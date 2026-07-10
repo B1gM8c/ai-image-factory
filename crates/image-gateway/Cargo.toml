@@ -2,6 +2,7 @@
 name = "gpt-image-2-gateway"
 version = "0.1.0"
 edition = "2024"
+default-run = "gpt-image-2-gateway"
 
 [dependencies]
 async-trait = "0.1.89"
@@ -18,7 +19,7 @@ opentelemetry_sdk = "0.32.1"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 sha2 = "0.11.0"
-sqlx = { version = "0.9.0", default-features = false, features = ["postgres", "migrate", "runtime-tokio", "uuid"] }
+sqlx = { version = "0.9.0", default-features = false, features = ["postgres", "macros", "migrate", "runtime-tokio", "uuid"] }
 tempfile = "3.27.0"
 thiserror = "2.0.18"
 tokio = { version = "1.52.3", features = ["macros", "rt-multi-thread", "process", "fs", "time", "sync", "signal", "net", "io-util"] }

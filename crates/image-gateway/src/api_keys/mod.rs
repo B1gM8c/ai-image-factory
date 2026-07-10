@@ -1,12 +1,12 @@
 use std::{
-    sync::{Arc, Mutex},
+    sync::Mutex,
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use async_trait::async_trait;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use sqlx::{PgPool, postgres::PgPoolOptions};
+use sqlx::PgPool;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
@@ -281,72 +281,12 @@ impl ApiKeyStore for InMemoryApiKeyStore {
 
 #[derive(Clone)]
 pub struct PostgresApiKeyStore {
-    pool: Arc<PgPool>,
+    pool: PgPool,
 }
 
 impl PostgresApiKeyStore {
-    pub async fn connect(database_url: &str) -> Result<Self, ImageGatewayError> {
-        let pool = PgPoolOptions::new()
-            .max_connections(5)
-            .connect(database_url)
-            .await
-            .map_err(|_| ImageGatewayError::service_unavailable("PostgreSQL is unavailable"))?;
-        let store = Self {
-            pool: Arc::new(pool),
-        };
-        store.migrate().await?;
-        Ok(store)
-    }
-
-    async fn migrate(&self) -> Result<(), ImageGatewayError> {
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS gateway_service_accounts (
-                id TEXT PRIMARY KEY,
-                project_id TEXT NOT NULL,
-                name TEXT NOT NULL,
-                role TEXT NOT NULL,
-                created_at BIGINT NOT NULL,
-                deleted_at BIGINT
-            )
-            "#,
-        )
-        .execute(&*self.pool)
-        .await
-        .map_err(|_| {
-            ImageGatewayError::service_unavailable("failed to migrate service accounts")
-        })?;
-
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS gateway_api_keys (
-                id TEXT PRIMARY KEY,
-                project_id TEXT NOT NULL,
-                service_account_id TEXT NOT NULL REFERENCES gateway_service_accounts(id),
-                name TEXT NOT NULL,
-                key_hash TEXT NOT NULL UNIQUE,
-                redacted_value TEXT NOT NULL,
-                created_at BIGINT NOT NULL,
-                last_used_at BIGINT,
-                deleted_at BIGINT
-            )
-            "#,
-        )
-        .execute(&*self.pool)
-        .await
-        .map_err(|_| ImageGatewayError::service_unavailable("failed to migrate api keys"))?;
-
-        sqlx::query(
-            r#"
-            CREATE INDEX IF NOT EXISTS gateway_api_keys_project_id_idx
-            ON gateway_api_keys (project_id, created_at)
-            "#,
-        )
-        .execute(&*self.pool)
-        .await
-        .map_err(|_| ImageGatewayError::service_unavailable("failed to migrate api key index"))?;
-
-        Ok(())
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
     }
 }
 
@@ -433,7 +373,7 @@ impl ApiKeyStore for PostgresApiKeyStore {
             "#,
         )
         .bind(hash)
-        .fetch_optional(&*self.pool)
+        .fetch_optional(&self.pool)
         .await
         .map_err(|_| ImageGatewayError::service_unavailable("api key state unavailable"))?;
 
@@ -444,7 +384,7 @@ impl ApiKeyStore for PostgresApiKeyStore {
         sqlx::query("UPDATE gateway_api_keys SET last_used_at = $1 WHERE id = $2")
             .bind(now)
             .bind(&api_key_id)
-            .execute(&*self.pool)
+            .execute(&self.pool)
             .await
             .map_err(|_| ImageGatewayError::service_unavailable("api key state unavailable"))?;
 
@@ -501,7 +441,7 @@ impl ApiKeyStore for PostgresApiKeyStore {
         .bind(project_id)
         .bind(after)
         .bind((limit + 1) as i64)
-        .fetch_all(&*self.pool)
+        .fetch_all(&self.pool)
         .await
         .map_err(|_| ImageGatewayError::service_unavailable("api key state unavailable"))?;
 
@@ -530,7 +470,7 @@ impl ApiKeyStore for PostgresApiKeyStore {
         .bind(now_seconds())
         .bind(project_id)
         .bind(api_key_id)
-        .execute(&*self.pool)
+        .execute(&self.pool)
         .await
         .map_err(|_| ImageGatewayError::service_unavailable("api key state unavailable"))?;
         if result.rows_affected() == 0 {

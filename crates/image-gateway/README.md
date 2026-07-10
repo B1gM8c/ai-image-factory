@@ -26,12 +26,14 @@ export DATABASE_URL='postgres://user:pass@localhost:5432/gpt_image_gateway'
 export GATEWAY_API_TOKEN='local-token'
 export GATEWAY_ADMIN_TOKEN='admin-token'
 export GATEWAY_CODEX_HOME='/srv/gpt-image-codex-home'
+cargo run --bin factoryctl -- migrate
 cargo run
 ```
 
 From the repository root, use:
 
 ```bash
+cargo run -p gpt-image-2-gateway --bin factoryctl -- migrate
 cargo run -p gpt-image-2-gateway
 ```
 
@@ -102,7 +104,7 @@ The OpenAPI document is generated from Rust path/schema annotations with `utoipa
 
 ## PostgreSQL Usage And Keys
 
-PostgreSQL is the authority for local API keys and 5-hour / 7-day image usage accounting. On startup the service creates the minimal tables from `migrations/0001_usage.sql` if they do not exist.
+PostgreSQL is the authority for local API keys and 5-hour / 7-day image usage accounting. Run `factoryctl migrate` before starting or upgrading the gateway. Gateway startup does not create or alter database objects.
 
 Current MVP behavior:
 

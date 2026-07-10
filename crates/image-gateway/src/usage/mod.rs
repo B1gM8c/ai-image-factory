@@ -1,12 +1,12 @@
 use std::{
-    sync::{Arc, Mutex},
+    sync::Mutex,
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use sqlx::{PgPool, postgres::PgPoolOptions};
+use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::{
@@ -344,192 +344,12 @@ impl UsageStore for InMemoryUsageStore {
 
 #[derive(Clone)]
 pub struct PostgresUsageStore {
-    pool: Arc<PgPool>,
+    pool: PgPool,
 }
 
 impl PostgresUsageStore {
-    pub async fn connect(database_url: &str) -> Result<Self, ImageGatewayError> {
-        let pool = PgPoolOptions::new()
-            .max_connections(5)
-            .connect(database_url)
-            .await
-            .map_err(|_| ImageGatewayError::service_unavailable("PostgreSQL is unavailable"))?;
-        let store = Self {
-            pool: Arc::new(pool),
-        };
-        store.migrate().await?;
-        Ok(store)
-    }
-
-    pub async fn migrate(&self) -> Result<(), ImageGatewayError> {
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS usage_events (
-                event_id UUID PRIMARY KEY,
-                tenant_id TEXT NOT NULL DEFAULT 'tenant_default',
-                request_id TEXT NOT NULL,
-                operation TEXT NOT NULL,
-                units INTEGER NOT NULL CHECK (units > 0),
-                outcome TEXT NOT NULL,
-                created_at_ms BIGINT NOT NULL
-            )
-            "#,
-        )
-        .execute(&*self.pool)
-        .await
-        .map_err(|_| ImageGatewayError::service_unavailable("failed to migrate usage_events"))?;
-
-        sqlx::query(
-            "ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS tenant_id TEXT NOT NULL DEFAULT 'tenant_default'",
-        )
-        .execute(&*self.pool)
-        .await
-        .map_err(|_| ImageGatewayError::service_unavailable("failed to migrate usage tenant"))?;
-
-        sqlx::query(
-            r#"
-            CREATE INDEX IF NOT EXISTS usage_events_tenant_created_at_ms_idx
-            ON usage_events (tenant_id, created_at_ms)
-            "#,
-        )
-        .execute(&*self.pool)
-        .await
-        .map_err(|_| ImageGatewayError::service_unavailable("failed to migrate usage index"))?;
-
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS quota_reservations (
-                reservation_id UUID PRIMARY KEY,
-                tenant_id TEXT NOT NULL DEFAULT 'tenant_default',
-                request_id TEXT NOT NULL,
-                job_id UUID,
-                requested_units INTEGER NOT NULL CHECK (requested_units > 0),
-                committed_units INTEGER NOT NULL DEFAULT 0,
-                started_units INTEGER NOT NULL DEFAULT 0,
-                released_units INTEGER NOT NULL DEFAULT 0,
-                state TEXT NOT NULL,
-                created_at_ms BIGINT NOT NULL,
-                updated_at_ms BIGINT NOT NULL,
-                expires_at_ms BIGINT NOT NULL
-            )
-            "#,
-        )
-        .execute(&*self.pool)
-        .await
-        .map_err(|_| ImageGatewayError::service_unavailable("failed to migrate reservations"))?;
-
-        for statement in [
-            "ALTER TABLE quota_reservations ADD COLUMN IF NOT EXISTS tenant_id TEXT NOT NULL DEFAULT 'tenant_default'",
-            "ALTER TABLE quota_reservations ADD COLUMN IF NOT EXISTS job_id UUID",
-            "ALTER TABLE quota_reservations ADD COLUMN IF NOT EXISTS committed_units INTEGER NOT NULL DEFAULT 0",
-        ] {
-            sqlx::query(statement)
-                .execute(&*self.pool)
-                .await
-                .map_err(|_| {
-                    ImageGatewayError::service_unavailable("failed to migrate reservation columns")
-                })?;
-        }
-
-        sqlx::query(
-            r#"
-            CREATE INDEX IF NOT EXISTS quota_reservations_active_tenant_idx
-            ON quota_reservations (tenant_id, state, expires_at_ms)
-            "#,
-        )
-        .execute(&*self.pool)
-        .await
-        .map_err(|_| {
-            ImageGatewayError::service_unavailable("failed to migrate reservation index")
-        })?;
-
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS jobs (
-                job_id UUID PRIMARY KEY,
-                tenant_id TEXT NOT NULL DEFAULT 'tenant_default',
-                request_id TEXT NOT NULL,
-                operation TEXT NOT NULL DEFAULT 'generation',
-                provider_id TEXT NOT NULL DEFAULT 'openai-codex',
-                model TEXT NOT NULL DEFAULT 'gpt-image-2',
-                state TEXT NOT NULL,
-                requested_units INTEGER NOT NULL,
-                charged_units INTEGER NOT NULL DEFAULT 0,
-                reservation_id UUID,
-                queue_entered_at_ms BIGINT,
-                started_at_ms BIGINT,
-                finished_at_ms BIGINT,
-                created_at_ms BIGINT NOT NULL DEFAULT 0,
-                updated_at_ms BIGINT NOT NULL DEFAULT 0,
-                last_error_code TEXT,
-                last_error_message TEXT
-            )
-            "#,
-        )
-        .execute(&*self.pool)
-        .await
-        .map_err(|_| ImageGatewayError::service_unavailable("failed to migrate jobs"))?;
-
-        for statement in [
-            "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS tenant_id TEXT NOT NULL DEFAULT 'tenant_default'",
-            "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS operation TEXT NOT NULL DEFAULT 'generation'",
-            "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS provider_id TEXT NOT NULL DEFAULT 'openai-codex'",
-            "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS model TEXT NOT NULL DEFAULT 'gpt-image-2'",
-            "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS reservation_id UUID",
-            "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS created_at_ms BIGINT NOT NULL DEFAULT 0",
-            "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS updated_at_ms BIGINT NOT NULL DEFAULT 0",
-            "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS last_error_code TEXT",
-            "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS last_error_message TEXT",
-        ] {
-            sqlx::query(statement)
-                .execute(&*self.pool)
-                .await
-                .map_err(|_| {
-                    ImageGatewayError::service_unavailable("failed to migrate job columns")
-                })?;
-        }
-
-        sqlx::query(
-            r#"
-            CREATE INDEX IF NOT EXISTS jobs_tenant_state_created_idx
-            ON jobs (tenant_id, state, created_at_ms)
-            "#,
-        )
-        .execute(&*self.pool)
-        .await
-        .map_err(|_| ImageGatewayError::service_unavailable("failed to migrate job index"))?;
-
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS metering_events (
-                event_id UUID PRIMARY KEY,
-                tenant_id TEXT NOT NULL,
-                job_id UUID,
-                reservation_id UUID,
-                request_id TEXT NOT NULL,
-                operation TEXT NOT NULL,
-                event_type TEXT NOT NULL,
-                units INTEGER NOT NULL DEFAULT 0,
-                outcome TEXT NOT NULL,
-                created_at_ms BIGINT NOT NULL
-            )
-            "#,
-        )
-        .execute(&*self.pool)
-        .await
-        .map_err(|_| ImageGatewayError::service_unavailable("failed to migrate metering"))?;
-
-        sqlx::query(
-            r#"
-            CREATE INDEX IF NOT EXISTS metering_events_tenant_created_idx
-            ON metering_events (tenant_id, created_at_ms)
-            "#,
-        )
-        .execute(&*self.pool)
-        .await
-        .map_err(|_| ImageGatewayError::service_unavailable("failed to migrate metering index"))?;
-
-        Ok(())
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
     }
 }
 

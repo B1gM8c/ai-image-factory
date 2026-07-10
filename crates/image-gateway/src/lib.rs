@@ -3,6 +3,7 @@ mod api_keys;
 mod auth;
 mod config;
 mod core;
+pub mod database;
 mod docs;
 mod error;
 mod generator;
@@ -22,4 +23,4 @@ pub use generator::{
     CodexImageGenerator, EditJob, GeneratedImage, GenerationJob, ImageGenerator, InputImage,
 };
 pub use telemetry::{TelemetryGuard, init_telemetry};
-pub use usage::{InMemoryUsageStore, PostgresUsageStore, UsageStore};
+pub use usage::{InMemoryUsageStore, PostgresUsageStore, UsageCharge, UsageLimits, UsageStore};
