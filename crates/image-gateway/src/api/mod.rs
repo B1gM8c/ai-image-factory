@@ -20,6 +20,7 @@ use crate::{
     scheduler::TenantJobScheduler,
     settlement::{ExecutionSettlementStore, SequentialExecutionSettlementStore},
     usage::{InMemoryUsageStore, UsageLimits, UsageStore},
+    workers::GenerationWorker,
 };
 
 mod admin;
@@ -39,7 +40,7 @@ pub(super) struct AppState {
     pub(super) api_key_store: Arc<dyn ApiKeyStore>,
     pub(super) usage_store: Arc<dyn UsageStore>,
     pub(super) admission_store: Arc<dyn AdmissionStore>,
-    pub(super) settlement_store: Arc<dyn ExecutionSettlementStore>,
+    pub(super) generation_worker: Arc<GenerationWorker>,
     pub(super) scheduler: Arc<TenantJobScheduler>,
     pub(super) worker_id: String,
 }
@@ -111,6 +112,13 @@ pub fn build_router_with_components(
         config.max_queue_size_per_tenant,
         config.queue_timeout,
     ));
+    let generation_worker = Arc::new(GenerationWorker::new(
+        generator.clone(),
+        admission_store.clone(),
+        settlement_store.clone(),
+        usage_store.clone(),
+        config.request_timeout,
+    ));
     let body_limit = config.max_upload_bytes;
     let state = AppState {
         config,
@@ -118,7 +126,7 @@ pub fn build_router_with_components(
         api_key_store,
         usage_store,
         admission_store,
-        settlement_store,
+        generation_worker,
         scheduler,
         worker_id: format!("gateway-{}", uuid::Uuid::new_v4().simple()),
     };

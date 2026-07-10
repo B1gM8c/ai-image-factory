@@ -17,7 +17,7 @@ use crate::{
     ImageGatewayError,
     admission::{
         AdmissionClaim, AdmissionError, AdmissionTicket, AttachJob, ClaimAdmission,
-        GENERATION_OPERATION, GenerationCommandV1, WorkOutcome, idempotency_key_digest,
+        GENERATION_OPERATION, GenerationCommandV1, idempotency_key_digest,
     },
     generator::normalize_generated_images,
     models::{HealthResponse, ImageStreamKind, images_response, models_response, parse_generation},
@@ -167,44 +167,30 @@ pub(super) async fn generations(
         }
     };
 
-    let generator = state.generator.clone();
-    let result = tokio::time::timeout(state.config.request_timeout, generator.generate(job))
-        .instrument(info_span!("gateway.handle_generate", image.units = units))
-        .await
-        .map_err(|_| ImageGatewayError::timeout())
-        .and_then(|result| result)
-        .and_then(|images| {
-            normalize_generated_images(images, &size, &output_format, output_compression)
-        })
-        .and_then(|images| {
-            let response_size = response_size_for_images(&images)?;
-            Ok(images_response(
-                images,
-                output_format,
-                quality,
-                response_size,
-                background,
-            ))
-        })
-        .and_then(|response| {
-            images_response_into_response(response, stream, ImageStreamKind::Generation)
-        });
-    let mut response = match result {
-        Ok(response) => response,
-        Err(error) => {
-            state
-                .admission_store
-                .settle(&lease, WorkOutcome::Failed, Some("generation_failed"))
-                .await
-                .map_err(admission_error)?;
-            state
-                .usage_store
-                .release(&reservation, "generation_failed")
-                .await?;
-            return Err(error);
-        }
-    };
-    let usage = state.settlement_store.succeed(&lease, &reservation).await?;
+    let execution = state
+        .generation_worker
+        .execute(
+            &lease,
+            &reservation,
+            job,
+            &size,
+            &output_format,
+            output_compression,
+        )
+        .await?;
+    let response_size = response_size_for_images(&execution.images)?;
+    let mut response = images_response_into_response(
+        images_response(
+            execution.images,
+            output_format,
+            quality,
+            response_size,
+            background,
+        ),
+        stream,
+        ImageStreamKind::Generation,
+    )?;
+    let usage = execution.usage;
     add_usage_headers(response.headers_mut(), &usage, &auth);
     Ok(response)
 }
