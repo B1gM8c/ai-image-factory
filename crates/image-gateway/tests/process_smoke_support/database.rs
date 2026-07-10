@@ -190,6 +190,65 @@ impl TestDatabase {
         require(
             metering == expected,
             format!("unexpected authoritative metering transitions: {metering:?}"),
+        )?;
+
+        let durable: DurableTransitionRow = sqlx::query_as(
+            r#"
+            SELECT a.state AS admission_state,
+                   p.command_schema,
+                   p.command_json ->> 'model' AS command_model,
+                   p.command_json ->> 'source_api_profile' AS source_api_profile,
+                   w.state AS work_state,
+                   w.lease_epoch,
+                   w.execution_id IS NOT NULL AS has_execution_id,
+                   ja.state AS attempt_state,
+                   i.state AS idempotency_state
+            FROM admission_sessions a
+            JOIN idempotency_requests i ON i.session_id = a.session_id
+            JOIN job_payloads p ON p.admission_session_id = a.session_id
+            JOIN work_items w ON w.job_id = p.job_id
+            JOIN job_attempts ja
+              ON ja.work_item_id = w.work_item_id
+             AND ja.execution_id = w.execution_id
+             AND ja.lease_epoch = w.lease_epoch
+            WHERE a.job_id = $1
+            "#,
+        )
+        .bind(transition.job_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|error| format!("failed to read durable execution transition: {error}"))?;
+        require(
+            durable.admission_state == "attached"
+                && durable.command_schema == "openai.images.generation.v1"
+                && durable.command_model.as_deref() == Some("gpt-image-2")
+                && durable.source_api_profile.as_deref() == Some("openai-images-v1")
+                && durable.work_state == "succeeded"
+                && durable.lease_epoch == 1
+                && durable.has_execution_id
+                && durable.attempt_state == "succeeded"
+                && durable.idempotency_state == "succeeded",
+            format!("unexpected durable execution transition: {durable:?}"),
+        )?;
+
+        let event_types: Vec<String> = sqlx::query_scalar(
+            "SELECT event_type FROM job_events WHERE job_id = $1 ORDER BY event_type",
+        )
+        .bind(transition.job_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| format!("failed to read durable job events: {error}"))?;
+        let outbox_types: Vec<String> = sqlx::query_scalar(
+            "SELECT event_type FROM outbox_events WHERE job_id = $1 ORDER BY event_type",
+        )
+        .bind(transition.job_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| format!("failed to read durable outbox events: {error}"))?;
+        let expected_events = vec!["job.accepted".to_string(), "job.succeeded".to_string()];
+        require(
+            event_types == expected_events && outbox_types == expected_events,
+            format!("unexpected durable events: job={event_types:?}, outbox={outbox_types:?}"),
         )
     }
 
@@ -225,6 +284,19 @@ struct TransitionRow {
     reservation_requested_units: i32,
     committed_units: i32,
     released_units: i32,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct DurableTransitionRow {
+    admission_state: String,
+    command_schema: String,
+    command_model: Option<String>,
+    source_api_profile: Option<String>,
+    work_state: String,
+    lease_epoch: i64,
+    has_execution_id: bool,
+    attempt_state: String,
+    idempotency_state: String,
 }
 
 #[derive(Debug, Eq, PartialEq, sqlx::FromRow)]

@@ -24,6 +24,10 @@ const CODE_TIMEOUT: &str = "timeout";
 const CODE_SERVICE_UNAVAILABLE: &str = "service_unavailable";
 const CODE_CONFIGURATION_ERROR: &str = "configuration_error";
 const CODE_INTERNAL_ERROR: &str = "internal_error";
+const CODE_INVALID_IDEMPOTENCY_KEY: &str = "invalid_idempotency_key";
+const CODE_IDEMPOTENCY_CONFLICT: &str = "idempotency_conflict";
+const CODE_IDEMPOTENCY_IN_PROGRESS: &str = "idempotency_in_progress";
+const CODE_IDEMPOTENCY_RESULT_UNAVAILABLE: &str = "idempotency_result_unavailable";
 
 #[derive(Debug)]
 pub struct ImageGatewayError {
@@ -87,6 +91,44 @@ impl ImageGatewayError {
             format!("Unknown parameter: '{param}'"),
             Some(param.to_string()),
             CODE_UNKNOWN_PARAMETER,
+        )
+    }
+
+    pub fn invalid_idempotency_key() -> Self {
+        Self::invalid_request(
+            "Idempotency-Key must contain 1 to 255 visible ASCII characters",
+            Some("Idempotency-Key".to_string()),
+            CODE_INVALID_IDEMPOTENCY_KEY,
+        )
+    }
+
+    pub fn idempotency_conflict() -> Self {
+        Self::new(
+            StatusCode::CONFLICT,
+            "Idempotency-Key was already used with different request parameters",
+            TYPE_INVALID_REQUEST,
+            Some("Idempotency-Key".to_string()),
+            CODE_IDEMPOTENCY_CONFLICT,
+        )
+    }
+
+    pub fn idempotency_in_progress() -> Self {
+        Self::new(
+            StatusCode::CONFLICT,
+            "A request with this Idempotency-Key is already in progress",
+            TYPE_INVALID_REQUEST,
+            Some("Idempotency-Key".to_string()),
+            CODE_IDEMPOTENCY_IN_PROGRESS,
+        )
+    }
+
+    pub fn idempotency_result_unavailable() -> Self {
+        Self::new(
+            StatusCode::CONFLICT,
+            "This idempotent request was already accepted and cannot be replayed yet",
+            TYPE_INVALID_REQUEST,
+            Some("Idempotency-Key".to_string()),
+            CODE_IDEMPOTENCY_RESULT_UNAVAILABLE,
         )
     }
 

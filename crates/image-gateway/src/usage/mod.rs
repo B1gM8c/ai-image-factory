@@ -29,6 +29,8 @@ pub struct UsageCharge {
     pub tenant_id: String,
     pub request_id: String,
     pub operation: &'static str,
+    pub provider_id: String,
+    pub model: String,
     pub units: u32,
     pub limits: UsageLimits,
 }
@@ -114,6 +116,8 @@ struct JobRecord {
     tenant_id: String,
     request_id: String,
     operation: &'static str,
+    provider_id: String,
+    model: String,
     state: JobState,
     requested_units: u32,
     charged_units: u32,
@@ -159,6 +163,8 @@ impl UsageStore for InMemoryUsageStore {
             tenant_id: charge.tenant_id.clone(),
             request_id: charge.request_id.clone(),
             operation: charge.operation,
+            provider_id: charge.provider_id.clone(),
+            model: charge.model.clone(),
             state: JobState::Reserved,
             requested_units: charge.units,
             charged_units: 0,
@@ -413,26 +419,20 @@ impl UsageStore for PostgresUsageStore {
         let seven_used = to_u32_saturated(seven_events + seven_reserved);
         let snapshot = ensure_quota(&charge, five_used, seven_used)?;
 
-        sqlx::query(
-            r#"
-            INSERT INTO jobs
-              (job_id, tenant_id, request_id, operation, provider_id, model, state,
-               requested_units, charged_units, reservation_id, created_at_ms, updated_at_ms)
-            VALUES ($1, $2, $3, $4, 'openai-codex', 'gpt-image-2', $5,
-                    $6, 0, $7, $8, $8)
-            "#,
-        )
-        .bind(job_id)
-        .bind(&charge.tenant_id)
-        .bind(&charge.request_id)
-        .bind(charge.operation)
-        .bind(JobState::Reserved.as_str())
-        .bind(charge.units as i32)
-        .bind(reservation_id)
-        .bind(now)
-        .execute(&mut *tx)
-        .await
-        .map_err(|_| ImageGatewayError::service_unavailable("job state unavailable"))?;
+        sqlx::query(postgres_job_insert_sql())
+            .bind(job_id)
+            .bind(&charge.tenant_id)
+            .bind(&charge.request_id)
+            .bind(charge.operation)
+            .bind(&charge.provider_id)
+            .bind(&charge.model)
+            .bind(JobState::Reserved.as_str())
+            .bind(charge.units as i32)
+            .bind(reservation_id)
+            .bind(now)
+            .execute(&mut *tx)
+            .await
+            .map_err(|_| ImageGatewayError::service_unavailable("job state unavailable"))?;
 
         sqlx::query(
             r#"
@@ -941,6 +941,15 @@ fn now_ms() -> i64 {
         .as_millis() as i64
 }
 
+fn postgres_job_insert_sql() -> &'static str {
+    r#"
+    INSERT INTO jobs
+      (job_id, tenant_id, request_id, operation, provider_id, model, state,
+       requested_units, charged_units, reservation_id, created_at_ms, updated_at_ms)
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 0, $9, $10, $10)
+    "#
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -950,12 +959,50 @@ mod tests {
             tenant_id: "tenant_a".to_string(),
             request_id: Uuid::new_v4().to_string(),
             operation: "generation",
+            provider_id: image_provider_contracts::openai_codex::PROVIDER_ID.to_string(),
+            model: image_provider_contracts::openai_codex::MODEL_GPT_IMAGE_2.to_string(),
             units,
             limits: UsageLimits {
                 five_hour_image_limit: 2,
                 seven_day_image_limit: 2,
             },
         }
+    }
+
+    #[test]
+    fn snapshot_model_identity_is_preserved_for_jobs_and_usage_persistence() {
+        use image_provider_contracts::openai_codex;
+        use serde_json::json;
+
+        let job = crate::models::parse_generation(
+            json!({
+                "model": openai_codex::MODEL_GPT_IMAGE_2_SNAPSHOT,
+                "prompt": "a snapshot identity test"
+            }),
+            "req-snapshot".to_string(),
+        )
+        .unwrap();
+        assert_eq!(job.model, openai_codex::MODEL_GPT_IMAGE_2_SNAPSHOT);
+
+        let charge = UsageCharge {
+            tenant_id: "tenant_a".to_string(),
+            request_id: job.request_id,
+            operation: "generation",
+            provider_id: openai_codex::PROVIDER_ID.to_string(),
+            model: job.model,
+            units: job.n,
+            limits: UsageLimits {
+                five_hour_image_limit: 2,
+                seven_day_image_limit: 2,
+            },
+        };
+        assert_eq!(charge.provider_id, openai_codex::PROVIDER_ID);
+        assert_eq!(charge.model, openai_codex::MODEL_GPT_IMAGE_2_SNAPSHOT);
+
+        let insert_sql = postgres_job_insert_sql();
+        assert!(insert_sql.contains("VALUES ($1, $2, $3, $4, $5, $6, $7,"));
+        assert!(!insert_sql.contains("'openai-codex'"));
+        assert!(!insert_sql.contains("'gpt-image-2'"));
     }
 
     #[tokio::test]

@@ -53,6 +53,14 @@ pub(crate) fn assert_response(
 }
 
 pub(crate) fn assert_codex_outputs(files: &SmokeFiles) -> TestResult {
+    let invocation_count = fs::read_to_string(&files.invocation_log)
+        .map_err(|error| format!("failed to read fake Codex invocation log: {error}"))?
+        .lines()
+        .count();
+    require(
+        invocation_count == 1,
+        format!("fake Codex invocation count was {invocation_count}, expected 1"),
+    )?;
     let argv = read_nul_strings(&files.argv_log)?;
     let request_dir = argv_value(&argv, "--cd")?;
     assert_codex_invocation(&argv, &request_dir)?;

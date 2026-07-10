@@ -193,6 +193,18 @@ async fn owner_expiring_before_attach_is_aborted() -> TestResult {
         require(
             states == ("aborted".to_string(), "aborted".to_string()),
             format!("expired admission was not aborted: {states:?}"),
+        )?;
+
+        let retry = store
+            .claim(claim_request(Some("3".repeat(64)), "2".repeat(64)))
+            .await
+            .map_err(|error| format!("same-hash aborted retry failed: {error}"))?;
+        let AdmissionClaim::Owner(retry_ticket) = retry else {
+            return Err(format!("aborted retry did not regain ownership: {retry:?}"));
+        };
+        require(
+            retry_ticket.session_id != ticket.session_id,
+            "aborted retry reused the old session",
         )
     }
     .await;
@@ -205,6 +217,107 @@ async fn owner_attachment_and_lease_epoch_are_fenced() -> TestResult {
         return Ok(());
     };
     let result = attachment_and_fencing_case(&database).await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
+async fn claim_job_leases_only_the_requested_ready_work() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let store = PostgresAdmissionStore::new(database.pool.clone());
+        let mut jobs = Vec::new();
+        for digest in ["5".repeat(64), "6".repeat(64)] {
+            let ticket = match store
+                .claim(claim_request(Some(digest), "7".repeat(64)))
+                .await
+                .map_err(|error| format!("owner claim failed: {error}"))?
+            {
+                AdmissionClaim::Owner(ticket) => ticket,
+                other => return Err(format!("expected owner, got {other:?}")),
+            };
+            let job_id = insert_job(&database.pool, "tenant-a").await?;
+            store
+                .attach(attach_request(ticket, job_id))
+                .await
+                .map_err(|error| format!("attach failed: {error}"))?;
+            jobs.push(job_id);
+        }
+
+        let lease = store
+            .claim_job(jobs[1], "inline-gateway", 30_000)
+            .await
+            .map_err(|error| format!("targeted claim failed: {error}"))?
+            .ok_or_else(|| "targeted work was not ready".to_string())?;
+        require(lease.job_id == jobs[1], "targeted claim leased another job")?;
+        let states: Vec<(Uuid, String)> =
+            sqlx::query_as("SELECT job_id, state FROM work_items ORDER BY job_id")
+                .fetch_all(&database.pool)
+                .await
+                .map_err(|error| format!("failed to inspect targeted claim: {error}"))?;
+        require(
+            states
+                .iter()
+                .any(|(job_id, state)| *job_id == jobs[0] && state == "ready"),
+            "non-targeted work did not remain ready",
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
+async fn attach_and_start_is_atomic_and_idempotent_for_the_owner() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let store = PostgresAdmissionStore::new(database.pool.clone());
+        let ticket = match store
+            .claim(claim_request(Some("8".repeat(64)), "9".repeat(64)))
+            .await
+            .map_err(|error| format!("owner claim failed: {error}"))?
+        {
+            AdmissionClaim::Owner(ticket) => ticket,
+            other => return Err(format!("expected owner, got {other:?}")),
+        };
+        let job_id = insert_job(&database.pool, "tenant-a").await?;
+        let request = attach_request(ticket, job_id);
+
+        let first = store
+            .attach_and_start(request.clone(), "inline-gateway", 30_000)
+            .await
+            .map_err(|error| format!("atomic attach/start failed: {error}"))?;
+        let replay = store
+            .attach_and_start(request, "inline-gateway", 30_000)
+            .await
+            .map_err(|error| format!("idempotent attach/start replay failed: {error}"))?;
+        require(
+            first == replay,
+            "attach/start replay returned a different lease",
+        )?;
+
+        let state: (String, String, i64, i64) = sqlx::query_as(
+            r#"
+            SELECT a.state, w.state,
+                   (SELECT COUNT(*) FROM work_items WHERE job_id = $1),
+                   (SELECT COUNT(*) FROM job_attempts WHERE work_item_id = w.work_item_id)
+            FROM admission_sessions a
+            JOIN work_items w ON w.job_id = a.job_id
+            WHERE a.job_id = $1
+            "#,
+        )
+        .bind(job_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(|error| format!("failed to inspect atomic attach/start: {error}"))?;
+        require(
+            state == ("attached".to_string(), "running".to_string(), 1, 1),
+            format!("unexpected atomic attach/start state: {state:?}"),
+        )
+    }
+    .await;
     combine(result, database.cleanup().await)
 }
 
@@ -254,6 +367,27 @@ async fn attachment_and_fencing_case(database: &TestDatabase) -> TestResult {
         .start(&lease)
         .await
         .map_err(|error| format!("valid lease did not start: {error}"))?;
+
+    let other_job_id = insert_job(&database.pool, "tenant-a").await?;
+    let cross_job = gpt_image_2_gateway::admission::WorkLease {
+        job_id: other_job_id,
+        ..lease.clone()
+    };
+    require(
+        matches!(
+            store
+                .settle(&cross_job, WorkOutcome::Failed, Some("cross_job"))
+                .await,
+            Err(AdmissionError::StaleLease)
+        ),
+        "lease was able to settle a different job",
+    )?;
+    let cross_events: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM job_events WHERE job_id = $1")
+        .bind(other_job_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(|error| format!("failed to count cross-job events: {error}"))?;
+    require(cross_events == 0, "cross-job settlement wrote events")?;
 
     let stale = gpt_image_2_gateway::admission::WorkLease {
         lease_epoch: lease.lease_epoch + 1,

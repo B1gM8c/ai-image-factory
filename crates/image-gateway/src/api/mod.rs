@@ -12,12 +12,14 @@ use tower_http::trace::TraceLayer;
 
 use crate::{
     AppConfig, ImageGatewayError,
+    admission::{AdmissionStore, InMemoryAdmissionStore},
     api_keys::{ApiKeyStore, InMemoryApiKeyStore},
     auth::{AuthContext, authorize_legacy, bearer_token},
     docs::{openapi_json, scalar_docs_html},
     generator::ImageGenerator,
     scheduler::TenantJobScheduler,
-    usage::{UsageLimits, UsageStore},
+    settlement::{ExecutionSettlementStore, SequentialExecutionSettlementStore},
+    usage::{InMemoryUsageStore, UsageLimits, UsageStore},
 };
 
 mod admin;
@@ -36,7 +38,10 @@ pub(super) struct AppState {
     pub(super) generator: Arc<dyn ImageGenerator>,
     pub(super) api_key_store: Arc<dyn ApiKeyStore>,
     pub(super) usage_store: Arc<dyn UsageStore>,
+    pub(super) admission_store: Arc<dyn AdmissionStore>,
+    pub(super) settlement_store: Arc<dyn ExecutionSettlementStore>,
     pub(super) scheduler: Arc<TenantJobScheduler>,
+    pub(super) worker_id: String,
 }
 
 #[derive(Clone, Debug)]
@@ -45,7 +50,7 @@ pub(super) struct RequestId(pub(super) String);
 pub fn build_router(
     config: AppConfig,
     generator: Arc<dyn ImageGenerator>,
-    usage_store: Arc<dyn UsageStore>,
+    usage_store: Arc<InMemoryUsageStore>,
 ) -> Router {
     build_router_with_api_key_store(
         config,
@@ -58,8 +63,46 @@ pub fn build_router(
 pub fn build_router_with_api_key_store(
     config: AppConfig,
     generator: Arc<dyn ImageGenerator>,
+    usage_store: Arc<InMemoryUsageStore>,
+    api_key_store: Arc<dyn ApiKeyStore>,
+) -> Router {
+    build_router_with_stores(
+        config,
+        generator,
+        usage_store,
+        api_key_store,
+        Arc::new(InMemoryAdmissionStore::default()),
+    )
+}
+
+fn build_router_with_stores(
+    config: AppConfig,
+    generator: Arc<dyn ImageGenerator>,
     usage_store: Arc<dyn UsageStore>,
     api_key_store: Arc<dyn ApiKeyStore>,
+    admission_store: Arc<dyn AdmissionStore>,
+) -> Router {
+    let settlement_store = Arc::new(SequentialExecutionSettlementStore::new(
+        admission_store.clone(),
+        usage_store.clone(),
+    ));
+    build_router_with_components(
+        config,
+        generator,
+        usage_store,
+        api_key_store,
+        admission_store,
+        settlement_store,
+    )
+}
+
+pub fn build_router_with_components(
+    config: AppConfig,
+    generator: Arc<dyn ImageGenerator>,
+    usage_store: Arc<dyn UsageStore>,
+    api_key_store: Arc<dyn ApiKeyStore>,
+    admission_store: Arc<dyn AdmissionStore>,
+    settlement_store: Arc<dyn ExecutionSettlementStore>,
 ) -> Router {
     let scheduler = Arc::new(TenantJobScheduler::new(
         config.max_concurrent_jobs,
@@ -74,7 +117,10 @@ pub fn build_router_with_api_key_store(
         generator,
         api_key_store,
         usage_store,
+        admission_store,
+        settlement_store,
         scheduler,
+        worker_id: format!("gateway-{}", uuid::Uuid::new_v4().simple()),
     };
 
     Router::new()

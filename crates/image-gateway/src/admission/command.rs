@@ -29,11 +29,10 @@ impl GenerationCommandV1 {
         job: &GenerationJob,
         source_api_profile: impl Into<String>,
         provider_id: impl Into<String>,
-        model: impl Into<String>,
     ) -> Self {
         Self {
             background: job.background.clone(),
-            model: model.into(),
+            model: job.model.clone(),
             n: job.n,
             operation: GENERATION_OPERATION.to_string(),
             output_compression: job.output_compression,
@@ -99,6 +98,7 @@ mod tests {
     fn generation_job() -> GenerationJob {
         GenerationJob {
             request_id: "request-1".to_string(),
+            model: "gpt-image-2".to_string(),
             prompt: "a red fox".to_string(),
             n: 2,
             size: "1024x1024".to_string(),
@@ -116,7 +116,6 @@ mod tests {
             &generation_job(),
             "openai-images-v1",
             "openai-codex",
-            "gpt-image-2",
         )
     }
 

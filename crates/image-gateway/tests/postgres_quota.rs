@@ -18,6 +18,42 @@ const DATABASE_URL: &str = "TEST_DATABASE_URL";
 const WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[tokio::test]
+async fn reserve_persists_selected_provider_and_snapshot_model() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+
+    let result = async {
+        let pool = database.pool("quota_provider_model").await?;
+        let store = PostgresUsageStore::new(pool.clone());
+        let mut charge = test_charge("tenant_provider_model", "request_provider_model");
+        charge.model = "gpt-image-2-2026-04-21".to_string();
+        let reservation = store
+            .reserve(charge)
+            .await
+            .map_err(|error| format!("provider/model reserve failed: {error:?}"))?;
+        let identity: (String, String) =
+            sqlx::query_as("SELECT provider_id, model FROM jobs WHERE job_id = $1")
+                .bind(reservation.job_id)
+                .fetch_one(&pool)
+                .await
+                .map_err(|error| format!("failed to read provider/model identity: {error}"))?;
+        require(
+            identity
+                == (
+                    "openai-codex".to_string(),
+                    "gpt-image-2-2026-04-21".to_string(),
+                ),
+            format!("unexpected persisted provider/model identity: {identity:?}"),
+        )
+    }
+    .await;
+    let cleanup = database.cleanup().await;
+    cleanup?;
+    result
+}
+
+#[tokio::test]
 async fn commit_and_reserve_are_linearized_by_the_tenant_lock() -> TestResult {
     let Some(database) = TestDatabase::new().await? else {
         return Ok(());
@@ -584,6 +620,8 @@ fn test_charge(tenant_id: &str, request_id: &str) -> UsageCharge {
         tenant_id: tenant_id.to_string(),
         request_id: request_id.to_string(),
         operation: "generation",
+        provider_id: "openai-codex".to_string(),
+        model: "gpt-image-2".to_string(),
         units: 1,
         limits: UsageLimits {
             five_hour_image_limit: 1,

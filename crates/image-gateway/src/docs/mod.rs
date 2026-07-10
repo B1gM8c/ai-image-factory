@@ -123,6 +123,9 @@ impl Modify for SecurityAddon {
     path = "/v1/images/generations",
     tag = "Images",
     security(("BearerAuth" = [])),
+    params(
+        ("Idempotency-Key" = Option<String>, Header, description = "Optional 1-255 character visible ASCII key. Replays never execute the provider twice; durable response replay is not yet available.")
+    ),
     request_body(content = ImageGenerationRequestDoc, content_type = "application/json"),
     responses(
         (status = 200, description = "Base64 encoded generated images or final-only SSE when stream=true", content(
@@ -131,6 +134,7 @@ impl Modify for SecurityAddon {
         )),
         (status = 400, description = "Invalid image request", body = ErrorResponseDoc),
         (status = 401, description = "Invalid authentication", body = ErrorResponseDoc),
+        (status = 409, description = "Idempotency key is in progress, conflicts with another body, or its result cannot yet be replayed", body = ErrorResponseDoc),
         (status = 429, description = "Gateway queue or quota limit reached", body = ErrorResponseDoc),
         (status = 502, description = "Codex CLI image backend failed", body = ErrorResponseDoc),
         (status = 504, description = "Codex CLI image backend timed out", body = ErrorResponseDoc)

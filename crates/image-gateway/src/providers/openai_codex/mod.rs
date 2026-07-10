@@ -145,6 +145,7 @@ impl ImageGenerator for OpenAiCodexImageProvider {
 
         let generation_job = GenerationJob {
             request_id: job.request_id,
+            model: job.model,
             prompt: build_edit_prompt(&job.prompt, job.images.len(), job.mask.is_some()),
             n: job.n,
             size: job.size,
@@ -805,6 +806,7 @@ mod tests {
     fn explicit_size_prompt_includes_reduced_aspect_ratio() {
         let job = GenerationJob {
             request_id: "req-test".to_string(),
+            model: "gpt-image-2".to_string(),
             prompt: "a clean product icon".to_string(),
             n: 1,
             size: "1536x1024".to_string(),
@@ -829,6 +831,7 @@ mod tests {
     fn aspect_ratio_prompt_does_not_request_exact_pixels() {
         let job = GenerationJob {
             request_id: "req-test".to_string(),
+            model: "gpt-image-2".to_string(),
             prompt: "a clean product icon".to_string(),
             n: 1,
             size: "16:9".to_string(),
@@ -852,6 +855,7 @@ mod tests {
     fn auto_size_prompt_does_not_add_aspect_ratio() {
         let job = GenerationJob {
             request_id: "req-test".to_string(),
+            model: "gpt-image-2".to_string(),
             prompt: "a clean product icon".to_string(),
             n: 1,
             size: "auto".to_string(),
@@ -873,6 +877,7 @@ mod tests {
     fn prompt_mentions_candidate_index_and_final_jpeg_filename() {
         let job = GenerationJob {
             request_id: "req-test".to_string(),
+            model: "gpt-image-2".to_string(),
             prompt: "a clean product icon".to_string(),
             n: 3,
             size: "auto".to_string(),

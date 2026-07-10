@@ -15,6 +15,7 @@ use tokio::{process::Child, time::timeout};
 use super::{ADMIN_TOKEN, API_TOKEN, TestDatabase, TestResult, combine_results, require};
 
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(10);
+const HEALTH_TIMEOUT_ENV: &str = "PROCESS_SMOKE_HEALTH_TIMEOUT_SECS";
 const EXIT_TIMEOUT: Duration = Duration::from_secs(5);
 const STARTUP_ATTEMPTS: usize = 3;
 
@@ -23,6 +24,7 @@ pub(crate) struct SmokeFiles {
     pub(crate) argv_log: PathBuf,
     pub(crate) stdin_log: PathBuf,
     pub(crate) fake_pid_log: PathBuf,
+    pub(crate) invocation_log: PathBuf,
     fake_bin: PathBuf,
     codex_home: PathBuf,
     fake_active_pid: PathBuf,
@@ -38,6 +40,7 @@ impl SmokeFiles {
         let argv_log = root.path().join("codex.argv");
         let stdin_log = root.path().join("codex.stdin");
         let fake_pid_log = root.path().join("codex.pid");
+        let invocation_log = root.path().join("codex.invocations");
         let fake_active_pid = root.path().join("codex.active.pid");
         let fixture_path = root.path().join("opaque.png");
         let gateway_log = root.path().join("gateway.log");
@@ -54,6 +57,7 @@ impl SmokeFiles {
             &argv_log,
             &stdin_log,
             &fake_pid_log,
+            &invocation_log,
             &fake_active_pid,
             &fixture_path,
         );
@@ -71,6 +75,7 @@ impl SmokeFiles {
             argv_log,
             stdin_log,
             fake_pid_log,
+            invocation_log,
             fake_bin,
             codex_home,
             fake_active_pid,
@@ -286,7 +291,7 @@ pub(crate) async fn poll_health(
     base_url: &str,
     gateway: &mut GatewayProcess,
 ) -> TestResult {
-    timeout(HEALTH_TIMEOUT, async {
+    timeout(health_timeout(), async {
         loop {
             if let Some(status) = gateway.poll_exit()? {
                 return Err(format!(
@@ -313,6 +318,15 @@ pub(crate) async fn poll_health(
     .map_err(|_| format!("gateway health check timed out: {}", gateway.logs()))?
 }
 
+fn health_timeout() -> Duration {
+    env::var(HEALTH_TIMEOUT_ENV)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(HEALTH_TIMEOUT)
+}
+
 pub(crate) fn startup_failed_from_address_in_use(logs: &str) -> bool {
     logs.contains("failed to bind HTTP listener")
 }
@@ -330,6 +344,7 @@ fn fake_codex_script(
     argv_log: &Path,
     stdin_log: &Path,
     fake_pid_log: &Path,
+    invocation_log: &Path,
     fake_active_pid: &Path,
     fixture: &Path,
 ) -> String {
@@ -345,6 +360,7 @@ set -eu
 [ -z "${{TEST_DATABASE_URL+x}}" ] || exit 26
 [ -z "${{GATEWAY_DATABASE_SCHEMA+x}}" ] || exit 29
 printf '%s\n' "$$" > {fake_pid_log}
+printf 'invoked\n' >> {invocation_log}
 printf '%s\n' "$$" > {fake_active_pid}
 trap 'rm -f {fake_active_pid}' EXIT
 printf '%s\0' "$@" > {argv_log}
@@ -366,6 +382,7 @@ cp {fixture} "$request_dir/final.png"
         argv_log = shell_quote(argv_log),
         stdin_log = shell_quote(stdin_log),
         fake_pid_log = shell_quote(fake_pid_log),
+        invocation_log = shell_quote(invocation_log),
         fake_active_pid = shell_quote(fake_active_pid),
         fixture = shell_quote(fixture),
     )

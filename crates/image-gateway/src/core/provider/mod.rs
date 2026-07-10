@@ -5,6 +5,7 @@ use crate::ImageGatewayError;
 #[derive(Clone, Debug)]
 pub struct GenerationJob {
     pub request_id: String,
+    pub model: String,
     pub prompt: String,
     pub n: u32,
     pub size: String,
@@ -19,6 +20,7 @@ pub struct GenerationJob {
 #[derive(Clone, Debug)]
 pub struct EditJob {
     pub request_id: String,
+    pub model: String,
     pub prompt: String,
     pub images: Vec<InputImage>,
     pub mask: Option<InputImage>,

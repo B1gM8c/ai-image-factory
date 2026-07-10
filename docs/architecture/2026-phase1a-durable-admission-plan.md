@@ -20,15 +20,17 @@ new provider is allowed during this phase.
    implementations.
 3. Canonicalize and hash the validated generation command. Support the
    `Idempotency-Key` header as a documented extension.
-4. Claim admission before quota reservation, attach the existing reserved job,
-   claim one fenced work lease, execute the current generator, and settle the
-   work item before committing or releasing quota.
+4. Claim admission before quota reservation, atomically attach and start the
+   existing reserved job, execute the current generator, and atomically settle
+   successful work together with quota, job, usage, metering, and outbox state.
 5. Preserve the current synchronous response and error body when no
    idempotency key is supplied.
 
 ## Invariants
 
-- `(project_id, api_profile, operation, key_digest)` creates at most one job.
+- `(project_id, api_profile, operation, key_digest)` creates at most one
+  attached/executable job. A released pre-attach quota attempt is never
+  executable.
 - Reusing a key with a different request hash returns conflict and creates no
   quota reservation or provider execution.
 - A concurrent same-hash request returns `idempotency_in_progress` and never
@@ -37,8 +39,14 @@ new provider is allowed during this phase.
   durable artifact projection is implemented, it returns an explicit
   `idempotency_result_unavailable` response instead of re-executing.
 - Only the admission owner token may attach a job.
+- PostgreSQL attach/start is one idempotent transaction. Retrying after an
+  ambiguous commit returns the same lease and creates no duplicate attempt.
 - Work settlement requires the current lease epoch; stale workers cannot
   succeed or fail work.
+- Successful PostgreSQL settlement commits work, attempt, idempotency, quota,
+  job, usage, metering, job event, and outbox state in one transaction.
+- An aborted same-hash key with no attached job may acquire a fresh admission
+  session. Different hashes and all accepted/terminal jobs remain immutable.
 - Command JSON stores the validated model, prompt, `n`, size, quality, format,
   background, source API profile, schema version, and request hash.
 - Admission, work, and terminal transitions append job events and transactional
@@ -66,10 +74,27 @@ shared PostgreSQL pool for API keys, quota, and admission.
 
 ## Task 4: Wire generations without changing the response
 
-Read and validate `Idempotency-Key`, claim admission, reserve quota, attach the
-job, claim the inline lease, execute Codex, and fenced-settle work. Any failure
-before provider execution aborts admission and releases quota where applicable.
-Edits remain on the Phase 0 path until multipart input manifests are available.
+Read and validate `Idempotency-Key`, claim admission, reserve quota, atomically
+attach/start the inline lease, execute Codex, and fenced-settle work. Attach is
+retried idempotently for bounded transient failures. Any deterministic failure
+before provider execution aborts admission and releases quota where applicable;
+ambiguous database failures retain the reservation so recovery cannot execute
+an uncharged job. Edits remain on the Phase 0 path until multipart input
+manifests are available.
+
+## Implemented Transaction Boundaries (2026-07-10)
+
+- `PostgresAdmissionStore::attach_and_start` writes payload, running work,
+  attempt, admission, idempotency, accepted event, and outbox atomically.
+- `PostgresExecutionSettlementStore::succeed` verifies that lease and
+  reservation belong to the same job, takes the tenant quota lock, fences the
+  execution, and commits every success/billing projection atomically.
+- The in-memory settlement implementation is intentionally sequential and is
+  used only by test router builders. Production composition must inject the
+  PostgreSQL settlement coordinator explicitly.
+- Production process smoke verifies one fake-Codex invocation, a rejected
+  idempotent replay, durable command identity, attempt/work success, committed
+  quota, metering, job events, and outbox events.
 
 ## Verification Gate
 

@@ -13,6 +13,7 @@ use process_smoke_support::{
 };
 
 const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
+const IDEMPOTENCY_KEY: &str = "process-smoke-key";
 
 // Like the other PostgreSQL integration tests, local runs skip without TEST_DATABASE_URL while CI
 // fails closed so the process composition cannot silently go untested there.
@@ -71,17 +72,19 @@ async fn exercise_gateway(
     let base_url = format!("http://{address}");
     poll_health(client, &base_url, gateway).await?;
 
+    let request_body = json!({
+        "model": "gpt-image-2",
+        "prompt": "process smoke opaque fixture",
+        "n": 1,
+        "size": "auto",
+        "quality": "low",
+        "output_format": "png"
+    });
     let response = client
         .post(format!("{base_url}/v1/images/generations"))
         .bearer_auth(API_TOKEN)
-        .json(&json!({
-            "model": "gpt-image-2",
-            "prompt": "process smoke opaque fixture",
-            "n": 1,
-            "size": "auto",
-            "quality": "low",
-            "output_format": "png"
-        }))
+        .header("Idempotency-Key", IDEMPOTENCY_KEY)
+        .json(&request_body)
         .send()
         .await
         .map_err(|error| format!("generation request failed: {error}"))?;
@@ -98,6 +101,26 @@ async fn exercise_gateway(
         format!("generation returned {status}: {body:#}"),
     )?;
     assert_response(&body, &headers, fixture)?;
+    assert_codex_outputs(files)?;
+
+    let replay = client
+        .post(format!("{base_url}/v1/images/generations"))
+        .bearer_auth(API_TOKEN)
+        .header("Idempotency-Key", IDEMPOTENCY_KEY)
+        .json(&request_body)
+        .send()
+        .await
+        .map_err(|error| format!("idempotent replay failed: {error}"))?;
+    let replay_status = replay.status();
+    let replay_body: Value = replay
+        .json()
+        .await
+        .map_err(|error| format!("idempotent replay was not JSON: {error}"))?;
+    require(
+        replay_status == reqwest::StatusCode::CONFLICT
+            && replay_body["error"]["code"] == "idempotency_result_unavailable",
+        format!("unexpected idempotent replay response {replay_status}: {replay_body:#}"),
+    )?;
     assert_codex_outputs(files)?;
     database.assert_transitions(&request_id).await
 }

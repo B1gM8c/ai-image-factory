@@ -3,12 +3,14 @@ use serde_json::Value;
 use uuid::Uuid;
 
 pub mod command;
+mod memory;
 mod postgres;
 
 pub use command::{
     GENERATION_COMMAND_SCHEMA_VERSION, GENERATION_OPERATION, GenerationCommandV1,
     IdempotencyKeyError, idempotency_key_digest, validate_idempotency_key,
 };
+pub use memory::InMemoryAdmissionStore;
 pub use postgres::PostgresAdmissionStore;
 
 #[derive(Clone, Debug)]
@@ -101,10 +103,32 @@ pub trait AdmissionStore: Send + Sync + 'static {
 
     async fn attach(&self, request: AttachJob) -> Result<AttachedWork, AdmissionError>;
 
+    async fn attach_and_start(
+        &self,
+        request: AttachJob,
+        worker_id: &str,
+        lease_duration_ms: i64,
+    ) -> Result<WorkLease, AdmissionError> {
+        let attached = self.attach(request).await?;
+        let lease = self
+            .claim_job(attached.job_id, worker_id, lease_duration_ms)
+            .await?
+            .ok_or(AdmissionError::Unavailable)?;
+        self.start(&lease).await?;
+        Ok(lease)
+    }
+
     async fn abort(&self, ticket: &AdmissionTicket) -> Result<(), AdmissionError>;
 
     async fn claim_ready(
         &self,
+        worker_id: &str,
+        lease_duration_ms: i64,
+    ) -> Result<Option<WorkLease>, AdmissionError>;
+
+    async fn claim_job(
+        &self,
+        job_id: Uuid,
         worker_id: &str,
         lease_duration_ms: i64,
     ) -> Result<Option<WorkLease>, AdmissionError>;

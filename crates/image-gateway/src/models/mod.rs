@@ -164,6 +164,7 @@ impl ImageGenerationRequest {
     fn into_job(self, request_id: String) -> Result<GenerationJob, ImageGatewayError> {
         let _accepted_user_passthrough = self.user;
         let CommonFields {
+            model,
             prompt,
             n,
             size,
@@ -191,6 +192,7 @@ impl ImageGenerationRequest {
 
         Ok(GenerationJob {
             request_id,
+            model,
             prompt,
             n,
             size,
@@ -222,6 +224,7 @@ impl EditForm {
         }
 
         let CommonFields {
+            model,
             prompt,
             n,
             size,
@@ -255,6 +258,7 @@ impl EditForm {
 
         Ok(EditJob {
             request_id,
+            model,
             prompt,
             images: self.images,
             mask: self.mask,
@@ -271,6 +275,7 @@ impl EditForm {
 }
 
 struct CommonFields {
+    model: String,
     prompt: String,
     n: u32,
     size: String,
@@ -439,6 +444,7 @@ fn validate_common(
     };
 
     Ok(CommonFields {
+        model,
         prompt,
         n,
         size,

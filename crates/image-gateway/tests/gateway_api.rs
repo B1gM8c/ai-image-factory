@@ -2276,6 +2276,16 @@ async fn openapi_json_documents_images_api() {
     assert_eq!(body["openapi"], "3.1.0");
     assert_eq!(body["info"]["title"], "AI Image Factory API");
     assert!(body["paths"]["/v1/images/generations"]["post"].is_object());
+    assert!(
+        body["paths"]["/v1/images/generations"]["post"]["parameters"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|parameter| parameter["name"] == "Idempotency-Key"
+                && parameter["in"] == "header"
+                && parameter["required"] == false)
+    );
+    assert!(body["paths"]["/v1/images/generations"]["post"]["responses"]["409"].is_object());
     assert!(body["paths"]["/v1/images/edits"]["post"].is_object());
     assert!(
         body["paths"]["/v1/organization/projects/{project_id}/service_accounts"]["post"]

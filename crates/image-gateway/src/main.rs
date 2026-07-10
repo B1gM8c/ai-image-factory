@@ -2,12 +2,14 @@ use std::sync::Arc;
 
 use gpt_image_2_gateway::{
     AppConfig, CodexImageGenerator, ImageGatewayError, PostgresApiKeyStore, PostgresUsageStore,
-    build_router_with_api_key_store,
+    admission::PostgresAdmissionStore,
+    build_router_with_components,
     database::{
         DEFAULT_MAX_CONNECTIONS, connect_pool_with_schema, database_schema_from_env,
         database_url_from_env, verify_migrations,
     },
     init_telemetry,
+    settlement::PostgresExecutionSettlementStore,
 };
 
 #[tokio::main]
@@ -22,10 +24,19 @@ async fn main() -> Result<(), ImageGatewayError> {
         connect_pool_with_schema(&database_url, DEFAULT_MAX_CONNECTIONS, &database_schema).await?;
     verify_migrations(&pool).await?;
     let usage_store = Arc::new(PostgresUsageStore::new(pool.clone()));
-    let api_key_store = Arc::new(PostgresApiKeyStore::new(pool));
+    let api_key_store = Arc::new(PostgresApiKeyStore::new(pool.clone()));
+    let admission_store = Arc::new(PostgresAdmissionStore::new(pool.clone()));
+    let settlement_store = Arc::new(PostgresExecutionSettlementStore::new(pool));
     let generator = Arc::new(CodexImageGenerator::new(config.clone()));
     let bind = config.bind;
-    let app = build_router_with_api_key_store(config, generator, usage_store, api_key_store);
+    let app = build_router_with_components(
+        config,
+        generator,
+        usage_store,
+        api_key_store,
+        admission_store,
+        settlement_store,
+    );
 
     let listener = tokio::net::TcpListener::bind(bind)
         .await

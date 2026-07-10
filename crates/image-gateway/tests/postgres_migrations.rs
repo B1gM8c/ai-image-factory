@@ -346,8 +346,8 @@ async fn shared_pool_case(pool: &PgPool) -> TestResult {
 
 async fn assert_expected_schema(pool: &PgPool) -> TestResult {
     require(
-        migration_versions(pool).await? == vec![0, 1],
-        "applied migration versions must be exactly [0, 1]",
+        migration_versions(pool).await? == vec![0, 1, 2],
+        "applied migration versions must be exactly [0, 1, 2]",
     )?;
 
     for (table, column) in REQUIRED_COLUMNS {
@@ -406,6 +406,8 @@ fn test_charge(request_id: &str) -> UsageCharge {
         tenant_id: "proj_test".to_string(),
         request_id: request_id.to_string(),
         operation: "generation",
+        provider_id: "openai-codex".to_string(),
+        model: "gpt-image-2".to_string(),
         units: 1,
         limits: UsageLimits {
             five_hour_image_limit: 10,
