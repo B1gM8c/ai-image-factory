@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Duration};
+use std::{env, sync::Arc, time::Duration};
 
 use axum::{
     body::{Body, to_bytes},
@@ -12,6 +12,9 @@ use serde_json::{Value, json};
 use tower::ServiceExt;
 
 fn smoke_config() -> AppConfig {
+    let codex_home = env::var("GATEWAY_CODEX_HOME").expect(
+        "GATEWAY_CODEX_HOME must explicitly select the Codex credentials for this smoke test",
+    );
     AppConfig {
         bind: "127.0.0.1:0".parse().unwrap(),
         auth_token: Some("smoke-token".to_string()),
@@ -27,7 +30,7 @@ fn smoke_config() -> AppConfig {
         request_timeout: Duration::from_secs(900),
         max_upload_bytes: 32 * 1024 * 1024,
         proxy: ProxyConfig::default(),
-        codex_home: None,
+        codex_home: Some(codex_home),
         cleanup_codex_outputs: false,
     }
 }
