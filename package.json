@@ -1,0 +1,19 @@
+{
+  "name": "ai-image-factory",
+  "private": true,
+  "workspaces": [
+    "apps/admin-console"
+  ],
+  "scripts": {
+    "dev:admin": "npm --workspace apps/admin-console run dev",
+    "build:admin": "npm --workspace apps/admin-console run build",
+    "typecheck:admin": "npm --workspace apps/admin-console run typecheck",
+    "test:api": "cargo test --workspace",
+    "smoke:codex": "cargo test -p gpt-image-2-gateway --test codex_smoke -- --ignored --nocapture"
+  },
+  "overrides": {
+    "next": {
+      "postcss": "8.5.16"
+    }
+  }
+}
