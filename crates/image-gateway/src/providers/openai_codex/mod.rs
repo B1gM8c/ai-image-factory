@@ -326,9 +326,16 @@ fn resolved_codex_home(config: &AppConfig) -> Option<PathBuf> {
     config
         .codex_home
         .clone()
-        .or_else(|| env::var("CODEX_HOME").ok())
-        .or_else(|| env::var("HOME").ok().map(|home| format!("{home}/.codex")))
+        .or_else(|| non_empty_process_env("CODEX_HOME"))
+        .or_else(|| non_empty_process_env("HOME").map(|home| format!("{home}/.codex")))
         .map(PathBuf::from)
+}
+
+fn non_empty_process_env(name: &str) -> Option<String> {
+    env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 fn build_codex_prompt(job: &GenerationJob, request_dir: &Path, index: u32) -> String {
@@ -403,12 +410,7 @@ fn apply_codex_env(command: &mut Command, config: &AppConfig) {
     copy_env_if_present(command, "SSL_CERT_DIR");
     copy_env_if_present(command, "SHELL");
 
-    if let Some(codex_home) = config
-        .codex_home
-        .clone()
-        .or_else(|| env::var("CODEX_HOME").ok())
-        .or_else(|| env::var("HOME").ok().map(|home| format!("{home}/.codex")))
-    {
+    if let Some(codex_home) = resolved_codex_home(config) {
         command.env("CODEX_HOME", &codex_home);
         command.env("HOME", codex_home);
     }
@@ -633,10 +635,12 @@ mod tests {
     }
 
     #[test]
-    fn codex_command_env_does_not_inherit_gateway_secrets() {
+    fn codex_command_uses_explicit_home_without_gateway_secrets() {
         let mut command = Command::new("codex");
         command.env("DATABASE_URL", "postgres://leak");
         command.env("GATEWAY_API_TOKEN", "secret");
+        command.env("GATEWAY_ADMIN_TOKEN", "admin-secret");
+        command.env("OTEL_EXPORTER_OTLP_HEADERS", "authorization=secret");
 
         apply_codex_env(&mut command, &test_config());
 
@@ -653,6 +657,8 @@ mod tests {
 
         assert!(!envs.contains_key("DATABASE_URL"));
         assert!(!envs.contains_key("GATEWAY_API_TOKEN"));
+        assert!(!envs.contains_key("GATEWAY_ADMIN_TOKEN"));
+        assert!(!envs.contains_key("OTEL_EXPORTER_OTLP_HEADERS"));
         assert_eq!(
             envs.get("CODEX_HOME"),
             Some(&Some("/tmp/gateway-codex-home".to_string()))
@@ -664,6 +670,14 @@ mod tests {
         assert_eq!(
             envs.get("HTTP_PROXY"),
             Some(&Some("http://proxy.test:8080".to_string()))
+        );
+    }
+
+    #[test]
+    fn explicit_codex_home_resolves_without_ambient_preconditions() {
+        assert_eq!(
+            resolved_codex_home(&test_config()),
+            Some(PathBuf::from("/tmp/gateway-codex-home"))
         );
     }
 

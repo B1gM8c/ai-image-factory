@@ -1,6 +1,13 @@
-use std::{env, net::SocketAddr, time::Duration};
+use std::{
+    env,
+    fs::{self, OpenOptions},
+    net::SocketAddr,
+    path::Path,
+    time::Duration,
+};
 
 use crate::ImageGatewayError;
+use uuid::Uuid;
 
 #[derive(Clone, Debug)]
 pub struct AppConfig {
@@ -75,7 +82,7 @@ impl AppConfig {
                     .ok()
                     .or_else(|| env::var("NO_PROXY").ok()),
             },
-            codex_home: env::var("GATEWAY_CODEX_HOME").ok(),
+            codex_home: non_empty_env("GATEWAY_CODEX_HOME"),
             cleanup_codex_outputs: env_bool("GATEWAY_CLEANUP_CODEX_OUTPUTS", false),
         })
     }
@@ -96,8 +103,72 @@ impl AppConfig {
                 "GATEWAY_API_TOKEN or GATEWAY_ADMIN_TOKEN is required when GATEWAY_BIND is not loopback",
             ));
         }
+        if !self.bind.ip().is_loopback() {
+            let codex_home = self
+                .codex_home
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    ImageGatewayError::config(
+                        "GATEWAY_CODEX_HOME is required when GATEWAY_BIND is not loopback",
+                    )
+                })?;
+            if !Path::new(codex_home).is_absolute() {
+                return Err(ImageGatewayError::config(
+                    "GATEWAY_CODEX_HOME must be an absolute path when GATEWAY_BIND is not loopback",
+                ));
+            }
+            validate_production_codex_home(Path::new(codex_home))?;
+        }
         Ok(())
     }
+}
+
+fn validate_production_codex_home(codex_home: &Path) -> Result<(), ImageGatewayError> {
+    validate_production_codex_home_with_probe(codex_home, |probe_path| {
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(probe_path)
+    })
+}
+
+fn validate_production_codex_home_with_probe<F>(
+    codex_home: &Path,
+    open_probe: F,
+) -> Result<(), ImageGatewayError>
+where
+    F: FnOnce(&Path) -> std::io::Result<std::fs::File>,
+{
+    let metadata = fs::symlink_metadata(codex_home).map_err(|_| {
+        ImageGatewayError::config("GATEWAY_CODEX_HOME must be an existing directory")
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(ImageGatewayError::config(
+            "GATEWAY_CODEX_HOME must be an existing directory and must not be a symlink",
+        ));
+    }
+    let canonical_home = fs::canonicalize(codex_home).map_err(|_| {
+        ImageGatewayError::config("GATEWAY_CODEX_HOME must be an existing directory")
+    })?;
+    if canonical_home.parent().is_none() {
+        return Err(ImageGatewayError::config(
+            "GATEWAY_CODEX_HOME must not be the filesystem root",
+        ));
+    }
+
+    let probe_path = canonical_home.join(format!(
+        ".image-gateway-write-probe-{}",
+        Uuid::new_v4().simple()
+    ));
+    let probe = open_probe(&probe_path)
+        .map_err(|_| ImageGatewayError::config("GATEWAY_CODEX_HOME must be writable"))?;
+    drop(probe);
+    fs::remove_file(probe_path).map_err(|_| {
+        ImageGatewayError::config("GATEWAY_CODEX_HOME write probe could not be removed")
+    })?;
+    Ok(())
 }
 
 fn env_u32(name: &str, default: u32) -> Result<u32, ImageGatewayError> {
@@ -177,7 +248,7 @@ mod tests {
     }
 
     #[test]
-    fn public_bind_requires_auth_token() {
+    fn public_bind_requires_auth_token_and_explicit_codex_home() {
         assert!(
             config_for_bind("0.0.0.0:8787", None)
                 .validate_startup()
@@ -186,18 +257,103 @@ mod tests {
         assert!(
             config_for_bind("0.0.0.0:8787", Some("token"))
                 .validate_startup()
-                .is_ok()
+                .is_err()
         );
         assert!(
             config_for_bind_with_admin("0.0.0.0:8787", Some("admin-token"))
                 .validate_startup()
-                .is_ok()
+                .is_err()
         );
         assert!(
             config_for_bind("127.0.0.1:8787", None)
                 .validate_startup()
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn public_bind_rejects_blank_codex_home() {
+        let mut config = config_for_bind("0.0.0.0:8787", Some("token"));
+        config.codex_home = Some("   ".to_string());
+
+        assert!(config.validate_startup().is_err());
+    }
+
+    #[test]
+    fn public_bind_accepts_absolute_explicit_codex_home() {
+        let codex_home = tempfile::tempdir().unwrap();
+        let mut config = config_for_bind("0.0.0.0:8787", Some("token"));
+        config.codex_home = Some(codex_home.path().to_string_lossy().into_owned());
+
+        assert!(config.validate_startup().is_ok());
+        assert_eq!(std::fs::read_dir(codex_home.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn public_bind_rejects_relative_explicit_codex_home() {
+        let mut config = config_for_bind("0.0.0.0:8787", Some("token"));
+        config.codex_home = Some("relative/codex-home".to_string());
+
+        assert!(config.validate_startup().is_err());
+    }
+
+    #[test]
+    fn public_bind_rejects_filesystem_root_as_codex_home() {
+        let mut config = config_for_bind("0.0.0.0:8787", Some("token"));
+        config.codex_home = Some("/".to_string());
+
+        assert!(config.validate_startup().is_err());
+    }
+
+    #[test]
+    fn public_bind_rejects_filesystem_root_alias_as_codex_home() {
+        let result = validate_production_codex_home_with_probe(Path::new("/."), |_| {
+            panic!("root aliases must be rejected before opening a write probe")
+        });
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn public_bind_rejects_nonexistent_codex_home() {
+        let parent = tempfile::tempdir().unwrap();
+        let mut config = config_for_bind("0.0.0.0:8787", Some("token"));
+        config.codex_home = Some(parent.path().join("missing").to_string_lossy().into_owned());
+
+        assert!(config.validate_startup().is_err());
+    }
+
+    #[test]
+    fn public_bind_rejects_regular_file_as_codex_home() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let mut config = config_for_bind("0.0.0.0:8787", Some("token"));
+        config.codex_home = Some(file.path().to_string_lossy().into_owned());
+
+        assert!(config.validate_startup().is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn public_bind_rejects_symlink_as_codex_home() {
+        let target = tempfile::tempdir().unwrap();
+        let parent = tempfile::tempdir().unwrap();
+        let symlink = parent.path().join("codex-home");
+        std::os::unix::fs::symlink(target.path(), &symlink).unwrap();
+        let mut config = config_for_bind("0.0.0.0:8787", Some("token"));
+        config.codex_home = Some(symlink.to_string_lossy().into_owned());
+
+        assert!(config.validate_startup().is_err());
+    }
+
+    #[test]
+    fn public_bind_rejects_unwritable_codex_home() {
+        let codex_home = tempfile::tempdir().unwrap();
+        let result = validate_production_codex_home_with_probe(codex_home.path(), |_| {
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+        });
+
+        assert!(result.is_err());
+        assert_eq!(std::fs::read_dir(codex_home.path()).unwrap().count(), 0);
     }
 
     #[test]

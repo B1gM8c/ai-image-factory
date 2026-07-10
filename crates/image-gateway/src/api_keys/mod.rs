@@ -367,11 +367,13 @@ impl ApiKeyStore for PostgresApiKeyStore {
         let hash = hash_key(bearer);
         let row: Option<(String, String)> = sqlx::query_as(
             r#"
-            SELECT id, project_id
-            FROM gateway_api_keys
-            WHERE key_hash = $1 AND deleted_at IS NULL
+            UPDATE gateway_api_keys
+            SET last_used_at = $1
+            WHERE key_hash = $2 AND deleted_at IS NULL
+            RETURNING id, project_id
             "#,
         )
+        .bind(now_seconds())
         .bind(hash)
         .fetch_optional(&self.pool)
         .await
@@ -380,14 +382,6 @@ impl ApiKeyStore for PostgresApiKeyStore {
         let Some((api_key_id, project_id)) = row else {
             return Ok(None);
         };
-        let now = now_seconds();
-        sqlx::query("UPDATE gateway_api_keys SET last_used_at = $1 WHERE id = $2")
-            .bind(now)
-            .bind(&api_key_id)
-            .execute(&self.pool)
-            .await
-            .map_err(|_| ImageGatewayError::service_unavailable("api key state unavailable"))?;
-
         Ok(Some(AuthContext {
             tenant_id: project_id.clone(),
             project_id,

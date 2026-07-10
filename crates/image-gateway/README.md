@@ -37,9 +37,9 @@ cargo run -p gpt-image-2-gateway --bin factoryctl -- migrate
 cargo run -p gpt-image-2-gateway
 ```
 
-Default bind address is `127.0.0.1:8787`. If you bind to a non-loopback address, either `GATEWAY_API_TOKEN` or `GATEWAY_ADMIN_TOKEN` is required at startup. `GATEWAY_ADMIN_TOKEN` protects local Admin endpoints for creating and revoking tenant API keys and must be configured explicitly. Image API tokens are not accepted on Admin endpoints.
+Default bind address is `127.0.0.1:8787`. A non-loopback bind requires (`GATEWAY_API_TOKEN` or `GATEWAY_ADMIN_TOKEN`) AND an absolute, existing, writable `GATEWAY_CODEX_HOME`. `GATEWAY_ADMIN_TOKEN` protects local Admin endpoints for creating and revoking tenant API keys and must be configured explicitly. Image API tokens are not accepted on Admin endpoints.
 
-For production, `GATEWAY_CODEX_HOME` is optional but recommended when you want a dedicated Codex auth/cache home for the service. `--ignore-user-config` skips user `config.toml`; Codex may still load its native system image generation skill. A dedicated home keeps the gateway away from your personal generated-image cache and local Codex state.
+For production or any non-loopback bind, provision the `GATEWAY_CODEX_HOME` directory before startup and grant the gateway service account permission to create and remove files there. The path itself must not be a symlink or the filesystem root. Loopback development may fall back to the inherited `CODEX_HOME` or `$HOME/.codex`. `--ignore-user-config` skips user `config.toml`; Codex may still load its native system image generation skill.
 
 ## Example
 
