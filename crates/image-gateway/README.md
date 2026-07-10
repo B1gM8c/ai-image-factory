@@ -37,9 +37,9 @@ cargo run -p gpt-image-2-gateway --bin factoryctl -- migrate
 cargo run -p gpt-image-2-gateway
 ```
 
-Default bind address is `127.0.0.1:8787`. A non-loopback bind requires (`GATEWAY_API_TOKEN` or `GATEWAY_ADMIN_TOKEN`) AND an absolute, existing, writable `GATEWAY_CODEX_HOME`. `GATEWAY_ADMIN_TOKEN` protects local Admin endpoints for creating and revoking tenant API keys and must be configured explicitly. Image API tokens are not accepted on Admin endpoints.
+Default bind address is `127.0.0.1:8787`. Every startup requires at least one of `GATEWAY_API_TOKEN` or `GATEWAY_ADMIN_TOKEN`, plus an explicit absolute, existing, writable `GATEWAY_CODEX_HOME`. If both tokens are configured, they must be different. `GATEWAY_ADMIN_TOKEN` protects Admin endpoints for creating and revoking project API keys; it never authorizes image calls. An admin-only startup can bootstrap project keys, and image calls must then use one of those keys. `GATEWAY_API_TOKEN` remains a legacy image token and is not accepted on Admin endpoints.
 
-For production or any non-loopback bind, provision the `GATEWAY_CODEX_HOME` directory before startup and grant the gateway service account permission to create and remove files there. The path itself must not be a symlink or the filesystem root. Loopback development may fall back to the inherited `CODEX_HOME` or `$HOME/.codex`. `--ignore-user-config` skips user `config.toml`; Codex may still load its native system image generation skill.
+The gateway does not yet provide native TLS and rejects every non-loopback bind. Bind it to loopback and place a TLS reverse proxy on the same host in front of it. Provision `GATEWAY_CODEX_HOME` before every startup and grant the gateway service account permission to create and remove files there; the path must not be a symlink or the filesystem root. `--ignore-user-config` skips user `config.toml`; Codex may still load its native system image generation skill.
 
 ## Example
 
@@ -112,15 +112,11 @@ Current MVP behavior:
 - Usage is isolated by project/tenant. Legacy `GATEWAY_API_TOKEN` calls use the `proj_default` tenant.
 - `GATEWAY_IMAGE_LIMIT_5H` defaults to `40`.
 - `GATEWAY_IMAGE_LIMIT_7D` defaults to `200`.
-- A request charges `n` image units after validation and queue admission, before Codex generation starts.
-- Failures after admission are conservatively counted.
+- After validation and queue admission, a request reserves `n` image units before Codex generation starts.
+- Successful generation commits the reservation. Generation or edit failure releases it, so failed provider attempts are not charged.
 - Responses include `x-request-id`, `openai-version`, `openai-project`, and image-unit quota headers when available.
-
-Production enhancements to add next:
-
-- Reservation rows per image attempt with release/commit state.
-- PG-backed queue with leases for multi-instance deployments.
-- PG integration tests that prove concurrent reserve calls cannot oversell quota.
+- PostgreSQL reservation transitions are serialized per tenant, and integration tests cover concurrent reservations without quota oversell.
+- The request scheduler is still in-process, so queue state is not shared across gateway instances.
 
 ## Concurrency
 

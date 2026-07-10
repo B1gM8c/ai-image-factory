@@ -114,21 +114,12 @@ pub(super) async fn authenticate_image_request(
     headers: &HeaderMap,
     state: &Arc<AppState>,
 ) -> Result<AuthContext, ImageGatewayError> {
-    let bearer = match bearer_token(headers) {
-        Ok(token) => token,
-        Err(_) if state.config.auth_token.is_none() && state.config.admin_token.is_none() => {
-            return authorize_legacy(headers, &state.config);
-        }
-        Err(error) => return Err(error),
-    };
+    let bearer = bearer_token(headers)?;
     if let Some(context) = state.api_key_store.authenticate(bearer).await? {
         return Ok(context);
     }
     if state.config.auth_token.is_some() {
         return authorize_legacy(headers, &state.config);
-    }
-    if state.config.admin_token.is_none() {
-        return Ok(AuthContext::legacy_default());
     }
     Err(ImageGatewayError::authentication())
 }

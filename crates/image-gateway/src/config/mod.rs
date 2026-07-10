@@ -88,38 +88,50 @@ impl AppConfig {
     }
 
     pub fn validate_startup(&self) -> Result<(), ImageGatewayError> {
-        if self
-            .auth_token
-            .as_deref()
-            .is_some_and(|token| token.trim().is_empty())
-        {
+        let auth_token = self.auth_token.as_deref().map(str::trim);
+        let admin_token = self.admin_token.as_deref().map(str::trim);
+
+        if auth_token.is_some_and(str::is_empty) {
             return Err(ImageGatewayError::config(
                 "GATEWAY_API_TOKEN must not be empty",
             ));
         }
-        if !self.bind.ip().is_loopback() && self.auth_token.is_none() && self.admin_token.is_none()
-        {
+        if admin_token.is_some_and(str::is_empty) {
             return Err(ImageGatewayError::config(
-                "GATEWAY_API_TOKEN or GATEWAY_ADMIN_TOKEN is required when GATEWAY_BIND is not loopback",
+                "GATEWAY_ADMIN_TOKEN must not be empty",
             ));
         }
+        if auth_token.is_none() && admin_token.is_none() {
+            return Err(ImageGatewayError::config(
+                "GATEWAY_API_TOKEN or GATEWAY_ADMIN_TOKEN is required",
+            ));
+        }
+        if auth_token
+            .zip(admin_token)
+            .is_some_and(|(api, admin)| api == admin)
+        {
+            return Err(ImageGatewayError::config(
+                "GATEWAY_API_TOKEN and GATEWAY_ADMIN_TOKEN must be different",
+            ));
+        }
+
+        let codex_home = self
+            .codex_home
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| ImageGatewayError::config("GATEWAY_CODEX_HOME is required"))?;
+        if !Path::new(codex_home).is_absolute() {
+            return Err(ImageGatewayError::config(
+                "GATEWAY_CODEX_HOME must be an absolute path",
+            ));
+        }
+        validate_production_codex_home(Path::new(codex_home))?;
+
         if !self.bind.ip().is_loopback() {
-            let codex_home = self
-                .codex_home
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .ok_or_else(|| {
-                    ImageGatewayError::config(
-                        "GATEWAY_CODEX_HOME is required when GATEWAY_BIND is not loopback",
-                    )
-                })?;
-            if !Path::new(codex_home).is_absolute() {
-                return Err(ImageGatewayError::config(
-                    "GATEWAY_CODEX_HOME must be an absolute path when GATEWAY_BIND is not loopback",
-                ));
-            }
-            validate_production_codex_home(Path::new(codex_home))?;
+            return Err(ImageGatewayError::config(
+                "native TLS is not implemented; set GATEWAY_BIND to a loopback address and expose it only through a TLS reverse proxy",
+            ));
         }
         Ok(())
     }
@@ -224,7 +236,7 @@ mod tests {
         AppConfig {
             bind: bind.parse().unwrap(),
             auth_token: token.map(str::to_string),
-            admin_token: token.map(str::to_string),
+            admin_token: None,
             database_url: Some("postgres://localhost/test".to_string()),
             five_hour_image_limit: 1,
             seven_day_image_limit: 1,
@@ -248,41 +260,39 @@ mod tests {
     }
 
     #[test]
-    fn public_bind_requires_auth_token_and_explicit_codex_home() {
-        assert!(
-            config_for_bind("0.0.0.0:8787", None)
-                .validate_startup()
-                .is_err()
-        );
-        assert!(
-            config_for_bind("0.0.0.0:8787", Some("token"))
-                .validate_startup()
-                .is_err()
-        );
-        assert!(
-            config_for_bind_with_admin("0.0.0.0:8787", Some("admin-token"))
-                .validate_startup()
-                .is_err()
-        );
-        assert!(
-            config_for_bind("127.0.0.1:8787", None)
-                .validate_startup()
-                .is_ok()
-        );
+    fn every_bind_requires_an_api_or_admin_token() {
+        let codex_home = tempfile::tempdir().unwrap();
+        for bind in ["127.0.0.1:8787", "0.0.0.0:8787"] {
+            let mut config = config_for_bind(bind, None);
+            config.codex_home = Some(codex_home.path().to_string_lossy().into_owned());
+
+            let error = format!("{:?}", config.validate_startup().unwrap_err());
+
+            assert!(error.contains("GATEWAY_API_TOKEN or GATEWAY_ADMIN_TOKEN is required"));
+        }
     }
 
     #[test]
-    fn public_bind_rejects_blank_codex_home() {
-        let mut config = config_for_bind("0.0.0.0:8787", Some("token"));
+    fn every_bind_rejects_blank_codex_home() {
+        let mut config = config_for_bind("127.0.0.1:8787", Some("token"));
         config.codex_home = Some("   ".to_string());
 
         assert!(config.validate_startup().is_err());
     }
 
     #[test]
-    fn public_bind_accepts_absolute_explicit_codex_home() {
+    fn every_bind_requires_explicit_codex_home() {
+        let config = config_for_bind("127.0.0.1:8787", Some("token"));
+
+        let error = format!("{:?}", config.validate_startup().unwrap_err());
+
+        assert!(error.contains("GATEWAY_CODEX_HOME is required"));
+    }
+
+    #[test]
+    fn loopback_bind_accepts_absolute_explicit_codex_home() {
         let codex_home = tempfile::tempdir().unwrap();
-        let mut config = config_for_bind("0.0.0.0:8787", Some("token"));
+        let mut config = config_for_bind("127.0.0.1:8787", Some("token"));
         config.codex_home = Some(codex_home.path().to_string_lossy().into_owned());
 
         assert!(config.validate_startup().is_ok());
@@ -290,8 +300,8 @@ mod tests {
     }
 
     #[test]
-    fn public_bind_rejects_relative_explicit_codex_home() {
-        let mut config = config_for_bind("0.0.0.0:8787", Some("token"));
+    fn every_bind_rejects_relative_explicit_codex_home() {
+        let mut config = config_for_bind("127.0.0.1:8787", Some("token"));
         config.codex_home = Some("relative/codex-home".to_string());
 
         assert!(config.validate_startup().is_err());
@@ -368,5 +378,38 @@ mod tests {
                 .validate_startup()
                 .is_err()
         );
+    }
+
+    #[test]
+    fn api_and_admin_tokens_must_be_distinct() {
+        let codex_home = tempfile::tempdir().unwrap();
+        let mut config = config_for_bind("127.0.0.1:8787", Some("shared-token"));
+        config.admin_token = Some("shared-token".to_string());
+        config.codex_home = Some(codex_home.path().to_string_lossy().into_owned());
+
+        let error = format!("{:?}", config.validate_startup().unwrap_err());
+
+        assert!(error.contains("GATEWAY_API_TOKEN and GATEWAY_ADMIN_TOKEN must be different"));
+    }
+
+    #[test]
+    fn non_loopback_bind_requires_tls_reverse_proxy() {
+        let codex_home = tempfile::tempdir().unwrap();
+        let mut config = config_for_bind("0.0.0.0:8787", Some("api-token"));
+        config.codex_home = Some(codex_home.path().to_string_lossy().into_owned());
+
+        let error = format!("{:?}", config.validate_startup().unwrap_err());
+
+        assert!(error.contains("loopback"));
+        assert!(error.contains("TLS reverse proxy"));
+    }
+
+    #[test]
+    fn loopback_allows_admin_only_bootstrap_with_safe_codex_home() {
+        let codex_home = tempfile::tempdir().unwrap();
+        let mut config = config_for_bind_with_admin("127.0.0.1:8787", Some("admin-token"));
+        config.codex_home = Some(codex_home.path().to_string_lossy().into_owned());
+
+        assert!(config.validate_startup().is_ok());
     }
 }

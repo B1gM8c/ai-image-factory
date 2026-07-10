@@ -661,6 +661,27 @@ async fn bearer_token_is_required() {
 }
 
 #[tokio::test]
+async fn manually_constructed_config_without_tokens_does_not_allow_images() {
+    let mut cfg = config();
+    cfg.auth_token = None;
+    cfg.admin_token = None;
+    let app = build_router(cfg, Arc::new(FakeGenerator::default()), usage_store());
+
+    let (status, _headers, body) = send_json(
+        app,
+        None,
+        json!({
+            "model": "gpt-image-2",
+            "prompt": "must not use the legacy default tenant"
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(body["error"]["code"], "invalid_api_key");
+}
+
+#[tokio::test]
 async fn admin_token_alone_does_not_authorize_image_requests() {
     let mut cfg = config();
     cfg.auth_token = None;
