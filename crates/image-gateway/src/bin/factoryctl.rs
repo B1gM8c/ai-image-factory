@@ -2,7 +2,10 @@ use std::env;
 
 use gpt_image_2_gateway::{
     ImageGatewayError,
-    database::{DEFAULT_MAX_CONNECTIONS, connect_pool, run_migrations},
+    database::{
+        DEFAULT_MAX_CONNECTIONS, connect_pool_with_schema, database_schema_from_env,
+        database_url_from_env, run_migrations,
+    },
 };
 
 #[derive(Debug, PartialEq, Eq)]
@@ -47,15 +50,11 @@ async fn main() -> Result<(), ImageGatewayError> {
     let command = parse_command(env::args().skip(1)).map_err(ImageGatewayError::config)?;
     match command {
         Command::Migrate => {
-            let database_url = env::var("DATABASE_URL")
-                .ok()
-                .filter(|url| !url.trim().is_empty())
-                .or_else(|| env::var("GATEWAY_DATABASE_URL").ok())
-                .filter(|url| !url.trim().is_empty())
-                .ok_or_else(|| {
-                    ImageGatewayError::config("DATABASE_URL or GATEWAY_DATABASE_URL is required")
-                })?;
-            let pool = connect_pool(&database_url, DEFAULT_MAX_CONNECTIONS).await?;
+            let database_url = database_url_from_env()?;
+            let database_schema = database_schema_from_env()?;
+            let pool =
+                connect_pool_with_schema(&database_url, DEFAULT_MAX_CONNECTIONS, &database_schema)
+                    .await?;
             run_migrations(&pool).await?;
             println!("database migrations complete");
         }

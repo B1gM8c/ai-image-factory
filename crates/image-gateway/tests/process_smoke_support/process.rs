@@ -115,7 +115,8 @@ impl GatewayProcess {
         command
             .env_clear()
             .env("PATH", path)
-            .env("DATABASE_URL", database.scoped_database_url())
+            .env("DATABASE_URL", database.database_url())
+            .env("GATEWAY_DATABASE_SCHEMA", database.schema())
             .env("GATEWAY_BIND", address.to_string())
             .env("GATEWAY_API_TOKEN", API_TOKEN)
             .env("GATEWAY_ADMIN_TOKEN", ADMIN_TOKEN)
@@ -342,6 +343,7 @@ set -eu
 [ -z "${{DATABASE_URL+x}}" ] || exit 24
 [ -z "${{GATEWAY_DATABASE_URL+x}}" ] || exit 25
 [ -z "${{TEST_DATABASE_URL+x}}" ] || exit 26
+[ -z "${{GATEWAY_DATABASE_SCHEMA+x}}" ] || exit 29
 printf '%s\n' "$$" > {fake_pid_log}
 printf '%s\n' "$$" > {fake_active_pid}
 trap 'rm -f {fake_active_pid}' EXIT

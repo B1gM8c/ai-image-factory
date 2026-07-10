@@ -356,10 +356,9 @@ impl PostgresUsageStore {
 #[async_trait]
 impl UsageStore for PostgresUsageStore {
     async fn reserve(&self, charge: UsageCharge) -> Result<UsageReservation, ImageGatewayError> {
-        let now = now_ms();
         let reservation_id = Uuid::new_v4();
         let job_id = Uuid::new_v4();
-        let mut tx = begin_quota_transition(&self.pool, &charge.tenant_id).await?;
+        let (mut tx, now) = begin_quota_transition(&self.pool, &charge.tenant_id).await?;
 
         sqlx::query(
             r#"
@@ -486,8 +485,8 @@ impl UsageStore for PostgresUsageStore {
         &self,
         reservation: &UsageReservation,
     ) -> Result<UsageSnapshot, ImageGatewayError> {
-        let now = now_ms();
-        let mut tx = begin_quota_transition(&self.pool, &reservation.charge.tenant_id).await?;
+        let (mut tx, now) =
+            begin_quota_transition(&self.pool, &reservation.charge.tenant_id).await?;
 
         let locked = lock_quota_reservation(&mut tx, reservation).await?;
         if locked.state == ReservationState::Committed.as_str() {
@@ -594,8 +593,8 @@ impl UsageStore for PostgresUsageStore {
         reservation: &UsageReservation,
         reason: &'static str,
     ) -> Result<(), ImageGatewayError> {
-        let now = now_ms();
-        let mut tx = begin_quota_transition(&self.pool, &reservation.charge.tenant_id).await?;
+        let (mut tx, now) =
+            begin_quota_transition(&self.pool, &reservation.charge.tenant_id).await?;
 
         let locked = lock_quota_reservation(&mut tx, reservation).await?;
         if locked.state != ReservationState::Reserved.as_str() {
@@ -682,7 +681,7 @@ impl UsageStore for PostgresUsageStore {
 async fn begin_quota_transition<'a>(
     pool: &'a PgPool,
     tenant_id: &str,
-) -> Result<Transaction<'a, Postgres>, ImageGatewayError> {
+) -> Result<(Transaction<'a, Postgres>, i64), ImageGatewayError> {
     let mut tx = pool
         .begin()
         .await
@@ -692,7 +691,12 @@ async fn begin_quota_transition<'a>(
         .execute(&mut *tx)
         .await
         .map_err(|_| ImageGatewayError::service_unavailable("quota lock unavailable"))?;
-    Ok(tx)
+    let now =
+        sqlx::query_scalar("SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT")
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|_| ImageGatewayError::service_unavailable("quota state unavailable"))?;
+    Ok((tx, now))
 }
 
 #[derive(sqlx::FromRow)]

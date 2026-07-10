@@ -3,7 +3,9 @@ use std::{env, time::Duration};
 use gpt_image_2_gateway::{
     ApiKeyStore, ImageGatewayError, PostgresApiKeyStore, PostgresUsageStore, UsageCharge,
     UsageLimits, UsageStore,
-    database::{connect_pool_with_search_path, run_migrations, verify_migrations},
+    database::{
+        connect_pool, connect_test_pool_with_search_path, run_migrations, verify_migrations,
+    },
 };
 use sqlx::{AssertSqlSafe, PgPool};
 use tokio::time::timeout;
@@ -81,6 +83,40 @@ async fn both_stores_share_one_connection_pool() -> TestResult {
     let cleanup = test_schema.cleanup().await;
     cleanup?;
     result
+}
+
+#[tokio::test]
+async fn default_pool_pins_public_despite_url_search_path_options() -> TestResult {
+    let Some(test_schema) = TestSchema::new(1).await? else {
+        return Ok(());
+    };
+
+    let result = default_pool_case(&test_schema).await;
+    let cleanup = test_schema.cleanup().await;
+    cleanup?;
+    result
+}
+
+async fn default_pool_case(test_schema: &TestSchema) -> TestResult {
+    let database_url = env::var("TEST_DATABASE_URL")
+        .map_err(|_| "TEST_DATABASE_URL disappeared during test".to_string())?;
+    let separator = if database_url.contains('?') { '&' } else { '?' };
+    let injected_url = format!(
+        "{database_url}{separator}options=-csearch_path%3D{}",
+        test_schema.name
+    );
+    let pool = connect_pool(&injected_url, 1)
+        .await
+        .map_err(|error| format!("default pool should connect: {error:?}"))?;
+    let current_schema: String = sqlx::query_scalar("SELECT current_schema()")
+        .fetch_one(&pool)
+        .await
+        .map_err(|error| format!("failed to read default pool schema: {error}"))?;
+    pool.close().await;
+    require(
+        current_schema == "public",
+        &format!("default pool resolved to {current_schema:?}, expected public"),
+    )
 }
 
 async fn legacy_schema_case(pool: &PgPool) -> TestResult {
@@ -238,9 +274,17 @@ async fn verification_case(pool: &PgPool) -> TestResult {
     .execute(pool)
     .await
     .map_err(|error| format!("failed to create extra migration state: {error}"))?;
-    require(
-        verify_migrations(pool).await.is_err(),
-        "verification must reject an extra migration",
+    gateway_result(
+        verify_migrations(pool).await,
+        "verification must tolerate a newer applied migration",
+    )?;
+    sqlx::query("UPDATE _sqlx_migrations SET success = false WHERE version = 999")
+        .execute(pool)
+        .await
+        .map_err(|error| format!("failed to alter newer migration state: {error}"))?;
+    gateway_result(
+        verify_migrations(pool).await,
+        "verification must only enforce embedded migration metadata",
     )?;
     sqlx::query("DELETE FROM _sqlx_migrations WHERE version = 999")
         .execute(pool)
@@ -377,12 +421,18 @@ struct TestSchema {
 
 impl TestSchema {
     async fn new(max_connections: u32) -> TestResult<Option<Self>> {
-        let Ok(database_url) = env::var("TEST_DATABASE_URL") else {
+        let Some(database_url) = env::var("TEST_DATABASE_URL")
+            .ok()
+            .filter(|url| !url.trim().is_empty())
+        else {
+            if env::var_os("CI").is_some() {
+                return Err("TEST_DATABASE_URL must be set when CI is present".to_string());
+            }
             eprintln!("skipping PostgreSQL migration test: TEST_DATABASE_URL is not set");
             return Ok(None);
         };
         let name = format!("image_gateway_test_{}", Uuid::new_v4().simple());
-        let pool = connect_pool_with_search_path(&database_url, max_connections, &name)
+        let pool = connect_test_pool_with_search_path(&database_url, max_connections, &name)
             .await
             .map_err(|error| format!("test database should be reachable: {error:?}"))?;
         let database_name: String = sqlx::query_scalar("SELECT current_database()")
@@ -400,15 +450,30 @@ impl TestSchema {
             .execute(&pool)
             .await
             .map_err(|error| format!("failed to create isolated schema {name}: {error}"))?;
-        let current_schema: String = sqlx::query_scalar("SELECT current_schema()")
-            .fetch_one(&pool)
-            .await
-            .map_err(|error| format!("failed to inspect current schema: {error}"))?;
-        if current_schema != name {
+        let setup = async {
+            let current_schema: String = sqlx::query_scalar("SELECT current_schema()")
+                .fetch_one(&pool)
+                .await
+                .map_err(|error| format!("failed to inspect current schema: {error}"))?;
+            require(
+                current_schema == name,
+                &format!(
+                    "test connection search_path resolved to {current_schema:?}, expected {name:?}"
+                ),
+            )
+        }
+        .await;
+        if let Err(error) = setup {
+            let cleanup = sqlx::query(AssertSqlSafe(format!("DROP SCHEMA \"{name}\" CASCADE")))
+                .execute(&pool)
+                .await;
             pool.close().await;
-            return Err(format!(
-                "test connection search_path resolved to {current_schema:?}, expected {name:?}"
-            ));
+            return match cleanup {
+                Ok(_) => Err(error),
+                Err(cleanup_error) => Err(format!(
+                    "{error}; additionally failed to clean isolated schema {name}: {cleanup_error}"
+                )),
+            };
         }
         Ok(Some(Self { name, pool }))
     }

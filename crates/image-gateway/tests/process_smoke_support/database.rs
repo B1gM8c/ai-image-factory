@@ -1,6 +1,6 @@
 use std::{env, time::Duration};
 
-use gpt_image_2_gateway::database::{connect_pool_with_search_path, run_migrations};
+use gpt_image_2_gateway::database::{connect_test_pool_with_search_path, run_migrations};
 use sqlx::{AssertSqlSafe, PgPool};
 use tokio::time::timeout;
 use uuid::Uuid;
@@ -17,7 +17,10 @@ pub(crate) struct TestDatabase {
 
 impl TestDatabase {
     pub(crate) async fn new() -> TestResult<Option<Self>> {
-        let Ok(database_url) = env::var(DATABASE_ENV) else {
+        let Some(database_url) = env::var(DATABASE_ENV)
+            .ok()
+            .filter(|url| !url.trim().is_empty())
+        else {
             if env::var_os("CI").is_some() {
                 return Err(format!("{DATABASE_ENV} must be set when CI is present"));
             }
@@ -25,7 +28,7 @@ impl TestDatabase {
             return Ok(None);
         };
         let schema = format!("image_gateway_process_smoke_{}", Uuid::new_v4().simple());
-        let pool = connect_pool_with_search_path(&database_url, 4, &schema)
+        let pool = connect_test_pool_with_search_path(&database_url, 4, &schema)
             .await
             .map_err(|error| format!("test database should be reachable: {error:?}"))?;
         let database_name: String = sqlx::query_scalar("SELECT current_database()")
@@ -72,16 +75,12 @@ impl TestDatabase {
         }))
     }
 
-    pub(crate) fn scoped_database_url(&self) -> String {
-        let separator = if self.database_url.contains('?') {
-            '&'
-        } else {
-            '?'
-        };
-        format!(
-            "{}{separator}options=-csearch_path%3D{}",
-            self.database_url, self.schema
-        )
+    pub(crate) fn database_url(&self) -> &str {
+        &self.database_url
+    }
+
+    pub(crate) fn schema(&self) -> &str {
+        &self.schema
     }
 
     pub(crate) async fn assert_transitions(&self, request_id: &str) -> TestResult {

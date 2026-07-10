@@ -65,6 +65,171 @@ async fn release_rejects_forged_request_units_and_operation_without_mutation() -
     result
 }
 
+#[tokio::test]
+async fn reserve_uses_postgres_time_after_waiting_for_the_tenant_lock() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+
+    let result = reserve_timestamp_case(&database).await;
+    let cleanup = database.cleanup().await;
+    cleanup?;
+    result
+}
+
+#[tokio::test]
+async fn commit_uses_postgres_time_after_waiting_for_the_tenant_lock() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+
+    let result = transition_timestamp_case(&database, TimestampTransition::Commit).await;
+    let cleanup = database.cleanup().await;
+    cleanup?;
+    result
+}
+
+#[tokio::test]
+async fn release_uses_postgres_time_after_waiting_for_the_tenant_lock() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+
+    let result = transition_timestamp_case(&database, TimestampTransition::Release).await;
+    let cleanup = database.cleanup().await;
+    cleanup?;
+    result
+}
+
+#[derive(Clone, Copy)]
+enum TimestampTransition {
+    Commit,
+    Release,
+}
+
+async fn reserve_timestamp_case(database: &TestDatabase) -> TestResult {
+    let tenant_id = format!("tenant_timestamp_{}", Uuid::new_v4().simple());
+    let guard_pool = database.pool("quota_guard_timestamp").await?;
+    let mut guard = guard_pool
+        .begin()
+        .await
+        .map_err(|error| format!("failed to begin timestamp guard transaction: {error}"))?;
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(quota_lock_id(&tenant_id))
+        .execute(&mut *guard)
+        .await
+        .map_err(|error| format!("failed to acquire timestamp guard lock: {error}"))?;
+
+    let application = database.application_name("quota_timestamp");
+    let store = PostgresUsageStore::new(database.pool_with_application_name(&application).await?);
+    let monitor = database.pool("quota_monitor_timestamp").await?;
+    let reserve_tenant = tenant_id.clone();
+    let reserve = tokio::spawn(async move {
+        store
+            .reserve(test_charge(&reserve_tenant, "request_timestamp"))
+            .await
+    });
+
+    if let Err(error) = wait_for_advisory_lock(&monitor, &application).await {
+        guard.rollback().await.ok();
+        abort_and_await(reserve).await;
+        return Err(error);
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let lower_bound_ms = postgres_now_ms(&monitor).await?;
+    guard
+        .commit()
+        .await
+        .map_err(|error| format!("failed to release timestamp guard lock: {error}"))?;
+    let reservation = join_gateway(reserve, "timestamped reserve").await?;
+
+    let created_at_ms: i64 = sqlx::query_scalar(
+        "SELECT created_at_ms FROM quota_reservations WHERE reservation_id = $1",
+    )
+    .bind(reservation.reservation_id)
+    .fetch_one(&monitor)
+    .await
+    .map_err(|error| format!("failed to read reservation timestamp: {error}"))?;
+    require(
+        created_at_ms >= lower_bound_ms,
+        format!(
+            "reservation timestamp {created_at_ms} predates PostgreSQL lock-wait lower bound {lower_bound_ms}"
+        ),
+    )
+}
+
+async fn transition_timestamp_case(
+    database: &TestDatabase,
+    transition: TimestampTransition,
+) -> TestResult {
+    let role = match transition {
+        TimestampTransition::Commit => "commit_timestamp",
+        TimestampTransition::Release => "release_timestamp",
+    };
+    let tenant_id = format!("tenant_{role}_{}", Uuid::new_v4().simple());
+    let initial_store = PostgresUsageStore::new(database.pool("quota_timestamp_initial").await?);
+    let reservation = initial_store
+        .reserve(test_charge(&tenant_id, "request_timestamp_transition"))
+        .await
+        .map_err(|error| format!("initial timestamp reserve should succeed: {error:?}"))?;
+    let reservation_id = reservation.reservation_id;
+
+    let guard_pool = database.pool("quota_guard_transition_timestamp").await?;
+    let mut guard = guard_pool
+        .begin()
+        .await
+        .map_err(|error| format!("failed to begin timestamp guard transaction: {error}"))?;
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(quota_lock_id(&tenant_id))
+        .execute(&mut *guard)
+        .await
+        .map_err(|error| format!("failed to acquire timestamp guard lock: {error}"))?;
+
+    let application = database.application_name(role);
+    let store = PostgresUsageStore::new(database.pool_with_application_name(&application).await?);
+    let monitor = database.pool("quota_monitor_transition_timestamp").await?;
+    let operation = tokio::spawn(async move {
+        match transition {
+            TimestampTransition::Commit => store.commit(&reservation).await.map(|_| ()),
+            TimestampTransition::Release => store.release(&reservation, "provider_failed").await,
+        }
+    });
+
+    if let Err(error) = wait_for_advisory_lock(&monitor, &application).await {
+        guard.rollback().await.ok();
+        abort_and_await(operation).await;
+        return Err(error);
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let lower_bound_ms = postgres_now_ms(&monitor).await?;
+    guard
+        .commit()
+        .await
+        .map_err(|error| format!("failed to release timestamp guard lock: {error}"))?;
+    join_gateway(operation, role).await?;
+
+    let updated_at_ms: i64 = sqlx::query_scalar(
+        "SELECT updated_at_ms FROM quota_reservations WHERE reservation_id = $1",
+    )
+    .bind(reservation_id)
+    .fetch_one(&monitor)
+    .await
+    .map_err(|error| format!("failed to read transition timestamp: {error}"))?;
+    require(
+        updated_at_ms >= lower_bound_ms,
+        format!(
+            "{role} timestamp {updated_at_ms} predates PostgreSQL lock-wait lower bound {lower_bound_ms}"
+        ),
+    )
+}
+
+async fn postgres_now_ms(pool: &PgPool) -> TestResult<i64> {
+    sqlx::query_scalar("SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT")
+        .fetch_one(pool)
+        .await
+        .map_err(|error| format!("failed to read PostgreSQL clock: {error}"))
+}
+
 async fn commit_linearization_case(database: &TestDatabase) -> TestResult {
     let tenant_id = format!("tenant_commit_{}", Uuid::new_v4().simple());
     let initial_store = PostgresUsageStore::new(database.pool("quota_initial").await?);

@@ -3,7 +3,10 @@ use std::sync::Arc;
 use gpt_image_2_gateway::{
     AppConfig, CodexImageGenerator, ImageGatewayError, PostgresApiKeyStore, PostgresUsageStore,
     build_router_with_api_key_store,
-    database::{DEFAULT_MAX_CONNECTIONS, connect_pool, verify_migrations},
+    database::{
+        DEFAULT_MAX_CONNECTIONS, connect_pool_with_schema, database_schema_from_env,
+        database_url_from_env, verify_migrations,
+    },
     init_telemetry,
 };
 
@@ -13,10 +16,10 @@ async fn main() -> Result<(), ImageGatewayError> {
     config.validate_startup()?;
     let telemetry = init_telemetry()?;
 
-    let database_url = config.database_url.as_deref().ok_or_else(|| {
-        ImageGatewayError::config("DATABASE_URL or GATEWAY_DATABASE_URL is required")
-    })?;
-    let pool = connect_pool(database_url, DEFAULT_MAX_CONNECTIONS).await?;
+    let database_url = database_url_from_env()?;
+    let database_schema = database_schema_from_env()?;
+    let pool =
+        connect_pool_with_schema(&database_url, DEFAULT_MAX_CONNECTIONS, &database_schema).await?;
     verify_migrations(&pool).await?;
     let usage_store = Arc::new(PostgresUsageStore::new(pool.clone()));
     let api_key_store = Arc::new(PostgresApiKeyStore::new(pool));
