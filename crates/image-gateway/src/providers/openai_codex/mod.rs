@@ -48,13 +48,6 @@ impl CodexProcessGroupGuard {
         }
     }
 
-    fn disarm(&mut self) {
-        #[cfg(unix)]
-        {
-            self.pid = None;
-        }
-    }
-
     fn kill(&mut self) {
         #[cfg(unix)]
         {
@@ -254,7 +247,7 @@ async fn run_codex_once(
     let image_path = select_image_output(&request_dir, &job.output_format)
         .ok_or_else(ImageGatewayError::codex_no_image_output)?;
     let bytes = tokio::fs::read(&image_path).await?;
-    process_group_guard.disarm();
+    process_group_guard.kill();
 
     if !config.cleanup_codex_outputs {
         let _ = request_temp_dir.keep();
@@ -319,7 +312,22 @@ fn collect_image_file_set(root: &Path) -> HashSet<PathBuf> {
 }
 
 fn codex_generated_images_root(config: &AppConfig) -> Option<PathBuf> {
-    resolved_codex_home(config).map(|codex_home| codex_home.join("generated_images"))
+    let codex_home = resolved_codex_home(config)?;
+    let home_metadata = std::fs::symlink_metadata(&codex_home).ok()?;
+    if home_metadata.file_type().is_symlink() || !home_metadata.is_dir() {
+        return None;
+    }
+    let canonical_home = codex_home.canonicalize().ok()?;
+    let root = codex_home.join("generated_images");
+    let Ok(root_metadata) = std::fs::symlink_metadata(&root) else {
+        return Some(root);
+    };
+    if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+        return None;
+    }
+    root.canonicalize()
+        .ok()
+        .filter(|canonical_root| canonical_root.starts_with(canonical_home))
 }
 
 fn resolved_codex_home(config: &AppConfig) -> Option<PathBuf> {
@@ -440,6 +448,12 @@ fn apply_proxy_env(command: &mut Command, proxy: &ProxyConfig) {
 }
 
 fn collect_image_files(root: &Path) -> Vec<PathBuf> {
+    let Ok(root_metadata) = std::fs::symlink_metadata(root) else {
+        return Vec::new();
+    };
+    if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+        return Vec::new();
+    }
     let root_canonical = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     let mut entries_seen = 0usize;
     let mut paths: Vec<_> = collect_paths(root, &root_canonical, 0, &mut entries_seen)
@@ -693,6 +707,34 @@ mod tests {
         let images = collect_image_files(root.path());
 
         assert!(images.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generated_images_symlink_is_not_a_cleanup_root() {
+        let codex_home = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), codex_home.path().join("generated_images"))
+            .unwrap();
+        let mut config = test_config();
+        config.codex_home = Some(codex_home.path().to_string_lossy().into_owned());
+
+        assert!(codex_generated_images_root(&config).is_none());
+        assert!(collect_image_files(&codex_home.path().join("generated_images")).is_empty());
+    }
+
+    #[test]
+    fn generated_images_directory_stays_within_canonical_codex_home() {
+        let codex_home = tempfile::tempdir().unwrap();
+        let generated_images = codex_home.path().join("generated_images");
+        std::fs::create_dir(&generated_images).unwrap();
+        let mut config = test_config();
+        config.codex_home = Some(codex_home.path().to_string_lossy().into_owned());
+
+        assert_eq!(
+            codex_generated_images_root(&config),
+            Some(generated_images.canonicalize().unwrap())
+        );
     }
 
     #[test]
