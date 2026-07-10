@@ -4,6 +4,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use image_scheduler_policy::{SchedulerConfig, ScopeWeight, effective_finish_tag, next_finish_tag};
 use serde_json::Value;
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -25,6 +26,7 @@ struct MemoryState {
     work_items: HashMap<Uuid, WorkItem>,
     work_by_job: HashMap<Uuid, Uuid>,
     work_order: Vec<Uuid>,
+    scope_next_finish: HashMap<String, u64>,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -69,6 +71,9 @@ struct WorkItem {
     execution_id: Option<Uuid>,
     command_schema: String,
     command_json: Value,
+    schedule_priority: u8,
+    schedule_finish_tag: u64,
+    enqueued_at_ms: u64,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -195,6 +200,7 @@ impl AdmissionStore for InMemoryAdmissionStore {
         if state.work_by_job.contains_key(&request.job_id) {
             return Err(AdmissionError::Unavailable);
         }
+        let (schedule_finish_tag, _) = schedule_slot(&mut state, &request)?;
 
         let work_item_id = Uuid::new_v4();
         state.work_items.insert(
@@ -209,6 +215,9 @@ impl AdmissionStore for InMemoryAdmissionStore {
                 execution_id: None,
                 command_schema: request.command_schema,
                 command_json: request.command_json,
+                schedule_priority: request.schedule_priority,
+                schedule_finish_tag,
+                enqueued_at_ms: now as u64,
             },
         );
         state.work_by_job.insert(request.job_id, work_item_id);
@@ -384,11 +393,35 @@ impl InMemoryAdmissionStore {
     ) -> Result<Option<WorkLease>, AdmissionError> {
         let now = now_ms();
         let mut state = self.state.lock().await;
-        let work_item_id = state.work_order.iter().copied().find(|work_item_id| {
-            state.work_items.get(work_item_id).is_some_and(|work| {
-                work.state == WorkState::Ready && job_id.is_none_or(|job_id| work.job_id == job_id)
+        let work_item_id = state
+            .work_order
+            .iter()
+            .copied()
+            .filter(|work_item_id| {
+                state.work_items.get(work_item_id).is_some_and(|work| {
+                    work.state == WorkState::Ready
+                        && job_id.is_none_or(|job_id| work.job_id == job_id)
+                })
             })
-        });
+            .min_by_key(|work_item_id| {
+                let work = state
+                    .work_items
+                    .get(work_item_id)
+                    .expect("filtered work item must exist");
+                (
+                    effective_finish_tag(
+                        work.schedule_finish_tag,
+                        work.enqueued_at_ms,
+                        image_scheduler_policy::Priority::new(work.schedule_priority)
+                            .expect("validated schedule priority"),
+                        now as u64,
+                        SchedulerConfig::default(),
+                    ),
+                    u8::MAX - work.schedule_priority,
+                    work.enqueued_at_ms,
+                    work_item_id.as_u128(),
+                )
+            });
         let Some(work_item_id) = work_item_id else {
             return Ok(None);
         };
@@ -433,6 +466,35 @@ fn validate_lease(
     } else {
         Err(AdmissionError::StaleLease)
     }
+}
+
+fn schedule_slot(
+    state: &mut MemoryState,
+    request: &AttachJob,
+) -> Result<(u64, u32), AdmissionError> {
+    let weight = ScopeWeight::new(request.schedule_weight)
+        .ok_or(AdmissionError::InvalidCommand)?
+        .value();
+    if request.schedule_scope.is_empty()
+        || request.schedule_priority > 3
+        || request.schedule_cost == 0
+    {
+        return Err(AdmissionError::InvalidCommand);
+    }
+    let previous = state
+        .scope_next_finish
+        .get(&request.schedule_scope)
+        .copied()
+        .unwrap_or_default();
+    let finish = next_finish_tag(
+        previous,
+        request.schedule_cost,
+        ScopeWeight::new(weight).expect("validated schedule weight"),
+    );
+    state
+        .scope_next_finish
+        .insert(request.schedule_scope.clone(), finish);
+    Ok((finish, weight))
 }
 
 fn abort_session(state: &mut MemoryState, session_id: Uuid) {

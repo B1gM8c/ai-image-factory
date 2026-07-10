@@ -149,6 +149,10 @@ pub(super) async fn generations(
         command_schema: GENERATION_COMMAND_SCHEMA.to_string(),
         command_json,
         work_kind: "image_batch".to_string(),
+        schedule_scope: format!("tenant:{}", auth.tenant_id),
+        schedule_weight: 1,
+        schedule_priority: 1,
+        schedule_cost: u64::from(units),
     };
     let lease = match attach_and_start_with_retry(&state, attach).await {
         Ok(lease) => lease,

@@ -11,7 +11,7 @@ use super::{
 };
 use operations::{
     abort_receiving_session, append_event_pair, attach_and_start_work, claim_work, database_now,
-    job_belongs_to_tenant, transition_active, unavailable,
+    job_belongs_to_tenant, reserve_schedule_slot, transition_active, unavailable,
 };
 
 #[derive(Clone)]
@@ -266,18 +266,26 @@ impl AdmissionStore for PostgresAdmissionStore {
         .await
         .map_err(unavailable)?;
 
+        let schedule = reserve_schedule_slot(&mut tx, &request, now).await?;
         let work_item_id = Uuid::new_v4();
         sqlx::query(
             r#"
             INSERT INTO work_items
-              (work_item_id, job_id, kind, state, available_at_ms, created_at_ms, updated_at_ms)
-            VALUES ($1, $2, $3, 'ready', $4, $4, $4)
+              (work_item_id, job_id, kind, state, available_at_ms,
+               schedule_scope, schedule_weight, schedule_priority, schedule_cost,
+               schedule_finish_tag, created_at_ms, updated_at_ms)
+            VALUES ($1, $2, $3, 'ready', $4, $5, $6, $7, $8, $9, $4, $4)
             "#,
         )
         .bind(work_item_id)
         .bind(request.job_id)
         .bind(&request.work_kind)
         .bind(now)
+        .bind(&schedule.scope)
+        .bind(schedule.weight)
+        .bind(schedule.priority)
+        .bind(schedule.cost)
+        .bind(schedule.finish_tag)
         .execute(&mut *tx)
         .await
         .map_err(unavailable)?;

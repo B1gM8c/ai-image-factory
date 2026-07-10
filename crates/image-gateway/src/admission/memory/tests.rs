@@ -53,6 +53,10 @@ async fn attach(store: &InMemoryAdmissionStore, ticket: AdmissionTicket, job_id:
             command_schema: "image.generate.v1".to_string(),
             command_json: json!({"prompt": "draw a lighthouse"}),
             work_kind: "image.generate".to_string(),
+            schedule_scope: "tenant-a".to_string(),
+            schedule_weight: 1,
+            schedule_priority: 1,
+            schedule_cost: 1,
         })
         .await
         .expect("attach must succeed");
@@ -141,6 +145,10 @@ async fn attach_requires_the_owner_and_an_object_command() {
                 command_schema: "image.generate.v1".to_string(),
                 command_json: json!({"prompt": "forged"}),
                 work_kind: "image.generate".to_string(),
+                schedule_scope: "tenant-a".to_string(),
+                schedule_weight: 1,
+                schedule_priority: 1,
+                schedule_cost: 1,
             })
             .await,
         Err(AdmissionError::InvalidOwner)
@@ -153,6 +161,10 @@ async fn attach_requires_the_owner_and_an_object_command() {
                 command_schema: "image.generate.v1".to_string(),
                 command_json: json!(["not", "an", "object"]),
                 work_kind: "image.generate".to_string(),
+                schedule_scope: "tenant-a".to_string(),
+                schedule_weight: 1,
+                schedule_priority: 1,
+                schedule_cost: 1,
             })
             .await,
         Err(AdmissionError::InvalidCommand)
@@ -298,6 +310,10 @@ async fn expired_deadlines_are_rejected_and_receiving_sessions_are_aborted() {
                 command_schema: "image.generate.v1".to_string(),
                 command_json: json!({"prompt": "too late"}),
                 work_kind: "image.generate".to_string(),
+                schedule_scope: "tenant-a".to_string(),
+                schedule_weight: 1,
+                schedule_priority: 1,
+                schedule_cost: 1,
             })
             .await,
         Err(AdmissionError::Expired)

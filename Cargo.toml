@@ -2,6 +2,7 @@
 members = [
     "crates/image-gateway",
     "crates/provider-contracts",
+    "crates/scheduler-policy",
 ]
 resolver = "3"
 

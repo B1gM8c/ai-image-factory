@@ -47,6 +47,10 @@ pub struct AttachJob {
     pub command_schema: String,
     pub command_json: Value,
     pub work_kind: String,
+    pub schedule_scope: String,
+    pub schedule_weight: u32,
+    pub schedule_priority: u8,
+    pub schedule_cost: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

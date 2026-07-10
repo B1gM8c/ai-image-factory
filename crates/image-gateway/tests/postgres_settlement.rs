@@ -235,6 +235,10 @@ fn attach_request(ticket: AdmissionTicket, job_id: Uuid) -> AttachJob {
         command_schema: "openai.images.generation.v1".to_string(),
         command_json: json!({"prompt": "atomic settlement"}),
         work_kind: "image_batch".to_string(),
+        schedule_scope: "tenant-settlement".to_string(),
+        schedule_weight: 1,
+        schedule_priority: 1,
+        schedule_cost: 1,
     }
 }
 

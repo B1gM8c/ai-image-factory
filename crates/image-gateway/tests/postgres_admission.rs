@@ -27,6 +27,7 @@ async fn migration_creates_durable_admission_tables() -> TestResult {
             "job_attempts",
             "job_events",
             "outbox_events",
+            "scheduler_scopes",
         ] {
             let exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
                 .bind(table)
@@ -268,6 +269,81 @@ async fn claim_job_leases_only_the_requested_ready_work() -> TestResult {
 }
 
 #[tokio::test]
+async fn durable_claim_uses_weighted_finish_tags_and_waiting_aging() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let store = PostgresAdmissionStore::new(database.pool.clone());
+        for index in 0..4 {
+            for (tenant, weight) in [("tenant-a", 1_u32), ("tenant-b", 2_u32)] {
+                let ticket = match store
+                    .claim(claim_request_for_tenant(
+                        tenant,
+                        None,
+                        &format!("hash-{tenant}-{index}"),
+                    ))
+                    .await
+                    .map_err(|error| format!("weighted claim failed: {error}"))?
+                {
+                    AdmissionClaim::Owner(ticket) => ticket,
+                    other => return Err(format!("expected weighted owner, got {other:?}")),
+                };
+                let job_id = insert_job(&database.pool, tenant).await?;
+                store
+                    .attach(attach_request_with_schedule(
+                        ticket,
+                        job_id,
+                        tenant,
+                        weight,
+                        1,
+                    ))
+                    .await
+                    .map_err(|error| format!("weighted attach failed: {error}"))?;
+            }
+        }
+
+        let mut first_four = Vec::new();
+        for _ in 0..4 {
+            let lease = store
+                .claim_ready("fair-worker", 30_000)
+                .await
+                .map_err(|error| format!("weighted ready claim failed: {error}"))?
+                .ok_or_else(|| "weighted queue unexpectedly empty".to_string())?;
+            let tenant: String = sqlx::query_scalar(
+                "SELECT tenant_id FROM jobs WHERE job_id = $1",
+            )
+            .bind(lease.job_id)
+            .fetch_one(&database.pool)
+            .await
+            .map_err(|error| format!("failed to inspect weighted job: {error}"))?;
+            first_four.push(tenant);
+        }
+        require(
+            first_four.iter().filter(|tenant| *tenant == "tenant-b").count() >= 3,
+            format!("weighted scope was not favored: {first_four:?}"),
+        )?;
+
+        let tags: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT schedule_scope, schedule_finish_tag FROM work_items ORDER BY schedule_scope, schedule_finish_tag",
+        )
+        .fetch_all(&database.pool)
+        .await
+        .map_err(|error| format!("failed to inspect durable schedule tags: {error}"))?;
+        require(
+            tags.iter()
+                .filter(|(scope, _)| scope == "tenant-b")
+                .map(|(_, tag)| *tag)
+                .collect::<Vec<_>>()
+                == vec![500_000, 1_000_000, 1_500_000, 2_000_000],
+            format!("unexpected heavy scope tags: {tags:?}"),
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
 async fn attach_and_start_is_atomic_and_idempotent_for_the_owner() -> TestResult {
     let Some(database) = TestDatabase::new().await? else {
         return Ok(());
@@ -440,25 +516,47 @@ async fn attachment_and_fencing_case(database: &TestDatabase) -> TestResult {
 }
 
 fn claim_request(key: Option<String>, request_hash: String) -> ClaimAdmission {
+    claim_request_for_tenant("tenant-a", key, &request_hash)
+}
+
+fn claim_request_for_tenant(
+    tenant_id: &str,
+    key: Option<String>,
+    request_hash: &str,
+) -> ClaimAdmission {
     ClaimAdmission {
-        tenant_id: "tenant-a".to_string(),
+        tenant_id: tenant_id.to_string(),
         project_id: "project-a".to_string(),
         api_profile: "openai-images-v1".to_string(),
         operation: "generation".to_string(),
         request_id: format!("req_{}", Uuid::new_v4().simple()),
         idempotency_key_digest: key,
-        request_hash,
+        request_hash: request_hash.to_string(),
         deadline_at_ms: i64::MAX,
     }
 }
 
 fn attach_request(ticket: AdmissionTicket, job_id: Uuid) -> AttachJob {
+    attach_request_with_schedule(ticket, job_id, "tenant-a", 1, 1)
+}
+
+fn attach_request_with_schedule(
+    ticket: AdmissionTicket,
+    job_id: Uuid,
+    schedule_scope: &str,
+    schedule_weight: u32,
+    schedule_cost: u64,
+) -> AttachJob {
     AttachJob {
         ticket,
         job_id,
         command_schema: "openai.images.generation.v1".to_string(),
         command_json: json!({"prompt": "durable"}),
         work_kind: "image_batch".to_string(),
+        schedule_scope: schedule_scope.to_string(),
+        schedule_weight,
+        schedule_priority: 1,
+        schedule_cost,
     }
 }
 

@@ -573,6 +573,7 @@ dependencies = [
  "hmac",
  "image",
  "image-provider-contracts",
+ "image-scheduler-policy",
  "libc",
  "opentelemetry",
  "opentelemetry-otlp",
@@ -869,6 +870,10 @@ dependencies = [
 
 [[package]]
 name = "image-provider-contracts"
+version = "0.1.0"
+
+[[package]]
+name = "image-scheduler-policy"
 version = "0.1.0"
 
 [[package]]

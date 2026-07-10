@@ -2,8 +2,12 @@ use serde_json::{Value, json};
 use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
+use image_scheduler_policy::{ScopeWeight, next_finish_tag};
+
 use super::{AttachedRunningWork, LockedAdmissionSession};
 use crate::admission::{AdmissionError, AttachJob, WorkLease};
+
+const MAX_SCHEDULE_PRIORITY: u8 = 3;
 
 pub(super) async fn attach_and_start_work(
     pool: &PgPool,
@@ -108,6 +112,7 @@ pub(super) async fn attach_and_start_work(
     .await
     .map_err(unavailable)?;
 
+    let schedule = reserve_schedule_slot(&mut tx, &request, now).await?;
     let work_item_id = Uuid::new_v4();
     let execution_id = Uuid::new_v4();
     let lease_epoch = 1_i64;
@@ -116,8 +121,11 @@ pub(super) async fn attach_and_start_work(
         r#"
         INSERT INTO work_items
           (work_item_id, job_id, kind, state, available_at_ms, lease_epoch,
-           lease_owner, lease_expires_at_ms, execution_id, created_at_ms, updated_at_ms)
-        VALUES ($1, $2, $3, 'running', $4, $5, $6, $7, $8, $4, $4)
+           lease_owner, lease_expires_at_ms, execution_id,
+           schedule_scope, schedule_weight, schedule_priority, schedule_cost,
+           schedule_finish_tag, created_at_ms, updated_at_ms)
+        VALUES ($1, $2, $3, 'running', $4, $5, $6, $7, $8,
+                $9, $10, $11, $12, $13, $4, $4)
         "#,
     )
     .bind(work_item_id)
@@ -128,6 +136,11 @@ pub(super) async fn attach_and_start_work(
     .bind(worker_id)
     .bind(lease_expires_at_ms)
     .bind(execution_id)
+    .bind(&schedule.scope)
+    .bind(schedule.weight)
+    .bind(schedule.priority)
+    .bind(schedule.cost)
+    .bind(schedule.finish_tag)
     .execute(&mut *tx)
     .await
     .map_err(unavailable)?;
@@ -204,7 +217,11 @@ pub(super) async fn claim_work(
         FROM work_items w JOIN job_payloads p ON p.job_id = w.job_id
         WHERE w.state = 'ready' AND w.available_at_ms <= $1
           AND ($2::UUID IS NULL OR w.job_id = $2)
-        ORDER BY w.available_at_ms, w.created_at_ms, w.work_item_id
+        ORDER BY
+          (w.schedule_finish_tag -
+             ((GREATEST($1 - w.created_at_ms, 0) / 30000) * 250000)),
+          w.schedule_priority DESC,
+          w.available_at_ms, w.created_at_ms, w.work_item_id
         FOR UPDATE OF w SKIP LOCKED LIMIT 1
         "#,
     )
@@ -419,6 +436,82 @@ pub(super) async fn database_now(
         .fetch_one(&mut **tx)
         .await
         .map_err(unavailable)
+}
+
+pub(super) struct ScheduledWork {
+    pub(super) scope: String,
+    pub(super) weight: i32,
+    pub(super) priority: i16,
+    pub(super) cost: i64,
+    pub(super) finish_tag: i64,
+}
+
+pub(super) async fn reserve_schedule_slot(
+    tx: &mut Transaction<'_, Postgres>,
+    request: &AttachJob,
+    now: i64,
+) -> Result<ScheduledWork, AdmissionError> {
+    let Some(weight) = ScopeWeight::new(request.schedule_weight) else {
+        return Err(AdmissionError::InvalidCommand);
+    };
+    if request.schedule_scope.is_empty()
+        || request.schedule_priority > MAX_SCHEDULE_PRIORITY
+        || request.schedule_cost == 0
+        || request.schedule_cost > i64::MAX as u64
+    {
+        return Err(AdmissionError::InvalidCommand);
+    }
+
+    let weight = i32::try_from(weight.value()).map_err(|_| AdmissionError::InvalidCommand)?;
+    sqlx::query(
+        r#"
+        INSERT INTO scheduler_scopes (scope_key, weight, next_finish_tag, updated_at_ms)
+        VALUES ($1, $2, 0, $3)
+        ON CONFLICT (scope_key) DO UPDATE
+        SET weight = EXCLUDED.weight, updated_at_ms = EXCLUDED.updated_at_ms
+        "#,
+    )
+    .bind(&request.schedule_scope)
+    .bind(weight)
+    .bind(now)
+    .execute(&mut **tx)
+    .await
+    .map_err(unavailable)?;
+
+    let previous_finish: i64 = sqlx::query_scalar(
+        "SELECT next_finish_tag FROM scheduler_scopes WHERE scope_key = $1 FOR UPDATE",
+    )
+    .bind(&request.schedule_scope)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(unavailable)?;
+    let previous_finish =
+        u64::try_from(previous_finish).map_err(|_| AdmissionError::Unavailable)?;
+    let finish_tag = next_finish_tag(
+        previous_finish,
+        request.schedule_cost,
+        ScopeWeight::new(u32::try_from(weight).map_err(|_| AdmissionError::InvalidCommand)?)
+            .ok_or(AdmissionError::InvalidCommand)?,
+    );
+    let finish_tag = i64::try_from(finish_tag).unwrap_or(i64::MAX);
+
+    sqlx::query(
+        "UPDATE scheduler_scopes SET next_finish_tag = $2, updated_at_ms = $3 WHERE scope_key = $1",
+    )
+    .bind(&request.schedule_scope)
+    .bind(finish_tag)
+    .bind(now)
+    .execute(&mut **tx)
+    .await
+    .map_err(unavailable)?;
+
+    Ok(ScheduledWork {
+        scope: request.schedule_scope.clone(),
+        weight,
+        priority: i16::from(request.schedule_priority),
+        cost: request.schedule_cost as i64,
+        finish_tag,
+    })
 }
 
 pub(super) fn unavailable(_: impl std::fmt::Display) -> AdmissionError {
