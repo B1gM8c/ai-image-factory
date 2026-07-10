@@ -124,7 +124,7 @@ async fn legacy_schema_case(pool: &PgPool) -> TestResult {
     .map_err(|error| format!("failed to create legacy schema: {error}"))?;
 
     require(
-        migration_table_exists(pool).await? == false,
+        !migration_table_exists(pool).await?,
         "legacy schema must start without _sqlx_migrations",
     )?;
     gateway_result(
@@ -159,7 +159,7 @@ async fn verification_case(pool: &PgPool) -> TestResult {
         "verification must reject a missing migration table",
     )?;
     require(
-        migration_table_exists(pool).await? == false,
+        !migration_table_exists(pool).await?,
         "verification must not create the migration table",
     )?;
 
