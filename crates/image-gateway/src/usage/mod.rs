@@ -6,7 +6,7 @@ use std::{
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use sqlx::PgPool;
+use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::{
@@ -359,17 +359,7 @@ impl UsageStore for PostgresUsageStore {
         let now = now_ms();
         let reservation_id = Uuid::new_v4();
         let job_id = Uuid::new_v4();
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|_| ImageGatewayError::service_unavailable("quota state unavailable"))?;
-
-        sqlx::query("SELECT pg_advisory_xact_lock($1)")
-            .bind(quota_lock_id(&charge.tenant_id))
-            .execute(&mut *tx)
-            .await
-            .map_err(|_| ImageGatewayError::service_unavailable("quota lock unavailable"))?;
+        let mut tx = begin_quota_transition(&self.pool, &charge.tenant_id).await?;
 
         sqlx::query(
             r#"
@@ -497,32 +487,16 @@ impl UsageStore for PostgresUsageStore {
         reservation: &UsageReservation,
     ) -> Result<UsageSnapshot, ImageGatewayError> {
         let now = now_ms();
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|_| ImageGatewayError::service_unavailable("quota state unavailable"))?;
+        let mut tx = begin_quota_transition(&self.pool, &reservation.charge.tenant_id).await?;
 
-        let row: Option<(String, i32)> = sqlx::query_as(
-            r#"
-            SELECT state, requested_units
-            FROM quota_reservations
-            WHERE reservation_id = $1
-            FOR UPDATE
-            "#,
-        )
-        .bind(reservation.reservation_id)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(|_| ImageGatewayError::service_unavailable("quota state unavailable"))?;
-
-        let Some((state, requested_units)) = row else {
-            return Err(ImageGatewayError::internal("reservation not found"));
-        };
-        if state == ReservationState::Committed.as_str() {
+        let locked = lock_quota_reservation(&mut tx, reservation).await?;
+        if locked.state == ReservationState::Committed.as_str() {
+            tx.commit()
+                .await
+                .map_err(|_| ImageGatewayError::service_unavailable("quota state unavailable"))?;
             return Ok(reservation.snapshot.clone());
         }
-        if state != ReservationState::Reserved.as_str() {
+        if locked.state != ReservationState::Reserved.as_str() {
             return Err(ImageGatewayError::internal("reservation is not active"));
         }
 
@@ -534,10 +508,10 @@ impl UsageStore for PostgresUsageStore {
             "#,
         )
         .bind(Uuid::new_v4())
-        .bind(&reservation.charge.tenant_id)
-        .bind(&reservation.charge.request_id)
-        .bind(reservation.charge.operation)
-        .bind(requested_units)
+        .bind(&locked.tenant_id)
+        .bind(&locked.request_id)
+        .bind(&locked.operation)
+        .bind(locked.requested_units)
         .bind(now)
         .execute(&mut *tx)
         .await
@@ -549,55 +523,61 @@ impl UsageStore for PostgresUsageStore {
             SET committed_units = requested_units,
                 state = $2,
                 updated_at_ms = $3
-            WHERE reservation_id = $1
+            WHERE reservation_id = $1 AND tenant_id = $4
             "#,
         )
-        .bind(reservation.reservation_id)
+        .bind(locked.reservation_id)
         .bind(ReservationState::Committed.as_str())
         .bind(now)
+        .bind(&locked.tenant_id)
         .execute(&mut *tx)
         .await
         .map_err(|_| ImageGatewayError::service_unavailable("quota state unavailable"))?;
 
-        sqlx::query(
+        let job_update = sqlx::query(
             r#"
             UPDATE jobs
             SET state = $2,
-                charged_units = requested_units,
+                charged_units = $6,
                 finished_at_ms = $3,
                 updated_at_ms = $3
-            WHERE job_id = $1
+            WHERE job_id = $1 AND tenant_id = $4 AND reservation_id = $5
             "#,
         )
-        .bind(reservation.job_id)
+        .bind(locked.job_id)
         .bind(JobState::Succeeded.as_str())
         .bind(now)
+        .bind(&locked.tenant_id)
+        .bind(locked.reservation_id)
+        .bind(locked.requested_units)
         .execute(&mut *tx)
         .await
         .map_err(|_| ImageGatewayError::service_unavailable("job state unavailable"))?;
 
+        require_one_job_updated(job_update)?;
+
         insert_metering_event(
             &mut tx,
-            &reservation.charge.tenant_id,
-            reservation.job_id,
-            reservation.reservation_id,
-            &reservation.charge.request_id,
-            reservation.charge.operation,
+            &locked.tenant_id,
+            locked.job_id,
+            locked.reservation_id,
+            &locked.request_id,
+            &locked.operation,
             "quota_committed",
-            reservation.charge.units,
+            locked.requested_units as u32,
             "succeeded",
             now,
         )
         .await?;
         insert_metering_event(
             &mut tx,
-            &reservation.charge.tenant_id,
-            reservation.job_id,
-            reservation.reservation_id,
-            &reservation.charge.request_id,
-            reservation.charge.operation,
+            &locked.tenant_id,
+            locked.job_id,
+            locked.reservation_id,
+            &locked.request_id,
+            &locked.operation,
             "job_succeeded",
-            reservation.charge.units,
+            locked.requested_units as u32,
             "succeeded",
             now,
         )
@@ -615,29 +595,13 @@ impl UsageStore for PostgresUsageStore {
         reason: &'static str,
     ) -> Result<(), ImageGatewayError> {
         let now = now_ms();
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|_| ImageGatewayError::service_unavailable("quota state unavailable"))?;
+        let mut tx = begin_quota_transition(&self.pool, &reservation.charge.tenant_id).await?;
 
-        let row: Option<(String, i32)> = sqlx::query_as(
-            r#"
-            SELECT state, requested_units
-            FROM quota_reservations
-            WHERE reservation_id = $1
-            FOR UPDATE
-            "#,
-        )
-        .bind(reservation.reservation_id)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(|_| ImageGatewayError::service_unavailable("quota state unavailable"))?;
-
-        let Some((state, requested_units)) = row else {
-            return Err(ImageGatewayError::internal("reservation not found"));
-        };
-        if state != ReservationState::Reserved.as_str() {
+        let locked = lock_quota_reservation(&mut tx, reservation).await?;
+        if locked.state != ReservationState::Reserved.as_str() {
+            tx.commit()
+                .await
+                .map_err(|_| ImageGatewayError::service_unavailable("quota state unavailable"))?;
             return Ok(());
         }
 
@@ -647,57 +611,62 @@ impl UsageStore for PostgresUsageStore {
             SET released_units = $2,
                 state = $3,
                 updated_at_ms = $4
-            WHERE reservation_id = $1
+            WHERE reservation_id = $1 AND tenant_id = $5
             "#,
         )
-        .bind(reservation.reservation_id)
-        .bind(requested_units)
+        .bind(locked.reservation_id)
+        .bind(locked.requested_units)
         .bind(ReservationState::Released.as_str())
         .bind(now)
+        .bind(&locked.tenant_id)
         .execute(&mut *tx)
         .await
         .map_err(|_| ImageGatewayError::service_unavailable("quota state unavailable"))?;
 
-        sqlx::query(
+        let job_update = sqlx::query(
             r#"
             UPDATE jobs
             SET state = $2,
                 finished_at_ms = $3,
                 updated_at_ms = $3,
                 last_error_code = $4
-            WHERE job_id = $1
+            WHERE job_id = $1 AND tenant_id = $5 AND reservation_id = $6
             "#,
         )
-        .bind(reservation.job_id)
+        .bind(locked.job_id)
         .bind(JobState::Failed.as_str())
         .bind(now)
         .bind(reason)
+        .bind(&locked.tenant_id)
+        .bind(locked.reservation_id)
         .execute(&mut *tx)
         .await
         .map_err(|_| ImageGatewayError::service_unavailable("job state unavailable"))?;
 
+        require_one_job_updated(job_update)?;
+
         insert_metering_event(
             &mut tx,
-            &reservation.charge.tenant_id,
-            reservation.job_id,
-            reservation.reservation_id,
-            &reservation.charge.request_id,
-            reservation.charge.operation,
+            &locked.tenant_id,
+            locked.job_id,
+            locked.reservation_id,
+            &locked.request_id,
+            &locked.operation,
             "quota_released",
-            reservation.charge.units,
+            locked.requested_units as u32,
             reason,
             now,
         )
         .await?;
         insert_metering_event(
             &mut tx,
-            &reservation.charge.tenant_id,
-            reservation.job_id,
-            reservation.reservation_id,
-            &reservation.charge.request_id,
-            reservation.charge.operation,
+            &locked.tenant_id,
+            locked.job_id,
+            locked.reservation_id,
+            &locked.request_id,
+            &locked.operation,
             "job_failed",
-            reservation.charge.units,
+            locked.requested_units as u32,
             reason,
             now,
         )
@@ -707,6 +676,89 @@ impl UsageStore for PostgresUsageStore {
             .await
             .map_err(|_| ImageGatewayError::service_unavailable("quota state unavailable"))?;
         Ok(())
+    }
+}
+
+async fn begin_quota_transition<'a>(
+    pool: &'a PgPool,
+    tenant_id: &str,
+) -> Result<Transaction<'a, Postgres>, ImageGatewayError> {
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|_| ImageGatewayError::service_unavailable("quota state unavailable"))?;
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(quota_lock_id(tenant_id))
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| ImageGatewayError::service_unavailable("quota lock unavailable"))?;
+    Ok(tx)
+}
+
+#[derive(sqlx::FromRow)]
+struct LockedQuotaReservation {
+    reservation_id: Uuid,
+    tenant_id: String,
+    state: String,
+    requested_units: i32,
+    job_id: Uuid,
+    request_id: String,
+    operation: String,
+}
+
+async fn lock_quota_reservation(
+    tx: &mut Transaction<'_, Postgres>,
+    reservation: &UsageReservation,
+) -> Result<LockedQuotaReservation, ImageGatewayError> {
+    let locked: Option<LockedQuotaReservation> = sqlx::query_as(
+        r#"
+        SELECT
+          qr.reservation_id,
+          qr.tenant_id,
+          qr.state,
+          qr.requested_units,
+          qr.job_id,
+          qr.request_id,
+          j.operation
+        FROM quota_reservations qr
+        JOIN jobs j
+          ON j.job_id = qr.job_id
+         AND j.tenant_id = qr.tenant_id
+         AND j.reservation_id = qr.reservation_id
+        WHERE qr.reservation_id = $1 AND qr.tenant_id = $2
+        FOR UPDATE OF qr, j
+        "#,
+    )
+    .bind(reservation.reservation_id)
+    .bind(&reservation.charge.tenant_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(|_| ImageGatewayError::service_unavailable("quota state unavailable"))?;
+
+    let Some(locked) = locked else {
+        return Err(ImageGatewayError::internal("reservation not found"));
+    };
+    let units_match =
+        u32::try_from(locked.requested_units).is_ok_and(|units| units == reservation.charge.units);
+    if locked.job_id != reservation.job_id
+        || locked.request_id != reservation.charge.request_id
+        || locked.operation != reservation.charge.operation
+        || !units_match
+    {
+        return Err(ImageGatewayError::internal(
+            "reservation handle does not match stored quota state",
+        ));
+    }
+    Ok(locked)
+}
+
+fn require_one_job_updated(result: sqlx::postgres::PgQueryResult) -> Result<(), ImageGatewayError> {
+    if result.rows_affected() == 1 {
+        Ok(())
+    } else {
+        Err(ImageGatewayError::internal(
+            "reservation job transition did not update exactly one row",
+        ))
     }
 }
 
