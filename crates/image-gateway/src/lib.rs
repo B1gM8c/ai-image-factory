@@ -1,3 +1,4 @@
+pub mod admission;
 mod api;
 mod api_keys;
 mod auth;
