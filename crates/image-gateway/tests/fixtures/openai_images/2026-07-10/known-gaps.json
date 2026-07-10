@@ -1,0 +1,23 @@
+{
+  "captured_on": "2026-07-10",
+  "gaps": [
+    {
+      "id": "sse_usage_missing",
+      "current_behavior": "Completed SSE events do not include usage.",
+      "upstream_contract": "Completed GPT image SSE events include token usage.",
+      "source": "https://developers.openai.com/api/docs/guides/image-generation"
+    },
+    {
+      "id": "input_fidelity_rejected",
+      "current_behavior": "Edit requests reject input_fidelity as unsupported.",
+      "upstream_contract": "The upstream GPT Image 2 contract requires input_fidelity to be omitted because fidelity is always high.",
+      "source": "https://developers.openai.com/api/docs/guides/image-generation"
+    },
+    {
+      "id": "partial_images_gt_zero_unsupported",
+      "current_behavior": "Streaming accepts only partial_images=0 final-image compatibility mode.",
+      "upstream_contract": "The upstream Images API accepts partial_images values from 0 through 3.",
+      "source": "https://developers.openai.com/api/docs/guides/image-generation"
+    }
+  ]
+}

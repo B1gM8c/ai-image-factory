@@ -80,7 +80,7 @@ pub struct ImageStreamEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub partial_image_index: Option<usize>,
     pub b64_json: String,
-    pub created: i64,
+    pub created_at: i64,
     pub background: String,
     pub output_format: String,
     pub quality: String,
@@ -522,7 +522,7 @@ pub fn image_stream_events(
             event_type: kind.completed_event(),
             partial_image_index: None,
             b64_json: image.b64_json.clone(),
-            created: response.created,
+            created_at: response.created,
             background: response.background.clone(),
             output_format: response.output_format.clone(),
             quality: response.quality.clone(),

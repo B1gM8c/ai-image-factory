@@ -70,7 +70,6 @@ pub fn openapi_json() -> Json<Value> {
         ResponseFormatDoc,
         ModerationDoc,
         StyleDoc,
-        InputFidelityDoc,
         CreateServiceAccountRequestDoc,
         ErrorResponseDoc,
         ErrorBodyDoc,
@@ -312,8 +311,6 @@ struct ImageEditRequestDoc {
     partial_images: Option<u32>,
     #[schema(inline)]
     style: Option<StyleDoc>,
-    #[schema(inline)]
-    input_fidelity: Option<InputFidelityDoc>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -411,14 +408,6 @@ enum StyleDoc {
     Natural,
 }
 
-#[derive(Debug, Serialize, ToSchema)]
-#[allow(dead_code)]
-#[serde(rename_all = "lowercase")]
-enum InputFidelityDoc {
-    High,
-    Low,
-}
-
 fn patch_generated_schema(value: &mut Value) {
     patch_property_enum(
         value,
@@ -472,13 +461,6 @@ fn patch_generated_schema(value: &mut Value) {
     );
     patch_property_enum(value, "ImageEditRequest", "background", &["auto", "opaque"]);
     patch_property_enum(value, "ImageEditRequest", "response_format", &["b64_json"]);
-    patch_property_enum(
-        value,
-        "ImageEditRequest",
-        "input_fidelity",
-        &["high", "low"],
-    );
-
     if let Some(size_schema) = value
         .pointer_mut("/components/schemas/ImageGenerationRequest/properties/size")
         .and_then(Value::as_object_mut)

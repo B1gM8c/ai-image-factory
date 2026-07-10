@@ -113,6 +113,28 @@ mod tests {
     }
 
     #[test]
+    fn validates_dimension_boundaries() {
+        for (size, valid) in [
+            ("1024x1024", true),
+            ("1025x1024", false),
+            ("1024x1025", false),
+            ("3840x1280", true),
+            ("3856x1280", false),
+            ("3840x1264", false),
+            ("1024x640", true),
+            ("1008x640", false),
+            ("2880x2880", true),
+            ("2896x2880", false),
+        ] {
+            assert_eq!(
+                is_valid_gpt_image_2_size(size),
+                valid,
+                "unexpected validity for {size}"
+            );
+        }
+    }
+
+    #[test]
     fn accepts_close_native_ratio_outputs() {
         assert!(aspect_ratio_matches(1672, 941, 16, 9));
         assert!(aspect_ratio_matches(1448, 1086, 4, 3));

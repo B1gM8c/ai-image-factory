@@ -18,6 +18,49 @@ use serde_json::{Value, json};
 use tower::ServiceExt;
 
 const TINY_PNG: &[u8] = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR\0\0\0\x01\0\0\0\x01\0\0\0\0";
+const RUNTIME_STABLE_FIXTURE: &str =
+    include_str!("fixtures/openai_images/2026-07-10/runtime-stable.json");
+const ERRORS_STABLE_FIXTURE: &str =
+    include_str!("fixtures/openai_images/2026-07-10/errors-stable.json");
+
+fn fixture_json(contents: &str) -> Value {
+    serde_json::from_str(contents).expect("valid OpenAI Images contract fixture")
+}
+
+fn runtime_event_fixture(event_type: &str) -> Value {
+    fixture_json(RUNTIME_STABLE_FIXTURE)["events"]
+        .as_array()
+        .expect("runtime events")
+        .iter()
+        .find(|event| event["type"] == event_type)
+        .unwrap_or_else(|| panic!("missing runtime fixture for {event_type}"))
+        .clone()
+}
+
+fn error_scenario_fixture(id: &str) -> Value {
+    fixture_json(ERRORS_STABLE_FIXTURE)["scenarios"]
+        .as_array()
+        .expect("error scenarios")
+        .iter()
+        .find(|scenario| scenario["id"] == id)
+        .unwrap_or_else(|| panic!("missing error fixture for {id}"))
+        .clone()
+}
+
+fn stable_sse_projection(event: &Value) -> Value {
+    let mut event = event.clone();
+    let object = event.as_object_mut().expect("SSE event object");
+    for dynamic in ["b64_json", "created_at", "usage"] {
+        object.remove(dynamic);
+    }
+    event
+}
+
+fn assert_error_fixture(status: StatusCode, body: &Value, id: &str) {
+    let fixture = error_scenario_fixture(id);
+    assert_eq!(status.as_u16(), fixture["status"].as_u64().unwrap() as u16);
+    assert_eq!(body["error"], fixture["error"]);
+}
 
 fn png_bytes(width: u32, height: u32) -> Vec<u8> {
     let image = ImageBuffer::from_pixel(width, height, Rgba([255u8, 255, 255, 255]));
@@ -529,6 +572,41 @@ async fn generation_accepts_aspect_ratio_size_extension() {
 }
 
 #[tokio::test]
+async fn generation_passes_arbitrary_gpt_image_2_size_through_exactly() {
+    let fake = FakeGenerator {
+        calls: Arc::default(),
+        delay: Duration::ZERO,
+        image_bytes: png_bytes(1536, 864),
+        failure: None,
+    };
+    let app = build_router(config(), Arc::new(fake.clone()), usage_store());
+
+    let (status, _headers, body) = send_json(
+        app,
+        Some("test-token"),
+        json!({
+            "model": "gpt-image-2",
+            "prompt": "a cinematic terminal icon",
+            "size": "1536x864",
+            "output_format": "png"
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["size"], "1536x864");
+    assert_eq!(
+        fake.calls.lock().unwrap().as_slice(),
+        &[FakeCall::Generate {
+            prompt: "a cinematic terminal icon".to_string(),
+            n: 1,
+            size: "1536x864".to_string(),
+            output_format: "png".to_string(),
+        }]
+    );
+}
+
+#[tokio::test]
 async fn generation_rejects_returned_png_with_wrong_aspect_ratio() {
     let fake = FakeGenerator {
         calls: Arc::default(),
@@ -709,9 +787,34 @@ async fn generation_stream_true_returns_final_only_sse_event() {
     assert_eq!(events[0].1["output_format"], "png");
     assert_eq!(events[0].1["quality"], "auto");
     assert_eq!(events[0].1["size"], "1024x1024");
-    assert!(events[0].1["created"].as_i64().is_some());
+    assert!(events[0].1["created_at"].as_i64().is_some());
+    assert!(events[0].1.get("created").is_none());
     assert!(events[0].1.get("usage").is_none());
     assert!(events[0].1.get("partial_image_index").is_none());
+    assert_eq!(
+        stable_sse_projection(&events[0].1),
+        runtime_event_fixture("image_generation.completed")
+    );
+}
+
+#[tokio::test]
+async fn generation_rejects_unknown_field_without_calling_provider() {
+    let fake = FakeGenerator::default();
+    let app = build_router(config(), Arc::new(fake.clone()), usage_store());
+
+    let (status, _headers, body) = send_json(
+        app,
+        Some("test-token"),
+        json!({
+            "model": "gpt-image-2",
+            "prompt": "a tiny terminal icon",
+            "input_fidelity": "high"
+        }),
+    )
+    .await;
+
+    assert_error_fixture(status, &body, "unknown_generation_field");
+    assert!(fake.calls.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -731,9 +834,7 @@ async fn generation_rejects_true_partial_image_streaming() {
     )
     .await;
 
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(body["error"]["param"], "partial_images");
-    assert_eq!(body["error"]["code"], "unsupported_parameter");
+    assert_error_fixture(status, &body, "partial_images_gt_zero");
     assert!(fake.calls.lock().unwrap().is_empty());
 }
 
@@ -1722,9 +1823,14 @@ async fn edits_stream_true_returns_final_only_sse_event() {
     assert_eq!(events[0].1["output_format"], "png");
     assert_eq!(events[0].1["quality"], "auto");
     assert_eq!(events[0].1["size"], "1024x1024");
-    assert!(events[0].1["created"].as_i64().is_some());
+    assert!(events[0].1["created_at"].as_i64().is_some());
+    assert!(events[0].1.get("created").is_none());
     assert!(events[0].1.get("usage").is_none());
     assert!(events[0].1.get("partial_image_index").is_none());
+    assert_eq!(
+        stable_sse_projection(&events[0].1),
+        runtime_event_fixture("image_edit.completed")
+    );
 }
 
 #[tokio::test]
@@ -1765,9 +1871,7 @@ async fn edits_reject_input_fidelity_for_gpt_image_2() {
     )
     .await;
 
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(body["error"]["param"], "input_fidelity");
-    assert_eq!(body["error"]["code"], "unsupported_parameter");
+    assert_error_fixture(status, &body, "edit_input_fidelity");
     assert!(fake.calls.lock().unwrap().is_empty());
 }
 
@@ -2177,6 +2281,14 @@ async fn openapi_json_documents_images_api() {
         body["components"]["schemas"]["ImageGenerationRequest"]["properties"]["stream"].is_object()
     );
     assert!(
+        body["components"]["schemas"]["ImageStreamEvent"]["properties"]["created_at"].is_object()
+    );
+    assert!(
+        body["components"]["schemas"]["ImageStreamEvent"]["properties"]
+            .get("created")
+            .is_none()
+    );
+    assert!(
         body["components"]["schemas"]["ImageEditRequest"]["properties"]["moderation"]["enum"]
             .as_array()
             .unwrap()
@@ -2184,8 +2296,9 @@ async fn openapi_json_documents_images_api() {
     );
     assert!(body["components"]["schemas"]["ImageEditRequest"]["properties"]["stream"].is_object());
     assert!(
-        body["components"]["schemas"]["ImageEditRequest"]["properties"]["input_fidelity"]
-            .is_object()
+        body["components"]["schemas"]["ImageEditRequest"]["properties"]
+            .get("input_fidelity")
+            .is_none()
     );
     assert_eq!(
         body["components"]["schemas"]["ImageEditRequest"]["anyOf"][0]["required"][0],

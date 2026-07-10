@@ -1,0 +1,20 @@
+{
+  "description": "Stable projection of final-only SSE output; dynamic and large fields are intentionally excluded.",
+  "excluded_dynamic_fields": ["b64_json", "created_at", "usage"],
+  "events": [
+    {
+      "type": "image_generation.completed",
+      "background": "opaque",
+      "output_format": "png",
+      "quality": "auto",
+      "size": "1024x1024"
+    },
+    {
+      "type": "image_edit.completed",
+      "background": "opaque",
+      "output_format": "png",
+      "quality": "auto",
+      "size": "1024x1024"
+    }
+  ]
+}

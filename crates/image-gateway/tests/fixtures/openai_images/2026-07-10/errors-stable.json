@@ -1,0 +1,34 @@
+{
+  "scenarios": [
+    {
+      "id": "unknown_generation_field",
+      "status": 400,
+      "error": {
+        "message": "Unknown parameter: 'input_fidelity'",
+        "type": "invalid_request_error",
+        "param": "input_fidelity",
+        "code": "unknown_parameter"
+      }
+    },
+    {
+      "id": "edit_input_fidelity",
+      "status": 400,
+      "error": {
+        "message": "gpt-image-2 always uses high fidelity for input images; omit input_fidelity.",
+        "type": "invalid_request_error",
+        "param": "input_fidelity",
+        "code": "unsupported_parameter"
+      }
+    },
+    {
+      "id": "partial_images_gt_zero",
+      "status": 400,
+      "error": {
+        "message": "Codex CLI does not expose native partial image events; only stream=true with partial_images=0 is supported as a final-image SSE compatibility mode.",
+        "type": "invalid_request_error",
+        "param": "partial_images",
+        "code": "unsupported_parameter"
+      }
+    }
+  ]
+}
