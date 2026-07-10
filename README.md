@@ -14,6 +14,7 @@ apps/
 crates/
   image-gateway/      Rust Axum API gateway and OpenAI Images compatibility layer
   provider-contracts/ Shared media/provider/job contracts and roadmap slots
+  scheduler-policy/  Provider-neutral weighted scheduling policy
 docs/
   architecture/       Upgrade notes and platform boundaries
 ```

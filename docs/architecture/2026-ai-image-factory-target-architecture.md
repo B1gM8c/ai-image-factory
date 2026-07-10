@@ -146,8 +146,10 @@ revision. It is not yet a multi-provider production architecture.
   Migrations do not have one owner or one controlled execution path.
 - Tenant, project, service account, principal, credential, and billing account
   are collapsed into free-form project strings.
-- API keys use an unpeppered SHA-256 digest and have no scopes, validity window,
-  rotation lineage, per-key policy, or budget restriction.
+- API keys now use a public key ID, 256-bit secret, and versioned
+  HMAC-SHA-256 pepper keyring with opt-in legacy SHA-256 migration reads. Scopes,
+  validity windows, rotation lineage, per-key policy, and budget restrictions
+  remain open.
 - A global middleware adds an OpenAI-specific version header to every route. It
   would pollute xAI, Ark, BytePlus, JiMeng, native, and admin profiles if those
   routes were added to the same router without profile-local middleware.

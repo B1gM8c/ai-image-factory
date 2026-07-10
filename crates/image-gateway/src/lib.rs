@@ -19,7 +19,7 @@ mod usage;
 mod workers;
 
 pub use api::{build_router, build_router_with_api_key_store, build_router_with_components};
-pub use api_keys::{ApiKeyStore, InMemoryApiKeyStore, PostgresApiKeyStore};
+pub use api_keys::{ApiKeyKeyring, ApiKeyStore, InMemoryApiKeyStore, PostgresApiKeyStore};
 pub use config::{AppConfig, ProxyConfig};
 pub use error::ImageGatewayError;
 pub use generator::{

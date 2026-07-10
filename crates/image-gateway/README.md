@@ -25,6 +25,8 @@ cd crates/image-gateway
 export DATABASE_URL='postgres://user:pass@localhost:5432/gpt_image_gateway'
 export GATEWAY_API_TOKEN='local-token'
 export GATEWAY_ADMIN_TOKEN='admin-token'
+export GATEWAY_API_KEY_PEPPERS="1:$(openssl rand -hex 32)"
+export GATEWAY_API_KEY_CURRENT_PEPPER_VERSION='1'
 export GATEWAY_CODEX_HOME='/srv/gpt-image-codex-home'
 cargo run --bin factoryctl -- migrate
 cargo run
@@ -37,7 +39,11 @@ cargo run -p gpt-image-2-gateway --bin factoryctl -- migrate
 cargo run -p gpt-image-2-gateway
 ```
 
-Default bind address is `127.0.0.1:8787`. Every startup requires at least one of `GATEWAY_API_TOKEN` or `GATEWAY_ADMIN_TOKEN`, plus an explicit absolute, existing, writable `GATEWAY_CODEX_HOME`. If both tokens are configured, they must be different. `GATEWAY_ADMIN_TOKEN` protects Admin endpoints for creating and revoking project API keys; it never authorizes image calls. An admin-only startup can bootstrap project keys, and image calls must then use one of those keys. `GATEWAY_API_TOKEN` remains a legacy image token and is not accepted on Admin endpoints.
+Default bind address is `127.0.0.1:8787`. Every startup requires at least one of `GATEWAY_API_TOKEN` or `GATEWAY_ADMIN_TOKEN`, a versioned API-key pepper keyring, plus an explicit absolute, existing, writable `GATEWAY_CODEX_HOME`. If both tokens are configured, they must be different. `GATEWAY_ADMIN_TOKEN` protects Admin endpoints for creating and revoking project API keys; it never authorizes image calls. An admin-only startup can bootstrap project keys, and image calls must then use one of those keys. `GATEWAY_API_TOKEN` remains a legacy image token and is not accepted on Admin endpoints.
+
+`GATEWAY_API_KEY_PEPPERS` is a comma-separated `version:64-hex` keyring. `GATEWAY_API_KEY_CURRENT_PEPPER_VERSION` selects the version used for new keys. During rotation, keep both versions configured, change the current version, then retire the old version after its keys have been rotated or revoked. Pepper values belong in KMS/secret-manager injection, never in source control.
+
+Legacy SHA-256 credential reads are disabled by default. Set `GATEWAY_API_KEY_ALLOW_LEGACY_SHA256=true` only during a controlled migration window, then remove it after those keys are rotated or revoked.
 
 The gateway does not yet provide native TLS and rejects every non-loopback bind. Bind it to loopback and place a TLS reverse proxy on the same host in front of it. Provision `GATEWAY_CODEX_HOME` before every startup and grant the gateway service account permission to create and remove files there; the path must not be a symlink or the filesystem root. `--ignore-user-config` skips user `config.toml`; Codex may still load its native system image generation skill.
 
@@ -108,7 +114,9 @@ PostgreSQL is the authority for local API keys and 5-hour / 7-day image usage ac
 
 Current MVP behavior:
 
-- API keys are gateway-local and stored as SHA-256 hashes. The unredacted key value is only returned when a project service account is created.
+- New API keys contain a public key id plus a 256-bit secret and are stored as versioned HMAC-SHA-256 digests. The unredacted key value is only returned when a project service account is created.
+- Legacy SHA-256 rows are readable only when the explicit migration switch is enabled; no new legacy rows are created.
+- `last_used_at` writes are coalesced to at most once per minute per key.
 - Usage is isolated by project/tenant. Legacy `GATEWAY_API_TOKEN` calls use the `proj_default` tenant.
 - `GATEWAY_IMAGE_LIMIT_5H` defaults to `40`.
 - `GATEWAY_IMAGE_LIMIT_7D` defaults to `200`.
@@ -116,7 +124,7 @@ Current MVP behavior:
 - Successful generation commits the reservation. Generation or edit failure releases it, so failed provider attempts are not charged.
 - Responses include `x-request-id`, `openai-version`, `openai-project`, and image-unit quota headers when available.
 - PostgreSQL reservation transitions are serialized per tenant, and integration tests cover concurrent reservations without quota oversell.
-- The request scheduler is still in-process, so queue state is not shared across gateway instances.
+- Local Codex capacity permits remain in-process; durable work ordering and weighted finish tags are stored in PostgreSQL.
 
 ## Concurrency
 
@@ -144,7 +152,7 @@ Proxy values are passed to Codex child processes:
 
 Proxy URLs are not written to traces by this service.
 
-The Codex child process runs with a cleared environment. The gateway only passes a small allowlist such as `PATH`, `HOME` pointed at the active Codex home, `CODEX_HOME`, temporary-directory variables, certificate variables, locale, shell, and the proxy variables above. It does not pass `DATABASE_URL`, `GATEWAY_API_TOKEN`, OTEL exporter settings, or other gateway process secrets.
+The Codex child process runs with a cleared environment. The gateway only passes a small allowlist such as `PATH`, `HOME` pointed at the active Codex home, `CODEX_HOME`, temporary-directory variables, certificate variables, locale, shell, and the proxy variables above. It does not pass `DATABASE_URL`, gateway/admin tokens, API-key peppers, OTEL exporter settings, or other gateway process secrets.
 
 ## OpenTelemetry
 

@@ -12,7 +12,13 @@ use uuid::Uuid;
 
 use crate::{ImageGatewayError, auth::AuthContext};
 
+mod credentials;
+
+pub use credentials::ApiKeyKeyring;
+use credentials::{HMAC_ALGORITHM, LEGACY_ALGORITHM, key_id_from_token, new_key_value};
+
 const MAX_NAME_CHARS: usize = 128;
+const LAST_USED_COALESCE_SECONDS: i64 = 60;
 
 #[async_trait]
 pub trait ApiKeyStore: Send + Sync + 'static {
@@ -107,9 +113,24 @@ pub struct ProjectApiKeyDeleted {
     pub deleted: bool,
 }
 
-#[derive(Default)]
 pub struct InMemoryApiKeyStore {
     state: Mutex<InMemoryApiKeyState>,
+    keyring: ApiKeyKeyring,
+}
+
+impl Default for InMemoryApiKeyStore {
+    fn default() -> Self {
+        Self::new(ApiKeyKeyring::ephemeral())
+    }
+}
+
+impl InMemoryApiKeyStore {
+    pub fn new(keyring: ApiKeyKeyring) -> Self {
+        Self {
+            state: Mutex::new(InMemoryApiKeyState::default()),
+            keyring,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -132,6 +153,7 @@ struct StoredApiKey {
     service_account_id: String,
     name: String,
     hash: String,
+    pepper_version: u16,
     redacted_value: String,
     created_at: i64,
     last_used_at: Option<i64>,
@@ -150,8 +172,8 @@ impl ApiKeyStore for InMemoryApiKeyStore {
         let created_at = now_seconds();
         let service_account_id = new_id("svc_acct");
         let key_id = new_id("key");
-        let value = new_key_value();
-        let hash = hash_key(&value);
+        let value = new_key_value(&key_id);
+        let hash = self.keyring.digest_current(&value);
         let redacted_value = redact_key(&value);
 
         let mut state = self
@@ -169,6 +191,7 @@ impl ApiKeyStore for InMemoryApiKeyStore {
             service_account_id: service_account_id.clone(),
             name: "Secret Key".to_string(),
             hash,
+            pepper_version: self.keyring.current_version(),
             redacted_value,
             created_at,
             last_used_at: None,
@@ -192,18 +215,26 @@ impl ApiKeyStore for InMemoryApiKeyStore {
     }
 
     async fn authenticate(&self, bearer: &str) -> Result<Option<AuthContext>, ImageGatewayError> {
-        let hash = hash_key(bearer);
         let mut state = self
             .state
             .lock()
             .map_err(|_| ImageGatewayError::internal("api key store lock poisoned"))?;
+        let Some(key_id) = key_id_from_token(bearer) else {
+            return Ok(None);
+        };
         let Some(api_key) = state
             .api_keys
             .iter_mut()
-            .find(|api_key| !api_key.deleted && api_key.hash == hash)
+            .find(|api_key| !api_key.deleted && api_key.id == key_id)
         else {
             return Ok(None);
         };
+        if !self
+            .keyring
+            .verify(api_key.pepper_version, bearer, &api_key.hash)
+        {
+            return Ok(None);
+        }
         api_key.last_used_at = Some(now_seconds());
         Ok(Some(AuthContext {
             tenant_id: api_key.project_id.clone(),
@@ -282,12 +313,23 @@ impl ApiKeyStore for InMemoryApiKeyStore {
 #[derive(Clone)]
 pub struct PostgresApiKeyStore {
     pool: PgPool,
+    keyring: ApiKeyKeyring,
 }
 
 impl PostgresApiKeyStore {
-    pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+    pub fn new(pool: PgPool, keyring: ApiKeyKeyring) -> Self {
+        Self { pool, keyring }
     }
+}
+
+#[derive(sqlx::FromRow)]
+struct CredentialRow {
+    id: String,
+    project_id: String,
+    key_hash: String,
+    hash_algorithm: String,
+    pepper_version: Option<i32>,
+    last_used_at: Option<i64>,
 }
 
 #[async_trait]
@@ -302,9 +344,10 @@ impl ApiKeyStore for PostgresApiKeyStore {
         let created_at = now_seconds();
         let service_account_id = new_id("svc_acct");
         let key_id = new_id("key");
-        let value = new_key_value();
+        let value = new_key_value(&key_id);
         let redacted_value = redact_key(&value);
-        let hash = hash_key(&value);
+        let hash = self.keyring.digest_current(&value);
+        let pepper_version = i32::from(self.keyring.current_version());
 
         let mut tx = self
             .pool
@@ -329,14 +372,17 @@ impl ApiKeyStore for PostgresApiKeyStore {
         sqlx::query(
             r#"
             INSERT INTO gateway_api_keys
-              (id, project_id, service_account_id, name, key_hash, redacted_value, created_at)
-            VALUES ($1, $2, $3, 'Secret Key', $4, $5, $6)
+              (id, project_id, service_account_id, name, key_hash, hash_algorithm,
+               pepper_version, redacted_value, created_at)
+            VALUES ($1, $2, $3, 'Secret Key', $4, $5, $6, $7, $8)
             "#,
         )
         .bind(&key_id)
         .bind(project_id)
         .bind(&service_account_id)
         .bind(hash)
+        .bind(HMAC_ALGORITHM)
+        .bind(pepper_version)
         .bind(&redacted_value)
         .bind(created_at)
         .execute(&mut *tx)
@@ -364,28 +410,90 @@ impl ApiKeyStore for PostgresApiKeyStore {
     }
 
     async fn authenticate(&self, bearer: &str) -> Result<Option<AuthContext>, ImageGatewayError> {
-        let hash = hash_key(bearer);
-        let row: Option<(String, String)> = sqlx::query_as(
-            r#"
-            UPDATE gateway_api_keys
-            SET last_used_at = $1
-            WHERE key_hash = $2 AND deleted_at IS NULL
-            RETURNING id, project_id
-            "#,
-        )
-        .bind(now_seconds())
-        .bind(hash)
-        .fetch_optional(&self.pool)
-        .await
+        let key_id = key_id_from_token(bearer);
+        if key_id.is_none() && !self.keyring.legacy_sha256_enabled() {
+            return Ok(None);
+        }
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|_| ImageGatewayError::service_unavailable("api key state unavailable"))?;
+        let row = if let Some(key_id) = key_id {
+            sqlx::query_as::<_, CredentialRow>(
+                r#"
+                SELECT id, project_id, key_hash, hash_algorithm, pepper_version, last_used_at
+                FROM gateway_api_keys
+                WHERE id = $1 AND deleted_at IS NULL
+                FOR NO KEY UPDATE
+                "#,
+            )
+            .bind(key_id)
+            .fetch_optional(&mut *tx)
+            .await
+        } else {
+            sqlx::query_as::<_, CredentialRow>(
+                r#"
+                SELECT id, project_id, key_hash, hash_algorithm, pepper_version, last_used_at
+                FROM gateway_api_keys
+                WHERE key_hash = $1 AND hash_algorithm = $2 AND deleted_at IS NULL
+                FOR NO KEY UPDATE
+                "#,
+            )
+            .bind(hash_key(bearer))
+            .bind(LEGACY_ALGORITHM)
+            .fetch_optional(&mut *tx)
+            .await
+        }
         .map_err(|_| ImageGatewayError::service_unavailable("api key state unavailable"))?;
 
-        let Some((api_key_id, project_id)) = row else {
+        let Some(row) = row else {
+            tx.rollback()
+                .await
+                .map_err(|_| ImageGatewayError::service_unavailable("api key state unavailable"))?;
             return Ok(None);
         };
+        let verified = match row.hash_algorithm.as_str() {
+            HMAC_ALGORITHM => row
+                .pepper_version
+                .and_then(|version| u16::try_from(version).ok())
+                .is_some_and(|version| self.keyring.verify(version, bearer, &row.key_hash)),
+            LEGACY_ALGORITHM => row.key_hash == hash_key(bearer),
+            _ => false,
+        };
+        if !verified {
+            tx.rollback()
+                .await
+                .map_err(|_| ImageGatewayError::service_unavailable("api key state unavailable"))?;
+            return Ok(None);
+        }
+
+        let now = now_seconds();
+        let should_update_last_used = row
+            .last_used_at
+            .is_none_or(|last_used| last_used <= now - LAST_USED_COALESCE_SECONDS);
+        tx.commit()
+            .await
+            .map_err(|_| ImageGatewayError::service_unavailable("api key state unavailable"))?;
+        if should_update_last_used {
+            let _ = sqlx::query(
+                r#"
+                UPDATE gateway_api_keys
+                SET last_used_at = $2
+                WHERE id = $1 AND deleted_at IS NULL
+                  AND (last_used_at IS NULL OR last_used_at <= $3)
+                "#,
+            )
+            .bind(&row.id)
+            .bind(now)
+            .bind(now - LAST_USED_COALESCE_SECONDS)
+            .execute(&self.pool)
+            .await;
+        }
         Ok(Some(AuthContext {
-            tenant_id: project_id.clone(),
-            project_id,
-            api_key_id: Some(api_key_id),
+            tenant_id: row.project_id.clone(),
+            project_id: row.project_id,
+            api_key_id: Some(row.id),
             is_admin: false,
         }))
     }
@@ -591,14 +699,6 @@ fn validate_name(name: &str) -> Result<String, ImageGatewayError> {
 
 fn new_id(prefix: &str) -> String {
     format!("{prefix}_{}", Uuid::new_v4().simple())
-}
-
-fn new_key_value() -> String {
-    format!(
-        "sk-gw-{}{}",
-        Uuid::new_v4().simple(),
-        Uuid::new_v4().simple()
-    )
 }
 
 fn hash_key(key: &str) -> String {

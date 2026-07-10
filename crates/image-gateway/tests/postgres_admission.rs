@@ -275,14 +275,10 @@ async fn durable_claim_uses_weighted_finish_tags_and_waiting_aging() -> TestResu
     };
     let result = async {
         let store = PostgresAdmissionStore::new(database.pool.clone());
-        for index in 0..4 {
+        for _ in 0..4 {
             for (tenant, weight) in [("tenant-a", 1_u32), ("tenant-b", 2_u32)] {
                 let ticket = match store
-                    .claim(claim_request_for_tenant(
-                        tenant,
-                        None,
-                        &format!("hash-{tenant}-{index}"),
-                    ))
+                    .claim(claim_request_for_tenant(tenant, None, &"a".repeat(64)))
                     .await
                     .map_err(|error| format!("weighted claim failed: {error}"))?
                 {

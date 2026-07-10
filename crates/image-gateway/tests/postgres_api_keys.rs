@@ -1,13 +1,14 @@
 use std::{env, str::FromStr, time::Duration};
 
 use gpt_image_2_gateway::{
-    ApiKeyStore, ImageGatewayError, PostgresApiKeyStore, database::run_migrations,
+    ApiKeyKeyring, ApiKeyStore, ImageGatewayError, PostgresApiKeyStore, database::run_migrations,
 };
+use sha2::{Digest, Sha256};
 use sqlx::{
     AssertSqlSafe, PgPool,
     postgres::{PgConnectOptions, PgPoolOptions},
 };
-use tokio::{task::JoinHandle, time::timeout};
+use tokio::{sync::Barrier, task::JoinHandle, time::timeout};
 use uuid::Uuid;
 
 type TestResult<T = ()> = Result<T, String>;
@@ -39,9 +40,46 @@ async fn authentication_stays_rejected_after_delete() -> TestResult {
     result
 }
 
+#[tokio::test]
+async fn pepper_rotation_preserves_only_configured_versions() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+
+    let result = pepper_rotation_case(&database).await;
+    let cleanup = database.cleanup().await;
+    cleanup?;
+    result
+}
+
+#[tokio::test]
+async fn legacy_sha_key_authenticates_during_migration_window() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+
+    let result = legacy_key_case(&database).await;
+    let cleanup = database.cleanup().await;
+    cleanup?;
+    result
+}
+
+#[tokio::test]
+async fn concurrent_authentication_does_not_deadlock_on_last_used_update() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+
+    let result = concurrent_authentication_case(&database).await;
+    let cleanup = database.cleanup().await;
+    cleanup?;
+    result
+}
+
 async fn revoke_authentication_race(database: &TestDatabase) -> TestResult {
     let project_id = format!("proj_{}", Uuid::new_v4().simple());
-    let setup_store = PostgresApiKeyStore::new(database.pool("setup").await?);
+    let keyring = test_keyring();
+    let setup_store = PostgresApiKeyStore::new(database.pool("setup").await?, keyring.clone());
     let account = setup_store
         .create_service_account(&project_id, "Race test")
         .await
@@ -66,6 +104,7 @@ async fn revoke_authentication_race(database: &TestDatabase) -> TestResult {
         database
             .pool_with_application_name(&revoke_application)
             .await?,
+        keyring.clone(),
     );
     let revoke_project = project_id.clone();
     let revoke_key_id = key_id.clone();
@@ -93,7 +132,7 @@ async fn revoke_authentication_race(database: &TestDatabase) -> TestResult {
             return Err(error);
         }
     };
-    let authenticate_store = PostgresApiKeyStore::new(authenticate_pool);
+    let authenticate_store = PostgresApiKeyStore::new(authenticate_pool, keyring);
     let authenticate =
         tokio::spawn(async move { authenticate_store.authenticate(&key_value).await });
 
@@ -124,7 +163,7 @@ async fn revoke_authentication_race(database: &TestDatabase) -> TestResult {
 
 async fn sequential_authentication_and_delete(database: &TestDatabase) -> TestResult {
     let project_id = format!("proj_{}", Uuid::new_v4().simple());
-    let store = PostgresApiKeyStore::new(database.pool("sequential").await?);
+    let store = PostgresApiKeyStore::new(database.pool("sequential").await?, test_keyring());
     let account = store
         .create_service_account(&project_id, "Sequential test")
         .await
@@ -138,6 +177,30 @@ async fn sequential_authentication_and_delete(database: &TestDatabase) -> TestRe
             .is_some(),
         "new API key should authenticate".to_string(),
     )?;
+    let version_before: String =
+        sqlx::query_scalar("SELECT xmin::TEXT FROM gateway_api_keys WHERE id = $1")
+            .bind(&account.api_key.id)
+            .fetch_one(&database.setup_pool)
+            .await
+            .map_err(|error| format!("failed to read key row version: {error}"))?;
+    require(
+        store
+            .authenticate(&account.api_key.value)
+            .await
+            .map_err(|error| format!("repeat authentication failed: {error:?}"))?
+            .is_some(),
+        "repeat API key authentication failed".to_string(),
+    )?;
+    let version_after: String =
+        sqlx::query_scalar("SELECT xmin::TEXT FROM gateway_api_keys WHERE id = $1")
+            .bind(&account.api_key.id)
+            .fetch_one(&database.setup_pool)
+            .await
+            .map_err(|error| format!("failed to reread key row version: {error}"))?;
+    require(
+        version_after == version_before,
+        "last_used_at coalescing still created a row version per request".to_string(),
+    )?;
     store
         .delete_project_api_key(&project_id, &account.api_key.id)
         .await
@@ -150,6 +213,175 @@ async fn sequential_authentication_and_delete(database: &TestDatabase) -> TestRe
             .is_none(),
         "deleted API key must stay rejected".to_string(),
     )
+}
+
+async fn pepper_rotation_case(database: &TestDatabase) -> TestResult {
+    let project_v1 = format!("proj_{}", Uuid::new_v4().simple());
+    let v1_store = PostgresApiKeyStore::new(database.pool("pepper_v1").await?, keyring_v1());
+    let v1_account = v1_store
+        .create_service_account(&project_v1, "Pepper v1")
+        .await
+        .map_err(|error| format!("failed to create v1 key: {error:?}"))?;
+
+    let metadata: (String, Option<i32>, String) = sqlx::query_as(
+        "SELECT hash_algorithm, pepper_version, key_hash FROM gateway_api_keys WHERE id = $1",
+    )
+    .bind(&v1_account.api_key.id)
+    .fetch_one(&database.setup_pool)
+    .await
+    .map_err(|error| format!("failed to inspect v1 key metadata: {error}"))?;
+    require(
+        metadata.0 == "hmac-sha256-v1" && metadata.1 == Some(1),
+        format!("new key did not use versioned HMAC: {metadata:?}"),
+    )?;
+    require(
+        metadata.2 != legacy_digest(&v1_account.api_key.value),
+        "new key was stored as an unpeppered SHA-256 digest".to_string(),
+    )?;
+
+    let rotated = PostgresApiKeyStore::new(database.pool("pepper_v2").await?, keyring_v2());
+    require(
+        rotated
+            .authenticate(&v1_account.api_key.value)
+            .await
+            .map_err(|error| format!("rotated keyring failed to verify v1 key: {error:?}"))?
+            .is_some(),
+        "rotated keyring did not retain v1 verification".to_string(),
+    )?;
+    let project_v2 = format!("proj_{}", Uuid::new_v4().simple());
+    let v2_account = rotated
+        .create_service_account(&project_v2, "Pepper v2")
+        .await
+        .map_err(|error| format!("failed to create v2 key: {error:?}"))?;
+    let v2_version: Option<i32> =
+        sqlx::query_scalar("SELECT pepper_version FROM gateway_api_keys WHERE id = $1")
+            .bind(&v2_account.api_key.id)
+            .fetch_one(&database.setup_pool)
+            .await
+            .map_err(|error| format!("failed to inspect v2 key version: {error}"))?;
+    require(
+        v2_version == Some(2),
+        format!("rotated key was not created with v2: {v2_version:?}"),
+    )?;
+
+    let retired =
+        PostgresApiKeyStore::new(database.pool("pepper_retired").await?, keyring_v2_only());
+    require(
+        retired
+            .authenticate(&v1_account.api_key.value)
+            .await
+            .map_err(|error| format!("retired keyring v1 check failed: {error:?}"))?
+            .is_none(),
+        "v1 key remained valid after v1 pepper was removed".to_string(),
+    )?;
+    require(
+        retired
+            .authenticate(&v2_account.api_key.value)
+            .await
+            .map_err(|error| format!("retired keyring v2 check failed: {error:?}"))?
+            .is_some(),
+        "v2 key stopped authenticating after v1 retirement".to_string(),
+    )
+}
+
+async fn legacy_key_case(database: &TestDatabase) -> TestResult {
+    let project_id = format!("proj_{}", Uuid::new_v4().simple());
+    let service_account_id = format!("svc_acct_{}", Uuid::new_v4().simple());
+    let key_id = format!("key_{}", Uuid::new_v4().simple());
+    let bearer = format!("sk-gw-legacy-{}", Uuid::new_v4().simple());
+    sqlx::query(
+        "INSERT INTO gateway_service_accounts (id, project_id, name, role, created_at) VALUES ($1, $2, 'Legacy', 'member', 1)",
+    )
+    .bind(&service_account_id)
+    .bind(&project_id)
+    .execute(&database.setup_pool)
+    .await
+    .map_err(|error| format!("failed to insert legacy service account: {error}"))?;
+    sqlx::query(
+        r#"
+        INSERT INTO gateway_api_keys
+          (id, project_id, service_account_id, name, key_hash, redacted_value, created_at)
+        VALUES ($1, $2, $3, 'Legacy Key', $4, 'sk-gw-...legacy', 1)
+        "#,
+    )
+    .bind(&key_id)
+    .bind(&project_id)
+    .bind(&service_account_id)
+    .bind(legacy_digest(&bearer))
+    .execute(&database.setup_pool)
+    .await
+    .map_err(|error| format!("failed to insert legacy API key: {error}"))?;
+
+    let disabled =
+        PostgresApiKeyStore::new(database.pool("legacy_disabled").await?, test_keyring());
+    require(
+        disabled
+            .authenticate(&bearer)
+            .await
+            .map_err(|error| format!("default legacy rejection failed: {error:?}"))?
+            .is_none(),
+        "legacy key authenticated without the migration switch".to_string(),
+    )?;
+
+    let store = PostgresApiKeyStore::new(
+        database.pool("legacy").await?,
+        test_keyring().with_legacy_sha256(true),
+    );
+    let auth = store
+        .authenticate(&bearer)
+        .await
+        .map_err(|error| format!("legacy authentication failed: {error:?}"))?;
+    require(
+        auth.is_some_and(|context| context.project_id == project_id),
+        "legacy key was not accepted during migration window".to_string(),
+    )
+}
+
+async fn concurrent_authentication_case(database: &TestDatabase) -> TestResult {
+    const CLIENTS: usize = 16;
+    let project_id = format!("proj_{}", Uuid::new_v4().simple());
+    let keyring = test_keyring();
+    let setup = PostgresApiKeyStore::new(database.pool("auth_setup").await?, keyring.clone());
+    let account = setup
+        .create_service_account(&project_id, "Concurrent auth")
+        .await
+        .map_err(|error| format!("failed to create concurrent auth key: {error:?}"))?;
+    sqlx::query("UPDATE gateway_api_keys SET last_used_at = NULL WHERE id = $1")
+        .bind(&account.api_key.id)
+        .execute(&database.setup_pool)
+        .await
+        .map_err(|error| format!("failed to reset last_used_at: {error}"))?;
+
+    let barrier = std::sync::Arc::new(Barrier::new(CLIENTS));
+    let mut tasks = Vec::new();
+    for index in 0..CLIENTS {
+        let store = PostgresApiKeyStore::new(
+            database.pool(&format!("auth_{index}")).await?,
+            keyring.clone(),
+        );
+        let bearer = account.api_key.value.clone();
+        let barrier = barrier.clone();
+        tasks.push(tokio::spawn(async move {
+            barrier.wait().await;
+            store.authenticate(&bearer).await
+        }));
+    }
+
+    timeout(WAIT_TIMEOUT, async {
+        for task in tasks {
+            let authenticated = task
+                .await
+                .map_err(|error| format!("authentication task failed: {error}"))?
+                .map_err(|error| format!("concurrent authentication failed: {error:?}"))?;
+            require(
+                authenticated.is_some(),
+                "concurrent valid key was rejected".to_string(),
+            )?;
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|_| "concurrent authentication deadlocked".to_string())?
 }
 
 async fn wait_for_database_lock(pool: &PgPool, application_name: &str) -> TestResult {
@@ -204,6 +436,27 @@ async fn abort_and_await<T>(task: JoinHandle<T>) {
 
 fn require(condition: bool, message: String) -> TestResult {
     if condition { Ok(()) } else { Err(message) }
+}
+
+fn test_keyring() -> ApiKeyKeyring {
+    keyring_v1()
+}
+
+fn keyring_v1() -> ApiKeyKeyring {
+    ApiKeyKeyring::new(1, [(1, vec![0x11; 32])]).expect("v1 test keyring must be valid")
+}
+
+fn keyring_v2() -> ApiKeyKeyring {
+    ApiKeyKeyring::new(2, [(1, vec![0x11; 32]), (2, vec![0x22; 32])])
+        .expect("rotated test keyring must be valid")
+}
+
+fn keyring_v2_only() -> ApiKeyKeyring {
+    ApiKeyKeyring::new(2, [(2, vec![0x22; 32])]).expect("v2 test keyring must be valid")
+}
+
+fn legacy_digest(value: &str) -> String {
+    hex::encode(Sha256::digest(value.as_bytes()))
 }
 
 struct TestDatabase {

@@ -1,8 +1,8 @@
 use std::{env, time::Duration};
 
 use gpt_image_2_gateway::{
-    ApiKeyStore, ImageGatewayError, PostgresApiKeyStore, PostgresUsageStore, UsageCharge,
-    UsageLimits, UsageStore,
+    ApiKeyKeyring, ApiKeyStore, ImageGatewayError, PostgresApiKeyStore, PostgresUsageStore,
+    UsageCharge, UsageLimits, UsageStore,
     database::{
         connect_pool, connect_test_pool_with_search_path, run_migrations, verify_migrations,
     },
@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 type TestResult<T = ()> = Result<T, String>;
 
-const REQUIRED_COLUMNS: [(&str, &str); 13] = [
+const REQUIRED_COLUMNS: [(&str, &str); 15] = [
     ("usage_events", "tenant_id"),
     ("quota_reservations", "tenant_id"),
     ("quota_reservations", "job_id"),
@@ -27,6 +27,8 @@ const REQUIRED_COLUMNS: [(&str, &str); 13] = [
     ("jobs", "updated_at_ms"),
     ("jobs", "last_error_code"),
     ("jobs", "last_error_message"),
+    ("gateway_api_keys", "hash_algorithm"),
+    ("gateway_api_keys", "pepper_version"),
 ];
 
 const REQUIRED_INDEXES: [&str; 5] = [
@@ -303,7 +305,10 @@ async fn shared_pool_case(pool: &PgPool) -> TestResult {
         "store schema migration should succeed",
     )?;
     let usage_store = PostgresUsageStore::new(pool.clone());
-    let api_key_store = PostgresApiKeyStore::new(pool.clone());
+    let api_key_store = PostgresApiKeyStore::new(
+        pool.clone(),
+        ApiKeyKeyring::new(1, [(1, vec![0x22; 32])]).expect("test keyring must be valid"),
+    );
     let held_connection = pool
         .acquire()
         .await
@@ -346,8 +351,8 @@ async fn shared_pool_case(pool: &PgPool) -> TestResult {
 
 async fn assert_expected_schema(pool: &PgPool) -> TestResult {
     require(
-        migration_versions(pool).await? == vec![0, 1, 2, 3],
-        "applied migration versions must be exactly [0, 1, 2, 3]",
+        migration_versions(pool).await? == vec![0, 1, 2, 3, 4],
+        "applied migration versions must be exactly [0, 1, 2, 3, 4]",
     )?;
 
     for (table, column) in REQUIRED_COLUMNS {

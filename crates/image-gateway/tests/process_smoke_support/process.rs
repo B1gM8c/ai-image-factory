@@ -125,6 +125,11 @@ impl GatewayProcess {
             .env("GATEWAY_BIND", address.to_string())
             .env("GATEWAY_API_TOKEN", API_TOKEN)
             .env("GATEWAY_ADMIN_TOKEN", ADMIN_TOKEN)
+            .env(
+                "GATEWAY_API_KEY_PEPPERS",
+                "1:1111111111111111111111111111111111111111111111111111111111111111",
+            )
+            .env("GATEWAY_API_KEY_CURRENT_PEPPER_VERSION", "1")
             .env("GATEWAY_CODEX_HOME", &files.codex_home)
             .env("GATEWAY_CLEANUP_CODEX_OUTPUTS", "true")
             .env("GATEWAY_QUEUE_TIMEOUT_SECS", "1")
@@ -359,6 +364,8 @@ set -eu
 [ -z "${{GATEWAY_DATABASE_URL+x}}" ] || exit 25
 [ -z "${{TEST_DATABASE_URL+x}}" ] || exit 26
 [ -z "${{GATEWAY_DATABASE_SCHEMA+x}}" ] || exit 29
+[ -z "${{GATEWAY_API_KEY_PEPPERS+x}}" ] || exit 30
+[ -z "${{GATEWAY_API_KEY_CURRENT_PEPPER_VERSION+x}}" ] || exit 31
 printf '%s\n' "$$" > {fake_pid_log}
 printf 'invoked\n' >> {invocation_log}
 printf '%s\n' "$$" > {fake_active_pid}
