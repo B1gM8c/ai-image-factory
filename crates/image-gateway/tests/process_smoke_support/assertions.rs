@@ -78,6 +78,53 @@ pub(crate) fn assert_codex_outputs(files: &SmokeFiles) -> TestResult {
     )
 }
 
+pub(crate) fn assert_artifact_bytes(files: &SmokeFiles, expected: &[u8]) -> TestResult {
+    let artifact_files = artifact_files(files)?;
+    require(
+        artifact_files.len() == 1,
+        format!("expected one durable artifact file, found {artifact_files:?}"),
+    )?;
+    let bytes = fs::read(&artifact_files[0])
+        .map_err(|error| format!("failed to read durable artifact: {error}"))?;
+    require(
+        bytes == expected,
+        "durable artifact bytes did not match fixture",
+    )
+}
+
+pub(crate) fn tamper_artifact(files: &SmokeFiles) -> TestResult {
+    let artifact_files = artifact_files(files)?;
+    require(
+        artifact_files.len() == 1,
+        format!("expected one artifact to tamper, found {artifact_files:?}"),
+    )?;
+    fs::write(&artifact_files[0], b"tampered artifact")
+        .map_err(|error| format!("failed to tamper artifact: {error}"))
+}
+
+fn artifact_files(files: &SmokeFiles) -> TestResult<Vec<std::path::PathBuf>> {
+    let objects = files.artifact_root.join("objects");
+    let mut artifact_files = Vec::new();
+    for shard in fs::read_dir(&objects)
+        .map_err(|error| format!("failed to read artifact objects: {error}"))?
+    {
+        let shard = shard.map_err(|error| format!("failed to read artifact shard: {error}"))?;
+        for entry in fs::read_dir(shard.path())
+            .map_err(|error| format!("failed to read artifact shard entries: {error}"))?
+        {
+            let entry = entry.map_err(|error| format!("failed to read artifact entry: {error}"))?;
+            if entry
+                .file_type()
+                .map_err(|error| format!("failed to stat artifact entry: {error}"))?
+                .is_file()
+            {
+                artifact_files.push(entry.path());
+            }
+        }
+    }
+    Ok(artifact_files)
+}
+
 pub(crate) fn opaque_png() -> TestResult<Vec<u8>> {
     let image = ImageBuffer::from_fn(2, 1, |x, _| {
         if x == 0 {

@@ -19,8 +19,12 @@ use crate::{
         AdmissionClaim, AdmissionError, AdmissionTicket, AttachJob, ClaimAdmission,
         GENERATION_OPERATION, GenerationCommandV1, idempotency_key_digest,
     },
+    artifacts::GENERATION_RESPONSE_SCHEMA,
     generator::normalize_generated_images,
-    models::{HealthResponse, ImageStreamKind, images_response, models_response, parse_generation},
+    models::{
+        HealthResponse, ImageStreamKind, images_response, images_response_at, models_response,
+        parse_generation,
+    },
     usage::UsageCharge,
 };
 
@@ -101,6 +105,12 @@ pub(super) async fn generations(
         AdmissionClaim::Existing { state, .. } if state == "accepted" => {
             return Err(ImageGatewayError::idempotency_in_progress());
         }
+        AdmissionClaim::Existing {
+            job_id,
+            state: claim_state,
+        } if claim_state == "succeeded" => {
+            return replay_generation(&state, job_id, &auth).await;
+        }
         AdmissionClaim::Existing { .. } => {
             return Err(ImageGatewayError::idempotency_result_unavailable());
         }
@@ -108,12 +118,6 @@ pub(super) async fn generations(
             return Err(ImageGatewayError::idempotency_conflict());
         }
     };
-    let output_format = job.output_format.clone();
-    let output_compression = job.output_compression;
-    let quality = job.quality.clone();
-    let size = job.size.clone();
-    let background = job.background.clone();
-    let stream = job.stream;
     let units = job.n;
     let model = job.model.clone();
 
@@ -173,25 +177,51 @@ pub(super) async fn generations(
             &lease,
             &reservation,
             job,
-            &size,
-            &output_format,
-            output_compression,
+            OPENAI_IMAGES_API_PROFILE,
+            GENERATION_RESPONSE_SCHEMA,
         )
         .await?;
-    let response_size = response_size_for_images(&execution.images)?;
+    render_generation_response(
+        execution.images,
+        execution.projection,
+        execution.usage,
+        &auth,
+    )
+}
+
+async fn replay_generation(
+    state: &Arc<AppState>,
+    job_id: uuid::Uuid,
+    auth: &crate::auth::AuthContext,
+) -> Result<Response, ImageGatewayError> {
+    let result = state
+        .settlement_store
+        .load_generation_result(job_id)
+        .await?
+        .ok_or_else(ImageGatewayError::idempotency_result_unavailable)?;
+    let usage = result.projection.usage.clone();
+    render_generation_response(result.images, result.projection, usage, auth)
+}
+
+fn render_generation_response(
+    images: Vec<crate::generator::GeneratedImage>,
+    projection: crate::artifacts::GenerationResponseProjection,
+    usage: crate::usage::UsageSnapshot,
+    auth: &crate::auth::AuthContext,
+) -> Result<Response, ImageGatewayError> {
     let mut response = images_response_into_response(
-        images_response(
-            execution.images,
-            output_format,
-            quality,
-            response_size,
-            background,
+        images_response_at(
+            projection.created_at_seconds,
+            images,
+            projection.output_format,
+            projection.quality,
+            projection.size,
+            projection.background,
         ),
-        stream,
+        projection.stream,
         ImageStreamKind::Generation,
     )?;
-    let usage = execution.usage;
-    add_usage_headers(response.headers_mut(), &usage, &auth);
+    add_usage_headers(response.headers_mut(), &usage, auth);
     Ok(response)
 }
 

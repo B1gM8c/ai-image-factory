@@ -202,7 +202,11 @@ impl TestDatabase {
                    w.lease_epoch,
                    w.execution_id IS NOT NULL AS has_execution_id,
                    ja.state AS attempt_state,
-                   i.state AS idempotency_state
+                   i.state AS idempotency_state,
+                   (SELECT COUNT(*) FROM job_response_projections rp
+                    WHERE rp.job_id = a.job_id) AS projection_count,
+                   (SELECT COUNT(*) FROM artifacts ar
+                    WHERE ar.job_id = a.job_id AND ar.state = 'ready') AS artifact_count
             FROM admission_sessions a
             JOIN idempotency_requests i ON i.session_id = a.session_id
             JOIN job_payloads p ON p.admission_session_id = a.session_id
@@ -227,7 +231,9 @@ impl TestDatabase {
                 && durable.lease_epoch == 1
                 && durable.has_execution_id
                 && durable.attempt_state == "succeeded"
-                && durable.idempotency_state == "succeeded",
+                && durable.idempotency_state == "succeeded"
+                && durable.projection_count == 1
+                && durable.artifact_count == 1,
             format!("unexpected durable execution transition: {durable:?}"),
         )?;
 
@@ -297,6 +303,8 @@ struct DurableTransitionRow {
     has_execution_id: bool,
     attempt_state: String,
     idempotency_state: String,
+    projection_count: i64,
+    artifact_count: i64,
 }
 
 #[derive(Debug, Eq, PartialEq, sqlx::FromRow)]

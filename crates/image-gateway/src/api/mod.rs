@@ -14,6 +14,7 @@ use crate::{
     AppConfig, ImageGatewayError,
     admission::{AdmissionStore, InMemoryAdmissionStore},
     api_keys::{ApiKeyStore, InMemoryApiKeyStore},
+    artifacts::{ArtifactBlobStore, InMemoryArtifactBlobStore},
     auth::{AuthContext, authorize_legacy, bearer_token},
     docs::{openapi_json, scalar_docs_html},
     generator::ImageGenerator,
@@ -41,6 +42,7 @@ pub(super) struct AppState {
     pub(super) usage_store: Arc<dyn UsageStore>,
     pub(super) admission_store: Arc<dyn AdmissionStore>,
     pub(super) generation_worker: Arc<GenerationWorker>,
+    pub(super) settlement_store: Arc<dyn ExecutionSettlementStore>,
     pub(super) scheduler: Arc<TenantJobScheduler>,
     pub(super) worker_id: String,
 }
@@ -83,9 +85,11 @@ fn build_router_with_stores(
     api_key_store: Arc<dyn ApiKeyStore>,
     admission_store: Arc<dyn AdmissionStore>,
 ) -> Router {
+    let artifact_store: Arc<dyn ArtifactBlobStore> = Arc::new(InMemoryArtifactBlobStore::default());
     let settlement_store = Arc::new(SequentialExecutionSettlementStore::new(
         admission_store.clone(),
         usage_store.clone(),
+        artifact_store.clone(),
     ));
     build_router_with_components(
         config,
@@ -94,6 +98,7 @@ fn build_router_with_stores(
         api_key_store,
         admission_store,
         settlement_store,
+        artifact_store,
     )
 }
 
@@ -104,6 +109,7 @@ pub fn build_router_with_components(
     api_key_store: Arc<dyn ApiKeyStore>,
     admission_store: Arc<dyn AdmissionStore>,
     settlement_store: Arc<dyn ExecutionSettlementStore>,
+    artifact_store: Arc<dyn ArtifactBlobStore>,
 ) -> Router {
     let scheduler = Arc::new(TenantJobScheduler::new(
         config.max_concurrent_jobs,
@@ -117,6 +123,7 @@ pub fn build_router_with_components(
         admission_store.clone(),
         settlement_store.clone(),
         usage_store.clone(),
+        artifact_store,
         config.request_timeout,
     ));
     let body_limit = config.max_upload_bytes;
@@ -127,6 +134,7 @@ pub fn build_router_with_components(
         usage_store,
         admission_store,
         generation_worker,
+        settlement_store,
         scheduler,
         worker_id: format!("gateway-{}", uuid::Uuid::new_v4().simple()),
     };

@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 type TestResult<T = ()> = Result<T, String>;
 
-const REQUIRED_COLUMNS: [(&str, &str); 15] = [
+const REQUIRED_COLUMNS: [(&str, &str); 21] = [
     ("usage_events", "tenant_id"),
     ("quota_reservations", "tenant_id"),
     ("quota_reservations", "job_id"),
@@ -29,14 +29,22 @@ const REQUIRED_COLUMNS: [(&str, &str); 15] = [
     ("jobs", "last_error_message"),
     ("gateway_api_keys", "hash_algorithm"),
     ("gateway_api_keys", "pepper_version"),
+    ("job_response_projections", "response_schema"),
+    ("job_response_projections", "created_at_seconds"),
+    ("job_response_projections", "artifact_count"),
+    ("artifacts", "execution_id"),
+    ("artifacts", "output_index"),
+    ("artifacts", "sha256_hex"),
 ];
 
-const REQUIRED_INDEXES: [&str; 5] = [
+const REQUIRED_INDEXES: [&str; 7] = [
     "usage_events_tenant_created_at_ms_idx",
     "gateway_api_keys_project_id_idx",
     "quota_reservations_active_tenant_idx",
     "jobs_tenant_state_created_idx",
     "metering_events_tenant_created_idx",
+    "artifacts_job_output_uidx",
+    "artifacts_execution_output_uidx",
 ];
 
 #[tokio::test]
@@ -351,8 +359,8 @@ async fn shared_pool_case(pool: &PgPool) -> TestResult {
 
 async fn assert_expected_schema(pool: &PgPool) -> TestResult {
     require(
-        migration_versions(pool).await? == vec![0, 1, 2, 3, 4],
-        "applied migration versions must be exactly [0, 1, 2, 3, 4]",
+        migration_versions(pool).await? == vec![0, 1, 2, 3, 4, 5],
+        "applied migration versions must be exactly [0, 1, 2, 3, 4, 5]",
     )?;
 
     for (table, column) in REQUIRED_COLUMNS {

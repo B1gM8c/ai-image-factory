@@ -499,11 +499,29 @@ pub fn images_response(
     size: String,
     background: String,
 ) -> ImagesResponse {
-    ImagesResponse {
-        created: SystemTime::now()
+    images_response_at(
+        SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs() as i64,
+        images,
+        output_format,
+        quality,
+        size,
+        background,
+    )
+}
+
+pub fn images_response_at(
+    created: i64,
+    images: Vec<GeneratedImage>,
+    output_format: String,
+    quality: String,
+    size: String,
+    background: String,
+) -> ImagesResponse {
+    ImagesResponse {
+        created,
         data: images
             .into_iter()
             .map(|image| ImageData {

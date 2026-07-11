@@ -28,6 +28,7 @@ const CODE_INVALID_IDEMPOTENCY_KEY: &str = "invalid_idempotency_key";
 const CODE_IDEMPOTENCY_CONFLICT: &str = "idempotency_conflict";
 const CODE_IDEMPOTENCY_IN_PROGRESS: &str = "idempotency_in_progress";
 const CODE_IDEMPOTENCY_RESULT_UNAVAILABLE: &str = "idempotency_result_unavailable";
+const CODE_ARTIFACT_INTEGRITY_ERROR: &str = "artifact_integrity_error";
 
 #[derive(Debug)]
 pub struct ImageGatewayError {
@@ -129,6 +130,16 @@ impl ImageGatewayError {
             TYPE_INVALID_REQUEST,
             Some("Idempotency-Key".to_string()),
             CODE_IDEMPOTENCY_RESULT_UNAVAILABLE,
+        )
+    }
+
+    pub fn artifact_integrity() -> Self {
+        Self::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Stored generation result failed integrity verification",
+            TYPE_SERVER,
+            None,
+            CODE_ARTIFACT_INTEGRITY_ERROR,
         )
     }
 

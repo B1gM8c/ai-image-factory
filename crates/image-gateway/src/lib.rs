@@ -1,6 +1,7 @@
 pub mod admission;
 mod api;
 mod api_keys;
+pub mod artifacts;
 mod auth;
 mod config;
 mod core;

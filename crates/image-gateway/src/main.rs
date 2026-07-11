@@ -4,6 +4,9 @@ use gpt_image_2_gateway::{
     ApiKeyKeyring, AppConfig, CodexImageGenerator, ImageGatewayError, PostgresApiKeyStore,
     PostgresUsageStore,
     admission::PostgresAdmissionStore,
+    artifacts::{
+        FilesystemArtifactBlobStore, artifact_root_from_env, validate_artifact_root_isolated,
+    },
     build_router_with_components,
     database::{
         DEFAULT_MAX_CONNECTIONS, connect_pool_with_schema, database_schema_from_env,
@@ -18,6 +21,13 @@ async fn main() -> Result<(), ImageGatewayError> {
     let config = AppConfig::from_env()?;
     config.validate_startup()?;
     let api_key_keyring = ApiKeyKeyring::from_env()?;
+    let artifact_root = artifact_root_from_env()?;
+    let codex_home = config
+        .codex_home
+        .as_deref()
+        .ok_or_else(|| ImageGatewayError::config("GATEWAY_CODEX_HOME is required"))?;
+    validate_artifact_root_isolated(&artifact_root, std::path::Path::new(codex_home))?;
+    let artifact_store = Arc::new(FilesystemArtifactBlobStore::new(artifact_root)?);
     let telemetry = init_telemetry()?;
 
     let database_url = database_url_from_env()?;
@@ -28,7 +38,10 @@ async fn main() -> Result<(), ImageGatewayError> {
     let usage_store = Arc::new(PostgresUsageStore::new(pool.clone()));
     let api_key_store = Arc::new(PostgresApiKeyStore::new(pool.clone(), api_key_keyring));
     let admission_store = Arc::new(PostgresAdmissionStore::new(pool.clone()));
-    let settlement_store = Arc::new(PostgresExecutionSettlementStore::new(pool));
+    let settlement_store = Arc::new(PostgresExecutionSettlementStore::new(
+        pool,
+        artifact_store.clone(),
+    ));
     let generator = Arc::new(CodexImageGenerator::new(config.clone()));
     let bind = config.bind;
     let app = build_router_with_components(
@@ -38,6 +51,7 @@ async fn main() -> Result<(), ImageGatewayError> {
         api_key_store,
         admission_store,
         settlement_store,
+        artifact_store,
     );
 
     let listener = tokio::net::TcpListener::bind(bind)

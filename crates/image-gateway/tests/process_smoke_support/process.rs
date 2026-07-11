@@ -25,6 +25,7 @@ pub(crate) struct SmokeFiles {
     pub(crate) stdin_log: PathBuf,
     pub(crate) fake_pid_log: PathBuf,
     pub(crate) invocation_log: PathBuf,
+    pub(crate) artifact_root: PathBuf,
     fake_bin: PathBuf,
     codex_home: PathBuf,
     fake_active_pid: PathBuf,
@@ -44,10 +45,13 @@ impl SmokeFiles {
         let fake_active_pid = root.path().join("codex.active.pid");
         let fixture_path = root.path().join("opaque.png");
         let gateway_log = root.path().join("gateway.log");
+        let artifact_root = root.path().join("artifacts");
         fs::create_dir_all(&fake_bin)
             .map_err(|error| format!("failed to create fake bin: {error}"))?;
         fs::create_dir_all(&codex_home)
             .map_err(|error| format!("failed to create Codex home: {error}"))?;
+        fs::create_dir_all(&artifact_root)
+            .map_err(|error| format!("failed to create artifact root: {error}"))?;
         fs::write(&fixture_path, fixture)
             .map_err(|error| format!("failed to write PNG fixture: {error}"))?;
 
@@ -76,6 +80,7 @@ impl SmokeFiles {
             stdin_log,
             fake_pid_log,
             invocation_log,
+            artifact_root,
             fake_bin,
             codex_home,
             fake_active_pid,
@@ -131,6 +136,7 @@ impl GatewayProcess {
             )
             .env("GATEWAY_API_KEY_CURRENT_PEPPER_VERSION", "1")
             .env("GATEWAY_CODEX_HOME", &files.codex_home)
+            .env("GATEWAY_ARTIFACT_ROOT", &files.artifact_root)
             .env("GATEWAY_CLEANUP_CODEX_OUTPUTS", "true")
             .env("GATEWAY_QUEUE_TIMEOUT_SECS", "1")
             .env("GATEWAY_REQUEST_TIMEOUT_SECS", "5")

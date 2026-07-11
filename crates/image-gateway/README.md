@@ -28,6 +28,7 @@ export GATEWAY_ADMIN_TOKEN='admin-token'
 export GATEWAY_API_KEY_PEPPERS="1:$(openssl rand -hex 32)"
 export GATEWAY_API_KEY_CURRENT_PEPPER_VERSION='1'
 export GATEWAY_CODEX_HOME='/srv/gpt-image-codex-home'
+export GATEWAY_ARTIFACT_ROOT='/srv/ai-image-factory/artifacts'
 cargo run --bin factoryctl -- migrate
 cargo run
 ```
@@ -39,13 +40,15 @@ cargo run -p gpt-image-2-gateway --bin factoryctl -- migrate
 cargo run -p gpt-image-2-gateway
 ```
 
-Default bind address is `127.0.0.1:8787`. Every startup requires at least one of `GATEWAY_API_TOKEN` or `GATEWAY_ADMIN_TOKEN`, a versioned API-key pepper keyring, plus an explicit absolute, existing, writable `GATEWAY_CODEX_HOME`. If both tokens are configured, they must be different. `GATEWAY_ADMIN_TOKEN` protects Admin endpoints for creating and revoking project API keys; it never authorizes image calls. An admin-only startup can bootstrap project keys, and image calls must then use one of those keys. `GATEWAY_API_TOKEN` remains a legacy image token and is not accepted on Admin endpoints.
+Default bind address is `127.0.0.1:8787`. Every startup requires at least one of `GATEWAY_API_TOKEN` or `GATEWAY_ADMIN_TOKEN`, a versioned API-key pepper keyring, an explicit absolute, existing, writable `GATEWAY_CODEX_HOME`, and an explicit absolute, existing `GATEWAY_ARTIFACT_ROOT`. If both tokens are configured, they must be different. `GATEWAY_ADMIN_TOKEN` protects Admin endpoints for creating and revoking project API keys; it never authorizes image calls. An admin-only startup can bootstrap project keys, and image calls must then use one of those keys. `GATEWAY_API_TOKEN` remains a legacy image token and is not accepted on Admin endpoints.
 
 `GATEWAY_API_KEY_PEPPERS` is a comma-separated `version:64-hex` keyring. `GATEWAY_API_KEY_CURRENT_PEPPER_VERSION` selects the version used for new keys. During rotation, keep both versions configured, change the current version, then retire the old version after its keys have been rotated or revoked. Pepper values belong in KMS/secret-manager injection, never in source control.
 
 Legacy SHA-256 credential reads are disabled by default. Set `GATEWAY_API_KEY_ALLOW_LEGACY_SHA256=true` only during a controlled migration window, then remove it after those keys are rotated or revoked.
 
 The gateway does not yet provide native TLS and rejects every non-loopback bind. Bind it to loopback and place a TLS reverse proxy on the same host in front of it. Provision `GATEWAY_CODEX_HOME` before every startup and grant the gateway service account permission to create and remove files there; the path must not be a symlink or the filesystem root. `--ignore-user-config` skips user `config.toml`; Codex may still load its native system image generation skill.
+
+`GATEWAY_ARTIFACT_ROOT` stores immutable generated-image blobs. The root must be owned by the gateway service user, must not be a symlink, and must not be group or world writable. The current filesystem backend is production-supported only when every gateway/worker process runs on one host or mounts the same persistent POSIX volume. PostgreSQL stores artifact metadata and immutable response projections, not image bytes. A successful generation writes and syncs every blob before the fenced settlement transaction commits job success, quota, metering, artifact metadata, and the replay projection. Reusing the same completed `Idempotency-Key` reconstructs the original JSON or final SSE response without another Codex invocation or another charge.
 
 ## Example
 
@@ -121,7 +124,8 @@ Current MVP behavior:
 - `GATEWAY_IMAGE_LIMIT_5H` defaults to `40`.
 - `GATEWAY_IMAGE_LIMIT_7D` defaults to `200`.
 - After validation and queue admission, a request reserves `n` image units before Codex generation starts.
-- Successful generation commits the reservation. Generation or edit failure releases it, so failed provider attempts are not charged.
+- Successful generation commits the reservation. Provider failures release it. A failure after the provider returned, such as artifact persistence failure, marks the work uncertain and leaves the reservation for reconciliation instead of falsely declaring that no provider cost occurred.
+- Generation artifacts are persisted before success settlement. Completed idempotent generation requests replay the original response projection and verified bytes without reserving quota again.
 - Responses include `x-request-id`, `openai-version`, `openai-project`, and image-unit quota headers when available.
 - PostgreSQL reservation transitions are serialized per tenant, and integration tests cover concurrent reservations without quota oversell.
 - Local Codex capacity permits remain in-process; durable work ordering and weighted finish tags are stored in PostgreSQL.

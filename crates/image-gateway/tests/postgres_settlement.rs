@@ -1,10 +1,14 @@
-use std::env;
+use std::{env, sync::Arc};
 
 use gpt_image_2_gateway::{
     ExecutionSettlementStore, PostgresExecutionSettlementStore, PostgresUsageStore, UsageCharge,
     UsageLimits, UsageReservation, UsageStore,
     admission::{
         AdmissionClaim, AdmissionStore, AdmissionTicket, AttachJob, ClaimAdmission, WorkLease,
+    },
+    artifacts::{
+        ArtifactBlobStore, ArtifactIdentity, GENERATION_RESPONSE_SCHEMA,
+        GenerationResponseProjection, GenerationResultManifest, InMemoryArtifactBlobStore,
     },
     database::{connect_test_pool_with_search_path, run_migrations},
 };
@@ -21,11 +25,16 @@ async fn forged_reservation_rolls_back_every_success_transition() -> TestResult 
     };
     let result = async {
         let fixture = RunningFixture::new(&database.pool).await?;
-        let store = PostgresExecutionSettlementStore::new(database.pool.clone());
+        let artifacts = Arc::new(InMemoryArtifactBlobStore::default());
+        let result_manifest = fixture.result_manifest(artifacts.as_ref()).await?;
+        let store = PostgresExecutionSettlementStore::new(database.pool.clone(), artifacts);
 
         for forged in forged_reservations(&fixture.reservation) {
             require(
-                store.succeed(&fixture.lease, &forged).await.is_err(),
+                store
+                    .succeed(&fixture.lease, &forged, &result_manifest)
+                    .await
+                    .is_err(),
                 "forged reservation was accepted",
             )?;
         }
@@ -83,10 +92,12 @@ async fn valid_settlement_is_atomic_and_duplicate_calls_are_side_effect_free() -
     };
     let result = async {
         let fixture = RunningFixture::new(&database.pool).await?;
-        let store = PostgresExecutionSettlementStore::new(database.pool.clone());
+        let artifacts = Arc::new(InMemoryArtifactBlobStore::default());
+        let result_manifest = fixture.result_manifest(artifacts.as_ref()).await?;
+        let store = PostgresExecutionSettlementStore::new(database.pool.clone(), artifacts);
 
         let first = store
-            .succeed(&fixture.lease, &fixture.reservation)
+            .succeed(&fixture.lease, &fixture.reservation, &result_manifest)
             .await
             .map_err(|error| format!("valid settlement failed: {error:?}"))?;
         assert_snapshot_matches(&first, &fixture.reservation)?;
@@ -94,7 +105,7 @@ async fn valid_settlement_is_atomic_and_duplicate_calls_are_side_effect_free() -
         let counts_after_first = success_effect_counts(&database.pool, &fixture).await?;
 
         let repeated = store
-            .succeed(&fixture.lease, &fixture.reservation)
+            .succeed(&fixture.lease, &fixture.reservation, &result_manifest)
             .await
             .map_err(|error| format!("duplicate settlement failed: {error:?}"))?;
         assert_snapshot_matches(&repeated, &fixture.reservation)?;
@@ -109,6 +120,25 @@ async fn valid_settlement_is_atomic_and_duplicate_calls_are_side_effect_free() -
         require(
             counts_after_repeat == SuccessEffectCounts::expected(),
             format!("unexpected success effect counts: {counts_after_repeat:?}"),
+        )?;
+
+        let mut conflicting_manifest = result_manifest.clone();
+        conflicting_manifest.projection.quality = "low".to_string();
+        require(
+            store
+                .succeed(
+                    &fixture.lease,
+                    &fixture.reservation,
+                    &conflicting_manifest,
+                )
+                .await
+                .is_err(),
+            "completed settlement accepted a different response projection",
+        )?;
+        let counts_after_conflict = success_effect_counts(&database.pool, &fixture).await?;
+        require(
+            counts_after_conflict == counts_after_repeat,
+            "conflicting duplicate settlement changed durable success effects",
         )
     }
     .await;
@@ -123,11 +153,13 @@ async fn valid_handles_from_different_jobs_cannot_be_cross_settled() -> TestResu
     let result = async {
         let left = RunningFixture::new(&database.pool).await?;
         let right = RunningFixture::new(&database.pool).await?;
-        let store = PostgresExecutionSettlementStore::new(database.pool.clone());
+        let artifacts = Arc::new(InMemoryArtifactBlobStore::default());
+        let result_manifest = left.result_manifest(artifacts.as_ref()).await?;
+        let store = PostgresExecutionSettlementStore::new(database.pool.clone(), artifacts);
 
         require(
             store
-                .succeed(&left.lease, &right.reservation)
+                .succeed(&left.lease, &right.reservation, &result_manifest)
                 .await
                 .is_err(),
             "valid handles from different jobs were cross-settled",
@@ -225,6 +257,49 @@ impl RunningFixture {
             .map_err(|error| format!("failed to attach and start work: {error}"))?;
 
         Ok(Self { lease, reservation })
+    }
+
+    async fn result_manifest(
+        &self,
+        artifacts: &dyn ArtifactBlobStore,
+    ) -> TestResult<GenerationResultManifest> {
+        let mut stored = Vec::new();
+        for output_index in 0..self.reservation.charge.units {
+            stored.push(
+                artifacts
+                    .put(
+                        ArtifactIdentity {
+                            artifact_id: Uuid::new_v4(),
+                            tenant_id: self.reservation.charge.tenant_id.clone(),
+                            job_id: self.lease.job_id,
+                            work_item_id: self.lease.work_item_id,
+                            execution_id: self.lease.execution_id,
+                            lease_epoch: self.lease.lease_epoch,
+                            output_index,
+                            media_type: "image/png".to_string(),
+                        },
+                        format!("artifact-{output_index}").as_bytes(),
+                    )
+                    .await
+                    .map_err(|error| format!("failed to stage test artifact: {error:?}"))?,
+            );
+        }
+        Ok(GenerationResultManifest {
+            job_id: self.lease.job_id,
+            tenant_id: self.reservation.charge.tenant_id.clone(),
+            projection: GenerationResponseProjection {
+                api_profile: "openai-images-v1".to_string(),
+                response_schema: GENERATION_RESPONSE_SCHEMA.to_string(),
+                created_at_seconds: 1_800_000_000,
+                output_format: "png".to_string(),
+                quality: "high".to_string(),
+                size: "1024x1024".to_string(),
+                background: "opaque".to_string(),
+                stream: false,
+                usage: self.reservation.snapshot.clone(),
+            },
+            artifacts: stored,
+        })
     }
 }
 
@@ -361,6 +436,8 @@ struct SuccessEffectCounts {
     job_metering: i64,
     job_events: i64,
     outbox: i64,
+    projections: i64,
+    artifacts: i64,
 }
 
 impl SuccessEffectCounts {
@@ -371,6 +448,8 @@ impl SuccessEffectCounts {
             job_metering: 1,
             job_events: 1,
             outbox: 1,
+            projections: 1,
+            artifacts: 2,
         }
     }
 }
@@ -391,7 +470,11 @@ async fn success_effect_counts(
           (SELECT COUNT(*) FROM job_events
            WHERE job_id = $3 AND event_type = 'job.succeeded') AS job_events,
           (SELECT COUNT(*) FROM outbox_events
-           WHERE job_id = $3 AND event_type = 'job.succeeded') AS outbox
+           WHERE job_id = $3 AND event_type = 'job.succeeded') AS outbox,
+          (SELECT COUNT(*) FROM job_response_projections
+           WHERE job_id = $3) AS projections,
+          (SELECT COUNT(*) FROM artifacts
+           WHERE job_id = $3) AS artifacts
         "#,
     )
     .bind(&fixture.reservation.charge.tenant_id)

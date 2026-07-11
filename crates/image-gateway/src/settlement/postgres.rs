@@ -1,24 +1,38 @@
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
-use super::ExecutionSettlementStore;
+use super::{ExecutionSettlementStore, validate_generation_result};
 use crate::{
     ImageGatewayError,
     admission::WorkLease,
+    artifacts::{
+        ArtifactBlobStore, GenerationResultManifest, StoredGenerationResult,
+        hydrate_generation_result,
+    },
     usage::{UsageReservation, UsageSnapshot},
 };
+
+mod results;
+
+use results::{load_generation_manifest, persist_generation_result, validate_completed_result};
 
 #[derive(Clone)]
 pub struct PostgresExecutionSettlementStore {
     pool: PgPool,
+    artifact_store: Arc<dyn ArtifactBlobStore>,
 }
 
 impl PostgresExecutionSettlementStore {
-    pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+    pub fn new(pool: PgPool, artifact_store: Arc<dyn ArtifactBlobStore>) -> Self {
+        Self {
+            pool,
+            artifact_store,
+        }
     }
 }
 
@@ -28,29 +42,27 @@ impl ExecutionSettlementStore for PostgresExecutionSettlementStore {
         &self,
         lease: &WorkLease,
         reservation: &UsageReservation,
+        result: &GenerationResultManifest,
     ) -> Result<UsageSnapshot, ImageGatewayError> {
-        if lease.job_id != reservation.job_id {
-            return Err(ImageGatewayError::internal(
-                "work lease and quota reservation belong to different jobs",
-            ));
-        }
+        validate_generation_result(lease, reservation, result)?;
         let mut tx = self.pool.begin().await.map_err(settlement_unavailable)?;
         lock_tenant_quota(&mut tx, &reservation.charge.tenant_id).await?;
-        let now = database_now(&mut tx).await?;
-
         let quota_job = lock_quota_and_job(&mut tx, reservation).await?;
         validate_reservation_handle(&quota_job, reservation)?;
         let work_attempt = lock_work_and_attempt(&mut tx, lease).await?;
         validate_lease_identity(&work_attempt, lease)?;
         let idempotency = lock_idempotency(&mut tx, lease.job_id).await?;
+        let now = database_now(&mut tx).await?;
 
         if is_completed(&quota_job, &work_attempt) {
             validate_completed_state(&quota_job, &work_attempt, &idempotency)?;
+            validate_completed_result(&mut tx, result).await?;
             tx.commit().await.map_err(settlement_unavailable)?;
             return Ok(reservation.snapshot.clone());
         }
 
         validate_active_state(&quota_job, &work_attempt, &idempotency, lease, now)?;
+        persist_generation_result(&mut tx, result, now).await?;
         transition_work(&mut tx, lease, now).await?;
         transition_attempt(&mut tx, lease, now).await?;
         transition_idempotency(&mut tx, lease.job_id, now, idempotency.len()).await?;
@@ -62,6 +74,18 @@ impl ExecutionSettlementStore for PostgresExecutionSettlementStore {
 
         tx.commit().await.map_err(settlement_unavailable)?;
         Ok(reservation.snapshot.clone())
+    }
+
+    async fn load_generation_result(
+        &self,
+        job_id: Uuid,
+    ) -> Result<Option<StoredGenerationResult>, ImageGatewayError> {
+        let Some(manifest) = load_generation_manifest(&self.pool, job_id).await? else {
+            return Ok(None);
+        };
+        hydrate_generation_result(self.artifact_store.as_ref(), manifest)
+            .await
+            .map(Some)
     }
 }
 

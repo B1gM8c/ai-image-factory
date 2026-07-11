@@ -12,6 +12,13 @@
 > `2026-platform-upgrade.md` and `2026-scheduler-quota-design.md`. Those files
 > remain useful as implementation history.
 
+> Implementation checkpoint (2026-07-10): durable admission, PostgreSQL weighted
+> scheduling metadata, fenced atomic success settlement, versioned HMAC API keys,
+> filesystem artifact persistence, immutable response projections, and generation
+> idempotency replay are implemented. The filesystem backend is an interim
+> single-host/shared-POSIX-volume deployment profile; S3-compatible storage,
+> independently deployed workers, and reconciliation remain target work.
+
 ## 1. Executive Decision
 
 AI Image Factory should be a **modular Rust monolith with separately deployable
@@ -73,12 +80,11 @@ crashes, retries, timeouts, and concurrent workers:
 - No provider/account/tenant capacity limit can be multiplied by adding gateway
   or worker replicas.
 
-## 3. Current-State Adversarial Findings
+## 3. Initial-State Adversarial Findings
 
-The current code is a useful synchronous prototype and has produced a successful
-real Codex smoke during the present uncommitted workspace work. The repository
-has no commit baseline, so Phase 0 must recapture that evidence from a reviewable
-revision. It is not yet a multi-provider production architecture.
+This section preserves the findings from the initial architecture review. Some
+items have since been addressed by the implementation checkpoint above; the
+remaining findings continue to drive later phases.
 
 ### 3.1 P0 correctness findings
 
@@ -386,7 +392,7 @@ sequenceDiagram
         Worker->>PG: record accepted handle and schedule poll
         Worker->>PG: release worker lease, keep outstanding provider allocation
     end
-    Worker->>Store: promote validated staged objects to canonical artifact keys
+    Worker->>Store: publish immutable attempt-scoped or content-addressed objects
     Worker->>PG: fenced settlement transaction
     PG-->>Gateway: terminal event via re-read + wakeup hint
     Gateway-->>Client: profile-specific response/SSE/poll result

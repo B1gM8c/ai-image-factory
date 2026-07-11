@@ -3,7 +3,8 @@ mod database;
 mod process;
 
 pub(crate) use assertions::{
-    assert_codex_outputs, assert_prompt_semantics, assert_response, header, opaque_png,
+    assert_artifact_bytes, assert_codex_outputs, assert_prompt_semantics, assert_response, header,
+    opaque_png, tamper_artifact,
 };
 pub(crate) use database::TestDatabase;
 pub(crate) use process::{

@@ -10,7 +10,7 @@ use std::{
 use async_trait::async_trait;
 use axum::{
     body::{Body, to_bytes},
-    http::{Method, Request, StatusCode, header},
+    http::{HeaderMap, Method, Request, StatusCode, header},
 };
 use gpt_image_2_gateway::{
     AppConfig, EditJob, GeneratedImage, GenerationJob, ImageGatewayError, ImageGenerator,
@@ -65,15 +65,30 @@ async fn completed_idempotent_request_is_not_executed_again() {
     let app = app(generator.clone());
     let body = generation_body("one prompt");
 
-    let first = send(app.clone(), "retry-key", body.clone()).await;
-    let second = send(app, "retry-key", body).await;
+    let first = send_raw(app.clone(), "retry-key", body.clone()).await;
+    let second = send_raw(app, "retry-key", body).await;
 
     assert_eq!(first.0, StatusCode::OK);
-    assert_error(
-        second,
-        StatusCode::CONFLICT,
-        "idempotency_result_unavailable",
-    );
+    assert_eq!(second.0, StatusCode::OK);
+    assert_eq!(second.2, first.2);
+    assert_eq!(generator.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn completed_streaming_request_replays_identical_sse_bytes() {
+    let generator = CountingGenerator::new(Duration::ZERO);
+    let app = app(generator.clone());
+    let mut body = generation_body("streaming prompt");
+    body["stream"] = json!(true);
+
+    let first = send_raw(app.clone(), "stream-retry-key", body.clone()).await;
+    let second = send_raw(app, "stream-retry-key", body).await;
+
+    assert_eq!(first.0, StatusCode::OK);
+    assert_eq!(second.0, StatusCode::OK);
+    assert_eq!(first.1[header::CONTENT_TYPE], "text/event-stream");
+    assert_eq!(second.1[header::CONTENT_TYPE], "text/event-stream");
+    assert_eq!(second.2, first.2);
     assert_eq!(generator.calls.load(Ordering::SeqCst), 1);
 }
 
@@ -148,6 +163,14 @@ fn generation_body(prompt: &str) -> Value {
 }
 
 async fn send(app: axum::Router, key: &str, body: Value) -> (StatusCode, Value) {
+    let (status, _, body) = send_raw(app, key, body).await;
+    (
+        status,
+        serde_json::from_slice(&body).expect("JSON response"),
+    )
+}
+
+async fn send_raw(app: axum::Router, key: &str, body: Value) -> (StatusCode, HeaderMap, Vec<u8>) {
     let response = app
         .oneshot(
             Request::builder()
@@ -162,13 +185,11 @@ async fn send(app: axum::Router, key: &str, body: Value) -> (StatusCode, Value) 
         .await
         .expect("response");
     let status = response.status();
+    let headers = response.headers().clone();
     let body = to_bytes(response.into_body(), usize::MAX)
         .await
         .expect("response body");
-    (
-        status,
-        serde_json::from_slice(&body).expect("JSON response"),
-    )
+    (status, headers, body.to_vec())
 }
 
 fn assert_error(response: (StatusCode, Value), status: StatusCode, code: &str) {

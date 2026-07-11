@@ -43,7 +43,7 @@ pub struct UsageReservation {
     pub snapshot: UsageSnapshot,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UsageSnapshot {
     pub limit_5h: u32,
     pub remaining_5h: u32,

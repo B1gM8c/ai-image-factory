@@ -7,9 +7,10 @@ use std::time::Duration;
 use serde_json::{Value, json};
 
 use process_smoke_support::{
-    API_TOKEN, GatewayProcess, SmokeFiles, TestDatabase, TestResult, assert_codex_outputs,
-    assert_prompt_semantics, assert_response, combine_results, header, opaque_png, poll_health,
-    require, start_gateway_with_retry, startup_failed_from_address_in_use,
+    API_TOKEN, GatewayProcess, SmokeFiles, TestDatabase, TestResult, assert_artifact_bytes,
+    assert_codex_outputs, assert_prompt_semantics, assert_response, combine_results, header,
+    opaque_png, poll_health, require, start_gateway_with_retry, startup_failed_from_address_in_use,
+    tamper_artifact,
 };
 
 const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
@@ -102,6 +103,13 @@ async fn exercise_gateway(
     )?;
     assert_response(&body, &headers, fixture)?;
     assert_codex_outputs(files)?;
+    assert_artifact_bytes(files, fixture)?;
+
+    gateway.terminate().await?;
+    let (restarted, restarted_address) = start_gateway_with_retry(client, database, files).await?;
+    *gateway = restarted;
+    let base_url = format!("http://{restarted_address}");
+    poll_health(client, &base_url, gateway).await?;
 
     let replay = client
         .post(format!("{base_url}/v1/images/generations"))
@@ -112,14 +120,50 @@ async fn exercise_gateway(
         .await
         .map_err(|error| format!("idempotent replay failed: {error}"))?;
     let replay_status = replay.status();
+    let replay_headers = replay.headers().clone();
+    let replay_request_id = header(&replay_headers, "x-request-id")?;
     let replay_body: Value = replay
         .json()
         .await
         .map_err(|error| format!("idempotent replay was not JSON: {error}"))?;
     require(
-        replay_status == reqwest::StatusCode::CONFLICT
-            && replay_body["error"]["code"] == "idempotency_result_unavailable",
+        replay_status == reqwest::StatusCode::OK && replay_body == body,
         format!("unexpected idempotent replay response {replay_status}: {replay_body:#}"),
+    )?;
+    require(
+        replay_request_id != request_id,
+        "replay must receive a fresh request id",
+    )?;
+    assert_response(&replay_body, &replay_headers, fixture)?;
+    assert_codex_outputs(files)?;
+    assert_artifact_bytes(files, fixture)?;
+    tamper_artifact(files)?;
+
+    let corrupted = client
+        .post(format!("{base_url}/v1/images/generations"))
+        .bearer_auth(API_TOKEN)
+        .header("Idempotency-Key", IDEMPOTENCY_KEY)
+        .json(&request_body)
+        .send()
+        .await
+        .map_err(|error| format!("corrupted artifact replay failed: {error}"))?;
+    let corrupted_status = corrupted.status();
+    let corrupted_body: Value = corrupted
+        .json()
+        .await
+        .map_err(|error| format!("corrupted artifact response was not JSON: {error}"))?;
+    require(
+        corrupted_status == reqwest::StatusCode::INTERNAL_SERVER_ERROR
+            && corrupted_body["error"]["code"] == "artifact_integrity_error"
+            && corrupted_body["error"]["param"].is_null(),
+        format!("unexpected corrupted artifact response {corrupted_status}: {corrupted_body:#}"),
+    )?;
+    require(
+        !corrupted_body["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(&files.artifact_root.display().to_string()),
+        "artifact integrity error leaked the storage path",
     )?;
     assert_codex_outputs(files)?;
     database.assert_transitions(&request_id).await
