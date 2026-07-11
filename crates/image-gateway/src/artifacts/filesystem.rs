@@ -19,6 +19,47 @@ pub struct FilesystemArtifactBlobStore {
     root: PathBuf,
 }
 
+struct PendingArtifact {
+    temporary: PathBuf,
+    object: PathBuf,
+    linked: bool,
+    committed: bool,
+}
+
+impl PendingArtifact {
+    fn new(temporary: PathBuf, object: PathBuf) -> Self {
+        Self {
+            temporary,
+            object,
+            linked: false,
+            committed: false,
+        }
+    }
+
+    fn mark_linked(&mut self) {
+        self.linked = true;
+    }
+
+    fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for PendingArtifact {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        let _ = fs::remove_file(&self.temporary);
+        if self.linked {
+            let _ = fs::remove_file(&self.object);
+            if let Some(parent) = self.object.parent() {
+                let _ = sync_directory(parent);
+            }
+        }
+    }
+}
+
 impl FilesystemArtifactBlobStore {
     pub fn new(root: impl AsRef<Path>) -> Result<Self, ImageGatewayError> {
         let root = validate_root(root.as_ref())?;
@@ -62,6 +103,7 @@ impl ArtifactBlobStore for FilesystemArtifactBlobStore {
         set_private_directory_permissions(parent).map_err(|_| ArtifactWriteError::Unavailable)?;
 
         let temporary = parent.join(format!(".tmp-{}", Uuid::new_v4().simple()));
+        let mut pending = PendingArtifact::new(temporary.clone(), object_path.clone());
         let mut options = tokio::fs::OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
@@ -80,7 +122,6 @@ impl ArtifactBlobStore for FilesystemArtifactBlobStore {
         .await;
         drop(file);
         if write_result.is_err() {
-            let _ = tokio::fs::remove_file(&temporary).await;
             return Err(ArtifactWriteError::Unavailable);
         }
 
@@ -88,22 +129,24 @@ impl ArtifactBlobStore for FilesystemArtifactBlobStore {
             .await
             .is_err()
         {
-            let _ = tokio::fs::remove_file(&temporary).await;
             return Err(ArtifactWriteError::Unavailable);
         }
+        pending.mark_linked();
         if tokio::fs::remove_file(&temporary).await.is_err()
             || sync_directory_async(parent.to_path_buf()).await.is_err()
         {
             return Err(ArtifactWriteError::Unavailable);
         }
 
-        Ok(ArtifactMetadata {
+        let metadata = ArtifactMetadata {
             identity,
             storage_backend: FILESYSTEM_BACKEND.to_string(),
             object_key,
             sha256_hex: sha256_hex(bytes),
             byte_size: bytes.len() as u64,
-        })
+        };
+        pending.commit();
+        Ok(metadata)
     }
 
     async fn get(&self, artifact: &ArtifactMetadata) -> Result<Vec<u8>, ArtifactReadError> {
@@ -134,6 +177,24 @@ impl ArtifactBlobStore for FilesystemArtifactBlobStore {
             return Err(ArtifactReadError::Integrity);
         }
         Ok(bytes)
+    }
+
+    async fn delete(&self, artifact: &ArtifactMetadata) -> Result<(), ArtifactWriteError> {
+        if artifact.storage_backend != FILESYSTEM_BACKEND
+            || artifact.object_key != Self::object_key(&artifact.identity)
+        {
+            return Err(ArtifactWriteError::Unavailable);
+        }
+        let path = self.object_path(&artifact.identity);
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(_) => return Err(ArtifactWriteError::Unavailable),
+        }
+        let parent = path.parent().ok_or(ArtifactWriteError::Unavailable)?;
+        sync_directory_async(parent.to_path_buf())
+            .await
+            .map_err(|_| ArtifactWriteError::Unavailable)
     }
 }
 
@@ -208,4 +269,41 @@ fn open_regular_no_follow(path: &Path) -> Result<fs::File, ArtifactReadError> {
         }
         _ => ArtifactReadError::Unavailable,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PendingArtifact;
+
+    #[test]
+    fn pending_artifact_drop_removes_temporary_and_linked_object() {
+        let directory = tempfile::tempdir().unwrap();
+        let temporary = directory.path().join("temporary");
+        let object = directory.path().join("object");
+        std::fs::write(&temporary, b"artifact").unwrap();
+        std::fs::hard_link(&temporary, &object).unwrap();
+
+        let mut pending = PendingArtifact::new(temporary.clone(), object.clone());
+        pending.mark_linked();
+        drop(pending);
+
+        assert!(!temporary.exists());
+        assert!(!object.exists());
+    }
+
+    #[test]
+    fn committed_artifact_is_not_removed() {
+        let directory = tempfile::tempdir().unwrap();
+        let temporary = directory.path().join("temporary");
+        let object = directory.path().join("object");
+        std::fs::write(&temporary, b"artifact").unwrap();
+        std::fs::hard_link(&temporary, &object).unwrap();
+        std::fs::remove_file(&temporary).unwrap();
+
+        let mut pending = PendingArtifact::new(temporary, object.clone());
+        pending.mark_linked();
+        pending.commit();
+
+        assert_eq!(std::fs::read(object).unwrap(), b"artifact");
+    }
 }

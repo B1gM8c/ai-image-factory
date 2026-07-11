@@ -83,6 +83,8 @@ pub trait ArtifactBlobStore: Send + Sync + 'static {
     ) -> Result<ArtifactMetadata, ArtifactWriteError>;
 
     async fn get(&self, artifact: &ArtifactMetadata) -> Result<Vec<u8>, ArtifactReadError>;
+
+    async fn delete(&self, artifact: &ArtifactMetadata) -> Result<(), ArtifactWriteError>;
 }
 
 pub fn artifact_root_from_env() -> Result<PathBuf, ImageGatewayError> {

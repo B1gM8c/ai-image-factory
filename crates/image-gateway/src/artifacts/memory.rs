@@ -54,4 +54,17 @@ impl ArtifactBlobStore for InMemoryArtifactBlobStore {
         }
         Ok(bytes)
     }
+
+    async fn delete(&self, artifact: &ArtifactMetadata) -> Result<(), ArtifactWriteError> {
+        if artifact.storage_backend != MEMORY_BACKEND
+            || artifact.object_key != format!("objects/{}", artifact.identity.artifact_id.simple())
+        {
+            return Err(ArtifactWriteError::Unavailable);
+        }
+        self.objects
+            .lock()
+            .map_err(|_| ArtifactWriteError::Unavailable)?
+            .remove(&artifact.object_key);
+        Ok(())
+    }
 }

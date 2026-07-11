@@ -7,8 +7,8 @@ mod memory;
 mod postgres;
 
 pub use command::{
-    GENERATION_COMMAND_SCHEMA_VERSION, GENERATION_OPERATION, GenerationCommandV1,
-    IdempotencyKeyError, idempotency_key_digest, validate_idempotency_key,
+    GENERATION_COMMAND_SCHEMA, GENERATION_COMMAND_SCHEMA_VERSION, GENERATION_OPERATION,
+    GenerationCommandV1, IdempotencyKeyError, idempotency_key_digest, validate_idempotency_key,
 };
 pub use memory::InMemoryAdmissionStore;
 pub use postgres::PostgresAdmissionStore;

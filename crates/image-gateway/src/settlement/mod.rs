@@ -28,10 +28,30 @@ pub trait ExecutionSettlementStore: Send + Sync + 'static {
         result: &GenerationResultManifest,
     ) -> Result<UsageSnapshot, ImageGatewayError>;
 
+    async fn fail(
+        &self,
+        lease: &WorkLease,
+        reservation: &UsageReservation,
+        error_code: &'static str,
+    ) -> Result<(), ImageGatewayError>;
+
     async fn load_generation_result(
         &self,
         job_id: uuid::Uuid,
     ) -> Result<Option<StoredGenerationResult>, ImageGatewayError>;
+
+    async fn generation_status(
+        &self,
+        job_id: uuid::Uuid,
+    ) -> Result<GenerationResultStatus, ImageGatewayError>;
+}
+
+#[derive(Debug)]
+pub enum GenerationResultStatus {
+    Pending,
+    Succeeded(StoredGenerationResult),
+    Failed { error_code: Option<String> },
+    Uncertain,
 }
 
 pub(crate) struct SequentialExecutionSettlementStore {
@@ -87,6 +107,19 @@ impl ExecutionSettlementStore for SequentialExecutionSettlementStore {
         self.usage_store.commit(reservation).await
     }
 
+    async fn fail(
+        &self,
+        lease: &WorkLease,
+        reservation: &UsageReservation,
+        error_code: &'static str,
+    ) -> Result<(), ImageGatewayError> {
+        self.admission_store
+            .settle(lease, WorkOutcome::Failed, Some(error_code))
+            .await
+            .map_err(map_admission_error)?;
+        self.usage_store.release(reservation, error_code).await
+    }
+
     async fn load_generation_result(
         &self,
         job_id: uuid::Uuid,
@@ -102,6 +135,16 @@ impl ExecutionSettlementStore for SequentialExecutionSettlementStore {
                 .await
                 .map(Some),
             None => Ok(None),
+        }
+    }
+
+    async fn generation_status(
+        &self,
+        job_id: uuid::Uuid,
+    ) -> Result<GenerationResultStatus, ImageGatewayError> {
+        match self.load_generation_result(job_id).await? {
+            Some(result) => Ok(GenerationResultStatus::Succeeded(result)),
+            None => Ok(GenerationResultStatus::Pending),
         }
     }
 }

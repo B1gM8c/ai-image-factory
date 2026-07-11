@@ -7,7 +7,7 @@ use gpt_image_2_gateway::{
     artifacts::{
         FilesystemArtifactBlobStore, artifact_root_from_env, validate_artifact_root_isolated,
     },
-    build_router_with_components,
+    build_router_with_external_execution,
     database::{
         DEFAULT_MAX_CONNECTIONS, connect_pool_with_schema, database_schema_from_env,
         database_url_from_env, verify_migrations,
@@ -44,7 +44,7 @@ async fn main() -> Result<(), ImageGatewayError> {
     ));
     let generator = Arc::new(CodexImageGenerator::new(config.clone()));
     let bind = config.bind;
-    let app = build_router_with_components(
+    let app = build_router_with_external_execution(
         config,
         generator,
         usage_store,

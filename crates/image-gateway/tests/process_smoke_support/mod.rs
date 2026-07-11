@@ -8,7 +8,7 @@ pub(crate) use assertions::{
 };
 pub(crate) use database::TestDatabase;
 pub(crate) use process::{
-    GatewayProcess, SmokeFiles, poll_health, read_pid, start_gateway_with_retry,
+    GatewayProcess, SmokeFiles, WorkerdProcess, poll_health, read_pid, start_gateway_with_retry,
     startup_failed_from_address_in_use,
 };
 

@@ -83,6 +83,25 @@ impl TestDatabase {
         &self.schema
     }
 
+    pub(crate) async fn wait_for_generation_work_count(&self, expected: i64) -> TestResult {
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let count: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM work_items WHERE state IN ('ready', 'leased', 'running')",
+                )
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|error| format!("failed to count generation work: {error}"))?;
+                if count >= expected {
+                    return Ok(());
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .map_err(|_| format!("durable queue did not reach {expected} active work items"))?
+    }
+
     pub(crate) async fn assert_transitions(&self, request_id: &str) -> TestResult {
         let transition: TransitionRow = sqlx::query_as(
             r#"
@@ -202,6 +221,7 @@ impl TestDatabase {
                    w.lease_epoch,
                    w.execution_id IS NOT NULL AS has_execution_id,
                    ja.state AS attempt_state,
+                   ja.worker_id,
                    i.state AS idempotency_state,
                    (SELECT COUNT(*) FROM job_response_projections rp
                     WHERE rp.job_id = a.job_id) AS projection_count,
@@ -231,6 +251,7 @@ impl TestDatabase {
                 && durable.lease_epoch == 1
                 && durable.has_execution_id
                 && durable.attempt_state == "succeeded"
+                && durable.worker_id == "process-smoke-workerd"
                 && durable.idempotency_state == "succeeded"
                 && durable.projection_count == 1
                 && durable.artifact_count == 1,
@@ -302,6 +323,7 @@ struct DurableTransitionRow {
     lease_epoch: i64,
     has_execution_id: bool,
     attempt_state: String,
+    worker_id: String,
     idempotency_state: String,
     projection_count: i64,
     artifact_count: i64,

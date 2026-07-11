@@ -24,12 +24,15 @@ pub(crate) struct SmokeFiles {
     pub(crate) argv_log: PathBuf,
     pub(crate) stdin_log: PathBuf,
     pub(crate) fake_pid_log: PathBuf,
+    pub(crate) fake_parent_pid_log: PathBuf,
     pub(crate) invocation_log: PathBuf,
     pub(crate) artifact_root: PathBuf,
     fake_bin: PathBuf,
     codex_home: PathBuf,
     fake_active_pid: PathBuf,
+    fake_delay: PathBuf,
     gateway_log: PathBuf,
+    workerd_log: PathBuf,
 }
 
 impl SmokeFiles {
@@ -41,10 +44,13 @@ impl SmokeFiles {
         let argv_log = root.path().join("codex.argv");
         let stdin_log = root.path().join("codex.stdin");
         let fake_pid_log = root.path().join("codex.pid");
+        let fake_parent_pid_log = root.path().join("codex.ppid");
         let invocation_log = root.path().join("codex.invocations");
         let fake_active_pid = root.path().join("codex.active.pid");
+        let fake_delay = root.path().join("codex.delay-seconds");
         let fixture_path = root.path().join("opaque.png");
         let gateway_log = root.path().join("gateway.log");
+        let workerd_log = root.path().join("workerd.log");
         let artifact_root = root.path().join("artifacts");
         fs::create_dir_all(&fake_bin)
             .map_err(|error| format!("failed to create fake bin: {error}"))?;
@@ -54,17 +60,21 @@ impl SmokeFiles {
             .map_err(|error| format!("failed to create artifact root: {error}"))?;
         fs::write(&fixture_path, fixture)
             .map_err(|error| format!("failed to write PNG fixture: {error}"))?;
+        fs::write(&fake_delay, "0")
+            .map_err(|error| format!("failed to initialize fake Codex delay: {error}"))?;
 
         let script_path = fake_bin.join("codex");
-        let script = fake_codex_script(
-            &codex_home,
-            &argv_log,
-            &stdin_log,
-            &fake_pid_log,
-            &invocation_log,
-            &fake_active_pid,
-            &fixture_path,
-        );
+        let script = fake_codex_script(FakeCodexPaths {
+            codex_home: &codex_home,
+            argv_log: &argv_log,
+            stdin_log: &stdin_log,
+            fake_pid_log: &fake_pid_log,
+            fake_parent_pid_log: &fake_parent_pid_log,
+            invocation_log: &invocation_log,
+            fake_active_pid: &fake_active_pid,
+            fake_delay: &fake_delay,
+            fixture: &fixture_path,
+        });
         fs::write(&script_path, script)
             .map_err(|error| format!("failed to write fake Codex: {error}"))?;
         let mut permissions = fs::metadata(&script_path)
@@ -79,13 +89,163 @@ impl SmokeFiles {
             argv_log,
             stdin_log,
             fake_pid_log,
+            fake_parent_pid_log,
             invocation_log,
             artifact_root,
             fake_bin,
             codex_home,
             fake_active_pid,
+            fake_delay,
             gateway_log,
+            workerd_log,
         })
+    }
+
+    pub(crate) fn set_fake_codex_delay(&self, delay: Duration) -> TestResult {
+        require(
+            !delay.is_zero() && delay.subsec_nanos() == 0,
+            "fake Codex delay must be a positive whole number of seconds",
+        )?;
+        fs::write(&self.fake_delay, delay.as_secs().to_string())
+            .map_err(|error| format!("failed to configure fake Codex delay: {error}"))
+    }
+
+    pub(crate) async fn wait_for_fake_codex_active(&self) -> TestResult {
+        timeout(HEALTH_TIMEOUT, async {
+            loop {
+                if read_pid(&self.fake_active_pid).is_ok() {
+                    return Ok(());
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .map_err(|_| "fake Codex did not become active before timeout".to_string())?
+    }
+}
+
+pub(crate) struct WorkerdProcess {
+    child: Child,
+    pid: u32,
+    log_path: PathBuf,
+    exit_status: Option<ExitStatus>,
+}
+
+impl WorkerdProcess {
+    pub(crate) async fn start(database: &TestDatabase, files: &SmokeFiles) -> TestResult<Self> {
+        let log = File::create(&files.workerd_log)
+            .map_err(|error| format!("failed to create workerd log: {error}"))?;
+        let stderr = log
+            .try_clone()
+            .map_err(|error| format!("failed to clone workerd log: {error}"))?;
+        let inherited_path = env::var_os("PATH").unwrap_or_default();
+        let path = env::join_paths(
+            std::iter::once(files.fake_bin.clone()).chain(env::split_paths(&inherited_path)),
+        )
+        .map_err(|error| format!("failed to build workerd PATH: {error}"))?;
+        let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_workerd"));
+        command
+            .env_clear()
+            .env("PATH", path)
+            .env("DATABASE_URL", database.database_url())
+            .env("GATEWAY_DATABASE_SCHEMA", database.schema())
+            .env("GATEWAY_CODEX_HOME", &files.codex_home)
+            .env("GATEWAY_ARTIFACT_ROOT", &files.artifact_root)
+            .env("GATEWAY_CLEANUP_CODEX_OUTPUTS", "true")
+            .env("GATEWAY_REQUEST_TIMEOUT_SECS", "5")
+            .env("WORKER_ID", "process-smoke-workerd")
+            .env("WORKER_POLL_INTERVAL_MS", "10")
+            .env("RUST_LOG", "info")
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(log))
+            .stderr(Stdio::from(stderr))
+            .kill_on_drop(true);
+        command.process_group(0);
+        let child = command
+            .spawn()
+            .map_err(|error| format!("failed to start workerd binary: {error}"))?;
+        let pid = child
+            .id()
+            .ok_or_else(|| "workerd PID unavailable after spawn".to_string())?;
+        let mut process = Self {
+            child,
+            pid,
+            log_path: files.workerd_log.clone(),
+            exit_status: None,
+        };
+        timeout(HEALTH_TIMEOUT, async {
+            loop {
+                if let Some(status) = process.poll_exit()? {
+                    return Err(format!(
+                        "workerd exited during startup with {status}: {}",
+                        process.logs()
+                    ));
+                }
+                if process.logs().contains("workerd started") {
+                    return Ok(());
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .map_err(|_| format!("workerd startup timed out: {}", process.logs()))??;
+        Ok(process)
+    }
+
+    pub(crate) fn pid(&self) -> u32 {
+        self.pid
+    }
+
+    pub(crate) async fn terminate(&mut self) -> TestResult {
+        if let Some(status) = self.poll_exit()? {
+            return Err(format!(
+                "workerd exited before SIGTERM with {status}: {}",
+                self.logs()
+            ));
+        }
+        signal_process_group(self.pid, libc::SIGTERM)?;
+        match timeout(EXIT_TIMEOUT, self.child.wait()).await {
+            Ok(Ok(status)) => {
+                self.exit_status = Some(status);
+                require(
+                    status.success(),
+                    format!("workerd SIGTERM exit was {status}: {}", self.logs()),
+                )
+            }
+            Ok(Err(error)) => Err(format!("failed waiting for workerd exit: {error}")),
+            Err(_) => Err(format!(
+                "workerd did not exit within {EXIT_TIMEOUT:?}: {}",
+                self.logs()
+            )),
+        }
+    }
+
+    fn poll_exit(&mut self) -> TestResult<Option<ExitStatus>> {
+        if self.exit_status.is_some() {
+            return Ok(self.exit_status);
+        }
+        let status = self
+            .child
+            .try_wait()
+            .map_err(|error| format!("failed to inspect workerd process: {error}"))?;
+        if status.is_some() {
+            self.exit_status = status;
+        }
+        Ok(status)
+    }
+
+    fn logs(&self) -> String {
+        fs::read_to_string(&self.log_path)
+            .unwrap_or_else(|_| "<workerd log unavailable>".to_string())
+    }
+}
+
+impl Drop for WorkerdProcess {
+    fn drop(&mut self) {
+        if self.exit_status.is_none() {
+            let _ = signal_process_group(self.pid, libc::SIGKILL);
+            let _ = self.child.start_kill();
+        }
     }
 }
 
@@ -350,15 +510,19 @@ pub(crate) fn read_pid(path: &Path) -> TestResult<i32> {
         .map_err(|error| format!("invalid PID log {}: {error}", path.display()))
 }
 
-fn fake_codex_script(
-    codex_home: &Path,
-    argv_log: &Path,
-    stdin_log: &Path,
-    fake_pid_log: &Path,
-    invocation_log: &Path,
-    fake_active_pid: &Path,
-    fixture: &Path,
-) -> String {
+struct FakeCodexPaths<'a> {
+    codex_home: &'a Path,
+    argv_log: &'a Path,
+    stdin_log: &'a Path,
+    fake_pid_log: &'a Path,
+    fake_parent_pid_log: &'a Path,
+    invocation_log: &'a Path,
+    fake_active_pid: &'a Path,
+    fake_delay: &'a Path,
+    fixture: &'a Path,
+}
+
+fn fake_codex_script(paths: FakeCodexPaths<'_>) -> String {
     format!(
         r#"#!/bin/sh
 set -eu
@@ -373,11 +537,13 @@ set -eu
 [ -z "${{GATEWAY_API_KEY_PEPPERS+x}}" ] || exit 30
 [ -z "${{GATEWAY_API_KEY_CURRENT_PEPPER_VERSION+x}}" ] || exit 31
 printf '%s\n' "$$" > {fake_pid_log}
+printf '%s\n' "$PPID" > {fake_parent_pid_log}
 printf 'invoked\n' >> {invocation_log}
 printf '%s\n' "$$" > {fake_active_pid}
 trap 'rm -f {fake_active_pid}' EXIT
 printf '%s\0' "$@" > {argv_log}
 cat > {stdin_log}
+sleep "$(cat {fake_delay})"
 request_dir=
 while [ "$#" -gt 0 ]; do
     if [ "$1" = "--cd" ]; then
@@ -391,13 +557,15 @@ done
 [ -n "$request_dir" ] || exit 28
 cp {fixture} "$request_dir/final.png"
 "#,
-        codex_home = shell_quote(codex_home),
-        argv_log = shell_quote(argv_log),
-        stdin_log = shell_quote(stdin_log),
-        fake_pid_log = shell_quote(fake_pid_log),
-        invocation_log = shell_quote(invocation_log),
-        fake_active_pid = shell_quote(fake_active_pid),
-        fixture = shell_quote(fixture),
+        codex_home = shell_quote(paths.codex_home),
+        argv_log = shell_quote(paths.argv_log),
+        stdin_log = shell_quote(paths.stdin_log),
+        fake_pid_log = shell_quote(paths.fake_pid_log),
+        fake_parent_pid_log = shell_quote(paths.fake_parent_pid_log),
+        invocation_log = shell_quote(paths.invocation_log),
+        fake_active_pid = shell_quote(paths.fake_active_pid),
+        fake_delay = shell_quote(paths.fake_delay),
+        fixture = shell_quote(paths.fixture),
     )
 }
 

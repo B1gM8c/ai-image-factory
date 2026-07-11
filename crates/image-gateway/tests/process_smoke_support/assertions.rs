@@ -52,7 +52,7 @@ pub(crate) fn assert_response(
     )
 }
 
-pub(crate) fn assert_codex_outputs(files: &SmokeFiles) -> TestResult {
+pub(crate) fn assert_codex_outputs(files: &SmokeFiles, expected_parent_pid: u32) -> TestResult {
     let invocation_count = fs::read_to_string(&files.invocation_log)
         .map_err(|error| format!("failed to read fake Codex invocation log: {error}"))?
         .lines()
@@ -71,6 +71,13 @@ pub(crate) fn assert_codex_outputs(files: &SmokeFiles) -> TestResult {
     require(
         fake_pid > 0,
         "fake Codex PID log must contain a positive PID",
+    )?;
+    let fake_parent_pid = read_pid(&files.fake_parent_pid_log)?;
+    require(
+        fake_parent_pid == expected_parent_pid as i32,
+        format!(
+            "fake Codex parent PID was {fake_parent_pid}, expected workerd PID {expected_parent_pid}"
+        ),
     )?;
     require(
         !Path::new(&request_dir).exists(),

@@ -35,6 +35,27 @@ async fn filesystem_store_rejects_tampered_bytes() {
     );
 }
 
+#[tokio::test]
+async fn filesystem_store_delete_is_idempotent() {
+    let root = tempfile::tempdir().expect("artifact tempdir");
+    let store = FilesystemArtifactBlobStore::new(root.path()).expect("artifact store");
+    let artifact = store
+        .put(identity(), b"discarded image")
+        .await
+        .expect("store artifact");
+
+    store.delete(&artifact).await.expect("delete artifact");
+    store
+        .delete(&artifact)
+        .await
+        .expect("repeat artifact delete");
+
+    assert_eq!(
+        store.get(&artifact).await,
+        Err(ArtifactReadError::Integrity)
+    );
+}
+
 fn identity() -> ArtifactIdentity {
     ArtifactIdentity {
         artifact_id: Uuid::new_v4(),

@@ -371,6 +371,9 @@ impl UsageStore for PostgresUsageStore {
             UPDATE quota_reservations
             SET state = 'expired', updated_at_ms = $1
             WHERE tenant_id = $2 AND state = 'reserved' AND expires_at_ms <= $1
+              AND NOT EXISTS (
+                SELECT 1 FROM work_items w WHERE w.job_id = quota_reservations.job_id
+              )
             "#,
         )
         .bind(now)
@@ -403,7 +406,14 @@ impl UsageStore for PostgresUsageStore {
             FROM quota_reservations
             WHERE tenant_id = $3
               AND state = 'reserved'
-              AND expires_at_ms > $4
+              AND (
+                expires_at_ms > $4
+                OR EXISTS (
+                  SELECT 1 FROM work_items w
+                  WHERE w.job_id = quota_reservations.job_id
+                    AND w.state IN ('ready', 'leased', 'running')
+                )
+              )
               AND created_at_ms >= $2
             "#,
         )
@@ -418,6 +428,10 @@ impl UsageStore for PostgresUsageStore {
         let five_used = to_u32_saturated(five_events + five_reserved);
         let seven_used = to_u32_saturated(seven_events + seven_reserved);
         let snapshot = ensure_quota(&charge, five_used, seven_used)?;
+        let limit_5h = quota_i32(snapshot.limit_5h)?;
+        let remaining_5h = quota_i32(snapshot.remaining_5h)?;
+        let limit_7d = quota_i32(snapshot.limit_7d)?;
+        let remaining_7d = quota_i32(snapshot.remaining_7d)?;
 
         sqlx::query(postgres_job_insert_sql())
             .bind(job_id)
@@ -439,8 +453,10 @@ impl UsageStore for PostgresUsageStore {
             INSERT INTO quota_reservations
               (reservation_id, tenant_id, request_id, job_id, requested_units,
                committed_units, started_units, released_units, state,
-               created_at_ms, updated_at_ms, expires_at_ms)
-            VALUES ($1, $2, $3, $4, $5, 0, 0, 0, $6, $7, $7, $8)
+               created_at_ms, updated_at_ms, expires_at_ms,
+               limit_5h, remaining_5h, limit_7d, remaining_7d)
+            VALUES ($1, $2, $3, $4, $5, 0, 0, 0, $6, $7, $7, $8,
+                    $9, $10, $11, $12)
             "#,
         )
         .bind(reservation_id)
@@ -451,6 +467,10 @@ impl UsageStore for PostgresUsageStore {
         .bind(ReservationState::Reserved.as_str())
         .bind(now)
         .bind(now + RESERVATION_TTL_MS)
+        .bind(limit_5h)
+        .bind(remaining_5h)
+        .bind(limit_7d)
+        .bind(remaining_7d)
         .execute(&mut *tx)
         .await
         .map_err(|_| ImageGatewayError::service_unavailable("quota state unavailable"))?;
@@ -676,6 +696,11 @@ impl UsageStore for PostgresUsageStore {
             .map_err(|_| ImageGatewayError::service_unavailable("quota state unavailable"))?;
         Ok(())
     }
+}
+
+fn quota_i32(value: u32) -> Result<i32, ImageGatewayError> {
+    i32::try_from(value)
+        .map_err(|_| ImageGatewayError::config("image quota limit exceeds PostgreSQL range"))
 }
 
 async fn begin_quota_transition<'a>(

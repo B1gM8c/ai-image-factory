@@ -191,6 +191,114 @@ async fn valid_handles_from_different_jobs_cannot_be_cross_settled() -> TestResu
     combine(result, database.cleanup().await)
 }
 
+#[tokio::test]
+async fn failure_settlement_releases_quota_and_transitions_every_state_atomically() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let fixture = RunningFixture::new(&database.pool).await?;
+        let artifacts = Arc::new(InMemoryArtifactBlobStore::default());
+        let store = PostgresExecutionSettlementStore::new(database.pool.clone(), artifacts);
+
+        store
+            .fail(&fixture.lease, &fixture.reservation, "provider_rejected")
+            .await
+            .map_err(|error| format!("failure settlement failed: {error:?}"))?;
+        let first = failure_state(&database.pool, &fixture).await?;
+        require(
+            first == FailureState::expected(),
+            format!("unexpected failure settlement state: {first:?}"),
+        )?;
+        match store
+            .generation_status(fixture.lease.job_id)
+            .await
+            .map_err(|error| format!("failure status load failed: {error:?}"))?
+        {
+            gpt_image_2_gateway::GenerationResultStatus::Failed { error_code } => require(
+                error_code.as_deref() == Some("provider_rejected"),
+                format!("failure status lost its error code: {error_code:?}"),
+            )?,
+            status => return Err(format!("unexpected failure status: {status:?}")),
+        }
+
+        store
+            .fail(&fixture.lease, &fixture.reservation, "provider_rejected")
+            .await
+            .map_err(|error| format!("duplicate failure settlement failed: {error:?}"))?;
+        let repeated = failure_state(&database.pool, &fixture).await?;
+        require(
+            repeated == first,
+            format!("duplicate failure settlement changed state: {repeated:?}"),
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, sqlx::FromRow)]
+struct FailureState {
+    work_failed: bool,
+    attempt_failed: bool,
+    idempotency_failed: bool,
+    job_failed: bool,
+    quota_released: bool,
+    charged_usage: i64,
+    release_metering: i64,
+    failed_metering: i64,
+    job_events: i64,
+    outbox: i64,
+}
+
+impl FailureState {
+    fn expected() -> Self {
+        Self {
+            work_failed: true,
+            attempt_failed: true,
+            idempotency_failed: true,
+            job_failed: true,
+            quota_released: true,
+            charged_usage: 0,
+            release_metering: 1,
+            failed_metering: 1,
+            job_events: 1,
+            outbox: 1,
+        }
+    }
+}
+
+async fn failure_state(pool: &PgPool, fixture: &RunningFixture) -> TestResult<FailureState> {
+    sqlx::query_as(
+        r#"
+        SELECT
+          (SELECT state = 'failed' FROM work_items WHERE work_item_id = $1) AS work_failed,
+          (SELECT state = 'failed' FROM job_attempts WHERE execution_id = $2) AS attempt_failed,
+          (SELECT state = 'failed' FROM idempotency_requests WHERE job_id = $3) AS idempotency_failed,
+          (SELECT state = 'failed' FROM jobs WHERE job_id = $3) AS job_failed,
+          (SELECT state = 'released' AND released_units = requested_units
+           FROM quota_reservations WHERE reservation_id = $4) AS quota_released,
+          (SELECT COUNT(*) FROM usage_events
+           WHERE request_id = $5 AND outcome = 'charged') AS charged_usage,
+          (SELECT COUNT(*) FROM metering_events
+           WHERE job_id = $3 AND event_type = 'quota_released') AS release_metering,
+          (SELECT COUNT(*) FROM metering_events
+           WHERE job_id = $3 AND event_type = 'job_failed') AS failed_metering,
+          (SELECT COUNT(*) FROM job_events
+           WHERE job_id = $3 AND event_type = 'job.failed') AS job_events,
+          (SELECT COUNT(*) FROM outbox_events
+           WHERE job_id = $3 AND event_type = 'job.failed') AS outbox
+        "#,
+    )
+    .bind(fixture.lease.work_item_id)
+    .bind(fixture.lease.execution_id)
+    .bind(fixture.lease.job_id)
+    .bind(fixture.reservation.reservation_id)
+    .bind(&fixture.reservation.charge.request_id)
+    .fetch_one(pool)
+    .await
+    .map_err(|error| format!("failure state query failed: {error}"))
+}
+
 #[derive(Debug, sqlx::FromRow)]
 struct RollbackState {
     work_state: String,

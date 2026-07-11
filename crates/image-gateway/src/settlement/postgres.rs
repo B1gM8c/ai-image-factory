@@ -6,7 +6,7 @@ use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
-use super::{ExecutionSettlementStore, validate_generation_result};
+use super::{ExecutionSettlementStore, GenerationResultStatus, validate_generation_result};
 use crate::{
     ImageGatewayError,
     admission::WorkLease,
@@ -17,6 +17,7 @@ use crate::{
     usage::{UsageReservation, UsageSnapshot},
 };
 
+mod failure;
 mod results;
 
 use results::{load_generation_manifest, persist_generation_result, validate_completed_result};
@@ -76,6 +77,15 @@ impl ExecutionSettlementStore for PostgresExecutionSettlementStore {
         Ok(reservation.snapshot.clone())
     }
 
+    async fn fail(
+        &self,
+        lease: &WorkLease,
+        reservation: &UsageReservation,
+        error_code: &'static str,
+    ) -> Result<(), ImageGatewayError> {
+        failure::settle(&self.pool, lease, reservation, error_code).await
+    }
+
     async fn load_generation_result(
         &self,
         job_id: Uuid,
@@ -86,6 +96,41 @@ impl ExecutionSettlementStore for PostgresExecutionSettlementStore {
         hydrate_generation_result(self.artifact_store.as_ref(), manifest)
             .await
             .map(Some)
+    }
+
+    async fn generation_status(
+        &self,
+        job_id: Uuid,
+    ) -> Result<GenerationResultStatus, ImageGatewayError> {
+        let state: Option<(String, String, Option<String>)> = sqlx::query_as(
+            r#"
+            SELECT j.state AS job_state, w.state AS work_state, j.last_error_code
+            FROM jobs j
+            JOIN work_items w ON w.job_id = j.job_id
+            WHERE j.job_id = $1
+            "#,
+        )
+        .bind(job_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(settlement_unavailable)?;
+        match state {
+            Some((job_state, _, _)) if job_state == "succeeded" => self
+                .load_generation_result(job_id)
+                .await?
+                .map(GenerationResultStatus::Succeeded)
+                .ok_or_else(ImageGatewayError::artifact_integrity),
+            Some((job_state, work_state, error_code))
+                if job_state == "failed" || work_state == "failed" =>
+            {
+                Ok(GenerationResultStatus::Failed { error_code })
+            }
+            Some((_, work_state, _)) if work_state == "uncertain" => {
+                Ok(GenerationResultStatus::Uncertain)
+            }
+            Some(_) => Ok(GenerationResultStatus::Pending),
+            None => Err(ImageGatewayError::internal("generation job not found")),
+        }
     }
 }
 
@@ -110,6 +155,7 @@ struct LockedQuotaJob {
     job_requested_units: i32,
     charged_units: i32,
     job_reservation_id: Uuid,
+    last_error_code: Option<String>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -126,6 +172,7 @@ struct LockedWorkAttempt {
     attempt_lease_epoch: i64,
     worker_id: String,
     attempt_state: String,
+    attempt_error_code: Option<String>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -178,7 +225,8 @@ async fn lock_quota_and_job(
           j.state AS job_state,
           j.requested_units AS job_requested_units,
           j.charged_units,
-          j.reservation_id AS job_reservation_id
+          j.reservation_id AS job_reservation_id,
+          j.last_error_code
         FROM quota_reservations qr
         JOIN jobs j
           ON j.job_id = qr.job_id
@@ -240,7 +288,8 @@ async fn lock_work_and_attempt(
           a.work_item_id AS attempt_work_item_id,
           a.lease_epoch AS attempt_lease_epoch,
           a.worker_id,
-          a.state AS attempt_state
+          a.state AS attempt_state,
+          a.error_code AS attempt_error_code
         FROM work_items w
         JOIN job_attempts a
           ON a.work_item_id = w.work_item_id

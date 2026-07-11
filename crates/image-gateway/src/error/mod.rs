@@ -59,6 +59,10 @@ impl ImageGatewayError {
         self.status
     }
 
+    pub(crate) fn error_code(&self) -> Option<&'static str> {
+        self.code
+    }
+
     pub fn authentication() -> Self {
         Self::new(
             StatusCode::UNAUTHORIZED,

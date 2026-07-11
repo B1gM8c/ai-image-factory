@@ -2,7 +2,7 @@
 
 > Status: proposed target architecture
 >
-> Reviewed: 2026-07-10
+> Reviewed: 2026-07-11
 >
 > Scope: OpenAI/Codex, Volcengine Ark/BytePlus, Volcengine CV/JiMeng, xAI/Grok,
 > durable scheduling, CLI-to-API execution, artifacts, identity, quota, metering,
@@ -15,9 +15,14 @@
 > Implementation checkpoint (2026-07-10): durable admission, PostgreSQL weighted
 > scheduling metadata, fenced atomic success settlement, versioned HMAC API keys,
 > filesystem artifact persistence, immutable response projections, and generation
-> idempotency replay are implemented. The filesystem backend is an interim
+> idempotency replay are implemented. Gateway and `workerd` are separate
+> processes. `reconcilerd` handles expired claimed/running leases and orphaned
+> pre-attach quota reservations. The filesystem backend is an interim
 > single-host/shared-POSIX-volume deployment profile; S3-compatible storage,
-> independently deployed workers, and reconciliation remain target work.
+> persistent executor supervision, and ambiguous provider-outcome reconciliation
+> remain target work.
+> Image edits still execute inline in the gateway at this checkpoint; a versioned
+> durable edit command and external workerd path are the next vertical slice.
 
 ## 1. Executive Decision
 

@@ -17,7 +17,8 @@ use crate::{
     ImageGatewayError,
     admission::{
         AdmissionClaim, AdmissionError, AdmissionTicket, AttachJob, ClaimAdmission,
-        GENERATION_OPERATION, GenerationCommandV1, idempotency_key_digest,
+        GENERATION_COMMAND_SCHEMA, GENERATION_OPERATION, GenerationCommandV1,
+        idempotency_key_digest,
     },
     artifacts::GENERATION_RESPONSE_SCHEMA,
     generator::normalize_generated_images,
@@ -29,14 +30,14 @@ use crate::{
 };
 
 const OPENAI_IMAGES_API_PROFILE: &str = "openai-images-v1";
-const GENERATION_COMMAND_SCHEMA: &str = "openai.images.generation.v1";
 const INLINE_LEASE_GRACE: Duration = Duration::from_secs(60);
 const ADMISSION_DEADLINE_GRACE: Duration = Duration::from_secs(5);
 const ATTACH_RETRY_DELAY: Duration = Duration::from_millis(25);
 const ATTACH_ATTEMPTS: usize = 3;
+const RESULT_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 use super::{
-    AppState, RequestId, authenticate_image_request,
+    AppState, GenerationExecutionMode, RequestId, authenticate_image_request,
     edit_input::parse_edit_request,
     middleware::new_request_id,
     responses::{add_usage_headers, images_response_into_response, response_size_for_images},
@@ -121,12 +122,16 @@ pub(super) async fn generations(
     let units = job.n;
     let model = job.model.clone();
 
-    let _permit = match state.scheduler.acquire(&auth.tenant_id).await {
-        Ok(permit) => permit,
-        Err(error) => {
-            abort_before_attach(&state, &ticket).await?;
-            return Err(error);
+    let _inline_permit = if state.generation_execution_mode == GenerationExecutionMode::Inline {
+        match state.scheduler.acquire(&auth.tenant_id).await {
+            Ok(permit) => Some(permit),
+            Err(error) => {
+                abort_before_attach(&state, &ticket).await?;
+                return Err(error);
+            }
         }
+    } else {
+        None
     };
     let reservation = match state
         .usage_store
@@ -158,6 +163,18 @@ pub(super) async fn generations(
         schedule_priority: 1,
         schedule_cost: u64::from(units),
     };
+    if state.generation_execution_mode == GenerationExecutionMode::External {
+        if let Err(error) = attach_ready_with_retry(&state, attach).await {
+            if !matches!(error, AdmissionError::Unavailable) {
+                state
+                    .usage_store
+                    .release(&reservation, "admission_attach_failed")
+                    .await?;
+            }
+            return Err(admission_error(error));
+        }
+        return wait_for_generation(&state, reservation.job_id, &auth).await;
+    }
     let lease = match attach_and_start_with_retry(&state, attach).await {
         Ok(lease) => lease,
         Err(error) => {
@@ -187,6 +204,63 @@ pub(super) async fn generations(
         execution.usage,
         &auth,
     )
+}
+
+async fn wait_for_generation(
+    state: &Arc<AppState>,
+    job_id: uuid::Uuid,
+    auth: &crate::auth::AuthContext,
+) -> Result<Response, ImageGatewayError> {
+    let wait = async {
+        loop {
+            match state.settlement_store.generation_status(job_id).await? {
+                crate::settlement::GenerationResultStatus::Pending => {
+                    tokio::time::sleep(RESULT_POLL_INTERVAL).await;
+                }
+                crate::settlement::GenerationResultStatus::Succeeded(result) => {
+                    let usage = result.projection.usage.clone();
+                    return render_generation_response(
+                        result.images,
+                        result.projection,
+                        usage,
+                        auth,
+                    );
+                }
+                crate::settlement::GenerationResultStatus::Failed { error_code } => {
+                    return Err(persisted_generation_error(error_code.as_deref()));
+                }
+                crate::settlement::GenerationResultStatus::Uncertain => {
+                    return Err(ImageGatewayError::service_unavailable(
+                        "generation outcome requires reconciliation",
+                    ));
+                }
+            }
+        }
+    };
+    tokio::time::timeout(
+        external_result_wait_timeout(state.config.queue_timeout, state.config.request_timeout),
+        wait,
+    )
+    .await
+    .map_err(|_| ImageGatewayError::timeout())?
+}
+
+fn external_result_wait_timeout(queue_timeout: Duration, request_timeout: Duration) -> Duration {
+    queue_timeout
+        .saturating_add(request_timeout)
+        .saturating_add(INLINE_LEASE_GRACE)
+}
+
+fn persisted_generation_error(error_code: Option<&str>) -> ImageGatewayError {
+    match error_code {
+        Some("timeout") => ImageGatewayError::timeout(),
+        Some("codex_cli_failed") => ImageGatewayError::codex_cli_failed(),
+        Some("codex_no_image_output") => ImageGatewayError::codex_no_image_output(),
+        Some("service_unavailable") => {
+            ImageGatewayError::service_unavailable("Image generation backend unavailable")
+        }
+        _ => ImageGatewayError::backend("Image generation failed"),
+    }
 }
 
 async fn replay_generation(
@@ -272,6 +346,24 @@ async fn attach_and_start_with_retry(
             .await
         {
             Ok(lease) => return Ok(lease),
+            Err(AdmissionError::Unavailable) if attempt + 1 < ATTACH_ATTEMPTS => {
+                last_error = AdmissionError::Unavailable;
+                tokio::time::sleep(ATTACH_RETRY_DELAY).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last_error)
+}
+
+async fn attach_ready_with_retry(
+    state: &Arc<AppState>,
+    request: AttachJob,
+) -> Result<(), AdmissionError> {
+    let mut last_error = AdmissionError::Unavailable;
+    for attempt in 0..ATTACH_ATTEMPTS {
+        match state.admission_store.attach(request.clone()).await {
+            Ok(_) => return Ok(()),
             Err(AdmissionError::Unavailable) if attempt + 1 < ATTACH_ATTEMPTS => {
                 last_error = AdmissionError::Unavailable;
                 tokio::time::sleep(ATTACH_RETRY_DELAY).await;
@@ -390,4 +482,41 @@ pub(super) async fn edits(
     let usage = state.usage_store.commit(&reservation).await?;
     add_usage_headers(response.headers_mut(), &usage, &auth);
     Ok(response)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn external_wait_budget_includes_queue_execution_and_settlement_grace() {
+        assert_eq!(
+            external_result_wait_timeout(Duration::from_secs(7), Duration::from_secs(11)),
+            Duration::from_secs(78),
+        );
+    }
+
+    #[test]
+    fn persisted_failure_codes_restore_the_original_gateway_error() {
+        let timeout = persisted_generation_error(Some("timeout"));
+        assert_eq!(
+            timeout.status_code(),
+            axum::http::StatusCode::GATEWAY_TIMEOUT
+        );
+        assert_eq!(timeout.error_code(), Some("timeout"));
+
+        let cli = persisted_generation_error(Some("codex_cli_failed"));
+        assert_eq!(cli.status_code(), axum::http::StatusCode::BAD_GATEWAY);
+        assert_eq!(cli.error_code(), Some("codex_cli_failed"));
+
+        let no_output = persisted_generation_error(Some("codex_no_image_output"));
+        assert_eq!(no_output.error_code(), Some("codex_no_image_output"));
+
+        let unavailable = persisted_generation_error(Some("service_unavailable"));
+        assert_eq!(
+            unavailable.status_code(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(unavailable.error_code(), Some("service_unavailable"));
+    }
 }

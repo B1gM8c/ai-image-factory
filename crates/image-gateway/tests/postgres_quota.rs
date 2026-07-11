@@ -137,6 +137,64 @@ async fn release_uses_postgres_time_after_waiting_for_the_tenant_lock() -> TestR
     result
 }
 
+#[tokio::test]
+async fn active_work_keeps_an_expired_timestamp_reserved_and_counted() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+
+    let result = active_work_expiry_case(&database).await;
+    let cleanup = database.cleanup().await;
+    cleanup?;
+    result
+}
+
+async fn active_work_expiry_case(database: &TestDatabase) -> TestResult {
+    let tenant_id = format!("tenant_active_expiry_{}", Uuid::new_v4().simple());
+    let pool = database.pool("quota_active_expiry").await?;
+    let store = PostgresUsageStore::new(pool.clone());
+    let reservation = store
+        .reserve(test_charge(&tenant_id, "request_active"))
+        .await
+        .map_err(|error| format!("active reservation failed: {error:?}"))?;
+    sqlx::query(
+        r#"
+        INSERT INTO work_items
+          (work_item_id, job_id, kind, state, available_at_ms, created_at_ms, updated_at_ms)
+        VALUES ($1, $2, 'image_batch', 'ready', 0, 0, 0)
+        "#,
+    )
+    .bind(Uuid::new_v4())
+    .bind(reservation.job_id)
+    .execute(&pool)
+    .await
+    .map_err(|error| format!("failed to attach active work: {error}"))?;
+    sqlx::query("UPDATE quota_reservations SET expires_at_ms = 0 WHERE reservation_id = $1")
+        .bind(reservation.reservation_id)
+        .execute(&pool)
+        .await
+        .map_err(|error| format!("failed to age active reservation: {error}"))?;
+
+    let denied = store
+        .reserve(test_charge(&tenant_id, "request_replacement"))
+        .await
+        .expect_err("active work must continue to consume quota");
+    require(
+        denied.status_code() == axum::http::StatusCode::TOO_MANY_REQUESTS,
+        format!("active work replacement should return 429, got {denied:?}"),
+    )?;
+    let state: String =
+        sqlx::query_scalar("SELECT state FROM quota_reservations WHERE reservation_id = $1")
+            .bind(reservation.reservation_id)
+            .fetch_one(&pool)
+            .await
+            .map_err(|error| format!("failed to inspect active reservation: {error}"))?;
+    require(
+        state == "reserved",
+        format!("active work reservation was swept to {state}"),
+    )
+}
+
 #[derive(Clone, Copy)]
 enum TimestampTransition {
     Commit,

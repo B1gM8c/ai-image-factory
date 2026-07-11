@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 type TestResult<T = ()> = Result<T, String>;
 
-const REQUIRED_COLUMNS: [(&str, &str); 21] = [
+const REQUIRED_COLUMNS: [(&str, &str); 25] = [
     ("usage_events", "tenant_id"),
     ("quota_reservations", "tenant_id"),
     ("quota_reservations", "job_id"),
@@ -35,6 +35,10 @@ const REQUIRED_COLUMNS: [(&str, &str); 21] = [
     ("artifacts", "execution_id"),
     ("artifacts", "output_index"),
     ("artifacts", "sha256_hex"),
+    ("quota_reservations", "limit_5h"),
+    ("quota_reservations", "remaining_5h"),
+    ("quota_reservations", "limit_7d"),
+    ("quota_reservations", "remaining_7d"),
 ];
 
 const REQUIRED_INDEXES: [&str; 7] = [
@@ -105,6 +109,110 @@ async fn default_pool_pins_public_despite_url_search_path_options() -> TestResul
     let cleanup = test_schema.cleanup().await;
     cleanup?;
     result
+}
+
+#[tokio::test]
+async fn execution_context_migration_requires_legacy_active_jobs_to_be_drained() -> TestResult {
+    let Some(test_schema) = TestSchema::new(1).await? else {
+        return Ok(());
+    };
+
+    let result = execution_context_upgrade_case(&test_schema.pool).await;
+    let cleanup = test_schema.cleanup().await;
+    cleanup?;
+    result
+}
+
+async fn execution_context_upgrade_case(pool: &PgPool) -> TestResult {
+    for migration in [
+        include_str!("../migrations/0000_legacy_reconciliation.sql"),
+        include_str!("../migrations/0001_usage.sql"),
+        include_str!("../migrations/0002_durable_admission.sql"),
+        include_str!("../migrations/0003_durable_scheduling.sql"),
+        include_str!("../migrations/0004_api_key_hmac.sql"),
+        include_str!("../migrations/0005_artifact_replay.sql"),
+    ] {
+        sqlx::raw_sql(migration)
+            .execute(pool)
+            .await
+            .map_err(|error| format!("pre-0006 migration failed: {error}"))?;
+    }
+    let job_id = Uuid::new_v4();
+    let reservation_id = Uuid::new_v4();
+    sqlx::query(
+        r#"
+        INSERT INTO jobs
+          (job_id, tenant_id, request_id, operation, provider_id, model, state,
+           requested_units, reservation_id, created_at_ms, updated_at_ms)
+        VALUES ($1, 'tenant_upgrade', 'request_upgrade', 'generation',
+                'openai-codex', 'gpt-image-2', 'reserved', 1, $2, 1, 1)
+        "#,
+    )
+    .bind(job_id)
+    .bind(reservation_id)
+    .execute(pool)
+    .await
+    .map_err(|error| format!("failed to insert legacy job: {error}"))?;
+    sqlx::query(
+        r#"
+        INSERT INTO quota_reservations
+          (reservation_id, tenant_id, request_id, job_id, requested_units,
+           state, created_at_ms, updated_at_ms, expires_at_ms)
+        VALUES ($1, 'tenant_upgrade', 'request_upgrade', $2, 1,
+                'reserved', 1, 1, 9999999999999)
+        "#,
+    )
+    .bind(reservation_id)
+    .bind(job_id)
+    .execute(pool)
+    .await
+    .map_err(|error| format!("failed to insert legacy reservation: {error}"))?;
+
+    require(
+        sqlx::raw_sql(include_str!("../migrations/0006_execution_context.sql"))
+            .execute(pool)
+            .await
+            .is_err(),
+        "0006 must reject an active legacy reservation without a quota snapshot",
+    )?;
+    let snapshot_column_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'quota_reservations' AND column_name = 'limit_5h')",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|error| format!("failed to inspect rolled-back migration: {error}"))?;
+    require(
+        !snapshot_column_exists,
+        "failed 0006 migration must roll back its schema changes",
+    )?;
+
+    sqlx::query("UPDATE jobs SET state = 'failed' WHERE job_id = $1")
+        .bind(job_id)
+        .execute(pool)
+        .await
+        .map_err(|error| format!("failed to terminalize legacy job: {error}"))?;
+    sqlx::query(
+        "UPDATE quota_reservations SET state = 'released', released_units = requested_units WHERE reservation_id = $1",
+    )
+    .bind(reservation_id)
+    .execute(pool)
+    .await
+    .map_err(|error| format!("failed to release legacy reservation: {error}"))?;
+    sqlx::raw_sql(include_str!("../migrations/0006_execution_context.sql"))
+        .execute(pool)
+        .await
+        .map_err(|error| format!("0006 should accept a drained legacy queue: {error}"))?;
+    let snapshots: (Option<i32>, Option<i32>, Option<i32>, Option<i32>) = sqlx::query_as(
+        "SELECT limit_5h, remaining_5h, limit_7d, remaining_7d FROM quota_reservations WHERE reservation_id = $1",
+    )
+    .bind(reservation_id)
+    .fetch_one(pool)
+    .await
+    .map_err(|error| format!("failed to read migrated legacy reservation: {error}"))?;
+    require(
+        snapshots == (None, None, None, None),
+        "terminal legacy snapshots must remain consistently NULL",
+    )
 }
 
 async fn default_pool_case(test_schema: &TestSchema) -> TestResult {
@@ -359,8 +467,8 @@ async fn shared_pool_case(pool: &PgPool) -> TestResult {
 
 async fn assert_expected_schema(pool: &PgPool) -> TestResult {
     require(
-        migration_versions(pool).await? == vec![0, 1, 2, 3, 4, 5],
-        "applied migration versions must be exactly [0, 1, 2, 3, 4, 5]",
+        migration_versions(pool).await? == vec![0, 1, 2, 3, 4, 5, 6],
+        "applied migration versions must be exactly [0, 1, 2, 3, 4, 5, 6]",
     )?;
 
     for (table, column) in REQUIRED_COLUMNS {

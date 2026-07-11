@@ -115,6 +115,17 @@ impl AppConfig {
             ));
         }
 
+        self.validate_worker_startup()?;
+
+        if !self.bind.ip().is_loopback() {
+            return Err(ImageGatewayError::config(
+                "native TLS is not implemented; set GATEWAY_BIND to a loopback address and expose it only through a TLS reverse proxy",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn validate_worker_startup(&self) -> Result<(), ImageGatewayError> {
         let codex_home = self
             .codex_home
             .as_deref()
@@ -127,12 +138,6 @@ impl AppConfig {
             ));
         }
         validate_production_codex_home(Path::new(codex_home))?;
-
-        if !self.bind.ip().is_loopback() {
-            return Err(ImageGatewayError::config(
-                "native TLS is not implemented; set GATEWAY_BIND to a loopback address and expose it only through a TLS reverse proxy",
-            ));
-        }
         Ok(())
     }
 }

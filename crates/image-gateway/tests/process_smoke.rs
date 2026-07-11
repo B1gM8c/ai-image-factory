@@ -7,14 +7,16 @@ use std::time::Duration;
 use serde_json::{Value, json};
 
 use process_smoke_support::{
-    API_TOKEN, GatewayProcess, SmokeFiles, TestDatabase, TestResult, assert_artifact_bytes,
-    assert_codex_outputs, assert_prompt_semantics, assert_response, combine_results, header,
-    opaque_png, poll_health, require, start_gateway_with_retry, startup_failed_from_address_in_use,
-    tamper_artifact,
+    API_TOKEN, GatewayProcess, SmokeFiles, TestDatabase, TestResult, WorkerdProcess,
+    assert_artifact_bytes, assert_codex_outputs, assert_prompt_semantics, assert_response,
+    combine_results, header, opaque_png, poll_health, require, start_gateway_with_retry,
+    startup_failed_from_address_in_use, tamper_artifact,
 };
 
 const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 const IDEMPOTENCY_KEY: &str = "process-smoke-key";
+const DRAIN_IDEMPOTENCY_KEY: &str = "process-smoke-drain-key";
+const QUEUE_IDEMPOTENCY_KEYS: [&str; 2] = ["process-smoke-queue-a", "process-smoke-queue-b"];
 
 // Like the other PostgreSQL integration tests, local runs skip without TEST_DATABASE_URL while CI
 // fails closed so the process composition cannot silently go untested there.
@@ -25,6 +27,28 @@ async fn production_process_composition_succeeds_when_test_database_is_configure
     };
 
     let result = run_process_smoke(&database).await;
+    let cleanup = database.cleanup().await;
+    combine_results(result, cleanup, "schema cleanup")
+}
+
+#[tokio::test]
+async fn workerd_sigterm_drains_in_flight_generation_before_successful_exit() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+
+    let result = run_workerd_drain_smoke(&database).await;
+    let cleanup = database.cleanup().await;
+    combine_results(result, cleanup, "schema cleanup")
+}
+
+#[tokio::test]
+async fn external_generation_queues_without_holding_gateway_scheduler_permits() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+
+    let result = run_external_queue_smoke(&database).await;
     let cleanup = database.cleanup().await;
     combine_results(result, cleanup, "schema cleanup")
 }
@@ -55,11 +79,131 @@ async fn run_process_smoke(database: &TestDatabase) -> TestResult {
         .timeout(HTTP_TIMEOUT)
         .build()
         .map_err(|error| format!("failed to build HTTP client: {error}"))?;
+    let mut workerd = WorkerdProcess::start(database, &files).await?;
     let (mut gateway, address) = start_gateway_with_retry(&client, database, &files).await?;
 
-    let result = exercise_gateway(&client, address, database, &files, &fixture, &mut gateway).await;
-    let shutdown = gateway.terminate().await;
-    combine_results(result, shutdown, "gateway shutdown")
+    let result = exercise_gateway(
+        &client,
+        address,
+        database,
+        &files,
+        &fixture,
+        workerd.pid(),
+        &mut gateway,
+    )
+    .await;
+    let gateway_shutdown = gateway.terminate().await;
+    let result = combine_results(result, gateway_shutdown, "gateway shutdown");
+    let worker_shutdown = workerd.terminate().await;
+    combine_results(result, worker_shutdown, "workerd shutdown")
+}
+
+async fn run_workerd_drain_smoke(database: &TestDatabase) -> TestResult {
+    let fixture = opaque_png()?;
+    let files = SmokeFiles::new(&fixture)?;
+    files.set_fake_codex_delay(Duration::from_secs(2))?;
+    let client = reqwest::Client::builder()
+        .timeout(HTTP_TIMEOUT)
+        .build()
+        .map_err(|error| format!("failed to build HTTP client: {error}"))?;
+    let mut workerd = WorkerdProcess::start(database, &files).await?;
+    let (mut gateway, address) = start_gateway_with_retry(&client, database, &files).await?;
+
+    let request_client = client.clone();
+    let request_fixture = fixture.clone();
+    let request = tokio::spawn(async move {
+        let response = request_client
+            .post(format!("http://{address}/v1/images/generations"))
+            .bearer_auth(API_TOKEN)
+            .header("Idempotency-Key", DRAIN_IDEMPOTENCY_KEY)
+            .json(&generation_request())
+            .send()
+            .await
+            .map_err(|error| format!("in-flight generation request failed: {error}"))?;
+        let status = response.status();
+        let headers = response.headers().clone();
+        let body: Value = response
+            .json()
+            .await
+            .map_err(|error| format!("in-flight generation response was not JSON: {error}"))?;
+        require(
+            status == reqwest::StatusCode::OK,
+            format!("in-flight generation returned {status}: {body:#}"),
+        )?;
+        assert_response(&body, &headers, &request_fixture)
+    });
+
+    let active = files.wait_for_fake_codex_active().await;
+    let worker_shutdown = match active {
+        Ok(()) => workerd.terminate().await,
+        Err(error) => Err(error),
+    };
+    let request_result = request
+        .await
+        .map_err(|error| format!("in-flight request task failed: {error}"))?;
+    let gateway_shutdown = gateway.terminate().await;
+    let result = combine_results(
+        request_result,
+        worker_shutdown,
+        "workerd drain and successful exit",
+    );
+    combine_results(result, gateway_shutdown, "gateway shutdown")
+}
+
+async fn run_external_queue_smoke(database: &TestDatabase) -> TestResult {
+    let fixture = opaque_png()?;
+    let files = SmokeFiles::new(&fixture)?;
+    files.set_fake_codex_delay(Duration::from_secs(2))?;
+    let client = reqwest::Client::builder()
+        .timeout(HTTP_TIMEOUT)
+        .build()
+        .map_err(|error| format!("failed to build HTTP client: {error}"))?;
+    let mut workerd = WorkerdProcess::start(database, &files).await?;
+    let (mut gateway, address) = start_gateway_with_retry(&client, database, &files).await?;
+
+    let first = spawn_generation_request(client.clone(), address, QUEUE_IDEMPOTENCY_KEYS[0]);
+    files.wait_for_fake_codex_active().await?;
+    let second = spawn_generation_request(client, address, QUEUE_IDEMPOTENCY_KEYS[1]);
+    let queue_result = database.wait_for_generation_work_count(2).await;
+    let first_result = first
+        .await
+        .map_err(|error| format!("first queued request task failed: {error}"))?;
+    let second_result = second
+        .await
+        .map_err(|error| format!("second queued request task failed: {error}"))?;
+    let gateway_shutdown = gateway.terminate().await;
+    let worker_shutdown = workerd.terminate().await;
+
+    let result = combine_results(queue_result, first_result, "first queued generation");
+    let result = combine_results(result, second_result, "second queued generation");
+    let result = combine_results(result, gateway_shutdown, "gateway shutdown");
+    combine_results(result, worker_shutdown, "workerd shutdown")
+}
+
+fn spawn_generation_request(
+    client: reqwest::Client,
+    address: std::net::SocketAddr,
+    idempotency_key: &'static str,
+) -> tokio::task::JoinHandle<TestResult> {
+    tokio::spawn(async move {
+        let response = client
+            .post(format!("http://{address}/v1/images/generations"))
+            .bearer_auth(API_TOKEN)
+            .header("Idempotency-Key", idempotency_key)
+            .json(&generation_request())
+            .send()
+            .await
+            .map_err(|error| format!("queued generation request failed: {error}"))?;
+        let status = response.status();
+        let body: Value = response
+            .json()
+            .await
+            .map_err(|error| format!("queued generation response was not JSON: {error}"))?;
+        require(
+            status == reqwest::StatusCode::OK,
+            format!("queued generation returned {status}: {body:#}"),
+        )
+    })
 }
 
 async fn exercise_gateway(
@@ -68,19 +212,13 @@ async fn exercise_gateway(
     database: &TestDatabase,
     files: &SmokeFiles,
     fixture: &[u8],
+    workerd_pid: u32,
     gateway: &mut GatewayProcess,
 ) -> TestResult {
     let base_url = format!("http://{address}");
     poll_health(client, &base_url, gateway).await?;
 
-    let request_body = json!({
-        "model": "gpt-image-2",
-        "prompt": "process smoke opaque fixture",
-        "n": 1,
-        "size": "auto",
-        "quality": "low",
-        "output_format": "png"
-    });
+    let request_body = generation_request();
     let response = client
         .post(format!("{base_url}/v1/images/generations"))
         .bearer_auth(API_TOKEN)
@@ -102,7 +240,7 @@ async fn exercise_gateway(
         format!("generation returned {status}: {body:#}"),
     )?;
     assert_response(&body, &headers, fixture)?;
-    assert_codex_outputs(files)?;
+    assert_codex_outputs(files, workerd_pid)?;
     assert_artifact_bytes(files, fixture)?;
 
     gateway.terminate().await?;
@@ -135,7 +273,7 @@ async fn exercise_gateway(
         "replay must receive a fresh request id",
     )?;
     assert_response(&replay_body, &replay_headers, fixture)?;
-    assert_codex_outputs(files)?;
+    assert_codex_outputs(files, workerd_pid)?;
     assert_artifact_bytes(files, fixture)?;
     tamper_artifact(files)?;
 
@@ -165,6 +303,17 @@ async fn exercise_gateway(
             .contains(&files.artifact_root.display().to_string()),
         "artifact integrity error leaked the storage path",
     )?;
-    assert_codex_outputs(files)?;
+    assert_codex_outputs(files, workerd_pid)?;
     database.assert_transitions(&request_id).await
+}
+
+fn generation_request() -> Value {
+    json!({
+        "model": "gpt-image-2",
+        "prompt": "process smoke opaque fixture",
+        "n": 1,
+        "size": "auto",
+        "quality": "low",
+        "output_format": "png"
+    })
 }

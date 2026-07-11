@@ -45,6 +45,13 @@ pub(super) struct AppState {
     pub(super) settlement_store: Arc<dyn ExecutionSettlementStore>,
     pub(super) scheduler: Arc<TenantJobScheduler>,
     pub(super) worker_id: String,
+    pub(super) generation_execution_mode: GenerationExecutionMode,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GenerationExecutionMode {
+    Inline,
+    External,
 }
 
 #[derive(Clone, Debug)]
@@ -111,6 +118,50 @@ pub fn build_router_with_components(
     settlement_store: Arc<dyn ExecutionSettlementStore>,
     artifact_store: Arc<dyn ArtifactBlobStore>,
 ) -> Router {
+    build_router_with_execution_mode(
+        config,
+        generator,
+        usage_store,
+        api_key_store,
+        admission_store,
+        settlement_store,
+        artifact_store,
+        GenerationExecutionMode::Inline,
+    )
+}
+
+pub fn build_router_with_external_execution(
+    config: AppConfig,
+    generator: Arc<dyn ImageGenerator>,
+    usage_store: Arc<dyn UsageStore>,
+    api_key_store: Arc<dyn ApiKeyStore>,
+    admission_store: Arc<dyn AdmissionStore>,
+    settlement_store: Arc<dyn ExecutionSettlementStore>,
+    artifact_store: Arc<dyn ArtifactBlobStore>,
+) -> Router {
+    build_router_with_execution_mode(
+        config,
+        generator,
+        usage_store,
+        api_key_store,
+        admission_store,
+        settlement_store,
+        artifact_store,
+        GenerationExecutionMode::External,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_router_with_execution_mode(
+    config: AppConfig,
+    generator: Arc<dyn ImageGenerator>,
+    usage_store: Arc<dyn UsageStore>,
+    api_key_store: Arc<dyn ApiKeyStore>,
+    admission_store: Arc<dyn AdmissionStore>,
+    settlement_store: Arc<dyn ExecutionSettlementStore>,
+    artifact_store: Arc<dyn ArtifactBlobStore>,
+    generation_execution_mode: GenerationExecutionMode,
+) -> Router {
     let scheduler = Arc::new(TenantJobScheduler::new(
         config.max_concurrent_jobs,
         config.max_queue_size,
@@ -122,7 +173,6 @@ pub fn build_router_with_components(
         generator.clone(),
         admission_store.clone(),
         settlement_store.clone(),
-        usage_store.clone(),
         artifact_store,
         config.request_timeout,
     ));
@@ -137,6 +187,7 @@ pub fn build_router_with_components(
         settlement_store,
         scheduler,
         worker_id: format!("gateway-{}", uuid::Uuid::new_v4().simple()),
+        generation_execution_mode,
     };
 
     Router::new()

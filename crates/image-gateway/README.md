@@ -29,15 +29,22 @@ export GATEWAY_API_KEY_PEPPERS="1:$(openssl rand -hex 32)"
 export GATEWAY_API_KEY_CURRENT_PEPPER_VERSION='1'
 export GATEWAY_CODEX_HOME='/srv/gpt-image-codex-home'
 export GATEWAY_ARTIFACT_ROOT='/srv/ai-image-factory/artifacts'
+export RECONCILER_ORPHAN_GRACE_MS='60000'
 cargo run --bin factoryctl -- migrate
-cargo run
+cargo run --bin workerd
+cargo run --bin reconcilerd
+cargo run --bin gpt-image-2-gateway
 ```
+
+Migration `0006_execution_context` is intentionally fail-closed when an older deployment still has active `reserved`, `queued`, or `running` jobs without persisted quota snapshots. Stop admission, drain or explicitly resolve that old queue, then run `factoryctl migrate`; the missing historical snapshot cannot be reconstructed safely from aggregate usage.
 
 From the repository root, use:
 
 ```bash
 cargo run -p gpt-image-2-gateway --bin factoryctl -- migrate
-cargo run -p gpt-image-2-gateway
+cargo run -p gpt-image-2-gateway --bin workerd
+cargo run -p gpt-image-2-gateway --bin reconcilerd
+cargo run -p gpt-image-2-gateway --bin gpt-image-2-gateway
 ```
 
 Default bind address is `127.0.0.1:8787`. Every startup requires at least one of `GATEWAY_API_TOKEN` or `GATEWAY_ADMIN_TOKEN`, a versioned API-key pepper keyring, an explicit absolute, existing, writable `GATEWAY_CODEX_HOME`, and an explicit absolute, existing `GATEWAY_ARTIFACT_ROOT`. If both tokens are configured, they must be different. `GATEWAY_ADMIN_TOKEN` protects Admin endpoints for creating and revoking project API keys; it never authorizes image calls. An admin-only startup can bootstrap project keys, and image calls must then use one of those keys. `GATEWAY_API_TOKEN` remains a legacy image token and is not accepted on Admin endpoints.
@@ -49,6 +56,10 @@ Legacy SHA-256 credential reads are disabled by default. Set `GATEWAY_API_KEY_AL
 The gateway does not yet provide native TLS and rejects every non-loopback bind. Bind it to loopback and place a TLS reverse proxy on the same host in front of it. Provision `GATEWAY_CODEX_HOME` before every startup and grant the gateway service account permission to create and remove files there; the path must not be a symlink or the filesystem root. `--ignore-user-config` skips user `config.toml`; Codex may still load its native system image generation skill.
 
 `GATEWAY_ARTIFACT_ROOT` stores immutable generated-image blobs. The root must be owned by the gateway service user, must not be a symlink, and must not be group or world writable. The current filesystem backend is production-supported only when every gateway/worker process runs on one host or mounts the same persistent POSIX volume. PostgreSQL stores artifact metadata and immutable response projections, not image bytes. A successful generation writes and syncs every blob before the fenced settlement transaction commits job success, quota, metering, artifact metadata, and the replay projection. Reusing the same completed `Idempotency-Key` reconstructs the original JSON or final SSE response without another Codex invocation or another charge.
+
+Production generation execution is external to the HTTP process. `gpt-image-2-gateway` authenticates, reserves quota, attaches ready work, and waits on PostgreSQL. `workerd` claims weighted ready work, validates and reconstructs the command and quota snapshot before marking the attempt running, executes Codex under a heartbeated fenced lease, persists artifacts, and requests atomic settlement. On SIGTERM it stops claiming and drains the in-flight attempt within a bounded window. `reconcilerd` safely requeues expired leases that never reached `running`; an expired `running` attempt becomes `uncertain` and keeps its economic reservation instead of being submitted again. It also atomically releases a reserved job/admission pair that still has no work item after `RECONCILER_ORPHAN_GRACE_MS` (default 60000). `RECONCILER_INTERVAL_MS` (default 1000) and `RECONCILER_BATCH_SIZE` (default 100) control each scan.
+
+This checkpoint externalizes image generation only. `POST /v1/images/edits` still executes synchronously in the gateway and is the next durable-command/workerd slice; deploy the gateway with Codex access until that migration is complete.
 
 ## Example
 

@@ -4,6 +4,7 @@ use sha2::{Digest, Sha256};
 use crate::generator::GenerationJob;
 
 pub const GENERATION_COMMAND_SCHEMA_VERSION: u16 = 1;
+pub const GENERATION_COMMAND_SCHEMA: &str = "openai.images.generation.v1";
 pub const GENERATION_OPERATION: &str = "generation";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
