@@ -28,6 +28,7 @@ pub struct UsageLimits {
 pub struct UsageCharge {
     pub tenant_id: String,
     pub request_id: String,
+    pub admission_session_id: Option<Uuid>,
     pub operation: &'static str,
     pub provider_id: String,
     pub model: String,
@@ -99,6 +100,7 @@ struct UsageReservationRecord {
     job_id: Uuid,
     tenant_id: String,
     request_id: String,
+    admission_session_id: Option<Uuid>,
     operation: &'static str,
     requested_units: u32,
     committed_units: u32,
@@ -179,6 +181,7 @@ impl UsageStore for InMemoryUsageStore {
             job_id,
             tenant_id: charge.tenant_id.clone(),
             request_id: charge.request_id.clone(),
+            admission_session_id: charge.admission_session_id,
             operation: charge.operation,
             requested_units: charge.units,
             committed_units: 0,
@@ -359,12 +362,37 @@ impl PostgresUsageStore {
     }
 }
 
+#[derive(sqlx::FromRow)]
+struct ExistingReservationRow {
+    reservation_id: Uuid,
+    job_id: Uuid,
+    tenant_id: String,
+    request_id: String,
+    operation: String,
+    provider_id: String,
+    model: String,
+    requested_units: i32,
+    reservation_state: String,
+    job_state: String,
+    limit_5h: Option<i32>,
+    remaining_5h: Option<i32>,
+    limit_7d: Option<i32>,
+    remaining_7d: Option<i32>,
+}
+
 #[async_trait]
 impl UsageStore for PostgresUsageStore {
     async fn reserve(&self, charge: UsageCharge) -> Result<UsageReservation, ImageGatewayError> {
         let reservation_id = Uuid::new_v4();
         let job_id = Uuid::new_v4();
         let (mut tx, now) = begin_quota_transition(&self.pool, &charge.tenant_id).await?;
+
+        if let Some(existing) = existing_session_reservation(&mut tx, &charge).await? {
+            tx.commit()
+                .await
+                .map_err(|_| ImageGatewayError::service_unavailable("quota state unavailable"))?;
+            return Ok(existing);
+        }
 
         sqlx::query(
             r#"
@@ -411,7 +439,7 @@ impl UsageStore for PostgresUsageStore {
                 OR EXISTS (
                   SELECT 1 FROM work_items w
                   WHERE w.job_id = quota_reservations.job_id
-                    AND w.state IN ('ready', 'leased', 'running')
+                    AND w.state IN ('ready', 'leased', 'running', 'uncertain')
                 )
               )
               AND created_at_ms >= $2
@@ -454,9 +482,10 @@ impl UsageStore for PostgresUsageStore {
               (reservation_id, tenant_id, request_id, job_id, requested_units,
                committed_units, started_units, released_units, state,
                created_at_ms, updated_at_ms, expires_at_ms,
-               limit_5h, remaining_5h, limit_7d, remaining_7d)
+               limit_5h, remaining_5h, limit_7d, remaining_7d,
+               admission_session_id)
             VALUES ($1, $2, $3, $4, $5, 0, 0, 0, $6, $7, $7, $8,
-                    $9, $10, $11, $12)
+                    $9, $10, $11, $12, $13)
             "#,
         )
         .bind(reservation_id)
@@ -471,6 +500,7 @@ impl UsageStore for PostgresUsageStore {
         .bind(remaining_5h)
         .bind(limit_7d)
         .bind(remaining_7d)
+        .bind(charge.admission_session_id)
         .execute(&mut *tx)
         .await
         .map_err(|_| ImageGatewayError::service_unavailable("quota state unavailable"))?;
@@ -698,6 +728,78 @@ impl UsageStore for PostgresUsageStore {
     }
 }
 
+async fn existing_session_reservation(
+    tx: &mut Transaction<'_, Postgres>,
+    charge: &UsageCharge,
+) -> Result<Option<UsageReservation>, ImageGatewayError> {
+    let Some(session_id) = charge.admission_session_id else {
+        return Ok(None);
+    };
+    let row: Option<ExistingReservationRow> = sqlx::query_as(
+        r#"
+        SELECT qr.reservation_id, qr.job_id, qr.tenant_id, qr.request_id,
+               j.operation, j.provider_id, j.model, qr.requested_units,
+               qr.state AS reservation_state, j.state AS job_state,
+               qr.limit_5h, qr.remaining_5h, qr.limit_7d, qr.remaining_7d
+        FROM quota_reservations qr
+        JOIN jobs j
+          ON j.job_id = qr.job_id
+         AND j.tenant_id = qr.tenant_id
+         AND j.reservation_id = qr.reservation_id
+        WHERE qr.admission_session_id = $1
+        FOR UPDATE OF qr, j
+        "#,
+    )
+    .bind(session_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(|_| ImageGatewayError::service_unavailable("quota state unavailable"))?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let units = u32::try_from(row.requested_units)
+        .map_err(|_| ImageGatewayError::internal("stored reservation units are invalid"))?;
+    let snapshot = UsageSnapshot {
+        limit_5h: row
+            .limit_5h
+            .and_then(|value| u32::try_from(value).ok())
+            .ok_or_else(|| ImageGatewayError::internal("stored quota snapshot is invalid"))?,
+        remaining_5h: row
+            .remaining_5h
+            .and_then(|value| u32::try_from(value).ok())
+            .ok_or_else(|| ImageGatewayError::internal("stored quota snapshot is invalid"))?,
+        limit_7d: row
+            .limit_7d
+            .and_then(|value| u32::try_from(value).ok())
+            .ok_or_else(|| ImageGatewayError::internal("stored quota snapshot is invalid"))?,
+        remaining_7d: row
+            .remaining_7d
+            .and_then(|value| u32::try_from(value).ok())
+            .ok_or_else(|| ImageGatewayError::internal("stored quota snapshot is invalid"))?,
+    };
+    if row.tenant_id != charge.tenant_id
+        || row.request_id != charge.request_id
+        || row.operation != charge.operation
+        || row.provider_id != charge.provider_id
+        || row.model != charge.model
+        || units != charge.units
+        || row.reservation_state != ReservationState::Reserved.as_str()
+        || row.job_state != JobState::Reserved.as_str()
+        || snapshot.limit_5h != charge.limits.five_hour_image_limit
+        || snapshot.limit_7d != charge.limits.seven_day_image_limit
+    {
+        return Err(ImageGatewayError::internal(
+            "admission session reservation does not match the request",
+        ));
+    }
+    Ok(Some(UsageReservation {
+        reservation_id: row.reservation_id,
+        job_id: row.job_id,
+        charge: charge.clone(),
+        snapshot,
+    }))
+}
+
 fn quota_i32(value: u32) -> Result<i32, ImageGatewayError> {
     i32::try_from(value)
         .map_err(|_| ImageGatewayError::config("image quota limit exceeds PostgreSQL range"))
@@ -733,6 +835,7 @@ struct LockedQuotaReservation {
     job_id: Uuid,
     request_id: String,
     operation: String,
+    admission_session_id: Option<Uuid>,
 }
 
 async fn lock_quota_reservation(
@@ -748,7 +851,8 @@ async fn lock_quota_reservation(
           qr.requested_units,
           qr.job_id,
           qr.request_id,
-          j.operation
+          j.operation,
+          qr.admission_session_id
         FROM quota_reservations qr
         JOIN jobs j
           ON j.job_id = qr.job_id
@@ -772,6 +876,7 @@ async fn lock_quota_reservation(
     if locked.job_id != reservation.job_id
         || locked.request_id != reservation.charge.request_id
         || locked.operation != reservation.charge.operation
+        || locked.admission_session_id != reservation.charge.admission_session_id
         || !units_match
     {
         return Err(ImageGatewayError::internal(
@@ -983,6 +1088,7 @@ mod tests {
         UsageCharge {
             tenant_id: "tenant_a".to_string(),
             request_id: Uuid::new_v4().to_string(),
+            admission_session_id: None,
             operation: "generation",
             provider_id: image_provider_contracts::openai_codex::PROVIDER_ID.to_string(),
             model: image_provider_contracts::openai_codex::MODEL_GPT_IMAGE_2.to_string(),
@@ -1012,6 +1118,7 @@ mod tests {
         let charge = UsageCharge {
             tenant_id: "tenant_a".to_string(),
             request_id: job.request_id,
+            admission_session_id: None,
             operation: "generation",
             provider_id: openai_codex::PROVIDER_ID.to_string(),
             model: job.model,

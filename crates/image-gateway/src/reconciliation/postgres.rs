@@ -50,6 +50,7 @@ struct LockedOrphanSession {
 #[derive(sqlx::FromRow)]
 struct LockedOrphanReservation {
     reservation_id: Uuid,
+    admission_session_id: Option<Uuid>,
     tenant_id: String,
     request_id: String,
     requested_units: i32,
@@ -142,6 +143,188 @@ impl ReconciliationStore for PostgresReconciliationStore {
         }
         Ok(outcome)
     }
+
+    async fn claim_input_cleanup(
+        &self,
+        owner: &str,
+        grace_ms: u64,
+        lease_ms: u64,
+        limit: u32,
+    ) -> Result<Vec<Uuid>, ImageGatewayError> {
+        if owner.is_empty() || limit == 0 || lease_ms == 0 {
+            return Ok(Vec::new());
+        }
+        let grace_ms = i64::try_from(grace_ms).unwrap_or(i64::MAX);
+        let lease_ms = i64::try_from(lease_ms).unwrap_or(i64::MAX);
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(reconciliation_unavailable)?;
+        let now = database_now(&mut tx).await?;
+        let cutoff = now.saturating_sub(grace_ms);
+        let lease_expires_at_ms = now.saturating_add(lease_ms);
+        abort_expired_unreserved_edit_sessions(&mut tx, cutoff, now, limit).await?;
+        let sessions: Vec<Uuid> = sqlx::query_scalar(
+            r#"
+            WITH candidates AS (
+              SELECT s.session_id
+              FROM admission_sessions s
+              WHERE s.operation = 'edit'
+                AND (
+                  s.input_cleanup_state = 'pending'
+                  OR (
+                    s.input_cleanup_state = 'leased'
+                    AND s.input_cleanup_lease_expires_at_ms <= $1
+                  )
+                )
+                AND (
+                  (
+                    s.job_id IS NULL
+                    AND s.state = 'aborted'
+                    AND s.updated_at_ms <= $2
+                  )
+                  OR EXISTS (
+                    SELECT 1
+                    FROM jobs j
+                    WHERE j.job_id = s.job_id
+                      AND j.tenant_id = s.tenant_id
+                      AND s.state = 'attached'
+                      AND j.state IN ('succeeded', 'failed')
+                      AND j.finished_at_ms <= $2
+                  )
+                )
+              ORDER BY s.updated_at_ms, s.session_id
+              FOR UPDATE OF s SKIP LOCKED
+              LIMIT $3
+            )
+            UPDATE admission_sessions s
+            SET input_cleanup_state = 'leased',
+                input_cleanup_owner = $4,
+                input_cleanup_lease_expires_at_ms = $5,
+                input_cleanup_completed_at_ms = NULL
+            FROM candidates c
+            WHERE s.session_id = c.session_id
+            RETURNING s.session_id
+            "#,
+        )
+        .bind(now)
+        .bind(cutoff)
+        .bind(i64::from(limit))
+        .bind(owner)
+        .bind(lease_expires_at_ms)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(reconciliation_unavailable)?;
+        tx.commit().await.map_err(reconciliation_unavailable)?;
+        Ok(sessions)
+    }
+
+    async fn complete_input_cleanup(
+        &self,
+        owner: &str,
+        session_id: Uuid,
+    ) -> Result<(), ImageGatewayError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(reconciliation_unavailable)?;
+        let now = database_now(&mut tx).await?;
+        let updated = sqlx::query(
+            r#"
+            UPDATE admission_sessions
+            SET input_cleanup_state = 'complete', input_cleanup_owner = NULL,
+                input_cleanup_lease_expires_at_ms = NULL,
+                input_cleanup_completed_at_ms = $3
+            WHERE session_id = $1 AND input_cleanup_state = 'leased'
+              AND input_cleanup_owner = $2
+            "#,
+        )
+        .bind(session_id)
+        .bind(owner)
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .map_err(reconciliation_unavailable)?;
+        if updated.rows_affected() == 0 {
+            let state: Option<String> = sqlx::query_scalar(
+                "SELECT input_cleanup_state FROM admission_sessions WHERE session_id = $1 FOR UPDATE",
+            )
+            .bind(session_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(reconciliation_unavailable)?;
+            if state.as_deref() != Some("complete") {
+                return Err(ImageGatewayError::service_unavailable(
+                    "input cleanup lease is unavailable",
+                ));
+            }
+        }
+        tx.commit().await.map_err(reconciliation_unavailable)?;
+        Ok(())
+    }
+}
+
+async fn abort_expired_unreserved_edit_sessions(
+    tx: &mut Transaction<'_, Postgres>,
+    cutoff: i64,
+    now: i64,
+    limit: u32,
+) -> Result<(), ImageGatewayError> {
+    let sessions: Vec<Uuid> = sqlx::query_scalar(
+        r#"
+        SELECT s.session_id
+        FROM admission_sessions s
+        WHERE s.operation = 'edit' AND s.state = 'receiving' AND s.job_id IS NULL
+          AND s.deadline_at_ms <= $1
+          AND NOT EXISTS (
+            SELECT 1
+            FROM quota_reservations qr
+            JOIN jobs j
+              ON j.job_id = qr.job_id
+             AND j.tenant_id = qr.tenant_id
+             AND j.reservation_id = qr.reservation_id
+            WHERE qr.state = 'reserved' AND j.state = 'reserved'
+              AND (
+                qr.admission_session_id = s.session_id
+                OR (
+                  qr.admission_session_id IS NULL
+                  AND qr.tenant_id = s.tenant_id
+                  AND qr.request_id = s.request_id
+                  AND j.operation = s.operation
+                )
+              )
+          )
+        ORDER BY s.deadline_at_ms, s.session_id
+        FOR UPDATE OF s SKIP LOCKED
+        LIMIT $2
+        "#,
+    )
+    .bind(cutoff)
+    .bind(i64::from(limit))
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(reconciliation_unavailable)?;
+    for session_id in sessions {
+        sqlx::query(
+            "UPDATE admission_sessions SET state = 'aborted', updated_at_ms = $2 WHERE session_id = $1 AND state = 'receiving' AND job_id IS NULL",
+        )
+        .bind(session_id)
+        .bind(now)
+        .execute(&mut **tx)
+        .await
+        .map_err(reconciliation_unavailable)?;
+        sqlx::query(
+            "UPDATE idempotency_requests SET state = 'aborted', terminal_outcome = NULL, updated_at_ms = $2 WHERE session_id = $1 AND state = 'receiving'",
+        )
+        .bind(session_id)
+        .bind(now)
+        .execute(&mut **tx)
+        .await
+        .map_err(reconciliation_unavailable)?;
+    }
+    Ok(())
 }
 
 async fn find_orphan_candidates(
@@ -152,18 +335,19 @@ async fn find_orphan_candidates(
     sqlx::query_as(
         r#"
         SELECT qr.reservation_id, qr.tenant_id,
-               (
+               COALESCE(qr.admission_session_id, (
                  SELECT s.session_id
                  FROM admission_sessions s
-                 WHERE s.tenant_id = qr.tenant_id
+                 WHERE qr.admission_session_id IS NULL
+                   AND s.tenant_id = qr.tenant_id
                    AND s.request_id = qr.request_id
                    AND s.operation = j.operation
-                   AND s.state = 'receiving'
+                   AND s.state IN ('receiving', 'aborted')
                    AND s.job_id IS NULL
                    AND s.created_at_ms <= $1
                  ORDER BY s.created_at_ms, s.session_id
                  LIMIT 1
-               ) AS session_id
+               )) AS session_id
         FROM quota_reservations qr
         JOIN jobs j
           ON j.job_id = qr.job_id
@@ -175,33 +359,52 @@ async fn find_orphan_candidates(
           AND j.created_at_ms <= $1
           AND NOT EXISTS (SELECT 1 FROM work_items w WHERE w.job_id = j.job_id)
           AND (
-            SELECT COUNT(*)
-            FROM admission_sessions s
-            WHERE s.tenant_id = qr.tenant_id
-              AND s.request_id = qr.request_id
-              AND s.operation = j.operation
-              AND s.state = 'receiving'
-              AND s.job_id IS NULL
-              AND s.created_at_ms <= $1
-          ) = 1
-          AND (
-            SELECT COUNT(*)
-            FROM quota_reservations other_qr
-            JOIN jobs other_j
-              ON other_j.job_id = other_qr.job_id
-             AND other_j.tenant_id = other_qr.tenant_id
-             AND other_j.reservation_id = other_qr.reservation_id
-            WHERE other_qr.tenant_id = qr.tenant_id
-              AND other_qr.request_id = qr.request_id
-              AND other_j.operation = j.operation
-              AND other_qr.state = 'reserved'
-              AND other_j.state = 'reserved'
-              AND other_qr.created_at_ms <= $1
-              AND other_j.created_at_ms <= $1
-              AND NOT EXISTS (
-                SELECT 1 FROM work_items other_w WHERE other_w.job_id = other_j.job_id
+            (
+              qr.admission_session_id IS NOT NULL
+              AND EXISTS (
+                SELECT 1 FROM admission_sessions s
+                WHERE s.session_id = qr.admission_session_id
+                  AND s.tenant_id = qr.tenant_id
+                  AND s.request_id = qr.request_id
+                  AND s.operation = j.operation
+                  AND s.state IN ('receiving', 'aborted')
+                  AND s.job_id IS NULL
+                  AND s.created_at_ms <= $1
               )
-          ) = 1
+            )
+            OR (
+              qr.admission_session_id IS NULL
+              AND (
+                SELECT COUNT(*)
+                FROM admission_sessions s
+                WHERE s.tenant_id = qr.tenant_id
+                  AND s.request_id = qr.request_id
+                  AND s.operation = j.operation
+                  AND s.state IN ('receiving', 'aborted')
+                  AND s.job_id IS NULL
+                  AND s.created_at_ms <= $1
+              ) = 1
+              AND (
+                SELECT COUNT(*)
+                FROM quota_reservations other_qr
+                JOIN jobs other_j
+                  ON other_j.job_id = other_qr.job_id
+                 AND other_j.tenant_id = other_qr.tenant_id
+                 AND other_j.reservation_id = other_qr.reservation_id
+                WHERE other_qr.admission_session_id IS NULL
+                  AND other_qr.tenant_id = qr.tenant_id
+                  AND other_qr.request_id = qr.request_id
+                  AND other_j.operation = j.operation
+                  AND other_qr.state = 'reserved'
+                  AND other_j.state = 'reserved'
+                  AND other_qr.created_at_ms <= $1
+                  AND other_j.created_at_ms <= $1
+                  AND NOT EXISTS (
+                    SELECT 1 FROM work_items other_w WHERE other_w.job_id = other_j.job_id
+                  )
+              ) = 1
+            )
+          )
         ORDER BY qr.created_at_ms, qr.reservation_id
         LIMIT $2
         "#,
@@ -253,7 +456,7 @@ async fn reconcile_orphan_candidate_once(
         return Ok(false);
     };
     if session.tenant_id != candidate.tenant_id
-        || session.state != "receiving"
+        || !matches!(session.state.as_str(), "receiving" | "aborted")
         || session.job_id.is_some()
         || session.created_at_ms > cutoff
     {
@@ -312,7 +515,7 @@ async fn lock_orphan_reservation(
 ) -> Result<Option<LockedOrphanReservation>, ImageGatewayError> {
     sqlx::query_as(
         r#"
-        SELECT qr.reservation_id, qr.tenant_id, qr.request_id,
+        SELECT qr.reservation_id, qr.admission_session_id, qr.tenant_id, qr.request_id,
                qr.requested_units, qr.released_units, qr.state AS quota_state,
                qr.created_at_ms AS quota_created_at_ms,
                j.job_id, j.operation, j.state AS job_state,
@@ -350,7 +553,8 @@ async fn orphan_still_reclaimable(
         SELECT COUNT(*)
         FROM admission_sessions s
         WHERE s.tenant_id = $1 AND s.request_id = $2 AND s.operation = $3
-          AND s.state = 'receiving' AND s.job_id IS NULL AND s.created_at_ms <= $4
+          AND s.state IN ('receiving', 'aborted')
+          AND s.job_id IS NULL AND s.created_at_ms <= $4
         "#,
     )
     .bind(&session.tenant_id)
@@ -381,8 +585,11 @@ async fn orphan_still_reclaimable(
     .fetch_one(&mut **tx)
     .await
     .map_err(reconciliation_unavailable)?;
-    Ok(matching_sessions == 1
-        && matching_reservations == 1
+    let binding_matches = match reservation.admission_session_id {
+        Some(session_id) => session_id == candidate.session_id,
+        None => matching_sessions == 1 && matching_reservations == 1,
+    };
+    Ok(binding_matches
         && reservation.reservation_id == candidate.reservation_id
         && reservation.tenant_id == candidate.tenant_id
         && reservation.tenant_id == session.tenant_id
@@ -408,7 +615,10 @@ async fn lock_active_idempotency(
     .fetch_all(&mut **tx)
     .await
     .map_err(reconciliation_unavailable)?;
-    if states.iter().all(|state| state == "receiving") {
+    if states
+        .iter()
+        .all(|state| matches!(state.as_str(), "receiving" | "aborted"))
+    {
         Ok(())
     } else {
         Err(ImageGatewayError::internal(
@@ -428,7 +638,7 @@ async fn terminalize_orphan(
             r#"
             UPDATE admission_sessions
             SET state = 'aborted', updated_at_ms = $2
-            WHERE session_id = $1 AND state = 'receiving' AND job_id IS NULL
+            WHERE session_id = $1 AND state IN ('receiving', 'aborted') AND job_id IS NULL
             "#,
         )
         .bind(session_id)

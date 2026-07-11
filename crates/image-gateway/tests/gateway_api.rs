@@ -879,11 +879,11 @@ async fn generation_accepts_gpt_image_2_snapshot_model() {
 }
 
 #[tokio::test]
-async fn generation_accepts_moderation_low_without_rejecting() {
+async fn generation_rejects_unsupported_moderation_low() {
     let fake = FakeGenerator::default();
     let app = build_router(config(), Arc::new(fake.clone()), usage_store());
 
-    let (status, _headers, _body) = send_json(
+    let (status, _headers, body) = send_json(
         app,
         Some("test-token"),
         json!({
@@ -894,8 +894,10 @@ async fn generation_accepts_moderation_low_without_rejecting() {
     )
     .await;
 
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(fake.calls.lock().unwrap().len(), 1);
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["param"], "moderation");
+    assert_eq!(body["error"]["code"], "unsupported_parameter");
+    assert!(fake.calls.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -1382,11 +1384,11 @@ async fn tenant_concurrency_pool_is_isolated_from_other_tenants() {
 }
 
 #[tokio::test]
-async fn edits_accept_multipart_moderation_low() {
+async fn edits_reject_unsupported_multipart_moderation_low() {
     let fake = FakeGenerator::default();
     let app = build_router(config(), Arc::new(fake.clone()), usage_store());
 
-    let (status, _headers, _body) = send_edit_multipart(
+    let (status, _headers, body) = send_edit_multipart(
         app,
         &[
             ("model", "gpt-image-2"),
@@ -1397,8 +1399,10 @@ async fn edits_accept_multipart_moderation_low() {
     )
     .await;
 
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(fake.calls.lock().unwrap().len(), 1);
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["param"], "moderation");
+    assert_eq!(body["error"]["code"], "unsupported_parameter");
+    assert!(fake.calls.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -1428,7 +1432,7 @@ async fn edits_reject_true_partial_image_streaming() {
 async fn edits_accept_json_data_url_images_and_mask() {
     let fake = FakeGenerator::default();
     let app = build_router(config(), Arc::new(fake.clone()), usage_store());
-    let image_url = format!("data:image/png;base64,{}", STANDARD.encode(TINY_PNG));
+    let image_url = format!("data:image/png;base64,{}", STANDARD.encode(png_bytes(1, 1)));
 
     let (status, _headers, body) = send_edit_json(
         app,
@@ -1489,7 +1493,7 @@ async fn edits_accept_json_data_url_image_field() {
 async fn edits_accept_json_b64_json_images_and_mask() {
     let fake = FakeGenerator::default();
     let app = build_router(config(), Arc::new(fake.clone()), usage_store());
-    let encoded = STANDARD.encode(TINY_PNG);
+    let encoded = STANDARD.encode(png_bytes(1, 1));
 
     let (status, _headers, body) = send_edit_json(
         app,
@@ -2091,6 +2095,7 @@ async fn edits_accept_multipart_mask() {
     let app = build_router(config(), Arc::new(fake.clone()), usage_store());
 
     let boundary = "x-test-boundary";
+    let rgba_png = png_bytes(1, 1);
     let mut body = Vec::new();
     body.extend_from_slice(
         b"--x-test-boundary\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\ngpt-image-2\r\n",
@@ -2101,12 +2106,12 @@ async fn edits_accept_multipart_mask() {
     body.extend_from_slice(
         b"--x-test-boundary\r\nContent-Disposition: form-data; name=\"image[]\"; filename=\"input.png\"\r\nContent-Type: image/png\r\n\r\n",
     );
-    body.extend_from_slice(TINY_PNG);
+    body.extend_from_slice(&rgba_png);
     body.extend_from_slice(b"\r\n");
     body.extend_from_slice(
         b"--x-test-boundary\r\nContent-Disposition: form-data; name=\"mask\"; filename=\"mask.png\"\r\nContent-Type: image/png\r\n\r\n",
     );
-    body.extend_from_slice(TINY_PNG);
+    body.extend_from_slice(&rgba_png);
     body.extend_from_slice(b"\r\n--x-test-boundary--\r\n");
 
     let response = app
@@ -2302,11 +2307,9 @@ async fn openapi_json_documents_images_api() {
             .unwrap()
             .contains(&json!("gpt-image-2-2026-04-21"))
     );
-    assert!(
-        body["components"]["schemas"]["ImageGenerationRequest"]["properties"]["moderation"]["enum"]
-            .as_array()
-            .unwrap()
-            .contains(&json!("low"))
+    assert_eq!(
+        body["components"]["schemas"]["ImageGenerationRequest"]["properties"]["moderation"]["enum"],
+        json!(["auto"]),
     );
     assert!(
         body["components"]["schemas"]["ImageGenerationRequest"]["properties"]["stream"].is_object()
@@ -2319,11 +2322,9 @@ async fn openapi_json_documents_images_api() {
             .get("created")
             .is_none()
     );
-    assert!(
-        body["components"]["schemas"]["ImageEditRequest"]["properties"]["moderation"]["enum"]
-            .as_array()
-            .unwrap()
-            .contains(&json!("low"))
+    assert_eq!(
+        body["components"]["schemas"]["ImageEditRequest"]["properties"]["moderation"]["enum"],
+        json!(["auto"]),
     );
     assert!(body["components"]["schemas"]["ImageEditRequest"]["properties"]["stream"].is_object());
     assert!(

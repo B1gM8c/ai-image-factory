@@ -326,6 +326,7 @@ impl RunningFixture {
             .reserve(UsageCharge {
                 tenant_id: tenant_id.clone(),
                 request_id: request_id.clone(),
+                admission_session_id: None,
                 operation: "generation",
                 provider_id: "openai-codex".to_string(),
                 model: "gpt-image-2".to_string(),
@@ -341,6 +342,7 @@ impl RunningFixture {
         let admission = gpt_image_2_gateway::admission::PostgresAdmissionStore::new(pool.clone());
         let claim = admission
             .claim(ClaimAdmission {
+                owner_token: Uuid::new_v4(),
                 tenant_id,
                 project_id: "project-settlement".to_string(),
                 api_profile: "openai-images-v1".to_string(),
@@ -397,6 +399,7 @@ impl RunningFixture {
             tenant_id: self.reservation.charge.tenant_id.clone(),
             projection: GenerationResponseProjection {
                 api_profile: "openai-images-v1".to_string(),
+                operation: "generation".to_string(),
                 response_schema: GENERATION_RESPONSE_SCHEMA.to_string(),
                 created_at_seconds: 1_800_000_000,
                 output_format: "png".to_string(),
@@ -417,6 +420,7 @@ fn attach_request(ticket: AdmissionTicket, job_id: Uuid) -> AttachJob {
         job_id,
         command_schema: "openai.images.generation.v1".to_string(),
         command_json: json!({"prompt": "atomic settlement"}),
+        input_manifest: None,
         work_kind: "image_batch".to_string(),
         schedule_scope: "tenant-settlement".to_string(),
         schedule_weight: 1,

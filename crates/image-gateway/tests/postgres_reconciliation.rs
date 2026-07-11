@@ -1,5 +1,7 @@
 use std::env;
 
+use async_trait::async_trait;
+
 use gpt_image_2_gateway::{
     GenerationJob, PostgresReconciliationStore, PostgresUsageStore, ReconciliationStore,
     UsageCharge, UsageLimits, UsageReservation, UsageStore,
@@ -7,7 +9,13 @@ use gpt_image_2_gateway::{
         AdmissionClaim, AdmissionStore, AdmissionTicket, AttachJob, ClaimAdmission,
         GenerationCommandV1, PostgresAdmissionStore, WorkLease,
     },
+    artifacts::InMemoryArtifactBlobStore,
     database::{connect_test_pool_with_search_path, run_migrations},
+    input_blobs::{
+        InputBlobDeleteError, InputBlobKey, InputBlobReadError, InputBlobRef, InputBlobStore,
+        InputBlobWriteError,
+    },
+    reconcile_input_cleanup,
 };
 use serde_json::to_value;
 use sqlx::{AssertSqlSafe, PgPool};
@@ -199,9 +207,387 @@ async fn concurrent_reconcilers_release_an_orphan_once() -> TestResult {
     combine(result, database.cleanup().await)
 }
 
+#[tokio::test]
+async fn aborted_session_with_reserved_quota_finishes_orphan_recovery() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let orphan = orphan_reservation(&database.pool, "orphan-half-aborted").await?;
+        age_orphan(&database.pool, &orphan, 120_000).await?;
+        sqlx::query("UPDATE admission_sessions SET state = 'aborted' WHERE session_id = $1")
+            .bind(orphan.ticket.session_id)
+            .execute(&database.pool)
+            .await
+            .map_err(|error| format!("half-aborted admission update failed: {error}"))?;
+        sqlx::query("UPDATE idempotency_requests SET state = 'aborted' WHERE session_id = $1")
+            .bind(orphan.ticket.session_id)
+            .execute(&database.pool)
+            .await
+            .map_err(|error| format!("half-aborted idempotency update failed: {error}"))?;
+
+        let outcome = PostgresReconciliationStore::new(database.pool.clone())
+            .reconcile_orphan_reservations(60_000, 1)
+            .await
+            .map_err(|error| format!("half-aborted orphan recovery failed: {error:?}"))?;
+        require(
+            outcome.orphaned == 1,
+            format!("half-aborted orphan was not recovered: {outcome:?}"),
+        )?;
+        assert_orphan_terminal_state(&database.pool, &orphan).await
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
+async fn input_cleanup_deletes_expired_unattached_session_blobs_once() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let ticket = expired_edit_session(&database.pool, "input-expired").await?;
+        let blobs = InMemoryArtifactBlobStore::default();
+        let blob = blobs
+            .put(
+                InputBlobKey {
+                    admission_session_id: ticket.session_id,
+                    input_id: Uuid::new_v4(),
+                },
+                b"staged edit input",
+            )
+            .await
+            .map_err(|error| format!("input staging failed: {error:?}"))?;
+        let reconciler = PostgresReconciliationStore::new(database.pool.clone());
+        let outcome =
+            reconcile_input_cleanup(&reconciler, &blobs, "cleanup-expired", 0, 60_000, 10)
+                .await
+                .map_err(|error| format!("input cleanup failed: {error:?}"))?;
+        require(
+            outcome.claimed == 1 && outcome.completed == 1 && outcome.failed == 0,
+            format!("unexpected input cleanup outcome: {outcome:?}"),
+        )?;
+        require(
+            blobs.get(&blob).await == Err(InputBlobReadError::Integrity),
+            "expired session input blob was not deleted",
+        )?;
+        let state: (String, Option<String>, Option<i64>, String, String) = sqlx::query_as(
+            r#"
+            SELECT s.input_cleanup_state, s.input_cleanup_owner,
+                   s.input_cleanup_completed_at_ms, s.state, i.state
+            FROM admission_sessions s
+            JOIN idempotency_requests i ON i.session_id = s.session_id
+            WHERE s.session_id = $1
+            "#,
+        )
+        .bind(ticket.session_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(|error| format!("cleanup state query failed: {error}"))?;
+        require(
+            state.0 == "complete"
+                && state.1.is_none()
+                && state.2.is_some()
+                && state.3 == "aborted"
+                && state.4 == "aborted",
+            format!("cleanup completion was not persisted: {state:?}"),
+        )?;
+        let duplicate =
+            reconcile_input_cleanup(&reconciler, &blobs, "cleanup-expired", 0, 60_000, 10)
+                .await
+                .map_err(|error| format!("duplicate cleanup failed: {error:?}"))?;
+        require(
+            duplicate.claimed == 0,
+            format!("completed cleanup was reclaimed: {duplicate:?}"),
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
+async fn failed_input_delete_is_retried_after_cleanup_lease_expiry() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let ticket = expired_edit_session(&database.pool, "input-retry").await?;
+        let blobs = InMemoryArtifactBlobStore::default();
+        let blob = blobs
+            .put(
+                InputBlobKey {
+                    admission_session_id: ticket.session_id,
+                    input_id: Uuid::new_v4(),
+                },
+                b"retryable staged input",
+            )
+            .await
+            .map_err(|error| format!("input staging failed: {error:?}"))?;
+        let reconciler = PostgresReconciliationStore::new(database.pool.clone());
+        let failed = reconcile_input_cleanup(
+            &reconciler,
+            &UnavailableDeleteStore,
+            "cleanup-first",
+            0,
+            60_000,
+            10,
+        )
+        .await
+        .map_err(|error| format!("failed cleanup pass errored: {error:?}"))?;
+        require(
+            failed.claimed == 1 && failed.completed == 0 && failed.failed == 1,
+            format!("delete failure was not retained for retry: {failed:?}"),
+        )?;
+        sqlx::query(
+            "UPDATE admission_sessions SET input_cleanup_lease_expires_at_ms = 0 WHERE session_id = $1",
+        )
+        .bind(ticket.session_id)
+        .execute(&database.pool)
+        .await
+        .map_err(|error| format!("cleanup lease expiry failed: {error}"))?;
+        let retried = reconcile_input_cleanup(
+            &reconciler,
+            &blobs,
+            "cleanup-second",
+            0,
+            60_000,
+            10,
+        )
+        .await
+        .map_err(|error| format!("cleanup retry failed: {error:?}"))?;
+        require(
+            retried.claimed == 1 && retried.completed == 1 && retried.failed == 0,
+            format!("expired cleanup lease was not recovered: {retried:?}"),
+        )?;
+        require(
+            blobs.get(&blob).await == Err(InputBlobReadError::Integrity),
+            "retried input cleanup did not delete the blob",
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
+async fn terminal_edit_inputs_are_cleanup_candidates() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let ticket = terminal_edit_session(&database.pool, "input-terminal").await?;
+        let blobs = InMemoryArtifactBlobStore::default();
+        let blob = blobs
+            .put(
+                InputBlobKey {
+                    admission_session_id: ticket.session_id,
+                    input_id: Uuid::new_v4(),
+                },
+                b"terminal edit input",
+            )
+            .await
+            .map_err(|error| format!("terminal input staging failed: {error:?}"))?;
+        let reconciler = PostgresReconciliationStore::new(database.pool.clone());
+        let outcome =
+            reconcile_input_cleanup(&reconciler, &blobs, "cleanup-terminal", 0, 60_000, 10)
+                .await
+                .map_err(|error| format!("terminal input cleanup failed: {error:?}"))?;
+        require(
+            outcome.completed == 1 && outcome.failed == 0,
+            format!("terminal edit was not cleaned: {outcome:?}"),
+        )?;
+        require(
+            blobs.get(&blob).await == Err(InputBlobReadError::Integrity),
+            "terminal edit blob remained readable",
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
+async fn concurrent_input_cleanup_claims_have_one_owner() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let ticket = expired_edit_session(&database.pool, "input-concurrent").await?;
+        let left = PostgresReconciliationStore::new(database.pool.clone());
+        let right = PostgresReconciliationStore::new(database.pool.clone());
+        let (left_claims, right_claims) = tokio::join!(
+            left.claim_input_cleanup("cleanup-left", 0, 60_000, 1),
+            right.claim_input_cleanup("cleanup-right", 0, 60_000, 1),
+        );
+        let left_claims = left_claims.map_err(|error| format!("left claim failed: {error:?}"))?;
+        let right_claims =
+            right_claims.map_err(|error| format!("right claim failed: {error:?}"))?;
+        require(
+            left_claims.len() + right_claims.len() == 1,
+            format!("cleanup session had multiple owners: {left_claims:?} {right_claims:?}"),
+        )?;
+        let (owner, session_id) = if let Some(session_id) = left_claims.first() {
+            ("cleanup-left", *session_id)
+        } else {
+            ("cleanup-right", right_claims[0])
+        };
+        require(
+            session_id == ticket.session_id,
+            "wrong cleanup session claimed",
+        )?;
+        left.complete_input_cleanup(owner, session_id)
+            .await
+            .map_err(|error| format!("cleanup completion failed: {error:?}"))
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
+async fn uncertain_edit_inputs_are_never_cleanup_candidates() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let admission = PostgresAdmissionStore::new(database.pool.clone());
+        let lease = ready_lease(&database.pool, &admission, "u").await?;
+        sqlx::query("UPDATE admission_sessions SET operation = 'edit' WHERE job_id = $1")
+            .bind(lease.job_id)
+            .execute(&database.pool)
+            .await
+            .map_err(|error| format!("uncertain session operation update failed: {error}"))?;
+        sqlx::query("UPDATE jobs SET operation = 'edit' WHERE job_id = $1")
+            .bind(lease.job_id)
+            .execute(&database.pool)
+            .await
+            .map_err(|error| format!("uncertain job operation update failed: {error}"))?;
+        admission
+            .start(&lease)
+            .await
+            .map_err(|error| format!("uncertain work start failed: {error}"))?;
+        expire_lease(&database.pool, &lease).await?;
+        let reconciler = PostgresReconciliationStore::new(database.pool.clone());
+        let work = reconciler
+            .reconcile_expired_work(1)
+            .await
+            .map_err(|error| format!("uncertain work reconciliation failed: {error:?}"))?;
+        require(work.uncertain == 1, "edit work did not become uncertain")?;
+        let claims = reconciler
+            .claim_input_cleanup("cleanup-uncertain", 0, 60_000, 10)
+            .await
+            .map_err(|error| format!("uncertain cleanup claim failed: {error:?}"))?;
+        require(
+            claims.is_empty(),
+            format!("uncertain edit input was claimed for deletion: {claims:?}"),
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
 struct OrphanFixture {
     reservation: UsageReservation,
     ticket: AdmissionTicket,
+}
+
+async fn expired_edit_session(pool: &PgPool, key: &str) -> TestResult<AdmissionTicket> {
+    let admission = PostgresAdmissionStore::new(pool.clone());
+    let claim = admission
+        .claim(ClaimAdmission {
+            owner_token: Uuid::new_v4(),
+            tenant_id: format!("tenant_{}", Uuid::new_v4().simple()),
+            project_id: format!("project-{key}"),
+            api_profile: "openai-images-v1".to_string(),
+            operation: "edit".to_string(),
+            request_id: format!("req_{}", Uuid::new_v4().simple()),
+            idempotency_key_digest: Some("c".repeat(64)),
+            request_hash: "d".repeat(64),
+            deadline_at_ms: i64::MAX,
+        })
+        .await
+        .map_err(|error| format!("edit admission failed: {error}"))?;
+    let AdmissionClaim::Owner(ticket) = claim else {
+        return Err(format!("unexpected edit claim: {claim:?}"));
+    };
+    sqlx::query(
+        "UPDATE admission_sessions SET deadline_at_ms = 0, updated_at_ms = 0 WHERE session_id = $1",
+    )
+    .bind(ticket.session_id)
+    .execute(pool)
+    .await
+    .map_err(|error| format!("edit session expiry failed: {error}"))?;
+    Ok(ticket)
+}
+
+async fn terminal_edit_session(pool: &PgPool, key: &str) -> TestResult<AdmissionTicket> {
+    let ticket = expired_edit_session(pool, key).await?;
+    let tenant_id: String =
+        sqlx::query_scalar("SELECT tenant_id FROM admission_sessions WHERE session_id = $1")
+            .bind(ticket.session_id)
+            .fetch_one(pool)
+            .await
+            .map_err(|error| format!("terminal session tenant query failed: {error}"))?;
+    let request_id: String =
+        sqlx::query_scalar("SELECT request_id FROM admission_sessions WHERE session_id = $1")
+            .bind(ticket.session_id)
+            .fetch_one(pool)
+            .await
+            .map_err(|error| format!("terminal session request query failed: {error}"))?;
+    let reservation = PostgresUsageStore::new(pool.clone())
+        .reserve(UsageCharge {
+            tenant_id,
+            request_id,
+            admission_session_id: Some(ticket.session_id),
+            operation: "edit",
+            provider_id: "openai-codex".to_string(),
+            model: "gpt-image-2".to_string(),
+            units: 1,
+            limits: UsageLimits {
+                five_hour_image_limit: 10,
+                seven_day_image_limit: 20,
+            },
+        })
+        .await
+        .map_err(|error| format!("terminal edit reserve failed: {error:?}"))?;
+    sqlx::query(
+        r#"
+        UPDATE admission_sessions
+        SET state = 'attached', job_id = $2, updated_at_ms = 0
+        WHERE session_id = $1
+        "#,
+    )
+    .bind(ticket.session_id)
+    .bind(reservation.job_id)
+    .execute(pool)
+    .await
+    .map_err(|error| format!("terminal admission update failed: {error}"))?;
+    sqlx::query(
+        "UPDATE jobs SET state = 'failed', finished_at_ms = 0, updated_at_ms = 0 WHERE job_id = $1",
+    )
+    .bind(reservation.job_id)
+    .execute(pool)
+    .await
+    .map_err(|error| format!("terminal job update failed: {error}"))?;
+    Ok(ticket)
+}
+
+struct UnavailableDeleteStore;
+
+#[async_trait]
+impl InputBlobStore for UnavailableDeleteStore {
+    async fn put(&self, _: InputBlobKey, _: &[u8]) -> Result<InputBlobRef, InputBlobWriteError> {
+        Err(InputBlobWriteError::Unavailable)
+    }
+
+    async fn get(&self, _: &InputBlobRef) -> Result<Vec<u8>, InputBlobReadError> {
+        Err(InputBlobReadError::Unavailable)
+    }
+
+    async fn delete(&self, _: &InputBlobRef) -> Result<(), InputBlobDeleteError> {
+        Err(InputBlobDeleteError::Unavailable)
+    }
+
+    async fn delete_session(&self, _: Uuid) -> Result<(), InputBlobDeleteError> {
+        Err(InputBlobDeleteError::Unavailable)
+    }
 }
 
 async fn orphan_reservation(pool: &PgPool, key: &str) -> TestResult<OrphanFixture> {
@@ -210,6 +596,7 @@ async fn orphan_reservation(pool: &PgPool, key: &str) -> TestResult<OrphanFixtur
     let admission = PostgresAdmissionStore::new(pool.clone());
     let claim = admission
         .claim(ClaimAdmission {
+            owner_token: Uuid::new_v4(),
             tenant_id: tenant_id.clone(),
             project_id: format!("project-{key}"),
             api_profile: "openai-images-v1".to_string(),
@@ -228,6 +615,7 @@ async fn orphan_reservation(pool: &PgPool, key: &str) -> TestResult<OrphanFixtur
         .reserve(UsageCharge {
             tenant_id,
             request_id,
+            admission_session_id: Some(ticket.session_id),
             operation: "generation",
             provider_id: "openai-codex".to_string(),
             model: "gpt-image-2".to_string(),
@@ -375,6 +763,7 @@ async fn ready_lease(
         request_id: request_id.clone(),
         model: "gpt-image-2".to_string(),
         prompt: "reconciliation fixture".to_string(),
+        moderation: "auto".to_string(),
         n: 1,
         size: "auto".to_string(),
         quality: "high".to_string(),
@@ -391,6 +780,7 @@ async fn ready_lease(
         .reserve(UsageCharge {
             tenant_id: tenant_id.clone(),
             request_id: request_id.clone(),
+            admission_session_id: None,
             operation: "generation",
             provider_id: "openai-codex".to_string(),
             model: "gpt-image-2".to_string(),
@@ -404,6 +794,7 @@ async fn ready_lease(
         .map_err(|error| format!("reserve failed: {error:?}"))?;
     let claim = admission
         .claim(ClaimAdmission {
+            owner_token: Uuid::new_v4(),
             tenant_id: tenant_id.clone(),
             project_id: format!("project-{key}"),
             api_profile: "openai-images-v1".to_string(),
@@ -424,6 +815,7 @@ async fn ready_lease(
             job_id: reservation.job_id,
             command_schema: "openai.images.generation.v1".to_string(),
             command_json: to_value(command).map_err(|error| error.to_string())?,
+            input_manifest: None,
             work_kind: "image_batch".to_string(),
             schedule_scope: format!("tenant:{tenant_id}"),
             schedule_weight: 1,

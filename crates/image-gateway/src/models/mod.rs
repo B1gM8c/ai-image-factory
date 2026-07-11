@@ -1,7 +1,4 @@
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::collections::{BTreeMap, BTreeSet};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use image_provider_contracts::{active_providers, openai_codex};
@@ -11,6 +8,7 @@ use utoipa::ToSchema;
 
 use crate::{
     ImageGatewayError,
+    core::provider::validate_edit_job,
     generator::{EditJob, GeneratedImage, GenerationJob, InputImage},
     size::is_valid_gpt_image_2_size,
 };
@@ -166,6 +164,7 @@ impl ImageGenerationRequest {
         let CommonFields {
             model,
             prompt,
+            moderation,
             n,
             size,
             quality,
@@ -194,6 +193,7 @@ impl ImageGenerationRequest {
             request_id,
             model,
             prompt,
+            moderation,
             n,
             size,
             quality,
@@ -226,6 +226,7 @@ impl EditForm {
         let CommonFields {
             model,
             prompt,
+            moderation,
             n,
             size,
             quality,
@@ -256,10 +257,11 @@ impl EditForm {
             ));
         }
 
-        Ok(EditJob {
+        let job = EditJob {
             request_id,
             model,
             prompt,
+            moderation,
             images: self.images,
             mask: self.mask,
             n,
@@ -270,13 +272,16 @@ impl EditForm {
             background,
             stream,
             partial_images,
-        })
+        };
+        validate_edit_job(&job)?;
+        Ok(job)
     }
 }
 
 struct CommonFields {
     model: String,
     prompt: String,
+    moderation: String,
     n: u32,
     size: String,
     quality: String,
@@ -343,13 +348,18 @@ fn validate_common(
             "style is only supported for DALL-E models",
         ));
     }
-    if let Some(value) = moderation.as_deref()
-        && !matches!(value, "auto" | "low")
-    {
+    let moderation = moderation.unwrap_or_else(|| "auto".to_string());
+    if !matches!(moderation.as_str(), "auto" | "low") {
         return Err(ImageGatewayError::invalid_request(
             "moderation must be auto or low",
             Some("moderation".to_string()),
             "invalid_value",
+        ));
+    }
+    if moderation == "low" {
+        return Err(ImageGatewayError::unsupported(
+            "moderation",
+            "The active Codex CLI provider cannot enforce moderation=low; use moderation=auto.",
         ));
     }
 
@@ -446,6 +456,7 @@ fn validate_common(
     Ok(CommonFields {
         model,
         prompt,
+        moderation,
         n,
         size,
         quality,
@@ -490,26 +501,6 @@ fn reject_unknown_parameters(value: &Value, allowed: &[&str]) -> Result<(), Imag
         }
     }
     Ok(())
-}
-
-pub fn images_response(
-    images: Vec<GeneratedImage>,
-    output_format: String,
-    quality: String,
-    size: String,
-    background: String,
-) -> ImagesResponse {
-    images_response_at(
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64,
-        images,
-        output_format,
-        quality,
-        size,
-        background,
-    )
 }
 
 pub fn images_response_at(

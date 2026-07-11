@@ -7,11 +7,12 @@ mod operations;
 
 use super::{
     AdmissionClaim, AdmissionError, AdmissionStore, AdmissionTicket, AttachJob, AttachedWork,
-    ClaimAdmission, WorkLease, WorkOutcome,
+    ClaimAdmission, WorkLease, WorkOutcome, attach_operation, validate_attach_request,
 };
 use operations::{
-    abort_receiving_session, append_event_pair, attach_and_start_work, claim_work, database_now,
-    job_belongs_to_tenant, reserve_schedule_slot, transition_active, unavailable,
+    abort_receiving_session, append_event_pair, attach_and_start_work, bind_quota_reservation,
+    claim_work, database_now, job_matches_admission_identity, persist_inputs, replay_attached_work,
+    reserve_schedule_slot, transition_active, unavailable,
 };
 
 #[derive(Clone)]
@@ -22,6 +23,8 @@ pub struct PostgresAdmissionStore {
 #[derive(sqlx::FromRow)]
 struct LockedAdmissionSession {
     tenant_id: String,
+    operation: String,
+    request_id: String,
     state: String,
     idempotency_key_digest: Option<String>,
     request_hash: String,
@@ -55,6 +58,70 @@ impl AdmissionStore for PostgresAdmissionStore {
         let now = database_now(&mut tx).await?;
         let mut replace_aborted_identity = false;
 
+        let recovered: Option<(
+            Uuid,
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            i64,
+            Option<Uuid>,
+        )> = sqlx::query_as(
+            r#"
+                SELECT session_id, tenant_id, project_id, api_profile, operation,
+                       request_id, request_hash, state, deadline_at_ms, job_id
+                FROM admission_sessions
+                WHERE owner_token = $1
+                FOR UPDATE
+                "#,
+        )
+        .bind(request.owner_token)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(unavailable)?;
+        if let Some((
+            session_id,
+            tenant_id,
+            project_id,
+            api_profile,
+            operation,
+            request_id,
+            request_hash,
+            state,
+            deadline_at_ms,
+            job_id,
+        )) = recovered
+        {
+            if tenant_id != request.tenant_id
+                || project_id != request.project_id
+                || api_profile != request.api_profile
+                || operation != request.operation
+                || request_id != request.request_id
+                || request_hash != request.request_hash
+            {
+                return Err(AdmissionError::InvalidOwner);
+            }
+            if state == "receiving" {
+                if job_id.is_some() {
+                    return Err(AdmissionError::InvalidOwner);
+                }
+                if deadline_at_ms <= now {
+                    abort_receiving_session(&mut tx, session_id, now).await?;
+                    tx.commit().await.map_err(unavailable)?;
+                    return Err(AdmissionError::Expired);
+                }
+                tx.commit().await.map_err(unavailable)?;
+                return Ok(AdmissionClaim::Owner(AdmissionTicket {
+                    session_id,
+                    owner_token: request.owner_token,
+                    request_hash,
+                }));
+            }
+        }
+
         if let Some(key_digest) = request.idempotency_key_digest.as_deref() {
             sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
                 .bind(key_digest)
@@ -79,8 +146,9 @@ impl AdmissionStore for PostgresAdmissionStore {
             .map_err(unavailable)?;
 
             if let Some(session_id) = existing_session_id {
-                let deadline_at_ms: i64 = sqlx::query_scalar(
-                    "SELECT deadline_at_ms FROM admission_sessions WHERE session_id = $1 FOR UPDATE",
+                let (deadline_at_ms, owner_token, session_request_hash): (i64, Uuid, String) =
+                    sqlx::query_as(
+                    "SELECT deadline_at_ms, owner_token, request_hash FROM admission_sessions WHERE session_id = $1 FOR UPDATE",
                 )
                 .bind(session_id)
                 .fetch_one(&mut *tx)
@@ -117,6 +185,16 @@ impl AdmissionStore for PostgresAdmissionStore {
                     if request_hash != request.request_hash {
                         return Ok(AdmissionClaim::Conflict { job_id });
                     }
+                    if state == "receiving"
+                        && owner_token == request.owner_token
+                        && session_request_hash == request.request_hash
+                    {
+                        return Ok(AdmissionClaim::Owner(AdmissionTicket {
+                            session_id,
+                            owner_token,
+                            request_hash,
+                        }));
+                    }
                     return if state == "receiving" {
                         Ok(AdmissionClaim::InProgress { session_id })
                     } else if let Some(job_id) = job_id {
@@ -133,7 +211,7 @@ impl AdmissionStore for PostgresAdmissionStore {
         }
         let ticket = AdmissionTicket {
             session_id: Uuid::new_v4(),
-            owner_token: Uuid::new_v4(),
+            owner_token: request.owner_token,
             request_hash: request.request_hash.clone(),
         };
         sqlx::query(
@@ -216,14 +294,13 @@ impl AdmissionStore for PostgresAdmissionStore {
     }
 
     async fn attach(&self, request: AttachJob) -> Result<AttachedWork, AdmissionError> {
-        if !request.command_json.is_object() {
-            return Err(AdmissionError::InvalidCommand);
-        }
+        validate_attach_request(&request)?;
         let mut tx = self.pool.begin().await.map_err(unavailable)?;
         let now = database_now(&mut tx).await?;
-        let session: Option<(String, String, Option<String>, String, i64)> = sqlx::query_as(
+        let session: Option<LockedAdmissionSession> = sqlx::query_as(
             r#"
-            SELECT tenant_id, state, idempotency_key_digest, request_hash, deadline_at_ms
+            SELECT tenant_id, operation, request_id, state, idempotency_key_digest,
+                   request_hash, deadline_at_ms, job_id
             FROM admission_sessions
             WHERE session_id = $1 AND owner_token = $2
             FOR UPDATE
@@ -234,20 +311,39 @@ impl AdmissionStore for PostgresAdmissionStore {
         .fetch_optional(&mut *tx)
         .await
         .map_err(unavailable)?;
-        let Some((tenant_id, state, key_digest, request_hash, deadline_at_ms)) = session else {
+        let Some(session) = session else {
             return Err(AdmissionError::InvalidOwner);
         };
-        if state != "receiving" || request_hash != request.ticket.request_hash {
+        let expected_operation = attach_operation(&request)?;
+        if session.request_hash != request.ticket.request_hash
+            || session.operation != expected_operation
+            || !job_matches_admission_identity(
+                &mut tx,
+                request.job_id,
+                &session.tenant_id,
+                expected_operation,
+                &session.request_id,
+            )
+            .await?
+        {
             return Err(AdmissionError::InvalidOwner);
         }
-        if deadline_at_ms <= now {
+        if session.state == "attached" && session.job_id == Some(request.job_id) {
+            bind_quota_reservation(&mut tx, &request, &session, now).await?;
+            let attached = replay_attached_work(&mut tx, &request).await?;
+            tx.commit().await.map_err(unavailable)?;
+            return Ok(attached);
+        }
+        if session.state != "receiving" || session.job_id.is_some() {
+            return Err(AdmissionError::InvalidOwner);
+        }
+        if session.deadline_at_ms <= now {
             abort_receiving_session(&mut tx, request.ticket.session_id, now).await?;
             tx.commit().await.map_err(unavailable)?;
             return Err(AdmissionError::Expired);
         }
-        if !job_belongs_to_tenant(&mut tx, request.job_id, &tenant_id).await? {
-            return Err(AdmissionError::InvalidOwner);
-        }
+        bind_quota_reservation(&mut tx, &request, &session, now).await?;
+        persist_inputs(&mut tx, &request, now).await?;
 
         sqlx::query(
             r#"
@@ -299,7 +395,7 @@ impl AdmissionStore for PostgresAdmissionStore {
         .execute(&mut *tx)
         .await
         .map_err(unavailable)?;
-        if key_digest.is_some() {
+        if session.idempotency_key_digest.is_some() {
             sqlx::query(
                 "UPDATE idempotency_requests SET state = 'accepted', job_id = $2, updated_at_ms = $3 WHERE session_id = $1",
             )

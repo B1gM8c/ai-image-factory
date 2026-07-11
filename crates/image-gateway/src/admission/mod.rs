@@ -1,20 +1,27 @@
+use std::collections::HashSet;
+
 use async_trait::async_trait;
 use serde_json::Value;
 use uuid::Uuid;
+
+use crate::input_blobs::InputBlobRef;
 
 pub mod command;
 mod memory;
 mod postgres;
 
 pub use command::{
-    GENERATION_COMMAND_SCHEMA, GENERATION_COMMAND_SCHEMA_VERSION, GENERATION_OPERATION,
-    GenerationCommandV1, IdempotencyKeyError, idempotency_key_digest, validate_idempotency_key,
+    EDIT_COMMAND_SCHEMA, EDIT_COMMAND_SCHEMA_VERSION, EDIT_INPUT_MANIFEST_SCHEMA, EDIT_OPERATION,
+    EditCommandV1, EditInputDescriptorV1, EditInputRoleV1, GENERATION_COMMAND_SCHEMA,
+    GENERATION_COMMAND_SCHEMA_VERSION, GENERATION_OPERATION, GenerationCommandV1,
+    IdempotencyKeyError, idempotency_key_digest, validate_idempotency_key,
 };
 pub use memory::InMemoryAdmissionStore;
 pub use postgres::PostgresAdmissionStore;
 
 #[derive(Clone, Debug)]
 pub struct ClaimAdmission {
+    pub owner_token: Uuid,
     pub tenant_id: String,
     pub project_id: String,
     pub api_profile: String,
@@ -46,11 +53,27 @@ pub struct AttachJob {
     pub job_id: Uuid,
     pub command_schema: String,
     pub command_json: Value,
+    pub input_manifest: Option<AttachInputManifest>,
     pub work_kind: String,
     pub schedule_scope: String,
     pub schedule_weight: u32,
     pub schedule_priority: u8,
     pub schedule_cost: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AttachInputManifest {
+    pub manifest_schema: String,
+    pub manifest_hash: String,
+    pub inputs: Vec<AttachInputObject>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AttachInputObject {
+    pub blob: InputBlobRef,
+    pub role: EditInputRoleV1,
+    pub index: u16,
+    pub media_type: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -99,6 +122,108 @@ pub enum AdmissionError {
     StaleLease,
     #[error("durable command payload must be a JSON object")]
     InvalidCommand,
+}
+
+pub(crate) fn validate_attach_request(request: &AttachJob) -> Result<(), AdmissionError> {
+    if !request.command_json.is_object() {
+        return Err(AdmissionError::InvalidCommand);
+    }
+    let Some(manifest) = request.input_manifest.as_ref() else {
+        return if request.command_schema == GENERATION_COMMAND_SCHEMA {
+            Ok(())
+        } else {
+            Err(AdmissionError::InvalidCommand)
+        };
+    };
+    if request.command_schema != EDIT_COMMAND_SCHEMA
+        || manifest.manifest_schema != EDIT_INPUT_MANIFEST_SCHEMA
+        || manifest.inputs.is_empty()
+        || manifest.inputs.len() > 17
+        || !is_sha256(&manifest.manifest_hash)
+    {
+        return Err(AdmissionError::InvalidCommand);
+    }
+    let command: EditCommandV1 = serde_json::from_value(request.command_json.clone())
+        .map_err(|_| AdmissionError::InvalidCommand)?;
+    if command.schema_version != EDIT_COMMAND_SCHEMA_VERSION
+        || command.operation != EDIT_OPERATION
+        || command.provider_id.is_empty()
+        || command.model.is_empty()
+        || command.source_api_profile.is_empty()
+        || command
+            .moderation
+            .as_deref()
+            .is_some_and(|value| !matches!(value, "auto" | "low"))
+        || command.request_hash_hex() != request.ticket.request_hash
+        || command.input_manifest_hash_hex() != manifest.manifest_hash
+        || command.inputs.len() != manifest.inputs.len()
+    {
+        return Err(AdmissionError::InvalidCommand);
+    }
+    let mut positions = HashSet::new();
+    let mut input_ids = HashSet::new();
+    let mut object_keys = HashSet::new();
+    let mut image_count = 0_usize;
+    let mut mask_count = 0_usize;
+    for (descriptor, input) in command.inputs.iter().zip(&manifest.inputs) {
+        let expected = EditInputDescriptorV1 {
+            byte_size: input.blob.byte_size,
+            index: input.index,
+            media_type: input.media_type.clone(),
+            role: input.role,
+            sha256_hex: input.blob.sha256_hex.clone(),
+        };
+        if descriptor != &expected
+            || input.blob.key.admission_session_id != request.ticket.session_id
+            || input.blob.byte_size == 0
+            || input.blob.storage_backend.is_empty()
+            || input.blob.object_key.is_empty()
+            || !is_sha256(&input.blob.sha256_hex)
+            || !positions.insert((input.role.as_str(), input.index))
+            || !input_ids.insert(input.blob.key.input_id)
+            || !object_keys.insert((
+                input.blob.storage_backend.as_str(),
+                input.blob.object_key.as_str(),
+            ))
+        {
+            return Err(AdmissionError::InvalidCommand);
+        }
+        match input.role {
+            EditInputRoleV1::Image => {
+                image_count += 1;
+                if input.index >= 16
+                    || !matches!(
+                        input.media_type.as_str(),
+                        "image/png" | "image/jpeg" | "image/webp"
+                    )
+                {
+                    return Err(AdmissionError::InvalidCommand);
+                }
+            }
+            EditInputRoleV1::Mask => {
+                mask_count += 1;
+                if input.index != 0 || input.media_type != "image/png" {
+                    return Err(AdmissionError::InvalidCommand);
+                }
+            }
+        }
+    }
+    if !(1..=16).contains(&image_count) || mask_count > 1 {
+        return Err(AdmissionError::InvalidCommand);
+    }
+    Ok(())
+}
+
+pub(crate) fn attach_operation(request: &AttachJob) -> Result<&'static str, AdmissionError> {
+    match request.command_schema.as_str() {
+        GENERATION_COMMAND_SCHEMA => Ok(GENERATION_OPERATION),
+        EDIT_COMMAND_SCHEMA => Ok(EDIT_OPERATION),
+        _ => Err(AdmissionError::InvalidCommand),
+    }
+}
+
+fn is_sha256(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 #[async_trait]

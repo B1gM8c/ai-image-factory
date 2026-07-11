@@ -10,8 +10,8 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use super::{
-    AdmissionClaim, AdmissionError, AdmissionStore, AdmissionTicket, AttachJob, AttachedWork,
-    ClaimAdmission, WorkLease, WorkOutcome,
+    AdmissionClaim, AdmissionError, AdmissionStore, AdmissionTicket, AttachInputManifest,
+    AttachJob, AttachedWork, ClaimAdmission, WorkLease, WorkOutcome, validate_attach_request,
 };
 
 #[derive(Default)]
@@ -71,6 +71,7 @@ struct WorkItem {
     execution_id: Option<Uuid>,
     command_schema: String,
     command_json: Value,
+    input_manifest: Option<AttachInputManifest>,
     schedule_priority: u8,
     schedule_finish_tag: u64,
     enqueued_at_ms: u64,
@@ -101,6 +102,27 @@ impl AdmissionStore for InMemoryAdmissionStore {
     async fn claim(&self, request: ClaimAdmission) -> Result<AdmissionClaim, AdmissionError> {
         let now = now_ms();
         let mut state = self.state.lock().await;
+        if let Some((session_id, session)) = state
+            .sessions
+            .iter()
+            .find(|(_, session)| session.owner_token == request.owner_token)
+            .map(|(session_id, session)| (*session_id, session.clone()))
+        {
+            if session.request_hash != request.request_hash {
+                return Err(AdmissionError::InvalidOwner);
+            }
+            if session.state == SessionState::Receiving {
+                if session.deadline_at_ms <= now {
+                    abort_session(&mut state, session_id);
+                    return Err(AdmissionError::Expired);
+                }
+                return Ok(AdmissionClaim::Owner(AdmissionTicket {
+                    session_id,
+                    owner_token: request.owner_token,
+                    request_hash: request.request_hash,
+                }));
+            }
+        }
         let scope = request
             .idempotency_key_digest
             .as_ref()
@@ -128,6 +150,13 @@ impl AdmissionStore for InMemoryAdmissionStore {
                     abort_session(&mut state, existing.session_id);
                     return Err(AdmissionError::Expired);
                 }
+                if session.owner_token == request.owner_token {
+                    return Ok(AdmissionClaim::Owner(AdmissionTicket {
+                        session_id: existing.session_id,
+                        owner_token: request.owner_token,
+                        request_hash: request.request_hash,
+                    }));
+                }
                 return Ok(AdmissionClaim::InProgress {
                     session_id: existing.session_id,
                 });
@@ -149,7 +178,7 @@ impl AdmissionStore for InMemoryAdmissionStore {
 
         let ticket = AdmissionTicket {
             session_id: Uuid::new_v4(),
-            owner_token: Uuid::new_v4(),
+            owner_token: request.owner_token,
             request_hash: request.request_hash.clone(),
         };
         state.sessions.insert(
@@ -177,9 +206,7 @@ impl AdmissionStore for InMemoryAdmissionStore {
     }
 
     async fn attach(&self, request: AttachJob) -> Result<AttachedWork, AdmissionError> {
-        if !request.command_json.is_object() {
-            return Err(AdmissionError::InvalidCommand);
-        }
+        validate_attach_request(&request)?;
         let now = now_ms();
         let mut state = self.state.lock().await;
         let session = state
@@ -189,8 +216,23 @@ impl AdmissionStore for InMemoryAdmissionStore {
             .ok_or(AdmissionError::InvalidOwner)?;
         if session.owner_token != request.ticket.owner_token
             || session.request_hash != request.ticket.request_hash
-            || session.state != SessionState::Receiving
         {
+            return Err(AdmissionError::InvalidOwner);
+        }
+        if session.state == SessionState::Attached
+            && let Some(work_item_id) = state.work_by_job.get(&request.job_id)
+            && let Some(work) = state.work_items.get(work_item_id)
+            && work.session_id == request.ticket.session_id
+            && work.command_schema == request.command_schema
+            && work.command_json == request.command_json
+            && work.input_manifest == request.input_manifest
+        {
+            return Ok(AttachedWork {
+                work_item_id: *work_item_id,
+                job_id: request.job_id,
+            });
+        }
+        if session.state != SessionState::Receiving {
             return Err(AdmissionError::InvalidOwner);
         }
         if session.deadline_at_ms <= now {
@@ -215,6 +257,7 @@ impl AdmissionStore for InMemoryAdmissionStore {
                 execution_id: None,
                 command_schema: request.command_schema,
                 command_json: request.command_json,
+                input_manifest: request.input_manifest,
                 schedule_priority: request.schedule_priority,
                 schedule_finish_tag,
                 enqueued_at_ms: now as u64,
@@ -280,6 +323,7 @@ impl AdmissionStore for InMemoryAdmissionStore {
                     .is_some_and(|deadline| deadline > now)
                 && work.command_schema == request.command_schema
                 && work.command_json == request.command_json
+                && work.input_manifest == request.input_manifest
             {
                 return Ok(WorkLease {
                     work_item_id: *work_item_id,

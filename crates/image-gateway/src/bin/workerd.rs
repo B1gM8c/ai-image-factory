@@ -55,9 +55,10 @@ async fn main() -> Result<(), ImageGatewayError> {
         admission,
         contexts,
         settlement,
+        artifact_store.clone(),
         artifact_store,
         config.request_timeout,
-    );
+    )?;
     tracing::info!(%worker_id, "workerd started");
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);

@@ -401,7 +401,6 @@ enum ResponseFormatDoc {
 #[serde(rename_all = "lowercase")]
 enum ModerationDoc {
     Auto,
-    Low,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -419,12 +418,7 @@ fn patch_generated_schema(value: &mut Value) {
         "model",
         openai_codex::MODELS,
     );
-    patch_property_enum(
-        value,
-        "ImageGenerationRequest",
-        "moderation",
-        &["auto", "low"],
-    );
+    patch_property_enum(value, "ImageGenerationRequest", "moderation", &["auto"]);
     patch_property_enum(
         value,
         "ImageGenerationRequest",
@@ -450,7 +444,7 @@ fn patch_generated_schema(value: &mut Value) {
         &["b64_json"],
     );
     patch_property_enum(value, "ImageEditRequest", "model", openai_codex::MODELS);
-    patch_property_enum(value, "ImageEditRequest", "moderation", &["auto", "low"]);
+    patch_property_enum(value, "ImageEditRequest", "moderation", &["auto"]);
     patch_property_enum(
         value,
         "ImageEditRequest",

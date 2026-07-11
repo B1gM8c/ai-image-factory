@@ -1,11 +1,15 @@
 use std::env;
 
 use gpt_image_2_gateway::{
+    EditJob,
     admission::{
-        AdmissionClaim, AdmissionError, AdmissionStore, AdmissionTicket, AttachJob, ClaimAdmission,
+        AdmissionClaim, AdmissionError, AdmissionStore, AdmissionTicket, AttachInputManifest,
+        AttachInputObject, AttachJob, ClaimAdmission, EDIT_COMMAND_SCHEMA,
+        EDIT_INPUT_MANIFEST_SCHEMA, EditCommandV1, EditInputDescriptorV1, EditInputRoleV1,
         PostgresAdmissionStore, WorkOutcome,
     },
     database::{connect_test_pool_with_search_path, run_migrations},
+    input_blobs::{InputBlobKey, InputBlobRef},
 };
 use serde_json::json;
 use sqlx::{AssertSqlSafe, PgPool};
@@ -54,7 +58,8 @@ async fn concurrent_same_key_claims_have_one_owner_and_conflicting_hash_is_rejec
         let mut tasks = Vec::new();
         for _ in 0..100 {
             let store = store.clone();
-            let request = request.clone();
+            let mut request = request.clone();
+            request.owner_token = Uuid::new_v4();
             tasks.push(tokio::spawn(async move { store.claim(request).await }));
         }
         let mut owners = 0;
@@ -89,6 +94,58 @@ async fn concurrent_same_key_claims_have_one_owner_and_conflicting_hash_is_rejec
         .await
         .map_err(|error| format!("failed to count identities: {error}"))?;
         require(counts == (1, 1), format!("unexpected identity counts: {counts:?}"))
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
+async fn same_attempt_token_recovers_receiving_owner_after_unknown_commit() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let store = PostgresAdmissionStore::new(database.pool.clone());
+        let request = claim_request(Some("e".repeat(64)), "f".repeat(64));
+        let first = store
+            .claim(request.clone())
+            .await
+            .map_err(|error| format!("initial claim failed: {error}"))?;
+        let replay = store
+            .claim(request.clone())
+            .await
+            .map_err(|error| format!("owner recovery failed: {error}"))?;
+        require(
+            replay == first,
+            format!("same attempt did not recover owner: {first:?} != {replay:?}"),
+        )?;
+
+        let mut challenger = request;
+        challenger.owner_token = Uuid::new_v4();
+        let challenged = store
+            .claim(challenger)
+            .await
+            .map_err(|error| format!("challenger claim failed: {error}"))?;
+        require(
+            matches!(challenged, AdmissionClaim::InProgress { .. }),
+            format!("different attempt stole receiving owner: {challenged:?}"),
+        )?;
+
+        let unkeyed = claim_request(None, "1".repeat(64));
+        let unkeyed_first = store
+            .claim(unkeyed.clone())
+            .await
+            .map_err(|error| format!("initial unkeyed claim failed: {error}"))?;
+        let unkeyed_replay = store
+            .claim(unkeyed)
+            .await
+            .map_err(|error| format!("unkeyed owner recovery failed: {error}"))?;
+        require(
+            unkeyed_replay == unkeyed_first,
+            format!(
+                "unkeyed attempt did not recover owner: {unkeyed_first:?} != {unkeyed_replay:?}"
+            ),
+        )
     }
     .await;
     combine(result, database.cleanup().await)
@@ -170,7 +227,8 @@ async fn owner_expiring_before_attach_is_aborted() -> TestResult {
             .execute(&database.pool)
             .await
             .map_err(|error| format!("failed to expire admission: {error}"))?;
-        let job_id = insert_job(&database.pool, "tenant-a").await?;
+        let job_id =
+            insert_job_for_ticket(&database.pool, &ticket, "tenant-a", "generation", None).await?;
 
         require(
             matches!(
@@ -238,7 +296,9 @@ async fn claim_job_leases_only_the_requested_ready_work() -> TestResult {
                 AdmissionClaim::Owner(ticket) => ticket,
                 other => return Err(format!("expected owner, got {other:?}")),
             };
-            let job_id = insert_job(&database.pool, "tenant-a").await?;
+            let job_id =
+                insert_job_for_ticket(&database.pool, &ticket, "tenant-a", "generation", None)
+                    .await?;
             store
                 .attach(attach_request(ticket, job_id))
                 .await
@@ -285,7 +345,14 @@ async fn durable_claim_uses_weighted_finish_tags_and_waiting_aging() -> TestResu
                     AdmissionClaim::Owner(ticket) => ticket,
                     other => return Err(format!("expected weighted owner, got {other:?}")),
                 };
-                let job_id = insert_job(&database.pool, tenant).await?;
+                let job_id = insert_job_for_ticket(
+                    &database.pool,
+                    &ticket,
+                    tenant,
+                    "generation",
+                    None,
+                )
+                .await?;
                 store
                     .attach(attach_request_with_schedule(
                         ticket,
@@ -354,7 +421,8 @@ async fn attach_and_start_is_atomic_and_idempotent_for_the_owner() -> TestResult
             AdmissionClaim::Owner(ticket) => ticket,
             other => return Err(format!("expected owner, got {other:?}")),
         };
-        let job_id = insert_job(&database.pool, "tenant-a").await?;
+        let job_id =
+            insert_job_for_ticket(&database.pool, &ticket, "tenant-a", "generation", None).await?;
         let request = attach_request(ticket, job_id);
 
         let first = store
@@ -393,6 +461,352 @@ async fn attach_and_start_is_atomic_and_idempotent_for_the_owner() -> TestResult
     combine(result, database.cleanup().await)
 }
 
+#[tokio::test]
+async fn ticket_cannot_attach_another_request_job_with_same_tenant_and_operation() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let store = PostgresAdmissionStore::new(database.pool.clone());
+        let ticket_a = claim_owner(&store, claim_request(None, "a".repeat(64))).await?;
+        let ticket_b = claim_owner(&store, claim_request(None, "b".repeat(64))).await?;
+        let job_b =
+            insert_job_for_ticket(&database.pool, &ticket_b, "tenant-a", "generation", None)
+                .await?;
+
+        require(
+            matches!(
+                store.attach(attach_request(ticket_a.clone(), job_b)).await,
+                Err(AdmissionError::InvalidOwner)
+            ),
+            "ticket A attached ticket B's job despite a different request_id",
+        )?;
+        require(
+            matches!(
+                store
+                    .attach_and_start(
+                        attach_request(ticket_a.clone(), job_b),
+                        "cross-request-worker",
+                        30_000,
+                    )
+                    .await,
+                Err(AdmissionError::InvalidOwner)
+            ),
+            "ticket A atomically attached and started ticket B's job",
+        )?;
+
+        let state: (String, String, Option<Uuid>, i64, i64) = sqlx::query_as(
+            r#"
+            SELECT
+              (SELECT state FROM admission_sessions WHERE session_id = $1),
+              (SELECT state FROM admission_sessions WHERE session_id = $2),
+              (SELECT admission_session_id FROM quota_reservations WHERE job_id = $3),
+              (SELECT COUNT(*) FROM job_payloads WHERE job_id = $3),
+              (SELECT COUNT(*) FROM work_items WHERE job_id = $3)
+            "#,
+        )
+        .bind(ticket_a.session_id)
+        .bind(ticket_b.session_id)
+        .bind(job_b)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(|error| format!("failed to inspect rejected cross-request attach: {error}"))?;
+        require(
+            state == ("receiving".to_string(), "receiving".to_string(), None, 0, 0),
+            format!("cross-request attach left durable state: {state:?}"),
+        )?;
+
+        store
+            .attach(attach_request(ticket_b, job_b))
+            .await
+            .map_err(|error| format!("rightful ticket could not attach its job: {error}"))?;
+        Ok(())
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
+async fn attach_accepts_quota_prebound_to_the_ticket_session() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let store = PostgresAdmissionStore::new(database.pool.clone());
+        let ticket = claim_owner(&store, claim_request(None, "c".repeat(64))).await?;
+        let job_id = insert_job_for_ticket(
+            &database.pool,
+            &ticket,
+            "tenant-a",
+            "generation",
+            Some(ticket.session_id),
+        )
+        .await?;
+
+        store
+            .attach(attach_request(ticket.clone(), job_id))
+            .await
+            .map_err(|error| format!("matching prebound quota was rejected: {error}"))?;
+
+        let bound_session: Option<Uuid> = sqlx::query_scalar(
+            "SELECT admission_session_id FROM quota_reservations WHERE job_id = $1",
+        )
+        .bind(job_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(|error| format!("failed to inspect prebound quota: {error}"))?;
+        require(
+            bound_session == Some(ticket.session_id),
+            "attach changed the matching quota session binding",
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
+async fn attach_rejects_quota_prebound_to_another_session() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let store = PostgresAdmissionStore::new(database.pool.clone());
+        let wrong_ticket = claim_owner(&store, claim_request(None, "d".repeat(64))).await?;
+        let ticket = claim_owner(&store, claim_request(None, "e".repeat(64))).await?;
+        let job_id = insert_job_for_ticket(
+            &database.pool,
+            &ticket,
+            "tenant-a",
+            "generation",
+            Some(wrong_ticket.session_id),
+        )
+        .await?;
+
+        require(
+            matches!(
+                store.attach(attach_request(ticket.clone(), job_id)).await,
+                Err(AdmissionError::InvalidOwner)
+            ),
+            "ticket attached a quota reservation bound to another session",
+        )?;
+
+        let state: (String, Option<Uuid>, i64, i64) = sqlx::query_as(
+            r#"
+            SELECT
+              (SELECT state FROM admission_sessions WHERE session_id = $1),
+              (SELECT admission_session_id FROM quota_reservations WHERE job_id = $2),
+              (SELECT COUNT(*) FROM job_payloads WHERE job_id = $2),
+              (SELECT COUNT(*) FROM work_items WHERE job_id = $2)
+            "#,
+        )
+        .bind(ticket.session_id)
+        .bind(job_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(|error| format!("failed to inspect rejected quota binding: {error}"))?;
+        require(
+            state == ("receiving".to_string(), Some(wrong_ticket.session_id), 0, 0),
+            format!("rejected quota binding left durable state: {state:?}"),
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
+async fn edit_attach_atomically_binds_quota_and_persists_ordered_inputs() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let store = PostgresAdmissionStore::new(database.pool.clone());
+        let input_specs = edit_input_specs(Uuid::new_v4(), None);
+        let command = edit_command(&input_specs);
+        let ticket = claim_edit_owner(&store, &command).await?;
+        let input_specs = edit_input_specs(ticket.session_id, None);
+        let command = edit_command(&input_specs);
+        let job_id =
+            insert_job_for_ticket(&database.pool, &ticket, "tenant-a", "edit", None).await?;
+
+        let request = edit_attach_request(ticket.clone(), job_id, command.clone(), input_specs);
+        let attached = store
+            .attach(request.clone())
+            .await
+            .map_err(|error| format!("edit attach failed: {error}"))?;
+        let replay = store
+            .attach(request)
+            .await
+            .map_err(|error| format!("edit attach replay failed: {error}"))?;
+        require(
+            replay == attached,
+            "edit attach replay returned a different work item",
+        )?;
+
+        let bound_session: Option<Uuid> = sqlx::query_scalar(
+            "SELECT admission_session_id FROM quota_reservations WHERE job_id = $1",
+        )
+        .bind(job_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(|error| format!("failed to inspect quota binding: {error}"))?;
+        require(
+            bound_session == Some(ticket.session_id),
+            "quota reservation was not bound to the edit admission",
+        )?;
+
+        let manifest: (Uuid, String, String, i16) = sqlx::query_as(
+            r#"
+            SELECT admission_session_id, manifest_schema, manifest_hash, input_count
+            FROM job_input_manifests
+            WHERE job_id = $1
+            "#,
+        )
+        .bind(job_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(|error| format!("failed to inspect edit manifest: {error}"))?;
+        require(
+            manifest
+                == (
+                    ticket.session_id,
+                    EDIT_INPUT_MANIFEST_SCHEMA.to_string(),
+                    command.input_manifest_hash_hex(),
+                    2,
+                ),
+            format!("unexpected edit manifest: {manifest:?}"),
+        )?;
+
+        let inputs: Vec<(String, i16, String, String)> = sqlx::query_as(
+            r#"
+            SELECT role, input_index, media_type, object_key
+            FROM job_input_objects
+            WHERE job_id = $1
+            ORDER BY CASE role WHEN 'image' THEN 0 ELSE 1 END, input_index
+            "#,
+        )
+        .bind(job_id)
+        .fetch_all(&database.pool)
+        .await
+        .map_err(|error| format!("failed to inspect edit inputs: {error}"))?;
+        require(
+            inputs
+                == vec![
+                    (
+                        "image".to_string(),
+                        0,
+                        "image/png".to_string(),
+                        format!("inputs/{}/image-0", ticket.session_id.simple()),
+                    ),
+                    (
+                        "mask".to_string(),
+                        0,
+                        "image/png".to_string(),
+                        format!("inputs/{}/mask-0", ticket.session_id.simple()),
+                    ),
+                ],
+            format!("unexpected persisted input order: {inputs:?}"),
+        )?;
+
+        let durable_rows: (i64, i64) = sqlx::query_as(
+            "SELECT (SELECT COUNT(*) FROM job_payloads WHERE job_id = $1), (SELECT COUNT(*) FROM work_items WHERE job_id = $1)",
+        )
+        .bind(job_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(|error| format!("failed to inspect edit work rows: {error}"))?;
+        require(
+            durable_rows == (1, 1),
+            format!("edit attach did not create one payload and work item: {durable_rows:?}"),
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
+async fn edit_attach_rolls_back_every_row_when_an_input_object_conflicts() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let store = PostgresAdmissionStore::new(database.pool.clone());
+
+        let first_specs = edit_input_specs(Uuid::new_v4(), None);
+        let first_command = edit_command(&first_specs);
+        let first_ticket = claim_edit_owner(&store, &first_command).await?;
+        let first_specs = edit_input_specs(first_ticket.session_id, None);
+        let first_command = edit_command(&first_specs);
+        let conflicting_object_key = first_specs[0].blob.object_key.clone();
+        let first_job =
+            insert_job_for_ticket(&database.pool, &first_ticket, "tenant-a", "edit", None).await?;
+        store
+            .attach(edit_attach_request(
+                first_ticket,
+                first_job,
+                first_command,
+                first_specs,
+            ))
+            .await
+            .map_err(|error| format!("first edit attach failed: {error}"))?;
+
+        let second_specs = edit_input_specs(Uuid::new_v4(), Some(conflicting_object_key));
+        let second_command = edit_command(&second_specs);
+        let second_ticket = claim_edit_owner(&store, &second_command).await?;
+        let second_specs = edit_input_specs(
+            second_ticket.session_id,
+            Some(format!("inputs/{}/image-0", first_job.simple())),
+        );
+        let mut second_specs = second_specs;
+        second_specs[0].blob.object_key = sqlx::query_scalar(
+            "SELECT object_key FROM job_input_objects WHERE job_id = $1 AND role = 'image'",
+        )
+        .bind(first_job)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(|error| format!("failed to load conflicting object key: {error}"))?;
+        let second_command = edit_command(&second_specs);
+        let second_job =
+            insert_job_for_ticket(&database.pool, &second_ticket, "tenant-a", "edit", None).await?;
+
+        require(
+            matches!(
+                store
+                    .attach(edit_attach_request(
+                        second_ticket.clone(),
+                        second_job,
+                        second_command,
+                        second_specs,
+                    ))
+                    .await,
+                Err(AdmissionError::Unavailable)
+            ),
+            "conflicting input object key unexpectedly attached",
+        )?;
+
+        let counts: (i64, i64, i64, Option<Uuid>, String) = sqlx::query_as(
+            r#"
+            SELECT
+              (SELECT COUNT(*) FROM job_input_manifests WHERE job_id = $1),
+              (SELECT COUNT(*) FROM job_payloads WHERE job_id = $1),
+              (SELECT COUNT(*) FROM work_items WHERE job_id = $1),
+              (SELECT admission_session_id FROM quota_reservations WHERE job_id = $1),
+              (SELECT state FROM admission_sessions WHERE session_id = $2)
+            "#,
+        )
+        .bind(second_job)
+        .bind(second_ticket.session_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(|error| format!("failed to inspect rolled back edit attach: {error}"))?;
+        require(
+            counts == (0, 0, 0, None, "receiving".to_string()),
+            format!("failed edit attach left partial durable state: {counts:?}"),
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
 async fn attachment_and_fencing_case(database: &TestDatabase) -> TestResult {
     let store = PostgresAdmissionStore::new(database.pool.clone());
     let ticket = match store
@@ -403,7 +817,8 @@ async fn attachment_and_fencing_case(database: &TestDatabase) -> TestResult {
         AdmissionClaim::Owner(ticket) => ticket,
         other => return Err(format!("expected owner, got {other:?}")),
     };
-    let job_id = insert_job(&database.pool, "tenant-a").await?;
+    let job_id =
+        insert_job_for_ticket(&database.pool, &ticket, "tenant-a", "generation", None).await?;
     let forged = AdmissionTicket {
         owner_token: Uuid::new_v4(),
         ..ticket.clone()
@@ -440,7 +855,7 @@ async fn attachment_and_fencing_case(database: &TestDatabase) -> TestResult {
         .await
         .map_err(|error| format!("valid lease did not start: {error}"))?;
 
-    let other_job_id = insert_job(&database.pool, "tenant-a").await?;
+    let other_job_id = insert_unbound_job(&database.pool, "tenant-a", "generation").await?;
     let cross_job = gpt_image_2_gateway::admission::WorkLease {
         job_id: other_job_id,
         ..lease.clone()
@@ -521,6 +936,7 @@ fn claim_request_for_tenant(
     request_hash: &str,
 ) -> ClaimAdmission {
     ClaimAdmission {
+        owner_token: Uuid::new_v4(),
         tenant_id: tenant_id.to_string(),
         project_id: "project-a".to_string(),
         api_profile: "openai-images-v1".to_string(),
@@ -548,6 +964,7 @@ fn attach_request_with_schedule(
         job_id,
         command_schema: "openai.images.generation.v1".to_string(),
         command_json: json!({"prompt": "durable"}),
+        input_manifest: None,
         work_kind: "image_batch".to_string(),
         schedule_scope: schedule_scope.to_string(),
         schedule_weight,
@@ -556,24 +973,223 @@ fn attach_request_with_schedule(
     }
 }
 
-async fn insert_job(pool: &PgPool, tenant_id: &str) -> TestResult<Uuid> {
+async fn claim_owner(
+    store: &PostgresAdmissionStore,
+    request: ClaimAdmission,
+) -> TestResult<AdmissionTicket> {
+    match store
+        .claim(request)
+        .await
+        .map_err(|error| format!("owner claim failed: {error}"))?
+    {
+        AdmissionClaim::Owner(ticket) => Ok(ticket),
+        other => Err(format!("expected owner, got {other:?}")),
+    }
+}
+
+async fn insert_job_for_ticket(
+    pool: &PgPool,
+    ticket: &AdmissionTicket,
+    tenant_id: &str,
+    operation: &str,
+    admission_session_id: Option<Uuid>,
+) -> TestResult<Uuid> {
+    let request_id: String =
+        sqlx::query_scalar("SELECT request_id FROM admission_sessions WHERE session_id = $1")
+            .bind(ticket.session_id)
+            .fetch_one(pool)
+            .await
+            .map_err(|error| format!("failed to load admission request_id: {error}"))?;
+    insert_job_record(
+        pool,
+        tenant_id,
+        operation,
+        &request_id,
+        admission_session_id,
+    )
+    .await
+}
+
+async fn insert_unbound_job(pool: &PgPool, tenant_id: &str, operation: &str) -> TestResult<Uuid> {
+    insert_job_record(
+        pool,
+        tenant_id,
+        operation,
+        &format!("req_{}", Uuid::new_v4().simple()),
+        None,
+    )
+    .await
+}
+
+async fn insert_job_record(
+    pool: &PgPool,
+    tenant_id: &str,
+    operation: &str,
+    request_id: &str,
+    admission_session_id: Option<Uuid>,
+) -> TestResult<Uuid> {
     let job_id = Uuid::new_v4();
+    let reservation_id = Uuid::new_v4();
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|error| format!("failed to begin test job transaction: {error}"))?;
     sqlx::query(
         r#"
         INSERT INTO jobs
           (job_id, tenant_id, request_id, operation, provider_id, model, state,
-           requested_units, charged_units, created_at_ms, updated_at_ms)
-        VALUES ($1, $2, $3, 'generation', 'openai-codex', 'gpt-image-2',
-                'reserved', 1, 0, 1, 1)
+           requested_units, charged_units, reservation_id, created_at_ms, updated_at_ms)
+        VALUES ($1, $2, $3, $4, 'openai-codex', 'gpt-image-2',
+                'reserved', 1, 0, $5, 1, 1)
         "#,
     )
     .bind(job_id)
     .bind(tenant_id)
-    .bind(format!("req_{}", Uuid::new_v4().simple()))
-    .execute(pool)
+    .bind(request_id)
+    .bind(operation)
+    .bind(reservation_id)
+    .execute(&mut *tx)
     .await
     .map_err(|error| format!("failed to insert test job: {error}"))?;
+    sqlx::query(
+        r#"
+        INSERT INTO quota_reservations
+          (reservation_id, tenant_id, request_id, job_id, requested_units,
+           committed_units, started_units, released_units, state,
+           created_at_ms, updated_at_ms, expires_at_ms,
+           limit_5h, remaining_5h, limit_7d, remaining_7d,
+           admission_session_id)
+        VALUES ($1, $2, $3, $4, 1, 0, 0, 0, 'reserved', 1, 1,
+                9223372036854775807, 100, 99, 100, 99, $5)
+        "#,
+    )
+    .bind(reservation_id)
+    .bind(tenant_id)
+    .bind(request_id)
+    .bind(job_id)
+    .bind(admission_session_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(|error| format!("failed to insert test quota reservation: {error}"))?;
+    tx.commit()
+        .await
+        .map_err(|error| format!("failed to commit test job: {error}"))?;
     Ok(job_id)
+}
+
+async fn claim_edit_owner(
+    store: &PostgresAdmissionStore,
+    command: &EditCommandV1,
+) -> TestResult<AdmissionTicket> {
+    let claim = ClaimAdmission {
+        owner_token: Uuid::new_v4(),
+        tenant_id: "tenant-a".to_string(),
+        project_id: "project-a".to_string(),
+        api_profile: "openai-images-v1".to_string(),
+        operation: "edit".to_string(),
+        request_id: format!("req_{}", Uuid::new_v4().simple()),
+        idempotency_key_digest: None,
+        request_hash: command.request_hash_hex(),
+        deadline_at_ms: i64::MAX,
+    };
+    match store
+        .claim(claim)
+        .await
+        .map_err(|error| format!("edit claim failed: {error}"))?
+    {
+        AdmissionClaim::Owner(ticket) => Ok(ticket),
+        other => Err(format!("expected edit owner, got {other:?}")),
+    }
+}
+
+fn edit_attach_request(
+    ticket: AdmissionTicket,
+    job_id: Uuid,
+    command: EditCommandV1,
+    inputs: Vec<AttachInputObject>,
+) -> AttachJob {
+    AttachJob {
+        ticket,
+        job_id,
+        command_schema: EDIT_COMMAND_SCHEMA.to_string(),
+        command_json: serde_json::to_value(&command).expect("edit command serializes"),
+        input_manifest: Some(AttachInputManifest {
+            manifest_schema: EDIT_INPUT_MANIFEST_SCHEMA.to_string(),
+            manifest_hash: command.input_manifest_hash_hex(),
+            inputs,
+        }),
+        work_kind: "image_batch".to_string(),
+        schedule_scope: "tenant-a".to_string(),
+        schedule_weight: 1,
+        schedule_priority: 1,
+        schedule_cost: 1,
+    }
+}
+
+fn edit_input_specs(session_id: Uuid, image_object_key: Option<String>) -> Vec<AttachInputObject> {
+    [
+        (EditInputRoleV1::Image, 0, "1".repeat(64), 123_u64),
+        (EditInputRoleV1::Mask, 0, "2".repeat(64), 45_u64),
+    ]
+    .into_iter()
+    .map(|(role, index, sha256_hex, byte_size)| {
+        let role_name = role.as_str();
+        AttachInputObject {
+            blob: InputBlobRef {
+                key: InputBlobKey {
+                    admission_session_id: session_id,
+                    input_id: Uuid::new_v4(),
+                },
+                storage_backend: "filesystem".to_string(),
+                object_key: if role == EditInputRoleV1::Image {
+                    image_object_key.clone().unwrap_or_else(|| {
+                        format!("inputs/{}/{role_name}-{index}", session_id.simple())
+                    })
+                } else {
+                    format!("inputs/{}/{role_name}-{index}", session_id.simple())
+                },
+                sha256_hex,
+                byte_size,
+            },
+            role,
+            index,
+            media_type: "image/png".to_string(),
+        }
+    })
+    .collect()
+}
+
+fn edit_command(inputs: &[AttachInputObject]) -> EditCommandV1 {
+    EditCommandV1::from_edit_job(
+        &EditJob {
+            request_id: "request-edit".to_string(),
+            model: "gpt-image-2".to_string(),
+            prompt: "replace the sky".to_string(),
+            moderation: "auto".to_string(),
+            images: Vec::new(),
+            mask: None,
+            n: 1,
+            size: "1024x1024".to_string(),
+            quality: "high".to_string(),
+            output_format: "png".to_string(),
+            output_compression: None,
+            background: "auto".to_string(),
+            stream: false,
+            partial_images: 0,
+        },
+        inputs
+            .iter()
+            .map(|input| EditInputDescriptorV1 {
+                byte_size: input.blob.byte_size,
+                index: input.index,
+                media_type: input.media_type.clone(),
+                role: input.role,
+                sha256_hex: input.blob.sha256_hex.clone(),
+            })
+            .collect(),
+        "openai-images-v1",
+        "openai-codex",
+    )
 }
 
 struct TestDatabase {

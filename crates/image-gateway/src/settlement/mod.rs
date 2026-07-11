@@ -21,6 +21,8 @@ pub use postgres::PostgresExecutionSettlementStore;
 
 #[async_trait]
 pub trait ExecutionSettlementStore: Send + Sync + 'static {
+    fn artifact_storage_identity(&self) -> String;
+
     async fn succeed(
         &self,
         lease: &WorkLease,
@@ -78,6 +80,10 @@ impl SequentialExecutionSettlementStore {
 
 #[async_trait]
 impl ExecutionSettlementStore for SequentialExecutionSettlementStore {
+    fn artifact_storage_identity(&self) -> String {
+        self.artifact_store.storage_identity()
+    }
+
     async fn succeed(
         &self,
         lease: &WorkLease,
@@ -180,6 +186,7 @@ pub(super) fn validate_generation_result(
         || result.job_id != lease.job_id
         || result.tenant_id != reservation.charge.tenant_id
         || result.projection.api_profile.is_empty()
+        || !matches!(result.projection.operation.as_str(), "generation" | "edit")
         || result.projection.response_schema.is_empty()
         || result.projection.created_at_seconds <= 0
         || result.projection.usage != reservation.snapshot

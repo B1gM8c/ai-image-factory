@@ -39,6 +39,7 @@ pub struct ArtifactMetadata {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GenerationResponseProjection {
     pub api_profile: String,
+    pub operation: String,
     pub response_schema: String,
     pub created_at_seconds: i64,
     pub output_format: String,
@@ -76,6 +77,8 @@ pub enum ArtifactWriteError {
 
 #[async_trait]
 pub trait ArtifactBlobStore: Send + Sync + 'static {
+    fn storage_identity(&self) -> String;
+
     async fn put(
         &self,
         identity: ArtifactIdentity,

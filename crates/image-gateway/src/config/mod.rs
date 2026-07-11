@@ -115,8 +115,6 @@ impl AppConfig {
             ));
         }
 
-        self.validate_worker_startup()?;
-
         if !self.bind.ip().is_loopback() {
             return Err(ImageGatewayError::config(
                 "native TLS is not implemented; set GATEWAY_BIND to a loopback address and expose it only through a TLS reverse proxy",
@@ -282,14 +280,14 @@ mod tests {
         let mut config = config_for_bind("127.0.0.1:8787", Some("token"));
         config.codex_home = Some("   ".to_string());
 
-        assert!(config.validate_startup().is_err());
+        assert!(config.validate_worker_startup().is_err());
     }
 
     #[test]
     fn every_bind_requires_explicit_codex_home() {
         let config = config_for_bind("127.0.0.1:8787", Some("token"));
 
-        let error = format!("{:?}", config.validate_startup().unwrap_err());
+        let error = format!("{:?}", config.validate_worker_startup().unwrap_err());
 
         assert!(error.contains("GATEWAY_CODEX_HOME is required"));
     }
@@ -300,7 +298,7 @@ mod tests {
         let mut config = config_for_bind("127.0.0.1:8787", Some("token"));
         config.codex_home = Some(codex_home.path().to_string_lossy().into_owned());
 
-        assert!(config.validate_startup().is_ok());
+        assert!(config.validate_worker_startup().is_ok());
         assert_eq!(std::fs::read_dir(codex_home.path()).unwrap().count(), 0);
     }
 
@@ -309,7 +307,7 @@ mod tests {
         let mut config = config_for_bind("127.0.0.1:8787", Some("token"));
         config.codex_home = Some("relative/codex-home".to_string());
 
-        assert!(config.validate_startup().is_err());
+        assert!(config.validate_worker_startup().is_err());
     }
 
     #[test]
@@ -317,7 +315,7 @@ mod tests {
         let mut config = config_for_bind("0.0.0.0:8787", Some("token"));
         config.codex_home = Some("/".to_string());
 
-        assert!(config.validate_startup().is_err());
+        assert!(config.validate_worker_startup().is_err());
     }
 
     #[test]
@@ -335,7 +333,7 @@ mod tests {
         let mut config = config_for_bind("0.0.0.0:8787", Some("token"));
         config.codex_home = Some(parent.path().join("missing").to_string_lossy().into_owned());
 
-        assert!(config.validate_startup().is_err());
+        assert!(config.validate_worker_startup().is_err());
     }
 
     #[test]
@@ -344,7 +342,7 @@ mod tests {
         let mut config = config_for_bind("0.0.0.0:8787", Some("token"));
         config.codex_home = Some(file.path().to_string_lossy().into_owned());
 
-        assert!(config.validate_startup().is_err());
+        assert!(config.validate_worker_startup().is_err());
     }
 
     #[cfg(unix)]
@@ -357,7 +355,7 @@ mod tests {
         let mut config = config_for_bind("0.0.0.0:8787", Some("token"));
         config.codex_home = Some(symlink.to_string_lossy().into_owned());
 
-        assert!(config.validate_startup().is_err());
+        assert!(config.validate_worker_startup().is_err());
     }
 
     #[test]
@@ -410,10 +408,8 @@ mod tests {
     }
 
     #[test]
-    fn loopback_allows_admin_only_bootstrap_with_safe_codex_home() {
-        let codex_home = tempfile::tempdir().unwrap();
-        let mut config = config_for_bind_with_admin("127.0.0.1:8787", Some("admin-token"));
-        config.codex_home = Some(codex_home.path().to_string_lossy().into_owned());
+    fn loopback_gateway_allows_admin_only_bootstrap_without_codex_home() {
+        let config = config_for_bind_with_admin("127.0.0.1:8787", Some("admin-token"));
 
         assert!(config.validate_startup().is_ok());
     }

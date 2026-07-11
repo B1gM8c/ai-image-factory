@@ -24,12 +24,16 @@ use crate::{
         ArtifactBlobStore, ArtifactIdentity, ArtifactWriteError, GenerationResponseProjection,
         GenerationResultManifest, media_type_for_output_format,
     },
-    generator::{GeneratedImage, GenerationJob, ImageGenerator, normalize_generated_images},
-    settlement::ExecutionSettlementStore,
+    generator::{
+        EditJob, GeneratedImage, GenerationJob, ImageGenerator, normalize_generated_images,
+    },
+    settlement::{ExecutionSettlementStore, GenerationResultStatus},
     usage::{UsageReservation, UsageSnapshot},
 };
 
 const INLINE_LEASE_GRACE: Duration = Duration::from_secs(60);
+const SETTLEMENT_ATTEMPTS: usize = 3;
+const SETTLEMENT_RETRY_DELAY: Duration = Duration::from_millis(50);
 
 pub(crate) struct GenerationWorker {
     generator: Arc<dyn ImageGenerator>,
@@ -60,10 +64,22 @@ enum StageResultError {
     Persist(ImageGatewayError),
 }
 
-struct GenerationResultStage<'a> {
+#[derive(Clone, Copy)]
+struct ImageExecutionSpec<'a> {
+    operation: &'a str,
+    output_format: &'a str,
+    output_compression: Option<u8>,
+    quality: &'a str,
+    size: &'a str,
+    background: &'a str,
+    stream: bool,
+    failure_code: &'static str,
+}
+
+struct ImageResultStage<'a> {
     lease: &'a WorkLease,
     reservation: &'a UsageReservation,
-    job: &'a GenerationJob,
+    spec: ImageExecutionSpec<'a>,
     api_profile: &'a str,
     response_schema: &'a str,
     images: &'a [GeneratedImage],
@@ -95,21 +111,87 @@ impl GenerationWorker {
         api_profile: &str,
         response_schema: &str,
     ) -> Result<GenerationExecution, ImageGatewayError> {
+        let provider = self.generator.generate(job.clone()).instrument(info_span!(
+            "worker.generate",
+            image.units = reservation.charge.units
+        ));
+        self.execute_provider(
+            lease,
+            reservation,
+            ImageExecutionSpec {
+                operation: crate::admission::GENERATION_OPERATION,
+                output_format: &job.output_format,
+                output_compression: job.output_compression,
+                quality: &job.quality,
+                size: &job.size,
+                background: &job.background,
+                stream: job.stream,
+                failure_code: "image_generation_failed",
+            },
+            api_profile,
+            response_schema,
+            provider,
+        )
+        .await
+    }
+
+    pub(crate) async fn execute_edit(
+        &self,
+        lease: &WorkLease,
+        reservation: &UsageReservation,
+        job: EditJob,
+        api_profile: &str,
+        response_schema: &str,
+    ) -> Result<GenerationExecution, ImageGatewayError> {
+        let provider = self.generator.edit(job.clone()).instrument(info_span!(
+            "worker.edit",
+            image.units = reservation.charge.units
+        ));
+        self.execute_provider(
+            lease,
+            reservation,
+            ImageExecutionSpec {
+                operation: crate::admission::EDIT_OPERATION,
+                output_format: &job.output_format,
+                output_compression: job.output_compression,
+                quality: &job.quality,
+                size: &job.size,
+                background: &job.background,
+                stream: job.stream,
+                failure_code: "image_edit_failed",
+            },
+            api_profile,
+            response_schema,
+            provider,
+        )
+        .await
+    }
+
+    async fn execute_provider(
+        &self,
+        lease: &WorkLease,
+        reservation: &UsageReservation,
+        spec: ImageExecutionSpec<'_>,
+        api_profile: &str,
+        response_schema: &str,
+        provider: impl Future<Output = Result<Vec<GeneratedImage>, ImageGatewayError>>,
+    ) -> Result<GenerationExecution, ImageGatewayError> {
         let mut heartbeat = self.start_heartbeat(lease.clone());
-        let generation =
-            timeout(self.request_timeout, self.generator.generate(job.clone())).instrument(
-                info_span!("worker.generate", image.units = reservation.charge.units),
-            );
-        let result = match run_until_lease_lost(&mut heartbeat.lost, generation).await {
+        let result = match run_until_lease_lost(
+            &mut heartbeat.lost,
+            timeout(self.request_timeout, provider),
+        )
+        .await
+        {
             Ok(result) => result
                 .map_err(|_| ImageGatewayError::timeout())
                 .and_then(|result| result)
                 .and_then(|images| {
                     normalize_generated_images(
                         images,
-                        &job.size,
-                        &job.output_format,
-                        job.output_compression,
+                        spec.size,
+                        spec.output_format,
+                        spec.output_compression,
                     )
                 }),
             Err(LeaseLost) => {
@@ -122,15 +204,17 @@ impl GenerationWorker {
             Ok(images) => images,
             Err(error) => {
                 heartbeat.stop().await;
-                return self.fail(lease, reservation, error).await;
+                return self
+                    .fail(lease, reservation, error, spec.failure_code)
+                    .await;
             }
         };
         let manifest = match self
             .stage_result(
-                GenerationResultStage {
+                ImageResultStage {
                     lease,
                     reservation,
-                    job: &job,
+                    spec,
                     api_profile,
                     response_schema,
                     images: &images,
@@ -149,13 +233,7 @@ impl GenerationWorker {
                 return self.mark_uncertain(lease, error).await;
             }
         };
-        let usage = self
-            .settlement
-            .succeed(lease, reservation, &manifest)
-            .await
-            .map_err(|_| {
-                ImageGatewayError::service_unavailable("generation settlement unavailable")
-            });
+        let usage = self.settle_success(lease, reservation, &manifest).await;
         heartbeat.stop().await;
         let usage = usage?;
         Ok(GenerationExecution {
@@ -163,6 +241,33 @@ impl GenerationWorker {
             projection: manifest.projection,
             usage,
         })
+    }
+
+    async fn settle_success(
+        &self,
+        lease: &WorkLease,
+        reservation: &UsageReservation,
+        manifest: &GenerationResultManifest,
+    ) -> Result<UsageSnapshot, ImageGatewayError> {
+        for attempt in 0..SETTLEMENT_ATTEMPTS {
+            match self.settlement.succeed(lease, reservation, manifest).await {
+                Ok(usage) => return Ok(usage),
+                Err(_) if attempt + 1 < SETTLEMENT_ATTEMPTS => {
+                    sleep(SETTLEMENT_RETRY_DELAY).await;
+                }
+                Err(_) => break,
+            }
+        }
+        match self.settlement.generation_status(lease.job_id).await {
+            Ok(GenerationResultStatus::Succeeded(result))
+                if result.projection == manifest.projection =>
+            {
+                Ok(reservation.snapshot.clone())
+            }
+            _ => Err(ImageGatewayError::service_unavailable(
+                "image settlement unavailable",
+            )),
+        }
     }
 
     pub(crate) async fn reject_invalid_context(
@@ -175,13 +280,22 @@ impl GenerationWorker {
             .await
     }
 
+    pub(crate) async fn reject_before_provider(
+        &self,
+        lease: &WorkLease,
+        reservation: &UsageReservation,
+        error_code: &'static str,
+    ) -> Result<(), ImageGatewayError> {
+        self.settlement.fail(lease, reservation, error_code).await
+    }
+
     async fn stage_result(
         &self,
-        stage: GenerationResultStage<'_>,
+        stage: ImageResultStage<'_>,
         heartbeat: &mut WorkerHeartbeat,
     ) -> Result<GenerationResultManifest, StageResultError> {
         let media_type =
-            media_type_for_output_format(&stage.job.output_format).ok_or_else(|| {
+            media_type_for_output_format(stage.spec.output_format).ok_or_else(|| {
                 StageResultError::Persist(ImageGatewayError::internal(
                     "unsupported artifact output format",
                 ))
@@ -233,13 +347,14 @@ impl GenerationWorker {
             tenant_id: stage.reservation.charge.tenant_id.clone(),
             projection: GenerationResponseProjection {
                 api_profile: stage.api_profile.to_string(),
+                operation: stage.spec.operation.to_string(),
                 response_schema: stage.response_schema.to_string(),
                 created_at_seconds: unix_seconds(),
-                output_format: stage.job.output_format.clone(),
-                quality: stage.job.quality.clone(),
+                output_format: stage.spec.output_format.to_string(),
+                quality: stage.spec.quality.to_string(),
                 size,
-                background: stage.job.background.clone(),
-                stream: stage.job.stream,
+                background: stage.spec.background.to_string(),
+                stream: stage.spec.stream,
                 usage: stage.reservation.snapshot.clone(),
             },
             artifacts,
@@ -281,12 +396,13 @@ impl GenerationWorker {
         lease: &WorkLease,
         reservation: &UsageReservation,
         error: ImageGatewayError,
+        fallback_code: &'static str,
     ) -> Result<GenerationExecution, ImageGatewayError> {
         self.settlement
             .fail(
                 lease,
                 reservation,
-                error.error_code().unwrap_or("image_generation_failed"),
+                error.error_code().unwrap_or(fallback_code),
             )
             .await?;
         Err(error)

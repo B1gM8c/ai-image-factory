@@ -53,6 +53,31 @@ pub(crate) fn assert_response(
 }
 
 pub(crate) fn assert_codex_outputs(files: &SmokeFiles, expected_parent_pid: u32) -> TestResult {
+    let (prompt, request_dir) = codex_output_evidence(files, expected_parent_pid, false)?;
+    assert_prompt_semantics(&prompt, &request_dir)
+}
+
+pub(crate) fn assert_codex_edit_outputs(
+    files: &SmokeFiles,
+    expected_parent_pid: u32,
+) -> TestResult {
+    let (prompt, request_dir) = codex_output_evidence(files, expected_parent_pid, true)?;
+    require(
+        prompt.contains("这是图生图编辑任务")
+            && prompt.contains("用户编辑需求：process smoke opaque fixture"),
+        format!("Codex edit prompt lost edit semantics: {prompt}"),
+    )?;
+    require(
+        !Path::new(&request_dir).exists(),
+        format!("cleaned edit request directory still exists: {request_dir}"),
+    )
+}
+
+fn codex_output_evidence(
+    files: &SmokeFiles,
+    expected_parent_pid: u32,
+    expects_image: bool,
+) -> TestResult<(String, String)> {
     let invocation_count = fs::read_to_string(&files.invocation_log)
         .map_err(|error| format!("failed to read fake Codex invocation log: {error}"))?
         .lines()
@@ -63,10 +88,9 @@ pub(crate) fn assert_codex_outputs(files: &SmokeFiles, expected_parent_pid: u32)
     )?;
     let argv = read_nul_strings(&files.argv_log)?;
     let request_dir = argv_value(&argv, "--cd")?;
-    assert_codex_invocation(&argv, &request_dir)?;
+    assert_codex_invocation(&argv, &request_dir, expects_image)?;
     let prompt = fs::read_to_string(&files.stdin_log)
         .map_err(|error| format!("failed to read fake Codex stdin log: {error}"))?;
-    assert_prompt_semantics(&prompt, &request_dir)?;
     let fake_pid = read_pid(&files.fake_pid_log)?;
     require(
         fake_pid > 0,
@@ -82,7 +106,8 @@ pub(crate) fn assert_codex_outputs(files: &SmokeFiles, expected_parent_pid: u32)
     require(
         !Path::new(&request_dir).exists(),
         format!("cleaned request directory still exists: {request_dir}"),
-    )
+    )?;
+    Ok((prompt, request_dir))
 }
 
 pub(crate) fn assert_artifact_bytes(files: &SmokeFiles, expected: &[u8]) -> TestResult {
@@ -191,8 +216,8 @@ pub(crate) fn header(headers: &reqwest::header::HeaderMap, name: &str) -> TestRe
         .map_err(|error| format!("response header {name} was invalid: {error}"))
 }
 
-fn assert_codex_invocation(argv: &[String], request_dir: &str) -> TestResult {
-    let expected = [
+fn assert_codex_invocation(argv: &[String], request_dir: &str, expects_image: bool) -> TestResult {
+    let expected_prefix = [
         "exec",
         "--ephemeral",
         "--ignore-user-config",
@@ -206,13 +231,32 @@ fn assert_codex_invocation(argv: &[String], request_dir: &str) -> TestResult {
         "--skip-git-repo-check",
         "--cd",
         request_dir,
-        "-",
     ]
     .map(str::to_string);
     require(
-        argv == expected,
-        format!("unexpected exact Codex argv:\nactual: {argv:?}\nexpected: {expected:?}"),
-    )
+        argv.starts_with(&expected_prefix),
+        format!(
+            "unexpected Codex argv prefix:\nactual: {argv:?}\nexpected prefix: {expected_prefix:?}"
+        ),
+    )?;
+    if expects_image {
+        require(
+            argv.len() == expected_prefix.len() + 3
+                && argv[expected_prefix.len()] == "--image"
+                && !argv[expected_prefix.len() + 1].is_empty()
+                && argv[expected_prefix.len() + 2] == "-",
+            format!("unexpected edit Codex argv: {argv:?}"),
+        )?;
+        require(
+            !Path::new(&argv[expected_prefix.len() + 1]).exists(),
+            "cleaned edit input file still exists",
+        )
+    } else {
+        require(
+            argv.len() == expected_prefix.len() + 1 && argv[expected_prefix.len()] == "-",
+            format!("unexpected generation Codex argv: {argv:?}"),
+        )
+    }
 }
 
 fn argv_value(argv: &[String], flag: &str) -> TestResult<String> {

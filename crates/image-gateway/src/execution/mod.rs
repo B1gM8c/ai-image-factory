@@ -1,6 +1,11 @@
 use async_trait::async_trait;
 
-use crate::{admission::WorkLease, generator::GenerationJob, usage::UsageReservation};
+use crate::{
+    admission::{EditCommandV1, EditInputRoleV1, WorkLease},
+    generator::GenerationJob,
+    input_blobs::InputBlobRef,
+    usage::UsageReservation,
+};
 
 mod postgres;
 
@@ -22,10 +27,31 @@ pub struct GenerationExecutionContext {
     pub response_schema: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PersistedEditInput {
+    pub blob: InputBlobRef,
+    pub role: EditInputRoleV1,
+    pub index: u16,
+    pub media_type: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct EditExecutionContext {
+    pub command: EditCommandV1,
+    pub inputs: Vec<PersistedEditInput>,
+    pub reservation: UsageReservation,
+    pub response_schema: String,
+}
+
 #[async_trait]
 pub trait ExecutionContextStore: Send + Sync + 'static {
     async fn load_generation(
         &self,
         lease: &WorkLease,
     ) -> Result<GenerationExecutionContext, ExecutionContextError>;
+
+    async fn load_edit(
+        &self,
+        lease: &WorkLease,
+    ) -> Result<EditExecutionContext, ExecutionContextError>;
 }

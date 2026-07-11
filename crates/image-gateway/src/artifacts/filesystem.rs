@@ -11,7 +11,13 @@ use super::{
     ArtifactBlobStore, ArtifactIdentity, ArtifactMetadata, ArtifactReadError, ArtifactWriteError,
     FILESYSTEM_BACKEND, sha256_hex,
 };
-use crate::ImageGatewayError;
+use crate::{
+    ImageGatewayError,
+    input_blobs::{
+        InputBlobDeleteError, InputBlobKey, InputBlobReadError, InputBlobRef, InputBlobStore,
+        InputBlobWriteError,
+    },
+};
 
 const MAX_ARTIFACT_BYTES: u64 = 256 * 1024 * 1024;
 
@@ -64,9 +70,17 @@ impl FilesystemArtifactBlobStore {
     pub fn new(root: impl AsRef<Path>) -> Result<Self, ImageGatewayError> {
         let root = validate_root(root.as_ref())?;
         let objects = root.join("objects");
-        fs::create_dir_all(&objects)
-            .map_err(|_| ImageGatewayError::config("artifact object directory is not writable"))?;
-        set_private_directory_permissions(&objects)?;
+        let inputs = root.join("inputs");
+        prepare_storage_directory(
+            &objects,
+            "artifact object directory is not writable",
+            "artifact object directory must be a directory and must not be a symlink",
+        )?;
+        prepare_storage_directory(
+            &inputs,
+            "input blob directory is not writable",
+            "input blob directory must be a directory and must not be a symlink",
+        )?;
         sync_directory(&root)
             .map_err(|_| ImageGatewayError::config("artifact root cannot be synchronized"))?;
         Ok(Self { root })
@@ -77,23 +91,15 @@ impl FilesystemArtifactBlobStore {
         format!("objects/{}/{}", &artifact_id[..2], artifact_id)
     }
 
-    fn object_path(&self, identity: &ArtifactIdentity) -> PathBuf {
-        self.root.join(Self::object_key(identity))
-    }
-}
-
-#[async_trait]
-impl ArtifactBlobStore for FilesystemArtifactBlobStore {
-    async fn put(
+    pub(crate) async fn put_blob_key(
         &self,
-        identity: ArtifactIdentity,
+        object_key: &str,
         bytes: &[u8],
-    ) -> Result<ArtifactMetadata, ArtifactWriteError> {
+    ) -> Result<(String, u64), ArtifactWriteError> {
         if bytes.is_empty() || bytes.len() as u64 > MAX_ARTIFACT_BYTES {
             return Err(ArtifactWriteError::Unavailable);
         }
-        let object_key = Self::object_key(&identity);
-        let object_path = self.object_path(&identity);
+        let object_path = self.root.join(object_key);
         let parent = object_path
             .parent()
             .ok_or(ArtifactWriteError::Unavailable)?;
@@ -138,54 +144,42 @@ impl ArtifactBlobStore for FilesystemArtifactBlobStore {
             return Err(ArtifactWriteError::Unavailable);
         }
 
-        let metadata = ArtifactMetadata {
-            identity,
-            storage_backend: FILESYSTEM_BACKEND.to_string(),
-            object_key,
-            sha256_hex: sha256_hex(bytes),
-            byte_size: bytes.len() as u64,
-        };
+        let result = (sha256_hex(bytes), bytes.len() as u64);
         pending.commit();
-        Ok(metadata)
+        Ok(result)
     }
 
-    async fn get(&self, artifact: &ArtifactMetadata) -> Result<Vec<u8>, ArtifactReadError> {
-        if artifact.storage_backend != FILESYSTEM_BACKEND
-            || artifact.object_key != Self::object_key(&artifact.identity)
-        {
+    pub(crate) async fn get_blob_key(
+        &self,
+        object_key: &str,
+        expected_sha256: &str,
+        expected_size: u64,
+    ) -> Result<Vec<u8>, ArtifactReadError> {
+        if expected_size == 0 || expected_size > MAX_ARTIFACT_BYTES {
             return Err(ArtifactReadError::Integrity);
         }
-        if artifact.byte_size == 0 || artifact.byte_size > MAX_ARTIFACT_BYTES {
-            return Err(ArtifactReadError::Integrity);
-        }
-        let path = self.object_path(&artifact.identity);
+        let path = self.root.join(object_key);
         let std_file = open_regular_no_follow(&path)?;
         let metadata = std_file
             .metadata()
             .map_err(|_| ArtifactReadError::Unavailable)?;
-        if !metadata.is_file() || metadata.len() != artifact.byte_size {
+        if !metadata.is_file() || metadata.len() != expected_size {
             return Err(ArtifactReadError::Integrity);
         }
-        let capacity =
-            usize::try_from(artifact.byte_size).map_err(|_| ArtifactReadError::Integrity)?;
-        let mut file = tokio::fs::File::from_std(std_file).take(artifact.byte_size + 1);
+        let capacity = usize::try_from(expected_size).map_err(|_| ArtifactReadError::Integrity)?;
+        let mut file = tokio::fs::File::from_std(std_file).take(expected_size + 1);
         let mut bytes = Vec::with_capacity(capacity);
         file.read_to_end(&mut bytes)
             .await
             .map_err(|_| ArtifactReadError::Unavailable)?;
-        if bytes.len() as u64 != artifact.byte_size || sha256_hex(&bytes) != artifact.sha256_hex {
+        if bytes.len() as u64 != expected_size || sha256_hex(&bytes) != expected_sha256 {
             return Err(ArtifactReadError::Integrity);
         }
         Ok(bytes)
     }
 
-    async fn delete(&self, artifact: &ArtifactMetadata) -> Result<(), ArtifactWriteError> {
-        if artifact.storage_backend != FILESYSTEM_BACKEND
-            || artifact.object_key != Self::object_key(&artifact.identity)
-        {
-            return Err(ArtifactWriteError::Unavailable);
-        }
-        let path = self.object_path(&artifact.identity);
+    pub(crate) async fn delete_blob_key(&self, object_key: &str) -> Result<(), ArtifactWriteError> {
+        let path = self.root.join(object_key);
         match tokio::fs::remove_file(&path).await {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -195,6 +189,130 @@ impl ArtifactBlobStore for FilesystemArtifactBlobStore {
         sync_directory_async(parent.to_path_buf())
             .await
             .map_err(|_| ArtifactWriteError::Unavailable)
+    }
+}
+
+fn input_blob_key(key: &InputBlobKey) -> String {
+    format!(
+        "inputs/{}/{}",
+        key.admission_session_id.simple(),
+        key.input_id.simple()
+    )
+}
+
+#[async_trait]
+impl ArtifactBlobStore for FilesystemArtifactBlobStore {
+    fn storage_identity(&self) -> String {
+        format!("{FILESYSTEM_BACKEND}:{}", self.root.display())
+    }
+
+    async fn put(
+        &self,
+        identity: ArtifactIdentity,
+        bytes: &[u8],
+    ) -> Result<ArtifactMetadata, ArtifactWriteError> {
+        let object_key = Self::object_key(&identity);
+        let (sha256_hex, byte_size) = self.put_blob_key(&object_key, bytes).await?;
+        Ok(ArtifactMetadata {
+            identity,
+            storage_backend: FILESYSTEM_BACKEND.to_string(),
+            object_key,
+            sha256_hex,
+            byte_size,
+        })
+    }
+
+    async fn get(&self, artifact: &ArtifactMetadata) -> Result<Vec<u8>, ArtifactReadError> {
+        if artifact.storage_backend != FILESYSTEM_BACKEND
+            || artifact.object_key != Self::object_key(&artifact.identity)
+        {
+            return Err(ArtifactReadError::Integrity);
+        }
+        self.get_blob_key(
+            &artifact.object_key,
+            &artifact.sha256_hex,
+            artifact.byte_size,
+        )
+        .await
+    }
+
+    async fn delete(&self, artifact: &ArtifactMetadata) -> Result<(), ArtifactWriteError> {
+        if artifact.storage_backend != FILESYSTEM_BACKEND
+            || artifact.object_key != Self::object_key(&artifact.identity)
+        {
+            return Err(ArtifactWriteError::Unavailable);
+        }
+        self.delete_blob_key(&artifact.object_key).await
+    }
+}
+
+#[async_trait]
+impl InputBlobStore for FilesystemArtifactBlobStore {
+    fn storage_identity(&self) -> String {
+        format!("{FILESYSTEM_BACKEND}:{}", self.root.display())
+    }
+
+    async fn put(
+        &self,
+        key: InputBlobKey,
+        bytes: &[u8],
+    ) -> Result<InputBlobRef, InputBlobWriteError> {
+        let object_key = input_blob_key(&key);
+        let (sha256_hex, byte_size) = self
+            .put_blob_key(&object_key, bytes)
+            .await
+            .map_err(|_| InputBlobWriteError::Unavailable)?;
+        Ok(InputBlobRef {
+            key,
+            storage_backend: FILESYSTEM_BACKEND.to_string(),
+            object_key,
+            sha256_hex,
+            byte_size,
+        })
+    }
+
+    async fn get(&self, blob: &InputBlobRef) -> Result<Vec<u8>, InputBlobReadError> {
+        if blob.storage_backend != FILESYSTEM_BACKEND
+            || blob.object_key != input_blob_key(&blob.key)
+        {
+            return Err(InputBlobReadError::Integrity);
+        }
+        self.get_blob_key(&blob.object_key, &blob.sha256_hex, blob.byte_size)
+            .await
+            .map_err(|error| match error {
+                ArtifactReadError::Unavailable => InputBlobReadError::Unavailable,
+                ArtifactReadError::Integrity => InputBlobReadError::Integrity,
+            })
+    }
+
+    async fn delete(&self, blob: &InputBlobRef) -> Result<(), InputBlobDeleteError> {
+        if blob.storage_backend != FILESYSTEM_BACKEND
+            || blob.object_key != input_blob_key(&blob.key)
+        {
+            return Err(InputBlobDeleteError::Unavailable);
+        }
+        self.delete_blob_key(&blob.object_key)
+            .await
+            .map_err(|_| InputBlobDeleteError::Unavailable)
+    }
+
+    async fn delete_session(&self, admission_session_id: Uuid) -> Result<(), InputBlobDeleteError> {
+        let inputs_root = self.root.join("inputs");
+        let session_path = inputs_root.join(admission_session_id.simple().to_string());
+        match tokio::fs::symlink_metadata(&session_path).await {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                return Err(InputBlobDeleteError::Unavailable);
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(_) => return Err(InputBlobDeleteError::Unavailable),
+        }
+        tokio::fs::remove_dir_all(&session_path)
+            .await
+            .map_err(|_| InputBlobDeleteError::Unavailable)?;
+        sync_directory_async(inputs_root)
+            .await
+            .map_err(|_| InputBlobDeleteError::Unavailable)
     }
 }
 
@@ -242,6 +360,26 @@ fn set_private_directory_permissions(path: &Path) -> Result<(), ImageGatewayErro
         })?;
     }
     Ok(())
+}
+
+fn prepare_storage_directory(
+    path: &Path,
+    unavailable_message: &'static str,
+    invalid_message: &'static str,
+) -> Result<(), ImageGatewayError> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir(path).map_err(|_| ImageGatewayError::config(unavailable_message))?;
+        }
+        Err(_) => return Err(ImageGatewayError::config(unavailable_message)),
+    }
+    let metadata =
+        fs::symlink_metadata(path).map_err(|_| ImageGatewayError::config(unavailable_message))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(ImageGatewayError::config(invalid_message));
+    }
+    set_private_directory_permissions(path)
 }
 
 fn sync_directory(path: &Path) -> std::io::Result<()> {

@@ -39,6 +39,10 @@ impl PostgresExecutionSettlementStore {
 
 #[async_trait]
 impl ExecutionSettlementStore for PostgresExecutionSettlementStore {
+    fn artifact_storage_identity(&self) -> String {
+        self.artifact_store.storage_identity()
+    }
+
     async fn succeed(
         &self,
         lease: &WorkLease,

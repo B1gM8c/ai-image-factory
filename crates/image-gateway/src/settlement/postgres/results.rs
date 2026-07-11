@@ -14,6 +14,7 @@ struct ProjectionRow {
     job_id: Uuid,
     tenant_id: String,
     api_profile: String,
+    operation: String,
     response_schema: String,
     created_at_seconds: i64,
     output_format: String,
@@ -53,14 +54,15 @@ pub(super) async fn persist_generation_result(
     sqlx::query(
         r#"
         INSERT INTO job_response_projections
-          (job_id, api_profile, response_schema, created_at_seconds, output_format,
+          (job_id, api_profile, operation, response_schema, created_at_seconds, output_format,
            quality, size, background, stream, limit_5h, remaining_5h, limit_7d,
            remaining_7d, artifact_count, created_at_ms)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
         "#,
     )
     .bind(result.job_id)
     .bind(&projection.api_profile)
+    .bind(&projection.operation)
     .bind(&projection.response_schema)
     .bind(projection.created_at_seconds)
     .bind(&projection.output_format)
@@ -130,7 +132,7 @@ pub(super) async fn load_generation_manifest(
 ) -> Result<Option<GenerationResultManifest>, ImageGatewayError> {
     let projection: Option<ProjectionRow> = sqlx::query_as(
         r#"
-        SELECT p.job_id, j.tenant_id, p.api_profile, p.response_schema,
+        SELECT p.job_id, j.tenant_id, p.api_profile, p.operation, p.response_schema,
                p.created_at_seconds, p.output_format, p.quality, p.size, p.background,
                p.stream, p.limit_5h, p.remaining_5h, p.limit_7d, p.remaining_7d,
                p.artifact_count
@@ -168,7 +170,7 @@ async fn load_generation_manifest_tx(
 ) -> Result<Option<GenerationResultManifest>, ImageGatewayError> {
     let projection: Option<ProjectionRow> = sqlx::query_as(
         r#"
-        SELECT p.job_id, j.tenant_id, p.api_profile, p.response_schema,
+        SELECT p.job_id, j.tenant_id, p.api_profile, p.operation, p.response_schema,
                p.created_at_seconds, p.output_format, p.quality, p.size, p.background,
                p.stream, p.limit_5h, p.remaining_5h, p.limit_7d, p.remaining_7d,
                p.artifact_count
@@ -242,6 +244,7 @@ fn manifest_from_rows(
         tenant_id: projection.tenant_id,
         projection: GenerationResponseProjection {
             api_profile: projection.api_profile,
+            operation: projection.operation,
             response_schema: projection.response_schema,
             created_at_seconds: projection.created_at_seconds,
             output_format: projection.output_format,

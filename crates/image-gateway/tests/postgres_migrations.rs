@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 type TestResult<T = ()> = Result<T, String>;
 
-const REQUIRED_COLUMNS: [(&str, &str); 25] = [
+const REQUIRED_COLUMNS: [(&str, &str); 36] = [
     ("usage_events", "tenant_id"),
     ("quota_reservations", "tenant_id"),
     ("quota_reservations", "job_id"),
@@ -39,9 +39,20 @@ const REQUIRED_COLUMNS: [(&str, &str); 25] = [
     ("quota_reservations", "remaining_5h"),
     ("quota_reservations", "limit_7d"),
     ("quota_reservations", "remaining_7d"),
+    ("quota_reservations", "admission_session_id"),
+    ("admission_sessions", "input_cleanup_state"),
+    ("admission_sessions", "input_cleanup_owner"),
+    ("admission_sessions", "input_cleanup_lease_expires_at_ms"),
+    ("admission_sessions", "input_cleanup_completed_at_ms"),
+    ("job_input_manifests", "manifest_schema"),
+    ("job_input_manifests", "manifest_hash"),
+    ("job_input_objects", "role"),
+    ("job_input_objects", "object_key"),
+    ("job_input_objects", "sha256_hex"),
+    ("job_response_projections", "operation"),
 ];
 
-const REQUIRED_INDEXES: [&str; 7] = [
+const REQUIRED_INDEXES: [&str; 10] = [
     "usage_events_tenant_created_at_ms_idx",
     "gateway_api_keys_project_id_idx",
     "quota_reservations_active_tenant_idx",
@@ -49,6 +60,9 @@ const REQUIRED_INDEXES: [&str; 7] = [
     "metering_events_tenant_created_idx",
     "artifacts_job_output_uidx",
     "artifacts_execution_output_uidx",
+    "job_input_objects_session_idx",
+    "admission_input_cleanup_pending_idx",
+    "admission_input_cleanup_lease_idx",
 ];
 
 #[tokio::test]
@@ -467,8 +481,8 @@ async fn shared_pool_case(pool: &PgPool) -> TestResult {
 
 async fn assert_expected_schema(pool: &PgPool) -> TestResult {
     require(
-        migration_versions(pool).await? == vec![0, 1, 2, 3, 4, 5, 6],
-        "applied migration versions must be exactly [0, 1, 2, 3, 4, 5, 6]",
+        migration_versions(pool).await? == vec![0, 1, 2, 3, 4, 5, 6, 7],
+        "applied migration versions must be exactly [0, 1, 2, 3, 4, 5, 6, 7]",
     )?;
 
     for (table, column) in REQUIRED_COLUMNS {
@@ -526,6 +540,7 @@ fn test_charge(request_id: &str) -> UsageCharge {
     UsageCharge {
         tenant_id: "proj_test".to_string(),
         request_id: request_id.to_string(),
+        admission_session_id: None,
         operation: "generation",
         provider_id: "openai-codex".to_string(),
         model: "gpt-image-2".to_string(),

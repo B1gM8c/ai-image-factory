@@ -12,17 +12,32 @@
 > `2026-platform-upgrade.md` and `2026-scheduler-quota-design.md`. Those files
 > remain useful as implementation history.
 
-> Implementation checkpoint (2026-07-10): durable admission, PostgreSQL weighted
+> Implementation checkpoint (2026-07-11): durable admission, PostgreSQL weighted
 > scheduling metadata, fenced atomic success settlement, versioned HMAC API keys,
-> filesystem artifact persistence, immutable response projections, and generation
+> filesystem artifact persistence, immutable response projections, and generation/edit
 > idempotency replay are implemented. Gateway and `workerd` are separate
-> processes. `reconcilerd` handles expired claimed/running leases and orphaned
-> pre-attach quota reservations. The filesystem backend is an interim
+> processes. `reconcilerd` handles expired claimed/running leases, orphaned
+> pre-attach quota reservations, and lease-based edit-input cleanup. The filesystem backend is an interim
 > single-host/shared-POSIX-volume deployment profile; S3-compatible storage,
 > persistent executor supervision, and ambiguous provider-outcome reconciliation
-> remain target work.
-> Image edits still execute inline in the gateway at this checkpoint; a versioned
-> durable edit command and external workerd path are the next vertical slice.
+> remain target work. OpenAI image generation and edits now both use versioned
+> durable commands and external `workerd` execution. Edit bytes are stored through
+> a provider-neutral `InputBlobStore`; PostgreSQL atomically binds quota,
+> admission, ordered input manifests, payloads, and work items. Workers verify
+> blob identity and content hashes before provider execution, and successful JSON
+> or SSE responses replay across gateway restarts without another provider call
+> or charge. Admission-session identity also makes quota reservation retry-safe
+> after an unknown commit result and prevents cross-request attach. Input cleanup
+> is session-scoped, retries storage failures after a cleanup lease expires, and
+> applies only to aborted uploads and succeeded/failed edits; uncertain work keeps
+> both its economic hold and inputs. Upload parsing has a separate global and
+> per-tenant concurrency gate, and component assembly rejects mismatched artifact,
+> input, and settlement storage instances at startup. The external HTTP gateway
+> no longer constructs a Codex generator or requires `GATEWAY_CODEX_HOME`; those
+> dependencies belong only to `workerd`. Codex outputs are bounded and always
+> decoded/re-encoded to remove untrusted metadata. The remaining shared-credential
+> risk of an agentic CLI is explicitly not considered hostile multi-tenant
+> isolation and still requires the target executor/account-pool boundary.
 
 ## 1. Executive Decision
 

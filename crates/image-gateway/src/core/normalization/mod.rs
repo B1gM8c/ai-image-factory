@@ -1,17 +1,17 @@
 use std::io::Cursor;
 
-use image::{DynamicImage, ImageFormat, Rgb, RgbImage};
+use image::{DynamicImage, ImageFormat, ImageReader, Rgb, RgbImage};
 
 use crate::{
     ImageGatewayError,
-    core::{
-        image_bytes::{is_jpeg, is_png, is_webp},
-        provider::GeneratedImage,
-    },
+    core::provider::GeneratedImage,
     size::{
         SizeConstraint, aspect_ratio_matches, aspect_ratio_tolerance_percent, parse_size_constraint,
     },
 };
+
+const MAX_DECODED_IMAGE_PIXELS: u64 = 16 * 1024 * 1024;
+const MAX_DECODED_IMAGE_DIMENSION: u32 = 8 * 1024;
 
 pub fn normalize_generated_images(
     images: Vec<GeneratedImage>,
@@ -34,20 +34,10 @@ fn normalize_generated_image(
     output_format: &str,
     output_compression: Option<u8>,
 ) -> Result<GeneratedImage, ImageGatewayError> {
-    let format_matches = bytes_match_output_format(&image.bytes, output_format);
-
+    let decoded = decode_generated_image(&image.bytes)?;
     match requested_size {
-        SizeConstraint::Auto => {
-            if format_matches && !generated_image_has_alpha(&image.bytes) {
-                return Ok(image);
-            }
-            let decoded = decode_generated_image(&image.bytes)?;
-            let decoded = flatten_to_opaque(decoded);
-            encode_image(decoded, output_format, output_compression)
-                .map(|bytes| GeneratedImage { bytes })
-        }
+        SizeConstraint::Auto => {}
         SizeConstraint::Dimensions { width, height } => {
-            let decoded = decode_generated_image(&image.bytes)?;
             if decoded.width() != width || decoded.height() != height {
                 return Err(ImageGatewayError::backend(format!(
                     "Codex CLI produced an image with dimensions {}x{}, not the requested {}x{}",
@@ -57,15 +47,8 @@ fn normalize_generated_image(
                     height
                 )));
             }
-            let decoded = flatten_to_opaque(decoded);
-            if format_matches && !generated_image_has_alpha(&image.bytes) {
-                return Ok(image);
-            }
-            encode_image(decoded, output_format, output_compression)
-                .map(|bytes| GeneratedImage { bytes })
         }
         SizeConstraint::AspectRatio { width, height } => {
-            let decoded = decode_generated_image(&image.bytes)?;
             if !aspect_ratio_matches(decoded.width(), decoded.height(), width, height) {
                 return Err(ImageGatewayError::backend(format!(
                     "Codex CLI produced an image with dimensions {}x{}, not the requested {}:{} aspect ratio within {:.2}% tolerance",
@@ -76,14 +59,14 @@ fn normalize_generated_image(
                     aspect_ratio_tolerance_percent()
                 )));
             }
-            let decoded = flatten_to_opaque(decoded);
-            if format_matches && !generated_image_has_alpha(&image.bytes) {
-                return Ok(image);
-            }
-            encode_image(decoded, output_format, output_compression)
-                .map(|bytes| GeneratedImage { bytes })
         }
     }
+    encode_image(
+        flatten_to_opaque(decoded),
+        output_format,
+        output_compression,
+    )
+    .map(|bytes| GeneratedImage { bytes })
 }
 
 fn requested_size_constraint(size: &str) -> Result<SizeConstraint, ImageGatewayError> {
@@ -128,14 +111,22 @@ fn encode_image(
 }
 
 fn decode_generated_image(bytes: &[u8]) -> Result<DynamicImage, ImageGatewayError> {
+    let reader = ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|_| ImageGatewayError::backend("Codex CLI produced an unreadable image"))?;
+    let (width, height) = reader
+        .into_dimensions()
+        .map_err(|_| ImageGatewayError::backend("Codex CLI produced an unreadable image"))?;
+    if width > MAX_DECODED_IMAGE_DIMENSION
+        || height > MAX_DECODED_IMAGE_DIMENSION
+        || u64::from(width).saturating_mul(u64::from(height)) > MAX_DECODED_IMAGE_PIXELS
+    {
+        return Err(ImageGatewayError::backend(
+            "Codex CLI produced an image that exceeds the decode budget",
+        ));
+    }
     image::load_from_memory(bytes)
         .map_err(|_| ImageGatewayError::backend("Codex CLI produced an unreadable image"))
-}
-
-fn generated_image_has_alpha(bytes: &[u8]) -> bool {
-    image::load_from_memory(bytes)
-        .map(|image| image.color().has_alpha())
-        .unwrap_or(false)
 }
 
 fn flatten_to_opaque(image: DynamicImage) -> DynamicImage {
@@ -156,20 +147,12 @@ fn flatten_to_opaque(image: DynamicImage) -> DynamicImage {
     DynamicImage::ImageRgb8(flattened)
 }
 
-fn bytes_match_output_format(bytes: &[u8], output_format: &str) -> bool {
-    match output_format {
-        "png" => is_png(bytes),
-        "jpeg" => is_jpeg(bytes),
-        "webp" => is_webp(bytes),
-        _ => true,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use image::ImageFormat;
 
     use super::*;
+    use crate::core::image_bytes::is_png;
 
     fn valid_png_with_dimensions(width: u32, height: u32) -> Vec<u8> {
         let image =
@@ -184,6 +167,19 @@ mod tests {
         let mut cursor = Cursor::new(Vec::new());
         image.write_to(&mut cursor, ImageFormat::Png).unwrap();
         cursor.into_inner()
+    }
+
+    fn jpeg_with_comment(comment: &[u8]) -> Vec<u8> {
+        let image = image::ImageBuffer::from_pixel(1, 1, image::Rgb([255u8, 255, 255]));
+        let mut cursor = Cursor::new(Vec::new());
+        image.write_to(&mut cursor, ImageFormat::Jpeg).unwrap();
+        let encoded = cursor.into_inner();
+        let segment_len = u16::try_from(comment.len() + 2).unwrap();
+        let mut with_comment = vec![0xff, 0xd8, 0xff, 0xfe];
+        with_comment.extend_from_slice(&segment_len.to_be_bytes());
+        with_comment.extend_from_slice(comment);
+        with_comment.extend_from_slice(&encoded[2..]);
+        with_comment
     }
 
     #[test]
@@ -205,6 +201,27 @@ mod tests {
     }
 
     #[test]
+    fn matching_output_is_reencoded_without_untrusted_metadata() {
+        let secret = b"credential-must-not-survive";
+        let output = normalize_generated_images(
+            vec![GeneratedImage {
+                bytes: jpeg_with_comment(secret),
+            }],
+            "auto",
+            "jpeg",
+            None,
+        )
+        .unwrap();
+
+        assert!(
+            !output[0]
+                .bytes
+                .windows(secret.len())
+                .any(|window| window == secret)
+        );
+    }
+
+    #[test]
     fn rejects_png_with_unexpected_aspect_ratio() {
         let image = GeneratedImage {
             bytes: valid_png_with_dimensions(1254, 1254),
@@ -222,7 +239,7 @@ mod tests {
         let normalized =
             normalize_generated_images(vec![image], "1024x1024", "jpeg", Some(80)).unwrap();
 
-        assert!(is_jpeg(&normalized[0].bytes));
+        assert!(normalized[0].bytes.starts_with(&[0xff, 0xd8, 0xff]));
     }
 
     #[test]

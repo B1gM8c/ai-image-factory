@@ -1,12 +1,10 @@
 use std::sync::Arc;
 
 use gpt_image_2_gateway::{
-    ApiKeyKeyring, AppConfig, CodexImageGenerator, ImageGatewayError, PostgresApiKeyStore,
-    PostgresUsageStore,
+    ApiKeyKeyring, AppConfig, ExternalImageGatewayComponents, ImageGatewayError,
+    PostgresApiKeyStore, PostgresUsageStore,
     admission::PostgresAdmissionStore,
-    artifacts::{
-        FilesystemArtifactBlobStore, artifact_root_from_env, validate_artifact_root_isolated,
-    },
+    artifacts::{FilesystemArtifactBlobStore, artifact_root_from_env},
     build_router_with_external_execution,
     database::{
         DEFAULT_MAX_CONNECTIONS, connect_pool_with_schema, database_schema_from_env,
@@ -22,11 +20,6 @@ async fn main() -> Result<(), ImageGatewayError> {
     config.validate_startup()?;
     let api_key_keyring = ApiKeyKeyring::from_env()?;
     let artifact_root = artifact_root_from_env()?;
-    let codex_home = config
-        .codex_home
-        .as_deref()
-        .ok_or_else(|| ImageGatewayError::config("GATEWAY_CODEX_HOME is required"))?;
-    validate_artifact_root_isolated(&artifact_root, std::path::Path::new(codex_home))?;
     let artifact_store = Arc::new(FilesystemArtifactBlobStore::new(artifact_root)?);
     let telemetry = init_telemetry()?;
 
@@ -42,17 +35,17 @@ async fn main() -> Result<(), ImageGatewayError> {
         pool,
         artifact_store.clone(),
     ));
-    let generator = Arc::new(CodexImageGenerator::new(config.clone()));
     let bind = config.bind;
     let app = build_router_with_external_execution(
         config,
-        generator,
-        usage_store,
-        api_key_store,
-        admission_store,
-        settlement_store,
-        artifact_store,
-    );
+        ExternalImageGatewayComponents {
+            usage_store,
+            api_key_store,
+            admission_store,
+            settlement_store,
+            input_blob_store: artifact_store,
+        },
+    )?;
 
     let listener = tokio::net::TcpListener::bind(bind)
         .await

@@ -19,6 +19,7 @@ fn now_ms() -> i64 {
 
 fn claim_request(key_digest: Option<&str>, request_hash: &str) -> ClaimAdmission {
     ClaimAdmission {
+        owner_token: Uuid::new_v4(),
         tenant_id: "tenant-a".to_string(),
         project_id: "project-a".to_string(),
         api_profile: "openai-images-v1".to_string(),
@@ -28,6 +29,33 @@ fn claim_request(key_digest: Option<&str>, request_hash: &str) -> ClaimAdmission
         request_hash: request_hash.to_string(),
         deadline_at_ms: now_ms() + 60_000,
     }
+}
+
+#[tokio::test]
+async fn receiving_owner_can_recover_with_the_same_attempt_token() {
+    let store = InMemoryAdmissionStore::default();
+    let request = claim_request(Some("recoverable-digest"), "recoverable-hash");
+    let first = store
+        .claim(request.clone())
+        .await
+        .expect("initial claim must succeed");
+    let replay = store
+        .claim(request.clone())
+        .await
+        .expect("owner recovery must succeed");
+    assert_eq!(replay, first);
+
+    let mut challenger = request;
+    challenger.owner_token = Uuid::new_v4();
+    assert!(matches!(
+        store.claim(challenger).await.expect("challenger claim"),
+        AdmissionClaim::InProgress { .. }
+    ));
+
+    let unkeyed = claim_request(None, "unkeyed-recovery");
+    let unkeyed_first = store.claim(unkeyed.clone()).await.unwrap();
+    let unkeyed_replay = store.claim(unkeyed).await.unwrap();
+    assert_eq!(unkeyed_replay, unkeyed_first);
 }
 
 async fn owner(
@@ -50,8 +78,9 @@ async fn attach(store: &InMemoryAdmissionStore, ticket: AdmissionTicket, job_id:
         .attach(AttachJob {
             ticket,
             job_id,
-            command_schema: "image.generate.v1".to_string(),
+            command_schema: "openai.images.generation.v1".to_string(),
             command_json: json!({"prompt": "draw a lighthouse"}),
+            input_manifest: None,
             work_kind: "image.generate".to_string(),
             schedule_scope: "tenant-a".to_string(),
             schedule_weight: 1,
@@ -142,8 +171,9 @@ async fn attach_requires_the_owner_and_an_object_command() {
             .attach(AttachJob {
                 ticket: forged,
                 job_id,
-                command_schema: "image.generate.v1".to_string(),
+                command_schema: "openai.images.generation.v1".to_string(),
                 command_json: json!({"prompt": "forged"}),
+                input_manifest: None,
                 work_kind: "image.generate".to_string(),
                 schedule_scope: "tenant-a".to_string(),
                 schedule_weight: 1,
@@ -158,8 +188,9 @@ async fn attach_requires_the_owner_and_an_object_command() {
             .attach(AttachJob {
                 ticket: ticket.clone(),
                 job_id,
-                command_schema: "image.generate.v1".to_string(),
+                command_schema: "openai.images.generation.v1".to_string(),
                 command_json: json!(["not", "an", "object"]),
+                input_manifest: None,
                 work_kind: "image.generate".to_string(),
                 schedule_scope: "tenant-a".to_string(),
                 schedule_weight: 1,
@@ -307,8 +338,9 @@ async fn expired_deadlines_are_rejected_and_receiving_sessions_are_aborted() {
             .attach(AttachJob {
                 ticket,
                 job_id: Uuid::new_v4(),
-                command_schema: "image.generate.v1".to_string(),
+                command_schema: "openai.images.generation.v1".to_string(),
                 command_json: json!({"prompt": "too late"}),
+                input_manifest: None,
                 work_kind: "image.generate".to_string(),
                 schedule_scope: "tenant-a".to_string(),
                 schedule_weight: 1,

@@ -279,6 +279,52 @@ impl TestDatabase {
         )
     }
 
+    pub(crate) async fn assert_edit_transitions(&self, request_id: &str) -> TestResult {
+        let row: EditTransitionRow = sqlx::query_as(
+            r#"
+            SELECT j.state AS job_state, j.operation, qr.state AS quota_state,
+                   a.state AS admission_state, p.command_schema,
+                   w.state AS work_state, ja.state AS attempt_state,
+                   COALESCE(i.state, '') AS idempotency_state,
+                   rp.operation AS projection_operation,
+                   (SELECT COUNT(*) FROM job_input_manifests m WHERE m.job_id = j.job_id) AS manifest_count,
+                   (SELECT COUNT(*) FROM job_input_objects o WHERE o.job_id = j.job_id) AS input_count,
+                   (SELECT COUNT(*) FROM artifacts ar WHERE ar.job_id = j.job_id AND ar.state = 'ready') AS artifact_count,
+                   (SELECT COUNT(*) FROM usage_events ue
+                    WHERE ue.request_id = j.request_id AND ue.operation = 'edit' AND ue.outcome = 'charged') AS charge_count
+            FROM jobs j
+            JOIN quota_reservations qr ON qr.reservation_id = j.reservation_id AND qr.job_id = j.job_id
+            JOIN admission_sessions a ON a.job_id = j.job_id
+            JOIN job_payloads p ON p.job_id = j.job_id
+            JOIN work_items w ON w.job_id = j.job_id
+            JOIN job_attempts ja ON ja.work_item_id = w.work_item_id AND ja.execution_id = w.execution_id
+            LEFT JOIN idempotency_requests i ON i.job_id = j.job_id
+            JOIN job_response_projections rp ON rp.job_id = j.job_id
+            WHERE j.request_id = $1
+            "#,
+        )
+        .bind(request_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|error| format!("failed to read edit durable transition: {error}"))?;
+        require(
+            row.job_state == "succeeded"
+                && row.operation == "edit"
+                && row.quota_state == "committed"
+                && row.admission_state == "attached"
+                && row.command_schema == "openai.images.edit.v1"
+                && row.work_state == "succeeded"
+                && row.attempt_state == "succeeded"
+                && row.idempotency_state == "succeeded"
+                && row.projection_operation == "edit"
+                && row.manifest_count == 1
+                && row.input_count == 1
+                && row.artifact_count == 1
+                && row.charge_count == 1,
+            format!("unexpected durable edit transition: {row:?}"),
+        )
+    }
+
     pub(crate) async fn cleanup(self) -> TestResult {
         let result = timeout(
             Duration::from_secs(5),
@@ -311,6 +357,23 @@ struct TransitionRow {
     reservation_requested_units: i32,
     committed_units: i32,
     released_units: i32,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct EditTransitionRow {
+    job_state: String,
+    operation: String,
+    quota_state: String,
+    admission_state: String,
+    command_schema: String,
+    work_state: String,
+    attempt_state: String,
+    idempotency_state: String,
+    projection_operation: String,
+    manifest_count: i64,
+    input_count: i64,
+    artifact_count: i64,
+    charge_count: i64,
 }
 
 #[derive(Debug, sqlx::FromRow)]

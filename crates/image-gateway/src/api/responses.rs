@@ -8,7 +8,6 @@ use axum::{
 use crate::{
     ImageGatewayError,
     auth::AuthContext,
-    generator::GeneratedImage,
     models::{ImageStreamKind, ImagesResponse, image_stream_events},
     usage::UsageSnapshot,
 };
@@ -45,17 +44,6 @@ pub(super) fn add_usage_headers(
         "x-image-units-remaining-7d",
         &usage.remaining_7d.to_string(),
     );
-}
-
-pub(super) fn response_size_for_images(
-    images: &[GeneratedImage],
-) -> Result<String, ImageGatewayError> {
-    let Some(image) = images.first() else {
-        return Err(ImageGatewayError::backend("Codex CLI returned no images"));
-    };
-    let decoded = image::load_from_memory(&image.bytes)
-        .map_err(|_| ImageGatewayError::backend("Codex CLI produced an unreadable image"))?;
-    Ok(format!("{}x{}", decoded.width(), decoded.height()))
 }
 
 pub(super) fn images_response_into_response(

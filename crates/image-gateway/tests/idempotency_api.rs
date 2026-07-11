@@ -12,6 +12,7 @@ use axum::{
     body::{Body, to_bytes},
     http::{HeaderMap, Method, Request, StatusCode, header},
 };
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use gpt_image_2_gateway::{
     AppConfig, EditJob, GeneratedImage, GenerationJob, ImageGatewayError, ImageGenerator,
     InMemoryUsageStore, build_router,
@@ -54,8 +55,14 @@ impl ImageGenerator for CountingGenerator {
             .collect())
     }
 
-    async fn edit(&self, _: EditJob) -> Result<Vec<GeneratedImage>, ImageGatewayError> {
-        unreachable!("edit is not used in generation idempotency tests")
+    async fn edit(&self, job: EditJob) -> Result<Vec<GeneratedImage>, ImageGatewayError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        tokio::time::sleep(self.delay).await;
+        Ok((0..job.n)
+            .map(|_| GeneratedImage {
+                bytes: self.image.clone(),
+            })
+            .collect())
     }
 }
 
@@ -145,6 +152,86 @@ async fn invalid_idempotency_key_is_rejected_before_provider_execution() {
     assert_eq!(generator.calls.load(Ordering::SeqCst), 0);
 }
 
+#[tokio::test]
+async fn completed_edit_request_replays_without_provider_execution() {
+    let generator = CountingGenerator::new(Duration::ZERO);
+    let app = app(generator.clone());
+    let body = edit_body([255, 0, 0, 255], false);
+
+    let first = send_edit_raw(app.clone(), "edit-retry-key", body.clone()).await;
+    let second = send_edit_raw(app, "edit-retry-key", body).await;
+
+    assert_eq!(first.0, StatusCode::OK);
+    assert_eq!(second.0, StatusCode::OK);
+    assert_eq!(second.2, first.2);
+    assert_eq!(generator.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn completed_streaming_edit_replays_the_edit_event_kind() {
+    let generator = CountingGenerator::new(Duration::ZERO);
+    let app = app(generator.clone());
+    let body = edit_body([0, 255, 0, 255], true);
+
+    let first = send_edit_raw(app.clone(), "edit-stream-key", body.clone()).await;
+    let second = send_edit_raw(app, "edit-stream-key", body).await;
+
+    assert_eq!(first.0, StatusCode::OK);
+    assert_eq!(second.2, first.2);
+    assert_eq!(first.1[header::CONTENT_TYPE], "text/event-stream");
+    assert!(String::from_utf8_lossy(&first.2).contains("image_edit.completed"));
+    assert!(!String::from_utf8_lossy(&first.2).contains("image_generation.completed"));
+    assert_eq!(generator.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn edit_idempotency_hash_covers_input_bytes() {
+    let generator = CountingGenerator::new(Duration::ZERO);
+    let app = app(generator.clone());
+
+    let first = send_edit_raw(
+        app.clone(),
+        "edit-input-conflict",
+        edit_body([0, 0, 255, 255], false),
+    )
+    .await;
+    let conflict = send_edit_raw(
+        app,
+        "edit-input-conflict",
+        edit_body([255, 255, 0, 255], false),
+    )
+    .await;
+
+    assert_eq!(first.0, StatusCode::OK);
+    assert_eq!(conflict.0, StatusCode::CONFLICT);
+    let body: Value = serde_json::from_slice(&conflict.2).expect("conflict JSON");
+    assert_eq!(body["error"]["code"], "idempotency_conflict");
+    assert_eq!(generator.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn concurrent_idempotent_edits_have_one_provider_execution() {
+    let generator = CountingGenerator::new(Duration::from_millis(100));
+    let app = app(generator.clone());
+    let body = edit_body([255, 0, 255, 255], false);
+
+    let (left, right) = tokio::join!(
+        send_edit_raw(app.clone(), "edit-concurrent", body.clone()),
+        send_edit_raw(app, "edit-concurrent", body),
+    );
+
+    assert!([left.0, right.0].contains(&StatusCode::OK));
+    let rejected = if left.0 == StatusCode::OK {
+        right
+    } else {
+        left
+    };
+    assert_eq!(rejected.0, StatusCode::CONFLICT);
+    let body: Value = serde_json::from_slice(&rejected.2).expect("in-progress JSON");
+    assert_eq!(body["error"]["code"], "idempotency_in_progress");
+    assert_eq!(generator.calls.load(Ordering::SeqCst), 1);
+}
+
 fn app(generator: CountingGenerator) -> axum::Router {
     build_router(
         config(),
@@ -162,6 +249,27 @@ fn generation_body(prompt: &str) -> Value {
     })
 }
 
+fn edit_body(pixel: [u8; 4], stream: bool) -> Value {
+    let image = ImageBuffer::from_pixel(1, 1, Rgba(pixel));
+    let mut cursor = std::io::Cursor::new(Vec::new());
+    image
+        .write_to(&mut cursor, ImageFormat::Png)
+        .expect("encode edit input");
+    json!({
+        "model": "gpt-image-2",
+        "prompt": "edit this image",
+        "images": [{
+            "image_url": format!(
+                "data:image/png;base64,{}",
+                STANDARD.encode(cursor.into_inner())
+            )
+        }],
+        "size": "1024x1024",
+        "output_format": "png",
+        "stream": stream
+    })
+}
+
 async fn send(app: axum::Router, key: &str, body: Value) -> (StatusCode, Value) {
     let (status, _, body) = send_raw(app, key, body).await;
     (
@@ -171,11 +279,28 @@ async fn send(app: axum::Router, key: &str, body: Value) -> (StatusCode, Value) 
 }
 
 async fn send_raw(app: axum::Router, key: &str, body: Value) -> (StatusCode, HeaderMap, Vec<u8>) {
+    send_raw_to(app, "/v1/images/generations", key, body).await
+}
+
+async fn send_edit_raw(
+    app: axum::Router,
+    key: &str,
+    body: Value,
+) -> (StatusCode, HeaderMap, Vec<u8>) {
+    send_raw_to(app, "/v1/images/edits", key, body).await
+}
+
+async fn send_raw_to(
+    app: axum::Router,
+    path: &str,
+    key: &str,
+    body: Value,
+) -> (StatusCode, HeaderMap, Vec<u8>) {
     let response = app
         .oneshot(
             Request::builder()
                 .method(Method::POST)
-                .uri("/v1/images/generations")
+                .uri(path)
                 .header(header::AUTHORIZATION, "Bearer test-token")
                 .header(header::CONTENT_TYPE, "application/json")
                 .header("idempotency-key", key)

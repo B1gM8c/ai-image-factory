@@ -295,9 +295,7 @@ impl GatewayProcess {
                 "1:1111111111111111111111111111111111111111111111111111111111111111",
             )
             .env("GATEWAY_API_KEY_CURRENT_PEPPER_VERSION", "1")
-            .env("GATEWAY_CODEX_HOME", &files.codex_home)
             .env("GATEWAY_ARTIFACT_ROOT", &files.artifact_root)
-            .env("GATEWAY_CLEANUP_CODEX_OUTPUTS", "true")
             .env("GATEWAY_QUEUE_TIMEOUT_SECS", "1")
             .env("GATEWAY_REQUEST_TIMEOUT_SECS", "5")
             .env("GATEWAY_MAX_CONCURRENT_JOBS", "1")

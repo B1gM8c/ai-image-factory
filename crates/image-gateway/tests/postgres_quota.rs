@@ -2,6 +2,7 @@ use std::{env, str::FromStr, time::Duration};
 
 use gpt_image_2_gateway::{
     ImageGatewayError, PostgresUsageStore, UsageCharge, UsageLimits, UsageStore,
+    admission::{AdmissionClaim, AdmissionStore, ClaimAdmission, PostgresAdmissionStore},
     database::run_migrations,
 };
 use sha2::{Digest, Sha256};
@@ -45,6 +46,78 @@ async fn reserve_persists_selected_provider_and_snapshot_model() -> TestResult {
                     "gpt-image-2-2026-04-21".to_string(),
                 ),
             format!("unexpected persisted provider/model identity: {identity:?}"),
+        )
+    }
+    .await;
+    let cleanup = database.cleanup().await;
+    cleanup?;
+    result
+}
+
+#[tokio::test]
+async fn reserve_replays_the_same_admission_session_without_duplicate_quota() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+
+    let result = async {
+        let pool = database.pool("quota_session_replay").await?;
+        let store = PostgresUsageStore::new(pool.clone());
+        let tenant_id = "tenant_session_replay";
+        let request_id = "request_session_replay";
+        let admission = PostgresAdmissionStore::new(pool.clone());
+        let claim = admission
+            .claim(ClaimAdmission {
+                owner_token: Uuid::new_v4(),
+                tenant_id: tenant_id.to_string(),
+                project_id: "project_session_replay".to_string(),
+                api_profile: "openai-images-v1".to_string(),
+                operation: "generation".to_string(),
+                request_id: request_id.to_string(),
+                idempotency_key_digest: Some("a".repeat(64)),
+                request_hash: "b".repeat(64),
+                deadline_at_ms: i64::MAX,
+            })
+            .await
+            .map_err(|error| format!("session claim failed: {error}"))?;
+        let AdmissionClaim::Owner(ticket) = claim else {
+            return Err(format!("unexpected session claim: {claim:?}"));
+        };
+        let session_id = ticket.session_id;
+        let mut charge = test_charge(tenant_id, request_id);
+        charge.admission_session_id = Some(ticket.session_id);
+
+        let first = store
+            .reserve(charge.clone())
+            .await
+            .map_err(|error| format!("first session reserve failed: {error:?}"))?;
+        let replay = store
+            .reserve(charge)
+            .await
+            .map_err(|error| format!("replayed session reserve failed: {error:?}"))?;
+        require(
+            replay.reservation_id == first.reservation_id
+                && replay.job_id == first.job_id
+                && replay.snapshot == first.snapshot
+                && replay.charge.admission_session_id == first.charge.admission_session_id
+                && replay.charge.request_id == first.charge.request_id,
+            format!("session replay changed reservation identity: {first:?} != {replay:?}"),
+        )?;
+        let counts: (i64, i64) = sqlx::query_as(
+            r#"
+            SELECT
+              (SELECT COUNT(*) FROM quota_reservations WHERE admission_session_id = $1),
+              (SELECT COUNT(*) FROM jobs WHERE job_id = $2)
+            "#,
+        )
+        .bind(session_id)
+        .bind(first.job_id)
+        .fetch_one(&pool)
+        .await
+        .map_err(|error| format!("failed to inspect session replay rows: {error}"))?;
+        require(
+            counts == (1, 1),
+            format!("session replay duplicated persisted state: {counts:?}"),
         )
     }
     .await;
@@ -144,6 +217,53 @@ async fn active_work_keeps_an_expired_timestamp_reserved_and_counted() -> TestRe
     };
 
     let result = active_work_expiry_case(&database).await;
+    let cleanup = database.cleanup().await;
+    cleanup?;
+    result
+}
+
+#[tokio::test]
+async fn uncertain_work_keeps_expired_reservation_counted_against_quota() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+
+    let result = async {
+        let tenant_id = format!("tenant_uncertain_expiry_{}", Uuid::new_v4().simple());
+        let pool = database.pool("quota_uncertain_expiry").await?;
+        let store = PostgresUsageStore::new(pool.clone());
+        let reservation = store
+            .reserve(test_charge(&tenant_id, "request_uncertain"))
+            .await
+            .map_err(|error| format!("uncertain reservation failed: {error:?}"))?;
+        sqlx::query(
+            r#"
+            INSERT INTO work_items
+              (work_item_id, job_id, kind, state, available_at_ms, created_at_ms, updated_at_ms)
+            VALUES ($1, $2, 'image_batch', 'uncertain', 0, 0, 0)
+            "#,
+        )
+        .bind(Uuid::new_v4())
+        .bind(reservation.job_id)
+        .execute(&pool)
+        .await
+        .map_err(|error| format!("failed to attach uncertain work: {error}"))?;
+        sqlx::query("UPDATE quota_reservations SET expires_at_ms = 0 WHERE reservation_id = $1")
+            .bind(reservation.reservation_id)
+            .execute(&pool)
+            .await
+            .map_err(|error| format!("failed to age uncertain reservation: {error}"))?;
+
+        let denied = store
+            .reserve(test_charge(&tenant_id, "request_after_uncertain"))
+            .await
+            .expect_err("uncertain work must continue to consume quota");
+        require(
+            denied.status_code() == axum::http::StatusCode::TOO_MANY_REQUESTS,
+            format!("uncertain replacement should return 429, got {denied:?}"),
+        )
+    }
+    .await;
     let cleanup = database.cleanup().await;
     cleanup?;
     result
@@ -677,6 +797,7 @@ fn test_charge(tenant_id: &str, request_id: &str) -> UsageCharge {
     UsageCharge {
         tenant_id: tenant_id.to_string(),
         request_id: request_id.to_string(),
+        admission_session_id: None,
         operation: "generation",
         provider_id: "openai-codex".to_string(),
         model: "gpt-image-2".to_string(),

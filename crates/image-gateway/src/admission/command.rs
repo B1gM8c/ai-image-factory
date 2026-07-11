@@ -3,6 +3,13 @@ use sha2::{Digest, Sha256};
 
 use crate::generator::GenerationJob;
 
+mod edit;
+
+pub use edit::{
+    EDIT_COMMAND_SCHEMA, EDIT_COMMAND_SCHEMA_VERSION, EDIT_INPUT_MANIFEST_SCHEMA, EDIT_OPERATION,
+    EditCommandV1, EditInputDescriptorV1, EditInputRoleV1,
+};
+
 pub const GENERATION_COMMAND_SCHEMA_VERSION: u16 = 1;
 pub const GENERATION_COMMAND_SCHEMA: &str = "openai.images.generation.v1";
 pub const GENERATION_OPERATION: &str = "generation";
@@ -11,6 +18,8 @@ pub const GENERATION_OPERATION: &str = "generation";
 pub struct GenerationCommandV1 {
     pub background: String,
     pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub moderation: Option<String>,
     pub n: u32,
     pub operation: String,
     pub output_compression: Option<u8>,
@@ -34,6 +43,7 @@ impl GenerationCommandV1 {
         Self {
             background: job.background.clone(),
             model: job.model.clone(),
+            moderation: (job.moderation != "auto").then(|| job.moderation.clone()),
             n: job.n,
             operation: GENERATION_OPERATION.to_string(),
             output_compression: job.output_compression,
@@ -101,6 +111,7 @@ mod tests {
             request_id: "request-1".to_string(),
             model: "gpt-image-2".to_string(),
             prompt: "a red fox".to_string(),
+            moderation: "auto".to_string(),
             n: 2,
             size: "1024x1024".to_string(),
             quality: "high".to_string(),
@@ -183,6 +194,10 @@ mod tests {
             },
             GenerationCommandV1 {
                 model: "other-model".to_string(),
+                ..base.clone()
+            },
+            GenerationCommandV1 {
+                moderation: Some("low".to_string()),
                 ..base.clone()
             },
             GenerationCommandV1 {
@@ -282,6 +297,94 @@ mod tests {
                 validate_idempotency_key(key),
                 Err(IdempotencyKeyError::NonVisibleAscii)
             );
+        }
+    }
+
+    fn edit_job() -> crate::generator::EditJob {
+        crate::generator::EditJob {
+            request_id: "edit-request-1".to_string(),
+            model: "gpt-image-2".to_string(),
+            prompt: "replace the sky".to_string(),
+            moderation: "auto".to_string(),
+            images: Vec::new(),
+            mask: None,
+            n: 1,
+            size: "1024x1024".to_string(),
+            quality: "high".to_string(),
+            output_format: "png".to_string(),
+            output_compression: None,
+            background: "auto".to_string(),
+            stream: false,
+            partial_images: 0,
+        }
+    }
+
+    fn edit_inputs() -> Vec<EditInputDescriptorV1> {
+        vec![
+            EditInputDescriptorV1 {
+                byte_size: 123,
+                index: 0,
+                media_type: "image/png".to_string(),
+                role: EditInputRoleV1::Image,
+                sha256_hex: "1".repeat(64),
+            },
+            EditInputDescriptorV1 {
+                byte_size: 45,
+                index: 0,
+                media_type: "image/png".to_string(),
+                role: EditInputRoleV1::Mask,
+                sha256_hex: "2".repeat(64),
+            },
+        ]
+    }
+
+    #[test]
+    fn edit_command_has_stable_canonical_request_hash() {
+        let command = EditCommandV1::from_edit_job(
+            &edit_job(),
+            edit_inputs(),
+            "openai-images-v1",
+            "openai-codex",
+        );
+        let reparsed: EditCommandV1 =
+            serde_json::from_slice(&command.canonical_json_bytes()).unwrap();
+
+        assert_eq!(reparsed, command);
+        assert_eq!(command.operation, EDIT_OPERATION);
+        assert_eq!(command.schema_version, EDIT_COMMAND_SCHEMA_VERSION);
+        assert_eq!(command.request_hash_hex().len(), 64);
+        assert_eq!(command.request_hash_hex(), reparsed.request_hash_hex());
+        assert_eq!(
+            command.input_manifest_hash_hex(),
+            reparsed.input_manifest_hash_hex()
+        );
+    }
+
+    #[test]
+    fn edit_request_hash_covers_input_order_role_hash_and_size() {
+        let base = EditCommandV1::from_edit_job(
+            &edit_job(),
+            edit_inputs(),
+            "openai-images-v1",
+            "openai-codex",
+        );
+        let base_hash = base.request_hash_hex();
+        let mut variants = Vec::new();
+        let mut reordered = base.clone();
+        reordered.inputs.swap(0, 1);
+        variants.push(reordered);
+        let mut changed_role = base.clone();
+        changed_role.inputs[0].role = EditInputRoleV1::Mask;
+        variants.push(changed_role);
+        let mut changed_hash = base.clone();
+        changed_hash.inputs[0].sha256_hex = "3".repeat(64);
+        variants.push(changed_hash);
+        let mut changed_size = base.clone();
+        changed_size.inputs[0].byte_size += 1;
+        variants.push(changed_size);
+
+        for variant in variants {
+            assert_ne!(variant.request_hash_hex(), base_hash);
         }
     }
 }
