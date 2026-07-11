@@ -481,8 +481,8 @@ async fn shared_pool_case(pool: &PgPool) -> TestResult {
 
 async fn assert_expected_schema(pool: &PgPool) -> TestResult {
     require(
-        migration_versions(pool).await? == vec![0, 1, 2, 3, 4, 5, 6, 7],
-        "applied migration versions must be exactly [0, 1, 2, 3, 4, 5, 6, 7]",
+        migration_versions(pool).await? == vec![0, 1, 2, 3, 4, 5, 6, 7, 8],
+        "applied migration versions must be exactly [0, 1, 2, 3, 4, 5, 6, 7, 8]",
     )?;
 
     for (table, column) in REQUIRED_COLUMNS {

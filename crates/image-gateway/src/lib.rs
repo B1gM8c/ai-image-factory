@@ -9,6 +9,7 @@ pub mod database;
 mod docs;
 mod error;
 mod execution;
+pub mod executor;
 mod generator;
 pub mod input_blobs;
 mod jobs;
@@ -33,6 +34,11 @@ pub use error::ImageGatewayError;
 pub use execution::{
     EditExecutionContext, ExecutionContextError, ExecutionContextStore, GenerationExecutionContext,
     PersistedEditInput, PostgresExecutionContextStore,
+};
+pub use executor::{
+    ExecutorClaimScope, ExecutorResultManifest, ExecutorSubmissionError, ExecutorSubmissionLease,
+    ExecutorSubmissionOutcome, ExecutorSubmissionStore, PostgresExecutorSubmissionStore,
+    PreparedExecutorSubmission,
 };
 pub use generator::{
     CodexImageGenerator, EditJob, GeneratedImage, GenerationJob, ImageGenerator, InputImage,

@@ -1,7 +1,8 @@
 use std::{env, sync::Arc, time::Duration};
 
 use gpt_image_2_gateway::{
-    ImageGatewayError, PostgresReconciliationStore, ReconciliationStore,
+    ExecutorSubmissionStore, ImageGatewayError, PostgresExecutorSubmissionStore,
+    PostgresReconciliationStore, ReconciliationStore,
     artifacts::{FilesystemArtifactBlobStore, artifact_root_from_env},
     database::{
         DEFAULT_MAX_CONNECTIONS, connect_pool_with_schema, database_schema_from_env,
@@ -13,9 +14,18 @@ use gpt_image_2_gateway::{
 const DEFAULT_INTERVAL_MS: u64 = 1_000;
 const MAX_INTERVAL_MS: u64 = 60_000;
 const DEFAULT_BATCH_SIZE: u32 = 100;
+const MAX_BATCH_SIZE: u32 = 1_000;
 const DEFAULT_ORPHAN_GRACE_MS: u64 = 60_000;
 const DEFAULT_INPUT_CLEANUP_GRACE_MS: u64 = 60_000;
 const DEFAULT_INPUT_CLEANUP_LEASE_MS: u64 = 60_000;
+
+#[derive(Clone, Copy)]
+struct ReconcileConfig {
+    orphan_grace_ms: u64,
+    input_cleanup_grace_ms: u64,
+    input_cleanup_lease_ms: u64,
+    batch_size: u32,
+}
 
 #[tokio::main]
 async fn main() -> Result<(), ImageGatewayError> {
@@ -25,7 +35,8 @@ async fn main() -> Result<(), ImageGatewayError> {
     let pool =
         connect_pool_with_schema(&database_url, DEFAULT_MAX_CONNECTIONS, &database_schema).await?;
     verify_migrations(&pool).await?;
-    let reconciler = PostgresReconciliationStore::new(pool);
+    let reconciler = PostgresReconciliationStore::new(pool.clone());
+    let executor_reconciler = PostgresExecutorSubmissionStore::new(pool);
     let input_blobs = Arc::new(FilesystemArtifactBlobStore::new(artifact_root_from_env()?)?);
     let owner = format!("reconcilerd-{}", uuid::Uuid::new_v4().simple());
     let interval_ms = env_u64("RECONCILER_INTERVAL_MS", DEFAULT_INTERVAL_MS)?;
@@ -36,6 +47,11 @@ async fn main() -> Result<(), ImageGatewayError> {
     }
     let interval = Duration::from_millis(interval_ms);
     let batch_size = env_u32("RECONCILER_BATCH_SIZE", DEFAULT_BATCH_SIZE)?;
+    if !(1..=MAX_BATCH_SIZE).contains(&batch_size) {
+        return Err(ImageGatewayError::config(format!(
+            "RECONCILER_BATCH_SIZE must be between 1 and {MAX_BATCH_SIZE}"
+        )));
+    }
     let orphan_grace_ms = env_u64("RECONCILER_ORPHAN_GRACE_MS", DEFAULT_ORPHAN_GRACE_MS)?;
     let input_cleanup_grace_ms = env_u64(
         "RECONCILER_INPUT_CLEANUP_GRACE_MS",
@@ -45,6 +61,12 @@ async fn main() -> Result<(), ImageGatewayError> {
         "RECONCILER_INPUT_CLEANUP_LEASE_MS",
         DEFAULT_INPUT_CLEANUP_LEASE_MS,
     )?;
+    let reconcile_config = ReconcileConfig {
+        orphan_grace_ms,
+        input_cleanup_grace_ms,
+        input_cleanup_lease_ms,
+        batch_size,
+    };
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
     tracing::info!(batch_size, "reconcilerd started");
@@ -52,15 +74,15 @@ async fn main() -> Result<(), ImageGatewayError> {
     loop {
         tokio::select! {
             _ = &mut shutdown => break,
-            result = reconcile_once(
+            result = reconcile_all(
                 &reconciler,
+                &executor_reconciler,
                 input_blobs.as_ref(),
                 &owner,
-                orphan_grace_ms,
-                input_cleanup_grace_ms,
-                input_cleanup_lease_ms,
-                batch_size,
-            ) => match result {
+                reconcile_config,
+            ) => {
+                let (core_result, executor_result) = result;
+                match core_result {
                 Ok((work, orphan, input)) => {
                     if work.requeued > 0 || work.uncertain > 0 || orphan.orphaned > 0
                         || input.claimed > 0
@@ -79,6 +101,16 @@ async fn main() -> Result<(), ImageGatewayError> {
                 Err(error) => {
                     tracing::error!(error = ?error, "work reconciliation failed");
                 }
+                }
+                match executor_result {
+                    Ok(executor_uncertain) if executor_uncertain > 0 => {
+                        tracing::info!(executor_uncertain, "executor state reconciled");
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        tracing::error!(error = ?error, "executor reconciliation failed");
+                    }
+                }
             },
         }
         tokio::select! {
@@ -90,14 +122,35 @@ async fn main() -> Result<(), ImageGatewayError> {
     Ok(())
 }
 
-async fn reconcile_once(
+async fn reconcile_all(
+    reconciler: &PostgresReconciliationStore,
+    executor_reconciler: &PostgresExecutorSubmissionStore,
+    input_blobs: &dyn gpt_image_2_gateway::input_blobs::InputBlobStore,
+    owner: &str,
+    config: ReconcileConfig,
+) -> (
+    Result<
+        (
+            gpt_image_2_gateway::ReconciliationOutcome,
+            gpt_image_2_gateway::ReconciliationOutcome,
+            gpt_image_2_gateway::InputCleanupOutcome,
+        ),
+        ImageGatewayError,
+    >,
+    Result<u64, gpt_image_2_gateway::ExecutorSubmissionError>,
+) {
+    let executor = executor_reconciler
+        .reconcile_expired(config.batch_size)
+        .await;
+    let core = reconcile_core(reconciler, input_blobs, owner, config).await;
+    (core, executor)
+}
+
+async fn reconcile_core(
     reconciler: &PostgresReconciliationStore,
     input_blobs: &dyn gpt_image_2_gateway::input_blobs::InputBlobStore,
     owner: &str,
-    orphan_grace_ms: u64,
-    input_cleanup_grace_ms: u64,
-    input_cleanup_lease_ms: u64,
-    batch_size: u32,
+    config: ReconcileConfig,
 ) -> Result<
     (
         gpt_image_2_gateway::ReconciliationOutcome,
@@ -106,17 +159,17 @@ async fn reconcile_once(
     ),
     ImageGatewayError,
 > {
-    let work = reconciler.reconcile_expired_work(batch_size).await?;
+    let work = reconciler.reconcile_expired_work(config.batch_size).await?;
     let orphan = reconciler
-        .reconcile_orphan_reservations(orphan_grace_ms, batch_size)
+        .reconcile_orphan_reservations(config.orphan_grace_ms, config.batch_size)
         .await?;
     let input = reconcile_input_cleanup(
         reconciler,
         input_blobs,
         owner,
-        input_cleanup_grace_ms,
-        input_cleanup_lease_ms,
-        batch_size,
+        config.input_cleanup_grace_ms,
+        config.input_cleanup_lease_ms,
+        config.batch_size,
     )
     .await?;
     Ok((work, orphan, input))
