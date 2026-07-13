@@ -4,7 +4,8 @@ use gpt_image_2_gateway::{
     ExecutionSettlementStore, PostgresExecutionSettlementStore, PostgresUsageStore, UsageCharge,
     UsageLimits, UsageReservation, UsageStore,
     admission::{
-        AdmissionClaim, AdmissionStore, AdmissionTicket, AttachJob, ClaimAdmission, WorkLease,
+        AdmissionClaim, AdmissionContract, AdmissionStore, AdmissionTicket, AttachJob,
+        ClaimAdmission, WorkLease,
     },
     artifacts::{
         ArtifactBlobStore, ArtifactIdentity, GENERATION_RESPONSE_SCHEMA,
@@ -426,6 +427,7 @@ fn attach_request(ticket: AdmissionTicket, job_id: Uuid) -> AttachJob {
         schedule_weight: 1,
         schedule_priority: 1,
         schedule_cost: 1,
+        contract: AdmissionContract::LegacyV1,
     }
 }
 

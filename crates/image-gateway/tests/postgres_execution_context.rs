@@ -14,8 +14,8 @@ use gpt_image_2_gateway::{
     PostgresExecutionSettlementStore, PostgresUsageStore, UsageCharge, UsageLimits,
     UsageReservation, UsageStore, Workerd,
     admission::{
-        AdmissionClaim, AdmissionStore, AttachInputManifest, AttachInputObject, AttachJob,
-        ClaimAdmission, EDIT_COMMAND_SCHEMA, EDIT_INPUT_MANIFEST_SCHEMA, EditCommandV1,
+        AdmissionClaim, AdmissionContract, AdmissionStore, AttachInputManifest, AttachInputObject,
+        AttachJob, ClaimAdmission, EDIT_COMMAND_SCHEMA, EDIT_INPUT_MANIFEST_SCHEMA, EditCommandV1,
         EditInputDescriptorV1, EditInputRoleV1, GenerationCommandV1, PostgresAdmissionStore,
         WorkLease,
     },
@@ -118,6 +118,7 @@ async fn leased_work_reconstructs_generation_and_quota_context() -> TestResult {
                 schedule_weight: 1,
                 schedule_priority: 1,
                 schedule_cost: 2,
+                contract: AdmissionContract::LegacyV1,
             })
             .await
             .map_err(|error| format!("attach failed: {error}"))?;
@@ -728,6 +729,7 @@ async fn prepare_ready_work(
             schedule_weight: 1,
             schedule_priority: 1,
             schedule_cost: u64::from(job.n),
+            contract: AdmissionContract::LegacyV1,
         })
         .await
         .map_err(|error| format!("attach failed: {error}"))?;
@@ -836,6 +838,7 @@ async fn prepare_attached_edit_with_blobs(
             schedule_weight: 1,
             schedule_priority: 1,
             schedule_cost: 1,
+            contract: AdmissionContract::LegacyV1,
         })
         .await
         .map_err(|error| format!("edit attach failed: {error}"))?;
@@ -907,6 +910,7 @@ async fn prepare_ready_edit(pool: &PgPool, worker_id: &str) -> TestResult<Prepar
             schedule_weight: 1,
             schedule_priority: 1,
             schedule_cost: 1,
+            contract: AdmissionContract::LegacyV1,
         })
         .await
         .map_err(|error| format!("edit attach failed: {error}"))?;

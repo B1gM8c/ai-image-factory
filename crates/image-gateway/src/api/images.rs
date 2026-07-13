@@ -16,10 +16,11 @@ use uuid::Uuid;
 use crate::{
     ImageGatewayError,
     admission::{
-        AdmissionClaim, AdmissionError, AdmissionTicket, AttachInputManifest, AttachInputObject,
-        AttachJob, ClaimAdmission, EDIT_COMMAND_SCHEMA, EDIT_INPUT_MANIFEST_SCHEMA, EDIT_OPERATION,
-        EditCommandV1, EditInputDescriptorV1, EditInputRoleV1, GENERATION_COMMAND_SCHEMA,
-        GENERATION_OPERATION, GenerationCommandV1, idempotency_key_digest,
+        AdmissionClaim, AdmissionContract, AdmissionError, AdmissionTicket, AttachInputManifest,
+        AttachInputObject, AttachJob, ClaimAdmission, EDIT_COMMAND_SCHEMA,
+        EDIT_INPUT_MANIFEST_SCHEMA, EDIT_OPERATION, EditCommandV1, EditInputDescriptorV1,
+        EditInputRoleV1, GENERATION_COMMAND_SCHEMA, GENERATION_OPERATION, GenerationCommandV1,
+        idempotency_key_digest,
     },
     artifacts::{GENERATION_RESPONSE_SCHEMA, sha256_hex},
     generator::{EditJob, InputImage},
@@ -171,6 +172,7 @@ pub(super) async fn generations(
         schedule_weight: 1,
         schedule_priority: 1,
         schedule_cost: u64::from(units),
+        contract: AdmissionContract::LegacyV1,
     };
     if state.generation_execution_mode == GenerationExecutionMode::External {
         if let Err(error) = attach_ready_with_retry(&state, attach).await {
@@ -394,7 +396,9 @@ async fn attach_ready_with_retry(
 fn admission_error(error: AdmissionError) -> ImageGatewayError {
     match error {
         AdmissionError::Expired => ImageGatewayError::timeout(),
+        AdmissionError::BillingLimitExceeded => ImageGatewayError::queue_overloaded(),
         AdmissionError::Unavailable
+        | AdmissionError::PricingUnavailable
         | AdmissionError::InvalidOwner
         | AdmissionError::StaleLease
         | AdmissionError::InvalidCommand => {
@@ -548,6 +552,7 @@ pub(super) async fn edits(
         schedule_weight: 1,
         schedule_priority: 1,
         schedule_cost: u64::from(units),
+        contract: AdmissionContract::LegacyV1,
     };
     if state.generation_execution_mode == GenerationExecutionMode::External {
         if let Err(error) = attach_ready_with_retry(&state, attach).await {

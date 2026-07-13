@@ -6,8 +6,8 @@ use gpt_image_2_gateway::{
     GenerationJob, PostgresReconciliationStore, PostgresUsageStore, ReconciliationStore,
     UsageCharge, UsageLimits, UsageReservation, UsageStore,
     admission::{
-        AdmissionClaim, AdmissionStore, AdmissionTicket, AttachJob, ClaimAdmission,
-        GenerationCommandV1, PostgresAdmissionStore, WorkLease,
+        AdmissionClaim, AdmissionContract, AdmissionStore, AdmissionTicket, AttachJob,
+        ClaimAdmission, GenerationCommandV1, PostgresAdmissionStore, WorkLease,
     },
     artifacts::InMemoryArtifactBlobStore,
     database::{connect_test_pool_with_search_path, run_migrations},
@@ -821,6 +821,7 @@ async fn ready_lease(
             schedule_weight: 1,
             schedule_priority: 1,
             schedule_cost: 1,
+            contract: AdmissionContract::LegacyV1,
         })
         .await
         .map_err(|error| format!("attach failed: {error}"))?;

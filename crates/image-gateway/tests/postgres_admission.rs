@@ -3,8 +3,8 @@ use std::env;
 use gpt_image_2_gateway::{
     EditJob,
     admission::{
-        AdmissionClaim, AdmissionError, AdmissionStore, AdmissionTicket, AttachInputManifest,
-        AttachInputObject, AttachJob, ClaimAdmission, EDIT_COMMAND_SCHEMA,
+        AdmissionClaim, AdmissionContract, AdmissionError, AdmissionStore, AdmissionTicket,
+        AttachInputManifest, AttachInputObject, AttachJob, ClaimAdmission, EDIT_COMMAND_SCHEMA,
         EDIT_INPUT_MANIFEST_SCHEMA, EditCommandV1, EditInputDescriptorV1, EditInputRoleV1,
         PostgresAdmissionStore, WorkOutcome,
     },
@@ -41,6 +41,138 @@ async fn migration_creates_durable_admission_tables() -> TestResult {
             require(exists, format!("migration did not create {table}"))?;
         }
         Ok(())
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
+async fn final_accept_creates_one_frozen_economic_identity_set() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let store = PostgresAdmissionStore::new(database.pool.clone());
+        let ticket = claim_owner(&store, claim_request(None, "9".repeat(64))).await?;
+        let job_id =
+            insert_job_for_ticket(&database.pool, &ticket, "tenant-a", "generation", None).await?;
+        let mut request = attach_request(ticket, job_id);
+        request.contract = AdmissionContract::OutputEconomicsV2;
+
+        let first = store
+            .attach(request.clone())
+            .await
+            .map_err(|error| format!("first attach failed: {error:?}"))?;
+        let replay = store
+            .attach(request)
+            .await
+            .map_err(|error| format!("attach replay failed: {error:?}"))?;
+        require(
+            first == replay,
+            "attach replay changed the durable work identity",
+        )?;
+
+        let counts: (i64, i64, i64, i64) = sqlx::query_as(
+            r#"
+            SELECT (SELECT COUNT(*) FROM job_outputs WHERE job_id = $1),
+                   (SELECT COUNT(*) FROM price_quotes WHERE job_id = $1),
+                   (SELECT COUNT(*) FROM output_holds h
+                      JOIN job_outputs o ON o.output_id = h.output_id
+                     WHERE o.job_id = $1),
+                   (SELECT economics_contract_version FROM jobs WHERE job_id = $1)::BIGINT
+            "#,
+        )
+        .bind(job_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(|error| format!("failed to inspect economic identities: {error}"))?;
+        require(
+            counts == (1, 1, 1, 2),
+            format!("unexpected economic identity counts: {counts:?}"),
+        )?;
+
+        let frozen: (String, i64, i64, String, String) = sqlx::query_as(
+            r#"
+            SELECT q.currency, q.output_count::BIGINT, q.max_total_micros,
+                   q.quote_hash, h.state
+            FROM price_quotes q
+            JOIN job_outputs o ON o.job_id = q.job_id
+            JOIN output_holds h ON h.output_id = o.output_id
+            WHERE q.job_id = $1
+            "#,
+        )
+        .bind(job_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(|error| format!("failed to inspect frozen economics: {error}"))?;
+        require(
+            frozen.0 == "USD"
+                && frozen.1 == 1
+                && frozen.2 == 0
+                && frozen.3.len() == 64
+                && frozen.4 == "held",
+            format!("invalid frozen economics: {frozen:?}"),
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
+async fn insufficient_billing_credit_rolls_back_the_entire_accept() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        sqlx::query(
+            r#"
+            INSERT INTO price_versions
+              (price_version_id, price_key, version, api_profile, operation, provider_id, model,
+               currency, success_micros, failed_micros, no_effect_micros, state,
+               created_at_ms, updated_at_ms)
+            VALUES ($1, 'paid-test', 1, 'openai-images-v1', 'generation',
+                    'openai-codex', 'gpt-image-2', 'USD', 11, 0, 0, 'active', 1, 1)
+            "#,
+        )
+        .bind(Uuid::new_v4())
+        .execute(&database.pool)
+        .await
+        .map_err(|error| format!("failed to seed paid price: {error}"))?;
+        let store = PostgresAdmissionStore::new(database.pool.clone());
+        let ticket = claim_owner(&store, claim_request(None, "8".repeat(64))).await?;
+        let owner_token = ticket.owner_token;
+        let job_id =
+            insert_job_for_ticket(&database.pool, &ticket, "tenant-a", "generation", None).await?;
+        let mut request = attach_request(ticket, job_id);
+        request.contract = AdmissionContract::OutputEconomicsV2;
+        require(
+            matches!(
+                store.attach(request).await,
+                Err(AdmissionError::BillingLimitExceeded)
+            ),
+            "accept ignored the tenant billing limit",
+        )?;
+        let state: (String, i64, i64, i64, i64) = sqlx::query_as(
+            r#"
+            SELECT s.state,
+                   (SELECT COUNT(*) FROM job_outputs WHERE job_id = $1),
+                   (SELECT COUNT(*) FROM price_quotes WHERE job_id = $1),
+                   (SELECT COUNT(*) FROM output_holds h
+                      JOIN job_outputs o ON o.output_id = h.output_id WHERE o.job_id = $1),
+                   (SELECT COUNT(*) FROM billing_accounts WHERE tenant_id = 'tenant-a')
+            FROM admission_sessions s
+            WHERE s.job_id IS NULL AND s.owner_token = $2
+            "#,
+        )
+        .bind(job_id)
+        .bind(owner_token)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(|error| format!("failed to inspect rejected accept: {error}"))?;
+        require(
+            state == ("receiving".to_string(), 0, 0, 0, 0),
+            format!("rejected accept left partial economics: {state:?}"),
+        )
     }
     .await;
     combine(result, database.cleanup().await)
@@ -970,6 +1102,7 @@ fn attach_request_with_schedule(
         schedule_weight,
         schedule_priority: 1,
         schedule_cost,
+        contract: AdmissionContract::LegacyV1,
     }
 }
 
@@ -1123,6 +1256,7 @@ fn edit_attach_request(
         schedule_weight: 1,
         schedule_priority: 1,
         schedule_cost: 1,
+        contract: AdmissionContract::LegacyV1,
     }
 }
 

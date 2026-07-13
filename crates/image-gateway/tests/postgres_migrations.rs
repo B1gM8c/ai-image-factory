@@ -137,6 +137,136 @@ async fn execution_context_migration_requires_legacy_active_jobs_to_be_drained()
     result
 }
 
+#[tokio::test]
+async fn economic_ledger_is_balanced_at_commit_and_append_only() -> TestResult {
+    let Some(test_schema) = TestSchema::new(2).await? else {
+        return Ok(());
+    };
+    let result = economic_ledger_case(&test_schema.pool).await;
+    let cleanup = test_schema.cleanup().await;
+    cleanup?;
+    result
+}
+
+async fn economic_ledger_case(pool: &PgPool) -> TestResult {
+    gateway_result(
+        run_migrations(pool).await,
+        "economic migration should succeed",
+    )?;
+    let debit_id = Uuid::new_v4();
+    let credit_id = Uuid::new_v4();
+    for (account_id, key, account_type) in [
+        (debit_id, "test:receivable", "receivable"),
+        (credit_id, "test:revenue", "revenue"),
+    ] {
+        sqlx::query(
+            r#"
+            INSERT INTO ledger_accounts
+              (account_id, account_key, owner_type, owner_id, account_type, currency, created_at_ms)
+            VALUES ($1, $2, 'platform', 'test', $3, 'USD', 1)
+            "#,
+        )
+        .bind(account_id)
+        .bind(key)
+        .bind(account_type)
+        .execute(pool)
+        .await
+        .map_err(|error| format!("failed to seed ledger account: {error}"))?;
+    }
+
+    let empty_transaction_id = Uuid::new_v4();
+    let mut empty = pool
+        .begin()
+        .await
+        .map_err(|error| format!("failed to begin empty ledger transaction: {error}"))?;
+    sqlx::query(
+        r#"
+        INSERT INTO ledger_transactions
+          (transaction_id, semantic_key, transaction_type, currency, payload_hash, created_at_ms)
+        VALUES ($1, $2, 'adjustment', 'USD', $3, 1)
+        "#,
+    )
+    .bind(empty_transaction_id)
+    .bind(format!("empty:{empty_transaction_id}"))
+    .bind("1".repeat(64))
+    .execute(&mut *empty)
+    .await
+    .map_err(|error| format!("failed to stage empty ledger transaction: {error}"))?;
+    require(
+        empty.commit().await.is_err(),
+        "empty ledger transaction committed",
+    )?;
+
+    let transaction_id = Uuid::new_v4();
+    let mut balanced = pool
+        .begin()
+        .await
+        .map_err(|error| format!("failed to begin balanced ledger transaction: {error}"))?;
+    sqlx::query(
+        r#"
+        INSERT INTO ledger_transactions
+          (transaction_id, semantic_key, transaction_type, currency, payload_hash, created_at_ms)
+        VALUES ($1, $2, 'adjustment', 'USD', $3, 1)
+        "#,
+    )
+    .bind(transaction_id)
+    .bind(format!("balanced:{transaction_id}"))
+    .bind("2".repeat(64))
+    .execute(&mut *balanced)
+    .await
+    .map_err(|error| format!("failed to stage balanced ledger transaction: {error}"))?;
+    for (posting_no, account_id, amount) in [(1_i16, debit_id, 9_i64), (2, credit_id, -9)] {
+        sqlx::query(
+            r#"
+            INSERT INTO ledger_postings
+              (transaction_id, posting_no, account_id, currency, amount_micros, created_at_ms)
+            VALUES ($1, $2, $3, 'USD', $4, 1)
+            "#,
+        )
+        .bind(transaction_id)
+        .bind(posting_no)
+        .bind(account_id)
+        .bind(amount)
+        .execute(&mut *balanced)
+        .await
+        .map_err(|error| format!("failed to stage balanced posting: {error}"))?;
+    }
+    sqlx::query(
+        "INSERT INTO ledger_transaction_seals (transaction_id, sealed_at_ms) VALUES ($1, 1)",
+    )
+    .bind(transaction_id)
+    .execute(&mut *balanced)
+    .await
+    .map_err(|error| format!("failed to seal balanced ledger transaction: {error}"))?;
+    balanced
+        .commit()
+        .await
+        .map_err(|error| format!("balanced ledger transaction was rejected: {error}"))?;
+    require(
+        sqlx::query("UPDATE ledger_postings SET amount_micros = 10 WHERE transaction_id = $1")
+            .bind(transaction_id)
+            .execute(pool)
+            .await
+            .is_err(),
+        "append-only ledger posting was mutated",
+    )?;
+    require(
+        sqlx::query(
+            r#"
+            INSERT INTO ledger_postings
+              (transaction_id, posting_no, account_id, currency, amount_micros, created_at_ms)
+            VALUES ($1, 3, $2, 'USD', 1, 2)
+            "#,
+        )
+        .bind(transaction_id)
+        .bind(debit_id)
+        .execute(pool)
+        .await
+        .is_err(),
+        "sealed ledger transaction accepted another posting",
+    )
+}
+
 async fn execution_context_upgrade_case(pool: &PgPool) -> TestResult {
     for migration in [
         include_str!("../migrations/0000_legacy_reconciliation.sql"),
@@ -406,17 +536,17 @@ async fn verification_case(pool: &PgPool) -> TestResult {
     .execute(pool)
     .await
     .map_err(|error| format!("failed to create extra migration state: {error}"))?;
-    gateway_result(
-        verify_migrations(pool).await,
-        "verification must tolerate a newer applied migration",
+    require(
+        verify_migrations(pool).await.is_err(),
+        "verification must reject a database newer than the running binary",
     )?;
     sqlx::query("UPDATE _sqlx_migrations SET success = false WHERE version = 999")
         .execute(pool)
         .await
         .map_err(|error| format!("failed to alter newer migration state: {error}"))?;
-    gateway_result(
-        verify_migrations(pool).await,
-        "verification must only enforce embedded migration metadata",
+    require(
+        verify_migrations(pool).await.is_err(),
+        "verification must reject unsuccessful future migration metadata",
     )?;
     sqlx::query("DELETE FROM _sqlx_migrations WHERE version = 999")
         .execute(pool)
@@ -481,8 +611,8 @@ async fn shared_pool_case(pool: &PgPool) -> TestResult {
 
 async fn assert_expected_schema(pool: &PgPool) -> TestResult {
     require(
-        migration_versions(pool).await? == vec![0, 1, 2, 3, 4, 5, 6, 7, 8],
-        "applied migration versions must be exactly [0, 1, 2, 3, 4, 5, 6, 7, 8]",
+        migration_versions(pool).await? == vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+        "applied migration versions must be exactly [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]",
     )?;
 
     for (table, column) in REQUIRED_COLUMNS {

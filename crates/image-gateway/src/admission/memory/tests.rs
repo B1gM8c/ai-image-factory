@@ -5,8 +5,8 @@ use tokio::sync::Barrier;
 use uuid::Uuid;
 
 use super::super::{
-    AdmissionClaim, AdmissionError, AdmissionStore, AdmissionTicket, AttachJob, ClaimAdmission,
-    WorkOutcome,
+    AdmissionClaim, AdmissionContract, AdmissionError, AdmissionStore, AdmissionTicket, AttachJob,
+    ClaimAdmission, WorkOutcome,
 };
 use super::InMemoryAdmissionStore;
 
@@ -86,6 +86,7 @@ async fn attach(store: &InMemoryAdmissionStore, ticket: AdmissionTicket, job_id:
             schedule_weight: 1,
             schedule_priority: 1,
             schedule_cost: 1,
+            contract: AdmissionContract::LegacyV1,
         })
         .await
         .expect("attach must succeed");
@@ -179,6 +180,7 @@ async fn attach_requires_the_owner_and_an_object_command() {
                 schedule_weight: 1,
                 schedule_priority: 1,
                 schedule_cost: 1,
+                contract: AdmissionContract::LegacyV1,
             })
             .await,
         Err(AdmissionError::InvalidOwner)
@@ -196,6 +198,7 @@ async fn attach_requires_the_owner_and_an_object_command() {
                 schedule_weight: 1,
                 schedule_priority: 1,
                 schedule_cost: 1,
+                contract: AdmissionContract::LegacyV1,
             })
             .await,
         Err(AdmissionError::InvalidCommand)
@@ -346,6 +349,7 @@ async fn expired_deadlines_are_rejected_and_receiving_sessions_are_aborted() {
                 schedule_weight: 1,
                 schedule_priority: 1,
                 schedule_cost: 1,
+                contract: AdmissionContract::LegacyV1,
             })
             .await,
         Err(AdmissionError::Expired)

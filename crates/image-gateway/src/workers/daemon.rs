@@ -246,8 +246,12 @@ async fn hydrate_edit_job(
 fn map_admission_error(error: AdmissionError) -> ImageGatewayError {
     match error {
         AdmissionError::Expired => ImageGatewayError::timeout(),
+        AdmissionError::BillingLimitExceeded => ImageGatewayError::queue_overloaded(),
         AdmissionError::Unavailable => {
             ImageGatewayError::service_unavailable("durable work claim unavailable")
+        }
+        AdmissionError::PricingUnavailable => {
+            ImageGatewayError::service_unavailable("durable work pricing unavailable")
         }
         AdmissionError::InvalidOwner
         | AdmissionError::StaleLease

@@ -59,6 +59,13 @@ pub struct AttachJob {
     pub schedule_weight: u32,
     pub schedule_priority: u8,
     pub schedule_cost: u64,
+    pub contract: AdmissionContract,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AdmissionContract {
+    LegacyV1,
+    OutputEconomicsV2,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -122,6 +129,10 @@ pub enum AdmissionError {
     StaleLease,
     #[error("durable command payload must be a JSON object")]
     InvalidCommand,
+    #[error("no published price is available for this image route")]
+    PricingUnavailable,
+    #[error("billing credit is insufficient for this image request")]
+    BillingLimitExceeded,
 }
 
 pub(crate) fn validate_attach_request(request: &AttachJob) -> Result<(), AdmissionError> {

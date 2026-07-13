@@ -102,7 +102,9 @@ pub async fn verify_migrations(pool: &PgPool) -> Result<(), ImageGatewayError> {
 
     for (version, success, checksum) in &applied {
         if *version > latest_known_version {
-            continue;
+            return Err(verification_error(format!(
+                "database migration version {version} is newer than this binary"
+            )));
         }
         if !success {
             return Err(verification_error(format!(

@@ -7,6 +7,7 @@ mod config;
 mod core;
 pub mod database;
 mod docs;
+pub mod economics;
 mod error;
 mod execution;
 pub mod executor;

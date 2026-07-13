@@ -6,7 +6,8 @@ use image_scheduler_policy::{ScopeWeight, next_finish_tag};
 
 use super::{AttachedRunningWork, LockedAdmissionSession};
 use crate::admission::{
-    AdmissionError, AttachJob, AttachedWork, WorkLease, attach_operation, validate_attach_request,
+    AdmissionContract, AdmissionError, AttachJob, AttachedWork, WorkLease, attach_operation,
+    validate_attach_request,
 };
 
 const MAX_SCHEDULE_PRIORITY: u8 = 3;
@@ -137,11 +138,14 @@ pub(super) async fn attach_and_start_work(
     lease_duration_ms: i64,
 ) -> Result<WorkLease, AdmissionError> {
     validate_attach_request(&request)?;
+    if request.contract != AdmissionContract::LegacyV1 {
+        return Err(AdmissionError::InvalidCommand);
+    }
     let mut tx = pool.begin().await.map_err(unavailable)?;
     let now = database_now(&mut tx).await?;
     let session: Option<LockedAdmissionSession> = sqlx::query_as(
         r#"
-            SELECT tenant_id, operation, request_id, state, idempotency_key_digest,
+            SELECT tenant_id, api_profile, operation, request_id, state, idempotency_key_digest,
                    request_hash, deadline_at_ms, job_id
             FROM admission_sessions
             WHERE session_id = $1 AND owner_token = $2

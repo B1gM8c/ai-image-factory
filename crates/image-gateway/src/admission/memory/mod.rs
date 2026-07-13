@@ -207,6 +207,9 @@ impl AdmissionStore for InMemoryAdmissionStore {
 
     async fn attach(&self, request: AttachJob) -> Result<AttachedWork, AdmissionError> {
         validate_attach_request(&request)?;
+        if request.contract != super::AdmissionContract::LegacyV1 {
+            return Err(AdmissionError::InvalidCommand);
+        }
         let now = now_ms();
         let mut state = self.state.lock().await;
         let session = state

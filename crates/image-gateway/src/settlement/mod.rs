@@ -202,7 +202,9 @@ pub(super) fn validate_generation_result(
 fn map_admission_error(error: AdmissionError) -> ImageGatewayError {
     match error {
         AdmissionError::Expired => ImageGatewayError::timeout(),
-        AdmissionError::Unavailable => {
+        AdmissionError::Unavailable
+        | AdmissionError::PricingUnavailable
+        | AdmissionError::BillingLimitExceeded => {
             ImageGatewayError::service_unavailable("admission settlement unavailable")
         }
         AdmissionError::InvalidOwner

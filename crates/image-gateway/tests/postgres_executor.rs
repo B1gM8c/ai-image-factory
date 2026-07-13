@@ -3,6 +3,10 @@ use std::{collections::HashSet, env, sync::Arc, time::Duration};
 use gpt_image_2_gateway::database::{connect_test_pool_with_search_path, run_migrations};
 use gpt_image_2_gateway::{
     admission::WorkLease,
+    economics::{
+        EconomicReceipt, EconomicReceiptOutcome, EconomicSettlementStore,
+        PostgresEconomicSettlementStore,
+    },
     executor::{
         ExecutorClaimScope, ExecutorResultManifest, ExecutorSubmissionError,
         ExecutorSubmissionLease, ExecutorSubmissionOutcome, ExecutorSubmissionStore,
@@ -73,6 +77,262 @@ async fn concurrent_prepare_returns_one_stable_identity_set() -> TestResult {
         require(
             counts == (3, 3, 3, 3),
             format!("unexpected counts: {counts:?}"),
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
+async fn prepare_attaches_submissions_to_admission_owned_outputs() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let lease = seed_lease(&database.pool, "admission-output-worker", 2).await?;
+        let output_ids = [Uuid::new_v4(), Uuid::new_v4()];
+        let now = database_now(&database.pool).await?;
+        let mut tx = database.pool.begin().await.map_err(debug_error)?;
+        sqlx::query("UPDATE jobs SET economics_contract_version = 2 WHERE job_id = $1")
+            .bind(lease.job_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(debug_error)?;
+        for (output_index, output_id) in output_ids.into_iter().enumerate() {
+            sqlx::query(
+                r#"
+                INSERT INTO job_outputs
+                  (output_id, job_id, output_index, state, created_at_ms, updated_at_ms)
+                VALUES ($1, $2, $3, 'pending', $4, $4)
+                "#,
+            )
+            .bind(output_id)
+            .bind(lease.job_id)
+            .bind(output_index as i32)
+            .bind(now)
+            .execute(&mut *tx)
+            .await
+            .map_err(debug_error)?;
+        }
+        tx.commit().await.map_err(debug_error)?;
+
+        let prepared = PostgresExecutorSubmissionStore::new(database.pool.clone())
+            .prepare_for_lease(&lease)
+            .await
+            .map_err(debug_error)?;
+        require(
+            prepared
+                .iter()
+                .map(|item| item.output_id)
+                .collect::<Vec<_>>()
+                == output_ids.to_vec(),
+            "executor replaced admission-owned output identities",
+        )?;
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM job_outputs WHERE job_id = $1")
+            .bind(lease.job_id)
+            .fetch_one(&database.pool)
+            .await
+            .map_err(debug_error)?;
+        require(count == 2, "executor created duplicate customer outputs")
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
+async fn successful_provider_output_is_rated_exactly_once_from_frozen_quote() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let work = seed_lease(&database.pool, "economic-worker", 1).await?;
+        let executor = PostgresExecutorSubmissionStore::new(database.pool.clone());
+        let prepared = executor
+            .prepare_for_lease(&work)
+            .await
+            .map_err(debug_error)?;
+        seed_price_hold(&database.pool, &prepared[0], 0).await?;
+        activate_work(&database.pool, &work).await?;
+        let lease = claim_required(&executor, "economic-executor").await?;
+        executor.start(&lease).await.map_err(debug_error)?;
+        executor
+            .record_outcome(
+                &lease,
+                &ExecutorSubmissionOutcome::Succeeded(result_manifest(&lease)),
+            )
+            .await
+            .map_err(debug_error)?;
+
+        let economics = PostgresEconomicSettlementStore::new(database.pool.clone());
+        let receipt = EconomicReceipt::new(
+            lease.submission_id,
+            EconomicReceiptOutcome::Succeeded,
+            "provider.receipt.v1",
+            json!({"provider_request_id": "provider-1"}),
+        )
+        .map_err(debug_error)?;
+        let first = economics.settle(&receipt).await.map_err(debug_error)?;
+        let replay = economics.settle(&receipt).await.map_err(debug_error)?;
+        require(
+            first == replay,
+            "economic replay changed the settled identity",
+        )?;
+
+        let state: (String, String, i64, i64, i64, i64) = sqlx::query_as(
+            r#"
+            SELECT o.state, h.state,
+                   (SELECT COUNT(*) FROM provider_receipts WHERE submission_id = $1),
+                   (SELECT COUNT(*) FROM economic_metering_events WHERE output_id = $2),
+                   (SELECT COUNT(*) FROM rated_usage WHERE output_id = $2),
+                   (SELECT COUNT(*) FROM ledger_transactions WHERE source_output_id = $2)
+            FROM job_outputs o
+            JOIN output_holds h ON h.output_id = o.output_id
+            WHERE o.output_id = $2
+            "#,
+        )
+        .bind(lease.submission_id)
+        .bind(lease.output_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(
+            state == ("succeeded".to_string(), "settled".to_string(), 1, 1, 1, 0),
+            format!("unexpected economic settlement state: {state:?}"),
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
+async fn nonzero_rating_posts_one_balanced_customer_transaction() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let work = seed_lease(&database.pool, "ledger-worker", 1).await?;
+        let executor = PostgresExecutorSubmissionStore::new(database.pool.clone());
+        let prepared = executor
+            .prepare_for_lease(&work)
+            .await
+            .map_err(debug_error)?;
+        seed_price_hold(&database.pool, &prepared[0], 7).await?;
+        activate_work(&database.pool, &work).await?;
+        let lease = claim_required(&executor, "ledger-executor").await?;
+        executor.start(&lease).await.map_err(debug_error)?;
+        executor
+            .record_outcome(
+                &lease,
+                &ExecutorSubmissionOutcome::Succeeded(result_manifest(&lease)),
+            )
+            .await
+            .map_err(debug_error)?;
+
+        let settlement = PostgresEconomicSettlementStore::new(database.pool.clone())
+            .settle(
+                &EconomicReceipt::new(
+                    lease.submission_id,
+                    EconomicReceiptOutcome::Succeeded,
+                    "provider.receipt.v1",
+                    json!({"provider_request_id": "provider-paid"}),
+                )
+                .map_err(debug_error)?,
+            )
+            .await
+            .map_err(debug_error)?;
+        require(
+            settlement.customer_ledger_transaction_id.is_some(),
+            "nonzero customer charge omitted the ledger transaction",
+        )?;
+        let state: (i64, i64, i64, i64, i64) = sqlx::query_as(
+            r#"
+            SELECT a.held_micros, a.captured_micros, r.amount_micros,
+                   COUNT(p.posting_no)::BIGINT,
+                   COALESCE(SUM(p.amount_micros::NUMERIC), 0)::BIGINT
+            FROM billing_accounts a
+            JOIN rated_usage r ON r.output_id = $1
+            JOIN ledger_transactions t ON t.source_output_id = $1
+              AND t.transaction_type = 'customer_charge'
+            JOIN ledger_postings p ON p.transaction_id = t.transaction_id
+            WHERE a.tenant_id = $2 AND a.currency = 'USD'
+            GROUP BY a.held_micros, a.captured_micros, r.amount_micros
+            "#,
+        )
+        .bind(lease.output_id)
+        .bind(&lease.tenant_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(
+            state == (0, 7, 7, 2, 0),
+            format!("customer ledger is not exactly balanced: {state:?}"),
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
+async fn uncertain_provider_outcome_keeps_the_full_monetary_hold() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let work = seed_lease(&database.pool, "uncertain-economic-worker", 1).await?;
+        let executor = PostgresExecutorSubmissionStore::new(database.pool.clone());
+        let prepared = executor
+            .prepare_for_lease(&work)
+            .await
+            .map_err(debug_error)?;
+        seed_price_hold(&database.pool, &prepared[0], 7).await?;
+        activate_work(&database.pool, &work).await?;
+        let lease = claim_required(&executor, "uncertain-economic-executor").await?;
+        executor.start(&lease).await.map_err(debug_error)?;
+        executor
+            .record_outcome(
+                &lease,
+                &ExecutorSubmissionOutcome::Uncertain {
+                    error_code: "provider_result_unknown".to_string(),
+                },
+            )
+            .await
+            .map_err(debug_error)?;
+
+        let settlement = PostgresEconomicSettlementStore::new(database.pool.clone())
+            .settle(
+                &EconomicReceipt::new(
+                    lease.submission_id,
+                    EconomicReceiptOutcome::Uncertain,
+                    "provider.receipt.v1",
+                    json!({"reason": "provider_result_unknown"}),
+                )
+                .map_err(debug_error)?,
+            )
+            .await
+            .map_err(debug_error)?;
+        require(
+            settlement.rated_usage_id.is_none()
+                && settlement.customer_ledger_transaction_id.is_none(),
+            "uncertain output was charged",
+        )?;
+        let state: (String, String, i64, i64, i64, i64) = sqlx::query_as(
+            r#"
+            SELECT o.state, h.state, a.held_micros, a.captured_micros,
+                   (SELECT COUNT(*) FROM rated_usage WHERE output_id = $1),
+                   (SELECT COUNT(*) FROM ledger_transactions WHERE source_output_id = $1)
+            FROM job_outputs o
+            JOIN output_holds h ON h.output_id = o.output_id
+            JOIN billing_accounts a ON a.tenant_id = h.tenant_id AND a.currency = h.currency
+            WHERE o.output_id = $1
+            "#,
+        )
+        .bind(lease.output_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(
+            state == ("uncertain".to_string(), "held".to_string(), 7, 0, 0, 0),
+            format!("uncertain output changed its monetary hold: {state:?}"),
         )
     }
     .await;
@@ -694,6 +954,92 @@ async fn claim_required(
         .await
         .map_err(debug_error)?
         .ok_or_else(|| "executor claim returned none".to_string())
+}
+
+async fn seed_price_hold(
+    pool: &PgPool,
+    submission: &gpt_image_2_gateway::PreparedExecutorSubmission,
+    success_micros: i64,
+) -> TestResult {
+    let now = database_now(pool).await?;
+    let quote_id = Uuid::new_v4();
+    let price_version_id = Uuid::new_v4();
+    let mut tx = pool.begin().await.map_err(debug_error)?;
+    sqlx::query(
+        r#"
+        INSERT INTO price_versions
+          (price_version_id, price_key, version, api_profile, operation, provider_id, model,
+           currency, success_micros, failed_micros, no_effect_micros, state,
+           created_at_ms, updated_at_ms)
+        VALUES ($1, $2, 1, 'test', 'generation', $3, $4,
+                'USD', $5, 0, 0, 'retired', $6, $6)
+        "#,
+    )
+    .bind(price_version_id)
+    .bind(format!("test-price-{price_version_id}"))
+    .bind(&submission.provider_id)
+    .bind(&submission.model)
+    .bind(success_micros)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .map_err(debug_error)?;
+    sqlx::query(
+        r#"
+        INSERT INTO billing_accounts
+          (tenant_id, currency, credit_limit_micros, held_micros, captured_micros,
+           created_at_ms, updated_at_ms)
+        VALUES ($1, 'USD', $2, $2, 0, $3, $3)
+        "#,
+    )
+    .bind(&submission.tenant_id)
+    .bind(success_micros)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .map_err(debug_error)?;
+    sqlx::query(
+        r#"
+        INSERT INTO price_quotes
+          (quote_id, job_id, price_version_id, currency, output_count,
+           success_micros, failed_micros, no_effect_micros, max_total_micros,
+           quote_hash, created_at_ms)
+        VALUES ($1, $2, $3, 'USD', 1, $4, 0, 0, $4, $5, $6)
+        "#,
+    )
+    .bind(quote_id)
+    .bind(submission.job_id)
+    .bind(price_version_id)
+    .bind(success_micros)
+    .bind("e".repeat(64))
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .map_err(debug_error)?;
+    sqlx::query(
+        r#"
+        INSERT INTO output_holds
+          (output_id, job_id, quote_id, tenant_id, currency, held_micros,
+           state, created_at_ms, updated_at_ms)
+        VALUES ($1, $2, $3, $4, 'USD', $5, 'held', $6, $6)
+        "#,
+    )
+    .bind(submission.output_id)
+    .bind(submission.job_id)
+    .bind(quote_id)
+    .bind(&submission.tenant_id)
+    .bind(success_micros)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .map_err(debug_error)?;
+    sqlx::query("UPDATE jobs SET economics_contract_version = 2 WHERE job_id = $1")
+        .bind(submission.job_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(debug_error)?;
+    tx.commit().await.map_err(debug_error)?;
+    Ok(())
 }
 
 async fn seed_lease(pool: &PgPool, worker_id: &str, requested_units: i32) -> TestResult<WorkLease> {

@@ -35,6 +35,7 @@ impl PostgresExecutorSubmissionStore {
 #[derive(sqlx::FromRow)]
 struct DurableCommandRow {
     requested_units: i32,
+    economics_contract_version: i16,
     tenant_id: String,
     provider_id: String,
     model: String,
@@ -121,11 +122,30 @@ impl ExecutorSubmissionStore for PostgresExecutorSubmissionStore {
 
         let existing = load_existing(&mut tx, lease.job_id).await?;
         if !existing.is_empty() {
+            if existing.iter().all(|row| row.submission_id.is_none()) {
+                if command.economics_contract_version != 2 {
+                    return Err(ExecutorSubmissionError::Conflict);
+                }
+                let prepared = prepare_admission_outputs(
+                    &mut tx,
+                    existing,
+                    lease,
+                    output_count,
+                    &command_hash,
+                    &command,
+                )
+                .await?;
+                tx.commit().await.map_err(unavailable)?;
+                return Ok(prepared);
+            }
             let prepared =
                 rebuild_existing(existing, lease, output_count, &command_hash, &command)?;
             attach_attempts(&mut tx, lease, &prepared).await?;
             tx.commit().await.map_err(unavailable)?;
             return Ok(prepared);
+        }
+        if command.economics_contract_version == 2 {
+            return Err(ExecutorSubmissionError::Conflict);
         }
 
         let now = database_now(&mut tx).await?;
@@ -554,9 +574,9 @@ async fn lock_durable_command(
     tx: &mut Transaction<'_, Postgres>,
     lease: &WorkLease,
 ) -> Result<DurableCommandRow, ExecutorSubmissionError> {
-    let job: Option<(i32, String, String, String)> = sqlx::query_as(
+    let job: Option<(i32, i16, String, String, String)> = sqlx::query_as(
         r#"
-        SELECT requested_units, tenant_id, provider_id, model
+        SELECT requested_units, economics_contract_version, tenant_id, provider_id, model
         FROM jobs
         WHERE job_id = $1 AND state IN ('reserved', 'queued', 'running')
         FOR UPDATE
@@ -566,7 +586,8 @@ async fn lock_durable_command(
     .fetch_optional(&mut **tx)
     .await
     .map_err(unavailable)?;
-    let Some((requested_units, tenant_id, provider_id, model)) = job else {
+    let Some((requested_units, economics_contract_version, tenant_id, provider_id, model)) = job
+    else {
         return Err(ExecutorSubmissionError::StaleLease);
     };
     let payload: Option<(String, Value)> = sqlx::query_as(
@@ -599,12 +620,93 @@ async fn lock_durable_command(
     };
     Ok(DurableCommandRow {
         requested_units,
+        economics_contract_version,
         tenant_id,
         provider_id,
         model,
         command_schema,
         command_json,
     })
+}
+
+async fn prepare_admission_outputs(
+    tx: &mut Transaction<'_, Postgres>,
+    rows: Vec<ExistingIdentityRow>,
+    lease: &WorkLease,
+    output_count: i32,
+    command_hash: &str,
+    command: &DurableCommandRow,
+) -> Result<Vec<PreparedExecutorSubmission>, ExecutorSubmissionError> {
+    if rows.len() != output_count as usize
+        || rows
+            .iter()
+            .enumerate()
+            .any(|(index, row)| row.output_index != index as i32 || row.submission_id.is_some())
+    {
+        return Err(ExecutorSubmissionError::Conflict);
+    }
+    let now = database_now(tx).await?;
+    let mut prepared = Vec::with_capacity(rows.len());
+    for row in rows {
+        let submission_id = Uuid::new_v4();
+        let executor_execution_id = distinct_execution_id(lease.execution_id);
+        sqlx::query(
+            r#"
+            INSERT INTO provider_submissions
+              (submission_id, executor_execution_id, output_id, job_id,
+               tenant_id, provider_id, model, work_item_id,
+               created_by_execution_id, created_by_lease_epoch, command_schema, command_hash,
+               state, prepared_at_ms, updated_at_ms)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+                    'prepared', $13, $13)
+            "#,
+        )
+        .bind(submission_id)
+        .bind(executor_execution_id)
+        .bind(row.output_id)
+        .bind(lease.job_id)
+        .bind(&command.tenant_id)
+        .bind(&command.provider_id)
+        .bind(&command.model)
+        .bind(lease.work_item_id)
+        .bind(lease.execution_id)
+        .bind(lease.lease_epoch)
+        .bind(&lease.command_schema)
+        .bind(command_hash)
+        .bind(now)
+        .execute(&mut **tx)
+        .await
+        .map_err(unavailable)?;
+        sqlx::query(
+            r#"
+            INSERT INTO executor_executions
+              (executor_execution_id, submission_id, state, created_at_ms, updated_at_ms)
+            VALUES ($1, $2, 'prepared', $3, $3)
+            "#,
+        )
+        .bind(executor_execution_id)
+        .bind(submission_id)
+        .bind(now)
+        .execute(&mut **tx)
+        .await
+        .map_err(unavailable)?;
+        let submission = PreparedExecutorSubmission {
+            submission_id,
+            executor_execution_id,
+            output_id: row.output_id,
+            job_id: lease.job_id,
+            tenant_id: command.tenant_id.clone(),
+            provider_id: command.provider_id.clone(),
+            model: command.model.clone(),
+            work_item_id: lease.work_item_id,
+            output_index: row.output_index,
+            command_schema: lease.command_schema.clone(),
+            command_hash: command_hash.to_string(),
+        };
+        insert_attachment(tx, lease, submission_id, now).await?;
+        prepared.push(submission);
+    }
+    Ok(prepared)
 }
 
 async fn load_existing(

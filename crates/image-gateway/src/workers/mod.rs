@@ -475,7 +475,9 @@ fn duration_ms(duration: Duration) -> i64 {
 fn map_admission_error(error: AdmissionError) -> ImageGatewayError {
     match error {
         AdmissionError::Expired => ImageGatewayError::timeout(),
+        AdmissionError::BillingLimitExceeded => ImageGatewayError::queue_overloaded(),
         AdmissionError::Unavailable
+        | AdmissionError::PricingUnavailable
         | AdmissionError::InvalidOwner
         | AdmissionError::StaleLease
         | AdmissionError::InvalidCommand => {

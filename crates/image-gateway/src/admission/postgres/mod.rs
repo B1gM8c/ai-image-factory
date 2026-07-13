@@ -3,11 +3,14 @@ use serde_json::{Value, json};
 use sqlx::PgPool;
 use uuid::Uuid;
 
+use crate::economics::{admit_job_outputs, validate_admitted_job_outputs};
+
 mod operations;
 
 use super::{
-    AdmissionClaim, AdmissionError, AdmissionStore, AdmissionTicket, AttachJob, AttachedWork,
-    ClaimAdmission, WorkLease, WorkOutcome, attach_operation, validate_attach_request,
+    AdmissionClaim, AdmissionContract, AdmissionError, AdmissionStore, AdmissionTicket, AttachJob,
+    AttachedWork, ClaimAdmission, WorkLease, WorkOutcome, attach_operation,
+    validate_attach_request,
 };
 use operations::{
     abort_receiving_session, append_event_pair, attach_and_start_work, bind_quota_reservation,
@@ -23,6 +26,7 @@ pub struct PostgresAdmissionStore {
 #[derive(sqlx::FromRow)]
 struct LockedAdmissionSession {
     tenant_id: String,
+    api_profile: String,
     operation: String,
     request_id: String,
     state: String,
@@ -299,7 +303,7 @@ impl AdmissionStore for PostgresAdmissionStore {
         let now = database_now(&mut tx).await?;
         let session: Option<LockedAdmissionSession> = sqlx::query_as(
             r#"
-            SELECT tenant_id, operation, request_id, state, idempotency_key_digest,
+            SELECT tenant_id, api_profile, operation, request_id, state, idempotency_key_digest,
                    request_hash, deadline_at_ms, job_id
             FROM admission_sessions
             WHERE session_id = $1 AND owner_token = $2
@@ -330,6 +334,23 @@ impl AdmissionStore for PostgresAdmissionStore {
         }
         if session.state == "attached" && session.job_id == Some(request.job_id) {
             bind_quota_reservation(&mut tx, &request, &session, now).await?;
+            match request.contract {
+                AdmissionContract::LegacyV1 => {
+                    let version: Option<i16> = sqlx::query_scalar(
+                        "SELECT economics_contract_version FROM jobs WHERE job_id = $1",
+                    )
+                    .bind(request.job_id)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(unavailable)?;
+                    if version != Some(1) {
+                        return Err(AdmissionError::InvalidOwner);
+                    }
+                }
+                AdmissionContract::OutputEconomicsV2 => {
+                    validate_admitted_job_outputs(&mut tx, &request).await?;
+                }
+            }
             let attached = replay_attached_work(&mut tx, &request).await?;
             tx.commit().await.map_err(unavailable)?;
             return Ok(attached);
@@ -343,6 +364,9 @@ impl AdmissionStore for PostgresAdmissionStore {
             return Err(AdmissionError::Expired);
         }
         bind_quota_reservation(&mut tx, &request, &session, now).await?;
+        if request.contract == AdmissionContract::OutputEconomicsV2 {
+            admit_job_outputs(&mut tx, &request, &session.api_profile, now).await?;
+        }
         persist_inputs(&mut tx, &request, now).await?;
 
         sqlx::query(
