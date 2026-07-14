@@ -287,6 +287,78 @@ fn marker_permissions_and_hardlinks_fail_integrity_validation() {
 
 #[cfg(unix)]
 #[test]
+fn preexisting_wide_directories_are_rejected_without_permission_repair() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root_temp = TempDir::new().unwrap();
+    let root = root_temp.path().join("journal");
+    fs::create_dir(&root).unwrap();
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o750)).unwrap();
+    assert!(matches!(
+        FilesystemRunnerJournal::new(&root),
+        Err(RunnerJournalError::InvalidInput)
+    ));
+    assert_eq!(
+        fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+        0o750
+    );
+
+    let execution_temp = TempDir::new().unwrap();
+    let execution_root = execution_temp.path().join("journal");
+    let journal = FilesystemRunnerJournal::new(&execution_root).unwrap();
+    let lease = lease();
+    let execution = execution_dir(execution_temp.path(), &lease);
+    fs::create_dir(&execution).unwrap();
+    fs::set_permissions(&execution, fs::Permissions::from_mode(0o750)).unwrap();
+    assert_eq!(
+        journal.start_or_attach(&lease),
+        Err(RunnerJournalError::Integrity)
+    );
+    assert_eq!(
+        fs::metadata(&execution).unwrap().permissions().mode() & 0o777,
+        0o750
+    );
+}
+
+#[test]
+fn terminal_manifest_uses_the_same_size_mime_and_error_code_boundary_as_postgres() {
+    let (_temp, journal) = journal();
+    let lease = lease();
+    journal.start_or_attach(&lease).unwrap();
+    journal.commit_launch(&lease).unwrap();
+
+    let RunnerOutcome::Succeeded(base) = success() else {
+        unreachable!();
+    };
+    let oversized = RunnerOutcome::Succeeded(ExecutorResultManifest {
+        byte_size: 256 * 1024 * 1024 + 1,
+        ..base.clone()
+    });
+    assert_eq!(
+        journal.publish_terminal(&lease, &oversized),
+        Err(RunnerJournalError::InvalidInput)
+    );
+    let unsupported_mime = RunnerOutcome::Succeeded(ExecutorResultManifest {
+        media_type: "image/gif".to_string(),
+        ..base
+    });
+    assert_eq!(
+        journal.publish_terminal(&lease, &unsupported_mime),
+        Err(RunnerJournalError::InvalidInput)
+    );
+    assert_eq!(
+        journal.publish_terminal(
+            &lease,
+            &RunnerOutcome::Failed {
+                error_code: "not allowed".to_string(),
+            }
+        ),
+        Err(RunnerJournalError::InvalidInput)
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn fifo_marker_is_rejected_without_blocking() {
     use std::{ffi::CString, os::unix::ffi::OsStrExt};
 

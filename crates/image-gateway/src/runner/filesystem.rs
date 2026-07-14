@@ -12,7 +12,10 @@ use rustix::{
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use uuid::Uuid;
 
-use crate::executor::{ExecutorResultManifest, ExecutorSubmissionLease, RunnerOutcome};
+use crate::executor::{
+    ExecutorResultManifest, ExecutorSubmissionLease, RunnerOutcome, error_code_is_valid,
+    result_manifest_is_valid,
+};
 
 use super::{LaunchDecision, RunnerJournalError, RunnerJournalObservation};
 
@@ -198,7 +201,6 @@ impl FilesystemRunnerJournal {
             Mode::empty(),
         )
         .map_err(|_| RunnerJournalError::Integrity)?;
-        rfs::fchmod(&fd, Mode::RWXU).map_err(|_| RunnerJournalError::Unavailable)?;
         validate_directory_fd(&fd, RunnerJournalError::Integrity)?;
         Ok(ExecutionDirectory { fd })
     }
@@ -331,10 +333,10 @@ impl DiskTerminal {
                 })
             }
             RunnerOutcome::Failed { error_code } => Ok(Self::Failed {
-                error_code: validated_input_text(error_code)?,
+                error_code: validated_error_code(error_code)?,
             }),
             RunnerOutcome::Uncertain { error_code } => Ok(Self::Uncertain {
-                error_code: validated_input_text(error_code)?,
+                error_code: validated_error_code(error_code)?,
             }),
         }
     }
@@ -378,7 +380,7 @@ fn prepare_root(root: &Path) -> Result<PathBuf, RunnerJournalError> {
     }
     match fs::symlink_metadata(root) {
         Ok(_) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => match fs::create_dir(root) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => match create_private_dir(root) {
             Ok(()) => sync_parent(root)?,
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
             Err(_) => return Err(RunnerJournalError::Unavailable),
@@ -400,11 +402,11 @@ fn secure_directory(path: &Path, invalid: RunnerJournalError) -> Result<(), Runn
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
         // SAFETY: geteuid has no preconditions and does not dereference pointers.
-        if metadata.uid() != unsafe { libc::geteuid() } {
+        if metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.permissions().mode() & 0o777 != 0o700
+        {
             return Err(invalid);
         }
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700))
-            .map_err(|_| RunnerJournalError::Unavailable)?;
     }
     Ok(())
 }
@@ -560,24 +562,16 @@ fn validate_manifest(
     manifest: &ExecutorResultManifest,
     error: RunnerJournalError,
 ) -> Result<(), RunnerJournalError> {
-    if manifest.byte_size == 0 || !is_sha256(&manifest.sha256_hex) {
+    if !result_manifest_is_valid(manifest) {
         return Err(error);
-    }
-    for value in [
-        &manifest.storage_backend,
-        &manifest.object_key,
-        &manifest.media_type,
-    ] {
-        if validate_text(value).is_err() {
-            return Err(error);
-        }
     }
     Ok(())
 }
 
-fn validated_input_text(value: &str) -> Result<String, RunnerJournalError> {
-    validate_input_text(value)?;
-    Ok(value.to_string())
+fn validated_error_code(value: &str) -> Result<String, RunnerJournalError> {
+    error_code_is_valid(value)
+        .then(|| value.to_string())
+        .ok_or(RunnerJournalError::InvalidInput)
 }
 
 fn validate_input_text(value: &str) -> Result<(), RunnerJournalError> {
@@ -625,19 +619,38 @@ impl DiskTerminal {
                 media_type,
             } => {
                 parse_uuid(manifest_id)?;
-                if *byte_size == 0 || !is_sha256(sha256_hex) {
-                    return Err(RunnerJournalError::Integrity);
-                }
-                for value in [storage_backend, object_key, media_type] {
-                    validate_text(value)?;
-                }
-                Ok(())
+                let manifest = ExecutorResultManifest {
+                    manifest_id: parse_uuid(manifest_id)?,
+                    storage_backend: storage_backend.clone(),
+                    object_key: object_key.clone(),
+                    sha256_hex: sha256_hex.clone(),
+                    byte_size: *byte_size,
+                    media_type: media_type.clone(),
+                };
+                result_manifest_is_valid(&manifest)
+                    .then_some(())
+                    .ok_or(RunnerJournalError::Integrity)
             }
             Self::Failed { error_code } | Self::Uncertain { error_code } => {
-                validate_text(error_code)
+                error_code_is_valid(error_code)
+                    .then_some(())
+                    .ok_or(RunnerJournalError::Integrity)
             }
         }
     }
+}
+
+#[cfg(unix)]
+fn create_private_dir(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+
+    let mut builder = fs::DirBuilder::new();
+    builder.mode(0o700).create(path)
+}
+
+#[cfg(not(unix))]
+fn create_private_dir(path: &Path) -> io::Result<()> {
+    fs::create_dir(path)
 }
 
 #[cfg(test)]

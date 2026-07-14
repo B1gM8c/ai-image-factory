@@ -8,9 +8,9 @@ use gpt_image_2_gateway::{
         PostgresEconomicSettlementStore,
     },
     executor::{
-        ExecutorClaimScope, ExecutorResultManifest, ExecutorSubmissionError,
-        ExecutorSubmissionLease, ExecutorSubmissionOutcome, ExecutorSubmissionStore,
-        PostgresExecutorSubmissionStore,
+        ExecutorClaimScope, ExecutorLaunchContextStore, ExecutorResultManifest,
+        ExecutorSubmissionError, ExecutorSubmissionLease, ExecutorSubmissionOutcome,
+        ExecutorSubmissionStore, PostgresExecutorSubmissionStore,
     },
 };
 use serde_json::json;
@@ -1225,6 +1225,113 @@ async fn resume_running_fences_owner_scope_state_and_database_expiry() -> TestRe
                 .map_err(debug_error)?
                 .is_none(),
             "expired running execution was resumable",
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
+async fn launch_context_is_loaded_only_for_the_exact_running_lease() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let work = seed_lease(&database.pool, "launch-context-worker", 2).await?;
+        let store = PostgresExecutorSubmissionStore::new(database.pool.clone());
+        store.prepare_for_lease(&work).await.map_err(debug_error)?;
+        activate_work(&database.pool, &work).await?;
+        let lease = claim_required(&store, "launch-context-executor").await?;
+
+        require(
+            store.load_launch_context(&lease).await == Err(ExecutorSubmissionError::StaleLease),
+            "leased execution exposed launch context before start",
+        )?;
+        store.start(&lease).await.map_err(debug_error)?;
+
+        let context = store
+            .load_launch_context(&lease)
+            .await
+            .map_err(debug_error)?;
+        require(
+            context.request_id().starts_with("request-"),
+            "launch context lost request identity",
+        )?;
+        require(
+            context.api_profile() == "openai-images-v1",
+            "launch context lost API profile",
+        )?;
+        require(
+            context.output_index() == lease.output_index,
+            "launch context changed output index",
+        )?;
+        require(
+            context.command_schema() == lease.command_schema
+                && context.command_hash() == lease.command_hash
+                && context.command_json() == &work.command_json,
+            "launch context changed the immutable command",
+        )?;
+
+        let mut forged = lease.clone();
+        forged.executor_owner = "other-executor".to_string();
+        require(
+            store.load_launch_context(&forged).await == Err(ExecutorSubmissionError::StaleLease),
+            "forged owner loaded launch context",
+        )?;
+        forged = lease.clone();
+        forged.executor_lease_epoch += 1;
+        require(
+            store.load_launch_context(&forged).await == Err(ExecutorSubmissionError::StaleLease),
+            "forged epoch loaded launch context",
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
+async fn launch_context_rejects_command_tampering_and_expired_lease() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let work = seed_lease(&database.pool, "launch-integrity-worker", 1).await?;
+        let store = PostgresExecutorSubmissionStore::new(database.pool.clone());
+        store.prepare_for_lease(&work).await.map_err(debug_error)?;
+        activate_work(&database.pool, &work).await?;
+        let lease = claim_required(&store, "launch-integrity-executor").await?;
+        store.start(&lease).await.map_err(debug_error)?;
+
+        sqlx::query(
+            "UPDATE job_payloads SET command_json = jsonb_set(command_json, '{prompt}', '\"tampered\"') WHERE job_id = $1",
+        )
+        .bind(lease.job_id)
+        .execute(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(
+            store.load_launch_context(&lease).await
+                == Err(ExecutorSubmissionError::Conflict),
+            "tampered command passed canonical hash validation",
+        )?;
+
+        sqlx::query("UPDATE job_payloads SET command_json = $2 WHERE job_id = $1")
+            .bind(lease.job_id)
+            .bind(&work.command_json)
+            .execute(&database.pool)
+            .await
+            .map_err(debug_error)?;
+        sqlx::query(
+            "UPDATE executor_executions SET lease_expires_at_ms = floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT - 1 WHERE executor_execution_id = $1",
+        )
+        .bind(lease.executor_execution_id)
+        .execute(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(
+            store.load_launch_context(&lease).await
+                == Err(ExecutorSubmissionError::StaleLease),
+            "expired lease loaded launch context",
         )
     }
     .await;

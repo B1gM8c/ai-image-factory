@@ -4,8 +4,9 @@ use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
 use super::{
-    ExecutorClaimScope, ExecutorResultManifest, ExecutorSubmissionError, ExecutorSubmissionLease,
-    ExecutorSubmissionOutcome, ExecutorSubmissionStore, PreparedExecutorSubmission,
+    ExecutorClaimScope, ExecutorLaunchContext, ExecutorLaunchContextStore, ExecutorResultManifest,
+    ExecutorSubmissionError, ExecutorSubmissionLease, ExecutorSubmissionOutcome,
+    ExecutorSubmissionStore, PreparedExecutorSubmission,
 };
 use crate::admission::WorkLease;
 
@@ -118,6 +119,93 @@ struct LockedExecutorRow {
     executor_owner: Option<String>,
     lease_epoch: i64,
     lease_expires_at_ms: Option<i64>,
+}
+
+#[derive(sqlx::FromRow)]
+struct LaunchContextRow {
+    request_id: String,
+    api_profile: String,
+    output_index: i32,
+    command_schema: String,
+    command_hash: String,
+    command_json: Value,
+}
+
+#[async_trait]
+impl ExecutorLaunchContextStore for PostgresExecutorSubmissionStore {
+    async fn load_launch_context(
+        &self,
+        lease: &ExecutorSubmissionLease,
+    ) -> Result<ExecutorLaunchContext, ExecutorSubmissionError> {
+        validate_executor_lease(lease)?;
+        let row: LaunchContextRow = sqlx::query_as(
+            r#"
+            WITH db_clock AS (
+              SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT AS now_ms
+            )
+            SELECT j.request_id, a.api_profile, o.output_index,
+                   p.command_schema, s.command_hash, p.command_json
+            FROM executor_executions e
+            JOIN provider_submissions s
+              ON s.executor_execution_id = e.executor_execution_id
+             AND s.submission_id = e.submission_id
+            JOIN job_outputs o ON o.output_id = s.output_id AND o.job_id = s.job_id
+            JOIN jobs j
+              ON j.job_id = s.job_id
+             AND j.tenant_id = s.tenant_id
+             AND j.provider_id = s.provider_id
+             AND j.model = s.model
+            JOIN job_payloads p ON p.job_id = s.job_id
+            JOIN admission_sessions a
+              ON a.session_id = p.admission_session_id
+             AND a.job_id = s.job_id
+             AND a.tenant_id = s.tenant_id
+             AND a.request_id = j.request_id
+            CROSS JOIN db_clock
+            WHERE e.executor_execution_id = $1 AND e.submission_id = $2
+              AND s.output_id = $3 AND s.job_id = $4 AND s.tenant_id = $5
+              AND s.provider_id = $6 AND s.model = $7 AND s.work_item_id = $8
+              AND o.output_index = $9
+              AND s.command_schema = $10 AND s.command_hash = $11
+              AND p.command_schema = s.command_schema
+              AND e.state = 'running' AND s.state = 'running'
+              AND e.executor_owner = $12 AND e.lease_epoch = $13
+              AND e.lease_expires_at_ms > db_clock.now_ms
+            "#,
+        )
+        .bind(lease.executor_execution_id)
+        .bind(lease.submission_id)
+        .bind(lease.output_id)
+        .bind(lease.job_id)
+        .bind(&lease.tenant_id)
+        .bind(&lease.provider_id)
+        .bind(&lease.model)
+        .bind(lease.work_item_id)
+        .bind(lease.output_index)
+        .bind(&lease.command_schema)
+        .bind(&lease.command_hash)
+        .bind(&lease.executor_owner)
+        .bind(lease.executor_lease_epoch)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(unavailable)?
+        .ok_or(ExecutorSubmissionError::StaleLease)?;
+        if row.output_index != lease.output_index
+            || row.command_schema != lease.command_schema
+            || row.command_hash != lease.command_hash
+            || command_hash(&row.command_json)? != lease.command_hash
+        {
+            return Err(ExecutorSubmissionError::Conflict);
+        }
+        Ok(ExecutorLaunchContext {
+            request_id: row.request_id,
+            api_profile: row.api_profile,
+            output_index: row.output_index,
+            command_schema: row.command_schema,
+            command_hash: row.command_hash,
+            command_json: row.command_json,
+        })
+    }
 }
 
 #[async_trait]

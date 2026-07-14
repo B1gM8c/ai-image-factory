@@ -5,12 +5,12 @@ use uuid::Uuid;
 use crate::admission::WorkLease;
 
 use super::super::{
-    ExecutorClaimScope, ExecutorSubmissionError, ExecutorSubmissionLease, ExecutorSubmissionOutcome,
+    ExecutorClaimScope, ExecutorSubmissionError, ExecutorSubmissionLease,
+    ExecutorSubmissionOutcome, error_code_is_valid, result_manifest_is_valid,
 };
 
 const MAX_IMAGE_OUTPUTS: i32 = 10;
 const MAX_EXECUTOR_LEASE_MS: i64 = 24 * 60 * 60 * 1_000;
-const MAX_RESULT_BYTES: u64 = 256 * 1024 * 1024;
 
 pub(super) fn command_output_count(
     requested_units: i32,
@@ -89,7 +89,7 @@ pub(super) fn validate_outcome(
     outcome: &ExecutorSubmissionOutcome,
 ) -> Result<(), ExecutorSubmissionError> {
     if let Some(error_code) = outcome.error_code() {
-        return if is_error_code(error_code) {
+        return if error_code_is_valid(error_code) {
             Ok(())
         } else {
             Err(ExecutorSubmissionError::InvalidInput)
@@ -98,22 +98,7 @@ pub(super) fn validate_outcome(
     let manifest = outcome
         .manifest()
         .ok_or(ExecutorSubmissionError::InvalidInput)?;
-    if manifest.storage_backend.is_empty()
-        || manifest.storage_backend.len() > 128
-        || manifest.object_key.is_empty()
-        || manifest.object_key.len() > 1_024
-        || manifest
-            .object_key
-            .bytes()
-            .any(|byte| byte.is_ascii_control())
-        || !is_sha256(&manifest.sha256_hex)
-        || manifest.byte_size == 0
-        || manifest.byte_size > MAX_RESULT_BYTES
-        || !matches!(
-            manifest.media_type.as_str(),
-            "image/png" | "image/jpeg" | "image/webp"
-        )
-    {
+    if !result_manifest_is_valid(manifest) {
         return Err(ExecutorSubmissionError::InvalidInput);
     }
     Ok(())
@@ -138,19 +123,4 @@ fn is_bounded_identifier(value: &str) -> bool {
 
 fn is_executor_owner(value: &str) -> bool {
     !value.is_empty() && value.len() <= 128 && value.bytes().all(|byte| byte.is_ascii_graphic())
-}
-
-fn is_error_code(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 128
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
-}
-
-fn is_sha256(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }

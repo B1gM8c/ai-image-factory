@@ -38,9 +38,9 @@ pub use execution::{
     PersistedEditInput, PostgresExecutionContextStore,
 };
 pub use executor::{
-    ExecutorClaimScope, ExecutorResultManifest, ExecutorSubmissionError, ExecutorSubmissionLease,
-    ExecutorSubmissionOutcome, ExecutorSubmissionStore, PostgresExecutorSubmissionStore,
-    PreparedExecutorSubmission,
+    ExecutorClaimScope, ExecutorLaunchContext, ExecutorLaunchContextStore, ExecutorResultManifest,
+    ExecutorSubmissionError, ExecutorSubmissionLease, ExecutorSubmissionOutcome,
+    ExecutorSubmissionStore, PostgresExecutorSubmissionStore, PreparedExecutorSubmission,
 };
 pub use generator::{
     CodexImageGenerator, EditJob, GeneratedImage, GenerationJob, ImageGenerator, InputImage,

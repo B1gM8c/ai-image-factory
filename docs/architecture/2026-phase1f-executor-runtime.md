@@ -1,13 +1,15 @@
 # Phase 1F: Persistent Executor Runtime
 
-Status: runtime kernel checkpoint implemented. The production Images API
-remains on `LegacyV1` until every activation gate in this document passes.
+Status: runtime kernel and canonical launch-context checkpoint implemented. The
+production Images API remains on `LegacyV1` until every activation gate in this
+document passes.
 
 The checkpoint includes the executor daemon application port, owner-and-scope
 resume of unexpired running executions, idempotent database start replay,
-pre-launch lease renewal, and a dirfd-bound filesystem journal with atomic
-no-replace launch and terminal markers. It does not yet include an executord
-binary or provider process supervisor.
+pre-launch lease renewal, an exact-lease PostgreSQL launch-context projection,
+and a dirfd-bound filesystem journal with atomic no-replace launch and terminal
+markers. It does not yet include an executord binary or provider process
+supervisor.
 
 ## 1. Scope
 
@@ -58,6 +60,13 @@ database-bound executor lease and no client-controlled command, environment, or
 credential material. Provider adapters are selected from the trusted
 `provider_id` and `command_schema` scope configured for executord.
 
+Immediately before launch, executord resolves the immutable command through
+`ExecutorLaunchContextStore`. The lookup requires an exact unexpired `running`
+executor identity, owner, epoch, submission, output, provider, model, work item,
+schema, and command hash. It uses PostgreSQL time and recomputes the canonical
+command hash. The resulting context intentionally does not implement `Debug`:
+it may contain a prompt and is transient authority data, never journal data.
+
 A restarted executord may resume an unexpired `running` execution only when the
 stored owner and scope match exactly. Resume does not change the owner, epoch,
 or expiry. A `leased`, expired, differently owned, or differently scoped row is
@@ -81,9 +90,12 @@ For one `executor_execution_id`, the durable runner must enforce:
     rejection.
 
 The journal and spool must reject symlinks, traversal, non-regular files,
-unbounded files, and ownership or permission mismatches. Process attachment
-must validate more than a reusable PID; Linux deployments should bind the PID
-to a process start-time or pidfd identity.
+unbounded files, and ownership or permission mismatches. Existing directories
+with wider permissions are rejected rather than repaired. Journal and database
+terminal validation share the same byte limit, MIME allowlist, object metadata,
+SHA-256, and error-code boundary. Process attachment must validate more than a
+reusable PID; Linux deployments should bind the PID to a process start-time or
+pidfd identity.
 
 ## 5. Lease And Crash Semantics
 
@@ -140,9 +152,16 @@ The socket is not a public API and does not reuse the official Images facade.
 
 Each slice is additive. `LegacyV1` remains the default until slice 7 passes.
 
-At this checkpoint, slices 1 and 2 are complete and the durable journal portion
-of slice 3 is complete. Process attachment, process identity, private output
+At this checkpoint, slices 1 and 2 are complete, the durable journal portion of
+slice 3 is complete, and the exact-lease canonical context projection required
+by slice 4 is complete. Process attachment, process identity, private output
 spooling, and artifact publication remain part of slices 3 through 5.
+
+The current `ImageGenerator` interface is job-level and may loop over `n`.
+Provider submissions are output-level, so executord must not call that interface
+with the original command. Each adapter must expose a trusted single-output
+operation bound to `output_index`; otherwise an `n`-output request could launch
+the provider `n * n` times.
 
 Two schema capabilities remain explicit activation blockers after the first
 daemon slice:
@@ -153,6 +172,13 @@ daemon slice:
 - an artifact-authority reference proving every successful executor manifest
   names an already durable immutable object, rather than trusting caller-supplied
   object metadata.
+
+These blockers are implemented before production child-process wiring. A child
+protocol also requires a versioned adapter revision, resource policy, stable
+process identity, bounded private UDS framing, peer credential checks, an
+absolute executable allowlist, `env_clear()`, and an external sandbox boundary.
+The existing shared Codex `HOME` and ambient executable lookup are not a
+multi-tenant isolation boundary and must not be reused by V2.
 
 ## 8. Activation Gates
 
