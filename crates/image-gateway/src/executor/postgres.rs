@@ -17,7 +17,7 @@ mod validation;
 
 use validation::{
     command_hash, command_output_count, distinct_execution_id, validate_claim_scope,
-    validate_executor_lease, validate_lease_duration, validate_outcome,
+    validate_executor_lease, validate_lease_duration, validate_outcome, validate_owner,
     validate_owner_and_duration, validate_work_lease,
 };
 
@@ -72,6 +72,23 @@ struct ClaimableRow {
     command_schema: String,
     command_hash: String,
     lease_epoch: i64,
+}
+
+#[derive(sqlx::FromRow)]
+struct ResumableRow {
+    submission_id: Uuid,
+    executor_execution_id: Uuid,
+    output_id: Uuid,
+    job_id: Uuid,
+    tenant_id: String,
+    provider_id: String,
+    model: String,
+    work_item_id: Uuid,
+    output_index: i32,
+    command_schema: String,
+    command_hash: String,
+    lease_epoch: i64,
+    lease_expires_at_ms: i64,
 }
 
 #[derive(sqlx::FromRow)]
@@ -228,6 +245,59 @@ impl ExecutorSubmissionStore for PostgresExecutorSubmissionStore {
         Ok(prepared)
     }
 
+    async fn resume_running(
+        &self,
+        scope: &ExecutorClaimScope,
+        owner: &str,
+    ) -> Result<Option<ExecutorSubmissionLease>, ExecutorSubmissionError> {
+        validate_claim_scope(scope)?;
+        validate_owner(owner)?;
+        let row: Option<ResumableRow> = sqlx::query_as(
+            r#"
+            WITH db_clock AS (
+              SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT AS now_ms
+            )
+            SELECT s.submission_id, e.executor_execution_id, s.output_id, s.job_id,
+                   s.tenant_id, s.provider_id, s.model, s.work_item_id,
+                   o.output_index, s.command_schema, s.command_hash,
+                   e.lease_epoch, e.lease_expires_at_ms
+            FROM executor_executions e
+            JOIN provider_submissions s
+              ON s.executor_execution_id = e.executor_execution_id
+             AND s.submission_id = e.submission_id
+            JOIN job_outputs o ON o.output_id = s.output_id AND o.job_id = s.job_id
+            CROSS JOIN db_clock
+            WHERE e.state = 'running' AND s.state = 'running'
+              AND e.executor_owner = $1 AND e.lease_expires_at_ms > db_clock.now_ms
+              AND s.provider_id = $2 AND s.command_schema = $3
+            ORDER BY e.started_at_ms, e.created_at_ms, e.executor_execution_id
+            LIMIT 1
+            "#,
+        )
+        .bind(owner)
+        .bind(&scope.provider_id)
+        .bind(&scope.command_schema)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(unavailable)?;
+        Ok(row.map(|row| ExecutorSubmissionLease {
+            submission_id: row.submission_id,
+            executor_execution_id: row.executor_execution_id,
+            output_id: row.output_id,
+            job_id: row.job_id,
+            tenant_id: row.tenant_id,
+            provider_id: row.provider_id,
+            model: row.model,
+            work_item_id: row.work_item_id,
+            output_index: row.output_index,
+            command_schema: row.command_schema,
+            command_hash: row.command_hash,
+            executor_owner: owner.to_string(),
+            executor_lease_epoch: row.lease_epoch,
+            executor_lease_expires_at_ms: row.lease_expires_at_ms,
+        }))
+    }
+
     async fn claim_prepared(
         &self,
         scope: &ExecutorClaimScope,
@@ -333,17 +403,31 @@ impl ExecutorSubmissionStore for PostgresExecutorSubmissionStore {
     async fn start(&self, lease: &ExecutorSubmissionLease) -> Result<(), ExecutorSubmissionError> {
         validate_executor_lease(lease)?;
         let mut tx = self.pool.begin().await.map_err(unavailable)?;
-        lock_current_running_work(&mut tx, lease).await?;
+        match lock_current_running_work(&mut tx, lease).await {
+            Ok(()) => {}
+            Err(ExecutorSubmissionError::StaleLease) => {
+                tx.rollback().await.map_err(unavailable)?;
+                return replay_started(&self.pool, lease).await;
+            }
+            Err(error) => return Err(error),
+        }
         let locked = lock_executor_execution(&mut tx, lease).await?;
         let now = database_now(&mut tx).await?;
-        if locked.state != "leased"
-            || locked.executor_owner.as_deref() != Some(lease.executor_owner.as_str())
-            || locked.lease_epoch != lease.executor_lease_epoch
-            || locked
-                .lease_expires_at_ms
-                .is_none_or(|expires| expires <= now)
-        {
+        if !locked_executor_matches(&locked, lease, now) {
             return Err(ExecutorSubmissionError::StaleLease);
+        }
+        if locked.state == "running" {
+            if lock_submission_state(&mut tx, lease).await? != "running" {
+                return Err(ExecutorSubmissionError::Conflict);
+            }
+            tx.commit().await.map_err(unavailable)?;
+            return Ok(());
+        }
+        if locked.state != "leased" {
+            return Err(ExecutorSubmissionError::StaleLease);
+        }
+        if lock_submission_state(&mut tx, lease).await? != "prepared" {
+            return Err(ExecutorSubmissionError::Conflict);
         }
         let changed = sqlx::query(
             r#"
@@ -872,6 +956,68 @@ async fn lock_executor_execution(
     .await
     .map_err(unavailable)?
     .ok_or(ExecutorSubmissionError::StaleLease)
+}
+
+async fn replay_started(
+    pool: &PgPool,
+    lease: &ExecutorSubmissionLease,
+) -> Result<(), ExecutorSubmissionError> {
+    let mut tx = pool.begin().await.map_err(unavailable)?;
+    let locked = lock_executor_execution(&mut tx, lease).await?;
+    let now = database_now(&mut tx).await?;
+    if locked.state != "running" || !locked_executor_matches(&locked, lease, now) {
+        return Err(ExecutorSubmissionError::StaleLease);
+    }
+    if lock_submission_state(&mut tx, lease).await? != "running" {
+        return Err(ExecutorSubmissionError::Conflict);
+    }
+    tx.commit().await.map_err(unavailable)
+}
+
+fn locked_executor_matches(
+    locked: &LockedExecutorRow,
+    lease: &ExecutorSubmissionLease,
+    now: i64,
+) -> bool {
+    locked.executor_owner.as_deref() == Some(lease.executor_owner.as_str())
+        && locked.lease_epoch == lease.executor_lease_epoch
+        && locked
+            .lease_expires_at_ms
+            .is_some_and(|expires| expires > now)
+}
+
+async fn lock_submission_state(
+    tx: &mut Transaction<'_, Postgres>,
+    lease: &ExecutorSubmissionLease,
+) -> Result<String, ExecutorSubmissionError> {
+    sqlx::query_scalar(
+        r#"
+        SELECT s.state
+        FROM provider_submissions s
+        JOIN job_outputs o ON o.output_id = s.output_id AND o.job_id = s.job_id
+        WHERE s.submission_id = $1 AND s.executor_execution_id = $2
+          AND s.output_id = $3 AND s.job_id = $4 AND s.work_item_id = $5
+          AND s.tenant_id = $6 AND s.provider_id = $7 AND s.model = $8
+          AND s.command_schema = $9 AND s.command_hash = $10
+          AND o.output_index = $11
+        FOR UPDATE OF s
+        "#,
+    )
+    .bind(lease.submission_id)
+    .bind(lease.executor_execution_id)
+    .bind(lease.output_id)
+    .bind(lease.job_id)
+    .bind(lease.work_item_id)
+    .bind(&lease.tenant_id)
+    .bind(&lease.provider_id)
+    .bind(&lease.model)
+    .bind(&lease.command_schema)
+    .bind(&lease.command_hash)
+    .bind(lease.output_index)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(unavailable)?
+    .ok_or(ExecutorSubmissionError::Conflict)
 }
 
 async fn insert_result_manifest(

@@ -45,10 +45,16 @@ pub(super) fn validate_owner_and_duration(
     owner: &str,
     lease_ms: i64,
 ) -> Result<(), ExecutorSubmissionError> {
-    if !is_executor_owner(owner) {
-        return Err(ExecutorSubmissionError::InvalidInput);
-    }
+    validate_owner(owner)?;
     validate_lease_duration(lease_ms)
+}
+
+pub(super) fn validate_owner(owner: &str) -> Result<(), ExecutorSubmissionError> {
+    if is_executor_owner(owner) {
+        Ok(())
+    } else {
+        Err(ExecutorSubmissionError::InvalidInput)
+    }
 }
 
 pub(super) fn validate_claim_scope(

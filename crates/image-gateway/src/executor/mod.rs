@@ -3,9 +3,13 @@ use uuid::Uuid;
 
 use crate::admission::WorkLease;
 
+mod daemon;
 mod postgres;
+mod runner;
 
+pub use daemon::{ExecutorDaemon, ExecutorDaemonError, ExecutorDaemonRun};
 pub use postgres::PostgresExecutorSubmissionStore;
+pub use runner::{DurableRunner, RunnerError, RunnerOutcome};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PreparedExecutorSubmission {
@@ -105,6 +109,12 @@ pub trait ExecutorSubmissionStore: Send + Sync + 'static {
         &self,
         lease: &WorkLease,
     ) -> Result<Vec<PreparedExecutorSubmission>, ExecutorSubmissionError>;
+
+    async fn resume_running(
+        &self,
+        scope: &ExecutorClaimScope,
+        owner: &str,
+    ) -> Result<Option<ExecutorSubmissionLease>, ExecutorSubmissionError>;
 
     async fn claim_prepared(
         &self,
