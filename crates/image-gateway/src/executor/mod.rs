@@ -341,26 +341,11 @@ pub trait ExecutorSubmissionStore: Send + Sync + 'static {
         lease_ms: i64,
     ) -> Result<ExecutorSubmissionLease, ExecutorSubmissionError>;
 
-    async fn append_runner_observation(
-        &self,
-        lease: &ExecutorSubmissionLease,
-        outcome: &ExecutorSubmissionOutcome,
-    ) -> Result<ExecutorRunnerObservation, ExecutorSubmissionError>;
-
-    async fn resolve_runner_observation(
-        &self,
-        lease: &ExecutorSubmissionLease,
-        observation: &ExecutorRunnerObservation,
-    ) -> Result<(), ExecutorSubmissionError>;
-
     async fn record_outcome(
         &self,
         lease: &ExecutorSubmissionLease,
         outcome: &ExecutorSubmissionOutcome,
-    ) -> Result<(), ExecutorSubmissionError> {
-        let observation = self.append_runner_observation(lease, outcome).await?;
-        self.resolve_runner_observation(lease, &observation).await
-    }
+    ) -> Result<(), ExecutorSubmissionError>;
 
     async fn reconcile_expired(&self, limit: u32) -> Result<u64, ExecutorSubmissionError>;
 }

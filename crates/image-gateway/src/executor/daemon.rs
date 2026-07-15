@@ -163,14 +163,7 @@ where
             }
         };
         let outcome = terminal_outcome(outcome)?;
-        let observation = self
-            .store
-            .append_runner_observation(&lease, &outcome)
-            .await?;
-        lease = self.store.heartbeat(&lease, self.lease_ms).await?;
-        self.store
-            .resolve_runner_observation(&lease, &observation)
-            .await?;
+        self.store.record_outcome(&lease, &outcome).await?;
         Ok(ExecutorDaemonRun::Recorded)
     }
 }
@@ -190,9 +183,7 @@ where
             return Ok(ExecutorDaemonRun::Idle);
         };
         let outcome = terminal_outcome(self.runner.recover_evidence(lease.clone()).await)?;
-        self.store
-            .append_runner_observation(&lease, &outcome)
-            .await?;
+        self.store.record_outcome(&lease, &outcome).await?;
         Ok(ExecutorDaemonRun::Recorded)
     }
 }

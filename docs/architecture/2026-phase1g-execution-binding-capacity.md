@@ -127,6 +127,9 @@ The PostgreSQL executor suite proves:
 - disabled profiles reject new claims but preserve running attach;
 - running expiry without evidence retains capacity;
 - late evidence and abandoned start release exactly once;
+- injected terminal projection failure rolls back observation, decision,
+  projection, and capacity release together, then exact retry succeeds;
+- terminal recording does not depend on a second post-run heartbeat;
 - process restart still invokes the provider exactly once;
 - journal replay rejects a changed profile or adapter revision.
 

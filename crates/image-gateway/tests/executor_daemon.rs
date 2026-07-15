@@ -6,9 +6,9 @@ use std::{
 use async_trait::async_trait;
 use gpt_image_2_gateway::executor::{
     DurableRunner, DurableRunnerResult, ExecutorClaimScope, ExecutorDaemon, ExecutorDaemonError,
-    ExecutorDaemonRun, ExecutorRunnerObservation, ExecutorSubmissionError, ExecutorSubmissionLease,
-    ExecutorSubmissionOutcome, ExecutorSubmissionStore, PreparedExecutorSubmission, RunnerError,
-    RunnerLaunchAuthority, RunnerOutcome,
+    ExecutorDaemonRun, ExecutorSubmissionError, ExecutorSubmissionLease, ExecutorSubmissionOutcome,
+    ExecutorSubmissionStore, PreparedExecutorSubmission, RunnerError, RunnerLaunchAuthority,
+    RunnerOutcome,
 };
 use tokio::sync::Barrier;
 use uuid::Uuid;
@@ -184,12 +184,12 @@ impl ExecutorSubmissionStore for FakeStore {
         }
     }
 
-    async fn append_runner_observation(
+    async fn record_outcome(
         &self,
-        lease: &ExecutorSubmissionLease,
+        _lease: &ExecutorSubmissionLease,
         outcome: &ExecutorSubmissionOutcome,
-    ) -> Result<ExecutorRunnerObservation, ExecutorSubmissionError> {
-        self.push_event("observe");
+    ) -> Result<(), ExecutorSubmissionError> {
+        self.push_event("record");
         let mut state = self.state.lock().expect("fake store lock");
         state.observed = state
             .observed
@@ -197,22 +197,7 @@ impl ExecutorSubmissionStore for FakeStore {
             .cloned()
             .chain(std::iter::once(outcome.clone()))
             .collect();
-        Ok(ExecutorRunnerObservation::new(
-            lease.executor_execution_id,
-            lease.submission_id,
-            outcome.clone(),
-        )
-        .unwrap())
-    }
-
-    async fn resolve_runner_observation(
-        &self,
-        _lease: &ExecutorSubmissionLease,
-        observation: &ExecutorRunnerObservation,
-    ) -> Result<(), ExecutorSubmissionError> {
-        self.push_event("resolve");
-        let mut state = self.state.lock().expect("fake store lock");
-        state.recorded.push(observation.outcome().clone());
+        state.recorded.push(outcome.clone());
         Ok(())
     }
 
@@ -265,10 +250,7 @@ async fn restart_resumes_running_before_claim_and_attaches_once() {
     let result = daemon.run_once().await.expect("daemon run");
 
     assert_eq!(result, ExecutorDaemonRun::Recorded);
-    assert_eq!(
-        store.events(),
-        vec!["resume", "runner", "observe", "heartbeat", "resolve"]
-    );
+    assert_eq!(store.events(), vec!["resume", "runner", "record"]);
     assert_eq!(
         runner.calls.lock().expect("runner calls").as_slice(),
         &[lease]
@@ -310,16 +292,7 @@ async fn prepared_submission_is_claimed_started_and_recorded() {
     assert_eq!(result, ExecutorDaemonRun::Recorded);
     assert_eq!(
         store.events(),
-        vec![
-            "resume",
-            "claim",
-            "start",
-            "heartbeat",
-            "runner",
-            "observe",
-            "heartbeat",
-            "resolve"
-        ]
+        vec!["resume", "claim", "start", "heartbeat", "runner", "record"]
     );
     assert_eq!(
         runner.calls.lock().expect("runner calls").as_slice(),
@@ -357,40 +330,24 @@ async fn prelaunch_heartbeat_failure_never_calls_runner_or_records() {
 }
 
 #[tokio::test]
-async fn final_heartbeat_loss_retains_observation_without_resolution() {
+async fn terminal_recording_does_not_require_a_post_runner_heartbeat() {
     let lease = executor_lease();
     let store = FakeStore::with_heartbeat_failure(lease, 2, HeartbeatError::Stale);
     let runner = store.runner(Duration::ZERO);
     let daemon = daemon(store.clone(), runner.clone());
 
-    let error = daemon
-        .run_once()
-        .await
-        .expect_err("lease loss must fail run");
-
-    assert_eq!(
-        error.store_error(),
-        Some(&ExecutorSubmissionError::StaleLease)
-    );
+    assert_eq!(daemon.run_once().await, Ok(ExecutorDaemonRun::Recorded));
     let snapshot = store.snapshot();
     assert_eq!(
         store.events(),
-        vec![
-            "resume",
-            "claim",
-            "start",
-            "heartbeat",
-            "runner",
-            "observe",
-            "heartbeat"
-        ]
+        vec!["resume", "claim", "start", "heartbeat", "runner", "record"]
     );
     assert_eq!(runner.calls.lock().expect("runner calls").len(), 1);
     assert_eq!(
         snapshot.observed,
         vec![ExecutorSubmissionOutcome::from(definite_outcome())]
     );
-    assert!(snapshot.recorded.is_empty());
+    assert_eq!(snapshot.recorded, snapshot.observed);
 }
 
 #[tokio::test]
@@ -415,9 +372,7 @@ async fn simultaneous_runner_and_failed_renewal_records_runner_outcome() {
             "heartbeat",
             "runner",
             "heartbeat",
-            "observe",
-            "heartbeat",
-            "resolve"
+            "record"
         ]
     );
     assert_eq!(

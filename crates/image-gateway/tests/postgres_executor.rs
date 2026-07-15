@@ -2197,6 +2197,134 @@ async fn record_outcome_persists_evidence_without_settling_customer_output() -> 
 }
 
 #[tokio::test]
+async fn record_outcome_rolls_back_evidence_projection_and_capacity_on_projection_failure()
+-> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let work = seed_lease(&database.pool, "atomic-outcome-worker", 1).await?;
+        let store = PostgresExecutorSubmissionStore::new(database.pool.clone());
+        store
+            .prepare_for_lease(&work, profile_id_for_lease(&work))
+            .await
+            .map_err(debug_error)?;
+        activate_work(&database.pool, &work).await?;
+        let claim = claim_required(&store, "atomic-outcome-executor").await?;
+        store.start(&claim).await.map_err(debug_error)?;
+        sqlx::raw_sql(
+            r#"
+            CREATE FUNCTION reject_test_terminal_projection() RETURNS TRIGGER AS $$
+            BEGIN
+                IF NEW.state IN ('succeeded', 'failed', 'uncertain') THEN
+                    RAISE EXCEPTION 'injected terminal projection failure';
+                END IF;
+                RETURN NEW;
+            END;
+            $$ LANGUAGE plpgsql;
+            CREATE TRIGGER reject_test_terminal_projection
+                BEFORE UPDATE ON provider_submissions
+                FOR EACH ROW EXECUTE FUNCTION reject_test_terminal_projection();
+            "#,
+        )
+        .execute(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        let outcome = ExecutorSubmissionOutcome::Failed {
+            error_code: "provider_rejected".to_string(),
+        };
+        require(
+            store.record_outcome(&claim, &outcome).await
+                == Err(ExecutorSubmissionError::Unavailable),
+            "injected projection failure did not abort terminal recording",
+        )?;
+        let rolled_back: (String, String, i64, i64, String, i32) = sqlx::query_as(
+            r#"
+            SELECT e.state, s.state,
+                   (SELECT COUNT(*) FROM executor_runner_observations observation
+                    WHERE observation.executor_execution_id = e.executor_execution_id),
+                   (SELECT COUNT(*) FROM executor_resolution_decisions decision
+                    WHERE decision.executor_execution_id = e.executor_execution_id),
+                   allocation.state, policy.allocated_count
+            FROM executor_executions e
+            JOIN provider_submissions s ON s.submission_id = e.submission_id
+            JOIN executor_capacity_allocations allocation
+              ON allocation.executor_execution_id = e.executor_execution_id
+            JOIN executor_resource_policies policy
+              ON policy.resource_policy_id = allocation.resource_policy_id
+             AND policy.revision = allocation.resource_policy_revision
+            WHERE e.executor_execution_id = $1
+            "#,
+        )
+        .bind(claim.executor_execution_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(
+            rolled_back
+                == (
+                    "running".to_string(),
+                    "running".to_string(),
+                    0,
+                    0,
+                    "held".to_string(),
+                    1,
+                ),
+            format!("terminal transaction partially committed: {rolled_back:?}"),
+        )?;
+        sqlx::raw_sql(
+            r#"
+            DROP TRIGGER reject_test_terminal_projection ON provider_submissions;
+            DROP FUNCTION reject_test_terminal_projection();
+            "#,
+        )
+        .execute(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        store
+            .record_outcome(&claim, &outcome)
+            .await
+            .map_err(debug_error)?;
+        let committed: (String, String, i64, i64, String, i32) = sqlx::query_as(
+            r#"
+            SELECT e.state, s.state,
+                   (SELECT COUNT(*) FROM executor_runner_observations observation
+                    WHERE observation.executor_execution_id = e.executor_execution_id),
+                   (SELECT COUNT(*) FROM executor_resolution_decisions decision
+                    WHERE decision.executor_execution_id = e.executor_execution_id),
+                   allocation.state, policy.allocated_count
+            FROM executor_executions e
+            JOIN provider_submissions s ON s.submission_id = e.submission_id
+            JOIN executor_capacity_allocations allocation
+              ON allocation.executor_execution_id = e.executor_execution_id
+            JOIN executor_resource_policies policy
+              ON policy.resource_policy_id = allocation.resource_policy_id
+             AND policy.revision = allocation.resource_policy_revision
+            WHERE e.executor_execution_id = $1
+            "#,
+        )
+        .bind(claim.executor_execution_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(
+            committed
+                == (
+                    "failed".to_string(),
+                    "failed".to_string(),
+                    1,
+                    1,
+                    "released".to_string(),
+                    0,
+                ),
+            format!("terminal retry did not commit exactly once: {committed:?}"),
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
 async fn expired_unstarted_execution_is_canceled_after_work_becomes_terminal() -> TestResult {
     let Some(database) = TestDatabase::new().await? else {
         return Ok(());
@@ -2391,8 +2519,32 @@ async fn expired_running_execution_reconciles_to_uncertain_without_retry() -> Te
                     },
                 )
                 .await
-                == Err(ExecutorSubmissionError::Conflict),
-            "late outcome overwrote uncertain evidence",
+                .is_ok(),
+            "matching late outcome was not retained as evidence",
+        )?;
+        let canonical: (String, String, String) = sqlx::query_as(
+            r#"
+            SELECT e.state, s.state, d.source
+            FROM executor_executions e
+            JOIN provider_submissions s ON s.submission_id = e.submission_id
+            JOIN executor_resolution_decisions d
+              ON d.decision_id = e.resolution_decision_id
+            WHERE e.executor_execution_id = $1 AND e.submission_id = $2
+            "#,
+        )
+        .bind(claim.executor_execution_id)
+        .bind(claim.submission_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(
+            canonical
+                == (
+                    "uncertain".to_string(),
+                    "uncertain".to_string(),
+                    "executor_lease_expired".to_string(),
+                ),
+            format!("late evidence rewrote the canonical expiry decision: {canonical:?}"),
         )?;
         let late_observation: (String, Option<String>, String) = sqlx::query_as(
             r#"
@@ -2728,7 +2880,8 @@ async fn expired_parent_does_not_start_a_still_leased_execution() -> TestResult 
 }
 
 #[tokio::test]
-async fn lock_wait_cannot_resurrect_an_expired_executor_lease() -> TestResult {
+async fn lock_wait_records_late_evidence_without_resurrecting_expired_executor_lease() -> TestResult
+{
     let Some(database) = TestDatabase::new().await? else {
         return Ok(());
     };
@@ -2766,8 +2919,51 @@ async fn lock_wait_cannot_resurrect_an_expired_executor_lease() -> TestResult {
         tokio::time::sleep(Duration::from_millis(250)).await;
         blocker.commit().await.map_err(debug_error)?;
         require(
-            outcome.await.map_err(debug_error)? == Err(ExecutorSubmissionError::StaleLease),
-            "lock wait used a timestamp captured before the executor lease expired",
+            outcome.await.map_err(debug_error)?.is_ok(),
+            "late terminal evidence was discarded after lock wait",
+        )?;
+        let after_wait: (String, i64, i64, i64) = sqlx::query_as(
+            r#"
+            SELECT e.state, e.lease_expires_at_ms,
+                   floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT,
+                   (SELECT COUNT(*) FROM executor_runner_observations observation
+                    WHERE observation.executor_execution_id = e.executor_execution_id)
+            FROM executor_executions e
+            WHERE e.executor_execution_id = $1
+            "#,
+        )
+        .bind(claim.executor_execution_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(
+            after_wait.0 == "running" && after_wait.1 <= after_wait.2 && after_wait.3 == 1,
+            format!("lock wait revived or lost the expired execution: {after_wait:?}"),
+        )?;
+        require(
+            store.reconcile_expired(1).await.map_err(debug_error)? == 1,
+            "expired execution with late evidence was not reconciled",
+        )?;
+        let canonical: (String, String) = sqlx::query_as(
+            r#"
+            SELECT e.state, d.source
+            FROM executor_executions e
+            JOIN executor_resolution_decisions d
+              ON d.decision_id = e.resolution_decision_id
+            WHERE e.executor_execution_id = $1
+            "#,
+        )
+        .bind(claim.executor_execution_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(
+            canonical
+                == (
+                    "uncertain".to_string(),
+                    "executor_lease_expired".to_string(),
+                ),
+            format!("late evidence bypassed conservative expiry resolution: {canonical:?}"),
         )
     }
     .await;

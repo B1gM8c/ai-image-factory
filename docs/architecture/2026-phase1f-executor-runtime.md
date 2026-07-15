@@ -129,6 +129,14 @@ PostgreSQL enforces one-way executor and submission transitions, a write-once
 launch owner and epoch, monotonic live heartbeats, and rejection of any attempt
 to revive an expired lease under the same fence.
 
+Terminal recording has one production entry point and one PostgreSQL
+transaction. For a still-live fence it applies a bounded finalization grace,
+then atomically validates artifact authority, appends the runner observation,
+creates the canonical decision, updates both executor projections, and releases
+capacity. A transaction that reaches the database after expiry records only
+late evidence; reconciliation retains ownership of the conservative canonical
+decision. There is no post-run heartbeat commit gap.
+
 A resumed execution is not renewed before local attach evidence is found. If a
 second process has the same configured owner but a different spool, the missing
 launch marker is retryable and produces no heartbeat, observation, or canonical
@@ -203,9 +211,11 @@ operation bound to `output_index`; otherwise an `n`-output request could launch
 the provider `n * n` times.
 
 The schema activation blockers are complete. Runner outcomes are first retained
-as append-only observations under the immutable launch fence. A separate active
-or expiry decision owns every terminal canonical transition, so late evidence
-survives without allowing a stale executor to overwrite the chosen state.
+as append-only observations under the immutable launch fence. An active or
+expiry decision owns every terminal canonical transition, so late evidence
+survives without allowing a stale executor to overwrite the chosen state. The
+active observation and decision now commit together rather than exposing a
+partially recorded terminal state.
 
 The artifact-authority blocker is complete: a successful executor manifest can
 contain only deterministic authority IDs, and PostgreSQL accepts it only after

@@ -16,6 +16,7 @@ use crate::admission::WorkLease;
 const MAX_RECONCILE_BATCH: u32 = 1_000;
 const EXECUTOR_LEASE_EXPIRED: &str = "executor_lease_expired";
 const EXECUTOR_START_ABANDONED: &str = "executor_start_abandoned";
+const FINALIZATION_FENCE_GRACE_MS: i64 = 5_000;
 
 mod validation;
 
@@ -100,19 +101,6 @@ struct ResumableRow {
     adapter_revision: String,
     lease_epoch: i64,
     lease_expires_at_ms: i64,
-}
-
-#[derive(sqlx::FromRow)]
-struct TerminalOutcomeRow {
-    execution_state: String,
-    submission_state: String,
-    execution_error_code: Option<String>,
-    submission_error_code: Option<String>,
-    manifest_id: Option<Uuid>,
-    artifact_authority_id: Option<Uuid>,
-    resolution_source: Option<String>,
-    decision_observation_id: Option<Uuid>,
-    observation_payload_hash: Option<String>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -885,11 +873,11 @@ impl ExecutorSubmissionStore for PostgresExecutorSubmissionStore {
         })
     }
 
-    async fn append_runner_observation(
+    async fn record_outcome(
         &self,
         lease: &ExecutorSubmissionLease,
         outcome: &ExecutorSubmissionOutcome,
-    ) -> Result<ExecutorRunnerObservation, ExecutorSubmissionError> {
+    ) -> Result<(), ExecutorSubmissionError> {
         validate_executor_lease(lease)?;
         validate_outcome(outcome)?;
         let mut tx = self.pool.begin().await.map_err(unavailable)?;
@@ -901,28 +889,59 @@ impl ExecutorSubmissionStore for PostgresExecutorSubmissionStore {
         {
             return Err(ExecutorSubmissionError::StaleLease);
         }
+        let now = database_now(&mut tx).await?;
+        let active = locked.state == "running"
+            && locked.executor_owner.as_deref() == Some(lease.executor_owner.as_str())
+            && locked.lease_epoch == lease.executor_lease_epoch
+            && locked
+                .lease_expires_at_ms
+                .is_some_and(|expires| expires > now);
+        if active {
+            if lock_submission_state(&mut tx, lease).await? != "running" {
+                return Err(ExecutorSubmissionError::Conflict);
+            }
+            lock_held_capacity_allocation(&mut tx, lease).await?;
+            require_one(
+                sqlx::query(
+                    r#"
+                    UPDATE executor_executions
+                    SET lease_expires_at_ms = GREATEST(lease_expires_at_ms, $5),
+                        updated_at_ms = $6
+                    WHERE executor_execution_id = $1 AND submission_id = $2
+                      AND executor_owner = $3 AND lease_epoch = $4
+                      AND state = 'running' AND lease_expires_at_ms > $6
+                    "#,
+                )
+                .bind(lease.executor_execution_id)
+                .bind(lease.submission_id)
+                .bind(&lease.executor_owner)
+                .bind(lease.executor_lease_epoch)
+                .bind(now + FINALIZATION_FENCE_GRACE_MS)
+                .bind(now)
+                .execute(&mut *tx)
+                .await
+                .map_err(unavailable)?,
+            )?;
+            heartbeat_capacity_allocation(&mut tx, lease, now).await?;
+        }
         let observation = runner_observation(lease, outcome)?;
         let payload_hash = observation_payload_hash(lease, outcome);
         if let Some(existing) = lock_runner_observation(&mut tx, lease).await? {
-            if stored_observation_matches(&existing, &observation, &payload_hash) {
-                tx.commit().await.map_err(unavailable)?;
-                return Ok(observation);
-            }
-            return Err(ExecutorSubmissionError::Conflict);
-        }
-        if let Some(manifest) = outcome.manifest() {
-            let authority = lock_artifact_authority(&mut tx, lease)
-                .await?
-                .ok_or(ExecutorSubmissionError::Conflict)?;
-            if !manifest_matches_artifact_authority(manifest, &authority) {
+            if !stored_observation_matches(&existing, &observation, &payload_hash) {
                 return Err(ExecutorSubmissionError::Conflict);
             }
+        } else {
+            if let Some(manifest) = outcome.manifest() {
+                let authority = lock_artifact_authority(&mut tx, lease)
+                    .await?
+                    .ok_or(ExecutorSubmissionError::Conflict)?;
+                if !manifest_matches_artifact_authority(manifest, &authority) {
+                    return Err(ExecutorSubmissionError::Conflict);
+                }
+                insert_result_manifest(&mut tx, lease, manifest, now).await?;
+            }
+            insert_runner_observation(&mut tx, lease, outcome, &payload_hash, now).await?;
         }
-        let now = database_now(&mut tx).await?;
-        if let Some(manifest) = outcome.manifest() {
-            insert_result_manifest(&mut tx, lease, manifest, now).await?;
-        }
-        insert_runner_observation(&mut tx, lease, outcome, &payload_hash, now).await?;
         if matches!(locked.state.as_str(), "succeeded" | "failed" | "uncertain") {
             release_capacity_allocation(
                 &mut tx,
@@ -933,63 +952,15 @@ impl ExecutorSubmissionStore for PostgresExecutorSubmissionStore {
                 now,
             )
             .await?;
+            tx.commit().await.map_err(unavailable)?;
+            return Ok(());
         }
-        tx.commit().await.map_err(unavailable)?;
-        Ok(observation)
-    }
-
-    async fn resolve_runner_observation(
-        &self,
-        lease: &ExecutorSubmissionLease,
-        observation: &ExecutorRunnerObservation,
-    ) -> Result<(), ExecutorSubmissionError> {
-        validate_executor_lease(lease)?;
-        validate_outcome(&observation.outcome)?;
-        if observation.observation_id != lease.executor_execution_id
-            || observation.executor_execution_id != lease.executor_execution_id
-            || observation.submission_id != lease.submission_id
-        {
-            return Err(ExecutorSubmissionError::InvalidInput);
+        if !active {
+            tx.commit().await.map_err(unavailable)?;
+            return Ok(());
         }
-        let mut tx = self.pool.begin().await.map_err(unavailable)?;
-        let outcome = &observation.outcome;
         let state = outcome.state();
         let error_code = outcome.error_code();
-        let locked = lock_executor_execution(&mut tx, lease).await?;
-        if matches!(locked.state.as_str(), "succeeded" | "failed" | "uncertain") {
-            if !launch_fence_matches(&locked, lease) {
-                return Err(ExecutorSubmissionError::StaleLease);
-            }
-            return match terminal_outcome_matches(&mut tx, lease, outcome).await? {
-                Some(true) => {
-                    tx.commit().await.map_err(unavailable)?;
-                    Ok(())
-                }
-                Some(false) => Err(ExecutorSubmissionError::Conflict),
-                None => Err(ExecutorSubmissionError::StaleLease),
-            };
-        }
-        let now = database_now(&mut tx).await?;
-        if locked.state != "running"
-            || locked.executor_owner.as_deref() != Some(lease.executor_owner.as_str())
-            || locked.lease_epoch != lease.executor_lease_epoch
-            || !launch_fence_matches(&locked, lease)
-            || locked
-                .lease_expires_at_ms
-                .is_none_or(|expires| expires <= now)
-        {
-            return Err(ExecutorSubmissionError::StaleLease);
-        }
-        if lock_submission_state(&mut tx, lease).await? != "running" {
-            return Err(ExecutorSubmissionError::Conflict);
-        }
-        let stored = lock_runner_observation(&mut tx, lease)
-            .await?
-            .ok_or(ExecutorSubmissionError::Conflict)?;
-        let payload_hash = observation_payload_hash(lease, outcome);
-        if !stored_observation_matches(&stored, observation, &payload_hash) {
-            return Err(ExecutorSubmissionError::Conflict);
-        }
         insert_resolution_decision(
             &mut tx,
             lease.executor_execution_id,
@@ -2081,86 +2052,6 @@ async fn insert_result_manifest(
     .await
     .map_err(unavailable)?;
     Ok(())
-}
-
-async fn terminal_outcome_matches(
-    tx: &mut Transaction<'_, Postgres>,
-    lease: &ExecutorSubmissionLease,
-    outcome: &ExecutorSubmissionOutcome,
-) -> Result<Option<bool>, ExecutorSubmissionError> {
-    let row: Option<TerminalOutcomeRow> = sqlx::query_as(
-        r#"
-        SELECT e.state AS execution_state, s.state AS submission_state,
-               e.error_code AS execution_error_code,
-               s.error_code AS submission_error_code,
-               m.manifest_id, m.artifact_authority_id,
-               d.source AS resolution_source,
-               d.observation_id AS decision_observation_id,
-               ro.payload_hash AS observation_payload_hash
-        FROM executor_executions e
-        JOIN provider_submissions s
-          ON s.executor_execution_id = e.executor_execution_id
-         AND s.submission_id = e.submission_id
-        LEFT JOIN executor_result_manifests m
-          ON m.manifest_id = s.result_manifest_id
-         AND m.executor_execution_id = e.executor_execution_id
-         AND m.submission_id = s.submission_id
-        LEFT JOIN executor_artifact_authorities aa
-          ON aa.authority_id = m.artifact_authority_id
-         AND aa.executor_execution_id = m.executor_execution_id
-         AND aa.submission_id = m.submission_id
-        LEFT JOIN executor_resolution_decisions d
-          ON d.decision_id = e.resolution_decision_id
-         AND d.executor_execution_id = e.executor_execution_id
-         AND d.submission_id = e.submission_id
-        LEFT JOIN executor_runner_observations ro
-          ON ro.observation_id = d.observation_id
-         AND ro.executor_execution_id = d.executor_execution_id
-         AND ro.submission_id = d.submission_id
-        WHERE e.executor_execution_id = $1 AND e.submission_id = $2
-          AND s.output_id = $3 AND s.job_id = $4 AND s.work_item_id = $5
-        FOR UPDATE OF e, s
-        "#,
-    )
-    .bind(lease.executor_execution_id)
-    .bind(lease.submission_id)
-    .bind(lease.output_id)
-    .bind(lease.job_id)
-    .bind(lease.work_item_id)
-    .fetch_optional(&mut **tx)
-    .await
-    .map_err(unavailable)?;
-    let Some(row) = row else {
-        return Ok(None);
-    };
-    if !matches!(
-        row.execution_state.as_str(),
-        "succeeded" | "failed" | "uncertain"
-    ) || !matches!(
-        row.submission_state.as_str(),
-        "succeeded" | "failed" | "uncertain"
-    ) {
-        return Ok(None);
-    }
-    let base_matches = row.execution_state == outcome.state()
-        && row.submission_state == outcome.state()
-        && row.execution_error_code.as_deref() == outcome.error_code()
-        && row.submission_error_code.as_deref() == outcome.error_code();
-    let manifest_matches = match outcome.manifest() {
-        Some(manifest) => {
-            row.manifest_id == Some(manifest.manifest_id)
-                && row.artifact_authority_id == Some(manifest.artifact_authority_id)
-        }
-        None => row.manifest_id.is_none(),
-    };
-    let active_decision_matches = row.resolution_source.as_deref()
-        == Some("active_runner_observation")
-        && row.decision_observation_id == Some(lease.executor_execution_id)
-        && row.observation_payload_hash.as_deref()
-            == Some(observation_payload_hash(lease, outcome).as_str());
-    Ok(Some(
-        base_matches && manifest_matches && active_decision_matches,
-    ))
 }
 
 async fn update_expired_execution(
