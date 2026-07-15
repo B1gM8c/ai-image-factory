@@ -5,8 +5,9 @@ use std::{
 
 use gpt_image_2_gateway::database::{connect_test_pool_with_search_path, run_migrations};
 use gpt_image_2_gateway::{
-    CODEX_GENERATION_ADAPTER_REVISION, GenerationJob, PostgresReconciliationStore,
-    ReconciliationOutcome, ReconciliationStore,
+    CODEX_GENERATION_ADAPTER_REVISION, CanonicalExecutorOutcome, ExecutorTerminalError,
+    ExecutorTerminalStore, GenerationJob, PostgresExecutorTerminalStore,
+    PostgresReconciliationStore, ReconciliationOutcome, ReconciliationStore,
     admission::{GENERATION_COMMAND_SCHEMA, GenerationCommandV1, WorkLease},
     artifacts::{ExecutorArtifactPublisher, FilesystemArtifactBlobStore},
     economics::{
@@ -1065,6 +1066,177 @@ async fn successful_provider_output_is_rated_exactly_once_from_frozen_quote() ->
         require(
             state == ("succeeded".to_string(), "settled".to_string(), 1, 1, 1, 0),
             format!("unexpected economic settlement state: {state:?}"),
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
+async fn terminal_reduction_claim_reads_only_canonical_success_authority() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let work = seed_lease(&database.pool, "terminal-reader-worker", 1).await?;
+        let executor = PostgresExecutorSubmissionStore::new(database.pool.clone());
+        let (artifacts, _artifact_root) = artifact_publisher(&executor)?;
+        executor
+            .prepare_and_handoff(&work, profile_id_for_lease(&work))
+            .await
+            .map_err(debug_error)?;
+        let executor_lease = claim_required(&executor, "terminal-reader-executor").await?;
+        executor.start(&executor_lease).await.map_err(debug_error)?;
+        let manifest = publish_result_authority(&artifacts, &executor_lease).await?;
+        executor
+            .record_outcome(
+                &executor_lease,
+                &ExecutorSubmissionOutcome::Succeeded(manifest.clone()),
+            )
+            .await
+            .map_err(debug_error)?;
+
+        let reductions = PostgresExecutorTerminalStore::new(database.pool.clone());
+        let terminal = reductions
+            .claim_terminal("terminal-reader", 60_000)
+            .await
+            .map_err(debug_error)?
+            .ok_or_else(|| "canonical terminal reduction was not queued".to_string())?;
+        require(
+            terminal.submission_id == executor_lease.submission_id
+                && terminal.executor_execution_id == executor_lease.executor_execution_id
+                && terminal.resolution_decision_id == executor_lease.executor_execution_id
+                && terminal.output_id == executor_lease.output_id
+                && terminal.job_id == executor_lease.job_id
+                && terminal.work_item_id == executor_lease.work_item_id
+                && terminal.attempt_execution_id == work.execution_id
+                && terminal.attempt_lease_epoch == work.lease_epoch,
+            "terminal read model changed a canonical execution identity",
+        )?;
+        let CanonicalExecutorOutcome::Succeeded(authority) = &terminal.outcome else {
+            return Err(format!(
+                "successful executor decision mapped to {:?}",
+                terminal.outcome
+            ));
+        };
+        require(
+            authority.authority_id == executor_lease.executor_execution_id
+                && manifest.manifest_id() == executor_lease.submission_id
+                && manifest.artifact_authority_id() == authority.authority_id
+                && authority.storage_backend == "filesystem-v1"
+                && authority.storage_namespace.starts_with("filesystem-v1:")
+                && !authority.object_key.is_empty()
+                && authority.sha256_hex.len() == 64
+                && authority.byte_size > 0
+                && authority.media_type == "image/png",
+            "terminal success omitted or changed artifact authority",
+        )?;
+        let renewed = reductions
+            .heartbeat_terminal(&terminal, 90_000)
+            .await
+            .map_err(debug_error)?;
+        require(
+            renewed.reducer_lease_epoch == terminal.reducer_lease_epoch
+                && renewed.reducer_lease_expires_at_ms >= terminal.reducer_lease_expires_at_ms,
+            "terminal reduction heartbeat changed its fence",
+        )?;
+        require(
+            reductions
+                .claim_terminal("another-reader", 60_000)
+                .await
+                .map_err(debug_error)?
+                .is_none(),
+            "a live terminal reduction lease was claimed twice",
+        )?;
+        require(
+            sqlx::query(
+                "UPDATE executor_terminal_reductions SET resolution_decision_id = $2 WHERE submission_id = $1",
+            )
+            .bind(terminal.submission_id)
+            .bind(Uuid::new_v4())
+            .execute(&database.pool)
+            .await
+            .is_err(),
+            "terminal reduction decision identity was rewritten",
+        )?;
+        require(
+            sqlx::query("DELETE FROM executor_terminal_reductions WHERE submission_id = $1")
+                .bind(terminal.submission_id)
+                .execute(&database.pool)
+                .await
+                .is_err(),
+            "terminal reduction queue item was deleted",
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
+async fn expired_terminal_reduction_has_one_reclaim_winner_and_fences_old_epoch() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let work = seed_lease(&database.pool, "terminal-reclaim-worker", 1).await?;
+        let executor = PostgresExecutorSubmissionStore::new(database.pool.clone());
+        executor
+            .prepare_and_handoff(&work, profile_id_for_lease(&work))
+            .await
+            .map_err(debug_error)?;
+        let executor_lease = claim_required(&executor, "terminal-reclaim-executor").await?;
+        executor.start(&executor_lease).await.map_err(debug_error)?;
+        executor
+            .record_outcome(
+                &executor_lease,
+                &ExecutorSubmissionOutcome::Failed {
+                    error_code: "provider_failed".to_string(),
+                },
+            )
+            .await
+            .map_err(debug_error)?;
+
+        let reductions = PostgresExecutorTerminalStore::new(database.pool.clone());
+        let expired = reductions
+            .claim_terminal("expired-reader", 25)
+            .await
+            .map_err(debug_error)?
+            .ok_or_else(|| "failed terminal reduction was not queued".to_string())?;
+        require(
+            matches!(
+                &expired.outcome,
+                CanonicalExecutorOutcome::Failed { error_code }
+                    if error_code == "provider_failed"
+            ),
+            "failed decision was not reconstructed from canonical evidence",
+        )?;
+        tokio::time::sleep(Duration::from_millis(40)).await;
+
+        let mut tasks = Vec::new();
+        for index in 0..20 {
+            let store = reductions.clone();
+            tasks.push(tokio::spawn(async move {
+                store
+                    .claim_terminal(&format!("reclaim-reader-{index}"), 60_000)
+                    .await
+            }));
+        }
+        let mut winners = Vec::new();
+        for task in tasks {
+            if let Some(lease) = task.await.map_err(debug_error)?.map_err(debug_error)? {
+                winners.push(lease);
+            }
+        }
+        require(
+            winners.len() == 1 && winners[0].reducer_lease_epoch == 2,
+            format!("terminal reduction reclaim winners were not fenced: {winners:?}"),
+        )?;
+        require(
+            matches!(
+                reductions.heartbeat_terminal(&expired, 60_000).await,
+                Err(ExecutorTerminalError::StaleLease)
+            ),
+            "expired terminal reduction epoch retained heartbeat authority",
         )
     }
     .await;

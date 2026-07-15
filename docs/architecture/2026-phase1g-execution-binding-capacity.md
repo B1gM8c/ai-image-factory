@@ -161,7 +161,7 @@ The PostgreSQL executor suite proves:
 
 ## 7. Remaining Activation Gates
 
-- canonical executor terminal read-side and trusted receipt construction;
+- trusted receipt construction from the implemented canonical terminal queue;
 - one-transaction output economics plus parent work/job/idempotency reduction;
 - normalized customer artifact publication and exact official response replay;
 - external agentic-CLI sandbox, dedicated service identity, cgroup/mount/network

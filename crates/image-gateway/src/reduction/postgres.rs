@@ -1,0 +1,303 @@
+use async_trait::async_trait;
+use sqlx::PgPool;
+use uuid::Uuid;
+
+use super::{
+    CanonicalExecutorOutcome, ExecutorTerminalArtifact, ExecutorTerminalError,
+    ExecutorTerminalLease, ExecutorTerminalStore,
+};
+
+const MAX_LEASE_MS: i64 = 10 * 60 * 1_000;
+
+#[derive(Clone)]
+pub struct PostgresExecutorTerminalStore {
+    pool: PgPool,
+}
+
+impl PostgresExecutorTerminalStore {
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct ClaimedTerminalRow {
+    submission_id: Uuid,
+    executor_execution_id: Uuid,
+    resolution_decision_id: Uuid,
+    output_id: Uuid,
+    output_index: i32,
+    job_id: Uuid,
+    tenant_id: String,
+    work_item_id: Uuid,
+    attempt_execution_id: Uuid,
+    attempt_lease_epoch: i64,
+    reducer_owner: String,
+    reducer_lease_epoch: i64,
+    reducer_lease_expires_at_ms: i64,
+    resolved_state: String,
+    error_code: Option<String>,
+    manifest_id: Option<Uuid>,
+    authority_id: Option<Uuid>,
+    storage_backend: Option<String>,
+    storage_namespace: Option<String>,
+    object_key: Option<String>,
+    sha256_hex: Option<String>,
+    byte_size: Option<i64>,
+    media_type: Option<String>,
+}
+
+#[async_trait]
+impl ExecutorTerminalStore for PostgresExecutorTerminalStore {
+    async fn claim_terminal(
+        &self,
+        owner: &str,
+        lease_ms: i64,
+    ) -> Result<Option<ExecutorTerminalLease>, ExecutorTerminalError> {
+        validate_claim(owner, lease_ms)?;
+        let mut tx = self.pool.begin().await.map_err(unavailable)?;
+        let row: Option<ClaimedTerminalRow> = sqlx::query_as(
+            r#"
+            WITH candidate AS (
+              SELECT reduction.submission_id
+              FROM executor_terminal_reductions reduction
+              JOIN provider_submissions submission
+                ON submission.submission_id = reduction.submission_id
+               AND submission.executor_execution_id = reduction.executor_execution_id
+               AND submission.resolution_decision_id = reduction.resolution_decision_id
+               AND submission.state = reduction.resolved_state
+              JOIN executor_executions execution
+                ON execution.executor_execution_id = submission.executor_execution_id
+               AND execution.submission_id = submission.submission_id
+               AND execution.resolution_decision_id = reduction.resolution_decision_id
+               AND execution.state = reduction.resolved_state
+              JOIN jobs job
+                ON job.job_id = submission.job_id
+               AND job.economics_contract_version = 2
+              JOIN job_outputs output
+                ON output.output_id = submission.output_id
+               AND output.job_id = submission.job_id
+               AND output.state IN ('pending', 'running')
+              JOIN work_items work
+                ON work.work_item_id = submission.work_item_id
+               AND work.job_id = submission.job_id
+               AND work.execution_id = submission.created_by_execution_id
+               AND work.lease_epoch = submission.created_by_lease_epoch
+               AND work.state = 'awaiting_executor'
+              JOIN job_attempts attempt
+                ON attempt.execution_id = submission.created_by_execution_id
+               AND attempt.work_item_id = submission.work_item_id
+               AND attempt.lease_epoch = submission.created_by_lease_epoch
+               AND attempt.state = 'handed_off'
+              JOIN provider_submission_attachments attachment
+                ON attachment.submission_id = submission.submission_id
+               AND attachment.job_id = submission.job_id
+               AND attachment.work_item_id = submission.work_item_id
+               AND attachment.attempt_execution_id = submission.created_by_execution_id
+               AND attachment.lease_epoch = submission.created_by_lease_epoch
+              WHERE reduction.state = 'ready'
+                 OR (
+                    reduction.state = 'leased'
+                    AND reduction.lease_expires_at_ms <=
+                        floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT
+                 )
+              ORDER BY reduction.created_at_ms, reduction.submission_id
+              FOR UPDATE OF reduction SKIP LOCKED
+              LIMIT 1
+            ), claimed AS (
+              UPDATE executor_terminal_reductions reduction
+              SET state = 'leased', lease_owner = $1,
+                  lease_epoch = reduction.lease_epoch + 1,
+                  lease_expires_at_ms =
+                    floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT + $2,
+                  claimed_at_ms =
+                    floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT,
+                  updated_at_ms =
+                    floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT
+              FROM candidate
+              WHERE reduction.submission_id = candidate.submission_id
+              RETURNING reduction.*
+            )
+            SELECT claimed.submission_id, claimed.executor_execution_id,
+                   claimed.resolution_decision_id,
+                   submission.output_id, output.output_index, submission.job_id,
+                   submission.tenant_id, submission.work_item_id,
+                   submission.created_by_execution_id AS attempt_execution_id,
+                   submission.created_by_lease_epoch AS attempt_lease_epoch,
+                   claimed.lease_owner AS reducer_owner,
+                   claimed.lease_epoch AS reducer_lease_epoch,
+                   claimed.lease_expires_at_ms AS reducer_lease_expires_at_ms,
+                   decision.resolved_state, decision.error_code,
+                   manifest.manifest_id, authority.authority_id,
+                   authority.storage_backend, authority.storage_namespace,
+                   authority.object_key, authority.sha256_hex,
+                   authority.byte_size, authority.media_type
+            FROM claimed
+            JOIN provider_submissions submission
+              ON submission.submission_id = claimed.submission_id
+             AND submission.executor_execution_id = claimed.executor_execution_id
+             AND submission.resolution_decision_id = claimed.resolution_decision_id
+             AND submission.state = claimed.resolved_state
+            JOIN executor_resolution_decisions decision
+              ON decision.decision_id = claimed.resolution_decision_id
+             AND decision.executor_execution_id = claimed.executor_execution_id
+             AND decision.submission_id = claimed.submission_id
+             AND decision.resolved_state = claimed.resolved_state
+            JOIN job_outputs output
+              ON output.output_id = submission.output_id
+             AND output.job_id = submission.job_id
+            LEFT JOIN executor_result_manifests manifest
+              ON manifest.manifest_id = decision.result_manifest_id
+             AND manifest.executor_execution_id = claimed.executor_execution_id
+             AND manifest.submission_id = claimed.submission_id
+            LEFT JOIN executor_artifact_authorities authority
+              ON authority.authority_id = manifest.artifact_authority_id
+             AND authority.executor_execution_id = claimed.executor_execution_id
+             AND authority.submission_id = claimed.submission_id
+            "#,
+        )
+        .bind(owner)
+        .bind(lease_ms)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(unavailable)?;
+        let lease = row.map(terminal_lease).transpose()?;
+        tx.commit().await.map_err(unavailable)?;
+        Ok(lease)
+    }
+
+    async fn heartbeat_terminal(
+        &self,
+        lease: &ExecutorTerminalLease,
+        lease_ms: i64,
+    ) -> Result<ExecutorTerminalLease, ExecutorTerminalError> {
+        validate_lease(lease, lease_ms)?;
+        let expires_at_ms: Option<i64> = sqlx::query_scalar(
+            r#"
+            UPDATE executor_terminal_reductions
+            SET lease_expires_at_ms = GREATEST(
+                  lease_expires_at_ms,
+                  floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT + $5
+                ),
+                updated_at_ms =
+                  floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT
+            WHERE submission_id = $1 AND resolution_decision_id = $2
+              AND lease_owner = $3 AND lease_epoch = $4 AND state = 'leased'
+              AND lease_expires_at_ms >
+                  floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT
+            RETURNING lease_expires_at_ms
+            "#,
+        )
+        .bind(lease.submission_id)
+        .bind(lease.resolution_decision_id)
+        .bind(&lease.reducer_owner)
+        .bind(lease.reducer_lease_epoch)
+        .bind(lease_ms)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(unavailable)?;
+        let expires_at_ms = expires_at_ms.ok_or(ExecutorTerminalError::StaleLease)?;
+        Ok(ExecutorTerminalLease {
+            reducer_lease_expires_at_ms: expires_at_ms,
+            ..lease.clone()
+        })
+    }
+}
+
+fn terminal_lease(row: ClaimedTerminalRow) -> Result<ExecutorTerminalLease, ExecutorTerminalError> {
+    let outcome = match row.resolved_state.as_str() {
+        "succeeded" => CanonicalExecutorOutcome::Succeeded(ExecutorTerminalArtifact {
+            authority_id: row.authority_id.ok_or(ExecutorTerminalError::Conflict)?,
+            storage_backend: row.storage_backend.ok_or(ExecutorTerminalError::Conflict)?,
+            storage_namespace: row
+                .storage_namespace
+                .ok_or(ExecutorTerminalError::Conflict)?,
+            object_key: row.object_key.ok_or(ExecutorTerminalError::Conflict)?,
+            sha256_hex: row.sha256_hex.ok_or(ExecutorTerminalError::Conflict)?,
+            byte_size: u64::try_from(row.byte_size.ok_or(ExecutorTerminalError::Conflict)?)
+                .map_err(|_| ExecutorTerminalError::Conflict)?,
+            media_type: row.media_type.ok_or(ExecutorTerminalError::Conflict)?,
+        }),
+        "failed" => CanonicalExecutorOutcome::Failed {
+            error_code: terminal_error_code(&row)?,
+        },
+        "uncertain" => CanonicalExecutorOutcome::Uncertain {
+            error_code: terminal_error_code(&row)?,
+        },
+        "canceled" => CanonicalExecutorOutcome::Canceled {
+            error_code: terminal_error_code(&row)?,
+        },
+        _ => return Err(ExecutorTerminalError::Conflict),
+    };
+    if matches!(outcome, CanonicalExecutorOutcome::Succeeded(_)) {
+        if row.error_code.is_some()
+            || row.manifest_id != Some(row.submission_id)
+            || row.authority_id != Some(row.executor_execution_id)
+        {
+            return Err(ExecutorTerminalError::Conflict);
+        }
+    } else if row.manifest_id.is_some() || row.authority_id.is_some() {
+        return Err(ExecutorTerminalError::Conflict);
+    }
+    Ok(ExecutorTerminalLease {
+        submission_id: row.submission_id,
+        executor_execution_id: row.executor_execution_id,
+        resolution_decision_id: row.resolution_decision_id,
+        output_id: row.output_id,
+        output_index: row.output_index,
+        job_id: row.job_id,
+        tenant_id: row.tenant_id,
+        work_item_id: row.work_item_id,
+        attempt_execution_id: row.attempt_execution_id,
+        attempt_lease_epoch: row.attempt_lease_epoch,
+        reducer_owner: row.reducer_owner,
+        reducer_lease_epoch: row.reducer_lease_epoch,
+        reducer_lease_expires_at_ms: row.reducer_lease_expires_at_ms,
+        outcome,
+    })
+}
+
+fn terminal_error_code(row: &ClaimedTerminalRow) -> Result<String, ExecutorTerminalError> {
+    row.error_code
+        .clone()
+        .filter(|value| !value.is_empty())
+        .ok_or(ExecutorTerminalError::Conflict)
+}
+
+fn validate_claim(owner: &str, lease_ms: i64) -> Result<(), ExecutorTerminalError> {
+    if owner.is_empty()
+        || owner.len() > 255
+        || owner.bytes().any(|byte| byte.is_ascii_control())
+        || !(1..=MAX_LEASE_MS).contains(&lease_ms)
+    {
+        Err(ExecutorTerminalError::InvalidInput)
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_lease(
+    lease: &ExecutorTerminalLease,
+    lease_ms: i64,
+) -> Result<(), ExecutorTerminalError> {
+    validate_claim(&lease.reducer_owner, lease_ms)?;
+    if lease.submission_id.is_nil()
+        || lease.executor_execution_id.is_nil()
+        || lease.resolution_decision_id.is_nil()
+        || lease.output_id.is_nil()
+        || lease.job_id.is_nil()
+        || lease.work_item_id.is_nil()
+        || lease.attempt_execution_id.is_nil()
+        || lease.output_index < 0
+        || lease.attempt_lease_epoch <= 0
+        || lease.reducer_lease_epoch <= 0
+    {
+        Err(ExecutorTerminalError::InvalidInput)
+    } else {
+        Ok(())
+    }
+}
+
+fn unavailable(_: sqlx::Error) -> ExecutorTerminalError {
+    ExecutorTerminalError::Unavailable
+}

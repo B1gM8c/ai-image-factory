@@ -104,9 +104,8 @@ after ownership has already moved to the wrong runtime.
 
 ## 6. Remaining Boundary
 
-Executor terminal evidence currently ends at the canonical executor decision.
-The next slice must load that decision through one trusted read model, publish
-the private executor artifact into a deterministic customer namespace, and
-atomically reduce output economics plus parent work, job, idempotency, and
-outbox projections. Public V2 routing stays disabled until that reducer and the
-fake plus credentialed Codex API smokes pass.
+Executor terminal evidence now enters a canonical leased reduction queue through
+migration 0015. The next slice must publish the private executor artifact into a
+deterministic customer namespace and atomically reduce output economics plus
+parent work, job, idempotency, and outbox projections. Public V2 routing stays
+disabled until that reducer and the fake plus credentialed Codex API smokes pass.

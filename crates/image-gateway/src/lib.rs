@@ -17,6 +17,7 @@ mod jobs;
 mod models;
 mod providers;
 mod reconciliation;
+pub mod reduction;
 pub mod runner;
 mod scheduler;
 pub mod settlement;
@@ -55,6 +56,10 @@ pub use generator::{
 pub use reconciliation::{
     InputCleanupOutcome, PostgresReconciliationStore, ReconciliationOutcome, ReconciliationStore,
     reconcile_input_cleanup,
+};
+pub use reduction::{
+    CanonicalExecutorOutcome, ExecutorTerminalArtifact, ExecutorTerminalError,
+    ExecutorTerminalLease, ExecutorTerminalStore, PostgresExecutorTerminalStore,
 };
 pub use settlement::{
     ExecutionSettlementStore, GenerationResultStatus, PostgresExecutionSettlementStore,

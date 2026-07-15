@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 type TestResult<T = ()> = Result<T, String>;
 
-const REQUIRED_COLUMNS: [(&str, &str); 57] = [
+const REQUIRED_COLUMNS: [(&str, &str); 65] = [
     ("usage_events", "tenant_id"),
     ("quota_reservations", "tenant_id"),
     ("quota_reservations", "job_id"),
@@ -71,6 +71,14 @@ const REQUIRED_COLUMNS: [(&str, &str); 57] = [
     ("executor_capacity_allocations", "release_decision_id"),
     ("work_items", "handed_off_at_ms"),
     ("job_attempts", "handed_off_at_ms"),
+    ("executor_terminal_reductions", "submission_id"),
+    ("executor_terminal_reductions", "executor_execution_id"),
+    ("executor_terminal_reductions", "resolution_decision_id"),
+    ("executor_terminal_reductions", "resolved_state"),
+    ("executor_terminal_reductions", "state"),
+    ("executor_terminal_reductions", "lease_owner"),
+    ("executor_terminal_reductions", "lease_epoch"),
+    ("executor_terminal_reductions", "lease_expires_at_ms"),
 ];
 
 const REQUIRED_INDEXES: [&str; 14] = [
@@ -974,8 +982,9 @@ async fn shared_pool_case(pool: &PgPool) -> TestResult {
 
 async fn assert_expected_schema(pool: &PgPool) -> TestResult {
     require(
-        migration_versions(pool).await? == vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14],
-        "applied migration versions must be exactly [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]",
+        migration_versions(pool).await?
+            == vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+        "applied migration versions must be exactly [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]",
     )?;
 
     for (table, column) in REQUIRED_COLUMNS {
