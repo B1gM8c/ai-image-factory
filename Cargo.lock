@@ -886,6 +886,21 @@ name = "image-provider-contracts"
 version = "0.1.0"
 
 [[package]]
+name = "image-provider-dreamina-cli"
+version = "0.1.0"
+dependencies = [
+ "image-cli-runtime",
+ "image-provider-contracts",
+ "image-provider-sdk",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "image-provider-sdk"
 version = "0.1.0"
 

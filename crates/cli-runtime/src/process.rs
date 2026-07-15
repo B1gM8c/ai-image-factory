@@ -9,15 +9,17 @@ use std::{
 
 use thiserror::Error;
 use tokio::{
-    io::AsyncWriteExt,
+    io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     process::{Child, Command},
     runtime::Handle,
+    task::JoinHandle,
     time::{Instant, sleep, timeout, timeout_at},
 };
 
 use crate::command::{CommandSpec, CommandSpecError};
 
 const KILL_REAP_TIMEOUT: Duration = Duration::from_secs(1);
+pub const MAX_CAPTURED_STREAM_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SpawnEvidence {
@@ -31,6 +33,24 @@ pub struct SpawnEvidence {
 pub struct ProcessCompletion {
     pub evidence: SpawnEvidence,
     pub status: ExitStatus,
+    pub stdout: CapturedStream,
+    pub stderr: CapturedStream,
+}
+
+#[derive(Debug, Default, Eq, PartialEq)]
+pub struct CapturedStream {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+impl CapturedStream {
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub fn is_truncated(&self) -> bool {
+        self.truncated
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -83,6 +103,12 @@ pub enum ProcessError {
         source: io::Error,
         cleanup_error: Option<String>,
     },
+    #[error("failed to capture process {stream}: {source}")]
+    Capture {
+        stream: &'static str,
+        #[source]
+        source: io::Error,
+    },
     #[error(
         "process leader exited while its process group remained alive; cleanup error: {cleanup_error:?}"
     )]
@@ -101,6 +127,41 @@ struct ChildProcessGuard {
     child: Option<Child>,
     evidence: SpawnEvidence,
     armed: bool,
+}
+
+struct CaptureTaskGuard {
+    handle: JoinHandle<io::Result<CapturedStream>>,
+}
+
+impl CaptureTaskGuard {
+    fn new(handle: JoinHandle<io::Result<CapturedStream>>) -> Self {
+        Self { handle }
+    }
+
+    async fn finish(mut self, stream: &'static str) -> Result<CapturedStream, ProcessError> {
+        let result = timeout(KILL_REAP_TIMEOUT, &mut self.handle).await;
+        match result {
+            Ok(Ok(Ok(captured))) => Ok(captured),
+            Ok(Ok(Err(source))) => Err(ProcessError::Capture { stream, source }),
+            Ok(Err(error)) => Err(ProcessError::Capture {
+                stream,
+                source: io::Error::other(error.to_string()),
+            }),
+            Err(_) => Err(ProcessError::Capture {
+                stream,
+                source: io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "capture task did not finish after process cleanup",
+                ),
+            }),
+        }
+    }
+}
+
+impl Drop for CaptureTaskGuard {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
 }
 
 impl ChildProcessGuard {
@@ -230,12 +291,37 @@ where
         }
     }
 
-    match timeout_at(deadline, process.child_mut().wait()).await {
+    let capture_tasks = {
+        let child = process.child_mut();
+        match (child.stdout.take(), child.stderr.take()) {
+            (Some(stdout), Some(stderr)) => Some((
+                CaptureTaskGuard::new(tokio::spawn(capture_stream(stdout))),
+                CaptureTaskGuard::new(tokio::spawn(capture_stream(stderr))),
+            )),
+            (None, None) => None,
+            _ => unreachable!("stdout and stderr use the same capture policy"),
+        }
+    };
+    let completion = timeout_at(deadline, process.child_mut().wait()).await;
+
+    match completion {
         Ok(Ok(status)) => {
             match terminate_remaining_group(evidence, spec.termination_grace()).await {
                 Ok(false) => {
                     process.disarm();
-                    Ok(ProcessCompletion { evidence, status })
+                    let (stdout, stderr) = match capture_tasks {
+                        Some((stdout, stderr)) => (
+                            stdout.finish("stdout").await?,
+                            stderr.finish("stderr").await?,
+                        ),
+                        None => (CapturedStream::default(), CapturedStream::default()),
+                    };
+                    Ok(ProcessCompletion {
+                        evidence,
+                        status,
+                        stdout,
+                        stderr,
+                    })
                 }
                 Ok(true) => {
                     process.disarm();
@@ -271,10 +357,13 @@ fn build_command(spec: &CommandSpec) -> Command {
         .args(spec.arguments())
         .current_dir(spec.working_directory().path())
         .env_clear()
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
         .kill_on_drop(true)
         .process_group(0);
+    if spec.output().is_none() {
+        command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    } else {
+        command.stdout(Stdio::null()).stderr(Stdio::null());
+    }
     for (key, value) in spec.environment() {
         command.env(key, value);
     }
@@ -284,6 +373,25 @@ fn build_command(spec: &CommandSpec) -> Command {
         command.stdin(Stdio::piped());
     }
     command
+}
+
+async fn capture_stream(mut stream: impl AsyncRead + Unpin) -> io::Result<CapturedStream> {
+    let mut bytes = Vec::new();
+    let mut truncated = false;
+    let mut buffer = [0_u8; 8 * 1024];
+
+    loop {
+        let read = stream.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        let remaining = MAX_CAPTURED_STREAM_BYTES.saturating_sub(bytes.len());
+        let retained = remaining.min(read);
+        bytes.extend_from_slice(&buffer[..retained]);
+        truncated |= retained < read;
+    }
+
+    Ok(CapturedStream { bytes, truncated })
 }
 
 async fn cleanup(mut process: ChildProcessGuard, grace: Duration) -> Option<String> {

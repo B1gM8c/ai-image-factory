@@ -57,12 +57,17 @@ mod tests {
         assert!(
             all_provider_roadmap()
                 .iter()
-                .any(|provider| provider.id() == "jimeng-cli")
+                .any(|provider| provider.id() == "dreamina-cli")
         );
         assert!(
             all_provider_roadmap()
                 .iter()
-                .any(|provider| provider.id() == "seedance-cli")
+                .any(|provider| provider.id() == "volcengine-ark-media")
+        );
+        assert!(
+            all_provider_roadmap()
+                .iter()
+                .any(|provider| provider.id() == "volcengine-jimeng-visual")
         );
         assert!(
             all_provider_roadmap()

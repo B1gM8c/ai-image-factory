@@ -4,7 +4,8 @@ AI Image Factory is a monorepo for an OpenAI-compatible image API platform.
 
 The first active backend is the existing native Codex CLI path for `gpt-image-2`.
 The platform layout now leaves explicit room for additional providers such as
-Midjourney, JiMeng CLI, and Grok CLI without changing the public Images API.
+Dreamina CLI, Volcengine Ark, and Grok CLI without coupling their native
+protocols to the public API.
 
 ## Workspace
 
@@ -12,17 +13,23 @@ Midjourney, JiMeng CLI, and Grok CLI without changing the public Images API.
 apps/
   admin-console/      Next.js + React + shadcn-style operations console
 crates/
-  image-gateway/      Rust gateway plus workerd/executord/reducerd/reconcilerd binaries
-  provider-contracts/ Shared media/provider/job contracts and roadmap slots
-  scheduler-policy/  Provider-neutral weighted scheduling policy
+  cli-runtime/            Provider-neutral Unix process and artifact runtime
+  image-gateway/          HTTP composition, PostgreSQL workflows, and service binaries
+  provider-contracts/     Immutable media/provider/job contracts and roadmap
+  provider-dreamina-cli/  Inactive official Dreamina CLI protocol adapter
+  provider-sdk/           Inline and remote provider execution ports
+  provider-test-support/  Dev-only provider conformance harness
+  scheduler-policy/       Provider-neutral weighted scheduling policy
 docs/
-  architecture/       Upgrade notes and platform boundaries
+  architecture/           Decisions, activation gates, and target boundaries
 ```
 
 The authoritative target design is
 [`docs/architecture/2026-ai-image-factory-target-architecture.md`](docs/architecture/2026-ai-image-factory-target-architecture.md).
 The current CLI execution boundary and activation gates are documented in
-[`docs/architecture/2026-phase1f-executor-runtime.md`](docs/architecture/2026-phase1f-executor-runtime.md).
+[`docs/architecture/2026-phase2a-provider-runtime-boundaries.md`](docs/architecture/2026-phase2a-provider-runtime-boundaries.md).
+The inactive Dreamina CLI adapter and its production gates are documented in
+[`docs/architecture/2026-phase2b-dreamina-cli-adapter.md`](docs/architecture/2026-phase2b-dreamina-cli-adapter.md).
 Database-bound provider profiles and durable capacity are documented in
 [`docs/architecture/2026-phase1g-execution-binding-capacity.md`](docs/architecture/2026-phase1g-execution-binding-capacity.md).
 

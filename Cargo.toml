@@ -3,6 +3,7 @@ members = [
     "crates/cli-runtime",
     "crates/image-gateway",
     "crates/provider-contracts",
+    "crates/provider-dreamina-cli",
     "crates/provider-sdk",
     "crates/provider-test-support",
     "crates/scheduler-policy",

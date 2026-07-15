@@ -12,8 +12,8 @@ use tempfile::TempDir;
 
 use crate::{
     CliPolicy, CliRuntime, CommandSpec, CommandSpecError, ExitClassification, NoopSpawnObserver,
-    OutputContract, ProcessError, RuntimeError, SpawnEvidence, SpawnObserver, VerifiedExecutable,
-    WorkingDirectory, default_exit_classification,
+    OutputContract, ProcessError, ReceiptCliPolicy, RuntimeError, SpawnEvidence, SpawnObserver,
+    VerifiedExecutable, WorkingDirectory, default_exit_classification,
 };
 
 #[derive(Clone)]
@@ -31,6 +31,31 @@ impl CliPolicy for StaticPolicy {
 
     fn classify_exit(&self, status: &std::process::ExitStatus) -> ExitClassification {
         default_exit_classification(status)
+    }
+}
+
+#[derive(Clone)]
+struct StaticReceiptPolicy {
+    command: CommandSpec,
+}
+
+impl ReceiptCliPolicy for StaticReceiptPolicy {
+    type Request = ();
+    type Receipt = String;
+    type Error = String;
+
+    fn command(&self, _request: &Self::Request) -> Result<CommandSpec, Self::Error> {
+        Ok(self.command.clone())
+    }
+
+    fn classify_exit(&self, status: &std::process::ExitStatus) -> ExitClassification {
+        default_exit_classification(status)
+    }
+
+    fn parse_receipt(&self, stdout: &[u8]) -> Result<Self::Receipt, Self::Error> {
+        std::str::from_utf8(stdout)
+            .map(str::to_owned)
+            .map_err(|_| "receipt is not UTF-8".to_string())
     }
 }
 
@@ -80,7 +105,7 @@ impl SpawnObserver for RecordingObserver {
 }
 
 #[tokio::test]
-async fn clears_environment_and_discards_stdout_and_stderr() {
+async fn clears_environment_and_discards_artifact_process_output() {
     let directory = TempDir::new().expect("temp directory");
     let script = r#"
         i=0
@@ -163,7 +188,7 @@ async fn timeout_terminates_the_entire_process_group_and_waits() {
     command = CommandSpec::new(
         command.executable().clone(),
         command.working_directory().clone(),
-        command.output().clone(),
+        command.output().expect("output contract").clone(),
         Duration::from_millis(80),
         Duration::from_millis(30),
     )
@@ -186,6 +211,48 @@ async fn timeout_terminates_the_entire_process_group_and_waits() {
         *observer.evidence.lock().expect("observer mutex")
     );
     assert_process_group_gone(evidence.process_group_id).await;
+}
+
+#[tokio::test]
+async fn captures_a_bounded_receipt_without_an_artifact_contract() {
+    let directory = TempDir::new().expect("temp directory");
+    let command = receipt_command(directory.path(), "printf '{\"submit_id\":\"task-1\"}'");
+    let result = CliRuntime::new(StaticReceiptPolicy { command })
+        .run_receipt(&(), &mut NoopSpawnObserver)
+        .await
+        .expect("receipt succeeds");
+
+    assert_eq!(result.receipt, r#"{"submit_id":"task-1"}"#);
+}
+
+#[tokio::test]
+async fn rejects_truncated_success_output_after_draining_the_process() {
+    let directory = TempDir::new().expect("temp directory");
+    let command = receipt_command(
+        directory.path(),
+        "i=0; while [ \"$i\" -lt 70000 ]; do printf x >&2; i=$((i + 1)); done; printf ok",
+    );
+    let error = CliRuntime::new(StaticReceiptPolicy { command })
+        .run_receipt(&(), &mut NoopSpawnObserver)
+        .await
+        .expect_err("oversized stderr fails closed");
+
+    assert!(matches!(
+        error,
+        RuntimeError::CapturedOutputTooLarge { stream: "stderr" }
+    ));
+}
+
+#[test]
+fn verifies_an_executable_against_a_pinned_sha256() {
+    let bytes = fs::read("/bin/sh").expect("read shell");
+    let expected: [u8; 32] = Sha256::digest(bytes).into();
+    VerifiedExecutable::new_with_sha256("/bin/sh", expected).expect("matching digest");
+
+    assert!(matches!(
+        VerifiedExecutable::new_with_sha256("/bin/sh", [0_u8; 32]),
+        Err(CommandSpecError::ExecutableDigestMismatch)
+    ));
 }
 
 #[tokio::test]
@@ -346,6 +413,20 @@ fn command(directory: &Path, script: &str, max_output_bytes: u64) -> CommandSpec
         VerifiedExecutable::new("/bin/sh").expect("verified shell"),
         WorkingDirectory::new(directory).expect("working directory"),
         OutputContract::new("result.bin", max_output_bytes).expect("output contract"),
+        Duration::from_secs(3),
+        Duration::from_millis(50),
+    )
+    .expect("command spec")
+    .arg("-c")
+    .expect("shell flag")
+    .arg(script)
+    .expect("shell script")
+}
+
+fn receipt_command(directory: &Path, script: &str) -> CommandSpec {
+    CommandSpec::new_receipt(
+        VerifiedExecutable::new("/bin/sh").expect("verified shell"),
+        WorkingDirectory::new(directory).expect("working directory"),
         Duration::from_secs(3),
         Duration::from_millis(50),
     )

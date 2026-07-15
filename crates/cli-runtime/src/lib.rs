@@ -14,8 +14,8 @@ pub use command::{
 };
 pub use output::{OutputContract, OutputError, STREAM_BUFFER_BYTES, SealedOutput};
 pub use process::{
-    NoopSpawnObserver, ProcessBackend, ProcessCompletion, ProcessError, SpawnEvidence,
-    SpawnObserver, TokioProcessBackend,
+    CapturedStream, MAX_CAPTURED_STREAM_BYTES, NoopSpawnObserver, ProcessBackend,
+    ProcessCompletion, ProcessError, SpawnEvidence, SpawnObserver, TokioProcessBackend,
 };
 
 pub trait CliPolicy {
@@ -25,6 +25,18 @@ pub trait CliPolicy {
     fn command(&self, request: &Self::Request) -> Result<CommandSpec, Self::Error>;
 
     fn classify_exit(&self, status: &ExitStatus) -> ExitClassification;
+}
+
+pub trait ReceiptCliPolicy {
+    type Request: Sync;
+    type Receipt;
+    type Error: Display;
+
+    fn command(&self, request: &Self::Request) -> Result<CommandSpec, Self::Error>;
+
+    fn classify_exit(&self, status: &ExitStatus) -> ExitClassification;
+
+    fn parse_receipt(&self, stdout: &[u8]) -> Result<Self::Receipt, Self::Error>;
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -41,6 +53,13 @@ pub struct RunSuccess<W> {
     pub sink: W,
 }
 
+#[derive(Debug)]
+pub struct ReceiptSuccess<R> {
+    pub evidence: SpawnEvidence,
+    pub status: ExitStatus,
+    pub receipt: R,
+}
+
 #[derive(Clone, Debug)]
 pub struct CliRuntime<P, B = TokioProcessBackend> {
     policy: P,
@@ -55,6 +74,14 @@ pub enum RuntimeError {
     Process(#[from] ProcessError),
     #[error("CLI process failed: {code}")]
     ProcessFailed { code: String },
+    #[error("artifact execution requires an output contract")]
+    MissingOutputContract,
+    #[error("receipt execution must not declare an artifact output contract")]
+    UnexpectedOutputContract,
+    #[error("captured process {stream} exceeded the 64 KiB limit")]
+    CapturedOutputTooLarge { stream: &'static str },
+    #[error("CLI receipt was rejected: {0}")]
+    Receipt(String),
     #[error(transparent)]
     Output(#[from] OutputError),
     #[error("output sealing task failed: {0}")]
@@ -83,6 +110,23 @@ impl<P> CliRuntime<P, TokioProcessBackend> {
         let command = self.command(request)?;
         let completion = self.backend.execute_process(&command, observer).await?;
         finish_run(&self.policy, command, completion, sink).await
+    }
+
+    pub async fn run_receipt<O>(
+        &self,
+        request: &P::Request,
+        observer: &mut O,
+    ) -> Result<ReceiptSuccess<P::Receipt>, RuntimeError>
+    where
+        P: ReceiptCliPolicy,
+        O: SpawnObserver + Send,
+    {
+        let command = self.receipt_command(request)?;
+        if command.output().is_some() {
+            return Err(RuntimeError::UnexpectedOutputContract);
+        }
+        let completion = self.backend.execute_process(&command, observer).await?;
+        finish_receipt(&self.policy, completion)
     }
 }
 
@@ -123,9 +167,42 @@ where
 
 impl<P, B> CliRuntime<P, B>
 where
+    P: ReceiptCliPolicy,
+    B: ProcessBackend,
+{
+    pub async fn run_receipt_with_backend<O>(
+        &self,
+        request: &P::Request,
+        observer: &mut O,
+    ) -> Result<ReceiptSuccess<P::Receipt>, RuntimeError>
+    where
+        O: SpawnObserver + Send,
+    {
+        let command = self.receipt_command(request)?;
+        if command.output().is_some() {
+            return Err(RuntimeError::UnexpectedOutputContract);
+        }
+        let completion = self.backend.execute(&command, observer).await?;
+        finish_receipt(&self.policy, completion)
+    }
+}
+
+impl<P, B> CliRuntime<P, B>
+where
     P: CliPolicy,
 {
     fn command(&self, request: &P::Request) -> Result<CommandSpec, RuntimeError> {
+        self.policy
+            .command(request)
+            .map_err(|error| RuntimeError::Policy(error.to_string()))
+    }
+}
+
+impl<P, B> CliRuntime<P, B>
+where
+    P: ReceiptCliPolicy,
+{
+    fn receipt_command(&self, request: &P::Request) -> Result<CommandSpec, RuntimeError> {
         self.policy
             .command(request)
             .map_err(|error| RuntimeError::Policy(error.to_string()))
@@ -150,7 +227,10 @@ where
     }
 
     let directory = command.working_directory().directory();
-    let contract = command.output().clone();
+    let contract = command
+        .output()
+        .cloned()
+        .ok_or(RuntimeError::MissingOutputContract)?;
     let (output, sink) =
         tokio::task::spawn_blocking(move || output::seal_to_sink(directory, contract, sink))
             .await
@@ -161,6 +241,35 @@ where
         status: completion.status,
         output,
         sink,
+    })
+}
+
+fn finish_receipt<P>(
+    policy: &P,
+    completion: ProcessCompletion,
+) -> Result<ReceiptSuccess<P::Receipt>, RuntimeError>
+where
+    P: ReceiptCliPolicy,
+{
+    match policy.classify_exit(&completion.status) {
+        ExitClassification::Success => {}
+        ExitClassification::Failed { code } => {
+            return Err(RuntimeError::ProcessFailed { code });
+        }
+    }
+    if completion.stdout.is_truncated() {
+        return Err(RuntimeError::CapturedOutputTooLarge { stream: "stdout" });
+    }
+    if completion.stderr.is_truncated() {
+        return Err(RuntimeError::CapturedOutputTooLarge { stream: "stderr" });
+    }
+    let receipt = policy
+        .parse_receipt(completion.stdout.bytes())
+        .map_err(|error| RuntimeError::Receipt(error.to_string()))?;
+    Ok(ReceiptSuccess {
+        evidence: completion.evidence,
+        status: completion.status,
+        receipt,
     })
 }
 

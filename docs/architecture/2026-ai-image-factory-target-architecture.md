@@ -1262,10 +1262,11 @@ ai-image-factory/
         prompt/
         output/
 
-    provider-jimeng-cli/
+    provider-dreamina-cli/
     provider-grok-cli/
     provider-openai-api/
     provider-ark-api/
+    provider-volcengine-visual-api/
     provider-xai-api/
 
     factory-test-support/

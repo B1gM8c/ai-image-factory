@@ -483,8 +483,13 @@ fn map_cli_runtime_error(error: RuntimeError) -> ChildOutcome {
         }
         RuntimeError::Output(_) => ChildOutcome::Failed("codex_no_image_output"),
         RuntimeError::Policy(_)
+        | RuntimeError::MissingOutputContract
+        | RuntimeError::UnexpectedOutputContract
+        | RuntimeError::CapturedOutputTooLarge { .. }
+        | RuntimeError::Receipt(_)
         | RuntimeError::OutputTask(_)
         | RuntimeError::Process(ProcessError::InvalidCommand(_))
+        | RuntimeError::Process(ProcessError::Capture { .. })
         | RuntimeError::Process(ProcessError::ResidualProcessGroup { .. })
         | RuntimeError::Process(ProcessError::Wait { .. }) => {
             ChildOutcome::Uncertain("codex_runtime_failed")

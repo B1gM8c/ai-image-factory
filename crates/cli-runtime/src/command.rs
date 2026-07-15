@@ -2,6 +2,7 @@ use std::{
     collections::BTreeMap,
     ffi::{OsStr, OsString},
     fs::{self, File, OpenOptions},
+    io::Read,
     os::unix::{
         ffi::OsStrExt,
         fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
@@ -11,6 +12,7 @@ use std::{
     time::Duration,
 };
 
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::output::OutputContract;
@@ -39,7 +41,7 @@ pub struct CommandSpec {
     stdin: Vec<u8>,
     wall_timeout: Duration,
     termination_grace: Duration,
-    output: OutputContract,
+    output: Option<OutputContract>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -64,6 +66,8 @@ pub enum CommandSpecError {
     InvalidExecutable,
     #[error("executable identity changed after verification")]
     ExecutableChanged,
+    #[error("executable SHA-256 does not match the configured digest")]
+    ExecutableDigestMismatch,
     #[error("working directory path must be absolute")]
     WorkingDirectoryNotAbsolute,
     #[error("working directory is unavailable: {0}")]
@@ -111,6 +115,42 @@ impl VerifiedExecutable {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    pub fn new_with_sha256(
+        path: impl AsRef<Path>,
+        expected_sha256: [u8; 32],
+    ) -> Result<Self, CommandSpecError> {
+        let executable = Self::new(path)?;
+        let mut file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(&executable.path)
+            .map_err(CommandSpecError::ExecutableUnavailable)?;
+        let metadata = file
+            .metadata()
+            .map_err(CommandSpecError::ExecutableUnavailable)?;
+        if FileIdentity::from_metadata(&metadata) != executable.identity {
+            return Err(CommandSpecError::ExecutableChanged);
+        }
+
+        let mut hasher = Sha256::new();
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let read = file
+                .read(&mut buffer)
+                .map_err(CommandSpecError::ExecutableUnavailable)?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+        }
+        executable.revalidate()?;
+        let actual: [u8; 32] = hasher.finalize().into();
+        if actual != expected_sha256 {
+            return Err(CommandSpecError::ExecutableDigestMismatch);
+        }
+        Ok(executable)
     }
 
     fn revalidate(&self) -> Result<(), CommandSpecError> {
@@ -185,19 +225,28 @@ impl CommandSpec {
         wall_timeout: Duration,
         termination_grace: Duration,
     ) -> Result<Self, CommandSpecError> {
-        if wall_timeout.is_zero() || termination_grace.is_zero() {
-            return Err(CommandSpecError::InvalidTimeout);
-        }
-        Ok(Self {
+        Self::new_inner(
             executable,
-            arguments: Vec::new(),
-            environment: BTreeMap::new(),
             working_directory,
-            stdin: Vec::new(),
+            Some(output),
             wall_timeout,
             termination_grace,
-            output,
-        })
+        )
+    }
+
+    pub fn new_receipt(
+        executable: VerifiedExecutable,
+        working_directory: WorkingDirectory,
+        wall_timeout: Duration,
+        termination_grace: Duration,
+    ) -> Result<Self, CommandSpecError> {
+        Self::new_inner(
+            executable,
+            working_directory,
+            None,
+            wall_timeout,
+            termination_grace,
+        )
     }
 
     pub fn arg(mut self, argument: impl Into<OsString>) -> Result<Self, CommandSpecError> {
@@ -260,14 +309,36 @@ impl CommandSpec {
         self.termination_grace
     }
 
-    pub fn output(&self) -> &OutputContract {
-        &self.output
+    pub fn output(&self) -> Option<&OutputContract> {
+        self.output.as_ref()
     }
 
     pub(crate) fn revalidate(&self) -> Result<(), CommandSpecError> {
         self.executable.revalidate()?;
         self.working_directory.revalidate()?;
         Ok(())
+    }
+
+    fn new_inner(
+        executable: VerifiedExecutable,
+        working_directory: WorkingDirectory,
+        output: Option<OutputContract>,
+        wall_timeout: Duration,
+        termination_grace: Duration,
+    ) -> Result<Self, CommandSpecError> {
+        if wall_timeout.is_zero() || termination_grace.is_zero() {
+            return Err(CommandSpecError::InvalidTimeout);
+        }
+        Ok(Self {
+            executable,
+            arguments: Vec::new(),
+            environment: BTreeMap::new(),
+            working_directory,
+            stdin: Vec::new(),
+            wall_timeout,
+            termination_grace,
+            output,
+        })
     }
 }
 

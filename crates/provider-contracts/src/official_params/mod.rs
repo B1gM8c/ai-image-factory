@@ -1,6 +1,7 @@
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OfficialParamsKind {
     OpenAiCodexCli,
+    DreaminaCli,
     XaiImage,
     XaiVideo,
     VolcengineJimengImage,

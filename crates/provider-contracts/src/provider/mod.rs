@@ -218,12 +218,28 @@ pub mod planned {
             intended_scope: "image generation",
         },
         ProviderRoadmapMetadata {
-            id: "jimeng-cli",
-            display_name: "JiMeng CLI",
-            owner: "volcengine",
+            id: "dreamina-cli",
+            display_name: "Dreamina CLI",
+            owner: "bytedance",
             execution_mode: ProviderExecutionMode::CliBridge,
+            candidate_models: &["dreamina-image-5.0", "seedance2.0", "seedance2.0fast"],
+            intended_scope: "official Dreamina CLI image and video generation",
+        },
+        ProviderRoadmapMetadata {
+            id: "volcengine-ark-media",
+            display_name: "Volcengine Ark Media API",
+            owner: "volcengine",
+            execution_mode: ProviderExecutionMode::ManagedApi,
+            candidate_models: &["seedream", "seedance"],
+            intended_scope: "Ark bearer-authenticated image and video APIs",
+        },
+        ProviderRoadmapMetadata {
+            id: "volcengine-jimeng-visual",
+            display_name: "Volcengine JiMeng Visual OpenAPI",
+            owner: "volcengine",
+            execution_mode: ProviderExecutionMode::ManagedApi,
             candidate_models: &["jimeng-image", "jimeng-video"],
-            intended_scope: "image and video generation",
+            intended_scope: "AK/SK-signed JiMeng Visual image and video APIs",
         },
         ProviderRoadmapMetadata {
             id: "grok-cli",
@@ -232,14 +248,6 @@ pub mod planned {
             execution_mode: ProviderExecutionMode::CliBridge,
             candidate_models: &["grok-image"],
             intended_scope: "image generation",
-        },
-        ProviderRoadmapMetadata {
-            id: "seedance-cli",
-            display_name: "Seedance CLI",
-            owner: "byteplus",
-            execution_mode: ProviderExecutionMode::CliBridge,
-            candidate_models: &["seedance-video"],
-            intended_scope: "video generation",
         },
     ];
 }
