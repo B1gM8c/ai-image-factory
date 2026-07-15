@@ -112,7 +112,7 @@ const REQUIRED_COLUMNS: [(&str, &str); 93] = [
     ("executor_resolution_decisions", "provider_submit_intent_id"),
 ];
 
-const REQUIRED_INDEXES: [&str; 17] = [
+const REQUIRED_INDEXES: [&str; 18] = [
     "usage_events_tenant_created_at_ms_idx",
     "gateway_api_keys_project_id_idx",
     "quota_reservations_active_tenant_idx",
@@ -130,6 +130,7 @@ const REQUIRED_INDEXES: [&str; 17] = [
     "provider_remote_tasks_poll_claim_idx",
     "provider_submit_intents_remote_operation_uidx",
     "provider_submit_recoveries_claim_idx",
+    "provider_submit_recoveries_deadline_idx",
 ];
 
 #[tokio::test]
@@ -1018,9 +1019,9 @@ async fn assert_expected_schema(pool: &PgPool) -> TestResult {
     require(
         migration_versions(pool).await?
             == vec![
-                0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
+                0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21,
             ],
-        "applied migration versions must be exactly [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]",
+        "applied migration versions must be exactly [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21]",
     )?;
 
     for (table, column) in REQUIRED_COLUMNS {
@@ -1073,8 +1074,9 @@ async fn assert_expected_schema(pool: &PgPool) -> TestResult {
             'provider_remote_tasks'::regclass
           )
           AND tgname IN (
-            'executor_capacity_allocations_heartbeat_time_guard',
-            'provider_remote_task_recovery_deadline_guard'
+              'executor_capacity_allocations_heartbeat_time_guard',
+              'executor_capacity_submit_deadline_hold_guard',
+              'provider_remote_task_recovery_deadline_guard'
           )
         "#,
     )
@@ -1082,8 +1084,8 @@ async fn assert_expected_schema(pool: &PgPool) -> TestResult {
     .await
     .map_err(|error| format!("failed to query provider heartbeat triggers: {error}"))?;
     require(
-        provider_heartbeat_triggers == 2,
-        "provider heartbeat and recovered-attach deadline guards must exist",
+        provider_heartbeat_triggers == 3,
+        "provider heartbeat, capacity quarantine, and attach deadline guards must exist",
     )?;
     for (index, expression) in [
         (

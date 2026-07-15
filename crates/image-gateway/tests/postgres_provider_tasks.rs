@@ -1257,6 +1257,724 @@ async fn capacity_heartbeat_migration_fails_closed_on_future_legacy_state() -> T
 }
 
 #[tokio::test]
+async fn deadline_quarantine_migration_accepts_due_active_recovery() -> TestResult {
+    let Some(database) = TestDatabase::new_before_deadline_quarantine().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let executor =
+            seed_running_submission_with_lease(&database.pool, "deadline-upgrade", 5_000).await?;
+        let store = PostgresProviderTaskStore::new(database.pool.clone());
+        let mut reservation = reservation_request(&executor);
+        reservation.provider_timeout_ms = 60;
+        store
+            .reserve_submit(&reservation)
+            .await
+            .map_err(debug_error)?;
+        store
+            .start_submit(&reservation)
+            .await
+            .map_err(debug_error)?;
+        tokio::time::sleep(Duration::from_millis(90)).await;
+
+        let mut business = database.pool.begin().await.map_err(debug_error)?;
+        sqlx::query(
+            r#"
+            SELECT submission_id
+            FROM provider_remote_submit_intents
+            WHERE submission_id = $1
+            FOR UPDATE
+            "#,
+        )
+        .bind(executor.submission_id)
+        .fetch_one(&mut *business)
+        .await
+        .map_err(debug_error)?;
+        let mut migration_connection = database.pool.acquire().await.map_err(debug_error)?;
+        let migration_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *migration_connection)
+            .await
+            .map_err(debug_error)?;
+        let intent_relation_oid: i64 =
+            sqlx::query_scalar("SELECT 'provider_remote_submit_intents'::regclass::oid::bigint")
+                .fetch_one(&database.pool)
+                .await
+                .map_err(debug_error)?;
+        let mut migration = tokio::spawn(async move {
+            sqlx::raw_sql(include_str!(
+                "../migrations/0021_provider_submit_deadline_quarantine.sql"
+            ))
+            .execute(&mut *migration_connection)
+            .await
+        });
+        let lock_observation = match tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let locks: Vec<(String, bool)> = sqlx::query_as(
+                    r#"
+                    SELECT mode, granted
+                    FROM pg_locks
+                    WHERE pid = $1 AND relation::bigint = $2
+                    ORDER BY mode, granted
+                    "#,
+                )
+                .bind(migration_pid)
+                .bind(intent_relation_oid)
+                .fetch_all(&database.pool)
+                .await
+                .map_err(debug_error)?;
+                if locks
+                    .iter()
+                    .any(|(mode, granted)| mode == "AccessExclusiveLock" && !granted)
+                {
+                    return Ok(locks);
+                }
+                if migration.is_finished() {
+                    return Err("0021 completed before its blocked lock was observable".to_string());
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        {
+            Ok(observation) => observation,
+            Err(_) => Err("0021 did not request its blocking table lock in time".to_string()),
+        };
+        business.commit().await.map_err(debug_error)?;
+        let migration_result =
+            match tokio::time::timeout(Duration::from_secs(5), &mut migration).await {
+                Ok(Ok(Ok(_))) => Ok(()),
+                Ok(Ok(Err(error))) => Err(format!(
+                    "20 -> 21 migration rejected due active recovery: {error}"
+                )),
+                Ok(Err(error)) => Err(format!("20 -> 21 migration task failed: {error}")),
+                Err(_) => {
+                    migration.abort();
+                    let _ = migration.await;
+                    Err("20 -> 21 migration remained blocked after business commit".to_string())
+                }
+            };
+        migration_result?;
+        let locks = lock_observation?;
+        require(
+            !locks
+                .iter()
+                .any(|(mode, granted)| mode == "ShareRowExclusiveLock" && *granted),
+            format!("0021 held a weaker lock before ACCESS EXCLUSIVE: {locks:?}"),
+        )?;
+        let resolved = store
+            .resolve_due_submit_deadline(&claim_scope())
+            .await
+            .map_err(debug_error)?
+            .ok_or_else(|| "migrated due recovery was not resolvable".to_string())?;
+        require(
+            resolved.state == ProviderSubmitIntentState::DeadlineQuarantined,
+            "20 -> 21 migration changed deadline resolver semantics",
+        )?;
+        let index_definition: String = sqlx::query_scalar(
+            r#"
+            SELECT lower(indexdef) FROM pg_indexes
+            WHERE schemaname = current_schema()
+              AND indexname = 'provider_submit_recoveries_deadline_idx'
+            "#,
+        )
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(
+            index_definition
+                .contains("provider_account_id, provider_deadline_at_ms, submission_id")
+                && !index_definition.contains("provider_id, provider_account_id")
+                && index_definition.contains("where (state = 'active'::text)"),
+            format!("deadline migration created the wrong queue index: {index_definition}"),
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
+async fn provider_submit_commit_classifies_deferred_projection_conflicts() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let store = PostgresProviderTaskStore::new(database.pool.clone());
+        let receipt_executor =
+            seed_running_submission_with_lease(&database.pool, "deferred-receipt", 5_000).await?;
+        let mut receipt_reservation = reservation_request(&receipt_executor);
+        receipt_reservation.provider_timeout_ms = 60_000;
+        store
+            .reserve_submit(&receipt_reservation)
+            .await
+            .map_err(debug_error)?;
+        store
+            .start_submit(&receipt_reservation)
+            .await
+            .map_err(debug_error)?;
+        sqlx::raw_sql(
+            r#"
+            CREATE FUNCTION test_deferred_submit_conflict() RETURNS TRIGGER AS $$
+            BEGIN
+                RAISE EXCEPTION USING
+                    ERRCODE = 'P0001',
+                    MESSAGE = 'injected deferred provider submit conflict';
+            END;
+            $$ LANGUAGE plpgsql;
+
+            CREATE CONSTRAINT TRIGGER test_deferred_submit_receipt_conflict
+            AFTER UPDATE ON provider_remote_submit_intents
+            DEFERRABLE INITIALLY DEFERRED
+            FOR EACH ROW
+            WHEN (NEW.receipt_event_identity = 'receipt-deferred-conflict')
+            EXECUTE FUNCTION test_deferred_submit_conflict();
+            "#,
+        )
+        .execute(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(
+            store
+                .record_submit_receipt(&submit_receipt(
+                    &receipt_executor,
+                    "operation-deferred-conflict",
+                    "receipt-deferred-conflict",
+                ))
+                .await
+                == Err(ProviderTaskStoreError::Conflict),
+            "deferred receipt projection failure was not classified as conflict",
+        )?;
+        require(
+            store
+                .load_submit_intent(receipt_executor.submission_id)
+                .await
+                .map_err(debug_error)?
+                .is_some_and(|intent| {
+                    intent.state == ProviderSubmitIntentState::Sending
+                        && intent.remote_operation_id.is_none()
+                }),
+            "failed receipt commit did not roll back its intent update",
+        )?;
+
+        let deadline_executor =
+            seed_running_submission_with_lease(&database.pool, "deferred-deadline", 5_000).await?;
+        let mut deadline_reservation = reservation_request(&deadline_executor);
+        deadline_reservation.provider_timeout_ms = 40;
+        store
+            .reserve_submit(&deadline_reservation)
+            .await
+            .map_err(debug_error)?;
+        store
+            .start_submit(&deadline_reservation)
+            .await
+            .map_err(debug_error)?;
+        sqlx::raw_sql(
+            r#"
+            CREATE CONSTRAINT TRIGGER test_deferred_submit_deadline_conflict
+            AFTER UPDATE ON provider_remote_submit_intents
+            DEFERRABLE INITIALLY DEFERRED
+            FOR EACH ROW
+            WHEN (NEW.state = 'deadline_quarantined')
+            EXECUTE FUNCTION test_deferred_submit_conflict();
+            "#,
+        )
+        .execute(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        tokio::time::sleep(Duration::from_millis(70)).await;
+        require(
+            store.resolve_due_submit_deadline(&claim_scope()).await
+                == Err(ProviderTaskStoreError::Conflict),
+            "deferred deadline projection failure was not classified as conflict",
+        )?;
+        require(
+            store
+                .load_submit_intent(deadline_executor.submission_id)
+                .await
+                .map_err(debug_error)?
+                .is_some_and(|intent| intent.state == ProviderSubmitIntentState::Sending),
+            "failed deadline commit did not roll back quarantine",
+        )?;
+        sqlx::raw_sql(
+            r#"
+            DROP TRIGGER test_deferred_submit_deadline_conflict
+                ON provider_remote_submit_intents;
+            DROP TRIGGER test_deferred_submit_receipt_conflict
+                ON provider_remote_submit_intents;
+            DROP FUNCTION test_deferred_submit_conflict();
+            "#,
+        )
+        .execute(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(
+            store
+                .resolve_due_submit_deadline(&claim_scope())
+                .await
+                .map_err(debug_error)?
+                .is_some_and(|intent| {
+                    intent.state == ProviderSubmitIntentState::DeadlineQuarantined
+                }),
+            "deadline did not resolve after removing the injected conflict",
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
+async fn submit_deadline_quarantines_capacity_and_preserves_late_receipts() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let executor =
+            seed_running_submission_with_lease(&database.pool, "deadline-quarantine", 5_000)
+                .await?;
+        let store = PostgresProviderTaskStore::new(database.pool.clone());
+        let mut reservation = reservation_request(&executor);
+        reservation.provider_timeout_ms = 80;
+        store
+            .reserve_submit(&reservation)
+            .await
+            .map_err(debug_error)?;
+        store
+            .start_submit(&reservation)
+            .await
+            .map_err(debug_error)?;
+        let ambiguity = submit_failure(
+            &executor,
+            ProviderSubmitFailureKind::OutcomeUnknown,
+            "deadline-ambiguity",
+            "provider_submit_ambiguous",
+        );
+        store
+            .record_submit_failure(&ambiguity)
+            .await
+            .map_err(debug_error)?;
+        tokio::time::sleep(Duration::from_millis(120)).await;
+
+        let mut plan_tx = database.pool.begin().await.map_err(debug_error)?;
+        sqlx::query("SET LOCAL enable_seqscan = off")
+            .execute(&mut *plan_tx)
+            .await
+            .map_err(debug_error)?;
+        let plan: Vec<String> = sqlx::query_scalar(
+            r#"
+            EXPLAIN (COSTS OFF)
+            SELECT recovery.submission_id, recovery.executor_execution_id
+            FROM provider_submit_recoveries recovery
+            JOIN provider_remote_submit_intents intent
+              ON intent.submission_id = recovery.submission_id
+             AND intent.executor_execution_id = recovery.executor_execution_id
+            JOIN executor_executions execution
+              ON execution.executor_execution_id = recovery.executor_execution_id
+             AND execution.submission_id = recovery.submission_id
+            JOIN provider_submissions submission
+              ON submission.executor_execution_id = recovery.executor_execution_id
+             AND submission.submission_id = recovery.submission_id
+            JOIN executor_capacity_allocations allocation
+              ON allocation.executor_execution_id = recovery.executor_execution_id
+             AND allocation.submission_id = recovery.submission_id
+            WHERE recovery.provider_id = $1
+              AND recovery.provider_account_id = $2
+              AND recovery.state = 'active'
+              AND recovery.provider_deadline_at_ms <= floor(
+                    extract(epoch FROM statement_timestamp()) * 1000
+                  )::BIGINT
+              AND intent.state IN ('sending', 'outcome_unknown', 'operation_known')
+              AND execution.state = 'running'
+              AND submission.state = 'running'
+              AND allocation.state = 'held'
+            ORDER BY recovery.provider_deadline_at_ms, recovery.submission_id
+            FOR UPDATE OF execution, submission, allocation SKIP LOCKED
+            LIMIT 1
+            "#,
+        )
+        .bind("provider-test")
+        .bind(ACCOUNT_ID)
+        .fetch_all(&mut *plan_tx)
+        .await
+        .map_err(debug_error)?;
+        plan_tx.rollback().await.map_err(debug_error)?;
+        let plan = plan.join("\n");
+        require(
+            plan.contains("provider_submit_recoveries_deadline_idx")
+                && !plan
+                    .lines()
+                    .any(|line| line.trim_start().starts_with("Sort")),
+            format!("deadline resolver lost its bounded queue plan:\n{plan}"),
+        )?;
+
+        let mut resolvers = tokio::task::JoinSet::new();
+        for _ in 0..64 {
+            let store = store.clone();
+            resolvers.spawn(async move { store.resolve_due_submit_deadline(&claim_scope()).await });
+        }
+        let mut winners = 0;
+        while let Some(result) = resolvers.join_next().await {
+            if result.map_err(debug_error)?.map_err(debug_error)?.is_some() {
+                winners += 1;
+            }
+        }
+        require(
+            winners == 1,
+            "concurrent deadline resolvers did not elect one winner",
+        )?;
+
+        let intent = store
+            .load_submit_intent(executor.submission_id)
+            .await
+            .map_err(debug_error)?
+            .ok_or_else(|| "deadline resolver lost its submit intent".to_string())?;
+        require(
+            intent.state == ProviderSubmitIntentState::DeadlineQuarantined
+                && intent.remote_operation_id.is_none(),
+            "deadline resolver did not preserve unknown remote effect",
+        )?;
+        let projection: (String, String, String, String, String, String, i32, String) =
+            sqlx::query_as(
+                r#"
+                SELECT execution.state, submission.state, decision.source,
+                       decision.resolved_state, decision.error_code,
+                       allocation.state, policy.allocated_count, recovery.state
+                FROM executor_executions execution
+                JOIN provider_submissions submission
+                  ON submission.executor_execution_id = execution.executor_execution_id
+                 AND submission.submission_id = execution.submission_id
+                JOIN executor_resolution_decisions decision
+                  ON decision.decision_id = execution.resolution_decision_id
+                JOIN executor_capacity_allocations allocation
+                  ON allocation.executor_execution_id = execution.executor_execution_id
+                 AND allocation.submission_id = execution.submission_id
+                JOIN executor_resource_policies policy
+                  ON policy.resource_policy_id = allocation.resource_policy_id
+                 AND policy.revision = allocation.resource_policy_revision
+                JOIN provider_submit_recoveries recovery
+                  ON recovery.executor_execution_id = execution.executor_execution_id
+                 AND recovery.submission_id = execution.submission_id
+                WHERE execution.executor_execution_id = $1
+                "#,
+            )
+            .bind(executor.executor_execution_id)
+            .fetch_one(&database.pool)
+            .await
+            .map_err(debug_error)?;
+        require(
+            projection
+                == (
+                    "uncertain".to_string(),
+                    "uncertain".to_string(),
+                    "remote_submit_deadline".to_string(),
+                    "uncertain".to_string(),
+                    "provider_submit_deadline".to_string(),
+                    "held".to_string(),
+                    1,
+                    "closed".to_string(),
+                ),
+            format!("deadline quarantine projection diverged: {projection:?}"),
+        )?;
+        let durable_counts: (i64, i64, i64) = sqlx::query_as(
+            r#"
+            SELECT
+              (SELECT COUNT(*) FROM executor_resolution_decisions
+               WHERE executor_execution_id = $1),
+              (SELECT COUNT(*) FROM executor_terminal_reductions
+               WHERE executor_execution_id = $1),
+              (SELECT COUNT(*) FROM provider_remote_tasks
+               WHERE executor_execution_id = $1)
+            "#,
+        )
+        .bind(executor.executor_execution_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(
+            durable_counts == (1, 1, 0),
+            format!("deadline resolver duplicated durable evidence: {durable_counts:?}"),
+        )?;
+        require(
+            store
+                .resolve_due_submit_deadline(&claim_scope())
+                .await
+                .map_err(debug_error)?
+                .is_none(),
+            "resolved deadline remained claimable",
+        )?;
+        require(
+            store
+                .record_submit_failure(&ambiguity)
+                .await
+                .map_err(debug_error)?
+                .state
+                == ProviderSubmitIntentState::DeadlineQuarantined,
+            "exact ambiguity replay lost its terminal evidence",
+        )?;
+        require(
+            sqlx::query(
+                r#"
+                UPDATE executor_capacity_allocations
+                SET state = 'released', released_at_ms = last_heartbeat_at_ms,
+                    release_decision_id = $1, released_state = 'uncertain',
+                    release_reason = 'terminal_evidence'
+                WHERE executor_execution_id = $1
+                "#,
+            )
+            .bind(executor.executor_execution_id)
+            .execute(&database.pool)
+            .await
+            .is_err(),
+            "raw SQL released deadline-quarantined provider capacity",
+        )?;
+
+        let receipt = submit_receipt(
+            &executor,
+            "operation-late-after-deadline",
+            "receipt-late-after-deadline",
+        );
+        let late = store
+            .record_submit_receipt(&receipt)
+            .await
+            .map_err(debug_error)?;
+        require(
+            late.state == ProviderSubmitIntentState::DeadlineQuarantined
+                && late.remote_operation_id.as_deref() == Some("operation-late-after-deadline"),
+            "late receipt changed the customer terminal result or lost provider identity",
+        )?;
+        require(
+            store
+                .record_submit_receipt(&receipt)
+                .await
+                .map_err(debug_error)?
+                == late,
+            "exact late receipt replay did not converge",
+        )?;
+        let conflicting = submit_receipt(
+            &executor,
+            "operation-conflicting-after-deadline",
+            "receipt-conflicting-after-deadline",
+        );
+        require(
+            store.record_submit_receipt(&conflicting).await
+                == Err(ProviderTaskStoreError::Conflict),
+            "conflicting late receipt rewrote provider identity",
+        )?;
+        require(
+            store
+                .attach(&attach_request(
+                    &executor,
+                    "operation-late-after-deadline",
+                    "attach-late-after-deadline",
+                ))
+                .await
+                == Err(ProviderTaskStoreError::Conflict),
+            "deadline-quarantined receipt reopened provider attachment",
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
+async fn submit_deadline_races_converge_without_deadlock() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let executor =
+            seed_running_submission_with_lease(&database.pool, "deadline-receipt-race", 5_000)
+                .await?;
+        let store = PostgresProviderTaskStore::new(database.pool.clone());
+        let mut reservation = reservation_request(&executor);
+        reservation.provider_timeout_ms = 80;
+        store
+            .reserve_submit(&reservation)
+            .await
+            .map_err(debug_error)?;
+        store
+            .start_submit(&reservation)
+            .await
+            .map_err(debug_error)?;
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        let receipt = submit_receipt(
+            &executor,
+            "operation-deadline-race",
+            "receipt-deadline-race",
+        );
+        let scope = claim_scope();
+        let (receipt_result, deadline_result) =
+            tokio::time::timeout(Duration::from_secs(3), async {
+                tokio::join!(
+                    store.record_submit_receipt(&receipt),
+                    store.resolve_due_submit_deadline(&scope)
+                )
+            })
+            .await
+            .map_err(|_| "deadline and late receipt deadlocked".to_string())?;
+        receipt_result.map_err(debug_error)?;
+        if deadline_result.map_err(debug_error)?.is_none() {
+            store
+                .resolve_due_submit_deadline(&claim_scope())
+                .await
+                .map_err(debug_error)?
+                .ok_or_else(|| "skipped deadline did not become claimable".to_string())?;
+        }
+        let intent = store
+            .load_submit_intent(executor.submission_id)
+            .await
+            .map_err(debug_error)?
+            .ok_or_else(|| "deadline race lost its intent".to_string())?;
+        require(
+            intent.state == ProviderSubmitIntentState::DeadlineQuarantined
+                && intent.remote_operation_id.as_deref() == Some("operation-deadline-race")
+                && intent.receipt_event_identity.as_deref() == Some("receipt-deadline-race"),
+            "deadline and receipt race did not preserve both terminal and provider evidence",
+        )?;
+        let evidence: (i64, i64, String) = sqlx::query_as(
+            r#"
+            SELECT
+              (SELECT COUNT(*) FROM executor_resolution_decisions
+               WHERE executor_execution_id = $1),
+              (SELECT COUNT(*) FROM provider_remote_tasks
+               WHERE executor_execution_id = $1),
+              (SELECT state FROM executor_capacity_allocations
+               WHERE executor_execution_id = $1)
+            "#,
+        )
+        .bind(executor.executor_execution_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(
+            evidence == (1, 0, "held".to_string()),
+            format!("deadline race produced conflicting evidence: {evidence:?}"),
+        )?;
+
+        let attach_executor =
+            seed_running_submission_with_lease(&database.pool, "deadline-attach-race", 5_000)
+                .await?;
+        let mut attach_reservation = reservation_request(&attach_executor);
+        attach_reservation.provider_timeout_ms = 80;
+        store
+            .reserve_submit(&attach_reservation)
+            .await
+            .map_err(debug_error)?;
+        store
+            .start_submit(&attach_reservation)
+            .await
+            .map_err(debug_error)?;
+        store
+            .record_submit_receipt(&submit_receipt(
+                &attach_executor,
+                "operation-deadline-attach-race",
+                "receipt-deadline-attach-race",
+            ))
+            .await
+            .map_err(debug_error)?;
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        let attach = attach_request(
+            &attach_executor,
+            "operation-deadline-attach-race",
+            "attach-deadline-race",
+        );
+        let attach_scope = claim_scope();
+        let (attach_result, deadline_result) =
+            tokio::time::timeout(Duration::from_secs(3), async {
+                tokio::join!(
+                    store.attach(&attach),
+                    store.resolve_due_submit_deadline(&attach_scope)
+                )
+            })
+            .await
+            .map_err(|_| "deadline and attach deadlocked".to_string())?;
+        require(
+            matches!(
+                attach_result,
+                Err(ProviderTaskStoreError::Conflict | ProviderTaskStoreError::StaleLease)
+            ),
+            "deadline-due attach retained authority",
+        )?;
+        if deadline_result.map_err(debug_error)?.is_none() {
+            store
+                .resolve_due_submit_deadline(&claim_scope())
+                .await
+                .map_err(debug_error)?
+                .ok_or_else(|| "attach-skipped deadline did not become claimable".to_string())?;
+        }
+        let attach_projection: (String, i64) = sqlx::query_as(
+            r#"
+            SELECT intent.state,
+                   (SELECT COUNT(*) FROM provider_remote_tasks task
+                    WHERE task.submission_id = intent.submission_id)
+            FROM provider_remote_submit_intents intent
+            WHERE intent.submission_id = $1
+            "#,
+        )
+        .bind(attach_executor.submission_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(
+            attach_projection == ("deadline_quarantined".to_string(), 0),
+            format!("attach race escaped quarantine: {attach_projection:?}"),
+        )?;
+
+        let heartbeat_executor =
+            seed_running_submission_with_lease(&database.pool, "deadline-heartbeat-race", 20)
+                .await?;
+        let mut heartbeat_reservation = reservation_request(&heartbeat_executor);
+        heartbeat_reservation.provider_timeout_ms = 120;
+        store
+            .reserve_submit(&heartbeat_reservation)
+            .await
+            .map_err(debug_error)?;
+        store
+            .start_submit(&heartbeat_reservation)
+            .await
+            .map_err(debug_error)?;
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let recovery = store
+            .claim_submit_recovery(&claim_scope(), "deadline-heartbeat-owner", 2_000)
+            .await
+            .map_err(debug_error)?
+            .ok_or_else(|| "pre-deadline recovery was not claimable".to_string())?;
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        let heartbeat_scope = claim_scope();
+        let (heartbeat_result, deadline_result) =
+            tokio::time::timeout(Duration::from_secs(3), async {
+                tokio::join!(
+                    store.heartbeat_submit_recovery(&recovery, 2_000),
+                    store.resolve_due_submit_deadline(&heartbeat_scope)
+                )
+            })
+            .await
+            .map_err(|_| "deadline and recovery heartbeat deadlocked".to_string())?;
+        require(
+            heartbeat_result == Err(ProviderTaskStoreError::StaleLease),
+            "post-deadline recovery heartbeat retained authority",
+        )?;
+        if deadline_result.map_err(debug_error)?.is_none() {
+            store
+                .resolve_due_submit_deadline(&claim_scope())
+                .await
+                .map_err(debug_error)?
+                .ok_or_else(|| "heartbeat-skipped deadline did not become claimable".to_string())?;
+        }
+        require(
+            store
+                .load_submit_intent(heartbeat_executor.submission_id)
+                .await
+                .map_err(debug_error)?
+                .is_some_and(|intent| {
+                    intent.state == ProviderSubmitIntentState::DeadlineQuarantined
+                }),
+            "heartbeat race did not converge to deadline quarantine",
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
 async fn submit_lifecycle_migration_backfills_attached_receipts() -> TestResult {
     let Some(database) = TestDatabase::new_before_submit_lifecycle().await? else {
         return Ok(());
@@ -1761,6 +2479,27 @@ impl TestDatabase {
                     )),
                 };
             }
+        }
+        Ok(Some(database))
+    }
+
+    async fn new_before_deadline_quarantine() -> TestResult<Option<Self>> {
+        let Some(database) = Self::new_before_capacity_heartbeats().await? else {
+            return Ok(None);
+        };
+        if let Err(error) = sqlx::raw_sql(include_str!(
+            "../migrations/0020_provider_capacity_heartbeats.sql"
+        ))
+        .execute(&database.pool)
+        .await
+        {
+            let cleanup = database.cleanup().await;
+            return match cleanup {
+                Ok(()) => Err(format!("pre-0021 migration failed: {error}")),
+                Err(cleanup) => Err(format!(
+                    "pre-0021 migration failed: {error}; cleanup failed: {cleanup}"
+                )),
+            };
         }
         Ok(Some(database))
     }

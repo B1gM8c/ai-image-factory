@@ -84,6 +84,7 @@ pub enum ProviderSubmitIntentState {
     OperationKnown,
     Attached,
     Rejected,
+    DeadlineQuarantined,
 }
 
 impl ProviderSubmitIntentState {
@@ -95,6 +96,7 @@ impl ProviderSubmitIntentState {
             Self::OperationKnown => "operation_known",
             Self::Attached => "attached",
             Self::Rejected => "rejected",
+            Self::DeadlineQuarantined => "deadline_quarantined",
         }
     }
 }
@@ -399,6 +401,11 @@ pub trait ProviderTaskStore: Send + Sync + 'static {
     async fn load_submit_intent(
         &self,
         submission_id: Uuid,
+    ) -> Result<Option<ProviderSubmitIntent>, ProviderTaskStoreError>;
+
+    async fn resolve_due_submit_deadline(
+        &self,
+        scope: &ProviderTaskClaimScope,
     ) -> Result<Option<ProviderSubmitIntent>, ProviderTaskStoreError>;
 
     async fn claim_submit_recovery(

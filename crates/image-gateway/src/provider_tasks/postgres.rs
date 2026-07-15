@@ -21,6 +21,7 @@ use super::{
 const MAX_POLL_AFTER_MS: i64 = 24 * 60 * 60 * 1_000;
 const MAX_LEASE_MS: i64 = 24 * 60 * 60 * 1_000;
 const MAX_PROVIDER_TIMEOUT_MS: i64 = 30 * 24 * 60 * 60 * 1_000;
+const SUBMIT_DEADLINE_ERROR: &str = "provider_submit_deadline";
 
 #[derive(Clone)]
 pub struct PostgresProviderTaskStore {
@@ -146,6 +147,13 @@ struct RecoveryClaimRow {
 }
 
 #[derive(sqlx::FromRow)]
+struct SubmitDeadlineCandidateRow {
+    submission_id: Uuid,
+    executor_execution_id: Uuid,
+    database_now_ms: i64,
+}
+
+#[derive(sqlx::FromRow)]
 struct ExistingObservation {
     observation_id: Uuid,
     source: String,
@@ -199,6 +207,9 @@ struct SubmitParentRow {
     launch_owner: Option<String>,
     launch_lease_epoch: Option<i64>,
     allocation_state: String,
+    execution_resolution_decision_id: Option<Uuid>,
+    submission_resolution_decision_id: Option<Uuid>,
+    resolution_source: Option<String>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -434,6 +445,7 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
                     ProviderSubmitIntentState::OutcomeUnknown
                         | ProviderSubmitIntentState::OperationKnown
                         | ProviderSubmitIntentState::Attached
+                        | ProviderSubmitIntentState::DeadlineQuarantined
                 ),
             };
             let replay = compatible_state
@@ -513,11 +525,18 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
         {
             return Err(ProviderTaskStoreError::Conflict);
         }
-        if !matches!(row.state.as_str(), "sending" | "outcome_unknown") {
+        let can_append_receipt = matches!(row.state.as_str(), "sending" | "outcome_unknown")
+            || (row.state == "deadline_quarantined"
+                && row.remote_operation_id.is_none()
+                && row.provider_request_id.is_none()
+                && row.receipt_event_identity.is_none());
+        if !can_append_receipt {
             let intent = submit_intent_from_row(row)?;
             let replay = matches!(
                 intent.state,
-                ProviderSubmitIntentState::OperationKnown | ProviderSubmitIntentState::Attached
+                ProviderSubmitIntentState::OperationKnown
+                    | ProviderSubmitIntentState::Attached
+                    | ProviderSubmitIntentState::DeadlineQuarantined
             ) && intent.remote_operation_id.as_deref()
                 == Some(&request.remote_operation_id)
                 && intent.provider_request_id == request.provider_request_id
@@ -528,7 +547,12 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
             }
             return Err(ProviderTaskStoreError::Conflict);
         }
-        if !submit_parent_accepts_evidence(&parent, &row) {
+        let parent_accepts_receipt = if row.state == "deadline_quarantined" {
+            submit_parent_accepts_late_receipt(&parent, &row)
+        } else {
+            submit_parent_accepts_evidence(&parent, &row)
+        };
+        if !parent_accepts_receipt {
             return Err(ProviderTaskStoreError::Conflict);
         }
         let now = database_now(&mut tx).await?;
@@ -536,11 +560,21 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
             sqlx::query(
                 r#"
                 UPDATE provider_remote_submit_intents
-                SET state = 'operation_known', remote_operation_id = $3,
+                SET state = CASE
+                      WHEN state = 'deadline_quarantined' THEN state
+                      ELSE 'operation_known'
+                    END,
+                    remote_operation_id = $3,
                     provider_request_id = $4, receipt_event_identity = $5,
                     updated_at_ms = $6
                 WHERE submission_id = $1 AND executor_execution_id = $2
-                  AND state IN ('sending', 'outcome_unknown')
+                  AND (
+                    state IN ('sending', 'outcome_unknown')
+                    OR (state = 'deadline_quarantined'
+                        AND remote_operation_id IS NULL
+                        AND provider_request_id IS NULL
+                        AND receipt_event_identity IS NULL)
+                  )
                 "#,
             )
             .bind(request.submission_id)
@@ -559,7 +593,7 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
                 .await?
                 .ok_or(ProviderTaskStoreError::NotFound)?,
         )?;
-        tx.commit().await.map_err(unavailable)?;
+        tx.commit().await.map_err(storage_conflict)?;
         Ok(intent)
     }
 
@@ -574,6 +608,121 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
             .await?
             .map(submit_intent_from_row)
             .transpose()
+    }
+
+    async fn resolve_due_submit_deadline(
+        &self,
+        scope: &ProviderTaskClaimScope,
+    ) -> Result<Option<ProviderSubmitIntent>, ProviderTaskStoreError> {
+        validate_scope(scope)?;
+        let mut tx = self.pool.begin().await.map_err(unavailable)?;
+        let candidate: Option<SubmitDeadlineCandidateRow> = sqlx::query_as(
+            r#"
+            SELECT recovery.submission_id, recovery.executor_execution_id,
+                   floor(
+                     extract(epoch FROM statement_timestamp()) * 1000
+                   )::BIGINT AS database_now_ms
+            FROM provider_submit_recoveries recovery
+            JOIN provider_remote_submit_intents intent
+              ON intent.submission_id = recovery.submission_id
+             AND intent.executor_execution_id = recovery.executor_execution_id
+            JOIN executor_executions execution
+              ON execution.executor_execution_id = recovery.executor_execution_id
+             AND execution.submission_id = recovery.submission_id
+            JOIN provider_submissions submission
+              ON submission.executor_execution_id = recovery.executor_execution_id
+             AND submission.submission_id = recovery.submission_id
+            JOIN executor_capacity_allocations allocation
+              ON allocation.executor_execution_id = recovery.executor_execution_id
+             AND allocation.submission_id = recovery.submission_id
+            WHERE recovery.provider_id = $1
+              AND recovery.provider_account_id = $2
+              AND recovery.state = 'active'
+              AND recovery.provider_deadline_at_ms <= floor(
+                    extract(epoch FROM statement_timestamp()) * 1000
+                  )::BIGINT
+              AND intent.state IN (
+                    'sending', 'outcome_unknown', 'operation_known'
+                  )
+              AND execution.state = 'running'
+              AND submission.state = 'running'
+              AND allocation.state = 'held'
+            ORDER BY recovery.provider_deadline_at_ms, recovery.submission_id
+            FOR UPDATE OF execution, submission, allocation SKIP LOCKED
+            LIMIT 1
+            "#,
+        )
+        .bind(&scope.provider_id)
+        .bind(scope.provider_account_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(unavailable)?;
+        let Some(candidate) = candidate else {
+            tx.commit().await.map_err(unavailable)?;
+            return Ok(None);
+        };
+
+        let row = load_submit_intent_in(&mut tx, candidate.submission_id)
+            .await?
+            .ok_or(ProviderTaskStoreError::Conflict)?;
+        let recovery = load_submit_recovery_in(&mut tx, candidate.submission_id)
+            .await?
+            .ok_or(ProviderTaskStoreError::Conflict)?;
+        if row.executor_execution_id != candidate.executor_execution_id
+            || row.provider_id != scope.provider_id
+            || row.provider_account_id != scope.provider_account_id
+            || !matches!(
+                row.state.as_str(),
+                "sending" | "outcome_unknown" | "operation_known"
+            )
+            || recovery.state != "active"
+            || recovery.provider_deadline_at_ms > candidate.database_now_ms
+            || recovery
+                .recovery_lease_expires_at_ms
+                .is_some_and(|expiry| expiry > candidate.database_now_ms)
+        {
+            return Err(ProviderTaskStoreError::Conflict);
+        }
+
+        require_one(
+            sqlx::query(
+                r#"
+                UPDATE provider_remote_submit_intents
+                SET state = 'deadline_quarantined', updated_at_ms = $3
+                WHERE submission_id = $1 AND executor_execution_id = $2
+                  AND state IN ('sending', 'outcome_unknown', 'operation_known')
+                "#,
+            )
+            .bind(candidate.submission_id)
+            .bind(candidate.executor_execution_id)
+            .bind(candidate.database_now_ms)
+            .execute(&mut *tx)
+            .await
+            .map_err(storage_conflict)?,
+            ProviderTaskStoreError::Conflict,
+        )?;
+        close_submit_recovery(
+            &mut tx,
+            candidate.submission_id,
+            candidate.executor_execution_id,
+            candidate.database_now_ms,
+            None,
+        )
+        .await?;
+        resolve_submit_deadline_terminal(
+            &mut tx,
+            candidate.executor_execution_id,
+            candidate.submission_id,
+            candidate.database_now_ms,
+        )
+        .await?;
+        let intent = submit_intent_from_row(
+            load_submit_intent_in(&mut tx, candidate.submission_id)
+                .await?
+                .ok_or(ProviderTaskStoreError::Conflict)?,
+        )?;
+        tx.commit().await.map_err(storage_conflict)?;
+        Ok(Some(intent))
     }
 
     async fn claim_submit_recovery(
@@ -1605,6 +1754,70 @@ struct ObservationValues<'a> {
     next_poll_at_ms: Option<i64>,
 }
 
+async fn resolve_submit_deadline_terminal(
+    tx: &mut Transaction<'_, Postgres>,
+    executor_execution_id: Uuid,
+    submission_id: Uuid,
+    now: i64,
+) -> Result<(), ProviderTaskStoreError> {
+    sqlx::query(
+        r#"
+        INSERT INTO executor_resolution_decisions
+          (decision_id, executor_execution_id, submission_id, source,
+           observation_id, provider_task_observation_id, provider_submit_intent_id,
+           resolved_state, result_manifest_id, error_code, decided_at_ms)
+        VALUES ($1, $1, $2, 'remote_submit_deadline',
+                NULL, NULL, $2, 'uncertain', NULL, $3, $4)
+        "#,
+    )
+    .bind(executor_execution_id)
+    .bind(submission_id)
+    .bind(SUBMIT_DEADLINE_ERROR)
+    .bind(now)
+    .execute(&mut **tx)
+    .await
+    .map_err(storage_conflict)?;
+    require_one(
+        sqlx::query(
+            r#"
+            UPDATE executor_executions
+            SET state = 'uncertain', executor_owner = NULL,
+                lease_expires_at_ms = NULL, resolution_decision_id = $1,
+                finished_at_ms = $3, updated_at_ms = $3, error_code = $4
+            WHERE executor_execution_id = $1 AND submission_id = $2
+              AND state = 'running'
+            "#,
+        )
+        .bind(executor_execution_id)
+        .bind(submission_id)
+        .bind(now)
+        .bind(SUBMIT_DEADLINE_ERROR)
+        .execute(&mut **tx)
+        .await
+        .map_err(storage_conflict)?,
+        ProviderTaskStoreError::Conflict,
+    )?;
+    require_one(
+        sqlx::query(
+            r#"
+            UPDATE provider_submissions
+            SET state = 'uncertain', resolution_decision_id = $1,
+                finished_at_ms = $3, updated_at_ms = $3, error_code = $4
+            WHERE executor_execution_id = $1 AND submission_id = $2
+              AND state = 'running'
+            "#,
+        )
+        .bind(executor_execution_id)
+        .bind(submission_id)
+        .bind(now)
+        .bind(SUBMIT_DEADLINE_ERROR)
+        .execute(&mut **tx)
+        .await
+        .map_err(storage_conflict)?,
+        ProviderTaskStoreError::Conflict,
+    )
+}
+
 async fn resolve_submit_terminal(
     tx: &mut Transaction<'_, Postgres>,
     intent: &ProviderSubmitIntent,
@@ -2121,7 +2334,10 @@ async fn lock_submit_parent(
                execution.executor_owner, execution.lease_epoch,
                execution.lease_expires_at_ms,
                execution.launch_owner, execution.launch_lease_epoch,
-               allocation.state AS allocation_state
+               allocation.state AS allocation_state,
+               execution.resolution_decision_id AS execution_resolution_decision_id,
+               submission.resolution_decision_id AS submission_resolution_decision_id,
+               decision.source AS resolution_source
         FROM executor_executions execution
         JOIN provider_submissions submission
           ON submission.executor_execution_id = execution.executor_execution_id
@@ -2129,6 +2345,10 @@ async fn lock_submit_parent(
         JOIN executor_capacity_allocations allocation
           ON allocation.executor_execution_id = execution.executor_execution_id
          AND allocation.submission_id = execution.submission_id
+        LEFT JOIN executor_resolution_decisions decision
+          ON decision.decision_id = execution.resolution_decision_id
+         AND decision.executor_execution_id = execution.executor_execution_id
+         AND decision.submission_id = execution.submission_id
         WHERE execution.executor_execution_id = $1
           AND execution.submission_id = $2
         FOR UPDATE OF execution, submission, allocation
@@ -2248,6 +2468,20 @@ fn submit_parent_accepts_evidence(parent: &SubmitParentRow, intent: &SubmitInten
         && parent.allocation_state == "held"
 }
 
+fn submit_parent_accepts_late_receipt(parent: &SubmitParentRow, intent: &SubmitIntentRow) -> bool {
+    parent.execution_state == "uncertain"
+        && parent.submission_state == "uncertain"
+        && parent.executor_owner.is_none()
+        && parent.lease_expires_at_ms.is_none()
+        && parent.lease_epoch == intent.submit_lease_epoch
+        && parent.launch_owner.as_deref() == Some(intent.submit_owner.as_str())
+        && parent.launch_lease_epoch == Some(intent.submit_lease_epoch)
+        && parent.execution_resolution_decision_id.is_some()
+        && parent.execution_resolution_decision_id == parent.submission_resolution_decision_id
+        && parent.resolution_source.as_deref() == Some("remote_submit_deadline")
+        && parent.allocation_state == "held"
+}
+
 async fn lock_live_submit_fence(
     tx: &mut Transaction<'_, Postgres>,
     request: &RemoteTaskSubmitReservation,
@@ -2303,6 +2537,7 @@ fn submit_intent_from_row(
         "operation_known" => ProviderSubmitIntentState::OperationKnown,
         "attached" => ProviderSubmitIntentState::Attached,
         "rejected" => ProviderSubmitIntentState::Rejected,
+        "deadline_quarantined" => ProviderSubmitIntentState::DeadlineQuarantined,
         _ => return Err(ProviderTaskStoreError::Conflict),
     };
     Ok(ProviderSubmitIntent {

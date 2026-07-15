@@ -1,9 +1,9 @@
 # Phase 2E: Fenced Provider Capacity Heartbeats
 
-Status: implemented and PostgreSQL-tested. Remote provider activation remains
-blocked by deadline resolution, recoverable artifact materialization, operation
-descriptor identity, and the single submit orchestrator that drives these store
-primitives.
+Status: implemented and PostgreSQL-tested. Phase 2F adds the deadline quarantine
+resolver described in
+[`2026-phase2f-provider-submit-deadline-quarantine.md`](2026-phase2f-provider-submit-deadline-quarantine.md).
+Remote provider activation remains blocked by the gates listed there.
 
 ## Scope
 
@@ -158,9 +158,10 @@ worker concurrency.
 
 ## Remaining Activation Gates
 
-1. Add the fenced deadline resolver and explicit unknown-effect capacity policy.
+1. Add independent capacity reconciliation evidence for deadline-quarantined
+   work without rewriting the customer decision.
 2. Make `artifact_ready -> canonical success` atomic or restart-recoverable.
-3. Add the single submit/recovery/poll orchestrator. It must be the only external
+3. Add the single submit/recovery/deadline/poll orchestrator. It must be the only external
    side-effect caller and must drive these heartbeat primitives.
 4. Persist operation descriptor identity and require the SDK to bind provider,
    operation, descriptor, adapter, submission, and idempotency identities.
