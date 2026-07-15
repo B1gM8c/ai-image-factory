@@ -128,6 +128,30 @@ fn same_execution_with_different_command_hash_conflicts() {
 }
 
 #[test]
+fn same_execution_with_different_profile_or_adapter_conflicts() {
+    let (_temp, journal) = journal();
+    let lease = lease();
+    journal.start_or_attach(&lease).unwrap();
+    let changed_profile = ExecutorSubmissionLease {
+        execution_profile_id: Uuid::new_v4(),
+        ..lease.clone()
+    };
+    let changed_adapter = ExecutorSubmissionLease {
+        adapter_revision: "adapter-v2".to_string(),
+        ..lease
+    };
+
+    assert_eq!(
+        journal.start_or_attach(&changed_profile),
+        Err(RunnerJournalError::Conflict)
+    );
+    assert_eq!(
+        journal.start_or_attach(&changed_adapter),
+        Err(RunnerJournalError::Conflict)
+    );
+}
+
+#[test]
 fn terminal_replay_is_idempotent_but_different_value_conflicts() {
     let (_temp, journal) = journal();
     let lease = lease();
@@ -459,6 +483,8 @@ fn lease() -> ExecutorSubmissionLease {
         output_index: 0,
         command_schema: "provider-command-v1".to_string(),
         command_hash: "a".repeat(64),
+        execution_profile_id: Uuid::new_v4(),
+        adapter_revision: "adapter-v1".to_string(),
         executor_owner: "owner-7".to_string(),
         executor_lease_epoch: 7,
         executor_lease_expires_at_ms: i64::MAX,

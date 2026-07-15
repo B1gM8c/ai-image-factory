@@ -14,7 +14,9 @@ mod runner;
 pub use codex_request::{
     CodexOutputRequest, CodexRequestProjectionError, project_codex_output_request,
 };
-pub use codex_supervisor::{CodexProcessSupervisor, run_codex_runner_child};
+pub use codex_supervisor::{
+    CODEX_GENERATION_ADAPTER_REVISION, CodexProcessSupervisor, run_codex_runner_child,
+};
 pub use daemon::{ExecutorDaemon, ExecutorDaemonError, ExecutorDaemonRun};
 pub use owner_guard::{ExecutorOwnerGuardError, PostgresExecutorOwnerGuard};
 pub use postgres::PostgresExecutorSubmissionStore;
@@ -37,6 +39,8 @@ pub struct PreparedExecutorSubmission {
     pub output_index: i32,
     pub command_schema: String,
     pub command_hash: String,
+    pub execution_profile_id: Uuid,
+    pub adapter_revision: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -52,6 +56,8 @@ pub struct ExecutorSubmissionLease {
     pub output_index: i32,
     pub command_schema: String,
     pub command_hash: String,
+    pub execution_profile_id: Uuid,
+    pub adapter_revision: String,
     pub executor_owner: String,
     pub executor_lease_epoch: i64,
     pub executor_lease_expires_at_ms: i64,
@@ -59,8 +65,38 @@ pub struct ExecutorSubmissionLease {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExecutorClaimScope {
+    pub execution_profile_id: Uuid,
     pub provider_id: String,
     pub command_schema: String,
+    pub adapter_revision: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExecutorExecutionProfile {
+    pub execution_profile_id: Uuid,
+    pub profile_key: String,
+    pub provider_id: String,
+    pub command_schema: String,
+    pub adapter_revision: String,
+    pub credential_pool_id: Uuid,
+    pub provider_account_id: Uuid,
+    pub credential_ref: String,
+    pub credential_revision: i64,
+    pub credential_auth_sha256: String,
+    pub resource_policy_id: Uuid,
+    pub resource_policy_revision: i64,
+    pub max_concurrency: i32,
+}
+
+impl ExecutorExecutionProfile {
+    pub fn claim_scope(&self) -> ExecutorClaimScope {
+        ExecutorClaimScope {
+            execution_profile_id: self.execution_profile_id,
+            provider_id: self.provider_id.clone(),
+            command_schema: self.command_schema.clone(),
+            adapter_revision: self.adapter_revision.clone(),
+        }
+    }
 }
 
 #[derive(Clone, PartialEq)]
@@ -281,6 +317,7 @@ pub trait ExecutorSubmissionStore: Send + Sync + 'static {
     async fn prepare_for_lease(
         &self,
         lease: &WorkLease,
+        execution_profile_id: Uuid,
     ) -> Result<Vec<PreparedExecutorSubmission>, ExecutorSubmissionError>;
 
     async fn resume_running(
@@ -326,6 +363,14 @@ pub trait ExecutorSubmissionStore: Send + Sync + 'static {
     }
 
     async fn reconcile_expired(&self, limit: u32) -> Result<u64, ExecutorSubmissionError>;
+}
+
+#[async_trait]
+pub trait ExecutorExecutionProfileStore: Send + Sync + 'static {
+    async fn load_execution_profile(
+        &self,
+        profile_key: &str,
+    ) -> Result<ExecutorExecutionProfile, ExecutorSubmissionError>;
 }
 
 #[async_trait]

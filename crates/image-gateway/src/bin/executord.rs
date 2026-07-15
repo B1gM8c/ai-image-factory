@@ -2,9 +2,9 @@ use std::{env, path::PathBuf, sync::Arc, time::Duration};
 
 use gpt_image_2_gateway::executor::{ExecutorDaemon, ExecutorDaemonRun};
 use gpt_image_2_gateway::{
-    CodexProcessSupervisor, ExecutorClaimScope, ExecutorOwnerGuardError, ImageGatewayError,
-    JournaledDurableRunner, PostgresExecutorOwnerGuard, PostgresExecutorSubmissionStore,
-    ProxyConfig,
+    CODEX_GENERATION_ADAPTER_REVISION, CodexProcessSupervisor, ExecutorExecutionProfileStore,
+    ExecutorOwnerGuardError, ImageGatewayError, JournaledDurableRunner, PostgresExecutorOwnerGuard,
+    PostgresExecutorSubmissionStore, ProxyConfig,
     admission::GENERATION_COMMAND_SCHEMA,
     artifacts::{
         ExecutorArtifactPublisher, FilesystemArtifactBlobStore, artifact_root_from_env,
@@ -30,7 +30,9 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
 
 struct ExecutorConfig {
     owner: String,
-    scope: ExecutorClaimScope,
+    profile_key: String,
+    credential_ref: String,
+    credential_revision: i64,
     runner_root: PathBuf,
     helper_executable: PathBuf,
     codex_executable: PathBuf,
@@ -53,17 +55,15 @@ impl ExecutorConfig {
                 "EXECUTOR_OWNER must contain at most 128 visible ASCII bytes",
             ));
         }
-        let scope = ExecutorClaimScope {
-            provider_id: required_env("EXECUTOR_PROVIDER_ID")?,
-            command_schema: required_env("EXECUTOR_COMMAND_SCHEMA")?,
-        };
-        if scope.provider_id != openai_codex::PROVIDER_ID
-            || scope.command_schema != GENERATION_COMMAND_SCHEMA
-        {
-            return Err(ImageGatewayError::config(
-                "this executord build supports only the openai-codex generation scope",
-            ));
-        }
+        let profile_key = required_env("EXECUTOR_PROFILE_KEY")?;
+        let credential_ref = required_env("EXECUTOR_CREDENTIAL_REF")?;
+        let credential_revision = required_env("EXECUTOR_CREDENTIAL_REVISION")?
+            .parse::<i64>()
+            .ok()
+            .filter(|value| *value > 0)
+            .ok_or_else(|| {
+                ImageGatewayError::config("EXECUTOR_CREDENTIAL_REVISION must be positive")
+            })?;
         let runner_root = absolute_env_path("EXECUTOR_RUNNER_ROOT")?;
         let helper_executable = absolute_env_path("EXECUTOR_HELPER_EXECUTABLE")?;
         let codex_executable = absolute_env_path("EXECUTOR_CODEX_EXECUTABLE")?;
@@ -100,7 +100,9 @@ impl ExecutorConfig {
         }
         Ok(Self {
             owner,
-            scope,
+            profile_key,
+            credential_ref,
+            credential_revision,
             runner_root,
             helper_executable,
             codex_executable,
@@ -135,20 +137,36 @@ async fn main() -> Result<(), ImageGatewayError> {
     let pool =
         connect_pool_with_schema(&database_url, DEFAULT_MAX_CONNECTIONS, &database_schema).await?;
     verify_migrations(&pool).await?;
+    let store = PostgresExecutorSubmissionStore::new(pool.clone());
+    let profile = store
+        .load_execution_profile(&config.profile_key)
+        .await
+        .map_err(|_| ImageGatewayError::config("EXECUTOR_PROFILE_KEY is unavailable"))?;
+    if profile.provider_id != openai_codex::PROVIDER_ID
+        || profile.command_schema != GENERATION_COMMAND_SCHEMA
+        || profile.adapter_revision != CODEX_GENERATION_ADAPTER_REVISION
+        || profile.credential_ref != config.credential_ref
+        || profile.credential_revision != config.credential_revision
+    {
+        return Err(ImageGatewayError::config(
+            "executor runtime does not match the selected database profile",
+        ));
+    }
+    let scope = profile.claim_scope();
     let mut owner_guard = PostgresExecutorOwnerGuard::acquire(
         &pool,
         &config.owner,
-        &config.scope,
+        &scope,
         config.owner_guard_timeout,
     )
     .await
     .map_err(|error| ImageGatewayError::service_unavailable(error.to_string()))?;
-    let store = PostgresExecutorSubmissionStore::new(pool);
     let supervisor = CodexProcessSupervisor::new(
         journal.clone(),
         &config.helper_executable,
         &config.codex_executable,
         &config.credential_home,
+        &profile.credential_auth_sha256,
         config.request_timeout,
         config.process_poll_interval,
         config.process_startup_grace,
@@ -159,15 +177,18 @@ async fn main() -> Result<(), ImageGatewayError> {
     let daemon = ExecutorDaemon::new(
         store,
         runner,
-        config.scope.clone(),
+        scope.clone(),
         config.owner.clone(),
         config.lease_ms,
         config.heartbeat_interval,
     );
     tracing::info!(
         owner = %config.owner,
-        provider.id = %config.scope.provider_id,
-        command.schema = %config.scope.command_schema,
+        execution.profile.id = %scope.execution_profile_id,
+        execution.profile.key = %profile.profile_key,
+        provider.id = %scope.provider_id,
+        command.schema = %scope.command_schema,
+        adapter.revision = %scope.adapter_revision,
         "executord started"
     );
     let shutdown = shutdown_signal();

@@ -519,6 +519,8 @@ mod tests {
             output_index: 0,
             command_schema: GENERATION_COMMAND_SCHEMA.to_string(),
             command_hash: "a".repeat(64),
+            execution_profile_id: Uuid::new_v4(),
+            adapter_revision: crate::executor::CODEX_GENERATION_ADAPTER_REVISION.to_string(),
             executor_owner: "executor-owner-1".to_string(),
             executor_lease_epoch: 1,
             executor_lease_expires_at_ms: i64::MAX,

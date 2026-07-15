@@ -2,9 +2,11 @@
 
 Status: the persistent executor runtime, independent `executord`, Codex helper,
 private process spool, immutable artifact authority, and append-only
-observation/resolution path are implemented. Process-level PostgreSQL tests
-cover one launch, restart attach, `SIGTERM` drain, owner-session loss, and late
-evidence after executor lease expiry. The production Images API remains on
+observation/resolution path are implemented. Phase 1G also binds every new
+submission to an immutable database execution profile and acquires durable
+provider capacity before launch. Process-level PostgreSQL tests cover one
+launch, restart attach, `SIGTERM` drain, owner-session loss, capacity races,
+and late evidence after executor lease expiry. The production Images API remains on
 `LegacyV1` until every open activation gate in this document passes.
 
 The checkpoint includes owner-and-scope singleton supervision, exact launch
@@ -58,11 +60,20 @@ The following identities are distinct:
 - `executor_owner`: stable identity of one executord deployment or sandbox
   pool, not a random process incarnation;
 - `executor_lease_epoch`: PostgreSQL fencing token for executor mutations.
+- `execution_profile_id`: immutable provider, adapter, credential account, and
+  resource-policy binding selected before submission preparation;
+- `allocation_id`: durable provider-capacity ownership, equal to the executor
+  execution identity for the current one-output runtime.
 
 Only PostgreSQL may grant launch authority. A valid runner request contains the
 database-bound executor lease and no client-controlled command, environment, or
-credential material. Provider adapters are selected from the trusted
-`provider_id` and `command_schema` scope configured for executord.
+credential material. Provider adapters are selected from the database profile,
+not from public model names or provider/schema environment variables. The
+executord process names a profile key and an opaque mounted-credential
+reference; startup rejects any provider, command schema, adapter revision,
+credential revision, reference, or immutable `auth.json` digest mismatch. The
+same digest is checked again when credentials are copied into or reused from
+the private spool.
 
 Immediately before launch, executord resolves the immutable command through
 `ExecutorLaunchContextStore`. The lookup requires an exact unexpired `running`
@@ -122,7 +133,7 @@ A resumed execution is not renewed before local attach evidence is found. If a
 second process has the same configured owner but a different spool, the missing
 launch marker is retryable and produces no heartbeat, observation, or canonical
 resolution. A dedicated PostgreSQL advisory-lock session owns each
-owner/provider/schema tuple; executord verifies that exact backend session both
+owner/profile/provider/schema/adapter tuple; executord verifies that exact backend session both
 between and during executions and exits fail-closed when the session is lost.
 
 The database `start` transition is itself idempotent for the exact same
@@ -140,6 +151,15 @@ Crash outcomes are deliberately asymmetric:
 | after provider launch | attach the same execution; never launch a replacement |
 | after spool commit, before artifact/DB acknowledgement | retain success spool and replay publication before writing terminal |
 | after executor lease expiry | append late evidence for audit and keep canonical state uncertain; never retry provider |
+
+Provider capacity is separate from both worker and executor leases. A fresh
+claim increments the immutable resource-policy revision counter and inserts a
+held allocation in the same transaction as `prepared -> leased`. Reclaiming an
+expired, unstarted executor reuses that allocation. Lease expiry, heartbeat
+failure, daemon exit, and owner-session loss never release capacity by
+themselves. A release requires a durable resolution decision; running expiry
+also requires terminal runner evidence, while an abandoned unstarted lease may
+release through its fenced canceled decision.
 
 ## 6. Internal Protocol
 
@@ -216,7 +236,7 @@ Production V2 traffic remains disabled according to this gate matrix:
 | owner singleton and session loss fail closed | passed | advisory-lock and backend-termination tests |
 | artifact integrity and economic settlement remain balanced | passed | authority, manifest, rating, and ledger tests |
 | provider process identity and orphan cleanup | passed | nonce/inode binding and real helper-death cleanup test |
-| credential pool, adapter revision, and resource policy are database-bound | open | extend claim scope before V2 activation |
+| credential pool, adapter revision, and resource policy are database-bound | passed | migration 0013, exact profile claim scope, journal binding, global capacity race tests |
 | hostile multi-tenant CLI isolation | open | dedicated UID plus externally enforced sandbox/cgroup/mount/network policy |
 | public Images API traverses the complete V2 path | open | wire gateway to workerd/executord/reducer |
 | credentialed real Codex CLI image generation | open | run official-shape API smoke and verify durable artifact/replay |

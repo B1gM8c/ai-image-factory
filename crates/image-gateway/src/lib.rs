@@ -38,9 +38,10 @@ pub use execution::{
     PersistedEditInput, PostgresExecutionContextStore,
 };
 pub use executor::{
-    CodexOutputRequest, CodexProcessSupervisor, CodexRequestProjectionError,
-    DurableEvidenceRecovery, DurableRunnerResult, ExecutorArtifactSink, ExecutorClaimScope,
-    ExecutorEvidenceStore, ExecutorLaunchContext, ExecutorLaunchContextStore,
+    CODEX_GENERATION_ADAPTER_REVISION, CodexOutputRequest, CodexProcessSupervisor,
+    CodexRequestProjectionError, DurableEvidenceRecovery, DurableRunnerResult,
+    ExecutorArtifactSink, ExecutorClaimScope, ExecutorEvidenceStore, ExecutorExecutionProfile,
+    ExecutorExecutionProfileStore, ExecutorLaunchContext, ExecutorLaunchContextStore,
     ExecutorOwnerGuardError, ExecutorResultManifest, ExecutorRunnerObservation,
     ExecutorSubmissionError, ExecutorSubmissionLease, ExecutorSubmissionOutcome,
     ExecutorSubmissionStore, JournaledDurableRunner, PostgresExecutorOwnerGuard,

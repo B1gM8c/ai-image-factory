@@ -5,7 +5,7 @@ use std::{
 
 use gpt_image_2_gateway::database::{connect_test_pool_with_search_path, run_migrations};
 use gpt_image_2_gateway::{
-    GenerationJob,
+    CODEX_GENERATION_ADAPTER_REVISION, GenerationJob,
     admission::{GENERATION_COMMAND_SCHEMA, GenerationCommandV1, WorkLease},
     artifacts::{ExecutorArtifactPublisher, FilesystemArtifactBlobStore},
     economics::{
@@ -13,10 +13,10 @@ use gpt_image_2_gateway::{
         PostgresEconomicSettlementStore,
     },
     executor::{
-        ExecutorClaimScope, ExecutorEvidenceStore, ExecutorLaunchContextStore,
-        ExecutorOwnerGuardError, ExecutorResultManifest, ExecutorSubmissionError,
-        ExecutorSubmissionLease, ExecutorSubmissionOutcome, ExecutorSubmissionStore,
-        PostgresExecutorOwnerGuard, PostgresExecutorSubmissionStore,
+        ExecutorClaimScope, ExecutorEvidenceStore, ExecutorExecutionProfileStore,
+        ExecutorLaunchContextStore, ExecutorOwnerGuardError, ExecutorResultManifest,
+        ExecutorSubmissionError, ExecutorSubmissionLease, ExecutorSubmissionOutcome,
+        ExecutorSubmissionStore, PostgresExecutorOwnerGuard, PostgresExecutorSubmissionStore,
     },
 };
 use image::{DynamicImage, ImageFormat, Rgba, RgbaImage};
@@ -27,6 +27,25 @@ use uuid::Uuid;
 
 type TestResult<T = ()> = Result<T, String>;
 
+const TEST_PROFILE_ID: Uuid = Uuid::from_u128(0x100);
+const CODEX_PROFILE_ID: Uuid = Uuid::from_u128(0x200);
+const TEST_POLICY_ID: Uuid = Uuid::from_u128(0x300);
+const CODEX_POLICY_ID: Uuid = Uuid::from_u128(0x400);
+const TEST_POOL_ID: Uuid = Uuid::from_u128(0x500);
+const CODEX_POOL_ID: Uuid = Uuid::from_u128(0x600);
+const TEST_ACCOUNT_ID: Uuid = Uuid::from_u128(0x700);
+const CODEX_ACCOUNT_ID: Uuid = Uuid::from_u128(0x800);
+const TEST_AUTH_SHA256: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+const CODEX_AUTH_SHA256: &str = "ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356";
+
+fn profile_id_for_lease(lease: &WorkLease) -> Uuid {
+    if lease.command_schema == GENERATION_COMMAND_SCHEMA {
+        CODEX_PROFILE_ID
+    } else {
+        TEST_PROFILE_ID
+    }
+}
+
 #[tokio::test]
 async fn real_executord_process_runs_one_output_through_durable_helper_and_artifact_authority()
 -> TestResult {
@@ -36,7 +55,10 @@ async fn real_executord_process_runs_one_output_through_durable_helper_and_artif
     let result = async {
         let lease = seed_codex_generation_lease(&database.pool, "executord-smoke-workerd").await?;
         let store = PostgresExecutorSubmissionStore::new(database.pool.clone());
-        let prepared = store.prepare_for_lease(&lease).await.map_err(debug_error)?;
+        let prepared = store
+            .prepare_for_lease(&lease, profile_id_for_lease(&lease))
+            .await
+            .map_err(debug_error)?;
         require(prepared.len() == 1, "expected one prepared output")?;
         activate_work(&database.pool, &lease).await?;
 
@@ -124,6 +146,40 @@ async fn real_executord_process_runs_one_output_through_durable_helper_and_artif
 }
 
 #[tokio::test]
+async fn executord_rejects_auth_home_that_does_not_match_database_credential() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let files = ExecutordFixture::new(Duration::ZERO)?;
+        let wrong_credentials = files._temp.path().join("wrong-credentials");
+        fs::create_dir(&wrong_credentials).map_err(debug_error)?;
+        fs::set_permissions(&wrong_credentials, fs::Permissions::from_mode(0o700))
+            .map_err(debug_error)?;
+        let wrong_auth = wrong_credentials.join("auth.json");
+        fs::write(&wrong_auth, b"{\"account\":\"other\"}\n").map_err(debug_error)?;
+        fs::set_permissions(&wrong_auth, fs::Permissions::from_mode(0o600)).map_err(debug_error)?;
+
+        let mut command = files.command(&database, "executord-wrong-auth")?;
+        command.env("EXECUTOR_CODEX_CREDENTIAL_HOME", &wrong_credentials);
+        let output = tokio::time::timeout(Duration::from_secs(5), command.output())
+            .await
+            .map_err(|_| "executord did not reject mismatched credentials".to_string())?
+            .map_err(debug_error)?;
+        require(
+            !output.status.success(),
+            "executord accepted auth material from a different provider account",
+        )?;
+        require(
+            !files.invocations.exists(),
+            "mismatched credentials launched the provider process",
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
 async fn restarted_executord_attaches_running_helper_without_relaunching_provider() -> TestResult {
     let Some(database) = TestDatabase::new().await? else {
         return Ok(());
@@ -134,7 +190,7 @@ async fn restarted_executord_attaches_running_helper_without_relaunching_provide
         let store = PostgresExecutorSubmissionStore::new(database.pool.clone());
         require(
             store
-                .prepare_for_lease(&lease)
+                .prepare_for_lease(&lease, profile_id_for_lease(&lease))
                 .await
                 .map_err(debug_error)?
                 .len()
@@ -189,6 +245,41 @@ async fn restarted_executord_attaches_running_helper_without_relaunching_provide
             !first_output.status.success(),
             "SIGKILLed executord unexpectedly exited successfully",
         )?;
+
+        let now = database_now(&database.pool).await?;
+        let mut disable = database.pool.begin().await.map_err(debug_error)?;
+        sqlx::query(
+            "UPDATE provider_execution_profiles SET state = 'disabled', updated_at_ms = $2 WHERE execution_profile_id = $1",
+        )
+        .bind(CODEX_PROFILE_ID)
+        .bind(now)
+        .execute(&mut *disable)
+        .await
+        .map_err(debug_error)?;
+        sqlx::query(
+            "UPDATE provider_credential_pools SET state = 'disabled', updated_at_ms = $2 WHERE credential_pool_id = $1",
+        )
+        .bind(CODEX_POOL_ID)
+        .bind(now)
+        .execute(&mut *disable)
+        .await
+        .map_err(debug_error)?;
+        sqlx::query(
+            "UPDATE provider_accounts SET state = 'disabled', updated_at_ms = $2 WHERE provider_account_id = $1",
+        )
+        .bind(CODEX_ACCOUNT_ID)
+        .bind(now)
+        .execute(&mut *disable)
+        .await
+        .map_err(debug_error)?;
+        sqlx::query(
+            "UPDATE executor_resource_policies SET state = 'disabled' WHERE resource_policy_id = $1 AND revision = 1",
+        )
+        .bind(CODEX_POLICY_ID)
+        .execute(&mut *disable)
+        .await
+        .map_err(debug_error)?;
+        disable.commit().await.map_err(debug_error)?;
 
         let mut second = files
             .command(&database, owner)?
@@ -263,7 +354,10 @@ async fn expired_execution_recovers_late_success_evidence_without_relaunching_pr
     let result = async {
         let work = seed_codex_generation_lease(&database.pool, "late-evidence-workerd").await?;
         let store = PostgresExecutorSubmissionStore::new(database.pool.clone());
-        let prepared = store.prepare_for_lease(&work).await.map_err(debug_error)?;
+        let prepared = store
+            .prepare_for_lease(&work, profile_id_for_lease(&work))
+            .await
+            .map_err(debug_error)?;
         require(prepared.len() == 1, "expected one prepared output")?;
         activate_work(&database.pool, &work).await?;
 
@@ -316,8 +410,10 @@ async fn expired_execution_recovers_late_success_evidence_without_relaunching_pr
         )?;
 
         let scope = ExecutorClaimScope {
+            execution_profile_id: CODEX_PROFILE_ID,
             provider_id: "openai-codex".to_string(),
             command_schema: GENERATION_COMMAND_SCHEMA.to_string(),
+            adapter_revision: CODEX_GENERATION_ADAPTER_REVISION.to_string(),
         };
         require(
             store
@@ -422,6 +518,24 @@ async fn expired_execution_recovers_late_success_evidence_without_relaunching_pr
                 ),
             format!("unexpected late evidence canonical projection: {canonical:?}"),
         )?;
+        let allocation: (String, i32) = sqlx::query_as(
+            r#"
+            SELECT allocation.state, policy.allocated_count
+            FROM executor_capacity_allocations allocation
+            JOIN executor_resource_policies policy
+              ON policy.resource_policy_id = allocation.resource_policy_id
+             AND policy.revision = allocation.resource_policy_revision
+            WHERE allocation.executor_execution_id = $1
+            "#,
+        )
+        .bind(prepared[0].executor_execution_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(
+            allocation == ("released".to_string(), 0),
+            format!("late terminal evidence did not release capacity: {allocation:?}"),
+        )?;
         let second_pid = second
             .id()
             .ok_or_else(|| "recovery executord PID unavailable".to_string())?;
@@ -458,7 +572,7 @@ async fn executord_sigterm_drains_running_helper_through_database_resolution() -
         let store = PostgresExecutorSubmissionStore::new(database.pool.clone());
         require(
             store
-                .prepare_for_lease(&lease)
+                .prepare_for_lease(&lease, profile_id_for_lease(&lease))
                 .await
                 .map_err(debug_error)?
                 .len()
@@ -553,8 +667,10 @@ async fn executor_owner_guard_allows_only_one_live_owner_scope_session() -> Test
     };
     let result = async {
         let scope = ExecutorClaimScope {
+            execution_profile_id: CODEX_PROFILE_ID,
             provider_id: "openai-codex".to_string(),
             command_schema: "openai.images.generation.v1".to_string(),
+            adapter_revision: CODEX_GENERATION_ADAPTER_REVISION.to_string(),
         };
         let mut first = PostgresExecutorOwnerGuard::acquire(
             &database.pool,
@@ -613,8 +729,10 @@ async fn executor_owner_guard_fails_closed_after_its_database_session_is_termina
     };
     let result = async {
         let scope = ExecutorClaimScope {
+            execution_profile_id: CODEX_PROFILE_ID,
             provider_id: "openai-codex".to_string(),
             command_schema: GENERATION_COMMAND_SCHEMA.to_string(),
+            adapter_revision: CODEX_GENERATION_ADAPTER_REVISION.to_string(),
         };
         let mut guard = PostgresExecutorOwnerGuard::acquire(
             &database.pool,
@@ -664,7 +782,11 @@ async fn concurrent_prepare_returns_one_stable_identity_set() -> TestResult {
             .map(|_| {
                 let store = store.clone();
                 let lease = lease.clone();
-                tokio::spawn(async move { store.prepare_for_lease(&lease).await })
+                tokio::spawn(async move {
+                    store
+                        .prepare_for_lease(&lease, profile_id_for_lease(&lease))
+                        .await
+                })
             })
             .collect::<Vec<_>>();
 
@@ -750,7 +872,7 @@ async fn prepare_attaches_submissions_to_admission_owned_outputs() -> TestResult
         tx.commit().await.map_err(debug_error)?;
 
         let prepared = PostgresExecutorSubmissionStore::new(database.pool.clone())
-            .prepare_for_lease(&lease)
+            .prepare_for_lease(&lease, profile_id_for_lease(&lease))
             .await
             .map_err(debug_error)?;
         require(
@@ -782,7 +904,7 @@ async fn successful_provider_output_is_rated_exactly_once_from_frozen_quote() ->
         let executor = PostgresExecutorSubmissionStore::new(database.pool.clone());
         let (artifacts, _artifact_root) = artifact_publisher(&executor)?;
         let prepared = executor
-            .prepare_for_lease(&work)
+            .prepare_for_lease(&work, profile_id_for_lease(&work))
             .await
             .map_err(debug_error)?;
         seed_price_hold(&database.pool, &prepared[0], 0).await?;
@@ -846,7 +968,7 @@ async fn nonzero_rating_posts_one_balanced_customer_transaction() -> TestResult 
         let executor = PostgresExecutorSubmissionStore::new(database.pool.clone());
         let (artifacts, _artifact_root) = artifact_publisher(&executor)?;
         let prepared = executor
-            .prepare_for_lease(&work)
+            .prepare_for_lease(&work, profile_id_for_lease(&work))
             .await
             .map_err(debug_error)?;
         seed_price_hold(&database.pool, &prepared[0], 7).await?;
@@ -912,7 +1034,7 @@ async fn uncertain_provider_outcome_keeps_the_full_monetary_hold() -> TestResult
         let work = seed_lease(&database.pool, "uncertain-economic-worker", 1).await?;
         let executor = PostgresExecutorSubmissionStore::new(database.pool.clone());
         let prepared = executor
-            .prepare_for_lease(&work)
+            .prepare_for_lease(&work, profile_id_for_lease(&work))
             .await
             .map_err(debug_error)?;
         seed_price_hold(&database.pool, &prepared[0], 7).await?;
@@ -982,7 +1104,10 @@ async fn prepare_binds_the_persisted_command_and_output_count() -> TestResult {
         let mut forged = lease.clone();
         forged.command_json["prompt"] = json!("forged command");
         require(
-            store.prepare_for_lease(&forged).await == Err(ExecutorSubmissionError::Conflict),
+            store
+                .prepare_for_lease(&forged, profile_id_for_lease(&forged))
+                .await
+                == Err(ExecutorSubmissionError::Conflict),
             "caller-supplied command replaced the durable payload",
         )?;
 
@@ -992,13 +1117,19 @@ async fn prepare_binds_the_persisted_command_and_output_count() -> TestResult {
             .await
             .map_err(|error| format!("requested unit tamper failed: {error}"))?;
         require(
-            store.prepare_for_lease(&lease).await == Err(ExecutorSubmissionError::Conflict),
+            store
+                .prepare_for_lease(&lease, profile_id_for_lease(&lease))
+                .await
+                == Err(ExecutorSubmissionError::Conflict),
             "quota units and durable command output count diverged",
         )?;
 
         let oversized = seed_lease(&database.pool, "oversized-worker", 11).await?;
         require(
-            store.prepare_for_lease(&oversized).await == Err(ExecutorSubmissionError::InvalidInput),
+            store
+                .prepare_for_lease(&oversized, profile_id_for_lease(&oversized))
+                .await
+                == Err(ExecutorSubmissionError::InvalidInput),
             "executor accepted an image output count outside the API contract",
         )
     }
@@ -1015,14 +1146,14 @@ async fn unstarted_worker_requeue_keeps_provider_identities_and_appends_attachme
         let original = seed_lease(&database.pool, "original-worker", 2).await?;
         let store = PostgresExecutorSubmissionStore::new(database.pool.clone());
         let first = store
-            .prepare_for_lease(&original)
+            .prepare_for_lease(&original, profile_id_for_lease(&original))
             .await
             .map_err(|error| format!("original prepare failed: {error:?}"))?;
 
         let replacement =
             requeue_and_reclaim(&database.pool, &original, "replacement-worker").await?;
         let replay = store
-            .prepare_for_lease(&replacement)
+            .prepare_for_lease(&replacement, profile_id_for_lease(&replacement))
             .await
             .map_err(|error| format!("replacement prepare failed: {error:?}"))?;
 
@@ -1054,6 +1185,320 @@ async fn unstarted_worker_requeue_keeps_provider_identities_and_appends_attachme
 }
 
 #[tokio::test]
+async fn capacity_limit_is_global_and_terminal_release_admits_exactly_one_waiter() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let (profile_id, policy_id) = seed_limited_test_profile(&database.pool, 2).await?;
+        let nonzero_policy_id = Uuid::new_v4();
+        require(
+            sqlx::query(
+                r#"
+                INSERT INTO executor_resource_policies
+                  (resource_policy_id, revision, credential_pool_id, provider_account_id,
+                   provider_id, execution_class, max_concurrency, allocated_count,
+                   state, created_at_ms)
+                VALUES ($1, 1, $2, $3, 'provider-test', 'invalid-nonzero',
+                        2, 1, 'disabled', $4)
+                "#,
+            )
+            .bind(nonzero_policy_id)
+            .bind(TEST_POOL_ID)
+            .bind(TEST_ACCOUNT_ID)
+            .bind(database_now(&database.pool).await?)
+            .execute(&database.pool)
+            .await
+            .is_err(),
+            "resource policy was created with a forged allocation counter",
+        )?;
+        let store = PostgresExecutorSubmissionStore::new(database.pool.clone());
+        for index in 0..5 {
+            let lease = seed_lease(
+                &database.pool,
+                &format!("capacity-worker-{index}"),
+                1,
+            )
+            .await?;
+            store
+                .prepare_for_lease(&lease, profile_id)
+                .await
+                .map_err(debug_error)?;
+            activate_work(&database.pool, &lease).await?;
+        }
+        let scope = test_scope(profile_id);
+        let mut tasks = Vec::new();
+        for index in 0..20 {
+            let store = store.clone();
+            let scope = scope.clone();
+            tasks.push(tokio::spawn(async move {
+                store
+                    .claim_prepared(&scope, &format!("capacity-executor-{index}"), 60_000)
+                    .await
+            }));
+        }
+        let mut winners = Vec::new();
+        for task in tasks {
+            if let Some(lease) = task.await.map_err(debug_error)?.map_err(debug_error)? {
+                winners.push(lease);
+            }
+        }
+        require(
+            winners.len() == 2,
+            format!("capacity limit produced {} winners", winners.len()),
+        )?;
+        let counts: (i32, i64) = sqlx::query_as(
+            r#"
+            SELECT policy.allocated_count,
+                   (SELECT COUNT(*) FROM executor_capacity_allocations allocation
+                    WHERE allocation.resource_policy_id = policy.resource_policy_id
+                      AND allocation.resource_policy_revision = policy.revision
+                      AND allocation.state = 'held')
+            FROM executor_resource_policies policy
+            WHERE policy.resource_policy_id = $1 AND policy.revision = 1
+            "#,
+        )
+        .bind(policy_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(counts == (2, 2), format!("capacity counter drifted: {counts:?}"))?;
+        let replacement_policy_id = Uuid::new_v4();
+        let mut replacement = database.pool.begin().await.map_err(debug_error)?;
+        sqlx::query(
+            "UPDATE executor_resource_policies SET state = 'disabled' WHERE resource_policy_id = $1 AND revision = 1",
+        )
+        .bind(policy_id)
+        .execute(&mut *replacement)
+        .await
+        .map_err(debug_error)?;
+        require(
+            sqlx::query(
+                r#"
+                INSERT INTO executor_resource_policies
+                  (resource_policy_id, revision, credential_pool_id, provider_account_id,
+                   provider_id, execution_class, max_concurrency, state, created_at_ms)
+                VALUES ($1, 1, $2, $3, 'provider-test', 'replacement',
+                        2, 'enabled', $4)
+                "#,
+            )
+            .bind(replacement_policy_id)
+            .bind(TEST_POOL_ID)
+            .bind(TEST_ACCOUNT_ID)
+            .bind(database_now(&database.pool).await?)
+            .execute(&mut *replacement)
+            .await
+            .is_err(),
+            "provider account enabled a replacement policy while capacity remained held",
+        )?;
+        replacement.rollback().await.map_err(debug_error)?;
+        require(
+            sqlx::query(
+                r#"
+                UPDATE executor_capacity_allocations
+                SET state = 'released', released_at_ms = $2,
+                    release_decision_id = executor_execution_id,
+                    released_state = 'failed', release_reason = 'terminal_evidence'
+                WHERE executor_execution_id = $1
+                "#,
+            )
+            .bind(winners[0].executor_execution_id)
+            .bind(database_now(&database.pool).await?)
+            .execute(&database.pool)
+            .await
+            .is_err(),
+            "capacity allocation was released without a durable resolution decision",
+        )?;
+        require(
+            sqlx::query(
+                "UPDATE executor_resource_policies SET allocated_count = allocated_count - 1 WHERE resource_policy_id = $1 AND revision = 1",
+            )
+            .bind(policy_id)
+            .execute(&database.pool)
+            .await
+            .is_err(),
+            "resource policy counter diverged from held allocations",
+        )?;
+
+        store.start(&winners[0]).await.map_err(debug_error)?;
+        store
+            .record_outcome(
+                &winners[0],
+                &ExecutorSubmissionOutcome::Failed {
+                    error_code: "provider_rejected".to_string(),
+                },
+            )
+            .await
+            .map_err(debug_error)?;
+        let next = store
+            .claim_prepared(&scope, "capacity-executor-next", 60_000)
+            .await
+            .map_err(debug_error)?
+            .ok_or_else(|| "released capacity did not admit one waiter".to_string())?;
+        require(
+            next.executor_execution_id != winners[0].executor_execution_id,
+            "released terminal execution was reclaimed",
+        )?;
+        let counts: (i32, i64, i64) = sqlx::query_as(
+            r#"
+            SELECT policy.allocated_count,
+                   COUNT(*) FILTER (WHERE allocation.state = 'held'),
+                   COUNT(*) FILTER (WHERE allocation.state = 'released')
+            FROM executor_resource_policies policy
+            JOIN executor_capacity_allocations allocation
+              ON allocation.resource_policy_id = policy.resource_policy_id
+             AND allocation.resource_policy_revision = policy.revision
+            WHERE policy.resource_policy_id = $1 AND policy.revision = 1
+            GROUP BY policy.allocated_count
+            "#,
+        )
+        .bind(policy_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(
+            counts == (2, 2, 1),
+            format!("terminal release was not exactly once: {counts:?}"),
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
+async fn expired_lease_reuses_allocation_and_disabled_profile_preserves_running_attach()
+-> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let (profile_id, policy_id) = seed_limited_test_profile(&database.pool, 1).await?;
+        let store = PostgresExecutorSubmissionStore::new(database.pool.clone());
+        let first = seed_lease(&database.pool, "reclaim-profile-worker", 1).await?;
+        let first_prepared = store
+            .prepare_for_lease(&first, profile_id)
+            .await
+            .map_err(debug_error)?;
+        activate_work(&database.pool, &first).await?;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let second = seed_lease(&database.pool, "disabled-profile-worker", 1).await?;
+        let second_prepared = store
+            .prepare_for_lease(&second, profile_id)
+            .await
+            .map_err(debug_error)?;
+        activate_work(&database.pool, &second).await?;
+        let first_execution_id = first_prepared
+            .first()
+            .ok_or_else(|| "first prepared submission missing".to_string())?
+            .executor_execution_id;
+        let second_execution_id = second_prepared
+            .first()
+            .ok_or_else(|| "second prepared submission missing".to_string())?
+            .executor_execution_id;
+        let mut skipped_fresh = database.pool.begin().await.map_err(debug_error)?;
+        sqlx::query("SELECT 1 FROM executor_executions WHERE executor_execution_id = $1 FOR UPDATE")
+            .bind(first_execution_id)
+            .fetch_one(&mut *skipped_fresh)
+            .await
+            .map_err(debug_error)?;
+        let scope = test_scope(profile_id);
+        let claimed = store
+            .claim_prepared(&scope, "reclaim-owner-a", 25)
+            .await
+            .map_err(debug_error)?
+            .ok_or_else(|| "initial capacity claim was empty".to_string())?;
+        require(
+            claimed.executor_execution_id == second_execution_id,
+            "SKIP LOCKED fixture did not place the newer submission under lease",
+        )?;
+        skipped_fresh.commit().await.map_err(debug_error)?;
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        let reclaimed = store
+            .claim_prepared(&scope, "reclaim-owner-b", 60_000)
+            .await
+            .map_err(debug_error)?
+            .ok_or_else(|| "expired leased execution was not reclaimable".to_string())?;
+        require(
+            reclaimed.executor_execution_id == claimed.executor_execution_id
+                && reclaimed.executor_lease_epoch == claimed.executor_lease_epoch + 1,
+            "expired lease did not preserve its durable allocation identity",
+        )?;
+        let counts: (i32, i64) = sqlx::query_as(
+            r#"
+            SELECT allocated_count,
+                   (SELECT COUNT(*) FROM executor_capacity_allocations
+                    WHERE resource_policy_id = $1 AND state = 'held')
+            FROM executor_resource_policies
+            WHERE resource_policy_id = $1 AND revision = 1
+            "#,
+        )
+        .bind(policy_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(counts == (1, 1), format!("reclaim double-counted capacity: {counts:?}"))?;
+        store.start(&reclaimed).await.map_err(debug_error)?;
+
+        let now = database_now(&database.pool).await?;
+        sqlx::query(
+            "UPDATE provider_execution_profiles SET state = 'disabled', updated_at_ms = $2 WHERE execution_profile_id = $1",
+        )
+        .bind(profile_id)
+        .bind(now)
+        .execute(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        let profile_key: String = sqlx::query_scalar(
+            "SELECT profile_key FROM provider_execution_profiles WHERE execution_profile_id = $1",
+        )
+        .bind(profile_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        let loaded = store
+            .load_execution_profile(&profile_key)
+            .await
+            .map_err(debug_error)?;
+        require(
+            loaded.execution_profile_id == profile_id,
+            "disabled profile could not be loaded for in-flight recovery",
+        )?;
+        let resumed = store
+            .resume_running(&scope, "reclaim-owner-b")
+            .await
+            .map_err(debug_error)?
+            .ok_or_else(|| "disabled profile interrupted an in-flight attach".to_string())?;
+        require(resumed == reclaimed, "running attach changed after profile disable")?;
+        require(
+            store
+                .claim_prepared(&scope, "disabled-profile-executor", 60_000)
+                .await
+                == Err(ExecutorSubmissionError::Conflict),
+            "disabled profile admitted a new capacity allocation",
+        )?;
+        store
+            .record_outcome(
+                &resumed,
+                &ExecutorSubmissionOutcome::Failed {
+                    error_code: "provider_rejected".to_string(),
+                },
+            )
+            .await
+            .map_err(debug_error)?;
+        let allocated: i32 = sqlx::query_scalar(
+            "SELECT allocated_count FROM executor_resource_policies WHERE resource_policy_id = $1 AND revision = 1",
+        )
+        .bind(policy_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(allocated == 0, "terminal outcome did not release disabled profile capacity")
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
 async fn claim_requires_live_running_work_and_has_one_winner_per_submission() -> TestResult {
     let Some(database) = TestDatabase::new().await? else {
         return Ok(());
@@ -1062,7 +1507,7 @@ async fn claim_requires_live_running_work_and_has_one_winner_per_submission() ->
         let lease = seed_lease(&database.pool, "claim-worker", 4).await?;
         let store = Arc::new(PostgresExecutorSubmissionStore::new(database.pool.clone()));
         store
-            .prepare_for_lease(&lease)
+            .prepare_for_lease(&lease, profile_id_for_lease(&lease))
             .await
             .map_err(|error| format!("prepare failed: {error:?}"))?;
         require(
@@ -1130,7 +1575,10 @@ async fn stale_executor_lease_is_fenced_after_unstarted_reclaim() -> TestResult 
     let result = async {
         let lease = seed_lease(&database.pool, "fence-worker", 1).await?;
         let store = PostgresExecutorSubmissionStore::new(database.pool.clone());
-        store.prepare_for_lease(&lease).await.map_err(debug_error)?;
+        store
+            .prepare_for_lease(&lease, profile_id_for_lease(&lease))
+            .await
+            .map_err(debug_error)?;
         activate_work(&database.pool, &lease).await?;
         let stale = claim_required_for(&store, "executor-old", 25).await?;
         require(
@@ -1185,7 +1633,10 @@ async fn start_replays_same_running_lease_without_changing_fence_or_timestamp() 
     let result = async {
         let work = seed_lease(&database.pool, "start-replay-worker", 1).await?;
         let store = PostgresExecutorSubmissionStore::new(database.pool.clone());
-        store.prepare_for_lease(&work).await.map_err(debug_error)?;
+        store
+            .prepare_for_lease(&work, profile_id_for_lease(&work))
+            .await
+            .map_err(debug_error)?;
         activate_work(&database.pool, &work).await?;
         let lease = claim_required(&store, "stable-executor").await?;
         require(
@@ -1351,7 +1802,7 @@ async fn executor_execution_insert_requires_prepared_state_without_launch_fence(
         let work = seed_lease(&database.pool, "forged-insert-worker", 1).await?;
         let store = PostgresExecutorSubmissionStore::new(database.pool.clone());
         let prepared = store
-            .prepare_for_lease(&work)
+            .prepare_for_lease(&work, profile_id_for_lease(&work))
             .await
             .map_err(debug_error)?
             .remove(0);
@@ -1378,11 +1829,17 @@ async fn executor_execution_insert_requires_prepared_state_without_launch_fence(
                   (submission_id, executor_execution_id, output_id, job_id,
                    tenant_id, provider_id, model, work_item_id,
                    created_by_execution_id, created_by_lease_epoch,
-                   command_schema, command_hash, state,
+                   command_schema, command_hash, execution_profile_id,
+                   credential_pool_id, provider_account_id, credential_ref,
+                   credential_revision, adapter_revision, resource_policy_id,
+                   resource_policy_revision, state,
                    prepared_at_ms, updated_at_ms)
                 SELECT $1, $1, $2, job_id, tenant_id, provider_id, model,
                        work_item_id, created_by_execution_id,
                        created_by_lease_epoch, command_schema, command_hash,
+                       execution_profile_id, credential_pool_id, provider_account_id,
+                       credential_ref, credential_revision, adapter_revision,
+                       resource_policy_id, resource_policy_revision,
                        'prepared', $3, $3
                 FROM provider_submissions
                 WHERE submission_id = $4
@@ -1420,11 +1877,17 @@ async fn executor_execution_insert_requires_prepared_state_without_launch_fence(
               (submission_id, executor_execution_id, output_id, job_id,
                tenant_id, provider_id, model, work_item_id,
                created_by_execution_id, created_by_lease_epoch,
-               command_schema, command_hash, state,
+               command_schema, command_hash, execution_profile_id,
+               credential_pool_id, provider_account_id, credential_ref,
+               credential_revision, adapter_revision, resource_policy_id,
+               resource_policy_revision, state,
                prepared_at_ms, started_at_ms, updated_at_ms)
             SELECT $1, $2, $3, job_id, tenant_id, provider_id, model,
                    work_item_id, created_by_execution_id, created_by_lease_epoch,
-                   command_schema, command_hash, 'running', $4, $4, $4
+                   command_schema, command_hash, execution_profile_id,
+                   credential_pool_id, provider_account_id, credential_ref,
+                   credential_revision, adapter_revision, resource_policy_id,
+                   resource_policy_revision, 'running', $4, $4, $4
             FROM provider_submissions
             WHERE submission_id = $5
             "#,
@@ -1475,7 +1938,7 @@ async fn success_requires_exact_immutable_artifact_authority() -> TestResult {
         let work = seed_lease(&database.pool, "authority-worker", 1).await?;
         let store = PostgresExecutorSubmissionStore::new(database.pool.clone());
         let (artifacts, _artifact_root) = artifact_publisher(&store)?;
-        store.prepare_for_lease(&work).await.map_err(debug_error)?;
+        store.prepare_for_lease(&work, profile_id_for_lease(&work)).await.map_err(debug_error)?;
         activate_work(&database.pool, &work).await?;
         let lease = claim_required(&store, "authority-executor").await?;
         store.start(&lease).await.map_err(debug_error)?;
@@ -1601,7 +2064,7 @@ async fn record_outcome_persists_evidence_without_settling_customer_output() -> 
         let lease = seed_lease(&database.pool, "outcome-worker", 3).await?;
         let store = PostgresExecutorSubmissionStore::new(database.pool.clone());
         let (artifacts, _artifact_root) = artifact_publisher(&store)?;
-        store.prepare_for_lease(&lease).await.map_err(debug_error)?;
+        store.prepare_for_lease(&lease, profile_id_for_lease(&lease)).await.map_err(debug_error)?;
         activate_work(&database.pool, &lease).await?;
         let mut claims = Vec::new();
         for _ in 0..3 {
@@ -1741,7 +2204,10 @@ async fn expired_unstarted_execution_is_canceled_after_work_becomes_terminal() -
     let result = async {
         let lease = seed_lease(&database.pool, "abandoned-worker", 1).await?;
         let store = PostgresExecutorSubmissionStore::new(database.pool.clone());
-        store.prepare_for_lease(&lease).await.map_err(debug_error)?;
+        store
+            .prepare_for_lease(&lease, profile_id_for_lease(&lease))
+            .await
+            .map_err(debug_error)?;
         activate_work(&database.pool, &lease).await?;
         let claim = claim_required_for(&store, "abandoned-executor", 25).await?;
         deactivate_work(&database.pool, &lease, "uncertain").await?;
@@ -1789,6 +2255,24 @@ async fn expired_unstarted_execution_is_canceled_after_work_becomes_terminal() -
                     Some("executor_start_abandoned".into()),
                 ),
             format!("unexpected abandoned states: {states:?}"),
+        )?;
+        let allocation: (String, i32) = sqlx::query_as(
+            r#"
+            SELECT allocation.state, policy.allocated_count
+            FROM executor_capacity_allocations allocation
+            JOIN executor_resource_policies policy
+              ON policy.resource_policy_id = allocation.resource_policy_id
+             AND policy.revision = allocation.resource_policy_revision
+            WHERE allocation.executor_execution_id = $1
+            "#,
+        )
+        .bind(claim.executor_execution_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(
+            allocation == ("released".to_string(), 0),
+            format!("abandoned start did not release capacity: {allocation:?}"),
         )
     }
     .await;
@@ -1803,11 +2287,11 @@ async fn expired_running_execution_reconciles_to_uncertain_without_retry() -> Te
     let result = async {
         let lease = seed_lease(&database.pool, "reconcile-worker", 1).await?;
         let store = PostgresExecutorSubmissionStore::new(database.pool.clone());
-        store.prepare_for_lease(&lease).await.map_err(debug_error)?;
+        store.prepare_for_lease(&lease, profile_id_for_lease(&lease)).await.map_err(debug_error)?;
         activate_work(&database.pool, &lease).await?;
-        let claim = claim_required_for(&store, "reconcile-executor", 25).await?;
+        let claim = claim_required_for(&store, "reconcile-executor", 200).await?;
         store.start(&claim).await.map_err(debug_error)?;
-        tokio::time::sleep(Duration::from_millis(40)).await;
+        tokio::time::sleep(Duration::from_millis(250)).await;
 
         require(
             sqlx::query(
@@ -1880,6 +2364,24 @@ async fn expired_running_execution_reconciles_to_uncertain_without_retry() -> Te
                 ),
             format!("unexpected reconciled states: {states:?}"),
         )?;
+        let held: (String, i32) = sqlx::query_as(
+            r#"
+            SELECT allocation.state, policy.allocated_count
+            FROM executor_capacity_allocations allocation
+            JOIN executor_resource_policies policy
+              ON policy.resource_policy_id = allocation.resource_policy_id
+             AND policy.revision = allocation.resource_policy_revision
+            WHERE allocation.executor_execution_id = $1
+            "#,
+        )
+        .bind(claim.executor_execution_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(
+            held == ("held".to_string(), 1),
+            format!("lease expiry released capacity without terminal evidence: {held:?}"),
+        )?;
         require(
             store
                 .record_outcome(
@@ -1909,6 +2411,24 @@ async fn expired_running_execution_reconciles_to_uncertain_without_retry() -> Te
                 && late_observation.1.as_deref() == Some("executor_lease_expired")
                 && late_observation.2.len() == 64,
             "matching late runner evidence was not retained after expiry resolution",
+        )?;
+        let released: (String, i32) = sqlx::query_as(
+            r#"
+            SELECT allocation.state, policy.allocated_count
+            FROM executor_capacity_allocations allocation
+            JOIN executor_resource_policies policy
+              ON policy.resource_policy_id = allocation.resource_policy_id
+             AND policy.revision = allocation.resource_policy_revision
+            WHERE allocation.executor_execution_id = $1
+            "#,
+        )
+        .bind(claim.executor_execution_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(
+            released == ("released".to_string(), 0),
+            format!("late evidence did not release held capacity: {released:?}"),
         )?;
         require(
             sqlx::query(
@@ -1959,7 +2479,10 @@ async fn executor_boundary_rejects_unbounded_identity_and_lease_inputs() -> Test
     let result = async {
         let lease = seed_lease(&database.pool, "validation-worker", 1).await?;
         let store = PostgresExecutorSubmissionStore::new(database.pool.clone());
-        store.prepare_for_lease(&lease).await.map_err(debug_error)?;
+        store
+            .prepare_for_lease(&lease, profile_id_for_lease(&lease))
+            .await
+            .map_err(debug_error)?;
         activate_work(&database.pool, &lease).await?;
         require(
             store
@@ -1978,16 +2501,15 @@ async fn executor_boundary_rejects_unbounded_identity_and_lease_inputs() -> Test
             "durable provider identity was mutable after submission preparation",
         )?;
         let wrong_scope = ExecutorClaimScope {
+            execution_profile_id: TEST_PROFILE_ID,
             provider_id: "other-provider".to_string(),
             command_schema: "provider-command-v1".to_string(),
+            adapter_revision: "provider-test-adapter-v1".to_string(),
         };
         require(
-            store
-                .claim_prepared(&wrong_scope, "executor", 60_000)
-                .await
-                .map_err(debug_error)?
-                .is_none(),
-            "executor claimed a submission outside its provider scope",
+            store.claim_prepared(&wrong_scope, "executor", 60_000).await
+                == Err(ExecutorSubmissionError::Conflict),
+            "executor accepted a scope that conflicts with its database profile",
         )?;
         require(
             store
@@ -2085,7 +2607,11 @@ async fn prepare_uses_job_then_work_lock_order_without_deadlock() -> TestResult 
 
         let store = PostgresExecutorSubmissionStore::new(database.pool.clone());
         let prepare_lease = lease.clone();
-        let prepare = tokio::spawn(async move { store.prepare_for_lease(&prepare_lease).await });
+        let prepare = tokio::spawn(async move {
+            store
+                .prepare_for_lease(&prepare_lease, profile_id_for_lease(&prepare_lease))
+                .await
+        });
         tokio::time::sleep(Duration::from_millis(50)).await;
         tokio::time::timeout(
             Duration::from_secs(1),
@@ -2112,7 +2638,10 @@ async fn start_locks_parent_before_executor_without_deadlock() -> TestResult {
     let result = async {
         let work = seed_lease(&database.pool, "start-lock-order-worker", 1).await?;
         let store = PostgresExecutorSubmissionStore::new(database.pool.clone());
-        store.prepare_for_lease(&work).await.map_err(debug_error)?;
+        store
+            .prepare_for_lease(&work, profile_id_for_lease(&work))
+            .await
+            .map_err(debug_error)?;
         activate_work(&database.pool, &work).await?;
         let lease = claim_required(&store, "start-lock-order-executor").await?;
 
@@ -2153,7 +2682,10 @@ async fn expired_parent_does_not_start_a_still_leased_execution() -> TestResult 
     let result = async {
         let work = seed_lease(&database.pool, "expired-parent-worker", 1).await?;
         let store = PostgresExecutorSubmissionStore::new(database.pool.clone());
-        store.prepare_for_lease(&work).await.map_err(debug_error)?;
+        store
+            .prepare_for_lease(&work, profile_id_for_lease(&work))
+            .await
+            .map_err(debug_error)?;
         activate_work(&database.pool, &work).await?;
         let lease = claim_required(&store, "expired-parent-executor").await?;
         sqlx::query(
@@ -2203,7 +2735,10 @@ async fn lock_wait_cannot_resurrect_an_expired_executor_lease() -> TestResult {
     let result = async {
         let lease = seed_lease(&database.pool, "deadline-worker", 1).await?;
         let store = PostgresExecutorSubmissionStore::new(database.pool.clone());
-        store.prepare_for_lease(&lease).await.map_err(debug_error)?;
+        store
+            .prepare_for_lease(&lease, profile_id_for_lease(&lease))
+            .await
+            .map_err(debug_error)?;
         activate_work(&database.pool, &lease).await?;
         let claim = claim_required_for(&store, "deadline-executor", 150).await?;
         store.start(&claim).await.map_err(debug_error)?;
@@ -2248,7 +2783,10 @@ async fn attachment_foreign_keys_reject_cross_work_audit_history() -> TestResult
         let first = seed_lease(&database.pool, "attachment-a", 1).await?;
         let second = seed_lease(&database.pool, "attachment-b", 1).await?;
         let store = PostgresExecutorSubmissionStore::new(database.pool.clone());
-        let prepared = store.prepare_for_lease(&first).await.map_err(debug_error)?;
+        let prepared = store
+            .prepare_for_lease(&first, profile_id_for_lease(&first))
+            .await
+            .map_err(debug_error)?;
         let result = sqlx::query(
             r#"
             INSERT INTO provider_submission_attachments
@@ -2276,8 +2814,10 @@ async fn attachment_foreign_keys_reject_cross_work_audit_history() -> TestResult
 
 fn claim_scope() -> ExecutorClaimScope {
     ExecutorClaimScope {
+        execution_profile_id: TEST_PROFILE_ID,
         provider_id: "provider-test".to_string(),
         command_schema: "provider-command-v1".to_string(),
+        adapter_revision: "provider-test-adapter-v1".to_string(),
     }
 }
 
@@ -2342,7 +2882,10 @@ async fn resume_running_fences_owner_scope_state_and_database_expiry() -> TestRe
     let result = async {
         let work = seed_lease(&database.pool, "resume-worker", 2).await?;
         let store = PostgresExecutorSubmissionStore::new(database.pool.clone());
-        store.prepare_for_lease(&work).await.map_err(debug_error)?;
+        store
+            .prepare_for_lease(&work, profile_id_for_lease(&work))
+            .await
+            .map_err(debug_error)?;
         activate_work(&database.pool, &work).await?;
 
         let leased = claim_required_for(&store, "stable-executor", 200).await?;
@@ -2371,8 +2914,8 @@ async fn resume_running_fences_owner_scope_state_and_database_expiry() -> TestRe
             "other owner resumed running execution",
         )?;
         let wrong_scope = ExecutorClaimScope {
-            provider_id: claim_scope().provider_id,
             command_schema: "other-command-v1".to_string(),
+            ..claim_scope()
         };
         require(
             store
@@ -2405,7 +2948,10 @@ async fn launch_context_is_loaded_only_for_the_exact_running_lease() -> TestResu
     let result = async {
         let work = seed_lease(&database.pool, "launch-context-worker", 2).await?;
         let store = PostgresExecutorSubmissionStore::new(database.pool.clone());
-        store.prepare_for_lease(&work).await.map_err(debug_error)?;
+        store
+            .prepare_for_lease(&work, profile_id_for_lease(&work))
+            .await
+            .map_err(debug_error)?;
         activate_work(&database.pool, &work).await?;
         let lease = claim_required(&store, "launch-context-executor").await?;
 
@@ -2463,7 +3009,7 @@ async fn launch_context_rejects_command_tampering_and_expired_lease() -> TestRes
     let result = async {
         let work = seed_lease(&database.pool, "launch-integrity-worker", 1).await?;
         let store = PostgresExecutorSubmissionStore::new(database.pool.clone());
-        store.prepare_for_lease(&work).await.map_err(debug_error)?;
+        store.prepare_for_lease(&work, profile_id_for_lease(&work)).await.map_err(debug_error)?;
         activate_work(&database.pool, &work).await?;
         let lease = claim_required_for(&store, "launch-integrity-executor", 100).await?;
         store.start(&lease).await.map_err(debug_error)?;
@@ -2895,8 +3441,9 @@ impl ExecutordFixture {
             .env("EXECUTOR_CODEX_EXECUTABLE", &self.fake_codex)
             .env("EXECUTOR_CODEX_CREDENTIAL_HOME", &self.credentials)
             .env("EXECUTOR_OWNER", owner)
-            .env("EXECUTOR_PROVIDER_ID", "openai-codex")
-            .env("EXECUTOR_COMMAND_SCHEMA", GENERATION_COMMAND_SCHEMA)
+            .env("EXECUTOR_PROFILE_KEY", "openai-codex-generation-v1")
+            .env("EXECUTOR_CREDENTIAL_REF", "test-vault.openai-codex.1")
+            .env("EXECUTOR_CREDENTIAL_REVISION", "1")
             .env("EXECUTOR_LEASE_MS", lease_ms.to_string())
             .env("EXECUTOR_HEARTBEAT_INTERVAL_MS", heartbeat_ms.to_string())
             .env("EXECUTOR_POLL_INTERVAL_MS", "20")
@@ -3103,6 +3650,231 @@ async fn database_now(pool: &PgPool) -> TestResult<i64> {
         .map_err(debug_error)
 }
 
+async fn seed_execution_profiles(pool: &PgPool) -> TestResult {
+    let now = database_now(pool).await?;
+    let mut tx = pool.begin().await.map_err(debug_error)?;
+    for (pool_id, pool_key, provider_id) in [
+        (TEST_POOL_ID, "provider-test-pool", "provider-test"),
+        (CODEX_POOL_ID, "openai-codex-pool", "openai-codex"),
+    ] {
+        sqlx::query(
+            r#"
+            INSERT INTO provider_credential_pools
+              (credential_pool_id, pool_key, provider_id, state, created_at_ms, updated_at_ms)
+            VALUES ($1, $2, $3, 'enabled', $4, $4)
+            "#,
+        )
+        .bind(pool_id)
+        .bind(pool_key)
+        .bind(provider_id)
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .map_err(debug_error)?;
+    }
+    for (account_id, pool_id, provider_id, account_key, credential_ref, auth_sha256) in [
+        (
+            TEST_ACCOUNT_ID,
+            TEST_POOL_ID,
+            "provider-test",
+            "provider-test-account",
+            "test-vault.provider-test.1",
+            TEST_AUTH_SHA256,
+        ),
+        (
+            CODEX_ACCOUNT_ID,
+            CODEX_POOL_ID,
+            "openai-codex",
+            "openai-codex-account",
+            "test-vault.openai-codex.1",
+            CODEX_AUTH_SHA256,
+        ),
+    ] {
+        sqlx::query(
+            r#"
+            INSERT INTO provider_accounts
+              (provider_account_id, credential_pool_id, provider_id, account_key,
+               credential_ref, credential_revision, credential_auth_sha256,
+               state, created_at_ms, updated_at_ms)
+            VALUES ($1, $2, $3, $4, $5, 1, $6, 'enabled', $7, $7)
+            "#,
+        )
+        .bind(account_id)
+        .bind(pool_id)
+        .bind(provider_id)
+        .bind(account_key)
+        .bind(credential_ref)
+        .bind(auth_sha256)
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .map_err(debug_error)?;
+    }
+    for (policy_id, execution_class) in [
+        (TEST_POLICY_ID, "provider-test"),
+        (CODEX_POLICY_ID, "agentic-cli"),
+    ] {
+        sqlx::query(
+            r#"
+            INSERT INTO executor_resource_policies
+              (resource_policy_id, revision, credential_pool_id,
+               provider_account_id, provider_id, execution_class,
+               max_concurrency, state, created_at_ms)
+            VALUES ($1, 1, $2, $3, $4, $5, 1000, 'enabled', $6)
+            "#,
+        )
+        .bind(policy_id)
+        .bind(if policy_id == TEST_POLICY_ID {
+            TEST_POOL_ID
+        } else {
+            CODEX_POOL_ID
+        })
+        .bind(if policy_id == TEST_POLICY_ID {
+            TEST_ACCOUNT_ID
+        } else {
+            CODEX_ACCOUNT_ID
+        })
+        .bind(if policy_id == TEST_POLICY_ID {
+            "provider-test"
+        } else {
+            "openai-codex"
+        })
+        .bind(execution_class)
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .map_err(debug_error)?;
+    }
+    for (
+        profile_id,
+        profile_key,
+        provider_id,
+        command_schema,
+        adapter_revision,
+        pool_id,
+        account_id,
+        credential_ref,
+        policy_id,
+    ) in [
+        (
+            TEST_PROFILE_ID,
+            "provider-test-generation-v1",
+            "provider-test",
+            "provider-command-v1",
+            "provider-test-adapter-v1",
+            TEST_POOL_ID,
+            TEST_ACCOUNT_ID,
+            "test-vault.provider-test.1",
+            TEST_POLICY_ID,
+        ),
+        (
+            CODEX_PROFILE_ID,
+            "openai-codex-generation-v1",
+            "openai-codex",
+            GENERATION_COMMAND_SCHEMA,
+            CODEX_GENERATION_ADAPTER_REVISION,
+            CODEX_POOL_ID,
+            CODEX_ACCOUNT_ID,
+            "test-vault.openai-codex.1",
+            CODEX_POLICY_ID,
+        ),
+    ] {
+        sqlx::query(
+            r#"
+            INSERT INTO provider_execution_profiles
+              (execution_profile_id, profile_key, provider_id, command_schema,
+               adapter_revision, credential_pool_id, provider_account_id,
+               credential_ref, credential_revision, resource_policy_id,
+               resource_policy_revision, state, created_at_ms, updated_at_ms)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 1, $9, 1,
+                    'enabled', $10, $10)
+            "#,
+        )
+        .bind(profile_id)
+        .bind(profile_key)
+        .bind(provider_id)
+        .bind(command_schema)
+        .bind(adapter_revision)
+        .bind(pool_id)
+        .bind(account_id)
+        .bind(credential_ref)
+        .bind(policy_id)
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .map_err(debug_error)?;
+    }
+    tx.commit().await.map_err(debug_error)?;
+    Ok(())
+}
+
+async fn seed_limited_test_profile(
+    pool: &PgPool,
+    max_concurrency: i32,
+) -> TestResult<(Uuid, Uuid)> {
+    let profile_id = Uuid::new_v4();
+    let policy_id = Uuid::new_v4();
+    let now = database_now(pool).await?;
+    let mut tx = pool.begin().await.map_err(debug_error)?;
+    sqlx::query(
+        "UPDATE executor_resource_policies SET state = 'disabled' WHERE resource_policy_id = $1 AND revision = 1",
+    )
+    .bind(TEST_POLICY_ID)
+    .execute(&mut *tx)
+    .await
+    .map_err(debug_error)?;
+    sqlx::query(
+        r#"
+        INSERT INTO executor_resource_policies
+          (resource_policy_id, revision, credential_pool_id, provider_account_id,
+           provider_id, execution_class, max_concurrency, state, created_at_ms)
+        VALUES ($1, 1, $2, $3, 'provider-test', 'provider-test-limited',
+                $4, 'enabled', $5)
+        "#,
+    )
+    .bind(policy_id)
+    .bind(TEST_POOL_ID)
+    .bind(TEST_ACCOUNT_ID)
+    .bind(max_concurrency)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .map_err(debug_error)?;
+    sqlx::query(
+        r#"
+        INSERT INTO provider_execution_profiles
+          (execution_profile_id, profile_key, provider_id, command_schema,
+           adapter_revision, credential_pool_id, provider_account_id,
+           credential_ref, credential_revision, resource_policy_id,
+           resource_policy_revision, state, created_at_ms, updated_at_ms)
+        VALUES ($1, $2, 'provider-test', 'provider-command-v1',
+                'provider-test-adapter-v1', $3, $4,
+                'test-vault.provider-test.1', 1, $5, 1,
+                'enabled', $6, $6)
+        "#,
+    )
+    .bind(profile_id)
+    .bind(format!("provider-test-limited-{}", profile_id.simple()))
+    .bind(TEST_POOL_ID)
+    .bind(TEST_ACCOUNT_ID)
+    .bind(policy_id)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .map_err(debug_error)?;
+    tx.commit().await.map_err(debug_error)?;
+    Ok((profile_id, policy_id))
+}
+
+fn test_scope(execution_profile_id: Uuid) -> ExecutorClaimScope {
+    ExecutorClaimScope {
+        execution_profile_id,
+        provider_id: "provider-test".to_string(),
+        command_schema: "provider-command-v1".to_string(),
+        adapter_revision: "provider-test-adapter-v1".to_string(),
+    }
+}
+
 struct TestDatabase {
     schema: String,
     pool: PgPool,
@@ -3142,6 +3914,13 @@ impl TestDatabase {
                 .await;
             pool.close().await;
             return Err(format!("migration failed: {error:?}"));
+        }
+        if let Err(error) = seed_execution_profiles(&pool).await {
+            let _ = sqlx::query(AssertSqlSafe(format!("DROP SCHEMA \"{schema}\" CASCADE")))
+                .execute(&pool)
+                .await;
+            pool.close().await;
+            return Err(format!("execution profile seed failed: {error}"));
         }
         Ok(Some(Self { schema, pool }))
     }

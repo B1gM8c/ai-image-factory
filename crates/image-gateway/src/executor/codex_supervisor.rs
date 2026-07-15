@@ -31,7 +31,7 @@ use crate::{
     },
 };
 
-const ADAPTER_REVISION: &str = "openai-codex-generation-v1";
+pub const CODEX_GENERATION_ADAPTER_REVISION: &str = "openai-codex-generation-v1";
 const AUTH_FILE: &str = "auth.json";
 const MAX_AUTH_BYTES: u64 = 1024 * 1024;
 const MAX_EXECUTABLE_BYTES: u64 = 512 * 1024 * 1024;
@@ -44,6 +44,7 @@ pub struct CodexProcessSupervisor {
     codex_executable: PathBuf,
     codex_executable_sha256: String,
     credential_auth_file: PathBuf,
+    credential_auth_sha256: String,
     request_timeout: Duration,
     poll_interval: Duration,
     startup_grace: Duration,
@@ -79,6 +80,7 @@ impl CodexProcessSupervisor {
         helper_executable: impl AsRef<Path>,
         codex_executable: impl AsRef<Path>,
         credential_home: impl AsRef<Path>,
+        credential_auth_sha256: &str,
         request_timeout: Duration,
         poll_interval: Duration,
         startup_grace: Duration,
@@ -96,13 +98,15 @@ impl CodexProcessSupervisor {
         let helper_executable = canonical_executable(helper_executable.as_ref())?;
         let codex_executable = canonical_executable(codex_executable.as_ref())?;
         let codex_executable_sha256 = hash_bounded_file(&codex_executable)?;
-        let credential_auth_file = validate_auth_source(credential_home.as_ref())?;
+        let credential_auth_file =
+            validate_auth_source(credential_home.as_ref(), credential_auth_sha256)?;
         Ok(Self {
             journal,
             helper_executable,
             codex_executable,
             codex_executable_sha256,
             credential_auth_file,
+            credential_auth_sha256: credential_auth_sha256.to_string(),
             request_timeout,
             poll_interval,
             startup_grace,
@@ -115,13 +119,18 @@ impl CodexProcessSupervisor {
         lease: &ExecutorSubmissionLease,
         context: &ExecutorLaunchContext,
     ) -> Result<CodexChildRequest, RunnerError> {
+        if lease.adapter_revision != CODEX_GENERATION_ADAPTER_REVISION {
+            return Err(RunnerError::Definite {
+                error_code: "executor_adapter_revision_mismatch".to_string(),
+            });
+        }
         let output =
             project_codex_output_request(lease, context).map_err(|_| RunnerError::Definite {
                 error_code: "executor_command_rejected".to_string(),
             })?;
         Ok(CodexChildRequest {
             schema_version: 1,
-            adapter_revision: ADAPTER_REVISION.to_string(),
+            adapter_revision: CODEX_GENERATION_ADAPTER_REVISION.to_string(),
             executor_execution_id: lease.executor_execution_id.to_string(),
             codex_executable: self.codex_executable.to_string_lossy().into_owned(),
             codex_executable_sha256: self.codex_executable_sha256.clone(),
@@ -190,6 +199,7 @@ impl SingleOutputSupervisor for CodexProcessSupervisor {
         prepare_isolated_auth(
             spool.codex_home_path().map_err(map_spool_error)?,
             &self.credential_auth_file,
+            &self.credential_auth_sha256,
         )
         .map_err(|_| RunnerError::Unavailable)?;
         spool.prepare_request(&bytes).map_err(map_spool_error)
@@ -411,7 +421,7 @@ fn validate_child_request(
     executor_execution_id: Uuid,
 ) -> Result<(), ImageGatewayError> {
     if request.schema_version != 1
-        || request.adapter_revision != ADAPTER_REVISION
+        || request.adapter_revision != CODEX_GENERATION_ADAPTER_REVISION
         || request.executor_execution_id != executor_execution_id.to_string()
         || request.timeout_ms == 0
         || request.timeout_ms > MAX_RUNNER_TIMEOUT.as_millis() as u64
@@ -449,31 +459,23 @@ fn generation_job(request: &CodexOutputRequest) -> GenerationJob {
     }
 }
 
-fn prepare_isolated_auth(destination_home: &Path, source: &Path) -> std::io::Result<()> {
+fn prepare_isolated_auth(
+    destination_home: &Path,
+    source: &Path,
+    expected_sha256: &str,
+) -> std::io::Result<()> {
     let destination = destination_home.join(AUTH_FILE);
     match fs::symlink_metadata(&destination) {
-        Ok(metadata) => return validate_private_file_metadata(&metadata),
+        Ok(metadata) => {
+            validate_private_file_metadata(&metadata)?;
+            let bytes = read_private_auth(&destination)?;
+            return ensure_auth_digest(&bytes, expected_sha256);
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error),
     }
-    let mut source_file = open_private_file(source)?;
-    let source_size = source_file.metadata()?.len();
-    if source_size == 0 || source_size > MAX_AUTH_BYTES {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "invalid auth file",
-        ));
-    }
-    let mut bytes = Vec::with_capacity(source_size as usize);
-    Read::by_ref(&mut source_file)
-        .take(MAX_AUTH_BYTES + 1)
-        .read_to_end(&mut bytes)?;
-    if bytes.len() as u64 != source_size {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "auth file changed",
-        ));
-    }
+    let bytes = read_private_auth(source)?;
+    ensure_auth_digest(&bytes, expected_sha256)?;
     let mut destination_file = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -485,17 +487,66 @@ fn prepare_isolated_auth(destination_home: &Path, source: &Path) -> std::io::Res
     fs::File::open(destination_home)?.sync_all()
 }
 
-fn validate_auth_source(home: &Path) -> Result<PathBuf, ImageGatewayError> {
+fn validate_auth_source(home: &Path, expected_sha256: &str) -> Result<PathBuf, ImageGatewayError> {
     if !home.is_absolute() {
         return Err(ImageGatewayError::config(
             "EXECUTOR_CODEX_CREDENTIAL_HOME must be absolute",
         ));
     }
+    if !is_sha256(expected_sha256) {
+        return Err(ImageGatewayError::config(
+            "database credential auth digest is invalid",
+        ));
+    }
     let source = home.join(AUTH_FILE);
-    open_private_file(&source).map_err(|_| {
+    let bytes = read_private_auth(&source).map_err(|_| {
         ImageGatewayError::config("EXECUTOR_CODEX_CREDENTIAL_HOME/auth.json is invalid")
     })?;
+    if sha256(&bytes) != expected_sha256 {
+        return Err(ImageGatewayError::config(
+            "EXECUTOR_CODEX_CREDENTIAL_HOME/auth.json does not match the database credential",
+        ));
+    }
     Ok(source)
+}
+
+fn read_private_auth(path: &Path) -> std::io::Result<Vec<u8>> {
+    let mut file = open_private_file(path)?;
+    let size = file.metadata()?.len();
+    if size == 0 || size > MAX_AUTH_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid auth file",
+        ));
+    }
+    let mut bytes = Vec::with_capacity(size as usize);
+    Read::by_ref(&mut file)
+        .take(MAX_AUTH_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 != size {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "auth file changed",
+        ));
+    }
+    Ok(bytes)
+}
+
+fn ensure_auth_digest(bytes: &[u8], expected_sha256: &str) -> std::io::Result<()> {
+    if sha256(bytes) != expected_sha256 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "auth file digest mismatch",
+        ));
+    }
+    Ok(())
+}
+
+fn is_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn open_private_file(path: &Path) -> std::io::Result<fs::File> {
@@ -858,6 +909,7 @@ mod tests {
                 &executable,
                 &executable,
                 &credentials,
+                &sha256(b"{}"),
                 Duration::from_secs(5),
                 Duration::from_millis(10),
                 Duration::from_secs(1),
@@ -906,6 +958,8 @@ mod tests {
                 output_index: 1,
                 command_schema: GENERATION_COMMAND_SCHEMA.to_string(),
                 command_hash: command.request_hash_hex(),
+                execution_profile_id: Uuid::new_v4(),
+                adapter_revision: CODEX_GENERATION_ADAPTER_REVISION.to_string(),
                 executor_owner: "executor-owner-1".to_string(),
                 executor_lease_epoch: 1,
                 executor_lease_expires_at_ms: i64::MAX,

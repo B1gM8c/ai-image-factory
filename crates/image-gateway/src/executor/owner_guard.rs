@@ -29,8 +29,10 @@ impl PostgresExecutorOwnerGuard {
         timeout: Duration,
     ) -> Result<Self, ExecutorOwnerGuardError> {
         if owner.is_empty()
+            || scope.execution_profile_id.is_nil()
             || scope.provider_id.is_empty()
             || scope.command_schema.is_empty()
+            || scope.adapter_revision.is_empty()
             || timeout.is_zero()
         {
             return Err(ExecutorOwnerGuardError::Unavailable);
@@ -91,7 +93,14 @@ impl PostgresExecutorOwnerGuard {
 fn lock_key(owner: &str, scope: &ExecutorClaimScope) -> i64 {
     let mut hasher = Sha256::new();
     hasher.update(OWNER_GUARD_DOMAIN);
-    for value in [owner, &scope.provider_id, &scope.command_schema] {
+    let profile_id = scope.execution_profile_id.to_string();
+    for value in [
+        owner,
+        &profile_id,
+        &scope.provider_id,
+        &scope.command_schema,
+        &scope.adapter_revision,
+    ] {
         hasher.update((value.len() as u64).to_be_bytes());
         hasher.update(value.as_bytes());
     }
@@ -108,13 +117,25 @@ mod tests {
     #[test]
     fn lock_key_is_stable_and_fenced_by_every_identity_component() {
         let scope = ExecutorClaimScope {
+            execution_profile_id: uuid::Uuid::from_u128(1),
             provider_id: "openai-codex".to_string(),
             command_schema: "openai.images.generation.v1".to_string(),
+            adapter_revision: "openai-codex-generation-v1".to_string(),
         };
         let base = lock_key("owner-a", &scope);
 
         assert_eq!(base, lock_key("owner-a", &scope));
         assert_ne!(base, lock_key("owner-b", &scope));
+        assert_ne!(
+            base,
+            lock_key(
+                "owner-a",
+                &ExecutorClaimScope {
+                    execution_profile_id: uuid::Uuid::from_u128(2),
+                    ..scope.clone()
+                }
+            )
+        );
         assert_ne!(
             base,
             lock_key(
@@ -131,6 +152,16 @@ mod tests {
                 "owner-a",
                 &ExecutorClaimScope {
                     command_schema: "openai.images.edit.v1".to_string(),
+                    ..scope.clone()
+                }
+            )
+        );
+        assert_ne!(
+            base,
+            lock_key(
+                "owner-a",
+                &ExecutorClaimScope {
+                    adapter_revision: "openai-codex-generation-v2".to_string(),
                     ..scope
                 }
             )

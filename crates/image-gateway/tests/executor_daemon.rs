@@ -127,6 +127,7 @@ impl ExecutorSubmissionStore for FakeStore {
     async fn prepare_for_lease(
         &self,
         _lease: &gpt_image_2_gateway::admission::WorkLease,
+        _execution_profile_id: Uuid,
     ) -> Result<Vec<PreparedExecutorSubmission>, ExecutorSubmissionError> {
         unreachable!("daemon does not prepare submissions")
     }
@@ -503,8 +504,10 @@ fn definite_outcome() -> RunnerOutcome {
 
 fn claim_scope() -> ExecutorClaimScope {
     ExecutorClaimScope {
+        execution_profile_id: Uuid::from_u128(1),
         provider_id: "provider-test".to_string(),
         command_schema: "provider-command-v1".to_string(),
+        adapter_revision: "provider-adapter-v1".to_string(),
     }
 }
 
@@ -521,6 +524,8 @@ fn executor_lease() -> ExecutorSubmissionLease {
         output_index: 0,
         command_schema: "provider-command-v1".to_string(),
         command_hash: "a".repeat(64),
+        execution_profile_id: Uuid::from_u128(1),
+        adapter_revision: "provider-adapter-v1".to_string(),
         executor_owner: "stable-executor".to_string(),
         executor_lease_epoch: 7,
         executor_lease_expires_at_ms: i64::MAX,

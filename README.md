@@ -23,6 +23,8 @@ The authoritative target design is
 [`docs/architecture/2026-ai-image-factory-target-architecture.md`](docs/architecture/2026-ai-image-factory-target-architecture.md).
 The current CLI execution boundary and activation gates are documented in
 [`docs/architecture/2026-phase1f-executor-runtime.md`](docs/architecture/2026-phase1f-executor-runtime.md).
+Database-bound provider profiles and durable capacity are documented in
+[`docs/architecture/2026-phase1g-execution-binding-capacity.md`](docs/architecture/2026-phase1g-execution-binding-capacity.md).
 
 ## Common Commands
 

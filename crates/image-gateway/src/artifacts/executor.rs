@@ -515,6 +515,8 @@ mod tests {
             output_index: 0,
             command_schema: "command-v1".to_string(),
             command_hash: "a".repeat(64),
+            execution_profile_id: Uuid::new_v4(),
+            adapter_revision: "adapter-v1".to_string(),
             executor_owner: "executor-test".to_string(),
             executor_lease_epoch: 1,
             executor_lease_expires_at_ms: i64::MAX,

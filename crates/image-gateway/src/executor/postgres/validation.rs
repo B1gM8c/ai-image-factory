@@ -61,7 +61,11 @@ pub(super) fn validate_owner(owner: &str) -> Result<(), ExecutorSubmissionError>
 pub(super) fn validate_claim_scope(
     scope: &ExecutorClaimScope,
 ) -> Result<(), ExecutorSubmissionError> {
-    if is_bounded_identifier(&scope.provider_id) && is_bounded_identifier(&scope.command_schema) {
+    if !scope.execution_profile_id.is_nil()
+        && is_bounded_identifier(&scope.provider_id)
+        && is_bounded_identifier(&scope.command_schema)
+        && is_bounded_identifier(&scope.adapter_revision)
+    {
         Ok(())
     } else {
         Err(ExecutorSubmissionError::InvalidInput)
@@ -87,6 +91,8 @@ pub(super) fn validate_executor_lease(
         && !lease.output_id.is_nil()
         && !lease.job_id.is_nil()
         && !lease.work_item_id.is_nil()
+        && !lease.execution_profile_id.is_nil()
+        && is_bounded_identifier(&lease.adapter_revision)
     {
         Ok(())
     } else {

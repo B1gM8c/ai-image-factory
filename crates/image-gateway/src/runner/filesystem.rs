@@ -47,6 +47,8 @@ struct DiskSpec {
     model: String,
     command_schema: String,
     command_hash: String,
+    execution_profile_id: String,
+    adapter_revision: String,
 }
 
 #[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -287,6 +289,8 @@ impl DiskSpec {
             model: lease.model.clone(),
             command_schema: lease.command_schema.clone(),
             command_hash: lease.command_hash.clone(),
+            execution_profile_id: lease.execution_profile_id.to_string(),
+            adapter_revision: lease.adapter_revision.clone(),
         }
     }
 
@@ -297,12 +301,18 @@ impl DiskSpec {
             &self.output_id,
             &self.job_id,
             &self.work_item_id,
+            &self.execution_profile_id,
         ] {
             if parse_uuid(value)?.to_string() != *value {
                 return Err(RunnerJournalError::Integrity);
             }
         }
-        for value in [&self.provider_id, &self.model, &self.command_schema] {
+        for value in [
+            &self.provider_id,
+            &self.model,
+            &self.command_schema,
+            &self.adapter_revision,
+        ] {
             validate_text(value)?;
         }
         if self.output_index < 0 || !is_sha256(&self.command_hash) {
@@ -568,11 +578,12 @@ fn validate_lease(lease: &ExecutorSubmissionLease) -> Result<(), RunnerJournalEr
         &lease.provider_id,
         &lease.model,
         &lease.command_schema,
+        &lease.adapter_revision,
         &lease.executor_owner,
     ] {
         validate_input_text(value)?;
     }
-    if !is_sha256(&lease.command_hash) {
+    if lease.execution_profile_id.is_nil() || !is_sha256(&lease.command_hash) {
         return Err(RunnerJournalError::InvalidInput);
     }
     Ok(())

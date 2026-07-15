@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 type TestResult<T = ()> = Result<T, String>;
 
-const REQUIRED_COLUMNS: [(&str, &str); 46] = [
+const REQUIRED_COLUMNS: [(&str, &str); 55] = [
     ("usage_events", "tenant_id"),
     ("quota_reservations", "tenant_id"),
     ("quota_reservations", "job_id"),
@@ -60,9 +60,18 @@ const REQUIRED_COLUMNS: [(&str, &str); 46] = [
     ("executor_runner_observations", "payload_hash"),
     ("executor_resolution_decisions", "source"),
     ("executor_resolution_decisions", "resolution_fingerprint"),
+    ("provider_submissions", "execution_profile_id"),
+    ("provider_submissions", "adapter_revision"),
+    ("work_items", "execution_profile_id"),
+    ("provider_execution_profiles", "credential_ref"),
+    ("provider_accounts", "credential_ref"),
+    ("provider_accounts", "credential_auth_sha256"),
+    ("executor_resource_policies", "allocated_count"),
+    ("executor_capacity_allocations", "state"),
+    ("executor_capacity_allocations", "release_decision_id"),
 ];
 
-const REQUIRED_INDEXES: [&str; 11] = [
+const REQUIRED_INDEXES: [&str; 14] = [
     "usage_events_tenant_created_at_ms_idx",
     "gateway_api_keys_project_id_idx",
     "quota_reservations_active_tenant_idx",
@@ -74,6 +83,9 @@ const REQUIRED_INDEXES: [&str; 11] = [
     "admission_input_cleanup_pending_idx",
     "admission_input_cleanup_lease_idx",
     "executor_executions_pending_evidence_idx",
+    "executor_capacity_allocations_held_execution_idx",
+    "executor_capacity_allocations_orphan_idx",
+    "executor_resource_policies_enabled_account_uidx",
 ];
 
 #[tokio::test]
@@ -167,6 +179,18 @@ async fn observation_migration_rejects_existing_projection_splits() -> TestResul
     };
 
     let result = observation_resolution_upgrade_case(&test_schema.pool).await;
+    let cleanup = test_schema.cleanup().await;
+    cleanup?;
+    result
+}
+
+#[tokio::test]
+async fn execution_profile_migration_waits_for_old_writers_before_drain_check() -> TestResult {
+    let Some(test_schema) = TestSchema::new(3).await? else {
+        return Ok(());
+    };
+
+    let result = execution_profile_upgrade_race_case(&test_schema.pool).await;
     let cleanup = test_schema.cleanup().await;
     cleanup?;
     result
@@ -575,6 +599,127 @@ async fn observation_resolution_upgrade_case(pool: &PgPool) -> TestResult {
     )
 }
 
+async fn execution_profile_upgrade_race_case(pool: &PgPool) -> TestResult {
+    for migration in [
+        include_str!("../migrations/0000_legacy_reconciliation.sql"),
+        include_str!("../migrations/0001_usage.sql"),
+        include_str!("../migrations/0002_durable_admission.sql"),
+        include_str!("../migrations/0003_durable_scheduling.sql"),
+        include_str!("../migrations/0004_api_key_hmac.sql"),
+        include_str!("../migrations/0005_artifact_replay.sql"),
+        include_str!("../migrations/0006_execution_context.sql"),
+        include_str!("../migrations/0007_edit_inputs.sql"),
+        include_str!("../migrations/0008_provider_submissions.sql"),
+        include_str!("../migrations/0009_economic_kernel.sql"),
+        include_str!("../migrations/0010_executor_artifact_authority.sql"),
+        include_str!("../migrations/0011_executor_observation_resolution.sql"),
+        include_str!("../migrations/0012_executor_pending_evidence_index.sql"),
+    ] {
+        sqlx::raw_sql(migration)
+            .execute(pool)
+            .await
+            .map_err(|error| format!("pre-0013 migration failed: {error}"))?;
+    }
+    sqlx::raw_sql(
+        r#"
+        DO $$
+        DECLARE constraint_name TEXT;
+        BEGIN
+            FOR constraint_name IN
+                SELECT conname
+                FROM pg_constraint
+                WHERE conrelid = 'provider_submissions'::regclass
+                  AND contype = 'f'
+            LOOP
+                EXECUTE format(
+                    'ALTER TABLE provider_submissions DROP CONSTRAINT %I',
+                    constraint_name
+                );
+            END LOOP;
+        END;
+        $$;
+        "#,
+    )
+    .execute(pool)
+    .await
+    .map_err(|error| format!("failed to isolate old executor writer: {error}"))?;
+
+    let submission_id = Uuid::new_v4();
+    let executor_execution_id = Uuid::new_v4();
+    let mut old_writer = pool
+        .begin()
+        .await
+        .map_err(|error| format!("failed to begin old writer: {error}"))?;
+    sqlx::query(
+        r#"
+        INSERT INTO provider_submissions
+          (submission_id, executor_execution_id, output_id, job_id,
+           tenant_id, provider_id, model, work_item_id,
+           created_by_execution_id, created_by_lease_epoch,
+           command_schema, command_hash, state, prepared_at_ms, updated_at_ms)
+        VALUES ($1, $2, $3, $4, 'tenant', 'provider', 'model', $5,
+                $6, 1, 'command-v1', $7, 'prepared', 1, 1)
+        "#,
+    )
+    .bind(submission_id)
+    .bind(executor_execution_id)
+    .bind(Uuid::new_v4())
+    .bind(Uuid::new_v4())
+    .bind(Uuid::new_v4())
+    .bind(Uuid::new_v4())
+    .bind("a".repeat(64))
+    .execute(&mut *old_writer)
+    .await
+    .map_err(|error| format!("failed to stage old submission: {error}"))?;
+    sqlx::query(
+        r#"
+        INSERT INTO executor_executions
+          (executor_execution_id, submission_id, state, created_at_ms, updated_at_ms)
+        VALUES ($1, $2, 'prepared', 1, 1)
+        "#,
+    )
+    .bind(executor_execution_id)
+    .bind(submission_id)
+    .execute(&mut *old_writer)
+    .await
+    .map_err(|error| format!("failed to stage old execution: {error}"))?;
+
+    let migration_pool = pool.clone();
+    let mut migration = tokio::spawn(async move {
+        sqlx::raw_sql(include_str!(
+            "../migrations/0013_executor_execution_profiles.sql"
+        ))
+        .execute(&migration_pool)
+        .await
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    require(
+        !migration.is_finished(),
+        "0013 did not serialize with the in-flight old executor writer",
+    )?;
+    old_writer
+        .commit()
+        .await
+        .map_err(|error| format!("failed to commit old writer: {error}"))?;
+    let migration_result = timeout(Duration::from_secs(5), &mut migration)
+        .await
+        .map_err(|_| "0013 did not finish after old writer committed".to_string())?
+        .map_err(|error| format!("0013 task failed: {error}"))?;
+    require(
+        migration_result.is_err(),
+        "0013 missed the active row committed by an old executor writer",
+    )?;
+    let profile_table_exists: bool =
+        sqlx::query_scalar("SELECT to_regclass('provider_execution_profiles') IS NOT NULL")
+            .fetch_one(pool)
+            .await
+            .map_err(|error| format!("failed to inspect rolled-back 0013: {error}"))?;
+    require(
+        !profile_table_exists,
+        "failed 0013 migration did not roll back its schema changes",
+    )
+}
+
 async fn default_pool_case(test_schema: &TestSchema) -> TestResult {
     let database_url = env::var("TEST_DATABASE_URL")
         .map_err(|_| "TEST_DATABASE_URL disappeared during test".to_string())?;
@@ -827,8 +972,8 @@ async fn shared_pool_case(pool: &PgPool) -> TestResult {
 
 async fn assert_expected_schema(pool: &PgPool) -> TestResult {
     require(
-        migration_versions(pool).await? == vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
-        "applied migration versions must be exactly [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]",
+        migration_versions(pool).await? == vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13],
+        "applied migration versions must be exactly [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]",
     )?;
 
     for (table, column) in REQUIRED_COLUMNS {

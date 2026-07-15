@@ -1159,6 +1159,8 @@ mod tests {
             output_index: 0,
             command_schema: "openai.images.generation.v1".to_string(),
             command_hash: "a".repeat(64),
+            execution_profile_id: Uuid::new_v4(),
+            adapter_revision: "openai-codex-generation-v1".to_string(),
             executor_owner: "owner-1".to_string(),
             executor_lease_epoch: 1,
             executor_lease_expires_at_ms: i64::MAX,
