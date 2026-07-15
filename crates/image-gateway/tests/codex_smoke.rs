@@ -20,6 +20,7 @@ fn smoke_config() -> AppConfig {
         auth_token: Some("smoke-token".to_string()),
         admin_token: Some("admin-token".to_string()),
         database_url: None,
+        generation_admission_contract: Default::default(),
         five_hour_image_limit: 3,
         seven_day_image_limit: 3,
         max_concurrent_jobs: 1,

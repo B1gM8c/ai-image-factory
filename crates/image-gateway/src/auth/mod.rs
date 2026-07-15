@@ -87,6 +87,7 @@ mod tests {
             auth_token: Some(token.to_string()),
             admin_token: Some(token.to_string()),
             database_url: None,
+            generation_admission_contract: Default::default(),
             five_hour_image_limit: 1,
             seven_day_image_limit: 1,
             max_concurrent_jobs: 1,

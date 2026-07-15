@@ -8,10 +8,12 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde_json::{Value, json};
 
 use process_smoke_support::{
-    API_TOKEN, GatewayProcess, SmokeFiles, TestDatabase, TestResult, WorkerdProcess,
-    assert_artifact_bytes, assert_codex_edit_outputs, assert_codex_outputs,
+    API_TOKEN, ExecutordProcess, GatewayProcess, ReducerdProcess, SmokeFiles, TestDatabase,
+    TestResult, WorkerdProcess, alternate_opaque_png, assert_artifact_bytes,
+    assert_codex_edit_outputs, assert_codex_outputs, assert_executor_codex_outputs,
     assert_prompt_semantics, assert_response, combine_results, header, opaque_png, poll_health,
-    require, start_gateway_with_retry, startup_failed_from_address_in_use, tamper_artifact,
+    require, start_gateway_with_retry, start_v2_gateway_with_retry,
+    startup_failed_from_address_in_use, tamper_artifact,
 };
 
 const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
@@ -19,6 +21,9 @@ const IDEMPOTENCY_KEY: &str = "process-smoke-key";
 const DRAIN_IDEMPOTENCY_KEY: &str = "process-smoke-drain-key";
 const QUEUE_IDEMPOTENCY_KEYS: [&str; 2] = ["process-smoke-queue-a", "process-smoke-queue-b"];
 const EDIT_IDEMPOTENCY_KEY: &str = "process-smoke-edit-key";
+const V2_IDEMPOTENCY_KEY: &str = "process-smoke-generation-v2-key";
+const V2_OUTPUT_COUNT: usize = 2;
+const V2_SUCCESS_PRICE_MICROS: i64 = 7_000;
 
 // Like the other PostgreSQL integration tests, local runs skip without TEST_DATABASE_URL while CI
 // fails closed so the process composition cannot silently go untested there.
@@ -29,6 +34,17 @@ async fn production_process_composition_succeeds_when_test_database_is_configure
     };
 
     let result = run_process_smoke(&database).await;
+    let cleanup = database.cleanup().await;
+    combine_results(result, cleanup, "schema cleanup")
+}
+
+#[tokio::test]
+async fn production_process_composition_executes_and_replays_generation_v2() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+
+    let result = run_generation_v2_process_smoke(&database).await;
     let cleanup = database.cleanup().await;
     combine_results(result, cleanup, "schema cleanup")
 }
@@ -109,6 +125,51 @@ async fn run_process_smoke(database: &TestDatabase) -> TestResult {
     let result = combine_results(result, gateway_shutdown, "gateway shutdown");
     let worker_shutdown = workerd.terminate().await;
     combine_results(result, worker_shutdown, "workerd shutdown")
+}
+
+async fn run_generation_v2_process_smoke(database: &TestDatabase) -> TestResult {
+    let fixtures = [opaque_png()?, alternate_opaque_png()?];
+    let files = SmokeFiles::new(&fixtures[0])?;
+    files.set_second_fixture(&fixtures[1])?;
+    database
+        .configure_v2_pricing(V2_OUTPUT_COUNT, V2_SUCCESS_PRICE_MICROS)
+        .await?;
+    let profile = database
+        .provision_codex_execution_profile(files.codex_auth_file_sha256()?)
+        .await?;
+    let client = reqwest::Client::builder()
+        .timeout(HTTP_TIMEOUT)
+        .build()
+        .map_err(|error| format!("failed to build HTTP client: {error}"))?;
+    let mut workerd = WorkerdProcess::start_handoff(database, &files, &profile.profile_key).await?;
+    let mut executord = ExecutordProcess::start(
+        database,
+        &files,
+        &profile.profile_key,
+        &profile.credential_ref,
+    )
+    .await?;
+    let mut reducerd = ReducerdProcess::start(database, &files).await?;
+    let (mut gateway, address) = start_v2_gateway_with_retry(&client, database, &files).await?;
+
+    let result = exercise_generation_v2_gateway(
+        &client,
+        address,
+        database,
+        &files,
+        &fixtures,
+        &profile,
+        &mut gateway,
+    )
+    .await;
+    let gateway_shutdown = gateway.terminate().await;
+    let result = combine_results(result, gateway_shutdown, "V2 gateway shutdown");
+    let reducer_shutdown = reducerd.terminate().await;
+    let result = combine_results(result, reducer_shutdown, "reducerd shutdown");
+    let executor_shutdown = executord.terminate().await;
+    let result = combine_results(result, executor_shutdown, "executord shutdown");
+    let worker_shutdown = workerd.terminate().await;
+    combine_results(result, worker_shutdown, "V2 workerd shutdown")
 }
 
 async fn run_edit_process_smoke(database: &TestDatabase) -> TestResult {
@@ -242,6 +303,127 @@ fn spawn_generation_request(
             format!("queued generation returned {status}: {body:#}"),
         )
     })
+}
+
+async fn exercise_generation_v2_gateway(
+    client: &reqwest::Client,
+    address: std::net::SocketAddr,
+    database: &TestDatabase,
+    files: &SmokeFiles,
+    fixtures: &[Vec<u8>; V2_OUTPUT_COUNT],
+    profile: &process_smoke_support::ExecutionProfile,
+    gateway: &mut GatewayProcess,
+) -> TestResult {
+    let request_body = generation_v2_request();
+    let base_url = format!("http://{address}");
+    poll_health(client, &base_url, gateway).await?;
+    let response = client
+        .post(format!("{base_url}/v1/images/generations"))
+        .bearer_auth(API_TOKEN)
+        .header("Idempotency-Key", V2_IDEMPOTENCY_KEY)
+        .json(&request_body)
+        .send()
+        .await
+        .map_err(|error| format!("V2 generation request failed: {error}"))?;
+    let status = response.status();
+    let headers = response.headers().clone();
+    let request_id = header(&headers, "x-request-id")?;
+    let body: Value = response
+        .json()
+        .await
+        .map_err(|error| format!("V2 generation response was not JSON: {error}"))?;
+    require(
+        status == reqwest::StatusCode::OK,
+        format!("V2 generation returned {status}: {body:#}"),
+    )?;
+    assert_generation_v2_response(&body, &headers, fixtures)?;
+    assert_executor_codex_outputs(files, V2_OUTPUT_COUNT)?;
+    database
+        .assert_v2_generation_graph(
+            &request_id,
+            profile,
+            fixtures,
+            V2_OUTPUT_COUNT,
+            V2_SUCCESS_PRICE_MICROS,
+        )
+        .await?;
+
+    gateway.terminate().await?;
+    let (restarted, restarted_address) =
+        start_v2_gateway_with_retry(client, database, files).await?;
+    *gateway = restarted;
+    let replay = client
+        .post(format!("http://{restarted_address}/v1/images/generations"))
+        .bearer_auth(API_TOKEN)
+        .header("Idempotency-Key", V2_IDEMPOTENCY_KEY)
+        .json(&request_body)
+        .send()
+        .await
+        .map_err(|error| format!("V2 idempotent replay failed: {error}"))?;
+    let replay_status = replay.status();
+    let replay_headers = replay.headers().clone();
+    let replay_request_id = header(&replay_headers, "x-request-id")?;
+    let replay_body: Value = replay
+        .json()
+        .await
+        .map_err(|error| format!("V2 idempotent replay was not JSON: {error}"))?;
+    require(
+        replay_status == reqwest::StatusCode::OK && replay_body == body,
+        format!("unexpected V2 idempotent replay {replay_status}: {replay_body:#}"),
+    )?;
+    require(
+        replay_request_id != request_id,
+        "V2 replay must receive a fresh request id",
+    )?;
+    assert_generation_v2_response(&replay_body, &replay_headers, fixtures)?;
+    assert_executor_codex_outputs(files, V2_OUTPUT_COUNT)?;
+    database
+        .assert_v2_generation_graph(
+            &request_id,
+            profile,
+            fixtures,
+            V2_OUTPUT_COUNT,
+            V2_SUCCESS_PRICE_MICROS,
+        )
+        .await
+}
+
+fn assert_generation_v2_response(
+    body: &Value,
+    headers: &reqwest::header::HeaderMap,
+    fixtures: &[Vec<u8>; V2_OUTPUT_COUNT],
+) -> TestResult {
+    require(
+        body["created"].as_i64().is_some_and(|value| value > 0)
+            && body["output_format"] == "png"
+            && body["quality"] == "low"
+            && body["size"] == "2x1"
+            && body["background"] == "opaque",
+        format!("unexpected V2 response metadata: {body:#}"),
+    )?;
+    require(
+        header(headers, "openai-project")? == "proj_default"
+            && header(headers, "x-image-units-limit-5h")? == "40"
+            && header(headers, "x-image-units-remaining-5h")? == "38",
+        "unexpected V2 response usage metadata",
+    )?;
+    let encoded = body["data"]
+        .as_array()
+        .filter(|data| data.len() == V2_OUTPUT_COUNT)
+        .ok_or_else(|| format!("V2 response must contain exactly {V2_OUTPUT_COUNT} images"))?;
+    for (index, image) in encoded.iter().enumerate() {
+        let encoded = image["b64_json"]
+            .as_str()
+            .ok_or_else(|| format!("V2 response image {index} is missing b64_json"))?;
+        let decoded = STANDARD
+            .decode(encoded)
+            .map_err(|error| format!("V2 response image {index} was not valid base64: {error}"))?;
+        require(
+            decoded.as_slice() == fixtures[index].as_slice(),
+            format!("V2 response image {index} did not exactly match the fake Codex fixture"),
+        )?;
+    }
+    Ok(())
 }
 
 async fn exercise_gateway(
@@ -419,6 +601,12 @@ fn generation_request() -> Value {
         "quality": "low",
         "output_format": "png"
     })
+}
+
+fn generation_v2_request() -> Value {
+    let mut request = generation_request();
+    request["n"] = json!(V2_OUTPUT_COUNT);
+    request
 }
 
 fn edit_request(image: &[u8]) -> Value {

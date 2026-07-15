@@ -3,12 +3,14 @@ mod database;
 mod process;
 
 pub(crate) use assertions::{
-    assert_artifact_bytes, assert_codex_edit_outputs, assert_codex_outputs,
-    assert_prompt_semantics, assert_response, header, opaque_png, tamper_artifact,
+    alternate_opaque_png, assert_artifact_bytes, assert_codex_edit_outputs, assert_codex_outputs,
+    assert_executor_codex_outputs, assert_prompt_semantics, assert_response, header, opaque_png,
+    tamper_artifact,
 };
-pub(crate) use database::TestDatabase;
+pub(crate) use database::{ExecutionProfile, TestDatabase};
 pub(crate) use process::{
-    GatewayProcess, SmokeFiles, WorkerdProcess, poll_health, read_pid, start_gateway_with_retry,
+    ExecutordProcess, GatewayProcess, ReducerdProcess, SmokeFiles, WorkerdProcess, poll_health,
+    read_pid, start_gateway_with_retry, start_v2_gateway_with_retry,
     startup_failed_from_address_in_use,
 };
 

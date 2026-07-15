@@ -7,9 +7,10 @@ submission to an immutable database execution profile and acquires durable
 provider capacity before launch. Phase 1H atomically transfers V2 work from
 the worker lease into executor ownership. Process-level PostgreSQL tests cover
 one launch, restart attach, `SIGTERM` drain, owner-session loss, capacity
-races, handoff rollback/replay, and late evidence after executor lease expiry.
-The production Images API remains on `LegacyV1` until every open activation
-gate in this document passes.
+races, handoff rollback/replay, late evidence after executor lease expiry, and
+the explicit default-off public V2 route. The production Images API defaults to
+`LegacyV1`; operators may select V2 generation only after satisfying the
+deployment-owned isolation gate in this document.
 
 The checkpoint includes owner-and-scope singleton supervision, exact launch
 context projection, output-scoped Codex command projection, idempotent database
@@ -202,13 +203,12 @@ The socket is not a public API and does not reuse the official Images facade.
 6. Connect provider evidence, output reduction, and economic settlement.
 7. Add crash injection, hostile-input, concurrent attach, and real Codex tests.
 
-Each slice is additive. `LegacyV1` remains the default until slice 7 passes.
-
-At this checkpoint, slices 1 through 5 are implemented. Slice 6's executor
-evidence, artifact authority, output economics, and reducer kernels are
-implemented independently; the V2 API wiring that composes them remains open.
-Slice 7 has adversarial fake-provider and real-process coverage but still lacks
-the credentialed real Codex CLI request through the public Images API.
+Each slice is additive. All seven slices are implemented, while `LegacyV1`
+remains the safe default. The public V2 process proof composes the real gateway,
+PostgreSQL, handoff workerd, executord, `codex-runner`, reducerd, artifact
+hydration, economics, and idempotent replay. Its release gate uses `n=2` and a
+non-zero exact price so an output/job cardinality error or duplicate settlement
+cannot pass invisibly.
 
 The current `ImageGenerator` interface is job-level and may loop over `n`.
 Provider submissions are output-level, so executord must not call that interface
@@ -231,8 +231,14 @@ derived its type, hash, and size, and committed its append-only authority row.
 The current child protocol is a versioned, length-bounded private filesystem
 request consumed by `codex-runner`; it rejects unknown fields, uses explicit
 canonical executable paths and hashes, clears ambient environment, and copies
-only a private `auth.json` into an execution-specific Codex home. This is a
-durability boundary, not a hostile multi-tenant security boundary. A same-UID
+only a private `auth.json` into an execution-specific Codex home. The child uses
+the restricted `PATH=/usr/bin:/bin`. Executord accepts a native
+Codex binary or a script with an existing executable absolute shebang
+interpreter. An `/usr/bin/env` wrapper must resolve its command in the
+restricted path, so executord rejects `#!/usr/bin/env node` before claiming
+work when `node` is absent. Malformed or unknown executable formats also fail
+startup. This remains a durability boundary, not a hostile multi-tenant
+security boundary. A same-UID
 process can still race executable replacement or inspect another same-UID
 process on common operating systems. Production activation therefore requires
 a dedicated service identity plus an external container/cgroup/sandbox policy
@@ -257,5 +263,13 @@ Production V2 traffic remains disabled according to this gate matrix:
 | repeatable profile provisioning preserves operator kill switches | passed | `factoryctl provision-codex-profile`, private auth digest, concurrent exact/conflict and rollback tests |
 | standalone terminal reducer lifecycle | passed | `reducerd` claim/heartbeat/publication/completion, transient retry, and bounded drain tests |
 | hostile multi-tenant CLI isolation | open | dedicated UID plus externally enforced sandbox/cgroup/mount/network policy |
-| public Images API traverses the complete V2 path | open | generation-only default-off route gate plus fake full-process test |
-| credentialed real Codex CLI image generation | open | run official-shape API smoke and verify durable artifact/replay |
+| public Images API traverses the complete V2 path | passed | default-off generation-only route gate; `n=2`, non-zero pricing, real gateway/workerd/executord/codex-runner/reducerd process smoke; restart replay keeps one job and two provider invocations |
+| credentialed real Codex CLI image generation | passed | 2026-07-15 official-shape `size=auto` request returned a verified PNG through the full V2 topology; replay was byte-identical with one durable job, one charge graph, and no second runner directory |
+
+The credentialed smoke used the self-contained native binary shipped in the
+official Codex package. The npm launcher is a Node script and is intentionally
+incompatible with the executor's restricted path unless its interpreter is
+explicitly present there. The successful `size=auto` response was `1254x1254`.
+An exact `1024x1024` request correctly failed when Codex produced a different
+native size: the gateway verifies exact dimensions and never crops, stretches,
+or resamples provider output to manufacture compliance.

@@ -36,6 +36,7 @@ async fn main() -> Result<(), ImageGatewayError> {
         artifact_store.clone(),
     ));
     let bind = config.bind;
+    let generation_contract = config.generation_admission_contract.as_str();
     let app = build_router_with_external_execution(
         config,
         ExternalImageGatewayComponents {
@@ -50,7 +51,7 @@ async fn main() -> Result<(), ImageGatewayError> {
     let listener = tokio::net::TcpListener::bind(bind)
         .await
         .map_err(|_| ImageGatewayError::config("failed to bind HTTP listener"))?;
-    tracing::info!(%bind, "gpt-image-2 gateway listening");
+    tracing::info!(%bind, generation.contract = generation_contract, "gpt-image-2 gateway listening");
 
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())

@@ -15,6 +15,7 @@ pub struct AppConfig {
     pub auth_token: Option<String>,
     pub admin_token: Option<String>,
     pub database_url: Option<String>,
+    pub generation_admission_contract: GenerationAdmissionContract,
     pub five_hour_image_limit: u32,
     pub seven_day_image_limit: u32,
     pub max_concurrent_jobs: usize,
@@ -27,6 +28,42 @@ pub struct AppConfig {
     pub proxy: ProxyConfig,
     pub codex_home: Option<String>,
     pub cleanup_codex_outputs: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum GenerationAdmissionContract {
+    #[default]
+    LegacyV1,
+    OutputEconomicsV2,
+}
+
+impl GenerationAdmissionContract {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::LegacyV1 => "legacy-v1",
+            Self::OutputEconomicsV2 => "output-economics-v2",
+        }
+    }
+
+    fn from_env() -> Result<Self, ImageGatewayError> {
+        match env::var("GATEWAY_IMAGES_GENERATION_CONTRACT") {
+            Ok(value) => Self::parse(Some(&value)),
+            Err(env::VarError::NotPresent) => Self::parse(None),
+            Err(env::VarError::NotUnicode(_)) => Err(ImageGatewayError::config(
+                "GATEWAY_IMAGES_GENERATION_CONTRACT must be valid UTF-8",
+            )),
+        }
+    }
+
+    fn parse(value: Option<&str>) -> Result<Self, ImageGatewayError> {
+        match value {
+            None | Some("legacy-v1") => Ok(Self::LegacyV1),
+            Some("output-economics-v2") => Ok(Self::OutputEconomicsV2),
+            Some(_) => Err(ImageGatewayError::config(
+                "GATEWAY_IMAGES_GENERATION_CONTRACT must be legacy-v1 or output-economics-v2",
+            )),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -53,6 +90,7 @@ impl AppConfig {
             auth_token: non_empty_env("GATEWAY_API_TOKEN"),
             admin_token: non_empty_env("GATEWAY_ADMIN_TOKEN"),
             database_url,
+            generation_admission_contract: GenerationAdmissionContract::from_env()?,
             five_hour_image_limit: env_u32("GATEWAY_IMAGE_LIMIT_5H", 40)?,
             seven_day_image_limit: env_u32("GATEWAY_IMAGE_LIMIT_7D", 200)?,
             max_concurrent_jobs: env_usize("GATEWAY_MAX_CONCURRENT_JOBS", 1)?,
@@ -241,6 +279,7 @@ mod tests {
             auth_token: token.map(str::to_string),
             admin_token: None,
             database_url: Some("postgres://localhost/test".to_string()),
+            generation_admission_contract: GenerationAdmissionContract::LegacyV1,
             five_hour_image_limit: 1,
             seven_day_image_limit: 1,
             max_concurrent_jobs: 1,
@@ -253,6 +292,25 @@ mod tests {
             proxy: ProxyConfig::default(),
             codex_home: None,
             cleanup_codex_outputs: false,
+        }
+    }
+
+    #[test]
+    fn generation_contract_is_default_off_and_strict() {
+        assert_eq!(
+            GenerationAdmissionContract::parse(None).unwrap(),
+            GenerationAdmissionContract::LegacyV1
+        );
+        assert_eq!(
+            GenerationAdmissionContract::parse(Some("legacy-v1")).unwrap(),
+            GenerationAdmissionContract::LegacyV1
+        );
+        assert_eq!(
+            GenerationAdmissionContract::parse(Some("output-economics-v2")).unwrap(),
+            GenerationAdmissionContract::OutputEconomicsV2
+        );
+        for invalid in ["", "true", "v2", " output-economics-v2"] {
+            assert!(GenerationAdmissionContract::parse(Some(invalid)).is_err());
         }
     }
 

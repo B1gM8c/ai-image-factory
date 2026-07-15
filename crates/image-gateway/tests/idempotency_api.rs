@@ -328,6 +328,7 @@ fn config() -> AppConfig {
         auth_token: Some("test-token".to_string()),
         admin_token: Some("admin-token".to_string()),
         database_url: None,
+        generation_admission_contract: Default::default(),
         five_hour_image_limit: 10,
         seven_day_image_limit: 50,
         max_concurrent_jobs: 2,

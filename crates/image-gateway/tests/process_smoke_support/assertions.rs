@@ -53,7 +53,17 @@ pub(crate) fn assert_response(
 }
 
 pub(crate) fn assert_codex_outputs(files: &SmokeFiles, expected_parent_pid: u32) -> TestResult {
-    let (prompt, request_dir) = codex_output_evidence(files, expected_parent_pid, false)?;
+    let (prompt, request_dir) =
+        codex_output_evidence(files, Some(expected_parent_pid), false, true, 1)?;
+    assert_prompt_semantics(&prompt, &request_dir)
+}
+
+pub(crate) fn assert_executor_codex_outputs(
+    files: &SmokeFiles,
+    expected_invocations: usize,
+) -> TestResult {
+    let (prompt, request_dir) =
+        codex_output_evidence(files, None, false, false, expected_invocations)?;
     assert_prompt_semantics(&prompt, &request_dir)
 }
 
@@ -61,7 +71,8 @@ pub(crate) fn assert_codex_edit_outputs(
     files: &SmokeFiles,
     expected_parent_pid: u32,
 ) -> TestResult {
-    let (prompt, request_dir) = codex_output_evidence(files, expected_parent_pid, true)?;
+    let (prompt, request_dir) =
+        codex_output_evidence(files, Some(expected_parent_pid), true, true, 1)?;
     require(
         prompt.contains("这是图生图编辑任务")
             && prompt.contains("用户编辑需求：process smoke opaque fixture"),
@@ -75,16 +86,20 @@ pub(crate) fn assert_codex_edit_outputs(
 
 fn codex_output_evidence(
     files: &SmokeFiles,
-    expected_parent_pid: u32,
+    expected_parent_pid: Option<u32>,
     expects_image: bool,
+    expects_cleanup: bool,
+    expected_invocations: usize,
 ) -> TestResult<(String, String)> {
     let invocation_count = fs::read_to_string(&files.invocation_log)
         .map_err(|error| format!("failed to read fake Codex invocation log: {error}"))?
         .lines()
         .count();
     require(
-        invocation_count == 1,
-        format!("fake Codex invocation count was {invocation_count}, expected 1"),
+        invocation_count == expected_invocations,
+        format!(
+            "fake Codex invocation count was {invocation_count}, expected {expected_invocations}"
+        ),
     )?;
     let argv = read_nul_strings(&files.argv_log)?;
     let request_dir = argv_value(&argv, "--cd")?;
@@ -97,15 +112,26 @@ fn codex_output_evidence(
         "fake Codex PID log must contain a positive PID",
     )?;
     let fake_parent_pid = read_pid(&files.fake_parent_pid_log)?;
+    if let Some(expected_parent_pid) = expected_parent_pid {
+        require(
+            fake_parent_pid == expected_parent_pid as i32,
+            format!(
+                "fake Codex parent PID was {fake_parent_pid}, expected workerd PID {expected_parent_pid}"
+            ),
+        )?;
+    } else {
+        require(
+            fake_parent_pid > 0 && fake_parent_pid != fake_pid,
+            "fake Codex must be launched by a distinct codex-runner process",
+        )?;
+    }
     require(
-        fake_parent_pid == expected_parent_pid as i32,
-        format!(
-            "fake Codex parent PID was {fake_parent_pid}, expected workerd PID {expected_parent_pid}"
-        ),
-    )?;
-    require(
-        !Path::new(&request_dir).exists(),
-        format!("cleaned request directory still exists: {request_dir}"),
+        Path::new(&request_dir).exists() != expects_cleanup,
+        if expects_cleanup {
+            format!("cleaned request directory still exists: {request_dir}")
+        } else {
+            format!("durable executor workspace is missing: {request_dir}")
+        },
     )?;
     Ok((prompt, request_dir))
 }
@@ -169,6 +195,21 @@ pub(crate) fn opaque_png() -> TestResult<Vec<u8>> {
     image
         .write_to(&mut cursor, ImageFormat::Png)
         .map_err(|error| format!("failed to encode opaque PNG fixture: {error}"))?;
+    Ok(cursor.into_inner())
+}
+
+pub(crate) fn alternate_opaque_png() -> TestResult<Vec<u8>> {
+    let image = ImageBuffer::from_fn(2, 1, |x, _| {
+        if x == 0 {
+            Rgb([90_u8, 15, 200])
+        } else {
+            Rgb([5_u8, 240, 130])
+        }
+    });
+    let mut cursor = Cursor::new(Vec::new());
+    image
+        .write_to(&mut cursor, ImageFormat::Png)
+        .map_err(|error| format!("failed to encode alternate opaque PNG fixture: {error}"))?;
     Ok(cursor.into_inner())
 }
 

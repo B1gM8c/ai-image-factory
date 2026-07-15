@@ -14,7 +14,7 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::{
-    ImageGatewayError,
+    GenerationAdmissionContract, ImageGatewayError,
     admission::{
         AdmissionClaim, AdmissionContract, AdmissionError, AdmissionTicket, AttachInputManifest,
         AttachInputObject, AttachJob, ClaimAdmission, EDIT_COMMAND_SCHEMA,
@@ -172,7 +172,7 @@ pub(super) async fn generations(
         schedule_weight: 1,
         schedule_priority: 1,
         schedule_cost: u64::from(units),
-        contract: AdmissionContract::LegacyV1,
+        contract: generation_admission_contract(state.config.generation_admission_contract),
     };
     if state.generation_execution_mode == GenerationExecutionMode::External {
         if let Err(error) = attach_ready_with_retry(&state, attach).await {
@@ -218,6 +218,13 @@ pub(super) async fn generations(
         execution.usage,
         &auth,
     )
+}
+
+fn generation_admission_contract(configured: GenerationAdmissionContract) -> AdmissionContract {
+    match configured {
+        GenerationAdmissionContract::LegacyV1 => AdmissionContract::LegacyV1,
+        GenerationAdmissionContract::OutputEconomicsV2 => AdmissionContract::OutputEconomicsV2,
+    }
 }
 
 async fn wait_for_generation(
@@ -768,6 +775,18 @@ mod tests {
         assert_eq!(
             external_result_wait_timeout(Duration::from_secs(7), Duration::from_secs(11)),
             Duration::from_secs(78),
+        );
+    }
+
+    #[test]
+    fn generation_contract_is_selected_explicitly() {
+        assert_eq!(
+            generation_admission_contract(GenerationAdmissionContract::LegacyV1),
+            AdmissionContract::LegacyV1
+        );
+        assert_eq!(
+            generation_admission_contract(GenerationAdmissionContract::OutputEconomicsV2),
+            AdmissionContract::OutputEconomicsV2
         );
     }
 

@@ -49,10 +49,10 @@ cargo run -p gpt-image-2-gateway --bin reconcilerd
 cargo run -p gpt-image-2-gateway --bin gpt-image-2-gateway
 ```
 
-The output-level V2 executor topology is implemented but is not selected by the
-public Images routes yet. Before running its internal workers, provision the
-immutable Codex execution binding from the same private `auth.json` that will be
-mounted into executord:
+The output-level V2 executor topology is available for generation requests but
+remains disabled by default. Before enabling it, provision the immutable Codex
+execution binding from the same private `auth.json` that will be mounted into
+executord:
 
 ```bash
 export EXECUTOR_PROFILE_KEY='openai-codex-generation-v1-account-1'
@@ -74,12 +74,29 @@ never overrides an operational kill switch.
 `workerd` uses `WORKER_EXECUTION_MODE=executor-handoff` and the same
 `EXECUTOR_PROFILE_KEY`; `executord` additionally requires its owner, mounted
 credential identity, runner root, helper executable, and Codex executable.
+Set `EXECUTOR_CODEX_EXECUTABLE` to the self-contained native Codex binary when
+using the official npm package, not its Node launcher. Executor children use
+`PATH=/usr/bin:/bin`; startup accepts native binaries and shebang scripts whose
+absolute interpreter exists and is executable. For `#!/usr/bin/env ...`
+wrappers, the requested interpreter must resolve inside that restricted path;
+incompatible or malformed wrappers are rejected before claiming work. Keep the
+restricted path instead of exposing an ambient package-manager environment to
+provider children.
 `reducerd` uses `REDUCER_OWNER`, `REDUCER_LEASE_MS`,
 `REDUCER_HEARTBEAT_INTERVAL_MS`, and `REDUCER_POLL_INTERVAL_MS`, with safe
 defaults. It verifies and publishes customer artifacts before atomically
 completing receipt, rating, quota, parent state, response projection, and
-outbox. Keep the Legacy workerd running for edits when later enabling
-generation-only V2 traffic.
+outbox. Set `GATEWAY_IMAGES_GENERATION_CONTRACT=output-economics-v2` on the
+gateway only after the handoff workerd, executord, and reducerd are healthy.
+The only accepted values are `legacy-v1` and `output-economics-v2`; unset means
+`legacy-v1`, and invalid values fail startup. This switch affects generation
+only. Keep a Legacy workerd pool running for edits and any previously admitted
+Legacy jobs.
+
+`size=auto` preserves the provider's native dimensions and reports the actual
+`WIDTHxHEIGHT`. Exact dimensions remain fail-closed: if Codex returns a
+different size, the request fails because the executor never locally crops,
+stretches, or resamples generated pixels.
 
 Default bind address is `127.0.0.1:8787`. Gateway startup requires at least one of `GATEWAY_API_TOKEN` or `GATEWAY_ADMIN_TOKEN`, a versioned API-key pepper keyring, and an explicit absolute, existing `GATEWAY_ARTIFACT_ROOT`; it does not require Codex CLI or `GATEWAY_CODEX_HOME`. Worker startup separately requires an explicit absolute, existing, writable `GATEWAY_CODEX_HOME` plus the shared artifact root. If both tokens are configured, they must be different. `GATEWAY_ADMIN_TOKEN` protects Admin endpoints for creating and revoking project API keys; it never authorizes image calls. An admin-only startup can bootstrap project keys, and image calls must then use one of those keys. `GATEWAY_API_TOKEN` remains a legacy image token and is not accepted on Admin endpoints.
 

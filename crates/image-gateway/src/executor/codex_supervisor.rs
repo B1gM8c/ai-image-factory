@@ -35,8 +35,10 @@ pub const CODEX_GENERATION_ADAPTER_REVISION: &str = "openai-codex-generation-v1"
 const AUTH_FILE: &str = "auth.json";
 const MAX_AUTH_BYTES: u64 = 1024 * 1024;
 const MAX_EXECUTABLE_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_SHEBANG_BYTES: usize = 4096;
 const MAX_RUNNER_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 const CHILD_REAP_TIMEOUT: Duration = Duration::from_secs(5);
+const CODEX_CHILD_PATH: &str = "/usr/bin:/bin";
 
 pub struct CodexProcessSupervisor {
     journal: Arc<FilesystemRunnerJournal>,
@@ -97,6 +99,7 @@ impl CodexProcessSupervisor {
         }
         let helper_executable = canonical_executable(helper_executable.as_ref())?;
         let codex_executable = canonical_executable(codex_executable.as_ref())?;
+        validate_codex_executable_compatibility(&codex_executable, CODEX_CHILD_PATH)?;
         let codex_executable_sha256 = hash_bounded_file(&codex_executable)?;
         let credential_auth_file =
             validate_auth_source(credential_home.as_ref(), credential_auth_sha256)?;
@@ -365,7 +368,7 @@ async fn run_codex_child(
         .env("HOME", codex_home)
         .env("CODEX_HOME", codex_home)
         .env("TMPDIR", workspace)
-        .env("PATH", "/usr/bin:/bin")
+        .env("PATH", CODEX_CHILD_PATH)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -609,6 +612,109 @@ fn canonical_executable(path: &Path) -> Result<PathBuf, ImageGatewayError> {
     Ok(canonical)
 }
 
+fn validate_codex_executable_compatibility(
+    path: &Path,
+    restricted_path: &str,
+) -> Result<(), ImageGatewayError> {
+    let mut file = fs::File::open(path)
+        .map_err(|_| ImageGatewayError::config("Codex executable is unreadable"))?;
+    let mut header = [0_u8; MAX_SHEBANG_BYTES + 1];
+    let count = file
+        .read(&mut header)
+        .map_err(|_| ImageGatewayError::config("Codex executable is unreadable"))?;
+    let header = &header[..count];
+    if !header.starts_with(b"#!") {
+        return if is_native_executable_header(header) {
+            Ok(())
+        } else {
+            Err(ImageGatewayError::config(
+                "Codex executable must be a native executable or a valid shebang script",
+            ))
+        };
+    }
+
+    let line_end = header
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .unwrap_or(count);
+    if line_end > MAX_SHEBANG_BYTES {
+        return Err(ImageGatewayError::config(
+            "Codex executable shebang is invalid",
+        ));
+    }
+    let shebang = std::str::from_utf8(&header[2..line_end])
+        .map_err(|_| ImageGatewayError::config("Codex executable shebang is invalid"))?
+        .trim_end_matches('\r');
+    let mut arguments = shebang.split_ascii_whitespace();
+    let interpreter = arguments
+        .next()
+        .ok_or_else(|| ImageGatewayError::config("Codex executable shebang is invalid"))?;
+    let interpreter_path = Path::new(interpreter);
+    if !interpreter_path.is_absolute() || !is_executable_file(interpreter_path) {
+        return Err(ImageGatewayError::config(format!(
+            "Codex executable shebang interpreter '{interpreter}' is unavailable"
+        )));
+    }
+
+    if interpreter_path.file_name().and_then(|name| name.to_str()) == Some("env") {
+        let arguments = arguments.collect::<Vec<_>>();
+        let command = env_shebang_command(&arguments)
+            .ok_or_else(|| ImageGatewayError::config("Codex executable shebang is invalid"))?;
+        if !command_available(command, restricted_path) {
+            return Err(ImageGatewayError::config(format!(
+                "Codex executable requires '{command}', but it is unavailable in restricted PATH {restricted_path}"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn is_native_executable_header(header: &[u8]) -> bool {
+    const NATIVE_MAGICS: [[u8; 4]; 9] = [
+        *b"\x7fELF",
+        [0xfe, 0xed, 0xfa, 0xce],
+        [0xce, 0xfa, 0xed, 0xfe],
+        [0xfe, 0xed, 0xfa, 0xcf],
+        [0xcf, 0xfa, 0xed, 0xfe],
+        [0xca, 0xfe, 0xba, 0xbe],
+        [0xbe, 0xba, 0xfe, 0xca],
+        [0xca, 0xfe, 0xba, 0xbf],
+        [0xbf, 0xba, 0xfe, 0xca],
+    ];
+    header
+        .get(..4)
+        .is_some_and(|magic| NATIVE_MAGICS.iter().any(|expected| magic == expected))
+}
+
+fn env_shebang_command<'a>(arguments: &'a [&'a str]) -> Option<&'a str> {
+    let mut index = 0;
+    while let Some(argument) = arguments.get(index).copied() {
+        match argument {
+            "--" | "-S" | "--split-string" => return arguments.get(index + 1).copied(),
+            "-u" | "--unset" | "-C" | "--chdir" => index += 2,
+            _ if argument.starts_with('-') || argument.contains('=') => index += 1,
+            _ => return Some(argument),
+        }
+    }
+    None
+}
+
+fn command_available(command: &str, restricted_path: &str) -> bool {
+    if command.contains('/') {
+        return Path::new(command).is_absolute() && is_executable_file(Path::new(command));
+    }
+    restricted_path
+        .split(':')
+        .filter(|directory| !directory.is_empty())
+        .any(|directory| is_executable_file(&Path::new(directory).join(command)))
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    fs::metadata(path)
+        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+}
+
 fn hash_bounded_file(path: &Path) -> Result<String, ImageGatewayError> {
     let mut file = fs::File::open(path)
         .map_err(|_| ImageGatewayError::config("executor executable is unreadable"))?;
@@ -809,6 +915,56 @@ mod tests {
         fs::write(&oversized_auth, vec![b'x'; MAX_AUTH_BYTES as usize + 1]).unwrap();
         fs::set_permissions(&oversized_auth, fs::Permissions::from_mode(0o600)).unwrap();
         assert!(codex_auth_file_sha256(oversized.path()).is_err());
+    }
+
+    #[test]
+    fn native_codex_executable_is_compatible_with_restricted_path() {
+        validate_codex_executable_compatibility(
+            &std::env::current_exe().unwrap(),
+            CODEX_CHILD_PATH,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn absolute_shebang_interpreter_is_compatible_when_executable() {
+        let temp = TempDir::new().unwrap();
+        let script = temp.path().join("codex-shell-wrapper");
+        fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+
+        validate_codex_executable_compatibility(&script, CODEX_CHILD_PATH).unwrap();
+    }
+
+    #[test]
+    fn env_shebang_is_rejected_when_node_is_missing_from_restricted_path() {
+        let temp = TempDir::new().unwrap();
+        let script = temp.path().join("codex-node-wrapper");
+        fs::write(&script, "#!/usr/bin/env node\n").unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let empty_path = temp.path().join("restricted-bin");
+        fs::create_dir(&empty_path).unwrap();
+
+        let error = validate_codex_executable_compatibility(&script, empty_path.to_str().unwrap())
+            .unwrap_err();
+
+        assert_eq!(error.error_code(), Some("configuration_error"));
+        let error = format!("{error:?}");
+        assert!(error.contains("requires 'node'"));
+        assert!(error.contains("unavailable in restricted PATH"));
+    }
+
+    #[test]
+    fn malformed_or_bom_prefixed_script_is_not_treated_as_native() {
+        let temp = TempDir::new().unwrap();
+        let script = temp.path().join("codex-invalid-wrapper");
+        fs::write(&script, b"\xef\xbb\xbf#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let error = validate_codex_executable_compatibility(&script, CODEX_CHILD_PATH).unwrap_err();
+
+        assert_eq!(error.error_code(), Some("configuration_error"));
+        assert!(format!("{error:?}").contains("native executable or a valid shebang"));
     }
 
     #[tokio::test]

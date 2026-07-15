@@ -27,12 +27,15 @@ pub(crate) struct SmokeFiles {
     pub(crate) fake_parent_pid_log: PathBuf,
     pub(crate) invocation_log: PathBuf,
     pub(crate) artifact_root: PathBuf,
+    runner_root: PathBuf,
     fake_bin: PathBuf,
     codex_home: PathBuf,
     fake_active_pid: PathBuf,
     fake_delay: PathBuf,
     gateway_log: PathBuf,
     workerd_log: PathBuf,
+    executord_log: PathBuf,
+    reducerd_log: PathBuf,
 }
 
 impl SmokeFiles {
@@ -49,17 +52,40 @@ impl SmokeFiles {
         let fake_active_pid = root.path().join("codex.active.pid");
         let fake_delay = root.path().join("codex.delay-seconds");
         let fixture_path = root.path().join("opaque.png");
+        let second_fixture_path = root.path().join("opaque-second.png");
         let gateway_log = root.path().join("gateway.log");
         let workerd_log = root.path().join("workerd.log");
+        let executord_log = root.path().join("executord.log");
+        let reducerd_log = root.path().join("reducerd.log");
         let artifact_root = root.path().join("artifacts");
+        let runner_root = root.path().join("runner");
         fs::create_dir_all(&fake_bin)
             .map_err(|error| format!("failed to create fake bin: {error}"))?;
         fs::create_dir_all(&codex_home)
             .map_err(|error| format!("failed to create Codex home: {error}"))?;
         fs::create_dir_all(&artifact_root)
             .map_err(|error| format!("failed to create artifact root: {error}"))?;
+        fs::create_dir_all(&runner_root)
+            .map_err(|error| format!("failed to create runner root: {error}"))?;
+        for private_root in [&codex_home, &artifact_root, &runner_root] {
+            fs::set_permissions(private_root, fs::Permissions::from_mode(0o700)).map_err(
+                |error| {
+                    format!(
+                        "failed to protect private root {}: {error}",
+                        private_root.display()
+                    )
+                },
+            )?;
+        }
+        let auth_path = codex_home.join("auth.json");
+        fs::write(&auth_path, b"{}\n")
+            .map_err(|error| format!("failed to write fake Codex credentials: {error}"))?;
+        fs::set_permissions(&auth_path, fs::Permissions::from_mode(0o600))
+            .map_err(|error| format!("failed to protect fake Codex credentials: {error}"))?;
         fs::write(&fixture_path, fixture)
             .map_err(|error| format!("failed to write PNG fixture: {error}"))?;
+        fs::write(&second_fixture_path, fixture)
+            .map_err(|error| format!("failed to write second PNG fixture: {error}"))?;
         fs::write(&fake_delay, "0")
             .map_err(|error| format!("failed to initialize fake Codex delay: {error}"))?;
 
@@ -74,6 +100,7 @@ impl SmokeFiles {
             fake_active_pid: &fake_active_pid,
             fake_delay: &fake_delay,
             fixture: &fixture_path,
+            second_fixture: &second_fixture_path,
         });
         fs::write(&script_path, script)
             .map_err(|error| format!("failed to write fake Codex: {error}"))?;
@@ -92,12 +119,15 @@ impl SmokeFiles {
             fake_parent_pid_log,
             invocation_log,
             artifact_root,
+            runner_root,
             fake_bin,
             codex_home,
             fake_active_pid,
             fake_delay,
             gateway_log,
             workerd_log,
+            executord_log,
+            reducerd_log,
         })
     }
 
@@ -108,6 +138,11 @@ impl SmokeFiles {
         )?;
         fs::write(&self.fake_delay, delay.as_secs().to_string())
             .map_err(|error| format!("failed to configure fake Codex delay: {error}"))
+    }
+
+    pub(crate) fn set_second_fixture(&self, fixture: &[u8]) -> TestResult {
+        fs::write(self._root.path().join("opaque-second.png"), fixture)
+            .map_err(|error| format!("failed to write distinct second PNG fixture: {error}"))
     }
 
     pub(crate) async fn wait_for_fake_codex_active(&self) -> TestResult {
@@ -121,6 +156,11 @@ impl SmokeFiles {
         })
         .await
         .map_err(|_| "fake Codex did not become active before timeout".to_string())?
+    }
+
+    pub(crate) fn codex_auth_file_sha256(&self) -> TestResult<String> {
+        gpt_image_2_gateway::codex_auth_file_sha256(&self.codex_home)
+            .map_err(|error| format!("failed to hash fake Codex auth.json: {error:?}"))
     }
 }
 
@@ -192,6 +232,63 @@ impl WorkerdProcess {
         Ok(process)
     }
 
+    pub(crate) async fn start_handoff(
+        database: &TestDatabase,
+        files: &SmokeFiles,
+        profile_key: &str,
+    ) -> TestResult<Self> {
+        let log = File::create(&files.workerd_log)
+            .map_err(|error| format!("failed to create V2 workerd log: {error}"))?;
+        let stderr = log
+            .try_clone()
+            .map_err(|error| format!("failed to clone V2 workerd log: {error}"))?;
+        let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_workerd"));
+        command
+            .env_clear()
+            .env("DATABASE_URL", database.database_url())
+            .env("GATEWAY_DATABASE_SCHEMA", database.schema())
+            .env("WORKER_EXECUTION_MODE", "executor-handoff")
+            .env("EXECUTOR_PROFILE_KEY", profile_key)
+            .env("WORKER_ID", "process-smoke-v2-workerd")
+            .env("WORKER_POLL_INTERVAL_MS", "10")
+            .env("WORKER_HANDOFF_LEASE_MS", "5000")
+            .env("RUST_LOG", "info")
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(log))
+            .stderr(Stdio::from(stderr))
+            .kill_on_drop(true);
+        command.process_group(0);
+        let child = command
+            .spawn()
+            .map_err(|error| format!("failed to start V2 workerd binary: {error}"))?;
+        let pid = child
+            .id()
+            .ok_or_else(|| "V2 workerd PID unavailable after spawn".to_string())?;
+        let mut process = Self {
+            child,
+            pid,
+            log_path: files.workerd_log.clone(),
+            exit_status: None,
+        };
+        timeout(HEALTH_TIMEOUT, async {
+            loop {
+                if let Some(status) = process.poll_exit()? {
+                    return Err(format!(
+                        "V2 workerd exited during startup with {status}: {}",
+                        process.logs()
+                    ));
+                }
+                if process.logs().contains("workerd started") {
+                    return Ok(());
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .map_err(|_| format!("V2 workerd startup timed out: {}", process.logs()))??;
+        Ok(process)
+    }
+
     pub(crate) fn pid(&self) -> u32 {
         self.pid
     }
@@ -249,6 +346,193 @@ impl Drop for WorkerdProcess {
     }
 }
 
+pub(crate) struct ExecutordProcess(ManagedProcess);
+
+impl ExecutordProcess {
+    pub(crate) async fn start(
+        database: &TestDatabase,
+        files: &SmokeFiles,
+        profile_key: &str,
+        credential_ref: &str,
+    ) -> TestResult<Self> {
+        let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_executord"));
+        command
+            .env_clear()
+            .env("DATABASE_URL", database.database_url())
+            .env("GATEWAY_DATABASE_SCHEMA", database.schema())
+            .env("GATEWAY_ARTIFACT_ROOT", &files.artifact_root)
+            .env("EXECUTOR_RUNNER_ROOT", &files.runner_root)
+            .env(
+                "EXECUTOR_HELPER_EXECUTABLE",
+                env!("CARGO_BIN_EXE_codex-runner"),
+            )
+            .env("EXECUTOR_CODEX_EXECUTABLE", files.fake_bin.join("codex"))
+            .env("EXECUTOR_CODEX_CREDENTIAL_HOME", &files.codex_home)
+            .env("EXECUTOR_OWNER", "process-smoke-v2-executord")
+            .env("EXECUTOR_PROFILE_KEY", profile_key)
+            .env("EXECUTOR_CREDENTIAL_REF", credential_ref)
+            .env("EXECUTOR_CREDENTIAL_REVISION", "1")
+            .env("EXECUTOR_LEASE_MS", "10000")
+            .env("EXECUTOR_HEARTBEAT_INTERVAL_MS", "250")
+            .env("EXECUTOR_POLL_INTERVAL_MS", "10")
+            .env("EXECUTOR_PROCESS_POLL_INTERVAL_MS", "10")
+            .env("EXECUTOR_PROCESS_STARTUP_GRACE_MS", "1000")
+            .env("EXECUTOR_REQUEST_TIMEOUT_MS", "5000")
+            .env("EXECUTOR_OWNER_GUARD_TIMEOUT_MS", "1000")
+            .env("RUST_LOG", "info")
+            .stdin(Stdio::null())
+            .kill_on_drop(true);
+        ManagedProcess::start(
+            command,
+            &files.executord_log,
+            "executord",
+            "executord started",
+        )
+        .await
+        .map(Self)
+    }
+
+    pub(crate) async fn terminate(&mut self) -> TestResult {
+        self.0.terminate().await
+    }
+}
+
+pub(crate) struct ReducerdProcess(ManagedProcess);
+
+impl ReducerdProcess {
+    pub(crate) async fn start(database: &TestDatabase, files: &SmokeFiles) -> TestResult<Self> {
+        let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_reducerd"));
+        command
+            .env_clear()
+            .env("DATABASE_URL", database.database_url())
+            .env("GATEWAY_DATABASE_SCHEMA", database.schema())
+            .env("GATEWAY_ARTIFACT_ROOT", &files.artifact_root)
+            .env("REDUCER_OWNER", "process-smoke-v2-reducerd")
+            .env("REDUCER_LEASE_MS", "10000")
+            .env("REDUCER_HEARTBEAT_INTERVAL_MS", "250")
+            .env("REDUCER_POLL_INTERVAL_MS", "10")
+            .env("RUST_LOG", "info")
+            .stdin(Stdio::null())
+            .kill_on_drop(true);
+        ManagedProcess::start(command, &files.reducerd_log, "reducerd", "reducerd started")
+            .await
+            .map(Self)
+    }
+
+    pub(crate) async fn terminate(&mut self) -> TestResult {
+        self.0.terminate().await
+    }
+}
+
+struct ManagedProcess {
+    child: Child,
+    pid: u32,
+    log_path: PathBuf,
+    name: &'static str,
+    exit_status: Option<ExitStatus>,
+}
+
+impl ManagedProcess {
+    async fn start(
+        mut command: tokio::process::Command,
+        log_path: &Path,
+        name: &'static str,
+        startup_marker: &str,
+    ) -> TestResult<Self> {
+        let log = File::create(log_path)
+            .map_err(|error| format!("failed to create {name} log: {error}"))?;
+        let stderr = log
+            .try_clone()
+            .map_err(|error| format!("failed to clone {name} log: {error}"))?;
+        command.stdout(Stdio::from(log)).stderr(Stdio::from(stderr));
+        command.process_group(0);
+        let child = command
+            .spawn()
+            .map_err(|error| format!("failed to start {name} binary: {error}"))?;
+        let pid = child
+            .id()
+            .ok_or_else(|| format!("{name} PID unavailable after spawn"))?;
+        let mut process = Self {
+            child,
+            pid,
+            log_path: log_path.to_path_buf(),
+            name,
+            exit_status: None,
+        };
+        timeout(HEALTH_TIMEOUT, async {
+            loop {
+                if let Some(status) = process.poll_exit()? {
+                    return Err(format!(
+                        "{name} exited during startup with {status}: {}",
+                        process.logs()
+                    ));
+                }
+                if process.logs().contains(startup_marker) {
+                    return Ok(());
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .map_err(|_| format!("{name} startup timed out: {}", process.logs()))??;
+        Ok(process)
+    }
+
+    async fn terminate(&mut self) -> TestResult {
+        if let Some(status) = self.poll_exit()? {
+            return Err(format!(
+                "{} exited before SIGTERM with {status}: {}",
+                self.name,
+                self.logs()
+            ));
+        }
+        signal_process_group(self.pid, libc::SIGTERM)?;
+        match timeout(EXIT_TIMEOUT, self.child.wait()).await {
+            Ok(Ok(status)) => {
+                self.exit_status = Some(status);
+                require(
+                    status.success(),
+                    format!("{} SIGTERM exit was {status}: {}", self.name, self.logs()),
+                )
+            }
+            Ok(Err(error)) => Err(format!("failed waiting for {} exit: {error}", self.name)),
+            Err(_) => Err(format!(
+                "{} did not exit within {EXIT_TIMEOUT:?}: {}",
+                self.name,
+                self.logs()
+            )),
+        }
+    }
+
+    fn poll_exit(&mut self) -> TestResult<Option<ExitStatus>> {
+        if self.exit_status.is_some() {
+            return Ok(self.exit_status);
+        }
+        let status = self
+            .child
+            .try_wait()
+            .map_err(|error| format!("failed to inspect {} process: {error}", self.name))?;
+        if status.is_some() {
+            self.exit_status = status;
+        }
+        Ok(status)
+    }
+
+    fn logs(&self) -> String {
+        fs::read_to_string(&self.log_path)
+            .unwrap_or_else(|_| format!("<{} log unavailable>", self.name))
+    }
+}
+
+impl Drop for ManagedProcess {
+    fn drop(&mut self) {
+        if self.exit_status.is_none() {
+            let _ = signal_process_group(self.pid, libc::SIGKILL);
+            let _ = self.child.start_kill();
+        }
+    }
+}
+
 pub(crate) struct GatewayProcess {
     child: Child,
     pid: u32,
@@ -263,6 +547,7 @@ impl GatewayProcess {
         files: &SmokeFiles,
         reserved_listener: TcpListener,
         address: SocketAddr,
+        generation_contract: Option<&str>,
     ) -> TestResult<Self> {
         let log = File::create(&files.gateway_log)
             .map_err(|error| format!("failed to create gateway log: {error}"))?;
@@ -305,6 +590,9 @@ impl GatewayProcess {
             .stdout(Stdio::from(log))
             .stderr(Stdio::from(stderr))
             .kill_on_drop(true);
+        if let Some(generation_contract) = generation_contract {
+            command.env("GATEWAY_IMAGES_GENERATION_CONTRACT", generation_contract);
+        }
         command.process_group(0);
         drop(reserved_listener);
         let child = command
@@ -418,6 +706,23 @@ pub(crate) async fn start_gateway_with_retry(
     database: &TestDatabase,
     files: &SmokeFiles,
 ) -> TestResult<(GatewayProcess, SocketAddr)> {
+    start_gateway_with_contract(client, database, files, None).await
+}
+
+pub(crate) async fn start_v2_gateway_with_retry(
+    client: &reqwest::Client,
+    database: &TestDatabase,
+    files: &SmokeFiles,
+) -> TestResult<(GatewayProcess, SocketAddr)> {
+    start_gateway_with_contract(client, database, files, Some("output-economics-v2")).await
+}
+
+async fn start_gateway_with_contract(
+    client: &reqwest::Client,
+    database: &TestDatabase,
+    files: &SmokeFiles,
+    generation_contract: Option<&str>,
+) -> TestResult<(GatewayProcess, SocketAddr)> {
     let mut failures = Vec::new();
     for attempt in 1..=STARTUP_ATTEMPTS {
         let reserved_listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
@@ -425,7 +730,13 @@ pub(crate) async fn start_gateway_with_retry(
         let address = reserved_listener
             .local_addr()
             .map_err(|error| format!("failed to inspect reserved loopback port: {error}"))?;
-        let mut gateway = GatewayProcess::start(database, files, reserved_listener, address)?;
+        let mut gateway = GatewayProcess::start(
+            database,
+            files,
+            reserved_listener,
+            address,
+            generation_contract,
+        )?;
         let health = poll_health(client, &format!("http://{address}"), &mut gateway).await;
         if health.is_ok() {
             return Ok((gateway, address));
@@ -518,6 +829,7 @@ struct FakeCodexPaths<'a> {
     fake_active_pid: &'a Path,
     fake_delay: &'a Path,
     fixture: &'a Path,
+    second_fixture: &'a Path,
 }
 
 fn fake_codex_script(paths: FakeCodexPaths<'_>) -> String {
@@ -525,7 +837,10 @@ fn fake_codex_script(paths: FakeCodexPaths<'_>) -> String {
         r#"#!/bin/sh
 set -eu
 [ "${{HOME-}}" = "${{CODEX_HOME-}}" ] || exit 20
-[ "${{HOME-}}" = {codex_home} ] || exit 21
+if [ "${{HOME-}}" != {codex_home} ]; then
+    [ -f "${{HOME-}}/auth.json" ] || exit 21
+    /usr/bin/cmp -s "${{HOME-}}/auth.json" {codex_auth} || exit 21
+fi
 [ -z "${{GATEWAY_API_TOKEN+x}}" ] || exit 22
 [ -z "${{GATEWAY_ADMIN_TOKEN+x}}" ] || exit 23
 [ -z "${{DATABASE_URL+x}}" ] || exit 24
@@ -553,9 +868,15 @@ while [ "$#" -gt 0 ]; do
     shift
 done
 [ -n "$request_dir" ] || exit 28
-cp {fixture} "$request_dir/final.png"
+if /usr/bin/grep -q '第 2/2 张候选图片' {stdin_log}; then
+    selected_fixture={second_fixture}
+else
+    selected_fixture={fixture}
+fi
+cp "$selected_fixture" "$request_dir/final.png"
 "#,
         codex_home = shell_quote(paths.codex_home),
+        codex_auth = shell_quote(&paths.codex_home.join("auth.json")),
         argv_log = shell_quote(paths.argv_log),
         stdin_log = shell_quote(paths.stdin_log),
         fake_pid_log = shell_quote(paths.fake_pid_log),
@@ -564,6 +885,7 @@ cp {fixture} "$request_dir/final.png"
         fake_active_pid = shell_quote(paths.fake_active_pid),
         fake_delay = shell_quote(paths.fake_delay),
         fixture = shell_quote(paths.fixture),
+        second_fixture = shell_quote(paths.second_fixture),
     )
 }
 

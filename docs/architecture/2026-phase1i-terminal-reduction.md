@@ -130,14 +130,24 @@ proving provider no-effect.
 - Codex profile provisioning is exact-replay idempotent, serializes concurrent
   writers, preserves disabled identities as kill switches, and rolls back all
   dependency rows on a late profile conflict.
-- `cargo test --workspace --all-targets` passes 372 tests with one credentialed
-  Codex smoke intentionally ignored; workspace clippy passes with warnings
-  denied.
+- The production process smoke traverses the public generation route,
+  PostgreSQL, executor-handoff workerd, executord, the real `codex-runner` with
+  fake Codex, reducerd, customer artifact hydration, and a gateway-restart
+  idempotency replay. Its `n=2` request proves exactly two provider invocations,
+  two immutable executor and customer artifacts, two non-zero ratings, two
+  balanced customer-charge transactions, one parent projection, and no new
+  job, quota, idempotency, execution, or charge rows after replay.
+- `cargo test --workspace --all-targets` passes 379 tests with one
+  quota-consuming Legacy Codex smoke intentionally ignored; workspace clippy
+  passes with warnings denied.
 
 ## 7. Activation Gate
 
-The reducer kernel and standalone `reducerd` do not make V2 externally
-available. The gateway must continue admitting public traffic as LegacyV1 until
-the public generation API explicitly selects V2 and fake plus credentialed
-Codex API tests prove the complete process topology. Edits remain LegacyV1, so
-activation requires separate Legacy and executor-handoff workerd pools.
+The public generation route supports an explicit, default-off V2 selection via
+`GATEWAY_IMAGES_GENERATION_CONTRACT=output-economics-v2`. Fake full-process
+proof is complete. A credentialed real Codex `size=auto` request also traversed
+the full V2 topology on 2026-07-15 and replayed byte-identically without a
+second runner directory or economic graph. Edits remain LegacyV1, so activation
+requires separate Legacy and executor-handoff workerd pools. Hostile tenant
+isolation remains an external deployment gate, as defined by the Phase 1F
+runtime document.

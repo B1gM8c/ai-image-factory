@@ -139,10 +139,13 @@ pub(crate) async fn hydrate_generation_result(
         })?;
         images.push(GeneratedImage { bytes });
     }
-    Ok(StoredGenerationResult {
-        projection: manifest.projection,
-        images,
-    })
+    let (width, height) = images
+        .first()
+        .and_then(|image| crate::core::image_bytes::image_dimensions(&image.bytes))
+        .ok_or_else(ImageGatewayError::artifact_integrity)?;
+    let mut projection = manifest.projection;
+    projection.size = format!("{width}x{height}");
+    Ok(StoredGenerationResult { projection, images })
 }
 
 pub(crate) fn media_type_for_output_format(output_format: &str) -> Option<&'static str> {

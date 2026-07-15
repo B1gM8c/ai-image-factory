@@ -11,7 +11,7 @@ use axum::{
 use tower_http::trace::TraceLayer;
 
 use crate::{
-    AppConfig, ImageGatewayError,
+    AppConfig, GenerationAdmissionContract, ImageGatewayError,
     admission::{AdmissionStore, InMemoryAdmissionStore},
     api_keys::{ApiKeyStore, InMemoryApiKeyStore},
     artifacts::{ArtifactBlobStore, InMemoryArtifactBlobStore},
@@ -218,6 +218,13 @@ fn build_router_with_execution_mode(
     generation_worker: Option<Arc<GenerationWorker>>,
     generation_execution_mode: GenerationExecutionMode,
 ) -> Result<Router, ImageGatewayError> {
+    if config.generation_admission_contract == GenerationAdmissionContract::OutputEconomicsV2
+        && generation_execution_mode != GenerationExecutionMode::External
+    {
+        return Err(ImageGatewayError::config(
+            "output-economics-v2 generation requires external execution",
+        ));
+    }
     let GatewayStores {
         usage_store,
         api_key_store,
