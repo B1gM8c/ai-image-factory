@@ -439,7 +439,7 @@ impl UsageStore for PostgresUsageStore {
                 OR EXISTS (
                   SELECT 1 FROM work_items w
                   WHERE w.job_id = quota_reservations.job_id
-                    AND w.state IN ('ready', 'leased', 'running', 'uncertain')
+                    AND w.state IN ('ready', 'leased', 'running', 'awaiting_executor', 'uncertain')
                 )
               )
               AND created_at_ms >= $2
@@ -1046,7 +1046,7 @@ fn ensure_quota(
     })
 }
 
-fn quota_lock_id(tenant_id: &str) -> i64 {
+pub(crate) fn quota_lock_id(tenant_id: &str) -> i64 {
     let mut hasher = Sha256::new();
     hasher.update(b"quota:");
     hasher.update(tenant_id.as_bytes());

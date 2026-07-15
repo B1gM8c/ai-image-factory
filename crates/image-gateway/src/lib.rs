@@ -58,8 +58,10 @@ pub use reconciliation::{
     reconcile_input_cleanup,
 };
 pub use reduction::{
-    CanonicalExecutorOutcome, ExecutorTerminalArtifact, ExecutorTerminalError,
-    ExecutorTerminalLease, ExecutorTerminalStore, PostgresExecutorTerminalStore,
+    CanonicalExecutorOutcome, CustomerArtifactPublishError, CustomerArtifactPublisher,
+    ExecutorParentTerminalState, ExecutorTerminalArtifact, ExecutorTerminalCompletion,
+    ExecutorTerminalError, ExecutorTerminalLease, ExecutorTerminalStore,
+    PostgresExecutorTerminalStore,
 };
 pub use settlement::{
     ExecutionSettlementStore, GenerationResultStatus, PostgresExecutionSettlementStore,

@@ -6,7 +6,9 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 pub use postgres::PostgresEconomicSettlementStore;
-pub(crate) use postgres::{admit_job_outputs, validate_admitted_job_outputs};
+pub(crate) use postgres::{
+    admit_job_outputs, settle_receipt_in_transaction, validate_admitted_job_outputs,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EconomicReceiptOutcome {

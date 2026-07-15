@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
-use sqlx::{PgPool, Postgres, Transaction};
+use sqlx::{Acquire, PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
 use super::{
@@ -416,25 +416,36 @@ impl EconomicSettlementStore for PostgresEconomicSettlementStore {
         &self,
         receipt: &EconomicReceipt,
     ) -> Result<EconomicSettlement, EconomicSettlementError> {
-        validate_receipt(receipt)?;
-        let snapshot = load_submission_identity(&self.pool, receipt.submission_id).await?;
         let mut tx = self.pool.begin().await.map_err(economic_unavailable)?;
-        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
-            .bind(format!("budget:{}", snapshot.tenant_id))
-            .execute(&mut *tx)
+        let settlement = settle_receipt_in_transaction(&mut tx, receipt).await?;
+        tx.commit().await.map_err(economic_unavailable)?;
+        Ok(settlement)
+    }
+}
+
+pub(crate) async fn settle_receipt_in_transaction(
+    transaction: &mut Transaction<'_, Postgres>,
+    receipt: &EconomicReceipt,
+) -> Result<EconomicSettlement, EconomicSettlementError> {
+    let mut tx = transaction.begin().await.map_err(economic_unavailable)?;
+    validate_receipt(receipt)?;
+    let snapshot = load_submission_identity(&mut tx, receipt.submission_id).await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(format!("budget:{}", snapshot.tenant_id))
+        .execute(&mut *tx)
+        .await
+        .map_err(economic_unavailable)?;
+    let locked_job: Option<Uuid> =
+        sqlx::query_scalar("SELECT job_id FROM jobs WHERE job_id = $1 FOR UPDATE")
+            .bind(snapshot.job_id)
+            .fetch_optional(&mut *tx)
             .await
             .map_err(economic_unavailable)?;
-        let locked_job: Option<Uuid> =
-            sqlx::query_scalar("SELECT job_id FROM jobs WHERE job_id = $1 FOR UPDATE")
-                .bind(snapshot.job_id)
-                .fetch_optional(&mut *tx)
-                .await
-                .map_err(economic_unavailable)?;
-        if locked_job.is_none() {
-            return Err(EconomicSettlementError::Conflict);
-        }
-        let output: LockedEconomicOutput = sqlx::query_as(
-            r#"
+    if locked_job.is_none() {
+        return Err(EconomicSettlementError::Conflict);
+    }
+    let output: LockedEconomicOutput = sqlx::query_as(
+        r#"
             SELECT o.state AS output_state, h.state AS hold_state, h.held_micros,
                    q.quote_id, q.currency, q.success_micros, q.failed_micros,
                    q.no_effect_micros
@@ -444,15 +455,15 @@ impl EconomicSettlementStore for PostgresEconomicSettlementStore {
             WHERE o.output_id = $1 AND o.job_id = $2
             FOR UPDATE OF o, h
             "#,
-        )
-        .bind(snapshot.output_id)
-        .bind(snapshot.job_id)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(economic_unavailable)?
-        .ok_or(EconomicSettlementError::Conflict)?;
-        let locked: SubmissionIdentity = sqlx::query_as(
-            r#"
+    )
+    .bind(snapshot.output_id)
+    .bind(snapshot.job_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(economic_unavailable)?
+    .ok_or(EconomicSettlementError::Conflict)?;
+    let locked: SubmissionIdentity = sqlx::query_as(
+        r#"
             SELECT output_id, job_id, tenant_id, provider_id,
                    state AS submission_state, error_code AS submission_error_code,
                    result_manifest_id
@@ -460,247 +471,245 @@ impl EconomicSettlementStore for PostgresEconomicSettlementStore {
             WHERE submission_id = $1
             FOR UPDATE
             "#,
-        )
-        .bind(receipt.submission_id)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(economic_unavailable)?
-        .ok_or(EconomicSettlementError::Conflict)?;
-        if locked.output_id != snapshot.output_id
-            || locked.job_id != snapshot.job_id
-            || locked.tenant_id != snapshot.tenant_id
-            || locked.provider_id != snapshot.provider_id
-        {
-            return Err(EconomicSettlementError::Conflict);
-        }
-        validate_provider_evidence(&locked, receipt)?;
+    )
+    .bind(receipt.submission_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(economic_unavailable)?
+    .ok_or(EconomicSettlementError::Conflict)?;
+    if locked.output_id != snapshot.output_id
+        || locked.job_id != snapshot.job_id
+        || locked.tenant_id != snapshot.tenant_id
+        || locked.provider_id != snapshot.provider_id
+    {
+        return Err(EconomicSettlementError::Conflict);
+    }
+    validate_provider_evidence(&locked, receipt)?;
 
-        if let Some(stored) = load_stored_receipt(&mut tx, receipt.submission_id).await? {
-            let result = replay_settlement(&mut tx, &stored, receipt).await?;
-            tx.commit().await.map_err(economic_unavailable)?;
-            return Ok(result);
-        }
-        if output.hold_state != "held"
-            || !matches!(output.output_state.as_str(), "pending" | "running")
-        {
-            return Err(EconomicSettlementError::Conflict);
-        }
+    if let Some(stored) = load_stored_receipt(&mut tx, receipt.submission_id).await? {
+        let result = replay_settlement(&mut tx, &stored, receipt).await?;
+        tx.commit().await.map_err(economic_unavailable)?;
+        return Ok(result);
+    }
+    if output.hold_state != "held" || !matches!(output.output_state.as_str(), "pending" | "running")
+    {
+        return Err(EconomicSettlementError::Conflict);
+    }
 
-        let now = economic_database_now(&mut tx).await?;
-        let receipt_id = Uuid::new_v4();
-        let semantic_key = receipt_semantic_key(receipt);
-        sqlx::query(
-            r#"
+    let now = economic_database_now(&mut tx).await?;
+    let receipt_id = Uuid::new_v4();
+    let semantic_key = receipt_semantic_key(receipt);
+    sqlx::query(
+        r#"
             INSERT INTO provider_receipts
               (receipt_id, semantic_key, submission_id, output_id, job_id, provider_id,
                outcome, receipt_schema, payload_hash, evidence,
                provider_cost_micros, provider_cost_currency, created_at_ms)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
             "#,
-        )
-        .bind(receipt_id)
-        .bind(&semantic_key)
-        .bind(receipt.submission_id)
-        .bind(snapshot.output_id)
-        .bind(snapshot.job_id)
-        .bind(&snapshot.provider_id)
-        .bind(receipt.outcome.as_str())
-        .bind(&receipt.receipt_schema)
-        .bind(&receipt.payload_hash)
-        .bind(&receipt.evidence)
-        .bind(
-            receipt
-                .provider_cost
-                .as_ref()
-                .map(|cost| cost.amount_micros),
-        )
-        .bind(receipt.provider_cost.as_ref().map(|cost| &cost.currency))
-        .bind(now)
-        .execute(&mut *tx)
-        .await
-        .map_err(economic_unavailable)?;
+    )
+    .bind(receipt_id)
+    .bind(&semantic_key)
+    .bind(receipt.submission_id)
+    .bind(snapshot.output_id)
+    .bind(snapshot.job_id)
+    .bind(&snapshot.provider_id)
+    .bind(receipt.outcome.as_str())
+    .bind(&receipt.receipt_schema)
+    .bind(&receipt.payload_hash)
+    .bind(&receipt.evidence)
+    .bind(
+        receipt
+            .provider_cost
+            .as_ref()
+            .map(|cost| cost.amount_micros),
+    )
+    .bind(receipt.provider_cost.as_ref().map(|cost| &cost.currency))
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .map_err(economic_unavailable)?;
 
-        let meter_event_id = Uuid::new_v4();
-        let fact_kind = if receipt.outcome == EconomicReceiptOutcome::Uncertain {
-            "uncertain_observation"
-        } else {
-            "output_terminal"
-        };
-        let quantity = i64::from(receipt.outcome != EconomicReceiptOutcome::Uncertain);
-        sqlx::query(
-            r#"
+    let meter_event_id = Uuid::new_v4();
+    let fact_kind = if receipt.outcome == EconomicReceiptOutcome::Uncertain {
+        "uncertain_observation"
+    } else {
+        "output_terminal"
+    };
+    let quantity = i64::from(receipt.outcome != EconomicReceiptOutcome::Uncertain);
+    sqlx::query(
+        r#"
             INSERT INTO economic_metering_events
               (meter_event_id, semantic_key, output_id, job_id, submission_id, receipt_id,
                fact_kind, metric, quantity, unit, outcome, created_at_ms)
             VALUES ($1, $2, $3, $4, $5, $6, $7, 'image_output', $8, 'output', $9, $10)
             "#,
-        )
-        .bind(meter_event_id)
-        .bind(format!("meter:{semantic_key}"))
-        .bind(snapshot.output_id)
-        .bind(snapshot.job_id)
-        .bind(receipt.submission_id)
-        .bind(receipt_id)
-        .bind(fact_kind)
-        .bind(quantity)
-        .bind(receipt.outcome.as_str())
-        .bind(now)
-        .execute(&mut *tx)
-        .await
-        .map_err(economic_unavailable)?;
+    )
+    .bind(meter_event_id)
+    .bind(format!("meter:{semantic_key}"))
+    .bind(snapshot.output_id)
+    .bind(snapshot.job_id)
+    .bind(receipt.submission_id)
+    .bind(receipt_id)
+    .bind(fact_kind)
+    .bind(quantity)
+    .bind(receipt.outcome.as_str())
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .map_err(economic_unavailable)?;
 
-        if receipt.outcome == EconomicReceiptOutcome::Uncertain {
-            sqlx::query(
-                r#"
+    if receipt.outcome == EconomicReceiptOutcome::Uncertain {
+        sqlx::query(
+            r#"
                 UPDATE job_outputs
                 SET state = 'uncertain', started_at_ms = COALESCE(started_at_ms, $2),
                     finished_at_ms = $2, updated_at_ms = $2,
                     error_code = 'provider_outcome_uncertain'
                 WHERE output_id = $1 AND state IN ('pending', 'running')
                 "#,
-            )
-            .bind(snapshot.output_id)
-            .bind(now)
-            .execute(&mut *tx)
-            .await
-            .map_err(economic_unavailable)?;
-            let settlement = EconomicSettlement {
-                receipt_id,
-                meter_event_id,
-                rated_usage_id: None,
-                customer_ledger_transaction_id: None,
-                outcome: receipt.outcome,
-            };
-            tx.commit().await.map_err(economic_unavailable)?;
-            return Ok(settlement);
-        }
-
-        let unit_price_micros = match receipt.outcome {
-            EconomicReceiptOutcome::Succeeded => output.success_micros,
-            EconomicReceiptOutcome::Failed => output.failed_micros,
-            EconomicReceiptOutcome::NoEffect => output.no_effect_micros,
-            EconomicReceiptOutcome::Uncertain => unreachable!(),
+        )
+        .bind(snapshot.output_id)
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .map_err(economic_unavailable)?;
+        let settlement = EconomicSettlement {
+            receipt_id,
+            meter_event_id,
+            rated_usage_id: None,
+            customer_ledger_transaction_id: None,
+            outcome: receipt.outcome,
         };
-        if unit_price_micros > output.held_micros {
-            return Err(EconomicSettlementError::Conflict);
-        }
-        let rated_usage_id = Uuid::new_v4();
-        sqlx::query(
-            r#"
+        tx.commit().await.map_err(economic_unavailable)?;
+        return Ok(settlement);
+    }
+
+    let unit_price_micros = match receipt.outcome {
+        EconomicReceiptOutcome::Succeeded => output.success_micros,
+        EconomicReceiptOutcome::Failed => output.failed_micros,
+        EconomicReceiptOutcome::NoEffect => output.no_effect_micros,
+        EconomicReceiptOutcome::Uncertain => unreachable!(),
+    };
+    if unit_price_micros > output.held_micros {
+        return Err(EconomicSettlementError::Conflict);
+    }
+    let rated_usage_id = Uuid::new_v4();
+    sqlx::query(
+        r#"
             INSERT INTO rated_usage
               (rated_usage_id, semantic_key, meter_event_id, output_id, job_id, quote_id,
                outcome, quantity, unit_price_micros, amount_micros, currency, created_at_ms)
             VALUES ($1, $2, $3, $4, $5, $6, $7, 1, $8, $8, $9, $10)
             "#,
-        )
-        .bind(rated_usage_id)
-        .bind(format!("rating:{semantic_key}"))
-        .bind(meter_event_id)
-        .bind(snapshot.output_id)
-        .bind(snapshot.job_id)
-        .bind(output.quote_id)
-        .bind(receipt.outcome.as_str())
-        .bind(unit_price_micros)
-        .bind(&output.currency)
-        .bind(now)
-        .execute(&mut *tx)
-        .await
-        .map_err(economic_unavailable)?;
-        settle_hold_and_account(&mut tx, &snapshot, &output, unit_price_micros, now).await?;
-        let customer_ledger_transaction_id = if unit_price_micros == 0 {
-            None
-        } else {
-            Some(
-                insert_ledger_pair(
-                    &mut tx,
-                    &format!("customer-charge:{semantic_key}"),
-                    snapshot.output_id,
-                    snapshot.job_id,
-                    receipt.submission_id,
-                    receipt_id,
-                    "customer_charge",
-                    &output.currency,
-                    unit_price_micros,
-                    &format!(
-                        "tenant:{}:{}:receivable",
-                        snapshot.tenant_id, output.currency
-                    ),
-                    "tenant",
-                    &snapshot.tenant_id,
-                    "receivable",
-                    &format!("platform:{}:revenue", output.currency),
-                    "platform",
-                    "platform",
-                    "revenue",
-                    now,
-                )
-                .await?,
-            )
-        };
-        if let Some(cost) = &receipt.provider_cost
-            && cost.amount_micros > 0
-        {
+    )
+    .bind(rated_usage_id)
+    .bind(format!("rating:{semantic_key}"))
+    .bind(meter_event_id)
+    .bind(snapshot.output_id)
+    .bind(snapshot.job_id)
+    .bind(output.quote_id)
+    .bind(receipt.outcome.as_str())
+    .bind(unit_price_micros)
+    .bind(&output.currency)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .map_err(economic_unavailable)?;
+    settle_hold_and_account(&mut tx, &snapshot, &output, unit_price_micros, now).await?;
+    let customer_ledger_transaction_id = if unit_price_micros == 0 {
+        None
+    } else {
+        Some(
             insert_ledger_pair(
                 &mut tx,
-                &format!("provider-cost:{semantic_key}"),
+                &format!("customer-charge:{semantic_key}"),
                 snapshot.output_id,
                 snapshot.job_id,
                 receipt.submission_id,
                 receipt_id,
-                "provider_cost",
-                &cost.currency,
-                cost.amount_micros,
-                &format!("platform:{}:provider-expense", cost.currency),
-                "platform",
-                "platform",
-                "expense",
+                "customer_charge",
+                &output.currency,
+                unit_price_micros,
                 &format!(
-                    "provider:{}:{}:payable",
-                    snapshot.provider_id, cost.currency
+                    "tenant:{}:{}:receivable",
+                    snapshot.tenant_id, output.currency
                 ),
-                "provider",
-                &snapshot.provider_id,
-                "payable",
+                "tenant",
+                &snapshot.tenant_id,
+                "receivable",
+                &format!("platform:{}:revenue", output.currency),
+                "platform",
+                "platform",
+                "revenue",
                 now,
             )
-            .await?;
-        }
-        let (output_state, error_code) = match receipt.outcome {
-            EconomicReceiptOutcome::Succeeded => ("succeeded", None),
-            EconomicReceiptOutcome::Failed => ("failed", Some("provider_failed")),
-            EconomicReceiptOutcome::NoEffect => ("failed", Some("provider_no_effect")),
-            EconomicReceiptOutcome::Uncertain => unreachable!(),
-        };
-        let changed = sqlx::query(
-            r#"
+            .await?,
+        )
+    };
+    if let Some(cost) = &receipt.provider_cost
+        && cost.amount_micros > 0
+    {
+        insert_ledger_pair(
+            &mut tx,
+            &format!("provider-cost:{semantic_key}"),
+            snapshot.output_id,
+            snapshot.job_id,
+            receipt.submission_id,
+            receipt_id,
+            "provider_cost",
+            &cost.currency,
+            cost.amount_micros,
+            &format!("platform:{}:provider-expense", cost.currency),
+            "platform",
+            "platform",
+            "expense",
+            &format!(
+                "provider:{}:{}:payable",
+                snapshot.provider_id, cost.currency
+            ),
+            "provider",
+            &snapshot.provider_id,
+            "payable",
+            now,
+        )
+        .await?;
+    }
+    let (output_state, error_code) = match receipt.outcome {
+        EconomicReceiptOutcome::Succeeded => ("succeeded", None),
+        EconomicReceiptOutcome::Failed => ("failed", Some("provider_failed")),
+        EconomicReceiptOutcome::NoEffect => ("failed", Some("provider_no_effect")),
+        EconomicReceiptOutcome::Uncertain => unreachable!(),
+    };
+    let changed = sqlx::query(
+        r#"
             UPDATE job_outputs
             SET state = $2, started_at_ms = COALESCE(started_at_ms, $3),
                 finished_at_ms = $3, updated_at_ms = $3, error_code = $4
             WHERE output_id = $1 AND state IN ('pending', 'running')
             "#,
-        )
-        .bind(snapshot.output_id)
-        .bind(output_state)
-        .bind(now)
-        .bind(error_code)
-        .execute(&mut *tx)
-        .await
-        .map_err(economic_unavailable)?
-        .rows_affected();
-        if changed != 1 {
-            return Err(EconomicSettlementError::Conflict);
-        }
-
-        let settlement = EconomicSettlement {
-            receipt_id,
-            meter_event_id,
-            rated_usage_id: Some(rated_usage_id),
-            customer_ledger_transaction_id,
-            outcome: receipt.outcome,
-        };
-        tx.commit().await.map_err(economic_unavailable)?;
-        Ok(settlement)
+    )
+    .bind(snapshot.output_id)
+    .bind(output_state)
+    .bind(now)
+    .bind(error_code)
+    .execute(&mut *tx)
+    .await
+    .map_err(economic_unavailable)?
+    .rows_affected();
+    if changed != 1 {
+        return Err(EconomicSettlementError::Conflict);
     }
+
+    let settlement = EconomicSettlement {
+        receipt_id,
+        meter_event_id,
+        rated_usage_id: Some(rated_usage_id),
+        customer_ledger_transaction_id,
+        outcome: receipt.outcome,
+    };
+    tx.commit().await.map_err(economic_unavailable)?;
+    Ok(settlement)
 }
 
 pub(super) fn validate_receipt(receipt: &EconomicReceipt) -> Result<(), EconomicSettlementError> {
@@ -735,7 +744,7 @@ pub(super) fn validate_receipt(receipt: &EconomicReceipt) -> Result<(), Economic
 }
 
 async fn load_submission_identity(
-    pool: &PgPool,
+    tx: &mut Transaction<'_, Postgres>,
     submission_id: Uuid,
 ) -> Result<SubmissionIdentity, EconomicSettlementError> {
     sqlx::query_as(
@@ -748,7 +757,7 @@ async fn load_submission_identity(
         "#,
     )
     .bind(submission_id)
-    .fetch_optional(pool)
+    .fetch_optional(&mut **tx)
     .await
     .map_err(economic_unavailable)?
     .ok_or(EconomicSettlementError::NotReady)
@@ -768,9 +777,11 @@ fn validate_provider_evidence(
                 && submission.submission_error_code.as_deref() != Some("provider_no_effect")
         }
         EconomicReceiptOutcome::NoEffect => {
-            submission.submission_state == "failed"
-                && submission.result_manifest_id.is_none()
-                && submission.submission_error_code.as_deref() == Some("provider_no_effect")
+            submission.result_manifest_id.is_none()
+                && ((submission.submission_state == "failed"
+                    && submission.submission_error_code.as_deref() == Some("provider_no_effect"))
+                    || (submission.submission_state == "canceled"
+                        && submission.submission_error_code.is_some()))
         }
         EconomicReceiptOutcome::Uncertain => {
             submission.submission_state == "uncertain" && submission.result_manifest_id.is_none()

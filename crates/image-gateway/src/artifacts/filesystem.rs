@@ -16,7 +16,8 @@ use uuid::Uuid;
 
 use super::{
     ArtifactBlobStore, ArtifactIdentity, ArtifactMetadata, ArtifactReadError, ArtifactWriteError,
-    FILESYSTEM_BACKEND, executor_object_key, sha256_hex,
+    ExecutorArtifactReference, FILESYSTEM_BACKEND, customer_object_key, executor_object_key,
+    sha256_hex,
 };
 use crate::{
     ImageGatewayError,
@@ -107,8 +108,7 @@ impl FilesystemArtifactBlobStore {
     }
 
     fn object_key(identity: &ArtifactIdentity) -> String {
-        let artifact_id = identity.artifact_id.simple().to_string();
-        format!("objects/{}/{}", &artifact_id[..2], artifact_id)
+        customer_object_key(identity.artifact_id)
     }
 
     pub(crate) async fn put_blob_key(
@@ -276,6 +276,27 @@ impl FilesystemArtifactBlobStore {
         let expected_size = artifact.byte_size;
         tokio::task::spawn_blocking(move || {
             read_executor_object_at(&root, artifact_id, &expected_sha256, expected_size)
+        })
+        .await
+        .map_err(|_| ArtifactReadError::Unavailable)?
+    }
+
+    pub(crate) async fn read_executor_reference(
+        &self,
+        artifact: &ExecutorArtifactReference<'_>,
+    ) -> Result<Vec<u8>, ArtifactReadError> {
+        if artifact.storage_backend != FILESYSTEM_BACKEND
+            || artifact.storage_namespace != self.executor_storage_namespace()?
+            || artifact.object_key != executor_object_key(artifact.authority_id)
+        {
+            return Err(ArtifactReadError::Integrity);
+        }
+        let root = self.executor_objects.clone();
+        let authority_id = artifact.authority_id;
+        let expected_sha256 = artifact.sha256_hex.to_string();
+        let expected_size = artifact.byte_size;
+        tokio::task::spawn_blocking(move || {
+            read_executor_object_at(&root, authority_id, &expected_sha256, expected_size)
         })
         .await
         .map_err(|_| ArtifactReadError::Unavailable)?

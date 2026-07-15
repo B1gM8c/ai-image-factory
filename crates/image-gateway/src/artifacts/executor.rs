@@ -241,7 +241,9 @@ impl ExecutorArtifactSink for ExecutorArtifactPublisher {
     }
 }
 
-fn media_type_from_bytes(bytes: &[u8]) -> Result<&'static str, ExecutorArtifactPublishError> {
+pub(crate) fn media_type_from_bytes(
+    bytes: &[u8],
+) -> Result<&'static str, ExecutorArtifactPublishError> {
     let format =
         image::guess_format(bytes).map_err(|_| ExecutorArtifactPublishError::ArtifactIntegrity)?;
     let media_type = match format {

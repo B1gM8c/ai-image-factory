@@ -3,9 +3,12 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use super::{
-    CanonicalExecutorOutcome, ExecutorTerminalArtifact, ExecutorTerminalError,
-    ExecutorTerminalLease, ExecutorTerminalStore,
+    CanonicalExecutorOutcome, ExecutorTerminalArtifact, ExecutorTerminalCompletion,
+    ExecutorTerminalError, ExecutorTerminalLease, ExecutorTerminalStore,
 };
+use crate::artifacts::ArtifactMetadata;
+
+mod completion;
 
 const MAX_LEASE_MS: i64 = 10 * 60 * 1_000;
 
@@ -201,6 +204,14 @@ impl ExecutorTerminalStore for PostgresExecutorTerminalStore {
             reducer_lease_expires_at_ms: expires_at_ms,
             ..lease.clone()
         })
+    }
+
+    async fn complete_terminal(
+        &self,
+        lease: &ExecutorTerminalLease,
+        customer_artifact: Option<&ArtifactMetadata>,
+    ) -> Result<ExecutorTerminalCompletion, ExecutorTerminalError> {
+        completion::complete(&self.pool, lease, customer_artifact).await
     }
 }
 

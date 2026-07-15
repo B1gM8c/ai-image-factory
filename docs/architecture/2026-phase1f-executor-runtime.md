@@ -251,7 +251,7 @@ Production V2 traffic remains disabled according to this gate matrix:
 | restart attaches without a second provider launch | passed | real executord/helper test, invocation count equals one |
 | journal/spool/commit ambiguity fails closed and can replay | passed | hostile filesystem tests, late-evidence test, artifact retry test |
 | owner singleton and session loss fail closed | passed | advisory-lock and backend-termination tests |
-| artifact integrity and economic settlement remain balanced | passed | authority, manifest, rating, and ledger tests |
+| terminal artifact, economics, quota, and parent reduction are atomic | passed | migration 0016, rollback/replay, partial/uncertain, stale lease, and concurrent completion tests |
 | provider process identity and orphan cleanup | passed | nonce/inode binding and real helper-death cleanup test |
 | credential pool, adapter revision, and resource policy are database-bound | passed | migration 0013, exact profile claim scope, journal binding, global capacity race tests |
 | hostile multi-tenant CLI isolation | open | dedicated UID plus externally enforced sandbox/cgroup/mount/network policy |

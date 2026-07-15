@@ -1,8 +1,8 @@
 # Phase 1I: Canonical Terminal Reduction
 
-Status: the canonical terminal queue and leased read model are implemented.
-Customer artifact publication, economic settlement, parent aggregation, and
-public Images V2 routing remain disabled.
+Status: the canonical terminal queue, customer artifact publication, output
+economics, quota slices, and parent aggregation are implemented. The standalone
+reducer daemon and public Images V2 routing remain disabled.
 
 ## 1. Authority Boundary
 
@@ -70,38 +70,67 @@ The authority includes storage backend, namespace, object key, SHA-256, byte
 size, and media type. Failure, uncertainty, and cancellation carry only the
 canonical decision error code and cannot carry a manifest or artifact.
 
-## 5. Next Transaction Boundary
+## 5. Final Transaction Boundary
 
-Artifact I/O must not hold economic database locks. The next reducer slice will:
+Artifact I/O does not hold economic database locks. The implemented completion
+path performs:
 
 1. claim one canonical terminal lease;
 2. for success, read and verify the private executor object;
 3. publish a deterministic customer object idempotently;
 4. begin the final PostgreSQL transaction;
 5. revalidate the live reducer lease and canonical decision;
-6. persist the customer artifact and trusted provider receipt;
-7. rate the output, settle its hold, and append ledger facts;
+6. derive and persist an `executor.resolution.v1` receipt from the canonical
+   decision rather than accepting caller receipt data;
+7. persist the customer artifact, rate the output, settle its hold, append
+   ledger facts, and apply one quota slice;
 8. aggregate all outputs and atomically project work, attempt, job,
    idempotency, quota, response, and outbox state;
 9. mark the reduction completed in the same commit.
 
 Crash before step 4 leaves only an idempotent customer object. Crash during the
 transaction leaves no economic or parent projection. Lost acknowledgement after
-commit replays by immutable submission and artifact identities.
+commit replays only for the same reducer owner, epoch, decision, receipt, and
+artifact identities.
+
+Migration `0016_terminal_reduction_completion.sql` binds every completed row to
+its completion owner, trusted receipt, optional customer artifact, and quota
+reservation. Deferred constraints verify receipt evidence, immutable artifact
+authority, economic meter/rating/hold state, quota totals, and the parent
+projection at outer commit. Standalone V2 receipt settlement is rejected unless
+the same commit links it to a completed canonical reduction.
+
+Success commits one charged quota unit. Failed or proven no-effect output
+commits one released unit. Uncertain output commits neither, keeps its monetary
+hold, and makes the parent uncertain only after every output has been reduced.
+The parent cannot become terminal before all reductions complete.
+
+Pre-launch `canceled` is not a public cancellation protocol. It previously
+required an already-terminal parent, which violates the V2 reducer ownership
+boundary. Migration 0016 rejects that early parent transition. Future request
+cancellation must collect auditable evidence and enter this reducer only after
+proving provider no-effect.
 
 ## 6. Verification
 
-- A real executor success queues and reconstructs the exact decision, attempt,
-  manifest, and artifact authority identities.
-- A live reduction lease cannot be claimed twice.
-- Twenty concurrent claims after expiry produce one epoch-two winner.
-- The stale epoch cannot heartbeat after reclaim.
-- Decision identity mutation and queue deletion are rejected.
-- Fresh and concurrent migrations apply through version 15.
+- Success atomically commits receipt, meter, rating, artifact, quota, response,
+  parent state, job event, and outbox; exact replay changes no identity.
+- A deferred outer-commit failure rolls back every database effect while the
+  deterministic customer blob remains reusable.
+- Twelve duplicate same-lease completions persist one result.
+- Concurrent completion of three outputs finalizes the parent exactly once.
+- Multi-output success does not finalize early; partial failure and uncertainty
+  preserve exact charge, release, artifact, and hold totals.
+- Expired reducer leases and forged replay owners are fenced.
+- Standalone V2 economics cannot create a receipt before reducer completion.
+- Fresh and concurrent migrations apply through version 16.
+- `cargo test --workspace --all-targets` passes 356 tests with one credentialed
+  Codex smoke intentionally ignored; workspace clippy passes with warnings
+  denied.
 
 ## 7. Activation Gate
 
-The presence of a reduction queue does not make V2 externally available. The
-gateway must continue admitting public traffic as LegacyV1 until deterministic
-customer publication, trusted economic reduction, parent aggregation, replay,
-and fake plus credentialed Codex API tests all pass.
+The internal reducer kernel does not make V2 externally available. The gateway
+must continue admitting public traffic as LegacyV1 until a standalone reducerd
+drives claim, publication, heartbeat, and completion; the public API selects V2;
+and fake plus credentialed Codex API tests prove the complete process topology.

@@ -5,11 +5,12 @@ use std::{
 
 use gpt_image_2_gateway::database::{connect_test_pool_with_search_path, run_migrations};
 use gpt_image_2_gateway::{
-    CODEX_GENERATION_ADAPTER_REVISION, CanonicalExecutorOutcome, ExecutorTerminalError,
-    ExecutorTerminalStore, GenerationJob, PostgresExecutorTerminalStore,
-    PostgresReconciliationStore, ReconciliationOutcome, ReconciliationStore,
+    CODEX_GENERATION_ADAPTER_REVISION, CanonicalExecutorOutcome, CustomerArtifactPublisher,
+    ExecutorParentTerminalState, ExecutorTerminalError, ExecutorTerminalStore, GenerationJob,
+    PostgresExecutorTerminalStore, PostgresReconciliationStore, ReconciliationOutcome,
+    ReconciliationStore,
     admission::{GENERATION_COMMAND_SCHEMA, GenerationCommandV1, WorkLease},
-    artifacts::{ExecutorArtifactPublisher, FilesystemArtifactBlobStore},
+    artifacts::{ArtifactBlobStore, ExecutorArtifactPublisher, FilesystemArtifactBlobStore},
     economics::{
         EconomicReceipt, EconomicReceiptOutcome, EconomicSettlementStore,
         PostgresEconomicSettlementStore,
@@ -40,6 +41,45 @@ const TEST_ACCOUNT_ID: Uuid = Uuid::from_u128(0x700);
 const CODEX_ACCOUNT_ID: Uuid = Uuid::from_u128(0x800);
 const TEST_AUTH_SHA256: &str = "1111111111111111111111111111111111111111111111111111111111111111";
 const CODEX_AUTH_SHA256: &str = "ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356";
+
+#[derive(Debug, Eq, PartialEq, sqlx::FromRow)]
+struct AtomicCompletionState {
+    reduction_state: String,
+    output_state: String,
+    work_state: String,
+    attempt_state: String,
+    committed_units: i32,
+    released_units: i32,
+    charged_units: i32,
+    quota_state: String,
+    receipt_count: i64,
+    economic_meter_count: i64,
+    rating_count: i64,
+    artifact_count: i64,
+    projection_count: i64,
+    usage_count: i64,
+    job_event_count: i64,
+    outbox_count: i64,
+}
+
+#[derive(Debug, Eq, PartialEq, sqlx::FromRow)]
+struct TerminalParentSnapshot {
+    work_state: String,
+    attempt_state: String,
+    job_state: String,
+    quota_state: String,
+    committed_units: i32,
+    released_units: i32,
+    charged_units: i32,
+    receipt_count: i64,
+    economic_meter_count: i64,
+    rating_count: i64,
+    artifact_count: i64,
+    projection_count: i64,
+    held_hold_count: i64,
+    terminal_job_event_count: i64,
+    terminal_outbox_count: i64,
+}
 
 fn profile_id_for_lease(lease: &WorkLease) -> Uuid {
     if lease.command_schema == GENERATION_COMMAND_SCHEMA {
@@ -1010,20 +1050,20 @@ async fn prepare_attaches_submissions_to_admission_owned_outputs() -> TestResult
 }
 
 #[tokio::test]
-async fn successful_provider_output_is_rated_exactly_once_from_frozen_quote() -> TestResult {
+async fn standalone_v2_economics_cannot_bypass_terminal_reducer() -> TestResult {
     let Some(database) = TestDatabase::new().await? else {
         return Ok(());
     };
     let result = async {
-        let work = seed_lease(&database.pool, "economic-worker", 1).await?;
+        let work = seed_lease(&database.pool, "economic-bypass-worker", 1).await?;
         let executor = PostgresExecutorSubmissionStore::new(database.pool.clone());
         let (artifacts, _artifact_root) = artifact_publisher(&executor)?;
         let prepared = executor
             .prepare_and_handoff(&work, profile_id_for_lease(&work))
             .await
             .map_err(debug_error)?;
-        seed_price_hold(&database.pool, &prepared[0], 0).await?;
-        let lease = claim_required(&executor, "economic-executor").await?;
+        seed_price_hold(&database.pool, &prepared[0], 7).await?;
+        let lease = claim_required(&executor, "economic-bypass-executor").await?;
         executor.start(&lease).await.map_err(debug_error)?;
         let manifest = publish_result_authority(&artifacts, &lease).await?;
         executor
@@ -1039,23 +1079,27 @@ async fn successful_provider_output_is_rated_exactly_once_from_frozen_quote() ->
             json!({"provider_request_id": "provider-1"}),
         )
         .map_err(debug_error)?;
-        let first = economics.settle(&receipt).await.map_err(debug_error)?;
-        let replay = economics.settle(&receipt).await.map_err(debug_error)?;
         require(
-            first == replay,
-            "economic replay changed the settled identity",
+            economics.settle(&receipt).await
+                == Err(gpt_image_2_gateway::economics::EconomicSettlementError::Unavailable),
+            "standalone V2 economics bypassed canonical terminal reduction",
         )?;
 
-        let state: (String, String, i64, i64, i64, i64) = sqlx::query_as(
+        let state: (String, String, String, i64, i64, i64, i64, i64) = sqlx::query_as(
             r#"
-            SELECT o.state, h.state,
+            SELECT reduction.state, o.state, h.state,
                    (SELECT COUNT(*) FROM provider_receipts WHERE submission_id = $1),
                    (SELECT COUNT(*) FROM economic_metering_events WHERE output_id = $2),
                    (SELECT COUNT(*) FROM rated_usage WHERE output_id = $2),
-                   (SELECT COUNT(*) FROM ledger_transactions WHERE source_output_id = $2)
-            FROM job_outputs o
+                   account.held_micros, account.captured_micros
+            FROM executor_terminal_reductions reduction
+            JOIN provider_submissions submission
+              ON submission.submission_id = reduction.submission_id
+            JOIN job_outputs o ON o.output_id = submission.output_id
             JOIN output_holds h ON h.output_id = o.output_id
-            WHERE o.output_id = $2
+            JOIN billing_accounts account
+              ON account.tenant_id = h.tenant_id AND account.currency = h.currency
+            WHERE reduction.submission_id = $1 AND o.output_id = $2
             "#,
         )
         .bind(lease.submission_id)
@@ -1064,8 +1108,18 @@ async fn successful_provider_output_is_rated_exactly_once_from_frozen_quote() ->
         .await
         .map_err(debug_error)?;
         require(
-            state == ("succeeded".to_string(), "settled".to_string(), 1, 1, 1, 0),
-            format!("unexpected economic settlement state: {state:?}"),
+            state
+                == (
+                    "ready".to_string(),
+                    "pending".to_string(),
+                    "held".to_string(),
+                    0,
+                    0,
+                    0,
+                    7,
+                    0,
+                ),
+            format!("standalone V2 economics leaked effects before reducer: {state:?}"),
         )
     }
     .await;
@@ -1080,7 +1134,7 @@ async fn terminal_reduction_claim_reads_only_canonical_success_authority() -> Te
     let result = async {
         let work = seed_lease(&database.pool, "terminal-reader-worker", 1).await?;
         let executor = PostgresExecutorSubmissionStore::new(database.pool.clone());
-        let (artifacts, _artifact_root) = artifact_publisher(&executor)?;
+        let (artifacts, artifact_root) = artifact_publisher(&executor)?;
         executor
             .prepare_and_handoff(&work, profile_id_for_lease(&work))
             .await
@@ -1131,6 +1185,39 @@ async fn terminal_reduction_claim_reads_only_canonical_success_authority() -> Te
                 && authority.media_type == "image/png",
             "terminal success omitted or changed artifact authority",
         )?;
+        let customer_blobs = Arc::new(
+            FilesystemArtifactBlobStore::new(artifact_root.path()).map_err(debug_error)?,
+        );
+        let customer_publisher = CustomerArtifactPublisher::new(customer_blobs.clone());
+        let first_customer = customer_publisher
+            .publish(&terminal)
+            .await
+            .map_err(debug_error)?;
+        let replay_customer = customer_publisher
+            .publish(&terminal)
+            .await
+            .map_err(debug_error)?;
+        require(
+            first_customer == replay_customer
+                && first_customer.identity.artifact_id == terminal.output_id
+                && first_customer.identity.execution_id == terminal.attempt_execution_id
+                && first_customer.identity.lease_epoch == terminal.attempt_lease_epoch
+                && first_customer.identity.output_index
+                    == u32::try_from(terminal.output_index).map_err(debug_error)?
+                && first_customer.sha256_hex == authority.sha256_hex
+                && first_customer.byte_size == authority.byte_size
+                && first_customer.identity.media_type == authority.media_type
+                && first_customer.object_key.starts_with("objects/"),
+            "customer artifact publication was not deterministic",
+        )?;
+        require(
+            customer_blobs
+                .get(&first_customer)
+                .await
+                .map_err(debug_error)?
+                == png_bytes([10, 20, 30, 255]),
+            "customer artifact bytes differ from canonical executor bytes",
+        )?;
         let renewed = reductions
             .heartbeat_terminal(&terminal, 90_000)
             .await
@@ -1166,6 +1253,1135 @@ async fn terminal_reduction_claim_reads_only_canonical_success_authority() -> Te
                 .await
                 .is_err(),
             "terminal reduction queue item was deleted",
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
+async fn terminal_success_completion_commits_every_effect_atomically() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let work =
+            seed_codex_generation_lease(&database.pool, "terminal-completion-worker").await?;
+        let executor = PostgresExecutorSubmissionStore::new(database.pool.clone());
+        let (executor_artifacts, artifact_root) = artifact_publisher(&executor)?;
+        let prepared = executor
+            .prepare_and_handoff(&work, profile_id_for_lease(&work))
+            .await
+            .map_err(debug_error)?;
+        seed_price_hold(&database.pool, &prepared[0], 7).await?;
+        seed_terminal_quota(&database.pool, &work).await?;
+        let scope = ExecutorClaimScope {
+            execution_profile_id: CODEX_PROFILE_ID,
+            provider_id: "openai-codex".to_string(),
+            command_schema: GENERATION_COMMAND_SCHEMA.to_string(),
+            adapter_revision: CODEX_GENERATION_ADAPTER_REVISION.to_string(),
+        };
+        let executor_lease = executor
+            .claim_prepared(&scope, "terminal-completion-executor", 60_000)
+            .await
+            .map_err(debug_error)?
+            .ok_or_else(|| "codex executor claim returned none".to_string())?;
+        executor.start(&executor_lease).await.map_err(debug_error)?;
+        let manifest = publish_result_authority(&executor_artifacts, &executor_lease).await?;
+        executor
+            .record_outcome(
+                &executor_lease,
+                &ExecutorSubmissionOutcome::Succeeded(manifest),
+            )
+            .await
+            .map_err(debug_error)?;
+
+        let reductions = PostgresExecutorTerminalStore::new(database.pool.clone());
+        let terminal = reductions
+            .claim_terminal("terminal-completion-reducer", 60_000)
+            .await
+            .map_err(debug_error)?
+            .ok_or_else(|| "terminal completion reduction was not queued".to_string())?;
+        let customer_blobs =
+            Arc::new(FilesystemArtifactBlobStore::new(artifact_root.path()).map_err(debug_error)?);
+        let customer = CustomerArtifactPublisher::new(customer_blobs.clone())
+            .publish(&terminal)
+            .await
+            .map_err(debug_error)?;
+        let first = reductions
+            .complete_terminal(&terminal, Some(&customer))
+            .await
+            .map_err(debug_error)?;
+        let replay = reductions
+            .complete_terminal(&terminal, Some(&customer))
+            .await
+            .map_err(debug_error)?;
+        require(
+            first == replay
+                && first.parent_state == ExecutorParentTerminalState::Succeeded
+                && first.customer_artifact_id == Some(terminal.output_id),
+            format!("terminal completion replay changed identity: {first:?} {replay:?}"),
+        )?;
+
+        let state: AtomicCompletionState = sqlx::query_as(
+            r#"
+            SELECT reduction.state AS reduction_state, output.state AS output_state,
+                   work.state AS work_state, attempt.state AS attempt_state,
+                   quota.committed_units, quota.released_units, job.charged_units,
+                   quota.state AS quota_state,
+                   (SELECT COUNT(*) FROM provider_receipts WHERE submission_id = $1)
+                     AS receipt_count,
+                   (SELECT COUNT(*) FROM economic_metering_events WHERE output_id = $2)
+                     AS economic_meter_count,
+                   (SELECT COUNT(*) FROM rated_usage WHERE output_id = $2) AS rating_count,
+                   (SELECT COUNT(*) FROM artifacts WHERE artifact_id = $2) AS artifact_count,
+                   (SELECT COUNT(*) FROM job_response_projections WHERE job_id = $3)
+                     AS projection_count,
+                   (SELECT COUNT(*) FROM usage_events WHERE request_id = job.request_id
+                      AND outcome = 'charged') AS usage_count,
+                   (SELECT COUNT(*) FROM job_events WHERE job_id = $3
+                      AND event_type = 'job.succeeded') AS job_event_count,
+                   (SELECT COUNT(*) FROM outbox_events WHERE job_id = $3
+                      AND event_type = 'job.succeeded') AS outbox_count
+            FROM executor_terminal_reductions reduction
+            JOIN job_outputs output ON output.output_id = $2
+            JOIN work_items work ON work.work_item_id = $4
+            JOIN job_attempts attempt ON attempt.execution_id = $5
+            JOIN jobs job ON job.job_id = $3
+            JOIN quota_reservations quota ON quota.reservation_id = job.reservation_id
+            WHERE reduction.submission_id = $1
+            "#,
+        )
+        .bind(terminal.submission_id)
+        .bind(terminal.output_id)
+        .bind(terminal.job_id)
+        .bind(terminal.work_item_id)
+        .bind(terminal.attempt_execution_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(
+            state
+                == AtomicCompletionState {
+                    reduction_state: "completed".to_string(),
+                    output_state: "succeeded".to_string(),
+                    work_state: "succeeded".to_string(),
+                    attempt_state: "succeeded".to_string(),
+                    committed_units: 1,
+                    released_units: 0,
+                    charged_units: 1,
+                    quota_state: "committed".to_string(),
+                    receipt_count: 1,
+                    economic_meter_count: 1,
+                    rating_count: 1,
+                    artifact_count: 1,
+                    projection_count: 1,
+                    usage_count: 1,
+                    job_event_count: 1,
+                    outbox_count: 1,
+                },
+            format!("terminal completion state is not atomic or exact: {state:?}"),
+        )?;
+        require(
+            sqlx::query(
+                r#"
+                INSERT INTO artifacts
+                  (artifact_id, tenant_id, job_id, work_item_id, execution_id,
+                   lease_epoch, output_index, state, storage_backend, object_key,
+                   sha256_hex, byte_size, media_type, created_at_ms)
+                VALUES ($1, $2, $3, $4, $5, $6, 1, 'ready', 'filesystem-v1',
+                        $7, $8, 1, 'image/png', $9)
+                "#,
+            )
+            .bind(Uuid::new_v4())
+            .bind(&terminal.tenant_id)
+            .bind(terminal.job_id)
+            .bind(terminal.work_item_id)
+            .bind(terminal.attempt_execution_id)
+            .bind(terminal.attempt_lease_epoch)
+            .bind(format!("objects/forged/{}", Uuid::new_v4().simple()))
+            .bind("f".repeat(64))
+            .bind(database_now(&database.pool).await?)
+            .execute(&database.pool)
+            .await
+            .is_err(),
+            "completed parent accepted an extra unlinked customer artifact",
+        )?;
+        let idempotency_state: String = sqlx::query_scalar(
+            "SELECT state FROM idempotency_requests WHERE job_id = $1",
+        )
+        .bind(terminal.job_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(
+            idempotency_state == "succeeded",
+            format!("terminal completion did not project idempotency: {idempotency_state}"),
+        )?;
+        require(
+            sqlx::query("DELETE FROM idempotency_requests WHERE job_id = $1")
+                .bind(terminal.job_id)
+                .execute(&database.pool)
+                .await
+                .is_err(),
+            "completed V2 job lost its idempotency binding",
+        )?;
+        let unrelated = seed_lease(&database.pool, "cross-parent-event-worker", 1).await?;
+        require(
+            sqlx::query(
+                "UPDATE job_events SET job_id = $2 WHERE job_id = $1 AND event_type = 'job.succeeded'",
+            )
+            .bind(terminal.job_id)
+            .bind(unrelated.job_id)
+            .execute(&database.pool)
+            .await
+            .is_err(),
+            "canonical terminal event moved away from its completed parent",
+        )?;
+        require(
+            customer_blobs.get(&customer).await.map_err(debug_error)?
+                == png_bytes([10, 20, 30, 255]),
+            "committed customer artifact bytes changed",
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
+async fn concurrent_duplicate_completion_has_one_durable_result() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let work = seed_codex_generation_lease(&database.pool, "duplicate-terminal-worker").await?;
+        let executor = PostgresExecutorSubmissionStore::new(database.pool.clone());
+        let (executor_artifacts, artifact_root) = artifact_publisher(&executor)?;
+        let prepared = executor
+            .prepare_and_handoff(&work, profile_id_for_lease(&work))
+            .await
+            .map_err(debug_error)?;
+        seed_price_hold(&database.pool, &prepared[0], 7).await?;
+        seed_terminal_quota(&database.pool, &work).await?;
+        let scope = ExecutorClaimScope {
+            execution_profile_id: CODEX_PROFILE_ID,
+            provider_id: "openai-codex".to_string(),
+            command_schema: GENERATION_COMMAND_SCHEMA.to_string(),
+            adapter_revision: CODEX_GENERATION_ADAPTER_REVISION.to_string(),
+        };
+        let executor_lease = executor
+            .claim_prepared(&scope, "duplicate-terminal-executor", 60_000)
+            .await
+            .map_err(debug_error)?
+            .ok_or_else(|| "duplicate terminal executor claim returned none".to_string())?;
+        executor.start(&executor_lease).await.map_err(debug_error)?;
+        let manifest = publish_result_authority(&executor_artifacts, &executor_lease).await?;
+        executor
+            .record_outcome(
+                &executor_lease,
+                &ExecutorSubmissionOutcome::Succeeded(manifest),
+            )
+            .await
+            .map_err(debug_error)?;
+
+        let reductions = PostgresExecutorTerminalStore::new(database.pool.clone());
+        let terminal = reductions
+            .claim_terminal("duplicate-terminal-reducer", 60_000)
+            .await
+            .map_err(debug_error)?
+            .ok_or_else(|| "duplicate terminal reduction was not queued".to_string())?;
+        let customer = CustomerArtifactPublisher::new(Arc::new(
+            FilesystemArtifactBlobStore::new(artifact_root.path()).map_err(debug_error)?,
+        ))
+        .publish(&terminal)
+        .await
+        .map_err(debug_error)?;
+        let barrier = Arc::new(tokio::sync::Barrier::new(12));
+        let mut tasks = Vec::new();
+        for _ in 0..12 {
+            let store = reductions.clone();
+            let lease = terminal.clone();
+            let artifact = customer.clone();
+            let barrier = barrier.clone();
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                store.complete_terminal(&lease, Some(&artifact)).await
+            }));
+        }
+        let completions = tokio::time::timeout(Duration::from_secs(10), async {
+            let mut completions = Vec::new();
+            for task in tasks {
+                completions.push(task.await.map_err(debug_error)?.map_err(debug_error)?);
+            }
+            Ok::<_, String>(completions)
+        })
+        .await
+        .map_err(|_| "duplicate terminal completions deadlocked".to_string())??;
+        let expected = completions
+            .first()
+            .ok_or_else(|| "duplicate terminal completion returned no result".to_string())?;
+        require(
+            completions.iter().all(|completion| completion == expected)
+                && expected.parent_state == ExecutorParentTerminalState::Succeeded,
+            format!("duplicate completion results diverged: {completions:?}"),
+        )?;
+        let counts: (i64, i64, i64, i64, i64, i64, i32) = sqlx::query_as(
+            r#"
+            SELECT
+              (SELECT COUNT(*) FROM provider_receipts WHERE submission_id = $1),
+              (SELECT COUNT(*) FROM economic_metering_events WHERE output_id = $2),
+              (SELECT COUNT(*) FROM rated_usage WHERE output_id = $2),
+              (SELECT COUNT(*) FROM artifacts WHERE artifact_id = $2),
+              (SELECT COUNT(*) FROM job_response_projections WHERE job_id = $3),
+              (SELECT COUNT(*) FROM outbox_events WHERE job_id = $3
+                 AND event_type = 'job.succeeded'),
+              (SELECT committed_units FROM quota_reservations WHERE job_id = $3)
+            "#,
+        )
+        .bind(terminal.submission_id)
+        .bind(terminal.output_id)
+        .bind(terminal.job_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(
+            counts == (1, 1, 1, 1, 1, 1, 1),
+            format!("duplicate completion persisted duplicate effects: {counts:?}"),
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
+async fn deferred_commit_failure_rolls_back_every_terminal_effect() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let work = seed_codex_generation_lease(&database.pool, "terminal-rollback-worker").await?;
+        let executor = PostgresExecutorSubmissionStore::new(database.pool.clone());
+        let (executor_artifacts, artifact_root) = artifact_publisher(&executor)?;
+        let prepared = executor
+            .prepare_and_handoff(&work, profile_id_for_lease(&work))
+            .await
+            .map_err(debug_error)?;
+        seed_price_hold(&database.pool, &prepared[0], 7).await?;
+        seed_terminal_quota(&database.pool, &work).await?;
+        let scope = ExecutorClaimScope {
+            execution_profile_id: CODEX_PROFILE_ID,
+            provider_id: "openai-codex".to_string(),
+            command_schema: GENERATION_COMMAND_SCHEMA.to_string(),
+            adapter_revision: CODEX_GENERATION_ADAPTER_REVISION.to_string(),
+        };
+        let executor_lease = executor
+            .claim_prepared(&scope, "terminal-rollback-executor", 60_000)
+            .await
+            .map_err(debug_error)?
+            .ok_or_else(|| "rollback executor claim returned none".to_string())?;
+        executor.start(&executor_lease).await.map_err(debug_error)?;
+        let manifest = publish_result_authority(&executor_artifacts, &executor_lease).await?;
+        executor
+            .record_outcome(
+                &executor_lease,
+                &ExecutorSubmissionOutcome::Succeeded(manifest),
+            )
+            .await
+            .map_err(debug_error)?;
+        let reductions = PostgresExecutorTerminalStore::new(database.pool.clone());
+        let terminal = reductions
+            .claim_terminal("terminal-rollback-reducer", 60_000)
+            .await
+            .map_err(debug_error)?
+            .ok_or_else(|| "rollback terminal reduction was not queued".to_string())?;
+        let customer_blobs =
+            Arc::new(FilesystemArtifactBlobStore::new(artifact_root.path()).map_err(debug_error)?);
+        let customer = CustomerArtifactPublisher::new(customer_blobs.clone())
+            .publish(&terminal)
+            .await
+            .map_err(debug_error)?;
+
+        sqlx::query(
+            r#"
+            CREATE FUNCTION reject_terminal_completion_commit() RETURNS TRIGGER AS $$
+            BEGIN
+                RAISE EXCEPTION 'injected terminal completion commit failure';
+            END;
+            $$ LANGUAGE plpgsql
+            "#,
+        )
+        .execute(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        sqlx::query(
+            r#"
+            CREATE CONSTRAINT TRIGGER reject_terminal_completion_at_commit
+            AFTER UPDATE ON executor_terminal_reductions
+            DEFERRABLE INITIALLY DEFERRED
+            FOR EACH ROW WHEN (NEW.state = 'completed')
+            EXECUTE FUNCTION reject_terminal_completion_commit()
+            "#,
+        )
+        .execute(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        sqlx::query(
+            r#"
+            CREATE FUNCTION erase_terminal_receipt_evidence() RETURNS TRIGGER AS $$
+            BEGIN
+                NEW.evidence = '{}'::jsonb;
+                RETURN NEW;
+            END;
+            $$ LANGUAGE plpgsql
+            "#,
+        )
+        .execute(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        sqlx::query(
+            r#"
+            CREATE TRIGGER erase_terminal_receipt_evidence
+            BEFORE INSERT ON provider_receipts
+            FOR EACH ROW EXECUTE FUNCTION erase_terminal_receipt_evidence()
+            "#,
+        )
+        .execute(&database.pool)
+        .await
+        .map_err(debug_error)?;
+
+        require(
+            matches!(
+                reductions
+                    .complete_terminal(&terminal, Some(&customer))
+                    .await,
+                Err(ExecutorTerminalError::Unavailable)
+            ),
+            "deferred commit injection did not fail the outer completion transaction",
+        )?;
+        let rolled_back: (String, String, String, i32, i32, i64, i64, i64, i64) = sqlx::query_as(
+            r#"
+                SELECT reduction.state, output.state, work.state,
+                       quota.committed_units, quota.released_units,
+                       (SELECT COUNT(*) FROM provider_receipts WHERE submission_id = $1),
+                       (SELECT COUNT(*) FROM rated_usage WHERE output_id = $2),
+                       (SELECT COUNT(*) FROM artifacts WHERE artifact_id = $2),
+                       (SELECT COUNT(*) FROM job_response_projections WHERE job_id = $3)
+                FROM executor_terminal_reductions reduction
+                JOIN job_outputs output ON output.output_id = $2
+                JOIN work_items work ON work.work_item_id = $4
+                JOIN jobs job ON job.job_id = $3
+                JOIN quota_reservations quota ON quota.reservation_id = job.reservation_id
+                WHERE reduction.submission_id = $1
+                "#,
+        )
+        .bind(terminal.submission_id)
+        .bind(terminal.output_id)
+        .bind(terminal.job_id)
+        .bind(terminal.work_item_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(
+            rolled_back
+                == (
+                    "leased".to_string(),
+                    "pending".to_string(),
+                    "awaiting_executor".to_string(),
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                ),
+            format!("deferred failure leaked terminal effects: {rolled_back:?}"),
+        )?;
+        require(
+            customer_blobs.get(&customer).await.map_err(debug_error)?
+                == png_bytes([10, 20, 30, 255]),
+            "rollback removed the deterministic customer blob",
+        )?;
+
+        sqlx::query(
+            "DROP TRIGGER reject_terminal_completion_at_commit ON executor_terminal_reductions",
+        )
+        .execute(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        sqlx::query("DROP FUNCTION reject_terminal_completion_commit()")
+            .execute(&database.pool)
+            .await
+            .map_err(debug_error)?;
+        require(
+            matches!(
+                reductions
+                    .complete_terminal(&terminal, Some(&customer))
+                    .await,
+                Err(ExecutorTerminalError::Unavailable)
+            ),
+            "missing canonical receipt evidence bypassed terminal completion constraints",
+        )?;
+        let receipt_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM provider_receipts WHERE submission_id = $1")
+                .bind(terminal.submission_id)
+                .fetch_one(&database.pool)
+                .await
+                .map_err(debug_error)?;
+        require(
+            receipt_count == 0,
+            format!("invalid receipt evidence leaked {receipt_count} receipt rows"),
+        )?;
+
+        sqlx::query("DROP TRIGGER erase_terminal_receipt_evidence ON provider_receipts")
+            .execute(&database.pool)
+            .await
+            .map_err(debug_error)?;
+        sqlx::query("DROP FUNCTION erase_terminal_receipt_evidence()")
+            .execute(&database.pool)
+            .await
+            .map_err(debug_error)?;
+        let retried = reductions
+            .complete_terminal(&terminal, Some(&customer))
+            .await
+            .map_err(debug_error)?;
+        require(
+            retried.parent_state == ExecutorParentTerminalState::Succeeded,
+            "exact retry did not complete after the injected commit failure",
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
+async fn multi_output_completion_does_not_finalize_parent_early() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let work =
+            seed_codex_generation_lease_with_outputs(&database.pool, "multi-terminal-worker", 2)
+                .await?;
+
+        let executor = PostgresExecutorSubmissionStore::new(database.pool.clone());
+        let (executor_artifacts, artifact_root) = artifact_publisher(&executor)?;
+        let prepared = executor
+            .prepare_and_handoff(&work, profile_id_for_lease(&work))
+            .await
+            .map_err(debug_error)?;
+        seed_terminal_economics(&database.pool, &prepared, 7, 3, 0).await?;
+        seed_terminal_quota(&database.pool, &work).await?;
+        let scope = ExecutorClaimScope {
+            execution_profile_id: CODEX_PROFILE_ID,
+            provider_id: "openai-codex".to_string(),
+            command_schema: GENERATION_COMMAND_SCHEMA.to_string(),
+            adapter_revision: CODEX_GENERATION_ADAPTER_REVISION.to_string(),
+        };
+        for owner in ["multi-executor-0", "multi-executor-1"] {
+            let executor_lease = executor
+                .claim_prepared(&scope, owner, 60_000)
+                .await
+                .map_err(debug_error)?
+                .ok_or_else(|| format!("{owner} claim returned none"))?;
+            executor.start(&executor_lease).await.map_err(debug_error)?;
+            let manifest = publish_result_authority(&executor_artifacts, &executor_lease).await?;
+            executor
+                .record_outcome(
+                    &executor_lease,
+                    &ExecutorSubmissionOutcome::Succeeded(manifest),
+                )
+                .await
+                .map_err(debug_error)?;
+        }
+
+        let reductions = PostgresExecutorTerminalStore::new(database.pool.clone());
+        let customer_blobs =
+            Arc::new(FilesystemArtifactBlobStore::new(artifact_root.path()).map_err(debug_error)?);
+        let customer_publisher = CustomerArtifactPublisher::new(customer_blobs);
+        let first = reductions
+            .claim_terminal("multi-reducer-0", 60_000)
+            .await
+            .map_err(debug_error)?
+            .ok_or_else(|| "first multi-output reduction was not queued".to_string())?;
+        let first_artifact = customer_publisher
+            .publish(&first)
+            .await
+            .map_err(debug_error)?;
+        let first_completion = reductions
+            .complete_terminal(&first, Some(&first_artifact))
+            .await
+            .map_err(debug_error)?;
+        require(
+            first_completion.parent_state == ExecutorParentTerminalState::Pending,
+            "first output finalized the parent early",
+        )?;
+        let intermediate: (String, String, i32, i32, i64) = sqlx::query_as(
+            r#"
+            SELECT work.state, quota.state, quota.committed_units, quota.released_units,
+                   (SELECT COUNT(*) FROM job_response_projections WHERE job_id = $1)
+            FROM work_items work
+            JOIN jobs job ON job.job_id = work.job_id
+            JOIN quota_reservations quota ON quota.reservation_id = job.reservation_id
+            WHERE work.job_id = $1
+            "#,
+        )
+        .bind(work.job_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(
+            intermediate
+                == (
+                    "awaiting_executor".to_string(),
+                    "reserved".to_string(),
+                    1,
+                    0,
+                    0,
+                ),
+            format!("first output leaked parent completion: {intermediate:?}"),
+        )?;
+
+        let second = reductions
+            .claim_terminal("multi-reducer-1", 60_000)
+            .await
+            .map_err(debug_error)?
+            .ok_or_else(|| "second multi-output reduction was not queued".to_string())?;
+        let second_artifact = customer_publisher
+            .publish(&second)
+            .await
+            .map_err(debug_error)?;
+        let second_completion = reductions
+            .complete_terminal(&second, Some(&second_artifact))
+            .await
+            .map_err(debug_error)?;
+        require(
+            second_completion.parent_state == ExecutorParentTerminalState::Succeeded,
+            "last output did not finalize the successful parent",
+        )?;
+        let final_state: (String, String, i32, i32, i64, i64, i64) = sqlx::query_as(
+            r#"
+            SELECT work.state, quota.state, quota.committed_units, quota.released_units,
+                   (SELECT COUNT(*) FROM artifacts WHERE job_id = $1),
+                   (SELECT COUNT(*) FROM provider_receipts receipt
+                      JOIN provider_submissions submission
+                        ON submission.submission_id = receipt.submission_id
+                      WHERE submission.job_id = $1),
+                   (SELECT COUNT(*) FROM job_response_projections WHERE job_id = $1)
+            FROM work_items work
+            JOIN jobs job ON job.job_id = work.job_id
+            JOIN quota_reservations quota ON quota.reservation_id = job.reservation_id
+            WHERE work.job_id = $1
+            "#,
+        )
+        .bind(work.job_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(
+            final_state
+                == (
+                    "succeeded".to_string(),
+                    "committed".to_string(),
+                    2,
+                    0,
+                    2,
+                    2,
+                    1,
+                ),
+            format!("multi-output final state is incomplete: {final_state:?}"),
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
+async fn concurrent_multi_output_completion_finalizes_parent_once() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let work =
+            seed_codex_generation_lease_with_outputs(&database.pool, "concurrent-parent-worker", 3)
+                .await?;
+        let executor = PostgresExecutorSubmissionStore::new(database.pool.clone());
+        let (executor_artifacts, artifact_root) = artifact_publisher(&executor)?;
+        let prepared = executor
+            .prepare_and_handoff(&work, profile_id_for_lease(&work))
+            .await
+            .map_err(debug_error)?;
+        seed_terminal_economics(&database.pool, &prepared, 7, 3, 0).await?;
+        seed_terminal_quota(&database.pool, &work).await?;
+        let scope = ExecutorClaimScope {
+            execution_profile_id: CODEX_PROFILE_ID,
+            provider_id: "openai-codex".to_string(),
+            command_schema: GENERATION_COMMAND_SCHEMA.to_string(),
+            adapter_revision: CODEX_GENERATION_ADAPTER_REVISION.to_string(),
+        };
+        for index in 0..3 {
+            let lease = executor
+                .claim_prepared(
+                    &scope,
+                    &format!("concurrent-parent-executor-{index}"),
+                    60_000,
+                )
+                .await
+                .map_err(debug_error)?
+                .ok_or_else(|| format!("concurrent parent output {index} was not claimable"))?;
+            executor.start(&lease).await.map_err(debug_error)?;
+            let manifest = publish_result_authority(&executor_artifacts, &lease).await?;
+            executor
+                .record_outcome(&lease, &ExecutorSubmissionOutcome::Succeeded(manifest))
+                .await
+                .map_err(debug_error)?;
+        }
+
+        let reductions = PostgresExecutorTerminalStore::new(database.pool.clone());
+        let customer_publisher = CustomerArtifactPublisher::new(Arc::new(
+            FilesystemArtifactBlobStore::new(artifact_root.path()).map_err(debug_error)?,
+        ));
+        let mut terminal_inputs = Vec::new();
+        for index in 0..3 {
+            let terminal = reductions
+                .claim_terminal(&format!("concurrent-parent-reducer-{index}"), 60_000)
+                .await
+                .map_err(debug_error)?
+                .ok_or_else(|| format!("concurrent parent reduction {index} was not queued"))?;
+            let artifact = customer_publisher
+                .publish(&terminal)
+                .await
+                .map_err(debug_error)?;
+            terminal_inputs.push((terminal, artifact));
+        }
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+        let mut tasks = Vec::new();
+        for (terminal, artifact) in terminal_inputs {
+            let store = reductions.clone();
+            let barrier = barrier.clone();
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                store.complete_terminal(&terminal, Some(&artifact)).await
+            }));
+        }
+        let completions = tokio::time::timeout(Duration::from_secs(10), async {
+            let mut completions = Vec::new();
+            for task in tasks {
+                completions.push(task.await.map_err(debug_error)?.map_err(debug_error)?);
+            }
+            Ok::<_, String>(completions)
+        })
+        .await
+        .map_err(|_| "concurrent output completion deadlocked".to_string())??;
+        require(
+            completions
+                .iter()
+                .filter(|completion| {
+                    completion.parent_state == ExecutorParentTerminalState::Succeeded
+                })
+                .count()
+                == 1
+                && completions
+                    .iter()
+                    .filter(|completion| {
+                        completion.parent_state == ExecutorParentTerminalState::Pending
+                    })
+                    .count()
+                    == 2,
+            format!("concurrent parent completion ownership diverged: {completions:?}"),
+        )?;
+        let state: (String, String, i32, i64, i64, i64, i64, i64) = sqlx::query_as(
+            r#"
+            SELECT work.state, quota.state, quota.committed_units,
+                   (SELECT COUNT(*) FROM provider_receipts receipt
+                      JOIN provider_submissions submission
+                        ON submission.submission_id = receipt.submission_id
+                      WHERE submission.job_id = $1),
+                   (SELECT COUNT(*) FROM rated_usage WHERE job_id = $1),
+                   (SELECT COUNT(*) FROM artifacts WHERE job_id = $1),
+                   (SELECT COUNT(*) FROM job_response_projections WHERE job_id = $1),
+                   (SELECT COUNT(*) FROM outbox_events WHERE job_id = $1
+                      AND event_type = 'job.succeeded')
+            FROM work_items work
+            JOIN jobs job ON job.job_id = work.job_id
+            JOIN quota_reservations quota ON quota.reservation_id = job.reservation_id
+            WHERE work.job_id = $1
+            "#,
+        )
+        .bind(work.job_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(
+            state
+                == (
+                    "succeeded".to_string(),
+                    "committed".to_string(),
+                    3,
+                    3,
+                    3,
+                    3,
+                    1,
+                    1,
+                ),
+            format!("concurrent parent completion was not exactly once: {state:?}"),
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
+async fn partial_failure_settles_outputs_and_fails_parent() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let work =
+            seed_codex_generation_lease_with_outputs(&database.pool, "partial-failure-worker", 3)
+                .await?;
+        let executor = PostgresExecutorSubmissionStore::new(database.pool.clone());
+        let (executor_artifacts, artifact_root) = artifact_publisher(&executor)?;
+        let prepared = executor
+            .prepare_and_handoff(&work, profile_id_for_lease(&work))
+            .await
+            .map_err(debug_error)?;
+        seed_terminal_economics(&database.pool, &prepared, 7, 3, 0).await?;
+        seed_terminal_quota(&database.pool, &work).await?;
+        let scope = ExecutorClaimScope {
+            execution_profile_id: CODEX_PROFILE_ID,
+            provider_id: "openai-codex".to_string(),
+            command_schema: GENERATION_COMMAND_SCHEMA.to_string(),
+            adapter_revision: CODEX_GENERATION_ADAPTER_REVISION.to_string(),
+        };
+        for index in 0..3 {
+            let lease = executor
+                .claim_prepared(&scope, &format!("partial-executor-{index}"), 60_000)
+                .await
+                .map_err(debug_error)?
+                .ok_or_else(|| format!("partial output {index} was not claimable"))?;
+            executor.start(&lease).await.map_err(debug_error)?;
+            let outcome = if lease.output_index == 1 {
+                ExecutorSubmissionOutcome::Failed {
+                    error_code: "provider_failed".to_string(),
+                }
+            } else {
+                ExecutorSubmissionOutcome::Succeeded(
+                    publish_result_authority(&executor_artifacts, &lease).await?,
+                )
+            };
+            executor
+                .record_outcome(&lease, &outcome)
+                .await
+                .map_err(debug_error)?;
+        }
+
+        let reductions = PostgresExecutorTerminalStore::new(database.pool.clone());
+        let customer_publisher = CustomerArtifactPublisher::new(Arc::new(
+            FilesystemArtifactBlobStore::new(artifact_root.path()).map_err(debug_error)?,
+        ));
+        for index in 0..3 {
+            let terminal = reductions
+                .claim_terminal(&format!("partial-reducer-{index}"), 60_000)
+                .await
+                .map_err(debug_error)?
+                .ok_or_else(|| format!("partial reduction {index} was not queued"))?;
+            let artifact = if matches!(terminal.outcome, CanonicalExecutorOutcome::Succeeded(_)) {
+                Some(
+                    customer_publisher
+                        .publish(&terminal)
+                        .await
+                        .map_err(debug_error)?,
+                )
+            } else {
+                None
+            };
+            let completion = reductions
+                .complete_terminal(&terminal, artifact.as_ref())
+                .await
+                .map_err(debug_error)?;
+            let expected = if index == 2 {
+                ExecutorParentTerminalState::Failed
+            } else {
+                ExecutorParentTerminalState::Pending
+            };
+            require(
+                completion.parent_state == expected,
+                format!("partial completion {index} returned {completion:?}"),
+            )?;
+        }
+
+        let state: TerminalParentSnapshot = sqlx::query_as(
+            r#"
+            SELECT work.state AS work_state, attempt.state AS attempt_state,
+                   job.state AS job_state, quota.state AS quota_state,
+                   quota.committed_units, quota.released_units, job.charged_units,
+                   (SELECT COUNT(*) FROM provider_receipts receipt
+                      JOIN provider_submissions submission
+                        ON submission.submission_id = receipt.submission_id
+                      WHERE submission.job_id = $1) AS receipt_count,
+                   (SELECT COUNT(*) FROM economic_metering_events WHERE job_id = $1)
+                     AS economic_meter_count,
+                   (SELECT COUNT(*) FROM rated_usage WHERE job_id = $1) AS rating_count,
+                   (SELECT COUNT(*) FROM artifacts WHERE job_id = $1) AS artifact_count,
+                   (SELECT COUNT(*) FROM job_response_projections WHERE job_id = $1)
+                     AS projection_count,
+                   (SELECT COUNT(*) FROM output_holds WHERE job_id = $1 AND state = 'held')
+                     AS held_hold_count,
+                   (SELECT COUNT(*) FROM job_events WHERE job_id = $1
+                      AND event_type = 'job.failed') AS terminal_job_event_count,
+                   (SELECT COUNT(*) FROM outbox_events WHERE job_id = $1
+                      AND event_type = 'job.failed') AS terminal_outbox_count
+            FROM work_items work
+            JOIN job_attempts attempt ON attempt.execution_id = work.execution_id
+            JOIN jobs job ON job.job_id = work.job_id
+            JOIN quota_reservations quota ON quota.reservation_id = job.reservation_id
+            WHERE work.job_id = $1
+            "#,
+        )
+        .bind(work.job_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(
+            state
+                == TerminalParentSnapshot {
+                    work_state: "failed".to_string(),
+                    attempt_state: "failed".to_string(),
+                    job_state: "failed".to_string(),
+                    quota_state: "committed".to_string(),
+                    committed_units: 2,
+                    released_units: 1,
+                    charged_units: 2,
+                    receipt_count: 3,
+                    economic_meter_count: 3,
+                    rating_count: 3,
+                    artifact_count: 2,
+                    projection_count: 0,
+                    held_hold_count: 0,
+                    terminal_job_event_count: 1,
+                    terminal_outbox_count: 1,
+                },
+            format!("partial failure did not close every output exactly once: {state:?}"),
+        )?;
+        let account: (i64, i64) = sqlx::query_as(
+            "SELECT held_micros, captured_micros FROM billing_accounts WHERE tenant_id = $1",
+        )
+        .bind("executord-process-smoke")
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(
+            account == (0, 17),
+            format!("partial failure monetary account is not exact: {account:?}"),
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
+async fn uncertain_output_keeps_hold_and_parent_unresolved() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let work = seed_codex_generation_lease_with_outputs(
+            &database.pool,
+            "uncertain-terminal-worker",
+            2,
+        )
+        .await?;
+        let executor = PostgresExecutorSubmissionStore::new(database.pool.clone());
+        let (executor_artifacts, artifact_root) = artifact_publisher(&executor)?;
+        let prepared = executor
+            .prepare_and_handoff(&work, profile_id_for_lease(&work))
+            .await
+            .map_err(debug_error)?;
+        seed_terminal_economics(&database.pool, &prepared, 7, 3, 0).await?;
+        seed_terminal_quota(&database.pool, &work).await?;
+        let scope = ExecutorClaimScope {
+            execution_profile_id: CODEX_PROFILE_ID,
+            provider_id: "openai-codex".to_string(),
+            command_schema: GENERATION_COMMAND_SCHEMA.to_string(),
+            adapter_revision: CODEX_GENERATION_ADAPTER_REVISION.to_string(),
+        };
+        for index in 0..2 {
+            let lease = executor
+                .claim_prepared(&scope, &format!("uncertain-executor-{index}"), 60_000)
+                .await
+                .map_err(debug_error)?
+                .ok_or_else(|| format!("uncertain output {index} was not claimable"))?;
+            executor.start(&lease).await.map_err(debug_error)?;
+            let outcome = if lease.output_index == 1 {
+                ExecutorSubmissionOutcome::Uncertain {
+                    error_code: "provider_result_unknown".to_string(),
+                }
+            } else {
+                ExecutorSubmissionOutcome::Succeeded(
+                    publish_result_authority(&executor_artifacts, &lease).await?,
+                )
+            };
+            executor
+                .record_outcome(&lease, &outcome)
+                .await
+                .map_err(debug_error)?;
+        }
+
+        let reductions = PostgresExecutorTerminalStore::new(database.pool.clone());
+        let customer_publisher = CustomerArtifactPublisher::new(Arc::new(
+            FilesystemArtifactBlobStore::new(artifact_root.path()).map_err(debug_error)?,
+        ));
+        for index in 0..2 {
+            let terminal = reductions
+                .claim_terminal(&format!("uncertain-reducer-{index}"), 60_000)
+                .await
+                .map_err(debug_error)?
+                .ok_or_else(|| format!("uncertain reduction {index} was not queued"))?;
+            let artifact = if matches!(terminal.outcome, CanonicalExecutorOutcome::Succeeded(_)) {
+                Some(
+                    customer_publisher
+                        .publish(&terminal)
+                        .await
+                        .map_err(debug_error)?,
+                )
+            } else {
+                None
+            };
+            let completion = reductions
+                .complete_terminal(&terminal, artifact.as_ref())
+                .await
+                .map_err(debug_error)?;
+            let expected = if index == 1 {
+                ExecutorParentTerminalState::Uncertain
+            } else {
+                ExecutorParentTerminalState::Pending
+            };
+            require(
+                completion.parent_state == expected,
+                format!("uncertain completion {index} returned {completion:?}"),
+            )?;
+        }
+
+        let state: TerminalParentSnapshot = sqlx::query_as(
+            r#"
+            SELECT work.state AS work_state, attempt.state AS attempt_state,
+                   job.state AS job_state, quota.state AS quota_state,
+                   quota.committed_units, quota.released_units, job.charged_units,
+                   (SELECT COUNT(*) FROM provider_receipts receipt
+                      JOIN provider_submissions submission
+                        ON submission.submission_id = receipt.submission_id
+                      WHERE submission.job_id = $1) AS receipt_count,
+                   (SELECT COUNT(*) FROM economic_metering_events WHERE job_id = $1)
+                     AS economic_meter_count,
+                   (SELECT COUNT(*) FROM rated_usage WHERE job_id = $1) AS rating_count,
+                   (SELECT COUNT(*) FROM artifacts WHERE job_id = $1) AS artifact_count,
+                   (SELECT COUNT(*) FROM job_response_projections WHERE job_id = $1)
+                     AS projection_count,
+                   (SELECT COUNT(*) FROM output_holds WHERE job_id = $1 AND state = 'held')
+                     AS held_hold_count,
+                   (SELECT COUNT(*) FROM job_events WHERE job_id = $1
+                      AND event_type = 'job.uncertain') AS terminal_job_event_count,
+                   (SELECT COUNT(*) FROM outbox_events WHERE job_id = $1
+                      AND event_type = 'job.uncertain') AS terminal_outbox_count
+            FROM work_items work
+            JOIN job_attempts attempt ON attempt.execution_id = work.execution_id
+            JOIN jobs job ON job.job_id = work.job_id
+            JOIN quota_reservations quota ON quota.reservation_id = job.reservation_id
+            WHERE work.job_id = $1
+            "#,
+        )
+        .bind(work.job_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(
+            state
+                == TerminalParentSnapshot {
+                    work_state: "uncertain".to_string(),
+                    attempt_state: "uncertain".to_string(),
+                    job_state: "uncertain".to_string(),
+                    quota_state: "reserved".to_string(),
+                    committed_units: 1,
+                    released_units: 0,
+                    charged_units: 1,
+                    receipt_count: 2,
+                    economic_meter_count: 2,
+                    rating_count: 1,
+                    artifact_count: 1,
+                    projection_count: 0,
+                    held_hold_count: 1,
+                    terminal_job_event_count: 1,
+                    terminal_outbox_count: 1,
+                },
+            format!("uncertain terminal state lost its unresolved hold: {state:?}"),
+        )?;
+        let account: (i64, i64) = sqlx::query_as(
+            "SELECT held_micros, captured_micros FROM billing_accounts WHERE tenant_id = $1",
+        )
+        .bind("executord-process-smoke")
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(
+            account == (7, 7),
+            format!("uncertain monetary account changed its unresolved hold: {account:?}"),
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
+async fn customer_artifact_publication_rejects_tampered_private_authority() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let work = seed_lease(&database.pool, "tampered-artifact-worker", 1).await?;
+        let executor = PostgresExecutorSubmissionStore::new(database.pool.clone());
+        let (artifacts, artifact_root) = artifact_publisher(&executor)?;
+        executor
+            .prepare_and_handoff(&work, profile_id_for_lease(&work))
+            .await
+            .map_err(debug_error)?;
+        let executor_lease = claim_required(&executor, "tampered-artifact-executor").await?;
+        executor.start(&executor_lease).await.map_err(debug_error)?;
+        let manifest = publish_result_authority(&artifacts, &executor_lease).await?;
+        executor
+            .record_outcome(
+                &executor_lease,
+                &ExecutorSubmissionOutcome::Succeeded(manifest),
+            )
+            .await
+            .map_err(debug_error)?;
+        let terminal = PostgresExecutorTerminalStore::new(database.pool.clone())
+            .claim_terminal("tampered-artifact-reader", 60_000)
+            .await
+            .map_err(debug_error)?
+            .ok_or_else(|| "tampered artifact terminal was not queued".to_string())?;
+
+        let authority_id = executor_lease.executor_execution_id.simple().to_string();
+        let private_object = artifact_root
+            .path()
+            .join("executor-objects")
+            .join(&authority_id[..2])
+            .join(&authority_id);
+        fs::write(&private_object, b"tampered").map_err(debug_error)?;
+        let customer_blobs =
+            Arc::new(FilesystemArtifactBlobStore::new(artifact_root.path()).map_err(debug_error)?);
+        let customer_object = artifact_root
+            .path()
+            .join("objects")
+            .join(&terminal.output_id.simple().to_string()[..2])
+            .join(terminal.output_id.simple().to_string());
+        require(
+            matches!(
+                CustomerArtifactPublisher::new(customer_blobs)
+                    .publish(&terminal)
+                    .await,
+                Err(gpt_image_2_gateway::CustomerArtifactPublishError::Integrity)
+            ) && !customer_object.exists(),
+            "tampered private authority was published to the customer namespace",
         )
     }
     .await;
@@ -1244,131 +2460,112 @@ async fn expired_terminal_reduction_has_one_reclaim_winner_and_fences_old_epoch(
 }
 
 #[tokio::test]
-async fn nonzero_rating_posts_one_balanced_customer_transaction() -> TestResult {
+async fn expired_reduction_lease_cannot_complete_after_reclaim() -> TestResult {
     let Some(database) = TestDatabase::new().await? else {
         return Ok(());
     };
     let result = async {
-        let work = seed_lease(&database.pool, "ledger-worker", 1).await?;
+        let work = seed_codex_generation_lease(&database.pool, "stale-terminal-worker").await?;
         let executor = PostgresExecutorSubmissionStore::new(database.pool.clone());
-        let (artifacts, _artifact_root) = artifact_publisher(&executor)?;
+        let (executor_artifacts, artifact_root) = artifact_publisher(&executor)?;
         let prepared = executor
             .prepare_and_handoff(&work, profile_id_for_lease(&work))
             .await
             .map_err(debug_error)?;
         seed_price_hold(&database.pool, &prepared[0], 7).await?;
-        let lease = claim_required(&executor, "ledger-executor").await?;
-        executor.start(&lease).await.map_err(debug_error)?;
-        let manifest = publish_result_authority(&artifacts, &lease).await?;
-        executor
-            .record_outcome(&lease, &ExecutorSubmissionOutcome::Succeeded(manifest))
+        seed_terminal_quota(&database.pool, &work).await?;
+        let scope = ExecutorClaimScope {
+            execution_profile_id: CODEX_PROFILE_ID,
+            provider_id: "openai-codex".to_string(),
+            command_schema: GENERATION_COMMAND_SCHEMA.to_string(),
+            adapter_revision: CODEX_GENERATION_ADAPTER_REVISION.to_string(),
+        };
+        let executor_lease = executor
+            .claim_prepared(&scope, "stale-terminal-executor", 60_000)
             .await
-            .map_err(debug_error)?;
-
-        let settlement = PostgresEconomicSettlementStore::new(database.pool.clone())
-            .settle(
-                &EconomicReceipt::new(
-                    lease.submission_id,
-                    EconomicReceiptOutcome::Succeeded,
-                    "provider.receipt.v1",
-                    json!({"provider_request_id": "provider-paid"}),
-                )
-                .map_err(debug_error)?,
-            )
-            .await
-            .map_err(debug_error)?;
-        require(
-            settlement.customer_ledger_transaction_id.is_some(),
-            "nonzero customer charge omitted the ledger transaction",
-        )?;
-        let state: (i64, i64, i64, i64, i64) = sqlx::query_as(
-            r#"
-            SELECT a.held_micros, a.captured_micros, r.amount_micros,
-                   COUNT(p.posting_no)::BIGINT,
-                   COALESCE(SUM(p.amount_micros::NUMERIC), 0)::BIGINT
-            FROM billing_accounts a
-            JOIN rated_usage r ON r.output_id = $1
-            JOIN ledger_transactions t ON t.source_output_id = $1
-              AND t.transaction_type = 'customer_charge'
-            JOIN ledger_postings p ON p.transaction_id = t.transaction_id
-            WHERE a.tenant_id = $2 AND a.currency = 'USD'
-            GROUP BY a.held_micros, a.captured_micros, r.amount_micros
-            "#,
-        )
-        .bind(lease.output_id)
-        .bind(&lease.tenant_id)
-        .fetch_one(&database.pool)
-        .await
-        .map_err(debug_error)?;
-        require(
-            state == (0, 7, 7, 2, 0),
-            format!("customer ledger is not exactly balanced: {state:?}"),
-        )
-    }
-    .await;
-    combine(result, database.cleanup().await)
-}
-
-#[tokio::test]
-async fn uncertain_provider_outcome_keeps_the_full_monetary_hold() -> TestResult {
-    let Some(database) = TestDatabase::new().await? else {
-        return Ok(());
-    };
-    let result = async {
-        let work = seed_lease(&database.pool, "uncertain-economic-worker", 1).await?;
-        let executor = PostgresExecutorSubmissionStore::new(database.pool.clone());
-        let prepared = executor
-            .prepare_and_handoff(&work, profile_id_for_lease(&work))
-            .await
-            .map_err(debug_error)?;
-        seed_price_hold(&database.pool, &prepared[0], 7).await?;
-        let lease = claim_required(&executor, "uncertain-economic-executor").await?;
-        executor.start(&lease).await.map_err(debug_error)?;
+            .map_err(debug_error)?
+            .ok_or_else(|| "stale terminal executor claim returned none".to_string())?;
+        executor.start(&executor_lease).await.map_err(debug_error)?;
+        let manifest = publish_result_authority(&executor_artifacts, &executor_lease).await?;
         executor
             .record_outcome(
-                &lease,
-                &ExecutorSubmissionOutcome::Uncertain {
-                    error_code: "provider_result_unknown".to_string(),
-                },
+                &executor_lease,
+                &ExecutorSubmissionOutcome::Succeeded(manifest),
             )
             .await
             .map_err(debug_error)?;
 
-        let settlement = PostgresEconomicSettlementStore::new(database.pool.clone())
-            .settle(
-                &EconomicReceipt::new(
-                    lease.submission_id,
-                    EconomicReceiptOutcome::Uncertain,
-                    "provider.receipt.v1",
-                    json!({"reason": "provider_result_unknown"}),
-                )
-                .map_err(debug_error)?,
-            )
+        let reductions = PostgresExecutorTerminalStore::new(database.pool.clone());
+        let expired = reductions
+            .claim_terminal("stale-terminal-reducer", 25)
             .await
-            .map_err(debug_error)?;
+            .map_err(debug_error)?
+            .ok_or_else(|| "stale terminal reduction was not queued".to_string())?;
+        let publisher = CustomerArtifactPublisher::new(Arc::new(
+            FilesystemArtifactBlobStore::new(artifact_root.path()).map_err(debug_error)?,
+        ));
+        let first_artifact = publisher.publish(&expired).await.map_err(debug_error)?;
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        let reclaimed = reductions
+            .claim_terminal("reclaimed-terminal-reducer", 60_000)
+            .await
+            .map_err(debug_error)?
+            .ok_or_else(|| "expired terminal reduction was not reclaimed".to_string())?;
         require(
-            settlement.rated_usage_id.is_none()
-                && settlement.customer_ledger_transaction_id.is_none(),
-            "uncertain output was charged",
+            reclaimed.reducer_lease_epoch == expired.reducer_lease_epoch + 1,
+            "terminal reclaim did not advance its epoch",
         )?;
-        let state: (String, String, i64, i64, i64, i64) = sqlx::query_as(
+        require(
+            reductions
+                .complete_terminal(&expired, Some(&first_artifact))
+                .await
+                == Err(ExecutorTerminalError::StaleLease),
+            "expired terminal lease completed after reclaim",
+        )?;
+        let untouched: (String, i64, i64, i64, i32) = sqlx::query_as(
             r#"
-            SELECT o.state, h.state, a.held_micros, a.captured_micros,
-                   (SELECT COUNT(*) FROM rated_usage WHERE output_id = $1),
-                   (SELECT COUNT(*) FROM ledger_transactions WHERE source_output_id = $1)
-            FROM job_outputs o
-            JOIN output_holds h ON h.output_id = o.output_id
-            JOIN billing_accounts a ON a.tenant_id = h.tenant_id AND a.currency = h.currency
-            WHERE o.output_id = $1
+            SELECT reduction.state,
+                   (SELECT COUNT(*) FROM provider_receipts WHERE submission_id = $1),
+                   (SELECT COUNT(*) FROM artifacts WHERE artifact_id = $2),
+                   (SELECT COUNT(*) FROM rated_usage WHERE output_id = $2),
+                   quota.committed_units
+            FROM executor_terminal_reductions reduction
+            JOIN jobs job ON job.job_id = $3
+            JOIN quota_reservations quota ON quota.reservation_id = job.reservation_id
+            WHERE reduction.submission_id = $1
             "#,
         )
-        .bind(lease.output_id)
+        .bind(expired.submission_id)
+        .bind(expired.output_id)
+        .bind(expired.job_id)
         .fetch_one(&database.pool)
         .await
         .map_err(debug_error)?;
         require(
-            state == ("uncertain".to_string(), "held".to_string(), 7, 0, 0, 0),
-            format!("uncertain output changed its monetary hold: {state:?}"),
+            untouched == ("leased".to_string(), 0, 0, 0, 0),
+            format!("stale completion leaked durable effects: {untouched:?}"),
+        )?;
+        let reclaimed_artifact = publisher.publish(&reclaimed).await.map_err(debug_error)?;
+        require(
+            reclaimed_artifact == first_artifact,
+            "reclaimed reducer did not reuse the deterministic customer artifact",
+        )?;
+        let completion = reductions
+            .complete_terminal(&reclaimed, Some(&reclaimed_artifact))
+            .await
+            .map_err(debug_error)?;
+        require(
+            completion.parent_state == ExecutorParentTerminalState::Succeeded,
+            "reclaimed terminal lease did not complete",
+        )?;
+        let mut forged = reclaimed.clone();
+        forged.reducer_owner = "forged-terminal-reducer".to_string();
+        require(
+            reductions
+                .complete_terminal(&forged, Some(&reclaimed_artifact))
+                .await
+                == Err(ExecutorTerminalError::StaleLease),
+            "completed terminal replay accepted a forged reducer owner",
         )
     }
     .await;
@@ -2364,7 +3561,6 @@ async fn record_outcome_persists_evidence_without_settling_customer_output() -> 
         )?;
 
         let successful_manifest = publish_result_authority(&artifacts, &claims[0]).await?;
-        deactivate_work(&database.pool, &lease, "uncertain").await?;
         let outcomes = [
             ExecutorSubmissionOutcome::Succeeded(successful_manifest),
             ExecutorSubmissionOutcome::Failed {
@@ -2594,47 +3790,42 @@ async fn record_outcome_rolls_back_evidence_projection_and_capacity_on_projectio
 }
 
 #[tokio::test]
-async fn expired_unstarted_execution_is_canceled_after_work_becomes_terminal() -> TestResult {
+async fn v2_parent_cannot_terminal_before_output_reductions() -> TestResult {
     let Some(database) = TestDatabase::new().await? else {
         return Ok(());
     };
     let result = async {
-        let lease = seed_lease(&database.pool, "abandoned-worker", 1).await?;
+        let lease = seed_lease(&database.pool, "early-terminal-worker", 1).await?;
         let store = PostgresExecutorSubmissionStore::new(database.pool.clone());
         store
             .prepare_and_handoff(&lease, profile_id_for_lease(&lease))
             .await
             .map_err(debug_error)?;
-        let claim = claim_required_for(&store, "abandoned-executor", 25).await?;
-        deactivate_work(&database.pool, &lease, "uncertain").await?;
+        let claim = claim_required_for(&store, "early-terminal-executor", 25).await?;
+        require(
+            deactivate_work(&database.pool, &lease, "uncertain")
+                .await
+                .is_err(),
+            "V2 parent terminalized before its output reductions",
+        )?;
         tokio::time::sleep(Duration::from_millis(40)).await;
-
+        let reclaimed =
+            claim_required_for(&store, "reclaimed-early-terminal-executor", 60_000).await?;
         require(
-            sqlx::query(
-                r#"
-                UPDATE executor_executions
-                SET lease_expires_at_ms =
-                  floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT + 60000
-                WHERE executor_execution_id = $1
-                "#,
-            )
-            .bind(claim.executor_execution_id)
-            .execute(&database.pool)
-            .await
-            .is_err(),
-            "expired leased executor fence was revived",
+            reclaimed.executor_execution_id == claim.executor_execution_id
+                && reclaimed.executor_lease_epoch == claim.executor_lease_epoch + 1,
+            "rejected early parent terminal prevented normal executor reclaim",
         )?;
-
-        require(
-            store.reconcile_expired(100).await.map_err(debug_error)? == 1,
-            "abandoned executor lease was not reconciled",
-        )?;
-        let states: (String, String, String, Option<String>) = sqlx::query_as(
+        let states: (String, String, String, String, String, i64) = sqlx::query_as(
             r#"
-            SELECT s.state, e.state, o.state, s.error_code
+            SELECT s.state, e.state, o.state, work.state, attempt.state,
+                   (SELECT COUNT(*) FROM executor_terminal_reductions
+                    WHERE submission_id = s.submission_id)
             FROM provider_submissions s
             JOIN executor_executions e USING (executor_execution_id)
             JOIN job_outputs o ON o.output_id = s.output_id
+            JOIN work_items work ON work.work_item_id = s.work_item_id
+            JOIN job_attempts attempt ON attempt.execution_id = work.execution_id
             WHERE s.submission_id = $1
             "#,
         )
@@ -2645,12 +3836,14 @@ async fn expired_unstarted_execution_is_canceled_after_work_becomes_terminal() -
         require(
             states
                 == (
-                    "canceled".into(),
-                    "canceled".into(),
+                    "prepared".into(),
+                    "leased".into(),
                     "pending".into(),
-                    Some("executor_start_abandoned".into()),
+                    "awaiting_executor".into(),
+                    "handed_off".into(),
+                    0,
                 ),
-            format!("unexpected abandoned states: {states:?}"),
+            format!("rejected early terminal changed canonical states: {states:?}"),
         )?;
         let allocation: (String, i32) = sqlx::query_as(
             r#"
@@ -2667,8 +3860,8 @@ async fn expired_unstarted_execution_is_canceled_after_work_becomes_terminal() -
         .await
         .map_err(debug_error)?;
         require(
-            allocation == ("released".to_string(), 0),
-            format!("abandoned start did not release capacity: {allocation:?}"),
+            allocation == ("held".to_string(), 1),
+            format!("executor reclaim changed capacity ownership: {allocation:?}"),
         )
     }
     .await;
@@ -3587,6 +4780,159 @@ async fn seed_price_hold(
     Ok(())
 }
 
+async fn seed_terminal_economics(
+    pool: &PgPool,
+    submissions: &[gpt_image_2_gateway::PreparedExecutorSubmission],
+    success_micros: i64,
+    failed_micros: i64,
+    no_effect_micros: i64,
+) -> TestResult {
+    let first = submissions
+        .first()
+        .ok_or_else(|| "terminal economics requires at least one output".to_string())?;
+    require(
+        submissions.iter().all(|submission| {
+            submission.job_id == first.job_id
+                && submission.tenant_id == first.tenant_id
+                && submission.provider_id == first.provider_id
+                && submission.model == first.model
+        }),
+        "terminal economics outputs do not share one immutable job identity",
+    )?;
+    let output_count = i32::try_from(submissions.len())
+        .map_err(|_| "terminal economics output count exceeds i32".to_string())?;
+    let held_per_output = success_micros.max(failed_micros).max(no_effect_micros);
+    let max_total_micros = held_per_output
+        .checked_mul(i64::from(output_count))
+        .ok_or_else(|| "terminal economics hold overflowed".to_string())?;
+    let now = database_now(pool).await?;
+    let quote_id = Uuid::new_v4();
+    let price_version_id = Uuid::new_v4();
+    let mut tx = pool.begin().await.map_err(debug_error)?;
+    sqlx::query(
+        r#"
+        INSERT INTO price_versions
+          (price_version_id, price_key, version, api_profile, operation, provider_id, model,
+           currency, success_micros, failed_micros, no_effect_micros, state,
+           created_at_ms, updated_at_ms)
+        VALUES ($1, $2, 1, 'test', 'generation', $3, $4,
+                'USD', $5, $6, $7, 'retired', $8, $8)
+        "#,
+    )
+    .bind(price_version_id)
+    .bind(format!("test-price-{price_version_id}"))
+    .bind(&first.provider_id)
+    .bind(&first.model)
+    .bind(success_micros)
+    .bind(failed_micros)
+    .bind(no_effect_micros)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .map_err(debug_error)?;
+    sqlx::query(
+        r#"
+        INSERT INTO billing_accounts
+          (tenant_id, currency, credit_limit_micros, held_micros, captured_micros,
+           created_at_ms, updated_at_ms)
+        VALUES ($1, 'USD', $2, $2, 0, $3, $3)
+        "#,
+    )
+    .bind(&first.tenant_id)
+    .bind(max_total_micros)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .map_err(debug_error)?;
+    sqlx::query(
+        r#"
+        INSERT INTO price_quotes
+          (quote_id, job_id, price_version_id, currency, output_count,
+           success_micros, failed_micros, no_effect_micros, max_total_micros,
+           quote_hash, created_at_ms)
+        VALUES ($1, $2, $3, 'USD', $4, $5, $6, $7, $8, $9, $10)
+        "#,
+    )
+    .bind(quote_id)
+    .bind(first.job_id)
+    .bind(price_version_id)
+    .bind(output_count)
+    .bind(success_micros)
+    .bind(failed_micros)
+    .bind(no_effect_micros)
+    .bind(max_total_micros)
+    .bind(hex::encode(Sha256::digest(quote_id.as_bytes())))
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .map_err(debug_error)?;
+    for submission in submissions {
+        sqlx::query(
+            r#"
+            INSERT INTO output_holds
+              (output_id, job_id, quote_id, tenant_id, currency, held_micros,
+               state, created_at_ms, updated_at_ms)
+            VALUES ($1, $2, $3, $4, 'USD', $5, 'held', $6, $6)
+            "#,
+        )
+        .bind(submission.output_id)
+        .bind(first.job_id)
+        .bind(quote_id)
+        .bind(&first.tenant_id)
+        .bind(held_per_output)
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .map_err(debug_error)?;
+    }
+    tx.commit().await.map_err(debug_error)
+}
+
+async fn seed_terminal_quota(pool: &PgPool, work: &WorkLease) -> TestResult {
+    let (tenant_id, request_id, requested_units): (String, String, i32) =
+        sqlx::query_as("SELECT tenant_id, request_id, requested_units FROM jobs WHERE job_id = $1")
+            .bind(work.job_id)
+            .fetch_one(pool)
+            .await
+            .map_err(debug_error)?;
+    let reservation_id = Uuid::new_v4();
+    let now = database_now(pool).await?;
+    let mut tx = pool.begin().await.map_err(debug_error)?;
+    sqlx::query(
+        r#"
+        INSERT INTO quota_reservations
+          (reservation_id, tenant_id, request_id, job_id, requested_units,
+           committed_units, started_units, released_units, state,
+           created_at_ms, updated_at_ms, expires_at_ms,
+           limit_5h, remaining_5h, limit_7d, remaining_7d)
+        VALUES ($1, $2, $3, $4, $5, 0, 0, 0, 'reserved',
+                $6, $6, $7, 100, 99, 1000, 999)
+        "#,
+    )
+    .bind(reservation_id)
+    .bind(&tenant_id)
+    .bind(&request_id)
+    .bind(work.job_id)
+    .bind(requested_units)
+    .bind(now)
+    .bind(now + 300_000)
+    .execute(&mut *tx)
+    .await
+    .map_err(debug_error)?;
+    let changed = sqlx::query(
+        "UPDATE jobs SET reservation_id = $2, state = 'running', updated_at_ms = $3 WHERE job_id = $1",
+    )
+    .bind(work.job_id)
+    .bind(reservation_id)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .map_err(debug_error)?
+    .rows_affected();
+    require(changed == 1, "terminal quota did not bind its job")?;
+    tx.commit().await.map_err(debug_error)
+}
+
 async fn seed_lease(pool: &PgPool, worker_id: &str, requested_units: i32) -> TestResult<WorkLease> {
     let job_id = Uuid::new_v4();
     let work_item_id = Uuid::new_v4();
@@ -3711,6 +5057,17 @@ async fn seed_lease(pool: &PgPool, worker_id: &str, requested_units: i32) -> Tes
 }
 
 async fn seed_codex_generation_lease(pool: &PgPool, worker_id: &str) -> TestResult<WorkLease> {
+    seed_codex_generation_lease_with_outputs(pool, worker_id, 1).await
+}
+
+async fn seed_codex_generation_lease_with_outputs(
+    pool: &PgPool,
+    worker_id: &str,
+    output_count: u32,
+) -> TestResult<WorkLease> {
+    let requested_units =
+        i32::try_from(output_count).map_err(|_| "codex output count exceeds i32".to_string())?;
+    require(requested_units > 0, "codex output count must be positive")?;
     let job_id = Uuid::new_v4();
     let work_item_id = Uuid::new_v4();
     let execution_id = Uuid::new_v4();
@@ -3721,7 +5078,7 @@ async fn seed_codex_generation_lease(pool: &PgPool, worker_id: &str) -> TestResu
         model: "gpt-image-2".to_string(),
         prompt: "draw a process-smoke lighthouse".to_string(),
         moderation: "auto".to_string(),
-        n: 1,
+        n: output_count,
         size: "1024x1024".to_string(),
         quality: "high".to_string(),
         output_format: "png".to_string(),
@@ -3741,28 +5098,32 @@ async fn seed_codex_generation_lease(pool: &PgPool, worker_id: &str) -> TestResu
           (job_id, tenant_id, request_id, operation, provider_id, model, state,
            requested_units, economics_contract_version, created_at_ms, updated_at_ms)
         VALUES ($1, 'executord-process-smoke', $2, 'generation', 'openai-codex',
-                'gpt-image-2', 'reserved', 1, 2, $3, $3)
+                'gpt-image-2', 'reserved', $3, 2, $4, $4)
         "#,
     )
     .bind(job_id)
     .bind(&request_id)
+    .bind(requested_units)
     .bind(now)
     .execute(pool)
     .await
     .map_err(debug_error)?;
-    sqlx::query(
-        r#"
-        INSERT INTO job_outputs
-          (output_id, job_id, output_index, state, created_at_ms, updated_at_ms)
-        VALUES ($1, $2, 0, 'pending', $3, $3)
-        "#,
-    )
-    .bind(Uuid::new_v4())
-    .bind(job_id)
-    .bind(now)
-    .execute(pool)
-    .await
-    .map_err(debug_error)?;
+    for output_index in 0..requested_units {
+        sqlx::query(
+            r#"
+            INSERT INTO job_outputs
+              (output_id, job_id, output_index, state, created_at_ms, updated_at_ms)
+            VALUES ($1, $2, $3, 'pending', $4, $4)
+            "#,
+        )
+        .bind(Uuid::new_v4())
+        .bind(job_id)
+        .bind(output_index)
+        .bind(now)
+        .execute(pool)
+        .await
+        .map_err(debug_error)?;
+    }
     sqlx::query(
         r#"
         INSERT INTO admission_sessions
@@ -3794,6 +5155,23 @@ async fn seed_codex_generation_lease(pool: &PgPool, worker_id: &str) -> TestResu
     .bind(GENERATION_COMMAND_SCHEMA)
     .bind(&command_json)
     .bind(&request_hash)
+    .bind(now)
+    .execute(pool)
+    .await
+    .map_err(debug_error)?;
+    sqlx::query(
+        r#"
+        INSERT INTO idempotency_requests
+          (project_id, api_profile, operation, key_digest, tenant_id,
+           request_hash, session_id, job_id, state, created_at_ms, updated_at_ms)
+        VALUES ('project-test', 'openai-images-v1', 'generation', $1,
+                'executord-process-smoke', $2, $3, $4, 'accepted', $5, $5)
+        "#,
+    )
+    .bind(sha256(request_id.as_bytes()))
+    .bind(&request_hash)
+    .bind(admission_session_id)
+    .bind(job_id)
     .bind(now)
     .execute(pool)
     .await

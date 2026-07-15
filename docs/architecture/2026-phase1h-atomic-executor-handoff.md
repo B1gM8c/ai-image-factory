@@ -104,8 +104,8 @@ after ownership has already moved to the wrong runtime.
 
 ## 6. Remaining Boundary
 
-Executor terminal evidence now enters a canonical leased reduction queue through
-migration 0015. The next slice must publish the private executor artifact into a
-deterministic customer namespace and atomically reduce output economics plus
-parent work, job, idempotency, and outbox projections. Public V2 routing stays
-disabled until that reducer and the fake plus credentialed Codex API smokes pass.
+Executor terminal evidence enters the migration 0015 queue. Migration 0016 and
+the terminal completion store now atomically close customer artifact, receipt,
+economics, quota, parent, response, event, and outbox projections. Public V2
+routing stays disabled until a standalone reducerd drives this kernel and the
+fake plus credentialed Codex API process smokes pass.

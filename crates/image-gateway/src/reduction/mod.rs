@@ -1,8 +1,12 @@
 use async_trait::async_trait;
 use uuid::Uuid;
 
+use crate::artifacts::ArtifactMetadata;
+
+mod artifacts;
 mod postgres;
 
+pub use artifacts::{CustomerArtifactPublishError, CustomerArtifactPublisher};
 pub use postgres::PostgresExecutorTerminalStore;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -42,6 +46,21 @@ pub struct ExecutorTerminalLease {
     pub outcome: CanonicalExecutorOutcome,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExecutorParentTerminalState {
+    Pending,
+    Succeeded,
+    Failed,
+    Uncertain,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExecutorTerminalCompletion {
+    pub receipt_id: Uuid,
+    pub customer_artifact_id: Option<Uuid>,
+    pub parent_state: ExecutorParentTerminalState,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum ExecutorTerminalError {
     #[error("executor terminal reduction storage is unavailable")]
@@ -67,4 +86,10 @@ pub trait ExecutorTerminalStore: Send + Sync + 'static {
         lease: &ExecutorTerminalLease,
         lease_ms: i64,
     ) -> Result<ExecutorTerminalLease, ExecutorTerminalError>;
+
+    async fn complete_terminal(
+        &self,
+        lease: &ExecutorTerminalLease,
+        customer_artifact: Option<&ArtifactMetadata>,
+    ) -> Result<ExecutorTerminalCompletion, ExecutorTerminalError>;
 }

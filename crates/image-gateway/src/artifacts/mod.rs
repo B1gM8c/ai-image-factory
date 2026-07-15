@@ -9,6 +9,7 @@ mod executor;
 mod filesystem;
 mod memory;
 
+pub(crate) use executor::media_type_from_bytes;
 pub use executor::{ExecutorArtifactPublishError, ExecutorArtifactPublisher};
 pub use filesystem::FilesystemArtifactBlobStore;
 pub use memory::InMemoryArtifactBlobStore;
@@ -162,4 +163,18 @@ pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
 pub(crate) fn executor_object_key(artifact_id: Uuid) -> String {
     let artifact_id = artifact_id.simple().to_string();
     format!("executor-objects/{}/{}", &artifact_id[..2], artifact_id)
+}
+
+pub(crate) fn customer_object_key(artifact_id: Uuid) -> String {
+    let artifact_id = artifact_id.simple().to_string();
+    format!("objects/{}/{}", &artifact_id[..2], artifact_id)
+}
+
+pub(crate) struct ExecutorArtifactReference<'a> {
+    pub authority_id: Uuid,
+    pub storage_backend: &'a str,
+    pub storage_namespace: &'a str,
+    pub object_key: &'a str,
+    pub sha256_hex: &'a str,
+    pub byte_size: u64,
 }

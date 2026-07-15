@@ -650,30 +650,31 @@ impl ExecutorSubmissionStore for PostgresExecutorSubmissionStore {
             .lease_epoch
             .checked_add(1)
             .ok_or(ExecutorSubmissionError::Unavailable)?;
-        let executor_lease_expires_at_ms = now + lease_ms;
-        let changed = sqlx::query(
+        let executor_lease_expires_at_ms: i64 = sqlx::query_scalar(
             r#"
+            WITH claim_clock AS (
+              SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT AS now_ms
+            )
             UPDATE executor_executions
             SET state = 'leased', executor_owner = $2, lease_epoch = $3,
-                lease_expires_at_ms = $4, leased_at_ms = $5, updated_at_ms = $5
-            WHERE executor_execution_id = $1 AND submission_id = $6
+                lease_expires_at_ms = claim_clock.now_ms + $4,
+                leased_at_ms = claim_clock.now_ms, updated_at_ms = claim_clock.now_ms
+            FROM claim_clock
+            WHERE executor_execution_id = $1 AND submission_id = $5
               AND (state = 'prepared'
-                OR (state = 'leased' AND lease_expires_at_ms <= $5))
+                OR (state = 'leased' AND lease_expires_at_ms <= claim_clock.now_ms))
+            RETURNING executor_executions.lease_expires_at_ms
             "#,
         )
         .bind(row.executor_execution_id)
         .bind(owner)
         .bind(executor_lease_epoch)
-        .bind(executor_lease_expires_at_ms)
-        .bind(now)
+        .bind(lease_ms)
         .bind(row.submission_id)
-        .execute(&mut *tx)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(unavailable)?
-        .rows_affected();
-        if changed != 1 {
-            return Err(ExecutorSubmissionError::Unavailable);
-        }
+        .ok_or(ExecutorSubmissionError::Unavailable)?;
         tx.commit().await.map_err(unavailable)?;
         Ok(Some(ExecutorSubmissionLease {
             submission_id: row.submission_id,
