@@ -39,16 +39,17 @@ pub use execution::{
     PersistedEditInput, PostgresExecutionContextStore,
 };
 pub use executor::{
-    CODEX_GENERATION_ADAPTER_REVISION, CodexOutputRequest, CodexProcessSupervisor,
-    CodexRequestProjectionError, DurableEvidenceRecovery, DurableRunnerResult,
-    ExecutorArtifactSink, ExecutorClaimScope, ExecutorEvidenceStore, ExecutorExecutionProfile,
-    ExecutorExecutionProfileStore, ExecutorHandoffStore, ExecutorLaunchContext,
-    ExecutorLaunchContextStore, ExecutorOwnerGuardError, ExecutorResultManifest,
-    ExecutorRunnerObservation, ExecutorSubmissionError, ExecutorSubmissionLease,
-    ExecutorSubmissionOutcome, ExecutorSubmissionStore, JournaledDurableRunner,
-    PostgresExecutorOwnerGuard, PostgresExecutorSubmissionStore, PreparedExecutorSubmission,
-    RunnerLaunchAuthority, SingleOutputSupervisor, project_codex_output_request,
-    run_codex_runner_child,
+    CODEX_GENERATION_ADAPTER_REVISION, CodexExecutionProfileProvisioning, CodexOutputRequest,
+    CodexProcessSupervisor, CodexProfileProvisioningError, CodexRequestProjectionError,
+    DurableEvidenceRecovery, DurableRunnerResult, ExecutorArtifactSink, ExecutorClaimScope,
+    ExecutorEvidenceStore, ExecutorExecutionProfile, ExecutorExecutionProfileStore,
+    ExecutorHandoffStore, ExecutorLaunchContext, ExecutorLaunchContextStore,
+    ExecutorOwnerGuardError, ExecutorResultManifest, ExecutorRunnerObservation,
+    ExecutorSubmissionError, ExecutorSubmissionLease, ExecutorSubmissionOutcome,
+    ExecutorSubmissionStore, JournaledDurableRunner, PostgresExecutorOwnerGuard,
+    PostgresExecutorSubmissionStore, PreparedExecutorSubmission, ProvisionedCodexExecutionProfile,
+    RunnerLaunchAuthority, SingleOutputSupervisor, codex_auth_file_sha256,
+    project_codex_output_request, provision_codex_execution_profile, run_codex_runner_child,
 };
 pub use generator::{
     CodexImageGenerator, EditJob, GeneratedImage, GenerationJob, ImageGenerator, InputImage,

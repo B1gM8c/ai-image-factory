@@ -1,8 +1,8 @@
 # Phase 1I: Canonical Terminal Reduction
 
 Status: the canonical terminal queue, customer artifact publication, output
-economics, quota slices, and parent aggregation are implemented. The standalone
-reducer daemon and public Images V2 routing remain disabled.
+economics, quota slices, parent aggregation, and standalone reducer daemon are
+implemented. Public Images V2 routing remains disabled.
 
 ## 1. Authority Boundary
 
@@ -124,13 +124,20 @@ proving provider no-effect.
 - Expired reducer leases and forged replay owners are fenced.
 - Standalone V2 economics cannot create a receipt before reducer completion.
 - Fresh and concurrent migrations apply through version 16.
-- `cargo test --workspace --all-targets` passes 356 tests with one credentialed
+- `reducerd` fake-store tests prove success publication ordering, failure
+  completion without artifacts, heartbeat lease-loss cancellation, transient
+  iteration retry, bounded drain, and fail-closed drain timeout.
+- Codex profile provisioning is exact-replay idempotent, serializes concurrent
+  writers, preserves disabled identities as kill switches, and rolls back all
+  dependency rows on a late profile conflict.
+- `cargo test --workspace --all-targets` passes 372 tests with one credentialed
   Codex smoke intentionally ignored; workspace clippy passes with warnings
   denied.
 
 ## 7. Activation Gate
 
-The internal reducer kernel does not make V2 externally available. The gateway
-must continue admitting public traffic as LegacyV1 until a standalone reducerd
-drives claim, publication, heartbeat, and completion; the public API selects V2;
-and fake plus credentialed Codex API tests prove the complete process topology.
+The reducer kernel and standalone `reducerd` do not make V2 externally
+available. The gateway must continue admitting public traffic as LegacyV1 until
+the public generation API explicitly selects V2 and fake plus credentialed
+Codex API tests prove the complete process topology. Edits remain LegacyV1, so
+activation requires separate Legacy and executor-handoff workerd pools.

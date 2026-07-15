@@ -4,9 +4,11 @@ use uuid::Uuid;
 use crate::artifacts::ArtifactMetadata;
 
 mod artifacts;
+mod daemon;
 mod postgres;
 
 pub use artifacts::{CustomerArtifactPublishError, CustomerArtifactPublisher};
+pub use daemon::{ReducerDaemon, ReducerDaemonError, ReducerDaemonRun, TerminalArtifactPublisher};
 pub use postgres::PostgresExecutorTerminalStore;
 
 #[derive(Clone, Debug, Eq, PartialEq)]

@@ -9,17 +9,23 @@ mod codex_supervisor;
 mod daemon;
 mod owner_guard;
 mod postgres;
+mod provisioning;
 mod runner;
 
 pub use codex_request::{
     CodexOutputRequest, CodexRequestProjectionError, project_codex_output_request,
 };
 pub use codex_supervisor::{
-    CODEX_GENERATION_ADAPTER_REVISION, CodexProcessSupervisor, run_codex_runner_child,
+    CODEX_GENERATION_ADAPTER_REVISION, CodexProcessSupervisor, codex_auth_file_sha256,
+    run_codex_runner_child,
 };
 pub use daemon::{ExecutorDaemon, ExecutorDaemonError, ExecutorDaemonRun};
 pub use owner_guard::{ExecutorOwnerGuardError, PostgresExecutorOwnerGuard};
 pub use postgres::PostgresExecutorSubmissionStore;
+pub use provisioning::{
+    CodexExecutionProfileProvisioning, CodexProfileProvisioningError,
+    ProvisionedCodexExecutionProfile, provision_codex_execution_profile,
+};
 pub use runner::{
     DurableEvidenceRecovery, DurableRunner, DurableRunnerResult, ExecutorArtifactSink,
     JournaledDurableRunner, RunnerError, RunnerLaunchAuthority, RunnerOutcome,

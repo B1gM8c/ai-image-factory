@@ -12,7 +12,7 @@ Midjourney, JiMeng CLI, and Grok CLI without changing the public Images API.
 apps/
   admin-console/      Next.js + React + shadcn-style operations console
 crates/
-  image-gateway/      Rust gateway plus workerd/executord/reconcilerd binaries
+  image-gateway/      Rust gateway plus workerd/executord/reducerd/reconcilerd binaries
   provider-contracts/ Shared media/provider/job contracts and roadmap slots
   scheduler-policy/  Provider-neutral weighted scheduling policy
 docs/
@@ -33,6 +33,7 @@ cargo test --workspace
 cargo run -p gpt-image-2-gateway
 cargo run -p gpt-image-2-gateway --bin workerd
 cargo run -p gpt-image-2-gateway --bin executord
+cargo run -p gpt-image-2-gateway --bin reducerd
 cargo run -p gpt-image-2-gateway --bin reconcilerd
 npm install
 npm run typecheck:admin

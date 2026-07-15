@@ -186,6 +186,21 @@ impl CodexProcessSupervisor {
     }
 }
 
+pub fn codex_auth_file_sha256(
+    credential_home: impl AsRef<Path>,
+) -> Result<String, ImageGatewayError> {
+    let credential_home = credential_home.as_ref();
+    if !credential_home.is_absolute() {
+        return Err(ImageGatewayError::config(
+            "EXECUTOR_CODEX_CREDENTIAL_HOME must be absolute",
+        ));
+    }
+    let bytes = read_private_auth(&credential_home.join(AUTH_FILE)).map_err(|_| {
+        ImageGatewayError::config("EXECUTOR_CODEX_CREDENTIAL_HOME/auth.json is invalid")
+    })?;
+    Ok(sha256(&bytes))
+}
+
 #[async_trait]
 impl SingleOutputSupervisor for CodexProcessSupervisor {
     async fn prepare(
@@ -710,7 +725,7 @@ fn configure_process_group(command: &mut Command) {
 
 #[cfg(test)]
 mod tests {
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{PermissionsExt, symlink};
 
     use tempfile::TempDir;
 
@@ -736,6 +751,64 @@ mod tests {
         ] {
             assert!(!names.iter().any(|name| name == forbidden));
         }
+    }
+
+    #[test]
+    fn auth_digest_uses_the_same_private_file_contract_as_runtime() {
+        let temp = TempDir::new().unwrap();
+        let auth = temp.path().join(AUTH_FILE);
+        fs::write(&auth, b"{\"tokens\":{}}").unwrap();
+        fs::set_permissions(&auth, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            codex_auth_file_sha256(temp.path()).unwrap(),
+            sha256(b"{\"tokens\":{}}")
+        );
+
+        fs::set_permissions(&auth, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(codex_auth_file_sha256(temp.path()).is_err());
+    }
+
+    #[test]
+    fn auth_digest_is_bound_to_exact_bytes_and_rejects_file_aliases() {
+        let first = TempDir::new().unwrap();
+        let first_auth = first.path().join(AUTH_FILE);
+        fs::write(&first_auth, b"{}\n").unwrap();
+        fs::set_permissions(&first_auth, fs::Permissions::from_mode(0o600)).unwrap();
+        let first_digest = codex_auth_file_sha256(first.path()).unwrap();
+
+        let second = TempDir::new().unwrap();
+        let second_auth = second.path().join(AUTH_FILE);
+        fs::write(&second_auth, b"{}").unwrap();
+        fs::set_permissions(&second_auth, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_ne!(first_digest, codex_auth_file_sha256(second.path()).unwrap());
+
+        let hardlink = second.path().join("auth-hardlink.json");
+        fs::hard_link(&second_auth, hardlink).unwrap();
+        assert!(codex_auth_file_sha256(second.path()).is_err());
+
+        let symlinked = TempDir::new().unwrap();
+        let target = symlinked.path().join("target.json");
+        fs::write(&target, b"{}").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+        symlink(&target, symlinked.path().join(AUTH_FILE)).unwrap();
+        assert!(codex_auth_file_sha256(symlinked.path()).is_err());
+    }
+
+    #[test]
+    fn auth_digest_rejects_relative_empty_and_oversized_sources() {
+        assert!(codex_auth_file_sha256(Path::new("relative-home")).is_err());
+
+        let empty = TempDir::new().unwrap();
+        let empty_auth = empty.path().join(AUTH_FILE);
+        fs::write(&empty_auth, []).unwrap();
+        fs::set_permissions(&empty_auth, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(codex_auth_file_sha256(empty.path()).is_err());
+
+        let oversized = TempDir::new().unwrap();
+        let oversized_auth = oversized.path().join(AUTH_FILE);
+        fs::write(&oversized_auth, vec![b'x'; MAX_AUTH_BYTES as usize + 1]).unwrap();
+        fs::set_permissions(&oversized_auth, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(codex_auth_file_sha256(oversized.path()).is_err());
     }
 
     #[tokio::test]

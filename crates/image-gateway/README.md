@@ -49,6 +49,38 @@ cargo run -p gpt-image-2-gateway --bin reconcilerd
 cargo run -p gpt-image-2-gateway --bin gpt-image-2-gateway
 ```
 
+The output-level V2 executor topology is implemented but is not selected by the
+public Images routes yet. Before running its internal workers, provision the
+immutable Codex execution binding from the same private `auth.json` that will be
+mounted into executord:
+
+```bash
+export EXECUTOR_PROFILE_KEY='openai-codex-generation-v1-account-1'
+export EXECUTOR_CREDENTIAL_POOL_KEY='openai-codex-production'
+export EXECUTOR_PROVIDER_ACCOUNT_KEY='account-1-revision-1'
+export EXECUTOR_CREDENTIAL_REF='mounted.openai-codex.account-1.1'
+export EXECUTOR_CREDENTIAL_REVISION='1'
+export EXECUTOR_CODEX_CREDENTIAL_HOME='/srv/codex-credentials/account-1'
+export EXECUTOR_MAX_CONCURRENCY='1'
+cargo run -p gpt-image-2-gateway --bin factoryctl -- provision-codex-profile
+```
+
+Provisioning hashes the exact private `auth.json` bytes and atomically creates
+or verifies the credential pool, account, resource policy, and execution
+profile. Exact enabled replay returns the same identities. A disabled row or
+any credential, revision, adapter, or capacity drift fails closed; this command
+never overrides an operational kill switch.
+
+`workerd` uses `WORKER_EXECUTION_MODE=executor-handoff` and the same
+`EXECUTOR_PROFILE_KEY`; `executord` additionally requires its owner, mounted
+credential identity, runner root, helper executable, and Codex executable.
+`reducerd` uses `REDUCER_OWNER`, `REDUCER_LEASE_MS`,
+`REDUCER_HEARTBEAT_INTERVAL_MS`, and `REDUCER_POLL_INTERVAL_MS`, with safe
+defaults. It verifies and publishes customer artifacts before atomically
+completing receipt, rating, quota, parent state, response projection, and
+outbox. Keep the Legacy workerd running for edits when later enabling
+generation-only V2 traffic.
+
 Default bind address is `127.0.0.1:8787`. Gateway startup requires at least one of `GATEWAY_API_TOKEN` or `GATEWAY_ADMIN_TOKEN`, a versioned API-key pepper keyring, and an explicit absolute, existing `GATEWAY_ARTIFACT_ROOT`; it does not require Codex CLI or `GATEWAY_CODEX_HOME`. Worker startup separately requires an explicit absolute, existing, writable `GATEWAY_CODEX_HOME` plus the shared artifact root. If both tokens are configured, they must be different. `GATEWAY_ADMIN_TOKEN` protects Admin endpoints for creating and revoking project API keys; it never authorizes image calls. An admin-only startup can bootstrap project keys, and image calls must then use one of those keys. `GATEWAY_API_TOKEN` remains a legacy image token and is not accepted on Admin endpoints.
 
 `GATEWAY_API_KEY_PEPPERS` is a comma-separated `version:64-hex` keyring. `GATEWAY_API_KEY_CURRENT_PEPPER_VERSION` selects the version used for new keys. During rotation, keep both versions configured, change the current version, then retire the old version after its keys have been rotated or revoked. Pepper values belong in KMS/secret-manager injection, never in source control.

@@ -254,6 +254,8 @@ Production V2 traffic remains disabled according to this gate matrix:
 | terminal artifact, economics, quota, and parent reduction are atomic | passed | migration 0016, rollback/replay, partial/uncertain, stale lease, and concurrent completion tests |
 | provider process identity and orphan cleanup | passed | nonce/inode binding and real helper-death cleanup test |
 | credential pool, adapter revision, and resource policy are database-bound | passed | migration 0013, exact profile claim scope, journal binding, global capacity race tests |
+| repeatable profile provisioning preserves operator kill switches | passed | `factoryctl provision-codex-profile`, private auth digest, concurrent exact/conflict and rollback tests |
+| standalone terminal reducer lifecycle | passed | `reducerd` claim/heartbeat/publication/completion, transient retry, and bounded drain tests |
 | hostile multi-tenant CLI isolation | open | dedicated UID plus externally enforced sandbox/cgroup/mount/network policy |
-| public Images API traverses the complete V2 path | open | wire gateway to workerd/executord/reducer |
+| public Images API traverses the complete V2 path | open | generation-only default-off route gate plus fake full-process test |
 | credentialed real Codex CLI image generation | open | run official-shape API smoke and verify durable artifact/replay |
