@@ -1674,7 +1674,7 @@ async fn heartbeat_capacity_allocation(
     )
 }
 
-async fn release_capacity_allocation(
+pub(crate) async fn release_capacity_allocation(
     tx: &mut Transaction<'_, Postgres>,
     executor_execution_id: Uuid,
     submission_id: Uuid,

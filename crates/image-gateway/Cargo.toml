@@ -10,6 +10,7 @@ axum = { version = "0.8.9", features = ["multipart", "json"] }
 base64 = "0.22.1"
 hex = "0.4.3"
 hmac = "0.13.0"
+image-cli-runtime = { path = "../cli-runtime" }
 image-provider-contracts = { path = "../provider-contracts" }
 image-scheduler-policy = { path = "../scheduler-policy" }
 image = { version = "0.25.9", default-features = false, features = ["png", "jpeg", "webp"] }

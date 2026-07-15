@@ -1,7 +1,10 @@
 [workspace]
 members = [
+    "crates/cli-runtime",
     "crates/image-gateway",
     "crates/provider-contracts",
+    "crates/provider-sdk",
+    "crates/provider-test-support",
     "crates/scheduler-policy",
 ]
 resolver = "3"

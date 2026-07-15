@@ -9,9 +9,13 @@ use std::{
 };
 
 use async_trait::async_trait;
+use image_cli_runtime::{
+    CliPolicy, CliRuntime, CommandSpec, CommandSpecError, ExitClassification, OutputContract,
+    ProcessError, RuntimeError, SpawnEvidence, SpawnObserver, VerifiedExecutable, WorkingDirectory,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::{io::AsyncWriteExt, process::Command, time::Instant};
+use tokio::{process::Command, time::Instant};
 use uuid::Uuid;
 
 use super::{
@@ -21,7 +25,7 @@ use super::{
 use crate::{
     ImageGatewayError, ProxyConfig,
     generator::GenerationJob,
-    providers::openai_codex::{build_codex_prompt, final_output_filename, read_codex_output},
+    providers::openai_codex::{build_codex_prompt, final_output_filename},
     runner::{
         FilesystemRunnerJournal, LaunchDecision,
         process::{
@@ -39,6 +43,7 @@ const MAX_SHEBANG_BYTES: usize = 4096;
 const MAX_RUNNER_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 const CHILD_REAP_TIMEOUT: Duration = Duration::from_secs(5);
 const CODEX_CHILD_PATH: &str = "/usr/bin:/bin";
+const MAX_CODEX_RUNTIME_OUTPUT_BYTES: u64 = 32 * 1024 * 1024;
 
 pub struct CodexProcessSupervisor {
     journal: Arc<FilesystemRunnerJournal>,
@@ -71,8 +76,22 @@ enum ChildOutcome {
     Uncertain(&'static str),
 }
 
-struct ProcessGroupGuard {
-    identity: Option<ProviderProcessIdentity>,
+struct CodexCliPolicy;
+
+struct CodexCliInvocation {
+    executable: PathBuf,
+    workspace: PathBuf,
+    codex_home: PathBuf,
+    timeout: Duration,
+    prompt: Vec<u8>,
+    output_filename: &'static str,
+    environment: Vec<(String, String)>,
+}
+
+struct CodexSpawnObserver {
+    spool: Arc<ExecutionSpool>,
+    runner_lock: Arc<RunnerLock>,
+    helper: crate::runner::process::ProcessIdentity,
 }
 
 impl CodexProcessSupervisor {
@@ -272,14 +291,22 @@ pub async fn run_codex_runner_child(
     runner_root: impl AsRef<Path>,
     executor_execution_id: Uuid,
 ) -> Result<(), ImageGatewayError> {
-    let spool = ExecutionSpool::open(runner_root.as_ref(), executor_execution_id)
-        .map_err(child_spool_error)?;
-    let runner_lock = spool.acquire_runner_lock().map_err(child_spool_error)?;
+    let spool = Arc::new(
+        ExecutionSpool::open(runner_root.as_ref(), executor_execution_id)
+            .map_err(child_spool_error)?,
+    );
+    let runner_lock = Arc::new(spool.acquire_runner_lock().map_err(child_spool_error)?);
     let identity = runner_lock.identity().map_err(child_spool_error)?;
     spool
         .publish_process(&runner_lock, &identity)
         .map_err(child_spool_error)?;
-    let outcome = run_codex_child(&spool, &runner_lock, &identity, executor_execution_id).await;
+    let outcome = run_codex_child(
+        Arc::clone(&spool),
+        Arc::clone(&runner_lock),
+        identity.clone(),
+        executor_execution_id,
+    )
+    .await;
     match outcome {
         ChildOutcome::Succeeded(bytes) => {
             spool.publish_output(&bytes).map_err(child_spool_error)?;
@@ -318,9 +345,9 @@ pub async fn run_codex_runner_child(
 }
 
 async fn run_codex_child(
-    spool: &ExecutionSpool,
-    runner_lock: &RunnerLock,
-    helper: &crate::runner::process::ProcessIdentity,
+    spool: Arc<ExecutionSpool>,
+    runner_lock: Arc<RunnerLock>,
+    helper: crate::runner::process::ProcessIdentity,
     executor_execution_id: Uuid,
 ) -> ChildOutcome {
     let request = match spool
@@ -347,90 +374,121 @@ async fn run_codex_child(
     };
     let job = generation_job(&request.output);
     let prompt = build_codex_prompt(&job, workspace, request.output.candidate_index);
-    let mut command = Command::new(&request.codex_executable);
-    command
-        .arg("exec")
-        .arg("--ephemeral")
-        .arg("--ignore-user-config")
-        .arg("--ignore-rules")
-        .arg("--disable")
-        .arg("plugins")
-        .arg("--disable")
-        .arg("apps")
-        .arg("--sandbox")
-        .arg("workspace-write")
-        .arg("--skip-git-repo-check")
-        .arg("--cd")
-        .arg(workspace)
-        .arg("-")
-        .current_dir(workspace)
-        .env_clear()
-        .env("HOME", codex_home)
-        .env("CODEX_HOME", codex_home)
-        .env("TMPDIR", workspace)
-        .env("PATH", CODEX_CHILD_PATH)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .kill_on_drop(true);
-    copy_allowed_child_env(&mut command);
-    configure_process_group(&mut command);
-    let mut child = match command.spawn() {
-        Ok(child) => child,
-        Err(_) => return ChildOutcome::Failed("codex_cli_unavailable"),
+    let invocation = CodexCliInvocation {
+        executable: PathBuf::from(&request.codex_executable),
+        workspace: workspace.to_path_buf(),
+        codex_home: codex_home.to_path_buf(),
+        timeout: Duration::from_millis(request.timeout_ms),
+        prompt: prompt.into_bytes(),
+        output_filename: final_output_filename(&request.output.output_format),
+        environment: allowed_child_environment(),
     };
-    let Some(provider_pid) = child.id() else {
-        let _ = child.start_kill();
-        let _ = tokio::time::timeout(CHILD_REAP_TIMEOUT, child.wait()).await;
-        return ChildOutcome::Uncertain("codex_process_identity_unavailable");
+    let mut observer = CodexSpawnObserver {
+        spool: Arc::clone(&spool),
+        runner_lock: Arc::clone(&runner_lock),
+        helper,
     };
-    let provider = match ProviderProcessIdentity::capture(provider_pid, &helper.nonce) {
-        Ok(provider) => provider,
-        Err(_) => {
-            let _ = child.start_kill();
-            let _ = tokio::time::timeout(CHILD_REAP_TIMEOUT, child.wait()).await;
-            return ChildOutcome::Uncertain("codex_process_identity_unavailable");
-        }
-    };
-    let mut process_group = ProcessGroupGuard {
-        identity: Some(provider.clone()),
-    };
-    if spool
-        .publish_provider_process(runner_lock, helper, &provider)
-        .is_err()
+    match CliRuntime::new(CodexCliPolicy)
+        .run_to_sink(&invocation, &mut observer, Vec::new())
+        .await
     {
-        process_group.kill();
-        let _ = child.start_kill();
-        let _ = tokio::time::timeout(CHILD_REAP_TIMEOUT, child.wait()).await;
-        return ChildOutcome::Uncertain("codex_process_identity_unavailable");
+        Ok(result) => ChildOutcome::Succeeded(result.sink),
+        Err(error) => map_cli_runtime_error(error),
     }
-    let Some(mut stdin) = child.stdin.take() else {
-        return ChildOutcome::Uncertain("codex_stdin_unavailable");
-    };
-    if stdin.write_all(prompt.as_bytes()).await.is_err() {
-        process_group.kill();
-        return ChildOutcome::Uncertain("codex_stdin_failed");
-    }
-    drop(stdin);
-    let timeout = Duration::from_millis(request.timeout_ms);
-    let status = match tokio::time::timeout(timeout, child.wait()).await {
-        Ok(Ok(status)) => status,
-        Ok(Err(_)) => return ChildOutcome::Uncertain("codex_wait_failed"),
-        Err(_) => {
-            process_group.kill();
-            let _ = child.start_kill();
-            let _ = tokio::time::timeout(CHILD_REAP_TIMEOUT, child.wait()).await;
-            return ChildOutcome::Uncertain("codex_timeout");
+}
+
+impl CliPolicy for CodexCliPolicy {
+    type Request = CodexCliInvocation;
+    type Error = CommandSpecError;
+
+    fn command(&self, request: &Self::Request) -> Result<CommandSpec, Self::Error> {
+        let mut command = CommandSpec::new(
+            VerifiedExecutable::new(&request.executable)?,
+            WorkingDirectory::new(&request.workspace)?,
+            OutputContract::new(request.output_filename, MAX_CODEX_RUNTIME_OUTPUT_BYTES)?,
+            request.timeout,
+            CHILD_REAP_TIMEOUT,
+        )?;
+        for argument in [
+            "exec",
+            "--ephemeral",
+            "--ignore-user-config",
+            "--ignore-rules",
+            "--disable",
+            "plugins",
+            "--disable",
+            "apps",
+            "--sandbox",
+            "workspace-write",
+            "--skip-git-repo-check",
+            "--cd",
+        ] {
+            command = command.arg(argument)?;
         }
-    };
-    process_group.kill();
-    if !status.success() {
-        return ChildOutcome::Failed("codex_cli_failed");
+        command = command.arg(request.workspace.as_os_str())?.arg("-")?;
+        for (name, value) in [
+            ("HOME", request.codex_home.to_string_lossy().into_owned()),
+            (
+                "CODEX_HOME",
+                request.codex_home.to_string_lossy().into_owned(),
+            ),
+            ("TMPDIR", request.workspace.to_string_lossy().into_owned()),
+            ("PATH", CODEX_CHILD_PATH.to_string()),
+        ] {
+            command = command.env(name, value)?;
+        }
+        for (name, value) in &request.environment {
+            command = command.env(name, value)?;
+        }
+        command.stdin(request.prompt.clone())
     }
-    let output = workspace.join(final_output_filename(&request.output.output_format));
-    match read_codex_output(&output).await {
-        Ok(bytes) => ChildOutcome::Succeeded(bytes),
-        Err(_) => ChildOutcome::Failed("codex_no_image_output"),
+
+    fn classify_exit(&self, status: &std::process::ExitStatus) -> ExitClassification {
+        if status.success() {
+            ExitClassification::Success
+        } else {
+            ExitClassification::Failed {
+                code: "codex_cli_failed".to_string(),
+            }
+        }
+    }
+}
+
+impl SpawnObserver for CodexSpawnObserver {
+    type Error = ProcessSpoolError;
+
+    fn observe_spawn(&mut self, evidence: &SpawnEvidence) -> Result<(), Self::Error> {
+        ProviderProcessIdentity::capture(evidence.pid, &self.helper.nonce).and_then(|provider| {
+            self.spool
+                .publish_provider_process(&self.runner_lock, &self.helper, &provider)
+        })
+    }
+}
+
+fn map_cli_runtime_error(error: RuntimeError) -> ChildOutcome {
+    match error {
+        RuntimeError::ProcessFailed { .. } => ChildOutcome::Failed("codex_cli_failed"),
+        RuntimeError::Process(ProcessError::Spawn(_)) => {
+            ChildOutcome::Failed("codex_cli_unavailable")
+        }
+        RuntimeError::Process(ProcessError::TimedOut { .. }) => {
+            ChildOutcome::Uncertain("codex_timeout")
+        }
+        RuntimeError::Process(ProcessError::Observer { .. })
+        | RuntimeError::Process(ProcessError::IdentityUnavailable) => {
+            ChildOutcome::Uncertain("codex_process_identity_unavailable")
+        }
+        RuntimeError::Process(ProcessError::Stdin { .. }) => {
+            ChildOutcome::Uncertain("codex_stdin_failed")
+        }
+        RuntimeError::Output(_) => ChildOutcome::Failed("codex_no_image_output"),
+        RuntimeError::Policy(_)
+        | RuntimeError::OutputTask(_)
+        | RuntimeError::Process(ProcessError::InvalidCommand(_))
+        | RuntimeError::Process(ProcessError::ResidualProcessGroup { .. })
+        | RuntimeError::Process(ProcessError::Wait { .. }) => {
+            ChildOutcome::Uncertain("codex_runtime_failed")
+        }
     }
 }
 
@@ -774,8 +832,8 @@ fn child_environment(proxy: &ProxyConfig) -> Vec<(String, String)> {
     values
 }
 
-fn copy_allowed_child_env(command: &mut Command) {
-    for name in [
+fn allowed_child_environment() -> Vec<(String, String)> {
+    [
         "LANG",
         "LC_ALL",
         "SSL_CERT_FILE",
@@ -788,11 +846,10 @@ fn copy_allowed_child_env(command: &mut Command) {
         "https_proxy",
         "all_proxy",
         "no_proxy",
-    ] {
-        if let Ok(value) = env::var(name) {
-            command.env(name, value);
-        }
-    }
+    ]
+    .into_iter()
+    .filter_map(|name| env::var(name).ok().map(|value| (name.to_string(), value)))
+    .collect()
 }
 
 fn map_spool_error(error: ProcessSpoolError) -> RunnerError {
@@ -809,24 +866,6 @@ fn map_spool_error(error: ProcessSpoolError) -> RunnerError {
 
 fn child_spool_error(_error: ProcessSpoolError) -> ImageGatewayError {
     ImageGatewayError::service_unavailable("Codex runner spool is unavailable")
-}
-
-impl ProcessGroupGuard {
-    fn kill(&mut self) {
-        if let Some(identity) = self.identity.take() {
-            let _ = identity.kill_process_group_if_current();
-        }
-    }
-}
-
-impl Drop for ProcessGroupGuard {
-    fn drop(&mut self) {
-        self.kill();
-    }
-}
-
-fn configure_process_group(command: &mut Command) {
-    command.process_group(0);
 }
 
 #[cfg(test)]

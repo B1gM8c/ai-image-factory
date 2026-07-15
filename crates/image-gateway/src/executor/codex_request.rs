@@ -68,6 +68,7 @@ pub fn project_codex_output_request(
     lease: &ExecutorSubmissionLease,
     context: &ExecutorLaunchContext,
 ) -> Result<CodexOutputRequest, CodexRequestProjectionError> {
+    validate_codex_generation_contract()?;
     if lease.output_index != context.output_index()
         || lease.command_schema != context.command_schema()
         || lease.command_hash != context.command_hash()
@@ -120,6 +121,23 @@ pub fn project_codex_output_request(
     Ok(request)
 }
 
+fn validate_codex_generation_contract() -> Result<(), CodexRequestProjectionError> {
+    use image_provider_contracts::{CompletionMode, OutputCardinality};
+
+    openai_codex::DEFINITION
+        .validate()
+        .map_err(|_| CodexRequestProjectionError::UnsupportedCommand)?;
+    let descriptor = openai_codex::operation("images.generations")
+        .ok_or(CodexRequestProjectionError::UnsupportedCommand)?;
+    if descriptor.command_schema != GENERATION_COMMAND_SCHEMA
+        || descriptor.completion != CompletionMode::Inline
+        || descriptor.output_cardinality != OutputCardinality::ExactlyOne
+    {
+        return Err(CodexRequestProjectionError::UnsupportedCommand);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::{Value, json};
@@ -146,6 +164,25 @@ mod tests {
             "stream": false
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn codex_generation_descriptor_matches_the_durable_gateway_contract() {
+        let descriptor = openai_codex::operation("images.generations").unwrap();
+
+        assert_eq!(descriptor.command_schema, GENERATION_COMMAND_SCHEMA);
+        assert_eq!(
+            descriptor.output_schema,
+            "factory.openai-compatible.images.response.v1"
+        );
+        assert_eq!(
+            descriptor.completion,
+            image_provider_contracts::CompletionMode::Inline
+        );
+        assert_eq!(
+            descriptor.output_cardinality,
+            image_provider_contracts::OutputCardinality::ExactlyOne
+        );
     }
 
     fn lease(output_index: i32, command: &GenerationCommandV1) -> ExecutorSubmissionLease {

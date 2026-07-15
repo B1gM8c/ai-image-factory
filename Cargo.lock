@@ -572,6 +572,7 @@ dependencies = [
  "hex",
  "hmac",
  "image",
+ "image-cli-runtime",
  "image-provider-contracts",
  "image-scheduler-policy",
  "libc",
@@ -870,8 +871,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "image-cli-runtime"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "sha2 0.11.0",
+ "tempfile",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "image-provider-contracts"
 version = "0.1.0"
+
+[[package]]
+name = "image-provider-sdk"
+version = "0.1.0"
+
+[[package]]
+name = "image-provider-test-support"
+version = "0.1.0"
+dependencies = [
+ "image-provider-sdk",
+]
 
 [[package]]
 name = "image-scheduler-policy"

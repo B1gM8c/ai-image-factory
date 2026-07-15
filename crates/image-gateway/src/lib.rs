@@ -15,6 +15,7 @@ mod generator;
 pub mod input_blobs;
 mod jobs;
 mod models;
+pub mod provider_tasks;
 mod providers;
 mod reconciliation;
 pub mod reduction;
@@ -53,6 +54,13 @@ pub use executor::{
 };
 pub use generator::{
     CodexImageGenerator, EditJob, GeneratedImage, GenerationJob, ImageGenerator, InputImage,
+};
+pub use provider_tasks::{
+    PostgresProviderTaskStore, ProviderArtifactAuthority, ProviderRemoteTask, ProviderSubmitIntent,
+    ProviderTaskClaimScope, ProviderTaskLease, ProviderTaskObservation,
+    ProviderTaskObservationOutcome, ProviderTaskObservationSource, ProviderTaskState,
+    ProviderTaskStore, ProviderTaskStoreError, RemoteTaskAttach, RemoteTaskSubmitReservation,
+    VerifiedCallbackWakeup,
 };
 pub use reconciliation::{
     InputCleanupOutcome, PostgresReconciliationStore, ReconciliationOutcome, ReconciliationStore,

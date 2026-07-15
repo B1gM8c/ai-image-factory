@@ -1,0 +1,9 @@
+[package]
+name = "image-provider-test-support"
+version = "0.1.0"
+edition = "2024"
+license = "UNLICENSED"
+publish = false
+
+[dependencies]
+image-provider-sdk = { path = "../provider-sdk" }

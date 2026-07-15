@@ -22,6 +22,7 @@ pub use codex_supervisor::{
 pub use daemon::{ExecutorDaemon, ExecutorDaemonError, ExecutorDaemonRun};
 pub use owner_guard::{ExecutorOwnerGuardError, PostgresExecutorOwnerGuard};
 pub use postgres::PostgresExecutorSubmissionStore;
+pub(crate) use postgres::release_capacity_allocation;
 pub use provisioning::{
     CodexExecutionProfileProvisioning, CodexProfileProvisioningError,
     ProvisionedCodexExecutionProfile, provision_codex_execution_profile,
@@ -200,7 +201,7 @@ pub(crate) fn result_manifest_is_valid(manifest: &ExecutorResultManifest) -> boo
         && manifest.manifest_id != manifest.artifact_authority_id
 }
 
-fn artifact_descriptor_is_valid(
+pub(crate) fn artifact_descriptor_is_valid(
     storage_backend: &str,
     storage_namespace: &str,
     object_key: &str,
