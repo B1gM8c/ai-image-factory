@@ -159,6 +159,9 @@ async fn remote_task_store_closes_attach_poll_callback_and_cancel_invariants() -
         )?;
         let second_attach = attach_request(&second, "operation-b", "submit-event-b");
 
+        let capacity_before_callback =
+            capacity_heartbeat(&database.pool, first.executor_execution_id).await?;
+        tokio::time::sleep(Duration::from_millis(10)).await;
         let callback = VerifiedCallbackWakeup {
             submission_id: first.submission_id,
             event_identity: "callback-event-a".to_string(),
@@ -182,6 +185,11 @@ async fn remote_task_store_closes_attach_poll_callback_and_cancel_invariants() -
         .await
         .map_err(debug_error)?;
         require(callback_count == 1, "duplicate callback was not deduplicated")?;
+        require(
+            capacity_heartbeat(&database.pool, first.executor_execution_id).await?
+                == capacity_before_callback,
+            "callback wakeup impersonated provider worker liveness",
+        )?;
         let callback_task = store
             .load(first.submission_id)
             .await
@@ -194,6 +202,9 @@ async fn remote_task_store_closes_attach_poll_callback_and_cancel_invariants() -
         )?;
 
         let scope = claim_scope();
+        let capacity_before_poll_claim =
+            capacity_heartbeat(&database.pool, first.executor_execution_id).await?;
+        tokio::time::sleep(Duration::from_millis(10)).await;
         let first_lease = store
             .claim_due(&scope, "poller-a", 5_000)
             .await
@@ -203,10 +214,22 @@ async fn remote_task_store_closes_attach_poll_callback_and_cancel_invariants() -
             first_lease.context() == &first_context,
             "poll claim re-resolved the frozen provider context",
         )?;
+        let capacity_after_poll_claim =
+            capacity_heartbeat(&database.pool, first.executor_execution_id).await?;
+        require(
+            capacity_after_poll_claim > capacity_before_poll_claim,
+            "poll claim did not heartbeat held provider capacity",
+        )?;
+        tokio::time::sleep(Duration::from_millis(10)).await;
         let first_lease = store
             .heartbeat(&first_lease, 5_000)
             .await
             .map_err(debug_error)?;
+        require(
+            capacity_heartbeat(&database.pool, first.executor_execution_id).await?
+                > capacity_after_poll_claim,
+            "poll lease renewal did not heartbeat held provider capacity",
+        )?;
         store
             .request_cancel(first.submission_id)
             .await
@@ -218,10 +241,25 @@ async fn remote_task_store_closes_attach_poll_callback_and_cancel_invariants() -
                 error_code: "cancel_effect_unknown".to_string(),
             },
         };
-        let terminal = store
-            .record_observation(&first_lease, &uncertain)
-            .await
-            .map_err(debug_error)?;
+        let (concurrent_heartbeat, terminal) = tokio::time::timeout(
+            Duration::from_secs(2),
+            async {
+                tokio::join!(
+                    store.heartbeat(&first_lease, 5_000),
+                    store.record_observation(&first_lease, &uncertain),
+                )
+            },
+        )
+        .await
+        .map_err(|_| "poll heartbeat and terminal release deadlocked".to_string())?;
+        require(
+            matches!(
+                concurrent_heartbeat,
+                Ok(_) | Err(ProviderTaskStoreError::StaleLease)
+            ),
+            "poll heartbeat and terminal release produced an invalid race result",
+        )?;
+        let terminal = terminal.map_err(debug_error)?;
         require(
             terminal.state == ProviderTaskState::Uncertain,
             "unknown cancellation was projected as canceled",
@@ -315,6 +353,18 @@ async fn remote_task_store_closes_attach_poll_callback_and_cancel_invariants() -
         require(
             reclaimed.poll_lease_epoch == second_lease.poll_lease_epoch + 1,
             "poll lease epoch did not advance on reclaim",
+        )?;
+        let capacity_after_reclaim =
+            capacity_heartbeat(&database.pool, second.executor_execution_id).await?;
+        require(
+            store.heartbeat(&second_lease, 5_000).await
+                == Err(ProviderTaskStoreError::StaleLease),
+            "expired poll fence renewed provider capacity",
+        )?;
+        require(
+            capacity_heartbeat(&database.pool, second.executor_execution_id).await?
+                == capacity_after_reclaim,
+            "stale poll heartbeat changed held provider capacity",
         )?;
         let stale_result = store
             .record_observation(
@@ -886,6 +936,24 @@ async fn submit_recovery_claim_is_scoped_fenced_and_reclaimable() -> TestResult 
         )?;
 
         let scope = claim_scope();
+        require(
+            sqlx::query(
+                r#"
+                UPDATE executor_capacity_allocations
+                SET last_heartbeat_at_ms =
+                    floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT + 60_000
+                WHERE executor_execution_id = $1
+                "#,
+            )
+            .bind(executor.executor_execution_id)
+            .execute(&database.pool)
+            .await
+            .is_err(),
+            "database accepted a future provider capacity heartbeat",
+        )?;
+        let capacity_before_recovery_claim =
+            capacity_heartbeat(&database.pool, executor.executor_execution_id).await?;
+        tokio::time::sleep(Duration::from_millis(10)).await;
         let (left, right) = tokio::join!(
             store.claim_submit_recovery(&scope, "recovery-a", 2_000),
             store.claim_submit_recovery(&scope, "recovery-b", 2_000),
@@ -902,6 +970,32 @@ async fn submit_recovery_claim_is_scoped_fenced_and_reclaimable() -> TestResult 
                 && first.context() == invocation.context(),
             "concurrent recovery claim did not elect exactly one frozen context",
         )?;
+        let capacity_after_recovery_claim =
+            capacity_heartbeat(&database.pool, executor.executor_execution_id).await?;
+        require(
+            capacity_after_recovery_claim > capacity_before_recovery_claim,
+            "submit recovery claim did not heartbeat held provider capacity",
+        )?;
+        require(
+            first.recovery_lease_expires_at_ms <= first.context().provider_deadline_at_ms(),
+            "submit recovery claim crossed the absolute provider deadline",
+        )?;
+        require(
+            sqlx::query(
+                r#"
+                UPDATE provider_submit_recoveries
+                SET recovery_lease_expires_at_ms = provider_deadline_at_ms + 1,
+                    updated_at_ms = updated_at_ms + 1
+                WHERE submission_id = $1
+                "#,
+            )
+            .bind(executor.submission_id)
+            .execute(&database.pool)
+            .await
+            .is_err(),
+            "database accepted a recovery lease beyond the provider deadline",
+        )?;
+        tokio::time::sleep(Duration::from_millis(10)).await;
         let renewed = store
             .heartbeat_submit_recovery(&first, 3_000)
             .await
@@ -909,6 +1003,15 @@ async fn submit_recovery_claim_is_scoped_fenced_and_reclaimable() -> TestResult 
         require(
             renewed.recovery_lease_expires_at_ms > first.recovery_lease_expires_at_ms,
             "recovery heartbeat did not advance monotonically",
+        )?;
+        require(
+            renewed.recovery_lease_expires_at_ms <= renewed.context().provider_deadline_at_ms(),
+            "submit recovery heartbeat crossed the absolute provider deadline",
+        )?;
+        require(
+            capacity_heartbeat(&database.pool, executor.executor_execution_id).await?
+                > capacity_after_recovery_claim,
+            "submit recovery renewal did not heartbeat held provider capacity",
         )?;
         require(
             store
@@ -991,6 +1094,47 @@ async fn submit_recovery_claim_is_scoped_fenced_and_reclaimable() -> TestResult 
             "closed recovery lease remained writable after attach",
         )?;
 
+        let deadline_executor =
+            seed_running_submission_with_lease(&database.pool, "recovery-deadline", 20).await?;
+        let mut deadline_reservation = reservation_request(&deadline_executor);
+        deadline_reservation.provider_timeout_ms = 120;
+        store
+            .reserve_submit(&deadline_reservation)
+            .await
+            .map_err(debug_error)?;
+        store
+            .start_submit(&deadline_reservation)
+            .await
+            .map_err(debug_error)?;
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let deadline_lease = store
+            .claim_submit_recovery(&claim_scope(), "deadline-recovery", 2_000)
+            .await
+            .map_err(debug_error)?
+            .ok_or_else(|| "pre-deadline recovery was not claimable".to_string())?;
+        store
+            .record_submit_receipt(&submit_receipt(
+                &deadline_executor,
+                "operation-after-deadline",
+                "receipt-before-deadline",
+            ))
+            .await
+            .map_err(debug_error)?;
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        let mut deadline_attach = attach_request(
+            &deadline_executor,
+            "operation-after-deadline",
+            "attach-after-deadline",
+        );
+        deadline_attach.recovery_fence = Some(ProviderSubmitRecoveryFence {
+            recovery_owner: deadline_lease.recovery_owner,
+            recovery_lease_epoch: deadline_lease.recovery_lease_epoch,
+        });
+        require(
+            store.attach(&deadline_attach).await == Err(ProviderTaskStoreError::StaleLease),
+            "recovery fence attached a remote operation after the provider deadline",
+        )?;
+
         let rejected_executor =
             seed_running_submission_with_lease(&database.pool, "recovery-reject", 200).await?;
         let rejected_reservation = reservation_request(&rejected_executor);
@@ -1018,14 +1162,27 @@ async fn submit_recovery_claim_is_scoped_fenced_and_reclaimable() -> TestResult 
             recovery_owner: rejection_lease.recovery_owner.clone(),
             recovery_lease_epoch: rejection_lease.recovery_lease_epoch,
         });
+        let (concurrent_heartbeat, rejected) = tokio::time::timeout(
+            Duration::from_secs(2),
+            async {
+                tokio::join!(
+                    store.heartbeat_submit_recovery(&rejection_lease, 2_000),
+                    store.record_submit_failure(&rejection),
+                )
+            },
+        )
+        .await
+        .map_err(|_| "recovery heartbeat and terminal release deadlocked".to_string())?;
         require(
-            store
-                .record_submit_failure(&rejection)
-                .await
-                .map_err(debug_error)?
-                .state
-                == ProviderSubmitIntentState::Rejected,
+            rejected.map_err(debug_error)?.state == ProviderSubmitIntentState::Rejected,
             "live recovery owner could not atomically commit confirmed rejection",
+        )?;
+        require(
+            matches!(
+                concurrent_heartbeat,
+                Ok(_) | Err(ProviderTaskStoreError::StaleLease)
+            ),
+            "heartbeat and terminal release produced an invalid race result",
         )?;
         require(
             store
@@ -1033,6 +1190,66 @@ async fn submit_recovery_claim_is_scoped_fenced_and_reclaimable() -> TestResult 
                 .await
                 == Err(ProviderTaskStoreError::StaleLease),
             "confirmed recovered rejection did not close its recovery lease",
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
+async fn capacity_heartbeat_migration_fails_closed_on_future_legacy_state() -> TestResult {
+    let Some(database) = TestDatabase::new_before_capacity_heartbeats().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let executor = seed_running_submission(&database.pool, "capacity-upgrade").await?;
+        let mut invalid = database.pool.begin().await.map_err(debug_error)?;
+        sqlx::query(
+            r#"
+            UPDATE executor_capacity_allocations
+            SET last_heartbeat_at_ms =
+                floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT + 60_000
+            WHERE executor_execution_id = $1
+            "#,
+        )
+        .bind(executor.executor_execution_id)
+        .execute(&mut *invalid)
+        .await
+        .map_err(debug_error)?;
+        require(
+            sqlx::raw_sql(include_str!(
+                "../migrations/0020_provider_capacity_heartbeats.sql"
+            ))
+            .execute(&mut *invalid)
+            .await
+            .is_err(),
+            "0020 accepted a future legacy capacity heartbeat",
+        )?;
+        invalid.rollback().await.map_err(debug_error)?;
+
+        let mut valid = database.pool.begin().await.map_err(debug_error)?;
+        sqlx::raw_sql(include_str!(
+            "../migrations/0020_provider_capacity_heartbeats.sql"
+        ))
+        .execute(&mut *valid)
+        .await
+        .map_err(|error| format!("0020 failed after legacy rollback: {error}"))?;
+        valid.commit().await.map_err(debug_error)?;
+        let constraint_exists: bool = sqlx::query_scalar(
+            r#"
+            SELECT EXISTS(
+              SELECT 1 FROM pg_constraint
+              WHERE conrelid = 'provider_submit_recoveries'::regclass
+                AND conname = 'provider_submit_recoveries_lease_deadline_check'
+            )
+            "#,
+        )
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(
+            constraint_exists,
+            "successful 19 -> 20 upgrade omitted its deadline constraint",
         )
     }
     .await;
@@ -1527,6 +1744,27 @@ impl TestDatabase {
         Ok(Some(Self { schema, pool }))
     }
 
+    async fn new_before_capacity_heartbeats() -> TestResult<Option<Self>> {
+        let Some(database) = Self::new_before_submit_lifecycle().await? else {
+            return Ok(None);
+        };
+        for migration in [
+            include_str!("../migrations/0018_provider_submit_lifecycle.sql"),
+            include_str!("../migrations/0019_provider_submit_recovery_leases.sql"),
+        ] {
+            if let Err(error) = sqlx::raw_sql(migration).execute(&database.pool).await {
+                let cleanup = database.cleanup().await;
+                return match cleanup {
+                    Ok(()) => Err(format!("pre-0020 migration failed: {error}")),
+                    Err(cleanup) => Err(format!(
+                        "pre-0020 migration failed: {error}; cleanup failed: {cleanup}"
+                    )),
+                };
+            }
+        }
+        Ok(Some(database))
+    }
+
     async fn cleanup(self) -> TestResult {
         let result = sqlx::query(AssertSqlSafe(format!(
             "DROP SCHEMA \"{}\" CASCADE",
@@ -1545,6 +1783,20 @@ async fn database_now(pool: &PgPool) -> TestResult<i64> {
         .fetch_one(pool)
         .await
         .map_err(debug_error)
+}
+
+async fn capacity_heartbeat(pool: &PgPool, executor_execution_id: Uuid) -> TestResult<i64> {
+    sqlx::query_scalar(
+        r#"
+        SELECT last_heartbeat_at_ms
+        FROM executor_capacity_allocations
+        WHERE executor_execution_id = $1 AND state = 'held'
+        "#,
+    )
+    .bind(executor_execution_id)
+    .fetch_one(pool)
+    .await
+    .map_err(debug_error)
 }
 
 fn require(condition: bool, message: impl Into<String>) -> TestResult {

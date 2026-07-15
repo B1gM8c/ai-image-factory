@@ -1018,9 +1018,9 @@ async fn assert_expected_schema(pool: &PgPool) -> TestResult {
     require(
         migration_versions(pool).await?
             == vec![
-                0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19,
+                0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
             ],
-        "applied migration versions must be exactly [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]",
+        "applied migration versions must be exactly [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]",
     )?;
 
     for (table, column) in REQUIRED_COLUMNS {
@@ -1045,6 +1045,46 @@ async fn assert_expected_schema(pool: &PgPool) -> TestResult {
         .map_err(|error| format!("failed to query index {index}: {error}"))?;
         require(exists, &format!("index {index} must exist"))?;
     }
+
+    let recovery_deadline_constraint: Option<String> = sqlx::query_scalar(
+        r#"
+        SELECT pg_get_constraintdef(oid)
+        FROM pg_constraint
+        WHERE conrelid = 'provider_submit_recoveries'::regclass
+          AND conname = 'provider_submit_recoveries_lease_deadline_check'
+        "#,
+    )
+    .fetch_optional(pool)
+    .await
+    .map_err(|error| format!("failed to query recovery deadline constraint: {error}"))?;
+    require(
+        recovery_deadline_constraint.is_some_and(|definition| {
+            definition.contains("recovery_lease_expires_at_ms <= provider_deadline_at_ms")
+        }),
+        "provider recovery leases must be bounded by the absolute provider deadline",
+    )?;
+    let provider_heartbeat_triggers: i64 = sqlx::query_scalar(
+        r#"
+        SELECT COUNT(*)
+        FROM pg_trigger
+        WHERE NOT tgisinternal
+          AND tgrelid IN (
+            'executor_capacity_allocations'::regclass,
+            'provider_remote_tasks'::regclass
+          )
+          AND tgname IN (
+            'executor_capacity_allocations_heartbeat_time_guard',
+            'provider_remote_task_recovery_deadline_guard'
+          )
+        "#,
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|error| format!("failed to query provider heartbeat triggers: {error}"))?;
+    require(
+        provider_heartbeat_triggers == 2,
+        "provider heartbeat and recovered-attach deadline guards must exist",
+    )?;
     for (index, expression) in [
         (
             "provider_submit_recoveries_claim_idx",

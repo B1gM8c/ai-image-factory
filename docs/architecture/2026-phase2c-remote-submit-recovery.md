@@ -86,7 +86,8 @@ Before activation, the platform still needs:
   unknown remote effect without creating capacity oversubscription;
 - atomic or recoverable materialization between `artifact_ready` and canonical
   success;
-- capacity heartbeat during long poll and materialization operations;
+- the Phase 2E heartbeat primitives must be driven by the single provider
+  orchestrator during long poll and materialization operations;
 - an adapter-specific submit orchestrator that is the only caller allowed to
   spawn after `ProviderSubmitStart::Acquired`.
 

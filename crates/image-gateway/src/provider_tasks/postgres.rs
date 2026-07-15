@@ -71,6 +71,7 @@ struct ClaimRow {
     attach_recovery_lease_epoch: Option<i64>,
     poll_owner: String,
     poll_lease_expires_at_ms: i64,
+    claim_updated_at_ms: i64,
     model: String,
     command_schema: String,
     command_hash: String,
@@ -127,6 +128,7 @@ struct RecoveryClaimRow {
     recovery_owner: String,
     recovery_lease_epoch: i64,
     recovery_lease_expires_at_ms: i64,
+    recovery_updated_at_ms: i64,
     model: String,
     command_schema: String,
     command_hash: String,
@@ -582,10 +584,11 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
     ) -> Result<Option<ProviderSubmitRecoveryLease>, ProviderTaskStoreError> {
         validate_scope(scope)?;
         validate_owner_and_lease(owner, lease_ms)?;
+        let mut tx = self.pool.begin().await.map_err(unavailable)?;
         let row: Option<RecoveryClaimRow> = sqlx::query_as(
             r#"
-            WITH candidate AS (
-              SELECT recovery.submission_id,
+            WITH capacity_candidate AS MATERIALIZED (
+              SELECT recovery.submission_id, recovery.executor_execution_id,
                      floor(extract(epoch FROM statement_timestamp()) * 1000)::BIGINT AS now_ms
               FROM provider_submit_recoveries recovery
               JOIN executor_capacity_allocations allocation
@@ -599,6 +602,9 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
               WHERE recovery.provider_id = $1
                 AND recovery.provider_account_id = $2
                 AND recovery.state = 'active'
+                AND recovery.provider_deadline_at_ms > floor(
+                      extract(epoch FROM statement_timestamp()) * 1000
+                    )::BIGINT
                 AND GREATEST(
                       recovery.next_recovery_at_ms,
                       COALESCE(
@@ -618,13 +624,32 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
                 ),
                 recovery.provider_deadline_at_ms,
                 recovery.submission_id
-              FOR UPDATE OF recovery SKIP LOCKED
+              FOR UPDATE OF allocation SKIP LOCKED
               LIMIT 1
+            ), candidate AS MATERIALIZED (
+              SELECT recovery.submission_id, capacity_candidate.now_ms
+              FROM provider_submit_recoveries recovery
+              JOIN capacity_candidate
+                ON capacity_candidate.submission_id = recovery.submission_id
+               AND capacity_candidate.executor_execution_id = recovery.executor_execution_id
+              WHERE recovery.state = 'active'
+                AND recovery.provider_deadline_at_ms > capacity_candidate.now_ms
+                AND GREATEST(
+                      recovery.next_recovery_at_ms,
+                      COALESCE(
+                        recovery.recovery_lease_expires_at_ms,
+                        recovery.next_recovery_at_ms
+                      )
+                    ) <= capacity_candidate.now_ms
+              FOR UPDATE OF recovery SKIP LOCKED
             ), claimed AS (
               UPDATE provider_submit_recoveries recovery
               SET recovery_owner = $3,
                   recovery_lease_epoch = recovery.recovery_lease_epoch + 1,
-                  recovery_lease_expires_at_ms = candidate.now_ms + $4,
+                  recovery_lease_expires_at_ms = LEAST(
+                    recovery.provider_deadline_at_ms,
+                    candidate.now_ms + $4
+                  ),
                   recovery_claimed_at_ms = candidate.now_ms,
                   updated_at_ms = candidate.now_ms
               FROM candidate
@@ -641,6 +666,7 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
                    intent.updated_at_ms, claimed.recovery_owner,
                    claimed.recovery_lease_epoch,
                    claimed.recovery_lease_expires_at_ms,
+                   claimed.updated_at_ms AS recovery_updated_at_ms,
                    submission.model, submission.command_schema,
                    submission.command_hash, submission.execution_profile_id,
                    submission.adapter_revision, submission.credential_pool_id,
@@ -669,10 +695,23 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
         .bind(scope.provider_account_id)
         .bind(owner)
         .bind(lease_ms)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(unavailable)?;
-        row.map(recovery_lease_from_row).transpose()
+        let Some(row) = row else {
+            tx.commit().await.map_err(unavailable)?;
+            return Ok(None);
+        };
+        heartbeat_capacity(
+            &mut tx,
+            row.executor_execution_id,
+            row.submission_id,
+            row.recovery_updated_at_ms,
+        )
+        .await?;
+        let lease = recovery_lease_from_row(row)?;
+        tx.commit().await.map_err(unavailable)?;
+        Ok(Some(lease))
     }
 
     async fn heartbeat_submit_recovery(
@@ -681,21 +720,40 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
         lease_ms: i64,
     ) -> Result<ProviderSubmitRecoveryLease, ProviderTaskStoreError> {
         validate_recovery_lease(lease, lease_ms)?;
-        let expires: Option<i64> = sqlx::query_scalar(
+        let mut tx = self.pool.begin().await.map_err(unavailable)?;
+        lock_held_capacity(
+            &mut tx,
+            lease.intent.executor_execution_id,
+            lease.intent.submission_id,
+        )
+        .await?;
+        let renewed: Option<(i64, i64)> = sqlx::query_as(
             r#"
-            UPDATE provider_submit_recoveries
-            SET recovery_lease_expires_at_ms = GREATEST(
-                  recovery_lease_expires_at_ms + 1,
-                  floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT + $5
+            UPDATE provider_submit_recoveries recovery
+            SET recovery_lease_expires_at_ms = LEAST(
+                  recovery.provider_deadline_at_ms,
+                  GREATEST(
+                    recovery.recovery_lease_expires_at_ms + 1,
+                    floor(
+                      extract(epoch FROM statement_timestamp()) * 1000
+                    )::BIGINT + $5
+                  )
                 ),
-                updated_at_ms =
-                  floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT
-            WHERE submission_id = $1 AND executor_execution_id = $2
-              AND recovery_owner = $3 AND recovery_lease_epoch = $4
-              AND state = 'active'
-              AND recovery_lease_expires_at_ms >
-                  floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT
-            RETURNING recovery_lease_expires_at_ms
+                updated_at_ms = floor(
+                  extract(epoch FROM statement_timestamp()) * 1000
+                )::BIGINT
+            WHERE recovery.submission_id = $1
+              AND recovery.executor_execution_id = $2
+              AND recovery.recovery_owner = $3
+              AND recovery.recovery_lease_epoch = $4
+              AND recovery.state = 'active'
+              AND recovery.recovery_lease_expires_at_ms > floor(
+                    extract(epoch FROM statement_timestamp()) * 1000
+                  )::BIGINT
+              AND recovery.provider_deadline_at_ms > floor(
+                    extract(epoch FROM statement_timestamp()) * 1000
+                  )::BIGINT
+            RETURNING recovery.recovery_lease_expires_at_ms, recovery.updated_at_ms
             "#,
         )
         .bind(lease.intent.submission_id)
@@ -703,11 +761,20 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
         .bind(&lease.recovery_owner)
         .bind(lease.recovery_lease_epoch)
         .bind(lease_ms)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(unavailable)?;
+        let (expires, now) = renewed.ok_or(ProviderTaskStoreError::StaleLease)?;
+        heartbeat_capacity(
+            &mut tx,
+            lease.intent.executor_execution_id,
+            lease.intent.submission_id,
+            now,
+        )
+        .await?;
+        tx.commit().await.map_err(unavailable)?;
         Ok(ProviderSubmitRecoveryLease {
-            recovery_lease_expires_at_ms: expires.ok_or(ProviderTaskStoreError::StaleLease)?,
+            recovery_lease_expires_at_ms: expires,
             ..lease.clone()
         })
     }
@@ -824,7 +891,8 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
                     && recovery.recovery_owner.is_none()
             }
             Some(fence) => {
-                recovery.recovery_owner.as_deref() == Some(&fence.recovery_owner)
+                recovery.provider_deadline_at_ms > now
+                    && recovery.recovery_owner.as_deref() == Some(&fence.recovery_owner)
                     && recovery.recovery_lease_epoch == fence.recovery_lease_epoch
                     && recovery
                         .recovery_lease_expires_at_ms
@@ -1019,6 +1087,7 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
     ) -> Result<Option<ProviderTaskLease>, ProviderTaskStoreError> {
         validate_scope(scope)?;
         validate_owner_and_lease(owner, lease_ms)?;
+        let mut tx = self.pool.begin().await.map_err(unavailable)?;
         let row: Option<ClaimRow> = sqlx::query_as(
             r#"
             WITH candidate AS (
@@ -1062,6 +1131,7 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
                    claimed.attach_recovery_owner,
                    claimed.attach_recovery_lease_epoch,
                    claimed.poll_owner, claimed.poll_lease_expires_at_ms,
+                   claimed.updated_at_ms AS claim_updated_at_ms,
                    submission.model, submission.command_schema,
                    submission.command_hash, submission.execution_profile_id,
                    submission.adapter_revision, submission.credential_pool_id,
@@ -1095,10 +1165,23 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
         .bind(scope.provider_account_id)
         .bind(owner)
         .bind(lease_ms)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(unavailable)?;
-        row.map(lease_from_row).transpose()
+        let Some(row) = row else {
+            tx.commit().await.map_err(unavailable)?;
+            return Ok(None);
+        };
+        heartbeat_capacity(
+            &mut tx,
+            row.executor_execution_id,
+            row.submission_id,
+            row.claim_updated_at_ms,
+        )
+        .await?;
+        let lease = lease_from_row(row)?;
+        tx.commit().await.map_err(unavailable)?;
+        Ok(Some(lease))
     }
 
     async fn heartbeat(
@@ -1107,20 +1190,27 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
         lease_ms: i64,
     ) -> Result<ProviderTaskLease, ProviderTaskStoreError> {
         validate_lease(lease, lease_ms)?;
-        let expires: Option<i64> = sqlx::query_scalar(
+        let mut tx = self.pool.begin().await.map_err(unavailable)?;
+        let renewed: Option<(i64, i64)> = sqlx::query_as(
             r#"
-            UPDATE provider_remote_tasks
+            UPDATE provider_remote_tasks task
             SET poll_lease_expires_at_ms = GREATEST(
-                  poll_lease_expires_at_ms + 1,
-                  floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT + $5
+                  task.poll_lease_expires_at_ms + 1,
+                  floor(
+                    extract(epoch FROM statement_timestamp()) * 1000
+                  )::BIGINT + $5
                 ),
-                updated_at_ms = floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT
-            WHERE submission_id = $1 AND executor_execution_id = $2
-              AND poll_owner = $3 AND poll_lease_epoch = $4
-              AND state = 'provider_waiting'
-              AND poll_lease_expires_at_ms >
-                  floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT
-            RETURNING poll_lease_expires_at_ms
+                updated_at_ms = floor(
+                  extract(epoch FROM statement_timestamp()) * 1000
+                )::BIGINT
+            WHERE task.submission_id = $1
+              AND task.executor_execution_id = $2
+              AND task.poll_owner = $3 AND task.poll_lease_epoch = $4
+              AND task.state = 'provider_waiting'
+              AND task.poll_lease_expires_at_ms > floor(
+                    extract(epoch FROM statement_timestamp()) * 1000
+                  )::BIGINT
+            RETURNING task.poll_lease_expires_at_ms, task.updated_at_ms
             "#,
         )
         .bind(lease.task.submission_id)
@@ -1128,11 +1218,20 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
         .bind(&lease.poll_owner)
         .bind(lease.poll_lease_epoch)
         .bind(lease_ms)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(unavailable)?;
+        let (expires, now) = renewed.ok_or(ProviderTaskStoreError::StaleLease)?;
+        heartbeat_capacity(
+            &mut tx,
+            lease.task.executor_execution_id,
+            lease.task.submission_id,
+            now,
+        )
+        .await?;
+        tx.commit().await.map_err(unavailable)?;
         Ok(ProviderTaskLease {
-            poll_lease_expires_at_ms: expires.ok_or(ProviderTaskStoreError::StaleLease)?,
+            poll_lease_expires_at_ms: expires,
             ..lease.clone()
         })
     }
@@ -1487,7 +1586,6 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
         .execute(&mut *tx)
         .await
         .map_err(storage_conflict)?;
-        heartbeat_capacity(&mut tx, task.executor_execution_id, task.submission_id, now).await?;
         let task = task_from_row(
             load_task_in(&mut tx, callback.submission_id)
                 .await?
@@ -2348,6 +2446,7 @@ fn lease_from_row(row: ClaimRow) -> Result<ProviderTaskLease, ProviderTaskStoreE
         attach_recovery_lease_epoch,
         poll_owner,
         poll_lease_expires_at_ms,
+        claim_updated_at_ms: _,
         model,
         command_schema,
         command_hash,
@@ -2620,6 +2719,27 @@ async fn database_now(tx: &mut Transaction<'_, Postgres>) -> Result<i64, Provide
         .fetch_one(&mut **tx)
         .await
         .map_err(unavailable)
+}
+
+async fn lock_held_capacity(
+    tx: &mut Transaction<'_, Postgres>,
+    executor_execution_id: Uuid,
+    submission_id: Uuid,
+) -> Result<(), ProviderTaskStoreError> {
+    let held: Option<bool> = sqlx::query_scalar(
+        r#"
+        SELECT TRUE
+        FROM executor_capacity_allocations
+        WHERE executor_execution_id = $1 AND submission_id = $2 AND state = 'held'
+        FOR UPDATE
+        "#,
+    )
+    .bind(executor_execution_id)
+    .bind(submission_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(unavailable)?;
+    held.ok_or(ProviderTaskStoreError::StaleLease).map(drop)
 }
 
 async fn heartbeat_capacity(

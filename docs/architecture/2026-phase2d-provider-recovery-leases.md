@@ -1,8 +1,9 @@
 # Phase 2D: Frozen Provider Context and Submit Recovery Leases
 
-Status: implemented and PostgreSQL-tested. Remote provider activation remains
-blocked by the deadline resolver, capacity heartbeat, recoverable artifact
-materialization, and the single submit orchestrator.
+Status: implemented and PostgreSQL-tested. Phase 2E adds fenced provider-capacity
+heartbeats and deadline-bounded recovery renewal. Remote provider activation
+remains blocked by the deadline resolver, recoverable artifact materialization,
+operation descriptor identity, and the single submit orchestrator.
 
 ## Scope
 
@@ -190,11 +191,10 @@ lease state again.
 1. Add a fenced deadline resolver. Deadline means `unknown_remote_effect`, never
    `rejected`; capacity release versus quarantined counting needs an explicit
    policy that cannot oversubscribe a provider account.
-2. Add provider-capacity heartbeat for long poll and materialization work.
-3. Make `artifact_ready -> canonical success` atomic or restart-recoverable.
-4. Add the single submit orchestrator. Only `ProviderSubmitStart::Acquired` may
+2. Make `artifact_ready -> canonical success` atomic or restart-recoverable.
+3. Add the single submit orchestrator. Only `ProviderSubmitStart::Acquired` may
    spawn a CLI process.
-5. Persist operation descriptor identity and add a checked SDK constructor that
+4. Persist operation descriptor identity and add a checked SDK constructor that
    binds submission, provider, idempotency, operation, descriptor, and adapter
    identities before adapters can evolve those contracts independently.
 
