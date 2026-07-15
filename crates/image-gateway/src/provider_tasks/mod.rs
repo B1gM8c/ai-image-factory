@@ -505,3 +505,11 @@ pub trait ProviderTaskStore: Send + Sync + 'static {
         callback: &VerifiedCallbackWakeup,
     ) -> Result<ProviderRemoteTask, ProviderTaskStoreError>;
 }
+
+#[async_trait]
+pub trait ProviderTaskDeadlineStore: Send + Sync + 'static {
+    async fn resolve_due_remote_task_deadline(
+        &self,
+        scope: &ProviderTaskClaimScope,
+    ) -> Result<Option<ProviderRemoteTask>, ProviderTaskStoreError>;
+}

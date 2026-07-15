@@ -62,10 +62,11 @@ pub use provider_tasks::{
     ProviderCapacityReconciliationStore, ProviderCapacityTerminalState, ProviderExecutionContext,
     ProviderRemoteTask, ProviderSubmitFailureKind, ProviderSubmitIntent, ProviderSubmitIntentState,
     ProviderSubmitInvocation, ProviderSubmitRecoveryFence, ProviderSubmitRecoveryLease,
-    ProviderSubmitStart, ProviderTaskClaimScope, ProviderTaskLease, ProviderTaskObservation,
-    ProviderTaskObservationOutcome, ProviderTaskObservationSource, ProviderTaskState,
-    ProviderTaskStore, ProviderTaskStoreError, RemoteTaskAttach, RemoteTaskSubmitFailure,
-    RemoteTaskSubmitReceipt, RemoteTaskSubmitReservation, VerifiedCallbackWakeup,
+    ProviderSubmitStart, ProviderTaskClaimScope, ProviderTaskDeadlineStore, ProviderTaskLease,
+    ProviderTaskObservation, ProviderTaskObservationOutcome, ProviderTaskObservationSource,
+    ProviderTaskState, ProviderTaskStore, ProviderTaskStoreError, RemoteTaskAttach,
+    RemoteTaskSubmitFailure, RemoteTaskSubmitReceipt, RemoteTaskSubmitReservation,
+    VerifiedCallbackWakeup,
 };
 pub use reconciliation::{
     InputCleanupOutcome, PostgresReconciliationStore, ReconciliationOutcome, ReconciliationStore,

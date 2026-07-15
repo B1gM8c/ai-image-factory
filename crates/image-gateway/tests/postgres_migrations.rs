@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 type TestResult<T = ()> = Result<T, String>;
 
-const REQUIRED_COLUMNS: [(&str, &str); 144] = [
+const REQUIRED_COLUMNS: [(&str, &str); 156] = [
     ("usage_events", "tenant_id"),
     ("quota_reservations", "tenant_id"),
     ("quota_reservations", "job_id"),
@@ -110,6 +110,24 @@ const REQUIRED_COLUMNS: [(&str, &str); 144] = [
     ("provider_submit_recoveries", "next_recovery_at_ms"),
     ("provider_submit_recoveries", "recovery_owner"),
     ("provider_submit_recoveries", "recovery_lease_epoch"),
+    ("provider_remote_tasks", "provider_deadline_at_ms"),
+    ("provider_remote_tasks", "deadline_quarantine_id"),
+    ("provider_remote_task_quarantines", "quarantine_id"),
+    ("provider_remote_task_quarantines", "submission_id"),
+    ("provider_remote_task_quarantines", "executor_execution_id"),
+    ("provider_remote_task_quarantines", "provider_id"),
+    ("provider_remote_task_quarantines", "provider_account_id"),
+    ("provider_remote_task_quarantines", "remote_operation_id"),
+    (
+        "provider_remote_task_quarantines",
+        "provider_deadline_at_ms",
+    ),
+    ("provider_remote_task_quarantines", "error_code"),
+    ("provider_remote_task_quarantines", "quarantined_at_ms"),
+    (
+        "executor_resolution_decisions",
+        "provider_remote_task_quarantine_id",
+    ),
     ("provider_submit_recovery_commands", "provider_id"),
     ("provider_submit_recovery_commands", "provider_account_id"),
     ("provider_submit_recovery_commands", "command_owner"),
@@ -202,7 +220,7 @@ const REQUIRED_COLUMNS: [(&str, &str); 144] = [
     ("executor_resolution_decisions", "provider_submit_intent_id"),
 ];
 
-const REQUIRED_INDEXES: [&str; 24] = [
+const REQUIRED_INDEXES: [&str; 26] = [
     "usage_events_tenant_created_at_ms_idx",
     "gateway_api_keys_project_id_idx",
     "quota_reservations_active_tenant_idx",
@@ -220,6 +238,8 @@ const REQUIRED_INDEXES: [&str; 24] = [
     "provider_remote_tasks_poll_claim_idx",
     "provider_submit_recovery_commands_pkey",
     "provider_submit_recovery_commands_transition_uidx",
+    "provider_remote_task_quarantines_pkey",
+    "provider_remote_tasks_deadline_claim_idx",
     "provider_task_observations_manifest_uidx",
     "provider_submit_intents_remote_operation_uidx",
     "provider_submit_recoveries_claim_idx",
@@ -1116,9 +1136,9 @@ async fn assert_expected_schema(pool: &PgPool) -> TestResult {
         migration_versions(pool).await?
             == vec![
                 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22,
-                23, 24,
+                23, 24, 25,
             ],
-        "applied migration versions must be exactly [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24]",
+        "applied migration versions must be exactly [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25]",
     )?;
 
     for (table, column) in REQUIRED_COLUMNS {

@@ -13,7 +13,7 @@ use super::{
     ProviderArtifactAuthority, ProviderArtifactPublication, ProviderExecutionContext,
     ProviderRemoteTask, ProviderSubmitFailureKind, ProviderSubmitIntent, ProviderSubmitIntentState,
     ProviderSubmitInvocation, ProviderSubmitRecoveryLease, ProviderSubmitStart,
-    ProviderTaskClaimScope, ProviderTaskLease, ProviderTaskObservation,
+    ProviderTaskClaimScope, ProviderTaskDeadlineStore, ProviderTaskLease, ProviderTaskObservation,
     ProviderTaskObservationOutcome, ProviderTaskObservationSource, ProviderTaskState,
     ProviderTaskStore, ProviderTaskStoreError, RemoteTaskAttach, RemoteTaskSubmitFailure,
     RemoteTaskSubmitReceipt, RemoteTaskSubmitReservation, VerifiedCallbackWakeup,
@@ -23,6 +23,8 @@ const MAX_POLL_AFTER_MS: i64 = 24 * 60 * 60 * 1_000;
 const MAX_LEASE_MS: i64 = 24 * 60 * 60 * 1_000;
 const MAX_PROVIDER_TIMEOUT_MS: i64 = 30 * 24 * 60 * 60 * 1_000;
 const SUBMIT_DEADLINE_ERROR: &str = "provider_submit_deadline";
+const REMOTE_TASK_DEADLINE_ERROR: &str = "provider_remote_task_deadline";
+const ARTIFACT_RECOVERY_EVENT: &str = "internal:artifact-authority-recovery-v1";
 
 #[derive(Clone)]
 pub struct PostgresProviderTaskStore {
@@ -43,13 +45,17 @@ struct TaskRow {
     provider_account_id: Uuid,
     remote_operation_id: String,
     provider_request_id: Option<String>,
+    provider_deadline_at_ms: i64,
     state: String,
     artifact_ref: Option<String>,
     error_code: Option<String>,
     next_poll_at_ms: Option<i64>,
     cancel_requested: bool,
+    poll_owner: Option<String>,
     poll_lease_epoch: i64,
+    poll_lease_expires_at_ms: Option<i64>,
     state_observation_id: Uuid,
+    deadline_quarantine_id: Option<Uuid>,
     attach_recovery_owner: Option<String>,
     attach_recovery_lease_epoch: Option<i64>,
 }
@@ -178,6 +184,7 @@ struct ExistingObservation {
     poll_owner: Option<String>,
     poll_lease_epoch: Option<i64>,
     payload_hash: String,
+    observed_at_ms: i64,
 }
 
 #[derive(sqlx::FromRow)]
@@ -1194,7 +1201,7 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
         if recovery.state != "active" || !has_attach_authority {
             return Err(ProviderTaskStoreError::StaleLease);
         }
-        let next_poll_at_ms = now + request.poll_after_ms;
+        let next_poll_at_ms = (now + request.poll_after_ms).min(recovery.provider_deadline_at_ms);
         let observation_id = Uuid::new_v4();
         let payload_hash = observation_hash(
             "submit_attach",
@@ -1233,10 +1240,11 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
               (submission_id, executor_execution_id, provider_id, provider_account_id,
                remote_operation_id, provider_request_id, submit_owner, submit_lease_epoch,
                attach_recovery_owner, attach_recovery_lease_epoch,
-               state, effect_certainty, next_poll_at_ms, state_observation_id,
+               provider_deadline_at_ms, state, effect_certainty, next_poll_at_ms,
+               state_observation_id,
                created_at_ms, updated_at_ms)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-                    'provider_waiting', 'not_applicable', $11, $12, $13, $13)
+                    $11, 'provider_waiting', 'not_applicable', $12, $13, $14, $14)
             "#,
         )
         .bind(request.submission_id)
@@ -1259,6 +1267,7 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
                 .as_ref()
                 .map(|fence| fence.recovery_lease_epoch),
         )
+        .bind(recovery.provider_deadline_at_ms)
         .bind(next_poll_at_ms)
         .bind(observation_id)
         .bind(now)
@@ -1393,7 +1402,8 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
                      GREATEST(
                        task.next_poll_at_ms,
                        COALESCE(task.poll_lease_expires_at_ms, task.next_poll_at_ms)
-                     ) AS due_at
+                     ) AS due_at,
+                     task.provider_deadline_at_ms
               FROM provider_remote_tasks task
               CROSS JOIN db_clock
               WHERE task.provider_id = $1 AND task.provider_account_id = $2
@@ -1417,6 +1427,7 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
               CROSS JOIN db_clock
               WHERE task.provider_id = $1 AND task.provider_account_id = $2
                 AND task.state = 'provider_waiting'
+                AND task.provider_deadline_at_ms > db_clock.now_ms
                 AND GREATEST(
                       task.next_poll_at_ms,
                       COALESCE(task.poll_lease_expires_at_ms, task.next_poll_at_ms)
@@ -1427,7 +1438,10 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
             ), claimed AS (
               UPDATE provider_remote_tasks task
               SET poll_owner = $3, poll_lease_epoch = task.poll_lease_epoch + 1,
-                  poll_lease_expires_at_ms = candidate.now_ms + $4,
+                  poll_lease_expires_at_ms = LEAST(
+                    task.provider_deadline_at_ms,
+                    candidate.now_ms + $4
+                  ),
                   poll_claimed_at_ms = candidate.now_ms, updated_at_ms = candidate.now_ms
               FROM candidate
               WHERE task.submission_id = candidate.submission_id
@@ -1451,7 +1465,7 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
                    submission.resource_policy_id,
                    submission.resource_policy_revision,
                    intent.idempotency_key, recovery.invocation_attempt,
-                   recovery.provider_timeout_ms, recovery.provider_deadline_at_ms
+                   recovery.provider_timeout_ms, claimed.provider_deadline_at_ms
             FROM claimed
             JOIN provider_submissions submission
               ON submission.submission_id = claimed.submission_id
@@ -1464,6 +1478,7 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
               ON recovery.submission_id = claimed.submission_id
              AND recovery.executor_execution_id = claimed.executor_execution_id
              AND recovery.state = 'closed'
+             AND recovery.provider_deadline_at_ms = claimed.provider_deadline_at_ms
             JOIN provider_accounts account
               ON account.provider_account_id = submission.provider_account_id
              AND account.credential_pool_id = submission.credential_pool_id
@@ -1523,9 +1538,12 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
         let renewed: Option<(i64, i64)> = sqlx::query_as(
             r#"
             UPDATE provider_remote_tasks task
-            SET poll_lease_expires_at_ms = GREATEST(
-                  task.poll_lease_expires_at_ms + 1,
-                  $5 + $6
+            SET poll_lease_expires_at_ms = LEAST(
+                  task.provider_deadline_at_ms,
+                  GREATEST(
+                    task.poll_lease_expires_at_ms + 1,
+                    $5 + $6
+                  )
                 ),
                 updated_at_ms = $5
             WHERE task.submission_id = $1
@@ -1533,6 +1551,7 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
               AND task.poll_owner = $3 AND task.poll_lease_epoch = $4
               AND task.state = 'provider_waiting'
               AND task.poll_lease_expires_at_ms > $5
+              AND task.provider_deadline_at_ms > $5
             RETURNING task.poll_lease_expires_at_ms, task.updated_at_ms
             "#,
         )
@@ -1567,36 +1586,49 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
         if submission_id.is_nil() {
             return Err(ProviderTaskStoreError::InvalidInput);
         }
-        let row: Option<TaskRow> = sqlx::query_as(
+        let mut tx = self.pool.begin().await.map_err(unavailable)?;
+        let task = load_task_in(&mut tx, submission_id)
+            .await?
+            .ok_or(ProviderTaskStoreError::NotFound)?;
+        if task.state != "provider_waiting" || task.cancel_requested {
+            let task = task_from_row(task)?;
+            tx.commit().await.map_err(unavailable)?;
+            return Ok(task);
+        }
+        let now = database_now(&mut tx).await?;
+        if task.provider_deadline_at_ms <= now {
+            let task = resolve_remote_task_deadline_in(&mut tx, task, now).await?;
+            let task = task_from_row(task)?;
+            tx.commit().await.map_err(storage_conflict)?;
+            return Ok(task);
+        }
+        let row: TaskRow = sqlx::query_as(
             r#"
             UPDATE provider_remote_tasks
             SET cancel_requested = TRUE,
-                cancel_requested_at_ms =
-                  floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT,
-                next_poll_at_ms = LEAST(
-                  next_poll_at_ms,
-                  floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT
-                ),
-                updated_at_ms = floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT
+                cancel_requested_at_ms = $2,
+                next_poll_at_ms = LEAST(next_poll_at_ms, $2),
+                updated_at_ms = $2
             WHERE submission_id = $1 AND state = 'provider_waiting'
               AND cancel_requested = FALSE
             RETURNING submission_id, executor_execution_id, provider_id,
                       provider_account_id, remote_operation_id, provider_request_id,
-                      state, artifact_ref, error_code, next_poll_at_ms,
-                      cancel_requested, poll_lease_epoch, state_observation_id,
+                      provider_deadline_at_ms, state, artifact_ref, error_code,
+                      next_poll_at_ms,
+                      cancel_requested, poll_owner, poll_lease_epoch,
+                      poll_lease_expires_at_ms, state_observation_id,
+                      deadline_quarantine_id,
                       attach_recovery_owner, attach_recovery_lease_epoch
             "#,
         )
         .bind(submission_id)
-        .fetch_optional(&self.pool)
+        .bind(now)
+        .fetch_one(&mut *tx)
         .await
-        .map_err(unavailable)?;
-        if let Some(row) = row {
-            return task_from_row(row);
-        }
-        self.load(submission_id)
-            .await?
-            .ok_or(ProviderTaskStoreError::NotFound)
+        .map_err(storage_conflict)?;
+        let task = task_from_row(row)?;
+        tx.commit().await.map_err(storage_conflict)?;
+        Ok(task)
     }
 
     async fn record_observation(
@@ -1608,9 +1640,19 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
         validate_observation(observation)?;
         validate_artifact_observation_binding(lease, observation)?;
         let mut tx = self.pool.begin().await.map_err(unavailable)?;
+        let task = load_task_in(&mut tx, lease.task.submission_id)
+            .await?
+            .ok_or(ProviderTaskStoreError::StaleLease)?;
         let now = database_now(&mut tx).await?;
         let mut values = observation_values(observation, now);
+        if let Some(next_poll_at_ms) = values.next_poll_at_ms.as_mut() {
+            *next_poll_at_ms = (*next_poll_at_ms).min(task.provider_deadline_at_ms);
+        }
         let publication = values.publication;
+        let requested_poll_after_ms = match &observation.outcome {
+            ProviderTaskObservationOutcome::Waiting { poll_after_ms } => Some(*poll_after_ms),
+            _ => None,
+        };
         let payload_hash = observation_hash(
             values.source,
             values.state,
@@ -1621,36 +1663,58 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
             publication.map(|value| value.media_type.as_str()),
             values.error_code,
             values.effect_certainty,
-            values.next_poll_at_ms,
+            requested_poll_after_ms.or(values.next_poll_at_ms),
             Some(&lease.poll_owner),
             Some(lease.poll_lease_epoch),
         );
-        let persisted = insert_or_load_observation(
-            &mut tx,
-            &NewObservation {
-                submission_id: lease.task.submission_id,
-                executor_execution_id: lease.task.executor_execution_id,
-                event_identity: &observation.event_identity,
-                source: values.source,
-                state: values.state,
-                artifact_ref: values.artifact_ref,
-                result_manifest_id: publication.map(|value| value.manifest.manifest_id()),
-                artifact_sha256_hex: publication.map(|value| value.sha256_hex.as_str()),
-                artifact_byte_size: publication
-                    .map(|value| i64::try_from(value.byte_size))
-                    .transpose()
-                    .map_err(|_| ProviderTaskStoreError::InvalidInput)?,
-                artifact_media_type: publication.map(|value| value.media_type.as_str()),
-                error_code: values.error_code,
-                effect_certainty: values.effect_certainty,
-                next_poll_at_ms: values.next_poll_at_ms,
-                poll_owner: Some(&lease.poll_owner),
-                poll_lease_epoch: Some(lease.poll_lease_epoch),
-                payload_hash: &payload_hash,
-                now,
-            },
-        )
-        .await?;
+        let new_observation = NewObservation {
+            submission_id: lease.task.submission_id,
+            executor_execution_id: lease.task.executor_execution_id,
+            event_identity: &observation.event_identity,
+            source: values.source,
+            state: values.state,
+            artifact_ref: values.artifact_ref,
+            result_manifest_id: publication.map(|value| value.manifest.manifest_id()),
+            artifact_sha256_hex: publication.map(|value| value.sha256_hex.as_str()),
+            artifact_byte_size: publication
+                .map(|value| i64::try_from(value.byte_size))
+                .transpose()
+                .map_err(|_| ProviderTaskStoreError::InvalidInput)?,
+            artifact_media_type: publication.map(|value| value.media_type.as_str()),
+            error_code: values.error_code,
+            effect_certainty: values.effect_certainty,
+            next_poll_at_ms: values.next_poll_at_ms,
+            poll_owner: Some(&lease.poll_owner),
+            poll_lease_epoch: Some(lease.poll_lease_epoch),
+            payload_hash: &payload_hash,
+            requested_poll_after_ms,
+            now,
+        };
+        if let Some(persisted) = load_matching_observation(&mut tx, &new_observation).await? {
+            if task.state != values.state
+                || task.artifact_ref.as_deref() != values.artifact_ref
+                || task.error_code.as_deref() != values.error_code
+            {
+                return Err(ProviderTaskStoreError::Conflict);
+            }
+            values.next_poll_at_ms = persisted.next_poll_at_ms;
+            resolve_observed_terminal(&mut tx, &task, values.publication, now).await?;
+            let task = task_from_row(task)?;
+            tx.commit().await.map_err(unavailable)?;
+            return Ok(task);
+        }
+        if task.executor_execution_id != lease.task.executor_execution_id
+            || task.state != "provider_waiting"
+            || task.poll_owner.as_deref() != Some(lease.poll_owner.as_str())
+            || task.poll_lease_epoch != lease.poll_lease_epoch
+            || task
+                .poll_lease_expires_at_ms
+                .is_none_or(|expires_at_ms| expires_at_ms <= now)
+            || task.provider_deadline_at_ms <= now
+        {
+            return Err(ProviderTaskStoreError::StaleLease);
+        }
+        let persisted = insert_or_load_observation(&mut tx, &new_observation).await?;
         values.next_poll_at_ms = persisted.next_poll_at_ms;
         let observation_id = persisted.observation_id;
         let changed = sqlx::query(
@@ -1765,11 +1829,12 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
                 media_type: authority.media_type.clone(),
             });
         }
-        let locked_task: Option<(Uuid, Uuid, String, Option<String>, i64, Option<i64>)> =
+        let locked_task: Option<(Uuid, Uuid, String, Option<String>, i64, Option<i64>, i64)> =
             sqlx::query_as(
                 r#"
             SELECT submission.output_id, submission.job_id, task.state,
-                   task.poll_owner, task.poll_lease_epoch, task.poll_lease_expires_at_ms
+                   task.poll_owner, task.poll_lease_epoch, task.poll_lease_expires_at_ms,
+                   task.provider_deadline_at_ms
             FROM provider_remote_tasks task
             JOIN provider_submissions submission
               ON submission.submission_id = task.submission_id
@@ -1785,12 +1850,20 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
             .await
             .map_err(unavailable)?;
         let now = database_now(&mut tx).await?;
-        let (output_id, job_id, state, poll_owner, poll_lease_epoch, poll_lease_expires_at_ms) =
-            locked_task.ok_or(ProviderTaskStoreError::StaleLease)?;
+        let (
+            output_id,
+            job_id,
+            state,
+            poll_owner,
+            poll_lease_epoch,
+            poll_lease_expires_at_ms,
+            provider_deadline_at_ms,
+        ) = locked_task.ok_or(ProviderTaskStoreError::StaleLease)?;
         if state != "provider_waiting"
             || poll_owner.as_deref() != Some(lease.poll_owner.as_str())
             || poll_lease_epoch != lease.poll_lease_epoch
             || poll_lease_expires_at_ms.is_none_or(|expires_at_ms| expires_at_ms <= now)
+            || provider_deadline_at_ms <= now
         {
             return Err(ProviderTaskStoreError::StaleLease);
         }
@@ -1884,7 +1957,8 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
         &self,
         callback: &VerifiedCallbackWakeup,
     ) -> Result<ProviderRemoteTask, ProviderTaskStoreError> {
-        if callback.submission_id.is_nil() || !valid_identifier(&callback.event_identity, 255) {
+        if callback.submission_id.is_nil() || !valid_public_event_identity(&callback.event_identity)
+        {
             return Err(ProviderTaskStoreError::InvalidInput);
         }
         let mut tx = self.pool.begin().await.map_err(unavailable)?;
@@ -1897,6 +1971,12 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
             return Ok(task);
         }
         let now = database_now(&mut tx).await?;
+        if task.provider_deadline_at_ms <= now {
+            let task = resolve_remote_task_deadline_in(&mut tx, task, now).await?;
+            let task = task_from_row(task)?;
+            tx.commit().await.map_err(storage_conflict)?;
+            return Ok(task);
+        }
         let payload_hash = observation_hash(
             "verified_callback",
             "provider_waiting",
@@ -1930,6 +2010,7 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
                 poll_owner: None,
                 poll_lease_epoch: None,
                 payload_hash: &payload_hash,
+                requested_poll_after_ms: None,
                 now,
             },
         )
@@ -1968,6 +2049,67 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
     }
 }
 
+#[async_trait]
+impl ProviderTaskDeadlineStore for PostgresProviderTaskStore {
+    async fn resolve_due_remote_task_deadline(
+        &self,
+        scope: &ProviderTaskClaimScope,
+    ) -> Result<Option<ProviderRemoteTask>, ProviderTaskStoreError> {
+        validate_scope(scope)?;
+        let mut tx = self.pool.begin().await.map_err(unavailable)?;
+        let candidate: Option<(Uuid, i64)> = sqlx::query_as(
+            r#"
+            WITH db_clock AS MATERIALIZED (
+              SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT AS now_ms
+            ), candidate_window AS MATERIALIZED (
+              SELECT task.submission_id, task.executor_execution_id,
+                     task.provider_deadline_at_ms
+              FROM provider_remote_tasks task
+              CROSS JOIN db_clock
+              WHERE task.provider_id = $1 AND task.provider_account_id = $2
+                AND task.state = 'provider_waiting'
+                AND task.provider_deadline_at_ms <= db_clock.now_ms
+              ORDER BY task.provider_deadline_at_ms, task.submission_id
+              LIMIT 64
+            ), candidate AS (
+              SELECT task.submission_id, db_clock.now_ms
+              FROM candidate_window candidates
+              JOIN provider_remote_tasks task
+                ON task.submission_id = candidates.submission_id
+               AND task.executor_execution_id = candidates.executor_execution_id
+              JOIN executor_capacity_allocations allocation
+                ON allocation.executor_execution_id = task.executor_execution_id
+               AND allocation.submission_id = task.submission_id
+               AND allocation.state = 'held'
+              CROSS JOIN db_clock
+              WHERE task.state = 'provider_waiting'
+                AND task.provider_deadline_at_ms <= db_clock.now_ms
+              ORDER BY candidates.provider_deadline_at_ms, candidates.submission_id
+              FOR UPDATE OF task SKIP LOCKED
+              LIMIT 1
+            )
+            SELECT submission_id, now_ms FROM candidate
+            "#,
+        )
+        .bind(&scope.provider_id)
+        .bind(scope.provider_account_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(unavailable)?;
+        let Some((submission_id, now)) = candidate else {
+            tx.commit().await.map_err(unavailable)?;
+            return Ok(None);
+        };
+        let task = load_task_in(&mut tx, submission_id)
+            .await?
+            .ok_or(ProviderTaskStoreError::NotFound)?;
+        let task = resolve_remote_task_deadline_in(&mut tx, task, now).await?;
+        let task = task_from_row(task)?;
+        tx.commit().await.map_err(storage_conflict)?;
+        Ok(Some(task))
+    }
+}
+
 struct ObservationValues<'a> {
     source: &'static str,
     state: &'static str,
@@ -1976,6 +2118,250 @@ struct ObservationValues<'a> {
     error_code: Option<&'a str>,
     effect_certainty: &'static str,
     next_poll_at_ms: Option<i64>,
+}
+
+async fn resolve_remote_task_deadline_in(
+    tx: &mut Transaction<'_, Postgres>,
+    task: TaskRow,
+    now: i64,
+) -> Result<TaskRow, ProviderTaskStoreError> {
+    if task.state != "provider_waiting" {
+        return Ok(task);
+    }
+    if task.provider_deadline_at_ms > now || task.deadline_quarantine_id.is_some() {
+        return Err(ProviderTaskStoreError::StaleLease);
+    }
+    if let Some(publication) = load_published_artifact_in(tx, &task).await? {
+        return recover_published_artifact_in(tx, task, publication, now).await;
+    }
+
+    let quarantine_id = task.executor_execution_id;
+    sqlx::query(
+        r#"
+        INSERT INTO provider_remote_task_quarantines
+          (quarantine_id, submission_id, executor_execution_id,
+           provider_id, provider_account_id, remote_operation_id,
+           provider_deadline_at_ms, error_code, quarantined_at_ms)
+        VALUES ($1, $2, $1, $3, $4, $5, $6, $7, $8)
+        "#,
+    )
+    .bind(quarantine_id)
+    .bind(task.submission_id)
+    .bind(&task.provider_id)
+    .bind(task.provider_account_id)
+    .bind(&task.remote_operation_id)
+    .bind(task.provider_deadline_at_ms)
+    .bind(REMOTE_TASK_DEADLINE_ERROR)
+    .bind(now)
+    .execute(&mut **tx)
+    .await
+    .map_err(storage_conflict)?;
+    require_one(
+        sqlx::query(
+            r#"
+            UPDATE provider_remote_tasks
+            SET state = 'uncertain', artifact_ref = NULL,
+                error_code = $3, effect_certainty = 'unknown_remote_effect',
+                next_poll_at_ms = NULL, poll_owner = NULL,
+                poll_lease_expires_at_ms = NULL, poll_claimed_at_ms = NULL,
+                deadline_quarantine_id = $1,
+                updated_at_ms = $4, terminal_at_ms = $4
+            WHERE submission_id = $2
+              AND executor_execution_id = $1
+              AND state = 'provider_waiting'
+              AND provider_deadline_at_ms <= $4
+            "#,
+        )
+        .bind(quarantine_id)
+        .bind(task.submission_id)
+        .bind(REMOTE_TASK_DEADLINE_ERROR)
+        .bind(now)
+        .execute(&mut **tx)
+        .await
+        .map_err(storage_conflict)?,
+        ProviderTaskStoreError::Conflict,
+    )?;
+    sqlx::query(
+        r#"
+        INSERT INTO executor_resolution_decisions
+          (decision_id, executor_execution_id, submission_id, source,
+           observation_id, provider_task_observation_id,
+           provider_submit_intent_id, provider_remote_task_quarantine_id,
+           resolved_state, result_manifest_id, error_code, decided_at_ms)
+        VALUES ($1, $1, $2, 'remote_task_deadline',
+                NULL, NULL, NULL, $1, 'uncertain', NULL, $3, $4)
+        "#,
+    )
+    .bind(quarantine_id)
+    .bind(task.submission_id)
+    .bind(REMOTE_TASK_DEADLINE_ERROR)
+    .bind(now)
+    .execute(&mut **tx)
+    .await
+    .map_err(storage_conflict)?;
+    require_one(
+        sqlx::query(
+            r#"
+            UPDATE executor_executions
+            SET state = 'uncertain', executor_owner = NULL,
+                lease_expires_at_ms = NULL, resolution_decision_id = $1,
+                finished_at_ms = $3, updated_at_ms = $3, error_code = $4
+            WHERE executor_execution_id = $1 AND submission_id = $2
+              AND state = 'provider_waiting'
+              AND executor_owner IS NULL AND lease_expires_at_ms IS NULL
+            "#,
+        )
+        .bind(quarantine_id)
+        .bind(task.submission_id)
+        .bind(now)
+        .bind(REMOTE_TASK_DEADLINE_ERROR)
+        .execute(&mut **tx)
+        .await
+        .map_err(storage_conflict)?,
+        ProviderTaskStoreError::Conflict,
+    )?;
+    require_one(
+        sqlx::query(
+            r#"
+            UPDATE provider_submissions
+            SET state = 'uncertain', result_manifest_id = NULL,
+                resolution_decision_id = $1, finished_at_ms = $3,
+                updated_at_ms = $3, error_code = $4
+            WHERE executor_execution_id = $1 AND submission_id = $2
+              AND state = 'provider_waiting'
+            "#,
+        )
+        .bind(quarantine_id)
+        .bind(task.submission_id)
+        .bind(now)
+        .bind(REMOTE_TASK_DEADLINE_ERROR)
+        .execute(&mut **tx)
+        .await
+        .map_err(storage_conflict)?,
+        ProviderTaskStoreError::Conflict,
+    )?;
+    load_task_in(tx, task.submission_id)
+        .await?
+        .ok_or(ProviderTaskStoreError::NotFound)
+}
+
+async fn load_published_artifact_in(
+    tx: &mut Transaction<'_, Postgres>,
+    task: &TaskRow,
+) -> Result<Option<ProviderArtifactPublication>, ProviderTaskStoreError> {
+    let row: Option<(Uuid, String, i64, String)> = sqlx::query_as(
+        r#"
+        SELECT manifest.manifest_id, authority.sha256_hex,
+               authority.byte_size, authority.media_type
+        FROM executor_result_manifests manifest
+        JOIN executor_artifact_authorities authority
+          ON authority.authority_id = manifest.artifact_authority_id
+         AND authority.executor_execution_id = manifest.executor_execution_id
+         AND authority.submission_id = manifest.submission_id
+        WHERE manifest.executor_execution_id = $1
+          AND manifest.submission_id = $2
+        "#,
+    )
+    .bind(task.executor_execution_id)
+    .bind(task.submission_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(unavailable)?;
+    let Some((manifest_id, sha256_hex, byte_size, media_type)) = row else {
+        return Ok(None);
+    };
+    let manifest = ExecutorResultManifest::new(task.submission_id, task.executor_execution_id)
+        .ok_or(ProviderTaskStoreError::Conflict)?;
+    if manifest.manifest_id() != manifest_id {
+        return Err(ProviderTaskStoreError::Conflict);
+    }
+    Ok(Some(ProviderArtifactPublication {
+        manifest,
+        sha256_hex,
+        byte_size: u64::try_from(byte_size).map_err(|_| ProviderTaskStoreError::Conflict)?,
+        media_type,
+    }))
+}
+
+async fn recover_published_artifact_in(
+    tx: &mut Transaction<'_, Postgres>,
+    task: TaskRow,
+    publication: ProviderArtifactPublication,
+    now: i64,
+) -> Result<TaskRow, ProviderTaskStoreError> {
+    let artifact_ref = format!("manifest:{}", publication.manifest.manifest_id().simple());
+    let payload_hash = observation_hash(
+        "artifact_recovery",
+        "artifact_ready",
+        Some(&artifact_ref),
+        Some(publication.manifest.manifest_id()),
+        Some(&publication.sha256_hex),
+        Some(publication.byte_size),
+        Some(&publication.media_type),
+        None,
+        "not_applicable",
+        None,
+        None,
+        None,
+    );
+    let persisted = insert_or_load_observation(
+        tx,
+        &NewObservation {
+            submission_id: task.submission_id,
+            executor_execution_id: task.executor_execution_id,
+            event_identity: ARTIFACT_RECOVERY_EVENT,
+            source: "artifact_recovery",
+            state: "artifact_ready",
+            artifact_ref: Some(&artifact_ref),
+            result_manifest_id: Some(publication.manifest.manifest_id()),
+            artifact_sha256_hex: Some(&publication.sha256_hex),
+            artifact_byte_size: Some(
+                i64::try_from(publication.byte_size)
+                    .map_err(|_| ProviderTaskStoreError::Conflict)?,
+            ),
+            artifact_media_type: Some(&publication.media_type),
+            error_code: None,
+            effect_certainty: "not_applicable",
+            next_poll_at_ms: None,
+            poll_owner: None,
+            poll_lease_epoch: None,
+            payload_hash: &payload_hash,
+            requested_poll_after_ms: None,
+            now,
+        },
+    )
+    .await?;
+    require_one(
+        sqlx::query(
+            r#"
+            UPDATE provider_remote_tasks
+            SET state = 'artifact_ready', artifact_ref = $3,
+                error_code = NULL, effect_certainty = 'not_applicable',
+                next_poll_at_ms = NULL, poll_owner = NULL,
+                poll_lease_expires_at_ms = NULL, poll_claimed_at_ms = NULL,
+                state_observation_id = $4, updated_at_ms = $5,
+                terminal_at_ms = $5
+            WHERE submission_id = $1 AND executor_execution_id = $2
+              AND state = 'provider_waiting'
+              AND provider_deadline_at_ms <= $5
+              AND deadline_quarantine_id IS NULL
+            "#,
+        )
+        .bind(task.submission_id)
+        .bind(task.executor_execution_id)
+        .bind(&artifact_ref)
+        .bind(persisted.observation_id)
+        .bind(now)
+        .execute(&mut **tx)
+        .await
+        .map_err(storage_conflict)?,
+        ProviderTaskStoreError::Conflict,
+    )?;
+    let row = load_task_in(tx, task.submission_id)
+        .await?
+        .ok_or(ProviderTaskStoreError::NotFound)?;
+    resolve_observed_terminal(tx, &row, Some(&publication), now).await?;
+    Ok(row)
 }
 
 async fn resolve_submit_deadline_terminal(
@@ -2389,6 +2775,7 @@ struct NewObservation<'a> {
     poll_owner: Option<&'a str>,
     poll_lease_epoch: Option<i64>,
     payload_hash: &'a str,
+    requested_poll_after_ms: Option<i64>,
     now: i64,
 }
 
@@ -2438,21 +2825,33 @@ async fn insert_or_load_observation(
             next_poll_at_ms: observation.next_poll_at_ms,
         });
     }
-    let existing: ExistingObservation = sqlx::query_as(
+    load_matching_observation(tx, observation)
+        .await?
+        .ok_or(ProviderTaskStoreError::Conflict)
+}
+
+async fn load_matching_observation(
+    tx: &mut Transaction<'_, Postgres>,
+    observation: &NewObservation<'_>,
+) -> Result<Option<PersistedObservation>, ProviderTaskStoreError> {
+    let existing: Option<ExistingObservation> = sqlx::query_as(
         r#"
         SELECT observation_id, source, observed_state, artifact_ref,
                result_manifest_id, artifact_sha256_hex, artifact_byte_size,
                artifact_media_type, error_code, effect_certainty, next_poll_at_ms,
-               poll_owner, poll_lease_epoch, payload_hash
+               poll_owner, poll_lease_epoch, payload_hash, observed_at_ms
         FROM provider_task_observations
         WHERE submission_id = $1 AND event_identity = $2
         "#,
     )
     .bind(observation.submission_id)
     .bind(observation.event_identity)
-    .fetch_one(&mut **tx)
+    .fetch_optional(&mut **tx)
     .await
     .map_err(unavailable)?;
+    let Some(existing) = existing else {
+        return Ok(None);
+    };
     let stable_payload_matches = existing.source == observation.source
         && existing.observed_state == observation.state
         && existing.artifact_ref.as_deref() == observation.artifact_ref
@@ -2465,17 +2864,53 @@ async fn insert_or_load_observation(
         && existing.poll_owner.as_deref() == observation.poll_owner
         && existing.poll_lease_epoch == observation.poll_lease_epoch;
     let time_dependent_replay = observation.source == "verified_callback"
-        || (observation.state == "provider_waiting" && stable_payload_matches);
+        || (observation.state == "provider_waiting"
+            && stable_payload_matches
+            && (existing.payload_hash == observation.payload_hash
+                || legacy_waiting_replay_matches(&existing, observation)));
     let exact_replay = existing.next_poll_at_ms == observation.next_poll_at_ms
         && existing.payload_hash == observation.payload_hash;
     if stable_payload_matches && (time_dependent_replay || exact_replay) {
-        Ok(PersistedObservation {
+        Ok(Some(PersistedObservation {
             observation_id: existing.observation_id,
             next_poll_at_ms: existing.next_poll_at_ms,
-        })
+        }))
     } else {
         Err(ProviderTaskStoreError::Conflict)
     }
+}
+
+fn legacy_waiting_replay_matches(
+    existing: &ExistingObservation,
+    observation: &NewObservation<'_>,
+) -> bool {
+    let Some(requested_poll_after_ms) = observation.requested_poll_after_ms else {
+        return false;
+    };
+    if existing
+        .next_poll_at_ms
+        .and_then(|next| next.checked_sub(existing.observed_at_ms))
+        != Some(requested_poll_after_ms)
+    {
+        return false;
+    }
+    let legacy_payload_hash = observation_hash(
+        &existing.source,
+        &existing.observed_state,
+        existing.artifact_ref.as_deref(),
+        existing.result_manifest_id,
+        existing.artifact_sha256_hex.as_deref(),
+        existing
+            .artifact_byte_size
+            .and_then(|value| u64::try_from(value).ok()),
+        existing.artifact_media_type.as_deref(),
+        existing.error_code.as_deref(),
+        &existing.effect_certainty,
+        existing.next_poll_at_ms,
+        existing.poll_owner.as_deref(),
+        existing.poll_lease_epoch,
+    );
+    existing.payload_hash == legacy_payload_hash
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2532,8 +2967,10 @@ async fn load_task(
     sqlx::query_as(
         r#"
         SELECT submission_id, executor_execution_id, provider_id, provider_account_id,
-               remote_operation_id, provider_request_id, state, artifact_ref, error_code,
-               next_poll_at_ms, cancel_requested, poll_lease_epoch, state_observation_id,
+               remote_operation_id, provider_request_id, provider_deadline_at_ms,
+               state, artifact_ref, error_code, next_poll_at_ms, cancel_requested,
+               poll_owner, poll_lease_epoch, poll_lease_expires_at_ms,
+               state_observation_id, deadline_quarantine_id,
                attach_recovery_owner, attach_recovery_lease_epoch
         FROM provider_remote_tasks
         WHERE submission_id = $1
@@ -3107,8 +3544,10 @@ async fn load_task_in(
     sqlx::query_as(
         r#"
         SELECT submission_id, executor_execution_id, provider_id, provider_account_id,
-               remote_operation_id, provider_request_id, state, artifact_ref, error_code,
-               next_poll_at_ms, cancel_requested, poll_lease_epoch, state_observation_id,
+               remote_operation_id, provider_request_id, provider_deadline_at_ms,
+               state, artifact_ref, error_code, next_poll_at_ms, cancel_requested,
+               poll_owner, poll_lease_epoch, poll_lease_expires_at_ms,
+               state_observation_id, deadline_quarantine_id,
                attach_recovery_owner, attach_recovery_lease_epoch
         FROM provider_remote_tasks
         WHERE submission_id = $1
@@ -3128,8 +3567,10 @@ async fn load_task_snapshot_in(
     sqlx::query_as(
         r#"
         SELECT submission_id, executor_execution_id, provider_id, provider_account_id,
-               remote_operation_id, provider_request_id, state, artifact_ref, error_code,
-               next_poll_at_ms, cancel_requested, poll_lease_epoch, state_observation_id,
+               remote_operation_id, provider_request_id, provider_deadline_at_ms,
+               state, artifact_ref, error_code, next_poll_at_ms, cancel_requested,
+               poll_owner, poll_lease_epoch, poll_lease_expires_at_ms,
+               state_observation_id, deadline_quarantine_id,
                attach_recovery_owner, attach_recovery_lease_epoch
         FROM provider_remote_tasks
         WHERE submission_id = $1
@@ -3202,13 +3643,17 @@ fn lease_from_row(row: ClaimRow) -> Result<ProviderTaskLease, ProviderTaskStoreE
             provider_account_id,
             remote_operation_id,
             provider_request_id,
+            provider_deadline_at_ms,
             state,
             artifact_ref,
             error_code,
             next_poll_at_ms,
             cancel_requested,
+            poll_owner: Some(poll_owner.clone()),
             poll_lease_epoch,
+            poll_lease_expires_at_ms: Some(poll_lease_expires_at_ms),
             state_observation_id,
+            deadline_quarantine_id: None,
             attach_recovery_owner,
             attach_recovery_lease_epoch,
         })?,
@@ -3257,7 +3702,7 @@ fn validate_attach(value: &RemoteTaskAttach) -> Result<(), ProviderTaskStoreErro
             .provider_request_id
             .as_deref()
             .is_some_and(|id| !valid_identifier(id, 255))
-        || !valid_identifier(&value.event_identity, 255)
+        || !valid_public_event_identity(&value.event_identity)
         || !(0..=MAX_POLL_AFTER_MS).contains(&value.poll_after_ms)
         || value.recovery_fence.as_ref().is_some_and(|fence| {
             !valid_owner(&fence.recovery_owner) || fence.recovery_lease_epoch <= 0
@@ -3399,7 +3844,7 @@ fn validate_recovery_lease(
 }
 
 fn validate_observation(value: &ProviderTaskObservation) -> Result<(), ProviderTaskStoreError> {
-    if !valid_identifier(&value.event_identity, 255) {
+    if !valid_public_event_identity(&value.event_identity) {
         return Err(ProviderTaskStoreError::InvalidInput);
     }
     let valid = match &value.outcome {
@@ -3463,6 +3908,10 @@ fn valid_identifier(value: &str, max: usize) -> bool {
             byte.is_ascii_alphanumeric()
                 || (index > 0 && matches!(byte, b'.' | b'_' | b':' | b'@' | b'/' | b'-'))
         })
+}
+
+fn valid_public_event_identity(value: &str) -> bool {
+    value != ARTIFACT_RECOVERY_EVENT && valid_identifier(value, 255)
 }
 
 fn valid_simple_identifier(value: &str, max: usize) -> bool {
@@ -3595,5 +4044,85 @@ fn map_executor_error(error: ExecutorSubmissionError) -> ProviderTaskStoreError 
         ExecutorSubmissionError::Conflict | ExecutorSubmissionError::StaleLease => {
             ProviderTaskStoreError::Conflict
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_waiting_replay_requires_the_original_relative_delay() {
+        let observed_at_ms = 1_000;
+        let next_poll_at_ms = 1_250;
+        let poll_owner = "legacy-poller";
+        let legacy_hash = observation_hash(
+            "poll",
+            "provider_waiting",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            "not_applicable",
+            Some(next_poll_at_ms),
+            Some(poll_owner),
+            Some(1),
+        );
+        let existing = ExistingObservation {
+            observation_id: Uuid::new_v4(),
+            source: "poll".to_string(),
+            observed_state: "provider_waiting".to_string(),
+            artifact_ref: None,
+            result_manifest_id: None,
+            artifact_sha256_hex: None,
+            artifact_byte_size: None,
+            artifact_media_type: None,
+            error_code: None,
+            effect_certainty: "not_applicable".to_string(),
+            next_poll_at_ms: Some(next_poll_at_ms),
+            poll_owner: Some(poll_owner.to_string()),
+            poll_lease_epoch: Some(1),
+            payload_hash: legacy_hash,
+            observed_at_ms,
+        };
+        let semantic_hash = observation_hash(
+            "poll",
+            "provider_waiting",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            "not_applicable",
+            Some(250),
+            Some(poll_owner),
+            Some(1),
+        );
+        let mut replay = NewObservation {
+            submission_id: Uuid::new_v4(),
+            executor_execution_id: Uuid::new_v4(),
+            event_identity: "legacy-waiting",
+            source: "poll",
+            state: "provider_waiting",
+            artifact_ref: None,
+            result_manifest_id: None,
+            artifact_sha256_hex: None,
+            artifact_byte_size: None,
+            artifact_media_type: None,
+            error_code: None,
+            effect_certainty: "not_applicable",
+            next_poll_at_ms: Some(2_250),
+            poll_owner: Some(poll_owner),
+            poll_lease_epoch: Some(1),
+            payload_hash: &semantic_hash,
+            requested_poll_after_ms: Some(250),
+            now: 2_000,
+        };
+        assert!(legacy_waiting_replay_matches(&existing, &replay));
+        replay.requested_poll_after_ms = Some(251);
+        assert!(!legacy_waiting_replay_matches(&existing, &replay));
     }
 }
