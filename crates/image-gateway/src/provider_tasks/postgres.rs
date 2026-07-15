@@ -9,10 +9,12 @@ use crate::executor::{
 };
 
 use super::{
-    ProviderArtifactAuthority, ProviderRemoteTask, ProviderSubmitIntent, ProviderTaskClaimScope,
-    ProviderTaskLease, ProviderTaskObservation, ProviderTaskObservationOutcome,
-    ProviderTaskObservationSource, ProviderTaskState, ProviderTaskStore, ProviderTaskStoreError,
-    RemoteTaskAttach, RemoteTaskSubmitReservation, VerifiedCallbackWakeup,
+    ProviderArtifactAuthority, ProviderRemoteTask, ProviderSubmitFailureKind, ProviderSubmitIntent,
+    ProviderSubmitIntentState, ProviderSubmitStart, ProviderTaskClaimScope, ProviderTaskLease,
+    ProviderTaskObservation, ProviderTaskObservationOutcome, ProviderTaskObservationSource,
+    ProviderTaskState, ProviderTaskStore, ProviderTaskStoreError, RemoteTaskAttach,
+    RemoteTaskSubmitFailure, RemoteTaskSubmitReceipt, RemoteTaskSubmitReservation,
+    VerifiedCallbackWakeup,
 };
 
 const MAX_POLL_AFTER_MS: i64 = 24 * 60 * 60 * 1_000;
@@ -85,6 +87,7 @@ struct ResolutionDecisionRow {
     result_manifest_id: Option<Uuid>,
     error_code: Option<String>,
     provider_task_observation_id: Option<Uuid>,
+    provider_submit_intent_id: Option<Uuid>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -98,6 +101,25 @@ struct SubmitIntentRow {
     idempotency_key: String,
     state: String,
     remote_operation_id: Option<String>,
+    provider_request_id: Option<String>,
+    send_started_at_ms: Option<i64>,
+    receipt_event_identity: Option<String>,
+    failure_event_identity: Option<String>,
+    failure_error_code: Option<String>,
+    updated_at_ms: i64,
+}
+
+#[derive(sqlx::FromRow)]
+struct SubmitParentRow {
+    provider_id: String,
+    provider_account_id: Uuid,
+    execution_state: String,
+    submission_state: String,
+    executor_owner: Option<String>,
+    lease_epoch: i64,
+    launch_owner: Option<String>,
+    launch_lease_epoch: Option<i64>,
+    allocation_state: String,
 }
 
 #[async_trait]
@@ -197,66 +219,244 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
         Ok(intent)
     }
 
+    async fn start_submit(
+        &self,
+        request: &RemoteTaskSubmitReservation,
+    ) -> Result<ProviderSubmitStart, ProviderTaskStoreError> {
+        validate_reservation(request)?;
+        let mut tx = self.pool.begin().await.map_err(unavailable)?;
+        if !lock_live_submit_fence(&mut tx, request).await? {
+            return Err(ProviderTaskStoreError::StaleLease);
+        }
+        let row = load_submit_intent_in(&mut tx, request.submission_id)
+            .await?
+            .ok_or(ProviderTaskStoreError::NotFound)?;
+        if !submit_intent_matches_reservation(&row, request) {
+            return Err(ProviderTaskStoreError::Conflict);
+        }
+        let intent = submit_intent_from_row(row)?;
+        if intent.state != ProviderSubmitIntentState::Reserved {
+            tx.commit().await.map_err(unavailable)?;
+            return Ok(ProviderSubmitStart::Existing(intent));
+        }
+        let now = database_now(&mut tx).await?;
+        require_one(
+            sqlx::query(
+                r#"
+                UPDATE provider_remote_submit_intents
+                SET state = 'sending', send_started_at_ms = $3, updated_at_ms = $3
+                WHERE submission_id = $1 AND executor_execution_id = $2
+                  AND state = 'reserved'
+                "#,
+            )
+            .bind(request.submission_id)
+            .bind(request.executor_execution_id)
+            .bind(now)
+            .execute(&mut *tx)
+            .await
+            .map_err(storage_conflict)?,
+            ProviderTaskStoreError::Conflict,
+        )?;
+        let intent = submit_intent_from_row(
+            load_submit_intent_in(&mut tx, request.submission_id)
+                .await?
+                .ok_or(ProviderTaskStoreError::NotFound)?,
+        )?;
+        tx.commit().await.map_err(unavailable)?;
+        Ok(ProviderSubmitStart::Acquired(intent))
+    }
+
+    async fn record_submit_failure(
+        &self,
+        request: &RemoteTaskSubmitFailure,
+    ) -> Result<ProviderSubmitIntent, ProviderTaskStoreError> {
+        validate_submit_failure(request)?;
+        let mut tx = self.pool.begin().await.map_err(unavailable)?;
+        let parent = lock_submit_parent(
+            &mut tx,
+            request.executor_execution_id,
+            request.submission_id,
+        )
+        .await?;
+        let row = load_submit_intent_in(&mut tx, request.submission_id)
+            .await?
+            .ok_or(ProviderTaskStoreError::NotFound)?;
+        if row.executor_execution_id != request.executor_execution_id
+            || row.submit_owner != request.executor_owner
+            || row.submit_lease_epoch != request.executor_lease_epoch
+        {
+            return Err(ProviderTaskStoreError::Conflict);
+        }
+        let target_state = match request.kind {
+            ProviderSubmitFailureKind::Rejected => "rejected",
+            ProviderSubmitFailureKind::OutcomeUnknown => "outcome_unknown",
+        };
+        if row.state != "sending" {
+            let intent = submit_intent_from_row(row)?;
+            let compatible_state = match request.kind {
+                ProviderSubmitFailureKind::Rejected => {
+                    intent.state == ProviderSubmitIntentState::Rejected
+                }
+                ProviderSubmitFailureKind::OutcomeUnknown => matches!(
+                    intent.state,
+                    ProviderSubmitIntentState::OutcomeUnknown
+                        | ProviderSubmitIntentState::OperationKnown
+                        | ProviderSubmitIntentState::Attached
+                ),
+            };
+            let replay = compatible_state
+                && intent.failure_event_identity.as_deref() == Some(&request.event_identity)
+                && intent.failure_error_code.as_deref() == Some(&request.error_code);
+            if replay {
+                tx.commit().await.map_err(unavailable)?;
+                return Ok(intent);
+            }
+            return Err(ProviderTaskStoreError::Conflict);
+        }
+        if !submit_parent_accepts_evidence(&parent, &row) {
+            return Err(ProviderTaskStoreError::Conflict);
+        }
+        let now = database_now(&mut tx).await?;
+        require_one(
+            sqlx::query(
+                r#"
+                UPDATE provider_remote_submit_intents
+                SET state = $3, failure_event_identity = $4,
+                    failure_error_code = $5, updated_at_ms = $6
+                WHERE submission_id = $1 AND executor_execution_id = $2
+                  AND state = 'sending'
+                "#,
+            )
+            .bind(request.submission_id)
+            .bind(request.executor_execution_id)
+            .bind(target_state)
+            .bind(&request.event_identity)
+            .bind(&request.error_code)
+            .bind(now)
+            .execute(&mut *tx)
+            .await
+            .map_err(storage_conflict)?,
+            ProviderTaskStoreError::Conflict,
+        )?;
+        let intent = submit_intent_from_row(
+            load_submit_intent_in(&mut tx, request.submission_id)
+                .await?
+                .ok_or(ProviderTaskStoreError::NotFound)?,
+        )?;
+        if request.kind == ProviderSubmitFailureKind::Rejected {
+            resolve_submit_terminal(&mut tx, &intent, "failed", now).await?;
+        }
+        tx.commit().await.map_err(unavailable)?;
+        Ok(intent)
+    }
+
+    async fn record_submit_receipt(
+        &self,
+        request: &RemoteTaskSubmitReceipt,
+    ) -> Result<ProviderSubmitIntent, ProviderTaskStoreError> {
+        validate_submit_receipt(request)?;
+        let mut tx = self.pool.begin().await.map_err(unavailable)?;
+        let parent = lock_submit_parent(
+            &mut tx,
+            request.executor_execution_id,
+            request.submission_id,
+        )
+        .await?;
+        let row = load_submit_intent_in(&mut tx, request.submission_id)
+            .await?
+            .ok_or(ProviderTaskStoreError::NotFound)?;
+        if row.executor_execution_id != request.executor_execution_id
+            || row.submit_owner != request.executor_owner
+            || row.submit_lease_epoch != request.executor_lease_epoch
+        {
+            return Err(ProviderTaskStoreError::Conflict);
+        }
+        if !matches!(row.state.as_str(), "sending" | "outcome_unknown") {
+            let intent = submit_intent_from_row(row)?;
+            let replay = matches!(
+                intent.state,
+                ProviderSubmitIntentState::OperationKnown | ProviderSubmitIntentState::Attached
+            ) && intent.remote_operation_id.as_deref()
+                == Some(&request.remote_operation_id)
+                && intent.provider_request_id == request.provider_request_id
+                && intent.receipt_event_identity.as_deref() == Some(&request.event_identity);
+            if replay {
+                tx.commit().await.map_err(unavailable)?;
+                return Ok(intent);
+            }
+            return Err(ProviderTaskStoreError::Conflict);
+        }
+        if !submit_parent_accepts_evidence(&parent, &row) {
+            return Err(ProviderTaskStoreError::Conflict);
+        }
+        let now = database_now(&mut tx).await?;
+        require_one(
+            sqlx::query(
+                r#"
+                UPDATE provider_remote_submit_intents
+                SET state = 'operation_known', remote_operation_id = $3,
+                    provider_request_id = $4, receipt_event_identity = $5,
+                    updated_at_ms = $6
+                WHERE submission_id = $1 AND executor_execution_id = $2
+                  AND state IN ('sending', 'outcome_unknown')
+                "#,
+            )
+            .bind(request.submission_id)
+            .bind(request.executor_execution_id)
+            .bind(&request.remote_operation_id)
+            .bind(&request.provider_request_id)
+            .bind(&request.event_identity)
+            .bind(now)
+            .execute(&mut *tx)
+            .await
+            .map_err(storage_conflict)?,
+            ProviderTaskStoreError::Conflict,
+        )?;
+        let intent = submit_intent_from_row(
+            load_submit_intent_in(&mut tx, request.submission_id)
+                .await?
+                .ok_or(ProviderTaskStoreError::NotFound)?,
+        )?;
+        tx.commit().await.map_err(unavailable)?;
+        Ok(intent)
+    }
+
+    async fn load_submit_intent(
+        &self,
+        submission_id: Uuid,
+    ) -> Result<Option<ProviderSubmitIntent>, ProviderTaskStoreError> {
+        if submission_id.is_nil() {
+            return Err(ProviderTaskStoreError::InvalidInput);
+        }
+        load_submit_intent(&self.pool, submission_id)
+            .await?
+            .map(submit_intent_from_row)
+            .transpose()
+    }
+
     async fn attach(
         &self,
         request: &RemoteTaskAttach,
     ) -> Result<ProviderRemoteTask, ProviderTaskStoreError> {
         validate_attach(request)?;
         let mut tx = self.pool.begin().await.map_err(unavailable)?;
-        let binding: Option<(
-            String,
-            Uuid,
-            String,
-            Option<String>,
-            i64,
-            String,
-            Option<i64>,
-            Option<i64>,
-        )> = sqlx::query_as(
-            r#"
-                SELECT submission.provider_id, submission.provider_account_id,
-                       submission.state, execution.executor_owner, execution.lease_epoch,
-                       execution.state, execution.launch_lease_epoch,
-                       execution.lease_expires_at_ms
-                FROM provider_submissions submission
-                JOIN executor_executions execution
-                  ON execution.executor_execution_id = submission.executor_execution_id
-                 AND execution.submission_id = submission.submission_id
-                WHERE submission.submission_id = $1
-                  AND submission.executor_execution_id = $2
-                FOR UPDATE OF submission, execution
-                "#,
+        let parent = lock_submit_parent(
+            &mut tx,
+            request.executor_execution_id,
+            request.submission_id,
         )
-        .bind(request.submission_id)
-        .bind(request.executor_execution_id)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(unavailable)?;
-        let Some((
-            provider_id,
-            provider_account_id,
-            submission_state,
-            owner,
-            epoch,
-            execution_state,
-            launch_epoch,
-            expires_at_ms,
-        )) = binding
-        else {
-            return Err(ProviderTaskStoreError::NotFound);
-        };
-
+        .await?;
         let intent = load_submit_intent_in(&mut tx, request.submission_id)
             .await?
             .ok_or(ProviderTaskStoreError::Conflict)?;
         if intent.executor_execution_id != request.executor_execution_id
-            || intent.provider_id != provider_id
-            || intent.provider_account_id != provider_account_id
+            || intent.provider_id != parent.provider_id
+            || intent.provider_account_id != parent.provider_account_id
             || intent.submit_owner != request.executor_owner
             || intent.submit_lease_epoch != request.executor_lease_epoch
-            || (intent.state == "attached"
-                && intent.remote_operation_id.as_deref()
-                    != Some(request.remote_operation_id.as_str()))
+            || !matches!(intent.state.as_str(), "operation_known" | "attached")
+            || intent.remote_operation_id.as_deref() != Some(request.remote_operation_id.as_str())
+            || intent.provider_request_id != request.provider_request_id
         {
             return Err(ProviderTaskStoreError::Conflict);
         }
@@ -271,18 +471,12 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
             }
             return Err(ProviderTaskStoreError::Conflict);
         }
-        if intent.state != "reserved" {
+        if intent.state != "operation_known" {
             return Err(ProviderTaskStoreError::Conflict);
         }
         let now = database_now(&mut tx).await?;
-        if submission_state != "running"
-            || execution_state != "running"
-            || owner.as_deref() != Some(request.executor_owner.as_str())
-            || epoch != request.executor_lease_epoch
-            || launch_epoch != Some(request.executor_lease_epoch)
-            || expires_at_ms.is_none_or(|value| value <= now)
-        {
-            return Err(ProviderTaskStoreError::StaleLease);
+        if !submit_parent_accepts_evidence(&parent, &intent) {
+            return Err(ProviderTaskStoreError::Conflict);
         }
         let next_poll_at_ms = now + request.poll_after_ms;
         let observation_id = Uuid::new_v4();
@@ -300,14 +494,13 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
             sqlx::query(
                 r#"
                 UPDATE provider_remote_submit_intents
-                SET state = 'attached', remote_operation_id = $3, updated_at_ms = $4
+                SET state = 'attached', updated_at_ms = $3
                 WHERE submission_id = $1 AND executor_execution_id = $2
-                  AND state = 'reserved'
+                  AND state = 'operation_known'
                 "#,
             )
             .bind(request.submission_id)
             .bind(request.executor_execution_id)
-            .bind(&request.remote_operation_id)
             .bind(now)
             .execute(&mut *tx)
             .await
@@ -327,8 +520,8 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
         )
         .bind(request.submission_id)
         .bind(request.executor_execution_id)
-        .bind(&provider_id)
-        .bind(provider_account_id)
+        .bind(&parent.provider_id)
+        .bind(parent.provider_account_id)
         .bind(&request.remote_operation_id)
         .bind(&request.provider_request_id)
         .bind(&request.executor_owner)
@@ -365,7 +558,6 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
                     lease_expires_at_ms = NULL, updated_at_ms = $5
                 WHERE executor_execution_id = $1 AND submission_id = $2
                   AND state = 'running' AND executor_owner = $3 AND lease_epoch = $4
-                  AND lease_expires_at_ms > $5
                 "#,
             )
             .bind(request.executor_execution_id)
@@ -376,7 +568,7 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
             .execute(&mut *tx)
             .await
             .map_err(unavailable)?,
-            ProviderTaskStoreError::StaleLease,
+            ProviderTaskStoreError::Conflict,
         )?;
         require_one(
             sqlx::query(
@@ -872,6 +1064,91 @@ struct ObservationValues<'a> {
     next_poll_at_ms: Option<i64>,
 }
 
+async fn resolve_submit_terminal(
+    tx: &mut Transaction<'_, Postgres>,
+    intent: &ProviderSubmitIntent,
+    resolved_state: &str,
+    now: i64,
+) -> Result<(), ProviderTaskStoreError> {
+    if resolved_state != "failed" || intent.state != ProviderSubmitIntentState::Rejected {
+        return Err(ProviderTaskStoreError::Conflict);
+    }
+    let error_code = intent
+        .failure_error_code
+        .as_deref()
+        .ok_or(ProviderTaskStoreError::Conflict)?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO executor_resolution_decisions
+          (decision_id, executor_execution_id, submission_id, source,
+           observation_id, provider_task_observation_id, provider_submit_intent_id,
+           resolved_state, result_manifest_id, error_code, decided_at_ms)
+        VALUES ($1, $1, $2, 'remote_submit_outcome',
+                NULL, NULL, $2, $3, NULL, $4, $5)
+        "#,
+    )
+    .bind(intent.executor_execution_id)
+    .bind(intent.submission_id)
+    .bind(resolved_state)
+    .bind(error_code)
+    .bind(now)
+    .execute(&mut **tx)
+    .await
+    .map_err(storage_conflict)?;
+    require_one(
+        sqlx::query(
+            r#"
+            UPDATE executor_executions
+            SET state = $3, executor_owner = NULL, lease_expires_at_ms = NULL,
+                resolution_decision_id = $1, finished_at_ms = $4,
+                updated_at_ms = $4, error_code = $5
+            WHERE executor_execution_id = $1 AND submission_id = $2
+              AND state = 'running'
+            "#,
+        )
+        .bind(intent.executor_execution_id)
+        .bind(intent.submission_id)
+        .bind(resolved_state)
+        .bind(now)
+        .bind(error_code)
+        .execute(&mut **tx)
+        .await
+        .map_err(storage_conflict)?,
+        ProviderTaskStoreError::Conflict,
+    )?;
+    require_one(
+        sqlx::query(
+            r#"
+            UPDATE provider_submissions
+            SET state = $3, resolution_decision_id = $1,
+                finished_at_ms = $4, updated_at_ms = $4, error_code = $5
+            WHERE executor_execution_id = $1 AND submission_id = $2
+              AND state = 'running'
+            "#,
+        )
+        .bind(intent.executor_execution_id)
+        .bind(intent.submission_id)
+        .bind(resolved_state)
+        .bind(now)
+        .bind(error_code)
+        .execute(&mut **tx)
+        .await
+        .map_err(storage_conflict)?,
+        ProviderTaskStoreError::Conflict,
+    )?;
+    release_capacity_allocation(
+        tx,
+        intent.executor_execution_id,
+        intent.submission_id,
+        resolved_state,
+        "remote_submit_outcome",
+        now,
+    )
+    .await
+    .map_err(map_executor_error)
+}
+
 async fn resolve_remote_terminal(
     tx: &mut Transaction<'_, Postgres>,
     task: &TaskRow,
@@ -936,7 +1213,7 @@ async fn resolve_remote_terminal(
     let existing: Option<ResolutionDecisionRow> = sqlx::query_as(
         r#"
             SELECT resolved_state, result_manifest_id, error_code,
-                   provider_task_observation_id
+                   provider_task_observation_id, provider_submit_intent_id
             FROM executor_resolution_decisions
             WHERE decision_id = $1
             "#,
@@ -950,6 +1227,7 @@ async fn resolve_remote_terminal(
             && existing.result_manifest_id == result_manifest_id
             && existing.error_code.as_deref() == error_code
             && existing.provider_task_observation_id == Some(task.state_observation_id)
+            && existing.provider_submit_intent_id.is_none()
         {
             Ok(())
         } else {
@@ -1253,7 +1531,9 @@ async fn load_submit_intent_in(
         r#"
         SELECT submission_id, executor_execution_id, provider_id, provider_account_id,
                submit_owner, submit_lease_epoch, idempotency_key, state,
-               remote_operation_id
+               remote_operation_id, provider_request_id, send_started_at_ms,
+               receipt_event_identity, failure_event_identity,
+               failure_error_code, updated_at_ms
         FROM provider_remote_submit_intents
         WHERE submission_id = $1
         FOR UPDATE
@@ -1265,12 +1545,125 @@ async fn load_submit_intent_in(
     .map_err(unavailable)
 }
 
+async fn load_submit_intent(
+    pool: &PgPool,
+    submission_id: Uuid,
+) -> Result<Option<SubmitIntentRow>, ProviderTaskStoreError> {
+    sqlx::query_as(
+        r#"
+        SELECT submission_id, executor_execution_id, provider_id, provider_account_id,
+               submit_owner, submit_lease_epoch, idempotency_key, state,
+               remote_operation_id, provider_request_id, send_started_at_ms,
+               receipt_event_identity, failure_event_identity,
+               failure_error_code, updated_at_ms
+        FROM provider_remote_submit_intents
+        WHERE submission_id = $1
+        "#,
+    )
+    .bind(submission_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(unavailable)
+}
+
+async fn lock_submit_parent(
+    tx: &mut Transaction<'_, Postgres>,
+    executor_execution_id: Uuid,
+    submission_id: Uuid,
+) -> Result<SubmitParentRow, ProviderTaskStoreError> {
+    sqlx::query_as(
+        r#"
+        SELECT submission.provider_id, submission.provider_account_id,
+               execution.state AS execution_state,
+               submission.state AS submission_state,
+               execution.executor_owner, execution.lease_epoch,
+               execution.launch_owner, execution.launch_lease_epoch,
+               allocation.state AS allocation_state
+        FROM executor_executions execution
+        JOIN provider_submissions submission
+          ON submission.executor_execution_id = execution.executor_execution_id
+         AND submission.submission_id = execution.submission_id
+        JOIN executor_capacity_allocations allocation
+          ON allocation.executor_execution_id = execution.executor_execution_id
+         AND allocation.submission_id = execution.submission_id
+        WHERE execution.executor_execution_id = $1
+          AND execution.submission_id = $2
+        FOR UPDATE OF execution, submission, allocation
+        "#,
+    )
+    .bind(executor_execution_id)
+    .bind(submission_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(unavailable)?
+    .ok_or(ProviderTaskStoreError::NotFound)
+}
+
+fn submit_parent_accepts_evidence(parent: &SubmitParentRow, intent: &SubmitIntentRow) -> bool {
+    parent.execution_state == "running"
+        && parent.submission_state == "running"
+        && parent.executor_owner.as_deref() == Some(intent.submit_owner.as_str())
+        && parent.lease_epoch == intent.submit_lease_epoch
+        && parent.launch_owner.as_deref() == Some(intent.submit_owner.as_str())
+        && parent.launch_lease_epoch == Some(intent.submit_lease_epoch)
+        && parent.allocation_state == "held"
+}
+
+async fn lock_live_submit_fence(
+    tx: &mut Transaction<'_, Postgres>,
+    request: &RemoteTaskSubmitReservation,
+) -> Result<bool, ProviderTaskStoreError> {
+    let row: Option<bool> = sqlx::query_scalar(
+        r#"
+        SELECT TRUE
+        FROM executor_executions execution
+        JOIN provider_submissions submission
+          ON submission.executor_execution_id = execution.executor_execution_id
+         AND submission.submission_id = execution.submission_id
+        JOIN executor_capacity_allocations allocation
+          ON allocation.executor_execution_id = execution.executor_execution_id
+         AND allocation.submission_id = execution.submission_id
+        WHERE execution.executor_execution_id = $1
+          AND execution.submission_id = $2
+          AND execution.state = 'running' AND submission.state = 'running'
+          AND execution.executor_owner = $3 AND execution.lease_epoch = $4
+          AND execution.launch_owner = $3 AND execution.launch_lease_epoch = $4
+          AND execution.lease_expires_at_ms >
+              floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT
+          AND allocation.state = 'held'
+        FOR UPDATE OF execution, submission, allocation
+        "#,
+    )
+    .bind(request.executor_execution_id)
+    .bind(request.submission_id)
+    .bind(&request.executor_owner)
+    .bind(request.executor_lease_epoch)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(unavailable)?;
+    Ok(row.unwrap_or(false))
+}
+
+fn submit_intent_matches_reservation(
+    row: &SubmitIntentRow,
+    request: &RemoteTaskSubmitReservation,
+) -> bool {
+    row.executor_execution_id == request.executor_execution_id
+        && row.submit_owner == request.executor_owner
+        && row.submit_lease_epoch == request.executor_lease_epoch
+        && row.idempotency_key == request.idempotency_key
+}
+
 fn submit_intent_from_row(
     row: SubmitIntentRow,
 ) -> Result<ProviderSubmitIntent, ProviderTaskStoreError> {
-    let attached = match row.state.as_str() {
-        "reserved" => false,
-        "attached" => true,
+    let state = match row.state.as_str() {
+        "reserved" => ProviderSubmitIntentState::Reserved,
+        "sending" => ProviderSubmitIntentState::Sending,
+        "outcome_unknown" => ProviderSubmitIntentState::OutcomeUnknown,
+        "operation_known" => ProviderSubmitIntentState::OperationKnown,
+        "attached" => ProviderSubmitIntentState::Attached,
+        "rejected" => ProviderSubmitIntentState::Rejected,
         _ => return Err(ProviderTaskStoreError::Conflict),
     };
     Ok(ProviderSubmitIntent {
@@ -1278,9 +1671,17 @@ fn submit_intent_from_row(
         executor_execution_id: row.executor_execution_id,
         provider_id: row.provider_id,
         provider_account_id: row.provider_account_id,
+        submit_owner: row.submit_owner,
+        submit_lease_epoch: row.submit_lease_epoch,
         idempotency_key: row.idempotency_key,
-        attached,
+        state,
         remote_operation_id: row.remote_operation_id,
+        provider_request_id: row.provider_request_id,
+        send_started_at_ms: row.send_started_at_ms,
+        receipt_event_identity: row.receipt_event_identity,
+        failure_event_identity: row.failure_event_identity,
+        failure_error_code: row.failure_error_code,
+        updated_at_ms: row.updated_at_ms,
     })
 }
 
@@ -1385,6 +1786,40 @@ fn validate_reservation(value: &RemoteTaskSubmitReservation) -> Result<(), Provi
         || value.executor_lease_epoch <= 0
         || !valid_owner(&value.executor_owner)
         || !valid_identifier(&value.idempotency_key, 255)
+    {
+        Err(ProviderTaskStoreError::InvalidInput)
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_submit_failure(value: &RemoteTaskSubmitFailure) -> Result<(), ProviderTaskStoreError> {
+    if value.submission_id.is_nil()
+        || value.executor_execution_id.is_nil()
+        || value.submission_id == value.executor_execution_id
+        || value.executor_lease_epoch <= 0
+        || !valid_owner(&value.executor_owner)
+        || !valid_identifier(&value.event_identity, 255)
+        || !valid_simple_identifier(&value.error_code, 128)
+    {
+        Err(ProviderTaskStoreError::InvalidInput)
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_submit_receipt(value: &RemoteTaskSubmitReceipt) -> Result<(), ProviderTaskStoreError> {
+    if value.submission_id.is_nil()
+        || value.executor_execution_id.is_nil()
+        || value.submission_id == value.executor_execution_id
+        || value.executor_lease_epoch <= 0
+        || !valid_owner(&value.executor_owner)
+        || !valid_identifier(&value.remote_operation_id, 255)
+        || value
+            .provider_request_id
+            .as_deref()
+            .is_some_and(|id| !valid_identifier(id, 255))
+        || !valid_identifier(&value.event_identity, 255)
     {
         Err(ProviderTaskStoreError::InvalidInput)
     } else {

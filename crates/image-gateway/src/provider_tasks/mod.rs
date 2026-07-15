@@ -59,9 +59,74 @@ pub struct ProviderSubmitIntent {
     pub executor_execution_id: Uuid,
     pub provider_id: String,
     pub provider_account_id: Uuid,
+    pub submit_owner: String,
+    pub submit_lease_epoch: i64,
     pub idempotency_key: String,
-    pub attached: bool,
+    pub state: ProviderSubmitIntentState,
     pub remote_operation_id: Option<String>,
+    pub provider_request_id: Option<String>,
+    pub send_started_at_ms: Option<i64>,
+    pub receipt_event_identity: Option<String>,
+    pub failure_event_identity: Option<String>,
+    pub failure_error_code: Option<String>,
+    pub updated_at_ms: i64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProviderSubmitIntentState {
+    Reserved,
+    Sending,
+    OutcomeUnknown,
+    OperationKnown,
+    Attached,
+    Rejected,
+}
+
+impl ProviderSubmitIntentState {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Reserved => "reserved",
+            Self::Sending => "sending",
+            Self::OutcomeUnknown => "outcome_unknown",
+            Self::OperationKnown => "operation_known",
+            Self::Attached => "attached",
+            Self::Rejected => "rejected",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ProviderSubmitStart {
+    Acquired(ProviderSubmitIntent),
+    Existing(ProviderSubmitIntent),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProviderSubmitFailureKind {
+    Rejected,
+    OutcomeUnknown,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RemoteTaskSubmitFailure {
+    pub submission_id: Uuid,
+    pub executor_execution_id: Uuid,
+    pub executor_owner: String,
+    pub executor_lease_epoch: i64,
+    pub kind: ProviderSubmitFailureKind,
+    pub event_identity: String,
+    pub error_code: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RemoteTaskSubmitReceipt {
+    pub submission_id: Uuid,
+    pub executor_execution_id: Uuid,
+    pub executor_owner: String,
+    pub executor_lease_epoch: i64,
+    pub remote_operation_id: String,
+    pub provider_request_id: Option<String>,
+    pub event_identity: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -166,6 +231,26 @@ pub trait ProviderTaskStore: Send + Sync + 'static {
         &self,
         request: &RemoteTaskSubmitReservation,
     ) -> Result<ProviderSubmitIntent, ProviderTaskStoreError>;
+
+    async fn start_submit(
+        &self,
+        request: &RemoteTaskSubmitReservation,
+    ) -> Result<ProviderSubmitStart, ProviderTaskStoreError>;
+
+    async fn record_submit_failure(
+        &self,
+        request: &RemoteTaskSubmitFailure,
+    ) -> Result<ProviderSubmitIntent, ProviderTaskStoreError>;
+
+    async fn record_submit_receipt(
+        &self,
+        request: &RemoteTaskSubmitReceipt,
+    ) -> Result<ProviderSubmitIntent, ProviderTaskStoreError>;
+
+    async fn load_submit_intent(
+        &self,
+        submission_id: Uuid,
+    ) -> Result<Option<ProviderSubmitIntent>, ProviderTaskStoreError>;
 
     async fn attach(
         &self,

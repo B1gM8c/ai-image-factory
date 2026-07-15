@@ -56,11 +56,12 @@ pub use generator::{
     CodexImageGenerator, EditJob, GeneratedImage, GenerationJob, ImageGenerator, InputImage,
 };
 pub use provider_tasks::{
-    PostgresProviderTaskStore, ProviderArtifactAuthority, ProviderRemoteTask, ProviderSubmitIntent,
-    ProviderTaskClaimScope, ProviderTaskLease, ProviderTaskObservation,
+    PostgresProviderTaskStore, ProviderArtifactAuthority, ProviderRemoteTask,
+    ProviderSubmitFailureKind, ProviderSubmitIntent, ProviderSubmitIntentState,
+    ProviderSubmitStart, ProviderTaskClaimScope, ProviderTaskLease, ProviderTaskObservation,
     ProviderTaskObservationOutcome, ProviderTaskObservationSource, ProviderTaskState,
-    ProviderTaskStore, ProviderTaskStoreError, RemoteTaskAttach, RemoteTaskSubmitReservation,
-    VerifiedCallbackWakeup,
+    ProviderTaskStore, ProviderTaskStoreError, RemoteTaskAttach, RemoteTaskSubmitFailure,
+    RemoteTaskSubmitReceipt, RemoteTaskSubmitReservation, VerifiedCallbackWakeup,
 };
 pub use reconciliation::{
     InputCleanupOutcome, PostgresReconciliationStore, ReconciliationOutcome, ReconciliationStore,

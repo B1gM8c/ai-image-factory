@@ -117,27 +117,37 @@ completion evidence.
 
 ## Durable Submit Semantics
 
-The current `reserved -> attached` submit intent is insufficient for a remote
-operation whose CLI may exit or disconnect after the provider accepted work.
-Before activating Dreamina, the durable intent must distinguish:
+The pre-Phase2C `reserved -> attached` submit intent was insufficient for a
+remote operation whose CLI may exit or disconnect after the provider accepted
+work. Before activating Dreamina, the durable intent must distinguish:
 
 ```text
-reserved -> sending -> attached
+reserved -> sending -> operation_known -> attached
+                    -> outcome_unknown -> operation_known
                     -> rejected
-                    -> uncertain
 ```
 
 - `reserved`: no side effect has been attempted.
 - `sending`: the side-effecting process may have reached the provider.
-- `attached`: a validated stable `submit_id` is durably bound.
+- `operation_known`: a validated stable `submit_id` is durable, but poll
+  ownership has not been handed off yet.
+- `attached`: the durable operation is bound to a fenced poll task.
 - `rejected`: evidence proves no accepted remote task for this attempt.
-- `uncertain`: the process may have submitted work, but no stable identifier
-  was recovered.
+- `outcome_unknown`: no stable identifier was recovered and reconciliation is
+  still allowed to accept a late receipt.
 
-Automatic submit retry is forbidden from `sending` or `uncertain` unless the
-official protocol gains a provider-enforced idempotency key or a reconciliation
-operation can prove absence. A customer idempotency key deduplicates platform
-requests; it does not make the upstream CLI idempotent.
+`outcome_unknown` remains nonterminal until a later phase adds a database-time
+deadline and fenced reconciliation claim. That resolver may then project the
+canonical execution as `uncertain`; this phase intentionally does not expose an
+unfenced finalization method.
+
+Automatic submit retry is forbidden from `sending` or `outcome_unknown` unless
+the official protocol gains a provider-enforced idempotency key or a
+reconciliation operation can prove absence. A customer idempotency key
+deduplicates platform requests; it does not make the upstream CLI idempotent.
+
+The gateway implementation and crash matrix are specified in
+`2026-phase2c-remote-submit-recovery.md`.
 
 ## Credentials and Accounts
 

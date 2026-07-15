@@ -1012,9 +1012,15 @@ impl ExecutorSubmissionStore for PostgresExecutorSubmissionStore {
             LEFT JOIN executor_runner_observations observation
               ON observation.executor_execution_id = e.executor_execution_id
              AND observation.submission_id = e.submission_id
+            LEFT JOIN provider_remote_submit_intents submit_intent
+              ON submit_intent.executor_execution_id = e.executor_execution_id
+             AND submit_intent.submission_id = e.submission_id
             WHERE e.lease_expires_at_ms <= $1
               AND (
-                (e.state = 'running' AND s.state = 'running')
+                (e.state = 'running' AND s.state = 'running'
+                  AND COALESCE(submit_intent.state, '') NOT IN (
+                    'sending', 'outcome_unknown', 'operation_known'
+                  ))
                 OR
                 (e.state = 'leased' AND s.state = 'prepared'
                   AND w.state IN ('succeeded', 'failed', 'uncertain'))
