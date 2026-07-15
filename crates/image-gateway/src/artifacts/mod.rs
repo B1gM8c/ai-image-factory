@@ -5,9 +5,11 @@ use uuid::Uuid;
 
 use crate::{ImageGatewayError, generator::GeneratedImage, usage::UsageSnapshot};
 
+mod executor;
 mod filesystem;
 mod memory;
 
+pub use executor::{ExecutorArtifactPublishError, ExecutorArtifactPublisher};
 pub use filesystem::FilesystemArtifactBlobStore;
 pub use memory::InMemoryArtifactBlobStore;
 
@@ -155,4 +157,9 @@ pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
 
     hex::encode(Sha256::digest(bytes))
+}
+
+pub(crate) fn executor_object_key(artifact_id: Uuid) -> String {
+    let artifact_id = artifact_id.simple().to_string();
+    format!("executor-objects/{}/{}", &artifact_id[..2], artifact_id)
 }

@@ -88,32 +88,85 @@ impl ExecutorLaunchContext {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ExecutorArtifactAuthority {
+    pub(crate) authority_id: Uuid,
+    pub(crate) storage_backend: String,
+    pub(crate) storage_namespace: String,
+    pub(crate) object_key: String,
+    pub(crate) sha256_hex: String,
+    pub(crate) byte_size: u64,
+    pub(crate) media_type: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExecutorResultManifest {
-    pub manifest_id: Uuid,
-    pub storage_backend: String,
-    pub object_key: String,
-    pub sha256_hex: String,
-    pub byte_size: u64,
-    pub media_type: String,
+    pub(crate) manifest_id: Uuid,
+    pub(crate) artifact_authority_id: Uuid,
+}
+
+impl ExecutorResultManifest {
+    pub(crate) fn new(manifest_id: Uuid, artifact_authority_id: Uuid) -> Option<Self> {
+        if manifest_id.is_nil()
+            || artifact_authority_id.is_nil()
+            || manifest_id == artifact_authority_id
+        {
+            return None;
+        }
+        Some(Self {
+            manifest_id,
+            artifact_authority_id,
+        })
+    }
+
+    pub fn manifest_id(&self) -> Uuid {
+        self.manifest_id
+    }
+
+    pub fn artifact_authority_id(&self) -> Uuid {
+        self.artifact_authority_id
+    }
 }
 
 const MAX_RESULT_BYTES: u64 = 256 * 1024 * 1024;
 
+pub(crate) fn artifact_authority_is_valid(authority: &ExecutorArtifactAuthority) -> bool {
+    artifact_descriptor_is_valid(
+        &authority.storage_backend,
+        &authority.storage_namespace,
+        &authority.object_key,
+        &authority.sha256_hex,
+        authority.byte_size,
+        &authority.media_type,
+    )
+}
+
 pub(crate) fn result_manifest_is_valid(manifest: &ExecutorResultManifest) -> bool {
-    !manifest.storage_backend.is_empty()
-        && manifest.storage_backend.len() <= 128
-        && !manifest.object_key.is_empty()
-        && manifest.object_key.len() <= 1_024
-        && !manifest
-            .object_key
+    !manifest.manifest_id.is_nil()
+        && !manifest.artifact_authority_id.is_nil()
+        && manifest.manifest_id != manifest.artifact_authority_id
+}
+
+fn artifact_descriptor_is_valid(
+    storage_backend: &str,
+    storage_namespace: &str,
+    object_key: &str,
+    sha256_hex: &str,
+    byte_size: u64,
+    media_type: &str,
+) -> bool {
+    storage_backend == "filesystem-v1"
+        && !storage_namespace.is_empty()
+        && storage_namespace.len() <= 1_024
+        && !storage_namespace
             .bytes()
             .any(|byte| byte.is_ascii_control())
-        && is_sha256(&manifest.sha256_hex)
-        && (1..=MAX_RESULT_BYTES).contains(&manifest.byte_size)
-        && matches!(
-            manifest.media_type.as_str(),
-            "image/png" | "image/jpeg" | "image/webp"
-        )
+        && storage_namespace.starts_with("filesystem-v1:")
+        && !object_key.is_empty()
+        && object_key.len() <= 1_024
+        && !object_key.bytes().any(|byte| byte.is_ascii_control())
+        && is_sha256(sha256_hex)
+        && (1..=MAX_RESULT_BYTES).contains(&byte_size)
+        && matches!(media_type, "image/png" | "image/jpeg" | "image/webp")
 }
 
 pub(crate) fn error_code_is_valid(value: &str) -> bool {
@@ -217,4 +270,13 @@ pub trait ExecutorLaunchContextStore: Send + Sync + 'static {
         &self,
         lease: &ExecutorSubmissionLease,
     ) -> Result<ExecutorLaunchContext, ExecutorSubmissionError>;
+}
+
+#[async_trait]
+pub(crate) trait ExecutorArtifactAuthorityStore: Send + Sync + 'static {
+    async fn publish_artifact_authority(
+        &self,
+        lease: &ExecutorSubmissionLease,
+        authority: &ExecutorArtifactAuthority,
+    ) -> Result<(), ExecutorSubmissionError>;
 }

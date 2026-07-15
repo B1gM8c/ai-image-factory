@@ -1,15 +1,17 @@
 # Phase 1F: Persistent Executor Runtime
 
-Status: runtime kernel and canonical launch-context checkpoint implemented. The
-production Images API remains on `LegacyV1` until every activation gate in this
-document passes.
+Status: runtime kernel, canonical launch context, and immutable executor artifact
+authority implemented. The production Images API remains on `LegacyV1` until
+every activation gate in this document passes.
 
 The checkpoint includes the executor daemon application port, owner-and-scope
 resume of unexpired running executions, idempotent database start replay,
 pre-launch lease renewal, an exact-lease PostgreSQL launch-context projection,
 and a dirfd-bound filesystem journal with atomic no-replace launch and terminal
-markers. It does not yet include an executord binary or provider process
-supervisor.
+markers. Verified executor objects now use an isolated write-once namespace,
+deterministic execution identities, a storage namespace binding, and an
+append-only PostgreSQL authority reference. It does not yet include an executord
+binary or provider process supervisor.
 
 ## 1. Scope
 
@@ -152,10 +154,11 @@ The socket is not a public API and does not reuse the official Images facade.
 
 Each slice is additive. `LegacyV1` remains the default until slice 7 passes.
 
-At this checkpoint, slices 1 and 2 are complete, the durable journal portion of
-slice 3 is complete, and the exact-lease canonical context projection required
-by slice 4 is complete. Process attachment, process identity, private output
-spooling, and artifact publication remain part of slices 3 through 5.
+At this checkpoint, slices 1 and 2 are complete, the durable journal and
+artifact-authority portions of slice 3 are complete, and the exact-lease
+canonical context projection required by slice 4 is complete. Process
+attachment, process identity, and private CLI output spooling remain part of
+slices 3 through 5.
 
 The current `ImageGenerator` interface is job-level and may loop over `n`.
 Provider submissions are output-level, so executord must not call that interface
@@ -163,15 +166,17 @@ with the original command. Each adapter must expose a trusted single-output
 operation bound to `output_index`; otherwise an `n`-output request could launch
 the provider `n * n` times.
 
-Two schema capabilities remain explicit activation blockers after the first
+One schema capability remains an explicit activation blocker after the first
 daemon slice:
 
 - an append-only runner observation and resolution decision path, so an expired
   running lease can retain a late durable manifest without letting a stale
   executor overwrite canonical state;
-- an artifact-authority reference proving every successful executor manifest
-  names an already durable immutable object, rather than trusting caller-supplied
-  object metadata.
+
+The artifact-authority blocker is complete: a successful executor manifest can
+contain only deterministic authority IDs, and PostgreSQL accepts it only after
+the publisher has durably written and reread the isolated object, independently
+derived its type, hash, and size, and committed its append-only authority row.
 
 These blockers are implemented before production child-process wiring. A child
 protocol also requires a versioned adapter revision, resource policy, stable

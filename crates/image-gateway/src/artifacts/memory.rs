@@ -2,6 +2,8 @@ use std::{collections::HashMap, sync::Mutex};
 
 use async_trait::async_trait;
 
+#[cfg(test)]
+use super::executor_object_key;
 use super::{
     ArtifactBlobStore, ArtifactIdentity, ArtifactMetadata, ArtifactReadError, ArtifactWriteError,
     MEMORY_BACKEND, sha256_hex,
@@ -25,6 +27,76 @@ impl Default for InMemoryArtifactBlobStore {
     }
 }
 
+#[cfg(test)]
+impl InMemoryArtifactBlobStore {
+    pub(crate) async fn put_executor_artifact(
+        &self,
+        identity: ArtifactIdentity,
+        bytes: &[u8],
+    ) -> Result<ArtifactMetadata, ArtifactWriteError> {
+        if bytes.is_empty() {
+            return Err(ArtifactWriteError::Unavailable);
+        }
+        let object_key = executor_object_key(identity.artifact_id);
+        let mut objects = self
+            .objects
+            .lock()
+            .map_err(|_| ArtifactWriteError::Unavailable)?;
+        match objects.get(&object_key) {
+            Some(existing) if existing.as_slice() == bytes => {}
+            Some(_) => return Err(ArtifactWriteError::Unavailable),
+            None => {
+                objects.insert(object_key.clone(), bytes.to_vec());
+            }
+        }
+        Ok(ArtifactMetadata {
+            identity,
+            storage_backend: MEMORY_BACKEND.to_string(),
+            object_key,
+            sha256_hex: sha256_hex(bytes),
+            byte_size: bytes.len() as u64,
+        })
+    }
+
+    pub(crate) async fn get_executor_artifact(
+        &self,
+        artifact: &ArtifactMetadata,
+    ) -> Result<Vec<u8>, ArtifactReadError> {
+        if artifact.storage_backend != MEMORY_BACKEND
+            || artifact.object_key != executor_object_key(artifact.identity.artifact_id)
+        {
+            return Err(ArtifactReadError::Integrity);
+        }
+        let bytes = self
+            .objects
+            .lock()
+            .map_err(|_| ArtifactReadError::Unavailable)?
+            .get(&artifact.object_key)
+            .cloned()
+            .ok_or(ArtifactReadError::Integrity)?;
+        if bytes.len() as u64 != artifact.byte_size || sha256_hex(&bytes) != artifact.sha256_hex {
+            return Err(ArtifactReadError::Integrity);
+        }
+        Ok(bytes)
+    }
+
+    pub(crate) async fn delete_unpublished_executor_artifact(
+        &self,
+        artifact: &ArtifactMetadata,
+    ) -> Result<(), ArtifactWriteError> {
+        if artifact.storage_backend != MEMORY_BACKEND
+            || artifact.object_key != executor_object_key(artifact.identity.artifact_id)
+        {
+            return Err(ArtifactWriteError::Unavailable);
+        }
+        self.objects
+            .lock()
+            .map_err(|_| ArtifactWriteError::Unavailable)?
+            .remove(&artifact.object_key);
+        Ok(())
+    }
+}
+
 #[async_trait]
 impl ArtifactBlobStore for InMemoryArtifactBlobStore {
     fn storage_identity(&self) -> String {
@@ -40,10 +112,17 @@ impl ArtifactBlobStore for InMemoryArtifactBlobStore {
             return Err(ArtifactWriteError::Unavailable);
         }
         let object_key = format!("objects/{}", identity.artifact_id.simple());
-        self.objects
+        let mut objects = self
+            .objects
             .lock()
-            .map_err(|_| ArtifactWriteError::Unavailable)?
-            .insert(object_key.clone(), bytes.to_vec());
+            .map_err(|_| ArtifactWriteError::Unavailable)?;
+        match objects.get(&object_key) {
+            Some(existing) if existing.as_slice() == bytes => {}
+            Some(_) => return Err(ArtifactWriteError::Unavailable),
+            None => {
+                objects.insert(object_key.clone(), bytes.to_vec());
+            }
+        }
         Ok(ArtifactMetadata {
             identity,
             storage_backend: MEMORY_BACKEND.to_string(),

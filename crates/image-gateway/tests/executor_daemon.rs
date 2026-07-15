@@ -6,9 +6,8 @@ use std::{
 use async_trait::async_trait;
 use gpt_image_2_gateway::executor::{
     DurableRunner, ExecutorClaimScope, ExecutorDaemon, ExecutorDaemonError, ExecutorDaemonRun,
-    ExecutorResultManifest, ExecutorSubmissionError, ExecutorSubmissionLease,
-    ExecutorSubmissionOutcome, ExecutorSubmissionStore, PreparedExecutorSubmission, RunnerError,
-    RunnerOutcome,
+    ExecutorSubmissionError, ExecutorSubmissionLease, ExecutorSubmissionOutcome,
+    ExecutorSubmissionStore, PreparedExecutorSubmission, RunnerError, RunnerOutcome,
 };
 use uuid::Uuid;
 
@@ -81,7 +80,7 @@ impl FakeStore {
         FakeRunner {
             calls: Arc::new(Mutex::new(Vec::new())),
             events: self.events.clone(),
-            outcome: succeeded_outcome(),
+            outcome: definite_outcome(),
             delay,
         }
     }
@@ -373,15 +372,10 @@ fn daemon_with_timing(
     )
 }
 
-fn succeeded_outcome() -> RunnerOutcome {
-    RunnerOutcome::Succeeded(ExecutorResultManifest {
-        manifest_id: Uuid::new_v4(),
-        storage_backend: "filesystem-v1".to_string(),
-        object_key: "executor/result".to_string(),
-        sha256_hex: "a".repeat(64),
-        byte_size: 128,
-        media_type: "image/png".to_string(),
-    })
+fn definite_outcome() -> RunnerOutcome {
+    RunnerOutcome::Failed {
+        error_code: "provider_rejected".to_string(),
+    }
 }
 
 fn claim_scope() -> ExecutorClaimScope {

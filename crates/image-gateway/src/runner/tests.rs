@@ -321,7 +321,7 @@ fn preexisting_wide_directories_are_rejected_without_permission_repair() {
 }
 
 #[test]
-fn terminal_manifest_uses_the_same_size_mime_and_error_code_boundary_as_postgres() {
+fn terminal_manifest_persists_only_valid_authority_references_and_error_codes() {
     let (_temp, journal) = journal();
     let lease = lease();
     journal.start_or_attach(&lease).unwrap();
@@ -330,20 +330,20 @@ fn terminal_manifest_uses_the_same_size_mime_and_error_code_boundary_as_postgres
     let RunnerOutcome::Succeeded(base) = success() else {
         unreachable!();
     };
-    let oversized = RunnerOutcome::Succeeded(ExecutorResultManifest {
-        byte_size: 256 * 1024 * 1024 + 1,
+    let nil_manifest = RunnerOutcome::Succeeded(ExecutorResultManifest {
+        manifest_id: Uuid::nil(),
         ..base.clone()
     });
     assert_eq!(
-        journal.publish_terminal(&lease, &oversized),
+        journal.publish_terminal(&lease, &nil_manifest),
         Err(RunnerJournalError::InvalidInput)
     );
-    let unsupported_mime = RunnerOutcome::Succeeded(ExecutorResultManifest {
-        media_type: "image/gif".to_string(),
-        ..base
+    let aliased_identity = RunnerOutcome::Succeeded(ExecutorResultManifest {
+        manifest_id: base.artifact_authority_id,
+        artifact_authority_id: base.artifact_authority_id,
     });
     assert_eq!(
-        journal.publish_terminal(&lease, &unsupported_mime),
+        journal.publish_terminal(&lease, &aliased_identity),
         Err(RunnerJournalError::InvalidInput)
     );
     assert_eq!(
@@ -466,14 +466,7 @@ fn lease() -> ExecutorSubmissionLease {
 }
 
 fn success() -> RunnerOutcome {
-    RunnerOutcome::Succeeded(ExecutorResultManifest {
-        manifest_id: Uuid::new_v4(),
-        storage_backend: "filesystem-v1".to_string(),
-        object_key: "objects/result.png".to_string(),
-        sha256_hex: "c".repeat(64),
-        byte_size: 128,
-        media_type: "image/png".to_string(),
-    })
+    RunnerOutcome::Succeeded(ExecutorResultManifest::new(Uuid::new_v4(), Uuid::new_v4()).unwrap())
 }
 
 fn read_tree(path: &Path) -> String {

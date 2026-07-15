@@ -5,8 +5,9 @@ use uuid::Uuid;
 use crate::admission::WorkLease;
 
 use super::super::{
-    ExecutorClaimScope, ExecutorSubmissionError, ExecutorSubmissionLease,
-    ExecutorSubmissionOutcome, error_code_is_valid, result_manifest_is_valid,
+    ExecutorArtifactAuthority, ExecutorClaimScope, ExecutorSubmissionError,
+    ExecutorSubmissionLease, ExecutorSubmissionOutcome, artifact_authority_is_valid,
+    error_code_is_valid, result_manifest_is_valid,
 };
 
 const MAX_IMAGE_OUTPUTS: i32 = 10;
@@ -102,6 +103,16 @@ pub(super) fn validate_outcome(
         return Err(ExecutorSubmissionError::InvalidInput);
     }
     Ok(())
+}
+
+pub(super) fn validate_artifact_authority(
+    authority: &ExecutorArtifactAuthority,
+) -> Result<(), ExecutorSubmissionError> {
+    if artifact_authority_is_valid(authority) {
+        Ok(())
+    } else {
+        Err(ExecutorSubmissionError::InvalidInput)
+    }
 }
 
 pub(super) fn distinct_execution_id(work_execution_id: Uuid) -> Uuid {

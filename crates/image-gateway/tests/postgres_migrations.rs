@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 type TestResult<T = ()> = Result<T, String>;
 
-const REQUIRED_COLUMNS: [(&str, &str); 36] = [
+const REQUIRED_COLUMNS: [(&str, &str); 40] = [
     ("usage_events", "tenant_id"),
     ("quota_reservations", "tenant_id"),
     ("quota_reservations", "job_id"),
@@ -50,6 +50,10 @@ const REQUIRED_COLUMNS: [(&str, &str); 36] = [
     ("job_input_objects", "object_key"),
     ("job_input_objects", "sha256_hex"),
     ("job_response_projections", "operation"),
+    ("executor_artifact_authorities", "authority_id"),
+    ("executor_artifact_authorities", "storage_namespace"),
+    ("executor_artifact_authorities", "sha256_hex"),
+    ("executor_result_manifests", "artifact_authority_id"),
 ];
 
 const REQUIRED_INDEXES: [&str; 10] = [
@@ -132,6 +136,18 @@ async fn execution_context_migration_requires_legacy_active_jobs_to_be_drained()
     };
 
     let result = execution_context_upgrade_case(&test_schema.pool).await;
+    let cleanup = test_schema.cleanup().await;
+    cleanup?;
+    result
+}
+
+#[tokio::test]
+async fn artifact_authority_migration_rejects_untrusted_existing_manifests() -> TestResult {
+    let Some(test_schema) = TestSchema::new(1).await? else {
+        return Ok(());
+    };
+
+    let result = artifact_authority_upgrade_case(&test_schema.pool).await;
     let cleanup = test_schema.cleanup().await;
     cleanup?;
     result
@@ -356,6 +372,85 @@ async fn execution_context_upgrade_case(pool: &PgPool) -> TestResult {
     require(
         snapshots == (None, None, None, None),
         "terminal legacy snapshots must remain consistently NULL",
+    )
+}
+
+async fn artifact_authority_upgrade_case(pool: &PgPool) -> TestResult {
+    for migration in [
+        include_str!("../migrations/0000_legacy_reconciliation.sql"),
+        include_str!("../migrations/0001_usage.sql"),
+        include_str!("../migrations/0002_durable_admission.sql"),
+        include_str!("../migrations/0003_durable_scheduling.sql"),
+        include_str!("../migrations/0004_api_key_hmac.sql"),
+        include_str!("../migrations/0005_artifact_replay.sql"),
+        include_str!("../migrations/0006_execution_context.sql"),
+        include_str!("../migrations/0007_edit_inputs.sql"),
+        include_str!("../migrations/0008_provider_submissions.sql"),
+        include_str!("../migrations/0009_economic_kernel.sql"),
+    ] {
+        sqlx::raw_sql(migration)
+            .execute(pool)
+            .await
+            .map_err(|error| format!("pre-0010 migration failed: {error}"))?;
+    }
+    sqlx::raw_sql(
+        r#"
+        DO $$
+        DECLARE constraint_name TEXT;
+        BEGIN
+            FOR constraint_name IN
+                SELECT conname
+                FROM pg_constraint
+                WHERE conrelid = 'executor_result_manifests'::regclass
+                  AND contype = 'f'
+            LOOP
+                EXECUTE format(
+                    'ALTER TABLE executor_result_manifests DROP CONSTRAINT %I',
+                    constraint_name
+                );
+            END LOOP;
+        END;
+        $$;
+        "#,
+    )
+    .execute(pool)
+    .await
+    .map_err(|error| format!("failed to isolate legacy manifest fixture: {error}"))?;
+    sqlx::query(
+        r#"
+        INSERT INTO executor_result_manifests
+          (manifest_id, executor_execution_id, submission_id, storage_backend,
+           object_key, sha256_hex, byte_size, media_type, created_at_ms)
+        VALUES ($1, $2, $3, 'legacy', 'legacy/object', $4, 1, 'image/png', 1)
+        "#,
+    )
+    .bind(Uuid::new_v4())
+    .bind(Uuid::new_v4())
+    .bind(Uuid::new_v4())
+    .bind("a".repeat(64))
+    .execute(pool)
+    .await
+    .map_err(|error| format!("failed to seed untrusted legacy manifest: {error}"))?;
+
+    require(
+        sqlx::raw_sql(include_str!(
+            "../migrations/0010_executor_artifact_authority.sql"
+        ))
+        .execute(pool)
+        .await
+        .is_err(),
+        "0010 accepted caller-supplied legacy artifact metadata",
+    )?;
+    let authority_table_exists: bool =
+        sqlx::query_scalar("SELECT to_regclass('executor_artifact_authorities') IS NOT NULL")
+            .fetch_one(pool)
+            .await
+            .map_err(|error| {
+                format!("failed to inspect rolled-back authority migration: {error}")
+            })?;
+    require(
+        !authority_table_exists,
+        "failed 0010 migration did not roll back its schema changes",
     )
 }
 
@@ -611,8 +706,8 @@ async fn shared_pool_case(pool: &PgPool) -> TestResult {
 
 async fn assert_expected_schema(pool: &PgPool) -> TestResult {
     require(
-        migration_versions(pool).await? == vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
-        "applied migration versions must be exactly [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]",
+        migration_versions(pool).await? == vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+        "applied migration versions must be exactly [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]",
     )?;
 
     for (table, column) in REQUIRED_COLUMNS {

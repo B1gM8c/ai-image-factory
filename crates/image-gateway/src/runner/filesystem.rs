@@ -60,11 +60,7 @@ struct DiskLaunch {
 enum DiskTerminal {
     Succeeded {
         manifest_id: String,
-        storage_backend: String,
-        object_key: String,
-        sha256_hex: String,
-        byte_size: u64,
-        media_type: String,
+        artifact_authority_id: String,
     },
     Failed {
         error_code: String,
@@ -325,11 +321,7 @@ impl DiskTerminal {
                 validate_manifest(manifest, RunnerJournalError::InvalidInput)?;
                 Ok(Self::Succeeded {
                     manifest_id: manifest.manifest_id.to_string(),
-                    storage_backend: manifest.storage_backend.clone(),
-                    object_key: manifest.object_key.clone(),
-                    sha256_hex: manifest.sha256_hex.clone(),
-                    byte_size: manifest.byte_size,
-                    media_type: manifest.media_type.clone(),
+                    artifact_authority_id: manifest.artifact_authority_id.to_string(),
                 })
             }
             RunnerOutcome::Failed { error_code } => Ok(Self::Failed {
@@ -345,20 +337,13 @@ impl DiskTerminal {
         match self {
             Self::Succeeded {
                 manifest_id,
-                storage_backend,
-                object_key,
-                sha256_hex,
-                byte_size,
-                media_type,
+                artifact_authority_id,
             } => {
-                let manifest = ExecutorResultManifest {
-                    manifest_id: parse_uuid(&manifest_id)?,
-                    storage_backend,
-                    object_key,
-                    sha256_hex,
-                    byte_size,
-                    media_type,
-                };
+                let manifest = ExecutorResultManifest::new(
+                    parse_uuid(&manifest_id)?,
+                    parse_uuid(&artifact_authority_id)?,
+                )
+                .ok_or(RunnerJournalError::Integrity)?;
                 validate_manifest(&manifest, RunnerJournalError::Integrity)?;
                 Ok(RunnerOutcome::Succeeded(manifest))
             }
@@ -612,21 +597,15 @@ impl DiskTerminal {
         match self {
             Self::Succeeded {
                 manifest_id,
-                storage_backend,
-                object_key,
-                sha256_hex,
-                byte_size,
-                media_type,
+                artifact_authority_id,
             } => {
                 parse_uuid(manifest_id)?;
-                let manifest = ExecutorResultManifest {
-                    manifest_id: parse_uuid(manifest_id)?,
-                    storage_backend: storage_backend.clone(),
-                    object_key: object_key.clone(),
-                    sha256_hex: sha256_hex.clone(),
-                    byte_size: *byte_size,
-                    media_type: media_type.clone(),
-                };
+                parse_uuid(artifact_authority_id)?;
+                let manifest = ExecutorResultManifest::new(
+                    parse_uuid(manifest_id)?,
+                    parse_uuid(artifact_authority_id)?,
+                )
+                .ok_or(RunnerJournalError::Integrity)?;
                 result_manifest_is_valid(&manifest)
                     .then_some(())
                     .ok_or(RunnerJournalError::Integrity)

@@ -3,6 +3,7 @@ use std::{collections::HashSet, env, sync::Arc, time::Duration};
 use gpt_image_2_gateway::database::{connect_test_pool_with_search_path, run_migrations};
 use gpt_image_2_gateway::{
     admission::WorkLease,
+    artifacts::{ExecutorArtifactPublisher, FilesystemArtifactBlobStore},
     economics::{
         EconomicReceipt, EconomicReceiptOutcome, EconomicSettlementStore,
         PostgresEconomicSettlementStore,
@@ -13,7 +14,9 @@ use gpt_image_2_gateway::{
         ExecutorSubmissionStore, PostgresExecutorSubmissionStore,
     },
 };
+use image::{DynamicImage, ImageFormat, Rgba, RgbaImage};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use sqlx::{AssertSqlSafe, PgPool};
 use uuid::Uuid;
 
@@ -147,6 +150,7 @@ async fn successful_provider_output_is_rated_exactly_once_from_frozen_quote() ->
     let result = async {
         let work = seed_lease(&database.pool, "economic-worker", 1).await?;
         let executor = PostgresExecutorSubmissionStore::new(database.pool.clone());
+        let (artifacts, _artifact_root) = artifact_publisher(&executor)?;
         let prepared = executor
             .prepare_for_lease(&work)
             .await
@@ -155,11 +159,9 @@ async fn successful_provider_output_is_rated_exactly_once_from_frozen_quote() ->
         activate_work(&database.pool, &work).await?;
         let lease = claim_required(&executor, "economic-executor").await?;
         executor.start(&lease).await.map_err(debug_error)?;
+        let manifest = publish_result_authority(&artifacts, &lease).await?;
         executor
-            .record_outcome(
-                &lease,
-                &ExecutorSubmissionOutcome::Succeeded(result_manifest(&lease)),
-            )
+            .record_outcome(&lease, &ExecutorSubmissionOutcome::Succeeded(manifest))
             .await
             .map_err(debug_error)?;
 
@@ -212,6 +214,7 @@ async fn nonzero_rating_posts_one_balanced_customer_transaction() -> TestResult 
     let result = async {
         let work = seed_lease(&database.pool, "ledger-worker", 1).await?;
         let executor = PostgresExecutorSubmissionStore::new(database.pool.clone());
+        let (artifacts, _artifact_root) = artifact_publisher(&executor)?;
         let prepared = executor
             .prepare_for_lease(&work)
             .await
@@ -220,11 +223,9 @@ async fn nonzero_rating_posts_one_balanced_customer_transaction() -> TestResult 
         activate_work(&database.pool, &work).await?;
         let lease = claim_required(&executor, "ledger-executor").await?;
         executor.start(&lease).await.map_err(debug_error)?;
+        let manifest = publish_result_authority(&artifacts, &lease).await?;
         executor
-            .record_outcome(
-                &lease,
-                &ExecutorSubmissionOutcome::Succeeded(result_manifest(&lease)),
-            )
+            .record_outcome(&lease, &ExecutorSubmissionOutcome::Succeeded(manifest))
             .await
             .map_err(debug_error)?;
 
@@ -642,6 +643,132 @@ async fn start_replays_same_running_lease_without_changing_fence_or_timestamp() 
 }
 
 #[tokio::test]
+async fn success_requires_exact_immutable_artifact_authority() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let work = seed_lease(&database.pool, "authority-worker", 1).await?;
+        let store = PostgresExecutorSubmissionStore::new(database.pool.clone());
+        let (artifacts, _artifact_root) = artifact_publisher(&store)?;
+        store.prepare_for_lease(&work).await.map_err(debug_error)?;
+        activate_work(&database.pool, &work).await?;
+        let lease = claim_required(&store, "authority-executor").await?;
+        store.start(&lease).await.map_err(debug_error)?;
+
+        require(
+            sqlx::query(
+                r#"
+                INSERT INTO executor_artifact_authorities
+                  (authority_id, executor_execution_id, submission_id, output_id,
+                   job_id, storage_backend, storage_namespace, object_key,
+                   sha256_hex, byte_size, media_type, created_at_ms)
+                VALUES ($1, $1, $2, $3, $4, 'memory-v1', 'memory-v1:test',
+                        'executor-objects/00/forged', $5, 1, 'image/png', 1)
+                "#,
+            )
+            .bind(lease.executor_execution_id)
+            .bind(lease.submission_id)
+            .bind(lease.output_id)
+            .bind(lease.job_id)
+            .bind("a".repeat(64))
+            .execute(&database.pool)
+            .await
+            .is_err(),
+            "volatile memory backend received a permanent artifact authority",
+        )?;
+        require(
+            sqlx::query(
+                r#"
+                INSERT INTO executor_result_manifests
+                  (manifest_id, artifact_authority_id, executor_execution_id,
+                   submission_id, created_at_ms)
+                VALUES ($1, $2, $3, $4, 1)
+                "#,
+            )
+            .bind(Uuid::new_v4())
+            .bind(Uuid::new_v4())
+            .bind(lease.executor_execution_id)
+            .bind(lease.submission_id)
+            .execute(&database.pool)
+            .await
+            .is_err(),
+            "result manifest bypassed the artifact authority foreign key",
+        )?;
+
+        let bytes = png_bytes([10, 20, 30, 255]);
+        let authority_id = lease.executor_execution_id;
+        let manifest = artifacts.publish(&lease, &bytes).await.map_err(debug_error)?;
+        require(
+            artifacts.publish(&lease, &bytes).await.is_ok(),
+            "verified artifact publication did not replay",
+        )?;
+        require(
+            manifest.manifest_id() == lease.submission_id
+                && manifest.artifact_authority_id() == lease.executor_execution_id,
+            "artifact identities were not derived from durable execution identities",
+        )?;
+
+        store
+            .record_outcome(
+                &lease,
+                &ExecutorSubmissionOutcome::Succeeded(manifest.clone()),
+            )
+            .await
+            .map_err(debug_error)?;
+        let stored: (Uuid, Uuid, String, i64, String) = sqlx::query_as(
+            r#"
+            SELECT m.artifact_authority_id, a.authority_id, a.sha256_hex,
+                   a.byte_size, a.media_type
+            FROM executor_result_manifests m
+            JOIN executor_artifact_authorities a
+              ON a.authority_id = m.artifact_authority_id
+             AND a.executor_execution_id = m.executor_execution_id
+             AND a.submission_id = m.submission_id
+            WHERE m.manifest_id = $1
+            "#,
+        )
+        .bind(manifest.manifest_id())
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(
+            stored
+                == (
+                    authority_id,
+                    authority_id,
+                    sha256(&bytes),
+                    bytes.len() as i64,
+                    "image/png".to_string(),
+                ),
+            "authority metadata was not derived from durable object bytes",
+        )?;
+        require(
+            sqlx::query(
+                "UPDATE executor_artifact_authorities SET object_key = 'forged' WHERE authority_id = $1",
+            )
+            .bind(authority_id)
+            .execute(&database.pool)
+            .await
+            .is_err(),
+            "artifact authority was mutable after publication",
+        )?;
+        require(
+            sqlx::query(
+                "UPDATE executor_result_manifests SET artifact_authority_id = artifact_authority_id WHERE manifest_id = $1",
+            )
+            .bind(manifest.manifest_id())
+            .execute(&database.pool)
+            .await
+            .is_err(),
+            "executor result manifest was mutable after publication",
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
 async fn record_outcome_persists_evidence_without_settling_customer_output() -> TestResult {
     let Some(database) = TestDatabase::new().await? else {
         return Ok(());
@@ -649,6 +776,7 @@ async fn record_outcome_persists_evidence_without_settling_customer_output() -> 
     let result = async {
         let lease = seed_lease(&database.pool, "outcome-worker", 3).await?;
         let store = PostgresExecutorSubmissionStore::new(database.pool.clone());
+        let (artifacts, _artifact_root) = artifact_publisher(&store)?;
         store.prepare_for_lease(&lease).await.map_err(debug_error)?;
         activate_work(&database.pool, &lease).await?;
         let mut claims = Vec::new();
@@ -658,9 +786,10 @@ async fn record_outcome_persists_evidence_without_settling_customer_output() -> 
             claims.push(claim);
         }
 
+        let successful_manifest = publish_result_authority(&artifacts, &claims[0]).await?;
         deactivate_work(&database.pool, &lease, "uncertain").await?;
         let outcomes = [
-            ExecutorSubmissionOutcome::Succeeded(result_manifest(&claims[0])),
+            ExecutorSubmissionOutcome::Succeeded(successful_manifest),
             ExecutorSubmissionOutcome::Failed {
                 error_code: "provider_rejected".to_string(),
             },
@@ -1135,15 +1264,38 @@ fn claim_scope() -> ExecutorClaimScope {
     }
 }
 
-fn result_manifest(claim: &ExecutorSubmissionLease) -> ExecutorResultManifest {
-    ExecutorResultManifest {
-        manifest_id: Uuid::new_v4(),
-        storage_backend: "filesystem-v1".to_string(),
-        object_key: format!("executor/{}/result", claim.executor_execution_id),
-        sha256_hex: "a".repeat(64),
-        byte_size: 128,
-        media_type: "image/png".to_string(),
-    }
+fn artifact_publisher(
+    store: &PostgresExecutorSubmissionStore,
+) -> TestResult<(ExecutorArtifactPublisher, tempfile::TempDir)> {
+    let root = tempfile::tempdir().map_err(debug_error)?;
+    let blobs = FilesystemArtifactBlobStore::new(root.path()).map_err(debug_error)?;
+    Ok((
+        ExecutorArtifactPublisher::with_filesystem_store(Arc::new(blobs), store.clone()),
+        root,
+    ))
+}
+
+async fn publish_result_authority(
+    publisher: &ExecutorArtifactPublisher,
+    claim: &ExecutorSubmissionLease,
+) -> TestResult<ExecutorResultManifest> {
+    publisher
+        .publish(claim, &png_bytes([10, 20, 30, 255]))
+        .await
+        .map_err(debug_error)
+}
+
+fn png_bytes(pixel: [u8; 4]) -> Vec<u8> {
+    let image = RgbaImage::from_pixel(1, 1, Rgba(pixel));
+    let mut cursor = std::io::Cursor::new(Vec::new());
+    DynamicImage::ImageRgba8(image)
+        .write_to(&mut cursor, ImageFormat::Png)
+        .unwrap();
+    cursor.into_inner()
+}
+
+fn sha256(bytes: &[u8]) -> String {
+    hex::encode(Sha256::digest(bytes))
 }
 
 async fn claim_required(

@@ -4,7 +4,8 @@ use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
 use super::{
-    ExecutorClaimScope, ExecutorLaunchContext, ExecutorLaunchContextStore, ExecutorResultManifest,
+    ExecutorArtifactAuthority, ExecutorArtifactAuthorityStore, ExecutorClaimScope,
+    ExecutorLaunchContext, ExecutorLaunchContextStore, ExecutorResultManifest,
     ExecutorSubmissionError, ExecutorSubmissionLease, ExecutorSubmissionOutcome,
     ExecutorSubmissionStore, PreparedExecutorSubmission,
 };
@@ -17,9 +18,9 @@ const EXECUTOR_START_ABANDONED: &str = "executor_start_abandoned";
 mod validation;
 
 use validation::{
-    command_hash, command_output_count, distinct_execution_id, validate_claim_scope,
-    validate_executor_lease, validate_lease_duration, validate_outcome, validate_owner,
-    validate_owner_and_duration, validate_work_lease,
+    command_hash, command_output_count, distinct_execution_id, validate_artifact_authority,
+    validate_claim_scope, validate_executor_lease, validate_lease_duration, validate_outcome,
+    validate_owner, validate_owner_and_duration, validate_work_lease,
 };
 
 #[derive(Clone)]
@@ -99,11 +100,18 @@ struct TerminalOutcomeRow {
     execution_error_code: Option<String>,
     submission_error_code: Option<String>,
     manifest_id: Option<Uuid>,
-    storage_backend: Option<String>,
-    object_key: Option<String>,
-    sha256_hex: Option<String>,
-    byte_size: Option<i64>,
-    media_type: Option<String>,
+    artifact_authority_id: Option<Uuid>,
+}
+
+#[derive(sqlx::FromRow)]
+struct ArtifactAuthorityRow {
+    authority_id: Uuid,
+    storage_backend: String,
+    storage_namespace: String,
+    object_key: String,
+    sha256_hex: String,
+    byte_size: i64,
+    media_type: String,
 }
 
 #[derive(sqlx::FromRow)]
@@ -205,6 +213,42 @@ impl ExecutorLaunchContextStore for PostgresExecutorSubmissionStore {
             command_hash: row.command_hash,
             command_json: row.command_json,
         })
+    }
+}
+
+#[async_trait]
+impl ExecutorArtifactAuthorityStore for PostgresExecutorSubmissionStore {
+    async fn publish_artifact_authority(
+        &self,
+        lease: &ExecutorSubmissionLease,
+        authority: &ExecutorArtifactAuthority,
+    ) -> Result<(), ExecutorSubmissionError> {
+        validate_executor_lease(lease)?;
+        validate_artifact_authority(authority)?;
+        let mut tx = self.pool.begin().await.map_err(unavailable)?;
+        let locked = lock_executor_execution(&mut tx, lease).await?;
+        if let Some(existing) = lock_artifact_authority(&mut tx, lease).await? {
+            if artifact_authority_matches(&existing, authority) {
+                tx.commit().await.map_err(unavailable)?;
+                return Ok(());
+            }
+            return Err(ExecutorSubmissionError::Conflict);
+        }
+        let now = database_now(&mut tx).await?;
+        if locked.state != "running"
+            || locked.executor_owner.as_deref() != Some(lease.executor_owner.as_str())
+            || locked.lease_epoch != lease.executor_lease_epoch
+            || locked
+                .lease_expires_at_ms
+                .is_none_or(|expires| expires <= now)
+        {
+            return Err(ExecutorSubmissionError::StaleLease);
+        }
+        if lock_submission_state(&mut tx, lease).await? != "running" {
+            return Err(ExecutorSubmissionError::Conflict);
+        }
+        insert_artifact_authority(&mut tx, lease, authority, now).await?;
+        tx.commit().await.map_err(unavailable)
     }
 }
 
@@ -645,6 +689,14 @@ impl ExecutorSubmissionStore for PostgresExecutorSubmissionStore {
                 .is_none_or(|expires| expires <= now)
         {
             return Err(ExecutorSubmissionError::StaleLease);
+        }
+        if let Some(manifest) = outcome.manifest() {
+            let authority = lock_artifact_authority(&mut tx, lease)
+                .await?
+                .ok_or(ExecutorSubmissionError::Conflict)?;
+            if !manifest_matches_artifact_authority(manifest, &authority) {
+                return Err(ExecutorSubmissionError::Conflict);
+            }
         }
         let execution_changed = sqlx::query(
             r#"
@@ -1108,6 +1160,98 @@ async fn lock_submission_state(
     .ok_or(ExecutorSubmissionError::Conflict)
 }
 
+async fn lock_artifact_authority(
+    tx: &mut Transaction<'_, Postgres>,
+    lease: &ExecutorSubmissionLease,
+) -> Result<Option<ArtifactAuthorityRow>, ExecutorSubmissionError> {
+    sqlx::query_as(
+        r#"
+        SELECT a.authority_id, a.storage_backend, a.storage_namespace,
+               a.object_key, a.sha256_hex, a.byte_size, a.media_type
+        FROM executor_artifact_authorities a
+        JOIN provider_submissions s
+          ON s.submission_id = a.submission_id
+         AND s.executor_execution_id = a.executor_execution_id
+         AND s.output_id = a.output_id
+         AND s.job_id = a.job_id
+        JOIN job_outputs o ON o.output_id = s.output_id AND o.job_id = s.job_id
+        WHERE a.executor_execution_id = $1 AND a.submission_id = $2
+          AND s.output_id = $3 AND s.job_id = $4 AND s.work_item_id = $5
+          AND s.tenant_id = $6 AND s.provider_id = $7 AND s.model = $8
+          AND s.command_schema = $9 AND s.command_hash = $10
+          AND o.output_index = $11
+        FOR UPDATE OF a
+        "#,
+    )
+    .bind(lease.executor_execution_id)
+    .bind(lease.submission_id)
+    .bind(lease.output_id)
+    .bind(lease.job_id)
+    .bind(lease.work_item_id)
+    .bind(&lease.tenant_id)
+    .bind(&lease.provider_id)
+    .bind(&lease.model)
+    .bind(&lease.command_schema)
+    .bind(&lease.command_hash)
+    .bind(lease.output_index)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(unavailable)
+}
+
+async fn insert_artifact_authority(
+    tx: &mut Transaction<'_, Postgres>,
+    lease: &ExecutorSubmissionLease,
+    authority: &ExecutorArtifactAuthority,
+    now: i64,
+) -> Result<(), ExecutorSubmissionError> {
+    sqlx::query(
+        r#"
+        INSERT INTO executor_artifact_authorities
+          (authority_id, executor_execution_id, submission_id, output_id, job_id,
+           storage_backend, storage_namespace, object_key, sha256_hex, byte_size,
+           media_type, created_at_ms)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+        "#,
+    )
+    .bind(authority.authority_id)
+    .bind(lease.executor_execution_id)
+    .bind(lease.submission_id)
+    .bind(lease.output_id)
+    .bind(lease.job_id)
+    .bind(&authority.storage_backend)
+    .bind(&authority.storage_namespace)
+    .bind(&authority.object_key)
+    .bind(&authority.sha256_hex)
+    .bind(i64::try_from(authority.byte_size).map_err(|_| ExecutorSubmissionError::InvalidInput)?)
+    .bind(&authority.media_type)
+    .bind(now)
+    .execute(&mut **tx)
+    .await
+    .map_err(unavailable)?;
+    Ok(())
+}
+
+fn artifact_authority_matches(
+    stored: &ArtifactAuthorityRow,
+    expected: &ExecutorArtifactAuthority,
+) -> bool {
+    stored.authority_id == expected.authority_id
+        && stored.storage_backend == expected.storage_backend
+        && stored.storage_namespace == expected.storage_namespace
+        && stored.object_key == expected.object_key
+        && stored.sha256_hex == expected.sha256_hex
+        && u64::try_from(stored.byte_size).ok() == Some(expected.byte_size)
+        && stored.media_type == expected.media_type
+}
+
+fn manifest_matches_artifact_authority(
+    manifest: &ExecutorResultManifest,
+    authority: &ArtifactAuthorityRow,
+) -> bool {
+    manifest.artifact_authority_id == authority.authority_id
+}
+
 async fn insert_result_manifest(
     tx: &mut Transaction<'_, Postgres>,
     lease: &ExecutorSubmissionLease,
@@ -1117,19 +1261,14 @@ async fn insert_result_manifest(
     sqlx::query(
         r#"
         INSERT INTO executor_result_manifests
-          (manifest_id, executor_execution_id, submission_id, storage_backend,
-           object_key, sha256_hex, byte_size, media_type, created_at_ms)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+          (manifest_id, artifact_authority_id, executor_execution_id, submission_id, created_at_ms)
+        VALUES ($1, $2, $3, $4, $5)
         "#,
     )
     .bind(manifest.manifest_id)
+    .bind(manifest.artifact_authority_id)
     .bind(lease.executor_execution_id)
     .bind(lease.submission_id)
-    .bind(&manifest.storage_backend)
-    .bind(&manifest.object_key)
-    .bind(&manifest.sha256_hex)
-    .bind(i64::try_from(manifest.byte_size).map_err(|_| ExecutorSubmissionError::InvalidInput)?)
-    .bind(&manifest.media_type)
     .bind(now)
     .execute(&mut **tx)
     .await
@@ -1147,8 +1286,7 @@ async fn terminal_outcome_matches(
         SELECT e.state AS execution_state, s.state AS submission_state,
                e.error_code AS execution_error_code,
                s.error_code AS submission_error_code,
-               m.manifest_id, m.storage_backend, m.object_key, m.sha256_hex,
-               m.byte_size, m.media_type
+               m.manifest_id, m.artifact_authority_id
         FROM executor_executions e
         JOIN provider_submissions s
           ON s.executor_execution_id = e.executor_execution_id
@@ -1157,6 +1295,10 @@ async fn terminal_outcome_matches(
           ON m.manifest_id = s.result_manifest_id
          AND m.executor_execution_id = e.executor_execution_id
          AND m.submission_id = s.submission_id
+        LEFT JOIN executor_artifact_authorities aa
+          ON aa.authority_id = m.artifact_authority_id
+         AND aa.executor_execution_id = m.executor_execution_id
+         AND aa.submission_id = m.submission_id
         WHERE e.executor_execution_id = $1 AND e.submission_id = $2
           AND s.output_id = $3 AND s.job_id = $4 AND s.work_item_id = $5
         FOR UPDATE OF e, s
@@ -1189,12 +1331,7 @@ async fn terminal_outcome_matches(
     let manifest_matches = match outcome.manifest() {
         Some(manifest) => {
             row.manifest_id == Some(manifest.manifest_id)
-                && row.storage_backend.as_deref() == Some(manifest.storage_backend.as_str())
-                && row.object_key.as_deref() == Some(manifest.object_key.as_str())
-                && row.sha256_hex.as_deref() == Some(manifest.sha256_hex.as_str())
-                && row.byte_size.and_then(|value| u64::try_from(value).ok())
-                    == Some(manifest.byte_size)
-                && row.media_type.as_deref() == Some(manifest.media_type.as_str())
+                && row.artifact_authority_id == Some(manifest.artifact_authority_id)
         }
         None => row.manifest_id.is_none(),
     };
