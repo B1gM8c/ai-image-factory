@@ -1,8 +1,9 @@
 # Phase 1F: Persistent Executor Runtime
 
-Status: runtime kernel, canonical launch context, and immutable executor artifact
-authority implemented. The production Images API remains on `LegacyV1` until
-every activation gate in this document passes.
+Status: runtime kernel, canonical launch context, immutable executor artifact
+authority, and append-only observation/resolution implemented. The production
+Images API remains on `LegacyV1` until every activation gate in this document
+passes.
 
 The checkpoint includes the executor daemon application port, owner-and-scope
 resume of unexpired running executions, idempotent database start replay,
@@ -108,6 +109,9 @@ authority is handed over, it transitions `leased -> running`.
 While `start_or_attach` is active, executord heartbeats the independent executor
 lease. A stale lease cannot publish a canonical outcome. Durable runner evidence
 may be retained for reconciliation, but cannot bypass PostgreSQL fencing.
+PostgreSQL enforces one-way executor and submission transitions, a write-once
+launch owner and epoch, monotonic live heartbeats, and rejection of any attempt
+to revive an expired lease under the same fence.
 
 The database `start` transition is itself idempotent for the exact same
 execution, submission, owner, and epoch. This covers a committed `running`
@@ -154,11 +158,11 @@ The socket is not a public API and does not reuse the official Images facade.
 
 Each slice is additive. `LegacyV1` remains the default until slice 7 passes.
 
-At this checkpoint, slices 1 and 2 are complete, the durable journal and
-artifact-authority portions of slice 3 are complete, and the exact-lease
-canonical context projection required by slice 4 is complete. Process
-attachment, process identity, and private CLI output spooling remain part of
-slices 3 through 5.
+At this checkpoint, slices 1 and 2 are complete, the durable journal,
+artifact-authority, and PostgreSQL observation/resolution portions of slice 3
+are complete, and the exact-lease canonical context projection required by
+slice 4 is complete. Process attachment, process identity, and private CLI
+output spooling remain part of slices 3 through 5.
 
 The current `ImageGenerator` interface is job-level and may loop over `n`.
 Provider submissions are output-level, so executord must not call that interface
@@ -166,12 +170,10 @@ with the original command. Each adapter must expose a trusted single-output
 operation bound to `output_index`; otherwise an `n`-output request could launch
 the provider `n * n` times.
 
-One schema capability remains an explicit activation blocker after the first
-daemon slice:
-
-- an append-only runner observation and resolution decision path, so an expired
-  running lease can retain a late durable manifest without letting a stale
-  executor overwrite canonical state;
+The schema activation blockers are complete. Runner outcomes are first retained
+as append-only observations under the immutable launch fence. A separate active
+or expiry decision owns every terminal canonical transition, so late evidence
+survives without allowing a stale executor to overwrite the chosen state.
 
 The artifact-authority blocker is complete: a successful executor manifest can
 contain only deterministic authority IDs, and PostgreSQL accepts it only after

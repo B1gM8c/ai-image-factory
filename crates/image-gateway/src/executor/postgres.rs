@@ -1,13 +1,14 @@
 use async_trait::async_trait;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
 use super::{
     ExecutorArtifactAuthority, ExecutorArtifactAuthorityStore, ExecutorClaimScope,
     ExecutorLaunchContext, ExecutorLaunchContextStore, ExecutorResultManifest,
-    ExecutorSubmissionError, ExecutorSubmissionLease, ExecutorSubmissionOutcome,
-    ExecutorSubmissionStore, PreparedExecutorSubmission,
+    ExecutorRunnerObservation, ExecutorSubmissionError, ExecutorSubmissionLease,
+    ExecutorSubmissionOutcome, ExecutorSubmissionStore, PreparedExecutorSubmission,
 };
 use crate::admission::WorkLease;
 
@@ -101,6 +102,9 @@ struct TerminalOutcomeRow {
     submission_error_code: Option<String>,
     manifest_id: Option<Uuid>,
     artifact_authority_id: Option<Uuid>,
+    resolution_source: Option<String>,
+    decision_observation_id: Option<Uuid>,
+    observation_payload_hash: Option<String>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -127,6 +131,17 @@ struct LockedExecutorRow {
     executor_owner: Option<String>,
     lease_epoch: i64,
     lease_expires_at_ms: Option<i64>,
+    launch_owner: Option<String>,
+    launch_lease_epoch: Option<i64>,
+}
+
+#[derive(sqlx::FromRow)]
+struct StoredObservationRow {
+    observation_id: Uuid,
+    observed_state: String,
+    result_manifest_id: Option<Uuid>,
+    error_code: Option<String>,
+    payload_hash: String,
 }
 
 #[derive(sqlx::FromRow)]
@@ -234,19 +249,20 @@ impl ExecutorArtifactAuthorityStore for PostgresExecutorSubmissionStore {
             }
             return Err(ExecutorSubmissionError::Conflict);
         }
-        let now = database_now(&mut tx).await?;
-        if locked.state != "running"
-            || locked.executor_owner.as_deref() != Some(lease.executor_owner.as_str())
-            || locked.lease_epoch != lease.executor_lease_epoch
-            || locked
-                .lease_expires_at_ms
-                .is_none_or(|expires| expires <= now)
+        if !matches!(
+            locked.state.as_str(),
+            "running" | "succeeded" | "failed" | "uncertain"
+        ) || !launch_fence_matches(&locked, lease)
         {
             return Err(ExecutorSubmissionError::StaleLease);
         }
-        if lock_submission_state(&mut tx, lease).await? != "running" {
+        if !matches!(
+            lock_submission_state(&mut tx, lease).await?.as_str(),
+            "running" | "succeeded" | "failed" | "uncertain"
+        ) {
             return Err(ExecutorSubmissionError::Conflict);
         }
+        let now = database_now(&mut tx).await?;
         insert_artifact_authority(&mut tx, lease, authority, now).await?;
         tx.commit().await.map_err(unavailable)
     }
@@ -302,7 +318,7 @@ impl ExecutorSubmissionStore for PostgresExecutorSubmissionStore {
         for output_index in 0..output_count {
             let output_id = Uuid::new_v4();
             let submission_id = Uuid::new_v4();
-            let executor_execution_id = distinct_execution_id(lease.execution_id);
+            let executor_execution_id = distinct_execution_id(lease.execution_id, submission_id);
             sqlx::query(
                 r#"
                 INSERT INTO job_outputs
@@ -549,7 +565,9 @@ impl ExecutorSubmissionStore for PostgresExecutorSubmissionStore {
             return Err(ExecutorSubmissionError::StaleLease);
         }
         if locked.state == "running" {
-            if lock_submission_state(&mut tx, lease).await? != "running" {
+            if !launch_fence_matches(&locked, lease)
+                || lock_submission_state(&mut tx, lease).await? != "running"
+            {
                 return Err(ExecutorSubmissionError::Conflict);
             }
             tx.commit().await.map_err(unavailable)?;
@@ -564,7 +582,8 @@ impl ExecutorSubmissionStore for PostgresExecutorSubmissionStore {
         let changed = sqlx::query(
             r#"
             UPDATE executor_executions
-            SET state = 'running', started_at_ms = $5, updated_at_ms = $5
+            SET state = 'running', launch_owner = $3, launch_lease_epoch = $4,
+                started_at_ms = $5, updated_at_ms = $5
             WHERE executor_execution_id = $1 AND submission_id = $2
               AND executor_owner = $3 AND lease_epoch = $4 AND state = 'leased'
             "#,
@@ -620,6 +639,7 @@ impl ExecutorSubmissionStore for PostgresExecutorSubmissionStore {
         if locked.state != "running"
             || locked.executor_owner.as_deref() != Some(lease.executor_owner.as_str())
             || locked.lease_epoch != lease.executor_lease_epoch
+            || !launch_fence_matches(&locked, lease)
             || locked
                 .lease_expires_at_ms
                 .is_none_or(|expires| expires <= now)
@@ -659,18 +679,70 @@ impl ExecutorSubmissionStore for PostgresExecutorSubmissionStore {
         })
     }
 
-    async fn record_outcome(
+    async fn append_runner_observation(
         &self,
         lease: &ExecutorSubmissionLease,
         outcome: &ExecutorSubmissionOutcome,
-    ) -> Result<(), ExecutorSubmissionError> {
+    ) -> Result<ExecutorRunnerObservation, ExecutorSubmissionError> {
         validate_executor_lease(lease)?;
         validate_outcome(outcome)?;
         let mut tx = self.pool.begin().await.map_err(unavailable)?;
+        let locked = lock_executor_execution(&mut tx, lease).await?;
+        if !matches!(
+            locked.state.as_str(),
+            "running" | "succeeded" | "failed" | "uncertain"
+        ) || !launch_fence_matches(&locked, lease)
+        {
+            return Err(ExecutorSubmissionError::StaleLease);
+        }
+        let observation = runner_observation(lease, outcome)?;
+        let payload_hash = observation_payload_hash(lease, outcome);
+        if let Some(existing) = lock_runner_observation(&mut tx, lease).await? {
+            if stored_observation_matches(&existing, &observation, &payload_hash) {
+                tx.commit().await.map_err(unavailable)?;
+                return Ok(observation);
+            }
+            return Err(ExecutorSubmissionError::Conflict);
+        }
+        if let Some(manifest) = outcome.manifest() {
+            let authority = lock_artifact_authority(&mut tx, lease)
+                .await?
+                .ok_or(ExecutorSubmissionError::Conflict)?;
+            if !manifest_matches_artifact_authority(manifest, &authority) {
+                return Err(ExecutorSubmissionError::Conflict);
+            }
+        }
+        let now = database_now(&mut tx).await?;
+        if let Some(manifest) = outcome.manifest() {
+            insert_result_manifest(&mut tx, lease, manifest, now).await?;
+        }
+        insert_runner_observation(&mut tx, lease, outcome, &payload_hash, now).await?;
+        tx.commit().await.map_err(unavailable)?;
+        Ok(observation)
+    }
+
+    async fn resolve_runner_observation(
+        &self,
+        lease: &ExecutorSubmissionLease,
+        observation: &ExecutorRunnerObservation,
+    ) -> Result<(), ExecutorSubmissionError> {
+        validate_executor_lease(lease)?;
+        validate_outcome(&observation.outcome)?;
+        if observation.observation_id != lease.executor_execution_id
+            || observation.executor_execution_id != lease.executor_execution_id
+            || observation.submission_id != lease.submission_id
+        {
+            return Err(ExecutorSubmissionError::InvalidInput);
+        }
+        let mut tx = self.pool.begin().await.map_err(unavailable)?;
+        let outcome = &observation.outcome;
         let state = outcome.state();
         let error_code = outcome.error_code();
         let locked = lock_executor_execution(&mut tx, lease).await?;
         if matches!(locked.state.as_str(), "succeeded" | "failed" | "uncertain") {
+            if !launch_fence_matches(&locked, lease) {
+                return Err(ExecutorSubmissionError::StaleLease);
+            }
             return match terminal_outcome_matches(&mut tx, lease, outcome).await? {
                 Some(true) => {
                     tx.commit().await.map_err(unavailable)?;
@@ -684,24 +756,40 @@ impl ExecutorSubmissionStore for PostgresExecutorSubmissionStore {
         if locked.state != "running"
             || locked.executor_owner.as_deref() != Some(lease.executor_owner.as_str())
             || locked.lease_epoch != lease.executor_lease_epoch
+            || !launch_fence_matches(&locked, lease)
             || locked
                 .lease_expires_at_ms
                 .is_none_or(|expires| expires <= now)
         {
             return Err(ExecutorSubmissionError::StaleLease);
         }
-        if let Some(manifest) = outcome.manifest() {
-            let authority = lock_artifact_authority(&mut tx, lease)
-                .await?
-                .ok_or(ExecutorSubmissionError::Conflict)?;
-            if !manifest_matches_artifact_authority(manifest, &authority) {
-                return Err(ExecutorSubmissionError::Conflict);
-            }
+        if lock_submission_state(&mut tx, lease).await? != "running" {
+            return Err(ExecutorSubmissionError::Conflict);
         }
+        let stored = lock_runner_observation(&mut tx, lease)
+            .await?
+            .ok_or(ExecutorSubmissionError::Conflict)?;
+        let payload_hash = observation_payload_hash(lease, outcome);
+        if !stored_observation_matches(&stored, observation, &payload_hash) {
+            return Err(ExecutorSubmissionError::Conflict);
+        }
+        insert_resolution_decision(
+            &mut tx,
+            lease.executor_execution_id,
+            lease.submission_id,
+            "active_runner_observation",
+            Some(observation.observation_id),
+            state,
+            outcome.manifest().map(|manifest| manifest.manifest_id),
+            error_code,
+            now,
+        )
+        .await?;
         let execution_changed = sqlx::query(
             r#"
             UPDATE executor_executions
             SET state = $5, executor_owner = NULL, lease_expires_at_ms = NULL,
+                resolution_decision_id = $1,
                 finished_at_ms = $6, updated_at_ms = $6, error_code = $7
             WHERE executor_execution_id = $1 AND submission_id = $2
               AND executor_owner = $3 AND lease_epoch = $4
@@ -722,14 +810,12 @@ impl ExecutorSubmissionStore for PostgresExecutorSubmissionStore {
         if execution_changed != 1 {
             return Err(ExecutorSubmissionError::StaleLease);
         }
-        if let Some(manifest) = outcome.manifest() {
-            insert_result_manifest(&mut tx, lease, manifest, now).await?;
-        }
         let submission_changed = sqlx::query(
             r#"
             UPDATE provider_submissions
             SET state = $6, result_manifest_id = $7, finished_at_ms = $8,
-                updated_at_ms = $8, error_code = $9
+                updated_at_ms = $8, error_code = $9,
+                resolution_decision_id = $2
             WHERE submission_id = $1 AND executor_execution_id = $2
               AND output_id = $3 AND job_id = $4 AND work_item_id = $5
               AND state = 'running'
@@ -873,7 +959,7 @@ async fn prepare_admission_outputs(
     let mut prepared = Vec::with_capacity(rows.len());
     for row in rows {
         let submission_id = Uuid::new_v4();
-        let executor_execution_id = distinct_execution_id(lease.execution_id);
+        let executor_execution_id = distinct_execution_id(lease.execution_id, submission_id);
         sqlx::query(
             r#"
             INSERT INTO provider_submissions
@@ -1084,7 +1170,8 @@ async fn lock_executor_execution(
 ) -> Result<LockedExecutorRow, ExecutorSubmissionError> {
     sqlx::query_as(
         r#"
-        SELECT state, executor_owner, lease_epoch, lease_expires_at_ms
+        SELECT state, executor_owner, lease_epoch, lease_expires_at_ms,
+               launch_owner, launch_lease_epoch
         FROM executor_executions
         WHERE executor_execution_id = $1 AND submission_id = $2
         FOR UPDATE
@@ -1105,7 +1192,10 @@ async fn replay_started(
     let mut tx = pool.begin().await.map_err(unavailable)?;
     let locked = lock_executor_execution(&mut tx, lease).await?;
     let now = database_now(&mut tx).await?;
-    if locked.state != "running" || !locked_executor_matches(&locked, lease, now) {
+    if locked.state != "running"
+        || !locked_executor_matches(&locked, lease, now)
+        || !launch_fence_matches(&locked, lease)
+    {
         return Err(ExecutorSubmissionError::StaleLease);
     }
     if lock_submission_state(&mut tx, lease).await? != "running" {
@@ -1124,6 +1214,11 @@ fn locked_executor_matches(
         && locked
             .lease_expires_at_ms
             .is_some_and(|expires| expires > now)
+}
+
+fn launch_fence_matches(locked: &LockedExecutorRow, lease: &ExecutorSubmissionLease) -> bool {
+    locked.launch_owner.as_deref() == Some(lease.executor_owner.as_str())
+        && locked.launch_lease_epoch == Some(lease.executor_lease_epoch)
 }
 
 async fn lock_submission_state(
@@ -1252,6 +1347,143 @@ fn manifest_matches_artifact_authority(
     manifest.artifact_authority_id == authority.authority_id
 }
 
+fn runner_observation(
+    lease: &ExecutorSubmissionLease,
+    outcome: &ExecutorSubmissionOutcome,
+) -> Result<ExecutorRunnerObservation, ExecutorSubmissionError> {
+    ExecutorRunnerObservation::new(
+        lease.executor_execution_id,
+        lease.submission_id,
+        outcome.clone(),
+    )
+    .ok_or(ExecutorSubmissionError::InvalidInput)
+}
+
+fn observation_payload_hash(
+    lease: &ExecutorSubmissionLease,
+    outcome: &ExecutorSubmissionOutcome,
+) -> String {
+    let mut hash = Sha256::new();
+    for value in [
+        "executor-runner-observation-v1".to_string(),
+        lease.executor_execution_id.to_string(),
+        lease.submission_id.to_string(),
+        lease.executor_owner.clone(),
+        lease.executor_lease_epoch.to_string(),
+        outcome.state().to_string(),
+        outcome
+            .manifest()
+            .map(|manifest| manifest.manifest_id.to_string())
+            .unwrap_or_default(),
+        outcome.error_code().unwrap_or_default().to_string(),
+    ] {
+        hash.update((value.len() as u64).to_be_bytes());
+        hash.update(value.as_bytes());
+    }
+    hex::encode(hash.finalize())
+}
+
+async fn lock_runner_observation(
+    tx: &mut Transaction<'_, Postgres>,
+    lease: &ExecutorSubmissionLease,
+) -> Result<Option<StoredObservationRow>, ExecutorSubmissionError> {
+    sqlx::query_as(
+        r#"
+        SELECT observation_id, observed_state, result_manifest_id, error_code, payload_hash
+        FROM executor_runner_observations
+        WHERE executor_execution_id = $1 AND submission_id = $2
+        FOR UPDATE
+        "#,
+    )
+    .bind(lease.executor_execution_id)
+    .bind(lease.submission_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(unavailable)
+}
+
+fn stored_observation_matches(
+    stored: &StoredObservationRow,
+    observation: &ExecutorRunnerObservation,
+    payload_hash: &str,
+) -> bool {
+    stored.observation_id == observation.observation_id
+        && stored.observed_state == observation.outcome.state()
+        && stored.result_manifest_id
+            == observation
+                .outcome
+                .manifest()
+                .map(|manifest| manifest.manifest_id)
+        && stored.error_code.as_deref() == observation.outcome.error_code()
+        && stored.payload_hash == payload_hash
+}
+
+async fn insert_runner_observation(
+    tx: &mut Transaction<'_, Postgres>,
+    lease: &ExecutorSubmissionLease,
+    outcome: &ExecutorSubmissionOutcome,
+    payload_hash: &str,
+    now: i64,
+) -> Result<(), ExecutorSubmissionError> {
+    sqlx::query(
+        r#"
+        INSERT INTO executor_runner_observations
+          (observation_id, executor_execution_id, submission_id, launch_owner,
+           launch_lease_epoch, observed_state, result_manifest_id, error_code,
+           payload_hash, observed_at_ms)
+        VALUES ($1, $1, $2, $3, $4, $5, $6, $7, $8, $9)
+        "#,
+    )
+    .bind(lease.executor_execution_id)
+    .bind(lease.submission_id)
+    .bind(&lease.executor_owner)
+    .bind(lease.executor_lease_epoch)
+    .bind(outcome.state())
+    .bind(outcome.manifest().map(|manifest| manifest.manifest_id))
+    .bind(outcome.error_code())
+    .bind(payload_hash)
+    .bind(now)
+    .execute(&mut **tx)
+    .await
+    .map_err(unavailable)?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn insert_resolution_decision(
+    tx: &mut Transaction<'_, Postgres>,
+    executor_execution_id: Uuid,
+    submission_id: Uuid,
+    source: &str,
+    observation_id: Option<Uuid>,
+    resolved_state: &str,
+    result_manifest_id: Option<Uuid>,
+    error_code: Option<&str>,
+    now: i64,
+) -> Result<(), ExecutorSubmissionError> {
+    sqlx::query(
+        r#"
+        INSERT INTO executor_resolution_decisions
+          (decision_id, executor_execution_id, submission_id, source,
+           observation_id, resolved_state, result_manifest_id, error_code,
+           decided_at_ms)
+        VALUES ($1, $1, $2, $3, $4, $5, $6, $7, $8)
+        "#,
+    )
+    .bind(executor_execution_id)
+    .bind(submission_id)
+    .bind(source)
+    .bind(observation_id)
+    .bind(resolved_state)
+    .bind(result_manifest_id)
+    .bind(error_code)
+    .bind(now)
+    .execute(&mut **tx)
+    .await
+    .map_err(unavailable)?;
+    Ok(())
+}
+
 async fn insert_result_manifest(
     tx: &mut Transaction<'_, Postgres>,
     lease: &ExecutorSubmissionLease,
@@ -1286,7 +1518,10 @@ async fn terminal_outcome_matches(
         SELECT e.state AS execution_state, s.state AS submission_state,
                e.error_code AS execution_error_code,
                s.error_code AS submission_error_code,
-               m.manifest_id, m.artifact_authority_id
+               m.manifest_id, m.artifact_authority_id,
+               d.source AS resolution_source,
+               d.observation_id AS decision_observation_id,
+               ro.payload_hash AS observation_payload_hash
         FROM executor_executions e
         JOIN provider_submissions s
           ON s.executor_execution_id = e.executor_execution_id
@@ -1299,6 +1534,14 @@ async fn terminal_outcome_matches(
           ON aa.authority_id = m.artifact_authority_id
          AND aa.executor_execution_id = m.executor_execution_id
          AND aa.submission_id = m.submission_id
+        LEFT JOIN executor_resolution_decisions d
+          ON d.decision_id = e.resolution_decision_id
+         AND d.executor_execution_id = e.executor_execution_id
+         AND d.submission_id = e.submission_id
+        LEFT JOIN executor_runner_observations ro
+          ON ro.observation_id = d.observation_id
+         AND ro.executor_execution_id = d.executor_execution_id
+         AND ro.submission_id = d.submission_id
         WHERE e.executor_execution_id = $1 AND e.submission_id = $2
           AND s.output_id = $3 AND s.job_id = $4 AND s.work_item_id = $5
         FOR UPDATE OF e, s
@@ -1335,7 +1578,14 @@ async fn terminal_outcome_matches(
         }
         None => row.manifest_id.is_none(),
     };
-    Ok(Some(base_matches && manifest_matches))
+    let active_decision_matches = row.resolution_source.as_deref()
+        == Some("active_runner_observation")
+        && row.decision_observation_id == Some(lease.executor_execution_id)
+        && row.observation_payload_hash.as_deref()
+            == Some(observation_payload_hash(lease, outcome).as_str());
+    Ok(Some(
+        base_matches && manifest_matches && active_decision_matches,
+    ))
 }
 
 async fn update_expired_execution(
@@ -1348,11 +1598,28 @@ async fn update_expired_execution(
     } else {
         ("leased", "prepared", "canceled", EXECUTOR_START_ABANDONED)
     };
+    insert_resolution_decision(
+        tx,
+        row.executor_execution_id,
+        row.submission_id,
+        if row.executor_state == "running" {
+            "executor_lease_expired"
+        } else {
+            "executor_start_abandoned"
+        },
+        None,
+        target,
+        None,
+        Some(error_code),
+        now,
+    )
+    .await?;
     require_one(
         sqlx::query(
             r#"
             UPDATE executor_executions
             SET state = $3, executor_owner = NULL, lease_expires_at_ms = NULL,
+                resolution_decision_id = $1,
                 finished_at_ms = $4, updated_at_ms = $4, error_code = $5
             WHERE executor_execution_id = $1 AND submission_id = $2 AND state = $6
             "#,
@@ -1372,7 +1639,8 @@ async fn update_expired_execution(
             r#"
             UPDATE provider_submissions
             SET state = $3, finished_at_ms = $4,
-                updated_at_ms = $4, error_code = $5
+                updated_at_ms = $4, error_code = $5,
+                resolution_decision_id = $1
             WHERE executor_execution_id = $1 AND submission_id = $2 AND state = $6
             "#,
         )

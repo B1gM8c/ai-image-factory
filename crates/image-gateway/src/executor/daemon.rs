@@ -1,4 +1,8 @@
-use std::time::Duration;
+use std::{
+    future::{Future, poll_fn},
+    task::Poll,
+    time::Duration,
+};
 
 use tokio::time::{Instant, MissedTickBehavior};
 
@@ -119,18 +123,41 @@ where
         let mut heartbeat = tokio::time::interval_at(first_tick, self.heartbeat_interval);
         heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
-        let outcome = loop {
+        let outcome = 'running: loop {
             tokio::select! {
                 biased;
-                _ = heartbeat.tick() => {
-                    lease = self.store.heartbeat(&lease, self.lease_ms).await?;
-                }
                 outcome = &mut runner => break outcome,
+                _ = heartbeat.tick() => {
+                    let renewal_result = {
+                        let renewal = self.store.heartbeat(&lease, self.lease_ms);
+                        tokio::pin!(renewal);
+                        tokio::select! {
+                            biased;
+                            outcome = &mut runner => break 'running outcome,
+                            renewed = &mut renewal => renewed,
+                        }
+                    };
+                    if let Some(outcome) = poll_fn(|cx| match runner.as_mut().poll(cx) {
+                        Poll::Ready(outcome) => Poll::Ready(Some(outcome)),
+                        Poll::Pending => Poll::Ready(None),
+                    })
+                    .await
+                    {
+                        break 'running outcome;
+                    }
+                    lease = renewal_result?;
+                }
             }
         };
-        lease = self.store.heartbeat(&lease, self.lease_ms).await?;
         let outcome = ExecutorSubmissionOutcome::from(outcome);
-        self.store.record_outcome(&lease, &outcome).await?;
+        let observation = self
+            .store
+            .append_runner_observation(&lease, &outcome)
+            .await?;
+        lease = self.store.heartbeat(&lease, self.lease_ms).await?;
+        self.store
+            .resolve_runner_observation(&lease, &observation)
+            .await?;
         Ok(ExecutorDaemonRun::Recorded)
     }
 }

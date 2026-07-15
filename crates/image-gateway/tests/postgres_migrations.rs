@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 type TestResult<T = ()> = Result<T, String>;
 
-const REQUIRED_COLUMNS: [(&str, &str); 40] = [
+const REQUIRED_COLUMNS: [(&str, &str); 46] = [
     ("usage_events", "tenant_id"),
     ("quota_reservations", "tenant_id"),
     ("quota_reservations", "job_id"),
@@ -54,6 +54,12 @@ const REQUIRED_COLUMNS: [(&str, &str); 40] = [
     ("executor_artifact_authorities", "storage_namespace"),
     ("executor_artifact_authorities", "sha256_hex"),
     ("executor_result_manifests", "artifact_authority_id"),
+    ("executor_executions", "launch_owner"),
+    ("executor_executions", "resolution_decision_id"),
+    ("provider_submissions", "resolution_decision_id"),
+    ("executor_runner_observations", "payload_hash"),
+    ("executor_resolution_decisions", "source"),
+    ("executor_resolution_decisions", "resolution_fingerprint"),
 ];
 
 const REQUIRED_INDEXES: [&str; 10] = [
@@ -148,6 +154,18 @@ async fn artifact_authority_migration_rejects_untrusted_existing_manifests() -> 
     };
 
     let result = artifact_authority_upgrade_case(&test_schema.pool).await;
+    let cleanup = test_schema.cleanup().await;
+    cleanup?;
+    result
+}
+
+#[tokio::test]
+async fn observation_migration_rejects_existing_projection_splits() -> TestResult {
+    let Some(test_schema) = TestSchema::new(1).await? else {
+        return Ok(());
+    };
+
+    let result = observation_resolution_upgrade_case(&test_schema.pool).await;
     let cleanup = test_schema.cleanup().await;
     cleanup?;
     result
@@ -454,6 +472,108 @@ async fn artifact_authority_upgrade_case(pool: &PgPool) -> TestResult {
     )
 }
 
+async fn observation_resolution_upgrade_case(pool: &PgPool) -> TestResult {
+    for migration in [
+        include_str!("../migrations/0000_legacy_reconciliation.sql"),
+        include_str!("../migrations/0001_usage.sql"),
+        include_str!("../migrations/0002_durable_admission.sql"),
+        include_str!("../migrations/0003_durable_scheduling.sql"),
+        include_str!("../migrations/0004_api_key_hmac.sql"),
+        include_str!("../migrations/0005_artifact_replay.sql"),
+        include_str!("../migrations/0006_execution_context.sql"),
+        include_str!("../migrations/0007_edit_inputs.sql"),
+        include_str!("../migrations/0008_provider_submissions.sql"),
+        include_str!("../migrations/0009_economic_kernel.sql"),
+        include_str!("../migrations/0010_executor_artifact_authority.sql"),
+    ] {
+        sqlx::raw_sql(migration)
+            .execute(pool)
+            .await
+            .map_err(|error| format!("pre-0011 migration failed: {error}"))?;
+    }
+    sqlx::raw_sql(
+        r#"
+        DO $$
+        DECLARE constraint_name TEXT;
+        BEGIN
+            FOR constraint_name IN
+                SELECT conname
+                FROM pg_constraint
+                WHERE conrelid = 'provider_submissions'::regclass
+                  AND contype = 'f'
+            LOOP
+                EXECUTE format(
+                    'ALTER TABLE provider_submissions DROP CONSTRAINT %I',
+                    constraint_name
+                );
+            END LOOP;
+        END;
+        $$;
+        "#,
+    )
+    .execute(pool)
+    .await
+    .map_err(|error| format!("failed to isolate projection split fixture: {error}"))?;
+    let submission_id = Uuid::new_v4();
+    let executor_execution_id = Uuid::new_v4();
+    sqlx::query(
+        r#"
+        INSERT INTO provider_submissions
+          (submission_id, executor_execution_id, output_id, job_id,
+           tenant_id, provider_id, model, work_item_id,
+           created_by_execution_id, created_by_lease_epoch,
+           command_schema, command_hash, state,
+           prepared_at_ms, started_at_ms, updated_at_ms)
+        VALUES ($1, $2, $3, $4, 'tenant', 'provider', 'model', $5,
+                $6, 1, 'command-v1', $7, 'running', 1, 1, 1)
+        "#,
+    )
+    .bind(submission_id)
+    .bind(executor_execution_id)
+    .bind(Uuid::new_v4())
+    .bind(Uuid::new_v4())
+    .bind(Uuid::new_v4())
+    .bind(Uuid::new_v4())
+    .bind("a".repeat(64))
+    .execute(pool)
+    .await
+    .map_err(|error| format!("failed to seed split submission: {error}"))?;
+    sqlx::query(
+        r#"
+        INSERT INTO executor_executions
+          (executor_execution_id, submission_id, state, executor_owner,
+           lease_epoch, lease_expires_at_ms, created_at_ms, leased_at_ms,
+           updated_at_ms)
+        VALUES ($1, $2, 'leased', 'executor', 1, 9999999999999, 1, 1, 1)
+        "#,
+    )
+    .bind(executor_execution_id)
+    .bind(submission_id)
+    .execute(pool)
+    .await
+    .map_err(|error| format!("failed to seed split execution: {error}"))?;
+
+    require(
+        sqlx::raw_sql(include_str!(
+            "../migrations/0011_executor_observation_resolution.sql"
+        ))
+        .execute(pool)
+        .await
+        .is_err(),
+        "0011 accepted an existing executor/submission projection split",
+    )?;
+    let launch_column_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'executor_executions' AND column_name = 'launch_owner')",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|error| format!("failed to inspect rolled-back observation migration: {error}"))?;
+    require(
+        !launch_column_exists,
+        "failed 0011 migration did not roll back its schema changes",
+    )
+}
+
 async fn default_pool_case(test_schema: &TestSchema) -> TestResult {
     let database_url = env::var("TEST_DATABASE_URL")
         .map_err(|_| "TEST_DATABASE_URL disappeared during test".to_string())?;
@@ -706,8 +826,8 @@ async fn shared_pool_case(pool: &PgPool) -> TestResult {
 
 async fn assert_expected_schema(pool: &PgPool) -> TestResult {
     require(
-        migration_versions(pool).await? == vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
-        "applied migration versions must be exactly [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]",
+        migration_versions(pool).await? == vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+        "applied migration versions must be exactly [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]",
     )?;
 
     for (table, column) in REQUIRED_COLUMNS {

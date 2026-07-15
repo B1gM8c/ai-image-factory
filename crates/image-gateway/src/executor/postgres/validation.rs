@@ -79,7 +79,15 @@ pub(super) fn validate_lease_duration(lease_ms: i64) -> Result<(), ExecutorSubmi
 pub(super) fn validate_executor_lease(
     lease: &ExecutorSubmissionLease,
 ) -> Result<(), ExecutorSubmissionError> {
-    if is_executor_owner(&lease.executor_owner) && lease.executor_lease_epoch > 0 {
+    if is_executor_owner(&lease.executor_owner)
+        && lease.executor_lease_epoch > 0
+        && !lease.submission_id.is_nil()
+        && !lease.executor_execution_id.is_nil()
+        && lease.submission_id != lease.executor_execution_id
+        && !lease.output_id.is_nil()
+        && !lease.job_id.is_nil()
+        && !lease.work_item_id.is_nil()
+    {
         Ok(())
     } else {
         Err(ExecutorSubmissionError::InvalidInput)
@@ -115,10 +123,10 @@ pub(super) fn validate_artifact_authority(
     }
 }
 
-pub(super) fn distinct_execution_id(work_execution_id: Uuid) -> Uuid {
+pub(super) fn distinct_execution_id(work_execution_id: Uuid, submission_id: Uuid) -> Uuid {
     loop {
         let candidate = Uuid::new_v4();
-        if candidate != work_execution_id {
+        if candidate != work_execution_id && candidate != submission_id {
             return candidate;
         }
     }

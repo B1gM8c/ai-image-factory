@@ -215,6 +215,43 @@ impl ExecutorSubmissionOutcome {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExecutorRunnerObservation {
+    pub(crate) observation_id: Uuid,
+    pub(crate) executor_execution_id: Uuid,
+    pub(crate) submission_id: Uuid,
+    pub(crate) outcome: ExecutorSubmissionOutcome,
+}
+
+impl ExecutorRunnerObservation {
+    pub fn new(
+        executor_execution_id: Uuid,
+        submission_id: Uuid,
+        outcome: ExecutorSubmissionOutcome,
+    ) -> Option<Self> {
+        if executor_execution_id.is_nil()
+            || submission_id.is_nil()
+            || executor_execution_id == submission_id
+        {
+            return None;
+        }
+        Some(Self {
+            observation_id: executor_execution_id,
+            executor_execution_id,
+            submission_id,
+            outcome,
+        })
+    }
+
+    pub fn observation_id(&self) -> Uuid {
+        self.observation_id
+    }
+
+    pub fn outcome(&self) -> &ExecutorSubmissionOutcome {
+        &self.outcome
+    }
+}
+
 #[derive(Debug, Eq, PartialEq, thiserror::Error)]
 pub enum ExecutorSubmissionError {
     #[error("executor submission storage is unavailable")]
@@ -255,11 +292,26 @@ pub trait ExecutorSubmissionStore: Send + Sync + 'static {
         lease_ms: i64,
     ) -> Result<ExecutorSubmissionLease, ExecutorSubmissionError>;
 
+    async fn append_runner_observation(
+        &self,
+        lease: &ExecutorSubmissionLease,
+        outcome: &ExecutorSubmissionOutcome,
+    ) -> Result<ExecutorRunnerObservation, ExecutorSubmissionError>;
+
+    async fn resolve_runner_observation(
+        &self,
+        lease: &ExecutorSubmissionLease,
+        observation: &ExecutorRunnerObservation,
+    ) -> Result<(), ExecutorSubmissionError>;
+
     async fn record_outcome(
         &self,
         lease: &ExecutorSubmissionLease,
         outcome: &ExecutorSubmissionOutcome,
-    ) -> Result<(), ExecutorSubmissionError>;
+    ) -> Result<(), ExecutorSubmissionError> {
+        let observation = self.append_runner_observation(lease, outcome).await?;
+        self.resolve_runner_observation(lease, &observation).await
+    }
 
     async fn reconcile_expired(&self, limit: u32) -> Result<u64, ExecutorSubmissionError>;
 }

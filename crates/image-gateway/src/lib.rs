@@ -39,8 +39,9 @@ pub use execution::{
 };
 pub use executor::{
     ExecutorClaimScope, ExecutorLaunchContext, ExecutorLaunchContextStore, ExecutorResultManifest,
-    ExecutorSubmissionError, ExecutorSubmissionLease, ExecutorSubmissionOutcome,
-    ExecutorSubmissionStore, PostgresExecutorSubmissionStore, PreparedExecutorSubmission,
+    ExecutorRunnerObservation, ExecutorSubmissionError, ExecutorSubmissionLease,
+    ExecutorSubmissionOutcome, ExecutorSubmissionStore, PostgresExecutorSubmissionStore,
+    PreparedExecutorSubmission,
 };
 pub use generator::{
     CodexImageGenerator, EditJob, GeneratedImage, GenerationJob, ImageGenerator, InputImage,

@@ -502,8 +502,23 @@ async fn stale_executor_lease_is_fenced_after_unstarted_reclaim() -> TestResult 
         let store = PostgresExecutorSubmissionStore::new(database.pool.clone());
         store.prepare_for_lease(&lease).await.map_err(debug_error)?;
         activate_work(&database.pool, &lease).await?;
-        let stale = claim_required(&store, "executor-old").await?;
-        expire_executor_lease(&database.pool, stale.submission_id).await?;
+        let stale = claim_required_for(&store, "executor-old", 25).await?;
+        require(
+            sqlx::query(
+                r#"
+                UPDATE executor_executions
+                SET state = 'prepared', executor_owner = NULL, lease_epoch = 0,
+                    lease_expires_at_ms = NULL, leased_at_ms = NULL
+                WHERE executor_execution_id = $1
+                "#,
+            )
+            .bind(stale.executor_execution_id)
+            .execute(&database.pool)
+            .await
+            .is_err(),
+            "leased executor moved backward to prepared",
+        )?;
+        tokio::time::sleep(Duration::from_millis(40)).await;
         let current = claim_required(&store, "executor-new").await?;
 
         require(
@@ -543,7 +558,39 @@ async fn start_replays_same_running_lease_without_changing_fence_or_timestamp() 
         store.prepare_for_lease(&work).await.map_err(debug_error)?;
         activate_work(&database.pool, &work).await?;
         let lease = claim_required(&store, "stable-executor").await?;
+        require(
+            sqlx::query(
+                r#"
+                UPDATE executor_executions
+                SET launch_owner = executor_owner,
+                    launch_lease_epoch = lease_epoch
+                WHERE executor_execution_id = $1 AND submission_id = $2
+                "#,
+            )
+            .bind(lease.executor_execution_id)
+            .bind(lease.submission_id)
+            .execute(&database.pool)
+            .await
+            .is_err(),
+            "launch fence was set before the leased-to-running transition",
+        )?;
         store.start(&lease).await.map_err(debug_error)?;
+        require(
+            sqlx::query(
+                r#"
+                UPDATE executor_executions
+                SET lease_expires_at_ms =
+                  floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT - 1
+                WHERE executor_execution_id = $1 AND submission_id = $2
+                "#,
+            )
+            .bind(lease.executor_execution_id)
+            .bind(lease.submission_id)
+            .execute(&database.pool)
+            .await
+            .is_err(),
+            "running executor lease expiry moved backward",
+        )?;
         let before: (i64, i64, i64) = sqlx::query_as(
             r#"
             SELECT started_at_ms, lease_epoch, lease_expires_at_ms
@@ -621,22 +668,169 @@ async fn start_replays_same_running_lease_without_changing_fence_or_timestamp() 
             "different epoch replay was accepted",
         )?;
 
+        require(
+            sqlx::query(
+                r#"
+                UPDATE executor_executions
+                SET launch_owner = 'replacement-executor'
+                WHERE executor_execution_id = $1 AND submission_id = $2
+                "#,
+            )
+            .bind(lease.executor_execution_id)
+            .bind(lease.submission_id)
+            .execute(&database.pool)
+            .await
+            .is_err(),
+            "immutable launch owner was replaced",
+        )?;
+        require(
+            sqlx::query(
+                r#"
+                UPDATE executor_executions
+                SET state = 'leased', started_at_ms = NULL,
+                    launch_owner = NULL, launch_lease_epoch = NULL
+                WHERE executor_execution_id = $1 AND submission_id = $2
+                "#,
+            )
+            .bind(lease.executor_execution_id)
+            .bind(lease.submission_id)
+            .execute(&database.pool)
+            .await
+            .is_err(),
+            "immutable launch fence was cleared",
+        )?;
+        require(
+            sqlx::query("DELETE FROM executor_executions WHERE executor_execution_id = $1")
+                .bind(lease.executor_execution_id)
+                .execute(&database.pool)
+                .await
+                .is_err(),
+            "durable executor execution was deleted",
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
+async fn executor_execution_insert_requires_prepared_state_without_launch_fence() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let work = seed_lease(&database.pool, "forged-insert-worker", 1).await?;
+        let store = PostgresExecutorSubmissionStore::new(database.pool.clone());
+        let prepared = store
+            .prepare_for_lease(&work)
+            .await
+            .map_err(debug_error)?
+            .remove(0);
+        let now = database_now(&database.pool).await?;
+        let invalid_identity = Uuid::new_v4();
+        let identity_output_id = Uuid::new_v4();
         sqlx::query(
             r#"
-            UPDATE executor_executions
-            SET state = 'leased', started_at_ms = NULL
-            WHERE executor_execution_id = $1 AND submission_id = $2
+            INSERT INTO job_outputs
+              (output_id, job_id, output_index, state, created_at_ms, updated_at_ms)
+            VALUES ($1, $2, 98, 'pending', $3, $3)
             "#,
         )
-        .bind(lease.executor_execution_id)
-        .bind(lease.submission_id)
+        .bind(identity_output_id)
+        .bind(prepared.job_id)
+        .bind(now)
         .execute(&database.pool)
         .await
         .map_err(debug_error)?;
         require(
-            store.start(&lease).await == Err(ExecutorSubmissionError::Conflict),
-            "inconsistent running state replay was accepted",
+            sqlx::query(
+                r#"
+                INSERT INTO provider_submissions
+                  (submission_id, executor_execution_id, output_id, job_id,
+                   tenant_id, provider_id, model, work_item_id,
+                   created_by_execution_id, created_by_lease_epoch,
+                   command_schema, command_hash, state,
+                   prepared_at_ms, updated_at_ms)
+                SELECT $1, $1, $2, job_id, tenant_id, provider_id, model,
+                       work_item_id, created_by_execution_id,
+                       created_by_lease_epoch, command_schema, command_hash,
+                       'prepared', $3, $3
+                FROM provider_submissions
+                WHERE submission_id = $4
+                "#,
+            )
+            .bind(invalid_identity)
+            .bind(identity_output_id)
+            .bind(now)
+            .bind(prepared.submission_id)
+            .execute(&database.pool)
+            .await
+            .is_err(),
+            "submission and executor identities were allowed to alias",
+        )?;
+        let output_id = Uuid::new_v4();
+        let submission_id = Uuid::new_v4();
+        let executor_execution_id = Uuid::new_v4();
+        let mut forged = database.pool.begin().await.map_err(debug_error)?;
+        sqlx::query(
+            r#"
+            INSERT INTO job_outputs
+              (output_id, job_id, output_index, state, created_at_ms, updated_at_ms)
+            VALUES ($1, $2, 99, 'pending', $3, $3)
+            "#,
         )
+        .bind(output_id)
+        .bind(prepared.job_id)
+        .bind(now)
+        .execute(&mut *forged)
+        .await
+        .map_err(debug_error)?;
+        sqlx::query(
+            r#"
+            INSERT INTO provider_submissions
+              (submission_id, executor_execution_id, output_id, job_id,
+               tenant_id, provider_id, model, work_item_id,
+               created_by_execution_id, created_by_lease_epoch,
+               command_schema, command_hash, state,
+               prepared_at_ms, started_at_ms, updated_at_ms)
+            SELECT $1, $2, $3, job_id, tenant_id, provider_id, model,
+                   work_item_id, created_by_execution_id, created_by_lease_epoch,
+                   command_schema, command_hash, 'running', $4, $4, $4
+            FROM provider_submissions
+            WHERE submission_id = $5
+            "#,
+        )
+        .bind(submission_id)
+        .bind(executor_execution_id)
+        .bind(output_id)
+        .bind(now)
+        .bind(prepared.submission_id)
+        .execute(&mut *forged)
+        .await
+        .map_err(debug_error)?;
+        let error = sqlx::query(
+            r#"
+            INSERT INTO executor_executions
+              (executor_execution_id, submission_id, state, executor_owner,
+               lease_epoch, lease_expires_at_ms, created_at_ms, leased_at_ms,
+               started_at_ms, updated_at_ms, launch_owner, launch_lease_epoch)
+            VALUES ($1, $2, 'running', 'forged-executor', 1, $3,
+                    $4, $4, $4, $4, 'forged-executor', 1)
+            "#,
+        )
+        .bind(executor_execution_id)
+        .bind(submission_id)
+        .bind(now + 60_000)
+        .bind(now)
+        .execute(&mut *forged)
+        .await
+        .expect_err("running executor insert must fail");
+        require(
+            error
+                .to_string()
+                .contains("must be inserted prepared without a launch fence"),
+            "running executor insert failed outside the launch-fence trigger",
+        )?;
+        forged.rollback().await.map_err(debug_error)
     }
     .await;
     combine(result, database.cleanup().await)
@@ -786,6 +980,26 @@ async fn record_outcome_persists_evidence_without_settling_customer_output() -> 
             claims.push(claim);
         }
 
+        require(
+            sqlx::query(
+                r#"
+                INSERT INTO executor_resolution_decisions
+                  (decision_id, executor_execution_id, submission_id, source,
+                   observation_id, resolved_state, result_manifest_id,
+                   error_code, decided_at_ms)
+                VALUES ($1, $1, $2, 'executor_lease_expired', NULL,
+                        'uncertain', NULL, 'executor_lease_expired', $3)
+                "#,
+            )
+            .bind(claims[0].executor_execution_id)
+            .bind(claims[0].submission_id)
+            .bind(database_now(&database.pool).await?)
+            .execute(&database.pool)
+            .await
+            .is_err(),
+            "an unexpired running execution accepted a forged expiry decision",
+        )?;
+
         let successful_manifest = publish_result_authority(&artifacts, &claims[0]).await?;
         deactivate_work(&database.pool, &lease, "uncertain").await?;
         let outcomes = [
@@ -818,6 +1032,31 @@ async fn record_outcome_persists_evidence_without_settling_customer_output() -> 
                 .await
                 == Err(ExecutorSubmissionError::Conflict),
             "conflicting terminal outcome was accepted",
+        )?;
+        let mut wrong_owner = claims[1].clone();
+        wrong_owner.executor_owner = "different-executor".to_string();
+        require(
+            store.record_outcome(&wrong_owner, &outcomes[1]).await
+                == Err(ExecutorSubmissionError::StaleLease),
+            "terminal replay ignored the immutable launch owner",
+        )?;
+        let mut wrong_epoch = claims[1].clone();
+        wrong_epoch.executor_lease_epoch += 1;
+        require(
+            store.record_outcome(&wrong_epoch, &outcomes[1]).await
+                == Err(ExecutorSubmissionError::StaleLease),
+            "terminal replay ignored the immutable launch epoch",
+        )?;
+
+        require(
+            sqlx::query(
+                "UPDATE executor_executions SET error_code = 'forged_error' WHERE executor_execution_id = $1",
+            )
+            .bind(claims[1].executor_execution_id)
+            .execute(&database.pool)
+            .await
+            .is_err(),
+            "terminal executor payload remained mutable",
         )?;
 
         type OutcomeRow = (String, String, String, Option<String>, Option<Uuid>);
@@ -874,9 +1113,25 @@ async fn expired_unstarted_execution_is_canceled_after_work_becomes_terminal() -
         let store = PostgresExecutorSubmissionStore::new(database.pool.clone());
         store.prepare_for_lease(&lease).await.map_err(debug_error)?;
         activate_work(&database.pool, &lease).await?;
-        let claim = claim_required(&store, "abandoned-executor").await?;
+        let claim = claim_required_for(&store, "abandoned-executor", 25).await?;
         deactivate_work(&database.pool, &lease, "uncertain").await?;
-        expire_executor_lease(&database.pool, claim.submission_id).await?;
+        tokio::time::sleep(Duration::from_millis(40)).await;
+
+        require(
+            sqlx::query(
+                r#"
+                UPDATE executor_executions
+                SET lease_expires_at_ms =
+                  floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT + 60000
+                WHERE executor_execution_id = $1
+                "#,
+            )
+            .bind(claim.executor_execution_id)
+            .execute(&database.pool)
+            .await
+            .is_err(),
+            "expired leased executor fence was revived",
+        )?;
 
         require(
             store.reconcile_expired(100).await.map_err(debug_error)? == 1,
@@ -920,9 +1175,45 @@ async fn expired_running_execution_reconciles_to_uncertain_without_retry() -> Te
         let store = PostgresExecutorSubmissionStore::new(database.pool.clone());
         store.prepare_for_lease(&lease).await.map_err(debug_error)?;
         activate_work(&database.pool, &lease).await?;
-        let claim = claim_required(&store, "reconcile-executor").await?;
+        let claim = claim_required_for(&store, "reconcile-executor", 25).await?;
         store.start(&claim).await.map_err(debug_error)?;
-        expire_executor_lease(&database.pool, claim.submission_id).await?;
+        tokio::time::sleep(Duration::from_millis(40)).await;
+
+        require(
+            sqlx::query(
+                r#"
+                UPDATE executor_executions
+                SET lease_expires_at_ms =
+                  floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT + 60000
+                WHERE executor_execution_id = $1
+                "#,
+            )
+            .bind(claim.executor_execution_id)
+            .execute(&database.pool)
+            .await
+            .is_err(),
+            "expired running executor fence was revived",
+        )?;
+
+        require(
+            sqlx::query(
+                r#"
+                INSERT INTO executor_resolution_decisions
+                  (decision_id, executor_execution_id, submission_id, source,
+                   observation_id, resolved_state, result_manifest_id,
+                   error_code, decided_at_ms)
+                VALUES ($1, $1, $2, 'executor_lease_expired', NULL,
+                        'uncertain', NULL, 'executor_lease_expired', $3)
+                "#,
+            )
+            .bind(claim.executor_execution_id)
+            .bind(claim.submission_id)
+            .bind(database_now(&database.pool).await?)
+            .execute(&database.pool)
+            .await
+            .is_err(),
+            "an unprojected expiry decision poisoned the execution",
+        )?;
 
         require(
             store
@@ -963,13 +1254,67 @@ async fn expired_running_execution_reconciles_to_uncertain_without_retry() -> Te
             store
                 .record_outcome(
                     &claim,
-                    &ExecutorSubmissionOutcome::Failed {
-                        error_code: "late_result".to_string(),
+                    &ExecutorSubmissionOutcome::Uncertain {
+                        error_code: "executor_lease_expired".to_string(),
                     },
                 )
                 .await
                 == Err(ExecutorSubmissionError::Conflict),
             "late outcome overwrote uncertain evidence",
+        )?;
+        let late_observation: (String, Option<String>, String) = sqlx::query_as(
+            r#"
+            SELECT observed_state, error_code, payload_hash
+            FROM executor_runner_observations
+            WHERE executor_execution_id = $1 AND submission_id = $2
+            "#,
+        )
+        .bind(claim.executor_execution_id)
+        .bind(claim.submission_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(
+            late_observation.0 == "uncertain"
+                && late_observation.1.as_deref() == Some("executor_lease_expired")
+                && late_observation.2.len() == 64,
+            "matching late runner evidence was not retained after expiry resolution",
+        )?;
+        require(
+            sqlx::query(
+                "UPDATE executor_runner_observations SET payload_hash = payload_hash WHERE executor_execution_id = $1",
+            )
+            .bind(claim.executor_execution_id)
+            .execute(&database.pool)
+            .await
+            .is_err(),
+            "runner observation was mutable",
+        )?;
+        require(
+            sqlx::query(
+                "UPDATE executor_resolution_decisions SET source = source WHERE executor_execution_id = $1",
+            )
+            .bind(claim.executor_execution_id)
+            .execute(&database.pool)
+            .await
+            .is_err(),
+            "resolution decision was mutable",
+        )?;
+        require(
+            sqlx::query(
+                r#"
+                UPDATE provider_submissions
+                SET state = 'running', result_manifest_id = NULL,
+                    finished_at_ms = NULL, error_code = NULL,
+                    resolution_decision_id = NULL
+                WHERE submission_id = $1
+                "#,
+            )
+            .bind(claim.submission_id)
+            .execute(&database.pool)
+            .await
+            .is_err(),
+            "terminal submission was reopened without its decision",
         )
     }
     .await;
@@ -1023,6 +1368,60 @@ async fn executor_boundary_rejects_unbounded_identity_and_lease_inputs() -> Test
         )?;
         let claim = claim_required(&store, "executor").await?;
         store.start(&claim).await.map_err(debug_error)?;
+        require(
+            sqlx::query(
+                r#"
+                UPDATE executor_executions
+                SET state = 'failed', executor_owner = NULL,
+                    lease_expires_at_ms = NULL,
+                    started_at_ms = started_at_ms + 1,
+                    finished_at_ms = $2, updated_at_ms = $2,
+                    error_code = 'forged_error'
+                WHERE executor_execution_id = $1
+                "#,
+            )
+            .bind(claim.executor_execution_id)
+            .bind(database_now(&database.pool).await?)
+            .execute(&database.pool)
+            .await
+            .is_err(),
+            "terminal executor transition changed immutable start history",
+        )?;
+        require(
+            sqlx::query(
+                r#"
+                UPDATE provider_submissions
+                SET state = 'failed', command_hash = $2,
+                    finished_at_ms = $3, updated_at_ms = $3,
+                    error_code = 'forged_error'
+                WHERE submission_id = $1
+                "#,
+            )
+            .bind(claim.submission_id)
+            .bind("b".repeat(64))
+            .bind(database_now(&database.pool).await?)
+            .execute(&database.pool)
+            .await
+            .is_err(),
+            "terminal submission transition changed its immutable command",
+        )?;
+        let valid_outcome = ExecutorSubmissionOutcome::Failed {
+            error_code: "provider_rejected".to_string(),
+        };
+        let mut aliased = claim.clone();
+        aliased.executor_execution_id = aliased.submission_id;
+        require(
+            store.record_outcome(&aliased, &valid_outcome).await
+                == Err(ExecutorSubmissionError::InvalidInput),
+            "aliased executor identity reached runner observation construction",
+        )?;
+        let mut nil_identity = claim.clone();
+        nil_identity.executor_execution_id = Uuid::nil();
+        require(
+            store.record_outcome(&nil_identity, &valid_outcome).await
+                == Err(ExecutorSubmissionError::InvalidInput),
+            "nil executor identity reached runner observation construction",
+        )?;
         require(
             store
                 .record_outcome(
@@ -1176,20 +1575,8 @@ async fn lock_wait_cannot_resurrect_an_expired_executor_lease() -> TestResult {
         let store = PostgresExecutorSubmissionStore::new(database.pool.clone());
         store.prepare_for_lease(&lease).await.map_err(debug_error)?;
         activate_work(&database.pool, &lease).await?;
-        let claim = claim_required(&store, "deadline-executor").await?;
+        let claim = claim_required_for(&store, "deadline-executor", 150).await?;
         store.start(&claim).await.map_err(debug_error)?;
-        sqlx::query(
-            r#"
-            UPDATE executor_executions
-            SET lease_expires_at_ms =
-              floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT + 150
-            WHERE executor_execution_id = $1
-            "#,
-        )
-        .bind(claim.executor_execution_id)
-        .execute(&database.pool)
-        .await
-        .map_err(debug_error)?;
 
         let mut blocker = database.pool.begin().await.map_err(debug_error)?;
         sqlx::query(
@@ -1302,8 +1689,16 @@ async fn claim_required(
     store: &PostgresExecutorSubmissionStore,
     owner: &str,
 ) -> TestResult<ExecutorSubmissionLease> {
+    claim_required_for(store, owner, 60_000).await
+}
+
+async fn claim_required_for(
+    store: &PostgresExecutorSubmissionStore,
+    owner: &str,
+    lease_ms: i64,
+) -> TestResult<ExecutorSubmissionLease> {
     store
-        .claim_prepared(&claim_scope(), owner, 60_000)
+        .claim_prepared(&claim_scope(), owner, lease_ms)
         .await
         .map_err(debug_error)?
         .ok_or_else(|| "executor claim returned none".to_string())
@@ -1320,7 +1715,7 @@ async fn resume_running_fences_owner_scope_state_and_database_expiry() -> TestRe
         store.prepare_for_lease(&work).await.map_err(debug_error)?;
         activate_work(&database.pool, &work).await?;
 
-        let leased = claim_required(&store, "stable-executor").await?;
+        let leased = claim_required_for(&store, "stable-executor", 200).await?;
         require(
             store
                 .resume_running(&claim_scope(), "stable-executor")
@@ -1358,18 +1753,7 @@ async fn resume_running_fences_owner_scope_state_and_database_expiry() -> TestRe
             "other scope resumed running execution",
         )?;
 
-        sqlx::query(
-            r#"
-            UPDATE executor_executions
-            SET lease_expires_at_ms =
-              floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT - 1
-            WHERE executor_execution_id = $1
-            "#,
-        )
-        .bind(leased.executor_execution_id)
-        .execute(&database.pool)
-        .await
-        .map_err(debug_error)?;
+        tokio::time::sleep(Duration::from_millis(220)).await;
         require(
             store
                 .resume_running(&claim_scope(), "stable-executor")
@@ -1451,7 +1835,7 @@ async fn launch_context_rejects_command_tampering_and_expired_lease() -> TestRes
         let store = PostgresExecutorSubmissionStore::new(database.pool.clone());
         store.prepare_for_lease(&work).await.map_err(debug_error)?;
         activate_work(&database.pool, &work).await?;
-        let lease = claim_required(&store, "launch-integrity-executor").await?;
+        let lease = claim_required_for(&store, "launch-integrity-executor", 100).await?;
         store.start(&lease).await.map_err(debug_error)?;
 
         sqlx::query(
@@ -1473,13 +1857,7 @@ async fn launch_context_rejects_command_tampering_and_expired_lease() -> TestRes
             .execute(&database.pool)
             .await
             .map_err(debug_error)?;
-        sqlx::query(
-            "UPDATE executor_executions SET lease_expires_at_ms = floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT - 1 WHERE executor_execution_id = $1",
-        )
-        .bind(lease.executor_execution_id)
-        .execute(&database.pool)
-        .await
-        .map_err(debug_error)?;
+        tokio::time::sleep(Duration::from_millis(120)).await;
         require(
             store.load_launch_context(&lease).await
                 == Err(ExecutorSubmissionError::StaleLease),
@@ -1844,21 +2222,6 @@ async fn extend_worker_lease(pool: &PgPool, lease: &WorkLease) -> TestResult {
     )
     .bind(lease.work_item_id)
     .bind(lease.lease_epoch)
-    .execute(pool)
-    .await
-    .map_err(debug_error)?;
-    Ok(())
-}
-
-async fn expire_executor_lease(pool: &PgPool, submission_id: Uuid) -> TestResult {
-    sqlx::query(
-        r#"
-        UPDATE executor_executions
-        SET lease_expires_at_ms = floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT - 1
-        WHERE submission_id = $1
-        "#,
-    )
-    .bind(submission_id)
     .execute(pool)
     .await
     .map_err(debug_error)?;

@@ -6,15 +6,18 @@ use std::{
 use async_trait::async_trait;
 use gpt_image_2_gateway::executor::{
     DurableRunner, ExecutorClaimScope, ExecutorDaemon, ExecutorDaemonError, ExecutorDaemonRun,
-    ExecutorSubmissionError, ExecutorSubmissionLease, ExecutorSubmissionOutcome,
-    ExecutorSubmissionStore, PreparedExecutorSubmission, RunnerError, RunnerOutcome,
+    ExecutorRunnerObservation, ExecutorSubmissionError, ExecutorSubmissionLease,
+    ExecutorSubmissionOutcome, ExecutorSubmissionStore, PreparedExecutorSubmission, RunnerError,
+    RunnerOutcome,
 };
+use tokio::sync::Barrier;
 use uuid::Uuid;
 
 #[derive(Clone)]
 struct FakeStore {
     state: Arc<Mutex<FakeStoreState>>,
     events: Arc<Mutex<Vec<&'static str>>>,
+    heartbeat_barrier: Option<(usize, Arc<Barrier>)>,
 }
 
 #[derive(Clone)]
@@ -23,6 +26,7 @@ struct FakeStoreState {
     claimed: Option<ExecutorSubmissionLease>,
     heartbeat_failure: Option<HeartbeatFailure>,
     heartbeat_calls: usize,
+    observed: Vec<ExecutorSubmissionOutcome>,
     recorded: Vec<ExecutorSubmissionOutcome>,
 }
 
@@ -66,10 +70,23 @@ impl FakeStore {
                 claimed,
                 heartbeat_failure,
                 heartbeat_calls: 0,
+                observed: Vec::new(),
                 recorded: Vec::new(),
             })),
             events: Arc::new(Mutex::new(Vec::new())),
+            heartbeat_barrier: None,
         }
+    }
+
+    fn with_simultaneous_heartbeat_failure(
+        lease: ExecutorSubmissionLease,
+        call: usize,
+        error: HeartbeatError,
+        barrier: Arc<Barrier>,
+    ) -> Self {
+        let mut store = Self::with_heartbeat_failure(lease, call, error);
+        store.heartbeat_barrier = Some((call, barrier));
+        store
     }
 
     fn snapshot(&self) -> FakeStoreState {
@@ -82,6 +99,17 @@ impl FakeStore {
             events: self.events.clone(),
             outcome: definite_outcome(),
             delay,
+            ready_barrier: None,
+        }
+    }
+
+    fn runner_with_barrier(&self, barrier: Arc<Barrier>) -> FakeRunner {
+        FakeRunner {
+            calls: Arc::new(Mutex::new(Vec::new())),
+            events: self.events.clone(),
+            outcome: definite_outcome(),
+            delay: Duration::ZERO,
+            ready_barrier: Some(barrier),
         }
     }
 
@@ -133,13 +161,21 @@ impl ExecutorSubmissionStore for FakeStore {
         _lease_ms: i64,
     ) -> Result<ExecutorSubmissionLease, ExecutorSubmissionError> {
         self.push_event("heartbeat");
-        let failure = {
+        let (failure, call) = {
             let mut state = self.state.lock().expect("fake store lock");
             state.heartbeat_calls += 1;
-            state
-                .heartbeat_failure
-                .filter(|failure| failure.call == state.heartbeat_calls)
+            (
+                state
+                    .heartbeat_failure
+                    .filter(|failure| failure.call == state.heartbeat_calls),
+                state.heartbeat_calls,
+            )
         };
+        if let Some((barrier_call, barrier)) = &self.heartbeat_barrier
+            && *barrier_call == call
+        {
+            barrier.wait().await;
+        }
         match failure.map(|failure| failure.error) {
             Some(HeartbeatError::Stale) => Err(ExecutorSubmissionError::StaleLease),
             Some(HeartbeatError::Unavailable) => Err(ExecutorSubmissionError::Unavailable),
@@ -147,19 +183,35 @@ impl ExecutorSubmissionStore for FakeStore {
         }
     }
 
-    async fn record_outcome(
+    async fn append_runner_observation(
         &self,
-        _lease: &ExecutorSubmissionLease,
+        lease: &ExecutorSubmissionLease,
         outcome: &ExecutorSubmissionOutcome,
-    ) -> Result<(), ExecutorSubmissionError> {
-        self.push_event("record");
+    ) -> Result<ExecutorRunnerObservation, ExecutorSubmissionError> {
+        self.push_event("observe");
         let mut state = self.state.lock().expect("fake store lock");
-        state.recorded = state
-            .recorded
+        state.observed = state
+            .observed
             .iter()
             .cloned()
             .chain(std::iter::once(outcome.clone()))
             .collect();
+        Ok(ExecutorRunnerObservation::new(
+            lease.executor_execution_id,
+            lease.submission_id,
+            outcome.clone(),
+        )
+        .unwrap())
+    }
+
+    async fn resolve_runner_observation(
+        &self,
+        _lease: &ExecutorSubmissionLease,
+        observation: &ExecutorRunnerObservation,
+    ) -> Result<(), ExecutorSubmissionError> {
+        self.push_event("resolve");
+        let mut state = self.state.lock().expect("fake store lock");
+        state.recorded.push(observation.outcome().clone());
         Ok(())
     }
 
@@ -174,6 +226,7 @@ struct FakeRunner {
     events: Arc<Mutex<Vec<&'static str>>>,
     outcome: RunnerOutcome,
     delay: Duration,
+    ready_barrier: Option<Arc<Barrier>>,
 }
 
 #[async_trait]
@@ -188,7 +241,11 @@ impl DurableRunner for FakeRunner {
                 .chain(std::iter::once(lease))
                 .collect();
         }
-        tokio::time::sleep(self.delay).await;
+        if let Some(barrier) = &self.ready_barrier {
+            barrier.wait().await;
+        } else {
+            tokio::time::sleep(self.delay).await;
+        }
         self.outcome.clone()
     }
 }
@@ -205,7 +262,14 @@ async fn restart_resumes_running_before_claim_and_attaches_once() {
     assert_eq!(result, ExecutorDaemonRun::Recorded);
     assert_eq!(
         store.events(),
-        vec!["resume", "heartbeat", "runner", "heartbeat", "record"]
+        vec![
+            "resume",
+            "heartbeat",
+            "runner",
+            "observe",
+            "heartbeat",
+            "resolve"
+        ]
     );
     assert_eq!(
         runner.calls.lock().expect("runner calls").as_slice(),
@@ -231,8 +295,9 @@ async fn prepared_submission_is_claimed_started_and_recorded() {
             "start",
             "heartbeat",
             "runner",
+            "observe",
             "heartbeat",
-            "record"
+            "resolve"
         ]
     );
     assert_eq!(
@@ -271,10 +336,10 @@ async fn prelaunch_heartbeat_failure_never_calls_runner_or_records() {
 }
 
 #[tokio::test]
-async fn in_flight_heartbeat_loss_never_records_runner_outcome() {
+async fn final_heartbeat_loss_retains_observation_without_resolution() {
     let lease = executor_lease();
     let store = FakeStore::with_heartbeat_failure(lease, 2, HeartbeatError::Stale);
-    let runner = store.runner(Duration::from_millis(50));
+    let runner = store.runner(Duration::ZERO);
     let daemon = daemon(store.clone(), runner.clone());
 
     let error = daemon
@@ -295,11 +360,49 @@ async fn in_flight_heartbeat_loss_never_records_runner_outcome() {
             "start",
             "heartbeat",
             "runner",
+            "observe",
             "heartbeat"
         ]
     );
     assert_eq!(runner.calls.lock().expect("runner calls").len(), 1);
+    assert_eq!(
+        snapshot.observed,
+        vec![ExecutorSubmissionOutcome::from(definite_outcome())]
+    );
     assert!(snapshot.recorded.is_empty());
+}
+
+#[tokio::test]
+async fn simultaneous_runner_and_failed_renewal_records_runner_outcome() {
+    let barrier = Arc::new(Barrier::new(2));
+    let store = FakeStore::with_simultaneous_heartbeat_failure(
+        executor_lease(),
+        2,
+        HeartbeatError::Stale,
+        barrier.clone(),
+    );
+    let runner = store.runner_with_barrier(barrier);
+    let daemon = daemon_with_timing(store.clone(), runner, 60_000, Duration::from_millis(1));
+
+    assert_eq!(daemon.run_once().await, Ok(ExecutorDaemonRun::Recorded));
+    assert_eq!(
+        store.events(),
+        vec![
+            "resume",
+            "claim",
+            "start",
+            "heartbeat",
+            "runner",
+            "heartbeat",
+            "observe",
+            "heartbeat",
+            "resolve"
+        ]
+    );
+    assert_eq!(
+        store.snapshot().recorded,
+        vec![ExecutorSubmissionOutcome::from(definite_outcome())]
+    );
 }
 
 #[tokio::test]
