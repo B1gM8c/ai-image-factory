@@ -219,12 +219,15 @@ and p50/p95/p99 latency.
 
 ## Remaining Activation Gates
 
-1. Make `artifact_ready -> canonical success` atomic or restart-recoverable.
-2. Add the single submit/recovery/deadline/reconciliation/poll/materialization
+Phase 2H closes the earlier `artifact_ready -> canonical success` split by
+making the durable observation and canonical resolution one replayable
+transaction.
+
+1. Add the single submit/recovery/deadline/reconciliation/poll/materialization
    orchestrator. It must be the only external side-effect caller.
-3. Persist operation descriptor identity and bind provider, operation,
+2. Persist operation descriptor identity and bind provider, operation,
    descriptor, adapter, submission, and idempotency identities.
-4. Make the earlier submit-recovery claim/defer commands exactly replayable, then
+3. Make the earlier submit-recovery claim/defer commands exactly replayable, then
    run the mixed-load million-row latency, lock, buffer, and WAL benchmark.
 
 Dreamina and other remote CLI providers remain inactive until these gates close.

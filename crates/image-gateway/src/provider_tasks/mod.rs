@@ -310,6 +310,20 @@ pub struct ProviderArtifactAuthority {
     media_type: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderArtifactPublication {
+    manifest: ExecutorResultManifest,
+    sha256_hex: String,
+    byte_size: u64,
+    media_type: String,
+}
+
+impl ProviderArtifactPublication {
+    pub fn manifest(&self) -> &ExecutorResultManifest {
+        &self.manifest
+    }
+}
+
 impl ProviderArtifactAuthority {
     pub fn new(
         storage_backend: String,
@@ -348,11 +362,22 @@ pub enum ProviderTaskObservationSource {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ProviderTaskObservationOutcome {
-    Waiting { poll_after_ms: i64 },
-    ArtifactReady { artifact_ref: String },
-    Failed { error_code: String },
-    Canceled { error_code: String },
-    Uncertain { error_code: String },
+    Waiting {
+        poll_after_ms: i64,
+    },
+    ArtifactReady {
+        artifact_ref: String,
+        publication: ProviderArtifactPublication,
+    },
+    Failed {
+        error_code: String,
+    },
+    Canceled {
+        error_code: String,
+    },
+    Uncertain {
+        error_code: String,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -471,13 +496,7 @@ pub trait ProviderTaskStore: Send + Sync + 'static {
         &self,
         lease: &ProviderTaskLease,
         authority: &ProviderArtifactAuthority,
-    ) -> Result<ExecutorResultManifest, ProviderTaskStoreError>;
-
-    async fn resolve_artifact(
-        &self,
-        submission_id: Uuid,
-        manifest: &ExecutorResultManifest,
-    ) -> Result<ProviderRemoteTask, ProviderTaskStoreError>;
+    ) -> Result<ProviderArtifactPublication, ProviderTaskStoreError>;
 
     async fn record_verified_callback(
         &self,

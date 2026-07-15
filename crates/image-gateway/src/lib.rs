@@ -56,8 +56,8 @@ pub use generator::{
     CodexImageGenerator, EditJob, GeneratedImage, GenerationJob, ImageGenerator, InputImage,
 };
 pub use provider_tasks::{
-    PostgresProviderTaskStore, ProviderArtifactAuthority, ProviderCapacityEvidence,
-    ProviderCapacityEvidenceOutcome, ProviderCapacityReconciliation,
+    PostgresProviderTaskStore, ProviderArtifactAuthority, ProviderArtifactPublication,
+    ProviderCapacityEvidence, ProviderCapacityEvidenceOutcome, ProviderCapacityReconciliation,
     ProviderCapacityReconciliationLease, ProviderCapacityReconciliationState,
     ProviderCapacityReconciliationStore, ProviderCapacityTerminalState, ProviderExecutionContext,
     ProviderRemoteTask, ProviderSubmitFailureKind, ProviderSubmitIntent, ProviderSubmitIntentState,

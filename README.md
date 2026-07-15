@@ -34,6 +34,8 @@ The remote-submit deadline quarantine is documented in
 [`docs/architecture/2026-phase2f-provider-submit-deadline-quarantine.md`](docs/architecture/2026-phase2f-provider-submit-deadline-quarantine.md).
 Its independent capacity reconciliation and strong-evidence release boundary is documented in
 [`docs/architecture/2026-phase2g-provider-capacity-reconciliation.md`](docs/architecture/2026-phase2g-provider-capacity-reconciliation.md).
+Atomic remote artifact evidence and canonical resolution are documented in
+[`docs/architecture/2026-phase2h-atomic-provider-artifact-resolution.md`](docs/architecture/2026-phase2h-atomic-provider-artifact-resolution.md).
 Database-bound provider profiles and durable capacity are documented in
 [`docs/architecture/2026-phase1g-execution-binding-capacity.md`](docs/architecture/2026-phase1g-execution-binding-capacity.md).
 

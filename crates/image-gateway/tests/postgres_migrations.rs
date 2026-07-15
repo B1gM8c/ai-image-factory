@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 type TestResult<T = ()> = Result<T, String>;
 
-const REQUIRED_COLUMNS: [(&str, &str); 120] = [
+const REQUIRED_COLUMNS: [(&str, &str); 124] = [
     ("usage_events", "tenant_id"),
     ("quota_reservations", "tenant_id"),
     ("quota_reservations", "job_id"),
@@ -92,6 +92,10 @@ const REQUIRED_COLUMNS: [(&str, &str); 120] = [
     ("provider_remote_tasks", "attach_recovery_lease_epoch"),
     ("provider_task_observations", "event_identity"),
     ("provider_task_observations", "payload_hash"),
+    ("provider_task_observations", "result_manifest_id"),
+    ("provider_task_observations", "artifact_sha256_hex"),
+    ("provider_task_observations", "artifact_byte_size"),
+    ("provider_task_observations", "artifact_media_type"),
     ("provider_remote_submit_intents", "idempotency_key"),
     ("provider_remote_submit_intents", "state"),
     ("provider_remote_submit_intents", "provider_request_id"),
@@ -157,7 +161,7 @@ const REQUIRED_COLUMNS: [(&str, &str); 120] = [
     ("executor_resolution_decisions", "provider_submit_intent_id"),
 ];
 
-const REQUIRED_INDEXES: [&str; 21] = [
+const REQUIRED_INDEXES: [&str; 22] = [
     "usage_events_tenant_created_at_ms_idx",
     "gateway_api_keys_project_id_idx",
     "quota_reservations_active_tenant_idx",
@@ -173,6 +177,7 @@ const REQUIRED_INDEXES: [&str; 21] = [
     "executor_capacity_allocations_orphan_idx",
     "executor_resource_policies_enabled_account_uidx",
     "provider_remote_tasks_poll_claim_idx",
+    "provider_task_observations_manifest_uidx",
     "provider_submit_intents_remote_operation_uidx",
     "provider_submit_recoveries_claim_idx",
     "provider_submit_recoveries_deadline_idx",
@@ -1068,8 +1073,9 @@ async fn assert_expected_schema(pool: &PgPool) -> TestResult {
         migration_versions(pool).await?
             == vec![
                 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22,
+                23,
             ],
-        "applied migration versions must be exactly [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22]",
+        "applied migration versions must be exactly [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]",
     )?;
 
     for (table, column) in REQUIRED_COLUMNS {

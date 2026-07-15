@@ -341,12 +341,116 @@ async fn remote_task_store_closes_attach_poll_callback_and_cancel_invariants() -
         )?;
 
         store.attach(&second_attach).await.map_err(debug_error)?;
-        let second_lease = store
-            .claim_due(&scope, "poller-old", 5)
-            .await
+        let (attach_replay, second_claim) = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(
+                store.attach(&second_attach),
+                store.claim_due(&scope, "poller-old", 200)
+            )
+        })
+        .await
+        .map_err(|_| "attach replay and poll claim deadlocked".to_string())?;
+        attach_replay.map_err(debug_error)?;
+        let second_lease = second_claim
             .map_err(debug_error)?
             .ok_or_else(|| "second task was not pollable".to_string())?;
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        let authority_id = second.executor_execution_id.simple().to_string();
+        let authority = ProviderArtifactAuthority::new(
+            "filesystem-v1".to_string(),
+            "filesystem-v1:provider-task-test".to_string(),
+            format!("executor-objects/{}/{}", &authority_id[..2], authority_id),
+            "a".repeat(64),
+            128,
+            "image/png".to_string(),
+        )
+        .ok_or_else(|| "valid provider artifact authority was rejected".to_string())?;
+        let mut task_locker = database.pool.begin().await.map_err(debug_error)?;
+        sqlx::query("SELECT 1 FROM provider_remote_tasks WHERE submission_id = $1 FOR UPDATE")
+            .bind(second.submission_id)
+            .execute(&mut *task_locker)
+            .await
+            .map_err(debug_error)?;
+        let stale_store = store.clone();
+        let stale_lease = second_lease.clone();
+        let stale_authority = authority.clone();
+        let mut blocked_publication = tokio::spawn(async move {
+            stale_store
+                .publish_artifact_authority(&stale_lease, &stale_authority)
+                .await
+        });
+        let stale_store = store.clone();
+        let stale_lease = second_lease.clone();
+        let mut blocked_observation = tokio::spawn(async move {
+            stale_store
+                .record_observation(
+                    &stale_lease,
+                    &ProviderTaskObservation {
+                        event_identity: "expired-while-locked-b".to_string(),
+                        source: ProviderTaskObservationSource::Poll,
+                        outcome: ProviderTaskObservationOutcome::Waiting { poll_after_ms: 0 },
+                    },
+                )
+                .await
+        });
+        let stale_store = store.clone();
+        let stale_lease = second_lease.clone();
+        let mut blocked_heartbeat =
+            tokio::spawn(async move { stale_store.heartbeat(&stale_lease, 5_000).await });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        require(
+            !blocked_publication.is_finished()
+                && !blocked_observation.is_finished()
+                && !blocked_heartbeat.is_finished(),
+            "provider write did not wait for the task fence lock",
+        )?;
+        task_locker.commit().await.map_err(debug_error)?;
+        let stale_publication =
+            tokio::time::timeout(Duration::from_secs(2), &mut blocked_publication)
+                .await
+                .map_err(|_| "stale authority publication remained blocked".to_string())?
+                .map_err(debug_error)?;
+        require(
+            stale_publication == Err(ProviderTaskStoreError::StaleLease),
+            "authority publication used a database timestamp captured before its task lock",
+        )?;
+        let stale_observation =
+            tokio::time::timeout(Duration::from_secs(2), &mut blocked_observation)
+                .await
+                .map_err(|_| "stale provider observation remained blocked".to_string())?
+                .map_err(debug_error)?;
+        require(
+            stale_observation.is_err(),
+            "provider observation used a database timestamp captured before its task lock",
+        )?;
+        let stale_heartbeat = tokio::time::timeout(Duration::from_secs(2), &mut blocked_heartbeat)
+            .await
+            .map_err(|_| "stale provider heartbeat remained blocked".to_string())?
+            .map_err(debug_error)?;
+        require(
+            stale_heartbeat == Err(ProviderTaskStoreError::StaleLease),
+            "provider heartbeat used a database timestamp captured before its task lock",
+        )?;
+        let stale_observation_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM provider_task_observations WHERE submission_id = $1 AND event_identity = 'expired-while-locked-b'",
+        )
+        .bind(second.submission_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(
+            stale_observation_count == 0,
+            "expired poll owner left append-only observation evidence",
+        )?;
+        let authority_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM executor_artifact_authorities WHERE authority_id = $1",
+        )
+        .bind(second.executor_execution_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(
+            authority_count == 0,
+            "expired poll owner published immutable artifact authority",
+        )?;
         let reclaimed = store
             .claim_due(&scope, "poller-new", 5_000)
             .await
@@ -398,7 +502,7 @@ async fn remote_task_store_closes_attach_poll_callback_and_cancel_invariants() -
             "waiting observation replay changed its absolute poll time",
         )?;
         let reclaimed = store
-            .claim_due(&scope, "poller-after-replay", 5_000)
+            .claim_due(&scope, "poller-after-replay", 60_000)
             .await
             .map_err(debug_error)?
             .ok_or_else(|| "replayed waiting task was not claimable".to_string())?;
@@ -426,41 +530,142 @@ async fn remote_task_store_closes_attach_poll_callback_and_cancel_invariants() -
                 .is_some_and(|task| task.state == ProviderTaskState::ProviderWaiting),
             "failed fenced writes changed another submission",
         )?;
-        let authority_id = second.executor_execution_id.simple().to_string();
-        let authority = ProviderArtifactAuthority::new(
-            "filesystem-v1".to_string(),
-            "filesystem-v1:provider-task-test".to_string(),
-            format!("executor-objects/{}/{}", &authority_id[..2], authority_id),
-            "a".repeat(64),
-            128,
-            "image/png".to_string(),
+        require(
+            sqlx::query(
+                r#"
+                INSERT INTO provider_task_observations
+                  (observation_id, submission_id, executor_execution_id,
+                   event_identity, source, observed_state, artifact_ref,
+                   result_manifest_id, artifact_sha256_hex, artifact_byte_size,
+                   artifact_media_type, error_code, effect_certainty,
+                   next_poll_at_ms, poll_owner, poll_lease_epoch, payload_hash,
+                   observed_at_ms)
+                VALUES ($1, $2, $3, 'artifact-ready-b', 'poll', 'artifact_ready',
+                        'durable-object-b', $2, $4, 128, 'image/png', NULL,
+                        'not_applicable', NULL, $5, $6, $7,
+                        floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT)
+                "#,
+            )
+            .bind(Uuid::new_v4())
+            .bind(second.submission_id)
+            .bind(second.executor_execution_id)
+            .bind("a".repeat(64))
+            .bind(&reclaimed.poll_owner)
+            .bind(reclaimed.poll_lease_epoch)
+            .bind("b".repeat(64))
+            .execute(&database.pool)
+            .await
+            .is_err(),
+            "artifact_ready committed before its immutable authority and manifest",
+        )?;
+        require(
+            store
+                .load(second.submission_id)
+                .await
+                .map_err(debug_error)?
+                .is_some_and(|task| task.state == ProviderTaskState::ProviderWaiting),
+            "rejected artifact_ready changed the durable task",
+        )?;
+        let premature_observations: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM provider_task_observations WHERE submission_id = $1 AND event_identity = 'artifact-ready-b'",
         )
-        .ok_or_else(|| "valid provider artifact authority was rejected".to_string())?;
-        let manifest = store
+        .bind(second.submission_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(
+            premature_observations == 0,
+            "rejected artifact_ready left append-only evidence behind",
+        )?;
+        let publication = store
             .publish_artifact_authority(&reclaimed, &authority)
             .await
             .map_err(|error| format!("publish remote artifact authority: {error:?}"))?;
-        let ready = store
-            .record_observation(
-                &reclaimed,
-                &ProviderTaskObservation {
-                    event_identity: "artifact-ready-b".to_string(),
-                    source: ProviderTaskObservationSource::Poll,
-                    outcome: ProviderTaskObservationOutcome::ArtifactReady {
-                        artifact_ref: "durable-object-b".to_string(),
+        let mut stale_publication_replay = reclaimed.clone();
+        stale_publication_replay.poll_lease_expires_at_ms = 0;
+        require(
+            store
+                .publish_artifact_authority(&stale_publication_replay, &authority)
+                .await
+                .map_err(debug_error)?
+                == publication,
+            "exact authority commit-ack replay required a live poll lease",
+        )?;
+        require(
+            store
+                .record_observation(
+                    &reclaimed,
+                    &ProviderTaskObservation {
+                        event_identity: "failure-after-authority-b".to_string(),
+                        source: ProviderTaskObservationSource::Poll,
+                        outcome: ProviderTaskObservationOutcome::Failed {
+                            error_code: "contradictory_failure".to_string(),
+                        },
                     },
-                },
-            )
+                )
+                .await
+                == Err(ProviderTaskStoreError::Conflict),
+            "contradictory failure won after immutable artifact publication",
+        )?;
+        let artifact_ready = ProviderTaskObservation {
+            event_identity: "artifact-ready-b".to_string(),
+            source: ProviderTaskObservationSource::Poll,
+            outcome: ProviderTaskObservationOutcome::ArtifactReady {
+                artifact_ref: "durable-object-b".to_string(),
+                publication: publication.clone(),
+            },
+        };
+        let mut split_observation = database.pool.begin().await.map_err(debug_error)?;
+        let split_observed_at = database_now(&database.pool).await?;
+        sqlx::query(
+            r#"
+            INSERT INTO provider_task_observations
+              (observation_id, submission_id, executor_execution_id,
+               event_identity, source, observed_state, artifact_ref,
+               result_manifest_id, artifact_sha256_hex, artifact_byte_size,
+               artifact_media_type, error_code, effect_certainty,
+               next_poll_at_ms, poll_owner, poll_lease_epoch, payload_hash,
+               observed_at_ms)
+            VALUES ($1, $2, $3, 'artifact-ready-b', 'poll', 'artifact_ready',
+                    'durable-object-b', $2, $4, 128, 'image/png', NULL,
+                    'not_applicable', NULL, $5, $6, $7, $8)
+            "#,
+        )
+        .bind(Uuid::new_v4())
+        .bind(second.submission_id)
+        .bind(second.executor_execution_id)
+        .bind("a".repeat(64))
+        .bind(&reclaimed.poll_owner)
+        .bind(reclaimed.poll_lease_epoch)
+        .bind("e".repeat(64))
+        .bind(split_observed_at)
+        .execute(&mut *split_observation)
+        .await
+        .map_err(debug_error)?;
+        require(
+            split_observation.commit().await.is_err(),
+            "raw artifact_ready observation committed without canonical resolution",
+        )?;
+        let ready = store
+            .record_observation(&reclaimed, &artifact_ready)
             .await
             .map_err(|error| format!("record remote artifact ready: {error:?}"))?;
         require(
             ready.state == ProviderTaskState::ArtifactReady,
             "verified remote artifact did not become ready",
         )?;
-        store
-            .resolve_artifact(second.submission_id, &manifest)
+        let replayed_ready = store
+            .record_observation(&reclaimed, &artifact_ready)
             .await
-            .map_err(|error| format!("resolve remote artifact: {error:?}"))?;
+            .map_err(|error| format!("replay remote artifact ready: {error:?}"))?;
+        require(
+            replayed_ready == ready,
+            "artifact_ready commit-ack replay changed the durable task",
+        )?;
+        require(
+            publication.manifest().manifest_id() == second.submission_id,
+            "remote artifact manifest identity drifted",
+        )?;
         let success_projection: (String, String, String, String) = sqlx::query_as(
             r#"
             SELECT execution.state, submission.state, decision.source, allocation.state
@@ -486,8 +691,25 @@ async fn remote_task_store_closes_attach_poll_callback_and_cancel_invariants() -
                     "succeeded".to_string(),
                     "remote_provider_observation".to_string(),
                     "released".to_string(),
-                ),
+            ),
             format!("remote artifact did not close canonical success: {success_projection:?}"),
+        )?;
+        let exact_counts: (i64, i64) = sqlx::query_as(
+            r#"
+            SELECT
+              (SELECT COUNT(*) FROM provider_task_observations
+               WHERE submission_id = $1 AND event_identity = 'artifact-ready-b'),
+              (SELECT COUNT(*) FROM executor_resolution_decisions
+               WHERE submission_id = $1 AND source = 'remote_provider_observation')
+            "#,
+        )
+        .bind(second.submission_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(
+            exact_counts == (1, 1),
+            format!("artifact_ready replay duplicated evidence or resolution: {exact_counts:?}"),
         )?;
 
         let third = seed_running_submission(&database.pool, "remote-worker-c").await?;
@@ -514,6 +736,111 @@ async fn remote_task_store_closes_attach_poll_callback_and_cancel_invariants() -
         require(
             invalid_projection.commit().await.is_err(),
             "provider_waiting committed without a durable remote task",
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
+async fn poll_claim_stops_after_one_locked_candidate_window() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let store = PostgresProviderTaskStore::new(database.pool.clone());
+        for index in 0..65 {
+            let lease =
+                seed_running_submission(&database.pool, &format!("bounded-poll-worker-{index}"))
+                    .await?;
+            let reservation = reservation_request(&lease);
+            store
+                .reserve_submit(&reservation)
+                .await
+                .map_err(debug_error)?;
+            store
+                .start_submit(&reservation)
+                .await
+                .map_err(debug_error)?;
+            let operation_id = format!("bounded-poll-operation-{index}");
+            store
+                .record_submit_receipt(&submit_receipt(
+                    &lease,
+                    &operation_id,
+                    &format!("bounded-poll-receipt-{index}"),
+                ))
+                .await
+                .map_err(debug_error)?;
+            store
+                .attach(&attach_request(
+                    &lease,
+                    &operation_id,
+                    &format!("bounded-poll-attach-{index}"),
+                ))
+                .await
+                .map_err(debug_error)?;
+        }
+
+        let first_window: Vec<Uuid> = sqlx::query_scalar(
+            r#"
+            SELECT submission_id
+            FROM provider_remote_tasks
+            WHERE provider_id = 'provider-test'
+              AND provider_account_id = $1
+              AND state = 'provider_waiting'
+            ORDER BY GREATEST(
+                       next_poll_at_ms,
+                       COALESCE(poll_lease_expires_at_ms, next_poll_at_ms)
+                     ),
+                     submission_id
+            LIMIT 64
+            "#,
+        )
+        .bind(ACCOUNT_ID)
+        .fetch_all(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(
+            first_window.len() == 64,
+            "poll claim fixture did not fill its window",
+        )?;
+        let mut locker = database.pool.begin().await.map_err(debug_error)?;
+        let locked: i64 = sqlx::query_scalar(
+            r#"
+            WITH locked AS (
+              SELECT submission_id
+              FROM provider_remote_tasks
+              WHERE submission_id = ANY($1)
+              FOR UPDATE
+            )
+            SELECT COUNT(*) FROM locked
+            "#,
+        )
+        .bind(&first_window)
+        .fetch_one(&mut *locker)
+        .await
+        .map_err(debug_error)?;
+        require(
+            locked == 64,
+            "poll claim fixture did not lock its first window",
+        )?;
+
+        require(
+            store
+                .claim_due(&claim_scope(), "bounded-poll-claimant", 5_000)
+                .await
+                .map_err(debug_error)?
+                .is_none(),
+            "poll claim scanned beyond its locked 64-row candidate window",
+        )?;
+        locker.commit().await.map_err(debug_error)?;
+        require(
+            store
+                .claim_due(&claim_scope(), "bounded-poll-after-unlock", 5_000)
+                .await
+                .map_err(debug_error)?
+                .is_some(),
+            "poll claim remained empty after its candidate window unlocked",
         )
     }
     .await;
@@ -957,8 +1284,8 @@ async fn submit_recovery_claim_is_scoped_fenced_and_reclaimable() -> TestResult 
             capacity_heartbeat(&database.pool, executor.executor_execution_id).await?;
         tokio::time::sleep(Duration::from_millis(10)).await;
         let (left, right) = tokio::join!(
-            store.claim_submit_recovery(&scope, "recovery-a", 2_000),
-            store.claim_submit_recovery(&scope, "recovery-b", 2_000),
+            store.claim_submit_recovery(&scope, "recovery-a", 200),
+            store.claim_submit_recovery(&scope, "recovery-b", 200),
         );
         let mut winners = [left.map_err(debug_error)?, right.map_err(debug_error)?]
             .into_iter()
@@ -981,6 +1308,45 @@ async fn submit_recovery_claim_is_scoped_fenced_and_reclaimable() -> TestResult 
         require(
             first.recovery_lease_expires_at_ms <= first.context().provider_deadline_at_ms(),
             "submit recovery claim crossed the absolute provider deadline",
+        )?;
+        let expired_epoch = first.recovery_lease_epoch;
+        let mut recovery_locker = database.pool.begin().await.map_err(debug_error)?;
+        sqlx::query(
+            "SELECT 1 FROM provider_submit_recoveries WHERE submission_id = $1 FOR UPDATE",
+        )
+        .bind(executor.submission_id)
+        .execute(&mut *recovery_locker)
+        .await
+        .map_err(debug_error)?;
+        let stale_store = store.clone();
+        let stale_recovery = first.clone();
+        let mut blocked_heartbeat = tokio::spawn(async move {
+            stale_store
+                .heartbeat_submit_recovery(&stale_recovery, 2_000)
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        require(
+            !blocked_heartbeat.is_finished(),
+            "submit recovery heartbeat did not wait for its fence lock",
+        )?;
+        recovery_locker.commit().await.map_err(debug_error)?;
+        let stale_heartbeat = tokio::time::timeout(Duration::from_secs(2), &mut blocked_heartbeat)
+            .await
+            .map_err(|_| "stale submit recovery heartbeat remained blocked".to_string())?
+            .map_err(debug_error)?;
+        require(
+            stale_heartbeat == Err(ProviderTaskStoreError::StaleLease),
+            "submit recovery heartbeat revived an expired epoch after a lock wait",
+        )?;
+        let first = store
+            .claim_submit_recovery(&scope, "recovery-after-expired-heartbeat", 2_000)
+            .await
+            .map_err(debug_error)?
+            .ok_or_else(|| "expired heartbeat recovery was not reclaimable".to_string())?;
+        require(
+            first.recovery_lease_epoch == expired_epoch + 1,
+            "expired heartbeat reclaim did not advance the recovery epoch",
         )?;
         require(
             sqlx::query(
@@ -1550,6 +1916,254 @@ async fn capacity_reconciliation_migration_rejects_incomplete_quarantine() -> Te
 }
 
 #[tokio::test]
+async fn atomic_artifact_migration_rejects_unresolved_ready_task() -> TestResult {
+    let Some(database) = TestDatabase::new_before_atomic_artifact_resolution().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let legacy =
+            seed_v22_artifact_ready(&database.pool, "artifact-upgrade", "artifact-upgrade").await?;
+
+        require(
+            sqlx::raw_sql(include_str!(
+                "../migrations/0023_atomic_provider_artifact_resolution.sql"
+            ))
+            .execute(&database.pool)
+            .await
+            .is_err(),
+            "0023 accepted an unresolved artifact_ready task",
+        )?;
+        let migration_rolled_back: bool = sqlx::query_scalar(
+            "SELECT to_regprocedure('enforce_provider_terminal_observation_projection()') IS NULL",
+        )
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(
+            migration_rolled_back,
+            "failed 0023 migration did not roll back atomically",
+        )?;
+        let unresolved_projection: (String, String) = sqlx::query_as(
+            r#"
+            SELECT task.state, execution.state
+            FROM provider_remote_tasks task
+            JOIN executor_executions execution
+              ON execution.executor_execution_id = task.executor_execution_id
+             AND execution.submission_id = task.submission_id
+            WHERE task.submission_id = $1
+            "#,
+        )
+        .bind(legacy.executor.submission_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(
+            unresolved_projection == ("artifact_ready".to_string(), "provider_waiting".to_string()),
+            format!("failed 0023 changed legacy evidence: {unresolved_projection:?}"),
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
+async fn atomic_artifact_migration_backfills_canonical_ready_task() -> TestResult {
+    let Some(database) = TestDatabase::new_before_atomic_artifact_resolution().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let legacy = seed_v22_artifact_ready(
+            &database.pool,
+            "artifact-upgrade-canonical",
+            "artifact-upgrade-canonical",
+        )
+        .await?;
+        let mut canonical = database.pool.begin().await.map_err(debug_error)?;
+        sqlx::query(
+            r#"
+            INSERT INTO executor_resolution_decisions
+              (decision_id, executor_execution_id, submission_id, source,
+               observation_id, provider_task_observation_id, resolved_state,
+               result_manifest_id, error_code, decided_at_ms)
+            VALUES ($1, $1, $2, 'remote_provider_observation',
+                    NULL, $3, 'succeeded', $2, NULL, $4)
+            "#,
+        )
+        .bind(legacy.executor.executor_execution_id)
+        .bind(legacy.executor.submission_id)
+        .bind(legacy.observation_id)
+        .bind(legacy.observed_at_ms)
+        .execute(&mut *canonical)
+        .await
+        .map_err(debug_error)?;
+        sqlx::query(
+            r#"
+            UPDATE executor_executions
+            SET state = 'succeeded', resolution_decision_id = $1,
+                finished_at_ms = $3, updated_at_ms = $3, error_code = NULL
+            WHERE executor_execution_id = $1 AND submission_id = $2
+              AND state = 'provider_waiting'
+            "#,
+        )
+        .bind(legacy.executor.executor_execution_id)
+        .bind(legacy.executor.submission_id)
+        .bind(legacy.observed_at_ms)
+        .execute(&mut *canonical)
+        .await
+        .map_err(debug_error)?;
+        sqlx::query(
+            r#"
+            UPDATE provider_submissions
+            SET state = 'succeeded', result_manifest_id = $1,
+                resolution_decision_id = $2, finished_at_ms = $3,
+                updated_at_ms = $3, error_code = NULL
+            WHERE executor_execution_id = $2 AND submission_id = $1
+              AND state = 'provider_waiting'
+            "#,
+        )
+        .bind(legacy.executor.submission_id)
+        .bind(legacy.executor.executor_execution_id)
+        .bind(legacy.observed_at_ms)
+        .execute(&mut *canonical)
+        .await
+        .map_err(debug_error)?;
+        let policy: (Uuid, i64) = sqlx::query_as(
+            r#"
+            SELECT resource_policy_id, resource_policy_revision
+            FROM executor_capacity_allocations
+            WHERE executor_execution_id = $1 AND submission_id = $2
+            FOR UPDATE
+            "#,
+        )
+        .bind(legacy.executor.executor_execution_id)
+        .bind(legacy.executor.submission_id)
+        .fetch_one(&mut *canonical)
+        .await
+        .map_err(debug_error)?;
+        sqlx::query(
+            r#"
+            UPDATE executor_capacity_allocations
+            SET state = 'released', released_at_ms = $3,
+                release_decision_id = $1, released_state = 'succeeded',
+                release_reason = 'remote_provider_observation',
+                last_heartbeat_at_ms = GREATEST(last_heartbeat_at_ms, $3)
+            WHERE executor_execution_id = $1 AND submission_id = $2
+              AND state = 'held'
+            "#,
+        )
+        .bind(legacy.executor.executor_execution_id)
+        .bind(legacy.executor.submission_id)
+        .bind(legacy.observed_at_ms)
+        .execute(&mut *canonical)
+        .await
+        .map_err(debug_error)?;
+        sqlx::query(
+            r#"
+            UPDATE executor_resource_policies
+            SET allocated_count = allocated_count - 1
+            WHERE resource_policy_id = $1 AND revision = $2
+              AND allocated_count > 0
+            "#,
+        )
+        .bind(policy.0)
+        .bind(policy.1)
+        .execute(&mut *canonical)
+        .await
+        .map_err(debug_error)?;
+        canonical.commit().await.map_err(debug_error)?;
+
+        sqlx::raw_sql(include_str!(
+            "../migrations/0023_atomic_provider_artifact_resolution.sql"
+        ))
+        .execute(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        let fingerprint: (Option<Uuid>, Option<String>, Option<i64>, Option<String>) =
+            sqlx::query_as(
+                r#"
+                SELECT result_manifest_id, artifact_sha256_hex,
+                       artifact_byte_size, artifact_media_type
+                FROM provider_task_observations
+                WHERE observation_id = $1
+                "#,
+            )
+            .bind(legacy.observation_id)
+            .fetch_one(&database.pool)
+            .await
+            .map_err(debug_error)?;
+        require(
+            fingerprint
+                == (
+                    Some(legacy.executor.submission_id),
+                    Some("c".repeat(64)),
+                    Some(128),
+                    Some("image/png".to_string()),
+                ),
+            format!("0023 did not backfill exact artifact evidence: {fingerprint:?}"),
+        )?;
+        require(
+            sqlx::query(
+                "UPDATE provider_task_observations SET payload_hash = payload_hash WHERE observation_id = $1",
+            )
+            .bind(legacy.observation_id)
+            .execute(&database.pool)
+            .await
+            .is_err(),
+            "0023 did not restore append-only observation protection",
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
+async fn atomic_artifact_migration_rolls_back_after_late_failure() -> TestResult {
+    let Some(database) = TestDatabase::new_before_atomic_artifact_resolution().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let script = format!(
+            "{}\nDO $$ BEGIN RAISE EXCEPTION 'forced late migration failure'; END $$;",
+            include_str!("../migrations/0023_atomic_provider_artifact_resolution.sql")
+        );
+        require(
+            sqlx::raw_sql(AssertSqlSafe(script))
+                .execute(&database.pool)
+                .await
+                .is_err(),
+            "forced late 0023 failure unexpectedly committed",
+        )?;
+        let residue: (i64, bool, bool, bool) = sqlx::query_as(
+            r#"
+            SELECT
+              (SELECT COUNT(*)
+               FROM information_schema.columns
+               WHERE table_schema = current_schema()
+                 AND table_name = 'provider_task_observations'
+                 AND column_name = 'result_manifest_id'),
+              to_regclass('provider_task_observations_manifest_uidx') IS NOT NULL,
+              to_regprocedure('enforce_provider_terminal_observation_projection()') IS NOT NULL,
+              EXISTS (
+                SELECT 1 FROM pg_trigger
+                WHERE tgrelid = 'provider_task_observations'::regclass
+                  AND tgname = 'provider_task_observations_reject_mutation'
+                  AND NOT tgisinternal
+              )
+            "#,
+        )
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(
+            residue == (0, false, false, true),
+            format!("late 0023 failure left schema residue: {residue:?}"),
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
 async fn provider_submit_commit_classifies_deferred_projection_conflicts() -> TestResult {
     let Some(database) = TestDatabase::new().await? else {
         return Ok(());
@@ -1967,12 +2581,15 @@ async fn submit_deadline_races_converge_without_deadlock() -> TestResult {
             })
             .await
             .map_err(|_| "deadline and late receipt deadlocked".to_string())?;
-        receipt_result.map_err(debug_error)?;
-        if deadline_result.map_err(debug_error)?.is_none() {
+        receipt_result.map_err(|error| format!("deadline race receipt: {error:?}"))?;
+        if deadline_result
+            .map_err(|error| format!("deadline race resolver: {error:?}"))?
+            .is_none()
+        {
             store
                 .resolve_due_submit_deadline(&claim_scope())
                 .await
-                .map_err(debug_error)?
+                .map_err(|error| format!("deadline race retry: {error:?}"))?
                 .ok_or_else(|| "skipped deadline did not become claimable".to_string())?;
         }
         let intent = store
@@ -2921,6 +3538,118 @@ async fn seed_legacy_attached_task(pool: &PgPool, lease: &ExecutorSubmissionLeas
     tx.commit().await.map_err(debug_error)
 }
 
+struct LegacyArtifactReady {
+    executor: ExecutorSubmissionLease,
+    observation_id: Uuid,
+    observed_at_ms: i64,
+}
+
+async fn seed_v22_artifact_ready(
+    pool: &PgPool,
+    worker: &str,
+    identity: &str,
+) -> TestResult<LegacyArtifactReady> {
+    let executor = seed_running_submission(pool, worker).await?;
+    let store = PostgresProviderTaskStore::new(pool.clone());
+    let reservation = reservation_request(&executor);
+    store
+        .reserve_submit(&reservation)
+        .await
+        .map_err(debug_error)?;
+    store
+        .start_submit(&reservation)
+        .await
+        .map_err(debug_error)?;
+    let operation_id = format!("{identity}-operation");
+    store
+        .record_submit_receipt(&submit_receipt(
+            &executor,
+            &operation_id,
+            &format!("{identity}-receipt"),
+        ))
+        .await
+        .map_err(debug_error)?;
+    store
+        .attach(&attach_request(
+            &executor,
+            &operation_id,
+            &format!("{identity}-attach"),
+        ))
+        .await
+        .map_err(debug_error)?;
+    let lease = store
+        .claim_due(&claim_scope(), &format!("{identity}-poller"), 60_000)
+        .await
+        .map_err(debug_error)?
+        .ok_or_else(|| "v22 artifact task was not claimable".to_string())?;
+    let authority_id = executor.executor_execution_id.simple().to_string();
+    let authority = ProviderArtifactAuthority::new(
+        "filesystem-v1".to_string(),
+        format!("filesystem-v1:{identity}"),
+        format!("executor-objects/{}/{}", &authority_id[..2], authority_id),
+        "c".repeat(64),
+        128,
+        "image/png".to_string(),
+    )
+    .ok_or_else(|| "v22 artifact authority was invalid".to_string())?;
+    store
+        .publish_artifact_authority(&lease, &authority)
+        .await
+        .map_err(debug_error)?;
+
+    let observation_id = Uuid::new_v4();
+    let observed_at_ms = database_now(pool).await?;
+    let event_identity = format!("{identity}-ready");
+    let artifact_ref = format!("{identity}-object");
+    let mut legacy = pool.begin().await.map_err(debug_error)?;
+    sqlx::query(
+        r#"
+        INSERT INTO provider_task_observations
+          (observation_id, submission_id, executor_execution_id,
+           event_identity, source, observed_state, artifact_ref,
+           error_code, effect_certainty, next_poll_at_ms, poll_owner,
+           poll_lease_epoch, payload_hash, observed_at_ms)
+        VALUES ($1, $2, $3, $4, 'poll', 'artifact_ready', $5, NULL,
+                'not_applicable', NULL, $6, $7, $8, $9)
+        "#,
+    )
+    .bind(observation_id)
+    .bind(executor.submission_id)
+    .bind(executor.executor_execution_id)
+    .bind(event_identity)
+    .bind(&artifact_ref)
+    .bind(&lease.poll_owner)
+    .bind(lease.poll_lease_epoch)
+    .bind("d".repeat(64))
+    .bind(observed_at_ms)
+    .execute(&mut *legacy)
+    .await
+    .map_err(debug_error)?;
+    sqlx::query(
+        r#"
+        UPDATE provider_remote_tasks
+        SET state = 'artifact_ready', artifact_ref = $2,
+            next_poll_at_ms = NULL, poll_owner = NULL,
+            poll_lease_expires_at_ms = NULL, poll_claimed_at_ms = NULL,
+            state_observation_id = $3, updated_at_ms = $4, terminal_at_ms = $4
+        WHERE submission_id = $1
+        "#,
+    )
+    .bind(executor.submission_id)
+    .bind(artifact_ref)
+    .bind(observation_id)
+    .bind(observed_at_ms)
+    .execute(&mut *legacy)
+    .await
+    .map_err(debug_error)?;
+    legacy.commit().await.map_err(debug_error)?;
+    Ok(LegacyArtifactReady {
+        executor,
+        observation_id,
+        observed_at_ms,
+    })
+}
+
 fn reservation_request(lease: &ExecutorSubmissionLease) -> RemoteTaskSubmitReservation {
     RemoteTaskSubmitReservation {
         submission_id: lease.submission_id,
@@ -3440,6 +4169,27 @@ impl TestDatabase {
                 Ok(()) => Err(format!("pre-0022 migration failed: {error}")),
                 Err(cleanup) => Err(format!(
                     "pre-0022 migration failed: {error}; cleanup failed: {cleanup}"
+                )),
+            };
+        }
+        Ok(Some(database))
+    }
+
+    async fn new_before_atomic_artifact_resolution() -> TestResult<Option<Self>> {
+        let Some(database) = Self::new_before_capacity_reconciliation().await? else {
+            return Ok(None);
+        };
+        if let Err(error) = sqlx::raw_sql(include_str!(
+            "../migrations/0022_provider_capacity_reconciliation.sql"
+        ))
+        .execute(&database.pool)
+        .await
+        {
+            let cleanup = database.cleanup().await;
+            return match cleanup {
+                Ok(()) => Err(format!("pre-0023 migration failed: {error}")),
+                Err(cleanup) => Err(format!(
+                    "pre-0023 migration failed: {error}; cleanup failed: {cleanup}"
                 )),
             };
         }
