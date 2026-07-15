@@ -5,10 +5,10 @@ use std::{
 
 use async_trait::async_trait;
 use gpt_image_2_gateway::executor::{
-    DurableRunner, ExecutorClaimScope, ExecutorDaemon, ExecutorDaemonError, ExecutorDaemonRun,
-    ExecutorRunnerObservation, ExecutorSubmissionError, ExecutorSubmissionLease,
+    DurableRunner, DurableRunnerResult, ExecutorClaimScope, ExecutorDaemon, ExecutorDaemonError,
+    ExecutorDaemonRun, ExecutorRunnerObservation, ExecutorSubmissionError, ExecutorSubmissionLease,
     ExecutorSubmissionOutcome, ExecutorSubmissionStore, PreparedExecutorSubmission, RunnerError,
-    RunnerOutcome,
+    RunnerLaunchAuthority, RunnerOutcome,
 };
 use tokio::sync::Barrier;
 use uuid::Uuid;
@@ -97,7 +97,7 @@ impl FakeStore {
         FakeRunner {
             calls: Arc::new(Mutex::new(Vec::new())),
             events: self.events.clone(),
-            outcome: definite_outcome(),
+            outcome: definite_outcome().into(),
             delay,
             ready_barrier: None,
         }
@@ -107,7 +107,7 @@ impl FakeStore {
         FakeRunner {
             calls: Arc::new(Mutex::new(Vec::new())),
             events: self.events.clone(),
-            outcome: definite_outcome(),
+            outcome: definite_outcome().into(),
             delay: Duration::ZERO,
             ready_barrier: Some(barrier),
         }
@@ -224,14 +224,18 @@ impl ExecutorSubmissionStore for FakeStore {
 struct FakeRunner {
     calls: Arc<Mutex<Vec<ExecutorSubmissionLease>>>,
     events: Arc<Mutex<Vec<&'static str>>>,
-    outcome: RunnerOutcome,
+    outcome: DurableRunnerResult,
     delay: Duration,
     ready_barrier: Option<Arc<Barrier>>,
 }
 
 #[async_trait]
 impl DurableRunner for FakeRunner {
-    async fn start_or_attach(&self, lease: ExecutorSubmissionLease) -> RunnerOutcome {
+    async fn start_or_attach(
+        &self,
+        lease: ExecutorSubmissionLease,
+        _authority: RunnerLaunchAuthority,
+    ) -> DurableRunnerResult {
         self.events.lock().expect("fake event lock").push("runner");
         {
             let mut calls = self.calls.lock().expect("fake runner lock");
@@ -262,19 +266,35 @@ async fn restart_resumes_running_before_claim_and_attaches_once() {
     assert_eq!(result, ExecutorDaemonRun::Recorded);
     assert_eq!(
         store.events(),
-        vec![
-            "resume",
-            "heartbeat",
-            "runner",
-            "observe",
-            "heartbeat",
-            "resolve"
-        ]
+        vec!["resume", "runner", "observe", "heartbeat", "resolve"]
     );
     assert_eq!(
         runner.calls.lock().expect("runner calls").as_slice(),
         &[lease]
     );
+}
+
+#[tokio::test]
+async fn resumed_retryable_runner_neither_renews_nor_records() {
+    let lease = executor_lease();
+    let store = FakeStore::running(lease);
+    let mut runner = store.runner(Duration::ZERO);
+    runner.outcome = DurableRunnerResult::Retryable {
+        error_code: "runner_launch_evidence_missing".to_string(),
+    };
+    let daemon = daemon(store.clone(), runner);
+
+    assert_eq!(
+        daemon.run_once().await,
+        Err(ExecutorDaemonError::RunnerRetryable {
+            error_code: "runner_launch_evidence_missing".to_string(),
+        })
+    );
+    assert_eq!(store.events(), vec!["resume", "runner"]);
+    let snapshot = store.snapshot();
+    assert_eq!(snapshot.heartbeat_calls, 0);
+    assert!(snapshot.observed.is_empty());
+    assert!(snapshot.recorded.is_empty());
 }
 
 #[tokio::test]

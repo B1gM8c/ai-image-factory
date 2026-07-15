@@ -7,8 +7,9 @@ use super::{
     executor_object_key, filesystem::FilesystemArtifactBlobStore, sha256_hex,
 };
 use crate::executor::{
-    ExecutorArtifactAuthority, ExecutorArtifactAuthorityStore, ExecutorResultManifest,
-    ExecutorSubmissionError, ExecutorSubmissionLease, PostgresExecutorSubmissionStore,
+    ExecutorArtifactAuthority, ExecutorArtifactAuthorityStore, ExecutorArtifactSink,
+    ExecutorResultManifest, ExecutorSubmissionError, ExecutorSubmissionLease,
+    PostgresExecutorSubmissionStore, RunnerError,
 };
 use async_trait::async_trait;
 
@@ -210,6 +211,33 @@ impl ExecutorArtifactPublisher {
             .delete_unpublished(artifact)
             .await
             .map_err(map_write_error)
+    }
+}
+
+#[async_trait]
+impl ExecutorArtifactSink for ExecutorArtifactPublisher {
+    async fn publish(
+        &self,
+        lease: &ExecutorSubmissionLease,
+        bytes: &[u8],
+    ) -> Result<ExecutorResultManifest, RunnerError> {
+        ExecutorArtifactPublisher::publish(self, lease, bytes)
+            .await
+            .map_err(|error| match error {
+                ExecutorArtifactPublishError::InvalidInput
+                | ExecutorArtifactPublishError::ArtifactIntegrity => RunnerError::Internal,
+                ExecutorArtifactPublishError::ArtifactUnavailable
+                | ExecutorArtifactPublishError::Authority(ExecutorSubmissionError::Unavailable) => {
+                    RunnerError::Unavailable
+                }
+                ExecutorArtifactPublishError::Authority(
+                    ExecutorSubmissionError::Conflict
+                    | ExecutorSubmissionError::InvalidInput
+                    | ExecutorSubmissionError::StaleLease,
+                ) => RunnerError::Unknown {
+                    error_code: "artifact_authority_rejected".to_string(),
+                },
+            })
     }
 }
 

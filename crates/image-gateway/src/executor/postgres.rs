@@ -6,9 +6,10 @@ use uuid::Uuid;
 
 use super::{
     ExecutorArtifactAuthority, ExecutorArtifactAuthorityStore, ExecutorClaimScope,
-    ExecutorLaunchContext, ExecutorLaunchContextStore, ExecutorResultManifest,
-    ExecutorRunnerObservation, ExecutorSubmissionError, ExecutorSubmissionLease,
-    ExecutorSubmissionOutcome, ExecutorSubmissionStore, PreparedExecutorSubmission,
+    ExecutorEvidenceStore, ExecutorLaunchContext, ExecutorLaunchContextStore,
+    ExecutorResultManifest, ExecutorRunnerObservation, ExecutorSubmissionError,
+    ExecutorSubmissionLease, ExecutorSubmissionOutcome, ExecutorSubmissionStore,
+    PreparedExecutorSubmission,
 };
 use crate::admission::WorkLease;
 
@@ -265,6 +266,72 @@ impl ExecutorArtifactAuthorityStore for PostgresExecutorSubmissionStore {
         let now = database_now(&mut tx).await?;
         insert_artifact_authority(&mut tx, lease, authority, now).await?;
         tx.commit().await.map_err(unavailable)
+    }
+}
+
+#[async_trait]
+impl ExecutorEvidenceStore for PostgresExecutorSubmissionStore {
+    async fn load_pending_evidence(
+        &self,
+        scope: &ExecutorClaimScope,
+        owner: &str,
+    ) -> Result<Option<ExecutorSubmissionLease>, ExecutorSubmissionError> {
+        validate_claim_scope(scope)?;
+        validate_owner(owner)?;
+        let row: Option<ResumableRow> = sqlx::query_as(
+            r#"
+            WITH db_clock AS (
+              SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT AS now_ms
+            )
+            SELECT s.submission_id, e.executor_execution_id, s.output_id, s.job_id,
+                   s.tenant_id, s.provider_id, s.model, s.work_item_id,
+                   o.output_index, s.command_schema, s.command_hash,
+                   e.launch_lease_epoch AS lease_epoch,
+                   COALESCE(e.lease_expires_at_ms, 0)::BIGINT AS lease_expires_at_ms
+            FROM executor_executions e
+            JOIN provider_submissions s
+              ON s.executor_execution_id = e.executor_execution_id
+             AND s.submission_id = e.submission_id
+            JOIN job_outputs o ON o.output_id = s.output_id AND o.job_id = s.job_id
+            LEFT JOIN executor_runner_observations observation
+              ON observation.executor_execution_id = e.executor_execution_id
+             AND observation.submission_id = e.submission_id
+            CROSS JOIN db_clock
+            WHERE e.launch_owner = $1 AND e.launch_lease_epoch IS NOT NULL
+              AND s.provider_id = $2 AND s.command_schema = $3
+              AND observation.observation_id IS NULL
+              AND (
+                (e.state = 'running' AND s.state = 'running'
+                    AND e.lease_expires_at_ms <= db_clock.now_ms)
+                OR
+                (e.state IN ('succeeded', 'failed', 'uncertain') AND s.state = e.state)
+              )
+            ORDER BY e.updated_at_ms, e.executor_execution_id
+            LIMIT 1
+            "#,
+        )
+        .bind(owner)
+        .bind(&scope.provider_id)
+        .bind(&scope.command_schema)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(unavailable)?;
+        Ok(row.map(|row| ExecutorSubmissionLease {
+            submission_id: row.submission_id,
+            executor_execution_id: row.executor_execution_id,
+            output_id: row.output_id,
+            job_id: row.job_id,
+            tenant_id: row.tenant_id,
+            provider_id: row.provider_id,
+            model: row.model,
+            work_item_id: row.work_item_id,
+            output_index: row.output_index,
+            command_schema: row.command_schema,
+            command_hash: row.command_hash,
+            executor_owner: owner.to_string(),
+            executor_lease_epoch: row.lease_epoch,
+            executor_lease_expires_at_ms: row.lease_expires_at_ms,
+        }))
     }
 }
 

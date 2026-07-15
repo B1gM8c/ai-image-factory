@@ -1,4 +1,5 @@
 mod filesystem;
+pub(crate) mod process;
 
 pub use filesystem::FilesystemRunnerJournal;
 

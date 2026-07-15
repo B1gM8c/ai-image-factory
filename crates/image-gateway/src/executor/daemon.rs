@@ -7,8 +7,9 @@ use std::{
 use tokio::time::{Instant, MissedTickBehavior};
 
 use super::{
-    DurableRunner, ExecutorClaimScope, ExecutorSubmissionError, ExecutorSubmissionLease,
-    ExecutorSubmissionOutcome, ExecutorSubmissionStore,
+    DurableEvidenceRecovery, DurableRunner, DurableRunnerResult, ExecutorClaimScope,
+    ExecutorEvidenceStore, ExecutorSubmissionError, ExecutorSubmissionLease,
+    ExecutorSubmissionOutcome, ExecutorSubmissionStore, RunnerLaunchAuthority,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -23,13 +24,15 @@ pub enum ExecutorDaemonError {
     InvalidConfiguration,
     #[error(transparent)]
     Store(ExecutorSubmissionError),
+    #[error("executor runner evidence is temporarily unavailable: {error_code}")]
+    RunnerRetryable { error_code: String },
 }
 
 impl ExecutorDaemonError {
     pub fn store_error(&self) -> Option<&ExecutorSubmissionError> {
         match self {
             Self::Store(error) => Some(error),
-            Self::InvalidConfiguration => None,
+            Self::InvalidConfiguration | Self::RunnerRetryable { .. } => None,
         }
     }
 }
@@ -80,8 +83,17 @@ where
         if claimed {
             self.store.start(&lease).await?;
         }
-        let lease = self.store.heartbeat(&lease, self.lease_ms).await?;
-        self.run_with_heartbeat(lease).await
+        let lease = if claimed {
+            self.store.heartbeat(&lease, self.lease_ms).await?
+        } else {
+            lease
+        };
+        let authority = if claimed {
+            RunnerLaunchAuthority::AllowLaunch
+        } else {
+            RunnerLaunchAuthority::AttachOnly
+        };
+        self.run_with_heartbeat(lease, authority).await
     }
 
     fn validate_configuration(&self) -> Result<(), ExecutorDaemonError> {
@@ -116,8 +128,9 @@ where
     async fn run_with_heartbeat(
         &self,
         mut lease: ExecutorSubmissionLease,
+        authority: RunnerLaunchAuthority,
     ) -> Result<ExecutorDaemonRun, ExecutorDaemonError> {
-        let runner = self.runner.start_or_attach(lease.clone());
+        let runner = self.runner.start_or_attach(lease.clone(), authority);
         tokio::pin!(runner);
         let first_tick = Instant::now() + self.heartbeat_interval;
         let mut heartbeat = tokio::time::interval_at(first_tick, self.heartbeat_interval);
@@ -149,7 +162,7 @@ where
                 }
             }
         };
-        let outcome = ExecutorSubmissionOutcome::from(outcome);
+        let outcome = terminal_outcome(outcome)?;
         let observation = self
             .store
             .append_runner_observation(&lease, &outcome)
@@ -159,5 +172,38 @@ where
             .resolve_runner_observation(&lease, &observation)
             .await?;
         Ok(ExecutorDaemonRun::Recorded)
+    }
+}
+
+impl<S, R> ExecutorDaemon<S, R>
+where
+    S: ExecutorSubmissionStore + ExecutorEvidenceStore,
+    R: DurableRunner + DurableEvidenceRecovery,
+{
+    pub async fn recover_evidence_once(&self) -> Result<ExecutorDaemonRun, ExecutorDaemonError> {
+        self.validate_configuration()?;
+        let Some(lease) = self
+            .store
+            .load_pending_evidence(&self.scope, &self.owner)
+            .await?
+        else {
+            return Ok(ExecutorDaemonRun::Idle);
+        };
+        let outcome = terminal_outcome(self.runner.recover_evidence(lease.clone()).await)?;
+        self.store
+            .append_runner_observation(&lease, &outcome)
+            .await?;
+        Ok(ExecutorDaemonRun::Recorded)
+    }
+}
+
+fn terminal_outcome(
+    result: DurableRunnerResult,
+) -> Result<ExecutorSubmissionOutcome, ExecutorDaemonError> {
+    match result {
+        DurableRunnerResult::Terminal(outcome) => Ok(ExecutorSubmissionOutcome::from(outcome)),
+        DurableRunnerResult::Retryable { error_code } => {
+            Err(ExecutorDaemonError::RunnerRetryable { error_code })
+        }
     }
 }

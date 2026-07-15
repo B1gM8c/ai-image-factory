@@ -1,17 +1,22 @@
-use std::{collections::HashSet, env, sync::Arc, time::Duration};
+use std::{
+    collections::HashSet, env, fs, os::unix::fs::PermissionsExt, process::Stdio, sync::Arc,
+    time::Duration,
+};
 
 use gpt_image_2_gateway::database::{connect_test_pool_with_search_path, run_migrations};
 use gpt_image_2_gateway::{
-    admission::WorkLease,
+    GenerationJob,
+    admission::{GENERATION_COMMAND_SCHEMA, GenerationCommandV1, WorkLease},
     artifacts::{ExecutorArtifactPublisher, FilesystemArtifactBlobStore},
     economics::{
         EconomicReceipt, EconomicReceiptOutcome, EconomicSettlementStore,
         PostgresEconomicSettlementStore,
     },
     executor::{
-        ExecutorClaimScope, ExecutorLaunchContextStore, ExecutorResultManifest,
-        ExecutorSubmissionError, ExecutorSubmissionLease, ExecutorSubmissionOutcome,
-        ExecutorSubmissionStore, PostgresExecutorSubmissionStore,
+        ExecutorClaimScope, ExecutorEvidenceStore, ExecutorLaunchContextStore,
+        ExecutorOwnerGuardError, ExecutorResultManifest, ExecutorSubmissionError,
+        ExecutorSubmissionLease, ExecutorSubmissionOutcome, ExecutorSubmissionStore,
+        PostgresExecutorOwnerGuard, PostgresExecutorSubmissionStore,
     },
 };
 use image::{DynamicImage, ImageFormat, Rgba, RgbaImage};
@@ -21,6 +26,631 @@ use sqlx::{AssertSqlSafe, PgPool};
 use uuid::Uuid;
 
 type TestResult<T = ()> = Result<T, String>;
+
+#[tokio::test]
+async fn real_executord_process_runs_one_output_through_durable_helper_and_artifact_authority()
+-> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let lease = seed_codex_generation_lease(&database.pool, "executord-smoke-workerd").await?;
+        let store = PostgresExecutorSubmissionStore::new(database.pool.clone());
+        let prepared = store.prepare_for_lease(&lease).await.map_err(debug_error)?;
+        require(prepared.len() == 1, "expected one prepared output")?;
+        activate_work(&database.pool, &lease).await?;
+
+        let files = ExecutordFixture::new(Duration::ZERO)?;
+        let mut child = files
+            .command(&database, "executord-process-smoke")?
+            .spawn()
+            .map_err(|error| format!("failed to spawn executord: {error}"))?;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        let terminal = loop {
+            let row: Option<(String, String, i64, i64, i64)> = sqlx::query_as(
+                r#"
+                    SELECT e.state, s.state,
+                           (SELECT COUNT(*) FROM executor_artifact_authorities
+                            WHERE executor_execution_id = e.executor_execution_id),
+                           (SELECT COUNT(*) FROM executor_runner_observations
+                            WHERE executor_execution_id = e.executor_execution_id),
+                           (SELECT COUNT(*) FROM executor_resolution_decisions
+                            WHERE executor_execution_id = e.executor_execution_id)
+                    FROM executor_executions e
+                    JOIN provider_submissions s ON s.submission_id = e.submission_id
+                    WHERE s.job_id = $1
+                    "#,
+            )
+            .bind(lease.job_id)
+            .fetch_optional(&database.pool)
+            .await
+            .map_err(debug_error)?;
+            if row.as_ref().is_some_and(|row| {
+                row.0 == "succeeded"
+                    && row.1 == "succeeded"
+                    && row.2 == 1
+                    && row.3 == 1
+                    && row.4 == 1
+            }) {
+                break row.unwrap();
+            }
+            if let Some(status) = child.try_wait().map_err(debug_error)? {
+                return Err(format!("executord exited early with {status}; row={row:?}"));
+            }
+            if tokio::time::Instant::now() >= deadline {
+                if let Some(pid) = child.id() {
+                    unsafe {
+                        libc::kill(pid as libc::pid_t, libc::SIGTERM);
+                    }
+                }
+                let _ = tokio::time::timeout(Duration::from_secs(3), child.wait()).await;
+                return Err(format!("executord result timed out; row={row:?}"));
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        };
+        require(
+            terminal == ("succeeded".to_string(), "succeeded".to_string(), 1, 1, 1),
+            format!("unexpected executor terminal projection: {terminal:?}"),
+        )?;
+        let pid = child
+            .id()
+            .ok_or_else(|| "executord PID unavailable".to_string())?;
+        if unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) } != 0 {
+            return Err("failed to signal executord".to_string());
+        }
+        let output = tokio::time::timeout(Duration::from_secs(5), child.wait_with_output())
+            .await
+            .map_err(|_| "executord did not exit after SIGTERM".to_string())?
+            .map_err(debug_error)?;
+        require(
+            output.status.success(),
+            format!(
+                "executord exit failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ),
+        )?;
+        require(
+            fs::read_to_string(&files.invocations).map_err(debug_error)? == "1\n",
+            "Codex helper launched the provider more than once",
+        )?;
+        let artifact_files = walk_regular_files(&files.artifact_root)?;
+        require(
+            artifact_files.len() == 1,
+            format!("unexpected artifact file count: {artifact_files:?}"),
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
+async fn restarted_executord_attaches_running_helper_without_relaunching_provider() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let lease =
+            seed_codex_generation_lease(&database.pool, "executord-restart-workerd").await?;
+        let store = PostgresExecutorSubmissionStore::new(database.pool.clone());
+        require(
+            store
+                .prepare_for_lease(&lease)
+                .await
+                .map_err(debug_error)?
+                .len()
+                == 1,
+            "expected one prepared output",
+        )?;
+        activate_work(&database.pool, &lease).await?;
+        let files = ExecutordFixture::new(Duration::from_secs(2))?;
+        let owner = "executord-restart-smoke";
+        let mut first = files
+            .command(&database, owner)?
+            .spawn()
+            .map_err(debug_error)?;
+        tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                let state: Option<String> = sqlx::query_scalar(
+                    r#"
+                    SELECT e.state
+                    FROM executor_executions e
+                    JOIN provider_submissions s ON s.submission_id = e.submission_id
+                    WHERE s.job_id = $1
+                    "#,
+                )
+                .bind(lease.job_id)
+                .fetch_optional(&database.pool)
+                .await
+                .map_err(debug_error)?;
+                if state.as_deref() == Some("running")
+                    && fs::read_to_string(&files.invocations).is_ok_and(|value| value == "1\n")
+                {
+                    break Ok::<_, String>(());
+                }
+                if let Some(status) = first.try_wait().map_err(debug_error)? {
+                    break Err(format!("first executord exited early with {status}"));
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .map_err(|_| "provider helper did not start before restart test deadline".to_string())??;
+        let first_pid = first
+            .id()
+            .ok_or_else(|| "first executord PID unavailable".to_string())?;
+        if unsafe { libc::kill(first_pid as libc::pid_t, libc::SIGKILL) } != 0 {
+            return Err("failed to SIGKILL first executord".to_string());
+        }
+        let first_output = tokio::time::timeout(Duration::from_secs(3), first.wait_with_output())
+            .await
+            .map_err(|_| "first executord did not exit after SIGKILL".to_string())?
+            .map_err(debug_error)?;
+        require(
+            !first_output.status.success(),
+            "SIGKILLed executord unexpectedly exited successfully",
+        )?;
+
+        let mut second = files
+            .command(&database, owner)?
+            .spawn()
+            .map_err(debug_error)?;
+        let terminal = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let row: Option<(String, String, i64)> = sqlx::query_as(
+                    r#"
+                    SELECT e.state, s.state,
+                           (SELECT COUNT(*) FROM executor_runner_observations
+                            WHERE executor_execution_id = e.executor_execution_id)
+                    FROM executor_executions e
+                    JOIN provider_submissions s ON s.submission_id = e.submission_id
+                    WHERE s.job_id = $1
+                    "#,
+                )
+                .bind(lease.job_id)
+                .fetch_optional(&database.pool)
+                .await
+                .map_err(debug_error)?;
+                if row
+                    .as_ref()
+                    .is_some_and(|row| row.0 == "succeeded" && row.1 == "succeeded" && row.2 == 1)
+                {
+                    break Ok::<_, String>(row.unwrap());
+                }
+                if let Some(status) = second.try_wait().map_err(debug_error)? {
+                    break Err(format!("second executord exited early with {status}"));
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .map_err(|_| "restarted executord did not attach before deadline".to_string())??;
+        require(
+            terminal == ("succeeded".to_string(), "succeeded".to_string(), 1),
+            format!("unexpected attached terminal state: {terminal:?}"),
+        )?;
+        let second_pid = second
+            .id()
+            .ok_or_else(|| "second executord PID unavailable".to_string())?;
+        if unsafe { libc::kill(second_pid as libc::pid_t, libc::SIGTERM) } != 0 {
+            return Err("failed to terminate second executord".to_string());
+        }
+        let second_output = tokio::time::timeout(Duration::from_secs(5), second.wait_with_output())
+            .await
+            .map_err(|_| "second executord did not drain after SIGTERM".to_string())?
+            .map_err(debug_error)?;
+        require(
+            second_output.status.success(),
+            format!(
+                "second executord failed: {}",
+                String::from_utf8_lossy(&second_output.stderr)
+            ),
+        )?;
+        require(
+            fs::read_to_string(&files.invocations).map_err(debug_error)? == "1\n",
+            "restart launched the provider more than once",
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
+async fn expired_execution_recovers_late_success_evidence_without_relaunching_provider()
+-> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let work = seed_codex_generation_lease(&database.pool, "late-evidence-workerd").await?;
+        let store = PostgresExecutorSubmissionStore::new(database.pool.clone());
+        let prepared = store.prepare_for_lease(&work).await.map_err(debug_error)?;
+        require(prepared.len() == 1, "expected one prepared output")?;
+        activate_work(&database.pool, &work).await?;
+
+        let files = ExecutordFixture::new(Duration::from_millis(1_200))?;
+        let owner = "late-evidence-executord";
+        let mut first = files
+            .command_with_lease(&database, owner, 800, 100)?
+            .spawn()
+            .map_err(debug_error)?;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let running: Option<(String, i64)> = sqlx::query_as(
+                    r#"
+                    SELECT e.state, e.lease_epoch
+                    FROM executor_executions e
+                    JOIN provider_submissions s ON s.submission_id = e.submission_id
+                    WHERE s.job_id = $1
+                    "#,
+                )
+                .bind(work.job_id)
+                .fetch_optional(&database.pool)
+                .await
+                .map_err(debug_error)?;
+                if running.as_ref().is_some_and(|row| row.0 == "running")
+                    && fs::read_to_string(&files.invocations).is_ok_and(|value| value == "1\n")
+                {
+                    break Ok::<_, String>(());
+                }
+                if let Some(status) = first.try_wait().map_err(debug_error)? {
+                    break Err(format!("first executord exited early with {status}"));
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .map_err(|_| "late-evidence helper did not start".to_string())??;
+        let first_pid = first
+            .id()
+            .ok_or_else(|| "first executord PID unavailable".to_string())?;
+        if unsafe { libc::kill(first_pid as libc::pid_t, libc::SIGKILL) } != 0 {
+            return Err("failed to SIGKILL first executord".to_string());
+        }
+        let first_output = tokio::time::timeout(Duration::from_secs(3), first.wait_with_output())
+            .await
+            .map_err(|_| "first executord did not exit after SIGKILL".to_string())?
+            .map_err(debug_error)?;
+        require(
+            !first_output.status.success(),
+            "SIGKILLed executord unexpectedly exited successfully",
+        )?;
+
+        let scope = ExecutorClaimScope {
+            provider_id: "openai-codex".to_string(),
+            command_schema: GENERATION_COMMAND_SCHEMA.to_string(),
+        };
+        require(
+            store
+                .load_pending_evidence(&scope, owner)
+                .await
+                .map_err(debug_error)?
+                .is_none(),
+            "live lease was exposed as late evidence",
+        )?;
+        let process_terminal = files
+            .runner_root
+            .join(prepared[0].executor_execution_id.simple().to_string())
+            .join("result.json");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !process_terminal.is_file() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .map_err(|_| "detached helper did not persist terminal evidence".to_string())?;
+        let evidence = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Some(evidence) = store
+                    .load_pending_evidence(&scope, owner)
+                    .await
+                    .map_err(debug_error)?
+                {
+                    break Ok::<_, String>(evidence);
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .map_err(|_| "expired launch fence was not recoverable".to_string())??;
+        require(
+            evidence.executor_execution_id == prepared[0].executor_execution_id
+                && evidence.submission_id == prepared[0].submission_id
+                && evidence.executor_owner == owner
+                && evidence.executor_lease_epoch > 0,
+            "recovered evidence did not preserve the immutable launch fence",
+        )?;
+
+        let mut second = files
+            .command_with_lease(&database, owner, 800, 100)?
+            .spawn()
+            .map_err(debug_error)?;
+        tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                let row: (i64, i64, Option<String>) = sqlx::query_as(
+                    r#"
+                    SELECT
+                      (SELECT COUNT(*) FROM executor_artifact_authorities
+                       WHERE executor_execution_id = $1),
+                      (SELECT COUNT(*) FROM executor_runner_observations
+                       WHERE executor_execution_id = $1),
+                      (SELECT observed_state FROM executor_runner_observations
+                       WHERE executor_execution_id = $1)
+                    "#,
+                )
+                .bind(prepared[0].executor_execution_id)
+                .fetch_one(&database.pool)
+                .await
+                .map_err(debug_error)?;
+                if row == (1, 1, Some("succeeded".to_string())) {
+                    break Ok::<_, String>(());
+                }
+                if let Some(status) = second.try_wait().map_err(debug_error)? {
+                    break Err(format!("recovery executord exited early with {status}"));
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .map_err(|_| "late success evidence was not imported".to_string())??;
+        require(
+            store.reconcile_expired(100).await.map_err(debug_error)? == 1,
+            "expired execution was not canonically reconciled",
+        )?;
+        let canonical: (String, String, String, i64) = sqlx::query_as(
+            r#"
+            SELECT e.state, s.state, d.source,
+                   (SELECT COUNT(*) FROM executor_runner_observations
+                    WHERE executor_execution_id = e.executor_execution_id)
+            FROM executor_executions e
+            JOIN provider_submissions s ON s.submission_id = e.submission_id
+            JOIN executor_resolution_decisions d
+              ON d.decision_id = e.resolution_decision_id
+            WHERE s.job_id = $1
+            "#,
+        )
+        .bind(work.job_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(
+            canonical
+                == (
+                    "uncertain".to_string(),
+                    "uncertain".to_string(),
+                    "executor_lease_expired".to_string(),
+                    1,
+                ),
+            format!("unexpected late evidence canonical projection: {canonical:?}"),
+        )?;
+        let second_pid = second
+            .id()
+            .ok_or_else(|| "recovery executord PID unavailable".to_string())?;
+        if unsafe { libc::kill(second_pid as libc::pid_t, libc::SIGTERM) } != 0 {
+            return Err("failed to terminate recovery executord".to_string());
+        }
+        let second_output = tokio::time::timeout(Duration::from_secs(5), second.wait_with_output())
+            .await
+            .map_err(|_| "recovery executord did not terminate".to_string())?
+            .map_err(debug_error)?;
+        require(
+            second_output.status.success(),
+            format!(
+                "recovery executord failed: {}",
+                String::from_utf8_lossy(&second_output.stderr)
+            ),
+        )?;
+        require(
+            fs::read_to_string(&files.invocations).map_err(debug_error)? == "1\n",
+            "late evidence recovery relaunched the provider",
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
+async fn executord_sigterm_drains_running_helper_through_database_resolution() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let lease = seed_codex_generation_lease(&database.pool, "executord-drain-workerd").await?;
+        let store = PostgresExecutorSubmissionStore::new(database.pool.clone());
+        require(
+            store
+                .prepare_for_lease(&lease)
+                .await
+                .map_err(debug_error)?
+                .len()
+                == 1,
+            "expected one prepared output",
+        )?;
+        activate_work(&database.pool, &lease).await?;
+        let files = ExecutordFixture::new(Duration::from_secs(1))?;
+        let mut child = files
+            .command(&database, "executord-drain-smoke")?
+            .spawn()
+            .map_err(debug_error)?;
+        tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                let state: Option<String> = sqlx::query_scalar(
+                    r#"
+                    SELECT e.state
+                    FROM executor_executions e
+                    JOIN provider_submissions s ON s.submission_id = e.submission_id
+                    WHERE s.job_id = $1
+                    "#,
+                )
+                .bind(lease.job_id)
+                .fetch_optional(&database.pool)
+                .await
+                .map_err(debug_error)?;
+                if state.as_deref() == Some("running")
+                    && fs::read_to_string(&files.invocations).is_ok_and(|value| value == "1\n")
+                {
+                    break Ok::<_, String>(());
+                }
+                if let Some(status) = child.try_wait().map_err(debug_error)? {
+                    break Err(format!(
+                        "executord exited before drain signal with {status}"
+                    ));
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .map_err(|_| "provider helper did not enter running state".to_string())??;
+        let pid = child
+            .id()
+            .ok_or_else(|| "executord PID unavailable".to_string())?;
+        if unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) } != 0 {
+            return Err("failed to SIGTERM executord".to_string());
+        }
+        let output = tokio::time::timeout(Duration::from_secs(8), child.wait_with_output())
+            .await
+            .map_err(|_| "executord did not finish drain".to_string())?
+            .map_err(debug_error)?;
+        require(
+            output.status.success(),
+            format!(
+                "executord drain failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ),
+        )?;
+        let terminal: (String, String, i64, i64) = sqlx::query_as(
+            r#"
+            SELECT e.state, s.state,
+                   (SELECT COUNT(*) FROM executor_artifact_authorities
+                    WHERE executor_execution_id = e.executor_execution_id),
+                   (SELECT COUNT(*) FROM executor_resolution_decisions
+                    WHERE executor_execution_id = e.executor_execution_id)
+            FROM executor_executions e
+            JOIN provider_submissions s ON s.submission_id = e.submission_id
+            WHERE s.job_id = $1
+            "#,
+        )
+        .bind(lease.job_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(
+            terminal == ("succeeded".to_string(), "succeeded".to_string(), 1, 1),
+            format!("SIGTERM drain left incomplete state: {terminal:?}"),
+        )?;
+        require(
+            fs::read_to_string(&files.invocations).map_err(debug_error)? == "1\n",
+            "SIGTERM drain relaunched the provider",
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
+async fn executor_owner_guard_allows_only_one_live_owner_scope_session() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let scope = ExecutorClaimScope {
+            provider_id: "openai-codex".to_string(),
+            command_schema: "openai.images.generation.v1".to_string(),
+        };
+        let mut first = PostgresExecutorOwnerGuard::acquire(
+            &database.pool,
+            "owner-guard-test",
+            &scope,
+            Duration::from_secs(2),
+        )
+        .await
+        .map_err(debug_error)?;
+        first.verify().await.map_err(debug_error)?;
+        let second = PostgresExecutorOwnerGuard::acquire(
+            &database.pool,
+            "owner-guard-test",
+            &scope,
+            Duration::from_secs(2),
+        )
+        .await;
+        require(
+            matches!(second, Err(ExecutorOwnerGuardError::AlreadyActive)),
+            "second owner guard was not rejected",
+        )?;
+        drop(first);
+        let reacquired = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                match PostgresExecutorOwnerGuard::acquire(
+                    &database.pool,
+                    "owner-guard-test",
+                    &scope,
+                    Duration::from_secs(1),
+                )
+                .await
+                {
+                    Ok(guard) => break Ok(guard),
+                    Err(ExecutorOwnerGuardError::AlreadyActive) => {
+                        tokio::time::sleep(Duration::from_millis(25)).await;
+                    }
+                    Err(error) => break Err(error),
+                }
+            }
+        })
+        .await
+        .map_err(|_| "owner guard was not released after connection close".to_string())?
+        .map_err(debug_error)?;
+        drop(reacquired);
+        Ok(())
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
+async fn executor_owner_guard_fails_closed_after_its_database_session_is_terminated() -> TestResult
+{
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let scope = ExecutorClaimScope {
+            provider_id: "openai-codex".to_string(),
+            command_schema: GENERATION_COMMAND_SCHEMA.to_string(),
+        };
+        let mut guard = PostgresExecutorOwnerGuard::acquire(
+            &database.pool,
+            "owner-guard-session-loss",
+            &scope,
+            Duration::from_secs(2),
+        )
+        .await
+        .map_err(debug_error)?;
+        let terminated: bool = sqlx::query_scalar("SELECT pg_terminate_backend($1)")
+            .bind(guard.backend_pid())
+            .fetch_one(&database.pool)
+            .await
+            .map_err(debug_error)?;
+        require(terminated, "owner guard backend was not terminated")?;
+        require(
+            matches!(
+                guard.verify().await,
+                Err(ExecutorOwnerGuardError::Unavailable)
+            ),
+            "owner guard did not fail closed after session loss",
+        )?;
+        drop(guard);
+        let mut reacquired = PostgresExecutorOwnerGuard::acquire(
+            &database.pool,
+            "owner-guard-session-loss",
+            &scope,
+            Duration::from_secs(2),
+        )
+        .await
+        .map_err(debug_error)?;
+        reacquired.verify().await.map_err(debug_error)
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
 
 #[tokio::test]
 async fn concurrent_prepare_returns_one_stable_identity_set() -> TestResult {
@@ -2059,6 +2689,244 @@ async fn seed_lease(pool: &PgPool, worker_id: &str, requested_units: i32) -> Tes
         command_schema: "provider-command-v1".to_string(),
         command_json,
     })
+}
+
+async fn seed_codex_generation_lease(pool: &PgPool, worker_id: &str) -> TestResult<WorkLease> {
+    let job_id = Uuid::new_v4();
+    let work_item_id = Uuid::new_v4();
+    let execution_id = Uuid::new_v4();
+    let admission_session_id = Uuid::new_v4();
+    let request_id = format!("request-{}", Uuid::new_v4().simple());
+    let job = GenerationJob {
+        request_id: request_id.clone(),
+        model: "gpt-image-2".to_string(),
+        prompt: "draw a process-smoke lighthouse".to_string(),
+        moderation: "auto".to_string(),
+        n: 1,
+        size: "1024x1024".to_string(),
+        quality: "high".to_string(),
+        output_format: "png".to_string(),
+        output_compression: None,
+        background: "opaque".to_string(),
+        stream: false,
+        partial_images: 0,
+    };
+    let command =
+        GenerationCommandV1::from_generation_job(&job, "openai-images-v1", "openai-codex");
+    let command_json = serde_json::to_value(&command).map_err(debug_error)?;
+    let request_hash = command.request_hash_hex();
+    let now = database_now(pool).await?;
+    sqlx::query(
+        r#"
+        INSERT INTO jobs
+          (job_id, tenant_id, request_id, operation, provider_id, model, state,
+           requested_units, created_at_ms, updated_at_ms)
+        VALUES ($1, 'executord-process-smoke', $2, 'generation', 'openai-codex',
+                'gpt-image-2', 'reserved', 1, $3, $3)
+        "#,
+    )
+    .bind(job_id)
+    .bind(&request_id)
+    .bind(now)
+    .execute(pool)
+    .await
+    .map_err(debug_error)?;
+    sqlx::query(
+        r#"
+        INSERT INTO admission_sessions
+          (session_id, owner_token, tenant_id, project_id, api_profile, operation,
+           request_id, request_hash, state, job_id, deadline_at_ms, created_at_ms, updated_at_ms)
+        VALUES ($1, $2, 'executord-process-smoke', 'project-test', 'openai-images-v1',
+                'generation', $3, $4, 'attached', $5, $6, $7, $7)
+        "#,
+    )
+    .bind(admission_session_id)
+    .bind(Uuid::new_v4())
+    .bind(&request_id)
+    .bind(&request_hash)
+    .bind(job_id)
+    .bind(now + 300_000)
+    .bind(now)
+    .execute(pool)
+    .await
+    .map_err(debug_error)?;
+    sqlx::query(
+        r#"
+        INSERT INTO job_payloads
+          (job_id, admission_session_id, command_schema, command_json, request_hash, created_at_ms)
+        VALUES ($1, $2, $3, $4, $5, $6)
+        "#,
+    )
+    .bind(job_id)
+    .bind(admission_session_id)
+    .bind(GENERATION_COMMAND_SCHEMA)
+    .bind(&command_json)
+    .bind(&request_hash)
+    .bind(now)
+    .execute(pool)
+    .await
+    .map_err(debug_error)?;
+    sqlx::query(
+        r#"
+        INSERT INTO work_items
+          (work_item_id, job_id, kind, state, available_at_ms, lease_epoch,
+           lease_owner, lease_expires_at_ms, execution_id, created_at_ms, updated_at_ms)
+        VALUES ($1, $2, 'generation', 'leased', $4, 7, $3, $5, $6, $4, $4)
+        "#,
+    )
+    .bind(work_item_id)
+    .bind(job_id)
+    .bind(worker_id)
+    .bind(now)
+    .bind(now + 300_000)
+    .bind(execution_id)
+    .execute(pool)
+    .await
+    .map_err(debug_error)?;
+    sqlx::query(
+        r#"
+        INSERT INTO job_attempts
+          (attempt_id, execution_id, work_item_id, lease_epoch, worker_id, state,
+           created_at_ms, updated_at_ms)
+        VALUES ($1, $2, $3, 7, $4, 'claimed', $5, $5)
+        "#,
+    )
+    .bind(Uuid::new_v4())
+    .bind(execution_id)
+    .bind(work_item_id)
+    .bind(worker_id)
+    .bind(now)
+    .execute(pool)
+    .await
+    .map_err(debug_error)?;
+    Ok(WorkLease {
+        work_item_id,
+        job_id,
+        execution_id,
+        lease_epoch: 7,
+        worker_id: worker_id.to_string(),
+        command_schema: GENERATION_COMMAND_SCHEMA.to_string(),
+        command_json,
+    })
+}
+
+struct ExecutordFixture {
+    _temp: tempfile::TempDir,
+    artifact_root: std::path::PathBuf,
+    runner_root: std::path::PathBuf,
+    credentials: std::path::PathBuf,
+    fake_codex: std::path::PathBuf,
+    invocations: std::path::PathBuf,
+}
+
+impl ExecutordFixture {
+    fn new(delay: Duration) -> TestResult<Self> {
+        let temp = tempfile::TempDir::new().map_err(debug_error)?;
+        let artifact_root = temp.path().join("artifacts");
+        let runner_root = temp.path().join("runner");
+        let credentials = temp.path().join("credentials");
+        fs::create_dir(&artifact_root).map_err(debug_error)?;
+        fs::create_dir(&credentials).map_err(debug_error)?;
+        fs::set_permissions(&artifact_root, fs::Permissions::from_mode(0o700))
+            .map_err(debug_error)?;
+        fs::set_permissions(&credentials, fs::Permissions::from_mode(0o700))
+            .map_err(debug_error)?;
+        let auth = credentials.join("auth.json");
+        fs::write(&auth, b"{}\n").map_err(debug_error)?;
+        fs::set_permissions(&auth, fs::Permissions::from_mode(0o600)).map_err(debug_error)?;
+        let source = temp.path().join("source.png");
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        DynamicImage::new_rgba8(1, 1)
+            .write_to(&mut bytes, ImageFormat::Png)
+            .map_err(debug_error)?;
+        fs::write(&source, bytes.into_inner()).map_err(debug_error)?;
+        let invocations = temp.path().join("invocations");
+        let fake_codex = temp.path().join("fake-codex");
+        let delay = if delay.is_zero() {
+            String::new()
+        } else {
+            format!("/bin/sleep {:.3}\n", delay.as_secs_f64())
+        };
+        fs::write(
+            &fake_codex,
+            format!(
+                "#!/bin/sh\n/bin/cat >/dev/null\nprintf '1\\n' >> '{}'\n{delay}/bin/cp '{}' final.png\n",
+                invocations.display(),
+                source.display()
+            ),
+        )
+        .map_err(debug_error)?;
+        fs::set_permissions(&fake_codex, fs::Permissions::from_mode(0o755)).map_err(debug_error)?;
+        Ok(Self {
+            _temp: temp,
+            artifact_root,
+            runner_root,
+            credentials,
+            fake_codex,
+            invocations,
+        })
+    }
+
+    fn command(&self, database: &TestDatabase, owner: &str) -> TestResult<tokio::process::Command> {
+        self.command_with_lease(database, owner, 10_000, 250)
+    }
+
+    fn command_with_lease(
+        &self,
+        database: &TestDatabase,
+        owner: &str,
+        lease_ms: u64,
+        heartbeat_ms: u64,
+    ) -> TestResult<tokio::process::Command> {
+        let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_executord"));
+        command
+            .env_clear()
+            .env(
+                "DATABASE_URL",
+                env::var("TEST_DATABASE_URL").map_err(debug_error)?,
+            )
+            .env("GATEWAY_DATABASE_SCHEMA", &database.schema)
+            .env("GATEWAY_ARTIFACT_ROOT", &self.artifact_root)
+            .env("EXECUTOR_RUNNER_ROOT", &self.runner_root)
+            .env(
+                "EXECUTOR_HELPER_EXECUTABLE",
+                env!("CARGO_BIN_EXE_codex-runner"),
+            )
+            .env("EXECUTOR_CODEX_EXECUTABLE", &self.fake_codex)
+            .env("EXECUTOR_CODEX_CREDENTIAL_HOME", &self.credentials)
+            .env("EXECUTOR_OWNER", owner)
+            .env("EXECUTOR_PROVIDER_ID", "openai-codex")
+            .env("EXECUTOR_COMMAND_SCHEMA", GENERATION_COMMAND_SCHEMA)
+            .env("EXECUTOR_LEASE_MS", lease_ms.to_string())
+            .env("EXECUTOR_HEARTBEAT_INTERVAL_MS", heartbeat_ms.to_string())
+            .env("EXECUTOR_POLL_INTERVAL_MS", "20")
+            .env("EXECUTOR_PROCESS_POLL_INTERVAL_MS", "10")
+            .env("EXECUTOR_PROCESS_STARTUP_GRACE_MS", "1000")
+            .env("EXECUTOR_REQUEST_TIMEOUT_MS", "5000")
+            .env("EXECUTOR_OWNER_GUARD_TIMEOUT_MS", "1000")
+            .env("RUST_LOG", "executord=info")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        Ok(command)
+    }
+}
+
+fn walk_regular_files(root: &std::path::Path) -> TestResult<Vec<std::path::PathBuf>> {
+    let mut files = Vec::new();
+    for entry in fs::read_dir(root).map_err(debug_error)? {
+        let path = entry.map_err(debug_error)?.path();
+        let metadata = fs::symlink_metadata(&path).map_err(debug_error)?;
+        if metadata.is_dir() {
+            files.extend(walk_regular_files(&path)?);
+        } else if metadata.is_file() {
+            files.push(path);
+        } else {
+            return Err(format!("unexpected artifact entry: {}", path.display()));
+        }
+    }
+    Ok(files)
 }
 
 async fn activate_work(pool: &PgPool, lease: &WorkLease) -> TestResult {

@@ -1,18 +1,19 @@
 # Phase 1F: Persistent Executor Runtime
 
-Status: runtime kernel, canonical launch context, immutable executor artifact
-authority, and append-only observation/resolution implemented. The production
-Images API remains on `LegacyV1` until every activation gate in this document
-passes.
+Status: the persistent executor runtime, independent `executord`, Codex helper,
+private process spool, immutable artifact authority, and append-only
+observation/resolution path are implemented. Process-level PostgreSQL tests
+cover one launch, restart attach, `SIGTERM` drain, owner-session loss, and late
+evidence after executor lease expiry. The production Images API remains on
+`LegacyV1` until every open activation gate in this document passes.
 
-The checkpoint includes the executor daemon application port, owner-and-scope
-resume of unexpired running executions, idempotent database start replay,
-pre-launch lease renewal, an exact-lease PostgreSQL launch-context projection,
-and a dirfd-bound filesystem journal with atomic no-replace launch and terminal
-markers. Verified executor objects now use an isolated write-once namespace,
-deterministic execution identities, a storage namespace binding, and an
-append-only PostgreSQL authority reference. It does not yet include an executord
-binary or provider process supervisor.
+The checkpoint includes owner-and-scope singleton supervision, exact launch
+context projection, output-scoped Codex command projection, idempotent database
+start replay, active lease heartbeats, retryable evidence publication, and a
+dirfd-bound filesystem journal with atomic no-replace markers. The helper uses
+an execution-private Codex home and spool, persists PID plus OS start identity,
+and launches one provider invocation for one output. Verified artifacts use an
+isolated write-once namespace and an append-only PostgreSQL authority reference.
 
 ## 1. Scope
 
@@ -88,8 +89,11 @@ For one `executor_execution_id`, the durable runner must enforce:
 6. write output into an execution-private spool;
 7. fsync files and directories before atomically publishing terminal state;
 8. report success only after every manifest object is durable and validated;
-9. return `uncertain` when launch or terminal evidence is incomplete;
-10. never convert an internal runner/storage failure into a definite provider
+9. keep temporarily unavailable local or database evidence retryable without
+   publishing an immutable terminal marker;
+10. return `uncertain` only when durable evidence proves the provider effect is
+    unknowable rather than merely unavailable;
+11. never convert an internal runner/storage failure into a definite provider
     rejection.
 
 The journal and spool must reject symlinks, traversal, non-regular files,
@@ -102,9 +106,10 @@ pidfd identity.
 
 ## 5. Lease And Crash Semantics
 
-`executord` first resumes its own unexpired running work, then claims prepared
-work. A fresh claim transitions `prepared -> leased`; immediately before runner
-authority is handed over, it transitions `leased -> running`.
+`executord` first imports pending late evidence, then resumes its own unexpired
+running work, then claims prepared work. A fresh claim transitions
+`prepared -> leased`; immediately before runner authority is handed over, it
+transitions `leased -> running`.
 
 While `start_or_attach` is active, executord heartbeats the independent executor
 lease. A stale lease cannot publish a canonical outcome. Durable runner evidence
@@ -112,6 +117,13 @@ may be retained for reconciliation, but cannot bypass PostgreSQL fencing.
 PostgreSQL enforces one-way executor and submission transitions, a write-once
 launch owner and epoch, monotonic live heartbeats, and rejection of any attempt
 to revive an expired lease under the same fence.
+
+A resumed execution is not renewed before local attach evidence is found. If a
+second process has the same configured owner but a different spool, the missing
+launch marker is retryable and produces no heartbeat, observation, or canonical
+resolution. A dedicated PostgreSQL advisory-lock session owns each
+owner/provider/schema tuple; executord verifies that exact backend session both
+between and during executions and exits fail-closed when the session is lost.
 
 The database `start` transition is itself idempotent for the exact same
 execution, submission, owner, and epoch. This covers a committed `running`
@@ -123,11 +135,11 @@ Crash outcomes are deliberately asymmetric:
 | Crash boundary | Recovery |
 | --- | --- |
 | before executor start | prepared/leased work may be safely reclaimed according to its state |
-| after executor start, before runner journal | running lease is resumed by the same stable owner; expiry becomes uncertain |
-| after journal, before provider launch evidence | attach journal; missing proof becomes uncertain |
+| after executor start, before runner journal | do not renew or relaunch; expiry becomes canonical uncertain |
+| after journal, before provider launch evidence | attach only; missing local proof remains retryable until expiry |
 | after provider launch | attach the same execution; never launch a replacement |
-| after spool commit, before DB commit acknowledgement | replay the identical terminal outcome |
-| after executor lease expiry | canonical state becomes uncertain; no automatic provider retry |
+| after spool commit, before artifact/DB acknowledgement | retain success spool and replay publication before writing terminal |
+| after executor lease expiry | append late evidence for audit and keep canonical state uncertain; never retry provider |
 
 ## 6. Internal Protocol
 
@@ -158,11 +170,11 @@ The socket is not a public API and does not reuse the official Images facade.
 
 Each slice is additive. `LegacyV1` remains the default until slice 7 passes.
 
-At this checkpoint, slices 1 and 2 are complete, the durable journal,
-artifact-authority, and PostgreSQL observation/resolution portions of slice 3
-are complete, and the exact-lease canonical context projection required by
-slice 4 is complete. Process attachment, process identity, and private CLI
-output spooling remain part of slices 3 through 5.
+At this checkpoint, slices 1 through 5 are implemented. Slice 6's executor
+evidence, artifact authority, output economics, and reducer kernels are
+implemented independently; the V2 API wiring that composes them remains open.
+Slice 7 has adversarial fake-provider and real-process coverage but still lacks
+the credentialed real Codex CLI request through the public Images API.
 
 The current `ImageGenerator` interface is job-level and may loop over `n`.
 Provider submissions are output-level, so executord must not call that interface
@@ -180,23 +192,31 @@ contain only deterministic authority IDs, and PostgreSQL accepts it only after
 the publisher has durably written and reread the isolated object, independently
 derived its type, hash, and size, and committed its append-only authority row.
 
-These blockers are implemented before production child-process wiring. A child
-protocol also requires a versioned adapter revision, resource policy, stable
-process identity, bounded private UDS framing, peer credential checks, an
-absolute executable allowlist, `env_clear()`, and an external sandbox boundary.
-The existing shared Codex `HOME` and ambient executable lookup are not a
-multi-tenant isolation boundary and must not be reused by V2.
+The current child protocol is a versioned, length-bounded private filesystem
+request consumed by `codex-runner`; it rejects unknown fields, uses explicit
+canonical executable paths and hashes, clears ambient environment, and copies
+only a private `auth.json` into an execution-specific Codex home. This is a
+durability boundary, not a hostile multi-tenant security boundary. A same-UID
+process can still race executable replacement or inspect another same-UID
+process on common operating systems. Production activation therefore requires
+a dedicated service identity plus an external container/cgroup/sandbox policy
+that restricts executable mounts, process creation, network egress, credentials,
+and access to gateway/database secrets.
 
 ## 8. Activation Gates
 
-Production V2 traffic remains disabled until tests prove:
+Production V2 traffic remains disabled according to this gate matrix:
 
-- concurrent prepare, claim, resume, and attach preserve one identity;
-- stale worker and executor epochs cannot mutate canonical state;
-- restarting executord attaches rather than launches a second CLI invocation;
-- incomplete journal, process, spool, or PostgreSQL commit evidence fails closed;
-- terminal replay is idempotent and conflicting replay is rejected;
-- artifact integrity and economic settlement remain atomic and balanced;
-- provider credentials are isolated from prompts and client-controlled input;
-- the real Images API traverses gateway, PostgreSQL, workerd, executord, runner,
-  Codex CLI, artifact publication, reduction, and replay.
+| Gate | Status | Evidence or remaining requirement |
+| --- | --- | --- |
+| concurrent prepare/claim/resume/attach preserve one identity | passed | PostgreSQL concurrency and process restart tests |
+| stale worker/executor epochs cannot mutate canonical state | passed | database fencing and expiry tests |
+| restart attaches without a second provider launch | passed | real executord/helper test, invocation count equals one |
+| journal/spool/commit ambiguity fails closed and can replay | passed | hostile filesystem tests, late-evidence test, artifact retry test |
+| owner singleton and session loss fail closed | passed | advisory-lock and backend-termination tests |
+| artifact integrity and economic settlement remain balanced | passed | authority, manifest, rating, and ledger tests |
+| provider process identity and orphan cleanup | passed | nonce/inode binding and real helper-death cleanup test |
+| credential pool, adapter revision, and resource policy are database-bound | open | extend claim scope before V2 activation |
+| hostile multi-tenant CLI isolation | open | dedicated UID plus externally enforced sandbox/cgroup/mount/network policy |
+| public Images API traverses the complete V2 path | open | wire gateway to workerd/executord/reducer |
+| credentialed real Codex CLI image generation | open | run official-shape API smoke and verify durable artifact/replay |

@@ -27,6 +27,7 @@ const MAX_TEXT_BYTES: usize = 1024;
 
 pub struct FilesystemRunnerJournal {
     root: OwnedFd,
+    root_path: PathBuf,
 }
 
 struct ExecutionDirectory {
@@ -77,15 +78,15 @@ enum PublishResult {
 
 impl FilesystemRunnerJournal {
     pub fn new(root: impl AsRef<Path>) -> Result<Self, RunnerJournalError> {
-        let root = prepare_root(root.as_ref())?;
+        let root_path = prepare_root(root.as_ref())?;
         let root = rfs::open(
-            &root,
+            &root_path,
             OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             Mode::empty(),
         )
         .map_err(|_| RunnerJournalError::InvalidInput)?;
         validate_directory_fd(&root, RunnerJournalError::InvalidInput)?;
-        Ok(Self { root })
+        Ok(Self { root, root_path })
     }
 
     pub fn start_or_attach(
@@ -136,6 +137,23 @@ impl FilesystemRunnerJournal {
             PublishResult::Exists if self.read_terminal(&directory)? == terminal => Ok(()),
             PublishResult::Exists => Err(RunnerJournalError::Conflict),
         }
+    }
+
+    pub(crate) fn execution_path(
+        &self,
+        lease: &ExecutorSubmissionLease,
+    ) -> Result<PathBuf, RunnerJournalError> {
+        let directory = self.ensure_spec(lease)?;
+        validate_bound_path(&self.root_path, &self.root)?;
+        let path = self
+            .root_path
+            .join(lease.executor_execution_id.simple().to_string());
+        validate_bound_path(&path, &directory.fd)?;
+        Ok(path)
+    }
+
+    pub(crate) fn root_path(&self) -> &Path {
+        &self.root_path
     }
 
     fn ensure_spec(
@@ -409,6 +427,23 @@ fn validate_directory_fd(
     // SAFETY: geteuid has no preconditions and does not dereference pointers.
     if stat.st_uid != unsafe { libc::geteuid() } {
         return Err(invalid);
+    }
+    Ok(())
+}
+
+fn validate_bound_path(path: &Path, fd: &OwnedFd) -> Result<(), RunnerJournalError> {
+    let metadata = fs::symlink_metadata(path).map_err(|_| RunnerJournalError::Integrity)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(RunnerJournalError::Integrity);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        let stat = rfs::fstat(fd).map_err(|_| RunnerJournalError::Unavailable)?;
+        if metadata.dev() != stat.st_dev as u64 || metadata.ino() != stat.st_ino {
+            return Err(RunnerJournalError::Integrity);
+        }
     }
     Ok(())
 }

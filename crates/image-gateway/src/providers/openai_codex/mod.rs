@@ -276,7 +276,7 @@ async fn run_codex_once(
     Ok(GeneratedImage { bytes })
 }
 
-async fn read_codex_output(image_path: &Path) -> Result<Vec<u8>, ImageGatewayError> {
+pub(crate) async fn read_codex_output(image_path: &Path) -> Result<Vec<u8>, ImageGatewayError> {
     let path = image_path.to_path_buf();
     let (file, expected_len) = tokio::task::spawn_blocking(move || {
         let mut options = std::fs::OpenOptions::new();
@@ -405,7 +405,7 @@ fn non_empty_process_env(name: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-fn build_codex_prompt(job: &GenerationJob, request_dir: &Path, index: u32) -> String {
+pub(crate) fn build_codex_prompt(job: &GenerationJob, request_dir: &Path, index: u32) -> String {
     let size_instruction = match parse_size_constraint(&job.size).unwrap_or(SizeConstraint::Auto) {
         SizeConstraint::Auto => "尺寸 auto，由图像生成器选择合适画布。".to_string(),
         SizeConstraint::Dimensions { width, height } => {
@@ -541,7 +541,7 @@ fn select_image_output(root: &Path, output_format: &str) -> Option<PathBuf> {
     candidates.into_iter().next()
 }
 
-fn final_output_filename(output_format: &str) -> &'static str {
+pub(crate) fn final_output_filename(output_format: &str) -> &'static str {
     match output_format {
         "jpeg" => "final.jpg",
         "webp" => "final.webp",

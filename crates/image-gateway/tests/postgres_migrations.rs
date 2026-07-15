@@ -62,7 +62,7 @@ const REQUIRED_COLUMNS: [(&str, &str); 46] = [
     ("executor_resolution_decisions", "resolution_fingerprint"),
 ];
 
-const REQUIRED_INDEXES: [&str; 10] = [
+const REQUIRED_INDEXES: [&str; 11] = [
     "usage_events_tenant_created_at_ms_idx",
     "gateway_api_keys_project_id_idx",
     "quota_reservations_active_tenant_idx",
@@ -73,6 +73,7 @@ const REQUIRED_INDEXES: [&str; 10] = [
     "job_input_objects_session_idx",
     "admission_input_cleanup_pending_idx",
     "admission_input_cleanup_lease_idx",
+    "executor_executions_pending_evidence_idx",
 ];
 
 #[tokio::test]
@@ -826,8 +827,8 @@ async fn shared_pool_case(pool: &PgPool) -> TestResult {
 
 async fn assert_expected_schema(pool: &PgPool) -> TestResult {
     require(
-        migration_versions(pool).await? == vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
-        "applied migration versions must be exactly [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]",
+        migration_versions(pool).await? == vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+        "applied migration versions must be exactly [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]",
     )?;
 
     for (table, column) in REQUIRED_COLUMNS {

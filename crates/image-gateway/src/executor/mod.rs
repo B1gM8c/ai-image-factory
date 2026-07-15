@@ -4,13 +4,25 @@ use uuid::Uuid;
 
 use crate::admission::WorkLease;
 
+mod codex_request;
+mod codex_supervisor;
 mod daemon;
+mod owner_guard;
 mod postgres;
 mod runner;
 
+pub use codex_request::{
+    CodexOutputRequest, CodexRequestProjectionError, project_codex_output_request,
+};
+pub use codex_supervisor::{CodexProcessSupervisor, run_codex_runner_child};
 pub use daemon::{ExecutorDaemon, ExecutorDaemonError, ExecutorDaemonRun};
+pub use owner_guard::{ExecutorOwnerGuardError, PostgresExecutorOwnerGuard};
 pub use postgres::PostgresExecutorSubmissionStore;
-pub use runner::{DurableRunner, RunnerError, RunnerOutcome};
+pub use runner::{
+    DurableEvidenceRecovery, DurableRunner, DurableRunnerResult, ExecutorArtifactSink,
+    JournaledDurableRunner, RunnerError, RunnerLaunchAuthority, RunnerOutcome,
+    SingleOutputSupervisor,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PreparedExecutorSubmission {
@@ -314,6 +326,15 @@ pub trait ExecutorSubmissionStore: Send + Sync + 'static {
     }
 
     async fn reconcile_expired(&self, limit: u32) -> Result<u64, ExecutorSubmissionError>;
+}
+
+#[async_trait]
+pub trait ExecutorEvidenceStore: Send + Sync + 'static {
+    async fn load_pending_evidence(
+        &self,
+        scope: &ExecutorClaimScope,
+        owner: &str,
+    ) -> Result<Option<ExecutorSubmissionLease>, ExecutorSubmissionError>;
 }
 
 #[async_trait]

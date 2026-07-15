@@ -2,7 +2,7 @@
 
 > Status: proposed target architecture
 >
-> Reviewed: 2026-07-11
+> Reviewed: 2026-07-15
 >
 > Scope: OpenAI/Codex, Volcengine Ark/BytePlus, Volcengine CV/JiMeng, xAI/Grok,
 > durable scheduling, CLI-to-API execution, artifacts, identity, quota, metering,
@@ -12,7 +12,7 @@
 > `2026-platform-upgrade.md` and `2026-scheduler-quota-design.md`. Those files
 > remain useful as implementation history.
 
-> Implementation checkpoint (2026-07-11): durable admission, PostgreSQL weighted
+> Implementation checkpoint (2026-07-15): durable admission, PostgreSQL weighted
 > scheduling metadata, fenced atomic success settlement, versioned HMAC API keys,
 > filesystem artifact persistence, immutable response projections, and generation/edit
 > idempotency replay are implemented. Gateway and `workerd` are separate
@@ -20,7 +20,7 @@
 > pre-attach quota reservations, and lease-based edit-input cleanup. The filesystem backend is an interim
 > single-host/shared-POSIX-volume deployment profile; S3-compatible storage,
 > persistent executor supervision, and ambiguous provider-outcome reconciliation
-> remain target work. OpenAI image generation and edits now both use versioned
+> were the next target work. OpenAI image generation and edits both use versioned
 > durable commands and external `workerd` execution. Edit bytes are stored through
 > a provider-neutral `InputBlobStore`; PostgreSQL atomically binds quota,
 > admission, ordered input manifests, payloads, and work items. Workers verify
@@ -37,15 +37,22 @@
 > dependencies belong only to `workerd`. Codex outputs are bounded and always
 > decoded/re-encoded to remove untrusted metadata. The remaining shared-credential
 > risk of an agentic CLI is explicitly not considered hostile multi-tenant
-> isolation and still requires the target executor/account-pool boundary.
+> isolation. Phase 1F now provides an independent `executord`, output-scoped
+> Codex adapter, persistent start-or-attach journal, private process spool,
+> immutable artifact authority, owner-session guard, and append-only late
+> evidence recovery. Real PostgreSQL process tests prove one launch across
+> restart, graceful drain, and lease-expired evidence import. V2 remains disabled
+> pending database-bound account/resource scope, an external dedicated-UID
+> sandbox/cgroup boundary, public API composition, and a credentialed real Codex
+> CLI image smoke.
 
 ## 1. Executive Decision
 
 AI Image Factory should be a **modular Rust monolith with separately deployable
-gateway, scheduler, worker, and reconciler processes**. PostgreSQL is the first
+gateway, scheduler, worker, executor, and reconciler processes**. PostgreSQL is the first
 authoritative control-plane store and durable work queue. S3-compatible object
 storage is the authoritative media store. Provider APIs and agentic CLIs run in
-workers, never in HTTP handlers.
+provider workers or isolated executors, never in HTTP handlers.
 
 The most important architectural separation is not “API versus provider”. It is
 the following four independent dimensions:
@@ -208,8 +215,11 @@ flowchart LR
     W["workerd pools"] --> P
     W --> O
     W --> B["Provider account broker"]
-    B --> E["Managed API or isolated CLI executor"]
-    E --> U["OpenAI, Volcengine, BytePlus, xAI"]
+    E["executord sandbox pools"] --> P
+    E --> O
+    E --> B
+    B --> U["Managed APIs or provider CLIs"]
+    U --> V["OpenAI, Volcengine, BytePlus, xAI"]
     R["reconcilerd"] --> P
     R --> O
     P --> X["Transactional outbox"]
@@ -225,9 +235,12 @@ flowchart LR
   scheduling metadata. It does not pre-assign a live account lease to an idle
   worker.
 - `workerd`: invoke the one atomic claim protocol that selects eligible work and
-  acquires capacity/provider-account leases, then execute
-  submit/poll/cancel/materialize, validate artifacts, and request atomic
-  settlement.
+  acquires capacity/provider-account leases, prepare immutable provider
+  submissions, and request atomic settlement. It does not spawn agentic CLIs on
+  the V2 path.
+- `executord`: own one database-bound provider/account/resource scope, hold the
+  OS sandbox and credential lease, and execute output-scoped start-or-attach
+  operations through a durable private spool.
 - `reconcilerd`: expired leases, ambiguous submissions, provider polling,
   orphan artifacts, stale reservations, outbox delivery, and economic
   reconciliation.
