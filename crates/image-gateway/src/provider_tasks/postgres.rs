@@ -9,16 +9,18 @@ use crate::executor::{
 };
 
 use super::{
-    ProviderArtifactAuthority, ProviderRemoteTask, ProviderSubmitFailureKind, ProviderSubmitIntent,
-    ProviderSubmitIntentState, ProviderSubmitStart, ProviderTaskClaimScope, ProviderTaskLease,
-    ProviderTaskObservation, ProviderTaskObservationOutcome, ProviderTaskObservationSource,
-    ProviderTaskState, ProviderTaskStore, ProviderTaskStoreError, RemoteTaskAttach,
-    RemoteTaskSubmitFailure, RemoteTaskSubmitReceipt, RemoteTaskSubmitReservation,
-    VerifiedCallbackWakeup,
+    ProviderArtifactAuthority, ProviderExecutionContext, ProviderRemoteTask,
+    ProviderSubmitFailureKind, ProviderSubmitIntent, ProviderSubmitIntentState,
+    ProviderSubmitInvocation, ProviderSubmitRecoveryLease, ProviderSubmitStart,
+    ProviderTaskClaimScope, ProviderTaskLease, ProviderTaskObservation,
+    ProviderTaskObservationOutcome, ProviderTaskObservationSource, ProviderTaskState,
+    ProviderTaskStore, ProviderTaskStoreError, RemoteTaskAttach, RemoteTaskSubmitFailure,
+    RemoteTaskSubmitReceipt, RemoteTaskSubmitReservation, VerifiedCallbackWakeup,
 };
 
 const MAX_POLL_AFTER_MS: i64 = 24 * 60 * 60 * 1_000;
 const MAX_LEASE_MS: i64 = 24 * 60 * 60 * 1_000;
+const MAX_PROVIDER_TIMEOUT_MS: i64 = 30 * 24 * 60 * 60 * 1_000;
 
 #[derive(Clone)]
 pub struct PostgresProviderTaskStore {
@@ -46,6 +48,8 @@ struct TaskRow {
     cancel_requested: bool,
     poll_lease_epoch: i64,
     state_observation_id: Uuid,
+    attach_recovery_owner: Option<String>,
+    attach_recovery_lease_epoch: Option<i64>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -63,8 +67,80 @@ struct ClaimRow {
     cancel_requested: bool,
     poll_lease_epoch: i64,
     state_observation_id: Uuid,
+    attach_recovery_owner: Option<String>,
+    attach_recovery_lease_epoch: Option<i64>,
     poll_owner: String,
     poll_lease_expires_at_ms: i64,
+    model: String,
+    command_schema: String,
+    command_hash: String,
+    execution_profile_id: Uuid,
+    adapter_revision: String,
+    credential_pool_id: Uuid,
+    credential_ref: String,
+    credential_revision: i64,
+    credential_auth_sha256: String,
+    resource_policy_id: Uuid,
+    resource_policy_revision: i64,
+    idempotency_key: String,
+    invocation_attempt: i32,
+    provider_timeout_ms: i64,
+    provider_deadline_at_ms: i64,
+}
+
+#[derive(sqlx::FromRow)]
+struct ProviderContextRow {
+    model: String,
+    command_schema: String,
+    command_hash: String,
+    execution_profile_id: Uuid,
+    adapter_revision: String,
+    credential_pool_id: Uuid,
+    credential_ref: String,
+    credential_revision: i64,
+    credential_auth_sha256: String,
+    resource_policy_id: Uuid,
+    resource_policy_revision: i64,
+    idempotency_key: String,
+    invocation_attempt: i32,
+    provider_timeout_ms: i64,
+    provider_deadline_at_ms: i64,
+}
+
+#[derive(sqlx::FromRow)]
+struct RecoveryClaimRow {
+    submission_id: Uuid,
+    executor_execution_id: Uuid,
+    provider_id: String,
+    provider_account_id: Uuid,
+    submit_owner: String,
+    submit_lease_epoch: i64,
+    idempotency_key: String,
+    state: String,
+    remote_operation_id: Option<String>,
+    provider_request_id: Option<String>,
+    send_started_at_ms: Option<i64>,
+    receipt_event_identity: Option<String>,
+    failure_event_identity: Option<String>,
+    failure_error_code: Option<String>,
+    updated_at_ms: i64,
+    recovery_owner: String,
+    recovery_lease_epoch: i64,
+    recovery_lease_expires_at_ms: i64,
+    model: String,
+    command_schema: String,
+    command_hash: String,
+    execution_profile_id: Uuid,
+    adapter_revision: String,
+    credential_pool_id: Uuid,
+    credential_ref: String,
+    credential_revision: i64,
+    credential_auth_sha256: String,
+    resource_policy_id: Uuid,
+    resource_policy_revision: i64,
+    invocation_attempt: i32,
+    provider_timeout_ms: i64,
+    provider_deadline_at_ms: i64,
 }
 
 #[derive(sqlx::FromRow)]
@@ -117,9 +193,19 @@ struct SubmitParentRow {
     submission_state: String,
     executor_owner: Option<String>,
     lease_epoch: i64,
+    lease_expires_at_ms: Option<i64>,
     launch_owner: Option<String>,
     launch_lease_epoch: Option<i64>,
     allocation_state: String,
+}
+
+#[derive(sqlx::FromRow)]
+struct SubmitRecoveryRow {
+    state: String,
+    recovery_owner: Option<String>,
+    recovery_lease_epoch: i64,
+    recovery_lease_expires_at_ms: Option<i64>,
+    provider_deadline_at_ms: i64,
 }
 
 #[async_trait]
@@ -236,8 +322,17 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
         }
         let intent = submit_intent_from_row(row)?;
         if intent.state != ProviderSubmitIntentState::Reserved {
+            let context = load_provider_context_in(&mut tx, request.submission_id)
+                .await?
+                .ok_or(ProviderTaskStoreError::Conflict)?;
+            if context.provider_timeout_ms != request.provider_timeout_ms {
+                return Err(ProviderTaskStoreError::Conflict);
+            }
             tx.commit().await.map_err(unavailable)?;
-            return Ok(ProviderSubmitStart::Existing(intent));
+            return Ok(ProviderSubmitStart::Existing(ProviderSubmitInvocation {
+                intent,
+                context: provider_context_from_row(context),
+            }));
         }
         let now = database_now(&mut tx).await?;
         require_one(
@@ -257,13 +352,48 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
             .map_err(storage_conflict)?,
             ProviderTaskStoreError::Conflict,
         )?;
+        sqlx::query(
+            r#"
+            INSERT INTO provider_submit_recoveries
+              (submission_id, executor_execution_id, provider_id, provider_account_id,
+               invocation_attempt, provider_timeout_ms, provider_deadline_at_ms,
+               next_recovery_at_ms, state, created_at_ms, updated_at_ms)
+            SELECT intent.submission_id, intent.executor_execution_id,
+                   intent.provider_id, intent.provider_account_id,
+                   1, $3, $4 + $3,
+                   LEAST(execution.lease_expires_at_ms, $4 + $3),
+                   'active', $4, $4
+            FROM provider_remote_submit_intents intent
+            JOIN executor_executions execution
+              ON execution.executor_execution_id = intent.executor_execution_id
+             AND execution.submission_id = intent.submission_id
+            WHERE intent.submission_id = $1
+              AND intent.executor_execution_id = $2
+              AND intent.state = 'sending'
+            "#,
+        )
+        .bind(request.submission_id)
+        .bind(request.executor_execution_id)
+        .bind(request.provider_timeout_ms)
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .map_err(storage_conflict)?;
         let intent = submit_intent_from_row(
             load_submit_intent_in(&mut tx, request.submission_id)
                 .await?
                 .ok_or(ProviderTaskStoreError::NotFound)?,
         )?;
+        let context = provider_context_from_row(
+            load_provider_context_in(&mut tx, request.submission_id)
+                .await?
+                .ok_or(ProviderTaskStoreError::Conflict)?,
+        );
         tx.commit().await.map_err(unavailable)?;
-        Ok(ProviderSubmitStart::Acquired(intent))
+        Ok(ProviderSubmitStart::Acquired(ProviderSubmitInvocation {
+            intent,
+            context,
+        }))
     }
 
     async fn record_submit_failure(
@@ -317,6 +447,16 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
             return Err(ProviderTaskStoreError::Conflict);
         }
         let now = database_now(&mut tx).await?;
+        if request.kind == ProviderSubmitFailureKind::Rejected {
+            close_submit_recovery(
+                &mut tx,
+                request.submission_id,
+                request.executor_execution_id,
+                now,
+                request.recovery_fence.as_ref(),
+            )
+            .await?;
+        }
         require_one(
             sqlx::query(
                 r#"
@@ -434,6 +574,187 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
             .transpose()
     }
 
+    async fn claim_submit_recovery(
+        &self,
+        scope: &ProviderTaskClaimScope,
+        owner: &str,
+        lease_ms: i64,
+    ) -> Result<Option<ProviderSubmitRecoveryLease>, ProviderTaskStoreError> {
+        validate_scope(scope)?;
+        validate_owner_and_lease(owner, lease_ms)?;
+        let row: Option<RecoveryClaimRow> = sqlx::query_as(
+            r#"
+            WITH candidate AS (
+              SELECT recovery.submission_id,
+                     floor(extract(epoch FROM statement_timestamp()) * 1000)::BIGINT AS now_ms
+              FROM provider_submit_recoveries recovery
+              JOIN executor_capacity_allocations allocation
+                ON allocation.executor_execution_id = recovery.executor_execution_id
+               AND allocation.submission_id = recovery.submission_id
+               AND allocation.state = 'held'
+              JOIN executor_executions execution
+                ON execution.executor_execution_id = recovery.executor_execution_id
+               AND execution.submission_id = recovery.submission_id
+               AND execution.state = 'running'
+              WHERE recovery.provider_id = $1
+                AND recovery.provider_account_id = $2
+                AND recovery.state = 'active'
+                AND GREATEST(
+                      recovery.next_recovery_at_ms,
+                      COALESCE(
+                        recovery.recovery_lease_expires_at_ms,
+                        recovery.next_recovery_at_ms
+                      )
+                    ) <= floor(
+                      extract(epoch FROM statement_timestamp()) * 1000
+                    )::BIGINT
+              ORDER BY
+                GREATEST(
+                  recovery.next_recovery_at_ms,
+                  COALESCE(
+                    recovery.recovery_lease_expires_at_ms,
+                    recovery.next_recovery_at_ms
+                  )
+                ),
+                recovery.provider_deadline_at_ms,
+                recovery.submission_id
+              FOR UPDATE OF recovery SKIP LOCKED
+              LIMIT 1
+            ), claimed AS (
+              UPDATE provider_submit_recoveries recovery
+              SET recovery_owner = $3,
+                  recovery_lease_epoch = recovery.recovery_lease_epoch + 1,
+                  recovery_lease_expires_at_ms = candidate.now_ms + $4,
+                  recovery_claimed_at_ms = candidate.now_ms,
+                  updated_at_ms = candidate.now_ms
+              FROM candidate
+              WHERE recovery.submission_id = candidate.submission_id
+              RETURNING recovery.*
+            )
+            SELECT intent.submission_id, intent.executor_execution_id,
+                   intent.provider_id, intent.provider_account_id,
+                   intent.submit_owner, intent.submit_lease_epoch,
+                   intent.idempotency_key, intent.state,
+                   intent.remote_operation_id, intent.provider_request_id,
+                   intent.send_started_at_ms, intent.receipt_event_identity,
+                   intent.failure_event_identity, intent.failure_error_code,
+                   intent.updated_at_ms, claimed.recovery_owner,
+                   claimed.recovery_lease_epoch,
+                   claimed.recovery_lease_expires_at_ms,
+                   submission.model, submission.command_schema,
+                   submission.command_hash, submission.execution_profile_id,
+                   submission.adapter_revision, submission.credential_pool_id,
+                   submission.credential_ref, submission.credential_revision,
+                   account.credential_auth_sha256,
+                   submission.resource_policy_id,
+                   submission.resource_policy_revision,
+                   claimed.invocation_attempt, claimed.provider_timeout_ms,
+                   claimed.provider_deadline_at_ms
+            FROM claimed
+            JOIN provider_remote_submit_intents intent
+              ON intent.submission_id = claimed.submission_id
+             AND intent.executor_execution_id = claimed.executor_execution_id
+            JOIN provider_submissions submission
+              ON submission.submission_id = claimed.submission_id
+             AND submission.executor_execution_id = claimed.executor_execution_id
+            JOIN provider_accounts account
+              ON account.provider_account_id = submission.provider_account_id
+             AND account.credential_pool_id = submission.credential_pool_id
+             AND account.provider_id = submission.provider_id
+             AND account.credential_ref = submission.credential_ref
+             AND account.credential_revision = submission.credential_revision
+            "#,
+        )
+        .bind(&scope.provider_id)
+        .bind(scope.provider_account_id)
+        .bind(owner)
+        .bind(lease_ms)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(unavailable)?;
+        row.map(recovery_lease_from_row).transpose()
+    }
+
+    async fn heartbeat_submit_recovery(
+        &self,
+        lease: &ProviderSubmitRecoveryLease,
+        lease_ms: i64,
+    ) -> Result<ProviderSubmitRecoveryLease, ProviderTaskStoreError> {
+        validate_recovery_lease(lease, lease_ms)?;
+        let expires: Option<i64> = sqlx::query_scalar(
+            r#"
+            UPDATE provider_submit_recoveries
+            SET recovery_lease_expires_at_ms = GREATEST(
+                  recovery_lease_expires_at_ms + 1,
+                  floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT + $5
+                ),
+                updated_at_ms =
+                  floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT
+            WHERE submission_id = $1 AND executor_execution_id = $2
+              AND recovery_owner = $3 AND recovery_lease_epoch = $4
+              AND state = 'active'
+              AND recovery_lease_expires_at_ms >
+                  floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT
+            RETURNING recovery_lease_expires_at_ms
+            "#,
+        )
+        .bind(lease.intent.submission_id)
+        .bind(lease.intent.executor_execution_id)
+        .bind(&lease.recovery_owner)
+        .bind(lease.recovery_lease_epoch)
+        .bind(lease_ms)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(unavailable)?;
+        Ok(ProviderSubmitRecoveryLease {
+            recovery_lease_expires_at_ms: expires.ok_or(ProviderTaskStoreError::StaleLease)?,
+            ..lease.clone()
+        })
+    }
+
+    async fn defer_submit_recovery(
+        &self,
+        lease: &ProviderSubmitRecoveryLease,
+        retry_after_ms: i64,
+    ) -> Result<(), ProviderTaskStoreError> {
+        validate_recovery_lease(lease, 1)?;
+        if !(1..=MAX_POLL_AFTER_MS).contains(&retry_after_ms) {
+            return Err(ProviderTaskStoreError::InvalidInput);
+        }
+        require_one(
+            sqlx::query(
+                r#"
+                UPDATE provider_submit_recoveries
+                SET recovery_owner = NULL,
+                    recovery_lease_expires_at_ms = NULL,
+                    recovery_claimed_at_ms = NULL,
+                    next_recovery_at_ms = LEAST(
+                      provider_deadline_at_ms,
+                      floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT + $5
+                    ),
+                    updated_at_ms =
+                      floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT
+                WHERE submission_id = $1 AND executor_execution_id = $2
+                  AND recovery_owner = $3 AND recovery_lease_epoch = $4
+                  AND state = 'active'
+                  AND recovery_lease_expires_at_ms >
+                      floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT
+                  AND provider_deadline_at_ms >
+                      floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT
+                "#,
+            )
+            .bind(lease.intent.submission_id)
+            .bind(lease.intent.executor_execution_id)
+            .bind(&lease.recovery_owner)
+            .bind(lease.recovery_lease_epoch)
+            .bind(retry_after_ms)
+            .execute(&self.pool)
+            .await
+            .map_err(unavailable)?,
+            ProviderTaskStoreError::StaleLease,
+        )
+    }
+
     async fn attach(
         &self,
         request: &RemoteTaskAttach,
@@ -461,6 +782,19 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
             return Err(ProviderTaskStoreError::Conflict);
         }
         if let Some(existing) = load_task_in(&mut tx, request.submission_id).await? {
+            let requested_recovery_owner = request
+                .recovery_fence
+                .as_ref()
+                .map(|fence| fence.recovery_owner.as_str());
+            let requested_recovery_epoch = request
+                .recovery_fence
+                .as_ref()
+                .map(|fence| fence.recovery_lease_epoch);
+            if existing.attach_recovery_owner.as_deref() != requested_recovery_owner
+                || existing.attach_recovery_lease_epoch != requested_recovery_epoch
+            {
+                return Err(ProviderTaskStoreError::StaleLease);
+            }
             let task = task_from_row(existing)?;
             if task.executor_execution_id == request.executor_execution_id
                 && task.remote_operation_id == request.remote_operation_id
@@ -475,8 +809,30 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
             return Err(ProviderTaskStoreError::Conflict);
         }
         let now = database_now(&mut tx).await?;
+        let recovery = load_submit_recovery_in(&mut tx, request.submission_id)
+            .await?
+            .ok_or(ProviderTaskStoreError::Conflict)?;
         if !submit_parent_accepts_evidence(&parent, &intent) {
             return Err(ProviderTaskStoreError::Conflict);
+        }
+        let has_attach_authority = match &request.recovery_fence {
+            None => {
+                parent
+                    .lease_expires_at_ms
+                    .is_some_and(|expiry| expiry > now)
+                    && recovery.provider_deadline_at_ms > now
+                    && recovery.recovery_owner.is_none()
+            }
+            Some(fence) => {
+                recovery.recovery_owner.as_deref() == Some(&fence.recovery_owner)
+                    && recovery.recovery_lease_epoch == fence.recovery_lease_epoch
+                    && recovery
+                        .recovery_lease_expires_at_ms
+                        .is_some_and(|expiry| expiry > now)
+            }
+        };
+        if recovery.state != "active" || !has_attach_authority {
+            return Err(ProviderTaskStoreError::StaleLease);
         }
         let next_poll_at_ms = now + request.poll_after_ms;
         let observation_id = Uuid::new_v4();
@@ -512,10 +868,11 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
             INSERT INTO provider_remote_tasks
               (submission_id, executor_execution_id, provider_id, provider_account_id,
                remote_operation_id, provider_request_id, submit_owner, submit_lease_epoch,
+               attach_recovery_owner, attach_recovery_lease_epoch,
                state, effect_certainty, next_poll_at_ms, state_observation_id,
                created_at_ms, updated_at_ms)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8,
-                    'provider_waiting', 'not_applicable', $9, $10, $11, $11)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+                    'provider_waiting', 'not_applicable', $11, $12, $13, $13)
             "#,
         )
         .bind(request.submission_id)
@@ -526,6 +883,18 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
         .bind(&request.provider_request_id)
         .bind(&request.executor_owner)
         .bind(request.executor_lease_epoch)
+        .bind(
+            request
+                .recovery_fence
+                .as_ref()
+                .map(|fence| fence.recovery_owner.as_str()),
+        )
+        .bind(
+            request
+                .recovery_fence
+                .as_ref()
+                .map(|fence| fence.recovery_lease_epoch),
+        )
         .bind(next_poll_at_ms)
         .bind(observation_id)
         .bind(now)
@@ -550,6 +919,42 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
             now,
         )
         .await?;
+        require_one(
+            sqlx::query(
+                r#"
+                UPDATE provider_submit_recoveries
+                SET state = 'closed', next_recovery_at_ms = NULL,
+                    recovery_owner = NULL, recovery_lease_expires_at_ms = NULL,
+                    recovery_claimed_at_ms = NULL,
+                    updated_at_ms = $5, closed_at_ms = $5
+                WHERE submission_id = $1 AND executor_execution_id = $2
+                  AND state = 'active'
+                  AND (
+                    ($3::TEXT IS NULL AND recovery_owner IS NULL)
+                    OR (recovery_owner = $3 AND recovery_lease_epoch = $4)
+                  )
+                "#,
+            )
+            .bind(request.submission_id)
+            .bind(request.executor_execution_id)
+            .bind(
+                request
+                    .recovery_fence
+                    .as_ref()
+                    .map(|fence| fence.recovery_owner.as_str()),
+            )
+            .bind(
+                request
+                    .recovery_fence
+                    .as_ref()
+                    .map(|fence| fence.recovery_lease_epoch),
+            )
+            .bind(now)
+            .execute(&mut *tx)
+            .await
+            .map_err(storage_conflict)?,
+            ProviderTaskStoreError::StaleLease,
+        )?;
         require_one(
             sqlx::query(
                 r#"
@@ -616,21 +1021,27 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
         validate_owner_and_lease(owner, lease_ms)?;
         let row: Option<ClaimRow> = sqlx::query_as(
             r#"
-            WITH db_clock AS (
-              SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT AS now_ms
-            ), candidate AS (
-              SELECT task.submission_id, clock.now_ms
+            WITH candidate AS (
+              SELECT task.submission_id,
+                     floor(extract(epoch FROM statement_timestamp()) * 1000)::BIGINT AS now_ms
               FROM provider_remote_tasks task
-              CROSS JOIN db_clock clock
               JOIN executor_capacity_allocations allocation
                 ON allocation.executor_execution_id = task.executor_execution_id
                AND allocation.submission_id = task.submission_id
-               AND allocation.state = 'held'
+                AND allocation.state = 'held'
               WHERE task.provider_id = $1 AND task.provider_account_id = $2
                 AND task.state = 'provider_waiting'
-                AND task.next_poll_at_ms <= clock.now_ms
-                AND (task.poll_owner IS NULL OR task.poll_lease_expires_at_ms <= clock.now_ms)
-              ORDER BY task.next_poll_at_ms, task.submission_id
+                AND GREATEST(
+                      task.next_poll_at_ms,
+                      COALESCE(task.poll_lease_expires_at_ms, task.next_poll_at_ms)
+                    ) <= floor(
+                      extract(epoch FROM statement_timestamp()) * 1000
+                    )::BIGINT
+              ORDER BY GREATEST(
+                         task.next_poll_at_ms,
+                         COALESCE(task.poll_lease_expires_at_ms, task.next_poll_at_ms)
+                       ),
+                       task.submission_id
               FOR UPDATE OF task SKIP LOCKED
               LIMIT 1
             ), claimed AS (
@@ -642,11 +1053,42 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
               WHERE task.submission_id = candidate.submission_id
               RETURNING task.*
             )
-            SELECT submission_id, executor_execution_id, provider_id, provider_account_id,
-                   remote_operation_id, provider_request_id, state, artifact_ref, error_code,
-                   next_poll_at_ms, cancel_requested, poll_lease_epoch,
-                   state_observation_id, poll_owner, poll_lease_expires_at_ms
+            SELECT claimed.submission_id, claimed.executor_execution_id,
+                   claimed.provider_id, claimed.provider_account_id,
+                   claimed.remote_operation_id, claimed.provider_request_id,
+                   claimed.state, claimed.artifact_ref, claimed.error_code,
+                   claimed.next_poll_at_ms, claimed.cancel_requested,
+                   claimed.poll_lease_epoch, claimed.state_observation_id,
+                   claimed.attach_recovery_owner,
+                   claimed.attach_recovery_lease_epoch,
+                   claimed.poll_owner, claimed.poll_lease_expires_at_ms,
+                   submission.model, submission.command_schema,
+                   submission.command_hash, submission.execution_profile_id,
+                   submission.adapter_revision, submission.credential_pool_id,
+                   submission.credential_ref, submission.credential_revision,
+                   account.credential_auth_sha256,
+                   submission.resource_policy_id,
+                   submission.resource_policy_revision,
+                   intent.idempotency_key, recovery.invocation_attempt,
+                   recovery.provider_timeout_ms, recovery.provider_deadline_at_ms
             FROM claimed
+            JOIN provider_submissions submission
+              ON submission.submission_id = claimed.submission_id
+             AND submission.executor_execution_id = claimed.executor_execution_id
+            JOIN provider_remote_submit_intents intent
+              ON intent.submission_id = claimed.submission_id
+             AND intent.executor_execution_id = claimed.executor_execution_id
+             AND intent.state = 'attached'
+            JOIN provider_submit_recoveries recovery
+              ON recovery.submission_id = claimed.submission_id
+             AND recovery.executor_execution_id = claimed.executor_execution_id
+             AND recovery.state = 'closed'
+            JOIN provider_accounts account
+              ON account.provider_account_id = submission.provider_account_id
+             AND account.credential_pool_id = submission.credential_pool_id
+             AND account.provider_id = submission.provider_id
+             AND account.credential_ref = submission.credential_ref
+             AND account.credential_revision = submission.credential_revision
             "#,
         )
         .bind(&scope.provider_id)
@@ -669,7 +1111,7 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
             r#"
             UPDATE provider_remote_tasks
             SET poll_lease_expires_at_ms = GREATEST(
-                  poll_lease_expires_at_ms,
+                  poll_lease_expires_at_ms + 1,
                   floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT + $5
                 ),
                 updated_at_ms = floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT
@@ -718,7 +1160,8 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
             RETURNING submission_id, executor_execution_id, provider_id,
                       provider_account_id, remote_operation_id, provider_request_id,
                       state, artifact_ref, error_code, next_poll_at_ms,
-                      cancel_requested, poll_lease_epoch, state_observation_id
+                      cancel_requested, poll_lease_epoch, state_observation_id,
+                      attach_recovery_owner, attach_recovery_lease_epoch
             "#,
         )
         .bind(submission_id)
@@ -1512,7 +1955,8 @@ async fn load_task(
         r#"
         SELECT submission_id, executor_execution_id, provider_id, provider_account_id,
                remote_operation_id, provider_request_id, state, artifact_ref, error_code,
-               next_poll_at_ms, cancel_requested, poll_lease_epoch, state_observation_id
+               next_poll_at_ms, cancel_requested, poll_lease_epoch, state_observation_id,
+               attach_recovery_owner, attach_recovery_lease_epoch
         FROM provider_remote_tasks
         WHERE submission_id = $1
         "#,
@@ -1577,6 +2021,7 @@ async fn lock_submit_parent(
                execution.state AS execution_state,
                submission.state AS submission_state,
                execution.executor_owner, execution.lease_epoch,
+               execution.lease_expires_at_ms,
                execution.launch_owner, execution.launch_lease_epoch,
                allocation.state AS allocation_state
         FROM executor_executions execution
@@ -1597,6 +2042,102 @@ async fn lock_submit_parent(
     .await
     .map_err(unavailable)?
     .ok_or(ProviderTaskStoreError::NotFound)
+}
+
+async fn load_provider_context_in(
+    tx: &mut Transaction<'_, Postgres>,
+    submission_id: Uuid,
+) -> Result<Option<ProviderContextRow>, ProviderTaskStoreError> {
+    sqlx::query_as(
+        r#"
+        SELECT submission.model, submission.command_schema,
+               submission.command_hash, submission.execution_profile_id,
+               submission.adapter_revision, submission.credential_pool_id,
+               submission.credential_ref, submission.credential_revision,
+               account.credential_auth_sha256,
+               submission.resource_policy_id, submission.resource_policy_revision,
+               intent.idempotency_key, recovery.invocation_attempt,
+               recovery.provider_timeout_ms, recovery.provider_deadline_at_ms
+        FROM provider_submit_recoveries recovery
+        JOIN provider_remote_submit_intents intent
+          ON intent.submission_id = recovery.submission_id
+         AND intent.executor_execution_id = recovery.executor_execution_id
+        JOIN provider_submissions submission
+          ON submission.submission_id = recovery.submission_id
+         AND submission.executor_execution_id = recovery.executor_execution_id
+        JOIN provider_accounts account
+          ON account.provider_account_id = submission.provider_account_id
+         AND account.credential_pool_id = submission.credential_pool_id
+         AND account.provider_id = submission.provider_id
+         AND account.credential_ref = submission.credential_ref
+         AND account.credential_revision = submission.credential_revision
+        WHERE recovery.submission_id = $1
+        FOR UPDATE OF recovery
+        "#,
+    )
+    .bind(submission_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(unavailable)
+}
+
+async fn load_submit_recovery_in(
+    tx: &mut Transaction<'_, Postgres>,
+    submission_id: Uuid,
+) -> Result<Option<SubmitRecoveryRow>, ProviderTaskStoreError> {
+    sqlx::query_as(
+        r#"
+        SELECT state, recovery_owner, recovery_lease_epoch,
+               recovery_lease_expires_at_ms, provider_deadline_at_ms
+        FROM provider_submit_recoveries
+        WHERE submission_id = $1
+        FOR UPDATE
+        "#,
+    )
+    .bind(submission_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(unavailable)
+}
+
+async fn close_submit_recovery(
+    tx: &mut Transaction<'_, Postgres>,
+    submission_id: Uuid,
+    executor_execution_id: Uuid,
+    now: i64,
+    recovery_fence: Option<&super::ProviderSubmitRecoveryFence>,
+) -> Result<(), ProviderTaskStoreError> {
+    require_one(
+        sqlx::query(
+            r#"
+            UPDATE provider_submit_recoveries
+            SET state = 'closed', next_recovery_at_ms = NULL,
+                recovery_owner = NULL, recovery_lease_expires_at_ms = NULL,
+                recovery_claimed_at_ms = NULL,
+                updated_at_ms = $3, closed_at_ms = $3
+            WHERE submission_id = $1 AND executor_execution_id = $2
+              AND state = 'active'
+              AND (
+                ($4::TEXT IS NULL AND (
+                  recovery_owner IS NULL OR recovery_lease_expires_at_ms <= $3
+                ))
+                OR (
+                  recovery_owner = $4 AND recovery_lease_epoch = $5
+                  AND recovery_lease_expires_at_ms > $3
+                )
+              )
+            "#,
+        )
+        .bind(submission_id)
+        .bind(executor_execution_id)
+        .bind(now)
+        .bind(recovery_fence.map(|fence| fence.recovery_owner.as_str()))
+        .bind(recovery_fence.map(|fence| fence.recovery_lease_epoch))
+        .execute(&mut **tx)
+        .await
+        .map_err(storage_conflict)?,
+        ProviderTaskStoreError::StaleLease,
+    )
 }
 
 fn submit_parent_accepts_evidence(parent: &SubmitParentRow, intent: &SubmitIntentRow) -> bool {
@@ -1685,6 +2226,71 @@ fn submit_intent_from_row(
     })
 }
 
+fn provider_context_from_row(row: ProviderContextRow) -> ProviderExecutionContext {
+    ProviderExecutionContext {
+        model: row.model,
+        command_schema: row.command_schema,
+        command_hash: row.command_hash,
+        execution_profile_id: row.execution_profile_id,
+        adapter_revision: row.adapter_revision,
+        credential_pool_id: row.credential_pool_id,
+        credential_ref: row.credential_ref,
+        credential_revision: row.credential_revision,
+        credential_auth_sha256: row.credential_auth_sha256,
+        resource_policy_id: row.resource_policy_id,
+        resource_policy_revision: row.resource_policy_revision,
+        idempotency_key: row.idempotency_key,
+        invocation_attempt: row.invocation_attempt,
+        provider_timeout_ms: row.provider_timeout_ms,
+        provider_deadline_at_ms: row.provider_deadline_at_ms,
+    }
+}
+
+fn recovery_lease_from_row(
+    row: RecoveryClaimRow,
+) -> Result<ProviderSubmitRecoveryLease, ProviderTaskStoreError> {
+    let intent = submit_intent_from_row(SubmitIntentRow {
+        submission_id: row.submission_id,
+        executor_execution_id: row.executor_execution_id,
+        provider_id: row.provider_id,
+        provider_account_id: row.provider_account_id,
+        submit_owner: row.submit_owner,
+        submit_lease_epoch: row.submit_lease_epoch,
+        idempotency_key: row.idempotency_key.clone(),
+        state: row.state,
+        remote_operation_id: row.remote_operation_id,
+        provider_request_id: row.provider_request_id,
+        send_started_at_ms: row.send_started_at_ms,
+        receipt_event_identity: row.receipt_event_identity,
+        failure_event_identity: row.failure_event_identity,
+        failure_error_code: row.failure_error_code,
+        updated_at_ms: row.updated_at_ms,
+    })?;
+    Ok(ProviderSubmitRecoveryLease {
+        intent,
+        context: ProviderExecutionContext {
+            model: row.model,
+            command_schema: row.command_schema,
+            command_hash: row.command_hash,
+            execution_profile_id: row.execution_profile_id,
+            adapter_revision: row.adapter_revision,
+            credential_pool_id: row.credential_pool_id,
+            credential_ref: row.credential_ref,
+            credential_revision: row.credential_revision,
+            credential_auth_sha256: row.credential_auth_sha256,
+            resource_policy_id: row.resource_policy_id,
+            resource_policy_revision: row.resource_policy_revision,
+            idempotency_key: row.idempotency_key,
+            invocation_attempt: row.invocation_attempt,
+            provider_timeout_ms: row.provider_timeout_ms,
+            provider_deadline_at_ms: row.provider_deadline_at_ms,
+        },
+        recovery_owner: row.recovery_owner,
+        recovery_lease_epoch: row.recovery_lease_epoch,
+        recovery_lease_expires_at_ms: row.recovery_lease_expires_at_ms,
+    })
+}
+
 async fn load_task_in(
     tx: &mut Transaction<'_, Postgres>,
     submission_id: Uuid,
@@ -1693,7 +2299,8 @@ async fn load_task_in(
         r#"
         SELECT submission_id, executor_execution_id, provider_id, provider_account_id,
                remote_operation_id, provider_request_id, state, artifact_ref, error_code,
-               next_poll_at_ms, cancel_requested, poll_lease_epoch, state_observation_id
+               next_poll_at_ms, cancel_requested, poll_lease_epoch, state_observation_id,
+               attach_recovery_owner, attach_recovery_lease_epoch
         FROM provider_remote_tasks
         WHERE submission_id = $1
         FOR UPDATE
@@ -1723,25 +2330,75 @@ fn task_from_row(row: TaskRow) -> Result<ProviderRemoteTask, ProviderTaskStoreEr
 }
 
 fn lease_from_row(row: ClaimRow) -> Result<ProviderTaskLease, ProviderTaskStoreError> {
-    let poll_owner = row.poll_owner.clone();
-    let poll_lease_epoch = row.poll_lease_epoch;
-    let poll_lease_expires_at_ms = row.poll_lease_expires_at_ms;
+    let ClaimRow {
+        submission_id,
+        executor_execution_id,
+        provider_id,
+        provider_account_id,
+        remote_operation_id,
+        provider_request_id,
+        state,
+        artifact_ref,
+        error_code,
+        next_poll_at_ms,
+        cancel_requested,
+        poll_lease_epoch,
+        state_observation_id,
+        attach_recovery_owner,
+        attach_recovery_lease_epoch,
+        poll_owner,
+        poll_lease_expires_at_ms,
+        model,
+        command_schema,
+        command_hash,
+        execution_profile_id,
+        adapter_revision,
+        credential_pool_id,
+        credential_ref,
+        credential_revision,
+        credential_auth_sha256,
+        resource_policy_id,
+        resource_policy_revision,
+        idempotency_key,
+        invocation_attempt,
+        provider_timeout_ms,
+        provider_deadline_at_ms,
+    } = row;
     Ok(ProviderTaskLease {
         task: task_from_row(TaskRow {
-            submission_id: row.submission_id,
-            executor_execution_id: row.executor_execution_id,
-            provider_id: row.provider_id,
-            provider_account_id: row.provider_account_id,
-            remote_operation_id: row.remote_operation_id,
-            provider_request_id: row.provider_request_id,
-            state: row.state,
-            artifact_ref: row.artifact_ref,
-            error_code: row.error_code,
-            next_poll_at_ms: row.next_poll_at_ms,
-            cancel_requested: row.cancel_requested,
+            submission_id,
+            executor_execution_id,
+            provider_id,
+            provider_account_id,
+            remote_operation_id,
+            provider_request_id,
+            state,
+            artifact_ref,
+            error_code,
+            next_poll_at_ms,
+            cancel_requested,
             poll_lease_epoch,
-            state_observation_id: row.state_observation_id,
+            state_observation_id,
+            attach_recovery_owner,
+            attach_recovery_lease_epoch,
         })?,
+        context: ProviderExecutionContext {
+            model,
+            command_schema,
+            command_hash,
+            execution_profile_id,
+            adapter_revision,
+            credential_pool_id,
+            credential_ref,
+            credential_revision,
+            credential_auth_sha256,
+            resource_policy_id,
+            resource_policy_revision,
+            idempotency_key,
+            invocation_attempt,
+            provider_timeout_ms,
+            provider_deadline_at_ms,
+        },
         poll_owner,
         poll_lease_epoch,
         poll_lease_expires_at_ms,
@@ -1772,6 +2429,9 @@ fn validate_attach(value: &RemoteTaskAttach) -> Result<(), ProviderTaskStoreErro
             .is_some_and(|id| !valid_identifier(id, 255))
         || !valid_identifier(&value.event_identity, 255)
         || !(0..=MAX_POLL_AFTER_MS).contains(&value.poll_after_ms)
+        || value.recovery_fence.as_ref().is_some_and(|fence| {
+            !valid_owner(&fence.recovery_owner) || fence.recovery_lease_epoch <= 0
+        })
     {
         Err(ProviderTaskStoreError::InvalidInput)
     } else {
@@ -1786,6 +2446,7 @@ fn validate_reservation(value: &RemoteTaskSubmitReservation) -> Result<(), Provi
         || value.executor_lease_epoch <= 0
         || !valid_owner(&value.executor_owner)
         || !valid_identifier(&value.idempotency_key, 255)
+        || !(1..=MAX_PROVIDER_TIMEOUT_MS).contains(&value.provider_timeout_ms)
     {
         Err(ProviderTaskStoreError::InvalidInput)
     } else {
@@ -1801,6 +2462,11 @@ fn validate_submit_failure(value: &RemoteTaskSubmitFailure) -> Result<(), Provid
         || !valid_owner(&value.executor_owner)
         || !valid_identifier(&value.event_identity, 255)
         || !valid_simple_identifier(&value.error_code, 128)
+        || value.recovery_fence.as_ref().is_some_and(|fence| {
+            value.kind != ProviderSubmitFailureKind::Rejected
+                || !valid_owner(&fence.recovery_owner)
+                || fence.recovery_lease_epoch <= 0
+        })
     {
         Err(ProviderTaskStoreError::InvalidInput)
     } else {
@@ -1848,6 +2514,25 @@ fn validate_lease(lease: &ProviderTaskLease, lease_ms: i64) -> Result<(), Provid
         || lease.task.executor_execution_id.is_nil()
         || lease.poll_lease_epoch <= 0
         || !valid_owner(&lease.poll_owner)
+        || !(1..=MAX_LEASE_MS).contains(&lease_ms)
+    {
+        Err(ProviderTaskStoreError::InvalidInput)
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_recovery_lease(
+    lease: &ProviderSubmitRecoveryLease,
+    lease_ms: i64,
+) -> Result<(), ProviderTaskStoreError> {
+    if lease.intent.submission_id.is_nil()
+        || lease.intent.executor_execution_id.is_nil()
+        || lease.intent.state == ProviderSubmitIntentState::Reserved
+        || lease.recovery_lease_epoch <= 0
+        || !valid_owner(&lease.recovery_owner)
+        || lease.context.idempotency_key != lease.intent.idempotency_key
+        || !(1..=MAX_PROVIDER_TIMEOUT_MS).contains(&lease.context.provider_timeout_ms)
         || !(1..=MAX_LEASE_MS).contains(&lease_ms)
     {
         Err(ProviderTaskStoreError::InvalidInput)

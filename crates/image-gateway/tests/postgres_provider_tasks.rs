@@ -4,10 +4,11 @@ use gpt_image_2_gateway::{
     ExecutorClaimScope, ExecutorHandoffStore, ExecutorSubmissionLease, ExecutorSubmissionOutcome,
     ExecutorSubmissionStore, PostgresExecutorSubmissionStore, PostgresProviderTaskStore,
     ProviderArtifactAuthority, ProviderSubmitFailureKind, ProviderSubmitIntentState,
-    ProviderSubmitStart, ProviderTaskClaimScope, ProviderTaskObservation,
-    ProviderTaskObservationOutcome, ProviderTaskObservationSource, ProviderTaskState,
-    ProviderTaskStore, ProviderTaskStoreError, RemoteTaskAttach, RemoteTaskSubmitFailure,
-    RemoteTaskSubmitReceipt, RemoteTaskSubmitReservation, VerifiedCallbackWakeup,
+    ProviderSubmitRecoveryFence, ProviderSubmitStart, ProviderTaskClaimScope,
+    ProviderTaskObservation, ProviderTaskObservationOutcome, ProviderTaskObservationSource,
+    ProviderTaskState, ProviderTaskStore, ProviderTaskStoreError, RemoteTaskAttach,
+    RemoteTaskSubmitFailure, RemoteTaskSubmitReceipt, RemoteTaskSubmitReservation,
+    VerifiedCallbackWakeup,
     admission::WorkLease,
     database::{connect_test_pool_with_search_path, run_migrations},
 };
@@ -58,10 +59,14 @@ async fn remote_task_store_closes_attach_poll_callback_and_cancel_invariants() -
                 && starts.iter().all(|start| match start {
                     ProviderSubmitStart::Acquired(intent)
                     | ProviderSubmitStart::Existing(intent) =>
-                        intent.state == ProviderSubmitIntentState::Sending,
+                        intent.intent.state == ProviderSubmitIntentState::Sending,
                 }),
             "concurrent submit start did not elect exactly one sender",
         )?;
+        let first_context = match &starts[0] {
+            ProviderSubmitStart::Acquired(invocation)
+            | ProviderSubmitStart::Existing(invocation) => invocation.context().clone(),
+        };
         let receipt = submit_receipt(&first, "operation-a", "submit-receipt-a");
         let (receipt_left, receipt_right) = tokio::join!(
             store.record_submit_receipt(&receipt),
@@ -194,6 +199,10 @@ async fn remote_task_store_closes_attach_poll_callback_and_cancel_invariants() -
             .await
             .map_err(debug_error)?
             .ok_or_else(|| "first task was not pollable".to_string())?;
+        require(
+            first_lease.context() == &first_context,
+            "poll claim re-resolved the frozen provider context",
+        )?;
         let first_lease = store
             .heartbeat(&first_lease, 5_000)
             .await
@@ -481,7 +490,7 @@ async fn submit_intent_lifecycle_fences_ambiguous_replay_and_late_evidence() -> 
                     .await
                     .map_err(debug_error)?,
                 ProviderSubmitStart::Acquired(ref intent)
-                    if intent.state == ProviderSubmitIntentState::Sending
+                    if intent.intent.state == ProviderSubmitIntentState::Sending
             ),
             "first submit start did not acquire send authority",
         )?;
@@ -492,7 +501,7 @@ async fn submit_intent_lifecycle_fences_ambiguous_replay_and_late_evidence() -> 
                     .await
                     .map_err(debug_error)?,
                 ProviderSubmitStart::Existing(ref intent)
-                    if intent.state == ProviderSubmitIntentState::Sending
+                    if intent.intent.state == ProviderSubmitIntentState::Sending
             ),
             "submit start replay acquired a second sender",
         )?;
@@ -538,7 +547,7 @@ async fn submit_intent_lifecycle_fences_ambiguous_replay_and_late_evidence() -> 
                 concurrent_start,
                 ProviderSubmitStart::Existing(ref intent)
                     if matches!(
-                        intent.state,
+                        intent.intent.state,
                         ProviderSubmitIntentState::Sending
                             | ProviderSubmitIntentState::OutcomeUnknown
                     )
@@ -598,12 +607,25 @@ async fn submit_intent_lifecycle_fences_ambiguous_replay_and_late_evidence() -> 
                 && known.failure_error_code.as_deref() == Some("submit_effect_unknown"),
             "late receipt overwrote or invalidated prior ambiguity evidence",
         )?;
+        let recovery = store
+            .claim_submit_recovery(&claim_scope(), "submit-recovery-a", 5_000)
+            .await
+            .map_err(debug_error)?
+            .ok_or_else(|| "expired submit was not recoverable".to_string())?;
+        require(
+            recovery.intent.state == ProviderSubmitIntentState::OperationKnown
+                && recovery.context().idempotency_key() == late_reservation.idempotency_key
+                && recovery.context().invocation_attempt() == 1,
+            "recovery claim did not return the frozen invocation context",
+        )?;
+        let mut recovered_attach =
+            attach_request(&late_lease, "operation-late", "late-attach");
+        recovered_attach.recovery_fence = Some(ProviderSubmitRecoveryFence {
+            recovery_owner: recovery.recovery_owner.clone(),
+            recovery_lease_epoch: recovery.recovery_lease_epoch,
+        });
         let attached = store
-            .attach(&attach_request(
-                &late_lease,
-                "operation-late",
-                "late-attach",
-            ))
+            .attach(&recovered_attach)
             .await
             .map_err(debug_error)?;
         require(
@@ -782,6 +804,242 @@ async fn submit_intent_terminal_projections_are_deferred_and_atomic() -> TestRes
 }
 
 #[tokio::test]
+async fn submit_recovery_claim_is_scoped_fenced_and_reclaimable() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let executor =
+            seed_running_submission_with_lease(&database.pool, "recovery-claim", 250).await?;
+        let store = PostgresProviderTaskStore::new(database.pool.clone());
+        let mut reservation = reservation_request(&executor);
+        reservation.provider_timeout_ms = 30_000;
+        store
+            .reserve_submit(&reservation)
+            .await
+            .map_err(debug_error)?;
+        let invocation = match store
+            .start_submit(&reservation)
+            .await
+            .map_err(debug_error)?
+        {
+            ProviderSubmitStart::Acquired(invocation) => invocation,
+            ProviderSubmitStart::Existing(_) => {
+                return Err("first submit start did not acquire authority".to_string());
+            }
+        };
+        require(
+            invocation.context().model() == "model-test"
+                && invocation.context().command_schema() == "provider-command-v1"
+                && invocation.context().execution_profile_id() == PROFILE_ID
+                && invocation.context().adapter_revision() == "provider-test-adapter-v1"
+                && invocation.context().credential_pool_id() == POOL_ID
+                && invocation.context().credential_ref() == "test-vault.provider-task.1"
+                && invocation.context().credential_revision() == 1
+                && invocation.context().credential_auth_sha256() == "1".repeat(64)
+                && invocation.context().resource_policy_id() == POLICY_ID
+                && invocation.context().resource_policy_revision() == 1
+                && invocation.context().idempotency_key() == reservation.idempotency_key
+                && invocation.context().invocation_attempt() == 1
+                && invocation.context().provider_timeout_ms() == 30_000
+                && invocation.context().provider_deadline_at_ms()
+                    - invocation.intent.send_started_at_ms.unwrap_or_default()
+                    == 30_000,
+            "submit start did not return its exact frozen invocation context",
+        )?;
+        let context_debug = format!("{:?}", invocation.context());
+        require(
+            !context_debug.contains("test-vault.provider-task.1")
+                && !context_debug.contains(&"1".repeat(64)),
+            "provider context Debug output exposed credential identity",
+        )?;
+        let mut conflicting_timeout = reservation.clone();
+        conflicting_timeout.provider_timeout_ms += 1;
+        require(
+            store.start_submit(&conflicting_timeout).await
+                == Err(ProviderTaskStoreError::Conflict),
+            "submit replay rewrote its frozen provider timeout",
+        )?;
+        require(
+            sqlx::query(
+                "UPDATE provider_submit_recoveries SET provider_deadline_at_ms = provider_deadline_at_ms + 1 WHERE submission_id = $1",
+            )
+            .bind(executor.submission_id)
+            .execute(&database.pool)
+            .await
+            .is_err(),
+            "raw SQL rewrote the absolute provider deadline",
+        )?;
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let wrong_scope = ProviderTaskClaimScope {
+            provider_id: "provider-test".to_string(),
+            provider_account_id: Uuid::new_v4(),
+        };
+        require(
+            store
+                .claim_submit_recovery(&wrong_scope, "wrong-account", 2_000)
+                .await
+                .map_err(debug_error)?
+                .is_none(),
+            "recovery claim crossed the provider account boundary",
+        )?;
+
+        let scope = claim_scope();
+        let (left, right) = tokio::join!(
+            store.claim_submit_recovery(&scope, "recovery-a", 2_000),
+            store.claim_submit_recovery(&scope, "recovery-b", 2_000),
+        );
+        let mut winners = [left.map_err(debug_error)?, right.map_err(debug_error)?]
+            .into_iter()
+            .flatten();
+        let first = winners
+            .next()
+            .ok_or_else(|| "due recovery had no claimant".to_string())?;
+        require(
+            winners.next().is_none()
+                && first.intent.submission_id == executor.submission_id
+                && first.context() == invocation.context(),
+            "concurrent recovery claim did not elect exactly one frozen context",
+        )?;
+        let renewed = store
+            .heartbeat_submit_recovery(&first, 3_000)
+            .await
+            .map_err(debug_error)?;
+        require(
+            renewed.recovery_lease_expires_at_ms > first.recovery_lease_expires_at_ms,
+            "recovery heartbeat did not advance monotonically",
+        )?;
+        require(
+            store
+                .claim_submit_recovery(&claim_scope(), "recovery-c", 2_000)
+                .await
+                .map_err(debug_error)?
+                .is_none(),
+            "live recovery lease was stolen",
+        )?;
+
+        store
+            .defer_submit_recovery(&renewed, 100)
+            .await
+            .map_err(debug_error)?;
+        require(
+            store
+                .claim_submit_recovery(&claim_scope(), "recovery-c", 2_000)
+                .await
+                .map_err(debug_error)?
+                .is_none(),
+            "deferred recovery became immediately claimable",
+        )?;
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        let reclaimed = store
+            .claim_submit_recovery(&claim_scope(), "recovery-c", 2_000)
+            .await
+            .map_err(debug_error)?
+            .ok_or_else(|| "deferred recovery was not reclaimed".to_string())?;
+        require(
+            reclaimed.recovery_lease_epoch == first.recovery_lease_epoch + 1,
+            "recovery reclaim did not advance the fence epoch",
+        )?;
+
+        store
+            .record_submit_receipt(&submit_receipt(
+                &executor,
+                "operation-recovered",
+                "receipt-recovered",
+            ))
+            .await
+            .map_err(debug_error)?;
+        let direct = attach_request(&executor, "operation-recovered", "direct-attach");
+        require(
+            store.attach(&direct).await == Err(ProviderTaskStoreError::StaleLease),
+            "expired executor attached without the recovery fence",
+        )?;
+        let mut stale = direct.clone();
+        stale.recovery_fence = Some(ProviderSubmitRecoveryFence {
+            recovery_owner: first.recovery_owner,
+            recovery_lease_epoch: first.recovery_lease_epoch,
+        });
+        require(
+            store.attach(&stale).await == Err(ProviderTaskStoreError::StaleLease),
+            "stale recovery epoch attached the remote operation",
+        )?;
+        let mut recovered = direct.clone();
+        recovered.recovery_fence = Some(ProviderSubmitRecoveryFence {
+            recovery_owner: reclaimed.recovery_owner.clone(),
+            recovery_lease_epoch: reclaimed.recovery_lease_epoch,
+        });
+        let task = store.attach(&recovered).await.map_err(debug_error)?;
+        require(
+            task.state == ProviderTaskState::ProviderWaiting,
+            "live recovery fence did not attach the known operation",
+        )?;
+        require(
+            store.attach(&stale).await == Err(ProviderTaskStoreError::StaleLease)
+                && store.attach(&direct).await == Err(ProviderTaskStoreError::StaleLease),
+            "completed recovered attach acknowledged stale authority",
+        )?;
+        require(
+            store.attach(&recovered).await.map_err(debug_error)? == task,
+            "current recovery fence could not replay its completed attach",
+        )?;
+        require(
+            store
+                .heartbeat_submit_recovery(&reclaimed, 2_000)
+                .await
+                == Err(ProviderTaskStoreError::StaleLease),
+            "closed recovery lease remained writable after attach",
+        )?;
+
+        let rejected_executor =
+            seed_running_submission_with_lease(&database.pool, "recovery-reject", 200).await?;
+        let rejected_reservation = reservation_request(&rejected_executor);
+        store
+            .reserve_submit(&rejected_reservation)
+            .await
+            .map_err(debug_error)?;
+        store
+            .start_submit(&rejected_reservation)
+            .await
+            .map_err(debug_error)?;
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let rejection_lease = store
+            .claim_submit_recovery(&claim_scope(), "recovery-rejector", 2_000)
+            .await
+            .map_err(debug_error)?
+            .ok_or_else(|| "confirmed rejection recovery was not claimable".to_string())?;
+        let mut rejection = submit_failure(
+            &rejected_executor,
+            ProviderSubmitFailureKind::Rejected,
+            "recovered-rejection",
+            "provider_rejected",
+        );
+        rejection.recovery_fence = Some(ProviderSubmitRecoveryFence {
+            recovery_owner: rejection_lease.recovery_owner.clone(),
+            recovery_lease_epoch: rejection_lease.recovery_lease_epoch,
+        });
+        require(
+            store
+                .record_submit_failure(&rejection)
+                .await
+                .map_err(debug_error)?
+                .state
+                == ProviderSubmitIntentState::Rejected,
+            "live recovery owner could not atomically commit confirmed rejection",
+        )?;
+        require(
+            store
+                .heartbeat_submit_recovery(&rejection_lease, 2_000)
+                .await
+                == Err(ProviderTaskStoreError::StaleLease),
+            "confirmed recovered rejection did not close its recovery lease",
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
 async fn submit_lifecycle_migration_backfills_attached_receipts() -> TestResult {
     let Some(database) = TestDatabase::new_before_submit_lifecycle().await? else {
         return Ok(());
@@ -815,6 +1073,25 @@ async fn submit_lifecycle_migration_backfills_attached_receipts() -> TestResult 
                 && migrated.3.is_some()
                 && migrated.4.as_deref() == Some("legacy-attach-event"),
             format!("0018 did not preserve the attached receipt: {migrated:?}"),
+        )?;
+        require(
+            sqlx::raw_sql(include_str!(
+                "../migrations/0019_provider_submit_recovery_leases.sql"
+            ))
+            .execute(&database.pool)
+            .await
+            .is_err(),
+            "0019 fabricated a provider deadline for legacy remote activity",
+        )?;
+        let recovery_table_exists: bool = sqlx::query_scalar(
+            "SELECT to_regclass(current_schema() || '.provider_submit_recoveries') IS NOT NULL",
+        )
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(
+            !recovery_table_exists,
+            "failed 0019 recovery migration did not roll back atomically",
         )
     }
     .await;
@@ -923,6 +1200,7 @@ fn reservation_request(lease: &ExecutorSubmissionLease) -> RemoteTaskSubmitReser
         executor_owner: lease.executor_owner.clone(),
         executor_lease_epoch: lease.executor_lease_epoch,
         idempotency_key: format!("provider-submit-{}", lease.submission_id.simple()),
+        provider_timeout_ms: 60_000,
     }
 }
 
@@ -940,6 +1218,7 @@ fn submit_failure(
         kind,
         event_identity: event_identity.to_string(),
         error_code: error_code.to_string(),
+        recovery_fence: None,
     }
 }
 
@@ -973,6 +1252,7 @@ fn attach_request(
         provider_request_id: Some(format!("request-{operation}")),
         event_identity: event.to_string(),
         poll_after_ms: 0,
+        recovery_fence: None,
     }
 }
 

@@ -1,3 +1,5 @@
+use std::fmt;
+
 use async_trait::async_trait;
 use uuid::Uuid;
 
@@ -42,6 +44,7 @@ pub struct RemoteTaskAttach {
     pub provider_request_id: Option<String>,
     pub event_identity: String,
     pub poll_after_ms: i64,
+    pub recovery_fence: Option<ProviderSubmitRecoveryFence>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -51,6 +54,7 @@ pub struct RemoteTaskSubmitReservation {
     pub executor_owner: String,
     pub executor_lease_epoch: i64,
     pub idempotency_key: String,
+    pub provider_timeout_ms: i64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -95,12 +99,6 @@ impl ProviderSubmitIntentState {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ProviderSubmitStart {
-    Acquired(ProviderSubmitIntent),
-    Existing(ProviderSubmitIntent),
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProviderSubmitFailureKind {
     Rejected,
@@ -116,6 +114,7 @@ pub struct RemoteTaskSubmitFailure {
     pub kind: ProviderSubmitFailureKind,
     pub event_identity: String,
     pub error_code: String,
+    pub recovery_fence: Option<ProviderSubmitRecoveryFence>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -135,12 +134,162 @@ pub struct ProviderTaskClaimScope {
     pub provider_account_id: Uuid,
 }
 
+#[derive(Clone, Eq, PartialEq)]
+pub struct ProviderExecutionContext {
+    model: String,
+    command_schema: String,
+    command_hash: String,
+    execution_profile_id: Uuid,
+    adapter_revision: String,
+    credential_pool_id: Uuid,
+    credential_ref: String,
+    credential_revision: i64,
+    credential_auth_sha256: String,
+    resource_policy_id: Uuid,
+    resource_policy_revision: i64,
+    idempotency_key: String,
+    invocation_attempt: i32,
+    provider_timeout_ms: i64,
+    provider_deadline_at_ms: i64,
+}
+
+impl ProviderExecutionContext {
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+
+    pub fn command_schema(&self) -> &str {
+        &self.command_schema
+    }
+
+    pub fn command_hash(&self) -> &str {
+        &self.command_hash
+    }
+
+    pub fn execution_profile_id(&self) -> Uuid {
+        self.execution_profile_id
+    }
+
+    pub fn adapter_revision(&self) -> &str {
+        &self.adapter_revision
+    }
+
+    pub fn credential_pool_id(&self) -> Uuid {
+        self.credential_pool_id
+    }
+
+    pub fn credential_ref(&self) -> &str {
+        &self.credential_ref
+    }
+
+    pub fn credential_revision(&self) -> i64 {
+        self.credential_revision
+    }
+
+    pub fn credential_auth_sha256(&self) -> &str {
+        &self.credential_auth_sha256
+    }
+
+    pub fn resource_policy_id(&self) -> Uuid {
+        self.resource_policy_id
+    }
+
+    pub fn resource_policy_revision(&self) -> i64 {
+        self.resource_policy_revision
+    }
+
+    pub fn idempotency_key(&self) -> &str {
+        &self.idempotency_key
+    }
+
+    pub fn invocation_attempt(&self) -> i32 {
+        self.invocation_attempt
+    }
+
+    pub fn provider_timeout_ms(&self) -> i64 {
+        self.provider_timeout_ms
+    }
+
+    pub fn provider_deadline_at_ms(&self) -> i64 {
+        self.provider_deadline_at_ms
+    }
+}
+
+impl fmt::Debug for ProviderExecutionContext {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProviderExecutionContext")
+            .field("model", &self.model)
+            .field("command_schema", &self.command_schema)
+            .field("command_hash", &self.command_hash)
+            .field("execution_profile_id", &self.execution_profile_id)
+            .field("adapter_revision", &self.adapter_revision)
+            .field("credential_pool_id", &self.credential_pool_id)
+            .field("credential_ref", &"[redacted]")
+            .field("credential_revision", &self.credential_revision)
+            .field("credential_auth_sha256", &"[redacted]")
+            .field("resource_policy_id", &self.resource_policy_id)
+            .field("resource_policy_revision", &self.resource_policy_revision)
+            .field("idempotency_key", &self.idempotency_key)
+            .field("invocation_attempt", &self.invocation_attempt)
+            .field("provider_timeout_ms", &self.provider_timeout_ms)
+            .field("provider_deadline_at_ms", &self.provider_deadline_at_ms)
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderSubmitInvocation {
+    pub intent: ProviderSubmitIntent,
+    context: ProviderExecutionContext,
+}
+
+impl ProviderSubmitInvocation {
+    pub fn context(&self) -> &ProviderExecutionContext {
+        &self.context
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ProviderSubmitStart {
+    Acquired(ProviderSubmitInvocation),
+    Existing(ProviderSubmitInvocation),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderSubmitRecoveryFence {
+    pub recovery_owner: String,
+    pub recovery_lease_epoch: i64,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProviderTaskLease {
     pub task: ProviderRemoteTask,
+    context: ProviderExecutionContext,
     pub poll_owner: String,
     pub poll_lease_epoch: i64,
     pub poll_lease_expires_at_ms: i64,
+}
+
+impl ProviderTaskLease {
+    pub fn context(&self) -> &ProviderExecutionContext {
+        &self.context
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderSubmitRecoveryLease {
+    pub intent: ProviderSubmitIntent,
+    context: ProviderExecutionContext,
+    pub recovery_owner: String,
+    pub recovery_lease_epoch: i64,
+    pub recovery_lease_expires_at_ms: i64,
+}
+
+impl ProviderSubmitRecoveryLease {
+    pub fn context(&self) -> &ProviderExecutionContext {
+        &self.context
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -251,6 +400,25 @@ pub trait ProviderTaskStore: Send + Sync + 'static {
         &self,
         submission_id: Uuid,
     ) -> Result<Option<ProviderSubmitIntent>, ProviderTaskStoreError>;
+
+    async fn claim_submit_recovery(
+        &self,
+        scope: &ProviderTaskClaimScope,
+        owner: &str,
+        lease_ms: i64,
+    ) -> Result<Option<ProviderSubmitRecoveryLease>, ProviderTaskStoreError>;
+
+    async fn heartbeat_submit_recovery(
+        &self,
+        lease: &ProviderSubmitRecoveryLease,
+        lease_ms: i64,
+    ) -> Result<ProviderSubmitRecoveryLease, ProviderTaskStoreError>;
+
+    async fn defer_submit_recovery(
+        &self,
+        lease: &ProviderSubmitRecoveryLease,
+        retry_after_ms: i64,
+    ) -> Result<(), ProviderTaskStoreError>;
 
     async fn attach(
         &self,

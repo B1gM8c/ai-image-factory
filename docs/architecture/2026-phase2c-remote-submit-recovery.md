@@ -61,10 +61,9 @@ must not spawn another CLI process.
 | `attached` | poll through the poll lease | reacquire executor ownership |
 | `rejected` | reduce terminal failure | mutate evidence |
 
-The store intentionally exposes no stale-submit scanner yet. Activation
-requires a provider/account-scoped leased recovery claim and a database-time
-absolute deadline; a global read-only scan would not provide authority or fair
-progress.
+Phase 2D adds the provider/account-scoped leased recovery claim, frozen execution
+context, and database-time absolute deadline. Deadline terminalization remains
+blocked; a global read-only scan would not provide authority or fair progress.
 
 ## Crash Matrix
 
@@ -83,9 +82,8 @@ progress.
 This phase deliberately does not add a submit daemon or activate Dreamina.
 Before activation, the platform still needs:
 
-- frozen poll context containing model, command schema, adapter revision,
-  execution profile, credential revision, and idempotency identity;
-- an absolute provider deadline with provider/account-scoped recovery claims;
+- a fenced resolver that terminalizes the Phase 2D absolute provider deadline as
+  unknown remote effect without creating capacity oversubscription;
 - atomic or recoverable materialization between `artifact_ready` and canonical
   success;
 - capacity heartbeat during long poll and materialization operations;

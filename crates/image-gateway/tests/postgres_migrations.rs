@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 type TestResult<T = ()> = Result<T, String>;
 
-const REQUIRED_COLUMNS: [(&str, &str); 84] = [
+const REQUIRED_COLUMNS: [(&str, &str); 93] = [
     ("usage_events", "tenant_id"),
     ("quota_reservations", "tenant_id"),
     ("quota_reservations", "job_id"),
@@ -87,6 +87,8 @@ const REQUIRED_COLUMNS: [(&str, &str); 84] = [
     ("provider_remote_tasks", "state"),
     ("provider_remote_tasks", "poll_lease_epoch"),
     ("provider_remote_tasks", "state_observation_id"),
+    ("provider_remote_tasks", "attach_recovery_owner"),
+    ("provider_remote_tasks", "attach_recovery_lease_epoch"),
     ("provider_task_observations", "event_identity"),
     ("provider_task_observations", "payload_hash"),
     ("provider_remote_submit_intents", "idempotency_key"),
@@ -96,6 +98,13 @@ const REQUIRED_COLUMNS: [(&str, &str); 84] = [
     ("provider_remote_submit_intents", "receipt_event_identity"),
     ("provider_remote_submit_intents", "failure_event_identity"),
     ("provider_remote_submit_intents", "failure_error_code"),
+    ("provider_submit_recoveries", "submission_id"),
+    ("provider_submit_recoveries", "invocation_attempt"),
+    ("provider_submit_recoveries", "provider_timeout_ms"),
+    ("provider_submit_recoveries", "provider_deadline_at_ms"),
+    ("provider_submit_recoveries", "next_recovery_at_ms"),
+    ("provider_submit_recoveries", "recovery_owner"),
+    ("provider_submit_recoveries", "recovery_lease_epoch"),
     (
         "executor_resolution_decisions",
         "provider_task_observation_id",
@@ -103,7 +112,7 @@ const REQUIRED_COLUMNS: [(&str, &str); 84] = [
     ("executor_resolution_decisions", "provider_submit_intent_id"),
 ];
 
-const REQUIRED_INDEXES: [&str; 16] = [
+const REQUIRED_INDEXES: [&str; 17] = [
     "usage_events_tenant_created_at_ms_idx",
     "gateway_api_keys_project_id_idx",
     "quota_reservations_active_tenant_idx",
@@ -120,6 +129,7 @@ const REQUIRED_INDEXES: [&str; 16] = [
     "executor_resource_policies_enabled_account_uidx",
     "provider_remote_tasks_poll_claim_idx",
     "provider_submit_intents_remote_operation_uidx",
+    "provider_submit_recoveries_claim_idx",
 ];
 
 #[tokio::test]
@@ -1008,9 +1018,9 @@ async fn assert_expected_schema(pool: &PgPool) -> TestResult {
     require(
         migration_versions(pool).await?
             == vec![
-                0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18,
+                0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19,
             ],
-        "applied migration versions must be exactly [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18]",
+        "applied migration versions must be exactly [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]",
     )?;
 
     for (table, column) in REQUIRED_COLUMNS {
@@ -1034,6 +1044,28 @@ async fn assert_expected_schema(pool: &PgPool) -> TestResult {
         .await
         .map_err(|error| format!("failed to query index {index}: {error}"))?;
         require(exists, &format!("index {index} must exist"))?;
+    }
+    for (index, expression) in [
+        (
+            "provider_submit_recoveries_claim_idx",
+            "greatest(next_recovery_at_ms, coalesce(recovery_lease_expires_at_ms, next_recovery_at_ms))",
+        ),
+        (
+            "provider_remote_tasks_poll_claim_idx",
+            "greatest(next_poll_at_ms, coalesce(poll_lease_expires_at_ms, next_poll_at_ms))",
+        ),
+    ] {
+        let definition: String = sqlx::query_scalar(
+            "SELECT lower(indexdef) FROM pg_indexes WHERE schemaname = current_schema() AND indexname = $1",
+        )
+        .bind(index)
+        .fetch_one(pool)
+        .await
+        .map_err(|error| format!("failed to inspect index {index}: {error}"))?;
+        require(
+            definition.contains(expression),
+            &format!("index {index} must preserve the effective due expression"),
+        )?;
     }
     Ok(())
 }
