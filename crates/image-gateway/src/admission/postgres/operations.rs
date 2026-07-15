@@ -430,15 +430,19 @@ pub(super) async fn claim_work(
     target_job_id: Option<Uuid>,
     worker_id: &str,
     lease_duration_ms: i64,
+    contract: Option<AdmissionContract>,
 ) -> Result<Option<WorkLease>, AdmissionError> {
     let mut tx = pool.begin().await.map_err(unavailable)?;
     let now = database_now(&mut tx).await?;
     let row: Option<(Uuid, Uuid, i64, String, Value)> = sqlx::query_as(
         r#"
         SELECT w.work_item_id, w.job_id, w.lease_epoch, p.command_schema, p.command_json
-        FROM work_items w JOIN job_payloads p ON p.job_id = w.job_id
+        FROM work_items w
+        JOIN jobs j ON j.job_id = w.job_id
+        JOIN job_payloads p ON p.job_id = w.job_id
         WHERE w.state = 'ready' AND w.available_at_ms <= $1
           AND ($2::UUID IS NULL OR w.job_id = $2)
+          AND ($3::SMALLINT IS NULL OR j.economics_contract_version = $3)
         ORDER BY
           (w.schedule_finish_tag -
              ((GREATEST($1 - w.created_at_ms, 0) / 30000) * 250000)),
@@ -449,6 +453,10 @@ pub(super) async fn claim_work(
     )
     .bind(now)
     .bind(target_job_id)
+    .bind(contract.map(|contract| match contract {
+        AdmissionContract::LegacyV1 => 1_i16,
+        AdmissionContract::OutputEconomicsV2 => 2_i16,
+    }))
     .fetch_optional(&mut *tx)
     .await
     .map_err(unavailable)?;

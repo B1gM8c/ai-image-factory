@@ -54,10 +54,10 @@ more-specific active price and provision tenant credit before acceptance.
 - Version 2 owns outputs at admission and requires a frozen quote and one hold
   for every output.
 
-`prepare_for_lease` retains version 1 lazy output creation for already accepted
-jobs. For version 2 it fails closed if outputs are missing, non-contiguous, or
-partially attached. It only creates submission and executor identities for the
-admission-owned output IDs.
+`prepare_and_handoff` accepts only version 2 jobs. It fails closed if outputs
+are missing, non-contiguous, or partially attached, and creates submission and
+executor identities only for admission-owned output IDs. LegacyV1 remains on
+the isolated inline worker path and cannot enter the executor handoff state.
 
 ### Economic facts
 

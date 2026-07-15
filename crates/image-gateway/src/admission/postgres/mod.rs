@@ -487,8 +487,16 @@ impl AdmissionStore for PostgresAdmissionStore {
         &self,
         worker_id: &str,
         lease_duration_ms: i64,
+        contract: AdmissionContract,
     ) -> Result<Option<WorkLease>, AdmissionError> {
-        claim_work(&self.pool, None, worker_id, lease_duration_ms).await
+        claim_work(
+            &self.pool,
+            None,
+            worker_id,
+            lease_duration_ms,
+            Some(contract),
+        )
+        .await
     }
 
     async fn claim_job(
@@ -497,7 +505,7 @@ impl AdmissionStore for PostgresAdmissionStore {
         worker_id: &str,
         lease_duration_ms: i64,
     ) -> Result<Option<WorkLease>, AdmissionError> {
-        claim_work(&self.pool, Some(job_id), worker_id, lease_duration_ms).await
+        claim_work(&self.pool, Some(job_id), worker_id, lease_duration_ms, None).await
     }
 
     async fn start(&self, lease: &WorkLease) -> Result<(), AdmissionError> {

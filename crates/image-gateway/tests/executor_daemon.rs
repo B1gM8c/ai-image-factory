@@ -7,8 +7,7 @@ use async_trait::async_trait;
 use gpt_image_2_gateway::executor::{
     DurableRunner, DurableRunnerResult, ExecutorClaimScope, ExecutorDaemon, ExecutorDaemonError,
     ExecutorDaemonRun, ExecutorSubmissionError, ExecutorSubmissionLease, ExecutorSubmissionOutcome,
-    ExecutorSubmissionStore, PreparedExecutorSubmission, RunnerError, RunnerLaunchAuthority,
-    RunnerOutcome,
+    ExecutorSubmissionStore, RunnerError, RunnerLaunchAuthority, RunnerOutcome,
 };
 use tokio::sync::Barrier;
 use uuid::Uuid;
@@ -124,14 +123,6 @@ impl FakeStore {
 
 #[async_trait]
 impl ExecutorSubmissionStore for FakeStore {
-    async fn prepare_for_lease(
-        &self,
-        _lease: &gpt_image_2_gateway::admission::WorkLease,
-        _execution_profile_id: Uuid,
-    ) -> Result<Vec<PreparedExecutorSubmission>, ExecutorSubmissionError> {
-        unreachable!("daemon does not prepare submissions")
-    }
-
     async fn resume_running(
         &self,
         _scope: &ExecutorClaimScope,

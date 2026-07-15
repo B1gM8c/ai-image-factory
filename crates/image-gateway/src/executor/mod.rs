@@ -313,13 +313,16 @@ pub enum ExecutorSubmissionError {
 }
 
 #[async_trait]
-pub trait ExecutorSubmissionStore: Send + Sync + 'static {
-    async fn prepare_for_lease(
+pub trait ExecutorHandoffStore: Send + Sync + 'static {
+    async fn prepare_and_handoff(
         &self,
         lease: &WorkLease,
         execution_profile_id: Uuid,
     ) -> Result<Vec<PreparedExecutorSubmission>, ExecutorSubmissionError>;
+}
 
+#[async_trait]
+pub trait ExecutorSubmissionStore: Send + Sync + 'static {
     async fn resume_running(
         &self,
         scope: &ExecutorClaimScope,

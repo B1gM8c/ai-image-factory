@@ -1,5 +1,6 @@
 use std::{
     env,
+    process::Stdio,
     sync::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
@@ -9,9 +10,10 @@ use std::{
 
 use async_trait::async_trait;
 use gpt_image_2_gateway::{
-    EditJob, ExecutionContextStore, ExecutionSettlementStore, GeneratedImage, GenerationJob,
-    ImageGatewayError, ImageGenerator, PostgresExecutionContextStore,
-    PostgresExecutionSettlementStore, PostgresUsageStore, UsageCharge, UsageLimits,
+    CODEX_GENERATION_ADAPTER_REVISION, EditJob, ExecutionContextStore, ExecutionSettlementStore,
+    GeneratedImage, GenerationJob, ImageGatewayError, ImageGenerator,
+    PostgresExecutionContextStore, PostgresExecutionSettlementStore,
+    PostgresExecutorSubmissionStore, PostgresUsageStore, UsageCharge, UsageLimits,
     UsageReservation, UsageStore, Workerd,
     admission::{
         AdmissionClaim, AdmissionContract, AdmissionStore, AttachInputManifest, AttachInputObject,
@@ -30,6 +32,7 @@ use image::{ImageBuffer, ImageFormat, Rgb, Rgba};
 use serde_json::to_value;
 use sha2::{Digest, Sha256};
 use sqlx::{AssertSqlSafe, PgPool};
+use tokio::process::Command;
 use uuid::Uuid;
 
 type TestResult<T = ()> = Result<T, String>;
@@ -123,7 +126,7 @@ async fn leased_work_reconstructs_generation_and_quota_context() -> TestResult {
             .await
             .map_err(|error| format!("attach failed: {error}"))?;
         let lease = admission
-            .claim_ready("workerd-test", 60_000)
+            .claim_ready("workerd-test", 60_000, AdmissionContract::LegacyV1)
             .await
             .map_err(|error| format!("work claim failed: {error}"))?
             .ok_or_else(|| "attached work was not claimable".to_string())?;
@@ -351,6 +354,210 @@ async fn workerd_executes_ready_generation_without_gateway_memory() -> TestResul
                 .map_err(|error| format!("idle workerd failed: {error:?}"))?
                 .is_none(),
             "completed work was claimed again",
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
+async fn workerd_hands_v2_generation_to_executord_without_invoking_provider() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let job = generation_job(&format!("req_{}", Uuid::new_v4().simple()));
+        let admission = Arc::new(PostgresAdmissionStore::new(database.pool.clone()));
+        let usage = Arc::new(PostgresUsageStore::new(database.pool.clone()));
+        let reservation = prepare_ready_work(admission.as_ref(), usage.as_ref(), &job).await?;
+        let now: i64 = sqlx::query_scalar(
+            "SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT",
+        )
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        let mut tx = database.pool.begin().await.map_err(debug_error)?;
+        sqlx::query("UPDATE jobs SET economics_contract_version = 2 WHERE job_id = $1")
+            .bind(reservation.job_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(debug_error)?;
+        for output_index in 0..job.n {
+            sqlx::query(
+                r#"
+                INSERT INTO job_outputs
+                  (output_id, job_id, output_index, state, created_at_ms, updated_at_ms)
+                VALUES ($1, $2, $3, 'pending', $4, $4)
+                "#,
+            )
+            .bind(Uuid::new_v4())
+            .bind(reservation.job_id)
+            .bind(i32::try_from(output_index).map_err(debug_error)?)
+            .bind(now)
+            .execute(&mut *tx)
+            .await
+            .map_err(debug_error)?;
+        }
+        tx.commit().await.map_err(debug_error)?;
+        let profile_id = seed_codex_handoff_profile(&database.pool).await?;
+
+        let executor_store = Arc::new(PostgresExecutorSubmissionStore::new(database.pool.clone()));
+        let workerd = Workerd::new_handoff_only(
+            "v2-handoff-workerd".to_string(),
+            admission,
+            Arc::new(PostgresExecutionContextStore::new(database.pool.clone())),
+            executor_store,
+            profile_id,
+            Duration::from_secs(5),
+        )
+        .map_err(debug_error)?;
+
+        require(
+            workerd.run_once().await.map_err(debug_error)? == Some(reservation.job_id),
+            "workerd handed off the wrong V2 job",
+        )?;
+        let state: (String, String, Option<String>, Option<i64>, i64, i64, i64) = sqlx::query_as(
+            r#"
+                SELECT work.state, attempt.state, work.lease_owner,
+                       work.lease_expires_at_ms,
+                       (SELECT COUNT(*) FROM provider_submissions
+                        WHERE job_id = work.job_id),
+                       (SELECT COUNT(*) FROM executor_executions execution
+                        JOIN provider_submissions submission
+                          ON submission.submission_id = execution.submission_id
+                        WHERE submission.job_id = work.job_id),
+                       (SELECT COUNT(*) FROM provider_submission_attachments
+                        WHERE job_id = work.job_id)
+                FROM work_items work
+                JOIN job_attempts attempt
+                  ON attempt.execution_id = work.execution_id
+                 AND attempt.work_item_id = work.work_item_id
+                 AND attempt.lease_epoch = work.lease_epoch
+                WHERE work.job_id = $1
+                "#,
+        )
+        .bind(reservation.job_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(
+            state
+                == (
+                    "awaiting_executor".to_string(),
+                    "handed_off".to_string(),
+                    None,
+                    None,
+                    2,
+                    2,
+                    2,
+                ),
+            format!("V2 handoff was not atomic: {state:?}"),
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
+async fn handoff_only_workerd_process_needs_no_codex_or_artifact_mount() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let job = generation_job(&format!("req_{}", Uuid::new_v4().simple()));
+        let admission = PostgresAdmissionStore::new(database.pool.clone());
+        let usage = PostgresUsageStore::new(database.pool.clone());
+        let reservation = prepare_ready_work(&admission, &usage, &job).await?;
+        let now: i64 = sqlx::query_scalar(
+            "SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT",
+        )
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        let mut tx = database.pool.begin().await.map_err(debug_error)?;
+        sqlx::query("UPDATE jobs SET economics_contract_version = 2 WHERE job_id = $1")
+            .bind(reservation.job_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(debug_error)?;
+        for output_index in 0..job.n {
+            sqlx::query(
+                r#"
+                INSERT INTO job_outputs
+                  (output_id, job_id, output_index, state, created_at_ms, updated_at_ms)
+                VALUES ($1, $2, $3, 'pending', $4, $4)
+                "#,
+            )
+            .bind(Uuid::new_v4())
+            .bind(reservation.job_id)
+            .bind(i32::try_from(output_index).map_err(debug_error)?)
+            .bind(now)
+            .execute(&mut *tx)
+            .await
+            .map_err(debug_error)?;
+        }
+        tx.commit().await.map_err(debug_error)?;
+        let profile_id = seed_codex_handoff_profile(&database.pool).await?;
+        let profile_key: String = sqlx::query_scalar(
+            "SELECT profile_key FROM provider_execution_profiles WHERE execution_profile_id = $1",
+        )
+        .bind(profile_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        let database_url = env::var("TEST_DATABASE_URL")
+            .map_err(|_| "TEST_DATABASE_URL disappeared during process test".to_string())?;
+        let mut child = Command::new(env!("CARGO_BIN_EXE_workerd"))
+            .env("DATABASE_URL", database_url)
+            .env("GATEWAY_DATABASE_SCHEMA", &database.schema)
+            .env("WORKER_EXECUTION_MODE", "executor-handoff")
+            .env("EXECUTOR_PROFILE_KEY", profile_key)
+            .env("WORKER_ID", "handoff-only-process")
+            .env("WORKER_POLL_INTERVAL_MS", "10")
+            .env("WORKER_HANDOFF_LEASE_MS", "1000")
+            .env_remove("GATEWAY_CODEX_HOME")
+            .env_remove("GATEWAY_ARTIFACT_ROOT")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(debug_error)?;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let state: Option<String> =
+                sqlx::query_scalar("SELECT state FROM work_items WHERE job_id = $1")
+                    .bind(reservation.job_id)
+                    .fetch_optional(&database.pool)
+                    .await
+                    .map_err(debug_error)?;
+            if state.as_deref() == Some("awaiting_executor") {
+                break;
+            }
+            if let Some(status) = child.try_wait().map_err(debug_error)? {
+                return Err(format!(
+                    "handoff-only workerd exited before handoff with {status}"
+                ));
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(format!(
+                    "handoff-only workerd timed out with state {state:?}"
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        if let Some(pid) = child.id() {
+            unsafe {
+                libc::kill(pid as libc::pid_t, libc::SIGTERM);
+            }
+        }
+        let status = tokio::time::timeout(Duration::from_secs(3), child.wait())
+            .await
+            .map_err(|_| "handoff-only workerd did not drain on SIGTERM".to_string())?
+            .map_err(debug_error)?;
+        require(
+            status.success(),
+            format!("handoff-only workerd exited with {status}"),
         )
     }
     .await;
@@ -676,6 +883,89 @@ async fn invalid_durable_context_is_failed_once_without_provider_execution() -> 
     combine(result, database.cleanup().await)
 }
 
+async fn seed_codex_handoff_profile(pool: &PgPool) -> TestResult<Uuid> {
+    let credential_pool_id = Uuid::new_v4();
+    let provider_account_id = Uuid::new_v4();
+    let resource_policy_id = Uuid::new_v4();
+    let execution_profile_id = Uuid::new_v4();
+    let now: i64 =
+        sqlx::query_scalar("SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT")
+            .fetch_one(pool)
+            .await
+            .map_err(debug_error)?;
+    let mut tx = pool.begin().await.map_err(debug_error)?;
+    sqlx::query(
+        r#"
+        INSERT INTO provider_credential_pools
+          (credential_pool_id, pool_key, provider_id, state, created_at_ms, updated_at_ms)
+        VALUES ($1, $2, 'openai-codex', 'enabled', $3, $3)
+        "#,
+    )
+    .bind(credential_pool_id)
+    .bind(format!("test-pool-{credential_pool_id}"))
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .map_err(debug_error)?;
+    sqlx::query(
+        r#"
+        INSERT INTO provider_accounts
+          (provider_account_id, credential_pool_id, provider_id, account_key,
+           credential_ref, credential_revision, credential_auth_sha256,
+           state, created_at_ms, updated_at_ms)
+        VALUES ($1, $2, 'openai-codex', $3, $4, 1, $5, 'enabled', $6, $6)
+        "#,
+    )
+    .bind(provider_account_id)
+    .bind(credential_pool_id)
+    .bind(format!("test-account-{provider_account_id}"))
+    .bind(format!("test-credential-{provider_account_id}"))
+    .bind("0".repeat(64))
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .map_err(debug_error)?;
+    sqlx::query(
+        r#"
+        INSERT INTO executor_resource_policies
+          (resource_policy_id, revision, credential_pool_id, provider_account_id,
+           provider_id, execution_class, max_concurrency, state, created_at_ms)
+        VALUES ($1, 1, $2, $3, 'openai-codex', 'test', 2, 'enabled', $4)
+        "#,
+    )
+    .bind(resource_policy_id)
+    .bind(credential_pool_id)
+    .bind(provider_account_id)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .map_err(debug_error)?;
+    sqlx::query(
+        r#"
+        INSERT INTO provider_execution_profiles
+          (execution_profile_id, profile_key, provider_id, command_schema,
+           adapter_revision, credential_pool_id, provider_account_id,
+           credential_ref, credential_revision, resource_policy_id,
+           resource_policy_revision, state, created_at_ms, updated_at_ms)
+        VALUES ($1, $2, 'openai-codex', 'openai.images.generation.v1',
+                $3, $4, $5, $6, 1, $7, 1, 'enabled', $8, $8)
+        "#,
+    )
+    .bind(execution_profile_id)
+    .bind(format!("test-profile-{execution_profile_id}"))
+    .bind(CODEX_GENERATION_ADAPTER_REVISION)
+    .bind(credential_pool_id)
+    .bind(provider_account_id)
+    .bind(format!("test-credential-{provider_account_id}"))
+    .bind(resource_policy_id)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .map_err(debug_error)?;
+    tx.commit().await.map_err(debug_error)?;
+    Ok(execution_profile_id)
+}
+
 async fn prepare_ready_work(
     admission: &PostgresAdmissionStore,
     usage: &PostgresUsageStore,
@@ -915,7 +1205,7 @@ async fn prepare_ready_edit(pool: &PgPool, worker_id: &str) -> TestResult<Prepar
         .await
         .map_err(|error| format!("edit attach failed: {error}"))?;
     let lease = admission
-        .claim_ready(worker_id, 60_000)
+        .claim_ready(worker_id, 60_000, AdmissionContract::LegacyV1)
         .await
         .map_err(|error| format!("edit work claim failed: {error}"))?
         .ok_or_else(|| "attached edit work was not claimable".to_string())?;
@@ -1048,6 +1338,10 @@ fn generation_job(request_id: &str) -> GenerationJob {
         stream: false,
         partial_images: 0,
     }
+}
+
+fn debug_error(error: impl std::fmt::Debug) -> String {
+    format!("{error:?}")
 }
 
 fn edit_job(request_id: &str) -> EditJob {

@@ -1,8 +1,9 @@
 # Phase 1G: Execution Binding And Durable Capacity
 
-Status: implemented on the internal executor path. Public Images V2 traffic
-remains disabled until the work handoff, canonical reducer, customer artifact
-publication, and real API smoke gates are complete.
+Status: implemented on the internal executor path. Migration 0014 and the V2
+workerd path now commit submission preparation and executor ownership handoff
+atomically. Public Images V2 traffic remains disabled until the canonical
+reducer, customer artifact publication, and real API smoke gates are complete.
 
 ## 1. Boundary
 
@@ -46,14 +47,23 @@ are rejected by PostgreSQL.
 The preparation contract is explicit:
 
 ```rust
-prepare_for_lease(work_lease, execution_profile_id)
+prepare_and_handoff(work_lease, execution_profile_id)
 ```
 
-Preparation locks and verifies the durable job command, checks the profile's
-provider and command schema, writes the work-item profile fence, and inserts
-all output submissions with the full profile snapshot. Repeated preparation
-must reproduce the same output, submission, profile, adapter, and command
-identities.
+The V2-only operation locks and verifies the durable job command, checks the
+profile's provider and command schema, writes the work-item profile fence, and
+inserts all output submissions with the full profile snapshot. In that same
+transaction it moves the attempt from `claimed` to `handed_off`, moves work
+from `leased` to `awaiting_executor`, and clears worker lease ownership.
+Repeated calls for the exact attempt and profile reproduce the same output,
+submission, profile, adapter, and command identities, including after the
+bound profile is disabled.
+
+Migration `0014_executor_handoff.sql` adds the handoff states and immutable
+timestamps. A deferred constraint trigger rejects commit unless every
+admission-owned output has exactly one bound submission, executor execution,
+and current-attempt attachment. The migration itself requires old active
+executor submissions to be drained.
 
 Claim uses one PostgreSQL transaction:
 
@@ -100,6 +110,15 @@ publishing terminal evidence.
 - `EXECUTOR_CREDENTIAL_REVISION`;
 - private runner, artifact, helper, executable, and credential-home paths.
 
+`workerd` enables V2 generation handoff only with
+`WORKER_EXECUTION_MODE=executor-handoff` and the same
+`EXECUTOR_PROFILE_KEY` used by executord. It validates the database profile
+before polling. This process mode does not construct a generator, settlement
+store, artifact store, or input store and does not require
+`GATEWAY_CODEX_HOME`. A V2 generation never falls back to inline Codex
+execution. The default `legacy-inline` mode retains the existing LegacyV1 path
+during migration.
+
 It loads the profile from PostgreSQL and rejects any mismatch with the compiled
 Codex generation adapter. Each immutable provider-account revision also stores
 the expected SHA-256 of `auth.json`; executord verifies that digest at startup
@@ -132,11 +151,16 @@ The PostgreSQL executor suite proves:
 - terminal recording does not depend on a second post-run heartbeat;
 - process restart still invokes the provider exactly once;
 - journal replay rejects a changed profile or adapter revision.
+- handoff commit failure rolls back submissions, executions, attachments,
+  profile binding, attempt state, and work state together;
+- twenty concurrent claims see only committed handoffs and retain one winner
+  per submission after the former worker lease deadline;
+- worker reconciliation ignores `awaiting_executor` work;
+- the production workerd V2 branch reaches `awaiting_executor/handed_off`
+  without invoking `ImageGenerator`.
 
 ## 7. Remaining Activation Gates
 
-- atomic `workerd -> awaiting_executor` handoff independent of the short worker
-  lease;
 - canonical executor terminal read-side and trusted receipt construction;
 - one-transaction output economics plus parent work/job/idempotency reduction;
 - normalized customer artifact publication and exact official response replay;

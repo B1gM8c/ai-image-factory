@@ -7,9 +7,10 @@ use uuid::Uuid;
 use super::{
     ExecutorArtifactAuthority, ExecutorArtifactAuthorityStore, ExecutorClaimScope,
     ExecutorEvidenceStore, ExecutorExecutionProfile, ExecutorExecutionProfileStore,
-    ExecutorLaunchContext, ExecutorLaunchContextStore, ExecutorResultManifest,
-    ExecutorRunnerObservation, ExecutorSubmissionError, ExecutorSubmissionLease,
-    ExecutorSubmissionOutcome, ExecutorSubmissionStore, PreparedExecutorSubmission,
+    ExecutorHandoffStore, ExecutorLaunchContext, ExecutorLaunchContextStore,
+    ExecutorResultManifest, ExecutorRunnerObservation, ExecutorSubmissionError,
+    ExecutorSubmissionLease, ExecutorSubmissionOutcome, ExecutorSubmissionStore,
+    PreparedExecutorSubmission,
 };
 use crate::admission::WorkLease;
 
@@ -46,6 +47,31 @@ struct DurableCommandRow {
     model: String,
     command_schema: String,
     command_json: Value,
+}
+
+#[derive(Clone, Copy)]
+enum HandoffParentState {
+    Leased,
+    HandedOff { execution_profile_id: Uuid },
+}
+
+struct LockedHandoffCommand {
+    command: DurableCommandRow,
+    parent_state: HandoffParentState,
+}
+
+#[derive(sqlx::FromRow)]
+struct HandoffParentRow {
+    command_schema: String,
+    command_json: Value,
+    work_state: String,
+    lease_owner: Option<String>,
+    lease_expires_at_ms: Option<i64>,
+    execution_profile_id: Option<Uuid>,
+    work_handed_off_at_ms: Option<i64>,
+    attempt_state: String,
+    worker_id: String,
+    attempt_handed_off_at_ms: Option<i64>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -404,8 +430,8 @@ impl ExecutorEvidenceStore for PostgresExecutorSubmissionStore {
 }
 
 #[async_trait]
-impl ExecutorSubmissionStore for PostgresExecutorSubmissionStore {
-    async fn prepare_for_lease(
+impl ExecutorHandoffStore for PostgresExecutorSubmissionStore {
+    async fn prepare_and_handoff(
         &self,
         lease: &WorkLease,
         execution_profile_id: Uuid,
@@ -415,151 +441,76 @@ impl ExecutorSubmissionStore for PostgresExecutorSubmissionStore {
             return Err(ExecutorSubmissionError::InvalidInput);
         }
         let mut tx = self.pool.begin().await.map_err(unavailable)?;
-        let command = lock_durable_command(&mut tx, lease).await?;
+        let locked = lock_durable_command(&mut tx, lease).await?;
+        let command = &locked.command;
         if command.command_schema != lease.command_schema
             || command.command_json != lease.command_json
         {
             return Err(ExecutorSubmissionError::Conflict);
         }
-        let profile = lock_active_execution_profile(&mut tx, execution_profile_id).await?;
+        if command.economics_contract_version != 2 {
+            return Err(ExecutorSubmissionError::Conflict);
+        }
+        let profile = match locked.parent_state {
+            HandoffParentState::Leased => {
+                lock_active_execution_profile(&mut tx, execution_profile_id).await?
+            }
+            HandoffParentState::HandedOff {
+                execution_profile_id: bound_profile_id,
+            } => {
+                if bound_profile_id != execution_profile_id {
+                    return Err(ExecutorSubmissionError::Conflict);
+                }
+                lock_bound_execution_profile(&mut tx, execution_profile_id).await?
+            }
+        };
         if profile.provider_id != command.provider_id
             || profile.command_schema != command.command_schema
         {
             return Err(ExecutorSubmissionError::Conflict);
         }
-        bind_work_execution_profile(&mut tx, lease, execution_profile_id).await?;
+        if matches!(locked.parent_state, HandoffParentState::Leased) {
+            bind_work_execution_profile(&mut tx, lease, execution_profile_id).await?;
+        }
         let output_count = command_output_count(command.requested_units, &command.command_json)?;
         let command_hash = command_hash(&command.command_json)?;
 
         let existing = load_existing(&mut tx, lease.job_id).await?;
-        if !existing.is_empty() {
-            if existing.iter().all(|row| row.submission_id.is_none()) {
-                if command.economics_contract_version != 2 {
-                    return Err(ExecutorSubmissionError::Conflict);
-                }
-                let prepared = prepare_admission_outputs(
-                    &mut tx,
-                    existing,
-                    lease,
-                    output_count,
-                    &command_hash,
-                    &command,
-                    &profile,
-                )
-                .await?;
-                tx.commit().await.map_err(unavailable)?;
-                return Ok(prepared);
-            }
+        let prepared = if existing.is_empty() {
+            return Err(ExecutorSubmissionError::Conflict);
+        } else if existing.iter().all(|row| row.submission_id.is_none()) {
+            prepare_admission_outputs(
+                &mut tx,
+                existing,
+                lease,
+                output_count,
+                &command_hash,
+                command,
+                &profile,
+            )
+            .await?
+        } else {
             let prepared = rebuild_existing(
                 existing,
                 lease,
                 output_count,
                 &command_hash,
-                &command,
+                command,
                 &profile,
             )?;
             attach_attempts(&mut tx, lease, &prepared).await?;
-            tx.commit().await.map_err(unavailable)?;
-            return Ok(prepared);
-        }
-        if command.economics_contract_version == 2 {
-            return Err(ExecutorSubmissionError::Conflict);
-        }
-
-        let now = database_now(&mut tx).await?;
-        let mut prepared = Vec::with_capacity(output_count as usize);
-        for output_index in 0..output_count {
-            let output_id = Uuid::new_v4();
-            let submission_id = Uuid::new_v4();
-            let executor_execution_id = distinct_execution_id(lease.execution_id, submission_id);
-            sqlx::query(
-                r#"
-                INSERT INTO job_outputs
-                  (output_id, job_id, output_index, state, created_at_ms, updated_at_ms)
-                VALUES ($1, $2, $3, 'pending', $4, $4)
-                "#,
-            )
-            .bind(output_id)
-            .bind(lease.job_id)
-            .bind(output_index)
-            .bind(now)
-            .execute(&mut *tx)
-            .await
-            .map_err(unavailable)?;
-            sqlx::query(
-                r#"
-                INSERT INTO provider_submissions
-                  (submission_id, executor_execution_id, output_id, job_id,
-                   tenant_id, provider_id, model, work_item_id,
-                   created_by_execution_id, created_by_lease_epoch, command_schema, command_hash,
-                   execution_profile_id, credential_pool_id, provider_account_id,
-                   credential_ref, credential_revision, adapter_revision,
-                   resource_policy_id, resource_policy_revision,
-                   state, prepared_at_ms, updated_at_ms)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
-                        $13, $14, $15, $16, $17, $18, $19, $20,
-                        'prepared', $21, $21)
-                "#,
-            )
-            .bind(submission_id)
-            .bind(executor_execution_id)
-            .bind(output_id)
-            .bind(lease.job_id)
-            .bind(&command.tenant_id)
-            .bind(&command.provider_id)
-            .bind(&command.model)
-            .bind(lease.work_item_id)
-            .bind(lease.execution_id)
-            .bind(lease.lease_epoch)
-            .bind(&lease.command_schema)
-            .bind(&command_hash)
-            .bind(profile.execution_profile_id)
-            .bind(profile.credential_pool_id)
-            .bind(profile.provider_account_id)
-            .bind(&profile.credential_ref)
-            .bind(profile.credential_revision)
-            .bind(&profile.adapter_revision)
-            .bind(profile.resource_policy_id)
-            .bind(profile.resource_policy_revision)
-            .bind(now)
-            .execute(&mut *tx)
-            .await
-            .map_err(unavailable)?;
-            sqlx::query(
-                r#"
-                INSERT INTO executor_executions
-                  (executor_execution_id, submission_id, state, created_at_ms, updated_at_ms)
-                VALUES ($1, $2, 'prepared', $3, $3)
-                "#,
-            )
-            .bind(executor_execution_id)
-            .bind(submission_id)
-            .bind(now)
-            .execute(&mut *tx)
-            .await
-            .map_err(unavailable)?;
-            let item = PreparedExecutorSubmission {
-                submission_id,
-                executor_execution_id,
-                output_id,
-                job_id: lease.job_id,
-                tenant_id: command.tenant_id.clone(),
-                provider_id: command.provider_id.clone(),
-                model: command.model.clone(),
-                work_item_id: lease.work_item_id,
-                output_index,
-                command_schema: lease.command_schema.clone(),
-                command_hash: command_hash.clone(),
-                execution_profile_id: profile.execution_profile_id,
-                adapter_revision: profile.adapter_revision.clone(),
-            };
-            insert_attachment(&mut tx, lease, submission_id, now).await?;
-            prepared.push(item);
+            prepared
+        };
+        if matches!(locked.parent_state, HandoffParentState::Leased) {
+            transition_to_executor_handoff(&mut tx, lease).await?;
         }
         tx.commit().await.map_err(unavailable)?;
         Ok(prepared)
     }
+}
 
+#[async_trait]
+impl ExecutorSubmissionStore for PostgresExecutorSubmissionStore {
     async fn resume_running(
         &self,
         scope: &ExecutorClaimScope,
@@ -664,8 +615,12 @@ impl ExecutorSubmissionStore for PostgresExecutorSubmissionStore {
             WHERE (e.state = 'prepared'
                OR (e.state = 'leased' AND e.lease_expires_at_ms <= $1))
               AND s.state = 'prepared'
-              AND w.state = 'running' AND w.lease_expires_at_ms > $1
-              AND a.state = 'running'
+              AND w.state = 'awaiting_executor'
+              AND w.lease_owner IS NULL AND w.lease_expires_at_ms IS NULL
+              AND w.execution_profile_id = s.execution_profile_id
+              AND w.handed_off_at_ms IS NOT NULL
+              AND a.state = 'handed_off'
+              AND a.handed_off_at_ms = w.handed_off_at_ms
               AND j.state IN ('reserved', 'queued', 'running')
               AND s.execution_profile_id = $2
               AND s.provider_id = $3 AND s.command_schema = $4
@@ -743,7 +698,7 @@ impl ExecutorSubmissionStore for PostgresExecutorSubmissionStore {
     async fn start(&self, lease: &ExecutorSubmissionLease) -> Result<(), ExecutorSubmissionError> {
         validate_executor_lease(lease)?;
         let mut tx = self.pool.begin().await.map_err(unavailable)?;
-        match lock_current_running_work(&mut tx, lease).await {
+        match lock_handed_off_work(&mut tx, lease).await {
             Ok(()) => {}
             Err(ExecutorSubmissionError::StaleLease) => {
                 tx.rollback().await.map_err(unavailable)?;
@@ -1084,7 +1039,7 @@ impl ExecutorSubmissionStore for PostgresExecutorSubmissionStore {
 async fn lock_durable_command(
     tx: &mut Transaction<'_, Postgres>,
     lease: &WorkLease,
-) -> Result<DurableCommandRow, ExecutorSubmissionError> {
+) -> Result<LockedHandoffCommand, ExecutorSubmissionError> {
     let job: Option<(i32, i16, String, String, String)> = sqlx::query_as(
         r#"
         SELECT requested_units, economics_contract_version, tenant_id, provider_id, model
@@ -1101,9 +1056,13 @@ async fn lock_durable_command(
     else {
         return Err(ExecutorSubmissionError::StaleLease);
     };
-    let payload: Option<(String, Value)> = sqlx::query_as(
+    let parent: Option<HandoffParentRow> = sqlx::query_as(
         r#"
-        SELECT p.command_schema, p.command_json
+        SELECT p.command_schema, p.command_json,
+               w.state AS work_state, w.lease_owner, w.lease_expires_at_ms,
+               w.execution_profile_id, w.handed_off_at_ms AS work_handed_off_at_ms,
+               a.state AS attempt_state, a.worker_id,
+               a.handed_off_at_ms AS attempt_handed_off_at_ms
         FROM work_items w
         JOIN job_attempts a
           ON a.work_item_id = w.work_item_id
@@ -1111,10 +1070,7 @@ async fn lock_durable_command(
          AND a.lease_epoch = w.lease_epoch
         JOIN job_payloads p ON p.job_id = w.job_id
         WHERE w.work_item_id = $1 AND w.job_id = $2
-          AND w.execution_id = $3 AND w.lease_epoch = $4 AND w.lease_owner = $5
-          AND w.state = 'leased' AND w.lease_expires_at_ms >
-              floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT
-          AND a.worker_id = $5 AND a.state = 'claimed'
+          AND w.execution_id = $3 AND w.lease_epoch = $4
         FOR UPDATE OF w, a
         "#,
     )
@@ -1122,21 +1078,53 @@ async fn lock_durable_command(
     .bind(lease.job_id)
     .bind(lease.execution_id)
     .bind(lease.lease_epoch)
-    .bind(&lease.worker_id)
     .fetch_optional(&mut **tx)
     .await
     .map_err(unavailable)?;
-    let Some((command_schema, command_json)) = payload else {
+    let Some(parent) = parent else {
         return Err(ExecutorSubmissionError::StaleLease);
     };
-    Ok(DurableCommandRow {
-        requested_units,
-        economics_contract_version,
-        tenant_id,
-        provider_id,
-        model,
-        command_schema,
-        command_json,
+    if parent.worker_id != lease.worker_id {
+        return Err(ExecutorSubmissionError::StaleLease);
+    }
+    let now = database_now(tx).await?;
+    let parent_state = if parent.work_state == "leased"
+        && parent.attempt_state == "claimed"
+        && parent.lease_owner.as_deref() == Some(lease.worker_id.as_str())
+        && parent
+            .lease_expires_at_ms
+            .is_some_and(|expires| expires > now)
+        && parent.execution_profile_id.is_none()
+        && parent.work_handed_off_at_ms.is_none()
+        && parent.attempt_handed_off_at_ms.is_none()
+    {
+        HandoffParentState::Leased
+    } else if parent.work_state == "awaiting_executor"
+        && parent.attempt_state == "handed_off"
+        && parent.lease_owner.is_none()
+        && parent.lease_expires_at_ms.is_none()
+        && parent.work_handed_off_at_ms.is_some()
+        && parent.work_handed_off_at_ms == parent.attempt_handed_off_at_ms
+    {
+        HandoffParentState::HandedOff {
+            execution_profile_id: parent
+                .execution_profile_id
+                .ok_or(ExecutorSubmissionError::Conflict)?,
+        }
+    } else {
+        return Err(ExecutorSubmissionError::StaleLease);
+    };
+    Ok(LockedHandoffCommand {
+        command: DurableCommandRow {
+            requested_units,
+            economics_contract_version,
+            tenant_id,
+            provider_id,
+            model,
+            command_schema: parent.command_schema,
+            command_json: parent.command_json,
+        },
+        parent_state,
     })
 }
 
@@ -1217,6 +1205,43 @@ async fn lock_active_execution_profile(
     .ok_or(ExecutorSubmissionError::Conflict)
 }
 
+async fn lock_bound_execution_profile(
+    tx: &mut Transaction<'_, Postgres>,
+    execution_profile_id: Uuid,
+) -> Result<ExecutionProfileRow, ExecutorSubmissionError> {
+    sqlx::query_as(
+        r#"
+        SELECT profile.execution_profile_id, profile.profile_key,
+               profile.provider_id, profile.command_schema, profile.adapter_revision,
+               profile.credential_pool_id, profile.provider_account_id,
+               profile.credential_ref, profile.credential_revision,
+               account.credential_auth_sha256,
+               profile.resource_policy_id, profile.resource_policy_revision,
+               policy.max_concurrency
+        FROM provider_execution_profiles profile
+        JOIN provider_credential_pools pool
+          ON pool.credential_pool_id = profile.credential_pool_id
+         AND pool.provider_id = profile.provider_id
+        JOIN provider_accounts account
+          ON account.provider_account_id = profile.provider_account_id
+         AND account.credential_pool_id = profile.credential_pool_id
+         AND account.provider_id = profile.provider_id
+         AND account.credential_ref = profile.credential_ref
+         AND account.credential_revision = profile.credential_revision
+        JOIN executor_resource_policies policy
+          ON policy.resource_policy_id = profile.resource_policy_id
+         AND policy.revision = profile.resource_policy_revision
+        WHERE profile.execution_profile_id = $1
+        FOR UPDATE OF profile, pool, account, policy
+        "#,
+    )
+    .bind(execution_profile_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(unavailable)?
+    .ok_or(ExecutorSubmissionError::Conflict)
+}
+
 async fn bind_work_execution_profile(
     tx: &mut Transaction<'_, Postgres>,
     lease: &WorkLease,
@@ -1247,6 +1272,63 @@ async fn bind_work_execution_profile(
     } else {
         Err(ExecutorSubmissionError::Conflict)
     }
+}
+
+async fn transition_to_executor_handoff(
+    tx: &mut Transaction<'_, Postgres>,
+    lease: &WorkLease,
+) -> Result<(), ExecutorSubmissionError> {
+    let now = database_now(tx).await?;
+    require_one(
+        sqlx::query(
+            r#"
+            UPDATE job_attempts
+            SET state = 'handed_off', handed_off_at_ms = $6, updated_at_ms = $6
+            WHERE execution_id = $1 AND work_item_id = $2 AND lease_epoch = $3
+              AND worker_id = $4 AND state = 'claimed'
+              AND handed_off_at_ms IS NULL
+              AND EXISTS (
+                SELECT 1 FROM work_items work
+                WHERE work.work_item_id = $2 AND work.job_id = $5
+                  AND work.execution_id = $1 AND work.lease_epoch = $3
+                  AND work.lease_owner = $4 AND work.state = 'leased'
+                  AND work.lease_expires_at_ms > $6
+              )
+            "#,
+        )
+        .bind(lease.execution_id)
+        .bind(lease.work_item_id)
+        .bind(lease.lease_epoch)
+        .bind(&lease.worker_id)
+        .bind(lease.job_id)
+        .bind(now)
+        .execute(&mut **tx)
+        .await
+        .map_err(unavailable)?,
+    )?;
+    require_one(
+        sqlx::query(
+            r#"
+            UPDATE work_items
+            SET state = 'awaiting_executor', lease_owner = NULL,
+                lease_expires_at_ms = NULL, handed_off_at_ms = $6,
+                updated_at_ms = $6
+            WHERE work_item_id = $1 AND job_id = $2
+              AND execution_id = $3 AND lease_epoch = $4 AND lease_owner = $5
+              AND state = 'leased' AND lease_expires_at_ms > $6
+              AND execution_profile_id IS NOT NULL
+            "#,
+        )
+        .bind(lease.work_item_id)
+        .bind(lease.job_id)
+        .bind(lease.execution_id)
+        .bind(lease.lease_epoch)
+        .bind(&lease.worker_id)
+        .bind(now)
+        .execute(&mut **tx)
+        .await
+        .map_err(unavailable)?,
+    )
 }
 
 async fn prepare_admission_outputs(
@@ -1665,7 +1747,7 @@ async fn release_capacity_allocation(
     Ok(())
 }
 
-async fn lock_current_running_work(
+async fn lock_handed_off_work(
     tx: &mut Transaction<'_, Postgres>,
     lease: &ExecutorSubmissionLease,
 ) -> Result<(), ExecutorSubmissionError> {
@@ -1685,9 +1767,12 @@ async fn lock_current_running_work(
          AND pa.attempt_execution_id = a.execution_id
          AND pa.lease_epoch = a.lease_epoch
         WHERE w.work_item_id = $1 AND w.job_id = $2
-          AND w.state = 'running' AND w.lease_expires_at_ms >
-              floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT
-          AND a.state = 'running'
+          AND w.state = 'awaiting_executor'
+          AND w.lease_owner IS NULL AND w.lease_expires_at_ms IS NULL
+          AND w.execution_profile_id = $4
+          AND w.handed_off_at_ms IS NOT NULL
+          AND a.state = 'handed_off'
+          AND a.handed_off_at_ms = w.handed_off_at_ms
           AND j.state IN ('reserved', 'queued', 'running')
         FOR UPDATE OF w, a
         "#,
@@ -1695,6 +1780,7 @@ async fn lock_current_running_work(
     .bind(lease.work_item_id)
     .bind(lease.job_id)
     .bind(lease.submission_id)
+    .bind(lease.execution_profile_id)
     .fetch_optional(&mut **tx)
     .await
     .map_err(unavailable)?;

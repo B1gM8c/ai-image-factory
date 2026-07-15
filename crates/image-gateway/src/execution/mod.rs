@@ -25,6 +25,7 @@ pub struct GenerationExecutionContext {
     pub reservation: UsageReservation,
     pub api_profile: String,
     pub response_schema: String,
+    pub economics_contract_version: i16,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -41,6 +42,7 @@ pub struct EditExecutionContext {
     pub inputs: Vec<PersistedEditInput>,
     pub reservation: UsageReservation,
     pub response_schema: String,
+    pub economics_contract_version: i16,
 }
 
 #[async_trait]

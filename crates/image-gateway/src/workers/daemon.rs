@@ -8,12 +8,13 @@ use super::{
 use crate::{
     ImageGatewayError,
     admission::{
-        AdmissionError, AdmissionStore, EDIT_COMMAND_SCHEMA, EditInputRoleV1,
+        AdmissionContract, AdmissionError, AdmissionStore, EDIT_COMMAND_SCHEMA, EditInputRoleV1,
         GENERATION_COMMAND_SCHEMA,
     },
     artifacts::ArtifactBlobStore,
     core::provider::validate_edit_job,
     execution::{EditExecutionContext, ExecutionContextError, ExecutionContextStore},
+    executor::{ExecutorHandoffStore, ExecutorSubmissionError},
     generator::{EditJob, ImageGenerator, InputImage},
     input_blobs::{InputBlobReadError, InputBlobStore},
     settlement::ExecutionSettlementStore,
@@ -23,9 +24,16 @@ pub struct Workerd {
     worker_id: String,
     admission: Arc<dyn AdmissionStore>,
     contexts: Arc<dyn ExecutionContextStore>,
-    generation: GenerationWorker,
-    inputs: Arc<dyn InputBlobStore>,
+    generation: Option<GenerationWorker>,
+    inputs: Option<Arc<dyn InputBlobStore>>,
     lease_duration: Duration,
+    executor_handoff: Option<ExecutorHandoffTarget>,
+    contract: AdmissionContract,
+}
+
+struct ExecutorHandoffTarget {
+    store: Arc<dyn ExecutorHandoffStore>,
+    execution_profile_id: Uuid,
 }
 
 impl Workerd {
@@ -59,16 +67,50 @@ impl Workerd {
             worker_id,
             admission,
             contexts,
-            generation,
-            inputs,
+            generation: Some(generation),
+            inputs: Some(inputs),
             lease_duration: request_timeout.saturating_add(INLINE_LEASE_GRACE),
+            executor_handoff: None,
+            contract: AdmissionContract::LegacyV1,
+        })
+    }
+
+    pub fn new_handoff_only(
+        worker_id: String,
+        admission: Arc<dyn AdmissionStore>,
+        contexts: Arc<dyn ExecutionContextStore>,
+        store: Arc<dyn ExecutorHandoffStore>,
+        execution_profile_id: Uuid,
+        lease_duration: Duration,
+    ) -> Result<Self, ImageGatewayError> {
+        if execution_profile_id.is_nil() || lease_duration.is_zero() {
+            return Err(ImageGatewayError::config(
+                "workerd executor handoff configuration is invalid",
+            ));
+        }
+        Ok(Self {
+            worker_id,
+            admission,
+            contexts,
+            generation: None,
+            inputs: None,
+            lease_duration,
+            executor_handoff: Some(ExecutorHandoffTarget {
+                store,
+                execution_profile_id,
+            }),
+            contract: AdmissionContract::OutputEconomicsV2,
         })
     }
 
     pub async fn run_once(&self) -> Result<Option<Uuid>, ImageGatewayError> {
         let Some(lease) = self
             .admission
-            .claim_ready(&self.worker_id, duration_ms(self.lease_duration))
+            .claim_ready(
+                &self.worker_id,
+                duration_ms(self.lease_duration),
+                self.contract,
+            )
             .await
             .map_err(map_admission_error)?
         else {
@@ -93,9 +135,11 @@ impl Workerd {
         let context = match self.contexts.load_generation(lease).await {
             Ok(context) => context,
             Err(ExecutionContextError::Invalid { reservation }) => {
-                self.generation
-                    .reject_invalid_context(lease, &reservation)
-                    .await?;
+                if let Some(generation) = &self.generation {
+                    generation
+                        .reject_invalid_context(lease, &reservation)
+                        .await?;
+                }
                 return Err(ImageGatewayError::internal(
                     "durable execution context failed integrity validation",
                 ));
@@ -106,11 +150,19 @@ impl Workerd {
                 ));
             }
         };
+        if context.economics_contract_version == 2 {
+            return self.handoff_generation(lease).await;
+        }
+        let generation = self.generation.as_ref().ok_or_else(|| {
+            ImageGatewayError::service_unavailable(
+                "LegacyV1 inline generation is disabled for this workerd",
+            )
+        })?;
         self.admission
             .start(lease)
             .await
             .map_err(map_admission_error)?;
-        self.generation
+        generation
             .execute(
                 lease,
                 &context.reservation,
@@ -129,9 +181,11 @@ impl Workerd {
         let context = match self.contexts.load_edit(lease).await {
             Ok(context) => context,
             Err(ExecutionContextError::Invalid { reservation }) => {
-                self.generation
-                    .reject_invalid_context(lease, &reservation)
-                    .await?;
+                if let Some(generation) = &self.generation {
+                    generation
+                        .reject_invalid_context(lease, &reservation)
+                        .await?;
+                }
                 return Err(ImageGatewayError::internal(
                     "durable edit execution context failed integrity validation",
                 ));
@@ -142,10 +196,23 @@ impl Workerd {
                 ));
             }
         };
-        let mut hydration_heartbeat = self.generation.start_heartbeat(lease.clone());
+        if context.economics_contract_version == 2 {
+            return Err(ImageGatewayError::service_unavailable(
+                "V2 edit executor handoff is not configured",
+            ));
+        }
+        let generation = self.generation.as_ref().ok_or_else(|| {
+            ImageGatewayError::service_unavailable(
+                "LegacyV1 inline edits are disabled for this workerd",
+            )
+        })?;
+        let inputs = self.inputs.as_ref().ok_or_else(|| {
+            ImageGatewayError::service_unavailable("workerd input storage is unavailable")
+        })?;
+        let mut hydration_heartbeat = generation.start_heartbeat(lease.clone());
         let hydration = run_until_lease_lost(
             &mut hydration_heartbeat.lost,
-            hydrate_edit_job(self.inputs.as_ref(), &context),
+            hydrate_edit_job(inputs.as_ref(), &context),
         )
         .await;
         hydration_heartbeat.stop().await;
@@ -158,7 +225,7 @@ impl Workerd {
                     .start(lease)
                     .await
                     .map_err(map_admission_error)?;
-                self.generation
+                generation
                     .reject_before_provider(lease, &context.reservation, error_code)
                     .await?;
                 return Err(error);
@@ -169,7 +236,7 @@ impl Workerd {
             .await
             .map_err(map_admission_error)?;
         let api_profile = context.command.source_api_profile.clone();
-        self.generation
+        generation
             .execute_edit(
                 lease,
                 &context.reservation,
@@ -179,6 +246,21 @@ impl Workerd {
             )
             .await?;
         Ok(())
+    }
+
+    async fn handoff_generation(
+        &self,
+        lease: &crate::admission::WorkLease,
+    ) -> Result<(), ImageGatewayError> {
+        let target = self.executor_handoff.as_ref().ok_or_else(|| {
+            ImageGatewayError::service_unavailable("V2 generation executor handoff is unavailable")
+        })?;
+        target
+            .store
+            .prepare_and_handoff(lease, target.execution_profile_id)
+            .await
+            .map(drop)
+            .map_err(map_handoff_error)
     }
 }
 
@@ -257,6 +339,18 @@ fn map_admission_error(error: AdmissionError) -> ImageGatewayError {
         | AdmissionError::StaleLease
         | AdmissionError::InvalidCommand => {
             ImageGatewayError::internal("durable work lease is stale or invalid")
+        }
+    }
+}
+
+fn map_handoff_error(error: ExecutorSubmissionError) -> ImageGatewayError {
+    match error {
+        ExecutorSubmissionError::Unavailable => {
+            ImageGatewayError::service_unavailable("executor handoff storage unavailable")
+        }
+        ExecutorSubmissionError::StaleLease => ImageGatewayError::timeout(),
+        ExecutorSubmissionError::Conflict | ExecutorSubmissionError::InvalidInput => {
+            ImageGatewayError::internal("executor handoff failed integrity validation")
         }
     }
 }

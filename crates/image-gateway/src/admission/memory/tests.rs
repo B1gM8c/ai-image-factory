@@ -250,11 +250,36 @@ async fn claim_job_only_takes_the_requested_ready_work() {
     );
 
     let remaining = store
-        .claim_ready("worker-c", 30_000)
+        .claim_ready("worker-c", 30_000, AdmissionContract::LegacyV1)
         .await
         .expect("claim_ready must succeed")
         .expect("second job must remain ready");
     assert_eq!(remaining.job_id, second_job);
+}
+
+#[tokio::test]
+async fn ready_claim_does_not_cross_economics_contracts() {
+    let store = InMemoryAdmissionStore::default();
+    let job_id = Uuid::new_v4();
+    attach(&store, owner(&store, None, "legacy").await, job_id).await;
+
+    assert!(
+        store
+            .claim_ready(
+                "handoff-worker",
+                30_000,
+                AdmissionContract::OutputEconomicsV2,
+            )
+            .await
+            .expect("V2 claim must succeed")
+            .is_none()
+    );
+    let lease = store
+        .claim_ready("inline-worker", 30_000, AdmissionContract::LegacyV1)
+        .await
+        .expect("LegacyV1 claim must succeed")
+        .expect("legacy work must remain ready");
+    assert_eq!(lease.job_id, job_id);
 }
 
 #[tokio::test]

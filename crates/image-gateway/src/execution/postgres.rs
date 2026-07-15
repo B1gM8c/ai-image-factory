@@ -43,6 +43,7 @@ struct ExecutionRow {
     provider_id: String,
     model: String,
     requested_units: i32,
+    economics_contract_version: i16,
     reservation_id: Uuid,
     command_schema: String,
     command_json: Value,
@@ -95,7 +96,7 @@ impl ExecutionContextStore for PostgresExecutionContextStore {
         let row: ExecutionRow = sqlx::query_as(
             r#"
             SELECT j.job_id, j.tenant_id, j.request_id, j.operation, j.provider_id,
-                   j.model, j.requested_units, j.reservation_id,
+                   j.model, j.requested_units, j.economics_contract_version, j.reservation_id,
                    qr.admission_session_id AS quota_admission_session_id,
                    p.command_schema, p.command_json, p.request_hash,
                    qr.limit_5h, qr.remaining_5h, qr.limit_7d, qr.remaining_7d,
@@ -177,6 +178,7 @@ impl ExecutionContextStore for PostgresExecutionContextStore {
             reservation,
             api_profile: command.source_api_profile,
             response_schema: GENERATION_RESPONSE_SCHEMA.to_string(),
+            economics_contract_version: row.economics_contract_version,
         })
     }
 
@@ -187,7 +189,7 @@ impl ExecutionContextStore for PostgresExecutionContextStore {
         let rows: Vec<EditExecutionRow> = sqlx::query_as(
             r#"
             SELECT j.job_id, j.tenant_id, j.request_id, j.operation, j.provider_id,
-                   j.model, j.requested_units, j.reservation_id,
+                   j.model, j.requested_units, j.economics_contract_version, j.reservation_id,
                    qr.admission_session_id AS quota_admission_session_id,
                    p.command_schema, p.command_json, p.request_hash,
                    qr.limit_5h, qr.remaining_5h, qr.limit_7d, qr.remaining_7d,
@@ -263,6 +265,7 @@ impl ExecutionContextStore for PostgresExecutionContextStore {
             inputs,
             reservation,
             response_schema: GENERATION_RESPONSE_SCHEMA.to_string(),
+            economics_contract_version: first.execution.economics_contract_version,
         })
     }
 }

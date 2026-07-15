@@ -119,6 +119,67 @@ async fn final_accept_creates_one_frozen_economic_identity_set() -> TestResult {
 }
 
 #[tokio::test]
+async fn ready_claims_are_isolated_by_economics_contract() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let store = PostgresAdmissionStore::new(database.pool.clone());
+
+        let legacy_ticket = claim_owner(&store, claim_request(None, "1".repeat(64))).await?;
+        let legacy_job = insert_job_for_ticket(
+            &database.pool,
+            &legacy_ticket,
+            "tenant-a",
+            "generation",
+            None,
+        )
+        .await?;
+        store
+            .attach(attach_request(legacy_ticket, legacy_job))
+            .await
+            .map_err(|error| format!("legacy attach failed: {error:?}"))?;
+
+        let v2_ticket = claim_owner(&store, claim_request(None, "2".repeat(64))).await?;
+        let v2_job =
+            insert_job_for_ticket(&database.pool, &v2_ticket, "tenant-a", "generation", None)
+                .await?;
+        let mut v2_request = attach_request(v2_ticket, v2_job);
+        v2_request.contract = AdmissionContract::OutputEconomicsV2;
+        store
+            .attach(v2_request)
+            .await
+            .map_err(|error| format!("V2 attach failed: {error:?}"))?;
+
+        let v2_lease = store
+            .claim_ready(
+                "executor-handoff-worker",
+                30_000,
+                AdmissionContract::OutputEconomicsV2,
+            )
+            .await
+            .map_err(|error| format!("V2 claim failed: {error:?}"))?
+            .ok_or_else(|| "V2 worker did not find V2 work".to_string())?;
+        require(
+            v2_lease.job_id == v2_job,
+            "V2 worker claimed the older LegacyV1 job",
+        )?;
+
+        let legacy_lease = store
+            .claim_ready("legacy-worker", 30_000, AdmissionContract::LegacyV1)
+            .await
+            .map_err(|error| format!("legacy claim failed: {error:?}"))?
+            .ok_or_else(|| "legacy worker did not find LegacyV1 work".to_string())?;
+        require(
+            legacy_lease.job_id == legacy_job,
+            "LegacyV1 worker claimed V2 work or the legacy job was starved",
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
 async fn insufficient_billing_credit_rolls_back_the_entire_accept() -> TestResult {
     let Some(database) = TestDatabase::new().await? else {
         return Ok(());
@@ -501,7 +562,7 @@ async fn durable_claim_uses_weighted_finish_tags_and_waiting_aging() -> TestResu
         let mut first_four = Vec::new();
         for _ in 0..4 {
             let lease = store
-                .claim_ready("fair-worker", 30_000)
+                .claim_ready("fair-worker", 30_000, AdmissionContract::LegacyV1)
                 .await
                 .map_err(|error| format!("weighted ready claim failed: {error}"))?
                 .ok_or_else(|| "weighted queue unexpectedly empty".to_string())?;
@@ -966,7 +1027,7 @@ async fn attachment_and_fencing_case(database: &TestDatabase) -> TestResult {
         .await
         .map_err(|error| format!("valid owner failed to attach: {error}"))?;
     let lease = store
-        .claim_ready("worker-a", 30_000)
+        .claim_ready("worker-a", 30_000, AdmissionContract::LegacyV1)
         .await
         .map_err(|error| format!("work claim failed: {error}"))?
         .ok_or_else(|| "attached work was not ready".to_string())?;
@@ -976,7 +1037,7 @@ async fn attachment_and_fencing_case(database: &TestDatabase) -> TestResult {
     )?;
     require(
         store
-            .claim_ready("worker-b", 30_000)
+            .claim_ready("worker-b", 30_000, AdmissionContract::LegacyV1)
             .await
             .map_err(|error| format!("second claim failed: {error}"))?
             .is_none(),

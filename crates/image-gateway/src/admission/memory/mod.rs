@@ -72,6 +72,7 @@ struct WorkItem {
     command_schema: String,
     command_json: Value,
     input_manifest: Option<AttachInputManifest>,
+    contract: super::AdmissionContract,
     schedule_priority: u8,
     schedule_finish_tag: u64,
     enqueued_at_ms: u64,
@@ -261,6 +262,7 @@ impl AdmissionStore for InMemoryAdmissionStore {
                 command_schema: request.command_schema,
                 command_json: request.command_json,
                 input_manifest: request.input_manifest,
+                contract: request.contract,
                 schedule_priority: request.schedule_priority,
                 schedule_finish_tag,
                 enqueued_at_ms: now as u64,
@@ -353,8 +355,9 @@ impl AdmissionStore for InMemoryAdmissionStore {
         &self,
         worker_id: &str,
         lease_duration_ms: i64,
+        contract: super::AdmissionContract,
     ) -> Result<Option<WorkLease>, AdmissionError> {
-        self.claim_matching(None, worker_id, lease_duration_ms)
+        self.claim_matching(None, worker_id, lease_duration_ms, Some(contract))
             .await
     }
 
@@ -364,7 +367,7 @@ impl AdmissionStore for InMemoryAdmissionStore {
         worker_id: &str,
         lease_duration_ms: i64,
     ) -> Result<Option<WorkLease>, AdmissionError> {
-        self.claim_matching(Some(job_id), worker_id, lease_duration_ms)
+        self.claim_matching(Some(job_id), worker_id, lease_duration_ms, None)
             .await
     }
 
@@ -437,6 +440,7 @@ impl InMemoryAdmissionStore {
         job_id: Option<Uuid>,
         worker_id: &str,
         lease_duration_ms: i64,
+        contract: Option<super::AdmissionContract>,
     ) -> Result<Option<WorkLease>, AdmissionError> {
         let now = now_ms();
         let mut state = self.state.lock().await;
@@ -448,6 +452,7 @@ impl InMemoryAdmissionStore {
                 state.work_items.get(work_item_id).is_some_and(|work| {
                     work.state == WorkState::Ready
                         && job_id.is_none_or(|job_id| work.job_id == job_id)
+                        && contract.is_none_or(|contract| work.contract == contract)
                 })
             })
             .min_by_key(|work_item_id| {

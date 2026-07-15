@@ -264,6 +264,7 @@ pub trait AdmissionStore: Send + Sync + 'static {
         &self,
         worker_id: &str,
         lease_duration_ms: i64,
+        contract: AdmissionContract,
     ) -> Result<Option<WorkLease>, AdmissionError>;
 
     async fn claim_job(

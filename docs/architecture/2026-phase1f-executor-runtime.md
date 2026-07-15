@@ -4,10 +4,12 @@ Status: the persistent executor runtime, independent `executord`, Codex helper,
 private process spool, immutable artifact authority, and append-only
 observation/resolution path are implemented. Phase 1G also binds every new
 submission to an immutable database execution profile and acquires durable
-provider capacity before launch. Process-level PostgreSQL tests cover one
-launch, restart attach, `SIGTERM` drain, owner-session loss, capacity races,
-and late evidence after executor lease expiry. The production Images API remains on
-`LegacyV1` until every open activation gate in this document passes.
+provider capacity before launch. Phase 1H atomically transfers V2 work from
+the worker lease into executor ownership. Process-level PostgreSQL tests cover
+one launch, restart attach, `SIGTERM` drain, owner-session loss, capacity
+races, handoff rollback/replay, and late evidence after executor lease expiry.
+The production Images API remains on `LegacyV1` until every open activation
+gate in this document passes.
 
 The checkpoint includes owner-and-scope singleton supervision, exact launch
 context projection, output-scoped Codex command projection, idempotent database
@@ -46,7 +48,8 @@ durable runner -> submission-scoped spool -> artifact store
 ```
 
 `workerd` never spawns a provider process on the V2 path. It may only prepare a
-submission and make it eligible for a provider-scoped executor. `executord`
+submission and atomically move the parent work to `awaiting_executor`. The
+worker owner and deadline are cleared in the same commit. `executord`
 does not settle customer balances. It records provider evidence and a durable
 result manifest; the economic reducer performs customer settlement later.
 
@@ -118,7 +121,8 @@ pidfd identity.
 ## 5. Lease And Crash Semantics
 
 `executord` first imports pending late evidence, then resumes its own unexpired
-running work, then claims prepared work. A fresh claim transitions
+running work, then claims prepared work whose parent is durably
+`awaiting_executor/handed_off`. A fresh claim transitions
 `prepared -> leased`; immediately before runner authority is handed over, it
 transitions `leased -> running`.
 
@@ -153,7 +157,9 @@ Crash outcomes are deliberately asymmetric:
 
 | Crash boundary | Recovery |
 | --- | --- |
-| before executor start | prepared/leased work may be safely reclaimed according to its state |
+| before handoff commit | worker lease reconciliation may safely requeue; no executor identity is visible |
+| after handoff commit, before executor claim | `awaiting_executor` is independent of the old worker deadline and remains claimable |
+| after executor claim, before executor start | the expired executor lease may be reclaimed with the same identity and capacity allocation |
 | after executor start, before runner journal | do not renew or relaunch; expiry becomes canonical uncertain |
 | after journal, before provider launch evidence | attach only; missing local proof remains retryable until expiry |
 | after provider launch | attach the same execution; never launch a replacement |
@@ -240,6 +246,7 @@ Production V2 traffic remains disabled according to this gate matrix:
 | Gate | Status | Evidence or remaining requirement |
 | --- | --- | --- |
 | concurrent prepare/claim/resume/attach preserve one identity | passed | PostgreSQL concurrency and process restart tests |
+| workerd handoff is atomic and independent of worker lease | passed | migration 0014, commit-failure rollback, replay, reconciliation, and V2 workerd tests |
 | stale worker/executor epochs cannot mutate canonical state | passed | database fencing and expiry tests |
 | restart attaches without a second provider launch | passed | real executord/helper test, invocation count equals one |
 | journal/spool/commit ambiguity fails closed and can replay | passed | hostile filesystem tests, late-evidence test, artifact retry test |
