@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 type TestResult<T = ()> = Result<T, String>;
 
-const REQUIRED_COLUMNS: [(&str, &str); 93] = [
+const REQUIRED_COLUMNS: [(&str, &str); 120] = [
     ("usage_events", "tenant_id"),
     ("quota_reservations", "tenant_id"),
     ("quota_reservations", "job_id"),
@@ -69,6 +69,7 @@ const REQUIRED_COLUMNS: [(&str, &str); 93] = [
     ("executor_resource_policies", "allocated_count"),
     ("executor_capacity_allocations", "state"),
     ("executor_capacity_allocations", "release_decision_id"),
+    ("executor_capacity_allocations", "release_reconciliation_id"),
     ("work_items", "handed_off_at_ms"),
     ("job_attempts", "handed_off_at_ms"),
     ("executor_terminal_reductions", "submission_id"),
@@ -105,6 +106,50 @@ const REQUIRED_COLUMNS: [(&str, &str); 93] = [
     ("provider_submit_recoveries", "next_recovery_at_ms"),
     ("provider_submit_recoveries", "recovery_owner"),
     ("provider_submit_recoveries", "recovery_lease_epoch"),
+    ("provider_capacity_reconciliations", "reconciliation_id"),
+    ("provider_capacity_reconciliations", "submission_id"),
+    ("provider_capacity_reconciliations", "executor_execution_id"),
+    ("provider_capacity_reconciliations", "provider_id"),
+    ("provider_capacity_reconciliations", "provider_account_id"),
+    (
+        "provider_capacity_reconciliations",
+        "provider_deadline_at_ms",
+    ),
+    ("provider_capacity_reconciliations", "state"),
+    ("provider_capacity_reconciliations", "available_at_ms"),
+    ("provider_capacity_reconciliations", "reconciliation_owner"),
+    (
+        "provider_capacity_reconciliations",
+        "reconciliation_lease_epoch",
+    ),
+    ("provider_capacity_reconciliations", "evidence_revision"),
+    (
+        "provider_capacity_reconciliations",
+        "claimed_evidence_revision",
+    ),
+    ("provider_capacity_reconciliations", "last_command_kind"),
+    ("provider_capacity_reconciliations", "last_command_id"),
+    ("provider_capacity_reconciliations", "last_command_owner"),
+    (
+        "provider_capacity_reconciliations",
+        "last_command_lease_epoch",
+    ),
+    (
+        "provider_capacity_reconciliations",
+        "claim_command_claimed_at_ms",
+    ),
+    (
+        "provider_capacity_reconciliations",
+        "claim_command_lease_expires_at_ms",
+    ),
+    ("provider_capacity_reconciliations", "evidence_kind"),
+    ("provider_capacity_reconciliations", "remote_operation_id"),
+    ("provider_capacity_reconciliations", "remote_terminal_state"),
+    ("provider_capacity_reconciliations", "event_identity"),
+    ("provider_capacity_reconciliations", "payload_hash"),
+    ("provider_capacity_reconciliations", "created_at_ms"),
+    ("provider_capacity_reconciliations", "updated_at_ms"),
+    ("provider_capacity_reconciliations", "released_at_ms"),
     (
         "executor_resolution_decisions",
         "provider_task_observation_id",
@@ -112,7 +157,7 @@ const REQUIRED_COLUMNS: [(&str, &str); 93] = [
     ("executor_resolution_decisions", "provider_submit_intent_id"),
 ];
 
-const REQUIRED_INDEXES: [&str; 18] = [
+const REQUIRED_INDEXES: [&str; 21] = [
     "usage_events_tenant_created_at_ms_idx",
     "gateway_api_keys_project_id_idx",
     "quota_reservations_active_tenant_idx",
@@ -131,6 +176,9 @@ const REQUIRED_INDEXES: [&str; 18] = [
     "provider_submit_intents_remote_operation_uidx",
     "provider_submit_recoveries_claim_idx",
     "provider_submit_recoveries_deadline_idx",
+    "provider_capacity_reconciliations_claim_idx",
+    "provider_capacity_reconciliations_remote_operation_idx",
+    "provider_capacity_reconciliations_claim_command_idx",
 ];
 
 #[tokio::test]
@@ -1019,9 +1067,9 @@ async fn assert_expected_schema(pool: &PgPool) -> TestResult {
     require(
         migration_versions(pool).await?
             == vec![
-                0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21,
+                0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22,
             ],
-        "applied migration versions must be exactly [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21]",
+        "applied migration versions must be exactly [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22]",
     )?;
 
     for (table, column) in REQUIRED_COLUMNS {

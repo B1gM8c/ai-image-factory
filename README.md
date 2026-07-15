@@ -30,8 +30,10 @@ The current CLI execution boundary and activation gates are documented in
 [`docs/architecture/2026-phase2a-provider-runtime-boundaries.md`](docs/architecture/2026-phase2a-provider-runtime-boundaries.md).
 The inactive Dreamina CLI adapter and its production gates are documented in
 [`docs/architecture/2026-phase2b-dreamina-cli-adapter.md`](docs/architecture/2026-phase2b-dreamina-cli-adapter.md).
-The current remote-submit deadline and conservative capacity boundary is documented in
+The remote-submit deadline quarantine is documented in
 [`docs/architecture/2026-phase2f-provider-submit-deadline-quarantine.md`](docs/architecture/2026-phase2f-provider-submit-deadline-quarantine.md).
+Its independent capacity reconciliation and strong-evidence release boundary is documented in
+[`docs/architecture/2026-phase2g-provider-capacity-reconciliation.md`](docs/architecture/2026-phase2g-provider-capacity-reconciliation.md).
 Database-bound provider profiles and durable capacity are documented in
 [`docs/architecture/2026-phase1g-execution-binding-capacity.md`](docs/architecture/2026-phase1g-execution-binding-capacity.md).
 

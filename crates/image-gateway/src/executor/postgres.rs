@@ -210,6 +210,7 @@ struct CapacityAllocationRow {
     resource_policy_id: Uuid,
     resource_policy_revision: i64,
     release_decision_id: Option<Uuid>,
+    release_reconciliation_id: Option<Uuid>,
     released_state: Option<String>,
     release_reason: Option<String>,
 }
@@ -905,6 +906,7 @@ impl ExecutorSubmissionStore for PostgresExecutorSubmissionStore {
                 lease.submission_id,
                 locked.state.as_str(),
                 "terminal_evidence",
+                None,
                 now,
             )
             .await?;
@@ -987,6 +989,7 @@ impl ExecutorSubmissionStore for PostgresExecutorSubmissionStore {
             lease.submission_id,
             state,
             "terminal_evidence",
+            None,
             now,
         )
         .await?;
@@ -1686,12 +1689,14 @@ pub(crate) async fn release_capacity_allocation(
     submission_id: Uuid,
     released_state: &str,
     release_reason: &str,
+    release_reconciliation_id: Option<Uuid>,
     now: i64,
 ) -> Result<(), ExecutorSubmissionError> {
     let allocation: Option<CapacityAllocationRow> = sqlx::query_as(
         r#"
             SELECT state, resource_policy_id, resource_policy_revision,
-                   release_decision_id, released_state, release_reason
+                   release_decision_id, release_reconciliation_id,
+                   released_state, release_reason
             FROM executor_capacity_allocations
             WHERE executor_execution_id = $1 AND submission_id = $2
             FOR UPDATE
@@ -1707,6 +1712,7 @@ pub(crate) async fn release_capacity_allocation(
     };
     if allocation.state == "released" {
         return if allocation.release_decision_id == Some(executor_execution_id)
+            && allocation.release_reconciliation_id == release_reconciliation_id
             && allocation.released_state.as_deref() == Some(released_state)
             && allocation.release_reason.as_deref() == Some(release_reason)
         {
@@ -1722,9 +1728,10 @@ pub(crate) async fn release_capacity_allocation(
         sqlx::query(
             r#"
             UPDATE executor_capacity_allocations
-            SET state = 'released', released_at_ms = $5,
+            SET state = 'released', released_at_ms = $6,
                 release_decision_id = $1, released_state = $3, release_reason = $4,
-                last_heartbeat_at_ms = GREATEST(last_heartbeat_at_ms, $5)
+                release_reconciliation_id = $5,
+                last_heartbeat_at_ms = GREATEST(last_heartbeat_at_ms, $6)
             WHERE executor_execution_id = $1 AND submission_id = $2 AND state = 'held'
             "#,
         )
@@ -1732,6 +1739,7 @@ pub(crate) async fn release_capacity_allocation(
         .bind(submission_id)
         .bind(released_state)
         .bind(release_reason)
+        .bind(release_reconciliation_id)
         .bind(now)
         .execute(&mut **tx)
         .await
@@ -2220,6 +2228,7 @@ async fn update_expired_execution(
             row.submission_id,
             target,
             "executor_start_abandoned",
+            None,
             now,
         )
         .await?;
@@ -2230,6 +2239,7 @@ async fn update_expired_execution(
             row.submission_id,
             target,
             "terminal_evidence",
+            None,
             now,
         )
         .await?;

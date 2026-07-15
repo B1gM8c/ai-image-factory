@@ -2,9 +2,10 @@
 
 Status: implemented and PostgreSQL-tested. A submit whose remote effect remains
 unknown at its frozen provider deadline now reaches a customer-terminal uncertain
-projection without releasing provider capacity. Remote provider activation still
-requires capacity reconciliation evidence, recoverable artifact materialization,
-operation descriptor identity, and the single provider orchestrator.
+projection without releasing provider capacity. Independent release evidence was
+implemented in Phase 2G. Remote provider activation still requires recoverable
+artifact materialization, operation descriptor identity, the single provider
+orchestrator, and the mixed-load activation benchmark.
 
 ## Scope
 
@@ -164,15 +165,15 @@ switch and verify both stages before enabling deadline workers.
 
 ## Remaining Activation Gates
 
-1. Add independent capacity reconciliation evidence and a scoped queue for late
-   receipts, confirmed no-effect outcomes, and remote terminal evidence. It may
-   release capacity exactly once but cannot change the customer decision.
-2. Make `artifact_ready -> canonical success` atomic or restart-recoverable.
-3. Add the single submit/recovery/deadline/poll/materialization orchestrator. It
+Independent capacity reconciliation is implemented in
+[`2026-phase2g-provider-capacity-reconciliation.md`](2026-phase2g-provider-capacity-reconciliation.md).
+
+1. Make `artifact_ready -> canonical success` atomic or restart-recoverable.
+2. Add the single submit/recovery/deadline/reconciliation/poll/materialization orchestrator. It
    must be the only external side-effect caller.
-4. Persist operation descriptor identity and bind provider, operation,
+3. Persist operation descriptor identity and bind provider, operation,
    descriptor, adapter, submission, and idempotency identities.
-5. Make recovery claim/defer commands exactly replayable after commit-response
+4. Make recovery claim/defer commands exactly replayable after commit-response
    loss, then run the mixed-load latency, lock, buffer, and WAL benchmark.
 
 Dreamina and other remote CLI providers remain inactive until these gates close.

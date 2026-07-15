@@ -158,12 +158,13 @@ worker concurrency.
 
 ## Remaining Activation Gates
 
-1. Add independent capacity reconciliation evidence for deadline-quarantined
-   work without rewriting the customer decision.
-2. Make `artifact_ready -> canonical success` atomic or restart-recoverable.
-3. Add the single submit/recovery/deadline/poll orchestrator. It must be the only external
+Independent capacity reconciliation is implemented in
+[`2026-phase2g-provider-capacity-reconciliation.md`](2026-phase2g-provider-capacity-reconciliation.md).
+
+1. Make `artifact_ready -> canonical success` atomic or restart-recoverable.
+2. Add the single submit/recovery/deadline/reconciliation/poll orchestrator. It must be the only external
    side-effect caller and must drive these heartbeat primitives.
-4. Persist operation descriptor identity and require the SDK to bind provider,
+3. Persist operation descriptor identity and require the SDK to bind provider,
    operation, descriptor, adapter, submission, and idempotency identities.
 
 Dreamina and other remote CLI providers remain inactive until these gates close.

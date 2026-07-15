@@ -8,6 +8,7 @@ use crate::executor::{
     ExecutorResultManifest, ExecutorSubmissionError, release_capacity_allocation,
 };
 
+use super::capacity::insert_capacity_reconciliation;
 use super::{
     ProviderArtifactAuthority, ProviderExecutionContext, ProviderRemoteTask,
     ProviderSubmitFailureKind, ProviderSubmitIntent, ProviderSubmitIntentState,
@@ -25,7 +26,7 @@ const SUBMIT_DEADLINE_ERROR: &str = "provider_submit_deadline";
 
 #[derive(Clone)]
 pub struct PostgresProviderTaskStore {
-    pool: PgPool,
+    pub(super) pool: PgPool,
 }
 
 impl PostgresProviderTaskStore {
@@ -207,6 +208,11 @@ struct SubmitParentRow {
     launch_owner: Option<String>,
     launch_lease_epoch: Option<i64>,
     allocation_state: String,
+    allocation_release_reason: Option<String>,
+    allocation_release_reconciliation_id: Option<Uuid>,
+    reconciliation_state: Option<String>,
+    reconciliation_evidence_kind: Option<String>,
+    reconciliation_remote_operation_id: Option<String>,
     execution_resolution_decision_id: Option<Uuid>,
     submission_resolution_decision_id: Option<Uuid>,
     resolution_source: Option<String>,
@@ -555,6 +561,13 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
         if !parent_accepts_receipt {
             return Err(ProviderTaskStoreError::Conflict);
         }
+        if parent.reconciliation_state.as_deref() == Some("released")
+            && parent.reconciliation_evidence_kind.as_deref() == Some("remote_terminal")
+            && parent.reconciliation_remote_operation_id.as_deref()
+                != Some(request.remote_operation_id.as_str())
+        {
+            return Err(ProviderTaskStoreError::Conflict);
+        }
         let now = database_now(&mut tx).await?;
         require_one(
             sqlx::query(
@@ -588,6 +601,33 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
             .map_err(storage_conflict)?,
             ProviderTaskStoreError::Conflict,
         )?;
+        if row.state == "deadline_quarantined"
+            && parent.reconciliation_state.as_deref() == Some("active")
+        {
+            require_one(
+                sqlx::query(
+                    r#"
+                    UPDATE provider_capacity_reconciliations
+                    SET evidence_revision = 1,
+                        available_at_ms = CASE
+                          WHEN reconciliation_owner IS NULL
+                          THEN LEAST(available_at_ms, $3)
+                          ELSE available_at_ms
+                        END,
+                        updated_at_ms = $3
+                    WHERE submission_id = $1 AND executor_execution_id = $2
+                      AND state = 'active' AND evidence_revision = 0
+                    "#,
+                )
+                .bind(request.submission_id)
+                .bind(request.executor_execution_id)
+                .bind(now)
+                .execute(&mut *tx)
+                .await
+                .map_err(storage_conflict)?,
+                ProviderTaskStoreError::Conflict,
+            )?;
+        }
         let intent = submit_intent_from_row(
             load_submit_intent_in(&mut tx, request.submission_id)
                 .await?
@@ -710,6 +750,13 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
         )
         .await?;
         resolve_submit_deadline_terminal(
+            &mut tx,
+            candidate.executor_execution_id,
+            candidate.submission_id,
+            candidate.database_now_ms,
+        )
+        .await?;
+        insert_capacity_reconciliation(
             &mut tx,
             candidate.executor_execution_id,
             candidate.submission_id,
@@ -1897,6 +1944,7 @@ async fn resolve_submit_terminal(
         intent.submission_id,
         resolved_state,
         "remote_submit_outcome",
+        None,
         now,
     )
     .await
@@ -2059,6 +2107,7 @@ async fn resolve_remote_terminal(
         task.submission_id,
         resolved_state,
         "remote_provider_observation",
+        None,
         now,
     )
     .await
@@ -2335,6 +2384,13 @@ async fn lock_submit_parent(
                execution.lease_expires_at_ms,
                execution.launch_owner, execution.launch_lease_epoch,
                allocation.state AS allocation_state,
+               allocation.release_reason AS allocation_release_reason,
+               allocation.release_reconciliation_id AS
+                   allocation_release_reconciliation_id,
+               reconciliation.state AS reconciliation_state,
+               reconciliation.evidence_kind AS reconciliation_evidence_kind,
+               reconciliation.remote_operation_id AS
+                   reconciliation_remote_operation_id,
                execution.resolution_decision_id AS execution_resolution_decision_id,
                submission.resolution_decision_id AS submission_resolution_decision_id,
                decision.source AS resolution_source
@@ -2349,6 +2405,9 @@ async fn lock_submit_parent(
           ON decision.decision_id = execution.resolution_decision_id
          AND decision.executor_execution_id = execution.executor_execution_id
          AND decision.submission_id = execution.submission_id
+        LEFT JOIN provider_capacity_reconciliations reconciliation
+          ON reconciliation.executor_execution_id = execution.executor_execution_id
+         AND reconciliation.submission_id = execution.submission_id
         WHERE execution.executor_execution_id = $1
           AND execution.submission_id = $2
         FOR UPDATE OF execution, submission, allocation
@@ -2479,7 +2538,15 @@ fn submit_parent_accepts_late_receipt(parent: &SubmitParentRow, intent: &SubmitI
         && parent.execution_resolution_decision_id.is_some()
         && parent.execution_resolution_decision_id == parent.submission_resolution_decision_id
         && parent.resolution_source.as_deref() == Some("remote_submit_deadline")
-        && parent.allocation_state == "held"
+        && ((parent.allocation_state == "held"
+            && parent.reconciliation_state.as_deref() == Some("active"))
+            || (parent.allocation_state == "released"
+                && parent.allocation_release_reason.as_deref()
+                    == Some("provider_capacity_reconciliation")
+                && parent.allocation_release_reconciliation_id.is_some()
+                && parent.allocation_release_reconciliation_id
+                    == parent.execution_resolution_decision_id
+                && parent.reconciliation_state.as_deref() == Some("released")))
 }
 
 async fn lock_live_submit_fence(

@@ -5,8 +5,14 @@ use uuid::Uuid;
 
 use crate::executor::ExecutorResultManifest;
 
+mod capacity;
 mod postgres;
 
+pub use capacity::{
+    ProviderCapacityEvidence, ProviderCapacityEvidenceOutcome, ProviderCapacityReconciliation,
+    ProviderCapacityReconciliationLease, ProviderCapacityReconciliationState,
+    ProviderCapacityReconciliationStore, ProviderCapacityTerminalState,
+};
 pub use postgres::PostgresProviderTaskStore;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -372,7 +378,7 @@ pub enum ProviderTaskStoreError {
     Conflict,
     #[error("provider task was not found")]
     NotFound,
-    #[error("provider task poll lease is stale")]
+    #[error("provider task lease is stale")]
     StaleLease,
 }
 
