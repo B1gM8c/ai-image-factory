@@ -443,6 +443,7 @@ pub trait ProviderTaskStore: Send + Sync + 'static {
         &self,
         scope: &ProviderTaskClaimScope,
         owner: &str,
+        command_id: &str,
         lease_ms: i64,
     ) -> Result<Option<ProviderSubmitRecoveryLease>, ProviderTaskStoreError>;
 
@@ -455,6 +456,7 @@ pub trait ProviderTaskStore: Send + Sync + 'static {
     async fn defer_submit_recovery(
         &self,
         lease: &ProviderSubmitRecoveryLease,
+        command_id: &str,
         retry_after_ms: i64,
     ) -> Result<(), ProviderTaskStoreError>;
 

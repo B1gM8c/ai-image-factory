@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 type TestResult<T = ()> = Result<T, String>;
 
-const REQUIRED_COLUMNS: [(&str, &str); 124] = [
+const REQUIRED_COLUMNS: [(&str, &str); 144] = [
     ("usage_events", "tenant_id"),
     ("quota_reservations", "tenant_id"),
     ("quota_reservations", "job_id"),
@@ -110,6 +110,47 @@ const REQUIRED_COLUMNS: [(&str, &str); 124] = [
     ("provider_submit_recoveries", "next_recovery_at_ms"),
     ("provider_submit_recoveries", "recovery_owner"),
     ("provider_submit_recoveries", "recovery_lease_epoch"),
+    ("provider_submit_recovery_commands", "provider_id"),
+    ("provider_submit_recovery_commands", "provider_account_id"),
+    ("provider_submit_recovery_commands", "command_owner"),
+    ("provider_submit_recovery_commands", "command_id"),
+    ("provider_submit_recovery_commands", "command_kind"),
+    ("provider_submit_recovery_commands", "request_duration_ms"),
+    ("provider_submit_recovery_commands", "submission_id"),
+    ("provider_submit_recovery_commands", "executor_execution_id"),
+    ("provider_submit_recovery_commands", "recovery_lease_epoch"),
+    ("provider_submit_recovery_commands", "claim_claimed_at_ms"),
+    (
+        "provider_submit_recovery_commands",
+        "claim_lease_expires_at_ms",
+    ),
+    ("provider_submit_recovery_commands", "intent_state"),
+    (
+        "provider_submit_recovery_commands",
+        "intent_remote_operation_id",
+    ),
+    (
+        "provider_submit_recovery_commands",
+        "intent_provider_request_id",
+    ),
+    (
+        "provider_submit_recovery_commands",
+        "intent_send_started_at_ms",
+    ),
+    (
+        "provider_submit_recovery_commands",
+        "intent_receipt_event_identity",
+    ),
+    (
+        "provider_submit_recovery_commands",
+        "intent_failure_event_identity",
+    ),
+    (
+        "provider_submit_recovery_commands",
+        "intent_failure_error_code",
+    ),
+    ("provider_submit_recovery_commands", "intent_updated_at_ms"),
+    ("provider_submit_recovery_commands", "created_at_ms"),
     ("provider_capacity_reconciliations", "reconciliation_id"),
     ("provider_capacity_reconciliations", "submission_id"),
     ("provider_capacity_reconciliations", "executor_execution_id"),
@@ -161,7 +202,7 @@ const REQUIRED_COLUMNS: [(&str, &str); 124] = [
     ("executor_resolution_decisions", "provider_submit_intent_id"),
 ];
 
-const REQUIRED_INDEXES: [&str; 22] = [
+const REQUIRED_INDEXES: [&str; 24] = [
     "usage_events_tenant_created_at_ms_idx",
     "gateway_api_keys_project_id_idx",
     "quota_reservations_active_tenant_idx",
@@ -177,6 +218,8 @@ const REQUIRED_INDEXES: [&str; 22] = [
     "executor_capacity_allocations_orphan_idx",
     "executor_resource_policies_enabled_account_uidx",
     "provider_remote_tasks_poll_claim_idx",
+    "provider_submit_recovery_commands_pkey",
+    "provider_submit_recovery_commands_transition_uidx",
     "provider_task_observations_manifest_uidx",
     "provider_submit_intents_remote_operation_uidx",
     "provider_submit_recoveries_claim_idx",
@@ -1073,9 +1116,9 @@ async fn assert_expected_schema(pool: &PgPool) -> TestResult {
         migration_versions(pool).await?
             == vec![
                 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22,
-                23,
+                23, 24,
             ],
-        "applied migration versions must be exactly [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]",
+        "applied migration versions must be exactly [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24]",
     )?;
 
     for (table, column) in REQUIRED_COLUMNS {

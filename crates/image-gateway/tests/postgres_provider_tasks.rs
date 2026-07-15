@@ -848,6 +848,286 @@ async fn poll_claim_stops_after_one_locked_candidate_window() -> TestResult {
 }
 
 #[tokio::test]
+async fn concurrent_submit_recovery_command_retries_share_one_result() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let executor =
+            seed_running_submission_with_lease(&database.pool, "same-recovery-command", 200)
+                .await?;
+        let store = PostgresProviderTaskStore::new(database.pool.clone());
+        let mut reservation = reservation_request(&executor);
+        reservation.provider_timeout_ms = 60_000;
+        store
+            .reserve_submit(&reservation)
+            .await
+            .map_err(debug_error)?;
+        store
+            .start_submit(&reservation)
+            .await
+            .map_err(debug_error)?;
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        let scope = claim_scope();
+        let (left, right) = tokio::join!(
+            store.claim_submit_recovery(&scope, "same-command-owner", "claim/retry@1", 5_000,),
+            store.claim_submit_recovery(&scope, "same-command-owner", "claim/retry@1", 5_000,),
+        );
+        let left = left
+            .map_err(debug_error)?
+            .ok_or_else(|| "first concurrent command retry returned no lease".to_string())?;
+        let right = right
+            .map_err(debug_error)?
+            .ok_or_else(|| "second concurrent command retry returned no lease".to_string())?;
+        require(
+            left == right,
+            "concurrent retries of one command returned different authority",
+        )?;
+        let command_count: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*) FROM provider_submit_recovery_commands
+            WHERE provider_id = 'provider-test' AND provider_account_id = $1
+              AND command_owner = 'same-command-owner'
+              AND command_id = 'claim/retry@1'
+            "#,
+        )
+        .bind(ACCOUNT_ID)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(
+            command_count == 1,
+            "concurrent command retries wrote more than one receipt",
+        )?;
+        require(
+            sqlx::query(
+                r#"
+                INSERT INTO provider_submit_recovery_commands
+                SELECT provider_id, provider_account_id, command_owner,
+                       'claim/retry-alias', command_kind, request_duration_ms,
+                       submission_id, executor_execution_id, recovery_lease_epoch,
+                       claim_claimed_at_ms, claim_lease_expires_at_ms, intent_state,
+                       intent_remote_operation_id, intent_provider_request_id,
+                       intent_send_started_at_ms, intent_receipt_event_identity,
+                       intent_failure_event_identity, intent_failure_error_code,
+                       intent_updated_at_ms, created_at_ms
+                FROM provider_submit_recovery_commands
+                WHERE command_id = 'claim/retry@1'
+                "#,
+            )
+            .execute(&database.pool)
+            .await
+            .is_err(),
+            "database accepted a second command identity for one recovery transition",
+        )?;
+        require(
+            store
+                .claim_submit_recovery(&scope, "empty-owner", "empty-claim", 5_000)
+                .await
+                .map_err(debug_error)?
+                .is_none(),
+            "live recovery unexpectedly produced a second claim",
+        )?;
+        let empty_command_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM provider_submit_recovery_commands WHERE command_id = 'empty-claim'",
+        )
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(
+            empty_command_count == 0,
+            "empty recovery polling wrote an unbounded command receipt",
+        )?;
+        require(
+            sqlx::query(
+                "UPDATE provider_submit_recovery_commands SET request_duration_ms = request_duration_ms + 1 WHERE command_id = 'claim/retry@1'",
+            )
+            .execute(&database.pool)
+            .await
+            .is_err(),
+            "database allowed recovery command receipt mutation",
+        )?;
+        require(
+            sqlx::query(
+                "DELETE FROM provider_submit_recovery_commands WHERE command_id = 'claim/retry@1'",
+            )
+            .execute(&database.pool)
+            .await
+            .is_err(),
+            "database allowed recovery command receipt deletion",
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
+async fn submit_recovery_claim_stops_after_one_locked_candidate_window() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let store = PostgresProviderTaskStore::new(database.pool.clone());
+        for index in 0..65 {
+            let lease = seed_running_submission_with_lease(
+                &database.pool,
+                &format!("bounded-recovery-worker-{index}"),
+                2_000,
+            )
+            .await?;
+            let mut reservation = reservation_request(&lease);
+            reservation.provider_timeout_ms = 60_000;
+            store
+                .reserve_submit(&reservation)
+                .await
+                .map_err(debug_error)?;
+            store
+                .start_submit(&reservation)
+                .await
+                .map_err(debug_error)?;
+        }
+        tokio::time::sleep(Duration::from_millis(2_100)).await;
+
+        let first_window: Vec<Uuid> = sqlx::query_scalar(
+            r#"
+            SELECT submission_id
+            FROM provider_submit_recoveries
+            WHERE provider_id = 'provider-test'
+              AND provider_account_id = $1
+              AND state = 'active'
+              AND GREATEST(
+                    next_recovery_at_ms,
+                    COALESCE(recovery_lease_expires_at_ms, next_recovery_at_ms)
+                  ) <= floor(
+                    extract(epoch FROM statement_timestamp()) * 1000
+                  )::BIGINT
+            ORDER BY GREATEST(
+                       next_recovery_at_ms,
+                       COALESCE(recovery_lease_expires_at_ms, next_recovery_at_ms)
+                     ),
+                     provider_deadline_at_ms,
+                     submission_id
+            LIMIT 64
+            "#,
+        )
+        .bind(ACCOUNT_ID)
+        .fetch_all(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(
+            first_window.len() == 64,
+            "submit recovery fixture did not fill its candidate window",
+        )?;
+        let mut locker = database.pool.begin().await.map_err(debug_error)?;
+        let locked: i64 = sqlx::query_scalar(
+            r#"
+            WITH locked AS (
+              SELECT submission_id
+              FROM executor_capacity_allocations
+              WHERE submission_id = ANY($1)
+              FOR UPDATE
+            )
+            SELECT COUNT(*) FROM locked
+            "#,
+        )
+        .bind(&first_window)
+        .fetch_one(&mut *locker)
+        .await
+        .map_err(debug_error)?;
+        require(
+            locked == 64,
+            "submit recovery fixture did not lock its first candidate window",
+        )?;
+
+        require(
+            store
+                .claim_submit_recovery(
+                    &claim_scope(),
+                    "bounded-recovery-claimant",
+                    "bounded-recovery-claim",
+                    5_000,
+                )
+                .await
+                .map_err(debug_error)?
+                .is_none(),
+            "submit recovery claim scanned beyond its locked 64-row candidate window",
+        )?;
+        locker.commit().await.map_err(debug_error)?;
+        require(
+            store
+                .claim_submit_recovery(
+                    &claim_scope(),
+                    "bounded-recovery-after-unlock",
+                    "bounded-recovery-after-unlock-claim",
+                    5_000,
+                )
+                .await
+                .map_err(debug_error)?
+                .is_some(),
+            "submit recovery claim remained empty after its candidate window unlocked",
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
+async fn submit_recovery_claim_stops_after_one_expired_candidate_window() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let store = PostgresProviderTaskStore::new(database.pool.clone());
+        for index in 0..65 {
+            let lease = seed_running_submission_with_lease(
+                &database.pool,
+                &format!("expired-window-recovery-{index}"),
+                2_000,
+            )
+            .await?;
+            let mut reservation = reservation_request(&lease);
+            reservation.provider_timeout_ms = if index < 64 { 500 } else { 60_000 };
+            store
+                .reserve_submit(&reservation)
+                .await
+                .map_err(debug_error)?;
+            store
+                .start_submit(&reservation)
+                .await
+                .map_err(debug_error)?;
+        }
+        tokio::time::sleep(Duration::from_millis(2_100)).await;
+
+        require(
+            store
+                .claim_submit_recovery(
+                    &claim_scope(),
+                    "expired-window-owner",
+                    "expired-window-claim",
+                    5_000,
+                )
+                .await
+                .map_err(debug_error)?
+                .is_none(),
+            "submit recovery claim scanned past its first 64 expired candidates",
+        )?;
+        let command_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM provider_submit_recovery_commands WHERE command_id = 'expired-window-claim'",
+        )
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(
+            command_count == 0,
+            "expired recovery window persisted a no-effect command",
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
 async fn submit_intent_lifecycle_fences_ambiguous_replay_and_late_evidence() -> TestResult {
     let Some(database) = TestDatabase::new().await? else {
         return Ok(());
@@ -987,7 +1267,12 @@ async fn submit_intent_lifecycle_fences_ambiguous_replay_and_late_evidence() -> 
             "late receipt overwrote or invalidated prior ambiguity evidence",
         )?;
         let recovery = store
-            .claim_submit_recovery(&claim_scope(), "submit-recovery-a", 5_000)
+            .claim_submit_recovery(
+                &claim_scope(),
+                "submit-recovery-a",
+                "claim-late-receipt",
+                5_000,
+            )
             .await
             .map_err(debug_error)?
             .ok_or_else(|| "expired submit was not recoverable".to_string())?;
@@ -1257,7 +1542,12 @@ async fn submit_recovery_claim_is_scoped_fenced_and_reclaimable() -> TestResult 
         };
         require(
             store
-                .claim_submit_recovery(&wrong_scope, "wrong-account", 2_000)
+                .claim_submit_recovery(
+                    &wrong_scope,
+                    "wrong-account",
+                    "claim-wrong-account",
+                    2_000,
+                )
                 .await
                 .map_err(debug_error)?
                 .is_none(),
@@ -1284,8 +1574,8 @@ async fn submit_recovery_claim_is_scoped_fenced_and_reclaimable() -> TestResult 
             capacity_heartbeat(&database.pool, executor.executor_execution_id).await?;
         tokio::time::sleep(Duration::from_millis(10)).await;
         let (left, right) = tokio::join!(
-            store.claim_submit_recovery(&scope, "recovery-a", 200),
-            store.claim_submit_recovery(&scope, "recovery-b", 200),
+            store.claim_submit_recovery(&scope, "recovery-a", "claim-recovery-a", 200),
+            store.claim_submit_recovery(&scope, "recovery-b", "claim-recovery-b", 200),
         );
         let mut winners = [left.map_err(debug_error)?, right.map_err(debug_error)?]
             .into_iter()
@@ -1298,6 +1588,66 @@ async fn submit_recovery_claim_is_scoped_fenced_and_reclaimable() -> TestResult 
                 && first.intent.submission_id == executor.submission_id
                 && first.context() == invocation.context(),
             "concurrent recovery claim did not elect exactly one frozen context",
+        )?;
+        let first_claim_command = match first.recovery_owner.as_str() {
+            "recovery-a" => "claim-recovery-a",
+            "recovery-b" => "claim-recovery-b",
+            _ => return Err("unexpected recovery claim owner".to_string()),
+        };
+        let claim_replay = store
+            .claim_submit_recovery(
+                &scope,
+                &first.recovery_owner,
+                first_claim_command,
+                200,
+            )
+            .await
+            .map_err(debug_error)?
+            .ok_or_else(|| "exact recovery claim replay disappeared".to_string())?;
+        require(
+            claim_replay == first,
+            "exact recovery claim replay minted different authority",
+        )?;
+        require(
+            store
+                .claim_submit_recovery(
+                    &scope,
+                    &first.recovery_owner,
+                    first_claim_command,
+                    201,
+                )
+                .await
+                == Err(ProviderTaskStoreError::Conflict),
+            "claim command identity accepted different lease parameters",
+        )?;
+        require(
+            store
+                .defer_submit_recovery(&first, first_claim_command, 100)
+                .await
+                == Err(ProviderTaskStoreError::Conflict),
+            "claim command identity was reused for a defer command",
+        )?;
+        store
+            .record_submit_receipt(&submit_receipt(
+                &executor,
+                "operation-recovered",
+                "receipt-recovered",
+            ))
+            .await
+            .map_err(debug_error)?;
+        let replay_after_receipt = store
+            .claim_submit_recovery(
+                &scope,
+                &first.recovery_owner,
+                first_claim_command,
+                200,
+            )
+            .await
+            .map_err(debug_error)?
+            .ok_or_else(|| "claim replay disappeared after late receipt".to_string())?;
+        require(
+            replay_after_receipt == first,
+            "late receipt rewrote the original recovery claim response",
         )?;
         let capacity_after_recovery_claim =
             capacity_heartbeat(&database.pool, executor.executor_execution_id).await?;
@@ -1339,14 +1689,47 @@ async fn submit_recovery_claim_is_scoped_fenced_and_reclaimable() -> TestResult 
             stale_heartbeat == Err(ProviderTaskStoreError::StaleLease),
             "submit recovery heartbeat revived an expired epoch after a lock wait",
         )?;
+        let expired_claim_replay = store
+            .claim_submit_recovery(
+                &scope,
+                &first.recovery_owner,
+                first_claim_command,
+                200,
+            )
+            .await
+            .map_err(debug_error)?
+            .ok_or_else(|| "expired claim acknowledgement replay disappeared".to_string())?;
+        require(
+            expired_claim_replay == first,
+            "expired claim acknowledgement replay minted new authority",
+        )?;
         let first = store
-            .claim_submit_recovery(&scope, "recovery-after-expired-heartbeat", 2_000)
+            .claim_submit_recovery(
+                &scope,
+                "recovery-after-expired-heartbeat",
+                "claim-after-expired-heartbeat",
+                2_000,
+            )
             .await
             .map_err(debug_error)?
             .ok_or_else(|| "expired heartbeat recovery was not reclaimable".to_string())?;
         require(
             first.recovery_lease_epoch == expired_epoch + 1,
             "expired heartbeat reclaim did not advance the recovery epoch",
+        )?;
+        let historical_claim_replay = store
+            .claim_submit_recovery(
+                &scope,
+                &expired_claim_replay.recovery_owner,
+                first_claim_command,
+                200,
+            )
+            .await
+            .map_err(debug_error)?
+            .ok_or_else(|| "superseded claim acknowledgement disappeared".to_string())?;
+        require(
+            historical_claim_replay == expired_claim_replay,
+            "superseded claim command minted or returned different authority",
         )?;
         require(
             sqlx::query(
@@ -1376,6 +1759,20 @@ async fn submit_recovery_claim_is_scoped_fenced_and_reclaimable() -> TestResult 
             renewed.recovery_lease_expires_at_ms <= renewed.context().provider_deadline_at_ms(),
             "submit recovery heartbeat crossed the absolute provider deadline",
         )?;
+        let replay_after_heartbeat = store
+            .claim_submit_recovery(
+                &scope,
+                &first.recovery_owner,
+                "claim-after-expired-heartbeat",
+                2_000,
+            )
+            .await
+            .map_err(debug_error)?
+            .ok_or_else(|| "claim replay disappeared after heartbeat".to_string())?;
+        require(
+            replay_after_heartbeat == first,
+            "heartbeat rewrote the original claim command result",
+        )?;
         require(
             capacity_heartbeat(&database.pool, executor.executor_execution_id).await?
                 > capacity_after_recovery_claim,
@@ -1383,20 +1780,82 @@ async fn submit_recovery_claim_is_scoped_fenced_and_reclaimable() -> TestResult 
         )?;
         require(
             store
-                .claim_submit_recovery(&claim_scope(), "recovery-c", 2_000)
+                .claim_submit_recovery(
+                    &claim_scope(),
+                    "recovery-c",
+                    "claim-live-recovery-check",
+                    2_000,
+                )
                 .await
                 .map_err(debug_error)?
                 .is_none(),
             "live recovery lease was stolen",
         )?;
 
+        let forged_defer_at = database_now(&database.pool).await?;
+        let mut forged_defer = database.pool.begin().await.map_err(debug_error)?;
+        sqlx::query(
+            r#"
+            INSERT INTO provider_submit_recovery_commands (
+                provider_id, provider_account_id, command_owner, command_id,
+                command_kind, request_duration_ms, submission_id,
+                executor_execution_id, recovery_lease_epoch, created_at_ms
+            ) VALUES ($1, $2, $3, 'forged-defer', 'defer', 100, $4, $5, $6, $7)
+            "#,
+        )
+        .bind(&renewed.intent.provider_id)
+        .bind(renewed.intent.provider_account_id)
+        .bind(&renewed.recovery_owner)
+        .bind(renewed.intent.submission_id)
+        .bind(renewed.intent.executor_execution_id)
+        .bind(renewed.recovery_lease_epoch)
+        .bind(forged_defer_at)
+        .execute(&mut *forged_defer)
+        .await
+        .map_err(debug_error)?;
+        sqlx::query(
+            r#"
+            UPDATE provider_submit_recoveries
+            SET recovery_owner = NULL, recovery_lease_expires_at_ms = NULL,
+                recovery_claimed_at_ms = NULL,
+                next_recovery_at_ms = LEAST(provider_deadline_at_ms, $3 + 101),
+                updated_at_ms = $3
+            WHERE submission_id = $1 AND executor_execution_id = $2
+            "#,
+        )
+        .bind(renewed.intent.submission_id)
+        .bind(renewed.intent.executor_execution_id)
+        .bind(forged_defer_at)
+        .execute(&mut *forged_defer)
+        .await
+        .map_err(debug_error)?;
+        require(
+            forged_defer.commit().await.is_err(),
+            "database committed a defer receipt with a different retry result",
+        )?;
         store
-            .defer_submit_recovery(&renewed, 100)
+            .defer_submit_recovery(&renewed, "defer-recovery-c", 100)
             .await
             .map_err(debug_error)?;
         require(
             store
-                .claim_submit_recovery(&claim_scope(), "recovery-c", 2_000)
+                .defer_submit_recovery(&renewed, "defer-recovery-c", 101)
+                .await
+                == Err(ProviderTaskStoreError::Conflict),
+            "defer command identity accepted different retry parameters",
+        )?;
+        store
+            .defer_submit_recovery(&renewed, "defer-recovery-c", 100)
+            .await
+            .map_err(debug_error)?;
+        require(
+            store
+                .claim_submit_recovery(
+                    &claim_scope(),
+                    "recovery-c",
+                    "claim-before-defer-due",
+                    2_000,
+                )
                 .await
                 .map_err(debug_error)?
                 .is_none(),
@@ -1404,7 +1863,12 @@ async fn submit_recovery_claim_is_scoped_fenced_and_reclaimable() -> TestResult 
         )?;
         tokio::time::sleep(Duration::from_millis(120)).await;
         let reclaimed = store
-            .claim_submit_recovery(&claim_scope(), "recovery-c", 2_000)
+            .claim_submit_recovery(
+                &claim_scope(),
+                "recovery-c",
+                "claim-after-defer/due",
+                2_000,
+            )
             .await
             .map_err(debug_error)?
             .ok_or_else(|| "deferred recovery was not reclaimed".to_string())?;
@@ -1412,6 +1876,10 @@ async fn submit_recovery_claim_is_scoped_fenced_and_reclaimable() -> TestResult 
             reclaimed.recovery_lease_epoch == first.recovery_lease_epoch + 1,
             "recovery reclaim did not advance the fence epoch",
         )?;
+        store
+            .defer_submit_recovery(&renewed, "defer-recovery-c", 100)
+            .await
+            .map_err(debug_error)?;
 
         store
             .record_submit_receipt(&submit_receipt(
@@ -1461,6 +1929,24 @@ async fn submit_recovery_claim_is_scoped_fenced_and_reclaimable() -> TestResult 
                 == Err(ProviderTaskStoreError::StaleLease),
             "closed recovery lease remained writable after attach",
         )?;
+        let replay_after_close = store
+            .claim_submit_recovery(
+                &scope,
+                &reclaimed.recovery_owner,
+                "claim-after-defer/due",
+                2_000,
+            )
+            .await
+            .map_err(debug_error)?
+            .ok_or_else(|| "claim acknowledgement disappeared after close".to_string())?;
+        require(
+            replay_after_close == reclaimed,
+            "closed recovery changed its historical claim acknowledgement",
+        )?;
+        store
+            .defer_submit_recovery(&renewed, "defer-recovery-c", 100)
+            .await
+            .map_err(debug_error)?;
 
         let deadline_executor =
             seed_running_submission_with_lease(&database.pool, "recovery-deadline", 20).await?;
@@ -1476,7 +1962,12 @@ async fn submit_recovery_claim_is_scoped_fenced_and_reclaimable() -> TestResult 
             .map_err(debug_error)?;
         tokio::time::sleep(Duration::from_millis(30)).await;
         let deadline_lease = store
-            .claim_submit_recovery(&claim_scope(), "deadline-recovery", 2_000)
+            .claim_submit_recovery(
+                &claim_scope(),
+                "deadline-recovery",
+                "claim-deadline-recovery",
+                2_000,
+            )
             .await
             .map_err(debug_error)?
             .ok_or_else(|| "pre-deadline recovery was not claimable".to_string())?;
@@ -1516,7 +2007,12 @@ async fn submit_recovery_claim_is_scoped_fenced_and_reclaimable() -> TestResult 
             .map_err(debug_error)?;
         tokio::time::sleep(Duration::from_millis(250)).await;
         let rejection_lease = store
-            .claim_submit_recovery(&claim_scope(), "recovery-rejector", 2_000)
+            .claim_submit_recovery(
+                &claim_scope(),
+                "recovery-rejector",
+                "claim-recovery-rejector",
+                2_000,
+            )
             .await
             .map_err(debug_error)?
             .ok_or_else(|| "confirmed rejection recovery was not claimable".to_string())?;
@@ -2164,6 +2660,215 @@ async fn atomic_artifact_migration_rolls_back_after_late_failure() -> TestResult
 }
 
 #[tokio::test]
+async fn recovery_command_migration_requires_drained_claimants() -> TestResult {
+    let Some(database) = TestDatabase::new_before_replayable_recovery_commands().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let store = PostgresProviderTaskStore::new(database.pool.clone());
+        let executor =
+            seed_running_submission_with_lease(&database.pool, "recovery-command-upgrade", 5_000)
+                .await?;
+        let mut reservation = reservation_request(&executor);
+        reservation.provider_timeout_ms = 60_000;
+        store
+            .reserve_submit(&reservation)
+            .await
+            .map_err(debug_error)?;
+        store
+            .start_submit(&reservation)
+            .await
+            .map_err(debug_error)?;
+        let now = database_now(&database.pool).await?;
+        sqlx::query(
+            r#"
+            UPDATE provider_submit_recoveries
+            SET recovery_owner = 'legacy-recovery-worker',
+                recovery_lease_epoch = recovery_lease_epoch + 1,
+                recovery_lease_expires_at_ms = $2 + 5_000,
+                recovery_claimed_at_ms = $2, updated_at_ms = $2
+            WHERE submission_id = $1 AND state = 'active'
+            "#,
+        )
+        .bind(executor.submission_id)
+        .bind(now)
+        .execute(&database.pool)
+        .await
+        .map_err(debug_error)?;
+
+        require(
+            sqlx::raw_sql(include_str!(
+                "../migrations/0024_replayable_provider_submit_recovery_commands.sql"
+            ))
+            .execute(&database.pool)
+            .await
+            .is_err(),
+            "0024 accepted a live legacy recovery claimant",
+        )?;
+        let command_table_exists: bool = sqlx::query_scalar(
+            "SELECT to_regclass('provider_submit_recovery_commands') IS NOT NULL",
+        )
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(
+            !command_table_exists,
+            "failed 0024 migration left command schema residue",
+        )?;
+
+        let now = database_now(&database.pool).await?;
+        sqlx::query(
+            r#"
+            UPDATE provider_submit_recoveries
+            SET recovery_owner = NULL,
+                recovery_lease_expires_at_ms = NULL,
+                recovery_claimed_at_ms = NULL,
+                next_recovery_at_ms = GREATEST(next_recovery_at_ms, $2 + 100),
+                updated_at_ms = $2
+            WHERE submission_id = $1 AND state = 'active'
+            "#,
+        )
+        .bind(executor.submission_id)
+        .bind(now)
+        .execute(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        sqlx::raw_sql(include_str!(
+            "../migrations/0024_replayable_provider_submit_recovery_commands.sql"
+        ))
+        .execute(&database.pool)
+        .await
+        .map_err(|error| format!("0024 rejected a drained recovery queue: {error}"))?;
+        let migrated: (bool, bool) = sqlx::query_as(
+            r#"
+            SELECT to_regclass('provider_submit_recovery_commands') IS NOT NULL,
+                   to_regclass('provider_submit_recovery_commands_pkey') IS NOT NULL
+            "#,
+        )
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(migrated == (true, true), "0024 schema is incomplete")?;
+        let now = database_now(&database.pool).await?;
+        let mut malformed_claim = database.pool.begin().await.map_err(debug_error)?;
+        let malformed_epoch: i64 = sqlx::query_scalar(
+            r#"
+            UPDATE provider_submit_recoveries
+            SET recovery_owner = 'malformed-claim-writer',
+                recovery_lease_epoch = recovery_lease_epoch + 1,
+                recovery_lease_expires_at_ms = $2 + 1,
+                recovery_claimed_at_ms = $2, updated_at_ms = $2
+            WHERE submission_id = $1 AND state = 'active'
+            RETURNING recovery_lease_epoch
+            "#,
+        )
+        .bind(executor.submission_id)
+        .bind(now)
+        .fetch_one(&mut *malformed_claim)
+        .await
+        .map_err(debug_error)?;
+        let malformed_rejected = sqlx::query(
+            r#"
+            INSERT INTO provider_submit_recovery_commands (
+                provider_id, provider_account_id, command_owner, command_id,
+                command_kind, request_duration_ms, submission_id,
+                executor_execution_id, recovery_lease_epoch,
+                claim_claimed_at_ms, claim_lease_expires_at_ms,
+                intent_state, intent_remote_operation_id,
+                intent_provider_request_id, intent_send_started_at_ms,
+                intent_receipt_event_identity, intent_failure_event_identity,
+                intent_failure_error_code, intent_updated_at_ms, created_at_ms
+            )
+            SELECT recovery.provider_id, recovery.provider_account_id,
+                   'malformed-claim-writer', 'malformed-claim', 'claim', 5000,
+                   recovery.submission_id, recovery.executor_execution_id,
+                   $2, $3, $3 + 1, intent.state, intent.remote_operation_id,
+                   intent.provider_request_id, intent.send_started_at_ms,
+                   intent.receipt_event_identity, intent.failure_event_identity,
+                   intent.failure_error_code, intent.updated_at_ms, $3
+            FROM provider_submit_recoveries recovery
+            JOIN provider_remote_submit_intents intent
+              ON intent.submission_id = recovery.submission_id
+             AND intent.executor_execution_id = recovery.executor_execution_id
+            WHERE recovery.submission_id = $1
+            "#,
+        )
+        .bind(executor.submission_id)
+        .bind(malformed_epoch)
+        .bind(now)
+        .execute(&mut *malformed_claim)
+        .await
+        .is_err();
+        malformed_claim.rollback().await.map_err(debug_error)?;
+        require(
+            malformed_rejected,
+            "0024 accepted a claim receipt whose duration did not match its lease",
+        )?;
+        let now = database_now(&database.pool).await?;
+        require(
+            sqlx::query(
+                r#"
+                UPDATE provider_submit_recoveries
+                SET recovery_owner = 'legacy-after-migration',
+                    recovery_lease_epoch = recovery_lease_epoch + 1,
+                    recovery_lease_expires_at_ms = $2 + 5_000,
+                    recovery_claimed_at_ms = $2, updated_at_ms = $2
+                WHERE submission_id = $1 AND state = 'active'
+                "#,
+            )
+            .bind(executor.submission_id)
+            .bind(now)
+            .execute(&database.pool)
+            .await
+            .is_err(),
+            "0024 allowed an old writer to claim without command evidence",
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
+async fn recovery_command_migration_rolls_back_after_late_failure() -> TestResult {
+    let Some(database) = TestDatabase::new_before_replayable_recovery_commands().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let script = format!(
+            "{}\nDO $$ BEGIN RAISE EXCEPTION 'forced late migration failure'; END $$;",
+            include_str!("../migrations/0024_replayable_provider_submit_recovery_commands.sql")
+        );
+        require(
+            sqlx::raw_sql(AssertSqlSafe(script))
+                .execute(&database.pool)
+                .await
+                .is_err(),
+            "forced late 0024 failure unexpectedly committed",
+        )?;
+        let residue: (bool, bool) = sqlx::query_as(
+            r#"
+            SELECT to_regclass('provider_submit_recovery_commands') IS NOT NULL,
+                   EXISTS (
+                     SELECT 1 FROM pg_trigger
+                     WHERE tgrelid = 'provider_submit_recoveries'::regclass
+                       AND tgname =
+                           'provider_submit_recovery_command_projection_check'
+                   )
+            "#,
+        )
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(
+            residue == (false, false),
+            format!("late 0024 failure left schema residue: {residue:?}"),
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
 async fn provider_submit_commit_classifies_deferred_projection_conflicts() -> TestResult {
     let Some(database) = TestDatabase::new().await? else {
         return Ok(());
@@ -2707,7 +3412,12 @@ async fn submit_deadline_races_converge_without_deadlock() -> TestResult {
             .map_err(debug_error)?;
         tokio::time::sleep(Duration::from_millis(150)).await;
         let recovery = store
-            .claim_submit_recovery(&claim_scope(), "deadline-heartbeat-owner", 2_000)
+            .claim_submit_recovery(
+                &claim_scope(),
+                "deadline-heartbeat-owner",
+                "claim-deadline-heartbeat",
+                2_000,
+            )
             .await
             .map_err(debug_error)?
             .ok_or_else(|| "pre-deadline recovery was not claimable".to_string())?;
@@ -4190,6 +4900,27 @@ impl TestDatabase {
                 Ok(()) => Err(format!("pre-0023 migration failed: {error}")),
                 Err(cleanup) => Err(format!(
                     "pre-0023 migration failed: {error}; cleanup failed: {cleanup}"
+                )),
+            };
+        }
+        Ok(Some(database))
+    }
+
+    async fn new_before_replayable_recovery_commands() -> TestResult<Option<Self>> {
+        let Some(database) = Self::new_before_atomic_artifact_resolution().await? else {
+            return Ok(None);
+        };
+        if let Err(error) = sqlx::raw_sql(include_str!(
+            "../migrations/0023_atomic_provider_artifact_resolution.sql"
+        ))
+        .execute(&database.pool)
+        .await
+        {
+            let cleanup = database.cleanup().await;
+            return match cleanup {
+                Ok(()) => Err(format!("pre-0024 migration failed: {error}")),
+                Err(cleanup) => Err(format!(
+                    "pre-0024 migration failed: {error}; cleanup failed: {cleanup}"
                 )),
             };
         }
