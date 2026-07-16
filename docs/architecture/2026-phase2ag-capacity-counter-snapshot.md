@@ -171,6 +171,47 @@ migration, disable fencing, release repair, and policy resizing. Adopting it
 still requires a controlled implementation and measured comparison against the
 current counter.
 
+### Rejected Held-Policy Index Experiment
+
+On 2026-07-17, a temporary uncommitted migration tested a narrower alternative:
+
+1. add a partial B-tree index on
+   `(resource_policy_id, resource_policy_revision) WHERE state = 'held'`;
+2. express the balance count as a correlated subquery in the existing
+   single-snapshot statement; and
+3. rerun the same 4096-row, 64-claimant workload.
+
+The experiment preserved 4096 / 4096 exact-once projection and zero deadlocks,
+but did not produce a material tail-latency improvement:
+
+| Metric | Current counter | Temporary partial index |
+| --- | ---: | ---: |
+| Throughput | 274.7 ops/s | 293.7 ops/s |
+| Fresh p99 | 391.3 ms | 387.6 ms |
+| Sampled lock waits | 17,934 | 20,193 |
+
+The throughput delta was smaller than the variance already observed between
+the two retained Phase 2AG runs. The index did not distribute ownership of the
+single policy counter row, and it added another index write to every allocation
+insert and release. The migration and test edits were therefore removed rather
+than committed.
+
+PostgreSQL documents that index-only scans are most beneficial when heap pages
+are sufficiently old to be marked all-visible. This benchmark continuously
+inserts and updates allocation rows, so that prerequisite is weak:
+
+- <https://www.postgresql.org/docs/18/indexes-index-only-scans.html>
+
+PostgreSQL also recommends checking actual plans and workload behavior instead
+of assuming an index will be selected or beneficial:
+
+- <https://www.postgresql.org/docs/18/indexes-examine.html>
+- <https://www.postgresql.org/docs/18/sql-explain.html>
+
+The experiment narrows the next candidate: a meaningful improvement must
+distribute capacity authority across independently lockable rows. Merely
+accelerating the invariant recount does not remove the serialized counter.
+
 ## Explicit Limits
 
 This phase does not add:
