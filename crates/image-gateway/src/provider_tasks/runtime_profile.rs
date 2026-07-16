@@ -5,6 +5,8 @@ use uuid::Uuid;
 use super::{MAX_PROVIDER_RUNTIME_LANES, ProviderTaskClaimScope, ProviderTaskStoreError};
 use crate::executor::{ExecutorClaimScope, ExecutorExecutionProfile};
 
+mod postgres;
+
 pub trait ProviderRuntimeProfileStore: Send + Sync + 'static {
     fn load_active_runtime_profile(
         &self,
