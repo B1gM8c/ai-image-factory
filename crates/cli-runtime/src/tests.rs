@@ -1,8 +1,11 @@
 use std::{
     convert::Infallible,
+    ffi::CString,
     fs,
     io::{self, Write},
+    os::unix::{ffi::OsStrExt, fs::PermissionsExt},
     path::Path,
+    path::PathBuf,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -11,9 +14,10 @@ use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
 use crate::{
-    CliPolicy, CliRuntime, CommandSpec, CommandSpecError, ExitClassification, NoopSpawnObserver,
-    OutputContract, ProcessError, ReceiptCliPolicy, RuntimeError, SpawnEvidence, SpawnObserver,
-    VerifiedExecutable, WorkingDirectory, default_exit_classification,
+    CliPolicy, CliRuntime, CommandSpec, CommandSpecError, ExitClassification, FreshOutputDirectory,
+    NoopSpawnObserver, OutputContract, OutputError, ProcessError, ReceiptCliPolicy, RuntimeError,
+    SpawnEvidence, SpawnObserver, VerifiedExecutable, WorkingDirectory,
+    default_exit_classification,
 };
 
 #[derive(Clone)]
@@ -63,6 +67,28 @@ impl ReceiptCliPolicy for StaticReceiptPolicy {
 struct ChunkRecordingSink {
     bytes: Vec<u8>,
     largest_write: usize,
+}
+
+#[derive(Debug)]
+struct ReplacingSink {
+    output: PathBuf,
+    detached: PathBuf,
+    replaced: bool,
+}
+
+impl Write for ReplacingSink {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if !self.replaced {
+            fs::rename(&self.output, &self.detached)?;
+            fs::write(&self.output, b"replacement")?;
+            self.replaced = true;
+        }
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 impl Write for ChunkRecordingSink {
@@ -179,6 +205,246 @@ async fn seals_output_with_fixed_size_streaming_buffer() {
     assert_eq!(result.output.sha256_hex, expected_hash);
     assert_eq!(result.sink.bytes, payload);
     assert!(result.sink.largest_write <= crate::STREAM_BUFFER_BYTES);
+}
+
+#[tokio::test]
+async fn fixed_output_rejects_same_name_replacement_during_read() {
+    let directory = TempDir::new().expect("temp directory");
+    let output_path = directory.path().join("result.bin");
+    let command = command(directory.path(), "printf original > result.bin", 1024);
+    let error = CliRuntime::new(StaticPolicy { command })
+        .run_to_sink(
+            &(),
+            &mut NoopSpawnObserver,
+            ReplacingSink {
+                output: output_path,
+                detached: directory.path().join("detached"),
+                replaced: false,
+            },
+        )
+        .await
+        .expect_err("same-name replacement must fail");
+
+    assert!(matches!(
+        error,
+        RuntimeError::Output(OutputError::ChangedDuringRead)
+    ));
+}
+
+#[test]
+fn fresh_output_directory_seals_one_bound_file_with_bounded_writes() {
+    let root = TempDir::new().expect("temp directory");
+    let directory = root.path().join("staging");
+    fs::create_dir(&directory).expect("staging directory");
+    make_private(&directory);
+    let working = WorkingDirectory::new(&directory).expect("working directory");
+    let output = FreshOutputDirectory::new(&working, 512 * 1024).expect("fresh output");
+    let payload = vec![b'x'; crate::STREAM_BUFFER_BYTES * 2 + 17];
+    fs::write(directory.join("provider-output.bin"), &payload).expect("provider output");
+
+    let (sealed, sink) = output
+        .seal_single_file_to_sink(ChunkRecordingSink::default())
+        .expect("single output seals");
+
+    assert_eq!(sealed.relative_filename, Path::new("provider-output.bin"));
+    assert_eq!(sealed.byte_size, payload.len() as u64);
+    let expected_hash = Sha256::digest(&payload)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    assert_eq!(sealed.sha256_hex, expected_hash);
+    assert_eq!(sink.bytes, payload);
+    assert!(sink.largest_write <= crate::STREAM_BUFFER_BYTES);
+}
+
+#[test]
+fn fresh_output_directory_rejects_untrusted_directory_shapes() {
+    let nonempty = TempDir::new().expect("temp directory");
+    make_private(nonempty.path());
+    fs::write(nonempty.path().join("existing"), b"data").expect("existing file");
+    let working = WorkingDirectory::new(nonempty.path()).expect("working directory");
+    assert!(matches!(
+        FreshOutputDirectory::new(&working, 1024),
+        Err(OutputError::DirectoryNotEmpty)
+    ));
+
+    let multiple = TempDir::new().expect("temp directory");
+    make_private(multiple.path());
+    let working = WorkingDirectory::new(multiple.path()).expect("working directory");
+    let output = FreshOutputDirectory::new(&working, 1024).expect("fresh output");
+    fs::write(multiple.path().join("one"), b"one").expect("first output");
+    fs::write(multiple.path().join("two"), b"two").expect("second output");
+    assert!(matches!(
+        output.seal_single_file_to_sink(Vec::new()),
+        Err(OutputError::MultipleEntries)
+    ));
+
+    let missing = TempDir::new().expect("temp directory");
+    make_private(missing.path());
+    let working = WorkingDirectory::new(missing.path()).expect("working directory");
+    let output = FreshOutputDirectory::new(&working, 1024).expect("fresh output");
+    assert!(matches!(
+        output.seal_single_file_to_sink(Vec::new()),
+        Err(OutputError::Missing)
+    ));
+
+    let empty = TempDir::new().expect("temp directory");
+    make_private(empty.path());
+    let working = WorkingDirectory::new(empty.path()).expect("working directory");
+    let output = FreshOutputDirectory::new(&working, 1024).expect("fresh output");
+    fs::write(empty.path().join("empty"), b"").expect("empty output");
+    assert!(matches!(
+        output.seal_single_file_to_sink(Vec::new()),
+        Err(OutputError::Empty)
+    ));
+
+    let oversized = TempDir::new().expect("temp directory");
+    make_private(oversized.path());
+    let working = WorkingDirectory::new(oversized.path()).expect("working directory");
+    let output = FreshOutputDirectory::new(&working, 3).expect("fresh output");
+    fs::write(oversized.path().join("large"), b"1234").expect("oversized output");
+    assert!(matches!(
+        output.seal_single_file_to_sink(Vec::new()),
+        Err(OutputError::TooLarge)
+    ));
+
+    let nested = TempDir::new().expect("temp directory");
+    make_private(nested.path());
+    let working = WorkingDirectory::new(nested.path()).expect("working directory");
+    let output = FreshOutputDirectory::new(&working, 1024).expect("fresh output");
+    fs::create_dir(nested.path().join("nested")).expect("nested output");
+    assert!(matches!(
+        output.seal_single_file_to_sink(Vec::new()),
+        Err(OutputError::NotRegular)
+    ));
+
+    let fifo = TempDir::new().expect("temp directory");
+    make_private(fifo.path());
+    let working = WorkingDirectory::new(fifo.path()).expect("working directory");
+    let output = FreshOutputDirectory::new(&working, 1024).expect("fresh output");
+    let fifo_path = fifo.path().join("output");
+    let fifo_c = CString::new(fifo_path.as_os_str().as_bytes()).expect("FIFO path");
+    assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+    assert!(matches!(
+        output.seal_single_file_to_sink(Vec::new()),
+        Err(OutputError::NotRegular)
+    ));
+
+    let symlink = TempDir::new().expect("temp directory");
+    make_private(symlink.path());
+    let target = TempDir::new().expect("target directory");
+    fs::write(target.path().join("target"), b"data").expect("target output");
+    let working = WorkingDirectory::new(symlink.path()).expect("working directory");
+    let output = FreshOutputDirectory::new(&working, 1024).expect("fresh output");
+    std::os::unix::fs::symlink(target.path().join("target"), symlink.path().join("output"))
+        .expect("symlink output");
+    assert!(output.seal_single_file_to_sink(Vec::new()).is_err());
+
+    let hardlink = TempDir::new().expect("temp directory");
+    make_private(hardlink.path());
+    let outside = TempDir::new().expect("outside directory");
+    fs::write(outside.path().join("target"), b"data").expect("hardlink target");
+    let working = WorkingDirectory::new(hardlink.path()).expect("working directory");
+    let output = FreshOutputDirectory::new(&working, 1024).expect("fresh output");
+    fs::hard_link(
+        outside.path().join("target"),
+        hardlink.path().join("output"),
+    )
+    .expect("hardlink output");
+    assert!(matches!(
+        output.seal_single_file_to_sink(Vec::new()),
+        Err(OutputError::NotRegular)
+    ));
+
+    let unsafe_permissions = TempDir::new().expect("temp directory");
+    fs::set_permissions(unsafe_permissions.path(), fs::Permissions::from_mode(0o755))
+        .expect("unsafe permissions");
+    let working = WorkingDirectory::new(unsafe_permissions.path()).expect("working directory");
+    assert!(matches!(
+        FreshOutputDirectory::new(&working, 1024),
+        Err(OutputError::UnsafeDirectory)
+    ));
+    assert!(matches!(
+        FreshOutputDirectory::new(&working, 0),
+        Err(OutputError::InvalidLimit)
+    ));
+
+    let special_permissions = TempDir::new().expect("temp directory");
+    fs::set_permissions(
+        special_permissions.path(),
+        fs::Permissions::from_mode(0o2700),
+    )
+    .expect("setgid permissions");
+    let working = WorkingDirectory::new(special_permissions.path()).expect("working directory");
+    assert!(matches!(
+        FreshOutputDirectory::new(&working, 1024),
+        Err(OutputError::UnsafeDirectory)
+    ));
+}
+
+#[test]
+fn fresh_output_directory_stays_bound_after_path_replacement() {
+    let root = TempDir::new().expect("temp directory");
+    let staging = root.path().join("staging");
+    let moved = root.path().join("moved");
+    fs::create_dir(&staging).expect("staging directory");
+    make_private(&staging);
+    let working = WorkingDirectory::new(&staging).expect("working directory");
+    let output = FreshOutputDirectory::new(&working, 1024).expect("fresh output");
+
+    fs::rename(&staging, &moved).expect("move bound directory");
+    fs::create_dir(&staging).expect("replacement directory");
+    fs::write(staging.join("replacement"), b"wrong").expect("replacement output");
+    fs::write(moved.join("expected"), b"right").expect("bound output");
+
+    let (sealed, bytes) = output
+        .seal_single_file_to_sink(Vec::new())
+        .expect("bound directory output");
+    assert_eq!(sealed.relative_filename, Path::new("expected"));
+    assert_eq!(bytes, b"right");
+}
+
+#[test]
+fn fresh_output_directory_rejects_same_name_replacement_during_read() {
+    let root = TempDir::new().expect("temp directory");
+    let staging = root.path().join("staging");
+    fs::create_dir(&staging).expect("staging directory");
+    make_private(&staging);
+    let working = WorkingDirectory::new(&staging).expect("working directory");
+    let output = FreshOutputDirectory::new(&working, 1024).expect("fresh output");
+    let output_path = staging.join("output");
+    fs::write(&output_path, b"original").expect("provider output");
+
+    let error = output
+        .seal_single_file_to_sink(ReplacingSink {
+            output: output_path,
+            detached: root.path().join("detached"),
+            replaced: false,
+        })
+        .expect_err("same-name replacement must fail");
+
+    assert!(matches!(error, OutputError::ChangedDuringRead));
+}
+
+#[test]
+fn fresh_output_directory_rejects_permissions_changed_after_preflight() {
+    let directory = TempDir::new().expect("temp directory");
+    make_private(directory.path());
+    let working = WorkingDirectory::new(directory.path()).expect("working directory");
+    let output = FreshOutputDirectory::new(&working, 1024).expect("fresh output");
+    fs::write(directory.path().join("output"), b"data").expect("provider output");
+    fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o755))
+        .expect("unsafe permissions");
+
+    assert!(matches!(
+        output.seal_single_file_to_sink(Vec::new()),
+        Err(OutputError::UnsafeDirectory)
+    ));
+}
+
+fn make_private(path: &Path) {
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+        .expect("private directory permissions");
 }
 
 #[tokio::test]

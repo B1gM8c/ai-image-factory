@@ -52,6 +52,8 @@ The inactive gated submit composition, static driver boundary, and crash-window 
 [`docs/architecture/2026-phase2o-gated-submit-orchestration.md`](docs/architecture/2026-phase2o-gated-submit-orchestration.md).
 The inactive Dreamina canonical submit codec and its gated runtime binding are documented in
 [`docs/architecture/2026-phase2p-dreamina-gated-submit-codec.md`](docs/architecture/2026-phase2p-dreamina-gated-submit-codec.md).
+The provider-neutral fresh CLI output-directory boundary is documented in
+[`docs/architecture/2026-phase2q-fresh-cli-output-directory.md`](docs/architecture/2026-phase2q-fresh-cli-output-directory.md).
 Database-bound provider profiles and durable capacity are documented in
 [`docs/architecture/2026-phase1g-execution-binding-capacity.md`](docs/architecture/2026-phase1g-execution-binding-capacity.md).
 

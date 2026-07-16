@@ -12,7 +12,9 @@ use thiserror::Error;
 pub use command::{
     CommandSpec, CommandSpecError, MAX_STDIN_BYTES, VerifiedExecutable, WorkingDirectory,
 };
-pub use output::{OutputContract, OutputError, STREAM_BUFFER_BYTES, SealedOutput};
+pub use output::{
+    FreshOutputDirectory, OutputContract, OutputError, STREAM_BUFFER_BYTES, SealedOutput,
+};
 pub use process::{
     CapturedStream, MAX_CAPTURED_STREAM_BYTES, NoopSpawnObserver, ProcessBackend,
     ProcessCompletion, ProcessError, SpawnEvidence, SpawnObserver, TokioProcessBackend,

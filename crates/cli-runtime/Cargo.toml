@@ -7,6 +7,7 @@ publish = false
 
 [dependencies]
 libc = "0.2.182"
+rustix = { version = "1.1.4", features = ["fs"] }
 sha2 = "0.11.0"
 thiserror = "2.0.17"
 tokio = { version = "1.52.0", features = ["io-util", "process", "rt", "time"] }

@@ -878,6 +878,7 @@ name = "image-cli-runtime"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "rustix",
  "sha2 0.11.0",
  "tempfile",
  "thiserror",

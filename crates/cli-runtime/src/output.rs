@@ -1,19 +1,26 @@
 use std::{
-    ffi::CString,
+    ffi::{CString, OsString},
     fs::{self, File},
     io::{Read, Write},
     os::{
         fd::{AsRawFd, FromRawFd},
-        unix::{ffi::OsStrExt, fs::MetadataExt},
+        unix::{
+            ffi::{OsStrExt, OsStringExt},
+            fs::MetadataExt,
+        },
     },
     path::{Path, PathBuf},
     sync::Arc,
 };
 
+use rustix::fs::Dir;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::command::{CommandSpecError, validate_output_filename};
+use crate::{
+    WorkingDirectory,
+    command::{CommandSpecError, validate_output_filename},
+};
 
 pub const STREAM_BUFFER_BYTES: usize = 64 * 1024;
 
@@ -30,10 +37,28 @@ pub struct SealedOutput {
     pub sha256_hex: String,
 }
 
+/// A one-shot capability for validating one provider-selected artifact in a
+/// private, initially empty working directory.
+#[derive(Debug)]
+pub struct FreshOutputDirectory {
+    directory: Arc<File>,
+    max_bytes: u64,
+}
+
 #[derive(Debug, Error)]
 pub enum OutputError {
     #[error("output could not be opened safely: {0}")]
     Unavailable(#[source] std::io::Error),
+    #[error("output directory must be private and owned by the current user")]
+    UnsafeDirectory,
+    #[error("output size limit must be non-zero")]
+    InvalidLimit,
+    #[error("output directory must be empty before execution")]
+    DirectoryNotEmpty,
+    #[error("output directory does not contain an artifact")]
+    Missing,
+    #[error("output directory contains more than one entry")]
+    MultipleEntries,
     #[error("output must be a regular file")]
     NotRegular,
     #[error("output must not be empty")]
@@ -71,14 +96,80 @@ impl OutputContract {
     }
 }
 
+impl FreshOutputDirectory {
+    pub fn new(directory: &WorkingDirectory, max_bytes: u64) -> Result<Self, OutputError> {
+        if max_bytes == 0 {
+            return Err(OutputError::InvalidLimit);
+        }
+        let directory = directory.directory();
+        validate_private_directory(&directory)?;
+        if first_two_entries(&directory)?.next().is_some() {
+            return Err(OutputError::DirectoryNotEmpty);
+        }
+        Ok(Self {
+            directory,
+            max_bytes,
+        })
+    }
+
+    pub fn ensure_empty(&self) -> Result<(), OutputError> {
+        validate_private_directory(&self.directory)?;
+        if first_two_entries(&self.directory)?.next().is_some() {
+            return Err(OutputError::DirectoryNotEmpty);
+        }
+        Ok(())
+    }
+
+    /// Streams the sole output into a provisional sink and returns the sink
+    /// only after the file and directory identity checks succeed.
+    ///
+    /// The sink must not publish its bytes as authoritative before this method
+    /// returns `Ok`; failures after streaming intentionally drop the sink.
+    pub fn seal_single_file_to_sink<W: Write>(
+        self,
+        sink: W,
+    ) -> Result<(SealedOutput, W), OutputError> {
+        validate_private_directory(&self.directory)?;
+        let mut entries = first_two_entries(&self.directory)?;
+        let filename = entries.next().ok_or(OutputError::Missing)?;
+        if entries.next().is_some() {
+            return Err(OutputError::MultipleEntries);
+        }
+        let relative_filename = PathBuf::from(&filename);
+        let file = open_output_at(&self.directory, &relative_filename)?;
+        let (sealed, sink, identity) =
+            seal_open_file(file, relative_filename.clone(), self.max_bytes, sink)?;
+        validate_private_directory(&self.directory)?;
+        let mut final_entries = first_two_entries(&self.directory)?;
+        if final_entries.next().as_ref() != Some(&filename) || final_entries.next().is_some() {
+            return Err(OutputError::ChangedDuringRead);
+        }
+        validate_current_output(&self.directory, &relative_filename, identity)?;
+        Ok((sealed, sink))
+    }
+}
+
 pub(crate) fn seal_to_sink<W: Write>(
     directory: Arc<File>,
     contract: OutputContract,
-    mut sink: W,
+    sink: W,
 ) -> Result<(SealedOutput, W), OutputError> {
-    let mut file = open_output_at(&directory, contract.relative_filename())?;
+    let file = open_output_at(&directory, contract.relative_filename())?;
+    let relative_filename = contract.relative_filename;
+    let (sealed, sink, identity) =
+        seal_open_file(file, relative_filename.clone(), contract.max_bytes, sink)?;
+    validate_current_output(&directory, &relative_filename, identity)?;
+    Ok((sealed, sink))
+}
+
+fn seal_open_file<W: Write>(
+    mut file: File,
+    relative_filename: PathBuf,
+    max_bytes: u64,
+    mut sink: W,
+) -> Result<(SealedOutput, W, OutputIdentity), OutputError> {
     let before = file.metadata().map_err(OutputError::Unavailable)?;
-    validate_regular_output(&before, contract.max_bytes())?;
+    validate_regular_output(&before, max_bytes)?;
     let identity = OutputIdentity::from_metadata(&before);
 
     let mut hasher = Sha256::new();
@@ -92,7 +183,7 @@ pub(crate) fn seal_to_sink<W: Write>(
         byte_size = byte_size
             .checked_add(count as u64)
             .ok_or(OutputError::TooLarge)?;
-        if byte_size > contract.max_bytes() {
+        if byte_size > max_bytes {
             return Err(OutputError::TooLarge);
         }
         hasher.update(&buffer[..count]);
@@ -109,12 +200,55 @@ pub(crate) fn seal_to_sink<W: Write>(
     let digest = hasher.finalize();
     Ok((
         SealedOutput {
-            relative_filename: contract.relative_filename,
+            relative_filename,
             byte_size,
             sha256_hex: hex_digest(&digest),
         },
         sink,
+        identity,
     ))
+}
+
+fn validate_current_output(
+    directory: &File,
+    relative_filename: &Path,
+    expected: OutputIdentity,
+) -> Result<(), OutputError> {
+    let current = open_output_at(directory, relative_filename)?;
+    let metadata = current.metadata().map_err(OutputError::Unavailable)?;
+    if OutputIdentity::from_metadata(&metadata) != expected {
+        return Err(OutputError::ChangedDuringRead);
+    }
+    Ok(())
+}
+
+fn validate_private_directory(directory: &File) -> Result<(), OutputError> {
+    let metadata = directory.metadata().map_err(OutputError::Unavailable)?;
+    if !metadata.is_dir()
+        || metadata.mode() & 0o7777 != 0o700
+        || metadata.uid() != unsafe { libc::geteuid() }
+    {
+        return Err(OutputError::UnsafeDirectory);
+    }
+    Ok(())
+}
+
+fn first_two_entries(directory: &File) -> Result<std::vec::IntoIter<OsString>, OutputError> {
+    let mut stream = Dir::read_from(directory)
+        .map_err(|error| OutputError::Unavailable(std::io::Error::from(error)))?;
+    let mut entries = Vec::with_capacity(2);
+    while let Some(entry) = stream.read() {
+        let entry = entry.map_err(|error| OutputError::Unavailable(std::io::Error::from(error)))?;
+        let name = entry.file_name().to_bytes();
+        if matches!(name, b"." | b"..") {
+            continue;
+        }
+        entries.push(OsString::from_vec(name.to_vec()));
+        if entries.len() == 2 {
+            break;
+        }
+    }
+    Ok(entries.into_iter())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
