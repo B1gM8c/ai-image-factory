@@ -1,18 +1,23 @@
 use std::fmt;
 
 use async_trait::async_trait;
-use image_provider_sdk::ProviderCommandIdentity;
+use image_provider_sdk::{OutputSlot, ProviderCommandIdentity};
 use uuid::Uuid;
 
-use crate::executor::ExecutorResultManifest;
+use crate::executor::{ExecutorResultManifest, ExecutorSubmissionLease};
 
 mod capacity;
+mod orchestrator;
 mod postgres;
 
 pub use capacity::{
     ProviderCapacityEvidence, ProviderCapacityEvidenceOutcome, ProviderCapacityReconciliation,
     ProviderCapacityReconciliationLease, ProviderCapacityReconciliationState,
     ProviderCapacityReconciliationStore, ProviderCapacityTerminalState,
+};
+pub use orchestrator::{
+    ProviderSubmitOrchestrator, ProviderSubmitOrchestratorError, ProviderSubmitOutcome,
+    ProviderSubmitWork,
 };
 pub use postgres::PostgresProviderTaskStore;
 
@@ -62,26 +67,26 @@ pub struct RemoteTaskSubmitReservation {
     pub executor_owner: String,
     pub executor_lease_epoch: i64,
     pub idempotency_key: String,
+    output: OutputSlot,
     provider_command: ProviderCommandIdentity,
     pub provider_timeout_ms: i64,
 }
 
 impl RemoteTaskSubmitReservation {
     pub fn new(
-        submission_id: Uuid,
-        executor_execution_id: Uuid,
-        executor_owner: String,
-        executor_lease_epoch: i64,
+        executor: &ExecutorSubmissionLease,
         idempotency_key: String,
+        output: OutputSlot,
         provider_command: ProviderCommandIdentity,
         provider_timeout_ms: i64,
     ) -> Self {
         Self {
-            submission_id,
-            executor_execution_id,
-            executor_owner,
-            executor_lease_epoch,
+            submission_id: executor.submission_id,
+            executor_execution_id: executor.executor_execution_id,
+            executor_owner: executor.executor_owner.clone(),
+            executor_lease_epoch: executor.executor_lease_epoch,
             idempotency_key,
+            output,
             provider_command,
             provider_timeout_ms,
         }
@@ -91,9 +96,12 @@ impl RemoteTaskSubmitReservation {
         self.provider_command
     }
 
-    pub fn with_provider_command(mut self, provider_command: ProviderCommandIdentity) -> Self {
-        self.provider_command = provider_command;
-        self
+    pub fn output_index(&self) -> u32 {
+        self.output.index()
+    }
+
+    pub fn output_total(&self) -> u32 {
+        self.output.total()
     }
 }
 
@@ -106,6 +114,8 @@ pub struct ProviderSubmitIntent {
     pub submit_owner: String,
     pub submit_lease_epoch: i64,
     pub idempotency_key: String,
+    pub output_index: u32,
+    pub output_total: u32,
     pub provider_command_sha256: String,
     pub execution_binding_sha256: String,
     pub provider_timeout_ms: i64,
@@ -172,6 +182,22 @@ pub struct RemoteTaskSubmitReceipt {
     pub remote_operation_id: String,
     pub provider_request_id: Option<String>,
     pub event_identity: String,
+    pub execution_binding_sha256: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RemoteTaskQuarantinedReceipt {
+    pub submission_id: Uuid,
+    pub executor_execution_id: Uuid,
+    pub executor_owner: String,
+    pub executor_lease_epoch: i64,
+    pub event_identity: String,
+    pub expected_provider_id: String,
+    pub observed_provider_id: String,
+    pub observed_submission_id: String,
+    pub remote_operation_id: String,
+    pub provider_request_id: Option<String>,
+    pub reason: String,
     pub execution_binding_sha256: String,
 }
 
@@ -357,6 +383,50 @@ pub enum ProviderSubmitStart {
     Existing(ProviderSubmitInvocation),
 }
 
+#[derive(Debug, Eq, PartialEq)]
+pub struct ProviderSubmitDispatchAuthority {
+    invocation: ProviderSubmitInvocation,
+    remaining_budget_ms: u64,
+}
+
+impl ProviderSubmitDispatchAuthority {
+    pub fn intent(&self) -> &ProviderSubmitIntent {
+        &self.invocation.intent
+    }
+
+    pub fn context(&self) -> &ProviderExecutionContext {
+        self.invocation.context()
+    }
+
+    pub fn remaining_budget_ms(&self) -> u64 {
+        self.remaining_budget_ms
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub struct ProviderSubmitAttachAuthority {
+    invocation: ProviderSubmitInvocation,
+}
+
+impl ProviderSubmitAttachAuthority {
+    pub fn intent(&self) -> &ProviderSubmitIntent {
+        &self.invocation.intent
+    }
+
+    pub fn context(&self) -> &ProviderExecutionContext {
+        self.invocation.context()
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub enum ProviderSubmitAcquire {
+    Dispatch(ProviderSubmitDispatchAuthority),
+    AttachOnly(ProviderSubmitAttachAuthority),
+    Busy(ProviderSubmitIntent),
+    ObserveOnly(ProviderSubmitIntent),
+    Terminal(ProviderSubmitIntent),
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProviderSubmitRecoveryFence {
     pub recovery_owner: String,
@@ -508,6 +578,11 @@ pub enum ProviderTaskStoreError {
 
 #[async_trait]
 pub trait ProviderTaskStore: Send + Sync + 'static {
+    async fn acquire_submit(
+        &self,
+        request: &RemoteTaskSubmitReservation,
+    ) -> Result<ProviderSubmitAcquire, ProviderTaskStoreError>;
+
     async fn reserve_submit(
         &self,
         request: &RemoteTaskSubmitReservation,
@@ -526,6 +601,11 @@ pub trait ProviderTaskStore: Send + Sync + 'static {
     async fn record_submit_receipt(
         &self,
         request: &RemoteTaskSubmitReceipt,
+    ) -> Result<ProviderSubmitIntent, ProviderTaskStoreError>;
+
+    async fn quarantine_submit_receipt(
+        &self,
+        request: &RemoteTaskQuarantinedReceipt,
     ) -> Result<ProviderSubmitIntent, ProviderTaskStoreError>;
 
     async fn load_submit_intent(

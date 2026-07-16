@@ -36,4 +36,5 @@ utoipa = "5.5.0"
 uuid = { version = "1.23.4", features = ["v4", "fast-rng"] }
 
 [dev-dependencies]
+image-provider-test-support = { path = "../provider-test-support" }
 reqwest = { version = "0.13.4", default-features = false, features = ["json"] }

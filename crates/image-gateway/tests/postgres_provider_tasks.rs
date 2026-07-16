@@ -1,20 +1,30 @@
-use std::{env, time::Duration};
+use std::{
+    env,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use gpt_image_2_gateway::{
     ExecutorClaimScope, ExecutorHandoffStore, ExecutorSubmissionLease, ExecutorSubmissionOutcome,
     ExecutorSubmissionStore, PostgresExecutorSubmissionStore, PostgresProviderTaskStore,
     ProviderArtifactAuthority, ProviderCapacityEvidence, ProviderCapacityEvidenceOutcome,
     ProviderCapacityReconciliationState, ProviderCapacityReconciliationStore,
-    ProviderCapacityTerminalState, ProviderSubmitFailureKind, ProviderSubmitIntentState,
-    ProviderSubmitRecoveryFence, ProviderSubmitStart, ProviderTaskClaimScope,
-    ProviderTaskDeadlineStore, ProviderTaskObservation, ProviderTaskObservationOutcome,
-    ProviderTaskObservationSource, ProviderTaskState, ProviderTaskStore, ProviderTaskStoreError,
-    RemoteTaskAttach, RemoteTaskSubmitFailure, RemoteTaskSubmitReceipt,
-    RemoteTaskSubmitReservation, VerifiedCallbackWakeup,
+    ProviderCapacityTerminalState, ProviderSubmitAcquire, ProviderSubmitFailureKind,
+    ProviderSubmitIntentState, ProviderSubmitOrchestrator, ProviderSubmitOrchestratorError,
+    ProviderSubmitOutcome, ProviderSubmitRecoveryFence, ProviderSubmitStart, ProviderSubmitWork,
+    ProviderTaskClaimScope, ProviderTaskDeadlineStore, ProviderTaskObservation,
+    ProviderTaskObservationOutcome, ProviderTaskObservationSource, ProviderTaskState,
+    ProviderTaskStore, ProviderTaskStoreError, RemoteTaskAttach, RemoteTaskSubmitFailure,
+    RemoteTaskSubmitReceipt, RemoteTaskSubmitReservation, VerifiedCallbackWakeup,
     admission::WorkLease,
     database::{connect_test_pool_with_search_path, run_migrations},
 };
-use image_provider_sdk::{OutputSlot, ProviderCommandIdentity, SingleOutputCommand};
+use image_provider_sdk::{
+    CanonicalCommandPayload, EffectCertainty, OutputSlot, PendingOperation,
+    ProviderCommandIdentity, ProviderFailure, ProviderFailureClass, ProviderRequestId,
+    RemoteOperationRef, RetryDirective, SingleOutputCommand,
+};
+use image_provider_test_support::{ScriptedFakeProvider, SubmitStep, TestPayload};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use sqlx::{AssertSqlSafe, PgPool};
@@ -43,6 +53,522 @@ macro_rules! attach_request {
     ($store:expr, $lease:expr, $operation:expr, $event:expr $(,)?) => {
         bound_attach_request($store, $lease, $operation, $event).await?
     };
+}
+
+#[tokio::test]
+async fn atomic_submit_acquire_elects_one_dispatch_without_reserved_gap() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let lease = seed_running_submission(&database.pool, "atomic-submit-worker").await?;
+        let store = PostgresProviderTaskStore::new(database.pool.clone());
+        let reservation = reservation_request(&lease);
+        let mut tasks = Vec::new();
+        for _ in 0..32 {
+            let store = store.clone();
+            let reservation = reservation.clone();
+            tasks.push(tokio::spawn(async move {
+                store.acquire_submit(&reservation).await
+            }));
+        }
+
+        let mut dispatches = 0;
+        let mut non_dispatches = 0;
+        for task in tasks {
+            match task.await.map_err(debug_error)?.map_err(debug_error)? {
+                ProviderSubmitAcquire::Dispatch(_) => dispatches += 1,
+                ProviderSubmitAcquire::Busy(_) => non_dispatches += 1,
+                other => {
+                    return Err(format!("unexpected concurrent acquire outcome: {other:?}"));
+                }
+            }
+        }
+        require(
+            dispatches == 1 && non_dispatches == 31,
+            format!("dispatch election was not unique: {dispatches}/{non_dispatches}"),
+        )?;
+
+        let projection: (i64, i64, i64) = sqlx::query_as(
+            r#"
+            SELECT
+              COUNT(*) FILTER (WHERE intent.state = 'sending'),
+              COUNT(*) FILTER (WHERE intent.state = 'reserved'),
+              COUNT(recovery.submission_id)
+            FROM provider_remote_submit_intents intent
+            LEFT JOIN provider_submit_recoveries recovery
+              ON recovery.submission_id = intent.submission_id
+            WHERE intent.submission_id = $1
+            "#,
+        )
+        .bind(lease.submission_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(
+            projection == (1, 0, 1),
+            format!("atomic acquire left an invalid projection: {projection:?}"),
+        )?;
+        Ok(())
+    }
+    .await;
+    database.cleanup().await?;
+    result
+}
+
+#[tokio::test]
+async fn submit_orchestrator_dispatches_once_and_replays_without_resubmit() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let lease = seed_running_submission(&database.pool, "orchestrator-worker").await?;
+        let provider = ScriptedFakeProvider::default();
+        provider.push_submit(SubmitStep::Pending(PendingOperation::new(
+            RemoteOperationRef::new(
+                "provider-test",
+                lease.submission_id.to_string(),
+                "remote-operation-1",
+            )
+            .map_err(debug_error)?,
+            None,
+            Some(250),
+        )));
+        let orchestrator = Arc::new(
+            ProviderSubmitOrchestrator::new(
+                PostgresProviderTaskStore::new(database.pool.clone()),
+                provider.clone(),
+                60_000,
+            )
+            .map_err(debug_error)?,
+        );
+        let wrong_total = ProviderSubmitWork::<ScriptedFakeProvider>::new(
+            &lease,
+            SingleOutputCommand::new(
+                OutputSlot::new(0, 2).map_err(debug_error)?,
+                TestPayload::bound_to(
+                    b"provider-test-payload".to_vec(),
+                    lease.command_hash.clone(),
+                ),
+            )
+            .map_err(debug_error)?,
+        )
+        .map_err(debug_error)?;
+        let wrong_total = orchestrator.submit(wrong_total).await;
+        require(
+            matches!(
+                wrong_total,
+                Err(ProviderSubmitOrchestratorError::Store(
+                    ProviderTaskStoreError::Conflict
+                ))
+            ) && provider.calls().submit == 0,
+            "submit work accepted an output total that disagreed with durable job identity",
+        )?;
+
+        let mut tasks = Vec::new();
+        for _ in 0..32 {
+            let orchestrator = Arc::clone(&orchestrator);
+            let work = orchestrator_work(&lease)?;
+            tasks.push(tokio::spawn(async move { orchestrator.submit(work).await }));
+        }
+        let mut attached = 0;
+        for task in tasks {
+            let observed = task.await.map_err(debug_error)?.map_err(debug_error)?;
+            if matches!(observed, ProviderSubmitOutcome::Attached(_)) {
+                attached += 1;
+            }
+        }
+        require(
+            attached >= 1,
+            "concurrent submit did not produce an attached task",
+        )?;
+        let restarted = ProviderSubmitOrchestrator::new(
+            PostgresProviderTaskStore::new(database.pool.clone()),
+            provider.clone(),
+            120_000,
+        )
+        .map_err(debug_error)?;
+        let replay = restarted
+            .submit(orchestrator_work(&lease)?)
+            .await
+            .map_err(debug_error)?;
+        require(
+            matches!(replay, ProviderSubmitOutcome::Attached(_)) && provider.calls().submit == 1,
+            format!("replay resubmitted or lost task: {replay:?}"),
+        )?;
+        Ok(())
+    }
+    .await;
+    database.cleanup().await?;
+    result
+}
+
+#[tokio::test]
+async fn submit_projection_rejects_sending_without_recovery() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let lease = seed_running_submission(&database.pool, "projection-worker").await?;
+        let store = PostgresProviderTaskStore::new(database.pool.clone());
+        store
+            .reserve_submit(&reservation_request(&lease))
+            .await
+            .map_err(debug_error)?;
+        let mut tx = database.pool.begin().await.map_err(debug_error)?;
+        let now: i64 = sqlx::query_scalar(
+            "SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT",
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(debug_error)?;
+        sqlx::query(
+            r#"
+            UPDATE provider_remote_submit_intents
+            SET state = 'sending', send_started_at_ms = $2, updated_at_ms = $2
+            WHERE submission_id = $1
+            "#,
+        )
+        .bind(lease.submission_id)
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .map_err(debug_error)?;
+        require(
+            tx.commit().await.is_err(),
+            "sending intent committed without an active recovery row",
+        )?;
+        let intent = store
+            .load_submit_intent(lease.submission_id)
+            .await
+            .map_err(debug_error)?
+            .ok_or_else(|| "reserved intent disappeared after rollback".to_string())?;
+        require(
+            intent.state == ProviderSubmitIntentState::Reserved,
+            "failed projection did not roll the intent back to reserved",
+        )?;
+
+        let direct = seed_running_submission(&database.pool, "direct-projection-worker").await?;
+        let mut tx = database.pool.begin().await.map_err(debug_error)?;
+        let now: i64 = sqlx::query_scalar(
+            "SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT",
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(debug_error)?;
+        sqlx::query(
+            r#"
+            INSERT INTO provider_remote_submit_intents
+              (submission_id, executor_execution_id, provider_id, provider_account_id,
+               submit_owner, submit_lease_epoch, idempotency_key, state,
+               output_index, output_total,
+               provider_command_sha256, execution_binding_sha256,
+               provider_timeout_ms, send_started_at_ms, created_at_ms, updated_at_ms)
+            VALUES ($1, $2, 'provider-test', $3, $4, $5, $6, 'sending', 0, 1,
+                    repeat('a', 64), repeat('b', 64), 60000, $7, $7, $7)
+            "#,
+        )
+        .bind(direct.submission_id)
+        .bind(direct.executor_execution_id)
+        .bind(ACCOUNT_ID)
+        .bind(&direct.executor_owner)
+        .bind(direct.executor_lease_epoch)
+        .bind(format!("provider-submit-{}", direct.submission_id.simple()))
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .map_err(debug_error)?;
+        require(
+            tx.commit().await.is_err(),
+            "direct sending insert committed without an active recovery row",
+        )?;
+        let direct_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM provider_remote_submit_intents WHERE submission_id = $1",
+        )
+        .bind(direct.submission_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(
+            direct_count == 0,
+            "failed direct sending insert was not fully rolled back",
+        )?;
+        Ok(())
+    }
+    .await;
+    database.cleanup().await?;
+    result
+}
+
+#[tokio::test]
+async fn submit_orchestrator_bounds_a_stuck_provider_future() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let lease = seed_running_submission(&database.pool, "submit-timeout-worker").await?;
+        let provider = ScriptedFakeProvider::default();
+        provider.push_submit(SubmitStep::Never);
+        let orchestrator = ProviderSubmitOrchestrator::new(
+            PostgresProviderTaskStore::new(database.pool.clone()),
+            provider.clone(),
+            200,
+        )
+        .map_err(debug_error)?;
+
+        let started = Instant::now();
+        let observed = orchestrator
+            .submit(orchestrator_work(&lease)?)
+            .await
+            .map_err(debug_error)?;
+        require(
+            started.elapsed() < Duration::from_secs(2)
+                && matches!(observed, ProviderSubmitOutcome::AwaitingEvidence(ref intent)
+                    if intent.state == ProviderSubmitIntentState::OutcomeUnknown
+                        && intent.failure_error_code.as_deref() == Some("provider_submit_timeout"))
+                && provider.calls().submit == 1,
+            format!("stuck submit was not bounded as uncertain: {observed:?}"),
+        )?;
+        Ok(())
+    }
+    .await;
+    database.cleanup().await?;
+    result
+}
+
+#[tokio::test]
+async fn atomic_submit_migration_bounds_lock_wait_and_retries_cleanly() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let mut holder = database.pool.begin().await.map_err(debug_error)?;
+        sqlx::query("LOCK TABLE provider_remote_submit_intents IN ROW EXCLUSIVE MODE")
+            .execute(&mut *holder)
+            .await
+            .map_err(debug_error)?;
+
+        let mut blocked = database.pool.begin().await.map_err(debug_error)?;
+        let attempted = tokio::time::timeout(
+            Duration::from_secs(7),
+            sqlx::raw_sql(include_str!(
+                "../migrations/0027_atomic_provider_submit_acquisition.sql"
+            ))
+            .execute(&mut *blocked),
+        )
+        .await
+        .map_err(|_| "atomic submit migration exceeded its lock timeout".to_string())?;
+        require(
+            attempted.is_err(),
+            "atomic submit migration ignored a conflicting writer lock",
+        )?;
+        blocked.rollback().await.map_err(debug_error)?;
+        holder.rollback().await.map_err(debug_error)?;
+
+        let mut retry = database.pool.begin().await.map_err(debug_error)?;
+        sqlx::raw_sql(include_str!(
+            "../migrations/0027_atomic_provider_submit_acquisition.sql"
+        ))
+        .execute(&mut *retry)
+        .await
+        .map_err(debug_error)?;
+        retry.commit().await.map_err(debug_error)
+    }
+    .await;
+    database.cleanup().await?;
+    result
+}
+
+#[tokio::test]
+async fn atomic_submit_migration_preserves_and_recovers_schema_26_submit_states() -> TestResult {
+    let Some(database) = TestDatabase::new_before_atomic_submit_acquisition().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let reserved_lease =
+            seed_running_submission(&database.pool, "schema-26-reserved-submit").await?;
+        let sending_lease =
+            seed_running_submission(&database.pool, "schema-26-sending-submit").await?;
+        let reserved = reservation_request(&reserved_lease);
+        let sending = reservation_request(&sending_lease);
+        seed_schema_26_submit(&database.pool, &reserved_lease, &reserved, false).await?;
+        seed_schema_26_submit(&database.pool, &sending_lease, &sending, true).await?;
+
+        let before: Vec<(Uuid, String)> = sqlx::query_as(
+            "SELECT submission_id, state FROM provider_remote_submit_intents ORDER BY submission_id",
+        )
+        .fetch_all(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(
+            before.iter().any(|row| row.1 == "reserved")
+                && before.iter().any(|row| row.1 == "sending"),
+            format!("schema 26 fixtures did not cover both active states: {before:?}"),
+        )?;
+
+        sqlx::raw_sql(include_str!(
+            "../migrations/0027_atomic_provider_submit_acquisition.sql"
+        ))
+        .execute(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        let after: Vec<(Uuid, String, i32, i32)> = sqlx::query_as(
+            "SELECT submission_id, state, output_index, output_total FROM provider_remote_submit_intents ORDER BY submission_id",
+        )
+        .fetch_all(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        let after_identity: Vec<(Uuid, String)> = after
+            .iter()
+            .map(|row| (row.0, row.1.clone()))
+            .collect();
+        require(
+            after_identity == before && after.iter().all(|row| row.2 == 0 && row.3 == 1),
+            format!("0027 rewrote schema 26 submit history: {before:?} -> {after:?}"),
+        )?;
+
+        let store = PostgresProviderTaskStore::new(database.pool.clone());
+        require(
+            matches!(
+                store.acquire_submit(&reserved).await.map_err(debug_error)?,
+                ProviderSubmitAcquire::Dispatch(_)
+            ),
+            "0027 did not let atomic acquire adopt a schema 26 reserved intent",
+        )?;
+        require(
+            matches!(
+                store.acquire_submit(&sending).await.map_err(debug_error)?,
+                ProviderSubmitAcquire::Busy(_)
+            ),
+            "0027 treated a schema 26 sending intent as new dispatch authority",
+        )
+    }
+    .await;
+    database.cleanup().await?;
+    result
+}
+
+#[tokio::test]
+async fn submit_orchestrator_never_retries_unknown_remote_effect() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let lease = seed_running_submission(&database.pool, "uncertain-submit-worker").await?;
+        let provider = ScriptedFakeProvider::default();
+        provider.push_submit(SubmitStep::Fail(
+            ProviderFailure::new(
+                ProviderFailureClass::Ambiguous,
+                "submit_effect_unknown",
+                EffectCertainty::UnknownRemoteEffect,
+                RetryDirective::Never,
+            )
+            .map_err(debug_error)?,
+        ));
+        let orchestrator = ProviderSubmitOrchestrator::new(
+            PostgresProviderTaskStore::new(database.pool.clone()),
+            provider.clone(),
+            60_000,
+        )
+        .map_err(debug_error)?;
+
+        let first = orchestrator
+            .submit(orchestrator_work(&lease)?)
+            .await
+            .map_err(debug_error)?;
+        let replay = orchestrator
+            .submit(orchestrator_work(&lease)?)
+            .await
+            .map_err(debug_error)?;
+        require(
+            matches!(first, ProviderSubmitOutcome::AwaitingEvidence(ref intent)
+                if intent.state == ProviderSubmitIntentState::OutcomeUnknown)
+                && matches!(replay, ProviderSubmitOutcome::AwaitingEvidence(ref intent)
+                    if intent.state == ProviderSubmitIntentState::OutcomeUnknown)
+                && provider.calls().submit == 1,
+            "unknown remote effect was retried or projected incorrectly",
+        )?;
+        Ok(())
+    }
+    .await;
+    database.cleanup().await?;
+    result
+}
+
+#[tokio::test]
+async fn submit_orchestrator_quarantines_misattributed_receipt() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let lease = seed_running_submission(&database.pool, "receipt-fence-worker").await?;
+        let provider = ScriptedFakeProvider::default();
+        provider.push_submit(SubmitStep::Pending(PendingOperation::new(
+            RemoteOperationRef::new(
+                "another-provider",
+                lease.submission_id.to_string(),
+                "misattributed-operation",
+            )
+            .map_err(debug_error)?,
+            Some(ProviderRequestId::new("misattributed-request").map_err(debug_error)?),
+            None,
+        )));
+        let orchestrator = ProviderSubmitOrchestrator::new(
+            PostgresProviderTaskStore::new(database.pool.clone()),
+            provider.clone(),
+            60_000,
+        )
+        .map_err(debug_error)?;
+
+        let observed = orchestrator
+            .submit(orchestrator_work(&lease)?)
+            .await
+            .map_err(debug_error)?;
+        let task_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM provider_remote_tasks WHERE submission_id = $1",
+        )
+        .bind(lease.submission_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        let evidence: (String, String, String, Option<String>) = sqlx::query_as(
+            r#"
+            SELECT observed_provider_id, observed_submission_id,
+                   remote_operation_id, provider_request_id
+            FROM provider_submit_quarantined_receipts
+            WHERE submission_id = $1
+            "#,
+        )
+        .bind(lease.submission_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(
+            matches!(observed, ProviderSubmitOutcome::AwaitingEvidence(ref intent)
+                if intent.state == ProviderSubmitIntentState::OutcomeUnknown)
+                && provider.calls().submit == 1
+                && task_count == 0
+                && evidence
+                    == (
+                        "another-provider".to_owned(),
+                        lease.submission_id.to_string(),
+                        "misattributed-operation".to_owned(),
+                        Some("misattributed-request".to_owned()),
+                    )
+                && sqlx::query(
+                    "UPDATE provider_submit_quarantined_receipts SET reason = 'tampered' WHERE submission_id = $1",
+                )
+                .bind(lease.submission_id)
+                .execute(&database.pool)
+                .await
+                .is_err(),
+            "misattributed receipt was attached or lost its uncertainty",
+        )?;
+        Ok(())
+    }
+    .await;
+    database.cleanup().await?;
+    result
 }
 
 #[tokio::test]
@@ -1010,9 +1536,14 @@ async fn remote_submit_requires_exact_remote_operation_binding() -> TestResult {
             .reserve_submit(&reservation)
             .await
             .map_err(debug_error)?;
-        let changed_command = reservation
-            .clone()
-            .with_provider_command(provider_command_identity([4; 32]));
+        let changed_command = RemoteTaskSubmitReservation::new(
+            &remote,
+            reservation.idempotency_key.clone(),
+            OutputSlot::new(reservation.output_index(), reservation.output_total())
+                .map_err(debug_error)?,
+            provider_command_identity([4; 32]),
+            reservation.provider_timeout_ms,
+        );
         require(
             store.reserve_submit(&changed_command).await == Err(ProviderTaskStoreError::Conflict),
             "reservation replay accepted a different provider command digest",
@@ -5773,23 +6304,198 @@ fn reservation_request(lease: &ExecutorSubmissionLease) -> RemoteTaskSubmitReser
     provider_command.update(lease.output_index.to_be_bytes());
     provider_command.update(lease.command_hash.as_bytes());
     RemoteTaskSubmitReservation::new(
-        lease.submission_id,
-        lease.executor_execution_id,
-        lease.executor_owner.clone(),
-        lease.executor_lease_epoch,
+        lease,
         format!("provider-submit-{}", lease.submission_id.simple()),
+        OutputSlot::new(
+            u32::try_from(lease.output_index).expect("test output index is nonnegative"),
+            1,
+        )
+        .expect("test output projection is valid"),
         provider_command_identity(provider_command.finalize().into()),
         60_000,
     )
 }
 
-fn provider_command_identity(canonical_sha256: [u8; 32]) -> ProviderCommandIdentity {
+async fn seed_schema_26_submit(
+    pool: &PgPool,
+    lease: &ExecutorSubmissionLease,
+    reservation: &RemoteTaskSubmitReservation,
+    sending: bool,
+) -> TestResult {
+    let now = database_now(pool).await?;
+    let provider_command_sha256 = hex::encode(reservation.provider_command().canonical_sha256());
+    let execution_binding_sha256 =
+        schema_26_execution_binding_sha256(lease, reservation, &provider_command_sha256);
+    let mut tx = pool.begin().await.map_err(debug_error)?;
+    sqlx::query(
+        r#"
+        INSERT INTO provider_remote_submit_intents
+          (submission_id, executor_execution_id, provider_id, provider_account_id,
+           submit_owner, submit_lease_epoch, idempotency_key, state,
+           provider_command_sha256, execution_binding_sha256,
+           provider_timeout_ms, created_at_ms, updated_at_ms)
+        VALUES ($1, $2, 'provider-test', $3, $4, $5, $6, 'reserved',
+                $7, $8, $9, $10, $10)
+        "#,
+    )
+    .bind(lease.submission_id)
+    .bind(lease.executor_execution_id)
+    .bind(ACCOUNT_ID)
+    .bind(&lease.executor_owner)
+    .bind(lease.executor_lease_epoch)
+    .bind(&reservation.idempotency_key)
+    .bind(provider_command_sha256)
+    .bind(execution_binding_sha256)
+    .bind(reservation.provider_timeout_ms)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .map_err(debug_error)?;
+    if sending {
+        sqlx::query(
+            r#"
+            UPDATE provider_remote_submit_intents
+            SET state = 'sending', send_started_at_ms = $3, updated_at_ms = $3
+            WHERE submission_id = $1 AND executor_execution_id = $2
+              AND state = 'reserved'
+            "#,
+        )
+        .bind(lease.submission_id)
+        .bind(lease.executor_execution_id)
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .map_err(debug_error)?;
+        let provider_deadline_at_ms = now + reservation.provider_timeout_ms;
+        sqlx::query(
+            r#"
+            INSERT INTO provider_submit_recoveries
+              (submission_id, executor_execution_id, provider_id, provider_account_id,
+               invocation_attempt, provider_timeout_ms, provider_deadline_at_ms,
+               next_recovery_at_ms, state, created_at_ms, updated_at_ms)
+            VALUES ($1, $2, 'provider-test', $3, 1, $4, $5, $6,
+                    'active', $7, $7)
+            "#,
+        )
+        .bind(lease.submission_id)
+        .bind(lease.executor_execution_id)
+        .bind(ACCOUNT_ID)
+        .bind(reservation.provider_timeout_ms)
+        .bind(provider_deadline_at_ms)
+        .bind(
+            lease
+                .executor_lease_expires_at_ms
+                .min(provider_deadline_at_ms),
+        )
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .map_err(debug_error)?;
+    }
+    tx.commit().await.map_err(debug_error)
+}
+
+fn schema_26_execution_binding_sha256(
+    lease: &ExecutorSubmissionLease,
+    reservation: &RemoteTaskSubmitReservation,
+    provider_command_sha256: &str,
+) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"ai-image-factory/provider-execution-binding/v1\0");
+    for (name, value) in [
+        (
+            "submission_id",
+            reservation.submission_id.as_bytes().as_slice(),
+        ),
+        (
+            "executor_execution_id",
+            reservation.executor_execution_id.as_bytes().as_slice(),
+        ),
+        ("output_id", lease.output_id.as_bytes().as_slice()),
+        ("provider_id", lease.provider_id.as_bytes()),
+        ("provider_account_id", ACCOUNT_ID.as_bytes().as_slice()),
+        ("model", lease.model.as_bytes()),
+        ("command_schema", lease.command_schema.as_bytes()),
+        ("command_hash", lease.command_hash.as_bytes()),
+        ("operation_id", b"images.generations".as_slice()),
+        (
+            "operation_descriptor_revision",
+            b"provider-test/images.generations/v1".as_slice(),
+        ),
+        ("operation_descriptor_sha256_v1", "2".repeat(64).as_bytes()),
+        ("completion_mode", b"remote_task".as_slice()),
+        ("idempotency_mode", b"submission_bound".as_slice()),
+        ("operation_binding_version", 2_i16.to_be_bytes().as_slice()),
+        ("execution_profile_id", PROFILE_ID.as_bytes().as_slice()),
+        ("adapter_revision", lease.adapter_revision.as_bytes()),
+        ("credential_pool_id", POOL_ID.as_bytes().as_slice()),
+        ("credential_ref", b"test-vault.provider-task.1".as_slice()),
+        ("credential_revision", 1_i64.to_be_bytes().as_slice()),
+        ("credential_auth_sha256", "1".repeat(64).as_bytes()),
+        ("resource_policy_id", POLICY_ID.as_bytes().as_slice()),
+        ("resource_policy_revision", 1_i64.to_be_bytes().as_slice()),
+        ("executor_owner", reservation.executor_owner.as_bytes()),
+        (
+            "executor_lease_epoch",
+            reservation.executor_lease_epoch.to_be_bytes().as_slice(),
+        ),
+        (
+            "submission_idempotency_key",
+            reservation.idempotency_key.as_bytes(),
+        ),
+        (
+            "provider_command_sha256",
+            provider_command_sha256.as_bytes(),
+        ),
+        (
+            "provider_timeout_ms",
+            reservation.provider_timeout_ms.to_be_bytes().as_slice(),
+        ),
+    ] {
+        digest.update((name.len() as u64).to_be_bytes());
+        digest.update(name.as_bytes());
+        digest.update((value.len() as u64).to_be_bytes());
+        digest.update(value);
+    }
+    hex::encode(digest.finalize())
+}
+
+fn orchestrator_command(lease: &ExecutorSubmissionLease) -> SingleOutputCommand<TestPayload> {
     SingleOutputCommand::new(
-        "provider-test.command.v1",
-        "provider-test-adapter-v1",
-        canonical_sha256,
         OutputSlot::new(0, 1).expect("one test output is valid"),
-        (),
+        TestPayload::bound_to(
+            b"provider-test-payload".to_vec(),
+            lease.command_hash.clone(),
+        ),
+    )
+    .expect("provider test command is canonical")
+}
+
+fn orchestrator_work(
+    lease: &ExecutorSubmissionLease,
+) -> TestResult<ProviderSubmitWork<ScriptedFakeProvider>> {
+    ProviderSubmitWork::new(lease, orchestrator_command(lease)).map_err(debug_error)
+}
+
+fn provider_command_identity(canonical_sha256: [u8; 32]) -> ProviderCommandIdentity {
+    struct TestCommandPayload([u8; 32]);
+
+    impl CanonicalCommandPayload for TestCommandPayload {
+        const SCHEMA_ID: &'static str = "provider-test.command.v1";
+        const ADAPTER_REVISION: &'static str = "provider-test-adapter-v1";
+
+        fn source_command_sha256(&self) -> &str {
+            "1111111111111111111111111111111111111111111111111111111111111111"
+        }
+
+        fn into_canonical_bytes(self, _output: OutputSlot) -> Vec<u8> {
+            self.0.to_vec()
+        }
+    }
+
+    SingleOutputCommand::new(
+        OutputSlot::new(0, 1).expect("one test output is valid"),
+        TestCommandPayload(canonical_sha256),
     )
     .expect("provider test command identity is valid")
     .identity()
@@ -7376,6 +8082,66 @@ impl TestDatabase {
                 Ok(()) => Err(format!("pre-0026 migration failed: {error}")),
                 Err(cleanup) => Err(format!(
                     "pre-0026 migration failed: {error}; cleanup failed: {cleanup}"
+                )),
+            };
+        }
+        Ok(Some(database))
+    }
+
+    async fn new_before_atomic_submit_acquisition() -> TestResult<Option<Self>> {
+        let Some(database) = Self::new_before_operation_binding().await? else {
+            return Ok(None);
+        };
+        if let Err(error) = sqlx::raw_sql(
+            r#"
+            ALTER TABLE provider_execution_profiles
+              DISABLE TRIGGER provider_execution_profiles_identity;
+            DELETE FROM provider_execution_profiles;
+            ALTER TABLE provider_execution_profiles
+              ENABLE TRIGGER provider_execution_profiles_identity;
+            "#,
+        )
+        .execute(&database.pool)
+        .await
+        {
+            let cleanup = database.cleanup().await;
+            return match cleanup {
+                Ok(()) => Err(format!("pre-0026 profile drain failed: {error}")),
+                Err(cleanup) => Err(format!(
+                    "pre-0026 profile drain failed: {error}; cleanup failed: {cleanup}"
+                )),
+            };
+        }
+        if let Err(error) = sqlx::raw_sql(include_str!(
+            "../migrations/0026_immutable_provider_operation_binding.sql"
+        ))
+        .execute(&database.pool)
+        .await
+        {
+            let cleanup = database.cleanup().await;
+            return match cleanup {
+                Ok(()) => Err(format!("pre-0027 migration failed: {error}")),
+                Err(cleanup) => Err(format!(
+                    "pre-0027 migration failed: {error}; cleanup failed: {cleanup}"
+                )),
+            };
+        }
+        let now = database_now(&database.pool).await?;
+        if let Err(error) = sqlx::query("INSERT INTO provider_execution_profiles (execution_profile_id, profile_key, provider_id, command_schema, operation_id, operation_descriptor_revision, operation_descriptor_sha256_v1, completion_mode, idempotency_mode, adapter_revision, credential_pool_id, provider_account_id, credential_ref, credential_revision, resource_policy_id, resource_policy_revision, state, created_at_ms, updated_at_ms) VALUES ($1, 'provider-task-profile', 'provider-test', 'provider-command-v1', 'images.generations', 'provider-test/images.generations/v1', $2, 'remote_task', 'submission_bound', 'provider-test-adapter-v1', $3, $4, 'test-vault.provider-task.1', 1, $5, 1, 'enabled', $6, $6)")
+            .bind(PROFILE_ID)
+            .bind("2".repeat(64))
+            .bind(POOL_ID)
+            .bind(ACCOUNT_ID)
+            .bind(POLICY_ID)
+            .bind(now)
+            .execute(&database.pool)
+            .await
+        {
+            let cleanup = database.cleanup().await;
+            return match cleanup {
+                Ok(()) => Err(format!("schema 26 profile provisioning failed: {error}")),
+                Err(cleanup) => Err(format!(
+                    "schema 26 profile provisioning failed: {error}; cleanup failed: {cleanup}"
                 )),
             };
         }

@@ -2,7 +2,7 @@ use std::{error::Error, fmt};
 
 use image_provider_sdk::{
     ArtifactSink, Completed, InvocationContext, PollObservation, ProviderFailure,
-    RemoteOperationRef, RemoteTaskProvider, SingleOutputCommand, Submission, SubmitIdempotency,
+    RemoteOperationRef, RemoteTaskProvider, SingleOutputCommand, SubmitCall, SubmitIdempotency,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -42,14 +42,10 @@ where
     P: RemoteTaskProvider,
     S: ArtifactSink,
 {
-    let pending = match provider
-        .submit(context, idempotency, command, sink)
+    let pending = provider
+        .submit(SubmitCall::new(context, command, idempotency))
         .await
-        .map_err(ConformanceError::Provider)?
-    {
-        Submission::Completed(completed) => return Ok(completed),
-        Submission::Pending(pending) => pending,
-    };
+        .map_err(ConformanceError::Provider)?;
 
     if pending.operation().submission_id() != context.submission_id() {
         return Err(ConformanceError::SubmissionMismatch);

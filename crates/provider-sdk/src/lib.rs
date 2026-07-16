@@ -12,8 +12,9 @@ pub use artifact::{
     DurableArtifactRefError,
 };
 pub use command::{
-    CommandIdentityError, InvocationContext, OutputSlot, OutputSlotError, ProviderCommandIdentity,
-    SingleOutputCommand, SubmitIdempotency,
+    CanonicalCommandPayload, CommandIdentityError, InvocationContext, InvocationDeadline,
+    OutputSlot, OutputSlotError, ProviderCommandIdentity, SingleOutputCommand, SubmitCall,
+    SubmitIdempotency,
 };
 pub use failure::{
     EffectCertainty, ProviderFailure, ProviderFailureClass, ProviderFailureValidationError,
@@ -24,7 +25,7 @@ pub use inline::InlineProvider;
 pub use remote::{
     CallbackEnvelope, CallbackKind, CallbackReceipt, CancelReceipt, CancelState, CanceledEvidence,
     Completed, OpaqueProviderId, OpaqueProviderIdError, PendingOperation, PollObservation,
-    ProviderRequestId, RemoteOperationRef, RemoteTaskProvider, Submission,
+    ProviderRequestId, RemoteOperationRef, RemoteTaskProvider,
 };
 
 #[cfg(test)]

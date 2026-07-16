@@ -4,13 +4,62 @@ use std::{
 };
 
 use image_provider_sdk::{
-    ArtifactMetadata, ArtifactSink, CallbackEnvelope, CallbackReceipt, CancelReceipt, Completed,
-    EffectCertainty, InlineProvider, InvocationContext, OutputSlot, PendingOperation,
-    PollObservation, ProviderFailure, ProviderFailureClass, ProviderRequestId, RemoteTaskProvider,
-    RetryDirective, SingleOutputCommand, Submission, SubmitIdempotency,
+    ArtifactMetadata, ArtifactSink, CallbackEnvelope, CallbackReceipt, CancelReceipt,
+    CanonicalCommandPayload, Completed, EffectCertainty, InlineProvider, InvocationContext,
+    OutputSlot, PendingOperation, PollObservation, ProviderFailure, ProviderFailureClass,
+    ProviderRequestId, RemoteTaskProvider, RetryDirective, SingleOutputCommand, SubmitCall,
 };
+use sha2::{Digest, Sha256};
 
-pub type TestPayload = Vec<u8>;
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TestPayload {
+    bytes: Vec<u8>,
+    source_command_sha256: String,
+}
+
+impl TestPayload {
+    pub fn new(bytes: impl Into<Vec<u8>>) -> Self {
+        let bytes = bytes.into();
+        let source_command_sha256 = hex_sha256(&bytes);
+        Self {
+            bytes,
+            source_command_sha256,
+        }
+    }
+
+    pub fn bound_to(bytes: impl Into<Vec<u8>>, source_command_sha256: impl Into<String>) -> Self {
+        Self {
+            bytes: bytes.into(),
+            source_command_sha256: source_command_sha256.into(),
+        }
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+impl CanonicalCommandPayload for TestPayload {
+    const SCHEMA_ID: &'static str = "provider-command-v1";
+    const ADAPTER_REVISION: &'static str = "provider-test-adapter-v1";
+
+    fn source_command_sha256(&self) -> &str {
+        &self.source_command_sha256
+    }
+
+    fn into_canonical_bytes(self, _output: OutputSlot) -> Vec<u8> {
+        self.bytes
+    }
+}
+
+fn hex_sha256(bytes: &[u8]) -> String {
+    let mut digest = Sha256::new();
+    digest.update(bytes);
+    let mut encoded = [0_u8; 64];
+    hex::encode_to_slice(digest.finalize(), &mut encoded)
+        .expect("SHA-256 always encodes into 64 hexadecimal bytes");
+    String::from_utf8(encoded.to_vec()).expect("hexadecimal output is ASCII")
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OutputPlan {
@@ -27,9 +76,9 @@ pub enum InlineStep {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SubmitStep {
-    Complete(OutputPlan),
     Pending(PendingOperation),
     Fail(ProviderFailure),
+    Never,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -63,9 +112,12 @@ pub struct ObservedSubmitCall {
     pub descriptor_revision: String,
     pub model: String,
     pub attempt: u32,
+    pub provider_timeout_ms: u64,
+    pub provider_deadline_unix_ms: u64,
     pub command_schema: &'static str,
     pub adapter_revision: &'static str,
     pub command_sha256: [u8; 32],
+    pub canonical_payload: Vec<u8>,
     pub output: OutputSlot,
     pub idempotency: ObservedSubmitIdempotency,
 }
@@ -183,13 +235,17 @@ impl InlineProvider for ScriptedFakeProvider {
 impl RemoteTaskProvider for ScriptedFakeProvider {
     type Payload = TestPayload;
 
-    async fn submit<S: ArtifactSink>(
+    fn provider_id(&self) -> &'static str {
+        "provider-test"
+    }
+
+    async fn submit(
         &self,
-        context: InvocationContext<'_>,
-        idempotency: SubmitIdempotency<'_>,
-        command: &SingleOutputCommand<Self::Payload>,
-        sink: &mut S,
-    ) -> Result<Submission, ProviderFailure> {
+        call: SubmitCall<'_, Self::Payload>,
+    ) -> Result<PendingOperation, ProviderFailure> {
+        let context = call.context();
+        let idempotency = call.idempotency();
+        let command = call.command();
         let step = {
             let mut state = self.state.lock().unwrap();
             state.calls.submit += 1;
@@ -205,9 +261,12 @@ impl RemoteTaskProvider for ScriptedFakeProvider {
                 descriptor_revision: context.descriptor_revision().to_owned(),
                 model: context.model().to_owned(),
                 attempt: context.attempt(),
+                provider_timeout_ms: context.provider_timeout_ms(),
+                provider_deadline_unix_ms: context.provider_deadline_unix_ms(),
                 command_schema: command.schema_id(),
                 adapter_revision: command.adapter_revision(),
                 command_sha256: *command.canonical_sha256(),
+                canonical_payload: command.canonical_payload().to_vec(),
                 output: command.output(),
                 idempotency,
             });
@@ -216,9 +275,9 @@ impl RemoteTaskProvider for ScriptedFakeProvider {
         .ok_or_else(|| missing_script("submit"))?;
 
         match step {
-            SubmitStep::Complete(plan) => emit(plan, sink).await.map(Submission::Completed),
-            SubmitStep::Pending(pending) => Ok(Submission::Pending(pending)),
+            SubmitStep::Pending(pending) => Ok(pending),
             SubmitStep::Fail(error) => Err(error),
+            SubmitStep::Never => std::future::pending().await,
         }
     }
 

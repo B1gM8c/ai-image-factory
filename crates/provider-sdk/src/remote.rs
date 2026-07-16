@@ -1,8 +1,7 @@
 use std::{error::Error, fmt};
 
 use crate::{
-    ArtifactSink, DurableArtifactManifest, InvocationContext, ProviderFailure, SingleOutputCommand,
-    SubmitIdempotency,
+    ArtifactSink, DurableArtifactManifest, InvocationContext, ProviderFailure, SubmitCall,
 };
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -158,12 +157,6 @@ impl PendingOperation {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum Submission {
-    Completed(Completed),
-    Pending(PendingOperation),
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CanceledEvidence {
     provider_request_id: Option<ProviderRequestId>,
 }
@@ -264,16 +257,15 @@ impl CallbackReceipt {
     }
 }
 
-pub trait RemoteTaskProvider: Sync {
-    type Payload: Sync;
+pub trait RemoteTaskProvider: Send + Sync + 'static {
+    type Payload: crate::CanonicalCommandPayload + Send + Sync + 'static;
 
-    fn submit<S: ArtifactSink>(
+    fn provider_id(&self) -> &'static str;
+
+    fn submit(
         &self,
-        context: InvocationContext<'_>,
-        idempotency: SubmitIdempotency<'_>,
-        command: &SingleOutputCommand<Self::Payload>,
-        sink: &mut S,
-    ) -> impl std::future::Future<Output = Result<Submission, ProviderFailure>> + Send;
+        call: SubmitCall<'_, Self::Payload>,
+    ) -> impl std::future::Future<Output = Result<PendingOperation, ProviderFailure>> + Send;
 
     fn poll<S: ArtifactSink>(
         &self,

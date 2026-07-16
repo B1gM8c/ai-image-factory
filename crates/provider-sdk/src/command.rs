@@ -1,4 +1,6 @@
-use std::{error::Error, fmt};
+use std::{error::Error, fmt, marker::PhantomData};
+
+use sha2::{Digest, Sha256};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct OutputSlot {
@@ -50,8 +52,18 @@ pub struct SingleOutputCommand<P> {
     schema_id: &'static str,
     adapter_revision: &'static str,
     canonical_sha256: [u8; 32],
+    source_command_sha256: String,
+    canonical_payload: Box<[u8]>,
     output: OutputSlot,
-    payload: P,
+    payload_type: PhantomData<fn() -> P>,
+}
+
+pub trait CanonicalCommandPayload {
+    const SCHEMA_ID: &'static str;
+    const ADAPTER_REVISION: &'static str;
+
+    fn source_command_sha256(&self) -> &str;
+    fn into_canonical_bytes(self, output: OutputSlot) -> Vec<u8>;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -65,23 +77,26 @@ impl ProviderCommandIdentity {
     }
 }
 
-impl<P> SingleOutputCommand<P> {
-    pub fn new(
-        schema_id: &'static str,
-        adapter_revision: &'static str,
-        canonical_sha256: [u8; 32],
-        output: OutputSlot,
-        payload: P,
-    ) -> Result<Self, CommandIdentityError> {
-        if !valid_text(schema_id) || !valid_text(adapter_revision) {
+impl<P: CanonicalCommandPayload> SingleOutputCommand<P> {
+    pub fn new(output: OutputSlot, payload: P) -> Result<Self, CommandIdentityError> {
+        if !valid_text(P::SCHEMA_ID)
+            || !valid_text(P::ADAPTER_REVISION)
+            || !valid_sha256(payload.source_command_sha256())
+        {
             return Err(CommandIdentityError::InvalidCommandIdentity);
         }
+        let source_command_sha256 = payload.source_command_sha256().to_owned();
+        let canonical_payload = payload.into_canonical_bytes(output).into_boxed_slice();
+        let canonical_sha256 =
+            command_sha256::<P>(&source_command_sha256, output, canonical_payload.as_ref());
         Ok(Self {
-            schema_id,
-            adapter_revision,
+            schema_id: P::SCHEMA_ID,
+            adapter_revision: P::ADAPTER_REVISION,
             canonical_sha256,
+            source_command_sha256,
+            canonical_payload,
             output,
-            payload,
+            payload_type: PhantomData,
         })
     }
 
@@ -97,6 +112,10 @@ impl<P> SingleOutputCommand<P> {
         &self.canonical_sha256
     }
 
+    pub fn source_command_sha256(&self) -> &str {
+        &self.source_command_sha256
+    }
+
     pub fn identity(&self) -> ProviderCommandIdentity {
         ProviderCommandIdentity {
             canonical_sha256: self.canonical_sha256,
@@ -107,12 +126,37 @@ impl<P> SingleOutputCommand<P> {
         self.output
     }
 
-    pub fn payload(&self) -> &P {
-        &self.payload
+    pub fn canonical_payload(&self) -> &[u8] {
+        &self.canonical_payload
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InvocationDeadline {
+    provider_timeout_ms: u64,
+    provider_deadline_unix_ms: u64,
+}
+
+impl InvocationDeadline {
+    pub fn new(
+        provider_timeout_ms: u64,
+        provider_deadline_unix_ms: u64,
+    ) -> Result<Self, CommandIdentityError> {
+        if provider_timeout_ms == 0 || provider_deadline_unix_ms == 0 {
+            return Err(CommandIdentityError::InvalidInvocationContext);
+        }
+        Ok(Self {
+            provider_timeout_ms,
+            provider_deadline_unix_ms,
+        })
     }
 
-    pub fn into_payload(self) -> P {
-        self.payload
+    pub fn provider_timeout_ms(self) -> u64 {
+        self.provider_timeout_ms
+    }
+
+    pub fn provider_deadline_unix_ms(self) -> u64 {
+        self.provider_deadline_unix_ms
     }
 }
 
@@ -124,6 +168,7 @@ pub struct InvocationContext<'a> {
     descriptor_revision: &'a str,
     model: &'a str,
     attempt: u32,
+    deadline: InvocationDeadline,
 }
 
 impl<'a> InvocationContext<'a> {
@@ -134,6 +179,7 @@ impl<'a> InvocationContext<'a> {
         descriptor_revision: &'a str,
         model: &'a str,
         attempt: u32,
+        deadline: InvocationDeadline,
     ) -> Result<Self, CommandIdentityError> {
         if !valid_identity(submission_id)
             || !valid_identity(provider_id)
@@ -151,6 +197,7 @@ impl<'a> InvocationContext<'a> {
             descriptor_revision,
             model,
             attempt,
+            deadline,
         })
     }
 
@@ -177,6 +224,14 @@ impl<'a> InvocationContext<'a> {
     pub fn attempt(self) -> u32 {
         self.attempt
     }
+
+    pub fn provider_timeout_ms(self) -> u64 {
+        self.deadline.provider_timeout_ms()
+    }
+
+    pub fn provider_deadline_unix_ms(self) -> u64 {
+        self.deadline.provider_deadline_unix_ms()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -202,6 +257,39 @@ impl<'a> SubmitIdempotency<'a> {
 
     pub fn token(self) -> Option<&'a str> {
         self.provider_token
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SubmitCall<'a, P> {
+    context: InvocationContext<'a>,
+    command: &'a SingleOutputCommand<P>,
+    idempotency: SubmitIdempotency<'a>,
+}
+
+impl<'a, P> SubmitCall<'a, P> {
+    pub fn new(
+        context: InvocationContext<'a>,
+        command: &'a SingleOutputCommand<P>,
+        idempotency: SubmitIdempotency<'a>,
+    ) -> Self {
+        Self {
+            context,
+            command,
+            idempotency,
+        }
+    }
+
+    pub fn context(&self) -> InvocationContext<'a> {
+        self.context
+    }
+
+    pub fn command(&self) -> &'a SingleOutputCommand<P> {
+        self.command
+    }
+
+    pub fn idempotency(&self) -> SubmitIdempotency<'a> {
+        self.idempotency
     }
 }
 
@@ -242,9 +330,67 @@ fn valid_text(value: &str) -> bool {
     !value.is_empty() && value.len() <= 255 && !value.bytes().any(|byte| byte.is_ascii_control())
 }
 
+fn valid_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
+fn command_sha256<P: CanonicalCommandPayload>(
+    source_command_sha256: &str,
+    output: OutputSlot,
+    canonical_payload: &[u8],
+) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"ai-image-factory/provider-command/v1\0");
+    for value in [
+        P::SCHEMA_ID.as_bytes(),
+        P::ADAPTER_REVISION.as_bytes(),
+        source_command_sha256.as_bytes(),
+        output.index().to_be_bytes().as_slice(),
+        output.total().to_be_bytes().as_slice(),
+        canonical_payload,
+    ] {
+        digest.update((value.len() as u64).to_be_bytes());
+        digest.update(value);
+    }
+    digest.finalize().into()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct TestPayload([u8; 32]);
+
+    impl CanonicalCommandPayload for TestPayload {
+        const SCHEMA_ID: &'static str = "provider.command.v1";
+        const ADAPTER_REVISION: &'static str = "adapter-v1";
+
+        fn source_command_sha256(&self) -> &str {
+            "1111111111111111111111111111111111111111111111111111111111111111"
+        }
+
+        fn into_canonical_bytes(self, _output: OutputSlot) -> Vec<u8> {
+            self.0.to_vec()
+        }
+    }
+
+    struct InvalidPayload;
+
+    impl CanonicalCommandPayload for InvalidPayload {
+        const SCHEMA_ID: &'static str = "";
+        const ADAPTER_REVISION: &'static str = "adapter-v1";
+
+        fn source_command_sha256(&self) -> &str {
+            "1111111111111111111111111111111111111111111111111111111111111111"
+        }
+
+        fn into_canonical_bytes(self, _output: OutputSlot) -> Vec<u8> {
+            Vec::new()
+        }
+    }
 
     #[test]
     fn output_slot_is_always_a_single_valid_projection() {
@@ -267,6 +413,7 @@ mod tests {
                 "provider/images.generations/v1",
                 "model",
                 1,
+                InvocationDeadline::new(60_000, 1_800_000_000_000).unwrap(),
             )
             .is_ok()
         );
@@ -278,6 +425,7 @@ mod tests {
                 "provider/images.generations/v1",
                 "model",
                 1,
+                InvocationDeadline::new(60_000, 1_800_000_000_000).unwrap(),
             )
             .is_err()
         );
@@ -289,6 +437,7 @@ mod tests {
                 "provider/images.generations/v1",
                 "model",
                 0,
+                InvocationDeadline::new(60_000, 1_800_000_000_000).unwrap(),
             )
             .is_err()
         );
@@ -300,24 +449,12 @@ mod tests {
             Some("provider-token-1")
         );
         assert!(SubmitIdempotency::provider_token("").is_err());
-        let command = SingleOutputCommand::new(
-            "provider.command.v1",
-            "adapter-v1",
-            [7; 32],
-            OutputSlot::new(0, 1).unwrap(),
-            (),
-        )
-        .unwrap();
-        assert_eq!(command.identity().canonical_sha256(), &[7; 32]);
-        assert!(
-            SingleOutputCommand::new(
-                "",
-                "adapter-v1",
-                [0; 32],
-                OutputSlot::new(0, 1).unwrap(),
-                ()
-            )
-            .is_err()
-        );
+        let command =
+            SingleOutputCommand::new(OutputSlot::new(0, 1).unwrap(), TestPayload([7; 32])).unwrap();
+        let replay =
+            SingleOutputCommand::new(OutputSlot::new(0, 1).unwrap(), TestPayload([7; 32])).unwrap();
+        assert_eq!(command.identity(), replay.identity());
+        assert_eq!(command.canonical_payload(), &[7; 32]);
+        assert!(SingleOutputCommand::new(OutputSlot::new(0, 1).unwrap(), InvalidPayload).is_err());
     }
 }

@@ -24,11 +24,13 @@ const EDIT_IDEMPOTENCY_KEY: &str = "process-smoke-edit-key";
 const V2_IDEMPOTENCY_KEY: &str = "process-smoke-generation-v2-key";
 const V2_OUTPUT_COUNT: usize = 2;
 const V2_SUCCESS_PRICE_MICROS: i64 = 7_000;
+static PROCESS_SMOKE_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 // Like the other PostgreSQL integration tests, local runs skip without TEST_DATABASE_URL while CI
 // fails closed so the process composition cannot silently go untested there.
 #[tokio::test]
 async fn production_process_composition_succeeds_when_test_database_is_configured() -> TestResult {
+    let _serial = PROCESS_SMOKE_SERIAL.lock().await;
     let Some(database) = TestDatabase::new().await? else {
         return Ok(());
     };
@@ -40,6 +42,7 @@ async fn production_process_composition_succeeds_when_test_database_is_configure
 
 #[tokio::test]
 async fn production_process_composition_executes_and_replays_generation_v2() -> TestResult {
+    let _serial = PROCESS_SMOKE_SERIAL.lock().await;
     let Some(database) = TestDatabase::new().await? else {
         return Ok(());
     };
@@ -51,6 +54,7 @@ async fn production_process_composition_executes_and_replays_generation_v2() -> 
 
 #[tokio::test]
 async fn workerd_sigterm_drains_in_flight_generation_before_successful_exit() -> TestResult {
+    let _serial = PROCESS_SMOKE_SERIAL.lock().await;
     let Some(database) = TestDatabase::new().await? else {
         return Ok(());
     };
@@ -62,6 +66,7 @@ async fn workerd_sigterm_drains_in_flight_generation_before_successful_exit() ->
 
 #[tokio::test]
 async fn external_generation_queues_without_holding_gateway_scheduler_permits() -> TestResult {
+    let _serial = PROCESS_SMOKE_SERIAL.lock().await;
     let Some(database) = TestDatabase::new().await? else {
         return Ok(());
     };
@@ -73,6 +78,7 @@ async fn external_generation_queues_without_holding_gateway_scheduler_permits() 
 
 #[tokio::test]
 async fn production_process_composition_executes_and_replays_durable_edit() -> TestResult {
+    let _serial = PROCESS_SMOKE_SERIAL.lock().await;
     let Some(database) = TestDatabase::new().await? else {
         return Ok(());
     };

@@ -6,13 +6,14 @@ use std::{
 
 use image_provider_sdk::{
     ArtifactMetadata, ArtifactSink, DurableArtifactRef, EffectCertainty, InlineProvider,
-    InvocationContext, OutputSlot, PendingOperation, ProviderFailure, ProviderFailureClass,
-    ProviderRequestId, RemoteOperationRef, RetryDirective, SingleOutputCommand, SubmitIdempotency,
+    InvocationContext, InvocationDeadline, OutputSlot, PendingOperation, ProviderFailure,
+    ProviderFailureClass, ProviderRequestId, RemoteOperationRef, RetryDirective,
+    SingleOutputCommand, SubmitIdempotency,
 };
 
 use crate::{
     InlineStep, ObservedSubmitCall, ObservedSubmitIdempotency, OutputPlan, PollStep,
-    RecordingArtifactSink, ScriptedFakeProvider, SubmitStep, drive_existing_operation,
+    RecordingArtifactSink, ScriptedFakeProvider, SubmitStep, TestPayload, drive_existing_operation,
     drive_remote_to_completion,
 };
 
@@ -43,17 +44,15 @@ fn context() -> InvocationContext<'static> {
         "fake/images.generations/v1",
         "model-1",
         1,
+        InvocationDeadline::new(60_000, 1_800_000_000_000).unwrap(),
     )
     .unwrap()
 }
 
-fn command(index: u32, total: u32) -> SingleOutputCommand<Vec<u8>> {
+fn command(index: u32, total: u32) -> SingleOutputCommand<TestPayload> {
     SingleOutputCommand::new(
-        "test/v1",
-        "adapter-v1",
-        [3; 32],
         OutputSlot::new(index, total).unwrap(),
-        vec![1, 2, 3],
+        TestPayload::new(vec![1, 2, 3]),
     )
     .unwrap()
 }
@@ -132,9 +131,12 @@ fn remote_pending_to_complete_submits_once() {
             descriptor_revision: "fake/images.generations/v1".to_string(),
             model: "model-1".to_string(),
             attempt: 1,
-            command_schema: "test/v1",
-            adapter_revision: "adapter-v1",
-            command_sha256: [3; 32],
+            provider_timeout_ms: 60_000,
+            provider_deadline_unix_ms: 1_800_000_000_000,
+            command_schema: "provider-command-v1",
+            adapter_revision: "provider-test-adapter-v1",
+            command_sha256: *command(0, 1).canonical_sha256(),
+            canonical_payload: vec![1, 2, 3],
             output: OutputSlot::new(0, 1).unwrap(),
             idempotency: ObservedSubmitIdempotency::SubmissionBound,
         }]
@@ -145,7 +147,12 @@ fn remote_pending_to_complete_submits_once() {
 #[test]
 fn remote_submit_observes_validated_provider_token() {
     let provider = ScriptedFakeProvider::default();
-    provider.push_submit(SubmitStep::Complete(output()));
+    provider.push_submit(SubmitStep::Pending(PendingOperation::new(
+        RemoteOperationRef::new("fake", "submission-1", "operation-1").unwrap(),
+        None,
+        None,
+    )));
+    provider.push_poll(PollStep::Complete(output()));
     let mut sink = sink();
 
     block_on(drive_remote_to_completion(

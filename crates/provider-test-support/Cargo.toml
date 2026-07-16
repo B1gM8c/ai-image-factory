@@ -7,3 +7,5 @@ publish = false
 
 [dependencies]
 image-provider-sdk = { path = "../provider-sdk" }
+hex = "0.4.3"
+sha2 = "0.11.0"
