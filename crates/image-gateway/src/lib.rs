@@ -63,9 +63,10 @@ pub use provider_tasks::{
     GatedCliBinding, GatedCliCommand, GatedCliObservation, GatedCliPreparedSubmission,
     GatedCliProcessError, GatedCliProcessOutcome, GatedCliProcessTerminal, GatedCliReady,
     GatedCliSubmission, GatedCliSubmitCodec, GatedCliSubmitDriver, PostgresProviderTaskStore,
-    ProviderArtifactAuthority, ProviderArtifactPublication, ProviderArtifactSinkContractError,
-    ProviderArtifactStageContext, ProviderArtifactStager, ProviderArtifactStagerFactory,
-    ProviderCapacityEvidence, ProviderCapacityEvidenceOutcome, ProviderCapacityReconciliation,
+    ProviderAccountHomeCapability, ProviderAccountHomeCapabilityError, ProviderArtifactAuthority,
+    ProviderArtifactPublication, ProviderArtifactSinkContractError, ProviderArtifactStageContext,
+    ProviderArtifactStager, ProviderArtifactStagerFactory, ProviderCapacityEvidence,
+    ProviderCapacityEvidenceOutcome, ProviderCapacityReconciliation,
     ProviderCapacityReconciliationLease, ProviderCapacityReconciliationState,
     ProviderCapacityReconciliationStore, ProviderCapacityTerminalState, ProviderExecutionContext,
     ProviderPollDaemon, ProviderPollDaemonConfig, ProviderPollDaemonError,
@@ -87,7 +88,7 @@ pub use provider_tasks::{
 };
 pub use providers::dreamina_cli::{
     DreaminaCliCodecConfigError, DreaminaCliPollDriverConfigError, DreaminaCliPollDriverV1,
-    DreaminaCliRuntimeBindingV1, DreaminaCliSubmitCodecV1,
+    DreaminaCliPollProcessConfig, DreaminaCliRuntimeBindingV1, DreaminaCliSubmitCodecV1,
 };
 pub use reconciliation::{
     InputCleanupOutcome, PostgresReconciliationStore, ReconciliationOutcome, ReconciliationStore,

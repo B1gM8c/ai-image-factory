@@ -1,16 +1,25 @@
+use std::{
+    path::{Path, PathBuf},
+    time::Duration,
+};
+
 use super::DreaminaCliRuntimeBindingV1;
 use crate::{
     artifacts::MAX_ARTIFACT_BYTES,
-    provider_tasks::{ProviderPollDriver, ProviderPollDriverCall},
+    provider_tasks::{
+        ProviderAccountHomeCapability, ProviderAccountHomeCapabilityError, ProviderPollDriver,
+        ProviderPollDriverCall, ProviderPollRuntimeProfile,
+    },
 };
 use image_cli_runtime::{
     AsyncOutputSealError, AsyncOutputSink, AttemptWorkspaceError, CliRuntime,
     ExclusiveAttemptWorkspace, FreshOutputDirectory, NoopSpawnObserver, OutputError, ProcessError,
-    RuntimeError,
+    RuntimeError, WorkingDirectory,
 };
 use image_provider_dreamina_cli::{
-    ADAPTER_REVISION, DREAMINA_SUBMIT_COMMAND_SCHEMA, DreaminaCliQueryPolicyV1,
-    DreaminaQueryStatusV1, PROVIDER_ID, QueryResultRequestV1,
+    ADAPTER_REVISION, DREAMINA_IMAGE_GENERATION_OPERATION_V1, DREAMINA_SUBMIT_COMMAND_SCHEMA,
+    DreaminaCliQueryPolicyError, DreaminaCliQueryPolicyV1, DreaminaQueryStatusV1, PROVIDER_ID,
+    QueryResultRequestV1,
 };
 use image_provider_sdk::{
     ArtifactMetadata, ArtifactSink, ArtifactSinkError, ArtifactSinkErrorKind, Completed,
@@ -29,7 +38,73 @@ pub struct DreaminaCliPollDriverV1 {
     workspace: ExclusiveAttemptWorkspace,
 }
 
+pub struct DreaminaCliPollProcessConfig {
+    executable_path: PathBuf,
+    executable_sha256: [u8; 32],
+    workspace_root: WorkingDirectory,
+    wall_timeout: Duration,
+    termination_grace: Duration,
+    max_artifact_bytes: u64,
+}
+
+impl DreaminaCliPollProcessConfig {
+    pub fn new(
+        executable_path: impl AsRef<Path>,
+        executable_sha256: [u8; 32],
+        workspace_root: WorkingDirectory,
+        wall_timeout: Duration,
+        termination_grace: Duration,
+        max_artifact_bytes: u64,
+    ) -> Self {
+        Self {
+            executable_path: executable_path.as_ref().to_path_buf(),
+            executable_sha256,
+            workspace_root,
+            wall_timeout,
+            termination_grace,
+            max_artifact_bytes,
+        }
+    }
+}
+
 impl DreaminaCliPollDriverV1 {
+    pub fn from_runtime_profile(
+        profile: &ProviderPollRuntimeProfile,
+        account_home: &ProviderAccountHomeCapability,
+        process: DreaminaCliPollProcessConfig,
+    ) -> Result<Self, DreaminaCliPollDriverConfigError> {
+        let operation = DREAMINA_IMAGE_GENERATION_OPERATION_V1;
+        if profile.provider_id() != PROVIDER_ID
+            || profile.command_schema() != operation.command_schema
+            || profile.operation_id() != operation.id
+            || profile.operation_descriptor_revision() != operation.descriptor_revision
+            || profile.operation_descriptor_sha256_v1() != operation.canonical_sha256_v1_hex()
+            || profile.idempotency_mode() != operation.idempotency.as_str()
+            || profile.adapter_revision() != ADAPTER_REVISION
+        {
+            return Err(DreaminaCliPollDriverConfigError::ProfileMismatch);
+        }
+        let account_home = account_home
+            .bind(profile)
+            .map_err(DreaminaCliPollDriverConfigError::AccountHome)?;
+        let binding = DreaminaCliRuntimeBindingV1::new(
+            profile.execution_profile_id(),
+            profile.provider_account_id(),
+            profile.credential_auth_sha256(),
+        )
+        .map_err(|_| DreaminaCliPollDriverConfigError::ProfileMismatch)?;
+        let policy = DreaminaCliQueryPolicyV1::new(
+            process.executable_path,
+            process.executable_sha256,
+            process.workspace_root,
+            account_home,
+            process.wall_timeout,
+            process.termination_grace,
+        )
+        .map_err(DreaminaCliPollDriverConfigError::Policy)?;
+        Self::new(policy, binding, process.max_artifact_bytes)
+    }
+
     pub fn new(
         policy: DreaminaCliQueryPolicyV1,
         binding: DreaminaCliRuntimeBindingV1,
@@ -317,6 +392,12 @@ fn terminal_failure(code: &'static str) -> ProviderFailure {
 
 #[derive(Debug, thiserror::Error)]
 pub enum DreaminaCliPollDriverConfigError {
+    #[error("Dreamina CLI poll runtime profile is incompatible")]
+    ProfileMismatch,
+    #[error("Dreamina CLI poll account-home capability is incompatible")]
+    AccountHome(#[source] ProviderAccountHomeCapabilityError),
+    #[error("Dreamina CLI query policy configuration is invalid")]
+    Policy(#[source] DreaminaCliQueryPolicyError),
     #[error("Dreamina CLI poll artifact limit is invalid")]
     InvalidArtifactLimit,
     #[error("Dreamina CLI poll workspace configuration is invalid")]

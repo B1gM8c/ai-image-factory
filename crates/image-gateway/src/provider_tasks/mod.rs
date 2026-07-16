@@ -23,6 +23,7 @@ pub use orchestrator::{
     ProviderSubmitWork,
 };
 pub use poll::{
+    ProviderAccountHomeCapability, ProviderAccountHomeCapabilityError,
     ProviderArtifactSinkContractError, ProviderArtifactStageContext, ProviderArtifactStager,
     ProviderArtifactStagerFactory, ProviderPollDaemon, ProviderPollDaemonConfig,
     ProviderPollDaemonError, ProviderPollDaemonReport, ProviderPollDriver, ProviderPollDriverCall,

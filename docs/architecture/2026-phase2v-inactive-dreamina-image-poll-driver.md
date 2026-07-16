@@ -7,6 +7,10 @@ artifact, and generic poll-orchestrator tests. Dreamina remains inactive. This
 phase performs no external provider call, credential login, quota consumption,
 route activation, billing change, or production artifact write.
 
+Follow-up: Phase 2X composes this driver into a runnable but inactive process
+with exact runtime-profile and account-home binding:
+[`2026-phase2x-inactive-provider-poll-service.md`](2026-phase2x-inactive-provider-poll-service.md).
+
 ## Scope
 
 Phase 2V adds the first provider-specific implementation of the Phase 2R poll
@@ -69,7 +73,7 @@ Before creating a process, `DreaminaCliPollDriverV1` requires:
 - the exact execution profile ID frozen into the driver binding;
 - the exact credential authentication SHA-256 frozen into the binding;
 - `command_schema = dreamina-cli.submit.v1`;
-- `adapter_revision = dreamina-cli/remote-task/v1`;
+- `adapter_revision = dreamina-cli.remote-task.v1`;
 - `operation_id = images.generations`;
 - `completion_mode = remote_task`; and
 - one of the explicitly supported `dreamina-image-*` platform model versions.
@@ -79,7 +83,7 @@ a lease attached to another account even when both accounts use the same
 provider and executable.
 
 The adapter revision changed from the Phase 2P submit-only value
-`dreamina-cli/submit/v1` to `dreamina-cli/remote-task/v1`. The canonical submit
+`dreamina-cli/submit/v1` to `dreamina-cli.remote-task.v1`. The canonical submit
 payload schema did not change. Dreamina is inactive, so no active durable task
 or compatibility contract is migrated by this revision change.
 
@@ -274,17 +278,9 @@ Phase 2W closes the provider-neutral exclusive attempt workspace and
 crash-recovery prerequisite:
 [`2026-phase2w-exclusive-cli-attempt-workspace.md`](2026-phase2w-exclusive-cli-attempt-workspace.md).
 
-The next phase should compose an inactive, runnable provider poll service
-without activating Dreamina:
-
-1. load one Phase 2U profile and derive the exact provider/account claim scope;
-2. resolve credentials through a narrow broker that returns an isolated
-   account home without exposing secret bytes to provider code;
-3. verify the executable digest and construct one provider-specific driver;
-4. construct the Phase 2T daemon with durable lane and artifact limits;
-5. add startup/shutdown, metrics, and redacted diagnostics;
-6. prove the service with local fake CLI plus real PostgreSQL leases; and
-7. keep provider activation, external calls, and video support disabled.
+Phase 2X closes the inactive service composition, exact account-home
+capability binding, executable digest, bounded daemon lifecycle, redacted
+diagnostics, and real PostgreSQL fake-CLI proof.
 
 Rate limits, circuit state, quota, spend, and cross-account scheduling should
 remain separate policies. They must not be inferred from the execution

@@ -17,7 +17,9 @@ use crate::provider_tasks::{
 
 mod poll;
 
-pub use poll::{DreaminaCliPollDriverConfigError, DreaminaCliPollDriverV1};
+pub use poll::{
+    DreaminaCliPollDriverConfigError, DreaminaCliPollDriverV1, DreaminaCliPollProcessConfig,
+};
 
 const DEFAULT_POLL_AFTER_MS: u64 = 1_000;
 

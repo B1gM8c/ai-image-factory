@@ -7,6 +7,10 @@ capability. Dreamina remains inactive. This phase performs no external
 provider call, credential login, quota consumption, route activation, billing
 change, or production artifact write.
 
+Follow-up: Phase 2X composes this capability into a runnable but inactive
+single-profile poll process:
+[`2026-phase2x-inactive-provider-poll-service.md`](2026-phase2x-inactive-provider-poll-service.md).
+
 ## Decision
 
 Each CLI poll process must receive an attempt directory created by one
@@ -267,16 +271,10 @@ login experiment.
 
 ## Next Gate
 
-The next independently verifiable phase can compose a runnable but inactive
-poll service port around:
-
-1. one Phase 2U provider/account runtime profile;
-2. one already-provisioned isolated account-home capability supplied by a
-   narrow interface, without guessing its internal files;
-3. the digest-pinned Dreamina image poll driver;
-4. the Phase 2T bounded daemon;
-5. redacted startup and health diagnostics; and
-6. real PostgreSQL lease, shutdown, and crash-restart tests.
+Phase 2X closes the runnable but inactive poll-service composition around one
+Phase 2U profile, one deployment-injected account-home capability, the
+digest-pinned Dreamina image driver, the Phase 2T daemon, redacted lifecycle
+diagnostics, and real PostgreSQL shutdown proof.
 
 Provider activation, external calls, credential provisioning, video support,
 pricing, and account routing remain separate gates.

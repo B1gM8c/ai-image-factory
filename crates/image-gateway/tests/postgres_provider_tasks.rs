@@ -1,5 +1,8 @@
 use std::{
     env,
+    fs::{self, File},
+    os::unix::fs::PermissionsExt,
+    process::Stdio,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -29,6 +32,10 @@ use gpt_image_2_gateway::{
     database::{connect_test_pool_with_search_path, run_migrations},
 };
 use image::{DynamicImage, ImageFormat, Rgba, RgbaImage};
+use image_provider_dreamina_cli::{
+    ADAPTER_REVISION as DREAMINA_ADAPTER_REVISION, DREAMINA_IMAGE_GENERATION_OPERATION_V1,
+    DREAMINA_SUBMIT_COMMAND_SCHEMA, PROVIDER_ID as DREAMINA_PROVIDER_ID,
+};
 use image_provider_sdk::{
     ArtifactMetadata, ArtifactSink, ArtifactSinkError, ArtifactSinkErrorKind,
     CanonicalCommandPayload, DurableArtifactManifest, DurableArtifactRef, EffectCertainty,
@@ -50,6 +57,12 @@ const PROFILE_ID: Uuid = Uuid::from_u128(0x1710);
 const POOL_ID: Uuid = Uuid::from_u128(0x1720);
 const ACCOUNT_ID: Uuid = Uuid::from_u128(0x1730);
 const POLICY_ID: Uuid = Uuid::from_u128(0x1740);
+const DREAMINA_PROFILE_ID: Uuid = Uuid::from_u128(0x2710);
+const DREAMINA_POOL_ID: Uuid = Uuid::from_u128(0x2720);
+const DREAMINA_ACCOUNT_ID: Uuid = Uuid::from_u128(0x2730);
+const DREAMINA_POLICY_ID: Uuid = Uuid::from_u128(0x2740);
+const DREAMINA_PROFILE_KEY: &str = "dreamina-image-poll-test";
+const DREAMINA_CREDENTIAL_REF: &str = "test-vault.dreamina.1";
 
 #[derive(Clone)]
 struct BlockingPendingPollDriver {
@@ -218,6 +231,193 @@ async fn poll_runtime_profile_rejects_each_disabled_dependency() -> TestResult {
     .await;
     let cleanup = database.cleanup().await;
     combine(result, cleanup)
+}
+
+#[tokio::test]
+async fn provider_pollerd_runs_fake_dreamina_cli_against_real_postgres_and_drains() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        seed_dreamina_execution_profile(&database.pool).await?;
+        let store = PostgresProviderTaskStore::new(database.pool.clone());
+        let executor = seed_attached_remote_task_for_runtime_profile(
+            &database.pool,
+            &store,
+            "provider-pollerd-worker",
+            "provider-pollerd",
+            30_000,
+            0,
+            DREAMINA_PROFILE_ID,
+            DREAMINA_PROVIDER_ID,
+            "dreamina-image-5.0",
+            DREAMINA_SUBMIT_COMMAND_SCHEMA,
+            DREAMINA_ADAPTER_REVISION,
+        )
+        .await?;
+
+        let root = tempfile::tempdir().map_err(debug_error)?;
+        let account_home = root.path().join("account-home");
+        let workspace = root.path().join("workspace");
+        let artifact_root = root.path().join("artifacts");
+        for path in [&account_home, &workspace, &artifact_root] {
+            fs::create_dir(path).map_err(debug_error)?;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(debug_error)?;
+        }
+        let bytes = png_bytes([31, 41, 59, 255]);
+        fs::write(account_home.join("source.png"), &bytes).map_err(debug_error)?;
+        let executable = root.path().join("dreamina");
+        let script = br#"#!/bin/sh
+download=
+submit=
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --submit_id) shift; submit=$1 ;;
+    --download_dir) shift; download=$1 ;;
+  esac
+  shift
+done
+printf called > "$HOME/query-called"
+/bin/cp "$HOME/source.png" "$download/result.png"
+printf '{"submit_id":"%s","gen_status":"success"}' "$submit"
+"#;
+        fs::write(&executable, script).map_err(debug_error)?;
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o500)).map_err(debug_error)?;
+        let executable_sha256 = hex::encode(Sha256::digest(script));
+        let log_path = root.path().join("provider-pollerd.log");
+        let log = File::create(&log_path).map_err(debug_error)?;
+        let stderr = log.try_clone().map_err(debug_error)?;
+        let database_url = env::var("TEST_DATABASE_URL").map_err(debug_error)?;
+        let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_provider-pollerd"));
+        command
+            .env_clear()
+            .env("DATABASE_URL", database_url)
+            .env("GATEWAY_DATABASE_SCHEMA", &database.schema)
+            .env("GATEWAY_ARTIFACT_ROOT", &artifact_root)
+            .env("PROVIDER_POLLER_ACTIVATION", "dreamina-image-v1")
+            .env("PROVIDER_POLLER_PROFILE_KEY", DREAMINA_PROFILE_KEY)
+            .env("PROVIDER_POLLER_OWNER", "provider-pollerd-process-test")
+            .env(
+                "PROVIDER_POLLER_CREDENTIAL_POOL_ID",
+                DREAMINA_POOL_ID.to_string(),
+            )
+            .env(
+                "PROVIDER_POLLER_ACCOUNT_ID",
+                DREAMINA_ACCOUNT_ID.to_string(),
+            )
+            .env("PROVIDER_POLLER_CREDENTIAL_REF", DREAMINA_CREDENTIAL_REF)
+            .env("PROVIDER_POLLER_CREDENTIAL_REVISION", "1")
+            .env("PROVIDER_POLLER_CREDENTIAL_AUTH_SHA256", "c".repeat(64))
+            .env("PROVIDER_POLLER_ACCOUNT_HOME", &account_home)
+            .env("PROVIDER_POLLER_WORKSPACE_ROOT", &workspace)
+            .env("PROVIDER_POLLER_EXECUTABLE", &executable)
+            .env("PROVIDER_POLLER_EXECUTABLE_SHA256", &executable_sha256)
+            .env("PROVIDER_POLLER_MAX_ARTIFACT_BYTES", "1048576")
+            .env("PROVIDER_POLLER_MAX_MATERIALIZATIONS", "1")
+            .env("PROVIDER_POLLER_LEASE_MS", "5000")
+            .env("PROVIDER_POLLER_HEARTBEAT_INTERVAL_MS", "1000")
+            .env("PROVIDER_POLLER_IDLE_DELAY_MS", "10")
+            .env("PROVIDER_POLLER_ERROR_BASE_DELAY_MS", "10")
+            .env("PROVIDER_POLLER_ERROR_MAX_DELAY_MS", "100")
+            .env("PROVIDER_POLLER_SHUTDOWN_DRAIN_MS", "5000")
+            .env("PROVIDER_POLLER_CLI_WALL_TIMEOUT_MS", "5000")
+            .env("PROVIDER_POLLER_CLI_TERMINATION_GRACE_MS", "50")
+            .env("RUST_LOG", "info")
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(log))
+            .stderr(Stdio::from(stderr))
+            .kill_on_drop(true);
+        command.process_group(0);
+        let mut child = command.spawn().map_err(debug_error)?;
+        let pid = child
+            .id()
+            .ok_or_else(|| "provider-pollerd PID unavailable".to_string())?;
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(status) = child.try_wait().map_err(debug_error)? {
+                    return Err(format!(
+                        "provider-pollerd exited before resolving work with {status}: {}",
+                        read_test_log(&log_path)
+                    ));
+                }
+                let state: Option<String> = sqlx::query_scalar(
+                    "SELECT state FROM provider_remote_tasks WHERE submission_id = $1",
+                )
+                .bind(executor.submission_id)
+                .fetch_optional(&database.pool)
+                .await
+                .map_err(debug_error)?;
+                if state.as_deref() == Some("artifact_ready") {
+                    return Ok::<(), String>(());
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .map_err(|_| {
+            format!(
+                "provider-pollerd did not resolve fake Dreamina work: {}",
+                read_test_log(&log_path)
+            )
+        })??;
+
+        signal_process_group(pid, libc::SIGTERM)?;
+        let status = tokio::time::timeout(Duration::from_secs(5), child.wait())
+            .await
+            .map_err(|_| {
+                format!(
+                    "provider-pollerd did not drain after SIGTERM: {}",
+                    read_test_log(&log_path)
+                )
+            })?
+            .map_err(debug_error)?;
+        require(
+            status.success(),
+            format!(
+                "provider-pollerd SIGTERM exit was {status}: {}",
+                read_test_log(&log_path)
+            ),
+        )?;
+
+        let authority = executor.executor_execution_id.simple().to_string();
+        let object = artifact_root
+            .join("executor-objects")
+            .join(&authority[..2])
+            .join(&authority);
+        require(
+            fs::read(object).map_err(debug_error)? == bytes,
+            "provider-pollerd did not preserve exact Dreamina artifact bytes",
+        )?;
+        require(
+            account_home.join("query-called").is_file(),
+            "provider-pollerd did not invoke the fake Dreamina CLI",
+        )?;
+        require(
+            fs::read_dir(&workspace).map_err(debug_error)?.all(|entry| {
+                !entry
+                    .map(|entry| {
+                        entry
+                            .file_name()
+                            .as_encoded_bytes()
+                            .starts_with(b".dreamina-poll-")
+                    })
+                    .unwrap_or(false)
+            }),
+            "provider-pollerd left an attempt directory after success",
+        )?;
+        let logs = read_test_log(&log_path);
+        require(
+            logs.contains("provider-pollerd started")
+                && logs.contains("provider-pollerd stopped")
+                && !logs.contains(DREAMINA_CREDENTIAL_REF)
+                && !logs.contains(&"c".repeat(64))
+                && !logs.contains(account_home.to_str().unwrap_or_default()),
+            format!("provider-pollerd diagnostics were incomplete or leaked identity: {logs}"),
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
 }
 
 #[tokio::test]
@@ -7870,6 +8070,57 @@ async fn seed_attached_remote_task(
     Ok(lease)
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn seed_attached_remote_task_for_runtime_profile(
+    pool: &PgPool,
+    store: &PostgresProviderTaskStore,
+    worker: &str,
+    identity: &str,
+    provider_timeout_ms: i64,
+    poll_after_ms: i64,
+    execution_profile_id: Uuid,
+    provider_id: &str,
+    model: &str,
+    command_schema: &str,
+    adapter_revision: &str,
+) -> TestResult<ExecutorSubmissionLease> {
+    let lease = seed_running_submission_for_runtime_profile(
+        pool,
+        worker,
+        5_000,
+        execution_profile_id,
+        provider_id,
+        model,
+        command_schema,
+        adapter_revision,
+    )
+    .await?;
+    let mut reservation = reservation_request(&lease);
+    reservation.provider_timeout_ms = provider_timeout_ms;
+    store
+        .reserve_submit(&reservation)
+        .await
+        .map_err(debug_error)?;
+    store
+        .start_submit(&reservation)
+        .await
+        .map_err(debug_error)?;
+    let operation = format!("{identity}-operation");
+    store
+        .record_submit_receipt(&submit_receipt!(
+            store,
+            &lease,
+            &operation,
+            &format!("{identity}-receipt"),
+        ))
+        .await
+        .map_err(debug_error)?;
+    let mut attach = attach_request!(store, &lease, &operation, &format!("{identity}-attach"));
+    attach.poll_after_ms = poll_after_ms;
+    store.attach(&attach).await.map_err(debug_error)?;
+    Ok(lease)
+}
+
 async fn seed_legacy_attached_remote_task(
     pool: &PgPool,
     lease: &ExecutorSubmissionLease,
@@ -8710,14 +8961,44 @@ async fn seed_running_submission_for_profile(
     execution_profile_id: Uuid,
     adapter_revision: &str,
 ) -> TestResult<ExecutorSubmissionLease> {
+    seed_running_submission_for_runtime_profile(
+        pool,
+        worker,
+        lease_ms,
+        execution_profile_id,
+        "provider-test",
+        "model-test",
+        "provider-command-v1",
+        adapter_revision,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn seed_running_submission_for_runtime_profile(
+    pool: &PgPool,
+    worker: &str,
+    lease_ms: i64,
+    execution_profile_id: Uuid,
+    provider_id: &str,
+    model: &str,
+    command_schema: &str,
+    adapter_revision: &str,
+) -> TestResult<ExecutorSubmissionLease> {
     if !operation_binding_exists(pool).await? {
         require(
-            execution_profile_id == PROFILE_ID && adapter_revision == "provider-test-adapter-v1",
+            execution_profile_id == PROFILE_ID
+                && provider_id == "provider-test"
+                && model == "model-test"
+                && command_schema == "provider-command-v1"
+                && adapter_revision == "provider-test-adapter-v1",
             "legacy fixture only supports its frozen execution profile",
         )?;
         return seed_legacy_running_submission_with_lease(pool, worker, lease_ms).await;
     }
-    let work = seed_work_lease(pool, worker).await?;
+    let work =
+        seed_work_lease_for_runtime_profile(pool, worker, provider_id, model, command_schema)
+            .await?;
     let store = PostgresExecutorSubmissionStore::new(pool.clone());
     let prepared = store
         .prepare_and_handoff(&work, execution_profile_id)
@@ -8728,8 +9009,8 @@ async fn seed_running_submission_for_profile(
         .claim_prepared(
             &ExecutorClaimScope {
                 execution_profile_id,
-                provider_id: "provider-test".to_string(),
-                command_schema: "provider-command-v1".to_string(),
+                provider_id: provider_id.to_string(),
+                command_schema: command_schema.to_string(),
                 adapter_revision: adapter_revision.to_string(),
             },
             &format!("executor-{worker}"),
@@ -9075,6 +9356,23 @@ async fn seed_legacy_running_submission_and_work(
 }
 
 async fn seed_work_lease(pool: &PgPool, worker: &str) -> TestResult<WorkLease> {
+    seed_work_lease_for_runtime_profile(
+        pool,
+        worker,
+        "provider-test",
+        "model-test",
+        "provider-command-v1",
+    )
+    .await
+}
+
+async fn seed_work_lease_for_runtime_profile(
+    pool: &PgPool,
+    worker: &str,
+    provider_id: &str,
+    model: &str,
+    command_schema: &str,
+) -> TestResult<WorkLease> {
     let job_id = Uuid::new_v4();
     let work_item_id = Uuid::new_v4();
     let execution_id = Uuid::new_v4();
@@ -9088,12 +9386,14 @@ async fn seed_work_lease(pool: &PgPool, worker: &str) -> TestResult<WorkLease> {
         INSERT INTO jobs
           (job_id, tenant_id, request_id, operation, provider_id, model, state,
            requested_units, economics_contract_version, created_at_ms, updated_at_ms)
-        VALUES ($1, 'provider-task-test', $2, 'generation', 'provider-test',
-                'model-test', 'reserved', 1, 2, $3, $3)
+        VALUES ($1, 'provider-task-test', $2, 'generation', $3,
+                $4, 'reserved', 1, 2, $5, $5)
         "#,
     )
     .bind(job_id)
     .bind(&request_id)
+    .bind(provider_id)
+    .bind(model)
     .bind(now)
     .execute(pool)
     .await
@@ -9127,10 +9427,11 @@ async fn seed_work_lease(pool: &PgPool, worker: &str) -> TestResult<WorkLease> {
     .await
     .map_err(debug_error)?;
     sqlx::query(
-        "INSERT INTO job_payloads (job_id, admission_session_id, command_schema, command_json, request_hash, created_at_ms) VALUES ($1, $2, 'provider-command-v1', $3, $4, $5)",
+        "INSERT INTO job_payloads (job_id, admission_session_id, command_schema, command_json, request_hash, created_at_ms) VALUES ($1, $2, $3, $4, $5, $6)",
     )
     .bind(job_id)
     .bind(session_id)
+    .bind(command_schema)
     .bind(&command)
     .bind("d".repeat(64))
     .bind(now)
@@ -9176,7 +9477,7 @@ async fn seed_work_lease(pool: &PgPool, worker: &str) -> TestResult<WorkLease> {
         execution_id,
         lease_epoch: 1,
         worker_id: worker.to_string(),
-        command_schema: "provider-command-v1".to_string(),
+        command_schema: command_schema.to_string(),
         command_json: command,
     })
 }
@@ -9207,6 +9508,92 @@ async fn seed_execution_profile(pool: &PgPool) -> TestResult {
             .bind(PROFILE_ID).bind(POOL_ID).bind(ACCOUNT_ID).bind(POLICY_ID).bind(now)
             .execute(&mut *tx).await.map_err(debug_error)?;
     }
+    tx.commit().await.map_err(debug_error)
+}
+
+async fn seed_dreamina_execution_profile(pool: &PgPool) -> TestResult {
+    let now = database_now(pool).await?;
+    let operation = DREAMINA_IMAGE_GENERATION_OPERATION_V1;
+    let mut tx = pool.begin().await.map_err(debug_error)?;
+    sqlx::query(
+        r#"
+        INSERT INTO provider_credential_pools
+          (credential_pool_id, pool_key, provider_id, state, created_at_ms, updated_at_ms)
+        VALUES ($1, 'dreamina-image-poll-test', $2, 'enabled', $3, $3)
+        "#,
+    )
+    .bind(DREAMINA_POOL_ID)
+    .bind(DREAMINA_PROVIDER_ID)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .map_err(debug_error)?;
+    sqlx::query(
+        r#"
+        INSERT INTO provider_accounts
+          (provider_account_id, credential_pool_id, provider_id, account_key,
+           credential_ref, credential_revision, credential_auth_sha256,
+           state, created_at_ms, updated_at_ms)
+        VALUES ($1, $2, $3, 'dreamina-image-poll-test', $4, 1, $5,
+                'enabled', $6, $6)
+        "#,
+    )
+    .bind(DREAMINA_ACCOUNT_ID)
+    .bind(DREAMINA_POOL_ID)
+    .bind(DREAMINA_PROVIDER_ID)
+    .bind(DREAMINA_CREDENTIAL_REF)
+    .bind("c".repeat(64))
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .map_err(debug_error)?;
+    sqlx::query(
+        r#"
+        INSERT INTO executor_resource_policies
+          (resource_policy_id, revision, credential_pool_id, provider_account_id,
+           provider_id, execution_class, max_concurrency, state, created_at_ms)
+        VALUES ($1, 1, $2, $3, $4, 'remote-task', 2, 'enabled', $5)
+        "#,
+    )
+    .bind(DREAMINA_POLICY_ID)
+    .bind(DREAMINA_POOL_ID)
+    .bind(DREAMINA_ACCOUNT_ID)
+    .bind(DREAMINA_PROVIDER_ID)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .map_err(debug_error)?;
+    sqlx::query(
+        r#"
+        INSERT INTO provider_execution_profiles
+          (execution_profile_id, profile_key, provider_id, command_schema,
+           operation_id, operation_descriptor_revision,
+           operation_descriptor_sha256_v1, completion_mode, idempotency_mode,
+           adapter_revision, credential_pool_id, provider_account_id,
+           credential_ref, credential_revision, resource_policy_id,
+           resource_policy_revision, state, created_at_ms, updated_at_ms)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+                $11, $12, $13, 1, $14, 1, 'enabled', $15, $15)
+        "#,
+    )
+    .bind(DREAMINA_PROFILE_ID)
+    .bind(DREAMINA_PROFILE_KEY)
+    .bind(DREAMINA_PROVIDER_ID)
+    .bind(operation.command_schema)
+    .bind(operation.id)
+    .bind(operation.descriptor_revision)
+    .bind(operation.canonical_sha256_v1_hex())
+    .bind(operation.completion.as_str())
+    .bind(operation.idempotency.as_str())
+    .bind(DREAMINA_ADAPTER_REVISION)
+    .bind(DREAMINA_POOL_ID)
+    .bind(DREAMINA_ACCOUNT_ID)
+    .bind(DREAMINA_CREDENTIAL_REF)
+    .bind(DREAMINA_POLICY_ID)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .map_err(debug_error)?;
     tx.commit().await.map_err(debug_error)
 }
 
@@ -9575,6 +9962,23 @@ fn require(condition: bool, message: impl Into<String>) -> TestResult {
 
 fn debug_error(error: impl std::fmt::Debug) -> String {
     format!("{error:?}")
+}
+
+fn read_test_log(path: &std::path::Path) -> String {
+    fs::read_to_string(path).unwrap_or_else(|_| "<provider-pollerd log unavailable>".to_owned())
+}
+
+fn signal_process_group(pid: u32, signal: libc::c_int) -> TestResult {
+    // SAFETY: the test supplies a positive child PID and a valid Unix signal.
+    let result = unsafe { libc::kill(-(pid as libc::pid_t), signal) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(format!(
+            "failed to signal provider-pollerd process group: {}",
+            std::io::Error::last_os_error()
+        ))
+    }
 }
 
 fn combine(result: TestResult, cleanup: TestResult) -> TestResult {

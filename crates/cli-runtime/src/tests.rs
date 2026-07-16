@@ -166,6 +166,91 @@ impl SpawnObserver for RecordingObserver {
     }
 }
 
+#[test]
+fn private_working_directory_requires_current_owner_and_mode_0700() {
+    let directory = TempDir::new().expect("temp directory");
+    make_private(directory.path());
+    WorkingDirectory::new_private(directory.path()).expect("private working directory");
+
+    fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o750))
+        .expect("relax directory mode");
+    assert!(matches!(
+        WorkingDirectory::new_private(directory.path()),
+        Err(CommandSpecError::InvalidPrivateWorkingDirectory)
+    ));
+    assert!(WorkingDirectory::new(directory.path()).is_ok());
+}
+
+#[test]
+fn command_debug_redacts_private_paths_and_runtime_payloads() {
+    let directory = TempDir::new().expect("working directory");
+    let account_home = TempDir::new().expect("account home");
+    make_private(account_home.path());
+    let secret_argument = "sensitive-provider-task";
+    let secret_environment = "sensitive-environment-value";
+    let secret_stdin = b"sensitive-stdin-value";
+    let command = CommandSpec::new_receipt(
+        VerifiedExecutable::new("/bin/sh").expect("verified shell"),
+        WorkingDirectory::new(directory.path()).expect("working directory"),
+        Duration::from_secs(1),
+        Duration::from_millis(10),
+    )
+    .expect("command spec")
+    .arg(secret_argument)
+    .expect("secret argument")
+    .env("HOME", account_home.path())
+    .expect("account home")
+    .env("PROVIDER_SECRET", secret_environment)
+    .expect("secret environment")
+    .stdin(secret_stdin)
+    .expect("secret stdin")
+    .require_directory(
+        WorkingDirectory::new_private(account_home.path()).expect("private account home"),
+    );
+
+    let debug = format!("{command:?}");
+    assert!(debug.contains("PROVIDER_SECRET"));
+    assert!(debug.contains("[redacted]"));
+    assert!(!debug.contains(directory.path().to_str().unwrap()));
+    assert!(!debug.contains(account_home.path().to_str().unwrap()));
+    assert!(!debug.contains(secret_argument));
+    assert!(!debug.contains(secret_environment));
+    assert!(!debug.contains(std::str::from_utf8(secret_stdin).unwrap()));
+}
+
+#[tokio::test]
+async fn private_working_directory_revalidates_permissions_before_spawn() {
+    let directory = TempDir::new().expect("temp directory");
+    let account_home = TempDir::new().expect("account home");
+    make_private(account_home.path());
+    let command = CommandSpec::new_receipt(
+        VerifiedExecutable::new("/bin/sh").expect("verified shell"),
+        WorkingDirectory::new(directory.path()).expect("working directory"),
+        Duration::from_secs(3),
+        Duration::from_millis(50),
+    )
+    .expect("command spec")
+    .require_directory(
+        WorkingDirectory::new_private(account_home.path()).expect("private account home"),
+    )
+    .arg("-c")
+    .expect("shell flag")
+    .arg("printf called > should-not-exist")
+    .expect("shell script");
+    fs::set_permissions(account_home.path(), fs::Permissions::from_mode(0o755))
+        .expect("relax account-home mode");
+
+    assert!(matches!(
+        CliRuntime::new(StaticReceiptPolicy { command })
+            .run_receipt(&(), &mut NoopSpawnObserver)
+            .await,
+        Err(RuntimeError::Process(ProcessError::InvalidCommand(
+            CommandSpecError::WorkingDirectoryChanged
+        )))
+    ));
+    assert!(!directory.path().join("should-not-exist").exists());
+}
+
 #[tokio::test]
 async fn clears_environment_and_discards_artifact_process_output() {
     let directory = TempDir::new().expect("temp directory");

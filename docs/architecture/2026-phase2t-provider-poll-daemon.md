@@ -11,6 +11,10 @@ Follow-up: Phase 2U now provides the active, frozen, redacted runtime profile
 and derives the daemon lane bound from durable provider-account capacity:
 [`2026-phase2u-active-poll-runtime-profile.md`](2026-phase2u-active-poll-runtime-profile.md).
 
+Phase 2X composes this daemon into a runnable but inactive single-profile
+process and verifies it against real PostgreSQL plus a local fake CLI:
+[`2026-phase2x-inactive-provider-poll-service.md`](2026-phase2x-inactive-provider-poll-service.md).
+
 ## Scope
 
 Phase 2T adds the reusable lifecycle boundary around the Phase 2R
@@ -266,6 +270,8 @@ Phase 2W adds exclusive descriptor-relative attempt ownership and startup
 crash recovery:
 [`2026-phase2w-exclusive-cli-attempt-workspace.md`](2026-phase2w-exclusive-cli-attempt-workspace.md).
 
-The next gate is a runnable but inactive service composition with credential
-broker binding, redacted metrics, and real PostgreSQL lease verification.
-Dreamina and Grok remain disabled.
+Phase 2X closes the inactive service composition, exact account capability
+binding, redacted lifecycle diagnostics, and real PostgreSQL process
+verification. Credential provisioning, production health semantics, query
+rate/cooldown policy, and provider activation remain open. Dreamina and Grok
+remain disabled.

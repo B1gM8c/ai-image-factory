@@ -1,9 +1,11 @@
+mod account_home;
 mod daemon;
 mod driver;
 mod orchestrator;
 mod runtime;
 mod sink;
 
+pub use account_home::{ProviderAccountHomeCapability, ProviderAccountHomeCapabilityError};
 pub(crate) use daemon::MAX_PROVIDER_POLL_LANES;
 pub use daemon::{
     ProviderPollDaemon, ProviderPollDaemonConfig, ProviderPollDaemonError,

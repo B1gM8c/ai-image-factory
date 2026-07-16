@@ -6,6 +6,10 @@ Status: implemented and verified with unit tests plus real PostgreSQL 18
 integration tests. This phase activates no provider, credential resolution,
 CLI process, poll service binary, route, billing behavior, or external call.
 
+Follow-up: Phase 2X loads this snapshot into a runnable but inactive
+single-profile process:
+[`2026-phase2x-inactive-provider-poll-service.md`](2026-phase2x-inactive-provider-poll-service.md).
+
 ## Scope
 
 Phase 2U adds the read-only startup boundary that a future provider poll service
@@ -227,7 +231,7 @@ Phase 2W binds that driver to an exclusive descriptor-relative attempt
 workspace with startup crash recovery:
 [`2026-phase2w-exclusive-cli-attempt-workspace.md`](2026-phase2w-exclusive-cli-attempt-workspace.md).
 
-The remaining gate is inactive service composition: load this Phase 2U
-profile, resolve an isolated account home through a credential broker,
-construct the digest-pinned driver, and prove the Phase 2T daemon against real
-PostgreSQL leases and a local fake CLI.
+Phase 2X closes inactive service composition with a deployment-injected
+account-home capability, digest-pinned driver, Phase 2T daemon, and real
+PostgreSQL fake-CLI proof. A production credential broker, revocation policy,
+health contract, and provider activation remain separate gates.

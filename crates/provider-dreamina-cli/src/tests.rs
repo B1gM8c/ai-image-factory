@@ -28,6 +28,33 @@ const VIDEO_MODELS: [VideoModelVersion; 5] = [
 ];
 
 #[test]
+fn image_generation_operation_descriptor_is_stable_and_remote_task_bound() {
+    assert_eq!(
+        DREAMINA_IMAGE_GENERATION_OPERATION_V1.id,
+        "images.generations"
+    );
+    assert_eq!(
+        DREAMINA_IMAGE_GENERATION_OPERATION_V1.command_schema,
+        DREAMINA_SUBMIT_COMMAND_SCHEMA
+    );
+    assert_eq!(
+        DREAMINA_IMAGE_GENERATION_OPERATION_V1.completion,
+        image_provider_contracts::CompletionMode::RemoteTask(DREAMINA_CLI_REMOTE_TASK_CONTROLS_V1)
+    );
+    assert_eq!(
+        DREAMINA_IMAGE_GENERATION_OPERATION_V1
+            .canonical_sha256_v1_hex()
+            .len(),
+        64
+    );
+    assert!(
+        ADAPTER_REVISION
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    );
+}
+
+#[test]
 fn image_request_enforces_count_and_model_resolution_boundaries() {
     for model in IMAGE_MODELS {
         for count in [1, 10] {

@@ -2,7 +2,7 @@
 
 > Status: proposed target architecture
 >
-> Reviewed: 2026-07-15
+> Reviewed: 2026-07-16
 >
 > Scope: OpenAI/Codex, Volcengine Ark/BytePlus, Volcengine CV/JiMeng, xAI/Grok,
 > durable scheduling, CLI-to-API execution, artifacts, identity, quota, metering,
@@ -241,7 +241,11 @@ flowchart LR
 - `executord`: own one database-bound provider/account/resource scope, hold the
   OS sandbox and credential lease, and execute output-scoped start-or-attach
   operations through a durable private spool.
-- `reconcilerd`: expired leases, ambiguous submissions, provider polling,
+- `provider-pollerd`: own one frozen remote-task execution profile and its
+  provider/account scope, run bounded provider queries, heartbeat fenced poll
+  leases, and materialize immutable provider artifacts. The current Dreamina
+  image composition is runnable but remains undeployed and inactive.
+- `reconcilerd`: expired leases, ambiguous submissions, provider deadlines,
   orphan artifacts, stale reservations, outbox delivery, and economic
   reconciliation.
 - `factoryctl`: migrations, provider/account administration, diagnostics, and

@@ -159,6 +159,7 @@ impl DreaminaCliQueryPolicyV1 {
             self.wall_timeout,
             self.termination_grace,
         )?
+        .require_directory(self.account_home.clone())
         .env("HOME", self.account_home.path().as_os_str())?
         .env("TMPDIR", request.download_dir().as_os_str())?;
         for argument in request.to_argv() {

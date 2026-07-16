@@ -6,7 +6,9 @@ mod policy;
 mod receipt;
 mod request;
 
-pub use capabilities::DREAMINA_CLI_REMOTE_TASK_CONTROLS_V1;
+pub use capabilities::{
+    DREAMINA_CLI_REMOTE_TASK_CONTROLS_V1, DREAMINA_IMAGE_GENERATION_OPERATION_V1,
+};
 pub use command::{
     DREAMINA_SUBMIT_COMMAND_SCHEMA, DreaminaSubmitCommandError, DreaminaSubmitPayloadV1,
     MAX_SUBMIT_COMMAND_BYTES, parse_submit_command,
@@ -23,7 +25,7 @@ pub use request::{
 };
 
 pub const PROVIDER_ID: &str = "dreamina-cli";
-pub const ADAPTER_REVISION: &str = "dreamina-cli/remote-task/v1";
+pub const ADAPTER_REVISION: &str = "dreamina-cli.remote-task.v1";
 pub const REQUEST_SCHEMA_VERSION: u16 = 1;
 
 #[cfg(test)]

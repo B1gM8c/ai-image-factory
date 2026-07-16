@@ -1,6 +1,7 @@
 use std::{
     collections::BTreeMap,
     ffi::{OsStr, OsString},
+    fmt,
     fs::{self, File, OpenOptions},
     io::Read,
     os::unix::{
@@ -25,19 +26,21 @@ pub struct VerifiedExecutable {
     identity: FileIdentity,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct WorkingDirectory {
     path: PathBuf,
     directory: Arc<File>,
     identity: FileIdentity,
+    private: bool,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct CommandSpec {
     executable: VerifiedExecutable,
     arguments: Vec<OsString>,
     environment: BTreeMap<OsString, OsString>,
     working_directory: WorkingDirectory,
+    required_directories: Vec<WorkingDirectory>,
     stdin: Vec<u8>,
     wall_timeout: Duration,
     termination_grace: Duration,
@@ -74,6 +77,8 @@ pub enum CommandSpecError {
     WorkingDirectoryUnavailable(#[source] std::io::Error),
     #[error("working directory must be a real directory")]
     InvalidWorkingDirectory,
+    #[error("private working directory must be owned by the current user with mode 0700")]
+    InvalidPrivateWorkingDirectory,
     #[error("working directory identity changed after verification")]
     WorkingDirectoryChanged,
     #[error("wall timeout and termination grace must be non-zero")]
@@ -167,9 +172,53 @@ impl VerifiedExecutable {
     }
 }
 
+impl fmt::Debug for WorkingDirectory {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WorkingDirectory")
+            .field(
+                "path",
+                if self.private {
+                    &"[redacted]" as &dyn fmt::Debug
+                } else {
+                    &self.path
+                },
+            )
+            .field("private", &self.private)
+            .finish_non_exhaustive()
+    }
+}
+
+impl fmt::Debug for CommandSpec {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CommandSpec")
+            .field("executable", &self.executable)
+            .field("argument_count", &self.arguments.len())
+            .field(
+                "environment_keys",
+                &self.environment.keys().collect::<Vec<_>>(),
+            )
+            .field("working_directory", &"[redacted]")
+            .field("required_directory_count", &self.required_directories.len())
+            .field("stdin_bytes", &self.stdin.len())
+            .field("wall_timeout", &self.wall_timeout)
+            .field("termination_grace", &self.termination_grace)
+            .field("output", &self.output)
+            .finish()
+    }
+}
+
 impl WorkingDirectory {
     pub fn new(path: impl AsRef<Path>) -> Result<Self, CommandSpecError> {
-        let path = path.as_ref();
+        Self::new_inner(path.as_ref(), false)
+    }
+
+    pub fn new_private(path: impl AsRef<Path>) -> Result<Self, CommandSpecError> {
+        Self::new_inner(path.as_ref(), true)
+    }
+
+    fn new_inner(path: &Path, private: bool) -> Result<Self, CommandSpecError> {
         if !path.is_absolute() {
             return Err(CommandSpecError::WorkingDirectoryNotAbsolute);
         }
@@ -180,6 +229,9 @@ impl WorkingDirectory {
         if !metadata.is_dir() {
             return Err(CommandSpecError::InvalidWorkingDirectory);
         }
+        if private && !private_directory_metadata(&metadata) {
+            return Err(CommandSpecError::InvalidPrivateWorkingDirectory);
+        }
         let directory = OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW)
@@ -189,6 +241,7 @@ impl WorkingDirectory {
             path: canonical,
             directory: Arc::new(directory),
             identity: FileIdentity::from_metadata(&metadata),
+            private,
         })
     }
 
@@ -203,14 +256,18 @@ impl WorkingDirectory {
     fn revalidate(&self) -> Result<(), CommandSpecError> {
         let metadata = metadata_without_symlink(&self.path)
             .map_err(|_| CommandSpecError::WorkingDirectoryChanged)?;
-        if !self.identity.matches_directory(&metadata) {
+        if !self.identity.matches_directory(&metadata)
+            || (self.private && !private_directory_metadata(&metadata))
+        {
             return Err(CommandSpecError::WorkingDirectoryChanged);
         }
         let bound = self
             .directory
             .metadata()
             .map_err(|_| CommandSpecError::WorkingDirectoryChanged)?;
-        if !self.identity.matches_directory(&bound) {
+        if !self.identity.matches_directory(&bound)
+            || (self.private && !private_directory_metadata(&bound))
+        {
             return Err(CommandSpecError::WorkingDirectoryChanged);
         }
         Ok(())
@@ -281,6 +338,11 @@ impl CommandSpec {
         Ok(self)
     }
 
+    pub fn require_directory(mut self, directory: WorkingDirectory) -> Self {
+        self.required_directories.push(directory);
+        self
+    }
+
     pub fn executable(&self) -> &VerifiedExecutable {
         &self.executable
     }
@@ -316,6 +378,9 @@ impl CommandSpec {
     pub(crate) fn revalidate(&self) -> Result<(), CommandSpecError> {
         self.executable.revalidate()?;
         self.working_directory.revalidate()?;
+        for directory in &self.required_directories {
+            directory.revalidate()?;
+        }
         Ok(())
     }
 
@@ -334,6 +399,7 @@ impl CommandSpec {
             arguments: Vec::new(),
             environment: BTreeMap::new(),
             working_directory,
+            required_directories: Vec::new(),
             stdin: Vec::new(),
             wall_timeout,
             termination_grace,
@@ -384,6 +450,17 @@ fn metadata_without_symlink(path: &Path) -> std::io::Result<fs::Metadata> {
         ));
     }
     Ok(metadata)
+}
+
+fn private_directory_metadata(metadata: &fs::Metadata) -> bool {
+    metadata.is_dir()
+        && metadata.permissions().mode() & 0o7777 == 0o700
+        && metadata.uid() == effective_user_id()
+}
+
+fn effective_user_id() -> u32 {
+    // SAFETY: geteuid has no arguments and only returns process identity.
+    unsafe { libc::geteuid() }
 }
 
 fn validate_no_nul(value: &OsStr) -> Result<(), ()> {

@@ -72,6 +72,9 @@ account-fenced local process verification are documented in
 The provider-neutral exclusive CLI attempt workspace, descriptor-relative
 crash recovery, and root-replacement fencing are documented in
 [`docs/architecture/2026-phase2w-exclusive-cli-attempt-workspace.md`](docs/architecture/2026-phase2w-exclusive-cli-attempt-workspace.md).
+The inactive provider poll service, exact profile/account capability binding,
+bounded lifecycle, and real PostgreSQL fake-CLI proof are documented in
+[`docs/architecture/2026-phase2x-inactive-provider-poll-service.md`](docs/architecture/2026-phase2x-inactive-provider-poll-service.md).
 Database-bound provider profiles and durable capacity are documented in
 [`docs/architecture/2026-phase1g-execution-binding-capacity.md`](docs/architecture/2026-phase1g-execution-binding-capacity.md).
 
@@ -84,6 +87,7 @@ cargo run -p gpt-image-2-gateway --bin workerd
 cargo run -p gpt-image-2-gateway --bin executord
 cargo run -p gpt-image-2-gateway --bin reducerd
 cargo run -p gpt-image-2-gateway --bin reconcilerd
+cargo run -p gpt-image-2-gateway --bin provider-pollerd
 npm install
 npm run typecheck:admin
 npm run dev:admin

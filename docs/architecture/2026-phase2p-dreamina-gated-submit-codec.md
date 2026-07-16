@@ -64,7 +64,7 @@ message broker, runtime registry, or alternative process supervisor.
 
 ```text
 schema: dreamina-cli.submit.v1
-adapter revision: dreamina-cli/remote-task/v1
+adapter revision: dreamina-cli.remote-task.v1
 ```
 
 The adapter revision was widened by Phase 2V after submit and query were bound
@@ -196,13 +196,13 @@ end-to-end smoke test.
 1. Add a provisioner that binds the inspected Dreamina executable digest,
    isolated account home, credential authentication digest, and execution
    profile without exposing credential bytes.
-2. Compose the verified Phase 2V image poll driver with the active runtime
-   profile, credential broker, and inactive service binary.
-3. Add provider/account daemon composition, cooldown, spend limits, and
-   production-scale mixed-account benchmarks.
-4. Add Linux cgroup v2 containment and define the macOS production supervisor
+2. Add provider/account cooldown, query-rate, spend, and quota controls around
+   the Phase 2X inactive poll service.
+3. Compose the existing submit codec into its own bounded inactive service.
+4. Add production-scale mixed-account benchmarks.
+5. Add Linux cgroup v2 containment and define the macOS production supervisor
    contract.
-5. Run an explicitly approved credentialed smoke test only after every prior
+6. Run an explicitly approved credentialed smoke test only after every prior
    gate is green.
 
 Until then, Dreamina remains planned/inactive and the public Codex image
@@ -211,3 +211,7 @@ behavior is unchanged.
 Follow-up: Phase 2V implements and locally verifies the image-only query and
 materialization boundary without activating Dreamina:
 [`2026-phase2v-inactive-dreamina-image-poll-driver.md`](2026-phase2v-inactive-dreamina-image-poll-driver.md).
+
+Phase 2X composes that query path into a runnable but inactive service with
+real PostgreSQL and a local fake CLI:
+[`2026-phase2x-inactive-provider-poll-service.md`](2026-phase2x-inactive-provider-poll-service.md).

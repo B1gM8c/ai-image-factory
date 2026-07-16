@@ -7,7 +7,7 @@ use std::{
 };
 
 use image::{DynamicImage, ImageFormat, Rgba, RgbaImage};
-use image_cli_runtime::WorkingDirectory;
+use image_cli_runtime::{ATTEMPT_WORKSPACE_LOCK_FILENAME, WorkingDirectory};
 use image_provider_dreamina_cli::DreaminaCliQueryPolicyV1;
 use image_provider_sdk::{
     DurableArtifactRef, EffectCertainty, PollObservation, RemoteOperationRef, RetryDirective,
@@ -18,6 +18,10 @@ use tempfile::TempDir;
 use uuid::Uuid;
 
 use super::*;
+use crate::{
+    executor::ExecutorExecutionProfile,
+    provider_tasks::{ProviderAccountHomeCapability, ProviderPollRuntimeProfile},
+};
 
 #[tokio::test]
 async fn pending_and_terminal_failure_require_an_empty_download_directory() {
@@ -296,6 +300,76 @@ fn driver_cleans_crash_left_attempts_and_exclusively_owns_the_workspace() {
     }
 }
 
+#[tokio::test]
+async fn runtime_profile_composition_revalidates_private_account_home_before_spawn() {
+    let fixture = Fixture::new(
+        r#"printf called > "$HOME/query-called"
+printf '{"submit_id":"%s","gen_status":"querying"}' "$submit""#,
+    );
+    let profile = ProviderPollRuntimeProfile::new(runtime_profile()).unwrap();
+    let capability = ProviderAccountHomeCapability::new(
+        PROVIDER_ID,
+        profile.credential_pool_id(),
+        profile.provider_account_id(),
+        profile.credential_ref(),
+        profile.credential_revision(),
+        profile.credential_auth_sha256(),
+        &fixture.account_home,
+    )
+    .unwrap();
+    let driver = DreaminaCliPollDriverV1::from_runtime_profile(
+        &profile,
+        &capability,
+        fixture.process_config(1024),
+    )
+    .unwrap();
+    fs::set_permissions(&fixture.account_home, fs::Permissions::from_mode(0o755)).unwrap();
+    let operation = fixture.operation();
+    let mut sink = fixture.sink([0_u8; 32]);
+
+    let failure = driver
+        .poll_operation(&operation, &mut sink)
+        .await
+        .unwrap_err();
+
+    assert_eq!(failure.code(), "dreamina_poll_process_invalid");
+    assert!(!fixture.account_home.join("query-called").exists());
+    fixture.assert_workspace_has_no_attempts();
+}
+
+#[test]
+fn runtime_profile_composition_rejects_descriptor_drift_before_workspace_lock() {
+    let fixture = Fixture::new("printf '{}'");
+    let mut changed = runtime_profile();
+    changed.operation_descriptor_sha256_v1 = "f".repeat(64);
+    let profile = ProviderPollRuntimeProfile::new(changed).unwrap();
+    let capability = ProviderAccountHomeCapability::new(
+        PROVIDER_ID,
+        profile.credential_pool_id(),
+        profile.provider_account_id(),
+        profile.credential_ref(),
+        profile.credential_revision(),
+        profile.credential_auth_sha256(),
+        &fixture.account_home,
+    )
+    .unwrap();
+
+    assert!(matches!(
+        DreaminaCliPollDriverV1::from_runtime_profile(
+            &profile,
+            &capability,
+            fixture.process_config(1024),
+        ),
+        Err(DreaminaCliPollDriverConfigError::ProfileMismatch)
+    ));
+    assert!(
+        !fixture
+            .workspace
+            .join(ATTEMPT_WORKSPACE_LOCK_FILENAME)
+            .exists()
+    );
+}
+
 #[test]
 fn media_detection_accepts_only_supported_image_signatures() {
     assert_eq!(
@@ -396,6 +470,17 @@ done
             .unwrap()
     }
 
+    fn process_config(&self, max_artifact_bytes: u64) -> DreaminaCliPollProcessConfig {
+        DreaminaCliPollProcessConfig::new(
+            &self.executable,
+            self.executable_sha256,
+            WorkingDirectory::new_private(&self.workspace).unwrap(),
+            Duration::from_secs(5),
+            Duration::from_millis(50),
+            max_artifact_bytes,
+        )
+    }
+
     fn operation(&self) -> RemoteOperationRef {
         RemoteOperationRef::new(PROVIDER_ID, Uuid::new_v4().to_string(), "task-1").unwrap()
     }
@@ -420,6 +505,30 @@ fn workspace_has_no_attempts(path: &Path) -> bool {
             .as_encoded_bytes()
             .starts_with(DREAMINA_POLL_ATTEMPT_PREFIX.as_bytes())
     })
+}
+
+fn runtime_profile() -> ExecutorExecutionProfile {
+    let operation = DREAMINA_IMAGE_GENERATION_OPERATION_V1;
+    ExecutorExecutionProfile {
+        execution_profile_id: Uuid::from_u128(1),
+        profile_key: "dreamina-image-test".to_owned(),
+        provider_id: PROVIDER_ID.to_owned(),
+        command_schema: operation.command_schema.to_owned(),
+        operation_id: operation.id.to_owned(),
+        operation_descriptor_revision: operation.descriptor_revision.to_owned(),
+        operation_descriptor_sha256_v1: operation.canonical_sha256_v1_hex(),
+        completion_mode: operation.completion.as_str().to_owned(),
+        idempotency_mode: operation.idempotency.as_str().to_owned(),
+        adapter_revision: ADAPTER_REVISION.to_owned(),
+        credential_pool_id: Uuid::from_u128(2),
+        provider_account_id: Uuid::from_u128(3),
+        credential_ref: "vault.dreamina.1".to_owned(),
+        credential_revision: 1,
+        credential_auth_sha256: "c".repeat(64),
+        resource_policy_id: Uuid::from_u128(4),
+        resource_policy_revision: 1,
+        max_concurrency: 2,
+    }
 }
 
 fn png_bytes(color: [u8; 4]) -> Vec<u8> {
