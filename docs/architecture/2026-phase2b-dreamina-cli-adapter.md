@@ -107,10 +107,12 @@ non-empty submit_id
 gen_status = querying | success
 ```
 
-`gen_status=fail` is a rejected submission and exposes only a length-bounded,
-control-character-free reason. Unknown status, duplicate/trailing JSON,
-non-JSON output, empty identifiers, or oversized stdout/stderr fail closed.
-stderr is never interpolated into customer-visible or durable error text.
+`gen_status=fail` is recognized and exposes only a length-bounded,
+control-character-free reason. Phase 2P conservatively records it as
+`UnknownRemoteEffect` rather than assuming it proves that no remote task was
+created. Unknown status, duplicate/trailing JSON, non-JSON output, empty
+identifiers, or oversized stdout/stderr also fail closed. stderr is never
+interpolated into customer-visible or durable error text.
 
 An accepted submit is not proof that an artifact exists and is not billable
 completion evidence.

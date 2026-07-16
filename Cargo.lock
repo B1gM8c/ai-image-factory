@@ -574,6 +574,7 @@ dependencies = [
  "image",
  "image-cli-runtime",
  "image-provider-contracts",
+ "image-provider-dreamina-cli",
  "image-provider-sdk",
  "image-provider-test-support",
  "image-scheduler-policy",

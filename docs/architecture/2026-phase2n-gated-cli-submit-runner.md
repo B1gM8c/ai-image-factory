@@ -222,13 +222,13 @@ useful for leader observation but not complete descendant containment:
 
 ## Remaining Activation Gates
 
-1. Add one provider-specific Phase 2O codec without activating external
-   credentials or provider calls.
-2. Add Linux cgroup v2 containment and zero-populated verification; define the
+1. Add Linux cgroup v2 containment and zero-populated verification; define the
    macOS production supervisor contract.
-3. Freeze and authenticate the helper executable/deployment identity and
+2. Freeze and authenticate the helper executable/deployment identity and
    benchmark executable/working-directory replacement defenses.
-4. Add retention only after PostgreSQL terminal convergence and an audited
+3. Add retention only after PostgreSQL terminal convergence and an audited
    safety interval.
-5. Run production-equivalent filesystem/process/concurrency benchmarks before
+4. Run production-equivalent filesystem/process/concurrency benchmarks before
    making any SOTA or activation claim.
+
+Phase 2P adds the first inactive provider-specific codec for Dreamina.

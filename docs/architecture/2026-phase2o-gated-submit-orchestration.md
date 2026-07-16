@@ -197,13 +197,14 @@ The process durability and containment evidence basis remains in Phase 2N.
 
 ## Remaining Activation Gates
 
-1. Implement one provider-specific composition adapter, initially Dreamina,
-   without enabling credentials or external calls.
-2. Add Linux per-submit cgroup v2 containment and prove `populated 0`; define
+1. Add Linux per-submit cgroup v2 containment and prove `populated 0`; define
    the macOS production supervisor boundary.
-3. Freeze the deployed helper identity and close or explicitly accept the
+2. Freeze the deployed helper identity and close or explicitly accept the
    remaining same-UID path-to-exec race.
-4. Add journal retention only after PostgreSQL terminal convergence and an
+3. Add journal retention only after PostgreSQL terminal convergence and an
    audited safety interval.
-5. Run production-equivalent process, filesystem, mixed-account, and receipt
+4. Run production-equivalent process, filesystem, mixed-account, and receipt
    decoding benchmarks before any activation or SOTA claim.
+
+Phase 2P closes the first provider-specific submit codec item for Dreamina
+without activating credentials, routing, polling, or external calls.

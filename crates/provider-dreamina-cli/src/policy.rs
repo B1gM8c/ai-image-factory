@@ -1,14 +1,9 @@
-use std::{ffi::OsString, time::Duration};
+use std::{ffi::OsString, path::Path, time::Duration};
 
-use image_cli_runtime::{
-    CommandSpec, CommandSpecError, ExitClassification, ReceiptCliPolicy, VerifiedExecutable,
-    WorkingDirectory, default_exit_classification,
-};
+use image_cli_runtime::{CommandSpec, CommandSpecError, VerifiedExecutable, WorkingDirectory};
 use thiserror::Error;
 
-use crate::{
-    AcceptedReceipt, ReceiptError, TextToImageRequestV1, TextToVideoRequestV1, parse_receipt,
-};
+use crate::{TextToImageRequestV1, TextToVideoRequestV1};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DreaminaSubmitRequestV1 {
@@ -17,7 +12,7 @@ pub enum DreaminaSubmitRequestV1 {
 }
 
 impl DreaminaSubmitRequestV1 {
-    fn argv(&self) -> Result<Vec<OsString>, DreaminaCliPolicyError> {
+    pub(crate) fn argv(&self) -> Result<Vec<OsString>, DreaminaCliPolicyError> {
         match self {
             Self::TextToImage(request) if request.generate_num() != 1 => {
                 Err(DreaminaCliPolicyError::BatchSubmissionUnsupported)
@@ -43,6 +38,7 @@ impl From<TextToVideoRequestV1> for DreaminaSubmitRequestV1 {
 #[derive(Clone, Debug)]
 pub struct DreaminaCliPolicyV1 {
     executable: VerifiedExecutable,
+    executable_sha256: [u8; 32],
     working_directory: WorkingDirectory,
     account_home: WorkingDirectory,
     wall_timeout: Duration,
@@ -51,7 +47,8 @@ pub struct DreaminaCliPolicyV1 {
 
 impl DreaminaCliPolicyV1 {
     pub fn new(
-        executable: VerifiedExecutable,
+        executable_path: impl AsRef<Path>,
+        executable_sha256: [u8; 32],
         working_directory: WorkingDirectory,
         account_home: WorkingDirectory,
         wall_timeout: Duration,
@@ -65,22 +62,25 @@ impl DreaminaCliPolicyV1 {
         {
             return Err(DreaminaCliPolicyError::OverlappingDirectories);
         }
+        let executable = VerifiedExecutable::new_with_sha256(executable_path, executable_sha256)?;
         Ok(Self {
             executable,
+            executable_sha256,
             working_directory,
             account_home,
             wall_timeout,
             termination_grace,
         })
     }
-}
 
-impl ReceiptCliPolicy for DreaminaCliPolicyV1 {
-    type Request = DreaminaSubmitRequestV1;
-    type Receipt = AcceptedReceipt;
-    type Error = DreaminaCliPolicyError;
+    pub fn executable_sha256(&self) -> [u8; 32] {
+        self.executable_sha256
+    }
 
-    fn command(&self, request: &Self::Request) -> Result<CommandSpec, Self::Error> {
+    pub fn command_spec(
+        &self,
+        request: &DreaminaSubmitRequestV1,
+    ) -> Result<CommandSpec, DreaminaCliPolicyError> {
         let mut command = CommandSpec::new_receipt(
             self.executable.clone(),
             self.working_directory.clone(),
@@ -94,22 +94,12 @@ impl ReceiptCliPolicy for DreaminaCliPolicyV1 {
         }
         Ok(command)
     }
-
-    fn classify_exit(&self, status: &std::process::ExitStatus) -> ExitClassification {
-        default_exit_classification(status)
-    }
-
-    fn parse_receipt(&self, stdout: &[u8]) -> Result<Self::Receipt, Self::Error> {
-        parse_receipt(stdout).map_err(Into::into)
-    }
 }
 
 #[derive(Debug, Error)]
 pub enum DreaminaCliPolicyError {
     #[error(transparent)]
     Command(#[from] CommandSpecError),
-    #[error(transparent)]
-    Receipt(#[from] ReceiptError),
     #[error("Dreamina account home and execution workspace must not overlap")]
     OverlappingDirectories,
     #[error("Dreamina execution supports exactly one output per submission")]

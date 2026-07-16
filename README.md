@@ -50,6 +50,8 @@ The inactive gated CLI process protocol, crash evidence, and containment limits 
 [`docs/architecture/2026-phase2n-gated-cli-submit-runner.md`](docs/architecture/2026-phase2n-gated-cli-submit-runner.md).
 The inactive gated submit composition, static driver boundary, and crash-window recovery are documented in
 [`docs/architecture/2026-phase2o-gated-submit-orchestration.md`](docs/architecture/2026-phase2o-gated-submit-orchestration.md).
+The inactive Dreamina canonical submit codec and its gated runtime binding are documented in
+[`docs/architecture/2026-phase2p-dreamina-gated-submit-codec.md`](docs/architecture/2026-phase2p-dreamina-gated-submit-codec.md).
 Database-bound provider profiles and durable capacity are documented in
 [`docs/architecture/2026-phase1g-execution-binding-capacity.md`](docs/architecture/2026-phase1g-execution-binding-capacity.md).
 

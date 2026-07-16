@@ -1,11 +1,16 @@
 #![forbid(unsafe_code)]
 
 mod capabilities;
+mod command;
 mod policy;
 mod receipt;
 mod request;
 
 pub use capabilities::DREAMINA_CLI_REMOTE_TASK_CONTROLS_V1;
+pub use command::{
+    DREAMINA_SUBMIT_COMMAND_SCHEMA, DreaminaSubmitCommandError, DreaminaSubmitPayloadV1,
+    MAX_SUBMIT_COMMAND_BYTES, parse_submit_command,
+};
 pub use policy::{DreaminaCliPolicyError, DreaminaCliPolicyV1, DreaminaSubmitRequestV1};
 pub use receipt::{
     AcceptedReceipt, AcceptedStatus, MAX_FAIL_REASON_CHARS, MAX_RECEIPT_BYTES, ReceiptError,

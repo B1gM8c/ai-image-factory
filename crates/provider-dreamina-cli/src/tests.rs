@@ -1,9 +1,8 @@
 use std::{ffi::OsString, fs, os::unix::fs::PermissionsExt, path::PathBuf, time::Duration};
 
-use image_cli_runtime::{
-    CliRuntime, NoopSpawnObserver, ReceiptCliPolicy, VerifiedExecutable, WorkingDirectory,
-};
+use image_cli_runtime::WorkingDirectory;
 use image_provider_contracts::{CallbackMode, CancellationMode, all_provider_roadmap};
+use image_provider_sdk::{OutputSlot, SingleOutputCommand};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
@@ -281,6 +280,75 @@ fn generation_argv_is_shell_free_and_keeps_injection_text_in_one_argument() {
 }
 
 #[test]
+fn canonical_submit_payload_is_stable_strict_and_single_output() {
+    let request = TextToImageRequestV1::new(
+        "a red fox",
+        ImageModelVersion::V5_0,
+        ImageRatio::R16x9,
+        ImageResolution::K2,
+        1,
+    )
+    .unwrap();
+    let command = SingleOutputCommand::new(
+        OutputSlot::new(0, 1).unwrap(),
+        DreaminaSubmitPayloadV1::new("a".repeat(64), request.clone().into()).unwrap(),
+    )
+    .unwrap();
+    let expected = br#"{"operation":"text2image","schema_version":1,"prompt":"a red fox","model_version":"5.0","ratio":"16:9","resolution_type":"2k","generate_num":1,"poll":0}"#;
+
+    assert_eq!(command.schema_id(), DREAMINA_SUBMIT_COMMAND_SCHEMA);
+    assert_eq!(command.adapter_revision(), ADAPTER_REVISION);
+    assert_eq!(command.canonical_payload(), expected);
+    assert_eq!(
+        parse_submit_command(command.canonical_payload()).unwrap(),
+        DreaminaSubmitRequestV1::TextToImage(request)
+    );
+
+    let batch = TextToImageRequestV1::new(
+        "two outputs",
+        ImageModelVersion::V5_0,
+        ImageRatio::R1x1,
+        ImageResolution::K2,
+        2,
+    )
+    .unwrap();
+    assert_eq!(
+        DreaminaSubmitPayloadV1::new("a".repeat(64), batch.into()),
+        Err(DreaminaSubmitCommandError::BatchSubmissionUnsupported)
+    );
+    assert_eq!(
+        DreaminaSubmitPayloadV1::new(
+            "not-a-digest",
+            DreaminaSubmitRequestV1::TextToImage(
+                TextToImageRequestV1::new(
+                    "prompt",
+                    ImageModelVersion::V5_0,
+                    ImageRatio::R1x1,
+                    ImageResolution::K2,
+                    1,
+                )
+                .unwrap(),
+            )
+        ),
+        Err(DreaminaSubmitCommandError::InvalidSourceCommand)
+    );
+}
+
+#[test]
+fn canonical_submit_parser_rejects_drift_and_revalidates_official_options() {
+    for invalid in [
+        br#"{"operation":"text2image","schema_version":2,"prompt":"p","model_version":"5.0","ratio":"1:1","resolution_type":"2k","generate_num":1,"poll":0}"#.as_slice(),
+        br#"{"operation":"text2image","schema_version":1,"prompt":"p","model_version":"5.0","ratio":"1:1","resolution_type":"2k","generate_num":1,"poll":1}"#.as_slice(),
+        br#"{"operation":"text2image","schema_version":1,"prompt":"p","model_version":"future","ratio":"1:1","resolution_type":"2k","generate_num":1,"poll":0}"#.as_slice(),
+        br#"{"operation":"text2image","schema_version":1,"prompt":"p","model_version":"5.0","ratio":"1:1","resolution_type":"2k","generate_num":2,"poll":0}"#.as_slice(),
+        br#"{"operation":"text2image","schema_version":1,"prompt":"p","model_version":"5.0","ratio":"1:1","resolution_type":"2k","generate_num":1,"poll":0,"unknown":true}"#.as_slice(),
+        br#"{"operation":"text2image","schema_version":1,"prompt":"p","model_version":"5.0","ratio":"1:1","resolution_type":"2k","generate_num":1,"poll":0}{}"#.as_slice(),
+    ] {
+        assert!(parse_submit_command(invalid).is_err(), "{invalid:?}");
+    }
+}
+
+#[test]
 fn query_result_projects_submit_id_and_download_directory_exactly() {
     let request = QueryResultRequestV1::new("task-1", PathBuf::from("/tmp/output dir")).unwrap();
     assert_eq!(
@@ -423,8 +491,8 @@ fn capability_metadata_is_polling_only() {
     );
 }
 
-#[tokio::test]
-async fn policy_runs_a_digest_pinned_cli_with_an_isolated_home_and_bounded_receipt() {
+#[test]
+fn policy_projects_a_digest_pinned_cli_with_an_isolated_home() {
     let root = TempDir::new().expect("temp directory");
     let workspace = root.path().join("workspace");
     let account_home = root.path().join("account-home");
@@ -440,13 +508,12 @@ printf '{"submit_id":"task-1","gen_status":"querying"}'
     fs::set_permissions(&executable_path, fs::Permissions::from_mode(0o500))
         .expect("executable permissions");
     let digest: [u8; 32] = Sha256::digest(executable_bytes).into();
-    let executable = VerifiedExecutable::new_with_sha256(&executable_path, digest)
-        .expect("digest-pinned executable");
     let working_directory = WorkingDirectory::new(&workspace).expect("verified workspace");
     let account_home = WorkingDirectory::new(&account_home).expect("verified account home");
     assert!(matches!(
         DreaminaCliPolicyV1::new(
-            executable.clone(),
+            &executable_path,
+            digest,
             working_directory.clone(),
             working_directory.clone(),
             Duration::from_secs(2),
@@ -455,7 +522,8 @@ printf '{"submit_id":"task-1","gen_status":"querying"}'
         Err(DreaminaCliPolicyError::OverlappingDirectories)
     ));
     let policy = DreaminaCliPolicyV1::new(
-        executable,
+        &executable_path,
+        digest,
         working_directory,
         account_home.clone(),
         Duration::from_secs(2),
@@ -479,21 +547,38 @@ printf '{"submit_id":"task-1","gen_status":"querying"}'
     )
     .expect("official batch request");
     assert!(matches!(
-        ReceiptCliPolicy::command(&policy, &batch.into()),
+        policy.command_spec(&batch.into()),
         Err(DreaminaCliPolicyError::BatchSubmissionUnsupported)
     ));
-    let result = CliRuntime::new(policy)
-        .run_receipt(&request.into(), &mut NoopSpawnObserver)
-        .await
-        .expect("accepted receipt");
-
-    assert_eq!(result.receipt.submit_id(), "task-1");
+    let command = policy
+        .command_spec(&request.into())
+        .expect("projected command");
     assert_eq!(
-        fs::read_to_string(workspace.join("home")).expect("captured home"),
-        account_home.path().to_string_lossy()
+        command.executable().path(),
+        fs::canonicalize(&executable_path).unwrap()
     );
-    let argv = fs::read_to_string(workspace.join("argv")).expect("captured argv");
-    assert!(argv.contains("image; $(touch should-not-run)\n"));
-    assert!(argv.ends_with("--poll=0\n"));
+    assert_eq!(
+        command
+            .environment()
+            .get(std::ffi::OsStr::new("HOME"))
+            .map(OsString::as_os_str),
+        Some(account_home.path().as_os_str())
+    );
+    assert_eq!(
+        command
+            .environment()
+            .get(std::ffi::OsStr::new("TMPDIR"))
+            .map(OsString::as_os_str),
+        Some(fs::canonicalize(&workspace).unwrap().as_os_str())
+    );
+    assert!(
+        command
+            .arguments()
+            .contains(&OsString::from("image; $(touch should-not-run)"))
+    );
+    assert_eq!(
+        command.arguments().last(),
+        Some(&OsString::from("--poll=0"))
+    );
     assert!(!workspace.join("should-not-run").exists());
 }
