@@ -4,6 +4,7 @@ compile_error!("image-cli-runtime supports Unix platforms only");
 mod command;
 mod output;
 mod process;
+mod workspace;
 
 use std::{fmt::Display, io::Write, process::ExitStatus};
 
@@ -19,6 +20,10 @@ pub use output::{
 pub use process::{
     CapturedStream, MAX_CAPTURED_STREAM_BYTES, NoopSpawnObserver, ProcessBackend,
     ProcessCompletion, ProcessError, SpawnEvidence, SpawnObserver, TokioProcessBackend,
+};
+pub use workspace::{
+    ATTEMPT_WORKSPACE_LOCK_FILENAME, AttemptDirectory, AttemptWorkspaceError,
+    ExclusiveAttemptWorkspace,
 };
 
 pub trait CliPolicy {

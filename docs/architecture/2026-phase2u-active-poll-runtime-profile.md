@@ -223,6 +223,10 @@ Phase 2V implements and locally verifies the first provider-specific,
 image-only poll driver without activating Dreamina:
 [`2026-phase2v-inactive-dreamina-image-poll-driver.md`](2026-phase2v-inactive-dreamina-image-poll-driver.md).
 
+Phase 2W binds that driver to an exclusive descriptor-relative attempt
+workspace with startup crash recovery:
+[`2026-phase2w-exclusive-cli-attempt-workspace.md`](2026-phase2w-exclusive-cli-attempt-workspace.md).
+
 The remaining gate is inactive service composition: load this Phase 2U
 profile, resolve an isolated account home through a credential broker,
 construct the digest-pinned driver, and prove the Phase 2T daemon against real

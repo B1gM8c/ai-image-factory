@@ -37,7 +37,7 @@ async fn pending_and_terminal_failure_require_an_empty_download_directory() {
     );
     assert!(sink.bytes().is_empty());
     assert_eq!(sink.finalize_count(), 0);
-    pending.assert_workspace_empty();
+    pending.assert_workspace_has_no_attempts();
 
     let failed = Fixture::new(
         r#"printf '{"submit_id":"%s","gen_status":"fail","fail_reason":"denied"}' "$submit""#,
@@ -57,7 +57,7 @@ async fn pending_and_terminal_failure_require_an_empty_download_directory() {
     assert_eq!(failure.retry(), RetryDirective::Never);
     assert!(sink.bytes().is_empty());
     assert_eq!(sink.finalize_count(), 0);
-    failed.assert_workspace_empty();
+    failed.assert_workspace_has_no_attempts();
 }
 
 #[tokio::test]
@@ -90,7 +90,7 @@ printf '{"submit_id":"%s","gen_status":"success"}' "$submit""#,
             .iter()
             .all(|size| *size <= image_cli_runtime::STREAM_BUFFER_BYTES)
     );
-    fixture.assert_workspace_empty();
+    fixture.assert_workspace_has_no_attempts();
 }
 
 #[tokio::test]
@@ -106,7 +106,7 @@ async fn mismatched_receipts_and_multiple_outputs_fail_closed() {
     assert_eq!(failure.code(), "dreamina_poll_receipt_mismatch");
     assert_eq!(failure.retry(), RetryDirective::Never);
     assert!(sink.bytes().is_empty());
-    mismatch.assert_workspace_empty();
+    mismatch.assert_workspace_has_no_attempts();
 
     let multiple = Fixture::new(
         r#"printf x > "$download/one.png"
@@ -123,7 +123,7 @@ printf '{"submit_id":"%s","gen_status":"success"}' "$submit""#,
     assert_eq!(failure.code(), "dreamina_poll_artifact_invalid");
     assert_eq!(failure.retry(), RetryDirective::Never);
     assert!(sink.bytes().is_empty());
-    multiple.assert_workspace_empty();
+    multiple.assert_workspace_has_no_attempts();
 
     let invalid_media = Fixture::new(
         r#"printf 'not-an-image' > "$download/result.bin"
@@ -139,7 +139,7 @@ printf '{"submit_id":"%s","gen_status":"success"}' "$submit""#,
     assert_eq!(failure.code(), "dreamina_poll_media_invalid");
     assert_eq!(sink.bytes(), b"not-an-image");
     assert_eq!(sink.finalize_count(), 0);
-    invalid_media.assert_workspace_empty();
+    invalid_media.assert_workspace_has_no_attempts();
 
     let oversized = Fixture::new(
         r#"printf '12345' > "$download/result.png"
@@ -154,7 +154,7 @@ printf '{"submit_id":"%s","gen_status":"success"}' "$submit""#,
         .unwrap_err();
     assert_eq!(failure.code(), "dreamina_poll_artifact_invalid");
     assert!(sink.bytes().is_empty());
-    oversized.assert_workspace_empty();
+    oversized.assert_workspace_has_no_attempts();
 }
 
 #[tokio::test]
@@ -176,7 +176,7 @@ printf '{"submit_id":"%s","gen_status":"success"}' "$submit""#,
     assert_eq!(failure.code(), "dreamina_poll_manifest_mismatch");
     assert_eq!(sink.bytes(), bytes);
     assert_eq!(sink.finalize_count(), 1);
-    fixture.assert_workspace_empty();
+    fixture.assert_workspace_has_no_attempts();
 }
 
 #[tokio::test]
@@ -213,7 +213,7 @@ async fn canceling_a_poll_future_terminates_the_query_process_and_cleans_the_att
     wait_for_process_exit(pid).await;
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
-            if workspace_is_empty(&fixture.workspace) {
+            if workspace_has_no_attempts(&fixture.workspace) {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
@@ -221,6 +221,30 @@ async fn canceling_a_poll_future_terminates_the_query_process_and_cleans_the_att
     })
     .await
     .expect("canceled attempt is cleaned");
+}
+
+#[tokio::test]
+async fn replacing_the_workspace_root_fails_before_the_query_process_starts() {
+    let fixture = Fixture::new(
+        r#"printf called > "$HOME/query-called"
+printf '{"submit_id":"%s","gen_status":"querying"}' "$submit""#,
+    );
+    let driver = fixture.driver(1024);
+    let moved = fixture._root.path().join("moved-workspace");
+    fs::rename(&fixture.workspace, &moved).unwrap();
+    fs::create_dir(&fixture.workspace).unwrap();
+    fs::set_permissions(&fixture.workspace, fs::Permissions::from_mode(0o700)).unwrap();
+    let operation = fixture.operation();
+    let mut sink = fixture.sink([0_u8; 32]);
+
+    let failure = driver
+        .poll_operation(&operation, &mut sink)
+        .await
+        .unwrap_err();
+
+    assert_eq!(failure.code(), "dreamina_poll_workspace_invalid");
+    assert!(!fixture.account_home.join("query-called").exists());
+    assert!(workspace_has_no_attempts(&fixture.workspace));
 }
 
 #[test]
@@ -232,14 +256,44 @@ fn driver_rejects_unsafe_workspace_and_unbounded_artifact_limits() {
             fixture.binding.clone(),
             MAX_ARTIFACT_BYTES + 1,
         ),
-        Err(DreaminaCliPollDriverConfigError)
+        Err(DreaminaCliPollDriverConfigError::InvalidArtifactLimit)
     ));
 
     fs::set_permissions(&fixture.workspace, fs::Permissions::from_mode(0o755)).unwrap();
     assert!(matches!(
         DreaminaCliPollDriverV1::new(fixture.policy(), fixture.binding, 1024),
-        Err(DreaminaCliPollDriverConfigError)
+        Err(DreaminaCliPollDriverConfigError::Workspace(
+            AttemptWorkspaceError::Integrity
+        ))
     ));
+}
+
+#[test]
+fn driver_cleans_crash_left_attempts_and_exclusively_owns_the_workspace() {
+    let fixture = Fixture::new("printf '{}'");
+    let crashed = fixture
+        .workspace
+        .join(format!("{DREAMINA_POLL_ATTEMPT_PREFIX}crash-left"));
+    fs::create_dir(&crashed).unwrap();
+    fs::set_permissions(&crashed, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::create_dir(crashed.join("nested")).unwrap();
+    fs::write(crashed.join("nested/artifact.bin"), b"stale").unwrap();
+
+    let owner = fixture.driver(1024);
+
+    assert!(!crashed.exists());
+    assert!(matches!(
+        DreaminaCliPollDriverV1::new(fixture.policy(), fixture.binding.clone(), 1024),
+        Err(DreaminaCliPollDriverConfigError::Workspace(
+            AttemptWorkspaceError::AlreadyLocked
+        ))
+    ));
+    drop(owner);
+    if let Err(error) =
+        DreaminaCliPollDriverV1::new(fixture.policy(), fixture.binding.clone(), 1024)
+    {
+        panic!("workspace lock was not reacquired: {error:?}");
+    }
 }
 
 #[test]
@@ -353,13 +407,19 @@ done
         )
     }
 
-    fn assert_workspace_empty(&self) {
-        assert!(workspace_is_empty(&self.workspace));
+    fn assert_workspace_has_no_attempts(&self) {
+        assert!(workspace_has_no_attempts(&self.workspace));
     }
 }
 
-fn workspace_is_empty(path: &Path) -> bool {
-    fs::read_dir(path).unwrap().next().is_none()
+fn workspace_has_no_attempts(path: &Path) -> bool {
+    fs::read_dir(path).unwrap().all(|entry| {
+        !entry
+            .unwrap()
+            .file_name()
+            .as_encoded_bytes()
+            .starts_with(DREAMINA_POLL_ATTEMPT_PREFIX.as_bytes())
+    })
 }
 
 fn png_bytes(color: [u8; 4]) -> Vec<u8> {

@@ -142,6 +142,10 @@ impl DreaminaCliQueryPolicyV1 {
         self.workspace_root.path()
     }
 
+    pub fn workspace_root_directory(&self) -> &WorkingDirectory {
+        &self.workspace_root
+    }
+
     pub fn command_spec(
         &self,
         request: &QueryResultRequestV1,

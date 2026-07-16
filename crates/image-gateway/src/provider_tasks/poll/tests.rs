@@ -609,8 +609,9 @@ printf '{"submit_id":"%s","gen_status":"querying"}' "$submit"
         })
     ));
     assert!(account_home.join("query-called").is_file());
-    assert!(fs::read_dir(&workspace).unwrap().next().is_none());
+    assert!(dreamina_workspace_has_no_attempts(&workspace));
     fs::remove_file(account_home.join("query-called")).unwrap();
+    drop(orchestrator);
 
     let wrong_account_id = Uuid::from_u128(11);
     let wrong_store = FakeStore::with_lease(dreamina_lease(wrong_account_id));
@@ -637,7 +638,7 @@ printf '{"submit_id":"%s","gen_status":"querying"}' "$submit"
             if error_code == "dreamina_poll_binding_mismatch"
     ));
     assert!(!account_home.join("query-called").exists());
-    assert!(fs::read_dir(&workspace).unwrap().next().is_none());
+    assert!(dreamina_workspace_has_no_attempts(&workspace));
 }
 
 fn orchestrator<D: ProviderPollDriver>(
@@ -745,6 +746,16 @@ fn dreamina_lease(provider_account_id: Uuid) -> ProviderTaskLease {
     lease.context.operation_id = "images.generations".to_owned();
     lease.context.adapter_revision = DREAMINA_ADAPTER_REVISION.to_owned();
     lease
+}
+
+fn dreamina_workspace_has_no_attempts(path: &std::path::Path) -> bool {
+    fs::read_dir(path).unwrap().all(|entry| {
+        !entry
+            .unwrap()
+            .file_name()
+            .as_encoded_bytes()
+            .starts_with(b".dreamina-poll-")
+    })
 }
 
 fn authority(lease: &ProviderTaskLease, bytes: &[u8]) -> ProviderArtifactAuthority {

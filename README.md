@@ -69,6 +69,9 @@ and durable lane derivation are documented in
 The inactive Dreamina image poll driver, bounded query materialization, and
 account-fenced local process verification are documented in
 [`docs/architecture/2026-phase2v-inactive-dreamina-image-poll-driver.md`](docs/architecture/2026-phase2v-inactive-dreamina-image-poll-driver.md).
+The provider-neutral exclusive CLI attempt workspace, descriptor-relative
+crash recovery, and root-replacement fencing are documented in
+[`docs/architecture/2026-phase2w-exclusive-cli-attempt-workspace.md`](docs/architecture/2026-phase2w-exclusive-cli-attempt-workspace.md).
 Database-bound provider profiles and durable capacity are documented in
 [`docs/architecture/2026-phase1g-execution-binding-capacity.md`](docs/architecture/2026-phase1g-execution-binding-capacity.md).
 

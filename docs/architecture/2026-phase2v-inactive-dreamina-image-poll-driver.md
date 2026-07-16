@@ -102,17 +102,17 @@ TMPDIR=<fresh poll attempt directory>
 ```
 
 The download directory must be exactly one direct child of the configured
-workspace root. The driver creates it with mode `0700`, canonicalizes it, and
-binds the open directory descriptor before process launch.
+workspace root. Phase 2W now makes the driver hold one exclusive workspace
+authority and create each attempt relative to the already-bound root
+descriptor. The attempt is mode `0700`, and its public path must resolve to
+the same open directory descriptor before process launch.
 
 Dropping the poll future drops the CLI runtime future. The existing process
 runtime terminates the process group and waits through its bounded termination
-contract. The per-attempt `TempDir` is then removed during ordinary
-cancellation and error unwinding.
-
-This is graceful-process cleanup, not crash cleanup. `SIGKILL`, host loss, or a
-runtime abort can leave an attempt directory. A startup or periodic janitor
-with the same ownership and age fencing is still required before activation.
+contract. The Phase 2W attempt capability removes contents relative to its
+held descriptors during ordinary cancellation and error unwinding. `SIGKILL`,
+host loss, or a runtime abort may still leave an attempt directory; the next
+exclusive driver startup removes exact-prefix residue before accepting work.
 
 ## Receipt Semantics
 
@@ -256,7 +256,6 @@ Phase 2V does not provide:
   daemon;
 - credential secret resolution, login, refresh, or revocation;
 - executable installation or an approved production digest;
-- crash-left attempt-directory cleanup;
 - provider query rate limiting, cooldown, circuit breaking, quota probing, or
   account rotation;
 - spend reservation or Dreamina-specific billing evidence;
@@ -271,16 +270,19 @@ would be an unsafe contract change.
 
 ## Next Gate
 
-Phase 2W should compose an inactive, runnable provider poll service without
-activating Dreamina:
+Phase 2W closes the provider-neutral exclusive attempt workspace and
+crash-recovery prerequisite:
+[`2026-phase2w-exclusive-cli-attempt-workspace.md`](2026-phase2w-exclusive-cli-attempt-workspace.md).
+
+The next phase should compose an inactive, runnable provider poll service
+without activating Dreamina:
 
 1. load one Phase 2U profile and derive the exact provider/account claim scope;
 2. resolve credentials through a narrow broker that returns an isolated
    account home without exposing secret bytes to provider code;
 3. verify the executable digest and construct one provider-specific driver;
 4. construct the Phase 2T daemon with durable lane and artifact limits;
-5. add startup/shutdown, crash-left workspace janitor, metrics, and redacted
-   diagnostics;
+5. add startup/shutdown, metrics, and redacted diagnostics;
 6. prove the service with local fake CLI plus real PostgreSQL leases; and
 7. keep provider activation, external calls, and video support disabled.
 

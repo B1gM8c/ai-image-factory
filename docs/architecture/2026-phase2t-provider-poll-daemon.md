@@ -262,6 +262,10 @@ Phase 2U closes selected provider/account profile loading. Phase 2V implements
 and locally verifies the inactive Dreamina image poll driver:
 [`2026-phase2v-inactive-dreamina-image-poll-driver.md`](2026-phase2v-inactive-dreamina-image-poll-driver.md).
 
+Phase 2W adds exclusive descriptor-relative attempt ownership and startup
+crash recovery:
+[`2026-phase2w-exclusive-cli-attempt-workspace.md`](2026-phase2w-exclusive-cli-attempt-workspace.md).
+
 The next gate is a runnable but inactive service composition with credential
-broker binding, crash-left workspace cleanup, redacted metrics, and real
-PostgreSQL lease verification. Dreamina and Grok remain disabled.
+broker binding, redacted metrics, and real PostgreSQL lease verification.
+Dreamina and Grok remain disabled.

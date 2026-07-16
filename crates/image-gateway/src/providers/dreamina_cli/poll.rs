@@ -1,12 +1,12 @@
-use std::{
-    fs,
-    os::unix::fs::{MetadataExt, PermissionsExt},
-    path::Path,
+use super::DreaminaCliRuntimeBindingV1;
+use crate::{
+    artifacts::MAX_ARTIFACT_BYTES,
+    provider_tasks::{ProviderPollDriver, ProviderPollDriverCall},
 };
-
 use image_cli_runtime::{
-    AsyncOutputSealError, AsyncOutputSink, CliRuntime, FreshOutputDirectory, NoopSpawnObserver,
-    OutputError, ProcessError, RuntimeError, WorkingDirectory,
+    AsyncOutputSealError, AsyncOutputSink, AttemptWorkspaceError, CliRuntime,
+    ExclusiveAttemptWorkspace, FreshOutputDirectory, NoopSpawnObserver, OutputError, ProcessError,
+    RuntimeError,
 };
 use image_provider_dreamina_cli::{
     ADAPTER_REVISION, DREAMINA_SUBMIT_COMMAND_SCHEMA, DreaminaCliQueryPolicyV1,
@@ -17,22 +17,16 @@ use image_provider_sdk::{
     EffectCertainty, PollObservation, ProviderFailure, ProviderFailureClass, RemoteOperationRef,
     RetryDirective,
 };
-use tempfile::Builder;
-
-use super::DreaminaCliRuntimeBindingV1;
-use crate::{
-    artifacts::MAX_ARTIFACT_BYTES,
-    provider_tasks::{ProviderPollDriver, ProviderPollDriverCall},
-};
 
 const DEFAULT_POLL_AFTER_MS: u64 = 1_000;
 const MEDIA_PREFIX_BYTES: usize = 12;
+const DREAMINA_POLL_ATTEMPT_PREFIX: &str = ".dreamina-poll-";
 
-#[derive(Clone)]
 pub struct DreaminaCliPollDriverV1 {
     runtime: CliRuntime<DreaminaCliQueryPolicyV1>,
     binding: DreaminaCliRuntimeBindingV1,
     max_artifact_bytes: u64,
+    workspace: ExclusiveAttemptWorkspace,
 }
 
 impl DreaminaCliPollDriverV1 {
@@ -41,15 +35,19 @@ impl DreaminaCliPollDriverV1 {
         binding: DreaminaCliRuntimeBindingV1,
         max_artifact_bytes: u64,
     ) -> Result<Self, DreaminaCliPollDriverConfigError> {
-        if !(1..=MAX_ARTIFACT_BYTES).contains(&max_artifact_bytes)
-            || !private_workspace_root(policy.workspace_root())
-        {
-            return Err(DreaminaCliPollDriverConfigError);
+        if !(1..=MAX_ARTIFACT_BYTES).contains(&max_artifact_bytes) {
+            return Err(DreaminaCliPollDriverConfigError::InvalidArtifactLimit);
         }
+        let workspace = ExclusiveAttemptWorkspace::acquire(
+            policy.workspace_root_directory(),
+            DREAMINA_POLL_ATTEMPT_PREFIX,
+        )
+        .map_err(DreaminaCliPollDriverConfigError::Workspace)?;
         Ok(Self {
             runtime: CliRuntime::new(policy),
             binding,
             max_artifact_bytes,
+            workspace,
         })
     }
 
@@ -58,16 +56,14 @@ impl DreaminaCliPollDriverV1 {
         operation: &RemoteOperationRef,
         sink: &mut S,
     ) -> Result<PollObservation, ProviderFailure> {
-        let workspace = Builder::new()
-            .prefix(".dreamina-poll-")
-            .tempdir_in(self.runtime.policy().workspace_root())
-            .map_err(|_| retryable_failure("dreamina_poll_workspace_unavailable"))?;
-        fs::set_permissions(workspace.path(), fs::Permissions::from_mode(0o700))
-            .map_err(|_| retryable_failure("dreamina_poll_workspace_unavailable"))?;
-        let download_dir = fs::canonicalize(workspace.path())
-            .map_err(|_| retryable_failure("dreamina_poll_workspace_unavailable"))?;
-        let working_directory = WorkingDirectory::new(&download_dir)
-            .map_err(|_| retryable_failure("dreamina_poll_workspace_unavailable"))?;
+        let attempt = self
+            .workspace
+            .create_attempt()
+            .map_err(map_attempt_workspace_error)?;
+        let download_dir = attempt.path().to_path_buf();
+        let working_directory = attempt
+            .working_directory()
+            .map_err(map_attempt_workspace_error)?;
         let output = FreshOutputDirectory::new(&working_directory, self.max_artifact_bytes)
             .map_err(map_fresh_output_error)?;
         let request = QueryResultRequestV1::new(operation.operation_id(), &download_dir)
@@ -188,12 +184,17 @@ where
     }
 }
 
-fn private_workspace_root(path: &Path) -> bool {
-    fs::metadata(path).is_ok_and(|metadata| {
-        metadata.is_dir()
-            && metadata.mode() & 0o7777 == 0o700
-            && metadata.uid() == unsafe { libc::geteuid() }
-    })
+fn map_attempt_workspace_error(error: AttemptWorkspaceError) -> ProviderFailure {
+    match error {
+        AttemptWorkspaceError::Unavailable => {
+            retryable_failure("dreamina_poll_workspace_unavailable")
+        }
+        AttemptWorkspaceError::InvalidConfiguration
+        | AttemptWorkspaceError::Integrity
+        | AttemptWorkspaceError::AlreadyLocked => {
+            contract_failure("dreamina_poll_workspace_invalid")
+        }
+    }
 }
 
 fn image_media_type(prefix: &[u8]) -> Option<&'static str> {
@@ -314,9 +315,13 @@ fn terminal_failure(code: &'static str) -> ProviderFailure {
     .expect("static Dreamina terminal failure must be valid")
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
-#[error("Dreamina CLI poll driver configuration is invalid")]
-pub struct DreaminaCliPollDriverConfigError;
+#[derive(Debug, thiserror::Error)]
+pub enum DreaminaCliPollDriverConfigError {
+    #[error("Dreamina CLI poll artifact limit is invalid")]
+    InvalidArtifactLimit,
+    #[error("Dreamina CLI poll workspace configuration is invalid")]
+    Workspace(#[source] AttemptWorkspaceError),
+}
 
 #[cfg(test)]
 mod tests;
