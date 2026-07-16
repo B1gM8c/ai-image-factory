@@ -145,8 +145,9 @@ more lanes than connections. There is no unbounded task creation per item, no
 in-memory work queue, and no process-global mutex around provider execution.
 
 This phase does not claim that one lane per provider slot is optimal at every
-scale. Mixed-load benchmarks are still required before changing the current
-simple mapping or claiming throughput leadership.
+scale. The first isolated mixed-load benchmark is now recorded in Phase 2AC;
+production-scale cardinality, pool-saturation, journal, and provider latency
+evidence remain activation gates.
 
 ## Shutdown And Restart
 
@@ -320,8 +321,8 @@ This phase does not provide:
 
 Before any provider activation:
 
-1. benchmark mixed fresh/recovery load, PostgreSQL lock wait, pool saturation,
-   allocations, journal synchronization cost, and scheduling p50/p95/p99;
+1. extend the Phase 2AC mixed fresh/recovery benchmark to production-scale
+   cardinality, pool saturation, journal synchronization, and provider latency;
 2. add operational readiness/health semantics that distinguish configured,
    active, draining, and blocked profile states;
 3. add credential-source and rotation capabilities without exposing provider

@@ -1,0 +1,15 @@
+[package]
+name = "provider-submit-bench"
+version = "0.1.0"
+edition.workspace = true
+publish = false
+
+[dependencies]
+gpt-image-2-gateway = { path = "../../crates/image-gateway" }
+image-provider-sdk = { path = "../../crates/provider-sdk" }
+image-provider-test-support = { path = "../../crates/provider-test-support" }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+sqlx = { version = "0.9.0", default-features = false, features = ["postgres", "runtime-tokio", "uuid"] }
+tokio = { version = "1.52.3", features = ["macros", "rt-multi-thread", "sync", "time", "fs"] }
+uuid = { version = "1.23.4", features = ["v4", "fast-rng"] }

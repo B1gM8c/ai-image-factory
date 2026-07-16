@@ -7,6 +7,7 @@ members = [
     "crates/provider-sdk",
     "crates/provider-test-support",
     "crates/scheduler-policy",
+    "tools/provider-submit-bench",
 ]
 resolver = "3"
 

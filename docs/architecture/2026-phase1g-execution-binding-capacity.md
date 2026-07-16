@@ -67,7 +67,8 @@ executor submissions to be drained.
 
 Claim uses one PostgreSQL transaction:
 
-1. lock and validate the enabled profile and exact policy revision;
+1. take concurrent shared locks on the enabled profile, credential pool, and
+   account, and validate the exact policy revision;
 2. select a matching prepared or expired-unstarted execution;
 3. for a fresh execution, increment `allocated_count` only below the policy
    limit and insert a held allocation;
@@ -75,10 +76,13 @@ Claim uses one PostgreSQL transaction:
 5. transition the executor to leased with the next epoch;
 6. commit before `start()` may grant runner launch authority.
 
-Profile-row locking serializes allocation changes for the exact resource
-policy. Deferred database constraints require `allocated_count` to equal the
-number of held allocations at commit, so direct counter edits and partial
-transactions fail closed.
+Shared configuration locks allow claims for one profile to proceed
+concurrently while still fencing profile, pool, and account disable updates.
+The atomic `allocated_count` update remains the exact policy-level capacity
+fence and therefore the remaining single-row contention point. Deferred
+database constraints require `allocated_count` to equal the number of held
+allocations at commit, so direct counter edits and partial transactions fail
+closed.
 
 ## 4. Release
 

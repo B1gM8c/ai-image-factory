@@ -22,6 +22,8 @@ crates/
   scheduler-policy/       Provider-neutral weighted scheduling policy
 docs/
   architecture/           Decisions, activation gates, and target boundaries
+tools/
+  provider-submit-bench/  Isolated PostgreSQL submit-scheduler benchmark
 ```
 
 The authoritative target design is
@@ -88,6 +90,9 @@ The inactive provider submit process, shared frozen runtime profile, exact
 Dreamina account/descriptor binding, graceful drain, and restart no-resubmit
 proof are documented in
 [`docs/architecture/2026-phase2ab-inactive-provider-submit-service.md`](docs/architecture/2026-phase2ab-inactive-provider-submit-service.md).
+The isolated mixed fresh/recovery benchmark, measured lock-contention fix, and
+remaining capacity hot-row gate are documented in
+[`docs/architecture/2026-phase2ac-provider-submit-scheduler-benchmark.md`](docs/architecture/2026-phase2ac-provider-submit-scheduler-benchmark.md).
 Database-bound provider profiles and durable capacity are documented in
 [`docs/architecture/2026-phase1g-execution-binding-capacity.md`](docs/architecture/2026-phase1g-execution-binding-capacity.md).
 
@@ -102,6 +107,9 @@ cargo run -p gpt-image-2-gateway --bin reducerd
 cargo run -p gpt-image-2-gateway --bin reconcilerd
 cargo run -p gpt-image-2-gateway --bin provider-pollerd
 cargo run -p gpt-image-2-gateway --bin provider-submitd
+PROVIDER_SUBMIT_BENCH_ACK=isolated-test-database-v1 \
+  TEST_DATABASE_URL=postgresql://... \
+  cargo run --release -p provider-submit-bench
 npm install
 npm run typecheck:admin
 npm run dev:admin

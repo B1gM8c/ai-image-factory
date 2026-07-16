@@ -550,7 +550,8 @@ impl ExecutorSubmissionStore for PostgresExecutorSubmissionStore {
         validate_claim_scope(scope)?;
         let mut tx = self.pool.begin().await.map_err(unavailable)?;
         let now = database_now(&mut tx).await?;
-        let profile = lock_active_execution_profile(&mut tx, scope.execution_profile_id).await?;
+        let profile =
+            lock_active_execution_profile_for_claim(&mut tx, scope.execution_profile_id).await?;
         if profile.provider_id != scope.provider_id
             || profile.command_schema != scope.command_schema
             || profile.adapter_revision != scope.adapter_revision
@@ -1254,7 +1255,53 @@ async fn lock_active_execution_profile(
           AND pool.state = 'enabled'
           AND account.state = 'enabled'
           AND policy.state = 'enabled'
-        FOR UPDATE OF profile, pool, account, policy
+        FOR SHARE OF profile, pool, account, policy
+        "#,
+    )
+    .bind(execution_profile_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(unavailable)?
+    .ok_or(ExecutorSubmissionError::Conflict)
+}
+
+// Configuration rows use shared locks; the policy row is fenced by the later
+// atomic capacity update. Administrative mutations must preserve this order.
+async fn lock_active_execution_profile_for_claim(
+    tx: &mut Transaction<'_, Postgres>,
+    execution_profile_id: Uuid,
+) -> Result<ExecutionProfileRow, ExecutorSubmissionError> {
+    sqlx::query_as(
+        r#"
+        SELECT profile.execution_profile_id, profile.profile_key,
+               profile.provider_id, profile.command_schema,
+               profile.operation_id, profile.operation_descriptor_revision,
+               profile.operation_descriptor_sha256_v1, profile.completion_mode,
+               profile.idempotency_mode, profile.adapter_revision,
+               profile.credential_pool_id, profile.provider_account_id,
+               profile.credential_ref, profile.credential_revision,
+               account.credential_auth_sha256,
+               profile.resource_policy_id, profile.resource_policy_revision,
+               policy.max_concurrency
+        FROM provider_execution_profiles profile
+        JOIN provider_credential_pools pool
+          ON pool.credential_pool_id = profile.credential_pool_id
+         AND pool.provider_id = profile.provider_id
+        JOIN provider_accounts account
+          ON account.provider_account_id = profile.provider_account_id
+         AND account.credential_pool_id = profile.credential_pool_id
+         AND account.provider_id = profile.provider_id
+         AND account.credential_ref = profile.credential_ref
+         AND account.credential_revision = profile.credential_revision
+        JOIN executor_resource_policies policy
+          ON policy.resource_policy_id = profile.resource_policy_id
+         AND policy.revision = profile.resource_policy_revision
+        WHERE profile.execution_profile_id = $1
+          AND profile.state = 'enabled'
+          AND pool.state = 'enabled'
+          AND account.state = 'enabled'
+          AND policy.state = 'enabled'
+        FOR SHARE OF profile, pool, account
         "#,
     )
     .bind(execution_profile_id)
@@ -1294,7 +1341,7 @@ async fn lock_bound_execution_profile(
           ON policy.resource_policy_id = profile.resource_policy_id
          AND policy.revision = profile.resource_policy_revision
         WHERE profile.execution_profile_id = $1
-        FOR UPDATE OF profile, pool, account, policy
+        FOR SHARE OF profile, pool, account, policy
         "#,
     )
     .bind(execution_profile_id)
