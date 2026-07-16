@@ -33,7 +33,7 @@ tracing = "0.1.44"
 tracing-opentelemetry = "0.33.0"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 utoipa = "5.5.0"
-uuid = { version = "1.23.4", features = ["v4", "fast-rng"] }
+uuid = { version = "1.23.4", features = ["v4", "fast-rng", "serde"] }
 
 [dev-dependencies]
 image-provider-test-support = { path = "../provider-test-support" }

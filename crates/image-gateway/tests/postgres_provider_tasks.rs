@@ -9,13 +9,14 @@ use gpt_image_2_gateway::{
     ExecutorSubmissionStore, PostgresExecutorSubmissionStore, PostgresProviderTaskStore,
     ProviderArtifactAuthority, ProviderCapacityEvidence, ProviderCapacityEvidenceOutcome,
     ProviderCapacityReconciliationState, ProviderCapacityReconciliationStore,
-    ProviderCapacityTerminalState, ProviderSubmitAcquire, ProviderSubmitFailureKind,
-    ProviderSubmitIntentState, ProviderSubmitOrchestrator, ProviderSubmitOrchestratorError,
-    ProviderSubmitOutcome, ProviderSubmitRecoveryFence, ProviderSubmitStart, ProviderSubmitWork,
-    ProviderTaskClaimScope, ProviderTaskDeadlineStore, ProviderTaskObservation,
-    ProviderTaskObservationOutcome, ProviderTaskObservationSource, ProviderTaskState,
-    ProviderTaskStore, ProviderTaskStoreError, RemoteTaskAttach, RemoteTaskSubmitFailure,
-    RemoteTaskSubmitReceipt, RemoteTaskSubmitReservation, VerifiedCallbackWakeup,
+    ProviderCapacityTerminalState, ProviderExecutionContext, ProviderSubmitAcquire,
+    ProviderSubmitFailureKind, ProviderSubmitIntent, ProviderSubmitIntentState,
+    ProviderSubmitOrchestrator, ProviderSubmitOrchestratorError, ProviderSubmitOutcome,
+    ProviderSubmitRecoveryFence, ProviderSubmitStart, ProviderSubmitWork, ProviderTaskClaimScope,
+    ProviderTaskDeadlineStore, ProviderTaskObservation, ProviderTaskObservationOutcome,
+    ProviderTaskObservationSource, ProviderTaskState, ProviderTaskStore, ProviderTaskStoreError,
+    RemoteTaskAttach, RemoteTaskSubmitFailure, RemoteTaskSubmitReceipt,
+    RemoteTaskSubmitReservation, VerifiedCallbackWakeup,
     admission::WorkLease,
     database::{connect_test_pool_with_search_path, run_migrations},
 };
@@ -117,12 +118,52 @@ async fn atomic_submit_acquire_elects_one_dispatch_without_reserved_gap() -> Tes
 }
 
 #[tokio::test]
+async fn submit_work_rejects_unjournalable_commands_before_database_acquire() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let lease = seed_running_submission(&database.pool, "command-boundary-worker").await?;
+        for payload in [Vec::new(), vec![b'x'; 1024 * 1024 + 1]] {
+            let command = SingleOutputCommand::new(
+                OutputSlot::new(0, 1).map_err(debug_error)?,
+                TestPayload::bound_to(payload, lease.command_hash.clone()),
+            )
+            .map_err(debug_error)?;
+            require(
+                matches!(
+                    ProviderSubmitWork::<ScriptedFakeProvider>::new(&lease, command),
+                    Err(ProviderSubmitOrchestratorError::InvalidWork)
+                ),
+                "unjournalable canonical command crossed the work boundary",
+            )?;
+        }
+        let intent_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM provider_remote_submit_intents WHERE submission_id = $1",
+        )
+        .bind(lease.submission_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(
+            intent_count == 0,
+            "command validation mutated submit state before acquire",
+        )
+    }
+    .await;
+    database.cleanup().await?;
+    result
+}
+
+#[tokio::test]
 async fn submit_orchestrator_dispatches_once_and_replays_without_resubmit() -> TestResult {
     let Some(database) = TestDatabase::new().await? else {
         return Ok(());
     };
     let result = async {
         let lease = seed_running_submission(&database.pool, "orchestrator-worker").await?;
+        let journal = tempfile::tempdir().map_err(debug_error)?;
+        let journal_root = journal.path().join("remote-submit");
         let provider = ScriptedFakeProvider::default();
         provider.push_submit(SubmitStep::Pending(PendingOperation::new(
             RemoteOperationRef::new(
@@ -139,6 +180,7 @@ async fn submit_orchestrator_dispatches_once_and_replays_without_resubmit() -> T
                 PostgresProviderTaskStore::new(database.pool.clone()),
                 provider.clone(),
                 60_000,
+                &journal_root,
             )
             .map_err(debug_error)?,
         );
@@ -186,6 +228,7 @@ async fn submit_orchestrator_dispatches_once_and_replays_without_resubmit() -> T
             PostgresProviderTaskStore::new(database.pool.clone()),
             provider.clone(),
             120_000,
+            &journal_root,
         )
         .map_err(debug_error)?;
         let replay = restarted
@@ -197,6 +240,241 @@ async fn submit_orchestrator_dispatches_once_and_replays_without_resubmit() -> T
             format!("replay resubmitted or lost task: {replay:?}"),
         )?;
         Ok(())
+    }
+    .await;
+    database.cleanup().await?;
+    result
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn submit_orchestrator_recovers_launch_prefix_before_remote_effect() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let lease = seed_running_submission(&database.pool, "launch-prefix-worker").await?;
+        let store = PostgresProviderTaskStore::new(database.pool.clone());
+        let command = orchestrator_command(&lease);
+        let reservation = RemoteTaskSubmitReservation::new(
+            &lease,
+            format!("provider-submit-{}", lease.submission_id.simple()),
+            command.output(),
+            command.identity(),
+            60_000,
+        );
+        let acquired = store
+            .acquire_submit(&reservation)
+            .await
+            .map_err(debug_error)?;
+        let ProviderSubmitAcquire::Dispatch(authority) = acquired else {
+            return Err(format!("initial acquire did not dispatch: {acquired:?}"));
+        };
+        let journal = tempfile::tempdir().map_err(debug_error)?;
+        let journal_root = journal.path().join("remote-submit");
+        seed_remote_submit_launch_prefix(
+            &journal_root,
+            authority.intent(),
+            authority.context(),
+            &command,
+        )?;
+        drop(authority);
+
+        let provider = ScriptedFakeProvider::default();
+        provider.push_submit(SubmitStep::Pending(PendingOperation::new(
+            RemoteOperationRef::new(
+                "provider-test",
+                lease.submission_id.to_string(),
+                "launch-prefix-operation",
+            )
+            .map_err(debug_error)?,
+            None,
+            None,
+        )));
+        let recovered =
+            ProviderSubmitOrchestrator::new(store, provider.clone(), 60_000, &journal_root)
+                .map_err(debug_error)?
+                .submit(
+                    ProviderSubmitWork::<ScriptedFakeProvider>::new(&lease, command)
+                        .map_err(debug_error)?,
+                )
+                .await
+                .map_err(debug_error)?;
+        require(
+            matches!(recovered, ProviderSubmitOutcome::Attached(ref task)
+                if task.remote_operation_id == "launch-prefix-operation")
+                && provider.calls().submit == 1,
+            format!("launch prefix did not recover exactly once: {recovered:?}"),
+        )
+    }
+    .await;
+    database.cleanup().await?;
+    result
+}
+
+#[tokio::test]
+async fn submit_orchestrator_recovers_durable_receipt_after_database_failure() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let lease = seed_running_submission(&database.pool, "receipt-recovery-worker").await?;
+        let journal = tempfile::tempdir().map_err(debug_error)?;
+        let journal_root = journal.path().join("remote-submit");
+        let provider = ScriptedFakeProvider::default();
+        provider.push_submit(SubmitStep::Pending(PendingOperation::new(
+            RemoteOperationRef::new(
+                "provider-test",
+                lease.submission_id.to_string(),
+                "durable-operation-1",
+            )
+            .map_err(debug_error)?,
+            Some(ProviderRequestId::new("durable-request-1").map_err(debug_error)?),
+            Some(125),
+        )));
+        sqlx::query(
+            r#"
+            CREATE FUNCTION reject_provider_submit_receipt()
+            RETURNS trigger LANGUAGE plpgsql AS $$
+            BEGIN
+              IF NEW.state = 'operation_known' THEN
+                RAISE EXCEPTION 'injected receipt transaction failure';
+              END IF;
+              RETURN NEW;
+            END
+            $$
+            "#,
+        )
+        .execute(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        sqlx::query(
+            r#"
+            CREATE TRIGGER reject_provider_submit_receipt
+            BEFORE UPDATE ON provider_remote_submit_intents
+            FOR EACH ROW EXECUTE FUNCTION reject_provider_submit_receipt()
+            "#,
+        )
+        .execute(&database.pool)
+        .await
+        .map_err(debug_error)?;
+
+        let first = ProviderSubmitOrchestrator::new(
+            PostgresProviderTaskStore::new(database.pool.clone()),
+            provider.clone(),
+            60_000,
+            &journal_root,
+        )
+        .map_err(debug_error)?
+        .submit(orchestrator_work(&lease)?)
+        .await;
+        require(
+            matches!(first, Err(ProviderSubmitOrchestratorError::Store(_)))
+                && provider.calls().submit == 1,
+            format!("receipt fault was not injected after one provider call: {first:?}"),
+        )?;
+        let state_after_failure: String = sqlx::query_scalar(
+            "SELECT state FROM provider_remote_submit_intents WHERE submission_id = $1",
+        )
+        .bind(lease.submission_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(
+            state_after_failure == "sending",
+            format!("failed receipt transaction partially committed: {state_after_failure}"),
+        )?;
+
+        sqlx::query(
+            "DROP TRIGGER reject_provider_submit_receipt ON provider_remote_submit_intents",
+        )
+        .execute(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        sqlx::query("DROP FUNCTION reject_provider_submit_receipt()")
+            .execute(&database.pool)
+            .await
+            .map_err(debug_error)?;
+        let recovered = ProviderSubmitOrchestrator::new(
+            PostgresProviderTaskStore::new(database.pool.clone()),
+            provider.clone(),
+            60_000,
+            &journal_root,
+        )
+        .map_err(debug_error)?
+        .submit(orchestrator_work(&lease)?)
+        .await
+        .map_err(debug_error)?;
+        require(
+            matches!(recovered, ProviderSubmitOutcome::Attached(ref task)
+                if task.remote_operation_id == "durable-operation-1"
+                    && task.provider_request_id.as_deref() == Some("durable-request-1"))
+                && provider.calls().submit == 1,
+            format!("durable receipt was not imported without resubmit: {recovered:?}"),
+        )
+    }
+    .await;
+    database.cleanup().await?;
+    result
+}
+
+#[tokio::test]
+async fn submit_orchestrator_does_not_resubmit_after_released_future_is_aborted() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let lease = seed_running_submission(&database.pool, "released-abort-worker").await?;
+        let journal = tempfile::tempdir().map_err(debug_error)?;
+        let journal_root = journal.path().join("remote-submit");
+        let provider = ScriptedFakeProvider::default();
+        provider.push_submit(SubmitStep::Never);
+        let orchestrator = Arc::new(
+            ProviderSubmitOrchestrator::new(
+                PostgresProviderTaskStore::new(database.pool.clone()),
+                provider.clone(),
+                60_000,
+                &journal_root,
+            )
+            .map_err(debug_error)?,
+        );
+        let running = {
+            let orchestrator = Arc::clone(&orchestrator);
+            let work = orchestrator_work(&lease)?;
+            tokio::spawn(async move { orchestrator.submit(work).await })
+        };
+        for _ in 0..100 {
+            if provider.calls().submit == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        require(
+            provider.calls().submit == 1,
+            "provider future was not reached after durable dispatch release",
+        )?;
+        running.abort();
+        require(
+            running.await.is_err_and(|error| error.is_cancelled()),
+            "in-flight submit task was not aborted at the intended crash window",
+        )?;
+
+        let recovered = ProviderSubmitOrchestrator::new(
+            PostgresProviderTaskStore::new(database.pool.clone()),
+            provider.clone(),
+            60_000,
+            &journal_root,
+        )
+        .map_err(debug_error)?
+        .submit(orchestrator_work(&lease)?)
+        .await
+        .map_err(debug_error)?;
+        require(
+            matches!(recovered, ProviderSubmitOutcome::AwaitingEvidence(ref intent)
+                if intent.state == ProviderSubmitIntentState::Sending)
+                && provider.calls().submit == 1,
+            format!("released submission was retried after abort: {recovered:?}"),
+        )
     }
     .await;
     database.cleanup().await?;
@@ -307,12 +585,14 @@ async fn submit_orchestrator_bounds_a_stuck_provider_future() -> TestResult {
     };
     let result = async {
         let lease = seed_running_submission(&database.pool, "submit-timeout-worker").await?;
+        let journal = tempfile::tempdir().map_err(debug_error)?;
         let provider = ScriptedFakeProvider::default();
         provider.push_submit(SubmitStep::Never);
         let orchestrator = ProviderSubmitOrchestrator::new(
             PostgresProviderTaskStore::new(database.pool.clone()),
             provider.clone(),
             200,
+            journal.path().join("remote-submit"),
         )
         .map_err(debug_error)?;
 
@@ -455,6 +735,7 @@ async fn submit_orchestrator_never_retries_unknown_remote_effect() -> TestResult
     };
     let result = async {
         let lease = seed_running_submission(&database.pool, "uncertain-submit-worker").await?;
+        let journal = tempfile::tempdir().map_err(debug_error)?;
         let provider = ScriptedFakeProvider::default();
         provider.push_submit(SubmitStep::Fail(
             ProviderFailure::new(
@@ -469,6 +750,7 @@ async fn submit_orchestrator_never_retries_unknown_remote_effect() -> TestResult
             PostgresProviderTaskStore::new(database.pool.clone()),
             provider.clone(),
             60_000,
+            journal.path().join("remote-submit"),
         )
         .map_err(debug_error)?;
 
@@ -502,6 +784,7 @@ async fn submit_orchestrator_quarantines_misattributed_receipt() -> TestResult {
     };
     let result = async {
         let lease = seed_running_submission(&database.pool, "receipt-fence-worker").await?;
+        let journal = tempfile::tempdir().map_err(debug_error)?;
         let provider = ScriptedFakeProvider::default();
         provider.push_submit(SubmitStep::Pending(PendingOperation::new(
             RemoteOperationRef::new(
@@ -517,6 +800,7 @@ async fn submit_orchestrator_quarantines_misattributed_receipt() -> TestResult {
             PostgresProviderTaskStore::new(database.pool.clone()),
             provider.clone(),
             60_000,
+            journal.path().join("remote-submit"),
         )
         .map_err(debug_error)?;
 
@@ -6469,6 +6753,82 @@ fn orchestrator_command(lease: &ExecutorSubmissionLease) -> SingleOutputCommand<
         ),
     )
     .expect("provider test command is canonical")
+}
+
+#[cfg(unix)]
+fn seed_remote_submit_launch_prefix(
+    root: &std::path::Path,
+    intent: &ProviderSubmitIntent,
+    context: &ProviderExecutionContext,
+    command: &SingleOutputCommand<TestPayload>,
+) -> TestResult {
+    use std::{
+        fs::{self, File, OpenOptions},
+        io::Write,
+        os::unix::fs::{DirBuilderExt, OpenOptionsExt},
+    };
+
+    let entry = root.join(intent.submission_id.simple().to_string());
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .create(root)
+        .map_err(debug_error)?;
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&entry)
+        .map_err(debug_error)?;
+    let command_bytes = command.canonical_payload();
+    let spec = json!({
+        "schema_version": 1,
+        "submission_id": intent.submission_id,
+        "executor_execution_id": intent.executor_execution_id,
+        "provider_id": intent.provider_id,
+        "provider_account_id": intent.provider_account_id,
+        "submit_owner": intent.submit_owner,
+        "submit_lease_epoch": intent.submit_lease_epoch,
+        "output_index": intent.output_index,
+        "output_total": intent.output_total,
+        "command_schema": context.command_schema(),
+        "adapter_revision": context.adapter_revision(),
+        "provider_command_sha256": context.provider_command_sha256(),
+        "execution_binding_sha256": context.execution_binding_sha256(),
+        "execution_profile_id": context.execution_profile_id(),
+        "credential_pool_id": context.credential_pool_id(),
+        "credential_revision": context.credential_revision(),
+        "credential_auth_sha256": context.credential_auth_sha256(),
+        "resource_policy_id": context.resource_policy_id(),
+        "resource_policy_revision": context.resource_policy_revision(),
+        "provider_deadline_at_ms": context.provider_deadline_at_ms(),
+        "command_bytes_sha256": hex::encode(Sha256::digest(command_bytes)),
+        "command_byte_size": command_bytes.len(),
+    });
+    let launch = json!({
+        "execution_binding_sha256": context.execution_binding_sha256(),
+        "launch_nonce": Uuid::new_v4(),
+    });
+    for (name, bytes) in [
+        ("command.bin", command_bytes.to_vec()),
+        ("spec.json", serde_json::to_vec(&spec).map_err(debug_error)?),
+        (
+            "launch.json",
+            serde_json::to_vec(&launch).map_err(debug_error)?,
+        ),
+    ] {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(entry.join(name))
+            .map_err(debug_error)?;
+        file.write_all(&bytes).map_err(debug_error)?;
+        file.sync_all().map_err(debug_error)?;
+    }
+    File::open(&entry)
+        .and_then(|directory| directory.sync_all())
+        .map_err(debug_error)?;
+    File::open(root)
+        .and_then(|directory| directory.sync_all())
+        .map_err(debug_error)
 }
 
 fn orchestrator_work(

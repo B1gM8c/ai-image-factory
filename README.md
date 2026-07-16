@@ -42,6 +42,10 @@ Attached remote-task deadlines, quarantine authority, and committed artifact rec
 [`docs/architecture/2026-phase2j-provider-remote-task-deadline.md`](docs/architecture/2026-phase2j-provider-remote-task-deadline.md).
 Immutable operation descriptors, command identity, submit idempotency, and execution binding are documented in
 [`docs/architecture/2026-phase2k-immutable-provider-operation-binding.md`](docs/architecture/2026-phase2k-immutable-provider-operation-binding.md).
+Atomic provider-submit dispatch and its single orchestration boundary are documented in
+[`docs/architecture/2026-phase2l-atomic-provider-submit-orchestrator.md`](docs/architecture/2026-phase2l-atomic-provider-submit-orchestrator.md).
+Durable local submit evidence, receipt-first recovery, and its remaining helper gates are documented in
+[`docs/architecture/2026-phase2m-durable-provider-submit-journal.md`](docs/architecture/2026-phase2m-durable-provider-submit-journal.md).
 Database-bound provider profiles and durable capacity are documented in
 [`docs/architecture/2026-phase1g-execution-binding-capacity.md`](docs/architecture/2026-phase1g-execution-binding-capacity.md).
 

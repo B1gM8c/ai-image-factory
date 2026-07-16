@@ -1,4 +1,8 @@
-use std::time::Duration;
+use std::{
+    path::Path,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use image_provider_sdk::{
     EffectCertainty, InvocationContext, InvocationDeadline, PendingOperation, ProviderFailure,
@@ -13,6 +17,11 @@ use super::{
     ProviderSubmitFailureKind, ProviderSubmitIntent, ProviderSubmitIntentState, ProviderTaskStore,
     ProviderTaskStoreError, RemoteTaskAttach, RemoteTaskQuarantinedReceipt,
     RemoteTaskSubmitFailure, RemoteTaskSubmitReceipt, RemoteTaskSubmitReservation,
+    remote_submit::{
+        RemoteSubmitJournal, RemoteSubmitJournalError, RemoteSubmitJournalObservation,
+        RemoteSubmitJournalSpec, RemoteSubmitJournalTerminal, RemoteSubmitLaunch,
+        RemoteSubmitRelease, RemoteSubmitReleasedAuthority,
+    },
 };
 
 const MAX_POLL_AFTER_MS: u64 = 24 * 60 * 60 * 1_000;
@@ -27,6 +36,8 @@ impl<P: RemoteTaskProvider> ProviderSubmitWork<P> {
         executor: &ExecutorSubmissionLease,
         command: SingleOutputCommand<P::Payload>,
     ) -> Result<Self, ProviderSubmitOrchestratorError> {
+        RemoteSubmitJournal::validate_canonical_command(command.canonical_payload())
+            .map_err(|_| ProviderSubmitOrchestratorError::InvalidWork)?;
         let output_index = i32::try_from(command.output().index())
             .map_err(|_| ProviderSubmitOrchestratorError::InvalidWork)?;
         if executor.output_index != output_index
@@ -57,6 +68,7 @@ pub struct ProviderSubmitOrchestrator<P: RemoteTaskProvider> {
     store: PostgresProviderTaskStore,
     provider: P,
     provider_timeout_ms: i64,
+    journal: Arc<RemoteSubmitJournal>,
 }
 
 impl<P: RemoteTaskProvider> ProviderSubmitOrchestrator<P> {
@@ -64,6 +76,7 @@ impl<P: RemoteTaskProvider> ProviderSubmitOrchestrator<P> {
         store: PostgresProviderTaskStore,
         provider: P,
         provider_timeout_ms: i64,
+        journal_root: impl AsRef<Path>,
     ) -> Result<Self, ProviderSubmitOrchestratorError> {
         if provider_timeout_ms <= 0 {
             return Err(ProviderSubmitOrchestratorError::InvalidWork);
@@ -72,6 +85,7 @@ impl<P: RemoteTaskProvider> ProviderSubmitOrchestrator<P> {
             store,
             provider,
             provider_timeout_ms,
+            journal: Arc::new(RemoteSubmitJournal::new(journal_root)?),
         })
     }
 
@@ -96,69 +110,48 @@ impl<P: RemoteTaskProvider> ProviderSubmitOrchestrator<P> {
                         )
                         .await;
                 }
-
-                let submission_id = intent.submission_id.to_string();
-                let attempt = u32::try_from(context.invocation_attempt())
-                    .map_err(|_| ProviderSubmitOrchestratorError::InvalidFrozenContext)?;
-                let provider_timeout_ms = u64::try_from(context.provider_timeout_ms())
-                    .map_err(|_| ProviderSubmitOrchestratorError::InvalidFrozenContext)?;
-                let provider_deadline_unix_ms = u64::try_from(context.provider_deadline_at_ms())
-                    .map_err(|_| ProviderSubmitOrchestratorError::InvalidFrozenContext)?;
-                let invocation = InvocationContext::new(
-                    &submission_id,
-                    &intent.provider_id,
-                    context.operation_id(),
-                    context.operation_descriptor_revision(),
-                    context.model(),
-                    attempt,
-                    InvocationDeadline::new(provider_timeout_ms, provider_deadline_unix_ms)
-                        .map_err(|_| ProviderSubmitOrchestratorError::InvalidFrozenContext)?,
-                )
-                .map_err(|_| ProviderSubmitOrchestratorError::InvalidFrozenContext)?;
-
-                if authority.remaining_budget_ms() == 0 {
-                    return self
-                        .record_failure(
-                            intent,
-                            context,
-                            ProviderSubmitFailureKind::Rejected,
-                            "provider_submit_deadline_elapsed",
-                        )
-                        .await;
-                }
-
-                let submit = self.provider.submit(SubmitCall::new(
-                    invocation,
-                    &work.command,
-                    SubmitIdempotency::submission_bound(),
-                ));
-                match tokio::time::timeout(
-                    Duration::from_millis(authority.remaining_budget_ms()),
-                    submit,
-                )
-                .await
-                {
-                    Ok(Ok(pending)) => self.record_pending(intent, context, pending).await,
-                    Ok(Err(failure)) => {
-                        self.record_provider_failure(intent, context, failure).await
-                    }
-                    Err(_) => {
-                        self.record_failure(
-                            intent,
-                            context,
-                            ProviderSubmitFailureKind::OutcomeUnknown,
-                            "provider_submit_timeout",
-                        )
-                        .await
-                    }
-                }
+                self.dispatch_provider(intent, context, authority.remaining_budget_ms(), work)
+                    .await
             }
             ProviderSubmitAcquire::AttachOnly(authority) => {
                 self.attach_known(authority.intent(), authority.context(), 0)
                     .await
             }
-            ProviderSubmitAcquire::Busy(intent) | ProviderSubmitAcquire::ObserveOnly(intent) => {
-                Ok(ProviderSubmitOutcome::AwaitingEvidence(intent))
+            ProviderSubmitAcquire::Busy(authority) => {
+                if authority.intent().provider_id != self.provider.provider_id()
+                    || !context_matches_command(authority.context(), &work.command)
+                {
+                    return Ok(ProviderSubmitOutcome::AwaitingEvidence(
+                        authority.intent().clone(),
+                    ));
+                }
+                self.dispatch_provider(
+                    authority.intent(),
+                    authority.context(),
+                    authority.remaining_budget_ms(),
+                    work,
+                )
+                .await
+            }
+            ProviderSubmitAcquire::ObserveOnly(invocation) => {
+                let spec = RemoteSubmitJournalSpec::new(
+                    &invocation.intent,
+                    invocation.context(),
+                    work.command.canonical_payload(),
+                )?;
+                let journal = Arc::clone(&self.journal);
+                let observation = tokio::task::spawn_blocking(move || {
+                    journal.prepare(&spec, work.command.canonical_payload())?;
+                    journal.observe(&spec)
+                })
+                .await
+                .map_err(|_| ProviderSubmitOrchestratorError::JournalWorkerStopped)??;
+                self.replay_journal_observation(
+                    &invocation.intent,
+                    invocation.context(),
+                    observation,
+                )
+                .await
             }
             ProviderSubmitAcquire::Terminal(intent) => {
                 if intent.state == ProviderSubmitIntentState::Attached
@@ -171,18 +164,204 @@ impl<P: RemoteTaskProvider> ProviderSubmitOrchestrator<P> {
         }
     }
 
-    async fn record_provider_failure(
+    async fn dispatch_provider(
         &self,
         intent: &ProviderSubmitIntent,
         context: &ProviderExecutionContext,
-        failure: ProviderFailure,
+        database_budget_ms: u64,
+        work: ProviderSubmitWork<P>,
     ) -> Result<ProviderSubmitOutcome, ProviderSubmitOrchestratorError> {
-        let kind = match failure.effect() {
-            EffectCertainty::NoRemoteEffect => ProviderSubmitFailureKind::Rejected,
-            EffectCertainty::UnknownRemoteEffect => ProviderSubmitFailureKind::OutcomeUnknown,
+        if database_budget_ms == 0 {
+            return self
+                .record_failure(
+                    intent,
+                    context,
+                    ProviderSubmitFailureKind::Rejected,
+                    "provider_submit_deadline_elapsed",
+                )
+                .await;
+        }
+        let submission_id = intent.submission_id.to_string();
+        let attempt = u32::try_from(context.invocation_attempt())
+            .map_err(|_| ProviderSubmitOrchestratorError::InvalidFrozenContext)?;
+        let provider_timeout_ms = u64::try_from(context.provider_timeout_ms())
+            .map_err(|_| ProviderSubmitOrchestratorError::InvalidFrozenContext)?;
+        let provider_deadline_unix_ms = u64::try_from(context.provider_deadline_at_ms())
+            .map_err(|_| ProviderSubmitOrchestratorError::InvalidFrozenContext)?;
+        let invocation = InvocationContext::new(
+            &submission_id,
+            &intent.provider_id,
+            context.operation_id(),
+            context.operation_descriptor_revision(),
+            context.model(),
+            attempt,
+            InvocationDeadline::new(provider_timeout_ms, provider_deadline_unix_ms)
+                .map_err(|_| ProviderSubmitOrchestratorError::InvalidFrozenContext)?,
+        )
+        .map_err(|_| ProviderSubmitOrchestratorError::InvalidFrozenContext)?;
+        let journal_spec =
+            RemoteSubmitJournalSpec::new(intent, context, work.command.canonical_payload())?;
+        let journal = Arc::clone(&self.journal);
+        let journal_started = Instant::now();
+        let (command, journal_spec, dispatch) = tokio::task::spawn_blocking(move || {
+            let command = work.command;
+            journal.prepare(&journal_spec, command.canonical_payload())?;
+            let dispatch = match journal.commit_launch(&journal_spec)? {
+                RemoteSubmitLaunch::Launch(launch) => {
+                    match journal.release_dispatch(&journal_spec, launch)? {
+                        RemoteSubmitRelease::Dispatch(released) => {
+                            RemoteSubmitDispatch::Released(released)
+                        }
+                        RemoteSubmitRelease::Attach(observation) => {
+                            RemoteSubmitDispatch::Attach(observation)
+                        }
+                    }
+                }
+                RemoteSubmitLaunch::Attach(observation) => {
+                    RemoteSubmitDispatch::Attach(observation)
+                }
+            };
+            Ok::<_, RemoteSubmitJournalError>((command, journal_spec, dispatch))
+        })
+        .await
+        .map_err(|_| ProviderSubmitOrchestratorError::JournalWorkerStopped)??;
+        let released = match dispatch {
+            RemoteSubmitDispatch::Released(released) => released,
+            RemoteSubmitDispatch::Attach(observation) => {
+                return self
+                    .replay_journal_observation(intent, context, observation)
+                    .await;
+            }
         };
-        self.record_failure(intent, context, kind, failure.code())
-            .await
+        let remaining_budget_ms =
+            remaining_budget_after(database_budget_ms, journal_started.elapsed());
+        if remaining_budget_ms == 0 {
+            let terminal = RemoteSubmitJournalTerminal::Rejected {
+                error_code: "provider_submit_deadline_elapsed".to_owned(),
+            };
+            self.publish_journal_failure(journal_spec, released, terminal)
+                .await?;
+            return self
+                .record_failure(
+                    intent,
+                    context,
+                    ProviderSubmitFailureKind::Rejected,
+                    "provider_submit_deadline_elapsed",
+                )
+                .await;
+        }
+
+        let submit = self.provider.submit(SubmitCall::new(
+            invocation,
+            &command,
+            SubmitIdempotency::submission_bound(),
+        ));
+        match tokio::time::timeout(Duration::from_millis(remaining_budget_ms), submit).await {
+            Ok(Ok(pending)) => {
+                let pending = self
+                    .publish_journal_accepted(journal_spec, released, pending)
+                    .await?;
+                self.record_pending(intent, context, pending).await
+            }
+            Ok(Err(failure)) => {
+                let (kind, terminal) = journal_failure(&failure);
+                self.publish_journal_failure(journal_spec, released, terminal)
+                    .await?;
+                self.record_failure(intent, context, kind, failure.code())
+                    .await
+            }
+            Err(_) => {
+                self.publish_journal_failure(
+                    journal_spec,
+                    released,
+                    RemoteSubmitJournalTerminal::Unknown {
+                        error_code: "provider_submit_timeout".to_owned(),
+                    },
+                )
+                .await?;
+                self.record_failure(
+                    intent,
+                    context,
+                    ProviderSubmitFailureKind::OutcomeUnknown,
+                    "provider_submit_timeout",
+                )
+                .await
+            }
+        }
+    }
+
+    async fn publish_journal_accepted(
+        &self,
+        spec: RemoteSubmitJournalSpec,
+        released: RemoteSubmitReleasedAuthority,
+        pending: PendingOperation,
+    ) -> Result<PendingOperation, ProviderSubmitOrchestratorError> {
+        let submission_id = spec.submission_id();
+        let journal = Arc::clone(&self.journal);
+        let (pending, result) = tokio::task::spawn_blocking(move || {
+            let result = journal.publish_accepted(&spec, &released, &pending);
+            (pending, result)
+        })
+        .await
+        .map_err(|_| ProviderSubmitOrchestratorError::JournalWorkerStopped)?;
+        tolerate_unavailable_journal(result, submission_id)?;
+        Ok(pending)
+    }
+
+    async fn publish_journal_failure(
+        &self,
+        spec: RemoteSubmitJournalSpec,
+        released: RemoteSubmitReleasedAuthority,
+        terminal: RemoteSubmitJournalTerminal,
+    ) -> Result<(), ProviderSubmitOrchestratorError> {
+        let submission_id = spec.submission_id();
+        let journal = Arc::clone(&self.journal);
+        let result = tokio::task::spawn_blocking(move || {
+            journal.publish_failure(&spec, &released, &terminal)
+        })
+        .await
+        .map_err(|_| ProviderSubmitOrchestratorError::JournalWorkerStopped)?;
+        tolerate_unavailable_journal(result, submission_id)
+    }
+
+    async fn replay_journal_observation(
+        &self,
+        intent: &ProviderSubmitIntent,
+        context: &ProviderExecutionContext,
+        observation: RemoteSubmitJournalObservation,
+    ) -> Result<ProviderSubmitOutcome, ProviderSubmitOrchestratorError> {
+        match observation {
+            RemoteSubmitJournalObservation::Terminal(RemoteSubmitJournalTerminal::Accepted(
+                pending,
+            )) => self.record_pending(intent, context, pending).await,
+            RemoteSubmitJournalObservation::Terminal(RemoteSubmitJournalTerminal::Rejected {
+                error_code,
+            }) => {
+                self.record_failure(
+                    intent,
+                    context,
+                    ProviderSubmitFailureKind::Rejected,
+                    &error_code,
+                )
+                .await
+            }
+            RemoteSubmitJournalObservation::Terminal(RemoteSubmitJournalTerminal::Unknown {
+                error_code,
+            }) => {
+                self.record_failure(
+                    intent,
+                    context,
+                    ProviderSubmitFailureKind::OutcomeUnknown,
+                    &error_code,
+                )
+                .await
+            }
+            RemoteSubmitJournalObservation::Prepared
+            | RemoteSubmitJournalObservation::LaunchCommitted
+            | RemoteSubmitJournalObservation::DispatchReleased => {
+                Ok(ProviderSubmitOutcome::AwaitingEvidence(intent.clone()))
+            }
+        }
     }
 
     async fn record_failure(
@@ -339,14 +518,83 @@ pub enum ProviderSubmitOutcome {
     Terminal(ProviderSubmitIntent),
 }
 
+enum RemoteSubmitDispatch {
+    Released(RemoteSubmitReleasedAuthority),
+    Attach(RemoteSubmitJournalObservation),
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum ProviderSubmitOrchestratorError {
     #[error("provider submit work is invalid")]
     InvalidWork,
     #[error("frozen provider submit context is invalid")]
     InvalidFrozenContext,
+    #[error("remote submit journal input is invalid")]
+    JournalInvalidInput,
+    #[error("remote submit journal conflicts with durable state")]
+    JournalConflict,
+    #[error("remote submit journal integrity validation failed")]
+    JournalIntegrity,
+    #[error("remote submit journal storage is unavailable")]
+    JournalUnavailable,
+    #[error("remote submit journal worker stopped unexpectedly")]
+    JournalWorkerStopped,
     #[error(transparent)]
     Store(#[from] ProviderTaskStoreError),
+}
+
+impl From<RemoteSubmitJournalError> for ProviderSubmitOrchestratorError {
+    fn from(error: RemoteSubmitJournalError) -> Self {
+        match error {
+            RemoteSubmitJournalError::InvalidInput => Self::JournalInvalidInput,
+            RemoteSubmitJournalError::Conflict => Self::JournalConflict,
+            RemoteSubmitJournalError::Integrity | RemoteSubmitJournalError::NotFound => {
+                Self::JournalIntegrity
+            }
+            RemoteSubmitJournalError::Unavailable => Self::JournalUnavailable,
+        }
+    }
+}
+
+fn journal_failure(
+    failure: &ProviderFailure,
+) -> (ProviderSubmitFailureKind, RemoteSubmitJournalTerminal) {
+    match failure.effect() {
+        EffectCertainty::NoRemoteEffect => (
+            ProviderSubmitFailureKind::Rejected,
+            RemoteSubmitJournalTerminal::Rejected {
+                error_code: failure.code().to_owned(),
+            },
+        ),
+        EffectCertainty::UnknownRemoteEffect => (
+            ProviderSubmitFailureKind::OutcomeUnknown,
+            RemoteSubmitJournalTerminal::Unknown {
+                error_code: failure.code().to_owned(),
+            },
+        ),
+    }
+}
+
+fn tolerate_unavailable_journal(
+    result: Result<(), RemoteSubmitJournalError>,
+    submission_id: uuid::Uuid,
+) -> Result<(), ProviderSubmitOrchestratorError> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(RemoteSubmitJournalError::Unavailable) => {
+            tracing::warn!(
+                %submission_id,
+                "remote submit journal unavailable; attempting PostgreSQL result fallback"
+            );
+            Ok(())
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn remaining_budget_after(database_budget_ms: u64, elapsed: Duration) -> u64 {
+    let elapsed_ms = u64::try_from(elapsed.as_nanos().div_ceil(1_000_000)).unwrap_or(u64::MAX);
+    database_budget_ms.saturating_sub(elapsed_ms)
 }
 
 fn context_matches_command<P>(
@@ -375,4 +623,33 @@ fn evidence_identity(prefix: &str, values: &[&str]) -> String {
         digest.update(value.as_bytes());
     }
     format!("{prefix}:{}", hex::encode(digest.finalize()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn journal_elapsed_time_is_subtracted_from_database_budget() {
+        assert_eq!(remaining_budget_after(500, Duration::from_millis(125)), 375);
+        assert_eq!(remaining_budget_after(500, Duration::from_micros(1)), 499);
+        assert_eq!(remaining_budget_after(500, Duration::from_millis(500)), 0);
+        assert_eq!(remaining_budget_after(500, Duration::from_millis(750)), 0);
+    }
+
+    #[test]
+    fn only_storage_unavailability_allows_database_fallback() {
+        let submission_id = uuid::Uuid::new_v4();
+        assert!(
+            tolerate_unavailable_journal(
+                Err(RemoteSubmitJournalError::Unavailable),
+                submission_id,
+            )
+            .is_ok()
+        );
+        assert!(matches!(
+            tolerate_unavailable_journal(Err(RemoteSubmitJournalError::Integrity), submission_id,),
+            Err(ProviderSubmitOrchestratorError::JournalIntegrity)
+        ));
+    }
 }

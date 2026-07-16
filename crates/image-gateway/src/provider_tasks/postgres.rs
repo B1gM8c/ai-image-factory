@@ -12,13 +12,14 @@ use super::capacity::insert_capacity_reconciliation;
 use super::{
     ProviderArtifactAuthority, ProviderArtifactPublication, ProviderExecutionContext,
     ProviderRemoteTask, ProviderSubmitAcquire, ProviderSubmitAttachAuthority,
-    ProviderSubmitDispatchAuthority, ProviderSubmitFailureKind, ProviderSubmitIntent,
-    ProviderSubmitIntentState, ProviderSubmitInvocation, ProviderSubmitRecoveryLease,
-    ProviderSubmitStart, ProviderTaskClaimScope, ProviderTaskDeadlineStore, ProviderTaskLease,
-    ProviderTaskObservation, ProviderTaskObservationOutcome, ProviderTaskObservationSource,
-    ProviderTaskState, ProviderTaskStore, ProviderTaskStoreError, RemoteTaskAttach,
-    RemoteTaskQuarantinedReceipt, RemoteTaskSubmitFailure, RemoteTaskSubmitReceipt,
-    RemoteTaskSubmitReservation, VerifiedCallbackWakeup,
+    ProviderSubmitBusyAuthority, ProviderSubmitDispatchAuthority, ProviderSubmitFailureKind,
+    ProviderSubmitIntent, ProviderSubmitIntentState, ProviderSubmitInvocation,
+    ProviderSubmitRecoveryLease, ProviderSubmitStart, ProviderTaskClaimScope,
+    ProviderTaskDeadlineStore, ProviderTaskLease, ProviderTaskObservation,
+    ProviderTaskObservationOutcome, ProviderTaskObservationSource, ProviderTaskState,
+    ProviderTaskStore, ProviderTaskStoreError, RemoteTaskAttach, RemoteTaskQuarantinedReceipt,
+    RemoteTaskSubmitFailure, RemoteTaskSubmitReceipt, RemoteTaskSubmitReservation,
+    VerifiedCallbackWakeup,
 };
 
 const MAX_POLL_AFTER_MS: i64 = 24 * 60 * 60 * 1_000;
@@ -409,10 +410,17 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
 
             let intent = submit_intent_from_row(row)?;
             let acquired = match intent.state {
-                ProviderSubmitIntentState::Sending => ProviderSubmitAcquire::Busy(intent),
-                ProviderSubmitIntentState::OutcomeUnknown => {
-                    ProviderSubmitAcquire::ObserveOnly(intent)
+                ProviderSubmitIntentState::Sending => {
+                    let invocation = load_submit_observation_in(&mut tx, intent).await?;
+                    let remaining_budget_ms = submit_remaining_budget(&mut tx, &invocation).await?;
+                    ProviderSubmitAcquire::Busy(ProviderSubmitBusyAuthority {
+                        invocation,
+                        remaining_budget_ms,
+                    })
                 }
+                ProviderSubmitIntentState::OutcomeUnknown => ProviderSubmitAcquire::ObserveOnly(
+                    load_submit_observation_in(&mut tx, intent).await?,
+                ),
                 ProviderSubmitIntentState::OperationKnown => {
                     let context = load_provider_context_in(&mut tx, request.submission_id)
                         .await?
@@ -2436,6 +2444,19 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
         tx.commit().await.map_err(unavailable)?;
         Ok(task)
     }
+}
+
+async fn load_submit_observation_in(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    intent: ProviderSubmitIntent,
+) -> Result<ProviderSubmitInvocation, ProviderTaskStoreError> {
+    let context = load_provider_context_in(tx, intent.submission_id)
+        .await?
+        .ok_or(ProviderTaskStoreError::Conflict)?;
+    Ok(ProviderSubmitInvocation {
+        intent,
+        context: provider_context_from_row(context),
+    })
 }
 
 #[async_trait]

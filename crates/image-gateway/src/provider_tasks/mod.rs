@@ -9,6 +9,7 @@ use crate::executor::{ExecutorResultManifest, ExecutorSubmissionLease};
 mod capacity;
 mod orchestrator;
 mod postgres;
+mod remote_submit;
 
 pub use capacity::{
     ProviderCapacityEvidence, ProviderCapacityEvidenceOutcome, ProviderCapacityReconciliation,
@@ -419,11 +420,31 @@ impl ProviderSubmitAttachAuthority {
 }
 
 #[derive(Debug, Eq, PartialEq)]
+pub struct ProviderSubmitBusyAuthority {
+    invocation: ProviderSubmitInvocation,
+    remaining_budget_ms: u64,
+}
+
+impl ProviderSubmitBusyAuthority {
+    pub fn intent(&self) -> &ProviderSubmitIntent {
+        &self.invocation.intent
+    }
+
+    pub fn context(&self) -> &ProviderExecutionContext {
+        self.invocation.context()
+    }
+
+    pub fn remaining_budget_ms(&self) -> u64 {
+        self.remaining_budget_ms
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
 pub enum ProviderSubmitAcquire {
     Dispatch(ProviderSubmitDispatchAuthority),
     AttachOnly(ProviderSubmitAttachAuthority),
-    Busy(ProviderSubmitIntent),
-    ObserveOnly(ProviderSubmitIntent),
+    Busy(ProviderSubmitBusyAuthority),
+    ObserveOnly(ProviderSubmitInvocation),
     Terminal(ProviderSubmitIntent),
 }
 
