@@ -434,6 +434,29 @@ fn receipt_accepts_only_querying_or_success_with_a_nonempty_submit_id() {
 }
 
 #[test]
+fn query_receipt_binds_querying_success_and_failure_to_a_submit_id() {
+    for (status, expected) in [
+        ("querying", DreaminaQueryStatusV1::Querying),
+        ("success", DreaminaQueryStatusV1::Success),
+        ("fail", DreaminaQueryStatusV1::Failed),
+    ] {
+        let payload = format!(r#"{{"submit_id":"task-1","gen_status":"{status}"}}"#);
+        let receipt = parse_query_receipt(payload.as_bytes()).unwrap();
+        assert_eq!(receipt.submit_id(), "task-1");
+        assert_eq!(receipt.status(), expected);
+    }
+
+    assert!(matches!(
+        parse_query_receipt(br#"{"gen_status":"fail","fail_reason":"denied"}"#),
+        Err(ReceiptError::EmptySubmitId)
+    ));
+    assert!(matches!(
+        parse_query_receipt(br#"{"submit_id":"other/task","gen_status":"success"}"#),
+        Err(ReceiptError::InvalidSubmitId)
+    ));
+}
+
+#[test]
 fn failed_receipt_returns_a_single_line_sanitized_reason() {
     let error = parse_receipt(
         br#"{"submit_id":"task-1","gen_status":"fail","fail_reason":"  denied\n\u001b[31m retry\t later  "}"#,
@@ -581,4 +604,60 @@ printf '{"submit_id":"task-1","gen_status":"querying"}'
         Some(&OsString::from("--poll=0"))
     );
     assert!(!workspace.join("should-not-run").exists());
+}
+
+#[test]
+fn query_policy_confines_downloads_to_one_direct_workspace_child() {
+    let root = TempDir::new().expect("temp directory");
+    let workspace = root.path().join("workspace");
+    let account_home = root.path().join("account-home");
+    let download = workspace.join("poll-attempt");
+    fs::create_dir(&workspace).expect("workspace");
+    fs::create_dir(&account_home).expect("account home");
+    fs::create_dir(&download).expect("download");
+    let executable_path = root.path().join("dreamina");
+    let executable_bytes = b"#!/bin/sh\nprintf '{}'\n";
+    fs::write(&executable_path, executable_bytes).expect("fake CLI");
+    fs::set_permissions(&executable_path, fs::Permissions::from_mode(0o500))
+        .expect("executable permissions");
+    let digest: [u8; 32] = Sha256::digest(executable_bytes).into();
+    let workspace = WorkingDirectory::new(&workspace).expect("verified workspace");
+    let account_home = WorkingDirectory::new(&account_home).expect("verified account home");
+    let policy = DreaminaCliQueryPolicyV1::new(
+        &executable_path,
+        digest,
+        workspace.clone(),
+        account_home.clone(),
+        Duration::from_secs(2),
+        Duration::from_millis(50),
+    )
+    .expect("query policy");
+    let download = fs::canonicalize(download).expect("canonical download");
+    let request = QueryResultRequestV1::new("task-1", &download).expect("query request");
+    let command = policy.command_spec(&request).expect("query command");
+
+    assert_eq!(command.working_directory().path(), workspace.path());
+    assert_eq!(
+        command
+            .environment()
+            .get(std::ffi::OsStr::new("HOME"))
+            .map(OsString::as_os_str),
+        Some(account_home.path().as_os_str())
+    );
+    assert_eq!(
+        command
+            .environment()
+            .get(std::ffi::OsStr::new("TMPDIR"))
+            .map(OsString::as_os_str),
+        Some(download.as_os_str())
+    );
+    assert_eq!(command.arguments(), request.to_argv());
+
+    let outside = root.path().join("outside");
+    fs::create_dir(&outside).expect("outside directory");
+    let outside_request = QueryResultRequestV1::new("task-1", outside).expect("outside request");
+    assert!(matches!(
+        policy.command_spec(&outside_request),
+        Err(DreaminaCliQueryPolicyError::DownloadDirectoryOutsideWorkspace)
+    ));
 }

@@ -15,6 +15,10 @@ use crate::provider_tasks::{
     GatedCliCommand, GatedCliSubmitCodec, ProviderExecutionContext, ProviderSubmitIntent,
 };
 
+mod poll;
+
+pub use poll::{DreaminaCliPollDriverConfigError, DreaminaCliPollDriverV1};
+
 const DEFAULT_POLL_AFTER_MS: u64 = 1_000;
 
 #[derive(Clone, Eq, PartialEq)]
@@ -55,8 +59,18 @@ impl DreaminaCliRuntimeBindingV1 {
         })
     }
 
-    fn matches(&self, intent: &ProviderSubmitIntent, context: &ProviderExecutionContext) -> bool {
+    fn matches_submit(
+        &self,
+        intent: &ProviderSubmitIntent,
+        context: &ProviderExecutionContext,
+    ) -> bool {
         intent.provider_account_id == self.provider_account_id
+            && context.execution_profile_id() == self.execution_profile_id
+            && context.credential_auth_sha256() == self.credential_auth_sha256
+    }
+
+    fn matches_poll(&self, provider_account_id: Uuid, context: &ProviderExecutionContext) -> bool {
+        provider_account_id == self.provider_account_id
             && context.execution_profile_id() == self.execution_profile_id
             && context.credential_auth_sha256() == self.credential_auth_sha256
     }
@@ -117,7 +131,7 @@ impl GatedCliSubmitCodec for DreaminaCliSubmitCodecV1 {
         command: &SingleOutputCommand<Self::Payload>,
     ) -> Result<GatedCliCommand, ProviderFailure> {
         if intent.provider_id != PROVIDER_ID
-            || !self.binding.matches(intent, context)
+            || !self.binding.matches_submit(intent, context)
             || context.command_schema() != DREAMINA_SUBMIT_COMMAND_SCHEMA
             || context.adapter_revision() != ADAPTER_REVISION
             || intent.output_index != command.output().index()

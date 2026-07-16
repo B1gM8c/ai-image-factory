@@ -66,6 +66,9 @@ shutdown drain are documented in
 The active provider/account poll runtime snapshot, redacted credential identity,
 and durable lane derivation are documented in
 [`docs/architecture/2026-phase2u-active-poll-runtime-profile.md`](docs/architecture/2026-phase2u-active-poll-runtime-profile.md).
+The inactive Dreamina image poll driver, bounded query materialization, and
+account-fenced local process verification are documented in
+[`docs/architecture/2026-phase2v-inactive-dreamina-image-poll-driver.md`](docs/architecture/2026-phase2v-inactive-dreamina-image-poll-driver.md).
 Database-bound provider profiles and durable capacity are documented in
 [`docs/architecture/2026-phase1g-execution-binding-capacity.md`](docs/architecture/2026-phase1g-execution-binding-capacity.md).
 

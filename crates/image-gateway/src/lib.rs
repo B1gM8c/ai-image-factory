@@ -86,7 +86,8 @@ pub use provider_tasks::{
     run_remote_submit_gate, run_remote_submit_runner,
 };
 pub use providers::dreamina_cli::{
-    DreaminaCliCodecConfigError, DreaminaCliRuntimeBindingV1, DreaminaCliSubmitCodecV1,
+    DreaminaCliCodecConfigError, DreaminaCliPollDriverConfigError, DreaminaCliPollDriverV1,
+    DreaminaCliRuntimeBindingV1, DreaminaCliSubmitCodecV1,
 };
 pub use reconciliation::{
     InputCleanupOutcome, PostgresReconciliationStore, ReconciliationOutcome, ReconciliationStore,

@@ -256,16 +256,12 @@ Phase 2T does not provide:
 - Dreamina query, Grok query, or any provider activation; or
 - production-scale benchmark evidence.
 
-## Next Gate
+## Follow-up
 
-Phase 2U closes the selected provider/account profile-loading gate. Phase 2V
-must implement a verified provider poll driver before any service binary is
-composed:
+Phase 2U closes selected provider/account profile loading. Phase 2V implements
+and locally verifies the inactive Dreamina image poll driver:
+[`2026-phase2v-inactive-dreamina-image-poll-driver.md`](2026-phase2v-inactive-dreamina-image-poll-driver.md).
 
-1. project the canonical query request from the frozen operation binding;
-2. prove fresh output-directory ownership and complete process cancellation;
-3. classify pending, terminal, retry, and uncertain responses;
-4. stream bounded media through the epoch-fenced artifact stager;
-5. add provider-safe metrics without logging raw provider errors; and
-6. keep Dreamina/Grok activation disabled until query and media conformance
-   tests pass independently.
+The next gate is a runnable but inactive service composition with credential
+broker binding, crash-left workspace cleanup, redacted metrics, and real
+PostgreSQL lease verification. Dreamina and Grok remain disabled.

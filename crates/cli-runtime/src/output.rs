@@ -1,6 +1,9 @@
 use std::{
+    error::Error,
     ffi::{CString, OsString},
+    fmt,
     fs::{self, File},
+    future::Future,
     io::{Read, Write},
     os::{
         fd::{AsRawFd, FromRawFd},
@@ -16,6 +19,7 @@ use std::{
 use rustix::fs::Dir;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+use tokio::io::AsyncReadExt;
 
 use crate::{
     WorkingDirectory,
@@ -43,6 +47,49 @@ pub struct SealedOutput {
 pub struct FreshOutputDirectory {
     directory: Arc<File>,
     max_bytes: u64,
+}
+
+pub trait AsyncOutputSink: Send {
+    type Error: Error + Send + Sync + 'static;
+
+    fn write_chunk(&mut self, chunk: &[u8])
+    -> impl Future<Output = Result<(), Self::Error>> + Send;
+}
+
+#[derive(Debug)]
+pub enum AsyncOutputSealError<E> {
+    Output(OutputError),
+    Sink(E),
+}
+
+impl<E> From<OutputError> for AsyncOutputSealError<E> {
+    fn from(error: OutputError) -> Self {
+        Self::Output(error)
+    }
+}
+
+impl<E> fmt::Display for AsyncOutputSealError<E>
+where
+    E: fmt::Display,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Output(error) => error.fmt(formatter),
+            Self::Sink(_) => formatter.write_str("output sink failed"),
+        }
+    }
+}
+
+impl<E> Error for AsyncOutputSealError<E>
+where
+    E: Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Output(error) => Some(error),
+            Self::Sink(error) => Some(error),
+        }
+    }
 }
 
 #[derive(Debug, Error)]
@@ -146,6 +193,70 @@ impl FreshOutputDirectory {
         }
         validate_current_output(&self.directory, &relative_filename, identity)?;
         Ok((sealed, sink))
+    }
+
+    pub async fn seal_single_file_to_async_sink<S>(
+        self,
+        mut sink: S,
+    ) -> Result<(SealedOutput, S), AsyncOutputSealError<S::Error>>
+    where
+        S: AsyncOutputSink,
+    {
+        validate_private_directory(&self.directory)?;
+        let mut entries = first_two_entries(&self.directory)?;
+        let filename = entries.next().ok_or(OutputError::Missing)?;
+        if entries.next().is_some() {
+            return Err(OutputError::MultipleEntries.into());
+        }
+        let relative_filename = PathBuf::from(&filename);
+        let file = open_output_at(&self.directory, &relative_filename)?;
+        let before = file.metadata().map_err(OutputError::Unavailable)?;
+        validate_regular_output(&before, self.max_bytes)?;
+        let identity = OutputIdentity::from_metadata(&before);
+        let mut file = tokio::fs::File::from_std(file);
+        let mut hasher = Sha256::new();
+        let mut buffer = [0_u8; STREAM_BUFFER_BYTES];
+        let mut byte_size = 0_u64;
+
+        loop {
+            let count = file
+                .read(&mut buffer)
+                .await
+                .map_err(OutputError::Unavailable)?;
+            if count == 0 {
+                break;
+            }
+            byte_size = byte_size
+                .checked_add(count as u64)
+                .ok_or(OutputError::TooLarge)?;
+            if byte_size > self.max_bytes {
+                return Err(OutputError::TooLarge.into());
+            }
+            hasher.update(&buffer[..count]);
+            sink.write_chunk(&buffer[..count])
+                .await
+                .map_err(AsyncOutputSealError::Sink)?;
+        }
+
+        let after = file.metadata().await.map_err(OutputError::Unavailable)?;
+        if byte_size != before.len() || OutputIdentity::from_metadata(&after) != identity {
+            return Err(OutputError::ChangedDuringRead.into());
+        }
+        validate_private_directory(&self.directory)?;
+        let mut final_entries = first_two_entries(&self.directory)?;
+        if final_entries.next().as_ref() != Some(&filename) || final_entries.next().is_some() {
+            return Err(OutputError::ChangedDuringRead.into());
+        }
+        validate_current_output(&self.directory, &relative_filename, identity)?;
+
+        Ok((
+            SealedOutput {
+                relative_filename,
+                byte_size,
+                sha256_hex: hex_digest(&hasher.finalize()),
+            },
+            sink,
+        ))
     }
 }
 

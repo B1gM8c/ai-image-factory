@@ -1,4 +1,6 @@
 use std::{
+    fs,
+    os::unix::fs::PermissionsExt,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -6,12 +8,18 @@ use std::{
     time::Duration,
 };
 
+use image_cli_runtime::WorkingDirectory;
+use image_provider_dreamina_cli::{
+    ADAPTER_REVISION as DREAMINA_ADAPTER_REVISION, DREAMINA_SUBMIT_COMMAND_SCHEMA,
+    DreaminaCliQueryPolicyV1, PROVIDER_ID as DREAMINA_PROVIDER_ID,
+};
 use image_provider_sdk::{
     ArtifactMetadata, ArtifactSink, ArtifactSinkError, ArtifactSinkErrorKind, Completed,
     DurableArtifactManifest, DurableArtifactRef, PollObservation,
 };
 use image_provider_test_support::{OutputPlan, PollStep, ScriptedFakeProvider};
 use sha2::{Digest, Sha256};
+use tempfile::TempDir;
 use tokio::sync::Semaphore;
 use uuid::Uuid;
 
@@ -24,6 +32,7 @@ use crate::{
         ProviderRemoteTask, ProviderTaskClaimScope, ProviderTaskLease, ProviderTaskObservation,
         ProviderTaskObservationOutcome, ProviderTaskState, ProviderTaskStoreError,
     },
+    providers::dreamina_cli::{DreaminaCliPollDriverV1, DreaminaCliRuntimeBindingV1},
 };
 
 #[derive(Clone, Default)]
@@ -523,6 +532,114 @@ async fn unverified_terminal_failures_become_uncertain() {
     }
 }
 
+#[tokio::test]
+async fn dreamina_driver_composes_through_account_fenced_poll_call() {
+    let root = TempDir::new().unwrap();
+    let workspace = root.path().join("workspace");
+    let account_home = root.path().join("account-home");
+    fs::create_dir(&workspace).unwrap();
+    fs::create_dir(&account_home).unwrap();
+    fs::set_permissions(&workspace, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::set_permissions(&account_home, fs::Permissions::from_mode(0o700)).unwrap();
+    let executable = root.path().join("dreamina");
+    let script = br#"#!/bin/sh
+submit=
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--submit_id" ]; then
+    shift
+    submit=$1
+  fi
+  shift
+done
+printf query > "$HOME/query-called"
+printf '{"submit_id":"%s","gen_status":"querying"}' "$submit"
+"#;
+    fs::write(&executable, script).unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o500)).unwrap();
+
+    let provider_account_id = Uuid::from_u128(10);
+    let execution_profile_id = Uuid::from_u128(3);
+    let credential_auth_sha256 = "c".repeat(64);
+    let binding = DreaminaCliRuntimeBindingV1::new(
+        execution_profile_id,
+        provider_account_id,
+        credential_auth_sha256.clone(),
+    )
+    .unwrap();
+    let policy = || {
+        DreaminaCliQueryPolicyV1::new(
+            &executable,
+            Sha256::digest(script).into(),
+            WorkingDirectory::new(&workspace).unwrap(),
+            WorkingDirectory::new(&account_home).unwrap(),
+            Duration::from_secs(5),
+            Duration::from_millis(50),
+        )
+        .unwrap()
+    };
+    let driver = || DreaminaCliPollDriverV1::new(policy(), binding.clone(), 1024 * 1024).unwrap();
+    let config = |provider_account_id| ProviderPollOrchestratorConfig {
+        scope: ProviderTaskClaimScope {
+            provider_id: DREAMINA_PROVIDER_ID.to_owned(),
+            provider_account_id,
+        },
+        owner: "poll-owner".to_owned(),
+        lease_ms: 100,
+        heartbeat_interval: Duration::from_millis(20),
+        max_materializations: 1,
+    };
+
+    let valid_lease = dreamina_lease(provider_account_id);
+    let valid_store = FakeStore::with_lease(valid_lease);
+    let orchestrator = ProviderPollOrchestrator::new(
+        valid_store.clone(),
+        driver(),
+        TestStagerFactory::default(),
+        config(provider_account_id),
+    )
+    .unwrap();
+
+    let result = orchestrator.run_once().await.unwrap();
+
+    assert!(matches!(
+        result,
+        ProviderPollRun::Observed(ProviderRemoteTask {
+            state: ProviderTaskState::ProviderWaiting,
+            ..
+        })
+    ));
+    assert!(account_home.join("query-called").is_file());
+    assert!(fs::read_dir(&workspace).unwrap().next().is_none());
+    fs::remove_file(account_home.join("query-called")).unwrap();
+
+    let wrong_account_id = Uuid::from_u128(11);
+    let wrong_store = FakeStore::with_lease(dreamina_lease(wrong_account_id));
+    let orchestrator = ProviderPollOrchestrator::new(
+        wrong_store.clone(),
+        driver(),
+        TestStagerFactory::default(),
+        config(wrong_account_id),
+    )
+    .unwrap();
+
+    let result = orchestrator.run_once().await.unwrap();
+
+    assert!(matches!(
+        result,
+        ProviderPollRun::Observed(ProviderRemoteTask {
+            state: ProviderTaskState::Uncertain,
+            ..
+        })
+    ));
+    assert!(matches!(
+        &wrong_store.state.lock().unwrap().observations[0].outcome,
+        ProviderTaskObservationOutcome::Uncertain { error_code }
+            if error_code == "dreamina_poll_binding_mismatch"
+    ));
+    assert!(!account_home.join("query-called").exists());
+    assert!(fs::read_dir(&workspace).unwrap().next().is_none());
+}
+
 fn orchestrator<D: ProviderPollDriver>(
     store: FakeStore,
     driver: D,
@@ -616,6 +733,18 @@ fn lease(committed_artifact: Option<ProviderArtifactPublication>) -> ProviderTas
         poll_lease_expires_at_ms: 9_999_999_999_999,
         authority_seal: [0_u8; 32],
     }
+}
+
+fn dreamina_lease(provider_account_id: Uuid) -> ProviderTaskLease {
+    let mut lease = lease(None);
+    lease.task.provider_id = DREAMINA_PROVIDER_ID.to_owned();
+    lease.task.provider_account_id = provider_account_id;
+    lease.task.remote_operation_id = "dreamina-task-1".to_owned();
+    lease.context.model = "dreamina-image-3.0".to_owned();
+    lease.context.command_schema = DREAMINA_SUBMIT_COMMAND_SCHEMA.to_owned();
+    lease.context.operation_id = "images.generations".to_owned();
+    lease.context.adapter_revision = DREAMINA_ADAPTER_REVISION.to_owned();
+    lease
 }
 
 fn authority(lease: &ProviderTaskLease, bytes: &[u8]) -> ProviderArtifactAuthority {

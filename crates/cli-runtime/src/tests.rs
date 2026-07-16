@@ -14,10 +14,10 @@ use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
 use crate::{
-    CliPolicy, CliRuntime, CommandSpec, CommandSpecError, ExitClassification, FreshOutputDirectory,
-    NoopSpawnObserver, OutputContract, OutputError, ProcessError, ReceiptCliPolicy, RuntimeError,
-    SpawnEvidence, SpawnObserver, VerifiedExecutable, WorkingDirectory,
-    default_exit_classification,
+    AsyncOutputSealError, AsyncOutputSink, CliPolicy, CliRuntime, CommandSpec, CommandSpecError,
+    ExitClassification, FreshOutputDirectory, NoopSpawnObserver, OutputContract, OutputError,
+    ProcessError, ReceiptCliPolicy, RuntimeError, SpawnEvidence, SpawnObserver, VerifiedExecutable,
+    WorkingDirectory, default_exit_classification,
 };
 
 #[derive(Clone)]
@@ -74,6 +74,42 @@ struct ReplacingSink {
     output: PathBuf,
     detached: PathBuf,
     replaced: bool,
+}
+
+#[derive(Default)]
+struct AsyncChunkRecordingSink {
+    bytes: Vec<u8>,
+    largest_write: usize,
+}
+
+#[derive(Debug)]
+struct AsyncReplacingSink {
+    output: PathBuf,
+    detached: PathBuf,
+    replaced: bool,
+}
+
+impl AsyncOutputSink for AsyncChunkRecordingSink {
+    type Error = io::Error;
+
+    async fn write_chunk(&mut self, bytes: &[u8]) -> Result<(), Self::Error> {
+        self.largest_write = self.largest_write.max(bytes.len());
+        self.bytes.extend_from_slice(bytes);
+        Ok(())
+    }
+}
+
+impl AsyncOutputSink for AsyncReplacingSink {
+    type Error = io::Error;
+
+    async fn write_chunk(&mut self, _bytes: &[u8]) -> Result<(), Self::Error> {
+        if !self.replaced {
+            fs::rename(&self.output, &self.detached)?;
+            fs::write(&self.output, b"replacement")?;
+            self.replaced = true;
+        }
+        Ok(())
+    }
 }
 
 impl Write for ReplacingSink {
@@ -255,6 +291,59 @@ fn fresh_output_directory_seals_one_bound_file_with_bounded_writes() {
     assert_eq!(sealed.sha256_hex, expected_hash);
     assert_eq!(sink.bytes, payload);
     assert!(sink.largest_write <= crate::STREAM_BUFFER_BYTES);
+}
+
+#[tokio::test]
+async fn fresh_output_directory_streams_one_bound_file_to_an_async_sink() {
+    let root = TempDir::new().expect("temp directory");
+    let directory = root.path().join("staging");
+    fs::create_dir(&directory).expect("staging directory");
+    make_private(&directory);
+    let working = WorkingDirectory::new(&directory).expect("working directory");
+    let output = FreshOutputDirectory::new(&working, 512 * 1024).expect("fresh output");
+    let payload = vec![b'x'; crate::STREAM_BUFFER_BYTES * 2 + 17];
+    fs::write(directory.join("provider-output.bin"), &payload).expect("provider output");
+
+    let (sealed, sink) = output
+        .seal_single_file_to_async_sink(AsyncChunkRecordingSink::default())
+        .await
+        .expect("single output seals asynchronously");
+
+    assert_eq!(sealed.relative_filename, Path::new("provider-output.bin"));
+    assert_eq!(sealed.byte_size, payload.len() as u64);
+    let expected_hash = Sha256::digest(&payload)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    assert_eq!(sealed.sha256_hex, expected_hash);
+    assert_eq!(sink.bytes, payload);
+    assert!(sink.largest_write <= crate::STREAM_BUFFER_BYTES);
+}
+
+#[tokio::test]
+async fn async_output_sealing_rejects_same_name_replacement_during_read() {
+    let root = TempDir::new().expect("temp directory");
+    let staging = root.path().join("staging");
+    fs::create_dir(&staging).expect("staging directory");
+    make_private(&staging);
+    let working = WorkingDirectory::new(&staging).expect("working directory");
+    let output = FreshOutputDirectory::new(&working, 1024).expect("fresh output");
+    let output_path = staging.join("output");
+    fs::write(&output_path, b"original").expect("provider output");
+
+    let error = output
+        .seal_single_file_to_async_sink(AsyncReplacingSink {
+            output: output_path,
+            detached: root.path().join("detached"),
+            replaced: false,
+        })
+        .await
+        .expect_err("same-name replacement must fail");
+
+    assert!(matches!(
+        error,
+        AsyncOutputSealError::Output(OutputError::ChangedDuringRead)
+    ));
 }
 
 #[test]

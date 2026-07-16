@@ -31,7 +31,7 @@ use crate::{
     },
 };
 
-pub(super) const MAX_ARTIFACT_BYTES: u64 = 256 * 1024 * 1024;
+pub(crate) const MAX_ARTIFACT_BYTES: u64 = 256 * 1024 * 1024;
 
 pub struct FilesystemArtifactBlobStore {
     root: PathBuf,

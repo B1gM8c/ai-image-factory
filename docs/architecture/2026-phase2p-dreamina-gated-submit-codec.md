@@ -64,8 +64,12 @@ message broker, runtime registry, or alternative process supervisor.
 
 ```text
 schema: dreamina-cli.submit.v1
-adapter revision: dreamina-cli/submit/v1
+adapter revision: dreamina-cli/remote-task/v1
 ```
+
+The adapter revision was widened by Phase 2V after submit and query were bound
+to one inactive remote-task execution profile. The canonical submit schema and
+bytes did not change.
 
 The canonical JSON uses the inspected official option names:
 
@@ -192,8 +196,8 @@ end-to-end smoke test.
 1. Add a provisioner that binds the inspected Dreamina executable digest,
    isolated account home, credential authentication digest, and execution
    profile without exposing credential bytes.
-2. Add the Dreamina poll codec and untrusted download-directory materializer
-   with streaming limits and immutable artifact authority.
+2. Compose the verified Phase 2V image poll driver with the active runtime
+   profile, credential broker, and inactive service binary.
 3. Add provider/account daemon composition, cooldown, spend limits, and
    production-scale mixed-account benchmarks.
 4. Add Linux cgroup v2 containment and define the macOS production supervisor
@@ -203,3 +207,7 @@ end-to-end smoke test.
 
 Until then, Dreamina remains planned/inactive and the public Codex image
 behavior is unchanged.
+
+Follow-up: Phase 2V implements and locally verifies the image-only query and
+materialization boundary without activating Dreamina:
+[`2026-phase2v-inactive-dreamina-image-poll-driver.md`](2026-phase2v-inactive-dreamina-image-poll-driver.md).

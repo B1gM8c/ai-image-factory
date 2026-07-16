@@ -2,12 +2,14 @@ use image_provider_sdk::{
     ArtifactSink, InvocationContext, InvocationDeadline, PollObservation, ProviderFailure,
     RemoteOperationRef, RemoteTaskProvider,
 };
+use uuid::Uuid;
 
 use super::super::{ProviderExecutionContext, ProviderTaskLease, ProviderTaskState};
 
 pub struct ProviderPollDriverCall {
     submission_id: String,
     provider_id: String,
+    provider_account_id: Uuid,
     operation: RemoteOperationRef,
     context: ProviderExecutionContext,
 }
@@ -31,6 +33,7 @@ impl ProviderPollDriverCall {
         Ok(Self {
             submission_id,
             provider_id: lease.task.provider_id.clone(),
+            provider_account_id: lease.task.provider_account_id,
             operation,
             context,
         })
@@ -42,6 +45,10 @@ impl ProviderPollDriverCall {
 
     pub fn operation(&self) -> &RemoteOperationRef {
         &self.operation
+    }
+
+    pub fn provider_account_id(&self) -> Uuid {
+        self.provider_account_id
     }
 
     fn invocation_context(&self) -> Result<InvocationContext<'_>, ProviderPollDriverCallError> {

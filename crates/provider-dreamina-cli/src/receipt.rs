@@ -28,6 +28,29 @@ impl AcceptedReceipt {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DreaminaQueryStatusV1 {
+    Querying,
+    Success,
+    Failed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DreaminaQueryReceiptV1 {
+    submit_id: OpaqueProviderId,
+    status: DreaminaQueryStatusV1,
+}
+
+impl DreaminaQueryReceiptV1 {
+    pub fn submit_id(&self) -> &str {
+        self.submit_id.as_str()
+    }
+
+    pub fn status(&self) -> DreaminaQueryStatusV1 {
+        self.status
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum ReceiptError {
     #[error("Dreamina receipt exceeds the 64 KiB limit: {actual} bytes")]
@@ -54,15 +77,7 @@ struct RawReceipt {
 }
 
 pub fn parse_receipt(input: &[u8]) -> Result<AcceptedReceipt, ReceiptError> {
-    if input.len() > MAX_RECEIPT_BYTES {
-        return Err(ReceiptError::InputTooLarge {
-            actual: input.len(),
-        });
-    }
-
-    let mut deserializer = serde_json::Deserializer::from_slice(input);
-    let raw = RawReceipt::deserialize(&mut deserializer).map_err(ReceiptError::InvalidJson)?;
-    deserializer.end().map_err(ReceiptError::InvalidJson)?;
+    let raw = parse_raw_receipt(input)?;
 
     match raw.gen_status.as_deref() {
         Some("querying") => accept(raw.submit_id, AcceptedStatus::Querying),
@@ -75,16 +90,44 @@ pub fn parse_receipt(input: &[u8]) -> Result<AcceptedReceipt, ReceiptError> {
     }
 }
 
+pub fn parse_query_receipt(input: &[u8]) -> Result<DreaminaQueryReceiptV1, ReceiptError> {
+    let raw = parse_raw_receipt(input)?;
+    let status = match raw.gen_status.as_deref() {
+        Some("querying") => DreaminaQueryStatusV1::Querying,
+        Some("success") => DreaminaQueryStatusV1::Success,
+        Some("fail") => DreaminaQueryStatusV1::Failed,
+        Some(status) => return Err(ReceiptError::UnknownStatus(sanitize_text(status))),
+        None => return Err(ReceiptError::MissingStatus),
+    };
+    let submit_id = parse_submit_id(raw.submit_id)?;
+    Ok(DreaminaQueryReceiptV1 { submit_id, status })
+}
+
+fn parse_raw_receipt(input: &[u8]) -> Result<RawReceipt, ReceiptError> {
+    if input.len() > MAX_RECEIPT_BYTES {
+        return Err(ReceiptError::InputTooLarge {
+            actual: input.len(),
+        });
+    }
+
+    let mut deserializer = serde_json::Deserializer::from_slice(input);
+    let raw = RawReceipt::deserialize(&mut deserializer).map_err(ReceiptError::InvalidJson)?;
+    deserializer.end().map_err(ReceiptError::InvalidJson)?;
+    Ok(raw)
+}
+
 fn accept(
     submit_id: Option<String>,
     status: AcceptedStatus,
 ) -> Result<AcceptedReceipt, ReceiptError> {
+    parse_submit_id(submit_id).map(|submit_id| AcceptedReceipt { submit_id, status })
+}
+
+fn parse_submit_id(submit_id: Option<String>) -> Result<OpaqueProviderId, ReceiptError> {
     let submit_id = submit_id.filter(|value| !value.trim().is_empty());
     match submit_id {
         Some(submit_id) => {
-            let submit_id =
-                OpaqueProviderId::new(submit_id).map_err(|_| ReceiptError::InvalidSubmitId)?;
-            Ok(AcceptedReceipt { submit_id, status })
+            OpaqueProviderId::new(submit_id).map_err(|_| ReceiptError::InvalidSubmitId)
         }
         None => Err(ReceiptError::EmptySubmitId),
     }

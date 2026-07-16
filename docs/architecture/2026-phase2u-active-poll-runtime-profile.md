@@ -217,19 +217,13 @@ Phase 2U does not provide:
 - production metrics, alert thresholds, or benchmark evidence; or
 - paid-provider activation.
 
-## Next Gate
+## Follow-up
 
-Phase 2V should implement and independently verify the first real provider poll
-driver before composing a service binary:
+Phase 2V implements and locally verifies the first provider-specific,
+image-only poll driver without activating Dreamina:
+[`2026-phase2v-inactive-dreamina-image-poll-driver.md`](2026-phase2v-inactive-dreamina-image-poll-driver.md).
 
-1. canonical query request projection from the frozen operation binding;
-2. fresh output-directory ownership for every poll attempt;
-3. complete process-group cancellation when the poll future is dropped;
-4. strict pending, terminal, retry, and uncertain response classification;
-5. bounded streaming of image or video bytes into the epoch-fenced stager;
-6. credential-broker binding to the frozen account identity without logging
-   credential metadata; and
-7. conformance tests with a fake CLI before any external provider call.
-
-Dreamina remains inactive because its crate currently has submit projection and
-receipt parsing but no verified `RemoteTaskProvider::poll` implementation.
+The remaining gate is inactive service composition: load this Phase 2U
+profile, resolve an isolated account home through a credential broker,
+construct the digest-pinned driver, and prove the Phase 2T daemon against real
+PostgreSQL leases and a local fake CLI.

@@ -1,9 +1,15 @@
 use std::{ffi::OsString, path::Path, time::Duration};
 
-use image_cli_runtime::{CommandSpec, CommandSpecError, VerifiedExecutable, WorkingDirectory};
+use image_cli_runtime::{
+    CommandSpec, CommandSpecError, ExitClassification, ReceiptCliPolicy, VerifiedExecutable,
+    WorkingDirectory, default_exit_classification,
+};
 use thiserror::Error;
 
-use crate::{TextToImageRequestV1, TextToVideoRequestV1};
+use crate::{
+    DreaminaQueryReceiptV1, QueryResultRequestV1, ReceiptError, TextToImageRequestV1,
+    TextToVideoRequestV1, parse_query_receipt,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DreaminaSubmitRequestV1 {
@@ -96,6 +102,86 @@ impl DreaminaCliPolicyV1 {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct DreaminaCliQueryPolicyV1 {
+    executable: VerifiedExecutable,
+    workspace_root: WorkingDirectory,
+    account_home: WorkingDirectory,
+    wall_timeout: Duration,
+    termination_grace: Duration,
+}
+
+impl DreaminaCliQueryPolicyV1 {
+    pub fn new(
+        executable_path: impl AsRef<Path>,
+        executable_sha256: [u8; 32],
+        workspace_root: WorkingDirectory,
+        account_home: WorkingDirectory,
+        wall_timeout: Duration,
+        termination_grace: Duration,
+    ) -> Result<Self, DreaminaCliQueryPolicyError> {
+        if wall_timeout.is_zero() || termination_grace.is_zero() {
+            return Err(CommandSpecError::InvalidTimeout.into());
+        }
+        if workspace_root.path().starts_with(account_home.path())
+            || account_home.path().starts_with(workspace_root.path())
+        {
+            return Err(DreaminaCliQueryPolicyError::OverlappingDirectories);
+        }
+        let executable = VerifiedExecutable::new_with_sha256(executable_path, executable_sha256)?;
+        Ok(Self {
+            executable,
+            workspace_root,
+            account_home,
+            wall_timeout,
+            termination_grace,
+        })
+    }
+
+    pub fn workspace_root(&self) -> &Path {
+        self.workspace_root.path()
+    }
+
+    pub fn command_spec(
+        &self,
+        request: &QueryResultRequestV1,
+    ) -> Result<CommandSpec, DreaminaCliQueryPolicyError> {
+        if request.download_dir().parent() != Some(self.workspace_root.path()) {
+            return Err(DreaminaCliQueryPolicyError::DownloadDirectoryOutsideWorkspace);
+        }
+        let mut command = CommandSpec::new_receipt(
+            self.executable.clone(),
+            self.workspace_root.clone(),
+            self.wall_timeout,
+            self.termination_grace,
+        )?
+        .env("HOME", self.account_home.path().as_os_str())?
+        .env("TMPDIR", request.download_dir().as_os_str())?;
+        for argument in request.to_argv() {
+            command = command.arg(argument)?;
+        }
+        Ok(command)
+    }
+}
+
+impl ReceiptCliPolicy for DreaminaCliQueryPolicyV1 {
+    type Request = QueryResultRequestV1;
+    type Receipt = DreaminaQueryReceiptV1;
+    type Error = DreaminaCliQueryPolicyError;
+
+    fn command(&self, request: &Self::Request) -> Result<CommandSpec, Self::Error> {
+        self.command_spec(request)
+    }
+
+    fn classify_exit(&self, status: &std::process::ExitStatus) -> ExitClassification {
+        default_exit_classification(status)
+    }
+
+    fn parse_receipt(&self, stdout: &[u8]) -> Result<Self::Receipt, Self::Error> {
+        parse_query_receipt(stdout).map_err(Into::into)
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum DreaminaCliPolicyError {
     #[error(transparent)]
@@ -104,4 +190,16 @@ pub enum DreaminaCliPolicyError {
     OverlappingDirectories,
     #[error("Dreamina execution supports exactly one output per submission")]
     BatchSubmissionUnsupported,
+}
+
+#[derive(Debug, Error)]
+pub enum DreaminaCliQueryPolicyError {
+    #[error(transparent)]
+    Command(#[from] CommandSpecError),
+    #[error("Dreamina account home and query workspace must not overlap")]
+    OverlappingDirectories,
+    #[error("Dreamina query download directory must be one direct workspace child")]
+    DownloadDirectoryOutsideWorkspace,
+    #[error(transparent)]
+    Receipt(#[from] ReceiptError),
 }

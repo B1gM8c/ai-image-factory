@@ -13,6 +13,7 @@ mod provider;
 pub(crate) use executor::media_type_from_bytes;
 pub use executor::{ExecutorArtifactPublishError, ExecutorArtifactPublisher};
 pub use filesystem::FilesystemArtifactBlobStore;
+pub(crate) use filesystem::MAX_ARTIFACT_BYTES;
 pub use memory::InMemoryArtifactBlobStore;
 pub use provider::{
     FilesystemProviderArtifactStagerFactory, ProviderArtifactStagerConfigurationError,
