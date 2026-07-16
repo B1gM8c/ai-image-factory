@@ -3,6 +3,7 @@
 use std::{
     collections::BTreeMap,
     fs,
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::Stdio,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -269,6 +270,8 @@ struct Fixture {
 impl Fixture {
     fn new(release_after: Duration, mode: &str) -> Result<Self, String> {
         let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700))
+            .map_err(|error| error.to_string())?;
         let root = temp.path().join("remote-submit");
         let side_effect = temp.path().join("provider-invoked");
         let completed = temp.path().join("provider-completed");

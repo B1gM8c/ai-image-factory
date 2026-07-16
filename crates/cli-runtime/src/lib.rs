@@ -23,7 +23,7 @@ pub use process::{
 };
 pub use workspace::{
     ATTEMPT_WORKSPACE_LOCK_FILENAME, AttemptDirectory, AttemptWorkspaceError,
-    ExclusiveAttemptWorkspace,
+    ExclusiveAttemptWorkspace, RecoverableAttemptDirectory, RecoverableAttemptWorkspace,
 };
 
 pub trait CliPolicy {

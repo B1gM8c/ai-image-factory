@@ -207,7 +207,7 @@ impl GatedCliCommand {
         let expected_digest = parse_sha256(&executable_sha256)?;
         let executable = VerifiedExecutable::new_with_sha256(executable, expected_digest)
             .map_err(|_| GatedCliProcessError::InvalidInput)?;
-        let working_directory = WorkingDirectory::new(working_directory)
+        let working_directory = WorkingDirectory::new_private(working_directory)
             .map_err(|_| GatedCliProcessError::InvalidInput)?;
         let mut command = CommandSpec::new_receipt(
             executable.clone(),
@@ -283,6 +283,10 @@ impl GatedCliCommand {
             validate_value(value)?;
         }
         Ok(())
+    }
+
+    pub fn working_directory(&self) -> &Path {
+        Path::new(&self.working_directory)
     }
 }
 
@@ -834,11 +838,19 @@ fn map_journal_error(error: RemoteSubmitJournalError) -> GatedCliProcessError {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
     use super::*;
+
+    fn private_tempdir() -> tempfile::TempDir {
+        let temp = tempfile::tempdir().unwrap();
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        temp
+    }
 
     #[test]
     fn request_digest_binds_command_and_release_identity() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = private_tempdir();
         let executable = std::env::current_exe().unwrap();
         let executable_sha256 = file_sha256(&executable);
         let binding = GatedCliBinding::new(
@@ -867,7 +879,7 @@ mod tests {
 
     #[test]
     fn command_preserves_empty_and_multiline_argument_values() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = private_tempdir();
         let executable = std::env::current_exe().unwrap();
         let mut environment = BTreeMap::new();
         environment.insert("EMPTY".to_owned(), String::new());
@@ -894,7 +906,7 @@ mod tests {
 
     #[test]
     fn oversized_request_is_rejected_before_stdin_is_published() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = private_tempdir();
         let executable = std::env::current_exe().unwrap();
         let submission =
             GatedCliSubmission::new(temp.path().join("journal"), Uuid::new_v4()).unwrap();
@@ -925,7 +937,7 @@ mod tests {
 
     #[test]
     fn private_process_entry_rejects_conflicting_replay() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = private_tempdir();
         let root = temp.path().join("journal");
         let submission_id = Uuid::new_v4();
         let submission = GatedCliSubmission::new(&root, submission_id).unwrap();
@@ -963,7 +975,7 @@ mod tests {
 
     #[test]
     fn terminal_self_digest_rejects_validly_encoded_stream_tampering() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = private_tempdir();
         let executable = std::env::current_exe().unwrap();
         let command = GatedCliCommand::new(
             &executable,

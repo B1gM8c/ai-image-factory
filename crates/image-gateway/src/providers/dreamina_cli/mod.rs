@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, fmt};
 
-use image_cli_runtime::CommandSpec;
+use image_cli_runtime::{CommandSpec, WorkingDirectory};
 use image_provider_dreamina_cli::{
     ADAPTER_REVISION, DREAMINA_SUBMIT_COMMAND_SCHEMA, DreaminaCliPolicyV1, DreaminaSubmitPayloadV1,
     DreaminaSubmitRequestV1, PROVIDER_ID, ReceiptError, parse_receipt, parse_submit_command,
@@ -96,10 +96,11 @@ impl DreaminaCliSubmitCodecV1 {
     fn project_request(
         &self,
         request: &DreaminaSubmitRequestV1,
+        workspace: &WorkingDirectory,
     ) -> Result<GatedCliCommand, ProviderFailure> {
         let command = self
             .policy
-            .command_spec(request)
+            .command_spec_in(request, workspace.clone())
             .map_err(|_| no_effect_failure("dreamina_submit_command_invalid"))?;
         command_to_gated(&command, self.policy.executable_sha256())
     }
@@ -135,6 +136,7 @@ impl GatedCliSubmitCodec for DreaminaCliSubmitCodecV1 {
         intent: &ProviderSubmitIntent,
         context: &ProviderExecutionContext,
         command: &SingleOutputCommand<Self::Payload>,
+        workspace: &WorkingDirectory,
     ) -> Result<GatedCliCommand, ProviderFailure> {
         if intent.provider_id != PROVIDER_ID
             || !self.binding.matches_submit(intent, context)
@@ -150,7 +152,7 @@ impl GatedCliSubmitCodec for DreaminaCliSubmitCodecV1 {
         if !request_matches_context(&request, context) {
             return Err(no_effect_failure("dreamina_submit_context_mismatch"));
         }
-        self.project_request(&request)
+        self.project_request(&request, workspace)
     }
 
     fn decode_receipt(
@@ -368,7 +370,8 @@ mod tests {
     fn projects_the_pinned_policy_into_a_gated_command() {
         let fixture = Fixture::new();
         let request = fixture.request();
-        let projected = fixture.codec.project_request(&request).unwrap();
+        let workspace = fixture.attempt_workspace();
+        let projected = fixture.codec.project_request(&request, &workspace).unwrap();
         let rendered = format!("{projected:?}");
 
         assert!(rendered.contains("text2image"));
@@ -542,6 +545,7 @@ mod tests {
 
     struct Fixture {
         _root: TempDir,
+        workspace: std::path::PathBuf,
         codec: DreaminaCliSubmitCodecV1,
         executable_sha256: String,
     }
@@ -553,6 +557,8 @@ mod tests {
             let account_home = root.path().join("account-home");
             fs::create_dir(&workspace).unwrap();
             fs::create_dir(&account_home).unwrap();
+            fs::set_permissions(&workspace, fs::Permissions::from_mode(0o700)).unwrap();
+            fs::set_permissions(&account_home, fs::Permissions::from_mode(0o700)).unwrap();
             let executable = root.path().join("dreamina");
             let bytes = b"#!/bin/sh\nprintf '{}'\n";
             fs::write(&executable, bytes).unwrap();
@@ -561,8 +567,8 @@ mod tests {
             let policy = DreaminaCliPolicyV1::new(
                 &executable,
                 digest,
-                WorkingDirectory::new(&workspace).unwrap(),
-                WorkingDirectory::new(&account_home).unwrap(),
+                WorkingDirectory::new_private(&workspace).unwrap(),
+                WorkingDirectory::new_private(&account_home).unwrap(),
                 Duration::from_secs(30),
                 Duration::from_millis(100),
             )
@@ -572,6 +578,7 @@ mod tests {
                     .unwrap();
             Self {
                 _root: root,
+                workspace,
                 codec: DreaminaCliSubmitCodecV1::new(policy, binding),
                 executable_sha256: hex::encode(digest),
             }
@@ -587,6 +594,13 @@ mod tests {
             )
             .unwrap()
             .into()
+        }
+
+        fn attempt_workspace(&self) -> WorkingDirectory {
+            let attempt = self.workspace.join("attempt");
+            fs::create_dir(&attempt).unwrap();
+            fs::set_permissions(&attempt, fs::Permissions::from_mode(0o700)).unwrap();
+            WorkingDirectory::new_private(attempt).unwrap()
         }
     }
 }

@@ -45,7 +45,7 @@ impl From<TextToVideoRequestV1> for DreaminaSubmitRequestV1 {
 pub struct DreaminaCliPolicyV1 {
     executable: VerifiedExecutable,
     executable_sha256: [u8; 32],
-    working_directory: WorkingDirectory,
+    workspace_root: WorkingDirectory,
     account_home: WorkingDirectory,
     wall_timeout: Duration,
     termination_grace: Duration,
@@ -55,7 +55,7 @@ impl DreaminaCliPolicyV1 {
     pub fn new(
         executable_path: impl AsRef<Path>,
         executable_sha256: [u8; 32],
-        working_directory: WorkingDirectory,
+        workspace_root: WorkingDirectory,
         account_home: WorkingDirectory,
         wall_timeout: Duration,
         termination_grace: Duration,
@@ -63,8 +63,8 @@ impl DreaminaCliPolicyV1 {
         if wall_timeout.is_zero() || termination_grace.is_zero() {
             return Err(CommandSpecError::InvalidTimeout.into());
         }
-        if working_directory.path().starts_with(account_home.path())
-            || account_home.path().starts_with(working_directory.path())
+        if workspace_root.path().starts_with(account_home.path())
+            || account_home.path().starts_with(workspace_root.path())
         {
             return Err(DreaminaCliPolicyError::OverlappingDirectories);
         }
@@ -72,7 +72,7 @@ impl DreaminaCliPolicyV1 {
         Ok(Self {
             executable,
             executable_sha256,
-            working_directory,
+            workspace_root,
             account_home,
             wall_timeout,
             termination_grace,
@@ -87,14 +87,33 @@ impl DreaminaCliPolicyV1 {
         &self,
         request: &DreaminaSubmitRequestV1,
     ) -> Result<CommandSpec, DreaminaCliPolicyError> {
+        self.build_command(request, self.workspace_root.clone())
+    }
+
+    pub fn command_spec_in(
+        &self,
+        request: &DreaminaSubmitRequestV1,
+        workspace: WorkingDirectory,
+    ) -> Result<CommandSpec, DreaminaCliPolicyError> {
+        if workspace.path().parent() != Some(self.workspace_root.path()) {
+            return Err(DreaminaCliPolicyError::ExecutionWorkspaceOutsideRoot);
+        }
+        self.build_command(request, workspace)
+    }
+
+    fn build_command(
+        &self,
+        request: &DreaminaSubmitRequestV1,
+        workspace: WorkingDirectory,
+    ) -> Result<CommandSpec, DreaminaCliPolicyError> {
         let mut command = CommandSpec::new_receipt(
             self.executable.clone(),
-            self.working_directory.clone(),
+            workspace.clone(),
             self.wall_timeout,
             self.termination_grace,
         )?
         .env("HOME", self.account_home.path().as_os_str())?
-        .env("TMPDIR", self.working_directory.path().as_os_str())?;
+        .env("TMPDIR", workspace.path().as_os_str())?;
         for argument in request.argv()? {
             command = command.arg(argument)?;
         }
@@ -193,6 +212,8 @@ pub enum DreaminaCliPolicyError {
     Command(#[from] CommandSpecError),
     #[error("Dreamina account home and execution workspace must not overlap")]
     OverlappingDirectories,
+    #[error("Dreamina execution workspace must be one direct child of the configured root")]
+    ExecutionWorkspaceOutsideRoot,
     #[error("Dreamina execution supports exactly one output per submission")]
     BatchSubmissionUnsupported,
 }

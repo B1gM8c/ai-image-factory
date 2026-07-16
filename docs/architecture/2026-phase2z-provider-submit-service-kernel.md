@@ -6,6 +6,10 @@ Status: implemented and verified with local fake providers plus PostgreSQL 18.
 This phase activates no provider, credential, public route, billing behavior,
 or external call.
 
+Follow-up: Phase 2AA closes the recoverable per-launch CLI submit workspace and
+frozen process-path binding:
+[`2026-phase2aa-recoverable-submit-attempt-workspace.md`](2026-phase2aa-recoverable-submit-attempt-workspace.md).
+
 ## Scope
 
 Phase 2Z composes the existing submit primitives into one provider-neutral
@@ -191,10 +195,8 @@ throughput, fairness under every workload, or production readiness.
 The next independent phase must close these items before activating a submit
 process:
 
-1. create a private per-attempt CLI submit workspace whose lifetime survives
-   the gated helper and whose path is part of the frozen process binding;
-2. compose an activation-gated `provider-submitd` only after that workspace
-   boundary exists;
-3. add real process restart and SIGTERM tests for the composed binary; and
-4. benchmark mixed recovery/fresh workloads, database lock wait, allocations,
+1. compose an activation-gated `provider-submitd` around the Phase 2AA
+   workspace boundary;
+2. add real process restart and SIGTERM tests for the composed binary; and
+3. benchmark mixed recovery/fresh workloads, database lock wait, allocations,
    journal fsync cost, and p50/p95/p99 scheduling latency.

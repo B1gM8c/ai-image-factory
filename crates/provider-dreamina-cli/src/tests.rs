@@ -580,6 +580,11 @@ printf '{"submit_id":"task-1","gen_status":"querying"}'
         Duration::from_millis(50),
     )
     .expect("policy");
+    let attempt = workspace.join("submit-attempt");
+    fs::create_dir(&attempt).expect("submit attempt");
+    fs::set_permissions(&attempt, fs::Permissions::from_mode(0o700))
+        .expect("submit attempt permissions");
+    let attempt = WorkingDirectory::new_private(&attempt).expect("private submit attempt");
     let request = TextToImageRequestV1::new(
         "image; $(touch should-not-run)",
         ImageModelVersion::V5_0,
@@ -601,7 +606,7 @@ printf '{"submit_id":"task-1","gen_status":"querying"}'
         Err(DreaminaCliPolicyError::BatchSubmissionUnsupported)
     ));
     let command = policy
-        .command_spec(&request.into())
+        .command_spec_in(&request.clone().into(), attempt.clone())
         .expect("projected command");
     assert_eq!(
         command.executable().path(),
@@ -619,8 +624,9 @@ printf '{"submit_id":"task-1","gen_status":"querying"}'
             .environment()
             .get(std::ffi::OsStr::new("TMPDIR"))
             .map(OsString::as_os_str),
-        Some(fs::canonicalize(&workspace).unwrap().as_os_str())
+        Some(attempt.path().as_os_str())
     );
+    assert_eq!(command.working_directory().path(), attempt.path());
     assert!(
         command
             .arguments()
@@ -631,6 +637,15 @@ printf '{"submit_id":"task-1","gen_status":"querying"}'
         Some(&OsString::from("--poll=0"))
     );
     assert!(!workspace.join("should-not-run").exists());
+    let outside = root.path().join("outside");
+    fs::create_dir(&outside).expect("outside");
+    assert!(matches!(
+        policy.command_spec_in(
+            &request.into(),
+            WorkingDirectory::new(&outside).expect("outside working directory")
+        ),
+        Err(DreaminaCliPolicyError::ExecutionWorkspaceOutsideRoot)
+    ));
 }
 
 #[test]

@@ -352,21 +352,6 @@ where
         };
         let dispatch_budget_ms =
             remaining_budget_after(database_budget_ms, journal_started.elapsed());
-        if dispatch_budget_ms == 0 {
-            return self
-                .record_pre_release_failure_or_replay(
-                    intent,
-                    context,
-                    journal_spec,
-                    command,
-                    recovery_fence,
-                    SubmitFailureEvidence {
-                        kind: ProviderSubmitFailureKind::Rejected,
-                        error_code: "provider_submit_deadline_elapsed",
-                    },
-                )
-                .await;
-        }
         let journal = Arc::clone(&self.journal);
         let release_spec = journal_spec.clone();
         let release =

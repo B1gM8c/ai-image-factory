@@ -81,6 +81,9 @@ database-time budget, and no-resubmit crash proof are documented in
 The provider-neutral submit service, stable lane command identity, lease
 heartbeats, bounded daemon, and inactive Dreamina projector are documented in
 [`docs/architecture/2026-phase2z-provider-submit-service-kernel.md`](docs/architecture/2026-phase2z-provider-submit-service-kernel.md).
+The recoverable per-launch submit workspace, frozen process-path binding,
+per-attempt cleanup serialization, and restart-safe lifecycle are documented in
+[`docs/architecture/2026-phase2aa-recoverable-submit-attempt-workspace.md`](docs/architecture/2026-phase2aa-recoverable-submit-attempt-workspace.md).
 Database-bound provider profiles and durable capacity are documented in
 [`docs/architecture/2026-phase1g-execution-binding-capacity.md`](docs/architecture/2026-phase1g-execution-binding-capacity.md).
 

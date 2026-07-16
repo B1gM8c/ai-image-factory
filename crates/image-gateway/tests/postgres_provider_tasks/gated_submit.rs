@@ -1,6 +1,7 @@
 use std::{
     collections::BTreeMap,
     fs,
+    os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
     process::Stdio,
     sync::Arc,
@@ -25,13 +26,13 @@ async fn orchestrator_runs_one_cli_for_concurrent_callers_and_replays() -> TestR
         let journal_root = journal.path().join("remote-submit");
         let side_effect = journal.path().join("provider-invoked");
         let codec = FakeGatedSubmitCodec::new(journal.path(), &side_effect, "gated-operation-1")?;
+        let workspace_root = codec.workspace_root.clone();
         let runner = Path::new(env!("CARGO_BIN_EXE_remote-submit-runner"));
         let runner_sha256 = file_sha256(runner)?;
         let orchestrator = Arc::new(
             ProviderSubmitOrchestrator::new(
                 PostgresProviderTaskStore::new(database.pool.clone()),
-                GatedCliSubmitDriver::new(codec.clone(), runner, &runner_sha256)
-                    .map_err(debug_error)?,
+                gated_submit_driver(codec.clone(), runner, &runner_sha256)?,
                 60_000,
                 &journal_root,
             )
@@ -59,7 +60,7 @@ async fn orchestrator_runs_one_cli_for_concurrent_callers_and_replays() -> TestR
         )?;
         let restarted = ProviderSubmitOrchestrator::new(
             PostgresProviderTaskStore::new(database.pool.clone()),
-            GatedCliSubmitDriver::new(codec, runner, &runner_sha256).map_err(debug_error)?,
+            gated_submit_driver(codec, runner, &runner_sha256)?,
             60_000,
             &journal_root,
         )
@@ -71,7 +72,8 @@ async fn orchestrator_runs_one_cli_for_concurrent_callers_and_replays() -> TestR
         require(
             matches!(replay, ProviderSubmitOutcome::Attached(ref task)
                 if task.remote_operation_id == "gated-operation-1")
-                && fs::read(&side_effect).map_err(debug_error)? == b"invoked",
+                && fs::read(&side_effect).map_err(debug_error)? == b"invoked"
+                && workspace_attempt_count(&workspace_root)? == 0,
             format!("gated submit relaunched or failed to replay: {replay:?}"),
         )
     }
@@ -125,7 +127,11 @@ async fn recovery_releases_the_same_ready_process_after_journal_release() -> Tes
         .map_err(debug_error)?;
         let submission =
             GatedCliSubmission::new(&journal_root, lease.submission_id).map_err(debug_error)?;
-        let process_command = codec.gated_command().map_err(debug_error)?;
+        let process_workspace = gated_attempt_workspace(&codec, lease.submission_id, launch_nonce)?;
+        let process_workspace_path = process_workspace.path().to_owned();
+        let process_command = codec
+            .gated_command(&process_workspace)
+            .map_err(debug_error)?;
         submission
             .prepare(&binding, &process_command)
             .map_err(debug_error)?;
@@ -142,8 +148,8 @@ async fn recovery_releases_the_same_ready_process_after_journal_release() -> Tes
         let mut runner = runner_command.spawn().map_err(debug_error)?;
         let _ready = wait_gated_ready(&submission, &binding).await?;
         require(
-            !side_effect.exists(),
-            "ready gated process invoked provider before process release",
+            !side_effect.exists() && process_workspace_path.is_dir(),
+            "ready gated process invoked provider or lost its private workspace",
         )?;
         seed_remote_submit_dispatch_release(
             &journal_root,
@@ -155,8 +161,7 @@ async fn recovery_releases_the_same_ready_process_after_journal_release() -> Tes
 
         let recovered = ProviderSubmitOrchestrator::new(
             store,
-            GatedCliSubmitDriver::new(codec, runner_path, file_sha256(runner_path)?)
-                .map_err(debug_error)?,
+            gated_submit_driver(codec, runner_path, file_sha256(runner_path)?)?,
             60_000,
             &journal_root,
         )
@@ -174,6 +179,139 @@ async fn recovery_releases_the_same_ready_process_after_journal_release() -> Tes
                     if task.remote_operation_id == "recovered-gated-operation")
                 && fs::read(&side_effect).map_err(debug_error)? == b"invoked",
             format!("released gated process was not recovered exactly once: {recovered:?}"),
+        )?;
+        require(
+            !process_workspace_path.exists(),
+            "terminal recovery left the submit attempt workspace behind",
+        )
+    }
+    .await;
+    database.cleanup().await?;
+    result
+}
+
+#[tokio::test]
+async fn replaced_submit_workspace_root_fails_before_process_or_provider() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let lease =
+            seed_running_submission(&database.pool, "gated-workspace-replaced-worker").await?;
+        let journal = tempfile::tempdir().map_err(debug_error)?;
+        let journal_root = journal.path().join("remote-submit");
+        let side_effect = journal.path().join("provider-invoked");
+        let codec =
+            FakeGatedSubmitCodec::new(journal.path(), &side_effect, "workspace-must-not-run")?;
+        let workspace_root = codec.workspace_root.clone();
+        let runner = Path::new(env!("CARGO_BIN_EXE_remote-submit-runner"));
+        let driver = gated_submit_driver(codec, runner, file_sha256(runner)?)?;
+
+        let moved_workspace = journal.path().join("moved-provider-submit-workspace");
+        fs::rename(&workspace_root, &moved_workspace).map_err(debug_error)?;
+        fs::create_dir(&workspace_root).map_err(debug_error)?;
+        fs::set_permissions(&workspace_root, fs::Permissions::from_mode(0o700))
+            .map_err(debug_error)?;
+
+        let outcome = ProviderSubmitOrchestrator::new(
+            PostgresProviderTaskStore::new(database.pool.clone()),
+            driver,
+            60_000,
+            &journal_root,
+        )
+        .map_err(debug_error)?
+        .submit(gated_orchestrator_work(&lease)?)
+        .await
+        .map_err(debug_error)?;
+        let durable: (String, String, Option<String>) = sqlx::query_as(
+            r#"
+            SELECT execution.state, submission.state, submission.error_code
+            FROM executor_executions execution
+            JOIN provider_submissions submission
+              ON submission.executor_execution_id = execution.executor_execution_id
+             AND submission.submission_id = execution.submission_id
+            WHERE execution.executor_execution_id = $1
+            "#,
+        )
+        .bind(lease.executor_execution_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+
+        require(
+            matches!(outcome, ProviderSubmitOutcome::Terminal(_))
+                && durable
+                    == (
+                        "failed".to_owned(),
+                        "failed".to_owned(),
+                        Some("provider_submit_workspace_invalid".to_owned()),
+                    )
+                && !side_effect.exists()
+                && workspace_attempt_count(&workspace_root)? == 0
+                && workspace_attempt_count(&moved_workspace)? == 0,
+            format!(
+                "replaced submit workspace escaped fail-closed handling: {outcome:?}/{durable:?}"
+            ),
+        )
+    }
+    .await;
+    database.cleanup().await?;
+    result
+}
+
+#[tokio::test]
+async fn codec_cannot_replace_the_platform_allocated_submit_workspace() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let lease =
+            seed_running_submission(&database.pool, "gated-workspace-binding-worker").await?;
+        let journal = tempfile::tempdir().map_err(debug_error)?;
+        let journal_root = journal.path().join("remote-submit");
+        let side_effect = journal.path().join("provider-invoked");
+        let codec =
+            FakeGatedSubmitCodec::new(journal.path(), &side_effect, "workspace-must-not-run")?
+                .with_workspace_mismatch();
+        let workspace_root = codec.workspace_root.clone();
+        let runner = Path::new(env!("CARGO_BIN_EXE_remote-submit-runner"));
+
+        let outcome = ProviderSubmitOrchestrator::new(
+            PostgresProviderTaskStore::new(database.pool.clone()),
+            gated_submit_driver(codec, runner, file_sha256(runner)?)?,
+            60_000,
+            &journal_root,
+        )
+        .map_err(debug_error)?
+        .submit(gated_orchestrator_work(&lease)?)
+        .await
+        .map_err(debug_error)?;
+        let durable: (String, String, Option<String>) = sqlx::query_as(
+            r#"
+            SELECT execution.state, submission.state, submission.error_code
+            FROM executor_executions execution
+            JOIN provider_submissions submission
+              ON submission.executor_execution_id = execution.executor_execution_id
+             AND submission.submission_id = execution.submission_id
+            WHERE execution.executor_execution_id = $1
+            "#,
+        )
+        .bind(lease.executor_execution_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+
+        require(
+            matches!(outcome, ProviderSubmitOutcome::Terminal(_))
+                && durable
+                    == (
+                        "failed".to_owned(),
+                        "failed".to_owned(),
+                        Some("provider_submit_workspace_binding_mismatch".to_owned()),
+                    )
+                && !side_effect.exists()
+                && workspace_attempt_count(&workspace_root)? == 0,
+            format!("codec escaped the platform submit workspace: {outcome:?}/{durable:?}"),
         )
     }
     .await;
@@ -225,8 +363,7 @@ async fn replays_process_receipt_after_database_transaction_failure() -> TestRes
 
         let first = ProviderSubmitOrchestrator::new(
             PostgresProviderTaskStore::new(database.pool.clone()),
-            GatedCliSubmitDriver::new(codec.clone(), runner, &runner_sha256)
-                .map_err(debug_error)?,
+            gated_submit_driver(codec.clone(), runner, &runner_sha256)?,
             60_000,
             &journal_root,
         )
@@ -262,7 +399,7 @@ async fn replays_process_receipt_after_database_transaction_failure() -> TestRes
             .map_err(debug_error)?;
         let recovered = ProviderSubmitOrchestrator::new(
             PostgresProviderTaskStore::new(database.pool.clone()),
-            GatedCliSubmitDriver::new(codec, runner, &runner_sha256).map_err(debug_error)?,
+            gated_submit_driver(codec, runner, &runner_sha256)?,
             60_000,
             &journal_root,
         )
@@ -296,11 +433,12 @@ async fn expired_pre_release_budget_never_invokes_the_cli() -> TestResult {
         let codec =
             FakeGatedSubmitCodec::new(journal.path(), &side_effect, "expired-budget-operation")?
                 .with_projection_delay(projection_delay);
+        let workspace_root = codec.workspace_root.clone();
         let runner = Path::new(env!("CARGO_BIN_EXE_remote-submit-runner"));
         let started = Instant::now();
         let outcome = ProviderSubmitOrchestrator::new(
             PostgresProviderTaskStore::new(database.pool.clone()),
-            GatedCliSubmitDriver::new(codec, runner, file_sha256(runner)?).map_err(debug_error)?,
+            gated_submit_driver(codec, runner, file_sha256(runner)?)?,
             500,
             &journal_root,
         )
@@ -311,9 +449,87 @@ async fn expired_pre_release_budget_never_invokes_the_cli() -> TestResult {
         require(
             started.elapsed() >= projection_delay
                 && matches!(outcome, ProviderSubmitOutcome::Terminal(_))
-                && !side_effect.exists(),
+                && !side_effect.exists()
+                && workspace_attempt_count(&workspace_root)? == 0,
             format!(
                 "expired pre-release budget invoked the CLI or skipped projection: {outcome:?}"
+            ),
+        )
+    }
+    .await;
+    database.cleanup().await?;
+    result
+}
+
+#[tokio::test]
+async fn prepared_gate_expiring_before_dispatch_reaches_terminal_and_cleans_workspace() -> TestResult
+{
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let lease =
+            seed_running_submission(&database.pool, "gated-expired-prepared-worker").await?;
+        let journal = tempfile::tempdir().map_err(debug_error)?;
+        let journal_root = journal.path().join("remote-submit");
+        let side_effect = journal.path().join("provider-invoked");
+        let codec = FakeGatedSubmitCodec::new(journal.path(), &side_effect, "must-not-dispatch")?;
+        let workspace_root = codec.workspace_root.clone();
+        let real_runner = Path::new(env!("CARGO_BIN_EXE_remote-submit-runner"));
+        let delayed_runner = journal.path().join("delayed-remote-submit-runner");
+        fs::write(
+            &delayed_runner,
+            format!(
+                "#!/bin/sh\n/bin/sleep 0.15\nexec '{}' \"$@\"\n",
+                real_runner.display()
+            ),
+        )
+        .map_err(debug_error)?;
+        fs::set_permissions(&delayed_runner, fs::Permissions::from_mode(0o500))
+            .map_err(debug_error)?;
+
+        let outcome = ProviderSubmitOrchestrator::new(
+            PostgresProviderTaskStore::new(database.pool.clone()),
+            gated_submit_driver(codec, &delayed_runner, file_sha256(&delayed_runner)?)?,
+            75,
+            &journal_root,
+        )
+        .map_err(debug_error)?
+        .submit(gated_orchestrator_work(&lease)?)
+        .await
+        .map_err(debug_error)?;
+        let durable: (String, String, Option<String>) = sqlx::query_as(
+            r#"
+            SELECT execution.state, submission.state, submission.error_code
+            FROM executor_executions execution
+            JOIN provider_submissions submission
+              ON submission.executor_execution_id = execution.executor_execution_id
+             AND submission.submission_id = execution.submission_id
+            WHERE execution.executor_execution_id = $1
+            "#,
+        )
+        .bind(lease.executor_execution_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        let process_terminal = journal_root
+            .join(lease.submission_id.simple().to_string())
+            .join("process-terminal.json");
+
+        require(
+            matches!(outcome, ProviderSubmitOutcome::Terminal(_))
+                && durable
+                    == (
+                        "failed".to_owned(),
+                        "failed".to_owned(),
+                        Some("provider_submit_deadline_elapsed".to_owned()),
+                    )
+                && process_terminal.is_file()
+                && !side_effect.exists()
+                && workspace_attempt_count(&workspace_root)? == 0,
+            format!(
+                "expired prepared gate leaked work or skipped terminal cleanup: \
+                 {outcome:?}/{durable:?}"
             ),
         )
     }
@@ -390,7 +606,7 @@ async fn recovery_claim_completes_the_elected_unlaunched_attempt_once() -> TestR
         let runner = Path::new(env!("CARGO_BIN_EXE_remote-submit-runner"));
         let recovered = ProviderSubmitOrchestrator::new(
             store,
-            GatedCliSubmitDriver::new(codec, runner, file_sha256(runner)?).map_err(debug_error)?,
+            gated_submit_driver(codec, runner, file_sha256(runner)?)?,
             60_000,
             &journal_root,
         )
@@ -441,8 +657,7 @@ async fn outcome_unknown_recovery_observes_without_relaunching_cli() -> TestResu
         let runner_sha256 = file_sha256(runner)?;
         let first = ProviderSubmitOrchestrator::new(
             PostgresProviderTaskStore::new(database.pool.clone()),
-            GatedCliSubmitDriver::new(codec.clone(), runner, &runner_sha256)
-                .map_err(debug_error)?,
+            gated_submit_driver(codec.clone(), runner, &runner_sha256)?,
             60_000,
             &journal_root,
         )
@@ -471,7 +686,7 @@ async fn outcome_unknown_recovery_observes_without_relaunching_cli() -> TestResu
             .ok_or_else(|| "unknown submit was not recovery-claimable".to_owned())?;
         let orchestrator = ProviderSubmitOrchestrator::new(
             store,
-            GatedCliSubmitDriver::new(codec, runner, &runner_sha256).map_err(debug_error)?,
+            gated_submit_driver(codec, runner, &runner_sha256)?,
             60_000,
             &journal_root,
         )
@@ -502,12 +717,13 @@ async fn outcome_unknown_recovery_observes_without_relaunching_cli() -> TestResu
 
 #[derive(Clone)]
 struct FakeGatedSubmitCodec {
-    working_directory: PathBuf,
+    workspace_root: PathBuf,
     side_effect: PathBuf,
     shell_sha256: String,
     operation_id: String,
     projection_delay: Duration,
     receipt: String,
+    workspace_mismatch: bool,
 }
 
 impl FakeGatedSubmitCodec {
@@ -516,13 +732,21 @@ impl FakeGatedSubmitCodec {
         side_effect: impl AsRef<Path>,
         operation_id: impl Into<String>,
     ) -> TestResult<Self> {
+        let workspace_root = working_directory.as_ref().join("provider-submit-workspace");
+        match fs::create_dir(&workspace_root) {
+            Ok(()) => fs::set_permissions(&workspace_root, fs::Permissions::from_mode(0o700))
+                .map_err(debug_error)?,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(debug_error(error)),
+        }
         Ok(Self {
-            working_directory: working_directory.as_ref().to_owned(),
+            workspace_root,
             side_effect: side_effect.as_ref().to_owned(),
             shell_sha256: file_sha256(Path::new("/bin/sh"))?,
             operation_id: operation_id.into(),
             projection_delay: Duration::ZERO,
             receipt: "gated-receipt".to_owned(),
+            workspace_mismatch: false,
         })
     }
 
@@ -536,11 +760,23 @@ impl FakeGatedSubmitCodec {
         self
     }
 
-    fn gated_command(&self) -> Result<GatedCliCommand, ProviderFailure> {
+    fn with_workspace_mismatch(mut self) -> Self {
+        self.workspace_mismatch = true;
+        self
+    }
+
+    fn workspace_root(&self) -> TestResult<WorkingDirectory> {
+        WorkingDirectory::new_private(&self.workspace_root).map_err(debug_error)
+    }
+
+    fn gated_command(
+        &self,
+        workspace: &WorkingDirectory,
+    ) -> Result<GatedCliCommand, ProviderFailure> {
         GatedCliCommand::new(
             "/bin/sh",
             &self.shell_sha256,
-            &self.working_directory,
+            workspace.path(),
             vec![
                 "-c".to_owned(),
                 "printf invoked >> \"$1\"; printf %s \"$2\"".to_owned(),
@@ -571,9 +807,17 @@ impl GatedCliSubmitCodec for FakeGatedSubmitCodec {
         _intent: &ProviderSubmitIntent,
         _context: &ProviderExecutionContext,
         _command: &SingleOutputCommand<Self::Payload>,
+        workspace: &WorkingDirectory,
     ) -> Result<GatedCliCommand, ProviderFailure> {
         std::thread::sleep(self.projection_delay);
-        self.gated_command()
+        if self.workspace_mismatch {
+            let workspace = self.workspace_root().map_err(|_| {
+                fake_provider_failure("gated_workspace_invalid", EffectCertainty::NoRemoteEffect)
+            })?;
+            self.gated_command(&workspace)
+        } else {
+            self.gated_command(workspace)
+        }
     }
 
     fn decode_receipt(
@@ -604,6 +848,47 @@ impl GatedCliSubmitCodec for FakeGatedSubmitCodec {
             Some(25),
         ))
     }
+}
+
+fn gated_submit_driver(
+    codec: FakeGatedSubmitCodec,
+    runner: impl AsRef<Path>,
+    runner_sha256: impl AsRef<str>,
+) -> TestResult<GatedCliSubmitDriver<FakeGatedSubmitCodec>> {
+    let workspace_root = codec.workspace_root()?;
+    GatedCliSubmitDriver::new(codec, runner, runner_sha256, workspace_root).map_err(debug_error)
+}
+
+fn gated_attempt_workspace(
+    codec: &FakeGatedSubmitCodec,
+    submission_id: Uuid,
+    launch_nonce: Uuid,
+) -> TestResult<WorkingDirectory> {
+    let workspace = RecoverableAttemptWorkspace::new(&codec.workspace_root()?, ".provider-submit-")
+        .map_err(debug_error)?;
+    workspace
+        .open_or_create(&format!(
+            "{}-{}",
+            submission_id.simple(),
+            launch_nonce.simple()
+        ))
+        .and_then(|attempt| attempt.working_directory())
+        .map_err(debug_error)
+}
+
+fn workspace_attempt_count(path: &Path) -> TestResult<usize> {
+    fs::read_dir(path)
+        .map_err(debug_error)?
+        .try_fold(0_usize, |count, entry| {
+            let entry = entry.map_err(debug_error)?;
+            Ok(count
+                + usize::from(
+                    entry
+                        .file_name()
+                        .as_bytes()
+                        .starts_with(b".provider-submit-"),
+                ))
+        })
 }
 
 fn gated_orchestrator_work(

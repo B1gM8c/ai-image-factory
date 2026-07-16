@@ -41,6 +41,19 @@ pub struct AttemptDirectory {
     root_device: u64,
 }
 
+pub struct RecoverableAttemptWorkspace {
+    root: PathBuf,
+    directory: File,
+    attempt_prefix: String,
+    device: u64,
+}
+
+pub struct RecoverableAttemptDirectory {
+    path: PathBuf,
+    directory: File,
+    root_device: u64,
+}
+
 impl ExclusiveAttemptWorkspace {
     pub fn acquire(
         root: &WorkingDirectory,
@@ -136,14 +149,133 @@ impl ExclusiveAttemptWorkspace {
     }
 }
 
+impl RecoverableAttemptWorkspace {
+    pub fn new(
+        root: &WorkingDirectory,
+        attempt_prefix: &str,
+    ) -> Result<Self, AttemptWorkspaceError> {
+        validate_prefix(attempt_prefix)?;
+        let path = root.path().to_owned();
+        let directory = root
+            .directory()
+            .try_clone()
+            .map_err(|_| AttemptWorkspaceError::Unavailable)?;
+        let stat = rfs::fstat(&directory).map_err(|_| AttemptWorkspaceError::Unavailable)?;
+        let device = stat.st_dev as u64;
+        validate_bound_directory(&path, &directory, device)?;
+        Ok(Self {
+            root: path,
+            directory,
+            attempt_prefix: attempt_prefix.to_owned(),
+            device,
+        })
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub fn open_or_create(
+        &self,
+        attempt_key: &str,
+    ) -> Result<RecoverableAttemptDirectory, AttemptWorkspaceError> {
+        let name = self.attempt_name(attempt_key)?;
+        validate_bound_directory(&self.root, &self.directory, self.device)?;
+        let created = match rfs::mkdirat(&self.directory, &name, Mode::RWXU) {
+            Ok(()) => true,
+            Err(Errno::EXIST) => false,
+            Err(_) => return Err(AttemptWorkspaceError::Unavailable),
+        };
+        let result = self.bind_attempt(&name, created);
+        if result.is_err() && created {
+            let _ = rfs::unlinkat(&self.directory, &name, AtFlags::REMOVEDIR);
+        }
+        result
+    }
+
+    pub fn remove(&self, attempt_key: &str) -> Result<bool, AttemptWorkspaceError> {
+        let name = self.attempt_name(attempt_key)?;
+        validate_bound_directory(&self.root, &self.directory, self.device)?;
+        let mut budget = CleanupBudget::new();
+        let removed = remove_recoverable_attempt(&self.directory, &name, self.device, &mut budget)?;
+        if removed {
+            rfs::fsync(&self.directory).map_err(|_| AttemptWorkspaceError::Unavailable)?;
+        }
+        Ok(removed)
+    }
+
+    fn attempt_name(&self, attempt_key: &str) -> Result<OsString, AttemptWorkspaceError> {
+        validate_attempt_key(attempt_key)?;
+        let name = format!("{}{attempt_key}", self.attempt_prefix);
+        if name.len() > 255 {
+            return Err(AttemptWorkspaceError::InvalidConfiguration);
+        }
+        Ok(name.into())
+    }
+
+    fn bind_attempt(
+        &self,
+        name: &OsStr,
+        created: bool,
+    ) -> Result<RecoverableAttemptDirectory, AttemptWorkspaceError> {
+        let descriptor = open_directory_at(&self.directory, name)?;
+        if created {
+            rfs::fchmod(&descriptor, Mode::RWXU).map_err(|_| AttemptWorkspaceError::Unavailable)?;
+        }
+        let stat = rfs::fstat(&descriptor).map_err(|_| AttemptWorkspaceError::Unavailable)?;
+        if FileType::from_raw_mode(stat.st_mode) != FileType::Directory
+            || Mode::from_raw_mode(stat.st_mode) != Mode::RWXU
+            || stat.st_uid != effective_user_id()
+            || stat.st_dev as u64 != self.device
+        {
+            return Err(AttemptWorkspaceError::Integrity);
+        }
+        let current = stat_without_following(&self.directory, name)?;
+        if !same_object(&stat, &current) {
+            return Err(AttemptWorkspaceError::Integrity);
+        }
+        validate_bound_directory(&self.root, &self.directory, self.device)?;
+        // A concurrent opener can observe the directory before its creator reaches fsync.
+        rfs::fsync(&descriptor).map_err(|_| AttemptWorkspaceError::Unavailable)?;
+        rfs::fsync(&self.directory).map_err(|_| AttemptWorkspaceError::Unavailable)?;
+        Ok(RecoverableAttemptDirectory {
+            path: self.root.join(name),
+            directory: File::from(descriptor),
+            root_device: self.device,
+        })
+    }
+}
+
 impl AttemptDirectory {
     pub fn path(&self) -> &Path {
         &self.path
     }
 
     pub fn working_directory(&self) -> Result<WorkingDirectory, AttemptWorkspaceError> {
-        let working =
-            WorkingDirectory::new(&self.path).map_err(|_| AttemptWorkspaceError::Integrity)?;
+        let working = WorkingDirectory::new_private(&self.path)
+            .map_err(|_| AttemptWorkspaceError::Integrity)?;
+        let opened = rfs::fstat(&self.directory).map_err(|_| AttemptWorkspaceError::Unavailable)?;
+        let working_directory = working.directory();
+        let rebound =
+            rfs::fstat(&working_directory).map_err(|_| AttemptWorkspaceError::Unavailable)?;
+        if !same_object(&opened, &rebound)
+            || Mode::from_raw_mode(opened.st_mode) != Mode::RWXU
+            || opened.st_dev as u64 != self.root_device
+        {
+            return Err(AttemptWorkspaceError::Integrity);
+        }
+        Ok(working)
+    }
+}
+
+impl RecoverableAttemptDirectory {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn working_directory(&self) -> Result<WorkingDirectory, AttemptWorkspaceError> {
+        let working = WorkingDirectory::new_private(&self.path)
+            .map_err(|_| AttemptWorkspaceError::Integrity)?;
         let opened = rfs::fstat(&self.directory).map_err(|_| AttemptWorkspaceError::Unavailable)?;
         let working_directory = working.directory();
         let rebound =
@@ -217,6 +349,18 @@ fn validate_prefix(prefix: &str) -> Result<(), AttemptWorkspaceError> {
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
         || ATTEMPT_WORKSPACE_LOCK_FILENAME.starts_with(prefix)
+    {
+        return Err(AttemptWorkspaceError::InvalidConfiguration);
+    }
+    Ok(())
+}
+
+fn validate_attempt_key(value: &str) -> Result<(), AttemptWorkspaceError> {
+    if value.is_empty()
+        || value.len() > 192
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
     {
         return Err(AttemptWorkspaceError::InvalidConfiguration);
     }
@@ -353,6 +497,50 @@ fn remove_attempt(
     rfs::unlinkat(root, name, AtFlags::REMOVEDIR).map_err(|_| AttemptWorkspaceError::Unavailable)
 }
 
+fn remove_recoverable_attempt(
+    root: &File,
+    name: &OsStr,
+    root_device: u64,
+    budget: &mut CleanupBudget,
+) -> Result<bool, AttemptWorkspaceError> {
+    let Some(before) = stat_optional_without_following(root, name)? else {
+        return Ok(false);
+    };
+    if FileType::from_raw_mode(before.st_mode) != FileType::Directory
+        || Mode::from_raw_mode(before.st_mode) != Mode::RWXU
+        || before.st_uid != effective_user_id()
+        || before.st_dev as u64 != root_device
+    {
+        return Err(AttemptWorkspaceError::Integrity);
+    }
+    let Some(directory) = open_optional_directory_at(root, name)? else {
+        return Ok(false);
+    };
+    let opened = rfs::fstat(&directory).map_err(|_| AttemptWorkspaceError::Unavailable)?;
+    if !same_object(&before, &opened) {
+        return Err(AttemptWorkspaceError::Integrity);
+    }
+    match rfs::flock(&directory, FlockOperation::NonBlockingLockExclusive) {
+        Ok(()) => {}
+        Err(error) if error == Errno::WOULDBLOCK || error == Errno::AGAIN => return Ok(false),
+        Err(_) => return Err(AttemptWorkspaceError::Unavailable),
+    }
+    let Some(current) = stat_optional_without_following(root, name)? else {
+        return Ok(false);
+    };
+    if !same_object(&opened, &current) {
+        return Err(AttemptWorkspaceError::Integrity);
+    }
+    clear_directory(&directory, root_device, true, 0, budget)?;
+    let current = stat_without_following(root, name)?;
+    if !same_object(&opened, &current) {
+        return Err(AttemptWorkspaceError::Integrity);
+    }
+    rfs::unlinkat(root, name, AtFlags::REMOVEDIR)
+        .map_err(|_| AttemptWorkspaceError::Unavailable)?;
+    Ok(true)
+}
+
 fn clear_directory(
     directory: &impl std::os::fd::AsFd,
     root_device: u64,
@@ -409,12 +597,39 @@ fn open_directory_at(
     .map_err(|_| AttemptWorkspaceError::Integrity)
 }
 
+fn open_optional_directory_at(
+    parent: &impl std::os::fd::AsFd,
+    name: &OsStr,
+) -> Result<Option<std::os::fd::OwnedFd>, AttemptWorkspaceError> {
+    match rfs::openat(
+        parent,
+        name,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
+        Mode::empty(),
+    ) {
+        Ok(directory) => Ok(Some(directory)),
+        Err(Errno::NOENT) => Ok(None),
+        Err(_) => Err(AttemptWorkspaceError::Integrity),
+    }
+}
+
 fn stat_without_following(
     parent: &impl std::os::fd::AsFd,
     name: &OsStr,
 ) -> Result<rfs::Stat, AttemptWorkspaceError> {
     rfs::statat(parent, name, AtFlags::SYMLINK_NOFOLLOW)
         .map_err(|_| AttemptWorkspaceError::Unavailable)
+}
+
+fn stat_optional_without_following(
+    parent: &impl std::os::fd::AsFd,
+    name: &OsStr,
+) -> Result<Option<rfs::Stat>, AttemptWorkspaceError> {
+    match rfs::statat(parent, name, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(stat) => Ok(Some(stat)),
+        Err(Errno::NOENT) => Ok(None),
+        Err(_) => Err(AttemptWorkspaceError::Unavailable),
+    }
 }
 
 fn directory_entries(
@@ -528,6 +743,107 @@ mod tests {
                 .count(),
             0
         );
+    }
+
+    #[test]
+    fn recoverable_attempt_reopens_one_deterministic_private_directory() {
+        let root = private_root();
+        let working = WorkingDirectory::new_private(root.path()).unwrap();
+        let workspace = RecoverableAttemptWorkspace::new(&working, ".provider-submit-").unwrap();
+
+        let first = workspace.open_or_create("submission-launch").unwrap();
+        let first_path = first.path().to_owned();
+        let first_directory = first.working_directory().unwrap();
+        drop(first);
+        let reopened = workspace.open_or_create("submission-launch").unwrap();
+        let reopened_directory = reopened.working_directory().unwrap();
+
+        assert_eq!(first_path, reopened.path());
+        assert_eq!(first_directory.path(), reopened_directory.path());
+        assert!(first_path.is_dir());
+    }
+
+    #[test]
+    fn recoverable_attempt_cleanup_is_bounded_and_idempotent() {
+        let root = private_root();
+        let outside_root = TempDir::new().unwrap();
+        let outside = outside_root.path().join("outside");
+        fs::write(&outside, b"authority").unwrap();
+        let working = WorkingDirectory::new_private(root.path()).unwrap();
+        let workspace = RecoverableAttemptWorkspace::new(&working, ".provider-submit-").unwrap();
+        let attempt = workspace.open_or_create("cleanup").unwrap();
+        let nested = attempt.path().join("nested");
+        fs::create_dir(&nested).unwrap();
+        fs::write(nested.join("provider.tmp"), b"bytes").unwrap();
+        symlink(&outside, attempt.path().join("outside-link")).unwrap();
+        drop(attempt);
+
+        assert!(workspace.remove("cleanup").unwrap());
+        assert!(!workspace.remove("cleanup").unwrap());
+        assert_eq!(fs::read(outside).unwrap(), b"authority");
+    }
+
+    #[test]
+    fn concurrent_recoverable_cleanup_serializes_per_attempt() {
+        let root = private_root();
+        let working = WorkingDirectory::new_private(root.path()).unwrap();
+        let workspace = std::sync::Arc::new(
+            RecoverableAttemptWorkspace::new(&working, ".provider-submit-").unwrap(),
+        );
+        let attempt = workspace.open_or_create("concurrent-cleanup").unwrap();
+        fs::write(attempt.path().join("provider.tmp"), b"bytes").unwrap();
+        drop(attempt);
+
+        let removed = std::thread::scope(|scope| {
+            let handles = (0..32)
+                .map(|_| {
+                    let workspace = std::sync::Arc::clone(&workspace);
+                    scope.spawn(move || workspace.remove("concurrent-cleanup").unwrap())
+                })
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+
+        assert_eq!(removed.into_iter().filter(|removed| *removed).count(), 1);
+        assert!(
+            !root
+                .path()
+                .join(".provider-submit-concurrent-cleanup")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn recoverable_attempt_stays_bound_to_the_original_root() {
+        let outer = TempDir::new().unwrap();
+        let root = outer.path().join("workspace");
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let working = WorkingDirectory::new_private(&root).unwrap();
+        let workspace = RecoverableAttemptWorkspace::new(&working, ".provider-submit-").unwrap();
+        let attempt = workspace.open_or_create("original").unwrap();
+        fs::write(attempt.path().join("provider.tmp"), b"original").unwrap();
+
+        let moved = outer.path().join("moved-workspace");
+        fs::rename(&root, &moved).unwrap();
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let replacement = root.join(".provider-submit-original");
+        fs::create_dir(&replacement).unwrap();
+        fs::write(replacement.join("sentinel"), b"replacement").unwrap();
+
+        assert!(matches!(
+            workspace.remove("original"),
+            Err(AttemptWorkspaceError::Integrity)
+        ));
+        assert_eq!(
+            fs::read(replacement.join("sentinel")).unwrap(),
+            b"replacement"
+        );
+        assert!(moved.join(".provider-submit-original").is_dir());
     }
 
     #[test]

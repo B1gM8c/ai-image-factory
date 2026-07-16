@@ -5,7 +5,9 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use image_cli_runtime::VerifiedExecutable;
+use image_cli_runtime::{
+    AttemptWorkspaceError, RecoverableAttemptWorkspace, VerifiedExecutable, WorkingDirectory,
+};
 use image_provider_sdk::{
     CanonicalCommandPayload, EffectCertainty, PendingOperation, ProviderFailure,
     ProviderFailureClass, RetryDirective,
@@ -25,6 +27,7 @@ use crate::provider_tasks::{
 const PROCESS_OBSERVATION_INTERVAL: Duration = Duration::from_millis(10);
 const RUNNER_HANDOFF_GRACE: Duration = Duration::from_millis(500);
 const TERMINAL_PUBLICATION_GRACE_MS: u64 = 2_000;
+const SUBMIT_ATTEMPT_PREFIX: &str = ".provider-submit-";
 
 pub trait GatedCliSubmitCodec: Send + Sync + 'static {
     type Payload: CanonicalCommandPayload + Send + Sync + 'static;
@@ -36,6 +39,7 @@ pub trait GatedCliSubmitCodec: Send + Sync + 'static {
         intent: &ProviderSubmitIntent,
         context: &ProviderExecutionContext,
         command: &image_provider_sdk::SingleOutputCommand<Self::Payload>,
+        workspace: &WorkingDirectory,
     ) -> Result<GatedCliCommand, ProviderFailure>;
 
     fn decode_receipt(
@@ -51,6 +55,7 @@ pub struct GatedCliSubmitDriver<C> {
     runner_executable: PathBuf,
     runner_sha256: [u8; 32],
     runner_start: Mutex<()>,
+    workspace: Arc<RecoverableAttemptWorkspace>,
 }
 
 pub struct GatedCliPreparedSubmission {
@@ -63,6 +68,7 @@ struct GatedProcessRef {
     root: PathBuf,
     submission_id: Uuid,
     binding: GatedCliBinding,
+    attempt_key: String,
 }
 
 impl<C> GatedCliSubmitDriver<C>
@@ -73,15 +79,19 @@ where
         codec: C,
         runner_executable: impl AsRef<Path>,
         runner_sha256: impl AsRef<str>,
+        workspace_root: WorkingDirectory,
     ) -> Result<Self, GatedCliProcessError> {
         let runner_sha256 = parse_sha256(runner_sha256.as_ref())?;
         let runner = VerifiedExecutable::new_with_sha256(runner_executable, runner_sha256)
             .map_err(|_| GatedCliProcessError::InvalidInput)?;
+        let workspace = RecoverableAttemptWorkspace::new(&workspace_root, SUBMIT_ATTEMPT_PREFIX)
+            .map_err(map_workspace_config_error)?;
         Ok(Self {
             codec: Arc::new(codec),
             runner_executable: runner.path().to_owned(),
             runner_sha256,
             runner_start: Mutex::new(()),
+            workspace: Arc::new(workspace),
         })
     }
 
@@ -90,25 +100,54 @@ where
         call: &ProviderSubmitDriverCall<C::Payload>,
     ) -> Result<GatedCliPreparedSubmission, ProviderFailure> {
         let prepare_started = Instant::now();
+        let process = GatedProcessRef::new(call)?;
+        let workspace = Arc::clone(&self.workspace);
+        let attempt_key = process.attempt_key.clone();
+        let working_directory = tokio::task::spawn_blocking(move || {
+            workspace.open_or_create(&attempt_key)?.working_directory()
+        })
+        .await
+        .map_err(|_| local_process_failure("provider_submit_workspace_worker_stopped"))?
+        .map_err(map_workspace_runtime_error)?;
         let codec = Arc::clone(&self.codec);
         let owned_call = call.clone();
+        let projected_workspace = working_directory.clone();
         let command = tokio::task::spawn_blocking(move || {
             codec.command(
                 owned_call.intent(),
                 owned_call.execution_context(),
                 owned_call.command(),
+                &projected_workspace,
             )
         })
-        .await
-        .map_err(|_| local_process_failure("provider_submit_codec_worker_stopped"))?
-        .map_err(|failure| {
-            if failure.effect() == EffectCertainty::NoRemoteEffect {
-                failure
-            } else {
-                local_process_failure("provider_submit_codec_effect_invalid")
+        .await;
+        let command = match command {
+            Ok(Ok(command)) => command,
+            Ok(Err(failure)) => {
+                self.cleanup_workspace(&process).await;
+                return Err(if failure.effect() == EffectCertainty::NoRemoteEffect {
+                    failure
+                } else {
+                    local_process_failure("provider_submit_codec_effect_invalid")
+                });
             }
-        })?;
-        let process = GatedProcessRef::new(call)?;
+            Err(_) => {
+                self.cleanup_workspace(&process).await;
+                return Err(local_process_failure(
+                    "provider_submit_codec_worker_stopped",
+                ));
+            }
+        };
+        if command.working_directory() != working_directory.path() {
+            self.cleanup_workspace(&process).await;
+            return Err(local_process_failure(
+                "provider_submit_workspace_binding_mismatch",
+            ));
+        }
+        if prepare_started.elapsed() >= Duration::from_millis(call.remaining_budget_ms()) {
+            self.cleanup_workspace(&process).await;
+            return Err(local_process_failure("provider_submit_deadline_elapsed"));
+        }
         let prepare_process = process.clone();
         tokio::task::spawn_blocking(move || {
             let submission =
@@ -130,7 +169,13 @@ where
                 .map_err(pre_release_process_failure)?;
             if matches!(observation, GatedCliObservation::AwaitingHelper) {
                 runner_start = Some(guard);
-                Some(self.spawn_runner(&process).await?)
+                match self.spawn_runner(&process).await {
+                    Ok(runner) => Some(runner),
+                    Err(failure) => {
+                        self.cleanup_workspace(&process).await;
+                        return Err(failure);
+                    }
+                }
             } else {
                 None
             }
@@ -209,8 +254,34 @@ where
             },
         };
         match wait_for_terminal(&process).await {
-            Ok(terminal) => self.resolve_terminal(call, terminal).await,
-            Err(failure) => ProviderSubmitDriverRecovery::Failed(failure),
+            Ok(terminal) => {
+                let result = self.resolve_terminal(call, terminal).await;
+                self.cleanup_workspace(&process).await;
+                result
+            }
+            Err(failure) => {
+                if failure.cleanup_safe {
+                    self.cleanup_workspace(&process).await;
+                }
+                ProviderSubmitDriverRecovery::Failed(failure.failure)
+            }
+        }
+    }
+
+    async fn cleanup_workspace(&self, process: &GatedProcessRef) {
+        let workspace = Arc::clone(&self.workspace);
+        let attempt_key = process.attempt_key.clone();
+        let result = tokio::task::spawn_blocking(move || workspace.remove(&attempt_key)).await;
+        match result {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => tracing::error!(
+                error = %error,
+                "provider submit attempt workspace cleanup failed"
+            ),
+            Err(error) => tracing::error!(
+                error = %error,
+                "provider submit attempt workspace cleanup worker stopped"
+            ),
         }
     }
 
@@ -300,9 +371,10 @@ impl GatedProcessRef {
         let absolute_deadline_unix_ms =
             u64::try_from(call.execution_context().provider_deadline_at_ms())
                 .map_err(|_| local_process_failure("provider_submit_deadline_invalid"))?;
+        let launch_nonce = call.launch_nonce();
         let binding = GatedCliBinding::new(
             call.execution_context().execution_binding_sha256(),
-            call.launch_nonce(),
+            launch_nonce,
             absolute_deadline_unix_ms,
         )
         .map_err(pre_release_process_failure)?;
@@ -310,6 +382,11 @@ impl GatedProcessRef {
             root: call.journal_root().to_owned(),
             submission_id: call.intent().submission_id,
             binding,
+            attempt_key: format!(
+                "{}-{}",
+                call.intent().submission_id.simple(),
+                launch_nonce.simple()
+            ),
         })
     }
 
@@ -329,17 +406,15 @@ async fn wait_until_prepared(
 ) -> Result<GatedCliPreparedSubmission, ProviderFailure> {
     let mut runner_stopped_at = None;
     loop {
-        if prepare_started.elapsed() >= prepare_budget {
-            let _ = terminate_orphan(&process).await;
-            return Err(local_process_failure("provider_submit_deadline_elapsed"));
-        }
+        let budget_expired = prepare_started.elapsed() >= prepare_budget;
         match observation {
-            GatedCliObservation::Ready(ready) => {
+            GatedCliObservation::Ready(ready) if !budget_expired => {
                 return Ok(GatedCliPreparedSubmission {
                     process,
                     ready: Some(ready),
                 });
             }
+            GatedCliObservation::Ready(_) => {}
             GatedCliObservation::Running | GatedCliObservation::Terminal(_) => {
                 return Ok(GatedCliPreparedSubmission {
                     process,
@@ -389,15 +464,16 @@ async fn wait_until_prepared(
 
 async fn wait_for_terminal(
     process: &GatedProcessRef,
-) -> Result<GatedCliProcessTerminal, ProviderFailure> {
+) -> Result<GatedCliProcessTerminal, ProcessWaitFailure> {
     loop {
         match observe_process(process).await {
             Ok(GatedCliObservation::Ready(ready)) => match release_process(process, ready).await {
                 Ok(()) | Err(GatedCliProcessError::NotReady) => {}
                 Err(_) => {
-                    return Err(unknown_process_failure(
-                        "provider_submit_process_release_failed",
-                    ));
+                    return Err(ProcessWaitFailure {
+                        failure: unknown_process_failure("provider_submit_process_release_failed"),
+                        cleanup_safe: false,
+                    });
                 }
             },
             Ok(GatedCliObservation::Running) => {}
@@ -407,33 +483,52 @@ async fn wait_for_terminal(
                 child_alive,
             }) => {
                 if child_alive {
-                    let _ = terminate_orphan(process).await;
+                    let cleanup_safe = terminate_orphan(process).await.is_ok();
+                    return Err(ProcessWaitFailure {
+                        failure: if released {
+                            unknown_process_failure("provider_submit_evidence_lost")
+                        } else {
+                            local_process_failure("provider_submit_gate_lost")
+                        },
+                        cleanup_safe,
+                    });
                 }
-                return Err(if released {
-                    unknown_process_failure("provider_submit_evidence_lost")
-                } else {
-                    local_process_failure("provider_submit_gate_lost")
+                return Err(ProcessWaitFailure {
+                    failure: if released {
+                        unknown_process_failure("provider_submit_evidence_lost")
+                    } else {
+                        local_process_failure("provider_submit_gate_lost")
+                    },
+                    cleanup_safe: true,
                 });
             }
             Ok(GatedCliObservation::AwaitingHelper | GatedCliObservation::Starting) => {
-                return Err(unknown_process_failure(
-                    "provider_submit_process_ordering_invalid",
-                ));
+                return Err(ProcessWaitFailure {
+                    failure: unknown_process_failure("provider_submit_process_ordering_invalid"),
+                    cleanup_safe: false,
+                });
             }
             Err(_) => {
-                return Err(unknown_process_failure(
-                    "provider_submit_process_observation_failed",
-                ));
+                return Err(ProcessWaitFailure {
+                    failure: unknown_process_failure("provider_submit_process_observation_failed"),
+                    cleanup_safe: false,
+                });
             }
         }
         if unix_time_ms() >= process.evidence_deadline_unix_ms() {
-            let _ = terminate_orphan(process).await;
-            return Err(unknown_process_failure(
-                "provider_submit_terminal_evidence_timeout",
-            ));
+            let cleanup_safe = terminate_orphan(process).await.is_ok();
+            return Err(ProcessWaitFailure {
+                failure: unknown_process_failure("provider_submit_terminal_evidence_timeout"),
+                cleanup_safe,
+            });
         }
         tokio::time::sleep(PROCESS_OBSERVATION_INTERVAL).await;
     }
+}
+
+struct ProcessWaitFailure {
+    failure: ProviderFailure,
+    cleanup_safe: bool,
 }
 
 async fn observe_process(
@@ -497,6 +592,26 @@ fn pre_release_process_failure(error: GatedCliProcessError) -> ProviderFailure {
         GatedCliProcessError::Unavailable => "provider_submit_process_unavailable",
         GatedCliProcessError::Busy => "provider_submit_process_busy",
         GatedCliProcessError::NotReady => "provider_submit_process_not_ready",
+    };
+    local_process_failure(code)
+}
+
+fn map_workspace_config_error(error: AttemptWorkspaceError) -> GatedCliProcessError {
+    match error {
+        AttemptWorkspaceError::InvalidConfiguration => GatedCliProcessError::InvalidInput,
+        AttemptWorkspaceError::Unavailable => GatedCliProcessError::Unavailable,
+        AttemptWorkspaceError::Integrity | AttemptWorkspaceError::AlreadyLocked => {
+            GatedCliProcessError::Integrity
+        }
+    }
+}
+
+fn map_workspace_runtime_error(error: AttemptWorkspaceError) -> ProviderFailure {
+    let code = match error {
+        AttemptWorkspaceError::Unavailable => "provider_submit_workspace_unavailable",
+        AttemptWorkspaceError::InvalidConfiguration
+        | AttemptWorkspaceError::Integrity
+        | AttemptWorkspaceError::AlreadyLocked => "provider_submit_workspace_invalid",
     };
     local_process_failure(code)
 }

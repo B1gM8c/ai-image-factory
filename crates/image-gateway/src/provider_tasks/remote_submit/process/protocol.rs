@@ -240,7 +240,7 @@ impl DiskRequest {
             parse_sha256(&self.executable_sha256)?,
         )
         .map_err(|_| GatedCliProcessError::Integrity)?;
-        let working_directory = WorkingDirectory::new(&self.working_directory)
+        let working_directory = WorkingDirectory::new_private(&self.working_directory)
             .map_err(|_| GatedCliProcessError::Integrity)?;
         let mut command = CommandSpec::new_receipt(
             executable,

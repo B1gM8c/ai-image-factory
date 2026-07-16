@@ -162,7 +162,7 @@ where
         call: &ProviderSubmitDriverCall<Self::Payload>,
     ) -> Result<PendingOperation, ProviderFailure> {
         if call.remaining_budget_ms == 0 {
-            return Err(submit_timeout_failure());
+            return Err(submit_deadline_elapsed_failure());
         }
         match tokio::time::timeout(
             Duration::from_millis(call.remaining_budget_ms),
@@ -201,4 +201,29 @@ fn submit_timeout_failure() -> ProviderFailure {
         RetryDirective::Never,
     )
     .expect("static provider failure must be valid")
+}
+
+fn submit_deadline_elapsed_failure() -> ProviderFailure {
+    ProviderFailure::new(
+        ProviderFailureClass::Permanent,
+        "provider_submit_deadline_elapsed",
+        EffectCertainty::NoRemoteEffect,
+        RetryDirective::Never,
+    )
+    .expect("static provider failure must be valid")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zero_budget_is_rejected_before_a_remote_effect() {
+        let failure = submit_deadline_elapsed_failure();
+
+        assert_eq!(failure.code(), "provider_submit_deadline_elapsed");
+        assert_eq!(failure.effect(), EffectCertainty::NoRemoteEffect);
+        assert_eq!(failure.class(), ProviderFailureClass::Permanent);
+        assert_eq!(failure.retry(), RetryDirective::Never);
+    }
 }

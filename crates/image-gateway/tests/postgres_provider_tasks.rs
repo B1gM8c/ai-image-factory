@@ -35,6 +35,7 @@ use gpt_image_2_gateway::{
     database::{connect_test_pool_with_search_path, run_migrations},
 };
 use image::{DynamicImage, ImageFormat, Rgba, RgbaImage};
+use image_cli_runtime::{RecoverableAttemptWorkspace, WorkingDirectory};
 use image_provider_dreamina_cli::{
     ADAPTER_REVISION as DREAMINA_ADAPTER_REVISION, DREAMINA_IMAGE_GENERATION_OPERATION_V1,
     DREAMINA_SUBMIT_COMMAND_SCHEMA, PROVIDER_ID as DREAMINA_PROVIDER_ID,
