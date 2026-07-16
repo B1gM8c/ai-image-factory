@@ -12,10 +12,10 @@ use crate::{
     provider_tasks::{
         ProviderExecutionContext, ProviderRemoteTask, ProviderSubmitAcquire, ProviderSubmitDriver,
         ProviderSubmitDriverCall, ProviderSubmitDriverRecovery, ProviderSubmitFailureKind,
-        ProviderSubmitIntent, ProviderSubmitIntentState, ProviderSubmitRecoveryFence,
-        ProviderSubmitRecoveryLease, ProviderTaskStore, ProviderTaskStoreError, RemoteTaskAttach,
-        RemoteTaskQuarantinedReceipt, RemoteTaskSubmitFailure, RemoteTaskSubmitReceipt,
-        RemoteTaskSubmitReservation,
+        ProviderSubmitIntent, ProviderSubmitIntentState, ProviderSubmitOrchestrationStore,
+        ProviderSubmitRecoveryFence, ProviderSubmitRecoveryLease, ProviderTaskStoreError,
+        RemoteTaskAttach, RemoteTaskQuarantinedReceipt, RemoteTaskSubmitFailure,
+        RemoteTaskSubmitReceipt, RemoteTaskSubmitReservation,
         remote_submit::{
             RemoteSubmitJournal, RemoteSubmitJournalError, RemoteSubmitJournalObservation,
             RemoteSubmitJournalSpec, RemoteSubmitJournalTerminal, RemoteSubmitLaunch,
@@ -114,7 +114,7 @@ pub struct ProviderSubmitOrchestrator<S, D> {
 
 impl<S, D> ProviderSubmitOrchestrator<S, D>
 where
-    S: ProviderTaskStore,
+    S: ProviderSubmitOrchestrationStore,
     D: ProviderSubmitDriver,
 {
     pub fn new(

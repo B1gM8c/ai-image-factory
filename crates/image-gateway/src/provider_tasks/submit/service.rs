@@ -10,9 +10,10 @@ use crate::{
         ExecutorSubmissionStore,
     },
     provider_tasks::{
-        ProviderSubmitDriver, ProviderSubmitOrchestrator, ProviderSubmitOrchestratorError,
-        ProviderSubmitOutcome, ProviderSubmitRecoveryLease, ProviderSubmitRecoveryWork,
-        ProviderSubmitWork, ProviderTaskClaimScope, ProviderTaskStore, ProviderTaskStoreError,
+        ProviderSubmitDriver, ProviderSubmitOrchestrationStore, ProviderSubmitOrchestrator,
+        ProviderSubmitOrchestratorError, ProviderSubmitOutcome, ProviderSubmitRecoveryLease,
+        ProviderSubmitRecoveryWork, ProviderSubmitSchedulingStore, ProviderSubmitWork,
+        ProviderTaskClaimScope, ProviderTaskStoreError,
     },
 };
 
@@ -170,7 +171,7 @@ pub struct ProviderSubmitService<E, S, D, P> {
 impl<E, S, D, P> ProviderSubmitService<E, S, D, P>
 where
     E: ExecutorSubmissionStore + ExecutorLaunchContextStore,
-    S: ProviderTaskStore + Clone,
+    S: ProviderSubmitOrchestrationStore + ProviderSubmitSchedulingStore + Clone,
     D: ProviderSubmitDriver,
     P: ProviderSubmitProjector<D>,
 {
@@ -405,7 +406,7 @@ where
 impl<E, S, D, P> ProviderSubmitIteration for ProviderSubmitService<E, S, D, P>
 where
     E: ExecutorSubmissionStore + ExecutorLaunchContextStore,
-    S: ProviderTaskStore + Clone,
+    S: ProviderSubmitOrchestrationStore + ProviderSubmitSchedulingStore + Clone,
     D: ProviderSubmitDriver,
     P: ProviderSubmitProjector<D>,
 {

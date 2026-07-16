@@ -105,6 +105,9 @@ constant-cardinality provider status projection are documented in
 The Read Committed capacity-counter race, heartbeat fast path, and repeated
 4096-row mixed submit evidence are documented in
 [`docs/architecture/2026-phase2ag-capacity-counter-snapshot.md`](docs/architecture/2026-phase2ag-capacity-counter-snapshot.md).
+The static submit orchestration and scheduling persistence ports are documented
+in
+[`docs/architecture/2026-phase2ah-capability-shaped-submit-store.md`](docs/architecture/2026-phase2ah-capability-shaped-submit-store.md).
 Database-bound provider profiles and durable capacity are documented in
 [`docs/architecture/2026-phase1g-execution-binding-capacity.md`](docs/architecture/2026-phase1g-execution-binding-capacity.md).
 

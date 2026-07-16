@@ -51,9 +51,10 @@ pub use submit::{
     ProviderSubmitDaemon, ProviderSubmitDaemonConfig, ProviderSubmitDaemonError,
     ProviderSubmitDaemonReport, ProviderSubmitDriver, ProviderSubmitDriverCall,
     ProviderSubmitDriverRecovery, ProviderSubmitIteration, ProviderSubmitIterationCommand,
-    ProviderSubmitIterationCommandError, ProviderSubmitOrchestrator,
-    ProviderSubmitOrchestratorError, ProviderSubmitOutcome, ProviderSubmitProjectionError,
-    ProviderSubmitProjector, ProviderSubmitRecoveryWork, ProviderSubmitRun, ProviderSubmitService,
+    ProviderSubmitIterationCommandError, ProviderSubmitOrchestrationStore,
+    ProviderSubmitOrchestrator, ProviderSubmitOrchestratorError, ProviderSubmitOutcome,
+    ProviderSubmitProjectionError, ProviderSubmitProjector, ProviderSubmitRecoveryWork,
+    ProviderSubmitRun, ProviderSubmitSchedulingStore, ProviderSubmitService,
     ProviderSubmitServiceConfig, ProviderSubmitServiceError, ProviderSubmitWork,
 };
 
