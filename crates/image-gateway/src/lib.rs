@@ -73,8 +73,8 @@ pub use provider_tasks::{
     ProviderPollDaemon, ProviderPollDaemonConfig, ProviderPollDaemonError,
     ProviderPollDaemonReport, ProviderPollDriver, ProviderPollDriverCall, ProviderPollIteration,
     ProviderPollOrchestrator, ProviderPollOrchestratorConfig, ProviderPollOrchestratorError,
-    ProviderPollRun, ProviderPollRuntimeProfile, ProviderPollRuntimeProfileStore,
-    ProviderPollStore, ProviderRemoteTask, ProviderSubmitAcquire, ProviderSubmitAttachAuthority,
+    ProviderPollRun, ProviderPollStore, ProviderRemoteTask, ProviderRuntimeProfile,
+    ProviderRuntimeProfileStore, ProviderSubmitAcquire, ProviderSubmitAttachAuthority,
     ProviderSubmitBusyAuthority, ProviderSubmitDaemon, ProviderSubmitDaemonConfig,
     ProviderSubmitDaemonError, ProviderSubmitDaemonReport, ProviderSubmitDispatchAuthority,
     ProviderSubmitDriver, ProviderSubmitDriverCall, ProviderSubmitDriverRecovery,
@@ -95,6 +95,7 @@ pub use provider_tasks::{
 pub use providers::dreamina_cli::{
     DreaminaCliCodecConfigError, DreaminaCliPollDriverConfigError, DreaminaCliPollDriverV1,
     DreaminaCliPollProcessConfig, DreaminaCliRuntimeBindingV1, DreaminaCliSubmitCodecV1,
+    DreaminaCliSubmitProcessConfig, DreaminaCliSubmitRuntimeConfigError,
 };
 pub use reconciliation::{
     InputCleanupOutcome, PostgresReconciliationStore, ReconciliationOutcome, ReconciliationStore,

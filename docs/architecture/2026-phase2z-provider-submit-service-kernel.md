@@ -192,11 +192,11 @@ throughput, fairness under every workload, or production readiness.
 
 ## Remaining Gates
 
-The next independent phase must close these items before activating a submit
-process:
+Phase 2AB closes the inactive process composition and real SIGTERM/restart
+proof:
 
-1. compose an activation-gated `provider-submitd` around the Phase 2AA
-   workspace boundary;
-2. add real process restart and SIGTERM tests for the composed binary; and
-3. benchmark mixed recovery/fresh workloads, database lock wait, allocations,
-   journal fsync cost, and p50/p95/p99 scheduling latency.
+- [`2026-phase2ab-inactive-provider-submit-service.md`](2026-phase2ab-inactive-provider-submit-service.md)
+
+Mixed recovery/fresh benchmarks, database lock wait, allocations, journal
+fsync cost, and p50/p95/p99 scheduling latency remain required before provider
+activation or performance-leadership claims.

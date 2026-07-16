@@ -84,6 +84,10 @@ heartbeats, bounded daemon, and inactive Dreamina projector are documented in
 The recoverable per-launch submit workspace, frozen process-path binding,
 per-attempt cleanup serialization, and restart-safe lifecycle are documented in
 [`docs/architecture/2026-phase2aa-recoverable-submit-attempt-workspace.md`](docs/architecture/2026-phase2aa-recoverable-submit-attempt-workspace.md).
+The inactive provider submit process, shared frozen runtime profile, exact
+Dreamina account/descriptor binding, graceful drain, and restart no-resubmit
+proof are documented in
+[`docs/architecture/2026-phase2ab-inactive-provider-submit-service.md`](docs/architecture/2026-phase2ab-inactive-provider-submit-service.md).
 Database-bound provider profiles and durable capacity are documented in
 [`docs/architecture/2026-phase1g-execution-binding-capacity.md`](docs/architecture/2026-phase1g-execution-binding-capacity.md).
 
@@ -97,6 +101,7 @@ cargo run -p gpt-image-2-gateway --bin executord
 cargo run -p gpt-image-2-gateway --bin reducerd
 cargo run -p gpt-image-2-gateway --bin reconcilerd
 cargo run -p gpt-image-2-gateway --bin provider-pollerd
+cargo run -p gpt-image-2-gateway --bin provider-submitd
 npm install
 npm run typecheck:admin
 npm run dev:admin

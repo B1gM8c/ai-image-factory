@@ -10,7 +10,7 @@ fn binds_only_the_exact_profile_identity_and_redacts_sensitive_fields() {
     let home = root.path().join("account-home");
     fs::create_dir(&home).unwrap();
     fs::set_permissions(&home, fs::Permissions::from_mode(0o700)).unwrap();
-    let profile = ProviderPollRuntimeProfile::new(profile_fixture()).unwrap();
+    let profile = ProviderRuntimeProfile::new(profile_fixture()).unwrap();
     let capability = ProviderAccountHomeCapability::new(
         profile.provider_id(),
         profile.credential_pool_id(),
@@ -32,7 +32,7 @@ fn binds_only_the_exact_profile_identity_and_redacts_sensitive_fields() {
 
     let mut changed = profile_fixture();
     changed.credential_revision += 1;
-    let changed = ProviderPollRuntimeProfile::new(changed).unwrap();
+    let changed = ProviderRuntimeProfile::new(changed).unwrap();
     assert!(matches!(
         capability.bind(&changed),
         Err(ProviderAccountHomeCapabilityError::ProfileMismatch)
@@ -43,7 +43,7 @@ fn binds_only_the_exact_profile_identity_and_redacts_sensitive_fields() {
 fn rejects_non_private_account_home_before_binding() {
     let root = tempfile::tempdir().unwrap();
     fs::set_permissions(root.path(), fs::Permissions::from_mode(0o755)).unwrap();
-    let profile = ProviderPollRuntimeProfile::new(profile_fixture()).unwrap();
+    let profile = ProviderRuntimeProfile::new(profile_fixture()).unwrap();
 
     assert!(matches!(
         ProviderAccountHomeCapability::new(

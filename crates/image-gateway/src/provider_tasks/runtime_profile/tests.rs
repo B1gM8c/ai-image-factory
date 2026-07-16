@@ -4,7 +4,7 @@ use super::*;
 
 #[test]
 fn remote_task_profile_freezes_scope_and_capacity_without_debugging_credentials() {
-    let profile = ProviderPollRuntimeProfile::new(profile()).unwrap();
+    let profile = ProviderRuntimeProfile::new(profile()).unwrap();
 
     assert_eq!(
         profile.claim_scope(),
@@ -25,19 +25,19 @@ fn remote_task_profile_freezes_scope_and_capacity_without_debugging_credentials(
 fn inline_and_oversized_profiles_are_rejected_before_daemon_construction() {
     let mut inline = profile();
     inline.completion_mode = "inline".to_owned();
-    assert!(ProviderPollRuntimeProfile::new(inline).is_err());
+    assert!(ProviderRuntimeProfile::new(inline).is_err());
 
     let mut oversized = profile();
     oversized.max_concurrency =
-        i32::try_from(MAX_PROVIDER_POLL_LANES + 1).expect("test lane count fits i32");
-    assert!(ProviderPollRuntimeProfile::new(oversized).is_err());
+        i32::try_from(MAX_PROVIDER_RUNTIME_LANES + 1).expect("test lane count fits i32");
+    assert!(ProviderRuntimeProfile::new(oversized).is_err());
 }
 
 #[test]
 fn malformed_frozen_identity_is_rejected() {
     let mut malformed = profile();
     malformed.credential_auth_sha256 = "not-a-digest".to_owned();
-    assert!(ProviderPollRuntimeProfile::new(malformed).is_err());
+    assert!(ProviderRuntimeProfile::new(malformed).is_err());
 }
 
 fn profile() -> ExecutorExecutionProfile {

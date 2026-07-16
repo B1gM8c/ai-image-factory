@@ -1,9 +1,15 @@
-use std::{collections::BTreeMap, fmt};
+use std::{
+    collections::BTreeMap,
+    fmt,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use image_cli_runtime::{CommandSpec, WorkingDirectory};
 use image_provider_dreamina_cli::{
-    ADAPTER_REVISION, DREAMINA_SUBMIT_COMMAND_SCHEMA, DreaminaCliPolicyV1, DreaminaSubmitPayloadV1,
-    DreaminaSubmitRequestV1, PROVIDER_ID, ReceiptError, parse_receipt, parse_submit_command,
+    ADAPTER_REVISION, DREAMINA_IMAGE_GENERATION_OPERATION_V1, DREAMINA_SUBMIT_COMMAND_SCHEMA,
+    DreaminaCliPolicyV1, DreaminaSubmitPayloadV1, DreaminaSubmitRequestV1, PROVIDER_ID,
+    ReceiptError, parse_receipt, parse_submit_command,
 };
 use image_provider_sdk::{
     EffectCertainty, OutputSlot, PendingOperation, ProviderFailure, ProviderFailureClass,
@@ -14,8 +20,10 @@ use uuid::Uuid;
 use crate::{
     executor::{ExecutorLaunchContext, ExecutorSubmissionLease},
     provider_tasks::{
-        GatedCliCommand, GatedCliSubmitCodec, ProviderExecutionContext, ProviderSubmitIntent,
-        ProviderSubmitProjectionError, ProviderSubmitProjector, ProviderSubmitRecoveryLease,
+        GatedCliCommand, GatedCliSubmitCodec, ProviderAccountHomeCapability,
+        ProviderAccountHomeCapabilityError, ProviderExecutionContext, ProviderRuntimeProfile,
+        ProviderSubmitIntent, ProviderSubmitProjectionError, ProviderSubmitProjector,
+        ProviderSubmitRecoveryLease,
     },
 };
 
@@ -88,9 +96,72 @@ pub struct DreaminaCliSubmitCodecV1 {
     binding: DreaminaCliRuntimeBindingV1,
 }
 
+pub struct DreaminaCliSubmitProcessConfig {
+    executable_path: PathBuf,
+    executable_sha256: [u8; 32],
+    workspace_root: WorkingDirectory,
+    wall_timeout: Duration,
+    termination_grace: Duration,
+}
+
+impl DreaminaCliSubmitProcessConfig {
+    pub fn new(
+        executable_path: impl AsRef<Path>,
+        executable_sha256: [u8; 32],
+        workspace_root: WorkingDirectory,
+        wall_timeout: Duration,
+        termination_grace: Duration,
+    ) -> Self {
+        Self {
+            executable_path: executable_path.as_ref().to_path_buf(),
+            executable_sha256,
+            workspace_root,
+            wall_timeout,
+            termination_grace,
+        }
+    }
+}
+
 impl DreaminaCliSubmitCodecV1 {
     pub fn new(policy: DreaminaCliPolicyV1, binding: DreaminaCliRuntimeBindingV1) -> Self {
         Self { policy, binding }
+    }
+
+    pub fn from_runtime_profile(
+        profile: &ProviderRuntimeProfile,
+        account_home: &ProviderAccountHomeCapability,
+        process: DreaminaCliSubmitProcessConfig,
+    ) -> Result<Self, DreaminaCliSubmitRuntimeConfigError> {
+        let operation = DREAMINA_IMAGE_GENERATION_OPERATION_V1;
+        if profile.provider_id() != PROVIDER_ID
+            || profile.command_schema() != operation.command_schema
+            || profile.operation_id() != operation.id
+            || profile.operation_descriptor_revision() != operation.descriptor_revision
+            || profile.operation_descriptor_sha256_v1() != operation.canonical_sha256_v1_hex()
+            || profile.idempotency_mode() != operation.idempotency.as_str()
+            || profile.adapter_revision() != ADAPTER_REVISION
+        {
+            return Err(DreaminaCliSubmitRuntimeConfigError::ProfileMismatch);
+        }
+        let account_home = account_home
+            .bind(profile)
+            .map_err(DreaminaCliSubmitRuntimeConfigError::AccountHome)?;
+        let binding = DreaminaCliRuntimeBindingV1::new(
+            profile.execution_profile_id(),
+            profile.provider_account_id(),
+            profile.credential_auth_sha256(),
+        )
+        .map_err(|_| DreaminaCliSubmitRuntimeConfigError::ProfileMismatch)?;
+        let policy = DreaminaCliPolicyV1::new(
+            process.executable_path,
+            process.executable_sha256,
+            process.workspace_root,
+            account_home,
+            process.wall_timeout,
+            process.termination_grace,
+        )
+        .map_err(DreaminaCliSubmitRuntimeConfigError::Policy)?;
+        Ok(Self::new(policy, binding))
     }
 
     fn project_request(
@@ -217,6 +288,16 @@ where
 pub enum DreaminaCliCodecConfigError {
     #[error("Dreamina CLI runtime binding is invalid")]
     InvalidRuntimeBinding,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum DreaminaCliSubmitRuntimeConfigError {
+    #[error("Dreamina submit runtime profile does not match the compiled adapter")]
+    ProfileMismatch,
+    #[error("Dreamina submit account-home capability is invalid")]
+    AccountHome(#[source] ProviderAccountHomeCapabilityError),
+    #[error("Dreamina submit process policy is invalid")]
+    Policy(#[source] image_provider_dreamina_cli::DreaminaCliPolicyError),
 }
 
 fn project_submit_command(
@@ -353,7 +434,7 @@ fn request_matches_platform(
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, os::unix::fs::PermissionsExt, time::Duration};
+    use std::{fs, os::unix::fs::PermissionsExt, path::PathBuf, time::Duration};
 
     use image_cli_runtime::WorkingDirectory;
     use image_provider_dreamina_cli::{
@@ -365,6 +446,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+    use crate::executor::ExecutorExecutionProfile;
 
     #[test]
     fn projects_the_pinned_policy_into_a_gated_command() {
@@ -543,9 +625,87 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn submit_runtime_composition_accepts_only_the_exact_frozen_profile() {
+        let fixture = Fixture::new();
+        let profile = ProviderRuntimeProfile::new(runtime_profile()).unwrap();
+        let capability = ProviderAccountHomeCapability::new(
+            PROVIDER_ID,
+            profile.credential_pool_id(),
+            profile.provider_account_id(),
+            profile.credential_ref(),
+            profile.credential_revision(),
+            profile.credential_auth_sha256(),
+            &fixture.account_home,
+        )
+        .unwrap();
+        let codec = DreaminaCliSubmitCodecV1::from_runtime_profile(
+            &profile,
+            &capability,
+            fixture.process_config(),
+        )
+        .unwrap();
+        let projected = codec
+            .project_request(&fixture.request(), &fixture.attempt_workspace())
+            .unwrap();
+
+        assert!(format!("{projected:?}").contains("text2image"));
+    }
+
+    #[test]
+    fn submit_runtime_composition_rejects_descriptor_and_account_drift() {
+        let fixture = Fixture::new();
+        let mut changed = runtime_profile();
+        changed.operation_descriptor_sha256_v1 = "f".repeat(64);
+        let changed = ProviderRuntimeProfile::new(changed).unwrap();
+        let changed_capability = ProviderAccountHomeCapability::new(
+            PROVIDER_ID,
+            changed.credential_pool_id(),
+            changed.provider_account_id(),
+            changed.credential_ref(),
+            changed.credential_revision(),
+            changed.credential_auth_sha256(),
+            &fixture.account_home,
+        )
+        .unwrap();
+        assert!(matches!(
+            DreaminaCliSubmitCodecV1::from_runtime_profile(
+                &changed,
+                &changed_capability,
+                fixture.process_config(),
+            ),
+            Err(DreaminaCliSubmitRuntimeConfigError::ProfileMismatch)
+        ));
+
+        let profile = ProviderRuntimeProfile::new(runtime_profile()).unwrap();
+        let mismatched_capability = ProviderAccountHomeCapability::new(
+            PROVIDER_ID,
+            profile.credential_pool_id(),
+            profile.provider_account_id(),
+            profile.credential_ref(),
+            profile.credential_revision() + 1,
+            profile.credential_auth_sha256(),
+            &fixture.account_home,
+        )
+        .unwrap();
+        assert!(matches!(
+            DreaminaCliSubmitCodecV1::from_runtime_profile(
+                &profile,
+                &mismatched_capability,
+                fixture.process_config(),
+            ),
+            Err(DreaminaCliSubmitRuntimeConfigError::AccountHome(
+                ProviderAccountHomeCapabilityError::ProfileMismatch
+            ))
+        ));
+    }
+
     struct Fixture {
         _root: TempDir,
         workspace: std::path::PathBuf,
+        account_home: PathBuf,
+        executable: PathBuf,
+        executable_digest: [u8; 32],
         codec: DreaminaCliSubmitCodecV1,
         executable_sha256: String,
     }
@@ -579,6 +739,9 @@ mod tests {
             Self {
                 _root: root,
                 workspace,
+                account_home,
+                executable,
+                executable_digest: digest,
                 codec: DreaminaCliSubmitCodecV1::new(policy, binding),
                 executable_sha256: hex::encode(digest),
             }
@@ -601,6 +764,40 @@ mod tests {
             fs::create_dir(&attempt).unwrap();
             fs::set_permissions(&attempt, fs::Permissions::from_mode(0o700)).unwrap();
             WorkingDirectory::new_private(attempt).unwrap()
+        }
+
+        fn process_config(&self) -> DreaminaCliSubmitProcessConfig {
+            DreaminaCliSubmitProcessConfig::new(
+                &self.executable,
+                self.executable_digest,
+                WorkingDirectory::new_private(&self.workspace).unwrap(),
+                Duration::from_secs(30),
+                Duration::from_millis(100),
+            )
+        }
+    }
+
+    fn runtime_profile() -> ExecutorExecutionProfile {
+        let operation = DREAMINA_IMAGE_GENERATION_OPERATION_V1;
+        ExecutorExecutionProfile {
+            execution_profile_id: Uuid::from_u128(1),
+            profile_key: "dreamina-image-test".to_owned(),
+            provider_id: PROVIDER_ID.to_owned(),
+            command_schema: operation.command_schema.to_owned(),
+            operation_id: operation.id.to_owned(),
+            operation_descriptor_revision: operation.descriptor_revision.to_owned(),
+            operation_descriptor_sha256_v1: operation.canonical_sha256_v1_hex(),
+            completion_mode: operation.completion.as_str().to_owned(),
+            idempotency_mode: operation.idempotency.as_str().to_owned(),
+            adapter_revision: ADAPTER_REVISION.to_owned(),
+            credential_pool_id: Uuid::from_u128(2),
+            provider_account_id: Uuid::from_u128(3),
+            credential_ref: "vault.dreamina.1".to_owned(),
+            credential_revision: 1,
+            credential_auth_sha256: "c".repeat(64),
+            resource_policy_id: Uuid::from_u128(4),
+            resource_policy_revision: 1,
+            max_concurrency: 2,
         }
     }
 }

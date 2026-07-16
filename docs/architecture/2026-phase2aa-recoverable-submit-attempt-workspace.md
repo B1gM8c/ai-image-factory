@@ -261,14 +261,11 @@ state is less safe than bounded residue requiring operator inspection.
 
 ## Next Gate
 
-The next independent phase may compose one activation-gated
-`provider-submitd` from:
+Phase 2AB now composes the activation-gated `provider-submitd`, exact runtime
+profile/account binding, digest-pinned runner and codec, and real PostgreSQL
+SIGTERM/restart proof:
 
-- a database-bound active provider/account profile;
-- the Phase 2Z submit service and daemon;
-- this recoverable submit workspace;
-- the digest-pinned gated runner and provider codec; and
-- redacted startup, SIGTERM, restart, and no-provider-call verification.
+- [`2026-phase2ab-inactive-provider-submit-service.md`](2026-phase2ab-inactive-provider-submit-service.md)
 
-Provider activation, external credentials, model advertisement, pricing, and
-paid smoke tests remain separate decisions.
+Provider activation, external credentials, model advertisement, pricing, paid
+smoke tests, and production-scale benchmarks remain separate decisions.

@@ -20,7 +20,7 @@ use uuid::Uuid;
 use super::*;
 use crate::{
     executor::ExecutorExecutionProfile,
-    provider_tasks::{ProviderAccountHomeCapability, ProviderPollRuntimeProfile},
+    provider_tasks::{ProviderAccountHomeCapability, ProviderRuntimeProfile},
 };
 
 #[tokio::test]
@@ -306,7 +306,7 @@ async fn runtime_profile_composition_revalidates_private_account_home_before_spa
         r#"printf called > "$HOME/query-called"
 printf '{"submit_id":"%s","gen_status":"querying"}' "$submit""#,
     );
-    let profile = ProviderPollRuntimeProfile::new(runtime_profile()).unwrap();
+    let profile = ProviderRuntimeProfile::new(runtime_profile()).unwrap();
     let capability = ProviderAccountHomeCapability::new(
         PROVIDER_ID,
         profile.credential_pool_id(),
@@ -342,7 +342,7 @@ fn runtime_profile_composition_rejects_descriptor_drift_before_workspace_lock() 
     let fixture = Fixture::new("printf '{}'");
     let mut changed = runtime_profile();
     changed.operation_descriptor_sha256_v1 = "f".repeat(64);
-    let profile = ProviderPollRuntimeProfile::new(changed).unwrap();
+    let profile = ProviderRuntimeProfile::new(changed).unwrap();
     let capability = ProviderAccountHomeCapability::new(
         PROVIDER_ID,
         profile.credential_pool_id(),

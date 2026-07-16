@@ -8,7 +8,7 @@ use crate::{
     artifacts::MAX_ARTIFACT_BYTES,
     provider_tasks::{
         ProviderAccountHomeCapability, ProviderAccountHomeCapabilityError, ProviderPollDriver,
-        ProviderPollDriverCall, ProviderPollRuntimeProfile,
+        ProviderPollDriverCall, ProviderRuntimeProfile,
     },
 };
 use image_cli_runtime::{
@@ -69,7 +69,7 @@ impl DreaminaCliPollProcessConfig {
 
 impl DreaminaCliPollDriverV1 {
     pub fn from_runtime_profile(
-        profile: &ProviderPollRuntimeProfile,
+        profile: &ProviderRuntimeProfile,
         account_home: &ProviderAccountHomeCapability,
         process: DreaminaCliPollProcessConfig,
     ) -> Result<Self, DreaminaCliPollDriverConfigError> {

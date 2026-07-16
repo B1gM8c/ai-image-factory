@@ -7,11 +7,17 @@ use uuid::Uuid;
 
 use crate::executor::{ExecutorResultManifest, ExecutorSubmissionLease};
 
+mod account_home;
 mod capacity;
 mod poll;
 mod postgres;
 mod remote_submit;
+mod runtime_profile;
 mod submit;
+
+const MAX_PROVIDER_RUNTIME_LANES: usize = 1_024;
+
+pub use account_home::{ProviderAccountHomeCapability, ProviderAccountHomeCapabilityError};
 
 pub use capacity::{
     ProviderCapacityEvidence, ProviderCapacityEvidenceOutcome, ProviderCapacityReconciliation,
@@ -19,13 +25,11 @@ pub use capacity::{
     ProviderCapacityReconciliationStore, ProviderCapacityTerminalState,
 };
 pub use poll::{
-    ProviderAccountHomeCapability, ProviderAccountHomeCapabilityError,
     ProviderArtifactSinkContractError, ProviderArtifactStageContext, ProviderArtifactStager,
     ProviderArtifactStagerFactory, ProviderPollDaemon, ProviderPollDaemonConfig,
     ProviderPollDaemonError, ProviderPollDaemonReport, ProviderPollDriver, ProviderPollDriverCall,
     ProviderPollIteration, ProviderPollOrchestrator, ProviderPollOrchestratorConfig,
-    ProviderPollOrchestratorError, ProviderPollRun, ProviderPollRuntimeProfile,
-    ProviderPollRuntimeProfileStore, ProviderPollStore, StagedProviderArtifact,
+    ProviderPollOrchestratorError, ProviderPollRun, ProviderPollStore, StagedProviderArtifact,
 };
 pub use postgres::PostgresProviderTaskStore;
 pub use remote_submit::{
@@ -34,6 +38,7 @@ pub use remote_submit::{
     GatedCliSubmission, GatedCliSubmitCodec, GatedCliSubmitDriver, run_remote_submit_gate,
     run_remote_submit_runner,
 };
+pub use runtime_profile::{ProviderRuntimeProfile, ProviderRuntimeProfileStore};
 pub use submit::{
     ProviderSubmitDaemon, ProviderSubmitDaemonConfig, ProviderSubmitDaemonError,
     ProviderSubmitDaemonReport, ProviderSubmitDriver, ProviderSubmitDriverCall,

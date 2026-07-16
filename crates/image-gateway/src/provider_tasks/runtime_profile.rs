@@ -2,31 +2,28 @@ use std::{fmt, future::Future};
 
 use uuid::Uuid;
 
-use super::MAX_PROVIDER_POLL_LANES;
-use crate::{
-    executor::ExecutorExecutionProfile,
-    provider_tasks::{ProviderTaskClaimScope, ProviderTaskStoreError},
-};
+use super::{MAX_PROVIDER_RUNTIME_LANES, ProviderTaskClaimScope, ProviderTaskStoreError};
+use crate::executor::{ExecutorClaimScope, ExecutorExecutionProfile};
 
-pub trait ProviderPollRuntimeProfileStore: Send + Sync + 'static {
-    fn load_active_poll_runtime_profile(
+pub trait ProviderRuntimeProfileStore: Send + Sync + 'static {
+    fn load_active_runtime_profile(
         &self,
         profile_key: &str,
-    ) -> impl Future<Output = Result<ProviderPollRuntimeProfile, ProviderTaskStoreError>> + Send;
+    ) -> impl Future<Output = Result<ProviderRuntimeProfile, ProviderTaskStoreError>> + Send;
 }
 
 #[derive(Clone, Eq, PartialEq)]
-pub struct ProviderPollRuntimeProfile {
+pub struct ProviderRuntimeProfile {
     profile: ExecutorExecutionProfile,
     max_in_flight: usize,
 }
 
-impl ProviderPollRuntimeProfile {
+impl ProviderRuntimeProfile {
     pub(crate) fn new(
         profile: ExecutorExecutionProfile,
-    ) -> Result<Self, ProviderPollRuntimeProfileError> {
-        let max_in_flight = usize::try_from(profile.max_concurrency)
-            .map_err(|_| ProviderPollRuntimeProfileError)?;
+    ) -> Result<Self, ProviderRuntimeProfileError> {
+        let max_in_flight =
+            usize::try_from(profile.max_concurrency).map_err(|_| ProviderRuntimeProfileError)?;
         if profile.execution_profile_id.is_nil()
             || profile.provider_account_id.is_nil()
             || profile.credential_pool_id.is_nil()
@@ -34,7 +31,7 @@ impl ProviderPollRuntimeProfile {
             || profile.completion_mode != "remote_task"
             || profile.credential_revision <= 0
             || profile.resource_policy_revision <= 0
-            || !(1..=MAX_PROVIDER_POLL_LANES).contains(&max_in_flight)
+            || !(1..=MAX_PROVIDER_RUNTIME_LANES).contains(&max_in_flight)
             || !valid_simple_identifier(&profile.profile_key)
             || !valid_simple_identifier(&profile.provider_id)
             || !valid_simple_identifier(&profile.command_schema)
@@ -46,7 +43,7 @@ impl ProviderPollRuntimeProfile {
             || !valid_text(&profile.credential_ref, 1_024)
             || !valid_sha256(&profile.credential_auth_sha256)
         {
-            return Err(ProviderPollRuntimeProfileError);
+            return Err(ProviderRuntimeProfileError);
         }
         Ok(Self {
             profile,
@@ -128,12 +125,16 @@ impl ProviderPollRuntimeProfile {
             provider_account_id: self.profile.provider_account_id,
         }
     }
+
+    pub fn executor_claim_scope(&self) -> ExecutorClaimScope {
+        self.profile.claim_scope()
+    }
 }
 
-impl fmt::Debug for ProviderPollRuntimeProfile {
+impl fmt::Debug for ProviderRuntimeProfile {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("ProviderPollRuntimeProfile")
+            .debug_struct("ProviderRuntimeProfile")
             .field("execution_profile_id", &self.profile.execution_profile_id)
             .field("profile_key", &self.profile.profile_key)
             .field("provider_id", &self.profile.provider_id)
@@ -165,8 +166,8 @@ impl fmt::Debug for ProviderPollRuntimeProfile {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
-#[error("provider poll runtime profile is invalid")]
-pub(crate) struct ProviderPollRuntimeProfileError;
+#[error("provider runtime profile is invalid")]
+pub(crate) struct ProviderRuntimeProfileError;
 
 fn valid_simple_identifier(value: &str) -> bool {
     !value.is_empty()

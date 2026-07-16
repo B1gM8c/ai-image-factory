@@ -241,6 +241,11 @@ flowchart LR
 - `executord`: own one database-bound provider/account/resource scope, hold the
   OS sandbox and credential lease, and execute output-scoped start-or-attach
   operations through a durable private spool.
+- `provider-submitd`: own one frozen remote-task execution profile and its
+  provider/account scope, prioritize expired submit recovery, claim prepared
+  executor submissions, and perform digest-pinned crash-recoverable CLI
+  dispatch. The current Dreamina image composition is runnable but remains
+  undeployed and inactive.
 - `provider-pollerd`: own one frozen remote-task execution profile and its
   provider/account scope, run bounded provider queries, heartbeat fenced poll
   leases, and materialize immutable provider artifacts. The current Dreamina

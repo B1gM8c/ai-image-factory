@@ -19,8 +19,8 @@ use gpt_image_2_gateway::{
     ProviderCapacityEvidence, ProviderCapacityEvidenceOutcome, ProviderCapacityReconciliationState,
     ProviderCapacityReconciliationStore, ProviderCapacityTerminalState, ProviderExecutionContext,
     ProviderPollDaemon, ProviderPollDaemonConfig, ProviderPollDriver, ProviderPollDriverCall,
-    ProviderPollOrchestrator, ProviderPollOrchestratorConfig, ProviderPollRun,
-    ProviderPollRuntimeProfileStore, ProviderPollStore, ProviderRemoteTask, ProviderSubmitAcquire,
+    ProviderPollOrchestrator, ProviderPollOrchestratorConfig, ProviderPollRun, ProviderPollStore,
+    ProviderRemoteTask, ProviderRuntimeProfileStore, ProviderSubmitAcquire,
     ProviderSubmitFailureKind, ProviderSubmitIntent, ProviderSubmitIntentState,
     ProviderSubmitIterationCommand, ProviderSubmitOrchestrator, ProviderSubmitOrchestratorError,
     ProviderSubmitOutcome, ProviderSubmitProjectionError, ProviderSubmitProjector,
@@ -65,7 +65,7 @@ const DREAMINA_PROFILE_ID: Uuid = Uuid::from_u128(0x2710);
 const DREAMINA_POOL_ID: Uuid = Uuid::from_u128(0x2720);
 const DREAMINA_ACCOUNT_ID: Uuid = Uuid::from_u128(0x2730);
 const DREAMINA_POLICY_ID: Uuid = Uuid::from_u128(0x2740);
-const DREAMINA_PROFILE_KEY: &str = "dreamina-image-poll-test";
+const DREAMINA_PROFILE_KEY: &str = "dreamina-image-runtime-test";
 const DREAMINA_CREDENTIAL_REF: &str = "test-vault.dreamina.1";
 
 #[derive(Clone, Copy, Default)]
@@ -185,14 +185,14 @@ macro_rules! attach_request {
 mod gated_submit;
 
 #[tokio::test]
-async fn active_poll_runtime_profile_freezes_scope_and_capacity() -> TestResult {
+async fn active_runtime_profile_freezes_scope_and_capacity() -> TestResult {
     let Some(database) = TestDatabase::new().await? else {
         return Ok(());
     };
     let result = async {
         let store = PostgresProviderTaskStore::new(database.pool.clone());
         let profile = store
-            .load_active_poll_runtime_profile("provider-task-profile")
+            .load_active_runtime_profile("provider-task-profile")
             .await
             .map_err(debug_error)?;
 
@@ -215,12 +215,12 @@ async fn active_poll_runtime_profile_freezes_scope_and_capacity() -> TestResult 
                 && profile.resource_policy_revision() == 1
                 && profile.max_in_flight() == 100
                 && profile.claim_scope() == claim_scope(),
-            format!("unexpected active poll runtime profile: {profile:?}"),
+            format!("unexpected active runtime profile: {profile:?}"),
         )?;
         let debug = format!("{profile:?}");
         require(
             !debug.contains("test-vault.provider-task.1") && !debug.contains(&"1".repeat(64)),
-            "poll runtime profile Debug leaked credential identity",
+            "runtime profile Debug leaked credential identity",
         )
     }
     .await;
@@ -229,7 +229,7 @@ async fn active_poll_runtime_profile_freezes_scope_and_capacity() -> TestResult 
 }
 
 #[tokio::test]
-async fn poll_runtime_profile_rejects_each_disabled_dependency() -> TestResult {
+async fn runtime_profile_rejects_each_disabled_dependency() -> TestResult {
     let Some(database) = TestDatabase::new().await? else {
         return Ok(());
     };
@@ -267,7 +267,7 @@ async fn poll_runtime_profile_rejects_each_disabled_dependency() -> TestResult {
             require(
                 matches!(
                     store
-                        .load_active_poll_runtime_profile("provider-task-profile")
+                        .load_active_runtime_profile("provider-task-profile")
                         .await,
                     Err(ProviderTaskStoreError::NotFound)
                 ),
@@ -281,7 +281,7 @@ async fn poll_runtime_profile_rejects_each_disabled_dependency() -> TestResult {
         }
 
         store
-            .load_active_poll_runtime_profile("provider-task-profile")
+            .load_active_runtime_profile("provider-task-profile")
             .await
             .map(|_| ())
             .map_err(debug_error)
@@ -472,6 +472,255 @@ printf '{"submit_id":"%s","gen_status":"success"}' "$submit"
                 && !logs.contains(&"c".repeat(64))
                 && !logs.contains(account_home.to_str().unwrap_or_default()),
             format!("provider-pollerd diagnostics were incomplete or leaked identity: {logs}"),
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
+async fn provider_submitd_drains_fake_dreamina_submit_and_restarts_without_resubmit() -> TestResult
+{
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        seed_dreamina_execution_profile(&database.pool).await?;
+        let work = seed_work_lease_for_runtime_profile_with_command(
+            &database.pool,
+            "provider-submitd-worker",
+            DREAMINA_PROVIDER_ID,
+            "dreamina-image-5.0",
+            DREAMINA_SUBMIT_COMMAND_SCHEMA,
+            json!({
+                "operation": "text2image",
+                "schema_version": 1,
+                "prompt": "provider submit daemon process test",
+                "model_version": "5.0",
+                "ratio": "1:1",
+                "resolution_type": "2k",
+                "generate_num": 1,
+                "poll": 0
+            }),
+        )
+        .await?;
+        let executor_store = PostgresExecutorSubmissionStore::new(database.pool.clone());
+        let prepared = executor_store
+            .prepare_and_handoff(&work, DREAMINA_PROFILE_ID)
+            .await
+            .map_err(debug_error)?;
+        let submission_id = prepared
+            .first()
+            .ok_or_else(|| "provider-submitd fixture was not prepared".to_owned())?
+            .submission_id;
+
+        let root = tempfile::tempdir().map_err(debug_error)?;
+        let account_home = root.path().join("account-home");
+        let workspace = root.path().join("workspace");
+        let journal = root.path().join("journal");
+        for path in [&account_home, &workspace, &journal] {
+            fs::create_dir(path).map_err(debug_error)?;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(debug_error)?;
+        }
+        let executable = root.path().join("dreamina");
+        let script = br#"#!/bin/sh
+printf 'invoked\n' >> "$HOME/submit-invocations"
+printf started > "$HOME/submit-started"
+/bin/sleep 1
+printf '{"submit_id":"dreamina-submitd-operation-1","gen_status":"querying"}'
+"#;
+        fs::write(&executable, script).map_err(debug_error)?;
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o500)).map_err(debug_error)?;
+        let executable_sha256 = hex::encode(Sha256::digest(script));
+        let runner = std::path::Path::new(env!("CARGO_BIN_EXE_remote-submit-runner"));
+        let runner_sha256 = hex::encode(Sha256::digest(fs::read(runner).map_err(debug_error)?));
+        let database_url = env::var("TEST_DATABASE_URL").map_err(debug_error)?;
+        let build_command = |log_path: &std::path::Path| -> TestResult<tokio::process::Command> {
+            let log = File::create(log_path).map_err(debug_error)?;
+            let stderr = log.try_clone().map_err(debug_error)?;
+            let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_provider-submitd"));
+            command
+                .env_clear()
+                .env("DATABASE_URL", &database_url)
+                .env("GATEWAY_DATABASE_SCHEMA", &database.schema)
+                .env("PROVIDER_SUBMITTER_ACTIVATION", "dreamina-image-submit-v1")
+                .env("PROVIDER_SUBMITTER_PROFILE_KEY", DREAMINA_PROFILE_KEY)
+                .env(
+                    "PROVIDER_SUBMITTER_OWNER_PREFIX",
+                    "provider-submitd-process-test",
+                )
+                .env(
+                    "PROVIDER_SUBMITTER_CREDENTIAL_POOL_ID",
+                    DREAMINA_POOL_ID.to_string(),
+                )
+                .env(
+                    "PROVIDER_SUBMITTER_ACCOUNT_ID",
+                    DREAMINA_ACCOUNT_ID.to_string(),
+                )
+                .env("PROVIDER_SUBMITTER_CREDENTIAL_REF", DREAMINA_CREDENTIAL_REF)
+                .env("PROVIDER_SUBMITTER_CREDENTIAL_REVISION", "1")
+                .env("PROVIDER_SUBMITTER_CREDENTIAL_AUTH_SHA256", "c".repeat(64))
+                .env("PROVIDER_SUBMITTER_ACCOUNT_HOME", &account_home)
+                .env("PROVIDER_SUBMITTER_WORKSPACE_ROOT", &workspace)
+                .env("PROVIDER_SUBMITTER_JOURNAL_ROOT", &journal)
+                .env("PROVIDER_SUBMITTER_EXECUTABLE", &executable)
+                .env("PROVIDER_SUBMITTER_EXECUTABLE_SHA256", &executable_sha256)
+                .env("PROVIDER_SUBMITTER_RUNNER", runner)
+                .env("PROVIDER_SUBMITTER_RUNNER_SHA256", &runner_sha256)
+                .env("PROVIDER_SUBMITTER_PROVIDER_TIMEOUT_MS", "10000")
+                .env("PROVIDER_SUBMITTER_EXECUTOR_LEASE_MS", "10000")
+                .env("PROVIDER_SUBMITTER_RECOVERY_LEASE_MS", "10000")
+                .env("PROVIDER_SUBMITTER_HEARTBEAT_INTERVAL_MS", "1000")
+                .env("PROVIDER_SUBMITTER_RECOVERY_RETRY_MS", "10")
+                .env("PROVIDER_SUBMITTER_IDLE_DELAY_MS", "10")
+                .env("PROVIDER_SUBMITTER_ERROR_BASE_DELAY_MS", "10")
+                .env("PROVIDER_SUBMITTER_ERROR_MAX_DELAY_MS", "100")
+                .env("PROVIDER_SUBMITTER_SHUTDOWN_DRAIN_MS", "5000")
+                .env("PROVIDER_SUBMITTER_CLI_WALL_TIMEOUT_MS", "5000")
+                .env("PROVIDER_SUBMITTER_CLI_TERMINATION_GRACE_MS", "50")
+                .env("RUST_LOG", "info")
+                .stdin(Stdio::null())
+                .stdout(Stdio::from(log))
+                .stderr(Stdio::from(stderr))
+                .kill_on_drop(true);
+            command.process_group(0);
+            Ok(command)
+        };
+
+        let first_log = root.path().join("provider-submitd-first.log");
+        let mut first = build_command(&first_log)?.spawn().map_err(debug_error)?;
+        let first_pid = first
+            .id()
+            .ok_or_else(|| "provider-submitd PID unavailable".to_owned())?;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(status) = first.try_wait().map_err(debug_error)? {
+                    return Err(format!(
+                        "provider-submitd exited before fake submit started with {status}: {}",
+                        read_test_log(&first_log)
+                    ));
+                }
+                if account_home.join("submit-started").is_file() {
+                    return Ok::<(), String>(());
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .map_err(|_| {
+            format!(
+                "provider-submitd did not invoke fake Dreamina submit: {}",
+                read_test_log(&first_log)
+            )
+        })??;
+
+        signal_process(first_pid, libc::SIGTERM)?;
+        let first_status = tokio::time::timeout(Duration::from_secs(5), first.wait())
+            .await
+            .map_err(|_| {
+                format!(
+                    "provider-submitd did not drain in-flight submit: {}",
+                    read_test_log(&first_log)
+                )
+            })?
+            .map_err(debug_error)?;
+        require(
+            first_status.success(),
+            format!(
+                "provider-submitd in-flight drain exited with {first_status}: {}",
+                read_test_log(&first_log)
+            ),
+        )?;
+        let attached: (String, String) = sqlx::query_as(
+            "SELECT state, remote_operation_id FROM provider_remote_tasks WHERE submission_id = $1",
+        )
+        .bind(submission_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(
+            attached
+                == (
+                    "provider_waiting".to_owned(),
+                    "dreamina-submitd-operation-1".to_owned(),
+                ),
+            format!("provider-submitd did not durably attach fake submit: {attached:?}"),
+        )?;
+
+        let second_log = root.path().join("provider-submitd-second.log");
+        let mut second = build_command(&second_log)?.spawn().map_err(debug_error)?;
+        let second_pid = second
+            .id()
+            .ok_or_else(|| "restarted provider-submitd PID unavailable".to_owned())?;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(status) = second.try_wait().map_err(debug_error)? {
+                    return Err(format!(
+                        "restarted provider-submitd exited before shutdown with {status}: {}",
+                        read_test_log(&second_log)
+                    ));
+                }
+                if read_test_log(&second_log).contains("provider-submitd started") {
+                    return Ok::<(), String>(());
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .map_err(|_| "restarted provider-submitd did not become ready".to_owned())??;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        signal_process(second_pid, libc::SIGTERM)?;
+        let second_status = tokio::time::timeout(Duration::from_secs(5), second.wait())
+            .await
+            .map_err(|_| {
+                format!(
+                    "restarted provider-submitd did not drain: {}",
+                    read_test_log(&second_log)
+                )
+            })?
+            .map_err(debug_error)?;
+        require(
+            second_status.success(),
+            format!(
+                "restarted provider-submitd exited with {second_status}: {}",
+                read_test_log(&second_log)
+            ),
+        )?;
+
+        let invocations =
+            fs::read_to_string(account_home.join("submit-invocations")).map_err(debug_error)?;
+        require(
+            invocations.lines().count() == 1,
+            format!("provider-submitd relaunched attached work: {invocations:?}"),
+        )?;
+        require(
+            fs::read_dir(&workspace).map_err(debug_error)?.all(|entry| {
+                !entry
+                    .map(|entry| {
+                        entry
+                            .file_name()
+                            .as_encoded_bytes()
+                            .starts_with(b".provider-submit-")
+                    })
+                    .unwrap_or(false)
+            }),
+            "provider-submitd left an attempt workspace after durable attach",
+        )?;
+        let logs = format!(
+            "{}\n{}",
+            read_test_log(&first_log),
+            read_test_log(&second_log)
+        );
+        require(
+            logs.contains("provider-submitd started")
+                && logs.contains("provider-submitd stopped")
+                && !logs.contains(DREAMINA_CREDENTIAL_REF)
+                && !logs.contains(&"c".repeat(64))
+                && !logs.contains(account_home.to_str().unwrap_or_default())
+                && !logs.contains(workspace.to_str().unwrap_or_default())
+                && !logs.contains(journal.to_str().unwrap_or_default())
+                && !logs.contains(executable.to_str().unwrap_or_default()),
+            format!("provider-submitd diagnostics were incomplete or leaked identity: {logs}"),
         )
     }
     .await;
@@ -9822,14 +10071,31 @@ async fn seed_work_lease_for_runtime_profile(
     model: &str,
     command_schema: &str,
 ) -> TestResult<WorkLease> {
+    seed_work_lease_for_runtime_profile_with_command(
+        pool,
+        worker,
+        provider_id,
+        model,
+        command_schema,
+        json!({"schema_version": 1, "operation": "generation", "n": 1, "prompt": "remote task"}),
+    )
+    .await
+}
+
+async fn seed_work_lease_for_runtime_profile_with_command(
+    pool: &PgPool,
+    worker: &str,
+    provider_id: &str,
+    model: &str,
+    command_schema: &str,
+    command: serde_json::Value,
+) -> TestResult<WorkLease> {
     let job_id = Uuid::new_v4();
     let work_item_id = Uuid::new_v4();
     let execution_id = Uuid::new_v4();
     let session_id = Uuid::new_v4();
     let now = database_now(pool).await?;
     let request_id = format!("request-{}", Uuid::new_v4().simple());
-    let command =
-        json!({"schema_version": 1, "operation": "generation", "n": 1, "prompt": "remote task"});
     sqlx::query(
         r#"
         INSERT INTO jobs
@@ -9968,7 +10234,7 @@ async fn seed_dreamina_execution_profile(pool: &PgPool) -> TestResult {
         r#"
         INSERT INTO provider_credential_pools
           (credential_pool_id, pool_key, provider_id, state, created_at_ms, updated_at_ms)
-        VALUES ($1, 'dreamina-image-poll-test', $2, 'enabled', $3, $3)
+        VALUES ($1, 'dreamina-image-runtime-test', $2, 'enabled', $3, $3)
         "#,
     )
     .bind(DREAMINA_POOL_ID)
@@ -9983,7 +10249,7 @@ async fn seed_dreamina_execution_profile(pool: &PgPool) -> TestResult {
           (provider_account_id, credential_pool_id, provider_id, account_key,
            credential_ref, credential_revision, credential_auth_sha256,
            state, created_at_ms, updated_at_ms)
-        VALUES ($1, $2, $3, 'dreamina-image-poll-test', $4, 1, $5,
+        VALUES ($1, $2, $3, 'dreamina-image-runtime-test', $4, 1, $5,
                 'enabled', $6, $6)
         "#,
     )
@@ -10414,7 +10680,7 @@ fn debug_error(error: impl std::fmt::Debug) -> String {
 }
 
 fn read_test_log(path: &std::path::Path) -> String {
-    fs::read_to_string(path).unwrap_or_else(|_| "<provider-pollerd log unavailable>".to_owned())
+    fs::read_to_string(path).unwrap_or_else(|_| "<provider daemon log unavailable>".to_owned())
 }
 
 fn signal_process_group(pid: u32, signal: libc::c_int) -> TestResult {
@@ -10424,7 +10690,20 @@ fn signal_process_group(pid: u32, signal: libc::c_int) -> TestResult {
         Ok(())
     } else {
         Err(format!(
-            "failed to signal provider-pollerd process group: {}",
+            "failed to signal provider daemon process group: {}",
+            std::io::Error::last_os_error()
+        ))
+    }
+}
+
+fn signal_process(pid: u32, signal: libc::c_int) -> TestResult {
+    // SAFETY: the test supplies a positive child PID and a valid Unix signal.
+    let result = unsafe { libc::kill(pid as libc::pid_t, signal) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(format!(
+            "failed to signal provider daemon process: {}",
             std::io::Error::last_os_error()
         ))
     }

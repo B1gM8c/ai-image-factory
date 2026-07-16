@@ -17,16 +17,20 @@ pub(super) fn command_output_count(
     requested_units: i32,
     command_json: &Value,
 ) -> Result<i32, ExecutorSubmissionError> {
-    let output_count = command_json
-        .get("n")
-        .and_then(Value::as_u64)
-        .and_then(|value| i32::try_from(value).ok())
-        .filter(|value| (1..=MAX_IMAGE_OUTPUTS).contains(value))
-        .ok_or(ExecutorSubmissionError::InvalidInput)?;
-    if requested_units != output_count {
-        return Err(ExecutorSubmissionError::Conflict);
+    if !(1..=MAX_IMAGE_OUTPUTS).contains(&requested_units) {
+        return Err(ExecutorSubmissionError::InvalidInput);
     }
-    Ok(output_count)
+    if let Some(value) = command_json.get("n") {
+        let command_units = value
+            .as_u64()
+            .and_then(|value| i32::try_from(value).ok())
+            .filter(|value| (1..=MAX_IMAGE_OUTPUTS).contains(value))
+            .ok_or(ExecutorSubmissionError::InvalidInput)?;
+        if requested_units != command_units {
+            return Err(ExecutorSubmissionError::Conflict);
+        }
+    }
+    Ok(requested_units)
 }
 
 pub(super) fn command_hash(command: &Value) -> Result<String, ExecutorSubmissionError> {
@@ -148,4 +152,50 @@ fn is_bounded_identifier(value: &str) -> bool {
 
 fn is_executor_owner(value: &str) -> bool {
     !value.is_empty() && value.len() <= 128 && value.bytes().all(|byte| byte.is_ascii_graphic())
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn requested_units_are_authoritative_for_provider_specific_commands() {
+        assert_eq!(
+            command_output_count(
+                1,
+                &json!({
+                    "operation": "text2image",
+                    "generate_num": 1
+                })
+            ),
+            Ok(1)
+        );
+    }
+
+    #[test]
+    fn optional_openai_count_must_match_the_durable_job() {
+        assert_eq!(command_output_count(2, &json!({"n": 2})), Ok(2));
+        assert_eq!(
+            command_output_count(2, &json!({"n": 1})),
+            Err(ExecutorSubmissionError::Conflict)
+        );
+        assert_eq!(
+            command_output_count(1, &json!({"n": "one"})),
+            Err(ExecutorSubmissionError::InvalidInput)
+        );
+    }
+
+    #[test]
+    fn durable_job_count_remains_bounded_without_a_command_count_field() {
+        assert_eq!(
+            command_output_count(0, &json!({"operation": "text2image"})),
+            Err(ExecutorSubmissionError::InvalidInput)
+        );
+        assert_eq!(
+            command_output_count(11, &json!({"operation": "text2image"})),
+            Err(ExecutorSubmissionError::InvalidInput)
+        );
+    }
 }

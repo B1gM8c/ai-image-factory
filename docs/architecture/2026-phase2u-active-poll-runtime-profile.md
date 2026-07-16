@@ -9,18 +9,21 @@ CLI process, poll service binary, route, billing behavior, or external call.
 Follow-up: Phase 2X loads this snapshot into a runnable but inactive
 single-profile process:
 [`2026-phase2x-inactive-provider-poll-service.md`](2026-phase2x-inactive-provider-poll-service.md).
+Phase 2AB moves the snapshot to the shared provider-task boundary and composes
+the inactive submit process:
+[`2026-phase2ab-inactive-provider-submit-service.md`](2026-phase2ab-inactive-provider-submit-service.md).
 
 ## Scope
 
-Phase 2U adds the read-only startup boundary that a future provider poll service
-must cross before constructing the Phase 2T daemon:
+Phase 2U adds the read-only startup boundary that a provider remote-task
+service must cross before constructing a bounded daemon:
 
 ```text
 profile_key
   -> one PostgreSQL SELECT
   -> enabled profile + pool + account + resource policy
   -> exact immutable identity validation
-  -> redacted ProviderPollRuntimeProfile
+  -> redacted ProviderRuntimeProfile
   -> claim scope + conservative lane bound
 ```
 
@@ -32,12 +35,12 @@ provider client, secret value, scheduler, or live-reload handle.
 The public store port is provider-neutral:
 
 ```rust
-pub trait ProviderPollRuntimeProfileStore {
-    fn load_active_poll_runtime_profile(
+pub trait ProviderRuntimeProfileStore {
+    fn load_active_runtime_profile(
         &self,
         profile_key: &str,
     ) -> impl Future<
-        Output = Result<ProviderPollRuntimeProfile, ProviderTaskStoreError>
+        Output = Result<ProviderRuntimeProfile, ProviderTaskStoreError>
     > + Send;
 }
 ```
@@ -68,7 +71,8 @@ partially initialized daemon.
 
 ## Frozen Identity
 
-`ProviderPollRuntimeProfile` owns the values needed by later composition:
+`ProviderRuntimeProfile` owns the values needed by submit and poll
+composition:
 
 - execution profile ID and key;
 - provider and command schema;
@@ -79,7 +83,7 @@ partially initialized daemon.
 - credential reference, revision, and authentication digest;
 - resource policy ID and revision;
 - provider/account claim scope; and
-- derived maximum in-flight poll count.
+- derived maximum in-flight remote-task count.
 
 The wrapped `ExecutorExecutionProfile` is private and is never returned by
 reference. Construction validates non-nil UUIDs, bounded identifiers,
@@ -129,10 +133,10 @@ can hold only one fenced poll lease. Therefore the total number of concurrently
 pollable tasks for the account cannot legitimately exceed the account's active
 execution capacity.
 
-The daemon also enforces `MAX_PROVIDER_POLL_LANES = 1024`. Profiles above that
-limit fail before daemon construction. This makes an unexpectedly large
-durable policy an explicit deployment-design decision rather than an
-unbounded task allocation.
+The shared runtime boundary enforces `MAX_PROVIDER_RUNTIME_LANES = 1024`.
+Profiles above that limit fail before daemon construction. This makes an
+unexpectedly large durable policy an explicit deployment-design decision
+rather than an unbounded task allocation.
 
 The following policies remain independent and are not inferred from execution
 capacity:
@@ -157,7 +161,7 @@ One successful load performs:
 - no row lock;
 - no explicit transaction;
 - one owned runtime value containing the returned strings; and
-- no database work on the daemon poll hot path.
+- no database profile work on the submit or poll hot path.
 
 Runtime profile access is ordinary immutable field access. Claim scope creation
 clones only the provider identifier because the existing claim API owns its

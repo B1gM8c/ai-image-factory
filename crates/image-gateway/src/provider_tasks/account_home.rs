@@ -3,7 +3,7 @@ use std::{fmt, path::Path};
 use image_cli_runtime::{CommandSpecError, WorkingDirectory};
 use uuid::Uuid;
 
-use super::ProviderPollRuntimeProfile;
+use super::ProviderRuntimeProfile;
 
 pub struct ProviderAccountHomeCapability {
     provider_id: String,
@@ -52,7 +52,7 @@ impl ProviderAccountHomeCapability {
 
     pub fn bind(
         &self,
-        profile: &ProviderPollRuntimeProfile,
+        profile: &ProviderRuntimeProfile,
     ) -> Result<WorkingDirectory, ProviderAccountHomeCapabilityError> {
         if profile.provider_id() != self.provider_id
             || profile.credential_pool_id() != self.credential_pool_id

@@ -5,7 +5,7 @@ use gpt_image_2_gateway::{
     FilesystemProviderArtifactStagerFactory, ImageGatewayError, PostgresProviderTaskStore,
     ProviderAccountHomeCapability, ProviderPollDaemon, ProviderPollDaemonConfig,
     ProviderPollDaemonError, ProviderPollOrchestrator, ProviderPollOrchestratorConfig,
-    ProviderPollRuntimeProfileStore, ProviderTaskStoreError,
+    ProviderRuntimeProfileStore, ProviderTaskStoreError,
     artifacts::artifact_root_from_env,
     database::{
         DEFAULT_MAX_CONNECTIONS, connect_pool_with_schema, database_schema_from_env,
@@ -175,7 +175,7 @@ async fn main() -> Result<(), ImageGatewayError> {
     verify_migrations(&pool).await?;
     let store = PostgresProviderTaskStore::new(pool);
     let profile = store
-        .load_active_poll_runtime_profile(&config.profile_key)
+        .load_active_runtime_profile(&config.profile_key)
         .await
         .map_err(map_profile_error)?;
     if config.max_materializations > profile.max_in_flight() {

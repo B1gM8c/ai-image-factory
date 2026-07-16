@@ -13,15 +13,15 @@ use crate::executor::{
 use super::capacity::insert_capacity_reconciliation;
 use super::{
     ProviderArtifactAuthority, ProviderArtifactPublication, ProviderExecutionContext,
-    ProviderPollRuntimeProfile, ProviderPollRuntimeProfileStore, ProviderRemoteTask,
-    ProviderSubmitAcquire, ProviderSubmitAttachAuthority, ProviderSubmitBusyAuthority,
-    ProviderSubmitDispatchAuthority, ProviderSubmitFailureKind, ProviderSubmitIntent,
-    ProviderSubmitIntentState, ProviderSubmitInvocation, ProviderSubmitRecoveryLease,
-    ProviderSubmitStart, ProviderTaskClaimScope, ProviderTaskDeadlineStore, ProviderTaskLease,
-    ProviderTaskObservation, ProviderTaskObservationOutcome, ProviderTaskObservationSource,
-    ProviderTaskState, ProviderTaskStore, ProviderTaskStoreError, RemoteTaskAttach,
-    RemoteTaskQuarantinedReceipt, RemoteTaskSubmitFailure, RemoteTaskSubmitReceipt,
-    RemoteTaskSubmitReservation, VerifiedCallbackWakeup,
+    ProviderRemoteTask, ProviderRuntimeProfile, ProviderRuntimeProfileStore, ProviderSubmitAcquire,
+    ProviderSubmitAttachAuthority, ProviderSubmitBusyAuthority, ProviderSubmitDispatchAuthority,
+    ProviderSubmitFailureKind, ProviderSubmitIntent, ProviderSubmitIntentState,
+    ProviderSubmitInvocation, ProviderSubmitRecoveryLease, ProviderSubmitStart,
+    ProviderTaskClaimScope, ProviderTaskDeadlineStore, ProviderTaskLease, ProviderTaskObservation,
+    ProviderTaskObservationOutcome, ProviderTaskObservationSource, ProviderTaskState,
+    ProviderTaskStore, ProviderTaskStoreError, RemoteTaskAttach, RemoteTaskQuarantinedReceipt,
+    RemoteTaskSubmitFailure, RemoteTaskSubmitReceipt, RemoteTaskSubmitReservation,
+    VerifiedCallbackWakeup,
 };
 
 const MAX_POLL_AFTER_MS: i64 = 24 * 60 * 60 * 1_000;
@@ -43,7 +43,7 @@ impl PostgresProviderTaskStore {
 }
 
 #[derive(sqlx::FromRow)]
-struct PollRuntimeProfileRow {
+struct RuntimeProfileRow {
     execution_profile_id: Uuid,
     profile_key: String,
     provider_id: String,
@@ -64,8 +64,8 @@ struct PollRuntimeProfileRow {
     max_concurrency: i32,
 }
 
-impl From<PollRuntimeProfileRow> for ExecutorExecutionProfile {
-    fn from(row: PollRuntimeProfileRow) -> Self {
+impl From<RuntimeProfileRow> for ExecutorExecutionProfile {
+    fn from(row: RuntimeProfileRow) -> Self {
         Self {
             execution_profile_id: row.execution_profile_id,
             profile_key: row.profile_key,
@@ -89,15 +89,15 @@ impl From<PollRuntimeProfileRow> for ExecutorExecutionProfile {
     }
 }
 
-impl ProviderPollRuntimeProfileStore for PostgresProviderTaskStore {
-    async fn load_active_poll_runtime_profile(
+impl ProviderRuntimeProfileStore for PostgresProviderTaskStore {
+    async fn load_active_runtime_profile(
         &self,
         profile_key: &str,
-    ) -> Result<ProviderPollRuntimeProfile, ProviderTaskStoreError> {
+    ) -> Result<ProviderRuntimeProfile, ProviderTaskStoreError> {
         if !valid_simple_identifier(profile_key, 128) {
             return Err(ProviderTaskStoreError::InvalidInput);
         }
-        let row: PollRuntimeProfileRow = sqlx::query_as(
+        let row: RuntimeProfileRow = sqlx::query_as(
             r#"
             SELECT profile.execution_profile_id, profile.profile_key,
                    profile.provider_id, profile.command_schema,
@@ -138,7 +138,7 @@ impl ProviderPollRuntimeProfileStore for PostgresProviderTaskStore {
         .await
         .map_err(unavailable)?
         .ok_or(ProviderTaskStoreError::NotFound)?;
-        ProviderPollRuntimeProfile::new(row.into()).map_err(|_| ProviderTaskStoreError::Conflict)
+        ProviderRuntimeProfile::new(row.into()).map_err(|_| ProviderTaskStoreError::Conflict)
     }
 }
 
