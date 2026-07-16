@@ -244,12 +244,15 @@ flowchart LR
 - `provider-submitd`: own one frozen remote-task execution profile and its
   provider/account scope, prioritize expired submit recovery, claim prepared
   executor submissions, and perform digest-pinned crash-recoverable CLI
-  dispatch. The current Dreamina image composition is runnable but remains
-  undeployed and inactive.
+  dispatch. A database runtime lease publishes active/draining state and loss of
+  that lease stops new iterations. The current Dreamina image composition is
+  runnable but remains undeployed and inactive.
 - `provider-pollerd`: own one frozen remote-task execution profile and its
   provider/account scope, run bounded provider queries, heartbeat fenced poll
-  leases, and materialize immutable provider artifacts. The current Dreamina
-  image composition is runnable but remains undeployed and inactive.
+  leases, and materialize immutable provider artifacts. Its process lease is
+  independent from task leases and remains live through graceful lane drain.
+  The current Dreamina image composition is runnable but remains undeployed and
+  inactive.
 - `reconcilerd`: expired leases, ambiguous submissions, provider deadlines,
   orphan artifacts, stale reservations, outbox delivery, and economic
   reconciliation.

@@ -22,6 +22,7 @@ use gpt_image_2_gateway::{
     ProviderPollOrchestrator, ProviderPollOrchestratorConfig, ProviderPollRun, ProviderPollStore,
     ProviderProfileReadinessStatus, ProviderRemoteTask, ProviderRuntimeProfileStore,
     ProviderRuntimeReadinessStore, ProviderRuntimeRegistration, ProviderRuntimeRole,
+    ProviderRuntimeSupervisor, ProviderRuntimeSupervisorConfig, ProviderRuntimeSupervisorError,
     ProviderSubmitAcquire, ProviderSubmitFailureKind, ProviderSubmitIntent,
     ProviderSubmitIntentState, ProviderSubmitIterationCommand, ProviderSubmitOrchestrator,
     ProviderSubmitOrchestratorError, ProviderSubmitOutcome, ProviderSubmitProjectionError,
@@ -502,6 +503,88 @@ async fn concurrent_runtime_registration_fences_duplicate_owner() -> TestResult 
 }
 
 #[tokio::test]
+async fn runtime_supervisor_stops_when_postgres_lease_authority_is_lost() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let store = PostgresProviderTaskStore::new(database.pool.clone());
+        let registration =
+            runtime_registration(ProviderRuntimeRole::Submit, "postgres-supervisor-loss");
+        let supervisor = ProviderRuntimeSupervisor::new(
+            store.clone(),
+            registration.clone(),
+            ProviderRuntimeSupervisorConfig {
+                lease_ms: 5_000,
+                heartbeat_interval: Duration::from_millis(20),
+            },
+        );
+        let started = Arc::new(tokio::sync::Semaphore::new(0));
+        let stopped = Arc::new(AtomicBool::new(false));
+        let run = tokio::spawn({
+            let started = Arc::clone(&started);
+            let stopped = Arc::clone(&stopped);
+            async move {
+                supervisor
+                    .run_until_shutdown(std::future::pending(), |shutdown| async move {
+                        started.add_permits(1);
+                        shutdown.wait().await;
+                        stopped.store(true, Ordering::SeqCst);
+                        Ok::<(), std::convert::Infallible>(())
+                    })
+                    .await
+            }
+        });
+        started.acquire().await.map_err(debug_error)?.forget();
+        sqlx::query(
+            r#"
+            UPDATE provider_runtime_leases
+            SET lease_expires_at_ms = heartbeat_at_ms + 1
+            WHERE runtime_id = $1
+            "#,
+        )
+        .bind(registration.runtime_id)
+        .execute(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        let outcome = tokio::time::timeout(Duration::from_secs(2), run)
+            .await
+            .map_err(|_| "runtime supervisor did not stop after lease loss".to_owned())?
+            .map_err(debug_error)?;
+        require(
+            outcome
+                == Err(ProviderRuntimeSupervisorError::Heartbeat(
+                    ProviderTaskStoreError::StaleLease,
+                )),
+            format!("runtime supervisor did not report lease loss: {outcome:?}"),
+        )?;
+        require(
+            stopped.load(Ordering::SeqCst),
+            "runtime did not receive shutdown after lease loss",
+        )?;
+
+        let replacement = store
+            .register_runtime(
+                &ProviderRuntimeRegistration {
+                    runtime_id: Uuid::new_v4(),
+                    ..registration
+                },
+                5_000,
+            )
+            .await
+            .map_err(debug_error)?;
+        store
+            .withdraw_runtime(&replacement)
+            .await
+            .map_err(debug_error)
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
 async fn provider_pollerd_runs_fake_dreamina_cli_against_real_postgres_and_drains() -> TestResult {
     let Some(database) = TestDatabase::new().await? else {
         return Ok(());
@@ -590,6 +673,8 @@ printf '{"submit_id":"%s","gen_status":"success"}' "$submit"
             .env("PROVIDER_POLLER_SHUTDOWN_DRAIN_MS", "5000")
             .env("PROVIDER_POLLER_CLI_WALL_TIMEOUT_MS", "5000")
             .env("PROVIDER_POLLER_CLI_TERMINATION_GRACE_MS", "50")
+            .env("PROVIDER_POLLER_RUNTIME_LEASE_MS", "5000")
+            .env("PROVIDER_POLLER_RUNTIME_HEARTBEAT_INTERVAL_MS", "250")
             .env("RUST_LOG", "info")
             .stdin(Stdio::null())
             .stdout(Stdio::from(log))
@@ -629,6 +714,23 @@ printf '{"submit_id":"%s","gen_status":"success"}' "$submit"
                 read_test_log(&log_path)
             )
         })??;
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        let runtime: (String, bool) = sqlx::query_as(
+            r#"
+            SELECT state, heartbeat_at_ms > created_at_ms
+            FROM provider_runtime_leases
+            WHERE execution_profile_id = $1 AND runtime_role = 'poll'
+              AND runtime_owner = 'provider-pollerd-process-test'
+            "#,
+        )
+        .bind(DREAMINA_PROFILE_ID)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(
+            runtime == ("active".to_owned(), true),
+            format!("provider-pollerd runtime lease was not active and heartbeating: {runtime:?}"),
+        )?;
 
         signal_process_group(pid, libc::SIGTERM)?;
         let status = tokio::time::timeout(Duration::from_secs(5), child.wait())
@@ -646,6 +748,17 @@ printf '{"submit_id":"%s","gen_status":"success"}' "$submit"
                 "provider-pollerd SIGTERM exit was {status}: {}",
                 read_test_log(&log_path)
             ),
+        )?;
+        require(
+            runtime_lease_count(
+                &database.pool,
+                DREAMINA_PROFILE_ID,
+                "poll",
+                "provider-pollerd-process-test",
+            )
+            .await?
+                == 0,
+            "provider-pollerd did not withdraw its runtime lease",
         )?;
 
         let authority = executor.executor_execution_id.simple().to_string();
@@ -788,6 +901,8 @@ printf '{"submit_id":"dreamina-submitd-operation-1","gen_status":"querying"}'
                 .env("PROVIDER_SUBMITTER_SHUTDOWN_DRAIN_MS", "5000")
                 .env("PROVIDER_SUBMITTER_CLI_WALL_TIMEOUT_MS", "5000")
                 .env("PROVIDER_SUBMITTER_CLI_TERMINATION_GRACE_MS", "50")
+                .env("PROVIDER_SUBMITTER_RUNTIME_LEASE_MS", "5000")
+                .env("PROVIDER_SUBMITTER_RUNTIME_HEARTBEAT_INTERVAL_MS", "250")
                 .env("RUST_LOG", "info")
                 .stdin(Stdio::null())
                 .stdout(Stdio::from(log))
@@ -823,8 +938,58 @@ printf '{"submit_id":"dreamina-submitd-operation-1","gen_status":"querying"}'
                 read_test_log(&first_log)
             )
         })??;
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        let runtime: (String, bool) = sqlx::query_as(
+            r#"
+            SELECT state, heartbeat_at_ms > created_at_ms
+            FROM provider_runtime_leases
+            WHERE execution_profile_id = $1 AND runtime_role = 'submit'
+              AND runtime_owner = 'provider-submitd-process-test'
+            "#,
+        )
+        .bind(DREAMINA_PROFILE_ID)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(
+            runtime == ("active".to_owned(), true),
+            format!("provider-submitd runtime lease was not active and heartbeating: {runtime:?}"),
+        )?;
 
         signal_process(first_pid, libc::SIGTERM)?;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(status) = first.try_wait().map_err(debug_error)? {
+                    return Err(format!(
+                        "provider-submitd exited before publishing drain state with {status}: {}",
+                        read_test_log(&first_log)
+                    ));
+                }
+                let state: Option<String> = sqlx::query_scalar(
+                    r#"
+                    SELECT state
+                    FROM provider_runtime_leases
+                    WHERE execution_profile_id = $1 AND runtime_role = 'submit'
+                      AND runtime_owner = 'provider-submitd-process-test'
+                    "#,
+                )
+                .bind(DREAMINA_PROFILE_ID)
+                .fetch_optional(&database.pool)
+                .await
+                .map_err(debug_error)?;
+                if state.as_deref() == Some("draining") {
+                    return Ok::<(), String>(());
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .map_err(|_| {
+            format!(
+                "provider-submitd did not publish draining before lane shutdown: {}",
+                read_test_log(&first_log)
+            )
+        })??;
         let first_status = tokio::time::timeout(Duration::from_secs(5), first.wait())
             .await
             .map_err(|_| {
@@ -840,6 +1005,17 @@ printf '{"submit_id":"dreamina-submitd-operation-1","gen_status":"querying"}'
                 "provider-submitd in-flight drain exited with {first_status}: {}",
                 read_test_log(&first_log)
             ),
+        )?;
+        require(
+            runtime_lease_count(
+                &database.pool,
+                DREAMINA_PROFILE_ID,
+                "submit",
+                "provider-submitd-process-test",
+            )
+            .await?
+                == 0,
+            "provider-submitd did not withdraw its first runtime lease",
         )?;
         let attached: (String, String) = sqlx::query_as(
             "SELECT state, remote_operation_id FROM provider_remote_tasks WHERE submission_id = $1",
@@ -895,6 +1071,17 @@ printf '{"submit_id":"dreamina-submitd-operation-1","gen_status":"querying"}'
                 "restarted provider-submitd exited with {second_status}: {}",
                 read_test_log(&second_log)
             ),
+        )?;
+        require(
+            runtime_lease_count(
+                &database.pool,
+                DREAMINA_PROFILE_ID,
+                "submit",
+                "provider-submitd-process-test",
+            )
+            .await?
+                == 0,
+            "restarted provider-submitd did not withdraw its runtime lease",
         )?;
 
         let invocations =
@@ -10874,6 +11061,28 @@ async fn require_profile_status(
             ) == counts,
         format!("unexpected provider profile readiness: {profile:?}"),
     )
+}
+
+async fn runtime_lease_count(
+    pool: &PgPool,
+    execution_profile_id: Uuid,
+    role: &str,
+    owner: &str,
+) -> TestResult<i64> {
+    sqlx::query_scalar(
+        r#"
+        SELECT COUNT(*)::BIGINT
+        FROM provider_runtime_leases
+        WHERE execution_profile_id = $1 AND runtime_role = $2
+          AND runtime_owner = $3
+        "#,
+    )
+    .bind(execution_profile_id)
+    .bind(role)
+    .bind(owner)
+    .fetch_one(pool)
+    .await
+    .map_err(debug_error)
 }
 
 async fn database_now(pool: &PgPool) -> TestResult<i64> {

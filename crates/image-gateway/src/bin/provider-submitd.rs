@@ -3,9 +3,11 @@ use std::{env, path::PathBuf, sync::Arc, time::Duration};
 use gpt_image_2_gateway::{
     DreaminaCliSubmitCodecV1, DreaminaCliSubmitProcessConfig, GatedCliSubmitDriver,
     ImageGatewayError, PostgresExecutorSubmissionStore, PostgresProviderTaskStore,
-    ProviderAccountHomeCapability, ProviderRuntimeProfileStore, ProviderSubmitDaemon,
-    ProviderSubmitDaemonConfig, ProviderSubmitDaemonError, ProviderSubmitService,
-    ProviderSubmitServiceConfig, ProviderSubmitServiceError, ProviderTaskStoreError,
+    ProviderAccountHomeCapability, ProviderRuntimeProfileStore, ProviderRuntimeRegistration,
+    ProviderRuntimeRole, ProviderRuntimeSupervisor, ProviderRuntimeSupervisorConfig,
+    ProviderRuntimeSupervisorError, ProviderSubmitDaemon, ProviderSubmitDaemonConfig,
+    ProviderSubmitDaemonError, ProviderSubmitService, ProviderSubmitServiceConfig,
+    ProviderSubmitServiceError, ProviderTaskStoreError,
     database::{
         DEFAULT_MAX_CONNECTIONS, connect_pool_with_schema, database_schema_from_env,
         database_url_from_env, verify_migrations,
@@ -28,6 +30,8 @@ const DEFAULT_ERROR_MAX_DELAY_MS: u64 = 30_000;
 const DEFAULT_SHUTDOWN_DRAIN_MS: u64 = 30_000;
 const DEFAULT_CLI_WALL_TIMEOUT_MS: u64 = 60_000;
 const DEFAULT_CLI_TERMINATION_GRACE_MS: u64 = 2_000;
+const DEFAULT_RUNTIME_LEASE_MS: u64 = 60_000;
+const DEFAULT_RUNTIME_HEARTBEAT_MS: u64 = 10_000;
 const MAX_DURATION_MS: u64 = 24 * 60 * 60 * 1_000;
 
 struct ProviderSubmitterConfig {
@@ -56,6 +60,8 @@ struct ProviderSubmitterConfig {
     shutdown_drain_timeout: Duration,
     cli_wall_timeout: Duration,
     cli_termination_grace: Duration,
+    runtime_lease_ms: i64,
+    runtime_heartbeat_interval: Duration,
 }
 
 impl ProviderSubmitterConfig {
@@ -127,8 +133,17 @@ impl ProviderSubmitterConfig {
             "PROVIDER_SUBMITTER_CLI_TERMINATION_GRACE_MS",
             DEFAULT_CLI_TERMINATION_GRACE_MS,
         )?;
+        let runtime_lease_ms = duration_env(
+            "PROVIDER_SUBMITTER_RUNTIME_LEASE_MS",
+            DEFAULT_RUNTIME_LEASE_MS,
+        )?;
+        let runtime_heartbeat_ms = duration_env(
+            "PROVIDER_SUBMITTER_RUNTIME_HEARTBEAT_INTERVAL_MS",
+            DEFAULT_RUNTIME_HEARTBEAT_MS,
+        )?;
         if heartbeat_ms.saturating_mul(3) > executor_lease_ms
             || heartbeat_ms.saturating_mul(3) > recovery_lease_ms
+            || runtime_heartbeat_ms.saturating_mul(3) > runtime_lease_ms
             || error_base_delay_ms > error_max_delay_ms
         {
             return Err(ImageGatewayError::config(
@@ -161,6 +176,8 @@ impl ProviderSubmitterConfig {
             shutdown_drain_timeout: Duration::from_millis(shutdown_drain_ms),
             cli_wall_timeout: Duration::from_millis(cli_wall_timeout_ms),
             cli_termination_grace: Duration::from_millis(cli_termination_grace_ms),
+            runtime_lease_ms: to_i64(runtime_lease_ms, "runtime lease")?,
+            runtime_heartbeat_interval: Duration::from_millis(runtime_heartbeat_ms),
         })
     }
 }
@@ -222,7 +239,7 @@ async fn main() -> Result<(), ImageGatewayError> {
     let service = Arc::new(
         ProviderSubmitService::new(
             executor_store,
-            provider_store,
+            provider_store.clone(),
             driver,
             codec,
             ProviderSubmitServiceConfig {
@@ -250,20 +267,35 @@ async fn main() -> Result<(), ImageGatewayError> {
         },
     )
     .map_err(map_daemon_error)?;
-
-    tracing::info!(
-        owner.prefix = %config.owner_prefix,
-        execution.profile.id = %profile.execution_profile_id(),
-        execution.profile.key = %profile.profile_key(),
-        provider.id = %provider_scope.provider_id,
-        provider.account.id = %provider_scope.provider_account_id,
-        max.in_flight = profile.max_in_flight(),
-        "provider-submitd started"
+    let runtime = ProviderRuntimeSupervisor::new(
+        provider_store,
+        ProviderRuntimeRegistration {
+            runtime_id: Uuid::new_v4(),
+            execution_profile_id: profile.execution_profile_id(),
+            role: ProviderRuntimeRole::Submit,
+            runtime_owner: config.owner_prefix.clone(),
+        },
+        ProviderRuntimeSupervisorConfig {
+            lease_ms: config.runtime_lease_ms,
+            heartbeat_interval: config.runtime_heartbeat_interval,
+        },
     );
-    let report = daemon
-        .run_until_shutdown(shutdown_signal())
+
+    let report = runtime
+        .run_until_shutdown(shutdown_signal(), |shutdown| {
+            tracing::info!(
+                owner.prefix = %config.owner_prefix,
+                execution.profile.id = %profile.execution_profile_id(),
+                execution.profile.key = %profile.profile_key(),
+                provider.id = %provider_scope.provider_id,
+                provider.account.id = %provider_scope.provider_account_id,
+                max.in_flight = profile.max_in_flight(),
+                "provider-submitd started"
+            );
+            daemon.run_until_shutdown(shutdown.wait())
+        })
         .await
-        .map_err(map_daemon_error)?;
+        .map_err(map_runtime_error)?;
     tracing::info!(
         deadline.resolved = report.deadline_resolved,
         fresh.submitted = report.fresh_submitted,
@@ -384,6 +416,31 @@ fn map_daemon_error(error: ProviderSubmitDaemonError) -> ImageGatewayError {
         }
         ProviderSubmitDaemonError::LaneTerminated
         | ProviderSubmitDaemonError::ShutdownDrainTimedOut => {
+            ImageGatewayError::service_unavailable(error.to_string())
+        }
+    }
+}
+
+fn map_runtime_error(
+    error: ProviderRuntimeSupervisorError<ProviderSubmitDaemonError>,
+) -> ImageGatewayError {
+    match error {
+        ProviderRuntimeSupervisorError::InvalidConfiguration => {
+            ImageGatewayError::config(error.to_string())
+        }
+        ProviderRuntimeSupervisorError::Runtime(error) => map_daemon_error(error),
+        ProviderRuntimeSupervisorError::Registration(ProviderTaskStoreError::InvalidInput)
+        | ProviderRuntimeSupervisorError::Registration(ProviderTaskStoreError::Conflict)
+        | ProviderRuntimeSupervisorError::Registration(ProviderTaskStoreError::NotFound)
+        | ProviderRuntimeSupervisorError::Registration(ProviderTaskStoreError::StaleLease) => {
+            ImageGatewayError::config(
+                "provider-submitd runtime identity is unavailable or incompatible",
+            )
+        }
+        ProviderRuntimeSupervisorError::Registration(ProviderTaskStoreError::Unavailable)
+        | ProviderRuntimeSupervisorError::Heartbeat(_)
+        | ProviderRuntimeSupervisorError::Drain(_)
+        | ProviderRuntimeSupervisorError::Withdraw(_) => {
             ImageGatewayError::service_unavailable(error.to_string())
         }
     }

@@ -219,6 +219,15 @@ times three must fit inside both executor and recovery leases. Error base delay
 must not exceed its cap. The optional owner prefix is visible ASCII and capped
 so generated lane, claim, and defer identities remain within database limits.
 
+Phase 2AE adds independent process-liveness controls:
+
+- `PROVIDER_SUBMITTER_RUNTIME_LEASE_MS`, default `60000`; and
+- `PROVIDER_SUBMITTER_RUNTIME_HEARTBEAT_INTERVAL_MS`, default `10000`.
+
+The runtime heartbeat interval times three must fit inside the runtime lease.
+These values are deliberately separate from executor and submit-recovery leases;
+process discoverability must not change task authority duration.
+
 ## Security And Diagnostics
 
 Startup logs include only:

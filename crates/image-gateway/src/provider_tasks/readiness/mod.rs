@@ -5,6 +5,12 @@ use uuid::Uuid;
 use super::ProviderTaskStoreError;
 
 mod postgres;
+mod supervisor;
+
+pub use supervisor::{
+    ProviderRuntimeShutdown, ProviderRuntimeSupervisor, ProviderRuntimeSupervisorConfig,
+    ProviderRuntimeSupervisorError,
+};
 
 const MAX_RUNTIME_LEASE_MS: i64 = 24 * 60 * 60 * 1_000;
 

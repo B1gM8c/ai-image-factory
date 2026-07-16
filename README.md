@@ -96,6 +96,9 @@ remaining capacity hot-row gate are documented in
 The inactive provider runtime lease fencing and configured/active/draining/blocked
 projection are documented in
 [`docs/architecture/2026-phase2ad-provider-runtime-readiness.md`](docs/architecture/2026-phase2ad-provider-runtime-readiness.md).
+The lease-supervised submit/poll daemon lifecycle and heartbeat-loss shutdown
+proof are documented in
+[`docs/architecture/2026-phase2ae-provider-runtime-supervisor.md`](docs/architecture/2026-phase2ae-provider-runtime-supervisor.md).
 Database-bound provider profiles and durable capacity are documented in
 [`docs/architecture/2026-phase1g-execution-binding-capacity.md`](docs/architecture/2026-phase1g-execution-binding-capacity.md).
 

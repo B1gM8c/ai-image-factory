@@ -154,9 +154,10 @@ This phase proves with PostgreSQL 18:
 
 ## Explicit Limits
 
-This phase does not provide:
+This phase by itself does not provide:
 
-- provider daemon registration or periodic heartbeats;
+- provider daemon registration or periodic heartbeats, which are composed in
+  Phase 2AE;
 - `/readyz` or an admin runtime status endpoint;
 - a desired activation state or rollout controller;
 - provider query rate limiting, cooldown, circuit breaking, or account
@@ -167,12 +168,13 @@ This phase does not provide:
 
 ## Next Gate
 
-The next phase should compose submit and poll daemons with the lease store:
+Phase 2AE composes submit and poll daemons with the lease store:
 
 1. register only after all local and database configuration checks pass;
 2. renew with a bounded interval shorter than the lease;
 3. make heartbeat loss initiate daemon shutdown;
 4. publish `draining` before graceful shutdown;
-5. withdraw only after all lanes finish; and
-6. expose a cheap `/readyz` database check plus aggregate profile state without
-   leaking account or credential identity.
+5. withdraw only after all lanes finish.
+
+The remaining gate is to expose a cheap `/readyz` database check plus aggregate
+profile state without leaking account or credential identity.

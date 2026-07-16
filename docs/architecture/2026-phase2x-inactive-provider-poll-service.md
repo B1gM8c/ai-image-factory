@@ -194,10 +194,16 @@ Optional bounded controls:
 | `PROVIDER_POLLER_SHUTDOWN_DRAIN_MS` | 30000 |
 | `PROVIDER_POLLER_CLI_WALL_TIMEOUT_MS` | 60000 |
 | `PROVIDER_POLLER_CLI_TERMINATION_GRACE_MS` | 2000 |
+| `PROVIDER_POLLER_RUNTIME_LEASE_MS` | 60000 |
+| `PROVIDER_POLLER_RUNTIME_HEARTBEAT_INTERVAL_MS` | 10000 |
 
 Every duration must be in `1..=86400000` milliseconds. There is deliberately
 no default for artifact size or materialization concurrency because silently
 choosing those values would create a production resource policy.
+
+The process runtime lease is independent from provider task poll leases. Its
+heartbeat interval times three must fit inside its lease; changing readiness
+timing therefore cannot silently extend task execution authority.
 
 Environment variables are currently the deployment injection mechanism. This
 phase does not claim they are a credential broker. Production provisioning
