@@ -1,8 +1,10 @@
 mod daemon;
 mod driver;
 mod orchestrator;
+mod runtime;
 mod sink;
 
+pub(crate) use daemon::MAX_PROVIDER_POLL_LANES;
 pub use daemon::{
     ProviderPollDaemon, ProviderPollDaemonConfig, ProviderPollDaemonError,
     ProviderPollDaemonReport, ProviderPollIteration,
@@ -12,6 +14,7 @@ pub use orchestrator::{
     ProviderPollOrchestrator, ProviderPollOrchestratorConfig, ProviderPollOrchestratorError,
     ProviderPollRun, ProviderPollStore,
 };
+pub use runtime::{ProviderPollRuntimeProfile, ProviderPollRuntimeProfileStore};
 pub(crate) use sink::ControlledProviderArtifactSink;
 pub use sink::{
     ProviderArtifactSinkContractError, ProviderArtifactStageContext, ProviderArtifactStager,

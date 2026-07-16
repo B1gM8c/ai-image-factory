@@ -63,6 +63,9 @@ pre-authority crash replay are documented in
 The provider-neutral fixed-lane poll daemon, jittered pacing, and bounded
 shutdown drain are documented in
 [`docs/architecture/2026-phase2t-provider-poll-daemon.md`](docs/architecture/2026-phase2t-provider-poll-daemon.md).
+The active provider/account poll runtime snapshot, redacted credential identity,
+and durable lane derivation are documented in
+[`docs/architecture/2026-phase2u-active-poll-runtime-profile.md`](docs/architecture/2026-phase2u-active-poll-runtime-profile.md).
 Database-bound provider profiles and durable capacity are documented in
 [`docs/architecture/2026-phase1g-execution-binding-capacity.md`](docs/architecture/2026-phase1g-execution-binding-capacity.md).
 

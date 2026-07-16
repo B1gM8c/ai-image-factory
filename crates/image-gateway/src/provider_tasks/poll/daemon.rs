@@ -8,7 +8,7 @@ use super::{
     ProviderPollOrchestratorError, ProviderPollRun, ProviderPollStore,
 };
 
-const MAX_LANES: usize = 1_024;
+pub(crate) const MAX_PROVIDER_POLL_LANES: usize = 1_024;
 const MAX_DELAY: Duration = Duration::from_secs(24 * 60 * 60);
 
 pub trait ProviderPollIteration: Send + Sync + 'static {
@@ -264,7 +264,7 @@ fn validate_config(config: ProviderPollDaemonConfig) -> Result<(), ProviderPollD
         config.error_max_delay,
         config.shutdown_drain_timeout,
     ];
-    if !(1..=MAX_LANES).contains(&config.max_in_flight)
+    if !(1..=MAX_PROVIDER_POLL_LANES).contains(&config.max_in_flight)
         || delays
             .iter()
             .any(|delay| delay.is_zero() || *delay > MAX_DELAY)

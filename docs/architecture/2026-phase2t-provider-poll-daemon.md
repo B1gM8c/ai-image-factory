@@ -7,6 +7,10 @@ PostgreSQL 18 concurrent-claim integration tests. This phase activates no
 provider, credential, CLI query command, service binary, route, billing
 behavior, or external call.
 
+Follow-up: Phase 2U now provides the active, frozen, redacted runtime profile
+and derives the daemon lane bound from durable provider-account capacity:
+[`2026-phase2u-active-poll-runtime-profile.md`](2026-phase2u-active-poll-runtime-profile.md).
+
 ## Scope
 
 Phase 2T adds the reusable lifecycle boundary around the Phase 2R
@@ -254,14 +258,14 @@ Phase 2T does not provide:
 
 ## Next Gate
 
-Phase 2U should compose this daemon into an inactive provider poll service only
-after the selected provider/account profile can be loaded and fenced exactly:
+Phase 2U closes the selected provider/account profile-loading gate. Phase 2V
+must implement a verified provider poll driver before any service binary is
+composed:
 
-1. bind one process to one immutable provider/account/profile revision;
-2. derive lane count from durable provider-account capacity;
-3. verify owner identity, credential revision, and query codec revision before
-   starting lanes;
-4. add provider-safe metrics without logging raw provider errors;
-5. prove two-process fairness, crash recovery, and bounded database load; and
-6. keep Dreamina/Grok activation disabled until their query and media contracts
-   pass independent conformance tests.
+1. project the canonical query request from the frozen operation binding;
+2. prove fresh output-directory ownership and complete process cancellation;
+3. classify pending, terminal, retry, and uncertain responses;
+4. stream bounded media through the epoch-fenced artifact stager;
+5. add provider-safe metrics without logging raw provider errors; and
+6. keep Dreamina/Grok activation disabled until query and media conformance
+   tests pass independently.

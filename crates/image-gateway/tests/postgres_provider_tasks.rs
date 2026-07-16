@@ -16,15 +16,15 @@ use gpt_image_2_gateway::{
     ProviderCapacityReconciliationState, ProviderCapacityReconciliationStore,
     ProviderCapacityTerminalState, ProviderExecutionContext, ProviderPollDaemon,
     ProviderPollDaemonConfig, ProviderPollDriver, ProviderPollDriverCall, ProviderPollOrchestrator,
-    ProviderPollOrchestratorConfig, ProviderPollRun, ProviderPollStore, ProviderRemoteTask,
-    ProviderSubmitAcquire, ProviderSubmitFailureKind, ProviderSubmitIntent,
-    ProviderSubmitIntentState, ProviderSubmitOrchestrator, ProviderSubmitOrchestratorError,
-    ProviderSubmitOutcome, ProviderSubmitRecoveryFence, ProviderSubmitStart, ProviderSubmitWork,
-    ProviderTaskClaimScope, ProviderTaskDeadlineStore, ProviderTaskLease, ProviderTaskObservation,
-    ProviderTaskObservationOutcome, ProviderTaskObservationSource, ProviderTaskState,
-    ProviderTaskStore, ProviderTaskStoreError, RemoteTaskAttach, RemoteTaskSubmitFailure,
-    RemoteTaskSubmitReceipt, RemoteTaskSubmitReservation, StagedProviderArtifact,
-    VerifiedCallbackWakeup,
+    ProviderPollOrchestratorConfig, ProviderPollRun, ProviderPollRuntimeProfileStore,
+    ProviderPollStore, ProviderRemoteTask, ProviderSubmitAcquire, ProviderSubmitFailureKind,
+    ProviderSubmitIntent, ProviderSubmitIntentState, ProviderSubmitOrchestrator,
+    ProviderSubmitOrchestratorError, ProviderSubmitOutcome, ProviderSubmitRecoveryFence,
+    ProviderSubmitStart, ProviderSubmitWork, ProviderTaskClaimScope, ProviderTaskDeadlineStore,
+    ProviderTaskLease, ProviderTaskObservation, ProviderTaskObservationOutcome,
+    ProviderTaskObservationSource, ProviderTaskState, ProviderTaskStore, ProviderTaskStoreError,
+    RemoteTaskAttach, RemoteTaskSubmitFailure, RemoteTaskSubmitReceipt,
+    RemoteTaskSubmitReservation, StagedProviderArtifact, VerifiedCallbackWakeup,
     admission::WorkLease,
     database::{connect_test_pool_with_search_path, run_migrations},
 };
@@ -112,6 +112,113 @@ macro_rules! attach_request {
 #[cfg(unix)]
 #[path = "postgres_provider_tasks/gated_submit.rs"]
 mod gated_submit;
+
+#[tokio::test]
+async fn active_poll_runtime_profile_freezes_scope_and_capacity() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let store = PostgresProviderTaskStore::new(database.pool.clone());
+        let profile = store
+            .load_active_poll_runtime_profile("provider-task-profile")
+            .await
+            .map_err(debug_error)?;
+
+        require(
+            profile.execution_profile_id() == PROFILE_ID
+                && profile.profile_key() == "provider-task-profile"
+                && profile.provider_id() == "provider-test"
+                && profile.command_schema() == "provider-command-v1"
+                && profile.operation_id() == "images.generations"
+                && profile.operation_descriptor_revision() == "provider-test/images.generations/v1"
+                && profile.operation_descriptor_sha256_v1() == "2".repeat(64)
+                && profile.idempotency_mode() == "submission_bound"
+                && profile.adapter_revision() == "provider-test-adapter-v1"
+                && profile.credential_pool_id() == POOL_ID
+                && profile.provider_account_id() == ACCOUNT_ID
+                && profile.credential_ref() == "test-vault.provider-task.1"
+                && profile.credential_revision() == 1
+                && profile.credential_auth_sha256() == "1".repeat(64)
+                && profile.resource_policy_id() == POLICY_ID
+                && profile.resource_policy_revision() == 1
+                && profile.max_in_flight() == 100
+                && profile.claim_scope() == claim_scope(),
+            format!("unexpected active poll runtime profile: {profile:?}"),
+        )?;
+        let debug = format!("{profile:?}");
+        require(
+            !debug.contains("test-vault.provider-task.1") && !debug.contains(&"1".repeat(64)),
+            "poll runtime profile Debug leaked credential identity",
+        )
+    }
+    .await;
+    let cleanup = database.cleanup().await;
+    combine(result, cleanup)
+}
+
+#[tokio::test]
+async fn poll_runtime_profile_rejects_each_disabled_dependency() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let store = PostgresProviderTaskStore::new(database.pool.clone());
+        let cases = [
+            (
+                "UPDATE provider_execution_profiles SET state = 'disabled' WHERE execution_profile_id = $1",
+                "UPDATE provider_execution_profiles SET state = 'enabled' WHERE execution_profile_id = $1",
+                PROFILE_ID,
+            ),
+            (
+                "UPDATE provider_credential_pools SET state = 'disabled' WHERE credential_pool_id = $1",
+                "UPDATE provider_credential_pools SET state = 'enabled' WHERE credential_pool_id = $1",
+                POOL_ID,
+            ),
+            (
+                "UPDATE provider_accounts SET state = 'disabled' WHERE provider_account_id = $1",
+                "UPDATE provider_accounts SET state = 'enabled' WHERE provider_account_id = $1",
+                ACCOUNT_ID,
+            ),
+            (
+                "UPDATE executor_resource_policies SET state = 'disabled' WHERE resource_policy_id = $1",
+                "UPDATE executor_resource_policies SET state = 'enabled' WHERE resource_policy_id = $1",
+                POLICY_ID,
+            ),
+        ];
+
+        for (disable, enable, id) in cases {
+            sqlx::query(disable)
+                .bind(id)
+                .execute(&database.pool)
+                .await
+                .map_err(debug_error)?;
+            require(
+                matches!(
+                    store
+                        .load_active_poll_runtime_profile("provider-task-profile")
+                        .await,
+                    Err(ProviderTaskStoreError::NotFound)
+                ),
+                format!("disabled profile dependency {id} remained runnable"),
+            )?;
+            sqlx::query(enable)
+                .bind(id)
+                .execute(&database.pool)
+                .await
+                .map_err(debug_error)?;
+        }
+
+        store
+            .load_active_poll_runtime_profile("provider-task-profile")
+            .await
+            .map(|_| ())
+            .map_err(debug_error)
+    }
+    .await;
+    let cleanup = database.cleanup().await;
+    combine(result, cleanup)
+}
 
 #[tokio::test]
 async fn provider_poll_orchestrator_materializes_and_atomically_resolves() -> TestResult {

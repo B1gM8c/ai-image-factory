@@ -27,7 +27,8 @@ pub use poll::{
     ProviderArtifactStagerFactory, ProviderPollDaemon, ProviderPollDaemonConfig,
     ProviderPollDaemonError, ProviderPollDaemonReport, ProviderPollDriver, ProviderPollDriverCall,
     ProviderPollIteration, ProviderPollOrchestrator, ProviderPollOrchestratorConfig,
-    ProviderPollOrchestratorError, ProviderPollRun, ProviderPollStore, StagedProviderArtifact,
+    ProviderPollOrchestratorError, ProviderPollRun, ProviderPollRuntimeProfile,
+    ProviderPollRuntimeProfileStore, ProviderPollStore, StagedProviderArtifact,
 };
 pub use postgres::PostgresProviderTaskStore;
 pub use remote_submit::{

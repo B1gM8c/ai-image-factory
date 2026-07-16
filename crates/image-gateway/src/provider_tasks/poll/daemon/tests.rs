@@ -123,7 +123,7 @@ fn invalid_configuration_is_rejected() {
             ..config()
         },
         ProviderPollDaemonConfig {
-            max_in_flight: MAX_LANES + 1,
+            max_in_flight: MAX_PROVIDER_POLL_LANES + 1,
             ..config()
         },
         ProviderPollDaemonConfig {
