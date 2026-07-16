@@ -24,9 +24,10 @@ pub use orchestrator::{
 };
 pub use poll::{
     ProviderArtifactSinkContractError, ProviderArtifactStageContext, ProviderArtifactStager,
-    ProviderArtifactStagerFactory, ProviderPollDriver, ProviderPollDriverCall,
-    ProviderPollOrchestrator, ProviderPollOrchestratorConfig, ProviderPollOrchestratorError,
-    ProviderPollRun, ProviderPollStore, StagedProviderArtifact,
+    ProviderArtifactStagerFactory, ProviderPollDaemon, ProviderPollDaemonConfig,
+    ProviderPollDaemonError, ProviderPollDaemonReport, ProviderPollDriver, ProviderPollDriverCall,
+    ProviderPollIteration, ProviderPollOrchestrator, ProviderPollOrchestratorConfig,
+    ProviderPollOrchestratorError, ProviderPollRun, ProviderPollStore, StagedProviderArtifact,
 };
 pub use postgres::PostgresProviderTaskStore;
 pub use remote_submit::{

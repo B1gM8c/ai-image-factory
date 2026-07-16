@@ -60,6 +60,9 @@ and committed-authority recovery are documented in
 The epoch-fenced streaming filesystem stager, immutable publication, and
 pre-authority crash replay are documented in
 [`docs/architecture/2026-phase2s-epoch-staged-provider-artifacts.md`](docs/architecture/2026-phase2s-epoch-staged-provider-artifacts.md).
+The provider-neutral fixed-lane poll daemon, jittered pacing, and bounded
+shutdown drain are documented in
+[`docs/architecture/2026-phase2t-provider-poll-daemon.md`](docs/architecture/2026-phase2t-provider-poll-daemon.md).
 Database-bound provider profiles and durable capacity are documented in
 [`docs/architecture/2026-phase1g-execution-binding-capacity.md`](docs/architecture/2026-phase1g-execution-binding-capacity.md).
 

@@ -14,7 +14,8 @@ use gpt_image_2_gateway::{
     ProviderArtifactPublication, ProviderArtifactStageContext, ProviderArtifactStager,
     ProviderArtifactStagerFactory, ProviderCapacityEvidence, ProviderCapacityEvidenceOutcome,
     ProviderCapacityReconciliationState, ProviderCapacityReconciliationStore,
-    ProviderCapacityTerminalState, ProviderExecutionContext, ProviderPollOrchestrator,
+    ProviderCapacityTerminalState, ProviderExecutionContext, ProviderPollDaemon,
+    ProviderPollDaemonConfig, ProviderPollDriver, ProviderPollDriverCall, ProviderPollOrchestrator,
     ProviderPollOrchestratorConfig, ProviderPollRun, ProviderPollStore, ProviderRemoteTask,
     ProviderSubmitAcquire, ProviderSubmitFailureKind, ProviderSubmitIntent,
     ProviderSubmitIntentState, ProviderSubmitOrchestrator, ProviderSubmitOrchestratorError,
@@ -29,10 +30,11 @@ use gpt_image_2_gateway::{
 };
 use image::{DynamicImage, ImageFormat, Rgba, RgbaImage};
 use image_provider_sdk::{
-    ArtifactMetadata, ArtifactSinkError, ArtifactSinkErrorKind, CanonicalCommandPayload,
-    DurableArtifactManifest, DurableArtifactRef, EffectCertainty, OutputSlot, PendingOperation,
-    ProviderCommandIdentity, ProviderFailure, ProviderFailureClass, ProviderRequestId,
-    RemoteOperationRef, RetryDirective, SingleOutputCommand,
+    ArtifactMetadata, ArtifactSink, ArtifactSinkError, ArtifactSinkErrorKind,
+    CanonicalCommandPayload, DurableArtifactManifest, DurableArtifactRef, EffectCertainty,
+    OutputSlot, PendingOperation, PollObservation, ProviderCommandIdentity, ProviderFailure,
+    ProviderFailureClass, ProviderRequestId, RemoteOperationRef, RetryDirective,
+    SingleOutputCommand,
 };
 use image_provider_test_support::{
     OutputPlan, PollStep, ScriptedFakeProvider, SubmitStep, TestPayload,
@@ -48,6 +50,46 @@ const PROFILE_ID: Uuid = Uuid::from_u128(0x1710);
 const POOL_ID: Uuid = Uuid::from_u128(0x1720);
 const ACCOUNT_ID: Uuid = Uuid::from_u128(0x1730);
 const POLICY_ID: Uuid = Uuid::from_u128(0x1740);
+
+#[derive(Clone)]
+struct BlockingPendingPollDriver {
+    started: Arc<tokio::sync::Semaphore>,
+    release: Arc<tokio::sync::Semaphore>,
+    calls: Arc<AtomicUsize>,
+}
+
+impl BlockingPendingPollDriver {
+    fn new() -> Self {
+        Self {
+            started: Arc::new(tokio::sync::Semaphore::new(0)),
+            release: Arc::new(tokio::sync::Semaphore::new(0)),
+            calls: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+}
+
+impl ProviderPollDriver for BlockingPendingPollDriver {
+    fn provider_id(&self) -> &'static str {
+        "provider-test"
+    }
+
+    async fn poll<S: ArtifactSink>(
+        &self,
+        _call: &ProviderPollDriverCall,
+        _sink: &mut S,
+    ) -> Result<PollObservation, ProviderFailure> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.started.add_permits(1);
+        self.release
+            .acquire()
+            .await
+            .expect("blocking provider release")
+            .forget();
+        Ok(PollObservation::Pending {
+            next_poll_after_ms: Some(10_000),
+        })
+    }
+}
 
 macro_rules! submit_failure {
     ($store:expr, $lease:expr, $kind:expr, $event:expr, $error:expr $(,)?) => {
@@ -200,6 +242,255 @@ async fn provider_poll_orchestrator_materializes_and_atomically_resolves() -> Te
                     1,
                 ),
             format!("poll orchestration did not commit one canonical success: {projection:?}"),
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
+async fn provider_poll_daemon_claims_due_tasks_once_across_concurrent_lanes() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        const TASKS: usize = 6;
+
+        let store = PostgresProviderTaskStore::new(database.pool.clone());
+        for index in 0..TASKS {
+            seed_attached_remote_task(
+                &database.pool,
+                &store,
+                &format!("poll-daemon-worker-{index}"),
+                &format!("poll-daemon-{index}"),
+                30_000,
+                0,
+            )
+            .await?;
+        }
+
+        let provider = ScriptedFakeProvider::default();
+        for _ in 0..TASKS {
+            provider.push_poll(PollStep::Pending {
+                next_poll_after_ms: Some(10_000),
+            });
+        }
+        let orchestrator = Arc::new(
+            ProviderPollOrchestrator::new(
+                store,
+                provider.clone(),
+                ManifestOnlyPollStagerFactory::default(),
+                ProviderPollOrchestratorConfig {
+                    scope: claim_scope(),
+                    owner: "poll-daemon-owner".to_owned(),
+                    lease_ms: 5_000,
+                    heartbeat_interval: Duration::from_secs(1),
+                    max_materializations: 2,
+                },
+            )
+            .map_err(debug_error)?,
+        );
+        let daemon =
+            ProviderPollDaemon::new(orchestrator, poll_daemon_config(3)).map_err(debug_error)?;
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let run = tokio::spawn(async move {
+            daemon
+                .run_until_shutdown(async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+        });
+
+        wait_for_poll_observations(&database.pool, TASKS as i64).await?;
+        shutdown_tx.send(()).map_err(debug_error)?;
+        let report = run.await.map_err(debug_error)?.map_err(debug_error)?;
+
+        require(
+            report.observed == TASKS as u64 && report.errors == 0,
+            format!("poll daemon report was not exact: {report:?}"),
+        )?;
+        require(
+            provider.calls().poll == TASKS,
+            "concurrent poll lanes invoked the provider more than once per due task",
+        )?;
+        let projection: (i64, i64, i64, i64) = sqlx::query_as(
+            r#"
+            SELECT
+              (SELECT COUNT(*) FROM provider_remote_tasks
+               WHERE state = 'provider_waiting'),
+              (SELECT COUNT(*) FROM provider_remote_tasks
+               WHERE poll_owner IS NOT NULL OR poll_lease_expires_at_ms IS NOT NULL),
+              (SELECT COUNT(*) FROM provider_task_observations
+               WHERE source = 'poll' AND observed_state = 'provider_waiting'),
+              (SELECT COUNT(*) FROM (
+                 SELECT submission_id
+                 FROM provider_task_observations
+                 WHERE source = 'poll'
+                 GROUP BY submission_id
+                 HAVING COUNT(*) <> 1
+               ) duplicates)
+            "#,
+        )
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(
+            projection == (TASKS as i64, 0, TASKS as i64, 0),
+            format!("concurrent poll claims did not resolve exactly once: {projection:?}"),
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
+async fn two_provider_poll_daemons_hold_distinct_leases_and_resolve_once() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let store = PostgresProviderTaskStore::new(database.pool.clone());
+        for index in 0..2 {
+            seed_attached_remote_task(
+                &database.pool,
+                &store,
+                &format!("dual-poll-daemon-worker-{index}"),
+                &format!("dual-poll-daemon-{index}"),
+                30_000,
+                0,
+            )
+            .await?;
+        }
+
+        let left_driver = BlockingPendingPollDriver::new();
+        let right_driver = BlockingPendingPollDriver::new();
+        let left = ProviderPollDaemon::new(
+            Arc::new(
+                ProviderPollOrchestrator::new(
+                    store.clone(),
+                    left_driver.clone(),
+                    ManifestOnlyPollStagerFactory::default(),
+                    ProviderPollOrchestratorConfig {
+                        scope: claim_scope(),
+                        owner: "left-poll-daemon".to_owned(),
+                        lease_ms: 5_000,
+                        heartbeat_interval: Duration::from_secs(1),
+                        max_materializations: 1,
+                    },
+                )
+                .map_err(debug_error)?,
+            ),
+            poll_daemon_config(1),
+        )
+        .map_err(debug_error)?;
+        let right = ProviderPollDaemon::new(
+            Arc::new(
+                ProviderPollOrchestrator::new(
+                    store,
+                    right_driver.clone(),
+                    ManifestOnlyPollStagerFactory::default(),
+                    ProviderPollOrchestratorConfig {
+                        scope: claim_scope(),
+                        owner: "right-poll-daemon".to_owned(),
+                        lease_ms: 5_000,
+                        heartbeat_interval: Duration::from_secs(1),
+                        max_materializations: 1,
+                    },
+                )
+                .map_err(debug_error)?,
+            ),
+            poll_daemon_config(1),
+        )
+        .map_err(debug_error)?;
+
+        let (left_shutdown_tx, left_shutdown_rx) = tokio::sync::oneshot::channel();
+        let left_run = tokio::spawn(async move {
+            left.run_until_shutdown(async {
+                let _ = left_shutdown_rx.await;
+            })
+            .await
+        });
+        left_driver
+            .started
+            .acquire()
+            .await
+            .expect("left provider started")
+            .forget();
+
+        let (right_shutdown_tx, right_shutdown_rx) = tokio::sync::oneshot::channel();
+        let right_run = tokio::spawn(async move {
+            right
+                .run_until_shutdown(async {
+                    let _ = right_shutdown_rx.await;
+                })
+                .await
+        });
+        right_driver
+            .started
+            .acquire()
+            .await
+            .expect("right provider started")
+            .forget();
+
+        let active_leases: (i64, i64) = sqlx::query_as(
+            r#"
+            SELECT COUNT(*), COUNT(DISTINCT poll_owner)
+            FROM provider_remote_tasks
+            WHERE poll_owner IS NOT NULL
+            "#,
+        )
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(
+            active_leases == (2, 2),
+            format!("independent daemons did not hold distinct leases: {active_leases:?}"),
+        )?;
+
+        left_driver.release.add_permits(1);
+        right_driver.release.add_permits(1);
+        wait_for_poll_observations(&database.pool, 2).await?;
+        left_shutdown_tx.send(()).map_err(debug_error)?;
+        right_shutdown_tx.send(()).map_err(debug_error)?;
+        let left_report = left_run.await.map_err(debug_error)?.map_err(debug_error)?;
+        let right_report = right_run.await.map_err(debug_error)?.map_err(debug_error)?;
+
+        require(
+            left_report.observed == 1
+                && right_report.observed == 1
+                && left_report.errors == 0
+                && right_report.errors == 0,
+            format!(
+                "independent daemon reports were not exact: left={left_report:?}, right={right_report:?}"
+            ),
+        )?;
+        require(
+            left_driver.calls.load(Ordering::SeqCst) == 1
+                && right_driver.calls.load(Ordering::SeqCst) == 1,
+            "independent daemons duplicated a provider poll",
+        )?;
+        let projection: (i64, i64, i64) = sqlx::query_as(
+            r#"
+            SELECT
+              (SELECT COUNT(*) FROM provider_task_observations
+               WHERE source = 'poll' AND observed_state = 'provider_waiting'),
+              (SELECT COUNT(*) FROM provider_remote_tasks
+               WHERE poll_owner IS NOT NULL OR poll_lease_expires_at_ms IS NOT NULL),
+              (SELECT COUNT(*) FROM (
+                 SELECT submission_id
+                 FROM provider_task_observations
+                 WHERE source = 'poll'
+                 GROUP BY submission_id
+                 HAVING COUNT(*) <> 1
+               ) duplicates)
+            "#,
+        )
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(
+            projection == (2, 0, 0),
+            format!("independent daemon resolution was not exactly once: {projection:?}"),
         )
     }
     .await;
@@ -7984,6 +8275,39 @@ fn completed_poll_provider(
         ),
     }));
     Ok(provider)
+}
+
+fn poll_daemon_config(max_in_flight: usize) -> ProviderPollDaemonConfig {
+    ProviderPollDaemonConfig {
+        max_in_flight,
+        idle_delay: Duration::from_millis(10),
+        error_base_delay: Duration::from_millis(10),
+        error_max_delay: Duration::from_millis(100),
+        shutdown_drain_timeout: Duration::from_secs(1),
+    }
+}
+
+async fn wait_for_poll_observations(pool: &PgPool, expected: i64) -> TestResult {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let observations: i64 = sqlx::query_scalar(
+                r#"
+                SELECT COUNT(*)
+                FROM provider_task_observations
+                WHERE source = 'poll' AND observed_state = 'provider_waiting'
+                "#,
+            )
+            .fetch_one(pool)
+            .await
+            .map_err(debug_error)?;
+            if observations == expected {
+                return Ok::<(), String>(());
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .map_err(|_| "poll daemon did not resolve all due tasks in time".to_owned())?
 }
 
 fn png_bytes(pixel: [u8; 4]) -> Vec<u8> {

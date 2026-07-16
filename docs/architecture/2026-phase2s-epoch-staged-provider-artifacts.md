@@ -6,6 +6,10 @@ Status: implemented and verified with filesystem adversarial tests plus real
 PostgreSQL 18 integration tests. This phase activates no provider, credential,
 CLI query command, daemon, route, billing behavior, or external call.
 
+Follow-up: Phase 2T now supplies the provider-neutral fixed-lane poll daemon,
+jittered idle/error pacing, and bounded shutdown drain. See
+[`2026-phase2t-provider-poll-daemon.md`](2026-phase2t-provider-poll-daemon.md).
+
 ## Scope
 
 Phase 2S supplies the production filesystem implementation behind the Phase 2R
@@ -340,7 +344,7 @@ Phase 2S does not provide:
 
 ## Next Gate
 
-Phase 2T should wire one provider-neutral poll daemon around the verified
+Phase 2T wires one provider-neutral poll daemon around the verified
 orchestrator without activating a provider:
 
 1. scope one daemon instance to one immutable provider/account execution
@@ -349,7 +353,8 @@ orchestrator without activating a provider:
    scheduler;
 3. add idle backoff, shutdown, bounded error pacing, and observability;
 4. preserve the existing database deadline and lease authority;
-5. prove two-daemon fairness and crash recovery against PostgreSQL; and
+5. prove two-daemon lease non-overlap and measure sustained fairness against
+   PostgreSQL; and
 6. benchmark idle, pending, and completed paths before selecting production
    defaults.
 
