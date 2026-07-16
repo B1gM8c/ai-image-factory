@@ -1,31 +1,39 @@
 use std::{
     env,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::{Duration, Instant},
 };
 
 use gpt_image_2_gateway::{
     ExecutorClaimScope, ExecutorHandoffStore, ExecutorSubmissionLease, ExecutorSubmissionOutcome,
     ExecutorSubmissionStore, PostgresExecutorSubmissionStore, PostgresProviderTaskStore,
-    ProviderArtifactAuthority, ProviderCapacityEvidence, ProviderCapacityEvidenceOutcome,
+    ProviderArtifactAuthority, ProviderArtifactStageContext, ProviderArtifactStager,
+    ProviderArtifactStagerFactory, ProviderCapacityEvidence, ProviderCapacityEvidenceOutcome,
     ProviderCapacityReconciliationState, ProviderCapacityReconciliationStore,
-    ProviderCapacityTerminalState, ProviderExecutionContext, ProviderSubmitAcquire,
+    ProviderCapacityTerminalState, ProviderExecutionContext, ProviderPollOrchestrator,
+    ProviderPollOrchestratorConfig, ProviderPollRun, ProviderSubmitAcquire,
     ProviderSubmitFailureKind, ProviderSubmitIntent, ProviderSubmitIntentState,
     ProviderSubmitOrchestrator, ProviderSubmitOrchestratorError, ProviderSubmitOutcome,
     ProviderSubmitRecoveryFence, ProviderSubmitStart, ProviderSubmitWork, ProviderTaskClaimScope,
     ProviderTaskDeadlineStore, ProviderTaskObservation, ProviderTaskObservationOutcome,
     ProviderTaskObservationSource, ProviderTaskState, ProviderTaskStore, ProviderTaskStoreError,
     RemoteTaskAttach, RemoteTaskSubmitFailure, RemoteTaskSubmitReceipt,
-    RemoteTaskSubmitReservation, VerifiedCallbackWakeup,
+    RemoteTaskSubmitReservation, StagedProviderArtifact, VerifiedCallbackWakeup,
     admission::WorkLease,
     database::{connect_test_pool_with_search_path, run_migrations},
 };
 use image_provider_sdk::{
-    CanonicalCommandPayload, EffectCertainty, OutputSlot, PendingOperation,
+    ArtifactMetadata, ArtifactSinkError, ArtifactSinkErrorKind, CanonicalCommandPayload,
+    DurableArtifactManifest, DurableArtifactRef, EffectCertainty, OutputSlot, PendingOperation,
     ProviderCommandIdentity, ProviderFailure, ProviderFailureClass, ProviderRequestId,
     RemoteOperationRef, RetryDirective, SingleOutputCommand,
 };
-use image_provider_test_support::{ScriptedFakeProvider, SubmitStep, TestPayload};
+use image_provider_test_support::{
+    OutputPlan, PollStep, ScriptedFakeProvider, SubmitStep, TestPayload,
+};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use sqlx::{AssertSqlSafe, PgPool};
@@ -59,6 +67,226 @@ macro_rules! attach_request {
 #[cfg(unix)]
 #[path = "postgres_provider_tasks/gated_submit.rs"]
 mod gated_submit;
+
+#[tokio::test]
+async fn provider_poll_orchestrator_materializes_and_atomically_resolves() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let store = PostgresProviderTaskStore::new(database.pool.clone());
+        let executor = seed_attached_remote_task(
+            &database.pool,
+            &store,
+            "poll-orchestrator-worker",
+            "poll-orchestrator",
+            30_000,
+            0,
+        )
+        .await?;
+        let provider = ScriptedFakeProvider::default();
+        provider.push_poll(PollStep::Complete(OutputPlan {
+            chunks: vec![b"provider-".to_vec(), b"artifact".to_vec()],
+            media_type: "image/png".to_owned(),
+            provider_request_id: Some(
+                ProviderRequestId::new("request-poll-orchestrator-operation")
+                    .map_err(debug_error)?,
+            ),
+        }));
+        let stagers = ManifestOnlyPollStagerFactory::default();
+        let orchestrator = ProviderPollOrchestrator::new(
+            store,
+            provider.clone(),
+            stagers.clone(),
+            ProviderPollOrchestratorConfig {
+                scope: claim_scope(),
+                owner: "poll-orchestrator-owner".to_owned(),
+                lease_ms: 5_000,
+                heartbeat_interval: Duration::from_secs(1),
+                max_materializations: 2,
+            },
+        )
+        .map_err(debug_error)?;
+
+        let run = orchestrator.run_once().await.map_err(debug_error)?;
+        require(
+            matches!(
+                run,
+                ProviderPollRun::Observed(ref task)
+                    if task.state == ProviderTaskState::ArtifactReady
+            ),
+            format!("poll orchestrator did not resolve artifact_ready: {run:?}"),
+        )?;
+        require(
+            provider.calls().poll == 1 && stagers.begins.load(Ordering::SeqCst) == 1,
+            "completed poll did not invoke exactly one provider poll and one materializer",
+        )?;
+
+        let projection: (String, String, String, String, i64, i64, i64, i64, i64) = sqlx::query_as(
+            r#"
+                SELECT task.state, execution.state, submission.state, allocation.state,
+                  (SELECT COUNT(*) FROM provider_task_observations observation
+                   WHERE observation.submission_id = $1
+                     AND observation.source = 'poll'
+                     AND observation.observed_state = 'artifact_ready'),
+                  (SELECT COUNT(*) FROM executor_artifact_authorities authority
+                   WHERE authority.executor_execution_id = $2),
+                  (SELECT COUNT(*) FROM executor_result_manifests manifest
+                   WHERE manifest.executor_execution_id = $2),
+                  (SELECT COUNT(*) FROM executor_resolution_decisions decision
+                   WHERE decision.submission_id = $1
+                     AND decision.source = 'remote_provider_observation'),
+                  (SELECT COUNT(*) FROM executor_terminal_reductions reduction
+                   WHERE reduction.submission_id = $1 AND reduction.state = 'ready')
+                FROM provider_remote_tasks task
+                JOIN executor_executions execution
+                  ON execution.executor_execution_id = task.executor_execution_id
+                 AND execution.submission_id = task.submission_id
+                JOIN provider_submissions submission
+                  ON submission.executor_execution_id = task.executor_execution_id
+                 AND submission.submission_id = task.submission_id
+                JOIN executor_capacity_allocations allocation
+                  ON allocation.executor_execution_id = task.executor_execution_id
+                WHERE task.submission_id = $1
+                "#,
+        )
+        .bind(executor.submission_id)
+        .bind(executor.executor_execution_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(
+            projection
+                == (
+                    "artifact_ready".to_owned(),
+                    "succeeded".to_owned(),
+                    "succeeded".to_owned(),
+                    "released".to_owned(),
+                    1,
+                    1,
+                    1,
+                    1,
+                    1,
+                ),
+            format!("poll orchestration did not commit one canonical success: {projection:?}"),
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
+async fn provider_poll_orchestrator_recovers_committed_authority_without_repoll() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let store = PostgresProviderTaskStore::new(database.pool.clone());
+        let executor = seed_attached_remote_task(
+            &database.pool,
+            &store,
+            "poll-recovery-worker",
+            "poll-recovery",
+            30_000,
+            0,
+        )
+        .await?;
+        let crashed_lease = store
+            .claim_due(&claim_scope(), "crashed-poller", 100)
+            .await
+            .map_err(debug_error)?
+            .ok_or_else(|| "crash recovery task was not claimable".to_owned())?;
+        let bytes = b"committed-before-crash";
+        let digest: [u8; 32] = Sha256::digest(bytes).into();
+        let authority = poll_artifact_authority(
+            executor.executor_execution_id,
+            digest,
+            bytes.len() as u64,
+            "image/png",
+        )?;
+        store
+            .publish_artifact_authority(&crashed_lease, &authority)
+            .await
+            .map_err(debug_error)?;
+        sleep_until_database_time(&database.pool, crashed_lease.poll_lease_expires_at_ms + 20)
+            .await?;
+
+        let provider = ScriptedFakeProvider::default();
+        let stagers = ManifestOnlyPollStagerFactory::default();
+        let orchestrator = ProviderPollOrchestrator::new(
+            store,
+            provider.clone(),
+            stagers.clone(),
+            ProviderPollOrchestratorConfig {
+                scope: claim_scope(),
+                owner: "recovery-poller".to_owned(),
+                lease_ms: 5_000,
+                heartbeat_interval: Duration::from_secs(1),
+                max_materializations: 2,
+            },
+        )
+        .map_err(debug_error)?;
+
+        let run = orchestrator.run_once().await.map_err(debug_error)?;
+        require(
+            matches!(
+                run,
+                ProviderPollRun::Observed(ref task)
+                    if task.state == ProviderTaskState::ArtifactReady
+            ),
+            format!("committed authority did not recover to artifact_ready: {run:?}"),
+        )?;
+        require(
+            provider.calls().poll == 0 && stagers.begins.load(Ordering::SeqCst) == 0,
+            "authority recovery re-polled the provider or re-materialized the artifact",
+        )?;
+
+        let projection: (String, String, String, String, i64, i64, i64) = sqlx::query_as(
+            r#"
+            SELECT task.state, execution.state, submission.state, allocation.state,
+              (SELECT COUNT(*) FROM provider_task_observations observation
+               WHERE observation.submission_id = $1
+                 AND observation.source = 'poll'
+                 AND observation.observed_state = 'artifact_ready'),
+              (SELECT COUNT(*) FROM executor_artifact_authorities authority
+               WHERE authority.executor_execution_id = $2),
+              (SELECT COUNT(*) FROM executor_resolution_decisions decision
+               WHERE decision.submission_id = $1
+                 AND decision.source = 'remote_provider_observation')
+            FROM provider_remote_tasks task
+            JOIN executor_executions execution
+              ON execution.executor_execution_id = task.executor_execution_id
+             AND execution.submission_id = task.submission_id
+            JOIN provider_submissions submission
+              ON submission.executor_execution_id = task.executor_execution_id
+             AND submission.submission_id = task.submission_id
+            JOIN executor_capacity_allocations allocation
+              ON allocation.executor_execution_id = task.executor_execution_id
+            WHERE task.submission_id = $1
+            "#,
+        )
+        .bind(executor.submission_id)
+        .bind(executor.executor_execution_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(
+            projection
+                == (
+                    "artifact_ready".to_owned(),
+                    "succeeded".to_owned(),
+                    "succeeded".to_owned(),
+                    "released".to_owned(),
+                    1,
+                    1,
+                    1,
+                ),
+            format!("authority recovery did not converge exactly once: {projection:?}"),
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
 
 #[tokio::test]
 async fn atomic_submit_acquire_elects_one_dispatch_without_reserved_gap() -> TestResult {
@@ -1676,6 +1904,25 @@ async fn provider_task_leases_reject_cross_submission_splicing() -> TestResult {
                 && store.record_observation(&forged, &observation).await
                     == Err(ProviderTaskStoreError::InvalidInput),
             "poll lease authority was spliceable across submissions",
+        )?;
+        let mut forged_request = first.clone();
+        forged_request.task.provider_request_id = Some("forged-provider-request".to_owned());
+        let mut forged_cancel = first.clone();
+        forged_cancel.task.cancel_requested = !forged_cancel.task.cancel_requested;
+        let mut forged_state = first.clone();
+        forged_state.task.state = ProviderTaskState::ArtifactReady;
+        let mut forged_epoch = first.clone();
+        forged_epoch.task.poll_lease_epoch += 1;
+        require(
+            store.heartbeat(&forged_request, 5_000).await
+                == Err(ProviderTaskStoreError::InvalidInput)
+                && store.heartbeat(&forged_cancel, 5_000).await
+                    == Err(ProviderTaskStoreError::InvalidInput)
+                && store.heartbeat(&forged_state, 5_000).await
+                    == Err(ProviderTaskStoreError::InvalidInput)
+                && store.heartbeat(&forged_epoch, 5_000).await
+                    == Err(ProviderTaskStoreError::InvalidInput),
+            "poll lease decision fields were mutable outside the database authority",
         )
     }
     .await;
@@ -7418,6 +7665,90 @@ fn artifact_authority(
         "image/png".to_string(),
     )
     .ok_or_else(|| "valid provider artifact authority was rejected".to_string())
+}
+
+#[derive(Clone, Default)]
+struct ManifestOnlyPollStagerFactory {
+    begins: Arc<AtomicUsize>,
+}
+
+impl ProviderArtifactStagerFactory for ManifestOnlyPollStagerFactory {
+    type Stager = ManifestOnlyPollStager;
+
+    async fn begin(
+        &self,
+        context: &ProviderArtifactStageContext,
+    ) -> Result<Self::Stager, ArtifactSinkError> {
+        self.begins.fetch_add(1, Ordering::SeqCst);
+        Ok(ManifestOnlyPollStager {
+            executor_execution_id: context.executor_execution_id(),
+            bytes: Vec::new(),
+        })
+    }
+}
+
+struct ManifestOnlyPollStager {
+    executor_execution_id: Uuid,
+    bytes: Vec<u8>,
+}
+
+impl ProviderArtifactStager for ManifestOnlyPollStager {
+    async fn write_chunk(&mut self, chunk: &[u8]) -> Result<(), ArtifactSinkError> {
+        self.bytes.extend_from_slice(chunk);
+        Ok(())
+    }
+
+    async fn finalize(
+        &mut self,
+        metadata: ArtifactMetadata<'_>,
+    ) -> Result<StagedProviderArtifact, ArtifactSinkError> {
+        if self.bytes.is_empty() {
+            return Err(poll_sink_error("provider_poll_test_artifact_empty"));
+        }
+        let digest: [u8; 32] = Sha256::digest(&self.bytes).into();
+        let manifest = DurableArtifactManifest::new(
+            DurableArtifactRef::new(
+                "provider-test",
+                self.executor_execution_id.simple().to_string(),
+            )
+            .map_err(|_| poll_sink_error("provider_poll_test_ref_invalid"))?,
+            metadata.media_type,
+            self.bytes.len() as u64,
+            digest,
+        )
+        .map_err(|_| poll_sink_error("provider_poll_test_manifest_invalid"))?;
+        let authority = poll_artifact_authority(
+            self.executor_execution_id,
+            digest,
+            self.bytes.len() as u64,
+            metadata.media_type,
+        )
+        .map_err(|_| poll_sink_error("provider_poll_test_authority_invalid"))?;
+        StagedProviderArtifact::new(manifest, authority)
+            .map_err(|_| poll_sink_error("provider_poll_test_contract_invalid"))
+    }
+}
+
+fn poll_artifact_authority(
+    executor_execution_id: Uuid,
+    digest: [u8; 32],
+    byte_size: u64,
+    media_type: &str,
+) -> TestResult<ProviderArtifactAuthority> {
+    let authority_id = executor_execution_id.simple().to_string();
+    ProviderArtifactAuthority::new(
+        "filesystem-v1".to_owned(),
+        "filesystem-v1:provider-poll-integration".to_owned(),
+        format!("executor-objects/{}/{}", &authority_id[..2], authority_id),
+        hex::encode(digest),
+        byte_size,
+        media_type.to_owned(),
+    )
+    .ok_or_else(|| "valid poll artifact authority was rejected".to_owned())
+}
+
+fn poll_sink_error(code: &'static str) -> ArtifactSinkError {
+    ArtifactSinkError::new(ArtifactSinkErrorKind::InvalidArtifact, code)
 }
 
 async fn seed_deadline_quarantine(

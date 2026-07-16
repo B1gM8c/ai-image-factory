@@ -106,6 +106,11 @@ struct ClaimRow {
     invocation_attempt: i32,
     provider_timeout_ms: i64,
     provider_deadline_at_ms: i64,
+    committed_manifest_id: Option<Uuid>,
+    committed_authority_id: Option<Uuid>,
+    committed_sha256_hex: Option<String>,
+    committed_byte_size: Option<i64>,
+    committed_media_type: Option<String>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -1862,7 +1867,12 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
                    submission.resource_policy_revision,
                    intent.idempotency_key, intent.provider_command_sha256,
                    intent.execution_binding_sha256, recovery.invocation_attempt,
-                   recovery.provider_timeout_ms, claimed.provider_deadline_at_ms
+                   recovery.provider_timeout_ms, claimed.provider_deadline_at_ms,
+                   committed_manifest.manifest_id AS committed_manifest_id,
+                   committed_manifest.artifact_authority_id AS committed_authority_id,
+                   committed_authority.sha256_hex AS committed_sha256_hex,
+                   committed_authority.byte_size AS committed_byte_size,
+                   committed_authority.media_type AS committed_media_type
             FROM claimed
             JOIN provider_submissions submission
               ON submission.submission_id = claimed.submission_id
@@ -1882,6 +1892,16 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
              AND account.provider_id = submission.provider_id
              AND account.credential_ref = submission.credential_ref
              AND account.credential_revision = submission.credential_revision
+            LEFT JOIN executor_result_manifests committed_manifest
+              ON committed_manifest.submission_id = claimed.submission_id
+             AND committed_manifest.executor_execution_id = claimed.executor_execution_id
+            LEFT JOIN executor_artifact_authorities committed_authority
+              ON committed_authority.authority_id =
+                   committed_manifest.artifact_authority_id
+             AND committed_authority.submission_id =
+                   committed_manifest.submission_id
+             AND committed_authority.executor_execution_id =
+                   committed_manifest.executor_execution_id
             "#,
         )
         .bind(&scope.provider_id)
@@ -1971,6 +1991,7 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
         .await?;
         tx.commit().await.map_err(unavailable)?;
         Ok(ProviderTaskLease {
+            remaining_budget_ms: remaining_budget_ms(lease.context.provider_deadline_at_ms, now)?,
             poll_lease_expires_at_ms: expires,
             ..lease.clone()
         })
@@ -4354,7 +4375,7 @@ fn lease_from_row(row: ClaimRow) -> Result<ProviderTaskLease, ProviderTaskStoreE
         attach_recovery_lease_epoch,
         poll_owner,
         poll_lease_expires_at_ms,
-        claim_updated_at_ms: _,
+        claim_updated_at_ms,
         model,
         command_schema,
         command_hash,
@@ -4378,6 +4399,11 @@ fn lease_from_row(row: ClaimRow) -> Result<ProviderTaskLease, ProviderTaskStoreE
         invocation_attempt,
         provider_timeout_ms,
         provider_deadline_at_ms,
+        committed_manifest_id,
+        committed_authority_id,
+        committed_sha256_hex,
+        committed_byte_size,
+        committed_media_type,
     } = row;
     let task = task_from_row(TaskRow {
         submission_id,
@@ -4425,11 +4451,46 @@ fn lease_from_row(row: ClaimRow) -> Result<ProviderTaskLease, ProviderTaskStoreE
         provider_timeout_ms,
         provider_deadline_at_ms,
     };
+    let committed_artifact = match (
+        committed_manifest_id,
+        committed_authority_id,
+        committed_sha256_hex,
+        committed_byte_size,
+        committed_media_type,
+    ) {
+        (None, None, None, None, None) => None,
+        (
+            Some(manifest_id),
+            Some(authority_id),
+            Some(sha256_hex),
+            Some(byte_size),
+            Some(media_type),
+        ) => {
+            let manifest = ExecutorResultManifest::new(manifest_id, authority_id)
+                .ok_or(ProviderTaskStoreError::Conflict)?;
+            if manifest.manifest_id() != task.submission_id
+                || manifest.artifact_authority_id() != task.executor_execution_id
+            {
+                return Err(ProviderTaskStoreError::Conflict);
+            }
+            Some(ProviderArtifactPublication {
+                manifest,
+                sha256_hex,
+                byte_size: u64::try_from(byte_size)
+                    .map_err(|_| ProviderTaskStoreError::Conflict)?,
+                media_type,
+            })
+        }
+        _ => return Err(ProviderTaskStoreError::Conflict),
+    };
     let authority_seal =
         provider_task_lease_authority_seal(&task, &context, &poll_owner, poll_lease_epoch);
+    let remaining_budget_ms = remaining_budget_ms(provider_deadline_at_ms, claim_updated_at_ms)?;
     Ok(ProviderTaskLease {
         task,
         context,
+        committed_artifact,
+        remaining_budget_ms,
         poll_owner,
         poll_lease_epoch,
         poll_lease_expires_at_ms,
@@ -4604,6 +4665,7 @@ fn validate_lease(lease: &ProviderTaskLease, lease_ms: i64) -> Result<(), Provid
     if lease.task.submission_id.is_nil()
         || lease.task.executor_execution_id.is_nil()
         || lease.poll_lease_epoch <= 0
+        || lease.task.poll_lease_epoch != lease.poll_lease_epoch
         || !valid_owner(&lease.poll_owner)
         || lease.authority_seal
             != provider_task_lease_authority_seal(
@@ -4655,14 +4717,26 @@ fn provider_task_lease_authority_seal(
     poll_owner: &str,
     poll_lease_epoch: i64,
 ) -> [u8; 32] {
+    let state = match task.state {
+        ProviderTaskState::ProviderWaiting => b"provider_waiting".as_slice(),
+        ProviderTaskState::ArtifactReady => b"artifact_ready".as_slice(),
+        ProviderTaskState::Failed => b"failed".as_slice(),
+        ProviderTaskState::Canceled => b"canceled".as_slice(),
+        ProviderTaskState::Uncertain => b"uncertain".as_slice(),
+    };
+    let cancel_requested = [u8::from(task.cancel_requested)];
     authority_seal(
-        b"ai-image-factory/provider-task-lease/v1\0",
+        b"ai-image-factory/provider-task-lease/v2\0",
         &[
             task.submission_id.as_bytes(),
             task.executor_execution_id.as_bytes(),
             task.provider_id.as_bytes(),
             task.provider_account_id.as_bytes(),
             task.remote_operation_id.as_bytes(),
+            task.provider_request_id.as_deref().unwrap_or("").as_bytes(),
+            state,
+            &cancel_requested,
+            &task.poll_lease_epoch.to_be_bytes(),
             context.execution_binding_sha256.as_bytes(),
             poll_owner.as_bytes(),
             &poll_lease_epoch.to_be_bytes(),

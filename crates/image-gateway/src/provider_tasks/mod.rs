@@ -1,13 +1,14 @@
 use std::fmt;
 
 use async_trait::async_trait;
-use image_provider_sdk::{OutputSlot, ProviderCommandIdentity};
+use image_provider_sdk::{DurableArtifactManifest, OutputSlot, ProviderCommandIdentity};
 use uuid::Uuid;
 
 use crate::executor::{ExecutorResultManifest, ExecutorSubmissionLease};
 
 mod capacity;
 mod orchestrator;
+mod poll;
 mod postgres;
 mod remote_submit;
 mod submit_driver;
@@ -20,6 +21,12 @@ pub use capacity::{
 pub use orchestrator::{
     ProviderSubmitOrchestrator, ProviderSubmitOrchestratorError, ProviderSubmitOutcome,
     ProviderSubmitWork,
+};
+pub use poll::{
+    ProviderArtifactSinkContractError, ProviderArtifactStageContext, ProviderArtifactStager,
+    ProviderArtifactStagerFactory, ProviderPollDriver, ProviderPollDriverCall,
+    ProviderPollOrchestrator, ProviderPollOrchestratorConfig, ProviderPollOrchestratorError,
+    ProviderPollRun, ProviderPollStore, StagedProviderArtifact,
 };
 pub use postgres::PostgresProviderTaskStore;
 pub use remote_submit::{
@@ -468,6 +475,8 @@ pub struct ProviderSubmitRecoveryFence {
 pub struct ProviderTaskLease {
     pub task: ProviderRemoteTask,
     context: ProviderExecutionContext,
+    committed_artifact: Option<ProviderArtifactPublication>,
+    remaining_budget_ms: u64,
     pub poll_owner: String,
     pub poll_lease_epoch: i64,
     pub poll_lease_expires_at_ms: i64,
@@ -477,6 +486,14 @@ pub struct ProviderTaskLease {
 impl ProviderTaskLease {
     pub fn context(&self) -> &ProviderExecutionContext {
         &self.context
+    }
+
+    pub fn committed_artifact(&self) -> Option<&ProviderArtifactPublication> {
+        self.committed_artifact.as_ref()
+    }
+
+    pub fn remaining_budget_ms(&self) -> u64 {
+        self.remaining_budget_ms
     }
 }
 
@@ -521,6 +538,14 @@ pub struct ProviderArtifactPublication {
 impl ProviderArtifactPublication {
     pub fn manifest(&self) -> &ExecutorResultManifest {
         &self.manifest
+    }
+
+    pub fn matches_durable_manifest(&self, manifest: &DurableArtifactManifest) -> bool {
+        let mut sha256 = [0_u8; 32];
+        hex::decode_to_slice(&self.sha256_hex, &mut sha256).is_ok()
+            && self.byte_size == manifest.byte_size()
+            && self.media_type == manifest.media_type()
+            && sha256 == *manifest.sha256()
     }
 }
 

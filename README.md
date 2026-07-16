@@ -54,6 +54,9 @@ The inactive Dreamina canonical submit codec and its gated runtime binding are d
 [`docs/architecture/2026-phase2p-dreamina-gated-submit-codec.md`](docs/architecture/2026-phase2p-dreamina-gated-submit-codec.md).
 The provider-neutral fresh CLI output-directory boundary is documented in
 [`docs/architecture/2026-phase2q-fresh-cli-output-directory.md`](docs/architecture/2026-phase2q-fresh-cli-output-directory.md).
+The provider-neutral fenced poll orchestrator, lazy materialization boundary,
+and committed-authority recovery are documented in
+[`docs/architecture/2026-phase2r-provider-poll-orchestrator.md`](docs/architecture/2026-phase2r-provider-poll-orchestrator.md).
 Database-bound provider profiles and durable capacity are documented in
 [`docs/architecture/2026-phase1g-execution-binding-capacity.md`](docs/architecture/2026-phase1g-execution-binding-capacity.md).
 
