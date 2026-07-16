@@ -2,6 +2,7 @@ use std::fmt;
 
 use async_trait::async_trait;
 use image_provider_sdk::{DurableArtifactManifest, OutputSlot, ProviderCommandIdentity};
+use serde_json::Value;
 use uuid::Uuid;
 
 use crate::executor::{ExecutorResultManifest, ExecutorSubmissionLease};
@@ -20,7 +21,7 @@ pub use capacity::{
 };
 pub use orchestrator::{
     ProviderSubmitOrchestrator, ProviderSubmitOrchestratorError, ProviderSubmitOutcome,
-    ProviderSubmitWork,
+    ProviderSubmitRecoveryWork, ProviderSubmitWork,
 };
 pub use poll::{
     ProviderAccountHomeCapability, ProviderAccountHomeCapabilityError,
@@ -500,19 +501,48 @@ impl ProviderTaskLease {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct ProviderSubmitRecoveryLease {
     pub intent: ProviderSubmitIntent,
     context: ProviderExecutionContext,
+    command_json: Value,
+    remaining_budget_ms: u64,
     pub recovery_owner: String,
     pub recovery_lease_epoch: i64,
     pub recovery_lease_expires_at_ms: i64,
     authority_seal: [u8; 32],
 }
 
+impl fmt::Debug for ProviderSubmitRecoveryLease {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProviderSubmitRecoveryLease")
+            .field("intent", &self.intent)
+            .field("context", &self.context)
+            .field("command_json", &"[redacted]")
+            .field("remaining_budget_ms", &self.remaining_budget_ms)
+            .field("recovery_owner", &self.recovery_owner)
+            .field("recovery_lease_epoch", &self.recovery_lease_epoch)
+            .field(
+                "recovery_lease_expires_at_ms",
+                &self.recovery_lease_expires_at_ms,
+            )
+            .field("authority_seal", &"[redacted]")
+            .finish()
+    }
+}
+
 impl ProviderSubmitRecoveryLease {
     pub fn context(&self) -> &ProviderExecutionContext {
         &self.context
+    }
+
+    pub fn command_json(&self) -> &Value {
+        &self.command_json
+    }
+
+    pub fn remaining_budget_ms(&self) -> u64 {
+        self.remaining_budget_ms
     }
 
     pub fn submission_idempotency_key(&self) -> &str {

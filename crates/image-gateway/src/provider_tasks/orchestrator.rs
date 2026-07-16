@@ -12,7 +12,8 @@ use crate::executor::ExecutorSubmissionLease;
 use super::{
     PostgresProviderTaskStore, ProviderExecutionContext, ProviderRemoteTask, ProviderSubmitAcquire,
     ProviderSubmitDriver, ProviderSubmitDriverCall, ProviderSubmitDriverRecovery,
-    ProviderSubmitFailureKind, ProviderSubmitIntent, ProviderSubmitIntentState, ProviderTaskStore,
+    ProviderSubmitFailureKind, ProviderSubmitIntent, ProviderSubmitIntentState,
+    ProviderSubmitRecoveryFence, ProviderSubmitRecoveryLease, ProviderTaskStore,
     ProviderTaskStoreError, RemoteTaskAttach, RemoteTaskQuarantinedReceipt,
     RemoteTaskSubmitFailure, RemoteTaskSubmitReceipt, RemoteTaskSubmitReservation,
     remote_submit::{
@@ -62,6 +63,47 @@ impl<D: ProviderSubmitDriver> ProviderSubmitWork<D> {
     }
 }
 
+pub struct ProviderSubmitRecoveryWork<D: ProviderSubmitDriver> {
+    intent: ProviderSubmitIntent,
+    context: ProviderExecutionContext,
+    remaining_budget_ms: u64,
+    recovery_fence: ProviderSubmitRecoveryFence,
+    command: Arc<SingleOutputCommand<D::Payload>>,
+}
+
+impl<D: ProviderSubmitDriver> ProviderSubmitRecoveryWork<D> {
+    pub fn new(
+        lease: &ProviderSubmitRecoveryLease,
+        command: SingleOutputCommand<D::Payload>,
+    ) -> Result<Self, ProviderSubmitOrchestratorError> {
+        RemoteSubmitJournal::validate_canonical_command(command.canonical_payload())
+            .map_err(|_| ProviderSubmitOrchestratorError::InvalidWork)?;
+        let intent = &lease.intent;
+        let context = lease.context();
+        if intent.state == ProviderSubmitIntentState::Reserved
+            || intent.output_index != command.output().index()
+            || intent.output_total != command.output().total()
+            || context.command_hash() != command.source_command_sha256()
+            || !context_matches_command(context, &command)
+            || intent.provider_command_sha256 != context.provider_command_sha256()
+            || intent.execution_binding_sha256 != context.execution_binding_sha256()
+            || lease.remaining_budget_ms() == 0
+        {
+            return Err(ProviderSubmitOrchestratorError::InvalidWork);
+        }
+        Ok(Self {
+            intent: intent.clone(),
+            context: context.clone(),
+            remaining_budget_ms: lease.remaining_budget_ms(),
+            recovery_fence: ProviderSubmitRecoveryFence {
+                recovery_owner: lease.recovery_owner.clone(),
+                recovery_lease_epoch: lease.recovery_lease_epoch,
+            },
+            command: Arc::new(command),
+        })
+    }
+}
+
 pub struct ProviderSubmitOrchestrator<D: ProviderSubmitDriver> {
     store: PostgresProviderTaskStore,
     driver: D,
@@ -103,16 +145,23 @@ impl<D: ProviderSubmitDriver> ProviderSubmitOrchestrator<D> {
                         .record_failure(
                             intent,
                             context,
+                            None,
                             ProviderSubmitFailureKind::Rejected,
                             "provider_submit_context_mismatch",
                         )
                         .await;
                 }
-                self.dispatch_provider(intent, context, authority.remaining_budget_ms(), work)
-                    .await
+                self.dispatch_provider(
+                    intent,
+                    context,
+                    authority.remaining_budget_ms(),
+                    work.command,
+                    None,
+                )
+                .await
             }
             ProviderSubmitAcquire::AttachOnly(authority) => {
-                self.attach_known(authority.intent(), authority.context(), 0)
+                self.attach_known(authority.intent(), authority.context(), 0, None)
                     .await
             }
             ProviderSubmitAcquire::Busy(authority) => {
@@ -127,33 +176,14 @@ impl<D: ProviderSubmitDriver> ProviderSubmitOrchestrator<D> {
                     authority.intent(),
                     authority.context(),
                     authority.remaining_budget_ms(),
-                    work,
+                    work.command,
+                    None,
                 )
                 .await
             }
             ProviderSubmitAcquire::ObserveOnly(invocation) => {
-                let spec = RemoteSubmitJournalSpec::new(
-                    &invocation.intent,
-                    invocation.context(),
-                    work.command.canonical_payload(),
-                )?;
-                let journal = Arc::clone(&self.journal);
-                let observation_spec = spec.clone();
-                let observation_command = Arc::clone(&work.command);
-                let observation = tokio::task::spawn_blocking(move || {
-                    journal.prepare(&observation_spec, observation_command.canonical_payload())?;
-                    journal.observe(&observation_spec)
-                })
-                .await
-                .map_err(|_| ProviderSubmitOrchestratorError::JournalWorkerStopped)??;
-                self.replay_journal_observation(
-                    &invocation.intent,
-                    invocation.context(),
-                    spec,
-                    work.command,
-                    observation,
-                )
-                .await
+                self.observe_provider(&invocation.intent, invocation.context(), work.command, None)
+                    .await
             }
             ProviderSubmitAcquire::Terminal(intent) => {
                 if intent.state == ProviderSubmitIntentState::Attached
@@ -166,30 +196,79 @@ impl<D: ProviderSubmitDriver> ProviderSubmitOrchestrator<D> {
         }
     }
 
+    pub async fn recover(
+        &self,
+        work: ProviderSubmitRecoveryWork<D>,
+    ) -> Result<ProviderSubmitOutcome, ProviderSubmitOrchestratorError> {
+        let intent = &work.intent;
+        let context = &work.context;
+        if intent.provider_id != self.driver.provider_id()
+            || !context_matches_command(context, &work.command)
+        {
+            return Err(ProviderSubmitOrchestratorError::InvalidWork);
+        }
+        let recovery_fence = work.recovery_fence;
+        match intent.state {
+            ProviderSubmitIntentState::Sending => {
+                self.dispatch_provider(
+                    intent,
+                    context,
+                    work.remaining_budget_ms,
+                    work.command,
+                    Some(recovery_fence),
+                )
+                .await
+            }
+            ProviderSubmitIntentState::OutcomeUnknown => {
+                self.observe_provider(intent, context, work.command, Some(recovery_fence))
+                    .await
+            }
+            ProviderSubmitIntentState::OperationKnown => {
+                self.attach_known(intent, context, 0, Some(recovery_fence))
+                    .await
+            }
+            ProviderSubmitIntentState::Attached => {
+                if let Some(task) = self.store.load(intent.submission_id).await? {
+                    Ok(ProviderSubmitOutcome::Attached(task))
+                } else {
+                    Err(ProviderSubmitOrchestratorError::InvalidFrozenContext)
+                }
+            }
+            ProviderSubmitIntentState::Rejected
+            | ProviderSubmitIntentState::DeadlineQuarantined => {
+                Ok(ProviderSubmitOutcome::Terminal(intent.clone()))
+            }
+            ProviderSubmitIntentState::Reserved => {
+                Err(ProviderSubmitOrchestratorError::InvalidWork)
+            }
+        }
+    }
+
     async fn dispatch_provider(
         &self,
         intent: &ProviderSubmitIntent,
         context: &ProviderExecutionContext,
         database_budget_ms: u64,
-        work: ProviderSubmitWork<D>,
+        command: Arc<SingleOutputCommand<D::Payload>>,
+        recovery_fence: Option<ProviderSubmitRecoveryFence>,
     ) -> Result<ProviderSubmitOutcome, ProviderSubmitOrchestratorError> {
         if database_budget_ms == 0 {
             return self
                 .record_failure(
                     intent,
                     context,
+                    recovery_fence,
                     ProviderSubmitFailureKind::Rejected,
                     "provider_submit_deadline_elapsed",
                 )
                 .await;
         }
         let journal_spec =
-            RemoteSubmitJournalSpec::new(intent, context, work.command.canonical_payload())?;
+            RemoteSubmitJournalSpec::new(intent, context, command.canonical_payload())?;
         let journal = Arc::clone(&self.journal);
         let journal_started = Instant::now();
         let (command, journal_spec, journal_root, launch) =
             tokio::task::spawn_blocking(move || {
-                let command = work.command;
                 journal.prepare(&journal_spec, command.canonical_payload())?;
                 let launch = match journal.commit_launch(&journal_spec)? {
                     RemoteSubmitLaunch::Launch(launch) => RemoteSubmitDispatch::Launch(launch),
@@ -210,7 +289,14 @@ impl<D: ProviderSubmitDriver> ProviderSubmitOrchestrator<D> {
             RemoteSubmitDispatch::Launch(launch) => launch,
             RemoteSubmitDispatch::Attach(observation) => {
                 return self
-                    .replay_journal_observation(intent, context, journal_spec, command, observation)
+                    .replay_journal_observation(
+                        intent,
+                        context,
+                        journal_spec,
+                        command,
+                        recovery_fence,
+                        observation,
+                    )
                     .await;
             }
         };
@@ -223,8 +309,11 @@ impl<D: ProviderSubmitDriver> ProviderSubmitOrchestrator<D> {
                     context,
                     journal_spec,
                     command,
-                    ProviderSubmitFailureKind::Rejected,
-                    "provider_submit_deadline_elapsed",
+                    recovery_fence,
+                    SubmitFailureEvidence {
+                        kind: ProviderSubmitFailureKind::Rejected,
+                        error_code: "provider_submit_deadline_elapsed",
+                    },
                 )
                 .await;
         }
@@ -247,8 +336,11 @@ impl<D: ProviderSubmitDriver> ProviderSubmitOrchestrator<D> {
                         context,
                         journal_spec,
                         command,
-                        kind,
-                        failure.code(),
+                        recovery_fence,
+                        SubmitFailureEvidence {
+                            kind,
+                            error_code: failure.code(),
+                        },
                     )
                     .await;
             }
@@ -262,8 +354,11 @@ impl<D: ProviderSubmitDriver> ProviderSubmitOrchestrator<D> {
                     context,
                     journal_spec,
                     command,
-                    ProviderSubmitFailureKind::Rejected,
-                    "provider_submit_deadline_elapsed",
+                    recovery_fence,
+                    SubmitFailureEvidence {
+                        kind: ProviderSubmitFailureKind::Rejected,
+                        error_code: "provider_submit_deadline_elapsed",
+                    },
                 )
                 .await;
         }
@@ -277,7 +372,14 @@ impl<D: ProviderSubmitDriver> ProviderSubmitOrchestrator<D> {
             RemoteSubmitRelease::Dispatch(released) => released,
             RemoteSubmitRelease::Attach(observation) => {
                 return self
-                    .replay_journal_observation(intent, context, journal_spec, command, observation)
+                    .replay_journal_observation(
+                        intent,
+                        context,
+                        journal_spec,
+                        command,
+                        recovery_fence,
+                        observation,
+                    )
                     .await;
             }
         };
@@ -287,16 +389,38 @@ impl<D: ProviderSubmitDriver> ProviderSubmitOrchestrator<D> {
                 let pending = self
                     .publish_journal_accepted(journal_spec, released, pending)
                     .await?;
-                self.record_pending(intent, context, pending).await
+                self.record_pending(intent, context, pending, recovery_fence)
+                    .await
             }
             Err(failure) => {
                 let (kind, terminal) = journal_failure(&failure);
                 self.publish_journal_failure(journal_spec, released, terminal)
                     .await?;
-                self.record_failure(intent, context, kind, failure.code())
+                self.record_failure(intent, context, recovery_fence, kind, failure.code())
                     .await
             }
         }
+    }
+
+    async fn observe_provider(
+        &self,
+        intent: &ProviderSubmitIntent,
+        context: &ProviderExecutionContext,
+        command: Arc<SingleOutputCommand<D::Payload>>,
+        recovery_fence: Option<ProviderSubmitRecoveryFence>,
+    ) -> Result<ProviderSubmitOutcome, ProviderSubmitOrchestratorError> {
+        let spec = RemoteSubmitJournalSpec::new(intent, context, command.canonical_payload())?;
+        let journal = Arc::clone(&self.journal);
+        let observation_spec = spec.clone();
+        let observation_command = Arc::clone(&command);
+        let observation = tokio::task::spawn_blocking(move || {
+            journal.prepare(&observation_spec, observation_command.canonical_payload())?;
+            journal.observe(&observation_spec)
+        })
+        .await
+        .map_err(|_| ProviderSubmitOrchestratorError::JournalWorkerStopped)??;
+        self.replay_journal_observation(intent, context, spec, command, recovery_fence, observation)
+            .await
     }
 
     async fn publish_journal_accepted(
@@ -339,18 +463,23 @@ impl<D: ProviderSubmitDriver> ProviderSubmitOrchestrator<D> {
         context: &ProviderExecutionContext,
         spec: RemoteSubmitJournalSpec,
         command: Arc<SingleOutputCommand<D::Payload>>,
+        recovery_fence: Option<ProviderSubmitRecoveryFence>,
         observation: RemoteSubmitJournalObservation,
     ) -> Result<ProviderSubmitOutcome, ProviderSubmitOrchestratorError> {
         match observation {
             RemoteSubmitJournalObservation::Terminal(RemoteSubmitJournalTerminal::Accepted(
                 pending,
-            )) => self.record_pending(intent, context, pending).await,
+            )) => {
+                self.record_pending(intent, context, pending, recovery_fence)
+                    .await
+            }
             RemoteSubmitJournalObservation::Terminal(RemoteSubmitJournalTerminal::Rejected {
                 error_code,
             }) => {
                 self.record_failure(
                     intent,
                     context,
+                    recovery_fence,
                     ProviderSubmitFailureKind::Rejected,
                     &error_code,
                 )
@@ -362,6 +491,7 @@ impl<D: ProviderSubmitDriver> ProviderSubmitOrchestrator<D> {
                 self.record_failure(
                     intent,
                     context,
+                    recovery_fence,
                     ProviderSubmitFailureKind::OutcomeUnknown,
                     &error_code,
                 )
@@ -398,13 +528,14 @@ impl<D: ProviderSubmitDriver> ProviderSubmitOrchestrator<D> {
                         let pending = self
                             .publish_journal_accepted(spec, released, pending)
                             .await?;
-                        self.record_pending(intent, context, pending).await
+                        self.record_pending(intent, context, pending, recovery_fence)
+                            .await
                     }
                     ProviderSubmitDriverRecovery::Failed(failure) => {
                         let (kind, terminal) = journal_failure(&failure);
                         self.publish_journal_failure(spec, released, terminal)
                             .await?;
-                        self.record_failure(intent, context, kind, failure.code())
+                        self.record_failure(intent, context, recovery_fence, kind, failure.code())
                             .await
                     }
                 }
@@ -418,8 +549,8 @@ impl<D: ProviderSubmitDriver> ProviderSubmitOrchestrator<D> {
         context: &ProviderExecutionContext,
         spec: RemoteSubmitJournalSpec,
         command: Arc<SingleOutputCommand<D::Payload>>,
-        kind: ProviderSubmitFailureKind,
-        error_code: &str,
+        recovery_fence: Option<ProviderSubmitRecoveryFence>,
+        failure: SubmitFailureEvidence<'_>,
     ) -> Result<ProviderSubmitOutcome, ProviderSubmitOrchestratorError> {
         let journal = Arc::clone(&self.journal);
         let observation_spec = spec.clone();
@@ -429,12 +560,26 @@ impl<D: ProviderSubmitDriver> ProviderSubmitOrchestrator<D> {
         match observation {
             RemoteSubmitJournalObservation::DispatchReleased
             | RemoteSubmitJournalObservation::Terminal(_) => {
-                self.replay_journal_observation(intent, context, spec, command, observation)
-                    .await
+                self.replay_journal_observation(
+                    intent,
+                    context,
+                    spec,
+                    command,
+                    recovery_fence,
+                    observation,
+                )
+                .await
             }
             RemoteSubmitJournalObservation::Prepared
             | RemoteSubmitJournalObservation::LaunchCommitted => {
-                self.record_failure(intent, context, kind, error_code).await
+                self.record_failure(
+                    intent,
+                    context,
+                    recovery_fence,
+                    failure.kind,
+                    failure.error_code,
+                )
+                .await
             }
         }
     }
@@ -443,9 +588,14 @@ impl<D: ProviderSubmitDriver> ProviderSubmitOrchestrator<D> {
         &self,
         intent: &ProviderSubmitIntent,
         context: &ProviderExecutionContext,
+        recovery_fence: Option<ProviderSubmitRecoveryFence>,
         kind: ProviderSubmitFailureKind,
         error_code: &str,
     ) -> Result<ProviderSubmitOutcome, ProviderSubmitOrchestratorError> {
+        let recovery_fence = match kind {
+            ProviderSubmitFailureKind::Rejected => recovery_fence,
+            ProviderSubmitFailureKind::OutcomeUnknown => None,
+        };
         let event_identity = evidence_identity(
             "provider-submit-failure",
             &[
@@ -468,7 +618,7 @@ impl<D: ProviderSubmitDriver> ProviderSubmitOrchestrator<D> {
                 event_identity,
                 error_code: error_code.to_owned(),
                 execution_binding_sha256: context.execution_binding_sha256().to_owned(),
-                recovery_fence: None,
+                recovery_fence,
             })
             .await?;
         Ok(match kind {
@@ -484,6 +634,7 @@ impl<D: ProviderSubmitDriver> ProviderSubmitOrchestrator<D> {
         intent: &ProviderSubmitIntent,
         context: &ProviderExecutionContext,
         pending: PendingOperation,
+        recovery_fence: Option<ProviderSubmitRecoveryFence>,
     ) -> Result<ProviderSubmitOutcome, ProviderSubmitOrchestratorError> {
         let operation = pending.operation();
         if operation.provider_id() != intent.provider_id
@@ -550,7 +701,8 @@ impl<D: ProviderSubmitDriver> ProviderSubmitOrchestrator<D> {
             .next_poll_after_ms()
             .unwrap_or(0)
             .min(MAX_POLL_AFTER_MS) as i64;
-        self.attach_known(&recorded, context, poll_after_ms).await
+        self.attach_known(&recorded, context, poll_after_ms, recovery_fence)
+            .await
     }
 
     async fn attach_known(
@@ -558,6 +710,7 @@ impl<D: ProviderSubmitDriver> ProviderSubmitOrchestrator<D> {
         intent: &ProviderSubmitIntent,
         context: &ProviderExecutionContext,
         poll_after_ms: i64,
+        recovery_fence: Option<ProviderSubmitRecoveryFence>,
     ) -> Result<ProviderSubmitOutcome, ProviderSubmitOrchestratorError> {
         let remote_operation_id = intent
             .remote_operation_id
@@ -579,7 +732,7 @@ impl<D: ProviderSubmitDriver> ProviderSubmitOrchestrator<D> {
                 event_identity,
                 execution_binding_sha256: context.execution_binding_sha256().to_owned(),
                 poll_after_ms,
-                recovery_fence: None,
+                recovery_fence,
             })
             .await?;
         Ok(ProviderSubmitOutcome::Attached(task))
@@ -596,6 +749,11 @@ pub enum ProviderSubmitOutcome {
 enum RemoteSubmitDispatch {
     Launch(RemoteSubmitLaunchAuthority),
     Attach(RemoteSubmitJournalObservation),
+}
+
+struct SubmitFailureEvidence<'a> {
+    kind: ProviderSubmitFailureKind,
+    error_code: &'a str,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]

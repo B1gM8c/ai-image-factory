@@ -223,3 +223,8 @@ the public Codex image behavior remains unchanged.
 
 Phase 2M through Phase 2O close the original durable journal, gated process,
 deadline, and receipt-import composition items without activating a provider.
+
+Phase 2Y closes the provider/account recovery-work and unique orchestrator
+re-entry boundary, including the database-time budget and no-resubmit crash
+proof:
+[`2026-phase2y-fenced-provider-submit-recovery.md`](2026-phase2y-fenced-provider-submit-recovery.md).

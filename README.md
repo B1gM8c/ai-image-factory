@@ -75,6 +75,9 @@ crash recovery, and root-replacement fencing are documented in
 The inactive provider poll service, exact profile/account capability binding,
 bounded lifecycle, and real PostgreSQL fake-CLI proof are documented in
 [`docs/architecture/2026-phase2x-inactive-provider-poll-service.md`](docs/architecture/2026-phase2x-inactive-provider-poll-service.md).
+The fenced provider-submit recovery work, frozen command projection,
+database-time budget, and no-resubmit crash proof are documented in
+[`docs/architecture/2026-phase2y-fenced-provider-submit-recovery.md`](docs/architecture/2026-phase2y-fenced-provider-submit-recovery.md).
 Database-bound provider profiles and durable capacity are documented in
 [`docs/architecture/2026-phase1g-execution-binding-capacity.md`](docs/architecture/2026-phase1g-execution-binding-capacity.md).
 

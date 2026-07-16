@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
@@ -266,9 +267,11 @@ struct RecoveryClaimRow {
     recovery_owner: String,
     recovery_lease_epoch: i64,
     recovery_lease_expires_at_ms: i64,
+    database_now_ms: i64,
     model: String,
     command_schema: String,
     command_hash: String,
+    command_json: Value,
     operation_id: String,
     operation_descriptor_revision: String,
     operation_descriptor_sha256_v1: String,
@@ -1512,6 +1515,7 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
         tx.commit().await.map_err(unavailable)?;
         Ok(ProviderSubmitRecoveryLease {
             recovery_lease_expires_at_ms: expires,
+            remaining_budget_ms: remaining_budget_ms(lease.context.provider_deadline_at_ms, now)?,
             ..lease.clone()
         })
     }
@@ -3772,8 +3776,10 @@ async fn load_recovery_claim_command_in(
                command.command_owner AS recovery_owner,
                command.recovery_lease_epoch,
                command.claim_lease_expires_at_ms AS recovery_lease_expires_at_ms,
+               command.claim_claimed_at_ms AS database_now_ms,
                submission.model, submission.command_schema,
-               submission.command_hash, submission.operation_id,
+               submission.command_hash, payload.command_json,
+               submission.operation_id,
                submission.operation_descriptor_revision,
                submission.operation_descriptor_sha256_v1,
                submission.completion_mode, submission.idempotency_mode,
@@ -3796,6 +3802,9 @@ async fn load_recovery_claim_command_in(
         JOIN provider_submissions submission
           ON submission.submission_id = command.submission_id
          AND submission.executor_execution_id = command.executor_execution_id
+        JOIN job_payloads payload
+          ON payload.job_id = submission.job_id
+         AND payload.command_schema = submission.command_schema
         JOIN provider_accounts account
           ON account.provider_account_id = submission.provider_account_id
          AND account.credential_pool_id = submission.credential_pool_id
@@ -4329,9 +4338,13 @@ fn provider_context_from_row(row: ProviderContextRow) -> ProviderExecutionContex
 fn recovery_lease_from_row(
     row: RecoveryClaimRow,
 ) -> Result<ProviderSubmitRecoveryLease, ProviderTaskStoreError> {
-    if row.intent_provider_timeout_ms != row.provider_timeout_ms {
+    if row.intent_provider_timeout_ms != row.provider_timeout_ms
+        || provider_source_command_hash(&row.command_json)? != row.command_hash
+    {
         return Err(ProviderTaskStoreError::Conflict);
     }
+    let remaining_budget_ms =
+        remaining_budget_ms(row.provider_deadline_at_ms, row.database_now_ms)?;
     let intent = submit_intent_from_row(SubmitIntentRow {
         submission_id: row.submission_id,
         executor_execution_id: row.executor_execution_id,
@@ -4388,11 +4401,18 @@ fn recovery_lease_from_row(
     Ok(ProviderSubmitRecoveryLease {
         intent,
         context,
+        command_json: row.command_json,
+        remaining_budget_ms,
         recovery_owner: row.recovery_owner,
         recovery_lease_epoch: row.recovery_lease_epoch,
         recovery_lease_expires_at_ms: row.recovery_lease_expires_at_ms,
         authority_seal,
     })
+}
+
+fn provider_source_command_hash(command: &Value) -> Result<String, ProviderTaskStoreError> {
+    let bytes = serde_json::to_vec(command).map_err(|_| ProviderTaskStoreError::Conflict)?;
+    Ok(hex::encode(Sha256::digest(bytes)))
 }
 
 async fn load_task_in(

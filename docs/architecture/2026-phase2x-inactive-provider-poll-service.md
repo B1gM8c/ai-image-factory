@@ -387,3 +387,7 @@ composition or provider-account control policy without activating Dreamina.
 Before a real provider smoke, the platform still needs an approved credential
 provisioning boundary, provider query rate/cooldown policy, spend and quota
 guards, host isolation, and deployment health semantics.
+
+Phase 2Y first closes the fenced submit-recovery kernel required by that
+service:
+[`2026-phase2y-fenced-provider-submit-recovery.md`](2026-phase2y-fenced-provider-submit-recovery.md).

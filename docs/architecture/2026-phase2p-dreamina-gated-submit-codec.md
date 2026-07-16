@@ -215,3 +215,7 @@ materialization boundary without activating Dreamina:
 Phase 2X composes that query path into a runnable but inactive service with
 real PostgreSQL and a local fake CLI:
 [`2026-phase2x-inactive-provider-poll-service.md`](2026-phase2x-inactive-provider-poll-service.md).
+
+Phase 2Y adds the provider-neutral fenced submit recovery entry needed before
+the codec can be composed into a bounded service:
+[`2026-phase2y-fenced-provider-submit-recovery.md`](2026-phase2y-fenced-provider-submit-recovery.md).

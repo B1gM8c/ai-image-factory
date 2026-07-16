@@ -322,6 +322,184 @@ async fn expired_pre_release_budget_never_invokes_the_cli() -> TestResult {
     result
 }
 
+#[tokio::test]
+async fn recovery_claim_completes_the_elected_unlaunched_attempt_once() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let lease = seed_running_submission_with_lease(
+            &database.pool,
+            "gated-unlaunched-recovery-worker",
+            200,
+        )
+        .await?;
+        let store = PostgresProviderTaskStore::new(database.pool.clone());
+        let command = orchestrator_command(&lease);
+        let reservation = RemoteTaskSubmitReservation::new(
+            &lease,
+            format!("provider-submit-{}", lease.submission_id.simple()),
+            command.output(),
+            command.identity(),
+            60_000,
+        );
+        let acquired = store
+            .acquire_submit(&reservation)
+            .await
+            .map_err(debug_error)?;
+        require(
+            matches!(acquired, ProviderSubmitAcquire::Dispatch(_)),
+            format!("fresh submit did not elect one dispatch: {acquired:?}"),
+        )?;
+        drop(acquired);
+
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let recovery = store
+            .claim_submit_recovery(
+                &claim_scope(),
+                "gated-unlaunched-recovery",
+                "claim-unlaunched-recovery",
+                5_000,
+            )
+            .await
+            .map_err(debug_error)?
+            .ok_or_else(|| "unlaunched submit was not recovery-claimable".to_owned())?;
+        let expected_command_json: serde_json::Value =
+            sqlx::query_scalar("SELECT command_json FROM job_payloads WHERE job_id = $1")
+                .bind(lease.job_id)
+                .fetch_one(&database.pool)
+                .await
+                .map_err(debug_error)?;
+        require(
+            recovery.command_json() == &expected_command_json
+                && (1..=60_000).contains(&recovery.remaining_budget_ms()),
+            "recovery claim did not freeze the durable command and database budget",
+        )?;
+        let recovery_debug = format!("{recovery:?}");
+        require(
+            recovery_debug.contains("[redacted]")
+                && !recovery_debug.contains(&expected_command_json.to_string()),
+            "recovery debug output exposed the frozen source command",
+        )?;
+
+        let journal = tempfile::tempdir().map_err(debug_error)?;
+        let journal_root = journal.path().join("remote-submit");
+        let side_effect = journal.path().join("provider-invoked");
+        let codec =
+            FakeGatedSubmitCodec::new(journal.path(), &side_effect, "recovered-unlaunched")?;
+        let runner = Path::new(env!("CARGO_BIN_EXE_remote-submit-runner"));
+        let recovered = ProviderSubmitOrchestrator::new(
+            store,
+            GatedCliSubmitDriver::new(codec, runner, file_sha256(runner)?).map_err(debug_error)?,
+            60_000,
+            &journal_root,
+        )
+        .map_err(debug_error)?
+        .recover(ProviderSubmitRecoveryWork::new(&recovery, command).map_err(debug_error)?)
+        .await
+        .map_err(debug_error)?;
+        let attached_fence: (Option<String>, Option<i64>) = sqlx::query_as(
+            "SELECT attach_recovery_owner, attach_recovery_lease_epoch \
+             FROM provider_remote_tasks WHERE submission_id = $1",
+        )
+        .bind(lease.submission_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(
+            matches!(recovered, ProviderSubmitOutcome::Attached(ref task)
+                if task.remote_operation_id == "recovered-unlaunched")
+                && fs::read(&side_effect).map_err(debug_error)? == b"invoked"
+                && attached_fence.0.as_deref() == Some(recovery.recovery_owner.as_str())
+                && attached_fence.1 == Some(recovery.recovery_lease_epoch),
+            format!("recovery did not complete the elected attempt exactly once: {recovered:?}"),
+        )
+    }
+    .await;
+    database.cleanup().await?;
+    result
+}
+
+#[tokio::test]
+async fn outcome_unknown_recovery_observes_without_relaunching_cli() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let lease = seed_running_submission_with_lease(
+            &database.pool,
+            "gated-unknown-recovery-worker",
+            200,
+        )
+        .await?;
+        let journal = tempfile::tempdir().map_err(debug_error)?;
+        let journal_root = journal.path().join("remote-submit");
+        let side_effect = journal.path().join("provider-invoked");
+        let codec = FakeGatedSubmitCodec::new(journal.path(), &side_effect, "unused-operation")?
+            .with_receipt("invalid-receipt");
+        let runner = Path::new(env!("CARGO_BIN_EXE_remote-submit-runner"));
+        let runner_sha256 = file_sha256(runner)?;
+        let first = ProviderSubmitOrchestrator::new(
+            PostgresProviderTaskStore::new(database.pool.clone()),
+            GatedCliSubmitDriver::new(codec.clone(), runner, &runner_sha256)
+                .map_err(debug_error)?,
+            60_000,
+            &journal_root,
+        )
+        .map_err(debug_error)?
+        .submit(gated_orchestrator_work(&lease)?)
+        .await
+        .map_err(debug_error)?;
+        require(
+            matches!(first, ProviderSubmitOutcome::AwaitingEvidence(ref intent)
+                if intent.state == ProviderSubmitIntentState::OutcomeUnknown)
+                && fs::read(&side_effect).map_err(debug_error)? == b"invoked",
+            format!("invalid receipt did not create one unknown attempt: {first:?}"),
+        )?;
+
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let store = PostgresProviderTaskStore::new(database.pool.clone());
+        let recovery = store
+            .claim_submit_recovery(
+                &claim_scope(),
+                "gated-unknown-recovery",
+                "claim-unknown-recovery",
+                5_000,
+            )
+            .await
+            .map_err(debug_error)?
+            .ok_or_else(|| "unknown submit was not recovery-claimable".to_owned())?;
+        let orchestrator = ProviderSubmitOrchestrator::new(
+            store,
+            GatedCliSubmitDriver::new(codec, runner, &runner_sha256).map_err(debug_error)?,
+            60_000,
+            &journal_root,
+        )
+        .map_err(debug_error)?;
+        for _ in 0..2 {
+            let observed = orchestrator
+                .recover(
+                    ProviderSubmitRecoveryWork::new(&recovery, orchestrator_command(&lease))
+                        .map_err(debug_error)?,
+                )
+                .await
+                .map_err(debug_error)?;
+            require(
+                matches!(observed, ProviderSubmitOutcome::AwaitingEvidence(ref intent)
+                    if intent.state == ProviderSubmitIntentState::OutcomeUnknown),
+                format!("unknown recovery changed the submit outcome: {observed:?}"),
+            )?;
+        }
+        require(
+            fs::read(&side_effect).map_err(debug_error)? == b"invoked",
+            "outcome_unknown recovery launched a second CLI side effect",
+        )
+    }
+    .await;
+    database.cleanup().await?;
+    result
+}
+
 #[derive(Clone)]
 struct FakeGatedSubmitCodec {
     working_directory: PathBuf,
@@ -329,6 +507,7 @@ struct FakeGatedSubmitCodec {
     shell_sha256: String,
     operation_id: String,
     projection_delay: Duration,
+    receipt: String,
 }
 
 impl FakeGatedSubmitCodec {
@@ -343,11 +522,17 @@ impl FakeGatedSubmitCodec {
             shell_sha256: file_sha256(Path::new("/bin/sh"))?,
             operation_id: operation_id.into(),
             projection_delay: Duration::ZERO,
+            receipt: "gated-receipt".to_owned(),
         })
     }
 
     fn with_projection_delay(mut self, projection_delay: Duration) -> Self {
         self.projection_delay = projection_delay;
+        self
+    }
+
+    fn with_receipt(mut self, receipt: impl Into<String>) -> Self {
+        self.receipt = receipt.into();
         self
     }
 
@@ -358,9 +543,10 @@ impl FakeGatedSubmitCodec {
             &self.working_directory,
             vec![
                 "-c".to_owned(),
-                "printf invoked >> \"$1\"; printf gated-receipt".to_owned(),
+                "printf invoked >> \"$1\"; printf %s \"$2\"".to_owned(),
                 "gated-provider-test".to_owned(),
                 self.side_effect.to_string_lossy().into_owned(),
+                self.receipt.clone(),
             ],
             BTreeMap::new(),
             Vec::new(),
