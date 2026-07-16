@@ -778,7 +778,7 @@ fn validate_release(
     Ok(())
 }
 
-fn prepare_root(path: &Path) -> Result<PathBuf, RemoteSubmitJournalError> {
+pub(super) fn prepare_root(path: &Path) -> Result<PathBuf, RemoteSubmitJournalError> {
     if !path.is_absolute() {
         return Err(RemoteSubmitJournalError::InvalidInput);
     }
@@ -816,7 +816,7 @@ fn validate_private_directory_path(
     Ok(())
 }
 
-fn validate_directory(
+pub(super) fn validate_directory(
     directory: &OwnedFd,
     error: RemoteSubmitJournalError,
 ) -> Result<(), RemoteSubmitJournalError> {
@@ -865,7 +865,7 @@ where
     }
 }
 
-fn publish_or_compare(
+pub(super) fn publish_or_compare(
     directory: &OwnedFd,
     name: &str,
     bytes: &[u8],
@@ -884,7 +884,7 @@ fn publish_or_compare(
     }
 }
 
-fn publish_bytes(
+pub(super) fn publish_bytes(
     directory: &OwnedFd,
     name: &str,
     bytes: &[u8],
@@ -936,7 +936,7 @@ fn publish_bytes(
     }
 }
 
-fn read_required_json<T: DeserializeOwned>(
+pub(super) fn read_required_json<T: DeserializeOwned>(
     directory: &OwnedFd,
     name: &str,
     max_bytes: u64,
@@ -945,7 +945,7 @@ fn read_required_json<T: DeserializeOwned>(
     serde_json::from_slice(&bytes).map_err(|_| RemoteSubmitJournalError::Integrity)
 }
 
-fn read_optional_json<T: DeserializeOwned>(
+pub(super) fn read_optional_json<T: DeserializeOwned>(
     directory: &OwnedFd,
     name: &str,
     max_bytes: u64,
@@ -966,7 +966,7 @@ fn read_required_bytes(
     read_optional_bytes(directory, name, max_bytes)?.ok_or(RemoteSubmitJournalError::Integrity)
 }
 
-fn read_optional_bytes(
+pub(super) fn read_optional_bytes(
     directory: &OwnedFd,
     name: &str,
     max_bytes: u64,
@@ -1071,7 +1071,7 @@ fn valid_text(value: &str) -> bool {
         && !value.bytes().any(|byte| byte.is_ascii_control())
 }
 
-fn valid_error_code(value: &str) -> bool {
+pub(super) fn valid_error_code(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= MAX_ERROR_CODE_BYTES
         && value
@@ -1079,14 +1079,14 @@ fn valid_error_code(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
-fn valid_sha256(value: &str) -> bool {
+pub(super) fn valid_sha256(value: &str) -> bool {
     value.len() == 64
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
 
-fn sha256(bytes: &[u8]) -> String {
+pub(super) fn sha256(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 

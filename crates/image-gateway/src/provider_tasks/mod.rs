@@ -21,6 +21,11 @@ pub use orchestrator::{
     ProviderSubmitWork,
 };
 pub use postgres::PostgresProviderTaskStore;
+pub use remote_submit::{
+    GatedCliBinding, GatedCliCommand, GatedCliObservation, GatedCliProcessError,
+    GatedCliProcessOutcome, GatedCliProcessTerminal, GatedCliReady, GatedCliSubmission,
+    run_remote_submit_gate, run_remote_submit_runner,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProviderTaskState {

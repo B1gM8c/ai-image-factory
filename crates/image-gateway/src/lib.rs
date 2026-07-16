@@ -56,6 +56,8 @@ pub use generator::{
     CodexImageGenerator, EditJob, GeneratedImage, GenerationJob, ImageGenerator, InputImage,
 };
 pub use provider_tasks::{
+    GatedCliBinding, GatedCliCommand, GatedCliObservation, GatedCliProcessError,
+    GatedCliProcessOutcome, GatedCliProcessTerminal, GatedCliReady, GatedCliSubmission,
     PostgresProviderTaskStore, ProviderArtifactAuthority, ProviderArtifactPublication,
     ProviderCapacityEvidence, ProviderCapacityEvidenceOutcome, ProviderCapacityReconciliation,
     ProviderCapacityReconciliationLease, ProviderCapacityReconciliationState,
@@ -69,7 +71,8 @@ pub use provider_tasks::{
     ProviderTaskObservation, ProviderTaskObservationOutcome, ProviderTaskObservationSource,
     ProviderTaskState, ProviderTaskStore, ProviderTaskStoreError, RemoteTaskAttach,
     RemoteTaskQuarantinedReceipt, RemoteTaskSubmitFailure, RemoteTaskSubmitReceipt,
-    RemoteTaskSubmitReservation, VerifiedCallbackWakeup,
+    RemoteTaskSubmitReservation, VerifiedCallbackWakeup, run_remote_submit_gate,
+    run_remote_submit_runner,
 };
 pub use reconciliation::{
     InputCleanupOutcome, PostgresReconciliationStore, ReconciliationOutcome, ReconciliationStore,
