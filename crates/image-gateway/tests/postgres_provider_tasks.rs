@@ -20,17 +20,19 @@ use gpt_image_2_gateway::{
     ProviderCapacityReconciliationStore, ProviderCapacityTerminalState, ProviderExecutionContext,
     ProviderPollDaemon, ProviderPollDaemonConfig, ProviderPollDriver, ProviderPollDriverCall,
     ProviderPollOrchestrator, ProviderPollOrchestratorConfig, ProviderPollRun, ProviderPollStore,
-    ProviderRemoteTask, ProviderRuntimeProfileStore, ProviderSubmitAcquire,
-    ProviderSubmitFailureKind, ProviderSubmitIntent, ProviderSubmitIntentState,
-    ProviderSubmitIterationCommand, ProviderSubmitOrchestrator, ProviderSubmitOrchestratorError,
-    ProviderSubmitOutcome, ProviderSubmitProjectionError, ProviderSubmitProjector,
-    ProviderSubmitRecoveryFence, ProviderSubmitRecoveryLease, ProviderSubmitRecoveryWork,
-    ProviderSubmitRun, ProviderSubmitService, ProviderSubmitServiceConfig, ProviderSubmitStart,
-    ProviderSubmitWork, ProviderTaskClaimScope, ProviderTaskDeadlineStore, ProviderTaskLease,
-    ProviderTaskObservation, ProviderTaskObservationOutcome, ProviderTaskObservationSource,
-    ProviderTaskState, ProviderTaskStore, ProviderTaskStoreError, RemoteTaskAttach,
-    RemoteTaskSubmitFailure, RemoteTaskSubmitReceipt, RemoteTaskSubmitReservation,
-    StagedProviderArtifact, VerifiedCallbackWakeup,
+    ProviderProfileReadinessStatus, ProviderRemoteTask, ProviderRuntimeProfileStore,
+    ProviderRuntimeReadinessStore, ProviderRuntimeRegistration, ProviderRuntimeRole,
+    ProviderSubmitAcquire, ProviderSubmitFailureKind, ProviderSubmitIntent,
+    ProviderSubmitIntentState, ProviderSubmitIterationCommand, ProviderSubmitOrchestrator,
+    ProviderSubmitOrchestratorError, ProviderSubmitOutcome, ProviderSubmitProjectionError,
+    ProviderSubmitProjector, ProviderSubmitRecoveryFence, ProviderSubmitRecoveryLease,
+    ProviderSubmitRecoveryWork, ProviderSubmitRun, ProviderSubmitService,
+    ProviderSubmitServiceConfig, ProviderSubmitStart, ProviderSubmitWork, ProviderTaskClaimScope,
+    ProviderTaskDeadlineStore, ProviderTaskLease, ProviderTaskObservation,
+    ProviderTaskObservationOutcome, ProviderTaskObservationSource, ProviderTaskState,
+    ProviderTaskStore, ProviderTaskStoreError, RemoteTaskAttach, RemoteTaskSubmitFailure,
+    RemoteTaskSubmitReceipt, RemoteTaskSubmitReservation, StagedProviderArtifact,
+    VerifiedCallbackWakeup,
     admission::WorkLease,
     database::{connect_test_pool_with_search_path, run_migrations},
 };
@@ -289,6 +291,214 @@ async fn runtime_profile_rejects_each_disabled_dependency() -> TestResult {
     .await;
     let cleanup = database.cleanup().await;
     combine(result, cleanup)
+}
+
+#[tokio::test]
+async fn runtime_readiness_projects_configured_active_draining_and_withdrawn_states() -> TestResult
+{
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let store = PostgresProviderTaskStore::new(database.pool.clone());
+        require_profile_status(
+            &store,
+            ProviderProfileReadinessStatus::Configured,
+            (0, 0, 0, 0),
+        )
+        .await?;
+
+        let submit = store
+            .register_runtime(
+                &runtime_registration(ProviderRuntimeRole::Submit, "submit-a"),
+                30_000,
+            )
+            .await
+            .map_err(debug_error)?;
+        let future = database_now(&database.pool).await? + 60_000;
+        require(
+            sqlx::query(
+                r#"
+                UPDATE provider_runtime_leases
+                SET heartbeat_at_ms = $2, lease_expires_at_ms = $2 + 30_000,
+                    updated_at_ms = $2
+                WHERE runtime_id = $1
+                "#,
+            )
+            .bind(submit.runtime_id)
+            .bind(future)
+            .execute(&database.pool)
+            .await
+            .is_err(),
+            "runtime lease accepted a future heartbeat outside the readiness store",
+        )?;
+        require_profile_status(
+            &store,
+            ProviderProfileReadinessStatus::Configured,
+            (1, 0, 0, 0),
+        )
+        .await?;
+
+        let poll = store
+            .register_runtime(
+                &runtime_registration(ProviderRuntimeRole::Poll, "poll-a"),
+                30_000,
+            )
+            .await
+            .map_err(debug_error)?;
+        require_profile_status(&store, ProviderProfileReadinessStatus::Active, (1, 1, 0, 0))
+            .await?;
+
+        let draining = store
+            .begin_runtime_drain(&poll, 30_000)
+            .await
+            .map_err(debug_error)?;
+        require(
+            draining.state == gpt_image_2_gateway::ProviderRuntimeLeaseState::Draining,
+            "poll runtime did not enter draining state",
+        )?;
+        let draining = store
+            .heartbeat_runtime(&poll, 30_000)
+            .await
+            .map_err(debug_error)?;
+        require(
+            draining.state == gpt_image_2_gateway::ProviderRuntimeLeaseState::Draining,
+            "draining heartbeat reactivated the runtime",
+        )?;
+        require_profile_status(
+            &store,
+            ProviderProfileReadinessStatus::Draining,
+            (1, 0, 0, 1),
+        )
+        .await?;
+
+        store
+            .withdraw_runtime(&draining)
+            .await
+            .map_err(debug_error)?;
+        store.withdraw_runtime(&submit).await.map_err(debug_error)?;
+        require_profile_status(
+            &store,
+            ProviderProfileReadinessStatus::Configured,
+            (0, 0, 0, 0),
+        )
+        .await
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
+async fn runtime_readiness_blocks_disabled_profile_dependencies() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let store = PostgresProviderTaskStore::new(database.pool.clone());
+        sqlx::query(
+            "UPDATE provider_accounts SET state = 'disabled' WHERE provider_account_id = $1",
+        )
+        .bind(ACCOUNT_ID)
+        .execute(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require_profile_status(
+            &store,
+            ProviderProfileReadinessStatus::Blocked,
+            (0, 0, 0, 0),
+        )
+        .await?;
+        require(
+            store
+                .register_runtime(
+                    &runtime_registration(ProviderRuntimeRole::Submit, "blocked-submit"),
+                    30_000,
+                )
+                .await
+                == Err(ProviderTaskStoreError::Conflict),
+            "disabled account admitted a runtime lease",
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
+async fn expired_runtime_is_not_live_and_exact_identity_can_register_again() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let store = PostgresProviderTaskStore::new(database.pool.clone());
+        let registration = runtime_registration(ProviderRuntimeRole::Submit, "expiring-submit");
+        let expired = store
+            .register_runtime(&registration, 5)
+            .await
+            .map_err(debug_error)?;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        require(
+            store.heartbeat_runtime(&expired, 30_000).await
+                == Err(ProviderTaskStoreError::StaleLease),
+            "expired runtime renewed its lease",
+        )?;
+        require_profile_status(
+            &store,
+            ProviderProfileReadinessStatus::Configured,
+            (0, 0, 0, 0),
+        )
+        .await?;
+        let replacement = store
+            .register_runtime(&registration, 30_000)
+            .await
+            .map_err(debug_error)?;
+        require(
+            replacement.runtime_id == registration.runtime_id
+                && replacement.heartbeat_at_ms > expired.heartbeat_at_ms,
+            "expired exact runtime identity did not register as a new lease",
+        )?;
+        store
+            .withdraw_runtime(&replacement)
+            .await
+            .map_err(debug_error)
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
+async fn concurrent_runtime_registration_fences_duplicate_owner() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let store = PostgresProviderTaskStore::new(database.pool.clone());
+        let first = runtime_registration(ProviderRuntimeRole::Poll, "one-owner");
+        let second = ProviderRuntimeRegistration {
+            runtime_id: Uuid::new_v4(),
+            ..first.clone()
+        };
+        let (left, right) = tokio::join!(
+            store.register_runtime(&first, 30_000),
+            store.register_runtime(&second, 30_000),
+        );
+        let results = [left, right];
+        require(
+            results.iter().filter(|result| result.is_ok()).count() == 1
+                && results
+                    .iter()
+                    .filter(|result| **result == Err(ProviderTaskStoreError::Conflict))
+                    .count()
+                    == 1,
+            format!("duplicate owner registration was not exactly fenced: {results:?}"),
+        )?;
+        let winner = results
+            .into_iter()
+            .find_map(Result::ok)
+            .ok_or_else(|| "runtime owner had no winner".to_string())?;
+        store.withdraw_runtime(&winner).await.map_err(debug_error)
+    }
+    .await;
+    combine(result, database.cleanup().await)
 }
 
 #[tokio::test]
@@ -10633,6 +10843,37 @@ impl TestDatabase {
         self.pool.close().await;
         result.map(|_| ())
     }
+}
+
+fn runtime_registration(role: ProviderRuntimeRole, owner: &str) -> ProviderRuntimeRegistration {
+    ProviderRuntimeRegistration {
+        runtime_id: Uuid::new_v4(),
+        execution_profile_id: PROFILE_ID,
+        role,
+        runtime_owner: owner.to_string(),
+    }
+}
+
+async fn require_profile_status(
+    store: &PostgresProviderTaskStore,
+    status: ProviderProfileReadinessStatus,
+    counts: (i64, i64, i64, i64),
+) -> TestResult {
+    let profiles = store.list_profile_readiness().await.map_err(debug_error)?;
+    let profile = profiles
+        .iter()
+        .find(|profile| profile.execution_profile_id == PROFILE_ID)
+        .ok_or_else(|| "provider runtime profile readiness was missing".to_string())?;
+    require(
+        profile.status == status
+            && (
+                profile.active_submitters,
+                profile.active_pollers,
+                profile.draining_submitters,
+                profile.draining_pollers,
+            ) == counts,
+        format!("unexpected provider profile readiness: {profile:?}"),
+    )
 }
 
 async fn database_now(pool: &PgPool) -> TestResult<i64> {

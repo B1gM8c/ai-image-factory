@@ -323,8 +323,8 @@ Before any provider activation:
 
 1. extend the Phase 2AC mixed fresh/recovery benchmark to production-scale
    cardinality, pool saturation, journal synchronization, and provider latency;
-2. add operational readiness/health semantics that distinguish configured,
-   active, draining, and blocked profile states;
+2. compose the Phase 2AD runtime lease kernel into submit/poll daemons and
+   expose readiness without weakening dependency-free liveness;
 3. add credential-source and rotation capabilities without exposing provider
    secrets to the scheduler; and
 4. complete the platform-side quota, key-management, and billing control plane

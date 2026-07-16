@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 type TestResult<T = ()> = Result<T, String>;
 
-const REQUIRED_COLUMNS: [(&str, &str); 170] = [
+const REQUIRED_COLUMNS: [(&str, &str); 179] = [
     ("usage_events", "tenant_id"),
     ("quota_reservations", "tenant_id"),
     ("quota_reservations", "job_id"),
@@ -238,9 +238,18 @@ const REQUIRED_COLUMNS: [(&str, &str); 170] = [
     ("provider_remote_submit_intents", "provider_command_sha256"),
     ("provider_remote_submit_intents", "execution_binding_sha256"),
     ("provider_remote_submit_intents", "provider_timeout_ms"),
+    ("provider_runtime_leases", "runtime_id"),
+    ("provider_runtime_leases", "execution_profile_id"),
+    ("provider_runtime_leases", "runtime_role"),
+    ("provider_runtime_leases", "runtime_owner"),
+    ("provider_runtime_leases", "state"),
+    ("provider_runtime_leases", "heartbeat_at_ms"),
+    ("provider_runtime_leases", "lease_expires_at_ms"),
+    ("provider_runtime_leases", "created_at_ms"),
+    ("provider_runtime_leases", "updated_at_ms"),
 ];
 
-const REQUIRED_INDEXES: [&str; 27] = [
+const REQUIRED_INDEXES: [&str; 28] = [
     "usage_events_tenant_created_at_ms_idx",
     "gateway_api_keys_project_id_idx",
     "quota_reservations_active_tenant_idx",
@@ -268,6 +277,7 @@ const REQUIRED_INDEXES: [&str; 27] = [
     "provider_capacity_reconciliations_claim_idx",
     "provider_capacity_reconciliations_remote_operation_idx",
     "provider_capacity_reconciliations_claim_command_idx",
+    "provider_runtime_leases_profile_role_idx",
 ];
 
 #[tokio::test]
@@ -1157,9 +1167,9 @@ async fn assert_expected_schema(pool: &PgPool) -> TestResult {
         migration_versions(pool).await?
             == vec![
                 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22,
-                23, 24, 25, 26, 27, 28,
+                23, 24, 25, 26, 27, 28, 29,
             ],
-        "applied migration versions must be exactly [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28]",
+        "applied migration versions must be exactly [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29]",
     )?;
 
     for (table, column) in REQUIRED_COLUMNS {

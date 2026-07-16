@@ -11,6 +11,7 @@ mod account_home;
 mod capacity;
 mod poll;
 mod postgres;
+mod readiness;
 mod remote_submit;
 mod runtime_profile;
 mod submit;
@@ -32,6 +33,11 @@ pub use poll::{
     ProviderPollOrchestratorError, ProviderPollRun, ProviderPollStore, StagedProviderArtifact,
 };
 pub use postgres::PostgresProviderTaskStore;
+pub use readiness::{
+    ProviderProfileReadiness, ProviderProfileReadinessStatus, ProviderRuntimeLease,
+    ProviderRuntimeLeaseState, ProviderRuntimeReadinessStore, ProviderRuntimeRegistration,
+    ProviderRuntimeRole,
+};
 pub use remote_submit::{
     GatedCliBinding, GatedCliCommand, GatedCliObservation, GatedCliPreparedSubmission,
     GatedCliProcessError, GatedCliProcessOutcome, GatedCliProcessTerminal, GatedCliReady,
