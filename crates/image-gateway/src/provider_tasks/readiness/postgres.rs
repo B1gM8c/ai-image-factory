@@ -6,9 +6,10 @@ use crate::provider_tasks::{
 };
 
 use super::{
-    ProviderProfileReadiness, ProviderProfileReadinessStatus, ProviderRuntimeLease,
-    ProviderRuntimeLeaseState, ProviderRuntimeReadinessStore, ProviderRuntimeRegistration,
-    ProviderRuntimeRole, validate_lease, validate_registration,
+    ProviderProfileReadiness, ProviderProfileReadinessStatus, ProviderProfileReadinessStore,
+    ProviderProfileReadinessSummary, ProviderRuntimeLease, ProviderRuntimeLeaseState,
+    ProviderRuntimeReadinessStore, ProviderRuntimeRegistration, ProviderRuntimeRole,
+    validate_lease, validate_registration,
 };
 
 #[derive(FromRow)]
@@ -43,40 +44,61 @@ struct ProfileReadinessRow {
     execution_profile_id: uuid::Uuid,
     profile_key: String,
     provider_id: String,
-    graph_enabled: bool,
-    max_concurrency: i32,
+    status: String,
     active_submitters: i64,
     active_pollers: i64,
     draining_submitters: i64,
     draining_pollers: i64,
 }
 
-impl From<ProfileReadinessRow> for ProviderProfileReadiness {
-    fn from(row: ProfileReadinessRow) -> Self {
-        let runnable = row.graph_enabled
-            && usize::try_from(row.max_concurrency)
-                .is_ok_and(|value| (1..=MAX_PROVIDER_RUNTIME_LANES).contains(&value));
-        let active = row.active_submitters > 0 && row.active_pollers > 0;
-        let draining = row.draining_submitters > 0 || row.draining_pollers > 0;
-        let status = if !runnable {
-            ProviderProfileReadinessStatus::Blocked
-        } else if active {
-            ProviderProfileReadinessStatus::Active
-        } else if draining {
-            ProviderProfileReadinessStatus::Draining
-        } else {
-            ProviderProfileReadinessStatus::Configured
-        };
-        Self {
+#[derive(FromRow)]
+struct ProfileReadinessSummaryRow {
+    configured: i64,
+    active: i64,
+    draining: i64,
+    blocked: i64,
+}
+
+impl TryFrom<ProfileReadinessRow> for ProviderProfileReadiness {
+    type Error = ProviderTaskStoreError;
+
+    fn try_from(row: ProfileReadinessRow) -> Result<Self, Self::Error> {
+        Ok(Self {
             execution_profile_id: row.execution_profile_id,
             profile_key: row.profile_key,
             provider_id: row.provider_id,
-            status,
+            status: ProviderProfileReadinessStatus::parse(&row.status)?,
             active_submitters: row.active_submitters,
             active_pollers: row.active_pollers,
             draining_submitters: row.draining_submitters,
             draining_pollers: row.draining_pollers,
-        }
+        })
+    }
+}
+
+#[async_trait]
+impl ProviderProfileReadinessStore for PostgresProviderTaskStore {
+    async fn summarize_profile_readiness(
+        &self,
+    ) -> Result<ProviderProfileReadinessSummary, ProviderTaskStoreError> {
+        let row: ProfileReadinessSummaryRow = sqlx::query_as(
+            r#"
+            SELECT COUNT(*) FILTER (WHERE status = 'configured')::BIGINT AS configured,
+                   COUNT(*) FILTER (WHERE status = 'active')::BIGINT AS active,
+                   COUNT(*) FILTER (WHERE status = 'draining')::BIGINT AS draining,
+                   COUNT(*) FILTER (WHERE status = 'blocked')::BIGINT AS blocked
+            FROM provider_profile_readiness
+            "#,
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(unavailable)?;
+        Ok(ProviderProfileReadinessSummary {
+            configured: row.configured,
+            active: row.active,
+            draining: row.draining,
+            blocked: row.blocked,
+        })
     }
 }
 
@@ -250,63 +272,17 @@ impl ProviderRuntimeReadinessStore for PostgresProviderTaskStore {
     ) -> Result<Vec<ProviderProfileReadiness>, ProviderTaskStoreError> {
         let rows: Vec<ProfileReadinessRow> = sqlx::query_as(
             r#"
-            WITH db_clock AS MATERIALIZED (
-              SELECT floor(extract(epoch FROM statement_timestamp()) * 1000)::BIGINT AS now_ms
-            )
-            SELECT profile.execution_profile_id, profile.profile_key,
-                   profile.provider_id,
-                   (
-                     profile.state = 'enabled'
-                     AND pool.state = 'enabled'
-                     AND account.state = 'enabled'
-                     AND policy.state = 'enabled'
-                   ) AS graph_enabled,
-                   policy.max_concurrency,
-                   COUNT(*) FILTER (
-                     WHERE runtime.runtime_role = 'submit'
-                       AND runtime.state = 'active'
-                       AND runtime.lease_expires_at_ms > db_clock.now_ms
-                   )::BIGINT AS active_submitters,
-                   COUNT(*) FILTER (
-                     WHERE runtime.runtime_role = 'poll'
-                       AND runtime.state = 'active'
-                       AND runtime.lease_expires_at_ms > db_clock.now_ms
-                   )::BIGINT AS active_pollers,
-                   COUNT(*) FILTER (
-                     WHERE runtime.runtime_role = 'submit'
-                       AND runtime.state = 'draining'
-                       AND runtime.lease_expires_at_ms > db_clock.now_ms
-                   )::BIGINT AS draining_submitters,
-                   COUNT(*) FILTER (
-                     WHERE runtime.runtime_role = 'poll'
-                       AND runtime.state = 'draining'
-                       AND runtime.lease_expires_at_ms > db_clock.now_ms
-                   )::BIGINT AS draining_pollers
-            FROM provider_execution_profiles profile
-            JOIN provider_credential_pools pool
-              ON pool.credential_pool_id = profile.credential_pool_id
-             AND pool.provider_id = profile.provider_id
-            JOIN provider_accounts account
-              ON account.provider_account_id = profile.provider_account_id
-             AND account.credential_pool_id = profile.credential_pool_id
-             AND account.provider_id = profile.provider_id
-            JOIN executor_resource_policies policy
-              ON policy.resource_policy_id = profile.resource_policy_id
-             AND policy.revision = profile.resource_policy_revision
-            CROSS JOIN db_clock
-            LEFT JOIN provider_runtime_leases runtime
-              ON runtime.execution_profile_id = profile.execution_profile_id
-            WHERE profile.completion_mode = 'remote_task'
-            GROUP BY profile.execution_profile_id, profile.profile_key,
-                     profile.provider_id, profile.state, pool.state,
-                     account.state, policy.state, policy.max_concurrency
-            ORDER BY profile.profile_key
+            SELECT execution_profile_id, profile_key, provider_id, status,
+                   active_submitters, active_pollers,
+                   draining_submitters, draining_pollers
+            FROM provider_profile_readiness
+            ORDER BY profile_key
             "#,
         )
         .fetch_all(&self.pool)
         .await
         .map_err(unavailable)?;
-        Ok(rows.into_iter().map(Into::into).collect())
+        rows.into_iter().map(TryInto::try_into).collect()
     }
 }
 

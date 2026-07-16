@@ -107,6 +107,21 @@ pub struct HealthResponse {
 }
 
 #[derive(Debug, Serialize, ToSchema)]
+pub struct ProviderProfileReadinessCounts {
+    pub configured: i64,
+    pub active: i64,
+    pub draining: i64,
+    pub blocked: i64,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ReadinessResponse {
+    #[schema(value_type = String)]
+    pub status: &'static str,
+    pub provider_profiles: Option<ProviderProfileReadinessCounts>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
 pub struct ModelsResponse {
     #[schema(value_type = String)]
     pub object: &'static str,

@@ -29,6 +29,7 @@ fn smoke_config() -> AppConfig {
         max_queue_size_per_tenant: 0,
         queue_timeout: Duration::from_secs(1),
         request_timeout: Duration::from_secs(900),
+        readiness_timeout: Duration::from_millis(500),
         max_upload_bytes: 32 * 1024 * 1024,
         proxy: ProxyConfig::default(),
         codex_home: Some(codex_home),

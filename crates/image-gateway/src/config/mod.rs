@@ -9,6 +9,9 @@ use std::{
 use crate::ImageGatewayError;
 use uuid::Uuid;
 
+const DEFAULT_READINESS_TIMEOUT_MS: u64 = 500;
+const MAX_READINESS_TIMEOUT_MS: u64 = 60_000;
+
 #[derive(Clone, Debug)]
 pub struct AppConfig {
     pub bind: SocketAddr,
@@ -24,6 +27,7 @@ pub struct AppConfig {
     pub max_queue_size_per_tenant: usize,
     pub queue_timeout: Duration,
     pub request_timeout: Duration,
+    pub readiness_timeout: Duration,
     pub max_upload_bytes: usize,
     pub proxy: ProxyConfig,
     pub codex_home: Option<String>,
@@ -105,6 +109,11 @@ impl AppConfig {
             )?,
             queue_timeout: Duration::from_secs(env_u64("GATEWAY_QUEUE_TIMEOUT_SECS", 120)?),
             request_timeout: Duration::from_secs(env_u64("GATEWAY_REQUEST_TIMEOUT_SECS", 900)?),
+            readiness_timeout: env_duration_ms(
+                "GATEWAY_READINESS_TIMEOUT_MS",
+                DEFAULT_READINESS_TIMEOUT_MS,
+                MAX_READINESS_TIMEOUT_MS,
+            )?,
             max_upload_bytes: env_usize("GATEWAY_MAX_UPLOAD_BYTES", 32 * 1024 * 1024)?,
             proxy: ProxyConfig {
                 http_proxy: env::var("GATEWAY_HTTP_PROXY")
@@ -156,6 +165,13 @@ impl AppConfig {
         if !self.bind.ip().is_loopback() {
             return Err(ImageGatewayError::config(
                 "native TLS is not implemented; set GATEWAY_BIND to a loopback address and expose it only through a TLS reverse proxy",
+            ));
+        }
+        if self.readiness_timeout.is_zero()
+            || self.readiness_timeout > Duration::from_millis(MAX_READINESS_TIMEOUT_MS)
+        {
+            return Err(ImageGatewayError::config(
+                "GATEWAY_READINESS_TIMEOUT_MS must be between 1 and 60000",
             ));
         }
         Ok(())
@@ -249,6 +265,16 @@ fn env_u64(name: &str, default: u64) -> Result<u64, ImageGatewayError> {
         .unwrap_or(Ok(default))
 }
 
+fn env_duration_ms(name: &str, default: u64, maximum: u64) -> Result<Duration, ImageGatewayError> {
+    let milliseconds = env_u64(name, default)?;
+    if !(1..=maximum).contains(&milliseconds) {
+        return Err(ImageGatewayError::config(format!(
+            "{name} must be between 1 and {maximum}",
+        )));
+    }
+    Ok(Duration::from_millis(milliseconds))
+}
+
 fn env_usize(name: &str, default: usize) -> Result<usize, ImageGatewayError> {
     env::var(name)
         .map(|v| {
@@ -288,6 +314,7 @@ mod tests {
             max_queue_size_per_tenant: 0,
             queue_timeout: Duration::from_secs(1),
             request_timeout: Duration::from_secs(1),
+            readiness_timeout: Duration::from_millis(DEFAULT_READINESS_TIMEOUT_MS),
             max_upload_bytes: 1024,
             proxy: ProxyConfig::default(),
             codex_home: None,
@@ -331,6 +358,26 @@ mod tests {
 
             assert!(error.contains("GATEWAY_API_TOKEN or GATEWAY_ADMIN_TOKEN is required"));
         }
+    }
+
+    #[test]
+    fn readiness_timeout_is_positive_and_operationally_bounded() {
+        for timeout in [
+            Duration::ZERO,
+            Duration::from_millis(MAX_READINESS_TIMEOUT_MS + 1),
+        ] {
+            let mut config = config_for_bind("127.0.0.1:8787", Some("token"));
+            config.readiness_timeout = timeout;
+
+            let error = format!("{:?}", config.validate_startup().unwrap_err());
+
+            assert!(error.contains("GATEWAY_READINESS_TIMEOUT_MS"));
+        }
+        assert!(
+            config_for_bind("127.0.0.1:8787", Some("token"))
+                .validate_startup()
+                .is_ok()
+        );
     }
 
     #[test]

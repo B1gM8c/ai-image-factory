@@ -99,6 +99,9 @@ projection are documented in
 The lease-supervised submit/poll daemon lifecycle and heartbeat-loss shutdown
 proof are documented in
 [`docs/architecture/2026-phase2ae-provider-runtime-supervisor.md`](docs/architecture/2026-phase2ae-provider-runtime-supervisor.md).
+The dependency-free liveness route, bounded database readiness route, and
+constant-cardinality provider status projection are documented in
+[`docs/architecture/2026-phase2af-bounded-gateway-readiness.md`](docs/architecture/2026-phase2af-bounded-gateway-readiness.md).
 Database-bound provider profiles and durable capacity are documented in
 [`docs/architecture/2026-phase1g-execution-binding-capacity.md`](docs/architecture/2026-phase1g-execution-binding-capacity.md).
 

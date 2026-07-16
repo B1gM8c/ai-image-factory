@@ -788,7 +788,22 @@ pub(crate) async fn poll_health(
                     .await
                     .map_err(|error| format!("health response was not JSON: {error}"))?;
                 if body == json!({"status": "ok"}) {
-                    return Ok(());
+                    let ready = client
+                        .get(format!("{base_url}/readyz"))
+                        .send()
+                        .await
+                        .map_err(|error| format!("readiness request failed: {error}"))?;
+                    let status = ready.status();
+                    let body: Value = ready
+                        .json()
+                        .await
+                        .map_err(|error| format!("readiness response was not JSON: {error}"))?;
+                    if status == reqwest::StatusCode::OK
+                        && body["status"] == "ready"
+                        && body["provider_profiles"].is_object()
+                    {
+                        return Ok(());
+                    }
                 }
             }
             tokio::time::sleep(Duration::from_millis(25)).await;

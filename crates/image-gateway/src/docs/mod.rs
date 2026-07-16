@@ -11,6 +11,7 @@ use crate::{
     },
     models::{
         HealthResponse, ImageData, ImageStreamEvent, ImagesResponse, ModelData, ModelsResponse,
+        ProviderProfileReadinessCounts, ReadinessResponse,
     },
 };
 
@@ -58,6 +59,7 @@ pub fn openapi_json() -> Json<Value> {
         list_project_api_keys,
         delete_project_api_key,
         healthz,
+        readyz,
     ),
     components(schemas(
         ImageGenerationRequestDoc,
@@ -79,6 +81,8 @@ pub fn openapi_json() -> Json<Value> {
         ModelsResponse,
         ModelData,
         HealthResponse,
+        ReadinessResponse,
+        ProviderProfileReadinessCounts,
         ProjectServiceAccount,
         CreatedProjectApiKey,
         ProjectApiKeyList,
@@ -248,6 +252,18 @@ async fn delete_project_api_key() {}
 )]
 #[allow(dead_code)]
 async fn healthz() {}
+
+#[utoipa::path(
+    get,
+    path = "/readyz",
+    tag = "System",
+    responses(
+        (status = 200, description = "Gateway dependencies are ready; provider profile states are diagnostic aggregates", body = ReadinessResponse),
+        (status = 503, description = "Gateway database readiness probe failed or timed out", body = ReadinessResponse)
+    )
+)]
+#[allow(dead_code)]
+async fn readyz() {}
 
 #[derive(Debug, Serialize, ToSchema)]
 #[schema(as = ImageGenerationRequest)]

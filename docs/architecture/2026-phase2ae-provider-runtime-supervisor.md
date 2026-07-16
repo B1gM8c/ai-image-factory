@@ -173,7 +173,6 @@ They perform no network or paid-provider operation.
 
 This phase does not add:
 
-- `/readyz` or an administrative readiness endpoint;
 - a desired-state rollout controller;
 - automatic process replacement;
 - provider circuit breakers or cooldown policy;
@@ -181,7 +180,9 @@ This phase does not add:
 - metrics export or alert thresholds; or
 - Dreamina, Grok, Seedance, or other provider activation.
 
-## Next Gate
+## Phase 2AF
+
+Phase 2AF closes the bounded gateway-readiness gate:
 
 Expose readiness without weakening liveness:
 
@@ -191,3 +192,6 @@ Expose readiness without weakening liveness:
 4. omit account, credential, executable, and filesystem identity;
 5. bound query latency and response cardinality; and
 6. prove status and timeout behavior through HTTP plus real PostgreSQL tests.
+
+See
+[`2026-phase2af-bounded-gateway-readiness.md`](2026-phase2af-bounded-gateway-readiness.md).

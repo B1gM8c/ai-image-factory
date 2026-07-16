@@ -11,7 +11,7 @@ use axum::{
 use tower_http::trace::TraceLayer;
 
 use crate::{
-    AppConfig, GenerationAdmissionContract, ImageGatewayError,
+    AppConfig, GenerationAdmissionContract, ImageGatewayError, ProviderProfileReadinessStore,
     admission::{AdmissionStore, InMemoryAdmissionStore},
     api_keys::{ApiKeyStore, InMemoryApiKeyStore},
     artifacts::{ArtifactBlobStore, InMemoryArtifactBlobStore},
@@ -29,11 +29,13 @@ mod admin;
 mod edit_input;
 mod images;
 mod middleware;
+mod readiness;
 mod responses;
 
 use self::middleware::add_request_id;
 use admin::{create_project_service_account, delete_project_api_key, list_project_api_keys};
 use images::{edits, generations, healthz, models};
+use readiness::{EmptyProviderProfileReadinessStore, readyz};
 
 #[derive(Clone)]
 pub(super) struct AppState {
@@ -44,6 +46,7 @@ pub(super) struct AppState {
     pub(super) generation_worker: Option<Arc<GenerationWorker>>,
     pub(super) settlement_store: Arc<dyn ExecutionSettlementStore>,
     pub(super) input_blob_store: Arc<dyn InputBlobStore>,
+    pub(super) provider_readiness_store: Arc<dyn ProviderProfileReadinessStore>,
     pub(super) scheduler: Arc<TenantJobScheduler>,
     pub(super) upload_scheduler: Arc<TenantJobScheduler>,
     pub(super) worker_id: String,
@@ -72,6 +75,7 @@ pub struct ExternalImageGatewayComponents {
     pub admission_store: Arc<dyn AdmissionStore>,
     pub settlement_store: Arc<dyn ExecutionSettlementStore>,
     pub input_blob_store: Arc<dyn InputBlobStore>,
+    pub provider_readiness_store: Arc<dyn ProviderProfileReadinessStore>,
 }
 
 struct GatewayStores {
@@ -80,6 +84,7 @@ struct GatewayStores {
     admission_store: Arc<dyn AdmissionStore>,
     settlement_store: Arc<dyn ExecutionSettlementStore>,
     input_blob_store: Arc<dyn InputBlobStore>,
+    provider_readiness_store: Arc<dyn ProviderProfileReadinessStore>,
 }
 
 #[derive(Clone, Debug)]
@@ -176,6 +181,7 @@ pub fn build_router_with_components(
             admission_store,
             settlement_store,
             input_blob_store,
+            provider_readiness_store: Arc::new(EmptyProviderProfileReadinessStore),
         },
         Some(generation_worker),
         GenerationExecutionMode::Inline,
@@ -192,6 +198,7 @@ pub fn build_router_with_external_execution(
         admission_store,
         settlement_store,
         input_blob_store,
+        provider_readiness_store,
     } = components;
     if settlement_store.artifact_storage_identity() != input_blob_store.storage_identity() {
         return Err(ImageGatewayError::config(
@@ -206,6 +213,7 @@ pub fn build_router_with_external_execution(
             admission_store,
             settlement_store,
             input_blob_store,
+            provider_readiness_store,
         },
         None,
         GenerationExecutionMode::External,
@@ -231,6 +239,7 @@ fn build_router_with_execution_mode(
         admission_store,
         settlement_store,
         input_blob_store,
+        provider_readiness_store,
     } = stores;
     let scheduler = Arc::new(TenantJobScheduler::new(
         config.max_concurrent_jobs,
@@ -255,6 +264,7 @@ fn build_router_with_execution_mode(
         generation_worker,
         settlement_store,
         input_blob_store,
+        provider_readiness_store,
         scheduler,
         upload_scheduler,
         worker_id: format!("gateway-{}", uuid::Uuid::new_v4().simple()),
@@ -265,6 +275,7 @@ fn build_router_with_execution_mode(
         .route("/docs", get(scalar_docs))
         .route("/openapi.json", get(openapi))
         .route("/healthz", get(healthz))
+        .route("/readyz", get(readyz))
         .route("/v1/models", get(models))
         .route("/v1/images/generations", post(generations))
         .route("/v1/images/edits", post(edits))

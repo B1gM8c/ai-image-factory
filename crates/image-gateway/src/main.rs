@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use gpt_image_2_gateway::{
     ApiKeyKeyring, AppConfig, ExternalImageGatewayComponents, ImageGatewayError,
-    PostgresApiKeyStore, PostgresUsageStore,
+    PostgresApiKeyStore, PostgresProviderTaskStore, PostgresUsageStore,
     admission::PostgresAdmissionStore,
     artifacts::{FilesystemArtifactBlobStore, artifact_root_from_env},
     build_router_with_external_execution,
@@ -31,6 +31,7 @@ async fn main() -> Result<(), ImageGatewayError> {
     let usage_store = Arc::new(PostgresUsageStore::new(pool.clone()));
     let api_key_store = Arc::new(PostgresApiKeyStore::new(pool.clone(), api_key_keyring));
     let admission_store = Arc::new(PostgresAdmissionStore::new(pool.clone()));
+    let provider_readiness_store = Arc::new(PostgresProviderTaskStore::new(pool.clone()));
     let settlement_store = Arc::new(PostgresExecutionSettlementStore::new(
         pool,
         artifact_store.clone(),
@@ -45,6 +46,7 @@ async fn main() -> Result<(), ImageGatewayError> {
             admission_store,
             settlement_store,
             input_blob_store: artifact_store,
+            provider_readiness_store,
         },
     )?;
 

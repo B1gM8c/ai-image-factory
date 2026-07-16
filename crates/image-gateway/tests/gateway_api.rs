@@ -182,6 +182,7 @@ fn config() -> AppConfig {
         max_queue_size_per_tenant: 4,
         queue_timeout: Duration::from_millis(100),
         request_timeout: Duration::from_secs(5),
+        readiness_timeout: Duration::from_millis(500),
         max_upload_bytes: 50 * 1024 * 1024,
         proxy: Default::default(),
         codex_home: None,
@@ -432,6 +433,38 @@ async fn get_with_token(
         .unwrap()
         .to_vec();
     (status, headers, bytes)
+}
+
+#[tokio::test]
+async fn liveness_stays_dependency_free_and_in_memory_readiness_is_empty() {
+    let fake = Arc::new(FakeGenerator::default());
+    let (health_status, _, health_bytes) = get(
+        build_router(config(), fake.clone(), usage_store()),
+        "/healthz",
+    )
+    .await;
+    let (ready_status, ready_headers, ready_bytes) =
+        get(build_router(config(), fake, usage_store()), "/readyz").await;
+
+    assert_eq!(health_status, StatusCode::OK);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&health_bytes).unwrap(),
+        json!({"status": "ok"})
+    );
+    assert_eq!(ready_status, StatusCode::OK);
+    assert_eq!(ready_headers[header::CACHE_CONTROL], "no-store");
+    assert_eq!(
+        serde_json::from_slice::<Value>(&ready_bytes).unwrap(),
+        json!({
+            "status": "ready",
+            "provider_profiles": {
+                "configured": 0,
+                "active": 0,
+                "draining": 0,
+                "blocked": 0
+            }
+        })
+    );
 }
 
 #[tokio::test]
@@ -2293,6 +2326,9 @@ async fn openapi_json_documents_images_api() {
     );
     assert!(body["paths"]["/v1/images/generations"]["post"]["responses"]["409"].is_object());
     assert!(body["paths"]["/v1/images/edits"]["post"].is_object());
+    assert!(body["paths"]["/healthz"]["get"].is_object());
+    assert!(body["paths"]["/readyz"]["get"]["responses"]["200"].is_object());
+    assert!(body["paths"]["/readyz"]["get"]["responses"]["503"].is_object());
     assert!(
         body["paths"]["/v1/organization/projects/{project_id}/service_accounts"]["post"]
             .is_object()

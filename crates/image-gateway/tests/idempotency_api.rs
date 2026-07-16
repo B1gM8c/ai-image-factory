@@ -337,6 +337,7 @@ fn config() -> AppConfig {
         max_queue_size_per_tenant: 4,
         queue_timeout: Duration::from_millis(100),
         request_timeout: Duration::from_secs(5),
+        readiness_timeout: Duration::from_millis(500),
         max_upload_bytes: 50 * 1024 * 1024,
         proxy: Default::default(),
         codex_home: None,

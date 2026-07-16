@@ -83,6 +83,18 @@ pub enum ProviderProfileReadinessStatus {
     Blocked,
 }
 
+impl ProviderProfileReadinessStatus {
+    fn parse(value: &str) -> Result<Self, ProviderTaskStoreError> {
+        match value {
+            "configured" => Ok(Self::Configured),
+            "active" => Ok(Self::Active),
+            "draining" => Ok(Self::Draining),
+            "blocked" => Ok(Self::Blocked),
+            _ => Err(ProviderTaskStoreError::Conflict),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ProviderProfileReadiness {
     pub execution_profile_id: Uuid,
@@ -93,6 +105,21 @@ pub struct ProviderProfileReadiness {
     pub active_pollers: i64,
     pub draining_submitters: i64,
     pub draining_pollers: i64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct ProviderProfileReadinessSummary {
+    pub configured: i64,
+    pub active: i64,
+    pub draining: i64,
+    pub blocked: i64,
+}
+
+#[async_trait]
+pub trait ProviderProfileReadinessStore: Send + Sync + 'static {
+    async fn summarize_profile_readiness(
+        &self,
+    ) -> Result<ProviderProfileReadinessSummary, ProviderTaskStoreError>;
 }
 
 #[async_trait]

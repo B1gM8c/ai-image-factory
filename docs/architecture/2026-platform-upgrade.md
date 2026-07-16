@@ -343,7 +343,8 @@ Then replace static data with real API calls for:
 7. Keep `/v1/images/*` as a synchronous facade over the new job service.
 8. Add `/v1/jobs` and artifact storage for async providers.
 9. Add provider account leases, cooldowns, and encrypted credential storage.
-10. Add webhook outbox, audit logs, metrics, `/readyz`, and OpenAPI diffing in CI.
+10. Add webhook outbox, audit logs, metrics, and OpenAPI diffing in CI; retain
+    the bounded `/readyz` delivered in Phase 2AF.
 11. Connect admin-console modules to real gateway APIs.
 12. Add JiMeng/Seedance/Grok adapters behind the registry one provider at a time.
 

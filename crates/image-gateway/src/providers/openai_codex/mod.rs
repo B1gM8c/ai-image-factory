@@ -669,6 +669,7 @@ mod tests {
             max_queue_size_per_tenant: 0,
             queue_timeout: Duration::from_secs(1),
             request_timeout: Duration::from_secs(1),
+            readiness_timeout: Duration::from_millis(500),
             max_upload_bytes: 1024,
             proxy: ProxyConfig {
                 http_proxy: Some("http://proxy.test:8080".to_string()),

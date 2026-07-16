@@ -176,5 +176,5 @@ Phase 2AE composes submit and poll daemons with the lease store:
 4. publish `draining` before graceful shutdown;
 5. withdraw only after all lanes finish.
 
-The remaining gate is to expose a cheap `/readyz` database check plus aggregate
-profile state without leaking account or credential identity.
+Phase 2AF exposes a bounded `/readyz` database check plus aggregate profile
+state without leaking account or credential identity.

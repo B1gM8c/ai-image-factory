@@ -1167,9 +1167,9 @@ async fn assert_expected_schema(pool: &PgPool) -> TestResult {
         migration_versions(pool).await?
             == vec![
                 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22,
-                23, 24, 25, 26, 27, 28, 29,
+                23, 24, 25, 26, 27, 28, 29, 30,
             ],
-        "applied migration versions must be exactly [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29]",
+        "applied migration versions must be exactly [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30]",
     )?;
 
     for (table, column) in REQUIRED_COLUMNS {
@@ -1194,6 +1194,33 @@ async fn assert_expected_schema(pool: &PgPool) -> TestResult {
         .map_err(|error| format!("failed to query index {index}: {error}"))?;
         require(exists, &format!("index {index} must exist"))?;
     }
+
+    let readiness_columns: Vec<String> = sqlx::query_scalar(
+        r#"
+        SELECT column_name::TEXT
+        FROM information_schema.columns
+        WHERE table_schema = current_schema()
+          AND table_name = 'provider_profile_readiness'
+        ORDER BY ordinal_position
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|error| format!("failed to inspect provider readiness view: {error}"))?;
+    require(
+        readiness_columns
+            == [
+                "execution_profile_id",
+                "profile_key",
+                "provider_id",
+                "status",
+                "active_submitters",
+                "active_pollers",
+                "draining_submitters",
+                "draining_pollers",
+            ],
+        "provider readiness view must expose only its fixed projection",
+    )?;
 
     let active_owner_index: (bool, bool, String, String) = sqlx::query_as(
         r#"

@@ -20,20 +20,20 @@ use gpt_image_2_gateway::{
     ProviderCapacityReconciliationStore, ProviderCapacityTerminalState, ProviderExecutionContext,
     ProviderPollDaemon, ProviderPollDaemonConfig, ProviderPollDriver, ProviderPollDriverCall,
     ProviderPollOrchestrator, ProviderPollOrchestratorConfig, ProviderPollRun, ProviderPollStore,
-    ProviderProfileReadinessStatus, ProviderRemoteTask, ProviderRuntimeProfileStore,
-    ProviderRuntimeReadinessStore, ProviderRuntimeRegistration, ProviderRuntimeRole,
-    ProviderRuntimeSupervisor, ProviderRuntimeSupervisorConfig, ProviderRuntimeSupervisorError,
-    ProviderSubmitAcquire, ProviderSubmitFailureKind, ProviderSubmitIntent,
-    ProviderSubmitIntentState, ProviderSubmitIterationCommand, ProviderSubmitOrchestrator,
-    ProviderSubmitOrchestratorError, ProviderSubmitOutcome, ProviderSubmitProjectionError,
-    ProviderSubmitProjector, ProviderSubmitRecoveryFence, ProviderSubmitRecoveryLease,
-    ProviderSubmitRecoveryWork, ProviderSubmitRun, ProviderSubmitService,
-    ProviderSubmitServiceConfig, ProviderSubmitStart, ProviderSubmitWork, ProviderTaskClaimScope,
-    ProviderTaskDeadlineStore, ProviderTaskLease, ProviderTaskObservation,
-    ProviderTaskObservationOutcome, ProviderTaskObservationSource, ProviderTaskState,
-    ProviderTaskStore, ProviderTaskStoreError, RemoteTaskAttach, RemoteTaskSubmitFailure,
-    RemoteTaskSubmitReceipt, RemoteTaskSubmitReservation, StagedProviderArtifact,
-    VerifiedCallbackWakeup,
+    ProviderProfileReadinessStatus, ProviderProfileReadinessStore, ProviderProfileReadinessSummary,
+    ProviderRemoteTask, ProviderRuntimeProfileStore, ProviderRuntimeReadinessStore,
+    ProviderRuntimeRegistration, ProviderRuntimeRole, ProviderRuntimeSupervisor,
+    ProviderRuntimeSupervisorConfig, ProviderRuntimeSupervisorError, ProviderSubmitAcquire,
+    ProviderSubmitFailureKind, ProviderSubmitIntent, ProviderSubmitIntentState,
+    ProviderSubmitIterationCommand, ProviderSubmitOrchestrator, ProviderSubmitOrchestratorError,
+    ProviderSubmitOutcome, ProviderSubmitProjectionError, ProviderSubmitProjector,
+    ProviderSubmitRecoveryFence, ProviderSubmitRecoveryLease, ProviderSubmitRecoveryWork,
+    ProviderSubmitRun, ProviderSubmitService, ProviderSubmitServiceConfig, ProviderSubmitStart,
+    ProviderSubmitWork, ProviderTaskClaimScope, ProviderTaskDeadlineStore, ProviderTaskLease,
+    ProviderTaskObservation, ProviderTaskObservationOutcome, ProviderTaskObservationSource,
+    ProviderTaskState, ProviderTaskStore, ProviderTaskStoreError, RemoteTaskAttach,
+    RemoteTaskSubmitFailure, RemoteTaskSubmitReceipt, RemoteTaskSubmitReservation,
+    StagedProviderArtifact, VerifiedCallbackWakeup,
     admission::WorkLease,
     database::{connect_test_pool_with_search_path, run_migrations},
 };
@@ -384,6 +384,89 @@ async fn runtime_readiness_projects_configured_active_draining_and_withdrawn_sta
             (0, 0, 0, 0),
         )
         .await
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
+async fn runtime_readiness_summary_is_bounded_and_preserves_status_precedence() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let store = PostgresProviderTaskStore::new(database.pool.clone());
+        require_profile_summary(
+            &store,
+            ProviderProfileReadinessSummary {
+                configured: 1,
+                active: 0,
+                draining: 0,
+                blocked: 0,
+            },
+        )
+        .await?;
+
+        let submit = store
+            .register_runtime(
+                &runtime_registration(ProviderRuntimeRole::Submit, "summary-submit"),
+                30_000,
+            )
+            .await
+            .map_err(debug_error)?;
+        let poll = store
+            .register_runtime(
+                &runtime_registration(ProviderRuntimeRole::Poll, "summary-poll"),
+                30_000,
+            )
+            .await
+            .map_err(debug_error)?;
+        require_profile_summary(
+            &store,
+            ProviderProfileReadinessSummary {
+                configured: 0,
+                active: 1,
+                draining: 0,
+                blocked: 0,
+            },
+        )
+        .await?;
+
+        let poll = store
+            .begin_runtime_drain(&poll, 30_000)
+            .await
+            .map_err(debug_error)?;
+        require_profile_summary(
+            &store,
+            ProviderProfileReadinessSummary {
+                configured: 0,
+                active: 0,
+                draining: 1,
+                blocked: 0,
+            },
+        )
+        .await?;
+
+        sqlx::query(
+            "UPDATE provider_execution_profiles SET state = 'disabled' WHERE execution_profile_id = $1",
+        )
+        .bind(PROFILE_ID)
+        .execute(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require_profile_summary(
+            &store,
+            ProviderProfileReadinessSummary {
+                configured: 0,
+                active: 0,
+                draining: 0,
+                blocked: 1,
+            },
+        )
+        .await?;
+
+        store.withdraw_runtime(&poll).await.map_err(debug_error)?;
+        store.withdraw_runtime(&submit).await.map_err(debug_error)
     }
     .await;
     combine(result, database.cleanup().await)
@@ -11060,6 +11143,20 @@ async fn require_profile_status(
                 profile.draining_pollers,
             ) == counts,
         format!("unexpected provider profile readiness: {profile:?}"),
+    )
+}
+
+async fn require_profile_summary(
+    store: &PostgresProviderTaskStore,
+    expected: ProviderProfileReadinessSummary,
+) -> TestResult {
+    let actual = store
+        .summarize_profile_readiness()
+        .await
+        .map_err(debug_error)?;
+    require(
+        actual == expected,
+        format!("unexpected provider profile readiness summary: {actual:?}"),
     )
 }
 
