@@ -1,4 +1,7 @@
-use std::{io::Cursor, sync::Arc};
+use std::{
+    io::{BufRead, BufReader, Cursor, Seek},
+    sync::Arc,
+};
 
 #[cfg(test)]
 use super::{ArtifactBlobStore, MEMORY_BACKEND, memory::InMemoryArtifactBlobStore};
@@ -244,26 +247,47 @@ impl ExecutorArtifactSink for ExecutorArtifactPublisher {
 pub(crate) fn media_type_from_bytes(
     bytes: &[u8],
 ) -> Result<&'static str, ExecutorArtifactPublishError> {
-    let format =
-        image::guess_format(bytes).map_err(|_| ExecutorArtifactPublishError::ArtifactIntegrity)?;
+    media_type_from_reader(Cursor::new(bytes))
+}
+
+pub(super) fn media_type_from_file(
+    file: std::fs::File,
+) -> Result<&'static str, ExecutorArtifactPublishError> {
+    media_type_from_reader(BufReader::new(file))
+}
+
+fn media_type_from_reader<R>(reader: R) -> Result<&'static str, ExecutorArtifactPublishError>
+where
+    R: BufRead + Seek,
+{
+    let mut reader = image::ImageReader::new(reader)
+        .with_guessed_format()
+        .map_err(|_| ExecutorArtifactPublishError::ArtifactIntegrity)?;
+    let format = reader
+        .format()
+        .ok_or(ExecutorArtifactPublishError::ArtifactIntegrity)?;
     let media_type = match format {
         image::ImageFormat::Png => "image/png",
         image::ImageFormat::Jpeg => "image/jpeg",
         image::ImageFormat::WebP => "image/webp",
         _ => return Err(ExecutorArtifactPublishError::ArtifactIntegrity),
     };
-    let reader = image::ImageReader::with_format(Cursor::new(bytes), format);
-    let (width, height) = reader
-        .into_dimensions()
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_DECODED_IMAGE_DIMENSION);
+    limits.max_image_height = Some(MAX_DECODED_IMAGE_DIMENSION);
+    limits.max_alloc = Some(MAX_DECODED_IMAGE_PIXELS * 8);
+    reader.limits(limits);
+    let image = reader
+        .decode()
         .map_err(|_| ExecutorArtifactPublishError::ArtifactIntegrity)?;
+    let width = image.width();
+    let height = image.height();
     if width > MAX_DECODED_IMAGE_DIMENSION
         || height > MAX_DECODED_IMAGE_DIMENSION
         || u64::from(width).saturating_mul(u64::from(height)) > MAX_DECODED_IMAGE_PIXELS
     {
         return Err(ExecutorArtifactPublishError::ArtifactIntegrity);
     }
-    image::load_from_memory_with_format(bytes, format)
-        .map_err(|_| ExecutorArtifactPublishError::ArtifactIntegrity)?;
     Ok(media_type)
 }
 

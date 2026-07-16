@@ -33,6 +33,10 @@ pub use api::{
     build_router_with_external_execution,
 };
 pub use api_keys::{ApiKeyKeyring, ApiKeyStore, InMemoryApiKeyStore, PostgresApiKeyStore};
+pub use artifacts::{
+    FilesystemArtifactBlobStore, FilesystemProviderArtifactStagerFactory,
+    ProviderArtifactStagerConfigurationError,
+};
 pub use config::{AppConfig, GenerationAdmissionContract, ProxyConfig};
 pub use error::ImageGatewayError;
 pub use execution::{

@@ -6,6 +6,10 @@ Status: implemented and verified with unit tests plus real PostgreSQL 18
 integration tests. This phase activates no provider, credential, CLI query
 command, daemon, route, billing behavior, or external call.
 
+Follow-up: Phase 2S has replaced the manifest-only integration stager with a
+real epoch-fenced streaming filesystem implementation. See
+[`2026-phase2s-epoch-staged-provider-artifacts.md`](2026-phase2s-epoch-staged-provider-artifacts.md).
+
 ## Scope
 
 Phase 2R adds the single provider-neutral orchestration boundary for one due

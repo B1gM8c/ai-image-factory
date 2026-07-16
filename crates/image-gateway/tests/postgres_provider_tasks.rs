@@ -2,29 +2,32 @@ use std::{
     env,
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
 
 use gpt_image_2_gateway::{
     ExecutorClaimScope, ExecutorHandoffStore, ExecutorSubmissionLease, ExecutorSubmissionOutcome,
-    ExecutorSubmissionStore, PostgresExecutorSubmissionStore, PostgresProviderTaskStore,
-    ProviderArtifactAuthority, ProviderArtifactStageContext, ProviderArtifactStager,
+    ExecutorSubmissionStore, FilesystemArtifactBlobStore, FilesystemProviderArtifactStagerFactory,
+    PostgresExecutorSubmissionStore, PostgresProviderTaskStore, ProviderArtifactAuthority,
+    ProviderArtifactPublication, ProviderArtifactStageContext, ProviderArtifactStager,
     ProviderArtifactStagerFactory, ProviderCapacityEvidence, ProviderCapacityEvidenceOutcome,
     ProviderCapacityReconciliationState, ProviderCapacityReconciliationStore,
     ProviderCapacityTerminalState, ProviderExecutionContext, ProviderPollOrchestrator,
-    ProviderPollOrchestratorConfig, ProviderPollRun, ProviderSubmitAcquire,
-    ProviderSubmitFailureKind, ProviderSubmitIntent, ProviderSubmitIntentState,
-    ProviderSubmitOrchestrator, ProviderSubmitOrchestratorError, ProviderSubmitOutcome,
-    ProviderSubmitRecoveryFence, ProviderSubmitStart, ProviderSubmitWork, ProviderTaskClaimScope,
-    ProviderTaskDeadlineStore, ProviderTaskObservation, ProviderTaskObservationOutcome,
-    ProviderTaskObservationSource, ProviderTaskState, ProviderTaskStore, ProviderTaskStoreError,
-    RemoteTaskAttach, RemoteTaskSubmitFailure, RemoteTaskSubmitReceipt,
-    RemoteTaskSubmitReservation, StagedProviderArtifact, VerifiedCallbackWakeup,
+    ProviderPollOrchestratorConfig, ProviderPollRun, ProviderPollStore, ProviderRemoteTask,
+    ProviderSubmitAcquire, ProviderSubmitFailureKind, ProviderSubmitIntent,
+    ProviderSubmitIntentState, ProviderSubmitOrchestrator, ProviderSubmitOrchestratorError,
+    ProviderSubmitOutcome, ProviderSubmitRecoveryFence, ProviderSubmitStart, ProviderSubmitWork,
+    ProviderTaskClaimScope, ProviderTaskDeadlineStore, ProviderTaskLease, ProviderTaskObservation,
+    ProviderTaskObservationOutcome, ProviderTaskObservationSource, ProviderTaskState,
+    ProviderTaskStore, ProviderTaskStoreError, RemoteTaskAttach, RemoteTaskSubmitFailure,
+    RemoteTaskSubmitReceipt, RemoteTaskSubmitReservation, StagedProviderArtifact,
+    VerifiedCallbackWakeup,
     admission::WorkLease,
     database::{connect_test_pool_with_search_path, run_migrations},
 };
+use image::{DynamicImage, ImageFormat, Rgba, RgbaImage};
 use image_provider_sdk::{
     ArtifactMetadata, ArtifactSinkError, ArtifactSinkErrorKind, CanonicalCommandPayload,
     DurableArtifactManifest, DurableArtifactRef, EffectCertainty, OutputSlot, PendingOperation,
@@ -84,20 +87,26 @@ async fn provider_poll_orchestrator_materializes_and_atomically_resolves() -> Te
             0,
         )
         .await?;
+        let artifact_root = tempfile::tempdir().map_err(debug_error)?;
+        let artifacts =
+            Arc::new(FilesystemArtifactBlobStore::new(artifact_root.path()).map_err(debug_error)?);
+        let bytes = png_bytes([10, 20, 30, 255]);
         let provider = ScriptedFakeProvider::default();
         provider.push_poll(PollStep::Complete(OutputPlan {
-            chunks: vec![b"provider-".to_vec(), b"artifact".to_vec()],
+            chunks: bytes.chunks(7).map(<[u8]>::to_vec).collect(),
             media_type: "image/png".to_owned(),
             provider_request_id: Some(
                 ProviderRequestId::new("request-poll-orchestrator-operation")
                     .map_err(debug_error)?,
             ),
         }));
-        let stagers = ManifestOnlyPollStagerFactory::default();
+        let stagers =
+            FilesystemProviderArtifactStagerFactory::new(Arc::clone(&artifacts), 1024 * 1024)
+                .map_err(debug_error)?;
         let orchestrator = ProviderPollOrchestrator::new(
             store,
             provider.clone(),
-            stagers.clone(),
+            stagers,
             ProviderPollOrchestratorConfig {
                 scope: claim_scope(),
                 owner: "poll-orchestrator-owner".to_owned(),
@@ -118,8 +127,30 @@ async fn provider_poll_orchestrator_materializes_and_atomically_resolves() -> Te
             format!("poll orchestrator did not resolve artifact_ready: {run:?}"),
         )?;
         require(
-            provider.calls().poll == 1 && stagers.begins.load(Ordering::SeqCst) == 1,
-            "completed poll did not invoke exactly one provider poll and one materializer",
+            provider.calls().poll == 1,
+            "completed poll did not invoke exactly one provider poll",
+        )?;
+        let authority_name = executor.executor_execution_id.simple().to_string();
+        let object_path = artifact_root
+            .path()
+            .join("executor-objects")
+            .join(&authority_name[..2])
+            .join(&authority_name);
+        require(
+            std::fs::read(&object_path).map_err(debug_error)? == bytes,
+            "real poll stager did not publish the exact provider bytes",
+        )?;
+        let staging_path = artifact_root
+            .path()
+            .join("executor-staging")
+            .join(&authority_name[..2])
+            .join(&authority_name);
+        require(
+            std::fs::read_dir(staging_path)
+                .map_err(debug_error)?
+                .next()
+                .is_none(),
+            "real poll stager left a provisional object after success",
         )?;
 
         let projection: (String, String, String, String, i64, i64, i64, i64, i64) = sqlx::query_as(
@@ -169,6 +200,140 @@ async fn provider_poll_orchestrator_materializes_and_atomically_resolves() -> Te
                     1,
                 ),
             format!("poll orchestration did not commit one canonical success: {projection:?}"),
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
+async fn provider_poll_orchestrator_reuses_object_after_pre_authority_crash() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let postgres = PostgresProviderTaskStore::new(database.pool.clone());
+        let executor = seed_attached_remote_task(
+            &database.pool,
+            &postgres,
+            "poll-object-replay-worker",
+            "poll-object-replay",
+            30_000,
+            0,
+        )
+        .await?;
+        let artifact_root = tempfile::tempdir().map_err(debug_error)?;
+        let artifacts =
+            Arc::new(FilesystemArtifactBlobStore::new(artifact_root.path()).map_err(debug_error)?);
+        let bytes = png_bytes([40, 50, 60, 255]);
+        let store = FailFirstArtifactPublishStore::new(postgres);
+
+        let first_provider =
+            completed_poll_provider(&bytes, "request-poll-object-replay-operation")?;
+        let first = ProviderPollOrchestrator::new(
+            store.clone(),
+            first_provider.clone(),
+            FilesystemProviderArtifactStagerFactory::new(Arc::clone(&artifacts), 1024 * 1024)
+                .map_err(debug_error)?,
+            ProviderPollOrchestratorConfig {
+                scope: claim_scope(),
+                owner: "pre-authority-crash".to_owned(),
+                lease_ms: 100,
+                heartbeat_interval: Duration::from_millis(20),
+                max_materializations: 1,
+            },
+        )
+        .map_err(debug_error)?;
+        require(
+            matches!(
+                first.run_once().await,
+                Err(gpt_image_2_gateway::ProviderPollOrchestratorError::Store(
+                    ProviderTaskStoreError::Unavailable
+                ))
+            ),
+            "pre-authority crash fixture did not fail after immutable object publication",
+        )?;
+        let authority_name = executor.executor_execution_id.simple().to_string();
+        let object_path = artifact_root
+            .path()
+            .join("executor-objects")
+            .join(&authority_name[..2])
+            .join(&authority_name);
+        require(
+            std::fs::read(&object_path).map_err(debug_error)? == bytes,
+            "pre-authority crash did not leave the exact immutable object",
+        )?;
+        let before_recovery: (i64, i64) = sqlx::query_as(
+            r#"
+            SELECT
+              (SELECT COUNT(*) FROM executor_artifact_authorities
+               WHERE executor_execution_id = $1),
+              poll_lease_expires_at_ms
+            FROM provider_remote_tasks
+            WHERE executor_execution_id = $1
+            "#,
+        )
+        .bind(executor.executor_execution_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(
+            before_recovery.0 == 0,
+            "failed authority publication unexpectedly committed database authority",
+        )?;
+        sleep_until_database_time(&database.pool, before_recovery.1 + 20).await?;
+
+        let recovery_provider =
+            completed_poll_provider(&bytes, "request-poll-object-replay-operation")?;
+        let recovery = ProviderPollOrchestrator::new(
+            store,
+            recovery_provider.clone(),
+            FilesystemProviderArtifactStagerFactory::new(Arc::clone(&artifacts), 1024 * 1024)
+                .map_err(debug_error)?,
+            ProviderPollOrchestratorConfig {
+                scope: claim_scope(),
+                owner: "post-authority-recovery".to_owned(),
+                lease_ms: 5_000,
+                heartbeat_interval: Duration::from_secs(1),
+                max_materializations: 1,
+            },
+        )
+        .map_err(debug_error)?;
+        let run = recovery.run_once().await.map_err(debug_error)?;
+        require(
+            matches!(
+                run,
+                ProviderPollRun::Observed(ref task)
+                    if task.state == ProviderTaskState::ArtifactReady
+            ),
+            format!("immutable object replay did not converge to artifact_ready: {run:?}"),
+        )?;
+        require(
+            first_provider.calls().poll == 1 && recovery_provider.calls().poll == 1,
+            "crash replay did not perform exactly one poll per lease epoch",
+        )?;
+        let after_recovery: (String, i64, i64) = sqlx::query_as(
+            r#"
+            SELECT task.state,
+              (SELECT COUNT(*) FROM executor_artifact_authorities
+               WHERE executor_execution_id = $1),
+              (SELECT COUNT(*) FROM executor_result_manifests
+               WHERE executor_execution_id = $1)
+            FROM provider_remote_tasks task
+            WHERE task.executor_execution_id = $1
+            "#,
+        )
+        .bind(executor.executor_execution_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(
+            after_recovery == ("artifact_ready".to_owned(), 1, 1),
+            format!("immutable object replay did not commit exactly once: {after_recovery:?}"),
+        )?;
+        require(
+            std::fs::read(object_path).map_err(debug_error)? == bytes,
+            "byte-stable recovery changed the immutable object",
         )
     }
     .await;
@@ -7667,6 +7832,61 @@ fn artifact_authority(
     .ok_or_else(|| "valid provider artifact authority was rejected".to_string())
 }
 
+#[derive(Clone)]
+struct FailFirstArtifactPublishStore {
+    inner: PostgresProviderTaskStore,
+    fail_publish: Arc<AtomicBool>,
+}
+
+impl FailFirstArtifactPublishStore {
+    fn new(inner: PostgresProviderTaskStore) -> Self {
+        Self {
+            inner,
+            fail_publish: Arc::new(AtomicBool::new(true)),
+        }
+    }
+}
+
+impl ProviderPollStore for FailFirstArtifactPublishStore {
+    async fn claim_poll(
+        &self,
+        scope: &ProviderTaskClaimScope,
+        owner: &str,
+        lease_ms: i64,
+    ) -> Result<Option<ProviderTaskLease>, ProviderTaskStoreError> {
+        self.inner.claim_due(scope, owner, lease_ms).await
+    }
+
+    async fn heartbeat_poll(
+        &self,
+        lease: &ProviderTaskLease,
+        lease_ms: i64,
+    ) -> Result<ProviderTaskLease, ProviderTaskStoreError> {
+        self.inner.heartbeat(lease, lease_ms).await
+    }
+
+    async fn publish_poll_artifact(
+        &self,
+        lease: &ProviderTaskLease,
+        authority: &ProviderArtifactAuthority,
+    ) -> Result<ProviderArtifactPublication, ProviderTaskStoreError> {
+        if self.fail_publish.swap(false, Ordering::SeqCst) {
+            return Err(ProviderTaskStoreError::Unavailable);
+        }
+        self.inner
+            .publish_artifact_authority(lease, authority)
+            .await
+    }
+
+    async fn record_poll_observation(
+        &self,
+        lease: &ProviderTaskLease,
+        observation: &ProviderTaskObservation,
+    ) -> Result<ProviderRemoteTask, ProviderTaskStoreError> {
+        self.inner.record_observation(lease, observation).await
+    }
+}
+
 #[derive(Clone, Default)]
 struct ManifestOnlyPollStagerFactory {
     begins: Arc<AtomicUsize>,
@@ -7749,6 +7969,30 @@ fn poll_artifact_authority(
 
 fn poll_sink_error(code: &'static str) -> ArtifactSinkError {
     ArtifactSinkError::new(ArtifactSinkErrorKind::InvalidArtifact, code)
+}
+
+fn completed_poll_provider(
+    bytes: &[u8],
+    provider_request_id: &str,
+) -> TestResult<ScriptedFakeProvider> {
+    let provider = ScriptedFakeProvider::default();
+    provider.push_poll(PollStep::Complete(OutputPlan {
+        chunks: bytes.chunks(7).map(<[u8]>::to_vec).collect(),
+        media_type: "image/png".to_owned(),
+        provider_request_id: Some(
+            ProviderRequestId::new(provider_request_id).map_err(debug_error)?,
+        ),
+    }));
+    Ok(provider)
+}
+
+fn png_bytes(pixel: [u8; 4]) -> Vec<u8> {
+    let image = RgbaImage::from_pixel(1, 1, Rgba(pixel));
+    let mut cursor = std::io::Cursor::new(Vec::new());
+    DynamicImage::ImageRgba8(image)
+        .write_to(&mut cursor, ImageFormat::Png)
+        .unwrap();
+    cursor.into_inner()
 }
 
 async fn seed_deadline_quarantine(

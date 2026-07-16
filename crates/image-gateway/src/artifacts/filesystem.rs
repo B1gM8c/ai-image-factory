@@ -6,11 +6,15 @@ use std::{
     sync::Arc,
 };
 
+#[cfg(target_os = "macos")]
+use std::os::fd::AsRawFd;
+
 use async_trait::async_trait;
 use rustix::{
-    fs::{self as rfs, AtFlags, FileType, Mode, OFlags, RenameFlags},
+    fs::{self as rfs, AtFlags, Dir, FileType, Mode, OFlags, RenameFlags},
     io::Errno,
 };
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use uuid::Uuid;
 
@@ -27,11 +31,12 @@ use crate::{
     },
 };
 
-const MAX_ARTIFACT_BYTES: u64 = 256 * 1024 * 1024;
+pub(super) const MAX_ARTIFACT_BYTES: u64 = 256 * 1024 * 1024;
 
 pub struct FilesystemArtifactBlobStore {
     root: PathBuf,
     executor_objects: Arc<fs::File>,
+    executor_staging: Arc<fs::File>,
 }
 
 struct PendingArtifact {
@@ -39,6 +44,20 @@ struct PendingArtifact {
     object: PathBuf,
     linked: bool,
     committed: bool,
+}
+
+pub(super) struct FilesystemExecutorArtifactStage {
+    staging_directory: Arc<fs::File>,
+    temporary_name: String,
+    executor_objects: Arc<fs::File>,
+    artifact_id: Uuid,
+    file: Option<tokio::fs::File>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ExecutorArtifactStageError {
+    Unavailable,
+    Integrity,
 }
 
 impl PendingArtifact {
@@ -75,11 +94,86 @@ impl Drop for PendingArtifact {
     }
 }
 
+impl FilesystemExecutorArtifactStage {
+    pub(super) async fn write_chunk(
+        &mut self,
+        chunk: &[u8],
+    ) -> Result<(), ExecutorArtifactStageError> {
+        let file = self
+            .file
+            .as_mut()
+            .ok_or(ExecutorArtifactStageError::Unavailable)?;
+        file.write_all(chunk)
+            .await
+            .map_err(|_| ExecutorArtifactStageError::Unavailable)
+    }
+
+    pub(super) async fn finish_writes(&mut self) -> Result<(), ExecutorArtifactStageError> {
+        let Some(mut file) = self.file.take() else {
+            return Err(ExecutorArtifactStageError::Unavailable);
+        };
+        file.flush()
+            .await
+            .map_err(|_| ExecutorArtifactStageError::Unavailable)?;
+        let file = file.into_std().await;
+        tokio::task::spawn_blocking(move || sync_artifact_file(&file))
+            .await
+            .map_err(|_| ExecutorArtifactStageError::Unavailable)?
+            .map_err(|_| ExecutorArtifactStageError::Unavailable)
+    }
+
+    pub(super) async fn open_reader(
+        &self,
+        expected_size: u64,
+    ) -> Result<fs::File, ExecutorArtifactStageError> {
+        let directory = Arc::clone(&self.staging_directory);
+        let temporary_name = self.temporary_name.clone();
+        tokio::task::spawn_blocking(move || {
+            open_staged_executor_file(&directory, &temporary_name, expected_size)
+        })
+        .await
+        .map_err(|_| ExecutorArtifactStageError::Unavailable)?
+    }
+
+    pub(super) async fn commit(
+        &mut self,
+        expected_sha256: [u8; 32],
+        expected_size: u64,
+    ) -> Result<(), ExecutorArtifactStageError> {
+        if self.file.is_some() {
+            return Err(ExecutorArtifactStageError::Unavailable);
+        }
+        let staging_directory = Arc::clone(&self.staging_directory);
+        let temporary_name = self.temporary_name.clone();
+        let executor_objects = Arc::clone(&self.executor_objects);
+        let artifact_id = self.artifact_id;
+        tokio::task::spawn_blocking(move || {
+            commit_staged_executor_object(
+                &staging_directory,
+                &temporary_name,
+                &executor_objects,
+                artifact_id,
+                expected_sha256,
+                expected_size,
+            )
+        })
+        .await
+        .map_err(|_| ExecutorArtifactStageError::Unavailable)?
+    }
+}
+
+impl Drop for FilesystemExecutorArtifactStage {
+    fn drop(&mut self) {
+        cleanup_executor_temporary(&self.staging_directory, &self.temporary_name);
+    }
+}
+
 impl FilesystemArtifactBlobStore {
     pub fn new(root: impl AsRef<Path>) -> Result<Self, ImageGatewayError> {
         let root = validate_root(root.as_ref())?;
         let objects = root.join("objects");
         let executor_objects = root.join("executor-objects");
+        let executor_staging = root.join("executor-staging");
         let inputs = root.join("inputs");
         prepare_storage_directory(
             &objects,
@@ -92,6 +186,11 @@ impl FilesystemArtifactBlobStore {
             "executor artifact directory must be a directory and must not be a symlink",
         )?;
         prepare_storage_directory(
+            &executor_staging,
+            "executor staging directory is not writable",
+            "executor staging directory must be a directory and must not be a symlink",
+        )?;
+        prepare_storage_directory(
             &inputs,
             "input blob directory is not writable",
             "input blob directory must be a directory and must not be a symlink",
@@ -101,9 +200,13 @@ impl FilesystemArtifactBlobStore {
         let executor_objects = open_private_directory(&executor_objects).map_err(|_| {
             ImageGatewayError::config("executor artifact directory could not be opened safely")
         })?;
+        let executor_staging = open_private_directory(&executor_staging).map_err(|_| {
+            ImageGatewayError::config("executor staging directory could not be opened safely")
+        })?;
         Ok(Self {
             root,
             executor_objects: Arc::new(executor_objects),
+            executor_staging: Arc::new(executor_staging),
         })
     }
 
@@ -320,21 +423,53 @@ impl FilesystemArtifactBlobStore {
             .map_err(|_| ArtifactWriteError::Unavailable)?
     }
 
-    pub(crate) fn executor_storage_namespace(&self) -> Result<String, ArtifactReadError> {
-        let current = open_private_directory(&self.root.join("executor-objects"))
-            .map_err(|_| ArtifactReadError::Integrity)?;
-        let opened_stat = rfs::fstat(self.executor_objects.as_ref())
-            .map_err(|_| ArtifactReadError::Unavailable)?;
-        let current_stat = rfs::fstat(&current).map_err(|_| ArtifactReadError::Unavailable)?;
-        if opened_stat.st_dev != current_stat.st_dev || opened_stat.st_ino != current_stat.st_ino {
-            return Err(ArtifactReadError::Integrity);
+    pub(super) async fn begin_executor_artifact_stage(
+        &self,
+        artifact_id: Uuid,
+        lease_epoch: i64,
+    ) -> Result<FilesystemExecutorArtifactStage, ExecutorArtifactStageError> {
+        if artifact_id.is_nil() || lease_epoch <= 0 {
+            return Err(ExecutorArtifactStageError::Integrity);
         }
+        self.executor_storage_namespace()
+            .map_err(map_stage_read_error)?;
+        self.validate_executor_staging_namespace()
+            .map_err(map_stage_read_error)?;
+        let executor_staging = Arc::clone(&self.executor_staging);
+        let executor_objects = Arc::clone(&self.executor_objects);
+        let (staging_directory, temporary_name, file) = tokio::task::spawn_blocking(move || {
+            begin_executor_artifact_stage_at(&executor_staging, artifact_id, lease_epoch)
+        })
+        .await
+        .map_err(|_| ExecutorArtifactStageError::Unavailable)??;
+        Ok(FilesystemExecutorArtifactStage {
+            staging_directory: Arc::new(staging_directory),
+            temporary_name,
+            executor_objects,
+            artifact_id,
+            file: Some(tokio::fs::File::from_std(file)),
+        })
+    }
+
+    pub(crate) fn executor_storage_namespace(&self) -> Result<String, ArtifactReadError> {
+        let opened_stat = validate_bound_private_directory(
+            &self.root.join("executor-objects"),
+            self.executor_objects.as_ref(),
+        )?;
         Ok(format!(
             "{FILESYSTEM_BACKEND}:{}#executor={}:{}",
             self.root.display(),
             opened_stat.st_dev,
             opened_stat.st_ino
         ))
+    }
+
+    fn validate_executor_staging_namespace(&self) -> Result<(), ArtifactReadError> {
+        validate_bound_private_directory(
+            &self.root.join("executor-staging"),
+            self.executor_staging.as_ref(),
+        )
+        .map(|_| ())
     }
 }
 
@@ -360,7 +495,7 @@ fn put_executor_object_at(
         return Err(ArtifactWriteError::Unavailable);
     }
     let mut file = fs::File::from(fd);
-    if file.write_all(bytes).is_err() || rfs::fsync(&file).is_err() {
+    if file.write_all(bytes).is_err() || sync_artifact_file(&file).is_err() {
         drop(file);
         cleanup_executor_temporary(&shard, &temporary);
         return Err(ArtifactWriteError::Unavailable);
@@ -394,6 +529,172 @@ fn put_executor_object_at(
         Err(_) => {
             cleanup_executor_temporary(&shard, &temporary);
             Err(ArtifactWriteError::Unavailable)
+        }
+    }
+}
+
+fn begin_executor_artifact_stage_at(
+    staging_root: &fs::File,
+    artifact_id: Uuid,
+    lease_epoch: i64,
+) -> Result<(fs::File, String, fs::File), ExecutorArtifactStageError> {
+    let (shard_name, execution_name) = executor_object_names(artifact_id);
+    let shard = open_or_create_private_directory_at(staging_root, &shard_name)?;
+    let execution = open_or_create_private_directory_at(&shard, &execution_name)?;
+    cleanup_abandoned_executor_stages(&execution, lease_epoch)?;
+    let temporary_name = format!(".epoch-{lease_epoch}-{}", Uuid::new_v4().simple());
+    let fd = rfs::openat(
+        &execution,
+        temporary_name.as_str(),
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::RUSR | Mode::WUSR,
+    )
+    .map_err(|_| ExecutorArtifactStageError::Unavailable)?;
+    if rfs::fchmod(&fd, Mode::RUSR | Mode::WUSR).is_err() {
+        drop(fd);
+        cleanup_executor_temporary(&execution, &temporary_name);
+        return Err(ExecutorArtifactStageError::Unavailable);
+    }
+    Ok((execution, temporary_name, fs::File::from(fd)))
+}
+
+fn open_or_create_private_directory_at(
+    parent: &fs::File,
+    name: &str,
+) -> Result<fs::File, ExecutorArtifactStageError> {
+    match rfs::mkdirat(parent, name, Mode::RWXU) {
+        Ok(()) | Err(Errno::EXIST) => {}
+        Err(_) => return Err(ExecutorArtifactStageError::Unavailable),
+    }
+    rfs::fsync(parent).map_err(|_| ExecutorArtifactStageError::Unavailable)?;
+    let fd = rfs::openat(
+        parent,
+        name,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|error| match error {
+        Errno::LOOP | Errno::NOTDIR => ExecutorArtifactStageError::Integrity,
+        _ => ExecutorArtifactStageError::Unavailable,
+    })?;
+    let directory = fs::File::from(fd);
+    validate_private_directory_fd(&directory).map_err(|_| ExecutorArtifactStageError::Integrity)?;
+    Ok(directory)
+}
+
+fn cleanup_abandoned_executor_stages(
+    directory: &fs::File,
+    current_epoch: i64,
+) -> Result<(), ExecutorArtifactStageError> {
+    let mut entries =
+        Dir::read_from(directory).map_err(|_| ExecutorArtifactStageError::Unavailable)?;
+    let mut removed = false;
+    while let Some(entry) = entries.read() {
+        let entry = entry.map_err(|_| ExecutorArtifactStageError::Unavailable)?;
+        let name = entry.file_name();
+        let bytes = name.to_bytes();
+        if matches!(bytes, b"." | b"..") {
+            continue;
+        }
+        let Some(epoch) = executor_stage_epoch(bytes) else {
+            return Err(ExecutorArtifactStageError::Integrity);
+        };
+        if epoch > current_epoch {
+            return Err(ExecutorArtifactStageError::Integrity);
+        }
+        let stat = rfs::statat(directory, name, AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(|_| ExecutorArtifactStageError::Unavailable)?;
+        if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
+            return Err(ExecutorArtifactStageError::Integrity);
+        }
+        rfs::unlinkat(directory, name, AtFlags::empty())
+            .map_err(|_| ExecutorArtifactStageError::Unavailable)?;
+        removed = true;
+    }
+    if removed {
+        rfs::fsync(directory).map_err(|_| ExecutorArtifactStageError::Unavailable)?;
+    }
+    Ok(())
+}
+
+fn executor_stage_epoch(name: &[u8]) -> Option<i64> {
+    let epoch = name.strip_prefix(b".epoch-")?;
+    let separator = epoch.iter().position(|byte| *byte == b'-')?;
+    let (epoch, nonce) = epoch.split_at(separator);
+    if epoch.is_empty()
+        || nonce.len() != 33
+        || nonce[0] != b'-'
+        || !epoch.iter().all(u8::is_ascii_digit)
+        || !nonce[1..].iter().all(u8::is_ascii_hexdigit)
+    {
+        return None;
+    }
+    std::str::from_utf8(epoch).ok()?.parse().ok()
+}
+
+fn open_staged_executor_file(
+    directory: &fs::File,
+    temporary_name: &str,
+    expected_size: u64,
+) -> Result<fs::File, ExecutorArtifactStageError> {
+    if expected_size == 0 || expected_size > MAX_ARTIFACT_BYTES {
+        return Err(ExecutorArtifactStageError::Integrity);
+    }
+    let fd = rfs::openat(
+        directory,
+        temporary_name,
+        OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|error| match error {
+        Errno::NOENT | Errno::LOOP => ExecutorArtifactStageError::Integrity,
+        _ => ExecutorArtifactStageError::Unavailable,
+    })?;
+    let file = fs::File::from(fd);
+    validate_private_regular_file(&file, expected_size).map_err(map_stage_read_error)?;
+    Ok(file)
+}
+
+fn commit_staged_executor_object(
+    staging_directory: &fs::File,
+    temporary_name: &str,
+    executor_objects: &fs::File,
+    artifact_id: Uuid,
+    expected_sha256: [u8; 32],
+    expected_size: u64,
+) -> Result<(), ExecutorArtifactStageError> {
+    let (shard_name, object_name) = executor_object_names(artifact_id);
+    let object_shard = open_or_create_executor_shard(executor_objects, &shard_name)
+        .map_err(|_| ExecutorArtifactStageError::Unavailable)?;
+    match rfs::renameat_with(
+        staging_directory,
+        temporary_name,
+        &object_shard,
+        object_name.as_str(),
+        RenameFlags::NOREPLACE,
+    ) {
+        Ok(()) => {
+            rfs::fsync(&object_shard).map_err(|_| ExecutorArtifactStageError::Unavailable)?;
+            rfs::fsync(staging_directory).map_err(|_| ExecutorArtifactStageError::Unavailable)
+        }
+        Err(Errno::EXIST) => {
+            let matches = executor_object_matches_from_shard(
+                &object_shard,
+                &object_name,
+                expected_sha256,
+                expected_size,
+            )
+            .map_err(map_stage_read_error)?;
+            cleanup_executor_temporary(staging_directory, temporary_name);
+            if matches {
+                Ok(())
+            } else {
+                Err(ExecutorArtifactStageError::Integrity)
+            }
+        }
+        Err(_) => {
+            cleanup_executor_temporary(staging_directory, temporary_name);
+            Err(ExecutorArtifactStageError::Unavailable)
         }
     }
 }
@@ -444,6 +745,51 @@ fn read_executor_object_from_shard(
         return Err(ArtifactReadError::Integrity);
     }
     Ok(bytes)
+}
+
+fn executor_object_matches_from_shard(
+    shard: &fs::File,
+    object_name: &str,
+    expected_sha256: [u8; 32],
+    expected_size: u64,
+) -> Result<bool, ArtifactReadError> {
+    if expected_size == 0 || expected_size > MAX_ARTIFACT_BYTES {
+        return Err(ArtifactReadError::Integrity);
+    }
+    let fd = rfs::openat(
+        shard,
+        object_name,
+        OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|error| match error {
+        Errno::NOENT | Errno::LOOP => ArtifactReadError::Integrity,
+        _ => ArtifactReadError::Unavailable,
+    })?;
+    let mut file = fs::File::from(fd);
+    validate_private_regular_file(&file, expected_size)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut byte_size = 0_u64;
+    loop {
+        let count = file
+            .read(&mut buffer)
+            .map_err(|_| ArtifactReadError::Unavailable)?;
+        if count == 0 {
+            break;
+        }
+        byte_size = byte_size
+            .checked_add(count as u64)
+            .ok_or(ArtifactReadError::Integrity)?;
+        if byte_size > expected_size {
+            return Ok(false);
+        }
+        hasher.update(&buffer[..count]);
+    }
+    let final_stat = rfs::fstat(&file).map_err(|_| ArtifactReadError::Unavailable)?;
+    Ok(byte_size == expected_size
+        && final_stat.st_size == i64::try_from(expected_size).unwrap_or(-1)
+        && <[u8; 32]>::from(hasher.finalize()) == expected_sha256)
 }
 
 fn delete_executor_object_at(root: &fs::File, artifact_id: Uuid) -> Result<(), ArtifactWriteError> {
@@ -500,6 +846,19 @@ fn open_private_directory(path: &Path) -> std::io::Result<fs::File> {
     Ok(file)
 }
 
+fn validate_bound_private_directory(
+    path: &Path,
+    opened: &fs::File,
+) -> Result<rfs::Stat, ArtifactReadError> {
+    let current = open_private_directory(path).map_err(|_| ArtifactReadError::Integrity)?;
+    let opened_stat = rfs::fstat(opened).map_err(|_| ArtifactReadError::Unavailable)?;
+    let current_stat = rfs::fstat(&current).map_err(|_| ArtifactReadError::Unavailable)?;
+    if opened_stat.st_dev != current_stat.st_dev || opened_stat.st_ino != current_stat.st_ino {
+        return Err(ArtifactReadError::Integrity);
+    }
+    Ok(opened_stat)
+}
+
 fn validate_private_directory_fd(directory: &impl AsFd) -> std::io::Result<()> {
     let stat = rfs::fstat(directory).map_err(std::io::Error::from)?;
     if FileType::from_raw_mode(stat.st_mode) != FileType::Directory
@@ -538,6 +897,13 @@ fn validate_private_regular_file(
 fn cleanup_executor_temporary(shard: &fs::File, temporary: &str) {
     let _ = rfs::unlinkat(shard, temporary, AtFlags::empty());
     let _ = rfs::fsync(shard);
+}
+
+fn map_stage_read_error(error: ArtifactReadError) -> ExecutorArtifactStageError {
+    match error {
+        ArtifactReadError::Unavailable => ExecutorArtifactStageError::Unavailable,
+        ArtifactReadError::Integrity => ExecutorArtifactStageError::Integrity,
+    }
 }
 
 fn executor_object_names(artifact_id: Uuid) -> (String, String) {
@@ -739,6 +1105,21 @@ fn sync_directory(path: &Path) -> std::io::Result<()> {
     fs::File::open(path)?.sync_all()
 }
 
+fn sync_artifact_file(file: &fs::File) -> std::io::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: fcntl only reads the valid file descriptor and F_FULLFSYNC takes no pointer.
+        if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_FULLFSYNC) } == 0 {
+            return Ok(());
+        }
+        Err(std::io::Error::last_os_error())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        file.sync_all()
+    }
+}
+
 async fn sync_directory_async(path: PathBuf) -> std::io::Result<()> {
     tokio::task::spawn_blocking(move || sync_directory(&path))
         .await
@@ -842,5 +1223,23 @@ mod tests {
         let relative = Path::new(&shard_name).join(object_name);
         assert!(!opened.join(&relative).exists());
         assert!(!replacement.join(relative).exists());
+    }
+
+    #[tokio::test]
+    async fn executor_staging_namespace_replacement_fails_closed() {
+        let root = tempfile::tempdir().unwrap();
+        let store = FilesystemArtifactBlobStore::new(root.path()).unwrap();
+        let opened = root.path().join("staging-opened");
+        fs::rename(root.path().join("executor-staging"), &opened).unwrap();
+        let replacement = root.path().join("executor-staging");
+        fs::create_dir(&replacement).unwrap();
+        set_private_directory_permissions(&replacement).unwrap();
+
+        assert!(matches!(
+            store.begin_executor_artifact_stage(Uuid::new_v4(), 1).await,
+            Err(ExecutorArtifactStageError::Integrity)
+        ));
+        assert!(fs::read_dir(opened).unwrap().next().is_none());
+        assert!(fs::read_dir(replacement).unwrap().next().is_none());
     }
 }

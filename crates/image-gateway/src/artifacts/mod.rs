@@ -8,11 +8,15 @@ use crate::{ImageGatewayError, generator::GeneratedImage, usage::UsageSnapshot};
 mod executor;
 mod filesystem;
 mod memory;
+mod provider;
 
 pub(crate) use executor::media_type_from_bytes;
 pub use executor::{ExecutorArtifactPublishError, ExecutorArtifactPublisher};
 pub use filesystem::FilesystemArtifactBlobStore;
 pub use memory::InMemoryArtifactBlobStore;
+pub use provider::{
+    FilesystemProviderArtifactStagerFactory, ProviderArtifactStagerConfigurationError,
+};
 
 pub const FILESYSTEM_BACKEND: &str = "filesystem-v1";
 pub const MEMORY_BACKEND: &str = "memory-v1";
