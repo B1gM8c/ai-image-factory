@@ -28,7 +28,8 @@ prepare immutable process request and optional stdin
   -> gate revalidates request, release, executable digest, and working directory
   -> gate fsyncs a create-once pre-exec marker after all validation
   -> gate execs the CLI in the same PID and process group
-  -> supervisor enforces the absolute provider deadline and wall timeout
+  -> supervisor hard-kills at the absolute provider deadline or gracefully
+     terminates on the shorter wall timeout
   -> supervisor drains bounded stdout/stderr
   -> supervisor fsyncs one self-digested terminal record
 ```
@@ -126,6 +127,13 @@ capture pipes, the supervisor terminates the residual group before joining
 capture readers and records `ResidualProcessGroup`. This prevents a background
 descendant from blocking terminal publication indefinitely.
 
+The absolute provider deadline is a hard external-effect boundary: the
+supervisor sends `SIGKILL` to the process group immediately and boundedly reaps
+the child. The CLI wall timeout remains an operational timeout and uses
+`SIGTERM`, the configured bounded grace, then `SIGKILL`. A termination grace
+therefore cannot extend provider execution beyond the database-bound absolute
+deadline.
+
 ## Containment Limits
 
 The current portable implementation uses a dedicated process group and
@@ -174,6 +182,8 @@ Real binary/process tests prove:
   group, which recovery kills without a relaunch;
 - an expired absolute provider deadline rejects release and terminates the gate
   without provider execution;
+- a released, running CLI is hard-killed at the absolute provider deadline
+  without consuming its deliberately configured five-second termination grace;
 - a released CLI exceeding its wall timeout is killed and recorded as
   `TimedOut` with `exec_started = true`;
 - a CLI leader that exits while leaving a background process in its group is

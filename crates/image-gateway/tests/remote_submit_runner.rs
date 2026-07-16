@@ -5,7 +5,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::Stdio,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use gpt_image_2_gateway::{
@@ -148,6 +148,33 @@ async fn released_cli_timeout_is_bounded_and_records_that_exec_started() {
 }
 
 #[tokio::test]
+async fn absolute_deadline_hard_kills_a_running_cli_without_termination_grace() {
+    let fixture = Fixture::new(Duration::from_secs(2), "absolute_deadline").unwrap();
+    let mut runner = fixture.spawn_runner().unwrap();
+    let ready = fixture.wait_ready().await.unwrap();
+    let started = Instant::now();
+    fixture
+        .submission
+        .release(&fixture.binding, &ready)
+        .unwrap();
+    fixture.wait_for_side_effect().await.unwrap();
+    let terminal = fixture.wait_terminal().await.unwrap();
+    let status = runner.wait().await.unwrap();
+
+    assert!(status.success());
+    assert!(terminal.released());
+    assert!(terminal.exec_started());
+    assert_eq!(
+        terminal.outcome(),
+        &GatedCliProcessOutcome::AbsoluteDeadlineElapsed
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "absolute deadline incorrectly waited for the five-second termination grace"
+    );
+}
+
+#[tokio::test]
 async fn residual_process_group_is_killed_before_terminal_publication() {
     let fixture = Fixture::new(Duration::from_secs(10), "residual").unwrap();
     let mut runner = fixture.spawn_runner().unwrap();
@@ -260,6 +287,7 @@ impl Fixture {
                 "printf invoked > \"$1\"; printf '{\"submit_id\":\"task-1\"}'; printf provider-stderr >&2"
             }
             "timeout" => "printf invoked > \"$1\"; /bin/sleep 30",
+            "absolute_deadline" => "printf invoked > \"$1\"; /bin/sleep 30",
             "orphan" => "printf invoked > \"$1\"; /bin/sleep 30; printf completed > \"$2\"",
             "residual" => "printf invoked > \"$1\"; /bin/sleep 30 &",
             "large_output" => "i=0; while [ \"$i\" -lt 70000 ]; do printf x; i=$((i + 1)); done",
@@ -280,11 +308,15 @@ impl Fixture {
             Vec::new(),
             match mode {
                 "timeout" => Duration::from_millis(250),
-                "orphan" | "residual" => Duration::from_secs(30),
+                "absolute_deadline" | "orphan" | "residual" => Duration::from_secs(30),
                 "large_output" => Duration::from_secs(10),
                 _ => Duration::from_secs(2),
             },
-            Duration::from_millis(100),
+            if mode == "absolute_deadline" {
+                Duration::from_secs(5)
+            } else {
+                Duration::from_millis(100)
+            },
         )
         .map_err(|error| error.to_string())?;
         submission

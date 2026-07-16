@@ -100,21 +100,13 @@ pub fn run_remote_submit_runner(
                 (Some(release), true, outcome)
             } else {
                 drop(release_write);
-                terminate_owned_child(
-                    &child_identity,
-                    &mut child,
-                    Duration::from_millis(request.termination_grace_ms),
-                )?;
+                kill_owned_child(&child_identity, &mut child)?;
                 (Some(release), false, DiskOutcome::AbsoluteDeadlineElapsed)
             }
         }
         ReleaseWait::AbsoluteDeadlineElapsed => {
             drop(release_write);
-            terminate_owned_child(
-                &child_identity,
-                &mut child,
-                Duration::from_millis(request.termination_grace_ms),
-            )?;
+            kill_owned_child(&child_identity, &mut child)?;
             (None, false, DiskOutcome::AbsoluteDeadlineElapsed)
         }
         ReleaseWait::ChildExited => {
@@ -362,7 +354,7 @@ fn wait_for_command(
         if unix_time_ms()? >= request.absolute_deadline_unix_ms
             || Instant::now() >= absolute_deadline
         {
-            terminate_owned_child(child_identity, child, termination_grace)?;
+            kill_owned_child(child_identity, child)?;
             return Ok(DiskOutcome::AbsoluteDeadlineElapsed);
         }
         if Instant::now() >= wall_deadline {
@@ -390,6 +382,13 @@ fn terminate_owned_child(
         }
         thread::sleep(PROCESS_POLL_INTERVAL);
     }
+    kill_owned_child(identity, child)
+}
+
+fn kill_owned_child(
+    identity: &DiskChildIdentity,
+    child: &mut Child,
+) -> Result<(), GatedCliProcessError> {
     signal_process_group(identity.process_group_id, libc::SIGKILL)?;
     let reap_deadline = deadline_after(Duration::from_secs(1))?;
     while Instant::now() < reap_deadline {
