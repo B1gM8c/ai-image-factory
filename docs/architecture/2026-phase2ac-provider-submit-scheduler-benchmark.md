@@ -155,6 +155,12 @@ storage cost for large policies, disable/update fencing, and better measured
 tail latency than the single counter. Until that evidence exists, the current
 counter remains authoritative.
 
+Phase 2AG later found and fixed a separate Read Committed snapshot race in the
+counter's heartbeat-only constraint path. The shared counter remains
+authoritative and remains the measured fresh-claim contention point:
+
+- [`2026-phase2ag-capacity-counter-snapshot.md`](2026-phase2ag-capacity-counter-snapshot.md)
+
 ## Operation
 
 Example:

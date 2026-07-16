@@ -18,10 +18,18 @@ async fn main() -> BenchResult {
     let config = BenchConfig::from_env()?;
     let database = BenchDatabase::create(&config).await?;
     let benchmark = async {
-        seed_prepared_queue(&database.pool, &config).await?;
-        seed_recovery_queue(&database.pool, &config).await?;
-        analyze_scheduler_tables(&database.pool).await?;
-        run_workload(&database.pool, &config).await
+        seed_prepared_queue(&database.pool, &config)
+            .await
+            .map_err(|error| stage_error("prepared queue seed", error))?;
+        seed_recovery_queue(&database.pool, &config)
+            .await
+            .map_err(|error| stage_error("recovery queue seed", error))?;
+        analyze_scheduler_tables(&database.pool)
+            .await
+            .map_err(|error| stage_error("scheduler table analyze", error))?;
+        run_workload(&database.pool, &config)
+            .await
+            .map_err(|error| stage_error("measured workload", error))
     }
     .await;
     let cleanup = database.cleanup().await;
@@ -43,4 +51,8 @@ async fn main() -> BenchResult {
     }
     println!("{json}");
     Ok(())
+}
+
+fn stage_error(stage: &str, error: Box<dyn Error + Send + Sync>) -> Box<dyn Error + Send + Sync> {
+    io::Error::other(format!("{stage} failed: {error}")).into()
 }

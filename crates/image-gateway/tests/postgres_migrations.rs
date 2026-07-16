@@ -1167,9 +1167,9 @@ async fn assert_expected_schema(pool: &PgPool) -> TestResult {
         migration_versions(pool).await?
             == vec![
                 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22,
-                23, 24, 25, 26, 27, 28, 29, 30,
+                23, 24, 25, 26, 27, 28, 29, 30, 31,
             ],
-        "applied migration versions must be exactly [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30]",
+        "applied migration versions must be exactly [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31]",
     )?;
 
     for (table, column) in REQUIRED_COLUMNS {
@@ -1220,6 +1220,19 @@ async fn assert_expected_schema(pool: &PgPool) -> TestResult {
                 "draining_pollers",
             ],
         "provider readiness view must expose only its fixed projection",
+    )?;
+
+    let capacity_guard: String = sqlx::query_scalar(
+        "SELECT pg_get_functiondef('enforce_executor_capacity_counter_balance()'::regprocedure)",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|error| format!("failed to inspect capacity counter guard: {error}"))?;
+    require(
+        capacity_guard.contains("OLD.state = 'held'")
+            && capacity_guard.contains("NEW.state = 'held'")
+            && capacity_guard.contains("LEFT JOIN executor_capacity_allocations"),
+        "capacity counter guard must skip heartbeat-only updates and compare one snapshot",
     )?;
 
     let active_owner_index: (bool, bool, String, String) = sqlx::query_as(

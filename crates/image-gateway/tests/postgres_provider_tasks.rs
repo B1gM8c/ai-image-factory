@@ -6086,6 +6086,75 @@ async fn deadline_quarantine_migration_accepts_due_active_recovery() -> TestResu
 }
 
 #[tokio::test]
+async fn capacity_heartbeat_skips_policy_scan_without_weakening_counter_guard() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let executor =
+            seed_running_submission(&database.pool, "heartbeat-counter-snapshot").await?;
+        let mut policy_lock = database.pool.begin().await.map_err(debug_error)?;
+        sqlx::query("LOCK TABLE executor_resource_policies IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut *policy_lock)
+            .await
+            .map_err(debug_error)?;
+
+        let heartbeat_pool = database.pool.clone();
+        let executor_execution_id = executor.executor_execution_id;
+        let submission_id = executor.submission_id;
+        let mut heartbeat = tokio::spawn(async move {
+            sqlx::query(
+                r#"
+                UPDATE executor_capacity_allocations
+                SET last_heartbeat_at_ms = GREATEST(
+                    last_heartbeat_at_ms,
+                    floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT
+                )
+                WHERE executor_execution_id = $1 AND submission_id = $2
+                  AND state = 'held'
+                "#,
+            )
+            .bind(executor_execution_id)
+            .bind(submission_id)
+            .execute(&heartbeat_pool)
+            .await
+        });
+        let heartbeat_result =
+            tokio::time::timeout(Duration::from_millis(500), &mut heartbeat).await;
+        policy_lock.rollback().await.map_err(debug_error)?;
+        let heartbeat_result = match heartbeat_result {
+            Ok(result) => result.map_err(debug_error)?.map_err(debug_error)?,
+            Err(_) => {
+                heartbeat.abort();
+                let _ = heartbeat.await;
+                return Err("capacity heartbeat waited on the policy table".to_string());
+            }
+        };
+        require(
+            heartbeat_result.rows_affected() == 1,
+            "capacity heartbeat did not update its held allocation",
+        )?;
+
+        require(
+            sqlx::query(
+                r#"
+                UPDATE executor_resource_policies
+                SET allocated_count = allocated_count + 1
+                WHERE resource_policy_id = $1 AND revision = 1
+                "#,
+            )
+            .bind(POLICY_ID)
+            .execute(&database.pool)
+            .await
+            .is_err(),
+            "capacity guard accepted an unbalanced policy counter",
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
 async fn capacity_reconciliation_migration_backfills_deadline_quarantine() -> TestResult {
     let Some(database) = TestDatabase::new_before_capacity_reconciliation().await? else {
         return Ok(());

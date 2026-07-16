@@ -1,0 +1,99 @@
+{
+  "schema": "ai-image-factory.provider-submit-benchmark.v1",
+  "generated_at_database_ms": 1784240204445,
+  "configuration": {
+    "queue_rows": 4096,
+    "recovery_rows": 819,
+    "fresh_rows": 3277,
+    "recovery_percent": 20,
+    "claimants": 64,
+    "seed_concurrency": 32,
+    "recovery_seed_lease_ms": 15000,
+    "recovery_claim_lease_ms": 60000,
+    "fresh_claim_lease_ms": 60000,
+    "provider_timeout_ms": 300000,
+    "wait_sample_interval_ms": 2
+  },
+  "environment": {
+    "postgres_version": "PostgreSQL 18.3 on x86_64-apple-darwin24.6.0, compiled by Apple clang version 17.0.0 (clang-1700.6.3.2), 64-bit",
+    "postgres_version_num": 180003,
+    "target_os": "macos",
+    "target_arch": "aarch64",
+    "logical_cpus": 18,
+    "migration_version": 31,
+    "wal_measurement_scope": "cluster-wide LSN delta; upper bound if unrelated writers exist"
+  },
+  "workload": {
+    "duration_ms": 10105.385791,
+    "throughput_ops_per_second": 405.32841444291574,
+    "acquired_total": 4096,
+    "acquired_recovery": 819,
+    "acquired_fresh": 3277,
+    "empty_cycles": 150,
+    "first_recovery_ordinal": 0,
+    "first_fresh_ordinal": 258,
+    "successful_acquire_latency_us": {
+      "samples": 4096,
+      "min": 755,
+      "p50": 152565,
+      "p95": 321451,
+      "p99": 368324,
+      "max": 523852
+    },
+    "recovery_acquire_latency_us": {
+      "samples": 819,
+      "min": 755,
+      "p50": 4253,
+      "p95": 64189,
+      "p99": 83000,
+      "max": 95807
+    },
+    "fresh_acquire_latency_us": {
+      "samples": 3277,
+      "min": 28627,
+      "p50": 187243,
+      "p95": 327611,
+      "p99": 374157,
+      "max": 523852
+    },
+    "wal_bytes_delta": 13107408,
+    "deadlocks_delta": 0,
+    "wait_sampling": {
+      "samples": 2797,
+      "sampled_waiting_backends": 51822,
+      "lock_wait_samples": 43378,
+      "events": {
+        "Client:ClientRead": 420,
+        "IO:DataFileExtend": 1,
+        "IO:WalWrite": 36,
+        "IPC:BufferIo": 9,
+        "IPC:XactGroupUpdate": 1,
+        "LWLock:BufferContent": 3350,
+        "LWLock:BufferMapping": 580,
+        "LWLock:LockManager": 3323,
+        "LWLock:ProcArray": 17,
+        "LWLock:WALInsert": 4,
+        "LWLock:WALWrite": 12,
+        "LWLock:XactSLRU": 1,
+        "Lock:extend": 12,
+        "Lock:transactionid": 27698,
+        "Lock:tuple": 15668,
+        "Timeout:SpinDelay": 690
+      }
+    }
+  },
+  "correctness": {
+    "expected_total": 4096,
+    "leased_fresh_rows": 3277,
+    "running_recovery_rows": 819,
+    "claimed_recovery_rows": 819,
+    "recovery_claim_commands": 819,
+    "held_capacity_rows": 4096,
+    "allocated_capacity_count": 4096,
+    "distinct_fresh_owners": 3277,
+    "distinct_recovery_owners": 819,
+    "remaining_prepared_rows": 0,
+    "deadline_quarantined_rows": 0,
+    "exact_once_projection": true
+  }
+}

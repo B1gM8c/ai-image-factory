@@ -181,7 +181,8 @@ async fn run_claimant(
         let started = Instant::now();
         if provider
             .resolve_due_submit_deadline(&provider_scope)
-            .await?
+            .await
+            .map_err(|error| claimant_error(worker_index, attempt, "deadline resolve", error))?
             .is_some()
         {
             return Err(io::Error::other("benchmark unexpectedly resolved a deadline").into());
@@ -194,13 +195,15 @@ async fn run_claimant(
                 &command_id,
                 config.recovery_claim_lease_ms,
             )
-            .await?
+            .await
+            .map_err(|error| claimant_error(worker_index, attempt, "recovery claim", error))?
             .is_some()
         {
             Some(AcquiredKind::Recovery)
         } else if executor
             .claim_prepared(&executor_scope(), &owner, config.fresh_claim_lease_ms)
-            .await?
+            .await
+            .map_err(|error| claimant_error(worker_index, attempt, "fresh claim", error))?
             .is_some()
         {
             Some(AcquiredKind::Fresh)
@@ -223,6 +226,18 @@ async fn run_claimant(
         }
     }
     Ok(report)
+}
+
+fn claimant_error(
+    worker_index: usize,
+    attempt: u64,
+    operation: &str,
+    error: impl std::fmt::Display,
+) -> Box<dyn std::error::Error + Send + Sync> {
+    io::Error::other(format!(
+        "claimant {worker_index} attempt {attempt} {operation} failed: {error}",
+    ))
+    .into()
 }
 
 async fn sample_waits(

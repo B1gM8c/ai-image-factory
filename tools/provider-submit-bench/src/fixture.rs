@@ -40,7 +40,11 @@ pub async fn seed_prepared_queue(pool: &PgPool, config: &BenchConfig) -> BenchRe
             join_fixture_task(&mut tasks).await?;
         }
         let pool = pool.clone();
-        tasks.spawn(async move { seed_prepared_submission(&pool, index).await });
+        tasks.spawn(async move {
+            seed_prepared_submission(&pool, index)
+                .await
+                .map_err(|error| fixture_error("prepared", index, error))
+        });
     }
     while !tasks.is_empty() {
         join_fixture_task(&mut tasks).await?;
@@ -67,7 +71,11 @@ pub async fn seed_recovery_queue(pool: &PgPool, config: &BenchConfig) -> BenchRe
         }
         let pool = pool.clone();
         let config = config.clone();
-        tasks.spawn(async move { seed_recovery(&pool, &config, index).await });
+        tasks.spawn(async move {
+            seed_recovery(&pool, &config, index)
+                .await
+                .map_err(|error| fixture_error("recovery", index, error))
+        });
     }
     while !tasks.is_empty() {
         join_fixture_task(&mut tasks).await?;
@@ -391,6 +399,14 @@ async fn database_now(pool: &PgPool) -> BenchResult<i64> {
 
 fn join_error(error: tokio::task::JoinError) -> io::Error {
     io::Error::other(format!("fixture task failed: {error}"))
+}
+
+fn fixture_error(
+    kind: &str,
+    index: usize,
+    error: Box<dyn std::error::Error + Send + Sync>,
+) -> Box<dyn std::error::Error + Send + Sync> {
+    io::Error::other(format!("{kind} seed {index} failed: {error}")).into()
 }
 
 async fn join_fixture_task(tasks: &mut JoinSet<BenchResult>) -> BenchResult {

@@ -102,6 +102,9 @@ proof are documented in
 The dependency-free liveness route, bounded database readiness route, and
 constant-cardinality provider status projection are documented in
 [`docs/architecture/2026-phase2af-bounded-gateway-readiness.md`](docs/architecture/2026-phase2af-bounded-gateway-readiness.md).
+The Read Committed capacity-counter race, heartbeat fast path, and repeated
+4096-row mixed submit evidence are documented in
+[`docs/architecture/2026-phase2ag-capacity-counter-snapshot.md`](docs/architecture/2026-phase2ag-capacity-counter-snapshot.md).
 Database-bound provider profiles and durable capacity are documented in
 [`docs/architecture/2026-phase1g-execution-binding-capacity.md`](docs/architecture/2026-phase1g-execution-binding-capacity.md).
 
