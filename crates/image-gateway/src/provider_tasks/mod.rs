@@ -8,20 +8,15 @@ use uuid::Uuid;
 use crate::executor::{ExecutorResultManifest, ExecutorSubmissionLease};
 
 mod capacity;
-mod orchestrator;
 mod poll;
 mod postgres;
 mod remote_submit;
-mod submit_driver;
+mod submit;
 
 pub use capacity::{
     ProviderCapacityEvidence, ProviderCapacityEvidenceOutcome, ProviderCapacityReconciliation,
     ProviderCapacityReconciliationLease, ProviderCapacityReconciliationState,
     ProviderCapacityReconciliationStore, ProviderCapacityTerminalState,
-};
-pub use orchestrator::{
-    ProviderSubmitOrchestrator, ProviderSubmitOrchestratorError, ProviderSubmitOutcome,
-    ProviderSubmitRecoveryWork, ProviderSubmitWork,
 };
 pub use poll::{
     ProviderAccountHomeCapability, ProviderAccountHomeCapabilityError,
@@ -39,8 +34,14 @@ pub use remote_submit::{
     GatedCliSubmission, GatedCliSubmitCodec, GatedCliSubmitDriver, run_remote_submit_gate,
     run_remote_submit_runner,
 };
-pub use submit_driver::{
-    ProviderSubmitDriver, ProviderSubmitDriverCall, ProviderSubmitDriverRecovery,
+pub use submit::{
+    ProviderSubmitDaemon, ProviderSubmitDaemonConfig, ProviderSubmitDaemonError,
+    ProviderSubmitDaemonReport, ProviderSubmitDriver, ProviderSubmitDriverCall,
+    ProviderSubmitDriverRecovery, ProviderSubmitIteration, ProviderSubmitIterationCommand,
+    ProviderSubmitIterationCommandError, ProviderSubmitOrchestrator,
+    ProviderSubmitOrchestratorError, ProviderSubmitOutcome, ProviderSubmitProjectionError,
+    ProviderSubmitProjector, ProviderSubmitRecoveryWork, ProviderSubmitRun, ProviderSubmitService,
+    ProviderSubmitServiceConfig, ProviderSubmitServiceError, ProviderSubmitWork,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

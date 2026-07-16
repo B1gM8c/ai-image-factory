@@ -78,6 +78,9 @@ bounded lifecycle, and real PostgreSQL fake-CLI proof are documented in
 The fenced provider-submit recovery work, frozen command projection,
 database-time budget, and no-resubmit crash proof are documented in
 [`docs/architecture/2026-phase2y-fenced-provider-submit-recovery.md`](docs/architecture/2026-phase2y-fenced-provider-submit-recovery.md).
+The provider-neutral submit service, stable lane command identity, lease
+heartbeats, bounded daemon, and inactive Dreamina projector are documented in
+[`docs/architecture/2026-phase2z-provider-submit-service-kernel.md`](docs/architecture/2026-phase2z-provider-submit-service-kernel.md).
 Database-bound provider profiles and durable capacity are documented in
 [`docs/architecture/2026-phase1g-execution-binding-capacity.md`](docs/architecture/2026-phase1g-execution-binding-capacity.md).
 

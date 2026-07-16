@@ -189,3 +189,7 @@ and bounded daemon:
 5. drain active attempts on shutdown; and
 6. bind one inactive Dreamina profile/account/home/helper composition without
    adding public routing or making an external call.
+
+Phase 2Z implements the provider-neutral service and bounded daemon kernel,
+including stable retry identities and the inactive Dreamina projector:
+[`2026-phase2z-provider-submit-service-kernel.md`](2026-phase2z-provider-submit-service-kernel.md).

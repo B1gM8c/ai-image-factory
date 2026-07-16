@@ -71,6 +71,24 @@ pub struct ExecutorSubmissionLease {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ExecutorSubmissionResume {
+    Leased(ExecutorSubmissionLease),
+    Running(ExecutorSubmissionLease),
+}
+
+impl ExecutorSubmissionResume {
+    pub fn needs_start(&self) -> bool {
+        matches!(self, Self::Leased(_))
+    }
+
+    pub fn into_lease(self) -> ExecutorSubmissionLease {
+        match self {
+            Self::Leased(lease) | Self::Running(lease) => lease,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExecutorClaimScope {
     pub execution_profile_id: Uuid,
     pub provider_id: String,
@@ -335,11 +353,11 @@ pub trait ExecutorHandoffStore: Send + Sync + 'static {
 
 #[async_trait]
 pub trait ExecutorSubmissionStore: Send + Sync + 'static {
-    async fn resume_running(
+    async fn resume_owned(
         &self,
         scope: &ExecutorClaimScope,
         owner: &str,
-    ) -> Result<Option<ExecutorSubmissionLease>, ExecutorSubmissionError>;
+    ) -> Result<Option<ExecutorSubmissionResume>, ExecutorSubmissionError>;
 
     async fn claim_prepared(
         &self,

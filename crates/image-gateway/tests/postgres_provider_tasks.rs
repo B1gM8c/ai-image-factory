@@ -11,24 +11,26 @@ use std::{
 };
 
 use gpt_image_2_gateway::{
-    ExecutorClaimScope, ExecutorHandoffStore, ExecutorSubmissionLease, ExecutorSubmissionOutcome,
-    ExecutorSubmissionStore, FilesystemArtifactBlobStore, FilesystemProviderArtifactStagerFactory,
-    PostgresExecutorSubmissionStore, PostgresProviderTaskStore, ProviderArtifactAuthority,
-    ProviderArtifactPublication, ProviderArtifactStageContext, ProviderArtifactStager,
-    ProviderArtifactStagerFactory, ProviderCapacityEvidence, ProviderCapacityEvidenceOutcome,
-    ProviderCapacityReconciliationState, ProviderCapacityReconciliationStore,
-    ProviderCapacityTerminalState, ProviderExecutionContext, ProviderPollDaemon,
-    ProviderPollDaemonConfig, ProviderPollDriver, ProviderPollDriverCall, ProviderPollOrchestrator,
-    ProviderPollOrchestratorConfig, ProviderPollRun, ProviderPollRuntimeProfileStore,
-    ProviderPollStore, ProviderRemoteTask, ProviderSubmitAcquire, ProviderSubmitFailureKind,
-    ProviderSubmitIntent, ProviderSubmitIntentState, ProviderSubmitOrchestrator,
-    ProviderSubmitOrchestratorError, ProviderSubmitOutcome, ProviderSubmitRecoveryFence,
-    ProviderSubmitRecoveryWork, ProviderSubmitStart, ProviderSubmitWork, ProviderTaskClaimScope,
-    ProviderTaskDeadlineStore, ProviderTaskLease, ProviderTaskObservation,
-    ProviderTaskObservationOutcome, ProviderTaskObservationSource, ProviderTaskState,
-    ProviderTaskStore, ProviderTaskStoreError, RemoteTaskAttach, RemoteTaskSubmitFailure,
-    RemoteTaskSubmitReceipt, RemoteTaskSubmitReservation, StagedProviderArtifact,
-    VerifiedCallbackWakeup,
+    ExecutorClaimScope, ExecutorHandoffStore, ExecutorLaunchContext, ExecutorSubmissionLease,
+    ExecutorSubmissionOutcome, ExecutorSubmissionStore, FilesystemArtifactBlobStore,
+    FilesystemProviderArtifactStagerFactory, PostgresExecutorSubmissionStore,
+    PostgresProviderTaskStore, ProviderArtifactAuthority, ProviderArtifactPublication,
+    ProviderArtifactStageContext, ProviderArtifactStager, ProviderArtifactStagerFactory,
+    ProviderCapacityEvidence, ProviderCapacityEvidenceOutcome, ProviderCapacityReconciliationState,
+    ProviderCapacityReconciliationStore, ProviderCapacityTerminalState, ProviderExecutionContext,
+    ProviderPollDaemon, ProviderPollDaemonConfig, ProviderPollDriver, ProviderPollDriverCall,
+    ProviderPollOrchestrator, ProviderPollOrchestratorConfig, ProviderPollRun,
+    ProviderPollRuntimeProfileStore, ProviderPollStore, ProviderRemoteTask, ProviderSubmitAcquire,
+    ProviderSubmitFailureKind, ProviderSubmitIntent, ProviderSubmitIntentState,
+    ProviderSubmitIterationCommand, ProviderSubmitOrchestrator, ProviderSubmitOrchestratorError,
+    ProviderSubmitOutcome, ProviderSubmitProjectionError, ProviderSubmitProjector,
+    ProviderSubmitRecoveryFence, ProviderSubmitRecoveryLease, ProviderSubmitRecoveryWork,
+    ProviderSubmitRun, ProviderSubmitService, ProviderSubmitServiceConfig, ProviderSubmitStart,
+    ProviderSubmitWork, ProviderTaskClaimScope, ProviderTaskDeadlineStore, ProviderTaskLease,
+    ProviderTaskObservation, ProviderTaskObservationOutcome, ProviderTaskObservationSource,
+    ProviderTaskState, ProviderTaskStore, ProviderTaskStoreError, RemoteTaskAttach,
+    RemoteTaskSubmitFailure, RemoteTaskSubmitReceipt, RemoteTaskSubmitReservation,
+    StagedProviderArtifact, VerifiedCallbackWakeup,
     admission::WorkLease,
     database::{connect_test_pool_with_search_path, run_migrations},
 };
@@ -64,6 +66,60 @@ const DREAMINA_ACCOUNT_ID: Uuid = Uuid::from_u128(0x2730);
 const DREAMINA_POLICY_ID: Uuid = Uuid::from_u128(0x2740);
 const DREAMINA_PROFILE_KEY: &str = "dreamina-image-poll-test";
 const DREAMINA_CREDENTIAL_REF: &str = "test-vault.dreamina.1";
+
+#[derive(Clone, Copy, Default)]
+struct TestSubmitProjector {
+    reject_fresh: bool,
+}
+
+impl ProviderSubmitProjector<ScriptedFakeProvider> for TestSubmitProjector {
+    fn project_fresh(
+        &self,
+        lease: &ExecutorSubmissionLease,
+        context: &ExecutorLaunchContext,
+    ) -> Result<SingleOutputCommand<TestPayload>, ProviderSubmitProjectionError> {
+        if self.reject_fresh {
+            return Err(ProviderSubmitProjectionError::InvalidSourceCommand);
+        }
+        if lease.output_index != context.output_index()
+            || lease.command_schema != context.command_schema()
+            || lease.command_hash != context.command_hash()
+        {
+            return Err(ProviderSubmitProjectionError::ContractMismatch);
+        }
+        test_submit_command(
+            u32::try_from(lease.output_index)
+                .map_err(|_| ProviderSubmitProjectionError::OutputOutOfRange)?,
+            1,
+            lease.command_hash.clone(),
+        )
+    }
+
+    fn project_recovery(
+        &self,
+        lease: &ProviderSubmitRecoveryLease,
+    ) -> Result<SingleOutputCommand<TestPayload>, ProviderSubmitProjectionError> {
+        test_submit_command(
+            lease.intent.output_index,
+            lease.intent.output_total,
+            lease.context().command_hash().to_owned(),
+        )
+    }
+}
+
+fn test_submit_command(
+    output_index: u32,
+    output_total: u32,
+    source_command_sha256: String,
+) -> Result<SingleOutputCommand<TestPayload>, ProviderSubmitProjectionError> {
+    let output = OutputSlot::new(output_index, output_total)
+        .map_err(|_| ProviderSubmitProjectionError::OutputOutOfRange)?;
+    SingleOutputCommand::new(
+        output,
+        TestPayload::bound_to(b"provider-test-payload".to_vec(), source_command_sha256),
+    )
+    .map_err(|_| ProviderSubmitProjectionError::InvalidSourceCommand)
+}
 
 #[derive(Clone)]
 struct BlockingPendingPollDriver {
@@ -1144,6 +1200,371 @@ async fn submit_work_rejects_unjournalable_commands_before_database_acquire() ->
         require(
             intent_count == 0,
             "command validation mutated submit state before acquire",
+        )
+    }
+    .await;
+    database.cleanup().await?;
+    result
+}
+
+#[tokio::test]
+async fn submit_service_claims_projects_and_attaches_fresh_work() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let work = seed_work_lease(&database.pool, "submit-service-fresh").await?;
+        let executor_store = PostgresExecutorSubmissionStore::new(database.pool.clone());
+        let prepared = executor_store
+            .prepare_and_handoff(&work, PROFILE_ID)
+            .await
+            .map_err(debug_error)?;
+        let submission = prepared
+            .first()
+            .ok_or_else(|| "fresh submit service fixture was not prepared".to_owned())?;
+        let provider = ScriptedFakeProvider::default();
+        provider.push_submit(SubmitStep::Pending(PendingOperation::new(
+            RemoteOperationRef::new(
+                "provider-test",
+                submission.submission_id.to_string(),
+                "submit-service-fresh-operation",
+            )
+            .map_err(debug_error)?,
+            None,
+            Some(25),
+        )));
+        let journal = tempfile::tempdir().map_err(debug_error)?;
+        let service = ProviderSubmitService::new(
+            executor_store,
+            PostgresProviderTaskStore::new(database.pool.clone()),
+            provider.clone(),
+            TestSubmitProjector::default(),
+            submit_service_config(200),
+            journal.path().join("remote-submit"),
+        )
+        .map_err(debug_error)?;
+        let command = submit_iteration_command("submit-service-fresh");
+
+        let run = service.run_once(&command).await.map_err(debug_error)?;
+        let task_state: String =
+            sqlx::query_scalar("SELECT state FROM provider_remote_tasks WHERE submission_id = $1")
+                .bind(submission.submission_id)
+                .fetch_one(&database.pool)
+                .await
+                .map_err(debug_error)?;
+        let owner: String = sqlx::query_scalar(
+            "SELECT submit_owner FROM provider_remote_submit_intents WHERE submission_id = $1",
+        )
+        .bind(submission.submission_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(
+            run == ProviderSubmitRun::FreshSubmitted
+                && provider.calls().submit == 1
+                && task_state == "provider_waiting"
+                && owner == command.owner(),
+            format!("fresh submit service did not converge: {run:?}/{task_state}/{owner}"),
+        )
+    }
+    .await;
+    database.cleanup().await?;
+    result
+}
+
+#[tokio::test]
+async fn submit_service_resumes_unacknowledged_fresh_claim_without_reclaiming() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let work = seed_work_lease(&database.pool, "submit-service-lost-claim").await?;
+        let executor_store = PostgresExecutorSubmissionStore::new(database.pool.clone());
+        let prepared = executor_store
+            .prepare_and_handoff(&work, PROFILE_ID)
+            .await
+            .map_err(debug_error)?;
+        let submission = prepared
+            .first()
+            .ok_or_else(|| "lost claim fixture was not prepared".to_owned())?;
+        let command = submit_iteration_command("submit-service-lost-claim");
+        let config = submit_service_config(200);
+        let claimed = executor_store
+            .claim_prepared(
+                &config.executor_scope,
+                command.owner(),
+                config.executor_lease_ms,
+            )
+            .await
+            .map_err(debug_error)?
+            .ok_or_else(|| "lost claim fixture was not claimable".to_owned())?;
+
+        let provider = ScriptedFakeProvider::default();
+        provider.push_submit(SubmitStep::Pending(PendingOperation::new(
+            RemoteOperationRef::new(
+                "provider-test",
+                submission.submission_id.to_string(),
+                "submit-service-lost-claim-operation",
+            )
+            .map_err(debug_error)?,
+            None,
+            Some(25),
+        )));
+        let journal = tempfile::tempdir().map_err(debug_error)?;
+        let service = ProviderSubmitService::new(
+            executor_store,
+            PostgresProviderTaskStore::new(database.pool.clone()),
+            provider.clone(),
+            TestSubmitProjector::default(),
+            config,
+            journal.path().join("remote-submit"),
+        )
+        .map_err(debug_error)?;
+
+        let run = service.run_once(&command).await.map_err(debug_error)?;
+        let durable: (String, i64, String) = sqlx::query_as(
+            r#"
+            SELECT execution.state, execution.lease_epoch, intent.state
+            FROM executor_executions execution
+            JOIN provider_remote_submit_intents intent
+              ON intent.executor_execution_id = execution.executor_execution_id
+             AND intent.submission_id = execution.submission_id
+            WHERE execution.executor_execution_id = $1
+            "#,
+        )
+        .bind(submission.executor_execution_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(
+            run == ProviderSubmitRun::FreshSubmitted
+                && provider.calls().submit == 1
+                && durable
+                    == (
+                        "provider_waiting".to_owned(),
+                        claimed.executor_lease_epoch,
+                        "attached".to_owned(),
+                    ),
+            format!("lost fresh claim was not resumed exactly once: {run:?}/{durable:?}"),
+        )
+    }
+    .await;
+    database.cleanup().await?;
+    result
+}
+
+#[tokio::test]
+async fn submit_service_prioritizes_expired_recovery_before_fresh_work() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let recovery_lease =
+            seed_running_submission_with_lease(&database.pool, "submit-service-recovery", 100)
+                .await?;
+        let provider_store = PostgresProviderTaskStore::new(database.pool.clone());
+        let recovery_command = orchestrator_command(&recovery_lease);
+        let acquired = provider_store
+            .acquire_submit(&RemoteTaskSubmitReservation::new(
+                &recovery_lease,
+                format!("provider-submit-{}", recovery_lease.submission_id.simple()),
+                recovery_command.output(),
+                recovery_command.identity(),
+                2_000,
+            ))
+            .await
+            .map_err(debug_error)?;
+        require(
+            matches!(acquired, ProviderSubmitAcquire::Dispatch(_)),
+            format!("recovery fixture did not elect sending: {acquired:?}"),
+        )?;
+
+        let fresh_work = seed_work_lease(&database.pool, "submit-service-waiting-fresh").await?;
+        let executor_store = PostgresExecutorSubmissionStore::new(database.pool.clone());
+        let fresh = executor_store
+            .prepare_and_handoff(&fresh_work, PROFILE_ID)
+            .await
+            .map_err(debug_error)?;
+        let fresh = fresh
+            .first()
+            .ok_or_else(|| "fresh priority fixture was not prepared".to_owned())?;
+        tokio::time::sleep(Duration::from_millis(130)).await;
+
+        let provider = ScriptedFakeProvider::default();
+        provider.push_submit(SubmitStep::Pending(PendingOperation::new(
+            RemoteOperationRef::new(
+                "provider-test",
+                recovery_lease.submission_id.to_string(),
+                "submit-service-recovered-operation",
+            )
+            .map_err(debug_error)?,
+            None,
+            None,
+        )));
+        let journal = tempfile::tempdir().map_err(debug_error)?;
+        let service = ProviderSubmitService::new(
+            executor_store,
+            provider_store,
+            provider.clone(),
+            TestSubmitProjector::default(),
+            submit_service_config(2_000),
+            journal.path().join("remote-submit"),
+        )
+        .map_err(debug_error)?;
+
+        let run = service
+            .run_once(&submit_iteration_command("submit-service-priority"))
+            .await
+            .map_err(debug_error)?;
+        let fresh_state: String = sqlx::query_scalar(
+            "SELECT state FROM executor_executions WHERE executor_execution_id = $1",
+        )
+        .bind(fresh.executor_execution_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        let recovered_operation: String = sqlx::query_scalar(
+            "SELECT remote_operation_id FROM provider_remote_tasks WHERE submission_id = $1",
+        )
+        .bind(recovery_lease.submission_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(
+            run == ProviderSubmitRun::RecoveryCompleted
+                && provider.calls().submit == 1
+                && fresh_state == "prepared"
+                && recovered_operation == "submit-service-recovered-operation",
+            format!(
+                "submit recovery was not prioritized: {run:?}/{fresh_state}/{recovered_operation}"
+            ),
+        )
+    }
+    .await;
+    database.cleanup().await?;
+    result
+}
+
+#[tokio::test]
+async fn submit_service_projection_failure_terminates_before_provider_effect() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let work = seed_work_lease(&database.pool, "submit-service-invalid-projection").await?;
+        let executor_store = PostgresExecutorSubmissionStore::new(database.pool.clone());
+        let prepared = executor_store
+            .prepare_and_handoff(&work, PROFILE_ID)
+            .await
+            .map_err(debug_error)?;
+        let submission = prepared
+            .first()
+            .ok_or_else(|| "projection failure fixture was not prepared".to_owned())?;
+        let provider = ScriptedFakeProvider::default();
+        let journal = tempfile::tempdir().map_err(debug_error)?;
+        let service = ProviderSubmitService::new(
+            executor_store,
+            PostgresProviderTaskStore::new(database.pool.clone()),
+            provider.clone(),
+            TestSubmitProjector { reject_fresh: true },
+            submit_service_config(200),
+            journal.path().join("remote-submit"),
+        )
+        .map_err(debug_error)?;
+
+        let run = service
+            .run_once(&submit_iteration_command("submit-service-invalid"))
+            .await
+            .map_err(debug_error)?;
+        let states: (String, String, i64) = sqlx::query_as(
+            r#"
+            SELECT execution.state, submission.state,
+                   COUNT(intent.submission_id)
+            FROM executor_executions execution
+            JOIN provider_submissions submission
+              ON submission.executor_execution_id = execution.executor_execution_id
+             AND submission.submission_id = execution.submission_id
+            LEFT JOIN provider_remote_submit_intents intent
+              ON intent.submission_id = submission.submission_id
+            WHERE execution.executor_execution_id = $1
+            GROUP BY execution.state, submission.state
+            "#,
+        )
+        .bind(submission.executor_execution_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(
+            run == ProviderSubmitRun::FreshProjectionRejected
+                && provider.calls().submit == 0
+                && states == ("failed".to_owned(), "failed".to_owned(), 0),
+            format!("projection failure crossed the provider boundary: {run:?}/{states:?}"),
+        )
+    }
+    .await;
+    database.cleanup().await?;
+    result
+}
+
+#[tokio::test]
+async fn submit_service_heartbeats_fresh_authority_during_provider_timeout() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let work = seed_work_lease(&database.pool, "submit-service-heartbeat").await?;
+        let executor_store = PostgresExecutorSubmissionStore::new(database.pool.clone());
+        let prepared = executor_store
+            .prepare_and_handoff(&work, PROFILE_ID)
+            .await
+            .map_err(debug_error)?;
+        let submission = prepared
+            .first()
+            .ok_or_else(|| "heartbeat fixture was not prepared".to_owned())?;
+        let provider = ScriptedFakeProvider::default();
+        provider.push_submit(SubmitStep::Never);
+        let journal = tempfile::tempdir().map_err(debug_error)?;
+        let mut config = submit_service_config(150);
+        config.executor_lease_ms = 80;
+        config.recovery_lease_ms = 80;
+        config.heartbeat_interval = Duration::from_millis(20);
+        let service = ProviderSubmitService::new(
+            executor_store,
+            PostgresProviderTaskStore::new(database.pool.clone()),
+            provider.clone(),
+            TestSubmitProjector::default(),
+            config,
+            journal.path().join("remote-submit"),
+        )
+        .map_err(debug_error)?;
+
+        let started = Instant::now();
+        let run = service
+            .run_once(&submit_iteration_command("submit-service-heartbeat"))
+            .await
+            .map_err(debug_error)?;
+        let projection: (String, i64, i64) = sqlx::query_as(
+            r#"
+            SELECT intent.state, execution.started_at_ms,
+                   execution.lease_expires_at_ms
+            FROM provider_remote_submit_intents intent
+            JOIN executor_executions execution
+              ON execution.executor_execution_id = intent.executor_execution_id
+             AND execution.submission_id = intent.submission_id
+            WHERE intent.submission_id = $1
+            "#,
+        )
+        .bind(submission.submission_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(
+            run == ProviderSubmitRun::FreshSubmitted
+                && provider.calls().submit == 1
+                && projection.0 == "outcome_unknown"
+                && projection.2.saturating_sub(projection.1) >= 120
+                && started.elapsed() >= Duration::from_millis(100),
+            format!("fresh submit authority was not heartbeated: {run:?}/{projection:?}"),
         )
     }
     .await;
@@ -8644,6 +9065,32 @@ fn poll_daemon_config(max_in_flight: usize) -> ProviderPollDaemonConfig {
         error_max_delay: Duration::from_millis(100),
         shutdown_drain_timeout: Duration::from_secs(1),
     }
+}
+
+fn submit_service_config(provider_timeout_ms: i64) -> ProviderSubmitServiceConfig {
+    ProviderSubmitServiceConfig {
+        executor_scope: ExecutorClaimScope {
+            execution_profile_id: PROFILE_ID,
+            provider_id: "provider-test".to_owned(),
+            command_schema: "provider-command-v1".to_owned(),
+            adapter_revision: "provider-test-adapter-v1".to_owned(),
+        },
+        provider_scope: claim_scope(),
+        provider_timeout_ms,
+        executor_lease_ms: 200,
+        recovery_lease_ms: 200,
+        heartbeat_interval: Duration::from_millis(25),
+        recovery_retry_after_ms: 50,
+    }
+}
+
+fn submit_iteration_command(identity: &str) -> ProviderSubmitIterationCommand {
+    ProviderSubmitIterationCommand::new(
+        format!("{identity}-owner"),
+        format!("{identity}-claim"),
+        format!("{identity}-defer"),
+    )
+    .expect("submit iteration command is valid")
 }
 
 async fn wait_for_poll_observations(pool: &PgPool, expected: i64) -> TestResult {

@@ -7,7 +7,7 @@ use image_provider_sdk::{
 };
 use uuid::Uuid;
 
-use super::{ProviderExecutionContext, ProviderSubmitIntent};
+use crate::provider_tasks::{ProviderExecutionContext, ProviderSubmitIntent};
 
 pub trait ProviderSubmitDriver: Send + Sync + 'static {
     type Payload: CanonicalCommandPayload + Send + Sync + 'static;

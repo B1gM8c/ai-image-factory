@@ -7,7 +7,8 @@ use async_trait::async_trait;
 use gpt_image_2_gateway::executor::{
     DurableRunner, DurableRunnerResult, ExecutorClaimScope, ExecutorDaemon, ExecutorDaemonError,
     ExecutorDaemonRun, ExecutorSubmissionError, ExecutorSubmissionLease, ExecutorSubmissionOutcome,
-    ExecutorSubmissionStore, RunnerError, RunnerLaunchAuthority, RunnerOutcome,
+    ExecutorSubmissionResume, ExecutorSubmissionStore, RunnerError, RunnerLaunchAuthority,
+    RunnerOutcome,
 };
 use tokio::sync::Barrier;
 use uuid::Uuid;
@@ -123,13 +124,16 @@ impl FakeStore {
 
 #[async_trait]
 impl ExecutorSubmissionStore for FakeStore {
-    async fn resume_running(
+    async fn resume_owned(
         &self,
         _scope: &ExecutorClaimScope,
         _owner: &str,
-    ) -> Result<Option<ExecutorSubmissionLease>, ExecutorSubmissionError> {
+    ) -> Result<Option<ExecutorSubmissionResume>, ExecutorSubmissionError> {
         self.push_event("resume");
-        Ok(self.snapshot().resumed)
+        Ok(self
+            .snapshot()
+            .resumed
+            .map(ExecutorSubmissionResume::Running))
     }
 
     async fn claim_prepared(

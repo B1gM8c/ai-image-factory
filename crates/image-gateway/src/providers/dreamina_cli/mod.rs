@@ -6,13 +6,17 @@ use image_provider_dreamina_cli::{
     DreaminaSubmitRequestV1, PROVIDER_ID, ReceiptError, parse_receipt, parse_submit_command,
 };
 use image_provider_sdk::{
-    EffectCertainty, PendingOperation, ProviderFailure, ProviderFailureClass, RemoteOperationRef,
-    RetryDirective, SingleOutputCommand,
+    EffectCertainty, OutputSlot, PendingOperation, ProviderFailure, ProviderFailureClass,
+    RemoteOperationRef, RetryDirective, SingleOutputCommand,
 };
 use uuid::Uuid;
 
-use crate::provider_tasks::{
-    GatedCliCommand, GatedCliSubmitCodec, ProviderExecutionContext, ProviderSubmitIntent,
+use crate::{
+    executor::{ExecutorLaunchContext, ExecutorSubmissionLease},
+    provider_tasks::{
+        GatedCliCommand, GatedCliSubmitCodec, ProviderExecutionContext, ProviderSubmitIntent,
+        ProviderSubmitProjectionError, ProviderSubmitProjector, ProviderSubmitRecoveryLease,
+    },
 };
 
 mod poll;
@@ -159,10 +163,80 @@ impl GatedCliSubmitCodec for DreaminaCliSubmitCodecV1 {
     }
 }
 
+impl<D> ProviderSubmitProjector<D> for DreaminaCliSubmitCodecV1
+where
+    D: crate::provider_tasks::ProviderSubmitDriver<Payload = DreaminaSubmitPayloadV1>,
+{
+    fn project_fresh(
+        &self,
+        lease: &ExecutorSubmissionLease,
+        context: &ExecutorLaunchContext,
+    ) -> Result<SingleOutputCommand<DreaminaSubmitPayloadV1>, ProviderSubmitProjectionError> {
+        if lease.provider_id != PROVIDER_ID
+            || lease.output_index != context.output_index()
+            || lease.command_schema != DREAMINA_SUBMIT_COMMAND_SCHEMA
+            || lease.command_schema != context.command_schema()
+            || lease.command_hash != context.command_hash()
+            || lease.adapter_revision != ADAPTER_REVISION
+        {
+            return Err(ProviderSubmitProjectionError::ContractMismatch);
+        }
+        project_submit_command(
+            context.command_json(),
+            context.command_hash(),
+            lease.output_index,
+            1,
+        )
+    }
+
+    fn project_recovery(
+        &self,
+        lease: &ProviderSubmitRecoveryLease,
+    ) -> Result<SingleOutputCommand<DreaminaSubmitPayloadV1>, ProviderSubmitProjectionError> {
+        let context = lease.context();
+        if lease.intent.provider_id != PROVIDER_ID
+            || context.command_schema() != DREAMINA_SUBMIT_COMMAND_SCHEMA
+            || context.adapter_revision() != ADAPTER_REVISION
+        {
+            return Err(ProviderSubmitProjectionError::ContractMismatch);
+        }
+        project_submit_command(
+            lease.command_json(),
+            context.command_hash(),
+            i32::try_from(lease.intent.output_index)
+                .map_err(|_| ProviderSubmitProjectionError::OutputOutOfRange)?,
+            i32::try_from(lease.intent.output_total)
+                .map_err(|_| ProviderSubmitProjectionError::OutputOutOfRange)?,
+        )
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum DreaminaCliCodecConfigError {
     #[error("Dreamina CLI runtime binding is invalid")]
     InvalidRuntimeBinding,
+}
+
+fn project_submit_command(
+    source_command: &serde_json::Value,
+    source_command_sha256: &str,
+    output_index: i32,
+    output_total: i32,
+) -> Result<SingleOutputCommand<DreaminaSubmitPayloadV1>, ProviderSubmitProjectionError> {
+    let source_bytes = serde_json::to_vec(source_command)
+        .map_err(|_| ProviderSubmitProjectionError::InvalidSourceCommand)?;
+    let request = parse_submit_command(&source_bytes)
+        .map_err(|_| ProviderSubmitProjectionError::InvalidSourceCommand)?;
+    let output_index =
+        u32::try_from(output_index).map_err(|_| ProviderSubmitProjectionError::OutputOutOfRange)?;
+    let output_total =
+        u32::try_from(output_total).map_err(|_| ProviderSubmitProjectionError::OutputOutOfRange)?;
+    let output = OutputSlot::new(output_index, output_total)
+        .map_err(|_| ProviderSubmitProjectionError::OutputOutOfRange)?;
+    let payload = DreaminaSubmitPayloadV1::new(source_command_sha256, request)
+        .map_err(|_| ProviderSubmitProjectionError::InvalidSourceCommand)?;
+    SingleOutputCommand::new(output, payload)
+        .map_err(|_| ProviderSubmitProjectionError::InvalidSourceCommand)
 }
 
 fn command_to_gated(
@@ -302,6 +376,65 @@ mod tests {
         assert!(rendered.contains("HOME"));
         assert!(rendered.contains("TMPDIR"));
         assert!(rendered.contains(&fixture.executable_sha256));
+    }
+
+    #[test]
+    fn projects_frozen_source_json_into_the_typed_submit_command() {
+        let source = serde_json::json!({
+            "operation": "text2image",
+            "schema_version": 1,
+            "prompt": "a red fox",
+            "model_version": "5.0",
+            "ratio": "16:9",
+            "resolution_type": "2k",
+            "generate_num": 1,
+            "poll": 0
+        });
+        let command = project_submit_command(&source, &"a".repeat(64), 0, 1).unwrap();
+
+        assert_eq!(command.schema_id(), DREAMINA_SUBMIT_COMMAND_SCHEMA);
+        assert_eq!(command.adapter_revision(), ADAPTER_REVISION);
+        assert_eq!(command.output(), OutputSlot::new(0, 1).unwrap());
+        assert_eq!(
+            parse_submit_command(command.canonical_payload()).unwrap(),
+            DreaminaSubmitRequestV1::TextToImage(
+                TextToImageRequestV1::new(
+                    "a red fox",
+                    ImageModelVersion::V5_0,
+                    ImageRatio::R16x9,
+                    ImageResolution::K2,
+                    1,
+                )
+                .unwrap()
+            )
+        );
+    }
+
+    #[test]
+    fn frozen_submit_projection_rejects_invalid_source_and_output() {
+        assert_eq!(
+            project_submit_command(
+                &serde_json::json!({"operation": "unknown"}),
+                &"a".repeat(64),
+                0,
+                1
+            ),
+            Err(ProviderSubmitProjectionError::InvalidSourceCommand)
+        );
+        let source = serde_json::json!({
+            "operation": "text2image",
+            "schema_version": 1,
+            "prompt": "a red fox",
+            "model_version": "5.0",
+            "ratio": "1:1",
+            "resolution_type": "2k",
+            "generate_num": 1,
+            "poll": 0
+        });
+        assert_eq!(
+            project_submit_command(&source, &"a".repeat(64), 1, 1),
+            Err(ProviderSubmitProjectionError::OutputOutOfRange)
+        );
     }
 
     #[test]

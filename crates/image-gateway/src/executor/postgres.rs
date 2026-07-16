@@ -9,8 +9,8 @@ use super::{
     ExecutorEvidenceStore, ExecutorExecutionProfile, ExecutorExecutionProfileStore,
     ExecutorHandoffStore, ExecutorLaunchContext, ExecutorLaunchContextStore,
     ExecutorResultManifest, ExecutorRunnerObservation, ExecutorSubmissionError,
-    ExecutorSubmissionLease, ExecutorSubmissionOutcome, ExecutorSubmissionStore,
-    PreparedExecutorSubmission,
+    ExecutorSubmissionLease, ExecutorSubmissionOutcome, ExecutorSubmissionResume,
+    ExecutorSubmissionStore, PreparedExecutorSubmission,
 };
 use crate::admission::WorkLease;
 
@@ -133,6 +133,7 @@ struct ResumableRow {
     command_hash: String,
     execution_profile_id: Uuid,
     adapter_revision: String,
+    needs_start: bool,
     lease_epoch: i64,
     lease_expires_at_ms: i64,
 }
@@ -393,6 +394,7 @@ impl ExecutorEvidenceStore for PostgresExecutorSubmissionStore {
                    s.tenant_id, s.provider_id, s.model, s.work_item_id,
                    o.output_index, s.command_schema, s.command_hash,
                    s.execution_profile_id, s.adapter_revision,
+                   FALSE AS needs_start,
                    e.launch_lease_epoch AS lease_epoch,
                    COALESCE(e.lease_expires_at_ms, 0)::BIGINT AS lease_expires_at_ms
             FROM executor_executions e
@@ -530,64 +532,12 @@ impl ExecutorHandoffStore for PostgresExecutorSubmissionStore {
 
 #[async_trait]
 impl ExecutorSubmissionStore for PostgresExecutorSubmissionStore {
-    async fn resume_running(
+    async fn resume_owned(
         &self,
         scope: &ExecutorClaimScope,
         owner: &str,
-    ) -> Result<Option<ExecutorSubmissionLease>, ExecutorSubmissionError> {
-        validate_claim_scope(scope)?;
-        validate_owner(owner)?;
-        let row: Option<ResumableRow> = sqlx::query_as(
-            r#"
-            WITH db_clock AS (
-              SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT AS now_ms
-            )
-            SELECT s.submission_id, e.executor_execution_id, s.output_id, s.job_id,
-                   s.tenant_id, s.provider_id, s.model, s.work_item_id,
-                   o.output_index, s.command_schema, s.command_hash,
-                   s.execution_profile_id, s.adapter_revision,
-                   e.lease_epoch, e.lease_expires_at_ms
-            FROM executor_executions e
-            JOIN provider_submissions s
-              ON s.executor_execution_id = e.executor_execution_id
-             AND s.submission_id = e.submission_id
-            JOIN job_outputs o ON o.output_id = s.output_id AND o.job_id = s.job_id
-            CROSS JOIN db_clock
-            WHERE e.state = 'running' AND s.state = 'running'
-              AND e.executor_owner = $1 AND e.lease_expires_at_ms > db_clock.now_ms
-              AND s.execution_profile_id = $2
-              AND s.provider_id = $3 AND s.command_schema = $4
-              AND s.adapter_revision = $5
-            ORDER BY e.started_at_ms, e.created_at_ms, e.executor_execution_id
-            LIMIT 1
-            "#,
-        )
-        .bind(owner)
-        .bind(scope.execution_profile_id)
-        .bind(&scope.provider_id)
-        .bind(&scope.command_schema)
-        .bind(&scope.adapter_revision)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(unavailable)?;
-        Ok(row.map(|row| ExecutorSubmissionLease {
-            submission_id: row.submission_id,
-            executor_execution_id: row.executor_execution_id,
-            output_id: row.output_id,
-            job_id: row.job_id,
-            tenant_id: row.tenant_id,
-            provider_id: row.provider_id,
-            model: row.model,
-            work_item_id: row.work_item_id,
-            output_index: row.output_index,
-            command_schema: row.command_schema,
-            command_hash: row.command_hash,
-            execution_profile_id: row.execution_profile_id,
-            adapter_revision: row.adapter_revision,
-            executor_owner: owner.to_string(),
-            executor_lease_epoch: row.lease_epoch,
-            executor_lease_expires_at_ms: row.lease_expires_at_ms,
-        }))
+    ) -> Result<Option<ExecutorSubmissionResume>, ExecutorSubmissionError> {
+        resume_owned_execution(&self.pool, scope, owner).await
     }
 
     async fn claim_prepared(
@@ -1061,6 +1011,81 @@ impl ExecutorSubmissionStore for PostgresExecutorSubmissionStore {
         }
         tx.commit().await.map_err(unavailable)?;
         Ok(rows.len() as u64)
+    }
+}
+
+async fn resume_owned_execution(
+    pool: &PgPool,
+    scope: &ExecutorClaimScope,
+    owner: &str,
+) -> Result<Option<ExecutorSubmissionResume>, ExecutorSubmissionError> {
+    validate_claim_scope(scope)?;
+    validate_owner(owner)?;
+    let row: Option<ResumableRow> = sqlx::query_as(
+        r#"
+        WITH db_clock AS (
+          SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT AS now_ms
+        )
+        SELECT s.submission_id, e.executor_execution_id, s.output_id, s.job_id,
+               s.tenant_id, s.provider_id, s.model, s.work_item_id,
+               o.output_index, s.command_schema, s.command_hash,
+               s.execution_profile_id, s.adapter_revision,
+               (e.state = 'leased') AS needs_start,
+               e.lease_epoch, e.lease_expires_at_ms
+        FROM executor_executions e
+        JOIN provider_submissions s
+          ON s.executor_execution_id = e.executor_execution_id
+         AND s.submission_id = e.submission_id
+        JOIN job_outputs o ON o.output_id = s.output_id AND o.job_id = s.job_id
+        CROSS JOIN db_clock
+        WHERE (
+              (e.state = 'running' AND s.state = 'running')
+              OR (e.state = 'leased' AND s.state = 'prepared')
+            )
+          AND e.executor_owner = $1 AND e.lease_expires_at_ms > db_clock.now_ms
+          AND s.execution_profile_id = $2
+          AND s.provider_id = $3 AND s.command_schema = $4
+          AND s.adapter_revision = $5
+        ORDER BY (e.state = 'running') DESC,
+                 COALESCE(e.started_at_ms, e.leased_at_ms),
+                 e.created_at_ms, e.executor_execution_id
+        LIMIT 1
+        "#,
+    )
+    .bind(owner)
+    .bind(scope.execution_profile_id)
+    .bind(&scope.provider_id)
+    .bind(&scope.command_schema)
+    .bind(&scope.adapter_revision)
+    .fetch_optional(pool)
+    .await
+    .map_err(unavailable)?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let needs_start = row.needs_start;
+    let lease = ExecutorSubmissionLease {
+        submission_id: row.submission_id,
+        executor_execution_id: row.executor_execution_id,
+        output_id: row.output_id,
+        job_id: row.job_id,
+        tenant_id: row.tenant_id,
+        provider_id: row.provider_id,
+        model: row.model,
+        work_item_id: row.work_item_id,
+        output_index: row.output_index,
+        command_schema: row.command_schema,
+        command_hash: row.command_hash,
+        execution_profile_id: row.execution_profile_id,
+        adapter_revision: row.adapter_revision,
+        executor_owner: owner.to_string(),
+        executor_lease_epoch: row.lease_epoch,
+        executor_lease_expires_at_ms: row.lease_expires_at_ms,
+    };
+    if needs_start {
+        Ok(Some(ExecutorSubmissionResume::Leased(lease)))
+    } else {
+        Ok(Some(ExecutorSubmissionResume::Running(lease)))
     }
 }
 

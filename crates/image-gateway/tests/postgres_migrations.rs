@@ -240,7 +240,7 @@ const REQUIRED_COLUMNS: [(&str, &str); 170] = [
     ("provider_remote_submit_intents", "provider_timeout_ms"),
 ];
 
-const REQUIRED_INDEXES: [&str; 26] = [
+const REQUIRED_INDEXES: [&str; 27] = [
     "usage_events_tenant_created_at_ms_idx",
     "gateway_api_keys_project_id_idx",
     "quota_reservations_active_tenant_idx",
@@ -252,6 +252,7 @@ const REQUIRED_INDEXES: [&str; 26] = [
     "admission_input_cleanup_pending_idx",
     "admission_input_cleanup_lease_idx",
     "executor_executions_pending_evidence_idx",
+    "executor_executions_active_owner_idx",
     "executor_capacity_allocations_held_execution_idx",
     "executor_capacity_allocations_orphan_idx",
     "executor_resource_policies_enabled_account_uidx",
@@ -1156,9 +1157,9 @@ async fn assert_expected_schema(pool: &PgPool) -> TestResult {
         migration_versions(pool).await?
             == vec![
                 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22,
-                23, 24, 25, 26, 27,
+                23, 24, 25, 26, 27, 28,
             ],
-        "applied migration versions must be exactly [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27]",
+        "applied migration versions must be exactly [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28]",
     )?;
 
     for (table, column) in REQUIRED_COLUMNS {
@@ -1183,6 +1184,36 @@ async fn assert_expected_schema(pool: &PgPool) -> TestResult {
         .map_err(|error| format!("failed to query index {index}: {error}"))?;
         require(exists, &format!("index {index} must exist"))?;
     }
+
+    let active_owner_index: (bool, bool, String, String) = sqlx::query_as(
+        r#"
+        SELECT metadata.indisvalid, metadata.indisready,
+               pg_get_indexdef(metadata.indexrelid),
+               pg_get_expr(metadata.indpred, metadata.indrelid)
+        FROM pg_index metadata
+        JOIN pg_class index_relation
+          ON index_relation.oid = metadata.indexrelid
+        JOIN pg_namespace namespace
+          ON namespace.oid = index_relation.relnamespace
+        WHERE namespace.nspname = current_schema()
+          AND index_relation.relname = 'executor_executions_active_owner_idx'
+        "#,
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|error| format!("failed to inspect active owner index: {error}"))?;
+    let active_owner_definition = active_owner_index.2.to_ascii_lowercase();
+    let active_owner_predicate = active_owner_index.3.to_ascii_lowercase();
+    require(
+        active_owner_index.0
+            && active_owner_index.1
+            && active_owner_definition.contains("(executor_owner)")
+            && !active_owner_definition.contains("lease_expires_at_ms")
+            && active_owner_predicate.contains("executor_owner is not null")
+            && active_owner_predicate.contains("leased")
+            && active_owner_predicate.contains("running"),
+        "active owner index must be valid, partial, and heartbeat-update friendly",
+    )?;
 
     let recovery_deadline_constraint: Option<String> = sqlx::query_scalar(
         r#"

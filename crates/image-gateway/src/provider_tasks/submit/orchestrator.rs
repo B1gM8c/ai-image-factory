@@ -7,19 +7,20 @@ use std::{
 use image_provider_sdk::{EffectCertainty, PendingOperation, ProviderFailure, SingleOutputCommand};
 use sha2::{Digest, Sha256};
 
-use crate::executor::ExecutorSubmissionLease;
-
-use super::{
-    PostgresProviderTaskStore, ProviderExecutionContext, ProviderRemoteTask, ProviderSubmitAcquire,
-    ProviderSubmitDriver, ProviderSubmitDriverCall, ProviderSubmitDriverRecovery,
-    ProviderSubmitFailureKind, ProviderSubmitIntent, ProviderSubmitIntentState,
-    ProviderSubmitRecoveryFence, ProviderSubmitRecoveryLease, ProviderTaskStore,
-    ProviderTaskStoreError, RemoteTaskAttach, RemoteTaskQuarantinedReceipt,
-    RemoteTaskSubmitFailure, RemoteTaskSubmitReceipt, RemoteTaskSubmitReservation,
-    remote_submit::{
-        RemoteSubmitJournal, RemoteSubmitJournalError, RemoteSubmitJournalObservation,
-        RemoteSubmitJournalSpec, RemoteSubmitJournalTerminal, RemoteSubmitLaunch,
-        RemoteSubmitLaunchAuthority, RemoteSubmitRelease, RemoteSubmitReleasedAuthority,
+use crate::{
+    executor::ExecutorSubmissionLease,
+    provider_tasks::{
+        ProviderExecutionContext, ProviderRemoteTask, ProviderSubmitAcquire, ProviderSubmitDriver,
+        ProviderSubmitDriverCall, ProviderSubmitDriverRecovery, ProviderSubmitFailureKind,
+        ProviderSubmitIntent, ProviderSubmitIntentState, ProviderSubmitRecoveryFence,
+        ProviderSubmitRecoveryLease, ProviderTaskStore, ProviderTaskStoreError, RemoteTaskAttach,
+        RemoteTaskQuarantinedReceipt, RemoteTaskSubmitFailure, RemoteTaskSubmitReceipt,
+        RemoteTaskSubmitReservation,
+        remote_submit::{
+            RemoteSubmitJournal, RemoteSubmitJournalError, RemoteSubmitJournalObservation,
+            RemoteSubmitJournalSpec, RemoteSubmitJournalTerminal, RemoteSubmitLaunch,
+            RemoteSubmitLaunchAuthority, RemoteSubmitRelease, RemoteSubmitReleasedAuthority,
+        },
     },
 };
 
@@ -104,16 +105,20 @@ impl<D: ProviderSubmitDriver> ProviderSubmitRecoveryWork<D> {
     }
 }
 
-pub struct ProviderSubmitOrchestrator<D: ProviderSubmitDriver> {
-    store: PostgresProviderTaskStore,
+pub struct ProviderSubmitOrchestrator<S, D> {
+    store: S,
     driver: D,
     provider_timeout_ms: i64,
     journal: Arc<RemoteSubmitJournal>,
 }
 
-impl<D: ProviderSubmitDriver> ProviderSubmitOrchestrator<D> {
+impl<S, D> ProviderSubmitOrchestrator<S, D>
+where
+    S: ProviderTaskStore,
+    D: ProviderSubmitDriver,
+{
     pub fn new(
-        store: PostgresProviderTaskStore,
+        store: S,
         driver: D,
         provider_timeout_ms: i64,
         journal_root: impl AsRef<Path>,

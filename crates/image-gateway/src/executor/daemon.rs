@@ -115,8 +115,9 @@ where
     async fn acquire(
         &self,
     ) -> Result<Option<(ExecutorSubmissionLease, bool)>, ExecutorDaemonError> {
-        if let Some(lease) = self.store.resume_running(&self.scope, &self.owner).await? {
-            return Ok(Some((lease, false)));
+        if let Some(resume) = self.store.resume_owned(&self.scope, &self.owner).await? {
+            let needs_start = resume.needs_start();
+            return Ok(Some((resume.into_lease(), needs_start)));
         }
         Ok(self
             .store

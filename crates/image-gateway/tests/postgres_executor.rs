@@ -2938,10 +2938,11 @@ async fn expired_lease_reuses_allocation_and_disabled_profile_preserves_running_
             "disabled profile could not be loaded for in-flight recovery",
         )?;
         let resumed = store
-            .resume_running(&scope, "reclaim-owner-b")
+            .resume_owned(&scope, "reclaim-owner-b")
             .await
             .map_err(debug_error)?
-            .ok_or_else(|| "disabled profile interrupted an in-flight attach".to_string())?;
+            .ok_or_else(|| "disabled profile interrupted an in-flight attach".to_string())?
+            .into_lease();
         require(resumed == reclaimed, "running attach changed after profile disable")?;
         require(
             store
@@ -4537,7 +4538,7 @@ async fn claim_required_for(
 }
 
 #[tokio::test]
-async fn resume_running_fences_owner_scope_state_and_database_expiry() -> TestResult {
+async fn resume_owned_fences_owner_scope_state_and_database_expiry() -> TestResult {
     let Some(database) = TestDatabase::new().await? else {
         return Ok(());
     };
@@ -4550,25 +4551,37 @@ async fn resume_running_fences_owner_scope_state_and_database_expiry() -> TestRe
             .map_err(debug_error)?;
 
         let leased = claim_required_for(&store, "stable-executor", 200).await?;
+        let resumed_lease = store
+            .resume_owned(&claim_scope(), "stable-executor")
+            .await
+            .map_err(debug_error)?
+            .ok_or_else(|| "active leased execution did not resume".to_string())?;
+        require(
+            resumed_lease.needs_start() && resumed_lease.into_lease() == leased,
+            "leased resume changed durable lease identity",
+        )?;
         require(
             store
-                .resume_running(&claim_scope(), "stable-executor")
+                .resume_owned(&claim_scope(), "other-executor")
                 .await
                 .map_err(debug_error)?
                 .is_none(),
-            "leased execution was resumable",
+            "other owner resumed leased execution",
         )?;
         store.start(&leased).await.map_err(debug_error)?;
 
         let resumed = store
-            .resume_running(&claim_scope(), "stable-executor")
+            .resume_owned(&claim_scope(), "stable-executor")
             .await
             .map_err(debug_error)?
             .ok_or_else(|| "running execution did not resume".to_string())?;
-        require(resumed == leased, "resume changed durable lease identity")?;
+        require(
+            !resumed.needs_start() && resumed.into_lease() == leased,
+            "resume changed durable lease identity",
+        )?;
         require(
             store
-                .resume_running(&claim_scope(), "other-executor")
+                .resume_owned(&claim_scope(), "other-executor")
                 .await
                 .map_err(debug_error)?
                 .is_none(),
@@ -4580,7 +4593,7 @@ async fn resume_running_fences_owner_scope_state_and_database_expiry() -> TestRe
         };
         require(
             store
-                .resume_running(&wrong_scope, "stable-executor")
+                .resume_owned(&wrong_scope, "stable-executor")
                 .await
                 .map_err(debug_error)?
                 .is_none(),
@@ -4590,11 +4603,39 @@ async fn resume_running_fences_owner_scope_state_and_database_expiry() -> TestRe
         tokio::time::sleep(Duration::from_millis(220)).await;
         require(
             store
-                .resume_running(&claim_scope(), "stable-executor")
+                .resume_owned(&claim_scope(), "stable-executor")
                 .await
                 .map_err(debug_error)?
                 .is_none(),
             "expired running execution was resumable",
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
+async fn resume_owned_rejects_expired_prelaunch_lease() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let work = seed_lease(&database.pool, "resume-expired-lease-worker", 1).await?;
+        let store = PostgresExecutorSubmissionStore::new(database.pool.clone());
+        store
+            .prepare_and_handoff(&work, profile_id_for_lease(&work))
+            .await
+            .map_err(debug_error)?;
+        claim_required_for(&store, "expired-prelaunch-owner", 25).await?;
+        tokio::time::sleep(Duration::from_millis(40)).await;
+
+        require(
+            store
+                .resume_owned(&claim_scope(), "expired-prelaunch-owner")
+                .await
+                .map_err(debug_error)?
+                .is_none(),
+            "expired prelaunch lease was resumable",
         )
     }
     .await;
