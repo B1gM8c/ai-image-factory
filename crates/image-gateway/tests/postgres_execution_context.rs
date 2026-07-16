@@ -540,8 +540,14 @@ async fn handoff_only_workerd_process_needs_no_codex_or_artifact_mount() -> Test
                 ));
             }
             if tokio::time::Instant::now() >= deadline {
+                child.start_kill().map_err(debug_error)?;
+                let output = tokio::time::timeout(Duration::from_secs(2), child.wait_with_output())
+                    .await
+                    .map_err(|_| "timed-out handoff-only workerd did not exit".to_string())?
+                    .map_err(debug_error)?;
                 return Err(format!(
-                    "handoff-only workerd timed out with state {state:?}"
+                    "handoff-only workerd timed out with state {state:?}: {}",
+                    String::from_utf8_lossy(&output.stderr)
                 ));
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -944,15 +950,20 @@ async fn seed_codex_handoff_profile(pool: &PgPool) -> TestResult<Uuid> {
         r#"
         INSERT INTO provider_execution_profiles
           (execution_profile_id, profile_key, provider_id, command_schema,
+           operation_id, operation_descriptor_revision,
+           operation_descriptor_sha256_v1, completion_mode, idempotency_mode,
            adapter_revision, credential_pool_id, provider_account_id,
            credential_ref, credential_revision, resource_policy_id,
            resource_policy_revision, state, created_at_ms, updated_at_ms)
         VALUES ($1, $2, 'openai-codex', 'openai.images.generation.v1',
-                $3, $4, $5, $6, 1, $7, 1, 'enabled', $8, $8)
+                'images.generations', 'openai-codex/images.generations/v1',
+                $3, 'inline', 'submission_bound', $4, $5, $6, $7, 1,
+                $8, 1, 'enabled', $9, $9)
         "#,
     )
     .bind(execution_profile_id)
     .bind(format!("test-profile-{execution_profile_id}"))
+    .bind("f7f3e84594bfda2312d9420aa22108e76b10b3b22c52535ccf768f944d9b7aaa")
     .bind(CODEX_GENERATION_ADAPTER_REVISION)
     .bind(credential_pool_id)
     .bind(provider_account_id)

@@ -5,9 +5,9 @@ use std::{
 
 use image_provider_sdk::{
     ArtifactMetadata, ArtifactSink, CallbackEnvelope, CallbackReceipt, CancelReceipt, Completed,
-    EffectCertainty, InlineProvider, InvocationContext, PendingOperation, PollObservation,
-    ProviderFailure, ProviderFailureClass, ProviderRequestId, RemoteTaskProvider, RetryDirective,
-    SingleOutputCommand, Submission,
+    EffectCertainty, InlineProvider, InvocationContext, OutputSlot, PendingOperation,
+    PollObservation, ProviderFailure, ProviderFailureClass, ProviderRequestId, RemoteTaskProvider,
+    RetryDirective, SingleOutputCommand, Submission, SubmitIdempotency,
 };
 
 pub type TestPayload = Vec<u8>;
@@ -49,6 +49,27 @@ pub struct FakeCallCounts {
     pub callback: usize,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ObservedSubmitIdempotency {
+    SubmissionBound,
+    ProviderToken(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ObservedSubmitCall {
+    pub submission_id: String,
+    pub provider_id: String,
+    pub operation_id: String,
+    pub descriptor_revision: String,
+    pub model: String,
+    pub attempt: u32,
+    pub command_schema: &'static str,
+    pub adapter_revision: &'static str,
+    pub command_sha256: [u8; 32],
+    pub output: OutputSlot,
+    pub idempotency: ObservedSubmitIdempotency,
+}
+
 #[derive(Default)]
 struct FakeState {
     inline: VecDeque<InlineStep>,
@@ -56,6 +77,8 @@ struct FakeState {
     poll: VecDeque<PollStep>,
     cancel: VecDeque<Result<CancelReceipt, ProviderFailure>>,
     callback: VecDeque<Result<CallbackReceipt, ProviderFailure>>,
+    submit_idempotency: Vec<ObservedSubmitIdempotency>,
+    submit_calls: Vec<ObservedSubmitCall>,
     calls: FakeCallCounts,
 }
 
@@ -87,6 +110,14 @@ impl ScriptedFakeProvider {
 
     pub fn calls(&self) -> FakeCallCounts {
         self.state.lock().unwrap().calls
+    }
+
+    pub fn submit_idempotency(&self) -> Vec<ObservedSubmitIdempotency> {
+        self.state.lock().unwrap().submit_idempotency.clone()
+    }
+
+    pub fn submit_calls(&self) -> Vec<ObservedSubmitCall> {
+        self.state.lock().unwrap().submit_calls.clone()
     }
 }
 
@@ -154,13 +185,32 @@ impl RemoteTaskProvider for ScriptedFakeProvider {
 
     async fn submit<S: ArtifactSink>(
         &self,
-        _context: InvocationContext<'_>,
-        _command: &SingleOutputCommand<Self::Payload>,
+        context: InvocationContext<'_>,
+        idempotency: SubmitIdempotency<'_>,
+        command: &SingleOutputCommand<Self::Payload>,
         sink: &mut S,
     ) -> Result<Submission, ProviderFailure> {
         let step = {
             let mut state = self.state.lock().unwrap();
             state.calls.submit += 1;
+            let idempotency = match idempotency.token() {
+                Some(token) => ObservedSubmitIdempotency::ProviderToken(token.to_owned()),
+                None => ObservedSubmitIdempotency::SubmissionBound,
+            };
+            state.submit_idempotency.push(idempotency.clone());
+            state.submit_calls.push(ObservedSubmitCall {
+                submission_id: context.submission_id().to_owned(),
+                provider_id: context.provider_id().to_owned(),
+                operation_id: context.operation_id().to_owned(),
+                descriptor_revision: context.descriptor_revision().to_owned(),
+                model: context.model().to_owned(),
+                attempt: context.attempt(),
+                command_schema: command.schema_id(),
+                adapter_revision: command.adapter_revision(),
+                command_sha256: *command.canonical_sha256(),
+                output: command.output(),
+                idempotency,
+            });
             state.submit.pop_front()
         }
         .ok_or_else(|| missing_script("submit"))?;

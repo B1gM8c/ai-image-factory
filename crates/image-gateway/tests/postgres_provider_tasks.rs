@@ -14,7 +14,9 @@ use gpt_image_2_gateway::{
     admission::WorkLease,
     database::{connect_test_pool_with_search_path, run_migrations},
 };
+use image_provider_sdk::{OutputSlot, ProviderCommandIdentity, SingleOutputCommand};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use sqlx::{AssertSqlSafe, PgPool};
 use uuid::Uuid;
 
@@ -24,6 +26,24 @@ const PROFILE_ID: Uuid = Uuid::from_u128(0x1710);
 const POOL_ID: Uuid = Uuid::from_u128(0x1720);
 const ACCOUNT_ID: Uuid = Uuid::from_u128(0x1730);
 const POLICY_ID: Uuid = Uuid::from_u128(0x1740);
+
+macro_rules! submit_failure {
+    ($store:expr, $lease:expr, $kind:expr, $event:expr, $error:expr $(,)?) => {
+        submit_failure_request($store, $lease, $kind, $event, $error).await?
+    };
+}
+
+macro_rules! submit_receipt {
+    ($store:expr, $lease:expr, $operation:expr, $event:expr $(,)?) => {
+        submit_receipt_request($store, $lease, $operation, $event).await?
+    };
+}
+
+macro_rules! attach_request {
+    ($store:expr, $lease:expr, $operation:expr, $event:expr $(,)?) => {
+        bound_attach_request($store, $lease, $operation, $event).await?
+    };
+}
 
 #[tokio::test]
 async fn remote_task_store_closes_attach_poll_callback_and_cancel_invariants() -> TestResult {
@@ -69,7 +89,22 @@ async fn remote_task_store_closes_attach_poll_callback_and_cancel_invariants() -
             ProviderSubmitStart::Acquired(invocation)
             | ProviderSubmitStart::Existing(invocation) => invocation.context().clone(),
         };
-        let receipt = submit_receipt(&first, "operation-a", "submit-receipt-a");
+        require(
+            first_context.command_hash() == first.command_hash
+                && first_context.operation_id() == "images.generations"
+                && first_context.operation_descriptor_revision()
+                    == "provider-test/images.generations/v1"
+                && first_context.operation_descriptor_sha256_v1() == "2".repeat(64)
+                && first_context.completion_mode() == "remote_task"
+                && first_context.idempotency_mode() == "submission_bound"
+                && first_context.operation_binding_version() == 2
+                && first_context.provider_command_sha256()
+                    == hex::encode(reservation.provider_command().canonical_sha256())
+                && first_context.execution_binding_sha256()
+                    == reserved_left.execution_binding_sha256,
+            "submit start omitted or changed its exact operation binding",
+        )?;
+        let receipt = submit_receipt!(&store, &first, "operation-a", "submit-receipt-a");
         let (receipt_left, receipt_right) = tokio::join!(
             store.record_submit_receipt(&receipt),
             store.record_submit_receipt(&receipt)
@@ -81,7 +116,7 @@ async fn remote_task_store_closes_attach_poll_callback_and_cancel_invariants() -
                 && receipt_left.state == ProviderSubmitIntentState::OperationKnown,
             "concurrent submit receipt did not converge",
         )?;
-        let attach = attach_request(&first, "operation-a", "submit-event-a");
+        let attach = attach_request!(&store, &first, "operation-a", "submit-event-a");
         let (left, right) = tokio::join!(store.attach(&attach), store.attach(&attach));
         let left = left.map_err(debug_error)?;
         let right = right.map_err(debug_error)?;
@@ -135,9 +170,32 @@ async fn remote_task_store_closes_attach_poll_callback_and_cancel_invariants() -
             .start_submit(&reservation_request(&second))
             .await
             .map_err(debug_error)?;
+        let second_binding = binding_sha256(&store, &second).await?;
+        let mut cross_bound_receipt = receipt.clone();
+        cross_bound_receipt.execution_binding_sha256 = second_binding.clone();
+        require(
+            store.record_submit_receipt(&cross_bound_receipt).await
+                == Err(ProviderTaskStoreError::Conflict),
+            "submit receipt accepted another execution binding",
+        )?;
+        let mut cross_bound_failure = submit_failure_request(
+            &store,
+            &second,
+            ProviderSubmitFailureKind::OutcomeUnknown,
+            "cross-bound-failure",
+            "submit_effect_unknown",
+        )
+        .await?;
+        cross_bound_failure.execution_binding_sha256 =
+            first_context.execution_binding_sha256().to_string();
+        require(
+            store.record_submit_failure(&cross_bound_failure).await
+                == Err(ProviderTaskStoreError::Conflict),
+            "submit failure accepted another execution binding",
+        )?;
         require(
             store
-                .record_submit_receipt(&submit_receipt(
+                .record_submit_receipt(&submit_receipt!(&store,
                     &second,
                     "operation-a",
                     "conflicting-receipt-b",
@@ -147,19 +205,27 @@ async fn remote_task_store_closes_attach_poll_callback_and_cancel_invariants() -
             "same account remote operation was accepted across submissions",
         )?;
         store
-            .record_submit_receipt(&submit_receipt(
+            .record_submit_receipt(&submit_receipt!(&store,
                 &second,
                 "operation-b",
                 "submit-receipt-b",
             ))
             .await
             .map_err(debug_error)?;
-        let cross_submission = attach_request(&second, "operation-a", "submit-event-b");
+        let mut cross_bound_attach =
+            attach_request!(&store, &second, "operation-b", "cross-bound-attach");
+        cross_bound_attach.execution_binding_sha256 =
+            first_context.execution_binding_sha256().to_string();
+        require(
+            store.attach(&cross_bound_attach).await == Err(ProviderTaskStoreError::Conflict),
+            "remote task attach accepted another execution binding",
+        )?;
+        let cross_submission = attach_request!(&store, &second, "operation-a", "submit-event-b");
         require(
             store.attach(&cross_submission).await == Err(ProviderTaskStoreError::Conflict),
             "same account remote operation was attached across submissions",
         )?;
-        let second_attach = attach_request(&second, "operation-b", "submit-event-b");
+        let second_attach = attach_request!(&store, &second, "operation-b", "submit-event-b");
 
         let capacity_before_callback =
             capacity_heartbeat(&database.pool, first.executor_execution_id).await?;
@@ -754,6 +820,215 @@ async fn remote_task_store_closes_attach_poll_callback_and_cancel_invariants() -
 }
 
 #[tokio::test]
+async fn provider_task_leases_reject_cross_submission_splicing() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let store = PostgresProviderTaskStore::new(database.pool.clone());
+        seed_attached_remote_task(&database.pool, &store, "splice-a", "splice-a", 30_000, 0)
+            .await?;
+        seed_attached_remote_task(&database.pool, &store, "splice-b", "splice-b", 30_000, 0)
+            .await?;
+        let scope = claim_scope();
+        let first = store
+            .claim_due(&scope, "splice-poller", 5_000)
+            .await
+            .map_err(debug_error)?
+            .ok_or_else(|| "first splice fixture was not claimable".to_string())?;
+        let second = store
+            .claim_due(&scope, "splice-poller", 5_000)
+            .await
+            .map_err(debug_error)?
+            .ok_or_else(|| "second splice fixture was not claimable".to_string())?;
+        require(
+            first.task.submission_id != second.task.submission_id,
+            "splice fixtures resolved to the same submission",
+        )?;
+
+        let mut forged = first.clone();
+        forged.task = second.task.clone();
+        forged.poll_owner = second.poll_owner.clone();
+        forged.poll_lease_epoch = second.poll_lease_epoch;
+        let observation = ProviderTaskObservation {
+            event_identity: "forged-cross-submission-poll".to_string(),
+            source: ProviderTaskObservationSource::Poll,
+            outcome: ProviderTaskObservationOutcome::Waiting {
+                poll_after_ms: 1_000,
+            },
+        };
+        require(
+            store.heartbeat(&forged, 5_000).await == Err(ProviderTaskStoreError::InvalidInput)
+                && store.record_observation(&forged, &observation).await
+                    == Err(ProviderTaskStoreError::InvalidInput),
+            "poll lease authority was spliceable across submissions",
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
+async fn submit_recovery_leases_reject_cross_submission_splicing() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let store = PostgresProviderTaskStore::new(database.pool.clone());
+        let first =
+            seed_running_submission_with_lease(&database.pool, "splice-recovery-a", 250).await?;
+        let second =
+            seed_running_submission_with_lease(&database.pool, "splice-recovery-b", 250).await?;
+        for executor in [&first, &second] {
+            let reservation = reservation_request(executor);
+            store
+                .reserve_submit(&reservation)
+                .await
+                .map_err(debug_error)?;
+            store
+                .start_submit(&reservation)
+                .await
+                .map_err(debug_error)?;
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let scope = claim_scope();
+        let first = store
+            .claim_submit_recovery(&scope, "splice-recovery", "splice-command-a", 5_000)
+            .await
+            .map_err(debug_error)?
+            .ok_or_else(|| "first recovery splice fixture was not claimable".to_string())?;
+        let second = store
+            .claim_submit_recovery(&scope, "splice-recovery", "splice-command-b", 5_000)
+            .await
+            .map_err(debug_error)?
+            .ok_or_else(|| "second recovery splice fixture was not claimable".to_string())?;
+        require(
+            first.intent.submission_id != second.intent.submission_id,
+            "recovery splice fixtures resolved to the same submission",
+        )?;
+
+        let mut forged = first.clone();
+        forged.intent = second.intent.clone();
+        forged.recovery_owner = second.recovery_owner.clone();
+        forged.recovery_lease_epoch = second.recovery_lease_epoch;
+        require(
+            store.heartbeat_submit_recovery(&forged, 5_000).await
+                == Err(ProviderTaskStoreError::InvalidInput)
+                && store
+                    .defer_submit_recovery(&forged, "forged-defer", 1_000)
+                    .await
+                    == Err(ProviderTaskStoreError::InvalidInput),
+            "submit recovery authority was spliceable across submissions",
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
+async fn remote_submit_requires_exact_remote_operation_binding() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let inline_profile_id = Uuid::new_v4();
+        let inline_adapter = "provider-test-inline-v1";
+        let now = database_now(&database.pool).await?;
+        sqlx::query(
+            r#"
+            INSERT INTO provider_execution_profiles
+              (execution_profile_id, profile_key, provider_id, command_schema,
+               operation_id, operation_descriptor_revision,
+               operation_descriptor_sha256_v1, completion_mode, idempotency_mode,
+               adapter_revision, credential_pool_id, provider_account_id,
+               credential_ref, credential_revision, resource_policy_id,
+               resource_policy_revision, state, created_at_ms, updated_at_ms)
+            VALUES ($1, $2, 'provider-test', 'provider-command-v1',
+                    'images.generations', 'provider-test/images.generations/v1',
+                    $3, 'inline', 'submission_bound', $4, $5, $6,
+                    'test-vault.provider-task.1', 1, $7, 1, 'enabled', $8, $8)
+            "#,
+        )
+        .bind(inline_profile_id)
+        .bind(format!("provider-inline-{}", inline_profile_id.simple()))
+        .bind("2".repeat(64))
+        .bind(inline_adapter)
+        .bind(POOL_ID)
+        .bind(ACCOUNT_ID)
+        .bind(POLICY_ID)
+        .bind(now)
+        .execute(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        let inline = seed_running_submission_for_profile(
+            &database.pool,
+            "inline-binding",
+            5_000,
+            inline_profile_id,
+            inline_adapter,
+        )
+        .await?;
+        let store = PostgresProviderTaskStore::new(database.pool.clone());
+        require(
+            store.reserve_submit(&reservation_request(&inline)).await
+                == Err(ProviderTaskStoreError::Conflict),
+            "inline operation profile entered the remote submit lifecycle",
+        )?;
+        let intent_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM provider_remote_submit_intents WHERE submission_id = $1",
+        )
+        .bind(inline.submission_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(intent_count == 0, "rejected inline submit left durable intent evidence")?;
+        require(
+            sqlx::query(
+                "UPDATE provider_execution_profiles SET completion_mode = 'remote_task' WHERE execution_profile_id = $1",
+            )
+            .bind(inline_profile_id)
+            .execute(&database.pool)
+            .await
+            .is_err(),
+            "execution profile operation semantics were mutable",
+        )?;
+        require(
+            sqlx::query(
+                "UPDATE provider_submissions SET operation_descriptor_sha256_v1 = $2 WHERE submission_id = $1",
+            )
+            .bind(inline.submission_id)
+            .bind("3".repeat(64))
+            .execute(&database.pool)
+            .await
+            .is_err(),
+            "provider submission descriptor snapshot was mutable",
+        )?;
+
+        let remote = seed_running_submission(&database.pool, "remote-binding").await?;
+        let reservation = reservation_request(&remote);
+        store
+            .reserve_submit(&reservation)
+            .await
+            .map_err(debug_error)?;
+        let changed_command = reservation
+            .clone()
+            .with_provider_command(provider_command_identity([4; 32]));
+        require(
+            store.reserve_submit(&changed_command).await == Err(ProviderTaskStoreError::Conflict),
+            "reservation replay accepted a different provider command digest",
+        )?;
+        let mut changed_timeout = reservation.clone();
+        changed_timeout.provider_timeout_ms += 1;
+        require(
+            store.reserve_submit(&changed_timeout).await == Err(ProviderTaskStoreError::Conflict),
+            "reservation replay accepted a different provider timeout",
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
 async fn remote_task_deadline_fences_late_poll_and_quarantines_capacity() -> TestResult {
     let Some(database) = TestDatabase::new().await? else {
         return Ok(());
@@ -1258,7 +1533,8 @@ async fn poll_claim_stops_after_one_locked_candidate_window() -> TestResult {
                 .map_err(debug_error)?;
             let operation_id = format!("bounded-poll-operation-{index}");
             store
-                .record_submit_receipt(&submit_receipt(
+                .record_submit_receipt(&submit_receipt!(
+                    &store,
                     &lease,
                     &operation_id,
                     &format!("bounded-poll-receipt-{index}"),
@@ -1266,7 +1542,8 @@ async fn poll_claim_stops_after_one_locked_candidate_window() -> TestResult {
                 .await
                 .map_err(debug_error)?;
             store
-                .attach(&attach_request(
+                .attach(&attach_request!(
+                    &store,
                     &lease,
                     &operation_id,
                     &format!("bounded-poll-attach-{index}"),
@@ -1755,7 +2032,7 @@ async fn submit_intent_lifecycle_fences_ambiguous_replay_and_late_evidence() -> 
             "sending intent lost its frozen recovery identity",
         )?;
 
-        let unknown = submit_failure(
+        let unknown = submit_failure!(&store,
             &late_lease,
             ProviderSubmitFailureKind::OutcomeUnknown,
             "submit-receipt-lost",
@@ -1810,7 +2087,7 @@ async fn submit_intent_lifecycle_fences_ambiguous_replay_and_late_evidence() -> 
             "generic lease reconciliation stole submit recovery ownership",
         )?;
         let known = store
-            .record_submit_receipt(&submit_receipt(
+            .record_submit_receipt(&submit_receipt!(&store,
                 &late_lease,
                 "operation-late",
                 "late-receipt",
@@ -1844,12 +2121,12 @@ async fn submit_intent_lifecycle_fences_ambiguous_replay_and_late_evidence() -> 
             .ok_or_else(|| "expired submit was not recoverable".to_string())?;
         require(
             recovery.intent.state == ProviderSubmitIntentState::OperationKnown
-                && recovery.context().idempotency_key() == late_reservation.idempotency_key
+                && recovery.submission_idempotency_key() == late_reservation.idempotency_key
                 && recovery.context().invocation_attempt() == 1,
             "recovery claim did not return the frozen invocation context",
         )?;
         let mut recovered_attach =
-            attach_request(&late_lease, "operation-late", "late-attach");
+            attach_request!(&store, &late_lease, "operation-late", "late-attach");
         recovered_attach.recovery_fence = Some(ProviderSubmitRecoveryFence {
             recovery_owner: recovery.recovery_owner.clone(),
             recovery_lease_epoch: recovery.recovery_lease_epoch,
@@ -1873,7 +2150,7 @@ async fn submit_intent_lifecycle_fences_ambiguous_replay_and_late_evidence() -> 
             .start_submit(&rejected_reservation)
             .await
             .map_err(debug_error)?;
-        let rejected = submit_failure(
+        let rejected = submit_failure!(&store,
             &rejected_lease,
             ProviderSubmitFailureKind::Rejected,
             "provider-rejected-event",
@@ -1997,7 +2274,8 @@ async fn submit_intent_terminal_projections_are_deferred_and_atomic() -> TestRes
             .await
             .map_err(debug_error)?;
         store
-            .record_submit_receipt(&submit_receipt(
+            .record_submit_receipt(&submit_receipt!(
+                &store,
                 &attached_lease,
                 "bare-operation",
                 "bare-receipt",
@@ -2061,6 +2339,14 @@ async fn submit_recovery_claim_is_scoped_fenced_and_reclaimable() -> TestResult 
         require(
             invocation.context().model() == "model-test"
                 && invocation.context().command_schema() == "provider-command-v1"
+                && invocation.context().command_hash() == executor.command_hash
+                && invocation.context().operation_id() == "images.generations"
+                && invocation.context().operation_descriptor_revision()
+                    == "provider-test/images.generations/v1"
+                && invocation.context().operation_descriptor_sha256_v1() == "2".repeat(64)
+                && invocation.context().completion_mode() == "remote_task"
+                && invocation.context().idempotency_mode() == "submission_bound"
+                && invocation.context().operation_binding_version() == 2
                 && invocation.context().execution_profile_id() == PROFILE_ID
                 && invocation.context().adapter_revision() == "provider-test-adapter-v1"
                 && invocation.context().credential_pool_id() == POOL_ID
@@ -2069,7 +2355,11 @@ async fn submit_recovery_claim_is_scoped_fenced_and_reclaimable() -> TestResult 
                 && invocation.context().credential_auth_sha256() == "1".repeat(64)
                 && invocation.context().resource_policy_id() == POLICY_ID
                 && invocation.context().resource_policy_revision() == 1
-                && invocation.context().idempotency_key() == reservation.idempotency_key
+                && invocation.submission_idempotency_key() == reservation.idempotency_key
+                && invocation.context().provider_command_sha256()
+                    == hex::encode(reservation.provider_command().canonical_sha256())
+                && invocation.context().execution_binding_sha256()
+                    == invocation.intent.execution_binding_sha256
                 && invocation.context().invocation_attempt() == 1
                 && invocation.context().provider_timeout_ms() == 30_000
                 && invocation.context().provider_deadline_at_ms()
@@ -2194,7 +2484,7 @@ async fn submit_recovery_claim_is_scoped_fenced_and_reclaimable() -> TestResult 
             "claim command identity was reused for a defer command",
         )?;
         store
-            .record_submit_receipt(&submit_receipt(
+            .record_submit_receipt(&submit_receipt!(&store,
                 &executor,
                 "operation-recovered",
                 "receipt-recovered",
@@ -2448,14 +2738,14 @@ async fn submit_recovery_claim_is_scoped_fenced_and_reclaimable() -> TestResult 
             .map_err(debug_error)?;
 
         store
-            .record_submit_receipt(&submit_receipt(
+            .record_submit_receipt(&submit_receipt!(&store,
                 &executor,
                 "operation-recovered",
                 "receipt-recovered",
             ))
             .await
             .map_err(debug_error)?;
-        let direct = attach_request(&executor, "operation-recovered", "direct-attach");
+        let direct = attach_request!(&store, &executor, "operation-recovered", "direct-attach");
         require(
             store.attach(&direct).await == Err(ProviderTaskStoreError::StaleLease),
             "expired executor attached without the recovery fence",
@@ -2538,7 +2828,7 @@ async fn submit_recovery_claim_is_scoped_fenced_and_reclaimable() -> TestResult 
             .map_err(debug_error)?
             .ok_or_else(|| "pre-deadline recovery was not claimable".to_string())?;
         store
-            .record_submit_receipt(&submit_receipt(
+            .record_submit_receipt(&submit_receipt!(&store,
                 &deadline_executor,
                 "operation-after-deadline",
                 "receipt-before-deadline",
@@ -2546,7 +2836,7 @@ async fn submit_recovery_claim_is_scoped_fenced_and_reclaimable() -> TestResult 
             .await
             .map_err(debug_error)?;
         tokio::time::sleep(Duration::from_millis(120)).await;
-        let mut deadline_attach = attach_request(
+        let mut deadline_attach = attach_request!(&store,
             &deadline_executor,
             "operation-after-deadline",
             "attach-after-deadline",
@@ -2582,7 +2872,7 @@ async fn submit_recovery_claim_is_scoped_fenced_and_reclaimable() -> TestResult 
             .await
             .map_err(debug_error)?
             .ok_or_else(|| "confirmed rejection recovery was not claimable".to_string())?;
-        let mut rejection = submit_failure(
+        let mut rejection = submit_failure!(&store,
             &rejected_executor,
             ProviderSubmitFailureKind::Rejected,
             "recovered-rejection",
@@ -2694,17 +2984,7 @@ async fn deadline_quarantine_migration_accepts_due_active_recovery() -> TestResu
     let result = async {
         let executor =
             seed_running_submission_with_lease(&database.pool, "deadline-upgrade", 5_000).await?;
-        let store = PostgresProviderTaskStore::new(database.pool.clone());
-        let mut reservation = reservation_request(&executor);
-        reservation.provider_timeout_ms = 60;
-        store
-            .reserve_submit(&reservation)
-            .await
-            .map_err(debug_error)?;
-        store
-            .start_submit(&reservation)
-            .await
-            .map_err(debug_error)?;
+        seed_legacy_sending_submit(&database.pool, &executor, 60).await?;
         tokio::time::sleep(Duration::from_millis(90)).await;
 
         let mut business = database.pool.begin().await.map_err(debug_error)?;
@@ -2797,13 +3077,9 @@ async fn deadline_quarantine_migration_accepts_due_active_recovery() -> TestResu
                 .any(|(mode, granted)| mode == "ShareRowExclusiveLock" && *granted),
             format!("0021 held a weaker lock before ACCESS EXCLUSIVE: {locks:?}"),
         )?;
-        let resolved = store
-            .resolve_due_submit_deadline(&claim_scope())
-            .await
-            .map_err(debug_error)?
-            .ok_or_else(|| "migrated due recovery was not resolvable".to_string())?;
+        let resolved = resolve_legacy_due_submit_deadline(&database.pool, &executor).await?;
         require(
-            resolved.state == ProviderSubmitIntentState::DeadlineQuarantined,
+            resolved == "deadline_quarantined",
             "20 -> 21 migration changed deadline resolver semantics",
         )?;
         let index_definition: String = sqlx::query_scalar(
@@ -2836,17 +3112,7 @@ async fn capacity_reconciliation_migration_backfills_deadline_quarantine() -> Te
     let result = async {
         let executor =
             seed_running_submission_with_lease(&database.pool, "capacity-upgrade", 5_000).await?;
-        let store = PostgresProviderTaskStore::new(database.pool.clone());
-        let mut reservation = reservation_request(&executor);
-        reservation.provider_timeout_ms = 40;
-        store
-            .reserve_submit(&reservation)
-            .await
-            .map_err(debug_error)?;
-        store
-            .start_submit(&reservation)
-            .await
-            .map_err(debug_error)?;
+        seed_legacy_sending_submit(&database.pool, &executor, 40).await?;
         tokio::time::sleep(Duration::from_millis(60)).await;
         force_deadline_quarantine_v21(&database.pool, &executor).await?;
 
@@ -2878,26 +3144,7 @@ async fn capacity_reconciliation_migration_backfills_deadline_quarantine() -> Te
             backfill == ("active".to_string(), 0, "held".to_string(), 1),
             format!("21 -> 22 backfill diverged: {backfill:?}"),
         )?;
-        let lease = store
-            .claim_due_capacity_reconciliation(
-                &claim_scope(),
-                "capacity-upgrade-owner",
-                "capacity-upgrade-claim",
-                5_000,
-            )
-            .await
-            .map_err(debug_error)?
-            .ok_or_else(|| "backfilled reconciliation was not claimable".to_string())?;
-        store
-            .record_capacity_evidence(
-                &lease,
-                &ProviderCapacityEvidence {
-                    event_identity: "capacity-upgrade-no-effect".to_string(),
-                    outcome: ProviderCapacityEvidenceOutcome::ConfirmedNoEffect,
-                },
-            )
-            .await
-            .map_err(debug_error)?;
+        release_legacy_capacity_no_effect(&database.pool, &executor).await?;
         require(
             sqlx::query_scalar::<_, i32>(
                 "SELECT allocated_count FROM executor_resource_policies WHERE resource_policy_id = $1 AND revision = 1",
@@ -2922,17 +3169,7 @@ async fn capacity_reconciliation_migration_rejects_incomplete_quarantine() -> Te
     let result = async {
         let executor =
             seed_running_submission_with_lease(&database.pool, "capacity-drift", 5_000).await?;
-        let store = PostgresProviderTaskStore::new(database.pool.clone());
-        let mut reservation = reservation_request(&executor);
-        reservation.provider_timeout_ms = 40;
-        store
-            .reserve_submit(&reservation)
-            .await
-            .map_err(debug_error)?;
-        store
-            .start_submit(&reservation)
-            .await
-            .map_err(debug_error)?;
+        seed_legacy_sending_submit(&database.pool, &executor, 40).await?;
         tokio::time::sleep(Duration::from_millis(60)).await;
         force_deadline_quarantine_v21(&database.pool, &executor).await?;
 
@@ -3231,20 +3468,10 @@ async fn recovery_command_migration_requires_drained_claimants() -> TestResult {
         return Ok(());
     };
     let result = async {
-        let store = PostgresProviderTaskStore::new(database.pool.clone());
         let executor =
             seed_running_submission_with_lease(&database.pool, "recovery-command-upgrade", 5_000)
                 .await?;
-        let mut reservation = reservation_request(&executor);
-        reservation.provider_timeout_ms = 60_000;
-        store
-            .reserve_submit(&reservation)
-            .await
-            .map_err(debug_error)?;
-        store
-            .start_submit(&reservation)
-            .await
-            .map_err(debug_error)?;
+        seed_legacy_sending_submit(&database.pool, &executor, 60_000).await?;
         let now = database_now(&database.pool).await?;
         sqlx::query(
             r#"
@@ -3428,6 +3655,318 @@ async fn recovery_command_migration_rolls_back_after_late_failure() -> TestResul
         require(
             residue == (false, false),
             format!("late 0024 failure left schema residue: {residue:?}"),
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
+async fn operation_binding_migration_rejects_unknown_profiles_atomically() -> TestResult {
+    let Some(database) = TestDatabase::new_before_operation_binding().await? else {
+        return Ok(());
+    };
+    let result = async {
+        require(
+            sqlx::raw_sql(include_str!(
+                "../migrations/0026_immutable_provider_operation_binding.sql"
+            ))
+            .execute(&database.pool)
+            .await
+            .is_err(),
+            "0026 inferred an unknown provider operation descriptor",
+        )?;
+        assert_operation_binding_migration_rolled_back(&database.pool).await
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
+async fn operation_binding_migration_requires_pre_activation_remote_history() -> TestResult {
+    let Some(database) = TestDatabase::new_before_operation_binding().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let lease = seed_running_submission(&database.pool, "operation-binding-evidence").await?;
+        seed_legacy_sending_submit(&database.pool, &lease, 60_000).await?;
+        require(
+            sqlx::raw_sql(include_str!(
+                "../migrations/0026_immutable_provider_operation_binding.sql"
+            ))
+            .execute(&database.pool)
+            .await
+            .is_err(),
+            "0026 accepted legacy remote submit evidence",
+        )?;
+        assert_operation_binding_migration_rolled_back(&database.pool).await
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
+async fn operation_binding_migration_requires_active_executions_to_be_drained() -> TestResult {
+    let Some(database) = TestDatabase::new_before_operation_binding().await? else {
+        return Ok(());
+    };
+    let result = async {
+        seed_running_submission(&database.pool, "operation-binding-active").await?;
+        require(
+            sqlx::raw_sql(include_str!(
+                "../migrations/0026_immutable_provider_operation_binding.sql"
+            ))
+            .execute(&database.pool)
+            .await
+            .is_err(),
+            "0026 accepted an active executor submission",
+        )?;
+        assert_operation_binding_migration_rolled_back(&database.pool).await
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
+async fn operation_binding_migration_backfills_known_codex_profile() -> TestResult {
+    let Some(database) = TestDatabase::new_before_operation_binding().await? else {
+        return Ok(());
+    };
+    let result = async {
+        sqlx::raw_sql(
+            r#"
+            ALTER TABLE provider_execution_profiles
+              DISABLE TRIGGER provider_execution_profiles_identity;
+            DELETE FROM provider_execution_profiles;
+            ALTER TABLE provider_execution_profiles
+              ENABLE TRIGGER provider_execution_profiles_identity;
+            "#,
+        )
+        .execute(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        let pool_id = Uuid::new_v4();
+        let account_id = Uuid::new_v4();
+        let policy_id = Uuid::new_v4();
+        let profile_id = Uuid::new_v4();
+        let now = database_now(&database.pool).await?;
+        let mut seed = database.pool.begin().await.map_err(debug_error)?;
+        sqlx::query(
+            "INSERT INTO provider_credential_pools (credential_pool_id, pool_key, provider_id, state, created_at_ms, updated_at_ms) VALUES ($1, $2, 'openai-codex', 'enabled', $3, $3)",
+        )
+        .bind(pool_id)
+        .bind(format!("codex-pool-{}", pool_id.simple()))
+        .bind(now)
+        .execute(&mut *seed)
+        .await
+        .map_err(debug_error)?;
+        sqlx::query(
+            "INSERT INTO provider_accounts (provider_account_id, credential_pool_id, provider_id, account_key, credential_ref, credential_revision, credential_auth_sha256, state, created_at_ms, updated_at_ms) VALUES ($1, $2, 'openai-codex', $3, $4, 1, $5, 'enabled', $6, $6)",
+        )
+        .bind(account_id)
+        .bind(pool_id)
+        .bind(format!("codex-account-{}", account_id.simple()))
+        .bind(format!("test-vault.codex.{}", account_id.simple()))
+        .bind("a".repeat(64))
+        .bind(now)
+        .execute(&mut *seed)
+        .await
+        .map_err(debug_error)?;
+        sqlx::query(
+            "INSERT INTO executor_resource_policies (resource_policy_id, revision, credential_pool_id, provider_account_id, provider_id, execution_class, max_concurrency, state, created_at_ms) VALUES ($1, 1, $2, $3, 'openai-codex', 'inline', 1, 'enabled', $4)",
+        )
+        .bind(policy_id)
+        .bind(pool_id)
+        .bind(account_id)
+        .bind(now)
+        .execute(&mut *seed)
+        .await
+        .map_err(debug_error)?;
+        sqlx::query(
+            "INSERT INTO provider_execution_profiles (execution_profile_id, profile_key, provider_id, command_schema, adapter_revision, credential_pool_id, provider_account_id, credential_ref, credential_revision, resource_policy_id, resource_policy_revision, state, created_at_ms, updated_at_ms) VALUES ($1, $2, 'openai-codex', 'openai.images.generation.v1', 'codex-cli-v1', $3, $4, $5, 1, $6, 1, 'enabled', $7, $7)",
+        )
+        .bind(profile_id)
+        .bind(format!("codex-profile-{}", profile_id.simple()))
+        .bind(pool_id)
+        .bind(account_id)
+        .bind(format!("test-vault.codex.{}", account_id.simple()))
+        .bind(policy_id)
+        .bind(now)
+        .execute(&mut *seed)
+        .await
+        .map_err(debug_error)?;
+        seed.commit().await.map_err(debug_error)?;
+
+        let forced = format!(
+            "{}\nDO $$ BEGIN RAISE EXCEPTION 'forced late 0026 failure'; END $$;",
+            include_str!("../migrations/0026_immutable_provider_operation_binding.sql")
+        );
+        require(
+            sqlx::raw_sql(AssertSqlSafe(forced))
+                .execute(&database.pool)
+                .await
+                .is_err(),
+            "forced late 0026 failure unexpectedly committed",
+        )?;
+        assert_operation_binding_migration_rolled_back(&database.pool).await?;
+
+        sqlx::raw_sql(include_str!(
+            "../migrations/0026_immutable_provider_operation_binding.sql"
+        ))
+        .execute(&database.pool)
+        .await
+        .map_err(|error| format!("0026 rejected a known Codex profile: {error}"))?;
+        let profile: (String, String, String, String, String) = sqlx::query_as(
+            r#"
+            SELECT operation_id, operation_descriptor_revision,
+                   operation_descriptor_sha256_v1, completion_mode, idempotency_mode
+            FROM provider_execution_profiles
+            WHERE execution_profile_id = $1
+            "#,
+        )
+        .bind(profile_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(
+            profile
+                == (
+                    "images.generations".to_string(),
+                    "openai-codex/images.generations/v1".to_string(),
+                    "f7f3e84594bfda2312d9420aa22108e76b10b3b22c52535ccf768f944d9b7aaa"
+                        .to_string(),
+                    "inline".to_string(),
+                    "submission_bound".to_string(),
+                ),
+            "0026 backfilled the wrong Codex operation descriptor",
+        )?;
+        require(
+            sqlx::query(
+                "UPDATE provider_execution_profiles SET operation_id = 'images.edits' WHERE execution_profile_id = $1",
+            )
+            .bind(profile_id)
+            .execute(&database.pool)
+            .await
+            .is_err(),
+            "0026 did not restore profile immutability",
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
+async fn operation_binding_migration_preserves_terminal_v1_handoff_replay() -> TestResult {
+    let Some(database) = TestDatabase::new_before_operation_binding().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let (mut work, executor) =
+            seed_legacy_running_submission_and_work(&database.pool, "terminal-v1", 5_000)
+                .await?;
+        let executor_store = PostgresExecutorSubmissionStore::new(database.pool.clone());
+        executor_store
+            .record_outcome(
+                &executor,
+                &ExecutorSubmissionOutcome::Failed {
+                    error_code: "terminal_v1_fixture".to_string(),
+                },
+            )
+            .await
+            .map_err(debug_error)?;
+
+        // The shared legacy fixture provisions a synthetic provider. Rewrite
+        // only its immutable test identity so it represents a historical Codex
+        // terminal row before applying 0026.
+        let mut rewrite = database.pool.begin().await.map_err(debug_error)?;
+        sqlx::query("SET LOCAL session_replication_role = replica")
+            .execute(&mut *rewrite)
+            .await
+            .map_err(debug_error)?;
+        for (statement, identity) in [
+            (
+                "UPDATE provider_credential_pools SET provider_id = 'openai-codex' WHERE credential_pool_id = $1",
+                POOL_ID,
+            ),
+            (
+                "UPDATE provider_accounts SET provider_id = 'openai-codex' WHERE provider_account_id = $1",
+                ACCOUNT_ID,
+            ),
+            (
+                "UPDATE executor_resource_policies SET provider_id = 'openai-codex' WHERE resource_policy_id = $1",
+                POLICY_ID,
+            ),
+        ] {
+            sqlx::query(statement)
+                .bind(identity)
+                .execute(&mut *rewrite)
+                .await
+                .map_err(debug_error)?;
+        }
+        sqlx::query(
+            "UPDATE provider_execution_profiles SET provider_id = 'openai-codex', command_schema = 'openai.images.generation.v1' WHERE execution_profile_id = $1",
+        )
+        .bind(PROFILE_ID)
+        .execute(&mut *rewrite)
+        .await
+        .map_err(debug_error)?;
+        sqlx::query(
+            "UPDATE jobs SET provider_id = 'openai-codex', model = 'gpt-image-2' WHERE job_id = $1",
+        )
+        .bind(work.job_id)
+        .execute(&mut *rewrite)
+        .await
+        .map_err(debug_error)?;
+        sqlx::query(
+            "UPDATE job_payloads SET command_schema = 'openai.images.generation.v1' WHERE job_id = $1",
+        )
+        .bind(work.job_id)
+        .execute(&mut *rewrite)
+        .await
+        .map_err(debug_error)?;
+        sqlx::query(
+            "UPDATE provider_submissions SET provider_id = 'openai-codex', model = 'gpt-image-2', command_schema = 'openai.images.generation.v1' WHERE submission_id = $1",
+        )
+        .bind(executor.submission_id)
+        .execute(&mut *rewrite)
+        .await
+        .map_err(debug_error)?;
+        rewrite.commit().await.map_err(debug_error)?;
+        work.command_schema = "openai.images.generation.v1".to_string();
+
+        sqlx::raw_sql(include_str!(
+            "../migrations/0026_immutable_provider_operation_binding.sql"
+        ))
+        .execute(&database.pool)
+        .await
+        .map_err(|error| format!("0026 rejected a terminal v1 submission: {error}"))?;
+        let legacy_binding: (i16, Option<String>, Option<String>, Option<String>) =
+            sqlx::query_as(
+                r#"
+                SELECT operation_binding_version, operation_id,
+                       operation_descriptor_sha256_v1, completion_mode
+                FROM provider_submissions
+                WHERE submission_id = $1
+                "#,
+            )
+            .bind(executor.submission_id)
+            .fetch_one(&database.pool)
+            .await
+            .map_err(debug_error)?;
+        require(
+            legacy_binding == (1, None, None, None),
+            format!("0026 rewrote terminal history instead of retaining v1: {legacy_binding:?}"),
+        )?;
+
+        let replay = executor_store
+            .prepare_and_handoff(&work, PROFILE_ID)
+            .await
+            .map_err(debug_error)?;
+        require(
+            replay.len() == 1
+                && replay[0].submission_id == executor.submission_id
+                && replay[0].executor_execution_id == executor.executor_execution_id,
+            "terminal v1 handoff replay minted different executor identities",
         )
     }
     .await;
@@ -3739,7 +4278,8 @@ async fn provider_submit_commit_classifies_deferred_projection_conflicts() -> Te
         .map_err(debug_error)?;
         require(
             store
-                .record_submit_receipt(&submit_receipt(
+                .record_submit_receipt(&submit_receipt!(
+                    &store,
                     &receipt_executor,
                     "operation-deferred-conflict",
                     "receipt-deferred-conflict",
@@ -3846,7 +4386,8 @@ async fn submit_deadline_quarantines_capacity_and_preserves_late_receipts() -> T
             .start_submit(&reservation)
             .await
             .map_err(debug_error)?;
-        let ambiguity = submit_failure(
+        let ambiguity = submit_failure!(
+            &store,
             &executor,
             ProviderSubmitFailureKind::OutcomeUnknown,
             "deadline-ambiguity",
@@ -4031,7 +4572,8 @@ async fn submit_deadline_quarantines_capacity_and_preserves_late_receipts() -> T
             "raw SQL released deadline-quarantined provider capacity",
         )?;
 
-        let receipt = submit_receipt(
+        let receipt = submit_receipt!(
+            &store,
             &executor,
             "operation-late-after-deadline",
             "receipt-late-after-deadline",
@@ -4053,7 +4595,8 @@ async fn submit_deadline_quarantines_capacity_and_preserves_late_receipts() -> T
                 == late,
             "exact late receipt replay did not converge",
         )?;
-        let conflicting = submit_receipt(
+        let conflicting = submit_receipt!(
+            &store,
             &executor,
             "operation-conflicting-after-deadline",
             "receipt-conflicting-after-deadline",
@@ -4065,7 +4608,8 @@ async fn submit_deadline_quarantines_capacity_and_preserves_late_receipts() -> T
         )?;
         require(
             store
-                .attach(&attach_request(
+                .attach(&attach_request!(
+                    &store,
                     &executor,
                     "operation-late-after-deadline",
                     "attach-late-after-deadline",
@@ -4100,7 +4644,8 @@ async fn submit_deadline_races_converge_without_deadlock() -> TestResult {
             .await
             .map_err(debug_error)?;
         tokio::time::sleep(Duration::from_millis(120)).await;
-        let receipt = submit_receipt(
+        let receipt = submit_receipt!(
+            &store,
             &executor,
             "operation-deadline-race",
             "receipt-deadline-race",
@@ -4171,7 +4716,8 @@ async fn submit_deadline_races_converge_without_deadlock() -> TestResult {
             .await
             .map_err(debug_error)?;
         store
-            .record_submit_receipt(&submit_receipt(
+            .record_submit_receipt(&submit_receipt!(
+                &store,
                 &attach_executor,
                 "operation-deadline-attach-race",
                 "receipt-deadline-attach-race",
@@ -4179,7 +4725,8 @@ async fn submit_deadline_races_converge_without_deadlock() -> TestResult {
             .await
             .map_err(debug_error)?;
         tokio::time::sleep(Duration::from_millis(300)).await;
-        let attach = attach_request(
+        let attach = attach_request!(
+            &store,
             &attach_executor,
             "operation-deadline-attach-race",
             "attach-deadline-race",
@@ -4545,7 +5092,7 @@ async fn capacity_reconciliation_is_scoped_fenced_and_exactly_replayable() -> Te
             format!("capacity evidence release diverged: {projection:?}"),
         )?;
         let late_after_release = store
-            .record_submit_receipt(&submit_receipt(
+            .record_submit_receipt(&submit_receipt!(&store,
                 &first,
                 "operation-after-no-effect",
                 "receipt-after-no-effect",
@@ -4590,7 +5137,7 @@ async fn capacity_reconciliation_is_scoped_fenced_and_exactly_replayable() -> Te
             "raw receipt bypassed the reconciliation evidence revision",
         )?;
         store
-            .record_submit_receipt(&submit_receipt(
+            .record_submit_receipt(&submit_receipt!(&store,
                 &second,
                 "operation-before-release",
                 "receipt-before-release",
@@ -4694,7 +5241,7 @@ async fn capacity_reconciliation_is_scoped_fenced_and_exactly_replayable() -> Te
             "remote terminal evidence established an unowned operation identity",
         )?;
         store
-            .record_submit_receipt(&submit_receipt(
+            .record_submit_receipt(&submit_receipt!(&store,
                 &third,
                 "operation-terminal-authority",
                 "receipt-terminal-authority",
@@ -4721,7 +5268,7 @@ async fn capacity_reconciliation_is_scoped_fenced_and_exactly_replayable() -> Te
             .map_err(debug_error)?;
         require(
             store
-                .record_submit_receipt(&submit_receipt(
+                .record_submit_receipt(&submit_receipt!(&store,
                     &third,
                     "operation-terminal-conflict",
                     "receipt-terminal-conflict",
@@ -4731,7 +5278,7 @@ async fn capacity_reconciliation_is_scoped_fenced_and_exactly_replayable() -> Te
             "late receipt contradicted remote terminal evidence",
         )?;
         store
-            .record_submit_receipt(&submit_receipt(
+            .record_submit_receipt(&submit_receipt!(&store,
                 &third,
                 "operation-terminal-authority",
                 "receipt-terminal-authority",
@@ -4841,7 +5388,8 @@ async fn capacity_evidence_and_late_receipt_race_converges_without_deadlock() ->
             .await
             .map_err(debug_error)?
             .ok_or_else(|| "capacity race was not claimable".to_string())?;
-        let receipt = submit_receipt(
+        let receipt = submit_receipt!(
+            &store,
             &executor,
             "operation-capacity-race",
             "receipt-capacity-race",
@@ -5088,9 +5636,9 @@ async fn seed_v22_artifact_ready(
     worker: &str,
     identity: &str,
 ) -> TestResult<LegacyArtifactReady> {
-    // This fixture exercises migration 0023 with the current store. Add only the
-    // later task columns required by that store; migration 0023 owns all behavior
-    // under test here.
+    // Migration 0023 is tested against the exact v22 schema. The temporary task
+    // columns model the later deadline fields only long enough to reuse the legacy
+    // attach fixture; no current production store is run against this schema.
     sqlx::raw_sql(
         r#"
         ALTER TABLE provider_remote_tasks
@@ -5102,52 +5650,67 @@ async fn seed_v22_artifact_ready(
     .await
     .map_err(debug_error)?;
     let executor = seed_running_submission(pool, worker).await?;
-    let store = PostgresProviderTaskStore::new(pool.clone());
-    let reservation = reservation_request(&executor);
-    store
-        .reserve_submit(&reservation)
-        .await
-        .map_err(debug_error)?;
-    store
-        .start_submit(&reservation)
-        .await
-        .map_err(debug_error)?;
-    let operation_id = format!("{identity}-operation");
-    store
-        .record_submit_receipt(&submit_receipt(
-            &executor,
-            &operation_id,
-            &format!("{identity}-receipt"),
-        ))
-        .await
-        .map_err(debug_error)?;
-    store
-        .attach(&attach_request(
-            &executor,
-            &operation_id,
-            &format!("{identity}-attach"),
-        ))
-        .await
-        .map_err(debug_error)?;
-    let lease = store
-        .claim_due(&claim_scope(), &format!("{identity}-poller"), 60_000)
-        .await
-        .map_err(debug_error)?
-        .ok_or_else(|| "v22 artifact task was not claimable".to_string())?;
+    seed_legacy_attached_remote_task(pool, &executor, identity, 60_000, 0).await?;
+    let poll_owner = format!("{identity}-poller");
+    let claim_at_ms = database_now(pool).await?;
     let authority_id = executor.executor_execution_id.simple().to_string();
-    let authority = ProviderArtifactAuthority::new(
-        "filesystem-v1".to_string(),
-        format!("filesystem-v1:{identity}"),
-        format!("executor-objects/{}/{}", &authority_id[..2], authority_id),
-        "c".repeat(64),
-        128,
-        "image/png".to_string(),
+    let storage_namespace = format!("filesystem-v1:{identity}");
+    let object_key = format!("executor-objects/{}/{}", &authority_id[..2], authority_id);
+    let mut publication = pool.begin().await.map_err(debug_error)?;
+    let claimed = sqlx::query(
+        r#"
+        UPDATE provider_remote_tasks
+        SET poll_owner = $2, poll_lease_epoch = poll_lease_epoch + 1,
+            poll_lease_expires_at_ms = $3 + 60_000,
+            poll_claimed_at_ms = $3, updated_at_ms = $3
+        WHERE submission_id = $1 AND state = 'provider_waiting'
+          AND poll_owner IS NULL AND next_poll_at_ms <= $3
+        "#,
     )
-    .ok_or_else(|| "v22 artifact authority was invalid".to_string())?;
-    store
-        .publish_artifact_authority(&lease, &authority)
-        .await
-        .map_err(debug_error)?;
+    .bind(executor.submission_id)
+    .bind(&poll_owner)
+    .bind(claim_at_ms)
+    .execute(&mut *publication)
+    .await
+    .map_err(debug_error)?
+    .rows_affected();
+    require(claimed == 1, "v22 artifact task was not claimable")?;
+    sqlx::query(
+        r#"
+        INSERT INTO executor_artifact_authorities
+          (authority_id, executor_execution_id, submission_id, output_id, job_id,
+           storage_backend, storage_namespace, object_key, sha256_hex, byte_size,
+           media_type, created_at_ms)
+        VALUES ($1, $1, $2, $3, $4, 'filesystem-v1', $5, $6, $7, 128,
+                'image/png', $8)
+        "#,
+    )
+    .bind(executor.executor_execution_id)
+    .bind(executor.submission_id)
+    .bind(executor.output_id)
+    .bind(executor.job_id)
+    .bind(storage_namespace)
+    .bind(object_key)
+    .bind("c".repeat(64))
+    .bind(claim_at_ms)
+    .execute(&mut *publication)
+    .await
+    .map_err(debug_error)?;
+    sqlx::query(
+        r#"
+        INSERT INTO executor_result_manifests
+          (manifest_id, artifact_authority_id, executor_execution_id,
+           submission_id, created_at_ms)
+        VALUES ($1, $2, $2, $1, $3)
+        "#,
+    )
+    .bind(executor.submission_id)
+    .bind(executor.executor_execution_id)
+    .bind(claim_at_ms)
+    .execute(&mut *publication)
+    .await
+    .map_err(debug_error)?;
+    publication.commit().await.map_err(debug_error)?;
 
     let observation_id = Uuid::new_v4();
     let observed_at_ms = database_now(pool).await?;
@@ -5170,8 +5733,8 @@ async fn seed_v22_artifact_ready(
     .bind(executor.executor_execution_id)
     .bind(event_identity)
     .bind(&artifact_ref)
-    .bind(&lease.poll_owner)
-    .bind(lease.poll_lease_epoch)
+    .bind(&poll_owner)
+    .bind(1_i64)
     .bind("d".repeat(64))
     .bind(observed_at_ms)
     .execute(&mut *legacy)
@@ -5203,23 +5766,44 @@ async fn seed_v22_artifact_ready(
 }
 
 fn reservation_request(lease: &ExecutorSubmissionLease) -> RemoteTaskSubmitReservation {
-    RemoteTaskSubmitReservation {
-        submission_id: lease.submission_id,
-        executor_execution_id: lease.executor_execution_id,
-        executor_owner: lease.executor_owner.clone(),
-        executor_lease_epoch: lease.executor_lease_epoch,
-        idempotency_key: format!("provider-submit-{}", lease.submission_id.simple()),
-        provider_timeout_ms: 60_000,
-    }
+    let mut provider_command = Sha256::new();
+    provider_command.update(b"ai-image-factory/provider-test-command/v1\0");
+    provider_command.update(lease.submission_id.as_bytes());
+    provider_command.update(lease.output_id.as_bytes());
+    provider_command.update(lease.output_index.to_be_bytes());
+    provider_command.update(lease.command_hash.as_bytes());
+    RemoteTaskSubmitReservation::new(
+        lease.submission_id,
+        lease.executor_execution_id,
+        lease.executor_owner.clone(),
+        lease.executor_lease_epoch,
+        format!("provider-submit-{}", lease.submission_id.simple()),
+        provider_command_identity(provider_command.finalize().into()),
+        60_000,
+    )
 }
 
-fn submit_failure(
+fn provider_command_identity(canonical_sha256: [u8; 32]) -> ProviderCommandIdentity {
+    SingleOutputCommand::new(
+        "provider-test.command.v1",
+        "provider-test-adapter-v1",
+        canonical_sha256,
+        OutputSlot::new(0, 1).expect("one test output is valid"),
+        (),
+    )
+    .expect("provider test command identity is valid")
+    .identity()
+}
+
+async fn submit_failure_request(
+    store: &PostgresProviderTaskStore,
     lease: &ExecutorSubmissionLease,
     kind: ProviderSubmitFailureKind,
     event_identity: &str,
     error_code: &str,
-) -> RemoteTaskSubmitFailure {
-    RemoteTaskSubmitFailure {
+) -> TestResult<RemoteTaskSubmitFailure> {
+    let execution_binding_sha256 = binding_sha256(store, lease).await?;
+    Ok(RemoteTaskSubmitFailure {
         submission_id: lease.submission_id,
         executor_execution_id: lease.executor_execution_id,
         executor_owner: lease.executor_owner.clone(),
@@ -5227,16 +5811,19 @@ fn submit_failure(
         kind,
         event_identity: event_identity.to_string(),
         error_code: error_code.to_string(),
+        execution_binding_sha256,
         recovery_fence: None,
-    }
+    })
 }
 
-fn submit_receipt(
+async fn submit_receipt_request(
+    store: &PostgresProviderTaskStore,
     lease: &ExecutorSubmissionLease,
     operation: &str,
     event: &str,
-) -> RemoteTaskSubmitReceipt {
-    RemoteTaskSubmitReceipt {
+) -> TestResult<RemoteTaskSubmitReceipt> {
+    let execution_binding_sha256 = binding_sha256(store, lease).await?;
+    Ok(RemoteTaskSubmitReceipt {
         submission_id: lease.submission_id,
         executor_execution_id: lease.executor_execution_id,
         executor_owner: lease.executor_owner.clone(),
@@ -5244,15 +5831,18 @@ fn submit_receipt(
         remote_operation_id: operation.to_string(),
         provider_request_id: Some(format!("request-{operation}")),
         event_identity: event.to_string(),
-    }
+        execution_binding_sha256,
+    })
 }
 
-fn attach_request(
+async fn bound_attach_request(
+    store: &PostgresProviderTaskStore,
     lease: &ExecutorSubmissionLease,
     operation: &str,
     event: &str,
-) -> RemoteTaskAttach {
-    RemoteTaskAttach {
+) -> TestResult<RemoteTaskAttach> {
+    let execution_binding_sha256 = binding_sha256(store, lease).await?;
+    Ok(RemoteTaskAttach {
         submission_id: lease.submission_id,
         executor_execution_id: lease.executor_execution_id,
         executor_owner: lease.executor_owner.clone(),
@@ -5260,9 +5850,22 @@ fn attach_request(
         remote_operation_id: operation.to_string(),
         provider_request_id: Some(format!("request-{operation}")),
         event_identity: event.to_string(),
+        execution_binding_sha256,
         poll_after_ms: 0,
         recovery_fence: None,
-    }
+    })
+}
+
+async fn binding_sha256(
+    store: &PostgresProviderTaskStore,
+    lease: &ExecutorSubmissionLease,
+) -> TestResult<String> {
+    store
+        .load_submit_intent(lease.submission_id)
+        .await
+        .map_err(debug_error)?
+        .map(|intent| intent.execution_binding_sha256)
+        .ok_or_else(|| "provider submit intent is unavailable".to_string())
 }
 
 fn claim_scope() -> ProviderTaskClaimScope {
@@ -5270,6 +5873,73 @@ fn claim_scope() -> ProviderTaskClaimScope {
         provider_id: "provider-test".to_string(),
         provider_account_id: ACCOUNT_ID,
     }
+}
+
+async fn seed_legacy_sending_submit(
+    pool: &PgPool,
+    lease: &ExecutorSubmissionLease,
+    provider_timeout_ms: i64,
+) -> TestResult<i64> {
+    let reservation = reservation_request(lease);
+    let now = database_now(pool).await?;
+    let provider_deadline_at_ms = now + provider_timeout_ms;
+    let next_recovery_at_ms = lease
+        .executor_lease_expires_at_ms
+        .min(provider_deadline_at_ms);
+    let mut tx = pool.begin().await.map_err(debug_error)?;
+    sqlx::query(
+        r#"
+        INSERT INTO provider_remote_submit_intents
+          (submission_id, executor_execution_id, provider_id, provider_account_id,
+           submit_owner, submit_lease_epoch, idempotency_key, state,
+           created_at_ms, updated_at_ms)
+        VALUES ($1, $2, 'provider-test', $3, $4, $5, $6, 'reserved', $7, $7)
+        "#,
+    )
+    .bind(lease.submission_id)
+    .bind(lease.executor_execution_id)
+    .bind(ACCOUNT_ID)
+    .bind(&lease.executor_owner)
+    .bind(lease.executor_lease_epoch)
+    .bind(&reservation.idempotency_key)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .map_err(debug_error)?;
+    sqlx::query(
+        r#"
+        UPDATE provider_remote_submit_intents
+        SET state = 'sending', send_started_at_ms = $3, updated_at_ms = $3
+        WHERE submission_id = $1 AND executor_execution_id = $2 AND state = 'reserved'
+        "#,
+    )
+    .bind(lease.submission_id)
+    .bind(lease.executor_execution_id)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .map_err(debug_error)?;
+    sqlx::query(
+        r#"
+        INSERT INTO provider_submit_recoveries
+          (submission_id, executor_execution_id, provider_id, provider_account_id,
+           invocation_attempt, provider_timeout_ms, provider_deadline_at_ms,
+           next_recovery_at_ms, state, created_at_ms, updated_at_ms)
+        VALUES ($1, $2, 'provider-test', $3, 1, $4, $5, $6, 'active', $7, $7)
+        "#,
+    )
+    .bind(lease.submission_id)
+    .bind(lease.executor_execution_id)
+    .bind(ACCOUNT_ID)
+    .bind(provider_timeout_ms)
+    .bind(provider_deadline_at_ms)
+    .bind(next_recovery_at_ms)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .map_err(debug_error)?;
+    tx.commit().await.map_err(debug_error)?;
+    Ok(provider_deadline_at_ms)
 }
 
 async fn seed_attached_remote_task(
@@ -5281,6 +5951,17 @@ async fn seed_attached_remote_task(
     poll_after_ms: i64,
 ) -> TestResult<ExecutorSubmissionLease> {
     let lease = seed_running_submission_with_lease(pool, worker, 5_000).await?;
+    if !operation_binding_exists(pool).await? {
+        seed_legacy_attached_remote_task(
+            pool,
+            &lease,
+            identity,
+            provider_timeout_ms,
+            poll_after_ms,
+        )
+        .await?;
+        return Ok(lease);
+    }
     let mut reservation = reservation_request(&lease);
     reservation.provider_timeout_ms = provider_timeout_ms;
     store
@@ -5293,17 +5974,236 @@ async fn seed_attached_remote_task(
         .map_err(debug_error)?;
     let operation = format!("{identity}-operation");
     store
-        .record_submit_receipt(&submit_receipt(
+        .record_submit_receipt(&submit_receipt!(
+            &store,
             &lease,
             &operation,
             &format!("{identity}-receipt"),
         ))
         .await
         .map_err(debug_error)?;
-    let mut attach = attach_request(&lease, &operation, &format!("{identity}-attach"));
+    let mut attach = attach_request!(&store, &lease, &operation, &format!("{identity}-attach"));
     attach.poll_after_ms = poll_after_ms;
     store.attach(&attach).await.map_err(debug_error)?;
     Ok(lease)
+}
+
+async fn seed_legacy_attached_remote_task(
+    pool: &PgPool,
+    lease: &ExecutorSubmissionLease,
+    identity: &str,
+    provider_timeout_ms: i64,
+    poll_after_ms: i64,
+) -> TestResult {
+    let provider_deadline_at_ms =
+        seed_legacy_sending_submit(pool, lease, provider_timeout_ms).await?;
+    let operation = format!("{identity}-operation");
+    let request_id = format!("request-{operation}");
+    let receipt_event = format!("{identity}-receipt");
+    let attach_event = format!("{identity}-attach");
+    let observation_id = Uuid::new_v4();
+    let now = database_now(pool).await?;
+    let next_poll_at_ms = (now + poll_after_ms).min(provider_deadline_at_ms);
+    let payload_hash = legacy_observation_hash(
+        "submit_attach",
+        "provider_waiting",
+        "not_applicable",
+        Some(next_poll_at_ms),
+        None,
+        None,
+    );
+    let has_task_deadline: bool = sqlx::query_scalar(
+        r#"
+        SELECT EXISTS (
+          SELECT 1 FROM information_schema.columns
+          WHERE table_schema = current_schema()
+            AND table_name = 'provider_remote_tasks'
+            AND column_name = 'provider_deadline_at_ms'
+        )
+        "#,
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(debug_error)?;
+    let mut tx = pool.begin().await.map_err(debug_error)?;
+    sqlx::query(
+        r#"
+        UPDATE provider_remote_submit_intents
+        SET state = 'operation_known', remote_operation_id = $3,
+            provider_request_id = $4, receipt_event_identity = $5,
+            updated_at_ms = $6
+        WHERE submission_id = $1 AND executor_execution_id = $2 AND state = 'sending'
+        "#,
+    )
+    .bind(lease.submission_id)
+    .bind(lease.executor_execution_id)
+    .bind(&operation)
+    .bind(&request_id)
+    .bind(&receipt_event)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .map_err(debug_error)?;
+    sqlx::query(
+        r#"
+        UPDATE provider_remote_submit_intents
+        SET state = 'attached', updated_at_ms = $3
+        WHERE submission_id = $1 AND executor_execution_id = $2
+          AND state = 'operation_known'
+        "#,
+    )
+    .bind(lease.submission_id)
+    .bind(lease.executor_execution_id)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .map_err(debug_error)?;
+    if has_task_deadline {
+        sqlx::query(
+            r#"
+            INSERT INTO provider_remote_tasks
+              (submission_id, executor_execution_id, provider_id, provider_account_id,
+               remote_operation_id, provider_request_id, submit_owner, submit_lease_epoch,
+               attach_recovery_owner, attach_recovery_lease_epoch,
+               provider_deadline_at_ms, state, effect_certainty, next_poll_at_ms,
+               state_observation_id, created_at_ms, updated_at_ms)
+            VALUES ($1, $2, 'provider-test', $3, $4, $5, $6, $7, NULL, NULL,
+                    $8, 'provider_waiting', 'not_applicable', $9, $10, $11, $11)
+            "#,
+        )
+        .bind(lease.submission_id)
+        .bind(lease.executor_execution_id)
+        .bind(ACCOUNT_ID)
+        .bind(&operation)
+        .bind(&request_id)
+        .bind(&lease.executor_owner)
+        .bind(lease.executor_lease_epoch)
+        .bind(provider_deadline_at_ms)
+        .bind(next_poll_at_ms)
+        .bind(observation_id)
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .map_err(debug_error)?;
+    } else {
+        sqlx::query(
+            r#"
+            INSERT INTO provider_remote_tasks
+              (submission_id, executor_execution_id, provider_id, provider_account_id,
+               remote_operation_id, provider_request_id, submit_owner, submit_lease_epoch,
+               attach_recovery_owner, attach_recovery_lease_epoch,
+               state, effect_certainty, next_poll_at_ms,
+               state_observation_id, created_at_ms, updated_at_ms)
+            VALUES ($1, $2, 'provider-test', $3, $4, $5, $6, $7, NULL, NULL,
+                    'provider_waiting', 'not_applicable', $8, $9, $10, $10)
+            "#,
+        )
+        .bind(lease.submission_id)
+        .bind(lease.executor_execution_id)
+        .bind(ACCOUNT_ID)
+        .bind(&operation)
+        .bind(&request_id)
+        .bind(&lease.executor_owner)
+        .bind(lease.executor_lease_epoch)
+        .bind(next_poll_at_ms)
+        .bind(observation_id)
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .map_err(debug_error)?;
+    }
+    sqlx::query(
+        r#"
+        INSERT INTO provider_task_observations
+          (observation_id, submission_id, executor_execution_id, event_identity,
+           source, observed_state, effect_certainty, next_poll_at_ms,
+           payload_hash, observed_at_ms)
+        VALUES ($1, $2, $3, $4, 'submit_attach', 'provider_waiting',
+                'not_applicable', $5, $6, $7)
+        "#,
+    )
+    .bind(observation_id)
+    .bind(lease.submission_id)
+    .bind(lease.executor_execution_id)
+    .bind(attach_event)
+    .bind(next_poll_at_ms)
+    .bind(payload_hash)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .map_err(debug_error)?;
+    sqlx::query(
+        r#"
+        UPDATE provider_submit_recoveries
+        SET state = 'closed', next_recovery_at_ms = NULL,
+            recovery_owner = NULL, recovery_lease_expires_at_ms = NULL,
+            recovery_claimed_at_ms = NULL, updated_at_ms = $3, closed_at_ms = $3
+        WHERE submission_id = $1 AND executor_execution_id = $2 AND state = 'active'
+        "#,
+    )
+    .bind(lease.submission_id)
+    .bind(lease.executor_execution_id)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .map_err(debug_error)?;
+    sqlx::query(
+        r#"
+        UPDATE executor_executions
+        SET state = 'provider_waiting', executor_owner = NULL,
+            lease_expires_at_ms = NULL, updated_at_ms = $3
+        WHERE executor_execution_id = $1 AND submission_id = $2 AND state = 'running'
+        "#,
+    )
+    .bind(lease.executor_execution_id)
+    .bind(lease.submission_id)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .map_err(debug_error)?;
+    sqlx::query(
+        r#"
+        UPDATE provider_submissions
+        SET state = 'provider_waiting', updated_at_ms = $3
+        WHERE submission_id = $1 AND executor_execution_id = $2 AND state = 'running'
+        "#,
+    )
+    .bind(lease.submission_id)
+    .bind(lease.executor_execution_id)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .map_err(debug_error)?;
+    tx.commit().await.map_err(debug_error)
+}
+
+fn legacy_observation_hash(
+    source: &str,
+    state: &str,
+    effect_certainty: &str,
+    next_poll_at_ms: Option<i64>,
+    poll_owner: Option<&str>,
+    poll_lease_epoch: Option<i64>,
+) -> String {
+    let mut hash = Sha256::new();
+    for value in [
+        source,
+        state,
+        "",
+        "",
+        "",
+        "",
+        "",
+        effect_certainty,
+        poll_owner.unwrap_or(""),
+    ] {
+        hash.update((value.len() as u64).to_be_bytes());
+        hash.update(value.as_bytes());
+    }
+    hash.update(0_u64.to_be_bytes());
+    hash.update(next_poll_at_ms.unwrap_or(-1).to_be_bytes());
+    hash.update(poll_lease_epoch.unwrap_or(-1).to_be_bytes());
+    hex::encode(hash.finalize())
 }
 
 async fn seed_v24_remote_task(
@@ -5334,11 +6234,25 @@ async fn seed_v24_remote_task(
     .await
     .map_err(debug_error)?;
     if leave_claimed {
-        store
-            .claim_due(&claim_scope(), &format!("{identity}-poller"), 5_000)
-            .await
-            .map_err(debug_error)?
-            .ok_or_else(|| "v24 remote task was not claimable".to_string())?;
+        let now = database_now(pool).await?;
+        let changed = sqlx::query(
+            r#"
+            UPDATE provider_remote_tasks
+            SET poll_owner = $2, poll_lease_epoch = poll_lease_epoch + 1,
+                poll_lease_expires_at_ms = $3 + 5_000,
+                poll_claimed_at_ms = $3, updated_at_ms = $3
+            WHERE submission_id = $1 AND state = 'provider_waiting'
+              AND poll_owner IS NULL AND next_poll_at_ms <= $3
+            "#,
+        )
+        .bind(executor.submission_id)
+        .bind(format!("{identity}-poller"))
+        .bind(now)
+        .execute(pool)
+        .await
+        .map_err(debug_error)?
+        .rows_affected();
+        require(changed == 1, "v24 remote task was not claimable")?;
     }
     sqlx::raw_sql(
         r#"
@@ -5381,6 +6295,43 @@ async fn assert_remote_task_deadline_migration_rolled_back(pool: &PgPool) -> Tes
     )
 }
 
+async fn assert_operation_binding_migration_rolled_back(pool: &PgPool) -> TestResult {
+    let residue: (i64, bool, bool) = sqlx::query_as(
+        r#"
+        SELECT
+          (SELECT COUNT(*) FROM information_schema.columns
+           WHERE table_schema = current_schema()
+             AND (
+               (table_name = 'provider_execution_profiles'
+                AND column_name = 'operation_id')
+               OR (table_name = 'provider_submissions'
+                   AND column_name = 'operation_binding_version')
+               OR (table_name = 'provider_remote_submit_intents'
+                   AND column_name = 'execution_binding_sha256')
+             )),
+          EXISTS (
+            SELECT 1 FROM pg_trigger
+            WHERE tgrelid = 'provider_execution_profiles'::regclass
+              AND tgname = 'provider_execution_profiles_identity'
+              AND NOT tgisinternal
+          ),
+          EXISTS (
+            SELECT 1 FROM pg_trigger
+            WHERE tgrelid = 'provider_submissions'::regclass
+              AND tgname = 'provider_submission_state_transition'
+              AND NOT tgisinternal
+          )
+        "#,
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(debug_error)?;
+    require(
+        residue == (0, true, true),
+        format!("failed 0026 migration left schema residue: {residue:?}"),
+    )
+}
+
 fn artifact_authority(
     lease: &ExecutorSubmissionLease,
     identity: &str,
@@ -5414,7 +6365,8 @@ async fn seed_deadline_quarantine(
         .await
         .map_err(debug_error)?;
     store
-        .record_submit_failure(&submit_failure(
+        .record_submit_failure(&submit_failure!(
+            &store,
             &lease,
             ProviderSubmitFailureKind::OutcomeUnknown,
             &format!("{worker}-ambiguous"),
@@ -5525,6 +6477,132 @@ async fn force_deadline_quarantine_v21(
     tx.commit().await.map_err(debug_error)
 }
 
+async fn resolve_legacy_due_submit_deadline(
+    pool: &PgPool,
+    lease: &ExecutorSubmissionLease,
+) -> TestResult<String> {
+    let now = database_now(pool).await?;
+    let mut tx = pool.begin().await.map_err(debug_error)?;
+    let changed = sqlx::query(
+        r#"
+        UPDATE provider_remote_submit_intents
+        SET state = 'deadline_quarantined', updated_at_ms = $3
+        WHERE submission_id = $1 AND executor_execution_id = $2
+          AND state IN ('sending', 'outcome_unknown', 'operation_known')
+          AND EXISTS (
+            SELECT 1 FROM provider_submit_recoveries recovery
+            WHERE recovery.submission_id = $1
+              AND recovery.executor_execution_id = $2
+              AND recovery.state = 'active'
+              AND recovery.provider_deadline_at_ms <= $3
+          )
+        "#,
+    )
+    .bind(lease.submission_id)
+    .bind(lease.executor_execution_id)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .map_err(debug_error)?
+    .rows_affected();
+    require(changed == 1, "migrated due recovery was not resolvable")?;
+    sqlx::query(
+        r#"
+        UPDATE provider_submit_recoveries
+        SET state = 'closed', next_recovery_at_ms = NULL,
+            recovery_owner = NULL, recovery_lease_expires_at_ms = NULL,
+            recovery_claimed_at_ms = NULL, updated_at_ms = $3, closed_at_ms = $3
+        WHERE submission_id = $1 AND executor_execution_id = $2 AND state = 'active'
+        "#,
+    )
+    .bind(lease.submission_id)
+    .bind(lease.executor_execution_id)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .map_err(debug_error)?;
+    sqlx::query(
+        r#"
+        INSERT INTO executor_resolution_decisions
+          (decision_id, executor_execution_id, submission_id, source,
+           observation_id, provider_task_observation_id, provider_submit_intent_id,
+           resolved_state, result_manifest_id, error_code, decided_at_ms)
+        VALUES ($1, $1, $2, 'remote_submit_deadline', NULL, NULL, $2,
+                'uncertain', NULL, 'provider_submit_deadline', $3)
+        "#,
+    )
+    .bind(lease.executor_execution_id)
+    .bind(lease.submission_id)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .map_err(debug_error)?;
+    sqlx::query(
+        r#"
+        UPDATE executor_executions
+        SET state = 'uncertain', executor_owner = NULL,
+            lease_expires_at_ms = NULL, resolution_decision_id = $1,
+            finished_at_ms = $3, updated_at_ms = $3,
+            error_code = 'provider_submit_deadline'
+        WHERE executor_execution_id = $1 AND submission_id = $2 AND state = 'running'
+        "#,
+    )
+    .bind(lease.executor_execution_id)
+    .bind(lease.submission_id)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .map_err(debug_error)?;
+    sqlx::query(
+        r#"
+        UPDATE provider_submissions
+        SET state = 'uncertain', resolution_decision_id = $1,
+            finished_at_ms = $3, updated_at_ms = $3,
+            error_code = 'provider_submit_deadline'
+        WHERE executor_execution_id = $1 AND submission_id = $2 AND state = 'running'
+        "#,
+    )
+    .bind(lease.executor_execution_id)
+    .bind(lease.submission_id)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .map_err(debug_error)?;
+    sqlx::query(
+        r#"
+        INSERT INTO provider_capacity_reconciliations
+          (reconciliation_id, submission_id, executor_execution_id,
+           provider_id, provider_account_id, provider_deadline_at_ms,
+           state, available_at_ms, reconciliation_owner,
+           reconciliation_lease_epoch, evidence_revision,
+           created_at_ms, updated_at_ms)
+        SELECT $1, intent.submission_id, intent.executor_execution_id,
+               intent.provider_id, intent.provider_account_id,
+               recovery.provider_deadline_at_ms, 'active', $3, NULL, 0,
+               CASE WHEN intent.receipt_event_identity IS NULL THEN 0 ELSE 1 END,
+               $3, $3
+        FROM provider_remote_submit_intents intent
+        JOIN provider_submit_recoveries recovery
+          ON recovery.submission_id = intent.submission_id
+         AND recovery.executor_execution_id = intent.executor_execution_id
+        WHERE intent.executor_execution_id = $1 AND intent.submission_id = $2
+          AND intent.state = 'deadline_quarantined' AND recovery.state = 'closed'
+        "#,
+    )
+    .bind(lease.executor_execution_id)
+    .bind(lease.submission_id)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .map_err(debug_error)?;
+    tx.commit().await.map_err(debug_error)?;
+    sqlx::query_scalar("SELECT state FROM provider_remote_submit_intents WHERE submission_id = $1")
+        .bind(lease.submission_id)
+        .fetch_one(pool)
+        .await
+        .map_err(debug_error)
+}
+
 async fn seed_running_submission(
     pool: &PgPool,
     worker: &str,
@@ -5537,20 +6615,44 @@ async fn seed_running_submission_with_lease(
     worker: &str,
     lease_ms: i64,
 ) -> TestResult<ExecutorSubmissionLease> {
+    seed_running_submission_for_profile(
+        pool,
+        worker,
+        lease_ms,
+        PROFILE_ID,
+        "provider-test-adapter-v1",
+    )
+    .await
+}
+
+async fn seed_running_submission_for_profile(
+    pool: &PgPool,
+    worker: &str,
+    lease_ms: i64,
+    execution_profile_id: Uuid,
+    adapter_revision: &str,
+) -> TestResult<ExecutorSubmissionLease> {
+    if !operation_binding_exists(pool).await? {
+        require(
+            execution_profile_id == PROFILE_ID && adapter_revision == "provider-test-adapter-v1",
+            "legacy fixture only supports its frozen execution profile",
+        )?;
+        return seed_legacy_running_submission_with_lease(pool, worker, lease_ms).await;
+    }
     let work = seed_work_lease(pool, worker).await?;
     let store = PostgresExecutorSubmissionStore::new(pool.clone());
     let prepared = store
-        .prepare_and_handoff(&work, PROFILE_ID)
+        .prepare_and_handoff(&work, execution_profile_id)
         .await
         .map_err(debug_error)?;
     require(prepared.len() == 1, "expected one provider submission")?;
     let lease = store
         .claim_prepared(
             &ExecutorClaimScope {
-                execution_profile_id: PROFILE_ID,
+                execution_profile_id,
                 provider_id: "provider-test".to_string(),
                 command_schema: "provider-command-v1".to_string(),
-                adapter_revision: "provider-test-adapter-v1".to_string(),
+                adapter_revision: adapter_revision.to_string(),
             },
             &format!("executor-{worker}"),
             lease_ms,
@@ -5560,6 +6662,338 @@ async fn seed_running_submission_with_lease(
         .ok_or_else(|| "prepared submission was not claimable".to_string())?;
     store.start(&lease).await.map_err(debug_error)?;
     Ok(lease)
+}
+
+async fn operation_binding_exists(pool: &PgPool) -> TestResult<bool> {
+    sqlx::query_scalar(
+        r#"
+        SELECT EXISTS (
+          SELECT 1
+          FROM information_schema.columns
+          WHERE table_schema = current_schema()
+            AND table_name = 'provider_submissions'
+            AND column_name = 'operation_binding_version'
+        )
+        "#,
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(debug_error)
+}
+
+async fn release_legacy_capacity_no_effect(
+    pool: &PgPool,
+    lease: &ExecutorSubmissionLease,
+) -> TestResult {
+    let now = database_now(pool).await?;
+    let owner = "capacity-upgrade-owner";
+    let command_id = "capacity-upgrade-claim";
+    let event_identity = "capacity-upgrade-no-effect";
+    let mut tx = pool.begin().await.map_err(debug_error)?;
+    let claimed = sqlx::query(
+        r#"
+        UPDATE provider_capacity_reconciliations
+        SET reconciliation_owner = $2,
+            reconciliation_lease_epoch = reconciliation_lease_epoch + 1,
+            claimed_evidence_revision = evidence_revision,
+            available_at_ms = $3 + 5_000,
+            last_command_kind = 'claim', last_command_id = $4,
+            last_command_owner = $2,
+            last_command_lease_epoch = reconciliation_lease_epoch + 1,
+            claim_command_claimed_at_ms = $3,
+            claim_command_lease_expires_at_ms = $3 + 5_000,
+            updated_at_ms = $3
+        WHERE submission_id = $1 AND state = 'active'
+          AND reconciliation_owner IS NULL AND available_at_ms <= $3
+        "#,
+    )
+    .bind(lease.submission_id)
+    .bind(owner)
+    .bind(now)
+    .bind(command_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(debug_error)?
+    .rows_affected();
+    require(claimed == 1, "backfilled reconciliation was not claimable")?;
+    sqlx::query(
+        r#"
+        UPDATE provider_capacity_reconciliations
+        SET state = 'released', evidence_kind = 'confirmed_no_effect',
+            event_identity = $2, payload_hash = $3,
+            updated_at_ms = $4, released_at_ms = $4
+        WHERE submission_id = $1 AND state = 'active'
+          AND reconciliation_owner = $5 AND reconciliation_lease_epoch = 1
+          AND claimed_evidence_revision = evidence_revision
+          AND available_at_ms > $4
+        "#,
+    )
+    .bind(lease.submission_id)
+    .bind(event_identity)
+    .bind("e".repeat(64))
+    .bind(now)
+    .bind(owner)
+    .execute(&mut *tx)
+    .await
+    .map_err(debug_error)?;
+    sqlx::query(
+        r#"
+        UPDATE executor_capacity_allocations
+        SET state = 'released', released_at_ms = $3,
+            release_decision_id = $1, released_state = 'uncertain',
+            release_reason = 'provider_capacity_reconciliation',
+            release_reconciliation_id = $1
+        WHERE executor_execution_id = $1 AND submission_id = $2 AND state = 'held'
+        "#,
+    )
+    .bind(lease.executor_execution_id)
+    .bind(lease.submission_id)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .map_err(debug_error)?;
+    sqlx::query(
+        r#"
+        UPDATE executor_resource_policies
+        SET allocated_count = allocated_count - 1
+        WHERE resource_policy_id = $1 AND revision = 1 AND allocated_count > 0
+        "#,
+    )
+    .bind(POLICY_ID)
+    .execute(&mut *tx)
+    .await
+    .map_err(debug_error)?;
+    tx.commit().await.map_err(debug_error)
+}
+
+async fn seed_legacy_running_submission_with_lease(
+    pool: &PgPool,
+    worker: &str,
+    lease_ms: i64,
+) -> TestResult<ExecutorSubmissionLease> {
+    seed_legacy_running_submission_and_work(pool, worker, lease_ms)
+        .await
+        .map(|(_, lease)| lease)
+}
+
+async fn seed_legacy_running_submission_and_work(
+    pool: &PgPool,
+    worker: &str,
+    lease_ms: i64,
+) -> TestResult<(WorkLease, ExecutorSubmissionLease)> {
+    let work = seed_work_lease(pool, worker).await?;
+    let command_hash = hex::encode(Sha256::digest(
+        serde_json::to_vec(&work.command_json).map_err(debug_error)?,
+    ));
+    let (output_id, output_index): (Uuid, i32) =
+        sqlx::query_as("SELECT output_id, output_index FROM job_outputs WHERE job_id = $1")
+            .bind(work.job_id)
+            .fetch_one(pool)
+            .await
+            .map_err(debug_error)?;
+    let submission_id = Uuid::new_v4();
+    let executor_execution_id = Uuid::new_v4();
+    let executor_owner = format!("executor-{worker}");
+    let now = database_now(pool).await?;
+    let executor_lease_expires_at_ms = now + lease_ms;
+    let mut tx = pool.begin().await.map_err(debug_error)?;
+
+    sqlx::query(
+        "UPDATE work_items SET execution_profile_id = $2, updated_at_ms = $3 WHERE work_item_id = $1",
+    )
+    .bind(work.work_item_id)
+    .bind(PROFILE_ID)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .map_err(debug_error)?;
+    sqlx::query(
+        r#"
+        INSERT INTO provider_submissions
+          (submission_id, executor_execution_id, output_id, job_id,
+           tenant_id, provider_id, model, work_item_id,
+           created_by_execution_id, created_by_lease_epoch, command_schema, command_hash,
+           execution_profile_id, credential_pool_id, provider_account_id,
+           credential_ref, credential_revision, adapter_revision,
+           resource_policy_id, resource_policy_revision,
+           state, prepared_at_ms, updated_at_ms)
+        VALUES ($1, $2, $3, $4, 'provider-task-test', 'provider-test', 'model-test', $5,
+                $6, $7, 'provider-command-v1', $8, $9, $10, $11,
+                'test-vault.provider-task.1', 1, 'provider-test-adapter-v1',
+                $12, 1, 'prepared', $13, $13)
+        "#,
+    )
+    .bind(submission_id)
+    .bind(executor_execution_id)
+    .bind(output_id)
+    .bind(work.job_id)
+    .bind(work.work_item_id)
+    .bind(work.execution_id)
+    .bind(work.lease_epoch)
+    .bind(&command_hash)
+    .bind(PROFILE_ID)
+    .bind(POOL_ID)
+    .bind(ACCOUNT_ID)
+    .bind(POLICY_ID)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .map_err(debug_error)?;
+    sqlx::query(
+        r#"
+        INSERT INTO executor_executions
+          (executor_execution_id, submission_id, state, created_at_ms, updated_at_ms)
+        VALUES ($1, $2, 'prepared', $3, $3)
+        "#,
+    )
+    .bind(executor_execution_id)
+    .bind(submission_id)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .map_err(debug_error)?;
+    sqlx::query(
+        r#"
+        INSERT INTO provider_submission_attachments
+          (submission_id, job_id, attempt_execution_id, work_item_id, lease_epoch, attached_at_ms)
+        VALUES ($1, $2, $3, $4, $5, $6)
+        "#,
+    )
+    .bind(submission_id)
+    .bind(work.job_id)
+    .bind(work.execution_id)
+    .bind(work.work_item_id)
+    .bind(work.lease_epoch)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .map_err(debug_error)?;
+    sqlx::query(
+        r#"
+        UPDATE job_attempts
+        SET state = 'handed_off', handed_off_at_ms = $4, updated_at_ms = $4
+        WHERE work_item_id = $1 AND execution_id = $2 AND lease_epoch = $3
+          AND state = 'claimed'
+        "#,
+    )
+    .bind(work.work_item_id)
+    .bind(work.execution_id)
+    .bind(work.lease_epoch)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .map_err(debug_error)?;
+    sqlx::query(
+        r#"
+        UPDATE work_items
+        SET state = 'awaiting_executor', lease_owner = NULL,
+            lease_expires_at_ms = NULL, handed_off_at_ms = $2, updated_at_ms = $2
+        WHERE work_item_id = $1 AND state = 'leased'
+        "#,
+    )
+    .bind(work.work_item_id)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .map_err(debug_error)?;
+    tx.commit().await.map_err(debug_error)?;
+
+    let mut tx = pool.begin().await.map_err(debug_error)?;
+    sqlx::query(
+        r#"
+        UPDATE executor_resource_policies
+        SET allocated_count = allocated_count + 1
+        WHERE resource_policy_id = $1 AND revision = 1
+          AND state = 'enabled' AND allocated_count < max_concurrency
+        "#,
+    )
+    .bind(POLICY_ID)
+    .execute(&mut *tx)
+    .await
+    .map_err(debug_error)?;
+    sqlx::query(
+        r#"
+        INSERT INTO executor_capacity_allocations
+          (allocation_id, executor_execution_id, submission_id, execution_profile_id,
+           resource_policy_id, resource_policy_revision, state,
+           acquired_at_ms, last_heartbeat_at_ms)
+        VALUES ($1, $1, $2, $3, $4, 1, 'held', $5, $5)
+        "#,
+    )
+    .bind(executor_execution_id)
+    .bind(submission_id)
+    .bind(PROFILE_ID)
+    .bind(POLICY_ID)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .map_err(debug_error)?;
+    sqlx::query(
+        r#"
+        UPDATE executor_executions
+        SET state = 'leased', executor_owner = $3, lease_epoch = 1,
+            lease_expires_at_ms = $4, leased_at_ms = $5, updated_at_ms = $5
+        WHERE executor_execution_id = $1 AND submission_id = $2 AND state = 'prepared'
+        "#,
+    )
+    .bind(executor_execution_id)
+    .bind(submission_id)
+    .bind(&executor_owner)
+    .bind(executor_lease_expires_at_ms)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .map_err(debug_error)?;
+    sqlx::query(
+        r#"
+        UPDATE executor_executions
+        SET state = 'running', launch_owner = $3, launch_lease_epoch = 1,
+            started_at_ms = $4, updated_at_ms = $4
+        WHERE executor_execution_id = $1 AND submission_id = $2
+          AND executor_owner = $3 AND lease_epoch = 1 AND state = 'leased'
+        "#,
+    )
+    .bind(executor_execution_id)
+    .bind(submission_id)
+    .bind(&executor_owner)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .map_err(debug_error)?;
+    sqlx::query(
+        r#"
+        UPDATE provider_submissions
+        SET state = 'running', started_at_ms = $3, updated_at_ms = $3
+        WHERE submission_id = $1 AND executor_execution_id = $2 AND state = 'prepared'
+        "#,
+    )
+    .bind(submission_id)
+    .bind(executor_execution_id)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .map_err(debug_error)?;
+    tx.commit().await.map_err(debug_error)?;
+
+    let lease = ExecutorSubmissionLease {
+        submission_id,
+        executor_execution_id,
+        output_id,
+        job_id: work.job_id,
+        tenant_id: "provider-task-test".to_string(),
+        provider_id: "provider-test".to_string(),
+        model: "model-test".to_string(),
+        work_item_id: work.work_item_id,
+        output_index,
+        command_schema: "provider-command-v1".to_string(),
+        command_hash,
+        execution_profile_id: PROFILE_ID,
+        adapter_revision: "provider-test-adapter-v1".to_string(),
+        executor_owner,
+        executor_lease_epoch: 1,
+        executor_lease_expires_at_ms,
+    };
+    Ok((work, lease))
 }
 
 async fn seed_work_lease(pool: &PgPool, worker: &str) -> TestResult<WorkLease> {
@@ -5680,9 +7114,21 @@ async fn seed_execution_profile(pool: &PgPool) -> TestResult {
     sqlx::query("INSERT INTO executor_resource_policies (resource_policy_id, revision, credential_pool_id, provider_account_id, provider_id, execution_class, max_concurrency, state, created_at_ms) VALUES ($1, 1, $2, $3, 'provider-test', 'remote-task', 100, 'enabled', $4)")
         .bind(POLICY_ID).bind(POOL_ID).bind(ACCOUNT_ID).bind(now)
         .execute(&mut *tx).await.map_err(debug_error)?;
-    sqlx::query("INSERT INTO provider_execution_profiles (execution_profile_id, profile_key, provider_id, command_schema, adapter_revision, credential_pool_id, provider_account_id, credential_ref, credential_revision, resource_policy_id, resource_policy_revision, state, created_at_ms, updated_at_ms) VALUES ($1, 'provider-task-profile', 'provider-test', 'provider-command-v1', 'provider-test-adapter-v1', $2, $3, 'test-vault.provider-task.1', 1, $4, 1, 'enabled', $5, $5)")
-        .bind(PROFILE_ID).bind(POOL_ID).bind(ACCOUNT_ID).bind(POLICY_ID).bind(now)
-        .execute(&mut *tx).await.map_err(debug_error)?;
+    let operation_binding_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'provider_execution_profiles' AND column_name = 'operation_id')",
+    )
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(debug_error)?;
+    if operation_binding_exists {
+        sqlx::query("INSERT INTO provider_execution_profiles (execution_profile_id, profile_key, provider_id, command_schema, operation_id, operation_descriptor_revision, operation_descriptor_sha256_v1, completion_mode, idempotency_mode, adapter_revision, credential_pool_id, provider_account_id, credential_ref, credential_revision, resource_policy_id, resource_policy_revision, state, created_at_ms, updated_at_ms) VALUES ($1, 'provider-task-profile', 'provider-test', 'provider-command-v1', 'images.generations', 'provider-test/images.generations/v1', $2, 'remote_task', 'submission_bound', 'provider-test-adapter-v1', $3, $4, 'test-vault.provider-task.1', 1, $5, 1, 'enabled', $6, $6)")
+            .bind(PROFILE_ID).bind("2".repeat(64)).bind(POOL_ID).bind(ACCOUNT_ID).bind(POLICY_ID).bind(now)
+            .execute(&mut *tx).await.map_err(debug_error)?;
+    } else {
+        sqlx::query("INSERT INTO provider_execution_profiles (execution_profile_id, profile_key, provider_id, command_schema, adapter_revision, credential_pool_id, provider_account_id, credential_ref, credential_revision, resource_policy_id, resource_policy_revision, state, created_at_ms, updated_at_ms) VALUES ($1, 'provider-task-profile', 'provider-test', 'provider-command-v1', 'provider-test-adapter-v1', $2, $3, 'test-vault.provider-task.1', 1, $4, 1, 'enabled', $5, $5)")
+            .bind(PROFILE_ID).bind(POOL_ID).bind(ACCOUNT_ID).bind(POLICY_ID).bind(now)
+            .execute(&mut *tx).await.map_err(debug_error)?;
+    }
     tx.commit().await.map_err(debug_error)
 }
 
@@ -5909,6 +7355,27 @@ impl TestDatabase {
                 Ok(()) => Err(format!("pre-0025 migration failed: {error}")),
                 Err(cleanup) => Err(format!(
                     "pre-0025 migration failed: {error}; cleanup failed: {cleanup}"
+                )),
+            };
+        }
+        Ok(Some(database))
+    }
+
+    async fn new_before_operation_binding() -> TestResult<Option<Self>> {
+        let Some(database) = Self::new_before_remote_task_deadline().await? else {
+            return Ok(None);
+        };
+        if let Err(error) = sqlx::raw_sql(include_str!(
+            "../migrations/0025_provider_remote_task_deadline_quarantine.sql"
+        ))
+        .execute(&database.pool)
+        .await
+        {
+            let cleanup = database.cleanup().await;
+            return match cleanup {
+                Ok(()) => Err(format!("pre-0026 migration failed: {error}")),
+                Err(cleanup) => Err(format!(
+                    "pre-0026 migration failed: {error}; cleanup failed: {cleanup}"
                 )),
             };
         }

@@ -1,6 +1,7 @@
 use std::fmt;
 
 use async_trait::async_trait;
+use image_provider_sdk::ProviderCommandIdentity;
 use uuid::Uuid;
 
 use crate::executor::ExecutorResultManifest;
@@ -49,6 +50,7 @@ pub struct RemoteTaskAttach {
     pub remote_operation_id: String,
     pub provider_request_id: Option<String>,
     pub event_identity: String,
+    pub execution_binding_sha256: String,
     pub poll_after_ms: i64,
     pub recovery_fence: Option<ProviderSubmitRecoveryFence>,
 }
@@ -60,7 +62,39 @@ pub struct RemoteTaskSubmitReservation {
     pub executor_owner: String,
     pub executor_lease_epoch: i64,
     pub idempotency_key: String,
+    provider_command: ProviderCommandIdentity,
     pub provider_timeout_ms: i64,
+}
+
+impl RemoteTaskSubmitReservation {
+    pub fn new(
+        submission_id: Uuid,
+        executor_execution_id: Uuid,
+        executor_owner: String,
+        executor_lease_epoch: i64,
+        idempotency_key: String,
+        provider_command: ProviderCommandIdentity,
+        provider_timeout_ms: i64,
+    ) -> Self {
+        Self {
+            submission_id,
+            executor_execution_id,
+            executor_owner,
+            executor_lease_epoch,
+            idempotency_key,
+            provider_command,
+            provider_timeout_ms,
+        }
+    }
+
+    pub fn provider_command(&self) -> ProviderCommandIdentity {
+        self.provider_command
+    }
+
+    pub fn with_provider_command(mut self, provider_command: ProviderCommandIdentity) -> Self {
+        self.provider_command = provider_command;
+        self
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -72,6 +106,9 @@ pub struct ProviderSubmitIntent {
     pub submit_owner: String,
     pub submit_lease_epoch: i64,
     pub idempotency_key: String,
+    pub provider_command_sha256: String,
+    pub execution_binding_sha256: String,
+    pub provider_timeout_ms: i64,
     pub state: ProviderSubmitIntentState,
     pub remote_operation_id: Option<String>,
     pub provider_request_id: Option<String>,
@@ -122,6 +159,7 @@ pub struct RemoteTaskSubmitFailure {
     pub kind: ProviderSubmitFailureKind,
     pub event_identity: String,
     pub error_code: String,
+    pub execution_binding_sha256: String,
     pub recovery_fence: Option<ProviderSubmitRecoveryFence>,
 }
 
@@ -134,6 +172,7 @@ pub struct RemoteTaskSubmitReceipt {
     pub remote_operation_id: String,
     pub provider_request_id: Option<String>,
     pub event_identity: String,
+    pub execution_binding_sha256: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -147,6 +186,12 @@ pub struct ProviderExecutionContext {
     model: String,
     command_schema: String,
     command_hash: String,
+    operation_id: String,
+    operation_descriptor_revision: String,
+    operation_descriptor_sha256_v1: String,
+    completion_mode: String,
+    idempotency_mode: String,
+    operation_binding_version: i16,
     execution_profile_id: Uuid,
     adapter_revision: String,
     credential_pool_id: Uuid,
@@ -155,7 +200,9 @@ pub struct ProviderExecutionContext {
     credential_auth_sha256: String,
     resource_policy_id: Uuid,
     resource_policy_revision: i64,
-    idempotency_key: String,
+    submission_idempotency_key: String,
+    provider_command_sha256: String,
+    execution_binding_sha256: String,
     invocation_attempt: i32,
     provider_timeout_ms: i64,
     provider_deadline_at_ms: i64,
@@ -172,6 +219,30 @@ impl ProviderExecutionContext {
 
     pub fn command_hash(&self) -> &str {
         &self.command_hash
+    }
+
+    pub fn operation_id(&self) -> &str {
+        &self.operation_id
+    }
+
+    pub fn operation_descriptor_revision(&self) -> &str {
+        &self.operation_descriptor_revision
+    }
+
+    pub fn operation_descriptor_sha256_v1(&self) -> &str {
+        &self.operation_descriptor_sha256_v1
+    }
+
+    pub fn completion_mode(&self) -> &str {
+        &self.completion_mode
+    }
+
+    pub fn idempotency_mode(&self) -> &str {
+        &self.idempotency_mode
+    }
+
+    pub fn operation_binding_version(&self) -> i16 {
+        self.operation_binding_version
     }
 
     pub fn execution_profile_id(&self) -> Uuid {
@@ -206,8 +277,12 @@ impl ProviderExecutionContext {
         self.resource_policy_revision
     }
 
-    pub fn idempotency_key(&self) -> &str {
-        &self.idempotency_key
+    pub fn provider_command_sha256(&self) -> &str {
+        &self.provider_command_sha256
+    }
+
+    pub fn execution_binding_sha256(&self) -> &str {
+        &self.execution_binding_sha256
     }
 
     pub fn invocation_attempt(&self) -> i32 {
@@ -230,6 +305,18 @@ impl fmt::Debug for ProviderExecutionContext {
             .field("model", &self.model)
             .field("command_schema", &self.command_schema)
             .field("command_hash", &self.command_hash)
+            .field("operation_id", &self.operation_id)
+            .field(
+                "operation_descriptor_revision",
+                &self.operation_descriptor_revision,
+            )
+            .field(
+                "operation_descriptor_sha256_v1",
+                &self.operation_descriptor_sha256_v1,
+            )
+            .field("completion_mode", &self.completion_mode)
+            .field("idempotency_mode", &self.idempotency_mode)
+            .field("operation_binding_version", &self.operation_binding_version)
             .field("execution_profile_id", &self.execution_profile_id)
             .field("adapter_revision", &self.adapter_revision)
             .field("credential_pool_id", &self.credential_pool_id)
@@ -238,7 +325,9 @@ impl fmt::Debug for ProviderExecutionContext {
             .field("credential_auth_sha256", &"[redacted]")
             .field("resource_policy_id", &self.resource_policy_id)
             .field("resource_policy_revision", &self.resource_policy_revision)
-            .field("idempotency_key", &self.idempotency_key)
+            .field("submission_idempotency_key", &"[redacted]")
+            .field("provider_command_sha256", &self.provider_command_sha256)
+            .field("execution_binding_sha256", &self.execution_binding_sha256)
             .field("invocation_attempt", &self.invocation_attempt)
             .field("provider_timeout_ms", &self.provider_timeout_ms)
             .field("provider_deadline_at_ms", &self.provider_deadline_at_ms)
@@ -255,6 +344,10 @@ pub struct ProviderSubmitInvocation {
 impl ProviderSubmitInvocation {
     pub fn context(&self) -> &ProviderExecutionContext {
         &self.context
+    }
+
+    pub fn submission_idempotency_key(&self) -> &str {
+        &self.context.submission_idempotency_key
     }
 }
 
@@ -277,6 +370,7 @@ pub struct ProviderTaskLease {
     pub poll_owner: String,
     pub poll_lease_epoch: i64,
     pub poll_lease_expires_at_ms: i64,
+    authority_seal: [u8; 32],
 }
 
 impl ProviderTaskLease {
@@ -292,11 +386,16 @@ pub struct ProviderSubmitRecoveryLease {
     pub recovery_owner: String,
     pub recovery_lease_epoch: i64,
     pub recovery_lease_expires_at_ms: i64,
+    authority_seal: [u8; 32],
 }
 
 impl ProviderSubmitRecoveryLease {
     pub fn context(&self) -> &ProviderExecutionContext {
         &self.context
+    }
+
+    pub fn submission_idempotency_key(&self) -> &str {
+        &self.context.submission_idempotency_key
     }
 }
 

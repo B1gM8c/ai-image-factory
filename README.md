@@ -40,6 +40,8 @@ Exact submit-recovery command replay and bounded claims are documented in
 [`docs/architecture/2026-phase2i-replayable-provider-submit-recovery.md`](docs/architecture/2026-phase2i-replayable-provider-submit-recovery.md).
 Attached remote-task deadlines, quarantine authority, and committed artifact recovery are documented in
 [`docs/architecture/2026-phase2j-provider-remote-task-deadline.md`](docs/architecture/2026-phase2j-provider-remote-task-deadline.md).
+Immutable operation descriptors, command identity, submit idempotency, and execution binding are documented in
+[`docs/architecture/2026-phase2k-immutable-provider-operation-binding.md`](docs/architecture/2026-phase2k-immutable-provider-operation-binding.md).
 Database-bound provider profiles and durable capacity are documented in
 [`docs/architecture/2026-phase1g-execution-binding-capacity.md`](docs/architecture/2026-phase1g-execution-binding-capacity.md).
 

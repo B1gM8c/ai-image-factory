@@ -2,7 +2,7 @@ use std::{error::Error, fmt};
 
 use image_provider_sdk::{
     ArtifactSink, Completed, InvocationContext, PollObservation, ProviderFailure,
-    RemoteOperationRef, RemoteTaskProvider, SingleOutputCommand, Submission,
+    RemoteOperationRef, RemoteTaskProvider, SingleOutputCommand, Submission, SubmitIdempotency,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -33,6 +33,7 @@ impl Error for ConformanceError {}
 pub async fn drive_remote_to_completion<P, S>(
     provider: &P,
     context: InvocationContext<'_>,
+    idempotency: SubmitIdempotency<'_>,
     command: &SingleOutputCommand<P::Payload>,
     sink: &mut S,
     max_polls: usize,
@@ -42,7 +43,7 @@ where
     S: ArtifactSink,
 {
     let pending = match provider
-        .submit(context, command, sink)
+        .submit(context, idempotency, command, sink)
         .await
         .map_err(ConformanceError::Provider)?
     {

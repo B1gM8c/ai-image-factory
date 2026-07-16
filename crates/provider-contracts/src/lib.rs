@@ -90,4 +90,138 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn active_operation_descriptor_digests_are_stable_and_distinct() {
+        let generation = openai_codex::operation("images.generations").unwrap();
+        let edit = openai_codex::operation("images.edits").unwrap();
+
+        assert_ne!(generation.canonical_sha256_v1(), edit.canonical_sha256_v1());
+        assert_eq!(
+            generation.canonical_sha256_v1_hex(),
+            "f7f3e84594bfda2312d9420aa22108e76b10b3b22c52535ccf768f944d9b7aaa"
+        );
+        assert_eq!(
+            edit.canonical_sha256_v1_hex(),
+            "c9a714ae667cab60f8130b841aa8887077232a29a1c3bb59ba7ecb77b8ddb471"
+        );
+    }
+
+    #[test]
+    fn operation_descriptor_sha256_v1_covers_each_variable_field() {
+        let base = *openai_codex::operation("images.generations").unwrap();
+        let base_digest = base.canonical_sha256_v1();
+        let variants = [
+            OperationDescriptor {
+                id: "images.other",
+                ..base
+            },
+            OperationDescriptor {
+                descriptor_revision: "revision-v2",
+                ..base
+            },
+            OperationDescriptor {
+                command_schema: "command-v2",
+                ..base
+            },
+            OperationDescriptor {
+                output_schema: "output-v2",
+                ..base
+            },
+            OperationDescriptor {
+                media: MediaKind::Video,
+                ..base
+            },
+            OperationDescriptor {
+                operation: MediaOperation::Variation,
+                ..base
+            },
+            OperationDescriptor {
+                completion: CompletionMode::RemoteTask(RemoteTaskControls {
+                    callback: CallbackMode::WakeupHint,
+                    cancellation: CancellationMode::ProviderConfirmed,
+                }),
+                ..base
+            },
+            OperationDescriptor {
+                artifact_delivery: ArtifactDelivery::InlineBounded {
+                    max_bytes: 256 * 1024 * 1024 + 1,
+                },
+                ..base
+            },
+            OperationDescriptor {
+                artifact_delivery: ArtifactDelivery::Streamed,
+                ..base
+            },
+            OperationDescriptor {
+                client_streaming: StreamingMode::PartialEvents,
+                ..base
+            },
+            OperationDescriptor {
+                idempotency: IdempotencyMode::ProviderToken,
+                ..base
+            },
+            OperationDescriptor {
+                billing_metric: BillingMetric::Request,
+                ..base
+            },
+            OperationDescriptor {
+                official_params: OfficialParamsContract {
+                    kind: OfficialParamsKind::XaiImage,
+                    ..base.official_params
+                },
+                ..base
+            },
+            OperationDescriptor {
+                official_params: OfficialParamsContract {
+                    schema_id: "official-v2",
+                    ..base.official_params
+                },
+                ..base
+            },
+            OperationDescriptor {
+                official_params: OfficialParamsContract {
+                    passthrough_allowed: !base.official_params.passthrough_allowed,
+                    ..base.official_params
+                },
+                ..base
+            },
+        ];
+
+        for variant in variants {
+            assert_ne!(variant.canonical_sha256_v1(), base_digest, "{variant:?}");
+        }
+
+        let remote_base = OperationDescriptor {
+            completion: CompletionMode::RemoteTask(RemoteTaskControls {
+                callback: CallbackMode::Unsupported,
+                cancellation: CancellationMode::Unsupported,
+            }),
+            ..base
+        };
+        let remote_digest = remote_base.canonical_sha256_v1();
+        assert_ne!(remote_digest, base_digest);
+        assert_ne!(
+            OperationDescriptor {
+                completion: CompletionMode::RemoteTask(RemoteTaskControls {
+                    callback: CallbackMode::WakeupHint,
+                    cancellation: CancellationMode::Unsupported,
+                }),
+                ..remote_base
+            }
+            .canonical_sha256_v1(),
+            remote_digest
+        );
+        assert_ne!(
+            OperationDescriptor {
+                completion: CompletionMode::RemoteTask(RemoteTaskControls {
+                    callback: CallbackMode::Unsupported,
+                    cancellation: CancellationMode::ProviderConfirmed,
+                }),
+                ..remote_base
+            }
+            .canonical_sha256_v1(),
+            remote_digest
+        );
+    }
 }

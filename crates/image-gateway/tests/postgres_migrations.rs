@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 type TestResult<T = ()> = Result<T, String>;
 
-const REQUIRED_COLUMNS: [(&str, &str); 156] = [
+const REQUIRED_COLUMNS: [(&str, &str); 170] = [
     ("usage_events", "tenant_id"),
     ("quota_reservations", "tenant_id"),
     ("quota_reservations", "job_id"),
@@ -218,6 +218,26 @@ const REQUIRED_COLUMNS: [(&str, &str); 156] = [
         "provider_task_observation_id",
     ),
     ("executor_resolution_decisions", "provider_submit_intent_id"),
+    ("provider_execution_profiles", "operation_id"),
+    (
+        "provider_execution_profiles",
+        "operation_descriptor_revision",
+    ),
+    (
+        "provider_execution_profiles",
+        "operation_descriptor_sha256_v1",
+    ),
+    ("provider_execution_profiles", "completion_mode"),
+    ("provider_execution_profiles", "idempotency_mode"),
+    ("provider_submissions", "operation_id"),
+    ("provider_submissions", "operation_descriptor_revision"),
+    ("provider_submissions", "operation_descriptor_sha256_v1"),
+    ("provider_submissions", "completion_mode"),
+    ("provider_submissions", "idempotency_mode"),
+    ("provider_submissions", "operation_binding_version"),
+    ("provider_remote_submit_intents", "provider_command_sha256"),
+    ("provider_remote_submit_intents", "execution_binding_sha256"),
+    ("provider_remote_submit_intents", "provider_timeout_ms"),
 ];
 
 const REQUIRED_INDEXES: [&str; 26] = [
@@ -1136,9 +1156,9 @@ async fn assert_expected_schema(pool: &PgPool) -> TestResult {
         migration_versions(pool).await?
             == vec![
                 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22,
-                23, 24, 25,
+                23, 24, 25, 26,
             ],
-        "applied migration versions must be exactly [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25]",
+        "applied migration versions must be exactly [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26]",
     )?;
 
     for (table, column) in REQUIRED_COLUMNS {

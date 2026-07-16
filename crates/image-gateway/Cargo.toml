@@ -12,6 +12,7 @@ hex = "0.4.3"
 hmac = "0.13.0"
 image-cli-runtime = { path = "../cli-runtime" }
 image-provider-contracts = { path = "../provider-contracts" }
+image-provider-sdk = { path = "../provider-sdk" }
 image-scheduler-policy = { path = "../scheduler-policy" }
 image = { version = "0.25.9", default-features = false, features = ["png", "jpeg", "webp"] }
 libc = "0.2.186"

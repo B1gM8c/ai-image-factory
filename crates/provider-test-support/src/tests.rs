@@ -7,12 +7,13 @@ use std::{
 use image_provider_sdk::{
     ArtifactMetadata, ArtifactSink, DurableArtifactRef, EffectCertainty, InlineProvider,
     InvocationContext, OutputSlot, PendingOperation, ProviderFailure, ProviderFailureClass,
-    ProviderRequestId, RemoteOperationRef, RetryDirective, SingleOutputCommand,
+    ProviderRequestId, RemoteOperationRef, RetryDirective, SingleOutputCommand, SubmitIdempotency,
 };
 
 use crate::{
-    InlineStep, OutputPlan, PollStep, RecordingArtifactSink, ScriptedFakeProvider, SubmitStep,
-    drive_existing_operation, drive_remote_to_completion,
+    InlineStep, ObservedSubmitCall, ObservedSubmitIdempotency, OutputPlan, PollStep,
+    RecordingArtifactSink, ScriptedFakeProvider, SubmitStep, drive_existing_operation,
+    drive_remote_to_completion,
 };
 
 fn block_on<F: Future>(future: F) -> F::Output {
@@ -35,7 +36,15 @@ fn block_on<F: Future>(future: F) -> F::Output {
 }
 
 fn context() -> InvocationContext<'static> {
-    InvocationContext::new("submission-1", "fake", "model-1", "idem-1", 1).unwrap()
+    InvocationContext::new(
+        "submission-1",
+        "fake",
+        "images.generations",
+        "fake/images.generations/v1",
+        "model-1",
+        1,
+    )
+    .unwrap()
 }
 
 fn command(index: u32, total: u32) -> SingleOutputCommand<Vec<u8>> {
@@ -101,6 +110,7 @@ fn remote_pending_to_complete_submits_once() {
     block_on(drive_remote_to_completion(
         &restarted_provider,
         context(),
+        SubmitIdempotency::submission_bound(),
         &command(0, 1),
         &mut sink,
         3,
@@ -109,7 +119,51 @@ fn remote_pending_to_complete_submits_once() {
 
     assert_eq!(provider.calls().submit, 1);
     assert_eq!(provider.calls().poll, 2);
+    assert_eq!(
+        provider.submit_idempotency(),
+        [ObservedSubmitIdempotency::SubmissionBound]
+    );
+    assert_eq!(
+        provider.submit_calls(),
+        [ObservedSubmitCall {
+            submission_id: "submission-1".to_string(),
+            provider_id: "fake".to_string(),
+            operation_id: "images.generations".to_string(),
+            descriptor_revision: "fake/images.generations/v1".to_string(),
+            model: "model-1".to_string(),
+            attempt: 1,
+            command_schema: "test/v1",
+            adapter_revision: "adapter-v1",
+            command_sha256: [3; 32],
+            output: OutputSlot::new(0, 1).unwrap(),
+            idempotency: ObservedSubmitIdempotency::SubmissionBound,
+        }]
+    );
     assert_eq!(sink.finalize_count(), 1);
+}
+
+#[test]
+fn remote_submit_observes_validated_provider_token() {
+    let provider = ScriptedFakeProvider::default();
+    provider.push_submit(SubmitStep::Complete(output()));
+    let mut sink = sink();
+
+    block_on(drive_remote_to_completion(
+        &provider,
+        context(),
+        SubmitIdempotency::provider_token("provider-token-1").unwrap(),
+        &command(0, 1),
+        &mut sink,
+        1,
+    ))
+    .unwrap();
+
+    assert_eq!(
+        provider.submit_idempotency(),
+        [ObservedSubmitIdempotency::ProviderToken(
+            "provider-token-1".to_owned()
+        )]
+    );
 }
 
 #[test]

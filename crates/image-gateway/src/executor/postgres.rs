@@ -87,7 +87,15 @@ struct ExistingIdentityRow {
     command_schema: Option<String>,
     command_hash: Option<String>,
     execution_profile_id: Option<Uuid>,
+    operation_id: Option<String>,
+    operation_descriptor_revision: Option<String>,
+    operation_descriptor_sha256_v1: Option<String>,
+    completion_mode: Option<String>,
+    idempotency_mode: Option<String>,
+    operation_binding_version: Option<i16>,
     adapter_revision: Option<String>,
+    submission_state: Option<String>,
+    executor_state: Option<String>,
     executor_row_id: Option<Uuid>,
 }
 
@@ -154,6 +162,11 @@ struct ExecutionProfileRow {
     profile_key: String,
     provider_id: String,
     command_schema: String,
+    operation_id: String,
+    operation_descriptor_revision: String,
+    operation_descriptor_sha256_v1: String,
+    completion_mode: String,
+    idempotency_mode: String,
     adapter_revision: String,
     credential_pool_id: Uuid,
     provider_account_id: Uuid,
@@ -172,6 +185,11 @@ impl From<ExecutionProfileRow> for ExecutorExecutionProfile {
             profile_key: row.profile_key,
             provider_id: row.provider_id,
             command_schema: row.command_schema,
+            operation_id: row.operation_id,
+            operation_descriptor_revision: row.operation_descriptor_revision,
+            operation_descriptor_sha256_v1: row.operation_descriptor_sha256_v1,
+            completion_mode: row.completion_mode,
+            idempotency_mode: row.idempotency_mode,
             adapter_revision: row.adapter_revision,
             credential_pool_id: row.credential_pool_id,
             provider_account_id: row.provider_account_id,
@@ -1145,7 +1163,10 @@ async fn load_execution_profile_by_key(
     sqlx::query_as(
         r#"
         SELECT profile.execution_profile_id, profile.profile_key,
-               profile.provider_id, profile.command_schema, profile.adapter_revision,
+               profile.provider_id, profile.command_schema,
+               profile.operation_id, profile.operation_descriptor_revision,
+               profile.operation_descriptor_sha256_v1, profile.completion_mode,
+               profile.idempotency_mode, profile.adapter_revision,
                profile.credential_pool_id, profile.provider_account_id,
                profile.credential_ref, profile.credential_revision,
                account.credential_auth_sha256,
@@ -1181,7 +1202,10 @@ async fn lock_active_execution_profile(
     sqlx::query_as(
         r#"
         SELECT profile.execution_profile_id, profile.profile_key,
-               profile.provider_id, profile.command_schema, profile.adapter_revision,
+               profile.provider_id, profile.command_schema,
+               profile.operation_id, profile.operation_descriptor_revision,
+               profile.operation_descriptor_sha256_v1, profile.completion_mode,
+               profile.idempotency_mode, profile.adapter_revision,
                profile.credential_pool_id, profile.provider_account_id,
                profile.credential_ref, profile.credential_revision,
                account.credential_auth_sha256,
@@ -1222,7 +1246,10 @@ async fn lock_bound_execution_profile(
     sqlx::query_as(
         r#"
         SELECT profile.execution_profile_id, profile.profile_key,
-               profile.provider_id, profile.command_schema, profile.adapter_revision,
+               profile.provider_id, profile.command_schema,
+               profile.operation_id, profile.operation_descriptor_revision,
+               profile.operation_descriptor_sha256_v1, profile.completion_mode,
+               profile.idempotency_mode, profile.adapter_revision,
                profile.credential_pool_id, profile.provider_account_id,
                profile.credential_ref, profile.credential_revision,
                account.credential_auth_sha256,
@@ -1372,10 +1399,12 @@ async fn prepare_admission_outputs(
                execution_profile_id, credential_pool_id, provider_account_id,
                credential_ref, credential_revision, adapter_revision,
                resource_policy_id, resource_policy_revision,
-               state, prepared_at_ms, updated_at_ms)
+               operation_id, operation_descriptor_revision,
+               operation_descriptor_sha256_v1, completion_mode, idempotency_mode,
+               operation_binding_version, state, prepared_at_ms, updated_at_ms)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
                     $13, $14, $15, $16, $17, $18, $19, $20,
-                    'prepared', $21, $21)
+                    $21, $22, $23, $24, $25, 2, 'prepared', $26, $26)
             "#,
         )
         .bind(submission_id)
@@ -1398,6 +1427,11 @@ async fn prepare_admission_outputs(
         .bind(&profile.adapter_revision)
         .bind(profile.resource_policy_id)
         .bind(profile.resource_policy_revision)
+        .bind(&profile.operation_id)
+        .bind(&profile.operation_descriptor_revision)
+        .bind(&profile.operation_descriptor_sha256_v1)
+        .bind(&profile.completion_mode)
+        .bind(&profile.idempotency_mode)
         .bind(now)
         .execute(&mut **tx)
         .await
@@ -1445,7 +1479,11 @@ async fn load_existing(
         SELECT o.output_id, o.output_index, s.submission_id, s.executor_execution_id,
                s.tenant_id, s.provider_id, s.model,
                s.work_item_id, s.command_schema, s.command_hash,
-               s.execution_profile_id, s.adapter_revision,
+               s.execution_profile_id, s.operation_id,
+               s.operation_descriptor_revision, s.operation_descriptor_sha256_v1,
+               s.completion_mode, s.idempotency_mode, s.operation_binding_version,
+               s.adapter_revision, s.state AS submission_state,
+               e.state AS executor_state,
                e.executor_execution_id AS executor_row_id
         FROM job_outputs o
         LEFT JOIN provider_submissions s
@@ -1481,6 +1519,32 @@ fn rebuild_existing(
             let executor_execution_id = row
                 .executor_execution_id
                 .ok_or(ExecutorSubmissionError::Conflict)?;
+            let exact_v2_binding = row.operation_binding_version == Some(2)
+                && row.execution_profile_id == Some(profile.execution_profile_id)
+                && row.operation_id.as_deref() == Some(profile.operation_id.as_str())
+                && row.operation_descriptor_revision.as_deref()
+                    == Some(profile.operation_descriptor_revision.as_str())
+                && row.operation_descriptor_sha256_v1.as_deref()
+                    == Some(profile.operation_descriptor_sha256_v1.as_str())
+                && row.completion_mode.as_deref() == Some(profile.completion_mode.as_str())
+                && row.idempotency_mode.as_deref() == Some(profile.idempotency_mode.as_str())
+                && row.adapter_revision.as_deref() == Some(profile.adapter_revision.as_str());
+            let legacy_terminal_binding = row.operation_binding_version == Some(1)
+                && row
+                    .submission_state
+                    .as_deref()
+                    .is_some_and(terminal_provider_submission_state)
+                && row
+                    .executor_state
+                    .as_deref()
+                    .is_some_and(terminal_executor_state)
+                && row
+                    .execution_profile_id
+                    .is_none_or(|id| id == profile.execution_profile_id)
+                && row
+                    .adapter_revision
+                    .as_deref()
+                    .is_none_or(|revision| revision == profile.adapter_revision);
             if row.output_index != index as i32
                 || row.work_item_id != Some(lease.work_item_id)
                 || row.tenant_id.as_deref() != Some(command.tenant_id.as_str())
@@ -1488,8 +1552,7 @@ fn rebuild_existing(
                 || row.model.as_deref() != Some(command.model.as_str())
                 || row.command_schema.as_deref() != Some(lease.command_schema.as_str())
                 || row.command_hash.as_deref() != Some(command_hash)
-                || row.execution_profile_id != Some(profile.execution_profile_id)
-                || row.adapter_revision.as_deref() != Some(profile.adapter_revision.as_str())
+                || !(exact_v2_binding || legacy_terminal_binding)
                 || row.executor_row_id != Some(executor_execution_id)
             {
                 return Err(ExecutorSubmissionError::Conflict);
@@ -1511,6 +1574,14 @@ fn rebuild_existing(
             })
         })
         .collect()
+}
+
+fn terminal_provider_submission_state(state: &str) -> bool {
+    matches!(state, "succeeded" | "failed" | "uncertain" | "canceled")
+}
+
+fn terminal_executor_state(state: &str) -> bool {
+    matches!(state, "succeeded" | "failed" | "uncertain" | "canceled")
 }
 
 async fn attach_attempts(

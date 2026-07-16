@@ -102,8 +102,16 @@ async fn main() -> Result<(), ImageGatewayError> {
                 .map_err(|_| {
                     ImageGatewayError::config("EXECUTOR_PROFILE_KEY is unavailable to workerd")
                 })?;
+            let operation = openai_codex::operation("images.generations").ok_or_else(|| {
+                ImageGatewayError::config("Codex generation operation descriptor is unavailable")
+            })?;
             if profile.provider_id != openai_codex::PROVIDER_ID
                 || profile.command_schema != GENERATION_COMMAND_SCHEMA
+                || profile.operation_id != operation.id
+                || profile.operation_descriptor_revision != operation.descriptor_revision
+                || profile.operation_descriptor_sha256_v1 != operation.canonical_sha256_v1_hex()
+                || profile.completion_mode != operation.completion.as_str()
+                || profile.idempotency_mode != operation.idempotency.as_str()
                 || profile.adapter_revision != CODEX_GENERATION_ADAPTER_REVISION
             {
                 return Err(ImageGatewayError::config(

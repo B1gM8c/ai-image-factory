@@ -2,6 +2,7 @@ use std::{error::Error, fmt};
 
 use crate::{
     ArtifactSink, DurableArtifactManifest, InvocationContext, ProviderFailure, SingleOutputCommand,
+    SubmitIdempotency,
 };
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -269,6 +270,7 @@ pub trait RemoteTaskProvider: Sync {
     fn submit<S: ArtifactSink>(
         &self,
         context: InvocationContext<'_>,
+        idempotency: SubmitIdempotency<'_>,
         command: &SingleOutputCommand<Self::Payload>,
         sink: &mut S,
     ) -> impl std::future::Future<Output = Result<Submission, ProviderFailure>> + Send;

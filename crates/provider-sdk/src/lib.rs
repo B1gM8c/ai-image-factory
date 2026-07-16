@@ -12,7 +12,8 @@ pub use artifact::{
     DurableArtifactRefError,
 };
 pub use command::{
-    CommandIdentityError, InvocationContext, OutputSlot, OutputSlotError, SingleOutputCommand,
+    CommandIdentityError, InvocationContext, OutputSlot, OutputSlotError, ProviderCommandIdentity,
+    SingleOutputCommand, SubmitIdempotency,
 };
 pub use failure::{
     EffectCertainty, ProviderFailure, ProviderFailureClass, ProviderFailureValidationError,

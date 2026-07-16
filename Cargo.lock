@@ -574,6 +574,7 @@ dependencies = [
  "image",
  "image-cli-runtime",
  "image-provider-contracts",
+ "image-provider-sdk",
  "image-scheduler-policy",
  "libc",
  "opentelemetry",
@@ -884,6 +885,9 @@ dependencies = [
 [[package]]
 name = "image-provider-contracts"
 version = "0.1.0"
+dependencies = [
+ "sha2 0.11.0",
+]
 
 [[package]]
 name = "image-provider-dreamina-cli"

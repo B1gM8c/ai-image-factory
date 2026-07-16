@@ -32,6 +32,7 @@ pub enum ProviderDescriptorError {
     MissingOperation,
     InvalidOperation,
     DuplicateOperation,
+    DuplicateCommandSchema,
 }
 
 impl ProviderDefinition {
@@ -66,6 +67,12 @@ impl ProviderDefinition {
                 .any(|candidate| candidate.id == operation.id)
             {
                 return Err(ProviderDescriptorError::DuplicateOperation);
+            }
+            if self.capabilities[..index]
+                .iter()
+                .any(|candidate| candidate.command_schema == operation.command_schema)
+            {
+                return Err(ProviderDescriptorError::DuplicateCommandSchema);
             }
         }
         Ok(())

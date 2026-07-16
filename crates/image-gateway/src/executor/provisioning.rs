@@ -74,6 +74,11 @@ struct ExecutionProfileRow {
     execution_profile_id: Uuid,
     provider_id: String,
     command_schema: String,
+    operation_id: String,
+    operation_descriptor_revision: String,
+    operation_descriptor_sha256_v1: String,
+    completion_mode: String,
+    idempotency_mode: String,
     adapter_revision: String,
     credential_pool_id: Uuid,
     provider_account_id: Uuid,
@@ -310,9 +315,15 @@ async fn ensure_profile(
     resource_policy_revision: i64,
     now: i64,
 ) -> Result<Uuid, CodexProfileProvisioningError> {
+    let operation = openai_codex::operation("images.generations")
+        .ok_or(CodexProfileProvisioningError::Conflict)?;
+    let operation_descriptor_sha256_v1 = operation.canonical_sha256_v1_hex();
     let existing: Option<ExecutionProfileRow> = sqlx::query_as(
         r#"
-        SELECT execution_profile_id, provider_id, command_schema, adapter_revision,
+        SELECT execution_profile_id, provider_id, command_schema,
+               operation_id, operation_descriptor_revision,
+               operation_descriptor_sha256_v1, completion_mode, idempotency_mode,
+               adapter_revision,
                credential_pool_id, provider_account_id, credential_ref,
                credential_revision, resource_policy_id, resource_policy_revision,
                state
@@ -328,6 +339,11 @@ async fn ensure_profile(
     let execution_profile_id = if let Some(existing) = existing {
         if existing.provider_id != openai_codex::PROVIDER_ID
             || existing.command_schema != GENERATION_COMMAND_SCHEMA
+            || existing.operation_id != operation.id
+            || existing.operation_descriptor_revision != operation.descriptor_revision
+            || existing.operation_descriptor_sha256_v1 != operation_descriptor_sha256_v1
+            || existing.completion_mode != operation.completion.as_str()
+            || existing.idempotency_mode != operation.idempotency.as_str()
             || existing.adapter_revision != CODEX_GENERATION_ADAPTER_REVISION
             || existing.credential_pool_id != credential_pool_id
             || existing.provider_account_id != provider_account_id
@@ -346,17 +362,24 @@ async fn ensure_profile(
             r#"
             INSERT INTO provider_execution_profiles
               (execution_profile_id, profile_key, provider_id, command_schema,
+               operation_id, operation_descriptor_revision,
+               operation_descriptor_sha256_v1, completion_mode, idempotency_mode,
                adapter_revision, credential_pool_id, provider_account_id,
                credential_ref, credential_revision, resource_policy_id,
                resource_policy_revision, state, created_at_ms, updated_at_ms)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
-                    'enabled', $12, $12)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+                    $13, $14, $15, $16, 'enabled', $17, $17)
             "#,
         )
         .bind(execution_profile_id)
         .bind(&provisioning.profile_key)
         .bind(openai_codex::PROVIDER_ID)
         .bind(GENERATION_COMMAND_SCHEMA)
+        .bind(operation.id)
+        .bind(operation.descriptor_revision)
+        .bind(&operation_descriptor_sha256_v1)
+        .bind(operation.completion.as_str())
+        .bind(operation.idempotency.as_str())
         .bind(CODEX_GENERATION_ADAPTER_REVISION)
         .bind(credential_pool_id)
         .bind(provider_account_id)

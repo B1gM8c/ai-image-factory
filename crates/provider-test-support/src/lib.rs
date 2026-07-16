@@ -5,7 +5,8 @@ pub mod sink;
 pub mod suite;
 
 pub use fake::{
-    FakeCallCounts, InlineStep, OutputPlan, PollStep, ScriptedFakeProvider, SubmitStep, TestPayload,
+    FakeCallCounts, InlineStep, ObservedSubmitCall, ObservedSubmitIdempotency, OutputPlan,
+    PollStep, ScriptedFakeProvider, SubmitStep, TestPayload,
 };
 pub use sink::RecordingArtifactSink;
 pub use suite::{ConformanceError, drive_existing_operation, drive_remote_to_completion};

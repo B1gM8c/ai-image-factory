@@ -3301,14 +3301,18 @@ async fn executor_execution_insert_requires_prepared_state_without_launch_fence(
                    command_schema, command_hash, execution_profile_id,
                    credential_pool_id, provider_account_id, credential_ref,
                    credential_revision, adapter_revision, resource_policy_id,
-                   resource_policy_revision, state,
+                   resource_policy_revision, operation_id,
+                   operation_descriptor_revision, operation_descriptor_sha256_v1,
+                   completion_mode, idempotency_mode, operation_binding_version, state,
                    prepared_at_ms, updated_at_ms)
                 SELECT $1, $1, $2, job_id, tenant_id, provider_id, model,
                        work_item_id, created_by_execution_id,
                        created_by_lease_epoch, command_schema, command_hash,
                        execution_profile_id, credential_pool_id, provider_account_id,
                        credential_ref, credential_revision, adapter_revision,
-                       resource_policy_id, resource_policy_revision,
+                       resource_policy_id, resource_policy_revision, operation_id,
+                       operation_descriptor_revision, operation_descriptor_sha256_v1,
+                       completion_mode, idempotency_mode, operation_binding_version,
                        'prepared', $3, $3
                 FROM provider_submissions
                 WHERE submission_id = $4
@@ -3349,14 +3353,19 @@ async fn executor_execution_insert_requires_prepared_state_without_launch_fence(
                command_schema, command_hash, execution_profile_id,
                credential_pool_id, provider_account_id, credential_ref,
                credential_revision, adapter_revision, resource_policy_id,
-               resource_policy_revision, state,
+               resource_policy_revision, operation_id,
+               operation_descriptor_revision, operation_descriptor_sha256_v1,
+               completion_mode, idempotency_mode, operation_binding_version, state,
                prepared_at_ms, started_at_ms, updated_at_ms)
             SELECT $1, $2, $3, job_id, tenant_id, provider_id, model,
                    work_item_id, created_by_execution_id, created_by_lease_epoch,
                    command_schema, command_hash, execution_profile_id,
                    credential_pool_id, provider_account_id, credential_ref,
                    credential_revision, adapter_revision, resource_policy_id,
-                   resource_policy_revision, 'running', $4, $4, $4
+                   resource_policy_revision, operation_id,
+                   operation_descriptor_revision, operation_descriptor_sha256_v1,
+                   completion_mode, idempotency_mode, operation_binding_version,
+                   'running', $4, $4, $4
             FROM provider_submissions
             WHERE submission_id = $5
             "#,
@@ -5465,6 +5474,9 @@ async fn seed_execution_profiles(pool: &PgPool) -> TestResult {
         profile_key,
         provider_id,
         command_schema,
+        operation_id,
+        operation_descriptor_revision,
+        operation_descriptor_sha256_v1,
         adapter_revision,
         pool_id,
         account_id,
@@ -5476,6 +5488,9 @@ async fn seed_execution_profiles(pool: &PgPool) -> TestResult {
             "provider-test-generation-v1",
             "provider-test",
             "provider-command-v1",
+            "images.generations",
+            "provider-test/images.generations/v1",
+            "2".repeat(64),
             "provider-test-adapter-v1",
             TEST_POOL_ID,
             TEST_ACCOUNT_ID,
@@ -5487,6 +5502,9 @@ async fn seed_execution_profiles(pool: &PgPool) -> TestResult {
             "openai-codex-generation-v1",
             "openai-codex",
             GENERATION_COMMAND_SCHEMA,
+            "images.generations",
+            "openai-codex/images.generations/v1",
+            "f7f3e84594bfda2312d9420aa22108e76b10b3b22c52535ccf768f944d9b7aaa".to_string(),
             CODEX_GENERATION_ADAPTER_REVISION,
             CODEX_POOL_ID,
             CODEX_ACCOUNT_ID,
@@ -5498,17 +5516,22 @@ async fn seed_execution_profiles(pool: &PgPool) -> TestResult {
             r#"
             INSERT INTO provider_execution_profiles
               (execution_profile_id, profile_key, provider_id, command_schema,
+               operation_id, operation_descriptor_revision,
+               operation_descriptor_sha256_v1, completion_mode, idempotency_mode,
                adapter_revision, credential_pool_id, provider_account_id,
                credential_ref, credential_revision, resource_policy_id,
                resource_policy_revision, state, created_at_ms, updated_at_ms)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 1, $9, 1,
-                    'enabled', $10, $10)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, 'inline', 'submission_bound',
+                    $8, $9, $10, $11, 1, $12, 1, 'enabled', $13, $13)
             "#,
         )
         .bind(profile_id)
         .bind(profile_key)
         .bind(provider_id)
         .bind(command_schema)
+        .bind(operation_id)
+        .bind(operation_descriptor_revision)
+        .bind(operation_descriptor_sha256_v1)
         .bind(adapter_revision)
         .bind(pool_id)
         .bind(account_id)
@@ -5559,17 +5582,22 @@ async fn seed_limited_test_profile(
         r#"
         INSERT INTO provider_execution_profiles
           (execution_profile_id, profile_key, provider_id, command_schema,
+           operation_id, operation_descriptor_revision,
+           operation_descriptor_sha256_v1, completion_mode, idempotency_mode,
            adapter_revision, credential_pool_id, provider_account_id,
            credential_ref, credential_revision, resource_policy_id,
            resource_policy_revision, state, created_at_ms, updated_at_ms)
         VALUES ($1, $2, 'provider-test', 'provider-command-v1',
-                'provider-test-adapter-v1', $3, $4,
-                'test-vault.provider-test.1', 1, $5, 1,
-                'enabled', $6, $6)
+                'images.generations', 'provider-test/images.generations/v1',
+                $3, 'inline', 'submission_bound',
+                'provider-test-adapter-v1', $4, $5,
+                'test-vault.provider-test.1', 1, $6, 1,
+                'enabled', $7, $7)
         "#,
     )
     .bind(profile_id)
     .bind(format!("provider-test-limited-{}", profile_id.simple()))
+    .bind("2".repeat(64))
     .bind(TEST_POOL_ID)
     .bind(TEST_ACCOUNT_ID)
     .bind(policy_id)

@@ -83,6 +83,12 @@ struct ClaimRow {
     model: String,
     command_schema: String,
     command_hash: String,
+    operation_id: String,
+    operation_descriptor_revision: String,
+    operation_descriptor_sha256_v1: String,
+    completion_mode: String,
+    idempotency_mode: String,
+    operation_binding_version: i16,
     execution_profile_id: Uuid,
     adapter_revision: String,
     credential_pool_id: Uuid,
@@ -92,6 +98,8 @@ struct ClaimRow {
     resource_policy_id: Uuid,
     resource_policy_revision: i64,
     idempotency_key: String,
+    provider_command_sha256: String,
+    execution_binding_sha256: String,
     invocation_attempt: i32,
     provider_timeout_ms: i64,
     provider_deadline_at_ms: i64,
@@ -102,6 +110,12 @@ struct ProviderContextRow {
     model: String,
     command_schema: String,
     command_hash: String,
+    operation_id: String,
+    operation_descriptor_revision: String,
+    operation_descriptor_sha256_v1: String,
+    completion_mode: String,
+    idempotency_mode: String,
+    operation_binding_version: i16,
     execution_profile_id: Uuid,
     adapter_revision: String,
     credential_pool_id: Uuid,
@@ -111,6 +125,8 @@ struct ProviderContextRow {
     resource_policy_id: Uuid,
     resource_policy_revision: i64,
     idempotency_key: String,
+    provider_command_sha256: String,
+    execution_binding_sha256: String,
     invocation_attempt: i32,
     provider_timeout_ms: i64,
     provider_deadline_at_ms: i64,
@@ -125,6 +141,9 @@ struct RecoveryClaimRow {
     submit_owner: String,
     submit_lease_epoch: i64,
     idempotency_key: String,
+    provider_command_sha256: String,
+    execution_binding_sha256: String,
+    intent_provider_timeout_ms: i64,
     state: String,
     remote_operation_id: Option<String>,
     provider_request_id: Option<String>,
@@ -139,6 +158,12 @@ struct RecoveryClaimRow {
     model: String,
     command_schema: String,
     command_hash: String,
+    operation_id: String,
+    operation_descriptor_revision: String,
+    operation_descriptor_sha256_v1: String,
+    completion_mode: String,
+    idempotency_mode: String,
+    operation_binding_version: i16,
     execution_profile_id: Uuid,
     adapter_revision: String,
     credential_pool_id: Uuid,
@@ -205,6 +230,9 @@ struct SubmitIntentRow {
     submit_owner: String,
     submit_lease_epoch: i64,
     idempotency_key: String,
+    provider_command_sha256: String,
+    execution_binding_sha256: String,
+    provider_timeout_ms: i64,
     state: String,
     remote_operation_id: Option<String>,
     provider_request_id: Option<String>,
@@ -213,6 +241,36 @@ struct SubmitIntentRow {
     failure_event_identity: Option<String>,
     failure_error_code: Option<String>,
     updated_at_ms: i64,
+}
+
+#[derive(sqlx::FromRow)]
+struct SubmitBindingRow {
+    output_id: Uuid,
+    provider_id: String,
+    provider_account_id: Uuid,
+    submission_state: String,
+    model: String,
+    command_schema: String,
+    command_hash: String,
+    operation_id: String,
+    operation_descriptor_revision: String,
+    operation_descriptor_sha256_v1: String,
+    completion_mode: String,
+    idempotency_mode: String,
+    operation_binding_version: i16,
+    execution_profile_id: Uuid,
+    adapter_revision: String,
+    credential_pool_id: Uuid,
+    credential_ref: String,
+    credential_revision: i64,
+    credential_auth_sha256: String,
+    resource_policy_id: Uuid,
+    resource_policy_revision: i64,
+    executor_owner: Option<String>,
+    executor_lease_epoch: i64,
+    launch_lease_epoch: Option<i64>,
+    lease_expires_at_ms: Option<i64>,
+    allocation_state: String,
 }
 
 #[derive(sqlx::FromRow)]
@@ -254,26 +312,41 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
     ) -> Result<ProviderSubmitIntent, ProviderTaskStoreError> {
         validate_reservation(request)?;
         let mut tx = self.pool.begin().await.map_err(unavailable)?;
-        let binding: Option<(
-            String,
-            Uuid,
-            String,
-            Option<String>,
-            i64,
-            Option<i64>,
-            Option<i64>,
-        )> = sqlx::query_as(
+        let binding: Option<SubmitBindingRow> = sqlx::query_as(
             r#"
-                SELECT submission.provider_id, submission.provider_account_id,
-                       submission.state, execution.executor_owner, execution.lease_epoch,
-                       execution.launch_lease_epoch, execution.lease_expires_at_ms
+                SELECT submission.output_id, submission.provider_id,
+                       submission.provider_account_id,
+                       submission.state AS submission_state, submission.model,
+                       submission.command_schema, submission.command_hash,
+                       submission.operation_id,
+                       submission.operation_descriptor_revision,
+                       submission.operation_descriptor_sha256_v1,
+                       submission.completion_mode, submission.idempotency_mode,
+                       submission.operation_binding_version,
+                       submission.execution_profile_id, submission.adapter_revision,
+                       submission.credential_pool_id, submission.credential_ref,
+                       submission.credential_revision, account.credential_auth_sha256,
+                       submission.resource_policy_id, submission.resource_policy_revision,
+                       execution.executor_owner,
+                       execution.lease_epoch AS executor_lease_epoch,
+                       execution.launch_lease_epoch, execution.lease_expires_at_ms,
+                       allocation.state AS allocation_state
                 FROM executor_executions execution
                 JOIN provider_submissions submission
                   ON submission.executor_execution_id = execution.executor_execution_id
                  AND submission.submission_id = execution.submission_id
+                JOIN provider_accounts account
+                  ON account.provider_account_id = submission.provider_account_id
+                 AND account.credential_pool_id = submission.credential_pool_id
+                 AND account.provider_id = submission.provider_id
+                 AND account.credential_ref = submission.credential_ref
+                 AND account.credential_revision = submission.credential_revision
+                JOIN executor_capacity_allocations allocation
+                  ON allocation.executor_execution_id = execution.executor_execution_id
+                 AND allocation.submission_id = execution.submission_id
                 WHERE execution.executor_execution_id = $1
                   AND execution.submission_id = $2
-                FOR UPDATE OF execution, submission
+                FOR UPDATE OF execution, submission, allocation
                 "#,
         )
         .bind(request.executor_execution_id)
@@ -281,23 +354,20 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
         .fetch_optional(&mut *tx)
         .await
         .map_err(unavailable)?;
-        let Some((
-            provider_id,
-            provider_account_id,
-            submission_state,
-            owner,
-            epoch,
-            launch_epoch,
-            expires_at_ms,
-        )) = binding
-        else {
+        let Some(binding) = binding else {
             return Err(ProviderTaskStoreError::NotFound);
         };
+        let provider_command_sha256 = provider_command_sha256(request);
+        let execution_binding_sha256 =
+            execution_binding_sha256(&binding, request, &provider_command_sha256);
         if let Some(existing) = load_submit_intent_in(&mut tx, request.submission_id).await? {
             let matches = existing.executor_execution_id == request.executor_execution_id
                 && existing.submit_owner == request.executor_owner
                 && existing.submit_lease_epoch == request.executor_lease_epoch
-                && existing.idempotency_key == request.idempotency_key;
+                && existing.idempotency_key == request.idempotency_key
+                && existing.provider_command_sha256 == provider_command_sha256
+                && existing.execution_binding_sha256 == execution_binding_sha256
+                && existing.provider_timeout_ms == request.provider_timeout_ms;
             if !matches {
                 return Err(ProviderTaskStoreError::Conflict);
             }
@@ -306,11 +376,12 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
             return Ok(intent);
         }
         let now = database_now(&mut tx).await?;
-        if submission_state != "running"
-            || owner.as_deref() != Some(request.executor_owner.as_str())
-            || epoch != request.executor_lease_epoch
-            || launch_epoch != Some(request.executor_lease_epoch)
-            || expires_at_ms.is_none_or(|value| value <= now)
+        if binding.submission_state != "running"
+            || binding.executor_owner.as_deref() != Some(request.executor_owner.as_str())
+            || binding.executor_lease_epoch != request.executor_lease_epoch
+            || binding.launch_lease_epoch != Some(request.executor_lease_epoch)
+            || binding.lease_expires_at_ms.is_none_or(|value| value <= now)
+            || binding.allocation_state != "held"
         {
             return Err(ProviderTaskStoreError::StaleLease);
         }
@@ -319,17 +390,21 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
             INSERT INTO provider_remote_submit_intents
               (submission_id, executor_execution_id, provider_id, provider_account_id,
                submit_owner, submit_lease_epoch, idempotency_key, state,
-               created_at_ms, updated_at_ms)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, 'reserved', $8, $8)
+               provider_command_sha256, execution_binding_sha256,
+               provider_timeout_ms, created_at_ms, updated_at_ms)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, 'reserved', $8, $9, $10, $11, $11)
             "#,
         )
         .bind(request.submission_id)
         .bind(request.executor_execution_id)
-        .bind(&provider_id)
-        .bind(provider_account_id)
+        .bind(&binding.provider_id)
+        .bind(binding.provider_account_id)
         .bind(&request.executor_owner)
         .bind(request.executor_lease_epoch)
         .bind(&request.idempotency_key)
+        .bind(&provider_command_sha256)
+        .bind(&execution_binding_sha256)
+        .bind(request.provider_timeout_ms)
         .bind(now)
         .execute(&mut *tx)
         .await
@@ -452,6 +527,7 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
         if row.executor_execution_id != request.executor_execution_id
             || row.submit_owner != request.executor_owner
             || row.submit_lease_epoch != request.executor_lease_epoch
+            || row.execution_binding_sha256 != request.execution_binding_sha256
         {
             return Err(ProviderTaskStoreError::Conflict);
         }
@@ -547,6 +623,7 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
         if row.executor_execution_id != request.executor_execution_id
             || row.submit_owner != request.executor_owner
             || row.submit_lease_epoch != request.executor_lease_epoch
+            || row.execution_binding_sha256 != request.execution_binding_sha256
         {
             return Err(ProviderTaskStoreError::Conflict);
         }
@@ -1141,6 +1218,7 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
             || intent.provider_account_id != parent.provider_account_id
             || intent.submit_owner != request.executor_owner
             || intent.submit_lease_epoch != request.executor_lease_epoch
+            || intent.execution_binding_sha256 != request.execution_binding_sha256
             || !matches!(intent.state.as_str(), "operation_known" | "attached")
             || intent.remote_operation_id.as_deref() != Some(request.remote_operation_id.as_str())
             || intent.provider_request_id != request.provider_request_id
@@ -1458,13 +1536,19 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
                    claimed.poll_owner, claimed.poll_lease_expires_at_ms,
                    claimed.updated_at_ms AS claim_updated_at_ms,
                    submission.model, submission.command_schema,
-                   submission.command_hash, submission.execution_profile_id,
+                   submission.command_hash, submission.operation_id,
+                   submission.operation_descriptor_revision,
+                   submission.operation_descriptor_sha256_v1,
+                   submission.completion_mode, submission.idempotency_mode,
+                   submission.operation_binding_version,
+                   submission.execution_profile_id,
                    submission.adapter_revision, submission.credential_pool_id,
                    submission.credential_ref, submission.credential_revision,
                    account.credential_auth_sha256,
                    submission.resource_policy_id,
                    submission.resource_policy_revision,
-                   intent.idempotency_key, recovery.invocation_attempt,
+                   intent.idempotency_key, intent.provider_command_sha256,
+                   intent.execution_binding_sha256, recovery.invocation_attempt,
                    recovery.provider_timeout_ms, claimed.provider_deadline_at_ms
             FROM claimed
             JOIN provider_submissions submission
@@ -2989,7 +3073,9 @@ async fn load_submit_intent_in(
     sqlx::query_as(
         r#"
         SELECT submission_id, executor_execution_id, provider_id, provider_account_id,
-               submit_owner, submit_lease_epoch, idempotency_key, state,
+               submit_owner, submit_lease_epoch, idempotency_key,
+               provider_command_sha256, execution_binding_sha256,
+               provider_timeout_ms, state,
                remote_operation_id, provider_request_id, send_started_at_ms,
                receipt_event_identity, failure_event_identity,
                failure_error_code, updated_at_ms
@@ -3011,7 +3097,9 @@ async fn load_submit_intent(
     sqlx::query_as(
         r#"
         SELECT submission_id, executor_execution_id, provider_id, provider_account_id,
-               submit_owner, submit_lease_epoch, idempotency_key, state,
+               submit_owner, submit_lease_epoch, idempotency_key,
+               provider_command_sha256, execution_binding_sha256,
+               provider_timeout_ms, state,
                remote_operation_id, provider_request_id, send_started_at_ms,
                receipt_event_identity, failure_event_identity,
                failure_error_code, updated_at_ms
@@ -3083,12 +3171,18 @@ async fn load_provider_context_in(
     sqlx::query_as(
         r#"
         SELECT submission.model, submission.command_schema,
-               submission.command_hash, submission.execution_profile_id,
+               submission.command_hash, submission.operation_id,
+               submission.operation_descriptor_revision,
+               submission.operation_descriptor_sha256_v1,
+               submission.completion_mode, submission.idempotency_mode,
+               submission.operation_binding_version,
+               submission.execution_profile_id,
                submission.adapter_revision, submission.credential_pool_id,
                submission.credential_ref, submission.credential_revision,
                account.credential_auth_sha256,
                submission.resource_policy_id, submission.resource_policy_revision,
-               intent.idempotency_key, recovery.invocation_attempt,
+               intent.idempotency_key, intent.provider_command_sha256,
+               intent.execution_binding_sha256, recovery.invocation_attempt,
                recovery.provider_timeout_ms, recovery.provider_deadline_at_ms
         FROM provider_submit_recoveries recovery
         JOIN provider_remote_submit_intents intent
@@ -3181,7 +3275,10 @@ async fn load_recovery_claim_command_in(
         SELECT command.submission_id, command.executor_execution_id,
                command.provider_id, command.provider_account_id,
                intent.submit_owner, intent.submit_lease_epoch,
-               intent.idempotency_key, command.intent_state AS state,
+               intent.idempotency_key, intent.provider_command_sha256,
+               intent.execution_binding_sha256,
+               intent.provider_timeout_ms AS intent_provider_timeout_ms,
+               command.intent_state AS state,
                command.intent_remote_operation_id AS remote_operation_id,
                command.intent_provider_request_id AS provider_request_id,
                command.intent_send_started_at_ms AS send_started_at_ms,
@@ -3193,7 +3290,12 @@ async fn load_recovery_claim_command_in(
                command.recovery_lease_epoch,
                command.claim_lease_expires_at_ms AS recovery_lease_expires_at_ms,
                submission.model, submission.command_schema,
-               submission.command_hash, submission.execution_profile_id,
+               submission.command_hash, submission.operation_id,
+               submission.operation_descriptor_revision,
+               submission.operation_descriptor_sha256_v1,
+               submission.completion_mode, submission.idempotency_mode,
+               submission.operation_binding_version,
+               submission.execution_profile_id,
                submission.adapter_revision, submission.credential_pool_id,
                submission.credential_ref, submission.credential_revision,
                account.credential_auth_sha256,
@@ -3438,6 +3540,107 @@ fn submit_intent_matches_reservation(
         && row.submit_owner == request.executor_owner
         && row.submit_lease_epoch == request.executor_lease_epoch
         && row.idempotency_key == request.idempotency_key
+        && provider_command_sha256_matches(&row.provider_command_sha256, request)
+        && row.provider_timeout_ms == request.provider_timeout_ms
+}
+
+fn provider_command_sha256_matches(expected: &str, request: &RemoteTaskSubmitReservation) -> bool {
+    let mut encoded = [0_u8; 64];
+    hex::encode_to_slice(request.provider_command().canonical_sha256(), &mut encoded).is_ok()
+        && expected.as_bytes() == encoded
+}
+
+fn provider_command_sha256(request: &RemoteTaskSubmitReservation) -> String {
+    hex::encode(request.provider_command().canonical_sha256())
+}
+
+fn execution_binding_sha256(
+    binding: &SubmitBindingRow,
+    request: &RemoteTaskSubmitReservation,
+    provider_command_sha256: &str,
+) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"ai-image-factory/provider-execution-binding/v1\0");
+    for (name, value) in [
+        ("submission_id", request.submission_id.as_bytes().as_slice()),
+        (
+            "executor_execution_id",
+            request.executor_execution_id.as_bytes().as_slice(),
+        ),
+        ("output_id", binding.output_id.as_bytes().as_slice()),
+        ("provider_id", binding.provider_id.as_bytes()),
+        (
+            "provider_account_id",
+            binding.provider_account_id.as_bytes().as_slice(),
+        ),
+        ("model", binding.model.as_bytes()),
+        ("command_schema", binding.command_schema.as_bytes()),
+        ("command_hash", binding.command_hash.as_bytes()),
+        ("operation_id", binding.operation_id.as_bytes()),
+        (
+            "operation_descriptor_revision",
+            binding.operation_descriptor_revision.as_bytes(),
+        ),
+        (
+            "operation_descriptor_sha256_v1",
+            binding.operation_descriptor_sha256_v1.as_bytes(),
+        ),
+        ("completion_mode", binding.completion_mode.as_bytes()),
+        ("idempotency_mode", binding.idempotency_mode.as_bytes()),
+        (
+            "operation_binding_version",
+            binding.operation_binding_version.to_be_bytes().as_slice(),
+        ),
+        (
+            "execution_profile_id",
+            binding.execution_profile_id.as_bytes().as_slice(),
+        ),
+        ("adapter_revision", binding.adapter_revision.as_bytes()),
+        (
+            "credential_pool_id",
+            binding.credential_pool_id.as_bytes().as_slice(),
+        ),
+        ("credential_ref", binding.credential_ref.as_bytes()),
+        (
+            "credential_revision",
+            binding.credential_revision.to_be_bytes().as_slice(),
+        ),
+        (
+            "credential_auth_sha256",
+            binding.credential_auth_sha256.as_bytes(),
+        ),
+        (
+            "resource_policy_id",
+            binding.resource_policy_id.as_bytes().as_slice(),
+        ),
+        (
+            "resource_policy_revision",
+            binding.resource_policy_revision.to_be_bytes().as_slice(),
+        ),
+        ("executor_owner", request.executor_owner.as_bytes()),
+        (
+            "executor_lease_epoch",
+            request.executor_lease_epoch.to_be_bytes().as_slice(),
+        ),
+        (
+            "submission_idempotency_key",
+            request.idempotency_key.as_bytes(),
+        ),
+        (
+            "provider_command_sha256",
+            provider_command_sha256.as_bytes(),
+        ),
+        (
+            "provider_timeout_ms",
+            request.provider_timeout_ms.to_be_bytes().as_slice(),
+        ),
+    ] {
+        digest.update((name.len() as u64).to_be_bytes());
+        digest.update(name.as_bytes());
+        digest.update((value.len() as u64).to_be_bytes());
+        digest.update(value);
+    }
+    hex::encode(digest.finalize())
 }
 
 fn submit_intent_from_row(
@@ -3461,6 +3664,9 @@ fn submit_intent_from_row(
         submit_owner: row.submit_owner,
         submit_lease_epoch: row.submit_lease_epoch,
         idempotency_key: row.idempotency_key,
+        provider_command_sha256: row.provider_command_sha256,
+        execution_binding_sha256: row.execution_binding_sha256,
+        provider_timeout_ms: row.provider_timeout_ms,
         state,
         remote_operation_id: row.remote_operation_id,
         provider_request_id: row.provider_request_id,
@@ -3477,6 +3683,12 @@ fn provider_context_from_row(row: ProviderContextRow) -> ProviderExecutionContex
         model: row.model,
         command_schema: row.command_schema,
         command_hash: row.command_hash,
+        operation_id: row.operation_id,
+        operation_descriptor_revision: row.operation_descriptor_revision,
+        operation_descriptor_sha256_v1: row.operation_descriptor_sha256_v1,
+        completion_mode: row.completion_mode,
+        idempotency_mode: row.idempotency_mode,
+        operation_binding_version: row.operation_binding_version,
         execution_profile_id: row.execution_profile_id,
         adapter_revision: row.adapter_revision,
         credential_pool_id: row.credential_pool_id,
@@ -3485,7 +3697,9 @@ fn provider_context_from_row(row: ProviderContextRow) -> ProviderExecutionContex
         credential_auth_sha256: row.credential_auth_sha256,
         resource_policy_id: row.resource_policy_id,
         resource_policy_revision: row.resource_policy_revision,
-        idempotency_key: row.idempotency_key,
+        submission_idempotency_key: row.idempotency_key,
+        provider_command_sha256: row.provider_command_sha256,
+        execution_binding_sha256: row.execution_binding_sha256,
         invocation_attempt: row.invocation_attempt,
         provider_timeout_ms: row.provider_timeout_ms,
         provider_deadline_at_ms: row.provider_deadline_at_ms,
@@ -3495,6 +3709,9 @@ fn provider_context_from_row(row: ProviderContextRow) -> ProviderExecutionContex
 fn recovery_lease_from_row(
     row: RecoveryClaimRow,
 ) -> Result<ProviderSubmitRecoveryLease, ProviderTaskStoreError> {
+    if row.intent_provider_timeout_ms != row.provider_timeout_ms {
+        return Err(ProviderTaskStoreError::Conflict);
+    }
     let intent = submit_intent_from_row(SubmitIntentRow {
         submission_id: row.submission_id,
         executor_execution_id: row.executor_execution_id,
@@ -3503,6 +3720,9 @@ fn recovery_lease_from_row(
         submit_owner: row.submit_owner,
         submit_lease_epoch: row.submit_lease_epoch,
         idempotency_key: row.idempotency_key.clone(),
+        provider_command_sha256: row.provider_command_sha256.clone(),
+        execution_binding_sha256: row.execution_binding_sha256.clone(),
+        provider_timeout_ms: row.intent_provider_timeout_ms,
         state: row.state,
         remote_operation_id: row.remote_operation_id,
         provider_request_id: row.provider_request_id,
@@ -3512,28 +3732,44 @@ fn recovery_lease_from_row(
         failure_error_code: row.failure_error_code,
         updated_at_ms: row.updated_at_ms,
     })?;
+    let context = ProviderExecutionContext {
+        model: row.model,
+        command_schema: row.command_schema,
+        command_hash: row.command_hash,
+        operation_id: row.operation_id,
+        operation_descriptor_revision: row.operation_descriptor_revision,
+        operation_descriptor_sha256_v1: row.operation_descriptor_sha256_v1,
+        completion_mode: row.completion_mode,
+        idempotency_mode: row.idempotency_mode,
+        operation_binding_version: row.operation_binding_version,
+        execution_profile_id: row.execution_profile_id,
+        adapter_revision: row.adapter_revision,
+        credential_pool_id: row.credential_pool_id,
+        credential_ref: row.credential_ref,
+        credential_revision: row.credential_revision,
+        credential_auth_sha256: row.credential_auth_sha256,
+        resource_policy_id: row.resource_policy_id,
+        resource_policy_revision: row.resource_policy_revision,
+        submission_idempotency_key: row.idempotency_key,
+        provider_command_sha256: row.provider_command_sha256,
+        execution_binding_sha256: row.execution_binding_sha256,
+        invocation_attempt: row.invocation_attempt,
+        provider_timeout_ms: row.provider_timeout_ms,
+        provider_deadline_at_ms: row.provider_deadline_at_ms,
+    };
+    let authority_seal = recovery_lease_authority_seal(
+        &intent,
+        &context,
+        &row.recovery_owner,
+        row.recovery_lease_epoch,
+    );
     Ok(ProviderSubmitRecoveryLease {
         intent,
-        context: ProviderExecutionContext {
-            model: row.model,
-            command_schema: row.command_schema,
-            command_hash: row.command_hash,
-            execution_profile_id: row.execution_profile_id,
-            adapter_revision: row.adapter_revision,
-            credential_pool_id: row.credential_pool_id,
-            credential_ref: row.credential_ref,
-            credential_revision: row.credential_revision,
-            credential_auth_sha256: row.credential_auth_sha256,
-            resource_policy_id: row.resource_policy_id,
-            resource_policy_revision: row.resource_policy_revision,
-            idempotency_key: row.idempotency_key,
-            invocation_attempt: row.invocation_attempt,
-            provider_timeout_ms: row.provider_timeout_ms,
-            provider_deadline_at_ms: row.provider_deadline_at_ms,
-        },
+        context,
         recovery_owner: row.recovery_owner,
         recovery_lease_epoch: row.recovery_lease_epoch,
         recovery_lease_expires_at_ms: row.recovery_lease_expires_at_ms,
+        authority_seal,
     })
 }
 
@@ -3622,6 +3858,12 @@ fn lease_from_row(row: ClaimRow) -> Result<ProviderTaskLease, ProviderTaskStoreE
         model,
         command_schema,
         command_hash,
+        operation_id,
+        operation_descriptor_revision,
+        operation_descriptor_sha256_v1,
+        completion_mode,
+        idempotency_mode,
+        operation_binding_version,
         execution_profile_id,
         adapter_revision,
         credential_pool_id,
@@ -3631,52 +3873,67 @@ fn lease_from_row(row: ClaimRow) -> Result<ProviderTaskLease, ProviderTaskStoreE
         resource_policy_id,
         resource_policy_revision,
         idempotency_key,
+        provider_command_sha256,
+        execution_binding_sha256,
         invocation_attempt,
         provider_timeout_ms,
         provider_deadline_at_ms,
     } = row;
+    let task = task_from_row(TaskRow {
+        submission_id,
+        executor_execution_id,
+        provider_id,
+        provider_account_id,
+        remote_operation_id,
+        provider_request_id,
+        provider_deadline_at_ms,
+        state,
+        artifact_ref,
+        error_code,
+        next_poll_at_ms,
+        cancel_requested,
+        poll_owner: Some(poll_owner.clone()),
+        poll_lease_epoch,
+        poll_lease_expires_at_ms: Some(poll_lease_expires_at_ms),
+        state_observation_id,
+        deadline_quarantine_id: None,
+        attach_recovery_owner,
+        attach_recovery_lease_epoch,
+    })?;
+    let context = ProviderExecutionContext {
+        model,
+        command_schema,
+        command_hash,
+        operation_id,
+        operation_descriptor_revision,
+        operation_descriptor_sha256_v1,
+        completion_mode,
+        idempotency_mode,
+        operation_binding_version,
+        execution_profile_id,
+        adapter_revision,
+        credential_pool_id,
+        credential_ref,
+        credential_revision,
+        credential_auth_sha256,
+        resource_policy_id,
+        resource_policy_revision,
+        submission_idempotency_key: idempotency_key,
+        provider_command_sha256,
+        execution_binding_sha256,
+        invocation_attempt,
+        provider_timeout_ms,
+        provider_deadline_at_ms,
+    };
+    let authority_seal =
+        provider_task_lease_authority_seal(&task, &context, &poll_owner, poll_lease_epoch);
     Ok(ProviderTaskLease {
-        task: task_from_row(TaskRow {
-            submission_id,
-            executor_execution_id,
-            provider_id,
-            provider_account_id,
-            remote_operation_id,
-            provider_request_id,
-            provider_deadline_at_ms,
-            state,
-            artifact_ref,
-            error_code,
-            next_poll_at_ms,
-            cancel_requested,
-            poll_owner: Some(poll_owner.clone()),
-            poll_lease_epoch,
-            poll_lease_expires_at_ms: Some(poll_lease_expires_at_ms),
-            state_observation_id,
-            deadline_quarantine_id: None,
-            attach_recovery_owner,
-            attach_recovery_lease_epoch,
-        })?,
-        context: ProviderExecutionContext {
-            model,
-            command_schema,
-            command_hash,
-            execution_profile_id,
-            adapter_revision,
-            credential_pool_id,
-            credential_ref,
-            credential_revision,
-            credential_auth_sha256,
-            resource_policy_id,
-            resource_policy_revision,
-            idempotency_key,
-            invocation_attempt,
-            provider_timeout_ms,
-            provider_deadline_at_ms,
-        },
+        task,
+        context,
         poll_owner,
         poll_lease_epoch,
         poll_lease_expires_at_ms,
+        authority_seal,
     })
 }
 
@@ -3703,6 +3960,7 @@ fn validate_attach(value: &RemoteTaskAttach) -> Result<(), ProviderTaskStoreErro
             .as_deref()
             .is_some_and(|id| !valid_identifier(id, 255))
         || !valid_public_event_identity(&value.event_identity)
+        || !valid_sha256(&value.execution_binding_sha256)
         || !(0..=MAX_POLL_AFTER_MS).contains(&value.poll_after_ms)
         || value.recovery_fence.as_ref().is_some_and(|fence| {
             !valid_owner(&fence.recovery_owner) || fence.recovery_lease_epoch <= 0
@@ -3737,6 +3995,7 @@ fn validate_submit_failure(value: &RemoteTaskSubmitFailure) -> Result<(), Provid
         || !valid_owner(&value.executor_owner)
         || !valid_identifier(&value.event_identity, 255)
         || !valid_simple_identifier(&value.error_code, 128)
+        || !valid_sha256(&value.execution_binding_sha256)
         || value.recovery_fence.as_ref().is_some_and(|fence| {
             value.kind != ProviderSubmitFailureKind::Rejected
                 || !valid_owner(&fence.recovery_owner)
@@ -3761,6 +4020,7 @@ fn validate_submit_receipt(value: &RemoteTaskSubmitReceipt) -> Result<(), Provid
             .as_deref()
             .is_some_and(|id| !valid_identifier(id, 255))
         || !valid_identifier(&value.event_identity, 255)
+        || !valid_sha256(&value.execution_binding_sha256)
     {
         Err(ProviderTaskStoreError::InvalidInput)
     } else {
@@ -3816,6 +4076,13 @@ fn validate_lease(lease: &ProviderTaskLease, lease_ms: i64) -> Result<(), Provid
         || lease.task.executor_execution_id.is_nil()
         || lease.poll_lease_epoch <= 0
         || !valid_owner(&lease.poll_owner)
+        || lease.authority_seal
+            != provider_task_lease_authority_seal(
+                &lease.task,
+                &lease.context,
+                &lease.poll_owner,
+                lease.poll_lease_epoch,
+            )
         || !(1..=MAX_LEASE_MS).contains(&lease_ms)
     {
         Err(ProviderTaskStoreError::InvalidInput)
@@ -3833,7 +4100,17 @@ fn validate_recovery_lease(
         || lease.intent.state == ProviderSubmitIntentState::Reserved
         || lease.recovery_lease_epoch <= 0
         || !valid_owner(&lease.recovery_owner)
-        || lease.context.idempotency_key != lease.intent.idempotency_key
+        || lease.context.submission_idempotency_key != lease.intent.idempotency_key
+        || lease.context.provider_command_sha256 != lease.intent.provider_command_sha256
+        || lease.context.execution_binding_sha256 != lease.intent.execution_binding_sha256
+        || lease.context.provider_timeout_ms != lease.intent.provider_timeout_ms
+        || lease.authority_seal
+            != recovery_lease_authority_seal(
+                &lease.intent,
+                &lease.context,
+                &lease.recovery_owner,
+                lease.recovery_lease_epoch,
+            )
         || !(1..=MAX_PROVIDER_TIMEOUT_MS).contains(&lease.context.provider_timeout_ms)
         || !(1..=MAX_LEASE_MS).contains(&lease_ms)
     {
@@ -3841,6 +4118,60 @@ fn validate_recovery_lease(
     } else {
         Ok(())
     }
+}
+
+fn provider_task_lease_authority_seal(
+    task: &ProviderRemoteTask,
+    context: &ProviderExecutionContext,
+    poll_owner: &str,
+    poll_lease_epoch: i64,
+) -> [u8; 32] {
+    authority_seal(
+        b"ai-image-factory/provider-task-lease/v1\0",
+        &[
+            task.submission_id.as_bytes(),
+            task.executor_execution_id.as_bytes(),
+            task.provider_id.as_bytes(),
+            task.provider_account_id.as_bytes(),
+            task.remote_operation_id.as_bytes(),
+            context.execution_binding_sha256.as_bytes(),
+            poll_owner.as_bytes(),
+            &poll_lease_epoch.to_be_bytes(),
+        ],
+    )
+}
+
+fn recovery_lease_authority_seal(
+    intent: &ProviderSubmitIntent,
+    context: &ProviderExecutionContext,
+    recovery_owner: &str,
+    recovery_lease_epoch: i64,
+) -> [u8; 32] {
+    authority_seal(
+        b"ai-image-factory/provider-submit-recovery-lease/v1\0",
+        &[
+            intent.submission_id.as_bytes(),
+            intent.executor_execution_id.as_bytes(),
+            intent.provider_id.as_bytes(),
+            intent.provider_account_id.as_bytes(),
+            intent.idempotency_key.as_bytes(),
+            intent.provider_command_sha256.as_bytes(),
+            intent.execution_binding_sha256.as_bytes(),
+            context.execution_binding_sha256.as_bytes(),
+            recovery_owner.as_bytes(),
+            &recovery_lease_epoch.to_be_bytes(),
+        ],
+    )
+}
+
+fn authority_seal(domain: &[u8], values: &[&[u8]]) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(domain);
+    for value in values {
+        digest.update((value.len() as u64).to_be_bytes());
+        digest.update(value);
+    }
+    digest.finalize().into()
 }
 
 fn validate_observation(value: &ProviderTaskObservation) -> Result<(), ProviderTaskStoreError> {
@@ -3920,6 +4251,13 @@ fn valid_simple_identifier(value: &str, max: usize) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+fn valid_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
 #[allow(clippy::too_many_arguments)]

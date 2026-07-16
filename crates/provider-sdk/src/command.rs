@@ -54,6 +54,17 @@ pub struct SingleOutputCommand<P> {
     payload: P,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProviderCommandIdentity {
+    canonical_sha256: [u8; 32],
+}
+
+impl ProviderCommandIdentity {
+    pub fn canonical_sha256(&self) -> &[u8; 32] {
+        &self.canonical_sha256
+    }
+}
+
 impl<P> SingleOutputCommand<P> {
     pub fn new(
         schema_id: &'static str,
@@ -86,6 +97,12 @@ impl<P> SingleOutputCommand<P> {
         &self.canonical_sha256
     }
 
+    pub fn identity(&self) -> ProviderCommandIdentity {
+        ProviderCommandIdentity {
+            canonical_sha256: self.canonical_sha256,
+        }
+    }
+
     pub fn output(&self) -> OutputSlot {
         self.output
     }
@@ -103,8 +120,9 @@ impl<P> SingleOutputCommand<P> {
 pub struct InvocationContext<'a> {
     submission_id: &'a str,
     provider_id: &'a str,
+    operation_id: &'a str,
+    descriptor_revision: &'a str,
     model: &'a str,
-    idempotency_key: &'a str,
     attempt: u32,
 }
 
@@ -112,14 +130,16 @@ impl<'a> InvocationContext<'a> {
     pub fn new(
         submission_id: &'a str,
         provider_id: &'a str,
+        operation_id: &'a str,
+        descriptor_revision: &'a str,
         model: &'a str,
-        idempotency_key: &'a str,
         attempt: u32,
     ) -> Result<Self, CommandIdentityError> {
         if !valid_identity(submission_id)
             || !valid_identity(provider_id)
+            || !valid_identity(operation_id)
+            || !valid_text(descriptor_revision)
             || !valid_text(model)
-            || !valid_identity(idempotency_key)
             || attempt == 0
         {
             return Err(CommandIdentityError::InvalidInvocationContext);
@@ -127,8 +147,9 @@ impl<'a> InvocationContext<'a> {
         Ok(Self {
             submission_id,
             provider_id,
+            operation_id,
+            descriptor_revision,
             model,
-            idempotency_key,
             attempt,
         })
     }
@@ -141,12 +162,16 @@ impl<'a> InvocationContext<'a> {
         self.provider_id
     }
 
-    pub fn model(self) -> &'a str {
-        self.model
+    pub fn operation_id(self) -> &'a str {
+        self.operation_id
     }
 
-    pub fn idempotency_key(self) -> &'a str {
-        self.idempotency_key
+    pub fn descriptor_revision(self) -> &'a str {
+        self.descriptor_revision
+    }
+
+    pub fn model(self) -> &'a str {
+        self.model
     }
 
     pub fn attempt(self) -> u32 {
@@ -155,9 +180,36 @@ impl<'a> InvocationContext<'a> {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SubmitIdempotency<'a> {
+    provider_token: Option<&'a str>,
+}
+
+impl<'a> SubmitIdempotency<'a> {
+    pub const fn submission_bound() -> Self {
+        Self {
+            provider_token: None,
+        }
+    }
+
+    pub fn provider_token(token: &'a str) -> Result<Self, CommandIdentityError> {
+        if !valid_text(token) {
+            return Err(CommandIdentityError::InvalidSubmitIdempotency);
+        }
+        Ok(Self {
+            provider_token: Some(token),
+        })
+    }
+
+    pub fn token(self) -> Option<&'a str> {
+        self.provider_token
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CommandIdentityError {
     InvalidCommandIdentity,
     InvalidInvocationContext,
+    InvalidSubmitIdempotency,
 }
 
 impl fmt::Display for CommandIdentityError {
@@ -168,6 +220,9 @@ impl fmt::Display for CommandIdentityError {
             }
             Self::InvalidInvocationContext => {
                 formatter.write_str("provider invocation context is invalid")
+            }
+            Self::InvalidSubmitIdempotency => {
+                formatter.write_str("provider submit idempotency is invalid")
             }
         }
     }
@@ -204,9 +259,56 @@ mod tests {
 
     #[test]
     fn durable_command_and_invocation_identity_fail_closed() {
-        assert!(InvocationContext::new("submission-1", "provider", "model", "idem", 1).is_ok());
-        assert!(InvocationContext::new("", "provider", "model", "idem", 1).is_err());
-        assert!(InvocationContext::new("submission-1", "provider", "model", "idem", 0).is_err());
+        assert!(
+            InvocationContext::new(
+                "submission-1",
+                "provider",
+                "images.generations",
+                "provider/images.generations/v1",
+                "model",
+                1,
+            )
+            .is_ok()
+        );
+        assert!(
+            InvocationContext::new(
+                "",
+                "provider",
+                "images.generations",
+                "provider/images.generations/v1",
+                "model",
+                1,
+            )
+            .is_err()
+        );
+        assert!(
+            InvocationContext::new(
+                "submission-1",
+                "provider",
+                "images.generations",
+                "provider/images.generations/v1",
+                "model",
+                0,
+            )
+            .is_err()
+        );
+        assert_eq!(SubmitIdempotency::submission_bound().token(), None);
+        assert_eq!(
+            SubmitIdempotency::provider_token("provider-token-1")
+                .unwrap()
+                .token(),
+            Some("provider-token-1")
+        );
+        assert!(SubmitIdempotency::provider_token("").is_err());
+        let command = SingleOutputCommand::new(
+            "provider.command.v1",
+            "adapter-v1",
+            [7; 32],
+            OutputSlot::new(0, 1).unwrap(),
+            (),
+        )
+        .unwrap();
+        assert_eq!(command.identity().canonical_sha256(), &[7; 32]);
         assert!(
             SingleOutputCommand::new(
                 "",
