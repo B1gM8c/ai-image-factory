@@ -1,0 +1,501 @@
+use std::{
+    collections::BTreeMap,
+    fs,
+    path::{Path, PathBuf},
+    process::Stdio,
+    sync::Arc,
+    time::{Duration, Instant},
+};
+
+use gpt_image_2_gateway::{
+    GatedCliBinding, GatedCliCommand, GatedCliObservation, GatedCliSubmission, GatedCliSubmitCodec,
+    GatedCliSubmitDriver,
+};
+
+use super::*;
+
+#[tokio::test]
+async fn orchestrator_runs_one_cli_for_concurrent_callers_and_replays() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let lease = seed_running_submission(&database.pool, "gated-orchestrator-worker").await?;
+        let journal = tempfile::tempdir().map_err(debug_error)?;
+        let journal_root = journal.path().join("remote-submit");
+        let side_effect = journal.path().join("provider-invoked");
+        let codec = FakeGatedSubmitCodec::new(journal.path(), &side_effect, "gated-operation-1")?;
+        let runner = Path::new(env!("CARGO_BIN_EXE_remote-submit-runner"));
+        let runner_sha256 = file_sha256(runner)?;
+        let orchestrator = Arc::new(
+            ProviderSubmitOrchestrator::new(
+                PostgresProviderTaskStore::new(database.pool.clone()),
+                GatedCliSubmitDriver::new(codec.clone(), runner, &runner_sha256)
+                    .map_err(debug_error)?,
+                60_000,
+                &journal_root,
+            )
+            .map_err(debug_error)?,
+        );
+
+        let mut tasks = Vec::new();
+        for _ in 0..32 {
+            let orchestrator = Arc::clone(&orchestrator);
+            let work = gated_orchestrator_work(&lease)?;
+            tasks.push(tokio::spawn(async move { orchestrator.submit(work).await }));
+        }
+        let mut attached = 0;
+        for task in tasks {
+            if matches!(
+                task.await.map_err(debug_error)?.map_err(debug_error)?,
+                ProviderSubmitOutcome::Attached(_)
+            ) {
+                attached += 1;
+            }
+        }
+        require(
+            attached >= 1,
+            "concurrent gated submit did not attach a provider task",
+        )?;
+        let restarted = ProviderSubmitOrchestrator::new(
+            PostgresProviderTaskStore::new(database.pool.clone()),
+            GatedCliSubmitDriver::new(codec, runner, &runner_sha256).map_err(debug_error)?,
+            60_000,
+            &journal_root,
+        )
+        .map_err(debug_error)?;
+        let replay = restarted
+            .submit(gated_orchestrator_work(&lease)?)
+            .await
+            .map_err(debug_error)?;
+        require(
+            matches!(replay, ProviderSubmitOutcome::Attached(ref task)
+                if task.remote_operation_id == "gated-operation-1")
+                && fs::read(&side_effect).map_err(debug_error)? == b"invoked",
+            format!("gated submit relaunched or failed to replay: {replay:?}"),
+        )
+    }
+    .await;
+    database.cleanup().await?;
+    result
+}
+
+#[tokio::test]
+async fn recovery_releases_the_same_ready_process_after_journal_release() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let lease =
+            seed_running_submission(&database.pool, "gated-release-recovery-worker").await?;
+        let store = PostgresProviderTaskStore::new(database.pool.clone());
+        let command = orchestrator_command(&lease);
+        let reservation = RemoteTaskSubmitReservation::new(
+            &lease,
+            format!("provider-submit-{}", lease.submission_id.simple()),
+            command.output(),
+            command.identity(),
+            60_000,
+        );
+        let acquired = store
+            .acquire_submit(&reservation)
+            .await
+            .map_err(debug_error)?;
+        let ProviderSubmitAcquire::Dispatch(authority) = acquired else {
+            return Err(format!(
+                "initial gated acquire did not dispatch: {acquired:?}"
+            ));
+        };
+        let journal = tempfile::tempdir().map_err(debug_error)?;
+        let journal_root = journal.path().join("remote-submit");
+        let side_effect = journal.path().join("provider-invoked");
+        let codec =
+            FakeGatedSubmitCodec::new(journal.path(), &side_effect, "recovered-gated-operation")?;
+        let launch_nonce = seed_remote_submit_launch_prefix(
+            &journal_root,
+            authority.intent(),
+            authority.context(),
+            &command,
+        )?;
+        let binding = GatedCliBinding::new(
+            authority.context().execution_binding_sha256(),
+            launch_nonce,
+            u64::try_from(authority.context().provider_deadline_at_ms()).map_err(debug_error)?,
+        )
+        .map_err(debug_error)?;
+        let submission =
+            GatedCliSubmission::new(&journal_root, lease.submission_id).map_err(debug_error)?;
+        let process_command = codec.gated_command().map_err(debug_error)?;
+        submission
+            .prepare(&binding, &process_command)
+            .map_err(debug_error)?;
+        let runner_path = Path::new(env!("CARGO_BIN_EXE_remote-submit-runner"));
+        let mut runner_command = tokio::process::Command::new(runner_path);
+        runner_command
+            .arg(&journal_root)
+            .arg(lease.submission_id.to_string())
+            .env_clear()
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        let mut runner = runner_command.spawn().map_err(debug_error)?;
+        let _ready = wait_gated_ready(&submission, &binding).await?;
+        require(
+            !side_effect.exists(),
+            "ready gated process invoked provider before process release",
+        )?;
+        seed_remote_submit_dispatch_release(
+            &journal_root,
+            lease.submission_id,
+            authority.context().execution_binding_sha256(),
+            launch_nonce,
+        )?;
+        drop(authority);
+
+        let recovered = ProviderSubmitOrchestrator::new(
+            store,
+            GatedCliSubmitDriver::new(codec, runner_path, file_sha256(runner_path)?)
+                .map_err(debug_error)?,
+            60_000,
+            &journal_root,
+        )
+        .map_err(debug_error)?
+        .submit(
+            ProviderSubmitWork::<GatedCliSubmitDriver<FakeGatedSubmitCodec>>::new(&lease, command)
+                .map_err(debug_error)?,
+        )
+        .await
+        .map_err(debug_error)?;
+        let runner_status = runner.wait().await.map_err(debug_error)?;
+        require(
+            runner_status.success()
+                && matches!(recovered, ProviderSubmitOutcome::Attached(ref task)
+                    if task.remote_operation_id == "recovered-gated-operation")
+                && fs::read(&side_effect).map_err(debug_error)? == b"invoked",
+            format!("released gated process was not recovered exactly once: {recovered:?}"),
+        )
+    }
+    .await;
+    database.cleanup().await?;
+    result
+}
+
+#[tokio::test]
+async fn replays_process_receipt_after_database_transaction_failure() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let lease =
+            seed_running_submission(&database.pool, "gated-receipt-recovery-worker").await?;
+        let journal = tempfile::tempdir().map_err(debug_error)?;
+        let journal_root = journal.path().join("remote-submit");
+        let side_effect = journal.path().join("provider-invoked");
+        let codec =
+            FakeGatedSubmitCodec::new(journal.path(), &side_effect, "gated-durable-operation")?;
+        let runner = Path::new(env!("CARGO_BIN_EXE_remote-submit-runner"));
+        let runner_sha256 = file_sha256(runner)?;
+        sqlx::query(
+            r#"
+            CREATE FUNCTION reject_gated_provider_submit_receipt()
+            RETURNS trigger LANGUAGE plpgsql AS $$
+            BEGIN
+              IF NEW.state = 'operation_known' THEN
+                RAISE EXCEPTION 'injected gated receipt transaction failure';
+              END IF;
+              RETURN NEW;
+            END
+            $$
+            "#,
+        )
+        .execute(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        sqlx::query(
+            r#"
+            CREATE TRIGGER reject_gated_provider_submit_receipt
+            BEFORE UPDATE ON provider_remote_submit_intents
+            FOR EACH ROW EXECUTE FUNCTION reject_gated_provider_submit_receipt()
+            "#,
+        )
+        .execute(&database.pool)
+        .await
+        .map_err(debug_error)?;
+
+        let first = ProviderSubmitOrchestrator::new(
+            PostgresProviderTaskStore::new(database.pool.clone()),
+            GatedCliSubmitDriver::new(codec.clone(), runner, &runner_sha256)
+                .map_err(debug_error)?,
+            60_000,
+            &journal_root,
+        )
+        .map_err(debug_error)?
+        .submit(gated_orchestrator_work(&lease)?)
+        .await;
+        require(
+            matches!(first, Err(ProviderSubmitOrchestratorError::Store(_)))
+                && fs::read(&side_effect).map_err(debug_error)? == b"invoked",
+            format!("gated receipt fault was not injected after one CLI call: {first:?}"),
+        )?;
+        let state_after_failure: String = sqlx::query_scalar(
+            "SELECT state FROM provider_remote_submit_intents WHERE submission_id = $1",
+        )
+        .bind(lease.submission_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(
+            state_after_failure == "sending",
+            format!("failed gated receipt transaction partially committed: {state_after_failure}"),
+        )?;
+
+        sqlx::query(
+            "DROP TRIGGER reject_gated_provider_submit_receipt ON provider_remote_submit_intents",
+        )
+        .execute(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        sqlx::query("DROP FUNCTION reject_gated_provider_submit_receipt()")
+            .execute(&database.pool)
+            .await
+            .map_err(debug_error)?;
+        let recovered = ProviderSubmitOrchestrator::new(
+            PostgresProviderTaskStore::new(database.pool.clone()),
+            GatedCliSubmitDriver::new(codec, runner, &runner_sha256).map_err(debug_error)?,
+            60_000,
+            &journal_root,
+        )
+        .map_err(debug_error)?
+        .submit(gated_orchestrator_work(&lease)?)
+        .await
+        .map_err(debug_error)?;
+        require(
+            matches!(recovered, ProviderSubmitOutcome::Attached(ref task)
+                if task.remote_operation_id == "gated-durable-operation")
+                && fs::read(&side_effect).map_err(debug_error)? == b"invoked",
+            format!("durable gated receipt was not replayed without a second CLI: {recovered:?}"),
+        )
+    }
+    .await;
+    database.cleanup().await?;
+    result
+}
+
+#[tokio::test]
+async fn expired_pre_release_budget_never_invokes_the_cli() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let lease = seed_running_submission(&database.pool, "gated-expired-budget-worker").await?;
+        let journal = tempfile::tempdir().map_err(debug_error)?;
+        let journal_root = journal.path().join("remote-submit");
+        let side_effect = journal.path().join("provider-invoked");
+        let projection_delay = Duration::from_millis(750);
+        let codec =
+            FakeGatedSubmitCodec::new(journal.path(), &side_effect, "expired-budget-operation")?
+                .with_projection_delay(projection_delay);
+        let runner = Path::new(env!("CARGO_BIN_EXE_remote-submit-runner"));
+        let started = Instant::now();
+        let outcome = ProviderSubmitOrchestrator::new(
+            PostgresProviderTaskStore::new(database.pool.clone()),
+            GatedCliSubmitDriver::new(codec, runner, file_sha256(runner)?).map_err(debug_error)?,
+            500,
+            &journal_root,
+        )
+        .map_err(debug_error)?
+        .submit(gated_orchestrator_work(&lease)?)
+        .await
+        .map_err(debug_error)?;
+        require(
+            started.elapsed() >= projection_delay
+                && matches!(outcome, ProviderSubmitOutcome::Terminal(_))
+                && !side_effect.exists(),
+            format!(
+                "expired pre-release budget invoked the CLI or skipped projection: {outcome:?}"
+            ),
+        )
+    }
+    .await;
+    database.cleanup().await?;
+    result
+}
+
+#[derive(Clone)]
+struct FakeGatedSubmitCodec {
+    working_directory: PathBuf,
+    side_effect: PathBuf,
+    shell_sha256: String,
+    operation_id: String,
+    projection_delay: Duration,
+}
+
+impl FakeGatedSubmitCodec {
+    fn new(
+        working_directory: impl AsRef<Path>,
+        side_effect: impl AsRef<Path>,
+        operation_id: impl Into<String>,
+    ) -> TestResult<Self> {
+        Ok(Self {
+            working_directory: working_directory.as_ref().to_owned(),
+            side_effect: side_effect.as_ref().to_owned(),
+            shell_sha256: file_sha256(Path::new("/bin/sh"))?,
+            operation_id: operation_id.into(),
+            projection_delay: Duration::ZERO,
+        })
+    }
+
+    fn with_projection_delay(mut self, projection_delay: Duration) -> Self {
+        self.projection_delay = projection_delay;
+        self
+    }
+
+    fn gated_command(&self) -> Result<GatedCliCommand, ProviderFailure> {
+        GatedCliCommand::new(
+            "/bin/sh",
+            &self.shell_sha256,
+            &self.working_directory,
+            vec![
+                "-c".to_owned(),
+                "printf invoked >> \"$1\"; printf gated-receipt".to_owned(),
+                "gated-provider-test".to_owned(),
+                self.side_effect.to_string_lossy().into_owned(),
+            ],
+            BTreeMap::new(),
+            Vec::new(),
+            Duration::from_secs(30),
+            Duration::from_millis(100),
+        )
+        .map_err(|_| {
+            fake_provider_failure("gated_command_invalid", EffectCertainty::NoRemoteEffect)
+        })
+    }
+}
+
+impl GatedCliSubmitCodec for FakeGatedSubmitCodec {
+    type Payload = TestPayload;
+
+    fn provider_id(&self) -> &'static str {
+        "provider-test"
+    }
+
+    fn command(
+        &self,
+        _intent: &ProviderSubmitIntent,
+        _context: &ProviderExecutionContext,
+        _command: &SingleOutputCommand<Self::Payload>,
+    ) -> Result<GatedCliCommand, ProviderFailure> {
+        std::thread::sleep(self.projection_delay);
+        self.gated_command()
+    }
+
+    fn decode_receipt(
+        &self,
+        intent: &ProviderSubmitIntent,
+        _command: &SingleOutputCommand<Self::Payload>,
+        stdout: &[u8],
+    ) -> Result<PendingOperation, ProviderFailure> {
+        if stdout != b"gated-receipt" {
+            return Err(fake_provider_failure(
+                "gated_receipt_invalid",
+                EffectCertainty::UnknownRemoteEffect,
+            ));
+        }
+        Ok(PendingOperation::new(
+            RemoteOperationRef::new(
+                self.provider_id(),
+                intent.submission_id.to_string(),
+                self.operation_id.clone(),
+            )
+            .map_err(|_| {
+                fake_provider_failure(
+                    "gated_receipt_identity_invalid",
+                    EffectCertainty::UnknownRemoteEffect,
+                )
+            })?,
+            None,
+            Some(25),
+        ))
+    }
+}
+
+fn gated_orchestrator_work(
+    lease: &ExecutorSubmissionLease,
+) -> TestResult<ProviderSubmitWork<GatedCliSubmitDriver<FakeGatedSubmitCodec>>> {
+    ProviderSubmitWork::new(lease, orchestrator_command(lease)).map_err(debug_error)
+}
+
+fn file_sha256(path: &Path) -> TestResult<String> {
+    fs::read(path)
+        .map(|bytes| hex::encode(Sha256::digest(bytes)))
+        .map_err(debug_error)
+}
+
+fn fake_provider_failure(code: &str, effect: EffectCertainty) -> ProviderFailure {
+    ProviderFailure::new(
+        if effect == EffectCertainty::NoRemoteEffect {
+            ProviderFailureClass::Permanent
+        } else {
+            ProviderFailureClass::Ambiguous
+        },
+        code,
+        effect,
+        RetryDirective::Never,
+    )
+    .expect("fake provider failure must be valid")
+}
+
+async fn wait_gated_ready(
+    submission: &GatedCliSubmission,
+    binding: &GatedCliBinding,
+) -> TestResult<gpt_image_2_gateway::GatedCliReady> {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match submission.observe(binding).map_err(debug_error)? {
+                GatedCliObservation::Ready(ready) => return Ok(ready),
+                GatedCliObservation::AwaitingHelper | GatedCliObservation::Starting => {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                observation => {
+                    return Err(format!(
+                        "unexpected gated recovery observation before ready: {observation:?}"
+                    ));
+                }
+            }
+        }
+    })
+    .await
+    .map_err(|_| "gated runner did not become ready".to_owned())?
+}
+
+fn seed_remote_submit_dispatch_release(
+    root: &Path,
+    submission_id: Uuid,
+    execution_binding_sha256: &str,
+    launch_nonce: Uuid,
+) -> TestResult {
+    use std::{
+        fs::{File, OpenOptions},
+        io::Write,
+        os::unix::fs::OpenOptionsExt,
+    };
+
+    let entry = root.join(submission_id.simple().to_string());
+    let release = serde_json::to_vec(&json!({
+        "execution_binding_sha256": execution_binding_sha256,
+        "launch_nonce": launch_nonce,
+    }))
+    .map_err(debug_error)?;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(entry.join("dispatch-released.json"))
+        .map_err(debug_error)?;
+    file.write_all(&release).map_err(debug_error)?;
+    file.sync_all().map_err(debug_error)?;
+    File::open(&entry)
+        .and_then(|directory| directory.sync_all())
+        .map_err(debug_error)
+}

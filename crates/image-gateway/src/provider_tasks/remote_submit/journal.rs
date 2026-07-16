@@ -33,6 +33,7 @@ const MAX_TEXT_BYTES: usize = 255;
 const MAX_ERROR_CODE_BYTES: usize = 128;
 
 pub(crate) struct RemoteSubmitJournal {
+    root_path: PathBuf,
     root: OwnedFd,
 }
 
@@ -257,7 +258,17 @@ impl RemoteSubmitJournal {
         )
         .map_err(|_| RemoteSubmitJournalError::InvalidInput)?;
         validate_directory(&root, RemoteSubmitJournalError::InvalidInput)?;
-        Ok(Self { root })
+        validate_bound_root(&root_path, &root, RemoteSubmitJournalError::InvalidInput)?;
+        Ok(Self { root_path, root })
+    }
+
+    pub(crate) fn root_path(&self) -> Result<PathBuf, RemoteSubmitJournalError> {
+        validate_bound_root(
+            &self.root_path,
+            &self.root,
+            RemoteSubmitJournalError::Integrity,
+        )?;
+        Ok(self.root_path.clone())
     }
 
     pub(crate) fn prepare(
@@ -417,6 +428,22 @@ impl RemoteSubmitJournal {
         self.observe_entry(&entry, spec)
     }
 
+    pub(crate) fn released_authority(
+        &self,
+        spec: &RemoteSubmitJournalSpec,
+    ) -> Result<RemoteSubmitReleasedAuthority, RemoteSubmitJournalError> {
+        let entry = self.open_prepared(spec)?;
+        let launch =
+            read_required_json::<DiskLaunch>(&entry.directory, LAUNCH_FILE, MAX_MARKER_BYTES)?;
+        validate_launch(&launch, spec)?;
+        let release =
+            read_required_json::<DiskRelease>(&entry.directory, RELEASE_FILE, MAX_MARKER_BYTES)?;
+        validate_release(&release, spec, launch.launch_nonce)?;
+        Ok(RemoteSubmitReleasedAuthority {
+            launch_nonce: launch.launch_nonce,
+        })
+    }
+
     fn observe_entry(
         &self,
         entry: &Entry,
@@ -526,6 +553,18 @@ impl RemoteSubmitJournal {
             read_required_json::<DiskRelease>(&entry.directory, RELEASE_FILE, MAX_MARKER_BYTES)?;
         validate_release(&release, spec, authority.launch_nonce)?;
         Ok(entry)
+    }
+}
+
+impl RemoteSubmitLaunchAuthority {
+    pub(crate) fn launch_nonce(&self) -> Uuid {
+        self.launch_nonce
+    }
+}
+
+impl RemoteSubmitReleasedAuthority {
+    pub(crate) fn launch_nonce(&self) -> Uuid {
+        self.launch_nonce
     }
 }
 
@@ -810,6 +849,25 @@ fn validate_private_directory_path(
         if metadata.uid() != unsafe { libc::geteuid() }
             || metadata.permissions().mode() & 0o777 != 0o700
         {
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+fn validate_bound_root(
+    path: &Path,
+    directory: &OwnedFd,
+    error: RemoteSubmitJournalError,
+) -> Result<(), RemoteSubmitJournalError> {
+    validate_private_directory_path(path, error)?;
+    let metadata = fs::metadata(path).map_err(|_| RemoteSubmitJournalError::Unavailable)?;
+    let stat = rfs::fstat(directory).map_err(|_| RemoteSubmitJournalError::Unavailable)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        if metadata.dev() != stat.st_dev as u64 || metadata.ino() != stat.st_ino {
             return Err(error);
         }
     }
@@ -1316,6 +1374,25 @@ mod tests {
             RemoteSubmitJournal::new(&public),
             Err(RemoteSubmitJournalError::InvalidInput)
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn root_path_replacement_cannot_redirect_process_evidence() {
+        use std::os::unix::fs::DirBuilderExt;
+
+        let fixture = Fixture::new();
+        let moved = fixture.temp.path().join("moved-journal");
+        fs::rename(&fixture.root, &moved).unwrap();
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&fixture.root)
+            .unwrap();
+
+        assert_eq!(
+            fixture.journal.root_path(),
+            Err(RemoteSubmitJournalError::Integrity)
+        );
     }
 
     struct Fixture {

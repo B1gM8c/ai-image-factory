@@ -56,6 +56,10 @@ macro_rules! attach_request {
     };
 }
 
+#[cfg(unix)]
+#[path = "postgres_provider_tasks/gated_submit.rs"]
+mod gated_submit;
+
 #[tokio::test]
 async fn atomic_submit_acquire_elects_one_dispatch_without_reserved_gap() -> TestResult {
     let Some(database) = TestDatabase::new().await? else {
@@ -6761,7 +6765,7 @@ fn seed_remote_submit_launch_prefix(
     intent: &ProviderSubmitIntent,
     context: &ProviderExecutionContext,
     command: &SingleOutputCommand<TestPayload>,
-) -> TestResult {
+) -> TestResult<Uuid> {
     use std::{
         fs::{self, File, OpenOptions},
         io::Write,
@@ -6802,9 +6806,10 @@ fn seed_remote_submit_launch_prefix(
         "command_bytes_sha256": hex::encode(Sha256::digest(command_bytes)),
         "command_byte_size": command_bytes.len(),
     });
+    let launch_nonce = Uuid::new_v4();
     let launch = json!({
         "execution_binding_sha256": context.execution_binding_sha256(),
-        "launch_nonce": Uuid::new_v4(),
+        "launch_nonce": launch_nonce,
     });
     for (name, bytes) in [
         ("command.bin", command_bytes.to_vec()),
@@ -6828,7 +6833,8 @@ fn seed_remote_submit_launch_prefix(
         .map_err(debug_error)?;
     File::open(root)
         .and_then(|directory| directory.sync_all())
-        .map_err(debug_error)
+        .map_err(debug_error)?;
+    Ok(launch_nonce)
 }
 
 fn orchestrator_work(

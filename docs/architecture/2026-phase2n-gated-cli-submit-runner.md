@@ -3,9 +3,9 @@
 Date: 2026-07-16
 
 Status: implemented and workspace-verified as inactive infrastructure.
-Dreamina, Grok, and other remote CLI providers remain disabled. The unique
-PostgreSQL provider-submit orchestrator is not yet wired to this runner, so this
-phase does not claim production activation readiness.
+Dreamina, Grok, and other remote CLI providers remain disabled. Phase 2O now
+composes the unique PostgreSQL provider-submit orchestrator with this runner,
+but no provider-specific production adapter is activated.
 
 ## Decision
 
@@ -222,17 +222,13 @@ useful for leader observation but not complete descendant containment:
 
 ## Remaining Activation Gates
 
-1. Compose the Phase 2M provider journal release with
-   `GatedCliSubmission::release`, preserving one PostgreSQL-elected submit
-   authority and recovery of the safe pre-release prefix.
-2. Add a narrow adapter-owned decoder that converts bounded raw terminal output
-   into canonical `PendingOperation` or a no-effect failure, then imports it
-   through the existing PostgreSQL receipt/quarantine paths.
-3. Add Linux cgroup v2 containment and zero-populated verification; define the
+1. Add one provider-specific Phase 2O codec without activating external
+   credentials or provider calls.
+2. Add Linux cgroup v2 containment and zero-populated verification; define the
    macOS production supervisor contract.
-4. Freeze and authenticate the helper executable/deployment identity and
+3. Freeze and authenticate the helper executable/deployment identity and
    benchmark executable/working-directory replacement defenses.
-5. Add retention only after PostgreSQL terminal convergence and an audited
+4. Add retention only after PostgreSQL terminal convergence and an audited
    safety interval.
-6. Run production-equivalent filesystem/process/concurrency benchmarks before
+5. Run production-equivalent filesystem/process/concurrency benchmarks before
    making any SOTA or activation claim.

@@ -4,37 +4,35 @@ use std::{
     time::{Duration, Instant},
 };
 
-use image_provider_sdk::{
-    EffectCertainty, InvocationContext, InvocationDeadline, PendingOperation, ProviderFailure,
-    RemoteTaskProvider, SingleOutputCommand, SubmitCall, SubmitIdempotency,
-};
+use image_provider_sdk::{EffectCertainty, PendingOperation, ProviderFailure, SingleOutputCommand};
 use sha2::{Digest, Sha256};
 
 use crate::executor::ExecutorSubmissionLease;
 
 use super::{
     PostgresProviderTaskStore, ProviderExecutionContext, ProviderRemoteTask, ProviderSubmitAcquire,
+    ProviderSubmitDriver, ProviderSubmitDriverCall, ProviderSubmitDriverRecovery,
     ProviderSubmitFailureKind, ProviderSubmitIntent, ProviderSubmitIntentState, ProviderTaskStore,
     ProviderTaskStoreError, RemoteTaskAttach, RemoteTaskQuarantinedReceipt,
     RemoteTaskSubmitFailure, RemoteTaskSubmitReceipt, RemoteTaskSubmitReservation,
     remote_submit::{
         RemoteSubmitJournal, RemoteSubmitJournalError, RemoteSubmitJournalObservation,
         RemoteSubmitJournalSpec, RemoteSubmitJournalTerminal, RemoteSubmitLaunch,
-        RemoteSubmitRelease, RemoteSubmitReleasedAuthority,
+        RemoteSubmitLaunchAuthority, RemoteSubmitRelease, RemoteSubmitReleasedAuthority,
     },
 };
 
 const MAX_POLL_AFTER_MS: u64 = 24 * 60 * 60 * 1_000;
 
-pub struct ProviderSubmitWork<P: RemoteTaskProvider> {
+pub struct ProviderSubmitWork<D: ProviderSubmitDriver> {
     executor: ExecutorSubmissionLease,
-    command: SingleOutputCommand<P::Payload>,
+    command: Arc<SingleOutputCommand<D::Payload>>,
 }
 
-impl<P: RemoteTaskProvider> ProviderSubmitWork<P> {
+impl<D: ProviderSubmitDriver> ProviderSubmitWork<D> {
     pub fn new(
         executor: &ExecutorSubmissionLease,
-        command: SingleOutputCommand<P::Payload>,
+        command: SingleOutputCommand<D::Payload>,
     ) -> Result<Self, ProviderSubmitOrchestratorError> {
         RemoteSubmitJournal::validate_canonical_command(command.canonical_payload())
             .map_err(|_| ProviderSubmitOrchestratorError::InvalidWork)?;
@@ -49,7 +47,7 @@ impl<P: RemoteTaskProvider> ProviderSubmitWork<P> {
         }
         Ok(Self {
             executor: executor.clone(),
-            command,
+            command: Arc::new(command),
         })
     }
 
@@ -64,17 +62,17 @@ impl<P: RemoteTaskProvider> ProviderSubmitWork<P> {
     }
 }
 
-pub struct ProviderSubmitOrchestrator<P: RemoteTaskProvider> {
+pub struct ProviderSubmitOrchestrator<D: ProviderSubmitDriver> {
     store: PostgresProviderTaskStore,
-    provider: P,
+    driver: D,
     provider_timeout_ms: i64,
     journal: Arc<RemoteSubmitJournal>,
 }
 
-impl<P: RemoteTaskProvider> ProviderSubmitOrchestrator<P> {
+impl<D: ProviderSubmitDriver> ProviderSubmitOrchestrator<D> {
     pub fn new(
         store: PostgresProviderTaskStore,
-        provider: P,
+        driver: D,
         provider_timeout_ms: i64,
         journal_root: impl AsRef<Path>,
     ) -> Result<Self, ProviderSubmitOrchestratorError> {
@@ -83,7 +81,7 @@ impl<P: RemoteTaskProvider> ProviderSubmitOrchestrator<P> {
         }
         Ok(Self {
             store,
-            provider,
+            driver,
             provider_timeout_ms,
             journal: Arc::new(RemoteSubmitJournal::new(journal_root)?),
         })
@@ -91,14 +89,14 @@ impl<P: RemoteTaskProvider> ProviderSubmitOrchestrator<P> {
 
     pub async fn submit(
         &self,
-        work: ProviderSubmitWork<P>,
+        work: ProviderSubmitWork<D>,
     ) -> Result<ProviderSubmitOutcome, ProviderSubmitOrchestratorError> {
         let reservation = work.reservation(self.provider_timeout_ms);
         match self.store.acquire_submit(&reservation).await? {
             ProviderSubmitAcquire::Dispatch(authority) => {
                 let intent = authority.intent();
                 let context = authority.context();
-                if intent.provider_id != self.provider.provider_id()
+                if intent.provider_id != self.driver.provider_id()
                     || !context_matches_command(context, &work.command)
                 {
                     return self
@@ -118,7 +116,7 @@ impl<P: RemoteTaskProvider> ProviderSubmitOrchestrator<P> {
                     .await
             }
             ProviderSubmitAcquire::Busy(authority) => {
-                if authority.intent().provider_id != self.provider.provider_id()
+                if authority.intent().provider_id != self.driver.provider_id()
                     || !context_matches_command(authority.context(), &work.command)
                 {
                     return Ok(ProviderSubmitOutcome::AwaitingEvidence(
@@ -140,15 +138,19 @@ impl<P: RemoteTaskProvider> ProviderSubmitOrchestrator<P> {
                     work.command.canonical_payload(),
                 )?;
                 let journal = Arc::clone(&self.journal);
+                let observation_spec = spec.clone();
+                let observation_command = Arc::clone(&work.command);
                 let observation = tokio::task::spawn_blocking(move || {
-                    journal.prepare(&spec, work.command.canonical_payload())?;
-                    journal.observe(&spec)
+                    journal.prepare(&observation_spec, observation_command.canonical_payload())?;
+                    journal.observe(&observation_spec)
                 })
                 .await
                 .map_err(|_| ProviderSubmitOrchestratorError::JournalWorkerStopped)??;
                 self.replay_journal_observation(
                     &invocation.intent,
                     invocation.context(),
+                    spec,
+                    work.command,
                     observation,
                 )
                 .await
@@ -169,7 +171,7 @@ impl<P: RemoteTaskProvider> ProviderSubmitOrchestrator<P> {
         intent: &ProviderSubmitIntent,
         context: &ProviderExecutionContext,
         database_budget_ms: u64,
-        work: ProviderSubmitWork<P>,
+        work: ProviderSubmitWork<D>,
     ) -> Result<ProviderSubmitOutcome, ProviderSubmitOrchestratorError> {
         if database_budget_ms == 0 {
             return self
@@ -181,111 +183,118 @@ impl<P: RemoteTaskProvider> ProviderSubmitOrchestrator<P> {
                 )
                 .await;
         }
-        let submission_id = intent.submission_id.to_string();
-        let attempt = u32::try_from(context.invocation_attempt())
-            .map_err(|_| ProviderSubmitOrchestratorError::InvalidFrozenContext)?;
-        let provider_timeout_ms = u64::try_from(context.provider_timeout_ms())
-            .map_err(|_| ProviderSubmitOrchestratorError::InvalidFrozenContext)?;
-        let provider_deadline_unix_ms = u64::try_from(context.provider_deadline_at_ms())
-            .map_err(|_| ProviderSubmitOrchestratorError::InvalidFrozenContext)?;
-        let invocation = InvocationContext::new(
-            &submission_id,
-            &intent.provider_id,
-            context.operation_id(),
-            context.operation_descriptor_revision(),
-            context.model(),
-            attempt,
-            InvocationDeadline::new(provider_timeout_ms, provider_deadline_unix_ms)
-                .map_err(|_| ProviderSubmitOrchestratorError::InvalidFrozenContext)?,
-        )
-        .map_err(|_| ProviderSubmitOrchestratorError::InvalidFrozenContext)?;
         let journal_spec =
             RemoteSubmitJournalSpec::new(intent, context, work.command.canonical_payload())?;
         let journal = Arc::clone(&self.journal);
         let journal_started = Instant::now();
-        let (command, journal_spec, dispatch) = tokio::task::spawn_blocking(move || {
-            let command = work.command;
-            journal.prepare(&journal_spec, command.canonical_payload())?;
-            let dispatch = match journal.commit_launch(&journal_spec)? {
-                RemoteSubmitLaunch::Launch(launch) => {
-                    match journal.release_dispatch(&journal_spec, launch)? {
-                        RemoteSubmitRelease::Dispatch(released) => {
-                            RemoteSubmitDispatch::Released(released)
-                        }
-                        RemoteSubmitRelease::Attach(observation) => {
-                            RemoteSubmitDispatch::Attach(observation)
-                        }
+        let (command, journal_spec, journal_root, launch) =
+            tokio::task::spawn_blocking(move || {
+                let command = work.command;
+                journal.prepare(&journal_spec, command.canonical_payload())?;
+                let launch = match journal.commit_launch(&journal_spec)? {
+                    RemoteSubmitLaunch::Launch(launch) => RemoteSubmitDispatch::Launch(launch),
+                    RemoteSubmitLaunch::Attach(observation) => {
+                        RemoteSubmitDispatch::Attach(observation)
                     }
-                }
-                RemoteSubmitLaunch::Attach(observation) => {
-                    RemoteSubmitDispatch::Attach(observation)
-                }
-            };
-            Ok::<_, RemoteSubmitJournalError>((command, journal_spec, dispatch))
-        })
-        .await
-        .map_err(|_| ProviderSubmitOrchestratorError::JournalWorkerStopped)??;
-        let released = match dispatch {
-            RemoteSubmitDispatch::Released(released) => released,
+                };
+                Ok::<_, RemoteSubmitJournalError>((
+                    command,
+                    journal_spec,
+                    journal.root_path()?,
+                    launch,
+                ))
+            })
+            .await
+            .map_err(|_| ProviderSubmitOrchestratorError::JournalWorkerStopped)??;
+        let launch = match launch {
+            RemoteSubmitDispatch::Launch(launch) => launch,
             RemoteSubmitDispatch::Attach(observation) => {
                 return self
-                    .replay_journal_observation(intent, context, observation)
+                    .replay_journal_observation(intent, context, journal_spec, command, observation)
                     .await;
             }
         };
-        let remaining_budget_ms =
+        let prepare_budget_ms =
             remaining_budget_after(database_budget_ms, journal_started.elapsed());
-        if remaining_budget_ms == 0 {
-            let terminal = RemoteSubmitJournalTerminal::Rejected {
-                error_code: "provider_submit_deadline_elapsed".to_owned(),
-            };
-            self.publish_journal_failure(journal_spec, released, terminal)
-                .await?;
+        if prepare_budget_ms == 0 {
             return self
-                .record_failure(
+                .record_pre_release_failure_or_replay(
                     intent,
                     context,
+                    journal_spec,
+                    command,
                     ProviderSubmitFailureKind::Rejected,
                     "provider_submit_deadline_elapsed",
                 )
                 .await;
         }
-
-        let submit = self.provider.submit(SubmitCall::new(
-            invocation,
-            &command,
-            SubmitIdempotency::submission_bound(),
-        ));
-        match tokio::time::timeout(Duration::from_millis(remaining_budget_ms), submit).await {
-            Ok(Ok(pending)) => {
+        let journal_root: Arc<Path> = Arc::from(journal_root.into_boxed_path());
+        let call = ProviderSubmitDriverCall::new(
+            intent,
+            context,
+            Arc::clone(&command),
+            Arc::clone(&journal_root),
+            launch.launch_nonce(),
+            prepare_budget_ms,
+        );
+        let prepared = match self.driver.prepare(&call).await {
+            Ok(prepared) => prepared,
+            Err(failure) => {
+                let (kind, _) = journal_failure(&failure);
+                return self
+                    .record_pre_release_failure_or_replay(
+                        intent,
+                        context,
+                        journal_spec,
+                        command,
+                        kind,
+                        failure.code(),
+                    )
+                    .await;
+            }
+        };
+        let dispatch_budget_ms =
+            remaining_budget_after(database_budget_ms, journal_started.elapsed());
+        if dispatch_budget_ms == 0 {
+            return self
+                .record_pre_release_failure_or_replay(
+                    intent,
+                    context,
+                    journal_spec,
+                    command,
+                    ProviderSubmitFailureKind::Rejected,
+                    "provider_submit_deadline_elapsed",
+                )
+                .await;
+        }
+        let journal = Arc::clone(&self.journal);
+        let release_spec = journal_spec.clone();
+        let release =
+            tokio::task::spawn_blocking(move || journal.release_dispatch(&release_spec, launch))
+                .await
+                .map_err(|_| ProviderSubmitOrchestratorError::JournalWorkerStopped)??;
+        let released = match release {
+            RemoteSubmitRelease::Dispatch(released) => released,
+            RemoteSubmitRelease::Attach(observation) => {
+                return self
+                    .replay_journal_observation(intent, context, journal_spec, command, observation)
+                    .await;
+            }
+        };
+        let dispatch_call = call.with_remaining_budget_ms(dispatch_budget_ms);
+        match self.driver.dispatch(prepared, &dispatch_call).await {
+            Ok(pending) => {
                 let pending = self
                     .publish_journal_accepted(journal_spec, released, pending)
                     .await?;
                 self.record_pending(intent, context, pending).await
             }
-            Ok(Err(failure)) => {
+            Err(failure) => {
                 let (kind, terminal) = journal_failure(&failure);
                 self.publish_journal_failure(journal_spec, released, terminal)
                     .await?;
                 self.record_failure(intent, context, kind, failure.code())
                     .await
-            }
-            Err(_) => {
-                self.publish_journal_failure(
-                    journal_spec,
-                    released,
-                    RemoteSubmitJournalTerminal::Unknown {
-                        error_code: "provider_submit_timeout".to_owned(),
-                    },
-                )
-                .await?;
-                self.record_failure(
-                    intent,
-                    context,
-                    ProviderSubmitFailureKind::OutcomeUnknown,
-                    "provider_submit_timeout",
-                )
-                .await
             }
         }
     }
@@ -328,6 +337,8 @@ impl<P: RemoteTaskProvider> ProviderSubmitOrchestrator<P> {
         &self,
         intent: &ProviderSubmitIntent,
         context: &ProviderExecutionContext,
+        spec: RemoteSubmitJournalSpec,
+        command: Arc<SingleOutputCommand<D::Payload>>,
         observation: RemoteSubmitJournalObservation,
     ) -> Result<ProviderSubmitOutcome, ProviderSubmitOrchestratorError> {
         match observation {
@@ -357,9 +368,73 @@ impl<P: RemoteTaskProvider> ProviderSubmitOrchestrator<P> {
                 .await
             }
             RemoteSubmitJournalObservation::Prepared
-            | RemoteSubmitJournalObservation::LaunchCommitted
-            | RemoteSubmitJournalObservation::DispatchReleased => {
+            | RemoteSubmitJournalObservation::LaunchCommitted => {
                 Ok(ProviderSubmitOutcome::AwaitingEvidence(intent.clone()))
+            }
+            RemoteSubmitJournalObservation::DispatchReleased => {
+                let journal = Arc::clone(&self.journal);
+                let authority_spec = spec.clone();
+                let (journal_root, released) = tokio::task::spawn_blocking(move || {
+                    Ok::<_, RemoteSubmitJournalError>((
+                        journal.root_path()?,
+                        journal.released_authority(&authority_spec)?,
+                    ))
+                })
+                .await
+                .map_err(|_| ProviderSubmitOrchestratorError::JournalWorkerStopped)??;
+                let call = ProviderSubmitDriverCall::new(
+                    intent,
+                    context,
+                    command,
+                    Arc::from(journal_root.into_boxed_path()),
+                    released.launch_nonce(),
+                    0,
+                );
+                match self.driver.recover_released(&call).await {
+                    ProviderSubmitDriverRecovery::AwaitingEvidence => {
+                        Ok(ProviderSubmitOutcome::AwaitingEvidence(intent.clone()))
+                    }
+                    ProviderSubmitDriverRecovery::Accepted(pending) => {
+                        let pending = self
+                            .publish_journal_accepted(spec, released, pending)
+                            .await?;
+                        self.record_pending(intent, context, pending).await
+                    }
+                    ProviderSubmitDriverRecovery::Failed(failure) => {
+                        let (kind, terminal) = journal_failure(&failure);
+                        self.publish_journal_failure(spec, released, terminal)
+                            .await?;
+                        self.record_failure(intent, context, kind, failure.code())
+                            .await
+                    }
+                }
+            }
+        }
+    }
+
+    async fn record_pre_release_failure_or_replay(
+        &self,
+        intent: &ProviderSubmitIntent,
+        context: &ProviderExecutionContext,
+        spec: RemoteSubmitJournalSpec,
+        command: Arc<SingleOutputCommand<D::Payload>>,
+        kind: ProviderSubmitFailureKind,
+        error_code: &str,
+    ) -> Result<ProviderSubmitOutcome, ProviderSubmitOrchestratorError> {
+        let journal = Arc::clone(&self.journal);
+        let observation_spec = spec.clone();
+        let observation = tokio::task::spawn_blocking(move || journal.observe(&observation_spec))
+            .await
+            .map_err(|_| ProviderSubmitOrchestratorError::JournalWorkerStopped)??;
+        match observation {
+            RemoteSubmitJournalObservation::DispatchReleased
+            | RemoteSubmitJournalObservation::Terminal(_) => {
+                self.replay_journal_observation(intent, context, spec, command, observation)
+                    .await
+            }
+            RemoteSubmitJournalObservation::Prepared
+            | RemoteSubmitJournalObservation::LaunchCommitted => {
+                self.record_failure(intent, context, kind, error_code).await
             }
         }
     }
@@ -519,7 +594,7 @@ pub enum ProviderSubmitOutcome {
 }
 
 enum RemoteSubmitDispatch {
-    Released(RemoteSubmitReleasedAuthority),
+    Launch(RemoteSubmitLaunchAuthority),
     Attach(RemoteSubmitJournalObservation),
 }
 

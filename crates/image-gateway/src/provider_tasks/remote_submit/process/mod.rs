@@ -185,6 +185,10 @@ impl GatedCliBinding {
         }
         Ok(())
     }
+
+    pub(crate) fn absolute_deadline_unix_ms(&self) -> u64 {
+        self.absolute_deadline_unix_ms
+    }
 }
 
 impl GatedCliCommand {

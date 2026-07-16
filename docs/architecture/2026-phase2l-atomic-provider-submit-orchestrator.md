@@ -204,21 +204,22 @@ not provide process-crash durability:
 
 ## Remaining Activation Gates
 
-1. Route submit through the existing durable helper/journal so daemon death
-   cannot lose a receipt after spawning a side-effecting CLI process.
-2. Bind the PostgreSQL absolute deadline to the external process group and prove
-   kill, reap, and zero-orphan behavior.
-3. Extend the orchestrator with recovery claims, poll, cancel, callback wakeup,
+1. Add Linux cgroup v2 containment to the Phase 2N/2O process-group boundary
+   and prove recursive zero-process cleanup.
+2. Extend the orchestrator with recovery claims, poll, cancel, callback wakeup,
    artifact materialization, deadline resolution, and provider/account scope
    rotation.
-4. Replace full-media artifact buffers with a lease-scoped streaming sink before
+3. Replace full-media artifact buffers with a lease-scoped streaming sink before
    video providers are enabled.
-5. Reconcile remote-task deadline capacity using strong late evidence and bind
+4. Reconcile remote-task deadline capacity using strong late evidence and bind
    the resulting terminal state to usage and billing decisions.
-6. Internalize the raw task-store lifecycle API after historical integration
+5. Internalize the raw task-store lifecycle API after historical integration
    tests are moved behind a crate-private test boundary.
-7. Run production-scale mixed-account benchmarks and migration rehearsal before
+6. Run production-scale mixed-account benchmarks and migration rehearsal before
    enabling Dreamina, Grok, or any other remote CLI provider.
 
 Until these gates close, all remote CLI providers remain planned/inactive and
 the public Codex image behavior remains unchanged.
+
+Phase 2M through Phase 2O close the original durable journal, gated process,
+deadline, and receipt-import composition items without activating a provider.

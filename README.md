@@ -48,6 +48,8 @@ Durable local submit evidence, receipt-first recovery, and its remaining helper 
 [`docs/architecture/2026-phase2m-durable-provider-submit-journal.md`](docs/architecture/2026-phase2m-durable-provider-submit-journal.md).
 The inactive gated CLI process protocol, crash evidence, and containment limits are documented in
 [`docs/architecture/2026-phase2n-gated-cli-submit-runner.md`](docs/architecture/2026-phase2n-gated-cli-submit-runner.md).
+The inactive gated submit composition, static driver boundary, and crash-window recovery are documented in
+[`docs/architecture/2026-phase2o-gated-submit-orchestration.md`](docs/architecture/2026-phase2o-gated-submit-orchestration.md).
 Database-bound provider profiles and durable capacity are documented in
 [`docs/architecture/2026-phase1g-execution-binding-capacity.md`](docs/architecture/2026-phase1g-execution-binding-capacity.md).
 

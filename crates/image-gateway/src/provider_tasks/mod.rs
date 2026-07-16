@@ -10,6 +10,7 @@ mod capacity;
 mod orchestrator;
 mod postgres;
 mod remote_submit;
+mod submit_driver;
 
 pub use capacity::{
     ProviderCapacityEvidence, ProviderCapacityEvidenceOutcome, ProviderCapacityReconciliation,
@@ -22,9 +23,13 @@ pub use orchestrator::{
 };
 pub use postgres::PostgresProviderTaskStore;
 pub use remote_submit::{
-    GatedCliBinding, GatedCliCommand, GatedCliObservation, GatedCliProcessError,
-    GatedCliProcessOutcome, GatedCliProcessTerminal, GatedCliReady, GatedCliSubmission,
-    run_remote_submit_gate, run_remote_submit_runner,
+    GatedCliBinding, GatedCliCommand, GatedCliObservation, GatedCliPreparedSubmission,
+    GatedCliProcessError, GatedCliProcessOutcome, GatedCliProcessTerminal, GatedCliReady,
+    GatedCliSubmission, GatedCliSubmitCodec, GatedCliSubmitDriver, run_remote_submit_gate,
+    run_remote_submit_runner,
+};
+pub use submit_driver::{
+    ProviderSubmitDriver, ProviderSubmitDriverCall, ProviderSubmitDriverRecovery,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
