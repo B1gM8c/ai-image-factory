@@ -212,6 +212,37 @@ The experiment narrows the next candidate: a meaningful improvement must
 distribute capacity authority across independently lockable rows. Merely
 accelerating the invariant recount does not remove the serialized counter.
 
+### Rejected Bounded Shard Experiment
+
+On 2026-07-17, a second uncommitted experiment replaced the policy counter
+with at most 64 capacity shards per policy. Allocation identity froze its shard,
+release decremented that exact shard, and migration testing backfilled 70 held
+allocations from schema 31 while bounding a one-million permit policy to 64
+rows. The upgrade test also exposed a pending deferred-trigger event that had
+to be settled before altering the allocation table.
+
+Two implementations ran against the same 4096-row, 64-claimant workload:
+
+| Metric | Shared policy fence | Control-plane shard fence |
+| --- | ---: | ---: |
+| Throughput | 242.3 ops/s | 484.5 ops/s |
+| Fresh p99 | 667.9 ms | 495.6 ms |
+| Recovery p99 | 124.4 ms | 157.9 ms |
+| Deadlocks | 0 | 0 |
+| Exact-once projection | true | true |
+
+The first version retained a shared policy-row lock on every claim and was
+slower than the counter. The second moved disable fencing to the low-frequency
+policy transition and materially improved throughput, but fresh p99 remained
+about 27 percent worse than the slower retained counter run (495.6 ms versus
+389.6 ms). It therefore failed the predeclared requirement to improve both
+throughput and tail latency.
+
+All shard migration, runtime, fixture, and benchmark edits were removed. The
+result is evidence against adopting a more complex semaphore solely from
+throughput measurements; any future replacement must also improve tail latency
+under a repeated, isolated workload.
+
 ## Explicit Limits
 
 This phase does not add:
