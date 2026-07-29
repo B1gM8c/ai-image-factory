@@ -60,9 +60,12 @@ pub fn parse_submit_command(
     }
     let canonical: CanonicalSubmitV1 = serde_json::from_slice(input)
         .map_err(|_| DreaminaSubmitCommandError::InvalidCanonicalCommand)?;
-    let request: DreaminaSubmitRequestV1 = canonical.try_into()?;
-    ensure_single_output(&request)?;
-    Ok(request)
+    canonical.try_into()
+}
+
+pub fn encode_submit_command(request: DreaminaSubmitRequestV1) -> Vec<u8> {
+    serde_json::to_vec(&CanonicalSubmitV1::from(request))
+        .expect("Dreamina canonical submit serialization cannot fail")
 }
 
 #[derive(Debug, Error, Eq, PartialEq)]
@@ -91,7 +94,12 @@ enum CanonicalSubmitV1 {
         schema_version: u16,
         prompt: String,
         model_version: String,
-        ratio: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ratio: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        width: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        height: Option<u32>,
         resolution_type: String,
         generate_num: u8,
         poll: u8,
@@ -115,7 +123,9 @@ impl From<DreaminaSubmitRequestV1> for CanonicalSubmitV1 {
                 schema_version: crate::REQUEST_SCHEMA_VERSION,
                 prompt: request.prompt().to_owned(),
                 model_version: request.model().as_str().to_owned(),
-                ratio: request.ratio().as_str().to_owned(),
+                ratio: request.ratio().map(|ratio| ratio.as_str().to_owned()),
+                width: request.width(),
+                height: request.height(),
                 resolution_type: request.resolution().as_str().to_owned(),
                 generate_num: request.generate_num(),
                 poll: 0,
@@ -143,18 +153,33 @@ impl TryFrom<CanonicalSubmitV1> for DreaminaSubmitRequestV1 {
                 prompt,
                 model_version,
                 ratio,
+                width,
+                height,
                 resolution_type,
                 generate_num,
                 poll,
             } => {
                 validate_envelope(schema_version, poll)?;
-                TextToImageRequestV1::new(
-                    prompt,
-                    parse_image_model(&model_version)?,
-                    parse_image_ratio(&ratio)?,
-                    parse_image_resolution(&resolution_type)?,
-                    generate_num,
-                )
+                let model = parse_image_model(&model_version)?;
+                let resolution = parse_image_resolution(&resolution_type)?;
+                match (ratio, width, height) {
+                    (Some(ratio), None, None) => TextToImageRequestV1::new(
+                        prompt,
+                        model,
+                        parse_image_ratio(&ratio)?,
+                        resolution,
+                        generate_num,
+                    ),
+                    (None, Some(width), Some(height)) => TextToImageRequestV1::new_custom(
+                        prompt,
+                        model,
+                        width,
+                        height,
+                        resolution,
+                        generate_num,
+                    ),
+                    _ => return Err(DreaminaSubmitCommandError::UnknownOfficialOption),
+                }
                 .map(Into::into)
                 .map_err(Into::into)
             }
@@ -202,6 +227,7 @@ fn parse_image_model(value: &str) -> Result<ImageModelVersion, DreaminaSubmitCom
         "4.6" => Ok(ImageModelVersion::V4_6),
         "4.7" => Ok(ImageModelVersion::V4_7),
         "5.0" => Ok(ImageModelVersion::V5_0),
+        "5.0Pro" => Ok(ImageModelVersion::V5_0Pro),
         _ => Err(DreaminaSubmitCommandError::UnknownOfficialOption),
     }
 }

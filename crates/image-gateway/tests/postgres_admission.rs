@@ -1,21 +1,37 @@
 use std::env;
 
 use gpt_image_2_gateway::{
-    EditJob,
+    CreditGrantService, EditJob, PostgresCreditGrantService,
     admission::{
         AdmissionClaim, AdmissionContract, AdmissionError, AdmissionStore, AdmissionTicket,
-        AttachInputManifest, AttachInputObject, AttachJob, ClaimAdmission, EDIT_COMMAND_SCHEMA,
+        AttachInputManifest, AttachInputObject, AttachJob, ClaimAdmission, CustomerPricingIntent,
+        DreaminaImageAdmissionPlan, DreaminaVideoAdmissionPlan, EDIT_COMMAND_SCHEMA,
         EDIT_INPUT_MANIFEST_SCHEMA, EditCommandV1, EditInputDescriptorV1, EditInputRoleV1,
-        PostgresAdmissionStore, WorkOutcome,
+        GENERATION_COMMAND_SCHEMA, GenerationCommandV1, PostgresAdmissionStore,
+        VIDEO_GENERATION_OPERATION, WorkOutcome, XaiImageAdmissionPlan,
     },
+    credit_grants::{CreateCreditGrantRequest, CreditGrantActor},
     database::{connect_test_pool_with_search_path, run_migrations},
     input_blobs::{InputBlobKey, InputBlobRef},
 };
+use image_api_contracts::xai::{
+    XaiImageGenerationRequest, XaiImageResolution, XaiImageResponseFormat,
+};
+use image_api_contracts::{
+    ark::{ARK_CONTENT_GENERATION_API_PROFILE, ARK_IMAGES_API_PROFILE},
+    dreamina::{
+        DREAMINA_IMAGES_API_PROFILE, DREAMINA_VIDEOS_API_PROFILE, DreaminaImageGenerationRequest,
+        DreaminaVideoGenerationRequest,
+    },
+};
+use image_provider_dreamina_cli::DREAMINA_SUBMIT_COMMAND_SCHEMA;
+use image_provider_grok_cli::GROK_IMAGE_GENERATION_COMMAND_SCHEMA;
 use serde_json::json;
 use sqlx::{AssertSqlSafe, PgPool};
 use uuid::Uuid;
 
 type TestResult<T = ()> = Result<T, String>;
+const DREAMINA_VIDEO_EXECUTION_MODEL: &str = "dreamina-video-seedance2-fast";
 
 #[tokio::test]
 async fn migration_creates_durable_admission_tables() -> TestResult {
@@ -119,6 +135,1284 @@ async fn final_accept_creates_one_frozen_economic_identity_set() -> TestResult {
 }
 
 #[tokio::test]
+async fn customer_pricing_v4_accept_is_atomic_and_replayable() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        seed_customer_price_v4(&database.pool, 11).await?;
+        seed_billing_account(&database.pool, 1000).await?;
+
+        let store = PostgresAdmissionStore::new(database.pool.clone());
+        let admission_hash = "f".repeat(64);
+        let (ticket, command_json, command_hash) =
+            claim_customer_pricing_owner_with_ticket_hash(&store, 1, admission_hash.clone())
+                .await?;
+        let job_id =
+            insert_job_for_ticket(&database.pool, &ticket, "tenant-a", "generation", None).await?;
+        seed_job_project_attribution(&database.pool, job_id).await?;
+        let mut request = attach_request(ticket, job_id);
+        request.command_json = command_json;
+        request.contract = AdmissionContract::CustomerPricingV4;
+        let mut pricing = customer_pricing_intent();
+        pricing.service_tier_decision =
+            gpt_image_2_gateway::service_tiers::ServiceTierDecision::for_default_only_project(
+                gpt_image_2_gateway::service_tiers::ProjectServiceTier::Priority,
+            );
+        pricing.provider_command_hash = Some(command_hash.clone());
+        request.customer_pricing = Some(pricing);
+
+        let first = store
+            .attach(request.clone())
+            .await
+            .map_err(|error| format!("v4 attach failed: {error:?}"))?;
+        let replay = store
+            .attach(request)
+            .await
+            .map_err(|error| format!("v4 attach replay failed: {error:?}"))?;
+        require(first == replay, "v4 replay changed the work identity")?;
+        let stored_payload_hash: String =
+            sqlx::query_scalar("SELECT request_hash FROM job_payloads WHERE job_id = $1")
+                .bind(job_id)
+                .fetch_one(&database.pool)
+                .await
+                .map_err(|error| format!("failed to inspect durable payload hash: {error}"))?;
+        require(
+            admission_hash != command_hash && stored_payload_hash == command_hash,
+            "v4 admission did not separate admission and provider command hashes",
+        )?;
+
+        let state: (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, String) = sqlx::query_as(
+            r#"
+                SELECT
+                  (SELECT economics_contract_version FROM jobs WHERE job_id = $1)::BIGINT,
+                  (SELECT COUNT(*) FROM job_outputs WHERE job_id = $1),
+                  (SELECT COUNT(*) FROM customer_price_quotes WHERE job_id = $1),
+                  (SELECT COUNT(*) FROM customer_price_quote_lines WHERE job_id = $1),
+                  (SELECT COUNT(*) FROM customer_billing_holds WHERE job_id = $1),
+                  (SELECT COUNT(*) FROM work_items WHERE job_id = $1),
+                  (SELECT COUNT(*) FROM price_quotes WHERE job_id = $1),
+                  (SELECT COUNT(*) FROM output_holds WHERE job_id = $1),
+                  (SELECT max_total_micros FROM customer_price_quotes WHERE job_id = $1),
+                  (SELECT held_micros FROM customer_billing_holds WHERE job_id = $1),
+                  (SELECT state FROM customer_billing_holds WHERE job_id = $1)
+                "#,
+        )
+        .bind(job_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(|error| format!("failed to inspect v4 admission: {error}"))?;
+        require(
+            state == (4, 1, 1, 3, 1, 1, 0, 0, 11, 11, "held".to_string()),
+            format!("v4 admission was not atomic: {state:?}"),
+        )?;
+
+        let timestamp_is_frozen: bool = sqlx::query_scalar(
+            r#"
+            SELECT quote.created_at_ms = attribution.admitted_at_ms
+            FROM customer_price_quotes quote
+            JOIN job_auth_attributions attribution ON attribution.job_id = quote.job_id
+            WHERE quote.job_id = $1
+            "#,
+        )
+        .bind(job_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(|error| format!("failed to inspect v4 admission timestamp: {error}"))?;
+        require(
+            timestamp_is_frozen,
+            "v4 quote did not use the admission timestamp",
+        )?;
+        let decision: (String, String, String, Option<String>) = sqlx::query_as(
+            r#"
+            SELECT requested_service_tier, project_service_tier,
+                   effective_service_tier, fallback_reason
+            FROM job_service_tier_decisions
+            WHERE job_id = $1
+            "#,
+        )
+        .bind(job_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(|error| format!("failed to inspect service tier decision: {error}"))?;
+        require(
+            decision
+                == (
+                    "auto".to_string(),
+                    "priority".to_string(),
+                    "default".to_string(),
+                    Some("model_service_tier_unsupported".to_string()),
+                ),
+            format!("v4 admission froze the wrong service tier decision: {decision:?}"),
+        )?;
+        let mutation = sqlx::query(
+            "UPDATE job_service_tier_decisions SET effective_service_tier = 'priority' WHERE job_id = $1",
+        )
+        .bind(job_id)
+        .execute(&database.pool)
+        .await;
+        require(
+            mutation.is_err(),
+            "service tier decision remained mutable after admission",
+        )?;
+
+        Ok(())
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
+async fn configured_soft_project_budget_does_not_block_customer_admission() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        seed_customer_price_v4(&database.pool, 11).await?;
+        seed_billing_account(&database.pool, 1000).await?;
+        let store = PostgresAdmissionStore::new(database.pool.clone());
+
+        let (first_ticket, first_command) = claim_customer_pricing_owner(&store, 1).await?;
+        let first_job = insert_job_for_ticket(
+            &database.pool,
+            &first_ticket,
+            "tenant-a",
+            "generation",
+            None,
+        )
+        .await?;
+        seed_job_project_attribution(&database.pool, first_job).await?;
+        seed_project_spend_budget(&database.pool, "soft", 11).await?;
+        let mut first_request = attach_request(first_ticket, first_job);
+        first_request.command_json = first_command;
+        first_request.contract = AdmissionContract::CustomerPricingV4;
+        first_request.customer_pricing = Some(customer_pricing_intent());
+        store
+            .attach(first_request)
+            .await
+            .map_err(|error| format!("first soft-budget admission failed: {error:?}"))?;
+
+        let (second_ticket, second_command) = claim_customer_pricing_owner(&store, 1).await?;
+        let second_job = insert_job_for_ticket(
+            &database.pool,
+            &second_ticket,
+            "tenant-a",
+            "generation",
+            None,
+        )
+        .await?;
+        seed_job_project_attribution(&database.pool, second_job).await?;
+        let mut second_request = attach_request(second_ticket, second_job);
+        second_request.command_json = second_command;
+        second_request.contract = AdmissionContract::CustomerPricingV4;
+        second_request.customer_pricing = Some(customer_pricing_intent());
+        store
+            .attach(second_request)
+            .await
+            .map_err(|error| format!("second soft-budget admission failed: {error:?}"))?;
+
+        let state: (i64, i64, i64) = sqlx::query_as(
+            r#"
+            SELECT
+              (SELECT COUNT(*) FROM customer_price_quotes WHERE project_id = 'project-a'),
+              (SELECT COUNT(*)
+                 FROM customer_billing_holds hold
+                 JOIN customer_price_quotes quote ON quote.quote_id = hold.quote_id
+                WHERE quote.project_id = 'project-a' AND hold.state = 'held'),
+              (SELECT COALESCE(SUM(hold.held_micros), 0)::BIGINT
+                 FROM customer_billing_holds hold
+                 JOIN customer_price_quotes quote ON quote.quote_id = hold.quote_id
+                WHERE quote.project_id = 'project-a' AND hold.state = 'held')
+            "#,
+        )
+        .fetch_one(&database.pool)
+        .await
+        .map_err(|error| format!("failed to inspect soft-budget admissions: {error}"))?;
+        require(
+            state == (2, 2, 22),
+            format!("soft budget unexpectedly blocked or corrupted admissions: {state:?}"),
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
+async fn project_hard_budget_serializes_concurrent_customer_admission() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        seed_customer_price_v4(&database.pool, 11).await?;
+        seed_billing_account(&database.pool, 1000).await?;
+        let store = PostgresAdmissionStore::new(database.pool.clone());
+
+        let (first_ticket, first_command) = claim_customer_pricing_owner(&store, 1).await?;
+        let first_job =
+            insert_job_for_ticket(&database.pool, &first_ticket, "tenant-a", "generation", None)
+                .await?;
+        seed_job_project_attribution(&database.pool, first_job).await?;
+        let mut first_request = attach_request(first_ticket, first_job);
+        first_request.command_json = first_command;
+        first_request.contract = AdmissionContract::CustomerPricingV4;
+        first_request.customer_pricing = Some(customer_pricing_intent());
+
+        let (second_ticket, second_command) = claim_customer_pricing_owner(&store, 1).await?;
+        let second_job =
+            insert_job_for_ticket(&database.pool, &second_ticket, "tenant-a", "generation", None)
+                .await?;
+        seed_job_project_attribution(&database.pool, second_job).await?;
+        let mut second_request = attach_request(second_ticket, second_job);
+        second_request.command_json = second_command;
+        second_request.contract = AdmissionContract::CustomerPricingV4;
+        second_request.customer_pricing = Some(customer_pricing_intent());
+        seed_project_spend_budget(&database.pool, "hard", 11).await?;
+
+        let first_store = store.clone();
+        let second_store = store.clone();
+        let first_attempt = first_request.clone();
+        let second_attempt = second_request.clone();
+        let (first_result, second_result) = tokio::join!(
+            first_store.attach(first_attempt),
+            second_store.attach(second_attempt)
+        );
+        let (winner_job, winner_request, loser_job) = match (&first_result, &second_result) {
+            (Ok(_), Err(AdmissionError::ProjectBudgetExceeded)) => {
+                (first_job, first_request, second_job)
+            }
+            (Err(AdmissionError::ProjectBudgetExceeded), Ok(_)) => {
+                (second_job, second_request, first_job)
+            }
+            _ => {
+                return Err(format!(
+                    "hard limit did not admit exactly one concurrent request: first={first_result:?}, second={second_result:?}"
+                ));
+            }
+        };
+
+        store
+            .attach(winner_request)
+            .await
+            .map_err(|error| format!("winning admission was not replayable: {error:?}"))?;
+        let state: (i64, i64, i64, i64, i64, i64) = sqlx::query_as(
+            r#"
+            SELECT
+              (SELECT COUNT(*) FROM customer_price_quotes WHERE project_id = 'project-a'),
+              (SELECT COUNT(*)
+                 FROM customer_billing_holds hold
+                 JOIN customer_price_quotes quote ON quote.quote_id = hold.quote_id
+                WHERE quote.project_id = 'project-a' AND hold.state = 'held'),
+              (SELECT COUNT(*) FROM work_items WHERE job_id = $1),
+              (SELECT economics_contract_version FROM jobs WHERE job_id = $2)::BIGINT,
+              (SELECT COUNT(*) FROM customer_price_quotes WHERE job_id = $2),
+              (SELECT COUNT(*) FROM work_items WHERE job_id = $2)
+            "#,
+        )
+        .bind(winner_job)
+        .bind(loser_job)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(|error| format!("failed to inspect hard-budget admissions: {error}"))?;
+        require(
+            state == (1, 1, 1, 1, 0, 0),
+            format!("hard-limit rejection left partial or duplicate state: {state:?}"),
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
+async fn edit_customer_pricing_v4_freezes_quote_and_preserves_input_manifest() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        seed_customer_price_v4_for_operation(&database.pool, "edit", 13).await?;
+        seed_billing_account(&database.pool, 1000).await?;
+
+        let store = PostgresAdmissionStore::new(database.pool.clone());
+        let provisional_inputs = edit_input_specs(Uuid::new_v4(), None);
+        let provisional_command = edit_command(&provisional_inputs);
+        let ticket = claim_edit_owner(&store, &provisional_command).await?;
+        let inputs = edit_input_specs(ticket.session_id, None);
+        let command = edit_command(&inputs);
+        let job_id =
+            insert_job_for_ticket(&database.pool, &ticket, "tenant-a", "edit", None).await?;
+        seed_codex_job_project_attribution(
+            &database.pool,
+            job_id,
+            "images.edits",
+            EDIT_COMMAND_SCHEMA,
+        )
+        .await?;
+
+        let mut request =
+            edit_attach_request(ticket.clone(), job_id, command.clone(), inputs.clone());
+        request.contract = AdmissionContract::CustomerPricingV4;
+        request.customer_pricing = Some(customer_pricing_intent());
+        let attached = store
+            .attach(request.clone())
+            .await
+            .map_err(|error| format!("v4 edit attach failed: {error:?}"))?;
+        let replay = store
+            .attach(request)
+            .await
+            .map_err(|error| format!("v4 edit attach replay failed: {error:?}"))?;
+        require(attached == replay, "v4 edit replay changed work identity")?;
+
+        let state: (i64, i64, i64, i64, i64, i64, i64, String) = sqlx::query_as(
+            r#"
+            SELECT
+              (SELECT economics_contract_version FROM jobs WHERE job_id = $1)::BIGINT,
+              (SELECT COUNT(*) FROM customer_price_quotes WHERE job_id = $1),
+              (SELECT COUNT(*) FROM customer_price_quote_lines WHERE job_id = $1),
+              (SELECT COUNT(*) FROM customer_billing_holds WHERE job_id = $1),
+              (SELECT COUNT(*) FROM price_quotes WHERE job_id = $1),
+              (SELECT COUNT(*) FROM output_holds WHERE job_id = $1),
+              (SELECT COUNT(*) FROM job_input_objects WHERE job_id = $1),
+              (SELECT operation FROM customer_price_quotes WHERE job_id = $1)
+            "#,
+        )
+        .bind(job_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(|error| format!("failed to inspect v4 edit economics: {error}"))?;
+        require(
+            state == (4, 1, 3, 1, 0, 0, 2, "edit".to_string()),
+            format!("edit did not use the v4 economic path: {state:?}"),
+        )?;
+
+        let frozen: (i64, i64, String, String) = sqlx::query_as(
+            r#"
+            SELECT quote.max_total_micros, hold.held_micros, hold.state,
+                   manifest.manifest_hash
+            FROM customer_price_quotes quote
+            JOIN customer_billing_holds hold ON hold.quote_id = quote.quote_id
+            JOIN job_input_manifests manifest ON manifest.job_id = quote.job_id
+            WHERE quote.job_id = $1
+            "#,
+        )
+        .bind(job_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(|error| format!("failed to inspect frozen v4 edit quote: {error}"))?;
+        require(
+            frozen
+                == (
+                    13,
+                    13,
+                    "held".to_string(),
+                    command.input_manifest_hash_hex(),
+                ),
+            format!("unexpected frozen v4 edit quote: {frozen:?}"),
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
+async fn dreamina_customer_pricing_v4_preserves_ark_identity_and_native_price_alias() -> TestResult
+{
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        seed_dreamina_customer_price_v4(&database.pool, 7).await?;
+        seed_billing_account(&database.pool, 1000).await?;
+
+        let plan = DreaminaImageAdmissionPlan::new(DreaminaImageGenerationRequest {
+            prompt: "Ark request with Dreamina execution".to_string(),
+            model_version: Some("5.0".to_string()),
+            ratio: Some("16:9".to_string()),
+            resolution_type: "2k".to_string(),
+            width: None,
+            height: None,
+            generate_num: Some(1),
+        })
+        .map_err(|error| format!("failed to create Dreamina admission plan: {error:?}"))?;
+        let store = PostgresAdmissionStore::new(database.pool.clone());
+        let claim = plan.claim_for_profile(
+            ARK_IMAGES_API_PROFILE,
+            Uuid::new_v4(),
+            "tenant-a",
+            "project-a",
+            format!("req_{}", Uuid::new_v4().simple()),
+            None,
+            i64::MAX,
+        );
+        let ticket = claim_owner(&store, claim).await?;
+        let job_id =
+            insert_job_for_ticket(&database.pool, &ticket, "tenant-a", "generation", None).await?;
+        sqlx::query(
+            r#"
+            UPDATE jobs
+            SET provider_id = 'dreamina-cli', model = 'dreamina-image-5.0'
+            WHERE job_id = $1
+            "#,
+        )
+        .bind(job_id)
+        .execute(&database.pool)
+        .await
+        .map_err(|error| format!("failed to bind Dreamina job identity: {error}"))?;
+        seed_dreamina_job_project_attribution(
+            &database.pool,
+            job_id,
+            ARK_IMAGES_API_PROFILE,
+            "doubao-seedream-5-0-lite",
+        )
+        .await?;
+
+        let mut request = plan.attach(ticket, job_id, "tenant-a");
+        request.contract = AdmissionContract::CustomerPricingV4;
+        request.customer_pricing = Some(CustomerPricingIntent {
+            public_model_id: "doubao-seedream-5-0-lite".to_string(),
+            provider_model_id: plan.provider_model_id().to_string(),
+            execution_model_id: plan.provider_model().to_string(),
+            provider_command_hash: Some(plan.provider_command_hash().to_string()),
+            media_kind: "image".to_string(),
+            service_tier: "standard".to_string(),
+            service_tier_decision:
+                gpt_image_2_gateway::service_tiers::ServiceTierDecision::for_default_only_project(
+                    gpt_image_2_gateway::service_tiers::ProjectServiceTier::Default,
+                ),
+            execution_surface: "provider_cli".to_string(),
+            currency: "USD".to_string(),
+            pricing_dimensions: plan.pricing_dimensions().clone(),
+            processing_mode: gpt_image_2_gateway::admission::PricingProcessingMode::Synchronous,
+        });
+        store
+            .attach(request)
+            .await
+            .map_err(|error| format!("Ark-to-Dreamina v4 attach failed: {error:?}"))?;
+
+        let frozen: (
+            String,
+            String,
+            String,
+            String,
+            String,
+            serde_json::Value,
+            i64,
+            i64,
+        ) = sqlx::query_as(
+            r#"
+            SELECT quote.api_profile, version.api_profile,
+                   quote.provider_model_id, quote.public_model_id,
+                   job.model, quote.request_dimensions_json,
+                   quote.max_total_micros, hold.held_micros
+            FROM customer_price_quotes quote
+            JOIN price_book_versions version
+              ON version.price_book_version_id = quote.price_book_version_id
+            JOIN customer_billing_holds hold ON hold.job_id = quote.job_id
+            JOIN jobs job ON job.job_id = quote.job_id
+            WHERE quote.job_id = $1
+            "#,
+        )
+        .bind(job_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(|error| format!("failed to inspect Dreamina frozen quote: {error}"))?;
+        require(
+            frozen
+                == (
+                    ARK_IMAGES_API_PROFILE.to_string(),
+                    DREAMINA_IMAGES_API_PROFILE.to_string(),
+                    "5.0".to_string(),
+                    "doubao-seedream-5-0-lite".to_string(),
+                    "dreamina-image-5.0".to_string(),
+                    json!({
+                        "processing_mode": "synchronous",
+                        "ratio": "16:9",
+                        "resolution_type": "2k"
+                    }),
+                    7,
+                    7,
+                ),
+            format!("Ark identity or Dreamina price source drifted: {frozen:?}"),
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
+async fn dreamina_video_customer_pricing_v4_freezes_ark_identity_and_output_seconds() -> TestResult
+{
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        seed_dreamina_video_customer_price_v4(&database.pool, 3).await?;
+        seed_billing_account(&database.pool, 1000).await?;
+
+        let plan = DreaminaVideoAdmissionPlan::new(DreaminaVideoGenerationRequest {
+            prompt: "Ark Seedance request with Dreamina execution".to_string(),
+            model_version: Some("seedance2.0fast".to_string()),
+            ratio: Some("9:16".to_string()),
+            duration: Some(8),
+            video_resolution: "720p".to_string(),
+        })
+        .map_err(|error| format!("failed to create Dreamina video plan: {error:?}"))?;
+        let store = PostgresAdmissionStore::new(database.pool.clone());
+        let mut claim = plan.claim_for_profile(
+            ARK_CONTENT_GENERATION_API_PROFILE,
+            Uuid::new_v4(),
+            "tenant-a",
+            "project-a",
+            format!("req_{}", Uuid::new_v4().simple()),
+            None,
+            i64::MAX,
+        );
+        claim.request_hash = "d".repeat(64);
+        let ticket = claim_owner(&store, claim).await?;
+        let job_id = insert_job_for_ticket(
+            &database.pool,
+            &ticket,
+            "tenant-a",
+            VIDEO_GENERATION_OPERATION,
+            None,
+        )
+        .await?;
+        configure_dreamina_video_job(&database.pool, job_id, plan.duration()).await?;
+        seed_dreamina_video_job_project_attribution(
+            &database.pool,
+            job_id,
+            ARK_CONTENT_GENERATION_API_PROFILE,
+            "doubao-seedance-2-0-fast-260128",
+        )
+        .await?;
+
+        let mut request = plan.attach(ticket, job_id, "tenant-a");
+        request.contract = AdmissionContract::CustomerPricingV4;
+        request.customer_pricing = Some(CustomerPricingIntent {
+            public_model_id: "doubao-seedance-2-0-fast-260128".to_string(),
+            provider_model_id: plan.provider_model_id().to_string(),
+            execution_model_id: DREAMINA_VIDEO_EXECUTION_MODEL.to_string(),
+            provider_command_hash: Some(plan.provider_command_hash().to_string()),
+            media_kind: "video".to_string(),
+            service_tier: "standard".to_string(),
+            service_tier_decision:
+                gpt_image_2_gateway::service_tiers::ServiceTierDecision::for_default_only_project(
+                    gpt_image_2_gateway::service_tiers::ProjectServiceTier::Default,
+                ),
+            execution_surface: "provider_cli".to_string(),
+            currency: "USD".to_string(),
+            pricing_dimensions: plan.pricing_dimensions().clone(),
+            processing_mode: gpt_image_2_gateway::admission::PricingProcessingMode::Synchronous,
+        });
+        store
+            .attach(request)
+            .await
+            .map_err(|error| format!("Ark-to-Dreamina video v4 attach failed: {error:?}"))?;
+
+        let frozen: (
+            String,
+            String,
+            String,
+            String,
+            String,
+            serde_json::Value,
+            i64,
+            i64,
+            i64,
+            String,
+            String,
+        ) = sqlx::query_as(
+            r#"
+            SELECT quote.api_profile, version.api_profile,
+                   quote.provider_model_id, quote.public_model_id,
+                   job.model, quote.request_dimensions_json,
+                   output.billable_units::BIGINT,
+                   quote.max_total_micros, hold.held_micros,
+                   job.billing_metric, job.billing_unit
+            FROM customer_price_quotes quote
+            JOIN price_book_versions version
+              ON version.price_book_version_id = quote.price_book_version_id
+            JOIN customer_billing_holds hold ON hold.job_id = quote.job_id
+            JOIN jobs job ON job.job_id = quote.job_id
+            JOIN job_outputs output ON output.job_id = quote.job_id
+            WHERE quote.job_id = $1
+            "#,
+        )
+        .bind(job_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(|error| format!("failed to inspect Dreamina video quote: {error}"))?;
+        require(
+            frozen
+                == (
+                    ARK_CONTENT_GENERATION_API_PROFILE.to_string(),
+                    DREAMINA_VIDEOS_API_PROFILE.to_string(),
+                    "seedance2.0fast".to_string(),
+                    "doubao-seedance-2-0-fast-260128".to_string(),
+                    DREAMINA_VIDEO_EXECUTION_MODEL.to_string(),
+                    json!({
+                        "duration": "8",
+                        "processing_mode": "synchronous",
+                        "ratio": "9:16",
+                        "resolution": "720p"
+                    }),
+                    8,
+                    24,
+                    24,
+                    "video_second".to_string(),
+                    "second".to_string(),
+                ),
+            format!("Ark video identity or frozen seconds drifted: {frozen:?}"),
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
+async fn customer_pricing_v4_quotes_each_requested_output_partition() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        seed_customer_price_v4(&database.pool, 11).await?;
+        seed_billing_account(&database.pool, 1000).await?;
+
+        let store = PostgresAdmissionStore::new(database.pool.clone());
+        let (ticket, command_json) = claim_customer_pricing_owner(&store, 3).await?;
+        let job_id =
+            insert_job_for_ticket(&database.pool, &ticket, "tenant-a", "generation", None).await?;
+        sqlx::query(
+            r#"
+            UPDATE jobs
+            SET requested_units = 3, output_count = 3, billable_units = 3
+            WHERE job_id = $1
+            "#,
+        )
+        .bind(job_id)
+        .execute(&database.pool)
+        .await
+        .map_err(|error| format!("failed to configure multi-output v4 job: {error}"))?;
+        sqlx::query(
+            r#"
+            UPDATE quota_reservations
+            SET requested_units = 3, remaining_5h = 97, remaining_7d = 97
+            WHERE job_id = $1
+            "#,
+        )
+        .bind(job_id)
+        .execute(&database.pool)
+        .await
+        .map_err(|error| format!("failed to configure multi-output quota: {error}"))?;
+        seed_job_project_attribution(&database.pool, job_id).await?;
+        let mut request = attach_request(ticket, job_id);
+        request.command_json = command_json;
+        request.schedule_cost = 3;
+        request.contract = AdmissionContract::CustomerPricingV4;
+        request.customer_pricing = Some(customer_pricing_intent());
+
+        let first = store
+            .attach(request.clone())
+            .await
+            .map_err(|error| format!("multi-output v4 attach failed: {error:?}"))?;
+        let replay = store
+            .attach(request)
+            .await
+            .map_err(|error| format!("multi-output v4 replay failed: {error:?}"))?;
+        require(
+            first == replay,
+            "multi-output v4 replay changed work identity",
+        )?;
+
+        let state: (i64, i64, i64, i64, i64, i64) = sqlx::query_as(
+            r#"
+            SELECT
+              (SELECT COUNT(*) FROM job_outputs WHERE job_id = $1),
+              (SELECT COUNT(DISTINCT partition_key)
+                 FROM customer_price_quote_lines WHERE job_id = $1),
+              (SELECT COUNT(*) FROM customer_price_quote_lines WHERE job_id = $1),
+              (SELECT max_total_micros FROM customer_price_quotes WHERE job_id = $1),
+              (SELECT held_micros FROM customer_billing_holds WHERE job_id = $1),
+              (SELECT held_micros FROM billing_accounts
+                 WHERE tenant_id = 'tenant-a' AND currency = 'USD')
+            "#,
+        )
+        .bind(job_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(|error| format!("failed to inspect multi-output v4 quote: {error}"))?;
+        require(
+            state == (3, 3, 9, 33, 33, 33),
+            format!("multi-output v4 quote lost partition economics: {state:?}"),
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
+async fn customer_pricing_v4_rejects_legacy_estimated_token_prices_without_partial_state()
+-> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        seed_customer_token_price_v4(&database.pool).await?;
+        seed_billing_account(&database.pool, 1_000_000).await?;
+
+        let store = PostgresAdmissionStore::new(database.pool.clone());
+        let (ticket, command_json) = claim_customer_pricing_owner(&store, 2).await?;
+        let owner_token = ticket.owner_token;
+        let job_id =
+            insert_job_for_ticket(&database.pool, &ticket, "tenant-a", "generation", None).await?;
+        sqlx::query(
+            r#"
+            UPDATE jobs
+            SET requested_units = 2, output_count = 2, billable_units = 2
+            WHERE job_id = $1
+            "#,
+        )
+        .bind(job_id)
+        .execute(&database.pool)
+        .await
+        .map_err(|error| format!("failed to configure token-priced v4 job: {error}"))?;
+        sqlx::query(
+            r#"
+            UPDATE quota_reservations
+            SET requested_units = 2, remaining_5h = 98, remaining_7d = 98
+            WHERE job_id = $1
+            "#,
+        )
+        .bind(job_id)
+        .execute(&database.pool)
+        .await
+        .map_err(|error| format!("failed to configure token-priced quota: {error}"))?;
+        seed_job_project_attribution(&database.pool, job_id).await?;
+        let mut request = attach_request(ticket, job_id);
+        request.command_json = command_json;
+        request.schedule_cost = 2;
+        request.contract = AdmissionContract::CustomerPricingV4;
+        request.customer_pricing = Some(customer_pricing_intent());
+
+        require(
+            matches!(
+                store.attach(request).await,
+                Err(AdmissionError::PricingUnavailable)
+            ),
+            "v4 admission accepted a legacy estimated token price",
+        )?;
+        let state: (String, i64, i64, i64, i64, i64, i64, i64, i64) = sqlx::query_as(
+            r#"
+            SELECT session.state,
+                   (SELECT economics_contract_version FROM jobs WHERE job_id = $1)::BIGINT,
+                   (SELECT COUNT(*) FROM job_payloads WHERE job_id = $1),
+                   (SELECT COUNT(*) FROM job_outputs WHERE job_id = $1),
+                   (SELECT COUNT(*) FROM customer_price_quotes WHERE job_id = $1),
+                   (SELECT COUNT(*) FROM customer_price_quote_lines WHERE job_id = $1),
+                   (SELECT COUNT(*) FROM customer_billing_holds WHERE job_id = $1),
+                   (SELECT COUNT(*) FROM work_items WHERE job_id = $1),
+                   (SELECT held_micros FROM billing_accounts
+                      WHERE tenant_id = 'tenant-a' AND currency = 'USD')
+            FROM admission_sessions session
+            WHERE session.owner_token = $2
+            "#,
+        )
+        .bind(job_id)
+        .bind(owner_token)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(|error| {
+            format!("failed to inspect rejected token-priced v4 admission: {error}")
+        })?;
+        require(
+            state == ("receiving".to_string(), 1, 0, 0, 0, 0, 0, 0, 0),
+            format!("rejected token-priced v4 admission left partial state: {state:?}"),
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
+async fn customer_pricing_v4_rejects_forged_dimensions_without_partial_state() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        seed_customer_token_price_v4(&database.pool).await?;
+        seed_billing_account(&database.pool, 1_000_000).await?;
+
+        let store = PostgresAdmissionStore::new(database.pool.clone());
+        let (ticket, command_json) = claim_customer_pricing_owner(&store, 1).await?;
+        let owner_token = ticket.owner_token;
+        let job_id =
+            insert_job_for_ticket(&database.pool, &ticket, "tenant-a", "generation", None).await?;
+        seed_job_project_attribution(&database.pool, job_id).await?;
+        let mut request = attach_request(ticket, job_id);
+        request.command_json = command_json;
+        request.contract = AdmissionContract::CustomerPricingV4;
+        let mut pricing = customer_pricing_intent();
+        pricing
+            .pricing_dimensions
+            .insert("quality".to_string(), "low".to_string());
+        request.customer_pricing = Some(pricing);
+
+        require(
+            matches!(
+                store.attach(request).await,
+                Err(AdmissionError::PricingUnavailable)
+            ),
+            "v4 admission priced a signed high-quality command as low quality",
+        )?;
+        let state: (String, i64, i64, i64, i64, i64, i64, i64) = sqlx::query_as(
+            r#"
+            SELECT session.state,
+                   (SELECT economics_contract_version FROM jobs WHERE job_id = $1)::BIGINT,
+                   (SELECT COUNT(*) FROM job_payloads WHERE job_id = $1),
+                   (SELECT COUNT(*) FROM job_outputs WHERE job_id = $1),
+                   (SELECT COUNT(*) FROM customer_price_quotes WHERE job_id = $1),
+                   (SELECT COUNT(*) FROM customer_price_quote_lines WHERE job_id = $1),
+                   (SELECT COUNT(*) FROM customer_billing_holds WHERE job_id = $1),
+                   (SELECT COUNT(*) FROM work_items WHERE job_id = $1)
+            FROM admission_sessions session
+            WHERE session.owner_token = $2
+            "#,
+        )
+        .bind(job_id)
+        .bind(owner_token)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(|error| format!("failed to inspect forged pricing dimensions: {error}"))?;
+        require(
+            state == ("receiving".to_string(), 1, 0, 0, 0, 0, 0, 0),
+            format!("forged pricing dimensions left partial state: {state:?}"),
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
+async fn customer_pricing_v4_rejects_forged_execution_model_without_partial_state() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        seed_customer_price_v4(&database.pool, 11).await?;
+        seed_billing_account(&database.pool, 1000).await?;
+
+        let store = PostgresAdmissionStore::new(database.pool.clone());
+        let (ticket, command_json) = claim_customer_pricing_owner(&store, 1).await?;
+        let owner_token = ticket.owner_token;
+        let job_id =
+            insert_job_for_ticket(&database.pool, &ticket, "tenant-a", "generation", None).await?;
+        seed_job_project_attribution(&database.pool, job_id).await?;
+        let mut request = attach_request(ticket, job_id);
+        request.command_json = command_json;
+        request.contract = AdmissionContract::CustomerPricingV4;
+        let mut pricing = customer_pricing_intent();
+        pricing.execution_model_id = "forged-execution-model".to_string();
+        request.customer_pricing = Some(pricing);
+
+        require(
+            matches!(
+                store.attach(request).await,
+                Err(AdmissionError::PricingUnavailable)
+            ),
+            "v4 admission accepted an execution model outside the frozen route mapping",
+        )?;
+        let state: (String, i64, i64, i64, i64, i64, i64, i64) = sqlx::query_as(
+            r#"
+            SELECT session.state,
+                   (SELECT economics_contract_version FROM jobs WHERE job_id = $1)::BIGINT,
+                   (SELECT COUNT(*) FROM job_payloads WHERE job_id = $1),
+                   (SELECT COUNT(*) FROM job_outputs WHERE job_id = $1),
+                   (SELECT COUNT(*) FROM customer_price_quotes WHERE job_id = $1),
+                   (SELECT COUNT(*) FROM customer_price_quote_lines WHERE job_id = $1),
+                   (SELECT COUNT(*) FROM customer_billing_holds WHERE job_id = $1),
+                   (SELECT COUNT(*) FROM work_items WHERE job_id = $1)
+            FROM admission_sessions session
+            WHERE session.owner_token = $2
+            "#,
+        )
+        .bind(job_id)
+        .bind(owner_token)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(|error| format!("failed to inspect forged v4 admission: {error}"))?;
+        require(
+            state == ("receiving".to_string(), 1, 0, 0, 0, 0, 0, 0),
+            format!("forged v4 admission left partial state: {state:?}"),
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
+async fn customer_pricing_v4_rejects_a_signed_provider_model_mismatch_without_partial_state()
+-> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        seed_customer_price_v4(&database.pool, 11).await?;
+        seed_billing_account(&database.pool, 1000).await?;
+
+        let store = PostgresAdmissionStore::new(database.pool.clone());
+        let (ticket, command_json) = claim_customer_pricing_owner_with_identity(
+            &store,
+            1,
+            "openai-codex",
+            "gpt-image-2-2026-04-21",
+            "openai-images-v1",
+        )
+        .await?;
+        let owner_token = ticket.owner_token;
+        let job_id =
+            insert_job_for_ticket(&database.pool, &ticket, "tenant-a", "generation", None).await?;
+        seed_job_project_attribution(&database.pool, job_id).await?;
+        let mut request = attach_request(ticket, job_id);
+        request.command_json = command_json;
+        request.contract = AdmissionContract::CustomerPricingV4;
+        request.customer_pricing = Some(customer_pricing_intent());
+
+        require(
+            matches!(
+                store.attach(request).await,
+                Err(AdmissionError::PricingUnavailable)
+            ),
+            "v4 admission accepted a signed provider model outside the frozen job and price",
+        )?;
+        let state: (String, i64, i64, i64, i64, i64, i64, i64) = sqlx::query_as(
+            r#"
+            SELECT session.state,
+                   (SELECT economics_contract_version FROM jobs WHERE job_id = $1)::BIGINT,
+                   (SELECT COUNT(*) FROM job_payloads WHERE job_id = $1),
+                   (SELECT COUNT(*) FROM job_outputs WHERE job_id = $1),
+                   (SELECT COUNT(*) FROM customer_price_quotes WHERE job_id = $1),
+                   (SELECT COUNT(*) FROM customer_price_quote_lines WHERE job_id = $1),
+                   (SELECT COUNT(*) FROM customer_billing_holds WHERE job_id = $1),
+                   (SELECT COUNT(*) FROM work_items WHERE job_id = $1)
+            FROM admission_sessions session
+            WHERE session.owner_token = $2
+            "#,
+        )
+        .bind(job_id)
+        .bind(owner_token)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(|error| format!("failed to inspect forged signed model: {error}"))?;
+        require(
+            state == ("receiving".to_string(), 1, 0, 0, 0, 0, 0, 0),
+            format!("forged signed provider model left partial state: {state:?}"),
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
+async fn customer_pricing_v4_concurrent_replay_creates_one_economic_identity() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        seed_customer_price_v4(&database.pool, 11).await?;
+        seed_billing_account(&database.pool, 1000).await?;
+
+        let store = PostgresAdmissionStore::new(database.pool.clone());
+        let (ticket, command_json) = claim_customer_pricing_owner(&store, 1).await?;
+        let job_id =
+            insert_job_for_ticket(&database.pool, &ticket, "tenant-a", "generation", None).await?;
+        seed_job_project_attribution(&database.pool, job_id).await?;
+        let mut request = attach_request(ticket, job_id);
+        request.command_json = command_json;
+        request.contract = AdmissionContract::CustomerPricingV4;
+        request.customer_pricing = Some(customer_pricing_intent());
+
+        let first_store = store.clone();
+        let first_request = request.clone();
+        let first = tokio::spawn(async move { first_store.attach(first_request).await });
+        let second = tokio::spawn(async move { store.attach(request).await });
+        let first = first
+            .await
+            .map_err(|error| format!("first concurrent v4 attach task failed: {error}"))?
+            .map_err(|error| format!("first concurrent v4 attach failed: {error:?}"))?;
+        let second = second
+            .await
+            .map_err(|error| format!("second concurrent v4 attach task failed: {error}"))?
+            .map_err(|error| format!("second concurrent v4 attach failed: {error:?}"))?;
+        require(
+            first == second,
+            "concurrent replay changed the work identity",
+        )?;
+
+        let state: (i64, i64, i64, i64, i64, i64, i64) = sqlx::query_as(
+            r#"
+            SELECT
+              (SELECT COUNT(*) FROM job_payloads WHERE job_id = $1),
+              (SELECT COUNT(*) FROM job_outputs WHERE job_id = $1),
+              (SELECT COUNT(*) FROM customer_price_quotes WHERE job_id = $1),
+              (SELECT COUNT(*) FROM customer_price_quote_lines WHERE job_id = $1),
+              (SELECT COUNT(*) FROM customer_billing_holds WHERE job_id = $1),
+              (SELECT COUNT(*) FROM work_items WHERE job_id = $1),
+              (SELECT held_micros FROM billing_accounts
+                WHERE tenant_id = 'tenant-a' AND currency = 'USD')
+            "#,
+        )
+        .bind(job_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(|error| format!("failed to inspect concurrent v4 admission: {error}"))?;
+        require(
+            state == (1, 1, 1, 3, 1, 1, 11),
+            format!("concurrent v4 admission duplicated economics: {state:?}"),
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
+async fn customer_pricing_v4_insufficient_credit_rolls_back_every_accept_effect() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        seed_customer_price_v4(&database.pool, 11).await?;
+        seed_billing_account(&database.pool, 5).await?;
+        let now: i64 = sqlx::query_scalar(
+            "SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT",
+        )
+        .fetch_one(&database.pool)
+        .await
+        .map_err(|error| format!("failed to read database time: {error}"))?;
+        sqlx::query(
+            r#"
+            INSERT INTO identity_organizations (
+                organization_id, display_name, organization_kind,
+                owner_user_id, created_at_ms, updated_at_ms
+            )
+            VALUES ('tenant-a', 'Admission tenant', 'system', NULL, $1, $1)
+            "#,
+        )
+        .bind(now)
+        .execute(&database.pool)
+        .await
+        .map_err(|error| format!("failed to seed grant organization: {error}"))?;
+        PostgresCreditGrantService::new(database.pool.clone())
+            .create(
+                "admission-insufficient-grant",
+                CreditGrantActor {
+                    user_id: Uuid::new_v4(),
+                    session_id: Uuid::new_v4(),
+                },
+                CreateCreditGrantRequest {
+                    organization_id: "tenant-a".to_string(),
+                    currency: "USD".to_string(),
+                    amount_micros: "5".to_string(),
+                    expires_at_ms: now + 86_400_000,
+                    source_reference: "admission-insufficient".to_string(),
+                    reason: "Admission rollback test".to_string(),
+                },
+            )
+            .await
+            .map_err(|error| format!("failed to issue test grant: {error:?}"))?;
+
+        let store = PostgresAdmissionStore::new(database.pool.clone());
+        let (ticket, command_json) = claim_customer_pricing_owner(&store, 1).await?;
+        let owner_token = ticket.owner_token;
+        let job_id =
+            insert_job_for_ticket(&database.pool, &ticket, "tenant-a", "generation", None).await?;
+        seed_job_project_attribution(&database.pool, job_id).await?;
+        let mut request = attach_request(ticket, job_id);
+        request.command_json = command_json;
+        request.contract = AdmissionContract::CustomerPricingV4;
+        request.customer_pricing = Some(customer_pricing_intent());
+
+        require(
+            matches!(
+                store.attach(request).await,
+                Err(AdmissionError::BillingLimitExceeded)
+            ),
+            "v4 accept ignored the billing credit limit",
+        )?;
+        let state: (String, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) = sqlx::query_as(
+            r#"
+            SELECT session.state,
+                   (SELECT economics_contract_version FROM jobs WHERE job_id = $1)::BIGINT,
+                   (SELECT COUNT(*) FROM job_outputs WHERE job_id = $1),
+                   (SELECT COUNT(*) FROM customer_price_quotes WHERE job_id = $1),
+                   (SELECT COUNT(*) FROM customer_price_quote_lines WHERE job_id = $1),
+                   (SELECT COUNT(*) FROM customer_billing_holds WHERE job_id = $1),
+                   (SELECT COUNT(*) FROM work_items WHERE job_id = $1),
+                   (SELECT held_micros FROM billing_accounts
+                     WHERE tenant_id = 'tenant-a' AND currency = 'USD'),
+                   (SELECT available_micros FROM credit_grants
+                     WHERE tenant_id = 'tenant-a' AND currency = 'USD'),
+                   (SELECT COUNT(*) FROM customer_billing_hold_grant_reservations
+                     WHERE tenant_id = 'tenant-a' AND currency = 'USD'),
+                   (SELECT COUNT(*) FROM credit_grant_events
+                     WHERE tenant_id = 'tenant-a' AND currency = 'USD'
+                       AND event_type = 'reserved')
+            FROM admission_sessions session
+            WHERE session.owner_token = $2
+            "#,
+        )
+        .bind(job_id)
+        .bind(owner_token)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(|error| format!("failed to inspect rejected v4 admission: {error}"))?;
+        require(
+            state == ("receiving".to_string(), 1, 0, 0, 0, 0, 0, 0, 5, 0, 0),
+            format!("rejected v4 admission left partial state: {state:?}"),
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
+async fn ark_profile_uses_the_dreamina_pricing_alias_without_losing_its_api_identity() -> TestResult
+{
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let price_id = Uuid::new_v4();
+        sqlx::query(
+            r#"
+            INSERT INTO price_versions
+              (price_version_id, price_key, version, api_profile, operation, provider_id, model,
+               billing_metric, billing_unit, currency,
+               success_micros, failed_micros, no_effect_micros, state,
+               created_at_ms, updated_at_ms)
+            VALUES ($1, 'dreamina-alias-test', 1, 'dreamina-cli-images-v1', 'generation',
+                    'openai-codex', 'gpt-image-2', 'output', 'output', 'USD',
+                    7, 0, 0, 'active', 1, 1)
+            "#,
+        )
+        .bind(price_id)
+        .execute(&database.pool)
+        .await
+        .map_err(|error| format!("failed to seed aliased price: {error}"))?;
+        sqlx::query(
+            r#"
+            INSERT INTO billing_accounts
+              (tenant_id, currency, credit_limit_micros, held_micros, captured_micros,
+               created_at_ms, updated_at_ms)
+            VALUES ('tenant-a', 'USD', 1000, 0, 0, 1, 1)
+            "#,
+        )
+        .execute(&database.pool)
+        .await
+        .map_err(|error| format!("failed to seed billing account: {error}"))?;
+
+        let store = PostgresAdmissionStore::new(database.pool.clone());
+        let mut claim = claim_request(None, "a".repeat(64));
+        claim.api_profile = "volcengine-ark-images-v3".to_owned();
+        let ticket = claim_owner(&store, claim).await?;
+        let job_id =
+            insert_job_for_ticket(&database.pool, &ticket, "tenant-a", "generation", None).await?;
+        let mut request = attach_request(ticket, job_id);
+        request.contract = AdmissionContract::OutputEconomicsV2;
+        store
+            .attach(request)
+            .await
+            .map_err(|error| format!("Ark attach failed: {error:?}"))?;
+
+        let frozen: (Uuid, String, i64) = sqlx::query_as(
+            r#"
+            SELECT q.price_version_id, s.api_profile, q.success_micros
+            FROM price_quotes q
+            JOIN admission_sessions s ON s.job_id = q.job_id
+            WHERE q.job_id = $1
+            "#,
+        )
+        .bind(job_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(|error| format!("failed to inspect aliased quote: {error}"))?;
+        require(
+            frozen == (price_id, "volcengine-ark-images-v3".to_owned(), 7),
+            format!("Ark pricing alias or API identity drifted: {frozen:?}"),
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
+async fn ark_specific_price_takes_precedence_over_a_more_specific_alias_price() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let alias_price_id = Uuid::new_v4();
+        let ark_price_id = Uuid::new_v4();
+        sqlx::query(
+            r#"
+            INSERT INTO price_versions
+              (price_version_id, price_key, version, api_profile, operation, provider_id, model,
+               billing_metric, billing_unit, currency,
+               success_micros, failed_micros, no_effect_micros, state,
+               created_at_ms, updated_at_ms)
+            VALUES
+              ($1, 'dreamina-specific-alias-test', 1, 'dreamina-cli-images-v1', 'generation',
+               'openai-codex', 'gpt-image-2', 'output', 'output', 'USD',
+               7, 0, 0, 'active', 1, 1),
+              ($2, 'ark-profile-override-test', 1, 'volcengine-ark-images-v3', '*',
+               '*', '*', 'output', 'output', 'USD',
+               11, 0, 0, 'active', 1, 1)
+            "#,
+        )
+        .bind(alias_price_id)
+        .bind(ark_price_id)
+        .execute(&database.pool)
+        .await
+        .map_err(|error| format!("failed to seed profile precedence prices: {error}"))?;
+        sqlx::query(
+            r#"
+            INSERT INTO billing_accounts
+              (tenant_id, currency, credit_limit_micros, held_micros, captured_micros,
+               created_at_ms, updated_at_ms)
+            VALUES ('tenant-a', 'USD', 1000, 0, 0, 1, 1)
+            "#,
+        )
+        .execute(&database.pool)
+        .await
+        .map_err(|error| format!("failed to seed billing account: {error}"))?;
+
+        let store = PostgresAdmissionStore::new(database.pool.clone());
+        let mut claim = claim_request(None, "b".repeat(64));
+        claim.api_profile = "volcengine-ark-images-v3".to_owned();
+        let ticket = claim_owner(&store, claim).await?;
+        let job_id =
+            insert_job_for_ticket(&database.pool, &ticket, "tenant-a", "generation", None).await?;
+        let mut request = attach_request(ticket, job_id);
+        request.contract = AdmissionContract::OutputEconomicsV2;
+        store
+            .attach(request)
+            .await
+            .map_err(|error| format!("Ark attach failed: {error:?}"))?;
+
+        let frozen: (Uuid, i64) = sqlx::query_as(
+            "SELECT price_version_id, success_micros FROM price_quotes WHERE job_id = $1",
+        )
+        .bind(job_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(|error| format!("failed to inspect Ark-specific quote: {error}"))?;
+        require(
+            frozen == (ark_price_id, 11),
+            format!("Ark-specific price did not take precedence: {frozen:?}"),
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
 async fn ready_claims_are_isolated_by_economics_contract() -> TestResult {
     let Some(database) = TestDatabase::new().await? else {
         return Ok(());
@@ -151,6 +1445,22 @@ async fn ready_claims_are_isolated_by_economics_contract() -> TestResult {
             .await
             .map_err(|error| format!("V2 attach failed: {error:?}"))?;
 
+        let v4_ticket = claim_owner(&store, claim_request(None, "6".repeat(64))).await?;
+        let v4_job =
+            insert_job_for_ticket(&database.pool, &v4_ticket, "tenant-a", "generation", None)
+                .await?;
+        store
+            .attach(attach_request(v4_ticket, v4_job))
+            .await
+            .map_err(|error| format!("v4 dispatcher fixture attach failed: {error:?}"))?;
+        sqlx::query(
+            "UPDATE jobs SET economics_contract_version = 4, updated_at_ms = 2 WHERE job_id = $1",
+        )
+        .bind(v4_job)
+        .execute(&database.pool)
+        .await
+        .map_err(|error| format!("failed to mark v4 dispatcher fixture: {error}"))?;
+
         let v2_lease = store
             .claim_ready(
                 "executor-handoff-worker",
@@ -165,6 +1475,20 @@ async fn ready_claims_are_isolated_by_economics_contract() -> TestResult {
             "V2 worker claimed the older LegacyV1 job",
         )?;
 
+        let v4_lease = store
+            .claim_ready(
+                "customer-pricing-worker",
+                30_000,
+                AdmissionContract::CustomerPricingV4,
+            )
+            .await
+            .map_err(|error| format!("v4 claim failed: {error:?}"))?
+            .ok_or_else(|| "v4 worker did not find v4 work".to_string())?;
+        require(
+            v4_lease.job_id == v4_job,
+            "v4 worker claimed another economics contract",
+        )?;
+
         let legacy_lease = store
             .claim_ready("legacy-worker", 30_000, AdmissionContract::LegacyV1)
             .await
@@ -173,6 +1497,98 @@ async fn ready_claims_are_isolated_by_economics_contract() -> TestResult {
         require(
             legacy_lease.job_id == legacy_job,
             "LegacyV1 worker claimed V2 work or the legacy job was starved",
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
+async fn ready_claims_are_isolated_by_provider_command_schema() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let store = PostgresAdmissionStore::new(database.pool.clone());
+
+        let codex_ticket = claim_owner(&store, claim_request(None, "3".repeat(64))).await?;
+        let codex_job = insert_job_for_ticket(
+            &database.pool,
+            &codex_ticket,
+            "tenant-a",
+            "generation",
+            None,
+        )
+        .await?;
+        store
+            .attach(attach_request(codex_ticket, codex_job))
+            .await
+            .map_err(|error| format!("Codex attach failed: {error:?}"))?;
+
+        let plan = XaiImageAdmissionPlan::for_grok_cli(XaiImageGenerationRequest {
+            aspect_ratio: None,
+            model: Some("grok-imagine-image-quality".to_owned()),
+            n: Some(1),
+            prompt: "a lighthouse".to_owned(),
+            resolution: Some(XaiImageResolution::R1k),
+            response_format: Some(XaiImageResponseFormat::B64Json),
+            storage_options: None,
+            user: None,
+        })
+        .map_err(|error| format!("xAI plan failed: {error}"))?;
+        let grok_ticket = claim_owner(
+            &store,
+            plan.claim(
+                Uuid::new_v4(),
+                "tenant-a",
+                "project-a",
+                format!("req_{}", Uuid::new_v4().simple()),
+                None,
+                i64::MAX,
+            ),
+        )
+        .await?;
+        let grok_job =
+            insert_job_for_ticket(&database.pool, &grok_ticket, "tenant-a", "generation", None)
+                .await?;
+        store
+            .attach(plan.attach(
+                grok_ticket,
+                grok_job,
+                "tenant:tenant-a",
+                AdmissionContract::LegacyV1,
+            ))
+            .await
+            .map_err(|error| format!("Grok attach failed: {error:?}"))?;
+
+        let grok_lease = store
+            .claim_ready_for_schema(
+                "grok-worker",
+                30_000,
+                AdmissionContract::LegacyV1,
+                GROK_IMAGE_GENERATION_COMMAND_SCHEMA,
+            )
+            .await
+            .map_err(|error| format!("Grok claim failed: {error:?}"))?
+            .ok_or_else(|| "Grok worker did not find Grok work".to_owned())?;
+        require(
+            grok_lease.job_id == grok_job,
+            "Grok worker claimed Codex work",
+        )?;
+
+        let codex_lease = store
+            .claim_ready_for_schema(
+                "codex-worker",
+                30_000,
+                AdmissionContract::LegacyV1,
+                GENERATION_COMMAND_SCHEMA,
+            )
+            .await
+            .map_err(|error| format!("Codex claim failed: {error:?}"))?
+            .ok_or_else(|| "Codex worker did not find Codex work".to_owned())?;
+        require(
+            codex_lease.job_id == codex_job,
+            "Codex worker claimed Grok work",
         )
     }
     .await;
@@ -1152,11 +2568,29 @@ fn attach_request_with_schedule(
     schedule_weight: u32,
     schedule_cost: u64,
 ) -> AttachJob {
+    let command = GenerationCommandV1 {
+        background: "auto".to_string(),
+        model: "gpt-image-2".to_string(),
+        moderation: None,
+        n: 1,
+        operation: "generation".to_string(),
+        output_compression: None,
+        output_format: "png".to_string(),
+        partial_images: 0,
+        prompt: "durable".to_string(),
+        provider_id: "openai-codex".to_string(),
+        quality: "high".to_string(),
+        schema_version: 1,
+        size: "1024x1024".to_string(),
+        source_api_profile: "openai-images-v1".to_string(),
+        stream: false,
+    };
     AttachJob {
         ticket,
         job_id,
         command_schema: "openai.images.generation.v1".to_string(),
-        command_json: json!({"prompt": "durable"}),
+        command_json: serde_json::to_value(command)
+            .expect("generation command fixture must serialize"),
         input_manifest: None,
         work_kind: "image_batch".to_string(),
         schedule_scope: schedule_scope.to_string(),
@@ -1164,7 +2598,1080 @@ fn attach_request_with_schedule(
         schedule_priority: 1,
         schedule_cost,
         contract: AdmissionContract::LegacyV1,
+        customer_pricing: None,
     }
+}
+
+fn customer_pricing_intent() -> CustomerPricingIntent {
+    CustomerPricingIntent {
+        public_model_id: "gpt-image-2".to_string(),
+        provider_model_id: "gpt-image-2".to_string(),
+        execution_model_id: "gpt-image-2".to_string(),
+        provider_command_hash: None,
+        media_kind: "image".to_string(),
+        service_tier: "standard".to_string(),
+        service_tier_decision:
+            gpt_image_2_gateway::service_tiers::ServiceTierDecision::for_default_only_project(
+                gpt_image_2_gateway::service_tiers::ProjectServiceTier::Default,
+            ),
+        execution_surface: "provider_cli".to_string(),
+        currency: "USD".to_string(),
+        pricing_dimensions: std::collections::BTreeMap::from([
+            ("quality".to_string(), "high".to_string()),
+            ("size".to_string(), "1024x1024".to_string()),
+        ]),
+        processing_mode: gpt_image_2_gateway::admission::PricingProcessingMode::Synchronous,
+    }
+}
+
+async fn claim_customer_pricing_owner(
+    store: &PostgresAdmissionStore,
+    output_count: u32,
+) -> TestResult<(AdmissionTicket, serde_json::Value)> {
+    claim_customer_pricing_owner_with_identity(
+        store,
+        output_count,
+        "openai-codex",
+        "gpt-image-2",
+        "openai-images-v1",
+    )
+    .await
+}
+
+async fn claim_customer_pricing_owner_with_ticket_hash(
+    store: &PostgresAdmissionStore,
+    output_count: u32,
+    ticket_hash: String,
+) -> TestResult<(AdmissionTicket, serde_json::Value, String)> {
+    let command = GenerationCommandV1 {
+        background: "auto".to_string(),
+        model: "gpt-image-2".to_string(),
+        moderation: None,
+        n: output_count,
+        operation: "generation".to_string(),
+        output_compression: None,
+        output_format: "png".to_string(),
+        partial_images: 0,
+        prompt: "durable customer price".to_string(),
+        provider_id: "openai-codex".to_string(),
+        quality: "high".to_string(),
+        schema_version: 1,
+        size: "1024x1024".to_string(),
+        source_api_profile: "openai-images-v1".to_string(),
+        stream: false,
+    };
+    let command_hash = command.request_hash_hex();
+    let ticket = claim_owner(store, claim_request(None, ticket_hash)).await?;
+    let command_json = serde_json::to_value(command)
+        .map_err(|error| format!("failed to encode v4 generation command: {error}"))?;
+    Ok((ticket, command_json, command_hash))
+}
+
+async fn claim_customer_pricing_owner_with_identity(
+    store: &PostgresAdmissionStore,
+    output_count: u32,
+    provider_id: &str,
+    model: &str,
+    api_profile: &str,
+) -> TestResult<(AdmissionTicket, serde_json::Value)> {
+    let command = GenerationCommandV1 {
+        background: "auto".to_string(),
+        model: model.to_string(),
+        moderation: None,
+        n: output_count,
+        operation: "generation".to_string(),
+        output_compression: None,
+        output_format: "png".to_string(),
+        partial_images: 0,
+        prompt: "durable customer price".to_string(),
+        provider_id: provider_id.to_string(),
+        quality: "high".to_string(),
+        schema_version: 1,
+        size: "1024x1024".to_string(),
+        source_api_profile: api_profile.to_string(),
+        stream: false,
+    };
+    let request_hash = command.request_hash_hex();
+    let ticket = claim_owner(store, claim_request(None, request_hash)).await?;
+    let command_json = serde_json::to_value(command)
+        .map_err(|error| format!("failed to encode v4 generation command: {error}"))?;
+    Ok((ticket, command_json))
+}
+
+async fn seed_customer_price_v4(pool: &PgPool, success_micros: i64) -> TestResult {
+    seed_customer_price_v4_for_operation(pool, "generation", success_micros).await
+}
+
+async fn seed_customer_price_v4_for_operation(
+    pool: &PgPool,
+    operation: &str,
+    success_micros: i64,
+) -> TestResult {
+    let price_book_id = Uuid::new_v4();
+    let version_id = Uuid::new_v4();
+    sqlx::query(
+        r#"
+        INSERT INTO price_books (
+            price_book_id, price_book_key, display_name, purpose,
+            scope_type, organization_id, project_id, provider_id,
+            currency, state, control_version, created_at_ms, updated_at_ms
+        )
+        VALUES (
+            $1, $2, 'Admission test customer price', 'customer_sale',
+            'platform', NULL, NULL, 'openai-codex',
+            'USD', 'active', 1, 1, 1
+        )
+        "#,
+    )
+    .bind(price_book_id)
+    .bind(format!("admission-test-{}", price_book_id.simple()))
+    .execute(pool)
+    .await
+    .map_err(|error| format!("failed to seed v4 price book: {error}"))?;
+    sqlx::query(
+        r#"
+        INSERT INTO price_book_versions (
+            price_book_version_id, price_book_id, version,
+            api_profile, operation, provider_id, provider_model_id,
+            public_model_id, media_kind, service_tier, execution_surface,
+            billing_mode, is_free, state, effective_from_ms,
+            effective_until_ms, source_kind, source_url,
+            source_checked_at_ms, notes, control_version,
+            created_at_ms, updated_at_ms
+        )
+        VALUES (
+            $1, $2, 1, 'openai-images-v1', $3,
+            'openai-codex', 'gpt-image-2', 'gpt-image-2',
+            'image', 'standard', 'provider_cli', 'customer_rate',
+            FALSE, 'draft', 0, NULL, 'manual', NULL, NULL, NULL, 1, 1, 1
+        )
+        "#,
+    )
+    .bind(version_id)
+    .bind(price_book_id)
+    .bind(operation)
+    .execute(pool)
+    .await
+    .map_err(|error| format!("failed to seed v4 price version: {error}"))?;
+    for (outcome, unit_price_micros) in [
+        ("succeeded", success_micros),
+        ("failed", 0),
+        ("no_effect", 0),
+    ] {
+        sqlx::query(
+            r#"
+            INSERT INTO price_components (
+                price_component_id, price_book_version_id, component_key,
+                metric, unit, unit_size, unit_price_micros, outcome,
+                quantity_source, required_confidence, rounding_mode,
+                dimensions_json, created_at_ms
+            )
+            VALUES (
+                $1, $2, $3, 'image_output', 'image', 1, $4, $5,
+                'request_derived', 'exact', 'exact',
+                '{"quality":"high","size":"1024x1024"}'::JSONB, 1
+            )
+            "#,
+        )
+        .bind(Uuid::new_v4())
+        .bind(version_id)
+        .bind(format!("image-output-{outcome}"))
+        .bind(unit_price_micros)
+        .bind(outcome)
+        .execute(pool)
+        .await
+        .map_err(|error| format!("failed to seed {outcome} v4 price component: {error}"))?;
+    }
+    bind_test_surface_contract(pool, version_id, None, None).await?;
+    sqlx::query(
+        r#"
+        UPDATE price_book_versions
+        SET state = 'active', control_version = control_version + 1,
+            updated_at_ms = 2
+        WHERE price_book_version_id = $1 AND state = 'draft'
+        "#,
+    )
+    .bind(version_id)
+    .execute(pool)
+    .await
+    .map_err(|error| format!("failed to publish v4 price version: {error}"))?;
+    Ok(())
+}
+
+async fn seed_dreamina_customer_price_v4(pool: &PgPool, success_micros: i64) -> TestResult {
+    let price_book_id = Uuid::new_v4();
+    let version_id = Uuid::new_v4();
+    sqlx::query(
+        r#"
+        INSERT INTO price_books (
+            price_book_id, price_book_key, display_name, purpose,
+            scope_type, organization_id, project_id, provider_id,
+            currency, state, control_version, created_at_ms, updated_at_ms
+        )
+        VALUES (
+            $1, $2, 'Dreamina admission customer price', 'customer_sale',
+            'platform', NULL, NULL, 'dreamina-cli',
+            'USD', 'active', 1, 1, 1
+        )
+        "#,
+    )
+    .bind(price_book_id)
+    .bind(format!(
+        "dreamina-admission-test-{}",
+        price_book_id.simple()
+    ))
+    .execute(pool)
+    .await
+    .map_err(|error| format!("failed to seed Dreamina v4 price book: {error}"))?;
+    sqlx::query(
+        r#"
+        INSERT INTO price_book_versions (
+            price_book_version_id, price_book_id, version,
+            api_profile, operation, provider_id, provider_model_id,
+            public_model_id, media_kind, service_tier, execution_surface,
+            billing_mode, is_free, state, effective_from_ms,
+            effective_until_ms, source_kind, source_url,
+            source_checked_at_ms, notes, control_version,
+            created_at_ms, updated_at_ms
+        )
+        VALUES (
+            $1, $2, 1, 'dreamina-cli-images-v1', 'generation',
+            'dreamina-cli', '5.0', '*',
+            'image', 'standard', 'provider_cli', 'customer_rate',
+            FALSE, 'draft', 0, NULL, 'official_document',
+            'https://www.volcengine.com/docs/82379/1544106',
+            1, 'Dreamina image customer rate', 1, 1, 1
+        )
+        "#,
+    )
+    .bind(version_id)
+    .bind(price_book_id)
+    .execute(pool)
+    .await
+    .map_err(|error| format!("failed to seed Dreamina v4 price version: {error}"))?;
+    for (outcome, unit_price_micros) in [
+        ("succeeded", success_micros),
+        ("failed", 0),
+        ("no_effect", 0),
+    ] {
+        sqlx::query(
+            r#"
+            INSERT INTO price_components (
+                price_component_id, price_book_version_id, component_key,
+                metric, unit, unit_size, unit_price_micros, outcome,
+                quantity_source, required_confidence, rounding_mode,
+                dimensions_json, created_at_ms
+            )
+            VALUES (
+                $1, $2, $3, 'image_output', 'image', 1, $4, $5,
+                'request_derived', 'exact', 'exact',
+                '{"ratio":"16:9","resolution_type":"2k"}'::JSONB, 1
+            )
+            "#,
+        )
+        .bind(Uuid::new_v4())
+        .bind(version_id)
+        .bind(format!("dreamina-image-output-{outcome}"))
+        .bind(unit_price_micros)
+        .bind(outcome)
+        .execute(pool)
+        .await
+        .map_err(|error| format!("failed to seed Dreamina {outcome} component: {error}"))?;
+    }
+    bind_test_surface_contract(
+        pool,
+        version_id,
+        Some(ARK_IMAGES_API_PROFILE),
+        Some("doubao-seedream-5-0-lite"),
+    )
+    .await?;
+    sqlx::query(
+        r#"
+        UPDATE price_book_versions
+        SET state = 'active', control_version = control_version + 1,
+            updated_at_ms = 2
+        WHERE price_book_version_id = $1 AND state = 'draft'
+        "#,
+    )
+    .bind(version_id)
+    .execute(pool)
+    .await
+    .map_err(|error| format!("failed to publish Dreamina v4 price version: {error}"))?;
+    Ok(())
+}
+
+async fn seed_dreamina_video_customer_price_v4(
+    pool: &PgPool,
+    success_micros_per_second: i64,
+) -> TestResult {
+    let price_book_id = Uuid::new_v4();
+    let version_id = Uuid::new_v4();
+    sqlx::query(
+        r#"
+        INSERT INTO price_books (
+            price_book_id, price_book_key, display_name, purpose,
+            scope_type, organization_id, project_id, provider_id,
+            currency, state, control_version, created_at_ms, updated_at_ms
+        )
+        VALUES (
+            $1, $2, 'Dreamina video admission customer price', 'customer_sale',
+            'platform', NULL, NULL, 'dreamina-cli',
+            'USD', 'active', 1, 1, 1
+        )
+        "#,
+    )
+    .bind(price_book_id)
+    .bind(format!(
+        "dreamina-video-admission-test-{}",
+        price_book_id.simple()
+    ))
+    .execute(pool)
+    .await
+    .map_err(|error| format!("failed to seed Dreamina video price book: {error}"))?;
+    sqlx::query(
+        r#"
+        INSERT INTO price_book_versions (
+            price_book_version_id, price_book_id, version,
+            api_profile, operation, provider_id, provider_model_id,
+            public_model_id, media_kind, service_tier, execution_surface,
+            billing_mode, is_free, state, effective_from_ms,
+            effective_until_ms, source_kind, source_url,
+            source_checked_at_ms, notes, control_version,
+            created_at_ms, updated_at_ms
+        )
+        VALUES (
+            $1, $2, 1, 'dreamina-cli-videos-v1', 'video_generation',
+            'dreamina-cli', 'seedance2.0fast', '*',
+            'video', 'standard', 'provider_cli', 'customer_rate',
+            FALSE, 'draft', 0, NULL, 'manual', NULL,
+            1, 'Platform customer sale rate; not an Ark provider-cost claim', 1, 1, 1
+        )
+        "#,
+    )
+    .bind(version_id)
+    .bind(price_book_id)
+    .execute(pool)
+    .await
+    .map_err(|error| format!("failed to seed Dreamina video price version: {error}"))?;
+    for (outcome, unit_price_micros) in [
+        ("succeeded", success_micros_per_second),
+        ("failed", 0),
+        ("no_effect", 0),
+    ] {
+        sqlx::query(
+            r#"
+            INSERT INTO price_components (
+                price_component_id, price_book_version_id, component_key,
+                metric, unit, unit_size, unit_price_micros, outcome,
+                quantity_source, required_confidence, rounding_mode,
+                dimensions_json, created_at_ms
+            )
+            VALUES (
+                $1, $2, $3, 'video_requested_second', 'second', 1, $4, $5,
+                'request_derived', 'exact', 'exact',
+                '{"duration":"8","ratio":"9:16","resolution":"720p"}'::JSONB, 1
+            )
+            "#,
+        )
+        .bind(Uuid::new_v4())
+        .bind(version_id)
+        .bind(format!("dreamina-video-output-{outcome}"))
+        .bind(unit_price_micros)
+        .bind(outcome)
+        .execute(pool)
+        .await
+        .map_err(|error| format!("failed to seed Dreamina video {outcome} component: {error}"))?;
+    }
+    bind_test_surface_contract(
+        pool,
+        version_id,
+        Some(ARK_CONTENT_GENERATION_API_PROFILE),
+        Some("doubao-seedance-2-0-fast-260128"),
+    )
+    .await?;
+    sqlx::query(
+        r#"
+        UPDATE price_book_versions
+        SET state = 'active', control_version = control_version + 1,
+            updated_at_ms = 2
+        WHERE price_book_version_id = $1 AND state = 'draft'
+        "#,
+    )
+    .bind(version_id)
+    .execute(pool)
+    .await
+    .map_err(|error| format!("failed to publish Dreamina video price version: {error}"))?;
+    Ok(())
+}
+
+async fn bind_test_surface_contract(
+    pool: &PgPool,
+    version_id: Uuid,
+    api_profile: Option<&str>,
+    public_model_id: Option<&str>,
+) -> TestResult {
+    let identity: (
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+    ) = sqlx::query_as(
+        r#"
+            SELECT version.api_profile, version.operation,
+                   COALESCE(version.provider_id, book.provider_id, 'test-provider'),
+                   COALESCE(version.provider_model_id, version.public_model_id),
+                   version.public_model_id, version.media_kind,
+                   version.service_tier, version.execution_surface
+            FROM price_book_versions version
+            JOIN price_books book ON book.price_book_id = version.price_book_id
+            WHERE version.price_book_version_id = $1
+            "#,
+    )
+    .bind(version_id)
+    .fetch_one(pool)
+    .await
+    .map_err(|error| format!("failed to load test surface identity: {error}"))?;
+    let api_profile = api_profile.unwrap_or(&identity.0);
+    let public_model_id = public_model_id.unwrap_or(&identity.4);
+    let contract_key = format!("test.admission-surface.{}", version_id.simple());
+    sqlx::query(
+        r#"
+        INSERT INTO pricing_surface_contract_revisions (
+            contract_key, revision, contract_hash, contract_schema_version,
+            api_profile, operation, provider_id, provider_model_id,
+            public_model_id, media_kind, service_tier, execution_surface,
+            normalizer_key, normalizer_revision, contract_json, created_at_ms
+        )
+        VALUES (
+            $1, 1, repeat('b', 64), 1,
+            $2, $3, $4, $5, $6, $7, $8, $9,
+            'test.admission-surface', 1, '{}'::JSONB, 1
+        )
+        "#,
+    )
+    .bind(&contract_key)
+    .bind(api_profile)
+    .bind(&identity.1)
+    .bind(&identity.2)
+    .bind(&identity.3)
+    .bind(public_model_id)
+    .bind(&identity.5)
+    .bind(&identity.6)
+    .bind(&identity.7)
+    .execute(pool)
+    .await
+    .map_err(|error| format!("failed to seed test surface contract: {error}"))?;
+    sqlx::query(
+        r#"
+        INSERT INTO price_book_version_surface_contract_bindings (
+            price_book_version_id, contract_key, contract_revision,
+            contract_hash, bound_at_ms
+        )
+        VALUES ($1, $2, 1, repeat('b', 64), 1)
+        "#,
+    )
+    .bind(version_id)
+    .bind(&contract_key)
+    .execute(pool)
+    .await
+    .map_err(|error| format!("failed to bind test surface contract: {error}"))?;
+    Ok(())
+}
+
+async fn seed_customer_token_price_v4(pool: &PgPool) -> TestResult {
+    let price_book_id = Uuid::new_v4();
+    let version_id = Uuid::new_v4();
+    sqlx::query(
+        r#"
+        INSERT INTO price_books (
+            price_book_id, price_book_key, display_name, purpose,
+            scope_type, organization_id, project_id, provider_id,
+            currency, state, control_version, created_at_ms, updated_at_ms
+        )
+        VALUES (
+            $1, $2, 'Admission test official token price', 'customer_sale',
+            'platform', NULL, NULL, 'openai-codex',
+            'USD', 'active', 1, 1, 1
+        )
+        "#,
+    )
+    .bind(price_book_id)
+    .bind(format!("admission-token-test-{}", price_book_id.simple()))
+    .execute(pool)
+    .await
+    .map_err(|error| format!("failed to seed token price book: {error}"))?;
+    sqlx::query(
+        r#"
+        INSERT INTO price_book_versions (
+            price_book_version_id, price_book_id, version,
+            api_profile, operation, provider_id, provider_model_id,
+            public_model_id, media_kind, service_tier, execution_surface,
+            billing_mode, is_free, state, effective_from_ms,
+            effective_until_ms, source_kind, source_url,
+            source_checked_at_ms, notes, control_version,
+            created_at_ms, updated_at_ms
+        )
+        VALUES (
+            $1, $2, 1, 'openai-images-v1', 'generation',
+            'openai-codex', 'gpt-image-2', 'gpt-image-2',
+            'image', 'standard', 'provider_cli', 'customer_rate',
+            FALSE, 'draft', 0, NULL, 'official_document',
+            'https://developers.openai.com/api/docs/guides/image-generation',
+            1, 'Official GPT Image 2 output token estimator', 1, 1, 1
+        )
+        "#,
+    )
+    .bind(version_id)
+    .bind(price_book_id)
+    .execute(pool)
+    .await
+    .map_err(|error| format!("failed to seed token price version: {error}"))?;
+    for (outcome, unit_price_micros) in [
+        ("succeeded", 30_000_000_i64),
+        ("failed", 0_i64),
+        ("no_effect", 0_i64),
+    ] {
+        sqlx::query(
+            r#"
+            INSERT INTO price_components (
+                price_component_id, price_book_version_id, component_key,
+                metric, unit, unit_size, unit_price_micros, outcome,
+                quantity_source, required_confidence, rounding_mode,
+                dimensions_json, created_at_ms
+            )
+            VALUES (
+                $1, $2, $3, 'image_output_token', 'token', 1000000, $4, $5,
+                'official_lookup', 'estimated', 'exact',
+                '{"quality":"high","size":"1024x1024"}'::JSONB, 1
+            )
+            "#,
+        )
+        .bind(Uuid::new_v4())
+        .bind(version_id)
+        .bind(format!("image-output-token-{outcome}"))
+        .bind(unit_price_micros)
+        .bind(outcome)
+        .execute(pool)
+        .await
+        .map_err(|error| format!("failed to seed {outcome} token component: {error}"))?;
+    }
+    let contract_key = format!("test.legacy-token.{}", version_id.simple());
+    sqlx::query(
+        r#"
+        INSERT INTO pricing_surface_contract_revisions (
+            contract_key, revision, contract_hash, contract_schema_version,
+            api_profile, operation, provider_id, provider_model_id,
+            public_model_id, media_kind, service_tier, execution_surface,
+            normalizer_key, normalizer_revision, contract_json, created_at_ms
+        )
+        VALUES (
+            $1, 1, repeat('a', 64), 1,
+            'openai-images-v1', 'generation', 'openai-codex', 'gpt-image-2',
+            'gpt-image-2', 'image', 'standard', 'provider_cli',
+            'test.legacy-token', 1, '{}'::JSONB, 1
+        )
+        "#,
+    )
+    .bind(&contract_key)
+    .execute(pool)
+    .await
+    .map_err(|error| format!("failed to seed legacy token surface contract: {error}"))?;
+    sqlx::query(
+        r#"
+        INSERT INTO price_book_version_surface_contract_bindings (
+            price_book_version_id, contract_key, contract_revision,
+            contract_hash, bound_at_ms
+        )
+        VALUES ($1, $2, 1, repeat('a', 64), 1)
+        "#,
+    )
+    .bind(version_id)
+    .bind(&contract_key)
+    .execute(pool)
+    .await
+    .map_err(|error| format!("failed to bind legacy token surface contract: {error}"))?;
+    sqlx::query(
+        r#"
+        UPDATE price_book_versions
+        SET state = 'active', control_version = control_version + 1,
+            updated_at_ms = 2
+        WHERE price_book_version_id = $1 AND state = 'draft'
+        "#,
+    )
+    .bind(version_id)
+    .execute(pool)
+    .await
+    .map_err(|error| format!("failed to publish token price version: {error}"))?;
+    Ok(())
+}
+
+async fn seed_billing_account(pool: &PgPool, credit_limit_micros: i64) -> TestResult {
+    sqlx::query(
+        r#"
+        INSERT INTO billing_accounts (
+            tenant_id, currency, credit_limit_micros,
+            held_micros, captured_micros, created_at_ms, updated_at_ms
+        )
+        VALUES ('tenant-a', 'USD', $1, 0, 0, 1, 1)
+        "#,
+    )
+    .bind(credit_limit_micros)
+    .execute(pool)
+    .await
+    .map_err(|error| format!("failed to seed v4 billing account: {error}"))?;
+    Ok(())
+}
+
+async fn seed_project_spend_budget(
+    pool: &PgPool,
+    limit_type: &str,
+    monthly_budget_micros: i64,
+) -> TestResult {
+    let actor_user_id = Uuid::new_v4();
+    sqlx::query(
+        r#"
+        INSERT INTO identity_users(
+            user_id, normalized_email, display_name, roles, scopes,
+            created_at_ms, updated_at_ms
+        )
+        VALUES (
+            $1, $2, 'Admission budget actor',
+            ARRAY['platform_owner'], ARRAY['admin:*'], 1, 1
+        )
+        "#,
+    )
+    .bind(actor_user_id)
+    .bind(format!("budget-{}@admission.test", actor_user_id.simple()))
+    .execute(pool)
+    .await
+    .map_err(|error| format!("failed to seed project budget actor: {error}"))?;
+    sqlx::query(
+        r#"
+        INSERT INTO project_spend_budgets(
+            project_id, organization_id, currency, monthly_budget_micros,
+            limit_type, created_by_user_id, updated_by_user_id,
+            created_at_ms, updated_at_ms
+        )
+        VALUES (
+            'project-a', 'tenant-a', 'USD', $1,
+            $2, $3, $3, 1, 1
+        )
+        "#,
+    )
+    .bind(monthly_budget_micros)
+    .bind(limit_type)
+    .bind(actor_user_id)
+    .execute(pool)
+    .await
+    .map_err(|error| format!("failed to seed project spend budget: {error}"))?;
+    Ok(())
+}
+
+async fn seed_job_project_attribution(pool: &PgPool, job_id: Uuid) -> TestResult {
+    seed_codex_job_project_attribution(
+        pool,
+        job_id,
+        "images.generations",
+        GENERATION_COMMAND_SCHEMA,
+    )
+    .await
+}
+
+async fn seed_codex_job_project_attribution(
+    pool: &PgPool,
+    job_id: Uuid,
+    operation_id: &str,
+    command_schema: &str,
+) -> TestResult {
+    let route_id = Uuid::new_v4();
+    let route_key = format!("admission.{}", route_id.simple());
+    sqlx::query(
+        r#"
+        INSERT INTO gateway_projects (id, tenant_id, name, created_at, archived_at)
+        VALUES ('project-a', 'tenant-a', 'Admission test project', 1, NULL)
+        ON CONFLICT (id) DO NOTHING
+        "#,
+    )
+    .execute(pool)
+    .await
+    .map_err(|error| format!("failed to seed v4 project: {error}"))?;
+    sqlx::query(
+        r#"
+        INSERT INTO job_auth_attributions (
+            job_id, tenant_id, project_id, service_account_id, api_key_id,
+            credential_authz_version, actor_user_id, actor_session_id,
+            actor_authz_version, route_provider_id, route_operation_id,
+            route_command_schema, route_id, route_revision,
+            auth_kind, admitted_at_ms
+        )
+        VALUES (
+            $1, 'tenant-a', 'project-a', NULL, NULL,
+            NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+            'legacy', 1
+        )
+        "#,
+    )
+    .bind(job_id)
+    .execute(pool)
+    .await
+    .map_err(|error| format!("failed to seed v4 job attribution: {error}"))?;
+    sqlx::query(
+        r#"
+        INSERT INTO provider_models (
+            provider_id, model_id, execution_model_id, media_kind,
+            display_name, adapter_state, lifecycle_state, operation_ids,
+            source_kind, first_seen_at_ms, last_seen_at_ms, metadata_json
+        )
+        VALUES (
+            'openai-codex', 'gpt-image-2', 'gpt-image-2', 'image',
+            'GPT Image 2', 'supported', 'enabled',
+            ARRAY[$1], 'adapter_contract', 1, 1, '{}'::JSONB
+        )
+        ON CONFLICT (provider_id, model_id, media_kind) DO NOTHING
+        "#,
+    )
+    .bind(operation_id)
+    .execute(pool)
+    .await
+    .map_err(|error| format!("failed to seed v4 provider model: {error}"))?;
+    sqlx::query(
+        r#"
+        INSERT INTO provider_routes (
+            route_id, revision, route_key, display_name, provider_id,
+            operation_id, command_schema, route_kind,
+            selection_strategy, state, created_at_ms
+        )
+        VALUES (
+            $1, 1, $2, 'Admission test route', 'openai-codex',
+            $3, $4,
+            'account', 'quota_aware_least_loaded', 'enabled', 1
+        )
+        "#,
+    )
+    .bind(route_id)
+    .bind(route_key)
+    .bind(operation_id)
+    .bind(command_schema)
+    .execute(pool)
+    .await
+    .map_err(|error| format!("failed to seed v4 provider route: {error}"))?;
+    sqlx::query(
+        r#"
+        INSERT INTO provider_route_model_mappings (
+            route_id, route_revision, provider_id, operation_id,
+            command_schema, api_profile, public_model_id,
+            provider_model_id, execution_model_id, media_kind, created_at_ms
+        )
+        VALUES (
+            $1, 1, 'openai-codex', $2,
+            $3, 'openai-images-v1',
+            'gpt-image-2', 'gpt-image-2', 'gpt-image-2', 'image', 1
+        )
+        "#,
+    )
+    .bind(route_id)
+    .bind(operation_id)
+    .bind(command_schema)
+    .execute(pool)
+    .await
+    .map_err(|error| format!("failed to seed v4 model mapping: {error}"))?;
+    sqlx::query(
+        r#"
+        INSERT INTO job_provider_route_attributions (
+            job_id, tenant_id, api_key_id, provider_id, operation_id,
+            command_schema, route_id, route_revision, attributed_at_ms
+        )
+        VALUES (
+            $1, 'tenant-a', NULL, 'openai-codex', $2,
+            $3, $4, 1, 1
+        )
+        "#,
+    )
+    .bind(job_id)
+    .bind(operation_id)
+    .bind(command_schema)
+    .bind(route_id)
+    .execute(pool)
+    .await
+    .map_err(|error| format!("failed to seed v4 route attribution: {error}"))?;
+    Ok(())
+}
+
+async fn seed_dreamina_job_project_attribution(
+    pool: &PgPool,
+    job_id: Uuid,
+    api_profile: &str,
+    public_model_id: &str,
+) -> TestResult {
+    let route_id = Uuid::new_v4();
+    let route_key = format!("dreamina-admission.{}", route_id.simple());
+    sqlx::query(
+        r#"
+        INSERT INTO gateway_projects (id, tenant_id, name, created_at, archived_at)
+        VALUES ('project-a', 'tenant-a', 'Admission test project', 1, NULL)
+        ON CONFLICT (id) DO NOTHING
+        "#,
+    )
+    .execute(pool)
+    .await
+    .map_err(|error| format!("failed to seed Dreamina project: {error}"))?;
+    sqlx::query(
+        r#"
+        INSERT INTO job_auth_attributions (
+            job_id, tenant_id, project_id, service_account_id, api_key_id,
+            credential_authz_version, actor_user_id, actor_session_id,
+            actor_authz_version, route_provider_id, route_operation_id,
+            route_command_schema, route_id, route_revision,
+            auth_kind, admitted_at_ms
+        )
+        VALUES (
+            $1, 'tenant-a', 'project-a', NULL, NULL,
+            NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+            'legacy', 1
+        )
+        "#,
+    )
+    .bind(job_id)
+    .execute(pool)
+    .await
+    .map_err(|error| format!("failed to seed Dreamina job attribution: {error}"))?;
+    sqlx::query(
+        r#"
+        INSERT INTO provider_models (
+            provider_id, model_id, execution_model_id, media_kind,
+            display_name, adapter_state, lifecycle_state, operation_ids,
+            source_kind, first_seen_at_ms, last_seen_at_ms, metadata_json
+        )
+        VALUES (
+            'dreamina-cli', '5.0', 'dreamina-image-5.0', 'image',
+            'Dreamina Image 5.0', 'supported', 'enabled',
+            ARRAY['images.generations'], 'adapter_contract', 1, 1, '{}'::JSONB
+        )
+        "#,
+    )
+    .execute(pool)
+    .await
+    .map_err(|error| format!("failed to seed Dreamina provider model: {error}"))?;
+    sqlx::query(
+        r#"
+        INSERT INTO provider_routes (
+            route_id, revision, route_key, display_name, provider_id,
+            operation_id, command_schema, route_kind,
+            selection_strategy, state, created_at_ms
+        )
+        VALUES (
+            $1, 1, $2, 'Dreamina admission test route', 'dreamina-cli',
+            'images.generations', $3,
+            'account', 'quota_aware_least_loaded', 'enabled', 1
+        )
+        "#,
+    )
+    .bind(route_id)
+    .bind(route_key)
+    .bind(DREAMINA_SUBMIT_COMMAND_SCHEMA)
+    .execute(pool)
+    .await
+    .map_err(|error| format!("failed to seed Dreamina provider route: {error}"))?;
+    sqlx::query(
+        r#"
+        INSERT INTO provider_route_model_mappings (
+            route_id, route_revision, provider_id, operation_id,
+            command_schema, api_profile, public_model_id,
+            provider_model_id, execution_model_id, media_kind, created_at_ms
+        )
+        VALUES (
+            $1, 1, 'dreamina-cli', 'images.generations',
+            $2, $3, $4, '5.0', 'dreamina-image-5.0', 'image', 1
+        )
+        "#,
+    )
+    .bind(route_id)
+    .bind(DREAMINA_SUBMIT_COMMAND_SCHEMA)
+    .bind(api_profile)
+    .bind(public_model_id)
+    .execute(pool)
+    .await
+    .map_err(|error| format!("failed to seed Dreamina model mapping: {error}"))?;
+    sqlx::query(
+        r#"
+        INSERT INTO job_provider_route_attributions (
+            job_id, tenant_id, api_key_id, provider_id, operation_id,
+            command_schema, route_id, route_revision, attributed_at_ms
+        )
+        VALUES (
+            $1, 'tenant-a', NULL, 'dreamina-cli', 'images.generations',
+            $2, $3, 1, 1
+        )
+        "#,
+    )
+    .bind(job_id)
+    .bind(DREAMINA_SUBMIT_COMMAND_SCHEMA)
+    .bind(route_id)
+    .execute(pool)
+    .await
+    .map_err(|error| format!("failed to seed Dreamina route attribution: {error}"))?;
+    Ok(())
+}
+
+async fn configure_dreamina_video_job(pool: &PgPool, job_id: Uuid, duration: u8) -> TestResult {
+    sqlx::query(
+        r#"
+        UPDATE jobs
+        SET provider_id = 'dreamina-cli',
+            model = $3,
+            requested_units = $2,
+            output_count = 1,
+            billable_units = $2,
+            billing_metric = 'video_second',
+            billing_unit = 'second'
+        WHERE job_id = $1
+        "#,
+    )
+    .bind(job_id)
+    .bind(i32::from(duration))
+    .bind(DREAMINA_VIDEO_EXECUTION_MODEL)
+    .execute(pool)
+    .await
+    .map_err(|error| format!("failed to configure Dreamina video job: {error}"))?;
+    sqlx::query(
+        r#"
+        UPDATE quota_reservations
+        SET requested_units = $2,
+            remaining_5h = limit_5h - $2,
+            remaining_7d = limit_7d - $2,
+            billing_metric = 'video_second',
+            billing_unit = 'second'
+        WHERE job_id = $1
+        "#,
+    )
+    .bind(job_id)
+    .bind(i32::from(duration))
+    .execute(pool)
+    .await
+    .map_err(|error| format!("failed to configure Dreamina video quota: {error}"))?;
+    Ok(())
+}
+
+async fn seed_dreamina_video_job_project_attribution(
+    pool: &PgPool,
+    job_id: Uuid,
+    api_profile: &str,
+    public_model_id: &str,
+) -> TestResult {
+    let route_id = Uuid::new_v4();
+    let route_key = format!("dreamina-video-admission.{}", route_id.simple());
+    sqlx::query(
+        r#"
+        INSERT INTO gateway_projects (id, tenant_id, name, created_at, archived_at)
+        VALUES ('project-a', 'tenant-a', 'Admission test project', 1, NULL)
+        ON CONFLICT (id) DO NOTHING
+        "#,
+    )
+    .execute(pool)
+    .await
+    .map_err(|error| format!("failed to seed Dreamina video project: {error}"))?;
+    sqlx::query(
+        r#"
+        INSERT INTO job_auth_attributions (
+            job_id, tenant_id, project_id, service_account_id, api_key_id,
+            credential_authz_version, actor_user_id, actor_session_id,
+            actor_authz_version, route_provider_id, route_operation_id,
+            route_command_schema, route_id, route_revision,
+            auth_kind, admitted_at_ms
+        )
+        VALUES (
+            $1, 'tenant-a', 'project-a', NULL, NULL,
+            NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+            'legacy', 1
+        )
+        "#,
+    )
+    .bind(job_id)
+    .execute(pool)
+    .await
+    .map_err(|error| format!("failed to seed Dreamina video job attribution: {error}"))?;
+    sqlx::query(
+        r#"
+        INSERT INTO provider_models (
+            provider_id, model_id, execution_model_id, media_kind,
+            display_name, adapter_state, lifecycle_state, operation_ids,
+            source_kind, first_seen_at_ms, last_seen_at_ms, metadata_json
+        )
+        VALUES (
+            'dreamina-cli', 'seedance2.0fast', $1, 'video',
+            'Seedance 2.0 Fast', 'supported', 'enabled',
+            ARRAY['videos.generations'], 'adapter_contract', 1, 1, '{}'::JSONB
+        )
+        "#,
+    )
+    .bind(DREAMINA_VIDEO_EXECUTION_MODEL)
+    .execute(pool)
+    .await
+    .map_err(|error| format!("failed to seed Dreamina video provider model: {error}"))?;
+    sqlx::query(
+        r#"
+        INSERT INTO provider_routes (
+            route_id, revision, route_key, display_name, provider_id,
+            operation_id, command_schema, route_kind,
+            selection_strategy, state, created_at_ms
+        )
+        VALUES (
+            $1, 1, $2, 'Dreamina video admission test route', 'dreamina-cli',
+            'videos.generations', $3,
+            'account', 'quota_aware_least_loaded', 'enabled', 1
+        )
+        "#,
+    )
+    .bind(route_id)
+    .bind(route_key)
+    .bind(DREAMINA_SUBMIT_COMMAND_SCHEMA)
+    .execute(pool)
+    .await
+    .map_err(|error| format!("failed to seed Dreamina video provider route: {error}"))?;
+    sqlx::query(
+        r#"
+        INSERT INTO provider_route_model_mappings (
+            route_id, route_revision, provider_id, operation_id,
+            command_schema, api_profile, public_model_id,
+            provider_model_id, execution_model_id, media_kind, created_at_ms
+        )
+        VALUES (
+            $1, 1, 'dreamina-cli', 'videos.generations',
+            $2, $3, $4, 'seedance2.0fast', $5, 'video', 1
+        )
+        "#,
+    )
+    .bind(route_id)
+    .bind(DREAMINA_SUBMIT_COMMAND_SCHEMA)
+    .bind(api_profile)
+    .bind(public_model_id)
+    .bind(DREAMINA_VIDEO_EXECUTION_MODEL)
+    .execute(pool)
+    .await
+    .map_err(|error| format!("failed to seed Dreamina video model mapping: {error}"))?;
+    sqlx::query(
+        r#"
+        INSERT INTO job_provider_route_attributions (
+            job_id, tenant_id, api_key_id, provider_id, operation_id,
+            command_schema, route_id, route_revision, attributed_at_ms
+        )
+        VALUES (
+            $1, 'tenant-a', NULL, 'dreamina-cli', 'videos.generations',
+            $2, $3, 1, 1
+        )
+        "#,
+    )
+    .bind(job_id)
+    .bind(DREAMINA_SUBMIT_COMMAND_SCHEMA)
+    .bind(route_id)
+    .execute(pool)
+    .await
+    .map_err(|error| format!("failed to seed Dreamina video route attribution: {error}"))?;
+    Ok(())
 }
 
 async fn claim_owner(
@@ -1232,9 +3739,10 @@ async fn insert_job_record(
         r#"
         INSERT INTO jobs
           (job_id, tenant_id, request_id, operation, provider_id, model, state,
-           requested_units, charged_units, reservation_id, created_at_ms, updated_at_ms)
+           requested_units, output_count, billable_units, billing_metric, billing_unit,
+           charged_units, reservation_id, created_at_ms, updated_at_ms)
         VALUES ($1, $2, $3, $4, 'openai-codex', 'gpt-image-2',
-                'reserved', 1, 0, $5, 1, 1)
+                'reserved', 1, 1, 1, 'output', 'output', 0, $5, 1, 1)
         "#,
     )
     .bind(job_id)
@@ -1252,9 +3760,9 @@ async fn insert_job_record(
            committed_units, started_units, released_units, state,
            created_at_ms, updated_at_ms, expires_at_ms,
            limit_5h, remaining_5h, limit_7d, remaining_7d,
-           admission_session_id)
+           admission_session_id, billing_metric, billing_unit)
         VALUES ($1, $2, $3, $4, 1, 0, 0, 0, 'reserved', 1, 1,
-                9223372036854775807, 100, 99, 100, 99, $5)
+                9223372036854775807, 100, 99, 100, 99, $5, 'output', 'output')
         "#,
     )
     .bind(reservation_id)
@@ -1318,6 +3826,7 @@ fn edit_attach_request(
         schedule_priority: 1,
         schedule_cost: 1,
         contract: AdmissionContract::LegacyV1,
+        customer_pricing: None,
     }
 }
 

@@ -1,6 +1,9 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use image_provider_contracts::ProviderReportedCostEvidenceV1;
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use super::{
     ExecutorLaunchContext, ExecutorLaunchContextStore, ExecutorResultManifest,
@@ -29,6 +32,67 @@ pub enum RunnerOutcome {
 pub enum DurableRunnerResult {
     Terminal(RunnerOutcome),
     Retryable { error_code: String },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SupervisedOutput {
+    bytes: Vec<u8>,
+    provider_reported_cost: Option<ProviderReportedCostEvidenceV1>,
+}
+
+impl SupervisedOutput {
+    pub fn without_provider_cost(bytes: Vec<u8>) -> Self {
+        Self {
+            bytes,
+            provider_reported_cost: None,
+        }
+    }
+
+    pub fn with_provider_reported_cost(
+        bytes: Vec<u8>,
+        provider_reported_cost: ProviderReportedCostEvidenceV1,
+    ) -> Option<Self> {
+        provider_reported_cost.validate().ok()?;
+        Some(Self {
+            bytes,
+            provider_reported_cost: Some(provider_reported_cost),
+        })
+    }
+
+    pub(crate) fn from_parts(
+        bytes: Vec<u8>,
+        provider_reported_cost: Option<ProviderReportedCostEvidenceV1>,
+    ) -> Option<Self> {
+        if provider_reported_cost
+            .as_ref()
+            .is_some_and(|evidence| evidence.validate().is_err())
+        {
+            return None;
+        }
+        Some(Self {
+            bytes,
+            provider_reported_cost,
+        })
+    }
+
+    fn validate_for(&self, lease: &ExecutorSubmissionLease) -> Result<(), RunnerError> {
+        if self.bytes.is_empty()
+            || self
+                .provider_reported_cost
+                .as_ref()
+                .is_some_and(|evidence| {
+                    evidence.validate().is_err()
+                        || evidence.observation().provider_id != lease.provider_id
+                })
+        {
+            return Err(RunnerError::Internal);
+        }
+        Ok(())
+    }
+
+    fn into_parts(self) -> (Vec<u8>, Option<ProviderReportedCostEvidenceV1>) {
+        (self.bytes, self.provider_reported_cost)
+    }
 }
 
 impl From<RunnerOutcome> for DurableRunnerResult {
@@ -82,6 +146,100 @@ pub enum RunnerLaunchAuthority {
     AttachOnly,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RunnerLaunchBinding {
+    executor_execution_id: String,
+    submission_id: String,
+    output_id: String,
+    job_id: String,
+    tenant_id: String,
+    provider_id: String,
+    model: String,
+    work_item_id: String,
+    output_index: i32,
+    command_schema: String,
+    command_hash: String,
+    execution_profile_id: String,
+    adapter_revision: String,
+    executor_owner: String,
+    executor_lease_epoch: i64,
+    executor_lease_expires_at_ms: i64,
+}
+
+impl RunnerLaunchBinding {
+    pub(crate) fn from_lease(lease: &ExecutorSubmissionLease) -> Self {
+        Self {
+            executor_execution_id: lease.executor_execution_id.to_string(),
+            submission_id: lease.submission_id.to_string(),
+            output_id: lease.output_id.to_string(),
+            job_id: lease.job_id.to_string(),
+            tenant_id: lease.tenant_id.clone(),
+            provider_id: lease.provider_id.clone(),
+            model: lease.model.clone(),
+            work_item_id: lease.work_item_id.to_string(),
+            output_index: lease.output_index,
+            command_schema: lease.command_schema.clone(),
+            command_hash: lease.command_hash.clone(),
+            execution_profile_id: lease.execution_profile_id.to_string(),
+            adapter_revision: lease.adapter_revision.clone(),
+            executor_owner: lease.executor_owner.clone(),
+            executor_lease_epoch: lease.executor_lease_epoch,
+            executor_lease_expires_at_ms: lease.executor_lease_expires_at_ms,
+        }
+    }
+
+    pub(crate) fn to_lease(&self) -> Option<ExecutorSubmissionLease> {
+        let lease = ExecutorSubmissionLease {
+            submission_id: parse_binding_uuid(&self.submission_id)?,
+            executor_execution_id: parse_binding_uuid(&self.executor_execution_id)?,
+            output_id: parse_binding_uuid(&self.output_id)?,
+            job_id: parse_binding_uuid(&self.job_id)?,
+            tenant_id: self.tenant_id.clone(),
+            provider_id: self.provider_id.clone(),
+            model: self.model.clone(),
+            work_item_id: parse_binding_uuid(&self.work_item_id)?,
+            output_index: self.output_index,
+            command_schema: self.command_schema.clone(),
+            command_hash: self.command_hash.clone(),
+            execution_profile_id: parse_binding_uuid(&self.execution_profile_id)?,
+            adapter_revision: self.adapter_revision.clone(),
+            executor_owner: self.executor_owner.clone(),
+            executor_lease_epoch: self.executor_lease_epoch,
+            executor_lease_expires_at_ms: self.executor_lease_expires_at_ms,
+        };
+        let valid_text = [
+            &lease.tenant_id,
+            &lease.provider_id,
+            &lease.model,
+            &lease.command_schema,
+            &lease.adapter_revision,
+            &lease.executor_owner,
+        ]
+        .into_iter()
+        .all(|value| {
+            !value.is_empty() && value.len() <= 1_024 && !value.chars().any(char::is_control)
+        });
+        let valid_hash = lease.command_hash.len() == 64
+            && lease
+                .command_hash
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'));
+        (valid_text
+            && valid_hash
+            && lease.output_index >= 0
+            && lease.executor_lease_epoch > 0
+            && lease.executor_lease_expires_at_ms > 0)
+            .then_some(lease)
+    }
+}
+
+fn parse_binding_uuid(value: &str) -> Option<Uuid> {
+    Uuid::parse_str(value)
+        .ok()
+        .filter(|uuid| !uuid.is_nil() && uuid.to_string() == value)
+}
+
 #[async_trait]
 pub trait SingleOutputSupervisor: Send + Sync + 'static {
     async fn prepare(
@@ -94,7 +252,7 @@ pub trait SingleOutputSupervisor: Send + Sync + 'static {
         &self,
         lease: &ExecutorSubmissionLease,
         decision: LaunchDecision,
-    ) -> Result<Vec<u8>, RunnerError>;
+    ) -> Result<SupervisedOutput, RunnerError>;
 }
 
 #[async_trait]
@@ -146,38 +304,49 @@ where
             Ok(observation) => observation,
             Err(error) => return journal_error_outcome(error).into(),
         };
-        if observation == RunnerJournalObservation::Prepared
-            && authority == RunnerLaunchAuthority::AttachOnly
-        {
-            return DurableRunnerResult::Retryable {
-                error_code: "runner_launch_evidence_missing".to_string(),
-            };
-        }
-
-        let context = match self.contexts.load_launch_context(&lease).await {
-            Ok(context) => context,
-            Err(error) => return submission_error_outcome(error).into(),
-        };
-        if let Err(error) = self.supervisor.prepare(&lease, &context).await {
-            return runner_error_result(error);
-        }
-        let decision = match authority {
-            RunnerLaunchAuthority::AllowLaunch => match self.journal.commit_launch(&lease) {
-                Ok(decision) => decision,
-                Err(error) => return journal_error_outcome(error).into(),
-            },
-            RunnerLaunchAuthority::AttachOnly => LaunchDecision::Attach,
-        };
-        let outcome = match self.supervisor.start_or_attach(&lease, decision).await {
-            Ok(bytes) => match self.artifacts.publish(&lease, &bytes).await {
-                Ok(manifest) => RunnerOutcome::Succeeded(manifest),
-                Err(RunnerError::Unavailable) => {
+        let decision = match observation {
+            RunnerJournalObservation::Prepared => {
+                if authority == RunnerLaunchAuthority::AttachOnly {
                     return DurableRunnerResult::Retryable {
-                        error_code: "artifact_authority_unavailable".to_string(),
+                        error_code: "runner_launch_evidence_missing".to_string(),
                     };
                 }
-                Err(error) => RunnerOutcome::from_error(error),
-            },
+                let context = match self.contexts.load_launch_context(&lease).await {
+                    Ok(context) => context,
+                    Err(error) => return submission_error_outcome(error).into(),
+                };
+                if let Err(error) = self.supervisor.prepare(&lease, &context).await {
+                    return runner_error_result(error);
+                }
+                match self.journal.commit_launch(&lease) {
+                    Ok(decision) => decision,
+                    Err(error) => return journal_error_outcome(error).into(),
+                }
+            }
+            RunnerJournalObservation::LaunchCommitted => LaunchDecision::Attach,
+            RunnerJournalObservation::Terminal(outcome) => return outcome.into(),
+        };
+        let outcome = match self.supervisor.start_or_attach(&lease, decision).await {
+            Ok(output) => {
+                if let Err(error) = output.validate_for(&lease) {
+                    return runner_error_result(error);
+                }
+                let (bytes, provider_reported_cost) = output.into_parts();
+                match self.artifacts.publish(&lease, &bytes).await {
+                    Ok(manifest) => {
+                        match manifest.with_provider_reported_cost(provider_reported_cost) {
+                            Some(manifest) => RunnerOutcome::Succeeded(manifest),
+                            None => return runner_error_result(RunnerError::Internal),
+                        }
+                    }
+                    Err(RunnerError::Unavailable) => {
+                        return DurableRunnerResult::Retryable {
+                            error_code: "artifact_authority_unavailable".to_string(),
+                        };
+                    }
+                    Err(error) => RunnerOutcome::from_error(error),
+                }
+            }
             Err(error) => return runner_error_result(error),
         };
         if let Err(error) = self.journal.publish_terminal(&lease, &outcome) {
@@ -206,15 +375,26 @@ where
                     .start_or_attach(&lease, LaunchDecision::Attach)
                     .await
                 {
-                    Ok(bytes) => match self.artifacts.publish(&lease, &bytes).await {
-                        Ok(manifest) => RunnerOutcome::Succeeded(manifest),
-                        Err(RunnerError::Unavailable) => {
-                            return DurableRunnerResult::Retryable {
-                                error_code: "artifact_authority_unavailable".to_string(),
-                            };
+                    Ok(output) => {
+                        if let Err(error) = output.validate_for(&lease) {
+                            return runner_error_result(error);
                         }
-                        Err(error) => RunnerOutcome::from_error(error),
-                    },
+                        let (bytes, provider_reported_cost) = output.into_parts();
+                        match self.artifacts.publish(&lease, &bytes).await {
+                            Ok(manifest) => {
+                                match manifest.with_provider_reported_cost(provider_reported_cost) {
+                                    Some(manifest) => RunnerOutcome::Succeeded(manifest),
+                                    None => return runner_error_result(RunnerError::Internal),
+                                }
+                            }
+                            Err(RunnerError::Unavailable) => {
+                                return DurableRunnerResult::Retryable {
+                                    error_code: "artifact_authority_unavailable".to_string(),
+                                };
+                            }
+                            Err(error) => RunnerOutcome::from_error(error),
+                        }
+                    }
                     Err(error) => return runner_error_result(error),
                 };
                 if let Err(error) = self.journal.publish_terminal(&lease, &outcome) {
@@ -311,9 +491,9 @@ mod tests {
             &self,
             _lease: &ExecutorSubmissionLease,
             decision: LaunchDecision,
-        ) -> Result<Vec<u8>, RunnerError> {
+        ) -> Result<SupervisedOutput, RunnerError> {
             self.decisions.lock().unwrap().push(decision);
-            Ok(self.bytes.clone())
+            Ok(SupervisedOutput::without_provider_cost(self.bytes.clone()))
         }
     }
 
@@ -487,7 +667,7 @@ mod tests {
             journal.start_or_attach(&lease).unwrap(),
             RunnerJournalObservation::Terminal(RunnerOutcome::Succeeded(manifest))
         );
-        assert_eq!(*context_calls.lock().unwrap(), 2);
+        assert_eq!(*context_calls.lock().unwrap(), 1);
         assert_eq!(*artifact_calls.lock().unwrap(), 2);
         assert_eq!(
             *decisions.lock().unwrap(),
@@ -503,6 +683,7 @@ mod tests {
             command_schema: GENERATION_COMMAND_SCHEMA.to_string(),
             command_hash: "a".repeat(64),
             command_json: json!({"prompt": "draw a lighthouse"}),
+            inputs: Vec::new(),
         }
     }
 

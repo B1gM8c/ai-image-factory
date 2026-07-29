@@ -1,14 +1,16 @@
 use std::{env, sync::Arc, time::Duration};
 
 use gpt_image_2_gateway::{
-    ExecutorSubmissionStore, ImageGatewayError, PostgresExecutorSubmissionStore,
-    PostgresReconciliationStore, ReconciliationStore,
+    ExecutorSubmissionStore, ImageGatewayError, PostgresArtifactRetentionStore,
+    PostgresExecutorSubmissionStore, PostgresReconciliationStore, ProviderUploadService,
+    ReconciliationStore,
     artifacts::{FilesystemArtifactBlobStore, artifact_root_from_env},
     database::{
         DEFAULT_MAX_CONNECTIONS, connect_pool_with_schema, database_schema_from_env,
         database_url_from_env, verify_migrations,
     },
-    init_telemetry, reconcile_input_cleanup,
+    identity::PostgresIdentityMaintenanceStore,
+    init_telemetry, reconcile_artifact_retention, reconcile_input_cleanup,
 };
 
 const DEFAULT_INTERVAL_MS: u64 = 1_000;
@@ -18,12 +20,28 @@ const MAX_BATCH_SIZE: u32 = 1_000;
 const DEFAULT_ORPHAN_GRACE_MS: u64 = 60_000;
 const DEFAULT_INPUT_CLEANUP_GRACE_MS: u64 = 60_000;
 const DEFAULT_INPUT_CLEANUP_LEASE_MS: u64 = 60_000;
+const DEFAULT_ARTIFACT_CLEANUP_LEASE_MS: u64 = 60_000;
+const DEFAULT_IDENTITY_GC_INTERVAL_MS: u64 = 5 * 60_000;
+const DEFAULT_IDENTITY_SESSION_RETENTION_MS: u64 = 7 * 24 * 60 * 60_000;
+const DEFAULT_IDENTITY_THROTTLE_RETENTION_MS: u64 = 24 * 60 * 60_000;
+const DEFAULT_IDENTITY_AUDIT_RETENTION_MS: u64 = 180 * 24 * 60 * 60_000;
+const PROVIDER_UPLOAD_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Copy)]
 struct ReconcileConfig {
     orphan_grace_ms: u64,
     input_cleanup_grace_ms: u64,
     input_cleanup_lease_ms: u64,
+    artifact_cleanup_lease_ms: u64,
+    batch_size: u32,
+}
+
+#[derive(Clone, Copy)]
+struct IdentityMaintenanceConfig {
+    interval: Duration,
+    session_retention_ms: u64,
+    throttle_retention_ms: u64,
+    audit_retention_ms: u64,
     batch_size: u32,
 }
 
@@ -36,8 +54,12 @@ async fn main() -> Result<(), ImageGatewayError> {
         connect_pool_with_schema(&database_url, DEFAULT_MAX_CONNECTIONS, &database_schema).await?;
     verify_migrations(&pool).await?;
     let reconciler = PostgresReconciliationStore::new(pool.clone());
+    let artifact_retention = PostgresArtifactRetentionStore::new(pool.clone());
+    let identity_maintenance = PostgresIdentityMaintenanceStore::new(pool.clone());
     let executor_reconciler = PostgresExecutorSubmissionStore::new(pool);
-    let input_blobs = Arc::new(FilesystemArtifactBlobStore::new(artifact_root_from_env()?)?);
+    let artifact_root = artifact_root_from_env()?;
+    let input_blobs = Arc::new(FilesystemArtifactBlobStore::new(&artifact_root)?);
+    let provider_uploads = ProviderUploadService::new(&artifact_root, None)?;
     let owner = format!("reconcilerd-{}", uuid::Uuid::new_v4().simple());
     let interval_ms = env_u64("RECONCILER_INTERVAL_MS", DEFAULT_INTERVAL_MS)?;
     if !(1..=MAX_INTERVAL_MS).contains(&interval_ms) {
@@ -61,12 +83,25 @@ async fn main() -> Result<(), ImageGatewayError> {
         "RECONCILER_INPUT_CLEANUP_LEASE_MS",
         DEFAULT_INPUT_CLEANUP_LEASE_MS,
     )?;
+    let artifact_cleanup_lease_ms = env_u64(
+        "RECONCILER_ARTIFACT_CLEANUP_LEASE_MS",
+        DEFAULT_ARTIFACT_CLEANUP_LEASE_MS,
+    )?;
+    if artifact_cleanup_lease_ms == 0 {
+        return Err(ImageGatewayError::config(
+            "RECONCILER_ARTIFACT_CLEANUP_LEASE_MS must be greater than zero",
+        ));
+    }
     let reconcile_config = ReconcileConfig {
         orphan_grace_ms,
         input_cleanup_grace_ms,
         input_cleanup_lease_ms,
+        artifact_cleanup_lease_ms,
         batch_size,
     };
+    let identity_maintenance_config = identity_maintenance_config(batch_size)?;
+    let mut next_identity_maintenance = tokio::time::Instant::now();
+    let mut next_provider_upload_cleanup = tokio::time::Instant::now();
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
     tracing::info!(batch_size, "reconcilerd started");
@@ -77,11 +112,12 @@ async fn main() -> Result<(), ImageGatewayError> {
             result = reconcile_all(
                 &reconciler,
                 &executor_reconciler,
+                &artifact_retention,
                 input_blobs.as_ref(),
                 &owner,
                 reconcile_config,
             ) => {
-                let (core_result, executor_result) = result;
+                let (core_result, executor_result, artifact_result) = result;
                 match core_result {
                 Ok((work, orphan, input)) => {
                     if work.requeued > 0 || work.uncertain > 0 || orphan.orphaned > 0
@@ -111,7 +147,63 @@ async fn main() -> Result<(), ImageGatewayError> {
                         tracing::error!(error = ?error, "executor reconciliation failed");
                     }
                 }
+                match artifact_result {
+                    Ok(artifacts) if artifacts.expired > 0 || artifacts.claimed > 0 => {
+                        tracing::info!(
+                            artifact_expired = artifacts.expired,
+                            artifact_cleanup_claimed = artifacts.claimed,
+                            artifact_cleanup_deleted = artifacts.deleted,
+                            artifact_cleanup_failed = artifacts.failed,
+                            "artifact retention reconciled"
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        tracing::error!(error = ?error, "artifact retention reconciliation failed");
+                    }
+                }
             },
+        }
+        if tokio::time::Instant::now() >= next_identity_maintenance {
+            match identity_maintenance
+                .purge_expired(
+                    identity_maintenance_config.session_retention_ms,
+                    identity_maintenance_config.throttle_retention_ms,
+                    identity_maintenance_config.audit_retention_ms,
+                    identity_maintenance_config.batch_size,
+                )
+                .await
+            {
+                Ok(outcome)
+                    if outcome.session_families > 0
+                        || outcome.login_throttles > 0
+                        || outcome.audit_events > 0 =>
+                {
+                    tracing::info!(
+                        session_families = outcome.session_families,
+                        login_throttles = outcome.login_throttles,
+                        audit_events = outcome.audit_events,
+                        "expired identity state purged"
+                    );
+                }
+                Ok(_) => {}
+                Err(error) => tracing::error!(error = ?error, "identity maintenance failed"),
+            }
+            next_identity_maintenance =
+                tokio::time::Instant::now() + identity_maintenance_config.interval;
+        }
+        if tokio::time::Instant::now() >= next_provider_upload_cleanup {
+            match provider_uploads.cleanup_expired().await {
+                Ok(deleted) if deleted > 0 => {
+                    tracing::info!(deleted, "expired provider uploads deleted")
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::error!(error = ?error, "provider upload cleanup failed")
+                }
+            }
+            next_provider_upload_cleanup =
+                tokio::time::Instant::now() + PROVIDER_UPLOAD_CLEANUP_INTERVAL;
         }
         tokio::select! {
             _ = &mut shutdown => break,
@@ -122,10 +214,49 @@ async fn main() -> Result<(), ImageGatewayError> {
     Ok(())
 }
 
+fn identity_maintenance_config(
+    batch_size: u32,
+) -> Result<IdentityMaintenanceConfig, ImageGatewayError> {
+    let interval_ms = env_u64(
+        "RECONCILER_IDENTITY_GC_INTERVAL_MS",
+        DEFAULT_IDENTITY_GC_INTERVAL_MS,
+    )?;
+    if !(1_000..=24 * 60 * 60_000).contains(&interval_ms) {
+        return Err(ImageGatewayError::config(
+            "RECONCILER_IDENTITY_GC_INTERVAL_MS must be between 1000 and 86400000",
+        ));
+    }
+    let session_retention_ms = env_u64(
+        "RECONCILER_IDENTITY_SESSION_RETENTION_MS",
+        DEFAULT_IDENTITY_SESSION_RETENTION_MS,
+    )?;
+    let throttle_retention_ms = env_u64(
+        "RECONCILER_IDENTITY_THROTTLE_RETENTION_MS",
+        DEFAULT_IDENTITY_THROTTLE_RETENTION_MS,
+    )?;
+    let audit_retention_ms = env_u64(
+        "RECONCILER_IDENTITY_AUDIT_RETENTION_MS",
+        DEFAULT_IDENTITY_AUDIT_RETENTION_MS,
+    )?;
+    if session_retention_ms == 0 || throttle_retention_ms == 0 || audit_retention_ms == 0 {
+        return Err(ImageGatewayError::config(
+            "identity maintenance retention values must be greater than zero",
+        ));
+    }
+    Ok(IdentityMaintenanceConfig {
+        interval: Duration::from_millis(interval_ms),
+        session_retention_ms,
+        throttle_retention_ms,
+        audit_retention_ms,
+        batch_size,
+    })
+}
+
 async fn reconcile_all(
     reconciler: &PostgresReconciliationStore,
     executor_reconciler: &PostgresExecutorSubmissionStore,
-    input_blobs: &dyn gpt_image_2_gateway::input_blobs::InputBlobStore,
+    artifact_retention: &PostgresArtifactRetentionStore,
+    blobs: &FilesystemArtifactBlobStore,
     owner: &str,
     config: ReconcileConfig,
 ) -> (
@@ -138,17 +269,24 @@ async fn reconcile_all(
         ImageGatewayError,
     >,
     Result<u64, gpt_image_2_gateway::ExecutorSubmissionError>,
+    Result<gpt_image_2_gateway::ArtifactRetentionOutcome, ImageGatewayError>,
 ) {
-    let executor = executor_reconciler
-        .reconcile_expired(config.batch_size)
-        .await;
-    let core = reconcile_core(reconciler, input_blobs, owner, config).await;
-    (core, executor)
+    let executor = executor_reconciler.reconcile_expired(config.batch_size);
+    let core = reconcile_core(reconciler, blobs, owner, config);
+    let artifacts = reconcile_artifact_retention(
+        artifact_retention,
+        blobs,
+        owner,
+        config.artifact_cleanup_lease_ms,
+        config.batch_size,
+    );
+    let (core, executor, artifacts) = tokio::join!(core, executor, artifacts);
+    (core, executor, artifacts)
 }
 
 async fn reconcile_core(
     reconciler: &PostgresReconciliationStore,
-    input_blobs: &dyn gpt_image_2_gateway::input_blobs::InputBlobStore,
+    blobs: &FilesystemArtifactBlobStore,
     owner: &str,
     config: ReconcileConfig,
 ) -> Result<
@@ -165,7 +303,7 @@ async fn reconcile_core(
         .await?;
     let input = reconcile_input_cleanup(
         reconciler,
-        input_blobs,
+        blobs,
         owner,
         config.input_cleanup_grace_ms,
         config.input_cleanup_lease_ms,

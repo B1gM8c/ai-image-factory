@@ -38,13 +38,14 @@ fn normalize_generated_image(
     match requested_size {
         SizeConstraint::Auto => {}
         SizeConstraint::Dimensions { width, height } => {
-            if decoded.width() != width || decoded.height() != height {
+            if !aspect_ratio_matches(decoded.width(), decoded.height(), width, height) {
                 return Err(ImageGatewayError::backend(format!(
-                    "Codex CLI produced an image with dimensions {}x{}, not the requested {}x{}",
+                    "Codex CLI produced an image with dimensions {}x{}, not the requested {}x{} aspect ratio within {:.2}% tolerance",
                     decoded.width(),
                     decoded.height(),
                     width,
-                    height
+                    height,
+                    aspect_ratio_tolerance_percent()
                 )));
             }
         }
@@ -183,12 +184,21 @@ mod tests {
     }
 
     #[test]
-    fn rejects_png_with_unexpected_dimensions() {
+    fn accepts_png_with_requested_dimension_ratio() {
         let image = GeneratedImage {
             bytes: valid_png_with_dimensions(1254, 1254),
         };
 
-        assert!(normalize_generated_images(vec![image], "1024x1024", "png", None).is_err());
+        assert!(normalize_generated_images(vec![image], "1024x1024", "png", None).is_ok());
+    }
+
+    #[test]
+    fn rejects_png_with_unexpected_dimension_ratio() {
+        let image = GeneratedImage {
+            bytes: valid_png_with_dimensions(1254, 1254),
+        };
+
+        assert!(normalize_generated_images(vec![image], "1536x1024", "png", None).is_err());
     }
 
     #[test]

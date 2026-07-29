@@ -11,12 +11,18 @@ const TYPE_RATE_LIMIT: &str = "rate_limit_error";
 const TYPE_SERVER: &str = "server_error";
 
 const CODE_INVALID_API_KEY: &str = "invalid_api_key";
+const CODE_INVALID_CREDENTIALS: &str = "invalid_credentials";
+const CODE_INVALID_TOKEN: &str = "invalid_token";
+const CODE_INSUFFICIENT_SCOPE: &str = "insufficient_scope";
 const CODE_UNSUPPORTED_PARAMETER: &str = "unsupported_parameter";
 const CODE_UNKNOWN_PARAMETER: &str = "unknown_parameter";
 const CODE_MODEL_NOT_FOUND: &str = "model_not_found";
 const CODE_UNSUPPORTED_MEDIA_TYPE: &str = "unsupported_media_type";
 const CODE_REQUEST_TOO_LARGE: &str = "request_too_large";
 const CODE_RATE_LIMIT_EXCEEDED: &str = "rate_limit_exceeded";
+const CODE_BILLING_LIMIT_EXCEEDED: &str = "billing_limit_exceeded";
+const CODE_PROJECT_BUDGET_EXCEEDED: &str = "project_budget_exceeded";
+const CODE_USER_API_KEYS_DISABLED: &str = "user_api_keys_disabled";
 const CODE_IMAGE_GENERATION_FAILED: &str = "image_generation_failed";
 const CODE_CODEX_CLI_FAILED: &str = "codex_cli_failed";
 const CODE_CODEX_NO_IMAGE_OUTPUT: &str = "codex_no_image_output";
@@ -28,6 +34,8 @@ const CODE_INVALID_IDEMPOTENCY_KEY: &str = "invalid_idempotency_key";
 const CODE_IDEMPOTENCY_CONFLICT: &str = "idempotency_conflict";
 const CODE_IDEMPOTENCY_IN_PROGRESS: &str = "idempotency_in_progress";
 const CODE_IDEMPOTENCY_RESULT_UNAVAILABLE: &str = "idempotency_result_unavailable";
+const CODE_IDEMPOTENCY_RESULT_EXPIRED: &str = "idempotency_result_expired";
+const CODE_ARTIFACT_EXPIRED: &str = "artifact_expired";
 const CODE_ARTIFACT_INTEGRITY_ERROR: &str = "artifact_integrity_error";
 
 #[derive(Debug)]
@@ -38,6 +46,17 @@ pub struct ImageGatewayError {
     param: Option<String>,
     code: Option<&'static str>,
     headers: Vec<(&'static str, String)>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct QuotaExceededContext {
+    pub billing_metric: &'static str,
+    pub billing_unit: &'static str,
+    pub limit_5h: u32,
+    pub limit_7d: u32,
+    pub remaining_5h: u32,
+    pub remaining_7d: u32,
+    pub window: &'static str,
 }
 
 #[derive(Serialize)]
@@ -71,6 +90,55 @@ impl ImageGatewayError {
             None,
             CODE_INVALID_API_KEY,
         )
+        .with_header("www-authenticate", "Bearer".to_string())
+    }
+
+    pub(crate) fn identity_credentials() -> Self {
+        Self::new(
+            StatusCode::UNAUTHORIZED,
+            "Invalid authentication",
+            TYPE_AUTHENTICATION,
+            None,
+            CODE_INVALID_CREDENTIALS,
+        )
+    }
+
+    pub(crate) fn identity_authentication() -> Self {
+        Self::new(
+            StatusCode::UNAUTHORIZED,
+            "Invalid authentication",
+            TYPE_AUTHENTICATION,
+            None,
+            CODE_INVALID_TOKEN,
+        )
+        .with_header(
+            "www-authenticate",
+            "Bearer error=\"invalid_token\"".to_string(),
+        )
+    }
+
+    pub fn forbidden(message: impl Into<String>) -> Self {
+        Self::new(
+            StatusCode::FORBIDDEN,
+            message,
+            TYPE_AUTHENTICATION,
+            None,
+            CODE_INSUFFICIENT_SCOPE,
+        )
+        .with_header(
+            "www-authenticate",
+            "Bearer error=\"insufficient_scope\"".to_string(),
+        )
+    }
+
+    pub fn user_api_keys_disabled() -> Self {
+        Self::new(
+            StatusCode::FORBIDDEN,
+            "User API keys are disabled for this project",
+            TYPE_INVALID_REQUEST,
+            None,
+            CODE_USER_API_KEYS_DISABLED,
+        )
     }
 
     pub fn invalid_request(
@@ -80,6 +148,20 @@ impl ImageGatewayError {
     ) -> Self {
         Self::new(
             StatusCode::BAD_REQUEST,
+            message,
+            TYPE_INVALID_REQUEST,
+            param,
+            code,
+        )
+    }
+
+    pub fn conflict(
+        message: impl Into<String>,
+        param: impl Into<Option<String>>,
+        code: &'static str,
+    ) -> Self {
+        Self::new(
+            StatusCode::CONFLICT,
             message,
             TYPE_INVALID_REQUEST,
             param,
@@ -134,6 +216,26 @@ impl ImageGatewayError {
             TYPE_INVALID_REQUEST,
             Some("Idempotency-Key".to_string()),
             CODE_IDEMPOTENCY_RESULT_UNAVAILABLE,
+        )
+    }
+
+    pub fn idempotency_result_expired() -> Self {
+        Self::new(
+            StatusCode::GONE,
+            "The result for this idempotent request has expired and can no longer be replayed",
+            TYPE_INVALID_REQUEST,
+            Some("Idempotency-Key".to_string()),
+            CODE_IDEMPOTENCY_RESULT_EXPIRED,
+        )
+    }
+
+    pub fn artifact_expired() -> Self {
+        Self::new(
+            StatusCode::GONE,
+            "The requested artifact has expired and is no longer available",
+            TYPE_INVALID_REQUEST,
+            None,
+            CODE_ARTIFACT_EXPIRED,
         )
     }
 
@@ -192,12 +294,81 @@ impl ImageGatewayError {
     }
 
     pub fn queue_overloaded() -> Self {
+        Self::queue_overloaded_for("image")
+    }
+
+    pub(crate) fn queue_overloaded_for(media_kind: &str) -> Self {
         Self::new(
             StatusCode::TOO_MANY_REQUESTS,
-            "Rate limit reached for image generation requests",
+            format!("Rate limit reached for {media_kind} generation requests"),
             TYPE_RATE_LIMIT,
             None,
             CODE_RATE_LIMIT_EXCEEDED,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn project_model_rate_limit_exceeded(
+        model: &str,
+        retry_after_seconds: u64,
+        request_limit_per_minute: Option<u32>,
+        unit_limit_per_minute: Option<u32>,
+        unit_kind: &str,
+        remaining_requests: Option<i64>,
+        remaining_units: Option<i64>,
+    ) -> Self {
+        let mut error = Self::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            format!("Rate limit reached for model '{model}' in this project"),
+            TYPE_RATE_LIMIT,
+            Some("model".to_string()),
+            CODE_RATE_LIMIT_EXCEEDED,
+        )
+        .with_header("retry-after", retry_after_seconds.to_string());
+        if let Some(limit) = request_limit_per_minute {
+            error = error
+                .with_header("x-ratelimit-limit-requests", limit.to_string())
+                .with_header(
+                    "x-ratelimit-remaining-requests",
+                    remaining_requests.unwrap_or(0).max(0).to_string(),
+                );
+        }
+        if let Some(limit) = unit_limit_per_minute {
+            let (limit_header, remaining_header) = match unit_kind {
+                "image" => ("x-ratelimit-limit-images", "x-ratelimit-remaining-images"),
+                "video_second" => (
+                    "x-ratelimit-limit-video-seconds",
+                    "x-ratelimit-remaining-video-seconds",
+                ),
+                _ => ("x-ratelimit-limit-units", "x-ratelimit-remaining-units"),
+            };
+            error = error
+                .with_header(limit_header, limit.to_string())
+                .with_header(
+                    remaining_header,
+                    remaining_units.unwrap_or(0).max(0).to_string(),
+                );
+        }
+        error
+    }
+
+    pub(crate) fn project_budget_exceeded() -> Self {
+        Self::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "You have exceeded your project's monthly usage limit",
+            TYPE_RATE_LIMIT,
+            None,
+            CODE_PROJECT_BUDGET_EXCEEDED,
+        )
+    }
+
+    pub(crate) fn billing_limit_exceeded() -> Self {
+        Self::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "Your organization has reached its billing credit limit",
+            TYPE_RATE_LIMIT,
+            None,
+            CODE_BILLING_LIMIT_EXCEEDED,
         )
     }
 
@@ -211,28 +382,48 @@ impl ImageGatewayError {
         )
     }
 
-    pub fn quota_exceeded(
+    pub(crate) fn quota_exceeded(
         message: impl Into<String>,
-        limit_5h: u32,
-        limit_7d: u32,
-        remaining_5h: u32,
-        remaining_7d: u32,
-        window: &'static str,
+        context: QuotaExceededContext,
     ) -> Self {
-        Self::new(
+        let error = Self::new(
             StatusCode::TOO_MANY_REQUESTS,
             message,
             TYPE_RATE_LIMIT,
             None,
             CODE_RATE_LIMIT_EXCEEDED,
         )
-        .with_header("x-ratelimit-limit-5h", limit_5h.to_string())
-        .with_header("x-ratelimit-remaining-5h", remaining_5h.to_string())
-        .with_header("x-image-units-limit-5h", limit_5h.to_string())
-        .with_header("x-image-units-remaining-5h", remaining_5h.to_string())
-        .with_header("x-image-units-limit-7d", limit_7d.to_string())
-        .with_header("x-image-units-remaining-7d", remaining_7d.to_string())
-        .with_header("x-image-quota-window", window.to_string())
+        .with_header("x-ratelimit-limit-5h", context.limit_5h.to_string())
+        .with_header("x-ratelimit-remaining-5h", context.remaining_5h.to_string())
+        .with_header("x-billing-metric", context.billing_metric.to_string())
+        .with_header("x-billing-unit", context.billing_unit.to_string())
+        .with_header("x-billing-units-limit-5h", context.limit_5h.to_string())
+        .with_header(
+            "x-billing-units-remaining-5h",
+            context.remaining_5h.to_string(),
+        )
+        .with_header("x-billing-units-limit-7d", context.limit_7d.to_string())
+        .with_header(
+            "x-billing-units-remaining-7d",
+            context.remaining_7d.to_string(),
+        )
+        .with_header("x-billing-quota-window", context.window.to_string());
+        if context.billing_metric == "output" && context.billing_unit == "output" {
+            error
+                .with_header("x-image-units-limit-5h", context.limit_5h.to_string())
+                .with_header(
+                    "x-image-units-remaining-5h",
+                    context.remaining_5h.to_string(),
+                )
+                .with_header("x-image-units-limit-7d", context.limit_7d.to_string())
+                .with_header(
+                    "x-image-units-remaining-7d",
+                    context.remaining_7d.to_string(),
+                )
+                .with_header("x-image-quota-window", context.window.to_string())
+        } else {
+            error
+        }
     }
 
     pub fn backend(message: impl Into<String>) -> Self {
@@ -330,6 +521,7 @@ impl ImageGatewayError {
 
 impl IntoResponse for ImageGatewayError {
     fn into_response(self) -> Response {
+        let error_code = self.code.map(str::to_owned);
         let body = Json(ErrorEnvelope {
             error: ErrorBody {
                 message: &self.message,
@@ -340,6 +532,14 @@ impl IntoResponse for ImageGatewayError {
         });
 
         let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::CACHE_CONTROL,
+            HeaderValue::from_static("no-store, max-age=0"),
+        );
+        headers.insert(
+            axum::http::header::PRAGMA,
+            HeaderValue::from_static("no-cache"),
+        );
         for (name, value) in self.headers {
             if let (Ok(name), Ok(value)) = (
                 HeaderName::from_lowercase(name.as_bytes()),
@@ -349,7 +549,11 @@ impl IntoResponse for ImageGatewayError {
             }
         }
 
-        (self.status, headers, body).into_response()
+        let mut response = (self.status, headers, body).into_response();
+        response
+            .extensions_mut()
+            .insert(crate::request_observability::ResponseErrorCode(error_code));
+        response
     }
 }
 

@@ -245,14 +245,15 @@ flowchart LR
   provider/account scope, prioritize expired submit recovery, claim prepared
   executor submissions, and perform digest-pinned crash-recoverable CLI
   dispatch. A database runtime lease publishes active/draining state and loss of
-  that lease stops new iterations. The current Dreamina image composition is
-  runnable but remains undeployed and inactive.
+  that lease stops new iterations. Dreamina text-to-image and text-to-video use
+  this runtime with separate immutable operation descriptors over one native CLI
+  command envelope.
 - `provider-pollerd`: own one frozen remote-task execution profile and its
   provider/account scope, run bounded provider queries, heartbeat fenced poll
   leases, and materialize immutable provider artifacts. Its process lease is
   independent from task leases and remains live through graceful lane drain.
-  The current Dreamina image composition is runnable but remains undeployed and
-  inactive.
+  Dreamina polling accepts only one verified PNG/JPEG/WebP or structurally valid
+  MP4 artifact per output slot and publishes it through the shared fenced stager.
 - `reconcilerd`: expired leases, ambiguous submissions, provider deadlines,
   orphan artifacts, stale reservations, outbox delivery, and economic
   reconciliation.
@@ -963,6 +964,11 @@ An accepted job stores an immutable quote/version. A retry after a price change
 keeps the accepted job's quote. Provider-reported cost is evidence for cost of
 goods, not an unreviewed customer charge.
 
+Media dimensions are explicit: image output count and video duration are never
+overloaded into one cardinality field. Active `video_second` prices require a
+positive success price, and missing prices fail admission instead of falling
+back to a zero wildcard rule.
+
 ### 13.4 Double-entry ledger
 
 Use integer monetary micros plus currency. `ledger_transactions` contain two or
@@ -970,6 +976,81 @@ more `ledger_postings`; a deferrable constraint/trigger requires postings to
 balance to zero per transaction and currency. Refunds and reconciliation are
 compensating transactions referencing the original charge. Historical entries
 are never rewritten.
+
+### 13.5 Credit Grants subledger
+
+Credit Grants are promotional, organization-scoped monetary batches. They are
+not the same control as `billing_accounts.credit_limit_micros`: the latter caps
+hard-credit risk exposure, while Grants are spendable value backed by a
+dedicated liability account.
+
+The V1 invariants are:
+
+- each batch belongs to exactly one organization and currency;
+- admission consumes available Grants before hard credit using FEFO
+  (`expires_at_ms`, then `received_at_ms`, then `grant_id`);
+- the existing `budget:{tenant}:{currency}` advisory lock serializes Grant and
+  hard-credit funding decisions, so replicas cannot reorder or double-spend a
+  batch;
+- a customer hold records gross, Grant-funded, and hard-credit-funded amounts
+  independently;
+- settlement captures Grant reservations up to the rated charge and releases
+  the remainder in the same transaction as the customer charge;
+- refunds release hard-credit-funded exposure first, then restore Grant
+  consumption in reverse consumption order;
+- restoring an expired or revoked batch records the economic reversal but does
+  not make the restored value spendable again;
+- expiration retires only unreserved available value; revocation fails while a
+  batch still has open reservations;
+- issue, reserve, consume, release, restore, expire, and revoke are append-only
+  events with semantic idempotency and sealed, balanced ledger transactions.
+
+Grant issue and revocation are platform-owner operations. Organization owners
+may view only their organization's batches and effective balance; unauthorized
+and cross-organization reads return a non-enumerating not-found response.
+The console mirrors the OpenAI organization Billing pattern: a balance summary
+and a non-navigating table of received time, state, balance, expiry, and source.
+
+### 13.6 Project spend controls
+
+Project spend controls are not another wallet. They are scoped policy over the
+same immutable customer pricing and rating evidence:
+
+- `soft` mode reports settled calendar-month spend and sends idempotent
+  threshold notifications without rejecting work;
+- `hard` mode serializes customer-pricing V4 admission per project and compares
+  settled month spend plus active quote reservations plus the new frozen
+  maximum quote against the configured limit;
+- idempotent replay validates the existing quote before the new-reservation
+  check, so retrying an accepted request never consumes the limit twice;
+- hard-limit currency mismatch fails closed instead of silently admitting an
+  unmeasured currency;
+- the hard-limit rejection rolls back the quote, funding reservation, work
+  item, and admission-state transition as one PostgreSQL transaction;
+- the console shows settled spend and active reservations separately and uses
+  an explicit switch to distinguish monitoring from enforcement.
+
+The organization billing account and Credit Grants remain the funding
+authority. A project hard limit can be stricter, but it cannot mint credit or
+override an organization-level rejection.
+
+### 13.7 Project model rate controls
+
+Project model limits use one effective policy at admission:
+
+- a configured project override takes precedence;
+- otherwise the current platform request and native-unit ceilings are inherited;
+- absence of both values means that dimension is unlimited;
+- protocol aliases for one native model share one stable bucket;
+- transactional bucket state is independent of the optional override row, so
+  changing a platform ceiling takes effect without copying stale values into
+  every project;
+- the bucket is locked and consumed in the same admission transaction, and the
+  admission session makes retries idempotent.
+
+Request and native-unit limits remain distinct. Image output count and video
+seconds consume their respective native-unit bucket; they are not inferred from
+customer price, provider quota, or project spend budget.
 
 ## 14. PostgreSQL Data Ownership
 
@@ -987,7 +1068,7 @@ Core tables by module:
 | Provider | `provider_bindings`, `provider_routes`, `provider_pools`, `provider_accounts`, `provider_account_capabilities`, `provider_account_leases`, `provider_execution_allocations`, `provider_submissions`, `provider_operations`, `provider_receipts`, `provider_spend_counters`, `cli_executions` |
 | Artifacts | `artifacts`, `artifact_links`, `input_manifests`, `artifact_manifests` |
 | Metering | `metering_events`, `price_books`, `price_versions`, `price_components`, `price_quotes`, `rated_usage` |
-| Billing | `billing_accounts`, `ledger_accounts`, `ledger_transactions`, `ledger_postings`, `refunds` |
+| Billing | `billing_accounts`, `credit_grants`, `customer_billing_holds`, `customer_billing_hold_grant_reservations`, `credit_grant_events`, `credit_grant_operations`, `ledger_accounts`, `ledger_transactions`, `ledger_postings`, `customer_refunds` |
 | Delivery | `outbox_events`, `webhook_endpoints`, `webhook_deliveries` |
 | Governance | `audit_events`, `reconciliation_runs`, `reconciliation_items`, `reconciliation_observations`, `reconciliation_decisions` |
 
@@ -1566,8 +1647,9 @@ green after every extraction step.
 - Add scoped and rotating Bearer keys plus signed-CV credential support.
 - Add provider pools/accounts/capabilities/cooldown/budgets/leases.
 - Generalize the Phase 1 Codex price/rating/ledger kernel across providers and
-  currencies; add refunds, credits, operator adjustments, exports, and full
-  reconciliation workflows.
+  currencies. Partial customer refunds and reversal evidence are implemented;
+  add credits, operator adjustments, exports, and full reconciliation
+  workflows.
 
 **Gate:** cross-tenant FKs, account thundering-herd, price-version, refund, and
 ledger-balance adversarial tests pass.

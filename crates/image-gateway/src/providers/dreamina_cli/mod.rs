@@ -6,10 +6,11 @@ use std::{
 };
 
 use image_cli_runtime::{CommandSpec, WorkingDirectory};
+use image_provider_contracts::OperationDescriptor;
 use image_provider_dreamina_cli::{
     ADAPTER_REVISION, DREAMINA_IMAGE_GENERATION_OPERATION_V1, DREAMINA_SUBMIT_COMMAND_SCHEMA,
-    DreaminaCliPolicyV1, DreaminaSubmitPayloadV1, DreaminaSubmitRequestV1, PROVIDER_ID,
-    ReceiptError, parse_receipt, parse_submit_command,
+    DREAMINA_VIDEO_GENERATION_OPERATION_V1, DreaminaCliPolicyV1, DreaminaSubmitPayloadV1,
+    DreaminaSubmitRequestV1, PROVIDER_ID, ReceiptError, parse_receipt, parse_submit_command,
 };
 use image_provider_sdk::{
     EffectCertainty, OutputSlot, PendingOperation, ProviderFailure, ProviderFailureClass,
@@ -27,8 +28,14 @@ use crate::{
     },
 };
 
+mod credential_environment;
 mod poll;
 
+pub use credential_environment::{
+    DreaminaCredentialEnvironmentError, DreaminaKeychainReplacement,
+    dreamina_account_isolation_available, dreamina_credential_fingerprint,
+    prepare_dreamina_account_home,
+};
 pub use poll::{
     DreaminaCliPollDriverConfigError, DreaminaCliPollDriverV1, DreaminaCliPollProcessConfig,
 };
@@ -132,7 +139,8 @@ impl DreaminaCliSubmitCodecV1 {
         account_home: &ProviderAccountHomeCapability,
         process: DreaminaCliSubmitProcessConfig,
     ) -> Result<Self, DreaminaCliSubmitRuntimeConfigError> {
-        let operation = DREAMINA_IMAGE_GENERATION_OPERATION_V1;
+        let operation = dreamina_operation(profile.operation_id())
+            .ok_or(DreaminaCliSubmitRuntimeConfigError::ProfileMismatch)?;
         if profile.provider_id() != PROVIDER_ID
             || profile.command_schema() != operation.command_schema
             || profile.operation_id() != operation.id
@@ -316,7 +324,10 @@ fn project_submit_command(
         u32::try_from(output_total).map_err(|_| ProviderSubmitProjectionError::OutputOutOfRange)?;
     let output = OutputSlot::new(output_index, output_total)
         .map_err(|_| ProviderSubmitProjectionError::OutputOutOfRange)?;
-    let payload = DreaminaSubmitPayloadV1::new(source_command_sha256, request)
+    if u32::from(request.output_count()) != output_total {
+        return Err(ProviderSubmitProjectionError::OutputOutOfRange);
+    }
+    let payload = DreaminaSubmitPayloadV1::new(source_command_sha256, request.into_single_output())
         .map_err(|_| ProviderSubmitProjectionError::InvalidSourceCommand)?;
     SingleOutputCommand::new(output, payload)
         .map_err(|_| ProviderSubmitProjectionError::InvalidSourceCommand)
@@ -429,6 +440,14 @@ fn request_matches_platform(
         DreaminaSubmitRequestV1::TextToVideo(request) => {
             operation_id == "videos.generations" && model == request.model().as_str()
         }
+    }
+}
+
+fn dreamina_operation(operation_id: &str) -> Option<&'static OperationDescriptor> {
+    match operation_id {
+        "images.generations" => Some(&DREAMINA_IMAGE_GENERATION_OPERATION_V1),
+        "videos.generations" => Some(&DREAMINA_VIDEO_GENERATION_OPERATION_V1),
+        _ => None,
     }
 }
 

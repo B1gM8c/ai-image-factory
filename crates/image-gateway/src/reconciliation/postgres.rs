@@ -164,13 +164,13 @@ impl ReconciliationStore for PostgresReconciliationStore {
         let now = database_now(&mut tx).await?;
         let cutoff = now.saturating_sub(grace_ms);
         let lease_expires_at_ms = now.saturating_add(lease_ms);
-        abort_expired_unreserved_edit_sessions(&mut tx, cutoff, now, limit).await?;
+        abort_expired_unreserved_input_sessions(&mut tx, cutoff, now, limit).await?;
         let sessions: Vec<Uuid> = sqlx::query_scalar(
             r#"
             WITH candidates AS (
               SELECT s.session_id
               FROM admission_sessions s
-              WHERE s.operation = 'edit'
+              WHERE s.operation IN ('edit', 'video_generation')
                 AND (
                   s.input_cleanup_state = 'pending'
                   OR (
@@ -266,7 +266,7 @@ impl ReconciliationStore for PostgresReconciliationStore {
     }
 }
 
-async fn abort_expired_unreserved_edit_sessions(
+async fn abort_expired_unreserved_input_sessions(
     tx: &mut Transaction<'_, Postgres>,
     cutoff: i64,
     now: i64,
@@ -276,7 +276,8 @@ async fn abort_expired_unreserved_edit_sessions(
         r#"
         SELECT s.session_id
         FROM admission_sessions s
-        WHERE s.operation = 'edit' AND s.state = 'receiving' AND s.job_id IS NULL
+        WHERE s.operation IN ('edit', 'video_generation')
+          AND s.state = 'receiving' AND s.job_id IS NULL
           AND s.deadline_at_ms <= $1
           AND NOT EXISTS (
             SELECT 1

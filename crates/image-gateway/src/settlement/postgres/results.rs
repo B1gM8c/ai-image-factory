@@ -27,6 +27,13 @@ struct ProjectionRow {
     limit_7d: i32,
     remaining_7d: i32,
     artifact_count: i32,
+    retention_state: String,
+}
+
+pub(super) enum GenerationManifestLookup {
+    Available(GenerationResultManifest),
+    Expired,
+    Missing,
 }
 
 #[derive(sqlx::FromRow)]
@@ -129,15 +136,23 @@ pub(super) async fn validate_completed_result(
 pub(super) async fn load_generation_manifest(
     pool: &PgPool,
     job_id: Uuid,
-) -> Result<Option<GenerationResultManifest>, ImageGatewayError> {
+) -> Result<GenerationManifestLookup, ImageGatewayError> {
     let projection: Option<ProjectionRow> = sqlx::query_as(
         r#"
         SELECT p.job_id, j.tenant_id, p.api_profile, p.operation, p.response_schema,
                p.created_at_seconds, p.output_format, p.quality, p.size, p.background,
                p.stream, p.limit_5h, p.remaining_5h, p.limit_7d, p.remaining_7d,
-               p.artifact_count
+               p.artifact_count,
+               CASE
+                 WHEN retention.state = 'available'
+                  AND retention.expires_at_ms >
+                      (EXTRACT(EPOCH FROM statement_timestamp()) * 1000)::BIGINT
+                 THEN 'available'
+                 ELSE 'expired'
+               END AS retention_state
         FROM job_response_projections p
         JOIN jobs j ON j.job_id = p.job_id
+        JOIN job_artifact_retention retention ON retention.job_id = p.job_id
         WHERE p.job_id = $1 AND j.state = 'succeeded'
         "#,
     )
@@ -146,8 +161,11 @@ pub(super) async fn load_generation_manifest(
     .await
     .map_err(result_storage_unavailable)?;
     let Some(projection) = projection else {
-        return Ok(None);
+        return Ok(GenerationManifestLookup::Missing);
     };
+    if projection.retention_state != "available" {
+        return Ok(GenerationManifestLookup::Expired);
+    }
     let artifacts: Vec<ArtifactRow> = sqlx::query_as(
         r#"
         SELECT artifact_id, tenant_id, job_id, work_item_id, execution_id, lease_epoch,
@@ -161,7 +179,7 @@ pub(super) async fn load_generation_manifest(
     .fetch_all(pool)
     .await
     .map_err(result_storage_unavailable)?;
-    manifest_from_rows(projection, artifacts).map(Some)
+    manifest_from_rows(projection, artifacts).map(GenerationManifestLookup::Available)
 }
 
 async fn load_generation_manifest_tx(
@@ -173,7 +191,7 @@ async fn load_generation_manifest_tx(
         SELECT p.job_id, j.tenant_id, p.api_profile, p.operation, p.response_schema,
                p.created_at_seconds, p.output_format, p.quality, p.size, p.background,
                p.stream, p.limit_5h, p.remaining_5h, p.limit_7d, p.remaining_7d,
-               p.artifact_count
+               p.artifact_count, 'available'::TEXT AS retention_state
         FROM job_response_projections p
         JOIN jobs j ON j.job_id = p.job_id
         WHERE p.job_id = $1
@@ -256,6 +274,26 @@ fn manifest_from_rows(
         },
         artifacts,
     })
+}
+
+pub(super) async fn generation_result_is_expired(
+    pool: &PgPool,
+    job_id: Uuid,
+) -> Result<bool, ImageGatewayError> {
+    sqlx::query_scalar(
+        r#"
+        SELECT state <> 'available'
+            OR expires_at_ms <=
+               (EXTRACT(EPOCH FROM statement_timestamp()) * 1000)::BIGINT
+        FROM job_artifact_retention
+        WHERE job_id = $1
+        "#,
+    )
+    .bind(job_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(result_storage_unavailable)?
+    .ok_or_else(ImageGatewayError::artifact_integrity)
 }
 
 fn invalid_result_number(_: impl std::fmt::Display) -> ImageGatewayError {

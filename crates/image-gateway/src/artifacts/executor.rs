@@ -1,5 +1,5 @@
 use std::{
-    io::{BufRead, BufReader, Cursor, Seek},
+    io::{BufRead, BufReader, Cursor, Read, Seek, SeekFrom},
     sync::Arc,
 };
 
@@ -147,6 +147,11 @@ impl ExecutorArtifactPublisher {
                 .ok_or(ExecutorArtifactPublishError::InvalidInput)?;
         let authority_id = manifest.artifact_authority_id();
         let media_type = media_type_from_bytes(bytes)?;
+        let media_duration_ms = if media_type == "video/mp4" {
+            Some(mp4_duration_ms(bytes)?)
+        } else {
+            None
+        };
         let expected_object_key = executor_object_key(authority_id);
         let expected_sha256_hex = sha256_hex(bytes);
         let expected_byte_size = bytes.len() as u64;
@@ -188,6 +193,7 @@ impl ExecutorArtifactPublisher {
             sha256_hex: stored.sha256_hex.clone(),
             byte_size: stored.byte_size,
             media_type: stored.identity.media_type.clone(),
+            media_duration_ms,
         };
         match self
             .authorities
@@ -247,13 +253,139 @@ impl ExecutorArtifactSink for ExecutorArtifactPublisher {
 pub(crate) fn media_type_from_bytes(
     bytes: &[u8],
 ) -> Result<&'static str, ExecutorArtifactPublishError> {
+    if validate_iso_bmff_video(bytes) {
+        return Ok("video/mp4");
+    }
     media_type_from_reader(Cursor::new(bytes))
+}
+
+fn validate_iso_bmff_video(bytes: &[u8]) -> bool {
+    validate_iso_bmff_reader(&mut Cursor::new(bytes)).unwrap_or(false)
+        && mp4_duration_ms(bytes).is_ok()
+}
+
+fn mp4_duration_ms(bytes: &[u8]) -> Result<u64, ExecutorArtifactPublishError> {
+    if !validate_iso_bmff_reader(&mut Cursor::new(bytes))
+        .map_err(|_| ExecutorArtifactPublishError::ArtifactIntegrity)?
+    {
+        return Err(ExecutorArtifactPublishError::ArtifactIntegrity);
+    }
+    let reader = mp4::Mp4Reader::read_header(Cursor::new(bytes), bytes.len() as u64)
+        .map_err(|_| ExecutorArtifactPublishError::ArtifactIntegrity)?;
+    if reader.is_fragmented() {
+        return Err(ExecutorArtifactPublishError::ArtifactIntegrity);
+    }
+    reader
+        .tracks()
+        .values()
+        .filter(|track| matches!(track.track_type(), Ok(mp4::TrackType::Video)))
+        .filter(|track| {
+            track.sample_count() > 0
+                && track.media_type().is_ok()
+                && track.width() > 0
+                && track.height() > 0
+        })
+        .map(|track| {
+            let timescale = u128::from(track.trak.mdia.mdhd.timescale);
+            let duration_units = u128::from(track.trak.mdia.mdhd.duration);
+            if timescale == 0 {
+                return Err(ExecutorArtifactPublishError::ArtifactIntegrity);
+            }
+            duration_units
+                .checked_mul(1_000)
+                .and_then(|value| value.checked_add(timescale - 1))
+                .map(|value| value / timescale)
+                .and_then(|value| u64::try_from(value).ok())
+                .filter(|value| (1..=86_400_000).contains(value))
+                .ok_or(ExecutorArtifactPublishError::ArtifactIntegrity)
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .max()
+        .ok_or(ExecutorArtifactPublishError::ArtifactIntegrity)
+}
+
+fn validate_iso_bmff_reader<R>(reader: &mut R) -> std::io::Result<bool>
+where
+    R: Read + Seek,
+{
+    const MAX_TOP_LEVEL_BOXES: usize = 65_536;
+    let length = reader.seek(SeekFrom::End(0))?;
+    reader.seek(SeekFrom::Start(0))?;
+    if length < 32 {
+        return Ok(false);
+    }
+    let mut offset = 0_u64;
+    let mut boxes = 0_usize;
+    let mut saw_ftyp = false;
+    let mut saw_moov = false;
+    let mut saw_mdat = false;
+    while offset < length {
+        boxes += 1;
+        if boxes > MAX_TOP_LEVEL_BOXES || length.saturating_sub(offset) < 8 {
+            return Ok(false);
+        }
+        reader.seek(SeekFrom::Start(offset))?;
+        let mut header = [0_u8; 16];
+        reader.read_exact(&mut header[..8])?;
+        let size32 = u32::from_be_bytes(header[..4].try_into().unwrap());
+        let box_type: [u8; 4] = header[4..8].try_into().unwrap();
+        let (header_size, box_size) = match size32 {
+            0 => (8_u64, length - offset),
+            1 => {
+                if length.saturating_sub(offset) < 16 {
+                    return Ok(false);
+                }
+                reader.read_exact(&mut header[8..16])?;
+                (16, u64::from_be_bytes(header[8..16].try_into().unwrap()))
+            }
+            size => (8, u64::from(size)),
+        };
+        if box_size < header_size || box_size > length - offset {
+            return Ok(false);
+        }
+        match &box_type {
+            b"ftyp" => {
+                if offset != 0 || box_size < header_size + 8 || saw_ftyp {
+                    return Ok(false);
+                }
+                saw_ftyp = true;
+            }
+            b"moov" => {
+                if box_size <= header_size {
+                    return Ok(false);
+                }
+                saw_moov = true;
+            }
+            b"mdat" => {
+                if box_size <= header_size {
+                    return Ok(false);
+                }
+                saw_mdat = true;
+            }
+            _ => {}
+        }
+        offset += box_size;
+        if size32 == 0 && offset != length {
+            return Ok(false);
+        }
+    }
+    Ok(offset == length && saw_ftyp && saw_moov && saw_mdat)
 }
 
 pub(super) fn media_type_from_file(
     file: std::fs::File,
 ) -> Result<&'static str, ExecutorArtifactPublishError> {
-    media_type_from_reader(BufReader::new(file))
+    let mut reader = BufReader::new(file);
+    if validate_iso_bmff_reader(&mut reader)
+        .map_err(|_| ExecutorArtifactPublishError::ArtifactIntegrity)?
+    {
+        return Ok("video/mp4");
+    }
+    reader
+        .seek(SeekFrom::Start(0))
+        .map_err(|_| ExecutorArtifactPublishError::ArtifactIntegrity)?;
+    media_type_from_reader(reader)
 }
 
 fn media_type_from_reader<R>(reader: R) -> Result<&'static str, ExecutorArtifactPublishError>
@@ -397,6 +529,7 @@ mod tests {
         assert_eq!(authority.sha256_hex, sha256_hex(&bytes));
         assert_eq!(authority.byte_size, bytes.len() as u64);
         assert_eq!(authority.media_type, "image/png");
+        assert_eq!(authority.media_duration_ms, None);
         assert!(
             authority
                 .object_key
@@ -428,6 +561,48 @@ mod tests {
                 .unwrap();
         assert_ne!(generic.object_key, metadata.object_key);
         assert_eq!(blobs.get_executor_artifact(&metadata).await.unwrap(), bytes);
+    }
+
+    #[tokio::test]
+    async fn publisher_accepts_structurally_bounded_mp4_and_rejects_magic_only_bytes() {
+        let blobs = Arc::new(InMemoryArtifactBlobStore::default());
+        let authorities = Arc::new(FakeAuthorityStore::default());
+        let publisher = ExecutorArtifactPublisher::new(blobs, authorities.clone());
+        let bytes = minimal_mp4();
+
+        publisher.publish(&lease(), &bytes).await.unwrap();
+        assert_eq!(
+            authorities
+                .published
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .media_type,
+            "video/mp4"
+        );
+        assert_eq!(
+            authorities
+                .published
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .media_duration_ms,
+            Some(8_000)
+        );
+        assert_eq!(
+            media_type_from_bytes(b"\0\0\0\x18ftypisom\0\0\0\0isommp42"),
+            Err(ExecutorArtifactPublishError::ArtifactIntegrity)
+        );
+        assert_eq!(
+            media_type_from_bytes(&container_without_track()),
+            Err(ExecutorArtifactPublishError::ArtifactIntegrity)
+        );
+        assert_eq!(
+            media_type_from_bytes(&minimal_audio_mp4()),
+            Err(ExecutorArtifactPublishError::ArtifactIntegrity)
+        );
     }
 
     #[tokio::test]
@@ -558,5 +733,77 @@ mod tests {
             .write_to(&mut cursor, image::ImageFormat::Png)
             .unwrap();
         cursor.into_inner()
+    }
+
+    fn minimal_mp4() -> Vec<u8> {
+        let config = mp4::Mp4Config {
+            major_brand: "isom".parse().unwrap(),
+            minor_version: 512,
+            compatible_brands: vec!["isom".parse().unwrap(), "avc1".parse().unwrap()],
+            timescale: 1_000,
+        };
+        let mut writer = mp4::Mp4Writer::write_start(Cursor::new(Vec::new()), &config).unwrap();
+        writer
+            .add_track(
+                &mp4::AvcConfig {
+                    width: 16,
+                    height: 16,
+                    seq_param_set: vec![0x67, 0x42, 0x00, 0x1e],
+                    pic_param_set: vec![0x68, 0xce, 0x3c, 0x80],
+                }
+                .into(),
+            )
+            .unwrap();
+        writer
+            .write_sample(
+                1,
+                &mp4::Mp4Sample {
+                    start_time: 0,
+                    duration: 8_000,
+                    rendering_offset: 0,
+                    is_sync: true,
+                    bytes: vec![0, 0, 0, 1, 0x65].into(),
+                },
+            )
+            .unwrap();
+        writer.write_end().unwrap();
+        writer.into_writer().into_inner()
+    }
+
+    fn minimal_audio_mp4() -> Vec<u8> {
+        let config = mp4::Mp4Config {
+            major_brand: "isom".parse().unwrap(),
+            minor_version: 512,
+            compatible_brands: vec!["isom".parse().unwrap(), "mp41".parse().unwrap()],
+            timescale: 1_000,
+        };
+        let mut writer = mp4::Mp4Writer::write_start(Cursor::new(Vec::new()), &config).unwrap();
+        writer.add_track(&mp4::AacConfig::default().into()).unwrap();
+        writer
+            .write_sample(
+                1,
+                &mp4::Mp4Sample {
+                    start_time: 0,
+                    duration: 1_000,
+                    rendering_offset: 0,
+                    is_sync: true,
+                    bytes: vec![0].into(),
+                },
+            )
+            .unwrap();
+        writer.write_end().unwrap();
+        writer.into_writer().into_inner()
+    }
+
+    fn container_without_track() -> Vec<u8> {
+        let config = mp4::Mp4Config {
+            major_brand: "isom".parse().unwrap(),
+            minor_version: 512,
+            compatible_brands: vec!["isom".parse().unwrap()],
+            timescale: 1_000,
+        };
+        let mut writer = mp4::Mp4Writer::write_start(Cursor::new(Vec::new()), &config).unwrap();
+        writer.write_end().unwrap();
+        writer.into_writer().into_inner()
     }
 }

@@ -9,6 +9,8 @@ use std::{
 use tempfile::TempDir;
 use uuid::Uuid;
 
+use image_provider_contracts::{ProviderCostEvidenceScope, ProviderReportedCostEvidenceV1};
+
 use super::{
     FilesystemRunnerJournal, LaunchDecision, RunnerJournalError, RunnerJournalObservation,
 };
@@ -173,6 +175,28 @@ fn terminal_replay_is_idempotent_but_different_value_conflicts() {
             },
         ),
         Err(RunnerJournalError::Conflict)
+    );
+}
+
+#[test]
+fn terminal_replay_preserves_provider_cost_and_rejects_wrong_provider() {
+    let (_temp, journal) = journal();
+    let lease = lease();
+    journal.start_or_attach(&lease).unwrap();
+    journal.commit_launch(&lease).unwrap();
+    let outcome = success_with_cost("provider-test", 200_000_000);
+
+    journal.publish_terminal(&lease, &outcome).unwrap();
+    assert_eq!(
+        journal.start_or_attach(&lease).unwrap(),
+        RunnerJournalObservation::Terminal(outcome.clone())
+    );
+    assert_eq!(
+        journal.publish_terminal(
+            &lease,
+            &success_with_cost("different-provider", 200_000_000),
+        ),
+        Err(RunnerJournalError::InvalidInput)
     );
 }
 
@@ -365,6 +389,7 @@ fn terminal_manifest_persists_only_valid_authority_references_and_error_codes() 
     let aliased_identity = RunnerOutcome::Succeeded(ExecutorResultManifest {
         manifest_id: base.artifact_authority_id,
         artifact_authority_id: base.artifact_authority_id,
+        provider_reported_cost: None,
     });
     assert_eq!(
         journal.publish_terminal(&lease, &aliased_identity),
@@ -493,6 +518,24 @@ fn lease() -> ExecutorSubmissionLease {
 
 fn success() -> RunnerOutcome {
     RunnerOutcome::Succeeded(ExecutorResultManifest::new(Uuid::new_v4(), Uuid::new_v4()).unwrap())
+}
+
+fn success_with_cost(provider_id: &str, native_quantity: u128) -> RunnerOutcome {
+    let evidence = ProviderReportedCostEvidenceV1::usd_ticks(
+        ProviderCostEvidenceScope::CliInvocation,
+        provider_id,
+        "provider_cli",
+        "provider-operation-1",
+        native_quantity,
+        br#"{"total_cost_usd_ticks":200000000}"#,
+        "end.total_cost_usd_ticks",
+    )
+    .unwrap();
+    RunnerOutcome::Succeeded(
+        ExecutorResultManifest::new(Uuid::new_v4(), Uuid::new_v4())
+            .and_then(|manifest| manifest.with_provider_reported_cost(Some(evidence)))
+            .unwrap(),
+    )
 }
 
 fn read_tree(path: &Path) -> String {

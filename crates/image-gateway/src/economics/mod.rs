@@ -7,7 +7,8 @@ use uuid::Uuid;
 
 pub use postgres::PostgresEconomicSettlementStore;
 pub(crate) use postgres::{
-    admit_job_outputs, settle_receipt_in_transaction, validate_admitted_job_outputs,
+    admit_job_outputs, record_v4_provider_receipt_in_transaction, settle_receipt_in_transaction,
+    validate_admitted_job_outputs,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -30,19 +31,12 @@ impl EconomicReceiptOutcome {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ProviderCost {
-    amount_micros: i64,
-    currency: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EconomicReceipt {
     submission_id: Uuid,
     outcome: EconomicReceiptOutcome,
     receipt_schema: String,
     payload_hash: String,
     evidence: Value,
-    provider_cost: Option<ProviderCost>,
 }
 
 impl EconomicReceipt {
@@ -60,7 +54,6 @@ impl EconomicReceipt {
             receipt_schema,
             payload_hash,
             evidence,
-            provider_cost: None,
         };
         postgres::validate_receipt(&receipt)?;
         Ok(receipt)
@@ -78,6 +71,12 @@ pub struct EconomicSettlement {
     pub meter_event_id: Uuid,
     pub rated_usage_id: Option<Uuid>,
     pub customer_ledger_transaction_id: Option<Uuid>,
+    pub outcome: EconomicReceiptOutcome,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ProviderReceiptRecord {
+    pub receipt_id: Uuid,
     pub outcome: EconomicReceiptOutcome,
 }
 

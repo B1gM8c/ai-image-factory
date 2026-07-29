@@ -9,7 +9,8 @@ use tokio::time::{Instant, MissedTickBehavior};
 
 use super::{
     CanonicalExecutorOutcome, CustomerArtifactPublishError, CustomerArtifactPublisher,
-    ExecutorTerminalError, ExecutorTerminalLease, ExecutorTerminalStore,
+    ExecutorTerminalBlockReason, ExecutorTerminalError, ExecutorTerminalLease,
+    ExecutorTerminalStore,
 };
 use crate::artifacts::ArtifactMetadata;
 
@@ -108,21 +109,53 @@ where
                 let (lease, artifact) = self
                     .run_with_heartbeat(lease, self.publisher.publish(&publication_lease))
                     .await?;
-                (lease, Some(artifact?))
+                match artifact {
+                    Ok(artifact) => (lease, Some(artifact)),
+                    Err(error @ CustomerArtifactPublishError::InvalidInput) => {
+                        self.store
+                            .block_terminal(&lease, ExecutorTerminalBlockReason::InvalidInput)
+                            .await?;
+                        return Err(error.into());
+                    }
+                    Err(error @ CustomerArtifactPublishError::Integrity) => {
+                        self.store
+                            .block_terminal(&lease, ExecutorTerminalBlockReason::ArtifactIntegrity)
+                            .await?;
+                        return Err(error.into());
+                    }
+                    Err(error @ CustomerArtifactPublishError::Unavailable) => {
+                        return Err(error.into());
+                    }
+                }
             } else {
                 (lease, None)
             };
 
         let completion_lease = lease.clone();
-        let (_, completion) = self
+        let (lease, completion) = self
             .run_with_heartbeat(
                 lease,
                 self.store
                     .complete_terminal(&completion_lease, customer_artifact.as_ref()),
             )
             .await?;
-        completion?;
-        Ok(ReducerDaemonRun::Completed)
+        match completion {
+            Ok(_) => Ok(ReducerDaemonRun::Completed),
+            Err(error @ ExecutorTerminalError::Conflict) => {
+                self.store
+                    .block_terminal(&lease, ExecutorTerminalBlockReason::CanonicalConflict)
+                    .await?;
+                Err(error.into())
+            }
+            Err(error @ ExecutorTerminalError::InvalidInput) => {
+                self.store
+                    .block_terminal(&lease, ExecutorTerminalBlockReason::InvalidInput)
+                    .await?;
+                Err(error.into())
+            }
+            Err(error @ ExecutorTerminalError::Unavailable)
+            | Err(error @ ExecutorTerminalError::StaleLease) => Err(error.into()),
+        }
     }
 
     pub async fn run_until_shutdown<F>(

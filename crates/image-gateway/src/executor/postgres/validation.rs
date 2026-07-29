@@ -14,10 +14,10 @@ const MAX_IMAGE_OUTPUTS: i32 = 10;
 const MAX_EXECUTOR_LEASE_MS: i64 = 24 * 60 * 60 * 1_000;
 
 pub(super) fn command_output_count(
-    requested_units: i32,
+    output_count: i32,
     command_json: &Value,
 ) -> Result<i32, ExecutorSubmissionError> {
-    if !(1..=MAX_IMAGE_OUTPUTS).contains(&requested_units) {
+    if !(1..=MAX_IMAGE_OUTPUTS).contains(&output_count) {
         return Err(ExecutorSubmissionError::InvalidInput);
     }
     if let Some(value) = command_json.get("n") {
@@ -26,11 +26,21 @@ pub(super) fn command_output_count(
             .and_then(|value| i32::try_from(value).ok())
             .filter(|value| (1..=MAX_IMAGE_OUTPUTS).contains(value))
             .ok_or(ExecutorSubmissionError::InvalidInput)?;
-        if requested_units != command_units {
+        if output_count != command_units {
             return Err(ExecutorSubmissionError::Conflict);
         }
     }
-    Ok(requested_units)
+    if let Some(value) = command_json.get("generate_num") {
+        let command_units = value
+            .as_u64()
+            .and_then(|value| i32::try_from(value).ok())
+            .filter(|value| (1..=MAX_IMAGE_OUTPUTS).contains(value))
+            .ok_or(ExecutorSubmissionError::InvalidInput)?;
+        if output_count != command_units {
+            return Err(ExecutorSubmissionError::Conflict);
+        }
+    }
+    Ok(output_count)
 }
 
 pub(super) fn command_hash(command: &Value) -> Result<String, ExecutorSubmissionError> {
@@ -161,7 +171,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn requested_units_are_authoritative_for_provider_specific_commands() {
+    fn output_count_is_authoritative_for_provider_specific_commands() {
         assert_eq!(
             command_output_count(
                 1,

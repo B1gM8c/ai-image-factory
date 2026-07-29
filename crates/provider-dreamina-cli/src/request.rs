@@ -17,6 +17,7 @@ pub enum ImageModelVersion {
     V4_6,
     V4_7,
     V5_0,
+    V5_0Pro,
 }
 
 impl ImageModelVersion {
@@ -30,6 +31,7 @@ impl ImageModelVersion {
             Self::V4_6 => "4.6",
             Self::V4_7 => "4.7",
             Self::V5_0 => "5.0",
+            Self::V5_0Pro => "5.0Pro",
         }
     }
 
@@ -41,6 +43,7 @@ impl ImageModelVersion {
             Self::V4_0 | Self::V4_1 | Self::V4_5 | Self::V4_6 | Self::V4_7 | Self::V5_0 => {
                 matches!(resolution, ImageResolution::K2 | ImageResolution::K4)
             }
+            Self::V5_0Pro => true,
         }
     }
 }
@@ -166,7 +169,9 @@ impl VideoResolution {
 pub struct TextToImageRequestV1 {
     prompt: String,
     model: ImageModelVersion,
-    ratio: ImageRatio,
+    ratio: Option<ImageRatio>,
+    width: Option<u32>,
+    height: Option<u32>,
     resolution: ImageResolution,
     generate_num: u8,
 }
@@ -189,7 +194,36 @@ impl TextToImageRequestV1 {
         Ok(Self {
             prompt,
             model,
-            ratio,
+            ratio: Some(ratio),
+            width: None,
+            height: None,
+            resolution,
+            generate_num,
+        })
+    }
+
+    pub fn new_custom(
+        prompt: impl Into<String>,
+        model: ImageModelVersion,
+        width: u32,
+        height: u32,
+        resolution: ImageResolution,
+        generate_num: u8,
+    ) -> Result<Self, RequestValidationError> {
+        let prompt = validate_prompt(prompt.into())?;
+        if !(1..=10).contains(&generate_num) {
+            return Err(RequestValidationError::InvalidGenerateNum(generate_num));
+        }
+        if !model.supports(resolution) {
+            return Err(RequestValidationError::UnsupportedImageResolution { model, resolution });
+        }
+        validate_custom_dimensions(width, height, resolution)?;
+        Ok(Self {
+            prompt,
+            model,
+            ratio: None,
+            width: Some(width),
+            height: Some(height),
             resolution,
             generate_num,
         })
@@ -203,8 +237,16 @@ impl TextToImageRequestV1 {
         self.model
     }
 
-    pub fn ratio(&self) -> ImageRatio {
+    pub fn ratio(&self) -> Option<ImageRatio> {
         self.ratio
+    }
+
+    pub fn width(&self) -> Option<u32> {
+        self.width
+    }
+
+    pub fn height(&self) -> Option<u32> {
+        self.height
     }
 
     pub fn resolution(&self) -> ImageResolution {
@@ -215,21 +257,42 @@ impl TextToImageRequestV1 {
         self.generate_num
     }
 
+    pub(crate) fn into_single_output(mut self) -> Self {
+        self.generate_num = 1;
+        self
+    }
+
     pub fn to_argv(&self) -> Vec<OsString> {
-        vec![
+        let mut arguments = vec![
             "text2image".into(),
             "--prompt".into(),
             self.prompt.clone().into(),
             "--model_version".into(),
             self.model.as_str().into(),
-            "--ratio".into(),
-            self.ratio.as_str().into(),
             "--resolution_type".into(),
             self.resolution.as_str().into(),
             "--generate_num".into(),
             self.generate_num.to_string().into(),
             "--poll=0".into(),
-        ]
+        ];
+        match (self.ratio, self.width, self.height) {
+            (Some(ratio), None, None) => {
+                arguments.splice(5..5, [OsString::from("--ratio"), ratio.as_str().into()]);
+            }
+            (None, Some(width), Some(height)) => {
+                arguments.splice(
+                    5..5,
+                    [
+                        OsString::from("--width"),
+                        width.to_string().into(),
+                        OsString::from("--height"),
+                        height.to_string().into(),
+                    ],
+                );
+            }
+            _ => unreachable!("validated Dreamina image geometry is complete"),
+        }
+        arguments
     }
 }
 
@@ -377,6 +440,12 @@ pub enum RequestValidationError {
         model: ImageModelVersion,
         resolution: ImageResolution,
     },
+    #[error("custom image dimensions {width}x{height} are invalid for {resolution:?}")]
+    InvalidImageDimensions {
+        width: u32,
+        height: u32,
+        resolution: ImageResolution,
+    },
     #[error("video duration must be between 4 and 15 seconds, got {0}")]
     InvalidVideoDuration(u8),
     #[error("video model {model:?} does not support resolution {resolution:?}")]
@@ -404,4 +473,27 @@ fn validate_prompt(prompt: String) -> Result<String, RequestValidationError> {
         return Err(RequestValidationError::InvalidPrompt);
     }
     Ok(prompt)
+}
+
+fn validate_custom_dimensions(
+    width: u32,
+    height: u32,
+    resolution: ImageResolution,
+) -> Result<(), RequestValidationError> {
+    let (minimum, maximum, max_pixels) = match resolution {
+        ImageResolution::K1 => (512_u32, 2_016_u32, 1_763_584_u64),
+        ImageResolution::K2 => (768, 3_072, 4_194_304),
+        ImageResolution::K4 => (1_536, 6_240, 16_777_216),
+    };
+    if !(minimum..=maximum).contains(&width)
+        || !(minimum..=maximum).contains(&height)
+        || u64::from(width) * u64::from(height) > max_pixels
+    {
+        return Err(RequestValidationError::InvalidImageDimensions {
+            width,
+            height,
+            resolution,
+        });
+    }
+    Ok(())
 }

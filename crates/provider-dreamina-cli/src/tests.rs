@@ -367,12 +367,16 @@ fn canonical_submit_parser_rejects_drift_and_revalidates_official_options() {
         br#"{"operation":"text2image","schema_version":2,"prompt":"p","model_version":"5.0","ratio":"1:1","resolution_type":"2k","generate_num":1,"poll":0}"#.as_slice(),
         br#"{"operation":"text2image","schema_version":1,"prompt":"p","model_version":"5.0","ratio":"1:1","resolution_type":"2k","generate_num":1,"poll":1}"#.as_slice(),
         br#"{"operation":"text2image","schema_version":1,"prompt":"p","model_version":"future","ratio":"1:1","resolution_type":"2k","generate_num":1,"poll":0}"#.as_slice(),
-        br#"{"operation":"text2image","schema_version":1,"prompt":"p","model_version":"5.0","ratio":"1:1","resolution_type":"2k","generate_num":2,"poll":0}"#.as_slice(),
         br#"{"operation":"text2image","schema_version":1,"prompt":"p","model_version":"5.0","ratio":"1:1","resolution_type":"2k","generate_num":1,"poll":0,"unknown":true}"#.as_slice(),
         br#"{"operation":"text2image","schema_version":1,"prompt":"p","model_version":"5.0","ratio":"1:1","resolution_type":"2k","generate_num":1,"poll":0}{}"#.as_slice(),
     ] {
         assert!(parse_submit_command(invalid).is_err(), "{invalid:?}");
     }
+
+    let batch = br#"{"operation":"text2image","schema_version":1,"prompt":"p","model_version":"5.0","ratio":"1:1","resolution_type":"2k","generate_num":2,"poll":0}"#;
+    let parsed = parse_submit_command(batch).unwrap();
+    assert_eq!(parsed.output_count(), 2);
+    assert_eq!(parsed.into_single_output().output_count(), 1);
 }
 
 #[test]

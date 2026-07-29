@@ -74,7 +74,7 @@ impl ProviderRuntimeProfileStore for PostgresProviderTaskStore {
                    profile.credential_ref, profile.credential_revision,
                    account.credential_auth_sha256,
                    profile.resource_policy_id, profile.resource_policy_revision,
-                   policy.max_concurrency
+                   control.desired_max_concurrency AS max_concurrency
             FROM provider_execution_profiles profile
             JOIN provider_credential_pools pool
               ON pool.credential_pool_id = profile.credential_pool_id
@@ -94,6 +94,9 @@ impl ProviderRuntimeProfileStore for PostgresProviderTaskStore {
              AND policy.provider_account_id = profile.provider_account_id
              AND policy.provider_id = profile.provider_id
              AND policy.state = 'enabled'
+            JOIN provider_account_execution_controls control
+              ON control.provider_account_id = profile.provider_account_id
+             AND control.lifecycle_state IN ('active', 'draining')
             WHERE profile.profile_key = $1
               AND profile.state = 'enabled'
               AND profile.completion_mode = 'remote_task'

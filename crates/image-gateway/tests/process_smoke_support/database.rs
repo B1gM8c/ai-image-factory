@@ -1,4 +1,4 @@
-use std::{env, time::Duration};
+use std::{env, path::Path, time::Duration};
 
 use gpt_image_2_gateway::{
     CodexExecutionProfileProvisioning,
@@ -149,6 +149,7 @@ impl TestDatabase {
 
     pub(crate) async fn provision_codex_execution_profile(
         &self,
+        credential_home: &Path,
         credential_auth_sha256: String,
     ) -> TestResult<ExecutionProfile> {
         let suffix = Uuid::new_v4().simple().to_string();
@@ -163,9 +164,55 @@ impl TestDatabase {
             credential_auth_sha256,
             max_concurrency: 2,
         };
-        provision_codex_execution_profile(&self.pool, &provisioning)
+        let provisioned = provision_codex_execution_profile(&self.pool, &provisioning)
             .await
             .map_err(|error| format!("production Codex profile provisioning failed: {error}"))?;
+        let now: i64 = sqlx::query_scalar(
+            "SELECT FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|error| format!("failed to read database time for V2 account: {error}"))?;
+        sqlx::query(
+            r#"
+            INSERT INTO provider_account_environments
+              (provider_account_id, provider_id, environment_kind, environment_ref,
+               upstream_identity_sha256, display_name, account_email, state,
+               created_at_ms, updated_at_ms)
+            VALUES ($1, 'openai-codex', 'codex_home_v1', $2, $3,
+                    'Process smoke Codex account', NULL, 'active', $4, $4)
+            "#,
+        )
+        .bind(provisioned.provider_account_id)
+        .bind(credential_home.to_string_lossy().as_ref())
+        .bind(&provisioning.credential_auth_sha256)
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        .map_err(|error| format!("failed to configure V2 credential environment: {error}"))?;
+        let next_refresh_at_ms = now
+            .checked_add(3_600_000)
+            .ok_or_else(|| "V2 credential refresh deadline overflowed".to_string())?;
+        let updated = sqlx::query(
+            r#"
+            UPDATE provider_account_credential_heads
+            SET refresh_after_ms = $2, next_refresh_at_ms = $2, updated_at_ms = $3
+            WHERE provider_account_id = $1
+            "#,
+        )
+        .bind(provisioned.provider_account_id)
+        .bind(next_refresh_at_ms)
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        .map_err(|error| format!("failed to defer V2 credential refresh: {error}"))?;
+        require(
+            updated.rows_affected() == 1,
+            format!(
+                "expected one V2 credential head, updated {}",
+                updated.rows_affected()
+            ),
+        )?;
         Ok(ExecutionProfile {
             profile_key,
             credential_ref,
@@ -189,6 +236,64 @@ impl TestDatabase {
         })
         .await
         .map_err(|_| format!("durable queue did not reach {expected} active work items"))?
+    }
+
+    pub(crate) async fn process_state_diagnostics(&self) -> TestResult<String> {
+        sqlx::query_scalar(
+            r#"
+            SELECT jsonb_pretty(jsonb_build_object(
+                'jobs', (
+                    SELECT COALESCE(jsonb_agg(jsonb_build_object(
+                        'state', state, 'error_code', last_error_code
+                    ) ORDER BY created_at_ms), '[]'::jsonb)
+                    FROM jobs
+                ),
+                'work_items', (
+                    SELECT COALESCE(jsonb_agg(jsonb_build_object(
+                        'state', state, 'lease_epoch', lease_epoch
+                    ) ORDER BY created_at_ms), '[]'::jsonb)
+                    FROM work_items
+                ),
+                'job_outputs', (
+                    SELECT COALESCE(jsonb_agg(jsonb_build_object(
+                        'output_index', output_index, 'state', state, 'error_code', error_code
+                    ) ORDER BY output_index), '[]'::jsonb)
+                    FROM job_outputs
+                ),
+                'provider_submissions', (
+                    SELECT COALESCE(jsonb_agg(jsonb_build_object(
+                        'state', state, 'error_code', error_code
+                    ) ORDER BY prepared_at_ms), '[]'::jsonb)
+                    FROM provider_submissions
+                ),
+                'executor_executions', (
+                    SELECT COALESCE(jsonb_agg(jsonb_build_object(
+                        'state', state, 'error_code', error_code
+                    ) ORDER BY created_at_ms), '[]'::jsonb)
+                    FROM executor_executions
+                ),
+                'terminal_reductions', (
+                    SELECT COALESCE(jsonb_agg(jsonb_build_object(
+                        'resolved_state', resolved_state, 'state', state
+                    ) ORDER BY created_at_ms), '[]'::jsonb)
+                    FROM executor_terminal_reductions
+                ),
+                'credential_heads', (
+                    SELECT COALESCE(jsonb_agg(jsonb_build_object(
+                        'lifecycle_state', lifecycle_state,
+                        'refresh_strategy', refresh_strategy,
+                        'next_refresh_at_ms', next_refresh_at_ms,
+                        'lease_owner', lease_owner,
+                        'last_error_code', last_error_code
+                    ) ORDER BY created_at_ms), '[]'::jsonb)
+                    FROM provider_account_credential_heads
+                )
+            ))::TEXT
+            "#,
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|error| format!("failed to read process smoke state diagnostics: {error}"))
     }
 
     pub(crate) async fn assert_transitions(&self, request_id: &str) -> TestResult {

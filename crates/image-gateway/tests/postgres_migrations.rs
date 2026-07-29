@@ -1,20 +1,22 @@
 use std::{env, time::Duration};
 
 use gpt_image_2_gateway::{
-    ApiKeyKeyring, ApiKeyStore, ImageGatewayError, PostgresApiKeyStore, PostgresUsageStore,
-    UsageCharge, UsageLimits, UsageStore,
+    ApiKeyKeyring, ApiKeyPermissionMode, ApiKeyPermissions, ApiKeyStore, CredentialResolveError,
+    ImageGatewayError, OperationalCredentialResolver, PostgresApiKeyStore, PostgresCredentialStore,
+    PostgresUsageStore, UsageCharge, UsageLimits, UsageStore,
     database::{
         connect_pool, connect_test_pool_with_search_path, run_migrations, verify_migrations,
     },
 };
-use sqlx::{AssertSqlSafe, PgPool};
+use sqlx::{AssertSqlSafe, PgPool, postgres::PgListener};
 use tokio::time::timeout;
 use uuid::Uuid;
 
 type TestResult<T = ()> = Result<T, String>;
 
-const REQUIRED_COLUMNS: [(&str, &str); 179] = [
+const REQUIRED_COLUMNS: [(&str, &str); 899] = [
     ("usage_events", "tenant_id"),
+    ("usage_events", "job_id"),
     ("quota_reservations", "tenant_id"),
     ("quota_reservations", "job_id"),
     ("quota_reservations", "committed_units"),
@@ -29,6 +31,514 @@ const REQUIRED_COLUMNS: [(&str, &str); 179] = [
     ("jobs", "last_error_message"),
     ("gateway_api_keys", "hash_algorithm"),
     ("gateway_api_keys", "pepper_version"),
+    ("gateway_projects", "id"),
+    ("gateway_projects", "tenant_id"),
+    ("gateway_projects", "archived_at"),
+    ("gateway_projects", "service_tier"),
+    ("gateway_projects", "user_api_keys_disabled"),
+    ("gateway_projects", "settings_version"),
+    ("gateway_projects", "file_storage_limit_bytes"),
+    ("gateway_projects", "file_storage_limit_count"),
+    ("job_service_tier_decisions", "job_id"),
+    ("job_service_tier_decisions", "requested_service_tier"),
+    ("job_service_tier_decisions", "project_service_tier"),
+    ("job_service_tier_decisions", "effective_service_tier"),
+    ("job_service_tier_decisions", "fallback_reason"),
+    ("job_service_tier_decisions", "created_at_ms"),
+    ("gateway_service_accounts", "tenant_id"),
+    ("gateway_service_accounts", "owner_type"),
+    ("gateway_service_accounts", "owner_user_id"),
+    ("gateway_api_keys", "tenant_id"),
+    ("gateway_api_keys", "expires_at"),
+    ("gateway_api_keys", "authz_version"),
+    ("gateway_api_keys", "permission_mode"),
+    ("gateway_api_keys", "permissions"),
+    ("gateway_api_keys", "created_by_user_id"),
+    ("gateway_api_keys", "revoked_by_user_id"),
+    ("gateway_api_keys", "revocation_reason"),
+    ("job_auth_attributions", "job_id"),
+    ("job_auth_attributions", "tenant_id"),
+    ("job_auth_attributions", "project_id"),
+    ("job_auth_attributions", "service_account_id"),
+    ("job_auth_attributions", "api_key_id"),
+    ("job_auth_attributions", "credential_authz_version"),
+    ("job_auth_attributions", "credential_owner_user_id"),
+    ("job_auth_attributions", "actor_user_id"),
+    ("job_auth_attributions", "actor_session_id"),
+    ("job_auth_attributions", "actor_authz_version"),
+    ("job_auth_attributions", "route_provider_id"),
+    ("job_auth_attributions", "route_operation_id"),
+    ("job_auth_attributions", "route_command_schema"),
+    ("job_auth_attributions", "route_id"),
+    ("job_auth_attributions", "route_revision"),
+    ("job_auth_attributions", "auth_kind"),
+    ("job_auth_attributions", "admitted_at_ms"),
+    ("provider_account_environments", "provider_account_id"),
+    ("provider_account_environments", "environment_ref"),
+    ("provider_account_environments", "upstream_identity_sha256"),
+    ("provider_account_login_sessions", "login_session_id"),
+    ("provider_account_login_sessions", "status"),
+    ("provider_account_login_sessions", "login_method"),
+    ("provider_account_login_sessions", "authorization_url"),
+    ("provider_account_login_sessions", "provider_account_id"),
+    ("provider_account_quota_snapshots", "provider_account_id"),
+    ("provider_account_quota_snapshots", "status"),
+    ("provider_account_quota_windows", "provider_account_id"),
+    ("provider_account_quota_windows", "limit_id"),
+    ("provider_account_quota_windows", "window_role"),
+    ("provider_account_quota_windows", "used_percent"),
+    (
+        "provider_account_credential_revisions",
+        "provider_account_id",
+    ),
+    ("provider_account_credential_revisions", "revision"),
+    ("provider_account_credential_revisions", "material_kind"),
+    (
+        "provider_account_credential_revisions",
+        "material_fingerprint_sha256",
+    ),
+    (
+        "provider_account_credential_revisions",
+        "access_expires_at_ms",
+    ),
+    ("provider_account_credential_heads", "provider_account_id"),
+    ("provider_account_credential_heads", "active_revision"),
+    ("provider_account_credential_heads", "lifecycle_state"),
+    ("provider_account_credential_heads", "refresh_strategy"),
+    ("provider_account_credential_heads", "next_refresh_at_ms"),
+    ("provider_account_credential_heads", "lease_epoch"),
+    ("provider_account_credential_heads", "control_version"),
+    ("provider_account_credential_events", "credential_event_id"),
+    ("provider_account_credential_events", "event_type"),
+    ("provider_routes", "route_id"),
+    ("provider_routes", "revision"),
+    ("provider_routes", "route_kind"),
+    ("provider_routes", "selection_strategy"),
+    ("provider_routes", "quota_freshness_ms"),
+    ("provider_routes", "unknown_quota_policy"),
+    ("provider_route_heads", "current_revision"),
+    ("provider_route_heads", "state"),
+    ("provider_route_members", "route_id"),
+    ("provider_route_members", "execution_profile_id"),
+    ("provider_route_members", "minimum_remaining_percent"),
+    ("provider_route_model_mappings", "route_id"),
+    ("provider_route_model_mappings", "route_revision"),
+    ("provider_route_model_mappings", "api_profile"),
+    ("provider_route_model_mappings", "public_model_id"),
+    ("provider_route_model_mappings", "provider_model_id"),
+    ("provider_route_model_mappings", "execution_model_id"),
+    ("provider_route_model_mappings", "media_kind"),
+    ("provider_account_operations", "provider_account_id"),
+    ("provider_account_operations", "provider_id"),
+    ("provider_account_operations", "operation_id"),
+    ("provider_account_operations", "state"),
+    ("price_books", "control_version"),
+    ("price_book_versions", "control_version"),
+    ("price_book_version_rollbacks", "rollback_version_id"),
+    ("price_book_version_rollbacks", "source_version_id"),
+    ("price_book_version_rollbacks", "created_by_user_id"),
+    ("price_book_version_rollbacks", "created_by_session_id"),
+    ("price_book_version_rollbacks", "created_at_ms"),
+    ("billing_accounts", "control_version"),
+    ("billing_accounts", "refunded_micros"),
+    ("ledger_transactions", "reverses_transaction_id"),
+    ("billing_account_limit_changes", "change_id"),
+    ("billing_account_limit_changes", "tenant_id"),
+    ("billing_account_limit_changes", "currency"),
+    (
+        "billing_account_limit_changes",
+        "previous_credit_limit_micros",
+    ),
+    ("billing_account_limit_changes", "new_credit_limit_micros"),
+    ("billing_account_limit_changes", "control_version"),
+    ("billing_account_limit_changes", "actor_user_id"),
+    ("billing_account_limit_changes", "session_id"),
+    ("billing_account_limit_changes", "reason"),
+    ("billing_account_limit_changes", "created_at_ms"),
+    ("billing_integrity_runs", "run_id"),
+    ("billing_integrity_runs", "check_version"),
+    ("billing_integrity_runs", "scanner_version"),
+    ("billing_integrity_runs", "check_set"),
+    ("billing_integrity_runs", "scope_type"),
+    ("billing_integrity_runs", "scope_id"),
+    ("billing_integrity_runs", "state"),
+    ("billing_integrity_runs", "actor_kind"),
+    ("billing_integrity_runs", "initiated_by_user_id"),
+    ("billing_integrity_runs", "session_id"),
+    ("billing_integrity_runs", "as_of_ms"),
+    ("billing_integrity_runs", "started_at_ms"),
+    ("billing_integrity_runs", "completed_at_ms"),
+    ("billing_integrity_runs", "critical_count"),
+    ("billing_integrity_runs", "warning_count"),
+    ("billing_integrity_runs", "finding_count"),
+    ("billing_integrity_runs", "summary"),
+    ("billing_integrity_findings", "finding_id"),
+    ("billing_integrity_findings", "run_id"),
+    ("billing_integrity_findings", "finding_key"),
+    ("billing_integrity_findings", "severity"),
+    ("billing_integrity_findings", "category"),
+    ("billing_integrity_findings", "finding_code"),
+    ("billing_integrity_findings", "tenant_id"),
+    ("billing_integrity_findings", "currency"),
+    ("billing_integrity_findings", "resource_type"),
+    ("billing_integrity_findings", "resource_id"),
+    ("billing_integrity_findings", "expected"),
+    ("billing_integrity_findings", "actual"),
+    ("billing_integrity_findings", "details"),
+    ("billing_integrity_findings", "detected_at_ms"),
+    ("provider_cost_obligations", "receipt_id"),
+    ("provider_cost_obligations", "submission_id"),
+    ("provider_cost_obligations", "output_id"),
+    ("provider_cost_obligations", "job_id"),
+    ("provider_cost_obligations", "provider_id"),
+    ("provider_cost_obligations", "provider_account_id"),
+    ("provider_cost_obligations", "currency"),
+    ("provider_cost_obligations", "state"),
+    ("provider_cost_obligations", "expected_authority_kind"),
+    ("provider_cost_obligations", "settlement_claim_id"),
+    ("provider_cost_obligations", "pending_reason_code"),
+    ("provider_cost_obligations", "waiver_reason_code"),
+    ("provider_cost_obligations", "waiver_source_kind"),
+    ("provider_cost_obligations", "waiver_source_id"),
+    ("provider_cost_obligations", "waiver_evidence_hash"),
+    ("provider_cost_obligations", "waived_by_user_id"),
+    ("provider_cost_obligations", "waived_by_session_id"),
+    ("provider_cost_obligations", "due_at_ms"),
+    ("provider_cost_obligations", "escalate_at_ms"),
+    ("provider_cost_obligations", "pending_since_ms"),
+    ("provider_cost_obligations", "last_reviewed_at_ms"),
+    ("provider_cost_obligations", "next_review_at_ms"),
+    ("provider_cost_obligations", "review_attempt_count"),
+    ("provider_cost_obligations", "control_version"),
+    ("provider_cost_obligations", "created_at_ms"),
+    ("provider_cost_obligations", "updated_at_ms"),
+    ("provider_cost_obligations", "settled_at_ms"),
+    ("provider_cost_obligations", "waived_at_ms"),
+    ("provider_cost_obligation_events", "event_id"),
+    ("provider_cost_obligation_events", "receipt_id"),
+    ("provider_cost_obligation_events", "control_version"),
+    ("provider_cost_obligation_events", "previous_state"),
+    ("provider_cost_obligation_events", "state"),
+    ("provider_cost_obligation_events", "event_kind"),
+    ("provider_cost_obligation_events", "details"),
+    ("provider_cost_obligation_events", "created_at_ms"),
+    ("customer_refunds", "refund_id"),
+    ("customer_refunds", "original_transaction_id"),
+    ("customer_refunds", "refund_transaction_id"),
+    ("customer_refunds", "tenant_id"),
+    ("customer_refunds", "currency"),
+    ("customer_refunds", "amount_micros"),
+    ("customer_refunds", "reason_code"),
+    ("customer_refunds", "reason"),
+    ("customer_refunds", "idempotency_key_digest"),
+    ("customer_refunds", "request_hash"),
+    ("customer_refunds", "actor_user_id"),
+    ("customer_refunds", "session_id"),
+    ("customer_refunds", "created_at_ms"),
+    ("customer_refunds", "grant_restored_micros"),
+    ("customer_refunds", "account_refunded_micros"),
+    ("customer_price_quotes", "quote_id"),
+    ("customer_price_quotes", "job_id"),
+    ("customer_price_quotes", "project_id"),
+    ("customer_price_quotes", "price_book_version_id"),
+    ("customer_price_quotes", "max_total_micros"),
+    ("customer_price_quotes", "quote_hash"),
+    ("customer_price_quote_lines", "quote_line_id"),
+    ("customer_price_quote_lines", "quote_id"),
+    ("customer_price_quote_lines", "price_component_id"),
+    ("customer_price_quote_lines", "partition_key"),
+    ("customer_price_quote_lines", "terminal_outcome"),
+    ("customer_price_quote_lines", "reservation_quantity_source"),
+    ("customer_price_quote_lines", "reservation_confidence"),
+    ("customer_price_quote_lines", "rate_adjustment_numerator"),
+    ("customer_price_quote_lines", "rate_adjustment_denominator"),
+    ("customer_price_quote_lines", "max_quantity"),
+    ("customer_price_quote_lines", "max_amount_micros"),
+    ("customer_billing_holds", "hold_id"),
+    ("customer_billing_holds", "quote_id"),
+    ("customer_billing_holds", "held_micros"),
+    ("customer_billing_holds", "captured_micros"),
+    ("customer_billing_holds", "released_micros"),
+    ("customer_billing_holds", "state"),
+    ("customer_billing_holds", "grant_held_micros"),
+    ("customer_billing_holds", "account_held_micros"),
+    ("customer_billing_holds", "grant_captured_micros"),
+    ("customer_billing_holds", "account_captured_micros"),
+    ("customer_billing_holds", "grant_released_micros"),
+    ("customer_billing_holds", "account_released_micros"),
+    ("credit_grants", "grant_id"),
+    ("credit_grants", "semantic_key"),
+    ("credit_grants", "tenant_id"),
+    ("credit_grants", "currency"),
+    ("credit_grants", "source_kind"),
+    ("credit_grants", "source_reference"),
+    ("credit_grants", "received_at_ms"),
+    ("credit_grants", "expires_at_ms"),
+    ("credit_grants", "original_amount_micros"),
+    ("credit_grants", "reserved_micros"),
+    ("credit_grants", "consumed_micros"),
+    ("credit_grants", "restored_micros"),
+    ("credit_grants", "expired_micros"),
+    ("credit_grants", "revoked_micros"),
+    ("credit_grants", "available_micros"),
+    ("credit_grants", "state"),
+    ("credit_grants", "control_version"),
+    ("credit_grants", "created_at_ms"),
+    ("credit_grants", "updated_at_ms"),
+    (
+        "customer_billing_hold_grant_reservations",
+        "grant_reservation_id",
+    ),
+    ("customer_billing_hold_grant_reservations", "hold_id"),
+    ("customer_billing_hold_grant_reservations", "grant_id"),
+    ("customer_billing_hold_grant_reservations", "tenant_id"),
+    ("customer_billing_hold_grant_reservations", "currency"),
+    (
+        "customer_billing_hold_grant_reservations",
+        "reserved_micros",
+    ),
+    (
+        "customer_billing_hold_grant_reservations",
+        "consumed_micros",
+    ),
+    (
+        "customer_billing_hold_grant_reservations",
+        "released_micros",
+    ),
+    ("customer_billing_hold_grant_reservations", "state"),
+    ("customer_billing_hold_grant_reservations", "created_at_ms"),
+    ("customer_billing_hold_grant_reservations", "updated_at_ms"),
+    ("credit_grant_events", "grant_event_id"),
+    ("credit_grant_events", "grant_id"),
+    ("credit_grant_events", "tenant_id"),
+    ("credit_grant_events", "currency"),
+    ("credit_grant_events", "event_sequence"),
+    ("credit_grant_events", "event_type"),
+    ("credit_grant_events", "amount_micros"),
+    ("credit_grant_events", "grant_reservation_id"),
+    ("credit_grant_events", "hold_id"),
+    ("credit_grant_events", "refund_id"),
+    ("credit_grant_events", "related_grant_event_id"),
+    ("credit_grant_events", "payload_hash"),
+    ("credit_grant_events", "occurred_at_ms"),
+    ("credit_grant_events", "created_at_ms"),
+    ("credit_grant_operations", "operation_id"),
+    ("credit_grant_operations", "grant_id"),
+    ("credit_grant_operations", "grant_event_id"),
+    ("credit_grant_operations", "tenant_id"),
+    ("credit_grant_operations", "currency"),
+    ("credit_grant_operations", "operation"),
+    ("credit_grant_operations", "idempotency_key_digest"),
+    ("credit_grant_operations", "request_hash"),
+    ("credit_grant_operations", "actor_user_id"),
+    ("credit_grant_operations", "actor_session_id"),
+    ("credit_grant_operations", "reason"),
+    ("credit_grant_operations", "created_at_ms"),
+    ("ledger_transactions", "source_credit_grant_event_id"),
+    ("customer_rated_usage", "rated_usage_id"),
+    ("customer_rated_usage", "quote_id"),
+    ("customer_rated_usage", "fact_set_hash"),
+    ("customer_rated_usage", "total_amount_micros"),
+    ("customer_rated_usage", "rating_hash"),
+    ("customer_rated_usage_lines", "rated_usage_line_id"),
+    ("customer_rated_usage_lines", "rated_usage_id"),
+    ("customer_rated_usage_lines", "quote_line_id"),
+    ("customer_rated_usage_lines", "actual_quantity"),
+    ("customer_rated_usage_lines", "amount_micros"),
+    ("customer_rated_usage_fact_links", "rated_usage_line_id"),
+    ("customer_rated_usage_fact_links", "usage_fact_id"),
+    ("provider_usage_facts", "billing_partition_key"),
+    ("provider_usage_facts", "terminal_outcome"),
+    ("provider_usage_facts", "fact_domain"),
+    ("provider_cost_observations", "provider_cost_observation_id"),
+    ("provider_cost_observations", "observation_key"),
+    ("provider_cost_observations", "provider_id"),
+    ("provider_cost_observations", "provider_account_id"),
+    ("provider_cost_observations", "execution_surface"),
+    ("provider_cost_observations", "provider_operation_id"),
+    ("provider_cost_observations", "purpose"),
+    ("provider_cost_observations", "price_book_version_id"),
+    ("provider_cost_observations", "fact_set_hash"),
+    ("provider_cost_observations", "currency"),
+    ("provider_cost_observations", "native_unit"),
+    ("provider_cost_observations", "native_quantity"),
+    ("provider_cost_observations", "authority"),
+    ("provider_cost_observations", "confidence"),
+    ("provider_cost_observations", "evidence_hash"),
+    ("provider_cost_observations", "evidence_path"),
+    ("provider_cost_observations", "amount_micros"),
+    ("provider_cost_observations", "rounding_mode"),
+    ("provider_cost_observations", "rounding_delta_native_atoms"),
+    ("provider_cost_observations", "created_at_ms"),
+    (
+        "provider_cost_observation_fact_links",
+        "provider_cost_observation_id",
+    ),
+    ("provider_cost_observation_fact_links", "usage_fact_id"),
+    ("provider_cost_observation_fact_links", "provider_id"),
+    (
+        "provider_cost_observation_fact_links",
+        "provider_account_id",
+    ),
+    ("provider_cost_observation_fact_links", "execution_surface"),
+    ("provider_cost_observation_fact_links", "created_at_ms"),
+    (
+        "provider_cost_observation_receipts",
+        "provider_cost_observation_id",
+    ),
+    ("provider_cost_observation_receipts", "receipt_id"),
+    ("provider_cost_observation_receipts", "provider_id"),
+    ("provider_cost_observation_receipts", "created_at_ms"),
+    ("ledger_transactions", "source_provider_cost_observation_id"),
+    (
+        "provider_cost_allocation_pools",
+        "provider_cost_allocation_pool_id",
+    ),
+    ("provider_cost_allocation_pools", "semantic_key"),
+    ("provider_cost_allocation_pools", "provider_id"),
+    ("provider_cost_allocation_pools", "provider_account_id"),
+    ("provider_cost_allocation_pools", "price_book_version_id"),
+    ("provider_cost_allocation_pools", "period_start_ms"),
+    ("provider_cost_allocation_pools", "period_end_ms"),
+    ("provider_cost_allocation_pools", "currency"),
+    ("provider_cost_allocation_pools", "total_amount_micros"),
+    ("provider_cost_allocation_pools", "residual_amount_micros"),
+    ("provider_cost_allocation_pools", "allocation_basis"),
+    ("provider_cost_allocation_pools", "state"),
+    ("provider_cost_allocation_pools", "control_version"),
+    ("provider_cost_allocation_pools", "created_at_ms"),
+    ("provider_cost_allocation_pools", "closed_at_ms"),
+    ("provider_cost_allocation_pools", "candidate_snapshot_hash"),
+    (
+        "provider_cost_allocation_lines",
+        "provider_cost_allocation_line_id",
+    ),
+    (
+        "provider_cost_allocation_lines",
+        "provider_cost_allocation_pool_id",
+    ),
+    ("provider_cost_allocation_lines", "provider_id"),
+    ("provider_cost_allocation_lines", "provider_account_id"),
+    ("provider_cost_allocation_lines", "job_id"),
+    ("provider_cost_allocation_lines", "output_id"),
+    ("provider_cost_allocation_lines", "basis_usage_fact_id"),
+    ("provider_cost_allocation_lines", "basis_quantity"),
+    ("provider_cost_allocation_lines", "basis_unit"),
+    ("provider_cost_allocation_lines", "amount_micros"),
+    ("provider_cost_allocation_lines", "created_at_ms"),
+    ("provider_cost_allocation_lines", "basis_receipt_id"),
+    (
+        "provider_cost_allocation_lines",
+        "basis_receipt_payload_hash",
+    ),
+    ("provider_cost_allocation_lines", "basis_quote_id"),
+    ("provider_cost_allocation_lines", "basis_quote_hash"),
+    ("provider_cost_authority_claims", "claim_id"),
+    ("provider_cost_authority_claims", "provider_id"),
+    ("provider_cost_authority_claims", "provider_account_id"),
+    ("provider_cost_authority_claims", "job_id"),
+    ("provider_cost_authority_claims", "currency"),
+    ("provider_cost_authority_claims", "authority_kind"),
+    ("provider_cost_authority_claims", "authority_period"),
+    (
+        "provider_cost_authority_claims",
+        "source_provider_cost_observation_id",
+    ),
+    ("provider_cost_authority_claims", "source_usage_fact_id"),
+    (
+        "provider_cost_authority_claims",
+        "source_provider_cost_allocation_pool_id",
+    ),
+    (
+        "provider_cost_authority_claims",
+        "source_provider_cost_allocation_line_id",
+    ),
+    (
+        "provider_cost_authority_claims",
+        "source_legacy_transaction_id",
+    ),
+    ("provider_cost_authority_claims", "source_receipt_id"),
+    ("provider_cost_authority_claims", "created_at_ms"),
+    (
+        "provider_cost_allocation_closures",
+        "provider_cost_allocation_pool_id",
+    ),
+    (
+        "provider_cost_allocation_closures",
+        "idempotency_key_digest",
+    ),
+    ("provider_cost_allocation_closures", "request_hash"),
+    (
+        "provider_cost_allocation_closures",
+        "candidate_snapshot_hash",
+    ),
+    ("provider_cost_allocation_closures", "source_kind"),
+    ("provider_cost_allocation_closures", "source_reference"),
+    ("provider_cost_allocation_closures", "source_evidence_hash"),
+    (
+        "provider_cost_allocation_closures",
+        "source_period_start_ms",
+    ),
+    ("provider_cost_allocation_closures", "source_period_end_ms"),
+    ("provider_cost_allocation_closures", "source_currency"),
+    ("provider_cost_allocation_closures", "source_amount_micros"),
+    ("provider_cost_allocation_closures", "closed_by_user_id"),
+    ("provider_cost_allocation_closures", "closed_by_session_id"),
+    ("provider_cost_allocation_closures", "created_at_ms"),
+    ("executor_provider_cost_evidence", "manifest_id"),
+    ("executor_provider_cost_evidence", "executor_execution_id"),
+    ("executor_provider_cost_evidence", "submission_id"),
+    ("executor_provider_cost_evidence", "scope"),
+    ("executor_provider_cost_evidence", "provider_id"),
+    ("executor_provider_cost_evidence", "execution_surface"),
+    ("executor_provider_cost_evidence", "provider_operation_id"),
+    ("executor_provider_cost_evidence", "currency"),
+    ("executor_provider_cost_evidence", "native_unit"),
+    ("executor_provider_cost_evidence", "native_quantity"),
+    ("executor_provider_cost_evidence", "authority"),
+    ("executor_provider_cost_evidence", "confidence"),
+    ("executor_provider_cost_evidence", "evidence_hash"),
+    ("executor_provider_cost_evidence", "evidence_path"),
+    ("executor_provider_cost_evidence", "created_at_ms"),
+    (
+        "ledger_transactions",
+        "source_provider_cost_allocation_pool_id",
+    ),
+    (
+        "ledger_transactions",
+        "source_provider_cost_allocation_line_id",
+    ),
+    (
+        "provider_account_execution_controls",
+        "desired_max_concurrency",
+    ),
+    ("provider_account_execution_controls", "lifecycle_state"),
+    ("provider_account_execution_controls", "control_version"),
+    (
+        "provider_account_execution_control_events",
+        "control_version",
+    ),
+    ("gateway_api_key_provider_routes", "api_key_id"),
+    ("gateway_api_key_provider_routes", "route_id"),
+    ("gateway_platform_provider_routes", "provider_id"),
+    ("gateway_platform_provider_routes", "operation_id"),
+    ("gateway_platform_provider_routes", "command_schema"),
+    ("gateway_platform_provider_routes", "route_id"),
+    ("gateway_platform_provider_routes", "route_revision"),
+    ("gateway_platform_provider_routes", "state"),
+    ("gateway_platform_provider_routes", "created_at_ms"),
+    ("gateway_platform_provider_routes", "updated_at_ms"),
+    ("gateway_project_provider_routes", "project_id"),
+    ("gateway_project_provider_routes", "provider_id"),
+    ("gateway_project_provider_routes", "operation_id"),
+    ("gateway_project_provider_routes", "command_schema"),
+    ("gateway_project_provider_routes", "route_id"),
+    ("gateway_project_provider_routes", "route_revision"),
+    ("gateway_project_provider_routes", "state"),
+    ("gateway_project_provider_routes", "created_at_ms"),
+    ("gateway_project_provider_routes", "updated_at_ms"),
+    ("job_provider_route_attributions", "job_id"),
+    ("job_provider_route_attributions", "route_id"),
     ("job_response_projections", "response_schema"),
     ("job_response_projections", "created_at_seconds"),
     ("job_response_projections", "artifact_count"),
@@ -53,6 +563,7 @@ const REQUIRED_COLUMNS: [(&str, &str); 179] = [
     ("executor_artifact_authorities", "authority_id"),
     ("executor_artifact_authorities", "storage_namespace"),
     ("executor_artifact_authorities", "sha256_hex"),
+    ("executor_artifact_authorities", "media_duration_ms"),
     ("executor_result_manifests", "artifact_authority_id"),
     ("executor_executions", "launch_owner"),
     ("executor_executions", "resolution_decision_id"),
@@ -80,6 +591,9 @@ const REQUIRED_COLUMNS: [(&str, &str); 179] = [
     ("executor_terminal_reductions", "lease_owner"),
     ("executor_terminal_reductions", "lease_epoch"),
     ("executor_terminal_reductions", "lease_expires_at_ms"),
+    ("executor_terminal_reductions", "blocked_error_code"),
+    ("executor_terminal_reductions", "blocked_by"),
+    ("executor_terminal_reductions", "blocked_at_ms"),
     ("executor_terminal_reductions", "completion_owner"),
     ("executor_terminal_reductions", "provider_receipt_id"),
     ("executor_terminal_reductions", "customer_artifact_id"),
@@ -247,9 +761,312 @@ const REQUIRED_COLUMNS: [(&str, &str); 179] = [
     ("provider_runtime_leases", "lease_expires_at_ms"),
     ("provider_runtime_leases", "created_at_ms"),
     ("provider_runtime_leases", "updated_at_ms"),
+    ("jobs", "output_count"),
+    ("jobs", "billable_units"),
+    ("jobs", "billing_metric"),
+    ("jobs", "billing_unit"),
+    ("job_outputs", "billable_units"),
+    ("quota_reservations", "billing_metric"),
+    ("quota_reservations", "billing_unit"),
+    ("usage_events", "billing_metric"),
+    ("usage_events", "billing_unit"),
+    ("metering_events", "billing_metric"),
+    ("metering_events", "billing_unit"),
+    ("price_versions", "billing_metric"),
+    ("price_versions", "billing_unit"),
+    ("api_profile_pricing_aliases", "api_profile"),
+    ("api_profile_pricing_aliases", "pricing_api_profile"),
+    ("api_profile_pricing_aliases", "created_at_ms"),
+    ("price_quotes", "billing_metric"),
+    ("price_quotes", "billing_unit"),
+    ("price_quotes", "billable_units"),
+    ("identity_users", "user_id"),
+    ("identity_users", "normalized_email"),
+    ("identity_users", "roles"),
+    ("identity_users", "scopes"),
+    ("identity_users", "authz_version"),
+    ("identity_organizations", "organization_id"),
+    ("identity_organizations", "organization_kind"),
+    ("identity_organizations", "owner_user_id"),
+    ("identity_organization_memberships", "organization_id"),
+    ("identity_organization_memberships", "user_id"),
+    ("identity_organization_memberships", "role"),
+    ("identity_project_memberships", "organization_id"),
+    ("identity_project_memberships", "project_id"),
+    ("identity_project_memberships", "user_id"),
+    ("identity_project_memberships", "is_default"),
+    ("provider_accounts", "tenant_id"),
+    ("provider_accounts", "owner_user_id"),
+    ("identity_password_credentials", "password_hash"),
+    ("identity_session_families", "session_id"),
+    ("identity_session_families", "user_id"),
+    ("identity_session_families", "authz_version_at_login"),
+    ("identity_session_families", "idle_expires_at_ms"),
+    ("identity_session_families", "absolute_expires_at_ms"),
+    ("identity_session_families", "revoked_at_ms"),
+    ("identity_refresh_tokens", "token_id"),
+    ("identity_refresh_tokens", "session_id"),
+    ("identity_refresh_tokens", "secret_hash"),
+    ("identity_refresh_tokens", "pepper_version"),
+    ("identity_refresh_tokens", "consumed_at_ms"),
+    ("identity_refresh_tokens", "replaced_by_token_id"),
+    ("identity_login_throttles", "throttle_key"),
+    ("identity_login_throttles", "dimension"),
+    ("identity_login_throttles", "blocked_until_ms"),
+    ("identity_audit_events", "event_id"),
+    ("identity_audit_events", "action"),
+    ("identity_audit_events", "outcome"),
+    ("identity_audit_events", "metadata"),
+    ("artifact_retention_policies", "policy_key"),
+    ("artifact_retention_policies", "policy_version"),
+    ("artifact_retention_policies", "retain_for_ms"),
+    ("artifact_retention_policies", "read_drain_ms"),
+    ("artifact_retention_policies", "retry_delay_ms"),
+    ("job_artifact_retention", "job_id"),
+    ("job_artifact_retention", "policy_version"),
+    ("job_artifact_retention", "retain_for_ms"),
+    ("job_artifact_retention", "read_drain_ms"),
+    ("job_artifact_retention", "retry_delay_ms"),
+    ("job_artifact_retention", "state"),
+    ("job_artifact_retention", "expires_at_ms"),
+    ("job_artifact_retention", "purge_after_ms"),
+    ("job_artifact_retention", "lease_owner"),
+    ("job_artifact_retention", "lease_epoch"),
+    ("job_artifact_retention", "lease_expires_at_ms"),
+    ("job_artifact_retention", "delete_attempts"),
+    ("job_artifact_retention", "last_error_code"),
+    ("job_artifact_retention", "deleted_at_ms"),
+    ("provider_models", "provider_id"),
+    ("provider_models", "model_id"),
+    ("provider_models", "execution_model_id"),
+    ("provider_models", "media_kind"),
+    ("provider_models", "display_name"),
+    ("provider_models", "adapter_state"),
+    ("provider_models", "lifecycle_state"),
+    ("provider_models", "operation_ids"),
+    ("provider_models", "source_kind"),
+    ("provider_models", "first_seen_at_ms"),
+    ("provider_models", "last_seen_at_ms"),
+    ("provider_models", "last_successful_refresh_at_ms"),
+    ("provider_models", "metadata_json"),
+    ("provider_model_refreshes", "refresh_id"),
+    ("provider_model_refreshes", "provider_account_id"),
+    ("provider_model_refreshes", "provider_id"),
+    ("provider_model_refreshes", "status"),
+    ("provider_model_refreshes", "discovered_count"),
+    ("provider_model_refreshes", "error_code"),
+    ("provider_model_refreshes", "started_at_ms"),
+    ("provider_model_refreshes", "completed_at_ms"),
+    ("provider_model_refreshes", "created_at_ms"),
+    ("provider_model_refreshes", "updated_at_ms"),
+    ("provider_account_model_observations", "provider_account_id"),
+    ("provider_account_model_observations", "provider_id"),
+    ("provider_account_model_observations", "model_id"),
+    ("provider_account_model_observations", "media_kind"),
+    ("provider_account_model_observations", "available"),
+    ("provider_account_model_observations", "source_kind"),
+    ("provider_account_model_observations", "cli_version"),
+    ("provider_account_model_observations", "observed_at_ms"),
+    ("provider_account_model_observations", "refresh_id"),
+    ("provider_account_model_observations", "metadata_json"),
+    (
+        "provider_account_model_configurations",
+        "provider_account_id",
+    ),
+    ("provider_account_model_configurations", "provider_id"),
+    ("provider_account_model_configurations", "mode"),
+    ("provider_account_model_configurations", "version"),
+    ("provider_account_model_configurations", "updated_at_ms"),
+    ("provider_account_model_bindings", "provider_account_id"),
+    ("provider_account_model_bindings", "provider_id"),
+    ("provider_account_model_bindings", "model_id"),
+    ("provider_account_model_bindings", "media_kind"),
+    ("provider_account_model_bindings", "configured_at_ms"),
+    (
+        "provider_cost_observation_sources",
+        "provider_cost_observation_id",
+    ),
+    ("provider_cost_observation_sources", "source_kind"),
+    (
+        "provider_cost_observation_sources",
+        "executor_provider_cost_evidence_manifest_id",
+    ),
+    ("provider_cost_observation_sources", "legacy_reason"),
+    ("provider_cost_observation_sources", "created_at_ms"),
+    ("project_spend_budgets", "project_id"),
+    ("project_spend_budgets", "organization_id"),
+    ("project_spend_budgets", "currency"),
+    ("project_spend_budgets", "monthly_budget_micros"),
+    ("project_spend_budgets", "limit_type"),
+    ("project_spend_budgets", "period_kind"),
+    ("project_spend_budgets", "control_version"),
+    ("project_spend_budgets", "created_by_user_id"),
+    ("project_spend_budgets", "updated_by_user_id"),
+    ("project_spend_budgets", "created_at_ms"),
+    ("project_spend_budgets", "updated_at_ms"),
+    ("project_spend_alert_thresholds", "project_id"),
+    ("project_spend_alert_thresholds", "threshold_percent"),
+    ("project_spend_alert_thresholds", "created_at_ms"),
+    ("project_spend_evaluation_queue", "project_id"),
+    ("project_spend_evaluation_queue", "requested_at_ms"),
+    ("project_spend_alert_events", "event_id"),
+    ("project_spend_alert_events", "project_id"),
+    ("project_spend_alert_events", "organization_id"),
+    ("project_spend_alert_events", "currency"),
+    ("project_spend_alert_events", "period_start_ms"),
+    ("project_spend_alert_events", "period_end_ms"),
+    ("project_spend_alert_events", "threshold_percent"),
+    ("project_spend_alert_events", "budget_control_version"),
+    ("project_spend_alert_events", "monthly_budget_micros"),
+    ("project_spend_alert_events", "spend_micros"),
+    ("project_spend_alert_events", "notification_state"),
+    ("project_spend_alert_events", "created_at_ms"),
+    ("project_spend_alert_events", "acknowledged_at_ms"),
+    ("project_spend_alert_events", "acknowledged_by_user_id"),
+    ("project_spend_notification_deliveries", "delivery_id"),
+    ("project_spend_notification_deliveries", "event_id"),
+    ("project_spend_notification_deliveries", "recipient_user_id"),
+    ("project_spend_notification_deliveries", "channel"),
+    ("project_spend_notification_deliveries", "state"),
+    ("project_spend_notification_deliveries", "attempt_count"),
+    (
+        "project_spend_notification_deliveries",
+        "next_attempt_at_ms",
+    ),
+    ("project_spend_notification_deliveries", "lease_owner"),
+    (
+        "project_spend_notification_deliveries",
+        "lease_expires_at_ms",
+    ),
+    ("project_spend_notification_deliveries", "last_error_code"),
+    ("project_spend_notification_deliveries", "created_at_ms"),
+    ("project_spend_notification_deliveries", "delivered_at_ms"),
+    ("project_spend_notification_deliveries", "read_at_ms"),
+    ("project_model_policies", "project_id"),
+    ("project_model_policies", "organization_id"),
+    ("project_model_policies", "control_version"),
+    ("project_model_policies", "created_by_user_id"),
+    ("project_model_policies", "updated_by_user_id"),
+    ("project_model_policies", "created_at_ms"),
+    ("project_model_policies", "updated_at_ms"),
+    ("project_model_access_entries", "project_id"),
+    ("project_model_access_entries", "operation_id"),
+    ("project_model_access_entries", "api_profile"),
+    ("project_model_access_entries", "public_model_id"),
+    ("project_model_access_entries", "media_kind"),
+    ("project_model_access_entries", "created_at_ms"),
+    ("platform_model_limit_members", "operation_id"),
+    ("platform_model_limit_members", "api_profile"),
+    ("platform_model_limit_members", "public_model_id"),
+    ("platform_model_limit_members", "media_kind"),
+    ("platform_model_limit_members", "bucket_key"),
+    ("platform_model_limit_members", "bucket_display_name"),
+    ("platform_model_limit_members", "unit_kind"),
+    ("platform_model_limit_members", "request_ceiling_per_minute"),
+    ("platform_model_limit_members", "unit_ceiling_per_minute"),
+    ("platform_model_limit_members", "created_at_ms"),
+    ("project_model_rate_limits", "project_id"),
+    ("project_model_rate_limits", "bucket_key"),
+    ("project_model_rate_limits", "unit_kind"),
+    ("project_model_rate_limits", "request_limit_per_minute"),
+    ("project_model_rate_limits", "unit_limit_per_minute"),
+    ("project_model_rate_limits", "created_at_ms"),
+    ("project_model_rate_limits", "updated_at_ms"),
+    ("project_model_rate_states", "project_id"),
+    ("project_model_rate_states", "bucket_key"),
+    ("project_model_rate_states", "request_tokens_microunits"),
+    ("project_model_rate_states", "unit_tokens_microunits"),
+    ("project_model_rate_states", "last_refill_at_ms"),
+    ("project_model_rate_states", "updated_at_ms"),
+    ("project_model_rate_admissions", "project_id"),
+    ("project_model_rate_admissions", "bucket_key"),
+    ("project_model_rate_admissions", "admission_session_id"),
+    ("project_model_rate_admissions", "request_units"),
+    ("project_model_rate_admissions", "unit_count"),
+    ("project_model_rate_admissions", "admitted_at_ms"),
+    ("gateway_request_observations", "request_id"),
+    ("gateway_request_observations", "source"),
+    ("gateway_request_observations", "method"),
+    ("gateway_request_observations", "route_pattern"),
+    ("gateway_request_observations", "request_path"),
+    ("gateway_request_observations", "status_code"),
+    ("gateway_request_observations", "duration_ms"),
+    ("gateway_request_observations", "error_code"),
+    ("gateway_request_observations", "idempotency_key_digest"),
+    ("gateway_request_observations", "tenant_id"),
+    ("gateway_request_observations", "project_id"),
+    ("gateway_request_observations", "service_account_id"),
+    ("gateway_request_observations", "api_key_id"),
+    ("gateway_request_observations", "credential_owner_user_id"),
+    ("gateway_request_observations", "actor_user_id"),
+    ("gateway_request_observations", "auth_kind"),
+    ("gateway_request_observations", "job_id"),
+    ("gateway_request_observations", "content_captured"),
+    ("gateway_request_observations", "content_expires_at_ms"),
+    ("gateway_request_observations", "created_at_ms"),
+    ("gateway_request_observations", "completed_at_ms"),
+    ("project_webhook_endpoints", "endpoint_id"),
+    ("project_webhook_endpoints", "project_id"),
+    ("project_webhook_endpoints", "organization_id"),
+    ("project_webhook_endpoints", "name"),
+    ("project_webhook_endpoints", "url"),
+    ("project_webhook_endpoints", "event_types"),
+    ("project_webhook_endpoints", "state"),
+    ("project_webhook_endpoints", "signing_key_version"),
+    ("project_webhook_endpoints", "secret_revision"),
+    ("project_webhook_endpoints", "created_by_user_id"),
+    ("project_webhook_endpoints", "created_at_ms"),
+    ("project_webhook_endpoints", "updated_at_ms"),
+    ("project_webhook_endpoints", "disabled_at_ms"),
+    ("project_webhook_endpoints", "deleted_at_ms"),
+    ("project_webhook_endpoints", "control_version"),
+    ("project_webhook_endpoint_runtime", "endpoint_id"),
+    ("project_webhook_endpoint_runtime", "paused_until_ms"),
+    ("project_webhook_endpoint_runtime", "consecutive_failures"),
+    ("project_webhook_endpoint_runtime", "updated_at_ms"),
+    ("project_webhook_events", "event_id"),
+    ("project_webhook_events", "project_id"),
+    ("project_webhook_events", "organization_id"),
+    ("project_webhook_events", "source_kind"),
+    ("project_webhook_events", "outbox_event_id"),
+    ("project_webhook_events", "event_type"),
+    ("project_webhook_events", "payload_json"),
+    ("project_webhook_events", "payload_body"),
+    ("project_webhook_events", "created_at_ms"),
+    ("project_webhook_deliveries", "delivery_id"),
+    ("project_webhook_deliveries", "event_id"),
+    ("project_webhook_deliveries", "endpoint_id"),
+    ("project_webhook_deliveries", "project_id"),
+    ("project_webhook_deliveries", "organization_id"),
+    ("project_webhook_deliveries", "state"),
+    ("project_webhook_deliveries", "attempt_count"),
+    ("project_webhook_deliveries", "next_attempt_at_ms"),
+    ("project_webhook_deliveries", "retry_deadline_at_ms"),
+    ("project_webhook_deliveries", "lease_owner"),
+    ("project_webhook_deliveries", "lease_epoch"),
+    ("project_webhook_deliveries", "lease_expires_at_ms"),
+    ("project_webhook_deliveries", "last_http_status"),
+    ("project_webhook_deliveries", "last_error_code"),
+    ("project_webhook_deliveries", "last_attempt_at_ms"),
+    ("project_webhook_deliveries", "delivered_at_ms"),
+    ("project_webhook_deliveries", "created_at_ms"),
+    ("project_webhook_deliveries", "updated_at_ms"),
+    ("project_webhook_attempts", "attempt_id"),
+    ("project_webhook_attempts", "delivery_id"),
+    ("project_webhook_attempts", "attempt_number"),
+    ("project_webhook_attempts", "outcome"),
+    ("project_webhook_attempts", "webhook_timestamp"),
+    ("project_webhook_attempts", "http_status"),
+    ("project_webhook_attempts", "error_code"),
+    ("project_webhook_attempts", "duration_ms"),
+    ("project_webhook_attempts", "next_attempt_at_ms"),
+    ("project_webhook_attempts", "created_at_ms"),
+    ("project_webhook_outbox_receipts", "outbox_event_id"),
+    ("project_webhook_outbox_receipts", "processed_at_ms"),
+    ("project_files", "cleanup_completed_at_ms"),
 ];
 
-const REQUIRED_INDEXES: [&str; 28] = [
+const REQUIRED_INDEXES: [&str; 148] = [
     "usage_events_tenant_created_at_ms_idx",
     "gateway_api_keys_project_id_idx",
     "quota_reservations_active_tenant_idx",
@@ -278,6 +1095,126 @@ const REQUIRED_INDEXES: [&str; 28] = [
     "provider_capacity_reconciliations_remote_operation_idx",
     "provider_capacity_reconciliations_claim_command_idx",
     "provider_runtime_leases_profile_role_idx",
+    "usage_events_tenant_metric_created_at_ms_idx",
+    "quota_reservations_active_tenant_metric_idx",
+    "price_versions_active_route_metric_uidx",
+    "identity_session_families_user_active_idx",
+    "identity_refresh_tokens_session_idx",
+    "identity_login_throttles_blocked_idx",
+    "identity_audit_events_actor_created_idx",
+    "identity_audit_events_session_created_idx",
+    "identity_refresh_tokens_session_token_unique",
+    "identity_refresh_tokens_parent_unique_idx",
+    "identity_refresh_tokens_replacement_unique_idx",
+    "identity_session_families_absolute_expiry_idx",
+    "identity_session_families_revoked_idx",
+    "identity_login_throttles_gc_idx",
+    "identity_audit_events_created_idx",
+    "identity_audit_events_action_created_idx",
+    "identity_audit_events_outcome_created_idx",
+    "identity_audit_events_project_created_idx",
+    "jobs_admin_global_created_idx",
+    "jobs_admin_provider_created_idx",
+    "jobs_admin_state_created_idx",
+    "jobs_admin_request_id_idx",
+    "jobs_admin_uncertain_updated_idx",
+    "usage_events_admin_created_idx",
+    "rated_usage_admin_created_idx",
+    "provider_receipts_admin_created_idx",
+    "ledger_transaction_seals_admin_sealed_idx",
+    "work_items_admin_awaiting_executor_idx",
+    "work_items_admin_uncertain_updated_idx",
+    "provider_remote_tasks_admin_uncertain_terminal_idx",
+    "gateway_projects_active_created_idx",
+    "gateway_api_keys_active_project_created_idx",
+    "job_auth_attributions_api_key_admitted_idx",
+    "job_auth_attributions_project_admitted_idx",
+    "job_auth_attributions_actor_admitted_idx",
+    "job_auth_attributions_credential_owner_admitted_idx",
+    "usage_events_job_created_idx",
+    "job_artifact_retention_expire_idx",
+    "job_artifact_retention_purge_idx",
+    "job_artifact_retention_reclaim_idx",
+    "job_artifact_retention_failure_idx",
+    "provider_account_credential_heads_due_idx",
+    "provider_account_credential_events_account_idx",
+    "provider_account_login_sessions_active_reauth_idx",
+    "provider_models_provider_state_idx",
+    "provider_model_refreshes_status_idx",
+    "provider_model_refreshes_active_account_idx",
+    "provider_account_model_observations_model_idx",
+    "provider_models_execution_lookup_idx",
+    "provider_account_model_bindings_scheduler_idx",
+    "provider_account_operations_provider_lookup_idx",
+    "ledger_transactions_provider_receipt_uidx",
+    "provider_cost_allocation_pools_period_idx",
+    "provider_cost_allocation_lines_job_idx",
+    "provider_cost_allocation_lines_receipt_idx",
+    "provider_cost_allocation_lines_quote_idx",
+    "ledger_transactions_provider_cost_allocation_line_uidx",
+    "provider_cost_observations_operation_account_unique",
+    "provider_cost_observation_fact_links_fact_uidx",
+    "provider_cost_observation_receipts_receipt_uidx",
+    "provider_cost_authority_claims_pkey",
+    "provider_cost_authority_actual_fact_uidx",
+    "provider_cost_authority_allocation_line_uidx",
+    "provider_cost_authority_legacy_transaction_uidx",
+    "provider_cost_authority_receipt_uidx",
+    "provider_cost_authority_period_excl",
+    "provider_cost_allocation_pools_closed_period_excl",
+    "executor_provider_cost_evidence_pkey",
+    "executor_provider_cost_evidence_operation_idx",
+    "provider_cost_observation_sources_kind_idx",
+    "project_spend_alert_events_project_period_idx",
+    "project_spend_notification_deliveries_pending_idx",
+    "project_spend_notification_deliveries_inbox_idx",
+    "platform_model_limit_members_bucket_idx",
+    "project_model_rate_admissions_bucket_idx",
+    "job_auth_attributions_project_job_idx",
+    "customer_rated_usage_created_quote_idx",
+    "gateway_request_observations_created_idx",
+    "gateway_request_observations_project_created_idx",
+    "gateway_request_observations_project_source_created_idx",
+    "gateway_request_observations_actor_created_idx",
+    "gateway_request_observations_credential_owner_created_idx",
+    "gateway_request_observations_api_key_created_idx",
+    "gateway_request_observations_project_status_created_idx",
+    "price_book_version_rollbacks_source_idx",
+    "billing_account_limit_changes_account_created_idx",
+    "billing_integrity_runs_completed_idx",
+    "billing_integrity_findings_run_severity_idx",
+    "provider_cost_obligations_pkey",
+    "provider_cost_obligation_events_pkey",
+    "provider_cost_obligations_settlement_claim_uidx",
+    "provider_cost_obligations_queue_idx",
+    "provider_cost_obligations_account_idx",
+    "provider_cost_obligation_events_receipt_idx",
+    "ledger_transactions_reversal_source_idx",
+    "customer_refunds_pkey",
+    "customer_refunds_refund_transaction_id_key",
+    "customer_refunds_original_idempotency_key",
+    "customer_refunds_original_created_idx",
+    "customer_refunds_account_created_idx",
+    "provider_cost_allocation_closures_pkey",
+    "provider_cost_allocation_closures_idempotency_key_digest_key",
+    "credit_grants_fefo_idx",
+    "credit_grants_expiry_idx",
+    "credit_grant_reservations_hold_idx",
+    "credit_grant_reservations_grant_idx",
+    "credit_grant_events_grant_idx",
+    "credit_grant_events_hold_idx",
+    "credit_grant_events_refund_idx",
+    "credit_grant_operations_grant_idx",
+    "ledger_transactions_credit_grant_event_uidx",
+    "project_webhook_endpoints_project_created_idx",
+    "project_webhook_endpoints_active_events_idx",
+    "project_webhook_events_project_created_idx",
+    "project_webhook_deliveries_ready_idx",
+    "project_webhook_deliveries_lease_expiry_idx",
+    "project_webhook_deliveries_endpoint_created_idx",
+    "project_webhook_attempts_delivery_created_idx",
+    "project_files_project_storage_pending_idx",
+    "project_files_cleanup_recovery_idx",
 ];
 
 #[tokio::test]
@@ -299,6 +1236,844 @@ async fn concurrent_fresh_migrations_are_repeatable() -> TestResult {
     };
 
     let result = concurrent_migration_case(&test_schema.pool).await;
+    let cleanup = test_schema.cleanup().await;
+    cleanup?;
+    result
+}
+
+#[tokio::test]
+async fn receipt_snapshot_migration_upgrades_an_existing_draft_pool() -> TestResult {
+    let Some(test_schema) = TestSchema::new(2).await? else {
+        return Ok(());
+    };
+
+    let result = async {
+        apply_migrations_through(&test_schema.pool, 93).await?;
+
+        let credential_pool_id = Uuid::new_v4();
+        let provider_account_id = Uuid::new_v4();
+        let price_book_id = Uuid::new_v4();
+        let price_book_version_id = Uuid::new_v4();
+        let allocation_pool_id = Uuid::new_v4();
+
+        sqlx::query(
+            r#"
+            INSERT INTO provider_credential_pools
+              (credential_pool_id, pool_key, provider_id, state,
+               created_at_ms, updated_at_ms)
+            VALUES ($1, $2, 'openai-codex', 'enabled', 1, 1)
+            "#,
+        )
+        .bind(credential_pool_id)
+        .bind(format!("migration-pool-{}", credential_pool_id.simple()))
+        .execute(&test_schema.pool)
+        .await
+        .map_err(|error| format!("failed to seed credential pool: {error}"))?;
+        sqlx::query(
+            r#"
+            INSERT INTO provider_accounts
+              (provider_account_id, credential_pool_id, provider_id,
+               account_key, credential_ref, credential_revision,
+               credential_auth_sha256, state, created_at_ms, updated_at_ms)
+            VALUES (
+                $1, $2, 'openai-codex', $3, $4, 1, repeat('a', 64),
+                'enabled', 1, 1
+            )
+            "#,
+        )
+        .bind(provider_account_id)
+        .bind(credential_pool_id)
+        .bind(format!(
+            "migration-account-{}",
+            provider_account_id.simple()
+        ))
+        .bind(format!("managed://migration-account/{provider_account_id}"))
+        .execute(&test_schema.pool)
+        .await
+        .map_err(|error| format!("failed to seed provider account: {error}"))?;
+        sqlx::query(
+            r#"
+            INSERT INTO price_books (
+                price_book_id, price_book_key, display_name, purpose,
+                scope_type, provider_id, currency, state,
+                created_at_ms, updated_at_ms
+            )
+            VALUES (
+                $1, $2, 'Migration allocation fixture',
+                'provider_allocated', 'platform', 'openai-codex',
+                'USD', 'active', 1, 1
+            )
+            "#,
+        )
+        .bind(price_book_id)
+        .bind(format!("migration.allocation.{}", price_book_id.simple()))
+        .execute(&test_schema.pool)
+        .await
+        .map_err(|error| format!("failed to seed price book: {error}"))?;
+        sqlx::query(
+            r#"
+            INSERT INTO price_book_versions (
+                price_book_version_id, price_book_id, version,
+                api_profile, operation, provider_id, provider_model_id,
+                public_model_id, media_kind, service_tier,
+                execution_surface, billing_mode, is_free, state,
+                effective_from_ms, source_kind, created_at_ms, updated_at_ms
+            )
+            VALUES (
+                $1, $2, 1, 'openai-images-v1', 'generation',
+                'openai-codex', 'gpt-image-2', 'gpt-image-2',
+                'image', 'standard', 'provider_cli',
+                'subscription_allocation', FALSE, 'active',
+                1, 'manual', 1, 1
+            )
+            "#,
+        )
+        .bind(price_book_version_id)
+        .bind(price_book_id)
+        .execute(&test_schema.pool)
+        .await
+        .map_err(|error| format!("failed to seed price book version: {error}"))?;
+        sqlx::query(
+            r#"
+            INSERT INTO provider_cost_allocation_pools (
+                provider_cost_allocation_pool_id, semantic_key,
+                provider_id, provider_account_id, price_book_version_id,
+                period_start_ms, period_end_ms, currency,
+                total_amount_micros, residual_amount_micros,
+                allocation_basis, state, control_version, created_at_ms
+            )
+            VALUES (
+                $1, $2, 'openai-codex', $3, $4,
+                1, 2, 'USD', 0, 0,
+                'successful_output', 'draft', 1, 1
+            )
+            "#,
+        )
+        .bind(allocation_pool_id)
+        .bind(format!("migration-allocation:{allocation_pool_id}"))
+        .bind(provider_account_id)
+        .bind(price_book_version_id)
+        .execute(&test_schema.pool)
+        .await
+        .map_err(|error| format!("failed to seed draft allocation pool: {error}"))?;
+
+        apply_migration_range(&test_schema.pool, 94, 94).await?;
+
+        let (snapshot_hash, control_version): (String, i64) = sqlx::query_as(
+            r#"
+            SELECT candidate_snapshot_hash, control_version
+            FROM provider_cost_allocation_pools
+            WHERE provider_cost_allocation_pool_id = $1
+            "#,
+        )
+        .bind(allocation_pool_id)
+        .fetch_one(&test_schema.pool)
+        .await
+        .map_err(|error| format!("failed to inspect migrated allocation pool: {error}"))?;
+        require(
+            snapshot_hash.len() == 64
+                && snapshot_hash
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+            "0094 must backfill a lowercase SHA-256 candidate snapshot",
+        )?;
+        require(
+            control_version == 2,
+            "0094 must advance the draft pool control version during backfill",
+        )
+    }
+    .await;
+
+    let cleanup = test_schema.cleanup().await;
+    cleanup?;
+    result
+}
+
+#[tokio::test]
+async fn incremental_customer_pricing_migrations_preserve_existing_usage_fact_outcomes()
+-> TestResult {
+    let Some(test_schema) = TestSchema::new(2).await? else {
+        return Ok(());
+    };
+
+    let result = async {
+        apply_migrations_through(&test_schema.pool, 61).await?;
+
+        // This fixture isolates the v4 backfill itself; the parent execution graph
+        // is immaterial because 0061 already made the receipt outcome canonical.
+        sqlx::raw_sql(
+            r#"
+            DO $$
+            DECLARE
+                target REGCLASS;
+                constraint_row RECORD;
+            BEGIN
+                FOREACH target IN ARRAY ARRAY[
+                    'provider_receipts'::REGCLASS,
+                    'provider_usage_facts'::REGCLASS
+                ]
+                LOOP
+                    FOR constraint_row IN
+                        SELECT conname
+                        FROM pg_constraint
+                        WHERE conrelid = target
+                          AND contype = 'f'
+                    LOOP
+                        EXECUTE format(
+                            'ALTER TABLE %s DROP CONSTRAINT %I',
+                            target,
+                            constraint_row.conname
+                        );
+                    END LOOP;
+                END LOOP;
+            END;
+            $$;
+            "#,
+        )
+        .execute(&test_schema.pool)
+        .await
+        .map_err(|error| format!("failed to isolate legacy usage fact fixture: {error}"))?;
+
+        let mut expected = Vec::new();
+        for (index, outcome) in ["succeeded", "failed", "no_effect"].into_iter().enumerate() {
+            let job_id = Uuid::new_v4();
+            let output_id = Uuid::new_v4();
+            let submission_id = Uuid::new_v4();
+            let receipt_id = Uuid::new_v4();
+            let usage_fact_id = Uuid::new_v4();
+            sqlx::query(
+                r#"
+                INSERT INTO provider_receipts (
+                    receipt_id, semantic_key, submission_id, output_id, job_id,
+                    provider_id, outcome, receipt_schema, payload_hash, evidence,
+                    created_at_ms
+                )
+                VALUES (
+                    $1, $2, $3, $4, $5, 'fixture-provider', $6,
+                    'fixture.v1', $7, '{}'::JSONB, $8
+                )
+                "#,
+            )
+            .bind(receipt_id)
+            .bind(format!("incremental-receipt-{outcome}"))
+            .bind(submission_id)
+            .bind(output_id)
+            .bind(job_id)
+            .bind(outcome)
+            .bind(format!("{:064x}", index + 1))
+            .bind(index as i64 + 1)
+            .execute(&test_schema.pool)
+            .await
+            .map_err(|error| format!("failed to seed {outcome} legacy receipt: {error}"))?;
+            sqlx::query(
+                r#"
+                INSERT INTO provider_usage_facts (
+                    usage_fact_id, semantic_key, job_id, output_id, submission_id,
+                    receipt_id, provider_id, execution_surface, metric, quantity,
+                    unit, quantity_source, confidence, created_at_ms
+                )
+                VALUES (
+                    $1, $2, $3, $4, $5, $6, 'fixture-provider',
+                    'manual_import', 'request', 1, 'request',
+                    'operator_adjustment', 'exact', $7
+                )
+                "#,
+            )
+            .bind(usage_fact_id)
+            .bind(format!("incremental-fact-{outcome}"))
+            .bind(job_id)
+            .bind(output_id)
+            .bind(submission_id)
+            .bind(receipt_id)
+            .bind(index as i64 + 1)
+            .execute(&test_schema.pool)
+            .await
+            .map_err(|error| format!("failed to seed {outcome} legacy usage fact: {error}"))?;
+            expected.push((usage_fact_id, outcome.to_owned()));
+        }
+
+        apply_migration_range(&test_schema.pool, 62, 64).await?;
+
+        let migrated: Vec<(Uuid, String, String, String)> = sqlx::query_as(
+            r#"
+            SELECT fact.usage_fact_id, receipt.outcome,
+                   fact.terminal_outcome, fact.billing_partition_key
+            FROM provider_usage_facts fact
+            JOIN provider_receipts receipt ON receipt.receipt_id = fact.receipt_id
+            ORDER BY fact.created_at_ms
+            "#,
+        )
+        .fetch_all(&test_schema.pool)
+        .await
+        .map_err(|error| format!("failed to inspect migrated usage facts: {error}"))?;
+        let expected: Vec<(Uuid, String, String, String)> = expected
+            .into_iter()
+            .map(|(usage_fact_id, outcome)| {
+                (usage_fact_id, outcome.clone(), outcome, "legacy".to_owned())
+            })
+            .collect();
+        require(
+            migrated == expected,
+            &format!(
+                "0062-0064 changed existing provider usage fact semantics; \
+                 expected {expected:?}, got {migrated:?}"
+            ),
+        )
+    }
+    .await;
+    let cleanup = test_schema.cleanup().await;
+    cleanup?;
+    result
+}
+
+#[tokio::test]
+async fn request_dimension_migration_rejects_an_unsafe_existing_quote_backfill() -> TestResult {
+    let Some(test_schema) = TestSchema::new(2).await? else {
+        return Ok(());
+    };
+    let result = async {
+        sqlx::query("CREATE TABLE customer_price_quotes (quote_id BIGINT PRIMARY KEY)")
+            .execute(&test_schema.pool)
+            .await
+            .map_err(|error| format!("failed to create legacy quote fixture: {error}"))?;
+        sqlx::query("INSERT INTO customer_price_quotes (quote_id) VALUES (1)")
+            .execute(&test_schema.pool)
+            .await
+            .map_err(|error| format!("failed to seed legacy quote fixture: {error}"))?;
+
+        require(
+            sqlx::raw_sql(include_str!(
+                "../migrations/0065_customer_pricing_request_dimensions.sql"
+            ))
+            .execute(&test_schema.pool)
+            .await
+            .is_err(),
+            "0065 silently assigned unknown request dimensions to an existing paid quote",
+        )
+    }
+    .await;
+    let cleanup = test_schema.cleanup().await;
+    cleanup?;
+    result
+}
+
+#[tokio::test]
+async fn provider_account_runtime_changes_emit_commit_notifications() -> TestResult {
+    let Some(test_schema) = TestSchema::new(4).await? else {
+        return Ok(());
+    };
+
+    let result = async {
+        gateway_result(run_migrations(&test_schema.pool).await, "migration failed")?;
+        let mut listener = PgListener::connect_with(&test_schema.pool)
+            .await
+            .map_err(|error| format!("failed to create runtime listener: {error}"))?;
+        listener
+            .listen("ai_image_factory_provider_account_runtime")
+            .await
+            .map_err(|error| format!("failed to listen for runtime changes: {error}"))?;
+
+        let credential_pool_id = Uuid::new_v4();
+        let provider_account_id = Uuid::new_v4();
+        sqlx::query(
+            r#"
+            INSERT INTO provider_credential_pools
+              (credential_pool_id, pool_key, provider_id, state, created_at_ms, updated_at_ms)
+            VALUES ($1, 'runtime-event-pool', 'openai-codex', 'enabled', 1, 1)
+            "#,
+        )
+        .bind(credential_pool_id)
+        .execute(&test_schema.pool)
+        .await
+        .map_err(|error| format!("failed to seed credential pool: {error}"))?;
+        sqlx::query(
+            r#"
+            INSERT INTO provider_accounts
+              (provider_account_id, credential_pool_id, provider_id, account_key,
+               credential_ref, credential_revision, credential_auth_sha256,
+               state, created_at_ms, updated_at_ms)
+            VALUES ($1, $2, 'openai-codex', 'runtime-event-account',
+                    'managed://runtime-event-account', 1, $3, 'enabled', 1, 1)
+            "#,
+        )
+        .bind(provider_account_id)
+        .bind(credential_pool_id)
+        .bind("a".repeat(64))
+        .execute(&test_schema.pool)
+        .await
+        .map_err(|error| format!("failed to seed provider account: {error}"))?;
+        sqlx::query(
+            r#"
+            INSERT INTO provider_account_execution_controls
+              (provider_account_id, desired_max_concurrency, lifecycle_state,
+               control_version, created_at_ms, updated_at_ms)
+            VALUES ($1, 10, 'active', 1, 1, 1)
+            "#,
+        )
+        .bind(provider_account_id)
+        .execute(&test_schema.pool)
+        .await
+        .map_err(|error| format!("failed to seed execution control: {error}"))?;
+
+        sqlx::query(
+            "UPDATE provider_account_execution_controls SET updated_at_ms = 2 WHERE provider_account_id = $1",
+        )
+        .bind(provider_account_id)
+        .execute(&test_schema.pool)
+        .await
+        .map_err(|error| format!("failed to apply no-op runtime update: {error}"))?;
+        require(
+            timeout(Duration::from_millis(100), listener.recv())
+                .await
+                .is_err(),
+            "unrelated control updates must not emit runtime notifications",
+        )?;
+
+        sqlx::query(
+            r#"
+            UPDATE provider_account_execution_controls
+            SET desired_max_concurrency = 9,
+                control_version = 2,
+                updated_at_ms = 2
+            WHERE provider_account_id = $1
+            "#,
+        )
+        .bind(provider_account_id)
+        .execute(&test_schema.pool)
+        .await
+        .map_err(|error| format!("failed to update execution control: {error}"))?;
+
+        let notification = timeout(Duration::from_secs(2), listener.recv())
+            .await
+            .map_err(|_| "runtime notification timed out".to_string())?
+            .map_err(|error| format!("failed to receive runtime notification: {error}"))?;
+        require(
+            notification.payload() == provider_account_id.to_string(),
+            "runtime notification did not identify the changed provider account",
+        )
+    }
+    .await;
+    let cleanup = test_schema.cleanup().await;
+    cleanup?;
+    result
+}
+
+#[tokio::test]
+async fn credential_broker_serializes_refresh_and_promotes_observed_metadata() -> TestResult {
+    let Some(test_schema) = TestSchema::new(4).await? else {
+        return Ok(());
+    };
+
+    let result = async {
+        gateway_result(run_migrations(&test_schema.pool).await, "migration failed")?;
+        let credential_pool_id = Uuid::new_v4();
+        let provider_account_id = Uuid::new_v4();
+        sqlx::query(
+            r#"
+            INSERT INTO provider_credential_pools
+              (credential_pool_id, pool_key, provider_id, state, created_at_ms, updated_at_ms)
+            VALUES ($1, 'broker-test-pool', 'openai-codex', 'enabled', 1, 1)
+            "#,
+        )
+        .bind(credential_pool_id)
+        .execute(&test_schema.pool)
+        .await
+        .map_err(|error| format!("failed to seed credential pool: {error}"))?;
+        sqlx::query(
+            r#"
+            INSERT INTO provider_accounts
+              (provider_account_id, credential_pool_id, provider_id, account_key,
+               credential_ref, credential_revision, credential_auth_sha256,
+               state, created_at_ms, updated_at_ms)
+            VALUES ($1, $2, 'openai-codex', 'broker-test-account',
+                    'managed://broker-test-account', 1, $3, 'enabled', 1, 1)
+            "#,
+        )
+        .bind(provider_account_id)
+        .bind(credential_pool_id)
+        .bind("a".repeat(64))
+        .execute(&test_schema.pool)
+        .await
+        .map_err(|error| format!("failed to seed provider account: {error}"))?;
+        sqlx::query(
+            r#"
+            INSERT INTO provider_account_environments
+              (provider_account_id, provider_id, environment_kind, environment_ref,
+               upstream_identity_sha256, display_name, account_email, state,
+               created_at_ms, updated_at_ms)
+            VALUES ($1, 'openai-codex', 'codex_home_v1', '/tmp/broker-test-account',
+                    $2, 'Broker test', NULL, 'active', 1, 1)
+            "#,
+        )
+        .bind(provider_account_id)
+        .bind("b".repeat(64))
+        .execute(&test_schema.pool)
+        .await
+        .map_err(|error| format!("failed to seed provider environment: {error}"))?;
+
+        let store = PostgresCredentialStore::new(test_schema.pool.clone());
+        let initial = store
+            .resolve(provider_account_id)
+            .await
+            .map_err(|error| format!("initial credential should resolve: {error:?}"))?;
+        require(
+            initial.revision == 1 && initial.access_expires_at_ms.is_none(),
+            "trigger must initialize the first operational credential revision",
+        )?;
+
+        let first_store = store.clone();
+        let second_store = store.clone();
+        let (first, second) = tokio::join!(
+            first_store.claim_refresh(provider_account_id, "broker-a", 60_000, true),
+            second_store.claim_refresh(provider_account_id, "broker-b", 60_000, true)
+        );
+        let first = first.map_err(|error| format!("first refresh claim failed: {error:?}"))?;
+        let second = second.map_err(|error| format!("second refresh claim failed: {error:?}"))?;
+        require(
+            first.is_some() ^ second.is_some(),
+            "two brokers acquired the same account refresh lease",
+        )?;
+        let lease = first.or(second).ok_or("refresh lease was not acquired")?;
+        require(
+            store.resolve(provider_account_id).await
+                == Err(CredentialResolveError::Unavailable),
+            "execution must fail closed while a credential refresh owns the account",
+        )?;
+
+        let expires_at_ms: i64 = sqlx::query_scalar(
+            "SELECT floor(extract(epoch FROM clock_timestamp() + interval '2 hours') * 1000)::BIGINT",
+        )
+        .fetch_one(&test_schema.pool)
+        .await
+        .map_err(|error| format!("failed to read database clock: {error}"))?;
+        let promoted_revision = store
+            .promote_auth_file(&lease, &"f".repeat(64), Some(expires_at_ms))
+            .await
+            .map_err(|error| format!("metadata-only promotion failed: {error:?}"))?;
+        require(
+            promoted_revision == 2,
+            "new expiry metadata must create an immutable credential revision",
+        )?;
+        let promoted = store
+            .resolve(provider_account_id)
+            .await
+            .map_err(|error| format!("promoted credential should resolve: {error:?}"))?;
+        require(
+            promoted.revision == 2
+                && promoted.material_fingerprint_sha256 == "f".repeat(64)
+                && promoted.access_expires_at_ms == Some(expires_at_ms),
+            "credential head did not expose the promoted revision",
+        )?;
+        require(
+            store
+                .promote_auth_file(&lease, &"c".repeat(64), Some(expires_at_ms))
+                .await
+                == Err(CredentialResolveError::Unavailable),
+            "a released refresh lease mutated the credential head",
+        )?;
+        require(
+            sqlx::query(
+                "UPDATE provider_account_credential_revisions SET access_expires_at_ms = NULL WHERE provider_account_id = $1 AND revision = 2",
+            )
+            .bind(provider_account_id)
+            .execute(&test_schema.pool)
+            .await
+            .is_err(),
+            "credential revision ledger accepted an update",
+        )?;
+        let expired_lease = store
+            .claim_refresh(
+                provider_account_id,
+                "broker-authorization-check",
+                60_000,
+                true,
+            )
+            .await
+            .map_err(|error| format!("authorization check claim failed: {error:?}"))?
+            .ok_or_else(|| "authorization check lease was not acquired".to_owned())?;
+        store
+            .fail_refresh(
+                &expired_lease,
+                "codex_reauthorization_required",
+                true,
+            )
+            .await
+            .map_err(|error| format!("authorization failure was not recorded: {error:?}"))?;
+        require(
+            store.resolve(provider_account_id).await
+                == Err(CredentialResolveError::ReauthorizationRequired),
+            "expired Codex authorization remained schedulable",
+        )?;
+        let expired_state: (String, i32, Option<String>) = sqlx::query_as(
+            r#"
+            SELECT lifecycle_state, consecutive_failures, last_error_code
+            FROM provider_account_credential_heads
+            WHERE provider_account_id = $1
+            "#,
+        )
+        .bind(provider_account_id)
+        .fetch_one(&test_schema.pool)
+        .await
+        .map_err(|error| format!("failed to inspect expired credential state: {error}"))?;
+        require(
+            expired_state
+                == (
+                    "reauth_required".to_owned(),
+                    1,
+                    Some("codex_reauthorization_required".to_owned()),
+                ),
+            &format!("expired Codex authorization was not surfaced: {expired_state:?}"),
+        )?;
+        let event_types: Vec<String> = sqlx::query_scalar(
+            "SELECT event_type FROM provider_account_credential_events WHERE provider_account_id = $1 ORDER BY created_at_ms, event_type",
+        )
+        .bind(provider_account_id)
+        .fetch_all(&test_schema.pool)
+        .await
+        .map_err(|error| format!("failed to read credential events: {error}"))?;
+        require(
+            event_types.iter().any(|event| event == "refresh_claimed")
+                && event_types.iter().any(|event| event == "refresh_succeeded"),
+            "credential refresh audit events are incomplete",
+        )?;
+
+        let first_reauthorization = Uuid::new_v4();
+        let second_reauthorization = Uuid::new_v4();
+        sqlx::query(
+            r#"
+            INSERT INTO provider_account_login_sessions
+              (login_session_id, provider_id, account_key, display_name,
+               environment_ref, status, login_method, max_concurrency,
+               provider_account_id, expires_at_ms, created_at_ms, updated_at_ms)
+            VALUES ($1, 'openai-codex', 'reauth-test-a', 'Reauth test',
+                    '/tmp/reauth-test-a', 'waiting_for_user', 'browser_oauth', 1,
+                    $2, 10000, 1, 1)
+            "#,
+        )
+        .bind(first_reauthorization)
+        .bind(provider_account_id)
+        .execute(&test_schema.pool)
+        .await
+        .map_err(|error| format!("failed to seed reauthorization session: {error}"))?;
+        let duplicate_reauthorization = sqlx::query(
+            r#"
+            INSERT INTO provider_account_login_sessions
+              (login_session_id, provider_id, account_key, display_name,
+               environment_ref, status, login_method, max_concurrency,
+               provider_account_id, expires_at_ms, created_at_ms, updated_at_ms)
+            VALUES ($1, 'openai-codex', 'reauth-test-b', 'Reauth test',
+                    '/tmp/reauth-test-b', 'starting', 'browser_oauth', 1,
+                    $2, 10000, 1, 1)
+            "#,
+        )
+        .bind(second_reauthorization)
+        .bind(provider_account_id)
+        .execute(&test_schema.pool)
+        .await;
+        require(
+            duplicate_reauthorization.is_err(),
+            "the same provider account accepted concurrent reauthorization sessions",
+        )?;
+        sqlx::query(
+            r#"
+            INSERT INTO provider_account_credential_events
+              (credential_event_id, provider_account_id, event_type, from_revision,
+               to_revision, created_at_ms)
+            VALUES ($1, $2, 'reauth_succeeded', 2, 2, 2)
+            "#,
+        )
+        .bind(Uuid::new_v4())
+        .bind(provider_account_id)
+        .execute(&test_schema.pool)
+        .await
+        .map_err(|error| format!("reauthorization audit event was rejected: {error}"))?;
+
+        let dreamina_pool_id = Uuid::new_v4();
+        let dreamina_account_id = Uuid::new_v4();
+        sqlx::query(
+            r#"
+            INSERT INTO provider_credential_pools
+              (credential_pool_id, pool_key, provider_id, state, created_at_ms, updated_at_ms)
+            VALUES ($1, 'dreamina-broker-test-pool', 'dreamina-cli', 'enabled', 1, 1)
+            "#,
+        )
+        .bind(dreamina_pool_id)
+        .execute(&test_schema.pool)
+        .await
+        .map_err(|error| format!("failed to seed Dreamina credential pool: {error}"))?;
+        sqlx::query(
+            r#"
+            INSERT INTO provider_accounts
+              (provider_account_id, credential_pool_id, provider_id, account_key,
+               credential_ref, credential_revision, credential_auth_sha256,
+               state, created_at_ms, updated_at_ms)
+            VALUES ($1, $2, 'dreamina-cli', 'dreamina-broker-test-account',
+                    'managed://dreamina-broker-test-account', 1, $3, 'enabled', 1, 1)
+            "#,
+        )
+        .bind(dreamina_account_id)
+        .bind(dreamina_pool_id)
+        .bind("d".repeat(64))
+        .execute(&test_schema.pool)
+        .await
+        .map_err(|error| format!("failed to seed Dreamina provider account: {error}"))?;
+        sqlx::query(
+            r#"
+            INSERT INTO provider_account_environments
+              (provider_account_id, provider_id, environment_kind, environment_ref,
+               upstream_identity_sha256, display_name, account_email, state,
+               created_at_ms, updated_at_ms)
+            VALUES ($1, 'dreamina-cli', 'dreamina_home_v1', '/tmp/dreamina-broker-test-account',
+                    $2, 'Dreamina broker test', NULL, 'active', 1, 1)
+            "#,
+        )
+        .bind(dreamina_account_id)
+        .bind("e".repeat(64))
+        .execute(&test_schema.pool)
+        .await
+        .map_err(|error| format!("failed to seed Dreamina provider environment: {error}"))?;
+        let dreamina_state: (String, String, String) = sqlx::query_as(
+            r#"
+            SELECT revision.material_kind, head.lifecycle_state, head.refresh_strategy
+            FROM provider_account_credential_heads head
+            JOIN provider_account_credential_revisions revision
+              ON revision.provider_account_id = head.provider_account_id
+             AND revision.revision = head.active_revision
+            WHERE head.provider_account_id = $1
+            "#,
+        )
+        .bind(dreamina_account_id)
+        .fetch_one(&test_schema.pool)
+        .await
+        .map_err(|error| format!("failed to read Dreamina credential state: {error}"))?;
+        require(
+            dreamina_state
+                == (
+                    "system_keyring".to_string(),
+                    "active".to_string(),
+                    "cli_managed".to_string(),
+                ),
+            "new Dreamina accounts must use the isolated CLI-managed credential contract",
+        )?;
+        let dreamina_credential = store
+            .resolve(dreamina_account_id)
+            .await
+            .map_err(|error| format!("Dreamina credential should resolve: {error:?}"))?;
+        require(
+            dreamina_credential.provider_id == "dreamina-cli"
+                && dreamina_credential.home()
+                    == std::path::Path::new("/tmp/dreamina-broker-test-account"),
+            "Dreamina credential did not resolve to its isolated account home",
+        )?;
+        let dreamina_lease = store
+            .claim_refresh(dreamina_account_id, "dreamina-cli-manager", 60_000, true)
+            .await
+            .map_err(|error| format!("Dreamina refresh claim failed: {error:?}"))?
+            .ok_or("Dreamina CLI-managed credential was not claimable")?;
+        require(
+            store.resolve(dreamina_account_id).await
+                == Err(CredentialResolveError::Unavailable),
+            "Dreamina execution remained available while its keyring refresh lease was active",
+        )?;
+        store
+            .complete_cli_managed_refresh(&dreamina_lease)
+            .await
+            .map_err(|error| format!("Dreamina refresh completion failed: {error:?}"))?;
+        let refreshed_dreamina = store
+            .resolve(dreamina_account_id)
+            .await
+            .map_err(|error| format!("refreshed Dreamina credential should resolve: {error:?}"))?;
+        require(
+            refreshed_dreamina.revision == dreamina_credential.revision
+                && refreshed_dreamina.material_kind == "system_keyring",
+            "CLI-managed refresh changed the opaque Dreamina keyring revision",
+        )?;
+        let refresh_state: (String, i32, bool) = sqlx::query_as(
+            r#"
+            SELECT lifecycle_state, consecutive_failures,
+                   next_refresh_at_ms > floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT
+            FROM provider_account_credential_heads
+            WHERE provider_account_id = $1
+            "#,
+        )
+        .bind(dreamina_account_id)
+        .fetch_one(&test_schema.pool)
+        .await
+        .map_err(|error| format!("failed to inspect Dreamina refresh state: {error}"))?;
+        require(
+            refresh_state == ("active".to_owned(), 0, true),
+            "Dreamina CLI-managed refresh did not schedule its next health check",
+        )
+    }
+    .await;
+    let cleanup = test_schema.cleanup().await;
+    cleanup?;
+    result
+}
+
+#[tokio::test]
+async fn active_video_pricing_is_fail_closed_and_requires_a_positive_success_price() -> TestResult {
+    let Some(test_schema) = TestSchema::new(1).await? else {
+        return Ok(());
+    };
+    let result = async {
+        gateway_result(run_migrations(&test_schema.pool).await, "migration failed")?;
+        let seeded_free_prices: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM price_versions WHERE state = 'active' AND billing_metric = 'video_second' AND success_micros = 0",
+        )
+        .fetch_one(&test_schema.pool)
+        .await
+        .map_err(|error| format!("failed to inspect video pricing: {error}"))?;
+        require(
+            seeded_free_prices == 0,
+            "migration must not publish a free active video price",
+        )?;
+
+        let zero_price_id = Uuid::new_v4();
+        sqlx::query(
+            r#"
+            INSERT INTO price_versions
+              (price_version_id, price_key, version, api_profile, operation, provider_id, model,
+               billing_metric, billing_unit, currency,
+               success_micros, failed_micros, no_effect_micros, state,
+               created_at_ms, updated_at_ms)
+            VALUES ($1, 'zero-video-price', 1, 'xai-videos-v1', 'video_generation',
+                    'grok-cli', '*', 'video_second', 'second', 'USD',
+                    0, 0, 0, 'draft', 1, 1)
+            "#,
+        )
+        .bind(zero_price_id)
+        .execute(&test_schema.pool)
+        .await
+        .map_err(|error| format!("failed to seed draft video price: {error}"))?;
+        require(
+            sqlx::query("UPDATE price_versions SET state = 'active', updated_at_ms = 2 WHERE price_version_id = $1")
+                .bind(zero_price_id)
+                .execute(&test_schema.pool)
+                .await
+                .is_err(),
+            "zero-success video price became active",
+        )?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO price_versions
+              (price_version_id, price_key, version, api_profile, operation, provider_id, model,
+               billing_metric, billing_unit, currency,
+               success_micros, failed_micros, no_effect_micros, state,
+               created_at_ms, updated_at_ms)
+            VALUES ($1, 'paid-video-price', 1, 'xai-videos-v1', 'video_generation',
+                    'grok-cli', '*', 'video_second', 'second', 'USD',
+                    10, 0, 0, 'active', 1, 1)
+            "#,
+        )
+        .bind(Uuid::new_v4())
+        .execute(&test_schema.pool)
+        .await
+        .map_err(|error| format!("positive video price was rejected: {error}"))?;
+        Ok(())
+    }
+    .await;
     let cleanup = test_schema.cleanup().await;
     cleanup?;
     result
@@ -425,6 +2200,37 @@ async fn economic_ledger_case(pool: &PgPool) -> TestResult {
         .map_err(|error| format!("failed to seed ledger account: {error}"))?;
     }
 
+    let ungoverned_adjustment = sqlx::query(
+        r#"
+        INSERT INTO ledger_transactions
+          (transaction_id, semantic_key, transaction_type, currency, payload_hash, created_at_ms)
+        VALUES ($1, $2, 'adjustment', 'USD', $3, 1)
+        "#,
+    )
+    .bind(Uuid::new_v4())
+    .bind(format!("ungoverned:{}", Uuid::new_v4()))
+    .bind("0".repeat(64))
+    .execute(pool)
+    .await
+    .expect_err("generic adjustments must be rejected without business evidence");
+    require(
+        ungoverned_adjustment
+            .as_database_error()
+            .and_then(|error| error.code())
+            .as_deref()
+            == Some("55000"),
+        &format!("unexpected generic adjustment error: {ungoverned_adjustment}"),
+    )?;
+
+    // The remaining assertions exercise the lower-level ledger guards in this
+    // isolated schema, independently of the product-level adjustment gate.
+    sqlx::query(
+        "ALTER TABLE ledger_transactions DISABLE TRIGGER ledger_transactions_reject_ungoverned_adjustment",
+    )
+    .execute(pool)
+    .await
+    .map_err(|error| format!("failed to isolate the ledger guard test: {error}"))?;
+
     let empty_transaction_id = Uuid::new_v4();
     let mut empty = pool
         .begin()
@@ -515,7 +2321,14 @@ async fn economic_ledger_case(pool: &PgPool) -> TestResult {
         .await
         .is_err(),
         "sealed ledger transaction accepted another posting",
+    )?;
+    sqlx::query(
+        "ALTER TABLE ledger_transactions ENABLE TRIGGER ledger_transactions_reject_ungoverned_adjustment",
     )
+    .execute(pool)
+    .await
+    .map_err(|error| format!("failed to restore the adjustment guard: {error}"))?;
+    Ok(())
 }
 
 async fn execution_context_upgrade_case(pool: &PgPool) -> TestResult {
@@ -1122,6 +2935,16 @@ async fn shared_pool_case(pool: &PgPool) -> TestResult {
         pool.clone(),
         ApiKeyKeyring::new(1, [(1, vec![0x22; 32])]).expect("test keyring must be valid"),
     );
+    sqlx::query(
+        r#"
+        INSERT INTO gateway_projects (id, tenant_id, name, created_at)
+        VALUES ('proj_blocked', 'proj_blocked', 'Blocked', 1),
+               ('proj_ready', 'proj_ready', 'Ready', 1)
+        "#,
+    )
+    .execute(pool)
+    .await
+    .map_err(|error| format!("failed to seed credential projects: {error}"))?;
     let held_connection = pool
         .acquire()
         .await
@@ -1145,7 +2968,12 @@ async fn shared_pool_case(pool: &PgPool) -> TestResult {
     require(
         timeout(
             Duration::from_millis(100),
-            api_key_store.create_service_account("proj_blocked", "Blocked"),
+            api_key_store.create_service_account(
+                "proj_blocked",
+                "Blocked",
+                ApiKeyPermissionMode::All,
+                ApiKeyPermissions::default(),
+            ),
         )
         .await
         .is_err(),
@@ -1155,7 +2983,12 @@ async fn shared_pool_case(pool: &PgPool) -> TestResult {
     drop(held_connection);
     let (usage_result, api_key_result) = tokio::join!(
         usage_store.reserve(test_charge("usage-ready")),
-        api_key_store.create_service_account("proj_ready", "Ready"),
+        api_key_store.create_service_account(
+            "proj_ready",
+            "Ready",
+            ApiKeyPermissionMode::All,
+            ApiKeyPermissions::default(),
+        ),
     );
     usage_result.map_err(|error| format!("usage store should be usable: {error:?}"))?;
     api_key_result.map_err(|error| format!("API key store should be usable: {error:?}"))?;
@@ -1164,12 +2997,23 @@ async fn shared_pool_case(pool: &PgPool) -> TestResult {
 
 async fn assert_expected_schema(pool: &PgPool) -> TestResult {
     require(
-        migration_versions(pool).await?
-            == vec![
-                0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22,
-                23, 24, 25, 26, 27, 28, 29, 30, 31,
-            ],
-        "applied migration versions must be exactly [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31]",
+        migration_versions(pool).await? == (0_i64..=113_i64).collect::<Vec<_>>(),
+        "applied migration versions must be exactly 0 through 113",
+    )?;
+
+    let retention_policy: (i64, i64, i64, i64) = sqlx::query_as(
+        r#"
+        SELECT policy_version, retain_for_ms, read_drain_ms, retry_delay_ms
+        FROM artifact_retention_policies
+        WHERE policy_key = 'default'
+        "#,
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|error| format!("failed to inspect active artifact retention policy: {error}"))?;
+    require(
+        retention_policy == (2, 1_800_000, 60_000, 60_000),
+        "active artifact retention policy must retain new results for 30 minutes",
     )?;
 
     for (table, column) in REQUIRED_COLUMNS {
@@ -1194,6 +3038,208 @@ async fn assert_expected_schema(pool: &PgPool) -> TestResult {
         .map_err(|error| format!("failed to query index {index}: {error}"))?;
         require(exists, &format!("index {index} must exist"))?;
     }
+
+    for table in [
+        "project_files",
+        "project_batches",
+        "project_batch_requests",
+        "project_batch_output_files",
+    ] {
+        let exists: bool =
+            sqlx::query_scalar("SELECT to_regclass(current_schema() || '.' || $1) IS NOT NULL")
+                .bind(table)
+                .fetch_one(pool)
+                .await
+                .map_err(|error| format!("failed to inspect batch table {table}: {error}"))?;
+        require(exists, &format!("batch table {table} must exist"))?;
+    }
+
+    for (table, column) in [
+        ("project_files", "object_key"),
+        ("project_files", "sha256_hex"),
+        ("project_files", "cleanup_lease_epoch"),
+        ("project_files", "cleanup_completed_at_ms"),
+        ("project_batches", "auth_snapshot"),
+        ("project_batches", "route_snapshot"),
+        ("project_batches", "lease_epoch"),
+        ("project_batches", "request_count_cancelled"),
+        ("project_batches", "result_bytes"),
+        ("project_batch_requests", "custom_id"),
+        ("project_batch_requests", "request_hash"),
+        ("project_batch_requests", "available_at_ms"),
+        ("project_batch_requests", "attempt_count"),
+        ("project_batch_requests", "last_error"),
+        ("project_batch_requests", "lease_epoch"),
+        ("project_batch_output_files", "role"),
+    ] {
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = $1 AND column_name = $2)",
+        )
+        .bind(table)
+        .bind(column)
+        .fetch_one(pool)
+        .await
+        .map_err(|error| format!("failed to inspect {table}.{column}: {error}"))?;
+        require(exists, &format!("{table}.{column} must exist"))?;
+    }
+
+    for index in [
+        "project_files_project_created_idx",
+        "project_files_expiry_cleanup_idx",
+        "project_files_project_storage_pending_idx",
+        "project_files_cleanup_recovery_idx",
+        "project_batches_project_created_idx",
+        "project_batches_recovery_idx",
+        "project_batch_requests_claim_idx",
+        "project_batch_requests_lease_expiry_idx",
+    ] {
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM pg_indexes WHERE schemaname = current_schema() AND indexname = $1)",
+        )
+        .bind(index)
+        .fetch_one(pool)
+        .await
+        .map_err(|error| format!("failed to inspect batch index {index}: {error}"))?;
+        require(exists, &format!("batch index {index} must exist"))?;
+    }
+    let claim_index: String = sqlx::query_scalar(
+        r#"
+        SELECT indexdef
+        FROM pg_indexes
+        WHERE schemaname = current_schema()
+          AND indexname = 'project_batch_requests_claim_idx'
+        "#,
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|error| format!("failed to inspect batch claim index: {error}"))?;
+    require(
+        claim_index.contains("available_at_ms"),
+        "batch claim index must support retry availability ordering",
+    )?;
+    let recovery_index: String = sqlx::query_scalar(
+        r#"
+        SELECT indexdef
+        FROM pg_indexes
+        WHERE schemaname = current_schema()
+          AND indexname = 'project_batches_recovery_idx'
+        "#,
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|error| format!("failed to inspect batch recovery index: {error}"))?;
+    require(
+        recovery_index.contains("updated_at_ms")
+            && recovery_index.contains("batch_id")
+            && recovery_index.contains("validating"),
+        "batch recovery index must match runnable scan ordering and statuses",
+    )?;
+    let cleanup_recovery_index: String = sqlx::query_scalar(
+        r#"
+        SELECT indexdef
+        FROM pg_indexes
+        WHERE schemaname = current_schema()
+          AND indexname = 'project_files_cleanup_recovery_idx'
+        "#,
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|error| format!("failed to inspect file cleanup recovery index: {error}"))?;
+    require(
+        cleanup_recovery_index.contains("cleanup_lease_expires_at_ms")
+            && cleanup_recovery_index.contains("cleanup_completed_at_ms IS NULL")
+            && cleanup_recovery_index.contains("deleted_at_ms")
+            && cleanup_recovery_index.contains("expires_at_ms"),
+        "file cleanup recovery index must support pending and expired lease scans",
+    )?;
+    let project_file_limits: Vec<(String, String)> = sqlx::query_as(
+        r#"
+        SELECT column_name::TEXT, column_default::TEXT
+        FROM information_schema.columns
+        WHERE table_schema = current_schema()
+          AND table_name = 'gateway_projects'
+          AND column_name IN ('file_storage_limit_bytes', 'file_storage_limit_count')
+        ORDER BY column_name
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|error| format!("failed to inspect project file storage limits: {error}"))?;
+    require(
+        project_file_limits.len() == 2
+            && project_file_limits.iter().any(|(column, default)| {
+                column == "file_storage_limit_bytes" && default.contains("2147483648")
+            })
+            && project_file_limits.iter().any(|(column, default)| {
+                column == "file_storage_limit_count" && default.contains("1000")
+            }),
+        "project file storage limits must persist the 2 GiB and 1000 file defaults",
+    )?;
+
+    let source_check: String = sqlx::query_scalar(
+        r#"
+        SELECT pg_get_constraintdef(oid)
+        FROM pg_constraint
+        WHERE conrelid = 'gateway_request_observations'::regclass
+          AND conname = 'gateway_request_observations_source_check'
+        "#,
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|error| format!("failed to inspect request source check: {error}"))?;
+    let source_check = source_check.to_ascii_lowercase();
+    require(
+        ["models", "images", "videos", "files", "batches"]
+            .into_iter()
+            .all(|source| source_check.contains(source)),
+        "request observation source check must preserve existing sources and allow batches",
+    )?;
+
+    let batch_foreign_keys: Vec<String> = sqlx::query_scalar(
+        r#"
+        SELECT lower(pg_get_constraintdef(oid))
+        FROM pg_constraint
+        WHERE conrelid IN (
+            'project_files'::regclass,
+            'project_batches'::regclass,
+            'project_batch_requests'::regclass,
+            'project_batch_output_files'::regclass
+        )
+          AND contype = 'f'
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|error| format!("failed to inspect batch foreign keys: {error}"))?;
+    require(
+        batch_foreign_keys.iter().all(|definition| {
+            !definition.contains("project_batches")
+                || (definition.contains("project_id") && definition.contains("tenant_id"))
+        }) && batch_foreign_keys
+            .iter()
+            .filter(|definition| definition.contains("references project_files"))
+            .all(|definition| {
+                definition.contains("project_id") && definition.contains("tenant_id")
+            }),
+        "batch and file references must preserve project and tenant ownership",
+    )?;
+
+    let output_identity: i64 = sqlx::query_scalar(
+        r#"
+        SELECT COUNT(*)
+        FROM pg_constraint
+        WHERE conrelid = 'project_batch_output_files'::regclass
+          AND contype IN ('p', 'u')
+          AND pg_get_constraintdef(oid) ILIKE '%batch_id%role%'
+        "#,
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|error| format!("failed to inspect batch output role identity: {error}"))?;
+    require(
+        output_identity >= 1,
+        "batch output roles must be unique per batch",
+    )?;
 
     let readiness_columns: Vec<String> = sqlx::query_scalar(
         r#"
@@ -1305,6 +3351,419 @@ async fn assert_expected_schema(pool: &PgPool) -> TestResult {
         provider_heartbeat_triggers == 3,
         "provider heartbeat, capacity quarantine, and attach deadline guards must exist",
     )?;
+
+    let provider_cost_integrity_triggers: i64 = sqlx::query_scalar(
+        r#"
+        SELECT COUNT(*)
+        FROM pg_trigger trigger
+        JOIN pg_class relation ON relation.oid = trigger.tgrelid
+        JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
+        WHERE NOT tgisinternal
+          AND namespace.nspname = current_schema()
+          AND tgname IN (
+              'ledger_transactions_provider_cost_amount_guard',
+              'ledger_postings_provider_cost_amount_guard',
+              'ledger_transaction_seals_provider_cost_amount_guard',
+              'provider_cost_observation_receipts_validate_fact_set',
+              'provider_cost_observation_fact_links_validate_contract',
+              'provider_cost_allocation_lines_validate_period',
+              'provider_cost_observation_fact_links_claim_authority',
+              'provider_cost_allocation_pools_claim_authority',
+              'ledger_transactions_claim_legacy_provider_cost_authority',
+              'provider_cost_authority_claims_reject_mutation',
+              'provider_cost_authority_claims_reject_truncate',
+              'executor_provider_cost_evidence_validate_contract',
+              'executor_provider_cost_evidence_reject_mutation',
+              'executor_provider_cost_evidence_reject_truncate',
+              'provider_receipts_reject_legacy_cost',
+              'ledger_transactions_reject_legacy_provider_cost',
+              'provider_cost_observation_sources_require_verified',
+              'provider_cost_observations_require_source',
+              'provider_cost_observation_sources_validate',
+              'provider_cost_observation_fact_links_validate_source',
+              'provider_cost_observation_receipts_validate_source',
+              'provider_cost_observation_sources_reject_mutation',
+              'provider_cost_observation_sources_reject_truncate',
+              'provider_cost_obligations_validate',
+              'provider_cost_obligations_preserve',
+              'provider_cost_obligations_record_event',
+              'provider_cost_obligation_events_immutable',
+              'provider_cost_obligation_events_reject_truncate',
+              'provider_receipts_create_cost_obligation',
+              'provider_cost_authority_claims_settle_obligations',
+              'provider_receipts_require_cost_obligation'
+          )
+        "#,
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|error| format!("failed to query provider cost integrity triggers: {error}"))?;
+    require(
+        provider_cost_integrity_triggers == 31,
+        "provider cost amount, attribution, obligation, and accounting-period guards must exist",
+    )?;
+
+    let customer_refund_integrity_triggers: i64 = sqlx::query_scalar(
+        r#"
+        SELECT COUNT(*)
+        FROM pg_trigger trigger
+        JOIN pg_class relation ON relation.oid = trigger.tgrelid
+        JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
+        WHERE NOT tgisinternal
+          AND namespace.nspname = current_schema()
+          AND tgname IN (
+              'customer_refunds_validate',
+              'customer_refunds_validate_account_total',
+              'billing_accounts_validate_refund_total',
+              'customer_refunds_reject_mutation',
+              'customer_refunds_reject_truncate',
+              'ledger_transactions_validate_customer_refund_source',
+              'ledger_transactions_require_customer_refund_evidence'
+          )
+        "#,
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|error| format!("failed to query customer refund integrity triggers: {error}"))?;
+    require(
+        customer_refund_integrity_triggers == 7,
+        "customer refund shape, account counter, and immutability guards must exist",
+    )?;
+    let billing_integrity_category_constraint: String = sqlx::query_scalar(
+        r#"
+        SELECT pg_get_constraintdef(oid)
+        FROM pg_constraint
+        WHERE conrelid = 'billing_integrity_findings'::regclass
+          AND conname = 'billing_integrity_findings_category_check'
+        "#,
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|error| format!("failed to query billing integrity category constraint: {error}"))?;
+    require(
+        billing_integrity_category_constraint.contains("'customer_refund'::text"),
+        "billing integrity findings must accept customer refund findings",
+    )?;
+
+    let provider_cost_source_guard: String = sqlx::query_scalar(
+        "SELECT pg_get_functiondef('validate_provider_cost_observation_source()'::regprocedure)",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|error| format!("failed to query provider cost source guard: {error}"))?;
+    let provider_cost_source_required: String = sqlx::query_scalar(
+        "SELECT pg_get_functiondef('require_provider_cost_observation_source()'::regprocedure)",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|error| format!("failed to query provider cost source requirement: {error}"))?;
+    let provider_cost_source_verified: String = sqlx::query_scalar(
+        "SELECT pg_get_functiondef('reject_new_unverified_provider_cost_source()'::regprocedure)",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|error| format!("failed to query provider cost source verification guard: {error}"))?;
+    require(
+        provider_cost_source_guard
+            .contains("provider cost observation source is not executor verified")
+            && provider_cost_source_guard.contains("fact.fact_domain = 'provider_actual'")
+            && provider_cost_source_guard.contains("fact.quantity::NUMERIC")
+            && provider_cost_source_required
+                .contains("provider cost observation requires one source")
+            && provider_cost_source_verified
+                .contains("new provider cost observations require executor evidence"),
+        "provider cost observations must be bound to exact executor evidence",
+    )?;
+
+    let receipt_legacy_guard: String = sqlx::query_scalar(
+        "SELECT pg_get_functiondef('reject_new_legacy_provider_receipt_cost()'::regprocedure)",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|error| format!("failed to query receipt legacy cost guard: {error}"))?;
+    let ledger_legacy_guard: String = sqlx::query_scalar(
+        "SELECT pg_get_functiondef('reject_new_legacy_provider_cost_ledger()'::regprocedure)",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|error| format!("failed to query ledger legacy cost guard: {error}"))?;
+    require(
+        receipt_legacy_guard.contains("legacy provider receipt cost writes are disabled")
+            && ledger_legacy_guard.contains("legacy provider cost ledger writes are disabled")
+            && ledger_legacy_guard.contains("source_provider_cost_observation_id IS NULL")
+            && ledger_legacy_guard.contains("source_provider_cost_allocation_line_id IS NULL"),
+        "new legacy receipt and ledger provider cost writes must fail closed",
+    )?;
+
+    let provider_cost_amount_guard: String = sqlx::query_scalar(
+        "SELECT pg_get_functiondef('validate_provider_cost_ledger_amount()'::regprocedure)",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|error| format!("failed to inspect provider cost amount guard: {error}"))?;
+    require(
+        provider_cost_amount_guard.contains("posting_count <> 2")
+            && provider_cost_amount_guard.contains("positive_amount <>")
+            && provider_cost_amount_guard.contains("negative_amount <>")
+            && provider_cost_amount_guard.contains("positive_account_key")
+            && provider_cost_amount_guard.contains("negative_account_key")
+            && provider_cost_amount_guard.contains("provider-expense")
+            && provider_cost_amount_guard.contains("payable")
+            && provider_cost_amount_guard.contains("provider_cost_ledger_payload_hash")
+            && provider_cost_amount_guard.contains("seal_count <> 1"),
+        "provider cost ledger guard must bind amount, accounts, payload, and seal to its source",
+    )?;
+
+    let provider_cost_fact_guard: String = sqlx::query_scalar(
+        "SELECT pg_get_functiondef('validate_provider_cost_fact_link()'::regprocedure)",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|error| format!("failed to inspect provider cost fact guard: {error}"))?;
+    require(
+        provider_cost_fact_guard.contains("fact.fact_domain <> 'provider_actual'")
+            && provider_cost_fact_guard.contains("fact.metric <> 'provider_reported_cost'")
+            && provider_cost_fact_guard.contains("fact.unit <> observation.native_unit")
+            && provider_cost_fact_guard
+                .contains("fact.provider_account_id <> observation.provider_account_id"),
+        "provider cost links must reject facts outside the exact observation contract",
+    )?;
+
+    let provider_cost_fact_set_guard: String = sqlx::query_scalar(
+        "SELECT pg_get_functiondef('validate_provider_cost_observation_fact_set()'::regprocedure)",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|error| format!("failed to inspect provider cost fact-set guard: {error}"))?;
+    require(
+        provider_cost_fact_set_guard.contains("valid_count <> linked_count")
+            && provider_cost_fact_set_guard.contains("linked_fact_set_hash")
+            && provider_cost_fact_set_guard.contains("sha256")
+            && provider_cost_fact_set_guard.contains("ledger_count <> 1")
+            && provider_cost_fact_set_guard.contains("ledger_count <> 0")
+            && provider_cost_fact_set_guard.contains("EXCEPT")
+            && provider_cost_fact_set_guard
+                .contains("provider cost receipt links do not equal the fact set"),
+        "provider cost observations must hash the entire exact fact and receipt set",
+    )?;
+
+    let provider_cost_receipt_guard: String = sqlx::query_scalar(
+        "SELECT pg_get_functiondef('validate_provider_cost_observation_receipt_link()'::regprocedure)",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|error| format!("failed to inspect provider cost receipt guard: {error}"))?;
+    require(
+        provider_cost_receipt_guard.contains("provider_cost_observation_fact_links")
+            && provider_cost_receipt_guard.contains("fact.receipt_id = NEW.receipt_id")
+            && provider_cost_receipt_guard
+                .contains("fact.provider_account_id = observation.provider_account_id"),
+        "provider cost receipt guard must derive attribution from the immutable fact set",
+    )?;
+
+    let provider_cost_period_guard: String = sqlx::query_scalar(
+        "SELECT pg_get_functiondef('validate_provider_cost_allocation_line_period()'::regprocedure)",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|error| format!("failed to inspect provider cost period guard: {error}"))?;
+    require(
+        provider_cost_period_guard.contains("receipt.created_at_ms >= pool.period_start_ms")
+            && provider_cost_period_guard.contains("receipt.created_at_ms < pool.period_end_ms")
+            && provider_cost_period_guard.contains("fact.created_at_ms >= pool.period_start_ms")
+            && provider_cost_period_guard.contains("fact.created_at_ms < pool.period_end_ms"),
+        "provider cost allocation guard must use half-open accounting periods for every basis",
+    )?;
+
+    let provider_actual_authority_guard: String = sqlx::query_scalar(
+        "SELECT pg_get_functiondef('claim_provider_actual_cost_authority()'::regprocedure)",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|error| format!("failed to inspect actual cost authority guard: {error}"))?;
+    let provider_actual_authority_guard = provider_actual_authority_guard.to_ascii_lowercase();
+    require(
+        provider_actual_authority_guard.contains("provider_usage_facts")
+            && provider_actual_authority_guard.contains("provider_receipts")
+            && provider_actual_authority_guard.contains("provider_actual")
+            && provider_actual_authority_guard.contains("int8range"),
+        "provider actual authority must derive its account, job, currency, and point period",
+    )?;
+
+    let provider_allocation_authority_guard: String = sqlx::query_scalar(
+        "SELECT pg_get_functiondef('claim_closed_provider_allocation_authority()'::regprocedure)",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|error| format!("failed to inspect allocated cost authority guard: {error}"))?;
+    let provider_allocation_authority_guard =
+        provider_allocation_authority_guard.to_ascii_lowercase();
+    require(
+        provider_allocation_authority_guard.contains("new.state <> 'closed'")
+            && provider_allocation_authority_guard.contains("provider_cost_allocation_lines")
+            && provider_allocation_authority_guard.contains("new.period_start_ms")
+            && provider_allocation_authority_guard.contains("new.period_end_ms"),
+        "provider allocated authority must be claimed only when its pool closes",
+    )?;
+
+    let receipt_authority_column: (String, String) = sqlx::query_as(
+        r#"
+        SELECT is_nullable::TEXT, data_type::TEXT
+        FROM information_schema.columns
+        WHERE table_schema = current_schema()
+          AND table_name = 'provider_cost_authority_claims'
+          AND column_name = 'source_receipt_id'
+        "#,
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|error| format!("failed to inspect receipt authority column: {error}"))?;
+    require(
+        receipt_authority_column == ("NO".to_string(), "uuid".to_string()),
+        "every provider cost authority must reference one immutable receipt",
+    )?;
+
+    let receipt_authority_guard: String = sqlx::query_scalar(
+        "SELECT pg_get_functiondef('validate_provider_cost_authority_receipt()'::regprocedure)",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|error| format!("failed to inspect receipt authority guard: {error}"))?;
+    let receipt_authority_guard = receipt_authority_guard.to_ascii_lowercase();
+    require(
+        receipt_authority_guard.contains("fact.receipt_id <> new.source_receipt_id")
+            && receipt_authority_guard.contains("line.basis_receipt_id <> new.source_receipt_id")
+            && receipt_authority_guard
+                .contains("ledger_tx.source_receipt_id <> new.source_receipt_id")
+            && receipt_authority_guard.contains("pool.state <> 'closed'")
+            && receipt_authority_guard.contains("pool.allocation_basis <> 'successful_output'"),
+        "actual, allocated, and legacy provider authority must match one exact receipt",
+    )?;
+
+    let obligation_settlement_guard: String = sqlx::query_scalar(
+        "SELECT pg_get_functiondef('settle_provider_cost_obligations_from_claim()'::regprocedure)",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|error| format!("failed to inspect obligation settlement guard: {error}"))?;
+    let obligation_settlement_guard = obligation_settlement_guard.to_ascii_lowercase();
+    require(
+        obligation_settlement_guard.contains("obligation.receipt_id = new.source_receipt_id")
+            && obligation_settlement_guard.contains("settlement_claim_id = new.claim_id"),
+        "provider cost obligations must settle by the authority's exact receipt",
+    )?;
+
+    let allocation_close_guard: String = sqlx::query_scalar(
+        "SELECT pg_get_functiondef('validate_provider_cost_allocation_closure()'::regprocedure)",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|error| format!("failed to inspect provider allocation close guard: {error}"))?;
+    let allocation_close_guard = allocation_close_guard.to_ascii_lowercase();
+    require(
+        allocation_close_guard.contains("pool.state")
+            && allocation_close_guard.contains("'draft'")
+            && allocation_close_guard.contains("pool.allocation_basis")
+            && allocation_close_guard.contains("'successful_output'")
+            && allocation_close_guard.contains("pool.residual_amount_micros")
+            && allocation_close_guard.contains("new.candidate_snapshot_hash")
+            && allocation_close_guard.contains("pool.candidate_snapshot_hash"),
+        "provider allocation close must bind an output snapshot with no residual",
+    )?;
+
+    let allocation_line_guard: String = sqlx::query_scalar(
+        "SELECT pg_get_functiondef('preserve_provider_cost_allocation_line()'::regprocedure)",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|error| format!("failed to inspect provider allocation line guard: {error}"))?;
+    let allocation_line_guard = allocation_line_guard.to_ascii_lowercase();
+    require(
+        allocation_line_guard.contains("tg_op in ('update', 'delete')")
+            && allocation_line_guard.contains("provider allocation lines are immutable")
+            && allocation_line_guard.contains("pool_state")
+            && allocation_line_guard.contains("'draft'"),
+        "provider allocation lines must be append-only while their pool is draft",
+    )?;
+
+    let closed_allocation_guard: String = sqlx::query_scalar(
+        "SELECT pg_get_functiondef('validate_closed_provider_cost_allocation_evidence(uuid)'::regprocedure)",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|error| format!("failed to inspect closed allocation evidence guard: {error}"))?;
+    let closed_allocation_guard = closed_allocation_guard.to_ascii_lowercase();
+    require(
+        closed_allocation_guard.contains("closure_count <> 1")
+            && closed_allocation_guard.contains("line_count = 0")
+            && closed_allocation_guard.contains("claim_count <> line_count")
+            && closed_allocation_guard.contains("invalid_claim_count <> 0")
+            && closed_allocation_guard.contains("invalid_snapshot_count <> 0")
+            && closed_allocation_guard.contains("basis_receipt_payload_hash")
+            && closed_allocation_guard.contains("basis_quote_hash"),
+        "closed provider allocations must retain complete receipt, quote, closure, and claim evidence",
+    )?;
+
+    let closed_allocation_ledger_guard: String = sqlx::query_scalar(
+        "SELECT pg_get_functiondef('validate_closed_provider_cost_allocation_ledger(uuid)'::regprocedure)",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|error| format!("failed to inspect closed allocation ledger guard: {error}"))?;
+    let closed_allocation_ledger_guard = closed_allocation_ledger_guard.to_ascii_lowercase();
+    require(
+        closed_allocation_ledger_guard.contains("residual <> 0")
+            && closed_allocation_ledger_guard.contains("line_count = 0")
+            && closed_allocation_ledger_guard.contains("invalid_line_count <> 0")
+            && closed_allocation_ledger_guard.contains("transaction_count <> 1")
+            && closed_allocation_ledger_guard.contains("seal_count <> 1")
+            && closed_allocation_ledger_guard.contains("amount_micros = 0")
+            && closed_allocation_ledger_guard.contains("transaction_count <> 0"),
+        "closed provider allocations must have exact sealed ledger coverage for positive lines only",
+    )?;
+
+    let provider_cost_period_exclusion: String = sqlx::query_scalar(
+        r#"
+        SELECT pg_get_constraintdef(oid)
+        FROM pg_constraint
+        WHERE conrelid = 'provider_cost_allocation_pools'::regclass
+          AND conname = 'provider_cost_allocation_pools_closed_period_excl'
+        "#,
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|error| format!("failed to inspect provider cost period exclusion: {error}"))?;
+    let provider_cost_period_exclusion = provider_cost_period_exclusion.to_ascii_lowercase();
+    require(
+        provider_cost_period_exclusion.contains("int8range")
+            && provider_cost_period_exclusion.contains("period_start_ms")
+            && provider_cost_period_exclusion.contains("period_end_ms")
+            && provider_cost_period_exclusion.contains("with &&")
+            && provider_cost_period_exclusion.contains("state = 'closed'"),
+        "closed provider allocation periods must use a half-open overlap exclusion",
+    )?;
+
+    let provider_cost_authority_exclusion: String = sqlx::query_scalar(
+        r#"
+        SELECT pg_get_constraintdef(oid)
+        FROM pg_constraint
+        WHERE conrelid = 'provider_cost_authority_claims'::regclass
+          AND conname = 'provider_cost_authority_period_excl'
+        "#,
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|error| format!("failed to inspect provider cost authority exclusion: {error}"))?;
+    let provider_cost_authority_exclusion = provider_cost_authority_exclusion.to_ascii_lowercase();
+    require(
+        provider_cost_authority_exclusion.contains("provider_account_id with =")
+            && provider_cost_authority_exclusion.contains("job_id with =")
+            && provider_cost_authority_exclusion.contains("currency with =")
+            && provider_cost_authority_exclusion.contains("authority_period with &&")
+            && provider_cost_authority_exclusion.contains("authority_kind with <>"),
+        "provider cost authorities must exclude overlapping mixed sources per account, job, and currency",
+    )?;
+
     for (index, expression) in [
         (
             "provider_submit_recoveries_claim_idx",
@@ -1344,6 +3803,50 @@ async fn migration_versions(pool: &PgPool) -> TestResult<Vec<i64>> {
         .map_err(|error| format!("failed to query migration versions: {error}"))
 }
 
+async fn apply_migrations_through(pool: &PgPool, last_version: i64) -> TestResult {
+    apply_migration_range(pool, 0, last_version).await
+}
+
+async fn apply_migration_range(pool: &PgPool, first_version: i64, last_version: i64) -> TestResult {
+    let migration_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+    let mut migrations = std::fs::read_dir(&migration_dir)
+        .map_err(|error| format!("failed to read {}: {error}", migration_dir.display()))?
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("failed to enumerate migrations: {error}"))?;
+    migrations.sort();
+
+    for path in migrations {
+        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let Some(version) = file_name
+            .split_once('_')
+            .and_then(|(version, _)| version.parse::<i64>().ok())
+        else {
+            continue;
+        };
+        if !(first_version..=last_version).contains(&version) {
+            continue;
+        }
+        let sql = std::fs::read_to_string(&path)
+            .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
+        let mut transaction = pool
+            .begin()
+            .await
+            .map_err(|error| format!("failed to begin migration {version}: {error}"))?;
+        sqlx::raw_sql(AssertSqlSafe(sql))
+            .execute(&mut *transaction)
+            .await
+            .map_err(|error| format!("migration {version} failed: {error}"))?;
+        transaction
+            .commit()
+            .await
+            .map_err(|error| format!("failed to commit migration {version}: {error}"))?;
+    }
+    Ok(())
+}
+
 fn gateway_result(result: Result<(), ImageGatewayError>, context: &str) -> TestResult {
     result.map_err(|error| format!("{context}: {error:?}"))
 }
@@ -1359,12 +3862,15 @@ fn require(condition: bool, message: &str) -> TestResult {
 fn test_charge(request_id: &str) -> UsageCharge {
     UsageCharge {
         tenant_id: "proj_test".to_string(),
+        attribution: None,
         request_id: request_id.to_string(),
         admission_session_id: None,
         operation: "generation",
         provider_id: "openai-codex".to_string(),
         model: "gpt-image-2".to_string(),
-        units: 1,
+        output_count: 1,
+        billable_units: 1,
+        billing_metric: image_provider_contracts::BillingMetric::Output,
         limits: UsageLimits {
             five_hour_image_limit: 10,
             seven_day_image_limit: 10,

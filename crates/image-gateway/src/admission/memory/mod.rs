@@ -357,8 +357,28 @@ impl AdmissionStore for InMemoryAdmissionStore {
         lease_duration_ms: i64,
         contract: super::AdmissionContract,
     ) -> Result<Option<WorkLease>, AdmissionError> {
-        self.claim_matching(None, worker_id, lease_duration_ms, Some(contract))
+        self.claim_matching(None, worker_id, lease_duration_ms, Some(contract), None)
             .await
+    }
+
+    async fn claim_ready_for_schema(
+        &self,
+        worker_id: &str,
+        lease_duration_ms: i64,
+        contract: super::AdmissionContract,
+        command_schema: &str,
+    ) -> Result<Option<WorkLease>, AdmissionError> {
+        if command_schema.is_empty() {
+            return Err(AdmissionError::InvalidCommand);
+        }
+        self.claim_matching(
+            None,
+            worker_id,
+            lease_duration_ms,
+            Some(contract),
+            Some(command_schema),
+        )
+        .await
     }
 
     async fn claim_job(
@@ -367,7 +387,7 @@ impl AdmissionStore for InMemoryAdmissionStore {
         worker_id: &str,
         lease_duration_ms: i64,
     ) -> Result<Option<WorkLease>, AdmissionError> {
-        self.claim_matching(Some(job_id), worker_id, lease_duration_ms, None)
+        self.claim_matching(Some(job_id), worker_id, lease_duration_ms, None, None)
             .await
     }
 
@@ -441,6 +461,7 @@ impl InMemoryAdmissionStore {
         worker_id: &str,
         lease_duration_ms: i64,
         contract: Option<super::AdmissionContract>,
+        command_schema: Option<&str>,
     ) -> Result<Option<WorkLease>, AdmissionError> {
         let now = now_ms();
         let mut state = self.state.lock().await;
@@ -453,6 +474,8 @@ impl InMemoryAdmissionStore {
                     work.state == WorkState::Ready
                         && job_id.is_none_or(|job_id| work.job_id == job_id)
                         && contract.is_none_or(|contract| work.contract == contract)
+                        && command_schema
+                            .is_none_or(|schema| work.command_schema.as_str() == schema)
                 })
             })
             .min_by_key(|work_item_id| {

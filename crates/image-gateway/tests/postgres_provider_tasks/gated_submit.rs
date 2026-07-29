@@ -480,7 +480,7 @@ async fn prepared_gate_expiring_before_dispatch_reaches_terminal_and_cleans_work
         fs::write(
             &delayed_runner,
             format!(
-                "#!/bin/sh\n/bin/sleep 0.15\nexec '{}' \"$@\"\n",
+                "#!/bin/sh\n/bin/sleep 1.5\nexec '{}' \"$@\"\n",
                 real_runner.display()
             ),
         )
@@ -491,7 +491,7 @@ async fn prepared_gate_expiring_before_dispatch_reaches_terminal_and_cleans_work
         let outcome = ProviderSubmitOrchestrator::new(
             PostgresProviderTaskStore::new(database.pool.clone()),
             gated_submit_driver(codec, &delayed_runner, file_sha256(&delayed_runner)?)?,
-            75,
+            750,
             &journal_root,
         )
         .map_err(debug_error)?

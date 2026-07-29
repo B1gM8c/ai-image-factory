@@ -25,6 +25,10 @@ use super::{
 };
 use crate::{
     ImageGatewayError,
+    batches::{
+        BatchFileBlob, BatchFileBlobError, BatchFileBlobStore, MAX_FILE_BYTES,
+        batch_file_object_key,
+    },
     input_blobs::{
         InputBlobDeleteError, InputBlobKey, InputBlobReadError, InputBlobRef, InputBlobStore,
         InputBlobWriteError,
@@ -32,18 +36,19 @@ use crate::{
 };
 
 pub(crate) const MAX_ARTIFACT_BYTES: u64 = 256 * 1024 * 1024;
+const STORAGE_NAMESPACE_MARKER: &str = ".storage-namespace-id";
 
 pub struct FilesystemArtifactBlobStore {
     root: PathBuf,
+    executor_namespace_id: Uuid,
+    batch_files: Arc<fs::File>,
+    customer_objects: Arc<fs::File>,
     executor_objects: Arc<fs::File>,
     executor_staging: Arc<fs::File>,
 }
 
 struct PendingArtifact {
     temporary: PathBuf,
-    object: PathBuf,
-    linked: bool,
-    committed: bool,
 }
 
 pub(super) struct FilesystemExecutorArtifactStage {
@@ -61,36 +66,14 @@ pub(super) enum ExecutorArtifactStageError {
 }
 
 impl PendingArtifact {
-    fn new(temporary: PathBuf, object: PathBuf) -> Self {
-        Self {
-            temporary,
-            object,
-            linked: false,
-            committed: false,
-        }
-    }
-
-    fn mark_linked(&mut self) {
-        self.linked = true;
-    }
-
-    fn commit(mut self) {
-        self.committed = true;
+    fn new(temporary: PathBuf) -> Self {
+        Self { temporary }
     }
 }
 
 impl Drop for PendingArtifact {
     fn drop(&mut self) {
-        if self.committed {
-            return;
-        }
         let _ = fs::remove_file(&self.temporary);
-        if self.linked {
-            let _ = fs::remove_file(&self.object);
-            if let Some(parent) = self.object.parent() {
-                let _ = sync_directory(parent);
-            }
-        }
     }
 }
 
@@ -171,10 +154,17 @@ impl Drop for FilesystemExecutorArtifactStage {
 impl FilesystemArtifactBlobStore {
     pub fn new(root: impl AsRef<Path>) -> Result<Self, ImageGatewayError> {
         let root = validate_root(root.as_ref())?;
+        let executor_namespace_id = load_or_create_storage_namespace_id(&root)?;
+        let batch_files = root.join("batch-files");
         let objects = root.join("objects");
         let executor_objects = root.join("executor-objects");
         let executor_staging = root.join("executor-staging");
         let inputs = root.join("inputs");
+        prepare_storage_directory(
+            &batch_files,
+            "batch file directory is not writable",
+            "batch file directory must be a directory and must not be a symlink",
+        )?;
         prepare_storage_directory(
             &objects,
             "artifact object directory is not writable",
@@ -197,6 +187,12 @@ impl FilesystemArtifactBlobStore {
         )?;
         sync_directory(&root)
             .map_err(|_| ImageGatewayError::config("artifact root cannot be synchronized"))?;
+        let batch_files = open_private_directory(&batch_files).map_err(|_| {
+            ImageGatewayError::config("batch file directory could not be opened safely")
+        })?;
+        let customer_objects = open_private_directory(&objects).map_err(|_| {
+            ImageGatewayError::config("customer artifact directory could not be opened safely")
+        })?;
         let executor_objects = open_private_directory(&executor_objects).map_err(|_| {
             ImageGatewayError::config("executor artifact directory could not be opened safely")
         })?;
@@ -205,6 +201,9 @@ impl FilesystemArtifactBlobStore {
         })?;
         Ok(Self {
             root,
+            executor_namespace_id,
+            batch_files: Arc::new(batch_files),
+            customer_objects: Arc::new(customer_objects),
             executor_objects: Arc::new(executor_objects),
             executor_staging: Arc::new(executor_staging),
         })
@@ -245,7 +244,7 @@ impl FilesystemArtifactBlobStore {
             .map_err(|_| ArtifactWriteError::Unavailable)?;
 
         let temporary = parent.join(format!(".tmp-{}", Uuid::new_v4().simple()));
-        let mut pending = PendingArtifact::new(temporary.clone(), object_path.clone());
+        let pending = PendingArtifact::new(temporary.clone());
         let mut options = tokio::fs::OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
@@ -268,7 +267,7 @@ impl FilesystemArtifactBlobStore {
         }
 
         match tokio::fs::hard_link(&temporary, &object_path).await {
-            Ok(()) => pending.mark_linked(),
+            Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                 let existing = self
                     .get_blob_key(object_key, &result.0, result.1)
@@ -287,7 +286,7 @@ impl FilesystemArtifactBlobStore {
             return Err(ArtifactWriteError::Unavailable);
         }
 
-        pending.commit();
+        drop(pending);
         Ok(result)
     }
 
@@ -322,13 +321,24 @@ impl FilesystemArtifactBlobStore {
 
     pub(crate) async fn delete_blob_key(&self, object_key: &str) -> Result<(), ArtifactWriteError> {
         let path = self.root.join(object_key);
+        let parent = path
+            .parent()
+            .ok_or(ArtifactWriteError::Unavailable)?
+            .to_path_buf();
         match tokio::fs::remove_file(&path).await {
             Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return tokio::task::spawn_blocking(move || {
+                    open_private_directory(&parent)
+                        .map(|_| ())
+                        .map_err(|_| ArtifactWriteError::Unavailable)
+                })
+                .await
+                .map_err(|_| ArtifactWriteError::Unavailable)?;
+            }
             Err(_) => return Err(ArtifactWriteError::Unavailable),
         }
-        let parent = path.parent().ok_or(ArtifactWriteError::Unavailable)?;
-        sync_directory_async(parent.to_path_buf())
+        sync_directory_async(parent)
             .await
             .map_err(|_| ArtifactWriteError::Unavailable)
     }
@@ -389,7 +399,7 @@ impl FilesystemArtifactBlobStore {
         artifact: &ExecutorArtifactReference<'_>,
     ) -> Result<Vec<u8>, ArtifactReadError> {
         if artifact.storage_backend != FILESYSTEM_BACKEND
-            || artifact.storage_namespace != self.executor_storage_namespace()?
+            || !self.executor_storage_namespace_matches(artifact.storage_namespace)?
             || artifact.object_key != executor_object_key(artifact.authority_id)
         {
             return Err(ArtifactReadError::Integrity);
@@ -403,6 +413,31 @@ impl FilesystemArtifactBlobStore {
         })
         .await
         .map_err(|_| ArtifactReadError::Unavailable)?
+    }
+
+    pub(crate) async fn delete_executor_reference(
+        &self,
+        artifact: &ExecutorArtifactReference<'_>,
+    ) -> Result<(), ArtifactWriteError> {
+        if artifact.storage_backend != FILESYSTEM_BACKEND
+            || !self
+                .executor_storage_namespace_matches(artifact.storage_namespace)
+                .map_err(|_| ArtifactWriteError::Unavailable)?
+            || artifact.object_key != executor_object_key(artifact.authority_id)
+            || artifact.sha256_hex.len() != 64
+            || artifact.byte_size == 0
+        {
+            return Err(ArtifactWriteError::Unavailable);
+        }
+        let root = self.executor_objects.clone();
+        let authority_id = artifact.authority_id;
+        let expected_sha256 = artifact.sha256_hex.to_owned();
+        let expected_size = artifact.byte_size;
+        tokio::task::spawn_blocking(move || {
+            delete_verified_executor_object_at(&root, authority_id, &expected_sha256, expected_size)
+        })
+        .await
+        .map_err(|_| ArtifactWriteError::Unavailable)?
     }
 
     pub(crate) async fn delete_unpublished_executor_artifact(
@@ -452,16 +487,35 @@ impl FilesystemArtifactBlobStore {
     }
 
     pub(crate) fn executor_storage_namespace(&self) -> Result<String, ArtifactReadError> {
-        let opened_stat = validate_bound_private_directory(
+        validate_bound_private_directory(
             &self.root.join("executor-objects"),
             self.executor_objects.as_ref(),
         )?;
         Ok(format!(
-            "{FILESYSTEM_BACKEND}:{}#executor={}:{}",
+            "{FILESYSTEM_BACKEND}:{}#executor={}",
             self.root.display(),
-            opened_stat.st_dev,
-            opened_stat.st_ino
+            self.executor_namespace_id
         ))
+    }
+
+    fn executor_storage_namespace_matches(
+        &self,
+        candidate: &str,
+    ) -> Result<bool, ArtifactReadError> {
+        if candidate == self.executor_storage_namespace()? {
+            return Ok(true);
+        }
+        let prefix = format!("{FILESYSTEM_BACKEND}:{}#executor=", self.root.display());
+        let Some(legacy) = candidate.strip_prefix(&prefix) else {
+            return Ok(false);
+        };
+        let Some((device, inode)) = legacy.split_once(':') else {
+            return Ok(false);
+        };
+        Ok(!device.is_empty()
+            && !inode.is_empty()
+            && device.bytes().all(|byte| byte.is_ascii_digit())
+            && inode.bytes().all(|byte| byte.is_ascii_digit()))
     }
 
     fn validate_executor_staging_namespace(&self) -> Result<(), ArtifactReadError> {
@@ -470,6 +524,16 @@ impl FilesystemArtifactBlobStore {
             self.executor_staging.as_ref(),
         )
         .map(|_| ())
+    }
+
+    fn validate_customer_namespace(&self) -> Result<(), ArtifactReadError> {
+        validate_bound_private_directory(&self.root.join("objects"), self.customer_objects.as_ref())
+            .map(|_| ())
+    }
+
+    fn validate_batch_file_namespace(&self) -> Result<(), ArtifactReadError> {
+        validate_bound_private_directory(&self.root.join("batch-files"), self.batch_files.as_ref())
+            .map(|_| ())
     }
 }
 
@@ -796,14 +860,52 @@ fn delete_executor_object_at(root: &fs::File, artifact_id: Uuid) -> Result<(), A
     let (shard_name, object_name) = executor_object_names(artifact_id);
     let shard = match open_executor_shard(root, &shard_name) {
         Ok(shard) => shard,
-        Err(ArtifactReadError::Integrity) => return Ok(()),
-        Err(ArtifactReadError::Unavailable) => return Err(ArtifactWriteError::Unavailable),
+        Err(ArtifactReadError::Integrity | ArtifactReadError::Unavailable) => {
+            return Err(ArtifactWriteError::Unavailable);
+        }
     };
     match rfs::unlinkat(&shard, object_name.as_str(), AtFlags::empty()) {
         Ok(()) => rfs::fsync(&shard).map_err(|_| ArtifactWriteError::Unavailable),
         Err(Errno::NOENT) => Ok(()),
         Err(_) => Err(ArtifactWriteError::Unavailable),
     }
+}
+
+fn delete_verified_executor_object_at(
+    root: &fs::File,
+    artifact_id: Uuid,
+    expected_sha256: &str,
+    expected_size: u64,
+) -> Result<(), ArtifactWriteError> {
+    let (shard_name, object_name) = executor_object_names(artifact_id);
+    let shard =
+        open_executor_shard(root, &shard_name).map_err(|_| ArtifactWriteError::Unavailable)?;
+    match read_executor_object_from_shard(&shard, &object_name, expected_sha256, expected_size) {
+        Ok(_) => {}
+        Err(ArtifactReadError::Integrity) => {
+            let missing = rfs::openat(
+                &shard,
+                object_name.as_str(),
+                OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .is_err_and(|error| error == Errno::NOENT);
+            if missing {
+                return Ok(());
+            }
+            return Err(ArtifactWriteError::Unavailable);
+        }
+        Err(ArtifactReadError::Unavailable) => return Err(ArtifactWriteError::Unavailable),
+    }
+    match rfs::unlinkat(&shard, object_name.as_str(), AtFlags::empty()) {
+        Ok(()) => rfs::fsync(&shard).map_err(|_| ArtifactWriteError::Unavailable),
+        Err(Errno::NOENT) => Ok(()),
+        Err(_) => Err(ArtifactWriteError::Unavailable),
+    }
+}
+
+fn delete_customer_object_at(root: &fs::File, artifact_id: Uuid) -> Result<(), ArtifactWriteError> {
+    delete_executor_object_at(root, artifact_id)
 }
 
 fn open_or_create_executor_shard(
@@ -920,6 +1022,94 @@ fn input_blob_key(key: &InputBlobKey) -> String {
 }
 
 #[async_trait]
+impl BatchFileBlobStore for FilesystemArtifactBlobStore {
+    async fn put(
+        &self,
+        file_uuid: Uuid,
+        bytes: &[u8],
+    ) -> Result<BatchFileBlob, BatchFileBlobError> {
+        self.validate_batch_file_namespace()
+            .map_err(map_batch_read_error)?;
+        if file_uuid.is_nil() || bytes.is_empty() || bytes.len() as u64 > MAX_FILE_BYTES {
+            return Err(BatchFileBlobError::Integrity);
+        }
+        let expected_sha256 = sha256_hex(bytes);
+        let root = Arc::clone(&self.batch_files);
+        let owned_bytes = bytes.to_vec();
+        let write_sha256 = expected_sha256.clone();
+        tokio::task::spawn_blocking(move || {
+            put_executor_object_at(&root, file_uuid, &owned_bytes, &write_sha256)
+        })
+        .await
+        .map_err(|_| BatchFileBlobError::Unavailable)?
+        .map_err(|_| BatchFileBlobError::Unavailable)?;
+        Ok(BatchFileBlob {
+            storage_backend: FILESYSTEM_BACKEND.to_string(),
+            object_key: batch_file_object_key(file_uuid),
+            sha256_hex: expected_sha256,
+            byte_size: bytes.len() as u64,
+        })
+    }
+
+    async fn get(
+        &self,
+        file_uuid: Uuid,
+        blob: &BatchFileBlob,
+    ) -> Result<Vec<u8>, BatchFileBlobError> {
+        self.validate_batch_file_namespace()
+            .map_err(map_batch_read_error)?;
+        if file_uuid.is_nil()
+            || blob.storage_backend != FILESYSTEM_BACKEND
+            || blob.object_key != batch_file_object_key(file_uuid)
+            || blob.sha256_hex.len() != 64
+            || blob.byte_size == 0
+            || blob.byte_size > MAX_FILE_BYTES
+        {
+            return Err(BatchFileBlobError::Integrity);
+        }
+        let root = Arc::clone(&self.batch_files);
+        let expected_sha256 = blob.sha256_hex.clone();
+        let expected_size = blob.byte_size;
+        tokio::task::spawn_blocking(move || {
+            read_executor_object_at(&root, file_uuid, &expected_sha256, expected_size)
+        })
+        .await
+        .map_err(|_| BatchFileBlobError::Unavailable)?
+        .map_err(map_batch_read_error)
+    }
+
+    async fn delete(
+        &self,
+        file_uuid: Uuid,
+        blob: &BatchFileBlob,
+    ) -> Result<(), BatchFileBlobError> {
+        self.validate_batch_file_namespace()
+            .map_err(map_batch_read_error)?;
+        if file_uuid.is_nil()
+            || blob.storage_backend != FILESYSTEM_BACKEND
+            || blob.object_key != batch_file_object_key(file_uuid)
+            || blob.sha256_hex.len() != 64
+            || blob.byte_size == 0
+            || blob.byte_size > MAX_FILE_BYTES
+        {
+            return Err(BatchFileBlobError::Integrity);
+        }
+        let root = Arc::clone(&self.batch_files);
+        tokio::task::spawn_blocking(move || delete_executor_object_at(&root, file_uuid))
+            .await
+            .map_err(|_| BatchFileBlobError::Unavailable)?
+            .map_err(|_| BatchFileBlobError::Unavailable)
+    }
+}
+
+fn map_batch_read_error(error: ArtifactReadError) -> BatchFileBlobError {
+    match error {
+        ArtifactReadError::Integrity => BatchFileBlobError::Integrity,
+        ArtifactReadError::Unavailable => BatchFileBlobError::Unavailable,
+    }
+}
+
+#[async_trait]
 impl ArtifactBlobStore for FilesystemArtifactBlobStore {
     fn storage_identity(&self) -> String {
         format!("{FILESYSTEM_BACKEND}:{}", self.root.display())
@@ -961,7 +1151,13 @@ impl ArtifactBlobStore for FilesystemArtifactBlobStore {
         {
             return Err(ArtifactWriteError::Unavailable);
         }
-        self.delete_blob_key(&artifact.object_key).await
+        self.validate_customer_namespace()
+            .map_err(|_| ArtifactWriteError::Unavailable)?;
+        let root = Arc::clone(&self.customer_objects);
+        let artifact_id = artifact.identity.artifact_id;
+        tokio::task::spawn_blocking(move || delete_customer_object_at(&root, artifact_id))
+            .await
+            .map_err(|_| ArtifactWriteError::Unavailable)?
     }
 }
 
@@ -1069,6 +1265,101 @@ fn validate_root(root: &Path) -> Result<PathBuf, ImageGatewayError> {
         .map_err(|_| ImageGatewayError::config("GATEWAY_ARTIFACT_ROOT could not be canonicalized"))
 }
 
+fn load_or_create_storage_namespace_id(root: &Path) -> Result<Uuid, ImageGatewayError> {
+    let marker = root.join(STORAGE_NAMESPACE_MARKER);
+    match read_storage_namespace_id(&marker) {
+        Ok(id) => return Ok(id),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => {
+            return Err(ImageGatewayError::config(
+                "artifact storage namespace marker is invalid",
+            ));
+        }
+    }
+
+    let temporary = root.join(format!(
+        "{STORAGE_NAMESPACE_MARKER}.tmp-{}",
+        Uuid::new_v4().simple()
+    ));
+    let namespace_id = Uuid::new_v4();
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    let mut file = options.open(&temporary).map_err(|_| {
+        ImageGatewayError::config("artifact storage namespace marker could not be created")
+    })?;
+    file.write_all(format!("{namespace_id}\n").as_bytes())
+        .and_then(|_| file.sync_all())
+        .map_err(|_| {
+            ImageGatewayError::config("artifact storage namespace marker could not be persisted")
+        })?;
+    drop(file);
+    let link_result = fs::hard_link(&temporary, &marker);
+    let remove_result = fs::remove_file(&temporary);
+    if remove_result.is_err() {
+        return Err(ImageGatewayError::config(
+            "artifact storage namespace temporary marker could not be removed",
+        ));
+    }
+    match link_result {
+        Ok(()) => sync_directory(root).map_err(|_| {
+            ImageGatewayError::config("artifact storage namespace marker could not be synchronized")
+        })?,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(_) => {
+            return Err(ImageGatewayError::config(
+                "artifact storage namespace marker could not be installed",
+            ));
+        }
+    }
+    read_storage_namespace_id(&marker)
+        .map_err(|_| ImageGatewayError::config("artifact storage namespace marker is invalid"))
+}
+
+fn read_storage_namespace_id(path: &Path) -> std::io::Result<Uuid> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    let mut file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() == 0 || metadata.len() > 64 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid artifact storage namespace marker",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.permissions().mode() & 0o077 != 0
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "artifact storage namespace marker permissions are invalid",
+            ));
+        }
+    }
+    let mut text = String::with_capacity(metadata.len() as usize);
+    Read::by_ref(&mut file).take(65).read_to_string(&mut text)?;
+    Uuid::parse_str(text.trim()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "artifact storage namespace marker is not a UUID",
+        )
+    })
+}
+
 fn set_private_directory_permissions(path: &Path) -> Result<(), ImageGatewayError> {
     #[cfg(unix)]
     {
@@ -1145,22 +1436,23 @@ fn open_regular_no_follow(path: &Path) -> Result<fs::File, ArtifactReadError> {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
     use super::*;
 
     #[test]
-    fn pending_artifact_drop_removes_temporary_and_linked_object() {
+    fn pending_artifact_drop_removes_only_its_temporary_link() {
         let directory = tempfile::tempdir().unwrap();
         let temporary = directory.path().join("temporary");
         let object = directory.path().join("object");
         std::fs::write(&temporary, b"artifact").unwrap();
         std::fs::hard_link(&temporary, &object).unwrap();
 
-        let mut pending = PendingArtifact::new(temporary.clone(), object.clone());
-        pending.mark_linked();
+        let pending = PendingArtifact::new(temporary.clone());
         drop(pending);
 
         assert!(!temporary.exists());
-        assert!(!object.exists());
+        assert_eq!(std::fs::read(object).unwrap(), b"artifact");
     }
 
     #[test]
@@ -1172,11 +1464,231 @@ mod tests {
         std::fs::hard_link(&temporary, &object).unwrap();
         std::fs::remove_file(&temporary).unwrap();
 
-        let mut pending = PendingArtifact::new(temporary, object.clone());
-        pending.mark_linked();
-        pending.commit();
+        let pending = PendingArtifact::new(temporary);
+        drop(pending);
 
         assert_eq!(std::fs::read(object).unwrap(), b"artifact");
+    }
+
+    #[tokio::test]
+    async fn retained_executor_reference_delete_is_typed_and_idempotent() {
+        let root = tempfile::tempdir().unwrap();
+        let store = FilesystemArtifactBlobStore::new(root.path()).unwrap();
+        let authority_id = Uuid::new_v4();
+        let stored = store
+            .put_executor_artifact(
+                ArtifactIdentity {
+                    artifact_id: authority_id,
+                    tenant_id: "tenant-retention".to_string(),
+                    job_id: Uuid::new_v4(),
+                    work_item_id: Uuid::new_v4(),
+                    execution_id: Uuid::new_v4(),
+                    lease_epoch: 1,
+                    output_index: 0,
+                    media_type: "image/png".to_string(),
+                },
+                b"retained executor bytes",
+            )
+            .await
+            .unwrap();
+        let namespace = store.executor_storage_namespace().unwrap();
+        let reference = ExecutorArtifactReference {
+            authority_id,
+            storage_backend: &stored.storage_backend,
+            storage_namespace: &namespace,
+            object_key: &stored.object_key,
+            sha256_hex: &stored.sha256_hex,
+            byte_size: stored.byte_size,
+        };
+
+        store.delete_executor_reference(&reference).await.unwrap();
+        store.delete_executor_reference(&reference).await.unwrap();
+        assert!(!root.path().join(&stored.object_key).exists());
+
+        let forged_key = "executor-objects/00/forged";
+        let forged = ExecutorArtifactReference {
+            object_key: forged_key,
+            ..reference
+        };
+        assert!(store.delete_executor_reference(&forged).await.is_err());
+    }
+
+    #[test]
+    fn executor_namespace_is_stable_across_store_restarts() {
+        let root = tempfile::tempdir().unwrap();
+        let first = FilesystemArtifactBlobStore::new(root.path())
+            .unwrap()
+            .executor_storage_namespace()
+            .unwrap();
+        let second = FilesystemArtifactBlobStore::new(root.path())
+            .unwrap()
+            .executor_storage_namespace()
+            .unwrap();
+
+        assert_eq!(first, second);
+        assert!(first.contains("#executor="));
+        assert_eq!(
+            fs::metadata(root.path().join(STORAGE_NAMESPACE_MARKER))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_executor_namespace_requires_exact_object_integrity_before_delete() {
+        let root = tempfile::tempdir().unwrap();
+        let store = FilesystemArtifactBlobStore::new(root.path()).unwrap();
+        let authority_id = Uuid::new_v4();
+        let stored = store
+            .put_executor_artifact(
+                ArtifactIdentity {
+                    artifact_id: authority_id,
+                    tenant_id: "tenant-retention".to_string(),
+                    job_id: Uuid::new_v4(),
+                    work_item_id: Uuid::new_v4(),
+                    execution_id: Uuid::new_v4(),
+                    lease_epoch: 1,
+                    output_index: 0,
+                    media_type: "video/mp4".to_string(),
+                },
+                b"legacy executor bytes",
+            )
+            .await
+            .unwrap();
+        let legacy_namespace = format!(
+            "{FILESYSTEM_BACKEND}:{}#executor=16777231:42",
+            fs::canonicalize(root.path()).unwrap().display()
+        );
+        let invalid_hash = "0".repeat(64);
+        let invalid = ExecutorArtifactReference {
+            authority_id,
+            storage_backend: &stored.storage_backend,
+            storage_namespace: &legacy_namespace,
+            object_key: &stored.object_key,
+            sha256_hex: &invalid_hash,
+            byte_size: stored.byte_size,
+        };
+
+        assert!(store.delete_executor_reference(&invalid).await.is_err());
+        assert!(root.path().join(&stored.object_key).exists());
+
+        let valid = ExecutorArtifactReference {
+            sha256_hex: &stored.sha256_hex,
+            ..invalid
+        };
+        store.delete_executor_reference(&valid).await.unwrap();
+        store.delete_executor_reference(&valid).await.unwrap();
+        assert!(!root.path().join(&stored.object_key).exists());
+    }
+
+    #[tokio::test]
+    async fn retained_customer_delete_does_not_acknowledge_a_missing_shard() {
+        let root = tempfile::tempdir().unwrap();
+        let store = FilesystemArtifactBlobStore::new(root.path()).unwrap();
+        let stored = ArtifactBlobStore::put(
+            &store,
+            ArtifactIdentity {
+                artifact_id: Uuid::new_v4(),
+                tenant_id: "tenant-retention".to_string(),
+                job_id: Uuid::new_v4(),
+                work_item_id: Uuid::new_v4(),
+                execution_id: Uuid::new_v4(),
+                lease_epoch: 1,
+                output_index: 0,
+                media_type: "image/png".to_string(),
+            },
+            b"retained customer bytes",
+        )
+        .await
+        .unwrap();
+        let object = root.path().join(&stored.object_key);
+        let shard = object.parent().unwrap();
+        let moved = shard.with_extension("moved");
+        fs::rename(shard, &moved).unwrap();
+
+        assert!(ArtifactBlobStore::delete(&store, &stored).await.is_err());
+        assert!(moved.join(object.file_name().unwrap()).exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn retained_customer_delete_never_follows_a_replaced_shard() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let root = tempfile::tempdir().unwrap();
+        let store = FilesystemArtifactBlobStore::new(root.path()).unwrap();
+        let stored = ArtifactBlobStore::put(
+            &store,
+            ArtifactIdentity {
+                artifact_id: Uuid::new_v4(),
+                tenant_id: "tenant-retention".to_string(),
+                job_id: Uuid::new_v4(),
+                work_item_id: Uuid::new_v4(),
+                execution_id: Uuid::new_v4(),
+                lease_epoch: 1,
+                output_index: 0,
+                media_type: "image/png".to_string(),
+            },
+            b"retained customer bytes",
+        )
+        .await
+        .unwrap();
+        let object = root.path().join(&stored.object_key);
+        let shard = object.parent().unwrap();
+        let moved = shard.with_extension("moved");
+        fs::rename(shard, &moved).unwrap();
+        let outside = root.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::set_permissions(&outside, fs::Permissions::from_mode(0o700)).unwrap();
+        let outside_object = outside.join(object.file_name().unwrap());
+        fs::write(&outside_object, b"must survive").unwrap();
+        symlink(&outside, shard).unwrap();
+
+        assert!(ArtifactBlobStore::delete(&store, &stored).await.is_err());
+        assert_eq!(fs::read(outside_object).unwrap(), b"must survive");
+        assert!(moved.join(object.file_name().unwrap()).exists());
+    }
+
+    #[tokio::test]
+    async fn retained_executor_delete_does_not_acknowledge_a_missing_shard() {
+        let root = tempfile::tempdir().unwrap();
+        let store = FilesystemArtifactBlobStore::new(root.path()).unwrap();
+        let authority_id = Uuid::new_v4();
+        let stored = store
+            .put_executor_artifact(
+                ArtifactIdentity {
+                    artifact_id: authority_id,
+                    tenant_id: "tenant-retention".to_string(),
+                    job_id: Uuid::new_v4(),
+                    work_item_id: Uuid::new_v4(),
+                    execution_id: Uuid::new_v4(),
+                    lease_epoch: 1,
+                    output_index: 0,
+                    media_type: "image/png".to_string(),
+                },
+                b"retained executor bytes",
+            )
+            .await
+            .unwrap();
+        let object = root.path().join(&stored.object_key);
+        let shard = object.parent().unwrap();
+        let moved = shard.with_extension("moved");
+        fs::rename(shard, &moved).unwrap();
+        let namespace = store.executor_storage_namespace().unwrap();
+        let reference = ExecutorArtifactReference {
+            authority_id,
+            storage_backend: &stored.storage_backend,
+            storage_namespace: &namespace,
+            object_key: &stored.object_key,
+            sha256_hex: &stored.sha256_hex,
+            byte_size: stored.byte_size,
+        };
+
+        assert!(store.delete_executor_reference(&reference).await.is_err());
+        assert!(moved.join(object.file_name().unwrap()).exists());
     }
 
     #[cfg(unix)]

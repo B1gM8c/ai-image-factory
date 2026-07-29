@@ -3,7 +3,7 @@ use std::{
     time::Duration,
 };
 
-use super::DreaminaCliRuntimeBindingV1;
+use super::{DreaminaCliRuntimeBindingV1, dreamina_operation};
 use crate::{
     artifacts::MAX_ARTIFACT_BYTES,
     provider_tasks::{
@@ -17,9 +17,8 @@ use image_cli_runtime::{
     RuntimeError, WorkingDirectory,
 };
 use image_provider_dreamina_cli::{
-    ADAPTER_REVISION, DREAMINA_IMAGE_GENERATION_OPERATION_V1, DREAMINA_SUBMIT_COMMAND_SCHEMA,
-    DreaminaCliQueryPolicyError, DreaminaCliQueryPolicyV1, DreaminaQueryStatusV1, PROVIDER_ID,
-    QueryResultRequestV1,
+    ADAPTER_REVISION, DREAMINA_SUBMIT_COMMAND_SCHEMA, DreaminaCliQueryPolicyError,
+    DreaminaCliQueryPolicyV1, DreaminaQueryStatusV1, PROVIDER_ID, QueryResultRequestV1,
 };
 use image_provider_sdk::{
     ArtifactMetadata, ArtifactSink, ArtifactSinkError, ArtifactSinkErrorKind, Completed,
@@ -73,7 +72,8 @@ impl DreaminaCliPollDriverV1 {
         account_home: &ProviderAccountHomeCapability,
         process: DreaminaCliPollProcessConfig,
     ) -> Result<Self, DreaminaCliPollDriverConfigError> {
-        let operation = DREAMINA_IMAGE_GENERATION_OPERATION_V1;
+        let operation = dreamina_operation(profile.operation_id())
+            .ok_or(DreaminaCliPollDriverConfigError::ProfileMismatch)?;
         if profile.provider_id() != PROVIDER_ID
             || profile.command_schema() != operation.command_schema
             || profile.operation_id() != operation.id
@@ -177,7 +177,7 @@ impl DreaminaCliPollDriverV1 {
                     .await
                     .map_err(map_output_seal_error)?;
                 let (prefix, prefix_len) = bridge.into_prefix();
-                let media_type = image_media_type(&prefix[..prefix_len])
+                let media_type = artifact_media_type(&prefix[..prefix_len])
                     .ok_or_else(|| contract_failure("dreamina_poll_media_invalid"))?;
                 let manifest = sink
                     .finalize(ArtifactMetadata { media_type })
@@ -214,9 +214,12 @@ impl ProviderPollDriver for DreaminaCliPollDriverV1 {
                 .matches_poll(call.provider_account_id(), context)
             || context.command_schema() != DREAMINA_SUBMIT_COMMAND_SCHEMA
             || context.adapter_revision() != ADAPTER_REVISION
-            || context.operation_id() != "images.generations"
+            || !matches!(
+                context.operation_id(),
+                "images.generations" | "videos.generations"
+            )
             || context.completion_mode() != "remote_task"
-            || !supported_image_model(context.model())
+            || !supported_model(context.operation_id(), context.model())
         {
             return Err(contract_failure("dreamina_poll_binding_mismatch"));
         }
@@ -272,30 +275,44 @@ fn map_attempt_workspace_error(error: AttemptWorkspaceError) -> ProviderFailure 
     }
 }
 
-fn image_media_type(prefix: &[u8]) -> Option<&'static str> {
+fn artifact_media_type(prefix: &[u8]) -> Option<&'static str> {
     if prefix.starts_with(b"\x89PNG\r\n\x1a\n") {
         Some("image/png")
     } else if prefix.starts_with(&[0xff, 0xd8, 0xff]) {
         Some("image/jpeg")
     } else if prefix.len() >= 12 && &prefix[..4] == b"RIFF" && &prefix[8..12] == b"WEBP" {
         Some("image/webp")
+    } else if prefix.len() >= 12 && &prefix[4..8] == b"ftyp" {
+        Some("video/mp4")
     } else {
         None
     }
 }
 
-fn supported_image_model(model: &str) -> bool {
-    matches!(
-        model,
-        "dreamina-image-3.0"
-            | "dreamina-image-3.1"
-            | "dreamina-image-4.0"
-            | "dreamina-image-4.1"
-            | "dreamina-image-4.5"
-            | "dreamina-image-4.6"
-            | "dreamina-image-4.7"
-            | "dreamina-image-5.0"
-    )
+fn supported_model(operation_id: &str, model: &str) -> bool {
+    match operation_id {
+        "images.generations" => matches!(
+            model,
+            "dreamina-image-3.0"
+                | "dreamina-image-3.1"
+                | "dreamina-image-4.0"
+                | "dreamina-image-4.1"
+                | "dreamina-image-4.5"
+                | "dreamina-image-4.6"
+                | "dreamina-image-4.7"
+                | "dreamina-image-5.0"
+                | "dreamina-image-5.0Pro"
+        ),
+        "videos.generations" => matches!(
+            model,
+            "seedance2.0"
+                | "seedance2.0fast"
+                | "seedance2.0_vip"
+                | "seedance2.0fast_vip"
+                | "seedance2.0mini"
+        ),
+        _ => false,
+    }
 }
 
 fn map_fresh_output_error(error: OutputError) -> ProviderFailure {

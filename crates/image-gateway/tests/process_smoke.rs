@@ -16,7 +16,7 @@ use process_smoke_support::{
     startup_failed_from_address_in_use, tamper_artifact,
 };
 
-const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
+const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 const IDEMPOTENCY_KEY: &str = "process-smoke-key";
 const DRAIN_IDEMPOTENCY_KEY: &str = "process-smoke-drain-key";
 const QUEUE_IDEMPOTENCY_KEYS: [&str; 2] = ["process-smoke-queue-a", "process-smoke-queue-b"];
@@ -141,7 +141,10 @@ async fn run_generation_v2_process_smoke(database: &TestDatabase) -> TestResult 
         .configure_v2_pricing(V2_OUTPUT_COUNT, V2_SUCCESS_PRICE_MICROS)
         .await?;
     let profile = database
-        .provision_codex_execution_profile(files.codex_auth_file_sha256()?)
+        .provision_codex_execution_profile(
+            files.codex_credential_home(),
+            files.codex_auth_file_sha256()?,
+        )
         .await?;
     let client = reqwest::Client::builder()
         .timeout(HTTP_TIMEOUT)
@@ -330,7 +333,12 @@ async fn exercise_generation_v2_gateway(
         .json(&request_body)
         .send()
         .await
-        .map_err(|error| format!("V2 generation request failed: {error}"))?;
+        .map_err(|error| {
+            format!(
+                "V2 generation request failed: {error}\n{}",
+                files.process_diagnostics()
+            )
+        })?;
     let status = response.status();
     let headers = response.headers().clone();
     let request_id = header(&headers, "x-request-id")?;
@@ -338,9 +346,16 @@ async fn exercise_generation_v2_gateway(
         .json()
         .await
         .map_err(|error| format!("V2 generation response was not JSON: {error}"))?;
+    if status != reqwest::StatusCode::OK {
+        return Err(format!(
+            "V2 generation returned {status}: {body:#}\n{}\n--- database ---\n{}",
+            files.process_diagnostics(),
+            database.process_state_diagnostics().await?
+        ));
+    }
     require(
         status == reqwest::StatusCode::OK,
-        format!("V2 generation returned {status}: {body:#}"),
+        "V2 generation status changed after validation",
     )?;
     assert_generation_v2_response(&body, &headers, fixtures)?;
     assert_executor_codex_outputs(files, V2_OUTPUT_COUNT)?;
@@ -365,7 +380,12 @@ async fn exercise_generation_v2_gateway(
         .json(&request_body)
         .send()
         .await
-        .map_err(|error| format!("V2 idempotent replay failed: {error}"))?;
+        .map_err(|error| {
+            format!(
+                "V2 idempotent replay failed: {error}\n{}",
+                files.process_diagnostics()
+            )
+        })?;
     let replay_status = replay.status();
     let replay_headers = replay.headers().clone();
     let replay_request_id = header(&replay_headers, "x-request-id")?;

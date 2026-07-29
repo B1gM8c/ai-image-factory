@@ -1,5 +1,10 @@
 use std::{sync::Arc, time::Duration};
 
+use image_provider_dreamina_cli::DREAMINA_SUBMIT_COMMAND_SCHEMA;
+use image_provider_grok_cli::{
+    GROK_IMAGE_EDIT_COMMAND_SCHEMA, GROK_IMAGE_GENERATION_COMMAND_SCHEMA,
+    GROK_VIDEO_GENERATION_COMMAND_SCHEMA,
+};
 use uuid::Uuid;
 
 use super::{
@@ -29,11 +34,14 @@ pub struct Workerd {
     lease_duration: Duration,
     executor_handoff: Option<ExecutorHandoffTarget>,
     contract: AdmissionContract,
+    claim_command_schema: Option<String>,
+    claim_execution_profile_id: Option<Uuid>,
 }
 
 struct ExecutorHandoffTarget {
     store: Arc<dyn ExecutorHandoffStore>,
     execution_profile_id: Uuid,
+    command_schema: String,
 }
 
 impl Workerd {
@@ -72,7 +80,44 @@ impl Workerd {
             lease_duration: request_timeout.saturating_add(INLINE_LEASE_GRACE),
             executor_handoff: None,
             contract: AdmissionContract::LegacyV1,
+            claim_command_schema: None,
+            claim_execution_profile_id: None,
         })
+    }
+
+    pub fn with_claim_filter(
+        mut self,
+        contract: AdmissionContract,
+        command_schema: &str,
+    ) -> Result<Self, ImageGatewayError> {
+        if command_schema.is_empty() || self.executor_handoff.is_some() {
+            return Err(ImageGatewayError::config(
+                "workerd inline claim filter is invalid",
+            ));
+        }
+        self.contract = contract;
+        self.claim_command_schema = Some(command_schema.to_string());
+        Ok(self)
+    }
+
+    pub fn with_claim_profile(
+        mut self,
+        contract: AdmissionContract,
+        command_schema: &str,
+        execution_profile_id: Uuid,
+    ) -> Result<Self, ImageGatewayError> {
+        if command_schema.is_empty()
+            || execution_profile_id.is_nil()
+            || self.executor_handoff.is_some()
+        {
+            return Err(ImageGatewayError::config(
+                "workerd inline claim profile is invalid",
+            ));
+        }
+        self.contract = contract;
+        self.claim_command_schema = Some(command_schema.to_string());
+        self.claim_execution_profile_id = Some(execution_profile_id);
+        Ok(self)
     }
 
     pub fn new_handoff_only(
@@ -81,9 +126,33 @@ impl Workerd {
         contexts: Arc<dyn ExecutionContextStore>,
         store: Arc<dyn ExecutorHandoffStore>,
         execution_profile_id: Uuid,
+        command_schema: String,
         lease_duration: Duration,
     ) -> Result<Self, ImageGatewayError> {
-        if execution_profile_id.is_nil() || lease_duration.is_zero() {
+        Self::new_handoff_only_with_contract(
+            worker_id,
+            admission,
+            contexts,
+            store,
+            execution_profile_id,
+            command_schema,
+            lease_duration,
+            AdmissionContract::OutputEconomicsV2,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_handoff_only_with_contract(
+        worker_id: String,
+        admission: Arc<dyn AdmissionStore>,
+        contexts: Arc<dyn ExecutionContextStore>,
+        store: Arc<dyn ExecutorHandoffStore>,
+        execution_profile_id: Uuid,
+        command_schema: String,
+        lease_duration: Duration,
+        contract: AdmissionContract,
+    ) -> Result<Self, ImageGatewayError> {
+        if execution_profile_id.is_nil() || command_schema.is_empty() || lease_duration.is_zero() {
             return Err(ImageGatewayError::config(
                 "workerd executor handoff configuration is invalid",
             ));
@@ -98,26 +167,76 @@ impl Workerd {
             executor_handoff: Some(ExecutorHandoffTarget {
                 store,
                 execution_profile_id,
+                command_schema,
             }),
-            contract: AdmissionContract::OutputEconomicsV2,
+            contract,
+            claim_command_schema: None,
+            claim_execution_profile_id: None,
         })
     }
 
     pub async fn run_once(&self) -> Result<Option<Uuid>, ImageGatewayError> {
-        let Some(lease) = self
-            .admission
-            .claim_ready(
-                &self.worker_id,
-                duration_ms(self.lease_duration),
-                self.contract,
-            )
-            .await
-            .map_err(map_admission_error)?
-        else {
+        let claimed = match self.executor_handoff.as_ref() {
+            Some(target) => {
+                self.admission
+                    .claim_ready_for_profile(
+                        &self.worker_id,
+                        duration_ms(self.lease_duration),
+                        self.contract,
+                        &target.command_schema,
+                        target.execution_profile_id,
+                    )
+                    .await
+            }
+            None => {
+                match (
+                    self.claim_command_schema.as_deref(),
+                    self.claim_execution_profile_id,
+                ) {
+                    (Some(command_schema), Some(execution_profile_id)) => {
+                        self.admission
+                            .claim_ready_for_profile(
+                                &self.worker_id,
+                                duration_ms(self.lease_duration),
+                                self.contract,
+                                command_schema,
+                                execution_profile_id,
+                            )
+                            .await
+                    }
+                    (Some(command_schema), None) => {
+                        self.admission
+                            .claim_ready_for_schema(
+                                &self.worker_id,
+                                duration_ms(self.lease_duration),
+                                self.contract,
+                                command_schema,
+                            )
+                            .await
+                    }
+                    (None, None) => {
+                        self.admission
+                            .claim_ready(
+                                &self.worker_id,
+                                duration_ms(self.lease_duration),
+                                self.contract,
+                            )
+                            .await
+                    }
+                    (None, Some(_)) => unreachable!("claim profile requires a command schema"),
+                }
+            }
+        }
+        .map_err(map_admission_error)?;
+        let Some(lease) = claimed else {
             return Ok(None);
         };
         match lease.command_schema.as_str() {
             GENERATION_COMMAND_SCHEMA => self.execute_generation(&lease).await?,
+            GROK_IMAGE_GENERATION_COMMAND_SCHEMA
+            | GROK_IMAGE_EDIT_COMMAND_SCHEMA
+            | GROK_VIDEO_GENERATION_COMMAND_SCHEMA
+            | DREAMINA_SUBMIT_COMMAND_SCHEMA => self.handoff_generation(&lease).await?,
             EDIT_COMMAND_SCHEMA => self.execute_edit(&lease).await?,
             _ => {
                 return Err(ImageGatewayError::internal(
@@ -150,7 +269,7 @@ impl Workerd {
                 ));
             }
         };
-        if context.economics_contract_version == 2 {
+        if matches!(context.economics_contract_version, 2 | 4) {
             return self.handoff_generation(lease).await;
         }
         let generation = self.generation.as_ref().ok_or_else(|| {
@@ -328,7 +447,8 @@ async fn hydrate_edit_job(
 fn map_admission_error(error: AdmissionError) -> ImageGatewayError {
     match error {
         AdmissionError::Expired => ImageGatewayError::timeout(),
-        AdmissionError::BillingLimitExceeded => ImageGatewayError::queue_overloaded(),
+        AdmissionError::BillingLimitExceeded => ImageGatewayError::billing_limit_exceeded(),
+        AdmissionError::ProjectBudgetExceeded => ImageGatewayError::project_budget_exceeded(),
         AdmissionError::Unavailable => {
             ImageGatewayError::service_unavailable("durable work claim unavailable")
         }

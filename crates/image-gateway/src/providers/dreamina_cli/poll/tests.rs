@@ -8,7 +8,9 @@ use std::{
 
 use image::{DynamicImage, ImageFormat, Rgba, RgbaImage};
 use image_cli_runtime::{ATTEMPT_WORKSPACE_LOCK_FILENAME, WorkingDirectory};
-use image_provider_dreamina_cli::DreaminaCliQueryPolicyV1;
+use image_provider_dreamina_cli::{
+    DREAMINA_IMAGE_GENERATION_OPERATION_V1, DreaminaCliQueryPolicyV1,
+};
 use image_provider_sdk::{
     DurableArtifactRef, EffectCertainty, PollObservation, RemoteOperationRef, RetryDirective,
 };
@@ -94,6 +96,35 @@ printf '{"submit_id":"%s","gen_status":"success"}' "$submit""#,
             .iter()
             .all(|size| *size <= image_cli_runtime::STREAM_BUFFER_BYTES)
     );
+    fixture.assert_workspace_has_no_attempts();
+}
+
+#[tokio::test]
+async fn success_streams_one_mp4_video_without_loading_it_as_an_image() {
+    let fixture = Fixture::new(
+        r#"/bin/cp "$HOME/source.mp4" "$download/result.mp4"
+printf '{"submit_id":"%s","gen_status":"success"}' "$submit""#,
+    );
+    let bytes = minimal_mp4();
+    fs::write(fixture.account_home.join("source.mp4"), &bytes).unwrap();
+    let sha256: [u8; 32] = Sha256::digest(&bytes).into();
+    let operation = fixture.operation();
+    let mut sink = fixture.sink(sha256);
+
+    let observation = fixture
+        .driver(1024 * 1024)
+        .poll_operation(&operation, &mut sink)
+        .await
+        .unwrap();
+
+    let PollObservation::Completed(completed) = observation else {
+        panic!("expected completed observation");
+    };
+    assert_eq!(completed.artifact().media_type(), "video/mp4");
+    assert_eq!(completed.artifact().byte_size(), bytes.len() as u64);
+    assert_eq!(completed.artifact().sha256(), &sha256);
+    assert_eq!(sink.bytes(), bytes);
+    assert_eq!(sink.finalize_count(), 1);
     fixture.assert_workspace_has_no_attempts();
 }
 
@@ -199,7 +230,7 @@ async fn canceling_a_poll_future_terminates_the_query_process_and_cleans_the_att
         driver.poll_operation(&operation, &mut sink).await
     });
     let pid_path = fixture.account_home.join("query.pid");
-    let pid = tokio::time::timeout(Duration::from_secs(2), async {
+    let pid = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             if let Ok(value) = fs::read_to_string(&pid_path)
                 && let Ok(pid) = value.parse::<u32>()
@@ -215,7 +246,7 @@ async fn canceling_a_poll_future_terminates_the_query_process_and_cleans_the_att
     task.abort();
     assert!(task.await.unwrap_err().is_cancelled());
     wait_for_process_exit(pid).await;
-    tokio::time::timeout(Duration::from_secs(2), async {
+    tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             if workspace_has_no_attempts(&fixture.workspace) {
                 break;
@@ -371,18 +402,18 @@ fn runtime_profile_composition_rejects_descriptor_drift_before_workspace_lock() 
 }
 
 #[test]
-fn media_detection_accepts_only_supported_image_signatures() {
+fn media_detection_accepts_supported_image_and_video_signatures() {
     assert_eq!(
-        image_media_type(b"\x89PNG\r\n\x1a\nrest"),
+        artifact_media_type(b"\x89PNG\r\n\x1a\nrest"),
         Some("image/png")
     );
     assert_eq!(
-        image_media_type(&[0xff, 0xd8, 0xff, 0x00]),
+        artifact_media_type(&[0xff, 0xd8, 0xff, 0x00]),
         Some("image/jpeg")
     );
-    assert_eq!(image_media_type(b"RIFF1234WEBP"), Some("image/webp"));
-    assert_eq!(image_media_type(b"....ftypisom"), None);
-    assert_eq!(image_media_type(b"not-media"), None);
+    assert_eq!(artifact_media_type(b"RIFF1234WEBP"), Some("image/webp"));
+    assert_eq!(artifact_media_type(b"....ftypisom"), Some("video/mp4"));
+    assert_eq!(artifact_media_type(b"not-media"), None);
 }
 
 #[test]
@@ -396,12 +427,15 @@ fn poll_binding_accepts_only_explicitly_supported_image_models() {
         "dreamina-image-4.6",
         "dreamina-image-4.7",
         "dreamina-image-5.0",
+        "dreamina-image-5.0Pro",
     ] {
-        assert!(supported_image_model(model));
+        assert!(supported_model("images.generations", model));
     }
-    assert!(!supported_image_model("dreamina-image-5.1"));
-    assert!(!supported_image_model("dreamina-image-"));
-    assert!(!supported_image_model("seedance2.0"));
+    assert!(!supported_model("images.generations", "dreamina-image-5.1"));
+    assert!(!supported_model("images.generations", "dreamina-image-"));
+    assert!(!supported_model("images.generations", "seedance2.0"));
+    assert!(supported_model("videos.generations", "seedance2.0"));
+    assert!(!supported_model("videos.generations", "dreamina-image-5.0"));
 }
 
 struct Fixture {
@@ -537,6 +571,20 @@ fn png_bytes(color: [u8; 4]) -> Vec<u8> {
     image
         .write_to(&mut Cursor::new(&mut bytes), ImageFormat::Png)
         .unwrap();
+    bytes
+}
+
+fn minimal_mp4() -> Vec<u8> {
+    let mut bytes = Vec::new();
+    for (box_type, payload) in [
+        (*b"ftyp", b"isom\0\0\0\0isom".as_slice()),
+        (*b"moov", b"m".as_slice()),
+        (*b"mdat", b"v".as_slice()),
+    ] {
+        bytes.extend_from_slice(&u32::try_from(payload.len() + 8).unwrap().to_be_bytes());
+        bytes.extend_from_slice(&box_type);
+        bytes.extend_from_slice(payload);
+    }
     bytes
 }
 

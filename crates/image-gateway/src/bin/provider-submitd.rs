@@ -12,13 +12,13 @@ use gpt_image_2_gateway::{
         DEFAULT_MAX_CONNECTIONS, connect_pool_with_schema, database_schema_from_env,
         database_url_from_env, verify_migrations,
     },
-    init_telemetry,
+    init_telemetry, prepare_dreamina_account_home,
 };
 use image_cli_runtime::WorkingDirectory;
 use image_provider_dreamina_cli::PROVIDER_ID as DREAMINA_PROVIDER_ID;
 use uuid::Uuid;
 
-const ACTIVATION_TOKEN: &str = "dreamina-image-submit-v1";
+const ACTIVATION_TOKENS: &[&str] = &["dreamina-remote-submit-v1", "dreamina-image-submit-v1"];
 const DEFAULT_PROVIDER_TIMEOUT_MS: u64 = 60_000;
 const DEFAULT_EXECUTOR_LEASE_MS: u64 = 60_000;
 const DEFAULT_RECOVERY_LEASE_MS: u64 = 60_000;
@@ -66,7 +66,7 @@ struct ProviderSubmitterConfig {
 
 impl ProviderSubmitterConfig {
     fn from_env() -> Result<Self, ImageGatewayError> {
-        if required_env("PROVIDER_SUBMITTER_ACTIVATION")? != ACTIVATION_TOKEN {
+        if !ACTIVATION_TOKENS.contains(&required_env("PROVIDER_SUBMITTER_ACTIVATION")?.as_str()) {
             return Err(ImageGatewayError::config(
                 "PROVIDER_SUBMITTER_ACTIVATION does not enable a supported provider runtime",
             ));
@@ -185,6 +185,9 @@ impl ProviderSubmitterConfig {
 #[tokio::main]
 async fn main() -> Result<(), ImageGatewayError> {
     let config = ProviderSubmitterConfig::from_env()?;
+    prepare_dreamina_account_home(&config.account_home)
+        .await
+        .map_err(|error| ImageGatewayError::config(error.to_string()))?;
     let telemetry = init_telemetry()?;
     let database_url = database_url_from_env()?;
     let database_schema = database_schema_from_env()?;

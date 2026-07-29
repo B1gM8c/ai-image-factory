@@ -405,6 +405,42 @@ async fn terminal_edit_inputs_are_cleanup_candidates() -> TestResult {
 }
 
 #[tokio::test]
+async fn terminal_video_inputs_are_cleanup_candidates() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let ticket = terminal_video_session(&database.pool, "video-input-terminal").await?;
+        let blobs = InMemoryArtifactBlobStore::default();
+        let blob = blobs
+            .put(
+                InputBlobKey {
+                    admission_session_id: ticket.session_id,
+                    input_id: Uuid::new_v4(),
+                },
+                b"terminal video input",
+            )
+            .await
+            .map_err(|error| format!("terminal video input staging failed: {error:?}"))?;
+        let reconciler = PostgresReconciliationStore::new(database.pool.clone());
+        let outcome =
+            reconcile_input_cleanup(&reconciler, &blobs, "cleanup-video-terminal", 0, 60_000, 10)
+                .await
+                .map_err(|error| format!("terminal video input cleanup failed: {error:?}"))?;
+        require(
+            outcome.completed == 1 && outcome.failed == 0,
+            format!("terminal video input was not cleaned: {outcome:?}"),
+        )?;
+        require(
+            blobs.get(&blob).await == Err(InputBlobReadError::Integrity),
+            "terminal video blob remained readable",
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
 async fn concurrent_input_cleanup_claims_have_one_owner() -> TestResult {
     let Some(database) = TestDatabase::new().await? else {
         return Ok(());
@@ -534,12 +570,15 @@ async fn terminal_edit_session(pool: &PgPool, key: &str) -> TestResult<Admission
     let reservation = PostgresUsageStore::new(pool.clone())
         .reserve(UsageCharge {
             tenant_id,
+            attribution: None,
             request_id,
             admission_session_id: Some(ticket.session_id),
             operation: "edit",
             provider_id: "openai-codex".to_string(),
             model: "gpt-image-2".to_string(),
-            units: 1,
+            output_count: 1,
+            billable_units: 1,
+            billing_metric: image_provider_contracts::BillingMetric::Output,
             limits: UsageLimits {
                 five_hour_image_limit: 10,
                 seven_day_image_limit: 20,
@@ -566,6 +605,78 @@ async fn terminal_edit_session(pool: &PgPool, key: &str) -> TestResult<Admission
     .execute(pool)
     .await
     .map_err(|error| format!("terminal job update failed: {error}"))?;
+    Ok(ticket)
+}
+
+async fn terminal_video_session(pool: &PgPool, key: &str) -> TestResult<AdmissionTicket> {
+    let admission = PostgresAdmissionStore::new(pool.clone());
+    let claim = admission
+        .claim(ClaimAdmission {
+            owner_token: Uuid::new_v4(),
+            tenant_id: format!("tenant_{}", Uuid::new_v4().simple()),
+            project_id: format!("project-{key}"),
+            api_profile: "xai-videos-v1".to_string(),
+            operation: "video_generation".to_string(),
+            request_id: format!("req_{}", Uuid::new_v4().simple()),
+            idempotency_key_digest: Some("e".repeat(64)),
+            request_hash: "f".repeat(64),
+            deadline_at_ms: i64::MAX,
+        })
+        .await
+        .map_err(|error| format!("video admission failed: {error}"))?;
+    let AdmissionClaim::Owner(ticket) = claim else {
+        return Err(format!("unexpected video claim: {claim:?}"));
+    };
+    let tenant_id: String =
+        sqlx::query_scalar("SELECT tenant_id FROM admission_sessions WHERE session_id = $1")
+            .bind(ticket.session_id)
+            .fetch_one(pool)
+            .await
+            .map_err(|error| format!("video session tenant query failed: {error}"))?;
+    let request_id: String =
+        sqlx::query_scalar("SELECT request_id FROM admission_sessions WHERE session_id = $1")
+            .bind(ticket.session_id)
+            .fetch_one(pool)
+            .await
+            .map_err(|error| format!("video session request query failed: {error}"))?;
+    let reservation = PostgresUsageStore::new(pool.clone())
+        .reserve(UsageCharge {
+            tenant_id,
+            attribution: None,
+            request_id,
+            admission_session_id: Some(ticket.session_id),
+            operation: "video_generation",
+            provider_id: "grok-cli".to_string(),
+            model: "grok-imagine-video-1.5-preview".to_string(),
+            output_count: 1,
+            billable_units: 6,
+            billing_metric: image_provider_contracts::BillingMetric::VideoSecond,
+            limits: UsageLimits {
+                five_hour_image_limit: 60,
+                seven_day_image_limit: 600,
+            },
+        })
+        .await
+        .map_err(|error| format!("terminal video reserve failed: {error:?}"))?;
+    sqlx::query(
+        r#"
+        UPDATE admission_sessions
+        SET state = 'attached', job_id = $2, updated_at_ms = 0
+        WHERE session_id = $1
+        "#,
+    )
+    .bind(ticket.session_id)
+    .bind(reservation.job_id)
+    .execute(pool)
+    .await
+    .map_err(|error| format!("terminal video admission update failed: {error}"))?;
+    sqlx::query(
+        "UPDATE jobs SET state = 'failed', finished_at_ms = 0, updated_at_ms = 0 WHERE job_id = $1",
+    )
+    .bind(reservation.job_id)
+    .execute(pool)
+    .await
+    .map_err(|error| format!("terminal video job update failed: {error}"))?;
     Ok(ticket)
 }
 
@@ -614,12 +725,15 @@ async fn orphan_reservation(pool: &PgPool, key: &str) -> TestResult<OrphanFixtur
     let reservation = PostgresUsageStore::new(pool.clone())
         .reserve(UsageCharge {
             tenant_id,
+            attribution: None,
             request_id,
             admission_session_id: Some(ticket.session_id),
             operation: "generation",
             provider_id: "openai-codex".to_string(),
             model: "gpt-image-2".to_string(),
-            units: 1,
+            output_count: 1,
+            billable_units: 1,
+            billing_metric: image_provider_contracts::BillingMetric::Output,
             limits: UsageLimits {
                 five_hour_image_limit: 10,
                 seven_day_image_limit: 20,
@@ -779,12 +893,15 @@ async fn ready_lease(
     let reservation = PostgresUsageStore::new(pool.clone())
         .reserve(UsageCharge {
             tenant_id: tenant_id.clone(),
+            attribution: None,
             request_id: request_id.clone(),
             admission_session_id: None,
             operation: "generation",
             provider_id: "openai-codex".to_string(),
             model: "gpt-image-2".to_string(),
-            units: 1,
+            output_count: 1,
+            billable_units: 1,
+            billing_metric: image_provider_contracts::BillingMetric::Output,
             limits: UsageLimits {
                 five_hour_image_limit: 10,
                 seven_day_image_limit: 20,
@@ -822,6 +939,7 @@ async fn ready_lease(
             schedule_priority: 1,
             schedule_cost: 1,
             contract: AdmissionContract::LegacyV1,
+            customer_pricing: None,
         })
         .await
         .map_err(|error| format!("attach failed: {error}"))?;

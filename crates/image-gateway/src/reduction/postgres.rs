@@ -3,8 +3,9 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use super::{
-    CanonicalExecutorOutcome, ExecutorTerminalArtifact, ExecutorTerminalCompletion,
-    ExecutorTerminalError, ExecutorTerminalLease, ExecutorTerminalStore,
+    CanonicalExecutorOutcome, ExecutorTerminalArtifact, ExecutorTerminalBlockReason,
+    ExecutorTerminalCompletion, ExecutorTerminalError, ExecutorTerminalLease,
+    ExecutorTerminalStore,
 };
 use crate::artifacts::ArtifactMetadata;
 
@@ -76,7 +77,7 @@ impl ExecutorTerminalStore for PostgresExecutorTerminalStore {
                AND execution.state = reduction.resolved_state
               JOIN jobs job
                 ON job.job_id = submission.job_id
-               AND job.economics_contract_version = 2
+               AND job.economics_contract_version IN (2, 3, 4)
               JOIN job_outputs output
                 ON output.output_id = submission.output_id
                AND output.job_id = submission.job_id
@@ -212,6 +213,46 @@ impl ExecutorTerminalStore for PostgresExecutorTerminalStore {
         customer_artifact: Option<&ArtifactMetadata>,
     ) -> Result<ExecutorTerminalCompletion, ExecutorTerminalError> {
         completion::complete(&self.pool, lease, customer_artifact).await
+    }
+
+    async fn block_terminal(
+        &self,
+        lease: &ExecutorTerminalLease,
+        reason: ExecutorTerminalBlockReason,
+    ) -> Result<(), ExecutorTerminalError> {
+        validate_lease(lease, 1)?;
+        let blocked: Option<i32> = sqlx::query_scalar(
+            r#"
+            UPDATE executor_terminal_reductions
+            SET state = 'blocked',
+                blocked_error_code = $5,
+                blocked_by = lease_owner,
+                blocked_at_ms =
+                    floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT,
+                lease_owner = NULL,
+                lease_expires_at_ms = NULL,
+                updated_at_ms =
+                    floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT
+            WHERE submission_id = $1
+              AND resolution_decision_id = $2
+              AND lease_owner = $3
+              AND lease_epoch = $4
+              AND state = 'leased'
+              AND lease_expires_at_ms >
+                  floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT
+            RETURNING 1
+            "#,
+        )
+        .bind(lease.submission_id)
+        .bind(lease.resolution_decision_id)
+        .bind(&lease.reducer_owner)
+        .bind(lease.reducer_lease_epoch)
+        .bind(reason.as_str())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(unavailable)?;
+        blocked.ok_or(ExecutorTerminalError::StaleLease)?;
+        Ok(())
     }
 }
 

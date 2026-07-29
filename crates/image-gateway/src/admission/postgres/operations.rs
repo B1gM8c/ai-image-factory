@@ -7,7 +7,7 @@ use image_scheduler_policy::{ScopeWeight, next_finish_tag};
 use super::{AttachedRunningWork, LockedAdmissionSession};
 use crate::admission::{
     AdmissionContract, AdmissionError, AttachJob, AttachedWork, WorkLease, attach_operation,
-    validate_attach_request,
+    provider_command_hash, validate_attach_request,
 };
 
 const MAX_SCHEDULE_PRIORITY: u8 = 3;
@@ -63,7 +63,7 @@ pub(super) async fn replay_attached_work(
     .ok_or(AdmissionError::InvalidOwner)?;
     if existing.command_schema != request.command_schema
         || existing.command_json != request.command_json
-        || existing.payload_hash != request.ticket.request_hash
+        || existing.payload_hash != provider_command_hash(request)?
         || !stored_inputs_match(tx, request).await?
     {
         return Err(AdmissionError::InvalidOwner);
@@ -138,6 +138,7 @@ pub(super) async fn attach_and_start_work(
     lease_duration_ms: i64,
 ) -> Result<WorkLease, AdmissionError> {
     validate_attach_request(&request)?;
+    let payload_hash = provider_command_hash(&request)?;
     if request.contract != AdmissionContract::LegacyV1 {
         return Err(AdmissionError::InvalidCommand);
     }
@@ -198,7 +199,7 @@ pub(super) async fn attach_and_start_work(
         };
         if existing.command_schema != request.command_schema
             || existing.command_json != request.command_json
-            || existing.payload_hash != request.ticket.request_hash
+            || existing.payload_hash != payload_hash
             || existing.work_state != "running"
             || existing.lease_owner.as_deref() != Some(worker_id)
             || existing
@@ -243,7 +244,7 @@ pub(super) async fn attach_and_start_work(
     .bind(request.ticket.session_id)
     .bind(&request.command_schema)
     .bind(&request.command_json)
-    .bind(&request.ticket.request_hash)
+    .bind(&payload_hash)
     .bind(now)
     .execute(&mut *tx)
     .await
@@ -431,6 +432,8 @@ pub(super) async fn claim_work(
     worker_id: &str,
     lease_duration_ms: i64,
     contract: Option<AdmissionContract>,
+    command_schema: Option<&str>,
+    execution_profile_id: Option<Uuid>,
 ) -> Result<Option<WorkLease>, AdmissionError> {
     let mut tx = pool.begin().await.map_err(unavailable)?;
     let now = database_now(&mut tx).await?;
@@ -443,6 +446,159 @@ pub(super) async fn claim_work(
         WHERE w.state = 'ready' AND w.available_at_ms <= $1
           AND ($2::UUID IS NULL OR w.job_id = $2)
           AND ($3::SMALLINT IS NULL OR j.economics_contract_version = $3)
+          AND ($4::TEXT IS NULL OR p.command_schema = $4)
+          AND ($5::UUID IS NULL OR w.execution_profile_id IS NULL OR w.execution_profile_id = $5)
+          AND (
+            $5::UUID IS NULL
+            OR NOT EXISTS (
+              SELECT 1
+              FROM provider_execution_profiles configured_profile
+              JOIN provider_account_model_configurations model_config
+                ON model_config.provider_account_id = configured_profile.provider_account_id
+               AND model_config.provider_id = configured_profile.provider_id
+               AND model_config.mode = 'allowlist'
+              WHERE configured_profile.execution_profile_id = $5
+            )
+            OR EXISTS (
+              SELECT 1
+              FROM provider_execution_profiles configured_profile
+              JOIN provider_account_model_bindings model_binding
+                ON model_binding.provider_account_id = configured_profile.provider_account_id
+               AND model_binding.provider_id = configured_profile.provider_id
+              JOIN provider_models configured_model
+                ON configured_model.provider_id = model_binding.provider_id
+               AND configured_model.model_id = model_binding.model_id
+               AND configured_model.media_kind = model_binding.media_kind
+               AND configured_model.execution_model_id = j.model
+               AND configured_profile.operation_id = ANY(configured_model.operation_ids)
+              WHERE configured_profile.execution_profile_id = $5
+            )
+          )
+          AND (
+            NOT EXISTS (
+                SELECT 1 FROM job_provider_route_attributions route
+                WHERE route.job_id = w.job_id
+            )
+            OR ($5::UUID IS NOT NULL AND $5 = (
+                SELECT member.execution_profile_id
+                FROM job_provider_route_attributions route
+                JOIN provider_routes route_config
+                  ON route_config.route_id = route.route_id
+                 AND route_config.revision = route.route_revision
+                 AND route_config.provider_id = route.provider_id
+                 AND route_config.operation_id = route.operation_id
+                 AND route_config.command_schema = route.command_schema
+                JOIN provider_route_members member
+                  ON member.route_id = route.route_id
+                 AND member.route_revision = route.route_revision
+                 AND member.provider_id = route.provider_id
+                 AND member.operation_id = route.operation_id
+                 AND member.command_schema = route.command_schema
+                JOIN provider_execution_profiles profile
+                  ON profile.execution_profile_id = member.execution_profile_id
+                 AND profile.provider_account_id = member.provider_account_id
+                 AND profile.provider_id = member.provider_id
+                 AND profile.operation_id = member.operation_id
+                 AND profile.command_schema = member.command_schema
+                JOIN provider_accounts account
+                 ON account.provider_account_id = profile.provider_account_id
+                 AND account.provider_id = profile.provider_id
+                JOIN provider_account_environments environment
+                  ON environment.provider_account_id = account.provider_account_id
+                 AND environment.provider_id = account.provider_id
+                JOIN provider_credential_pools pool
+                  ON pool.credential_pool_id = profile.credential_pool_id
+                 AND pool.provider_id = profile.provider_id
+                JOIN executor_resource_policies policy
+                  ON policy.resource_policy_id = profile.resource_policy_id
+                 AND policy.revision = profile.resource_policy_revision
+                 AND policy.provider_account_id = profile.provider_account_id
+                JOIN provider_account_execution_controls control
+                  ON control.provider_account_id = profile.provider_account_id
+                LEFT JOIN LATERAL (
+                  SELECT MAX(quota_window.used_percent) AS highest_used_percent,
+                         COUNT(*) > 0 AS has_fresh_quota,
+                         BOOL_OR(
+                           quota_window.used_percent >= 100
+                           OR quota_window.used_percent
+                              > 100 - member.minimum_remaining_percent
+                         ) AS exhausted
+                  FROM provider_account_quota_snapshots quota_snapshot
+                  JOIN provider_account_quota_windows quota_window
+                    ON quota_window.provider_account_id = quota_snapshot.provider_account_id
+                   AND quota_window.provider_id = quota_snapshot.provider_id
+                   AND quota_window.observed_at_ms = quota_snapshot.observed_at_ms
+                  WHERE quota_snapshot.provider_account_id = member.provider_account_id
+                    AND quota_snapshot.status = 'observed'
+                    AND quota_snapshot.observed_at_ms >= $1 - route_config.quota_freshness_ms
+                    AND (quota_window.resets_at_ms IS NULL OR quota_window.resets_at_ms > $1)
+                ) quota ON TRUE
+                WHERE route.job_id = w.job_id
+                  AND member.state = 'enabled'
+                  AND profile.state = 'enabled'
+                  AND account.state = 'enabled'
+                  AND environment.state = 'active'
+                  AND pool.state = 'enabled'
+                  AND policy.state = 'enabled'
+                  AND (
+                    NOT EXISTS (
+                      SELECT 1 FROM provider_account_model_configurations model_config
+                      WHERE model_config.provider_account_id = profile.provider_account_id
+                        AND model_config.provider_id = profile.provider_id
+                        AND model_config.mode = 'allowlist'
+                    )
+                    OR EXISTS (
+                      SELECT 1
+                      FROM provider_account_model_bindings model_binding
+                      JOIN provider_models configured_model
+                        ON configured_model.provider_id = model_binding.provider_id
+                       AND configured_model.model_id = model_binding.model_id
+                       AND configured_model.media_kind = model_binding.media_kind
+                       AND configured_model.execution_model_id = j.model
+                       AND profile.operation_id = ANY(configured_model.operation_ids)
+                      WHERE model_binding.provider_account_id = profile.provider_account_id
+                        AND model_binding.provider_id = profile.provider_id
+                    )
+                  )
+                  AND (
+                    control.lifecycle_state = 'active'
+                    OR w.execution_profile_id = profile.execution_profile_id
+                  )
+                  AND policy.allocated_count
+                      < LEAST(policy.max_concurrency, control.desired_max_concurrency)
+                  AND (
+                    route_config.unknown_quota_policy = 'allow'
+                    OR COALESCE(quota.has_fresh_quota, FALSE)
+                  )
+                  AND NOT COALESCE(quota.exhausted, FALSE)
+                ORDER BY member.priority DESC,
+                         CASE WHEN COALESCE(quota.has_fresh_quota, FALSE) THEN 0 ELSE 1 END ASC,
+                         CASE WHEN route_config.selection_strategy = 'quota_aware_least_loaded'
+                           THEN COALESCE(quota.highest_used_percent, 50)
+                         END ASC NULLS LAST,
+                         CASE WHEN route_config.selection_strategy = 'quota_aware_least_loaded'
+                           THEN policy.allocated_count::NUMERIC
+                                / control.desired_max_concurrency::NUMERIC
+                         END ASC NULLS LAST,
+                         -LN(
+                           (
+                             (
+                               ('x' || SUBSTR(
+                                 md5(
+                                   route.route_id::TEXT || ':' || route.route_revision::TEXT
+                                   || ':' || w.job_id::TEXT || ':'
+                                   || member.execution_profile_id::TEXT
+                                 ),
+                                 1,
+                                 15
+                               ))::BIT(60)::BIGINT + 1
+                             )::NUMERIC / 1152921504606846977::NUMERIC
+                           )
+                         ) / member.weight::NUMERIC,
+                         member.execution_profile_id
+                LIMIT 1
+            ))
+          )
         ORDER BY
           (w.schedule_finish_tag -
              ((GREATEST($1 - w.created_at_ms, 0) / 30000) * 250000)),
@@ -456,7 +612,11 @@ pub(super) async fn claim_work(
     .bind(contract.map(|contract| match contract {
         AdmissionContract::LegacyV1 => 1_i16,
         AdmissionContract::OutputEconomicsV2 => 2_i16,
+        AdmissionContract::MediaEconomicsV3 => 3_i16,
+        AdmissionContract::CustomerPricingV4 => 4_i16,
     }))
+    .bind(command_schema)
+    .bind(execution_profile_id)
     .fetch_optional(&mut *tx)
     .await
     .map_err(unavailable)?;
@@ -469,8 +629,10 @@ pub(super) async fn claim_work(
     sqlx::query(
         r#"
         UPDATE work_items SET state = 'leased', lease_epoch = $2, lease_owner = $3,
-          lease_expires_at_ms = $4, execution_id = $5, updated_at_ms = $6
+          lease_expires_at_ms = $4, execution_id = $5, updated_at_ms = $6,
+          execution_profile_id = COALESCE(execution_profile_id, $7)
         WHERE work_item_id = $1
+          AND ($7::UUID IS NULL OR execution_profile_id IS NULL OR execution_profile_id = $7)
         "#,
     )
     .bind(work_item_id)
@@ -479,6 +641,7 @@ pub(super) async fn claim_work(
     .bind(now.saturating_add(lease_duration_ms.max(1)))
     .bind(execution_id)
     .bind(now)
+    .bind(execution_profile_id)
     .execute(&mut *tx)
     .await
     .map_err(unavailable)?;
@@ -753,6 +916,7 @@ pub(super) async fn reserve_schedule_slot(
     })
 }
 
-pub(super) fn unavailable(_: impl std::fmt::Display) -> AdmissionError {
+pub(super) fn unavailable(error: impl std::fmt::Display) -> AdmissionError {
+    tracing::error!(error = %error, "PostgreSQL admission operation failed");
     AdmissionError::Unavailable
 }

@@ -1,6 +1,6 @@
 # AI Image Factory
 
-AI Image Factory is a monorepo for an OpenAI-compatible image API platform.
+AI Image Factory is a monorepo for provider-neutral image and video APIs.
 
 The first active backend is the existing native Codex CLI path for `gpt-image-2`.
 The platform layout now leaves explicit room for additional providers such as
@@ -13,10 +13,13 @@ protocols to the public API.
 apps/
   admin-console/      Next.js + React + shadcn-style operations console
 crates/
+  api-contracts/          Official-compatible public wire contracts and DTOs
   cli-runtime/            Provider-neutral Unix process and artifact runtime
+  factory-identity/       Admin identity, access JWT, opaque refresh, and auth ports
   image-gateway/          HTTP composition, PostgreSQL workflows, and service binaries
   provider-contracts/     Immutable media/provider/job contracts and roadmap
-  provider-dreamina-cli/  Inactive official Dreamina CLI protocol adapter
+  provider-dreamina-cli/  Managed Dreamina CLI image and Seedance video adapter
+  provider-grok-cli/      xAI-to-Grok CLI media binding with gated public activation
   provider-sdk/           Inline and remote provider execution ports
   provider-test-support/  Dev-only provider conformance harness
   scheduler-policy/       Provider-neutral weighted scheduling policy
@@ -30,7 +33,7 @@ The authoritative target design is
 [`docs/architecture/2026-ai-image-factory-target-architecture.md`](docs/architecture/2026-ai-image-factory-target-architecture.md).
 The current CLI execution boundary and activation gates are documented in
 [`docs/architecture/2026-phase2a-provider-runtime-boundaries.md`](docs/architecture/2026-phase2a-provider-runtime-boundaries.md).
-The inactive Dreamina CLI adapter and its production gates are documented in
+The Dreamina CLI adapter baseline and its production gates are documented in
 [`docs/architecture/2026-phase2b-dreamina-cli-adapter.md`](docs/architecture/2026-phase2b-dreamina-cli-adapter.md).
 The remote-submit deadline quarantine is documented in
 [`docs/architecture/2026-phase2f-provider-submit-deadline-quarantine.md`](docs/architecture/2026-phase2f-provider-submit-deadline-quarantine.md).
@@ -52,7 +55,7 @@ The inactive gated CLI process protocol, crash evidence, and containment limits 
 [`docs/architecture/2026-phase2n-gated-cli-submit-runner.md`](docs/architecture/2026-phase2n-gated-cli-submit-runner.md).
 The inactive gated submit composition, static driver boundary, and crash-window recovery are documented in
 [`docs/architecture/2026-phase2o-gated-submit-orchestration.md`](docs/architecture/2026-phase2o-gated-submit-orchestration.md).
-The inactive Dreamina canonical submit codec and its gated runtime binding are documented in
+The Dreamina canonical submit codec and its gated runtime binding are documented in
 [`docs/architecture/2026-phase2p-dreamina-gated-submit-codec.md`](docs/architecture/2026-phase2p-dreamina-gated-submit-codec.md).
 The provider-neutral fresh CLI output-directory boundary is documented in
 [`docs/architecture/2026-phase2q-fresh-cli-output-directory.md`](docs/architecture/2026-phase2q-fresh-cli-output-directory.md).
@@ -68,7 +71,7 @@ shutdown drain are documented in
 The active provider/account poll runtime snapshot, redacted credential identity,
 and durable lane derivation are documented in
 [`docs/architecture/2026-phase2u-active-poll-runtime-profile.md`](docs/architecture/2026-phase2u-active-poll-runtime-profile.md).
-The inactive Dreamina image poll driver, bounded query materialization, and
+The Dreamina media poll driver, bounded query materialization, and
 account-fenced local process verification are documented in
 [`docs/architecture/2026-phase2v-inactive-dreamina-image-poll-driver.md`](docs/architecture/2026-phase2v-inactive-dreamina-image-poll-driver.md).
 The provider-neutral exclusive CLI attempt workspace, descriptor-relative
@@ -110,8 +113,16 @@ in
 [`docs/architecture/2026-phase2ah-capability-shaped-submit-store.md`](docs/architecture/2026-phase2ah-capability-shaped-submit-store.md).
 The runtime-profile PostgreSQL adapter ownership move is documented in
 [`docs/architecture/2026-phase2ai-runtime-profile-postgres-ownership.md`](docs/architecture/2026-phase2ai-runtime-profile-postgres-ownership.md).
+
+The verified xAI API to Grok CLI media capability matrix and activation gates are in
+[`docs/architecture/2026-grok-cli-xai-media-binding.md`](docs/architecture/2026-grok-cli-xai-media-binding.md).
 Database-bound provider profiles and durable capacity are documented in
 [`docs/architecture/2026-phase1g-execution-binding-capacity.md`](docs/architecture/2026-phase1g-execution-binding-capacity.md).
+Admin identity, session rotation, browser controls, and release gates are documented in
+[`docs/architecture/2026-admin-identity-authentication.md`](docs/architecture/2026-admin-identity-authentication.md).
+Platform-owner operational projections, financial fact semantics, read-pool isolation, and
+tenant-admin release gates are documented in
+[`docs/architecture/2026-admin-read-models.md`](docs/architecture/2026-admin-read-models.md).
 
 ## Common Commands
 
@@ -133,8 +144,47 @@ npm run dev:admin
 npm run smoke:codex
 ```
 
-The admin console proxies gateway requests through `/api/gateway/*`.
-Set `GATEWAY_BASE_URL`, `GATEWAY_ADMIN_TOKEN`, and
-`ADMIN_CONSOLE_ACCESS_TOKEN` for server-side admin calls. The console BFF
-requires `Authorization: Bearer $ADMIN_CONSOLE_ACCESS_TOKEN` from callers and
-only proxies an allowlist of gateway admin/system routes.
+The xAI-shaped Grok video surface is implemented but default-off. Production
+configuration must provision the exact Grok video execution profile and a
+positive `video_second` price before setting:
+
+```bash
+GATEWAY_ENABLE_XAI_VIDEO_API=true
+GATEWAY_VIDEO_SECOND_LIMIT_5H=360
+GATEWAY_VIDEO_SECOND_LIMIT_7D=1440
+```
+
+The gated routes are `POST /v1/videos/generations`,
+`GET /v1/videos/{request_id}`, and `GET /v1/files/{file_id}/content`. Missing or
+zero-success video pricing fails admission; migration `0033` never publishes a
+free wildcard video price.
+
+The admin console proxies an explicit allowlist through `/api/gateway/*` and keeps
+access and refresh credentials in HttpOnly cookies. Set `GATEWAY_BASE_URL` and
+`ADMIN_CONSOLE_ORIGIN`; the browser never receives the Gateway admin token.
+Enable the Axum identity service with the key, issuer, audience, client, and
+pepper-file settings in the identity architecture document, apply the complete
+embedded migration set,
+then create the first owner from a TTY:
+
+```bash
+cargo run -p gpt-image-2-gateway --bin factoryctl -- \
+  bootstrap-admin owner@example.com "Platform Owner"
+```
+
+The reproducible key-generation, database-role, bootstrap, and release-check sequence is in
+[`docs/operations/admin-control-plane-bootstrap.md`](docs/operations/admin-control-plane-bootstrap.md).
+The production process topology, migration order, canary gates, backup/restore,
+rollback, monitoring, and current Batch limits are in
+[`docs/operations/production-release.md`](docs/operations/production-release.md).
+
+Static admin authentication is disabled by default. A controlled transition
+requires both `GATEWAY_ADMIN_TOKEN` and
+`GATEWAY_LEGACY_ADMIN_AUTH_ENABLED=true`. The console exposes a static-token-free
+emergency session only on the local Next.js development server.
+
+The operational console reads `/admin/v1/overview`, `/admin/v1/billing/summary`,
+`/admin/v1/provider-accounts`, `/admin/v1/scheduler/queues`, and `/admin/v1/jobs`
+through the BFF. These endpoints require an identity JWT with `admin:*`; the legacy token
+cannot access them. Set `GATEWAY_ADMIN_READ_DATABASE_URL` to a database-enforced read-only
+role in production. Money and unbounded quantities are returned as decimal strings.

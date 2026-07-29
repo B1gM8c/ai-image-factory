@@ -1,13 +1,14 @@
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct InputBlobKey {
     pub admission_session_id: Uuid,
     pub input_id: Uuid,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct InputBlobRef {
     pub key: InputBlobKey,
     pub storage_backend: String,

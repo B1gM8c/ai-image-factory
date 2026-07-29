@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -9,6 +10,8 @@ use axum::{
     http::HeaderMap,
     response::{IntoResponse, Response},
 };
+use image_api_contracts::xai::XAI_IMAGES_API_PROFILE;
+use image_provider_contracts::BillingMetric;
 use image_provider_contracts::openai_codex;
 use serde_json::Value;
 use uuid::Uuid;
@@ -17,16 +20,20 @@ use crate::{
     GenerationAdmissionContract, ImageGatewayError,
     admission::{
         AdmissionClaim, AdmissionContract, AdmissionError, AdmissionTicket, AttachInputManifest,
-        AttachInputObject, AttachJob, ClaimAdmission, EDIT_COMMAND_SCHEMA,
+        AttachInputObject, AttachJob, ClaimAdmission, CustomerPricingIntent, EDIT_COMMAND_SCHEMA,
         EDIT_INPUT_MANIFEST_SCHEMA, EDIT_OPERATION, EditCommandV1, EditInputDescriptorV1,
         EditInputRoleV1, GENERATION_COMMAND_SCHEMA, GENERATION_OPERATION, GenerationCommandV1,
+        PricingProcessingMode, XaiImageEditAdmissionError, XaiImageEditAdmissionPlan,
         idempotency_key_digest,
     },
-    artifacts::{GENERATION_RESPONSE_SCHEMA, sha256_hex},
+    artifacts::{GENERATION_RESPONSE_SCHEMA, StoredGenerationResult, sha256_hex},
+    auth::{ApiKeyCapability, AuthContext},
     generator::{EditJob, InputImage},
     input_blobs::{InputBlobKey, InputBlobWriteError},
+    model_routing::ResolvedModelRoute,
     models::{
-        HealthResponse, ImageStreamKind, images_response_at, models_response, parse_generation,
+        HealthResponse, ImageStreamKind, ModelData, ModelsResponse, images_response_at,
+        models_response, parse_generation,
     },
     usage::UsageCharge,
 };
@@ -39,11 +46,13 @@ const ATTACH_ATTEMPTS: usize = 3;
 const RESULT_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 use super::{
-    AppState, GenerationExecutionMode, RequestId, authenticate_image_request,
+    AppState, GenerationExecutionMode, IMAGE_EDIT_ROUTE_OPERATION,
+    IMAGE_GENERATION_ROUTE_OPERATION, RequestId, authenticate_image_request,
     edit_input::parse_edit_request,
     middleware::new_request_id,
+    resolve_request_model, resolve_surface_model,
     responses::{add_usage_headers, images_response_into_response},
-    usage_limits,
+    usage_limits, xai_images,
 };
 
 pub(super) async fn healthz() -> impl IntoResponse {
@@ -53,11 +62,38 @@ pub(super) async fn healthz() -> impl IntoResponse {
 pub(super) async fn models(
     headers: HeaderMap,
     State(state): State<Arc<AppState>>,
-) -> impl IntoResponse {
-    match authenticate_image_request(&headers, &state).await {
-        Ok(_) => Ok(Json(models_response())),
-        Err(error) => Err(error),
-    }
+) -> Result<Json<ModelsResponse>, ImageGatewayError> {
+    let auth = authenticate_image_request(&headers, &state).await?;
+    auth.require_api_key_capability(ApiKeyCapability::ModelsRead)?;
+    let Some(api_key_id) = auth.api_key_id.as_deref() else {
+        return Ok(Json(models_response()));
+    };
+    let Some(authz_version) = auth.credential_authz_version else {
+        return Err(ImageGatewayError::authentication());
+    };
+    let Some(store) = state.model_routing_store.as_ref() else {
+        return Ok(Json(models_response()));
+    };
+    let models = store
+        .list_api_key_models(&auth.project_id, api_key_id, authz_version)
+        .await?;
+    let data = models
+        .into_iter()
+        .fold(BTreeMap::new(), |mut unique, model| {
+            unique.entry(model.id.clone()).or_insert(ModelData {
+                id: model.id,
+                object: "model".to_owned(),
+                created: model.created_at_ms.div_euclid(1_000),
+                owned_by: model.provider_id,
+            });
+            unique
+        })
+        .into_values()
+        .collect();
+    Ok(Json(ModelsResponse {
+        object: "list".to_owned(),
+        data,
+    }))
 }
 
 pub(super) async fn generations(
@@ -67,6 +103,7 @@ pub(super) async fn generations(
     body: Result<Json<Value>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Response, ImageGatewayError> {
     let auth = authenticate_image_request(&headers, &state).await?;
+    auth.require_api_key_capability(ApiKeyCapability::ImagesWrite)?;
     let Json(value) = body.map_err(|error| {
         ImageGatewayError::invalid_request(
             format!("Invalid JSON request: {error}"),
@@ -74,19 +111,198 @@ pub(super) async fn generations(
             "invalid_json",
         )
     })?;
+    generate_with_auth(&state, auth, &headers, request_id.0, value).await
+}
 
-    let request_id = request_id.0;
+pub(super) async fn generate_with_auth(
+    state: &Arc<AppState>,
+    mut auth: AuthContext,
+    headers: &HeaderMap,
+    request_id: String,
+    value: Value,
+) -> Result<Response, ImageGatewayError> {
+    let requested_model = value
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let resolved_surface = match requested_model.as_deref() {
+        Some(model) => {
+            resolve_surface_model(
+                &state,
+                &mut auth,
+                IMAGE_GENERATION_ROUTE_OPERATION,
+                &[OPENAI_IMAGES_API_PROFILE, XAI_IMAGES_API_PROFILE],
+                model,
+            )
+            .await?
+        }
+        None => None,
+    };
+    generate_after_surface_resolution(
+        state,
+        auth,
+        headers,
+        request_id,
+        value,
+        resolved_surface,
+        requested_model.is_none(),
+        PricingProcessingMode::Synchronous,
+    )
+    .await
+}
+
+pub(super) async fn generate_with_resolved_auth(
+    state: &Arc<AppState>,
+    auth: AuthContext,
+    headers: &HeaderMap,
+    request_id: String,
+    value: Value,
+    resolved_surface: ResolvedModelRoute,
+) -> Result<Response, ImageGatewayError> {
+    generate_after_surface_resolution(
+        state,
+        auth,
+        headers,
+        request_id,
+        value,
+        Some(resolved_surface),
+        false,
+        PricingProcessingMode::Synchronous,
+    )
+    .await
+}
+
+pub(super) async fn generate_batch_with_resolved_auth(
+    state: &Arc<AppState>,
+    auth: AuthContext,
+    headers: &HeaderMap,
+    request_id: String,
+    value: Value,
+    resolved_surface: ResolvedModelRoute,
+) -> Result<Response, ImageGatewayError> {
+    if resolved_surface.provider_id != openai_codex::PROVIDER_ID
+        || resolved_surface.api_profile != OPENAI_IMAGES_API_PROFILE
+    {
+        return Err(ImageGatewayError::invalid_request(
+            "This model does not support the Batch API",
+            Some("model".to_string()),
+            "batch_model_unsupported",
+        ));
+    }
+    generate_after_surface_resolution(
+        state,
+        auth,
+        headers,
+        request_id,
+        value,
+        Some(resolved_surface),
+        false,
+        PricingProcessingMode::Batch,
+    )
+    .await
+}
+
+async fn generate_after_surface_resolution(
+    state: &Arc<AppState>,
+    mut auth: AuthContext,
+    headers: &HeaderMap,
+    request_id: String,
+    mut value: Value,
+    resolved_surface: Option<ResolvedModelRoute>,
+    resolve_default: bool,
+    processing_mode: PricingProcessingMode,
+) -> Result<Response, ImageGatewayError> {
+    let contract = generation_admission_contract(state.config.generation_admission_contract);
+    let mut execution_model_id = None;
+    let mut public_model_id = resolved_surface
+        .as_ref()
+        .map(|resolved| resolved.public_model_id.clone())
+        .or_else(|| {
+            value
+                .get("model")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| "gpt-image-2".to_string());
+    if let Some(resolved) = resolved_surface {
+        execution_model_id = Some(resolved.execution_model_id.clone());
+        set_request_model(&mut value, resolved.provider_model_id)?;
+        match (resolved.provider_id.as_str(), resolved.api_profile.as_str()) {
+            (image_provider_grok_cli::PROVIDER_ID, XAI_IMAGES_API_PROFILE) => {
+                return xai_images::create_image(
+                    state,
+                    &auth,
+                    headers,
+                    request_id,
+                    value,
+                    public_model_id,
+                    resolved.execution_model_id,
+                )
+                .await;
+            }
+            (openai_codex::PROVIDER_ID, OPENAI_IMAGES_API_PROFILE) => {}
+            _ => {
+                return Err(ImageGatewayError::service_unavailable(
+                    "model route does not match the images API surface",
+                ));
+            }
+        }
+    } else if looks_like_xai_image_request(&value) {
+        if contract == AdmissionContract::CustomerPricingV4 {
+            return Err(ImageGatewayError::service_unavailable(
+                "customer pricing requires an enabled model route",
+            ));
+        }
+        return xai_images::create_image(
+            state,
+            &auth,
+            headers,
+            request_id,
+            value,
+            public_model_id.clone(),
+            public_model_id,
+        )
+        .await;
+    } else if resolve_default
+        && let Some(resolved) = resolve_request_model(
+            &state,
+            &mut auth,
+            openai_codex::PROVIDER_ID,
+            IMAGE_GENERATION_ROUTE_OPERATION,
+            OPENAI_IMAGES_API_PROFILE,
+            None,
+            "gpt-image-2",
+        )
+        .await?
+    {
+        public_model_id = resolved.public_model_id;
+        execution_model_id = Some(resolved.execution_model_id);
+        set_request_model(&mut value, resolved.provider_model_id)?;
+    }
+    if contract == AdmissionContract::CustomerPricingV4 && execution_model_id.is_none() {
+        return Err(ImageGatewayError::service_unavailable(
+            "customer pricing requires an enabled model route",
+        ));
+    }
+
     let job = parse_generation(value, request_id.clone())?;
     let command = GenerationCommandV1::from_generation_job(
         &job,
         OPENAI_IMAGES_API_PROFILE,
         openai_codex::PROVIDER_ID,
     );
-    let request_hash = command.request_hash_hex();
+    let provider_command_hash = command.request_hash_hex();
+    let request_hash = if contract == AdmissionContract::CustomerPricingV4 {
+        crate::service_tiers::request_hash_with_project_service_tier(
+            &provider_command_hash,
+            auth.project_service_tier,
+        )
+    } else {
+        provider_command_hash.clone()
+    };
     let command_json = serde_json::to_value(command)
         .map_err(|_| ImageGatewayError::internal("failed to serialize durable command"))?;
-    let idempotency_key_digest =
-        idempotency_digest(&headers, &auth.project_id, GENERATION_OPERATION)?;
+    let idempotency_key_digest = idempotency_digest(&headers, &auth, GENERATION_OPERATION)?;
     let ticket = match claim_admission_with_retry(
         &state,
         ClaimAdmission {
@@ -125,7 +341,7 @@ pub(super) async fn generations(
         }
     };
     let units = job.n;
-    let model = job.model.clone();
+    let provider_model_id = job.model.clone();
 
     let _inline_permit = if state.generation_execution_mode == GenerationExecutionMode::Inline {
         match state.scheduler.acquire(&auth.tenant_id).await {
@@ -142,12 +358,15 @@ pub(super) async fn generations(
         &state,
         UsageCharge {
             tenant_id: auth.tenant_id.clone(),
+            attribution: Some(auth.attribution()),
             request_id,
             admission_session_id: Some(ticket.session_id),
             operation: "generation",
             provider_id: openai_codex::PROVIDER_ID.to_string(),
-            model,
-            units,
+            model: provider_model_id.clone(),
+            output_count: units,
+            billable_units: units,
+            billing_metric: BillingMetric::Output,
             limits: usage_limits(&state.config),
         },
     )
@@ -161,6 +380,9 @@ pub(super) async fn generations(
             return Err(error);
         }
     };
+    let service_tier_decision = crate::service_tiers::ServiceTierDecision::for_default_only_project(
+        auth.project_service_tier,
+    );
     let attach = AttachJob {
         ticket: ticket.clone(),
         job_id: reservation.job_id,
@@ -172,15 +394,32 @@ pub(super) async fn generations(
         schedule_weight: 1,
         schedule_priority: 1,
         schedule_cost: u64::from(units),
-        contract: generation_admission_contract(state.config.generation_admission_contract),
+        contract,
+        customer_pricing: (contract == AdmissionContract::CustomerPricingV4).then(|| {
+            CustomerPricingIntent {
+                public_model_id,
+                provider_model_id,
+                execution_model_id: execution_model_id
+                    .expect("v4 execution model was validated before admission"),
+                provider_command_hash: Some(provider_command_hash),
+                media_kind: "image".to_string(),
+                service_tier: service_tier_decision.effective.pricing_key().to_string(),
+                service_tier_decision,
+                execution_surface: "provider_cli".to_string(),
+                currency: "USD".to_string(),
+                pricing_dimensions: BTreeMap::from([
+                    ("quality".to_string(), job.quality.clone()),
+                    ("size".to_string(), job.size.clone()),
+                ]),
+                processing_mode,
+            }
+        }),
     };
     if state.generation_execution_mode == GenerationExecutionMode::External {
         if let Err(error) = attach_ready_with_retry(&state, attach).await {
+            tracing::warn!(?error, "generation admission attach failed");
             if !matches!(error, AdmissionError::Unavailable) {
-                state
-                    .usage_store
-                    .release(&reservation, "admission_attach_failed")
-                    .await?;
+                rollback_generation_before_attach(&state, &ticket, &reservation).await?;
             }
             return Err(admission_error(error));
         }
@@ -189,11 +428,9 @@ pub(super) async fn generations(
     let lease = match attach_and_start_with_retry(&state, attach).await {
         Ok(lease) => lease,
         Err(error) => {
+            tracing::warn!(?error, "generation admission attach-and-start failed");
             if !matches!(error, AdmissionError::Unavailable) {
-                state
-                    .usage_store
-                    .release(&reservation, "admission_attach_failed")
-                    .await?;
+                rollback_generation_before_attach(&state, &ticket, &reservation).await?;
             }
             return Err(admission_error(error));
         }
@@ -220,18 +457,55 @@ pub(super) async fn generations(
     )
 }
 
-fn generation_admission_contract(configured: GenerationAdmissionContract) -> AdmissionContract {
+fn set_request_model(value: &mut Value, model: String) -> Result<(), ImageGatewayError> {
+    value
+        .as_object_mut()
+        .ok_or_else(|| {
+            ImageGatewayError::invalid_request(
+                "Request body must be a JSON object",
+                None,
+                "invalid_json",
+            )
+        })?
+        .insert("model".to_owned(), Value::String(model));
+    Ok(())
+}
+
+fn looks_like_xai_image_request(value: &Value) -> bool {
+    value.as_object().is_some_and(|object| {
+        object.contains_key("aspect_ratio")
+            || object.contains_key("resolution")
+            || object.contains_key("storage_options")
+            || object
+                .get("model")
+                .and_then(Value::as_str)
+                .is_some_and(|model| model.starts_with("grok-imagine-"))
+    })
+}
+
+pub(super) fn generation_admission_contract(
+    configured: GenerationAdmissionContract,
+) -> AdmissionContract {
     match configured {
         GenerationAdmissionContract::LegacyV1 => AdmissionContract::LegacyV1,
         GenerationAdmissionContract::OutputEconomicsV2 => AdmissionContract::OutputEconomicsV2,
+        GenerationAdmissionContract::CustomerPricingV4 => AdmissionContract::CustomerPricingV4,
     }
 }
 
-async fn wait_for_generation(
+pub(super) async fn wait_for_generation(
     state: &Arc<AppState>,
     job_id: uuid::Uuid,
     auth: &crate::auth::AuthContext,
 ) -> Result<Response, ImageGatewayError> {
+    let result = wait_for_generation_result(state, job_id).await?;
+    render_stored_generation_response(result, auth)
+}
+
+pub(super) async fn wait_for_generation_result(
+    state: &Arc<AppState>,
+    job_id: uuid::Uuid,
+) -> Result<StoredGenerationResult, ImageGatewayError> {
     let wait = async {
         loop {
             match state.settlement_store.generation_status(job_id).await? {
@@ -239,13 +513,10 @@ async fn wait_for_generation(
                     tokio::time::sleep(RESULT_POLL_INTERVAL).await;
                 }
                 crate::settlement::GenerationResultStatus::Succeeded(result) => {
-                    let usage = result.projection.usage.clone();
-                    return render_generation_response(
-                        result.images,
-                        result.projection,
-                        usage,
-                        auth,
-                    );
+                    return Ok(result);
+                }
+                crate::settlement::GenerationResultStatus::Expired => {
+                    return Err(ImageGatewayError::artifact_expired());
                 }
                 crate::settlement::GenerationResultStatus::Failed { error_code } => {
                     return Err(persisted_generation_error(error_code.as_deref()));
@@ -284,26 +555,51 @@ fn persisted_generation_error(error_code: Option<&str>) -> ImageGatewayError {
     }
 }
 
-async fn replay_generation(
+pub(super) async fn replay_generation(
     state: &Arc<AppState>,
     job_id: uuid::Uuid,
     auth: &crate::auth::AuthContext,
 ) -> Result<Response, ImageGatewayError> {
-    let result = state
+    let result = replay_generation_result(state, job_id).await?;
+    render_stored_generation_response(result, auth)
+}
+
+pub(super) async fn replay_generation_result(
+    state: &Arc<AppState>,
+    job_id: uuid::Uuid,
+) -> Result<StoredGenerationResult, ImageGatewayError> {
+    match state
         .settlement_store
         .load_generation_result(job_id)
         .await?
-        .ok_or_else(ImageGatewayError::idempotency_result_unavailable)?;
+    {
+        crate::settlement::GenerationResultLookup::Available(result) => Ok(result),
+        crate::settlement::GenerationResultLookup::Expired => {
+            Err(ImageGatewayError::idempotency_result_expired())
+        }
+        crate::settlement::GenerationResultLookup::Missing => {
+            Err(ImageGatewayError::idempotency_result_unavailable())
+        }
+    }
+}
+
+pub(super) fn render_stored_generation_response(
+    result: StoredGenerationResult,
+    auth: &crate::auth::AuthContext,
+) -> Result<Response, ImageGatewayError> {
     let usage = result.projection.usage.clone();
     render_generation_response(result.images, result.projection, usage, auth)
 }
 
 fn render_generation_response(
     images: Vec<crate::generator::GeneratedImage>,
-    projection: crate::artifacts::GenerationResponseProjection,
+    mut projection: crate::artifacts::GenerationResponseProjection,
     usage: crate::usage::UsageSnapshot,
     auth: &crate::auth::AuthContext,
 ) -> Result<Response, ImageGatewayError> {
+    if projection.output_format == "auto" {
+        projection.output_format = inferred_output_format(&images)?;
+    }
     let stream_kind = match projection.operation.as_str() {
         GENERATION_OPERATION => ImageStreamKind::Generation,
         crate::admission::EDIT_OPERATION => ImageStreamKind::Edit,
@@ -329,9 +625,32 @@ fn render_generation_response(
     Ok(response)
 }
 
+fn inferred_output_format(
+    images: &[crate::generator::GeneratedImage],
+) -> Result<String, ImageGatewayError> {
+    let mut detected = None;
+    for image in images {
+        let format = match crate::artifacts::media_type_from_bytes(&image.bytes)
+            .map_err(|_| ImageGatewayError::artifact_integrity())?
+        {
+            "image/png" => "png",
+            "image/jpeg" => "jpeg",
+            "image/webp" => "webp",
+            _ => return Err(ImageGatewayError::artifact_integrity()),
+        };
+        if detected.is_some_and(|existing| existing != format) {
+            return Err(ImageGatewayError::artifact_integrity());
+        }
+        detected = Some(format);
+    }
+    detected
+        .map(str::to_owned)
+        .ok_or_else(ImageGatewayError::artifact_integrity)
+}
+
 fn idempotency_digest(
     headers: &HeaderMap,
-    project_id: &str,
+    auth: &AuthContext,
     operation: &str,
 ) -> Result<Option<String>, ImageGatewayError> {
     let Some(value) = headers.get("idempotency-key") else {
@@ -340,12 +659,20 @@ fn idempotency_digest(
     let key = value
         .to_str()
         .map_err(|_| ImageGatewayError::invalid_idempotency_key())?;
-    idempotency_key_digest(project_id, OPENAI_IMAGES_API_PROFILE, operation, key)
+    let scope = idempotency_scope(auth);
+    idempotency_key_digest(&scope, OPENAI_IMAGES_API_PROFILE, operation, key)
         .map(Some)
         .map_err(|_| ImageGatewayError::invalid_idempotency_key())
 }
 
-async fn abort_before_attach(
+fn idempotency_scope(auth: &AuthContext) -> String {
+    auth.actor_user_id.map_or_else(
+        || auth.project_id.clone(),
+        |user_id| format!("{}:user:{user_id}", auth.project_id),
+    )
+}
+
+pub(super) async fn abort_before_attach(
     state: &Arc<AppState>,
     ticket: &AdmissionTicket,
 ) -> Result<(), ImageGatewayError> {
@@ -354,6 +681,30 @@ async fn abort_before_attach(
         .abort(ticket)
         .await
         .map_err(admission_error)
+}
+
+async fn rollback_generation_before_attach(
+    state: &Arc<AppState>,
+    ticket: &AdmissionTicket,
+    reservation: &crate::usage::UsageReservation,
+) -> Result<(), ImageGatewayError> {
+    let abort = state.admission_store.abort(ticket).await;
+    let release = state
+        .usage_store
+        .release(reservation, "admission_attach_failed")
+        .await;
+    let abort_failed = matches!(
+        abort,
+        Err(AdmissionError::Unavailable
+            | AdmissionError::StaleLease
+            | AdmissionError::InvalidCommand)
+    );
+    if abort_failed || release.is_err() {
+        return Err(ImageGatewayError::service_unavailable(
+            "generation admission cleanup unavailable",
+        ));
+    }
+    Ok(())
 }
 
 async fn attach_and_start_with_retry(
@@ -382,7 +733,7 @@ async fn attach_and_start_with_retry(
     Err(last_error)
 }
 
-async fn attach_ready_with_retry(
+pub(super) async fn attach_ready_with_retry(
     state: &Arc<AppState>,
     request: AttachJob,
 ) -> Result<(), AdmissionError> {
@@ -400,10 +751,11 @@ async fn attach_ready_with_retry(
     Err(last_error)
 }
 
-fn admission_error(error: AdmissionError) -> ImageGatewayError {
+pub(super) fn admission_error(error: AdmissionError) -> ImageGatewayError {
     match error {
         AdmissionError::Expired => ImageGatewayError::timeout(),
-        AdmissionError::BillingLimitExceeded => ImageGatewayError::queue_overloaded(),
+        AdmissionError::BillingLimitExceeded => ImageGatewayError::billing_limit_exceeded(),
+        AdmissionError::ProjectBudgetExceeded => ImageGatewayError::project_budget_exceeded(),
         AdmissionError::Unavailable
         | AdmissionError::PricingUnavailable
         | AdmissionError::InvalidOwner
@@ -414,7 +766,22 @@ fn admission_error(error: AdmissionError) -> ImageGatewayError {
     }
 }
 
-fn admission_deadline(config: &crate::AppConfig) -> i64 {
+fn xai_edit_admission_error(error: XaiImageEditAdmissionError) -> ImageGatewayError {
+    let parameter = match error {
+        XaiImageEditAdmissionError::UnsupportedMask => "mask",
+        XaiImageEditAdmissionError::UnsupportedOutputCount => "n",
+        XaiImageEditAdmissionError::UnsupportedStreaming => "stream",
+        XaiImageEditAdmissionError::UnsupportedOutputCompression => "output_compression",
+        XaiImageEditAdmissionError::UnsupportedAspectRatio => "size",
+        XaiImageEditAdmissionError::InvalidProviderRequest(_) => "image",
+        XaiImageEditAdmissionError::InvalidProviderCommand => {
+            return ImageGatewayError::internal("failed to encode durable Grok image edit command");
+        }
+    };
+    ImageGatewayError::unsupported(parameter, error.to_string())
+}
+
+pub(super) fn admission_deadline(config: &crate::AppConfig) -> i64 {
     now_ms().saturating_add(duration_ms(
         config
             .queue_timeout
@@ -444,6 +811,16 @@ pub(super) async fn edits(
 ) -> Result<Response, ImageGatewayError> {
     let headers = request.headers().clone();
     let auth = authenticate_image_request(&headers, &state).await?;
+    auth.require_api_key_capability(ApiKeyCapability::ImagesWrite)?;
+    edit_with_resolved_auth(&state, auth, request).await
+}
+
+pub(super) async fn edit_with_resolved_auth(
+    state: &Arc<AppState>,
+    mut auth: AuthContext,
+    request: Request,
+) -> Result<Response, ImageGatewayError> {
+    let headers = request.headers().clone();
     let upload_permit = state.upload_scheduler.acquire(&auth.tenant_id).await?;
 
     let request_id = request
@@ -451,24 +828,106 @@ pub(super) async fn edits(
         .get::<RequestId>()
         .map(|request_id| request_id.0.clone())
         .unwrap_or_else(new_request_id);
-    let form = parse_edit_request(request, &state).await?;
-    let job = form.into_job(request_id.clone())?;
+    let contract = generation_admission_contract(state.config.generation_admission_contract);
+    let mut form = parse_edit_request(request, &state).await?;
+    let requested_model = form
+        .model
+        .clone()
+        .unwrap_or_else(|| "gpt-image-2".to_string());
+    let resolved = resolve_surface_model(
+        &state,
+        &mut auth,
+        IMAGE_EDIT_ROUTE_OPERATION,
+        &[OPENAI_IMAGES_API_PROFILE, XAI_IMAGES_API_PROFILE],
+        &requested_model,
+    )
+    .await?;
+    let (public_model_id, execution_model_id, provider_id, api_profile, provider_model_id) =
+        resolved.map_or_else(
+            || {
+                (
+                    requested_model.clone(),
+                    None,
+                    openai_codex::PROVIDER_ID.to_owned(),
+                    OPENAI_IMAGES_API_PROFILE.to_owned(),
+                    requested_model.clone(),
+                )
+            },
+            |resolved| {
+                (
+                    resolved.public_model_id,
+                    Some(resolved.execution_model_id),
+                    resolved.provider_id,
+                    resolved.api_profile,
+                    resolved.provider_model_id,
+                )
+            },
+        );
+    if contract == AdmissionContract::CustomerPricingV4 && execution_model_id.is_none() {
+        return Err(ImageGatewayError::service_unavailable(
+            "customer pricing requires an enabled image edit model route",
+        ));
+    }
+    if provider_id == image_provider_grok_cli::PROVIDER_ID
+        && state.generation_execution_mode != GenerationExecutionMode::External
+    {
+        return Err(ImageGatewayError::service_unavailable(
+            "Grok image editing requires external provider execution",
+        ));
+    }
+    form.model = Some(if provider_id == image_provider_grok_cli::PROVIDER_ID {
+        "gpt-image-2".to_owned()
+    } else {
+        provider_model_id.clone()
+    });
+    let mut job = form.into_job(request_id.clone())?;
+    job.model = provider_model_id.clone();
     let descriptors = edit_input_descriptors(&job)?;
-    let command = EditCommandV1::from_edit_job(
-        &job,
-        descriptors,
-        OPENAI_IMAGES_API_PROFILE,
-        openai_codex::PROVIDER_ID,
-    );
-    let request_hash = command.request_hash_hex();
-    let idempotency_key_digest = idempotency_digest(&headers, &auth.project_id, EDIT_OPERATION)?;
+    let (command_schema, command_json, provider_command_hash, input_manifest_hash) = if provider_id
+        == image_provider_grok_cli::PROVIDER_ID
+    {
+        let plan = XaiImageEditAdmissionPlan::for_grok_cli(&job, descriptors)
+            .map_err(xai_edit_admission_error)?;
+        (
+            plan.command_schema().to_owned(),
+            plan.provider_command().clone(),
+            plan.source_request_hash(),
+            plan.input_manifest_hash(),
+        )
+    } else if provider_id == openai_codex::PROVIDER_ID {
+        let command = EditCommandV1::from_edit_job(&job, descriptors, &api_profile, &provider_id);
+        let provider_command_hash = command.request_hash_hex();
+        let input_manifest_hash = command.input_manifest_hash_hex();
+        (
+            EDIT_COMMAND_SCHEMA.to_owned(),
+            serde_json::to_value(command).map_err(|_| {
+                ImageGatewayError::internal("failed to serialize durable edit command")
+            })?,
+            provider_command_hash,
+            input_manifest_hash,
+        )
+    } else {
+        return Err(ImageGatewayError::unsupported(
+            "model",
+            "the selected provider does not expose image editing",
+        ));
+    };
+    let request_hash = if contract == AdmissionContract::CustomerPricingV4 {
+        crate::service_tiers::request_hash_with_project_service_tier(
+            &provider_command_hash,
+            auth.project_service_tier,
+        )
+    } else {
+        provider_command_hash.clone()
+    };
+    let idempotency_key_digest = idempotency_digest(&headers, &auth, EDIT_OPERATION)?;
     let ticket = match claim_admission_with_retry(
         &state,
         ClaimAdmission {
             owner_token: Uuid::new_v4(),
             tenant_id: auth.tenant_id.clone(),
             project_id: auth.project_id.clone(),
-            api_profile: OPENAI_IMAGES_API_PROFILE.to_string(),
+            api_profile: api_profile.clone(),
             operation: EDIT_OPERATION.to_string(),
             request_id: request_id.clone(),
             idempotency_key_digest,
@@ -500,7 +959,7 @@ pub(super) async fn edits(
         }
     };
     let units = job.n;
-    let model = job.model.clone();
+    let provider_model_id = job.model.clone();
 
     let _inline_permit = if state.generation_execution_mode == GenerationExecutionMode::Inline {
         match state.scheduler.acquire(&auth.tenant_id).await {
@@ -517,12 +976,15 @@ pub(super) async fn edits(
         &state,
         UsageCharge {
             tenant_id: auth.tenant_id.clone(),
+            attribution: Some(auth.attribution()),
             request_id: request_id.clone(),
             admission_session_id: Some(ticket.session_id),
             operation: EDIT_OPERATION,
-            provider_id: openai_codex::PROVIDER_ID.to_string(),
-            model,
-            units,
+            provider_id: provider_id.clone(),
+            model: provider_model_id.clone(),
+            output_count: units,
+            billable_units: units,
+            billing_metric: BillingMetric::Output,
             limits: usage_limits(&state.config),
         },
     )
@@ -543,15 +1005,17 @@ pub(super) async fn edits(
             return Err(error);
         }
     };
+    let service_tier_decision = crate::service_tiers::ServiceTierDecision::for_default_only_project(
+        auth.project_service_tier,
+    );
     let attach = AttachJob {
         ticket: ticket.clone(),
         job_id: reservation.job_id,
-        command_schema: EDIT_COMMAND_SCHEMA.to_string(),
-        command_json: serde_json::to_value(&command)
-            .map_err(|_| ImageGatewayError::internal("failed to serialize durable edit command"))?,
+        command_schema,
+        command_json,
         input_manifest: Some(AttachInputManifest {
             manifest_schema: EDIT_INPUT_MANIFEST_SCHEMA.to_string(),
-            manifest_hash: command.input_manifest_hash_hex(),
+            manifest_hash: input_manifest_hash,
             inputs,
         }),
         work_kind: "image_batch".to_string(),
@@ -559,7 +1023,40 @@ pub(super) async fn edits(
         schedule_weight: 1,
         schedule_priority: 1,
         schedule_cost: u64::from(units),
-        contract: AdmissionContract::LegacyV1,
+        contract,
+        customer_pricing: (contract == AdmissionContract::CustomerPricingV4).then(|| {
+            CustomerPricingIntent {
+                public_model_id,
+                provider_model_id,
+                execution_model_id: execution_model_id
+                    .expect("v4 edit execution model was validated before admission"),
+                provider_command_hash: Some(provider_command_hash),
+                media_kind: "image".to_string(),
+                service_tier: service_tier_decision.effective.pricing_key().to_string(),
+                service_tier_decision,
+                execution_surface: "provider_cli".to_string(),
+                currency: "USD".to_string(),
+                pricing_dimensions: if provider_id == image_provider_grok_cli::PROVIDER_ID {
+                    BTreeMap::from([
+                        (
+                            "aspect_ratio".to_string(),
+                            if job.images.len() == 1 {
+                                "auto".to_string()
+                            } else {
+                                job.size.clone()
+                            },
+                        ),
+                        ("resolution".to_string(), "1k".to_string()),
+                    ])
+                } else {
+                    BTreeMap::from([
+                        ("quality".to_string(), job.quality.clone()),
+                        ("size".to_string(), job.size.clone()),
+                    ])
+                },
+                processing_mode: crate::admission::PricingProcessingMode::Synchronous,
+            }
+        }),
     };
     if state.generation_execution_mode == GenerationExecutionMode::External {
         if let Err(error) = attach_ready_with_retry(&state, attach).await {
@@ -590,7 +1087,7 @@ pub(super) async fn edits(
             &lease,
             &reservation,
             job,
-            OPENAI_IMAGES_API_PROFILE,
+            &api_profile,
             GENERATION_RESPONSE_SCHEMA,
         )
         .await?;
@@ -730,7 +1227,7 @@ fn map_input_blob_write_error(_: InputBlobWriteError) -> ImageGatewayError {
     ImageGatewayError::service_unavailable("input storage unavailable")
 }
 
-async fn reserve_with_retry(
+pub(super) async fn reserve_with_retry(
     state: &Arc<AppState>,
     charge: UsageCharge,
 ) -> Result<crate::usage::UsageReservation, ImageGatewayError> {
@@ -751,7 +1248,7 @@ async fn reserve_with_retry(
     Err(last_error)
 }
 
-async fn claim_admission_with_retry(
+pub(super) async fn claim_admission_with_retry(
     state: &Arc<AppState>,
     claim: ClaimAdmission,
 ) -> Result<AdmissionClaim, AdmissionError> {
@@ -788,6 +1285,20 @@ mod tests {
             generation_admission_contract(GenerationAdmissionContract::OutputEconomicsV2),
             AdmissionContract::OutputEconomicsV2
         );
+        assert_eq!(
+            generation_admission_contract(GenerationAdmissionContract::CustomerPricingV4),
+            AdmissionContract::CustomerPricingV4
+        );
+    }
+
+    #[test]
+    fn billing_limit_is_not_reported_as_request_rate_limiting() {
+        let error = admission_error(AdmissionError::BillingLimitExceeded);
+        assert_eq!(
+            error.status_code(),
+            axum::http::StatusCode::TOO_MANY_REQUESTS
+        );
+        assert_eq!(error.error_code(), Some("billing_limit_exceeded"));
     }
 
     #[test]

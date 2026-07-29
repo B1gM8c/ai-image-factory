@@ -1,12 +1,12 @@
 use std::{sync::Arc, time::Duration};
 
-use serde_json::json;
+use serde_json::{Value, json};
 use tokio::sync::Barrier;
 use uuid::Uuid;
 
 use super::super::{
     AdmissionClaim, AdmissionContract, AdmissionError, AdmissionStore, AdmissionTicket, AttachJob,
-    ClaimAdmission, WorkOutcome,
+    ClaimAdmission, GenerationCommandV1, WorkOutcome,
 };
 use super::InMemoryAdmissionStore;
 
@@ -79,7 +79,7 @@ async fn attach(store: &InMemoryAdmissionStore, ticket: AdmissionTicket, job_id:
             ticket,
             job_id,
             command_schema: "openai.images.generation.v1".to_string(),
-            command_json: json!({"prompt": "draw a lighthouse"}),
+            command_json: generation_command("draw a lighthouse"),
             input_manifest: None,
             work_kind: "image.generate".to_string(),
             schedule_scope: "tenant-a".to_string(),
@@ -87,9 +87,31 @@ async fn attach(store: &InMemoryAdmissionStore, ticket: AdmissionTicket, job_id:
             schedule_priority: 1,
             schedule_cost: 1,
             contract: AdmissionContract::LegacyV1,
+            customer_pricing: None,
         })
         .await
         .expect("attach must succeed");
+}
+
+fn generation_command(prompt: &str) -> Value {
+    serde_json::to_value(GenerationCommandV1 {
+        background: "auto".to_string(),
+        model: "gpt-image-2".to_string(),
+        moderation: None,
+        n: 1,
+        operation: "generation".to_string(),
+        output_compression: None,
+        output_format: "png".to_string(),
+        partial_images: 0,
+        prompt: prompt.to_string(),
+        provider_id: "openai-codex".to_string(),
+        quality: "high".to_string(),
+        schema_version: 1,
+        size: "1024x1024".to_string(),
+        source_api_profile: "openai-images-v1".to_string(),
+        stream: false,
+    })
+    .expect("generation command fixture must serialize")
 }
 
 #[tokio::test]
@@ -173,7 +195,7 @@ async fn attach_requires_the_owner_and_an_object_command() {
                 ticket: forged,
                 job_id,
                 command_schema: "openai.images.generation.v1".to_string(),
-                command_json: json!({"prompt": "forged"}),
+                command_json: generation_command("forged"),
                 input_manifest: None,
                 work_kind: "image.generate".to_string(),
                 schedule_scope: "tenant-a".to_string(),
@@ -181,6 +203,7 @@ async fn attach_requires_the_owner_and_an_object_command() {
                 schedule_priority: 1,
                 schedule_cost: 1,
                 contract: AdmissionContract::LegacyV1,
+                customer_pricing: None,
             })
             .await,
         Err(AdmissionError::InvalidOwner)
@@ -199,6 +222,7 @@ async fn attach_requires_the_owner_and_an_object_command() {
                 schedule_priority: 1,
                 schedule_cost: 1,
                 contract: AdmissionContract::LegacyV1,
+                customer_pricing: None,
             })
             .await,
         Err(AdmissionError::InvalidCommand)
@@ -367,7 +391,7 @@ async fn expired_deadlines_are_rejected_and_receiving_sessions_are_aborted() {
                 ticket,
                 job_id: Uuid::new_v4(),
                 command_schema: "openai.images.generation.v1".to_string(),
-                command_json: json!({"prompt": "too late"}),
+                command_json: generation_command("too late"),
                 input_manifest: None,
                 work_kind: "image.generate".to_string(),
                 schedule_scope: "tenant-a".to_string(),
@@ -375,6 +399,7 @@ async fn expired_deadlines_are_rejected_and_receiving_sessions_are_aborted() {
                 schedule_priority: 1,
                 schedule_cost: 1,
                 contract: AdmissionContract::LegacyV1,
+                customer_pricing: None,
             })
             .await,
         Err(AdmissionError::Expired)

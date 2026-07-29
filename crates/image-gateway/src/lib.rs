@@ -1,10 +1,17 @@
+pub mod admin_read;
 pub mod admission;
 mod api;
 mod api_keys;
 pub mod artifacts;
 mod auth;
+pub mod batches;
+pub mod billing_control;
+pub mod billing_integrity;
 mod config;
 mod core;
+pub mod credentials;
+pub mod credit_grants;
+pub mod customer_refunds;
 pub mod database;
 mod docs;
 pub mod economics;
@@ -12,53 +19,110 @@ mod error;
 mod execution;
 pub mod executor;
 mod generator;
+pub mod identity;
 pub mod input_blobs;
 mod jobs;
+pub mod model_routing;
 mod models;
+pub mod pricing;
+pub mod project_governance;
+pub mod project_limits;
+pub mod project_model_policy;
+pub mod provider_cost_allocations;
+pub mod provider_cost_obligations;
+pub mod provider_management;
 pub mod provider_tasks;
+pub mod provider_uploads;
 mod providers;
 mod reconciliation;
 pub mod reduction;
+mod request_observability;
+pub mod retention;
 pub mod runner;
 mod scheduler;
+pub mod service_tiers;
 pub mod settlement;
 mod size;
 mod telemetry;
 mod usage;
+pub mod webhooks;
 mod workers;
 
+pub use admin_read::{
+    AdminReadScope, AdminReadStore, PostgresAdminReadStore, ProviderAccountRuntimeEventHub,
+};
 pub use api::{
-    ExternalImageGatewayComponents, GenerationExecutionMode, ImageGatewayComponents, build_router,
-    build_router_with_api_key_store, build_router_with_components,
-    build_router_with_external_execution,
+    ExternalControlPlaneServices, ExternalImageGatewayComponents, GenerationExecutionMode,
+    ImageGatewayComponents, build_router, build_router_with_api_key_store,
+    build_router_with_components, build_router_with_external_execution,
+    build_router_with_external_execution_and_control_plane,
+    build_router_with_external_execution_and_control_plane_and_runtime_events,
+    build_router_with_external_execution_and_control_plane_and_runtime_events_and_model_routing,
+    build_router_with_external_execution_and_identity,
+    build_router_with_external_execution_and_identity_and_admin_read,
+    build_router_with_external_execution_and_services,
 };
 pub use api_keys::{ApiKeyKeyring, ApiKeyStore, InMemoryApiKeyStore, PostgresApiKeyStore};
 pub use artifacts::{
     FilesystemArtifactBlobStore, FilesystemProviderArtifactStagerFactory,
     ProviderArtifactStagerConfigurationError,
 };
+pub use auth::{ApiKeyCapability, ApiKeyPermissionLevel, ApiKeyPermissionMode, ApiKeyPermissions};
+pub use billing_control::{BillingAccountControlService, PostgresBillingAccountControlService};
+pub use billing_integrity::{BillingIntegrityService, PostgresBillingIntegrityService};
 pub use config::{AppConfig, GenerationAdmissionContract, ProxyConfig};
+pub use credentials::{
+    CredentialRefreshLease, CredentialResolveError, OperationalCredential,
+    OperationalCredentialResolver, PostgresCredentialStore,
+};
+pub use credit_grants::{CreditGrantService, PostgresCreditGrantService};
+pub use customer_refunds::{CustomerRefundService, PostgresCustomerRefundService};
 pub use error::ImageGatewayError;
 pub use execution::{
     EditExecutionContext, ExecutionContextError, ExecutionContextStore, GenerationExecutionContext,
     PersistedEditInput, PostgresExecutionContextStore,
 };
 pub use executor::{
-    CODEX_GENERATION_ADAPTER_REVISION, CodexExecutionProfileProvisioning, CodexOutputRequest,
-    CodexProcessSupervisor, CodexProfileProvisioningError, CodexRequestProjectionError,
-    DurableEvidenceRecovery, DurableRunnerResult, ExecutorArtifactSink, ExecutorClaimScope,
+    CODEX_EDIT_INLINE_ADAPTER_REVISION, CODEX_GENERATION_ADAPTER_REVISION,
+    CodexExecutionProfileProvisioning, CodexOutputRequest, CodexProcessSupervisor,
+    CodexProfileProvisioningError, CodexRequestProjectionError,
+    DreaminaExecutionProfileProvisioning, DreaminaProfileProvisioningError,
+    DurableEvidenceRecovery, DurableRunnerResult, ExecutionProfileProvisioning,
+    ExecutionProfileProvisioningError, ExecutorArtifactSink, ExecutorClaimScope,
     ExecutorEvidenceStore, ExecutorExecutionProfile, ExecutorExecutionProfileStore,
-    ExecutorHandoffStore, ExecutorLaunchContext, ExecutorLaunchContextStore,
-    ExecutorOwnerGuardError, ExecutorResultManifest, ExecutorRunnerObservation,
+    ExecutorHandoffStore, ExecutorInputObject, ExecutorLaunchContext, ExecutorLaunchContextStore,
+    ExecutorOwnerGuardError, ExecutorProcessSupervisor, ExecutorProfileBinding,
+    ExecutorProfileBindingError, ExecutorResultManifest, ExecutorRunnerObservation,
     ExecutorSubmissionError, ExecutorSubmissionLease, ExecutorSubmissionOutcome,
-    ExecutorSubmissionResume, ExecutorSubmissionStore, JournaledDurableRunner,
-    PostgresExecutorOwnerGuard, PostgresExecutorSubmissionStore, PreparedExecutorSubmission,
-    ProvisionedCodexExecutionProfile, RunnerLaunchAuthority, SingleOutputSupervisor,
-    codex_auth_file_sha256, project_codex_output_request, provision_codex_execution_profile,
-    run_codex_runner_child,
+    ExecutorSubmissionResume, ExecutorSubmissionStore, GrokExecutionProfileProvisioning,
+    GrokExecutionRequest, GrokProcessSupervisor, GrokProfileProvisioningError,
+    GrokRequestProjectionError, JournaledDurableRunner, PostgresExecutorOwnerGuard,
+    PostgresExecutorSubmissionStore, PreparedExecutorSubmission, ProvisionedCodexExecutionProfile,
+    ProvisionedDreaminaExecutionProfile, ProvisionedExecutionProfile,
+    ProvisionedGrokExecutionProfile, RunnerLaunchAuthority, SingleOutputSupervisor,
+    codex_auth_file_sha256, grok_auth_file_sha256, identify_executor_profile_binding,
+    prepare_codex_auth_copy, project_codex_output_request, project_grok_execution_request,
+    provision_codex_edit_execution_profile_in_transaction, provision_codex_execution_profile,
+    provision_codex_execution_profile_in_transaction, provision_dreamina_execution_profile,
+    provision_dreamina_execution_profile_in_transaction,
+    provision_dreamina_video_execution_profile,
+    provision_dreamina_video_execution_profile_in_transaction,
+    provision_grok_edit_execution_profile, provision_grok_edit_execution_profile_in_transaction,
+    provision_grok_execution_profile, provision_grok_execution_profile_in_transaction,
+    provision_grok_video_execution_profile, provision_grok_video_execution_profile_in_transaction,
+    run_codex_runner_child, run_grok_runner_child,
 };
 pub use generator::{
     CodexImageGenerator, EditJob, GeneratedImage, GenerationJob, ImageGenerator, InputImage,
+};
+pub use project_governance::{PostgresProjectGovernanceService, ProjectGovernanceService};
+pub use project_limits::{PostgresProjectSpendBudgetService, ProjectSpendBudgetService};
+pub use project_model_policy::{PostgresProjectModelPolicyService, ProjectModelPolicyService};
+pub use provider_cost_allocations::{
+    PostgresProviderCostAllocationService, ProviderCostAllocationService,
+};
+pub use provider_cost_obligations::{
+    PostgresProviderCostObligationService, ProviderCostObligationService,
 };
 pub use provider_tasks::{
     GatedCliBinding, GatedCliCommand, GatedCliObservation, GatedCliPreparedSubmission,
@@ -97,10 +161,14 @@ pub use provider_tasks::{
     RemoteTaskSubmitReservation, StagedProviderArtifact, VerifiedCallbackWakeup,
     run_remote_submit_gate, run_remote_submit_runner,
 };
+pub use provider_uploads::ProviderUploadService;
 pub use providers::dreamina_cli::{
     DreaminaCliCodecConfigError, DreaminaCliPollDriverConfigError, DreaminaCliPollDriverV1,
     DreaminaCliPollProcessConfig, DreaminaCliRuntimeBindingV1, DreaminaCliSubmitCodecV1,
     DreaminaCliSubmitProcessConfig, DreaminaCliSubmitRuntimeConfigError,
+    DreaminaCredentialEnvironmentError, DreaminaKeychainReplacement,
+    dreamina_account_isolation_available, dreamina_credential_fingerprint,
+    prepare_dreamina_account_home,
 };
 pub use reconciliation::{
     InputCleanupOutcome, PostgresReconciliationStore, ReconciliationOutcome, ReconciliationStore,
@@ -108,9 +176,14 @@ pub use reconciliation::{
 };
 pub use reduction::{
     CanonicalExecutorOutcome, CustomerArtifactPublishError, CustomerArtifactPublisher,
-    ExecutorParentTerminalState, ExecutorTerminalArtifact, ExecutorTerminalCompletion,
-    ExecutorTerminalError, ExecutorTerminalLease, ExecutorTerminalStore,
-    PostgresExecutorTerminalStore,
+    ExecutorParentTerminalState, ExecutorTerminalArtifact, ExecutorTerminalBlockReason,
+    ExecutorTerminalCompletion, ExecutorTerminalError, ExecutorTerminalLease,
+    ExecutorTerminalStore, PostgresExecutorTerminalStore,
+};
+pub use request_observability::RequestObservationSink;
+pub use retention::{
+    ArtifactRetentionClaim, ArtifactRetentionOutcome, ArtifactRetentionStore,
+    PostgresArtifactRetentionStore, reconcile_artifact_retention,
 };
 pub use settlement::{
     ExecutionSettlementStore, GenerationResultStatus, PostgresExecutionSettlementStore,

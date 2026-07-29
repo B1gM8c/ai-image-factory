@@ -8,6 +8,14 @@ It exposes:
 
 - `POST /v1/images/generations`
 - `POST /v1/images/edits`
+- `POST /api/v3/images/generations`
+- `POST /api/v3/contents/generations/tasks`
+- `GET /api/v3/contents/generations/tasks/{task_id}`
+- `GET /api/v3/files/{file_id}/content`
+- `POST /v1/dreamina/images/generations`
+- `POST /v1/dreamina/videos/generations`
+- `GET /v1/dreamina/videos/{task_id}`
+- `GET /v1/dreamina/files/{file_id}/content`
 - `POST /v1/organization/projects/{project_id}/service_accounts`
 - `GET /v1/organization/projects/{project_id}/api_keys`
 - `DELETE /v1/organization/projects/{project_id}/api_keys/{api_key_id}`
@@ -86,17 +94,19 @@ provider children.
 `REDUCER_HEARTBEAT_INTERVAL_MS`, and `REDUCER_POLL_INTERVAL_MS`, with safe
 defaults. It verifies and publishes customer artifacts before atomically
 completing receipt, rating, quota, parent state, response projection, and
-outbox. Set `GATEWAY_IMAGES_GENERATION_CONTRACT=output-economics-v2` on the
-gateway only after the handoff workerd, executord, and reducerd are healthy.
-The only accepted values are `legacy-v1` and `output-economics-v2`; unset means
-`legacy-v1`, and invalid values fail startup. This switch affects generation
-only. Keep a Legacy workerd pool running for edits and any previously admitted
-Legacy jobs.
+outbox. `GATEWAY_IMAGES_GENERATION_CONTRACT` is required and accepts
+`legacy-v1`, `output-economics-v2`, or `customer-pricing-v4`; an unset or
+invalid value fails startup. Use `customer-pricing-v4` only after model routes,
+published customer price versions, billing accounts, and the handoff workerd,
+executord, and reducerd are healthy. The selected contract applies to both
+generation and edit admission, so edits cannot silently bypass the frozen
+customer quote and billing-hold path. Keep a compatible worker pool only for
+jobs admitted under an older contract during a controlled migration.
 
 `size=auto` preserves the provider's native dimensions and reports the actual
-`WIDTHxHEIGHT`. Exact dimensions remain fail-closed: if Codex returns a
-different size, the request fails because the executor never locally crops,
-stretches, or resamples generated pixels.
+`WIDTHxHEIGHT`. Explicit dimensions constrain the output aspect ratio: Codex
+native dimensions with the same ratio are accepted. The executor never locally
+crops, stretches, or resamples generated pixels.
 
 Default bind address is `127.0.0.1:8787`. Gateway startup requires at least one of `GATEWAY_API_TOKEN` or `GATEWAY_ADMIN_TOKEN`, a versioned API-key pepper keyring, and an explicit absolute, existing `GATEWAY_ARTIFACT_ROOT`; it does not require Codex CLI or `GATEWAY_CODEX_HOME`. Worker startup separately requires an explicit absolute, existing, writable `GATEWAY_CODEX_HOME` plus the shared artifact root. If both tokens are configured, they must be different. `GATEWAY_ADMIN_TOKEN` protects Admin endpoints for creating and revoking project API keys; it never authorizes image calls. An admin-only startup can bootstrap project keys, and image calls must then use one of those keys. `GATEWAY_API_TOKEN` remains a legacy image token and is not accepted on Admin endpoints.
 
@@ -106,13 +116,17 @@ Legacy SHA-256 credential reads are disabled by default. Set `GATEWAY_API_KEY_AL
 
 The gateway does not yet provide native TLS and rejects every non-loopback bind. Bind it to loopback and place a TLS reverse proxy on the same host in front of it. Provision `GATEWAY_CODEX_HOME` before each worker startup and grant the worker service account permission to create and remove files there; the path must not be a symlink or the filesystem root. `--ignore-user-config` skips user `config.toml`; Codex may still load its native system image generation skill.
 
-`GATEWAY_ARTIFACT_ROOT` stores immutable generated-image blobs and durable edit inputs in separate object namespaces. The root must be owned by the gateway service user, must not be a symlink, and must not be group or world writable. The current filesystem backend is production-supported only when every gateway/worker process runs on one host or mounts the same persistent POSIX volume. PostgreSQL stores artifact metadata, ordered edit-input manifests, and immutable response projections, not image bytes. A successful generation or edit writes and syncs every output blob before the fenced settlement transaction commits job success, quota, metering, artifact metadata, and the replay projection. Reusing the same completed `Idempotency-Key` reconstructs the original JSON or final SSE response without another Codex invocation or another charge.
+`GATEWAY_ARTIFACT_ROOT` stores immutable generated-image blobs and durable edit inputs in separate object namespaces. The root must be owned by the gateway service user, must not be a symlink, and must not be group or world writable. The current filesystem backend is production-supported only when every gateway/worker process runs on one host or mounts the same persistent POSIX volume. PostgreSQL stores artifact metadata, ordered edit-input manifests, immutable response projections, and retention tombstones, not image bytes. A successful generation or edit writes and syncs every output blob before the fenced settlement transaction commits job success, quota, metering, artifact metadata, and the replay projection. Reusing the same completed `Idempotency-Key` reconstructs the original JSON or final SSE response without another provider invocation or charge while the result is retained. After logical expiry, the same key and request return `410 idempotency_result_expired`; unknown or corrupted live artifacts are never disguised as expiry.
+
+Grok video generation does not require Qiniu or another customer-managed object store. When an account has no explicit `[tools.zdr_video_output_s3]` configuration, set `GATEWAY_PROVIDER_UPLOAD_PUBLIC_BASE_URL` to the public HTTPS origin of this gateway. For each fenced execution, `executord` injects a private, short-lived S3-compatible upload credential into that execution's isolated Grok home. The provider uploads to `/v1/internal/provider-uploads/s3/...`; Grok CLI downloads the same object into its normal output slot; then the existing executor validates, publishes, settles, and exposes it through the project-scoped video URL. The temporary provider upload is never returned to the user and is removed after its ticket expires. An explicit account S3/Qiniu configuration takes precedence.
+
+`GATEWAY_PROVIDER_UPLOAD_PUBLIC_BASE_URL` must contain only an origin, for example `https://media-gateway.example.com`. The reverse proxy must preserve the public `Host` header and route the internal upload path to `gpt-image-2-gateway` without adding JWT or API-key authentication; the route authenticates only short-lived AWS SigV4 presigned PUT/GET/HEAD requests. Gateway, `executord`, and `reconcilerd` must share the same `GATEWAY_ARTIFACT_ROOT`. Loopback HTTP is accepted only for protocol tests; a real Grok/xAI generation needs an Internet-reachable HTTPS origin.
 
 Production generation and edit execution are external to the HTTP process. `gpt-image-2-gateway` authenticates, reserves quota, writes edit inputs when present, atomically attaches ready work, and waits on PostgreSQL. Quota reservation retries are keyed by the admission session, and attach validates the exact tenant, operation, request, job, and quota/session binding. `workerd` claims weighted ready work, validates and reconstructs the versioned command and quota snapshot, verifies edit-input blob hashes before marking the attempt running, executes Codex under a heartbeated fenced lease, persists output artifacts, and requests atomic settlement. A transient input-store failure leaves the unstarted lease recoverable; an input-integrity failure is terminalized without invoking Codex. On SIGTERM the worker stops claiming and drains the in-flight attempt within a bounded window.
 
 The Codex adapter treats prompts as untrusted descriptions, strips untrusted image metadata by decoding and re-encoding every output, checks output byte and pixel budgets before allocation, and clears gateway secrets from the child environment. These controls do not make an agentic CLI credential domain suitable for mutually hostile tenants: the Codex parent runtime must still access its own provider credential. Until the planned externally sandboxed executor/account-pool isolation is implemented, deploy each Codex worker pool with a dedicated least-privilege account and do not mix unrelated trust domains in one `GATEWAY_CODEX_HOME`.
 
-`reconcilerd` safely requeues expired leases that never reached `running`; an expired `running` attempt becomes `uncertain`, keeps its economic reservation and edit inputs, and is never automatically submitted or garbage-collected. It atomically releases a reserved job/admission pair that still has no work item after `RECONCILER_ORPHAN_GRACE_MS` (default 60000). It also leases session-scoped input cleanup, deletes expired aborted uploads and inputs for succeeded/failed edits, and marks cleanup complete only after storage confirms the idempotent deletion. Failed deletes retry after `RECONCILER_INPUT_CLEANUP_LEASE_MS`; `RECONCILER_INPUT_CLEANUP_GRACE_MS` controls terminal retention. `RECONCILER_INTERVAL_MS` (default 1000) and `RECONCILER_BATCH_SIZE` (default 100) control each scan.
+`reconcilerd` safely requeues expired leases that never reached `running`; an expired `running` attempt becomes `uncertain`, keeps its economic reservation and edit inputs, and is never automatically submitted or garbage-collected. It atomically releases a reserved job/admission pair that still has no work item after `RECONCILER_ORPHAN_GRACE_MS` (default 60000). It also leases session-scoped input cleanup and artifact retention work. Artifact expiry is committed before any file I/O, then physical customer and executor objects are deleted after the snapshotted read-drain interval. A fenced tombstone is committed only after idempotent deletion succeeds; failures use the job's snapshotted retry delay. New response snapshots retain results for 30 minutes and drain readers for 1 minute; existing rows keep the policy captured when they were created. `RECONCILER_ARTIFACT_CLEANUP_LEASE_MS` (default 60000) controls deletion ownership. `RECONCILER_INTERVAL_MS` (default 1000) and `RECONCILER_BATCH_SIZE` (default 100) bound each scan.
 
 Migration `0007_edit_inputs` adds the quota/admission binding, ordered edit-input manifests, immutable input object identities, operation-aware response projections, and leased input-cleanup state required by durable edits. The gateway never invokes the provider CLI; only `workerd` does.
 
@@ -160,6 +174,109 @@ curl http://127.0.0.1:8787/v1/images/edits \
     "output_format": "png"
   }'
 ```
+
+## Volcengine Ark Compatibility
+
+The canonical Dreamina public surface follows Volcengine Ark's `/api/v3`
+routes and request envelopes. It is an explicit compatibility adapter over the
+isolated Dreamina CLI execution profile, so CLI command names never leak into
+new client integrations.
+
+Generate Seedream images as base64:
+
+```bash
+curl http://127.0.0.1:8787/api/v3/images/generations \
+  -H 'Authorization: Bearer sk-gw-...' \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: ark-image-example-1' \
+  -d '{
+    "model": "doubao-seedream-5-0-260128",
+    "prompt": "a clean product photograph on a white background",
+    "size": "2K",
+    "sequential_image_generation": "disabled",
+    "response_format": "b64_json",
+    "stream": false
+  }'
+```
+
+Submit and poll a Seedance 2.0 video task:
+
+```bash
+curl http://127.0.0.1:8787/api/v3/contents/generations/tasks \
+  -H 'Authorization: Bearer sk-gw-...' \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: ark-video-example-1' \
+  -d '{
+    "model": "doubao-seedance-2-0-fast-260128",
+    "content": [{
+      "type": "text",
+      "text": "slow camera push toward a futuristic city at sunrise"
+    }],
+    "ratio": "16:9",
+    "resolution": "720p",
+    "duration": 5
+  }'
+
+curl http://127.0.0.1:8787/api/v3/contents/generations/tasks/<cgt-task-id> \
+  -H 'Authorization: Bearer sk-gw-...'
+```
+
+The request DTOs retain the current official Ark fields, but the adapter fails
+closed with `unsupported_parameter` when the installed CLI cannot honor a
+field. Today that includes image references, URL image responses, streaming,
+seed/guidance/watermark/prompt optimization/tools, video reference media,
+callbacks, audio, draft mode, frame counts, and service-tier controls. The
+supported CLI subset is text-to-image with base64 output and text-only
+Seedance 2.0 at 720p. Collection listing and task cancellation are not yet
+implemented.
+
+## Dreamina CLI Compatibility Routes
+
+The older `/v1/dreamina/*` facade preserves the current CLI field names for
+existing clients. New integrations should use the Ark-compatible `/api/v3`
+routes above.
+
+Generate one or more images and receive OpenAI-style base64 output:
+
+```bash
+curl http://127.0.0.1:8787/v1/dreamina/images/generations \
+  -H 'Authorization: Bearer sk-gw-...' \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: dreamina-image-example-1' \
+  -d '{
+    "prompt": "a clean product photograph on a white background",
+    "model_version": "5.0Pro",
+    "ratio": "1:1",
+    "resolution_type": "2k",
+    "generate_num": 2
+  }'
+```
+
+Submit a Seedance text-to-video task, then poll it:
+
+```bash
+curl http://127.0.0.1:8787/v1/dreamina/videos/generations \
+  -H 'Authorization: Bearer sk-gw-...' \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: dreamina-video-example-1' \
+  -d '{
+    "prompt": "slow camera push toward a futuristic city at sunrise",
+    "model_version": "seedance2.0fast",
+    "ratio": "16:9",
+    "duration": 5,
+    "video_resolution": "720p"
+  }'
+
+curl http://127.0.0.1:8787/v1/dreamina/videos/<task-id> \
+  -H 'Authorization: Bearer sk-gw-...'
+```
+
+Completed video tasks return a tenant-scoped `content.video_url`. Video
+admission requires an explicit positive `video_second` price; no free wildcard
+video price is published. Migration `0050` permits one account to carry the
+separate image and video operation descriptors, and gateway startup
+idempotently adds the missing video profile and account route to older managed
+Dreamina accounts.
 
 ## API Docs
 
@@ -240,7 +357,7 @@ This is a compatibility subset, not the official OpenAI Images API.
 - Codex's built-in image generation skill is considered native Codex capability. The gateway no longer tries to avoid it; it avoids user config/plugins/apps and gateway secret leakage.
 - Responses always use `data[].b64_json`.
 - `response_format=url` is rejected.
-- Explicit `WIDTHxHEIGHT` requests are enforced through the Codex prompt and then verified by the gateway. The gateway does not crop, stretch, or resample images to force a requested size; if Codex returns the wrong dimensions, the request fails. Responses report the actual output dimensions as `WIDTHxHEIGHT`.
+- Explicit `WIDTHxHEIGHT` requests are enforced through the Codex prompt and then verified as an aspect-ratio constraint by the gateway. Codex-native dimensions with the same ratio are accepted. The gateway does not crop, stretch, or resample images, and responses report the actual output dimensions as `WIDTHxHEIGHT`.
 - As a Codex gateway extension, request `size` may also be an aspect ratio such as `1:1`, `4:3`, or `16:9`. These requests do not require an exact pixel size; the gateway prompts Codex for the native ratio and verifies the returned image with a 1% aspect-ratio tolerance. Responses still report the actual output dimensions as `WIDTHxHEIGHT`.
 - Requested `output_format` values are encoded by the gateway after Codex generation when possible. JPEG `output_compression` maps to encoder quality and defaults to 100. WebP `output_compression` is accepted for request compatibility, but the current encoder path does not guarantee official quality parity.
 - `stream=true` with `partial_images=0` returns a final-only `text/event-stream` response after Codex finishes. The event is `image_generation.completed` for generations and `image_edit.completed` for edits, with `data` containing `{ "type": "...completed", "b64_json": "..." }`. It does not stream thinking or live partial image progress. `partial_images=1..3` is rejected because native Codex CLI does not expose official partial image events.

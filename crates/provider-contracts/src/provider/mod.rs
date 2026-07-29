@@ -253,8 +253,13 @@ pub mod planned {
             display_name: "Grok CLI",
             owner: "xai",
             execution_mode: ProviderExecutionMode::CliBridge,
-            candidate_models: &["grok-image"],
-            intended_scope: "image generation",
+            candidate_models: &[
+                "grok-imagine-image",
+                "grok-imagine-image-quality",
+                "grok-imagine-video",
+                "grok-imagine-video-1.5-preview",
+            ],
+            intended_scope: "image generation and editing; image/reference-to-video generation",
         },
     ];
 }

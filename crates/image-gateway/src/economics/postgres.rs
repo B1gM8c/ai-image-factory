@@ -5,11 +5,17 @@ use uuid::Uuid;
 
 use super::{
     EconomicReceipt, EconomicReceiptOutcome, EconomicSettlement, EconomicSettlementError,
-    EconomicSettlementStore, evidence_hash,
+    EconomicSettlementStore, ProviderReceiptRecord, evidence_hash,
 };
 use crate::admission::{AdmissionError, AttachJob};
 
-const MAX_IMAGE_OUTPUTS: i32 = 10;
+const MAX_OUTPUTS_PER_JOB: i32 = 10;
+const OUTPUT_BILLING_METRIC: &str = "output";
+const OUTPUT_BILLING_UNIT: &str = "output";
+const REQUEST_BILLING_METRIC: &str = "request";
+const REQUEST_BILLING_UNIT: &str = "request";
+const VIDEO_SECOND_BILLING_METRIC: &str = "video_second";
+const VIDEO_SECOND_BILLING_UNIT: &str = "second";
 
 #[derive(Clone)]
 pub struct PostgresEconomicSettlementStore {
@@ -29,12 +35,64 @@ struct LockedJob {
     provider_id: String,
     model: String,
     requested_units: i32,
+    output_count: i32,
+    billable_units: i32,
+    billing_metric: String,
+    billing_unit: String,
     economics_contract_version: i16,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BillingDimension {
+    Output,
+    Request,
+    VideoSecond,
+}
+
+impl BillingDimension {
+    fn from_job(job: &LockedJob) -> Result<Self, AdmissionError> {
+        let dimension = match (job.billing_metric.as_str(), job.billing_unit.as_str()) {
+            (OUTPUT_BILLING_METRIC, OUTPUT_BILLING_UNIT) => Self::Output,
+            (REQUEST_BILLING_METRIC, REQUEST_BILLING_UNIT) => Self::Request,
+            (VIDEO_SECOND_BILLING_METRIC, VIDEO_SECOND_BILLING_UNIT) => Self::VideoSecond,
+            _ => return Err(AdmissionError::InvalidCommand),
+        };
+        let dimensions_valid = job.requested_units == job.billable_units
+            && match dimension {
+                Self::Output => {
+                    (1..=MAX_OUTPUTS_PER_JOB).contains(&job.output_count)
+                        && job.output_count == job.billable_units
+                }
+                Self::Request => job.output_count == 1 && job.billable_units == 1,
+                Self::VideoSecond => job.output_count == 1 && job.billable_units > 0,
+            };
+        if dimensions_valid {
+            Ok(dimension)
+        } else {
+            Err(AdmissionError::InvalidCommand)
+        }
+    }
+
+    const fn contract_version(self) -> i16 {
+        match self {
+            Self::Output | Self::Request => 2,
+            Self::VideoSecond => 3,
+        }
+    }
+
+    const fn output_billable_units(self, job_billable_units: i32) -> i32 {
+        match self {
+            Self::Output => 1,
+            Self::Request | Self::VideoSecond => job_billable_units,
+        }
+    }
 }
 
 #[derive(sqlx::FromRow)]
 struct PriceVersion {
     price_version_id: Uuid,
+    billing_metric: String,
+    billing_unit: String,
     currency: String,
     success_micros: i64,
     failed_micros: i64,
@@ -47,11 +105,28 @@ struct FrozenQuote {
     price_version_id: Uuid,
     currency: String,
     output_count: i32,
+    billable_units: i64,
+    billing_metric: String,
+    billing_unit: String,
+    price_billing_metric: String,
+    price_billing_unit: String,
     success_micros: i64,
     failed_micros: i64,
     no_effect_micros: i64,
     max_total_micros: i64,
     quote_hash: String,
+}
+
+#[derive(sqlx::FromRow)]
+struct FrozenOutputSet {
+    output_count: i64,
+    min_index: Option<i32>,
+    max_index: Option<i32>,
+    min_billable_units: Option<i32>,
+    max_billable_units: Option<i32>,
+    hold_count: i64,
+    holds_match_weights: Option<bool>,
+    held_total: i64,
 }
 
 #[derive(sqlx::FromRow)]
@@ -67,11 +142,16 @@ struct SubmissionIdentity {
 
 #[derive(sqlx::FromRow)]
 struct LockedEconomicOutput {
+    economics_contract_version: i16,
     output_state: String,
+    billable_units: i32,
     hold_state: String,
     held_micros: i64,
     quote_id: Uuid,
     currency: String,
+    billing_metric: String,
+    billing_unit: String,
+    quote_billable_units: i64,
     success_micros: i64,
     failed_micros: i64,
     no_effect_micros: i64,
@@ -95,9 +175,13 @@ pub(crate) async fn admit_job_outputs(
     now: i64,
 ) -> Result<(), AdmissionError> {
     let job = lock_job(tx, request.job_id).await?;
-    validate_output_count(&job, request)?;
-    if job.economics_contract_version == 2 {
+    let dimension = validate_job_dimensions(&job, request)?;
+    let target_contract_version = dimension.contract_version();
+    if job.economics_contract_version == target_contract_version {
         return validate_locked_economics(tx, request.job_id, &job).await;
+    }
+    if job.economics_contract_version != 1 {
+        return Err(AdmissionError::InvalidOwner);
     }
 
     let existing_outputs: i64 =
@@ -116,15 +200,10 @@ pub(crate) async fn admit_job_outputs(
         .max(price.failed_micros)
         .max(price.no_effect_micros);
     let max_total_micros = max_unit_micros
-        .checked_mul(i64::from(job.requested_units))
+        .checked_mul(i64::from(job.billable_units))
         .ok_or(AdmissionError::InvalidCommand)?;
     let quote_id = Uuid::new_v4();
-    let quote_hash = quote_hash(
-        request.job_id,
-        &price,
-        job.requested_units,
-        max_total_micros,
-    );
+    let quote_hash = quote_hash(request.job_id, &price, &job, max_total_micros);
 
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
         .bind(format!("budget:{}:{}", job.tenant_id, price.currency))
@@ -135,8 +214,8 @@ pub(crate) async fn admit_job_outputs(
         r#"
         INSERT INTO billing_accounts
           (tenant_id, currency, credit_limit_micros, held_micros, captured_micros,
-           created_at_ms, updated_at_ms)
-        VALUES ($1, $2, 0, 0, 0, $3, $3)
+           refunded_micros, created_at_ms, updated_at_ms)
+        VALUES ($1, $2, 0, 0, 0, 0, $3, $3)
         ON CONFLICT (tenant_id, currency) DO NOTHING
         "#,
     )
@@ -151,7 +230,10 @@ pub(crate) async fn admit_job_outputs(
         UPDATE billing_accounts
         SET held_micros = held_micros + $3, updated_at_ms = $4
         WHERE tenant_id = $1 AND currency = $2
-          AND (held_micros::NUMERIC + captured_micros::NUMERIC + $3::NUMERIC)
+          AND (
+                held_micros::NUMERIC + captured_micros::NUMERIC
+                - refunded_micros::NUMERIC + $3::NUMERIC
+              )
               <= credit_limit_micros::NUMERIC
         "#,
     )
@@ -170,17 +252,20 @@ pub(crate) async fn admit_job_outputs(
     sqlx::query(
         r#"
         INSERT INTO price_quotes
-          (quote_id, job_id, price_version_id, currency, output_count,
-           success_micros, failed_micros, no_effect_micros, max_total_micros,
-           quote_hash, created_at_ms)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+          (quote_id, job_id, price_version_id, currency, output_count, billable_units,
+           billing_metric, billing_unit, success_micros, failed_micros, no_effect_micros,
+           max_total_micros, quote_hash, created_at_ms)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
         "#,
     )
     .bind(quote_id)
     .bind(request.job_id)
     .bind(price.price_version_id)
     .bind(&price.currency)
-    .bind(job.requested_units)
+    .bind(job.output_count)
+    .bind(job.billable_units)
+    .bind(&job.billing_metric)
+    .bind(&job.billing_unit)
     .bind(price.success_micros)
     .bind(price.failed_micros)
     .bind(price.no_effect_micros)
@@ -191,18 +276,24 @@ pub(crate) async fn admit_job_outputs(
     .await
     .map_err(unavailable)?;
 
-    for output_index in 0..job.requested_units {
+    let output_billable_units = dimension.output_billable_units(job.billable_units);
+    let output_hold_micros = max_unit_micros
+        .checked_mul(i64::from(output_billable_units))
+        .ok_or(AdmissionError::InvalidCommand)?;
+    for output_index in 0..job.output_count {
         let output_id = Uuid::new_v4();
         sqlx::query(
             r#"
             INSERT INTO job_outputs
-              (output_id, job_id, output_index, state, created_at_ms, updated_at_ms)
-            VALUES ($1, $2, $3, 'pending', $4, $4)
+              (output_id, job_id, output_index, billable_units, state,
+               created_at_ms, updated_at_ms)
+            VALUES ($1, $2, $3, $4, 'pending', $5, $5)
             "#,
         )
         .bind(output_id)
         .bind(request.job_id)
         .bind(output_index)
+        .bind(output_billable_units)
         .bind(now)
         .execute(&mut **tx)
         .await
@@ -220,7 +311,7 @@ pub(crate) async fn admit_job_outputs(
         .bind(quote_id)
         .bind(&job.tenant_id)
         .bind(&price.currency)
-        .bind(max_unit_micros)
+        .bind(output_hold_micros)
         .bind(now)
         .execute(&mut **tx)
         .await
@@ -228,9 +319,10 @@ pub(crate) async fn admit_job_outputs(
     }
 
     let changed = sqlx::query(
-        "UPDATE jobs SET economics_contract_version = 2, updated_at_ms = $2 WHERE job_id = $1 AND economics_contract_version = 1",
+        "UPDATE jobs SET economics_contract_version = $2, updated_at_ms = $3 WHERE job_id = $1 AND economics_contract_version = 1",
     )
     .bind(request.job_id)
+    .bind(target_contract_version)
     .bind(now)
     .execute(&mut **tx)
     .await
@@ -247,8 +339,8 @@ pub(crate) async fn validate_admitted_job_outputs(
     request: &AttachJob,
 ) -> Result<(), AdmissionError> {
     let job = lock_job(tx, request.job_id).await?;
-    validate_output_count(&job, request)?;
-    if job.economics_contract_version != 2 {
+    let dimension = validate_job_dimensions(&job, request)?;
+    if job.economics_contract_version != dimension.contract_version() {
         return Err(AdmissionError::InvalidOwner);
     }
     validate_locked_economics(tx, request.job_id, &job).await
@@ -261,6 +353,7 @@ async fn lock_job(
     sqlx::query_as(
         r#"
         SELECT tenant_id, operation, provider_id, model, requested_units,
+               output_count, billable_units, billing_metric, billing_unit,
                economics_contract_version
         FROM jobs
         WHERE job_id = $1 AND state IN ('reserved', 'queued', 'running', 'succeeded', 'failed', 'uncertain')
@@ -274,20 +367,21 @@ async fn lock_job(
     .ok_or(AdmissionError::InvalidOwner)
 }
 
-fn validate_output_count(job: &LockedJob, request: &AttachJob) -> Result<(), AdmissionError> {
-    if !(1..=MAX_IMAGE_OUTPUTS).contains(&job.requested_units) {
-        return Err(AdmissionError::InvalidCommand);
-    }
+fn validate_job_dimensions(
+    job: &LockedJob,
+    request: &AttachJob,
+) -> Result<BillingDimension, AdmissionError> {
+    let dimension = BillingDimension::from_job(job)?;
     if let Some(command_count) = request.command_json.get("n") {
         let command_count = command_count
             .as_u64()
             .and_then(|value| i32::try_from(value).ok())
             .ok_or(AdmissionError::InvalidCommand)?;
-        if command_count != job.requested_units {
+        if command_count != job.output_count {
             return Err(AdmissionError::InvalidCommand);
         }
     }
-    Ok(())
+    Ok(dimension)
 }
 
 async fn select_price(
@@ -295,18 +389,34 @@ async fn select_price(
     api_profile: &str,
     job: &LockedJob,
 ) -> Result<PriceVersion, AdmissionError> {
-    sqlx::query_as(
+    let price: PriceVersion = sqlx::query_as(
         r#"
-        SELECT price_version_id, currency, success_micros, failed_micros, no_effect_micros
-        FROM price_versions
+        WITH requested_profile AS (
+            SELECT COALESCE(
+                (SELECT pricing_api_profile
+                 FROM api_profile_pricing_aliases
+                 WHERE api_profile = $1),
+                $1
+            ) AS pricing_api_profile
+        )
+        SELECT price_version_id, billing_metric, billing_unit, currency,
+               success_micros, failed_micros, no_effect_micros
+        FROM price_versions, requested_profile
         WHERE state = 'active'
-          AND api_profile IN ($1, '*')
+          AND api_profile IN ($1, requested_profile.pricing_api_profile, '*')
           AND operation IN ($2, '*')
           AND provider_id IN ($3, '*')
           AND model IN ($4, '*')
+          AND billing_metric = $5
+          AND billing_unit = $6
         ORDER BY
-          ((api_profile <> '*')::INT + (operation <> '*')::INT
-           + (provider_id <> '*')::INT + (model <> '*')::INT) DESC,
+          CASE
+            WHEN api_profile = $1 THEN 2
+            WHEN api_profile = requested_profile.pricing_api_profile THEN 1
+            ELSE 0
+          END DESC,
+          ((operation <> '*')::INT + (provider_id <> '*')::INT
+           + (model <> '*')::INT) DESC,
           version DESC, price_version_id
         LIMIT 1
         FOR SHARE
@@ -316,10 +426,16 @@ async fn select_price(
     .bind(&job.operation)
     .bind(&job.provider_id)
     .bind(&job.model)
+    .bind(&job.billing_metric)
+    .bind(&job.billing_unit)
     .fetch_optional(&mut **tx)
     .await
     .map_err(unavailable)?
-    .ok_or(AdmissionError::PricingUnavailable)
+    .ok_or(AdmissionError::PricingUnavailable)?;
+    if job.billing_metric == VIDEO_SECOND_BILLING_METRIC && price.success_micros <= 0 {
+        return Err(AdmissionError::PricingUnavailable);
+    }
+    Ok(price)
 }
 
 async fn validate_locked_economics(
@@ -329,10 +445,15 @@ async fn validate_locked_economics(
 ) -> Result<(), AdmissionError> {
     let quote: FrozenQuote = sqlx::query_as(
         r#"
-        SELECT quote_id, price_version_id, currency, output_count, success_micros,
-               failed_micros, no_effect_micros, max_total_micros, quote_hash
-        FROM price_quotes
-        WHERE job_id = $1
+        SELECT q.quote_id, q.price_version_id, q.currency, q.output_count,
+               q.billable_units, q.billing_metric, q.billing_unit,
+               p.billing_metric AS price_billing_metric,
+               p.billing_unit AS price_billing_unit,
+               q.success_micros, q.failed_micros, q.no_effect_micros,
+               q.max_total_micros, q.quote_hash
+        FROM price_quotes q
+        JOIN price_versions p ON p.price_version_id = q.price_version_id
+        WHERE q.job_id = $1
         "#,
     )
     .bind(job_id)
@@ -340,31 +461,54 @@ async fn validate_locked_economics(
     .await
     .map_err(unavailable)?
     .ok_or(AdmissionError::InvalidOwner)?;
-    let expected_hash = quote_hash(
-        job_id,
-        &PriceVersion {
-            price_version_id: quote.price_version_id,
-            currency: quote.currency.clone(),
-            success_micros: quote.success_micros,
-            failed_micros: quote.failed_micros,
-            no_effect_micros: quote.no_effect_micros,
-        },
-        quote.output_count,
-        quote.max_total_micros,
-    );
-    if quote.output_count != job.requested_units || quote.quote_hash != expected_hash {
+    let price = PriceVersion {
+        price_version_id: quote.price_version_id,
+        billing_metric: quote.price_billing_metric.clone(),
+        billing_unit: quote.price_billing_unit.clone(),
+        currency: quote.currency.clone(),
+        success_micros: quote.success_micros,
+        failed_micros: quote.failed_micros,
+        no_effect_micros: quote.no_effect_micros,
+    };
+    let expected_hash = quote_hash(job_id, &price, job, quote.max_total_micros);
+    let legacy_v2_hash =
+        legacy_v2_quote_hash(job_id, &price, quote.output_count, quote.max_total_micros);
+    let hash_valid = quote.quote_hash == expected_hash
+        || (job.economics_contract_version == 2
+            && job.billing_metric == OUTPUT_BILLING_METRIC
+            && job.billing_unit == OUTPUT_BILLING_UNIT
+            && quote.quote_hash == legacy_v2_hash);
+    let expected_max_total_micros = quote
+        .success_micros
+        .max(quote.failed_micros)
+        .max(quote.no_effect_micros)
+        .checked_mul(i64::from(job.billable_units));
+    if quote.output_count != job.output_count
+        || quote.billable_units != i64::from(job.billable_units)
+        || quote.billing_metric != job.billing_metric
+        || quote.billing_unit != job.billing_unit
+        || quote.price_billing_metric != job.billing_metric
+        || quote.price_billing_unit != job.billing_unit
+        || expected_max_total_micros != Some(quote.max_total_micros)
+        || !hash_valid
+    {
         return Err(AdmissionError::InvalidOwner);
     }
-    let (output_count, min_index, max_index, hold_count, held_total): (
-        i64,
-        Option<i32>,
-        Option<i32>,
-        i64,
-        i64,
-    ) = sqlx::query_as(
+    let expected_output_billable_units =
+        BillingDimension::from_job(job)?.output_billable_units(job.billable_units);
+    let outputs: FrozenOutputSet = sqlx::query_as(
         r#"
-        SELECT COUNT(*)::BIGINT, MIN(o.output_index), MAX(o.output_index),
-               COUNT(h.output_id)::BIGINT, COALESCE(SUM(h.held_micros), 0)::BIGINT
+        SELECT COUNT(*)::BIGINT AS output_count,
+               MIN(o.output_index) AS min_index,
+               MAX(o.output_index) AS max_index,
+               MIN(o.billable_units) AS min_billable_units,
+               MAX(o.billable_units) AS max_billable_units,
+               COUNT(h.output_id)::BIGINT AS hold_count,
+               BOOL_AND(
+                   h.held_micros = o.billable_units::BIGINT
+                       * GREATEST($3::BIGINT, $4::BIGINT, $5::BIGINT)
+               ) AS holds_match_weights,
+               COALESCE(SUM(h.held_micros), 0)::BIGINT AS held_total
         FROM job_outputs o
         LEFT JOIN output_holds h
           ON h.output_id = o.output_id AND h.job_id = o.job_id AND h.quote_id = $2
@@ -373,14 +517,20 @@ async fn validate_locked_economics(
     )
     .bind(job_id)
     .bind(quote.quote_id)
+    .bind(quote.success_micros)
+    .bind(quote.failed_micros)
+    .bind(quote.no_effect_micros)
     .fetch_one(&mut **tx)
     .await
     .map_err(unavailable)?;
-    if output_count != i64::from(job.requested_units)
-        || hold_count != output_count
-        || min_index != Some(0)
-        || max_index != Some(job.requested_units - 1)
-        || held_total != quote.max_total_micros
+    if outputs.output_count != i64::from(job.output_count)
+        || outputs.hold_count != outputs.output_count
+        || outputs.min_index != Some(0)
+        || outputs.max_index != Some(job.output_count - 1)
+        || outputs.min_billable_units != Some(expected_output_billable_units)
+        || outputs.max_billable_units != Some(expected_output_billable_units)
+        || outputs.holds_match_weights != Some(true)
+        || outputs.held_total != quote.max_total_micros
     {
         return Err(AdmissionError::InvalidOwner);
     }
@@ -390,11 +540,31 @@ async fn validate_locked_economics(
 fn quote_hash(
     job_id: Uuid,
     price: &PriceVersion,
+    job: &LockedJob,
+    max_total_micros: i64,
+) -> String {
+    hash_quote_parts([
+        job_id.to_string(),
+        price.price_version_id.to_string(),
+        price.billing_metric.clone(),
+        price.billing_unit.clone(),
+        price.currency.clone(),
+        job.output_count.to_string(),
+        job.billable_units.to_string(),
+        price.success_micros.to_string(),
+        price.failed_micros.to_string(),
+        price.no_effect_micros.to_string(),
+        max_total_micros.to_string(),
+    ])
+}
+
+fn legacy_v2_quote_hash(
+    job_id: Uuid,
+    price: &PriceVersion,
     output_count: i32,
     max_total_micros: i64,
 ) -> String {
-    let mut hasher = Sha256::new();
-    for part in [
+    hash_quote_parts([
         job_id.to_string(),
         price.price_version_id.to_string(),
         price.currency.clone(),
@@ -403,7 +573,12 @@ fn quote_hash(
         price.failed_micros.to_string(),
         price.no_effect_micros.to_string(),
         max_total_micros.to_string(),
-    ] {
+    ])
+}
+
+fn hash_quote_parts<const N: usize>(parts: [String; N]) -> String {
+    let mut hasher = Sha256::new();
+    for part in parts {
         hasher.update((part.len() as u64).to_be_bytes());
         hasher.update(part.as_bytes());
     }
@@ -436,7 +611,9 @@ pub(crate) async fn settle_receipt_in_transaction(
         .await
         .map_err(economic_unavailable)?;
     let locked_job: Option<Uuid> =
-        sqlx::query_scalar("SELECT job_id FROM jobs WHERE job_id = $1 FOR UPDATE")
+        sqlx::query_scalar(
+            "SELECT job_id FROM jobs WHERE job_id = $1 AND economics_contract_version IN (2, 3) FOR UPDATE",
+        )
             .bind(snapshot.job_id)
             .fetch_optional(&mut *tx)
             .await
@@ -446,13 +623,20 @@ pub(crate) async fn settle_receipt_in_transaction(
     }
     let output: LockedEconomicOutput = sqlx::query_as(
         r#"
-            SELECT o.state AS output_state, h.state AS hold_state, h.held_micros,
-                   q.quote_id, q.currency, q.success_micros, q.failed_micros,
-                   q.no_effect_micros
+            SELECT j.economics_contract_version, o.state AS output_state, o.billable_units,
+                   h.state AS hold_state, h.held_micros,
+                   q.quote_id, q.currency, q.billing_metric, q.billing_unit,
+                   q.billable_units AS quote_billable_units,
+                   q.success_micros, q.failed_micros, q.no_effect_micros
             FROM job_outputs o
             JOIN output_holds h ON h.output_id = o.output_id AND h.job_id = o.job_id
             JOIN price_quotes q ON q.quote_id = h.quote_id AND q.job_id = o.job_id
+            JOIN jobs j ON j.job_id = o.job_id
             WHERE o.output_id = $1 AND o.job_id = $2
+              AND q.output_count = j.output_count
+              AND q.billable_units = j.billable_units
+              AND q.billing_metric = j.billing_metric
+              AND q.billing_unit = j.billing_unit
             FOR UPDATE OF o, h
             "#,
     )
@@ -462,6 +646,7 @@ pub(crate) async fn settle_receipt_in_transaction(
     .await
     .map_err(economic_unavailable)?
     .ok_or(EconomicSettlementError::Conflict)?;
+    validate_locked_output(&output)?;
     let locked: SubmissionIdentity = sqlx::query_as(
         r#"
             SELECT output_id, job_id, tenant_id, provider_id,
@@ -518,13 +703,8 @@ pub(crate) async fn settle_receipt_in_transaction(
     .bind(&receipt.receipt_schema)
     .bind(&receipt.payload_hash)
     .bind(&receipt.evidence)
-    .bind(
-        receipt
-            .provider_cost
-            .as_ref()
-            .map(|cost| cost.amount_micros),
-    )
-    .bind(receipt.provider_cost.as_ref().map(|cost| &cost.currency))
+    .bind(Option::<i64>::None)
+    .bind(Option::<String>::None)
     .bind(now)
     .execute(&mut *tx)
     .await
@@ -536,13 +716,17 @@ pub(crate) async fn settle_receipt_in_transaction(
     } else {
         "output_terminal"
     };
-    let quantity = i64::from(receipt.outcome != EconomicReceiptOutcome::Uncertain);
+    let quantity = if receipt.outcome == EconomicReceiptOutcome::Uncertain {
+        0
+    } else {
+        i64::from(output.billable_units)
+    };
     sqlx::query(
         r#"
             INSERT INTO economic_metering_events
               (meter_event_id, semantic_key, output_id, job_id, submission_id, receipt_id,
                fact_kind, metric, quantity, unit, outcome, created_at_ms)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, 'image_output', $8, 'output', $9, $10)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
             "#,
     )
     .bind(meter_event_id)
@@ -552,7 +736,9 @@ pub(crate) async fn settle_receipt_in_transaction(
     .bind(receipt.submission_id)
     .bind(receipt_id)
     .bind(fact_kind)
+    .bind(&output.billing_metric)
     .bind(quantity)
+    .bind(&output.billing_unit)
     .bind(receipt.outcome.as_str())
     .bind(now)
     .execute(&mut *tx)
@@ -591,7 +777,10 @@ pub(crate) async fn settle_receipt_in_transaction(
         EconomicReceiptOutcome::NoEffect => output.no_effect_micros,
         EconomicReceiptOutcome::Uncertain => unreachable!(),
     };
-    if unit_price_micros > output.held_micros {
+    let amount_micros = unit_price_micros
+        .checked_mul(quantity)
+        .ok_or(EconomicSettlementError::Conflict)?;
+    if amount_micros > output.held_micros {
         return Err(EconomicSettlementError::Conflict);
     }
     let rated_usage_id = Uuid::new_v4();
@@ -600,7 +789,7 @@ pub(crate) async fn settle_receipt_in_transaction(
             INSERT INTO rated_usage
               (rated_usage_id, semantic_key, meter_event_id, output_id, job_id, quote_id,
                outcome, quantity, unit_price_micros, amount_micros, currency, created_at_ms)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, 1, $8, $8, $9, $10)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
             "#,
     )
     .bind(rated_usage_id)
@@ -610,14 +799,16 @@ pub(crate) async fn settle_receipt_in_transaction(
     .bind(snapshot.job_id)
     .bind(output.quote_id)
     .bind(receipt.outcome.as_str())
+    .bind(quantity)
     .bind(unit_price_micros)
+    .bind(amount_micros)
     .bind(&output.currency)
     .bind(now)
     .execute(&mut *tx)
     .await
     .map_err(economic_unavailable)?;
-    settle_hold_and_account(&mut tx, &snapshot, &output, unit_price_micros, now).await?;
-    let customer_ledger_transaction_id = if unit_price_micros == 0 {
+    settle_hold_and_account(&mut tx, &snapshot, &output, amount_micros, now).await?;
+    let customer_ledger_transaction_id = if amount_micros == 0 {
         None
     } else {
         Some(
@@ -630,7 +821,7 @@ pub(crate) async fn settle_receipt_in_transaction(
                 receipt_id,
                 "customer_charge",
                 &output.currency,
-                unit_price_micros,
+                amount_micros,
                 &format!(
                     "tenant:{}:{}:receivable",
                     snapshot.tenant_id, output.currency
@@ -647,34 +838,6 @@ pub(crate) async fn settle_receipt_in_transaction(
             .await?,
         )
     };
-    if let Some(cost) = &receipt.provider_cost
-        && cost.amount_micros > 0
-    {
-        insert_ledger_pair(
-            &mut tx,
-            &format!("provider-cost:{semantic_key}"),
-            snapshot.output_id,
-            snapshot.job_id,
-            receipt.submission_id,
-            receipt_id,
-            "provider_cost",
-            &cost.currency,
-            cost.amount_micros,
-            &format!("platform:{}:provider-expense", cost.currency),
-            "platform",
-            "platform",
-            "expense",
-            &format!(
-                "provider:{}:{}:payable",
-                snapshot.provider_id, cost.currency
-            ),
-            "provider",
-            &snapshot.provider_id,
-            "payable",
-            now,
-        )
-        .await?;
-    }
     let (output_state, error_code) = match receipt.outcome {
         EconomicReceiptOutcome::Succeeded => ("succeeded", None),
         EconomicReceiptOutcome::Failed => ("failed", Some("provider_failed")),
@@ -712,6 +875,126 @@ pub(crate) async fn settle_receipt_in_transaction(
     Ok(settlement)
 }
 
+pub(crate) async fn record_v4_provider_receipt_in_transaction(
+    transaction: &mut Transaction<'_, Postgres>,
+    receipt: &EconomicReceipt,
+) -> Result<ProviderReceiptRecord, EconomicSettlementError> {
+    let mut tx = transaction.begin().await.map_err(economic_unavailable)?;
+    validate_receipt(receipt)?;
+    let snapshot = load_submission_identity(&mut tx, receipt.submission_id).await?;
+    let contract_version: Option<i16> = sqlx::query_scalar(
+        "SELECT economics_contract_version FROM jobs WHERE job_id = $1 AND tenant_id = $2",
+    )
+    .bind(snapshot.job_id)
+    .bind(&snapshot.tenant_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(economic_unavailable)?;
+    if contract_version != Some(4) {
+        return Err(EconomicSettlementError::Conflict);
+    }
+    let locked: SubmissionIdentity = sqlx::query_as(
+        r#"
+        SELECT output_id, job_id, tenant_id, provider_id,
+               state AS submission_state, error_code AS submission_error_code,
+               result_manifest_id
+        FROM provider_submissions
+        WHERE submission_id = $1
+        FOR UPDATE
+        "#,
+    )
+    .bind(receipt.submission_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(economic_unavailable)?
+    .ok_or(EconomicSettlementError::Conflict)?;
+    if locked.output_id != snapshot.output_id
+        || locked.job_id != snapshot.job_id
+        || locked.tenant_id != snapshot.tenant_id
+        || locked.provider_id != snapshot.provider_id
+    {
+        return Err(EconomicSettlementError::Conflict);
+    }
+    validate_provider_evidence(&locked, receipt)?;
+
+    if let Some(stored) = load_stored_receipt(&mut tx, receipt.submission_id).await? {
+        validate_stored_receipt(&stored, receipt)?;
+        validate_v4_provider_cost_ledger(&mut tx, stored.receipt_id).await?;
+        let record = ProviderReceiptRecord {
+            receipt_id: stored.receipt_id,
+            outcome: receipt.outcome,
+        };
+        tx.commit().await.map_err(economic_unavailable)?;
+        return Ok(record);
+    }
+
+    let now = economic_database_now(&mut tx).await?;
+    let receipt_id = Uuid::new_v4();
+    let semantic_key = receipt_semantic_key(receipt);
+    sqlx::query(
+        r#"
+        INSERT INTO provider_receipts (
+            receipt_id, semantic_key, submission_id, output_id, job_id,
+            provider_id, outcome, receipt_schema, payload_hash, evidence,
+            provider_cost_micros, provider_cost_currency, created_at_ms
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+        "#,
+    )
+    .bind(receipt_id)
+    .bind(&semantic_key)
+    .bind(receipt.submission_id)
+    .bind(snapshot.output_id)
+    .bind(snapshot.job_id)
+    .bind(&snapshot.provider_id)
+    .bind(receipt.outcome.as_str())
+    .bind(&receipt.receipt_schema)
+    .bind(&receipt.payload_hash)
+    .bind(&receipt.evidence)
+    .bind(Option::<i64>::None)
+    .bind(Option::<String>::None)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .map_err(economic_unavailable)?;
+    let record = ProviderReceiptRecord {
+        receipt_id,
+        outcome: receipt.outcome,
+    };
+    tx.commit().await.map_err(economic_unavailable)?;
+    Ok(record)
+}
+
+fn validate_locked_output(output: &LockedEconomicOutput) -> Result<(), EconomicSettlementError> {
+    let billable_units = i64::from(output.billable_units);
+    let dimensions_valid = billable_units > 0
+        && match (output.billing_metric.as_str(), output.billing_unit.as_str()) {
+            (OUTPUT_BILLING_METRIC, OUTPUT_BILLING_UNIT) => {
+                output.economics_contract_version == 2 && output.billable_units == 1
+            }
+            (REQUEST_BILLING_METRIC, REQUEST_BILLING_UNIT) => {
+                output.economics_contract_version == 2
+                    && output.billable_units == 1
+                    && output.quote_billable_units == 1
+            }
+            (VIDEO_SECOND_BILLING_METRIC, VIDEO_SECOND_BILLING_UNIT) => {
+                output.economics_contract_version == 3
+                    && billable_units == output.quote_billable_units
+            }
+            _ => false,
+        };
+    let expected_hold = output
+        .success_micros
+        .max(output.failed_micros)
+        .max(output.no_effect_micros)
+        .checked_mul(billable_units);
+    if dimensions_valid && expected_hold == Some(output.held_micros) {
+        Ok(())
+    } else {
+        Err(EconomicSettlementError::Conflict)
+    }
+}
+
 pub(super) fn validate_receipt(receipt: &EconomicReceipt) -> Result<(), EconomicSettlementError> {
     let schema_valid = !receipt.receipt_schema.is_empty()
         && receipt.receipt_schema.len() <= 128
@@ -724,19 +1007,9 @@ pub(super) fn validate_receipt(receipt: &EconomicReceipt) -> Result<(), Economic
             .payload_hash
             .bytes()
             .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'));
-    let cost_valid = receipt.provider_cost.as_ref().is_none_or(|cost| {
-        cost.amount_micros >= 0
-            && cost.currency.len() == 3
-            && cost.currency.bytes().all(|byte| byte.is_ascii_uppercase())
-    });
     let evidence_hash_matches =
         evidence_hash(&receipt.evidence).is_ok_and(|expected| expected == receipt.payload_hash);
-    if schema_valid
-        && hash_valid
-        && evidence_hash_matches
-        && receipt.evidence.is_object()
-        && cost_valid
-    {
+    if schema_valid && hash_valid && evidence_hash_matches && receipt.evidence.is_object() {
         Ok(())
     } else {
         Err(EconomicSettlementError::InvalidInput)
@@ -817,21 +1090,7 @@ async fn replay_settlement(
     stored: &StoredReceipt,
     receipt: &EconomicReceipt,
 ) -> Result<EconomicSettlement, EconomicSettlementError> {
-    let stored_cost = stored
-        .provider_cost_micros
-        .zip(stored.provider_cost_currency.clone());
-    let requested_cost = receipt
-        .provider_cost
-        .as_ref()
-        .map(|cost| (cost.amount_micros, cost.currency.clone()));
-    if stored.outcome != receipt.outcome.as_str()
-        || stored.receipt_schema != receipt.receipt_schema
-        || stored.payload_hash != receipt.payload_hash
-        || stored.evidence != receipt.evidence
-        || stored_cost != requested_cost
-    {
-        return Err(EconomicSettlementError::Conflict);
-    }
+    validate_stored_receipt(stored, receipt)?;
     let row: Option<(Uuid, Option<Uuid>, Option<Uuid>)> = sqlx::query_as(
         r#"
         SELECT m.meter_event_id, r.rated_usage_id,
@@ -856,6 +1115,48 @@ async fn replay_settlement(
         customer_ledger_transaction_id,
         outcome: receipt.outcome,
     })
+}
+
+fn validate_stored_receipt(
+    stored: &StoredReceipt,
+    receipt: &EconomicReceipt,
+) -> Result<(), EconomicSettlementError> {
+    if stored.outcome == receipt.outcome.as_str()
+        && stored.receipt_schema == receipt.receipt_schema
+        && stored.payload_hash == receipt.payload_hash
+        && stored.evidence == receipt.evidence
+        && stored.provider_cost_micros.is_none()
+        && stored.provider_cost_currency.is_none()
+    {
+        Ok(())
+    } else {
+        Err(EconomicSettlementError::Conflict)
+    }
+}
+
+async fn validate_v4_provider_cost_ledger(
+    tx: &mut Transaction<'_, Postgres>,
+    receipt_id: Uuid,
+) -> Result<(), EconomicSettlementError> {
+    let legacy_transaction_id: Option<Uuid> = sqlx::query_scalar(
+        r#"
+        SELECT transaction.transaction_id
+        FROM ledger_transactions transaction
+        WHERE transaction.source_receipt_id = $1
+          AND transaction.transaction_type = 'provider_cost'
+          AND transaction.source_provider_cost_observation_id IS NULL
+          AND transaction.source_provider_cost_allocation_line_id IS NULL
+        "#,
+    )
+    .bind(receipt_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(economic_unavailable)?;
+    if legacy_transaction_id.is_none() {
+        Ok(())
+    } else {
+        Err(EconomicSettlementError::Conflict)
+    }
 }
 
 async fn settle_hold_and_account(
@@ -1085,4 +1386,144 @@ fn economic_unavailable(_: sqlx::Error) -> EconomicSettlementError {
 
 fn unavailable(_: sqlx::Error) -> AdmissionError {
     AdmissionError::Unavailable
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn locked_job(
+        output_count: i32,
+        billable_units: i32,
+        billing_metric: &str,
+        billing_unit: &str,
+        economics_contract_version: i16,
+    ) -> LockedJob {
+        LockedJob {
+            tenant_id: "tenant-a".to_owned(),
+            operation: "generation".to_owned(),
+            provider_id: "provider-a".to_owned(),
+            model: "model-a".to_owned(),
+            requested_units: billable_units,
+            output_count,
+            billable_units,
+            billing_metric: billing_metric.to_owned(),
+            billing_unit: billing_unit.to_owned(),
+            economics_contract_version,
+        }
+    }
+
+    fn price(billing_metric: &str, billing_unit: &str) -> PriceVersion {
+        PriceVersion {
+            price_version_id: Uuid::from_u128(1),
+            billing_metric: billing_metric.to_owned(),
+            billing_unit: billing_unit.to_owned(),
+            currency: "USD".to_owned(),
+            success_micros: 7,
+            failed_micros: 3,
+            no_effect_micros: 0,
+        }
+    }
+
+    #[test]
+    fn billing_dimensions_keep_output_cardinality_separate_from_quantity() {
+        let image = locked_job(3, 3, OUTPUT_BILLING_METRIC, OUTPUT_BILLING_UNIT, 2);
+        let video = locked_job(
+            1,
+            6,
+            VIDEO_SECOND_BILLING_METRIC,
+            VIDEO_SECOND_BILLING_UNIT,
+            3,
+        );
+
+        let image_dimension = BillingDimension::from_job(&image).unwrap();
+        let video_dimension = BillingDimension::from_job(&video).unwrap();
+        assert_eq!(image_dimension.contract_version(), 2);
+        assert_eq!(
+            image_dimension.output_billable_units(image.billable_units),
+            1
+        );
+        assert_eq!(video_dimension.contract_version(), 3);
+        assert_eq!(
+            video_dimension.output_billable_units(video.billable_units),
+            6
+        );
+
+        let invalid = locked_job(
+            6,
+            6,
+            VIDEO_SECOND_BILLING_METRIC,
+            VIDEO_SECOND_BILLING_UNIT,
+            3,
+        );
+        assert!(BillingDimension::from_job(&invalid).is_err());
+    }
+
+    #[test]
+    fn quote_hash_binds_metric_unit_cardinality_and_billable_quantity() {
+        let image = locked_job(6, 6, OUTPUT_BILLING_METRIC, OUTPUT_BILLING_UNIT, 2);
+        let video_six = locked_job(
+            1,
+            6,
+            VIDEO_SECOND_BILLING_METRIC,
+            VIDEO_SECOND_BILLING_UNIT,
+            3,
+        );
+        let video_ten = locked_job(
+            1,
+            10,
+            VIDEO_SECOND_BILLING_METRIC,
+            VIDEO_SECOND_BILLING_UNIT,
+            3,
+        );
+        let job_id = Uuid::from_u128(2);
+
+        let image_hash = quote_hash(
+            job_id,
+            &price(OUTPUT_BILLING_METRIC, OUTPUT_BILLING_UNIT),
+            &image,
+            42,
+        );
+        let video_six_hash = quote_hash(
+            job_id,
+            &price(VIDEO_SECOND_BILLING_METRIC, VIDEO_SECOND_BILLING_UNIT),
+            &video_six,
+            42,
+        );
+        let video_ten_hash = quote_hash(
+            job_id,
+            &price(VIDEO_SECOND_BILLING_METRIC, VIDEO_SECOND_BILLING_UNIT),
+            &video_ten,
+            70,
+        );
+
+        assert_ne!(image_hash, video_six_hash);
+        assert_ne!(video_six_hash, video_ten_hash);
+    }
+
+    #[test]
+    fn settlement_capture_uses_the_outputs_billable_weight() {
+        let video = LockedEconomicOutput {
+            economics_contract_version: 3,
+            output_state: "running".to_owned(),
+            billable_units: 6,
+            hold_state: "held".to_owned(),
+            held_micros: 42,
+            quote_id: Uuid::from_u128(3),
+            currency: "USD".to_owned(),
+            billing_metric: VIDEO_SECOND_BILLING_METRIC.to_owned(),
+            billing_unit: VIDEO_SECOND_BILLING_UNIT.to_owned(),
+            quote_billable_units: 6,
+            success_micros: 7,
+            failed_micros: 3,
+            no_effect_micros: 0,
+        };
+
+        assert!(validate_locked_output(&video).is_ok());
+        let wrong_contract = LockedEconomicOutput {
+            economics_contract_version: 2,
+            ..video
+        };
+        assert!(validate_locked_output(&wrong_contract).is_err());
+    }
 }

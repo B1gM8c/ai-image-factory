@@ -7,13 +7,13 @@
   "scripts": {
     "dev:admin": "npm --workspace apps/admin-console run dev",
     "build:admin": "npm --workspace apps/admin-console run build",
+    "start:admin": "npm --workspace apps/admin-console run start",
     "typecheck:admin": "npm --workspace apps/admin-console run typecheck",
     "test:api": "cargo test --workspace",
     "smoke:codex": "cargo test -p gpt-image-2-gateway --test codex_smoke -- --ignored --nocapture"
   },
   "overrides": {
-    "next": {
-      "postcss": "8.5.16"
-    }
+    "postcss": "8.5.24",
+    "sharp": "0.35.3"
   }
 }

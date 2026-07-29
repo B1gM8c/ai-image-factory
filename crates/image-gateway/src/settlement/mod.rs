@@ -40,20 +40,100 @@ pub trait ExecutionSettlementStore: Send + Sync + 'static {
     async fn load_generation_result(
         &self,
         job_id: uuid::Uuid,
-    ) -> Result<Option<StoredGenerationResult>, ImageGatewayError>;
+    ) -> Result<GenerationResultLookup, ImageGatewayError>;
 
     async fn generation_status(
         &self,
         job_id: uuid::Uuid,
     ) -> Result<GenerationResultStatus, ImageGatewayError>;
+
+    async fn video_status(
+        &self,
+        _tenant_id: &str,
+        _job_id: uuid::Uuid,
+    ) -> Result<Option<VideoResultStatus>, ImageGatewayError> {
+        Ok(None)
+    }
+
+    async fn project_video_status(
+        &self,
+        _tenant_id: &str,
+        _project_id: &str,
+        _actor_user_id: Option<uuid::Uuid>,
+        _job_id: uuid::Uuid,
+    ) -> Result<Option<VideoResultStatus>, ImageGatewayError> {
+        Ok(None)
+    }
+
+    async fn load_video_artifact(
+        &self,
+        _tenant_id: &str,
+        _artifact_id: uuid::Uuid,
+    ) -> Result<Option<StoredVideoArtifact>, ImageGatewayError> {
+        Ok(None)
+    }
+
+    async fn load_project_video_artifact(
+        &self,
+        _tenant_id: &str,
+        _project_id: &str,
+        _actor_user_id: Option<uuid::Uuid>,
+        _artifact_id: uuid::Uuid,
+    ) -> Result<Option<StoredVideoArtifact>, ImageGatewayError> {
+        Ok(None)
+    }
 }
 
 #[derive(Debug)]
 pub enum GenerationResultStatus {
     Pending,
     Succeeded(StoredGenerationResult),
+    Expired,
     Failed { error_code: Option<String> },
     Uncertain,
+}
+
+#[derive(Debug)]
+pub enum GenerationResultLookup {
+    Available(StoredGenerationResult),
+    Expired,
+    Missing,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub enum VideoResultStatus {
+    Pending {
+        model: String,
+        duration: u8,
+        stage: VideoPendingStage,
+    },
+    Succeeded {
+        model: String,
+        duration: u8,
+        artifact_id: uuid::Uuid,
+    },
+    Failed {
+        model: String,
+        duration: u8,
+        error_code: Option<String>,
+    },
+    Uncertain {
+        model: String,
+        duration: u8,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VideoPendingStage {
+    Queued,
+    Dispatching,
+    Processing,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub struct StoredVideoArtifact {
+    pub media_type: String,
+    pub bytes: Vec<u8>,
 }
 
 pub(crate) struct SequentialExecutionSettlementStore {
@@ -129,7 +209,7 @@ impl ExecutionSettlementStore for SequentialExecutionSettlementStore {
     async fn load_generation_result(
         &self,
         job_id: uuid::Uuid,
-    ) -> Result<Option<StoredGenerationResult>, ImageGatewayError> {
+    ) -> Result<GenerationResultLookup, ImageGatewayError> {
         let manifest = self
             .results
             .lock()
@@ -139,8 +219,8 @@ impl ExecutionSettlementStore for SequentialExecutionSettlementStore {
         match manifest {
             Some(manifest) => hydrate_generation_result(self.artifact_store.as_ref(), manifest)
                 .await
-                .map(Some),
-            None => Ok(None),
+                .map(GenerationResultLookup::Available),
+            None => Ok(GenerationResultLookup::Missing),
         }
     }
 
@@ -149,8 +229,11 @@ impl ExecutionSettlementStore for SequentialExecutionSettlementStore {
         job_id: uuid::Uuid,
     ) -> Result<GenerationResultStatus, ImageGatewayError> {
         match self.load_generation_result(job_id).await? {
-            Some(result) => Ok(GenerationResultStatus::Succeeded(result)),
-            None => Ok(GenerationResultStatus::Pending),
+            GenerationResultLookup::Available(result) => {
+                Ok(GenerationResultStatus::Succeeded(result))
+            }
+            GenerationResultLookup::Expired => Ok(GenerationResultStatus::Expired),
+            GenerationResultLookup::Missing => Ok(GenerationResultStatus::Pending),
         }
     }
 }
@@ -160,7 +243,7 @@ pub(super) fn validate_generation_result(
     reservation: &UsageReservation,
     result: &GenerationResultManifest,
 ) -> Result<(), ImageGatewayError> {
-    let artifacts_match = result.artifacts.len() == reservation.charge.units as usize
+    let artifacts_match = result.artifacts.len() == reservation.charge.output_count as usize
         && result
             .artifacts
             .iter()
@@ -204,7 +287,8 @@ fn map_admission_error(error: AdmissionError) -> ImageGatewayError {
         AdmissionError::Expired => ImageGatewayError::timeout(),
         AdmissionError::Unavailable
         | AdmissionError::PricingUnavailable
-        | AdmissionError::BillingLimitExceeded => {
+        | AdmissionError::BillingLimitExceeded
+        | AdmissionError::ProjectBudgetExceeded => {
             ImageGatewayError::service_unavailable("admission settlement unavailable")
         }
         AdmissionError::InvalidOwner

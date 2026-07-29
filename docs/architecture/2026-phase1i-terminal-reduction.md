@@ -143,11 +143,10 @@ proving provider no-effect.
 
 ## 7. Activation Gate
 
-The public generation route supports an explicit, default-off V2 selection via
-`GATEWAY_IMAGES_GENERATION_CONTRACT=output-economics-v2`. Fake full-process
+The public image routes require an explicit contract selection via
+`GATEWAY_IMAGES_GENERATION_CONTRACT`; production customer pricing uses
+`customer-pricing-v4` for both generations and edits. Fake full-process
 proof is complete. A credentialed real Codex `size=auto` request also traversed
 the full V2 topology on 2026-07-15 and replayed byte-identically without a
-second runner directory or economic graph. Edits remain LegacyV1, so activation
-requires separate Legacy and executor-handoff workerd pools. Hostile tenant
-isolation remains an external deployment gate, as defined by the Phase 1F
-runtime document.
+second runner directory or economic graph. Hostile tenant isolation remains an
+external deployment gate, as defined by the Phase 1F runtime document.

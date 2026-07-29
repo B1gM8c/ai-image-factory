@@ -657,7 +657,7 @@ async fn forged_release_case(database: &TestDatabase) -> TestResult {
     let mut forged = reservation.clone();
     forged.charge.request_id = "forged_request".to_string();
     forged.charge.operation = "edit";
-    forged.charge.units = 99;
+    forged.charge.billable_units = 99;
     require(
         store.release(&forged, "provider_failed").await.is_err(),
         "release must reject forged request metadata and units".to_string(),
@@ -796,12 +796,15 @@ async fn abort_and_await<T>(task: JoinHandle<T>) {
 fn test_charge(tenant_id: &str, request_id: &str) -> UsageCharge {
     UsageCharge {
         tenant_id: tenant_id.to_string(),
+        attribution: None,
         request_id: request_id.to_string(),
         admission_session_id: None,
         operation: "generation",
         provider_id: "openai-codex".to_string(),
         model: "gpt-image-2".to_string(),
-        units: 1,
+        output_count: 1,
+        billable_units: 1,
+        billing_metric: image_provider_contracts::BillingMetric::Output,
         limits: UsageLimits {
             five_hour_image_limit: 1,
             seven_day_image_limit: 1,

@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use image_provider_contracts::ProviderReportedCostEvidenceV1;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Postgres, Transaction};
@@ -7,7 +8,7 @@ use uuid::Uuid;
 use super::{
     ExecutorArtifactAuthority, ExecutorArtifactAuthorityStore, ExecutorClaimScope,
     ExecutorEvidenceStore, ExecutorExecutionProfile, ExecutorExecutionProfileStore,
-    ExecutorHandoffStore, ExecutorLaunchContext, ExecutorLaunchContextStore,
+    ExecutorHandoffStore, ExecutorInputObject, ExecutorLaunchContext, ExecutorLaunchContextStore,
     ExecutorResultManifest, ExecutorRunnerObservation, ExecutorSubmissionError,
     ExecutorSubmissionLease, ExecutorSubmissionOutcome, ExecutorSubmissionResume,
     ExecutorSubmissionStore, PreparedExecutorSubmission,
@@ -40,7 +41,7 @@ impl PostgresExecutorSubmissionStore {
 
 #[derive(sqlx::FromRow)]
 struct DurableCommandRow {
-    requested_units: i32,
+    output_count: i32,
     economics_contract_version: i16,
     tenant_id: String,
     provider_id: String,
@@ -147,6 +148,7 @@ struct ArtifactAuthorityRow {
     sha256_hex: String,
     byte_size: i64,
     media_type: String,
+    media_duration_ms: Option<i64>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -224,6 +226,21 @@ struct StoredObservationRow {
 }
 
 #[derive(sqlx::FromRow)]
+struct StoredProviderCostEvidenceRow {
+    scope: String,
+    provider_id: String,
+    execution_surface: String,
+    provider_operation_id: String,
+    currency: String,
+    native_unit: String,
+    native_quantity: String,
+    authority: String,
+    confidence: String,
+    evidence_hash: String,
+    evidence_path: String,
+}
+
+#[derive(sqlx::FromRow)]
 struct CapacityAllocationRow {
     state: String,
     resource_policy_id: Uuid,
@@ -242,6 +259,19 @@ struct LaunchContextRow {
     command_schema: String,
     command_hash: String,
     command_json: Value,
+}
+
+#[derive(sqlx::FromRow)]
+struct LaunchInputRow {
+    admission_session_id: Uuid,
+    input_id: Uuid,
+    role: String,
+    input_index: i16,
+    media_type: String,
+    storage_backend: String,
+    object_key: String,
+    sha256_hex: String,
+    byte_size: i64,
 }
 
 #[async_trait]
@@ -266,6 +296,11 @@ impl ExecutorLaunchContextStore for PostgresExecutorSubmissionStore {
         lease: &ExecutorSubmissionLease,
     ) -> Result<ExecutorLaunchContext, ExecutorSubmissionError> {
         validate_executor_lease(lease)?;
+        let mut tx = self.pool.begin().await.map_err(unavailable)?;
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            .execute(&mut *tx)
+            .await
+            .map_err(unavailable)?;
         let row: LaunchContextRow = sqlx::query_as(
             r#"
             WITH db_clock AS (
@@ -317,7 +352,7 @@ impl ExecutorLaunchContextStore for PostgresExecutorSubmissionStore {
         .bind(lease.executor_lease_epoch)
         .bind(lease.execution_profile_id)
         .bind(&lease.adapter_revision)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(unavailable)?
         .ok_or(ExecutorSubmissionError::StaleLease)?;
@@ -328,6 +363,51 @@ impl ExecutorLaunchContextStore for PostgresExecutorSubmissionStore {
         {
             return Err(ExecutorSubmissionError::Conflict);
         }
+        let input_rows: Vec<LaunchInputRow> = sqlx::query_as(
+            r#"
+            SELECT i.admission_session_id, i.input_id, i.role, i.input_index,
+                   i.media_type, i.storage_backend, i.object_key, i.sha256_hex, i.byte_size
+            FROM job_input_manifests m
+            JOIN job_payloads p
+              ON p.job_id = m.job_id
+             AND p.admission_session_id = m.admission_session_id
+            JOIN job_input_objects i
+              ON i.job_id = m.job_id
+             AND i.admission_session_id = m.admission_session_id
+            WHERE m.job_id = $1
+            ORDER BY i.input_index
+            "#,
+        )
+        .bind(lease.job_id)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(unavailable)?;
+        tx.commit().await.map_err(unavailable)?;
+        let inputs = input_rows
+            .into_iter()
+            .map(|input| {
+                let index = u16::try_from(input.input_index)
+                    .map_err(|_| ExecutorSubmissionError::Conflict)?;
+                let byte_size = u64::try_from(input.byte_size)
+                    .map_err(|_| ExecutorSubmissionError::Conflict)?;
+                ExecutorInputObject::new(
+                    crate::input_blobs::InputBlobRef {
+                        key: crate::input_blobs::InputBlobKey {
+                            admission_session_id: input.admission_session_id,
+                            input_id: input.input_id,
+                        },
+                        storage_backend: input.storage_backend,
+                        object_key: input.object_key,
+                        sha256_hex: input.sha256_hex,
+                        byte_size,
+                    },
+                    input.role,
+                    index,
+                    input.media_type,
+                )
+                .ok_or(ExecutorSubmissionError::Conflict)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(ExecutorLaunchContext {
             request_id: row.request_id,
             api_profile: row.api_profile,
@@ -335,6 +415,7 @@ impl ExecutorLaunchContextStore for PostgresExecutorSubmissionStore {
             command_schema: row.command_schema,
             command_hash: row.command_hash,
             command_json: row.command_json,
+            inputs,
         })
     }
 }
@@ -462,14 +543,14 @@ impl ExecutorHandoffStore for PostgresExecutorSubmissionStore {
             return Err(ExecutorSubmissionError::InvalidInput);
         }
         let mut tx = self.pool.begin().await.map_err(unavailable)?;
-        let locked = lock_durable_command(&mut tx, lease).await?;
+        let locked = lock_durable_command(&mut tx, lease, execution_profile_id).await?;
         let command = &locked.command;
         if command.command_schema != lease.command_schema
             || command.command_json != lease.command_json
         {
             return Err(ExecutorSubmissionError::Conflict);
         }
-        if command.economics_contract_version != 2 {
+        if !matches!(command.economics_contract_version, 2 | 3 | 4) {
             return Err(ExecutorSubmissionError::Conflict);
         }
         let profile = match locked.parent_state {
@@ -493,7 +574,7 @@ impl ExecutorHandoffStore for PostgresExecutorSubmissionStore {
         if matches!(locked.parent_state, HandoffParentState::Leased) {
             bind_work_execution_profile(&mut tx, lease, execution_profile_id).await?;
         }
-        let output_count = command_output_count(command.requested_units, &command.command_json)?;
+        let output_count = command_output_count(command.output_count, &command.command_json)?;
         let command_hash = command_hash(&command.command_json)?;
 
         let existing = load_existing(&mut tx, lease.job_id).await?;
@@ -856,6 +937,15 @@ impl ExecutorSubmissionStore for PostgresExecutorSubmissionStore {
             if !stored_observation_matches(&existing, &observation, &payload_hash) {
                 return Err(ExecutorSubmissionError::Conflict);
             }
+            if let Some(manifest) = outcome.manifest() {
+                let stored = load_provider_cost_evidence(&mut tx, manifest.manifest_id).await?;
+                if !stored_provider_cost_evidence_matches(
+                    stored.as_ref(),
+                    manifest.provider_reported_cost(),
+                ) {
+                    return Err(ExecutorSubmissionError::Conflict);
+                }
+            }
         } else {
             if let Some(manifest) = outcome.manifest() {
                 let authority = lock_artifact_authority(&mut tx, lease)
@@ -865,6 +955,7 @@ impl ExecutorSubmissionStore for PostgresExecutorSubmissionStore {
                     return Err(ExecutorSubmissionError::Conflict);
                 }
                 insert_result_manifest(&mut tx, lease, manifest, now).await?;
+                insert_provider_cost_evidence(&mut tx, lease, manifest, now).await?;
             }
             insert_runner_observation(&mut tx, lease, outcome, &payload_hash, now).await?;
         }
@@ -1093,10 +1184,11 @@ async fn resume_owned_execution(
 async fn lock_durable_command(
     tx: &mut Transaction<'_, Postgres>,
     lease: &WorkLease,
+    execution_profile_id: Uuid,
 ) -> Result<LockedHandoffCommand, ExecutorSubmissionError> {
     let job: Option<(i32, i16, String, String, String)> = sqlx::query_as(
         r#"
-        SELECT requested_units, economics_contract_version, tenant_id, provider_id, model
+        SELECT output_count, economics_contract_version, tenant_id, provider_id, model
         FROM jobs
         WHERE job_id = $1 AND state IN ('reserved', 'queued', 'running')
         FOR UPDATE
@@ -1106,7 +1198,7 @@ async fn lock_durable_command(
     .fetch_optional(&mut **tx)
     .await
     .map_err(unavailable)?;
-    let Some((requested_units, economics_contract_version, tenant_id, provider_id, model)) = job
+    let Some((output_count, economics_contract_version, tenant_id, provider_id, model)) = job
     else {
         return Err(ExecutorSubmissionError::StaleLease);
     };
@@ -1148,7 +1240,9 @@ async fn lock_durable_command(
         && parent
             .lease_expires_at_ms
             .is_some_and(|expires| expires > now)
-        && parent.execution_profile_id.is_none()
+        && parent
+            .execution_profile_id
+            .is_none_or(|bound_profile_id| bound_profile_id == execution_profile_id)
         && parent.work_handed_off_at_ms.is_none()
         && parent.attempt_handed_off_at_ms.is_none()
     {
@@ -1170,7 +1264,7 @@ async fn lock_durable_command(
     };
     Ok(LockedHandoffCommand {
         command: DurableCommandRow {
-            requested_units,
+            output_count,
             economics_contract_version,
             tenant_id,
             provider_id,
@@ -1197,7 +1291,7 @@ async fn load_execution_profile_by_key(
                profile.credential_ref, profile.credential_revision,
                account.credential_auth_sha256,
                profile.resource_policy_id, profile.resource_policy_revision,
-               policy.max_concurrency
+               control.desired_max_concurrency AS max_concurrency
         FROM provider_execution_profiles profile
         JOIN provider_credential_pools pool
           ON pool.credential_pool_id = profile.credential_pool_id
@@ -1211,6 +1305,8 @@ async fn load_execution_profile_by_key(
         JOIN executor_resource_policies policy
           ON policy.resource_policy_id = profile.resource_policy_id
          AND policy.revision = profile.resource_policy_revision
+        JOIN provider_account_execution_controls control
+          ON control.provider_account_id = profile.provider_account_id
         WHERE profile.profile_key = $1
         "#,
     )
@@ -1236,7 +1332,7 @@ async fn lock_active_execution_profile(
                profile.credential_ref, profile.credential_revision,
                account.credential_auth_sha256,
                profile.resource_policy_id, profile.resource_policy_revision,
-               policy.max_concurrency
+               control.desired_max_concurrency AS max_concurrency
         FROM provider_execution_profiles profile
         JOIN provider_credential_pools pool
           ON pool.credential_pool_id = profile.credential_pool_id
@@ -1250,12 +1346,14 @@ async fn lock_active_execution_profile(
         JOIN executor_resource_policies policy
           ON policy.resource_policy_id = profile.resource_policy_id
          AND policy.revision = profile.resource_policy_revision
+        JOIN provider_account_execution_controls control
+          ON control.provider_account_id = profile.provider_account_id
         WHERE profile.execution_profile_id = $1
           AND profile.state = 'enabled'
           AND pool.state = 'enabled'
           AND account.state = 'enabled'
           AND policy.state = 'enabled'
-        FOR SHARE OF profile, pool, account, policy
+        FOR SHARE OF profile, pool, account, policy, control
         "#,
     )
     .bind(execution_profile_id)
@@ -1282,7 +1380,7 @@ async fn lock_active_execution_profile_for_claim(
                profile.credential_ref, profile.credential_revision,
                account.credential_auth_sha256,
                profile.resource_policy_id, profile.resource_policy_revision,
-               policy.max_concurrency
+               control.desired_max_concurrency AS max_concurrency
         FROM provider_execution_profiles profile
         JOIN provider_credential_pools pool
           ON pool.credential_pool_id = profile.credential_pool_id
@@ -1296,12 +1394,14 @@ async fn lock_active_execution_profile_for_claim(
         JOIN executor_resource_policies policy
           ON policy.resource_policy_id = profile.resource_policy_id
          AND policy.revision = profile.resource_policy_revision
+        JOIN provider_account_execution_controls control
+          ON control.provider_account_id = profile.provider_account_id
         WHERE profile.execution_profile_id = $1
           AND profile.state = 'enabled'
           AND pool.state = 'enabled'
           AND account.state = 'enabled'
           AND policy.state = 'enabled'
-        FOR SHARE OF profile, pool, account
+        FOR SHARE OF profile, pool, account, control
         "#,
     )
     .bind(execution_profile_id)
@@ -1326,7 +1426,7 @@ async fn lock_bound_execution_profile(
                profile.credential_ref, profile.credential_revision,
                account.credential_auth_sha256,
                profile.resource_policy_id, profile.resource_policy_revision,
-               policy.max_concurrency
+               control.desired_max_concurrency AS max_concurrency
         FROM provider_execution_profiles profile
         JOIN provider_credential_pools pool
           ON pool.credential_pool_id = profile.credential_pool_id
@@ -1340,8 +1440,10 @@ async fn lock_bound_execution_profile(
         JOIN executor_resource_policies policy
           ON policy.resource_policy_id = profile.resource_policy_id
          AND policy.revision = profile.resource_policy_revision
+        JOIN provider_account_execution_controls control
+          ON control.provider_account_id = profile.provider_account_id
         WHERE profile.execution_profile_id = $1
-        FOR SHARE OF profile, pool, account, policy
+        FOR SHARE OF profile, pool, account, policy, control
         "#,
     )
     .bind(execution_profile_id)
@@ -1742,10 +1844,15 @@ async fn ensure_capacity_allocation(
     }
     let acquired = sqlx::query(
         r#"
-        UPDATE executor_resource_policies
-        SET allocated_count = allocated_count + 1
-        WHERE resource_policy_id = $1 AND revision = $2
-          AND state = 'enabled' AND allocated_count < max_concurrency
+        UPDATE executor_resource_policies policy
+        SET allocated_count = policy.allocated_count + 1
+        FROM provider_account_execution_controls control
+        WHERE policy.resource_policy_id = $1 AND policy.revision = $2
+          AND control.provider_account_id = policy.provider_account_id
+          AND control.lifecycle_state IN ('active', 'draining')
+          AND policy.state = 'enabled'
+          AND policy.allocated_count
+              < LEAST(policy.max_concurrency, control.desired_max_concurrency)
         "#,
     )
     .bind(profile.resource_policy_id)
@@ -2047,7 +2154,8 @@ async fn lock_artifact_authority(
     sqlx::query_as(
         r#"
         SELECT a.authority_id, a.storage_backend, a.storage_namespace,
-               a.object_key, a.sha256_hex, a.byte_size, a.media_type
+               a.object_key, a.sha256_hex, a.byte_size, a.media_type,
+               a.media_duration_ms
         FROM executor_artifact_authorities a
         JOIN provider_submissions s
           ON s.submission_id = a.submission_id
@@ -2093,8 +2201,8 @@ async fn insert_artifact_authority(
         INSERT INTO executor_artifact_authorities
           (authority_id, executor_execution_id, submission_id, output_id, job_id,
            storage_backend, storage_namespace, object_key, sha256_hex, byte_size,
-           media_type, created_at_ms)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+           media_type, media_duration_ms, created_at_ms)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
         "#,
     )
     .bind(authority.authority_id)
@@ -2108,6 +2216,13 @@ async fn insert_artifact_authority(
     .bind(&authority.sha256_hex)
     .bind(i64::try_from(authority.byte_size).map_err(|_| ExecutorSubmissionError::InvalidInput)?)
     .bind(&authority.media_type)
+    .bind(
+        authority
+            .media_duration_ms
+            .map(i64::try_from)
+            .transpose()
+            .map_err(|_| ExecutorSubmissionError::InvalidInput)?,
+    )
     .bind(now)
     .execute(&mut **tx)
     .await
@@ -2119,6 +2234,13 @@ fn artifact_authority_matches(
     stored: &ArtifactAuthorityRow,
     expected: &ExecutorArtifactAuthority,
 ) -> bool {
+    let stored_duration = stored
+        .media_duration_ms
+        .and_then(|value| u64::try_from(value).ok());
+    let duration_matches = stored_duration == expected.media_duration_ms
+        || (stored.media_type == "video/mp4"
+            && stored_duration.is_none()
+            && expected.media_duration_ms.is_some());
     stored.authority_id == expected.authority_id
         && stored.storage_backend == expected.storage_backend
         && stored.storage_namespace == expected.storage_namespace
@@ -2126,6 +2248,7 @@ fn artifact_authority_matches(
         && stored.sha256_hex == expected.sha256_hex
         && u64::try_from(stored.byte_size).ok() == Some(expected.byte_size)
         && stored.media_type == expected.media_type
+        && duration_matches
 }
 
 fn manifest_matches_artifact_authority(
@@ -2152,8 +2275,17 @@ fn observation_payload_hash(
     outcome: &ExecutorSubmissionOutcome,
 ) -> String {
     let mut hash = Sha256::new();
+    let version = if outcome
+        .manifest()
+        .and_then(ExecutorResultManifest::provider_reported_cost)
+        .is_some()
+    {
+        "executor-runner-observation-v3"
+    } else {
+        "executor-runner-observation-v2"
+    };
     for value in [
-        "executor-runner-observation-v2".to_string(),
+        version.to_string(),
         lease.executor_execution_id.to_string(),
         lease.submission_id.to_string(),
         lease.execution_profile_id.to_string(),
@@ -2169,6 +2301,14 @@ fn observation_payload_hash(
     ] {
         hash.update((value.len() as u64).to_be_bytes());
         hash.update(value.as_bytes());
+    }
+    if let Some(evidence) = outcome
+        .manifest()
+        .and_then(ExecutorResultManifest::provider_reported_cost)
+    {
+        let digest = evidence.canonical_sha256_v1();
+        hash.update((digest.len() as u64).to_be_bytes());
+        hash.update(digest);
     }
     hex::encode(hash.finalize())
 }
@@ -2296,6 +2436,97 @@ async fn insert_result_manifest(
     .await
     .map_err(unavailable)?;
     Ok(())
+}
+
+async fn insert_provider_cost_evidence(
+    tx: &mut Transaction<'_, Postgres>,
+    lease: &ExecutorSubmissionLease,
+    manifest: &ExecutorResultManifest,
+    now: i64,
+) -> Result<(), ExecutorSubmissionError> {
+    let Some(evidence) = manifest.provider_reported_cost() else {
+        return Ok(());
+    };
+    let observation = evidence.observation();
+    if evidence.validate().is_err() || observation.provider_id != lease.provider_id {
+        return Err(ExecutorSubmissionError::InvalidInput);
+    }
+    sqlx::query(
+        r#"
+        INSERT INTO executor_provider_cost_evidence (
+            manifest_id, executor_execution_id, submission_id, scope,
+            provider_id, execution_surface, provider_operation_id,
+            currency, native_unit, native_quantity, authority, confidence,
+            evidence_hash, evidence_path, created_at_ms
+        )
+        VALUES (
+            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10::NUMERIC,
+            $11, $12, $13, $14, $15
+        )
+        "#,
+    )
+    .bind(manifest.manifest_id)
+    .bind(lease.executor_execution_id)
+    .bind(lease.submission_id)
+    .bind(evidence.scope().as_str())
+    .bind(&observation.provider_id)
+    .bind(&observation.execution_surface)
+    .bind(&observation.provider_operation_id)
+    .bind(&observation.currency)
+    .bind(observation.native_unit.as_str())
+    .bind(observation.native_quantity.to_string())
+    .bind(observation.authority.as_str())
+    .bind(observation.confidence.as_str())
+    .bind(hex::encode(observation.evidence_hash))
+    .bind(&observation.evidence_path)
+    .bind(now)
+    .execute(&mut **tx)
+    .await
+    .map_err(unavailable)?;
+    Ok(())
+}
+
+async fn load_provider_cost_evidence(
+    tx: &mut Transaction<'_, Postgres>,
+    manifest_id: Uuid,
+) -> Result<Option<StoredProviderCostEvidenceRow>, ExecutorSubmissionError> {
+    sqlx::query_as(
+        r#"
+        SELECT scope, provider_id, execution_surface, provider_operation_id,
+               currency, native_unit, native_quantity::TEXT AS native_quantity,
+               authority, confidence, evidence_hash, evidence_path
+        FROM executor_provider_cost_evidence
+        WHERE manifest_id = $1
+        "#,
+    )
+    .bind(manifest_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(unavailable)
+}
+
+fn stored_provider_cost_evidence_matches(
+    stored: Option<&StoredProviderCostEvidenceRow>,
+    expected: Option<&ProviderReportedCostEvidenceV1>,
+) -> bool {
+    match (stored, expected) {
+        (None, None) => true,
+        (Some(stored), Some(expected)) => {
+            let observation = expected.observation();
+            stored.scope == expected.scope().as_str()
+                && stored.provider_id == observation.provider_id
+                && stored.execution_surface == observation.execution_surface
+                && stored.provider_operation_id == observation.provider_operation_id
+                && stored.currency == observation.currency
+                && stored.native_unit == observation.native_unit.as_str()
+                && stored.native_quantity == observation.native_quantity.to_string()
+                && stored.authority == observation.authority.as_str()
+                && stored.confidence == observation.confidence.as_str()
+                && stored.evidence_hash == hex::encode(observation.evidence_hash)
+                && stored.evidence_path == observation.evidence_path
+        }
+        _ => false,
+    }
 }
 
 async fn update_expired_execution(

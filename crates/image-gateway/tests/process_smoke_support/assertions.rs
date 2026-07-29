@@ -62,9 +62,15 @@ pub(crate) fn assert_executor_codex_outputs(
     files: &SmokeFiles,
     expected_invocations: usize,
 ) -> TestResult {
-    let (prompt, request_dir) =
-        codex_output_evidence(files, None, false, false, expected_invocations)?;
-    assert_prompt_semantics(&prompt, &request_dir)
+    let (prompt, _request_dir) =
+        codex_output_evidence(files, None, false, true, expected_invocations)?;
+    let argv = read_nul_strings(&files.argv_log)?;
+    let output_dir = argv_value(&argv, "--add-dir")?;
+    let final_output = Path::new(&output_dir)
+        .join("sealed-output.bin")
+        .display()
+        .to_string();
+    assert_prompt_semantics_for_output(&prompt, &final_output)
 }
 
 pub(crate) fn assert_codex_edit_outputs(
@@ -103,7 +109,12 @@ fn codex_output_evidence(
     )?;
     let argv = read_nul_strings(&files.argv_log)?;
     let request_dir = argv_value(&argv, "--cd")?;
-    assert_codex_invocation(&argv, &request_dir, expects_image)?;
+    assert_codex_invocation(
+        &argv,
+        &request_dir,
+        expects_image,
+        expected_parent_pid.is_none(),
+    )?;
     let prompt = fs::read_to_string(&files.stdin_log)
         .map_err(|error| format!("failed to read fake Codex stdin log: {error}"))?;
     let fake_pid = read_pid(&files.fake_pid_log)?;
@@ -214,6 +225,10 @@ pub(crate) fn alternate_opaque_png() -> TestResult<Vec<u8>> {
 }
 
 pub(crate) fn assert_prompt_semantics(prompt: &str, request_dir: &str) -> TestResult {
+    assert_prompt_semantics_for_output(prompt, &format!("{request_dir}/final.png"))
+}
+
+fn assert_prompt_semantics_for_output(prompt: &str, final_output: &str) -> TestResult {
     for (description, required) in [
         (
             "original prompt",
@@ -222,10 +237,7 @@ pub(crate) fn assert_prompt_semantics(prompt: &str, request_dir: &str) -> TestRe
         ("auto size", "尺寸 auto".to_string()),
         ("low quality", "质量 low".to_string()),
         ("PNG output format", "输出格式 png".to_string()),
-        (
-            "request-local final image",
-            format!("{request_dir}/final.png"),
-        ),
+        ("request-local final image", final_output.to_string()),
         (
             "no delegated AI CLI",
             "不要再启动 codex、openai 或其它 AI CLI 子进程".to_string(),
@@ -257,7 +269,12 @@ pub(crate) fn header(headers: &reqwest::header::HeaderMap, name: &str) -> TestRe
         .map_err(|error| format!("response header {name} was invalid: {error}"))
 }
 
-fn assert_codex_invocation(argv: &[String], request_dir: &str, expects_image: bool) -> TestResult {
+fn assert_codex_invocation(
+    argv: &[String],
+    request_dir: &str,
+    expects_image: bool,
+    expects_runtime_home: bool,
+) -> TestResult {
     let expected_prefix = [
         "exec",
         "--ephemeral",
@@ -280,21 +297,42 @@ fn assert_codex_invocation(argv: &[String], request_dir: &str, expects_image: bo
             "unexpected Codex argv prefix:\nactual: {argv:?}\nexpected prefix: {expected_prefix:?}"
         ),
     )?;
+    let mut argument_index = expected_prefix.len();
+    if expects_runtime_home {
+        require(
+            argv.get(argument_index).map(String::as_str) == Some("--add-dir"),
+            format!("managed Codex argv is missing --add-dir: {argv:?}"),
+        )?;
+        let runtime_home = argv
+            .get(argument_index + 1)
+            .ok_or_else(|| format!("managed Codex argv is missing runtime home: {argv:?}"))?;
+        require(
+            Path::new(runtime_home)
+                .file_name()
+                .and_then(|name| name.to_str())
+                == Some("runtime-home")
+                && Path::new(runtime_home).parent() == Path::new(request_dir).parent(),
+            format!(
+                "managed Codex runtime home is outside the request runner root: {runtime_home}"
+            ),
+        )?;
+        argument_index += 2;
+    }
     if expects_image {
         require(
-            argv.len() == expected_prefix.len() + 3
-                && argv[expected_prefix.len()] == "--image"
-                && !argv[expected_prefix.len() + 1].is_empty()
-                && argv[expected_prefix.len() + 2] == "-",
+            argv.len() == argument_index + 3
+                && argv[argument_index] == "--image"
+                && !argv[argument_index + 1].is_empty()
+                && argv[argument_index + 2] == "-",
             format!("unexpected edit Codex argv: {argv:?}"),
         )?;
         require(
-            !Path::new(&argv[expected_prefix.len() + 1]).exists(),
+            !Path::new(&argv[argument_index + 1]).exists(),
             "cleaned edit input file still exists",
         )
     } else {
         require(
-            argv.len() == expected_prefix.len() + 1 && argv[expected_prefix.len()] == "-",
+            argv.len() == argument_index + 1 && argv[argument_index] == "-",
             format!("unexpected generation Codex argv: {argv:?}"),
         )
     }

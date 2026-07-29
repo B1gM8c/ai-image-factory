@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 
 use async_trait::async_trait;
+use image_provider_contracts::BillingMetric;
 use serde_json::Value;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -85,6 +86,7 @@ struct EditExecutionRow {
     object_key: String,
     input_sha256_hex: String,
     input_byte_size: i64,
+    project_service_tier: Option<String>,
 }
 
 #[async_trait]
@@ -214,7 +216,8 @@ impl ExecutionContextStore for PostgresExecutionContextStore {
                    i.media_type AS input_media_type,
                    i.storage_backend, i.object_key,
                    i.sha256_hex AS input_sha256_hex,
-                   i.byte_size AS input_byte_size
+                   i.byte_size AS input_byte_size,
+                   tier.project_service_tier
             FROM work_items w
             JOIN job_attempts a
               ON a.work_item_id = w.work_item_id
@@ -230,6 +233,7 @@ impl ExecutionContextStore for PostgresExecutionContextStore {
              AND qr.request_id = j.request_id
             JOIN job_input_manifests m ON m.job_id = j.job_id
             JOIN job_input_objects i ON i.job_id = m.job_id
+            LEFT JOIN job_service_tier_decisions tier ON tier.job_id = j.job_id
             WHERE w.work_item_id = $1 AND w.job_id = $2 AND w.execution_id = $3
               AND w.lease_epoch = $4 AND w.lease_owner = $5
               AND a.worker_id = $5
@@ -296,12 +300,15 @@ fn reservation_from_row(row: &ExecutionRow, operation: &'static str) -> (UsageRe
             job_id: row.job_id,
             charge: UsageCharge {
                 tenant_id: row.tenant_id.clone(),
+                attribution: None,
                 request_id: row.request_id.clone(),
                 admission_session_id: row.quota_admission_session_id,
                 operation,
                 provider_id: row.provider_id.clone(),
                 model: row.model.clone(),
-                units: units.unwrap_or_default(),
+                output_count: units.unwrap_or_default(),
+                billable_units: units.unwrap_or_default(),
+                billing_metric: BillingMetric::Output,
                 limits: UsageLimits {
                     five_hour_image_limit: snapshot.limit_5h,
                     seven_day_image_limit: snapshot.limit_7d,
@@ -338,13 +345,38 @@ fn valid_edit_envelope(
         && row.admission_request_id == execution.request_id
         && row.admission_operation == EDIT_OPERATION
         && row.admission_api_profile == command.source_api_profile
-        && row.admission_request_hash == execution.request_hash
+        && valid_admission_request_hash(
+            execution.economics_contract_version,
+            &execution.request_hash,
+            &row.admission_request_hash,
+            row.project_service_tier.as_deref(),
+        )
         && row.admission_state == "attached"
         && row.manifest_schema == EDIT_INPUT_MANIFEST_SCHEMA
         && row.manifest_hash == command.input_manifest_hash_hex()
         && usize::try_from(row.manifest_input_count).ok() == Some(command.inputs.len())
         && row_count == command.inputs.len()
         && (1..=17).contains(&row_count)
+}
+
+fn valid_admission_request_hash(
+    economics_contract_version: i16,
+    provider_command_hash: &str,
+    admission_request_hash: &str,
+    project_service_tier: Option<&str>,
+) -> bool {
+    if economics_contract_version != 4 {
+        return admission_request_hash == provider_command_hash;
+    }
+    let Some(project_service_tier) =
+        project_service_tier.and_then(crate::service_tiers::ProjectServiceTier::from_database)
+    else {
+        return false;
+    };
+    crate::service_tiers::request_hash_with_project_service_tier(
+        provider_command_hash,
+        project_service_tier,
+    ) == admission_request_hash
 }
 
 fn rebuild_edit_inputs(
@@ -456,5 +488,55 @@ fn is_sha256(value: &str) -> bool {
 fn invalid(reservation: &UsageReservation) -> ExecutionContextError {
     ExecutionContextError::Invalid {
         reservation: reservation.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::valid_admission_request_hash;
+    use crate::service_tiers::{ProjectServiceTier, request_hash_with_project_service_tier};
+
+    #[test]
+    fn v4_edit_admission_hash_includes_the_persisted_project_service_tier() {
+        let provider_hash = "a".repeat(64);
+        let admission_hash =
+            request_hash_with_project_service_tier(&provider_hash, ProjectServiceTier::Priority);
+
+        assert!(valid_admission_request_hash(
+            4,
+            &provider_hash,
+            &admission_hash,
+            Some("priority"),
+        ));
+        assert!(!valid_admission_request_hash(
+            4,
+            &provider_hash,
+            &admission_hash,
+            Some("default"),
+        ));
+        assert!(!valid_admission_request_hash(
+            4,
+            &provider_hash,
+            &admission_hash,
+            None,
+        ));
+    }
+
+    #[test]
+    fn legacy_edit_admission_hash_remains_the_provider_command_hash() {
+        let provider_hash = "b".repeat(64);
+
+        assert!(valid_admission_request_hash(
+            1,
+            &provider_hash,
+            &provider_hash,
+            None,
+        ));
+        assert!(!valid_admission_request_hash(
+            1,
+            &provider_hash,
+            &"c".repeat(64),
+            None,
+        ));
     }
 }

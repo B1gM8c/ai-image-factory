@@ -4,12 +4,13 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::economics::{admit_job_outputs, validate_admitted_job_outputs};
+use crate::pricing::admission::{admit_customer_pricing_v4, validate_customer_pricing_v4};
 
 mod operations;
 
 use super::{
     AdmissionClaim, AdmissionContract, AdmissionError, AdmissionStore, AdmissionTicket, AttachJob,
-    AttachedWork, ClaimAdmission, WorkLease, WorkOutcome, attach_operation,
+    AttachedWork, ClaimAdmission, WorkLease, WorkOutcome, attach_operation, provider_command_hash,
     validate_attach_request,
 };
 use operations::{
@@ -299,6 +300,7 @@ impl AdmissionStore for PostgresAdmissionStore {
 
     async fn attach(&self, request: AttachJob) -> Result<AttachedWork, AdmissionError> {
         validate_attach_request(&request)?;
+        let payload_hash = provider_command_hash(&request)?;
         let mut tx = self.pool.begin().await.map_err(unavailable)?;
         let now = database_now(&mut tx).await?;
         let session: Option<LockedAdmissionSession> = sqlx::query_as(
@@ -347,8 +349,11 @@ impl AdmissionStore for PostgresAdmissionStore {
                         return Err(AdmissionError::InvalidOwner);
                     }
                 }
-                AdmissionContract::OutputEconomicsV2 => {
+                AdmissionContract::OutputEconomicsV2 | AdmissionContract::MediaEconomicsV3 => {
                     validate_admitted_job_outputs(&mut tx, &request).await?;
+                }
+                AdmissionContract::CustomerPricingV4 => {
+                    validate_customer_pricing_v4(&mut tx, &request, &session.api_profile).await?;
                 }
             }
             let attached = replay_attached_work(&mut tx, &request).await?;
@@ -364,7 +369,10 @@ impl AdmissionStore for PostgresAdmissionStore {
             return Err(AdmissionError::Expired);
         }
         bind_quota_reservation(&mut tx, &request, &session, now).await?;
-        if request.contract == AdmissionContract::OutputEconomicsV2 {
+        if matches!(
+            request.contract,
+            AdmissionContract::OutputEconomicsV2 | AdmissionContract::MediaEconomicsV3
+        ) {
             admit_job_outputs(&mut tx, &request, &session.api_profile, now).await?;
         }
         persist_inputs(&mut tx, &request, now).await?;
@@ -380,13 +388,45 @@ impl AdmissionStore for PostgresAdmissionStore {
         .bind(request.ticket.session_id)
         .bind(&request.command_schema)
         .bind(&request.command_json)
-        .bind(&request.ticket.request_hash)
+        .bind(&payload_hash)
         .bind(now)
         .execute(&mut *tx)
         .await
         .map_err(unavailable)?;
 
-        let schedule = reserve_schedule_slot(&mut tx, &request, now).await?;
+        bind_provider_route_attribution(&mut tx, &request, now)
+            .await
+            .inspect_err(|error| {
+                tracing::warn!(
+                    ?error,
+                    job.id = %request.job_id,
+                    admission.session.id = %request.ticket.session_id,
+                    "provider route attribution failed during admission"
+                );
+            })?;
+        if request.contract == AdmissionContract::CustomerPricingV4 {
+            admit_customer_pricing_v4(&mut tx, &request, &session.api_profile)
+                .await
+                .inspect_err(|error| {
+                    tracing::warn!(
+                        ?error,
+                        job.id = %request.job_id,
+                        admission.session.id = %request.ticket.session_id,
+                        "customer pricing admission failed"
+                    );
+                })?;
+        }
+
+        let schedule = reserve_schedule_slot(&mut tx, &request, now)
+            .await
+            .inspect_err(|error| {
+                tracing::warn!(
+                    ?error,
+                    job.id = %request.job_id,
+                    admission.session.id = %request.ticket.session_id,
+                    "scheduler reservation failed during admission"
+                );
+            })?;
         let work_item_id = Uuid::new_v4();
         sqlx::query(
             r#"
@@ -495,6 +535,53 @@ impl AdmissionStore for PostgresAdmissionStore {
             worker_id,
             lease_duration_ms,
             Some(contract),
+            None,
+            None,
+        )
+        .await
+    }
+
+    async fn claim_ready_for_schema(
+        &self,
+        worker_id: &str,
+        lease_duration_ms: i64,
+        contract: AdmissionContract,
+        command_schema: &str,
+    ) -> Result<Option<WorkLease>, AdmissionError> {
+        if command_schema.is_empty() {
+            return Err(AdmissionError::InvalidCommand);
+        }
+        claim_work(
+            &self.pool,
+            None,
+            worker_id,
+            lease_duration_ms,
+            Some(contract),
+            Some(command_schema),
+            None,
+        )
+        .await
+    }
+
+    async fn claim_ready_for_profile(
+        &self,
+        worker_id: &str,
+        lease_duration_ms: i64,
+        contract: AdmissionContract,
+        command_schema: &str,
+        execution_profile_id: Uuid,
+    ) -> Result<Option<WorkLease>, AdmissionError> {
+        if command_schema.is_empty() || execution_profile_id.is_nil() {
+            return Err(AdmissionError::InvalidCommand);
+        }
+        claim_work(
+            &self.pool,
+            None,
+            worker_id,
+            lease_duration_ms,
+            Some(contract),
+            Some(command_schema),
+            Some(execution_profile_id),
         )
         .await
     }
@@ -505,7 +592,16 @@ impl AdmissionStore for PostgresAdmissionStore {
         worker_id: &str,
         lease_duration_ms: i64,
     ) -> Result<Option<WorkLease>, AdmissionError> {
-        claim_work(&self.pool, Some(job_id), worker_id, lease_duration_ms, None).await
+        claim_work(
+            &self.pool,
+            Some(job_id),
+            worker_id,
+            lease_duration_ms,
+            None,
+            None,
+            None,
+        )
+        .await
     }
 
     async fn start(&self, lease: &WorkLease) -> Result<(), AdmissionError> {
@@ -551,4 +647,217 @@ impl AdmissionStore for PostgresAdmissionStore {
     ) -> Result<(), AdmissionError> {
         transition_active(&self.pool, lease, "running", outcome.as_str(), error_code).await
     }
+}
+
+async fn bind_provider_route_attribution(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    request: &AttachJob,
+    now: i64,
+) -> Result<(), AdmissionError> {
+    let binding: Option<(String, String, String, Uuid, i64, String)> = sqlx::query_as(
+        r#"
+        SELECT binding.provider_id, binding.operation_id, binding.command_schema,
+               binding.route_id, binding.route_revision, head.state
+        FROM jobs job
+        JOIN job_payloads job_command
+          ON job_command.job_id = job.job_id
+        JOIN admission_sessions session
+          ON session.session_id = job_command.admission_session_id
+        JOIN job_auth_attributions attribution
+          ON attribution.job_id = job.job_id
+         AND attribution.tenant_id = job.tenant_id
+        JOIN gateway_api_keys api_key
+          ON api_key.id = attribution.api_key_id
+         AND api_key.project_id = attribution.project_id
+         AND api_key.service_account_id = attribution.service_account_id
+         AND api_key.tenant_id = attribution.tenant_id
+         AND api_key.authz_version = attribution.credential_authz_version
+         AND api_key.deleted_at IS NULL
+        JOIN gateway_api_key_provider_routes binding
+          ON binding.api_key_id = attribution.api_key_id
+         AND binding.tenant_id = attribution.tenant_id
+         AND binding.project_id = attribution.project_id
+         AND binding.service_account_id = attribution.service_account_id
+         AND binding.provider_id = job.provider_id
+         AND (
+           attribution.route_id IS NULL
+           OR (
+             binding.route_id = attribution.route_id
+             AND binding.route_revision = attribution.route_revision
+             AND binding.provider_id = attribution.route_provider_id
+             AND binding.operation_id = attribution.route_operation_id
+             AND binding.command_schema = attribution.route_command_schema
+           )
+         )
+        JOIN provider_route_heads head
+          ON head.route_id = binding.route_id
+         AND head.provider_id = binding.provider_id
+         AND head.operation_id = binding.operation_id
+         AND head.command_schema = binding.command_schema
+        WHERE job.job_id = $1 AND attribution.auth_kind = 'api_key'
+          AND EXISTS (
+            SELECT 1
+            FROM provider_route_model_mappings mapping
+            WHERE mapping.route_id = binding.route_id
+              AND mapping.route_revision = binding.route_revision
+              AND mapping.provider_id = binding.provider_id
+              AND mapping.operation_id = binding.operation_id
+              AND mapping.command_schema = binding.command_schema
+              AND mapping.api_profile = session.api_profile
+              AND mapping.execution_model_id = job.model
+          )
+        FOR SHARE OF binding, head
+        "#,
+    )
+    .bind(request.job_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(unavailable)?;
+    let Some((provider_id, operation_id, command_schema, route_id, route_revision, route_state)) =
+        binding
+    else {
+        let api_key_attributed: bool = sqlx::query_scalar(
+            r#"
+            SELECT EXISTS (
+              SELECT 1 FROM job_auth_attributions
+              WHERE job_id = $1 AND auth_kind = 'api_key'
+            )
+            "#,
+        )
+        .bind(request.job_id)
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(unavailable)?;
+        if api_key_attributed {
+            return Err(AdmissionError::InvalidOwner);
+        }
+        let user_binding: Option<(String, String, String, Uuid, i64, String)> = sqlx::query_as(
+            r#"
+                SELECT attribution.route_provider_id, attribution.route_operation_id,
+                       attribution.route_command_schema, attribution.route_id,
+                       attribution.route_revision, head.state
+                FROM jobs job
+                JOIN job_payloads job_command
+                  ON job_command.job_id = job.job_id
+                JOIN admission_sessions session
+                  ON session.session_id = job_command.admission_session_id
+                JOIN job_auth_attributions attribution
+                  ON attribution.job_id = job.job_id
+                 AND attribution.tenant_id = job.tenant_id
+                JOIN provider_route_heads head
+                  ON head.route_id = attribution.route_id
+                 AND head.current_revision = attribution.route_revision
+                 AND head.provider_id = attribution.route_provider_id
+                 AND head.operation_id = attribution.route_operation_id
+                 AND head.command_schema = attribution.route_command_schema
+                WHERE job.job_id = $1 AND attribution.auth_kind = 'user_session'
+                  AND attribution.route_provider_id = job.provider_id
+                  AND EXISTS (
+                    SELECT 1
+                    FROM provider_route_model_mappings mapping
+                    WHERE mapping.route_id = attribution.route_id
+                      AND mapping.route_revision = attribution.route_revision
+                      AND mapping.provider_id = attribution.route_provider_id
+                      AND mapping.operation_id = attribution.route_operation_id
+                      AND mapping.command_schema = attribution.route_command_schema
+                      AND mapping.api_profile = session.api_profile
+                      AND mapping.execution_model_id = job.model
+                  )
+                FOR SHARE OF head
+                "#,
+        )
+        .bind(request.job_id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(unavailable)?;
+        let Some((
+            provider_id,
+            operation_id,
+            command_schema,
+            route_id,
+            route_revision,
+            route_state,
+        )) = user_binding
+        else {
+            let user_attributed: bool = sqlx::query_scalar(
+                r#"
+                SELECT EXISTS (
+                  SELECT 1 FROM job_auth_attributions
+                  WHERE job_id = $1 AND auth_kind = 'user_session'
+                )
+                "#,
+            )
+            .bind(request.job_id)
+            .fetch_one(&mut **tx)
+            .await
+            .map_err(unavailable)?;
+            return if user_attributed {
+                Err(AdmissionError::InvalidOwner)
+            } else {
+                Ok(())
+            };
+        };
+        if route_state != "enabled" || command_schema != request.command_schema {
+            return Err(AdmissionError::InvalidCommand);
+        }
+        let inserted = sqlx::query(
+            r#"
+            INSERT INTO job_provider_route_attributions
+              (job_id, tenant_id, api_key_id, provider_id, operation_id,
+               command_schema, route_id, route_revision, attributed_at_ms)
+            SELECT job.job_id, job.tenant_id, NULL,
+                   $2, $3, $4, $5, $6, $7
+            FROM jobs job
+            JOIN job_auth_attributions attribution ON attribution.job_id = job.job_id
+            WHERE job.job_id = $1 AND attribution.auth_kind = 'user_session'
+            ON CONFLICT (job_id) DO NOTHING
+            "#,
+        )
+        .bind(request.job_id)
+        .bind(provider_id)
+        .bind(operation_id)
+        .bind(command_schema)
+        .bind(route_id)
+        .bind(route_revision)
+        .bind(now)
+        .execute(&mut **tx)
+        .await
+        .map_err(unavailable)?
+        .rows_affected();
+        if inserted != 1 {
+            return Err(AdmissionError::InvalidOwner);
+        }
+        return Ok(());
+    };
+    if route_state != "enabled" || command_schema != request.command_schema {
+        return Err(AdmissionError::InvalidCommand);
+    }
+    let inserted = sqlx::query(
+        r#"
+        INSERT INTO job_provider_route_attributions
+          (job_id, tenant_id, api_key_id, provider_id, operation_id,
+           command_schema, route_id, route_revision, attributed_at_ms)
+        SELECT job.job_id, job.tenant_id, attribution.api_key_id,
+               $2, $3, $4, $5, $6, $7
+        FROM jobs job
+        JOIN job_auth_attributions attribution ON attribution.job_id = job.job_id
+        WHERE job.job_id = $1 AND attribution.auth_kind = 'api_key'
+        ON CONFLICT (job_id) DO NOTHING
+        "#,
+    )
+    .bind(request.job_id)
+    .bind(provider_id)
+    .bind(operation_id)
+    .bind(command_schema)
+    .bind(route_id)
+    .bind(route_revision)
+    .bind(now)
+    .execute(&mut **tx)
+    .await
+    .map_err(unavailable)?
+    .rows_affected();
+    if inserted != 1 {
+        return Err(AdmissionError::InvalidOwner);
+    }
+    Ok(())
 }

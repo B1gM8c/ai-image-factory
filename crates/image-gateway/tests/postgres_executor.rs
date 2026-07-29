@@ -6,10 +6,13 @@ use std::{
 use gpt_image_2_gateway::database::{connect_test_pool_with_search_path, run_migrations};
 use gpt_image_2_gateway::{
     CODEX_GENERATION_ADAPTER_REVISION, CanonicalExecutorOutcome, CustomerArtifactPublisher,
-    ExecutorParentTerminalState, ExecutorTerminalError, ExecutorTerminalStore, GenerationJob,
-    PostgresExecutorTerminalStore, PostgresReconciliationStore, ReconciliationOutcome,
-    ReconciliationStore,
-    admission::{GENERATION_COMMAND_SCHEMA, GenerationCommandV1, WorkLease},
+    ExecutorParentTerminalState, ExecutorTerminalBlockReason, ExecutorTerminalError,
+    ExecutorTerminalStore, GenerationJob, PostgresExecutorTerminalStore,
+    PostgresReconciliationStore, ReconciliationOutcome, ReconciliationStore,
+    admission::{
+        AdmissionTicket, DreaminaImageAdmissionPlan, DreaminaVideoAdmissionPlan,
+        GENERATION_COMMAND_SCHEMA, GenerationCommandV1, VIDEO_GENERATION_OPERATION, WorkLease,
+    },
     artifacts::{ArtifactBlobStore, ExecutorArtifactPublisher, FilesystemArtifactBlobStore},
     economics::{
         EconomicReceipt, EconomicReceiptOutcome, EconomicSettlementStore,
@@ -24,6 +27,16 @@ use gpt_image_2_gateway::{
     },
 };
 use image::{DynamicImage, ImageFormat, Rgba, RgbaImage};
+use image_api_contracts::dreamina::{
+    DREAMINA_IMAGES_API_PROFILE, DREAMINA_VIDEOS_API_PROFILE, DreaminaImageGenerationRequest,
+    DreaminaVideoGenerationRequest,
+};
+use image_provider_contracts::{ProviderCostEvidenceScope, ProviderReportedCostEvidenceV1};
+use image_provider_dreamina_cli::{
+    ADAPTER_REVISION as DREAMINA_ADAPTER_REVISION, DREAMINA_IMAGE_GENERATION_OPERATION_V1,
+    DREAMINA_SUBMIT_COMMAND_SCHEMA, DREAMINA_VIDEO_GENERATION_OPERATION_V1,
+    PROVIDER_ID as DREAMINA_PROVIDER_ID,
+};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use sqlx::{AssertSqlSafe, PgPool};
@@ -39,8 +52,17 @@ const TEST_POOL_ID: Uuid = Uuid::from_u128(0x500);
 const CODEX_POOL_ID: Uuid = Uuid::from_u128(0x600);
 const TEST_ACCOUNT_ID: Uuid = Uuid::from_u128(0x700);
 const CODEX_ACCOUNT_ID: Uuid = Uuid::from_u128(0x800);
+const DREAMINA_PROFILE_ID: Uuid = Uuid::from_u128(0x900);
+const DREAMINA_VIDEO_PROFILE_ID: Uuid = Uuid::from_u128(0xd00);
+const DREAMINA_POLICY_ID: Uuid = Uuid::from_u128(0xa00);
+const DREAMINA_POOL_ID: Uuid = Uuid::from_u128(0xb00);
+const DREAMINA_ACCOUNT_ID: Uuid = Uuid::from_u128(0xc00);
 const TEST_AUTH_SHA256: &str = "1111111111111111111111111111111111111111111111111111111111111111";
 const CODEX_AUTH_SHA256: &str = "ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356";
+const DREAMINA_AUTH_SHA256: &str =
+    "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+const PROCESS_STATE_TIMEOUT: Duration = Duration::from_secs(30);
+static EXECUTORD_PROCESS_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[derive(Debug, Eq, PartialEq, sqlx::FromRow)]
 struct AtomicCompletionState {
@@ -53,6 +75,7 @@ struct AtomicCompletionState {
     charged_units: i32,
     quota_state: String,
     receipt_count: i64,
+    provider_usage_fact_count: i64,
     economic_meter_count: i64,
     rating_count: i64,
     artifact_count: i64,
@@ -81,17 +104,67 @@ struct TerminalParentSnapshot {
     terminal_outbox_count: i64,
 }
 
+#[derive(Debug, Eq, PartialEq, sqlx::FromRow)]
+struct V4TerminalEconomicState {
+    job_state: String,
+    output_state: String,
+    receipt_count: i64,
+    provider_usage_fact_count: i64,
+    legacy_economic_meter_count: i64,
+    legacy_rating_count: i64,
+    legacy_hold_count: i64,
+    legacy_customer_charge_count: i64,
+    customer_rating_count: i64,
+    customer_rating_line_count: i64,
+    customer_fact_link_count: i64,
+    customer_job_charge_count: i64,
+    hold_state: String,
+    hold_captured_micros: i64,
+    hold_released_micros: i64,
+    account_held_micros: i64,
+    account_captured_micros: i64,
+}
+
 fn profile_id_for_lease(lease: &WorkLease) -> Uuid {
-    if lease.command_schema == GENERATION_COMMAND_SCHEMA {
-        CODEX_PROFILE_ID
-    } else {
-        TEST_PROFILE_ID
+    match lease.command_schema.as_str() {
+        GENERATION_COMMAND_SCHEMA => CODEX_PROFILE_ID,
+        DREAMINA_SUBMIT_COMMAND_SCHEMA => DREAMINA_PROFILE_ID,
+        _ => TEST_PROFILE_ID,
     }
+}
+
+#[tokio::test]
+async fn profile_bound_claim_hands_off_to_the_same_execution_profile() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let lease =
+            seed_codex_generation_lease(&database.pool, "profile-bound-handoff-worker").await?;
+        sqlx::query("UPDATE work_items SET execution_profile_id = $2 WHERE work_item_id = $1")
+            .bind(lease.work_item_id)
+            .bind(CODEX_PROFILE_ID)
+            .execute(&database.pool)
+            .await
+            .map_err(debug_error)?;
+
+        let prepared = PostgresExecutorSubmissionStore::new(database.pool.clone())
+            .prepare_and_handoff(&lease, CODEX_PROFILE_ID)
+            .await
+            .map_err(debug_error)?;
+        require(
+            prepared.len() == 1,
+            "profile-bound claim did not hand off its output",
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
 }
 
 #[tokio::test]
 async fn real_executord_process_runs_one_output_through_durable_helper_and_artifact_authority()
 -> TestResult {
+    let _process_guard = EXECUTORD_PROCESS_TEST_LOCK.lock().await;
     let Some(database) = TestDatabase::new().await? else {
         return Ok(());
     };
@@ -106,10 +179,11 @@ async fn real_executord_process_runs_one_output_through_durable_helper_and_artif
 
         let files = ExecutordFixture::new(Duration::ZERO)?;
         let mut child = files
-            .command(&database, "executord-process-smoke")?
+            .command(&database, "executord-process-smoke")
+            .await?
             .spawn()
             .map_err(|error| format!("failed to spawn executord: {error}"))?;
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        let deadline = tokio::time::Instant::now() + PROCESS_STATE_TIMEOUT;
         let terminal = loop {
             let row: Option<(String, String, i64, i64, i64)> = sqlx::query_as(
                 r#"
@@ -139,7 +213,12 @@ async fn real_executord_process_runs_one_output_through_durable_helper_and_artif
                 break row.unwrap();
             }
             if let Some(status) = child.try_wait().map_err(debug_error)? {
-                return Err(format!("executord exited early with {status}; row={row:?}"));
+                let output = child.wait_with_output().await.map_err(debug_error)?;
+                return Err(format!(
+                    "executord exited early with {status}; row={row:?}; stdout={}; stderr={}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr),
+                ));
             }
             if tokio::time::Instant::now() >= deadline {
                 if let Some(pid) = child.id() {
@@ -189,6 +268,7 @@ async fn real_executord_process_runs_one_output_through_durable_helper_and_artif
 
 #[tokio::test]
 async fn executord_rejects_auth_home_that_does_not_match_database_credential() -> TestResult {
+    let _process_guard = EXECUTORD_PROCESS_TEST_LOCK.lock().await;
     let Some(database) = TestDatabase::new().await? else {
         return Ok(());
     };
@@ -202,7 +282,7 @@ async fn executord_rejects_auth_home_that_does_not_match_database_credential() -
         fs::write(&wrong_auth, b"{\"account\":\"other\"}\n").map_err(debug_error)?;
         fs::set_permissions(&wrong_auth, fs::Permissions::from_mode(0o600)).map_err(debug_error)?;
 
-        let mut command = files.command(&database, "executord-wrong-auth")?;
+        let mut command = files.command(&database, "executord-wrong-auth").await?;
         command.env("EXECUTOR_CODEX_CREDENTIAL_HOME", &wrong_credentials);
         let output = tokio::time::timeout(Duration::from_secs(5), command.output())
             .await
@@ -223,6 +303,7 @@ async fn executord_rejects_auth_home_that_does_not_match_database_credential() -
 
 #[tokio::test]
 async fn restarted_executord_attaches_running_helper_without_relaunching_provider() -> TestResult {
+    let _process_guard = EXECUTORD_PROCESS_TEST_LOCK.lock().await;
     let Some(database) = TestDatabase::new().await? else {
         return Ok(());
     };
@@ -242,10 +323,11 @@ async fn restarted_executord_attaches_running_helper_without_relaunching_provide
         let files = ExecutordFixture::new(Duration::from_secs(2))?;
         let owner = "executord-restart-smoke";
         let mut first = files
-            .command(&database, owner)?
+            .command(&database, owner)
+            .await?
             .spawn()
             .map_err(debug_error)?;
-        tokio::time::timeout(Duration::from_secs(8), async {
+        tokio::time::timeout(PROCESS_STATE_TIMEOUT, async {
             loop {
                 let state: Option<String> = sqlx::query_scalar(
                     r#"
@@ -306,14 +388,6 @@ async fn restarted_executord_attaches_running_helper_without_relaunching_provide
         .await
         .map_err(debug_error)?;
         sqlx::query(
-            "UPDATE provider_accounts SET state = 'disabled', updated_at_ms = $2 WHERE provider_account_id = $1",
-        )
-        .bind(CODEX_ACCOUNT_ID)
-        .bind(now)
-        .execute(&mut *disable)
-        .await
-        .map_err(debug_error)?;
-        sqlx::query(
             "UPDATE executor_resource_policies SET state = 'disabled' WHERE resource_policy_id = $1 AND revision = 1",
         )
         .bind(CODEX_POLICY_ID)
@@ -323,10 +397,11 @@ async fn restarted_executord_attaches_running_helper_without_relaunching_provide
         disable.commit().await.map_err(debug_error)?;
 
         let mut second = files
-            .command(&database, owner)?
+            .command(&database, owner)
+            .await?
             .spawn()
             .map_err(debug_error)?;
-        let terminal = tokio::time::timeout(Duration::from_secs(10), async {
+        let terminal = tokio::time::timeout(PROCESS_STATE_TIMEOUT, async {
             loop {
                 let row: Option<(String, String, i64)> = sqlx::query_as(
                     r#"
@@ -349,7 +424,15 @@ async fn restarted_executord_attaches_running_helper_without_relaunching_provide
                     break Ok::<_, String>(row.unwrap());
                 }
                 if let Some(status) = second.try_wait().map_err(debug_error)? {
-                    break Err(format!("second executord exited early with {status}"));
+                    let mut stderr = String::new();
+                    if let Some(mut stream) = second.stderr.take() {
+                        tokio::io::AsyncReadExt::read_to_string(&mut stream, &mut stderr)
+                            .await
+                            .map_err(debug_error)?;
+                    }
+                    break Err(format!(
+                        "second executord exited early with {status}: {stderr}"
+                    ));
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
@@ -389,6 +472,7 @@ async fn restarted_executord_attaches_running_helper_without_relaunching_provide
 #[tokio::test]
 async fn expired_execution_recovers_late_success_evidence_without_relaunching_provider()
 -> TestResult {
+    let _process_guard = EXECUTORD_PROCESS_TEST_LOCK.lock().await;
     let Some(database) = TestDatabase::new().await? else {
         return Ok(());
     };
@@ -404,10 +488,11 @@ async fn expired_execution_recovers_late_success_evidence_without_relaunching_pr
         let files = ExecutordFixture::new(Duration::from_millis(1_200))?;
         let owner = "late-evidence-executord";
         let mut first = files
-            .command_with_lease(&database, owner, 800, 100)?
+            .command_with_lease(&database, owner, 800, 100)
+            .await?
             .spawn()
             .map_err(debug_error)?;
-        tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::time::timeout(PROCESS_STATE_TIMEOUT, async {
             loop {
                 let running: Option<(String, i64)> = sqlx::query_as(
                     r#"
@@ -467,7 +552,7 @@ async fn expired_execution_recovers_late_success_evidence_without_relaunching_pr
             .runner_root
             .join(prepared[0].executor_execution_id.simple().to_string())
             .join("result.json");
-        tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::time::timeout(PROCESS_STATE_TIMEOUT, async {
             while !process_terminal.is_file() {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
@@ -497,10 +582,11 @@ async fn expired_execution_recovers_late_success_evidence_without_relaunching_pr
         )?;
 
         let mut second = files
-            .command_with_lease(&database, owner, 800, 100)?
+            .command_with_lease(&database, owner, 800, 100)
+            .await?
             .spawn()
             .map_err(debug_error)?;
-        tokio::time::timeout(Duration::from_secs(8), async {
+        tokio::time::timeout(PROCESS_STATE_TIMEOUT, async {
             loop {
                 let row: (i64, i64, Option<String>) = sqlx::query_as(
                     r#"
@@ -604,6 +690,7 @@ async fn expired_execution_recovers_late_success_evidence_without_relaunching_pr
 
 #[tokio::test]
 async fn executord_sigterm_drains_running_helper_through_database_resolution() -> TestResult {
+    let _process_guard = EXECUTORD_PROCESS_TEST_LOCK.lock().await;
     let Some(database) = TestDatabase::new().await? else {
         return Ok(());
     };
@@ -621,10 +708,11 @@ async fn executord_sigterm_drains_running_helper_through_database_resolution() -
         )?;
         let files = ExecutordFixture::new(Duration::from_secs(1))?;
         let mut child = files
-            .command(&database, "executord-drain-smoke")?
+            .command(&database, "executord-drain-smoke")
+            .await?
             .spawn()
             .map_err(debug_error)?;
-        tokio::time::timeout(Duration::from_secs(8), async {
+        tokio::time::timeout(PROCESS_STATE_TIMEOUT, async {
             loop {
                 let state: Option<String> = sqlx::query_scalar(
                     r#"
@@ -1061,7 +1149,7 @@ async fn standalone_v2_economics_cannot_bypass_terminal_reducer() -> TestResult 
         let prepared = executor
             .prepare_and_handoff(&work, profile_id_for_lease(&work))
             .await
-            .map_err(debug_error)?;
+            .map_err(|error| format!("v4 prepare_and_handoff failed: {error:?}"))?;
         seed_price_hold(&database.pool, &prepared[0], 7).await?;
         let lease = claim_required(&executor, "economic-bypass-executor").await?;
         executor.start(&lease).await.map_err(debug_error)?;
@@ -1331,6 +1419,20 @@ async fn terminal_success_completion_commits_every_effect_atomically() -> TestRe
                    quota.state AS quota_state,
                    (SELECT COUNT(*) FROM provider_receipts WHERE submission_id = $1)
                      AS receipt_count,
+                   (SELECT COUNT(*) FROM provider_usage_facts
+                      WHERE submission_id = $1
+                        AND receipt_id = reduction.provider_receipt_id
+                        AND output_id = $2
+                        AND job_id = $3
+                        AND provider_id = 'openai-codex'
+                        AND provider_account_id = $6
+                        AND execution_surface = 'provider_cli'
+                        AND metric = 'image_output'
+                        AND quantity = 1
+                        AND unit = 'image'
+                        AND quantity_source = 'request_derived'
+                        AND confidence = 'exact')
+                     AS provider_usage_fact_count,
                    (SELECT COUNT(*) FROM economic_metering_events WHERE output_id = $2)
                      AS economic_meter_count,
                    (SELECT COUNT(*) FROM rated_usage WHERE output_id = $2) AS rating_count,
@@ -1357,6 +1459,7 @@ async fn terminal_success_completion_commits_every_effect_atomically() -> TestRe
         .bind(terminal.job_id)
         .bind(terminal.work_item_id)
         .bind(terminal.attempt_execution_id)
+        .bind(CODEX_ACCOUNT_ID)
         .fetch_one(&database.pool)
         .await
         .map_err(debug_error)?;
@@ -1372,6 +1475,7 @@ async fn terminal_success_completion_commits_every_effect_atomically() -> TestRe
                     charged_units: 1,
                     quota_state: "committed".to_string(),
                     receipt_count: 1,
+                    provider_usage_fact_count: 1,
                     economic_meter_count: 1,
                     rating_count: 1,
                     artifact_count: 1,
@@ -1442,6 +1546,1270 @@ async fn terminal_success_completion_commits_every_effect_atomically() -> TestRe
             customer_blobs.get(&customer).await.map_err(debug_error)?
                 == png_bytes([10, 20, 30, 255]),
             "committed customer artifact bytes changed",
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
+async fn v4_terminal_success_settles_customer_and_provider_cost_once() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let work =
+            seed_codex_generation_lease(&database.pool, "v4-terminal-completion-worker").await?;
+        seed_v4_customer_quote(&database.pool, &work, 7).await?;
+        let provider_actual_version_id = seed_provider_reported_actual_price(
+            &database.pool,
+            &work,
+            V4CustomerQuoteIdentity::openai(),
+        )
+        .await?;
+        let executor = PostgresExecutorSubmissionStore::new(database.pool.clone());
+        let (executor_artifacts, artifact_root) = artifact_publisher(&executor)?;
+        let prepared = executor
+            .prepare_and_handoff(&work, profile_id_for_lease(&work))
+            .await
+            .map_err(debug_error)?;
+        require(prepared.len() == 1, "expected one v4 prepared output")?;
+        seed_terminal_quota(&database.pool, &work).await?;
+
+        let scope = ExecutorClaimScope {
+            execution_profile_id: CODEX_PROFILE_ID,
+            provider_id: "openai-codex".to_string(),
+            command_schema: GENERATION_COMMAND_SCHEMA.to_string(),
+            adapter_revision: CODEX_GENERATION_ADAPTER_REVISION.to_string(),
+        };
+        let executor_lease = executor
+            .claim_prepared(&scope, "v4-terminal-completion-executor", 60_000)
+            .await
+            .map_err(|error| format!("v4 claim_prepared failed: {error:?}"))?
+            .ok_or_else(|| "v4 codex executor claim returned none".to_string())?;
+        executor
+            .start(&executor_lease)
+            .await
+            .map_err(|error| format!("v4 executor start failed: {error:?}"))?;
+        let provider_operation_id = format!("provider-operation-{}", Uuid::new_v4().simple());
+        let provider_cost = ProviderReportedCostEvidenceV1::usd_ticks(
+            ProviderCostEvidenceScope::CliInvocation,
+            "openai-codex",
+            "provider_cli",
+            &provider_operation_id,
+            200_000_000,
+            br#"{"total_cost_usd_ticks":200000000}"#,
+            "end.total_cost_usd_ticks",
+        )
+        .map_err(debug_error)?;
+        let manifest = publish_result_authority(&executor_artifacts, &executor_lease)
+            .await?
+            .with_provider_reported_cost(Some(provider_cost))
+            .ok_or("provider cost evidence was rejected")?;
+        executor
+            .record_outcome(
+                &executor_lease,
+                &ExecutorSubmissionOutcome::Succeeded(manifest),
+            )
+            .await
+            .map_err(|error| format!("v4 record_outcome failed: {error:?}"))?;
+        let evidence_at_ms: i64 = sqlx::query_scalar(
+            "SELECT created_at_ms FROM executor_provider_cost_evidence WHERE submission_id = $1",
+        )
+        .bind(executor_lease.submission_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require_one(
+            sqlx::query(
+                r#"
+                UPDATE price_book_versions
+                SET state = 'retired', effective_until_ms = $2,
+                    control_version = control_version + 1, updated_at_ms = $2
+                WHERE price_book_version_id = $1
+                "#,
+            )
+            .bind(provider_actual_version_id)
+            .bind(evidence_at_ms + 1)
+            .execute(&database.pool)
+            .await
+            .map_err(debug_error)?,
+            "provider actual price retirement",
+        )?;
+
+        let reductions = PostgresExecutorTerminalStore::new(database.pool.clone());
+        let terminal = reductions
+            .claim_terminal("v4-terminal-completion-reducer", 60_000)
+            .await
+            .map_err(|error| format!("v4 claim_terminal failed: {error:?}"))?
+            .ok_or_else(|| "v4 terminal completion reduction was not queued".to_string())?;
+        let customer_blobs =
+            Arc::new(FilesystemArtifactBlobStore::new(artifact_root.path()).map_err(debug_error)?);
+        let customer = CustomerArtifactPublisher::new(customer_blobs)
+            .publish(&terminal)
+            .await
+            .map_err(debug_error)?;
+        let first = reductions
+            .complete_terminal(&terminal, Some(&customer))
+            .await
+            .map_err(|error| format!("v4 complete_terminal failed: {error:?}"))?;
+        let replay = reductions
+            .complete_terminal(&terminal, Some(&customer))
+            .await
+            .map_err(|error| format!("v4 complete_terminal replay failed: {error:?}"))?;
+        require(
+            first == replay && first.parent_state == ExecutorParentTerminalState::Succeeded,
+            format!("v4 terminal replay changed identity: {first:?} {replay:?}"),
+        )?;
+
+        let state = v4_terminal_economic_state(
+            &database.pool,
+            terminal.submission_id,
+            terminal.job_id,
+            terminal.output_id,
+            "succeeded",
+            "image_output",
+            1,
+            &json!({"quality": "high", "size": "1024x1024"}),
+        )
+        .await?;
+        require(
+            state
+                == V4TerminalEconomicState {
+                    job_state: "succeeded".to_string(),
+                    output_state: "succeeded".to_string(),
+                    receipt_count: 1,
+                    provider_usage_fact_count: 1,
+                    legacy_economic_meter_count: 0,
+                    legacy_rating_count: 0,
+                    legacy_hold_count: 0,
+                    legacy_customer_charge_count: 0,
+                    customer_rating_count: 1,
+                    customer_rating_line_count: 1,
+                    customer_fact_link_count: 1,
+                    customer_job_charge_count: 1,
+                    hold_state: "settled".to_string(),
+                    hold_captured_micros: 7,
+                    hold_released_micros: 0,
+                    account_held_micros: 0,
+                    account_captured_micros: 7,
+                },
+            format!("v4 terminal customer settlement was not exact: {state:?}"),
+        )?;
+        let (posting_count, posting_sum): (i64, i64) = sqlx::query_as(
+            r#"
+            SELECT COUNT(posting.posting_no)::BIGINT,
+                   COALESCE(SUM(posting.amount_micros), 0)::BIGINT
+            FROM ledger_transactions transaction
+            JOIN ledger_postings posting
+              ON posting.transaction_id = transaction.transaction_id
+            WHERE transaction.source_job_id = $1
+              AND transaction.transaction_type = 'customer_job_charge'
+            "#,
+        )
+        .bind(terminal.job_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(
+            posting_count == 2 && posting_sum == 0,
+            format!("v4 customer ledger was not balanced: {posting_count}/{posting_sum}"),
+        )?;
+        let provider_cost_state: (String, i64, i64, i64, i64, i64) = sqlx::query_as(
+            r#"
+            SELECT observation.native_quantity::TEXT,
+                   observation.amount_micros,
+                   (SELECT COUNT(*)::BIGINT
+                    FROM provider_cost_observation_fact_links fact_link
+                    WHERE fact_link.provider_cost_observation_id =
+                        observation.provider_cost_observation_id),
+                   (SELECT COUNT(*)::BIGINT
+                    FROM provider_cost_observation_receipts receipt_link
+                    WHERE receipt_link.provider_cost_observation_id =
+                        observation.provider_cost_observation_id),
+                   (SELECT COUNT(*)::BIGINT
+                    FROM ledger_transactions ledger
+                    WHERE ledger.source_provider_cost_observation_id =
+                        observation.provider_cost_observation_id
+                      AND ledger.transaction_type = 'provider_cost'),
+                   (SELECT COALESCE(SUM(posting.amount_micros), 0)::BIGINT
+                    FROM ledger_transactions ledger
+                    JOIN ledger_postings posting
+                      ON posting.transaction_id = ledger.transaction_id
+                    WHERE ledger.source_provider_cost_observation_id =
+                        observation.provider_cost_observation_id)
+            FROM provider_cost_observations observation
+            WHERE observation.provider_id = 'openai-codex'
+              AND observation.provider_operation_id = $1
+            "#,
+        )
+        .bind(&provider_operation_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(
+            provider_cost_state == ("200000000".to_string(), 20_000, 1, 1, 1, 0),
+            format!("provider-reported cost did not settle exactly once: {provider_cost_state:?}"),
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
+async fn v4_dreamina_terminal_success_settles_the_native_quote_once() -> TestResult {
+    verify_v4_dreamina_terminal_success(
+        DREAMINA_IMAGES_API_PROFILE,
+        V4CustomerQuoteIdentity::dreamina(),
+        "dreamina",
+    )
+    .await
+}
+
+#[tokio::test]
+async fn v4_ark_terminal_success_preserves_ark_identity_and_dreamina_price() -> TestResult {
+    verify_v4_dreamina_terminal_success(
+        image_api_contracts::ark::ARK_IMAGES_API_PROFILE,
+        V4CustomerQuoteIdentity::ark(),
+        "ark",
+    )
+    .await
+}
+
+async fn verify_v4_dreamina_terminal_success(
+    api_profile: &str,
+    quote_identity: V4CustomerQuoteIdentity,
+    owner_suffix: &str,
+) -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let work = seed_dreamina_generation_lease_for_profile(
+            &database.pool,
+            &format!("v4-{owner_suffix}-terminal-worker"),
+            api_profile,
+        )
+        .await?;
+        seed_v4_customer_quote_with_basis(
+            &database.pool,
+            &work,
+            quote_identity.clone(),
+            V4CustomerQuoteBasis {
+                metric: "image_output",
+                unit: "image",
+                unit_size: 1,
+                unit_price_micros: 7,
+                quantity_source: "request_derived",
+                confidence: "exact",
+                max_quantity: 1,
+                max_amount_micros: 7,
+            },
+        )
+        .await?;
+        let executor = PostgresExecutorSubmissionStore::new(database.pool.clone());
+        let (executor_artifacts, artifact_root) = artifact_publisher(&executor)?;
+        let prepared = executor
+            .prepare_and_handoff(&work, DREAMINA_PROFILE_ID)
+            .await
+            .map_err(debug_error)?;
+        require(prepared.len() == 1, "expected one Dreamina prepared output")?;
+        seed_terminal_quota(&database.pool, &work).await?;
+
+        let scope = ExecutorClaimScope {
+            execution_profile_id: DREAMINA_PROFILE_ID,
+            provider_id: DREAMINA_PROVIDER_ID.to_string(),
+            command_schema: DREAMINA_SUBMIT_COMMAND_SCHEMA.to_string(),
+            adapter_revision: DREAMINA_ADAPTER_REVISION.to_string(),
+        };
+        let executor_lease = executor
+            .claim_prepared(
+                &scope,
+                &format!("v4-{owner_suffix}-terminal-executor"),
+                60_000,
+            )
+            .await
+            .map_err(debug_error)?
+            .ok_or_else(|| "Dreamina terminal executor claim returned none".to_string())?;
+        executor.start(&executor_lease).await.map_err(debug_error)?;
+        let manifest = publish_result_authority(&executor_artifacts, &executor_lease).await?;
+        executor
+            .record_outcome(
+                &executor_lease,
+                &ExecutorSubmissionOutcome::Succeeded(manifest),
+            )
+            .await
+            .map_err(debug_error)?;
+
+        let reductions = PostgresExecutorTerminalStore::new(database.pool.clone());
+        let terminal = reductions
+            .claim_terminal(&format!("v4-{owner_suffix}-terminal-reducer"), 60_000)
+            .await
+            .map_err(debug_error)?
+            .ok_or_else(|| "Dreamina terminal reduction was not queued".to_string())?;
+        let customer_blobs =
+            Arc::new(FilesystemArtifactBlobStore::new(artifact_root.path()).map_err(debug_error)?);
+        let customer = CustomerArtifactPublisher::new(customer_blobs)
+            .publish(&terminal)
+            .await
+            .map_err(debug_error)?;
+        let first = reductions
+            .complete_terminal(&terminal, Some(&customer))
+            .await
+            .map_err(debug_error)?;
+        let replay = reductions
+            .complete_terminal(&terminal, Some(&customer))
+            .await
+            .map_err(debug_error)?;
+        require(
+            first == replay && first.parent_state == ExecutorParentTerminalState::Succeeded,
+            format!("Dreamina terminal replay changed identity: {first:?} {replay:?}"),
+        )?;
+
+        let state = v4_terminal_economic_state(
+            &database.pool,
+            terminal.submission_id,
+            terminal.job_id,
+            terminal.output_id,
+            "succeeded",
+            "image_output",
+            1,
+            &json!({"resolution_type": "2k", "ratio": "1:1"}),
+        )
+        .await?;
+        require(
+            state
+                == V4TerminalEconomicState {
+                    job_state: "succeeded".to_string(),
+                    output_state: "succeeded".to_string(),
+                    receipt_count: 1,
+                    provider_usage_fact_count: 1,
+                    legacy_economic_meter_count: 0,
+                    legacy_rating_count: 0,
+                    legacy_hold_count: 0,
+                    legacy_customer_charge_count: 0,
+                    customer_rating_count: 1,
+                    customer_rating_line_count: 1,
+                    customer_fact_link_count: 1,
+                    customer_job_charge_count: 1,
+                    hold_state: "settled".to_string(),
+                    hold_captured_micros: 7,
+                    hold_released_micros: 0,
+                    account_held_micros: 0,
+                    account_captured_micros: 7,
+                },
+            format!("Dreamina customer settlement was not exact: {state:?}"),
+        )?;
+        let identity: (
+            String,
+            String,
+            String,
+            String,
+            serde_json::Value,
+            String,
+            Uuid,
+            String,
+            String,
+        ) = sqlx::query_as(
+            r#"
+            SELECT quote.api_profile, version.api_profile,
+                   quote.provider_model_id, quote.public_model_id,
+                   quote.request_dimensions_json,
+                   fact.provider_id, fact.provider_account_id,
+                   projection.api_profile, projection.size
+            FROM customer_price_quotes quote
+            JOIN price_book_versions version
+              ON version.price_book_version_id = quote.price_book_version_id
+            JOIN provider_usage_facts fact ON fact.job_id = quote.job_id
+            JOIN job_response_projections projection ON projection.job_id = quote.job_id
+            WHERE quote.job_id = $1
+              AND fact.submission_id = $2
+              AND fact.metric = 'image_output'
+            "#,
+        )
+        .bind(terminal.job_id)
+        .bind(terminal.submission_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(
+            identity.0 == quote_identity.quote_api_profile
+                && identity.1 == quote_identity.price_api_profile
+                && identity.2 == quote_identity.provider_model_id
+                && identity.3 == quote_identity.public_model_id
+                && identity.4 == quote_identity.dimensions
+                && identity.5 == DREAMINA_PROVIDER_ID
+                && identity.6 == DREAMINA_ACCOUNT_ID
+                && identity.7 == api_profile
+                && identity.8 == "2k:1:1",
+            format!("{owner_suffix} terminal identity drifted: {identity:?}"),
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
+async fn v4_dreamina_video_terminal_success_settles_output_seconds_once() -> TestResult {
+    verify_v4_dreamina_video_terminal_success(
+        DREAMINA_VIDEOS_API_PROFILE,
+        V4CustomerQuoteIdentity::dreamina_video(),
+        "dreamina-video",
+    )
+    .await
+}
+
+#[tokio::test]
+async fn v4_ark_video_terminal_success_preserves_ark_identity_and_dreamina_rate() -> TestResult {
+    verify_v4_dreamina_video_terminal_success(
+        image_api_contracts::ark::ARK_CONTENT_GENERATION_API_PROFILE,
+        V4CustomerQuoteIdentity::ark_video(),
+        "ark-video",
+    )
+    .await
+}
+
+async fn verify_v4_dreamina_video_terminal_success(
+    api_profile: &str,
+    quote_identity: V4CustomerQuoteIdentity,
+    owner_suffix: &str,
+) -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let work = seed_dreamina_video_generation_lease_for_profile(
+            &database.pool,
+            &format!("v4-{owner_suffix}-terminal-worker"),
+            api_profile,
+        )
+        .await?;
+        seed_v4_customer_quote_with_basis(
+            &database.pool,
+            &work,
+            quote_identity.clone(),
+            V4CustomerQuoteBasis {
+                metric: "video_requested_second",
+                unit: "second",
+                unit_size: 1,
+                unit_price_micros: 3,
+                quantity_source: "request_derived",
+                confidence: "exact",
+                max_quantity: 8,
+                max_amount_micros: 24,
+            },
+        )
+        .await?;
+        let executor = PostgresExecutorSubmissionStore::new(database.pool.clone());
+        let (executor_artifacts, artifact_root) = artifact_publisher(&executor)?;
+        let prepared = executor
+            .prepare_and_handoff(&work, DREAMINA_VIDEO_PROFILE_ID)
+            .await
+            .map_err(debug_error)?;
+        require(
+            prepared.len() == 1,
+            "expected one Dreamina video prepared output",
+        )?;
+        seed_terminal_quota(&database.pool, &work).await?;
+
+        let scope = ExecutorClaimScope {
+            execution_profile_id: DREAMINA_VIDEO_PROFILE_ID,
+            provider_id: DREAMINA_PROVIDER_ID.to_string(),
+            command_schema: DREAMINA_SUBMIT_COMMAND_SCHEMA.to_string(),
+            adapter_revision: DREAMINA_ADAPTER_REVISION.to_string(),
+        };
+        let executor_lease = executor
+            .claim_prepared(
+                &scope,
+                &format!("v4-{owner_suffix}-terminal-executor"),
+                60_000,
+            )
+            .await
+            .map_err(debug_error)?
+            .ok_or_else(|| "Dreamina video terminal executor claim returned none".to_string())?;
+        executor.start(&executor_lease).await.map_err(debug_error)?;
+        let manifest = publish_video_result_authority(&executor_artifacts, &executor_lease).await?;
+        executor
+            .record_outcome(
+                &executor_lease,
+                &ExecutorSubmissionOutcome::Succeeded(manifest),
+            )
+            .await
+            .map_err(debug_error)?;
+
+        let reductions = PostgresExecutorTerminalStore::new(database.pool.clone());
+        let terminal = reductions
+            .claim_terminal(&format!("v4-{owner_suffix}-terminal-reducer"), 60_000)
+            .await
+            .map_err(debug_error)?
+            .ok_or_else(|| "Dreamina video terminal reduction was not queued".to_string())?;
+        let customer_blobs =
+            Arc::new(FilesystemArtifactBlobStore::new(artifact_root.path()).map_err(debug_error)?);
+        let customer = CustomerArtifactPublisher::new(customer_blobs)
+            .publish(&terminal)
+            .await
+            .map_err(debug_error)?;
+        let first = reductions
+            .complete_terminal(&terminal, Some(&customer))
+            .await
+            .map_err(debug_error)?;
+        let replay = reductions
+            .complete_terminal(&terminal, Some(&customer))
+            .await
+            .map_err(debug_error)?;
+        require(
+            first == replay && first.parent_state == ExecutorParentTerminalState::Succeeded,
+            format!("Dreamina video terminal replay changed identity: {first:?} {replay:?}"),
+        )?;
+
+        let state = v4_terminal_economic_state(
+            &database.pool,
+            terminal.submission_id,
+            terminal.job_id,
+            terminal.output_id,
+            "succeeded",
+            "video_requested_second",
+            8,
+            &quote_identity.dimensions,
+        )
+        .await?;
+        require(
+            state
+                == V4TerminalEconomicState {
+                    job_state: "succeeded".to_string(),
+                    output_state: "succeeded".to_string(),
+                    receipt_count: 1,
+                    provider_usage_fact_count: 1,
+                    legacy_economic_meter_count: 0,
+                    legacy_rating_count: 0,
+                    legacy_hold_count: 0,
+                    legacy_customer_charge_count: 0,
+                    customer_rating_count: 1,
+                    customer_rating_line_count: 1,
+                    customer_fact_link_count: 1,
+                    customer_job_charge_count: 1,
+                    hold_state: "settled".to_string(),
+                    hold_captured_micros: 24,
+                    hold_released_micros: 0,
+                    account_held_micros: 0,
+                    account_captured_micros: 24,
+                },
+            format!("Dreamina video customer settlement was not exact: {state:?}"),
+        )?;
+
+        let identity: serde_json::Value = sqlx::query_scalar(
+            r#"
+            SELECT jsonb_build_object(
+                'quote_api_profile', quote.api_profile,
+                'price_api_profile', version.api_profile,
+                'provider_model_id', quote.provider_model_id,
+                'public_model_id', quote.public_model_id,
+                'dimensions', quote.request_dimensions_json,
+                'source_kind', version.source_kind,
+                'source_url', version.source_url,
+                'provider_id', fact.provider_id,
+                'provider_account_id', fact.provider_account_id::TEXT,
+                'metric', fact.metric,
+                'unit', fact.unit,
+                'quantity', fact.quantity,
+                'projection_api_profile', projection.api_profile,
+                'projection_operation', projection.operation,
+                'output_format', projection.output_format,
+                'size', projection.size,
+                'media_type', authority.media_type,
+                'media_duration_ms', authority.media_duration_ms
+            )
+            FROM customer_price_quotes quote
+            JOIN price_book_versions version
+              ON version.price_book_version_id = quote.price_book_version_id
+            JOIN provider_usage_facts fact ON fact.job_id = quote.job_id
+            JOIN job_response_projections projection ON projection.job_id = quote.job_id
+            JOIN executor_artifact_authorities authority
+              ON authority.submission_id = fact.submission_id
+            WHERE quote.job_id = $1
+              AND fact.submission_id = $2
+              AND fact.metric = 'video_requested_second'
+            "#,
+        )
+        .bind(terminal.job_id)
+        .bind(terminal.submission_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        let expected_identity = json!({
+            "quote_api_profile": quote_identity.quote_api_profile,
+            "price_api_profile": quote_identity.price_api_profile,
+            "provider_model_id": quote_identity.provider_model_id,
+            "public_model_id": quote_identity.public_model_id,
+            "dimensions": quote_identity.dimensions,
+            "source_kind": "manual",
+            "source_url": null,
+            "provider_id": DREAMINA_PROVIDER_ID,
+            "provider_account_id": DREAMINA_ACCOUNT_ID.to_string(),
+            "metric": "video_requested_second",
+            "unit": "second",
+            "quantity": 8,
+            "projection_api_profile": api_profile,
+            "projection_operation": VIDEO_GENERATION_OPERATION,
+            "output_format": "mp4",
+            "size": "720p",
+            "media_type": "video/mp4",
+            "media_duration_ms": 8000,
+        });
+        require(
+            identity == expected_identity,
+            format!("{owner_suffix} video terminal identity drifted: {identity}"),
+        )?;
+
+        let inspected_usage: serde_json::Value = sqlx::query_scalar(
+            r#"
+            SELECT jsonb_build_object(
+                'quantity', fact.quantity,
+                'unit', fact.unit,
+                'quantity_source', fact.quantity_source,
+                'confidence', fact.confidence,
+                'evidence_path', fact.evidence_path,
+                'partition_key', fact.billing_partition_key,
+                'media_duration_ms', fact.metadata_json -> 'media_duration_ms',
+                'duration_rounding', fact.metadata_json -> 'duration_rounding'
+            )
+            FROM provider_usage_facts fact
+            WHERE fact.job_id = $1
+              AND fact.submission_id = $2
+              AND fact.metric = 'video_output_second'
+              AND fact.quantity_source = 'media_inspected'
+            "#,
+        )
+        .bind(terminal.job_id)
+        .bind(terminal.submission_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(
+            inspected_usage
+                == json!({
+                    "quantity": 8,
+                    "unit": "second",
+                    "quantity_source": "media_inspected",
+                    "confidence": "exact",
+                    "evidence_path": "executor_artifact_authorities.media_duration_ms",
+                    "partition_key": format!("provider-output:{}", terminal.output_id),
+                    "media_duration_ms": 8000,
+                    "duration_rounding": "ceil_to_second",
+                }),
+            format!("video media evidence did not produce exact usage: {inspected_usage}"),
+        )?;
+
+        let (posting_count, posting_sum): (i64, i64) = sqlx::query_as(
+            r#"
+            SELECT COUNT(posting.posting_no)::BIGINT,
+                   COALESCE(SUM(posting.amount_micros), 0)::BIGINT
+            FROM ledger_transactions transaction
+            JOIN ledger_postings posting
+              ON posting.transaction_id = transaction.transaction_id
+            WHERE transaction.source_job_id = $1
+              AND transaction.transaction_type = 'customer_job_charge'
+            "#,
+        )
+        .bind(terminal.job_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(
+            posting_count == 2 && posting_sum == 0,
+            format!(
+                "Dreamina video customer ledger was not balanced: {posting_count}/{posting_sum}"
+            ),
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
+async fn v4_terminal_success_rates_the_frozen_official_token_quantity() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let work =
+            seed_codex_generation_lease(&database.pool, "v4-token-completion-worker").await?;
+        seed_v4_customer_token_quote(&database.pool, &work).await?;
+        let executor = PostgresExecutorSubmissionStore::new(database.pool.clone());
+        let (executor_artifacts, artifact_root) = artifact_publisher(&executor)?;
+        let prepared = executor
+            .prepare_and_handoff(&work, profile_id_for_lease(&work))
+            .await
+            .map_err(debug_error)?;
+        require(prepared.len() == 1, "expected one token-priced output")?;
+        seed_terminal_quota(&database.pool, &work).await?;
+
+        let scope = ExecutorClaimScope {
+            execution_profile_id: CODEX_PROFILE_ID,
+            provider_id: "openai-codex".to_string(),
+            command_schema: GENERATION_COMMAND_SCHEMA.to_string(),
+            adapter_revision: CODEX_GENERATION_ADAPTER_REVISION.to_string(),
+        };
+        let executor_lease = executor
+            .claim_prepared(&scope, "v4-token-completion-executor", 60_000)
+            .await
+            .map_err(debug_error)?
+            .ok_or_else(|| "token-priced executor claim returned none".to_string())?;
+        executor.start(&executor_lease).await.map_err(debug_error)?;
+        let manifest = publish_result_authority(&executor_artifacts, &executor_lease).await?;
+        executor
+            .record_outcome(
+                &executor_lease,
+                &ExecutorSubmissionOutcome::Succeeded(manifest),
+            )
+            .await
+            .map_err(debug_error)?;
+
+        let reductions = PostgresExecutorTerminalStore::new(database.pool.clone());
+        let terminal = reductions
+            .claim_terminal("v4-token-completion-reducer", 60_000)
+            .await
+            .map_err(debug_error)?
+            .ok_or_else(|| "token-priced terminal reduction was not queued".to_string())?;
+        let customer_blobs =
+            Arc::new(FilesystemArtifactBlobStore::new(artifact_root.path()).map_err(debug_error)?);
+        let customer = CustomerArtifactPublisher::new(customer_blobs)
+            .publish(&terminal)
+            .await
+            .map_err(debug_error)?;
+        let first = reductions
+            .complete_terminal(&terminal, Some(&customer))
+            .await
+            .map_err(debug_error)?;
+        let replay = reductions
+            .complete_terminal(&terminal, Some(&customer))
+            .await
+            .map_err(debug_error)?;
+        require(
+            first == replay && first.parent_state == ExecutorParentTerminalState::Succeeded,
+            format!("token-priced terminal replay changed identity: {first:?} {replay:?}"),
+        )?;
+
+        let state: (
+            i64,
+            String,
+            String,
+            String,
+            i64,
+            i64,
+            i64,
+            i64,
+            String,
+        ) = sqlx::query_as(
+            r#"
+            SELECT fact.quantity, fact.quantity_source, fact.confidence,
+                   fact.evidence_path,
+                   line.actual_quantity, line.amount_micros,
+                   hold.captured_micros, account.captured_micros,
+                   hold.state
+            FROM provider_usage_facts fact
+            JOIN customer_rated_usage_fact_links link
+              ON link.usage_fact_id = fact.usage_fact_id
+            JOIN customer_rated_usage_lines line
+              ON line.rated_usage_line_id = link.rated_usage_line_id
+            JOIN customer_rated_usage rating
+              ON rating.rated_usage_id = line.rated_usage_id
+            JOIN customer_billing_holds hold
+              ON hold.job_id = rating.job_id
+            JOIN billing_accounts account
+              ON account.tenant_id = hold.tenant_id
+             AND account.currency = hold.currency
+            WHERE fact.submission_id = $1
+              AND fact.metric = 'image_output_token'
+              AND fact.unit = 'token'
+              AND fact.terminal_outcome = 'succeeded'
+            "#,
+        )
+        .bind(terminal.submission_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(
+            state
+                == (
+                    7_024,
+                    "official_lookup".to_string(),
+                    "estimated".to_string(),
+                    "https://developers.openai.com/api/docs/guides/image-generation#gpt-image-2-output-tokens".to_string(),
+                    7_024,
+                    210_720,
+                    210_720,
+                    210_720,
+                    "settled".to_string(),
+                ),
+            format!("official token quantity did not settle exactly: {state:?}"),
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
+async fn v4_terminal_rejects_a_conflicting_usage_fact_without_partial_settlement() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let work = seed_codex_generation_lease(&database.pool, "v4-fact-conflict-worker").await?;
+        seed_v4_customer_quote(&database.pool, &work, 7).await?;
+        let executor = PostgresExecutorSubmissionStore::new(database.pool.clone());
+        let (executor_artifacts, artifact_root) = artifact_publisher(&executor)?;
+        executor
+            .prepare_and_handoff(&work, profile_id_for_lease(&work))
+            .await
+            .map_err(debug_error)?;
+        seed_terminal_quota(&database.pool, &work).await?;
+
+        let scope = ExecutorClaimScope {
+            execution_profile_id: CODEX_PROFILE_ID,
+            provider_id: "openai-codex".to_string(),
+            command_schema: GENERATION_COMMAND_SCHEMA.to_string(),
+            adapter_revision: CODEX_GENERATION_ADAPTER_REVISION.to_string(),
+        };
+        let executor_lease = executor
+            .claim_prepared(&scope, "v4-fact-conflict-executor", 60_000)
+            .await
+            .map_err(debug_error)?
+            .ok_or_else(|| "fact-conflict executor claim returned none".to_string())?;
+        executor.start(&executor_lease).await.map_err(debug_error)?;
+        let manifest = publish_result_authority(&executor_artifacts, &executor_lease).await?;
+        executor
+            .record_outcome(
+                &executor_lease,
+                &ExecutorSubmissionOutcome::Succeeded(manifest),
+            )
+            .await
+            .map_err(debug_error)?;
+
+        let reductions = PostgresExecutorTerminalStore::new(database.pool.clone());
+        let terminal = reductions
+            .claim_terminal("v4-fact-conflict-reducer", 60_000)
+            .await
+            .map_err(debug_error)?
+            .ok_or_else(|| "fact-conflict terminal reduction was not queued".to_string())?;
+        sqlx::query(
+            r#"
+            CREATE FUNCTION inject_conflicting_v4_usage_fact() RETURNS TRIGGER AS $$
+            DECLARE
+                account_id UUID;
+            BEGIN
+                SELECT provider_account_id INTO account_id
+                FROM provider_submissions
+                WHERE submission_id = NEW.submission_id;
+
+                INSERT INTO provider_usage_facts (
+                    usage_fact_id, semantic_key, job_id, output_id, submission_id,
+                    receipt_id, provider_id, provider_account_id, execution_surface,
+                    fact_domain, metric, quantity, unit, quantity_source, confidence, evidence_path,
+                    metadata_json, billing_partition_key, terminal_outcome, created_at_ms
+                )
+                VALUES (
+                    NEW.receipt_id,
+                    NEW.receipt_id::TEXT || ':image_output:image:request_derived:v1',
+                    NEW.job_id, NEW.output_id, NEW.submission_id, NEW.receipt_id,
+                    NEW.provider_id, account_id, 'provider_cli',
+                    'customer_billable', 'image_output', 2, 'image',
+                    'request_derived', 'exact',
+                    'job_outputs.billable_units',
+                    '{"quality":"high","size":"1024x1024","basis":"forged"}'::JSONB,
+                    'output:' || NEW.output_id::TEXT, NEW.outcome, NEW.created_at_ms
+                );
+                RETURN NEW;
+            END;
+            $$ LANGUAGE plpgsql;
+            "#,
+        )
+        .execute(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        sqlx::query(
+            r#"
+            CREATE TRIGGER inject_conflicting_v4_usage_fact
+            AFTER INSERT ON provider_receipts
+            FOR EACH ROW EXECUTE FUNCTION inject_conflicting_v4_usage_fact()
+            "#,
+        )
+        .execute(&database.pool)
+        .await
+        .map_err(debug_error)?;
+
+        let customer_blobs =
+            Arc::new(FilesystemArtifactBlobStore::new(artifact_root.path()).map_err(debug_error)?);
+        let customer = CustomerArtifactPublisher::new(customer_blobs)
+            .publish(&terminal)
+            .await
+            .map_err(debug_error)?;
+        require(
+            matches!(
+                reductions
+                    .complete_terminal(&terminal, Some(&customer))
+                    .await,
+                Err(ExecutorTerminalError::Conflict)
+            ),
+            "terminal settlement accepted a conflicting immutable usage fact",
+        )?;
+
+        let state: (String, String, i64, i64, i64, i64, i64, i64) = sqlx::query_as(
+            r#"
+            SELECT reduction.state, output.state,
+                   (SELECT COUNT(*) FROM provider_receipts WHERE submission_id = $1),
+                   (SELECT COUNT(*) FROM provider_usage_facts WHERE submission_id = $1),
+                   (SELECT COUNT(*) FROM customer_rated_usage WHERE job_id = $2),
+                   (SELECT COUNT(*) FROM ledger_transactions
+                      WHERE source_job_id = $2
+                        AND transaction_type = 'customer_job_charge'),
+                   hold.captured_micros, hold.released_micros
+            FROM executor_terminal_reductions reduction
+            JOIN provider_submissions submission
+              ON submission.submission_id = reduction.submission_id
+            JOIN job_outputs output ON output.output_id = submission.output_id
+            JOIN customer_billing_holds hold ON hold.job_id = submission.job_id
+            WHERE reduction.submission_id = $1
+            "#,
+        )
+        .bind(terminal.submission_id)
+        .bind(terminal.job_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(
+            state
+                == (
+                    "leased".to_string(),
+                    "pending".to_string(),
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                ),
+            format!("conflicting usage fact left partial settlement state: {state:?}"),
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
+async fn v4_terminal_failure_releases_the_official_token_hold_without_a_charge() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let work = seed_codex_generation_lease(&database.pool, "v4-token-failure-worker").await?;
+        seed_v4_customer_token_quote(&database.pool, &work).await?;
+        let executor = PostgresExecutorSubmissionStore::new(database.pool.clone());
+        let prepared = executor
+            .prepare_and_handoff(&work, profile_id_for_lease(&work))
+            .await
+            .map_err(debug_error)?;
+        require(prepared.len() == 1, "expected one token-priced output")?;
+        seed_terminal_quota(&database.pool, &work).await?;
+
+        let scope = ExecutorClaimScope {
+            execution_profile_id: CODEX_PROFILE_ID,
+            provider_id: "openai-codex".to_string(),
+            command_schema: GENERATION_COMMAND_SCHEMA.to_string(),
+            adapter_revision: CODEX_GENERATION_ADAPTER_REVISION.to_string(),
+        };
+        let executor_lease = executor
+            .claim_prepared(&scope, "v4-token-failure-executor", 60_000)
+            .await
+            .map_err(debug_error)?
+            .ok_or_else(|| "token-priced failed executor claim returned none".to_string())?;
+        executor.start(&executor_lease).await.map_err(debug_error)?;
+        executor
+            .record_outcome(
+                &executor_lease,
+                &ExecutorSubmissionOutcome::Failed {
+                    error_code: "provider_failed".to_string(),
+                },
+            )
+            .await
+            .map_err(debug_error)?;
+
+        let reductions = PostgresExecutorTerminalStore::new(database.pool.clone());
+        let terminal = reductions
+            .claim_terminal("v4-token-failure-reducer", 60_000)
+            .await
+            .map_err(debug_error)?
+            .ok_or_else(|| "token-priced failed reduction was not queued".to_string())?;
+        let first = reductions
+            .complete_terminal(&terminal, None)
+            .await
+            .map_err(debug_error)?;
+        let replay = reductions
+            .complete_terminal(&terminal, None)
+            .await
+            .map_err(debug_error)?;
+        require(
+            first == replay && first.parent_state == ExecutorParentTerminalState::Failed,
+            format!("token-priced failed replay changed identity: {first:?} {replay:?}"),
+        )?;
+
+        let state: (i64, i64, i64, i64, i64, String) = sqlx::query_as(
+            r#"
+            SELECT fact.quantity, line.actual_quantity, line.amount_micros,
+                   hold.captured_micros, hold.released_micros, hold.state
+            FROM provider_usage_facts fact
+            JOIN customer_rated_usage_fact_links link
+              ON link.usage_fact_id = fact.usage_fact_id
+            JOIN customer_rated_usage_lines line
+              ON line.rated_usage_line_id = link.rated_usage_line_id
+            JOIN customer_rated_usage rating
+              ON rating.rated_usage_id = line.rated_usage_id
+            JOIN customer_billing_holds hold
+              ON hold.job_id = rating.job_id
+            WHERE fact.submission_id = $1
+              AND fact.metric = 'image_output_token'
+              AND fact.unit = 'token'
+              AND fact.terminal_outcome = 'failed'
+              AND fact.quantity_source = 'official_lookup'
+              AND fact.confidence = 'estimated'
+            "#,
+        )
+        .bind(terminal.submission_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(
+            state == (0, 0, 0, 0, 210_720, "settled".to_string()),
+            format!("failed token-priced output was charged or remained held: {state:?}"),
+        )?;
+        let charge_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM ledger_transactions
+             WHERE source_job_id = $1 AND transaction_type = 'customer_job_charge'",
+        )
+        .bind(terminal.job_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(
+            charge_count == 0,
+            format!("failed token-priced output created {charge_count} customer charges"),
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
+async fn v4_terminal_multi_output_rates_every_token_partition_once() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let work =
+            seed_codex_generation_lease_with_outputs(&database.pool, "v4-token-multi-worker", 2)
+                .await?;
+        seed_v4_customer_token_quote(&database.pool, &work).await?;
+        let executor = PostgresExecutorSubmissionStore::new(database.pool.clone());
+        let (executor_artifacts, artifact_root) = artifact_publisher(&executor)?;
+        let prepared = executor
+            .prepare_and_handoff(&work, profile_id_for_lease(&work))
+            .await
+            .map_err(debug_error)?;
+        require(prepared.len() == 2, "expected two token-priced outputs")?;
+        seed_terminal_quota(&database.pool, &work).await?;
+
+        let scope = ExecutorClaimScope {
+            execution_profile_id: CODEX_PROFILE_ID,
+            provider_id: "openai-codex".to_string(),
+            command_schema: GENERATION_COMMAND_SCHEMA.to_string(),
+            adapter_revision: CODEX_GENERATION_ADAPTER_REVISION.to_string(),
+        };
+        let customer_blobs =
+            Arc::new(FilesystemArtifactBlobStore::new(artifact_root.path()).map_err(debug_error)?);
+        let customer_publisher = CustomerArtifactPublisher::new(customer_blobs);
+        let reductions = PostgresExecutorTerminalStore::new(database.pool.clone());
+        for output_index in 0..2 {
+            let executor_lease = executor
+                .claim_prepared(
+                    &scope,
+                    &format!("v4-token-multi-executor-{output_index}"),
+                    60_000,
+                )
+                .await
+                .map_err(debug_error)?
+                .ok_or_else(|| format!("token output {output_index} was not claimable"))?;
+            executor.start(&executor_lease).await.map_err(debug_error)?;
+            let manifest = publish_result_authority(&executor_artifacts, &executor_lease).await?;
+            executor
+                .record_outcome(
+                    &executor_lease,
+                    &ExecutorSubmissionOutcome::Succeeded(manifest),
+                )
+                .await
+                .map_err(debug_error)?;
+            let terminal = reductions
+                .claim_terminal(&format!("v4-token-multi-reducer-{output_index}"), 60_000)
+                .await
+                .map_err(debug_error)?
+                .ok_or_else(|| format!("token output {output_index} reduction was not queued"))?;
+            let customer = customer_publisher
+                .publish(&terminal)
+                .await
+                .map_err(debug_error)?;
+            let completion = reductions
+                .complete_terminal(&terminal, Some(&customer))
+                .await
+                .map_err(debug_error)?;
+            let expected_parent = if output_index == 0 {
+                ExecutorParentTerminalState::Pending
+            } else {
+                ExecutorParentTerminalState::Succeeded
+            };
+            require(
+                completion.parent_state == expected_parent,
+                format!("token output {output_index} settled parent too early: {completion:?}"),
+            )?;
+        }
+
+        let state: (i64, i64, i64, i64, i64, i64, i64, String) = sqlx::query_as(
+            r#"
+            SELECT
+              (SELECT COUNT(*) FROM provider_usage_facts
+                 WHERE job_id = $1
+                   AND metric = 'image_output_token'
+                   AND quantity = 7024
+                   AND quantity_source = 'official_lookup'
+                   AND confidence = 'estimated'),
+              (SELECT COUNT(DISTINCT billing_partition_key)
+                 FROM provider_usage_facts
+                 WHERE job_id = $1 AND metric = 'image_output_token'),
+              (SELECT COUNT(*) FROM customer_rated_usage WHERE job_id = $1),
+              (SELECT COUNT(*) FROM customer_rated_usage_lines line
+                 JOIN customer_rated_usage rating
+                   ON rating.rated_usage_id = line.rated_usage_id
+                 WHERE rating.job_id = $1),
+              (SELECT COUNT(*) FROM customer_rated_usage_fact_links link
+                 JOIN customer_rated_usage_lines line
+                   ON line.rated_usage_line_id = link.rated_usage_line_id
+                 JOIN customer_rated_usage rating
+                   ON rating.rated_usage_id = line.rated_usage_id
+                 WHERE rating.job_id = $1),
+              (SELECT COUNT(*) FROM ledger_transactions
+                 WHERE source_job_id = $1
+                   AND transaction_type = 'customer_job_charge'),
+              hold.captured_micros,
+              hold.state
+            FROM customer_billing_holds hold
+            WHERE hold.job_id = $1
+            "#,
+        )
+        .bind(work.job_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(
+            state == (2, 2, 1, 2, 2, 1, 421_440, "settled".to_string()),
+            format!("multi-output token settlement lost partition identity: {state:?}"),
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
+async fn v4_terminal_failure_releases_the_customer_hold_without_a_charge() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let work =
+            seed_codex_generation_lease(&database.pool, "v4-terminal-failure-worker").await?;
+        seed_v4_customer_quote(&database.pool, &work, 7).await?;
+        let executor = PostgresExecutorSubmissionStore::new(database.pool.clone());
+        let prepared = executor
+            .prepare_and_handoff(&work, profile_id_for_lease(&work))
+            .await
+            .map_err(debug_error)?;
+        require(
+            prepared.len() == 1,
+            "expected one failed v4 prepared output",
+        )?;
+        seed_terminal_quota(&database.pool, &work).await?;
+
+        let scope = ExecutorClaimScope {
+            execution_profile_id: CODEX_PROFILE_ID,
+            provider_id: "openai-codex".to_string(),
+            command_schema: GENERATION_COMMAND_SCHEMA.to_string(),
+            adapter_revision: CODEX_GENERATION_ADAPTER_REVISION.to_string(),
+        };
+        let executor_lease = executor
+            .claim_prepared(&scope, "v4-terminal-failure-executor", 60_000)
+            .await
+            .map_err(debug_error)?
+            .ok_or_else(|| "failed v4 codex executor claim returned none".to_string())?;
+        executor.start(&executor_lease).await.map_err(debug_error)?;
+        executor
+            .record_outcome(
+                &executor_lease,
+                &ExecutorSubmissionOutcome::Failed {
+                    error_code: "provider_failed".to_string(),
+                },
+            )
+            .await
+            .map_err(debug_error)?;
+
+        let reductions = PostgresExecutorTerminalStore::new(database.pool.clone());
+        let terminal = reductions
+            .claim_terminal("v4-terminal-failure-reducer", 60_000)
+            .await
+            .map_err(debug_error)?
+            .ok_or_else(|| "failed v4 terminal reduction was not queued".to_string())?;
+        let first = reductions
+            .complete_terminal(&terminal, None)
+            .await
+            .map_err(debug_error)?;
+        let replay = reductions
+            .complete_terminal(&terminal, None)
+            .await
+            .map_err(debug_error)?;
+        require(
+            first == replay && first.parent_state == ExecutorParentTerminalState::Failed,
+            format!("failed v4 terminal replay changed identity: {first:?} {replay:?}"),
+        )?;
+
+        let state = v4_terminal_economic_state(
+            &database.pool,
+            terminal.submission_id,
+            terminal.job_id,
+            terminal.output_id,
+            "failed",
+            "image_output",
+            1,
+            &json!({"quality": "high", "size": "1024x1024"}),
+        )
+        .await?;
+        require(
+            state
+                == V4TerminalEconomicState {
+                    job_state: "failed".to_string(),
+                    output_state: "failed".to_string(),
+                    receipt_count: 1,
+                    provider_usage_fact_count: 1,
+                    legacy_economic_meter_count: 0,
+                    legacy_rating_count: 0,
+                    legacy_hold_count: 0,
+                    legacy_customer_charge_count: 0,
+                    customer_rating_count: 1,
+                    customer_rating_line_count: 1,
+                    customer_fact_link_count: 1,
+                    customer_job_charge_count: 0,
+                    hold_state: "settled".to_string(),
+                    hold_captured_micros: 0,
+                    hold_released_micros: 7,
+                    account_held_micros: 0,
+                    account_captured_micros: 0,
+                },
+            format!("failed v4 terminal customer settlement was not exact: {state:?}"),
         )
     }
     .await;
@@ -2460,6 +3828,103 @@ async fn expired_terminal_reduction_has_one_reclaim_winner_and_fences_old_epoch(
 }
 
 #[tokio::test]
+async fn blocked_terminal_reduction_is_durable_and_fences_its_lease() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let work = seed_lease(&database.pool, "blocked-terminal-worker", 1).await?;
+        seed_terminal_quota(&database.pool, &work).await?;
+        let executor = PostgresExecutorSubmissionStore::new(database.pool.clone());
+        executor
+            .prepare_and_handoff(&work, profile_id_for_lease(&work))
+            .await
+            .map_err(debug_error)?;
+        let executor_lease = claim_required(&executor, "blocked-terminal-executor").await?;
+        executor.start(&executor_lease).await.map_err(debug_error)?;
+        executor
+            .record_outcome(
+                &executor_lease,
+                &ExecutorSubmissionOutcome::Failed {
+                    error_code: "provider_failed".to_string(),
+                },
+            )
+            .await
+            .map_err(debug_error)?;
+
+        let reductions = PostgresExecutorTerminalStore::new(database.pool.clone());
+        let lease = reductions
+            .claim_terminal("blocked-terminal-reducer", 60_000)
+            .await
+            .map_err(debug_error)?
+            .ok_or_else(|| "failed terminal reduction was not queued".to_string())?;
+        reductions
+            .block_terminal(&lease, ExecutorTerminalBlockReason::CanonicalConflict)
+            .await
+            .map_err(debug_error)?;
+
+        let blocked: (
+            String,
+            Option<String>,
+            Option<i64>,
+            String,
+            String,
+            i64,
+            Option<String>,
+            Option<Uuid>,
+            Option<Uuid>,
+            Option<Uuid>,
+        ) = sqlx::query_as(
+            r#"
+            SELECT state, lease_owner, lease_expires_at_ms,
+                   blocked_error_code, blocked_by, blocked_at_ms,
+                   completion_owner, provider_receipt_id,
+                   customer_artifact_id, quota_reservation_id
+            FROM executor_terminal_reductions
+            WHERE submission_id = $1
+            "#,
+        )
+        .bind(lease.submission_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(
+            blocked.0 == "blocked"
+                && blocked.1.is_none()
+                && blocked.2.is_none()
+                && blocked.3 == "canonical_conflict"
+                && blocked.4 == lease.reducer_owner
+                && blocked.5 > 0
+                && blocked.6.is_none()
+                && blocked.7.is_none()
+                && blocked.8.is_none()
+                && blocked.9.is_none(),
+            format!("blocked terminal state was not durable and clean: {blocked:?}"),
+        )?;
+        require(
+            reductions
+                .claim_terminal("blocked-terminal-reclaimer", 60_000)
+                .await
+                .map_err(debug_error)?
+                .is_none(),
+            "blocked terminal reduction was reclaimed",
+        )?;
+        require(
+            reductions.heartbeat_terminal(&lease, 60_000).await
+                == Err(ExecutorTerminalError::StaleLease),
+            "blocked terminal lease retained heartbeat authority",
+        )?;
+        let completion = reductions.complete_terminal(&lease, None).await;
+        require(
+            completion == Err(ExecutorTerminalError::StaleLease),
+            format!("blocked terminal lease retained completion authority: {completion:?}"),
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
 async fn expired_reduction_lease_cannot_complete_after_reclaim() -> TestResult {
     let Some(database) = TestDatabase::new().await? else {
         return Ok(());
@@ -2591,7 +4056,9 @@ async fn prepare_binds_the_persisted_command_and_output_count() -> TestResult {
             "caller-supplied command replaced the durable payload",
         )?;
 
-        sqlx::query("UPDATE jobs SET requested_units = 3 WHERE job_id = $1")
+        sqlx::query(
+            "UPDATE jobs SET requested_units = 3, output_count = 3, billable_units = 3 WHERE job_id = $1",
+        )
             .bind(lease.job_id)
             .execute(&database.pool)
             .await
@@ -3005,6 +4472,21 @@ async fn claim_requires_committed_handoff_and_has_one_winner_per_submission() ->
             .prepare_and_handoff(&lease, profile_id_for_lease(&lease))
             .await
             .map_err(|error| format!("handoff failed: {error:?}"))?;
+        sqlx::query(
+            r#"
+            UPDATE provider_account_execution_controls control
+            SET lifecycle_state = 'draining', control_version = control_version + 1,
+                drain_started_at_ms = floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT,
+                updated_at_ms = floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT
+            FROM provider_execution_profiles profile
+            WHERE profile.execution_profile_id = $1
+              AND control.provider_account_id = profile.provider_account_id
+            "#,
+        )
+        .bind(profile_id_for_lease(&lease))
+        .execute(&database.pool)
+        .await
+        .map_err(debug_error)?;
         tokio::time::sleep(Duration::from_millis(130)).await;
         let reconciled = PostgresReconciliationStore::new(database.pool.clone())
             .reconcile_expired_work(10)
@@ -3570,7 +5052,22 @@ async fn record_outcome_persists_evidence_without_settling_customer_output() -> 
             "an unexpired running execution accepted a forged expiry decision",
         )?;
 
-        let successful_manifest = publish_result_authority(&artifacts, &claims[0]).await?;
+        let provider_cost = ProviderReportedCostEvidenceV1::usd_ticks(
+            ProviderCostEvidenceScope::CliInvocation,
+            "provider-test",
+            "provider_cli",
+            "provider-operation-1",
+            200_000_000,
+            br#"{"total_cost_usd_ticks":200000000}"#,
+            "end.total_cost_usd_ticks",
+        )
+        .map_err(debug_error)?;
+        let successful_manifest = publish_result_authority(&artifacts, &claims[0])
+            .await?
+            .with_provider_reported_cost(Some(provider_cost.clone()))
+            .ok_or("provider cost evidence was rejected")?;
+        let successful_manifest_id = successful_manifest.manifest_id();
+        let successful_authority_id = successful_manifest.artifact_authority_id();
         let outcomes = [
             ExecutorSubmissionOutcome::Succeeded(successful_manifest),
             ExecutorSubmissionOutcome::Failed {
@@ -3602,6 +5099,32 @@ async fn record_outcome_persists_evidence_without_settling_customer_output() -> 
                 == Err(ExecutorSubmissionError::Conflict),
             "conflicting terminal outcome was accepted",
         )?;
+        let conflicting_cost = ProviderReportedCostEvidenceV1::usd_ticks(
+            ProviderCostEvidenceScope::CliInvocation,
+            "provider-test",
+            "provider_cli",
+            "provider-operation-1",
+            300_000_000,
+            br#"{"total_cost_usd_ticks":300000000}"#,
+            "end.total_cost_usd_ticks",
+        )
+        .map_err(debug_error)?;
+        let conflicting_manifest =
+            ExecutorResultManifest::new(successful_manifest_id, successful_authority_id)
+                .and_then(|manifest| {
+                    manifest.with_provider_reported_cost(Some(conflicting_cost))
+                })
+                .ok_or("conflicting provider cost manifest was rejected locally")?;
+        require(
+            store
+                .record_outcome(
+                    &claims[0],
+                    &ExecutorSubmissionOutcome::Succeeded(conflicting_manifest),
+                )
+                .await
+                == Err(ExecutorSubmissionError::Conflict),
+            "terminal replay accepted different provider cost evidence",
+        )?;
         let mut wrong_owner = claims[1].clone();
         wrong_owner.executor_owner = "different-executor".to_string();
         require(
@@ -3626,6 +5149,37 @@ async fn record_outcome_persists_evidence_without_settling_customer_output() -> 
             .await
             .is_err(),
             "terminal executor payload remained mutable",
+        )?;
+        let stored_cost: (String, String, String, String) = sqlx::query_as(
+            r#"
+            SELECT scope, provider_id, native_quantity::TEXT, evidence_path
+            FROM executor_provider_cost_evidence
+            WHERE manifest_id = $1
+            "#,
+        )
+        .bind(successful_manifest_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(
+            stored_cost
+                == (
+                    "cli_invocation".to_string(),
+                    "provider-test".to_string(),
+                    "200000000".to_string(),
+                    "end.total_cost_usd_ticks".to_string(),
+                ),
+            format!("provider cost evidence drifted in storage: {stored_cost:?}"),
+        )?;
+        require(
+            sqlx::query(
+                "UPDATE executor_provider_cost_evidence SET native_quantity = 1 WHERE manifest_id = $1",
+            )
+            .bind(successful_manifest_id)
+            .execute(&database.pool)
+            .await
+            .is_err(),
+            "provider cost evidence remained mutable",
         )?;
 
         type OutcomeRow = (String, String, String, Option<String>, Option<Uuid>);
@@ -4505,6 +6059,16 @@ async fn publish_result_authority(
         .map_err(debug_error)
 }
 
+async fn publish_video_result_authority(
+    publisher: &ExecutorArtifactPublisher,
+    claim: &ExecutorSubmissionLease,
+) -> TestResult<ExecutorResultManifest> {
+    publisher
+        .publish(claim, &minimal_mp4())
+        .await
+        .map_err(debug_error)
+}
+
 fn png_bytes(pixel: [u8; 4]) -> Vec<u8> {
     let image = RgbaImage::from_pixel(1, 1, Rgba(pixel));
     let mut cursor = std::io::Cursor::new(Vec::new());
@@ -4512,6 +6076,42 @@ fn png_bytes(pixel: [u8; 4]) -> Vec<u8> {
         .write_to(&mut cursor, ImageFormat::Png)
         .unwrap();
     cursor.into_inner()
+}
+
+fn minimal_mp4() -> Vec<u8> {
+    let config = mp4::Mp4Config {
+        major_brand: "isom".parse().unwrap(),
+        minor_version: 512,
+        compatible_brands: vec!["isom".parse().unwrap(), "avc1".parse().unwrap()],
+        timescale: 1_000,
+    };
+    let mut writer =
+        mp4::Mp4Writer::write_start(std::io::Cursor::new(Vec::new()), &config).unwrap();
+    writer
+        .add_track(
+            &mp4::AvcConfig {
+                width: 16,
+                height: 16,
+                seq_param_set: vec![0x67, 0x42, 0x00, 0x1e],
+                pic_param_set: vec![0x68, 0xce, 0x3c, 0x80],
+            }
+            .into(),
+        )
+        .unwrap();
+    writer
+        .write_sample(
+            1,
+            &mp4::Mp4Sample {
+                start_time: 0,
+                duration: 8_000,
+                rendering_offset: 0,
+                is_sync: true,
+                bytes: vec![0, 0, 0, 1, 0x65].into(),
+            },
+        )
+        .unwrap();
+    writer.write_end().unwrap();
+    writer.into_writer().into_inner()
 }
 
 fn sha256(bytes: &[u8]) -> String {
@@ -4703,6 +6303,91 @@ async fn launch_context_is_loaded_only_for_the_exact_running_lease() -> TestResu
 }
 
 #[tokio::test]
+async fn launch_context_restores_digest_bound_input_metadata() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let work = seed_lease(&database.pool, "launch-input-worker", 1).await?;
+        let admission_session_id: Uuid = sqlx::query_scalar(
+            "SELECT admission_session_id FROM job_payloads WHERE job_id = $1",
+        )
+        .bind(work.job_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        let input_id = Uuid::new_v4();
+        let object_key = format!("sealed/{input_id}");
+        let digest = "d".repeat(64);
+        let now = database_now(&database.pool).await?;
+        sqlx::query(
+            r#"
+            INSERT INTO job_input_manifests
+              (job_id, admission_session_id, manifest_schema, manifest_hash, input_count, created_at_ms)
+            VALUES ($1, $2, 'xai.video.inputs.v1', $3, 1, $4)
+            "#,
+        )
+        .bind(work.job_id)
+        .bind(admission_session_id)
+        .bind("e".repeat(64))
+        .bind(now)
+        .execute(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        sqlx::query(
+            r#"
+            INSERT INTO job_input_objects
+              (input_id, job_id, admission_session_id, role, input_index, media_type,
+               storage_backend, object_key, sha256_hex, byte_size, created_at_ms)
+            VALUES ($1, $2, $3, 'image', 0, 'image/jpeg',
+                    'filesystem-input-v1', $4, $5, 123, $6)
+            "#,
+        )
+        .bind(input_id)
+        .bind(work.job_id)
+        .bind(admission_session_id)
+        .bind(&object_key)
+        .bind(&digest)
+        .bind(now)
+        .execute(&database.pool)
+        .await
+        .map_err(debug_error)?;
+
+        let store = PostgresExecutorSubmissionStore::new(database.pool.clone());
+        store
+            .prepare_and_handoff(&work, profile_id_for_lease(&work))
+            .await
+            .map_err(debug_error)?;
+        let lease = claim_required(&store, "launch-input-executor").await?;
+        store.start(&lease).await.map_err(debug_error)?;
+        let context = store
+            .load_launch_context(&lease)
+            .await
+            .map_err(debug_error)?;
+        let [input] = context.inputs() else {
+            return Err(format!(
+                "launch context did not restore exactly one input: {:?}",
+                context.inputs()
+            ));
+        };
+        require(
+            input.role() == "image"
+                && input.index() == 0
+                && input.media_type() == "image/jpeg"
+                && input.blob().key.admission_session_id == admission_session_id
+                && input.blob().key.input_id == input_id
+                && input.blob().storage_backend == "filesystem-input-v1"
+                && input.blob().object_key == object_key
+                && input.blob().sha256_hex == digest
+                && input.blob().byte_size == 123,
+            format!("launch context changed sealed input authority: {input:?}"),
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
 async fn launch_context_rejects_command_tampering_and_expired_lease() -> TestResult {
     let Some(database) = TestDatabase::new().await? else {
         return Ok(());
@@ -4789,10 +6474,12 @@ async fn seed_price_hold(
     sqlx::query(
         r#"
         INSERT INTO price_quotes
-          (quote_id, job_id, price_version_id, currency, output_count,
+          (quote_id, job_id, price_version_id, currency, output_count, billable_units,
+           billing_metric, billing_unit,
            success_micros, failed_micros, no_effect_micros, max_total_micros,
            quote_hash, created_at_ms)
-        VALUES ($1, $2, $3, 'USD', 1, $4, 0, 0, $4, $5, $6)
+        VALUES ($1, $2, $3, 'USD', 1, 1, 'output', 'output',
+                $4, 0, 0, $4, $5, $6)
         "#,
     )
     .bind(quote_id)
@@ -4897,10 +6584,12 @@ async fn seed_terminal_economics(
     sqlx::query(
         r#"
         INSERT INTO price_quotes
-          (quote_id, job_id, price_version_id, currency, output_count,
+          (quote_id, job_id, price_version_id, currency, output_count, billable_units,
+           billing_metric, billing_unit,
            success_micros, failed_micros, no_effect_micros, max_total_micros,
            quote_hash, created_at_ms)
-        VALUES ($1, $2, $3, 'USD', $4, $5, $6, $7, $8, $9, $10)
+        VALUES ($1, $2, $3, 'USD', $4, $4, 'output', 'output',
+                $5, $6, $7, $8, $9, $10)
         "#,
     )
     .bind(quote_id)
@@ -4938,13 +6627,670 @@ async fn seed_terminal_economics(
     tx.commit().await.map_err(debug_error)
 }
 
-async fn seed_terminal_quota(pool: &PgPool, work: &WorkLease) -> TestResult {
-    let (tenant_id, request_id, requested_units): (String, String, i32) =
-        sqlx::query_as("SELECT tenant_id, request_id, requested_units FROM jobs WHERE job_id = $1")
+async fn v4_terminal_economic_state(
+    pool: &PgPool,
+    submission_id: Uuid,
+    job_id: Uuid,
+    output_id: Uuid,
+    terminal_outcome: &str,
+    expected_metric: &str,
+    expected_quantity: i64,
+    expected_dimensions: &serde_json::Value,
+) -> TestResult<V4TerminalEconomicState> {
+    sqlx::query_as(
+        r#"
+        SELECT job.state AS job_state, output.state AS output_state,
+               (SELECT COUNT(*) FROM provider_receipts
+                WHERE submission_id = $1) AS receipt_count,
+               (SELECT COUNT(*) FROM provider_usage_facts
+                WHERE submission_id = $1
+                  AND job_id = $2
+                  AND output_id = $3
+                  AND billing_partition_key = 'output:' || $3::TEXT
+                  AND terminal_outcome = $4
+                  AND metric = $5
+                  AND quantity = $6
+                  AND metadata_json @> $7)
+                 AS provider_usage_fact_count,
+               (SELECT COUNT(*) FROM economic_metering_events
+                WHERE output_id = $3) AS legacy_economic_meter_count,
+               (SELECT COUNT(*) FROM rated_usage
+                WHERE output_id = $3) AS legacy_rating_count,
+               (SELECT COUNT(*) FROM output_holds
+                WHERE output_id = $3) AS legacy_hold_count,
+               (SELECT COUNT(*) FROM ledger_transactions
+                WHERE source_job_id = $2
+                  AND transaction_type = 'customer_charge')
+                 AS legacy_customer_charge_count,
+               (SELECT COUNT(*) FROM customer_rated_usage
+                WHERE job_id = $2) AS customer_rating_count,
+               (SELECT COUNT(*) FROM customer_rated_usage_lines line
+                JOIN customer_rated_usage rating
+                  ON rating.rated_usage_id = line.rated_usage_id
+                WHERE rating.job_id = $2) AS customer_rating_line_count,
+               (SELECT COUNT(*) FROM customer_rated_usage_fact_links link
+                JOIN customer_rated_usage_lines line
+                  ON line.rated_usage_line_id = link.rated_usage_line_id
+                JOIN customer_rated_usage rating
+                  ON rating.rated_usage_id = line.rated_usage_id
+                WHERE rating.job_id = $2) AS customer_fact_link_count,
+               (SELECT COUNT(*) FROM ledger_transactions
+                WHERE source_job_id = $2
+                  AND transaction_type = 'customer_job_charge')
+                 AS customer_job_charge_count,
+               hold.state AS hold_state,
+               hold.captured_micros AS hold_captured_micros,
+               hold.released_micros AS hold_released_micros,
+               account.held_micros AS account_held_micros,
+               account.captured_micros AS account_captured_micros
+        FROM jobs job
+        JOIN job_outputs output ON output.job_id = job.job_id
+        JOIN customer_billing_holds hold ON hold.job_id = job.job_id
+        JOIN billing_accounts account
+          ON account.tenant_id = job.tenant_id
+         AND account.currency = hold.currency
+        WHERE job.job_id = $2 AND output.output_id = $3
+        "#,
+    )
+    .bind(submission_id)
+    .bind(job_id)
+    .bind(output_id)
+    .bind(terminal_outcome)
+    .bind(expected_metric)
+    .bind(expected_quantity)
+    .bind(expected_dimensions)
+    .fetch_one(pool)
+    .await
+    .map_err(debug_error)
+}
+
+async fn seed_v4_customer_quote(
+    pool: &PgPool,
+    work: &WorkLease,
+    success_micros: i64,
+) -> TestResult {
+    seed_v4_customer_quote_with_basis(
+        pool,
+        work,
+        V4CustomerQuoteIdentity::openai(),
+        V4CustomerQuoteBasis {
+            metric: "image_output",
+            unit: "image",
+            unit_size: 1,
+            unit_price_micros: success_micros,
+            quantity_source: "request_derived",
+            confidence: "exact",
+            max_quantity: 1,
+            max_amount_micros: success_micros,
+        },
+    )
+    .await
+}
+
+async fn seed_v4_customer_token_quote(pool: &PgPool, work: &WorkLease) -> TestResult {
+    seed_v4_customer_quote_with_basis(
+        pool,
+        work,
+        V4CustomerQuoteIdentity::openai(),
+        V4CustomerQuoteBasis {
+            metric: "image_output_token",
+            unit: "token",
+            unit_size: 1_000_000,
+            unit_price_micros: 30_000_000,
+            quantity_source: "official_lookup",
+            confidence: "estimated",
+            max_quantity: 7_024,
+            max_amount_micros: 210_720,
+        },
+    )
+    .await
+}
+
+async fn seed_provider_reported_actual_price(
+    pool: &PgPool,
+    work: &WorkLease,
+    identity: V4CustomerQuoteIdentity,
+) -> TestResult<Uuid> {
+    let provider_id: String = sqlx::query_scalar("SELECT provider_id FROM jobs WHERE job_id = $1")
+        .bind(work.job_id)
+        .fetch_one(pool)
+        .await
+        .map_err(debug_error)?;
+    let now = database_now(pool).await?;
+    let price_book_id = Uuid::new_v4();
+    let price_book_version_id = Uuid::new_v4();
+    let mut tx = pool.begin().await.map_err(debug_error)?;
+    sqlx::query(
+        r#"
+        INSERT INTO price_books (
+            price_book_id, price_book_key, display_name, purpose,
+            scope_type, provider_id, currency, state,
+            created_at_ms, updated_at_ms
+        )
+        VALUES ($1, $2, 'Executor provider actual cost', 'provider_actual',
+                'platform', $3, 'USD', 'active', $4, $4)
+        "#,
+    )
+    .bind(price_book_id)
+    .bind(format!(
+        "executor-provider-actual-{}",
+        price_book_id.simple()
+    ))
+    .bind(&provider_id)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .map_err(debug_error)?;
+    sqlx::query(
+        r#"
+        INSERT INTO price_book_versions (
+            price_book_version_id, price_book_id, version,
+            api_profile, operation, provider_id, provider_model_id,
+            public_model_id, media_kind, service_tier,
+            execution_surface, billing_mode, is_free, state,
+            effective_from_ms, source_kind,
+            created_at_ms, updated_at_ms
+        )
+        VALUES ($1, $2, 1, $3, $4, $5, $6, $7, $8, 'standard',
+                'provider_cli', 'provider_reported', FALSE, 'draft',
+                $9, 'manual', $9, $9)
+        "#,
+    )
+    .bind(price_book_version_id)
+    .bind(price_book_id)
+    .bind(identity.price_api_profile)
+    .bind(identity.operation)
+    .bind(&provider_id)
+    .bind(identity.provider_model_id)
+    .bind(identity.public_model_id)
+    .bind(identity.media_kind)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .map_err(debug_error)?;
+    require_one(
+        sqlx::query(
+            r#"
+            UPDATE price_book_versions
+            SET state = 'active', control_version = 2, updated_at_ms = $2
+            WHERE price_book_version_id = $1
+            "#,
+        )
+        .bind(price_book_version_id)
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .map_err(debug_error)?,
+        "provider actual price version activation",
+    )?;
+    tx.commit().await.map_err(debug_error)?;
+    Ok(price_book_version_id)
+}
+
+#[derive(Clone)]
+struct V4CustomerQuoteIdentity {
+    quote_api_profile: &'static str,
+    price_api_profile: &'static str,
+    operation: &'static str,
+    provider_model_id: &'static str,
+    public_model_id: &'static str,
+    media_kind: &'static str,
+    dimensions: serde_json::Value,
+    source_kind: &'static str,
+    source_url: Option<&'static str>,
+}
+
+impl V4CustomerQuoteIdentity {
+    fn openai() -> Self {
+        Self {
+            quote_api_profile: "openai-images-v1",
+            price_api_profile: "openai-images-v1",
+            operation: "generation",
+            provider_model_id: "gpt-image-2",
+            public_model_id: "gpt-image-2",
+            media_kind: "image",
+            dimensions: json!({"quality": "high", "size": "1024x1024"}),
+            source_kind: "official_document",
+            source_url: Some("https://developers.openai.com/api/docs/pricing"),
+        }
+    }
+
+    fn dreamina() -> Self {
+        Self {
+            quote_api_profile: DREAMINA_IMAGES_API_PROFILE,
+            price_api_profile: DREAMINA_IMAGES_API_PROFILE,
+            operation: "generation",
+            provider_model_id: "5.0",
+            public_model_id: "5.0",
+            media_kind: "image",
+            dimensions: json!({"resolution_type": "2k", "ratio": "1:1"}),
+            source_kind: "official_document",
+            source_url: Some("https://bytedance.larkoffice.com/wiki/FVTwwm0bGiishxkKOoScdHR2nsg"),
+        }
+    }
+
+    fn ark() -> Self {
+        Self {
+            quote_api_profile: image_api_contracts::ark::ARK_IMAGES_API_PROFILE,
+            price_api_profile: DREAMINA_IMAGES_API_PROFILE,
+            operation: "generation",
+            provider_model_id: "5.0",
+            public_model_id: "doubao-seedream-5-0-lite",
+            media_kind: "image",
+            dimensions: json!({"resolution_type": "2k", "ratio": "1:1"}),
+            source_kind: "official_document",
+            source_url: Some("https://bytedance.larkoffice.com/wiki/FVTwwm0bGiishxkKOoScdHR2nsg"),
+        }
+    }
+
+    fn dreamina_video() -> Self {
+        Self {
+            quote_api_profile: DREAMINA_VIDEOS_API_PROFILE,
+            price_api_profile: DREAMINA_VIDEOS_API_PROFILE,
+            operation: VIDEO_GENERATION_OPERATION,
+            provider_model_id: "seedance2.0fast",
+            public_model_id: "seedance2.0fast",
+            media_kind: "video",
+            dimensions: json!({"duration": "8", "ratio": "9:16", "resolution": "720p"}),
+            source_kind: "manual",
+            source_url: None,
+        }
+    }
+
+    fn ark_video() -> Self {
+        Self {
+            quote_api_profile: image_api_contracts::ark::ARK_CONTENT_GENERATION_API_PROFILE,
+            price_api_profile: DREAMINA_VIDEOS_API_PROFILE,
+            operation: VIDEO_GENERATION_OPERATION,
+            provider_model_id: "seedance2.0fast",
+            public_model_id: "doubao-seedance-2-0-fast-260128",
+            media_kind: "video",
+            dimensions: json!({"duration": "8", "ratio": "9:16", "resolution": "720p"}),
+            source_kind: "manual",
+            source_url: None,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct V4CustomerQuoteBasis {
+    metric: &'static str,
+    unit: &'static str,
+    unit_size: i64,
+    unit_price_micros: i64,
+    quantity_source: &'static str,
+    confidence: &'static str,
+    max_quantity: i64,
+    max_amount_micros: i64,
+}
+
+async fn seed_v4_customer_quote_with_basis(
+    pool: &PgPool,
+    work: &WorkLease,
+    identity: V4CustomerQuoteIdentity,
+    basis: V4CustomerQuoteBasis,
+) -> TestResult {
+    let (tenant_id, provider_id): (String, String) =
+        sqlx::query_as("SELECT tenant_id, provider_id FROM jobs WHERE job_id = $1")
             .bind(work.job_id)
             .fetch_one(pool)
             .await
             .map_err(debug_error)?;
+    let output_ids: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT output_id FROM job_outputs WHERE job_id = $1 ORDER BY output_index",
+    )
+    .bind(work.job_id)
+    .fetch_all(pool)
+    .await
+    .map_err(debug_error)?;
+    require(
+        !output_ids.is_empty(),
+        "v4 customer quote requires at least one output",
+    )?;
+    let max_total_micros = basis
+        .max_amount_micros
+        .checked_mul(
+            i64::try_from(output_ids.len())
+                .map_err(|_| "v4 output count exceeds i64".to_string())?,
+        )
+        .ok_or_else(|| "v4 quote maximum overflowed".to_string())?;
+    let now = database_now(pool).await?;
+    let price_book_id = Uuid::new_v4();
+    let price_book_version_id = Uuid::new_v4();
+    let success_price_component_id = Uuid::new_v4();
+    let failed_price_component_id = Uuid::new_v4();
+    let quote_id = Uuid::new_v4();
+    let mut tx = pool.begin().await.map_err(debug_error)?;
+    sqlx::query(
+        r#"
+        INSERT INTO identity_organizations (
+            organization_id, display_name, organization_kind,
+            created_at_ms, updated_at_ms
+        )
+        VALUES ($1, 'Executor v4 test', 'system', $2, $2)
+        "#,
+    )
+    .bind(&tenant_id)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .map_err(debug_error)?;
+    sqlx::query(
+        r#"
+        INSERT INTO gateway_projects (id, tenant_id, name, created_at)
+        VALUES ('project-test', $1, 'Executor test project', $2)
+        "#,
+    )
+    .bind(&tenant_id)
+    .bind(now / 1_000)
+    .execute(&mut *tx)
+    .await
+    .map_err(debug_error)?;
+    sqlx::query(
+        r#"
+        INSERT INTO job_auth_attributions (
+            job_id, tenant_id, project_id, auth_kind, admitted_at_ms
+        )
+        VALUES ($1, $2, 'project-test', 'legacy', $3)
+        "#,
+    )
+    .bind(work.job_id)
+    .bind(&tenant_id)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .map_err(debug_error)?;
+    require_one(
+        sqlx::query(
+            "UPDATE jobs SET economics_contract_version = 4, updated_at_ms = $2 WHERE job_id = $1",
+        )
+        .bind(work.job_id)
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .map_err(debug_error)?,
+        "v4 economics contract activation",
+    )?;
+    sqlx::query(
+        r#"
+        INSERT INTO price_books (
+            price_book_id, price_book_key, display_name, purpose,
+            scope_type, currency, state, created_at_ms, updated_at_ms
+        )
+        VALUES ($1, $2, 'Executor v4 customer price', 'customer_sale',
+                'platform', 'USD', 'active', $3, $3)
+        "#,
+    )
+    .bind(price_book_id)
+    .bind(format!("executor-v4-{}", price_book_id.simple()))
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .map_err(debug_error)?;
+    sqlx::query(
+        r#"
+        INSERT INTO price_book_versions (
+            price_book_version_id, price_book_id, version,
+            api_profile, operation, provider_id, provider_model_id,
+            public_model_id, media_kind, service_tier,
+            execution_surface, billing_mode, is_free, state,
+            effective_from_ms, source_kind, source_url,
+            source_checked_at_ms, created_at_ms, updated_at_ms
+        )
+        VALUES ($1, $2, 1, $3, $4,
+                $5, $6, $7, $8, 'standard', 'provider_cli',
+                'customer_rate', FALSE, 'draft', $9,
+                $10, $11, $9, $9, $9)
+        "#,
+    )
+    .bind(price_book_version_id)
+    .bind(price_book_id)
+    .bind(identity.price_api_profile)
+    .bind(identity.operation)
+    .bind(&provider_id)
+    .bind(identity.provider_model_id)
+    .bind(identity.public_model_id)
+    .bind(identity.media_kind)
+    .bind(now)
+    .bind(identity.source_kind)
+    .bind(identity.source_url)
+    .execute(&mut *tx)
+    .await
+    .map_err(debug_error)?;
+    for (component_id, suffix, outcome, unit_price_micros) in [
+        (
+            success_price_component_id,
+            "succeeded",
+            "succeeded",
+            basis.unit_price_micros,
+        ),
+        (failed_price_component_id, "failed", "failed", 0),
+    ] {
+        sqlx::query(
+            r#"
+            INSERT INTO price_components (
+                price_component_id, price_book_version_id, component_key,
+                metric, unit, unit_size, unit_price_micros, outcome,
+                quantity_source, required_confidence, rounding_mode,
+                dimensions_json, created_at_ms
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+                    'exact', $11, $12)
+            "#,
+        )
+        .bind(component_id)
+        .bind(price_book_version_id)
+        .bind(format!("{}.{}", basis.metric, suffix))
+        .bind(basis.metric)
+        .bind(basis.unit)
+        .bind(basis.unit_size)
+        .bind(unit_price_micros)
+        .bind(outcome)
+        .bind(basis.quantity_source)
+        .bind(basis.confidence)
+        .bind(&identity.dimensions)
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .map_err(debug_error)?;
+    }
+    let contract_key = format!("test.executor-surface.{}", price_book_version_id.simple());
+    let contract_hash = hex::encode(Sha256::digest(contract_key.as_bytes()));
+    sqlx::query(
+        r#"
+        INSERT INTO pricing_surface_contract_revisions (
+            contract_key, revision, contract_hash, contract_schema_version,
+            api_profile, operation, provider_id, provider_model_id,
+            public_model_id, media_kind, service_tier, execution_surface,
+            normalizer_key, normalizer_revision, contract_json, created_at_ms
+        )
+        VALUES (
+            $1, 1, $2, 1, $3, $4, $5, $6, $7, $8,
+            'standard', 'provider_cli',
+            'test.executor-surface', 1, '{}'::JSONB, $9
+        )
+        "#,
+    )
+    .bind(&contract_key)
+    .bind(&contract_hash)
+    .bind(identity.quote_api_profile)
+    .bind(identity.operation)
+    .bind(&provider_id)
+    .bind(identity.provider_model_id)
+    .bind(identity.public_model_id)
+    .bind(identity.media_kind)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .map_err(debug_error)?;
+    sqlx::query(
+        r#"
+        INSERT INTO price_book_version_surface_contract_bindings (
+            price_book_version_id, contract_key, contract_revision,
+            contract_hash, bound_at_ms
+        )
+        VALUES ($1, $2, 1, $3, $4)
+        "#,
+    )
+    .bind(price_book_version_id)
+    .bind(&contract_key)
+    .bind(&contract_hash)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .map_err(debug_error)?;
+    require_one(
+        sqlx::query(
+            r#"
+            UPDATE price_book_versions
+            SET state = 'active', control_version = 2, updated_at_ms = $2
+            WHERE price_book_version_id = $1
+            "#,
+        )
+        .bind(price_book_version_id)
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .map_err(debug_error)?,
+        "v4 price version activation",
+    )?;
+    sqlx::query(
+        r#"
+        INSERT INTO billing_accounts (
+            tenant_id, currency, credit_limit_micros, held_micros,
+            captured_micros, created_at_ms, updated_at_ms
+        )
+        VALUES ($1, 'USD', $2, $2, 0, $3, $3)
+        "#,
+    )
+    .bind(&tenant_id)
+    .bind(max_total_micros)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .map_err(debug_error)?;
+    sqlx::query(
+        r#"
+        INSERT INTO customer_price_quotes (
+            quote_id, job_id, tenant_id, project_id,
+            price_book_id, price_book_version_id,
+            api_profile, operation, provider_id, provider_model_id,
+            public_model_id, media_kind, service_tier,
+            execution_surface, request_dimensions_json,
+            billing_mode, is_free, currency,
+            max_total_micros, quote_hash, created_at_ms
+        )
+        VALUES ($1, $2, $3, 'project-test', $4, $5,
+                $6, $7, $8, $9, $10,
+                $11, 'standard', 'provider_cli', $12,
+                'customer_rate', FALSE, 'USD', $13, $14, $15)
+        "#,
+    )
+    .bind(quote_id)
+    .bind(work.job_id)
+    .bind(&tenant_id)
+    .bind(price_book_id)
+    .bind(price_book_version_id)
+    .bind(identity.quote_api_profile)
+    .bind(identity.operation)
+    .bind(&provider_id)
+    .bind(identity.provider_model_id)
+    .bind(identity.public_model_id)
+    .bind(identity.media_kind)
+    .bind(&identity.dimensions)
+    .bind(max_total_micros)
+    .bind(hex::encode(Sha256::digest(quote_id.as_bytes())))
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .map_err(debug_error)?;
+    for output_id in output_ids {
+        for (component_id, suffix, outcome, unit_price_micros, max_amount_micros) in [
+            (
+                success_price_component_id,
+                "succeeded",
+                "succeeded",
+                basis.unit_price_micros,
+                basis.max_amount_micros,
+            ),
+            (failed_price_component_id, "failed", "failed", 0, 0),
+        ] {
+            sqlx::query(
+                r#"
+                INSERT INTO customer_price_quote_lines (
+                    quote_line_id, quote_id, job_id, price_component_id,
+                    component_key, partition_key, terminal_outcome,
+                    metric, unit, unit_size, unit_price_micros,
+                    quantity_source, required_confidence, rounding_mode,
+                    reservation_quantity_source, reservation_confidence,
+                    dimensions_json, max_quantity, max_amount_micros, created_at_ms
+                )
+                VALUES (
+                    $1, $2, $3, $4, $5, $6, $7,
+                    $8, $9, $10, $11, $12, $13, 'exact',
+                    $12, $13, $14, $15, $16, $17
+                )
+                "#,
+            )
+            .bind(Uuid::new_v4())
+            .bind(quote_id)
+            .bind(work.job_id)
+            .bind(component_id)
+            .bind(format!("{}.{}", basis.metric, suffix))
+            .bind(format!("output:{output_id}"))
+            .bind(outcome)
+            .bind(basis.metric)
+            .bind(basis.unit)
+            .bind(basis.unit_size)
+            .bind(unit_price_micros)
+            .bind(basis.quantity_source)
+            .bind(basis.confidence)
+            .bind(&identity.dimensions)
+            .bind(basis.max_quantity)
+            .bind(max_amount_micros)
+            .bind(now)
+            .execute(&mut *tx)
+            .await
+            .map_err(debug_error)?;
+        }
+    }
+    sqlx::query(
+        r#"
+        INSERT INTO customer_billing_holds (
+            hold_id, quote_id, job_id, tenant_id, currency,
+            held_micros, account_held_micros,
+            state, created_at_ms, updated_at_ms
+        )
+        VALUES ($1, $2, $3, $4, 'USD', $5, $5, 'held', $6, $6)
+        "#,
+    )
+    .bind(Uuid::new_v4())
+    .bind(quote_id)
+    .bind(work.job_id)
+    .bind(&tenant_id)
+    .bind(max_total_micros)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .map_err(debug_error)?;
+    tx.commit().await.map_err(debug_error)
+}
+
+async fn seed_terminal_quota(pool: &PgPool, work: &WorkLease) -> TestResult {
+    let (tenant_id, request_id, requested_units, billing_metric, billing_unit): (
+        String,
+        String,
+        i32,
+        String,
+        String,
+    ) = sqlx::query_as(
+        "SELECT tenant_id, request_id, requested_units, billing_metric, billing_unit
+         FROM jobs WHERE job_id = $1",
+    )
+    .bind(work.job_id)
+    .fetch_one(pool)
+    .await
+    .map_err(debug_error)?;
     let reservation_id = Uuid::new_v4();
     let now = database_now(pool).await?;
     let mut tx = pool.begin().await.map_err(debug_error)?;
@@ -4954,9 +7300,10 @@ async fn seed_terminal_quota(pool: &PgPool, work: &WorkLease) -> TestResult {
           (reservation_id, tenant_id, request_id, job_id, requested_units,
            committed_units, started_units, released_units, state,
            created_at_ms, updated_at_ms, expires_at_ms,
-           limit_5h, remaining_5h, limit_7d, remaining_7d)
+           limit_5h, remaining_5h, limit_7d, remaining_7d,
+           billing_metric, billing_unit)
         VALUES ($1, $2, $3, $4, $5, 0, 0, 0, 'reserved',
-                $6, $6, $7, 100, 99, 1000, 999)
+                $6, $6, $7, 100, 99, 1000, 999, $8, $9)
         "#,
     )
     .bind(reservation_id)
@@ -4966,6 +7313,8 @@ async fn seed_terminal_quota(pool: &PgPool, work: &WorkLease) -> TestResult {
     .bind(requested_units)
     .bind(now)
     .bind(now + 300_000)
+    .bind(billing_metric)
+    .bind(billing_unit)
     .execute(&mut *tx)
     .await
     .map_err(debug_error)?;
@@ -5000,9 +7349,10 @@ async fn seed_lease(pool: &PgPool, worker_id: &str, requested_units: i32) -> Tes
         r#"
         INSERT INTO jobs
           (job_id, tenant_id, request_id, operation, provider_id, model, state,
-           requested_units, economics_contract_version, created_at_ms, updated_at_ms)
+           requested_units, output_count, billable_units, billing_metric, billing_unit,
+           economics_contract_version, created_at_ms, updated_at_ms)
         VALUES ($1, 'executor-test', $2, 'generation', 'provider-test', 'model-test',
-                'reserved', $3, 2, $4, $4)
+                'reserved', $3, $3, $3, 'output', 'output', 2, $4, $4)
         "#,
     )
     .bind(job_id)
@@ -5115,13 +7465,7 @@ async fn seed_codex_generation_lease_with_outputs(
     worker_id: &str,
     output_count: u32,
 ) -> TestResult<WorkLease> {
-    let requested_units =
-        i32::try_from(output_count).map_err(|_| "codex output count exceeds i32".to_string())?;
-    require(requested_units > 0, "codex output count must be positive")?;
     let job_id = Uuid::new_v4();
-    let work_item_id = Uuid::new_v4();
-    let execution_id = Uuid::new_v4();
-    let admission_session_id = Uuid::new_v4();
     let request_id = format!("request-{}", Uuid::new_v4().simple());
     let job = GenerationJob {
         request_id: request_id.clone(),
@@ -5141,34 +7485,232 @@ async fn seed_codex_generation_lease_with_outputs(
         GenerationCommandV1::from_generation_job(&job, "openai-images-v1", "openai-codex");
     let command_json = serde_json::to_value(&command).map_err(debug_error)?;
     let request_hash = command.request_hash_hex();
+    seed_generation_lease(
+        pool,
+        worker_id,
+        GenerationLeaseSeed {
+            job_id,
+            admission_session_id: Uuid::new_v4(),
+            owner_token: Uuid::new_v4(),
+            api_profile: "openai-images-v1".to_string(),
+            provider_id: "openai-codex".to_string(),
+            model: "gpt-image-2".to_string(),
+            request_id,
+            request_hash,
+            command_schema: GENERATION_COMMAND_SCHEMA.to_string(),
+            command_json,
+            operation: "generation".to_string(),
+            work_kind: "image_batch".to_string(),
+            output_count,
+            billable_units: output_count,
+            output_billable_units: 1,
+            billing_metric: "output".to_string(),
+            billing_unit: "output".to_string(),
+        },
+    )
+    .await
+}
+
+async fn seed_dreamina_generation_lease_for_profile(
+    pool: &PgPool,
+    worker_id: &str,
+    api_profile: &str,
+) -> TestResult<WorkLease> {
+    let job_id = Uuid::new_v4();
+    let owner_token = Uuid::new_v4();
+    let request_id = format!("request-{}", Uuid::new_v4().simple());
+    let plan = DreaminaImageAdmissionPlan::new(DreaminaImageGenerationRequest {
+        prompt: "draw a provider-native pricing lighthouse".to_string(),
+        model_version: Some("5.0".to_string()),
+        ratio: Some("1:1".to_string()),
+        resolution_type: "2k".to_string(),
+        width: None,
+        height: None,
+        generate_num: Some(1),
+    })
+    .map_err(debug_error)?;
+    let claim = plan.claim_for_profile(
+        api_profile,
+        owner_token,
+        "executord-process-smoke",
+        "project-test",
+        request_id.clone(),
+        None,
+        i64::MAX,
+    );
+    let attach = plan.attach(
+        AdmissionTicket {
+            session_id: Uuid::new_v4(),
+            owner_token,
+            request_hash: claim.request_hash.clone(),
+        },
+        job_id,
+        "dreamina-terminal-test",
+    );
+    seed_generation_lease(
+        pool,
+        worker_id,
+        GenerationLeaseSeed {
+            job_id,
+            admission_session_id: attach.ticket.session_id,
+            owner_token,
+            api_profile: claim.api_profile,
+            provider_id: plan.provider_id().to_string(),
+            model: plan.provider_model().to_string(),
+            request_id,
+            request_hash: claim.request_hash,
+            command_schema: attach.command_schema,
+            command_json: attach.command_json,
+            operation: "generation".to_string(),
+            work_kind: "image_batch".to_string(),
+            output_count: plan.output_count(),
+            billable_units: plan.output_count(),
+            output_billable_units: 1,
+            billing_metric: "output".to_string(),
+            billing_unit: "output".to_string(),
+        },
+    )
+    .await
+}
+
+async fn seed_dreamina_video_generation_lease_for_profile(
+    pool: &PgPool,
+    worker_id: &str,
+    api_profile: &str,
+) -> TestResult<WorkLease> {
+    let job_id = Uuid::new_v4();
+    let owner_token = Uuid::new_v4();
+    let request_id = format!("request-{}", Uuid::new_v4().simple());
+    let plan = DreaminaVideoAdmissionPlan::new(DreaminaVideoGenerationRequest {
+        prompt: "animate a provider-native pricing lighthouse".to_string(),
+        model_version: Some("seedance2.0fast".to_string()),
+        ratio: Some("9:16".to_string()),
+        duration: Some(8),
+        video_resolution: "720p".to_string(),
+    })
+    .map_err(debug_error)?;
+    let claim = plan.claim_for_profile(
+        api_profile,
+        owner_token,
+        "executord-process-smoke",
+        "project-test",
+        request_id.clone(),
+        None,
+        i64::MAX,
+    );
+    let attach = plan.attach(
+        AdmissionTicket {
+            session_id: Uuid::new_v4(),
+            owner_token,
+            request_hash: claim.request_hash.clone(),
+        },
+        job_id,
+        "dreamina-video-terminal-test",
+    );
+    seed_generation_lease(
+        pool,
+        worker_id,
+        GenerationLeaseSeed {
+            job_id,
+            admission_session_id: attach.ticket.session_id,
+            owner_token,
+            api_profile: claim.api_profile,
+            provider_id: plan.provider_id().to_string(),
+            model: plan.provider_model().to_string(),
+            request_id,
+            request_hash: claim.request_hash,
+            command_schema: attach.command_schema,
+            command_json: attach.command_json,
+            operation: VIDEO_GENERATION_OPERATION.to_string(),
+            work_kind: "video_single".to_string(),
+            output_count: 1,
+            billable_units: u32::from(plan.duration()),
+            output_billable_units: u32::from(plan.duration()),
+            billing_metric: "video_second".to_string(),
+            billing_unit: "second".to_string(),
+        },
+    )
+    .await
+}
+
+struct GenerationLeaseSeed {
+    job_id: Uuid,
+    admission_session_id: Uuid,
+    owner_token: Uuid,
+    api_profile: String,
+    provider_id: String,
+    model: String,
+    request_id: String,
+    request_hash: String,
+    command_schema: String,
+    command_json: serde_json::Value,
+    operation: String,
+    work_kind: String,
+    output_count: u32,
+    billable_units: u32,
+    output_billable_units: u32,
+    billing_metric: String,
+    billing_unit: String,
+}
+
+async fn seed_generation_lease(
+    pool: &PgPool,
+    worker_id: &str,
+    seed: GenerationLeaseSeed,
+) -> TestResult<WorkLease> {
+    let output_count = i32::try_from(seed.output_count)
+        .map_err(|_| "generation output count exceeds i32".to_string())?;
+    let billable_units = i32::try_from(seed.billable_units)
+        .map_err(|_| "generation billable units exceed i32".to_string())?;
+    let output_billable_units = i32::try_from(seed.output_billable_units)
+        .map_err(|_| "output billable units exceed i32".to_string())?;
+    require(
+        output_count > 0
+            && billable_units > 0
+            && output_billable_units > 0
+            && billable_units == output_count * output_billable_units,
+        "generation output count must be positive",
+    )?;
+    let work_item_id = Uuid::new_v4();
+    let execution_id = Uuid::new_v4();
     let now = database_now(pool).await?;
     sqlx::query(
         r#"
         INSERT INTO jobs
           (job_id, tenant_id, request_id, operation, provider_id, model, state,
-           requested_units, economics_contract_version, created_at_ms, updated_at_ms)
-        VALUES ($1, 'executord-process-smoke', $2, 'generation', 'openai-codex',
-                'gpt-image-2', 'reserved', $3, 2, $4, $4)
+           requested_units, output_count, billable_units, billing_metric, billing_unit,
+           economics_contract_version, created_at_ms, updated_at_ms)
+        VALUES ($1, 'executord-process-smoke', $2, $3, $4,
+                $5, 'reserved', $6, $7, $8, $9, $10, 2, $11, $11)
         "#,
     )
-    .bind(job_id)
-    .bind(&request_id)
-    .bind(requested_units)
+    .bind(seed.job_id)
+    .bind(&seed.request_id)
+    .bind(&seed.operation)
+    .bind(&seed.provider_id)
+    .bind(&seed.model)
+    .bind(billable_units)
+    .bind(output_count)
+    .bind(billable_units)
+    .bind(&seed.billing_metric)
+    .bind(&seed.billing_unit)
     .bind(now)
     .execute(pool)
     .await
     .map_err(debug_error)?;
-    for output_index in 0..requested_units {
+    for output_index in 0..output_count {
         sqlx::query(
             r#"
             INSERT INTO job_outputs
-              (output_id, job_id, output_index, state, created_at_ms, updated_at_ms)
-            VALUES ($1, $2, $3, 'pending', $4, $4)
+              (output_id, job_id, output_index, billable_units,
+               state, created_at_ms, updated_at_ms)
+            VALUES ($1, $2, $3, $4, 'pending', $5, $5)
             "#,
         )
         .bind(Uuid::new_v4())
-        .bind(job_id)
+        .bind(seed.job_id)
         .bind(output_index)
+        .bind(output_billable_units)
         .bind(now)
         .execute(pool)
         .await
@@ -5179,15 +7721,17 @@ async fn seed_codex_generation_lease_with_outputs(
         INSERT INTO admission_sessions
           (session_id, owner_token, tenant_id, project_id, api_profile, operation,
            request_id, request_hash, state, job_id, deadline_at_ms, created_at_ms, updated_at_ms)
-        VALUES ($1, $2, 'executord-process-smoke', 'project-test', 'openai-images-v1',
-                'generation', $3, $4, 'attached', $5, $6, $7, $7)
+        VALUES ($1, $2, 'executord-process-smoke', 'project-test', $3,
+                $4, $5, $6, 'attached', $7, $8, $9, $9)
         "#,
     )
-    .bind(admission_session_id)
-    .bind(Uuid::new_v4())
-    .bind(&request_id)
-    .bind(&request_hash)
-    .bind(job_id)
+    .bind(seed.admission_session_id)
+    .bind(seed.owner_token)
+    .bind(&seed.api_profile)
+    .bind(&seed.operation)
+    .bind(&seed.request_id)
+    .bind(&seed.request_hash)
+    .bind(seed.job_id)
     .bind(now + 300_000)
     .bind(now)
     .execute(pool)
@@ -5200,11 +7744,11 @@ async fn seed_codex_generation_lease_with_outputs(
         VALUES ($1, $2, $3, $4, $5, $6)
         "#,
     )
-    .bind(job_id)
-    .bind(admission_session_id)
-    .bind(GENERATION_COMMAND_SCHEMA)
-    .bind(&command_json)
-    .bind(&request_hash)
+    .bind(seed.job_id)
+    .bind(seed.admission_session_id)
+    .bind(&seed.command_schema)
+    .bind(&seed.command_json)
+    .bind(&seed.request_hash)
     .bind(now)
     .execute(pool)
     .await
@@ -5214,14 +7758,16 @@ async fn seed_codex_generation_lease_with_outputs(
         INSERT INTO idempotency_requests
           (project_id, api_profile, operation, key_digest, tenant_id,
            request_hash, session_id, job_id, state, created_at_ms, updated_at_ms)
-        VALUES ('project-test', 'openai-images-v1', 'generation', $1,
-                'executord-process-smoke', $2, $3, $4, 'accepted', $5, $5)
+        VALUES ('project-test', $1, $2, $3,
+                'executord-process-smoke', $4, $5, $6, 'accepted', $7, $7)
         "#,
     )
-    .bind(sha256(request_id.as_bytes()))
-    .bind(&request_hash)
-    .bind(admission_session_id)
-    .bind(job_id)
+    .bind(&seed.api_profile)
+    .bind(&seed.operation)
+    .bind(sha256(seed.request_id.as_bytes()))
+    .bind(&seed.request_hash)
+    .bind(seed.admission_session_id)
+    .bind(seed.job_id)
     .bind(now)
     .execute(pool)
     .await
@@ -5231,11 +7777,12 @@ async fn seed_codex_generation_lease_with_outputs(
         INSERT INTO work_items
           (work_item_id, job_id, kind, state, available_at_ms, lease_epoch,
            lease_owner, lease_expires_at_ms, execution_id, created_at_ms, updated_at_ms)
-        VALUES ($1, $2, 'generation', 'leased', $4, 7, $3, $5, $6, $4, $4)
+        VALUES ($1, $2, $3, 'leased', $5, 7, $4, $6, $7, $5, $5)
         "#,
     )
     .bind(work_item_id)
-    .bind(job_id)
+    .bind(seed.job_id)
+    .bind(&seed.work_kind)
     .bind(worker_id)
     .bind(now)
     .bind(now + 300_000)
@@ -5261,12 +7808,12 @@ async fn seed_codex_generation_lease_with_outputs(
     .map_err(debug_error)?;
     Ok(WorkLease {
         work_item_id,
-        job_id,
+        job_id: seed.job_id,
         execution_id,
         lease_epoch: 7,
         worker_id: worker_id.to_string(),
-        command_schema: GENERATION_COMMAND_SCHEMA.to_string(),
-        command_json,
+        command_schema: seed.command_schema,
+        command_json: seed.command_json,
     })
 }
 
@@ -5310,7 +7857,7 @@ impl ExecutordFixture {
         fs::write(
             &fake_codex,
             format!(
-                "#!/bin/sh\n/bin/cat >/dev/null\nprintf '1\\n' >> '{}'\n{delay}/bin/cp '{}' final.png\n",
+                "#!/bin/sh\n/bin/cat >/dev/null\nprintf '1\\n' >> '{}'\n{delay}/bin/cp '{}' sealed-output.bin\n",
                 invocations.display(),
                 source.display()
             ),
@@ -5327,17 +7874,45 @@ impl ExecutordFixture {
         })
     }
 
-    fn command(&self, database: &TestDatabase, owner: &str) -> TestResult<tokio::process::Command> {
-        self.command_with_lease(database, owner, 10_000, 250)
+    async fn command(
+        &self,
+        database: &TestDatabase,
+        owner: &str,
+    ) -> TestResult<tokio::process::Command> {
+        self.command_with_lease(database, owner, 10_000, 250).await
     }
 
-    fn command_with_lease(
+    async fn command_with_lease(
         &self,
         database: &TestDatabase,
         owner: &str,
         lease_ms: u64,
         heartbeat_ms: u64,
     ) -> TestResult<tokio::process::Command> {
+        let now = database_now(&database.pool).await?;
+        sqlx::query(
+            r#"
+            INSERT INTO provider_account_environments (
+                provider_account_id, provider_id, environment_kind, environment_ref,
+                upstream_identity_sha256, display_name, account_email, state,
+                created_at_ms, updated_at_ms
+            )
+            VALUES ($1, 'openai-codex', 'codex_home_v1', $2, $3,
+                    'Executor process test', NULL, 'active', $4, $4)
+            ON CONFLICT (provider_account_id) DO UPDATE
+            SET environment_ref = EXCLUDED.environment_ref,
+                upstream_identity_sha256 = EXCLUDED.upstream_identity_sha256,
+                state = 'active',
+                updated_at_ms = EXCLUDED.updated_at_ms
+            "#,
+        )
+        .bind(CODEX_ACCOUNT_ID)
+        .bind(self.credentials.to_string_lossy().as_ref())
+        .bind(CODEX_AUTH_SHA256)
+        .bind(now)
+        .execute(&database.pool)
+        .await
+        .map_err(debug_error)?;
         let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_executord"));
         command
             .env_clear()
@@ -5382,7 +7957,9 @@ fn walk_regular_files(root: &std::path::Path) -> TestResult<Vec<std::path::PathB
         if metadata.is_dir() {
             files.extend(walk_regular_files(&path)?);
         } else if metadata.is_file() {
-            files.push(path);
+            if path.file_name() != Some(std::ffi::OsStr::new(".storage-namespace-id")) {
+                files.push(path);
+            }
         } else {
             return Err(format!("unexpected artifact entry: {}", path.display()));
         }
@@ -5421,6 +7998,11 @@ async fn seed_execution_profiles(pool: &PgPool) -> TestResult {
     for (pool_id, pool_key, provider_id) in [
         (TEST_POOL_ID, "provider-test-pool", "provider-test"),
         (CODEX_POOL_ID, "openai-codex-pool", "openai-codex"),
+        (
+            DREAMINA_POOL_ID,
+            "dreamina-image-pool",
+            DREAMINA_PROVIDER_ID,
+        ),
     ] {
         sqlx::query(
             r#"
@@ -5454,6 +8036,14 @@ async fn seed_execution_profiles(pool: &PgPool) -> TestResult {
             "test-vault.openai-codex.1",
             CODEX_AUTH_SHA256,
         ),
+        (
+            DREAMINA_ACCOUNT_ID,
+            DREAMINA_POOL_ID,
+            DREAMINA_PROVIDER_ID,
+            "dreamina-image-account",
+            "test-vault.dreamina.1",
+            DREAMINA_AUTH_SHA256,
+        ),
     ] {
         sqlx::query(
             r#"
@@ -5475,9 +8065,28 @@ async fn seed_execution_profiles(pool: &PgPool) -> TestResult {
         .await
         .map_err(debug_error)?;
     }
-    for (policy_id, execution_class) in [
-        (TEST_POLICY_ID, "provider-test"),
-        (CODEX_POLICY_ID, "agentic-cli"),
+    for (policy_id, pool_id, account_id, provider_id, execution_class) in [
+        (
+            TEST_POLICY_ID,
+            TEST_POOL_ID,
+            TEST_ACCOUNT_ID,
+            "provider-test",
+            "provider-test",
+        ),
+        (
+            CODEX_POLICY_ID,
+            CODEX_POOL_ID,
+            CODEX_ACCOUNT_ID,
+            "openai-codex",
+            "agentic-cli",
+        ),
+        (
+            DREAMINA_POLICY_ID,
+            DREAMINA_POOL_ID,
+            DREAMINA_ACCOUNT_ID,
+            DREAMINA_PROVIDER_ID,
+            "remote-task",
+        ),
     ] {
         sqlx::query(
             r#"
@@ -5489,21 +8098,9 @@ async fn seed_execution_profiles(pool: &PgPool) -> TestResult {
             "#,
         )
         .bind(policy_id)
-        .bind(if policy_id == TEST_POLICY_ID {
-            TEST_POOL_ID
-        } else {
-            CODEX_POOL_ID
-        })
-        .bind(if policy_id == TEST_POLICY_ID {
-            TEST_ACCOUNT_ID
-        } else {
-            CODEX_ACCOUNT_ID
-        })
-        .bind(if policy_id == TEST_POLICY_ID {
-            "provider-test"
-        } else {
-            "openai-codex"
-        })
+        .bind(pool_id)
+        .bind(account_id)
+        .bind(provider_id)
         .bind(execution_class)
         .bind(now)
         .execute(&mut *tx)
@@ -5518,6 +8115,8 @@ async fn seed_execution_profiles(pool: &PgPool) -> TestResult {
         operation_id,
         operation_descriptor_revision,
         operation_descriptor_sha256_v1,
+        completion_mode,
+        idempotency_mode,
         adapter_revision,
         pool_id,
         account_id,
@@ -5532,6 +8131,8 @@ async fn seed_execution_profiles(pool: &PgPool) -> TestResult {
             "images.generations",
             "provider-test/images.generations/v1",
             "2".repeat(64),
+            "inline",
+            "submission_bound",
             "provider-test-adapter-v1",
             TEST_POOL_ID,
             TEST_ACCOUNT_ID,
@@ -5546,11 +8147,45 @@ async fn seed_execution_profiles(pool: &PgPool) -> TestResult {
             "images.generations",
             "openai-codex/images.generations/v1",
             "f7f3e84594bfda2312d9420aa22108e76b10b3b22c52535ccf768f944d9b7aaa".to_string(),
+            "inline",
+            "submission_bound",
             CODEX_GENERATION_ADAPTER_REVISION,
             CODEX_POOL_ID,
             CODEX_ACCOUNT_ID,
             "test-vault.openai-codex.1",
             CODEX_POLICY_ID,
+        ),
+        (
+            DREAMINA_PROFILE_ID,
+            "dreamina-image-generation-v1",
+            DREAMINA_PROVIDER_ID,
+            DREAMINA_SUBMIT_COMMAND_SCHEMA,
+            DREAMINA_IMAGE_GENERATION_OPERATION_V1.id,
+            DREAMINA_IMAGE_GENERATION_OPERATION_V1.descriptor_revision,
+            DREAMINA_IMAGE_GENERATION_OPERATION_V1.canonical_sha256_v1_hex(),
+            DREAMINA_IMAGE_GENERATION_OPERATION_V1.completion.as_str(),
+            DREAMINA_IMAGE_GENERATION_OPERATION_V1.idempotency.as_str(),
+            DREAMINA_ADAPTER_REVISION,
+            DREAMINA_POOL_ID,
+            DREAMINA_ACCOUNT_ID,
+            "test-vault.dreamina.1",
+            DREAMINA_POLICY_ID,
+        ),
+        (
+            DREAMINA_VIDEO_PROFILE_ID,
+            "dreamina-video-generation-v1",
+            DREAMINA_PROVIDER_ID,
+            DREAMINA_SUBMIT_COMMAND_SCHEMA,
+            DREAMINA_VIDEO_GENERATION_OPERATION_V1.id,
+            DREAMINA_VIDEO_GENERATION_OPERATION_V1.descriptor_revision,
+            DREAMINA_VIDEO_GENERATION_OPERATION_V1.canonical_sha256_v1_hex(),
+            DREAMINA_VIDEO_GENERATION_OPERATION_V1.completion.as_str(),
+            DREAMINA_VIDEO_GENERATION_OPERATION_V1.idempotency.as_str(),
+            DREAMINA_ADAPTER_REVISION,
+            DREAMINA_POOL_ID,
+            DREAMINA_ACCOUNT_ID,
+            "test-vault.dreamina.1",
+            DREAMINA_POLICY_ID,
         ),
     ] {
         sqlx::query(
@@ -5562,8 +8197,8 @@ async fn seed_execution_profiles(pool: &PgPool) -> TestResult {
                adapter_revision, credential_pool_id, provider_account_id,
                credential_ref, credential_revision, resource_policy_id,
                resource_policy_revision, state, created_at_ms, updated_at_ms)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, 'inline', 'submission_bound',
-                    $8, $9, $10, $11, 1, $12, 1, 'enabled', $13, $13)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9,
+                    $10, $11, $12, $13, 1, $14, 1, 'enabled', $15, $15)
             "#,
         )
         .bind(profile_id)
@@ -5573,6 +8208,8 @@ async fn seed_execution_profiles(pool: &PgPool) -> TestResult {
         .bind(operation_id)
         .bind(operation_descriptor_revision)
         .bind(operation_descriptor_sha256_v1)
+        .bind(completion_mode)
+        .bind(idempotency_mode)
         .bind(adapter_revision)
         .bind(pool_id)
         .bind(account_id)

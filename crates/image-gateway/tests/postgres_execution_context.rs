@@ -18,8 +18,8 @@ use gpt_image_2_gateway::{
     admission::{
         AdmissionClaim, AdmissionContract, AdmissionStore, AttachInputManifest, AttachInputObject,
         AttachJob, ClaimAdmission, EDIT_COMMAND_SCHEMA, EDIT_INPUT_MANIFEST_SCHEMA, EditCommandV1,
-        EditInputDescriptorV1, EditInputRoleV1, GenerationCommandV1, PostgresAdmissionStore,
-        WorkLease,
+        EditInputDescriptorV1, EditInputRoleV1, GENERATION_COMMAND_SCHEMA, GenerationCommandV1,
+        PostgresAdmissionStore, WorkLease,
     },
     artifacts::InMemoryArtifactBlobStore,
     database::{connect_test_pool_with_search_path, run_migrations},
@@ -27,12 +27,13 @@ use gpt_image_2_gateway::{
         InputBlobDeleteError, InputBlobKey, InputBlobReadError, InputBlobRef, InputBlobStore,
         InputBlobWriteError,
     },
+    settlement::GenerationResultLookup,
 };
 use image::{ImageBuffer, ImageFormat, Rgb, Rgba};
 use serde_json::to_value;
 use sha2::{Digest, Sha256};
 use sqlx::{AssertSqlSafe, PgPool};
-use tokio::process::Command;
+use tokio::{io::AsyncReadExt, process::Command};
 use uuid::Uuid;
 
 type TestResult<T = ()> = Result<T, String>;
@@ -78,12 +79,15 @@ async fn leased_work_reconstructs_generation_and_quota_context() -> TestResult {
         let reservation = usage
             .reserve(UsageCharge {
                 tenant_id: tenant_id.clone(),
+                attribution: None,
                 request_id: request_id.clone(),
                 admission_session_id: None,
                 operation: "generation",
                 provider_id: "openai-codex".to_string(),
                 model: "gpt-image-2".to_string(),
-                units: 2,
+                output_count: 2,
+                billable_units: 2,
+                billing_metric: image_provider_contracts::BillingMetric::Output,
                 limits: UsageLimits {
                     five_hour_image_limit: 17,
                     seven_day_image_limit: 53,
@@ -122,6 +126,7 @@ async fn leased_work_reconstructs_generation_and_quota_context() -> TestResult {
                 schedule_priority: 1,
                 schedule_cost: 2,
                 contract: AdmissionContract::LegacyV1,
+                customer_pricing: None,
             })
             .await
             .map_err(|error| format!("attach failed: {error}"))?;
@@ -338,11 +343,16 @@ async fn workerd_executes_ready_generation_without_gateway_memory() -> TestResul
             generator.calls.load(Ordering::SeqCst) == 1,
             "workerd invoked the provider more than once",
         )?;
-        let result = settlement
+        let result = match settlement
             .load_generation_result(reservation.job_id)
             .await
             .map_err(|error| format!("result load failed: {error:?}"))?
-            .ok_or_else(|| "workerd did not persist a result".to_string())?;
+        {
+            GenerationResultLookup::Available(result) => result,
+            GenerationResultLookup::Expired | GenerationResultLookup::Missing => {
+                return Err("workerd did not persist a result".to_string());
+            }
+        };
         require(
             result.images.len() == 2,
             "workerd persisted wrong output count",
@@ -408,6 +418,7 @@ async fn workerd_hands_v2_generation_to_executord_without_invoking_provider() ->
             Arc::new(PostgresExecutionContextStore::new(database.pool.clone())),
             executor_store,
             profile_id,
+            GENERATION_COMMAND_SCHEMA.to_owned(),
             Duration::from_secs(5),
         )
         .map_err(debug_error)?;
@@ -512,6 +523,7 @@ async fn handoff_only_workerd_process_needs_no_codex_or_artifact_mount() -> Test
             .env("GATEWAY_DATABASE_SCHEMA", &database.schema)
             .env("WORKER_EXECUTION_MODE", "executor-handoff")
             .env("EXECUTOR_PROFILE_KEY", profile_key)
+            .env("GATEWAY_IMAGES_GENERATION_CONTRACT", "output-economics-v2")
             .env("WORKER_ID", "handoff-only-process")
             .env("WORKER_POLL_INTERVAL_MS", "10")
             .env("WORKER_HANDOFF_LEASE_MS", "1000")
@@ -535,8 +547,13 @@ async fn handoff_only_workerd_process_needs_no_codex_or_artifact_mount() -> Test
                 break;
             }
             if let Some(status) = child.try_wait().map_err(debug_error)? {
+                let mut stderr = Vec::new();
+                if let Some(mut pipe) = child.stderr.take() {
+                    pipe.read_to_end(&mut stderr).await.map_err(debug_error)?;
+                }
                 return Err(format!(
-                    "handoff-only workerd exited before handoff with {status}"
+                    "handoff-only workerd exited before handoff with {status}: {}",
+                    String::from_utf8_lossy(&stderr)
                 ));
             }
             if tokio::time::Instant::now() >= deadline {
@@ -622,11 +639,16 @@ async fn workerd_hydrates_and_executes_durable_edit_inputs() -> TestResult {
                 "workerd did not hydrate the persisted edit bytes",
             )?;
         }
-        let stored = settlement
+        let stored = match settlement
             .load_generation_result(reservation.job_id)
             .await
             .map_err(|error| format!("edit result load failed: {error:?}"))?
-            .ok_or_else(|| "workerd did not persist the edit result".to_string())?;
+        {
+            GenerationResultLookup::Available(result) => result,
+            GenerationResultLookup::Expired | GenerationResultLookup::Missing => {
+                return Err("workerd did not persist the edit result".to_string());
+            }
+        };
         require(
             stored.projection.operation == "edit" && stored.images.len() == 1,
             "workerd persisted an invalid edit result projection",
@@ -988,12 +1010,15 @@ async fn prepare_ready_work(
     let reservation = usage
         .reserve(UsageCharge {
             tenant_id: tenant_id.clone(),
+            attribution: None,
             request_id: job.request_id.clone(),
             admission_session_id: None,
             operation: "generation",
             provider_id: "openai-codex".to_string(),
             model: "gpt-image-2".to_string(),
-            units: job.n,
+            output_count: job.n,
+            billable_units: job.n,
+            billing_metric: image_provider_contracts::BillingMetric::Output,
             limits: UsageLimits {
                 five_hour_image_limit: 17,
                 seven_day_image_limit: 53,
@@ -1031,6 +1056,7 @@ async fn prepare_ready_work(
             schedule_priority: 1,
             schedule_cost: u64::from(job.n),
             contract: AdmissionContract::LegacyV1,
+            customer_pricing: None,
         })
         .await
         .map_err(|error| format!("attach failed: {error}"))?;
@@ -1071,12 +1097,15 @@ async fn prepare_attached_edit_with_blobs(
     let reservation = usage
         .reserve(UsageCharge {
             tenant_id: tenant_id.clone(),
+            attribution: None,
             request_id: request_id.clone(),
             admission_session_id: None,
             operation: "edit",
             provider_id: "openai-codex".to_string(),
             model: "gpt-image-2".to_string(),
-            units: 1,
+            output_count: 1,
+            billable_units: 1,
+            billing_metric: image_provider_contracts::BillingMetric::Output,
             limits: UsageLimits {
                 five_hour_image_limit: 17,
                 seven_day_image_limit: 53,
@@ -1140,6 +1169,7 @@ async fn prepare_attached_edit_with_blobs(
             schedule_priority: 1,
             schedule_cost: 1,
             contract: AdmissionContract::LegacyV1,
+            customer_pricing: None,
         })
         .await
         .map_err(|error| format!("edit attach failed: {error}"))?;
@@ -1162,12 +1192,15 @@ async fn prepare_ready_edit(pool: &PgPool, worker_id: &str) -> TestResult<Prepar
     let reservation = usage
         .reserve(UsageCharge {
             tenant_id: tenant_id.clone(),
+            attribution: None,
             request_id: request_id.clone(),
             admission_session_id: None,
             operation: "edit",
             provider_id: "openai-codex".to_string(),
             model: "gpt-image-2".to_string(),
-            units: 1,
+            output_count: 1,
+            billable_units: 1,
+            billing_metric: image_provider_contracts::BillingMetric::Output,
             limits: UsageLimits {
                 five_hour_image_limit: 17,
                 seven_day_image_limit: 53,
@@ -1212,6 +1245,7 @@ async fn prepare_ready_edit(pool: &PgPool, worker_id: &str) -> TestResult<Prepar
             schedule_priority: 1,
             schedule_cost: 1,
             contract: AdmissionContract::LegacyV1,
+            customer_pricing: None,
         })
         .await
         .map_err(|error| format!("edit attach failed: {error}"))?;

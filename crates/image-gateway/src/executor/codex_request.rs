@@ -214,6 +214,7 @@ mod tests {
             command_schema: GENERATION_COMMAND_SCHEMA.to_string(),
             command_hash: command.request_hash_hex(),
             command_json: serde_json::to_value(command).unwrap(),
+            inputs: Vec::new(),
         }
     }
 

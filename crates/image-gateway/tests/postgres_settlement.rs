@@ -1,23 +1,302 @@
 use std::{env, sync::Arc};
 
 use gpt_image_2_gateway::{
-    ExecutionSettlementStore, PostgresExecutionSettlementStore, PostgresUsageStore, UsageCharge,
-    UsageLimits, UsageReservation, UsageStore,
+    ArtifactRetentionClaim, ArtifactRetentionStore, ExecutionSettlementStore,
+    PostgresArtifactRetentionStore, PostgresExecutionSettlementStore, PostgresUsageStore,
+    UsageCharge, UsageLimits, UsageReservation, UsageStore,
     admission::{
         AdmissionClaim, AdmissionContract, AdmissionStore, AdmissionTicket, AttachJob,
         ClaimAdmission, WorkLease,
     },
     artifacts::{
-        ArtifactBlobStore, ArtifactIdentity, GENERATION_RESPONSE_SCHEMA,
-        GenerationResponseProjection, GenerationResultManifest, InMemoryArtifactBlobStore,
+        ArtifactBlobStore, ArtifactIdentity, FilesystemArtifactBlobStore,
+        GENERATION_RESPONSE_SCHEMA, GenerationResponseProjection, GenerationResultManifest,
+        InMemoryArtifactBlobStore,
     },
     database::{connect_test_pool_with_search_path, run_migrations},
+    reconcile_artifact_retention,
+    settlement::GenerationResultLookup,
 };
 use serde_json::json;
 use sqlx::{AssertSqlSafe, PgPool};
 use uuid::Uuid;
 
 type TestResult<T = ()> = Result<T, String>;
+
+#[tokio::test]
+async fn artifact_retention_expires_fences_and_deletes_without_erasing_economic_facts() -> TestResult
+{
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        sqlx::query(
+            r#"
+            UPDATE artifact_retention_policies
+            SET policy_version = policy_version + 1, retain_for_ms = 1000,
+                read_drain_ms = 1000, retry_delay_ms = 1000,
+                updated_at_ms = updated_at_ms + 1
+            WHERE policy_key = 'default'
+            "#,
+        )
+        .execute(&database.pool)
+        .await
+        .map_err(|error| format!("failed to shorten test retention policy: {error}"))?;
+        require(
+            sqlx::query(
+                r#"
+                UPDATE artifact_retention_policies
+                SET retain_for_ms = retain_for_ms + 1,
+                    updated_at_ms = updated_at_ms + 1
+                WHERE policy_key = 'default'
+                "#,
+            )
+            .execute(&database.pool)
+            .await
+            .is_err(),
+            "retention policy changed without a new version",
+        )?;
+
+        let fixture = RunningFixture::new(&database.pool).await?;
+        let artifact_root = tempfile::tempdir()
+            .map_err(|error| format!("failed to create artifact root: {error}"))?;
+        let artifacts = Arc::new(
+            FilesystemArtifactBlobStore::new(artifact_root.path())
+                .map_err(|error| format!("failed to open artifact root: {error:?}"))?,
+        );
+        let manifest = fixture.result_manifest(artifacts.as_ref()).await?;
+        let settlement =
+            PostgresExecutionSettlementStore::new(database.pool.clone(), artifacts.clone());
+        settlement
+            .succeed(&fixture.lease, &fixture.reservation, &manifest)
+            .await
+            .map_err(|error| format!("failed to settle retained result: {error:?}"))?;
+
+        let retention = PostgresArtifactRetentionStore::new(database.pool.clone());
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        require(
+            matches!(
+                settlement
+                    .load_generation_result(fixture.lease.job_id)
+                    .await
+                    .map_err(|error| format!("failed to enforce retention TTL: {error:?}"))?,
+                GenerationResultLookup::Expired
+            ),
+            "expired result remained replayable before reconciliation",
+        )?;
+        require(
+            retention
+                .expire_due(10)
+                .await
+                .map_err(|error| format!("failed to expire result: {error:?}"))?
+                == 1,
+            "due result was not expired exactly once",
+        )?;
+        require(
+            matches!(
+                settlement
+                    .load_generation_result(fixture.lease.job_id)
+                    .await
+                    .map_err(|error| format!("failed to load expired result: {error:?}"))?,
+                GenerationResultLookup::Expired
+            ),
+            "expired result remained replayable",
+        )?;
+
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        let (left, right) = tokio::join!(
+            retention.claim_due("retention-left", 1000),
+            retention.claim_due("retention-right", 1000),
+        );
+        let left = left.map_err(|error| format!("left retention claim failed: {error:?}"))?;
+        let right = right.map_err(|error| format!("right retention claim failed: {error:?}"))?;
+        require(
+            left.is_some() ^ right.is_some(),
+            "concurrent retention claim did not have exactly one winner",
+        )?;
+        let first_claim = left.or(right).expect("one retention claim must win");
+        let ArtifactRetentionClaim::Lease(first_lease) = first_claim else {
+            return Err("valid retention claim was unexpectedly deferred".to_string());
+        };
+        retention
+            .retry(&first_lease, "injected_delete_failure")
+            .await
+            .map_err(|error| format!("failed to defer retention retry: {error:?}"))?;
+        require(
+            retention.complete(&first_lease).await.is_err(),
+            "stale retention lease completed after retry fencing",
+        )?;
+        require(
+            sqlx::query(
+                r#"
+                UPDATE job_artifact_retention
+                SET state = 'deleting', lease_owner = $2,
+                    lease_expires_at_ms =
+                      (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT + 1000,
+                    delete_attempts = delete_attempts + 1,
+                    updated_at_ms =
+                      (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT
+                WHERE job_id = $1
+                "#,
+            )
+            .bind(first_lease.job_id)
+            .bind(&first_lease.owner)
+            .execute(&database.pool)
+            .await
+            .is_err(),
+            "retention claim reused an old epoch",
+        )?;
+
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        let outcome = reconcile_artifact_retention(
+            &retention,
+            artifacts.as_ref(),
+            "retention-finalizer",
+            1000,
+            10,
+        )
+        .await
+        .map_err(|error| format!("retention reconciliation failed: {error:?}"))?;
+        require(
+            outcome.claimed == 1 && outcome.deleted == 1 && outcome.failed == 0,
+            format!("unexpected retention outcome: {outcome:?}"),
+        )?;
+        for artifact in &manifest.artifacts {
+            require(
+                !artifact_root.path().join(&artifact.object_key).exists(),
+                "retention left customer artifact bytes on disk",
+            )?;
+        }
+        let durable: (String, i64, i64, i64, i64) = sqlx::query_as(
+            r#"
+            SELECT retention.state,
+                   (SELECT COUNT(*) FROM artifacts WHERE job_id = $1),
+                   (SELECT COUNT(*) FROM job_response_projections WHERE job_id = $1),
+                   (SELECT COUNT(*) FROM idempotency_requests WHERE job_id = $1),
+                   (SELECT COUNT(*) FROM usage_events WHERE job_id = $1)
+            FROM job_artifact_retention retention
+            WHERE retention.job_id = $1
+            "#,
+        )
+        .bind(fixture.lease.job_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(|error| format!("failed to inspect retention tombstone: {error}"))?;
+        require(
+            durable == ("deleted".to_string(), 2, 1, 1, 1),
+            format!("retention erased durable economic facts: {durable:?}"),
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
+async fn invalid_retention_manifest_is_deferred_without_blocking_later_jobs() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let artifact_root = tempfile::tempdir()
+            .map_err(|error| format!("failed to create artifact root: {error}"))?;
+        let artifacts = Arc::new(
+            FilesystemArtifactBlobStore::new(artifact_root.path())
+                .map_err(|error| format!("failed to open artifact root: {error:?}"))?,
+        );
+        let settlement =
+            PostgresExecutionSettlementStore::new(database.pool.clone(), artifacts.clone());
+
+        let invalid = RunningFixture::new(&database.pool).await?;
+        let invalid_manifest = invalid.result_manifest(artifacts.as_ref()).await?;
+        settlement
+            .succeed(&invalid.lease, &invalid.reservation, &invalid_manifest)
+            .await
+            .map_err(|error| format!("failed to settle invalid fixture: {error:?}"))?;
+        let valid = RunningFixture::new(&database.pool).await?;
+        let valid_manifest = valid.result_manifest(artifacts.as_ref()).await?;
+        settlement
+            .succeed(&valid.lease, &valid.reservation, &valid_manifest)
+            .await
+            .map_err(|error| format!("failed to settle valid fixture: {error:?}"))?;
+
+        sqlx::query("ALTER TABLE artifacts DISABLE TRIGGER artifacts_terminal_parent_check")
+            .execute(&database.pool)
+            .await
+            .map_err(|error| format!("failed to open corruption fixture: {error}"))?;
+        let corrupt = sqlx::query("DELETE FROM artifacts WHERE job_id = $1")
+            .bind(invalid.lease.job_id)
+            .execute(&database.pool)
+            .await
+            .map_err(|error| format!("failed to corrupt retention manifest: {error}"));
+        let restore =
+            sqlx::query("ALTER TABLE artifacts ENABLE TRIGGER artifacts_terminal_parent_check")
+                .execute(&database.pool)
+                .await
+                .map_err(|error| format!("failed to restore artifact invariant trigger: {error}"));
+        corrupt?;
+        restore?;
+
+        for (job_id, order_offset) in [(invalid.lease.job_id, -1_i64), (valid.lease.job_id, 0_i64)]
+        {
+            sqlx::query(
+                r#"
+                UPDATE job_artifact_retention
+                SET state = 'expired',
+                    expired_at_ms =
+                      (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT,
+                    purge_after_ms =
+                      (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT + $2,
+                    updated_at_ms =
+                      (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT
+                WHERE job_id = $1
+                "#,
+            )
+            .bind(job_id)
+            .bind(order_offset)
+            .execute(&database.pool)
+            .await
+            .map_err(|error| format!("failed to expire retention fixture: {error}"))?;
+        }
+
+        let outcome = reconcile_artifact_retention(
+            &PostgresArtifactRetentionStore::new(database.pool.clone()),
+            artifacts.as_ref(),
+            "retention-poison-test",
+            60_000,
+            10,
+        )
+        .await
+        .map_err(|error| format!("retention queue failed on invalid manifest: {error:?}"))?;
+        require(
+            outcome.failed == 1 && outcome.claimed == 1 && outcome.deleted == 1,
+            format!("invalid manifest blocked later work: {outcome:?}"),
+        )?;
+        let states: Vec<(Uuid, String, Option<String>)> = sqlx::query_as(
+            r#"
+            SELECT job_id, state, last_error_code
+            FROM job_artifact_retention
+            WHERE job_id = ANY($1)
+            ORDER BY job_id
+            "#,
+        )
+        .bind(&[invalid.lease.job_id, valid.lease.job_id][..])
+        .fetch_all(&database.pool)
+        .await
+        .map_err(|error| format!("failed to inspect retention queue: {error}"))?;
+        require(
+            states.iter().any(|row| {
+                row.0 == invalid.lease.job_id
+                    && row.1 == "expired"
+                    && row.2.as_deref() == Some("artifact_manifest_invalid")
+            }) && states
+                .iter()
+                .any(|row| row.0 == valid.lease.job_id && row.1 == "deleted" && row.2.is_none()),
+            format!("unexpected retention states after poison handling: {states:?}"),
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
 
 #[tokio::test]
 async fn forged_reservation_rolls_back_every_success_transition() -> TestResult {
@@ -326,12 +605,15 @@ impl RunningFixture {
         let reservation = usage
             .reserve(UsageCharge {
                 tenant_id: tenant_id.clone(),
+                attribution: None,
                 request_id: request_id.clone(),
                 admission_session_id: None,
                 operation: "generation",
                 provider_id: "openai-codex".to_string(),
                 model: "gpt-image-2".to_string(),
-                units: 2,
+                output_count: 2,
+                billable_units: 2,
+                billing_metric: image_provider_contracts::BillingMetric::Output,
                 limits: UsageLimits {
                     five_hour_image_limit: 20,
                     seven_day_image_limit: 40,
@@ -375,7 +657,7 @@ impl RunningFixture {
         artifacts: &dyn ArtifactBlobStore,
     ) -> TestResult<GenerationResultManifest> {
         let mut stored = Vec::new();
-        for output_index in 0..self.reservation.charge.units {
+        for output_index in 0..self.reservation.charge.output_count {
             stored.push(
                 artifacts
                     .put(
@@ -420,7 +702,23 @@ fn attach_request(ticket: AdmissionTicket, job_id: Uuid) -> AttachJob {
         ticket,
         job_id,
         command_schema: "openai.images.generation.v1".to_string(),
-        command_json: json!({"prompt": "atomic settlement"}),
+        command_json: json!({
+            "background": "auto",
+            "model": "gpt-image-2",
+            "moderation": null,
+            "n": 2,
+            "operation": "generation",
+            "output_compression": null,
+            "output_format": "png",
+            "partial_images": 0,
+            "prompt": "atomic settlement",
+            "provider_id": "openai-codex",
+            "quality": "high",
+            "schema_version": 1,
+            "size": "1024x1024",
+            "source_api_profile": "openai-images-v1",
+            "stream": false
+        }),
         input_manifest: None,
         work_kind: "image_batch".to_string(),
         schedule_scope: "tenant-settlement".to_string(),
@@ -428,6 +726,7 @@ fn attach_request(ticket: AdmissionTicket, job_id: Uuid) -> AttachJob {
         schedule_priority: 1,
         schedule_cost: 1,
         contract: AdmissionContract::LegacyV1,
+        customer_pricing: None,
     }
 }
 
@@ -455,7 +754,7 @@ fn forged_reservations(reservation: &UsageReservation) -> Vec<UsageReservation> 
     forged.push(value);
 
     let mut value = reservation.clone();
-    value.charge.units += 1;
+    value.charge.billable_units += 1;
     forged.push(value);
 
     let mut value = reservation.clone();
@@ -519,9 +818,9 @@ async fn assert_success_state(pool: &PgPool, fixture: &RunningFixture) -> TestRe
     .map_err(|error| format!("failed to read quota and job state: {error}"))?;
     require(
         quota_and_job.0 == "committed"
-            && quota_and_job.1 == fixture.reservation.charge.units as i32
+            && quota_and_job.1 == fixture.reservation.charge.billable_units as i32
             && quota_and_job.2 == "succeeded"
-            && quota_and_job.3 == fixture.reservation.charge.units as i32
+            && quota_and_job.3 == fixture.reservation.charge.billable_units as i32
             && quota_and_job.4.is_some(),
         format!("unexpected quota/job state: {quota_and_job:?}"),
     )

@@ -5,6 +5,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use image_provider_contracts::ProviderReportedCostEvidenceV1;
 use rustix::{
     fs::{self as rfs, AtFlags, FileType, Mode, OFlags, RenameFlags},
     io::Errno,
@@ -64,6 +65,8 @@ enum DiskTerminal {
     Succeeded {
         manifest_id: String,
         artifact_authority_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider_reported_cost: Option<ProviderReportedCostEvidenceV1>,
     },
     Failed {
         error_code: String,
@@ -124,7 +127,7 @@ impl FilesystemRunnerJournal {
         outcome: &RunnerOutcome,
     ) -> Result<(), RunnerJournalError> {
         validate_lease(lease)?;
-        let terminal = DiskTerminal::from_outcome(outcome)?;
+        let terminal = DiskTerminal::from_outcome(outcome, lease)?;
         let directory = self.ensure_spec(lease)?;
         match self.observe(&directory, lease)? {
             RunnerJournalObservation::Prepared => return Err(RunnerJournalError::Integrity),
@@ -138,6 +141,19 @@ impl FilesystemRunnerJournal {
             PublishResult::Created => Ok(()),
             PublishResult::Exists if self.read_terminal(&directory)? == terminal => Ok(()),
             PublishResult::Exists => Err(RunnerJournalError::Conflict),
+        }
+    }
+
+    pub(crate) fn verify_launch_committed(
+        &self,
+        lease: &ExecutorSubmissionLease,
+    ) -> Result<(), RunnerJournalError> {
+        let directory = self.ensure_spec(lease)?;
+        match self.observe(&directory, lease)? {
+            RunnerJournalObservation::LaunchCommitted => Ok(()),
+            RunnerJournalObservation::Prepared | RunnerJournalObservation::Terminal(_) => {
+                Err(RunnerJournalError::Integrity)
+            }
         }
     }
 
@@ -197,7 +213,9 @@ impl FilesystemRunnerJournal {
             return Ok(RunnerJournalObservation::Prepared);
         }
         match terminal {
-            Some(value) => Ok(RunnerJournalObservation::Terminal(value.into_outcome()?)),
+            Some(value) => Ok(RunnerJournalObservation::Terminal(
+                value.into_outcome(lease)?,
+            )),
             None => Ok(RunnerJournalObservation::LaunchCommitted),
         }
     }
@@ -343,13 +361,18 @@ impl DiskLaunch {
 }
 
 impl DiskTerminal {
-    fn from_outcome(outcome: &RunnerOutcome) -> Result<Self, RunnerJournalError> {
+    fn from_outcome(
+        outcome: &RunnerOutcome,
+        lease: &ExecutorSubmissionLease,
+    ) -> Result<Self, RunnerJournalError> {
         match outcome {
             RunnerOutcome::Succeeded(manifest) => {
                 validate_manifest(manifest, RunnerJournalError::InvalidInput)?;
+                validate_manifest_provider(manifest, lease, RunnerJournalError::InvalidInput)?;
                 Ok(Self::Succeeded {
                     manifest_id: manifest.manifest_id.to_string(),
                     artifact_authority_id: manifest.artifact_authority_id.to_string(),
+                    provider_reported_cost: manifest.provider_reported_cost.clone(),
                 })
             }
             RunnerOutcome::Failed { error_code } => Ok(Self::Failed {
@@ -361,18 +384,24 @@ impl DiskTerminal {
         }
     }
 
-    fn into_outcome(self) -> Result<RunnerOutcome, RunnerJournalError> {
+    fn into_outcome(
+        self,
+        lease: &ExecutorSubmissionLease,
+    ) -> Result<RunnerOutcome, RunnerJournalError> {
         match self {
             Self::Succeeded {
                 manifest_id,
                 artifact_authority_id,
+                provider_reported_cost,
             } => {
                 let manifest = ExecutorResultManifest::new(
                     parse_uuid(&manifest_id)?,
                     parse_uuid(&artifact_authority_id)?,
                 )
+                .and_then(|manifest| manifest.with_provider_reported_cost(provider_reported_cost))
                 .ok_or(RunnerJournalError::Integrity)?;
                 validate_manifest(&manifest, RunnerJournalError::Integrity)?;
+                validate_manifest_provider(&manifest, lease, RunnerJournalError::Integrity)?;
                 Ok(RunnerOutcome::Succeeded(manifest))
             }
             Self::Failed { error_code } => {
@@ -599,6 +628,24 @@ fn validate_manifest(
     Ok(())
 }
 
+fn validate_manifest_provider(
+    manifest: &ExecutorResultManifest,
+    lease: &ExecutorSubmissionLease,
+    error: RunnerJournalError,
+) -> Result<(), RunnerJournalError> {
+    if manifest
+        .provider_reported_cost
+        .as_ref()
+        .is_some_and(|evidence| {
+            evidence.observation().provider_id != lease.provider_id || evidence.validate().is_err()
+        })
+    {
+        Err(error)
+    } else {
+        Ok(())
+    }
+}
+
 fn validated_error_code(value: &str) -> Result<String, RunnerJournalError> {
     error_code_is_valid(value)
         .then(|| value.to_string())
@@ -644,6 +691,7 @@ impl DiskTerminal {
             Self::Succeeded {
                 manifest_id,
                 artifact_authority_id,
+                provider_reported_cost,
             } => {
                 parse_uuid(manifest_id)?;
                 parse_uuid(artifact_authority_id)?;
@@ -651,6 +699,9 @@ impl DiskTerminal {
                     parse_uuid(manifest_id)?,
                     parse_uuid(artifact_authority_id)?,
                 )
+                .and_then(|manifest| {
+                    manifest.with_provider_reported_cost(provider_reported_cost.clone())
+                })
                 .ok_or(RunnerJournalError::Integrity)?;
                 result_manifest_is_valid(&manifest)
                     .then_some(())

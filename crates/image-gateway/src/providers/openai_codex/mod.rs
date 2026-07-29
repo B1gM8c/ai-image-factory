@@ -228,9 +228,7 @@ async fn run_codex_once(
         .kill_on_drop(true);
     configure_codex_process_group(&mut command);
 
-    for path in input_paths {
-        command.arg("--image").arg(path);
-    }
+    append_input_image_arguments(&mut command, input_paths);
     command.arg("-");
     apply_codex_env(&mut command, config);
 
@@ -274,6 +272,12 @@ async fn run_codex_once(
     }
 
     Ok(GeneratedImage { bytes })
+}
+
+fn append_input_image_arguments(command: &mut Command, input_paths: &[PathBuf]) {
+    for path in input_paths {
+        command.arg("--image").arg(path);
+    }
 }
 
 pub(crate) async fn read_codex_output(image_path: &Path) -> Result<Vec<u8>, ImageGatewayError> {
@@ -406,6 +410,22 @@ fn non_empty_process_env(name: &str) -> Option<String> {
 }
 
 pub(crate) fn build_codex_prompt(job: &GenerationJob, request_dir: &Path, index: u32) -> String {
+    build_codex_prompt_for_output(
+        job,
+        request_dir,
+        index,
+        request_dir,
+        final_output_filename(&job.output_format),
+    )
+}
+
+pub(crate) fn build_codex_prompt_for_output(
+    job: &GenerationJob,
+    request_dir: &Path,
+    index: u32,
+    output_dir: &Path,
+    final_filename: &str,
+) -> String {
     let size_instruction = match parse_size_constraint(&job.size).unwrap_or(SizeConstraint::Auto) {
         SizeConstraint::Auto => "尺寸 auto，由图像生成器选择合适画布。".to_string(),
         SizeConstraint::Dimensions { width, height } => {
@@ -422,7 +442,7 @@ pub(crate) fn build_codex_prompt(job: &GenerationJob, request_dir: &Path, index:
             )
         }
     };
-    let final_filename = final_output_filename(&job.output_format);
+    let provider_filename = provider_output_filename(&job.output_format);
     let candidate_instruction = if job.n > 1 {
         format!(
             "请求参数 n={} 表示整个 API 请求需要返回 {} 张图片，网关会分 {} 次调用 Codex。当前只生成第 {index}/{} 张候选图片；请只输出这一张最终图片，不要在同一张画布里拼出多张图。请生成一个独立候选结果，保持用户需求一致，但构图、细节或风格处理不要与其它候选完全重复。",
@@ -441,9 +461,21 @@ pub(crate) fn build_codex_prompt(job: &GenerationJob, request_dir: &Path, index:
     }
     prompt.push_str(" 背景必须是不透明背景，不要生成透明背景或 alpha 通道。");
     prompt.push_str(&format!(
-        " 不要再启动 codex、openai 或其它 AI CLI 子进程来委托生成；不要用 sips、ImageMagick、Python、Rust、ffmpeg、canvas 或其他本地图像处理工具裁切、拉伸、重采样、扩边、转绘或修改像素。请把唯一最终图片保存为 {}/{}；不要在该目录下留下其它 png、jpg、jpeg 或 webp 图片文件。不要在图片中加入水印。",
+        " 不要再启动 codex、openai 或其它 AI CLI 子进程来委托生成；不要用 sips、ImageMagick、Python、Rust、ffmpeg、canvas 或其他本地图像处理工具裁切、拉伸、重采样、扩边、转绘或修改像素。请先让图像生成能力把原生结果保存为 {}/{}。生成彻底完成后，必须依次执行 `/bin/cp {}/{} {}/{}.partial`、`/bin/mv {}/{}.partial {}/{}`、`/bin/rm {}/{}`。这里允许 cp、mv、rm，因为它们不能修改图片像素。不要让图像生成能力直接管理最终文件，不要使用硬链接或符号链接。退出前确认该目录只剩唯一最终图片 {}/{}，不要留下其它 png、jpg、jpeg 或 webp 图片文件。不要在图片中加入水印。",
         request_dir.display(),
-        final_filename
+        provider_filename,
+        request_dir.display(),
+        provider_filename,
+        output_dir.display(),
+        final_filename,
+        output_dir.display(),
+        final_filename,
+        output_dir.display(),
+        final_filename,
+        request_dir.display(),
+        provider_filename,
+        output_dir.display(),
+        final_filename,
     ));
     prompt
 }
@@ -546,6 +578,14 @@ pub(crate) fn final_output_filename(output_format: &str) -> &'static str {
         "jpeg" => "final.jpg",
         "webp" => "final.webp",
         _ => "final.png",
+    }
+}
+
+pub(crate) fn provider_output_filename(output_format: &str) -> &'static str {
+    match output_format {
+        "jpeg" => "provider-output.jpg",
+        "webp" => "provider-output.webp",
+        _ => "provider-output.png",
     }
 }
 
@@ -659,10 +699,14 @@ mod tests {
             bind: "127.0.0.1:0".parse().unwrap(),
             auth_token: Some("gateway-token".to_string()),
             admin_token: Some("admin-token".to_string()),
+            legacy_admin_auth_enabled: true,
             database_url: Some("postgres://secret".to_string()),
             generation_admission_contract: Default::default(),
+            enable_xai_video_api: false,
             five_hour_image_limit: 1,
             seven_day_image_limit: 1,
+            five_hour_video_second_limit: i32::MAX as u32,
+            seven_day_video_second_limit: i32::MAX as u32,
             max_concurrent_jobs: 1,
             max_queue_size: 0,
             max_concurrent_jobs_per_tenant: 1,
@@ -856,7 +900,46 @@ mod tests {
         assert!(prompt.contains("宽高比必须为 3:2"));
         assert!(prompt.contains("不透明背景"));
         assert!(prompt.contains("不要用 sips"));
+        assert!(prompt.contains("/tmp/out/provider-output.png"));
+        assert!(prompt.contains("/bin/cp /tmp/out/provider-output.png /tmp/out/final.png.partial"));
+        assert!(prompt.contains("/bin/mv /tmp/out/final.png.partial /tmp/out/final.png"));
+        assert!(prompt.contains("不要使用硬链接或符号链接"));
         assert!(prompt.contains("/tmp/out/final.png"));
+    }
+
+    #[test]
+    fn executor_prompt_seals_media_bytes_under_a_non_media_filename() {
+        let job = GenerationJob {
+            request_id: "req-test".to_string(),
+            model: "gpt-image-2".to_string(),
+            prompt: "a clean product icon".to_string(),
+            moderation: "auto".to_string(),
+            n: 1,
+            size: "1024x1024".to_string(),
+            quality: "low".to_string(),
+            output_format: "png".to_string(),
+            output_compression: None,
+            background: "opaque".to_string(),
+            stream: false,
+            partial_images: 0,
+        };
+
+        let prompt = build_codex_prompt_for_output(
+            &job,
+            Path::new("/tmp/workspace"),
+            1,
+            Path::new("/tmp/output"),
+            "sealed-output.bin",
+        );
+
+        assert!(prompt.contains("/tmp/workspace/provider-output.png"));
+        assert!(prompt.contains(
+            "/bin/cp /tmp/workspace/provider-output.png /tmp/output/sealed-output.bin.partial"
+        ));
+        assert!(prompt.contains(
+            "/bin/mv /tmp/output/sealed-output.bin.partial /tmp/output/sealed-output.bin"
+        ));
+        assert!(!prompt.contains("/tmp/output/final.png"));
     }
 
     #[test]
@@ -1021,6 +1104,35 @@ mod tests {
         assert!(prompt.contains("不要把输入图逐张简单拼贴成网格"));
         assert!(prompt.contains("mask.png"));
         assert!(prompt.contains("非遮罩区域"));
+    }
+
+    #[test]
+    fn every_reference_image_becomes_one_codex_cli_image_argument() {
+        let input_paths = vec![
+            PathBuf::from("/tmp/reference-1.png"),
+            PathBuf::from("/tmp/reference-2.webp"),
+            PathBuf::from("/tmp/reference-3.jpg"),
+        ];
+        let mut command = Command::new("codex");
+
+        append_input_image_arguments(&mut command, &input_paths);
+
+        let arguments = command
+            .as_std()
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            arguments,
+            [
+                "--image",
+                "/tmp/reference-1.png",
+                "--image",
+                "/tmp/reference-2.webp",
+                "--image",
+                "/tmp/reference-3.jpg",
+            ]
+        );
     }
 
     #[tokio::test]

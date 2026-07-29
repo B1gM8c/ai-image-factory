@@ -2,10 +2,11 @@ use std::{env, path::PathBuf, sync::Arc, time::Duration};
 
 use gpt_image_2_gateway::executor::{ExecutorDaemon, ExecutorDaemonRun};
 use gpt_image_2_gateway::{
-    CODEX_GENERATION_ADAPTER_REVISION, CodexProcessSupervisor, ExecutorExecutionProfileStore,
-    ExecutorOwnerGuardError, ImageGatewayError, JournaledDurableRunner, PostgresExecutorOwnerGuard,
-    PostgresExecutorSubmissionStore, ProxyConfig,
-    admission::GENERATION_COMMAND_SCHEMA,
+    CodexProcessSupervisor, ExecutorExecutionProfileStore, ExecutorOwnerGuardError,
+    ExecutorProcessSupervisor, ExecutorProfileBinding, GrokProcessSupervisor, ImageGatewayError,
+    JournaledDurableRunner, OperationalCredentialResolver, PostgresCredentialStore,
+    PostgresExecutorOwnerGuard, PostgresExecutorSubmissionStore, ProviderUploadService,
+    ProxyConfig,
     artifacts::{
         ExecutorArtifactPublisher, FilesystemArtifactBlobStore, artifact_root_from_env,
         validate_artifact_root_isolated,
@@ -14,16 +15,15 @@ use gpt_image_2_gateway::{
         DEFAULT_MAX_CONNECTIONS, connect_pool_with_schema, database_schema_from_env,
         database_url_from_env, verify_migrations,
     },
-    init_telemetry,
+    identify_executor_profile_binding, init_telemetry,
     runner::FilesystemRunnerJournal,
 };
-use image_provider_contracts::openai_codex;
 
 const DEFAULT_LEASE_MS: u64 = 60_000;
 const DEFAULT_HEARTBEAT_MS: u64 = 10_000;
 const DEFAULT_POLL_MS: u64 = 250;
 const DEFAULT_PROCESS_POLL_MS: u64 = 100;
-const DEFAULT_PROCESS_STARTUP_GRACE_MS: u64 = 5_000;
+const DEFAULT_PROCESS_STARTUP_GRACE_MS: u64 = 60_000;
 const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 15 * 60 * 1_000;
 const DEFAULT_OWNER_GUARD_TIMEOUT_MS: u64 = 5_000;
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
@@ -35,8 +35,6 @@ struct ExecutorConfig {
     credential_revision: i64,
     runner_root: PathBuf,
     helper_executable: PathBuf,
-    codex_executable: PathBuf,
-    credential_home: PathBuf,
     lease_ms: i64,
     heartbeat_interval: Duration,
     poll_interval: Duration,
@@ -66,8 +64,6 @@ impl ExecutorConfig {
             })?;
         let runner_root = absolute_env_path("EXECUTOR_RUNNER_ROOT")?;
         let helper_executable = absolute_env_path("EXECUTOR_HELPER_EXECUTABLE")?;
-        let codex_executable = absolute_env_path("EXECUTOR_CODEX_EXECUTABLE")?;
-        let credential_home = absolute_env_path("EXECUTOR_CODEX_CREDENTIAL_HOME")?;
         let lease_ms = env_u64("EXECUTOR_LEASE_MS", DEFAULT_LEASE_MS)?;
         let heartbeat_ms = env_u64("EXECUTOR_HEARTBEAT_INTERVAL_MS", DEFAULT_HEARTBEAT_MS)?;
         let poll_ms = env_u64("EXECUTOR_POLL_INTERVAL_MS", DEFAULT_POLL_MS)?;
@@ -105,8 +101,6 @@ impl ExecutorConfig {
             credential_revision,
             runner_root,
             helper_executable,
-            codex_executable,
-            credential_home,
             lease_ms: i64::try_from(lease_ms)
                 .map_err(|_| ImageGatewayError::config("EXECUTOR_LEASE_MS is too large"))?,
             heartbeat_interval: Duration::from_millis(heartbeat_ms),
@@ -120,44 +114,76 @@ impl ExecutorConfig {
     }
 }
 
+struct ProviderRuntimeConfig {
+    executable: PathBuf,
+    credential_home: PathBuf,
+}
+
+impl ProviderRuntimeConfig {
+    fn from_env(binding: ExecutorProfileBinding) -> Result<Self, ImageGatewayError> {
+        Ok(Self {
+            executable: absolute_env_path_with_fallback(
+                "EXECUTOR_PROVIDER_EXECUTABLE",
+                binding.provider_executable_env(),
+            )?,
+            credential_home: absolute_env_path_with_fallback(
+                "EXECUTOR_CREDENTIAL_HOME",
+                binding.credential_home_env(),
+            )?,
+        })
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), ImageGatewayError> {
     let config = ExecutorConfig::from_env()?;
     let telemetry = init_telemetry()?;
     let artifact_root = artifact_root_from_env()?;
     let artifacts = Arc::new(FilesystemArtifactBlobStore::new(&artifact_root)?);
+    let provider_uploads = Arc::new(ProviderUploadService::from_env(&artifact_root)?);
     let journal = Arc::new(
         FilesystemRunnerJournal::new(&config.runner_root)
             .map_err(|_| ImageGatewayError::config("EXECUTOR_RUNNER_ROOT is invalid"))?,
     );
-    validate_isolated_trees(&artifact_root, &config.runner_root, &config.credential_home)?;
-    validate_artifact_root_isolated(&artifact_root, &config.credential_home)?;
     let database_url = database_url_from_env()?;
     let database_schema = database_schema_from_env()?;
     let pool =
         connect_pool_with_schema(&database_url, DEFAULT_MAX_CONNECTIONS, &database_schema).await?;
     verify_migrations(&pool).await?;
     let store = PostgresExecutorSubmissionStore::new(pool.clone());
+    let credential_resolver = Arc::new(PostgresCredentialStore::new(pool.clone()));
     let profile = store
         .load_execution_profile(&config.profile_key)
         .await
         .map_err(|_| ImageGatewayError::config("EXECUTOR_PROFILE_KEY is unavailable"))?;
-    let operation = openai_codex::operation("images.generations").ok_or_else(|| {
-        ImageGatewayError::config("Codex generation operation descriptor is unavailable")
+    let binding = identify_executor_profile_binding(&profile).map_err(|_| {
+        ImageGatewayError::config("executor runtime does not support the selected database profile")
     })?;
-    if profile.provider_id != openai_codex::PROVIDER_ID
-        || profile.command_schema != GENERATION_COMMAND_SCHEMA
-        || profile.operation_id != operation.id
-        || profile.operation_descriptor_revision != operation.descriptor_revision
-        || profile.operation_descriptor_sha256_v1 != operation.canonical_sha256_v1_hex()
-        || profile.completion_mode != operation.completion.as_str()
-        || profile.idempotency_mode != operation.idempotency.as_str()
-        || profile.adapter_revision != CODEX_GENERATION_ADAPTER_REVISION
-        || profile.credential_ref != config.credential_ref
+    if profile.credential_ref != config.credential_ref
         || profile.credential_revision != config.credential_revision
     {
         return Err(ImageGatewayError::config(
             "executor runtime does not match the selected database profile",
+        ));
+    }
+    let provider_runtime = ProviderRuntimeConfig::from_env(binding)?;
+    validate_isolated_trees(
+        &artifact_root,
+        &config.runner_root,
+        &provider_runtime.credential_home,
+    )?;
+    validate_artifact_root_isolated(&artifact_root, &provider_runtime.credential_home)?;
+    let operational_credential = credential_resolver
+        .resolve(profile.provider_account_id)
+        .await
+        .map_err(|_| {
+            ImageGatewayError::service_unavailable("operational provider credential is unavailable")
+        })?;
+    if operational_credential.provider_id != profile.provider_id
+        || operational_credential.home() != provider_runtime.credential_home
+    {
+        return Err(ImageGatewayError::config(
+            "executor credential environment does not match the managed account",
         ));
     }
     let scope = profile.claim_scope();
@@ -169,17 +195,40 @@ async fn main() -> Result<(), ImageGatewayError> {
     )
     .await
     .map_err(|error| ImageGatewayError::service_unavailable(error.to_string()))?;
-    let supervisor = CodexProcessSupervisor::new(
-        journal.clone(),
-        &config.helper_executable,
-        &config.codex_executable,
-        &config.credential_home,
-        &profile.credential_auth_sha256,
-        config.request_timeout,
-        config.process_poll_interval,
-        config.process_startup_grace,
-        &config.proxy,
-    )?;
+    let supervisor = match binding {
+        ExecutorProfileBinding::CodexImageGeneration => ExecutorProcessSupervisor::Codex(
+            CodexProcessSupervisor::new(
+                journal.clone(),
+                &config.helper_executable,
+                &provider_runtime.executable,
+                &provider_runtime.credential_home,
+                &operational_credential.material_fingerprint_sha256,
+                config.request_timeout,
+                config.process_poll_interval,
+                config.process_startup_grace,
+                &config.proxy,
+            )?
+            .with_credential_resolver(profile.provider_account_id, credential_resolver.clone())?,
+        ),
+        ExecutorProfileBinding::GrokImageGeneration
+        | ExecutorProfileBinding::GrokImageEdit
+        | ExecutorProfileBinding::GrokVideoGeneration => ExecutorProcessSupervisor::Grok(
+            GrokProcessSupervisor::new(
+                journal.clone(),
+                &config.helper_executable,
+                &provider_runtime.executable,
+                &provider_runtime.credential_home,
+                &operational_credential.material_fingerprint_sha256,
+                config.request_timeout,
+                config.process_poll_interval,
+                config.process_startup_grace,
+                &config.proxy,
+            )?
+            .with_credential_resolver(profile.provider_account_id, credential_resolver.clone())?
+            .with_input_blobs(artifacts.clone())
+            .with_local_video_uploads(provider_uploads),
+        ),
+    };
     let publisher = ExecutorArtifactPublisher::with_filesystem_store(artifacts, store.clone());
     let runner = JournaledDurableRunner::new(store.clone(), journal, supervisor, publisher);
     let daemon = ExecutorDaemon::new(
@@ -304,6 +353,23 @@ fn required_env(name: &str) -> Result<String, ImageGatewayError> {
 
 fn absolute_env_path(name: &str) -> Result<PathBuf, ImageGatewayError> {
     let path = PathBuf::from(required_env(name)?);
+    if !path.is_absolute() {
+        return Err(ImageGatewayError::config(format!(
+            "{name} must be an absolute path"
+        )));
+    }
+    Ok(path)
+}
+
+fn absolute_env_path_with_fallback(
+    primary: &str,
+    fallback: &str,
+) -> Result<PathBuf, ImageGatewayError> {
+    let (name, value) = env_value(primary)
+        .map(|value| (primary, value))
+        .or_else(|| env_value(fallback).map(|value| (fallback, value)))
+        .ok_or_else(|| ImageGatewayError::config(format!("{primary} or {fallback} is required")))?;
+    let path = PathBuf::from(value);
     if !path.is_absolute() {
         return Err(ImageGatewayError::config(format!(
             "{name} must be an absolute path"

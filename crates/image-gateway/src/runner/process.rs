@@ -2,9 +2,10 @@ use std::{
     fs,
     io::{Read, Write},
     os::fd::{AsRawFd, OwnedFd},
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
 };
 
+use image_provider_contracts::ProviderReportedCostEvidenceV1;
 use rustix::{
     fs::{self as rfs, AtFlags, FileType, Mode, OFlags, RenameFlags},
     io::Errno,
@@ -14,7 +15,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::{FilesystemRunnerJournal, RunnerJournalError};
-use crate::executor::{ExecutorSubmissionLease, error_code_is_valid};
+use crate::executor::{ExecutorSubmissionLease, SupervisedOutput, error_code_is_valid};
 
 const REQUEST_FILE: &str = "provider-request.json";
 const PROCESS_FILE: &str = "process.json";
@@ -24,6 +25,10 @@ const OUTPUT_FILE: &str = "output.bin";
 const RESULT_FILE: &str = "result.json";
 const WORKSPACE_DIR: &str = "workspace";
 const CODEX_HOME_DIR: &str = "codex-home";
+const RUNTIME_HOME_DIR: &str = "runtime-home";
+const PROVIDER_HOME_DIR: &str = "provider-home";
+const PROVIDER_WORKSPACES_DIR: &str = "provider-workspaces";
+const PROVIDER_ATTEMPT_DIR: &str = "attempt";
 const MAX_REQUEST_BYTES: u64 = 1024 * 1024;
 const MAX_MARKER_BYTES: u64 = 64 * 1024;
 const MAX_OUTPUT_BYTES: u64 = 256 * 1024 * 1024;
@@ -34,6 +39,10 @@ pub(crate) struct ExecutionSpool {
     path: PathBuf,
     workspace: PrivateDirectory,
     codex_home: PrivateDirectory,
+    runtime_home: PrivateDirectory,
+    provider_home: PrivateDirectory,
+    provider_workspaces: PrivateDirectory,
+    provider_attempt: PrivateDirectory,
 }
 
 struct PrivateDirectory {
@@ -73,6 +82,8 @@ pub(crate) enum ProcessTerminal {
         helper_nonce: String,
         sha256_hex: String,
         byte_size: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider_reported_cost: Option<ProviderReportedCostEvidenceV1>,
     },
     Failed {
         helper_nonce: String,
@@ -88,7 +99,7 @@ pub(crate) enum ProcessTerminal {
 pub(crate) enum ProcessObservation {
     AwaitingProcess,
     Running(ProcessIdentity),
-    Succeeded(Vec<u8>),
+    Succeeded(SupervisedOutput),
     Failed {
         error_code: String,
     },
@@ -98,6 +109,13 @@ pub(crate) enum ProcessObservation {
     Lost {
         provider: Option<ProviderProcessIdentity>,
     },
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum WorkspaceOutputSnapshot {
+    Missing,
+    Incomplete,
+    Bytes(Vec<u8>),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
@@ -143,6 +161,15 @@ impl ExecutionSpool {
     fn from_directory(directory: OwnedFd, path: PathBuf) -> Result<Self, ProcessSpoolError> {
         let workspace = ensure_private_directory_at(&directory, &path, WORKSPACE_DIR)?;
         let codex_home = ensure_private_directory_at(&directory, &path, CODEX_HOME_DIR)?;
+        let runtime_home = ensure_private_directory_at(&directory, &path, RUNTIME_HOME_DIR)?;
+        let provider_home = ensure_private_directory_at(&directory, &path, PROVIDER_HOME_DIR)?;
+        let provider_workspaces =
+            ensure_private_directory_at(&directory, &path, PROVIDER_WORKSPACES_DIR)?;
+        let provider_attempt = ensure_private_directory_at(
+            &provider_workspaces.fd,
+            &provider_workspaces.path,
+            PROVIDER_ATTEMPT_DIR,
+        )?;
         ensure_lock_file(&directory)?;
         Ok(Self {
             directory,
@@ -150,6 +177,10 @@ impl ExecutionSpool {
             path,
             workspace,
             codex_home,
+            runtime_home,
+            provider_home,
+            provider_workspaces,
+            provider_attempt,
         })
     }
 
@@ -286,12 +317,15 @@ impl ExecutionSpool {
                 helper_nonce: _,
                 sha256_hex,
                 byte_size,
+                provider_reported_cost,
             } => {
                 let bytes = read_required_bytes(&self.directory, OUTPUT_FILE, MAX_OUTPUT_BYTES)?;
                 if bytes.len() as u64 != byte_size || sha256(&bytes) != sha256_hex {
                     return Err(ProcessSpoolError::Integrity);
                 }
-                Ok(ProcessObservation::Succeeded(bytes))
+                let output = SupervisedOutput::from_parts(bytes, provider_reported_cost)
+                    .ok_or(ProcessSpoolError::Integrity)?;
+                Ok(ProcessObservation::Succeeded(output))
             }
             ProcessTerminal::Failed {
                 helper_nonce: _,
@@ -373,9 +407,115 @@ impl ExecutionSpool {
         Ok(&self.workspace.path)
     }
 
+    pub(crate) fn read_workspace_output(
+        &self,
+        filename: &str,
+        max_bytes: u64,
+    ) -> Result<WorkspaceOutputSnapshot, ProcessSpoolError> {
+        if !valid_single_component(filename) || max_bytes == 0 {
+            return Err(ProcessSpoolError::InvalidInput);
+        }
+        validate_bound_path(&self.workspace.path, &self.workspace.fd)?;
+        read_workspace_output(&self.workspace.fd, filename, max_bytes)
+    }
+
     pub(crate) fn codex_home_path(&self) -> Result<&Path, ProcessSpoolError> {
         validate_bound_path(&self.codex_home.path, &self.codex_home.fd)?;
         Ok(&self.codex_home.path)
+    }
+
+    pub(crate) fn runtime_home_path(&self) -> Result<&Path, ProcessSpoolError> {
+        validate_bound_path(&self.runtime_home.path, &self.runtime_home.fd)?;
+        Ok(&self.runtime_home.path)
+    }
+
+    pub(crate) fn provider_home_path(&self) -> Result<&Path, ProcessSpoolError> {
+        validate_bound_path(&self.provider_home.path, &self.provider_home.fd)?;
+        Ok(&self.provider_home.path)
+    }
+
+    pub(crate) fn provider_workspaces_path(&self) -> Result<&Path, ProcessSpoolError> {
+        validate_bound_path(&self.provider_workspaces.path, &self.provider_workspaces.fd)?;
+        Ok(&self.provider_workspaces.path)
+    }
+
+    pub(crate) fn provider_attempt_path(&self) -> Result<&Path, ProcessSpoolError> {
+        validate_bound_path(&self.provider_attempt.path, &self.provider_attempt.fd)?;
+        Ok(&self.provider_attempt.path)
+    }
+
+    pub(crate) fn stage_provider_input(
+        &self,
+        filename: &str,
+        bytes: &[u8],
+        max_bytes: u64,
+    ) -> Result<(), ProcessSpoolError> {
+        let mut components = Path::new(filename).components();
+        if !matches!(components.next(), Some(Component::Normal(_)))
+            || components.next().is_some()
+            || filename.is_empty()
+            || filename.len() > 255
+            || bytes.is_empty()
+            || bytes.len() as u64 > max_bytes
+        {
+            return Err(ProcessSpoolError::InvalidInput);
+        }
+        validate_bound_path(&self.provider_attempt.path, &self.provider_attempt.fd)?;
+        publish_or_compare(&self.provider_attempt.fd, filename, bytes, max_bytes)
+    }
+
+    pub(crate) fn cleanup_provider_runtime(&self) -> Result<(), ProcessSpoolError> {
+        for directory in [
+            &self.provider_home,
+            &self.provider_workspaces,
+            &self.runtime_home,
+        ] {
+            validate_bound_path(&directory.path, &directory.fd)?;
+            fs::remove_dir_all(&directory.path).map_err(|_| ProcessSpoolError::Unavailable)?;
+        }
+        rfs::fsync(&self.directory).map_err(|_| ProcessSpoolError::Unavailable)
+    }
+
+    pub(crate) fn cleanup_codex_runtime(&self) -> Result<(), ProcessSpoolError> {
+        for directory in [&self.codex_home, &self.workspace, &self.runtime_home] {
+            validate_bound_path(&directory.path, &directory.fd)?;
+            fs::remove_dir_all(&directory.path).map_err(|_| ProcessSpoolError::Unavailable)?;
+        }
+        rfs::fsync(&self.directory).map_err(|_| ProcessSpoolError::Unavailable)
+    }
+
+    pub(crate) fn open_provider_file(
+        &self,
+        relative_path: &Path,
+    ) -> Result<fs::File, ProcessSpoolError> {
+        validate_bound_path(&self.provider_home.path, &self.provider_home.fd)?;
+        let components = relative_path
+            .components()
+            .map(|component| match component {
+                Component::Normal(name) => Ok(name),
+                _ => Err(ProcessSpoolError::InvalidInput),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let (filename, directories) = components
+            .split_last()
+            .ok_or(ProcessSpoolError::InvalidInput)?;
+        let mut current_directory = None;
+        for name in directories {
+            let fd = match current_directory.as_ref() {
+                Some(directory) => open_provider_directory_at(directory, name),
+                None => open_provider_directory_at(&self.provider_home.fd, name),
+            }?;
+            current_directory = Some(fd);
+        }
+        let directory = current_directory.as_ref().unwrap_or(&self.provider_home.fd);
+        let fd = rfs::openat(
+            directory,
+            *filename,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
+            Mode::empty(),
+        )
+        .map_err(|_| ProcessSpoolError::Integrity)?;
+        Ok(fs::File::from(fd))
     }
 
     #[cfg(test)]
@@ -449,8 +589,14 @@ impl ProcessTerminal {
                 helper_nonce: _,
                 sha256_hex,
                 byte_size,
+                provider_reported_cost,
             } => {
-                if !is_sha256(sha256_hex) || !(1..=MAX_OUTPUT_BYTES).contains(byte_size) {
+                if !is_sha256(sha256_hex)
+                    || !(1..=MAX_OUTPUT_BYTES).contains(byte_size)
+                    || provider_reported_cost
+                        .as_ref()
+                        .is_some_and(|evidence| evidence.validate().is_err())
+                {
                     return Err(ProcessSpoolError::Integrity);
                 }
             }
@@ -798,6 +944,102 @@ fn read_optional_bytes(
     Ok(Some(bytes))
 }
 
+fn read_workspace_output(
+    directory: &OwnedFd,
+    name: &str,
+    max_bytes: u64,
+) -> Result<WorkspaceOutputSnapshot, ProcessSpoolError> {
+    let fd = match rfs::openat(
+        directory,
+        name,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
+        Mode::empty(),
+    ) {
+        Ok(fd) => fd,
+        Err(Errno::NOENT) => return Ok(WorkspaceOutputSnapshot::Missing),
+        Err(_) => return Err(ProcessSpoolError::Integrity),
+    };
+    let mut file = fs::File::from(fd);
+    let initial = rfs::fstat(&file).map_err(|_| ProcessSpoolError::Unavailable)?;
+    let Some(size) = validate_workspace_output_stat(&initial, max_bytes)? else {
+        return Ok(WorkspaceOutputSnapshot::Incomplete);
+    };
+    let mut bytes = Vec::with_capacity(size);
+    Read::by_ref(&mut file)
+        .take(max_bytes + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| ProcessSpoolError::Unavailable)?;
+    let final_stat = rfs::fstat(&file).map_err(|_| ProcessSpoolError::Unavailable)?;
+    if validate_workspace_output_stat(&final_stat, max_bytes)? != Some(size)
+        || !same_file_snapshot(&initial, &final_stat)
+        || bytes.len() != size
+    {
+        return Ok(WorkspaceOutputSnapshot::Incomplete);
+    }
+
+    let current = match rfs::openat(
+        directory,
+        name,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
+        Mode::empty(),
+    ) {
+        Ok(fd) => fd,
+        Err(Errno::NOENT) => return Ok(WorkspaceOutputSnapshot::Incomplete),
+        Err(_) => return Err(ProcessSpoolError::Integrity),
+    };
+    let current_stat = rfs::fstat(&current).map_err(|_| ProcessSpoolError::Unavailable)?;
+    if validate_workspace_output_stat(&current_stat, max_bytes)? != Some(size)
+        || !same_file_snapshot(&final_stat, &current_stat)
+    {
+        return Ok(WorkspaceOutputSnapshot::Incomplete);
+    }
+    Ok(WorkspaceOutputSnapshot::Bytes(bytes))
+}
+
+fn validate_workspace_output_stat(
+    stat: &rfs::Stat,
+    max_bytes: u64,
+) -> Result<Option<usize>, ProcessSpoolError> {
+    if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile
+        || stat.st_uid != unsafe { libc::geteuid() }
+        || stat.st_nlink != 1
+        || Mode::from_raw_mode(stat.st_mode).bits() & 0o7022 != 0
+        || stat.st_size < 0
+        || stat.st_size as u64 > max_bytes
+    {
+        return Err(ProcessSpoolError::Integrity);
+    }
+    if stat.st_size == 0 {
+        return Ok(None);
+    }
+    usize::try_from(stat.st_size)
+        .map(Some)
+        .map_err(|_| ProcessSpoolError::Integrity)
+}
+
+fn same_file_snapshot(first: &rfs::Stat, second: &rfs::Stat) -> bool {
+    first.st_dev == second.st_dev
+        && first.st_ino == second.st_ino
+        && first.st_mode == second.st_mode
+        && first.st_uid == second.st_uid
+        && first.st_gid == second.st_gid
+        && first.st_nlink == second.st_nlink
+        && first.st_size == second.st_size
+        && first.st_mtime == second.st_mtime
+        && first.st_mtime_nsec == second.st_mtime_nsec
+        && first.st_ctime == second.st_ctime
+        && first.st_ctime_nsec == second.st_ctime_nsec
+}
+
+fn valid_single_component(name: &str) -> bool {
+    let mut components = Path::new(name).components();
+    matches!(components.next(), Some(Component::Normal(_)))
+        && components.next().is_none()
+        && !name.is_empty()
+        && name.len() <= 255
+        && !name.as_bytes().contains(&0)
+}
+
 fn validate_private_directory_path(
     path: &Path,
     invalid: ProcessSpoolError,
@@ -827,6 +1069,27 @@ fn validate_directory_stat(stat: &rfs::Stat) -> Result<(), ProcessSpoolError> {
         return Err(ProcessSpoolError::Integrity);
     }
     Ok(())
+}
+
+fn open_provider_directory_at(
+    parent: &OwnedFd,
+    name: &std::ffi::OsStr,
+) -> Result<OwnedFd, ProcessSpoolError> {
+    let fd = rfs::openat(
+        parent,
+        name,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|_| ProcessSpoolError::Integrity)?;
+    let stat = rfs::fstat(&fd).map_err(|_| ProcessSpoolError::Unavailable)?;
+    if FileType::from_raw_mode(stat.st_mode) != FileType::Directory
+        || stat.st_uid != unsafe { libc::geteuid() }
+        || Mode::from_raw_mode(stat.st_mode).bits() & 0o022 != 0
+    {
+        return Err(ProcessSpoolError::Integrity);
+    }
+    Ok(fd)
 }
 
 fn validate_bound_path(path: &Path, fd: &OwnedFd) -> Result<(), ProcessSpoolError> {
@@ -971,6 +1234,7 @@ fn is_sha256(value: &str) -> bool {
 mod tests {
     use std::sync::Arc;
 
+    use image_provider_contracts::{ProviderCostEvidenceScope, ProviderReportedCostEvidenceV1};
     use tempfile::TempDir;
 
     use super::*;
@@ -1005,17 +1269,114 @@ mod tests {
         spool.publish_process(&lock, &identity).unwrap();
         let bytes = b"bounded-output";
         spool.publish_output(bytes).unwrap();
+        let provider_reported_cost = ProviderReportedCostEvidenceV1::usd_ticks(
+            ProviderCostEvidenceScope::CliInvocation,
+            "provider-test",
+            "provider_cli",
+            "provider-operation-1",
+            200_000_000,
+            br#"{"total_cost_usd_ticks":200000000}"#,
+            "end.total_cost_usd_ticks",
+        )
+        .unwrap();
         let terminal = ProcessTerminal::Succeeded {
             helper_nonce: identity.nonce.clone(),
             sha256_hex: sha256(bytes),
             byte_size: bytes.len() as u64,
+            provider_reported_cost: Some(provider_reported_cost.clone()),
         };
+        let terminal_json = serde_json::to_vec(&terminal).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<ProcessTerminal>(&terminal_json).unwrap(),
+            terminal
+        );
         spool.publish_terminal(&lock, &terminal).unwrap();
         spool.publish_terminal(&lock, &terminal).unwrap();
 
         assert_eq!(
             spool.observe().unwrap(),
-            ProcessObservation::Succeeded(bytes.to_vec())
+            ProcessObservation::Succeeded(
+                SupervisedOutput::from_parts(bytes.to_vec(), Some(provider_reported_cost)).unwrap()
+            )
+        );
+    }
+
+    #[test]
+    fn workspace_output_reader_accepts_owned_read_only_regular_files() {
+        let (_temp, journal, lease) = fixture();
+        let spool = ExecutionSpool::for_lease(&journal, &lease).unwrap();
+        let output = spool.workspace_path().unwrap().join("provider-output.png");
+
+        assert_eq!(
+            spool
+                .read_workspace_output("provider-output.png", 1024)
+                .unwrap(),
+            WorkspaceOutputSnapshot::Missing
+        );
+        fs::write(&output, []).unwrap();
+        assert_eq!(
+            spool
+                .read_workspace_output("provider-output.png", 1024)
+                .unwrap(),
+            WorkspaceOutputSnapshot::Incomplete
+        );
+        fs::write(&output, b"complete-image").unwrap();
+        assert_eq!(
+            spool
+                .read_workspace_output("provider-output.png", 1024)
+                .unwrap(),
+            WorkspaceOutputSnapshot::Bytes(b"complete-image".to_vec())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_output_reader_rejects_file_aliases() {
+        use std::os::unix::fs::symlink;
+
+        let (temp, journal, lease) = fixture();
+        let spool = ExecutionSpool::for_lease(&journal, &lease).unwrap();
+        let outside = temp.path().join("outside.png");
+        fs::write(&outside, b"outside").unwrap();
+        let output = spool.workspace_path().unwrap().join("provider-output.png");
+        symlink(&outside, &output).unwrap();
+        assert_eq!(
+            spool.read_workspace_output("provider-output.png", 1024),
+            Err(ProcessSpoolError::Integrity)
+        );
+
+        fs::remove_file(&output).unwrap();
+        fs::hard_link(&outside, &output).unwrap();
+        assert_eq!(
+            spool.read_workspace_output("provider-output.png", 1024),
+            Err(ProcessSpoolError::Integrity)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_output_reader_rejects_unsafe_modes_and_oversized_files() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_temp, journal, lease) = fixture();
+        let spool = ExecutionSpool::for_lease(&journal, &lease).unwrap();
+        let output = spool.workspace_path().unwrap().join("provider-output.png");
+        fs::write(&output, b"image").unwrap();
+
+        fs::set_permissions(&output, fs::Permissions::from_mode(0o666)).unwrap();
+        assert_eq!(
+            spool.read_workspace_output("provider-output.png", 1024),
+            Err(ProcessSpoolError::Integrity)
+        );
+        fs::set_permissions(&output, fs::Permissions::from_mode(0o4644)).unwrap();
+        assert_eq!(
+            spool.read_workspace_output("provider-output.png", 1024),
+            Err(ProcessSpoolError::Integrity)
+        );
+        fs::set_permissions(&output, fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            spool.read_workspace_output("provider-output.png", 4),
+            Err(ProcessSpoolError::Integrity)
         );
     }
 

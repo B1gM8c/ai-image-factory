@@ -144,14 +144,17 @@ impl ProviderRuntimeReadinessStore for PostgresProviderTaskStore {
              AND policy.credential_pool_id = profile.credential_pool_id
              AND policy.provider_account_id = profile.provider_account_id
              AND policy.provider_id = profile.provider_id
+            JOIN provider_account_execution_controls control
+              ON control.provider_account_id = profile.provider_account_id
             WHERE profile.execution_profile_id = $1
               AND profile.state = 'enabled'
               AND pool.state = 'enabled'
               AND account.state = 'enabled'
               AND policy.state = 'enabled'
+              AND control.lifecycle_state IN ('active', 'draining')
               AND profile.completion_mode = 'remote_task'
-              AND policy.max_concurrency BETWEEN 1 AND $2
-            FOR SHARE OF profile, pool, account, policy
+              AND control.desired_max_concurrency BETWEEN 1 AND $2
+            FOR SHARE OF profile, pool, account, policy, control
             "#,
         )
         .bind(registration.execution_profile_id)

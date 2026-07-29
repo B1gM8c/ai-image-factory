@@ -123,20 +123,16 @@ pub struct ReadinessResponse {
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ModelsResponse {
-    #[schema(value_type = String)]
-    pub object: &'static str,
+    pub object: String,
     pub data: Vec<ModelData>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ModelData {
-    #[schema(value_type = String)]
-    pub id: &'static str,
-    #[schema(value_type = String)]
-    pub object: &'static str,
+    pub id: String,
+    pub object: String,
     pub created: i64,
-    #[schema(value_type = String)]
-    pub owned_by: &'static str,
+    pub owned_by: String,
 }
 
 pub fn parse_generation(
@@ -563,15 +559,15 @@ pub fn image_stream_events(
 
 pub fn models_response() -> ModelsResponse {
     ModelsResponse {
-        object: "list",
+        object: "list".to_owned(),
         data: active_providers()
             .iter()
             .flat_map(|provider| {
                 provider.models.iter().map(|model| ModelData {
-                    id: model,
-                    object: "model",
+                    id: (*model).to_owned(),
+                    object: "model".to_owned(),
                     created: 0,
-                    owned_by: provider.owner,
+                    owned_by: provider.owner.to_owned(),
                 })
             })
             .collect(),

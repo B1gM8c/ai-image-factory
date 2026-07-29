@@ -8,10 +8,11 @@ mod request;
 
 pub use capabilities::{
     DREAMINA_CLI_REMOTE_TASK_CONTROLS_V1, DREAMINA_IMAGE_GENERATION_OPERATION_V1,
+    DREAMINA_VIDEO_GENERATION_OPERATION_V1,
 };
 pub use command::{
     DREAMINA_SUBMIT_COMMAND_SCHEMA, DreaminaSubmitCommandError, DreaminaSubmitPayloadV1,
-    MAX_SUBMIT_COMMAND_BYTES, parse_submit_command,
+    MAX_SUBMIT_COMMAND_BYTES, encode_submit_command, parse_submit_command,
 };
 pub use policy::{DreaminaCliPolicyError, DreaminaCliPolicyV1, DreaminaSubmitRequestV1};
 pub use policy::{DreaminaCliQueryPolicyError, DreaminaCliQueryPolicyV1};

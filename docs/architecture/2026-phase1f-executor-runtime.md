@@ -245,6 +245,20 @@ a dedicated service identity plus an external container/cgroup/sandbox policy
 that restricts executable mounts, process creation, network egress, credentials,
 and access to gateway/database secrets.
 
+Codex image sessions may delete their generated image before the outer CLI
+process exits. The runner therefore keeps the normal `CliRuntime` output
+contract as the primary path and concurrently observes one adapter-derived
+`provider-output.*` filename through the already bound workspace directory FD.
+The target must be absent before provider spawn. Every read uses `openat` with
+`O_NOFOLLOW`, requires a current-user, single-link, non-special, non-writable
+regular file, bounds bytes and decoded pixels, and rechecks file identity after
+the read. Two identical snapshots establish a candidate, but observation
+continues until process exit so a later stable version supersedes it. Blocking
+file reads and decoding run outside Tokio workers. The candidate is accepted
+only when the provider exits successfully and the primary contract reports
+`Missing` or `NotFound`; failure, timeout, observer, wait, integrity, or process
+group errors never publish captured bytes.
+
 ## 8. Activation Gates
 
 Production V2 traffic remains disabled according to this gate matrix:
@@ -264,12 +278,11 @@ Production V2 traffic remains disabled according to this gate matrix:
 | standalone terminal reducer lifecycle | passed | `reducerd` claim/heartbeat/publication/completion, transient retry, and bounded drain tests |
 | hostile multi-tenant CLI isolation | open | dedicated UID plus externally enforced sandbox/cgroup/mount/network policy |
 | public Images API traverses the complete V2 path | passed | default-off generation-only route gate; `n=2`, non-zero pricing, real gateway/workerd/executord/codex-runner/reducerd process smoke; restart replay keeps one job and two provider invocations |
-| credentialed real Codex CLI image generation | passed | 2026-07-15 official-shape `size=auto` request returned a verified PNG through the full V2 topology; replay was byte-identical with one durable job, one charge graph, and no second runner directory |
+| credentialed real Codex CLI image generation | passed | 2026-07-19 official-shape `1024x1024` request returned a verified native 1:1 PNG through the full V2 topology after runtime-safe capture; replay was byte-identical with one durable job, one provider submission, and one charge |
 
 The credentialed smoke used the self-contained native binary shipped in the
 official Codex package. The npm launcher is a Node script and is intentionally
 incompatible with the executor's restricted path unless its interpreter is
-explicitly present there. The successful `size=auto` response was `1254x1254`.
-An exact `1024x1024` request correctly failed when Codex produced a different
-native size: the gateway verifies exact dimensions and never crops, stretches,
-or resamples provider output to manufacture compliance.
+explicitly present there. The verified `1024x1024` request produced Codex-native
+`1254x1254` output. The gateway accepts it as the same 1:1 aspect ratio without
+cropping, stretching, or resampling provider output.

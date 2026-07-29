@@ -11,16 +11,21 @@ use uuid::Uuid;
 
 const DEFAULT_READINESS_TIMEOUT_MS: u64 = 500;
 const MAX_READINESS_TIMEOUT_MS: u64 = 60_000;
+const DEFAULT_UNBOUNDED_DATABASE_QUOTA: u32 = i32::MAX as u32;
 
 #[derive(Clone, Debug)]
 pub struct AppConfig {
     pub bind: SocketAddr,
     pub auth_token: Option<String>,
     pub admin_token: Option<String>,
+    pub legacy_admin_auth_enabled: bool,
     pub database_url: Option<String>,
     pub generation_admission_contract: GenerationAdmissionContract,
+    pub enable_xai_video_api: bool,
     pub five_hour_image_limit: u32,
     pub seven_day_image_limit: u32,
+    pub five_hour_video_second_limit: u32,
+    pub seven_day_video_second_limit: u32,
     pub max_concurrent_jobs: usize,
     pub max_queue_size: usize,
     pub max_concurrent_jobs_per_tenant: usize,
@@ -39,6 +44,7 @@ pub enum GenerationAdmissionContract {
     #[default]
     LegacyV1,
     OutputEconomicsV2,
+    CustomerPricingV4,
 }
 
 impl GenerationAdmissionContract {
@@ -46,6 +52,7 @@ impl GenerationAdmissionContract {
         match self {
             Self::LegacyV1 => "legacy-v1",
             Self::OutputEconomicsV2 => "output-economics-v2",
+            Self::CustomerPricingV4 => "customer-pricing-v4",
         }
     }
 
@@ -61,10 +68,14 @@ impl GenerationAdmissionContract {
 
     fn parse(value: Option<&str>) -> Result<Self, ImageGatewayError> {
         match value {
-            None | Some("legacy-v1") => Ok(Self::LegacyV1),
+            None => Err(ImageGatewayError::config(
+                "GATEWAY_IMAGES_GENERATION_CONTRACT must be explicitly configured",
+            )),
+            Some("legacy-v1") => Ok(Self::LegacyV1),
             Some("output-economics-v2") => Ok(Self::OutputEconomicsV2),
+            Some("customer-pricing-v4") => Ok(Self::CustomerPricingV4),
             Some(_) => Err(ImageGatewayError::config(
-                "GATEWAY_IMAGES_GENERATION_CONTRACT must be legacy-v1 or output-economics-v2",
+                "GATEWAY_IMAGES_GENERATION_CONTRACT must be legacy-v1, output-economics-v2, or customer-pricing-v4",
             )),
         }
     }
@@ -93,10 +104,20 @@ impl AppConfig {
             bind,
             auth_token: non_empty_env("GATEWAY_API_TOKEN"),
             admin_token: non_empty_env("GATEWAY_ADMIN_TOKEN"),
+            legacy_admin_auth_enabled: env_bool_strict("GATEWAY_LEGACY_ADMIN_AUTH_ENABLED", false)?,
             database_url,
             generation_admission_contract: GenerationAdmissionContract::from_env()?,
+            enable_xai_video_api: env_bool_strict("GATEWAY_ENABLE_XAI_VIDEO_API", false)?,
             five_hour_image_limit: env_u32("GATEWAY_IMAGE_LIMIT_5H", 40)?,
             seven_day_image_limit: env_u32("GATEWAY_IMAGE_LIMIT_7D", 200)?,
+            five_hour_video_second_limit: env_u32(
+                "GATEWAY_VIDEO_SECOND_LIMIT_5H",
+                DEFAULT_UNBOUNDED_DATABASE_QUOTA,
+            )?,
+            seven_day_video_second_limit: env_u32(
+                "GATEWAY_VIDEO_SECOND_LIMIT_7D",
+                DEFAULT_UNBOUNDED_DATABASE_QUOTA,
+            )?,
             max_concurrent_jobs: env_usize("GATEWAY_MAX_CONCURRENT_JOBS", 1)?,
             max_queue_size: env_usize("GATEWAY_MAX_QUEUE_SIZE", 8)?,
             max_concurrent_jobs_per_tenant: env_usize(
@@ -130,7 +151,7 @@ impl AppConfig {
                     .or_else(|| env::var("NO_PROXY").ok()),
             },
             codex_home: non_empty_env("GATEWAY_CODEX_HOME"),
-            cleanup_codex_outputs: env_bool("GATEWAY_CLEANUP_CODEX_OUTPUTS", false),
+            cleanup_codex_outputs: env_bool("GATEWAY_CLEANUP_CODEX_OUTPUTS", true),
         })
     }
 
@@ -148,9 +169,14 @@ impl AppConfig {
                 "GATEWAY_ADMIN_TOKEN must not be empty",
             ));
         }
-        if auth_token.is_none() && admin_token.is_none() {
+        if self.legacy_admin_auth_enabled && admin_token.is_none() {
             return Err(ImageGatewayError::config(
-                "GATEWAY_API_TOKEN or GATEWAY_ADMIN_TOKEN is required",
+                "GATEWAY_ADMIN_TOKEN is required when legacy admin authentication is enabled",
+            ));
+        }
+        if auth_token.is_none() && !(self.legacy_admin_auth_enabled && admin_token.is_some()) {
+            return Err(ImageGatewayError::config(
+                "GATEWAY_API_TOKEN or GATEWAY_ADMIN_TOKEN with GATEWAY_LEGACY_ADMIN_AUTH_ENABLED=true is required",
             ));
         }
         if auth_token
@@ -295,6 +321,26 @@ fn env_bool(name: &str, default: bool) -> bool {
         .unwrap_or(default)
 }
 
+fn env_bool_strict(name: &str, default: bool) -> Result<bool, ImageGatewayError> {
+    match env::var(name) {
+        Ok(value) => parse_bool(name, &value),
+        Err(env::VarError::NotPresent) => Ok(default),
+        Err(env::VarError::NotUnicode(_)) => Err(ImageGatewayError::config(format!(
+            "{name} must be valid UTF-8"
+        ))),
+    }
+}
+
+fn parse_bool(name: &str, value: &str) -> Result<bool, ImageGatewayError> {
+    match value {
+        "1" | "true" | "TRUE" | "yes" | "YES" => Ok(true),
+        "0" | "false" | "FALSE" | "no" | "NO" => Ok(false),
+        _ => Err(ImageGatewayError::config(format!(
+            "{name} must be one of 1, 0, true, false, yes, or no"
+        ))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -304,10 +350,14 @@ mod tests {
             bind: bind.parse().unwrap(),
             auth_token: token.map(str::to_string),
             admin_token: None,
+            legacy_admin_auth_enabled: false,
             database_url: Some("postgres://localhost/test".to_string()),
             generation_admission_contract: GenerationAdmissionContract::LegacyV1,
+            enable_xai_video_api: false,
             five_hour_image_limit: 1,
             seven_day_image_limit: 1,
+            five_hour_video_second_limit: DEFAULT_UNBOUNDED_DATABASE_QUOTA,
+            seven_day_video_second_limit: DEFAULT_UNBOUNDED_DATABASE_QUOTA,
             max_concurrent_jobs: 1,
             max_queue_size: 0,
             max_concurrent_jobs_per_tenant: 1,
@@ -323,11 +373,8 @@ mod tests {
     }
 
     #[test]
-    fn generation_contract_is_default_off_and_strict() {
-        assert_eq!(
-            GenerationAdmissionContract::parse(None).unwrap(),
-            GenerationAdmissionContract::LegacyV1
-        );
+    fn generation_contract_is_explicit_and_strict() {
+        assert!(GenerationAdmissionContract::parse(None).is_err());
         assert_eq!(
             GenerationAdmissionContract::parse(Some("legacy-v1")).unwrap(),
             GenerationAdmissionContract::LegacyV1
@@ -336,14 +383,33 @@ mod tests {
             GenerationAdmissionContract::parse(Some("output-economics-v2")).unwrap(),
             GenerationAdmissionContract::OutputEconomicsV2
         );
+        assert_eq!(
+            GenerationAdmissionContract::parse(Some("customer-pricing-v4")).unwrap(),
+            GenerationAdmissionContract::CustomerPricingV4
+        );
         for invalid in ["", "true", "v2", " output-economics-v2"] {
             assert!(GenerationAdmissionContract::parse(Some(invalid)).is_err());
+        }
+    }
+
+    #[test]
+    fn xai_video_api_gate_is_default_off_and_strict() {
+        assert!(!config_for_bind("127.0.0.1:8787", Some("token")).enable_xai_video_api);
+        for value in ["1", "true", "TRUE", "yes", "YES"] {
+            assert!(parse_bool("GATEWAY_ENABLE_XAI_VIDEO_API", value).unwrap());
+        }
+        for value in ["0", "false", "FALSE", "no", "NO"] {
+            assert!(!parse_bool("GATEWAY_ENABLE_XAI_VIDEO_API", value).unwrap());
+        }
+        for value in ["", "True", "on", " true"] {
+            assert!(parse_bool("GATEWAY_ENABLE_XAI_VIDEO_API", value).is_err());
         }
     }
 
     fn config_for_bind_with_admin(bind: &str, admin_token: Option<&str>) -> AppConfig {
         let mut config = config_for_bind(bind, None);
         config.admin_token = admin_token.map(str::to_string);
+        config.legacy_admin_auth_enabled = admin_token.is_some();
         config
     }
 
@@ -356,8 +422,16 @@ mod tests {
 
             let error = format!("{:?}", config.validate_startup().unwrap_err());
 
-            assert!(error.contains("GATEWAY_API_TOKEN or GATEWAY_ADMIN_TOKEN is required"));
+            assert!(error.contains("GATEWAY_API_TOKEN or GATEWAY_ADMIN_TOKEN"));
         }
+    }
+
+    #[test]
+    fn static_admin_token_requires_explicit_legacy_enablement() {
+        let mut config = config_for_bind_with_admin("127.0.0.1:8787", Some("admin-token"));
+        config.legacy_admin_auth_enabled = false;
+        let error = format!("{:?}", config.validate_startup().unwrap_err());
+        assert!(error.contains("GATEWAY_LEGACY_ADMIN_AUTH_ENABLED=true"));
     }
 
     #[test]

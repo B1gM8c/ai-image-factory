@@ -63,6 +63,23 @@ pub struct ExecutorTerminalCompletion {
     pub parent_state: ExecutorParentTerminalState,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExecutorTerminalBlockReason {
+    CanonicalConflict,
+    InvalidInput,
+    ArtifactIntegrity,
+}
+
+impl ExecutorTerminalBlockReason {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::CanonicalConflict => "canonical_conflict",
+            Self::InvalidInput => "invalid_input",
+            Self::ArtifactIntegrity => "artifact_integrity",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum ExecutorTerminalError {
     #[error("executor terminal reduction storage is unavailable")]
@@ -94,4 +111,10 @@ pub trait ExecutorTerminalStore: Send + Sync + 'static {
         lease: &ExecutorTerminalLease,
         customer_artifact: Option<&ArtifactMetadata>,
     ) -> Result<ExecutorTerminalCompletion, ExecutorTerminalError>;
+
+    async fn block_terminal(
+        &self,
+        lease: &ExecutorTerminalLease,
+        reason: ExecutorTerminalBlockReason,
+    ) -> Result<(), ExecutorTerminalError>;
 }

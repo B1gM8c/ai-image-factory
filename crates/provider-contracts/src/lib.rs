@@ -1,4 +1,5 @@
 pub mod capability;
+pub mod cost;
 pub mod jobs;
 pub mod media;
 pub mod official_params;
@@ -8,6 +9,11 @@ pub use capability::{
     ArtifactDelivery, BillingMetric, CallbackMode, CancellationMode, CompletionMode,
     IdempotencyMode, OperationDescriptor, OutputCardinality, ProviderCapabilities,
     RemoteTaskControls,
+};
+pub use cost::{
+    ProviderCostAuthority, ProviderCostConfidence, ProviderCostEvidenceScope,
+    ProviderCostNativeUnit, ProviderCostObservationError, ProviderCostObservationV1,
+    ProviderReportedCostEvidenceV1,
 };
 pub use jobs::{JobKind, JobLifecycleState};
 pub use media::{JobMode, MediaKind, MediaOperation, StreamingMode};

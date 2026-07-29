@@ -1,5 +1,5 @@
-import { PlatformShell } from "@/components/platform-shell";
+import { redirect } from "next/navigation";
 
 export default function Page() {
-  return <PlatformShell />;
+  redirect("/overview");
 }

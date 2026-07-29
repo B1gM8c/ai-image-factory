@@ -11,9 +11,9 @@ use gpt_image_2_gateway::{
     artifacts::{ArtifactIdentity, ArtifactMetadata, FILESYSTEM_BACKEND},
     reduction::{
         CanonicalExecutorOutcome, CustomerArtifactPublishError, ExecutorParentTerminalState,
-        ExecutorTerminalArtifact, ExecutorTerminalCompletion, ExecutorTerminalError,
-        ExecutorTerminalLease, ExecutorTerminalStore, ReducerDaemon, ReducerDaemonError,
-        ReducerDaemonRun, TerminalArtifactPublisher,
+        ExecutorTerminalArtifact, ExecutorTerminalBlockReason, ExecutorTerminalCompletion,
+        ExecutorTerminalError, ExecutorTerminalLease, ExecutorTerminalStore, ReducerDaemon,
+        ReducerDaemonError, ReducerDaemonRun, TerminalArtifactPublisher,
     },
 };
 use tokio::sync::{Semaphore, oneshot};
@@ -32,7 +32,9 @@ struct FakeStoreState {
     claim_error_once: Option<ExecutorTerminalError>,
     heartbeat_error: Option<ExecutorTerminalError>,
     heartbeat_calls: usize,
+    completion_error: Option<ExecutorTerminalError>,
     completions: Vec<Option<ArtifactMetadata>>,
+    blocks: Vec<ExecutorTerminalBlockReason>,
 }
 
 impl FakeStore {
@@ -43,7 +45,9 @@ impl FakeStore {
                 claim_error_once: None,
                 heartbeat_error: None,
                 heartbeat_calls: 0,
+                completion_error: None,
                 completions: Vec::new(),
+                blocks: Vec::new(),
             })),
             events: Arc::new(Mutex::new(Vec::new())),
             completed: Arc::new(Semaphore::new(0)),
@@ -63,6 +67,16 @@ impl FakeStore {
     fn with_heartbeat_error(lease: ExecutorTerminalLease, error: ExecutorTerminalError) -> Self {
         let store = Self::new(lease);
         store.state.lock().expect("fake store lock").heartbeat_error = Some(error);
+        store
+    }
+
+    fn with_completion_error(lease: ExecutorTerminalLease, error: ExecutorTerminalError) -> Self {
+        let store = Self::new(lease);
+        store
+            .state
+            .lock()
+            .expect("fake store lock")
+            .completion_error = Some(error);
         store
     }
 
@@ -122,12 +136,29 @@ impl ExecutorTerminalStore for FakeStore {
             .expect("fake store lock")
             .completions
             .push(customer_artifact.cloned());
+        if let Some(error) = self.state.lock().expect("fake store lock").completion_error {
+            return Err(error);
+        }
         self.completed.add_permits(1);
         Ok(ExecutorTerminalCompletion {
             receipt_id: Uuid::from_u128(90),
             customer_artifact_id: customer_artifact.map(|artifact| artifact.identity.artifact_id),
             parent_state: ExecutorParentTerminalState::Succeeded,
         })
+    }
+
+    async fn block_terminal(
+        &self,
+        _lease: &ExecutorTerminalLease,
+        reason: ExecutorTerminalBlockReason,
+    ) -> Result<(), ExecutorTerminalError> {
+        self.push_event("block");
+        self.state
+            .lock()
+            .expect("fake store lock")
+            .blocks
+            .push(reason);
+        Ok(())
     }
 }
 
@@ -315,6 +346,28 @@ async fn transient_iteration_error_does_not_stop_polling() {
     );
     assert_eq!(publisher.call_count(), 1);
     assert_eq!(store.snapshot().completions, vec![Some(artifact)]);
+}
+
+#[tokio::test]
+async fn permanent_completion_conflict_is_blocked_once() {
+    let lease = terminal_lease(CanonicalExecutorOutcome::Failed {
+        error_code: "provider_rejected".to_string(),
+    });
+    let store = FakeStore::with_completion_error(lease.clone(), ExecutorTerminalError::Conflict);
+    let publisher = FakePublisher::immediate(&store, customer_artifact(&lease));
+    let daemon = daemon(store.clone(), publisher.clone());
+
+    assert_eq!(
+        daemon.run_once().await,
+        Err(ReducerDaemonError::Store(ExecutorTerminalError::Conflict))
+    );
+    assert_eq!(store.events(), vec!["claim", "complete", "block"]);
+    assert_eq!(
+        store.snapshot().blocks,
+        vec![ExecutorTerminalBlockReason::CanonicalConflict]
+    );
+    assert_eq!(publisher.call_count(), 0);
+    assert_eq!(daemon.run_once().await, Ok(ReducerDaemonRun::Idle));
 }
 
 #[tokio::test]

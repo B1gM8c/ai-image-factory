@@ -113,7 +113,7 @@ impl GenerationWorker {
     ) -> Result<GenerationExecution, ImageGatewayError> {
         let provider = self.generator.generate(job.clone()).instrument(info_span!(
             "worker.generate",
-            image.units = reservation.charge.units
+            image.units = reservation.charge.output_count
         ));
         self.execute_provider(
             lease,
@@ -145,7 +145,7 @@ impl GenerationWorker {
     ) -> Result<GenerationExecution, ImageGatewayError> {
         let provider = self.generator.edit(job.clone()).instrument(info_span!(
             "worker.edit",
-            image.units = reservation.charge.units
+            image.units = reservation.charge.output_count
         ));
         self.execute_provider(
             lease,
@@ -475,7 +475,8 @@ fn duration_ms(duration: Duration) -> i64 {
 fn map_admission_error(error: AdmissionError) -> ImageGatewayError {
     match error {
         AdmissionError::Expired => ImageGatewayError::timeout(),
-        AdmissionError::BillingLimitExceeded => ImageGatewayError::queue_overloaded(),
+        AdmissionError::BillingLimitExceeded => ImageGatewayError::billing_limit_exceeded(),
+        AdmissionError::ProjectBudgetExceeded => ImageGatewayError::project_budget_exceeded(),
         AdmissionError::Unavailable
         | AdmissionError::PricingUnavailable
         | AdmissionError::InvalidOwner

@@ -1,9 +1,12 @@
 [workspace]
 members = [
+    "crates/api-contracts",
     "crates/cli-runtime",
+    "crates/factory-identity",
     "crates/image-gateway",
     "crates/provider-contracts",
     "crates/provider-dreamina-cli",
+    "crates/provider-grok-cli",
     "crates/provider-sdk",
     "crates/provider-test-support",
     "crates/scheduler-policy",

@@ -6,13 +6,16 @@ use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
-use super::{ExecutionSettlementStore, GenerationResultStatus, validate_generation_result};
+use super::{
+    ExecutionSettlementStore, GenerationResultLookup, GenerationResultStatus, StoredVideoArtifact,
+    VideoPendingStage, VideoResultStatus, validate_generation_result,
+};
 use crate::{
     ImageGatewayError,
     admission::WorkLease,
     artifacts::{
-        ArtifactBlobStore, GenerationResultManifest, StoredGenerationResult,
-        hydrate_generation_result,
+        ArtifactBlobStore, ArtifactIdentity, ArtifactMetadata, ArtifactReadError,
+        GenerationResultManifest, hydrate_generation_result,
     },
     usage::{UsageReservation, UsageSnapshot},
 };
@@ -20,7 +23,10 @@ use crate::{
 mod failure;
 mod results;
 
-use results::{load_generation_manifest, persist_generation_result, validate_completed_result};
+use results::{
+    GenerationManifestLookup, generation_result_is_expired, load_generation_manifest,
+    persist_generation_result, validate_completed_result,
+};
 
 #[derive(Clone)]
 pub struct PostgresExecutionSettlementStore {
@@ -93,13 +99,22 @@ impl ExecutionSettlementStore for PostgresExecutionSettlementStore {
     async fn load_generation_result(
         &self,
         job_id: Uuid,
-    ) -> Result<Option<StoredGenerationResult>, ImageGatewayError> {
-        let Some(manifest) = load_generation_manifest(&self.pool, job_id).await? else {
-            return Ok(None);
+    ) -> Result<GenerationResultLookup, ImageGatewayError> {
+        let manifest = match load_generation_manifest(&self.pool, job_id).await? {
+            GenerationManifestLookup::Available(manifest) => manifest,
+            GenerationManifestLookup::Expired => return Ok(GenerationResultLookup::Expired),
+            GenerationManifestLookup::Missing => return Ok(GenerationResultLookup::Missing),
         };
-        hydrate_generation_result(self.artifact_store.as_ref(), manifest)
-            .await
-            .map(Some)
+        match hydrate_generation_result(self.artifact_store.as_ref(), manifest).await {
+            Ok(result) => Ok(GenerationResultLookup::Available(result)),
+            Err(error) => {
+                if generation_result_is_expired(&self.pool, job_id).await? {
+                    Ok(GenerationResultLookup::Expired)
+                } else {
+                    Err(error)
+                }
+            }
+        }
     }
 
     async fn generation_status(
@@ -119,11 +134,15 @@ impl ExecutionSettlementStore for PostgresExecutionSettlementStore {
         .await
         .map_err(settlement_unavailable)?;
         match state {
-            Some((job_state, _, _)) if job_state == "succeeded" => self
-                .load_generation_result(job_id)
-                .await?
-                .map(GenerationResultStatus::Succeeded)
-                .ok_or_else(ImageGatewayError::artifact_integrity),
+            Some((job_state, _, _)) if job_state == "succeeded" => {
+                match self.load_generation_result(job_id).await? {
+                    GenerationResultLookup::Available(result) => {
+                        Ok(GenerationResultStatus::Succeeded(result))
+                    }
+                    GenerationResultLookup::Expired => Ok(GenerationResultStatus::Expired),
+                    GenerationResultLookup::Missing => Err(ImageGatewayError::artifact_integrity()),
+                }
+            }
             Some((job_state, work_state, error_code))
                 if job_state == "failed" || work_state == "failed" =>
             {
@@ -135,6 +154,248 @@ impl ExecutionSettlementStore for PostgresExecutionSettlementStore {
             Some(_) => Ok(GenerationResultStatus::Pending),
             None => Err(ImageGatewayError::internal("generation job not found")),
         }
+    }
+
+    async fn video_status(
+        &self,
+        tenant_id: &str,
+        job_id: Uuid,
+    ) -> Result<Option<VideoResultStatus>, ImageGatewayError> {
+        let row: Option<VideoStatusRow> = sqlx::query_as(
+            r#"
+            SELECT j.state, w.state, j.last_error_code, j.model, j.billable_units,
+                   artifact.artifact_id
+            FROM jobs j
+            JOIN work_items w ON w.job_id = j.job_id
+            LEFT JOIN artifacts artifact
+              ON artifact.job_id = j.job_id
+             AND artifact.output_index = 0
+             AND artifact.state = 'ready'
+             AND artifact.media_type = 'video/mp4'
+            WHERE j.job_id = $1 AND j.tenant_id = $2
+              AND j.operation = 'video_generation'
+              AND j.economics_contract_version IN (3, 4)
+            "#,
+        )
+        .bind(job_id)
+        .bind(tenant_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(settlement_unavailable)?;
+        row.map(video_result_status).transpose()
+    }
+
+    async fn project_video_status(
+        &self,
+        tenant_id: &str,
+        project_id: &str,
+        actor_user_id: Option<Uuid>,
+        job_id: Uuid,
+    ) -> Result<Option<VideoResultStatus>, ImageGatewayError> {
+        let row: Option<VideoStatusRow> = sqlx::query_as(
+            r#"
+                SELECT j.state, w.state, j.last_error_code, j.model, j.billable_units,
+                       artifact.artifact_id
+                FROM jobs j
+                JOIN work_items w ON w.job_id = j.job_id
+                JOIN job_auth_attributions attribution
+                  ON attribution.job_id = j.job_id
+                LEFT JOIN artifacts artifact
+                  ON artifact.job_id = j.job_id
+                 AND artifact.output_index = 0
+                 AND artifact.state = 'ready'
+                 AND artifact.media_type = 'video/mp4'
+                WHERE j.job_id = $1 AND j.tenant_id = $2
+                  AND attribution.project_id = $3
+                  AND ($4::UUID IS NULL OR attribution.actor_user_id = $4)
+                  AND j.operation = 'video_generation'
+                  AND j.economics_contract_version IN (3, 4)
+                "#,
+        )
+        .bind(job_id)
+        .bind(tenant_id)
+        .bind(project_id)
+        .bind(actor_user_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(settlement_unavailable)?;
+        row.map(video_result_status).transpose()
+    }
+
+    async fn load_video_artifact(
+        &self,
+        tenant_id: &str,
+        artifact_id: Uuid,
+    ) -> Result<Option<StoredVideoArtifact>, ImageGatewayError> {
+        let row: Option<(
+            Uuid,
+            String,
+            Uuid,
+            Uuid,
+            Uuid,
+            i64,
+            i32,
+            String,
+            String,
+            String,
+            String,
+            i64,
+            bool,
+        )> = sqlx::query_as(
+            r#"
+                SELECT artifact.artifact_id, artifact.tenant_id, artifact.job_id,
+                       artifact.work_item_id, artifact.execution_id, artifact.lease_epoch,
+                       artifact.output_index, artifact.media_type, artifact.storage_backend,
+                       artifact.object_key, artifact.sha256_hex, artifact.byte_size,
+                       retention.state = 'available'
+                         AND retention.expires_at_ms >
+                           (EXTRACT(EPOCH FROM statement_timestamp()) * 1000)::BIGINT
+                         AS retention_available
+                FROM artifacts artifact
+                JOIN jobs job ON job.job_id = artifact.job_id
+                JOIN job_artifact_retention retention ON retention.job_id = artifact.job_id
+                WHERE artifact.artifact_id = $1 AND artifact.tenant_id = $2
+                  AND artifact.state = 'ready'
+                  AND job.operation = 'video_generation'
+                  AND job.economics_contract_version IN (3, 4)
+                "#,
+        )
+        .bind(artifact_id)
+        .bind(tenant_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(settlement_unavailable)?;
+        let Some((
+            artifact_id,
+            tenant_id,
+            job_id,
+            work_item_id,
+            execution_id,
+            lease_epoch,
+            output_index,
+            media_type,
+            storage_backend,
+            object_key,
+            sha256_hex,
+            byte_size,
+            retention_available,
+        )) = row
+        else {
+            return Ok(None);
+        };
+        if !retention_available {
+            return Err(ImageGatewayError::artifact_expired());
+        }
+        if media_type != "video/mp4" {
+            return Err(ImageGatewayError::artifact_integrity());
+        }
+        let metadata = ArtifactMetadata {
+            identity: ArtifactIdentity {
+                artifact_id,
+                tenant_id,
+                job_id,
+                work_item_id,
+                execution_id,
+                lease_epoch,
+                output_index: u32::try_from(output_index)
+                    .map_err(|_| ImageGatewayError::artifact_integrity())?,
+                media_type: media_type.clone(),
+            },
+            storage_backend,
+            object_key,
+            sha256_hex,
+            byte_size: u64::try_from(byte_size)
+                .map_err(|_| ImageGatewayError::artifact_integrity())?,
+        };
+        let bytes = match self.artifact_store.get(&metadata).await {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                if generation_result_is_expired(&self.pool, job_id).await? {
+                    return Err(ImageGatewayError::artifact_expired());
+                }
+                return Err(match error {
+                    ArtifactReadError::Integrity => ImageGatewayError::artifact_integrity(),
+                    ArtifactReadError::Unavailable => {
+                        ImageGatewayError::service_unavailable("artifact storage unavailable")
+                    }
+                });
+            }
+        };
+        Ok(Some(StoredVideoArtifact { media_type, bytes }))
+    }
+
+    async fn load_project_video_artifact(
+        &self,
+        tenant_id: &str,
+        project_id: &str,
+        actor_user_id: Option<Uuid>,
+        artifact_id: Uuid,
+    ) -> Result<Option<StoredVideoArtifact>, ImageGatewayError> {
+        let belongs_to_project: bool = sqlx::query_scalar(
+            r#"
+            SELECT EXISTS (
+                SELECT 1
+                FROM artifacts artifact
+                JOIN jobs job ON job.job_id = artifact.job_id
+                JOIN job_auth_attributions attribution
+                  ON attribution.job_id = job.job_id
+                WHERE artifact.artifact_id = $1
+                  AND artifact.tenant_id = $2
+                  AND attribution.project_id = $3
+                  AND ($4::UUID IS NULL OR attribution.actor_user_id = $4)
+                  AND artifact.state = 'ready'
+                  AND job.operation = 'video_generation'
+                  AND job.economics_contract_version IN (3, 4)
+            )
+            "#,
+        )
+        .bind(artifact_id)
+        .bind(tenant_id)
+        .bind(project_id)
+        .bind(actor_user_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(settlement_unavailable)?;
+        if !belongs_to_project {
+            return Ok(None);
+        }
+        self.load_video_artifact(tenant_id, artifact_id).await
+    }
+}
+
+type VideoStatusRow = (String, String, Option<String>, String, i32, Option<Uuid>);
+
+fn video_result_status(row: VideoStatusRow) -> Result<VideoResultStatus, ImageGatewayError> {
+    let (job_state, work_state, error_code, model, billable_units, artifact_id) = row;
+    let duration = u8::try_from(billable_units)
+        .ok()
+        .filter(|duration| *duration > 0)
+        .ok_or_else(ImageGatewayError::artifact_integrity)?;
+    if job_state == "succeeded" {
+        Ok(VideoResultStatus::Succeeded {
+            model,
+            duration,
+            artifact_id: artifact_id.ok_or_else(ImageGatewayError::artifact_integrity)?,
+        })
+    } else if job_state == "failed" || work_state == "failed" {
+        Ok(VideoResultStatus::Failed {
+            model,
+            duration,
+            error_code,
+        })
+    } else if work_state == "uncertain" {
+        Ok(VideoResultStatus::Uncertain { model, duration })
+    } else {
+        let stage = match work_state.as_str() {
+            "ready" => VideoPendingStage::Queued,
+            "leased" | "running" => VideoPendingStage::Dispatching,
+            _ => VideoPendingStage::Processing,
+        };
+        Ok(VideoResultStatus::Pending {
+            model,
+            duration,
+            stage,
+        })
     }
 }
 
@@ -251,8 +512,8 @@ fn validate_reservation_handle(
     locked: &LockedQuotaJob,
     reservation: &UsageReservation,
 ) -> Result<(), ImageGatewayError> {
-    let units_match =
-        u32::try_from(locked.requested_units).is_ok_and(|units| units == reservation.charge.units);
+    let units_match = u32::try_from(locked.requested_units)
+        .is_ok_and(|units| units == reservation.charge.billable_units);
     if locked.reservation_id != reservation.reservation_id
         || locked.quota_tenant_id != reservation.charge.tenant_id
         || locked.job_tenant_id != reservation.charge.tenant_id
@@ -492,12 +753,13 @@ async fn insert_usage_event(
     sqlx::query(
         r#"
         INSERT INTO usage_events
-          (event_id, tenant_id, request_id, operation, units, outcome, created_at_ms)
-        VALUES ($1, $2, $3, $4, $5, 'charged', $6)
+          (event_id, tenant_id, job_id, request_id, operation, units, outcome, created_at_ms)
+        VALUES ($1, $2, $3, $4, $5, $6, 'charged', $7)
         "#,
     )
     .bind(Uuid::new_v4())
     .bind(&locked.quota_tenant_id)
+    .bind(locked.quota_job_id)
     .bind(&locked.quota_request_id)
     .bind(&locked.operation)
     .bind(locked.requested_units)

@@ -8,26 +8,38 @@ default-run = "gpt-image-2-gateway"
 async-trait = "0.1.89"
 axum = { version = "0.8.9", features = ["multipart", "json"] }
 base64 = "0.22.1"
+factory-identity = { path = "../factory-identity" }
+futures-util = "0.3.31"
 hex = "0.4.3"
 hmac = "0.13.0"
+httpdate = "1.0.3"
+image-api-contracts = { path = "../api-contracts" }
 image-cli-runtime = { path = "../cli-runtime" }
 image-provider-contracts = { path = "../provider-contracts" }
 image-provider-dreamina-cli = { path = "../provider-dreamina-cli" }
+image-provider-grok-cli = { path = "../provider-grok-cli" }
 image-provider-sdk = { path = "../provider-sdk" }
 image-scheduler-policy = { path = "../scheduler-policy" }
 image = { version = "0.25.9", default-features = false, features = ["png", "jpeg", "webp"] }
 libc = "0.2.186"
+mp4 = "0.14.0"
 opentelemetry = "0.32.0"
 opentelemetry-otlp = "0.32.0"
 opentelemetry_sdk = "0.32.1"
 rustix = { version = "1.1.4", features = ["fs"] }
+rpassword = "7.4.0"
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls", "system-proxy"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 sha2 = "0.11.0"
 sqlx = { version = "0.9.0", default-features = false, features = ["postgres", "macros", "migrate", "runtime-tokio", "uuid", "json"] }
 tempfile = "3.27.0"
 thiserror = "2.0.18"
+time = { version = "0.3.53", features = ["parsing"] }
 tokio = { version = "1.52.3", features = ["macros", "rt-multi-thread", "process", "fs", "time", "sync", "signal", "net", "io-util"] }
+tokio-stream = { version = "0.1.18", features = ["sync"] }
+tokio-util = { version = "0.7.18", features = ["io"] }
+toml = "0.9.8"
 tower = { version = "0.5.3", features = ["util"] }
 tower-http = { version = "0.7.0", features = ["trace", "limit", "timeout", "cors"] }
 tracing = "0.1.44"
@@ -38,4 +50,3 @@ uuid = { version = "1.23.4", features = ["v4", "fast-rng", "serde"] }
 
 [dev-dependencies]
 image-provider-test-support = { path = "../provider-test-support" }
-reqwest = { version = "0.13.4", default-features = false, features = ["json"] }

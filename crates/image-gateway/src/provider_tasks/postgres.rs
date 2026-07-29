@@ -332,7 +332,7 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
         let binding: Option<SubmitBindingRow> = sqlx::query_as(
             r#"
                 SELECT submission.output_id, job_output.output_index,
-                       job.requested_units AS output_total, submission.provider_id,
+                       job.output_count AS output_total, submission.provider_id,
                        submission.provider_account_id,
                        submission.state AS submission_state, submission.model,
                        submission.command_schema, submission.command_hash,
@@ -517,7 +517,7 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
         let binding: Option<SubmitBindingRow> = sqlx::query_as(
             r#"
                 SELECT submission.output_id, job_output.output_index,
-                       job.requested_units AS output_total, submission.provider_id,
+                       job.output_count AS output_total, submission.provider_id,
                        submission.provider_account_id,
                        submission.state AS submission_state, submission.model,
                        submission.command_schema, submission.command_hash,

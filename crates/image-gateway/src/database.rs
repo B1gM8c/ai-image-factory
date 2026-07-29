@@ -1,4 +1,4 @@
-use std::{env, fmt::Display, str::FromStr};
+use std::{env, fmt::Display, str::FromStr, time::Duration};
 
 use sqlx::{
     PgPool,
@@ -8,6 +8,7 @@ use sqlx::{
 use crate::ImageGatewayError;
 
 pub const DEFAULT_MAX_CONNECTIONS: u32 = 10;
+pub const ADMIN_READ_MAX_CONNECTIONS: u32 = 3;
 pub const DEFAULT_DATABASE_SCHEMA: &str = "public";
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
@@ -25,6 +26,33 @@ pub async fn connect_pool_with_schema(
     schema: &str,
 ) -> Result<PgPool, ImageGatewayError> {
     connect_pool_in_schema(database_url, max_connections, schema).await
+}
+
+pub async fn connect_admin_read_pool_with_schema(
+    database_url: &str,
+    schema: &str,
+) -> Result<PgPool, ImageGatewayError> {
+    if !is_simple_identifier(schema) {
+        return Err(ImageGatewayError::config(
+            "database search_path must be a simple identifier",
+        ));
+    }
+    let connect_options = PgConnectOptions::from_str(database_url)
+        .map_err(connection_error)?
+        .application_name("ai-image-factory-admin-read")
+        .options([
+            ("search_path", schema),
+            ("default_transaction_read_only", "on"),
+            ("statement_timeout", "500ms"),
+            ("lock_timeout", "100ms"),
+            ("idle_in_transaction_session_timeout", "2s"),
+        ]);
+    PgPoolOptions::new()
+        .max_connections(ADMIN_READ_MAX_CONNECTIONS)
+        .acquire_timeout(Duration::from_secs(1))
+        .connect_with(connect_options)
+        .await
+        .map_err(connection_error)
 }
 
 #[doc(hidden)]
@@ -71,6 +99,14 @@ pub fn database_url_from_env() -> Result<String, ImageGatewayError> {
         .ok_or_else(|| {
             ImageGatewayError::config("DATABASE_URL or GATEWAY_DATABASE_URL is required")
         })
+}
+
+pub fn admin_read_database_url_from_env(primary_url: &str) -> String {
+    resolve_admin_read_database_url(
+        env::var("GATEWAY_ADMIN_READ_DATABASE_URL").ok().as_deref(),
+        primary_url,
+    )
+    .to_owned()
 }
 
 pub fn database_schema_from_env() -> Result<String, ImageGatewayError> {
@@ -158,6 +194,12 @@ fn resolve_database_url<'a>(
         .or_else(|| fallback.filter(|url| !url.trim().is_empty()))
 }
 
+fn resolve_admin_read_database_url<'a>(configured: Option<&'a str>, primary: &'a str) -> &'a str {
+    configured
+        .filter(|url| !url.trim().is_empty())
+        .unwrap_or(primary)
+}
+
 fn resolve_database_schema(schema: Option<&str>) -> Result<&str, ImageGatewayError> {
     let schema = schema.unwrap_or(DEFAULT_DATABASE_SCHEMA);
     if is_simple_identifier(schema) {
@@ -185,7 +227,7 @@ fn verification_error(error: impl Display) -> ImageGatewayError {
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_database_schema, resolve_database_url};
+    use super::{resolve_admin_read_database_url, resolve_database_schema, resolve_database_url};
 
     #[test]
     fn database_url_uses_nonblank_primary_then_nonblank_fallback() {
@@ -210,5 +252,20 @@ mod tests {
         assert!(resolve_database_schema(Some("tenant-a")).is_err());
         assert!(resolve_database_schema(Some("public, attacker")).is_err());
         assert!(resolve_database_schema(Some(" ")).is_err());
+    }
+
+    #[test]
+    fn admin_read_database_url_prefers_a_nonblank_dedicated_role_url() {
+        assert_eq!(
+            resolve_admin_read_database_url(
+                Some("postgres://admin-reader"),
+                "postgres://gateway-writer"
+            ),
+            "postgres://admin-reader"
+        );
+        assert_eq!(
+            resolve_admin_read_database_url(Some("  "), "postgres://gateway-writer"),
+            "postgres://gateway-writer"
+        );
     }
 }

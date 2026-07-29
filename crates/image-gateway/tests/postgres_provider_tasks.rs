@@ -2854,6 +2854,20 @@ async fn atomic_submit_migration_preserves_and_recovers_schema_26_submit_states(
             format!("0027 rewrote schema 26 submit history: {before:?} -> {after:?}"),
         )?;
 
+        for migration in [
+            include_str!("../migrations/0028_executor_active_owner_lookup.sql"),
+            include_str!("../migrations/0029_provider_runtime_readiness.sql"),
+            include_str!("../migrations/0030_provider_profile_readiness_projection.sql"),
+            include_str!("../migrations/0031_capacity_counter_snapshot.sql"),
+            include_str!("../migrations/0032_video_artifact_media.sql"),
+            include_str!("../migrations/0033_media_economics_v3.sql"),
+        ] {
+            sqlx::raw_sql(migration)
+                .execute(&database.pool)
+                .await
+                .map_err(debug_error)?;
+        }
+
         let store = PostgresProviderTaskStore::new(database.pool.clone());
         require(
             matches!(
@@ -7008,6 +7022,8 @@ async fn operation_binding_migration_preserves_terminal_v1_handoff_replay() -> T
             format!("0026 rewrote terminal history instead of retaining v1: {legacy_binding:?}"),
         )?;
 
+        apply_migration_range(&database.pool, 27, i64::MAX).await?;
+
         let replay = executor_store
             .prepare_and_handoff(&work, PROFILE_ID)
             .await
@@ -10232,7 +10248,7 @@ async fn seed_running_submission_for_runtime_profile(
     command_schema: &str,
     adapter_revision: &str,
 ) -> TestResult<ExecutorSubmissionLease> {
-    if !operation_binding_exists(pool).await? {
+    if !operation_binding_exists(pool).await? || !media_economics_exists(pool).await? {
         require(
             execution_profile_id == PROFILE_ID
                 && provider_id == "provider-test"
@@ -10279,6 +10295,23 @@ async fn operation_binding_exists(pool: &PgPool) -> TestResult<bool> {
           WHERE table_schema = current_schema()
             AND table_name = 'provider_submissions'
             AND column_name = 'operation_binding_version'
+        )
+        "#,
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(debug_error)
+}
+
+async fn media_economics_exists(pool: &PgPool) -> TestResult<bool> {
+    sqlx::query_scalar(
+        r#"
+        SELECT EXISTS (
+          SELECT 1
+          FROM information_schema.columns
+          WHERE table_schema = current_schema()
+            AND table_name = 'jobs'
+            AND column_name = 'output_count'
         )
         "#,
     )
@@ -10413,38 +10446,78 @@ async fn seed_legacy_running_submission_and_work(
     .execute(&mut *tx)
     .await
     .map_err(debug_error)?;
-    sqlx::query(
-        r#"
-        INSERT INTO provider_submissions
-          (submission_id, executor_execution_id, output_id, job_id,
-           tenant_id, provider_id, model, work_item_id,
-           created_by_execution_id, created_by_lease_epoch, command_schema, command_hash,
-           execution_profile_id, credential_pool_id, provider_account_id,
-           credential_ref, credential_revision, adapter_revision,
-           resource_policy_id, resource_policy_revision,
-           state, prepared_at_ms, updated_at_ms)
-        VALUES ($1, $2, $3, $4, 'provider-task-test', 'provider-test', 'model-test', $5,
-                $6, $7, 'provider-command-v1', $8, $9, $10, $11,
-                'test-vault.provider-task.1', 1, 'provider-test-adapter-v1',
-                $12, 1, 'prepared', $13, $13)
-        "#,
-    )
-    .bind(submission_id)
-    .bind(executor_execution_id)
-    .bind(output_id)
-    .bind(work.job_id)
-    .bind(work.work_item_id)
-    .bind(work.execution_id)
-    .bind(work.lease_epoch)
-    .bind(&command_hash)
-    .bind(PROFILE_ID)
-    .bind(POOL_ID)
-    .bind(ACCOUNT_ID)
-    .bind(POLICY_ID)
-    .bind(now)
-    .execute(&mut *tx)
-    .await
-    .map_err(debug_error)?;
+    if operation_binding_exists(pool).await? {
+        sqlx::query(
+            r#"
+            INSERT INTO provider_submissions
+              (submission_id, executor_execution_id, output_id, job_id,
+               tenant_id, provider_id, model, work_item_id,
+               created_by_execution_id, created_by_lease_epoch, command_schema, command_hash,
+               execution_profile_id, credential_pool_id, provider_account_id,
+               credential_ref, credential_revision, adapter_revision,
+               resource_policy_id, resource_policy_revision,
+               operation_id, operation_descriptor_revision,
+               operation_descriptor_sha256_v1, completion_mode, idempotency_mode,
+               operation_binding_version, state, prepared_at_ms, updated_at_ms)
+            VALUES ($1, $2, $3, $4, 'provider-task-test', 'provider-test', 'model-test', $5,
+                    $6, $7, 'provider-command-v1', $8, $9, $10, $11,
+                    'test-vault.provider-task.1', 1, 'provider-test-adapter-v1',
+                    $12, 1, 'images.generations', 'provider-test/images.generations/v1',
+                    $13, 'remote_task', 'submission_bound', 2,
+                    'prepared', $14, $14)
+            "#,
+        )
+        .bind(submission_id)
+        .bind(executor_execution_id)
+        .bind(output_id)
+        .bind(work.job_id)
+        .bind(work.work_item_id)
+        .bind(work.execution_id)
+        .bind(work.lease_epoch)
+        .bind(&command_hash)
+        .bind(PROFILE_ID)
+        .bind(POOL_ID)
+        .bind(ACCOUNT_ID)
+        .bind(POLICY_ID)
+        .bind("2".repeat(64))
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .map_err(debug_error)?;
+    } else {
+        sqlx::query(
+            r#"
+            INSERT INTO provider_submissions
+              (submission_id, executor_execution_id, output_id, job_id,
+               tenant_id, provider_id, model, work_item_id,
+               created_by_execution_id, created_by_lease_epoch, command_schema, command_hash,
+               execution_profile_id, credential_pool_id, provider_account_id,
+               credential_ref, credential_revision, adapter_revision,
+               resource_policy_id, resource_policy_revision,
+               state, prepared_at_ms, updated_at_ms)
+            VALUES ($1, $2, $3, $4, 'provider-task-test', 'provider-test', 'model-test', $5,
+                    $6, $7, 'provider-command-v1', $8, $9, $10, $11,
+                    'test-vault.provider-task.1', 1, 'provider-test-adapter-v1',
+                    $12, 1, 'prepared', $13, $13)
+            "#,
+        )
+        .bind(submission_id)
+        .bind(executor_execution_id)
+        .bind(output_id)
+        .bind(work.job_id)
+        .bind(work.work_item_id)
+        .bind(work.execution_id)
+        .bind(work.lease_epoch)
+        .bind(&command_hash)
+        .bind(PROFILE_ID)
+        .bind(POOL_ID)
+        .bind(ACCOUNT_ID)
+        .bind(POLICY_ID)
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .map_err(debug_error)?;
+    }
     sqlx::query(
         r#"
         INSERT INTO executor_executions
@@ -10645,23 +10718,50 @@ async fn seed_work_lease_for_runtime_profile_with_command(
     let session_id = Uuid::new_v4();
     let now = database_now(pool).await?;
     let request_id = format!("request-{}", Uuid::new_v4().simple());
-    sqlx::query(
-        r#"
-        INSERT INTO jobs
-          (job_id, tenant_id, request_id, operation, provider_id, model, state,
-           requested_units, economics_contract_version, created_at_ms, updated_at_ms)
-        VALUES ($1, 'provider-task-test', $2, 'generation', $3,
-                $4, 'reserved', 1, 2, $5, $5)
-        "#,
+    let media_economics_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'jobs' AND column_name = 'output_count')",
     )
-    .bind(job_id)
-    .bind(&request_id)
-    .bind(provider_id)
-    .bind(model)
-    .bind(now)
-    .execute(pool)
+    .fetch_one(pool)
     .await
     .map_err(debug_error)?;
+    if media_economics_exists {
+        sqlx::query(
+            r#"
+            INSERT INTO jobs
+              (job_id, tenant_id, request_id, operation, provider_id, model, state,
+               requested_units, output_count, billable_units, billing_metric, billing_unit,
+               economics_contract_version, created_at_ms, updated_at_ms)
+            VALUES ($1, 'provider-task-test', $2, 'generation', $3,
+                    $4, 'reserved', 1, 1, 1, 'output', 'output', 2, $5, $5)
+            "#,
+        )
+        .bind(job_id)
+        .bind(&request_id)
+        .bind(provider_id)
+        .bind(model)
+        .bind(now)
+        .execute(pool)
+        .await
+        .map_err(debug_error)?;
+    } else {
+        sqlx::query(
+            r#"
+            INSERT INTO jobs
+              (job_id, tenant_id, request_id, operation, provider_id, model, state,
+               requested_units, economics_contract_version, created_at_ms, updated_at_ms)
+            VALUES ($1, 'provider-task-test', $2, 'generation', $3,
+                    $4, 'reserved', 1, 2, $5, $5)
+            "#,
+        )
+        .bind(job_id)
+        .bind(&request_id)
+        .bind(provider_id)
+        .bind(model)
+        .bind(now)
+        .execute(pool)
+        .await
+        .map_err(debug_error)?;
+    }
     sqlx::query(
         "INSERT INTO job_outputs (output_id, job_id, output_index, state, created_at_ms, updated_at_ms) VALUES ($1, $2, 0, 'pending', $3, $3)",
     )
@@ -11182,6 +11282,46 @@ impl TestDatabase {
         self.pool.close().await;
         result.map(|_| ())
     }
+}
+
+async fn apply_migration_range(pool: &PgPool, first_version: i64, last_version: i64) -> TestResult {
+    let migration_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+    let mut migrations = fs::read_dir(&migration_dir)
+        .map_err(|error| format!("failed to read {}: {error}", migration_dir.display()))?
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("failed to enumerate migrations: {error}"))?;
+    migrations.sort();
+
+    for path in migrations {
+        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let Some(version) = file_name
+            .split_once('_')
+            .and_then(|(version, _)| version.parse::<i64>().ok())
+        else {
+            continue;
+        };
+        if !(first_version..=last_version).contains(&version) {
+            continue;
+        }
+        let sql = fs::read_to_string(&path)
+            .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
+        let mut transaction = pool
+            .begin()
+            .await
+            .map_err(|error| format!("failed to begin migration {version}: {error}"))?;
+        sqlx::raw_sql(AssertSqlSafe(sql))
+            .execute(&mut *transaction)
+            .await
+            .map_err(|error| format!("migration {version} failed: {error}"))?;
+        transaction
+            .commit()
+            .await
+            .map_err(|error| format!("failed to commit migration {version}: {error}"))?;
+    }
+    Ok(())
 }
 
 fn runtime_registration(role: ProviderRuntimeRole, owner: &str) -> ProviderRuntimeRegistration {

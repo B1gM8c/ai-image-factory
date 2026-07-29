@@ -12,4 +12,6 @@ async function handler(request: Request, context: RouteContext) {
 
 export const GET = handler;
 export const POST = handler;
+export const PATCH = handler;
+export const PUT = handler;
 export const DELETE = handler;

@@ -326,7 +326,7 @@ fn parse_json_image_ref(
     )
 }
 
-fn decode_data_url_image(
+pub(super) fn decode_data_url_image(
     param: &str,
     value: &str,
     mask: bool,

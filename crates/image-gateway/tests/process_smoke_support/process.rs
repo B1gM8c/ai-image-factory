@@ -17,6 +17,7 @@ use super::{ADMIN_TOKEN, API_TOKEN, TestDatabase, TestResult, combine_results, r
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(10);
 const HEALTH_TIMEOUT_ENV: &str = "PROCESS_SMOKE_HEALTH_TIMEOUT_SECS";
 const EXIT_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_DIAGNOSTIC_LOG_LINES: usize = 200;
 const STARTUP_ATTEMPTS: usize = 3;
 
 pub(crate) struct SmokeFiles {
@@ -162,6 +163,38 @@ impl SmokeFiles {
         gpt_image_2_gateway::codex_auth_file_sha256(&self.codex_home)
             .map_err(|error| format!("failed to hash fake Codex auth.json: {error:?}"))
     }
+
+    pub(crate) fn codex_credential_home(&self) -> &Path {
+        &self.codex_home
+    }
+
+    pub(crate) fn process_diagnostics(&self) -> String {
+        [
+            ("gateway", &self.gateway_log),
+            ("workerd", &self.workerd_log),
+            ("executord", &self.executord_log),
+            ("reducerd", &self.reducerd_log),
+        ]
+        .into_iter()
+        .map(|(name, path)| {
+            let log = fs::read_to_string(path).unwrap_or_else(|_| "<log unavailable>".to_string());
+            let lines = log.lines().collect::<Vec<_>>();
+            let omitted = lines.len().saturating_sub(MAX_DIAGNOSTIC_LOG_LINES);
+            let tail = lines
+                .into_iter()
+                .skip(omitted)
+                .collect::<Vec<_>>()
+                .join("\n");
+            let prefix = if omitted == 0 {
+                String::new()
+            } else {
+                format!("<{omitted} earlier lines omitted>\n")
+            };
+            format!("--- {name} ---\n{prefix}{tail}")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+    }
 }
 
 pub(crate) struct WorkerdProcess {
@@ -189,10 +222,11 @@ impl WorkerdProcess {
             .env("PATH", path)
             .env("DATABASE_URL", database.database_url())
             .env("GATEWAY_DATABASE_SCHEMA", database.schema())
+            .env("GATEWAY_IMAGES_GENERATION_CONTRACT", "legacy-v1")
             .env("GATEWAY_CODEX_HOME", &files.codex_home)
             .env("GATEWAY_ARTIFACT_ROOT", &files.artifact_root)
             .env("GATEWAY_CLEANUP_CODEX_OUTPUTS", "true")
-            .env("GATEWAY_REQUEST_TIMEOUT_SECS", "5")
+            .env("GATEWAY_REQUEST_TIMEOUT_SECS", "15")
             .env("WORKER_ID", "process-smoke-workerd")
             .env("WORKER_POLL_INTERVAL_MS", "10")
             .env("RUST_LOG", "info")
@@ -247,6 +281,7 @@ impl WorkerdProcess {
             .env_clear()
             .env("DATABASE_URL", database.database_url())
             .env("GATEWAY_DATABASE_SCHEMA", database.schema())
+            .env("GATEWAY_IMAGES_GENERATION_CONTRACT", "output-economics-v2")
             .env("WORKER_EXECUTION_MODE", "executor-handoff")
             .env("EXECUTOR_PROFILE_KEY", profile_key)
             .env("WORKER_ID", "process-smoke-v2-workerd")
@@ -376,8 +411,8 @@ impl ExecutordProcess {
             .env("EXECUTOR_HEARTBEAT_INTERVAL_MS", "250")
             .env("EXECUTOR_POLL_INTERVAL_MS", "10")
             .env("EXECUTOR_PROCESS_POLL_INTERVAL_MS", "10")
-            .env("EXECUTOR_PROCESS_STARTUP_GRACE_MS", "1000")
-            .env("EXECUTOR_REQUEST_TIMEOUT_MS", "5000")
+            .env("EXECUTOR_PROCESS_STARTUP_GRACE_MS", "10000")
+            .env("EXECUTOR_REQUEST_TIMEOUT_MS", "15000")
             .env("EXECUTOR_OWNER_GUARD_TIMEOUT_MS", "1000")
             .env("RUST_LOG", "info")
             .stdin(Stdio::null())
@@ -575,14 +610,20 @@ impl GatewayProcess {
             .env("GATEWAY_BIND", address.to_string())
             .env("GATEWAY_API_TOKEN", API_TOKEN)
             .env("GATEWAY_ADMIN_TOKEN", ADMIN_TOKEN)
+            .env("GATEWAY_LEGACY_ADMIN_AUTH_ENABLED", "true")
             .env(
                 "GATEWAY_API_KEY_PEPPERS",
                 "1:1111111111111111111111111111111111111111111111111111111111111111",
             )
             .env("GATEWAY_API_KEY_CURRENT_PEPPER_VERSION", "1")
+            .env(
+                "GATEWAY_WEBHOOK_SIGNING_KEYS",
+                "1:2222222222222222222222222222222222222222222222222222222222222222",
+            )
+            .env("GATEWAY_WEBHOOK_CURRENT_SIGNING_KEY_VERSION", "1")
             .env("GATEWAY_ARTIFACT_ROOT", &files.artifact_root)
             .env("GATEWAY_QUEUE_TIMEOUT_SECS", "1")
-            .env("GATEWAY_REQUEST_TIMEOUT_SECS", "5")
+            .env("GATEWAY_REQUEST_TIMEOUT_SECS", "15")
             .env("GATEWAY_MAX_CONCURRENT_JOBS", "1")
             .env("GATEWAY_MAX_QUEUE_SIZE", "0")
             .env("RUST_LOG", "info")
@@ -706,7 +747,7 @@ pub(crate) async fn start_gateway_with_retry(
     database: &TestDatabase,
     files: &SmokeFiles,
 ) -> TestResult<(GatewayProcess, SocketAddr)> {
-    start_gateway_with_contract(client, database, files, None).await
+    start_gateway_with_contract(client, database, files, Some("legacy-v1")).await
 }
 
 pub(crate) async fn start_v2_gateway_with_retry(
@@ -873,12 +914,16 @@ printf '%s\0' "$@" > {argv_log}
 cat > {stdin_log}
 sleep "$(cat {fake_delay})"
 request_dir=
+output_dir=
 while [ "$#" -gt 0 ]; do
     if [ "$1" = "--cd" ]; then
         shift
         [ "$#" -gt 0 ] || exit 27
         request_dir=$1
-        break
+    elif [ "$1" = "--add-dir" ]; then
+        shift
+        [ "$#" -gt 0 ] || exit 32
+        output_dir=$1
     fi
     shift
 done
@@ -888,7 +933,11 @@ if /usr/bin/grep -q '第 2/2 张候选图片' {stdin_log}; then
 else
     selected_fixture={fixture}
 fi
-cp "$selected_fixture" "$request_dir/final.png"
+if [ -n "$output_dir" ]; then
+    cp "$selected_fixture" "$output_dir/sealed-output.bin"
+else
+    cp "$selected_fixture" "$request_dir/final.png"
+fi
 "#,
         codex_home = shell_quote(paths.codex_home),
         codex_auth = shell_quote(&paths.codex_home.join("auth.json")),

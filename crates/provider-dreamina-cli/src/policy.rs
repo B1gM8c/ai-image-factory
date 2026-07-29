@@ -18,6 +18,20 @@ pub enum DreaminaSubmitRequestV1 {
 }
 
 impl DreaminaSubmitRequestV1 {
+    pub fn output_count(&self) -> u8 {
+        match self {
+            Self::TextToImage(request) => request.generate_num(),
+            Self::TextToVideo(_) => 1,
+        }
+    }
+
+    pub fn into_single_output(self) -> Self {
+        match self {
+            Self::TextToImage(request) => Self::TextToImage(request.into_single_output()),
+            Self::TextToVideo(request) => Self::TextToVideo(request),
+        }
+    }
+
     pub(crate) fn argv(&self) -> Result<Vec<OsString>, DreaminaCliPolicyError> {
         match self {
             Self::TextToImage(request) if request.generate_num() != 1 => {

@@ -1,7 +1,7 @@
 use std::{
     env, fs,
-    io::{Read, Write},
-    os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+    io::{Cursor, Read},
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::Stdio,
     sync::Arc,
@@ -11,39 +11,45 @@ use std::{
 use async_trait::async_trait;
 use image_cli_runtime::{
     CliPolicy, CliRuntime, CommandSpec, CommandSpecError, ExitClassification, OutputContract,
-    ProcessError, RuntimeError, SpawnEvidence, SpawnObserver, VerifiedExecutable, WorkingDirectory,
+    OutputError, ProcessError, RuntimeError, SpawnEvidence, SpawnObserver, VerifiedExecutable,
+    WorkingDirectory,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::{process::Command, time::Instant};
+use tokio::{process::Command, sync::oneshot, time::Instant};
 use uuid::Uuid;
 
 use super::{
     CodexOutputRequest, ExecutorLaunchContext, ExecutorSubmissionLease, RunnerError,
-    SingleOutputSupervisor, project_codex_output_request,
+    SingleOutputSupervisor, SupervisedOutput,
+    private_auth::{auth_file_sha256, prepare_isolated_auth, validate_auth_source},
+    project_codex_output_request,
+    runner::RunnerLaunchBinding,
 };
 use crate::{
     ImageGatewayError, ProxyConfig,
     generator::GenerationJob,
-    providers::openai_codex::{build_codex_prompt, final_output_filename},
+    providers::openai_codex::{build_codex_prompt_for_output, provider_output_filename},
     runner::{
         FilesystemRunnerJournal, LaunchDecision,
         process::{
             ExecutionSpool, ProcessObservation, ProcessSpoolError, ProcessTerminal,
-            ProviderProcessIdentity, RunnerLock, sha256,
+            ProviderProcessIdentity, RunnerLock, WorkspaceOutputSnapshot, sha256,
         },
     },
 };
 
 pub const CODEX_GENERATION_ADAPTER_REVISION: &str = "openai-codex-generation-v1";
-const AUTH_FILE: &str = "auth.json";
-const MAX_AUTH_BYTES: u64 = 1024 * 1024;
 const MAX_EXECUTABLE_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_SHEBANG_BYTES: usize = 4096;
 const MAX_RUNNER_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 const CHILD_REAP_TIMEOUT: Duration = Duration::from_secs(5);
 const CODEX_CHILD_PATH: &str = "/usr/bin:/bin";
 const MAX_CODEX_RUNTIME_OUTPUT_BYTES: u64 = 32 * 1024 * 1024;
+const CODEX_RUNTIME_OUTPUT_FILE: &str = "sealed-output.bin";
+const EPHEMERAL_OUTPUT_POLL_INTERVAL: Duration = Duration::from_millis(200);
+const MAX_DECODED_IMAGE_PIXELS: u64 = 16 * 1024 * 1024;
+const MAX_DECODED_IMAGE_DIMENSION: u32 = 8 * 1024;
 
 pub struct CodexProcessSupervisor {
     journal: Arc<FilesystemRunnerJournal>,
@@ -52,6 +58,7 @@ pub struct CodexProcessSupervisor {
     codex_executable_sha256: String,
     credential_auth_file: PathBuf,
     credential_auth_sha256: String,
+    credential_resolver: Option<(Uuid, Arc<dyn crate::OperationalCredentialResolver>)>,
     request_timeout: Duration,
     poll_interval: Duration,
     startup_grace: Duration,
@@ -64,6 +71,7 @@ struct CodexChildRequest {
     schema_version: u16,
     adapter_revision: String,
     executor_execution_id: String,
+    launch: RunnerLaunchBinding,
     codex_executable: String,
     codex_executable_sha256: String,
     timeout_ms: u64,
@@ -81,6 +89,7 @@ struct CodexCliPolicy;
 struct CodexCliInvocation {
     executable: PathBuf,
     workspace: PathBuf,
+    output_dir: PathBuf,
     codex_home: PathBuf,
     timeout: Duration,
     prompt: Vec<u8>,
@@ -120,8 +129,15 @@ impl CodexProcessSupervisor {
         let codex_executable = canonical_executable(codex_executable.as_ref())?;
         validate_codex_executable_compatibility(&codex_executable, CODEX_CHILD_PATH)?;
         let codex_executable_sha256 = hash_bounded_file(&codex_executable)?;
-        let credential_auth_file =
-            validate_auth_source(credential_home.as_ref(), credential_auth_sha256)?;
+        let credential_auth_file = validate_auth_source(
+            credential_home.as_ref(),
+            credential_auth_sha256,
+        )
+        .map_err(|_| {
+            ImageGatewayError::config(
+                "EXECUTOR_CODEX_CREDENTIAL_HOME/auth.json is invalid or does not match the database credential",
+            )
+        })?;
         Ok(Self {
             journal,
             helper_executable,
@@ -129,11 +145,54 @@ impl CodexProcessSupervisor {
             codex_executable_sha256,
             credential_auth_file,
             credential_auth_sha256: credential_auth_sha256.to_string(),
+            credential_resolver: None,
             request_timeout,
             poll_interval,
             startup_grace,
             child_env: child_environment(proxy),
         })
+    }
+
+    pub fn with_credential_resolver(
+        mut self,
+        provider_account_id: Uuid,
+        resolver: Arc<dyn crate::OperationalCredentialResolver>,
+    ) -> Result<Self, ImageGatewayError> {
+        if provider_account_id.is_nil() {
+            return Err(ImageGatewayError::config(
+                "Codex credential resolver account is invalid",
+            ));
+        }
+        self.credential_resolver = Some((provider_account_id, resolver));
+        Ok(self)
+    }
+
+    async fn credential_source(&self) -> Result<(PathBuf, String, i64), RunnerError> {
+        let Some((provider_account_id, resolver)) = &self.credential_resolver else {
+            return Ok((
+                self.credential_auth_file.clone(),
+                self.credential_auth_sha256.clone(),
+                1,
+            ));
+        };
+        let credential = resolver
+            .resolve(*provider_account_id)
+            .await
+            .map_err(|_| RunnerError::Unavailable)?;
+        if credential.provider_id != image_provider_contracts::openai_codex::PROVIDER_ID
+            || credential.provider_account_id != *provider_account_id
+            || self.credential_auth_file.parent() != Some(credential.home())
+        {
+            return Err(RunnerError::Unavailable);
+        }
+        let source =
+            validate_auth_source(credential.home(), &credential.material_fingerprint_sha256)
+                .map_err(|_| RunnerError::Unavailable)?;
+        Ok((
+            source,
+            credential.material_fingerprint_sha256,
+            credential.revision,
+        ))
     }
 
     fn child_request(
@@ -154,6 +213,7 @@ impl CodexProcessSupervisor {
             schema_version: 1,
             adapter_revision: CODEX_GENERATION_ADAPTER_REVISION.to_string(),
             executor_execution_id: lease.executor_execution_id.to_string(),
+            launch: RunnerLaunchBinding::from_lease(lease),
             codex_executable: self.codex_executable.to_string_lossy().into_owned(),
             codex_executable_sha256: self.codex_executable_sha256.clone(),
             timeout_ms: self.request_timeout.as_millis() as u64,
@@ -211,16 +271,20 @@ impl CodexProcessSupervisor {
 pub fn codex_auth_file_sha256(
     credential_home: impl AsRef<Path>,
 ) -> Result<String, ImageGatewayError> {
-    let credential_home = credential_home.as_ref();
-    if !credential_home.is_absolute() {
-        return Err(ImageGatewayError::config(
-            "EXECUTOR_CODEX_CREDENTIAL_HOME must be absolute",
-        ));
-    }
-    let bytes = read_private_auth(&credential_home.join(AUTH_FILE)).map_err(|_| {
+    auth_file_sha256(credential_home.as_ref()).map_err(|_| {
         ImageGatewayError::config("EXECUTOR_CODEX_CREDENTIAL_HOME/auth.json is invalid")
-    })?;
-    Ok(sha256(&bytes))
+    })
+}
+
+pub fn prepare_codex_auth_copy(
+    destination_home: impl AsRef<Path>,
+    source_home: impl AsRef<Path>,
+    expected_sha256: &str,
+) -> Result<(), ImageGatewayError> {
+    let source = validate_auth_source(source_home.as_ref(), expected_sha256)
+        .map_err(|_| ImageGatewayError::config("managed Codex auth source is invalid"))?;
+    prepare_isolated_auth(destination_home.as_ref(), &source, expected_sha256)
+        .map_err(|_| ImageGatewayError::config("managed Codex auth copy is invalid"))
 }
 
 #[async_trait]
@@ -230,15 +294,22 @@ impl SingleOutputSupervisor for CodexProcessSupervisor {
         lease: &ExecutorSubmissionLease,
         context: &ExecutorLaunchContext,
     ) -> Result<(), RunnerError> {
+        let (credential_auth_file, credential_auth_sha256, credential_revision) =
+            self.credential_source().await?;
         let request = self.child_request(lease, context)?;
         let bytes = serde_json::to_vec(&request).map_err(|_| RunnerError::Internal)?;
         let spool = ExecutionSpool::for_lease(&self.journal, lease).map_err(map_spool_error)?;
         prepare_isolated_auth(
             spool.codex_home_path().map_err(map_spool_error)?,
-            &self.credential_auth_file,
-            &self.credential_auth_sha256,
+            &credential_auth_file,
+            &credential_auth_sha256,
         )
         .map_err(|_| RunnerError::Unavailable)?;
+        tracing::debug!(
+            execution.profile.id = %lease.execution_profile_id,
+            credential.revision = credential_revision,
+            "resolved Codex operational credential"
+        );
         spool.prepare_request(&bytes).map_err(map_spool_error)
     }
 
@@ -246,7 +317,7 @@ impl SingleOutputSupervisor for CodexProcessSupervisor {
         &self,
         lease: &ExecutorSubmissionLease,
         decision: LaunchDecision,
-    ) -> Result<Vec<u8>, RunnerError> {
+    ) -> Result<SupervisedOutput, RunnerError> {
         let spool = ExecutionSpool::for_lease(&self.journal, lease).map_err(map_spool_error)?;
         if decision == LaunchDecision::LaunchOnce {
             self.spawn_helper(lease)?;
@@ -291,10 +362,24 @@ pub async fn run_codex_runner_child(
     runner_root: impl AsRef<Path>,
     executor_execution_id: Uuid,
 ) -> Result<(), ImageGatewayError> {
+    let runner_root = runner_root.as_ref();
     let spool = Arc::new(
-        ExecutionSpool::open(runner_root.as_ref(), executor_execution_id)
-            .map_err(child_spool_error)?,
+        ExecutionSpool::open(runner_root, executor_execution_id).map_err(child_spool_error)?,
     );
+    let request = spool
+        .read_request()
+        .map_err(child_spool_error)
+        .and_then(|bytes| {
+            serde_json::from_slice::<CodexChildRequest>(&bytes).map_err(|_| {
+                ImageGatewayError::service_unavailable("Codex runner request is invalid")
+            })
+        })?;
+    let lease = validate_child_request(&request, executor_execution_id)?;
+    FilesystemRunnerJournal::new(runner_root)
+        .and_then(|journal| journal.verify_launch_committed(&lease))
+        .map_err(|_| {
+            ImageGatewayError::service_unavailable("Codex launch authority is unavailable")
+        })?;
     let runner_lock = Arc::new(spool.acquire_runner_lock().map_err(child_spool_error)?);
     let identity = runner_lock.identity().map_err(child_spool_error)?;
     spool
@@ -310,6 +395,19 @@ pub async fn run_codex_runner_child(
     match outcome {
         ChildOutcome::Succeeded(bytes) => {
             spool.publish_output(&bytes).map_err(child_spool_error)?;
+            if spool.cleanup_codex_runtime().is_err() {
+                spool
+                    .publish_terminal(
+                        &runner_lock,
+                        &ProcessTerminal::Uncertain {
+                            helper_nonce: identity.nonce.clone(),
+                            error_code: "codex_local_cleanup_failed".to_owned(),
+                        },
+                    )
+                    .map_err(child_spool_error)?;
+                drop(runner_lock);
+                return Ok(());
+            }
             spool
                 .publish_terminal(
                     &runner_lock,
@@ -317,28 +415,44 @@ pub async fn run_codex_runner_child(
                         helper_nonce: identity.nonce.clone(),
                         sha256_hex: sha256(&bytes),
                         byte_size: bytes.len() as u64,
+                        provider_reported_cost: None,
                     },
                 )
                 .map_err(child_spool_error)?;
         }
-        ChildOutcome::Failed(error_code) => spool
-            .publish_terminal(
-                &runner_lock,
-                &ProcessTerminal::Failed {
+        ChildOutcome::Failed(error_code) => {
+            let cleanup_failed = spool.cleanup_codex_runtime().is_err();
+            let terminal = if cleanup_failed {
+                ProcessTerminal::Uncertain {
                     helper_nonce: identity.nonce.clone(),
-                    error_code: error_code.to_string(),
-                },
-            )
-            .map_err(child_spool_error)?,
-        ChildOutcome::Uncertain(error_code) => spool
-            .publish_terminal(
-                &runner_lock,
-                &ProcessTerminal::Uncertain {
+                    error_code: "codex_local_cleanup_failed".to_owned(),
+                }
+            } else {
+                ProcessTerminal::Failed {
                     helper_nonce: identity.nonce.clone(),
-                    error_code: error_code.to_string(),
-                },
-            )
-            .map_err(child_spool_error)?,
+                    error_code: error_code.to_owned(),
+                }
+            };
+            spool
+                .publish_terminal(&runner_lock, &terminal)
+                .map_err(child_spool_error)?
+        }
+        ChildOutcome::Uncertain(error_code) => {
+            let cleanup_failed = spool.cleanup_codex_runtime().is_err();
+            spool
+                .publish_terminal(
+                    &runner_lock,
+                    &ProcessTerminal::Uncertain {
+                        helper_nonce: identity.nonce.clone(),
+                        error_code: if cleanup_failed {
+                            "codex_local_cleanup_failed".to_owned()
+                        } else {
+                            error_code.to_owned()
+                        },
+                    },
+                )
+                .map_err(child_spool_error)?
+        }
     }
     drop(runner_lock);
     Ok(())
@@ -372,15 +486,26 @@ async fn run_codex_child(
         Ok(path) => path,
         Err(_) => return ChildOutcome::Uncertain("runner_codex_home_invalid"),
     };
+    let output_dir = match spool.runtime_home_path() {
+        Ok(path) => path,
+        Err(_) => return ChildOutcome::Uncertain("runner_output_directory_invalid"),
+    };
     let job = generation_job(&request.output);
-    let prompt = build_codex_prompt(&job, workspace, request.output.candidate_index);
+    let prompt = build_codex_prompt_for_output(
+        &job,
+        workspace,
+        request.output.candidate_index,
+        output_dir,
+        CODEX_RUNTIME_OUTPUT_FILE,
+    );
     let invocation = CodexCliInvocation {
         executable: PathBuf::from(&request.codex_executable),
         workspace: workspace.to_path_buf(),
+        output_dir: output_dir.to_path_buf(),
         codex_home: codex_home.to_path_buf(),
         timeout: Duration::from_millis(request.timeout_ms),
         prompt: prompt.into_bytes(),
-        output_filename: final_output_filename(&request.output.output_format),
+        output_filename: CODEX_RUNTIME_OUTPUT_FILE,
         environment: allowed_child_environment(),
     };
     let mut observer = CodexSpawnObserver {
@@ -388,12 +513,141 @@ async fn run_codex_child(
         runner_lock: Arc::clone(&runner_lock),
         helper,
     };
-    match CliRuntime::new(CodexCliPolicy)
-        .run_to_sink(&invocation, &mut observer, Vec::new())
+    let capture_filename = provider_output_filename(&request.output.output_format);
+    match spool.read_workspace_output(capture_filename, MAX_CODEX_RUNTIME_OUTPUT_BYTES) {
+        Ok(WorkspaceOutputSnapshot::Missing) => {}
+        Ok(WorkspaceOutputSnapshot::Incomplete | WorkspaceOutputSnapshot::Bytes(_)) => {
+            return ChildOutcome::Uncertain("codex_workspace_output_preexisting");
+        }
+        Err(_) => return ChildOutcome::Uncertain("codex_ephemeral_output_unavailable"),
+    }
+    let (stop_capture, capture_stop) = oneshot::channel();
+    let capture_spool = Arc::clone(&spool);
+    let capture_format = request.output.output_format.clone();
+    let capture = tokio::spawn(async move {
+        capture_ephemeral_output(
+            capture_spool,
+            capture_filename,
+            capture_format,
+            capture_stop,
+        )
         .await
-    {
+    });
+    let runtime_result = CliRuntime::new(CodexCliPolicy)
+        .run_to_sink(&invocation, &mut observer, Vec::new())
+        .await;
+    let _ = stop_capture.send(());
+    let captured = match capture.await {
+        Ok(result) => result,
+        Err(_) => Err(ProcessSpoolError::Unavailable),
+    };
+    match runtime_result {
         Ok(result) => ChildOutcome::Succeeded(result.sink),
+        Err(error) if ephemeral_capture_fallback_allowed(&error) => match captured {
+            Ok(Some(bytes)) => ChildOutcome::Succeeded(bytes),
+            Ok(None) => map_cli_runtime_error(error),
+            Err(ProcessSpoolError::Integrity) => {
+                ChildOutcome::Failed("codex_ephemeral_output_invalid")
+            }
+            Err(
+                ProcessSpoolError::InvalidInput
+                | ProcessSpoolError::Conflict
+                | ProcessSpoolError::Unavailable,
+            ) => ChildOutcome::Uncertain("codex_ephemeral_output_unavailable"),
+        },
         Err(error) => map_cli_runtime_error(error),
+    }
+}
+
+async fn capture_ephemeral_output(
+    spool: Arc<ExecutionSpool>,
+    filename: &'static str,
+    output_format: String,
+    mut stop: oneshot::Receiver<()>,
+) -> Result<Option<Vec<u8>>, ProcessSpoolError> {
+    let mut previous: Option<Vec<u8>> = None;
+    let mut stable: Option<Vec<u8>> = None;
+    let mut first_poll = true;
+    loop {
+        if first_poll {
+            first_poll = false;
+        } else {
+            tokio::select! {
+                biased;
+                _ = &mut stop => return Ok(stable),
+                _ = tokio::time::sleep(EPHEMERAL_OUTPUT_POLL_INTERVAL) => {}
+            }
+        }
+        let read_spool = Arc::clone(&spool);
+        let snapshot = tokio::task::spawn_blocking(move || {
+            read_spool.read_workspace_output(filename, MAX_CODEX_RUNTIME_OUTPUT_BYTES)
+        })
+        .await
+        .map_err(|_| ProcessSpoolError::Unavailable)??;
+        match snapshot {
+            WorkspaceOutputSnapshot::Missing => previous = None,
+            WorkspaceOutputSnapshot::Incomplete => {
+                previous = None;
+                stable = None;
+            }
+            WorkspaceOutputSnapshot::Bytes(bytes) => {
+                if stable.as_deref() == Some(bytes.as_slice()) {
+                    previous = Some(bytes);
+                } else if previous.as_deref() == Some(bytes.as_slice()) {
+                    let format = output_format.clone();
+                    let (bytes, valid) = tokio::task::spawn_blocking(move || {
+                        let valid = valid_captured_image(&bytes, &format);
+                        (bytes, valid)
+                    })
+                    .await
+                    .map_err(|_| ProcessSpoolError::Unavailable)?;
+                    if valid {
+                        stable = Some(bytes.clone());
+                        previous = Some(bytes);
+                    } else {
+                        stable = None;
+                        previous = None;
+                    }
+                } else {
+                    stable = None;
+                    previous = Some(bytes);
+                }
+            }
+        }
+    }
+}
+
+fn valid_captured_image(bytes: &[u8], output_format: &str) -> bool {
+    let expected = match output_format {
+        "png" => image::ImageFormat::Png,
+        "jpeg" => image::ImageFormat::Jpeg,
+        "webp" => image::ImageFormat::WebP,
+        _ => return false,
+    };
+    let mut reader = match image::ImageReader::new(Cursor::new(bytes)).with_guessed_format() {
+        Ok(reader) if reader.format() == Some(expected) => reader,
+        _ => return false,
+    };
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_DECODED_IMAGE_DIMENSION);
+    limits.max_image_height = Some(MAX_DECODED_IMAGE_DIMENSION);
+    limits.max_alloc = Some(MAX_DECODED_IMAGE_PIXELS * 8);
+    reader.limits(limits);
+    reader.decode().is_ok_and(|image| {
+        image.width() > 0
+            && image.height() > 0
+            && u64::from(image.width()).saturating_mul(u64::from(image.height()))
+                <= MAX_DECODED_IMAGE_PIXELS
+    })
+}
+
+fn ephemeral_capture_fallback_allowed(error: &RuntimeError) -> bool {
+    match error {
+        RuntimeError::Output(OutputError::Missing) => true,
+        RuntimeError::Output(OutputError::Unavailable(error)) => {
+            error.kind() == std::io::ErrorKind::NotFound
+        }
+        _ => false,
     }
 }
 
@@ -404,11 +658,12 @@ impl CliPolicy for CodexCliPolicy {
     fn command(&self, request: &Self::Request) -> Result<CommandSpec, Self::Error> {
         let mut command = CommandSpec::new(
             VerifiedExecutable::new(&request.executable)?,
-            WorkingDirectory::new(&request.workspace)?,
+            WorkingDirectory::new(&request.output_dir)?,
             OutputContract::new(request.output_filename, MAX_CODEX_RUNTIME_OUTPUT_BYTES)?,
             request.timeout,
             CHILD_REAP_TIMEOUT,
-        )?;
+        )?
+        .require_directory(WorkingDirectory::new(&request.workspace)?);
         for argument in [
             "exec",
             "--ephemeral",
@@ -425,7 +680,11 @@ impl CliPolicy for CodexCliPolicy {
         ] {
             command = command.arg(argument)?;
         }
-        command = command.arg(request.workspace.as_os_str())?.arg("-")?;
+        command = command
+            .arg(request.workspace.as_os_str())?
+            .arg("--add-dir")?
+            .arg(request.output_dir.as_os_str())?
+            .arg("-")?;
         for (name, value) in [
             ("HOME", request.codex_home.to_string_lossy().into_owned()),
             (
@@ -481,7 +740,31 @@ fn map_cli_runtime_error(error: RuntimeError) -> ChildOutcome {
         RuntimeError::Process(ProcessError::Stdin { .. }) => {
             ChildOutcome::Uncertain("codex_stdin_failed")
         }
-        RuntimeError::Output(_) => ChildOutcome::Failed("codex_no_image_output"),
+        RuntimeError::Output(error) => match error {
+            OutputError::Missing => ChildOutcome::Failed("codex_no_image_output"),
+            OutputError::MultipleEntries => ChildOutcome::Failed("codex_multiple_image_outputs"),
+            OutputError::NotRegular => ChildOutcome::Failed("codex_image_output_not_regular"),
+            OutputError::Empty => ChildOutcome::Failed("codex_image_output_empty"),
+            OutputError::TooLarge => ChildOutcome::Failed("codex_image_output_too_large"),
+            OutputError::ChangedDuringRead => ChildOutcome::Uncertain("codex_image_output_changed"),
+            OutputError::Unavailable(error) => match error.kind() {
+                std::io::ErrorKind::NotFound => {
+                    ChildOutcome::Failed("codex_image_output_disappeared")
+                }
+                std::io::ErrorKind::PermissionDenied => {
+                    ChildOutcome::Failed("codex_image_output_unreadable")
+                }
+                _ => ChildOutcome::Uncertain("codex_output_unavailable"),
+            },
+            OutputError::UnsafeDirectory => {
+                ChildOutcome::Uncertain("codex_output_directory_unsafe")
+            }
+            OutputError::InvalidLimit => ChildOutcome::Uncertain("codex_output_contract_invalid"),
+            OutputError::DirectoryNotEmpty => {
+                ChildOutcome::Failed("codex_output_directory_not_empty")
+            }
+            OutputError::Sink(_) => ChildOutcome::Uncertain("codex_output_sink_failed"),
+        },
         RuntimeError::Policy(_)
         | RuntimeError::MissingOutputContract
         | RuntimeError::UnexpectedOutputContract
@@ -500,10 +783,22 @@ fn map_cli_runtime_error(error: RuntimeError) -> ChildOutcome {
 fn validate_child_request(
     request: &CodexChildRequest,
     executor_execution_id: Uuid,
-) -> Result<(), ImageGatewayError> {
+) -> Result<ExecutorSubmissionLease, ImageGatewayError> {
+    let lease = request.launch.to_lease().ok_or_else(|| {
+        ImageGatewayError::service_unavailable("Codex runner lease binding is invalid")
+    })?;
     if request.schema_version != 1
         || request.adapter_revision != CODEX_GENERATION_ADAPTER_REVISION
         || request.executor_execution_id != executor_execution_id.to_string()
+        || lease.executor_execution_id != executor_execution_id
+        || lease.provider_id != image_provider_contracts::openai_codex::PROVIDER_ID
+        || lease.adapter_revision != CODEX_GENERATION_ADAPTER_REVISION
+        || lease.command_schema != crate::admission::GENERATION_COMMAND_SCHEMA
+        || lease.model != request.output.model
+        || u32::try_from(lease.output_index)
+            .ok()
+            .map(|index| index + 1)
+            != Some(request.output.candidate_index)
         || request.timeout_ms == 0
         || request.timeout_ms > MAX_RUNNER_TIMEOUT.as_millis() as u64
         || request.output.validate().is_err()
@@ -520,7 +815,7 @@ fn validate_child_request(
             "Codex executable identity changed",
         ));
     }
-    Ok(())
+    Ok(lease)
 }
 
 fn generation_job(request: &CodexOutputRequest) -> GenerationJob {
@@ -538,119 +833,6 @@ fn generation_job(request: &CodexOutputRequest) -> GenerationJob {
         stream: request.stream,
         partial_images: request.partial_images,
     }
-}
-
-fn prepare_isolated_auth(
-    destination_home: &Path,
-    source: &Path,
-    expected_sha256: &str,
-) -> std::io::Result<()> {
-    let destination = destination_home.join(AUTH_FILE);
-    match fs::symlink_metadata(&destination) {
-        Ok(metadata) => {
-            validate_private_file_metadata(&metadata)?;
-            let bytes = read_private_auth(&destination)?;
-            return ensure_auth_digest(&bytes, expected_sha256);
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error),
-    }
-    let bytes = read_private_auth(source)?;
-    ensure_auth_digest(&bytes, expected_sha256)?;
-    let mut destination_file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(&destination)?;
-    destination_file.write_all(&bytes)?;
-    destination_file.sync_all()?;
-    fs::File::open(destination_home)?.sync_all()
-}
-
-fn validate_auth_source(home: &Path, expected_sha256: &str) -> Result<PathBuf, ImageGatewayError> {
-    if !home.is_absolute() {
-        return Err(ImageGatewayError::config(
-            "EXECUTOR_CODEX_CREDENTIAL_HOME must be absolute",
-        ));
-    }
-    if !is_sha256(expected_sha256) {
-        return Err(ImageGatewayError::config(
-            "database credential auth digest is invalid",
-        ));
-    }
-    let source = home.join(AUTH_FILE);
-    let bytes = read_private_auth(&source).map_err(|_| {
-        ImageGatewayError::config("EXECUTOR_CODEX_CREDENTIAL_HOME/auth.json is invalid")
-    })?;
-    if sha256(&bytes) != expected_sha256 {
-        return Err(ImageGatewayError::config(
-            "EXECUTOR_CODEX_CREDENTIAL_HOME/auth.json does not match the database credential",
-        ));
-    }
-    Ok(source)
-}
-
-fn read_private_auth(path: &Path) -> std::io::Result<Vec<u8>> {
-    let mut file = open_private_file(path)?;
-    let size = file.metadata()?.len();
-    if size == 0 || size > MAX_AUTH_BYTES {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "invalid auth file",
-        ));
-    }
-    let mut bytes = Vec::with_capacity(size as usize);
-    Read::by_ref(&mut file)
-        .take(MAX_AUTH_BYTES + 1)
-        .read_to_end(&mut bytes)?;
-    if bytes.len() as u64 != size {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "auth file changed",
-        ));
-    }
-    Ok(bytes)
-}
-
-fn ensure_auth_digest(bytes: &[u8], expected_sha256: &str) -> std::io::Result<()> {
-    if sha256(bytes) != expected_sha256 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "auth file digest mismatch",
-        ));
-    }
-    Ok(())
-}
-
-fn is_sha256(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-}
-
-fn open_private_file(path: &Path) -> std::io::Result<fs::File> {
-    let file = fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(path)?;
-    validate_private_file_metadata(&file.metadata()?)?;
-    Ok(file)
-}
-
-fn validate_private_file_metadata(metadata: &fs::Metadata) -> std::io::Result<()> {
-    if !metadata.is_file()
-        || metadata.nlink() != 1
-        || metadata.uid() != unsafe { libc::geteuid() }
-        || metadata.permissions().mode() & 0o077 != 0
-    {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "private file validation failed",
-        ));
-    }
-    Ok(())
 }
 
 fn canonical_executable(path: &Path) -> Result<PathBuf, ImageGatewayError> {
@@ -884,6 +1066,7 @@ mod tests {
         GENERATION_COMMAND_SCHEMA, GENERATION_COMMAND_SCHEMA_VERSION, GENERATION_OPERATION,
         GenerationCommandV1,
     };
+    use crate::executor::private_auth::{AUTH_FILE, MAX_AUTH_BYTES};
 
     #[test]
     fn child_environment_excludes_gateway_and_database_secrets() {
@@ -901,6 +1084,36 @@ mod tests {
         ] {
             assert!(!names.iter().any(|name| name == forbidden));
         }
+    }
+
+    #[test]
+    fn output_seal_failures_preserve_actionable_terminal_codes() {
+        assert!(matches!(
+            map_cli_runtime_error(RuntimeError::Output(OutputError::Missing)),
+            ChildOutcome::Failed("codex_no_image_output")
+        ));
+        assert!(matches!(
+            map_cli_runtime_error(RuntimeError::Output(OutputError::MultipleEntries)),
+            ChildOutcome::Failed("codex_multiple_image_outputs")
+        ));
+        assert!(matches!(
+            map_cli_runtime_error(RuntimeError::Output(OutputError::NotRegular)),
+            ChildOutcome::Failed("codex_image_output_not_regular")
+        ));
+        assert!(matches!(
+            map_cli_runtime_error(RuntimeError::Output(OutputError::TooLarge)),
+            ChildOutcome::Failed("codex_image_output_too_large")
+        ));
+        assert!(matches!(
+            map_cli_runtime_error(RuntimeError::Output(OutputError::ChangedDuringRead)),
+            ChildOutcome::Uncertain("codex_image_output_changed")
+        ));
+        assert!(matches!(
+            map_cli_runtime_error(RuntimeError::Output(OutputError::Unavailable(
+                std::io::Error::from(std::io::ErrorKind::NotFound),
+            ))),
+            ChildOutcome::Failed("codex_image_output_disappeared")
+        ));
     }
 
     #[test]
@@ -1034,6 +1247,14 @@ mod tests {
             .await
             .unwrap();
         child.await.unwrap();
+        let execution_root = fixture
+            .journal
+            .root_path()
+            .join(lease.executor_execution_id.simple().to_string());
+        assert!(!execution_root.join("codex-home").exists());
+        assert!(!execution_root.join("workspace").exists());
+        assert!(!execution_root.join("runtime-home").exists());
+        assert!(execution_root.join("output.bin").is_file());
         let replay = fixture
             .supervisor
             .start_or_attach(&lease, LaunchDecision::Attach)
@@ -1042,6 +1263,164 @@ mod tests {
 
         assert_eq!(first, replay);
         assert_eq!(fs::read_to_string(&fixture.invocations).unwrap(), "1\n");
+    }
+
+    #[tokio::test]
+    async fn captures_provider_output_before_codex_deletes_it_on_clean_exit() {
+        let fixture = CodexFixture::ephemeral_workspace_output(0);
+        let lease = fixture.lease();
+        let context = fixture.context(&lease);
+        let expected = fs::read(fixture._temp.path().join("source.png")).unwrap();
+        fixture.journal.start_or_attach(&lease).unwrap();
+        fixture.supervisor.prepare(&lease, &context).await.unwrap();
+        assert_eq!(
+            fixture.journal.commit_launch(&lease).unwrap(),
+            LaunchDecision::LaunchOnce
+        );
+        let spool = ExecutionSpool::for_lease(&fixture.journal, &lease).unwrap();
+
+        run_codex_runner_child(fixture.journal.root_path(), lease.executor_execution_id)
+            .await
+            .unwrap();
+
+        assert!(
+            fixture
+                ._temp
+                .path()
+                .join("provider-output-created")
+                .is_file()
+        );
+        assert!(
+            fixture
+                ._temp
+                .path()
+                .join("provider-output-deleted")
+                .is_file()
+        );
+        assert_eq!(
+            spool.observe().unwrap(),
+            ProcessObservation::Succeeded(SupervisedOutput::without_provider_cost(
+                expected.clone()
+            ))
+        );
+        let execution_root = fixture
+            .journal
+            .root_path()
+            .join(lease.executor_execution_id.simple().to_string());
+        assert_eq!(
+            fs::read(execution_root.join("output.bin")).unwrap(),
+            expected
+        );
+        assert!(!execution_root.join("codex-home").exists());
+        assert!(!execution_root.join("workspace").exists());
+        assert!(!execution_root.join("runtime-home").exists());
+        assert_eq!(fs::read_to_string(&fixture.invocations).unwrap(), "1\n");
+    }
+
+    #[tokio::test]
+    async fn captured_output_is_never_published_after_failed_codex_exit() {
+        let fixture = CodexFixture::ephemeral_workspace_output(1);
+        let lease = fixture.lease();
+        let context = fixture.context(&lease);
+        fixture.journal.start_or_attach(&lease).unwrap();
+        fixture.supervisor.prepare(&lease, &context).await.unwrap();
+        assert_eq!(
+            fixture.journal.commit_launch(&lease).unwrap(),
+            LaunchDecision::LaunchOnce
+        );
+        let spool = ExecutionSpool::for_lease(&fixture.journal, &lease).unwrap();
+
+        run_codex_runner_child(fixture.journal.root_path(), lease.executor_execution_id)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            spool.observe().unwrap(),
+            ProcessObservation::Failed {
+                error_code: "codex_cli_failed".to_string(),
+            }
+        );
+        let execution_root = fixture
+            .journal
+            .root_path()
+            .join(lease.executor_execution_id.simple().to_string());
+        assert!(!execution_root.join("output.bin").exists());
+    }
+
+    #[tokio::test]
+    async fn preexisting_workspace_output_is_never_attributed_to_a_new_process() {
+        let fixture = CodexFixture::new();
+        let lease = fixture.lease();
+        let context = fixture.context(&lease);
+        fixture.journal.start_or_attach(&lease).unwrap();
+        fixture.supervisor.prepare(&lease, &context).await.unwrap();
+        assert_eq!(
+            fixture.journal.commit_launch(&lease).unwrap(),
+            LaunchDecision::LaunchOnce
+        );
+        let spool = ExecutionSpool::for_lease(&fixture.journal, &lease).unwrap();
+        fs::copy(
+            fixture._temp.path().join("source.png"),
+            spool.workspace_path().unwrap().join("provider-output.png"),
+        )
+        .unwrap();
+
+        run_codex_runner_child(fixture.journal.root_path(), lease.executor_execution_id)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            spool.observe().unwrap(),
+            ProcessObservation::Uncertain {
+                error_code: "codex_workspace_output_preexisting".to_string(),
+            }
+        );
+        assert!(!fixture.invocations.exists());
+    }
+
+    #[tokio::test]
+    async fn capture_tracks_the_latest_stable_workspace_output_until_exit() {
+        let fixture = CodexFixture::changing_workspace_output();
+        let lease = fixture.lease();
+        let context = fixture.context(&lease);
+        let expected = fs::read(fixture._temp.path().join("source-2.png")).unwrap();
+        fixture.journal.start_or_attach(&lease).unwrap();
+        fixture.supervisor.prepare(&lease, &context).await.unwrap();
+        assert_eq!(
+            fixture.journal.commit_launch(&lease).unwrap(),
+            LaunchDecision::LaunchOnce
+        );
+        let spool = ExecutionSpool::for_lease(&fixture.journal, &lease).unwrap();
+
+        run_codex_runner_child(fixture.journal.root_path(), lease.executor_execution_id)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            spool.observe().unwrap(),
+            ProcessObservation::Succeeded(SupervisedOutput::without_provider_cost(expected))
+        );
+    }
+
+    #[tokio::test]
+    async fn helper_rejects_direct_execution_before_launch_commit() {
+        let fixture = CodexFixture::new();
+        let lease = fixture.lease();
+        let context = fixture.context(&lease);
+        fixture.journal.start_or_attach(&lease).unwrap();
+        fixture.supervisor.prepare(&lease, &context).await.unwrap();
+
+        assert!(
+            run_codex_runner_child(fixture.journal.root_path(), lease.executor_execution_id,)
+                .await
+                .is_err()
+        );
+        assert!(!fixture.invocations.exists());
+        let spool = ExecutionSpool::for_lease(&fixture.journal, &lease).unwrap();
+        assert!(matches!(
+            spool.observe().unwrap(),
+            ProcessObservation::AwaitingProcess
+        ));
     }
 
     #[test]
@@ -1139,7 +1518,7 @@ mod tests {
         fn new() -> Self {
             Self::with_script(|invocations, image, _root| {
                 format!(
-                    "#!/bin/sh\n/bin/cat >/dev/null\nprintf '1\\n' >> '{}'\n/bin/cp '{}' final.png\n",
+                    "#!/bin/sh\n/bin/cat >/dev/null\nprintf '1\\n' >> '{}'\n/bin/cp '{}' sealed-output.bin\n",
                     invocations.display(),
                     image.display()
                 )
@@ -1149,11 +1528,41 @@ mod tests {
         fn slow() -> Self {
             Self::with_script(|invocations, image, root| {
                 format!(
-                    "#!/bin/sh\n/bin/cat >/dev/null\nprintf '1\\n' >> '{}'\nprintf 'started\\n' > '{}'\n/bin/sleep 30\nprintf 'completed\\n' > '{}'\n/bin/cp '{}' final.png\n",
+                    "#!/bin/sh\n/bin/cat >/dev/null\nprintf '1\\n' >> '{}'\nprintf 'started\\n' > '{}'\n/bin/sleep 30\nprintf 'completed\\n' > '{}'\n/bin/cp '{}' sealed-output.bin\n",
                     invocations.display(),
                     root.join("provider-started").display(),
                     root.join("provider-completed").display(),
                     image.display()
+                )
+            })
+        }
+
+        fn ephemeral_workspace_output(exit_code: u8) -> Self {
+            Self::with_script(|invocations, image, root| {
+                format!(
+                    "#!/bin/sh\nset -eu\n/bin/cat >/dev/null\nprintf '1\\n' >> '{}'\nworkspace=''\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = '--cd' ]; then\n    shift\n    workspace=\"$1\"\n    break\n  fi\n  shift\ndone\ntest -n \"$workspace\"\n/bin/cp '{}' \"$workspace/provider-output.png\"\nprintf 'created\\n' > '{}'\n/bin/sleep 1\n/bin/rm \"$workspace/provider-output.png\"\nprintf 'deleted\\n' > '{}'\nexit {}\n",
+                    invocations.display(),
+                    image.display(),
+                    root.join("provider-output-created").display(),
+                    root.join("provider-output-deleted").display(),
+                    exit_code,
+                )
+            })
+        }
+
+        fn changing_workspace_output() -> Self {
+            Self::with_script(|invocations, image, root| {
+                let second = root.join("source-2.png");
+                let mut bytes = std::io::Cursor::new(Vec::new());
+                image::DynamicImage::new_rgb8(2, 1)
+                    .write_to(&mut bytes, image::ImageFormat::Png)
+                    .unwrap();
+                fs::write(&second, bytes.into_inner()).unwrap();
+                format!(
+                    "#!/bin/sh\nset -eu\n/bin/cat >/dev/null\nprintf '1\\n' >> '{}'\nworkspace=''\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = '--cd' ]; then\n    shift\n    workspace=\"$1\"\n    break\n  fi\n  shift\ndone\ntest -n \"$workspace\"\n/bin/cp '{}' \"$workspace/provider-output.png\"\n/bin/sleep 1\n/bin/cp '{}' \"$workspace/provider-output.png\"\n/bin/sleep 1\n/bin/rm \"$workspace/provider-output.png\"\nexit 0\n",
+                    invocations.display(),
+                    image.display(),
+                    second.display(),
                 )
             })
         }
@@ -1248,6 +1657,7 @@ mod tests {
                 command_schema: lease.command_schema.clone(),
                 command_hash: lease.command_hash.clone(),
                 command_json: serde_json::to_value(command).unwrap(),
+                inputs: Vec::new(),
             }
         }
     }

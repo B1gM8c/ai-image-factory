@@ -1,8 +1,19 @@
-use image_provider_contracts::openai_codex;
+use image_provider_contracts::{OperationDescriptor, openai_codex};
+use image_provider_dreamina_cli::{
+    ADAPTER_REVISION as DREAMINA_ADAPTER_REVISION, DREAMINA_IMAGE_GENERATION_OPERATION_V1,
+    DREAMINA_SUBMIT_COMMAND_SCHEMA, DREAMINA_VIDEO_GENERATION_OPERATION_V1,
+    PROVIDER_ID as DREAMINA_PROVIDER_ID,
+};
+use image_provider_grok_cli::{
+    ADAPTER_REVISION as GROK_ADAPTER_REVISION, GROK_IMAGE_EDIT_COMMAND_SCHEMA,
+    GROK_IMAGE_EDIT_OPERATION_V1, GROK_IMAGE_GENERATION_COMMAND_SCHEMA,
+    GROK_IMAGE_GENERATION_OPERATION_V1, GROK_VIDEO_GENERATION_COMMAND_SCHEMA,
+    GROK_VIDEO_GENERATION_OPERATION_V1, PROVIDER_ID as GROK_PROVIDER_ID,
+};
 use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
-use crate::admission::GENERATION_COMMAND_SCHEMA;
+use crate::admission::{EDIT_COMMAND_SCHEMA, GENERATION_COMMAND_SCHEMA};
 
 use super::CODEX_GENERATION_ADAPTER_REVISION;
 
@@ -10,9 +21,10 @@ const EXECUTION_CLASS: &str = "agentic-cli";
 const MAX_KEY_BYTES: usize = 128;
 const MAX_CREDENTIAL_REF_BYTES: usize = 1_024;
 const MAX_CONCURRENCY: i32 = 1_000_000;
+pub const CODEX_EDIT_INLINE_ADAPTER_REVISION: &str = "openai-codex-edit-inline-v1";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CodexExecutionProfileProvisioning {
+pub struct ExecutionProfileProvisioning {
     pub profile_key: String,
     pub credential_pool_key: String,
     pub provider_account_key: String,
@@ -23,7 +35,7 @@ pub struct CodexExecutionProfileProvisioning {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ProvisionedCodexExecutionProfile {
+pub struct ProvisionedExecutionProfile {
     pub execution_profile_id: Uuid,
     pub credential_pool_id: Uuid,
     pub provider_account_id: Uuid,
@@ -31,15 +43,26 @@ pub struct ProvisionedCodexExecutionProfile {
     pub resource_policy_revision: i64,
 }
 
+pub type CodexExecutionProfileProvisioning = ExecutionProfileProvisioning;
+pub type DreaminaExecutionProfileProvisioning = ExecutionProfileProvisioning;
+pub type GrokExecutionProfileProvisioning = ExecutionProfileProvisioning;
+pub type ProvisionedCodexExecutionProfile = ProvisionedExecutionProfile;
+pub type ProvisionedDreaminaExecutionProfile = ProvisionedExecutionProfile;
+pub type ProvisionedGrokExecutionProfile = ProvisionedExecutionProfile;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
-pub enum CodexProfileProvisioningError {
-    #[error("Codex execution profile provisioning input is invalid")]
+pub enum ExecutionProfileProvisioningError {
+    #[error("execution profile provisioning input is invalid")]
     InvalidInput,
-    #[error("Codex execution profile provisioning conflicts with durable identity")]
+    #[error("execution profile provisioning conflicts with durable identity")]
     Conflict,
-    #[error("Codex execution profile provisioning storage is unavailable")]
+    #[error("execution profile provisioning storage is unavailable")]
     Unavailable,
 }
+
+pub type CodexProfileProvisioningError = ExecutionProfileProvisioningError;
+pub type DreaminaProfileProvisioningError = ExecutionProfileProvisioningError;
+pub type GrokProfileProvisioningError = ExecutionProfileProvisioningError;
 
 #[derive(sqlx::FromRow)]
 struct CredentialPoolRow {
@@ -89,33 +112,240 @@ struct ExecutionProfileRow {
     state: String,
 }
 
+#[derive(Clone, Copy)]
+struct ProvisioningBinding {
+    provider_id: &'static str,
+    command_schema: &'static str,
+    operation: &'static OperationDescriptor,
+    adapter_revision: &'static str,
+    advisory_lock_key: &'static str,
+}
+
 pub async fn provision_codex_execution_profile(
     pool: &PgPool,
     provisioning: &CodexExecutionProfileProvisioning,
 ) -> Result<ProvisionedCodexExecutionProfile, CodexProfileProvisioningError> {
-    validate(provisioning)?;
-    let mut tx = pool.begin().await.map_err(map_sql_error)?;
-    sqlx::query(
-        "SELECT pg_advisory_xact_lock(hashtextextended('factoryctl.provision-codex-profile', 0))",
-    )
-    .execute(&mut *tx)
-    .await
-    .map_err(map_sql_error)?;
-    let now = database_now(&mut tx).await?;
-    let credential_pool_id = ensure_pool(&mut tx, provisioning, now).await?;
-    let provider_account_id =
-        ensure_account(&mut tx, provisioning, credential_pool_id, now).await?;
-    let (resource_policy_id, resource_policy_revision) = ensure_policy(
-        &mut tx,
+    provision_execution_profile(pool, provisioning, codex_provisioning_binding()?).await
+}
+
+pub async fn provision_codex_execution_profile_in_transaction(
+    tx: &mut Transaction<'_, Postgres>,
+    provisioning: &CodexExecutionProfileProvisioning,
+) -> Result<ProvisionedCodexExecutionProfile, CodexProfileProvisioningError> {
+    provision_execution_profile_in_transaction(tx, provisioning, codex_provisioning_binding()?)
+        .await
+}
+
+pub async fn provision_codex_edit_execution_profile_in_transaction(
+    tx: &mut Transaction<'_, Postgres>,
+    provisioning: &CodexExecutionProfileProvisioning,
+) -> Result<ProvisionedCodexExecutionProfile, CodexProfileProvisioningError> {
+    provision_execution_profile_in_transaction(tx, provisioning, codex_edit_provisioning_binding()?)
+        .await
+}
+
+pub async fn provision_grok_execution_profile(
+    pool: &PgPool,
+    provisioning: &GrokExecutionProfileProvisioning,
+) -> Result<ProvisionedGrokExecutionProfile, GrokProfileProvisioningError> {
+    provision_execution_profile(
+        pool,
         provisioning,
+        ProvisioningBinding {
+            provider_id: GROK_PROVIDER_ID,
+            command_schema: GROK_IMAGE_GENERATION_COMMAND_SCHEMA,
+            operation: &GROK_IMAGE_GENERATION_OPERATION_V1,
+            adapter_revision: GROK_ADAPTER_REVISION,
+            advisory_lock_key: "factoryctl.provision-grok-profile",
+        },
+    )
+    .await
+}
+
+pub async fn provision_grok_execution_profile_in_transaction(
+    tx: &mut Transaction<'_, Postgres>,
+    provisioning: &GrokExecutionProfileProvisioning,
+) -> Result<ProvisionedGrokExecutionProfile, GrokProfileProvisioningError> {
+    provision_execution_profile_in_transaction(
+        tx,
+        provisioning,
+        ProvisioningBinding {
+            provider_id: GROK_PROVIDER_ID,
+            command_schema: GROK_IMAGE_GENERATION_COMMAND_SCHEMA,
+            operation: &GROK_IMAGE_GENERATION_OPERATION_V1,
+            adapter_revision: GROK_ADAPTER_REVISION,
+            advisory_lock_key: "factoryctl.provision-grok-profile",
+        },
+    )
+    .await
+}
+
+pub async fn provision_grok_edit_execution_profile(
+    pool: &PgPool,
+    provisioning: &GrokExecutionProfileProvisioning,
+) -> Result<ProvisionedGrokExecutionProfile, GrokProfileProvisioningError> {
+    provision_execution_profile(
+        pool,
+        provisioning,
+        ProvisioningBinding {
+            provider_id: GROK_PROVIDER_ID,
+            command_schema: GROK_IMAGE_EDIT_COMMAND_SCHEMA,
+            operation: &GROK_IMAGE_EDIT_OPERATION_V1,
+            adapter_revision: GROK_ADAPTER_REVISION,
+            advisory_lock_key: "factoryctl.provision-grok-edit-profile",
+        },
+    )
+    .await
+}
+
+pub async fn provision_grok_edit_execution_profile_in_transaction(
+    tx: &mut Transaction<'_, Postgres>,
+    provisioning: &GrokExecutionProfileProvisioning,
+) -> Result<ProvisionedGrokExecutionProfile, GrokProfileProvisioningError> {
+    provision_execution_profile_in_transaction(
+        tx,
+        provisioning,
+        ProvisioningBinding {
+            provider_id: GROK_PROVIDER_ID,
+            command_schema: GROK_IMAGE_EDIT_COMMAND_SCHEMA,
+            operation: &GROK_IMAGE_EDIT_OPERATION_V1,
+            adapter_revision: GROK_ADAPTER_REVISION,
+            advisory_lock_key: "factoryctl.provision-grok-edit-profile",
+        },
+    )
+    .await
+}
+
+pub async fn provision_grok_video_execution_profile(
+    pool: &PgPool,
+    provisioning: &GrokExecutionProfileProvisioning,
+) -> Result<ProvisionedGrokExecutionProfile, GrokProfileProvisioningError> {
+    provision_execution_profile(
+        pool,
+        provisioning,
+        ProvisioningBinding {
+            provider_id: GROK_PROVIDER_ID,
+            command_schema: GROK_VIDEO_GENERATION_COMMAND_SCHEMA,
+            operation: &GROK_VIDEO_GENERATION_OPERATION_V1,
+            adapter_revision: GROK_ADAPTER_REVISION,
+            advisory_lock_key: "factoryctl.provision-grok-video-profile",
+        },
+    )
+    .await
+}
+
+pub async fn provision_grok_video_execution_profile_in_transaction(
+    tx: &mut Transaction<'_, Postgres>,
+    provisioning: &GrokExecutionProfileProvisioning,
+) -> Result<ProvisionedGrokExecutionProfile, GrokProfileProvisioningError> {
+    provision_execution_profile_in_transaction(
+        tx,
+        provisioning,
+        ProvisioningBinding {
+            provider_id: GROK_PROVIDER_ID,
+            command_schema: GROK_VIDEO_GENERATION_COMMAND_SCHEMA,
+            operation: &GROK_VIDEO_GENERATION_OPERATION_V1,
+            adapter_revision: GROK_ADAPTER_REVISION,
+            advisory_lock_key: "factoryctl.provision-grok-video-profile",
+        },
+    )
+    .await
+}
+
+pub async fn provision_dreamina_execution_profile(
+    pool: &PgPool,
+    provisioning: &DreaminaExecutionProfileProvisioning,
+) -> Result<ProvisionedDreaminaExecutionProfile, DreaminaProfileProvisioningError> {
+    provision_execution_profile(pool, provisioning, dreamina_provisioning_binding()).await
+}
+
+pub async fn provision_dreamina_execution_profile_in_transaction(
+    tx: &mut Transaction<'_, Postgres>,
+    provisioning: &DreaminaExecutionProfileProvisioning,
+) -> Result<ProvisionedDreaminaExecutionProfile, DreaminaProfileProvisioningError> {
+    provision_execution_profile_in_transaction(tx, provisioning, dreamina_provisioning_binding())
+        .await
+}
+
+pub async fn provision_dreamina_video_execution_profile(
+    pool: &PgPool,
+    provisioning: &DreaminaExecutionProfileProvisioning,
+) -> Result<ProvisionedDreaminaExecutionProfile, DreaminaProfileProvisioningError> {
+    provision_execution_profile(pool, provisioning, dreamina_video_provisioning_binding()).await
+}
+
+pub async fn provision_dreamina_video_execution_profile_in_transaction(
+    tx: &mut Transaction<'_, Postgres>,
+    provisioning: &DreaminaExecutionProfileProvisioning,
+) -> Result<ProvisionedDreaminaExecutionProfile, DreaminaProfileProvisioningError> {
+    provision_execution_profile_in_transaction(
+        tx,
+        provisioning,
+        dreamina_video_provisioning_binding(),
+    )
+    .await
+}
+
+fn dreamina_provisioning_binding() -> ProvisioningBinding {
+    ProvisioningBinding {
+        provider_id: DREAMINA_PROVIDER_ID,
+        command_schema: DREAMINA_SUBMIT_COMMAND_SCHEMA,
+        operation: &DREAMINA_IMAGE_GENERATION_OPERATION_V1,
+        adapter_revision: DREAMINA_ADAPTER_REVISION,
+        advisory_lock_key: "factoryctl.provision-dreamina-profile",
+    }
+}
+
+fn dreamina_video_provisioning_binding() -> ProvisioningBinding {
+    ProvisioningBinding {
+        provider_id: DREAMINA_PROVIDER_ID,
+        command_schema: DREAMINA_SUBMIT_COMMAND_SCHEMA,
+        operation: &DREAMINA_VIDEO_GENERATION_OPERATION_V1,
+        adapter_revision: DREAMINA_ADAPTER_REVISION,
+        advisory_lock_key: "factoryctl.provision-dreamina-video-profile",
+    }
+}
+
+async fn provision_execution_profile(
+    pool: &PgPool,
+    provisioning: &CodexExecutionProfileProvisioning,
+    binding: ProvisioningBinding,
+) -> Result<ProvisionedCodexExecutionProfile, CodexProfileProvisioningError> {
+    let mut tx = pool.begin().await.map_err(map_sql_error)?;
+    let provisioned =
+        provision_execution_profile_in_transaction(&mut tx, provisioning, binding).await?;
+    tx.commit().await.map_err(map_sql_error)?;
+    Ok(provisioned)
+}
+
+async fn provision_execution_profile_in_transaction(
+    tx: &mut Transaction<'_, Postgres>,
+    provisioning: &CodexExecutionProfileProvisioning,
+    binding: ProvisioningBinding,
+) -> Result<ProvisionedCodexExecutionProfile, CodexProfileProvisioningError> {
+    validate(provisioning)?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(binding.advisory_lock_key)
+        .execute(&mut **tx)
+        .await
+        .map_err(map_sql_error)?;
+    let now = database_now(tx).await?;
+    let credential_pool_id = ensure_pool(tx, provisioning, binding, now).await?;
+    let provider_account_id =
+        ensure_account(tx, provisioning, binding, credential_pool_id, now).await?;
+    let (resource_policy_id, resource_policy_revision) = ensure_policy(
+        tx,
+        provisioning,
+        binding,
         credential_pool_id,
         provider_account_id,
         now,
     )
     .await?;
     let execution_profile_id = ensure_profile(
-        &mut tx,
+        tx,
         provisioning,
+        binding,
         credential_pool_id,
         provider_account_id,
         resource_policy_id,
@@ -123,7 +353,7 @@ pub async fn provision_codex_execution_profile(
         now,
     )
     .await?;
-    tx.commit().await.map_err(map_sql_error)?;
+    ensure_account_operation(tx, provider_account_id, binding, now).await?;
     Ok(ProvisionedCodexExecutionProfile {
         execution_profile_id,
         credential_pool_id,
@@ -133,9 +363,59 @@ pub async fn provision_codex_execution_profile(
     })
 }
 
+async fn ensure_account_operation(
+    tx: &mut Transaction<'_, Postgres>,
+    provider_account_id: Uuid,
+    binding: ProvisioningBinding,
+    now: i64,
+) -> Result<(), CodexProfileProvisioningError> {
+    sqlx::query(
+        r#"
+        INSERT INTO provider_account_operations
+          (provider_account_id, provider_id, operation_id, state, created_at_ms, updated_at_ms)
+        VALUES ($1, $2, $3, 'enabled', $4, $4)
+        ON CONFLICT (provider_account_id, operation_id) DO UPDATE
+        SET state = 'enabled', updated_at_ms = EXCLUDED.updated_at_ms
+        "#,
+    )
+    .bind(provider_account_id)
+    .bind(binding.provider_id)
+    .bind(binding.operation.id)
+    .bind(now)
+    .execute(&mut **tx)
+    .await
+    .map_err(map_sql_error)?;
+    Ok(())
+}
+
+fn codex_provisioning_binding() -> Result<ProvisioningBinding, CodexProfileProvisioningError> {
+    let operation = openai_codex::operation("images.generations")
+        .ok_or(CodexProfileProvisioningError::Conflict)?;
+    Ok(ProvisioningBinding {
+        provider_id: openai_codex::PROVIDER_ID,
+        command_schema: GENERATION_COMMAND_SCHEMA,
+        operation,
+        adapter_revision: CODEX_GENERATION_ADAPTER_REVISION,
+        advisory_lock_key: "factoryctl.provision-codex-profile",
+    })
+}
+
+fn codex_edit_provisioning_binding() -> Result<ProvisioningBinding, CodexProfileProvisioningError> {
+    let operation =
+        openai_codex::operation("images.edits").ok_or(CodexProfileProvisioningError::Conflict)?;
+    Ok(ProvisioningBinding {
+        provider_id: openai_codex::PROVIDER_ID,
+        command_schema: EDIT_COMMAND_SCHEMA,
+        operation,
+        adapter_revision: CODEX_EDIT_INLINE_ADAPTER_REVISION,
+        advisory_lock_key: "factoryctl.provision-codex-edit-profile",
+    })
+}
+
 async fn ensure_pool(
     tx: &mut Transaction<'_, Postgres>,
     provisioning: &CodexExecutionProfileProvisioning,
+    binding: ProvisioningBinding,
     now: i64,
 ) -> Result<Uuid, CodexProfileProvisioningError> {
     let existing: Option<CredentialPoolRow> = sqlx::query_as(
@@ -151,7 +431,7 @@ async fn ensure_pool(
     .await
     .map_err(map_sql_error)?;
     let credential_pool_id = if let Some(existing) = existing {
-        if existing.provider_id != openai_codex::PROVIDER_ID || existing.state != "enabled" {
+        if existing.provider_id != binding.provider_id || existing.state != "enabled" {
             return Err(CodexProfileProvisioningError::Conflict);
         }
         existing.credential_pool_id
@@ -167,7 +447,7 @@ async fn ensure_pool(
         )
         .bind(credential_pool_id)
         .bind(&provisioning.credential_pool_key)
-        .bind(openai_codex::PROVIDER_ID)
+        .bind(binding.provider_id)
         .bind(now)
         .execute(&mut **tx)
         .await
@@ -180,6 +460,7 @@ async fn ensure_pool(
 async fn ensure_account(
     tx: &mut Transaction<'_, Postgres>,
     provisioning: &CodexExecutionProfileProvisioning,
+    binding: ProvisioningBinding,
     credential_pool_id: Uuid,
     now: i64,
 ) -> Result<Uuid, CodexProfileProvisioningError> {
@@ -198,7 +479,7 @@ async fn ensure_account(
     .await
     .map_err(map_sql_error)?;
     let provider_account_id = if let Some(existing) = existing {
-        if existing.provider_id != openai_codex::PROVIDER_ID
+        if existing.provider_id != binding.provider_id
             || existing.credential_ref != provisioning.credential_ref
             || existing.credential_revision != provisioning.credential_revision
             || existing.credential_auth_sha256 != provisioning.credential_auth_sha256
@@ -220,7 +501,7 @@ async fn ensure_account(
         )
         .bind(provider_account_id)
         .bind(credential_pool_id)
-        .bind(openai_codex::PROVIDER_ID)
+        .bind(binding.provider_id)
         .bind(&provisioning.provider_account_key)
         .bind(&provisioning.credential_ref)
         .bind(provisioning.credential_revision)
@@ -237,6 +518,7 @@ async fn ensure_account(
 async fn ensure_policy(
     tx: &mut Transaction<'_, Postgres>,
     provisioning: &CodexExecutionProfileProvisioning,
+    binding: ProvisioningBinding,
     credential_pool_id: Uuid,
     provider_account_id: Uuid,
     now: i64,
@@ -259,7 +541,7 @@ async fn ensure_policy(
         .iter()
         .filter(|policy| {
             policy.credential_pool_id == credential_pool_id
-                && policy.provider_id == openai_codex::PROVIDER_ID
+                && policy.provider_id == binding.provider_id
                 && policy.execution_class == EXECUTION_CLASS
                 && policy.max_concurrency == provisioning.max_concurrency
         })
@@ -291,7 +573,7 @@ async fn ensure_policy(
             .bind(resource_policy_id)
             .bind(credential_pool_id)
             .bind(provider_account_id)
-            .bind(openai_codex::PROVIDER_ID)
+            .bind(binding.provider_id)
             .bind(EXECUTION_CLASS)
             .bind(provisioning.max_concurrency)
             .bind(now)
@@ -309,14 +591,14 @@ async fn ensure_policy(
 async fn ensure_profile(
     tx: &mut Transaction<'_, Postgres>,
     provisioning: &CodexExecutionProfileProvisioning,
+    binding: ProvisioningBinding,
     credential_pool_id: Uuid,
     provider_account_id: Uuid,
     resource_policy_id: Uuid,
     resource_policy_revision: i64,
     now: i64,
 ) -> Result<Uuid, CodexProfileProvisioningError> {
-    let operation = openai_codex::operation("images.generations")
-        .ok_or(CodexProfileProvisioningError::Conflict)?;
+    let operation = binding.operation;
     let operation_descriptor_sha256_v1 = operation.canonical_sha256_v1_hex();
     let existing: Option<ExecutionProfileRow> = sqlx::query_as(
         r#"
@@ -337,14 +619,14 @@ async fn ensure_profile(
     .await
     .map_err(map_sql_error)?;
     let execution_profile_id = if let Some(existing) = existing {
-        if existing.provider_id != openai_codex::PROVIDER_ID
-            || existing.command_schema != GENERATION_COMMAND_SCHEMA
+        if existing.provider_id != binding.provider_id
+            || existing.command_schema != binding.command_schema
             || existing.operation_id != operation.id
             || existing.operation_descriptor_revision != operation.descriptor_revision
             || existing.operation_descriptor_sha256_v1 != operation_descriptor_sha256_v1
             || existing.completion_mode != operation.completion.as_str()
             || existing.idempotency_mode != operation.idempotency.as_str()
-            || existing.adapter_revision != CODEX_GENERATION_ADAPTER_REVISION
+            || existing.adapter_revision != binding.adapter_revision
             || existing.credential_pool_id != credential_pool_id
             || existing.provider_account_id != provider_account_id
             || existing.credential_ref != provisioning.credential_ref
@@ -373,14 +655,14 @@ async fn ensure_profile(
         )
         .bind(execution_profile_id)
         .bind(&provisioning.profile_key)
-        .bind(openai_codex::PROVIDER_ID)
-        .bind(GENERATION_COMMAND_SCHEMA)
+        .bind(binding.provider_id)
+        .bind(binding.command_schema)
         .bind(operation.id)
         .bind(operation.descriptor_revision)
         .bind(&operation_descriptor_sha256_v1)
         .bind(operation.completion.as_str())
         .bind(operation.idempotency.as_str())
-        .bind(CODEX_GENERATION_ADAPTER_REVISION)
+        .bind(binding.adapter_revision)
         .bind(credential_pool_id)
         .bind(provider_account_id)
         .bind(&provisioning.credential_ref)

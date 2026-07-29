@@ -10,8 +10,9 @@ use axum::{
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use gpt_image_2_gateway::{
-    AppConfig, EditJob, GeneratedImage, GenerationJob, ImageGatewayError, ImageGenerator,
-    InMemoryApiKeyStore, InMemoryUsageStore, build_router, build_router_with_api_key_store,
+    ApiKeyPermissionMode, ApiKeyPermissions, ApiKeyStore, AppConfig, EditJob, GeneratedImage,
+    GenerationJob, ImageGatewayError, ImageGenerator, InMemoryApiKeyStore, InMemoryUsageStore,
+    build_router, build_router_with_api_key_store,
 };
 use image::{ImageBuffer, ImageFormat, Rgba};
 use serde_json::{Value, json};
@@ -172,10 +173,14 @@ fn config() -> AppConfig {
         bind: "127.0.0.1:0".parse().unwrap(),
         auth_token: Some("test-token".to_string()),
         admin_token: Some("admin-token".to_string()),
+        legacy_admin_auth_enabled: true,
         database_url: None,
         generation_admission_contract: Default::default(),
+        enable_xai_video_api: false,
         five_hour_image_limit: 10,
         seven_day_image_limit: 50,
+        five_hour_video_second_limit: i32::MAX as u32,
+        seven_day_video_second_limit: i32::MAX as u32,
         max_concurrent_jobs: 2,
         max_queue_size: 4,
         max_concurrent_jobs_per_tenant: 2,
@@ -303,6 +308,43 @@ async fn send_edit_multipart(
     (status, headers, json)
 }
 
+async fn send_file_multipart(
+    app: axum::Router,
+    purpose: &str,
+    filename: &str,
+    contents: &[u8],
+) -> (StatusCode, Value) {
+    let boundary = "x-file-boundary";
+    let mut body = format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"purpose\"\r\n\r\n{purpose}\r\n\
+         --{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{filename}\"\r\n\
+         Content-Type: application/octet-stream\r\n\r\n"
+    )
+    .into_bytes();
+    body.extend_from_slice(contents);
+    body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/files")
+                .header(header::AUTHORIZATION, "Bearer test-token")
+                .header(
+                    header::CONTENT_TYPE,
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let json = serde_json::from_slice(&bytes).unwrap();
+    (status, json)
+}
+
 async fn send_edit_json(
     app: axum::Router,
     token: Option<&str>,
@@ -384,27 +426,22 @@ async fn post_json_to(
     (status, headers, json)
 }
 
-async fn delete_with_token(
-    app: axum::Router,
-    uri: &str,
-    token: Option<&str>,
-) -> (StatusCode, axum::http::HeaderMap, Value) {
-    let mut builder = Request::builder().method(Method::DELETE).uri(uri);
-
-    if let Some(token) = token {
-        builder = builder.header(header::AUTHORIZATION, format!("Bearer {token}"));
-    }
-
-    let response = app
-        .oneshot(builder.body(Body::empty()).unwrap())
+async fn seed_service_account(
+    key_store: &InMemoryApiKeyStore,
+    project_name: &str,
+    account_name: &str,
+) -> (String, String, String) {
+    let project = key_store.create_project(project_name).await.unwrap();
+    let account = key_store
+        .create_service_account(
+            &project.id,
+            account_name,
+            ApiKeyPermissionMode::All,
+            ApiKeyPermissions::default(),
+        )
         .await
         .unwrap();
-    let status = response.status();
-    let headers = response.headers().clone();
-    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-    let json = serde_json::from_slice(&bytes).unwrap();
-
-    (status, headers, json)
+    (project.id, account.id, account.api_key.value)
 }
 
 async fn get(app: axum::Router, uri: &str) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
@@ -465,6 +502,110 @@ async fn liveness_stays_dependency_free_and_in_memory_readiness_is_empty() {
             }
         })
     );
+}
+
+#[tokio::test]
+async fn xai_video_api_routes_are_default_off_and_explicitly_registered() {
+    let video_routes = [
+        (Method::POST, "/v1/videos/generations"),
+        (
+            Method::GET,
+            "/v1/videos/00000000-0000-4000-8000-000000000001",
+        ),
+    ];
+    for (method, uri) in &video_routes {
+        let response = build_router(config(), Arc::new(FakeGenerator::default()), usage_store())
+            .oneshot(
+                Request::builder()
+                    .method(method.clone())
+                    .uri(*uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{method} {uri}");
+    }
+
+    let shared_file_response =
+        build_router(config(), Arc::new(FakeGenerator::default()), usage_store())
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/v1/files/00000000-0000-4000-8000-000000000001/content")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+    assert_eq!(shared_file_response.status(), StatusCode::UNAUTHORIZED);
+
+    let mut enabled = config();
+    enabled.enable_xai_video_api = true;
+    for (method, uri) in &video_routes {
+        let response = build_router(
+            enabled.clone(),
+            Arc::new(FakeGenerator::default()),
+            usage_store(),
+        )
+        .oneshot(
+            Request::builder()
+                .method(method.clone())
+                .uri(*uri)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "{method} {uri}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn dreamina_native_and_ark_media_routes_are_always_registered() {
+    let routes = [
+        (Method::POST, "/v1/dreamina/images/generations"),
+        (Method::POST, "/v1/dreamina/videos/generations"),
+        (
+            Method::GET,
+            "/v1/dreamina/videos/00000000-0000-4000-8000-000000000001",
+        ),
+        (
+            Method::GET,
+            "/v1/dreamina/files/00000000-0000-4000-8000-000000000001/content",
+        ),
+        (Method::POST, "/api/v3/images/generations"),
+        (Method::POST, "/api/v3/contents/generations/tasks"),
+        (
+            Method::GET,
+            "/api/v3/contents/generations/tasks/cgt-00000000-0000-4000-8000-000000000001",
+        ),
+        (
+            Method::GET,
+            "/api/v3/files/00000000-0000-4000-8000-000000000001/content",
+        ),
+    ];
+    for (method, uri) in routes {
+        let response = build_router(config(), Arc::new(FakeGenerator::default()), usage_store())
+            .oneshot(
+                Request::builder()
+                    .method(method.clone())
+                    .uri(uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "{method} {uri}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -537,7 +678,7 @@ async fn generation_auto_size_reports_actual_dimensions_and_opaque_background() 
 }
 
 #[tokio::test]
-async fn generation_rejects_returned_png_with_wrong_dimensions() {
+async fn generation_accepts_native_dimensions_with_the_requested_aspect_ratio() {
     let fake = FakeGenerator {
         calls: Arc::default(),
         delay: Duration::ZERO,
@@ -558,15 +699,8 @@ async fn generation_rejects_returned_png_with_wrong_dimensions() {
     )
     .await;
 
-    assert_eq!(status, StatusCode::BAD_GATEWAY);
-    assert_eq!(body["error"]["type"], "server_error");
-    assert_eq!(body["error"]["code"], "image_generation_failed");
-    assert!(
-        body["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("not the requested 1024x1024")
-    );
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["size"], "1254x1254");
 }
 
 #[tokio::test]
@@ -1084,37 +1218,21 @@ async fn models_response_lists_active_provider_models() {
 }
 
 #[tokio::test]
-async fn admin_can_create_project_service_account_api_key_and_use_it() {
+async fn project_service_account_api_key_can_generate_for_its_project() {
     let key_store = Arc::new(InMemoryApiKeyStore::default());
+    let (project_id, _service_account_id, api_key) =
+        seed_service_account(key_store.as_ref(), "Production", "Production App").await;
     let app = build_router_with_api_key_store(
         config(),
         Arc::new(FakeGenerator::default()),
         usage_store(),
         key_store,
     );
-
-    let (create_status, create_headers, created) = post_json_to(
-        app.clone(),
-        "/v1/organization/projects/proj_alpha/service_accounts",
-        Some("admin-token"),
-        json!({ "name": "Production App" }),
-    )
-    .await;
-
-    assert_eq!(create_status, StatusCode::OK);
-    assert_request_id(&create_headers);
-    assert_eq!(created["object"], "organization.project.service_account");
-    assert_eq!(created["role"], "member");
-    assert_eq!(
-        created["api_key"]["object"],
-        "organization.project.service_account.api_key"
-    );
-    let api_key = created["api_key"]["value"].as_str().unwrap();
     assert!(api_key.starts_with("sk-gw-"));
 
     let (status, headers, body) = send_json(
         app,
-        Some(api_key),
+        Some(&api_key),
         json!({
             "model": "gpt-image-2",
             "prompt": "tenant scoped image"
@@ -1123,7 +1241,7 @@ async fn admin_can_create_project_service_account_api_key_and_use_it() {
     .await;
 
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(headers["openai-project"], "proj_alpha");
+    assert_eq!(headers["openai-project"], project_id);
     assert_eq!(headers["x-ratelimit-limit-5h"], "10");
     assert_eq!(headers["x-ratelimit-remaining-5h"], "9");
     assert!(body["data"][0]["b64_json"].as_str().is_some());
@@ -1153,33 +1271,39 @@ async fn image_api_token_does_not_authorize_admin_requests() {
 }
 
 #[tokio::test]
-async fn deleted_project_api_key_cannot_be_used_again() {
+async fn legacy_admin_token_cannot_read_platform_admin_data() {
+    let app = build_router(config(), Arc::new(FakeGenerator::default()), usage_store());
+
+    let (status, headers, body) =
+        get_with_token(app, "/admin/v1/overview", Some("admin-token")).await;
+    let body: Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_request_id(&headers);
+    assert_eq!(body["error"]["type"], "authentication_error");
+    assert_eq!(body["error"]["code"], "invalid_api_key");
+}
+
+#[tokio::test]
+async fn deleted_project_service_account_keys_cannot_be_used_again() {
     let key_store = Arc::new(InMemoryApiKeyStore::default());
+    let (project_id, service_account_id, api_key) =
+        seed_service_account(key_store.as_ref(), "Temporary", "Temporary App").await;
     let app = build_router_with_api_key_store(
         config(),
         Arc::new(FakeGenerator::default()),
         usage_store(),
-        key_store,
+        key_store.clone(),
     );
-    let (_create_status, _headers, created) = post_json_to(
-        app.clone(),
-        "/v1/organization/projects/proj_alpha/service_accounts",
-        Some("admin-token"),
-        json!({ "name": "Temporary App" }),
-    )
-    .await;
-    let key_id = created["api_key"]["id"].as_str().unwrap();
-    let api_key = created["api_key"]["value"].as_str().unwrap().to_string();
-
-    let (delete_status, _headers, deleted) = delete_with_token(
-        app.clone(),
-        &format!("/v1/organization/projects/proj_alpha/api_keys/{key_id}"),
-        Some("admin-token"),
-    )
-    .await;
-    assert_eq!(delete_status, StatusCode::OK);
-    assert_eq!(deleted["object"], "organization.project.api_key.deleted");
-    assert_eq!(deleted["deleted"], true);
+    let deleted = key_store
+        .delete_service_account(&project_id, &service_account_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        deleted.object,
+        "organization.project.service_account.deleted"
+    );
+    assert!(deleted.deleted);
 
     let (status, _headers, body) = send_json(
         app,
@@ -1196,57 +1320,15 @@ async fn deleted_project_api_key_cannot_be_used_again() {
 }
 
 #[tokio::test]
-async fn project_api_key_list_redacts_secret_values() {
-    let app = build_router_with_api_key_store(
-        config(),
-        Arc::new(FakeGenerator::default()),
-        usage_store(),
-        Arc::new(InMemoryApiKeyStore::default()),
-    );
-    let (_create_status, _headers, created) = post_json_to(
-        app.clone(),
-        "/v1/organization/projects/proj_alpha/service_accounts",
-        Some("admin-token"),
-        json!({ "name": "Listable App" }),
-    )
-    .await;
-    let api_key = created["api_key"]["value"].as_str().unwrap();
-    let key_id = created["api_key"]["id"].as_str().unwrap();
-
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method(Method::GET)
-                .uri("/v1/organization/projects/proj_alpha/api_keys?limit=20")
-                .header(header::AUTHORIZATION, "Bearer admin-token")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let status = response.status();
-    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-    let body: Value = serde_json::from_slice(&bytes).unwrap();
-
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["object"], "list");
-    assert_eq!(body["data"][0]["id"], key_id);
-    assert!(
-        body["data"][0]["redacted_value"]
-            .as_str()
-            .unwrap()
-            .starts_with("sk-gw-...")
-    );
-    assert_ne!(body["data"][0]["redacted_value"], api_key);
-    assert!(body["data"][0].get("value").is_none());
-}
-
-#[tokio::test]
 async fn tenant_usage_limits_are_isolated_by_api_key_project() {
     let mut cfg = config();
     cfg.five_hour_image_limit = 1;
     cfg.seven_day_image_limit = 1;
     let key_store = Arc::new(InMemoryApiKeyStore::default());
+    let (_alpha_project, _alpha_account, alpha_key) =
+        seed_service_account(key_store.as_ref(), "Alpha", "Alpha").await;
+    let (beta_project, _beta_account, beta_key) =
+        seed_service_account(key_store.as_ref(), "Beta", "Beta").await;
     let app = build_router_with_api_key_store(
         cfg,
         Arc::new(FakeGenerator::default()),
@@ -1254,26 +1336,9 @@ async fn tenant_usage_limits_are_isolated_by_api_key_project() {
         key_store,
     );
 
-    let (_status, _headers, alpha) = post_json_to(
-        app.clone(),
-        "/v1/organization/projects/proj_alpha/service_accounts",
-        Some("admin-token"),
-        json!({ "name": "Alpha" }),
-    )
-    .await;
-    let (_status, _headers, beta) = post_json_to(
-        app.clone(),
-        "/v1/organization/projects/proj_beta/service_accounts",
-        Some("admin-token"),
-        json!({ "name": "Beta" }),
-    )
-    .await;
-    let alpha_key = alpha["api_key"]["value"].as_str().unwrap();
-    let beta_key = beta["api_key"]["value"].as_str().unwrap();
-
     let (alpha_first, _headers, _body) = send_json(
         app.clone(),
-        Some(alpha_key),
+        Some(&alpha_key),
         json!({ "model": "gpt-image-2", "prompt": "alpha first" }),
     )
     .await;
@@ -1281,7 +1346,7 @@ async fn tenant_usage_limits_are_isolated_by_api_key_project() {
 
     let (alpha_second, _headers, alpha_error) = send_json(
         app.clone(),
-        Some(alpha_key),
+        Some(&alpha_key),
         json!({ "model": "gpt-image-2", "prompt": "alpha second" }),
     )
     .await;
@@ -1290,12 +1355,12 @@ async fn tenant_usage_limits_are_isolated_by_api_key_project() {
 
     let (beta_status, beta_headers, _body) = send_json(
         app,
-        Some(beta_key),
+        Some(&beta_key),
         json!({ "model": "gpt-image-2", "prompt": "beta still has quota" }),
     )
     .await;
     assert_eq!(beta_status, StatusCode::OK);
-    assert_eq!(beta_headers["openai-project"], "proj_beta");
+    assert_eq!(beta_headers["openai-project"], beta_project);
 }
 
 #[tokio::test]
@@ -1354,6 +1419,10 @@ async fn tenant_concurrency_pool_is_isolated_from_other_tenants() {
     cfg.queue_timeout = Duration::from_millis(20);
 
     let key_store = Arc::new(InMemoryApiKeyStore::default());
+    let (_alpha_project, _alpha_account, alpha_key) =
+        seed_service_account(key_store.as_ref(), "Alpha", "Alpha").await;
+    let (beta_project, _beta_account, beta_key) =
+        seed_service_account(key_store.as_ref(), "Beta", "Beta").await;
     let app = build_router_with_api_key_store(
         cfg,
         Arc::new(FakeGenerator {
@@ -1365,23 +1434,6 @@ async fn tenant_concurrency_pool_is_isolated_from_other_tenants() {
         usage_store(),
         key_store,
     );
-
-    let (_status, _headers, alpha) = post_json_to(
-        app.clone(),
-        "/v1/organization/projects/proj_alpha/service_accounts",
-        Some("admin-token"),
-        json!({ "name": "Alpha" }),
-    )
-    .await;
-    let (_status, _headers, beta) = post_json_to(
-        app.clone(),
-        "/v1/organization/projects/proj_beta/service_accounts",
-        Some("admin-token"),
-        json!({ "name": "Beta" }),
-    )
-    .await;
-    let alpha_key = alpha["api_key"]["value"].as_str().unwrap().to_string();
-    let beta_key = beta["api_key"]["value"].as_str().unwrap().to_string();
 
     let first_alpha_app = app.clone();
     let first_alpha_key = alpha_key.clone();
@@ -1411,7 +1463,7 @@ async fn tenant_concurrency_pool_is_isolated_from_other_tenants() {
     )
     .await;
     assert_eq!(beta_status, StatusCode::OK);
-    assert_eq!(beta_headers["openai-project"], "proj_beta");
+    assert_eq!(beta_headers["openai-project"], beta_project);
 
     let (first_status, _headers, _body) = first_alpha.await.unwrap();
     assert_eq!(first_status, StatusCode::OK);
@@ -2326,6 +2378,17 @@ async fn openapi_json_documents_images_api() {
     );
     assert!(body["paths"]["/v1/images/generations"]["post"]["responses"]["409"].is_object());
     assert!(body["paths"]["/v1/images/edits"]["post"].is_object());
+    assert!(body["paths"]["/v1/videos/generations"]["post"].is_object());
+    assert!(body["paths"]["/v1/videos/{request_id}"]["get"].is_object());
+    assert!(body["paths"]["/v1/files/{file_id}/content"]["get"].is_object());
+    assert!(body["paths"]["/v1/dreamina/images/generations"]["post"].is_object());
+    assert!(body["paths"]["/v1/dreamina/videos/generations"]["post"].is_object());
+    assert!(body["paths"]["/v1/dreamina/videos/{task_id}"]["get"].is_object());
+    assert!(body["paths"]["/v1/dreamina/files/{file_id}/content"]["get"].is_object());
+    assert!(body["paths"]["/api/v3/images/generations"]["post"].is_object());
+    assert!(body["paths"]["/api/v3/contents/generations/tasks"]["post"].is_object());
+    assert!(body["paths"]["/api/v3/contents/generations/tasks/{task_id}"]["get"].is_object());
+    assert!(body["paths"]["/api/v3/files/{file_id}/content"]["get"].is_object());
     assert!(body["paths"]["/healthz"]["get"].is_object());
     assert!(body["paths"]["/readyz"]["get"]["responses"]["200"].is_object());
     assert!(body["paths"]["/readyz"]["get"]["responses"]["503"].is_object());
@@ -2338,6 +2401,27 @@ async fn openapi_json_documents_images_api() {
         body["paths"]["/v1/organization/projects/{project_id}/api_keys/{api_key_id}"]["delete"]
             .is_object()
     );
+    assert!(body["paths"]["/admin/v1/pricing/preview"]["post"].is_object());
+    assert!(body["paths"]["/admin/v1/billing/provider-cost-obligations"]["get"].is_object());
+    assert!(
+        body["paths"]["/admin/v1/billing/provider-cost-obligations/{receipt_id}"]["get"]
+            .is_object()
+    );
+    assert!(body["paths"]["/admin/v1/billing/customer-charges"]["get"].is_object());
+    assert!(
+        body["paths"]["/admin/v1/billing/customer-charges/{transaction_id}"]["get"].is_object()
+    );
+    assert!(
+        body["paths"]["/admin/v1/billing/customer-charges/{transaction_id}/refunds"]["post"]
+            .is_object()
+    );
+    assert!(body["components"]["schemas"]["PricePreviewRequest"].is_object());
+    assert!(body["components"]["schemas"]["PricePreviewResult"].is_object());
+    assert!(body["components"]["schemas"]["ProviderCostObligationList"].is_object());
+    assert!(body["components"]["schemas"]["ProviderCostObligationDetail"].is_object());
+    assert!(body["components"]["schemas"]["CustomerChargeList"].is_object());
+    assert!(body["components"]["schemas"]["CustomerChargeDetail"].is_object());
+    assert!(body["components"]["schemas"]["CustomerRefundView"].is_object());
     assert!(
         body["components"]["schemas"]["ImageGenerationRequest"]["properties"]["model"]["enum"]
             .as_array()
@@ -2377,6 +2461,114 @@ async fn openapi_json_documents_images_api() {
         body["components"]["securitySchemes"]["BearerAuth"]["type"],
         "http"
     );
+}
+
+#[tokio::test]
+async fn openapi_json_documents_files_and_batches_api() {
+    let app = build_router(config(), Arc::new(FakeGenerator::default()), usage_store());
+
+    let (status, _, bytes) = get(app, "/openapi.json").await;
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(body["paths"]["/v1/files"]["post"].is_object());
+    assert!(body["paths"]["/v1/files"]["get"].is_object());
+    assert!(body["paths"]["/v1/files/{file_id}"]["get"].is_object());
+    assert!(body["paths"]["/v1/files/{file_id}"]["delete"].is_object());
+    assert!(body["paths"]["/v1/files/{file_id}/content"]["get"].is_object());
+    assert!(body["paths"]["/v1/batches"]["post"].is_object());
+    assert!(body["paths"]["/v1/batches"]["get"].is_object());
+    assert!(body["paths"]["/v1/batches/{batch_id}"]["get"].is_object());
+    assert!(body["paths"]["/v1/batches/{batch_id}/cancel"]["post"].is_object());
+
+    let file_upload = &body["paths"]["/v1/files"]["post"];
+    assert_eq!(
+        file_upload["requestBody"]["content"]["multipart/form-data"]["schema"]["$ref"],
+        "#/components/schemas/CreateFileRequest"
+    );
+    assert!(
+        file_upload["requestBody"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("8 MiB")
+    );
+    assert_eq!(
+        body["components"]["schemas"]["CreateFileRequest"]["properties"]["file"]["format"],
+        "binary"
+    );
+    assert!(
+        body["components"]["schemas"]["CreateFileRequest"]["properties"]["purpose"]["enum"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("batch"))
+    );
+    assert_eq!(
+        body["components"]["schemas"]["FileObject"]["properties"]["object"]["example"],
+        "file"
+    );
+    assert!(body["components"]["schemas"]["FileList"]["properties"]["has_more"].is_object());
+    assert!(
+        body["components"]["schemas"]["DeletedFileObject"]["properties"]["deleted"].is_object()
+    );
+
+    let batch_create = &body["paths"]["/v1/batches"]["post"];
+    let batch_description = batch_create["requestBody"]["description"].as_str().unwrap();
+    assert!(batch_description.contains("/v1/images/generations"));
+    assert!(batch_description.contains("24h"));
+    assert!(batch_description.contains("purpose=batch"));
+    assert!(batch_description.contains("8 MiB"));
+    assert!(batch_description.contains("1000"));
+    assert_eq!(
+        batch_create["requestBody"]["content"]["application/json"]["schema"]["$ref"],
+        "#/components/schemas/CreateBatchRequest"
+    );
+    assert_eq!(
+        body["components"]["schemas"]["CreateBatchRequest"]["properties"]["endpoint"]["example"],
+        "/v1/images/generations"
+    );
+    assert_eq!(
+        body["components"]["schemas"]["CreateBatchRequest"]["properties"]["completion_window"]["example"],
+        "24h"
+    );
+    assert_eq!(
+        body["components"]["schemas"]["OutputExpiresAfter"]["properties"]["seconds"]["minimum"],
+        3600
+    );
+    assert_eq!(
+        body["components"]["schemas"]["OutputExpiresAfter"]["properties"]["seconds"]["maximum"],
+        2592000
+    );
+    assert_eq!(
+        body["components"]["schemas"]["BatchObject"]["properties"]["object"]["example"],
+        "batch"
+    );
+    assert_eq!(
+        body["components"]["schemas"]["BatchObject"]["properties"]["status"]["enum"],
+        json!([
+            "validating",
+            "failed",
+            "in_progress",
+            "finalizing",
+            "completed",
+            "expired",
+            "cancelling",
+            "cancelled"
+        ])
+    );
+    assert!(
+        body["components"]["schemas"]["BatchObject"]["properties"]["request_counts"].is_object()
+    );
+    assert!(body["components"]["schemas"]["BatchList"]["properties"]["has_more"].is_object());
+}
+
+#[tokio::test]
+async fn files_reject_unimplemented_purposes_instead_of_storing_dead_data() {
+    let app = build_router(config(), Arc::new(FakeGenerator::default()), usage_store());
+    let (status, body) = send_file_multipart(app, "assistants", "unused.txt", b"unused").await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["code"], "unsupported_file_purpose");
+    assert_eq!(body["error"]["param"], "purpose");
 }
 
 #[tokio::test]
