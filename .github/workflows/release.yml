@@ -46,8 +46,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_VERSION: ${{ github.ref_name }}
+          RELEASE_COMMIT: ${{ github.sha }}
         run: |
           set -Eeuo pipefail
+          test "${GITHUB_REF_PROTECTED:-false}" = true
           tag_object_type="$(
             gh api \
               "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_VERSION}" \
@@ -64,11 +66,102 @@ jobs:
               "repos/${GITHUB_REPOSITORY}/git/tags/${tag_object_sha}" \
               --jq '.verification.verified'
           )" = true
+          test "$(
+            gh api \
+              "repos/${GITHUB_REPOSITORY}/git/tags/${tag_object_sha}" \
+              --jq '.object.type'
+          )" = commit
+          test "$(
+            gh api \
+              "repos/${GITHUB_REPOSITORY}/git/tags/${tag_object_sha}" \
+              --jq '.object.sha'
+          )" = "$RELEASE_COMMIT"
 
       - name: Install native build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends libssl-dev pkg-config
+          sudo apt-get install --yes --no-install-recommends \
+            libssl-dev \
+            pkg-config \
+            shellcheck
+
+      - name: Validate release scripts and systemd topology
+        run: |
+          set -Eeuo pipefail
+          shellcheck \
+            scripts/package-release.sh \
+            deploy/hooks/* \
+            deploy/install-release \
+            deploy/upgrade-updater
+          bash -n \
+            scripts/package-release.sh \
+            deploy/hooks/* \
+            deploy/install-release \
+            deploy/upgrade-updater
+
+          sudo install -d \
+            /etc/ai-image-factory \
+            /opt/ai-image-factory/current/bin \
+            /opt/ai-image-factory/current/admin \
+            /usr/libexec/ai-image-factory \
+            /usr/share/doc/ai-image-factory \
+            /var/lib/ai-image-factory/admin-runtime \
+            /var/lib/ai-image-factory/artifacts \
+            /var/lib/ai-image-factory/backups \
+            /var/lib/ai-image-factory/updater
+          id ai-image-factory >/dev/null 2>&1 \
+            || sudo useradd --system --home /var/lib/ai-image-factory \
+              --shell /usr/sbin/nologin ai-image-factory
+          test -x /usr/bin/node \
+            || sudo ln -s /usr/bin/true /usr/bin/node
+          sudo install -m 0600 deploy/systemd/admin.env.example \
+            /etc/ai-image-factory/admin.env
+          sudo install -m 0600 deploy/systemd/app.env.example \
+            /etc/ai-image-factory/app.env
+          sudo install -m 0600 deploy/systemd/update-policy.env.example \
+            /etc/ai-image-factory/update-policy.env
+          sudo install -m 0600 deploy/systemd/updater.env.example \
+            /etc/ai-image-factory/updater.env
+          sudo install -m 0644 docs/operations/github-release-deployment.md \
+            /usr/share/doc/ai-image-factory/github-release-deployment.md
+          for binary in \
+            executord \
+            gpt-image-2-gateway \
+            provider-pollerd \
+            provider-submitd \
+            reconcilerd \
+            reducerd \
+            webhookd \
+            workerd; do
+            sudo install -m 0755 /usr/bin/true \
+              "/opt/ai-image-factory/current/bin/${binary}"
+          done
+          sudo install -m 0755 /usr/bin/true \
+            /usr/libexec/ai-image-factory/updated
+          sudo touch /opt/ai-image-factory/current/admin/server.js
+          systemd-analyze verify --recursive-errors=yes \
+            deploy/systemd/*.service \
+            deploy/systemd/*.target
+          grep -Fq -- '--job-mode=ignore-requirements' \
+            deploy/hooks/start-processes
+          grep -Fq -- '--job-mode=ignore-dependencies' \
+            deploy/hooks/start-processes
+          grep -Fq 'START_MODE" == "gate"' \
+            deploy/hooks/start-processes
+          grep -Fq 'ai-image-factory-processes.target' \
+            deploy/hooks/start-processes
+          grep -Fq 'ai-image-factory.target' \
+            deploy/hooks/start-processes
+          ! grep -Fq 'EnvironmentFile=' \
+            deploy/systemd/ai-image-factory-recovery-failed.service
+          ! grep -Fq 'AIF_UPDATE_ADMISSION_CLOSE_HOOK' \
+            deploy/hooks/fail-closed
+          grep -Fq '"ops/hooks/fail-closed"' deploy/install-release
+          grep -Fq \
+            '"ops/systemd/ai-image-factory-updater-recover@.service"' \
+            deploy/install-release
+          test "$(grep -c "'activating_full'" \
+            crates/platform-updater/src/lib.rs)" -ge 3
 
       - name: Select repository Rust toolchain
         run: |
@@ -191,6 +284,23 @@ jobs:
       contents: write
       id-token: write
     steps:
+      - name: Check out tagged release tooling
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 1
+
+      - name: Require immutable releases before publication
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_POLICY_TOKEN }}
+        run: |
+          set -Eeuo pipefail
+          test "$(
+            gh api \
+              --header 'X-GitHub-Api-Version: 2026-03-10' \
+              "repos/${GITHUB_REPOSITORY}/immutable-releases" \
+              --jq '.enabled'
+          )" = true
+
       - name: Download all architecture assets
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
@@ -204,6 +314,9 @@ jobs:
           RELEASE_COMMIT: ${{ github.sha }}
         run: |
           set -Eeuo pipefail
+          install -m 0755 deploy/install-release dist/install-release
+          test "$(find dist -maxdepth 1 -type f | wc -l | tr -d ' ')" = 5
+          test -x dist/install-release
           for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
             prefix="dist/ai-image-factory-${RELEASE_VERSION}-${target}"
             manifest="${prefix}.manifest.json"
@@ -227,7 +340,12 @@ jobs:
                 and (
                   .files
                   | all(
-                      if (.path | startswith("bin/"))
+                      if (
+                        (.path | startswith("bin/"))
+                        or (.path | startswith("ops/hooks/"))
+                        or .path == "ops/install-release"
+                        or .path == "ops/upgrade-updater"
+                      )
                       then .mode == 493
                       else .mode == 420
                       end
@@ -240,10 +358,26 @@ jobs:
             test "$(stat --format='%s' "$bundle")" = \
               "$(jq --raw-output '.bundle_bytes' "$manifest")"
             tar -tzf "$bundle" >/dev/null
+
+            install_root="/opt/ai-image-factory-ci-${target}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+            libexec_root="/usr/libexec/ai-image-factory-ci-${target}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+            sudo install -d -o root -g root -m 0755 "$install_root" "$libexec_root"
+            protected_assets="${install_root}/bootstrap/${RELEASE_VERSION}"
+            sudo install -d -m 0755 "$protected_assets"
+            sudo install -m 0644 "$bundle" "$manifest" "$protected_assets/"
+            sudo env \
+              AIF_INSTALL_ROOT="$install_root" \
+              AIF_LIBEXEC_ROOT="$libexec_root" \
+              dist/install-release \
+              "$RELEASE_VERSION" \
+              "$target" \
+              "${protected_assets}/$(basename "$bundle")" \
+              "${protected_assets}/$(basename "$manifest")"
+            sudo rm -rf -- "$install_root" "$libexec_root"
           done
 
       - name: Attest release assets
-        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4.1.0
         with:
           subject-path: "${{ github.workspace }}/dist/*"
 
@@ -251,8 +385,24 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_VERSION: ${{ github.ref_name }}
+          RELEASE_COMMIT: ${{ github.sha }}
         run: |
           set -Eeuo pipefail
+          tag_object_sha="$(
+            gh api \
+              "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_VERSION}" \
+              --jq '.object.sha'
+          )"
+          test "$(
+            gh api \
+              "repos/${GITHUB_REPOSITORY}/git/tags/${tag_object_sha}" \
+              --jq '.verification.verified'
+          )" = true
+          test "$(
+            gh api \
+              "repos/${GITHUB_REPOSITORY}/git/tags/${tag_object_sha}" \
+              --jq '.object.sha'
+          )" = "$RELEASE_COMMIT"
           gh release create "$RELEASE_VERSION" \
             --repo "$GITHUB_REPOSITORY" \
             --verify-tag \
@@ -266,11 +416,44 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_VERSION: ${{ github.ref_name }}
+          RELEASE_COMMIT: ${{ github.sha }}
         run: |
           set -Eeuo pipefail
+          verify_tag_commit() {
+            local tag_object_sha
+            tag_object_sha="$(
+              gh api \
+                "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_VERSION}" \
+                --jq '.object.sha'
+            )"
+            test "$(
+              gh api \
+                "repos/${GITHUB_REPOSITORY}/git/tags/${tag_object_sha}" \
+                --jq '.verification.verified'
+            )" = true
+            test "$(
+              gh api \
+                "repos/${GITHUB_REPOSITORY}/git/tags/${tag_object_sha}" \
+                --jq '.object.sha'
+            )" = "$RELEASE_COMMIT"
+          }
+          verify_tag_commit
           gh release edit "$RELEASE_VERSION" \
             --repo "$GITHUB_REPOSITORY" \
             --draft=false \
             --latest
-          gh release verify "$RELEASE_VERSION" \
-            --repo "$GITHUB_REPOSITORY"
+          for attempt in $(seq 1 12); do
+            if test "$(
+              gh api \
+                "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_VERSION}" \
+                --jq '.immutable'
+            )" = true \
+              && verify_tag_commit \
+              && gh release verify "$RELEASE_VERSION" \
+                --repo "$GITHUB_REPOSITORY"; then
+              exit 0
+            fi
+            sleep 5
+          done
+          printf 'published release did not become verifiably immutable\n' >&2
+          exit 1

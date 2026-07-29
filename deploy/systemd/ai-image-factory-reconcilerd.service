@@ -1,7 +1,8 @@
 [Unit]
 Description=AI Image Factory reconciler
-PartOf=ai-image-factory.target
-After=network-online.target
+PartOf=ai-image-factory-processes.target
+Requires=ai-image-factory-recovery-gate.service
+After=network-online.target ai-image-factory-recovery-gate.service
 Before=ai-image-factory-executord@default.service
 
 [Service]
@@ -32,4 +33,4 @@ RestrictSUIDSGID=yes
 SystemCallArchitectures=native
 
 [Install]
-WantedBy=ai-image-factory.target
+WantedBy=ai-image-factory-processes.target

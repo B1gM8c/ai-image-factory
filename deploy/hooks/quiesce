@@ -3,8 +3,35 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 
-systemctl stop ai-image-factory.target
-if systemctl is-active --quiet ai-image-factory.target; then
-  printf 'application target did not stop cleanly\n' >&2
-  exit 1
-fi
+PROCESS_UNITS=(
+  ai-image-factory-reconcilerd.service
+  ai-image-factory-executord@default.service
+  ai-image-factory-reducerd.service
+  ai-image-factory-workerd.service
+  ai-image-factory-gateway.service
+  ai-image-factory-admin.service
+  ai-image-factory-provider-submitd.service
+  ai-image-factory-provider-pollerd.service
+  ai-image-factory-webhookd.service
+)
+
+while IFS= read -r unit; do
+  [[ "$unit" == ai-image-factory-executord@*.service ]] || continue
+  PROCESS_UNITS+=("$unit")
+done < <(
+  systemctl list-units \
+    --type=service \
+    --state=active,activating,deactivating \
+    --no-legend \
+    --plain \
+    'ai-image-factory-executord@*.service' \
+    | awk '{print $1}'
+)
+
+systemctl stop ai-image-factory-processes.target "${PROCESS_UNITS[@]}"
+for unit in ai-image-factory-processes.target "${PROCESS_UNITS[@]}"; do
+  if systemctl is-active --quiet "$unit"; then
+    printf 'application process unit did not stop cleanly: %s\n' "$unit" >&2
+    exit 1
+  fi
+done

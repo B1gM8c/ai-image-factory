@@ -1,7 +1,8 @@
 [Unit]
 Description=AI Image Factory Axum gateway
-PartOf=ai-image-factory.target
-After=network-online.target ai-image-factory-workerd.service ai-image-factory-provider-submitd.service ai-image-factory-provider-pollerd.service
+PartOf=ai-image-factory-processes.target
+Requires=ai-image-factory-recovery-gate.service
+After=network-online.target ai-image-factory-recovery-gate.service ai-image-factory-workerd.service ai-image-factory-provider-submitd.service ai-image-factory-provider-pollerd.service
 Before=ai-image-factory-admin.service
 
 [Service]
@@ -33,4 +34,4 @@ RestrictSUIDSGID=yes
 SystemCallArchitectures=native
 
 [Install]
-WantedBy=ai-image-factory.target
+WantedBy=ai-image-factory-processes.target

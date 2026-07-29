@@ -1,7 +1,8 @@
 [Unit]
 Description=AI Image Factory webhook dispatcher
-PartOf=ai-image-factory.target
-After=network-online.target ai-image-factory-reducerd.service
+PartOf=ai-image-factory-processes.target
+Requires=ai-image-factory-recovery-gate.service
+After=network-online.target ai-image-factory-recovery-gate.service ai-image-factory-reducerd.service
 Before=ai-image-factory-gateway.service
 
 [Service]
@@ -32,4 +33,4 @@ RestrictSUIDSGID=yes
 SystemCallArchitectures=native
 
 [Install]
-WantedBy=ai-image-factory.target
+WantedBy=ai-image-factory-processes.target

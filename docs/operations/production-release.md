@@ -41,15 +41,9 @@ Build every Rust binary from one Git commit and deploy them together:
 
 ```bash
 cargo build --locked --release -p gpt-image-2-gateway \
-  --bin factoryctl \
-  --bin gpt-image-2-gateway \
-  --bin workerd \
-  --bin executord \
-  --bin reducerd \
-  --bin reconcilerd \
-  --bin provider-submitd \
-  --bin provider-pollerd \
-  --bin webhookd
+  --bins
+cargo build --locked --release -p ai-image-factory-updater \
+  --bin updated
 npm ci
 npm run build:admin
 ```
@@ -219,6 +213,36 @@ not generated media bytes.
 
 Migrations are immutable. Do not edit an applied migration or attempt ad hoc
 down-migration SQL during an incident.
+
+The updater intentionally rejects a downgrade after an Apply has committed.
+Do not perform an ad hoc in-place rollback by separately restoring PostgreSQL,
+artifacts, and the `current` symlink. Those operations are not one atomic
+recovery point and can expose mixed release state.
+
+For an unfinished Apply with a protected recovery descriptor, use only the
+fenced recovery command:
+
+```bash
+sudo systemctl stop ai-image-factory-updater.service
+sudo systemctl start ai-image-factory-updater-recover@COMMAND_UUID.service
+sudo systemctl start ai-image-factory.target
+```
+
+The recovery unit reacquires the database and lease fences, consumes the
+recorded descriptor, restores one matched database-and-artifact recovery point,
+validates Gateway and admin, persists the leased restoration phase, starts and
+verifies the full process scope, reopens admission, and only then commits
+`restored`.
+
+A rollback after a successful release is a disaster-recovery cutover, not an
+updater command. Keep admission closed and all business processes stopped.
+Require verified checksums, a database and artifact backup from the same
+recovery point, the previous signed release manifest, the exact recorded
+migration version, and an atomic traffic or host pointer cutover. Until that
+procedure has passed the documented failure-injection drill, restore onto a
+replacement database and host, run the complete release gate there, and then
+cut traffic over. Preserve the failed database, artifacts, release tree, and
+logs until the incident is closed.
 
 ## Alerts
 

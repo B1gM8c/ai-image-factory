@@ -8,8 +8,9 @@ usage() {
 Usage:
   deploy/install-release VERSION TARGET_TRIPLE BUNDLE MANIFEST
 
-The GitHub Release and both local assets must be verified before this command.
-This bootstrap installer refuses to replace an existing release or current link.
+The bundle and manifest must be verified root-owned files under
+INSTALL_ROOT/bootstrap/VERSION. It may resume the same verified first install,
+but never replaces another release.
 EOF
 }
 
@@ -36,10 +37,15 @@ command -v python3 >/dev/null 2>&1 || die "required command is unavailable: pyth
 
 readonly VERSION="$1"
 readonly TARGET_TRIPLE="$2"
-readonly BUNDLE="$(canonical_path "$3")"
-readonly MANIFEST="$(canonical_path "$4")"
+readonly BUNDLE_INPUT="$3"
+readonly MANIFEST_INPUT="$4"
+[[ ! -L "$BUNDLE_INPUT" && ! -L "$MANIFEST_INPUT" ]] \
+  || die "bundle and manifest must not be symbolic links"
+readonly BUNDLE="$(canonical_path "$BUNDLE_INPUT")"
+readonly MANIFEST="$(canonical_path "$MANIFEST_INPUT")"
 readonly INSTALL_ROOT="${AIF_INSTALL_ROOT:-/opt/ai-image-factory}"
 readonly LIBEXEC_ROOT="${AIF_LIBEXEC_ROOT:-/usr/libexec/ai-image-factory}"
+readonly BOOTSTRAP_ROOT="${INSTALL_ROOT}/bootstrap/${VERSION}"
 readonly RELEASE_ROOT="${INSTALL_ROOT}/releases/${VERSION}"
 readonly CURRENT_LINK="${INSTALL_ROOT}/current"
 
@@ -50,12 +56,73 @@ case "$TARGET_TRIPLE" in
   *) die "unsupported target triple: $TARGET_TRIPLE" ;;
 esac
 [[ -f "$BUNDLE" && -f "$MANIFEST" ]] || die "bundle and manifest must be regular files"
-[[ ! -e "$RELEASE_ROOT" ]] || die "release already exists: $RELEASE_ROOT"
-[[ ! -e "$CURRENT_LINK" && ! -L "$CURRENT_LINK" ]] \
-  || die "current release pointer already exists"
+[[ "$(dirname "$BUNDLE")" = "$(canonical_path "$BOOTSTRAP_ROOT")" ]] \
+  || die "bundle must be staged in the protected bootstrap directory"
+[[ "$(dirname "$MANIFEST")" = "$(canonical_path "$BOOTSTRAP_ROOT")" ]] \
+  || die "manifest must be staged in the protected bootstrap directory"
+if [[ -e "$RELEASE_ROOT" || -L "$RELEASE_ROOT" ]]; then
+  [[ -d "$RELEASE_ROOT" && ! -L "$RELEASE_ROOT" ]] \
+    || die "existing release is not a regular directory: $RELEASE_ROOT"
+fi
+if [[ -e "$CURRENT_LINK" || -L "$CURRENT_LINK" ]]; then
+  [[ -d "$RELEASE_ROOT" ]] \
+    || die "current release pointer exists without the requested release"
+  [[ "$(canonical_path "$CURRENT_LINK")" = "$(canonical_path "$RELEASE_ROOT")" ]] \
+    || die "current release pointer already selects another release"
+fi
+
+env \
+  AIF_BOOTSTRAP_INSTALL_ROOT="$INSTALL_ROOT" \
+  AIF_BOOTSTRAP_PROTECTED_ROOT="$BOOTSTRAP_ROOT" \
+  AIF_BOOTSTRAP_BUNDLE="$BUNDLE" \
+  AIF_BOOTSTRAP_MANIFEST="$MANIFEST" \
+  python3 <<'PY'
+import os
+import stat
+from pathlib import Path
+
+install_root = Path(os.environ["AIF_BOOTSTRAP_INSTALL_ROOT"])
+protected_root = Path(os.environ["AIF_BOOTSTRAP_PROTECTED_ROOT"])
+bundle_path = Path(os.environ["AIF_BOOTSTRAP_BUNDLE"])
+manifest_path = Path(os.environ["AIF_BOOTSTRAP_MANIFEST"])
+
+if not install_root.is_absolute() or install_root == Path("/"):
+    raise SystemExit("install root must be an absolute non-root path")
+if install_root.resolve(strict=True) != install_root:
+    raise SystemExit("install root must not traverse symbolic links")
+
+ancestor = Path("/")
+for component in install_root.parts[1:]:
+    ancestor /= component
+    metadata = ancestor.lstat()
+    if (
+        ancestor.is_symlink()
+        or not ancestor.is_dir()
+        or metadata.st_uid != 0
+        or stat.S_IMODE(metadata.st_mode) & 0o022
+    ):
+        raise SystemExit(f"install root ancestor is not root-protected: {ancestor}")
+
+for path, kind in (
+    (protected_root.parent, "directory"),
+    (protected_root, "directory"),
+    (bundle_path, "file"),
+    (manifest_path, "file"),
+):
+    metadata = path.lstat()
+    if path.is_symlink() or metadata.st_uid != 0 or stat.S_IMODE(metadata.st_mode) & 0o022:
+        raise SystemExit(f"bootstrap {kind} is not root-protected: {path}")
+    if kind == "directory" and not path.is_dir():
+        raise SystemExit(f"bootstrap directory is invalid: {path}")
+    if kind == "file" and not path.is_file():
+        raise SystemExit(f"bootstrap file is invalid: {path}")
+if bundle_path.parent != protected_root or manifest_path.parent != protected_root:
+    raise SystemExit("bootstrap assets escaped the protected directory")
+PY
 
 install -d -m 0755 \
   "$INSTALL_ROOT" \
+  "${INSTALL_ROOT}/bootstrap" \
   "${INSTALL_ROOT}/releases" \
   "${INSTALL_ROOT}/staging" \
   "$LIBEXEC_ROOT"
@@ -63,7 +130,10 @@ install -d -m 0755 \
 STAGING_DIR="$(mktemp -d "${INSTALL_ROOT}/staging/.bootstrap-${VERSION}.XXXXXXXX")"
 cleanup() {
   if [[ -n "${STAGING_DIR:-}" && -d "$STAGING_DIR" ]]; then
-    rm -rf --one-file-system -- "$STAGING_DIR"
+    rm -rf -- "$STAGING_DIR"
+  fi
+  if [[ -n "${TEMPORARY_LINK:-}" && -L "$TEMPORARY_LINK" ]]; then
+    rm -f -- "$TEMPORARY_LINK"
   fi
 }
 trap cleanup EXIT
@@ -73,12 +143,15 @@ env \
   AIF_BOOTSTRAP_TARGET="$TARGET_TRIPLE" \
   AIF_BOOTSTRAP_BUNDLE="$BUNDLE" \
   AIF_BOOTSTRAP_MANIFEST="$MANIFEST" \
+  AIF_BOOTSTRAP_INSTALL_ROOT="$INSTALL_ROOT" \
+  AIF_BOOTSTRAP_PROTECTED_ROOT="$BOOTSTRAP_ROOT" \
   AIF_BOOTSTRAP_DESTINATION="$STAGING_DIR" \
   python3 <<'PY'
 import hashlib
 import json
 import os
 import re
+import stat
 import tarfile
 from pathlib import Path, PurePosixPath
 
@@ -86,10 +159,51 @@ version = os.environ["AIF_BOOTSTRAP_VERSION"]
 target_triple = os.environ["AIF_BOOTSTRAP_TARGET"]
 bundle_path = Path(os.environ["AIF_BOOTSTRAP_BUNDLE"])
 manifest_path = Path(os.environ["AIF_BOOTSTRAP_MANIFEST"])
+install_root = Path(os.environ["AIF_BOOTSTRAP_INSTALL_ROOT"])
+protected_root = Path(os.environ["AIF_BOOTSTRAP_PROTECTED_ROOT"])
 destination = Path(os.environ["AIF_BOOTSTRAP_DESTINATION"])
 allowed_path = re.compile(r"^[A-Za-z0-9@._/-]+$")
 commit_sha = re.compile(r"^[0-9a-f]{40}$")
+max_manifest_bytes = 8 * 1024 * 1024
+max_release_bytes = 4 * 1024 * 1024 * 1024
+max_archive_entries = 20_000
 
+if not install_root.is_absolute() or install_root == Path("/"):
+    raise SystemExit("install root must be an absolute non-root path")
+if install_root.resolve(strict=True) != install_root:
+    raise SystemExit("install root must not traverse symbolic links")
+
+ancestor = Path("/")
+for component in install_root.parts[1:]:
+    ancestor /= component
+    metadata = ancestor.lstat()
+    if (
+        ancestor.is_symlink()
+        or not ancestor.is_dir()
+        or metadata.st_uid != 0
+        or stat.S_IMODE(metadata.st_mode) & 0o022
+    ):
+        raise SystemExit(f"install root ancestor is not root-protected: {ancestor}")
+
+for path, kind in (
+    (protected_root.parent, "directory"),
+    (protected_root, "directory"),
+    (bundle_path, "file"),
+    (manifest_path, "file"),
+):
+    metadata = path.lstat()
+    if path.is_symlink() or metadata.st_uid != 0 or stat.S_IMODE(metadata.st_mode) & 0o022:
+        raise SystemExit(f"bootstrap {kind} is not root-protected: {path}")
+    if kind == "directory" and not path.is_dir():
+        raise SystemExit(f"bootstrap directory is invalid: {path}")
+    if kind == "file" and not path.is_file():
+        raise SystemExit(f"bootstrap file is invalid: {path}")
+if bundle_path.parent != protected_root or manifest_path.parent != protected_root:
+    raise SystemExit("bootstrap assets escaped the protected directory")
+
+manifest_bytes = manifest_path.stat().st_size
+if manifest_bytes <= 0 or manifest_bytes > max_manifest_bytes:
+    raise SystemExit("manifest size is outside the supported range")
 with manifest_path.open("rb") as source:
     manifest = json.load(source)
 
@@ -105,6 +219,13 @@ if not commit_sha.fullmatch(str(manifest.get("commit_sha", ""))):
     raise SystemExit("manifest commit is invalid")
 if manifest.get("rollback_mode") != "backup_restore":
     raise SystemExit("manifest rollback contract is invalid")
+bundle_bytes = manifest.get("bundle_bytes")
+if (
+    not isinstance(bundle_bytes, int)
+    or bundle_bytes <= 0
+    or bundle_bytes > max_release_bytes
+):
+    raise SystemExit("bundle size is outside the supported range")
 
 bundle_digest = hashlib.sha256()
 with bundle_path.open("rb") as source:
@@ -112,14 +233,19 @@ with bundle_path.open("rb") as source:
         bundle_digest.update(chunk)
 if bundle_digest.hexdigest() != manifest.get("bundle_sha256"):
     raise SystemExit("bundle digest mismatch")
-if bundle_path.stat().st_size != manifest.get("bundle_bytes"):
+if bundle_path.stat().st_size != bundle_bytes:
     raise SystemExit("bundle size mismatch")
 
 files = manifest.get("files")
-if not isinstance(files, list) or not files:
-    raise SystemExit("manifest file list is empty")
+if (
+    not isinstance(files, list)
+    or not files
+    or len(files) > max_archive_entries
+):
+    raise SystemExit("manifest file count is outside the supported range")
 
 expected = {}
+total_bytes = 0
 for entry in files:
     if not isinstance(entry, dict):
         raise SystemExit("manifest file entry is invalid")
@@ -131,11 +257,24 @@ for entry in files:
         raise SystemExit(f"manifest path escapes the release: {relative}")
     if relative in expected:
         raise SystemExit(f"duplicate manifest path: {relative}")
-    required_mode = 0o755 if relative.startswith("bin/") else 0o644
+    required_mode = (
+        0o755
+        if relative.startswith("bin/")
+        or relative.startswith("ops/hooks/")
+        or relative in {"ops/install-release", "ops/upgrade-updater"}
+        else 0o644
+    )
     if entry.get("mode") != required_mode:
         raise SystemExit(f"manifest mode is invalid: {relative}")
-    if not isinstance(entry.get("bytes"), int) or entry["bytes"] < 0:
+    if (
+        not isinstance(entry.get("bytes"), int)
+        or entry["bytes"] < 0
+        or entry["bytes"] > max_release_bytes
+    ):
         raise SystemExit(f"manifest size is invalid: {relative}")
+    total_bytes += entry["bytes"]
+    if total_bytes > max_release_bytes:
+        raise SystemExit("manifest expanded size is outside the supported range")
     if not re.fullmatch(r"[0-9a-f]{64}", str(entry.get("sha256", ""))):
         raise SystemExit(f"manifest digest is invalid: {relative}")
     expected[relative] = entry
@@ -146,6 +285,21 @@ required_files = {
     "bin/factoryctl",
     "bin/gpt-image-2-gateway",
     "bin/updated",
+    "ops/hooks/activate",
+    "ops/hooks/fail-closed",
+    "ops/hooks/quiesce",
+    "ops/hooks/recover",
+    "ops/hooks/resume",
+    "ops/hooks/start-processes",
+    "ops/hooks/verify",
+    "ops/install-release",
+    "ops/systemd/ai-image-factory-processes.target",
+    "ops/systemd/ai-image-factory-recovery-failed.service",
+    "ops/systemd/ai-image-factory-recovery-gate.service",
+    "ops/systemd/ai-image-factory-updater-recover@.service",
+    "ops/systemd/ai-image-factory-updater.service",
+    "ops/systemd/ai-image-factory.target",
+    "ops/upgrade-updater",
     "release.json",
 }
 if not required_files.issubset(expected):
@@ -154,6 +308,8 @@ if not required_files.issubset(expected):
 with tarfile.open(bundle_path, mode="r:gz") as archive:
     members = archive.getmembers()
     names = [member.name for member in members]
+    if len(names) > max_archive_entries:
+        raise SystemExit("bundle file count is outside the supported range")
     if len(names) != len(set(names)):
         raise SystemExit("bundle contains duplicate paths")
     if set(names) != set(expected):
@@ -183,6 +339,74 @@ with tarfile.open(bundle_path, mode="r:gz") as archive:
             raise SystemExit(f"bundle member integrity mismatch: {member.name}")
         output.chmod(entry["mode"])
 
+expected_machine = {
+    "x86_64-unknown-linux-gnu": 62,
+    "aarch64-unknown-linux-gnu": 183,
+}[target_triple]
+for relative in expected:
+    if not relative.startswith("bin/"):
+        continue
+    with (destination / relative).open("rb") as source:
+        header = source.read(20)
+    if (
+        len(header) != 20
+        or header[:4] != b"\x7fELF"
+        or header[4] != 2
+        or header[5] != 1
+        or int.from_bytes(header[18:20], "little") != expected_machine
+    ):
+        raise SystemExit(f"release binary architecture mismatch: {relative}")
+
+admin_archive = destination / "admin/standalone.tar.gz"
+macho_magics = {
+    b"\xce\xfa\xed\xfe",
+    b"\xfe\xed\xfa\xce",
+    b"\xcf\xfa\xed\xfe",
+    b"\xfe\xed\xfa\xcf",
+    b"\xca\xfe\xba\xbe",
+    b"\xbe\xba\xfe\xca",
+    b"\xca\xfe\xba\xbf",
+    b"\xbf\xba\xfe\xca",
+}
+admin_total_bytes = 0
+with tarfile.open(admin_archive, mode="r:gz") as archive:
+    members = archive.getmembers()
+    if not members or len(members) > max_archive_entries:
+        raise SystemExit("admin runtime entry count is outside the supported range")
+    for member in members:
+        path = PurePosixPath(member.name)
+        if path.is_absolute() or ".." in path.parts or "." in path.parts:
+            raise SystemExit(f"admin runtime path escapes the archive: {member.name}")
+        if member.isdir():
+            continue
+        if not member.isreg():
+            raise SystemExit(f"admin runtime contains a link or special file: {member.name}")
+        admin_total_bytes += member.size
+        if admin_total_bytes > max_release_bytes:
+            raise SystemExit("admin runtime expanded size is outside the supported range")
+        source = archive.extractfile(member)
+        if source is None:
+            raise SystemExit(f"admin runtime member cannot be read: {member.name}")
+        header = source.read(20)
+        magic = header[:4]
+        is_elf = magic == b"\x7fELF"
+        if is_elf and (
+            len(header) != 20
+            or header[4] != 2
+            or header[5] != 1
+            or int.from_bytes(header[18:20], "little") != expected_machine
+        ):
+            raise SystemExit(f"admin runtime ELF architecture mismatch: {member.name}")
+        if (
+            not is_elf
+            and (
+                member.name.endswith(".node")
+                or magic in macho_magics
+                or header[:2] == b"MZ"
+            )
+        ):
+            raise SystemExit(f"admin runtime contains a foreign native module: {member.name}")
+
 identity_path = destination / "release.json"
 with identity_path.open("rb") as source:
     identity = json.load(source)
@@ -205,11 +429,77 @@ for directory in sorted(directories, key=lambda value: len(value.parts), reverse
         os.close(descriptor)
 PY
 
-chown -R root:root "$STAGING_DIR"
-mv -- "$STAGING_DIR" "$RELEASE_ROOT"
-STAGING_DIR=""
+if [[ -d "$RELEASE_ROOT" ]]; then
+  env \
+    AIF_BOOTSTRAP_EXISTING="$RELEASE_ROOT" \
+    AIF_BOOTSTRAP_MANIFEST="$MANIFEST" \
+    python3 <<'PY'
+import hashlib
+import json
+import os
+import stat
+from pathlib import Path
+
+root = Path(os.environ["AIF_BOOTSTRAP_EXISTING"])
+with Path(os.environ["AIF_BOOTSTRAP_MANIFEST"]).open("rb") as source:
+    manifest = json.load(source)
+expected = {entry["path"]: entry for entry in manifest["files"]}
+actual = {}
+root_metadata = root.lstat()
+if root_metadata.st_uid != 0 or stat.S_IMODE(root_metadata.st_mode) != 0o755:
+    raise SystemExit("existing release root is unprotected")
+
+for path in root.rglob("*"):
+    metadata = path.lstat()
+    relative = path.relative_to(root).as_posix()
+    if stat.S_ISLNK(metadata.st_mode):
+        raise SystemExit(f"existing release contains a link: {relative}")
+    if path.is_dir():
+        if metadata.st_uid != 0 or stat.S_IMODE(metadata.st_mode) != 0o755:
+            raise SystemExit(f"existing release directory is unprotected: {relative}")
+        continue
+    if not path.is_file():
+        raise SystemExit(f"existing release contains a special file: {relative}")
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    actual[relative] = (
+        metadata.st_size,
+        stat.S_IMODE(metadata.st_mode),
+        metadata.st_uid,
+        digest.hexdigest(),
+    )
+
+if set(actual) != set(expected):
+    raise SystemExit("existing release paths do not match the manifest")
+for relative, entry in expected.items():
+    size, mode, owner, digest = actual[relative]
+    if (
+        size != entry["bytes"]
+        or mode != entry["mode"]
+        or owner != 0
+        or digest != entry["sha256"]
+    ):
+        raise SystemExit(f"existing release integrity mismatch: {relative}")
+PY
+  rm -rf -- "$STAGING_DIR"
+  STAGING_DIR=""
+else
+  chown -R root:root "$STAGING_DIR"
+  mv -- "$STAGING_DIR" "$RELEASE_ROOT"
+  STAGING_DIR=""
+  sync -f "${INSTALL_ROOT}/releases"
+fi
 install -m 0755 "${RELEASE_ROOT}/bin/updated" "${LIBEXEC_ROOT}/updated"
-ln -s "releases/${VERSION}" "$CURRENT_LINK"
+sync -f "${LIBEXEC_ROOT}/updated"
+if [[ ! -e "$CURRENT_LINK" && ! -L "$CURRENT_LINK" ]]; then
+  TEMPORARY_LINK="${INSTALL_ROOT}/.current-${VERSION}.$$"
+  ln -s "releases/${VERSION}" "$TEMPORARY_LINK"
+  mv -- "$TEMPORARY_LINK" "$CURRENT_LINK"
+  TEMPORARY_LINK=""
+  sync -f "$INSTALL_ROOT"
+fi
 
 printf 'installed_release=%s\ncurrent=%s\nupdater=%s\n' \
   "$RELEASE_ROOT" \

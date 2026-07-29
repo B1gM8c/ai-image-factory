@@ -3,7 +3,8 @@ use std::{
     env,
     ffi::OsStr,
     fs::OpenOptions,
-    io::Write,
+    future::Future,
+    io::{Read, Write},
     os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt, symlink},
     path::{Component, Path, PathBuf},
     process::{Output, Stdio},
@@ -37,11 +38,13 @@ pub const UPDATER_PROTOCOL_VERSION: u32 = 1;
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const DEFAULT_LEASE_DURATION: Duration = Duration::from_secs(90);
 const DEFAULT_COMMAND_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const GUARD_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_COMMAND_OUTPUT_BYTES: usize = 1024 * 1024;
 const MAX_ARCHIVE_ENTRIES: usize = 20_000;
 const MAX_RELEASE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const MAX_MANIFEST_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_RELEASE_METADATA_BYTES: u64 = 16 * 1024;
+const UPDATER_CLUSTER_LOCK_KEY: i64 = 4_658_666_586_371_342_929;
 
 #[derive(Debug, thiserror::Error)]
 pub enum UpdaterError {
@@ -61,6 +64,88 @@ pub enum UpdaterError {
     RestoreRequired(String),
 }
 
+struct DatabaseAdvisoryLock {
+    stop_tx: watch::Sender<bool>,
+    lost_rx: watch::Receiver<bool>,
+    task: Option<JoinHandle<Result<(), UpdaterError>>>,
+}
+
+impl DatabaseAdvisoryLock {
+    async fn acquire(pool: &PgPool) -> Result<Self, UpdaterError> {
+        let mut transaction = pool.begin().await?;
+        sqlx::query("SET LOCAL idle_in_transaction_session_timeout = 0")
+            .execute(&mut *transaction)
+            .await?;
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(UPDATER_CLUSTER_LOCK_KEY)
+            .execute(&mut *transaction)
+            .await?;
+        let (stop_tx, mut stop_rx) = watch::channel(false);
+        let (lost_tx, lost_rx) = watch::channel(false);
+        let task = tokio::spawn(async move {
+            let mut ticker = interval(Duration::from_secs(5));
+            ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => {
+                        match timeout(
+                            GUARD_PROBE_TIMEOUT,
+                            sqlx::query("SELECT 1").execute(&mut *transaction),
+                        )
+                        .await
+                        {
+                            Ok(Ok(_)) => {}
+                            Ok(Err(error)) => {
+                                let _ = lost_tx.send(true);
+                                return Err(error.into());
+                            }
+                            Err(_) => {
+                                let _ = lost_tx.send(true);
+                                return Err(UpdaterError::LeaseLost);
+                            }
+                        }
+                    }
+                    changed = stop_rx.changed() => {
+                        if changed.is_err() || *stop_rx.borrow() {
+                            transaction.rollback().await?;
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+        });
+        Ok(Self {
+            stop_tx,
+            lost_rx,
+            task: Some(task),
+        })
+    }
+
+    fn loss_receiver(&self) -> watch::Receiver<bool> {
+        self.lost_rx.clone()
+    }
+
+    async fn release(mut self) -> Result<(), UpdaterError> {
+        let _ = self.stop_tx.send(true);
+        let task = self.task.take().ok_or_else(|| {
+            UpdaterError::Config("database advisory lock task is missing".to_string())
+        })?;
+        task.await.map_err(|error| {
+            UpdaterError::Config(format!("database advisory lock task failed: {error}"))
+        })??;
+        Ok(())
+    }
+}
+
+impl Drop for DatabaseAdvisoryLock {
+    fn drop(&mut self) {
+        let _ = self.stop_tx.send(true);
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct UpdaterConfig {
     database_url: String,
@@ -76,6 +161,8 @@ pub struct UpdaterConfig {
     backup_root: PathBuf,
     apply_enabled: bool,
     attestation_workflow: String,
+    admission_close_hook: Option<PathBuf>,
+    admission_open_hook: Option<PathBuf>,
     quiesce_hook: Option<PathBuf>,
     resume_hook: Option<PathBuf>,
     backup_hook: Option<PathBuf>,
@@ -126,6 +213,8 @@ impl UpdaterConfig {
         } else {
             normalize_workflow_identity(&repository, &attestation_workflow)?
         };
+        let admission_close_hook = optional_absolute_env_path("AIF_UPDATE_ADMISSION_CLOSE_HOOK")?;
+        let admission_open_hook = optional_absolute_env_path("AIF_UPDATE_ADMISSION_OPEN_HOOK")?;
         let quiesce_hook = optional_absolute_env_path("AIF_UPDATE_QUIESCE_HOOK")?;
         let resume_hook = optional_absolute_env_path("AIF_UPDATE_RESUME_HOOK")?;
         let backup_hook = optional_absolute_env_path("AIF_UPDATE_BACKUP_HOOK")?;
@@ -133,6 +222,8 @@ impl UpdaterConfig {
         let activate_hook = optional_absolute_env_path("AIF_UPDATE_ACTIVATE_HOOK")?;
         let verify_hook = optional_absolute_env_path("AIF_UPDATE_VERIFY_HOOK")?;
         for hook in [
+            &admission_close_hook,
+            &admission_open_hook,
             &quiesce_hook,
             &resume_hook,
             &backup_hook,
@@ -159,6 +250,8 @@ impl UpdaterConfig {
             backup_root,
             apply_enabled,
             attestation_workflow,
+            admission_close_hook,
+            admission_open_hook,
             quiesce_hook,
             resume_hook,
             backup_hook,
@@ -172,6 +265,14 @@ impl UpdaterConfig {
 
     fn apply_hooks(&self) -> Result<ApplyHooks, UpdaterError> {
         Ok(ApplyHooks {
+            admission_close: required_hook(
+                &self.admission_close_hook,
+                "AIF_UPDATE_ADMISSION_CLOSE_HOOK",
+            )?,
+            admission_open: required_hook(
+                &self.admission_open_hook,
+                "AIF_UPDATE_ADMISSION_OPEN_HOOK",
+            )?,
             quiesce: required_hook(&self.quiesce_hook, "AIF_UPDATE_QUIESCE_HOOK")?,
             resume: required_hook(&self.resume_hook, "AIF_UPDATE_RESUME_HOOK")?,
             backup: required_hook(&self.backup_hook, "AIF_UPDATE_BACKUP_HOOK")?,
@@ -184,6 +285,8 @@ impl UpdaterConfig {
 
 #[derive(Clone, Debug)]
 struct ApplyHooks {
+    admission_close: PathBuf,
+    admission_open: PathBuf,
     quiesce: PathBuf,
     resume: PathBuf,
     backup: PathBuf,
@@ -227,10 +330,26 @@ impl Updater {
 
     pub async fn run_once(&self) -> Result<bool, UpdaterError> {
         let _host_lock = self.acquire_host_lock()?;
+        let cluster_lock = DatabaseAdvisoryLock::acquire(&self.pool).await?;
+        let mut cluster_loss = cluster_lock.loss_receiver();
+        let result = self.run_once_locked(&mut cluster_loss).await;
+        cluster_lock.release().await?;
+        result
+    }
+
+    async fn run_once_locked(
+        &self,
+        cluster_loss: &mut watch::Receiver<bool>,
+    ) -> Result<bool, UpdaterError> {
         if let Some(claim) = self.claim_expired_recovery().await? {
-            let heartbeat = self.start_heartbeat(&claim);
-            let result = self.execute_recovery_takeover(&claim).await;
-            heartbeat.stop().await;
+            let result = self
+                .guard_claim_operation(
+                    &claim,
+                    cluster_loss,
+                    true,
+                    self.execute_recovery_takeover(&claim, false),
+                )
+                .await;
             if let Err(error) = result {
                 tracing::error!(
                     command.id = %claim.command_id,
@@ -243,18 +362,37 @@ impl Updater {
         let Some(claim) = self.claim_next().await? else {
             return Ok(false);
         };
-        let heartbeat = self.start_heartbeat(&claim);
-        let result = match claim.action.as_str() {
-            "check" => self.execute_check(&claim).await,
-            "apply" => self.execute_apply(&claim).await,
-            action => Err(UpdaterError::InvalidRelease(format!(
-                "unsupported persisted action {action}"
-            ))),
+        let operation = async {
+            match claim.action.as_str() {
+                "check" => self.execute_check(&claim).await,
+                "apply" => self.execute_apply(&claim).await,
+                action => Err(UpdaterError::InvalidRelease(format!(
+                    "unsupported persisted action {action}"
+                ))),
+            }
         };
-        heartbeat.stop().await;
+        let result = self
+            .guard_claim_operation(&claim, cluster_loss, true, operation)
+            .await;
         if let Err(error) = result {
             tracing::error!(command.id = %claim.command_id, ?error, "system update command failed");
-            if !matches!(error, UpdaterError::RestoreRequired(_)) {
+            if claim.action == "apply" && self.recovery_descriptor_path(&claim).exists() {
+                if let Err(state_error) = self
+                    .set_recovery_state(
+                        &claim,
+                        "restore_required",
+                        "failed",
+                        &format!("unsafe update exited before recovery completed: {error}"),
+                    )
+                    .await
+                {
+                    tracing::error!(
+                        command.id = %claim.command_id,
+                        ?state_error,
+                        "unsafe update remains protected by its local recovery descriptor"
+                    );
+                }
+            } else if !matches!(error, UpdaterError::RestoreRequired(_)) {
                 self.fail_command(&claim, "update_failed", &error.to_string())
                     .await?;
             }
@@ -262,10 +400,155 @@ impl Updater {
         Ok(true)
     }
 
+    pub async fn recover_pending(&self) -> Result<(), UpdaterError> {
+        let _host_lock = self.acquire_host_lock()?;
+        let cluster_lock = DatabaseAdvisoryLock::acquire(&self.pool).await?;
+        let mut cluster_loss = cluster_lock.loss_receiver();
+        let result = self.recover_pending_locked(&mut cluster_loss).await;
+        cluster_lock.release().await?;
+        result
+    }
+
+    async fn recover_pending_locked(
+        &self,
+        cluster_loss: &mut watch::Receiver<bool>,
+    ) -> Result<(), UpdaterError> {
+        for command_id in self.pending_recovery_descriptor_ids()? {
+            if self
+                .cleanup_terminal_recovery_descriptor(command_id, cluster_loss)
+                .await?
+            {
+                continue;
+            }
+            let claim = self
+                .claim_startup_recovery(command_id)
+                .await?
+                .ok_or_else(|| {
+                    UpdaterError::RestoreRequired(format!(
+                        "local recovery descriptor {command_id} has no recoverable database command"
+                    ))
+                })?;
+            self.guard_claim_operation(
+                &claim,
+                cluster_loss,
+                true,
+                self.execute_recovery_takeover(&claim, true),
+            )
+            .await?;
+        }
+        if let Some(command_id) = self.pending_recovery_descriptor_ids()?.into_iter().next() {
+            return Err(UpdaterError::RestoreRequired(format!(
+                "recovery descriptor remains after startup recovery: {command_id}"
+            )));
+        }
+        if let Some(command_id) = self.unsafe_recovery_command_ids().await?.into_iter().next() {
+            return Err(UpdaterError::RestoreRequired(format!(
+                "database command {command_id} crossed the update mutation boundary without a local recovery descriptor"
+            )));
+        }
+        Ok(())
+    }
+
+    async fn cleanup_terminal_recovery_descriptor(
+        &self,
+        command_id: Uuid,
+        cluster_loss: &mut watch::Receiver<bool>,
+    ) -> Result<bool, UpdaterError> {
+        let Some((status, action, target_version, lease_epoch)) =
+            sqlx::query_as::<_, (String, String, Option<String>, i64)>(
+                r#"
+                SELECT status, action, target_version, lease_epoch
+                FROM platform_update_commands
+                WHERE command_id = $1
+                  AND action = 'apply'
+                  AND status IN ('succeeded', 'restored')
+                "#,
+            )
+            .bind(command_id)
+            .fetch_optional(&self.pool)
+            .await?
+        else {
+            return Ok(false);
+        };
+        let claim = ClaimedCommand {
+            command_id,
+            action,
+            target_version,
+            lease_epoch,
+        };
+        let operation = async {
+            let descriptor = self.read_recovery_descriptor(&claim)?;
+            descriptor.validate(&claim, &self.config)?;
+            verify_release_tree(&descriptor.release_dir, &descriptor.manifest).await?;
+            verify_release_identity(&descriptor.release_dir, &descriptor.manifest).await?;
+            let current = read_current_release(
+                &self.config.release_root.join("current"),
+                &self.config.release_root.join("releases"),
+            )?;
+            let expected = match status.as_str() {
+                "succeeded" => std::fs::canonicalize(&descriptor.release_dir)?,
+                "restored" => std::fs::canonicalize(&descriptor.previous_release)?,
+                _ => unreachable!("query limits terminal recovery states"),
+            };
+            if current != expected {
+                return Err(UpdaterError::RestoreRequired(format!(
+                    "terminal database command {command_id} does not match the active release pointer"
+                )));
+            }
+            let hooks = self.config.apply_hooks()?;
+            let mut service_context = self.recovery_service_context(&claim, &descriptor, true);
+            service_context.insert("AIF_UPDATE_PROCESS_SCOPE".to_string(), "full".to_string());
+            if let Err(error) = run_hook(&hooks.admission_close, &service_context).await {
+                self.quiesce_failed_recovery(&claim, &hooks, &service_context, &error)
+                    .await;
+                return Err(error);
+            }
+            let activation = match status.as_str() {
+                "succeeded" => run_hook(&hooks.activate, &service_context).await,
+                "restored" => run_hook(&hooks.resume, &service_context).await,
+                _ => unreachable!("query limits terminal recovery states"),
+            };
+            if let Err(error) = activation {
+                self.quiesce_failed_recovery(&claim, &hooks, &service_context, &error)
+                    .await;
+                return Err(error);
+            }
+            if let Err(error) = run_hook(&hooks.verify, &service_context).await {
+                self.quiesce_failed_recovery(&claim, &hooks, &service_context, &error)
+                    .await;
+                return Err(error);
+            }
+            if let Err(error) = run_hook(&hooks.admission_open, &service_context).await {
+                self.quiesce_failed_recovery(&claim, &hooks, &service_context, &error)
+                    .await;
+                return Err(error);
+            }
+            self.remove_recovery_descriptor_fail_closed(&claim, &hooks, &service_context)
+                .await
+        };
+        self.guard_claim_operation(&claim, cluster_loss, false, operation)
+            .await?;
+        Ok(true)
+    }
+
     pub async fn recover_command(&self, command_id: &str) -> Result<(), UpdaterError> {
         let command_id = Uuid::parse_str(command_id)
             .map_err(|_| UpdaterError::Config("recovery command id must be a UUID".to_string()))?;
         let _host_lock = self.acquire_host_lock()?;
+        let cluster_lock = DatabaseAdvisoryLock::acquire(&self.pool).await?;
+        let mut cluster_loss = cluster_lock.loss_receiver();
+        let result = self
+            .recover_command_locked(command_id, &mut cluster_loss)
+            .await;
+        cluster_lock.release().await?;
+        result
+    }
+
+    async fn recover_command_locked(
+        &self,
+        command_id: Uuid,
+        cluster_loss: &mut watch::Receiver<bool>,
+    ) -> Result<(), UpdaterError> {
         let claim = self
             .claim_manual_recovery(command_id)
             .await?
@@ -274,10 +557,13 @@ impl Updater {
                     "the requested command is not awaiting operator recovery".to_string(),
                 )
             })?;
-        let heartbeat = self.start_heartbeat(&claim);
-        let result = self.execute_recovery_takeover(&claim).await;
-        heartbeat.stop().await;
-        result
+        self.guard_claim_operation(
+            &claim,
+            cluster_loss,
+            true,
+            self.execute_recovery_takeover(&claim, false),
+        )
+        .await
     }
 
     fn acquire_host_lock(&self) -> Result<std::fs::File, UpdaterError> {
@@ -298,11 +584,15 @@ impl Updater {
         Ok(file)
     }
 
-    fn migration_database_url(&self) -> &str {
+    fn migration_database_url(&self) -> Result<&str, UpdaterError> {
         self.config
             .migration_database_url
             .as_deref()
-            .expect("apply configuration validates AIF_MIGRATOR_DATABASE_URL")
+            .ok_or_else(|| {
+                UpdaterError::Config(
+                    "AIF_MIGRATOR_DATABASE_URL is required to recover an unsafe update".to_string(),
+                )
+            })
     }
 
     async fn execute_check(&self, claim: &ClaimedCommand) -> Result<(), UpdaterError> {
@@ -320,11 +610,11 @@ impl Updater {
         )
         .await?;
         self.finish_check(claim, &release, &staged.manifest).await?;
-        self.append_journal(
+        self.append_journal_best_effort(
             claim,
             "verified",
             json!({"release": release.tag_name, "immutable": true}),
-        )?;
+        );
         Ok(())
     }
 
@@ -361,12 +651,45 @@ impl Updater {
         let current_link = self.config.release_root.join("current");
         let previous_release =
             read_current_release(&current_link, &self.config.release_root.join("releases"))?;
+        ensure_upgrade_version(version, &previous_release)?;
         let mut recovery = RecoveryDescriptor::new(claim, &staged, previous_release.clone());
         self.persist_recovery_descriptor(&recovery)?;
-        self.assert_lease(claim).await?;
-        self.record_phase(claim, "quiescing", "started", json!({}))
-            .await?;
-        let pre_migration_context = self.update_context(claim, &staged, None);
+        if let Err(error) = self.assert_lease(claim).await {
+            return self
+                .resume_previous(claim, &staged, &hooks, &previous_release, error)
+                .await;
+        }
+        if let Err(error) = self
+            .record_phase(claim, "admission_closing", "started", json!({}))
+            .await
+        {
+            return self
+                .resume_previous(claim, &staged, &hooks, &previous_release, error)
+                .await;
+        }
+        let service_context = self.service_update_context(claim, &staged, None);
+        if let Err(error) = run_hook(&hooks.admission_close, &service_context).await {
+            return self
+                .resume_previous(claim, &staged, &hooks, &previous_release, error)
+                .await;
+        }
+        if let Err(error) = self
+            .record_phase(claim, "admission_closed", "succeeded", json!({}))
+            .await
+        {
+            return self
+                .resume_previous(claim, &staged, &hooks, &previous_release, error)
+                .await;
+        }
+        if let Err(error) = self
+            .record_phase(claim, "quiescing", "started", json!({}))
+            .await
+        {
+            return self
+                .resume_previous(claim, &staged, &hooks, &previous_release, error)
+                .await;
+        }
+        let pre_migration_context = self.service_update_context(claim, &staged, None);
         if let Err(error) = run_hook(&hooks.quiesce, &pre_migration_context).await {
             return self
                 .resume_previous(claim, &staged, &hooks, &previous_release, error)
@@ -410,10 +733,19 @@ impl Updater {
                 .resume_previous(claim, &staged, &hooks, &previous_release, error)
                 .await;
         }
+        let migration_context =
+            match self.migration_update_context(claim, &staged, Some(&backup_token)) {
+                Ok(context) => context,
+                Err(error) => {
+                    return self
+                        .resume_previous(claim, &staged, &hooks, &previous_release, error)
+                        .await;
+                }
+            };
         let migration = run_trusted(
             &staged.release_dir.join("bin/factoryctl"),
             [OsStr::new("migrate")],
-            &self.update_context(claim, &staged, Some(&backup_token)),
+            &migration_context,
         )
         .await;
         if let Err(error) = migration {
@@ -479,7 +811,7 @@ impl Updater {
         let activation = match self.assert_lease(claim).await {
             Ok(()) => run_hook(
                 &hooks.activate,
-                &self.update_context(claim, &staged, Some(&backup_token)),
+                &self.service_update_context(claim, &staged, Some(&backup_token)),
             )
             .await
             .map(|_| ()),
@@ -500,13 +832,66 @@ impl Updater {
         let verification = match self.assert_lease(claim).await {
             Ok(()) => run_hook(
                 &hooks.verify,
-                &self.update_context(claim, &staged, Some(&backup_token)),
+                &self.service_update_context(claim, &staged, Some(&backup_token)),
             )
             .await
             .map(|_| ()),
             Err(error) => Err(error),
         };
         if let Err(error) = verification {
+            return self
+                .recover_after_migration_boundary(
+                    claim,
+                    &staged,
+                    &hooks,
+                    &previous_release,
+                    &backup_token,
+                    error,
+                )
+                .await;
+        }
+        if let Err(error) = self
+            .mark_apply_activating_full(claim, &staged.manifest)
+            .await
+        {
+            return self
+                .recover_after_migration_boundary(
+                    claim,
+                    &staged,
+                    &hooks,
+                    &previous_release,
+                    &backup_token,
+                    error,
+                )
+                .await;
+        }
+        let mut service_context = self.service_update_context(claim, &staged, Some(&backup_token));
+        service_context.insert("AIF_UPDATE_PROCESS_SCOPE".to_string(), "full".to_string());
+        if let Err(error) = run_hook(&hooks.activate, &service_context).await {
+            return self
+                .recover_after_migration_boundary(
+                    claim,
+                    &staged,
+                    &hooks,
+                    &previous_release,
+                    &backup_token,
+                    error,
+                )
+                .await;
+        }
+        if let Err(error) = run_hook(&hooks.verify, &service_context).await {
+            return self
+                .recover_after_migration_boundary(
+                    claim,
+                    &staged,
+                    &hooks,
+                    &previous_release,
+                    &backup_token,
+                    error,
+                )
+                .await;
+        }
+        if let Err(error) = run_hook(&hooks.admission_open, &service_context).await {
             return self
                 .recover_after_migration_boundary(
                     claim,
@@ -530,13 +915,8 @@ impl Updater {
                 )
                 .await;
         }
-        if let Err(error) = self.remove_recovery_descriptor(claim) {
-            tracing::error!(
-                command.id = %claim.command_id,
-                ?error,
-                "system update succeeded but the recovery descriptor could not be removed"
-            );
-        }
+        self.remove_recovery_descriptor_fail_closed(claim, &hooks, &service_context)
+            .await?;
         if let Err(error) = self.append_journal(
             claim,
             "verified",
@@ -558,7 +938,8 @@ impl Updater {
         hooks: &ApplyHooks,
     ) -> Result<String, UpdaterError> {
         self.assert_lease(claim).await?;
-        let backup = run_hook(&hooks.backup, &self.update_context(claim, staged, None)).await?;
+        let context = self.migration_update_context(claim, staged, None)?;
+        let backup = run_hook(&hooks.backup, &context).await?;
         let backup_token = parse_backup_token(&backup.stdout)?;
         Ok(backup_token)
     }
@@ -571,17 +952,55 @@ impl Updater {
         previous_release: &Path,
         cause: UpdaterError,
     ) -> Result<(), UpdaterError> {
-        let mut context = self.update_context(claim, staged, None);
+        if matches!(&cause, UpdaterError::LeaseLost) {
+            return Err(cause);
+        }
+        self.mark_restoring(claim, &cause.to_string()).await?;
+        self.append_journal_best_effort(
+            claim,
+            "restoring",
+            json!({
+                "reason": "pre_migration_update_failed",
+                "error": cause.to_string(),
+                "previous_release": previous_release
+            }),
+        );
+        let mut context = self.service_update_context(claim, staged, None);
+        context.insert("AIF_UPDATE_PROCESS_SCOPE".to_string(), "full".to_string());
         context.insert(
             "AIF_UPDATE_PREVIOUS_RELEASE".to_string(),
             previous_release.to_string_lossy().into_owned(),
         );
-        match run_hook(&hooks.resume, &context).await {
+        let result = async {
+            self.assert_lease(claim).await?;
+            run_hook(&hooks.resume, &context).await?;
+            self.assert_lease(claim).await?;
+            run_hook(&hooks.verify, &context).await?;
+            self.assert_lease(claim).await?;
+            run_hook(&hooks.admission_open, &context).await?;
+            self.assert_lease(claim).await?;
+            self.mark_restored(claim, &cause.to_string()).await?;
+            Ok::<(), UpdaterError>(())
+        }
+        .await;
+        match result {
             Ok(_) => {
-                self.remove_recovery_descriptor(claim)?;
-                Err(cause)
+                self.remove_recovery_descriptor_fail_closed(claim, hooks, &context)
+                    .await?;
+                self.append_journal_best_effort(
+                    claim,
+                    "restored",
+                    json!({
+                        "reason": "pre_migration_update_failed",
+                        "error": cause.to_string(),
+                        "previous_release": previous_release
+                    }),
+                );
+                Ok(())
             }
             Err(resume_error) => {
+                self.quiesce_failed_recovery(claim, hooks, &context, &resume_error)
+                    .await;
                 let message = format!(
                     "pre-migration update failed ({cause}) and old services could not resume: {resume_error}"
                 );
@@ -627,8 +1046,29 @@ impl Updater {
         backup_token: &str,
         cause: UpdaterError,
     ) -> Result<(), UpdaterError> {
-        self.mark_restoring(claim, &cause.to_string()).await?;
-        self.append_journal(
+        if matches!(&cause, UpdaterError::LeaseLost) {
+            return Err(cause);
+        }
+        let service_context = self.service_update_context(claim, staged, Some(backup_token));
+        self.assert_lease(claim).await?;
+        if let Err(admission_error) = run_hook(&hooks.admission_close, &service_context).await {
+            self.mark_restore_required(claim, &cause, &admission_error)
+                .await?;
+            return Err(UpdaterError::RestoreRequired(format!(
+                "automatic recovery could not close admission: {admission_error}"
+            )));
+        }
+        if let Err(state_error) = self.mark_restoring(claim, &cause.to_string()).await {
+            self.quiesce_failed_recovery(claim, hooks, &service_context, &state_error)
+                .await;
+            return Err(match state_error {
+                UpdaterError::LeaseLost => UpdaterError::LeaseLost,
+                _ => UpdaterError::RestoreRequired(format!(
+                    "admission is closed but the restoring state could not be persisted: {state_error}"
+                )),
+            });
+        }
+        self.append_journal_best_effort(
             claim,
             "restoring",
             json!({
@@ -636,7 +1076,8 @@ impl Updater {
                 "previous_release": previous_release,
                 "backup_token_sha256": sha256_hex(backup_token.as_bytes())
             }),
-        )?;
+        );
+        self.assert_lease(claim).await?;
         if let Err(recovery_error) =
             atomic_switch(&self.config.release_root.join("current"), previous_release)
         {
@@ -646,40 +1087,85 @@ impl Updater {
                 "automatic recovery could not restore the previous release pointer: {recovery_error}"
             )));
         }
-        let mut context = self.update_context(claim, staged, Some(backup_token));
+        let mut context = match self.migration_update_context(claim, staged, Some(backup_token)) {
+            Ok(context) => context,
+            Err(recovery_error) => {
+                self.mark_restore_required(claim, &cause, &recovery_error)
+                    .await?;
+                return Err(UpdaterError::RestoreRequired(format!(
+                    "automatic recovery is missing its migration credential: {recovery_error}"
+                )));
+            }
+        };
         context.insert(
             "AIF_UPDATE_PREVIOUS_RELEASE".to_string(),
             previous_release.to_string_lossy().into_owned(),
         );
-        match run_hook(&hooks.recover, &context).await {
-            Ok(_) => {
-                self.append_journal(
-                    claim,
-                    "restored",
-                    json!({"previous_release": previous_release}),
-                )?;
-                self.mark_restored(claim, &cause.to_string()).await?;
-                self.remove_recovery_descriptor(claim)?;
-                Err(UpdaterError::RestoreRequired(format!(
-                    "new release failed and the previous recovery point was restored: {cause}"
-                )))
-            }
-            Err(recovery_error) => {
-                self.append_journal(
-                    claim,
-                    "restore_required",
-                    json!({
-                        "update_error": cause.to_string(),
-                        "recovery_error": recovery_error.to_string()
-                    }),
-                )?;
-                self.mark_restore_required(claim, &cause, &recovery_error)
-                    .await?;
-                Err(UpdaterError::RestoreRequired(format!(
-                    "automatic recovery failed: {recovery_error}"
-                )))
-            }
+        let recovery = async {
+            self.assert_lease(claim).await?;
+            run_hook(&hooks.recover, &context).await?;
+            self.assert_lease(claim).await?;
+            run_hook(&hooks.verify, &service_context).await?;
+            Ok::<(), UpdaterError>(())
         }
+        .await;
+        if let Err(recovery_error) = recovery {
+            self.quiesce_failed_recovery(claim, hooks, &service_context, &recovery_error)
+                .await;
+            self.mark_restore_required(claim, &cause, &recovery_error)
+                .await?;
+            self.append_journal_best_effort(
+                claim,
+                "restore_required",
+                json!({
+                    "update_error": cause.to_string(),
+                    "recovery_error": recovery_error.to_string()
+                }),
+            );
+            return Err(UpdaterError::RestoreRequired(format!(
+                "automatic recovery failed: {recovery_error}"
+            )));
+        }
+        let mut full_service_context = service_context.clone();
+        full_service_context.insert("AIF_UPDATE_PROCESS_SCOPE".to_string(), "full".to_string());
+        if let Err(error) = run_hook(&hooks.resume, &full_service_context).await {
+            self.quiesce_failed_recovery(claim, hooks, &full_service_context, &error)
+                .await;
+            return Err(UpdaterError::RestoreRequired(format!(
+                "previous recovery point was restored but full process activation failed: {error}"
+            )));
+        }
+        if let Err(error) = run_hook(&hooks.verify, &full_service_context).await {
+            self.quiesce_failed_recovery(claim, hooks, &full_service_context, &error)
+                .await;
+            return Err(UpdaterError::RestoreRequired(format!(
+                "previous recovery point was restored but full process verification failed: {error}"
+            )));
+        }
+        if let Err(error) = run_hook(&hooks.admission_open, &full_service_context).await {
+            self.quiesce_failed_recovery(claim, hooks, &full_service_context, &error)
+                .await;
+            return Err(UpdaterError::RestoreRequired(format!(
+                "previous recovery point was restored but admission could not be opened: {error}"
+            )));
+        }
+        if let Err(error) = self.mark_restored(claim, &cause.to_string()).await {
+            self.quiesce_failed_recovery(claim, hooks, &full_service_context, &error)
+                .await;
+            return Err(UpdaterError::RestoreRequired(format!(
+                "previous recovery point was restored but terminal state could not be persisted: {error}"
+            )));
+        }
+        self.append_journal_best_effort(
+            claim,
+            "restored",
+            json!({"previous_release": previous_release}),
+        );
+        self.remove_recovery_descriptor_fail_closed(claim, hooks, &full_service_context)
+            .await?;
+        Err(UpdaterError::RestoreRequired(format!(
+            "new release failed and the previous recovery point was restored: {cause}"
+        )))
     }
 
     async fn assert_lease(&self, claim: &ClaimedCommand) -> Result<(), UpdaterError> {
@@ -709,16 +1195,40 @@ impl Updater {
         }
     }
 
-    fn update_context(
+    fn service_update_context(
         &self,
         claim: &ClaimedCommand,
         staged: &StagedRelease,
         backup_token: Option<&str>,
     ) -> BTreeMap<String, String> {
         let mut context = hook_context(claim, staged, backup_token);
+        context.insert("AIF_UPDATE_LEASE_OWNER".to_string(), self.owner_id.clone());
+        context.insert(
+            "AIF_UPDATE_LEASE_EPOCH".to_string(),
+            claim.lease_epoch.to_string(),
+        );
+        context.insert(
+            "AIF_UPDATE_LEASE_DURATION_MS".to_string(),
+            self.config.lease_duration.as_millis().to_string(),
+        );
+        context.insert(
+            "AIF_UPDATE_PROCESS_SCOPE".to_string(),
+            "validation".to_string(),
+        );
+        context.insert("AIF_UPDATE_START_MODE".to_string(), "direct".to_string());
+        context
+    }
+
+    fn migration_update_context(
+        &self,
+        claim: &ClaimedCommand,
+        staged: &StagedRelease,
+        backup_token: Option<&str>,
+    ) -> Result<BTreeMap<String, String>, UpdaterError> {
+        let mut context = self.service_update_context(claim, staged, backup_token);
         context.insert(
             "DATABASE_URL".to_string(),
-            self.migration_database_url().to_string(),
+            self.migration_database_url()?.to_string(),
         );
         context.insert(
             "GATEWAY_DATABASE_SCHEMA".to_string(),
@@ -732,12 +1242,7 @@ impl Updater {
             "AIF_BACKUP_ROOT".to_string(),
             self.config.backup_root.to_string_lossy().into_owned(),
         );
-        context.insert("AIF_UPDATE_LEASE_OWNER".to_string(), self.owner_id.clone());
-        context.insert(
-            "AIF_UPDATE_LEASE_EPOCH".to_string(),
-            claim.lease_epoch.to_string(),
-        );
-        context
+        Ok(context)
     }
 
     async fn latest_release(&self) -> Result<GitHubRelease, UpdaterError> {
@@ -899,12 +1404,24 @@ impl Updater {
         .await?;
         normalize_release_permissions(&unpacked, &manifest)?;
         verify_release_tree(&unpacked, &manifest).await?;
+        verify_admin_runtime_archive(
+            &self.config.tar_executable,
+            &unpacked.join("admin/standalone.tar.gz"),
+            &manifest.target_triple,
+        )
+        .await?;
         verify_release_identity(&unpacked, &manifest).await?;
 
         let releases_dir = self.config.release_root.join("releases");
         let release_dir = releases_dir.join(version);
         if tokio::fs::try_exists(&release_dir).await? {
             verify_release_tree(&release_dir, &manifest).await?;
+            verify_admin_runtime_archive(
+                &self.config.tar_executable,
+                &release_dir.join("admin/standalone.tar.gz"),
+                &manifest.target_triple,
+            )
+            .await?;
             verify_release_identity(&release_dir, &manifest).await?;
         } else {
             sync_tree(&unpacked)?;
@@ -930,7 +1447,7 @@ impl Updater {
 
     async fn claim_next(&self) -> Result<Option<ClaimedCommand>, UpdaterError> {
         let now = database_now_ms(&self.pool).await?;
-        let lease_expires = now + duration_ms(self.config.lease_duration)?;
+        let lease_duration = duration_ms(self.config.lease_duration)?;
         let command = sqlx::query_as::<_, ClaimedCommand>(
             r#"
             WITH candidate AS (
@@ -940,7 +1457,8 @@ impl Updater {
                    OR (
                        status = 'running'
                        AND phase IN ('queued', 'preflight', 'staged')
-                       AND lease_expires_at_ms < $1
+                       AND lease_expires_at_ms <
+                           floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT
                    )
                 ORDER BY requested_at_ms, command_id
                 FOR UPDATE SKIP LOCKED
@@ -954,7 +1472,8 @@ impl Updater {
                 END,
                 lease_owner = $2,
                 lease_epoch = command.lease_epoch + 1,
-                lease_expires_at_ms = $3,
+                lease_expires_at_ms =
+                    floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT + $3,
                 attempt_count = command.attempt_count + 1,
                 started_at_ms = COALESCE(command.started_at_ms, $1),
                 updated_at_ms = $1
@@ -966,7 +1485,7 @@ impl Updater {
         )
         .bind(now)
         .bind(&self.owner_id)
-        .bind(lease_expires)
+        .bind(lease_duration)
         .fetch_optional(&self.pool)
         .await?;
         Ok(command)
@@ -974,7 +1493,7 @@ impl Updater {
 
     async fn claim_expired_recovery(&self) -> Result<Option<ClaimedCommand>, UpdaterError> {
         let now = database_now_ms(&self.pool).await?;
-        let lease_expires = now + duration_ms(self.config.lease_duration)?;
+        let lease_duration = duration_ms(self.config.lease_duration)?;
         let command = sqlx::query_as::<_, ClaimedCommand>(
             r#"
             WITH candidate AS (
@@ -983,10 +1502,12 @@ impl Updater {
                 WHERE action = 'apply'
                   AND status IN ('running', 'restoring')
                   AND phase IN (
-                      'quiescing', 'quiesced', 'recovery_ready', 'migrated',
-                      'switched', 'restoring'
+                      'admission_closing', 'admission_closed', 'quiescing',
+                      'quiesced', 'recovery_ready', 'migrated', 'switched',
+                      'activating_full', 'restoring'
                   )
-                  AND lease_expires_at_ms < $1
+                  AND lease_expires_at_ms <
+                      floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT
                 ORDER BY requested_at_ms, command_id
                 FOR UPDATE SKIP LOCKED
                 LIMIT 1
@@ -999,7 +1520,8 @@ impl Updater {
                     'Updater lease expired after the release crossed a mutation boundary',
                 lease_owner = $2,
                 lease_epoch = command.lease_epoch + 1,
-                lease_expires_at_ms = $3,
+                lease_expires_at_ms =
+                    floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT + $3,
                 attempt_count = command.attempt_count + 1,
                 updated_at_ms = $1
             FROM candidate
@@ -1010,10 +1532,34 @@ impl Updater {
         )
         .bind(now)
         .bind(&self.owner_id)
-        .bind(lease_expires)
+        .bind(lease_duration)
         .fetch_optional(&self.pool)
         .await?;
         Ok(command)
+    }
+
+    async fn unsafe_recovery_command_ids(&self) -> Result<Vec<Uuid>, UpdaterError> {
+        Ok(sqlx::query_scalar(
+            r#"
+            SELECT command_id
+            FROM platform_update_commands
+            WHERE action = 'apply'
+              AND (
+                  status = 'restore_required'
+                  OR (
+                      status IN ('running', 'restoring')
+                      AND phase IN (
+                          'admission_closing', 'admission_closed', 'quiescing',
+                          'quiesced', 'recovery_ready', 'migrated', 'switched',
+                          'activating_full', 'restoring'
+                      )
+                  )
+              )
+            ORDER BY requested_at_ms, command_id
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?)
     }
 
     async fn claim_manual_recovery(
@@ -1021,7 +1567,7 @@ impl Updater {
         command_id: Uuid,
     ) -> Result<Option<ClaimedCommand>, UpdaterError> {
         let now = database_now_ms(&self.pool).await?;
-        let lease_expires = now + duration_ms(self.config.lease_duration)?;
+        let lease_duration = duration_ms(self.config.lease_duration)?;
         let command = sqlx::query_as::<_, ClaimedCommand>(
             r#"
             UPDATE platform_update_commands
@@ -1031,7 +1577,8 @@ impl Updater {
                 failure_message = NULL,
                 lease_owner = $2,
                 lease_epoch = lease_epoch + 1,
-                lease_expires_at_ms = $3,
+                lease_expires_at_ms =
+                    floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT + $3,
                 attempt_count = attempt_count + 1,
                 updated_at_ms = $1
             WHERE command_id = $4
@@ -1042,68 +1589,276 @@ impl Updater {
         )
         .bind(now)
         .bind(&self.owner_id)
-        .bind(lease_expires)
+        .bind(lease_duration)
         .bind(command_id)
         .fetch_optional(&self.pool)
         .await?;
         Ok(command)
     }
 
-    async fn execute_recovery_takeover(&self, claim: &ClaimedCommand) -> Result<(), UpdaterError> {
-        let result = self.try_recovery_takeover(claim).await;
+    async fn claim_startup_recovery(
+        &self,
+        command_id: Uuid,
+    ) -> Result<Option<ClaimedCommand>, UpdaterError> {
+        let now = database_now_ms(&self.pool).await?;
+        let lease_duration = duration_ms(self.config.lease_duration)?;
+        let command = sqlx::query_as::<_, ClaimedCommand>(
+            r#"
+            UPDATE platform_update_commands
+            SET status = 'restoring',
+                phase = 'restoring',
+                failure_code = 'startup_recovery_gate',
+                failure_message =
+                    'Startup recovery gate found an unfinished local recovery descriptor',
+                lease_owner = $2,
+                lease_epoch = lease_epoch + 1,
+                lease_expires_at_ms =
+                    floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT + $3,
+                attempt_count = attempt_count + 1,
+                updated_at_ms = $1
+            WHERE command_id = $4
+              AND action = 'apply'
+              AND status IN ('running', 'restoring', 'restore_required')
+            RETURNING command_id, action, target_version, lease_epoch
+            "#,
+        )
+        .bind(now)
+        .bind(&self.owner_id)
+        .bind(lease_duration)
+        .bind(command_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(command)
+    }
+
+    async fn execute_recovery_takeover(
+        &self,
+        claim: &ClaimedCommand,
+        startup_gate: bool,
+    ) -> Result<(), UpdaterError> {
+        let result = self.try_recovery_takeover(claim, startup_gate).await;
         if let Err(error) = result {
+            if matches!(&error, UpdaterError::LeaseLost) {
+                return Err(error);
+            }
+            let context = self.emergency_recovery_context(claim, startup_gate);
+            self.quiesce_failed_recovery_from_config(claim, &context, &error)
+                .await;
             let message = format!("automatic recovery takeover failed: {error}");
             self.set_recovery_state(claim, "restore_required", "failed", &message)
                 .await?;
-            self.append_journal(
+            self.append_journal_best_effort(
                 claim,
                 "restore_required",
                 json!({"reason": "automatic_recovery_takeover_failed", "error": error.to_string()}),
-            )?;
+            );
             return Err(UpdaterError::RestoreRequired(message));
         }
         Ok(())
     }
 
-    async fn try_recovery_takeover(&self, claim: &ClaimedCommand) -> Result<(), UpdaterError> {
+    fn emergency_recovery_context(
+        &self,
+        claim: &ClaimedCommand,
+        startup_gate: bool,
+    ) -> BTreeMap<String, String> {
+        BTreeMap::from([
+            (
+                "AIF_UPDATE_COMMAND_ID".to_string(),
+                claim.command_id.to_string(),
+            ),
+            ("AIF_UPDATE_LEASE_OWNER".to_string(), self.owner_id.clone()),
+            (
+                "AIF_UPDATE_LEASE_EPOCH".to_string(),
+                claim.lease_epoch.to_string(),
+            ),
+            (
+                "AIF_UPDATE_START_MODE".to_string(),
+                recovery_start_mode(startup_gate).to_string(),
+            ),
+            (
+                "AIF_UPDATE_PROCESS_SCOPE".to_string(),
+                "validation".to_string(),
+            ),
+        ])
+    }
+
+    async fn try_recovery_takeover(
+        &self,
+        claim: &ClaimedCommand,
+        startup_gate: bool,
+    ) -> Result<(), UpdaterError> {
         let hooks = self.config.apply_hooks()?;
         let descriptor = self.read_recovery_descriptor(claim)?;
         descriptor.validate(claim, &self.config)?;
         verify_release_tree(&descriptor.release_dir, &descriptor.manifest).await?;
         verify_release_identity(&descriptor.release_dir, &descriptor.manifest).await?;
+        let service_context = self.recovery_service_context(claim, &descriptor, startup_gate);
+        self.assert_lease(claim).await?;
+        run_hook(&hooks.admission_close, &service_context).await?;
+        self.assert_lease(claim).await?;
         atomic_switch(
             &self.config.release_root.join("current"),
             &descriptor.previous_release,
         )?;
 
-        let context = self.recovery_update_context(claim, &descriptor);
         if descriptor.backup_token.is_some() {
-            run_hook(&hooks.recover, &context).await?;
+            let recovery_context =
+                self.recovery_update_context(claim, &descriptor, startup_gate)?;
+            self.assert_lease(claim).await?;
+            if let Err(error) = run_hook(&hooks.recover, &recovery_context).await {
+                self.quiesce_failed_recovery(claim, &hooks, &service_context, &error)
+                    .await;
+                return Err(error);
+            }
         } else {
-            run_hook(&hooks.resume, &context).await?;
+            self.assert_lease(claim).await?;
+            if let Err(error) = run_hook(&hooks.resume, &service_context).await {
+                self.quiesce_failed_recovery(claim, &hooks, &service_context, &error)
+                    .await;
+                return Err(error);
+            }
         }
-        self.append_journal(
+        if let Err(error) = self.assert_lease(claim).await {
+            self.quiesce_failed_recovery(claim, &hooks, &service_context, &error)
+                .await;
+            return Err(error);
+        }
+        if let Err(error) = run_hook(&hooks.verify, &service_context).await {
+            self.quiesce_failed_recovery(claim, &hooks, &service_context, &error)
+                .await;
+            return Err(error);
+        }
+        let mut full_service_context = service_context.clone();
+        full_service_context.insert("AIF_UPDATE_PROCESS_SCOPE".to_string(), "full".to_string());
+        if let Err(error) = run_hook(&hooks.resume, &full_service_context).await {
+            self.quiesce_failed_recovery(claim, &hooks, &full_service_context, &error)
+                .await;
+            return Err(error);
+        }
+        if let Err(error) = run_hook(&hooks.verify, &full_service_context).await {
+            self.quiesce_failed_recovery(claim, &hooks, &full_service_context, &error)
+                .await;
+            return Err(error);
+        }
+        if let Err(error) = run_hook(&hooks.admission_open, &full_service_context).await {
+            self.quiesce_failed_recovery(claim, &hooks, &full_service_context, &error)
+                .await;
+            return Err(error);
+        }
+        if let Err(error) = self
+            .mark_restored(
+                claim,
+                "Updater restarted after an unfinished unsafe update and restored the previous release",
+            )
+            .await
+        {
+            self.quiesce_failed_recovery(claim, &hooks, &full_service_context, &error)
+                .await;
+            return Err(error);
+        }
+        self.append_journal_best_effort(
             claim,
             "restored",
             json!({
-                "reason": "expired_update_lease",
+                "reason": "unfinished_unsafe_update",
                 "previous_release": descriptor.previous_release,
                 "used_backup": descriptor.backup_token.is_some()
             }),
-        )?;
-        self.mark_restored(
-            claim,
-            "Updater restarted after an expired unsafe lease and restored the previous release",
-        )
-        .await?;
-        self.remove_recovery_descriptor(claim)?;
+        );
+        self.remove_recovery_descriptor_fail_closed(claim, &hooks, &full_service_context)
+            .await?;
         Ok(())
     }
 
-    fn recovery_update_context(
+    async fn remove_recovery_descriptor_fail_closed(
+        &self,
+        claim: &ClaimedCommand,
+        hooks: &ApplyHooks,
+        service_context: &BTreeMap<String, String>,
+    ) -> Result<(), UpdaterError> {
+        if let Err(error) = self.remove_recovery_descriptor(claim) {
+            self.quiesce_failed_recovery(claim, hooks, service_context, &error)
+                .await;
+            return Err(UpdaterError::RestoreRequired(format!(
+                "recovery descriptor could not be removed safely: {error}"
+            )));
+        }
+        Ok(())
+    }
+
+    async fn quiesce_failed_recovery_from_config(
+        &self,
+        claim: &ClaimedCommand,
+        service_context: &BTreeMap<String, String>,
+        cause: &UpdaterError,
+    ) {
+        match &self.config.admission_close_hook {
+            Some(hook) => {
+                if let Err(error) = run_hook(hook, service_context).await {
+                    tracing::error!(
+                        command.id = %claim.command_id,
+                        ?error,
+                        ?cause,
+                        "failed recovery could not close admission"
+                    );
+                }
+            }
+            None => tracing::error!(
+                command.id = %claim.command_id,
+                ?cause,
+                "failed recovery has no configured admission-close hook"
+            ),
+        }
+        match &self.config.quiesce_hook {
+            Some(hook) => {
+                if let Err(error) = run_hook(hook, service_context).await {
+                    tracing::error!(
+                        command.id = %claim.command_id,
+                        ?error,
+                        ?cause,
+                        "failed recovery could not stop application processes"
+                    );
+                }
+            }
+            None => tracing::error!(
+                command.id = %claim.command_id,
+                ?cause,
+                "failed recovery has no configured quiesce hook"
+            ),
+        }
+    }
+
+    async fn quiesce_failed_recovery(
+        &self,
+        claim: &ClaimedCommand,
+        hooks: &ApplyHooks,
+        service_context: &BTreeMap<String, String>,
+        cause: &UpdaterError,
+    ) {
+        if let Err(error) = run_hook(&hooks.admission_close, service_context).await {
+            tracing::error!(
+                command.id = %claim.command_id,
+                ?error,
+                ?cause,
+                "failed recovery could not close admission"
+            );
+        }
+        if let Err(error) = run_hook(&hooks.quiesce, service_context).await {
+            tracing::error!(
+                command.id = %claim.command_id,
+                ?error,
+                ?cause,
+                "failed recovery could not stop application processes"
+            );
+        }
+    }
+
+    fn recovery_service_context(
         &self,
         claim: &ClaimedCommand,
         descriptor: &RecoveryDescriptor,
+        startup_gate: bool,
     ) -> BTreeMap<String, String> {
         let mut context = hook_context_parts(
             claim,
@@ -1112,8 +1867,39 @@ impl Updater {
             descriptor.backup_token.as_deref(),
         );
         context.insert(
+            "AIF_UPDATE_PREVIOUS_RELEASE".to_string(),
+            descriptor.previous_release.to_string_lossy().into_owned(),
+        );
+        context.insert("AIF_UPDATE_LEASE_OWNER".to_string(), self.owner_id.clone());
+        context.insert(
+            "AIF_UPDATE_LEASE_EPOCH".to_string(),
+            claim.lease_epoch.to_string(),
+        );
+        context.insert(
+            "AIF_UPDATE_LEASE_DURATION_MS".to_string(),
+            self.config.lease_duration.as_millis().to_string(),
+        );
+        context.insert(
+            "AIF_UPDATE_START_MODE".to_string(),
+            recovery_start_mode(startup_gate).to_string(),
+        );
+        context.insert(
+            "AIF_UPDATE_PROCESS_SCOPE".to_string(),
+            "validation".to_string(),
+        );
+        context
+    }
+
+    fn recovery_update_context(
+        &self,
+        claim: &ClaimedCommand,
+        descriptor: &RecoveryDescriptor,
+        startup_gate: bool,
+    ) -> Result<BTreeMap<String, String>, UpdaterError> {
+        let mut context = self.recovery_service_context(claim, descriptor, startup_gate);
+        context.insert(
             "DATABASE_URL".to_string(),
-            self.migration_database_url().to_string(),
+            self.migration_database_url()?.to_string(),
         );
         context.insert(
             "GATEWAY_DATABASE_SCHEMA".to_string(),
@@ -1127,16 +1913,7 @@ impl Updater {
             "AIF_BACKUP_ROOT".to_string(),
             self.config.backup_root.to_string_lossy().into_owned(),
         );
-        context.insert(
-            "AIF_UPDATE_PREVIOUS_RELEASE".to_string(),
-            descriptor.previous_release.to_string_lossy().into_owned(),
-        );
-        context.insert("AIF_UPDATE_LEASE_OWNER".to_string(), self.owner_id.clone());
-        context.insert(
-            "AIF_UPDATE_LEASE_EPOCH".to_string(),
-            claim.lease_epoch.to_string(),
-        );
-        context
+        Ok(context)
     }
 
     fn recovery_descriptor_path(&self, claim: &ClaimedCommand) -> PathBuf {
@@ -1144,6 +1921,10 @@ impl Updater {
             .journal_root
             .join("recovery")
             .join(format!("{}.json", claim.command_id))
+    }
+
+    fn pending_recovery_descriptor_ids(&self) -> Result<Vec<Uuid>, UpdaterError> {
+        list_recovery_descriptor_ids(&self.config.journal_root.join("recovery"))
     }
 
     fn persist_recovery_descriptor(
@@ -1210,48 +1991,85 @@ impl Updater {
 
     fn start_heartbeat(&self, claim: &ClaimedCommand) -> Heartbeat {
         let (stop_tx, mut stop_rx) = watch::channel(false);
+        let (lost_tx, lost_rx) = watch::channel(false);
         let pool = self.pool.clone();
         let owner = self.owner_id.clone();
         let command_id = claim.command_id;
         let lease_epoch = claim.lease_epoch;
         let lease_duration = self.config.lease_duration;
+        let recovery_descriptor = self.recovery_descriptor_path(claim);
         let mut ticker = interval((lease_duration / 3).max(Duration::from_secs(1)));
         ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let task = tokio::spawn(async move {
             loop {
                 tokio::select! {
                     _ = ticker.tick() => {
-                        let Ok(now) = database_now_ms(&pool).await else {
+                        let Ok(lease_duration_ms) = duration_ms(lease_duration) else {
                             continue;
                         };
-                        let Ok(expires) = duration_ms(lease_duration).map(|lease| now + lease) else {
-                            continue;
-                        };
-                        let heartbeat = sqlx::query(
-                            r#"
-                            UPDATE platform_update_commands
-                            SET lease_expires_at_ms = $1, updated_at_ms = $2
-                            WHERE command_id = $3
-                              AND lease_owner = $4
-                              AND lease_epoch = $5
-                              AND status IN ('running', 'restoring')
-                            "#,
+                        let heartbeat = timeout(
+                            GUARD_PROBE_TIMEOUT,
+                            sqlx::query_scalar::<_, bool>(
+                                r#"
+                                WITH refreshed AS (
+                                    UPDATE platform_update_commands
+                                    SET lease_expires_at_ms =
+                                            floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT + $1,
+                                        updated_at_ms =
+                                            floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT
+                                    WHERE command_id = $2
+                                      AND lease_owner = $3
+                                      AND lease_epoch = $4
+                                      AND status IN ('running', 'restoring')
+                                    RETURNING 1
+                                )
+                                SELECT EXISTS(SELECT 1 FROM refreshed)
+                                    OR EXISTS(
+                                        SELECT 1
+                                        FROM platform_update_commands
+                                        WHERE command_id = $2
+                                          AND lease_epoch = $4
+                                          AND status IN ('succeeded', 'restored')
+                                    )
+                                "#,
+                            )
+                            .bind(lease_duration_ms)
+                            .bind(command_id)
+                            .bind(&owner)
+                            .bind(lease_epoch)
+                            .fetch_one(&pool),
                         )
-                        .bind(expires)
-                        .bind(now)
-                        .bind(command_id)
-                        .bind(&owner)
-                        .bind(lease_epoch)
-                        .execute(&pool)
                         .await;
                         match heartbeat {
-                            Ok(result) if result.rows_affected() == 1 => {}
-                            Ok(_) => {
+                            Ok(Ok(true)) => {}
+                            Ok(Ok(false)) => {
                                 tracing::error!(%command_id, "system update lease heartbeat lost ownership");
+                                let _ = lost_tx.send(true);
                                 break;
                             }
-                            Err(error) => {
+                            Ok(Err(error)) => {
+                                if recovery_descriptor.exists() {
+                                    tracing::warn!(
+                                        %command_id,
+                                        ?error,
+                                        "system update lease heartbeat is blocked during protected recovery; advisory lock remains authoritative"
+                                    );
+                                    continue;
+                                }
                                 tracing::error!(%command_id, ?error, "system update lease heartbeat failed");
+                                let _ = lost_tx.send(true);
+                                break;
+                            }
+                            Err(_) => {
+                                if recovery_descriptor.exists() {
+                                    tracing::warn!(
+                                        %command_id,
+                                        "system update lease heartbeat timed out during protected recovery; advisory lock remains authoritative"
+                                    );
+                                    continue;
+                                }
+                                tracing::error!(%command_id, "system update lease heartbeat timed out");
+                                let _ = lost_tx.send(true);
                                 break;
                             }
                         }
@@ -1264,7 +2082,84 @@ impl Updater {
                 }
             }
         });
-        Heartbeat { stop_tx, task }
+        Heartbeat {
+            stop_tx,
+            lost_rx,
+            task: Some(task),
+        }
+    }
+
+    async fn guard_claim_operation<T, F>(
+        &self,
+        claim: &ClaimedCommand,
+        cluster_loss: &mut watch::Receiver<bool>,
+        heartbeat_enabled: bool,
+        operation: F,
+    ) -> Result<T, UpdaterError>
+    where
+        F: Future<Output = Result<T, UpdaterError>>,
+    {
+        let heartbeat = heartbeat_enabled.then(|| self.start_heartbeat(claim));
+        let mut lease_loss = heartbeat.as_ref().map(Heartbeat::loss_receiver);
+        let mut operation = Box::pin(operation);
+        let (result, guard_loss_handled) = match lease_loss.as_mut() {
+            Some(lease_loss) => {
+                tokio::select! {
+                    result = &mut operation => (result, false),
+                    _ = wait_for_loss(cluster_loss) => {
+                        drop(operation);
+                        self.fail_closed_guard_loss(claim, "database advisory lock was lost").await;
+                        (Err(UpdaterError::LeaseLost), true)
+                    }
+                    _ = wait_for_loss(lease_loss) => {
+                        drop(operation);
+                        self.fail_closed_guard_loss(claim, "database command lease heartbeat was lost").await;
+                        (Err(UpdaterError::LeaseLost), true)
+                    }
+                }
+            }
+            None => {
+                tokio::select! {
+                    result = &mut operation => (result, false),
+                    _ = wait_for_loss(cluster_loss) => {
+                        drop(operation);
+                        self.fail_closed_guard_loss(claim, "database advisory lock was lost").await;
+                        (Err(UpdaterError::LeaseLost), true)
+                    }
+                }
+            }
+        };
+        if !guard_loss_handled
+            && result.is_err()
+            && claim.action == "apply"
+            && (matches!(&result, Err(UpdaterError::LeaseLost))
+                || self.recovery_descriptor_path(claim).exists())
+        {
+            self.fail_closed_guard_loss(
+                claim,
+                "update operation failed after crossing a mutation boundary",
+            )
+            .await;
+        }
+        if let Some(heartbeat) = heartbeat {
+            heartbeat.stop().await;
+        }
+        result
+    }
+
+    async fn fail_closed_guard_loss(&self, claim: &ClaimedCommand, reason: &str) {
+        if claim.action != "apply" {
+            return;
+        }
+        let error = UpdaterError::LeaseLost;
+        let context = self.emergency_recovery_context(claim, false);
+        tracing::error!(
+            command.id = %claim.command_id,
+            reason,
+            "system update execution guard was lost; forcing admission closed"
+        );
+        self.quiesce_failed_recovery_from_config(claim, &context, &error)
+            .await;
     }
 
     async fn record_phase(
@@ -1285,6 +2180,8 @@ impl Updater {
             WHERE command_id = $4
               AND lease_owner = $5
               AND lease_epoch = $6
+              AND lease_expires_at_ms >
+                  floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT
               AND status = 'running'
             "#,
         )
@@ -1363,10 +2260,70 @@ impl Updater {
             WHERE command_id = $3
               AND lease_owner = $4
               AND lease_epoch = $5
+              AND lease_expires_at_ms >
+                  floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT
             "#,
         )
         .bind(now)
         .bind(json!({"latest_version": release.tag_name, "immutable": true}))
+        .bind(claim.command_id)
+        .bind(&self.owner_id)
+        .bind(claim.lease_epoch)
+        .execute(&mut *tx)
+        .await?;
+        if result.rows_affected() != 1 {
+            return Err(UpdaterError::LeaseLost);
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn mark_apply_activating_full(
+        &self,
+        claim: &ClaimedCommand,
+        manifest: &ReleaseManifest,
+    ) -> Result<(), UpdaterError> {
+        let now = database_now_ms(&self.pool).await?;
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            r#"
+            UPDATE platform_release_state
+            SET previous_version = current_version,
+                previous_commit_sha = current_commit_sha,
+                current_version = $1,
+                current_commit_sha = $2,
+                latest_version = $1,
+                latest_commit_sha = $2,
+                latest_verified = TRUE,
+                last_error_code = NULL,
+                last_error_message = NULL,
+                updated_at_ms = $3
+            WHERE singleton = TRUE
+            "#,
+        )
+        .bind(&manifest.release_version)
+        .bind(&manifest.commit_sha)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+        let result = sqlx::query(
+            r#"
+            UPDATE platform_update_commands
+            SET phase = 'activating_full', updated_at_ms = $1,
+                progress = progress || $2
+            WHERE command_id = $3
+              AND lease_owner = $4
+              AND lease_epoch = $5
+              AND lease_expires_at_ms >
+                  floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT
+            "#,
+        )
+        .bind(now)
+        .bind(json!({
+            "release_version": manifest.release_version,
+            "commit_sha": manifest.commit_sha,
+            "migration_version": manifest.migration_version
+        }))
         .bind(claim.command_id)
         .bind(&self.owner_id)
         .bind(claim.lease_epoch)
@@ -1389,22 +2346,10 @@ impl Updater {
         sqlx::query(
             r#"
             UPDATE platform_release_state
-            SET previous_version = current_version,
-                previous_commit_sha = current_commit_sha,
-                current_version = $1,
-                current_commit_sha = $2,
-                latest_version = $1,
-                latest_commit_sha = $2,
-                latest_verified = TRUE,
-                last_applied_at_ms = $3,
-                last_error_code = NULL,
-                last_error_message = NULL,
-                updated_at_ms = $3
+            SET last_applied_at_ms = $1, updated_at_ms = $1
             WHERE singleton = TRUE
             "#,
         )
-        .bind(&manifest.release_version)
-        .bind(&manifest.commit_sha)
         .bind(now)
         .execute(&mut *tx)
         .await?;
@@ -1418,6 +2363,8 @@ impl Updater {
             WHERE command_id = $3
               AND lease_owner = $4
               AND lease_epoch = $5
+              AND lease_expires_at_ms >
+                  floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT
             "#,
         )
         .bind(now)
@@ -1455,6 +2402,8 @@ impl Updater {
             WHERE command_id = $4
               AND lease_owner = $5
               AND lease_epoch = $6
+              AND lease_expires_at_ms >
+                  floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT
             "#,
         )
         .bind(code)
@@ -1480,7 +2429,7 @@ impl Updater {
         .bind(now)
         .execute(&self.pool)
         .await?;
-        self.append_journal(claim, "failed", json!({"error": message}))?;
+        self.append_journal_best_effort(claim, "failed", json!({"error": message}));
         Ok(())
     }
 
@@ -1543,6 +2492,8 @@ impl Updater {
             WHERE command_id = $5
               AND lease_owner = $6
               AND lease_epoch = $7
+              AND lease_expires_at_ms >
+                  floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT
             "#,
         )
         .bind(status)
@@ -1568,7 +2519,11 @@ impl Updater {
     ) -> Result<(), UpdaterError> {
         std::fs::create_dir_all(&self.config.journal_root)?;
         let path = self.config.journal_root.join("events.jsonl");
-        let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(path)?;
         let entry = JournalEntry {
             command_id: claim.command_id,
             action: &claim.action,
@@ -1583,17 +2538,44 @@ impl Updater {
         file.sync_data()?;
         Ok(())
     }
+
+    fn append_journal_best_effort(&self, claim: &ClaimedCommand, phase: &str, details: Value) {
+        if let Err(error) = self.append_journal(claim, phase, details) {
+            tracing::error!(
+                command.id = %claim.command_id,
+                ?error,
+                phase,
+                "system update local journal append failed"
+            );
+        }
+    }
 }
 
 struct Heartbeat {
     stop_tx: watch::Sender<bool>,
-    task: JoinHandle<()>,
+    lost_rx: watch::Receiver<bool>,
+    task: Option<JoinHandle<()>>,
 }
 
 impl Heartbeat {
-    async fn stop(self) {
+    fn loss_receiver(&self) -> watch::Receiver<bool> {
+        self.lost_rx.clone()
+    }
+
+    async fn stop(mut self) {
         let _ = self.stop_tx.send(true);
-        let _ = self.task.await;
+        if let Some(task) = self.task.take() {
+            let _ = task.await;
+        }
+    }
+}
+
+impl Drop for Heartbeat {
+    fn drop(&mut self) {
+        let _ = self.stop_tx.send(true);
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
     }
 }
 
@@ -1720,6 +2702,23 @@ impl ReleaseManifest {
             "bin/remote-submit-runner",
             "bin/updated",
             "admin/server.js",
+            "admin/standalone.tar.gz",
+            "ops/hooks/activate",
+            "ops/hooks/fail-closed",
+            "ops/hooks/quiesce",
+            "ops/hooks/recover",
+            "ops/hooks/resume",
+            "ops/hooks/start-processes",
+            "ops/hooks/verify",
+            "ops/docs/production-release.md",
+            "ops/install-release",
+            "ops/systemd/ai-image-factory-processes.target",
+            "ops/systemd/ai-image-factory-recovery-failed.service",
+            "ops/systemd/ai-image-factory-recovery-gate.service",
+            "ops/systemd/ai-image-factory-updater-recover@.service",
+            "ops/systemd/ai-image-factory-updater.service",
+            "ops/systemd/ai-image-factory.target",
+            "ops/upgrade-updater",
             "release.json",
         ] {
             if !paths.contains(required) {
@@ -1838,6 +2837,17 @@ async fn database_now_ms(pool: &PgPool) -> Result<i64, UpdaterError> {
     .await?)
 }
 
+async fn wait_for_loss(receiver: &mut watch::Receiver<bool>) {
+    if *receiver.borrow() {
+        return;
+    }
+    while receiver.changed().await.is_ok() {
+        if *receiver.borrow() {
+            return;
+        }
+    }
+}
+
 async fn run_hook(
     executable: &Path,
     context: &BTreeMap<String, String>,
@@ -1872,6 +2882,7 @@ where
             executable.display()
         ))
     })?;
+    let mut process_group_guard = ProcessGroupGuard::new(process_group);
     let stdout = child.stdout.take().ok_or_else(|| {
         UpdaterError::Command("trusted command stdout was not captured".to_string())
     })?;
@@ -1923,7 +2934,32 @@ where
             output.status
         )));
     }
+    process_group_guard.disarm();
     Ok(output)
+}
+
+struct ProcessGroupGuard {
+    process_group: Option<u32>,
+}
+
+impl ProcessGroupGuard {
+    fn new(process_group: u32) -> Self {
+        Self {
+            process_group: Some(process_group),
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.process_group = None;
+    }
+}
+
+impl Drop for ProcessGroupGuard {
+    fn drop(&mut self) {
+        if let Some(process_group) = self.process_group {
+            terminate_process_group(process_group);
+        }
+    }
 }
 
 async fn read_bounded_output<R>(mut reader: R) -> std::io::Result<Vec<u8>>
@@ -2057,6 +3093,188 @@ async fn verify_release_tree(root: &Path, manifest: &ReleaseManifest) -> Result<
                 expected.path
             )));
         }
+        if expected.path.starts_with("bin/") {
+            verify_release_binary_architecture(&path, &expected.path, &manifest.target_triple)?;
+        }
+    }
+    Ok(())
+}
+
+fn verify_release_binary_architecture(
+    path: &Path,
+    relative: &str,
+    target_triple: &str,
+) -> Result<(), UpdaterError> {
+    let expected_machine = match target_triple {
+        "x86_64-unknown-linux-gnu" => 62_u16,
+        "aarch64-unknown-linux-gnu" => 183_u16,
+        _ => {
+            return Err(UpdaterError::InvalidRelease(
+                "release target is unsupported".to_string(),
+            ));
+        }
+    };
+    let mut header = [0_u8; 20];
+    std::fs::File::open(path)?
+        .read_exact(&mut header)
+        .map_err(|_| {
+            UpdaterError::InvalidRelease(format!(
+                "release binary has a truncated ELF header: {relative}"
+            ))
+        })?;
+    let machine = u16::from_le_bytes([header[18], header[19]]);
+    if header[..4] != [0x7f, b'E', b'L', b'F']
+        || header[4] != 2
+        || header[5] != 1
+        || machine != expected_machine
+    {
+        return Err(UpdaterError::InvalidRelease(format!(
+            "release binary architecture does not match {target_triple}: {relative}"
+        )));
+    }
+    Ok(())
+}
+
+async fn verify_admin_runtime_archive(
+    tar: &Path,
+    archive: &Path,
+    target_triple: &str,
+) -> Result<(), UpdaterError> {
+    let listing = run_trusted(
+        tar,
+        [OsStr::new("-tzf"), archive.as_os_str()],
+        &BTreeMap::new(),
+    )
+    .await?;
+    let listing = String::from_utf8(listing.stdout).map_err(|_| {
+        UpdaterError::InvalidRelease("admin runtime paths are not UTF-8".to_string())
+    })?;
+    let paths: Vec<_> = listing.lines().collect();
+    if paths.is_empty() || paths.len() > MAX_ARCHIVE_ENTRIES {
+        return Err(UpdaterError::InvalidRelease(
+            "admin runtime entry count is outside the supported range".to_string(),
+        ));
+    }
+    for path in paths {
+        let path = Path::new(path.trim_end_matches('/'));
+        if path.as_os_str().is_empty()
+            || path.is_absolute()
+            || path.components().any(|component| {
+                matches!(
+                    component,
+                    std::path::Component::ParentDir
+                        | std::path::Component::CurDir
+                        | std::path::Component::Prefix(_)
+                        | std::path::Component::RootDir
+                )
+            })
+        {
+            return Err(UpdaterError::InvalidRelease(
+                "admin runtime path escapes the archive".to_string(),
+            ));
+        }
+    }
+    let verbose = run_trusted(
+        tar,
+        [OsStr::new("-tvzf"), archive.as_os_str()],
+        &BTreeMap::new(),
+    )
+    .await?;
+    for line in String::from_utf8(verbose.stdout)
+        .map_err(|_| {
+            UpdaterError::InvalidRelease("admin runtime listing is not UTF-8".to_string())
+        })?
+        .lines()
+    {
+        if !matches!(line.as_bytes().first(), Some(b'-' | b'd')) {
+            return Err(UpdaterError::InvalidRelease(
+                "admin runtime contains links or special files".to_string(),
+            ));
+        }
+    }
+
+    let extracted = tempfile::tempdir()?;
+    run_trusted(
+        tar,
+        [
+            OsStr::new("-xzf"),
+            archive.as_os_str(),
+            OsStr::new("-C"),
+            extracted.path().as_os_str(),
+            OsStr::new("--no-same-owner"),
+            OsStr::new("--no-same-permissions"),
+        ],
+        &BTreeMap::new(),
+    )
+    .await?;
+    verify_admin_runtime_tree(extracted.path(), extracted.path(), target_triple)
+}
+
+fn verify_admin_runtime_tree(
+    root: &Path,
+    directory: &Path,
+    target_triple: &str,
+) -> Result<(), UpdaterError> {
+    for entry in std::fs::read_dir(directory)? {
+        let entry = entry?;
+        let path = entry.path();
+        let metadata = std::fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_symlink() {
+            return Err(UpdaterError::InvalidRelease(
+                "admin runtime contains a link".to_string(),
+            ));
+        }
+        if metadata.is_dir() {
+            verify_admin_runtime_tree(root, &path, target_triple)?;
+            continue;
+        }
+        if !metadata.is_file() {
+            return Err(UpdaterError::InvalidRelease(
+                "admin runtime contains a special file".to_string(),
+            ));
+        }
+        let relative = path
+            .strip_prefix(root)
+            .map_err(|_| {
+                UpdaterError::InvalidRelease(
+                    "admin runtime path escapes the extracted tree".to_string(),
+                )
+            })?
+            .to_string_lossy();
+        verify_admin_runtime_file_architecture(&path, &relative, target_triple)?;
+    }
+    Ok(())
+}
+
+fn verify_admin_runtime_file_architecture(
+    path: &Path,
+    relative: &str,
+    target_triple: &str,
+) -> Result<(), UpdaterError> {
+    let mut header = [0_u8; 20];
+    let read = std::fs::File::open(path)?.read(&mut header)?;
+    let magic = &header[..read.min(4)];
+    let is_elf = magic == [0x7f, b'E', b'L', b'F'];
+    if is_elf {
+        return verify_release_binary_architecture(path, relative, target_triple);
+    }
+    let is_macho = matches!(
+        magic,
+        [0xce, 0xfa, 0xed, 0xfe]
+            | [0xfe, 0xed, 0xfa, 0xce]
+            | [0xcf, 0xfa, 0xed, 0xfe]
+            | [0xfe, 0xed, 0xfa, 0xcf]
+            | [0xca, 0xfe, 0xba, 0xbe]
+            | [0xbe, 0xba, 0xfe, 0xca]
+            | [0xca, 0xfe, 0xba, 0xbf]
+            | [0xbf, 0xba, 0xfe, 0xca]
+    );
+    let is_pe = read >= 2 && header[..2] == [b'M', b'Z'];
+    let is_native_module = path.extension() == Some(OsStr::new("node"));
+    if is_macho || is_pe || is_native_module {
+        return Err(UpdaterError::InvalidRelease(format!(
+            "admin runtime contains a foreign native module: {relative}"
+        )));
     }
     Ok(())
 }
@@ -2127,7 +3345,10 @@ fn collect_regular_files(
 }
 
 fn validate_release_file_mode(path: &str, mode: u32) -> Result<(), UpdaterError> {
-    let expected = if path.starts_with("bin/") {
+    let expected = if path.starts_with("bin/")
+        || path.starts_with("ops/hooks/")
+        || matches!(path, "ops/install-release" | "ops/upgrade-updater")
+    {
         0o755
     } else {
         0o644
@@ -2342,6 +3563,32 @@ fn read_current_release(current: &Path, releases_root: &Path) -> Result<PathBuf,
     Ok(absolute)
 }
 
+fn ensure_upgrade_version(target: &str, current_release: &Path) -> Result<(), UpdaterError> {
+    let current = current_release
+        .file_name()
+        .and_then(OsStr::to_str)
+        .ok_or_else(|| {
+            UpdaterError::InvalidRelease(
+                "current release directory has no valid version name".to_string(),
+            )
+        })?;
+    let parse = |value: &str| {
+        semver::Version::parse(value.strip_prefix('v').unwrap_or(value)).map_err(|error| {
+            UpdaterError::InvalidRelease(format!(
+                "release version {value} is not semantic: {error}"
+            ))
+        })
+    };
+    let target_version = parse(target)?;
+    let current_version = parse(current)?;
+    if target_version <= current_version {
+        return Err(UpdaterError::InvalidRelease(format!(
+            "apply requires a version newer than {current}; requested {target}"
+        )));
+    }
+    Ok(())
+}
+
 fn sync_tree(path: &Path) -> Result<(), UpdaterError> {
     for entry in std::fs::read_dir(path)? {
         let entry = entry?;
@@ -2364,6 +3611,38 @@ fn sync_directory(path: &Path) -> Result<(), UpdaterError> {
     let directory = OpenOptions::new().read(true).open(path)?;
     directory.sync_all()?;
     Ok(())
+}
+
+fn list_recovery_descriptor_ids(directory: &Path) -> Result<Vec<Uuid>, UpdaterError> {
+    let entries = match std::fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut command_ids = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        let metadata = entry.file_type()?;
+        let name = entry.file_name();
+        let name = name.to_str().ok_or_else(|| {
+            UpdaterError::InvalidRelease(
+                "recovery directory contains a non-UTF-8 entry".to_string(),
+            )
+        })?;
+        let command_id = name
+            .strip_suffix(".json")
+            .and_then(|value| Uuid::parse_str(value).ok())
+            .filter(|_| metadata.is_file())
+            .ok_or_else(|| {
+                UpdaterError::InvalidRelease(format!(
+                    "recovery directory contains an unexpected entry: {name}"
+                ))
+            })?;
+        command_ids.push(command_id);
+    }
+    command_ids.sort_unstable();
+    command_ids.dedup();
+    Ok(command_ids)
 }
 
 fn hook_context(
@@ -2597,6 +3876,10 @@ fn duration_ms(value: Duration) -> Result<i64, UpdaterError> {
         .map_err(|_| UpdaterError::Config("duration exceeds supported range".to_string()))
 }
 
+fn recovery_start_mode(startup_gate: bool) -> &'static str {
+    if startup_gate { "gate" } else { "direct" }
+}
+
 fn sha256_hex(bytes: &[u8]) -> String {
     let mut digest = Sha256::new();
     digest.update(bytes);
@@ -2669,6 +3952,23 @@ mod tests {
                 release_file("bin/remote-submit-runner"),
                 release_file("bin/updated"),
                 release_file("admin/server.js"),
+                release_file("admin/standalone.tar.gz"),
+                release_file("ops/hooks/activate"),
+                release_file("ops/hooks/fail-closed"),
+                release_file("ops/hooks/quiesce"),
+                release_file("ops/hooks/recover"),
+                release_file("ops/hooks/resume"),
+                release_file("ops/hooks/start-processes"),
+                release_file("ops/hooks/verify"),
+                release_file("ops/docs/production-release.md"),
+                release_file("ops/install-release"),
+                release_file("ops/systemd/ai-image-factory-processes.target"),
+                release_file("ops/systemd/ai-image-factory-recovery-failed.service"),
+                release_file("ops/systemd/ai-image-factory-recovery-gate.service"),
+                release_file("ops/systemd/ai-image-factory-updater-recover@.service"),
+                release_file("ops/systemd/ai-image-factory-updater.service"),
+                release_file("ops/systemd/ai-image-factory.target"),
+                release_file("ops/upgrade-updater"),
                 release_file("release.json"),
             ],
         }
@@ -2679,7 +3979,10 @@ mod tests {
             path: path.to_string(),
             sha256: "b".repeat(64),
             bytes: 1,
-            mode: if path.starts_with("bin/") {
+            mode: if path.starts_with("bin/")
+                || path.starts_with("ops/hooks/")
+                || matches!(path, "ops/install-release" | "ops/upgrade-updater")
+            {
                 0o755
             } else {
                 0o644
@@ -2709,6 +4012,23 @@ mod tests {
                 .validate("v1.2.3", "x86_64-unknown-linux-gnu")
                 .is_err()
         );
+        for required in [
+            "ops/hooks/fail-closed",
+            "ops/systemd/ai-image-factory-recovery-failed.service",
+            "ops/systemd/ai-image-factory-recovery-gate.service",
+            "ops/systemd/ai-image-factory-updater-recover@.service",
+        ] {
+            let mut missing_safety_file = valid_manifest();
+            missing_safety_file
+                .files
+                .retain(|file| file.path != required);
+            assert!(
+                missing_safety_file
+                    .validate("v1.2.3", "x86_64-unknown-linux-gnu")
+                    .is_err(),
+                "manifest unexpectedly accepted without {required}"
+            );
+        }
     }
 
     #[test]
@@ -2727,6 +4047,106 @@ mod tests {
         }
         validate_relative_path(Path::new("bin/gpt-image-2-gateway")).unwrap();
         validate_relative_path(Path::new("admin/.next/static/app.js")).unwrap();
+    }
+
+    #[test]
+    fn apply_version_must_move_forward() {
+        let current = Path::new("/opt/ai-image-factory/releases/v1.2.3");
+        ensure_upgrade_version("v1.2.4", current).unwrap();
+        assert!(ensure_upgrade_version("v1.2.3", current).is_err());
+        assert!(ensure_upgrade_version("v1.2.2", current).is_err());
+        assert!(ensure_upgrade_version("rolling", current).is_err());
+    }
+
+    #[test]
+    fn release_modes_allow_only_declared_executables() {
+        validate_release_file_mode("bin/updated", 0o755).unwrap();
+        validate_release_file_mode("ops/hooks/verify", 0o755).unwrap();
+        validate_release_file_mode("ops/install-release", 0o755).unwrap();
+        validate_release_file_mode("ops/systemd/ai-image-factory.target", 0o644).unwrap();
+        assert!(validate_release_file_mode("ops/systemd/evil.service", 0o755).is_err());
+        assert!(validate_release_file_mode("admin/server.js", 0o755).is_err());
+    }
+
+    #[test]
+    fn release_binary_architecture_must_match_the_manifest_target() {
+        let directory = tempfile::tempdir().unwrap();
+        let binary = directory.path().join("updated");
+        let mut x86_64_header = [0_u8; 20];
+        x86_64_header[..6].copy_from_slice(&[0x7f, b'E', b'L', b'F', 2, 1]);
+        x86_64_header[18..20].copy_from_slice(&62_u16.to_le_bytes());
+        std::fs::write(&binary, x86_64_header).unwrap();
+
+        verify_release_binary_architecture(&binary, "bin/updated", "x86_64-unknown-linux-gnu")
+            .unwrap();
+        assert!(
+            verify_release_binary_architecture(
+                &binary,
+                "bin/updated",
+                "aarch64-unknown-linux-gnu",
+            )
+            .is_err()
+        );
+
+        std::fs::write(&binary, b"Mach-O arm64").unwrap();
+        assert!(
+            verify_release_binary_architecture(&binary, "bin/updated", "x86_64-unknown-linux-gnu",)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn admin_runtime_native_modules_must_match_the_manifest_target() {
+        let root = tempfile::tempdir().unwrap();
+        let binary = root.path().join("sharp.node");
+        let mut x86_64_header = vec![0_u8; 20];
+        x86_64_header[..6].copy_from_slice(&[0x7f, b'E', b'L', b'F', 2, 1]);
+        x86_64_header[18..20].copy_from_slice(&62_u16.to_le_bytes());
+        std::fs::write(&binary, &x86_64_header).unwrap();
+        verify_admin_runtime_file_architecture(
+            &binary,
+            "node_modules/sharp.node",
+            "x86_64-unknown-linux-gnu",
+        )
+        .unwrap();
+
+        std::fs::write(&binary, b"\xcf\xfa\xed\xfe Mach-O arm64").unwrap();
+        assert!(
+            verify_admin_runtime_file_architecture(
+                &binary,
+                "node_modules/sharp.node",
+                "x86_64-unknown-linux-gnu",
+            )
+            .is_err()
+        );
+
+        std::fs::write(&binary, b"not a native module").unwrap();
+        assert!(
+            verify_admin_runtime_file_architecture(
+                &binary,
+                "node_modules/sharp.node",
+                "x86_64-unknown-linux-gnu",
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn recovery_directory_rejects_unexpected_entries() {
+        let temp = tempfile::tempdir().unwrap();
+        let recovery = temp.path().join("recovery");
+        assert!(list_recovery_descriptor_ids(&recovery).unwrap().is_empty());
+
+        std::fs::create_dir(&recovery).unwrap();
+        let command_id = Uuid::new_v4();
+        std::fs::write(recovery.join(format!("{command_id}.json")), b"{}").unwrap();
+        assert_eq!(
+            list_recovery_descriptor_ids(&recovery).unwrap(),
+            vec![command_id]
+        );
+
+        std::fs::write(recovery.join(".partial.tmp"), b"{}").unwrap();
+        assert!(list_recovery_descriptor_ids(&recovery).is_err());
     }
 
     #[test]

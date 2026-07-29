@@ -1,0 +1,9 @@
+#!/bin/bash
+set -Eeuo pipefail
+IFS=$'\n\t'
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
+if ! /usr/libexec/ai-image-factory/hooks/quiesce; then
+  printf 'application processes could not be quiesced during failure cleanup\n' >&2
+  exit 1
+fi

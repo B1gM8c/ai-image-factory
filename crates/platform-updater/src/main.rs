@@ -16,11 +16,12 @@ async fn main() -> Result<(), UpdaterError> {
     let updater = Updater::from_config(UpdaterConfig::from_env()?).await?;
     match arguments.as_slice() {
         [] => updater.run().await,
+        [operation] if operation == "recover-pending" => updater.recover_pending().await,
         [operation, command_id] if operation == "recover" => {
             updater.recover_command(command_id).await
         }
         _ => Err(UpdaterError::Config(
-            "usage: updated [version|recover COMMAND_ID]".to_string(),
+            "usage: updated [version|recover-pending|recover COMMAND_ID]".to_string(),
         )),
     }
 }

@@ -1,7 +1,8 @@
 [Unit]
 Description=AI Image Factory durable work dispatcher
-PartOf=ai-image-factory.target
-After=network-online.target ai-image-factory-reducerd.service ai-image-factory-executord@default.service
+PartOf=ai-image-factory-processes.target
+Requires=ai-image-factory-recovery-gate.service
+After=network-online.target ai-image-factory-recovery-gate.service ai-image-factory-reducerd.service ai-image-factory-executord@default.service
 Before=ai-image-factory-provider-submitd.service ai-image-factory-provider-pollerd.service ai-image-factory-gateway.service
 
 [Service]
@@ -32,4 +33,4 @@ RestrictSUIDSGID=yes
 SystemCallArchitectures=native
 
 [Install]
-WantedBy=ai-image-factory.target
+WantedBy=ai-image-factory-processes.target

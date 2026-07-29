@@ -6,19 +6,48 @@ export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 readonly GATEWAY_BASE_URL="${AIF_VERIFY_GATEWAY_BASE_URL:-http://127.0.0.1:8787}"
 readonly ADMIN_BASE_URL="${AIF_VERIFY_ADMIN_BASE_URL:-http://127.0.0.1:3010}"
 readonly MAX_ATTEMPTS="${AIF_VERIFY_MAX_ATTEMPTS:-60}"
-readonly REQUIRED_UNITS=(
+readonly PROCESS_SCOPE="${AIF_UPDATE_PROCESS_SCOPE:-full}"
+case "$PROCESS_SCOPE" in
+  validation | full) ;;
+  *)
+    printf 'unsupported process scope: %s\n' "$PROCESS_SCOPE" >&2
+    exit 1
+    ;;
+esac
+
+VALIDATION_UNITS=(
+  ai-image-factory-gateway.service
+  ai-image-factory-admin.service
+)
+REQUIRED_UNITS=(
   ai-image-factory-reconcilerd.service
   ai-image-factory-executord@default.service
   ai-image-factory-reducerd.service
   ai-image-factory-workerd.service
-  ai-image-factory-gateway.service
-  ai-image-factory-admin.service
+  "${VALIDATION_UNITS[@]}"
 )
 readonly OPTIONAL_UNITS=(
   ai-image-factory-provider-submitd.service
   ai-image-factory-provider-pollerd.service
   ai-image-factory-webhookd.service
 )
+
+if [[ "$PROCESS_SCOPE" == "validation" ]]; then
+  REQUIRED_UNITS=("${VALIDATION_UNITS[@]}")
+else
+  while IFS= read -r unit; do
+    [[ "$unit" == ai-image-factory-executord@*.service ]] || continue
+    [[ "$unit" == "ai-image-factory-executord@default.service" ]] || REQUIRED_UNITS+=("$unit")
+  done < <(
+    systemctl list-unit-files \
+      --type=service \
+      --state=enabled \
+      --no-legend \
+      --plain \
+      'ai-image-factory-executord@*.service' \
+      | awk '{print $1}'
+  )
+fi
 
 for ((attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1)); do
   ready=true
@@ -33,12 +62,14 @@ for ((attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1)); do
     && curl --fail --silent --show-error "${GATEWAY_BASE_URL}/readyz" >/dev/null \
     && curl --fail --silent --show-error "${GATEWAY_BASE_URL}/openapi.json" >/dev/null \
     && curl --fail --silent --show-error "${ADMIN_BASE_URL}/login" >/dev/null; then
-    for unit in "${OPTIONAL_UNITS[@]}"; do
-      if systemctl is-enabled --quiet "$unit" && ! systemctl is-active --quiet "$unit"; then
-        printf 'enabled optional unit is not active: %s\n' "$unit" >&2
-        exit 1
-      fi
-    done
+    if [[ "$PROCESS_SCOPE" == "full" ]]; then
+      for unit in "${OPTIONAL_UNITS[@]}"; do
+        if systemctl is-enabled --quiet "$unit" && ! systemctl is-active --quiet "$unit"; then
+          printf 'enabled optional unit is not active: %s\n' "$unit" >&2
+          exit 1
+        fi
+      done
+    fi
     exit 0
   fi
   sleep 2

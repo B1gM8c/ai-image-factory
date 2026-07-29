@@ -1,22 +1,21 @@
 [Unit]
-Description=AI Image Factory immutable release updater
+Description=Recover unfinished AI Image Factory updates before application startup
 Documentation=file:/usr/share/doc/ai-image-factory/github-release-deployment.md
 Wants=network-online.target
-Requires=ai-image-factory-recovery-gate.service
-After=network-online.target ai-image-factory-recovery-gate.service
+After=network-online.target
+Before=ai-image-factory-processes.target ai-image-factory.target ai-image-factory-updater.service
+OnFailure=ai-image-factory-recovery-failed.service
 RequiresMountsFor=/opt/ai-image-factory /var/lib/ai-image-factory
 
 [Service]
-Type=simple
+Type=oneshot
 User=root
 Group=root
 EnvironmentFile=/etc/ai-image-factory/update-policy.env
 EnvironmentFile=/etc/ai-image-factory/updater.env
 WorkingDirectory=/var/lib/ai-image-factory/updater
-ExecStart=/usr/libexec/ai-image-factory/updated
-Restart=on-failure
-RestartSec=10s
-TimeoutStopSec=2min
+ExecStart=/usr/libexec/ai-image-factory/updated recover-pending
+TimeoutStartSec=45min
 UMask=0077
 NoNewPrivileges=yes
 PrivateDevices=yes
@@ -35,6 +34,3 @@ ReadWritePaths=/var/lib/ai-image-factory/updater
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 RestrictSUIDSGID=yes
 SystemCallArchitectures=native
-
-[Install]
-WantedBy=multi-user.target

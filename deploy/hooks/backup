@@ -46,13 +46,12 @@ cleanup() {
 }
 trap cleanup EXIT
 
-pg_dump \
+PGDATABASE="$DATABASE_URL" pg_dump \
   --format=plain \
   --no-owner \
   --no-privileges \
   --schema="$GATEWAY_DATABASE_SCHEMA" \
-  --file="${TEMPORARY_DIRECTORY}/database.dump.sql" \
-  "$DATABASE_URL"
+  --file="${TEMPORARY_DIRECTORY}/database.dump.sql"
 {
   printf 'DROP SCHEMA IF EXISTS "%s" CASCADE;\n' "$GATEWAY_DATABASE_SCHEMA"
   cat "${TEMPORARY_DIRECTORY}/database.dump.sql"

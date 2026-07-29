@@ -4,6 +4,8 @@ Documentation=file:/usr/share/doc/ai-image-factory/github-release-deployment.md
 Wants=network-online.target
 After=network-online.target
 Conflicts=ai-image-factory-updater.service
+OnFailure=ai-image-factory-recovery-failed.service
+RequiresMountsFor=/opt/ai-image-factory /var/lib/ai-image-factory
 
 [Service]
 Type=oneshot

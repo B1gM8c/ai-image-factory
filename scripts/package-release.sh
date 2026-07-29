@@ -37,11 +37,128 @@ file_size() {
     'process.stdout.write(String(require("node:fs").statSync(process.env.FILE_SIZE_PATH).size))'
 }
 
+assert_target_binary() {
+  env \
+    TARGET_BINARY_PATH="$1" \
+    TARGET_TRIPLE="$TARGET_TRIPLE" \
+    node <<'NODE'
+const fs = require("node:fs");
+
+const path = process.env.TARGET_BINARY_PATH;
+const expectedMachine = {
+  "x86_64-unknown-linux-gnu": 62,
+  "aarch64-unknown-linux-gnu": 183,
+}[process.env.TARGET_TRIPLE];
+const descriptor = fs.openSync(path, "r");
+const header = Buffer.alloc(20);
+try {
+  if (fs.readSync(descriptor, header, 0, header.length, 0) !== header.length) {
+    throw new Error(`release binary has a truncated ELF header: ${path}`);
+  }
+} finally {
+  fs.closeSync(descriptor);
+}
+const isElf64LittleEndian =
+  header.subarray(0, 4).equals(Buffer.from([0x7f, 0x45, 0x4c, 0x46])) &&
+  header[4] === 2 &&
+  header[5] === 1;
+if (!isElf64LittleEndian || header.readUInt16LE(18) !== expectedMachine) {
+  throw new Error(
+    `release binary does not match ${process.env.TARGET_TRIPLE}: ${path}`,
+  );
+}
+NODE
+}
+
+assert_runtime_tree_architecture() {
+  env \
+    RUNTIME_TREE_PATH="$1" \
+    TARGET_TRIPLE="$TARGET_TRIPLE" \
+    node <<'NODE'
+const fs = require("node:fs");
+const path = require("node:path");
+
+const root = process.env.RUNTIME_TREE_PATH;
+const expectedMachine = {
+  "x86_64-unknown-linux-gnu": 62,
+  "aarch64-unknown-linux-gnu": 183,
+}[process.env.TARGET_TRIPLE];
+const machoMagics = new Set([
+  "cefaedfe",
+  "feedface",
+  "cffaedfe",
+  "feedfacf",
+  "cafebabe",
+  "bebafeca",
+  "cafebabf",
+  "bfbafeca",
+]);
+
+function inspect(file) {
+  const descriptor = fs.openSync(file, "r");
+  const header = Buffer.alloc(20);
+  let bytesRead;
+  try {
+    bytesRead = fs.readSync(descriptor, header, 0, header.length, 0);
+  } finally {
+    fs.closeSync(descriptor);
+  }
+  const relative = path.relative(root, file);
+  const magic = header.subarray(0, Math.min(bytesRead, 4)).toString("hex");
+  const isElf = bytesRead >= 4 && magic === "7f454c46";
+  if (isElf) {
+    if (
+      bytesRead < 20 ||
+      header[4] !== 2 ||
+      header[5] !== 1 ||
+      header.readUInt16LE(18) !== expectedMachine
+    ) {
+      throw new Error(
+        `admin runtime ELF does not match ${process.env.TARGET_TRIPLE}: ${relative}`,
+      );
+    }
+    return;
+  }
+  if (
+    path.extname(file) === ".node" ||
+    machoMagics.has(magic) ||
+    (bytesRead >= 2 && header.subarray(0, 2).toString("ascii") === "MZ")
+  ) {
+    throw new Error(
+      `admin runtime contains a foreign native module: ${relative}`,
+    );
+  }
+}
+
+function visit(directory) {
+  for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+    const absolute = path.join(directory, entry.name);
+    if (entry.isSymbolicLink()) {
+      throw new Error(`admin runtime contains a symlink: ${absolute}`);
+    }
+    if (entry.isDirectory()) {
+      visit(absolute);
+    } else if (entry.isFile()) {
+      inspect(absolute);
+    } else {
+      throw new Error(`admin runtime contains a special file: ${absolute}`);
+    }
+  }
+}
+
+visit(root);
+NODE
+}
+
 normalize_tree() {
   local root="$1"
   find "$root" -type d -exec chmod 0755 {} +
   find "$root" -type f -exec chmod 0644 {} +
   find "$root/bin" -type f -exec chmod 0755 {} +
+  find "$root/ops/hooks" -type f -exec chmod 0755 {} +
+  chmod 0755 \
+    "$root/ops/install-release" \
+    "$root/ops/upgrade-updater"
   chmod 0644 "$root/admin/server.js"
   normalize_mtime_tree "$root"
 }
@@ -222,19 +339,52 @@ trap cleanup EXIT
 
 readonly RELEASE_ROOT="${WORK_DIR}/release"
 readonly ADMIN_RUNTIME_ROOT="${WORK_DIR}/admin-runtime"
-mkdir -p "${RELEASE_ROOT}/bin" "${RELEASE_ROOT}/admin" "$ADMIN_RUNTIME_ROOT"
+mkdir -p \
+  "${RELEASE_ROOT}/bin" \
+  "${RELEASE_ROOT}/admin" \
+  "${RELEASE_ROOT}/ops/hooks" \
+  "${RELEASE_ROOT}/ops/systemd" \
+  "${RELEASE_ROOT}/ops/docs" \
+  "$ADMIN_RUNTIME_ROOT"
 
 for binary in "${GATEWAY_BINARIES[@]}"; do
   source_path="${RUST_RELEASE_DIR}/${binary}"
   [[ -f "$source_path" && -x "$source_path" ]] \
     || die "required Rust binary is missing or not executable: $source_path"
+  assert_target_binary "$source_path"
   install -m 0755 "$source_path" "${RELEASE_ROOT}/bin/${binary}"
 done
 
 readonly UPDATER_SOURCE="${RUST_RELEASE_DIR}/updated"
 [[ -f "$UPDATER_SOURCE" && -x "$UPDATER_SOURCE" ]] \
   || die "required updater binary is missing or not executable: $UPDATER_SOURCE"
+assert_target_binary "$UPDATER_SOURCE"
 install -m 0755 "$UPDATER_SOURCE" "${RELEASE_ROOT}/bin/updated"
+
+cp -aL "${REPO_ROOT}/deploy/hooks/." "${RELEASE_ROOT}/ops/hooks/"
+cp -aL "${REPO_ROOT}/deploy/systemd/." "${RELEASE_ROOT}/ops/systemd/"
+install -m 0755 \
+  "${REPO_ROOT}/deploy/install-release" \
+  "${RELEASE_ROOT}/ops/install-release"
+install -m 0755 \
+  "${REPO_ROOT}/deploy/upgrade-updater" \
+  "${RELEASE_ROOT}/ops/upgrade-updater"
+install -m 0644 \
+  "${REPO_ROOT}/docs/operations/github-release-deployment.md" \
+  "${RELEASE_ROOT}/ops/docs/github-release-deployment.md"
+install -m 0644 \
+  "${REPO_ROOT}/docs/operations/production-release.md" \
+  "${RELEASE_ROOT}/ops/docs/production-release.md"
+
+readonly MIGRATION_PREFIX="$(
+  find "${REPO_ROOT}/crates/image-gateway/migrations" -maxdepth 1 -type f -name '*.sql' \
+    -exec basename {} \; \
+    | sed -nE 's/^([0-9]{4})_.*/\1/p' \
+    | LC_ALL=C sort \
+    | tail -n 1
+)"
+[[ -n "$MIGRATION_PREFIX" ]] || die "no numbered database migration was found"
+readonly MIGRATION_VERSION="$((10#${MIGRATION_PREFIX}))"
 
 env \
   RELEASE_IDENTITY_PATH="${RELEASE_ROOT}/release.json" \
@@ -267,6 +417,7 @@ if [[ -d "$NEXT_PUBLIC" ]]; then
   mkdir -p "${ADMIN_RUNTIME_ROOT}/apps/admin-console/public"
   cp -aL "${NEXT_PUBLIC}/." "${ADMIN_RUNTIME_ROOT}/apps/admin-console/public/"
 fi
+assert_runtime_tree_architecture "$ADMIN_RUNTIME_ROOT"
 find "$ADMIN_RUNTIME_ROOT" -type d -exec chmod 0755 {} +
 find "$ADMIN_RUNTIME_ROOT" -type f -exec chmod 0644 {} +
 normalize_mtime_tree "$ADMIN_RUNTIME_ROOT"
@@ -352,15 +503,6 @@ create_deterministic_tarball "$RELEASE_ROOT" "$RELEASE_FILE_LIST" "$BUNDLE_PATH"
 
 readonly BUNDLE_SHA256="$(sha256_file "$BUNDLE_PATH")"
 readonly BUNDLE_BYTES="$(file_size "$BUNDLE_PATH")"
-readonly MIGRATION_PREFIX="$(
-  find "${REPO_ROOT}/crates/image-gateway/migrations" -maxdepth 1 -type f -name '*.sql' \
-    -exec basename {} \; \
-    | sed -nE 's/^([0-9]{4})_.*/\1/p' \
-    | LC_ALL=C sort \
-    | tail -n 1
-)"
-[[ -n "$MIGRATION_PREFIX" ]] || die "no numbered database migration was found"
-readonly MIGRATION_VERSION="$((10#${MIGRATION_PREFIX}))"
 readonly MIN_SCHEMA_VERSION="${MIN_SCHEMA_VERSION:-$((MIGRATION_VERSION - 1))}"
 [[ "$MIN_SCHEMA_VERSION" =~ ^[0-9]+$ ]] \
   || die "MIN_SCHEMA_VERSION must be a non-negative integer"

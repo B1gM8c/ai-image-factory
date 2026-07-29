@@ -1,0 +1,13 @@
+[Unit]
+Description=AI Image Factory internal application process set
+Documentation=file:/usr/share/doc/ai-image-factory/github-release-deployment.md
+PartOf=ai-image-factory.target
+Wants=network-online.target
+Requires=ai-image-factory-reconcilerd.service
+Requires=ai-image-factory-executord@default.service
+Requires=ai-image-factory-reducerd.service
+Requires=ai-image-factory-workerd.service
+Requires=ai-image-factory-gateway.service
+Requires=ai-image-factory-admin.service
+After=network-online.target
+RequiresMountsFor=/opt/ai-image-factory /var/lib/ai-image-factory

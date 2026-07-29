@@ -9,15 +9,31 @@ export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 : "${GATEWAY_ARTIFACT_ROOT:?GATEWAY_ARTIFACT_ROOT is required}"
 : "${AIF_UPDATE_BACKUP_TOKEN:?AIF_UPDATE_BACKUP_TOKEN is required}"
 : "${AIF_UPDATE_COMMAND_ID:?AIF_UPDATE_COMMAND_ID is required}"
+: "${AIF_UPDATE_LEASE_OWNER:?AIF_UPDATE_LEASE_OWNER is required}"
+: "${AIF_UPDATE_LEASE_EPOCH:?AIF_UPDATE_LEASE_EPOCH is required}"
+: "${AIF_UPDATE_LEASE_DURATION_MS:?AIF_UPDATE_LEASE_DURATION_MS is required}"
 
 readonly BACKUP_ROOT="${AIF_BACKUP_ROOT:-/var/lib/ai-image-factory/backups}"
 readonly SERVICE_USER="${AIF_SERVICE_USER:-ai-image-factory}"
 readonly SERVICE_GROUP="${AIF_SERVICE_GROUP:-ai-image-factory}"
+readonly RECOVERY_LEASE_FLOOR_MS=300000
 readonly RESOLVED_BACKUP_ROOT="$(realpath -e "$BACKUP_ROOT")"
 readonly RECOVERY_DIRECTORY="$(realpath -e "$AIF_UPDATE_BACKUP_TOKEN")"
 
 [[ "$GATEWAY_DATABASE_SCHEMA" =~ ^[A-Za-z_][A-Za-z0-9_]{0,62}$ ]] || {
   printf 'GATEWAY_DATABASE_SCHEMA is invalid\n' >&2
+  exit 1
+}
+[[ "$AIF_UPDATE_COMMAND_ID" =~ ^[0-9a-fA-F-]{36}$ ]] || {
+  printf 'AIF_UPDATE_COMMAND_ID is invalid\n' >&2
+  exit 1
+}
+[[ "$AIF_UPDATE_LEASE_EPOCH" =~ ^[1-9][0-9]*$ ]] || {
+  printf 'AIF_UPDATE_LEASE_EPOCH is invalid\n' >&2
+  exit 1
+}
+[[ "$AIF_UPDATE_LEASE_DURATION_MS" =~ ^[1-9][0-9]*$ ]] || {
+  printf 'AIF_UPDATE_LEASE_DURATION_MS is invalid\n' >&2
   exit 1
 }
 
@@ -49,12 +65,52 @@ esac
     | awk 'substr($1, 1, 1) != "-" && substr($1, 1, 1) != "d" { exit 1 }'
 )
 
-systemctl stop ai-image-factory.target
-psql \
-  "$DATABASE_URL" \
+systemctl stop ai-image-factory-processes.target
+{
+  cat "${RECOVERY_DIRECTORY}/database.sql"
+  cat <<'SQL'
+SET search_path TO :"database_schema";
+
+UPDATE platform_update_commands
+SET status = 'restoring',
+    phase = 'restoring',
+    lease_owner = :'lease_owner',
+    lease_epoch = :'lease_epoch'::BIGINT,
+    lease_expires_at_ms =
+        floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT
+        + GREATEST(
+            :'lease_duration_ms'::BIGINT,
+            :'recovery_lease_floor_ms'::BIGINT
+        ),
+    updated_at_ms =
+        floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT
+WHERE command_id = :'update_command_id'::UUID
+  AND action = 'apply';
+
+SELECT EXISTS(
+    SELECT 1
+    FROM platform_update_commands
+    WHERE command_id = :'update_command_id'::UUID
+      AND status = 'restoring'
+      AND phase = 'restoring'
+      AND lease_owner = :'lease_owner'
+      AND lease_epoch = :'lease_epoch'::BIGINT
+) AS update_lease_reasserted \gset
+\if :update_lease_reasserted
+\else
+  \echo 'restored database did not contain the claimed update command'
+  \quit 1
+\endif
+SQL
+} | PGDATABASE="$DATABASE_URL" psql \
   --set=ON_ERROR_STOP=1 \
   --single-transaction \
-  --file="${RECOVERY_DIRECTORY}/database.sql"
+  --set="database_schema=${GATEWAY_DATABASE_SCHEMA}" \
+  --set="update_command_id=${AIF_UPDATE_COMMAND_ID}" \
+  --set="lease_owner=${AIF_UPDATE_LEASE_OWNER}" \
+  --set="lease_epoch=${AIF_UPDATE_LEASE_EPOCH}" \
+  --set="lease_duration_ms=${AIF_UPDATE_LEASE_DURATION_MS}" \
+  --set="recovery_lease_floor_ms=${RECOVERY_LEASE_FLOOR_MS}"
 
 [[ "$GATEWAY_ARTIFACT_ROOT" = /* && "$GATEWAY_ARTIFACT_ROOT" != "/" ]] || {
   printf 'GATEWAY_ARTIFACT_ROOT must be an absolute non-root path\n' >&2
@@ -93,5 +149,10 @@ trap - EXIT
 sync -f "$ARTIFACT_PARENT"
 rm -rf -- "$PREVIOUS_ARTIFACT_ROOT"
 
-systemctl start ai-image-factory.target
-systemctl is-active --quiet ai-image-factory.target
+if [[ "${AIF_UPDATE_START_MODE:-target}" =~ ^(direct|gate)$ \
+  || "${AIF_UPDATE_PROCESS_SCOPE:-full}" == "validation" ]]; then
+  /usr/libexec/ai-image-factory/hooks/start-processes
+else
+  systemctl start ai-image-factory-processes.target
+  systemctl is-active --quiet ai-image-factory-processes.target
+fi

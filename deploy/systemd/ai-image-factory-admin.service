@@ -1,13 +1,14 @@
 [Unit]
 Description=AI Image Factory Next.js admin console
-PartOf=ai-image-factory.target
-After=network-online.target ai-image-factory-gateway.service
+PartOf=ai-image-factory-processes.target
+Requires=ai-image-factory-recovery-gate.service
+After=network-online.target ai-image-factory-recovery-gate.service ai-image-factory-gateway.service
 
 [Service]
 Type=simple
 User=ai-image-factory
 Group=ai-image-factory
-EnvironmentFile=/etc/ai-image-factory/app.env
+EnvironmentFile=/etc/ai-image-factory/admin.env
 Environment=NODE_ENV=production
 Environment=HOSTNAME=127.0.0.1
 Environment=PORT=3010
@@ -35,4 +36,4 @@ RestrictSUIDSGID=yes
 SystemCallArchitectures=native
 
 [Install]
-WantedBy=ai-image-factory.target
+WantedBy=ai-image-factory-processes.target

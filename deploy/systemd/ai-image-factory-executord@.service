@@ -1,7 +1,8 @@
 [Unit]
 Description=AI Image Factory executor for profile %i
-PartOf=ai-image-factory.target
-After=network-online.target ai-image-factory-reconcilerd.service
+PartOf=ai-image-factory-processes.target
+Requires=ai-image-factory-recovery-gate.service
+After=network-online.target ai-image-factory-recovery-gate.service ai-image-factory-reconcilerd.service
 Before=ai-image-factory-reducerd.service
 
 [Service]
@@ -9,7 +10,7 @@ Type=simple
 User=ai-image-factory
 Group=ai-image-factory
 EnvironmentFile=/etc/ai-image-factory/app.env
-Environment=EXECUTOR_PROFILE_KEY=%i
+Environment=EXECUTOR_PROFILE_KEY=%I
 WorkingDirectory=/opt/ai-image-factory/current
 ExecStart=/opt/ai-image-factory/current/bin/executord
 Restart=on-failure
@@ -33,4 +34,4 @@ RestrictSUIDSGID=yes
 SystemCallArchitectures=native
 
 [Install]
-WantedBy=ai-image-factory.target
+WantedBy=ai-image-factory-processes.target

@@ -1,0 +1,23 @@
+[Unit]
+Description=Fail closed after AI Image Factory startup recovery failure
+Documentation=file:/usr/share/doc/ai-image-factory/github-release-deployment.md
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+ExecStart=/usr/libexec/ai-image-factory/hooks/fail-closed
+UMask=0077
+NoNewPrivileges=yes
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectControlGroups=yes
+ProtectHome=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectSystem=strict
+ReadOnlyPaths=/usr/libexec/ai-image-factory
+RestrictAddressFamilies=AF_UNIX
+RestrictSUIDSGID=yes
+SystemCallArchitectures=native
