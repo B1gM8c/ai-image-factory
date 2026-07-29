@@ -1,0 +1,36 @@
+[Unit]
+Description=AI Image Factory executor for profile %i
+PartOf=ai-image-factory.target
+After=network-online.target ai-image-factory-reconcilerd.service
+Before=ai-image-factory-reducerd.service
+
+[Service]
+Type=simple
+User=ai-image-factory
+Group=ai-image-factory
+EnvironmentFile=/etc/ai-image-factory/app.env
+Environment=EXECUTOR_PROFILE_KEY=%i
+WorkingDirectory=/opt/ai-image-factory/current
+ExecStart=/opt/ai-image-factory/current/bin/executord
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=15min
+KillMode=mixed
+UMask=0077
+NoNewPrivileges=yes
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectControlGroups=yes
+ProtectHome=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectSystem=strict
+ReadOnlyPaths=/opt/ai-image-factory/current
+ReadWritePaths=/var/lib/ai-image-factory
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictSUIDSGID=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=ai-image-factory.target

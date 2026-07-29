@@ -1,0 +1,8 @@
+#!/bin/bash
+set -Eeuo pipefail
+IFS=$'\n\t'
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
+systemctl daemon-reload
+systemctl start ai-image-factory.target
+systemctl is-active --quiet ai-image-factory.target

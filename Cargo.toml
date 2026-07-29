@@ -4,6 +4,7 @@ members = [
     "crates/cli-runtime",
     "crates/factory-identity",
     "crates/image-gateway",
+    "crates/platform-updater",
     "crates/provider-contracts",
     "crates/provider-dreamina-cli",
     "crates/provider-grok-cli",

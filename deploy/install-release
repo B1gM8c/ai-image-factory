@@ -1,0 +1,217 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+IFS=$'\n\t'
+umask 077
+
+usage() {
+  cat <<'EOF'
+Usage:
+  deploy/install-release VERSION TARGET_TRIPLE BUNDLE MANIFEST
+
+The GitHub Release and both local assets must be verified before this command.
+This bootstrap installer refuses to replace an existing release or current link.
+EOF
+}
+
+die() {
+  printf 'install-release: %s\n' "$*" >&2
+  exit 1
+}
+
+canonical_path() {
+  python3 - "$1" <<'PY'
+import sys
+from pathlib import Path
+
+print(Path(sys.argv[1]).resolve(strict=True))
+PY
+}
+
+[[ $# -eq 4 ]] || {
+  usage >&2
+  exit 2
+}
+[[ "${EUID}" -eq 0 ]] || die "must run as root"
+command -v python3 >/dev/null 2>&1 || die "required command is unavailable: python3"
+
+readonly VERSION="$1"
+readonly TARGET_TRIPLE="$2"
+readonly BUNDLE="$(canonical_path "$3")"
+readonly MANIFEST="$(canonical_path "$4")"
+readonly INSTALL_ROOT="${AIF_INSTALL_ROOT:-/opt/ai-image-factory}"
+readonly LIBEXEC_ROOT="${AIF_LIBEXEC_ROOT:-/usr/libexec/ai-image-factory}"
+readonly RELEASE_ROOT="${INSTALL_ROOT}/releases/${VERSION}"
+readonly CURRENT_LINK="${INSTALL_ROOT}/current"
+
+[[ "$VERSION" =~ ^[A-Za-z0-9._-]+$ ]] \
+  || die "version contains unsupported characters"
+case "$TARGET_TRIPLE" in
+  x86_64-unknown-linux-gnu | aarch64-unknown-linux-gnu) ;;
+  *) die "unsupported target triple: $TARGET_TRIPLE" ;;
+esac
+[[ -f "$BUNDLE" && -f "$MANIFEST" ]] || die "bundle and manifest must be regular files"
+[[ ! -e "$RELEASE_ROOT" ]] || die "release already exists: $RELEASE_ROOT"
+[[ ! -e "$CURRENT_LINK" && ! -L "$CURRENT_LINK" ]] \
+  || die "current release pointer already exists"
+
+install -d -m 0755 \
+  "$INSTALL_ROOT" \
+  "${INSTALL_ROOT}/releases" \
+  "${INSTALL_ROOT}/staging" \
+  "$LIBEXEC_ROOT"
+
+STAGING_DIR="$(mktemp -d "${INSTALL_ROOT}/staging/.bootstrap-${VERSION}.XXXXXXXX")"
+cleanup() {
+  if [[ -n "${STAGING_DIR:-}" && -d "$STAGING_DIR" ]]; then
+    rm -rf --one-file-system -- "$STAGING_DIR"
+  fi
+}
+trap cleanup EXIT
+
+env \
+  AIF_BOOTSTRAP_VERSION="$VERSION" \
+  AIF_BOOTSTRAP_TARGET="$TARGET_TRIPLE" \
+  AIF_BOOTSTRAP_BUNDLE="$BUNDLE" \
+  AIF_BOOTSTRAP_MANIFEST="$MANIFEST" \
+  AIF_BOOTSTRAP_DESTINATION="$STAGING_DIR" \
+  python3 <<'PY'
+import hashlib
+import json
+import os
+import re
+import tarfile
+from pathlib import Path, PurePosixPath
+
+version = os.environ["AIF_BOOTSTRAP_VERSION"]
+target_triple = os.environ["AIF_BOOTSTRAP_TARGET"]
+bundle_path = Path(os.environ["AIF_BOOTSTRAP_BUNDLE"])
+manifest_path = Path(os.environ["AIF_BOOTSTRAP_MANIFEST"])
+destination = Path(os.environ["AIF_BOOTSTRAP_DESTINATION"])
+allowed_path = re.compile(r"^[A-Za-z0-9@._/-]+$")
+commit_sha = re.compile(r"^[0-9a-f]{40}$")
+
+with manifest_path.open("rb") as source:
+    manifest = json.load(source)
+
+if manifest.get("schema_version") != 1:
+    raise SystemExit("unsupported manifest schema")
+if manifest.get("updater_protocol_version") != 1:
+    raise SystemExit("unsupported updater protocol")
+if manifest.get("release_version") != version:
+    raise SystemExit("manifest version mismatch")
+if manifest.get("target_triple") != target_triple:
+    raise SystemExit("manifest target mismatch")
+if not commit_sha.fullmatch(str(manifest.get("commit_sha", ""))):
+    raise SystemExit("manifest commit is invalid")
+if manifest.get("rollback_mode") != "backup_restore":
+    raise SystemExit("manifest rollback contract is invalid")
+
+bundle_digest = hashlib.sha256()
+with bundle_path.open("rb") as source:
+    for chunk in iter(lambda: source.read(1024 * 1024), b""):
+        bundle_digest.update(chunk)
+if bundle_digest.hexdigest() != manifest.get("bundle_sha256"):
+    raise SystemExit("bundle digest mismatch")
+if bundle_path.stat().st_size != manifest.get("bundle_bytes"):
+    raise SystemExit("bundle size mismatch")
+
+files = manifest.get("files")
+if not isinstance(files, list) or not files:
+    raise SystemExit("manifest file list is empty")
+
+expected = {}
+for entry in files:
+    if not isinstance(entry, dict):
+        raise SystemExit("manifest file entry is invalid")
+    relative = entry.get("path")
+    if not isinstance(relative, str) or not allowed_path.fullmatch(relative):
+        raise SystemExit(f"manifest path is invalid: {relative!r}")
+    path = PurePosixPath(relative)
+    if path.is_absolute() or ".." in path.parts or "." in path.parts:
+        raise SystemExit(f"manifest path escapes the release: {relative}")
+    if relative in expected:
+        raise SystemExit(f"duplicate manifest path: {relative}")
+    required_mode = 0o755 if relative.startswith("bin/") else 0o644
+    if entry.get("mode") != required_mode:
+        raise SystemExit(f"manifest mode is invalid: {relative}")
+    if not isinstance(entry.get("bytes"), int) or entry["bytes"] < 0:
+        raise SystemExit(f"manifest size is invalid: {relative}")
+    if not re.fullmatch(r"[0-9a-f]{64}", str(entry.get("sha256", ""))):
+        raise SystemExit(f"manifest digest is invalid: {relative}")
+    expected[relative] = entry
+
+required_files = {
+    "admin/server.js",
+    "admin/standalone.tar.gz",
+    "bin/factoryctl",
+    "bin/gpt-image-2-gateway",
+    "bin/updated",
+    "release.json",
+}
+if not required_files.issubset(expected):
+    raise SystemExit("manifest is missing required release files")
+
+with tarfile.open(bundle_path, mode="r:gz") as archive:
+    members = archive.getmembers()
+    names = [member.name for member in members]
+    if len(names) != len(set(names)):
+        raise SystemExit("bundle contains duplicate paths")
+    if set(names) != set(expected):
+        raise SystemExit("bundle paths do not match the manifest")
+
+    for member in members:
+        entry = expected[member.name]
+        if not member.isreg():
+            raise SystemExit(f"bundle contains a non-regular file: {member.name}")
+        if member.size != entry["bytes"]:
+            raise SystemExit(f"bundle member size mismatch: {member.name}")
+        output = destination.joinpath(*PurePosixPath(member.name).parts)
+        output.parent.mkdir(parents=True, exist_ok=True, mode=0o755)
+        source = archive.extractfile(member)
+        if source is None:
+            raise SystemExit(f"bundle member cannot be read: {member.name}")
+        digest = hashlib.sha256()
+        written = 0
+        with output.open("xb") as sink:
+            while chunk := source.read(1024 * 1024):
+                sink.write(chunk)
+                digest.update(chunk)
+                written += len(chunk)
+            sink.flush()
+            os.fsync(sink.fileno())
+        if written != entry["bytes"] or digest.hexdigest() != entry["sha256"]:
+            raise SystemExit(f"bundle member integrity mismatch: {member.name}")
+        output.chmod(entry["mode"])
+
+identity_path = destination / "release.json"
+with identity_path.open("rb") as source:
+    identity = json.load(source)
+if (
+    identity.get("schema_version") != 1
+    or identity.get("release_version") != version
+    or identity.get("commit_sha") != manifest["commit_sha"]
+    or identity.get("target_triple") != target_triple
+):
+    raise SystemExit("release identity mismatch")
+
+directories = [destination]
+directories.extend(path for path in destination.rglob("*") if path.is_dir())
+for directory in sorted(directories, key=lambda value: len(value.parts), reverse=True):
+    directory.chmod(0o755)
+    descriptor = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+PY
+
+chown -R root:root "$STAGING_DIR"
+mv -- "$STAGING_DIR" "$RELEASE_ROOT"
+STAGING_DIR=""
+install -m 0755 "${RELEASE_ROOT}/bin/updated" "${LIBEXEC_ROOT}/updated"
+ln -s "releases/${VERSION}" "$CURRENT_LINK"
+
+printf 'installed_release=%s\ncurrent=%s\nupdater=%s\n' \
+  "$RELEASE_ROOT" \
+  "$CURRENT_LINK" \
+  "${LIBEXEC_ROOT}/updated"

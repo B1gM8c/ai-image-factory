@@ -212,6 +212,7 @@ fn console_capabilities(principal: &AuthenticatedPrincipal) -> Vec<&'static str>
             "providers:manage",
             "scheduler:read",
             "system:read",
+            "system:update",
             "users:manage",
         ];
     }

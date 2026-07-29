@@ -1,0 +1,14 @@
+[Unit]
+Description=AI Image Factory application processes
+Documentation=file:/usr/share/doc/ai-image-factory/github-release-deployment.md
+Wants=network-online.target
+Wants=ai-image-factory-reconcilerd.service
+Wants=ai-image-factory-executord@default.service
+Wants=ai-image-factory-reducerd.service
+Wants=ai-image-factory-workerd.service
+Wants=ai-image-factory-gateway.service
+Wants=ai-image-factory-admin.service
+After=network-online.target
+
+[Install]
+WantedBy=multi-user.target

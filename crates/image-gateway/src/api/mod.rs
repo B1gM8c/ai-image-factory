@@ -37,6 +37,7 @@ use crate::{
     provider_uploads::ProviderUploadService,
     scheduler::TenantJobScheduler,
     settlement::{ExecutionSettlementStore, SequentialExecutionSettlementStore},
+    system_updates::SystemUpdateService,
     usage::{InMemoryUsageStore, UsageLimits, UsageStore},
     webhooks::ProjectWebhookService,
     workers::GenerationWorker,
@@ -70,6 +71,7 @@ mod provider_uploads;
 mod readiness;
 mod responses;
 mod sessions;
+mod system_updates;
 mod users;
 mod videos;
 mod webhooks;
@@ -157,6 +159,7 @@ use provider_management::{
 use provider_uploads::provider_upload;
 use readiness::{EmptyProviderProfileReadinessStore, readyz};
 use sessions::{login, logout, me, refresh};
+use system_updates::{apply_system_update, check_system_update, get_system_update};
 use users::{create_user, list_users};
 use videos::{create_video, get_video, get_video_content};
 use webhooks::{
@@ -197,6 +200,7 @@ pub(super) struct AppState {
     pub(super) project_model_policy_service: Option<Arc<dyn ProjectModelPolicyService>>,
     pub(super) project_webhook_service: Option<Arc<dyn ProjectWebhookService>>,
     pub(super) batch_service: Option<Arc<dyn BatchService>>,
+    pub(super) system_update_service: Option<Arc<dyn SystemUpdateService>>,
     pub(super) request_observation_sink: crate::RequestObservationSink,
     pub(super) legacy_admin_auth_enabled: bool,
 }
@@ -221,6 +225,7 @@ pub struct ExternalControlPlaneServices {
     pub project_model_policy_service: Option<Arc<dyn ProjectModelPolicyService>>,
     pub project_webhook_service: Option<Arc<dyn ProjectWebhookService>>,
     pub batch_service: Option<Arc<dyn BatchService>>,
+    pub system_update_service: Option<Arc<dyn SystemUpdateService>>,
     pub request_observation_sink: Option<crate::RequestObservationSink>,
 }
 
@@ -463,6 +468,7 @@ pub fn build_router_with_external_execution_and_control_plane_and_runtime_events
             project_model_policy_service: None,
             project_webhook_service: None,
             batch_service: None,
+            system_update_service: None,
             request_observation_sink: None,
         },
     )
@@ -563,6 +569,7 @@ fn build_router_with_execution_mode(
         project_model_policy_service,
         project_webhook_service,
         batch_service,
+        system_update_service,
         request_observation_sink,
     } = control_plane;
     let state = AppState {
@@ -596,6 +603,7 @@ fn build_router_with_execution_mode(
         project_model_policy_service,
         project_webhook_service,
         batch_service,
+        system_update_service,
         request_observation_sink: request_observation_sink.unwrap_or_default(),
         legacy_admin_auth_enabled,
     };
@@ -632,6 +640,9 @@ fn build_router_with_execution_mode(
         .route("/admin/v1/auth/logout", post(logout))
         .route("/admin/v1/auth/me", get(me))
         .route("/admin/v1/users", get(list_users).post(create_user))
+        .route("/admin/v1/system/update", get(get_system_update))
+        .route("/admin/v1/system/update/check", post(check_system_update))
+        .route("/admin/v1/system/update/apply", post(apply_system_update))
         .route("/v1/console/overview", get(console_overview))
         .route("/v1/console/billing/summary", get(console_billing_summary))
         .route(

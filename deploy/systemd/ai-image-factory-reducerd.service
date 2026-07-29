@@ -1,0 +1,35 @@
+[Unit]
+Description=AI Image Factory terminal reducer
+PartOf=ai-image-factory.target
+After=network-online.target ai-image-factory-reconcilerd.service ai-image-factory-executord@default.service
+Before=ai-image-factory-workerd.service
+
+[Service]
+Type=simple
+User=ai-image-factory
+Group=ai-image-factory
+EnvironmentFile=/etc/ai-image-factory/app.env
+WorkingDirectory=/opt/ai-image-factory/current
+ExecStart=/opt/ai-image-factory/current/bin/reducerd
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=5min
+KillMode=mixed
+UMask=0077
+NoNewPrivileges=yes
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectControlGroups=yes
+ProtectHome=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectSystem=strict
+ReadOnlyPaths=/opt/ai-image-factory/current
+ReadWritePaths=/var/lib/ai-image-factory
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictSUIDSGID=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=ai-image-factory.target

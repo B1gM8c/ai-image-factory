@@ -3,7 +3,8 @@ use std::sync::Arc;
 use gpt_image_2_gateway::{
     ApiKeyKeyring, AppConfig, ExternalControlPlaneServices, ExternalImageGatewayComponents,
     ImageGatewayError, PostgresAdminReadStore, PostgresApiKeyStore, PostgresProviderTaskStore,
-    PostgresUsageStore, ProviderAccountRuntimeEventHub, RequestObservationSink,
+    PostgresSystemUpdateService, PostgresUsageStore, ProviderAccountRuntimeEventHub,
+    RequestObservationSink,
     admission::PostgresAdmissionStore,
     artifacts::{FilesystemArtifactBlobStore, artifact_root_from_env},
     batches::{BatchFileBlobStore, PostgresBatchService},
@@ -105,6 +106,7 @@ async fn main() -> Result<(), ImageGatewayError> {
         webhook_signing_keyring,
         webhook_destination_policy,
     ));
+    let system_update_service = Arc::new(PostgresSystemUpdateService::from_env(pool.clone())?);
     let request_observation_sink = RequestObservationSink::from_env(pool.clone())?;
     let project_spend_budget_evaluator = project_spend_budget_service.clone();
     tokio::spawn(async move {
@@ -173,6 +175,7 @@ async fn main() -> Result<(), ImageGatewayError> {
             project_model_policy_service: Some(project_model_policy_service),
             project_webhook_service: Some(project_webhook_service),
             batch_service: Some(batch_service),
+            system_update_service: Some(system_update_service),
             request_observation_sink: Some(request_observation_sink),
         },
     )?;

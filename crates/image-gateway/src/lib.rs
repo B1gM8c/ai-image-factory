@@ -43,6 +43,7 @@ mod scheduler;
 pub mod service_tiers;
 pub mod settlement;
 mod size;
+pub mod system_updates;
 mod telemetry;
 mod usage;
 pub mod webhooks;
@@ -187,6 +188,10 @@ pub use retention::{
 };
 pub use settlement::{
     ExecutionSettlementStore, GenerationResultStatus, PostgresExecutionSettlementStore,
+};
+pub use system_updates::{
+    ApplySystemUpdateRequest, PostgresSystemUpdateService, SystemUpdateAction, SystemUpdateActor,
+    SystemUpdateCommandView, SystemUpdateService, SystemUpdateSnapshot,
 };
 pub use telemetry::{TelemetryGuard, init_telemetry};
 pub use usage::{

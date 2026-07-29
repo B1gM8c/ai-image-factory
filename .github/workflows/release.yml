@@ -1,0 +1,276 @@
+name: Immutable Linux release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  quality:
+    name: Release gates
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_DB: ai_image_factory_test
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_USER: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d ai_image_factory_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      TEST_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/ai_image_factory_test
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify annotated signed release tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ github.ref_name }}
+        run: |
+          set -Eeuo pipefail
+          tag_object_type="$(
+            gh api \
+              "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_VERSION}" \
+              --jq '.object.type'
+          )"
+          test "$tag_object_type" = tag
+          tag_object_sha="$(
+            gh api \
+              "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_VERSION}" \
+              --jq '.object.sha'
+          )"
+          test "$(
+            gh api \
+              "repos/${GITHUB_REPOSITORY}/git/tags/${tag_object_sha}" \
+              --jq '.verification.verified'
+          )" = true
+
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends libssl-dev pkg-config
+
+      - name: Select repository Rust toolchain
+        run: |
+          rustup show active-toolchain
+          rustc --version --verbose
+          cargo --version
+
+      - name: Install Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Verify Rust formatting
+        run: cargo fmt --all -- --check
+
+      - name: Test Rust workspace
+        run: cargo test --locked --workspace --all-targets
+
+      - name: Install admin dependencies
+        run: npm ci
+
+      - name: Type-check admin console
+        run: npm run typecheck:admin
+
+  build-linux:
+    name: Build ${{ matrix.target }}
+    needs: quality
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends libssl-dev pkg-config
+
+      - name: Install target Rust standard library
+        env:
+          RELEASE_TARGET: ${{ matrix.target }}
+        run: |
+          rustup target add "$RELEASE_TARGET"
+          rustc --version --verbose
+          cargo --version
+
+      - name: Build complete Rust process set
+        env:
+          RELEASE_TARGET: ${{ matrix.target }}
+        run: |
+          cargo build \
+            --locked \
+            --release \
+            --target "$RELEASE_TARGET" \
+            --package gpt-image-2-gateway \
+            --bins
+          cargo build \
+            --locked \
+            --release \
+            --target "$RELEASE_TARGET" \
+            --package ai-image-factory-updater \
+            --bin updated
+
+      - name: Install Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Build architecture-matched admin standalone
+        run: |
+          npm ci
+          npm run build:admin
+
+      - name: Package deterministic release assets
+        env:
+          RELEASE_TARGET: ${{ matrix.target }}
+          RELEASE_VERSION: ${{ github.ref_name }}
+          RELEASE_COMMIT: ${{ github.sha }}
+        run: |
+          export SOURCE_DATE_EPOCH
+          SOURCE_DATE_EPOCH="$(git show -s --format=%ct "$RELEASE_COMMIT")"
+          scripts/package-release.sh \
+            "$RELEASE_VERSION" \
+            "$RELEASE_TARGET" \
+            "$RELEASE_COMMIT" \
+            dist
+
+      - name: Upload architecture assets
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-${{ matrix.target }}
+          path: |
+            dist/*.manifest.json
+            dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  attest-and-release:
+    name: Attest and publish immutable release
+    needs: build-linux
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment: production-release
+    permissions:
+      attestations: write
+      contents: write
+      id-token: write
+    steps:
+      - name: Download all architecture assets
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+
+      - name: Verify release assets before attestation
+        env:
+          RELEASE_VERSION: ${{ github.ref_name }}
+          RELEASE_COMMIT: ${{ github.sha }}
+        run: |
+          set -Eeuo pipefail
+          for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
+            prefix="dist/ai-image-factory-${RELEASE_VERSION}-${target}"
+            manifest="${prefix}.manifest.json"
+            bundle="${prefix}.tar.gz"
+            test -s "$manifest"
+            test -s "$bundle"
+            jq --exit-status \
+              --arg version "$RELEASE_VERSION" \
+              --arg commit "$RELEASE_COMMIT" \
+              --arg target "$target" \
+              '
+                .schema_version == 1
+                and .updater_protocol_version == 1
+                and .release_version == $version
+                and .commit_sha == $commit
+                and .target_triple == $target
+                and .migration_version == .target_schema_version
+                and .min_schema_version <= .target_schema_version
+                and .rollback_mode == "backup_restore"
+                and (.files | length > 0)
+                and (
+                  .files
+                  | all(
+                      if (.path | startswith("bin/"))
+                      then .mode == 493
+                      else .mode == 420
+                      end
+                    )
+                )
+              ' \
+              "$manifest" >/dev/null
+            test "$(sha256sum "$bundle" | awk '{print $1}')" = \
+              "$(jq --raw-output '.bundle_sha256' "$manifest")"
+            test "$(stat --format='%s' "$bundle")" = \
+              "$(jq --raw-output '.bundle_bytes' "$manifest")"
+            tar -tzf "$bundle" >/dev/null
+          done
+
+      - name: Attest release assets
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-path: "${{ github.workspace }}/dist/*"
+
+      - name: Create draft release and upload every asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ github.ref_name }}
+        run: |
+          set -Eeuo pipefail
+          gh release create "$RELEASE_VERSION" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --draft \
+            --title "$RELEASE_VERSION" \
+            --notes "Immutable AI Image Factory Linux release for ${GITHUB_SHA}."
+          gh release upload "$RELEASE_VERSION" dist/* \
+            --repo "$GITHUB_REPOSITORY"
+
+      - name: Publish release after all uploads succeed
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ github.ref_name }}
+        run: |
+          set -Eeuo pipefail
+          gh release edit "$RELEASE_VERSION" \
+            --repo "$GITHUB_REPOSITORY" \
+            --draft=false \
+            --latest
+          gh release verify "$RELEASE_VERSION" \
+            --repo "$GITHUB_REPOSITORY"

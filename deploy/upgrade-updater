@@ -1,0 +1,71 @@
+#!/bin/bash
+set -Eeuo pipefail
+IFS=$'\n\t'
+umask 077
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
+readonly RELEASE_ROOT="${AIF_RELEASE_ROOT:-/opt/ai-image-factory}"
+readonly FIXED_UPDATER="${AIF_FIXED_UPDATER:-/usr/libexec/ai-image-factory/updated}"
+readonly CANDIDATE_INPUT="${1:-${RELEASE_ROOT}/current/bin/updated}"
+readonly CANDIDATE="$(realpath -e "$CANDIDATE_INPUT")"
+readonly RELEASES_ROOT="$(realpath -e "${RELEASE_ROOT}/releases")"
+
+case "$CANDIDATE" in
+  "${RELEASES_ROOT}/"*/bin/updated) ;;
+  *)
+    printf 'updater candidate is outside the verified releases tree\n' >&2
+    exit 1
+    ;;
+esac
+[[ -f "$CANDIDATE" && ! -L "$CANDIDATE" && -x "$CANDIDATE" ]] || {
+  printf 'updater candidate must be a regular executable\n' >&2
+  exit 1
+}
+[[ "$(stat --format='%u' "$CANDIDATE")" = 0 ]] || {
+  printf 'updater candidate must be owned by root\n' >&2
+  exit 1
+}
+readonly CANDIDATE_MODE="$((8#$(stat --format='%a' "$CANDIDATE")))"
+(( (CANDIDATE_MODE & 8#022) == 0 )) || {
+  printf 'updater candidate must not be group/world writable\n' >&2
+  exit 1
+}
+[[ "$("$CANDIDATE" version)" =~ ^ai-image-factory-updater[[:space:]]protocol=[0-9]+$ ]] || {
+  printf 'updater candidate did not expose a valid protocol version\n' >&2
+  exit 1
+}
+
+readonly FIXED_DIRECTORY="$(dirname "$FIXED_UPDATER")"
+readonly TEMPORARY_UPDATER="${FIXED_DIRECTORY}/.updated.new.$$"
+readonly PREVIOUS_UPDATER="${FIXED_DIRECTORY}/.updated.previous"
+cleanup() {
+  rm -f -- "$TEMPORARY_UPDATER"
+}
+trap cleanup EXIT
+install -d -m 0755 "$FIXED_DIRECTORY"
+install -m 0755 -o root -g root "$CANDIDATE" "$TEMPORARY_UPDATER"
+sync -f "$TEMPORARY_UPDATER"
+
+systemctl stop ai-image-factory-updater.service
+if [[ -f "$FIXED_UPDATER" ]]; then
+  cp --preserve=mode,ownership,timestamps "$FIXED_UPDATER" "$PREVIOUS_UPDATER"
+  sync -f "$PREVIOUS_UPDATER"
+fi
+mv -f -T "$TEMPORARY_UPDATER" "$FIXED_UPDATER"
+sync -f "$FIXED_DIRECTORY"
+
+if systemctl start ai-image-factory-updater.service \
+  && sleep 2 \
+  && systemctl is-active --quiet ai-image-factory-updater.service; then
+  printf 'updater upgraded successfully: %s\n' "$("$FIXED_UPDATER" version)"
+  exit 0
+fi
+
+systemctl stop ai-image-factory-updater.service || true
+if [[ -f "$PREVIOUS_UPDATER" ]]; then
+  mv -f -T "$PREVIOUS_UPDATER" "$FIXED_UPDATER"
+  sync -f "$FIXED_DIRECTORY"
+  systemctl start ai-image-factory-updater.service
+fi
+printf 'updater upgrade failed and the previous binary was restored\n' >&2
+exit 1

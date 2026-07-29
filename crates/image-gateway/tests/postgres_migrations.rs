@@ -14,7 +14,7 @@ use uuid::Uuid;
 
 type TestResult<T = ()> = Result<T, String>;
 
-const REQUIRED_COLUMNS: [(&str, &str); 899] = [
+const REQUIRED_COLUMNS: [(&str, &str); 940] = [
     ("usage_events", "tenant_id"),
     ("usage_events", "job_id"),
     ("quota_reservations", "tenant_id"),
@@ -1064,9 +1064,50 @@ const REQUIRED_COLUMNS: [(&str, &str); 899] = [
     ("project_webhook_outbox_receipts", "outbox_event_id"),
     ("project_webhook_outbox_receipts", "processed_at_ms"),
     ("project_files", "cleanup_completed_at_ms"),
+    ("platform_release_state", "singleton"),
+    ("platform_release_state", "repository"),
+    ("platform_release_state", "target_triple"),
+    ("platform_release_state", "current_version"),
+    ("platform_release_state", "current_commit_sha"),
+    ("platform_release_state", "previous_version"),
+    ("platform_release_state", "previous_commit_sha"),
+    ("platform_release_state", "latest_version"),
+    ("platform_release_state", "latest_commit_sha"),
+    ("platform_release_state", "latest_verified"),
+    ("platform_release_state", "last_checked_at_ms"),
+    ("platform_release_state", "last_applied_at_ms"),
+    ("platform_release_state", "last_error_code"),
+    ("platform_release_state", "last_error_message"),
+    ("platform_release_state", "updated_at_ms"),
+    ("platform_update_commands", "command_id"),
+    ("platform_update_commands", "action"),
+    ("platform_update_commands", "target_version"),
+    ("platform_update_commands", "status"),
+    ("platform_update_commands", "phase"),
+    ("platform_update_commands", "idempotency_key_digest"),
+    ("platform_update_commands", "request_digest"),
+    ("platform_update_commands", "requested_by_user_id"),
+    ("platform_update_commands", "requested_by_session_id"),
+    ("platform_update_commands", "lease_owner"),
+    ("platform_update_commands", "lease_epoch"),
+    ("platform_update_commands", "lease_expires_at_ms"),
+    ("platform_update_commands", "attempt_count"),
+    ("platform_update_commands", "progress"),
+    ("platform_update_commands", "failure_code"),
+    ("platform_update_commands", "failure_message"),
+    ("platform_update_commands", "requested_at_ms"),
+    ("platform_update_commands", "started_at_ms"),
+    ("platform_update_commands", "completed_at_ms"),
+    ("platform_update_commands", "updated_at_ms"),
+    ("platform_update_events", "event_id"),
+    ("platform_update_events", "command_id"),
+    ("platform_update_events", "phase"),
+    ("platform_update_events", "outcome"),
+    ("platform_update_events", "details"),
+    ("platform_update_events", "created_at_ms"),
 ];
 
-const REQUIRED_INDEXES: [&str; 148] = [
+const REQUIRED_INDEXES: [&str; 152] = [
     "usage_events_tenant_created_at_ms_idx",
     "gateway_api_keys_project_id_idx",
     "quota_reservations_active_tenant_idx",
@@ -1215,6 +1256,10 @@ const REQUIRED_INDEXES: [&str; 148] = [
     "project_webhook_attempts_delivery_created_idx",
     "project_files_project_storage_pending_idx",
     "project_files_cleanup_recovery_idx",
+    "platform_update_commands_active_uidx",
+    "platform_update_commands_requested_idx",
+    "platform_update_commands_claim_idx",
+    "platform_update_events_command_created_idx",
 ];
 
 #[tokio::test]
@@ -2997,8 +3042,8 @@ async fn shared_pool_case(pool: &PgPool) -> TestResult {
 
 async fn assert_expected_schema(pool: &PgPool) -> TestResult {
     require(
-        migration_versions(pool).await? == (0_i64..=113_i64).collect::<Vec<_>>(),
-        "applied migration versions must be exactly 0 through 113",
+        migration_versions(pool).await? == (0_i64..=114_i64).collect::<Vec<_>>(),
+        "applied migration versions must be exactly 0 through 114",
     )?;
 
     let retention_policy: (i64, i64, i64, i64) = sqlx::query_as(

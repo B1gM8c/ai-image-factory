@@ -1,0 +1,96 @@
+#!/bin/bash
+set -Eeuo pipefail
+IFS=$'\n\t'
+umask 077
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
+: "${DATABASE_URL:?DATABASE_URL is required}"
+: "${GATEWAY_DATABASE_SCHEMA:?GATEWAY_DATABASE_SCHEMA is required}"
+: "${GATEWAY_ARTIFACT_ROOT:?GATEWAY_ARTIFACT_ROOT is required}"
+: "${AIF_UPDATE_COMMAND_ID:?AIF_UPDATE_COMMAND_ID is required}"
+: "${AIF_UPDATE_RELEASE_VERSION:?AIF_UPDATE_RELEASE_VERSION is required}"
+
+readonly BACKUP_ROOT="${AIF_BACKUP_ROOT:-/var/lib/ai-image-factory/backups}"
+readonly FINAL_DIRECTORY="${BACKUP_ROOT}/${AIF_UPDATE_COMMAND_ID}-${AIF_UPDATE_RELEASE_VERSION}"
+
+[[ "$BACKUP_ROOT" = /* && "$BACKUP_ROOT" != "/" ]] || {
+  printf 'AIF_BACKUP_ROOT must be an absolute non-root path\n' >&2
+  exit 1
+}
+[[ "$GATEWAY_ARTIFACT_ROOT" = /* && "$GATEWAY_ARTIFACT_ROOT" != "/" ]] || {
+  printf 'GATEWAY_ARTIFACT_ROOT must be an absolute non-root path\n' >&2
+  exit 1
+}
+[[ "$GATEWAY_DATABASE_SCHEMA" =~ ^[A-Za-z_][A-Za-z0-9_]{0,62}$ ]] || {
+  printf 'GATEWAY_DATABASE_SCHEMA is invalid\n' >&2
+  exit 1
+}
+[[ -d "$GATEWAY_ARTIFACT_ROOT" ]] || {
+  printf 'artifact root does not exist: %s\n' "$GATEWAY_ARTIFACT_ROOT" >&2
+  exit 1
+}
+if find "$GATEWAY_ARTIFACT_ROOT" -xdev -mindepth 1 ! -type f ! -type d -print -quit \
+  | grep -q .; then
+  printf 'artifact root contains links or special files\n' >&2
+  exit 1
+fi
+[[ ! -e "$FINAL_DIRECTORY" ]] || {
+  printf 'recovery point already exists: %s\n' "$FINAL_DIRECTORY" >&2
+  exit 1
+}
+
+install -d -m 0700 "$BACKUP_ROOT"
+readonly TEMPORARY_DIRECTORY="$(mktemp -d "${BACKUP_ROOT}/.backup.XXXXXXXX")"
+cleanup() {
+  rm -rf -- "$TEMPORARY_DIRECTORY"
+}
+trap cleanup EXIT
+
+pg_dump \
+  --format=plain \
+  --no-owner \
+  --no-privileges \
+  --schema="$GATEWAY_DATABASE_SCHEMA" \
+  --file="${TEMPORARY_DIRECTORY}/database.dump.sql" \
+  "$DATABASE_URL"
+{
+  printf 'DROP SCHEMA IF EXISTS "%s" CASCADE;\n' "$GATEWAY_DATABASE_SCHEMA"
+  cat "${TEMPORARY_DIRECTORY}/database.dump.sql"
+} >"${TEMPORARY_DIRECTORY}/database.sql"
+rm -f -- "${TEMPORARY_DIRECTORY}/database.dump.sql"
+[[ -s "${TEMPORARY_DIRECTORY}/database.sql" ]] || {
+  printf 'database recovery image is empty\n' >&2
+  exit 1
+}
+tar \
+  --create \
+  --gzip \
+  --file="${TEMPORARY_DIRECTORY}/artifacts.tar.gz" \
+  --directory="$GATEWAY_ARTIFACT_ROOT" \
+  .
+tar --list --verbose --gzip --file="${TEMPORARY_DIRECTORY}/artifacts.tar.gz" \
+  | awk 'substr($1, 1, 1) != "-" && substr($1, 1, 1) != "d" { exit 1 }'
+
+(
+  cd "$TEMPORARY_DIRECTORY"
+  sha256sum database.sql artifacts.tar.gz >SHA256SUMS
+)
+cat >"${TEMPORARY_DIRECTORY}/recovery.env" <<EOF
+UPDATE_COMMAND_ID=${AIF_UPDATE_COMMAND_ID}
+RELEASE_VERSION=${AIF_UPDATE_RELEASE_VERSION}
+RELEASE_COMMIT=${AIF_UPDATE_RELEASE_COMMIT:-unknown}
+MIGRATION_VERSION=${AIF_UPDATE_MIGRATION_VERSION:-unknown}
+DATABASE_SCHEMA=${GATEWAY_DATABASE_SCHEMA}
+EOF
+chmod 0600 "${TEMPORARY_DIRECTORY}/"*
+sync -f "${TEMPORARY_DIRECTORY}/database.sql"
+sync -f "${TEMPORARY_DIRECTORY}/artifacts.tar.gz"
+sync -f "${TEMPORARY_DIRECTORY}/SHA256SUMS"
+sync -f "${TEMPORARY_DIRECTORY}/recovery.env"
+sync -f "$TEMPORARY_DIRECTORY"
+mv "$TEMPORARY_DIRECTORY" "$FINAL_DIRECTORY"
+sync -f "$BACKUP_ROOT"
+trap - EXIT
+
+# stdout is the updater's opaque recovery token. Keep all diagnostics on stderr.
+printf '%s\n' "$FINAL_DIRECTORY"

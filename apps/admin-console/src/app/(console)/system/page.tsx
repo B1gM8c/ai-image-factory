@@ -3,6 +3,7 @@ import { BookOpen, Braces, Database, HeartPulse, Network } from "lucide-react";
 import { CapabilityGuard } from "@/components/auth/capability-guard";
 import { MetricCard } from "@/components/metric-card";
 import { PageHeader } from "@/components/page-header";
+import { SystemUpdatePanel } from "@/components/system-update-panel";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -34,6 +35,7 @@ export default async function SystemPage() {
           <MetricCard label="Active Profile" value={profiles ? String(profiles.active) : "--"} detail="Provider readiness projection" icon={Database} tone={profiles?.active ? "info" : "neutral"} />
           <MetricCard label="Blocked Profile" value={profiles ? String(profiles.blocked) : "--"} detail="不包含具体凭据原因" icon={Database} tone={profiles?.blocked ? "danger" : "success"} />
         </section>
+        <SystemUpdatePanel />
         <Card>
           <CardHeader>
             <CardTitle className="text-base">探针详情</CardTitle>

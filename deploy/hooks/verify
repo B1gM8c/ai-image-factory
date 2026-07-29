@@ -1,0 +1,48 @@
+#!/bin/bash
+set -Eeuo pipefail
+IFS=$'\n\t'
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
+readonly GATEWAY_BASE_URL="${AIF_VERIFY_GATEWAY_BASE_URL:-http://127.0.0.1:8787}"
+readonly ADMIN_BASE_URL="${AIF_VERIFY_ADMIN_BASE_URL:-http://127.0.0.1:3010}"
+readonly MAX_ATTEMPTS="${AIF_VERIFY_MAX_ATTEMPTS:-60}"
+readonly REQUIRED_UNITS=(
+  ai-image-factory-reconcilerd.service
+  ai-image-factory-executord@default.service
+  ai-image-factory-reducerd.service
+  ai-image-factory-workerd.service
+  ai-image-factory-gateway.service
+  ai-image-factory-admin.service
+)
+readonly OPTIONAL_UNITS=(
+  ai-image-factory-provider-submitd.service
+  ai-image-factory-provider-pollerd.service
+  ai-image-factory-webhookd.service
+)
+
+for ((attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1)); do
+  ready=true
+  for unit in "${REQUIRED_UNITS[@]}"; do
+    if ! systemctl is-active --quiet "$unit"; then
+      ready=false
+      break
+    fi
+  done
+  if "$ready" \
+    && curl --fail --silent --show-error "${GATEWAY_BASE_URL}/healthz" >/dev/null \
+    && curl --fail --silent --show-error "${GATEWAY_BASE_URL}/readyz" >/dev/null \
+    && curl --fail --silent --show-error "${GATEWAY_BASE_URL}/openapi.json" >/dev/null \
+    && curl --fail --silent --show-error "${ADMIN_BASE_URL}/login" >/dev/null; then
+    for unit in "${OPTIONAL_UNITS[@]}"; do
+      if systemctl is-enabled --quiet "$unit" && ! systemctl is-active --quiet "$unit"; then
+        printf 'enabled optional unit is not active: %s\n' "$unit" >&2
+        exit 1
+      fi
+    done
+    exit 0
+  fi
+  sleep 2
+done
+
+printf 'release did not pass service and HTTP readiness checks\n' >&2
+exit 1

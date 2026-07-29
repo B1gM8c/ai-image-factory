@@ -1,0 +1,97 @@
+#!/bin/bash
+set -Eeuo pipefail
+IFS=$'\n\t'
+umask 077
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
+: "${DATABASE_URL:?DATABASE_URL is required}"
+: "${GATEWAY_DATABASE_SCHEMA:?GATEWAY_DATABASE_SCHEMA is required}"
+: "${GATEWAY_ARTIFACT_ROOT:?GATEWAY_ARTIFACT_ROOT is required}"
+: "${AIF_UPDATE_BACKUP_TOKEN:?AIF_UPDATE_BACKUP_TOKEN is required}"
+: "${AIF_UPDATE_COMMAND_ID:?AIF_UPDATE_COMMAND_ID is required}"
+
+readonly BACKUP_ROOT="${AIF_BACKUP_ROOT:-/var/lib/ai-image-factory/backups}"
+readonly SERVICE_USER="${AIF_SERVICE_USER:-ai-image-factory}"
+readonly SERVICE_GROUP="${AIF_SERVICE_GROUP:-ai-image-factory}"
+readonly RESOLVED_BACKUP_ROOT="$(realpath -e "$BACKUP_ROOT")"
+readonly RECOVERY_DIRECTORY="$(realpath -e "$AIF_UPDATE_BACKUP_TOKEN")"
+
+[[ "$GATEWAY_DATABASE_SCHEMA" =~ ^[A-Za-z_][A-Za-z0-9_]{0,62}$ ]] || {
+  printf 'GATEWAY_DATABASE_SCHEMA is invalid\n' >&2
+  exit 1
+}
+
+case "$RECOVERY_DIRECTORY" in
+  "${RESOLVED_BACKUP_ROOT}/"*) ;;
+  *)
+    printf 'recovery token is outside the configured backup root\n' >&2
+    exit 1
+    ;;
+esac
+
+[[ -f "${RECOVERY_DIRECTORY}/database.sql" ]] || {
+  printf 'database recovery image is missing\n' >&2
+  exit 1
+}
+[[ -f "${RECOVERY_DIRECTORY}/artifacts.tar.gz" ]] || {
+  printf 'artifact recovery image is missing\n' >&2
+  exit 1
+}
+[[ ! -L "${RECOVERY_DIRECTORY}/database.sql" \
+  && ! -L "${RECOVERY_DIRECTORY}/artifacts.tar.gz" ]] || {
+  printf 'recovery images must not be symbolic links\n' >&2
+  exit 1
+}
+(
+  cd "$RECOVERY_DIRECTORY"
+  sha256sum --check SHA256SUMS
+  tar --list --verbose --gzip --file=artifacts.tar.gz \
+    | awk 'substr($1, 1, 1) != "-" && substr($1, 1, 1) != "d" { exit 1 }'
+)
+
+systemctl stop ai-image-factory.target
+psql \
+  "$DATABASE_URL" \
+  --set=ON_ERROR_STOP=1 \
+  --single-transaction \
+  --file="${RECOVERY_DIRECTORY}/database.sql"
+
+[[ "$GATEWAY_ARTIFACT_ROOT" = /* && "$GATEWAY_ARTIFACT_ROOT" != "/" ]] || {
+  printf 'GATEWAY_ARTIFACT_ROOT must be an absolute non-root path\n' >&2
+  exit 1
+}
+readonly ARTIFACT_PARENT="$(dirname "$GATEWAY_ARTIFACT_ROOT")"
+readonly ARTIFACT_NAME="$(basename "$GATEWAY_ARTIFACT_ROOT")"
+readonly PREVIOUS_ARTIFACT_ROOT="${ARTIFACT_PARENT}/.${ARTIFACT_NAME}.before-recovery-${AIF_UPDATE_COMMAND_ID}"
+install -d -m 0755 "$ARTIFACT_PARENT"
+if [[ ! -d "$GATEWAY_ARTIFACT_ROOT" && -d "$PREVIOUS_ARTIFACT_ROOT" ]]; then
+  mv -T "$PREVIOUS_ARTIFACT_ROOT" "$GATEWAY_ARTIFACT_ROOT"
+fi
+[[ -d "$GATEWAY_ARTIFACT_ROOT" ]] || {
+  printf 'artifact root does not exist: %s\n' "$GATEWAY_ARTIFACT_ROOT" >&2
+  exit 1
+}
+rm -rf -- "$PREVIOUS_ARTIFACT_ROOT"
+readonly RESTORED_ARTIFACT_ROOT="$(mktemp -d "${ARTIFACT_PARENT}/.${ARTIFACT_NAME}.restore.XXXXXXXX")"
+cleanup() {
+  rm -rf -- "$RESTORED_ARTIFACT_ROOT"
+}
+trap cleanup EXIT
+tar \
+  --extract \
+  --gzip \
+  --file="${RECOVERY_DIRECTORY}/artifacts.tar.gz" \
+  --directory="$RESTORED_ARTIFACT_ROOT" \
+  --no-same-owner \
+  --no-same-permissions
+chown -R "${SERVICE_USER}:${SERVICE_GROUP}" "$RESTORED_ARTIFACT_ROOT"
+find "$RESTORED_ARTIFACT_ROOT" -type f -exec sync -f {} +
+find "$RESTORED_ARTIFACT_ROOT" -depth -type d -exec sync -f {} +
+mv -T "$GATEWAY_ARTIFACT_ROOT" "$PREVIOUS_ARTIFACT_ROOT"
+mv -T "$RESTORED_ARTIFACT_ROOT" "$GATEWAY_ARTIFACT_ROOT"
+trap - EXIT
+sync -f "$ARTIFACT_PARENT"
+rm -rf -- "$PREVIOUS_ARTIFACT_ROOT"
+
+systemctl start ai-image-factory.target
+systemctl is-active --quiet ai-image-factory.target
