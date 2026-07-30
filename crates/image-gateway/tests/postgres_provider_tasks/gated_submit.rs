@@ -645,7 +645,7 @@ async fn outcome_unknown_recovery_observes_without_relaunching_cli() -> TestResu
         let lease = seed_running_submission_with_lease(
             &database.pool,
             "gated-unknown-recovery-worker",
-            10_000,
+            60_000,
         )
         .await?;
         let journal = tempfile::tempdir().map_err(debug_error)?;

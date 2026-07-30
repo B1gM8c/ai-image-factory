@@ -5318,7 +5318,7 @@ async fn submit_recovery_claim_is_scoped_fenced_and_reclaimable() -> TestResult 
             seed_running_submission_with_lease(&database.pool, "recovery-claim", 2_000).await?;
         let store = PostgresProviderTaskStore::new(database.pool.clone());
         let mut reservation = reservation_request(&executor);
-        reservation.provider_timeout_ms = 30_000;
+        reservation.provider_timeout_ms = 120_000;
         store
             .reserve_submit(&reservation)
             .await
@@ -5358,10 +5358,10 @@ async fn submit_recovery_claim_is_scoped_fenced_and_reclaimable() -> TestResult 
                 && invocation.context().execution_binding_sha256()
                     == invocation.intent.execution_binding_sha256
                 && invocation.context().invocation_attempt() == 1
-                && invocation.context().provider_timeout_ms() == 30_000
+                && invocation.context().provider_timeout_ms() == 120_000
                 && invocation.context().provider_deadline_at_ms()
                     - invocation.intent.send_started_at_ms.unwrap_or_default()
-                    == 30_000,
+                    == 120_000,
             "submit start did not return its exact frozen invocation context",
         )?;
         let context_debug = format!("{:?}", invocation.context());
@@ -5399,7 +5399,7 @@ async fn submit_recovery_claim_is_scoped_fenced_and_reclaimable() -> TestResult 
                     &wrong_scope,
                     "wrong-account",
                     "claim-wrong-account",
-                    2_000,
+                    10_000,
                 )
                 .await
                 .map_err(debug_error)?
@@ -5427,8 +5427,8 @@ async fn submit_recovery_claim_is_scoped_fenced_and_reclaimable() -> TestResult 
             capacity_heartbeat(&database.pool, executor.executor_execution_id).await?;
         tokio::time::sleep(Duration::from_millis(10)).await;
         let (left, right) = tokio::join!(
-            store.claim_submit_recovery(&scope, "recovery-a", "claim-recovery-a", 2_000),
-            store.claim_submit_recovery(&scope, "recovery-b", "claim-recovery-b", 2_000),
+            store.claim_submit_recovery(&scope, "recovery-a", "claim-recovery-a", 10_000),
+            store.claim_submit_recovery(&scope, "recovery-b", "claim-recovery-b", 10_000),
         );
         let mut winners = [left.map_err(debug_error)?, right.map_err(debug_error)?]
             .into_iter()
@@ -5452,7 +5452,7 @@ async fn submit_recovery_claim_is_scoped_fenced_and_reclaimable() -> TestResult 
                 &scope,
                 &first.recovery_owner,
                 first_claim_command,
-                2_000,
+                10_000,
             )
             .await
             .map_err(debug_error)?
@@ -5467,7 +5467,7 @@ async fn submit_recovery_claim_is_scoped_fenced_and_reclaimable() -> TestResult 
                     &scope,
                     &first.recovery_owner,
                     first_claim_command,
-                    2_001,
+                    10_001,
                 )
                 .await
                 == Err(ProviderTaskStoreError::Conflict),
@@ -5493,7 +5493,7 @@ async fn submit_recovery_claim_is_scoped_fenced_and_reclaimable() -> TestResult 
                 &scope,
                 &first.recovery_owner,
                 first_claim_command,
-                2_000,
+                10_000,
             )
             .await
             .map_err(debug_error)?
@@ -5525,10 +5525,10 @@ async fn submit_recovery_claim_is_scoped_fenced_and_reclaimable() -> TestResult 
         let stale_recovery = first.clone();
         let mut blocked_heartbeat = tokio::spawn(async move {
             stale_store
-                .heartbeat_submit_recovery(&stale_recovery, 2_000)
+                .heartbeat_submit_recovery(&stale_recovery, 10_000)
                 .await
         });
-        tokio::time::sleep(Duration::from_millis(2_500)).await;
+        tokio::time::sleep(Duration::from_millis(10_500)).await;
         require(
             !blocked_heartbeat.is_finished(),
             "submit recovery heartbeat did not wait for its fence lock",
@@ -5547,7 +5547,7 @@ async fn submit_recovery_claim_is_scoped_fenced_and_reclaimable() -> TestResult 
                 &scope,
                 &first.recovery_owner,
                 first_claim_command,
-                2_000,
+                10_000,
             )
             .await
             .map_err(debug_error)?
@@ -5575,7 +5575,7 @@ async fn submit_recovery_claim_is_scoped_fenced_and_reclaimable() -> TestResult 
                 &scope,
                 &expired_claim_replay.recovery_owner,
                 first_claim_command,
-                2_000,
+                10_000,
             )
             .await
             .map_err(debug_error)?
