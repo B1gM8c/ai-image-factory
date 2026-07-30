@@ -3042,8 +3042,8 @@ async fn shared_pool_case(pool: &PgPool) -> TestResult {
 
 async fn assert_expected_schema(pool: &PgPool) -> TestResult {
     require(
-        migration_versions(pool).await? == (0_i64..=114_i64).collect::<Vec<_>>(),
-        "applied migration versions must be exactly 0 through 114",
+        migration_versions(pool).await? == (0_i64..=115_i64).collect::<Vec<_>>(),
+        "applied migration versions must be exactly 0 through 115",
     )?;
 
     let retention_policy: (i64, i64, i64, i64) = sqlx::query_as(

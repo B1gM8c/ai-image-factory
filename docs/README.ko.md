@@ -24,9 +24,6 @@ AI Image Factory는 Codex, Grok, Dreamina 등의 CLI를 이미지·비디오 API
   <img src="assets/screenshots/media-workspace.png" alt="AI Image Factory 이미지와 비디오 작업 공간" width="88%">
 </p>
 
-공개 스크린샷에는 실제 계정, 이메일, API 키, 프롬프트, 사용량 및 공급자 자격
-증명을 포함하지 않아야 합니다.
-
 ## 해결하는 문제
 
 CLI를 안정적인 API 서비스로 운영하기 위해 다음 기능을 제공합니다.

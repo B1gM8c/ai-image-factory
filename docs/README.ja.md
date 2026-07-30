@@ -20,9 +20,6 @@ AI Image Factory は、Codex、Grok、Dreamina などの CLI を画像・動画 
 
 ![AI Image Factory メディア作成ワークスペース](assets/screenshots/media-workspace.png)
 
-スクリーンショットには匿名化したデモデータのみを使用します。実際のプロバイダー
-アカウント、資格情報、Prompt、内部パスを公開リポジトリへ含めてはいけません。
-
 管理コンソールは、画像・動画生成、API 呼び出し履歴、使用量、モデル、
 API Key、プロバイダーアカウント、スケジューリング、価格、課金、ユーザー、
 監査ログ、システム状態を一つのワークスペースにまとめます。

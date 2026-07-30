@@ -16,8 +16,6 @@ AI Image Factory 将 Codex、Grok、即梦（Dreamina）等 CLI 转为图片和�
 
 ![AI Image Factory 媒体创作工作区](assets/screenshots/media-workspace.png)
 
-截图使用脱敏演示数据。真实 Provider 账号、凭据、请求内容和内部运行路径不应提交到公开仓库。
-
 ## 解决的问题
 
 将 CLI 稳定地作为 API 服务运行，还需要以下能力：

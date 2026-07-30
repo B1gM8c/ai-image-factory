@@ -242,9 +242,6 @@ or audit facts.
 
 ![AI Image Factory media workspace](docs/assets/screenshots/media-workspace.png)
 
-Screenshots contain sanitized demo data. Do not commit real provider accounts,
-emails, credentials, prompts, quota values, or internal filesystem paths.
-
 ## Quick Start
 
 ### Prerequisites
