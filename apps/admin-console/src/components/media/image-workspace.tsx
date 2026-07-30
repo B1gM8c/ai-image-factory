@@ -43,7 +43,13 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
-import { consoleFetch } from "@/lib/auth/client";
+import type { Locale, LocalizedText } from "@/i18n/config";
+import { useI18n } from "@/i18n/locale-provider";
+import {
+  consoleFetch,
+  consoleRequestFailure,
+  consoleResponseFailure,
+} from "@/lib/auth/client";
 import { cn } from "@/lib/utils";
 
 type ConsoleImageModel = {
@@ -125,6 +131,7 @@ type PendingImageGeneration = {
 };
 
 export function ImageWorkspace() {
+  const { locale, t } = useI18n();
   const {
     activeWorkspace,
     loading: sessionLoading,
@@ -192,6 +199,12 @@ export function ImageWorkspace() {
     pendingIdempotency.current = null;
     if (!projectId) return;
 
+    const catalogFailure = t({
+      en: "The model catalog is temporarily unavailable.",
+      "zh-CN": "模型目录暂时不可用。",
+      ja: "モデルカタログは一時的に利用できません。",
+      ko: "모델 카탈로그를 일시적으로 사용할 수 없습니다.",
+    });
     const controller = new AbortController();
     setLoadingModels(true);
     void consoleFetch(
@@ -199,7 +212,11 @@ export function ImageWorkspace() {
       { signal: controller.signal },
     )
       .then(async (response) => {
-        if (!response.ok) throw new Error(await responseMessage(response));
+        if (!response.ok) {
+          throw new Error(
+            await consoleResponseFailure(response, catalogFailure, t),
+          );
+        }
         return (await response.json()) as ConsoleImageModelsResponse;
       })
       .then((payload) => {
@@ -210,14 +227,14 @@ export function ImageWorkspace() {
       })
       .catch((reason: unknown) => {
         if (controller.signal.aborted || sequence !== requestSequence.current) return;
-        setError(reason instanceof Error ? reason.message : "模型目录暂时不可用");
+        setError(consoleRequestFailure(reason, catalogFailure, t));
       })
       .finally(() => {
         if (sequence === requestSequence.current) setLoadingModels(false);
       });
 
     return () => controller.abort();
-  }, [projectId, revokeOwnedObjectUrls]);
+  }, [projectId, revokeOwnedObjectUrls, t]);
 
   const selectedModel = useMemo(
     () => models.find((model) => model.id === modelId) ?? null,
@@ -311,6 +328,12 @@ export function ImageWorkspace() {
 
   async function submit() {
     if (!projectId || !selectedModel || !prompt.trim() || generating) return;
+    const generationFailure = t({
+      en: "Image generation failed.",
+      "zh-CN": "图片生成失败。",
+      ja: "画像生成に失敗しました。",
+      ko: "이미지 생성에 실패했습니다.",
+    });
     const sequence = ++generationSequence.current;
     const controller = new AbortController();
     generationController.current?.abort();
@@ -364,10 +387,26 @@ export function ImageWorkspace() {
       );
       if (sequence !== generationSequence.current) return;
       pendingIdempotency.current = null;
-      if (!response.ok) throw new Error(await responseMessage(response));
+      if (!response.ok) {
+        throw new Error(
+          await consoleResponseFailure(response, generationFailure, t),
+        );
+      }
       const payload = (await response.json()) as unknown;
       const generated = parseGeneratedImages(payload);
-      if (generated.length === 0) throw new Error("上游未返回可展示的图片");
+      if (generated.length === 0) {
+        throw new Error(
+          t(
+            {
+              en: "{primary} The provider did not return a displayable image.",
+              "zh-CN": "{primary} 上游未返回可展示的图片。",
+              ja: "{primary} プロバイダーから表示可能な画像が返されませんでした。",
+              ko: "{primary} 공급자가 표시 가능한 이미지를 반환하지 않았습니다.",
+            },
+            { primary: generationFailure },
+          ),
+        );
+      }
       if (sequence !== generationSequence.current) {
         revokeImages(generated);
         return;
@@ -395,7 +434,7 @@ export function ImageWorkspace() {
       setActiveHistoryId(entry.id);
     } catch (reason) {
       if (controller.signal.aborted || sequence !== generationSequence.current) return;
-      setError(reason instanceof Error ? reason.message : "图片生成失败");
+      setError(consoleRequestFailure(reason, generationFailure, t));
     } finally {
       if (sequence === generationSequence.current) {
         generationController.current = null;
@@ -413,14 +452,24 @@ export function ImageWorkspace() {
 
   async function addReferenceFiles(files: File[]) {
     if (!selectedModel?.supports_edit) {
-      setError("当前模型不支持参考图编辑");
+      setError(t({
+        en: "This model does not support reference-image editing.",
+        "zh-CN": "当前模型不支持参考图编辑",
+        ja: "このモデルは参照画像を使った編集に対応していません。",
+        ko: "이 모델은 참조 이미지 편집을 지원하지 않습니다.",
+      }));
       return;
     }
     const supported = files.filter((file) =>
       ["image/png", "image/jpeg", "image/webp"].includes(file.type),
     );
     if (supported.length === 0) {
-      setError("参考图仅支持 PNG、JPEG 或 WebP");
+      setError(t({
+        en: "Reference images must be PNG, JPEG, or WebP.",
+        "zh-CN": "参考图仅支持 PNG、JPEG 或 WebP",
+        ja: "参照画像は PNG、JPEG、WebP のみ使用できます。",
+        ko: "참조 이미지는 PNG, JPEG 또는 WebP 형식만 지원합니다.",
+      }));
       return;
     }
     const currentBytes = referenceImages.reduce(
@@ -439,8 +488,21 @@ export function ImageWorkspace() {
     if (candidates.length === 0) {
       setError(
         referenceImages.length >= maxReferenceImages
-          ? `当前模型最多添加 ${maxReferenceImages} 张参考图`
-          : "参考图总大小不能超过 32 MiB",
+          ? t(
+            {
+              en: "This model accepts up to {count} reference images.",
+              "zh-CN": "当前模型最多添加 {count} 张参考图",
+              ja: "このモデルでは参照画像を最大 {count} 枚追加できます。",
+              ko: "이 모델에는 참조 이미지를 최대 {count}개까지 추가할 수 있습니다.",
+            },
+            { count: maxReferenceImages },
+          )
+          : t({
+            en: "Reference images cannot exceed 32 MiB in total.",
+            "zh-CN": "参考图总大小不能超过 32 MiB",
+            ja: "参照画像の合計サイズは 32 MiB 以下にしてください。",
+            ko: "참조 이미지의 총 크기는 32 MiB를 초과할 수 없습니다.",
+          }),
       );
       return;
     }
@@ -462,13 +524,23 @@ export function ImageWorkspace() {
         }),
       );
     } catch {
-      setError("参考图无法解码，请重新选择有效的 PNG、JPEG 或 WebP 图片");
+      setError(t({
+        en: "The reference image could not be decoded. Choose a valid PNG, JPEG, or WebP image.",
+        "zh-CN": "参考图无法解码，请重新选择有效的 PNG、JPEG 或 WebP 图片",
+        ja: "参照画像をデコードできませんでした。有効な PNG、JPEG、WebP 画像を選択してください。",
+        ko: "참조 이미지를 디코딩할 수 없습니다. 유효한 PNG, JPEG 또는 WebP 이미지를 선택하세요.",
+      }));
       return;
     }
     setReferenceImages((current) => [...current, ...accepted]);
     setError(
       accepted.length < supported.length
-        ? "部分图片因数量或总大小限制未添加"
+        ? t({
+          en: "Some images were not added because of the count or total-size limit.",
+          "zh-CN": "部分图片因数量或总大小限制未添加",
+          ja: "枚数または合計サイズの上限により、一部の画像は追加されませんでした。",
+          ko: "개수 또는 총 크기 제한으로 일부 이미지가 추가되지 않았습니다.",
+        })
         : null,
     );
   }
@@ -518,12 +590,24 @@ export function ImageWorkspace() {
           size="icon"
           variant="ghost"
           onClick={() => setHistoryOpen(true)}
-          aria-label="打开当前会话历史"
+          aria-label={t({
+            en: "Open session history",
+            "zh-CN": "打开当前会话历史",
+            ja: "セッション履歴を開く",
+            ko: "세션 기록 열기",
+          })}
         >
           <History aria-hidden="true" />
         </Button>
       </TooltipTrigger>
-      <TooltipContent>当前会话历史</TooltipContent>
+      <TooltipContent>
+        {t({
+          en: "Session history",
+          "zh-CN": "当前会话历史",
+          ja: "セッション履歴",
+          ko: "세션 기록",
+        })}
+      </TooltipContent>
     </Tooltip>
   );
   const resultHeightCap =
@@ -533,7 +617,15 @@ export function ImageWorkspace() {
   )}dvh`;
   const viewerItems = images.map((image, index) => ({
     src: image.objectUrl,
-    alt: `${submittedPrompt}，结果 ${index + 1}`,
+    alt: t(
+      {
+        en: "{prompt}, result {index}",
+        "zh-CN": "{prompt}，结果 {index}",
+        ja: "{prompt}、結果 {index}",
+        ko: "{prompt}, 결과 {index}",
+      },
+      { prompt: submittedPrompt, index: index + 1 },
+    ),
   }));
 
   if (!sessionLoading && !projectId) {
@@ -541,9 +633,21 @@ export function ImageWorkspace() {
       <section className="flex min-h-0 flex-1 items-center justify-center bg-muted/20 px-6">
         <div className="max-w-sm text-center">
           <ImageIcon className="mx-auto mb-4 size-8 text-muted-foreground" aria-hidden="true" />
-          <h2 className="text-lg font-semibold">选择一个项目开始创作</h2>
+          <h2 className="text-lg font-semibold">
+            {t({
+              en: "Select a project to start creating",
+              "zh-CN": "选择一个项目开始创作",
+              ja: "プロジェクトを選択して作成を開始",
+              ko: "프로젝트를 선택해 창작을 시작하세요",
+            })}
+          </h2>
           <p className="mt-2 text-sm leading-6 text-muted-foreground">
-            图片、调用记录和用量都归属于项目。请从左上角切换到具体项目。
+            {t({
+              en: "Images, request logs, and usage belong to a project. Choose a project from the top left.",
+              "zh-CN": "图片、调用记录和用量都归属于项目。请从左上角切换到具体项目。",
+              ja: "画像、リクエストログ、使用量はプロジェクトに紐づきます。左上からプロジェクトを選択してください。",
+              ko: "이미지, 요청 기록 및 사용량은 프로젝트에 속합니다. 왼쪽 상단에서 프로젝트를 선택하세요.",
+            })}
           </p>
         </div>
       </section>
@@ -594,11 +698,27 @@ export function ImageWorkspace() {
                     type="button"
                     className="relative block w-full cursor-zoom-in focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
                     onClick={() => setViewerIndex(index)}
-                    aria-label={`查看结果 ${index + 1} 原图`}
+                    aria-label={t(
+                      {
+                        en: "View original for result {index}",
+                        "zh-CN": "查看结果 {index} 原图",
+                        ja: "結果 {index} の元画像を表示",
+                        ko: "결과 {index}의 원본 이미지 보기",
+                      },
+                      { index: index + 1 },
+                    )}
                   >
                     <img
                       src={image.objectUrl}
-                      alt={`${submittedPrompt}，结果 ${index + 1}`}
+                      alt={t(
+                        {
+                          en: "{prompt}, result {index}",
+                          "zh-CN": "{prompt}，结果 {index}",
+                          ja: "{prompt}、結果 {index}",
+                          ko: "{prompt}, 결과 {index}",
+                        },
+                        { prompt: submittedPrompt, index: index + 1 },
+                      )}
                       className="h-auto w-full object-contain"
                       style={{ aspectRatio: cssAspectRatio(resultAspectRatio) }}
                     />
@@ -615,12 +735,27 @@ export function ImageWorkspace() {
                           size="icon"
                           variant="secondary"
                           onClick={() => downloadImage(image, index)}
-                          aria-label={`下载结果 ${index + 1}`}
+                          aria-label={t(
+                            {
+                              en: "Download result {index}",
+                              "zh-CN": "下载结果 {index}",
+                              ja: "結果 {index} をダウンロード",
+                              ko: "결과 {index} 다운로드",
+                            },
+                            { index: index + 1 },
+                          )}
                         >
                           <Download aria-hidden="true" />
                         </Button>
                       </TooltipTrigger>
-                      <TooltipContent>下载图片</TooltipContent>
+                      <TooltipContent>
+                        {t({
+                          en: "Download image",
+                          "zh-CN": "下载图片",
+                          ja: "画像をダウンロード",
+                          ko: "이미지 다운로드",
+                        })}
+                      </TooltipContent>
                     </Tooltip>
                   </div>
                 </figure>
@@ -634,7 +769,15 @@ export function ImageWorkspace() {
                 {activeHistory ? (
                   <p className="mt-1 flex items-center gap-1.5 text-xs text-muted-foreground">
                     <Clock3 className="size-3.5" aria-hidden="true" />
-                    完成用时 {formatDuration(activeHistory.durationMs)}
+                    {t(
+                      {
+                        en: "Completed in {duration}",
+                        "zh-CN": "完成用时 {duration}",
+                        ja: "{duration} で完了",
+                        ko: "{duration} 만에 완료",
+                      },
+                      { duration: formatDuration(activeHistory.durationMs, t) },
+                    )}
                   </p>
                 ) : null}
               </div>
@@ -645,16 +788,33 @@ export function ImageWorkspace() {
                 onClick={() => void submit()}
               >
                 <RotateCcw aria-hidden="true" />
-                再次生成
+                {t({
+                  en: "Generate again",
+                  "zh-CN": "再次生成",
+                  ja: "もう一度生成",
+                  ko: "다시 생성",
+                })}
               </Button>
             </div>
           </div>
         ) : (
           <div className="m-auto max-w-xl pb-8 text-center">
             <Sparkles className="mx-auto mb-5 size-8 text-muted-foreground" aria-hidden="true" />
-            <h2 className="text-2xl font-semibold md:text-3xl">今天想创作什么？</h2>
+            <h2 className="text-2xl font-semibold md:text-3xl">
+              {t({
+                en: "What will you create today?",
+                "zh-CN": "今天想创作什么？",
+                ja: "今日は何を作りますか？",
+                ko: "오늘은 무엇을 만들어 볼까요?",
+              })}
+            </h2>
             <p className="mt-3 text-sm leading-6 text-muted-foreground">
-              描述画面、主体、构图和风格，生成结果只在当前会话中展示。
+              {t({
+                en: "Describe the scene, subject, composition, and style. Results stay in this session only.",
+                "zh-CN": "描述画面、主体、构图和风格，生成结果只在当前会话中展示。",
+                ja: "シーン、被写体、構図、スタイルを説明してください。結果は現在のセッションにのみ表示されます。",
+                ko: "장면, 피사체, 구도와 스타일을 설명하세요. 결과는 현재 세션에만 표시됩니다.",
+              })}
             </p>
           </div>
         )}
@@ -663,9 +823,21 @@ export function ImageWorkspace() {
       <Sheet open={historyOpen} onOpenChange={setHistoryOpen}>
         <SheetContent className="flex w-full min-w-0 flex-col gap-0 overflow-hidden p-0 sm:max-w-md">
           <SheetHeader className="border-b px-6 py-5 pr-14 text-left">
-            <SheetTitle>当前会话历史</SheetTitle>
+            <SheetTitle>
+              {t({
+                en: "Session history",
+                "zh-CN": "当前会话历史",
+                ja: "セッション履歴",
+                ko: "세션 기록",
+              })}
+            </SheetTitle>
             <SheetDescription>
-              仅保留本次页面会话中成功生成的图片，切换项目或离开页面后自动清除。
+              {t({
+                en: "Only images generated successfully in this page session are kept. They are cleared when you switch projects or leave the page.",
+                "zh-CN": "仅保留本次页面会话中成功生成的图片，切换项目或离开页面后自动清除。",
+                ja: "このページセッションで正常に生成された画像のみ保持します。プロジェクトを切り替えるかページを離れると自動的に消去されます。",
+                ko: "이 페이지 세션에서 성공적으로 생성된 이미지만 보관합니다. 프로젝트를 전환하거나 페이지를 나가면 자동으로 삭제됩니다.",
+              })}
             </SheetDescription>
           </SheetHeader>
           {history.length > 0 ? (
@@ -684,11 +856,23 @@ export function ImageWorkspace() {
                     <span className="flex min-w-0 items-center justify-between gap-3">
                       <span className="truncate text-sm font-medium">{entry.prompt}</span>
                       <span className="shrink-0 text-xs text-muted-foreground">
-                        {formatHistoryTime(entry.createdAt)}
+                        {formatHistoryTime(entry.createdAt, locale)}
                       </span>
                     </span>
                     <span className="mt-1 block text-xs text-muted-foreground">
-                      {entry.modelId} · {entry.aspectRatio} · {entry.images.length} 张
+                      {t(
+                        {
+                          en: "{model} · {ratio} · {count} images",
+                          "zh-CN": "{model} · {ratio} · {count} 张",
+                          ja: "{model} · {ratio} · {count} 枚",
+                          ko: "{model} · {ratio} · 이미지 {count}개",
+                        },
+                        {
+                          model: entry.modelId,
+                          ratio: entry.aspectRatio,
+                          count: entry.images.length.toLocaleString(locale),
+                        },
+                      )}
                     </span>
                     <span className="mt-3 flex max-w-full gap-2 overflow-x-auto pb-1">
                       {entry.images.map((image, index) => (
@@ -712,9 +896,21 @@ export function ImageWorkspace() {
                   className="mx-auto mb-4 size-8 text-muted-foreground"
                   aria-hidden="true"
                 />
-                <p className="text-sm font-medium">还没有会话记录</p>
+                <p className="text-sm font-medium">
+                  {t({
+                    en: "No session history yet",
+                    "zh-CN": "还没有会话记录",
+                    ja: "セッション履歴はまだありません",
+                    ko: "아직 세션 기록이 없습니다",
+                  })}
+                </p>
                 <p className="mt-2 text-sm leading-6 text-muted-foreground">
-                  成功生成图片后，结果会临时显示在这里。
+                  {t({
+                    en: "Successfully generated images will appear here temporarily.",
+                    "zh-CN": "成功生成图片后，结果会临时显示在这里。",
+                    ja: "正常に生成された画像は一時的にここに表示されます。",
+                    ko: "성공적으로 생성된 이미지가 여기에 임시로 표시됩니다.",
+                  })}
                 </p>
               </div>
             </div>
@@ -749,7 +945,15 @@ export function ImageWorkspace() {
                 >
                   <img
                     src={image.previewUrl}
-                    alt={`参考图 ${index + 1}`}
+                    alt={t(
+                      {
+                        en: "Reference image {index}",
+                        "zh-CN": "参考图 {index}",
+                        ja: "参照画像 {index}",
+                        ko: "참조 이미지 {index}",
+                      },
+                      { index: index + 1 },
+                    )}
                     className="size-full object-cover"
                   />
                   <Button
@@ -759,7 +963,15 @@ export function ImageWorkspace() {
                     className="absolute right-1 top-1 size-6 opacity-100 shadow-sm sm:opacity-0 sm:group-hover:opacity-100"
                     disabled={generating}
                     onClick={() => removeReferenceImage(image.id)}
-                    aria-label={`移除参考图 ${index + 1}`}
+                    aria-label={t(
+                      {
+                        en: "Remove reference image {index}",
+                        "zh-CN": "移除参考图 {index}",
+                        ja: "参照画像 {index} を削除",
+                        ko: "참조 이미지 {index} 제거",
+                      },
+                      { index: index + 1 },
+                    )}
                   >
                     <X className="size-3.5" aria-hidden="true" />
                   </Button>
@@ -772,8 +984,18 @@ export function ImageWorkspace() {
             onChange={(event) => setPrompt(event.target.value)}
             onKeyDown={handlePromptKeyDown}
             onPaste={handlePromptPaste}
-            placeholder="描述你想生成的图片"
-            aria-label="图片提示词"
+            placeholder={t({
+              en: "Describe the image you want to create",
+              "zh-CN": "描述你想生成的图片",
+              ja: "生成したい画像を説明してください",
+              ko: "생성할 이미지를 설명하세요",
+            })}
+            aria-label={t({
+              en: "Image prompt",
+              "zh-CN": "图片提示词",
+              ja: "画像プロンプト",
+              ko: "이미지 프롬프트",
+            })}
             maxLength={6_000}
             className="min-h-20 border-0 px-2 py-2 text-base shadow-none focus-visible:ring-0"
           />
@@ -792,15 +1014,33 @@ export function ImageWorkspace() {
                   className="size-8 shrink-0"
                   disabled={!selectedModel?.supports_edit || generating}
                   onClick={() => fileInput.current?.click()}
-                  aria-label="添加参考图"
+                  aria-label={t({
+                    en: "Add reference images",
+                    "zh-CN": "添加参考图",
+                    ja: "参照画像を追加",
+                    ko: "참조 이미지 추가",
+                  })}
                 >
                   <Paperclip aria-hidden="true" />
                 </Button>
               </TooltipTrigger>
               <TooltipContent>
                 {selectedModel?.supports_edit
-                  ? `添加参考图（最多 ${selectedModel.max_reference_images} 张，也可直接粘贴）`
-                  : "当前模型不支持参考图"}
+                  ? t(
+                    {
+                      en: "Add reference images (up to {count}; you can also paste them)",
+                      "zh-CN": "添加参考图（最多 {count} 张，也可直接粘贴）",
+                      ja: "参照画像を追加（最大 {count} 枚、貼り付けも可能）",
+                      ko: "참조 이미지 추가(최대 {count}개, 붙여넣기도 가능)",
+                    },
+                    { count: selectedModel.max_reference_images },
+                  )
+                  : t({
+                    en: "This model does not support reference images",
+                    "zh-CN": "当前模型不支持参考图",
+                    ja: "このモデルは参照画像に対応していません",
+                    ko: "이 모델은 참조 이미지를 지원하지 않습니다",
+                  })}
               </TooltipContent>
             </Tooltip>
             <Select value={modelId} onValueChange={setModelId} disabled={loadingModels}>
@@ -811,7 +1051,12 @@ export function ImageWorkspace() {
                 {loadingModels ? (
                   <span className="flex items-center gap-2 text-sm text-muted-foreground">
                     <LoaderCircle className="size-3.5 animate-spin" aria-hidden="true" />
-                    载入模型
+                    {t({
+                      en: "Loading models",
+                      "zh-CN": "载入模型",
+                      ja: "モデルを読み込み中",
+                      ko: "모델 불러오는 중",
+                    })}
                   </span>
                 ) : selectedModel ? (
                   <span className="flex min-w-0 items-center gap-2 whitespace-nowrap">
@@ -819,7 +1064,12 @@ export function ImageWorkspace() {
                     <span>{selectedModel.id}</span>
                   </span>
                 ) : (
-                  <SelectValue placeholder="选择模型" />
+                  <SelectValue placeholder={t({
+                    en: "Select a model",
+                    "zh-CN": "选择模型",
+                    ja: "モデルを選択",
+                    ko: "모델 선택",
+                  })} />
                 )}
               </SelectTrigger>
               <SelectContent>
@@ -845,7 +1095,7 @@ export function ImageWorkspace() {
               <SelectContent>
                 {aspectRatioOptions.map((ratio) => (
                   <SelectItem key={ratio} value={ratio}>
-                    {aspectRatioLabel(ratio)} {ratio}
+                    {aspectRatioLabel(ratio, t)} {ratio}
                   </SelectItem>
                 ))}
               </SelectContent>
@@ -862,7 +1112,15 @@ export function ImageWorkspace() {
                     (_, index) => minCount + index,
                   ).map((value) => (
                     <SelectItem key={value} value={String(value)}>
-                      {value} 张
+                      {t(
+                        {
+                          en: "{count} images",
+                          "zh-CN": "{count} 张",
+                          ja: "{count} 枚",
+                          ko: "이미지 {count}개",
+                        },
+                        { count: value },
+                      )}
                     </SelectItem>
                   ))}
                 </SelectContent>
@@ -904,13 +1162,37 @@ export function ImageWorkspace() {
                   className="ml-auto size-8"
                   disabled={!canSubmit}
                   onClick={() => void submit()}
-                  aria-label={generating ? "图片生成中" : "生成图片"}
+                  aria-label={generating
+                    ? t({
+                      en: "Generating image",
+                      "zh-CN": "图片生成中",
+                      ja: "画像を生成中",
+                      ko: "이미지 생성 중",
+                    })
+                    : t({
+                      en: "Generate image",
+                      "zh-CN": "生成图片",
+                      ja: "画像を生成",
+                      ko: "이미지 생성",
+                    })}
                 >
                   <ArrowUp aria-hidden="true" />
                 </Button>
               </TooltipTrigger>
               <TooltipContent>
-                {generating ? "图片生成中" : "生成图片"}
+                {generating
+                  ? t({
+                    en: "Generating image",
+                    "zh-CN": "图片生成中",
+                    ja: "画像を生成中",
+                    ko: "이미지 생성 중",
+                  })
+                  : t({
+                    en: "Generate image",
+                    "zh-CN": "生成图片",
+                    ja: "画像を生成",
+                    ko: "이미지 생성",
+                  })}
               </TooltipContent>
             </Tooltip>
           </div>
@@ -927,6 +1209,7 @@ function ImageGenerationPending({
   generation: PendingImageGeneration;
   elapsedSeconds: number;
 }) {
+  const { t } = useI18n();
   const placeholderCount = Math.min(4, Math.max(1, generation.count));
   const aspectRatioValue = numericAspectRatio(generation.aspectRatio);
   const placeholderHeightCap =
@@ -950,7 +1233,15 @@ function ImageGenerationPending({
           className="shrink-0 text-xs text-muted-foreground"
           aria-hidden="true"
         >
-          生成中 · {formatElapsed(elapsedSeconds)}
+          {t(
+            {
+              en: "Generating · {duration}",
+              "zh-CN": "生成中 · {duration}",
+              ja: "生成中 · {duration}",
+              ko: "생성 중 · {duration}",
+            },
+            { duration: formatElapsed(elapsedSeconds, t) },
+          )}
         </p>
       </div>
       <div
@@ -974,7 +1265,15 @@ function ImageGenerationPending({
         ))}
       </div>
       <span className="sr-only" role="status">
-        图片生成任务已提交，模型 {generation.modelId}，正在生成
+        {t(
+          {
+            en: "Image generation submitted. Model {model} is generating the result.",
+            "zh-CN": "图片生成任务已提交，模型 {model}，正在生成",
+            ja: "画像生成を送信しました。モデル {model} が生成中です。",
+            ko: "이미지 생성 작업을 제출했습니다. 모델 {model}이 결과를 생성 중입니다.",
+          },
+          { model: generation.modelId },
+        )}
       </span>
     </div>
   );
@@ -1008,16 +1307,41 @@ function requestBody(
   };
 }
 
-function formatElapsed(seconds: number) {
-  if (seconds < 60) return `${seconds} 秒`;
+function formatElapsed(seconds: number, t: Translate) {
+  if (seconds < 60) {
+    return t(
+      {
+        en: "{seconds}s",
+        "zh-CN": "{seconds} 秒",
+        ja: "{seconds} 秒",
+        ko: "{seconds}초",
+      },
+      { seconds },
+    );
+  }
   const minutes = Math.floor(seconds / 60);
   const remainder = seconds % 60;
-  return `${minutes} 分 ${remainder} 秒`;
+  return t(
+    {
+      en: "{minutes}m {seconds}s",
+      "zh-CN": "{minutes} 分 {seconds} 秒",
+      ja: "{minutes} 分 {seconds} 秒",
+      ko: "{minutes}분 {seconds}초",
+    },
+    { minutes, seconds: remainder },
+  );
 }
 
-function formatDuration(milliseconds: number) {
-  if (milliseconds < 1_000) return "不足 1 秒";
-  return formatElapsed(Math.round(milliseconds / 1_000));
+function formatDuration(milliseconds: number, t: Translate) {
+  if (milliseconds < 1_000) {
+    return t({
+      en: "under 1s",
+      "zh-CN": "不足 1 秒",
+      ja: "1 秒未満",
+      ko: "1초 미만",
+    });
+  }
+  return formatElapsed(Math.round(milliseconds / 1_000), t);
 }
 
 function editRequestBody(
@@ -1113,31 +1437,23 @@ function downloadImage(image: GeneratedImage, index: number) {
   anchor.click();
 }
 
-async function responseMessage(response: Response) {
-  const payload = (await response.json().catch(() => null)) as unknown;
-  if (isRecord(payload)) {
-    if (typeof payload.error === "string") return payload.error;
-    if (isRecord(payload.error)) {
-      if (payload.error.code === "billing_limit_exceeded") {
-        return "组织计费可用额度不足，请联系管理员调整组织限额";
-      }
-      if (typeof payload.error.message === "string") {
-        return payload.error.message;
-      }
-    }
+function aspectRatioLabel(value: string, t: Translate) {
+  if (value === "1:1") {
+    return t({ en: "Square", "zh-CN": "方形", ja: "正方形", ko: "정사각형" });
   }
-  if (response.status === 403) return "当前账号没有在此项目中生成图片的权限";
-  if (response.status === 429) return "当前项目请求较多，请稍后重试";
-  return "图片生成服务暂时不可用";
-}
-
-function aspectRatioLabel(value: string) {
-  if (value === "1:1") return "方形";
-  if (value === "3:4") return "竖版";
-  if (value === "4:3") return "横版";
-  if (value === "9:16") return "故事";
-  if (value === "16:9") return "宽屏";
-  return "比例";
+  if (value === "3:4") {
+    return t({ en: "Portrait", "zh-CN": "竖版", ja: "縦長", ko: "세로형" });
+  }
+  if (value === "4:3") {
+    return t({ en: "Landscape", "zh-CN": "横版", ja: "横長", ko: "가로형" });
+  }
+  if (value === "9:16") {
+    return t({ en: "Story", "zh-CN": "故事", ja: "ストーリー", ko: "스토리" });
+  }
+  if (value === "16:9") {
+    return t({ en: "Widescreen", "zh-CN": "宽屏", ja: "ワイド", ko: "와이드스크린" });
+  }
+  return t({ en: "Ratio", "zh-CN": "比例", ja: "比率", ko: "비율" });
 }
 
 function cssAspectRatio(value: string) {
@@ -1156,14 +1472,19 @@ function roundDimension(value: number) {
   return Math.round(value * 100) / 100;
 }
 
-function formatHistoryTime(value: number) {
-  return new Intl.DateTimeFormat("zh-CN", {
+function formatHistoryTime(value: number, locale: Locale) {
+  return new Intl.DateTimeFormat(locale, {
     month: "2-digit",
     day: "2-digit",
     hour: "2-digit",
     minute: "2-digit",
   }).format(new Date(value));
 }
+
+type Translate = (
+  text: LocalizedText,
+  values?: Record<string, string | number>,
+) => string;
 
 function objectUrlFromBase64(encoded: string, mimeType: string) {
   const binary = window.atob(encoded);

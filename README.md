@@ -1,190 +1,360 @@
 # AI Image Factory
 
-AI Image Factory is a monorepo for provider-neutral image and video APIs.
+<p align="center">
+  Turn image and video CLIs into provider-shaped APIs with multi-account routing.
+</p>
 
-The first active backend is the existing native Codex CLI path for `gpt-image-2`.
-The platform layout now leaves explicit room for additional providers such as
-Dreamina CLI, Volcengine Ark, and Grok CLI without coupling their native
-protocols to the public API.
+<p align="center">
+  <a href="https://github.com/B1gM8c/ai-image-factory/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/B1gM8c/ai-image-factory/actions/workflows/ci.yml/badge.svg"></a>
+  <a href="LICENSE"><img alt="License: Apache-2.0" src="https://img.shields.io/badge/license-Apache--2.0-blue.svg"></a>
+</p>
 
-## Workspace
+<p align="center">
+  <a href="README.md">English</a> |
+  <a href="docs/README.zh-CN.md">简体中文</a> |
+  <a href="docs/README.ja.md">日本語</a> |
+  <a href="docs/README.ko.md">한국어</a>
+</p>
+
+![AI Image Factory operations overview](docs/assets/screenshots/admin-console-overview.png)
+
+AI Image Factory exposes Codex, Grok, Dreamina, and other CLIs through
+provider-shaped image and video APIs. It routes requests across isolated
+accounts by concurrency, weight, health, and quota while managing login, jobs,
+outputs, usage, and pricing. Compatibility is adapter-scoped; unsupported
+fields are rejected. Account pooling can improve utilization and reduce
+per-call cost.
+
+This repository is under active development. The status labels below are part
+of the contract:
+
+- **Implemented** means the code path and automated tests exist in this
+  repository.
+- **Configuration required** means the path is implemented but remains
+  unavailable until an operator supplies provider credentials, account
+  bindings, pricing, storage, or an activation flag.
+- **Roadmap** means intended direction, not a production claim.
+
+## What It Solves
+
+Operating provider CLIs as an API service requires five additional functions:
+
+1. **Provider-shaped API profiles** preserve supported routes, fields, and
+   response envelopes and reject unsupported fields.
+2. **Multi-account routing** selects an eligible account using configured
+   concurrency, weight, health, quota, and model policy.
+3. **Durable execution** records jobs, leases, retries, outputs, and terminal
+   state in PostgreSQL so work can recover after a process restart.
+4. **Usage and pricing** connect each accepted request to a project, model,
+   metering result, customer price, and provider cost.
+5. **Central operations** provide one console for accounts, quotas, queues,
+   users, projects, API keys, audit records, and system health.
+
+## Business Value
+
+| Concern | Platform value |
+| --- | --- |
+| Provider integration | One contract boundary for managed APIs and isolated CLI runtimes |
+| Capacity | Account-aware scheduling, concurrency limits, quota observations, and groups |
+| Reliability | Durable leases, idempotency, terminal reduction, artifact cleanup, and reconciliation |
+| Cost control | Per-model pricing, immutable metering facts, rating, budgets, and a settlement ledger |
+| Multi-tenancy | Organizations, projects, memberships, scoped API keys, and owner-filtered reads |
+| Operations | One console for requests, accounts, queues, pricing, users, audit events, and health |
+| Migration | External model aliases and per-account model policy decouple clients from upstream names |
+
+## Product Surfaces
+
+### Implemented
+
+- Next.js, React, and shadcn-style administration console with English as the
+  default UI language and persistent English, Simplified Chinese, Japanese,
+  and Korean switching.
+- Axum gateway with identity sessions, JWT access tokens, opaque rotating
+  refresh tokens, CSRF protection, and an explicit BFF proxy allowlist.
+- Organization, project, membership, API key, model policy, budget, and audit
+  boundaries.
+- OpenAI-shaped image generation and edit contracts backed by configured
+  provider bindings.
+- xAI-shaped asynchronous video routes with durable job lookup and file
+  delivery.
+- Codex, Grok, and Dreamina/Seedance CLI adapter boundaries.
+- Provider account isolation, model discovery, model aliases, account groups,
+  scheduling weights, priority, concurrency, health, and quota snapshots.
+- PostgreSQL-backed jobs, leases, capacity counters, metering, pricing,
+  customer charges, and reconciliation work.
+- Local POSIX artifact delivery with bounded retention, plus optional
+  provider-upload and object-storage integration points.
+- Batch admission, request logs, usage views, pricing management, user
+  administration, queue inspection, audit logs, and health/readiness views.
+- Operator binaries for execution, submission, polling, reduction,
+  reconciliation, and webhooks.
+
+### Configuration Required
+
+- Real Codex, Grok, or Dreamina accounts and their isolated credential homes.
+- Provider-specific model bindings and external model aliases.
+- Positive production prices for every billable metric.
+- Grok video activation through the exact execution profile and feature gate.
+- Public artifact URLs through a reverse proxy or configured object storage.
+- TLS termination, backup, monitoring, alert delivery, and production secrets.
+- Real-provider smoke tests; automated CI uses fake or contract-test providers
+  unless credentials are deliberately supplied.
+
+### Roadmap
+
+- S3-compatible artifact storage as a first-class production backend.
+- Stronger OS/container isolation for untrusted CLI workloads.
+- Broader managed-provider API adapters beside CLI execution.
+- Evidence-driven multi-node event transport and multi-region control-plane
+  deployment.
+- A stable provider SDK and conformance suite for third-party adapters.
+
+## Architecture
+
+```mermaid
+flowchart LR
+    SDK["Official SDKs and API clients"] --> API["API facades<br/>OpenAI | xAI | Ark | native"]
+    UI["Next.js admin console"] --> BFF["Secure BFF"]
+    BFF --> GW["Axum gateway"]
+    API --> GW
+
+    GW --> PG[("PostgreSQL<br/>identity | jobs | queue | pricing | ledger")]
+    GW --> ART[("Artifact store<br/>POSIX today | S3 roadmap")]
+
+    WORK["workerd"] --> PG
+    EXEC["executord<br/>account-isolated CLI runtime"] --> PG
+    EXEC --> ART
+    REDUCE["reducerd<br/>metering | rating | settlement"] --> PG
+    RECON["reconcilerd<br/>lease | artifact | economic recovery"] --> PG
+    SUBMIT["provider-submitd"] --> PG
+    POLL["provider-pollerd"] --> PG
+
+    EXEC --> ROUTE["Provider bindings"]
+    SUBMIT --> ROUTE
+    POLL --> ROUTE
+    ROUTE --> CODEX["Codex CLI"]
+    ROUTE --> GROK["Grok CLI"]
+    ROUTE --> DREAM["Dreamina / Seedance CLI"]
+    ROUTE -. roadmap .-> MANAGED["Managed provider APIs"]
+```
+
+### Request Lifecycle
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant G as Gateway
+    participant D as PostgreSQL
+    participant W as Worker
+    participant P as Provider runtime
+    participant R as Reducer
+
+    C->>G: Provider-shaped request
+    G->>D: Authorize, price, reserve, enqueue
+    G-->>C: Request or job identifier
+    W->>D: Lease eligible work
+    W->>P: Execute bound model on selected account
+    P-->>W: Provider evidence and artifacts
+    W->>D: Commit terminal evidence
+    R->>D: Meter, rate, settle, reconcile
+    C->>G: Poll request or fetch artifact
+    G-->>C: Terminal result
+```
+
+The database is the durable coordination boundary. Process-local state is an
+optimization, never the source of truth for job ownership, account capacity,
+or billing.
+
+## Design Principles
+
+- **Official-shaped edges, provider-neutral core.** Public DTOs remain close
+  to the official API being emulated; internal jobs use immutable media and
+  provider contracts.
+- **Ports before providers.** Scheduling, persistence, execution, and
+  artifacts are interfaces owned by their domain, not by a specific CLI.
+- **Durability before cleverness.** Lease fencing, idempotency, terminal
+  reduction, and recovery evidence are explicit.
+- **Economic correctness.** Admission, metering, rating, charging, refunds,
+  budgets, and reconciliation are separate transitions.
+- **Account isolation.** Each CLI account has an independent credential home
+  and runtime binding.
+- **Bounded hot paths.** Queue acquisition and capacity accounting avoid
+  unbounded scans and high-cardinality runtime labels.
+- **Fail closed.** Missing model policy, pricing, identity, or activation
+  evidence rejects traffic instead of silently routing or billing at zero.
+
+## Repository Layout
 
 ```text
 apps/
-  admin-console/      Next.js + React + shadcn-style operations console
+  admin-console/          Next.js + React operations and creator console
 crates/
-  api-contracts/          Official-compatible public wire contracts and DTOs
-  cli-runtime/            Provider-neutral Unix process and artifact runtime
-  factory-identity/       Admin identity, access JWT, opaque refresh, and auth ports
-  image-gateway/          HTTP composition, PostgreSQL workflows, and service binaries
-  provider-contracts/     Immutable media/provider/job contracts and roadmap
-  provider-dreamina-cli/  Managed Dreamina CLI image and Seedance video adapter
-  provider-grok-cli/      xAI-to-Grok CLI media binding with gated public activation
+  api-contracts/          Public provider-shaped wire contracts
+  cli-runtime/            Process, workspace, deadline, and artifact runtime
+  factory-identity/       Users, sessions, JWT, refresh rotation, and auth ports
+  image-gateway/          Axum composition, PostgreSQL adapters, and daemons
+  platform-updater/       Signed update planning and installation boundaries
+  provider-contracts/     Provider-neutral model, job, and artifact contracts
+  provider-dreamina-cli/  Dreamina image and Seedance video adapter
+  provider-grok-cli/      Grok image and video adapter
   provider-sdk/           Inline and remote provider execution ports
-  provider-test-support/  Dev-only provider conformance harness
-  scheduler-policy/       Provider-neutral weighted scheduling policy
+  provider-test-support/  Provider contract and fake-runtime test support
+  scheduler-policy/       Provider-neutral scheduling policy
 docs/
-  architecture/           Decisions, activation gates, and target boundaries
+  architecture/           Decisions, invariants, activation gates, and evidence
+  operations/             Bootstrap, release, recovery, and production runbooks
 tools/
-  provider-submit-bench/  Isolated PostgreSQL submit-scheduler benchmark
+  provider-submit-bench/  Isolated PostgreSQL scheduling benchmark
 ```
 
-The authoritative target design is
-[`docs/architecture/2026-ai-image-factory-target-architecture.md`](docs/architecture/2026-ai-image-factory-target-architecture.md).
-The current CLI execution boundary and activation gates are documented in
-[`docs/architecture/2026-phase2a-provider-runtime-boundaries.md`](docs/architecture/2026-phase2a-provider-runtime-boundaries.md).
-The Dreamina CLI adapter baseline and its production gates are documented in
-[`docs/architecture/2026-phase2b-dreamina-cli-adapter.md`](docs/architecture/2026-phase2b-dreamina-cli-adapter.md).
-The remote-submit deadline quarantine is documented in
-[`docs/architecture/2026-phase2f-provider-submit-deadline-quarantine.md`](docs/architecture/2026-phase2f-provider-submit-deadline-quarantine.md).
-Its independent capacity reconciliation and strong-evidence release boundary is documented in
-[`docs/architecture/2026-phase2g-provider-capacity-reconciliation.md`](docs/architecture/2026-phase2g-provider-capacity-reconciliation.md).
-Atomic remote artifact evidence and canonical resolution are documented in
-[`docs/architecture/2026-phase2h-atomic-provider-artifact-resolution.md`](docs/architecture/2026-phase2h-atomic-provider-artifact-resolution.md).
-Exact submit-recovery command replay and bounded claims are documented in
-[`docs/architecture/2026-phase2i-replayable-provider-submit-recovery.md`](docs/architecture/2026-phase2i-replayable-provider-submit-recovery.md).
-Attached remote-task deadlines, quarantine authority, and committed artifact recovery are documented in
-[`docs/architecture/2026-phase2j-provider-remote-task-deadline.md`](docs/architecture/2026-phase2j-provider-remote-task-deadline.md).
-Immutable operation descriptors, command identity, submit idempotency, and execution binding are documented in
-[`docs/architecture/2026-phase2k-immutable-provider-operation-binding.md`](docs/architecture/2026-phase2k-immutable-provider-operation-binding.md).
-Atomic provider-submit dispatch and its single orchestration boundary are documented in
-[`docs/architecture/2026-phase2l-atomic-provider-submit-orchestrator.md`](docs/architecture/2026-phase2l-atomic-provider-submit-orchestrator.md).
-Durable local submit evidence, receipt-first recovery, and its remaining helper gates are documented in
-[`docs/architecture/2026-phase2m-durable-provider-submit-journal.md`](docs/architecture/2026-phase2m-durable-provider-submit-journal.md).
-The inactive gated CLI process protocol, crash evidence, and containment limits are documented in
-[`docs/architecture/2026-phase2n-gated-cli-submit-runner.md`](docs/architecture/2026-phase2n-gated-cli-submit-runner.md).
-The inactive gated submit composition, static driver boundary, and crash-window recovery are documented in
-[`docs/architecture/2026-phase2o-gated-submit-orchestration.md`](docs/architecture/2026-phase2o-gated-submit-orchestration.md).
-The Dreamina canonical submit codec and its gated runtime binding are documented in
-[`docs/architecture/2026-phase2p-dreamina-gated-submit-codec.md`](docs/architecture/2026-phase2p-dreamina-gated-submit-codec.md).
-The provider-neutral fresh CLI output-directory boundary is documented in
-[`docs/architecture/2026-phase2q-fresh-cli-output-directory.md`](docs/architecture/2026-phase2q-fresh-cli-output-directory.md).
-The provider-neutral fenced poll orchestrator, lazy materialization boundary,
-and committed-authority recovery are documented in
-[`docs/architecture/2026-phase2r-provider-poll-orchestrator.md`](docs/architecture/2026-phase2r-provider-poll-orchestrator.md).
-The epoch-fenced streaming filesystem stager, immutable publication, and
-pre-authority crash replay are documented in
-[`docs/architecture/2026-phase2s-epoch-staged-provider-artifacts.md`](docs/architecture/2026-phase2s-epoch-staged-provider-artifacts.md).
-The provider-neutral fixed-lane poll daemon, jittered pacing, and bounded
-shutdown drain are documented in
-[`docs/architecture/2026-phase2t-provider-poll-daemon.md`](docs/architecture/2026-phase2t-provider-poll-daemon.md).
-The active provider/account poll runtime snapshot, redacted credential identity,
-and durable lane derivation are documented in
-[`docs/architecture/2026-phase2u-active-poll-runtime-profile.md`](docs/architecture/2026-phase2u-active-poll-runtime-profile.md).
-The Dreamina media poll driver, bounded query materialization, and
-account-fenced local process verification are documented in
-[`docs/architecture/2026-phase2v-inactive-dreamina-image-poll-driver.md`](docs/architecture/2026-phase2v-inactive-dreamina-image-poll-driver.md).
-The provider-neutral exclusive CLI attempt workspace, descriptor-relative
-crash recovery, and root-replacement fencing are documented in
-[`docs/architecture/2026-phase2w-exclusive-cli-attempt-workspace.md`](docs/architecture/2026-phase2w-exclusive-cli-attempt-workspace.md).
-The inactive provider poll service, exact profile/account capability binding,
-bounded lifecycle, and real PostgreSQL fake-CLI proof are documented in
-[`docs/architecture/2026-phase2x-inactive-provider-poll-service.md`](docs/architecture/2026-phase2x-inactive-provider-poll-service.md).
-The fenced provider-submit recovery work, frozen command projection,
-database-time budget, and no-resubmit crash proof are documented in
-[`docs/architecture/2026-phase2y-fenced-provider-submit-recovery.md`](docs/architecture/2026-phase2y-fenced-provider-submit-recovery.md).
-The provider-neutral submit service, stable lane command identity, lease
-heartbeats, bounded daemon, and inactive Dreamina projector are documented in
-[`docs/architecture/2026-phase2z-provider-submit-service-kernel.md`](docs/architecture/2026-phase2z-provider-submit-service-kernel.md).
-The recoverable per-launch submit workspace, frozen process-path binding,
-per-attempt cleanup serialization, and restart-safe lifecycle are documented in
-[`docs/architecture/2026-phase2aa-recoverable-submit-attempt-workspace.md`](docs/architecture/2026-phase2aa-recoverable-submit-attempt-workspace.md).
-The inactive provider submit process, shared frozen runtime profile, exact
-Dreamina account/descriptor binding, graceful drain, and restart no-resubmit
-proof are documented in
-[`docs/architecture/2026-phase2ab-inactive-provider-submit-service.md`](docs/architecture/2026-phase2ab-inactive-provider-submit-service.md).
-The isolated mixed fresh/recovery benchmark, measured lock-contention fix, and
-remaining capacity hot-row gate are documented in
-[`docs/architecture/2026-phase2ac-provider-submit-scheduler-benchmark.md`](docs/architecture/2026-phase2ac-provider-submit-scheduler-benchmark.md).
-The inactive provider runtime lease fencing and configured/active/draining/blocked
-projection are documented in
-[`docs/architecture/2026-phase2ad-provider-runtime-readiness.md`](docs/architecture/2026-phase2ad-provider-runtime-readiness.md).
-The lease-supervised submit/poll daemon lifecycle and heartbeat-loss shutdown
-proof are documented in
-[`docs/architecture/2026-phase2ae-provider-runtime-supervisor.md`](docs/architecture/2026-phase2ae-provider-runtime-supervisor.md).
-The dependency-free liveness route, bounded database readiness route, and
-constant-cardinality provider status projection are documented in
-[`docs/architecture/2026-phase2af-bounded-gateway-readiness.md`](docs/architecture/2026-phase2af-bounded-gateway-readiness.md).
-The Read Committed capacity-counter race, heartbeat fast path, and repeated
-4096-row mixed submit evidence are documented in
-[`docs/architecture/2026-phase2ag-capacity-counter-snapshot.md`](docs/architecture/2026-phase2ag-capacity-counter-snapshot.md).
-The static submit orchestration and scheduling persistence ports are documented
-in
-[`docs/architecture/2026-phase2ah-capability-shaped-submit-store.md`](docs/architecture/2026-phase2ah-capability-shaped-submit-store.md).
-The runtime-profile PostgreSQL adapter ownership move is documented in
-[`docs/architecture/2026-phase2ai-runtime-profile-postgres-ownership.md`](docs/architecture/2026-phase2ai-runtime-profile-postgres-ownership.md).
+The detailed target design is in
+[the 2026 architecture document](docs/architecture/2026-ai-image-factory-target-architecture.md).
+Operational bootstrap and release gates live in
+[the control-plane bootstrap guide](docs/operations/admin-control-plane-bootstrap.md)
+and [the production release runbook](docs/operations/production-release.md).
 
-The verified xAI API to Grok CLI media capability matrix and activation gates are in
-[`docs/architecture/2026-grok-cli-xai-media-binding.md`](docs/architecture/2026-grok-cli-xai-media-binding.md).
-Database-bound provider profiles and durable capacity are documented in
-[`docs/architecture/2026-phase1g-execution-binding-capacity.md`](docs/architecture/2026-phase1g-execution-binding-capacity.md).
-Admin identity, session rotation, browser controls, and release gates are documented in
-[`docs/architecture/2026-admin-identity-authentication.md`](docs/architecture/2026-admin-identity-authentication.md).
-Platform-owner operational projections, financial fact semantics, read-pool isolation, and
-tenant-admin release gates are documented in
-[`docs/architecture/2026-admin-read-models.md`](docs/architecture/2026-admin-read-models.md).
+## API Compatibility Boundary
 
-## Common Commands
+AI Image Factory is not a transparent proxy. It implements deliberate subsets
+of upstream contracts and maps them to the capabilities of a configured
+provider account.
+
+| Surface | Current boundary |
+| --- | --- |
+| OpenAI Images | Generation and edit-shaped requests; accepted fields depend on the selected model binding |
+| xAI video | Asynchronous create, status, and artifact delivery; disabled until profile and pricing gates pass |
+| Dreamina / Seedance | Native adapter and Ark-compatible task boundaries; account capability and route configuration required |
+| Admin API | Identity-authorized project and platform operations through the Next.js BFF |
+
+Unsupported upstream fields may be retained in public DTOs for compatibility,
+but they must not be advertised as effective until the selected adapter proves
+the behavior.
+
+## Console
+
+The same control plane serves operators and creators. User-facing reads are
+scoped to the active organization and project; platform administrators can
+inspect cross-tenant operational views through explicit admin scopes.
+The console defaults to English and persists the selected interface language
+in a browser cookie so server-rendered and hydrated content agree from the
+first frame. Language selection never changes API payloads, model identifiers,
+or audit facts.
+
+![AI Image Factory media workspace](docs/assets/screenshots/media-workspace.png)
+
+Screenshots contain sanitized demo data. Do not commit real provider accounts,
+emails, credentials, prompts, quota values, or internal filesystem paths.
+
+## Quick Start
+
+### Prerequisites
+
+- Rust 1.96 (pinned by `rust-toolchain.toml`)
+- Node.js 22 or newer and npm
+- PostgreSQL 16 or newer for the full control plane
+- Provider CLIs only when exercising their real adapters
+
+### Validate the Repository
 
 ```bash
-cargo test --workspace
+npm ci
+npm run typecheck:admin
+npm run build:admin
+cargo test --workspace --locked
+```
+
+### Run the Control Plane
+
+The identity-enabled stack needs PostgreSQL, signing keys, a refresh-token
+pepper, secure origins, and an initial administrator. Follow the
+[reproducible bootstrap guide](docs/operations/admin-control-plane-bootstrap.md)
+rather than inventing development defaults.
+
+After the gateway is available:
+
+```bash
+export GATEWAY_BASE_URL='http://127.0.0.1:8787'
+npm run dev:admin
+```
+
+Useful service commands:
+
+```bash
 cargo run -p gpt-image-2-gateway
 cargo run -p gpt-image-2-gateway --bin workerd
 cargo run -p gpt-image-2-gateway --bin executord
 cargo run -p gpt-image-2-gateway --bin reducerd
 cargo run -p gpt-image-2-gateway --bin reconcilerd
-cargo run -p gpt-image-2-gateway --bin provider-pollerd
 cargo run -p gpt-image-2-gateway --bin provider-submitd
-PROVIDER_SUBMIT_BENCH_ACK=isolated-test-database-v1 \
-  TEST_DATABASE_URL=postgresql://... \
-  cargo run --release -p provider-submit-bench
-npm install
-npm run typecheck:admin
-npm run dev:admin
-npm run smoke:codex
+cargo run -p gpt-image-2-gateway --bin provider-pollerd
 ```
 
-The xAI-shaped Grok video surface is implemented but default-off. Production
-configuration must provision the exact Grok video execution profile and a
-positive `video_second` price before setting:
+`GET /healthz` is dependency-free liveness. `GET /readyz` performs bounded
+database and provider-readiness checks.
 
-```bash
-GATEWAY_ENABLE_XAI_VIDEO_API=true
-GATEWAY_VIDEO_SECOND_LIMIT_5H=360
-GATEWAY_VIDEO_SECOND_LIMIT_7D=1440
-```
+## Production Posture
 
-The gated routes are `POST /v1/videos/generations`,
-`GET /v1/videos/{request_id}`, and `GET /v1/files/{file_id}/content`. Missing or
-zero-success video pricing fails admission; migration `0033` never publishes a
-free wildcard video price.
+This repository provides production-oriented mechanisms, not a universal
+production guarantee. A deployment is ready only after its own release gates
+pass:
 
-The admin console proxies an explicit allowlist through `/api/gateway/*` and keeps
-access and refresh credentials in HttpOnly cookies. Set `GATEWAY_BASE_URL` and
-`ADMIN_CONSOLE_ORIGIN`; the browser never receives the Gateway admin token.
-Enable the Axum identity service with the key, issuer, audience, client, and
-pepper-file settings in the identity architecture document, apply the complete
-embedded migration set,
-then create the first owner from a TTY:
+- TLS reverse proxy and trusted-origin policy
+- non-default signing keys, peppers, provider credentials, and database roles
+- migrations, backup, restore, and rollback rehearsal
+- positive prices and explicit model/account activation
+- bounded concurrency and quota policies
+- artifact retention and public URL strategy
+- health, queue, settlement, storage, and provider alerts
+- real-provider image and video smoke tests
 
-```bash
-cargo run -p gpt-image-2-gateway --bin factoryctl -- \
-  bootstrap-admin owner@example.com "Platform Owner"
-```
+See [the production release runbook](docs/operations/production-release.md).
 
-The reproducible key-generation, database-role, bootstrap, and release-check sequence is in
-[`docs/operations/admin-control-plane-bootstrap.md`](docs/operations/admin-control-plane-bootstrap.md).
-The production process topology, migration order, canary gates, backup/restore,
-rollback, monitoring, and current Batch limits are in
-[`docs/operations/production-release.md`](docs/operations/production-release.md).
+## Roadmap
 
-Static admin authentication is disabled by default. A controlled transition
-requires both `GATEWAY_ADMIN_TOKEN` and
-`GATEWAY_LEGACY_ADMIN_AUTH_ENABLED=true`. The console exposes a static-token-free
-emergency session only on the local Next.js development server.
+### 2026 Q3: Public Baseline
 
-The operational console reads `/admin/v1/overview`, `/admin/v1/billing/summary`,
-`/admin/v1/provider-accounts`, `/admin/v1/scheduler/queues`, and `/admin/v1/jobs`
-through the BFF. These endpoints require an identity JWT with `admin:*`; the legacy token
-cannot access them. Set `GATEWAY_ADMIN_READ_DATABASE_URL` to a database-enforced read-only
-role in production. Money and unbounded quantities are returned as decimal strings.
+- Complete public documentation, screenshots, licensing, security policy, and
+  contribution workflow.
+- Keep frontend build, Rust tests, migration checks, and secret scanning in the
+  release gate.
+- Publish a capability matrix that distinguishes contract coverage from
+  real-provider evidence.
+
+### 2026 Q4: Provider Operations
+
+- Expand real-account smoke coverage for Codex, Grok, Dreamina, and Seedance.
+- Finish provider model discovery, account capability refresh, and operator
+  diagnostics.
+- Reduce the remaining Clippy baseline and formalize compatibility versioning.
+
+### 2027 H1: Storage and Isolation
+
+- Promote S3-compatible storage to a first-class artifact backend.
+- Add stronger CLI process/container isolation and tenant-level database
+  enforcement where deployment requirements justify it.
+- Expand pricing, metering, reconciliation, and budget evidence.
+
+### 2027 H2: Scale and Ecosystem
+
+- Introduce event transport or multi-region coordination only after measured
+  PostgreSQL and operational evidence requires it.
+- Stabilize the provider SDK and conformance suite.
+- Publish deployment profiles for single-node, high-availability, and
+  geographically distributed installations.
+
+## Contributing
+
+Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request. Changes
+should preserve provider-neutral boundaries, include focused verification, and
+avoid real credentials or customer data in tests and screenshots.
+
+Security issues must be reported through the process in
+[SECURITY.md](SECURITY.md), not a public issue.
+
+## License
+
+Licensed under the [Apache License 2.0](LICENSE).
+
+OpenAI, Codex, Grok, xAI, Dreamina, Seedance, ByteDance, and Volcengine are
+trademarks of their respective owners. This project is not affiliated with,
+endorsed by, or sponsored by those companies.

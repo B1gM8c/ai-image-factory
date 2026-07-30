@@ -45,6 +45,7 @@ import {
   routeModelMappingsRequest,
   type EditableRouteModelMappings,
 } from "@/components/provider-accounts/route-model-mappings-editor";
+import { useI18n } from "@/i18n/locale-provider";
 import type {
   GrokVideoOutput,
   ProviderAccountModels,
@@ -54,19 +55,20 @@ import type {
 } from "@/lib/admin/types";
 import { consoleFetch } from "@/lib/auth/client";
 
+type Translate = ReturnType<typeof useI18n>["t"];
 type SchedulingMode = "active" | "draining";
 export type AccountSettingsTab = "scheduling" | "models" | "video-storage";
 type VideoStorageProvider = "qiniu-kodo" | "aws-s3" | "s3-compatible";
 
 const QINIU_REGIONS = [
-  { id: "cn-east-1", label: "华东-浙江" },
-  { id: "cn-east-2", label: "华东-浙江 2" },
-  { id: "cn-north-1", label: "华北-河北" },
-  { id: "cn-south-1", label: "华南-广东" },
-  { id: "us-north-1", label: "北美-洛杉矶" },
-  { id: "ap-southeast-1", label: "亚太-新加坡" },
-  { id: "ap-southeast-2", label: "亚太-河内" },
-  { id: "ap-southeast-3", label: "亚太-胡志明" },
+  { id: "cn-east-1" },
+  { id: "cn-east-2" },
+  { id: "cn-north-1" },
+  { id: "cn-south-1" },
+  { id: "us-north-1" },
+  { id: "ap-southeast-1" },
+  { id: "ap-southeast-2" },
+  { id: "ap-southeast-3" },
 ] as const;
 const DEFAULT_QINIU_REGION = QINIU_REGIONS[0].id;
 
@@ -89,6 +91,7 @@ export function AccountSchedulingSheet({
   models: ProviderModelView[];
   onSaved: () => void;
 }) {
+  const { locale, t } = useI18n();
   const [tab, setTab] = useState<AccountSettingsTab>(initialTab);
   const [maxConcurrency, setMaxConcurrency] = useState(1);
   const [mode, setMode] = useState<SchedulingMode>("active");
@@ -168,7 +171,7 @@ export function AccountSchedulingSheet({
       const response = await consoleFetch(
         `/api/gateway/admin/v1/provider-accounts/${providerAccountId}/models`,
       );
-      if (!response.ok) throw new Error(await responseMessage(response));
+      if (!response.ok) throw new Error(await responseMessage(response, t));
       const settings = (await response.json()) as ProviderAccountModels;
       if (requestId !== modelRequestId.current) return;
       setModelSettings(settings);
@@ -185,7 +188,16 @@ export function AccountSchedulingSheet({
       );
     } catch (error) {
       if (requestId !== modelRequestId.current) return;
-      toast.error(error instanceof Error ? error.message : "模型权限加载失败");
+      toast.error(
+        error instanceof Error
+          ? error.message
+          : t({
+              en: "Failed to load model permissions",
+              "zh-CN": "模型权限加载失败",
+              ja: "モデル権限を読み込めませんでした",
+              ko: "모델 권한을 불러오지 못했습니다",
+            }),
+      );
     } finally {
       if (requestId === modelRequestId.current) setModelLoading(false);
     }
@@ -198,7 +210,7 @@ export function AccountSchedulingSheet({
       const response = await consoleFetch(
         `/api/gateway/admin/v1/provider-accounts/${providerAccountId}/grok-video-output`,
       );
-      if (!response.ok) throw new Error(await responseMessage(response));
+      if (!response.ok) throw new Error(await responseMessage(response, t));
       const output = (await response.json()) as GrokVideoOutput;
       if (requestId !== videoOutputRequestId.current) return;
       setVideoOutput(output);
@@ -221,7 +233,14 @@ export function AccountSchedulingSheet({
     } catch (error) {
       if (requestId !== videoOutputRequestId.current) return;
       toast.error(
-        error instanceof Error ? error.message : "视频输出配置加载失败",
+        error instanceof Error
+          ? error.message
+          : t({
+              en: "Failed to load video output settings",
+              "zh-CN": "视频输出配置加载失败",
+              ja: "動画出力設定を読み込めませんでした",
+              ko: "동영상 출력 설정을 불러오지 못했습니다",
+            }),
       );
     } finally {
       if (requestId === videoOutputRequestId.current)
@@ -290,12 +309,35 @@ export function AccountSchedulingSheet({
           }),
         },
       );
-      if (!response.ok) throw new Error(await responseMessage(response));
-      toast.success(mode === "active" ? "调度设置已保存" : "账户已开始排空");
+      if (!response.ok) throw new Error(await responseMessage(response, t));
+      toast.success(
+        mode === "active"
+          ? t({
+              en: "Scheduling settings saved",
+              "zh-CN": "调度设置已保存",
+              ja: "スケジューリング設定を保存しました",
+              ko: "스케줄링 설정이 저장되었습니다",
+            })
+          : t({
+              en: "Account is now draining",
+              "zh-CN": "账户已开始排空",
+              ja: "アカウントのドレインを開始しました",
+              ko: "계정 드레이닝이 시작되었습니다",
+            }),
+      );
       onOpenChange(false);
       onSaved();
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "账户设置保存失败");
+      toast.error(
+        error instanceof Error
+          ? error.message
+          : t({
+              en: "Failed to save account settings",
+              "zh-CN": "账户设置保存失败",
+              ja: "アカウント設定を保存できませんでした",
+              ko: "계정 설정을 저장하지 못했습니다",
+            }),
+      );
     } finally {
       setPending(false);
     }
@@ -330,14 +372,31 @@ export function AccountSchedulingSheet({
           }),
         },
       );
-      if (!response.ok) throw new Error(await responseMessage(response));
+      if (!response.ok) throw new Error(await responseMessage(response, t));
       toast.success(
-        `${operationLabel(selectedRoute.operation_id)}模型配置已保存`,
+        t(
+          {
+            en: "{operation} model settings saved",
+            "zh-CN": "{operation}模型配置已保存",
+            ja: "{operation}のモデル設定を保存しました",
+            ko: "{operation} 모델 설정이 저장되었습니다",
+          },
+          { operation: operationLabel(t, selectedRoute.operation_id) },
+        ),
       );
       onSaved();
       await loadModels(currentAccount.provider_account_id);
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "模型配置保存失败");
+      toast.error(
+        error instanceof Error
+          ? error.message
+          : t({
+              en: "Failed to save model settings",
+              "zh-CN": "模型配置保存失败",
+              ja: "モデル設定を保存できませんでした",
+              ko: "모델 설정을 저장하지 못했습니다",
+            }),
+      );
     } finally {
       setPending(false);
     }
@@ -363,7 +422,7 @@ export function AccountSchedulingSheet({
           }),
         },
       );
-      if (!response.ok) throw new Error(await responseMessage(response));
+      if (!response.ok) throw new Error(await responseMessage(response, t));
       const output = (await response.json()) as GrokVideoOutput;
       setVideoOutput(output);
       setVideoOutputEnabled(output.enabled);
@@ -383,12 +442,31 @@ export function AccountSchedulingSheet({
       setVideoAccessKeyId("");
       setVideoSecretAccessKey("");
       toast.success(
-        output.ready ? "Grok 视频输出已就绪" : "视频输出配置已保存",
+        output.ready
+          ? t({
+              en: "Grok video output is ready",
+              "zh-CN": "Grok 视频输出已就绪",
+              ja: "Grok 動画出力の準備ができました",
+              ko: "Grok 동영상 출력이 준비되었습니다",
+            })
+          : t({
+              en: "Video output settings saved",
+              "zh-CN": "视频输出配置已保存",
+              ja: "動画出力設定を保存しました",
+              ko: "동영상 출력 설정이 저장되었습니다",
+            }),
       );
       onSaved();
     } catch (error) {
       toast.error(
-        error instanceof Error ? error.message : "视频输出配置保存失败",
+        error instanceof Error
+          ? error.message
+          : t({
+              en: "Failed to save video output settings",
+              "zh-CN": "视频输出配置保存失败",
+              ja: "動画出力設定を保存できませんでした",
+              ko: "동영상 출력 설정을 저장하지 못했습니다",
+            }),
       );
     } finally {
       setPending(false);
@@ -476,10 +554,10 @@ export function AccountSchedulingSheet({
                 <SheetTitle className="truncate text-base">
                   {account.display_name ?? account.account_key}
                 </SheetTitle>
-                <SchedulingBadge state={account.scheduling_state} />
+                <SchedulingBadge t={t} state={account.scheduling_state} />
               </div>
               <SheetDescription className="mt-1 truncate">
-                {providerLabel(account.provider_id)} ·{" "}
+                {providerLabel(t, account.provider_id)} ·{" "}
                 {account.account_email ?? account.account_key}
               </SheetDescription>
             </div>
@@ -495,16 +573,31 @@ export function AccountSchedulingSheet({
             <TabsList variant="line" className="w-full">
               <TabsTrigger value="scheduling" variant="line">
                 <Gauge className="size-4" aria-hidden="true" />
-                调度设置
+                {t({
+                  en: "Scheduling",
+                  "zh-CN": "调度设置",
+                  ja: "スケジューリング",
+                  ko: "스케줄링",
+                })}
               </TabsTrigger>
               <TabsTrigger value="models" variant="line">
                 <Layers3 className="size-4" aria-hidden="true" />
-                模型配置
+                {t({
+                  en: "Models",
+                  "zh-CN": "模型配置",
+                  ja: "モデル",
+                  ko: "모델",
+                })}
               </TabsTrigger>
               {account.provider_id === "grok-cli" ? (
                 <TabsTrigger value="video-storage" variant="line">
                   <CloudUpload className="size-4" aria-hidden="true" />
-                  视频存储
+                  {t({
+                    en: "Video storage",
+                    "zh-CN": "视频存储",
+                    ja: "動画ストレージ",
+                    ko: "동영상 스토리지",
+                  })}
                 </TabsTrigger>
               ) : null}
             </TabsList>
@@ -515,33 +608,81 @@ export function AccountSchedulingSheet({
             className="min-h-0 flex-1 overflow-y-auto px-5 sm:px-6"
           >
             <section className="space-y-4 py-5">
-              <h3 className="text-sm font-medium">账户状态</h3>
+              <h3 className="text-sm font-medium">
+                {t({
+                  en: "Account status",
+                  "zh-CN": "账户状态",
+                  ja: "アカウント状態",
+                  ko: "계정 상태",
+                })}
+              </h3>
               <dl className="grid min-w-0 gap-x-8 gap-y-4 sm:grid-cols-2">
                 <AccountDetail
-                  label="账户标识"
+                  label={t({
+                    en: "Account ID",
+                    "zh-CN": "账户标识",
+                    ja: "アカウント ID",
+                    ko: "계정 ID",
+                  })}
                   value={account.account_key}
                   mono
                   wide
                 />
-                <AccountDetail label="调度状态">
-                  <SchedulingBadge state={account.scheduling_state} />
-                </AccountDetail>
-                <AccountDetail label="登录凭据">
-                  <CredentialBadge state={account.credential_lifecycle_state} />
+                <AccountDetail
+                  label={t({
+                    en: "Scheduling status",
+                    "zh-CN": "调度状态",
+                    ja: "スケジューリング状態",
+                    ko: "스케줄링 상태",
+                  })}
+                >
+                  <SchedulingBadge t={t} state={account.scheduling_state} />
                 </AccountDetail>
                 <AccountDetail
-                  label="凭据版本"
+                  label={t({
+                    en: "Authentication",
+                    "zh-CN": "登录凭据",
+                    ja: "認証情報",
+                    ko: "인증 정보",
+                  })}
+                >
+                  <CredentialBadge
+                    t={t}
+                    state={account.credential_lifecycle_state}
+                  />
+                </AccountDetail>
+                <AccountDetail
+                  label={t({
+                    en: "Credential version",
+                    "zh-CN": "凭据版本",
+                    ja: "認証情報バージョン",
+                    ko: "인증 정보 버전",
+                  })}
                   value={`v${account.operational_credential_revision}`}
                 />
                 <AccountDetail
-                  label="访问令牌到期"
+                  label={t({
+                    en: "Access token expires",
+                    "zh-CN": "访问令牌到期",
+                    ja: "アクセストークン有効期限",
+                    ko: "액세스 토큰 만료",
+                  })}
                   value={formatCredentialTime(
+                    t,
+                    locale,
                     account.credential_access_expires_at_ms,
                   )}
                 />
                 <AccountDetail
-                  label="下次检查"
+                  label={t({
+                    en: "Next check",
+                    "zh-CN": "下次检查",
+                    ja: "次回確認",
+                    ko: "다음 확인",
+                  })}
                   value={formatCredentialTime(
+                    t,
+                    locale,
                     account.credential_next_refresh_at_ms,
                   )}
                 />
@@ -551,10 +692,24 @@ export function AccountSchedulingSheet({
             <Separator />
 
             <section className="space-y-4 py-5">
-              <h3 className="text-sm font-medium">调度策略</h3>
+              <h3 className="text-sm font-medium">
+                {t({
+                  en: "Scheduling policy",
+                  "zh-CN": "调度策略",
+                  ja: "スケジューリングポリシー",
+                  ko: "스케줄링 정책",
+                })}
+              </h3>
               <div className="grid gap-4 sm:grid-cols-2">
                 <div className="space-y-2">
-                  <Label htmlFor="account-max-concurrency">最大并发</Label>
+                  <Label htmlFor="account-max-concurrency">
+                    {t({
+                      en: "Maximum concurrency",
+                      "zh-CN": "最大并发",
+                      ja: "最大同時実行数",
+                      ko: "최대 동시 실행",
+                    })}
+                  </Label>
                   <Input
                     id="account-max-concurrency"
                     type="number"
@@ -567,10 +722,24 @@ export function AccountSchedulingSheet({
                     }
                     aria-invalid={!capacityValid}
                   />
-                  <p className="text-xs text-muted-foreground">允许范围 1–64</p>
+                  <p className="text-xs text-muted-foreground">
+                    {t({
+                      en: "Allowed range: 1–64",
+                      "zh-CN": "允许范围 1–64",
+                      ja: "許容範囲: 1–64",
+                      ko: "허용 범위: 1–64",
+                    })}
+                  </p>
                 </div>
                 <div className="space-y-2">
-                  <Label>接单模式</Label>
+                  <Label>
+                    {t({
+                      en: "Job intake",
+                      "zh-CN": "接单模式",
+                      ja: "ジョブ受付",
+                      ko: "작업 수락",
+                    })}
+                  </Label>
                   <Select
                     value={mode}
                     onValueChange={(value) => setMode(value as SchedulingMode)}
@@ -579,22 +748,46 @@ export function AccountSchedulingSheet({
                       <SelectValue />
                     </SelectTrigger>
                     <SelectContent>
-                      <SelectItem value="active">接收新任务</SelectItem>
-                      <SelectItem value="draining">排空中</SelectItem>
+                      <SelectItem value="active">
+                        {schedulingLabel(t, "active")}
+                      </SelectItem>
+                      <SelectItem value="draining">
+                        {schedulingLabel(t, "draining")}
+                      </SelectItem>
                     </SelectContent>
                   </Select>
                   <p className="text-xs text-muted-foreground">
-                    排空不会中断正在执行的任务
+                    {t({
+                      en: "Draining does not interrupt jobs already running",
+                      "zh-CN": "排空不会中断正在执行的任务",
+                      ja: "ドレインしても実行中のジョブは中断されません",
+                      ko: "드레이닝은 실행 중인 작업을 중단하지 않습니다",
+                    })}
                   </p>
                 </div>
               </div>
               <div className="space-y-2">
                 <div className="flex items-center justify-between gap-4 text-sm">
-                  <span className="text-muted-foreground">实时并发</span>
+                  <span className="text-muted-foreground">
+                    {t({
+                      en: "Live concurrency",
+                      "zh-CN": "实时并发",
+                      ja: "リアルタイム同時実行数",
+                      ko: "실시간 동시 실행",
+                    })}
+                  </span>
                   <span className="tabular-nums">
                     {account.allocated_count} / {account.max_concurrency}
                     <span className="ml-2 text-muted-foreground">
-                      可用 {account.available_capacity}
+                      {t(
+                        {
+                          en: "{count} available",
+                          "zh-CN": "可用 {count}",
+                          ja: "利用可能 {count}",
+                          ko: "사용 가능 {count}",
+                        },
+                        { count: account.available_capacity },
+                      )}
                     </span>
                   </span>
                 </div>
@@ -607,13 +800,33 @@ export function AccountSchedulingSheet({
                         )
                       : 0
                   }
-                  aria-label={`当前并发 ${account.allocated_count}，最大并发 ${account.max_concurrency}`}
+                  aria-label={t(
+                    {
+                      en: "Current concurrency {current}, maximum {maximum}",
+                      "zh-CN": "当前并发 {current}，最大并发 {maximum}",
+                      ja: "現在の同時実行数 {current}、最大 {maximum}",
+                      ko: "현재 동시 실행 {current}, 최대 {maximum}",
+                    },
+                    {
+                      current: account.allocated_count,
+                      maximum: account.max_concurrency,
+                    },
+                  )}
                   className="h-1.5"
                 />
               </div>
               {maxConcurrency < allocated ? (
                 <p className="border-l-2 border-foreground/30 pl-3 text-sm text-muted-foreground">
-                  现有任务不会中断；新任务会等待占用降至 {maxConcurrency} 以下。
+                  {t(
+                    {
+                      en: "Running jobs will not be interrupted. New jobs wait until usage falls below {limit}.",
+                      "zh-CN":
+                        "现有任务不会中断；新任务会等待占用降至 {limit} 以下。",
+                      ja: "実行中のジョブは中断されません。新しいジョブは使用数が {limit} 未満になるまで待機します。",
+                      ko: "실행 중인 작업은 중단되지 않습니다. 새 작업은 사용량이 {limit} 미만이 될 때까지 대기합니다.",
+                    },
+                    { limit: maxConcurrency },
+                  )}
                 </p>
               ) : null}
             </section>
@@ -622,7 +835,14 @@ export function AccountSchedulingSheet({
 
             <section className="space-y-3 py-5">
               <div className="flex items-center gap-2">
-                <h3 className="text-sm font-medium">所属账户组</h3>
+                <h3 className="text-sm font-medium">
+                  {t({
+                    en: "Account groups",
+                    "zh-CN": "所属账户组",
+                    ja: "所属アカウントグループ",
+                    ko: "소속 계정 그룹",
+                  })}
+                </h3>
                 <Badge variant="secondary" className="font-normal">
                   {memberships.length}
                 </Badge>
@@ -630,7 +850,12 @@ export function AccountSchedulingSheet({
               {memberships.length === 0 ? (
                 <div className="flex min-h-20 items-center justify-center gap-2 text-sm text-muted-foreground">
                   <UsersRound className="size-4" aria-hidden="true" />
-                  尚未加入账户组
+                  {t({
+                    en: "Not assigned to an account group",
+                    "zh-CN": "尚未加入账户组",
+                    ja: "アカウントグループに未所属です",
+                    ko: "계정 그룹에 속해 있지 않습니다",
+                  })}
                 </div>
               ) : (
                 memberships.map(({ group, member }) => (
@@ -643,12 +868,32 @@ export function AccountSchedulingSheet({
                         {group.display_name}
                       </p>
                       <p className="mt-0.5 text-xs text-muted-foreground">
-                        版本 {group.revision}
+                        {t(
+                          {
+                            en: "Version {version}",
+                            "zh-CN": "版本 {version}",
+                            ja: "バージョン {version}",
+                            ko: "버전 {version}",
+                          },
+                          { version: group.revision },
+                        )}
                       </p>
                     </div>
                     <span className="whitespace-nowrap text-xs tabular-nums text-muted-foreground">
-                      P {member.priority} · W {member.weight} · 保留{" "}
-                      {member.minimum_remaining_percent}%
+                      {t(
+                        {
+                          en: "P {priority} · W {weight} · Reserve {reserve}%",
+                          "zh-CN":
+                            "P {priority} · W {weight} · 保留 {reserve}%",
+                          ja: "P {priority} · W {weight} · 予約 {reserve}%",
+                          ko: "P {priority} · W {weight} · 보존 {reserve}%",
+                        },
+                        {
+                          priority: member.priority,
+                          weight: member.weight,
+                          reserve: member.minimum_remaining_percent,
+                        },
+                      )}
                     </span>
                   </div>
                 ))
@@ -662,19 +907,31 @@ export function AccountSchedulingSheet({
           >
             {routes.length === 0 ? (
               <div className="flex min-h-40 items-center justify-center border text-sm text-muted-foreground">
-                此账户未启用图片或视频生成能力
+                {t({
+                  en: "Image and video generation are not enabled for this account",
+                  "zh-CN": "此账户未启用图片或视频生成能力",
+                  ja: "このアカウントでは画像または動画生成が有効になっていません",
+                  ko: "이 계정에는 이미지 또는 동영상 생성이 활성화되어 있지 않습니다",
+                })}
               </div>
             ) : (
               <>
                 <div className="grid min-w-0 gap-3 sm:grid-cols-[11rem_minmax(0,1fr)]">
                   <Select value={selectedRouteId} onValueChange={selectRoute}>
-                    <SelectTrigger aria-label="选择生成能力">
+                    <SelectTrigger
+                      aria-label={t({
+                        en: "Select generation capability",
+                        "zh-CN": "选择生成能力",
+                        ja: "生成機能を選択",
+                        ko: "생성 기능 선택",
+                      })}
+                    >
                       <SelectValue />
                     </SelectTrigger>
                     <SelectContent>
                       {routes.map((route) => (
                         <SelectItem key={route.route_id} value={route.route_id}>
-                          {operationLabel(route.operation_id)} · v
+                          {operationLabel(t, route.operation_id)} · v
                           {route.revision}
                         </SelectItem>
                       ))}
@@ -688,9 +945,19 @@ export function AccountSchedulingSheet({
                     <Input
                       value={modelSearch}
                       onChange={(event) => setModelSearch(event.target.value)}
-                      placeholder="搜索模型"
+                      placeholder={t({
+                        en: "Search models",
+                        "zh-CN": "搜索模型",
+                        ja: "モデルを検索",
+                        ko: "모델 검색",
+                      })}
                       className="pl-9"
-                      aria-label="搜索模型"
+                      aria-label={t({
+                        en: "Search models",
+                        "zh-CN": "搜索模型",
+                        ja: "モデルを検索",
+                        ko: "모델 검색",
+                      })}
                     />
                   </div>
                 </div>
@@ -699,7 +966,12 @@ export function AccountSchedulingSheet({
                   <div className="flex min-h-40 items-center justify-center border">
                     <LoaderCircle
                       className="animate-spin"
-                      aria-label="正在加载模型"
+                      aria-label={t({
+                        en: "Loading models",
+                        "zh-CN": "正在加载模型",
+                        ja: "モデルを読み込み中",
+                        ko: "모델 불러오는 중",
+                      })}
                     />
                   </div>
                 ) : selectedRoute ? (
@@ -734,7 +1006,12 @@ export function AccountSchedulingSheet({
                 <div className="flex min-h-40 items-center justify-center">
                   <LoaderCircle
                     className="animate-spin"
-                    aria-label="正在加载视频输出配置"
+                    aria-label={t({
+                      en: "Loading video output settings",
+                      "zh-CN": "正在加载视频输出配置",
+                      ja: "動画出力設定を読み込み中",
+                      ko: "동영상 출력 설정 불러오는 중",
+                    })}
                   />
                 </div>
               ) : (
@@ -743,23 +1020,51 @@ export function AccountSchedulingSheet({
                     <div className="min-w-0 space-y-1">
                       <div className="flex items-center gap-2">
                         <h3 className="text-sm font-medium">
-                          零数据保留视频输出
+                          {t({
+                            en: "Zero data retention video output",
+                            "zh-CN": "零数据保留视频输出",
+                            ja: "ゼロデータ保持の動画出力",
+                            ko: "데이터 미보존 동영상 출력",
+                          })}
                         </h3>
                         <Badge
                           variant={videoOutput.ready ? "secondary" : "outline"}
                           className="font-normal"
                         >
-                          {videoOutput.ready ? "已就绪" : "待配置"}
+                          {videoOutput.ready
+                            ? t({
+                                en: "Ready",
+                                "zh-CN": "已就绪",
+                                ja: "準備完了",
+                                ko: "준비됨",
+                              })
+                            : t({
+                                en: "Setup required",
+                                "zh-CN": "待配置",
+                                ja: "要設定",
+                                ko: "설정 필요",
+                              })}
                         </Badge>
                       </div>
                       <p className="text-sm text-muted-foreground">
-                        生成结果由 xAI 写入此账户专属的 S3 兼容存储。
+                        {t({
+                          en: "xAI writes generated results to S3-compatible storage dedicated to this account.",
+                          "zh-CN":
+                            "生成结果由 xAI 写入此账户专属的 S3 兼容存储。",
+                          ja: "生成結果は xAI により、このアカウント専用の S3 互換ストレージへ書き込まれます。",
+                          ko: "xAI가 생성 결과를 이 계정 전용 S3 호환 스토리지에 기록합니다.",
+                        })}
                       </p>
                     </div>
                     <Switch
                       checked={videoOutputEnabled}
                       onCheckedChange={setVideoOutputEnabled}
-                      aria-label="启用 Grok 视频输出存储"
+                      aria-label={t({
+                        en: "Enable Grok video output storage",
+                        "zh-CN": "启用 Grok 视频输出存储",
+                        ja: "Grok 動画出力ストレージを有効化",
+                        ko: "Grok 동영상 출력 스토리지 활성화",
+                      })}
                     />
                   </section>
 
@@ -767,14 +1072,35 @@ export function AccountSchedulingSheet({
                     <Info aria-hidden="true" />
                     <AlertTitle>
                       {videoStorageProvider === "qiniu-kodo"
-                        ? "七牛云 Kodo 上传目标"
-                        : "公网上传目标"}
+                        ? t({
+                            en: "Qiniu Kodo upload destination",
+                            "zh-CN": "七牛云 Kodo 上传目标",
+                            ja: "Qiniu Kodo アップロード先",
+                            ko: "Qiniu Kodo 업로드 대상",
+                          })
+                        : t({
+                            en: "Public upload destination",
+                            "zh-CN": "公网上传目标",
+                            ja: "公開アップロード先",
+                            ko: "공개 업로드 대상",
+                          })}
                     </AlertTitle>
                     <AlertDescription>
                       {videoStorageProvider === "qiniu-kodo"
-                        ? "使用七牛云 S3 兼容接口接收 xAI 上传；请选择 Bucket 所在区域。"
-                        : "端点必须支持 HTTPS，并允许 xAI 使用预签名地址上传。"}
-                      密钥留空会保留当前凭据。
+                        ? t({
+                            en: "Receive xAI uploads through Qiniu's S3-compatible API. Select the region that contains the bucket. Leave credentials blank to keep the current values.",
+                            "zh-CN":
+                              "使用七牛云 S3 兼容接口接收 xAI 上传；请选择 Bucket 所在区域。密钥留空会保留当前凭据。",
+                            ja: "Qiniu の S3 互換 API で xAI のアップロードを受け取ります。Bucket のリージョンを選択してください。認証情報を空欄にすると現在の値が保持されます。",
+                            ko: "Qiniu S3 호환 API로 xAI 업로드를 수신합니다. Bucket이 있는 리전을 선택하세요. 자격 증명을 비워 두면 현재 값이 유지됩니다.",
+                          })
+                        : t({
+                            en: "The endpoint must support HTTPS and allow xAI to upload with presigned URLs. Leave credentials blank to keep the current values.",
+                            "zh-CN":
+                              "端点必须支持 HTTPS，并允许 xAI 使用预签名地址上传。密钥留空会保留当前凭据。",
+                            ja: "エンドポイントは HTTPS と、署名付き URL を使った xAI のアップロードに対応している必要があります。認証情報を空欄にすると現在の値が保持されます。",
+                            ko: "엔드포인트는 HTTPS와 사전 서명 URL을 사용한 xAI 업로드를 지원해야 합니다. 자격 증명을 비워 두면 현재 값이 유지됩니다.",
+                          })}
                     </AlertDescription>
                   </Alert>
 
@@ -783,7 +1109,14 @@ export function AccountSchedulingSheet({
                     className="space-y-5 disabled:opacity-50"
                   >
                     <div className="space-y-2">
-                      <Label>存储服务</Label>
+                      <Label>
+                        {t({
+                          en: "Storage service",
+                          "zh-CN": "存储服务",
+                          ja: "ストレージサービス",
+                          ko: "스토리지 서비스",
+                        })}
+                      </Label>
                       <Select
                         value={videoStorageProvider}
                         onValueChange={(value) =>
@@ -792,16 +1125,33 @@ export function AccountSchedulingSheet({
                           )
                         }
                       >
-                        <SelectTrigger aria-label="选择视频存储服务">
+                        <SelectTrigger
+                          aria-label={t({
+                            en: "Select video storage service",
+                            "zh-CN": "选择视频存储服务",
+                            ja: "動画ストレージサービスを選択",
+                            ko: "동영상 스토리지 서비스 선택",
+                          })}
+                        >
                           <SelectValue />
                         </SelectTrigger>
                         <SelectContent>
                           <SelectItem value="qiniu-kodo">
-                            七牛云 Kodo
+                            {t({
+                              en: "Qiniu Kodo",
+                              "zh-CN": "七牛云 Kodo",
+                              ja: "Qiniu Kodo",
+                              ko: "Qiniu Kodo",
+                            })}
                           </SelectItem>
                           <SelectItem value="aws-s3">AWS S3</SelectItem>
                           <SelectItem value="s3-compatible">
-                            其他 S3 兼容存储
+                            {t({
+                              en: "Other S3-compatible storage",
+                              "zh-CN": "其他 S3 兼容存储",
+                              ja: "その他の S3 互換ストレージ",
+                              ko: "기타 S3 호환 스토리지",
+                            })}
                           </SelectItem>
                         </SelectContent>
                       </Select>
@@ -809,7 +1159,14 @@ export function AccountSchedulingSheet({
 
                     <div className="grid gap-4 sm:grid-cols-2">
                       <div className="space-y-2">
-                        <Label htmlFor="grok-video-bucket">Bucket</Label>
+                        <Label htmlFor="grok-video-bucket">
+                          {t({
+                            en: "Bucket",
+                            "zh-CN": "存储桶",
+                            ja: "バケット",
+                            ko: "버킷",
+                          })}
+                        </Label>
                         <Input
                           id="grok-video-bucket"
                           value={videoBucket}
@@ -821,24 +1178,43 @@ export function AccountSchedulingSheet({
                         />
                         {videoStorageProvider === "qiniu-kodo" ? (
                           <p className="text-xs text-muted-foreground">
-                            使用七牛控制台显示的 S3 空间名。
+                            {t({
+                              en: "Use the S3 bucket name shown in the Qiniu console.",
+                              "zh-CN": "使用七牛控制台显示的 S3 空间名。",
+                              ja: "Qiniu コンソールに表示される S3 バケット名を使用してください。",
+                              ko: "Qiniu 콘솔에 표시된 S3 버킷 이름을 사용하세요.",
+                            })}
                           </p>
                         ) : null}
                       </div>
                       <div className="space-y-2">
-                        <Label>Region</Label>
+                        <Label>
+                          {t({
+                            en: "Region",
+                            "zh-CN": "区域",
+                            ja: "リージョン",
+                            ko: "리전",
+                          })}
+                        </Label>
                         {videoStorageProvider === "qiniu-kodo" ? (
                           <Select
                             value={videoRegion}
                             onValueChange={selectQiniuRegion}
                           >
-                            <SelectTrigger aria-label="选择七牛云区域">
+                            <SelectTrigger
+                              aria-label={t({
+                                en: "Select Qiniu region",
+                                "zh-CN": "选择七牛云区域",
+                                ja: "Qiniu リージョンを選択",
+                                ko: "Qiniu 리전 선택",
+                              })}
+                            >
                               <SelectValue />
                             </SelectTrigger>
                             <SelectContent>
                               {QINIU_REGIONS.map((region) => (
                                 <SelectItem key={region.id} value={region.id}>
-                                  {region.label} · {region.id}
+                                  {qiniuRegionLabel(t, region.id)} · {region.id}
                                 </SelectItem>
                               ))}
                             </SelectContent>
@@ -853,7 +1229,12 @@ export function AccountSchedulingSheet({
                             placeholder={
                               videoStorageProvider === "aws-s3"
                                 ? "us-east-1"
-                                : "Region ID"
+                                : t({
+                                    en: "Region ID",
+                                    "zh-CN": "区域 ID",
+                                    ja: "リージョン ID",
+                                    ko: "리전 ID",
+                                  })
                             }
                             autoComplete="off"
                           />
@@ -862,7 +1243,14 @@ export function AccountSchedulingSheet({
                     </div>
 
                     <div className="space-y-2">
-                      <Label htmlFor="grok-video-endpoint">S3 兼容端点</Label>
+                      <Label htmlFor="grok-video-endpoint">
+                        {t({
+                          en: "S3-compatible endpoint",
+                          "zh-CN": "S3 兼容端点",
+                          ja: "S3 互換エンドポイント",
+                          ko: "S3 호환 엔드포인트",
+                        })}
+                      </Label>
                       <Input
                         id="grok-video-endpoint"
                         type="url"
@@ -872,8 +1260,18 @@ export function AccountSchedulingSheet({
                         }
                         placeholder={
                           videoStorageProvider === "aws-s3"
-                            ? "AWS S3 使用默认端点"
-                            : "填写 HTTPS S3 兼容端点"
+                            ? t({
+                                en: "AWS S3 uses its default endpoint",
+                                "zh-CN": "AWS S3 使用默认端点",
+                                ja: "AWS S3 はデフォルトのエンドポイントを使用します",
+                                ko: "AWS S3는 기본 엔드포인트를 사용합니다",
+                              })
+                            : t({
+                                en: "Enter an HTTPS S3-compatible endpoint",
+                                "zh-CN": "填写 HTTPS S3 兼容端点",
+                                ja: "HTTPS の S3 互換エンドポイントを入力",
+                                ko: "HTTPS S3 호환 엔드포인트 입력",
+                              })
                         }
                         readOnly={videoStorageProvider === "qiniu-kodo"}
                         autoComplete="off"
@@ -882,7 +1280,14 @@ export function AccountSchedulingSheet({
 
                     <div className="grid gap-4 sm:grid-cols-2">
                       <div className="space-y-2">
-                        <Label htmlFor="grok-video-key-prefix">对象前缀</Label>
+                        <Label htmlFor="grok-video-key-prefix">
+                          {t({
+                            en: "Object prefix",
+                            "zh-CN": "对象前缀",
+                            ja: "オブジェクトプレフィックス",
+                            ko: "객체 접두사",
+                          })}
+                        </Label>
                         <Input
                           id="grok-video-key-prefix"
                           value={videoKeyPrefix}
@@ -895,7 +1300,12 @@ export function AccountSchedulingSheet({
                       </div>
                       <div className="space-y-2">
                         <Label htmlFor="grok-video-expires">
-                          上传地址有效期
+                          {t({
+                            en: "Upload URL lifetime",
+                            "zh-CN": "上传地址有效期",
+                            ja: "アップロード URL の有効期間",
+                            ko: "업로드 URL 유효 기간",
+                          })}
                         </Label>
                         <div className="relative">
                           <Input
@@ -911,7 +1321,12 @@ export function AccountSchedulingSheet({
                             className="pr-12"
                           />
                           <span className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-sm text-muted-foreground">
-                            秒
+                            {t({
+                              en: "sec",
+                              "zh-CN": "秒",
+                              ja: "秒",
+                              ko: "초",
+                            })}
                           </span>
                         </div>
                       </div>
@@ -920,18 +1335,41 @@ export function AccountSchedulingSheet({
                     <Separator />
 
                     <div className="space-y-1">
-                      <h3 className="text-sm font-medium">写入凭据</h3>
+                      <h3 className="text-sm font-medium">
+                        {t({
+                          en: "Write credentials",
+                          "zh-CN": "写入凭据",
+                          ja: "書き込み認証情報",
+                          ko: "쓰기 자격 증명",
+                        })}
+                      </h3>
                       <p className="text-sm text-muted-foreground">
                         {videoOutput.has_read_write_credentials
-                          ? "已保存写入凭据；仅在需要轮换时重新填写。"
-                          : "尚未保存写入凭据。"}
+                          ? t({
+                              en: "Write credentials are saved. Enter new values only when rotating them.",
+                              "zh-CN":
+                                "已保存写入凭据；仅在需要轮换时重新填写。",
+                              ja: "書き込み認証情報は保存済みです。ローテーション時のみ新しい値を入力してください。",
+                              ko: "쓰기 자격 증명이 저장되어 있습니다. 교체할 때만 새 값을 입력하세요.",
+                            })
+                          : t({
+                              en: "Write credentials have not been saved.",
+                              "zh-CN": "尚未保存写入凭据。",
+                              ja: "書き込み認証情報はまだ保存されていません。",
+                              ko: "쓰기 자격 증명이 아직 저장되지 않았습니다.",
+                            })}
                       </p>
                     </div>
                     <div className="grid gap-4 sm:grid-cols-2">
                       <div className="space-y-2">
                         <Label htmlFor="grok-video-access-key">
                           {videoStorageProvider === "qiniu-kodo"
-                            ? "七牛 Access Key"
+                            ? t({
+                                en: "Qiniu Access Key",
+                                "zh-CN": "七牛 Access Key",
+                                ja: "Qiniu Access Key",
+                                ko: "Qiniu Access Key",
+                              })
                             : "Access Key ID"}
                         </Label>
                         <Input
@@ -942,8 +1380,18 @@ export function AccountSchedulingSheet({
                           }
                           placeholder={
                             videoOutput.has_read_write_credentials
-                              ? "留空以保留"
-                              : "必填"
+                              ? t({
+                                  en: "Leave blank to keep",
+                                  "zh-CN": "留空以保留",
+                                  ja: "空欄で現在の値を保持",
+                                  ko: "비워 두면 현재 값 유지",
+                                })
+                              : t({
+                                  en: "Required",
+                                  "zh-CN": "必填",
+                                  ja: "必須",
+                                  ko: "필수",
+                                })
                           }
                           autoComplete="new-password"
                         />
@@ -951,8 +1399,18 @@ export function AccountSchedulingSheet({
                       <div className="space-y-2">
                         <Label htmlFor="grok-video-secret-key">
                           {videoStorageProvider === "qiniu-kodo"
-                            ? "七牛 Secret Key"
-                            : "Secret Access Key"}
+                            ? t({
+                                en: "Qiniu Secret Key",
+                                "zh-CN": "七牛密钥",
+                                ja: "Qiniu シークレットキー",
+                                ko: "Qiniu 비밀 키",
+                              })
+                            : t({
+                                en: "Secret Access Key",
+                                "zh-CN": "秘密访问密钥",
+                                ja: "シークレットアクセスキー",
+                                ko: "비밀 액세스 키",
+                              })}
                         </Label>
                         <Input
                           id="grok-video-secret-key"
@@ -963,8 +1421,18 @@ export function AccountSchedulingSheet({
                           }
                           placeholder={
                             videoOutput.has_read_write_credentials
-                              ? "留空以保留"
-                              : "必填"
+                              ? t({
+                                  en: "Leave blank to keep",
+                                  "zh-CN": "留空以保留",
+                                  ja: "空欄で現在の値を保持",
+                                  ko: "비워 두면 현재 값 유지",
+                                })
+                              : t({
+                                  en: "Required",
+                                  "zh-CN": "必填",
+                                  ja: "必須",
+                                  ko: "필수",
+                                })
                           }
                           autoComplete="new-password"
                         />
@@ -984,7 +1452,12 @@ export function AccountSchedulingSheet({
             disabled={pending}
             className="w-full sm:w-auto"
           >
-            取消
+            {t({
+              en: "Cancel",
+              "zh-CN": "取消",
+              ja: "キャンセル",
+              ko: "취소",
+            })}
           </Button>
           <Button
             onClick={() =>
@@ -1013,10 +1486,28 @@ export function AccountSchedulingSheet({
               <Save aria-hidden="true" />
             )}
             {tab === "scheduling"
-              ? "保存调度设置"
+              ? t({
+                  en: "Save scheduling",
+                  "zh-CN": "保存调度设置",
+                  ja: "スケジューリングを保存",
+                  ko: "스케줄링 저장",
+                })
               : tab === "models"
-                ? `保存模型配置 · v${(selectedRoute?.revision ?? 0) + 1}`
-                : "保存视频存储"}
+                ? t(
+                    {
+                      en: "Save model settings · v{version}",
+                      "zh-CN": "保存模型配置 · v{version}",
+                      ja: "モデル設定を保存 · v{version}",
+                      ko: "모델 설정 저장 · v{version}",
+                    },
+                    { version: (selectedRoute?.revision ?? 0) + 1 },
+                  )
+                : t({
+                    en: "Save video storage",
+                    "zh-CN": "保存视频存储",
+                    ja: "動画ストレージを保存",
+                    ko: "동영상 스토리지 저장",
+                  })}
           </Button>
         </SheetFooter>
       </SheetContent>
@@ -1051,8 +1542,10 @@ function AccountDetail({
 }
 
 function SchedulingBadge({
+  t,
   state,
 }: {
+  t: Translate;
   state: ProviderAccountView["scheduling_state"];
 }) {
   const active = state === "active";
@@ -1064,14 +1557,16 @@ function SchedulingBadge({
         }`}
         aria-hidden="true"
       />
-      {schedulingLabel(state)}
+      {schedulingLabel(t, state)}
     </Badge>
   );
 }
 
 function CredentialBadge({
+  t,
   state,
 }: {
+  t: Translate;
   state: ProviderAccountView["credential_lifecycle_state"];
 }) {
   return (
@@ -1079,7 +1574,7 @@ function CredentialBadge({
       variant={state === "reauth_required" ? "destructive" : "secondary"}
       className="font-normal"
     >
-      {credentialStateLabel(state)}
+      {credentialStateLabel(t, state)}
     </Badge>
   );
 }
@@ -1089,18 +1584,58 @@ function modelKey(model: { model_id: string; media_kind: string }) {
 }
 
 function credentialStateLabel(
+  t: Translate,
   state: ProviderAccountView["credential_lifecycle_state"],
 ) {
-  if (state === "active") return "正常";
-  if (state === "refresh_due") return "等待续期";
-  if (state === "refreshing") return "正在续期";
-  if (state === "reauth_required") return "需要重新登录";
-  return "等待运行环境";
+  if (state === "active")
+    return t({
+      en: "Active",
+      "zh-CN": "正常",
+      ja: "有効",
+      ko: "정상",
+    });
+  if (state === "refresh_due")
+    return t({
+      en: "Refresh due",
+      "zh-CN": "等待续期",
+      ja: "更新待ち",
+      ko: "갱신 대기",
+    });
+  if (state === "refreshing")
+    return t({
+      en: "Refreshing",
+      "zh-CN": "正在续期",
+      ja: "更新中",
+      ko: "갱신 중",
+    });
+  if (state === "reauth_required")
+    return t({
+      en: "Sign-in required",
+      "zh-CN": "需要重新登录",
+      ja: "再ログインが必要",
+      ko: "다시 로그인 필요",
+    });
+  return t({
+    en: "Waiting for runtime",
+    "zh-CN": "等待运行环境",
+    ja: "実行環境を待機中",
+    ko: "런타임 대기 중",
+  });
 }
 
-function formatCredentialTime(value: number | null) {
-  if (value === null) return "CLI 未提供";
-  return new Intl.DateTimeFormat("zh-CN", {
+function formatCredentialTime(
+  t: Translate,
+  locale: string,
+  value: number | null,
+) {
+  if (value === null)
+    return t({
+      en: "Not provided by CLI",
+      "zh-CN": "CLI 未提供",
+      ja: "CLI から提供されていません",
+      ko: "CLI에서 제공하지 않음",
+    });
+  return new Intl.DateTimeFormat(locale, {
     month: "2-digit",
     day: "2-digit",
     hour: "2-digit",
@@ -1109,23 +1644,115 @@ function formatCredentialTime(value: number | null) {
   }).format(new Date(value));
 }
 
-function schedulingLabel(state: string) {
-  if (state === "active") return "接收新任务";
-  if (state === "draining") return "排空中";
-  return "已停用";
+function schedulingLabel(t: Translate, state: string) {
+  if (state === "active")
+    return t({
+      en: "Accepting new jobs",
+      "zh-CN": "接收新任务",
+      ja: "新しいジョブを受付中",
+      ko: "새 작업 수락 중",
+    });
+  if (state === "draining")
+    return t({
+      en: "Draining",
+      "zh-CN": "排空中",
+      ja: "ドレイン中",
+      ko: "드레이닝 중",
+    });
+  return t({
+    en: "Disabled",
+    "zh-CN": "已停用",
+    ja: "無効",
+    ko: "비활성화됨",
+  });
 }
 
-function providerLabel(providerId: string) {
+function providerLabel(t: Translate, providerId: string) {
   if (providerId === "openai-codex") return "Codex";
   if (providerId === "grok-cli") return "Grok";
-  if (providerId === "dreamina-cli") return "即梦";
+  if (providerId === "dreamina-cli")
+    return t({
+      en: "Dreamina",
+      "zh-CN": "即梦",
+      ja: "Dreamina",
+      ko: "Dreamina",
+    });
   return providerId;
 }
 
-function operationLabel(operationId: string) {
-  if (operationId === "images.generations") return "图片生成";
-  if (operationId === "videos.generations") return "视频生成";
+function operationLabel(t: Translate, operationId: string) {
+  if (operationId === "images.generations")
+    return t({
+      en: "Image generation",
+      "zh-CN": "图片生成",
+      ja: "画像生成",
+      ko: "이미지 생성",
+    });
+  if (operationId === "videos.generations")
+    return t({
+      en: "Video generation",
+      "zh-CN": "视频生成",
+      ja: "動画生成",
+      ko: "동영상 생성",
+    });
   return operationId;
+}
+
+function qiniuRegionLabel(
+  t: Translate,
+  region: (typeof QINIU_REGIONS)[number]["id"],
+) {
+  const labels = {
+    "cn-east-1": {
+      en: "East China · Zhejiang",
+      "zh-CN": "华东-浙江",
+      ja: "中国東部・浙江",
+      ko: "중국 동부 · 저장",
+    },
+    "cn-east-2": {
+      en: "East China · Zhejiang 2",
+      "zh-CN": "华东-浙江 2",
+      ja: "中国東部・浙江 2",
+      ko: "중국 동부 · 저장 2",
+    },
+    "cn-north-1": {
+      en: "North China · Hebei",
+      "zh-CN": "华北-河北",
+      ja: "中国北部・河北",
+      ko: "중국 북부 · 허베이",
+    },
+    "cn-south-1": {
+      en: "South China · Guangdong",
+      "zh-CN": "华南-广东",
+      ja: "中国南部・広東",
+      ko: "중국 남부 · 광둥",
+    },
+    "us-north-1": {
+      en: "North America · Los Angeles",
+      "zh-CN": "北美-洛杉矶",
+      ja: "北米・ロサンゼルス",
+      ko: "북미 · 로스앤젤레스",
+    },
+    "ap-southeast-1": {
+      en: "Asia Pacific · Singapore",
+      "zh-CN": "亚太-新加坡",
+      ja: "アジア太平洋・シンガポール",
+      ko: "아시아 태평양 · 싱가포르",
+    },
+    "ap-southeast-2": {
+      en: "Asia Pacific · Hanoi",
+      "zh-CN": "亚太-河内",
+      ja: "アジア太平洋・ハノイ",
+      ko: "아시아 태평양 · 하노이",
+    },
+    "ap-southeast-3": {
+      en: "Asia Pacific · Ho Chi Minh City",
+      "zh-CN": "亚太-胡志明",
+      ja: "アジア太平洋・ホーチミン",
+      ko: "아시아 태평양 · 호찌민",
+    },
+  } as const;
+  return t(labels[region]);
 }
 
 function validBucket(value: string) {
@@ -1172,7 +1799,7 @@ function isQiniuEndpoint(endpoint: string) {
   }
 }
 
-async function responseMessage(response: Response) {
+async function responseMessage(response: Response, t: Translate) {
   try {
     const body = (await response.json()) as {
       error?: string | { message?: string };
@@ -1183,5 +1810,13 @@ async function responseMessage(response: Response) {
   } catch {
     // Preserve the stable fallback for non-JSON proxy failures.
   }
-  return `请求失败 (${response.status})`;
+  return t(
+    {
+      en: "Request failed ({status})",
+      "zh-CN": "请求失败 ({status})",
+      ja: "リクエストに失敗しました ({status})",
+      ko: "요청 실패 ({status})",
+    },
+    { status: response.status },
+  );
 }

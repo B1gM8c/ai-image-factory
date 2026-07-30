@@ -6,6 +6,7 @@ import { cva, type VariantProps } from "class-variance-authority"
 import { PanelLeft } from "lucide-react"
 
 import { useIsMobile } from "@/hooks/use-mobile"
+import { useI18n } from "@/i18n/locale-provider"
 import { cn } from "@/lib/utils"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -182,6 +183,7 @@ const Sidebar = React.forwardRef<
     ref
   ) => {
     const { isMobile, state, openMobile, setOpenMobile } = useSidebar()
+    const { t } = useI18n()
 
     if (collapsible === "none") {
       return (
@@ -213,8 +215,22 @@ const Sidebar = React.forwardRef<
             side={side}
           >
             <SheetHeader className="sr-only">
-              <SheetTitle>Sidebar</SheetTitle>
-              <SheetDescription>Displays the mobile sidebar.</SheetDescription>
+              <SheetTitle>
+                {t({
+                  en: "Sidebar",
+                  "zh-CN": "侧边栏",
+                  ja: "サイドバー",
+                  ko: "사이드바",
+                })}
+              </SheetTitle>
+              <SheetDescription>
+                {t({
+                  en: "Displays the mobile sidebar.",
+                  "zh-CN": "显示移动端侧边栏。",
+                  ja: "モバイルサイドバーを表示します。",
+                  ko: "모바일 사이드바를 표시합니다.",
+                })}
+              </SheetDescription>
             </SheetHeader>
             <div className="flex h-full w-full flex-col">{children}</div>
           </SheetContent>
@@ -274,6 +290,7 @@ const SidebarTrigger = React.forwardRef<
   React.ComponentProps<typeof Button>
 >(({ className, onClick, ...props }, ref) => {
   const { toggleSidebar } = useSidebar()
+  const { t } = useI18n()
 
   return (
     <Button
@@ -289,7 +306,14 @@ const SidebarTrigger = React.forwardRef<
       {...props}
     >
       <PanelLeft />
-      <span className="sr-only">Toggle Sidebar</span>
+      <span className="sr-only">
+        {t({
+          en: "Toggle sidebar",
+          "zh-CN": "切换侧边栏",
+          ja: "サイドバーを切り替える",
+          ko: "사이드바 전환",
+        })}
+      </span>
     </Button>
   )
 })
@@ -300,15 +324,22 @@ const SidebarRail = React.forwardRef<
   React.ComponentProps<"button">
 >(({ className, ...props }, ref) => {
   const { toggleSidebar } = useSidebar()
+  const { t } = useI18n()
+  const label = t({
+    en: "Toggle sidebar",
+    "zh-CN": "切换侧边栏",
+    ja: "サイドバーを切り替える",
+    ko: "사이드바 전환",
+  })
 
   return (
     <button
       ref={ref}
       data-sidebar="rail"
-      aria-label="Toggle Sidebar"
+      aria-label={label}
       tabIndex={-1}
       onClick={toggleSidebar}
-      title="Toggle Sidebar"
+      title={label}
       className={cn(
         "absolute inset-y-0 z-20 hidden w-4 -translate-x-1/2 transition-all ease-linear after:absolute after:inset-y-0 after:left-1/2 after:w-[2px] hover:after:bg-sidebar-border group-data-[side=left]:-right-4 group-data-[side=right]:left-0 sm:flex",
         "[[data-side=left]_&]:cursor-w-resize [[data-side=right]_&]:cursor-e-resize",

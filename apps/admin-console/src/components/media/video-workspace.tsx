@@ -56,6 +56,8 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { ProviderBrandIcon } from "@/components/media/provider-brand-icon";
+import type { Locale, LocalizedText } from "@/i18n/config";
+import { useI18n } from "@/i18n/locale-provider";
 import { consoleFetch } from "@/lib/auth/client";
 import type { RequestLogItem, RequestLogsSnapshot } from "@/lib/admin/types";
 import { cn } from "@/lib/utils";
@@ -132,14 +134,9 @@ type PendingIdempotency = {
 };
 
 const MAX_FIRST_FRAME_BYTES = 10 * 1024 * 1024;
-const HISTORY_TIME_FORMATTER = new Intl.DateTimeFormat("zh-CN", {
-  month: "2-digit",
-  day: "2-digit",
-  hour: "2-digit",
-  minute: "2-digit",
-});
 
 export function VideoWorkspace() {
+  const { locale, t } = useI18n();
   const {
     activeWorkspace,
     loading: sessionLoading,
@@ -213,7 +210,7 @@ export function VideoWorkspace() {
       { signal: controller.signal },
     )
       .then(async (response) => {
-        if (!response.ok) throw new Error(await responseMessage(response));
+        if (!response.ok) throw new Error(await responseMessage(response, t));
         return (await response.json()) as ConsoleVideoModelsResponse;
       })
       .then((payload) => {
@@ -228,7 +225,14 @@ export function VideoWorkspace() {
         if (controller.signal.aborted || sequence !== requestSequence.current)
           return;
         setError(
-          reason instanceof Error ? reason.message : "模型目录暂时不可用",
+          reason instanceof Error
+            ? reason.message
+            : t({
+              en: "The model catalog is temporarily unavailable.",
+              "zh-CN": "模型目录暂时不可用",
+              ja: "モデルカタログは一時的に利用できません。",
+              ko: "모델 카탈로그를 일시적으로 사용할 수 없습니다.",
+            }),
         );
       })
       .finally(() => {
@@ -236,7 +240,7 @@ export function VideoWorkspace() {
       });
 
     return () => controller.abort();
-  }, [projectId]);
+  }, [projectId, t]);
 
   useEffect(
     () => () => {
@@ -352,10 +356,17 @@ export function VideoWorkspace() {
       );
       if (sequence !== taskSequence.current) return;
       pendingIdempotency.current = null;
-      if (!response.ok) throw new Error(await responseMessage(response));
+      if (!response.ok) throw new Error(await responseMessage(response, t));
       const payload = (await response.json()) as unknown;
       const taskId = readTaskId(payload);
-      if (!taskId) throw new Error("任务已提交，但服务未返回任务编号");
+      if (!taskId) {
+        throw new Error(t({
+          en: "The task was submitted, but the service did not return a task ID.",
+          "zh-CN": "任务已提交，但服务未返回任务编号",
+          ja: "タスクは送信されましたが、サービスからタスク ID が返されませんでした。",
+          ko: "작업이 제출되었지만 서비스가 작업 ID를 반환하지 않았습니다.",
+        }));
+      }
       const nextTask: VideoTask = {
         taskId,
         status: "pending",
@@ -382,7 +393,16 @@ export function VideoWorkspace() {
     } catch (reason) {
       if (controller.signal.aborted || sequence !== taskSequence.current)
         return;
-      setError(reason instanceof Error ? reason.message : "视频生成失败");
+      setError(
+        reason instanceof Error
+          ? reason.message
+          : t({
+            en: "Video generation failed.",
+            "zh-CN": "视频生成失败",
+            ja: "動画生成に失敗しました。",
+            ko: "동영상 생성에 실패했습니다.",
+          }),
+      );
     } finally {
       if (sequence === taskSequence.current) {
         taskController.current = null;
@@ -406,8 +426,8 @@ export function VideoWorkspace() {
         `/api/gateway/v1/console/projects/${encodeURIComponent(submittedProjectId)}/videos/${encodeURIComponent(taskId)}`,
         { signal: controller.signal },
       );
-      if (!response.ok) throw new Error(await responseMessage(response));
-      const nextTask = parseVideoTask(await response.json(), taskId);
+      if (!response.ok) throw new Error(await responseMessage(response, t));
+      const nextTask = parseVideoTask(await response.json(), taskId, t);
       setTask(nextTask);
       syncHistoryTask(nextTask);
       if (
@@ -500,7 +520,14 @@ export function VideoWorkspace() {
         if (controller.signal.aborted || sequence !== taskSequence.current)
           return;
         setError(
-          reason instanceof Error ? reason.message : "任务状态暂时不可用",
+          reason instanceof Error
+            ? reason.message
+            : t({
+              en: "Task status is temporarily unavailable.",
+              "zh-CN": "任务状态暂时不可用",
+              ja: "タスクの状態は一時的に取得できません。",
+              ko: "작업 상태를 일시적으로 확인할 수 없습니다.",
+            }),
         );
       })
       .finally(() => {
@@ -562,15 +589,30 @@ export function VideoWorkspace() {
   async function selectFirstFrame(file: File | undefined) {
     if (!file) return;
     if (!selectedModel?.controls.first_frame.supported) {
-      setError("当前模型不支持首帧图片");
+      setError(t({
+        en: "This model does not support a first-frame image.",
+        "zh-CN": "当前模型不支持首帧图片",
+        ja: "このモデルは先頭フレーム画像に対応していません。",
+        ko: "이 모델은 첫 프레임 이미지를 지원하지 않습니다.",
+      }));
       return;
     }
     if (!["image/png", "image/jpeg", "image/webp"].includes(file.type)) {
-      setError("首帧仅支持 PNG、JPEG 或 WebP");
+      setError(t({
+        en: "The first frame must be PNG, JPEG, or WebP.",
+        "zh-CN": "首帧仅支持 PNG、JPEG 或 WebP",
+        ja: "先頭フレームは PNG、JPEG、WebP のみ使用できます。",
+        ko: "첫 프레임은 PNG, JPEG 또는 WebP 형식만 지원합니다.",
+      }));
       return;
     }
     if (file.size > MAX_FIRST_FRAME_BYTES) {
-      setError("首帧图片不能超过 10 MB");
+      setError(t({
+        en: "The first-frame image cannot exceed 10 MB.",
+        "zh-CN": "首帧图片不能超过 10 MB",
+        ja: "先頭フレーム画像は 10 MB 以下にしてください。",
+        ko: "첫 프레임 이미지는 10MB를 초과할 수 없습니다.",
+      }));
       return;
     }
     try {
@@ -580,7 +622,12 @@ export function VideoWorkspace() {
       });
       setError(null);
     } catch {
-      setError("首帧图片无法解码，请重新选择有效的 PNG、JPEG 或 WebP 图片");
+      setError(t({
+        en: "The first-frame image could not be decoded. Choose a valid PNG, JPEG, or WebP image.",
+        "zh-CN": "首帧图片无法解码，请重新选择有效的 PNG、JPEG 或 WebP 图片",
+        ja: "先頭フレーム画像をデコードできませんでした。有効な PNG、JPEG、WebP 画像を選択してください。",
+        ko: "첫 프레임 이미지를 디코딩할 수 없습니다. 유효한 PNG, JPEG 또는 WebP 이미지를 선택하세요.",
+      }));
     } finally {
       if (fileInput.current) fileInput.current.value = "";
     }
@@ -616,12 +663,24 @@ export function VideoWorkspace() {
           size="icon"
           variant="ghost"
           onClick={() => setHistoryOpen(true)}
-          aria-label="打开当前会话历史"
+          aria-label={t({
+            en: "Open session history",
+            "zh-CN": "打开当前会话历史",
+            ja: "セッション履歴を開く",
+            ko: "세션 기록 열기",
+          })}
         >
           <History aria-hidden="true" />
         </Button>
       </TooltipTrigger>
-      <TooltipContent>当前会话历史</TooltipContent>
+      <TooltipContent>
+        {t({
+          en: "Session history",
+          "zh-CN": "当前会话历史",
+          ja: "セッション履歴",
+          ko: "세션 기록",
+        })}
+      </TooltipContent>
     </Tooltip>
   );
 
@@ -633,9 +692,21 @@ export function VideoWorkspace() {
             className="mx-auto mb-4 size-8 text-muted-foreground"
             aria-hidden="true"
           />
-          <h2 className="text-lg font-semibold">选择一个项目开始创作</h2>
+          <h2 className="text-lg font-semibold">
+            {t({
+              en: "Select a project to start creating",
+              "zh-CN": "选择一个项目开始创作",
+              ja: "プロジェクトを選択して作成を開始",
+              ko: "프로젝트를 선택해 창작을 시작하세요",
+            })}
+          </h2>
           <p className="mt-2 text-sm leading-6 text-muted-foreground">
-            视频任务、调用记录和用量都归属于项目。请从左上角切换到具体项目。
+            {t({
+              en: "Video tasks, request logs, and usage belong to a project. Choose a project from the top left.",
+              "zh-CN": "视频任务、调用记录和用量都归属于项目。请从左上角切换到具体项目。",
+              ja: "動画タスク、リクエストログ、使用量はプロジェクトに紐づきます。左上からプロジェクトを選択してください。",
+              ko: "동영상 작업, 요청 기록 및 사용량은 프로젝트에 속합니다. 왼쪽 상단에서 프로젝트를 선택하세요.",
+            })}
           </p>
         </div>
       </section>
@@ -655,8 +726,22 @@ export function VideoWorkspace() {
       <Sheet open={historyOpen} onOpenChange={setHistoryOpen}>
         <SheetContent className="flex w-full min-w-0 flex-col gap-0 overflow-hidden p-0 sm:max-w-md">
           <SheetHeader className="shrink-0 border-b px-5 py-5 pr-12 text-left sm:px-6">
-            <SheetTitle>当前会话历史</SheetTitle>
-            <SheetDescription>本次页面会话中提交的视频任务</SheetDescription>
+            <SheetTitle>
+              {t({
+                en: "Session history",
+                "zh-CN": "当前会话历史",
+                ja: "セッション履歴",
+                ko: "세션 기록",
+              })}
+            </SheetTitle>
+            <SheetDescription>
+              {t({
+                en: "Video tasks submitted during this page session",
+                "zh-CN": "本次页面会话中提交的视频任务",
+                ja: "このページセッションで送信した動画タスク",
+                ko: "이 페이지 세션에서 제출한 동영상 작업",
+              })}
+            </SheetDescription>
           </SheetHeader>
           {history.length > 0 ? (
             <div className="min-h-0 flex-1 overflow-y-auto p-3">
@@ -683,13 +768,25 @@ export function VideoWorkspace() {
                   </span>
                   <span className="flex w-full min-w-0 items-center justify-between gap-3 text-xs text-muted-foreground">
                     <span className="min-w-0 truncate">
-                      {item.modelId} · {item.duration} 秒 · {item.resolution}
+                      {t(
+                        {
+                          en: "{model} · {duration}s · {resolution}",
+                          "zh-CN": "{model} · {duration} 秒 · {resolution}",
+                          ja: "{model} · {duration} 秒 · {resolution}",
+                          ko: "{model} · {duration}초 · {resolution}",
+                        },
+                        {
+                          model: item.modelId,
+                          duration: item.duration,
+                          resolution: item.resolution,
+                        },
+                      )}
                     </span>
                     <time
                       className="shrink-0"
                       dateTime={new Date(item.submittedAt).toISOString()}
                     >
-                      {formatHistoryTime(item.submittedAt)}
+                      {formatHistoryTime(item.submittedAt, locale)}
                     </time>
                   </span>
                   <span className="w-full truncate font-mono text-xs text-muted-foreground">
@@ -709,7 +806,14 @@ export function VideoWorkspace() {
                 className="mb-4 size-8 text-muted-foreground"
                 aria-hidden="true"
               />
-              <p className="text-sm font-medium">还没有会话记录</p>
+              <p className="text-sm font-medium">
+                {t({
+                  en: "No session history yet",
+                  "zh-CN": "还没有会话记录",
+                  ja: "セッション履歴はまだありません",
+                  ko: "아직 세션 기록이 없습니다",
+                })}
+              </p>
             </div>
           )}
         </SheetContent>
@@ -721,7 +825,12 @@ export function VideoWorkspace() {
             <div className="mx-auto w-full max-w-4xl overflow-hidden rounded-lg border bg-black">
               <MediaPlayer
                 className="aif-video-player relative"
-                title={submittedPrompt || "生成视频"}
+                title={submittedPrompt || t({
+                  en: "Generated video",
+                  "zh-CN": "生成视频",
+                  ja: "生成された動画",
+                  ko: "생성된 동영상",
+                })}
                 src={{
                   src: `/api/gateway${task.contentUrl}`,
                   type: "video/mp4",
@@ -738,13 +847,35 @@ export function VideoWorkspace() {
             <div className="mt-4 flex flex-col gap-3">
               <div className="flex flex-wrap items-center justify-between gap-3">
                 <div className="flex flex-wrap items-center gap-2 text-sm text-muted-foreground">
-                  <Badge variant="secondary">已完成</Badge>
-                  {task.duration ? <span>{task.duration} 秒视频</span> : null}
+                  <Badge variant="secondary">
+                    {t({ en: "Completed", "zh-CN": "已完成", ja: "完了", ko: "완료됨" })}
+                  </Badge>
+                  {task.duration ? (
+                    <span>
+                      {t(
+                        {
+                          en: "{duration}s video",
+                          "zh-CN": "{duration} 秒视频",
+                          ja: "{duration} 秒の動画",
+                          ko: "{duration}초 동영상",
+                        },
+                        { duration: task.duration },
+                      )}
+                    </span>
+                  ) : null}
                   {generationElapsedSeconds > 0 ? (
                     <>
                       <span aria-hidden="true">·</span>
                       <span>
-                        生成耗时 {formatElapsed(generationElapsedSeconds)}
+                        {t(
+                          {
+                            en: "Generated in {duration}",
+                            "zh-CN": "生成耗时 {duration}",
+                            ja: "生成時間 {duration}",
+                            ko: "생성 시간 {duration}",
+                          },
+                          { duration: formatElapsed(generationElapsedSeconds, t) },
+                        )}
                       </span>
                     </>
                   ) : null}
@@ -753,7 +884,7 @@ export function VideoWorkspace() {
                   <Button asChild variant="outline" size="sm">
                     <a href={`/api/gateway${task.contentUrl}`} download>
                       <Download aria-hidden="true" />
-                      下载
+                      {t({ en: "Download", "zh-CN": "下载", ja: "ダウンロード", ko: "다운로드" })}
                     </a>
                   </Button>
                   <ActivityButton projectId={projectId} taskId={task.taskId} />
@@ -764,11 +895,21 @@ export function VideoWorkspace() {
                     onClick={() => void submit()}
                   >
                     <RotateCcw aria-hidden="true" />
-                    再次生成
+                    {t({
+                      en: "Generate again",
+                      "zh-CN": "再次生成",
+                      ja: "もう一度生成",
+                      ko: "다시 생성",
+                    })}
                   </Button>
                   <Button size="sm" onClick={startNewVideo}>
                     <Plus aria-hidden="true" />
-                    新建视频
+                    {t({
+                      en: "New video",
+                      "zh-CN": "新建视频",
+                      ja: "新しい動画",
+                      ko: "새 동영상",
+                    })}
                   </Button>
                 </div>
               </div>
@@ -796,7 +937,19 @@ export function VideoWorkspace() {
                       )}
                       aria-hidden="true"
                     />
-                    {promptExpanded ? "收起提示词" : "展开提示词"}
+                    {promptExpanded
+                      ? t({
+                        en: "Collapse prompt",
+                        "zh-CN": "收起提示词",
+                        ja: "プロンプトを折りたたむ",
+                        ko: "프롬프트 접기",
+                      })
+                      : t({
+                        en: "Expand prompt",
+                        "zh-CN": "展开提示词",
+                        ja: "プロンプトを展開",
+                        ko: "프롬프트 펼치기",
+                      })}
                   </Button>
                 ) : null}
               </div>
@@ -816,8 +969,8 @@ export function VideoWorkspace() {
                 className="shrink-0 text-xs text-muted-foreground"
                 aria-hidden="true"
               >
-                {pendingStageLabel(task, submitting)} ·{" "}
-                {formatElapsed(generationElapsedSeconds)}
+                {pendingStageLabel(task, submitting, t)} ·{" "}
+                {formatElapsed(generationElapsedSeconds, t)}
               </p>
             </div>
             <div className="flex min-h-0 flex-1 items-center justify-center">
@@ -832,15 +985,25 @@ export function VideoWorkspace() {
                 <div className="relative z-10 flex items-center gap-2 rounded-full bg-foreground/70 px-4 py-2 text-sm font-medium text-background shadow-sm backdrop-blur-sm">
                   <span>
                     {submitting
-                      ? "正在创建任务"
+                      ? t({
+                        en: "Creating task",
+                        "zh-CN": "正在创建任务",
+                        ja: "タスクを作成中",
+                        ko: "작업 생성 중",
+                      })
                       : task?.status === "uncertain"
-                        ? "正在确认状态"
-                        : pendingStageLabel(task, false)}
+                        ? t({
+                          en: "Confirming status",
+                          "zh-CN": "正在确认状态",
+                          ja: "状態を確認中",
+                          ko: "상태 확인 중",
+                        })
+                        : pendingStageLabel(task, false, t)}
                   </span>
                   <span className="opacity-50">·</span>
                   <span>
                     {normalizeProgress(task?.progress) === null
-                      ? pendingStageDetail(task, submitting)
+                      ? pendingStageDetail(task, submitting, t)
                       : `${normalizeProgress(task?.progress)}%`}
                   </span>
                 </div>
@@ -863,13 +1026,30 @@ export function VideoWorkspace() {
                     ) : (
                       <Play aria-hidden="true" />
                     )}
-                    {polling ? "停止等待" : "继续查看"}
+                    {polling
+                      ? t({
+                        en: "Stop waiting",
+                        "zh-CN": "停止等待",
+                        ja: "待機を停止",
+                        ko: "대기 중지",
+                      })
+                      : t({
+                        en: "Keep checking",
+                        "zh-CN": "继续查看",
+                        ja: "確認を続ける",
+                        ko: "계속 확인",
+                      })}
                   </Button>
                 </div>
               </div>
             ) : null}
             <span className="sr-only" role="status">
-              视频任务已提交，正在后台生成
+              {t({
+                en: "Video task submitted and generating in the background.",
+                "zh-CN": "视频任务已提交，正在后台生成",
+                ja: "動画タスクを送信し、バックグラウンドで生成中です。",
+                ko: "동영상 작업을 제출했으며 백그라운드에서 생성 중입니다.",
+              })}
             </span>
           </div>
         ) : task?.status === "uncertain" ? (
@@ -878,13 +1058,33 @@ export function VideoWorkspace() {
               className="mx-auto mb-5 size-8 text-muted-foreground"
               aria-hidden="true"
             />
-            <h2 className="text-xl font-semibold">生成结果待确认</h2>
+            <h2 className="text-xl font-semibold">
+              {t({
+                en: "Result awaiting confirmation",
+                "zh-CN": "生成结果待确认",
+                ja: "結果の確認待ち",
+                ko: "결과 확인 대기 중",
+              })}
+            </h2>
             <p className="mt-3 text-sm leading-6 text-muted-foreground">
-              上游执行已经结束，但系统未能安全确认生成结果。请查看调用记录后再决定是否重新生成。
+              {t({
+                en: "The provider finished, but the system could not safely confirm the result. Review the request log before generating again.",
+                "zh-CN": "上游执行已经结束，但系统未能安全确认生成结果。请查看调用记录后再决定是否重新生成。",
+                ja: "プロバイダーでの実行は完了しましたが、システムは結果を安全に確認できませんでした。再生成する前にリクエストログを確認してください。",
+                ko: "공급자 실행은 끝났지만 시스템이 결과를 안전하게 확인하지 못했습니다. 다시 생성하기 전에 요청 기록을 확인하세요.",
+              })}
             </p>
             {generationElapsedSeconds > 0 ? (
               <p className="mt-2 text-xs text-muted-foreground">
-                已停止等待 · {formatElapsed(generationElapsedSeconds)}
+                {t(
+                  {
+                    en: "Stopped waiting · {duration}",
+                    "zh-CN": "已停止等待 · {duration}",
+                    ja: "待機停止 · {duration}",
+                    ko: "대기 중지 · {duration}",
+                  },
+                  { duration: formatElapsed(generationElapsedSeconds, t) },
+                )}
               </p>
             ) : null}
             <div className="mt-5 flex flex-wrap items-center justify-center gap-2">
@@ -896,7 +1096,12 @@ export function VideoWorkspace() {
                 disabled={polling}
               >
                 <RotateCcw aria-hidden="true" />
-                重新检查
+                {t({
+                  en: "Check again",
+                  "zh-CN": "重新检查",
+                  ja: "再確認",
+                  ko: "다시 확인",
+                })}
               </Button>
             </div>
           </div>
@@ -906,9 +1111,21 @@ export function VideoWorkspace() {
               className="mx-auto mb-5 size-8 text-muted-foreground"
               aria-hidden="true"
             />
-            <h2 className="text-xl font-semibold">视频生成失败</h2>
+            <h2 className="text-xl font-semibold">
+              {t({
+                en: "Video generation failed",
+                "zh-CN": "视频生成失败",
+                ja: "動画生成に失敗しました",
+                ko: "동영상 생성 실패",
+              })}
+            </h2>
             <p className="mt-3 text-sm leading-6 text-muted-foreground">
-              {error ?? task.error?.message ?? "请调整提示词或稍后重试"}
+              {error ?? task.error?.message ?? t({
+                en: "Adjust the prompt or try again later.",
+                "zh-CN": "请调整提示词或稍后重试",
+                ja: "プロンプトを調整するか、後でもう一度お試しください。",
+                ko: "프롬프트를 조정하거나 나중에 다시 시도하세요.",
+              })}
             </p>
             <div className="mt-5 flex flex-wrap items-center justify-center gap-2">
               <ActivityButton projectId={projectId} taskId={task.taskId} />
@@ -918,7 +1135,12 @@ export function VideoWorkspace() {
                 onClick={() => void submit()}
               >
                 <RotateCcw aria-hidden="true" />
-                重新生成
+                {t({
+                  en: "Generate again",
+                  "zh-CN": "重新生成",
+                  ja: "再生成",
+                  ko: "다시 생성",
+                })}
               </Button>
             </div>
           </div>
@@ -928,9 +1150,21 @@ export function VideoWorkspace() {
               className="mx-auto mb-5 size-8 text-muted-foreground"
               aria-hidden="true"
             />
-            <h2 className="text-2xl font-semibold md:text-3xl">让画面动起来</h2>
+            <h2 className="text-2xl font-semibold md:text-3xl">
+              {t({
+                en: "Bring your scene to life",
+                "zh-CN": "让画面动起来",
+                ja: "シーンに動きを加えよう",
+                ko: "장면에 생동감을 더하세요",
+              })}
+            </h2>
             <p className="mt-3 text-sm leading-6 text-muted-foreground">
-              描述场景、动作和镜头，任务会在后台持续生成。
+              {t({
+                en: "Describe the scene, motion, and camera. Generation continues in the background.",
+                "zh-CN": "描述场景、动作和镜头，任务会在后台持续生成。",
+                ja: "シーン、動き、カメラワークを説明してください。生成はバックグラウンドで続行されます。",
+                ko: "장면, 동작과 카메라를 설명하세요. 생성은 백그라운드에서 계속됩니다.",
+              })}
             </p>
           </div>
         )}
@@ -939,7 +1173,12 @@ export function VideoWorkspace() {
       {generationActive ? (
         <div className="border-t bg-background/95 px-4 py-3 backdrop-blur">
           <p className="mx-auto max-w-3xl text-center text-sm text-muted-foreground">
-            当前任务已提交，完成后可继续创作
+            {t({
+              en: "The current task has been submitted. You can create again when it finishes.",
+              "zh-CN": "当前任务已提交，完成后可继续创作",
+              ja: "現在のタスクを送信しました。完了後に次の作成を開始できます。",
+              ko: "현재 작업이 제출되었습니다. 완료 후 다시 생성할 수 있습니다.",
+            })}
           </p>
         </div>
       ) : task?.status === "done" ? null : (
@@ -966,12 +1205,24 @@ export function VideoWorkspace() {
                       variant="ghost"
                       className="size-8"
                       onClick={() => setFirstFrame(null)}
-                      aria-label="移除首帧"
+                      aria-label={t({
+                        en: "Remove first frame",
+                        "zh-CN": "移除首帧",
+                        ja: "先頭フレームを削除",
+                        ko: "첫 프레임 제거",
+                      })}
                     >
                       <X aria-hidden="true" />
                     </Button>
                   </TooltipTrigger>
-                  <TooltipContent>移除首帧</TooltipContent>
+                  <TooltipContent>
+                    {t({
+                      en: "Remove first frame",
+                      "zh-CN": "移除首帧",
+                      ja: "先頭フレームを削除",
+                      ko: "첫 프레임 제거",
+                    })}
+                  </TooltipContent>
                 </Tooltip>
               </div>
             ) : null}
@@ -980,8 +1231,18 @@ export function VideoWorkspace() {
               onChange={(event) => setPrompt(event.target.value)}
               onKeyDown={handlePromptKeyDown}
               onPaste={handlePromptPaste}
-              placeholder="描述你想生成的视频"
-              aria-label="视频提示词"
+              placeholder={t({
+                en: "Describe the video you want to create",
+                "zh-CN": "描述你想生成的视频",
+                ja: "生成したい動画を説明してください",
+                ko: "생성할 동영상을 설명하세요",
+              })}
+              aria-label={t({
+                en: "Video prompt",
+                "zh-CN": "视频提示词",
+                ja: "動画プロンプト",
+                ko: "동영상 프롬프트",
+              })}
               maxLength={6_000}
               className="min-h-20 max-h-36 overflow-y-auto border-0 px-2 py-2 text-base shadow-none focus-visible:ring-0"
             />
@@ -992,9 +1253,14 @@ export function VideoWorkspace() {
             ) : null}
             {firstFrame &&
             selectedModel &&
-            !selectedModel.controls.first_frame.supported ? (
+              !selectedModel.controls.first_frame.supported ? (
               <p role="alert" className="px-2 pb-2 text-sm text-destructive">
-                当前模型不支持首帧，请移除首帧或切换模型
+                {t({
+                  en: "This model does not support a first frame. Remove it or switch models.",
+                  "zh-CN": "当前模型不支持首帧，请移除首帧或切换模型",
+                  ja: "このモデルは先頭フレームに対応していません。削除するかモデルを切り替えてください。",
+                  ko: "이 모델은 첫 프레임을 지원하지 않습니다. 이미지를 제거하거나 모델을 전환하세요.",
+                })}
               </p>
             ) : null}
             <div className="flex min-w-0 flex-wrap items-center gap-2">
@@ -1013,7 +1279,12 @@ export function VideoWorkspace() {
                         className="size-3.5 animate-spin"
                         aria-hidden="true"
                       />
-                      载入模型
+                      {t({
+                        en: "Loading models",
+                        "zh-CN": "载入模型",
+                        ja: "モデルを読み込み中",
+                        ko: "모델 불러오는 중",
+                      })}
                     </span>
                   ) : selectedModel ? (
                     <span className="flex min-w-0 items-center gap-2 whitespace-nowrap">
@@ -1021,7 +1292,12 @@ export function VideoWorkspace() {
                       <span>{selectedModel.id}</span>
                     </span>
                   ) : (
-                    <SelectValue placeholder="选择模型" />
+                    <SelectValue placeholder={t({
+                      en: "Select a model",
+                      "zh-CN": "选择模型",
+                      ja: "モデルを選択",
+                      ko: "모델 선택",
+                    })} />
                   )}
                 </SelectTrigger>
                 <SelectContent>
@@ -1068,7 +1344,15 @@ export function VideoWorkspace() {
                   {(selectedModel?.controls.duration.options ?? []).map(
                     (seconds) => (
                       <SelectItem key={seconds} value={String(seconds)}>
-                        {seconds} 秒
+                        {t(
+                          {
+                            en: "{seconds}s",
+                            "zh-CN": "{seconds} 秒",
+                            ja: "{seconds} 秒",
+                            ko: "{seconds}초",
+                          },
+                          { seconds },
+                        )}
                       </SelectItem>
                     ),
                   )}
@@ -1112,8 +1396,18 @@ export function VideoWorkspace() {
                       aria-label={
                         selectedModel?.controls.first_frame.required &&
                         !firstFrame
-                          ? "添加必需首帧"
-                          : "添加首帧"
+                          ? t({
+                            en: "Add required first frame",
+                            "zh-CN": "添加必需首帧",
+                            ja: "必須の先頭フレームを追加",
+                            ko: "필수 첫 프레임 추가",
+                          })
+                          : t({
+                            en: "Add first frame",
+                            "zh-CN": "添加首帧",
+                            ja: "先頭フレームを追加",
+                            ko: "첫 프레임 추가",
+                          })
                       }
                     >
                       <Paperclip aria-hidden="true" />
@@ -1129,10 +1423,25 @@ export function VideoWorkspace() {
                 </TooltipTrigger>
                 <TooltipContent>
                   {!selectedModel?.controls.first_frame.supported
-                    ? "当前模型的 CLI 尚未支持首帧"
+                    ? t({
+                      en: "The CLI for this model does not support first frames yet",
+                      "zh-CN": "当前模型的 CLI 尚未支持首帧",
+                      ja: "このモデルの CLI はまだ先頭フレームに対応していません",
+                      ko: "이 모델의 CLI는 아직 첫 프레임을 지원하지 않습니다",
+                    })
                     : selectedModel.controls.first_frame.required
-                      ? "添加首帧（必需，也可直接粘贴）"
-                      : "添加首帧（也可直接粘贴）"}
+                      ? t({
+                        en: "Add a first frame (required; you can also paste it)",
+                        "zh-CN": "添加首帧（必需，也可直接粘贴）",
+                        ja: "先頭フレームを追加（必須、貼り付けも可能）",
+                        ko: "첫 프레임 추가(필수, 붙여넣기도 가능)",
+                      })
+                      : t({
+                        en: "Add a first frame (you can also paste it)",
+                        "zh-CN": "添加首帧（也可直接粘贴）",
+                        ja: "先頭フレームを追加（貼り付けも可能）",
+                        ko: "첫 프레임 추가(붙여넣기도 가능)",
+                      })}
                 </TooltipContent>
               </Tooltip>
 
@@ -1146,7 +1455,12 @@ export function VideoWorkspace() {
                     )}
                     disabled={!canSubmit}
                     onClick={() => void submit()}
-                    aria-label="生成视频"
+                    aria-label={t({
+                      en: "Generate video",
+                      "zh-CN": "生成视频",
+                      ja: "動画を生成",
+                      ko: "동영상 생성",
+                    })}
                   >
                     {submitting ? (
                       <LoaderCircle
@@ -1158,7 +1472,14 @@ export function VideoWorkspace() {
                     )}
                   </Button>
                 </TooltipTrigger>
-                <TooltipContent>生成视频</TooltipContent>
+                <TooltipContent>
+                  {t({
+                    en: "Generate video",
+                    "zh-CN": "生成视频",
+                    ja: "動画を生成",
+                    ko: "동영상 생성",
+                  })}
+                </TooltipContent>
               </Tooltip>
             </div>
           </div>
@@ -1169,6 +1490,7 @@ export function VideoWorkspace() {
 }
 
 function VideoPlayerControls() {
+  const { t } = useI18n();
   const paused = useMediaState("paused");
   const muted = useMediaState("muted");
 
@@ -1177,7 +1499,12 @@ function VideoPlayerControls() {
       <Controls.Group>
         <TimeSlider.Root
           className="group relative flex h-5 w-full cursor-pointer touch-none select-none items-center outline-none"
-          aria-label="视频播放进度"
+          aria-label={t({
+            en: "Video playback progress",
+            "zh-CN": "视频播放进度",
+            ja: "動画の再生位置",
+            ko: "동영상 재생 진행률",
+          })}
         >
           <TimeSlider.Track className="relative h-1 w-full rounded-full bg-white/35 group-data-[focus]:ring-2 group-data-[focus]:ring-white/70">
             <TimeSlider.Progress className="absolute h-full w-[var(--slider-progress)] rounded-full bg-white/30" />
@@ -1189,7 +1516,9 @@ function VideoPlayerControls() {
       <Controls.Group className="flex h-9 items-center gap-1.5">
         <PlayButton
           className="inline-flex size-8 items-center justify-center rounded-md hover:bg-white/15 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/70"
-          aria-label={paused ? "播放" : "暂停"}
+          aria-label={paused
+            ? t({ en: "Play", "zh-CN": "播放", ja: "再生", ko: "재생" })
+            : t({ en: "Pause", "zh-CN": "暂停", ja: "一時停止", ko: "일시 정지" })}
         >
           {paused ? (
             <Play className="size-4 fill-current" aria-hidden="true" />
@@ -1199,7 +1528,9 @@ function VideoPlayerControls() {
         </PlayButton>
         <MuteButton
           className="inline-flex size-8 items-center justify-center rounded-md hover:bg-white/15 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/70"
-          aria-label={muted ? "取消静音" : "静音"}
+          aria-label={muted
+            ? t({ en: "Unmute", "zh-CN": "取消静音", ja: "ミュート解除", ko: "음소거 해제" })
+            : t({ en: "Mute", "zh-CN": "静音", ja: "ミュート", ko: "음소거" })}
         >
           {muted ? (
             <VolumeX className="size-4" aria-hidden="true" />
@@ -1214,7 +1545,12 @@ function VideoPlayerControls() {
         </div>
         <FullscreenButton
           className="ml-auto inline-flex size-8 items-center justify-center rounded-md hover:bg-white/15 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/70"
-          aria-label="全屏"
+          aria-label={t({
+            en: "Fullscreen",
+            "zh-CN": "全屏",
+            ja: "全画面",
+            ko: "전체 화면",
+          })}
         >
           <Maximize className="size-4" aria-hidden="true" />
         </FullscreenButton>
@@ -1232,21 +1568,30 @@ function VideoStatusBadge({
   stage?: VideoTask["stage"];
   progress?: number;
 }) {
+  const { t } = useI18n();
   const normalizedProgress = normalizeProgress(progress);
   const label =
     status === "done"
-      ? "已完成"
+      ? t({ en: "Completed", "zh-CN": "已完成", ja: "完了", ko: "완료됨" })
       : status === "failed"
-        ? "失败"
+        ? t({ en: "Failed", "zh-CN": "失败", ja: "失敗", ko: "실패" })
         : status === "uncertain"
-          ? "待确认"
+          ? t({ en: "Needs confirmation", "zh-CN": "待确认", ja: "確認待ち", ko: "확인 필요" })
           : stage === "queued"
-            ? "排队中"
+            ? t({ en: "Queued", "zh-CN": "排队中", ja: "キュー待ち", ko: "대기열" })
             : stage === "dispatching"
-              ? "启动中"
+              ? t({ en: "Starting", "zh-CN": "启动中", ja: "開始中", ko: "시작 중" })
               : normalizedProgress === null
-                ? "生成中"
-                : `生成中 ${normalizedProgress}%`;
+                ? t({ en: "Generating", "zh-CN": "生成中", ja: "生成中", ko: "생성 중" })
+                : t(
+                  {
+                    en: "Generating {progress}%",
+                    "zh-CN": "生成中 {progress}%",
+                    ja: "生成中 {progress}%",
+                    ko: "생성 중 {progress}%",
+                  },
+                  { progress: normalizedProgress },
+                );
   return (
     <Badge
       variant={
@@ -1262,15 +1607,38 @@ function VideoStatusBadge({
   );
 }
 
-function formatHistoryTime(timestamp: number) {
-  return HISTORY_TIME_FORMATTER.format(timestamp);
+function formatHistoryTime(timestamp: number, locale: Locale) {
+  return new Intl.DateTimeFormat(locale, {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(timestamp);
 }
 
-function formatElapsed(seconds: number) {
-  if (seconds < 60) return `${seconds} 秒`;
+function formatElapsed(seconds: number, t: Translate) {
+  if (seconds < 60) {
+    return t(
+      {
+        en: "{seconds}s",
+        "zh-CN": "{seconds} 秒",
+        ja: "{seconds} 秒",
+        ko: "{seconds}초",
+      },
+      { seconds },
+    );
+  }
   const minutes = Math.floor(seconds / 60);
   const remainder = seconds % 60;
-  return `${minutes} 分 ${remainder} 秒`;
+  return t(
+    {
+      en: "{minutes}m {seconds}s",
+      "zh-CN": "{minutes} 分 {seconds} 秒",
+      ja: "{minutes} 分 {seconds} 秒",
+      ko: "{minutes}분 {seconds}초",
+    },
+    { minutes, seconds: remainder },
+  );
 }
 
 function cssAspectRatio(value: string) {
@@ -1305,12 +1673,22 @@ function readTaskId(payload: unknown) {
   return payload.task_id;
 }
 
-function parseVideoTask(payload: unknown, taskId: string): VideoTask {
-  if (!isRecord(payload)) throw new Error("任务状态响应无效");
+function parseVideoTask(
+  payload: unknown,
+  taskId: string,
+  t: Translate,
+): VideoTask {
+  const invalidResponse = t({
+    en: "The task status response is invalid.",
+    "zh-CN": "任务状态响应无效",
+    ja: "タスク状態のレスポンスが無効です。",
+    ko: "작업 상태 응답이 유효하지 않습니다.",
+  });
+  if (!isRecord(payload)) throw new Error(invalidResponse);
   if (
     !["pending", "uncertain", "done", "failed"].includes(String(payload.status))
   ) {
-    throw new Error("任务状态响应无效");
+    throw new Error(invalidResponse);
   }
   const status = payload.status as VideoTask["status"];
   return {
@@ -1338,54 +1716,113 @@ function parseVideoTask(payload: unknown, taskId: string): VideoTask {
             message: friendlyVideoTaskError(
               payload.error.code,
               payload.error.message,
+              t,
             ),
           }
         : undefined,
   };
 }
 
-function pendingStageLabel(task: VideoTask | null, submitting: boolean) {
-  if (submitting) return "提交中";
-  if (task?.status === "uncertain") return "确认中";
-  if (task?.stage === "queued") return "排队中";
-  if (task?.stage === "dispatching") return "正在启动";
-  return "生成中";
+function pendingStageLabel(
+  task: VideoTask | null,
+  submitting: boolean,
+  t: Translate,
+) {
+  if (submitting) return t({ en: "Submitting", "zh-CN": "提交中", ja: "送信中", ko: "제출 중" });
+  if (task?.status === "uncertain") {
+    return t({ en: "Confirming", "zh-CN": "确认中", ja: "確認中", ko: "확인 중" });
+  }
+  if (task?.stage === "queued") {
+    return t({ en: "Queued", "zh-CN": "排队中", ja: "キュー待ち", ko: "대기열" });
+  }
+  if (task?.stage === "dispatching") {
+    return t({ en: "Starting", "zh-CN": "正在启动", ja: "開始中", ko: "시작 중" });
+  }
+  return t({ en: "Generating", "zh-CN": "生成中", ja: "生成中", ko: "생성 중" });
 }
 
-function pendingStageDetail(task: VideoTask | null, submitting: boolean) {
-  if (submitting) return "正在创建任务";
-  if (task?.status === "uncertain") return "等待上游确认";
-  if (task?.stage === "queued") return "等待可用执行器";
-  if (task?.stage === "dispatching") return "正在提交到服务";
-  return "后台处理中";
+function pendingStageDetail(
+  task: VideoTask | null,
+  submitting: boolean,
+  t: Translate,
+) {
+  if (submitting) {
+    return t({ en: "Creating task", "zh-CN": "正在创建任务", ja: "タスクを作成中", ko: "작업 생성 중" });
+  }
+  if (task?.status === "uncertain") {
+    return t({ en: "Awaiting provider confirmation", "zh-CN": "等待上游确认", ja: "プロバイダーの確認待ち", ko: "공급자 확인 대기" });
+  }
+  if (task?.stage === "queued") {
+    return t({ en: "Waiting for an executor", "zh-CN": "等待可用执行器", ja: "利用可能なエグゼキューターを待機中", ko: "사용 가능한 실행기 대기 중" });
+  }
+  if (task?.stage === "dispatching") {
+    return t({ en: "Submitting to the service", "zh-CN": "正在提交到服务", ja: "サービスに送信中", ko: "서비스에 제출 중" });
+  }
+  return t({ en: "Processing in the background", "zh-CN": "后台处理中", ja: "バックグラウンドで処理中", ko: "백그라운드 처리 중" });
 }
 
-async function responseMessage(response: Response) {
+async function responseMessage(response: Response, t: Translate) {
   const payload = (await response.json().catch(() => null)) as unknown;
   if (isRecord(payload)) {
     if (typeof payload.error === "string") return payload.error;
     if (isRecord(payload.error) && typeof payload.error.message === "string") {
-      return friendlyVideoError(payload.error.message);
+      return friendlyVideoError(payload.error.message, t);
     }
   }
-  if (response.status === 403) return "当前账号没有在此项目中生成视频的权限";
-  if (response.status === 404) return "视频任务不存在或不属于当前项目";
-  if (response.status === 429) return "当前项目请求较多，请稍后重试";
-  return "视频生成服务暂时不可用";
+  if (response.status === 403) {
+    return t({
+      en: "Your account cannot generate videos in this project.",
+      "zh-CN": "当前账号没有在此项目中生成视频的权限",
+      ja: "このアカウントには、このプロジェクトで動画を生成する権限がありません。",
+      ko: "현재 계정에는 이 프로젝트에서 동영상을 생성할 권한이 없습니다.",
+    });
+  }
+  if (response.status === 404) {
+    return t({
+      en: "The video task does not exist or does not belong to this project.",
+      "zh-CN": "视频任务不存在或不属于当前项目",
+      ja: "動画タスクが存在しないか、このプロジェクトに属していません。",
+      ko: "동영상 작업이 없거나 현재 프로젝트에 속하지 않습니다.",
+    });
+  }
+  if (response.status === 429) {
+    return t({
+      en: "This project is receiving too many requests. Try again shortly.",
+      "zh-CN": "当前项目请求较多，请稍后重试",
+      ja: "このプロジェクトへのリクエストが集中しています。しばらくしてから再試行してください。",
+      ko: "현재 프로젝트에 요청이 많습니다. 잠시 후 다시 시도하세요.",
+    });
+  }
+  return t({
+    en: "Video generation is temporarily unavailable.",
+    "zh-CN": "视频生成服务暂时不可用",
+    ja: "動画生成サービスは一時的に利用できません。",
+    ko: "동영상 생성 서비스를 일시적으로 사용할 수 없습니다.",
+  });
 }
 
-function friendlyVideoError(message: string) {
+function friendlyVideoError(message: string, t: Translate) {
   if (message === "video pricing is unavailable") {
-    return "当前视频模型尚未发布价格，请联系平台管理员配置模型定价";
+    return t({
+      en: "Pricing has not been published for this video model. Ask a platform administrator to configure model pricing.",
+      "zh-CN": "当前视频模型尚未发布价格，请联系平台管理员配置模型定价",
+      ja: "この動画モデルの価格はまだ公開されていません。プラットフォーム管理者にモデル価格の設定を依頼してください。",
+      ko: "현재 동영상 모델의 가격이 아직 게시되지 않았습니다. 플랫폼 관리자에게 모델 가격 구성을 요청하세요.",
+    });
   }
   return message;
 }
 
-function friendlyVideoTaskError(code: string, message: string) {
+function friendlyVideoTaskError(code: string, message: string, t: Translate) {
   if (code === "grok_video_output_upload_url_required") {
-    return "当前 Grok 账号启用了零数据保留，CLI 视频生成需要先配置上传目标。请联系平台管理员完成账号的视频输出配置后重试。";
+    return t({
+      en: "This Grok account has zero data retention enabled. CLI video generation requires an upload destination. Ask a platform administrator to configure video output for the account, then try again.",
+      "zh-CN": "当前 Grok 账号启用了零数据保留，CLI 视频生成需要先配置上传目标。请联系平台管理员完成账号的视频输出配置后重试。",
+      ja: "この Grok アカウントではゼロデータ保持が有効です。CLI で動画を生成するにはアップロード先が必要です。プラットフォーム管理者に動画出力の設定を依頼してから再試行してください。",
+      ko: "현재 Grok 계정에는 데이터 미보존이 활성화되어 있습니다. CLI 동영상 생성을 위해 업로드 대상이 필요합니다. 플랫폼 관리자에게 계정의 동영상 출력 구성을 요청한 뒤 다시 시도하세요.",
+    });
   }
-  return friendlyVideoError(message);
+  return friendlyVideoError(message, t);
 }
 
 function ActivityButton({
@@ -1395,6 +1832,7 @@ function ActivityButton({
   projectId: string | null;
   taskId: string;
 }) {
+  const { t } = useI18n();
   const [loading, setLoading] = useState(false);
   const [item, setItem] = useState<RequestLogItem | null>(null);
 
@@ -1415,7 +1853,7 @@ function ActivityButton({
       const response = await consoleFetch(
         `/api/gateway/v1/console/logs?${query.toString()}`,
       );
-      if (!response.ok) throw new Error(await responseMessage(response));
+      if (!response.ok) throw new Error(await responseMessage(response, t));
       const payload = (await response.json()) as RequestLogsSnapshot;
       const selected =
         payload.items.find(
@@ -1423,12 +1861,24 @@ function ActivityButton({
             candidate.job_id === taskId || candidate.request_id === taskId,
         ) ?? payload.items[0];
       if (!selected) {
-        throw new Error("调用记录仍在写入，请稍后重试");
+        throw new Error(t({
+          en: "The request log is still being written. Try again shortly.",
+          "zh-CN": "调用记录仍在写入，请稍后重试",
+          ja: "リクエストログはまだ書き込み中です。しばらくしてから再試行してください。",
+          ko: "요청 기록이 아직 작성 중입니다. 잠시 후 다시 시도하세요.",
+        }));
       }
       setItem(selected);
     } catch (reason: unknown) {
       toast.error(
-        reason instanceof Error ? reason.message : "调用记录暂时不可用",
+        reason instanceof Error
+          ? reason.message
+          : t({
+            en: "Request logs are temporarily unavailable.",
+            "zh-CN": "调用记录暂时不可用",
+            ja: "リクエストログは一時的に利用できません。",
+            ko: "요청 기록을 일시적으로 사용할 수 없습니다.",
+          }),
       );
     } finally {
       setLoading(false);
@@ -1454,7 +1904,12 @@ function ActivityButton({
         ) : (
           <History aria-hidden="true" />
         )}
-        调用记录
+        {t({
+          en: "Request log",
+          "zh-CN": "调用记录",
+          ja: "リクエストログ",
+          ko: "요청 기록",
+        })}
       </Button>
       <ActivityRequestSheet
         item={item}
@@ -1475,6 +1930,11 @@ function constrainedPlaceholderWidth(value: string) {
       : 16 / 9;
   return `min(100%, calc(52dvh * ${ratio}))`;
 }
+
+type Translate = (
+  text: LocalizedText,
+  values?: Record<string, string | number>,
+) => string;
 
 function readDataUrl(file: File) {
   return new Promise<string>((resolve, reject) => {

@@ -44,10 +44,10 @@ import {
 } from "@/components/ui/table";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { useAdminQuery } from "@/hooks/use-admin-query";
+import { useI18n } from "@/i18n/locale-provider";
 import {
   formatInteger,
   formatMoneyMicros,
-  formatStatus,
 } from "@/lib/admin/format";
 import type {
   UsageActivityPoint,
@@ -60,6 +60,8 @@ export type UsageWindow = "24h" | "7d" | "30d";
 type UsageInterval = "1m" | "1h" | "1d";
 type UsageGroupBy = UsageAnalysisSnapshot["group_by"];
 type UsageView = "activity" | "cost";
+type Translate = ReturnType<typeof useI18n>["t"];
+type Locale = ReturnType<typeof useI18n>["locale"];
 
 const chartColors = [
   "var(--chart-1)",
@@ -67,18 +69,6 @@ const chartColors = [
   "var(--chart-3)",
   "var(--chart-4)",
   "var(--chart-5)",
-];
-
-const groupOptions: Array<{ value: UsageGroupBy; label: string }> = [
-  { value: "line_item", label: "计量项目" },
-  { value: "project", label: "项目" },
-  { value: "api_key", label: "API Key" },
-  { value: "user", label: "用户" },
-  { value: "provider", label: "供应商" },
-  { value: "model", label: "模型" },
-  { value: "operation", label: "操作" },
-  { value: "service_tier", label: "服务层级" },
-  { value: "none", label: "不分组" },
 ];
 
 const serviceTierOptions: UsageFilterOption[] = [
@@ -100,6 +90,7 @@ export function UsageAnalysisPanel({
   enabled: boolean;
   refreshKey: number;
 }) {
+  const { locale, t } = useI18n();
   const [view, setView] = useState<UsageView>("activity");
   const [interval, setInterval] = useState<UsageInterval>(
     window === "24h" ? "1h" : "1d",
@@ -160,13 +151,14 @@ export function UsageAnalysisPanel({
   const query = useAdminQuery<UsageAnalysisSnapshot>(endpoint, enabled);
   const options = query.data?.filter_options;
   const activityMetricOptions = useMemo(
-    () => collectActivityMetrics(query.data?.activity ?? []),
-    [query.data?.activity],
+    () => collectActivityMetrics(query.data?.activity ?? [], t, locale),
+    [locale, query.data?.activity, t],
   );
   const chart = useMemo(
-    () => buildChart(query.data ?? undefined, view, activityMetric),
-    [activityMetric, query.data, view],
+    () => buildChart(query.data ?? undefined, view, activityMetric, t, locale),
+    [activityMetric, locale, query.data, t, view],
   );
+  const groupOptions = useMemo(() => usageGroupOptions(t), [t]);
   const visibleGroupOptions = useMemo(
     () =>
       projectId
@@ -196,38 +188,68 @@ export function UsageAnalysisPanel({
     <section className="min-w-0 space-y-4">
       <div className="flex flex-wrap items-center gap-2">
         <FilterSelect
-          label="全部 API Keys"
+          label={t({
+            en: "All API keys",
+            "zh-CN": "全部 API Keys",
+            ja: "すべての API キー",
+            ko: "모든 API 키",
+          })}
           value={apiKeyId}
           options={options?.api_keys ?? []}
           onValueChange={setApiKeyId}
         />
         <FilterSelect
-          label="全部供应商"
+          label={t({
+            en: "All providers",
+            "zh-CN": "全部供应商",
+            ja: "すべてのプロバイダー",
+            ko: "모든 공급자",
+          })}
           value={providerId}
           options={options?.providers ?? []}
           onValueChange={setProviderId}
         />
         <FilterSelect
-          label="全部模型"
+          label={t({
+            en: "All models",
+            "zh-CN": "全部模型",
+            ja: "すべてのモデル",
+            ko: "모든 모델",
+          })}
           value={model}
           options={options?.models ?? []}
           onValueChange={setModel}
         />
         <FilterSelect
-          label="全部操作"
+          label={t({
+            en: "All operations",
+            "zh-CN": "全部操作",
+            ja: "すべての操作",
+            ko: "모든 작업",
+          })}
           value={operation}
           options={options?.operations ?? []}
           onValueChange={setOperation}
         />
         <FilterSelect
-          label="全部服务层级"
+          label={t({
+            en: "All service tiers",
+            "zh-CN": "全部服务层级",
+            ja: "すべてのサービス階層",
+            ko: "모든 서비스 등급",
+          })}
           value={serviceTier}
           options={serviceTierOptions}
           onValueChange={setServiceTier}
         />
         {platformOwner ? (
           <FilterSelect
-            label="全部用户"
+            label={t({
+              en: "All users",
+              "zh-CN": "全部用户",
+              ja: "すべてのユーザー",
+              ko: "모든 사용자",
+            })}
             value={userId}
             options={options?.users ?? []}
             onValueChange={setUserId}
@@ -244,7 +266,12 @@ export function UsageAnalysisPanel({
           disabled={!query.data}
         >
           <Download aria-hidden="true" />
-          导出
+          {t({
+            en: "Export",
+            "zh-CN": "导出",
+            ja: "エクスポート",
+            ko: "내보내기",
+          })}
         </Button>
       </div>
 
@@ -261,8 +288,22 @@ export function UsageAnalysisPanel({
                 onValueChange={(value) => setView(value as UsageView)}
               >
                 <TabsList className="h-9">
-                  <TabsTrigger value="activity">API 用量</TabsTrigger>
-                  <TabsTrigger value="cost">费用分类</TabsTrigger>
+                  <TabsTrigger value="activity">
+                    {t({
+                      en: "API usage",
+                      "zh-CN": "API 用量",
+                      ja: "API 使用量",
+                      ko: "API 사용량",
+                    })}
+                  </TabsTrigger>
+                  <TabsTrigger value="cost">
+                    {t({
+                      en: "Cost breakdown",
+                      "zh-CN": "费用分类",
+                      ja: "コスト内訳",
+                      ko: "비용 분류",
+                    })}
+                  </TabsTrigger>
                 </TabsList>
               </Tabs>
               <div className="flex flex-wrap items-center gap-2">
@@ -270,7 +311,12 @@ export function UsageAnalysisPanel({
                   <Select value={activityMetric} onValueChange={setActivityMetric}>
                     <SelectTrigger
                       className="w-[168px] max-w-full"
-                      aria-label="计量指标"
+                      aria-label={t({
+                        en: "Usage metric",
+                        "zh-CN": "计量指标",
+                        ja: "使用量指標",
+                        ko: "사용량 지표",
+                      })}
                     >
                       <SelectValue />
                     </SelectTrigger>
@@ -287,7 +333,15 @@ export function UsageAnalysisPanel({
                   value={groupBy}
                   onValueChange={(value) => setGroupBy(value as UsageGroupBy)}
                 >
-                  <SelectTrigger className="w-[132px]" aria-label="分组方式">
+                  <SelectTrigger
+                    className="w-[132px]"
+                    aria-label={t({
+                      en: "Group by",
+                      "zh-CN": "分组方式",
+                      ja: "グループ化",
+                      ko: "그룹 기준",
+                    })}
+                  >
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
@@ -336,7 +390,7 @@ export function UsageAnalysisPanel({
                       tickLine={false}
                       axisLine={false}
                       width={52}
-                      tickFormatter={compactNumber}
+                      tickFormatter={(value) => compactNumber(value, locale)}
                     />
                     <ChartTooltip
                       cursor={false}
@@ -421,6 +475,7 @@ function UsageBreakdown({
   view: UsageView;
   activityMetric: string;
 }) {
+  const { t } = useI18n();
   const rows = useMemo(
     () =>
       view === "activity"
@@ -429,26 +484,49 @@ function UsageBreakdown({
               (point) =>
                 metricKey(point.billing_metric, point.billing_unit) === activityMetric,
             ),
+            t,
           )
-        : spendBreakdown(data.spend),
-    [activityMetric, data.activity, data.spend, view],
+        : spendBreakdown(data.spend, t),
+    [activityMetric, data.activity, data.spend, t, view],
   );
   if (rows.length === 0) return null;
   return (
     <div className="overflow-hidden rounded-md border">
       <div className="border-b px-4 py-3">
-        <h2 className="text-sm font-semibold">分组明细</h2>
+        <h2 className="text-sm font-semibold">
+          {t({
+            en: "Grouped details",
+            "zh-CN": "分组明细",
+            ja: "グループ別詳細",
+            ko: "그룹별 상세",
+          })}
+        </h2>
       </div>
       <div className="overflow-x-auto">
         <Table className="min-w-[760px]">
           <TableHeader>
             <TableRow>
-              <TableHead className="pl-4">分组</TableHead>
-              <TableHead>计量项目</TableHead>
-              <TableHead>结果</TableHead>
-              <TableHead className="text-right">数量</TableHead>
+              <TableHead className="pl-4">
+                {t({ en: "Group", "zh-CN": "分组", ja: "グループ", ko: "그룹" })}
+              </TableHead>
+              <TableHead>
+                {t({
+                  en: "Usage item",
+                  "zh-CN": "计量项目",
+                  ja: "使用量項目",
+                  ko: "사용량 항목",
+                })}
+              </TableHead>
+              <TableHead>
+                {t({ en: "Result", "zh-CN": "结果", ja: "結果", ko: "결과" })}
+              </TableHead>
+              <TableHead className="text-right">
+                {t({ en: "Quantity", "zh-CN": "数量", ja: "数量", ko: "수량" })}
+              </TableHead>
               {view === "cost" ? (
-                <TableHead className="pr-4 text-right">金额</TableHead>
+                <TableHead className="pr-4 text-right">
+                  {t({ en: "Amount", "zh-CN": "金额", ja: "金額", ko: "금액" })}
+                </TableHead>
               ) : null}
             </TableRow>
           </TableHeader>
@@ -456,10 +534,10 @@ function UsageBreakdown({
             {rows.map((row) => (
               <TableRow key={row.key}>
                 <TableCell className="pl-4 font-medium">{row.group}</TableCell>
-                <TableCell>{metricLabel(row.metric)}</TableCell>
-                <TableCell>{formatStatus(row.outcome)}</TableCell>
+                <TableCell>{metricLabel(t, row.metric)}</TableCell>
+                <TableCell>{usageOutcomeLabel(t, row.outcome)}</TableCell>
                 <TableCell className="text-right font-mono tabular-nums">
-                  {formatInteger(row.quantity)} {unitLabel(row.unit)}
+                  {formatInteger(row.quantity)} {unitLabel(t, row.unit)}
                 </TableCell>
                 {view === "cost" ? (
                   <TableCell className="pr-4 text-right font-mono tabular-nums">
@@ -490,46 +568,103 @@ function UsageExportDialog({
   onExportTypeChange: (value: UsageView) => void;
   activityMetric: string;
 }) {
+  const { locale, t } = useI18n();
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="sm:max-w-lg">
         <DialogHeader>
-          <DialogTitle>导出用量</DialogTitle>
+          <DialogTitle>
+            {t({
+              en: "Export usage",
+              "zh-CN": "导出用量",
+              ja: "使用量をエクスポート",
+              ko: "사용량 내보내기",
+            })}
+          </DialogTitle>
           <DialogDescription>
-            导出当前项目、筛选、分组和时间粒度下的聚合结果。
+            {t({
+              en: "Export aggregated results for the current project, filters, grouping, and time interval.",
+              "zh-CN": "导出当前项目、筛选、分组和时间粒度下的聚合结果。",
+              ja: "現在のプロジェクト、フィルター、グループ、時間間隔に基づく集計結果をエクスポートします。",
+              ko: "현재 프로젝트, 필터, 그룹 및 시간 간격의 집계 결과를 내보냅니다.",
+            })}
           </DialogDescription>
         </DialogHeader>
         <div className="space-y-4 py-2">
           <div>
-            <p className="mb-2 text-sm font-medium">导出类型</p>
+            <p className="mb-2 text-sm font-medium">
+              {t({
+                en: "Export type",
+                "zh-CN": "导出类型",
+                ja: "エクスポートの種類",
+                ko: "내보내기 유형",
+              })}
+            </p>
             <Tabs
               value={exportType}
               onValueChange={(value) => onExportTypeChange(value as UsageView)}
             >
               <TabsList className="grid w-full grid-cols-2">
-                <TabsTrigger value="activity">活动数据</TabsTrigger>
-                <TabsTrigger value="cost">费用数据</TabsTrigger>
+                <TabsTrigger value="activity">
+                  {t({
+                    en: "Activity data",
+                    "zh-CN": "活动数据",
+                    ja: "アクティビティデータ",
+                    ko: "활동 데이터",
+                  })}
+                </TabsTrigger>
+                <TabsTrigger value="cost">
+                  {t({
+                    en: "Cost data",
+                    "zh-CN": "费用数据",
+                    ja: "コストデータ",
+                    ko: "비용 데이터",
+                  })}
+                </TabsTrigger>
               </TabsList>
             </Tabs>
           </div>
           <dl className="grid grid-cols-[112px_1fr] gap-x-4 gap-y-2 text-sm">
-            <dt className="text-muted-foreground">时间范围</dt>
+            <dt className="text-muted-foreground">
+              {t({
+                en: "Time range",
+                "zh-CN": "时间范围",
+                ja: "期間",
+                ko: "기간",
+              })}
+            </dt>
             <dd>
               {data
-                ? `${new Date(data.from_ms).toLocaleString()} - ${new Date(data.to_ms).toLocaleString()}`
+                ? `${new Date(data.from_ms).toLocaleString(locale)} - ${new Date(data.to_ms).toLocaleString(locale)}`
                 : "--"}
             </dd>
-            <dt className="text-muted-foreground">分组</dt>
-            <dd>{data ? groupLabel(data.group_by) : "--"}</dd>
-            <dt className="text-muted-foreground">时间粒度</dt>
+            <dt className="text-muted-foreground">
+              {t({ en: "Group", "zh-CN": "分组", ja: "グループ", ko: "그룹" })}
+            </dt>
+            <dd>{data ? groupLabel(t, data.group_by) : "--"}</dd>
+            <dt className="text-muted-foreground">
+              {t({
+                en: "Time interval",
+                "zh-CN": "时间粒度",
+                ja: "時間間隔",
+                ko: "시간 간격",
+              })}
+            </dt>
             <dd>{data?.interval ?? "--"}</dd>
-            <dt className="text-muted-foreground">文件格式</dt>
+            <dt className="text-muted-foreground">
+              {t({
+                en: "File format",
+                "zh-CN": "文件格式",
+                ja: "ファイル形式",
+                ko: "파일 형식",
+              })}
+            </dt>
             <dd>CSV</dd>
           </dl>
         </div>
         <DialogFooter>
           <Button type="button" variant="outline" onClick={() => onOpenChange(false)}>
-            取消
+            {t({ en: "Cancel", "zh-CN": "取消", ja: "キャンセル", ko: "취소" })}
           </Button>
           <Button
             type="button"
@@ -541,7 +676,12 @@ function UsageExportDialog({
             disabled={!data}
           >
             <Download aria-hidden="true" />
-            下载 CSV
+            {t({
+              en: "Download CSV",
+              "zh-CN": "下载 CSV",
+              ja: "CSV をダウンロード",
+              ko: "CSV 다운로드",
+            })}
           </Button>
         </DialogFooter>
       </DialogContent>
@@ -550,13 +690,31 @@ function UsageExportDialog({
 }
 
 function EmptyTrend({ view }: { view: UsageView }) {
+  const { t } = useI18n();
   return (
     <div className="flex h-64 flex-col items-center justify-center text-center">
       <p className="text-sm font-medium">
-        {view === "activity" ? "暂无活动数据" : "暂无费用数据"}
+        {view === "activity"
+          ? t({
+              en: "No activity data",
+              "zh-CN": "暂无活动数据",
+              ja: "アクティビティデータはありません",
+              ko: "활동 데이터가 없습니다",
+            })
+          : t({
+              en: "No cost data",
+              "zh-CN": "暂无费用数据",
+              ja: "コストデータはありません",
+              ko: "비용 데이터가 없습니다",
+            })}
       </p>
       <p className="mt-1 text-sm text-muted-foreground">
-        当前项目和筛选条件下没有可展示的数据。
+        {t({
+          en: "There is no data to display for the current project and filters.",
+          "zh-CN": "当前项目和筛选条件下没有可展示的数据。",
+          ja: "現在のプロジェクトとフィルターに表示できるデータはありません。",
+          ko: "현재 프로젝트와 필터에 표시할 데이터가 없습니다.",
+        })}
       </p>
     </div>
   );
@@ -566,6 +724,8 @@ function buildChart(
   data: UsageAnalysisSnapshot | undefined,
   view: UsageView,
   activityMetric: string,
+  t: Translate,
+  locale: Locale,
 ) {
   if (!data) return { rows: [], series: [], config: {} as ChartConfig };
   const points =
@@ -581,7 +741,7 @@ function buildChart(
     const identity = `${point.group_value}\u0000${currency}`;
     const groupLabel =
       point.group_kind === "line_item"
-        ? metricLabel(point.billing_metric)
+        ? metricLabel(t, point.billing_metric)
         : point.group_label;
     const label = currency ? `${groupLabel} · ${currency}` : groupLabel;
     if (!seriesIdentities.has(identity)) seriesIdentities.set(identity, label);
@@ -598,7 +758,7 @@ function buildChart(
       buckets.get(point.bucket_start_ms) ??
       {
         bucket: point.bucket_start_ms,
-        label: formatBucket(point.bucket_start_ms, data.interval),
+        label: formatBucket(point.bucket_start_ms, data.interval, locale),
       };
     const currency = "currency" in point ? point.currency : "";
     const item = seriesByIdentity.get(`${point.group_value}\u0000${currency}`);
@@ -636,7 +796,10 @@ type BreakdownRow = {
   amountMicros?: string;
 };
 
-function activityBreakdown(points: UsageActivityPoint[]): BreakdownRow[] {
+function activityBreakdown(
+  points: UsageActivityPoint[],
+  t: Translate,
+): BreakdownRow[] {
   const totals = new Map<string, BreakdownRow>();
   for (const point of points) {
     const key = `${point.group_value}\u0000${point.billing_metric}\u0000${point.billing_unit}\u0000${point.outcome}`;
@@ -645,7 +808,7 @@ function activityBreakdown(points: UsageActivityPoint[]): BreakdownRow[] {
       key,
       group:
         point.group_kind === "line_item"
-          ? metricLabel(point.billing_metric)
+          ? metricLabel(t, point.billing_metric)
           : point.group_label,
       metric: point.billing_metric,
       unit: point.billing_unit,
@@ -658,7 +821,10 @@ function activityBreakdown(points: UsageActivityPoint[]): BreakdownRow[] {
   return [...totals.values()];
 }
 
-function spendBreakdown(points: UsageSpendPoint[]): BreakdownRow[] {
+function spendBreakdown(
+  points: UsageSpendPoint[],
+  t: Translate,
+): BreakdownRow[] {
   const totals = new Map<string, BreakdownRow>();
   for (const point of points) {
     const key = `${point.group_value}\u0000${point.billing_metric}\u0000${point.billing_unit}\u0000${point.outcome}\u0000${point.currency}`;
@@ -667,7 +833,7 @@ function spendBreakdown(points: UsageSpendPoint[]): BreakdownRow[] {
       key,
       group:
         point.group_kind === "line_item"
-          ? metricLabel(point.billing_metric)
+          ? metricLabel(t, point.billing_metric)
           : point.group_label,
       metric: point.billing_metric,
       unit: point.billing_unit,
@@ -768,8 +934,8 @@ function appendFilter(params: URLSearchParams, name: string, value: string) {
   if (value !== "all") params.set(name, value);
 }
 
-function formatBucket(value: number, interval: UsageInterval) {
-  return new Intl.DateTimeFormat("zh-CN", {
+function formatBucket(value: number, interval: UsageInterval, locale: Locale) {
+  return new Intl.DateTimeFormat(locale, {
     month: interval === "1d" ? "2-digit" : undefined,
     day: "2-digit",
     hour: interval === "1d" ? undefined : "2-digit",
@@ -778,65 +944,217 @@ function formatBucket(value: number, interval: UsageInterval) {
   }).format(new Date(value));
 }
 
-function compactNumber(value: number) {
-  return new Intl.NumberFormat("zh-CN", {
+function compactNumber(value: number, locale: Locale) {
+  return new Intl.NumberFormat(locale, {
     notation: "compact",
     maximumFractionDigits: 1,
   }).format(value);
 }
 
-function metricLabel(metric: string) {
-  const labels: Record<string, string> = {
-    request: "请求",
-    output: "输出",
-    image_output: "图片输出",
-    image_output_token: "图片输出 Token",
-    image_input: "图片输入",
-    image_input_token: "图片输入 Token",
-    text_input_token: "文本输入 Token",
-    cached_text_input_token: "缓存文本 Token",
-    cached_image_input_token: "缓存图片 Token",
-    video_requested_second: "视频请求时长",
-    video_output_second: "视频输出时长",
-    membership_point: "会员积分",
+function metricLabel(t: Translate, metric: string) {
+  const labels: Record<
+    string,
+    { en: string; "zh-CN": string; ja: string; ko: string }
+  > = {
+    request: { en: "Requests", "zh-CN": "请求", ja: "リクエスト", ko: "요청" },
+    output: { en: "Outputs", "zh-CN": "输出", ja: "出力", ko: "출력" },
+    image_output: {
+      en: "Image outputs",
+      "zh-CN": "图片输出",
+      ja: "画像出力",
+      ko: "이미지 출력",
+    },
+    image_output_token: {
+      en: "Image output tokens",
+      "zh-CN": "图片输出 Token",
+      ja: "画像出力 Token",
+      ko: "이미지 출력 Token",
+    },
+    image_input: {
+      en: "Image inputs",
+      "zh-CN": "图片输入",
+      ja: "画像入力",
+      ko: "이미지 입력",
+    },
+    image_input_token: {
+      en: "Image input tokens",
+      "zh-CN": "图片输入 Token",
+      ja: "画像入力 Token",
+      ko: "이미지 입력 Token",
+    },
+    text_input_token: {
+      en: "Text input tokens",
+      "zh-CN": "文本输入 Token",
+      ja: "テキスト入力 Token",
+      ko: "텍스트 입력 Token",
+    },
+    cached_text_input_token: {
+      en: "Cached text tokens",
+      "zh-CN": "缓存文本 Token",
+      ja: "キャッシュ済みテキスト Token",
+      ko: "캐시된 텍스트 Token",
+    },
+    cached_image_input_token: {
+      en: "Cached image tokens",
+      "zh-CN": "缓存图片 Token",
+      ja: "キャッシュ済み画像 Token",
+      ko: "캐시된 이미지 Token",
+    },
+    video_requested_second: {
+      en: "Requested video duration",
+      "zh-CN": "视频请求时长",
+      ja: "動画リクエスト時間",
+      ko: "요청한 동영상 길이",
+    },
+    video_output_second: {
+      en: "Video output duration",
+      "zh-CN": "视频输出时长",
+      ja: "動画出力時間",
+      ko: "동영상 출력 길이",
+    },
+    membership_point: {
+      en: "Membership points",
+      "zh-CN": "会员积分",
+      ja: "メンバーシップポイント",
+      ko: "멤버십 포인트",
+    },
   };
-  return labels[metric] ?? "其他用量";
+  return labels[metric]
+    ? t(labels[metric])
+    : t({
+        en: "Other usage",
+        "zh-CN": "其他用量",
+        ja: "その他の使用量",
+        ko: "기타 사용량",
+      });
 }
 
-function unitLabel(unit: string) {
-  const labels: Record<string, string> = {
-    request: "次",
-    output: "个",
-    image: "张",
-    token: "Token",
-    second: "秒",
-    point: "积分",
+function unitLabel(t: Translate, unit: string) {
+  const labels: Record<
+    string,
+    { en: string; "zh-CN": string; ja: string; ko: string }
+  > = {
+    request: { en: "requests", "zh-CN": "次", ja: "件", ko: "회" },
+    output: { en: "outputs", "zh-CN": "个", ja: "件", ko: "개" },
+    image: { en: "images", "zh-CN": "张", ja: "枚", ko: "장" },
+    token: { en: "tokens", "zh-CN": "Token", ja: "Token", ko: "Token" },
+    second: { en: "seconds", "zh-CN": "秒", ja: "秒", ko: "초" },
+    point: { en: "points", "zh-CN": "积分", ja: "ポイント", ko: "포인트" },
   };
-  return labels[unit] ?? "单位";
+  return labels[unit]
+    ? t(labels[unit])
+    : t({ en: "units", "zh-CN": "单位", ja: "単位", ko: "단위" });
 }
 
 function metricKey(metric: string, unit: string) {
   return `${metric}::${unit}`;
 }
 
-function collectActivityMetrics(points: UsageActivityPoint[]) {
+function collectActivityMetrics(
+  points: UsageActivityPoint[],
+  t: Translate,
+  locale: Locale,
+) {
   const metrics = new Map<string, { value: string; label: string }>();
   for (const point of points) {
     const value = metricKey(point.billing_metric, point.billing_unit);
     if (!metrics.has(value)) {
       metrics.set(value, {
         value,
-        label: `${metricLabel(point.billing_metric)} · ${unitLabel(point.billing_unit)}`,
+        label: `${metricLabel(t, point.billing_metric)} · ${unitLabel(t, point.billing_unit)}`,
       });
     }
   }
   return [...metrics.values()].sort((left, right) => {
     if (left.value === "request::request") return -1;
     if (right.value === "request::request") return 1;
-    return left.label.localeCompare(right.label, "zh-CN");
+    return left.label.localeCompare(right.label, locale);
   });
 }
 
-function groupLabel(group: UsageGroupBy) {
-  return groupOptions.find((option) => option.value === group)?.label ?? group;
+function usageGroupOptions(
+  t: Translate,
+): Array<{ value: UsageGroupBy; label: string }> {
+  return [
+    {
+      value: "line_item",
+      label: t({
+        en: "Usage item",
+        "zh-CN": "计量项目",
+        ja: "使用量項目",
+        ko: "사용량 항목",
+      }),
+    },
+    {
+      value: "project",
+      label: t({ en: "Project", "zh-CN": "项目", ja: "プロジェクト", ko: "프로젝트" }),
+    },
+    {
+      value: "api_key",
+      label: "API Key",
+    },
+    {
+      value: "user",
+      label: t({ en: "User", "zh-CN": "用户", ja: "ユーザー", ko: "사용자" }),
+    },
+    {
+      value: "provider",
+      label: t({
+        en: "Provider",
+        "zh-CN": "供应商",
+        ja: "プロバイダー",
+        ko: "공급자",
+      }),
+    },
+    {
+      value: "model",
+      label: t({ en: "Model", "zh-CN": "模型", ja: "モデル", ko: "모델" }),
+    },
+    {
+      value: "operation",
+      label: t({ en: "Operation", "zh-CN": "操作", ja: "操作", ko: "작업" }),
+    },
+    {
+      value: "service_tier",
+      label: t({
+        en: "Service tier",
+        "zh-CN": "服务层级",
+        ja: "サービス階層",
+        ko: "서비스 등급",
+      }),
+    },
+    {
+      value: "none",
+      label: t({
+        en: "No grouping",
+        "zh-CN": "不分组",
+        ja: "グループ化なし",
+        ko: "그룹화 안 함",
+      }),
+    },
+  ];
+}
+
+function groupLabel(t: Translate, group: UsageGroupBy) {
+  return usageGroupOptions(t).find((option) => option.value === group)?.label ?? group;
+}
+
+function usageOutcomeLabel(t: Translate, outcome: string) {
+  const labels: Record<
+    string,
+    { en: string; "zh-CN": string; ja: string; ko: string }
+  > = {
+    success: { en: "Success", "zh-CN": "成功", ja: "成功", ko: "성공" },
+    succeeded: { en: "Succeeded", "zh-CN": "成功", ja: "成功", ko: "성공" },
+    failed: { en: "Failed", "zh-CN": "失败", ja: "失敗", ko: "실패" },
+    error: { en: "Error", "zh-CN": "错误", ja: "エラー", ko: "오류" },
+    cancelled: {
+      en: "Cancelled",
+      "zh-CN": "已取消",
+      ja: "キャンセル済み",
+      ko: "취소됨",
+    },
+  };
+  const label = labels[outcome.toLowerCase()];
+  return label ? t(label) : outcome.replaceAll("_", " ");
 }

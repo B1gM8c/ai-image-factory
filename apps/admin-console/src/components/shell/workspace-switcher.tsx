@@ -21,11 +21,13 @@ import {
   useSidebar,
 } from "@/components/ui/sidebar";
 import { requiresProjectWorkspace } from "@/lib/navigation";
+import { useI18n } from "@/i18n/locale-provider";
 
 export function WorkspaceSwitcher() {
   const pathname = usePathname();
   const [createOpen, setCreateOpen] = useState(false);
   const { setOpenMobile } = useSidebar();
+  const { t } = useI18n();
   const {
     activeWorkspace,
     loading,
@@ -46,10 +48,21 @@ export function WorkspaceSwitcher() {
               <SidebarMenuButton
                 className="h-9 min-w-0 px-2 data-[state=open]:bg-sidebar-accent data-[state=open]:text-sidebar-accent-foreground"
                 disabled={loading || !activeWorkspace}
-                aria-label="切换项目"
+                aria-label={t({
+                  en: "Switch project",
+                  "zh-CN": "切换项目",
+                  ja: "プロジェクトを切り替える",
+                  ko: "프로젝트 전환",
+                })}
               >
                 <span className="min-w-0 flex-1 truncate text-left text-sm font-medium">
-                  {activeWorkspace?.name ?? "正在载入项目"}
+                  {activeWorkspace?.name ??
+                    t({
+                      en: "Loading project",
+                      "zh-CN": "正在载入项目",
+                      ja: "プロジェクトを読み込み中",
+                      ko: "프로젝트 불러오는 중",
+                    })}
                 </span>
                 <ChevronsUpDown
                   className="ml-auto size-3.5 shrink-0 text-muted-foreground"
@@ -64,7 +77,12 @@ export function WorkspaceSwitcher() {
               sideOffset={4}
             >
               <DropdownMenuLabel className="text-xs font-normal text-muted-foreground">
-                项目
+                {t({
+                  en: "Projects",
+                  "zh-CN": "项目",
+                  ja: "プロジェクト",
+                  ko: "프로젝트",
+                })}
               </DropdownMenuLabel>
               <DropdownMenuSeparator />
               {visibleWorkspaces.map((workspace) => (
@@ -80,7 +98,15 @@ export function WorkspaceSwitcher() {
                     </span>
                   </span>
                   {workspace.key === activeWorkspace?.key ? (
-                    <Check className="size-4 shrink-0" aria-label="当前工作区" />
+                    <Check
+                      className="size-4 shrink-0"
+                      aria-label={t({
+                        en: "Current workspace",
+                        "zh-CN": "当前工作区",
+                        ja: "現在のワークスペース",
+                        ko: "현재 워크스페이스",
+                      })}
+                    />
                   ) : null}
                 </DropdownMenuItem>
               ))}
@@ -92,12 +118,22 @@ export function WorkspaceSwitcher() {
                 }}
               >
                 <Plus aria-hidden="true" />
-                创建项目
+                {t({
+                  en: "Create project",
+                  "zh-CN": "创建项目",
+                  ja: "プロジェクトを作成",
+                  ko: "프로젝트 만들기",
+                })}
               </DropdownMenuItem>
               <DropdownMenuItem asChild>
                 <Link href="/projects" onClick={() => setOpenMobile(false)}>
                   <Settings aria-hidden="true" />
-                  管理项目
+                  {t({
+                    en: "Manage projects",
+                    "zh-CN": "管理项目",
+                    ja: "プロジェクトを管理",
+                    ko: "프로젝트 관리",
+                  })}
                 </Link>
               </DropdownMenuItem>
             </DropdownMenuContent>

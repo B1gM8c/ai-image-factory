@@ -41,7 +41,12 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
-import { consoleFetch } from "@/lib/auth/client";
+import { useI18n } from "@/i18n/locale-provider";
+import {
+  consoleFetch,
+  consoleRequestFailure,
+  consoleResponseFailure,
+} from "@/lib/auth/client";
 
 type ProjectMemberRole = "owner" | "member";
 
@@ -72,6 +77,7 @@ export function ProjectMembersPanel({
   active: boolean;
 }) {
   const { user } = useConsoleSession();
+  const { t } = useI18n();
   const [members, setMembers] = useState<ProjectMember[]>([]);
   const [loading, setLoading] = useState(false);
   const [pendingUserId, setPendingUserId] = useState<string | null>(null);
@@ -82,22 +88,30 @@ export function ProjectMembersPanel({
   const [error, setError] = useState<string | null>(null);
 
   const loadMembers = useCallback(async () => {
+    const failure = t({
+      en: "Failed to load project members.",
+      "zh-CN": "项目成员加载失败。",
+      ja: "プロジェクトメンバーを読み込めませんでした。",
+      ko: "프로젝트 멤버를 불러오지 못했습니다.",
+    });
     setLoading(true);
     setError(null);
     try {
       const response = await consoleFetch(
         `/api/gateway/v1/organization/projects/${encodeURIComponent(projectId)}/members`,
       );
-      if (!response.ok) throw new Error(await responseMessage(response));
+      if (!response.ok) {
+        throw new Error(await consoleResponseFailure(response, failure, t));
+      }
       const payload = (await response.json()) as ProjectMemberList;
       setMembers(payload.data);
     } catch (reason) {
       setMembers([]);
-      setError(reason instanceof Error ? reason.message : "项目成员加载失败");
+      setError(consoleRequestFailure(reason, failure, t));
     } finally {
       setLoading(false);
     }
-  }, [projectId]);
+  }, [projectId, t]);
 
   useEffect(() => {
     if (active) void loadMembers();
@@ -115,6 +129,12 @@ export function ProjectMembersPanel({
     event.preventDefault();
     const normalizedEmail = email.trim();
     if (!normalizedEmail || !canManage) return;
+    const failure = t({
+      en: "Failed to add the project member.",
+      "zh-CN": "添加项目成员失败。",
+      ja: "プロジェクトメンバーを追加できませんでした。",
+      ko: "프로젝트 멤버를 추가하지 못했습니다.",
+    });
     setPendingUserId("add");
     setError(null);
     try {
@@ -126,14 +146,16 @@ export function ProjectMembersPanel({
           body: JSON.stringify({ email: normalizedEmail, role }),
         },
       );
-      if (!response.ok) throw new Error(await responseMessage(response));
+      if (!response.ok) {
+        throw new Error(await consoleResponseFailure(response, failure, t));
+      }
       setEmail("");
       setRole("member");
       setAddOpen(false);
       await loadMembers();
-      toast.success("项目成员已添加");
+      toast.success(t({ en: "Project member added", "zh-CN": "项目成员已添加", ja: "プロジェクトメンバーを追加しました", ko: "프로젝트 멤버를 추가했습니다" }));
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "添加项目成员失败");
+      setError(consoleRequestFailure(reason, failure, t));
     } finally {
       setPendingUserId(null);
     }
@@ -141,6 +163,12 @@ export function ProjectMembersPanel({
 
   async function updateRole(member: ProjectMember, nextRole: ProjectMemberRole) {
     if (!canManage || member.role === nextRole) return;
+    const failure = t({
+      en: "Failed to update the member role.",
+      "zh-CN": "成员角色更新失败。",
+      ja: "メンバーのロールを更新できませんでした。",
+      ko: "멤버 역할을 업데이트하지 못했습니다.",
+    });
     setPendingUserId(member.user_id);
     setError(null);
     try {
@@ -152,11 +180,13 @@ export function ProjectMembersPanel({
           body: JSON.stringify({ role: nextRole }),
         },
       );
-      if (!response.ok) throw new Error(await responseMessage(response));
+      if (!response.ok) {
+        throw new Error(await consoleResponseFailure(response, failure, t));
+      }
       await loadMembers();
-      toast.success("成员角色已更新");
+      toast.success(t({ en: "Member role updated", "zh-CN": "成员角色已更新", ja: "メンバーのロールを更新しました", ko: "멤버 역할을 업데이트했습니다" }));
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "成员角色更新失败");
+      setError(consoleRequestFailure(reason, failure, t));
     } finally {
       setPendingUserId(null);
     }
@@ -165,6 +195,12 @@ export function ProjectMembersPanel({
   async function confirmRemove() {
     if (!removeMember || !canManage) return;
     const target = removeMember;
+    const failure = t({
+      en: "Failed to remove the project member.",
+      "zh-CN": "移除项目成员失败。",
+      ja: "プロジェクトメンバーを削除できませんでした。",
+      ko: "프로젝트 멤버를 제거하지 못했습니다.",
+    });
     setPendingUserId(target.user_id);
     setError(null);
     try {
@@ -172,12 +208,14 @@ export function ProjectMembersPanel({
         `/api/gateway/v1/organization/projects/${encodeURIComponent(projectId)}/members/${encodeURIComponent(target.user_id)}`,
         { method: "DELETE" },
       );
-      if (!response.ok) throw new Error(await responseMessage(response));
+      if (!response.ok) {
+        throw new Error(await consoleResponseFailure(response, failure, t));
+      }
       setRemoveMember(null);
       await loadMembers();
-      toast.success("项目成员已移除");
+      toast.success(t({ en: "Project member removed", "zh-CN": "项目成员已移除", ja: "プロジェクトメンバーを削除しました", ko: "프로젝트 멤버를 제거했습니다" }));
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "移除项目成员失败");
+      setError(consoleRequestFailure(reason, failure, t));
     } finally {
       setPendingUserId(null);
     }
@@ -187,9 +225,9 @@ export function ProjectMembersPanel({
     <div className="space-y-5 px-5 py-6 sm:px-6">
       <div className="flex items-start justify-between gap-4">
         <div>
-          <h3 className="text-sm font-medium">项目成员</h3>
+          <h3 className="text-sm font-medium">{t({ en: "Project members", "zh-CN": "项目成员", ja: "プロジェクトメンバー", ko: "프로젝트 멤버" })}</h3>
           <p className="mt-1 text-sm text-muted-foreground">
-            成员只能访问已加入的项目；所有者可以管理成员、限额与项目凭据。
+            {t({ en: "Members can access only the projects they join. Owners can manage members, limits, and project credentials.", "zh-CN": "成员只能访问已加入的项目；所有者可以管理成员、限额与项目凭据。", ja: "メンバーは参加しているプロジェクトのみにアクセスできます。所有者はメンバー、上限、プロジェクト認証情報を管理できます。", ko: "멤버는 참여한 프로젝트에만 액세스할 수 있습니다. 소유자는 멤버, 한도 및 프로젝트 자격 증명을 관리할 수 있습니다." })}
           </p>
         </div>
         <div className="flex shrink-0 gap-2">
@@ -199,8 +237,8 @@ export function ProjectMembersPanel({
             size="icon"
             onClick={() => void loadMembers()}
             disabled={loading}
-            aria-label="刷新项目成员"
-            title="刷新项目成员"
+            aria-label={t({ en: "Refresh project members", "zh-CN": "刷新项目成员", ja: "プロジェクトメンバーを更新", ko: "프로젝트 멤버 새로고침" })}
+            title={t({ en: "Refresh project members", "zh-CN": "刷新项目成员", ja: "プロジェクトメンバーを更新", ko: "프로젝트 멤버 새로고침" })}
           >
             {loading ? (
               <LoaderCircle className="animate-spin" aria-hidden="true" />
@@ -211,7 +249,7 @@ export function ProjectMembersPanel({
           {canManage ? (
             <Button type="button" onClick={() => setAddOpen(true)}>
               <Plus aria-hidden="true" />
-              添加成员
+              {t({ en: "Add member", "zh-CN": "添加成员", ja: "メンバーを追加", ko: "멤버 추가" })}
             </Button>
           ) : null}
         </div>
@@ -221,11 +259,11 @@ export function ProjectMembersPanel({
         <Table>
           <TableHeader>
             <TableRow>
-              <TableHead>成员</TableHead>
-              <TableHead className="w-36">角色</TableHead>
-              <TableHead className="w-24">状态</TableHead>
+              <TableHead>{t({ en: "Member", "zh-CN": "成员", ja: "メンバー", ko: "멤버" })}</TableHead>
+              <TableHead className="w-36">{t({ en: "Role", "zh-CN": "角色", ja: "ロール", ko: "역할" })}</TableHead>
+              <TableHead className="w-24">{t({ en: "Status", "zh-CN": "状态", ja: "ステータス", ko: "상태" })}</TableHead>
               <TableHead className="w-14">
-                <span className="sr-only">操作</span>
+                <span className="sr-only">{t({ en: "Actions", "zh-CN": "操作", ja: "操作", ko: "작업" })}</span>
               </TableHead>
             </TableRow>
           </TableHeader>
@@ -251,7 +289,7 @@ export function ProjectMembersPanel({
                           {member.display_name}
                           {member.user_id === user?.id ? (
                             <span className="ml-1 font-normal text-muted-foreground">
-                              （你）
+                              {t({ en: " (you)", "zh-CN": "（你）", ja: "（あなた）", ko: " (나)" })}
                             </span>
                           ) : null}
                         </p>
@@ -272,25 +310,29 @@ export function ProjectMembersPanel({
                       >
                         <SelectTrigger
                           className="h-8"
-                          aria-label={`${member.display_name} 的项目角色`}
-                          title={isLastOwner ? "项目必须保留至少一位所有者" : undefined}
+                          aria-label={t({ en: "{member}'s project role", "zh-CN": "{member} 的项目角色", ja: "{member} のプロジェクトロール", ko: "{member}의 프로젝트 역할" }, { member: member.display_name })}
+                          title={isLastOwner ? t({ en: "The project must retain at least one owner", "zh-CN": "项目必须保留至少一位所有者", ja: "プロジェクトには少なくとも 1 人の所有者が必要です", ko: "프로젝트에는 소유자가 한 명 이상 있어야 합니다" }) : undefined}
                         >
                           <SelectValue />
                         </SelectTrigger>
                         <SelectContent>
-                          <SelectItem value="member">成员</SelectItem>
-                          <SelectItem value="owner">所有者</SelectItem>
+                          <SelectItem value="member">{t({ en: "Member", "zh-CN": "成员", ja: "メンバー", ko: "멤버" })}</SelectItem>
+                          <SelectItem value="owner">{t({ en: "Owner", "zh-CN": "所有者", ja: "所有者", ko: "소유자" })}</SelectItem>
                         </SelectContent>
                       </Select>
                     ) : (
                       <span className="text-sm">
-                        {member.role === "owner" ? "所有者" : "成员"}
+                        {member.role === "owner"
+                          ? t({ en: "Owner", "zh-CN": "所有者", ja: "所有者", ko: "소유자" })
+                          : t({ en: "Member", "zh-CN": "成员", ja: "メンバー", ko: "멤버" })}
                       </span>
                     )}
                   </TableCell>
                   <TableCell>
                     <Badge variant={member.state === "active" ? "secondary" : "outline"}>
-                      {member.state === "active" ? "已加入" : "已移除"}
+                      {member.state === "active"
+                        ? t({ en: "Active", "zh-CN": "已加入", ja: "参加中", ko: "활성" })
+                        : t({ en: "Removed", "zh-CN": "已移除", ja: "削除済み", ko: "제거됨" })}
                     </Badge>
                   </TableCell>
                   <TableCell>
@@ -301,9 +343,11 @@ export function ProjectMembersPanel({
                         size="icon"
                         onClick={() => setRemoveMember(member)}
                         disabled={pending || isLastOwner}
-                        aria-label={`移除 ${member.display_name}`}
+                        aria-label={t({ en: "Remove {member}", "zh-CN": "移除 {member}", ja: "{member} を削除", ko: "{member} 제거" }, { member: member.display_name })}
                         title={
-                          isLastOwner ? "项目必须保留至少一位所有者" : "移除成员"
+                          isLastOwner
+                            ? t({ en: "The project must retain at least one owner", "zh-CN": "项目必须保留至少一位所有者", ja: "プロジェクトには少なくとも 1 人の所有者が必要です", ko: "프로젝트에는 소유자가 한 명 이상 있어야 합니다" })
+                            : t({ en: "Remove member", "zh-CN": "移除成员", ja: "メンバーを削除", ko: "멤버 제거" })
                         }
                       >
                         {pending ? (
@@ -323,7 +367,7 @@ export function ProjectMembersPanel({
                   colSpan={4}
                   className="h-28 text-center text-muted-foreground"
                 >
-                  {error ?? "暂无项目成员"}
+                  {error ?? t({ en: "No project members", "zh-CN": "暂无项目成员", ja: "プロジェクトメンバーはいません", ko: "프로젝트 멤버가 없습니다" })}
                 </TableCell>
               </TableRow>
             ) : null}
@@ -333,7 +377,7 @@ export function ProjectMembersPanel({
 
       {!canManage ? (
         <p className="text-sm text-muted-foreground">
-          只有项目或组织所有者可以调整成员角色和访问权限。
+          {t({ en: "Only project or organization owners can change member roles and access.", "zh-CN": "只有项目或组织所有者可以调整成员角色和访问权限。", ja: "メンバーのロールとアクセス権を変更できるのは、プロジェクトまたは組織の所有者のみです。", ko: "프로젝트 또는 조직 소유자만 멤버 역할과 액세스를 변경할 수 있습니다." })}
         </p>
       ) : null}
       {error ? (
@@ -346,14 +390,14 @@ export function ProjectMembersPanel({
         <DialogContent className="sm:max-w-md">
           <form onSubmit={addMember}>
             <DialogHeader>
-              <DialogTitle>添加项目成员</DialogTitle>
+              <DialogTitle>{t({ en: "Add project member", "zh-CN": "添加项目成员", ja: "プロジェクトメンバーを追加", ko: "프로젝트 멤버 추가" })}</DialogTitle>
               <DialogDescription>
-                选择一个已注册账户，并仅授予当前项目的访问权限。
+                {t({ en: "Select a registered account and grant access only to this project.", "zh-CN": "选择一个已注册账户，并仅授予当前项目的访问权限。", ja: "登録済みアカウントを選択し、このプロジェクトへのアクセスのみを付与します。", ko: "등록된 계정을 선택하고 현재 프로젝트에만 액세스 권한을 부여합니다." })}
               </DialogDescription>
             </DialogHeader>
             <div className="space-y-4 py-5">
               <div className="space-y-2">
-                <Label htmlFor="project-member-email">账户邮箱</Label>
+                <Label htmlFor="project-member-email">{t({ en: "Account email", "zh-CN": "账户邮箱", ja: "アカウントのメール", ko: "계정 이메일" })}</Label>
                 <Input
                   id="project-member-email"
                   type="email"
@@ -365,7 +409,7 @@ export function ProjectMembersPanel({
                 />
               </div>
               <div className="space-y-2">
-                <Label htmlFor="project-member-role">项目角色</Label>
+                <Label htmlFor="project-member-role">{t({ en: "Project role", "zh-CN": "项目角色", ja: "プロジェクトロール", ko: "프로젝트 역할" })}</Label>
                 <Select
                   value={role}
                   onValueChange={(value) => setRole(value as ProjectMemberRole)}
@@ -374,12 +418,12 @@ export function ProjectMembersPanel({
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
-                    <SelectItem value="member">成员</SelectItem>
-                    <SelectItem value="owner">所有者</SelectItem>
+                    <SelectItem value="member">{t({ en: "Member", "zh-CN": "成员", ja: "メンバー", ko: "멤버" })}</SelectItem>
+                    <SelectItem value="owner">{t({ en: "Owner", "zh-CN": "所有者", ja: "所有者", ko: "소유자" })}</SelectItem>
                   </SelectContent>
                 </Select>
                 <p className="text-xs text-muted-foreground">
-                  所有者可以管理成员、项目限额和项目 API 凭据。
+                  {t({ en: "Owners can manage members, project limits, and project API credentials.", "zh-CN": "所有者可以管理成员、项目限额和项目 API 凭据。", ja: "所有者はメンバー、プロジェクト上限、プロジェクト API 認証情報を管理できます。", ko: "소유자는 멤버, 프로젝트 한도 및 프로젝트 API 자격 증명을 관리할 수 있습니다." })}
                 </p>
               </div>
             </div>
@@ -390,7 +434,7 @@ export function ProjectMembersPanel({
                 onClick={() => setAddOpen(false)}
                 disabled={pendingUserId === "add"}
               >
-                取消
+                {t({ en: "Cancel", "zh-CN": "取消", ja: "キャンセル", ko: "취소" })}
               </Button>
               <Button
                 type="submit"
@@ -401,7 +445,7 @@ export function ProjectMembersPanel({
                 ) : (
                   <Plus aria-hidden="true" />
                 )}
-                添加
+                {t({ en: "Add", "zh-CN": "添加", ja: "追加", ko: "추가" })}
               </Button>
             </DialogFooter>
           </form>
@@ -416,15 +460,15 @@ export function ProjectMembersPanel({
       >
         <AlertDialogContent>
           <AlertDialogHeader>
-            <AlertDialogTitle>移除项目成员？</AlertDialogTitle>
+            <AlertDialogTitle>{t({ en: "Remove project member?", "zh-CN": "移除项目成员？", ja: "プロジェクトメンバーを削除しますか？", ko: "프로젝트 멤버를 제거할까요?" })}</AlertDialogTitle>
             <AlertDialogDescription>
               {removeMember
-                ? `${removeMember.display_name} 将立即失去此项目的访问权限，已有会话和用户 API Key 权限会同步失效。`
+                ? t({ en: "{member} will immediately lose access to this project. Existing sessions and user API key access will also be revoked.", "zh-CN": "{member} 将立即失去此项目的访问权限，已有会话和用户 API Key 权限会同步失效。", ja: "{member} は直ちにこのプロジェクトへアクセスできなくなります。既存のセッションとユーザー API キーの権限も無効になります。", ko: "{member}은(는) 즉시 이 프로젝트에 대한 액세스 권한을 잃으며 기존 세션과 사용자 API 키 권한도 함께 취소됩니다." }, { member: removeMember.display_name })
                 : ""}
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
-            <AlertDialogCancel disabled={pendingUserId !== null}>取消</AlertDialogCancel>
+            <AlertDialogCancel disabled={pendingUserId !== null}>{t({ en: "Cancel", "zh-CN": "取消", ja: "キャンセル", ko: "취소" })}</AlertDialogCancel>
             <AlertDialogAction
               onClick={(event) => {
                 event.preventDefault();
@@ -438,22 +482,11 @@ export function ProjectMembersPanel({
               ) : (
                 <Trash2 aria-hidden="true" />
               )}
-              移除
+              {t({ en: "Remove", "zh-CN": "移除", ja: "削除", ko: "제거" })}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
     </div>
   );
-}
-
-async function responseMessage(response: Response) {
-  const body = (await response.json().catch(() => null)) as
-    | { error?: string | { message?: string } }
-    | null;
-  if (typeof body?.error === "string") return body.error;
-  if (body?.error && typeof body.error === "object" && body.error.message) {
-    return body.error.message;
-  }
-  return `请求失败 (${response.status})`;
 }

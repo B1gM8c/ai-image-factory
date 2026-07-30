@@ -40,6 +40,7 @@ import {
 } from "@/components/ui/table";
 import { Textarea } from "@/components/ui/textarea";
 import { useAdminQuery } from "@/hooks/use-admin-query";
+import { useI18n } from "@/i18n/locale-provider";
 import {
   decimalToMicros,
   formatDateTime,
@@ -54,6 +55,7 @@ import type {
 import { consoleFetch } from "@/lib/auth/client";
 
 const PAGE_SIZE = 20;
+type Translate = ReturnType<typeof useI18n>["t"];
 
 export function BillingAccountControlSheet({
   open,
@@ -64,6 +66,7 @@ export function BillingAccountControlSheet({
   onOpenChange: (open: boolean) => void;
   onUpdated: () => void;
 }) {
+  const { t } = useI18n();
   const [currency, setCurrency] = useState("USD");
   const [search, setSearch] = useState("");
   const [debouncedSearch, setDebouncedSearch] = useState("");
@@ -126,11 +129,25 @@ export function BillingAccountControlSheet({
     if (!selected) return;
     const creditLimitMicros = decimalToMicros(limit, { allowZero: true });
     if (creditLimitMicros === null) {
-      setSaveError("请输入不小于 0、最多 6 位小数的金额");
+      setSaveError(
+        t({
+          en: "Enter an amount of 0 or more with no more than 6 decimal places",
+          "zh-CN": "请输入不小于 0、最多 6 位小数的金额",
+          ja: "0 以上で小数点以下 6 桁以内の金額を入力してください",
+          ko: "0 이상이며 소수점 이하 6자리 이내인 금액을 입력하세요",
+        }),
+      );
       return;
     }
     if (reason.trim().length < 3) {
-      setSaveError("请填写至少 3 个字符的变更原因");
+      setSaveError(
+        t({
+          en: "Enter a reason with at least 3 characters",
+          "zh-CN": "请填写至少 3 个字符的变更原因",
+          ja: "変更理由を 3 文字以上で入力してください",
+          ko: "변경 사유를 3자 이상 입력하세요",
+        }),
+      );
       return;
     }
     setSaving(true);
@@ -150,15 +167,31 @@ export function BillingAccountControlSheet({
           }),
         },
       );
-      if (!response.ok) throw new Error(await responseMessage(response));
+      if (!response.ok) throw new Error(await responseMessage(response, t));
       const account = (await response.json()) as BillingAccountControlView;
       setSelected((current) => (current ? { ...current, account } : current));
       query.retry();
       onUpdated();
-      toast.success("组织限额已更新");
+      toast.success(
+        t({
+          en: "Organization limit updated",
+          "zh-CN": "组织限额已更新",
+          ja: "組織の上限を更新しました",
+          ko: "조직 한도가 업데이트되었습니다",
+        }),
+      );
       setSelected(null);
     } catch (caught) {
-      setSaveError(caught instanceof Error ? caught.message : "组织限额保存失败");
+      setSaveError(
+        caught instanceof Error
+          ? caught.message
+          : t({
+              en: "Organization limit could not be saved",
+              "zh-CN": "组织限额保存失败",
+              ja: "組織の上限を保存できませんでした",
+              ko: "조직 한도를 저장하지 못했습니다",
+            }),
+      );
     } finally {
       setSaving(false);
     }
@@ -175,7 +208,12 @@ export function BillingAccountControlSheet({
                 variant="ghost"
                 size="icon"
                 className="-ml-2 mt-[-6px] shrink-0"
-                aria-label="返回组织列表"
+                aria-label={t({
+                  en: "Back to organizations",
+                  "zh-CN": "返回组织列表",
+                  ja: "組織一覧に戻る",
+                  ko: "조직 목록으로 돌아가기",
+                })}
                 onClick={() => setSelected(null)}
               >
                 <ArrowLeft aria-hidden="true" />
@@ -183,12 +221,23 @@ export function BillingAccountControlSheet({
             ) : null}
             <div className="min-w-0">
               <SheetTitle className="truncate">
-                {selected?.display_name ?? "组织限额"}
+                {selected?.display_name ??
+                  t({
+                    en: "Organization limits",
+                    "zh-CN": "组织限额",
+                    ja: "組織の上限",
+                    ko: "조직 한도",
+                  })}
               </SheetTitle>
               <SheetDescription className="truncate">
                 {selected
                   ? `${selected.organization_id} · ${currency}`
-                  : "平台计费准入"}
+                  : t({
+                      en: "Platform billing access",
+                      "zh-CN": "平台计费准入",
+                      ja: "プラットフォームの請求アクセス",
+                      ko: "플랫폼 결제 접근",
+                    })}
               </SheetDescription>
             </div>
           </div>
@@ -235,7 +284,12 @@ export function BillingAccountControlSheet({
               onClick={closeOrBack}
               disabled={saving}
             >
-              取消
+              {t({
+                en: "Cancel",
+                "zh-CN": "取消",
+                ja: "キャンセル",
+                ko: "취소",
+              })}
             </Button>
             <Button type="button" onClick={() => void save()} disabled={saving}>
               {saving ? (
@@ -243,7 +297,12 @@ export function BillingAccountControlSheet({
               ) : (
                 <Save aria-hidden="true" />
               )}
-              保存限额
+              {t({
+                en: "Save limit",
+                "zh-CN": "保存限额",
+                ja: "上限を保存",
+                ko: "한도 저장",
+              })}
             </Button>
           </SheetFooter>
         ) : null}
@@ -273,6 +332,8 @@ function AccountList({
   onPrevious: () => void;
   onNext: () => void;
 }) {
+  const { t } = useI18n();
+
   return (
     <div className="flex min-h-0 flex-1 flex-col">
       <div className="flex shrink-0 flex-col gap-3 border-b px-5 py-4 sm:flex-row sm:px-6">
@@ -285,12 +346,30 @@ function AccountList({
             className="pl-9"
             value={search}
             onChange={(event) => onSearchChange(event.target.value)}
-            placeholder="搜索组织名称或 ID"
-            aria-label="搜索组织"
+            placeholder={t({
+              en: "Search organization name or ID",
+              "zh-CN": "搜索组织名称或 ID",
+              ja: "組織名または ID を検索",
+              ko: "조직 이름 또는 ID 검색",
+            })}
+            aria-label={t({
+              en: "Search organizations",
+              "zh-CN": "搜索组织",
+              ja: "組織を検索",
+              ko: "조직 검색",
+            })}
           />
         </div>
         <Select value={currency} onValueChange={onCurrencyChange}>
-          <SelectTrigger className="w-full sm:w-28" aria-label="选择币种">
+          <SelectTrigger
+            className="w-full sm:w-28"
+            aria-label={t({
+              en: "Select currency",
+              "zh-CN": "选择币种",
+              ja: "通貨を選択",
+              ko: "통화 선택",
+            })}
+          >
             <SelectValue />
           </SelectTrigger>
           <SelectContent>
@@ -304,11 +383,36 @@ function AccountList({
         <Table className="min-w-[760px]">
           <TableHeader>
             <TableRow>
-              <TableHead className="pl-6">组织</TableHead>
-              <TableHead>状态</TableHead>
-              <TableHead className="text-right">限额</TableHead>
-              <TableHead className="text-right">可用</TableHead>
-              <TableHead className="pr-6 text-right">操作</TableHead>
+              <TableHead className="pl-6">
+                {t({
+                  en: "Organization",
+                  "zh-CN": "组织",
+                  ja: "組織",
+                  ko: "조직",
+                })}
+              </TableHead>
+              <TableHead>
+                {t({ en: "Status", "zh-CN": "状态", ja: "状態", ko: "상태" })}
+              </TableHead>
+              <TableHead className="text-right">
+                {t({ en: "Limit", "zh-CN": "限额", ja: "上限", ko: "한도" })}
+              </TableHead>
+              <TableHead className="text-right">
+                {t({
+                  en: "Available",
+                  "zh-CN": "可用",
+                  ja: "利用可能",
+                  ko: "사용 가능",
+                })}
+              </TableHead>
+              <TableHead className="pr-6 text-right">
+                {t({
+                  en: "Actions",
+                  "zh-CN": "操作",
+                  ja: "操作",
+                  ko: "작업",
+                })}
+              </TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
@@ -322,14 +426,26 @@ function AccountList({
                     className="mx-auto mb-2 size-5 animate-spin"
                     aria-hidden="true"
                   />
-                  正在加载组织
+                  {t({
+                    en: "Loading organizations",
+                    "zh-CN": "正在加载组织",
+                    ja: "組織を読み込み中",
+                    ko: "조직 불러오는 중",
+                  })}
                 </TableCell>
               </TableRow>
             ) : null}
             {!query.loading && query.error ? (
               <TableRow>
                 <TableCell colSpan={5} className="h-40 text-center">
-                  <p className="font-medium">组织限额加载失败</p>
+                  <p className="font-medium">
+                    {t({
+                      en: "Organization limits could not be loaded",
+                      "zh-CN": "组织限额加载失败",
+                      ja: "組織の上限を読み込めませんでした",
+                      ko: "조직 한도를 불러오지 못했습니다",
+                    })}
+                  </p>
                   <p className="mt-1 text-sm text-muted-foreground">
                     {query.error.message}
                   </p>
@@ -340,7 +456,12 @@ function AccountList({
                     className="mt-3"
                     onClick={query.retry}
                   >
-                    重新加载
+                    {t({
+                      en: "Reload",
+                      "zh-CN": "重新加载",
+                      ja: "再読み込み",
+                      ko: "다시 불러오기",
+                    })}
                   </Button>
                 </TableCell>
               </TableRow>
@@ -351,7 +472,12 @@ function AccountList({
                   colSpan={5}
                   className="h-40 text-center text-muted-foreground"
                 >
-                  没有匹配的组织
+                  {t({
+                    en: "No matching organizations",
+                    "zh-CN": "没有匹配的组织",
+                    ja: "一致する組織はありません",
+                    ko: "일치하는 조직이 없습니다",
+                  })}
                 </TableCell>
               </TableRow>
             ) : null}
@@ -365,7 +491,19 @@ function AccountList({
                 </TableCell>
                 <TableCell>
                   <Badge variant={item.account.configured ? "secondary" : "outline"}>
-                    {item.account.configured ? "已配置" : "未配置"}
+                    {item.account.configured
+                      ? t({
+                          en: "Configured",
+                          "zh-CN": "已配置",
+                          ja: "設定済み",
+                          ko: "구성됨",
+                        })
+                      : t({
+                          en: "Not configured",
+                          "zh-CN": "未配置",
+                          ja: "未設定",
+                          ko: "구성되지 않음",
+                        })}
                   </Badge>
                 </TableCell>
                 <TableCell className="text-right font-mono tabular-nums">
@@ -388,7 +526,12 @@ function AccountList({
                     onClick={() => onSelect(item)}
                   >
                     <SlidersHorizontal aria-hidden="true" />
-                    设置
+                    {t({
+                      en: "Configure",
+                      "zh-CN": "设置",
+                      ja: "設定",
+                      ko: "설정",
+                    })}
                   </Button>
                 </TableCell>
               </TableRow>
@@ -398,7 +541,17 @@ function AccountList({
       </div>
 
       <div className="flex shrink-0 items-center justify-between border-t px-5 py-3 sm:px-6">
-        <span className="text-sm text-muted-foreground">第 {page} 页</span>
+        <span className="text-sm text-muted-foreground">
+          {t(
+            {
+              en: "Page {page}",
+              "zh-CN": "第 {page} 页",
+              ja: "{page} ページ",
+              ko: "{page}페이지",
+            },
+            { page },
+          )}
+        </span>
         <div className="flex gap-2">
           <Button
             type="button"
@@ -408,7 +561,12 @@ function AccountList({
             disabled={page === 1 || query.refreshing}
           >
             <ChevronLeft aria-hidden="true" />
-            上一页
+            {t({
+              en: "Previous",
+              "zh-CN": "上一页",
+              ja: "前へ",
+              ko: "이전",
+            })}
           </Button>
           <Button
             type="button"
@@ -417,7 +575,12 @@ function AccountList({
             onClick={onNext}
             disabled={!query.data?.has_more || query.refreshing}
           >
-            下一页
+            {t({
+              en: "Next",
+              "zh-CN": "下一页",
+              ja: "次へ",
+              ko: "다음",
+            })}
             <ChevronRight aria-hidden="true" />
           </Button>
         </div>
@@ -445,28 +608,54 @@ function AccountEditor({
   onLimitChange: (value: string) => void;
   onReasonChange: (value: string) => void;
 }) {
+  const { locale, t } = useI18n();
   const account = item.account;
   return (
     <div className="min-h-0 flex-1 overflow-y-auto px-5 py-6 sm:px-6">
       <div className="grid gap-x-8 gap-y-5 rounded-md bg-muted/30 p-4 sm:grid-cols-3">
         <AccountMetric
-          label="消费上限"
+          label={t({
+            en: "Spending limit",
+            "zh-CN": "消费上限",
+            ja: "利用上限",
+            ko: "지출 한도",
+          })}
           value={formatMoneyMicros(account.credit_limit_micros, currency)}
         />
         <AccountMetric
-          label="已占用"
+          label={t({
+            en: "Reserved",
+            "zh-CN": "已占用",
+            ja: "予約済み",
+            ko: "예약됨",
+          })}
           value={formatMoneyMicros(account.held_micros, currency)}
         />
         <AccountMetric
-          label="累计扣费"
+          label={t({
+            en: "Captured",
+            "zh-CN": "累计扣费",
+            ja: "確定済み",
+            ko: "결제 확정",
+          })}
           value={formatMoneyMicros(account.captured_micros, currency)}
         />
         <AccountMetric
-          label="已退款"
+          label={t({
+            en: "Refunded",
+            "zh-CN": "已退款",
+            ja: "返金済み",
+            ko: "환불됨",
+          })}
           value={formatMoneyMicros(account.refunded_micros, currency)}
         />
         <AccountMetric
-          label="净支出"
+          label={t({
+            en: "Net spend",
+            "zh-CN": "净支出",
+            ja: "純支出",
+            ko: "순 지출",
+          })}
           value={formatMoneyMicros(
             (
               parseMicros(account.captured_micros) -
@@ -476,14 +665,26 @@ function AccountEditor({
           )}
         />
         <AccountMetric
-          label="可用"
+          label={t({
+            en: "Available",
+            "zh-CN": "可用",
+            ja: "利用可能",
+            ko: "사용 가능",
+          })}
           value={formatMoneyMicros(account.available_micros, currency)}
         />
       </div>
 
       <div className="mt-7 grid gap-6">
         <div className="grid gap-2">
-          <Label htmlFor="billing-credit-limit">新的消费上限</Label>
+          <Label htmlFor="billing-credit-limit">
+            {t({
+              en: "New spending limit",
+              "zh-CN": "新的消费上限",
+              ja: "新しい利用上限",
+              ko: "새 지출 한도",
+            })}
+          </Label>
           <div className="flex">
             <span className="flex h-9 items-center rounded-l-md border border-r-0 bg-muted px-3 text-sm text-muted-foreground">
               {currency}
@@ -498,17 +699,34 @@ function AccountEditor({
             />
           </div>
           <p className="text-xs text-muted-foreground">
-            设为 0 将停止该组织的新计费请求；已有占用和已结算金额不会被回退。
+            {t({
+              en: "Set this to 0 to stop new billable requests for this organization. Existing reservations and settled amounts will not be reversed.",
+              "zh-CN": "设为 0 将停止该组织的新计费请求；已有占用和已结算金额不会被回退。",
+              ja: "0 に設定すると、この組織の新しい課金対象リクエストを停止します。既存の予約額と確定額は取り消されません。",
+              ko: "0으로 설정하면 이 조직의 새로운 유료 요청이 중지됩니다. 기존 예약 및 정산 금액은 되돌려지지 않습니다.",
+            })}
           </p>
         </div>
 
         <div className="grid gap-2">
-          <Label htmlFor="billing-credit-reason">变更原因</Label>
+          <Label htmlFor="billing-credit-reason">
+            {t({
+              en: "Reason for change",
+              "zh-CN": "变更原因",
+              ja: "変更理由",
+              ko: "변경 사유",
+            })}
+          </Label>
           <Textarea
             id="billing-credit-reason"
             value={reason}
             onChange={(event) => onReasonChange(event.target.value)}
-            placeholder="例如：财务审批单 FIN-2026-042"
+            placeholder={t({
+              en: "For example: Finance approval FIN-2026-042",
+              "zh-CN": "例如：财务审批单 FIN-2026-042",
+              ja: "例: 財務承認 FIN-2026-042",
+              ko: "예: 재무 승인 FIN-2026-042",
+            })}
             maxLength={500}
             disabled={saving}
           />
@@ -521,10 +739,24 @@ function AccountEditor({
         ) : null}
 
         <dl className="grid gap-3 border-t pt-5 text-sm sm:grid-cols-2">
-          <Definition label="控制版本" value={account.control_version} mono />
           <Definition
-            label="最后更新"
-            value={formatDateTime(account.updated_at_ms)}
+            label={t({
+              en: "Control version",
+              "zh-CN": "控制版本",
+              ja: "制御バージョン",
+              ko: "제어 버전",
+            })}
+            value={account.control_version}
+            mono
+          />
+          <Definition
+            label={t({
+              en: "Last updated",
+              "zh-CN": "最后更新",
+              ja: "最終更新",
+              ko: "마지막 업데이트",
+            })}
+            value={formatDateTime(account.updated_at_ms, locale)}
           />
         </dl>
       </div>
@@ -568,14 +800,34 @@ function Definition({
   );
 }
 
-async function responseMessage(response: Response) {
+async function responseMessage(response: Response, t: Translate) {
   try {
     const body = (await response.json()) as {
       error?: { message?: string };
       message?: string;
     };
-    return body.error?.message ?? body.message ?? `请求失败（${response.status}）`;
+    return (
+      body.error?.message ??
+      body.message ??
+      t(
+        {
+          en: "Request failed ({status})",
+          "zh-CN": "请求失败（{status}）",
+          ja: "リクエストに失敗しました（{status}）",
+          ko: "요청 실패({status})",
+        },
+        { status: response.status },
+      )
+    );
   } catch {
-    return `请求失败（${response.status}）`;
+    return t(
+      {
+        en: "Request failed ({status})",
+        "zh-CN": "请求失败（{status}）",
+        ja: "リクエストに失敗しました（{status}）",
+        ko: "요청 실패({status})",
+      },
+      { status: response.status },
+    );
   }
 }

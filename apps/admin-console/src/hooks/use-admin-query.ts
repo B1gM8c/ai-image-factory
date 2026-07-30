@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
+import { useI18n } from "@/i18n/locale-provider";
 import { AdminApiError, fetchAdminJson } from "@/lib/admin/client";
 
 type AdminQueryState<T> = {
@@ -16,6 +17,7 @@ export function useAdminQuery<T>(
   enabled = true,
   refreshIntervalMs?: number,
 ): AdminQueryState<T> {
+  const { t } = useI18n();
   const [data, setData] = useState<T | null>(null);
   const [error, setError] = useState<AdminApiError | null>(null);
   const [request, setRequest] = useState(0);
@@ -40,14 +42,22 @@ export function useAdminQuery<T>(
         setError(
           caught instanceof AdminApiError
             ? caught
-            : new AdminApiError("管理数据暂时不可用", 0),
+            : new AdminApiError(
+                t({
+                  en: "Admin data is temporarily unavailable",
+                  "zh-CN": "管理数据暂时不可用",
+                  ja: "管理データは一時的に利用できません",
+                  ko: "관리 데이터를 일시적으로 사용할 수 없습니다",
+                }),
+                0,
+              ),
         );
       })
       .finally(() => {
         if (!controller.signal.aborted) setPending(false);
       });
     return () => controller.abort();
-  }, [enabled, path, request]);
+  }, [enabled, path, request, t]);
 
   const retry = useCallback(() => setRequest((value) => value + 1), []);
 

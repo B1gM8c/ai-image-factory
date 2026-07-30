@@ -20,6 +20,7 @@ import type {
   ConsoleSessionStatus,
 } from "@/lib/auth/types";
 import { requiresProjectWorkspace } from "@/lib/navigation";
+import { useI18n } from "@/i18n/locale-provider";
 
 const WORKSPACE_STORAGE_KEY = "aif-console-workspace";
 
@@ -50,6 +51,7 @@ const ConsoleSessionContext = createContext<ConsoleSessionContextValue | null>(n
 
 export function ConsoleSessionProvider({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
+  const { t } = useI18n();
   const [session, setSession] = useState<ConsoleSessionStatus | null>(null);
   const [selectedWorkspaceKey, setSelectedWorkspaceKey] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -69,7 +71,36 @@ export function ConsoleSessionProvider({ children }: { children: React.ReactNode
     void reload();
   }, [reload]);
 
-  const workspaces = useMemo(() => buildWorkspaces(session), [session]);
+  const workspaces = useMemo(
+    () =>
+      buildWorkspaces(session, {
+        organization: t({
+          en: "Organization",
+          "zh-CN": "组织",
+          ja: "組織",
+          ko: "조직",
+        }),
+        platform: t({
+          en: "All projects",
+          "zh-CN": "全平台",
+          ja: "すべてのプロジェクト",
+          ko: "모든 프로젝트",
+        }),
+        platformDetail: t({
+          en: "Platform operations",
+          "zh-CN": "平台运营视图",
+          ja: "プラットフォーム運用",
+          ko: "플랫폼 운영",
+        }),
+        project: t({
+          en: "Project",
+          "zh-CN": "项目",
+          ja: "プロジェクト",
+          ko: "프로젝트",
+        }),
+      }),
+    [session, t],
+  );
 
   useEffect(() => {
     if (workspaces.length === 0) {
@@ -135,7 +166,15 @@ export function useConsoleSession() {
   return context;
 }
 
-function buildWorkspaces(session: ConsoleSessionStatus | null): ConsoleWorkspace[] {
+function buildWorkspaces(
+  session: ConsoleSessionStatus | null,
+  copy: {
+    organization: string;
+    platform: string;
+    platformDetail: string;
+    project: string;
+  },
+): ConsoleWorkspace[] {
   if (!session?.user) return [];
 
   const workspaces: ConsoleWorkspace[] = [];
@@ -145,8 +184,8 @@ function buildWorkspaces(session: ConsoleSessionStatus | null): ConsoleWorkspace
       kind: "platform",
       id: null,
       organizationId: null,
-      name: "全平台",
-      detail: "平台运营视图",
+      name: copy.platform,
+      detail: copy.platformDetail,
       role: "platform_owner",
     });
   }
@@ -162,7 +201,7 @@ function buildWorkspaces(session: ConsoleSessionStatus | null): ConsoleWorkspace
       id: project.id,
       organizationId: project.organization_id,
       name: project.name,
-      detail: organizations.get(project.organization_id)?.name ?? "项目",
+      detail: organizations.get(project.organization_id)?.name ?? copy.project,
       role: project.role,
     });
   }
@@ -175,7 +214,7 @@ function buildWorkspaces(session: ConsoleSessionStatus | null): ConsoleWorkspace
       id: organization.id,
       organizationId: organization.id,
       name: organization.name,
-      detail: "组织",
+      detail: copy.organization,
       role: organization.role,
     });
   }

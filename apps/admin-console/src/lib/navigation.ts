@@ -15,9 +15,10 @@ import {
   Video,
   type LucideIcon,
 } from "lucide-react";
+import type { LocalizedText } from "@/i18n/config";
 
 export type NavigationItem = {
-  title: string;
+  title: LocalizedText;
   href: string;
   icon: LucideIcon;
   capability: string;
@@ -25,22 +26,37 @@ export type NavigationItem = {
 };
 
 export type NavigationGroup = {
-  label: string;
+  label: LocalizedText;
   items: NavigationItem[];
 };
 
 const navigationGroups: NavigationGroup[] = [
   {
-    label: "创作",
+    label: {
+      en: "Create",
+      "zh-CN": "创作",
+      ja: "作成",
+      ko: "만들기",
+    },
     items: [
       {
-        title: "图片",
+        title: {
+          en: "Images",
+          "zh-CN": "图片",
+          ja: "画像",
+          ko: "이미지",
+        },
         href: "/images",
         icon: Images,
         capability: "workspace:write",
       },
       {
-        title: "视频",
+        title: {
+          en: "Videos",
+          "zh-CN": "视频",
+          ja: "動画",
+          ko: "동영상",
+        },
         href: "/videos",
         icon: Video,
         capability: "workspace:write",
@@ -48,22 +64,42 @@ const navigationGroups: NavigationGroup[] = [
     ],
   },
   {
-    label: "工作区",
+    label: {
+      en: "Workspace",
+      "zh-CN": "工作区",
+      ja: "ワークスペース",
+      ko: "워크스페이스",
+    },
     items: [
       {
-        title: "运营总览",
+        title: {
+          en: "Overview",
+          "zh-CN": "运营总览",
+          ja: "概要",
+          ko: "개요",
+        },
         href: "/overview",
         icon: Activity,
         capability: "console:read",
       },
       {
-        title: "API 调用记录",
+        title: {
+          en: "API activity",
+          "zh-CN": "API 调用记录",
+          ja: "API アクティビティ",
+          ko: "API 활동",
+        },
         href: "/activity",
         icon: ListChecks,
         capability: "console:read",
       },
       {
-        title: "用量",
+        title: {
+          en: "Usage",
+          "zh-CN": "用量",
+          ja: "使用量",
+          ko: "사용량",
+        },
         href: "/billing",
         icon: CircleDollarSign,
         capability: "billing:read",
@@ -71,10 +107,20 @@ const navigationGroups: NavigationGroup[] = [
     ],
   },
   {
-    label: "供应能力",
+    label: {
+      en: "Providers",
+      "zh-CN": "供应能力",
+      ja: "プロバイダー",
+      ko: "공급자",
+    },
     items: [
       {
-        title: "模型与能力",
+        title: {
+          en: "Models",
+          "zh-CN": "模型与能力",
+          ja: "モデル",
+          ko: "모델",
+        },
         href: "/providers",
         icon: Boxes,
         capability: "console:read",
@@ -82,16 +128,31 @@ const navigationGroups: NavigationGroup[] = [
     ],
   },
   {
-    label: "开发者",
+    label: {
+      en: "Developers",
+      "zh-CN": "开发者",
+      ja: "開発者",
+      ko: "개발자",
+    },
     items: [
       {
-        title: "API Keys",
+        title: {
+          en: "API keys",
+          "zh-CN": "API Keys",
+          ja: "API キー",
+          ko: "API 키",
+        },
         href: "/keys",
         icon: KeyRound,
         capability: "projects:read",
       },
       {
-        title: "批处理",
+        title: {
+          en: "Batches",
+          "zh-CN": "批处理",
+          ja: "バッチ",
+          ko: "배치",
+        },
         href: "/batches",
         icon: Files,
         capability: "projects:read",
@@ -99,45 +160,80 @@ const navigationGroups: NavigationGroup[] = [
     ],
   },
   {
-    label: "平台运营",
+    label: {
+      en: "Platform",
+      "zh-CN": "平台运营",
+      ja: "プラットフォーム",
+      ko: "플랫폼",
+    },
     items: [
       {
-        title: "模型定价",
+        title: {
+          en: "Model pricing",
+          "zh-CN": "模型定价",
+          ja: "モデル料金",
+          ko: "모델 요금",
+        },
         href: "/pricing",
         icon: Banknote,
         capability: "admin:*",
         platformOnly: true,
       },
       {
-        title: "用户与权限",
+        title: {
+          en: "Users and access",
+          "zh-CN": "用户与权限",
+          ja: "ユーザーと権限",
+          ko: "사용자 및 권한",
+        },
         href: "/users",
         icon: UsersRound,
         capability: "users:manage",
         platformOnly: true,
       },
       {
-        title: "CLI 账号与额度",
+        title: {
+          en: "CLI accounts",
+          "zh-CN": "CLI 账号与额度",
+          ja: "CLI アカウント",
+          ko: "CLI 계정",
+        },
         href: "/provider-accounts",
         icon: TerminalSquare,
         capability: "providers:manage",
         platformOnly: true,
       },
       {
-        title: "任务队列",
+        title: {
+          en: "Task queue",
+          "zh-CN": "任务队列",
+          ja: "タスクキュー",
+          ko: "작업 대기열",
+        },
         href: "/scheduling",
         icon: ListTodo,
         capability: "scheduler:read",
         platformOnly: true,
       },
       {
-        title: "审计日志",
+        title: {
+          en: "Audit logs",
+          "zh-CN": "审计日志",
+          ja: "監査ログ",
+          ko: "감사 로그",
+        },
         href: "/audit-logs",
         icon: ScrollText,
         capability: "admin:*",
         platformOnly: true,
       },
       {
-        title: "系统状态",
+        title: {
+          en: "System status",
+          "zh-CN": "系统状态",
+          ja: "システム状態",
+          ko: "시스템 상태",
+        },
         href: "/system",
         icon: ServerCog,
         capability: "system:read",
@@ -161,13 +257,18 @@ export function navigationFor(
   });
 }
 
-export const pageTitles: Record<string, string> = {
+export const pageTitles: Record<string, LocalizedText> = {
   ...Object.fromEntries(
     navigationGroups.flatMap((group) =>
       group.items.map((item) => [item.href, item.title]),
     ),
   ),
-  "/projects": "项目",
+  "/projects": {
+    en: "Projects",
+    "zh-CN": "项目",
+    ja: "プロジェクト",
+    ko: "프로젝트",
+  },
 };
 
 export function requiresProjectWorkspace(pathname: string) {

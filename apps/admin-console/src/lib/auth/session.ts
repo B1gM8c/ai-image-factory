@@ -125,7 +125,7 @@ export async function publicSession(): Promise<PublicSession> {
       ? {
           id: "emergency",
           email: "development-emergency@localhost",
-          display_name: "开发应急管理员",
+          display_name: "Emergency administrator",
           roles: ["platform_owner"],
           scopes: ["admin:*"],
         }

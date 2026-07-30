@@ -18,6 +18,7 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
+import { useI18n } from "@/i18n/locale-provider";
 
 export type ImageChoiceControl = {
   default: string;
@@ -45,6 +46,8 @@ export function ImageControlsMenu({
   onOutputFormatChange: (value: string) => void;
   onBackgroundChange: (value: string) => void;
 }) {
+  const { t } = useI18n();
+
   if (!qualityControl && !outputFormatControl && !backgroundControl) return null;
 
   return (
@@ -57,28 +60,57 @@ export function ImageControlsMenu({
               size="icon"
               variant="ghost"
               className="size-8 bg-muted"
-              aria-label="图片参数"
+              aria-label={t({
+                en: "Image settings",
+                "zh-CN": "图片参数",
+                ja: "画像設定",
+                ko: "이미지 설정",
+              })}
             >
               <SlidersHorizontal aria-hidden="true" />
             </Button>
           </DropdownMenuTrigger>
         </TooltipTrigger>
-        <TooltipContent>图片参数</TooltipContent>
+        <TooltipContent>
+          {t({
+            en: "Image settings",
+            "zh-CN": "图片参数",
+            ja: "画像設定",
+            ko: "이미지 설정",
+          })}
+        </TooltipContent>
       </Tooltip>
       <DropdownMenuContent align="start" className="w-48">
-        <DropdownMenuLabel>图片参数</DropdownMenuLabel>
+        <DropdownMenuLabel>
+          {t({
+            en: "Image settings",
+            "zh-CN": "图片参数",
+            ja: "画像設定",
+            ko: "이미지 설정",
+          })}
+        </DropdownMenuLabel>
         {qualityControl ? (
           <ChoiceSubmenu
-            label="质量"
+            label={t({
+              en: "Quality",
+              "zh-CN": "质量",
+              ja: "品質",
+              ko: "품질",
+            })}
             value={quality}
             control={qualityControl}
             onValueChange={onQualityChange}
-            formatLabel={qualityLabel}
+            formatLabel={(value) => qualityLabel(value, t)}
           />
         ) : null}
         {outputFormatControl ? (
           <ChoiceSubmenu
-            label="格式"
+            label={t({
+              en: "Format",
+              "zh-CN": "格式",
+              ja: "形式",
+              ko: "형식",
+            })}
             value={outputFormat}
             control={outputFormatControl}
             onValueChange={onOutputFormatChange}
@@ -87,11 +119,16 @@ export function ImageControlsMenu({
         ) : null}
         {backgroundControl ? (
           <ChoiceSubmenu
-            label="背景"
+            label={t({
+              en: "Background",
+              "zh-CN": "背景",
+              ja: "背景",
+              ko: "배경",
+            })}
             value={background}
             control={backgroundControl}
             onValueChange={onBackgroundChange}
-            formatLabel={backgroundLabel}
+            formatLabel={(value) => backgroundLabel(value, t)}
           />
         ) : null}
       </DropdownMenuContent>
@@ -133,16 +170,35 @@ function ChoiceSubmenu({
   );
 }
 
-function qualityLabel(value: string) {
-  if (value === "auto") return "自动";
-  if (value === "high") return "高";
-  if (value === "medium") return "中";
-  if (value === "low") return "低";
+type Translate = ReturnType<typeof useI18n>["t"];
+
+function qualityLabel(value: string, t: Translate) {
+  if (value === "auto") {
+    return t({ en: "Auto", "zh-CN": "自动", ja: "自動", ko: "자동" });
+  }
+  if (value === "high") {
+    return t({ en: "High", "zh-CN": "高", ja: "高", ko: "높음" });
+  }
+  if (value === "medium") {
+    return t({ en: "Medium", "zh-CN": "中", ja: "中", ko: "중간" });
+  }
+  if (value === "low") {
+    return t({ en: "Low", "zh-CN": "低", ja: "低", ko: "낮음" });
+  }
   return value;
 }
 
-function backgroundLabel(value: string) {
-  if (value === "auto") return "自动";
-  if (value === "opaque") return "不透明";
+function backgroundLabel(value: string, t: Translate) {
+  if (value === "auto") {
+    return t({ en: "Auto", "zh-CN": "自动", ja: "自動", ko: "자동" });
+  }
+  if (value === "opaque") {
+    return t({
+      en: "Opaque",
+      "zh-CN": "不透明",
+      ja: "不透明",
+      ko: "불투명",
+    });
+  }
   return value;
 }

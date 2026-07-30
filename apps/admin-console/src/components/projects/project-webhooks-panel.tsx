@@ -53,7 +53,12 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
-import { consoleFetch } from "@/lib/auth/client";
+import { useI18n } from "@/i18n/locale-provider";
+import {
+  consoleFetch,
+  consoleRequestFailure,
+  consoleResponseFailure,
+} from "@/lib/auth/client";
 
 type EndpointList = {
   object: "list";
@@ -78,6 +83,7 @@ export function ProjectWebhooksPanel({
   canManage: boolean;
   active: boolean;
 }) {
+  const { locale, t } = useI18n();
   const [endpoints, setEndpoints] = useState<ProjectWebhookEndpoint[]>([]);
   const [loading, setLoading] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
@@ -99,13 +105,21 @@ export function ProjectWebhooksPanel({
   const loadEndpoints = useCallback(
     async (background = false) => {
       if (!active) return;
+      const failure = t({
+        en: "Failed to load webhooks.",
+        "zh-CN": "Webhook 加载失败。",
+        ja: "Webhook を読み込めませんでした。",
+        ko: "Webhook을 불러오지 못했습니다.",
+      });
       background ? setRefreshing(true) : setLoading(true);
       setError(null);
       try {
         const response = await consoleFetch(
           `/api/gateway/v1/organization/projects/${encodeURIComponent(projectId)}/webhooks?limit=100`,
         );
-        if (!response.ok) throw new Error(await responseMessage(response));
+        if (!response.ok) {
+          throw new Error(await consoleResponseFailure(response, failure, t));
+        }
         const payload = (await response.json()) as EndpointList;
         setEndpoints(payload.data);
         setSelected((current) =>
@@ -115,23 +129,31 @@ export function ProjectWebhooksPanel({
         );
       } catch (reason) {
         if (!background) setEndpoints([]);
-        setError(reason instanceof Error ? reason.message : "Webhook 加载失败");
+        setError(consoleRequestFailure(reason, failure, t));
       } finally {
         background ? setRefreshing(false) : setLoading(false);
       }
     },
-    [active, projectId],
+    [active, projectId, t],
   );
 
   const loadDeliveries = useCallback(async (endpointId: string, background = false) => {
     if (!active) return;
+    const failure = t({
+      en: "Failed to load delivery history.",
+      "zh-CN": "投递记录加载失败。",
+      ja: "配信履歴を読み込めませんでした。",
+      ko: "전송 기록을 불러오지 못했습니다.",
+    });
     if (!background) setDeliveriesLoading(true);
     setDeliveryError(null);
     try {
       const response = await consoleFetch(
         `/api/gateway/v1/organization/projects/${encodeURIComponent(projectId)}/webhooks/${encodeURIComponent(endpointId)}/deliveries?limit=100`,
       );
-      if (!response.ok) throw new Error(await responseMessage(response));
+      if (!response.ok) {
+        throw new Error(await consoleResponseFailure(response, failure, t));
+      }
       const payload = (await response.json()) as DeliveryList;
       setDeliveries(payload.data);
       if (
@@ -144,13 +166,11 @@ export function ProjectWebhooksPanel({
       }
     } catch (reason) {
       setDeliveries([]);
-      setDeliveryError(
-        reason instanceof Error ? reason.message : "投递记录加载失败",
-      );
+      setDeliveryError(consoleRequestFailure(reason, failure, t));
     } finally {
       if (!background) setDeliveriesLoading(false);
     }
-  }, [active, loadEndpoints, projectId]);
+  }, [active, loadEndpoints, projectId, t]);
 
   useEffect(() => {
     if (active) void loadEndpoints();
@@ -190,6 +210,12 @@ export function ProjectWebhooksPanel({
 
   async function toggleEndpoint(endpoint: ProjectWebhookEndpoint) {
     if (!canManage) return;
+    const failure = t({
+      en: "Failed to update the webhook status.",
+      "zh-CN": "Webhook 状态更新失败。",
+      ja: "Webhook のステータスを更新できませんでした。",
+      ko: "Webhook 상태를 업데이트하지 못했습니다.",
+    });
     setMutationPending(true);
     try {
       const response = await consoleFetch(
@@ -206,11 +232,15 @@ export function ProjectWebhooksPanel({
           }),
         },
       );
-      if (!response.ok) throw new Error(await responseMessage(response));
-      toast.success(endpoint.state === "active" ? "Webhook 已停用" : "Webhook 已启用");
+      if (!response.ok) {
+        throw new Error(await consoleResponseFailure(response, failure, t));
+      }
+      toast.success(endpoint.state === "active"
+        ? t({ en: "Webhook disabled", "zh-CN": "Webhook 已停用", ja: "Webhook を無効にしました", ko: "Webhook을 비활성화했습니다" })
+        : t({ en: "Webhook enabled", "zh-CN": "Webhook 已启用", ja: "Webhook を有効にしました", ko: "Webhook을 활성화했습니다" }));
       await loadEndpoints(true);
     } catch (reason) {
-      toast.error(reason instanceof Error ? reason.message : "状态更新失败");
+      toast.error(consoleRequestFailure(reason, failure, t));
     } finally {
       setMutationPending(false);
     }
@@ -218,18 +248,26 @@ export function ProjectWebhooksPanel({
 
   async function enqueueTest(endpoint: ProjectWebhookEndpoint) {
     if (!canManage) return;
+    const failure = t({
+      en: "Failed to create the test event.",
+      "zh-CN": "测试事件创建失败。",
+      ja: "テストイベントを作成できませんでした。",
+      ko: "테스트 이벤트를 만들지 못했습니다.",
+    });
     setMutationPending(true);
     try {
       const response = await consoleFetch(
         `/api/gateway/v1/organization/projects/${encodeURIComponent(projectId)}/webhooks/${encodeURIComponent(endpoint.id)}/test`,
         { method: "POST" },
       );
-      if (!response.ok) throw new Error(await responseMessage(response));
-      toast.success("测试事件已加入投递队列");
+      if (!response.ok) {
+        throw new Error(await consoleResponseFailure(response, failure, t));
+      }
+      toast.success(t({ en: "Test event queued for delivery", "zh-CN": "测试事件已加入投递队列", ja: "テストイベントを配信キューに追加しました", ko: "테스트 이벤트가 전송 대기열에 추가되었습니다" }));
       setSelected(endpoint);
       await Promise.all([loadEndpoints(true), loadDeliveries(endpoint.id)]);
     } catch (reason) {
-      toast.error(reason instanceof Error ? reason.message : "测试事件创建失败");
+      toast.error(consoleRequestFailure(reason, failure, t));
     } finally {
       setMutationPending(false);
     }
@@ -237,21 +275,29 @@ export function ProjectWebhooksPanel({
 
   async function rotateSecret() {
     if (!rotateTarget) return;
+    const failure = t({
+      en: "Failed to rotate the signing secret.",
+      "zh-CN": "签名密钥轮换失败。",
+      ja: "署名シークレットをローテーションできませんでした。",
+      ko: "서명 시크릿을 교체하지 못했습니다.",
+    });
     setMutationPending(true);
     try {
       const response = await consoleFetch(
         `/api/gateway/v1/organization/projects/${encodeURIComponent(projectId)}/webhooks/${encodeURIComponent(rotateTarget.id)}/rotate`,
         { method: "POST" },
       );
-      if (!response.ok) throw new Error(await responseMessage(response));
+      if (!response.ok) {
+        throw new Error(await consoleResponseFailure(response, failure, t));
+      }
       const payload = (await response.json()) as RotatedProjectWebhookSecret;
       setSecret(payload.signing_secret);
       setCopied(false);
       setRotateTarget(null);
       await loadEndpoints(true);
-      toast.success("签名密钥已轮换");
+      toast.success(t({ en: "Signing secret rotated", "zh-CN": "签名密钥已轮换", ja: "署名シークレットをローテーションしました", ko: "서명 시크릿을 교체했습니다" }));
     } catch (reason) {
-      toast.error(reason instanceof Error ? reason.message : "密钥轮换失败");
+      toast.error(consoleRequestFailure(reason, failure, t));
     } finally {
       setMutationPending(false);
     }
@@ -259,19 +305,27 @@ export function ProjectWebhooksPanel({
 
   async function deleteEndpoint() {
     if (!deleteTarget) return;
+    const failure = t({
+      en: "Failed to delete the webhook.",
+      "zh-CN": "Webhook 删除失败。",
+      ja: "Webhook を削除できませんでした。",
+      ko: "Webhook을 삭제하지 못했습니다.",
+    });
     setMutationPending(true);
     try {
       const response = await consoleFetch(
         `/api/gateway/v1/organization/projects/${encodeURIComponent(projectId)}/webhooks/${encodeURIComponent(deleteTarget.id)}`,
         { method: "DELETE" },
       );
-      if (!response.ok) throw new Error(await responseMessage(response));
+      if (!response.ok) {
+        throw new Error(await consoleResponseFailure(response, failure, t));
+      }
       if (selected?.id === deleteTarget.id) setSelected(null);
       setDeleteTarget(null);
       await loadEndpoints(true);
-      toast.success("Webhook 已删除");
+      toast.success(t({ en: "Webhook deleted", "zh-CN": "Webhook 已删除", ja: "Webhook を削除しました", ko: "Webhook을 삭제했습니다" }));
     } catch (reason) {
-      toast.error(reason instanceof Error ? reason.message : "Webhook 删除失败");
+      toast.error(consoleRequestFailure(reason, failure, t));
     } finally {
       setMutationPending(false);
     }
@@ -283,7 +337,7 @@ export function ProjectWebhooksPanel({
       await navigator.clipboard.writeText(secret);
       setCopied(true);
     } catch {
-      toast.error("复制失败，请手动选择密钥");
+      toast.error(t({ en: "Copy failed. Select and copy the secret manually.", "zh-CN": "复制失败，请手动选择密钥", ja: "コピーできませんでした。シークレットを手動で選択してコピーしてください。", ko: "복사하지 못했습니다. 시크릿을 직접 선택해 복사하세요." }));
     }
   }
 
@@ -299,7 +353,7 @@ export function ProjectWebhooksPanel({
               onClick={() => setSelected(null)}
             >
               <ArrowLeft aria-hidden="true" />
-              返回 Webhooks
+              {t({ en: "Back to webhooks", "zh-CN": "返回 Webhooks", ja: "Webhook に戻る", ko: "Webhook으로 돌아가기" })}
             </Button>
             <h3 className="truncate text-sm font-medium">
               {selected.name || endpointDisplayUrl(selected.url)}
@@ -319,18 +373,25 @@ export function ProjectWebhooksPanel({
             ) : (
               <RefreshCw aria-hidden="true" />
             )}
-            刷新
+            {t({ en: "Refresh", "zh-CN": "刷新", ja: "更新", ko: "새로고침" })}
           </Button>
         </div>
 
         <div className="grid gap-3 text-sm sm:grid-cols-[128px_1fr]">
-          <span className="text-muted-foreground">Endpoint URL</span>
+          <span className="text-muted-foreground">
+            {t({
+              en: "Endpoint URL",
+              "zh-CN": "端点 URL",
+              ja: "エンドポイント URL",
+              ko: "엔드포인트 URL",
+            })}
+          </span>
           <span className="break-all font-mono text-xs">{selected.url}</span>
-          <span className="text-muted-foreground">订阅事件</span>
+          <span className="text-muted-foreground">{t({ en: "Events", "zh-CN": "订阅事件", ja: "購読イベント", ko: "구독 이벤트" })}</span>
           <div className="flex flex-wrap gap-1.5">
             {selected.event_types.map((eventType) => (
               <Badge key={eventType} variant="outline">
-                {WEBHOOK_EVENT_LABELS[eventType]}
+                {t(WEBHOOK_EVENT_LABELS[eventType])}
               </Badge>
             ))}
           </div>
@@ -340,18 +401,18 @@ export function ProjectWebhooksPanel({
           <Table>
             <TableHeader>
               <TableRow>
-                <TableHead>事件</TableHead>
-                <TableHead>状态</TableHead>
+                <TableHead>{t({ en: "Event", "zh-CN": "事件", ja: "イベント", ko: "이벤트" })}</TableHead>
+                <TableHead>{t({ en: "Status", "zh-CN": "状态", ja: "ステータス", ko: "상태" })}</TableHead>
                 <TableHead className="hidden md:table-cell">HTTP</TableHead>
-                <TableHead className="hidden md:table-cell">尝试</TableHead>
-                <TableHead className="text-right">更新时间</TableHead>
+                <TableHead className="hidden md:table-cell">{t({ en: "Attempts", "zh-CN": "尝试", ja: "試行回数", ko: "시도 횟수" })}</TableHead>
+                <TableHead className="text-right">{t({ en: "Updated", "zh-CN": "更新时间", ja: "更新日時", ko: "업데이트 시간" })}</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
               {deliveries.map((delivery) => (
                 <TableRow key={delivery.id}>
                   <TableCell>
-                    <div className="font-medium">{eventLabel(delivery.event_type)}</div>
+                    <div className="font-medium">{eventLabel(delivery.event_type, t)}</div>
                     <div className="max-w-56 truncate font-mono text-xs text-muted-foreground">
                       {delivery.event_id}
                     </div>
@@ -371,14 +432,14 @@ export function ProjectWebhooksPanel({
                     {delivery.attempt_count}
                   </TableCell>
                   <TableCell className="text-right text-muted-foreground">
-                    {formatTime(delivery.updated_at_ms)}
+                    {formatTime(delivery.updated_at_ms, locale)}
                   </TableCell>
                 </TableRow>
               ))}
               {!deliveriesLoading && deliveries.length === 0 ? (
                 <TableRow>
                   <TableCell colSpan={5} className="h-32 text-center text-muted-foreground">
-                    {deliveryError ?? "尚无投递记录"}
+                    {deliveryError ?? t({ en: "No delivery history", "zh-CN": "尚无投递记录", ja: "配信履歴はありません", ko: "전송 기록이 없습니다" })}
                   </TableCell>
                 </TableRow>
               ) : null}
@@ -394,9 +455,16 @@ export function ProjectWebhooksPanel({
       <div className="space-y-5 px-5 py-6 sm:px-6">
         <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
           <div>
-            <h3 className="text-sm font-medium">Webhooks</h3>
+            <h3 className="text-sm font-medium">
+              {t({
+                en: "Webhooks",
+                "zh-CN": "Webhook",
+                ja: "Webhook",
+                ko: "Webhook",
+              })}
+            </h3>
             <p className="mt-1 text-sm text-muted-foreground">
-              使用签名 HTTP 请求把项目中的图片和视频事件发送到你的服务。
+              {t({ en: "Send image and video events from this project to your service with signed HTTP requests.", "zh-CN": "使用签名 HTTP 请求把项目中的图片和视频事件发送到你的服务。", ja: "署名付き HTTP リクエストで、このプロジェクトの画像・動画イベントをサービスに送信します。", ko: "서명된 HTTP 요청으로 이 프로젝트의 이미지 및 동영상 이벤트를 서비스에 전송합니다." })}
             </p>
           </div>
           <div className="flex shrink-0 gap-2">
@@ -405,8 +473,8 @@ export function ProjectWebhooksPanel({
               size="icon"
               disabled={refreshing || loading}
               onClick={() => void loadEndpoints(true)}
-              aria-label="刷新 Webhooks"
-              title="刷新 Webhooks"
+              aria-label={t({ en: "Refresh webhooks", "zh-CN": "刷新 Webhooks", ja: "Webhook を更新", ko: "Webhook 새로고침" })}
+              title={t({ en: "Refresh webhooks", "zh-CN": "刷新 Webhooks", ja: "Webhook を更新", ko: "Webhook 새로고침" })}
             >
               {refreshing ? (
                 <LoaderCircle className="animate-spin" aria-hidden="true" />
@@ -422,7 +490,7 @@ export function ProjectWebhooksPanel({
                 }}
               >
                 <Plus aria-hidden="true" />
-                创建 Webhook
+                {t({ en: "Create webhook", "zh-CN": "创建 Webhook", ja: "Webhook を作成", ko: "Webhook 만들기" })}
               </Button>
             ) : null}
           </div>
@@ -430,15 +498,15 @@ export function ProjectWebhooksPanel({
 
         {loading ? (
           <div className="grid min-h-48 place-items-center text-muted-foreground">
-            <LoaderCircle className="size-5 animate-spin" aria-label="正在加载 Webhooks" />
+            <LoaderCircle className="size-5 animate-spin" aria-label={t({ en: "Loading webhooks", "zh-CN": "正在加载 Webhooks", ja: "Webhook を読み込み中", ko: "Webhook 불러오는 중" })} />
           </div>
         ) : endpoints.length === 0 ? (
           <div className="grid min-h-56 place-items-center border border-dashed px-6 text-center">
             <div className="max-w-sm">
               <Webhook className="mx-auto mb-3 size-6 text-muted-foreground" aria-hidden="true" />
-              <p className="text-sm font-medium">尚未创建 Webhook</p>
+              <p className="text-sm font-medium">{t({ en: "No webhooks yet", "zh-CN": "尚未创建 Webhook", ja: "Webhook はまだありません", ko: "아직 Webhook이 없습니다" })}</p>
               <p className="mt-1 text-sm text-muted-foreground">
-                创建 Endpoint 后即可订阅项目事件并查看每次投递。
+                {t({ en: "Create an endpoint to subscribe to project events and inspect each delivery.", "zh-CN": "创建端点后即可订阅项目事件并查看每次投递。", ja: "エンドポイントを作成すると、プロジェクトイベントを購読し、各配信を確認できます。", ko: "엔드포인트를 만들면 프로젝트 이벤트를 구독하고 각 전송을 확인할 수 있습니다." })}
               </p>
               {canManage ? (
                 <Button
@@ -447,7 +515,7 @@ export function ProjectWebhooksPanel({
                   onClick={() => setDialogOpen(true)}
                 >
                   <Plus aria-hidden="true" />
-                  创建 Webhook
+                  {t({ en: "Create webhook", "zh-CN": "创建 Webhook", ja: "Webhook を作成", ko: "Webhook 만들기" })}
                 </Button>
               ) : null}
             </div>
@@ -457,12 +525,19 @@ export function ProjectWebhooksPanel({
             <Table>
               <TableHeader>
                 <TableRow>
-                  <TableHead>Endpoint</TableHead>
-                  <TableHead className="hidden lg:table-cell">订阅事件</TableHead>
-                  <TableHead>状态</TableHead>
-                  <TableHead className="hidden sm:table-cell">最近投递</TableHead>
+                  <TableHead>
+                    {t({
+                      en: "Endpoint",
+                      "zh-CN": "端点",
+                      ja: "エンドポイント",
+                      ko: "엔드포인트",
+                    })}
+                  </TableHead>
+                  <TableHead className="hidden lg:table-cell">{t({ en: "Events", "zh-CN": "订阅事件", ja: "購読イベント", ko: "구독 이벤트" })}</TableHead>
+                  <TableHead>{t({ en: "Status", "zh-CN": "状态", ja: "ステータス", ko: "상태" })}</TableHead>
+                  <TableHead className="hidden sm:table-cell">{t({ en: "Latest delivery", "zh-CN": "最近投递", ja: "最新の配信", ko: "최근 전송" })}</TableHead>
                   <TableHead className="w-12">
-                    <span className="sr-only">操作</span>
+                    <span className="sr-only">{t({ en: "Actions", "zh-CN": "操作", ja: "操作", ko: "작업" })}</span>
                   </TableHead>
                 </TableRow>
               </TableHeader>
@@ -485,15 +560,17 @@ export function ProjectWebhooksPanel({
                     </TableCell>
                     <TableCell className="hidden lg:table-cell">
                       <span className="text-sm">
-                        {WEBHOOK_EVENT_LABELS[endpoint.event_types[0]]}
+                        {t(WEBHOOK_EVENT_LABELS[endpoint.event_types[0]])}
                         {endpoint.event_types.length > 1
-                          ? ` 等 ${endpoint.event_types.length} 项`
+                          ? t({ en: " and {count} more", "zh-CN": " 等 {count} 项", ja: "、ほか {count} 件", ko: " 외 {count}개" }, { count: endpoint.event_types.length - 1 })
                           : ""}
                       </span>
                     </TableCell>
                     <TableCell>
                       <Badge variant={endpoint.state === "active" ? "secondary" : "outline"}>
-                        {endpoint.state === "active" ? "启用" : "已停用"}
+                        {endpoint.state === "active"
+                          ? t({ en: "Active", "zh-CN": "启用", ja: "有効", ko: "활성" })
+                          : t({ en: "Disabled", "zh-CN": "已停用", ja: "無効", ko: "비활성" })}
                       </Badge>
                     </TableCell>
                     <TableCell className="hidden sm:table-cell">
@@ -501,11 +578,11 @@ export function ProjectWebhooksPanel({
                         <div>
                           <DeliveryBadge state={endpoint.last_delivery_state} />
                           <div className="mt-1 text-xs text-muted-foreground">
-                            {formatTime(endpoint.last_delivery_at_ms)}
+                            {formatTime(endpoint.last_delivery_at_ms, locale)}
                           </div>
                         </div>
                       ) : (
-                        <span className="text-sm text-muted-foreground">尚无投递</span>
+                        <span className="text-sm text-muted-foreground">{t({ en: "No deliveries", "zh-CN": "尚无投递", ja: "配信なし", ko: "전송 없음" })}</span>
                       )}
                     </TableCell>
                     <TableCell>
@@ -514,7 +591,7 @@ export function ProjectWebhooksPanel({
                           <Button
                             variant="ghost"
                             size="icon"
-                            aria-label={`管理 ${endpoint.name || endpoint.id}`}
+                            aria-label={t({ en: "Manage {endpoint}", "zh-CN": "管理 {endpoint}", ja: "{endpoint} を管理", ko: "{endpoint} 관리" }, { endpoint: endpoint.name || endpoint.id })}
                           >
                             <Ellipsis aria-hidden="true" />
                           </Button>
@@ -522,7 +599,7 @@ export function ProjectWebhooksPanel({
                         <DropdownMenuContent align="end">
                           <DropdownMenuItem onSelect={() => setSelected(endpoint)}>
                             <Webhook aria-hidden="true" />
-                            查看投递记录
+                            {t({ en: "View deliveries", "zh-CN": "查看投递记录", ja: "配信履歴を表示", ko: "전송 기록 보기" })}
                           </DropdownMenuItem>
                           {canManage ? (
                             <>
@@ -533,28 +610,30 @@ export function ProjectWebhooksPanel({
                                 }}
                               >
                                 <Pencil aria-hidden="true" />
-                                编辑
+                                {t({ en: "Edit", "zh-CN": "编辑", ja: "編集", ko: "편집" })}
                               </DropdownMenuItem>
                               <DropdownMenuItem
                                 disabled={endpoint.state !== "active" || mutationPending}
                                 onSelect={() => void enqueueTest(endpoint)}
                               >
                                 <FlaskConical aria-hidden="true" />
-                                发送测试事件
+                                {t({ en: "Send test event", "zh-CN": "发送测试事件", ja: "テストイベントを送信", ko: "테스트 이벤트 전송" })}
                               </DropdownMenuItem>
                               <DropdownMenuItem
                                 disabled={mutationPending}
                                 onSelect={() => void toggleEndpoint(endpoint)}
                               >
                                 <Play aria-hidden="true" />
-                                {endpoint.state === "active" ? "停用" : "启用"}
+                                {endpoint.state === "active"
+                                  ? t({ en: "Disable", "zh-CN": "停用", ja: "無効化", ko: "비활성화" })
+                                  : t({ en: "Enable", "zh-CN": "启用", ja: "有効化", ko: "활성화" })}
                               </DropdownMenuItem>
                               <DropdownMenuItem
                                 disabled={mutationPending}
                                 onSelect={() => setRotateTarget(endpoint)}
                               >
                                 <RotateCw aria-hidden="true" />
-                                轮换签名密钥
+                                {t({ en: "Rotate signing secret", "zh-CN": "轮换签名密钥", ja: "署名シークレットをローテーション", ko: "서명 시크릿 교체" })}
                               </DropdownMenuItem>
                               <DropdownMenuSeparator />
                               <DropdownMenuItem
@@ -563,7 +642,7 @@ export function ProjectWebhooksPanel({
                                 onSelect={() => setDeleteTarget(endpoint)}
                               >
                                 <Trash2 aria-hidden="true" />
-                                删除
+                                {t({ en: "Delete", "zh-CN": "删除", ja: "削除", ko: "삭제" })}
                               </DropdownMenuItem>
                             </>
                           ) : null}
@@ -584,7 +663,7 @@ export function ProjectWebhooksPanel({
         ) : null}
         {!canManage ? (
           <p className="text-sm text-muted-foreground">
-            你可以查看 Endpoint 和投递记录；只有项目或组织所有者可以更改。
+            {t({ en: "You can view endpoints and delivery history. Only project or organization owners can make changes.", "zh-CN": "你可以查看端点和投递记录；只有项目或组织所有者可以更改。", ja: "エンドポイントと配信履歴は閲覧できます。変更できるのはプロジェクトまたは組織の所有者のみです。", ko: "엔드포인트와 전송 기록을 볼 수 있습니다. 프로젝트 또는 조직 소유자만 변경할 수 있습니다." })}
           </p>
         ) : null}
       </div>
@@ -607,9 +686,9 @@ export function ProjectWebhooksPanel({
       <AlertDialog open={Boolean(secret)}>
         <AlertDialogContent className="w-[calc(100%-2rem)]">
           <AlertDialogHeader>
-            <AlertDialogTitle>保存 Webhook 签名密钥</AlertDialogTitle>
+            <AlertDialogTitle>{t({ en: "Save the webhook signing secret", "zh-CN": "保存 Webhook 签名密钥", ja: "Webhook 署名シークレットを保存", ko: "Webhook 서명 시크릿 저장" })}</AlertDialogTitle>
             <AlertDialogDescription>
-              密钥只在本次响应中显示。关闭后无法再次查看，可通过轮换生成新的密钥。
+              {t({ en: "This secret is shown only once. It cannot be viewed again after closing, but you can rotate it to generate a new one.", "zh-CN": "密钥只在本次响应中显示。关闭后无法再次查看，可通过轮换生成新的密钥。", ja: "このシークレットは今回のみ表示されます。閉じると再表示できませんが、ローテーションして新しいシークレットを生成できます。", ko: "이 시크릿은 이번에만 표시됩니다. 닫은 후에는 다시 볼 수 없지만 교체하여 새 시크릿을 만들 수 있습니다." })}
             </AlertDialogDescription>
           </AlertDialogHeader>
           {secret ? (
@@ -619,7 +698,9 @@ export function ProjectWebhooksPanel({
               </div>
               <Button className="w-full" variant="outline" onClick={() => void copySecret()}>
                 {copied ? <Check aria-hidden="true" /> : <Copy aria-hidden="true" />}
-                {copied ? "已复制" : "复制密钥"}
+                {copied
+                  ? t({ en: "Copied", "zh-CN": "已复制", ja: "コピー済み", ko: "복사됨" })
+                  : t({ en: "Copy secret", "zh-CN": "复制密钥", ja: "シークレットをコピー", ko: "시크릿 복사" })}
               </Button>
             </div>
           ) : null}
@@ -630,7 +711,7 @@ export function ProjectWebhooksPanel({
                 setCopied(false);
               }}
             >
-              我已保存并关闭
+              {t({ en: "I saved it. Close", "zh-CN": "我已保存并关闭", ja: "保存しました。閉じる", ko: "저장했습니다. 닫기" })}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
@@ -642,13 +723,13 @@ export function ProjectWebhooksPanel({
       >
         <AlertDialogContent className="w-[calc(100%-2rem)]">
           <AlertDialogHeader>
-            <AlertDialogTitle>轮换签名密钥？</AlertDialogTitle>
+            <AlertDialogTitle>{t({ en: "Rotate signing secret?", "zh-CN": "轮换签名密钥？", ja: "署名シークレットをローテーションしますか？", ko: "서명 시크릿을 교체할까요?" })}</AlertDialogTitle>
             <AlertDialogDescription>
-              旧密钥会立即停止签名后续请求。请准备好同步更新接收端配置。
+              {t({ en: "The old secret immediately stops signing new requests. Be ready to update the receiving service at the same time.", "zh-CN": "旧密钥会立即停止签名后续请求。请准备好同步更新接收端配置。", ja: "古いシークレットは直ちに新しいリクエストへの署名を停止します。受信側の設定も同時に更新できるよう準備してください。", ko: "이전 시크릿은 즉시 새 요청 서명을 중지합니다. 수신 서비스 설정도 동시에 업데이트할 준비를 하세요." })}
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
-            <AlertDialogCancel disabled={mutationPending}>取消</AlertDialogCancel>
+            <AlertDialogCancel disabled={mutationPending}>{t({ en: "Cancel", "zh-CN": "取消", ja: "キャンセル", ko: "취소" })}</AlertDialogCancel>
             <AlertDialogAction
               disabled={mutationPending}
               onClick={(event) => {
@@ -661,7 +742,7 @@ export function ProjectWebhooksPanel({
               ) : (
                 <RotateCw aria-hidden="true" />
               )}
-              轮换密钥
+              {t({ en: "Rotate secret", "zh-CN": "轮换密钥", ja: "シークレットをローテーション", ko: "시크릿 교체" })}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
@@ -673,13 +754,13 @@ export function ProjectWebhooksPanel({
       >
         <AlertDialogContent className="w-[calc(100%-2rem)]">
           <AlertDialogHeader>
-            <AlertDialogTitle>删除 Webhook？</AlertDialogTitle>
+            <AlertDialogTitle>{t({ en: "Delete webhook?", "zh-CN": "删除 Webhook？", ja: "Webhook を削除しますか？", ko: "Webhook을 삭제할까요?" })}</AlertDialogTitle>
             <AlertDialogDescription>
-              Endpoint 会停止接收新事件，所有尚未发送的投递会被取消。历史投递记录仍保留用于审计。
+              {t({ en: "The endpoint will stop receiving new events and all undelivered attempts will be canceled. Historical delivery records remain available for audit.", "zh-CN": "端点会停止接收新事件，所有尚未发送的投递会被取消。历史投递记录仍保留用于审计。", ja: "エンドポイントは新しいイベントの受信を停止し、未配信の試行はすべてキャンセルされます。過去の配信履歴は監査用に保持されます。", ko: "엔드포인트가 새 이벤트 수신을 중지하고 아직 전송되지 않은 모든 시도가 취소됩니다. 과거 전송 기록은 감사를 위해 유지됩니다." })}
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
-            <AlertDialogCancel disabled={mutationPending}>取消</AlertDialogCancel>
+            <AlertDialogCancel disabled={mutationPending}>{t({ en: "Cancel", "zh-CN": "取消", ja: "キャンセル", ko: "취소" })}</AlertDialogCancel>
             <AlertDialogAction
               className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
               disabled={mutationPending}
@@ -693,7 +774,7 @@ export function ProjectWebhooksPanel({
               ) : (
                 <Trash2 aria-hidden="true" />
               )}
-              删除 Webhook
+              {t({ en: "Delete webhook", "zh-CN": "删除 Webhook", ja: "Webhook を削除", ko: "Webhook 삭제" })}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
@@ -703,6 +784,7 @@ export function ProjectWebhooksPanel({
 }
 
 function DeliveryBadge({ state }: { state: WebhookDeliveryState }) {
+  const { t } = useI18n();
   return (
     <Badge
       variant={
@@ -713,16 +795,20 @@ function DeliveryBadge({ state }: { state: WebhookDeliveryState }) {
             : "outline"
       }
     >
-      {WEBHOOK_DELIVERY_LABELS[state]}
+      {t(WEBHOOK_DELIVERY_LABELS[state])}
     </Badge>
   );
 }
 
-function eventLabel(eventType: string) {
-  return (
-    WEBHOOK_EVENT_LABELS[eventType as keyof typeof WEBHOOK_EVENT_LABELS] ??
-    (eventType === "webhook.test" ? "测试事件" : eventType)
-  );
+function eventLabel(
+  eventType: string,
+  t: ReturnType<typeof useI18n>["t"],
+) {
+  const label = WEBHOOK_EVENT_LABELS[eventType as keyof typeof WEBHOOK_EVENT_LABELS];
+  if (label) return t(label);
+  return eventType === "webhook.test"
+    ? t({ en: "Test event", "zh-CN": "测试事件", ja: "テストイベント", ko: "테스트 이벤트" })
+    : eventType;
 }
 
 function endpointDisplayUrl(value: string) {
@@ -734,24 +820,13 @@ function endpointDisplayUrl(value: string) {
   }
 }
 
-function formatTime(value: number | null) {
+function formatTime(value: number | null, locale: string) {
   if (!value) return "—";
-  return new Intl.DateTimeFormat("zh-CN", {
+  return new Intl.DateTimeFormat(locale, {
     month: "2-digit",
     day: "2-digit",
     hour: "2-digit",
     minute: "2-digit",
     second: "2-digit",
   }).format(new Date(value));
-}
-
-async function responseMessage(response: Response) {
-  const body = (await response.json().catch(() => null)) as
-    | { error?: string | { message?: string } }
-    | null;
-  if (typeof body?.error === "string") return body.error;
-  if (body?.error && typeof body.error === "object" && body.error.message) {
-    return body.error.message;
-  }
-  return `请求失败 (${response.status})`;
 }

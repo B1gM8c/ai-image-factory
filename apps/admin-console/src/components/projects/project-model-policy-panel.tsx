@@ -15,6 +15,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { useI18n } from "@/i18n/locale-provider";
 import { consoleFetch } from "@/lib/auth/client";
 
 type ModelIdentity = {
@@ -66,6 +67,7 @@ export function ProjectModelPolicyPanel({
   canManage: boolean;
   active: boolean;
 }) {
+  const { t } = useI18n();
   const [policy, setPolicy] = useState<ProjectModelPolicy | null>(null);
   const [models, setModels] = useState<EditableModel[]>([]);
   const [query, setQuery] = useState("");
@@ -79,7 +81,10 @@ export function ProjectModelPolicyPanel({
     let current = true;
     setLoading(true);
     setError(null);
-    void loadPolicy(projectId)
+    void loadPolicy(
+      projectId,
+      t({ en: "Request failed", "zh-CN": "请求失败", ja: "リクエストに失敗しました", ko: "요청에 실패했습니다" }),
+    )
       .then((next) => {
         if (!current) return;
         setPolicy(next);
@@ -87,7 +92,7 @@ export function ProjectModelPolicyPanel({
       })
       .catch((reason) => {
         if (current) {
-          setError(reason instanceof Error ? reason.message : "模型策略加载失败");
+          setError(reason instanceof Error ? reason.message : t({ en: "Failed to load model policy", "zh-CN": "模型策略加载失败", ja: "モデルポリシーを読み込めませんでした", ko: "모델 정책을 불러오지 못했습니다" }));
         }
       })
       .finally(() => {
@@ -96,7 +101,7 @@ export function ProjectModelPolicyPanel({
     return () => {
       current = false;
     };
-  }, [active, projectId]);
+  }, [active, projectId, t]);
 
   const filtered = useMemo(() => {
     const normalized = query.trim().toLowerCase();
@@ -157,7 +162,7 @@ export function ProjectModelPolicyPanel({
         ),
     );
     if (invalid) {
-      setError(`请检查 ${invalid.public_model_id} 的每分钟限额`);
+      setError(t({ en: "Check the per-minute limits for {model}", "zh-CN": "请检查 {model} 的每分钟限额", ja: "{model} の 1 分あたりの上限を確認してください", ko: "{model}의 분당 한도를 확인하세요" }, { model: invalid.public_model_id }));
       return;
     }
     setSaving(true);
@@ -183,13 +188,13 @@ export function ProjectModelPolicyPanel({
           }),
         },
       );
-      if (!response.ok) throw new Error(await responseMessage(response));
+      if (!response.ok) throw new Error(await responseMessage(response, t({ en: "Request failed", "zh-CN": "请求失败", ja: "リクエストに失敗しました", ko: "요청에 실패했습니다" })));
       const next = (await response.json()) as ProjectModelPolicy;
       setPolicy(next);
       setModels(editableModels(next.models));
-      toast.success("项目模型策略已保存");
+      toast.success(t({ en: "Project model policy saved", "zh-CN": "项目模型策略已保存", ja: "プロジェクトのモデルポリシーを保存しました", ko: "프로젝트 모델 정책을 저장했습니다" }));
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "模型策略保存失败");
+      setError(reason instanceof Error ? reason.message : t({ en: "Failed to save model policy", "zh-CN": "模型策略保存失败", ja: "モデルポリシーを保存できませんでした", ko: "모델 정책을 저장하지 못했습니다" }));
     } finally {
       setSaving(false);
     }
@@ -198,7 +203,7 @@ export function ProjectModelPolicyPanel({
   if (loading && !policy) {
     return (
       <div className="grid min-h-72 place-items-center text-muted-foreground">
-        <LoaderCircle className="size-5 animate-spin" aria-label="正在加载模型策略" />
+        <LoaderCircle className="size-5 animate-spin" aria-label={t({ en: "Loading model policy", "zh-CN": "正在加载模型策略", ja: "モデルポリシーを読み込み中", ko: "모델 정책 불러오는 중" })} />
       </div>
     );
   }
@@ -206,7 +211,7 @@ export function ProjectModelPolicyPanel({
   if (!policy) {
     return (
       <div className="grid min-h-72 place-items-center px-6 text-center text-sm text-muted-foreground">
-        {error ?? "项目模型策略暂时不可用"}
+        {error ?? t({ en: "Project model policy is temporarily unavailable", "zh-CN": "项目模型策略暂时不可用", ja: "プロジェクトのモデルポリシーは一時的に利用できません", ko: "프로젝트 모델 정책을 일시적으로 사용할 수 없습니다" })}
       </div>
     );
   }
@@ -215,13 +220,13 @@ export function ProjectModelPolicyPanel({
     <div className="space-y-5 px-5 py-6 sm:px-6">
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
-          <h3 className="text-sm font-medium">模型使用</h3>
+          <h3 className="text-sm font-medium">{t({ en: "Model access", "zh-CN": "模型使用", ja: "モデルアクセス", ko: "모델 액세스" })}</h3>
           <p className="mt-1 text-sm text-muted-foreground">
-            项目 API Key、服务账户和创作页面共同继承这里的模型范围与限额。
+            {t({ en: "Project API keys, service accounts, and creation tools inherit this model scope and its limits.", "zh-CN": "项目 API Key、服务账户和创作页面共同继承这里的模型范围与限额。", ja: "プロジェクト API キー、サービスアカウント、作成ツールは、ここで設定したモデル範囲と上限を継承します。", ko: "프로젝트 API 키, 서비스 계정 및 제작 도구는 여기의 모델 범위와 한도를 상속합니다." })}
           </p>
         </div>
         <Badge variant="secondary">
-          已启用 {allowedCount} / {models.length}
+          {t({ en: "{allowed} of {total} enabled", "zh-CN": "已启用 {allowed} / {total}", ja: "{total} 件中 {allowed} 件を有効化", ko: "{total}개 중 {allowed}개 활성화" }, { allowed: allowedCount, total: models.length })}
         </Badge>
       </div>
 
@@ -234,7 +239,7 @@ export function ProjectModelPolicyPanel({
           <Input
             value={query}
             onChange={(event) => setQuery(event.target.value)}
-            placeholder="搜索模型或供应商"
+            placeholder={t({ en: "Search models or providers", "zh-CN": "搜索模型或供应商", ja: "モデルまたはプロバイダーを検索", ko: "모델 또는 공급자 검색" })}
             className="pl-9"
           />
         </div>
@@ -242,13 +247,13 @@ export function ProjectModelPolicyPanel({
           value={media}
           onValueChange={(value) => setMedia(value as typeof media)}
         >
-          <SelectTrigger aria-label="筛选媒体类型">
+          <SelectTrigger aria-label={t({ en: "Filter by media type", "zh-CN": "筛选媒体类型", ja: "メディアタイプで絞り込み", ko: "미디어 유형 필터" })}>
             <SelectValue />
           </SelectTrigger>
           <SelectContent>
-            <SelectItem value="all">全部类型</SelectItem>
-            <SelectItem value="image">图片</SelectItem>
-            <SelectItem value="video">视频</SelectItem>
+            <SelectItem value="all">{t({ en: "All types", "zh-CN": "全部类型", ja: "すべてのタイプ", ko: "모든 유형" })}</SelectItem>
+            <SelectItem value="image">{t({ en: "Image", "zh-CN": "图片", ja: "画像", ko: "이미지" })}</SelectItem>
+            <SelectItem value="video">{t({ en: "Video", "zh-CN": "视频", ja: "動画", ko: "동영상" })}</SelectItem>
           </SelectContent>
         </Select>
       </div>
@@ -259,11 +264,11 @@ export function ProjectModelPolicyPanel({
             checked={partiallyAllowed ? "indeterminate" : allAllowed}
             onCheckedChange={(checked) => setAllAllowed(checked === true)}
             disabled={!canManage || saving || models.length === 0}
-            aria-label="切换全部模型"
+            aria-label={t({ en: "Toggle all models", "zh-CN": "切换全部模型", ja: "すべてのモデルを切り替え", ko: "모든 모델 전환" })}
           />
-          <span className="font-medium">可用模型</span>
+          <span className="font-medium">{t({ en: "Available models", "zh-CN": "可用模型", ja: "利用可能なモデル", ko: "사용 가능한 모델" })}</span>
           <span className="ml-auto text-xs text-muted-foreground">
-            未填写限额时继承平台配置
+            {t({ en: "Blank limits inherit platform settings", "zh-CN": "未填写限额时继承平台配置", ja: "上限が空欄の場合はプラットフォーム設定を継承", ko: "한도를 비워 두면 플랫폼 설정 상속" })}
           </span>
         </div>
         {filtered.length > 0 ? (
@@ -283,14 +288,16 @@ export function ProjectModelPolicyPanel({
           </div>
         ) : (
           <div className="grid min-h-40 place-items-center px-6 text-center text-sm text-muted-foreground">
-            {models.length === 0 ? "当前项目没有可路由模型" : "没有符合条件的模型"}
+            {models.length === 0
+              ? t({ en: "No routable models are available for this project", "zh-CN": "当前项目没有可路由模型", ja: "このプロジェクトでルーティング可能なモデルはありません", ko: "이 프로젝트에 라우팅 가능한 모델이 없습니다" })
+              : t({ en: "No models match the filters", "zh-CN": "没有符合条件的模型", ja: "条件に一致するモデルはありません", ko: "필터와 일치하는 모델이 없습니다" })}
           </div>
         )}
       </div>
 
       {!canManage ? (
         <p className="text-sm text-muted-foreground">
-          你可以查看模型策略；只有项目或组织所有者可以修改。
+          {t({ en: "You can view the model policy. Only project or organization owners can change it.", "zh-CN": "你可以查看模型策略；只有项目或组织所有者可以修改。", ja: "モデルポリシーは閲覧できます。変更できるのはプロジェクトまたは組織の所有者のみです。", ko: "모델 정책을 볼 수 있습니다. 프로젝트 또는 조직 소유자만 변경할 수 있습니다." })}
         </p>
       ) : null}
       {error ? (
@@ -306,7 +313,7 @@ export function ProjectModelPolicyPanel({
             ) : (
               <Save aria-hidden="true" />
             )}
-            保存模型策略
+            {t({ en: "Save model policy", "zh-CN": "保存模型策略", ja: "モデルポリシーを保存", ko: "모델 정책 저장" })}
           </Button>
         </div>
       ) : null}
@@ -330,8 +337,11 @@ function ModelRow({
     value: string,
   ) => void;
 }) {
+  const { t } = useI18n();
   const unitLabel =
-    model.rate_limit.unit_kind === "image" ? "图片 / 分钟" : "视频秒 / 分钟";
+    model.rate_limit.unit_kind === "image"
+      ? t({ en: "Images / minute", "zh-CN": "图片 / 分钟", ja: "画像 / 分", ko: "이미지 / 분" })
+      : t({ en: "Video seconds / minute", "zh-CN": "视频秒 / 分钟", ja: "動画秒 / 分", ko: "동영상 초 / 분" });
   return (
     <div className="grid gap-4 px-4 py-4 lg:grid-cols-[minmax(0,1fr)_140px_140px] lg:items-center">
       <div className="flex min-w-0 items-start gap-3">
@@ -339,7 +349,9 @@ function ModelRow({
           checked={model.allowed}
           onCheckedChange={(checked) => onAllowedChange(checked === true)}
           disabled={!canManage || saving}
-          aria-label={`${model.allowed ? "停用" : "启用"} ${model.public_model_id}`}
+          aria-label={t(model.allowed
+            ? { en: "Disable {model}", "zh-CN": "停用 {model}", ja: "{model} を無効化", ko: "{model} 비활성화" }
+            : { en: "Enable {model}", "zh-CN": "启用 {model}", ja: "{model} を有効化", ko: "{model} 활성화" }, { model: model.public_model_id })}
           className="mt-0.5"
         />
         <div className="min-w-0">
@@ -351,22 +363,22 @@ function ModelRow({
             )}
             <span className="break-all font-medium">{model.public_model_id}</span>
             {model.rate_limit.shared ? (
-              <Badge variant="outline">共享限额</Badge>
+              <Badge variant="outline">{t({ en: "Shared limit", "zh-CN": "共享限额", ja: "共有上限", ko: "공유 한도" })}</Badge>
             ) : null}
           </div>
           <p className="mt-1 truncate text-xs text-muted-foreground">
-            {model.providers.join("、")} · {model.api_profile}
+            {model.providers.join(", ")} · {model.api_profile}
           </p>
           {model.rate_limit.shared ? (
             <p className="mt-1 text-xs text-muted-foreground">
-              与 {model.rate_limit.bucket_display_name} 的协议别名共用容量。
+              {t({ en: "Shares capacity with protocol aliases in {bucket}.", "zh-CN": "与 {bucket} 的协议别名共用容量。", ja: "{bucket} のプロトコルエイリアスと容量を共有します。", ko: "{bucket}의 프로토콜 별칭과 용량을 공유합니다." }, { bucket: model.rate_limit.bucket_display_name })}
             </p>
           ) : null}
         </div>
       </div>
       <LimitInput
         id={limitInputId(model, "requests")}
-        label="请求 / 分钟"
+        label={t({ en: "Requests / minute", "zh-CN": "请求 / 分钟", ja: "リクエスト / 分", ko: "요청 / 분" })}
         value={model.requestLimit}
         ceiling={model.rate_limit.inherited_request_ceiling_per_minute}
         disabled={!canManage || saving}
@@ -399,6 +411,7 @@ function LimitInput({
   disabled: boolean;
   onChange: (value: string) => void;
 }) {
+  const { t } = useI18n();
   return (
     <div className="space-y-1.5">
       <Label htmlFor={id} className="text-xs text-muted-foreground">
@@ -408,7 +421,9 @@ function LimitInput({
         id={id}
         value={value}
         inputMode="numeric"
-        placeholder={ceiling ? `继承 ${ceiling}` : "继承"}
+        placeholder={ceiling
+          ? t({ en: "Inherit {limit}", "zh-CN": "继承 {limit}", ja: "{limit} を継承", ko: "{limit} 상속" }, { limit: ceiling })
+          : t({ en: "Inherit", "zh-CN": "继承", ja: "継承", ko: "상속" })}
         disabled={disabled}
         onChange={(event) => onChange(event.target.value)}
         aria-label={label}
@@ -467,15 +482,15 @@ function optionalNumber(value: string) {
   return value ? Number(value) : null;
 }
 
-async function loadPolicy(projectId: string) {
+async function loadPolicy(projectId: string, fallback: string) {
   const response = await consoleFetch(
     `/api/gateway/v1/organization/projects/${encodeURIComponent(projectId)}/model-policy`,
   );
-  if (!response.ok) throw new Error(await responseMessage(response));
+  if (!response.ok) throw new Error(await responseMessage(response, fallback));
   return (await response.json()) as ProjectModelPolicy;
 }
 
-async function responseMessage(response: Response) {
+async function responseMessage(response: Response, fallback: string) {
   const body = (await response.json().catch(() => null)) as
     | { error?: string | { message?: string } }
     | null;
@@ -483,5 +498,5 @@ async function responseMessage(response: Response) {
   if (body?.error && typeof body.error === "object" && body.error.message) {
     return body.error.message;
   }
-  return `请求失败 (${response.status})`;
+  return `${fallback} (${response.status})`;
 }

@@ -19,6 +19,7 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
+import { useI18n } from "@/i18n/locale-provider";
 import { consoleFetch } from "@/lib/auth/client";
 
 type ProjectListResponse = {
@@ -29,6 +30,7 @@ type ProjectListResponse = {
 };
 
 export function ProjectsManager() {
+  const { locale, t } = useI18n();
   const {
     activeWorkspace,
     organizations,
@@ -50,16 +52,37 @@ export function ProjectsManager() {
       const response = await consoleFetch(
         "/api/gateway/v1/organization/projects?limit=100",
       );
-      if (!response.ok) throw new Error(await responseMessage(response));
+      if (!response.ok) {
+        throw new Error(
+          await responseMessage(
+            response,
+            t({
+              en: "Request failed",
+              "zh-CN": "请求失败",
+              ja: "リクエストに失敗しました",
+              ko: "요청에 실패했습니다",
+            }),
+          ),
+        );
+      }
       const payload = (await response.json()) as ProjectListResponse;
       setProjects(payload.data);
     } catch (reason) {
       setProjects([]);
-      setError(reason instanceof Error ? reason.message : "项目加载失败");
+      setError(
+        reason instanceof Error
+          ? reason.message
+          : t({
+              en: "Failed to load projects",
+              "zh-CN": "项目加载失败",
+              ja: "プロジェクトを読み込めませんでした",
+              ko: "프로젝트를 불러오지 못했습니다",
+            }),
+      );
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [t]);
 
   useEffect(() => {
     void loadProjects();
@@ -124,8 +147,18 @@ export function ProjectsManager() {
               className="pl-9"
               value={query}
               onChange={(event) => setQuery(event.target.value)}
-              placeholder="按名称或项目 ID 搜索"
-              aria-label="搜索项目"
+              placeholder={t({
+                en: "Search by name or project ID",
+                "zh-CN": "按名称或项目 ID 搜索",
+                ja: "名前またはプロジェクト ID で検索",
+                ko: "이름 또는 프로젝트 ID로 검색",
+              })}
+              aria-label={t({
+                en: "Search projects",
+                "zh-CN": "搜索项目",
+                ja: "プロジェクトを検索",
+                ko: "프로젝트 검색",
+              })}
             />
           </div>
           <Button
@@ -133,8 +166,18 @@ export function ProjectsManager() {
             size="icon"
             disabled={loading}
             onClick={() => void loadProjects()}
-            aria-label="刷新项目"
-            title="刷新项目"
+            aria-label={t({
+              en: "Refresh projects",
+              "zh-CN": "刷新项目",
+              ja: "プロジェクトを更新",
+              ko: "프로젝트 새로고침",
+            })}
+            title={t({
+              en: "Refresh projects",
+              "zh-CN": "刷新项目",
+              ja: "プロジェクトを更新",
+              ko: "프로젝트 새로고침",
+            })}
           >
             {loading ? (
               <LoaderCircle className="animate-spin" aria-hidden="true" />
@@ -147,14 +190,29 @@ export function ProjectsManager() {
             disabled={!canCreateProject}
             title={
               activeWorkspace?.kind === "platform"
-                ? "请先切换到一个组织或项目工作区"
+                ? t({
+                    en: "Switch to an organization or project workspace first",
+                    "zh-CN": "请先切换到一个组织或项目工作区",
+                    ja: "先に組織またはプロジェクトのワークスペースへ切り替えてください",
+                    ko: "먼저 조직 또는 프로젝트 워크스페이스로 전환하세요",
+                  })
                 : !canCreateProject
-                  ? "只有当前组织的所有者可以创建项目"
+                  ? t({
+                      en: "Only owners of the current organization can create projects",
+                      "zh-CN": "只有当前组织的所有者可以创建项目",
+                      ja: "現在の組織の所有者のみがプロジェクトを作成できます",
+                      ko: "현재 조직의 소유자만 프로젝트를 만들 수 있습니다",
+                    })
                   : undefined
             }
           >
             <Plus aria-hidden="true" />
-            创建项目
+            {t({
+              en: "Create project",
+              "zh-CN": "创建项目",
+              ja: "プロジェクトを作成",
+              ko: "프로젝트 만들기",
+            })}
           </Button>
         </div>
 
@@ -162,12 +220,16 @@ export function ProjectsManager() {
           <Table>
             <TableHeader>
               <TableRow>
-                <TableHead>名称</TableHead>
-                <TableHead>项目 ID</TableHead>
-                <TableHead>状态</TableHead>
-                <TableHead className="text-right">创建时间</TableHead>
+                <TableHead>{t({ en: "Name", "zh-CN": "名称", ja: "名前", ko: "이름" })}</TableHead>
+                <TableHead>{t({ en: "Project ID", "zh-CN": "项目 ID", ja: "プロジェクト ID", ko: "프로젝트 ID" })}</TableHead>
+                <TableHead>{t({ en: "Status", "zh-CN": "状态", ja: "ステータス", ko: "상태" })}</TableHead>
+                <TableHead className="text-right">
+                  {t({ en: "Created", "zh-CN": "创建时间", ja: "作成日時", ko: "생성 시간" })}
+                </TableHead>
                 <TableHead className="w-12">
-                  <span className="sr-only">操作</span>
+                  <span className="sr-only">
+                    {t({ en: "Actions", "zh-CN": "操作", ja: "操作", ko: "작업" })}
+                  </span>
                 </TableHead>
               </TableRow>
             </TableHeader>
@@ -182,11 +244,13 @@ export function ProjectsManager() {
                   <TableCell className="font-mono text-xs">{project.id}</TableCell>
                   <TableCell>
                     <Badge variant={project.status === "active" ? "default" : "secondary"}>
-                      {project.status === "active" ? "启用" : "已归档"}
+                      {project.status === "active"
+                        ? t({ en: "Active", "zh-CN": "启用", ja: "有効", ko: "활성" })
+                        : t({ en: "Archived", "zh-CN": "已归档", ja: "アーカイブ済み", ko: "보관됨" })}
                     </Badge>
                   </TableCell>
                   <TableCell className="text-right text-muted-foreground">
-                    {formatUnix(project.created_at)}
+                    {formatUnix(project.created_at, locale)}
                   </TableCell>
                   <TableCell>
                     <Button
@@ -197,8 +261,21 @@ export function ProjectsManager() {
                         event.stopPropagation();
                         setSelectedProject(project);
                       }}
-                      aria-label={`打开 ${project.name} 的项目设置`}
-                      title="项目设置"
+                      aria-label={t(
+                        {
+                          en: "Open settings for {project}",
+                          "zh-CN": "打开 {project} 的项目设置",
+                          ja: "{project} のプロジェクト設定を開く",
+                          ko: "{project} 프로젝트 설정 열기",
+                        },
+                        { project: project.name },
+                      )}
+                      title={t({
+                        en: "Project settings",
+                        "zh-CN": "项目设置",
+                        ja: "プロジェクト設定",
+                        ko: "프로젝트 설정",
+                      })}
                     >
                       <Settings2 aria-hidden="true" />
                     </Button>
@@ -208,7 +285,20 @@ export function ProjectsManager() {
               {!loading && visibleProjects.length === 0 ? (
                 <TableRow>
                   <TableCell colSpan={5} className="h-32 text-center text-muted-foreground">
-                    {error ?? (query.trim() ? "没有匹配的项目" : "暂无项目")}
+                    {error ??
+                      (query.trim()
+                        ? t({
+                            en: "No matching projects",
+                            "zh-CN": "没有匹配的项目",
+                            ja: "一致するプロジェクトはありません",
+                            ko: "일치하는 프로젝트가 없습니다",
+                          })
+                        : t({
+                            en: "No projects yet",
+                            "zh-CN": "暂无项目",
+                            ja: "プロジェクトはまだありません",
+                            ko: "아직 프로젝트가 없습니다",
+                          }))}
                   </TableCell>
                 </TableRow>
               ) : null}
@@ -242,7 +332,7 @@ export function ProjectsManager() {
   );
 }
 
-async function responseMessage(response: Response) {
+async function responseMessage(response: Response, fallback: string) {
   const body = (await response.json().catch(() => null)) as
     | { error?: string | { message?: string } }
     | null;
@@ -250,11 +340,11 @@ async function responseMessage(response: Response) {
   if (body?.error && typeof body.error === "object" && body.error.message) {
     return body.error.message;
   }
-  return `请求失败 (${response.status})`;
+  return `${fallback} (${response.status})`;
 }
 
-function formatUnix(value: number) {
-  return new Intl.DateTimeFormat("zh-CN", {
+function formatUnix(value: number, locale: string) {
+  return new Intl.DateTimeFormat(locale, {
     year: "numeric",
     month: "2-digit",
     day: "2-digit",

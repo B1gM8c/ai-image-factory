@@ -117,7 +117,9 @@ function upstreamError(payload: unknown, status: number) {
       if (typeof message === "string" && message.length <= 256) return message;
     }
   }
-  return status === 401 ? "邮箱或密码错误" : `认证服务返回错误 (${status})`;
+  return status === 401
+    ? "Incorrect email or password"
+    : `Authentication service error (${status})`;
 }
 
 function passthroughStatus(status: number) {

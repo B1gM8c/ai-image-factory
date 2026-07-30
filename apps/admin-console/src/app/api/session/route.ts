@@ -68,10 +68,10 @@ export async function POST(request: Request) {
   const email = typeof body?.email === "string" ? body.email.trim() : "";
   const password = typeof body?.password === "string" ? body.password : "";
   if (!email || !password) {
-    return authJson({ error: "请输入邮箱和密码" }, 400);
+    return authJson({ error: "Email and password are required" }, 400);
   }
   if (email.length > 254 || Buffer.byteLength(password, "utf8") > 1024) {
-    return authJson({ error: "登录信息格式不正确" }, 400);
+    return authJson({ error: "The sign-in payload is invalid" }, 400);
   }
 
   const result = await requestAuthTokens("/admin/v1/auth/login", {
@@ -114,7 +114,7 @@ export async function DELETE(request: Request) {
 
 async function emergencyLogin() {
   if (!isLegacyAdminAuthEnabled() || !configuredConsoleAccessToken()) {
-    return authJson({ error: "应急登录未启用" }, 404);
+    return authJson({ error: "Emergency sign-in is disabled" }, 404);
   }
   await setEmergencySession();
   return noStoreResponse();

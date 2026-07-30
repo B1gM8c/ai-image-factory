@@ -31,6 +31,7 @@ import {
   routeModelMappingsRequest,
   type EditableRouteModelMappings,
 } from "@/components/provider-accounts/route-model-mappings-editor";
+import { useI18n } from "@/i18n/locale-provider";
 import type {
   ProviderAccountView,
   ProviderModelView,
@@ -38,6 +39,7 @@ import type {
 } from "@/lib/admin/types";
 import { consoleFetch } from "@/lib/auth/client";
 
+type Translate = ReturnType<typeof useI18n>["t"];
 type Strategy = "quota_aware_least_loaded" | "priority_weighted";
 type UnknownQuotaPolicy = "allow" | "block";
 type MemberPolicy = {
@@ -60,6 +62,7 @@ export function RoutePolicySheet({
   route: ProviderRoute | null;
   onSaved: () => void;
 }) {
+  const { t } = useI18n();
   const [name, setName] = useState("");
   const [providerId, setProviderId] = useState("openai-codex");
   const [operationId, setOperationId] = useState("images.generations");
@@ -249,13 +252,28 @@ export function RoutePolicySheet({
           ),
         },
       );
-      if (!response.ok) throw new Error(await responseMessage(response));
+      if (!response.ok) throw new Error(await responseMessage(response, t));
       toast.success(
         accountRoute
-          ? "API 模型映射新版本已发布"
+          ? t({
+              en: "A new API model mapping version has been published",
+              "zh-CN": "API 模型映射新版本已发布",
+              ja: "API モデルマッピングの新しいバージョンを公開しました",
+              ko: "API 모델 매핑의 새 버전이 게시되었습니다",
+            })
           : route
-            ? "账号组新版本已发布"
-            : "账号组已创建",
+            ? t({
+                en: "A new account group version has been published",
+                "zh-CN": "账号组新版本已发布",
+                ja: "アカウントグループの新しいバージョンを公開しました",
+                ko: "계정 그룹의 새 버전이 게시되었습니다",
+              })
+            : t({
+                en: "Account group created",
+                "zh-CN": "账号组已创建",
+                ja: "アカウントグループを作成しました",
+                ko: "계정 그룹이 생성되었습니다",
+              }),
       );
       onOpenChange(false);
       onSaved();
@@ -264,8 +282,18 @@ export function RoutePolicySheet({
         error instanceof Error
           ? error.message
           : accountRoute
-            ? "API 模型映射保存失败"
-            : "账号组保存失败",
+            ? t({
+                en: "Failed to save API model mappings",
+                "zh-CN": "API 模型映射保存失败",
+                ja: "API モデルマッピングを保存できませんでした",
+                ko: "API 모델 매핑을 저장하지 못했습니다",
+              })
+            : t({
+                en: "Failed to save the account group",
+                "zh-CN": "账号组保存失败",
+                ja: "アカウントグループを保存できませんでした",
+                ko: "계정 그룹을 저장하지 못했습니다",
+              }),
       );
     } finally {
       setPending(false);
@@ -278,17 +306,59 @@ export function RoutePolicySheet({
         <SheetHeader className="border-b px-5 py-5 pr-12 sm:px-6">
           <SheetTitle>
             {accountRoute
-              ? `${route.display_name} · API 模型`
+              ? t(
+                  {
+                    en: "{name} · API models",
+                    "zh-CN": "{name} · API 模型",
+                    ja: "{name} · API モデル",
+                    ko: "{name} · API 모델",
+                  },
+                  { name: route.display_name },
+                )
               : route
-                ? "编辑账号组"
-                : "新建账号组"}
+                ? t({
+                    en: "Edit account group",
+                    "zh-CN": "编辑账号组",
+                    ja: "アカウントグループを編集",
+                    ko: "계정 그룹 편집",
+                  })
+                : t({
+                    en: "Create account group",
+                    "zh-CN": "新建账号组",
+                    ja: "アカウントグループを作成",
+                    ko: "계정 그룹 만들기",
+                  })}
           </SheetTitle>
           <SheetDescription>
             {accountRoute
-              ? `${providerLabel(route.provider_id)} · ${operationLabel(route.operation_id)}；保存后发布不可变的新版本。`
+              ? t(
+                  {
+                    en: "{provider} · {operation}. Saving publishes an immutable new version.",
+                    "zh-CN":
+                      "{provider} · {operation}；保存后发布不可变的新版本。",
+                    ja: "{provider} · {operation}。保存すると変更不可の新しいバージョンが公開されます。",
+                    ko: "{provider} · {operation}. 저장하면 변경할 수 없는 새 버전이 게시됩니다.",
+                  },
+                  {
+                    provider: providerLabel(t, route.provider_id),
+                    operation: operationLabel(t, route.operation_id),
+                  },
+                )
               : route
-                ? "保存会发布不可变的新版本，已进入队列的任务仍使用原版本。"
-                : "API Key 绑定账号组后，只会在组内账号之间调度。"}
+                ? t({
+                    en: "Saving publishes an immutable new version. Jobs already queued continue to use the previous version.",
+                    "zh-CN":
+                      "保存会发布不可变的新版本，已进入队列的任务仍使用原版本。",
+                    ja: "保存すると変更不可の新しいバージョンが公開されます。キュー内の既存ジョブは以前のバージョンを引き続き使用します。",
+                    ko: "저장하면 변경할 수 없는 새 버전이 게시됩니다. 이미 대기열에 있는 작업은 이전 버전을 계속 사용합니다.",
+                  })
+                : t({
+                    en: "After an API key is assigned to an account group, requests are scheduled only across accounts in that group.",
+                    "zh-CN":
+                      "API Key 绑定账号组后，只会在组内账号之间调度。",
+                    ja: "API キーをアカウントグループに割り当てると、そのグループ内のアカウントだけがスケジュール対象になります。",
+                    ko: "API 키를 계정 그룹에 할당하면 해당 그룹의 계정만 스케줄링됩니다.",
+                  })}
           </SheetDescription>
         </SheetHeader>
 
@@ -302,11 +372,21 @@ export function RoutePolicySheet({
               <TabsList variant="line">
                 <TabsTrigger value="scheduling" variant="line">
                   <Users className="size-4" aria-hidden="true" />
-                  成员与调度
+                  {t({
+                    en: "Members & scheduling",
+                    "zh-CN": "成员与调度",
+                    ja: "メンバーとスケジューリング",
+                    ko: "멤버 및 스케줄링",
+                  })}
                 </TabsTrigger>
                 <TabsTrigger value="models" variant="line">
                   <Layers3 className="size-4" aria-hidden="true" />
-                  对外模型
+                  {t({
+                    en: "API models",
+                    "zh-CN": "对外模型",
+                    ja: "API モデル",
+                    ko: "API 모델",
+                  })}
                 </TabsTrigger>
               </TabsList>
             </div>
@@ -316,19 +396,38 @@ export function RoutePolicySheet({
             className="min-h-0 flex-1 space-y-6 overflow-y-auto px-5 py-5 sm:px-6"
           >
             <div className="space-y-2">
-              <Label htmlFor="group-name">组名称</Label>
+              <Label htmlFor="group-name">
+                {t({
+                  en: "Group name",
+                  "zh-CN": "组名称",
+                  ja: "グループ名",
+                  ko: "그룹 이름",
+                })}
+              </Label>
               <Input
                 id="group-name"
                 value={name}
                 onChange={(event) => setName(event.target.value)}
-                placeholder="例如：图片生产组"
+                placeholder={t({
+                  en: "For example: Image production",
+                  "zh-CN": "例如：图片生产组",
+                  ja: "例: 画像生成グループ",
+                  ko: "예: 이미지 생성 그룹",
+                })}
                 maxLength={128}
               />
             </div>
 
             <div className="grid gap-4 md:grid-cols-2">
               <div className="space-y-2">
-                <Label>CLI 供应商</Label>
+                <Label>
+                  {t({
+                    en: "CLI provider",
+                    "zh-CN": "CLI 供应商",
+                    ja: "CLI プロバイダー",
+                    ko: "CLI 공급자",
+                  })}
+                </Label>
                 <Select
                   value={providerId}
                   onValueChange={changeProvider}
@@ -340,14 +439,21 @@ export function RoutePolicySheet({
                   <SelectContent>
                     {providerOptions.map((provider) => (
                       <SelectItem key={provider} value={provider}>
-                        {providerLabel(provider)}
+                        {providerLabel(t, provider)}
                       </SelectItem>
                     ))}
                   </SelectContent>
                 </Select>
               </div>
               <div className="space-y-2">
-                <Label>API 能力</Label>
+                <Label>
+                  {t({
+                    en: "API capability",
+                    "zh-CN": "API 能力",
+                    ja: "API 機能",
+                    ko: "API 기능",
+                  })}
+                </Label>
                 <Select
                   value={operationId}
                   onValueChange={changeOperation}
@@ -359,7 +465,7 @@ export function RoutePolicySheet({
                   <SelectContent>
                     {operationOptions.map((operation) => (
                       <SelectItem key={operation} value={operation}>
-                        {operationLabel(operation)}
+                        {operationLabel(t, operation)}
                       </SelectItem>
                     ))}
                   </SelectContent>
@@ -369,7 +475,14 @@ export function RoutePolicySheet({
 
             <div className="grid gap-4 md:grid-cols-3">
               <div className="space-y-2">
-                <Label>选择规则</Label>
+                <Label>
+                  {t({
+                    en: "Selection strategy",
+                    "zh-CN": "选择规则",
+                    ja: "選択ルール",
+                    ko: "선택 규칙",
+                  })}
+                </Label>
                 <Select
                   value={strategy}
                   onValueChange={(value) => setStrategy(value as Strategy)}
@@ -379,16 +492,33 @@ export function RoutePolicySheet({
                   </SelectTrigger>
                   <SelectContent>
                     <SelectItem value="quota_aware_least_loaded">
-                      额度与负载优先
+                      {t({
+                        en: "Prefer quota and available capacity",
+                        "zh-CN": "额度与负载优先",
+                        ja: "クォータと空き容量を優先",
+                        ko: "할당량 및 가용 용량 우선",
+                      })}
                     </SelectItem>
                     <SelectItem value="priority_weighted">
-                      优先级与权重
+                      {t({
+                        en: "Priority and weight",
+                        "zh-CN": "优先级与权重",
+                        ja: "優先度と重み",
+                        ko: "우선순위 및 가중치",
+                      })}
                     </SelectItem>
                   </SelectContent>
                 </Select>
               </div>
               <div className="space-y-2">
-                <Label>额度数据缺失</Label>
+                <Label>
+                  {t({
+                    en: "When quota data is unavailable",
+                    "zh-CN": "额度数据缺失",
+                    ja: "クォータデータがない場合",
+                    ko: "할당량 데이터가 없을 때",
+                  })}
+                </Label>
                 <Select
                   value={unknownQuotaPolicy}
                   onValueChange={(value) =>
@@ -399,13 +529,34 @@ export function RoutePolicySheet({
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
-                    <SelectItem value="allow">继续调度</SelectItem>
-                    <SelectItem value="block">暂停调度</SelectItem>
+                    <SelectItem value="allow">
+                      {t({
+                        en: "Continue scheduling",
+                        "zh-CN": "继续调度",
+                        ja: "スケジューリングを続行",
+                        ko: "스케줄링 계속",
+                      })}
+                    </SelectItem>
+                    <SelectItem value="block">
+                      {t({
+                        en: "Pause scheduling",
+                        "zh-CN": "暂停调度",
+                        ja: "スケジューリングを一時停止",
+                        ko: "스케줄링 일시 중지",
+                      })}
+                    </SelectItem>
                   </SelectContent>
                 </Select>
               </div>
               <div className="space-y-2">
-                <Label htmlFor="quota-freshness">快照有效期（分钟）</Label>
+                <Label htmlFor="quota-freshness">
+                  {t({
+                    en: "Snapshot validity (minutes)",
+                    "zh-CN": "快照有效期（分钟）",
+                    ja: "スナップショット有効期間（分）",
+                    ko: "스냅샷 유효 기간(분)",
+                  })}
+                </Label>
                 <Input
                   id="quota-freshness"
                   type="number"
@@ -422,22 +573,70 @@ export function RoutePolicySheet({
 
             <section className="space-y-2">
               <div className="flex items-center justify-between gap-4">
-                <Label>成员策略</Label>
+                <Label>
+                  {t({
+                    en: "Member policies",
+                    "zh-CN": "成员策略",
+                    ja: "メンバーポリシー",
+                    ko: "멤버 정책",
+                  })}
+                </Label>
                 <span className="text-xs text-muted-foreground">
-                  已选择 {selectedMemberCount} 个账号
+                  {t(
+                    {
+                      en: "{count} accounts selected",
+                      "zh-CN": "已选择 {count} 个账号",
+                      ja: "{count} 件のアカウントを選択済み",
+                      ko: "{count}개 계정 선택됨",
+                    },
+                    { count: selectedMemberCount },
+                  )}
                 </span>
               </div>
               <div className="border">
                 <div className="hidden grid-cols-[2.5rem_minmax(12rem,1fr)_7rem_7rem_8rem] items-center border-b bg-muted/40 px-3 py-2 text-xs font-medium text-muted-foreground md:grid">
                   <span />
-                  <span>账号</span>
-                  <span>优先级</span>
-                  <span>权重</span>
-                  <span>最低保留额度</span>
+                  <span>
+                    {t({
+                      en: "Account",
+                      "zh-CN": "账号",
+                      ja: "アカウント",
+                      ko: "계정",
+                    })}
+                  </span>
+                  <span>
+                    {t({
+                      en: "Priority",
+                      "zh-CN": "优先级",
+                      ja: "優先度",
+                      ko: "우선순위",
+                    })}
+                  </span>
+                  <span>
+                    {t({
+                      en: "Weight",
+                      "zh-CN": "权重",
+                      ja: "重み",
+                      ko: "가중치",
+                    })}
+                  </span>
+                  <span>
+                    {t({
+                      en: "Minimum quota",
+                      "zh-CN": "最低保留额度",
+                      ja: "最低クォータ残量",
+                      ko: "최소 보존 할당량",
+                    })}
+                  </span>
                 </div>
                 {routeAccounts.length === 0 ? (
                   <div className="flex min-h-24 items-center justify-center text-sm text-muted-foreground">
-                    该供应商暂无可用账号
+                    {t({
+                      en: "No accounts are available for this provider",
+                      "zh-CN": "该供应商暂无可用账号",
+                      ja: "このプロバイダーで利用可能なアカウントはありません",
+                      ko: "이 공급자에 사용 가능한 계정이 없습니다",
+                    })}
                   </div>
                 ) : (
                   routeAccounts.map((account) => {
@@ -455,22 +654,55 @@ export function RoutePolicySheet({
                             toggleMember(account.provider_account_id)
                           }
                           className="mt-1 size-4 accent-primary md:mt-0"
-                          aria-label={`选择 ${account.display_name ?? account.account_key}`}
+                          aria-label={t(
+                            {
+                              en: "Select {account}",
+                              "zh-CN": "选择 {account}",
+                              ja: "{account} を選択",
+                              ko: "{account} 선택",
+                            },
+                            {
+                              account:
+                                account.display_name ?? account.account_key,
+                            },
+                          )}
                         />
                         <div className="min-w-0 pr-2 text-sm">
                           <p className="truncate font-medium">
                             {account.display_name ?? account.account_key}
                           </p>
                           <p className="truncate text-xs text-muted-foreground">
-                            {accountStatusLabel(account)} · 可用并发{" "}
-                            {account.available_capacity}
+                            {t(
+                              {
+                                en: "{status} · {count} slots available",
+                                "zh-CN": "{status} · 可用并发 {count}",
+                                ja: "{status} · 利用可能な同時実行数 {count}",
+                                ko: "{status} · 사용 가능한 동시 실행 {count}",
+                              },
+                              {
+                                status: accountStatusLabel(t, account),
+                                count: account.available_capacity,
+                              },
+                            )}
                           </p>
                         </div>
                         {checked ? (
                           <>
-                            <MobilePolicyField label="优先级">
+                            <MobilePolicyField
+                              label={t({
+                                en: "Priority",
+                                "zh-CN": "优先级",
+                                ja: "優先度",
+                                ko: "우선순위",
+                              })}
+                            >
                               <PolicyNumberInput
-                                label="优先级"
+                                label={t({
+                                  en: "Priority",
+                                  "zh-CN": "优先级",
+                                  ja: "優先度",
+                                  ko: "우선순위",
+                                })}
                                 value={policy.priority}
                                 min={-1_000}
                                 max={1_000}
@@ -483,9 +715,21 @@ export function RoutePolicySheet({
                                 }
                               />
                             </MobilePolicyField>
-                            <MobilePolicyField label="权重">
+                            <MobilePolicyField
+                              label={t({
+                                en: "Weight",
+                                "zh-CN": "权重",
+                                ja: "重み",
+                                ko: "가중치",
+                              })}
+                            >
                               <PolicyNumberInput
-                                label="权重"
+                                label={t({
+                                  en: "Weight",
+                                  "zh-CN": "权重",
+                                  ja: "重み",
+                                  ko: "가중치",
+                                })}
                                 value={policy.weight}
                                 min={1}
                                 max={1_000_000}
@@ -498,10 +742,22 @@ export function RoutePolicySheet({
                                 }
                               />
                             </MobilePolicyField>
-                            <MobilePolicyField label="最低保留额度">
+                            <MobilePolicyField
+                              label={t({
+                                en: "Minimum quota",
+                                "zh-CN": "最低保留额度",
+                                ja: "最低クォータ残量",
+                                ko: "최소 보존 할당량",
+                              })}
+                            >
                               <div className="flex items-center gap-1.5">
                                 <PolicyNumberInput
-                                  label="最低保留额度"
+                                  label={t({
+                                    en: "Minimum quota",
+                                    "zh-CN": "最低保留额度",
+                                    ja: "最低クォータ残量",
+                                    ko: "최소 보존 할당량",
+                                  })}
                                   value={policy.minimumRemainingPercent}
                                   min={0}
                                   max={100}
@@ -537,15 +793,29 @@ export function RoutePolicySheet({
             {accountRoute ? (
               <div className="grid gap-3 border-b pb-5 text-sm sm:grid-cols-2">
                 <div>
-                  <span className="text-muted-foreground">CLI 供应商</span>
+                  <span className="text-muted-foreground">
+                    {t({
+                      en: "CLI provider",
+                      "zh-CN": "CLI 供应商",
+                      ja: "CLI プロバイダー",
+                      ko: "CLI 공급자",
+                    })}
+                  </span>
                   <p className="mt-1 font-medium">
-                    {providerLabel(providerId)}
+                    {providerLabel(t, providerId)}
                   </p>
                 </div>
                 <div>
-                  <span className="text-muted-foreground">API 能力</span>
+                  <span className="text-muted-foreground">
+                    {t({
+                      en: "API capability",
+                      "zh-CN": "API 能力",
+                      ja: "API 機能",
+                      ko: "API 기능",
+                    })}
+                  </span>
                   <p className="mt-1 font-medium">
-                    {operationLabel(operationId)}
+                    {operationLabel(t, operationId)}
                   </p>
                 </div>
               </div>
@@ -568,7 +838,12 @@ export function RoutePolicySheet({
             onClick={() => onOpenChange(false)}
             disabled={pending}
           >
-            取消
+            {t({
+              en: "Cancel",
+              "zh-CN": "取消",
+              ja: "キャンセル",
+              ko: "취소",
+            })}
           </Button>
           <Button onClick={() => void save()} disabled={pending || !routeValid}>
             {pending ? (
@@ -578,7 +853,22 @@ export function RoutePolicySheet({
             ) : (
               <Users aria-hidden="true" />
             )}
-            {route ? `发布版本 ${route.revision + 1}` : "创建账号组"}
+            {route
+              ? t(
+                  {
+                    en: "Publish version {version}",
+                    "zh-CN": "发布版本 {version}",
+                    ja: "バージョン {version} を公開",
+                    ko: "버전 {version} 게시",
+                  },
+                  { version: route.revision + 1 },
+                )
+              : t({
+                  en: "Create account group",
+                  "zh-CN": "创建账号组",
+                  ja: "アカウントグループを作成",
+                  ko: "계정 그룹 만들기",
+                })}
           </Button>
         </SheetFooter>
       </SheetContent>
@@ -628,12 +918,41 @@ function PolicyNumberInput({
   );
 }
 
-function accountStatusLabel(account: ProviderAccountView) {
-  if (account.environment_state === "invalid") return "登录失效";
-  if (account.scheduling_state === "draining") return "排空中";
-  if (account.scheduling_state === "disabled") return "已停用";
-  if (account.configuration_status !== "configured") return "配置异常";
-  return "接收新任务";
+function accountStatusLabel(t: Translate, account: ProviderAccountView) {
+  if (account.environment_state === "invalid")
+    return t({
+      en: "Authentication expired",
+      "zh-CN": "登录失效",
+      ja: "認証期限切れ",
+      ko: "인증 만료",
+    });
+  if (account.scheduling_state === "draining")
+    return t({
+      en: "Draining",
+      "zh-CN": "排空中",
+      ja: "ドレイン中",
+      ko: "드레이닝 중",
+    });
+  if (account.scheduling_state === "disabled")
+    return t({
+      en: "Disabled",
+      "zh-CN": "已停用",
+      ja: "無効",
+      ko: "비활성화됨",
+    });
+  if (account.configuration_status !== "configured")
+    return t({
+      en: "Configuration issue",
+      "zh-CN": "配置异常",
+      ja: "設定エラー",
+      ko: "구성 오류",
+    });
+  return t({
+    en: "Accepting new jobs",
+    "zh-CN": "接收新任务",
+    ja: "新しいジョブを受付中",
+    ko: "새 작업 수락 중",
+  });
 }
 
 function preferredProvider(accounts: ProviderAccountView[]) {
@@ -656,17 +975,41 @@ function preferredOperation(models: ProviderModelView[], providerId: string) {
   return operations.values().next().value ?? "images.generations";
 }
 
-function providerLabel(providerId: string) {
+function providerLabel(t: Translate, providerId: string) {
   if (providerId === "openai-codex") return "Codex";
   if (providerId === "grok-cli") return "Grok";
-  if (providerId === "dreamina-cli") return "即梦";
+  if (providerId === "dreamina-cli")
+    return t({
+      en: "Dreamina",
+      "zh-CN": "即梦",
+      ja: "Dreamina",
+      ko: "Dreamina",
+    });
   return providerId;
 }
 
-function operationLabel(operationId: string) {
-  if (operationId === "images.generations") return "图片生成";
-  if (operationId === "images.edits") return "图片编辑";
-  if (operationId === "videos.generations") return "视频生成";
+function operationLabel(t: Translate, operationId: string) {
+  if (operationId === "images.generations")
+    return t({
+      en: "Image generation",
+      "zh-CN": "图片生成",
+      ja: "画像生成",
+      ko: "이미지 생성",
+    });
+  if (operationId === "images.edits")
+    return t({
+      en: "Image editing",
+      "zh-CN": "图片编辑",
+      ja: "画像編集",
+      ko: "이미지 편집",
+    });
+  if (operationId === "videos.generations")
+    return t({
+      en: "Video generation",
+      "zh-CN": "视频生成",
+      ja: "動画生成",
+      ko: "동영상 생성",
+    });
   return operationId;
 }
 
@@ -678,7 +1021,7 @@ function slug(value: string) {
   return normalized.slice(0, 32) || "accounts";
 }
 
-async function responseMessage(response: Response) {
+async function responseMessage(response: Response, t: Translate) {
   try {
     const body = (await response.json()) as {
       error?: string | { message?: string };
@@ -689,5 +1032,13 @@ async function responseMessage(response: Response) {
   } catch {
     // Preserve the stable fallback for non-JSON proxy failures.
   }
-  return `请求失败 (${response.status})`;
+  return t(
+    {
+      en: "Request failed ({status})",
+      "zh-CN": "请求失败 ({status})",
+      ja: "リクエストに失敗しました ({status})",
+      ko: "요청 실패 ({status})",
+    },
+    { status: response.status },
+  );
 }

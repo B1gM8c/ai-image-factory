@@ -6,6 +6,7 @@ import { useConsoleSession } from "@/components/auth/console-session-provider";
 import { NavUser } from "@/components/shell/nav-user";
 import { WorkspaceSwitcher } from "@/components/shell/workspace-switcher";
 import { navigationFor } from "@/lib/navigation";
+import { useI18n } from "@/i18n/locale-provider";
 import {
   Sidebar,
   SidebarContent,
@@ -24,6 +25,7 @@ export function AppSidebar() {
   const pathname = usePathname();
   const { setOpenMobile } = useSidebar();
   const { capabilities, user } = useConsoleSession();
+  const { t } = useI18n();
   const navigationGroups = navigationFor(user?.roles ?? [], capabilities);
 
   return (
@@ -34,18 +36,22 @@ export function AppSidebar() {
 
       <SidebarContent className="py-2">
         {navigationGroups.map((group) => (
-          <SidebarGroup key={group.label}>
-            <SidebarGroupLabel>{group.label}</SidebarGroupLabel>
+          <SidebarGroup key={group.label.en}>
+            <SidebarGroupLabel>{t(group.label)}</SidebarGroupLabel>
             <SidebarGroupContent>
               <SidebarMenu>
                 {group.items.map((item) => {
                   const active = pathname === item.href || pathname.startsWith(`${item.href}/`);
                   return (
                     <SidebarMenuItem key={item.href}>
-                      <SidebarMenuButton asChild isActive={active} tooltip={item.title}>
+                      <SidebarMenuButton
+                        asChild
+                        isActive={active}
+                        tooltip={t(item.title)}
+                      >
                         <Link href={item.href} onClick={() => setOpenMobile(false)}>
                           <item.icon aria-hidden="true" />
-                          <span>{item.title}</span>
+                          <span>{t(item.title)}</span>
                         </Link>
                       </SidebarMenuButton>
                     </SidebarMenuItem>

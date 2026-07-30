@@ -48,6 +48,7 @@ import {
 } from "@/components/ui/table";
 import { Textarea } from "@/components/ui/textarea";
 import { useAdminQuery } from "@/hooks/use-admin-query";
+import { useI18n } from "@/i18n/locale-provider";
 import {
   decimalToMicros,
   formatDateTime,
@@ -63,6 +64,7 @@ import type {
 import { consoleFetch } from "@/lib/auth/client";
 
 const PAGE_SIZE = 50;
+type Translate = ReturnType<typeof useI18n>["t"];
 
 type RefundState =
   | "refundable"
@@ -77,6 +79,7 @@ export function CustomerRefundsPanel({
   enabled: boolean;
   tenantNames: Map<string, string>;
 }) {
+  const { t } = useI18n();
   const [state, setState] = useState<RefundState>("refundable");
   const [tenantId, setTenantId] = useState("");
   const [debouncedTenantId, setDebouncedTenantId] = useState("");
@@ -112,16 +115,33 @@ export function CustomerRefundsPanel({
     <section className="min-w-0 space-y-4">
       <div className="flex flex-wrap items-start justify-between gap-4">
         <div>
-          <h2 className="text-base font-semibold">客户扣费与退款</h2>
+          <h2 className="text-base font-semibold">
+            {t({
+              en: "Customer charges and refunds",
+              "zh-CN": "客户扣费与退款",
+              ja: "顧客請求と返金",
+              ko: "고객 청구 및 환불",
+            })}
+          </h2>
           <p className="mt-1 max-w-2xl text-sm text-muted-foreground">
-            原始用量和扣费保持不变，退款以独立冲正交易追加到账本。
+            {t({
+              en: "Original usage and charges remain unchanged. Refunds are appended to the ledger as separate reversal transactions.",
+              "zh-CN": "原始用量和扣费保持不变，退款以独立冲正交易追加到账本。",
+              ja: "元の使用量と請求は変更されず、返金は独立した取消取引として台帳に追加されます。",
+              ko: "원래 사용량과 청구 내역은 유지되며, 환불은 별도의 취소 거래로 원장에 추가됩니다.",
+            })}
           </p>
         </div>
         <Button
           type="button"
           variant="outline"
           size="icon"
-          aria-label="刷新退款记录"
+          aria-label={t({
+            en: "Refresh refund records",
+            "zh-CN": "刷新退款记录",
+            ja: "返金履歴を更新",
+            ko: "환불 기록 새로고침",
+          })}
           onClick={query.retry}
           disabled={query.refreshing}
         >
@@ -134,22 +154,68 @@ export function CustomerRefundsPanel({
 
       <div className="flex flex-col gap-2 sm:flex-row">
         <Select value={state} onValueChange={(value) => setState(value as RefundState)}>
-          <SelectTrigger className="w-full sm:w-48" aria-label="筛选退款状态">
+          <SelectTrigger
+            className="w-full sm:w-48"
+            aria-label={t({
+              en: "Filter by refund status",
+              "zh-CN": "筛选退款状态",
+              ja: "返金ステータスで絞り込む",
+              ko: "환불 상태로 필터링",
+            })}
+          >
             <SelectValue />
           </SelectTrigger>
           <SelectContent>
-            <SelectItem value="refundable">可退款</SelectItem>
-            <SelectItem value="partially_refunded">部分退款</SelectItem>
-            <SelectItem value="fully_refunded">已全额退款</SelectItem>
-            <SelectItem value="all">全部扣费</SelectItem>
+            <SelectItem value="refundable">
+              {t({
+                en: "Refundable",
+                "zh-CN": "可退款",
+                ja: "返金可能",
+                ko: "환불 가능",
+              })}
+            </SelectItem>
+            <SelectItem value="partially_refunded">
+              {t({
+                en: "Partially refunded",
+                "zh-CN": "部分退款",
+                ja: "一部返金済み",
+                ko: "일부 환불됨",
+              })}
+            </SelectItem>
+            <SelectItem value="fully_refunded">
+              {t({
+                en: "Fully refunded",
+                "zh-CN": "已全额退款",
+                ja: "全額返金済み",
+                ko: "전액 환불됨",
+              })}
+            </SelectItem>
+            <SelectItem value="all">
+              {t({
+                en: "All charges",
+                "zh-CN": "全部扣费",
+                ja: "すべての請求",
+                ko: "모든 청구",
+              })}
+            </SelectItem>
           </SelectContent>
         </Select>
         <Input
           className="w-full sm:max-w-sm"
           value={tenantId}
           onChange={(event) => setTenantId(event.target.value)}
-          placeholder="按组织 ID 精确筛选"
-          aria-label="按组织 ID 筛选"
+          placeholder={t({
+            en: "Filter by exact organization ID",
+            "zh-CN": "按组织 ID 精确筛选",
+            ja: "組織 ID で完全一致検索",
+            ko: "정확한 조직 ID로 필터링",
+          })}
+          aria-label={t({
+            en: "Filter by organization ID",
+            "zh-CN": "按组织 ID 筛选",
+            ja: "組織 ID で絞り込む",
+            ko: "조직 ID로 필터링",
+          })}
         />
       </div>
 
@@ -167,7 +233,17 @@ export function CustomerRefundsPanel({
 
       {query.data ? (
         <div className="flex items-center justify-between">
-          <p className="text-sm text-muted-foreground">第 {cursors.length} 页</p>
+          <p className="text-sm text-muted-foreground">
+            {t(
+              {
+                en: "Page {page}",
+                "zh-CN": "第 {page} 页",
+                ja: "{page} ページ",
+                ko: "{page}페이지",
+              },
+              { page: cursors.length },
+            )}
+          </p>
           <div className="flex gap-2">
             <Button
               type="button"
@@ -181,7 +257,12 @@ export function CustomerRefundsPanel({
               disabled={cursors.length === 1 || query.refreshing}
             >
               <ChevronLeft aria-hidden="true" />
-              上一页
+              {t({
+                en: "Previous",
+                "zh-CN": "上一页",
+                ja: "前へ",
+                ko: "이전",
+              })}
             </Button>
             <Button
               type="button"
@@ -193,7 +274,12 @@ export function CustomerRefundsPanel({
               }}
               disabled={!query.data.has_more || query.refreshing}
             >
-              下一页
+              {t({
+                en: "Next",
+                "zh-CN": "下一页",
+                ja: "次へ",
+                ko: "다음",
+              })}
               <ChevronRight aria-hidden="true" />
             </Button>
           </div>
@@ -221,13 +307,26 @@ function ChargeTable({
   tenantNames: Map<string, string>;
   onSelect: (row: CustomerChargeView) => void;
 }) {
+  const { t, locale } = useI18n();
   if (rows.length === 0) {
     return (
       <div className="flex min-h-72 flex-col items-center justify-center rounded-md border px-6 text-center">
         <CheckCircle2 className="size-8 text-muted-foreground" aria-hidden="true" />
-        <h3 className="mt-4 text-sm font-medium">当前筛选下没有客户扣费</h3>
+        <h3 className="mt-4 text-sm font-medium">
+          {t({
+            en: "No customer charges match these filters",
+            "zh-CN": "当前筛选下没有客户扣费",
+            ja: "この条件に一致する顧客請求はありません",
+            ko: "현재 필터와 일치하는 고객 청구가 없습니다",
+          })}
+        </h3>
         <p className="mt-1 max-w-md text-sm text-muted-foreground">
-          已封账的客户扣费会显示在这里，并可查看不可变退款历史。
+          {t({
+            en: "Finalized customer charges appear here with their immutable refund history.",
+            "zh-CN": "已封账的客户扣费会显示在这里，并可查看不可变退款历史。",
+            ja: "確定済みの顧客請求と、変更不可能な返金履歴がここに表示されます。",
+            ko: "확정된 고객 청구와 변경할 수 없는 환불 이력이 여기에 표시됩니다.",
+          })}
         </p>
       </div>
     );
@@ -238,13 +337,42 @@ function ChargeTable({
       <Table className="min-w-[920px]">
         <TableHeader>
           <TableRow>
-            <TableHead className="pl-4">组织</TableHead>
-            <TableHead>原始扣费</TableHead>
-            <TableHead>已退款</TableHead>
-            <TableHead>剩余可退</TableHead>
-            <TableHead>状态</TableHead>
-            <TableHead>扣费时间</TableHead>
-            <TableHead className="w-24 pr-4 text-right">操作</TableHead>
+            <TableHead className="pl-4">
+              {t({ en: "Organization", "zh-CN": "组织", ja: "組織", ko: "조직" })}
+            </TableHead>
+            <TableHead>
+              {t({
+                en: "Original charge",
+                "zh-CN": "原始扣费",
+                ja: "元の請求",
+                ko: "원래 청구",
+              })}
+            </TableHead>
+            <TableHead>
+              {t({ en: "Refunded", "zh-CN": "已退款", ja: "返金済み", ko: "환불됨" })}
+            </TableHead>
+            <TableHead>
+              {t({
+                en: "Refundable",
+                "zh-CN": "剩余可退",
+                ja: "返金可能残高",
+                ko: "환불 가능 잔액",
+              })}
+            </TableHead>
+            <TableHead>
+              {t({ en: "Status", "zh-CN": "状态", ja: "ステータス", ko: "상태" })}
+            </TableHead>
+            <TableHead>
+              {t({
+                en: "Charged at",
+                "zh-CN": "扣费时间",
+                ja: "請求日時",
+                ko: "청구 시간",
+              })}
+            </TableHead>
+            <TableHead className="w-24 pr-4 text-right">
+              {t({ en: "Actions", "zh-CN": "操作", ja: "操作", ko: "작업" })}
+            </TableHead>
           </TableRow>
         </TableHeader>
         <TableBody>
@@ -271,7 +399,7 @@ function ChargeTable({
               <TableCell>
                 <RefundStateBadge state={row.refund_state} />
               </TableCell>
-              <TableCell>{formatDateTime(row.created_at_ms)}</TableCell>
+              <TableCell>{formatDateTime(row.created_at_ms, locale)}</TableCell>
               <TableCell className="pr-4 text-right">
                 <Button
                   type="button"
@@ -282,7 +410,7 @@ function ChargeTable({
                     onSelect(row);
                   }}
                 >
-                  查看
+                  {t({ en: "View", "zh-CN": "查看", ja: "表示", ko: "보기" })}
                   <ChevronRight aria-hidden="true" />
                 </Button>
               </TableCell>
@@ -305,6 +433,7 @@ function CustomerChargeSheet({
   onOpenChange: (open: boolean) => void;
   onRefunded: () => void;
 }) {
+  const { t, locale } = useI18n();
   const [refundOpen, setRefundOpen] = useState(false);
   const endpoint = transactionId
     ? `/admin/v1/billing/customer-charges/${encodeURIComponent(transactionId)}`
@@ -322,7 +451,14 @@ function CustomerChargeSheet({
       <Sheet open={Boolean(transactionId)} onOpenChange={onOpenChange}>
         <SheetContent className="flex h-full w-full flex-col gap-0 overflow-hidden p-0 sm:max-w-2xl">
           <SheetHeader className="shrink-0 border-b px-5 py-5 pr-12 text-left sm:px-6">
-            <SheetTitle>扣费详情</SheetTitle>
+            <SheetTitle>
+              {t({
+                en: "Charge details",
+                "zh-CN": "扣费详情",
+                ja: "請求の詳細",
+                ko: "청구 상세",
+              })}
+            </SheetTitle>
             <SheetDescription className="truncate font-mono">
               {transactionId ?? "--"}
             </SheetDescription>
@@ -337,15 +473,30 @@ function CustomerChargeSheet({
               <div className="space-y-7">
                 <dl className="grid gap-x-6 gap-y-4 sm:grid-cols-2">
                   <Definition
-                    label="组织"
+                    label={t({
+                      en: "Organization",
+                      "zh-CN": "组织",
+                      ja: "組織",
+                      ko: "조직",
+                    })}
                     value={tenantNames.get(charge.tenant_id) ?? charge.tenant_id}
                   />
                   <Definition
-                    label="状态"
-                    value={refundStateLabel(charge.refund_state)}
+                    label={t({
+                      en: "Status",
+                      "zh-CN": "状态",
+                      ja: "ステータス",
+                      ko: "상태",
+                    })}
+                    value={refundStateLabel(t, charge.refund_state)}
                   />
                   <Definition
-                    label="原始扣费"
+                    label={t({
+                      en: "Original charge",
+                      "zh-CN": "原始扣费",
+                      ja: "元の請求",
+                      ko: "원래 청구",
+                    })}
                     value={formatMoneyMicros(
                       charge.amount_micros,
                       charge.currency,
@@ -353,22 +504,59 @@ function CustomerChargeSheet({
                     mono
                   />
                   <Definition
-                    label="剩余可退"
+                    label={t({
+                      en: "Refundable",
+                      "zh-CN": "剩余可退",
+                      ja: "返金可能残高",
+                      ko: "환불 가능 잔액",
+                    })}
                     value={formatMoneyMicros(
                       charge.remaining_refundable_micros,
                       charge.currency,
                     )}
                     mono
                   />
-                  <Definition label="扣费时间" value={formatDateTime(charge.created_at_ms)} />
-                  <Definition label="Job ID" value={charge.job_id} mono />
+                  <Definition
+                    label={t({
+                      en: "Charged at",
+                      "zh-CN": "扣费时间",
+                      ja: "請求日時",
+                      ko: "청구 시간",
+                    })}
+                    value={formatDateTime(charge.created_at_ms, locale)}
+                  />
+                  <Definition
+                    label={t({
+                      en: "Job ID",
+                      "zh-CN": "任务 ID",
+                      ja: "ジョブ ID",
+                      ko: "작업 ID",
+                    })}
+                    value={charge.job_id}
+                    mono
+                  />
                 </dl>
 
                 <section>
                   <div className="mb-3 flex items-center justify-between gap-3">
-                    <h3 className="text-sm font-semibold">退款历史</h3>
+                    <h3 className="text-sm font-semibold">
+                      {t({
+                        en: "Refund history",
+                        "zh-CN": "退款历史",
+                        ja: "返金履歴",
+                        ko: "환불 이력",
+                      })}
+                    </h3>
                     <span className="text-xs text-muted-foreground">
-                      {charge.refunds.length} 笔
+                      {t(
+                        {
+                          en: "{count} refunds",
+                          "zh-CN": "{count} 笔",
+                          ja: "{count} 件",
+                          ko: "{count}건",
+                        },
+                        { count: charge.refunds.length },
+                      )}
                     </span>
                   </div>
                   <RefundHistory
@@ -388,7 +576,19 @@ function CustomerChargeSheet({
                 disabled={charge.remaining_refundable_micros === "0"}
               >
                 <RotateCcw aria-hidden="true" />
-                {charge.remaining_refundable_micros === "0" ? "已全额退款" : "发起退款"}
+                {charge.remaining_refundable_micros === "0"
+                  ? t({
+                      en: "Fully refunded",
+                      "zh-CN": "已全额退款",
+                      ja: "全額返金済み",
+                      ko: "전액 환불됨",
+                    })
+                  : t({
+                      en: "Issue refund",
+                      "zh-CN": "发起退款",
+                      ja: "返金する",
+                      ko: "환불 처리",
+                    })}
               </Button>
             </SheetFooter>
           ) : null}
@@ -415,10 +615,16 @@ function RefundHistory({
   refunds: CustomerRefundView[];
   currency: string;
 }) {
+  const { t, locale } = useI18n();
   if (refunds.length === 0) {
     return (
       <div className="rounded-md border px-4 py-10 text-center text-sm text-muted-foreground">
-        尚未发生退款
+        {t({
+          en: "No refunds yet",
+          "zh-CN": "尚未发生退款",
+          ja: "返金はまだありません",
+          ko: "아직 환불 내역이 없습니다",
+        })}
       </div>
     );
   }
@@ -427,10 +633,18 @@ function RefundHistory({
       <Table className="min-w-[620px]">
         <TableHeader>
           <TableRow>
-            <TableHead className="pl-4">金额</TableHead>
-            <TableHead>原因</TableHead>
-            <TableHead>操作人</TableHead>
-            <TableHead className="pr-4">时间</TableHead>
+            <TableHead className="pl-4">
+              {t({ en: "Amount", "zh-CN": "金额", ja: "金額", ko: "금액" })}
+            </TableHead>
+            <TableHead>
+              {t({ en: "Reason", "zh-CN": "原因", ja: "理由", ko: "사유" })}
+            </TableHead>
+            <TableHead>
+              {t({ en: "Actor", "zh-CN": "操作人", ja: "実行者", ko: "처리자" })}
+            </TableHead>
+            <TableHead className="pr-4">
+              {t({ en: "Time", "zh-CN": "时间", ja: "日時", ko: "시간" })}
+            </TableHead>
           </TableRow>
         </TableHeader>
         <TableBody>
@@ -440,7 +654,7 @@ function RefundHistory({
                 {formatMoneyMicros(refund.amount_micros, currency)}
               </TableCell>
               <TableCell className="max-w-64">
-                <p>{refundReasonLabel(refund.reason_code)}</p>
+                <p>{refundReasonLabel(t, refund.reason_code)}</p>
                 <p className="mt-0.5 truncate text-xs text-muted-foreground">
                   {refund.reason}
                 </p>
@@ -449,7 +663,7 @@ function RefundHistory({
                 {refund.actor_user_id}
               </TableCell>
               <TableCell className="pr-4">
-                {formatDateTime(refund.created_at_ms)}
+                {formatDateTime(refund.created_at_ms, locale)}
               </TableCell>
             </TableRow>
           ))}
@@ -470,6 +684,7 @@ function RefundDialog({
   onOpenChange: (open: boolean) => void;
   onSuccess: () => void;
 }) {
+  const { t } = useI18n();
   const [amount, setAmount] = useState("");
   const [reasonCode, setReasonCode] = useState("customer_request");
   const [reason, setReason] = useState("");
@@ -491,11 +706,25 @@ function RefundDialog({
       amountMicros === null ||
       BigInt(amountMicros) > BigInt(charge.remaining_refundable_micros)
     ) {
-      setError("退款金额必须大于 0，且不能超过剩余可退金额");
+      setError(
+        t({
+          en: "The refund amount must be greater than 0 and cannot exceed the refundable balance.",
+          "zh-CN": "退款金额必须大于 0，且不能超过剩余可退金额",
+          ja: "返金額は 0 より大きく、返金可能残高を超えないようにしてください。",
+          ko: "환불 금액은 0보다 커야 하며 환불 가능 잔액을 초과할 수 없습니다.",
+        }),
+      );
       return;
     }
     if (reason.trim().length < 3) {
-      setError("请填写至少 3 个字符的退款说明");
+      setError(
+        t({
+          en: "Enter a refund note of at least 3 characters.",
+          "zh-CN": "请填写至少 3 个字符的退款说明",
+          ja: "返金メモを 3 文字以上入力してください。",
+          ko: "환불 설명을 3자 이상 입력하세요.",
+        }),
+      );
       return;
     }
 
@@ -519,12 +748,28 @@ function RefundDialog({
           }),
         },
       );
-      if (!response.ok) throw new Error(await responseMessage(response));
-      toast.success("退款已记入账本");
+      if (!response.ok) throw new Error(await responseMessage(response, t));
+      toast.success(
+        t({
+          en: "Refund recorded in the ledger",
+          "zh-CN": "退款已记入账本",
+          ja: "返金を台帳に記録しました",
+          ko: "환불이 원장에 기록되었습니다",
+        }),
+      );
       onOpenChange(false);
       onSuccess();
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "退款失败");
+      setError(
+        caught instanceof Error
+          ? caught.message
+          : t({
+              en: "Refund failed",
+              "zh-CN": "退款失败",
+              ja: "返金に失敗しました",
+              ko: "환불에 실패했습니다",
+            }),
+      );
     } finally {
       setSaving(false);
     }
@@ -534,9 +779,21 @@ function RefundDialog({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="max-h-[calc(100vh-2rem)] overflow-y-auto sm:max-w-xl">
         <DialogHeader>
-          <DialogTitle>确认客户退款</DialogTitle>
+          <DialogTitle>
+            {t({
+              en: "Confirm customer refund",
+              "zh-CN": "确认客户退款",
+              ja: "顧客への返金を確認",
+              ko: "고객 환불 확인",
+            })}
+          </DialogTitle>
           <DialogDescription>
-            此操作会追加不可变冲正交易，不会删除原始用量或扣费记录。
+            {t({
+              en: "This adds an immutable reversal transaction without deleting the original usage or charge.",
+              "zh-CN": "此操作会追加不可变冲正交易，不会删除原始用量或扣费记录。",
+              ja: "この操作は変更不可能な取消取引を追加し、元の使用量や請求は削除しません。",
+              ko: "이 작업은 변경할 수 없는 취소 거래를 추가하며 원래 사용량이나 청구 기록을 삭제하지 않습니다.",
+            })}
           </DialogDescription>
         </DialogHeader>
 
@@ -544,7 +801,14 @@ function RefundDialog({
           <div className="grid gap-5 py-1">
             <div className="rounded-md bg-muted/40 px-4 py-3 text-sm">
               <div className="flex items-center justify-between gap-4">
-                <span className="text-muted-foreground">剩余可退</span>
+                <span className="text-muted-foreground">
+                  {t({
+                    en: "Refundable",
+                    "zh-CN": "剩余可退",
+                    ja: "返金可能残高",
+                    ko: "환불 가능 잔액",
+                  })}
+                </span>
                 <span className="font-mono font-medium tabular-nums">
                   {formatMoneyMicros(
                     charge.remaining_refundable_micros,
@@ -554,7 +818,14 @@ function RefundDialog({
               </div>
             </div>
             <div className="grid gap-2">
-              <Label htmlFor="refund-amount">退款金额</Label>
+              <Label htmlFor="refund-amount">
+                {t({
+                  en: "Refund amount",
+                  "zh-CN": "退款金额",
+                  ja: "返金額",
+                  ko: "환불 금액",
+                })}
+              </Label>
               <div className="flex">
                 <span className="flex h-9 items-center rounded-l-md border border-r-0 bg-muted px-3 text-sm text-muted-foreground">
                   {charge.currency}
@@ -570,7 +841,14 @@ function RefundDialog({
               </div>
             </div>
             <div className="grid gap-2">
-              <Label htmlFor="refund-reason-code">退款原因</Label>
+              <Label htmlFor="refund-reason-code">
+                {t({
+                  en: "Refund reason",
+                  "zh-CN": "退款原因",
+                  ja: "返金理由",
+                  ko: "환불 사유",
+                })}
+              </Label>
               <Select
                 value={reasonCode}
                 onValueChange={setReasonCode}
@@ -580,24 +858,46 @@ function RefundDialog({
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="customer_request">客户申请</SelectItem>
-                  <SelectItem value="service_failure">服务失败</SelectItem>
-                  <SelectItem value="billing_correction">计费更正</SelectItem>
-                  <SelectItem value="fraud_dispute">欺诈或争议</SelectItem>
-                  <SelectItem value="provider_refund_pass_through">
-                    上游退款转付
+                  <SelectItem value="customer_request">
+                    {refundReasonLabel(t, "customer_request")}
                   </SelectItem>
-                  <SelectItem value="other">其他</SelectItem>
+                  <SelectItem value="service_failure">
+                    {refundReasonLabel(t, "service_failure")}
+                  </SelectItem>
+                  <SelectItem value="billing_correction">
+                    {refundReasonLabel(t, "billing_correction")}
+                  </SelectItem>
+                  <SelectItem value="fraud_dispute">
+                    {refundReasonLabel(t, "fraud_dispute")}
+                  </SelectItem>
+                  <SelectItem value="provider_refund_pass_through">
+                    {refundReasonLabel(t, "provider_refund_pass_through")}
+                  </SelectItem>
+                  <SelectItem value="other">
+                    {refundReasonLabel(t, "other")}
+                  </SelectItem>
                 </SelectContent>
               </Select>
             </div>
             <div className="grid gap-2">
-              <Label htmlFor="refund-reason">退款说明</Label>
+              <Label htmlFor="refund-reason">
+                {t({
+                  en: "Refund note",
+                  "zh-CN": "退款说明",
+                  ja: "返金メモ",
+                  ko: "환불 설명",
+                })}
+              </Label>
               <Textarea
                 id="refund-reason"
                 value={reason}
                 onChange={(event) => setReason(event.target.value)}
-                placeholder="填写工单号或退款依据"
+                placeholder={t({
+                  en: "Enter a ticket number or refund justification",
+                  "zh-CN": "填写工单号或退款依据",
+                  ja: "チケット番号または返金の根拠を入力",
+                  ko: "티켓 번호 또는 환불 근거 입력",
+                })}
                 maxLength={500}
                 disabled={saving}
               />
@@ -617,7 +917,7 @@ function RefundDialog({
             onClick={() => onOpenChange(false)}
             disabled={saving}
           >
-            取消
+            {t({ en: "Cancel", "zh-CN": "取消", ja: "キャンセル", ko: "취소" })}
           </Button>
           <Button type="button" onClick={() => void submit()} disabled={saving}>
             {saving ? (
@@ -625,7 +925,12 @@ function RefundDialog({
             ) : (
               <RotateCcw aria-hidden="true" />
             )}
-            确认退款
+            {t({
+              en: "Confirm refund",
+              "zh-CN": "确认退款",
+              ja: "返金を確定",
+              ko: "환불 확인",
+            })}
           </Button>
         </DialogFooter>
       </DialogContent>
@@ -642,13 +947,22 @@ function MoneyCell({ value, currency }: { value: string; currency: string }) {
 }
 
 function RefundStateBadge({ state }: { state: CustomerChargeView["refund_state"] }) {
+  const { t } = useI18n();
   if (state === "fully_refunded") {
-    return <Badge variant="outline">已全额退款</Badge>;
+    return (
+      <Badge variant="outline">
+        {refundStateLabel(t, "fully_refunded")}
+      </Badge>
+    );
   }
   if (state === "partially_refunded") {
-    return <Badge variant="secondary">部分退款</Badge>;
+    return (
+      <Badge variant="secondary">
+        {refundStateLabel(t, "partially_refunded")}
+      </Badge>
+    );
   }
-  return <Badge>可退款</Badge>;
+  return <Badge>{refundStateLabel(t, "refundable")}</Badge>;
 }
 
 function Definition({
@@ -675,32 +989,104 @@ function Definition({
   );
 }
 
-function refundStateLabel(state: CustomerChargeView["refund_state"]) {
-  if (state === "fully_refunded") return "已全额退款";
-  if (state === "partially_refunded") return "部分退款";
-  return "可退款";
+function refundStateLabel(
+  t: Translate,
+  state: CustomerChargeView["refund_state"],
+) {
+  if (state === "fully_refunded") {
+    return t({
+      en: "Fully refunded",
+      "zh-CN": "已全额退款",
+      ja: "全額返金済み",
+      ko: "전액 환불됨",
+    });
+  }
+  if (state === "partially_refunded") {
+    return t({
+      en: "Partially refunded",
+      "zh-CN": "部分退款",
+      ja: "一部返金済み",
+      ko: "일부 환불됨",
+    });
+  }
+  return t({
+    en: "Refundable",
+    "zh-CN": "可退款",
+    ja: "返金可能",
+    ko: "환불 가능",
+  });
 }
 
-function refundReasonLabel(reasonCode: string) {
-  const labels: Record<string, string> = {
-    customer_request: "客户申请",
-    service_failure: "服务失败",
-    billing_correction: "计费更正",
-    fraud_dispute: "欺诈或争议",
-    provider_refund_pass_through: "上游退款转付",
-    other: "其他",
+function refundReasonLabel(t: Translate, reasonCode: string) {
+  const labels: Record<string, ReturnType<Translate>> = {
+    customer_request: t({
+      en: "Customer request",
+      "zh-CN": "客户申请",
+      ja: "顧客からの依頼",
+      ko: "고객 요청",
+    }),
+    service_failure: t({
+      en: "Service failure",
+      "zh-CN": "服务失败",
+      ja: "サービス障害",
+      ko: "서비스 실패",
+    }),
+    billing_correction: t({
+      en: "Billing correction",
+      "zh-CN": "计费更正",
+      ja: "請求訂正",
+      ko: "청구 정정",
+    }),
+    fraud_dispute: t({
+      en: "Fraud or dispute",
+      "zh-CN": "欺诈或争议",
+      ja: "不正利用または異議申し立て",
+      ko: "사기 또는 분쟁",
+    }),
+    provider_refund_pass_through: t({
+      en: "Provider refund pass-through",
+      "zh-CN": "上游退款转付",
+      ja: "プロバイダー返金の転送",
+      ko: "공급자 환불 전달",
+    }),
+    other: t({
+      en: "Other",
+      "zh-CN": "其他",
+      ja: "その他",
+      ko: "기타",
+    }),
   };
   return labels[reasonCode] ?? reasonCode;
 }
 
-async function responseMessage(response: Response) {
+async function responseMessage(response: Response, t: Translate) {
   try {
     const body = (await response.json()) as {
       error?: { message?: string };
       message?: string;
     };
-    return body.error?.message ?? body.message ?? `请求失败（${response.status}）`;
+    return (
+      body.error?.message ??
+      body.message ??
+      t(
+        {
+          en: "Request failed ({status})",
+          "zh-CN": "请求失败（{status}）",
+          ja: "リクエストに失敗しました（{status}）",
+          ko: "요청 실패({status})",
+        },
+        { status: response.status },
+      )
+    );
   } catch {
-    return `请求失败（${response.status}）`;
+    return t(
+      {
+        en: "Request failed ({status})",
+        "zh-CN": "请求失败（{status}）",
+        ja: "リクエストに失敗しました（{status}）",
+        ko: "요청 실패({status})",
+      },
+      { status: response.status },
+    );
   }
 }

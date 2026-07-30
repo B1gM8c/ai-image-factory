@@ -5,10 +5,19 @@ import { pageTitles } from "@/lib/navigation";
 import { NotificationMenu } from "@/components/shell/notification-menu";
 import { Separator } from "@/components/ui/separator";
 import { SidebarTrigger } from "@/components/ui/sidebar";
+import { useI18n } from "@/i18n/locale-provider";
 
 export function SiteHeader() {
   const pathname = usePathname();
-  const title = pageTitles[pathname] ?? "运营控制台";
+  const { t } = useI18n();
+  const title = t(
+    pageTitles[pathname] ?? {
+      en: "Operations console",
+      "zh-CN": "运营控制台",
+      ja: "運用コンソール",
+      ko: "운영 콘솔",
+    },
+  );
 
   return (
     <header className="flex h-[var(--header-height)] shrink-0 items-center gap-2 border-b transition-[width,height] ease-linear">

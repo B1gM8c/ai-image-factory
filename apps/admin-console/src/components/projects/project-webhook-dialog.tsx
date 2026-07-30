@@ -15,6 +15,7 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { useI18n } from "@/i18n/locale-provider";
 import { consoleFetch } from "@/lib/auth/client";
 import {
   WEBHOOK_EVENT_LABELS,
@@ -39,6 +40,7 @@ export function ProjectWebhookDialog({
   onSaved: () => void | Promise<void>;
   onSecret: (secret: string) => void;
 }) {
+  const { t } = useI18n();
   const [name, setName] = useState("");
   const [url, setUrl] = useState("");
   const [eventTypes, setEventTypes] = useState<WebhookEventType[]>([
@@ -70,11 +72,11 @@ export function ProjectWebhookDialog({
   async function submit(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!url.trim()) {
-      setError("请输入 Endpoint URL");
+      setError(t({ en: "Enter an Endpoint URL", "zh-CN": "请输入 Endpoint URL", ja: "Endpoint URL を入力してください", ko: "Endpoint URL을 입력하세요" }));
       return;
     }
     if (eventTypes.length === 0) {
-      setError("至少选择一个订阅事件");
+      setError(t({ en: "Select at least one event", "zh-CN": "至少选择一个订阅事件", ja: "少なくとも 1 つのイベントを選択してください", ko: "이벤트를 하나 이상 선택하세요" }));
       return;
     }
     setSaving(true);
@@ -102,18 +104,25 @@ export function ProjectWebhookDialog({
               },
         ),
       });
-      if (!response.ok) throw new Error(await responseMessage(response));
+      if (!response.ok) {
+        throw new Error(
+          await responseMessage(
+            response,
+            t({ en: "Request failed", "zh-CN": "请求失败", ja: "リクエストに失敗しました", ko: "요청에 실패했습니다" }),
+          ),
+        );
+      }
       if (endpoint) {
-        toast.success("Webhook 已更新");
+        toast.success(t({ en: "Webhook updated", "zh-CN": "Webhook 已更新", ja: "Webhook を更新しました", ko: "Webhook을 업데이트했습니다" }));
       } else {
         const created = (await response.json()) as CreatedProjectWebhook;
         onSecret(created.signing_secret);
-        toast.success("Webhook 已创建");
+        toast.success(t({ en: "Webhook created", "zh-CN": "Webhook 已创建", ja: "Webhook を作成しました", ko: "Webhook을 만들었습니다" }));
       }
       onOpenChange(false);
       await onSaved();
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "Webhook 保存失败");
+      setError(reason instanceof Error ? reason.message : t({ en: "Failed to save webhook", "zh-CN": "Webhook 保存失败", ja: "Webhook を保存できませんでした", ko: "Webhook을 저장하지 못했습니다" }));
     } finally {
       setSaving(false);
     }
@@ -129,26 +138,37 @@ export function ProjectWebhookDialog({
       <DialogContent className="max-h-[calc(100dvh-2rem)] w-[calc(100%-2rem)] overflow-y-auto sm:max-w-xl">
         <form onSubmit={submit} className="space-y-5">
           <DialogHeader>
-            <DialogTitle>{endpoint ? "编辑 Webhook" : "创建 Webhook"}</DialogTitle>
+            <DialogTitle>
+              {endpoint
+                ? t({ en: "Edit webhook", "zh-CN": "编辑 Webhook", ja: "Webhook を編集", ko: "Webhook 편집" })
+                : t({ en: "Create webhook", "zh-CN": "创建 Webhook", ja: "Webhook を作成", ko: "Webhook 만들기" })}
+            </DialogTitle>
             <DialogDescription>
-              项目事件会使用 Standard Webhooks 签名后发送到这个地址。
+              {t({ en: "Project events are signed using Standard Webhooks and sent to this URL.", "zh-CN": "项目事件会使用 Standard Webhooks 签名后发送到这个地址。", ja: "プロジェクトイベントは Standard Webhooks で署名され、この URL に送信されます。", ko: "프로젝트 이벤트는 Standard Webhooks로 서명된 후 이 URL로 전송됩니다." })}
             </DialogDescription>
           </DialogHeader>
 
           <div className="space-y-2">
-            <Label htmlFor="webhook-name">名称（可选）</Label>
+            <Label htmlFor="webhook-name">{t({ en: "Name (optional)", "zh-CN": "名称（可选）", ja: "名前（任意）", ko: "이름(선택 사항)" })}</Label>
             <Input
               id="webhook-name"
               value={name}
               onChange={(event) => setName(event.target.value)}
-              placeholder="例如：生产环境媒体事件"
+              placeholder={t({ en: "For example: Production media events", "zh-CN": "例如：生产环境媒体事件", ja: "例: 本番メディアイベント", ko: "예: 프로덕션 미디어 이벤트" })}
               maxLength={128}
               disabled={saving}
             />
           </div>
 
           <div className="space-y-2">
-            <Label htmlFor="webhook-url">Endpoint URL</Label>
+            <Label htmlFor="webhook-url">
+              {t({
+                en: "Endpoint URL",
+                "zh-CN": "端点 URL",
+                ja: "エンドポイント URL",
+                ko: "엔드포인트 URL",
+              })}
+            </Label>
             <Input
               id="webhook-url"
               type="url"
@@ -159,12 +179,12 @@ export function ProjectWebhookDialog({
               disabled={saving}
             />
             <p className="text-xs leading-5 text-muted-foreground">
-              生产环境仅允许解析到公网地址的 HTTPS URL，不跟随重定向。
+              {t({ en: "Production only accepts HTTPS URLs that resolve to public addresses. Redirects are not followed.", "zh-CN": "生产环境仅允许解析到公网地址的 HTTPS URL，不跟随重定向。", ja: "本番環境では、公開アドレスに解決される HTTPS URL のみ使用できます。リダイレクトには追従しません。", ko: "프로덕션에서는 공개 주소로 확인되는 HTTPS URL만 허용하며 리디렉션을 따르지 않습니다." })}
             </p>
           </div>
 
           <fieldset className="space-y-3">
-            <legend className="text-sm font-medium">订阅事件</legend>
+            <legend className="text-sm font-medium">{t({ en: "Events", "zh-CN": "订阅事件", ja: "購読イベント", ko: "구독 이벤트" })}</legend>
             <div className="max-h-64 space-y-1 overflow-y-auto rounded-md border p-2">
               {WEBHOOK_EVENT_TYPES.map((eventType) => {
                 const checked = eventTypes.includes(eventType);
@@ -179,11 +199,11 @@ export function ProjectWebhookDialog({
                         toggleEvent(eventType, value === true)
                       }
                       disabled={saving}
-                      aria-label={WEBHOOK_EVENT_LABELS[eventType]}
+                      aria-label={t(WEBHOOK_EVENT_LABELS[eventType])}
                     />
                     <span className="min-w-0">
                       <span className="block text-sm">
-                        {WEBHOOK_EVENT_LABELS[eventType]}
+                        {t(WEBHOOK_EVENT_LABELS[eventType])}
                       </span>
                       <span className="block break-all font-mono text-xs text-muted-foreground">
                         {eventType}
@@ -208,7 +228,7 @@ export function ProjectWebhookDialog({
               onClick={() => onOpenChange(false)}
               disabled={saving}
             >
-              取消
+              {t({ en: "Cancel", "zh-CN": "取消", ja: "キャンセル", ko: "취소" })}
             </Button>
             <Button type="submit" disabled={saving || !url.trim()}>
               {saving ? (
@@ -218,7 +238,9 @@ export function ProjectWebhookDialog({
               ) : (
                 <Webhook aria-hidden="true" />
               )}
-              {endpoint ? "保存更改" : "创建 Webhook"}
+              {endpoint
+                ? t({ en: "Save changes", "zh-CN": "保存更改", ja: "変更を保存", ko: "변경 사항 저장" })
+                : t({ en: "Create webhook", "zh-CN": "创建 Webhook", ja: "Webhook を作成", ko: "Webhook 만들기" })}
             </Button>
           </DialogFooter>
         </form>
@@ -227,7 +249,7 @@ export function ProjectWebhookDialog({
   );
 }
 
-async function responseMessage(response: Response) {
+async function responseMessage(response: Response, fallback: string) {
   const body = (await response.json().catch(() => null)) as
     | { error?: string | { message?: string } }
     | null;
@@ -235,5 +257,5 @@ async function responseMessage(response: Response) {
   if (body?.error && typeof body.error === "object" && body.error.message) {
     return body.error.message;
   }
-  return `请求失败 (${response.status})`;
+  return `${fallback} (${response.status})`;
 }

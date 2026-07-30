@@ -2,6 +2,7 @@
 
 import { FormEvent, useState } from "react";
 import { Filter, Search, X } from "lucide-react";
+import { formatActivityStatus } from "@/components/activity-status-badge";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -12,7 +13,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { formatStatus } from "@/lib/admin/format";
+import { useI18n } from "@/i18n/locale-provider";
 
 export type ActivityFilterValues = {
   q: string;
@@ -45,6 +46,7 @@ export function ActivityFilters({
   onSubmit,
   onClear,
 }: ActivityFiltersProps) {
+  const { t } = useI18n();
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const advancedCount = [
     value.model,
@@ -71,12 +73,24 @@ export function ActivityFilters({
             className="absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground"
             aria-hidden="true"
           />
-          <span className="sr-only">搜索 Request ID 或 Job ID</span>
+          <span className="sr-only">
+            {t({
+              en: "Search by Request ID or Job ID",
+              "zh-CN": "搜索 Request ID 或 Job ID",
+              ja: "Request ID または Job ID で検索",
+              ko: "Request ID 또는 Job ID로 검색",
+            })}
+          </span>
           <Input
             className="pl-9"
             value={value.q}
             onChange={(event) => onChange({ ...value, q: event.target.value })}
-            placeholder="搜索 Request ID 或 Job ID"
+            placeholder={t({
+              en: "Search by Request ID or Job ID",
+              "zh-CN": "搜索 Request ID 或 Job ID",
+              ja: "Request ID または Job ID で検索",
+              ko: "Request ID 또는 Job ID로 검색",
+            })}
             maxLength={255}
             disabled={disabled}
           />
@@ -86,16 +100,65 @@ export function ActivityFilters({
           onValueChange={(window) => onChange({ ...value, window })}
           disabled={disabled}
         >
-          <SelectTrigger aria-label="选择时间范围">
+          <SelectTrigger
+            aria-label={t({
+              en: "Select time range",
+              "zh-CN": "选择时间范围",
+              ja: "期間を選択",
+              ko: "기간 선택",
+            })}
+          >
             <SelectValue />
           </SelectTrigger>
           <SelectContent>
-            <SelectItem value="1h">最近 1 小时</SelectItem>
-            <SelectItem value="6h">最近 6 小时</SelectItem>
-            <SelectItem value="24h">最近 24 小时</SelectItem>
-            <SelectItem value="7d">最近 7 天</SelectItem>
-            <SelectItem value="30d">最近 30 天</SelectItem>
-            <SelectItem value="90d">最近 90 天</SelectItem>
+            <SelectItem value="1h">
+              {t({
+                en: "Last hour",
+                "zh-CN": "最近 1 小时",
+                ja: "過去 1 時間",
+                ko: "최근 1시간",
+              })}
+            </SelectItem>
+            <SelectItem value="6h">
+              {t({
+                en: "Last 6 hours",
+                "zh-CN": "最近 6 小时",
+                ja: "過去 6 時間",
+                ko: "최근 6시간",
+              })}
+            </SelectItem>
+            <SelectItem value="24h">
+              {t({
+                en: "Last 24 hours",
+                "zh-CN": "最近 24 小时",
+                ja: "過去 24 時間",
+                ko: "최근 24시간",
+              })}
+            </SelectItem>
+            <SelectItem value="7d">
+              {t({
+                en: "Last 7 days",
+                "zh-CN": "最近 7 天",
+                ja: "過去 7 日間",
+                ko: "최근 7일",
+              })}
+            </SelectItem>
+            <SelectItem value="30d">
+              {t({
+                en: "Last 30 days",
+                "zh-CN": "最近 30 天",
+                ja: "過去 30 日間",
+                ko: "최근 30일",
+              })}
+            </SelectItem>
+            <SelectItem value="90d">
+              {t({
+                en: "Last 90 days",
+                "zh-CN": "最近 90 天",
+                ja: "過去 90 日間",
+                ko: "최근 90일",
+              })}
+            </SelectItem>
           </SelectContent>
         </Select>
         <Select
@@ -103,11 +166,32 @@ export function ActivityFilters({
           onValueChange={(provider) => onChange({ ...value, provider })}
           disabled={disabled}
         >
-          <SelectTrigger aria-label="选择 Provider">
-            <SelectValue placeholder="全部 Provider" />
+          <SelectTrigger
+            aria-label={t({
+              en: "Select provider",
+              "zh-CN": "选择 Provider",
+              ja: "Provider を選択",
+              ko: "Provider 선택",
+            })}
+          >
+            <SelectValue
+              placeholder={t({
+                en: "All providers",
+                "zh-CN": "全部 Provider",
+                ja: "すべての Provider",
+                ko: "모든 Provider",
+              })}
+            />
           </SelectTrigger>
           <SelectContent>
-            <SelectItem value="all">全部 Provider</SelectItem>
+            <SelectItem value="all">
+              {t({
+                en: "All providers",
+                "zh-CN": "全部 Provider",
+                ja: "すべての Provider",
+                ko: "모든 Provider",
+              })}
+            </SelectItem>
             {providers.map((provider) => (
               <SelectItem key={provider} value={provider}>
                 {provider}
@@ -120,14 +204,35 @@ export function ActivityFilters({
           onValueChange={(state) => onChange({ ...value, state })}
           disabled={disabled}
         >
-          <SelectTrigger aria-label="选择请求状态">
-            <SelectValue placeholder="全部状态" />
+          <SelectTrigger
+            aria-label={t({
+              en: "Select request status",
+              "zh-CN": "选择请求状态",
+              ja: "リクエスト状態を選択",
+              ko: "요청 상태 선택",
+            })}
+          >
+            <SelectValue
+              placeholder={t({
+                en: "All statuses",
+                "zh-CN": "全部状态",
+                ja: "すべての状態",
+                ko: "모든 상태",
+              })}
+            />
           </SelectTrigger>
           <SelectContent>
-            <SelectItem value="all">全部状态</SelectItem>
+            <SelectItem value="all">
+              {t({
+                en: "All statuses",
+                "zh-CN": "全部状态",
+                ja: "すべての状態",
+                ko: "모든 상태",
+              })}
+            </SelectItem>
             {states.map((state) => (
               <SelectItem key={state} value={state}>
-                {formatStatus(state)}
+                {formatActivityStatus(t, state)}
               </SelectItem>
             ))}
           </SelectContent>
@@ -141,14 +246,24 @@ export function ActivityFilters({
             aria-expanded={advancedOpen}
           >
             <Filter aria-hidden="true" />
-            更多筛选
+            {t({
+              en: "More filters",
+              "zh-CN": "更多筛选",
+              ja: "その他のフィルター",
+              ko: "추가 필터",
+            })}
             {advancedCount > 0 ? (
               <Badge variant="secondary">{advancedCount}</Badge>
             ) : null}
           </Button>
           <Button type="submit" disabled={disabled}>
             <Search aria-hidden="true" />
-            查询
+            {t({
+              en: "Search",
+              "zh-CN": "查询",
+              ja: "検索",
+              ko: "검색",
+            })}
           </Button>
         </div>
       </div>
@@ -160,34 +275,64 @@ export function ActivityFilters({
           }`}
         >
           <Input
-            aria-label="按模型筛选"
+            aria-label={t({
+              en: "Filter by model",
+              "zh-CN": "按模型筛选",
+              ja: "モデルで絞り込む",
+              ko: "모델로 필터링",
+            })}
             value={value.model}
             onChange={(event) =>
               onChange({ ...value, model: event.target.value })
             }
-            placeholder="模型 ID"
+            placeholder={t({
+              en: "Model ID",
+              "zh-CN": "模型 ID",
+              ja: "Model ID",
+              ko: "Model ID",
+            })}
             maxLength={255}
             disabled={disabled}
           />
           {showProjectFilter ? (
             <Input
-              aria-label="按项目 ID 筛选"
+              aria-label={t({
+                en: "Filter by Project ID",
+                "zh-CN": "按项目 ID 筛选",
+                ja: "Project ID で絞り込む",
+                ko: "Project ID로 필터링",
+              })}
               value={value.projectId}
               onChange={(event) =>
                 onChange({ ...value, projectId: event.target.value })
               }
-              placeholder="Project ID"
+              placeholder={t({
+                en: "Project ID",
+                "zh-CN": "项目 ID",
+                ja: "プロジェクト ID",
+                ko: "프로젝트 ID",
+              })}
               maxLength={128}
               disabled={disabled}
             />
           ) : null}
           <Input
-            aria-label="按 API Key ID 筛选"
+            aria-label={t({
+              en: "Filter by API Key ID",
+              "zh-CN": "按 API Key ID 筛选",
+              ja: "API Key ID で絞り込む",
+              ko: "API Key ID로 필터링",
+            })}
             value={value.apiKeyId}
             onChange={(event) =>
               onChange({ ...value, apiKeyId: event.target.value })
             }
-            placeholder="API Key ID"
+            placeholder={t({
+              en: "API key ID",
+              "zh-CN": "API 密钥 ID",
+              ja: "API キー ID",
+              ko: "API 키 ID",
+            })}
             maxLength={128}
             disabled={disabled}
           />
@@ -204,7 +349,12 @@ export function ActivityFilters({
             disabled={disabled}
           >
             <X aria-hidden="true" />
-            清除筛选
+            {t({
+              en: "Clear filters",
+              "zh-CN": "清除筛选",
+              ja: "フィルターをクリア",
+              ko: "필터 지우기",
+            })}
           </Button>
         </div>
       ) : null}

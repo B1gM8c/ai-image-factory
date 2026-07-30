@@ -2,6 +2,7 @@
 name = "gpt-image-2-gateway"
 version = "0.1.0"
 edition = "2024"
+license.workspace = true
 default-run = "gpt-image-2-gateway"
 
 [dependencies]

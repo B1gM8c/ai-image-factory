@@ -7,18 +7,59 @@ import {
   ChartTooltipContent,
   type ChartConfig,
 } from "@/components/ui/chart";
+import { useI18n } from "@/i18n/locale-provider";
 import type { ProviderProfileReadiness } from "@/lib/gateway/server";
 
-const chartConfig = {
-  count: { label: "Profile 数", color: "var(--chart-2)" },
-} satisfies ChartConfig;
-
 export function ReadinessChart({ profiles }: { profiles: ProviderProfileReadiness }) {
+  const { t } = useI18n();
+  const chartConfig = {
+    count: {
+      label: t({
+        en: "Profiles",
+        "zh-CN": "Profile 数",
+        ja: "プロファイル数",
+        ko: "프로필 수",
+      }),
+      color: "var(--chart-2)",
+    },
+  } satisfies ChartConfig;
   const data = [
-    { state: "Configured", count: profiles.configured },
-    { state: "Active", count: profiles.active },
-    { state: "Draining", count: profiles.draining },
-    { state: "Blocked", count: profiles.blocked },
+    {
+      state: t({
+        en: "Configured",
+        "zh-CN": "已配置",
+        ja: "設定済み",
+        ko: "구성됨",
+      }),
+      count: profiles.configured,
+    },
+    {
+      state: t({
+        en: "Active",
+        "zh-CN": "活跃",
+        ja: "稼働中",
+        ko: "활성",
+      }),
+      count: profiles.active,
+    },
+    {
+      state: t({
+        en: "Draining",
+        "zh-CN": "排空中",
+        ja: "ドレイン中",
+        ko: "드레이닝",
+      }),
+      count: profiles.draining,
+    },
+    {
+      state: t({
+        en: "Blocked",
+        "zh-CN": "已阻止",
+        ja: "ブロック中",
+        ko: "차단됨",
+      }),
+      count: profiles.blocked,
+    },
   ];
 
   return (

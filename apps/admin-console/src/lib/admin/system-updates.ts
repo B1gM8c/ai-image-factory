@@ -80,7 +80,9 @@ async function responseMessage(response: Response) {
   } catch {
     // Keep upstream response bodies private and use a stable operator-facing fallback.
   }
-  if (response.status === 403) return "当前账号没有管理系统更新的权限";
-  if (response.status === 409) return "已有系统更新命令正在执行";
-  return "系统更新服务暂时不可用";
+  if (response.status === 403) {
+    return "This account cannot manage system updates";
+  }
+  if (response.status === 409) return "A system update command is already running";
+  return "The system update service is temporarily unavailable";
 }

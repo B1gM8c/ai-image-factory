@@ -31,6 +31,7 @@ import {
 } from "@/components/ui/table";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { useAdminQuery } from "@/hooks/use-admin-query";
+import { useI18n } from "@/i18n/locale-provider";
 import {
   formatDateTime,
   formatInteger,
@@ -45,6 +46,7 @@ import type {
 } from "@/lib/admin/types";
 
 type UsageSnapshot = ConsoleBillingSnapshot | BillingSnapshot;
+type Translate = ReturnType<typeof useI18n>["t"];
 type BillingSection =
   | "usage"
   | "credit_grants"
@@ -53,6 +55,7 @@ type BillingSection =
   | "integrity";
 
 export function AdminBilling() {
+  const { t } = useI18n();
   const {
     activeWorkspace,
     loading: sessionLoading,
@@ -141,8 +144,21 @@ export function AdminBilling() {
   return (
     <div className="min-w-0 space-y-6 overflow-x-clip">
       <PageHeader
-        title="用量与计费"
-        description={activeWorkspace?.name ?? "当前工作区"}
+        title={t({
+          en: "Usage & billing",
+          "zh-CN": "用量与计费",
+          ja: "使用量と請求",
+          ko: "사용량 및 결제",
+        })}
+        description={
+          activeWorkspace?.name ??
+          t({
+            en: "Current workspace",
+            "zh-CN": "当前工作区",
+            ja: "現在のワークスペース",
+            ko: "현재 워크스페이스",
+          })
+        }
         actions={
           activeSection === "usage" ? (
             <>
@@ -153,7 +169,12 @@ export function AdminBilling() {
                 onClick={() => setBillingControlOpen(true)}
               >
                 <WalletCards aria-hidden="true" />
-                组织限额
+                {t({
+                  en: "Organization limits",
+                  "zh-CN": "组织限额",
+                  ja: "組織の上限",
+                  ko: "조직 한도",
+                })}
               </Button>
             ) : null}
             {budgetProject ? (
@@ -163,28 +184,64 @@ export function AdminBilling() {
                 onClick={() => setBudgetOpen(true)}
               >
                 <Gauge aria-hidden="true" />
-                项目预算
+                {t({
+                  en: "Project budget",
+                  "zh-CN": "项目预算",
+                  ja: "プロジェクト予算",
+                  ko: "프로젝트 예산",
+                })}
               </Button>
             ) : (
               <Button asChild type="button" variant="outline">
                 <Link href="/projects">
                   <Gauge aria-hidden="true" />
-                  项目预算
+                  {t({
+                    en: "Project budget",
+                    "zh-CN": "项目预算",
+                    ja: "プロジェクト予算",
+                    ko: "프로젝트 예산",
+                  })}
                 </Link>
               </Button>
             )}
             <Tabs value={window} onValueChange={(value) => setWindow(value as UsageWindow)}>
               <TabsList className="h-9">
-                <TabsTrigger value="24h">24 小时</TabsTrigger>
-                <TabsTrigger value="7d">7 天</TabsTrigger>
-                <TabsTrigger value="30d">30 天</TabsTrigger>
+                <TabsTrigger value="24h">
+                  {t({
+                    en: "24 hours",
+                    "zh-CN": "24 小时",
+                    ja: "24 時間",
+                    ko: "24시간",
+                  })}
+                </TabsTrigger>
+                <TabsTrigger value="7d">
+                  {t({
+                    en: "7 days",
+                    "zh-CN": "7 天",
+                    ja: "7 日間",
+                    ko: "7일",
+                  })}
+                </TabsTrigger>
+                <TabsTrigger value="30d">
+                  {t({
+                    en: "30 days",
+                    "zh-CN": "30 天",
+                    ja: "30 日間",
+                    ko: "30일",
+                  })}
+                </TabsTrigger>
               </TabsList>
             </Tabs>
             <Button
               type="button"
               variant="outline"
               size="icon"
-              aria-label="刷新用量"
+              aria-label={t({
+                en: "Refresh usage",
+                "zh-CN": "刷新用量",
+                ja: "使用量を更新",
+                ko: "사용량 새로고침",
+              })}
               onClick={() => {
                 query.retry();
                 setAnalysisRefreshKey((value) => value + 1);
@@ -208,15 +265,50 @@ export function AdminBilling() {
           onValueChange={(value) => setSection(value as BillingSection)}
         >
           <TabsList className="w-max">
-            <TabsTrigger value="usage">用量概览</TabsTrigger>
+            <TabsTrigger value="usage">
+              {t({
+                en: "Usage overview",
+                "zh-CN": "用量概览",
+                ja: "使用量の概要",
+                ko: "사용량 개요",
+              })}
+            </TabsTrigger>
             {canViewCreditGrants ? (
-              <TabsTrigger value="credit_grants">Credit Grants</TabsTrigger>
+              <TabsTrigger value="credit_grants">
+                {t({
+                  en: "Credit Grants",
+                  "zh-CN": "额度发放",
+                  ja: "クレジット付与",
+                  ko: "크레딧 지급",
+                })}
+              </TabsTrigger>
             ) : null}
             {canInspectBilling ? (
               <>
-                <TabsTrigger value="refunds">退款与冲正</TabsTrigger>
-                <TabsTrigger value="provider_costs">上游成本</TabsTrigger>
-                <TabsTrigger value="integrity">账务检查</TabsTrigger>
+                <TabsTrigger value="refunds">
+                  {t({
+                    en: "Refunds & reversals",
+                    "zh-CN": "退款与冲正",
+                    ja: "返金と取消",
+                    ko: "환불 및 취소",
+                  })}
+                </TabsTrigger>
+                <TabsTrigger value="provider_costs">
+                  {t({
+                    en: "Provider costs",
+                    "zh-CN": "上游成本",
+                    ja: "プロバイダーコスト",
+                    ko: "공급자 비용",
+                  })}
+                </TabsTrigger>
+                <TabsTrigger value="integrity">
+                  {t({
+                    en: "Billing integrity",
+                    "zh-CN": "账务检查",
+                    ja: "請求整合性",
+                    ko: "결제 무결성",
+                  })}
+                </TabsTrigger>
               </>
             ) : null}
           </TabsList>
@@ -233,6 +325,7 @@ export function AdminBilling() {
           ) : null}
           {query.data && (!query.error || query.error.status !== 403) ? (
             <UsageContent
+              t={t}
               data={query.data}
               platformOwner={platformOwner}
               tenantNames={tenantNames}
@@ -291,6 +384,7 @@ function hasScope(scopes: string[], required: string) {
 }
 
 function UsageContent({
+  t,
   data,
   platformOwner,
   tenantNames,
@@ -300,6 +394,7 @@ function UsageContent({
   analysisRefreshKey,
   analysisEnabled,
 }: {
+  t: Translate;
   data: UsageSnapshot;
   platformOwner: boolean;
   tenantNames: Map<string, string>;
@@ -344,7 +439,12 @@ function UsageContent({
       {stale ? (
         <div className="flex items-center gap-2 rounded-md border px-3 py-2 text-sm text-muted-foreground">
           <AlertTriangle className="size-4" aria-hidden="true" />
-          当前显示上一次成功快照
+          {t({
+            en: "Showing the most recent successful snapshot",
+            "zh-CN": "当前显示上一次成功快照",
+            ja: "直近の成功したスナップショットを表示しています",
+            ko: "마지막으로 성공한 스냅샷을 표시합니다",
+          })}
         </div>
       ) : null}
 
@@ -352,43 +452,106 @@ function UsageContent({
         {platformOwner ? (
           <>
             <SummaryMetric
-              label="客户净收入"
-              {...netRevenueSummary(revenue, grossRevenue, refunds)}
+              label={t({
+                en: "Net customer revenue",
+                "zh-CN": "客户净收入",
+                ja: "顧客純収益",
+                ko: "고객 순수익",
+              })}
+              {...netRevenueSummary(t, revenue, grossRevenue, refunds)}
             />
             <SummaryMetric
-              label="供应商成本"
-              {...providerCostSummary(authoritativeCosts, coverage)}
+              label={t({
+                en: "Provider costs",
+                "zh-CN": "供应商成本",
+                ja: "プロバイダーコスト",
+                ko: "공급자 비용",
+              })}
+              {...providerCostSummary(t, authoritativeCosts, coverage)}
             />
             <SummaryMetric
-              label="毛利"
-              {...marginSummary(revenue, authoritativeCosts, marginAvailable)}
+              label={t({
+                en: "Gross margin",
+                "zh-CN": "毛利",
+                ja: "粗利益",
+                ko: "매출총이익",
+              })}
+              {...marginSummary(t, revenue, authoritativeCosts, marginAvailable)}
             />
             <SummaryMetric
-              label="实际成本覆盖"
-              {...coverageSummary(coverage)}
+              label={t({
+                en: "Actual cost coverage",
+                "zh-CN": "实际成本覆盖",
+                ja: "実コストカバレッジ",
+                ko: "실제 비용 적용 범위",
+              })}
+              {...coverageSummary(t, coverage)}
               last
             />
           </>
         ) : (
           <>
             <SummaryMetric
-              label="本期净支出"
-              {...netRevenueSummary(revenue, grossRevenue, refunds)}
+              label={t({
+                en: "Net spend",
+                "zh-CN": "本期净支出",
+                ja: "期間純支出",
+                ko: "기간 순지출",
+              })}
+              {...netRevenueSummary(t, revenue, grossRevenue, refunds)}
             />
             <SummaryMetric
-              label="请求"
+              label={t({
+                en: "Requests",
+                "zh-CN": "请求",
+                ja: "リクエスト",
+                ko: "요청",
+              })}
               value={formatInteger(requests)}
-              detail="已进入计量的调用"
+              detail={t({
+                en: "Calls included in metering",
+                "zh-CN": "已进入计量的调用",
+                ja: "計測対象となった呼び出し",
+                ko: "측정에 포함된 호출",
+              })}
             />
             <SummaryMetric
-              label="图片输出"
+              label={t({
+                en: "Image outputs",
+                "zh-CN": "图片输出",
+                ja: "画像出力",
+                ko: "이미지 출력",
+              })}
               value={formatInteger(outputs)}
-              detail="成功计量的图片"
+              detail={t({
+                en: "Successfully metered images",
+                "zh-CN": "成功计量的图片",
+                ja: "正常に計測された画像",
+                ko: "성공적으로 측정된 이미지",
+              })}
             />
             <SummaryMetric
-              label="实际输出视频时长"
-              value={`${formatInteger(videoSeconds)} 秒`}
-              detail="成功生成并完成计量"
+              label={t({
+                en: "Actual video output duration",
+                "zh-CN": "实际输出视频时长",
+                ja: "実動画出力時間",
+                ko: "실제 동영상 출력 시간",
+              })}
+              value={t(
+                {
+                  en: "{seconds} sec",
+                  "zh-CN": "{seconds} 秒",
+                  ja: "{seconds} 秒",
+                  ko: "{seconds}초",
+                },
+                { seconds: formatInteger(videoSeconds) },
+              )}
+              detail={t({
+                en: "Successfully generated and metered",
+                "zh-CN": "成功生成并完成计量",
+                ja: "正常に生成・計測済み",
+                ko: "성공적으로 생성 및 측정됨",
+              })}
               last
             />
           </>
@@ -405,26 +568,37 @@ function UsageContent({
 
       {platformData ? (
         <ProviderCostTable
+          t={t}
           rows={platformData.provider_costs}
           coverage={platformData.provider_cost_coverage}
           tenantNames={tenantNames}
         />
       ) : (
-        <BalanceTable data={data} tenantNames={tenantNames} />
+        <BalanceTable t={t} data={data} tenantNames={tenantNames} />
       )}
 
       <p className="text-right text-xs text-muted-foreground">
-        更新于 {formatDateTime(data.as_of_ms)}
+        {t(
+          {
+            en: "Updated {time}",
+            "zh-CN": "更新于 {time}",
+            ja: "{time} に更新",
+            ko: "{time} 업데이트",
+          },
+          { time: formatDateTime(data.as_of_ms) },
+        )}
       </p>
     </>
   );
 }
 
 function ProviderCostTable({
+  t,
   rows,
   coverage,
   tenantNames,
 }: {
+  t: Translate;
   rows: ProviderCostAggregate[];
   coverage: BillingSnapshot["provider_cost_coverage"];
   tenantNames: Map<string, string>;
@@ -432,10 +606,25 @@ function ProviderCostTable({
   return (
     <section>
       <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
-        <h2 className="text-sm font-semibold">供应商成本</h2>
+        <h2 className="text-sm font-semibold">
+          {t({
+            en: "Provider costs",
+            "zh-CN": "供应商成本",
+            ja: "プロバイダーコスト",
+            ko: "공급자 비용",
+          })}
+        </h2>
         {coverage.authority_conflicts !== "0" ? (
           <Badge variant="destructive">
-            {coverage.authority_conflicts} 个成本权威冲突
+            {t(
+              {
+                en: "{count} cost authority conflicts",
+                "zh-CN": "{count} 个成本权威冲突",
+                ja: "コスト権限の競合 {count} 件",
+                ko: "비용 권한 충돌 {count}건",
+              },
+              { count: coverage.authority_conflicts },
+            )}
           </Badge>
         ) : null}
       </div>
@@ -443,10 +632,25 @@ function ProviderCostTable({
         <EmptyState
           title={
             coverage.terminal_receipts === "0"
-              ? "暂无上游任务"
-              : "尚未获得上游实际成本"
+              ? t({
+                  en: "No provider jobs yet",
+                  "zh-CN": "暂无上游任务",
+                  ja: "プロバイダージョブはまだありません",
+                  ko: "공급자 작업이 아직 없습니다",
+                })
+              : t({
+                  en: "Actual provider costs are not available yet",
+                  "zh-CN": "尚未获得上游实际成本",
+                  ja: "プロバイダーの実コストはまだ取得されていません",
+                  ko: "실제 공급자 비용을 아직 받지 못했습니다",
+                })
           }
-          description="基准价格和估算价格不会被计入实际成本。"
+          description={t({
+            en: "Reference and estimated prices are not counted as actual costs.",
+            "zh-CN": "基准价格和估算价格不会被计入实际成本。",
+            ja: "基準価格と見積価格は実コストに含まれません。",
+            ko: "기준 가격과 예상 가격은 실제 비용에 포함되지 않습니다.",
+          })}
         />
       ) : (
         <div className="overflow-hidden rounded-md border">
@@ -454,12 +658,54 @@ function ProviderCostTable({
             <Table className="min-w-[900px]">
               <TableHeader>
                 <TableRow>
-                  <TableHead className="pl-4">供应商</TableHead>
-                  <TableHead>成本口径</TableHead>
-                  <TableHead>归属</TableHead>
-                  <TableHead>结果</TableHead>
-                  <TableHead className="text-right">交易</TableHead>
-                  <TableHead className="pr-4 text-right">金额</TableHead>
+                  <TableHead className="pl-4">
+                    {t({
+                      en: "Provider",
+                      "zh-CN": "供应商",
+                      ja: "プロバイダー",
+                      ko: "공급자",
+                    })}
+                  </TableHead>
+                  <TableHead>
+                    {t({
+                      en: "Cost basis",
+                      "zh-CN": "成本口径",
+                      ja: "コスト基準",
+                      ko: "비용 기준",
+                    })}
+                  </TableHead>
+                  <TableHead>
+                    {t({
+                      en: "Attribution",
+                      "zh-CN": "归属",
+                      ja: "帰属",
+                      ko: "귀속",
+                    })}
+                  </TableHead>
+                  <TableHead>
+                    {t({
+                      en: "Outcome",
+                      "zh-CN": "结果",
+                      ja: "結果",
+                      ko: "결과",
+                    })}
+                  </TableHead>
+                  <TableHead className="text-right">
+                    {t({
+                      en: "Transactions",
+                      "zh-CN": "交易",
+                      ja: "取引",
+                      ko: "거래",
+                    })}
+                  </TableHead>
+                  <TableHead className="pr-4 text-right">
+                    {t({
+                      en: "Amount",
+                      "zh-CN": "金额",
+                      ja: "金額",
+                      ko: "금액",
+                    })}
+                  </TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
@@ -468,15 +714,20 @@ function ProviderCostTable({
                     key={`${item.provider_id}-${item.cost_basis}-${item.tenant_id ?? "none"}-${item.currency}-${index}`}
                   >
                     <TableCell className="pl-4 font-medium">
-                      {providerLabel(item.provider_id)}
+                      {providerLabel(t, item.provider_id)}
                     </TableCell>
                     <TableCell>
-                      <CostBasisBadge basis={item.cost_basis} />
+                      <CostBasisBadge t={t} basis={item.cost_basis} />
                     </TableCell>
                     <TableCell>
                       {item.attribution_state === "unattributed"
-                        ? "待归属"
-                        : scopeLabel(item.tenant_id, tenantNames)}
+                        ? t({
+                            en: "Unattributed",
+                            "zh-CN": "待归属",
+                            ja: "未帰属",
+                            ko: "미귀속",
+                          })
+                        : scopeLabel(t, item.tenant_id, tenantNames)}
                     </TableCell>
                     <TableCell>{formatStatus(item.outcome)}</TableCell>
                     <TableCell className="text-right font-mono tabular-nums">
@@ -497,32 +748,76 @@ function ProviderCostTable({
 }
 
 function BalanceTable({
+  t,
   data,
   tenantNames,
 }: {
+  t: Translate;
   data: UsageSnapshot;
   tenantNames: Map<string, string>;
 }) {
   if (data.account_snapshots.length === 0) return null;
   return (
     <section>
-      <h2 className="mb-3 text-sm font-semibold">余额</h2>
+      <h2 className="mb-3 text-sm font-semibold">
+        {t({
+          en: "Balance",
+          "zh-CN": "余额",
+          ja: "残高",
+          ko: "잔액",
+        })}
+      </h2>
       <div className="overflow-x-auto rounded-md border">
         <Table className="min-w-[720px]">
           <TableHeader>
             <TableRow>
-              <TableHead className="pl-4">工作区</TableHead>
-              <TableHead className="text-right">累计扣费</TableHead>
-              <TableHead className="text-right">已退款</TableHead>
-              <TableHead className="text-right">净支出</TableHead>
-              <TableHead className="pr-4 text-right">可用</TableHead>
+              <TableHead className="pl-4">
+                {t({
+                  en: "Workspace",
+                  "zh-CN": "工作区",
+                  ja: "ワークスペース",
+                  ko: "워크스페이스",
+                })}
+              </TableHead>
+              <TableHead className="text-right">
+                {t({
+                  en: "Total charges",
+                  "zh-CN": "累计扣费",
+                  ja: "累計請求",
+                  ko: "누적 청구",
+                })}
+              </TableHead>
+              <TableHead className="text-right">
+                {t({
+                  en: "Refunded",
+                  "zh-CN": "已退款",
+                  ja: "返金済み",
+                  ko: "환불됨",
+                })}
+              </TableHead>
+              <TableHead className="text-right">
+                {t({
+                  en: "Net spend",
+                  "zh-CN": "净支出",
+                  ja: "純支出",
+                  ko: "순지출",
+                })}
+              </TableHead>
+              <TableHead className="pr-4 text-right">
+                {t({
+                  en: "Available",
+                  "zh-CN": "可用",
+                  ja: "利用可能",
+                  ko: "사용 가능",
+                })}
+              </TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
             {data.account_snapshots.map((item) => (
               <TableRow key={`${item.tenant_id}-${item.currency}`}>
                 <TableCell className="pl-4">
-                  {scopeLabel(item.tenant_id, tenantNames)}
+                  {scopeLabel(t, item.tenant_id, tenantNames)}
                 </TableCell>
                 <TableCell className="text-right font-mono tabular-nums">
                   {formatMoneyMicros(item.captured_micros, item.currency)}
@@ -578,12 +873,46 @@ function SummaryMetric({
   );
 }
 
-function CostBasisBadge({ basis }: { basis: ProviderCostAggregate["cost_basis"] }) {
-  if (basis === "provider_actual") return <Badge>上游实际</Badge>;
+function CostBasisBadge({
+  t,
+  basis,
+}: {
+  t: Translate;
+  basis: ProviderCostAggregate["cost_basis"];
+}) {
+  if (basis === "provider_actual")
+    return (
+      <Badge>
+        {t({
+          en: "Provider actual",
+          "zh-CN": "上游实际",
+          ja: "プロバイダー実績",
+          ko: "공급자 실제 비용",
+        })}
+      </Badge>
+    );
   if (basis === "provider_allocated") {
-    return <Badge variant="secondary">订阅/积分分摊</Badge>;
+    return (
+      <Badge variant="secondary">
+        {t({
+          en: "Subscription/credit allocation",
+          "zh-CN": "订阅/积分分摊",
+          ja: "サブスクリプション/クレジット配分",
+          ko: "구독/크레딧 배분",
+        })}
+      </Badge>
+    );
   }
-  return <Badge variant="outline">旧链路未核验</Badge>;
+  return (
+    <Badge variant="outline">
+      {t({
+        en: "Legacy path unverified",
+        "zh-CN": "旧链路未核验",
+        ja: "旧経路未検証",
+        ko: "레거시 경로 미검증",
+      })}
+    </Badge>
+  );
 }
 
 function EmptyState({ title, description }: { title: string; description: string }) {
@@ -637,23 +966,40 @@ function subtractCurrencyTotals(
 }
 
 function netRevenueSummary(
+  t: Translate,
   net: Map<string, bigint>,
   gross: Map<string, bigint>,
   refunds: Map<string, bigint>,
 ) {
-  const summary = moneySummary(net, { emptyCurrency: "USD" });
+  const summary = moneySummary(t, net, { emptyCurrency: "USD" });
   if (gross.size === 1 && refunds.size <= 1) {
     const [currency, grossAmount] = [...gross.entries()][0];
     const refundedAmount = refunds.get(currency) ?? 0n;
     return {
       ...summary,
-      detail: `累计扣费 ${formatMoneyMicros(
-        grossAmount.toString(),
-        currency,
-      )} · 退款 ${formatMoneyMicros(refundedAmount.toString(), currency)}`,
+      detail: t(
+        {
+          en: "Total charges {gross} · Refunds {refunds}",
+          "zh-CN": "累计扣费 {gross} · 退款 {refunds}",
+          ja: "累計請求 {gross} · 返金 {refunds}",
+          ko: "누적 청구 {gross} · 환불 {refunds}",
+        },
+        {
+          gross: formatMoneyMicros(grossAmount.toString(), currency),
+          refunds: formatMoneyMicros(refundedAmount.toString(), currency),
+        },
+      ),
     };
   }
-  return { ...summary, detail: "累计扣费减客户退款" };
+  return {
+    ...summary,
+    detail: t({
+      en: "Total charges minus customer refunds",
+      "zh-CN": "累计扣费减客户退款",
+      ja: "累計請求から顧客返金を控除",
+      ko: "누적 청구에서 고객 환불 차감",
+    }),
+  };
 }
 
 function costByCurrency(rows: ProviderCostAggregate[]) {
@@ -668,54 +1014,109 @@ function costByCurrency(rows: ProviderCostAggregate[]) {
 }
 
 function moneySummary(
+  t: Translate,
   totals: Map<string, bigint>,
   { emptyCurrency }: { emptyCurrency: string },
 ) {
   if (totals.size === 0) {
     return {
       value: formatMoneyMicros("0", emptyCurrency),
-      detail: "已结算金额",
+      detail: t({
+        en: "Settled amount",
+        "zh-CN": "已结算金额",
+        ja: "精算済み金額",
+        ko: "정산 금액",
+      }),
     };
   }
   if (totals.size === 1) {
     const [currency, amount] = [...totals.entries()][0];
     return {
       value: formatMoneyMicros(amount.toString(), currency),
-      detail: "已结算金额",
+      detail: t({
+        en: "Settled amount",
+        "zh-CN": "已结算金额",
+        ja: "精算済み金額",
+        ko: "정산 금액",
+      }),
     };
   }
   return {
-    value: `${totals.size} 种币种`,
+    value: t(
+      {
+        en: "{count} currencies",
+        "zh-CN": "{count} 种币种",
+        ja: "{count} 通貨",
+        ko: "{count}개 통화",
+      },
+      { count: totals.size },
+    ),
     detail: formatCurrencyTotals(totals),
   };
 }
 
 function providerCostSummary(
+  t: Translate,
   totals: Map<string, bigint>,
   coverage: BillingSnapshot["provider_cost_coverage"] | null,
 ) {
   if (!coverage || coverage.terminal_receipts === "0") {
-    return { value: formatMoneyMicros("0", "USD"), detail: "暂无上游任务" };
+    return {
+      value: formatMoneyMicros("0", "USD"),
+      detail: t({
+        en: "No provider jobs yet",
+        "zh-CN": "暂无上游任务",
+        ja: "プロバイダージョブはまだありません",
+        ko: "공급자 작업이 아직 없습니다",
+      }),
+    };
   }
   if (totals.size === 0) {
-    return { value: "待核验", detail: `${coverage.uncovered_receipts} 条结果未覆盖` };
+    return {
+      value: t({
+        en: "Pending verification",
+        "zh-CN": "待核验",
+        ja: "検証待ち",
+        ko: "검증 대기",
+      }),
+      detail: uncoveredResults(t, coverage.uncovered_receipts),
+    };
   }
   return {
-    ...moneySummary(totals, { emptyCurrency: "USD" }),
+    ...moneySummary(t, totals, { emptyCurrency: "USD" }),
     detail:
       coverage.uncovered_receipts === "0"
-        ? "实际回执与已关闭分摊"
-        : `${coverage.uncovered_receipts} 条结果未覆盖`,
+        ? t({
+            en: "Actual receipts and closed allocations",
+            "zh-CN": "实际回执与已关闭分摊",
+            ja: "実績レシートと確定済み配分",
+            ko: "실제 영수증 및 마감된 배분",
+          })
+        : uncoveredResults(t, coverage.uncovered_receipts),
   };
 }
 
 function marginSummary(
+  t: Translate,
   revenue: Map<string, bigint>,
   costs: Map<string, bigint>,
   available: boolean,
 ) {
   if (!available) {
-    return { value: "暂不可用", detail: "成本覆盖完整后计算" };
+    return {
+      value: t({
+        en: "Unavailable",
+        "zh-CN": "暂不可用",
+        ja: "利用不可",
+        ko: "사용 불가",
+      }),
+      detail: t({
+        en: "Calculated after cost coverage is complete",
+        "zh-CN": "成本覆盖完整后计算",
+        ja: "コストカバレッジ完了後に計算されます",
+        ko: "비용 적용 범위가 완료된 후 계산됩니다",
+      }),
+    };
   }
   const currencies = new Set([...revenue.keys(), ...costs.keys()]);
   const margins = new Map<string, bigint>();
@@ -726,16 +1127,30 @@ function marginSummary(
     );
   }
   return {
-    ...moneySummary(margins, { emptyCurrency: "USD" }),
-    detail: "客户收入减权威供应成本",
+    ...moneySummary(t, margins, { emptyCurrency: "USD" }),
+    detail: t({
+      en: "Customer revenue minus authoritative provider costs",
+      "zh-CN": "客户收入减权威供应成本",
+      ja: "顧客収益から確定プロバイダーコストを控除",
+      ko: "고객 수익에서 확정 공급자 비용 차감",
+    }),
   };
 }
 
 function coverageSummary(
+  t: Translate,
   coverage: BillingSnapshot["provider_cost_coverage"] | null,
 ) {
   if (!coverage || coverage.terminal_receipts === "0") {
-    return { value: "--", detail: "暂无上游任务" };
+    return {
+      value: "--",
+      detail: t({
+        en: "No provider jobs yet",
+        "zh-CN": "暂无上游任务",
+        ja: "プロバイダージョブはまだありません",
+        ko: "공급자 작업이 아직 없습니다",
+      }),
+    };
   }
   const total = parseInteger(coverage.terminal_receipts);
   const covered = parseInteger(coverage.covered_receipts);
@@ -743,8 +1158,27 @@ function coverageSummary(
   const value = `${Number(basisPoints) / 100}%`;
   const detail =
     coverage.authority_conflicts !== "0"
-      ? `${coverage.authority_conflicts} 个成本权威冲突`
-      : `${coverage.covered_receipts} / ${coverage.terminal_receipts} 条结果`;
+      ? t(
+          {
+            en: "{count} cost authority conflicts",
+            "zh-CN": "{count} 个成本权威冲突",
+            ja: "コスト権限の競合 {count} 件",
+            ko: "비용 권한 충돌 {count}건",
+          },
+          { count: coverage.authority_conflicts },
+        )
+      : t(
+          {
+            en: "{covered} / {total} results",
+            "zh-CN": "{covered} / {total} 条结果",
+            ja: "{covered} / {total} 件の結果",
+            ko: "결과 {covered} / {total}건",
+          },
+          {
+            covered: coverage.covered_receipts,
+            total: coverage.terminal_receipts,
+          },
+        );
   return { value, detail };
 }
 
@@ -763,17 +1197,49 @@ function parseInteger(value: string) {
   }
 }
 
-function scopeLabel(tenantId: string | undefined, tenantNames: Map<string, string>) {
-  if (!tenantId) return "未归属";
+function uncoveredResults(t: Translate, count: string) {
+  return t(
+    {
+      en: "{count} results are not covered",
+      "zh-CN": "{count} 条结果未覆盖",
+      ja: "{count} 件の結果が未カバーです",
+      ko: "결과 {count}건이 적용되지 않음",
+    },
+    { count },
+  );
+}
+
+function scopeLabel(
+  t: Translate,
+  tenantId: string | undefined,
+  tenantNames: Map<string, string>,
+) {
+  if (!tenantId)
+    return t({
+      en: "Unattributed",
+      "zh-CN": "未归属",
+      ja: "未帰属",
+      ko: "미귀속",
+    });
   return tenantNames.get(tenantId) ?? tenantId;
 }
 
-function providerLabel(providerId: string) {
+function providerLabel(t: Translate, providerId: string) {
   const labels: Record<string, string> = {
     "openai-codex": "Codex",
     "xai-grok": "Grok",
-    dreamina: "即梦",
-    "volcengine-ark": "火山方舟",
+    dreamina: t({
+      en: "Dreamina",
+      "zh-CN": "即梦",
+      ja: "Dreamina",
+      ko: "Dreamina",
+    }),
+    "volcengine-ark": t({
+      en: "Volcengine Ark",
+      "zh-CN": "火山方舟",
+      ja: "Volcengine Ark",
+      ko: "Volcengine Ark",
+    }),
   };
   return labels[providerId] ?? providerId;
 }

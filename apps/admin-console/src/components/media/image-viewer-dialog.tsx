@@ -8,6 +8,7 @@ import {
   DialogContent,
   DialogTitle,
 } from "@/components/ui/dialog";
+import { useI18n } from "@/i18n/locale-provider";
 
 export type ImageViewerItem = {
   src: string;
@@ -25,6 +26,7 @@ export function ImageViewerDialog({
   onActiveIndexChange: (index: number | null) => void;
   onDownload: (index: number) => void;
 }) {
+  const { t } = useI18n();
   const [dimensions, setDimensions] = useState<string | null>(null);
   const currentIndex =
     activeIndex === null || items.length === 0
@@ -58,13 +60,29 @@ export function ImageViewerDialog({
         }}
       >
         <DialogTitle className="sr-only">
-          查看原图{currentIndex === null ? "" : ` ${currentIndex + 1}`}
+          {t(
+            {
+              en: "View original{index}",
+              "zh-CN": "查看原图{index}",
+              ja: "元画像を表示{index}",
+              ko: "원본 이미지 보기{index}",
+            },
+            { index: currentIndex === null ? "" : ` ${currentIndex + 1}` },
+          )}
         </DialogTitle>
         {current && currentIndex !== null ? (
           <div className="flex min-h-0 flex-1 flex-col">
             <div className="flex h-12 shrink-0 items-center gap-3 border-b border-white/10 px-4 pr-14 text-sm text-white/70">
               <span>
-                原图 {currentIndex + 1} / {items.length}
+                {t(
+                  {
+                    en: "Original {current} / {total}",
+                    "zh-CN": "原图 {current} / {total}",
+                    ja: "元画像 {current} / {total}",
+                    ko: "원본 {current} / {total}",
+                  },
+                  { current: currentIndex + 1, total: items.length },
+                )}
               </span>
               {dimensions ? (
                 <span className="text-white/45">{dimensions}</span>
@@ -75,7 +93,15 @@ export function ImageViewerDialog({
                 variant="ghost"
                 className="ml-auto size-8 text-white hover:bg-white/10 hover:text-white"
                 onClick={() => onDownload(currentIndex)}
-                aria-label={`下载原图 ${currentIndex + 1}`}
+                aria-label={t(
+                  {
+                    en: "Download original {index}",
+                    "zh-CN": "下载原图 {index}",
+                    ja: "元画像 {index} をダウンロード",
+                    ko: "원본 이미지 {index} 다운로드",
+                  },
+                  { index: currentIndex + 1 },
+                )}
               >
                 <Download aria-hidden="true" />
               </Button>
@@ -88,7 +114,12 @@ export function ImageViewerDialog({
                   variant="secondary"
                   className="absolute left-3 z-10 size-9 bg-black/60 text-white hover:bg-black/80 sm:left-5"
                   onClick={() => move(-1)}
-                  aria-label="查看上一张原图"
+                  aria-label={t({
+                    en: "View previous original",
+                    "zh-CN": "查看上一张原图",
+                    ja: "前の元画像を表示",
+                    ko: "이전 원본 이미지 보기",
+                  })}
                 >
                   <ChevronLeft aria-hidden="true" />
                 </Button>
@@ -112,7 +143,12 @@ export function ImageViewerDialog({
                   variant="secondary"
                   className="absolute right-3 z-10 size-9 bg-black/60 text-white hover:bg-black/80 sm:right-5"
                   onClick={() => move(1)}
-                  aria-label="查看下一张原图"
+                  aria-label={t({
+                    en: "View next original",
+                    "zh-CN": "查看下一张原图",
+                    ja: "次の元画像を表示",
+                    ko: "다음 원본 이미지 보기",
+                  })}
                 >
                   <ChevronRight aria-hidden="true" />
                 </Button>

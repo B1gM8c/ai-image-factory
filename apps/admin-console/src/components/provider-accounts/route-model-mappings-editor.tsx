@@ -16,6 +16,9 @@ import type {
   ProviderRoute,
   ProviderRouteModelMapping,
 } from "@/lib/admin/types";
+import { useI18n } from "@/i18n/locale-provider";
+
+type Translate = ReturnType<typeof useI18n>["t"];
 
 export type EditableRouteModelMapping = {
   apiProfile: string;
@@ -52,7 +55,8 @@ export function RouteModelMappingsEditor({
   enabledAccountModels?: Set<string>;
   onAccountModelToggle?: (model: ProviderAccountModel) => void;
 }) {
-  const profiles = apiProfilesFor(providerId, operationId);
+  const { t } = useI18n();
+  const profiles = apiProfilesFor(providerId, operationId, t);
   const routeModels = models.filter(
     (model) =>
       model.provider_id === providerId &&
@@ -97,12 +101,12 @@ export function RouteModelMappingsEditor({
   return (
     <div className="min-w-0 space-y-5">
       <div className="grid gap-2 md:grid-cols-[12rem_minmax(0,1fr)] md:items-center">
-        <Label>API 协议</Label>
+        <Label>{t({ en: "API protocol", "zh-CN": "API 协议", ja: "API プロトコル", ko: "API 프로토콜" })}</Label>
         <Select
           value={activeApiProfile}
           onValueChange={onActiveApiProfileChange}
         >
-          <SelectTrigger aria-label="API 协议">
+          <SelectTrigger aria-label={t({ en: "API protocol", "zh-CN": "API 协议", ja: "API プロトコル", ko: "API 프로토콜" })}>
             <SelectValue />
           </SelectTrigger>
           <SelectContent>
@@ -123,21 +127,21 @@ export function RouteModelMappingsEditor({
               : "hidden grid-cols-[3rem_minmax(12rem,1fr)_7rem_minmax(15rem,1.2fr)] items-center border-b bg-muted/40 px-3 py-2 text-xs font-medium text-muted-foreground md:grid"
           }
         >
-          {accountModels ? <span>账户可用</span> : <span />}
-          <span>原生模型</span>
-          {accountModels ? <span>API 开放</span> : <span>类型</span>}
-          <span>外部模型 ID</span>
+          {accountModels ? <span>{t({ en: "Account access", "zh-CN": "账户可用", ja: "アカウント利用", ko: "계정 사용" })}</span> : <span />}
+          <span>{t({ en: "Native model", "zh-CN": "原生模型", ja: "ネイティブモデル", ko: "네이티브 모델" })}</span>
+          {accountModels ? <span>{t({ en: "API access", "zh-CN": "API 开放", ja: "API 公開", ko: "API 공개" })}</span> : <span>{t({ en: "Type", "zh-CN": "类型", ja: "種別", ko: "유형" })}</span>}
+          <span>{t({ en: "Public model ID", "zh-CN": "外部模型 ID", ja: "公開モデル ID", ko: "공개 모델 ID" })}</span>
         </div>
         {routeModels.length === 0 ? (
           <div className="flex min-h-28 items-center justify-center text-sm text-muted-foreground">
-            当前能力没有可配置模型
+            {t({ en: "No configurable models for this capability", "zh-CN": "当前能力没有可配置模型", ja: "この機能に設定可能なモデルはありません", ko: "이 기능에 구성 가능한 모델이 없습니다" })}
           </div>
         ) : (
           routeModels.map((model) => {
             const key = routeModelMappingKey(activeApiProfile, model.model_id);
             const mapping = mappings[key];
             const publicModelIdError = mapping
-              ? routeModelMappingError(mapping, Object.values(mappings))
+              ? routeModelMappingError(mapping, Object.values(mappings), t)
               : null;
             const accountModel = accountModels?.find(
               (item) =>
@@ -168,7 +172,10 @@ export function RouteModelMappingsEditor({
                       accountModel && onAccountModelToggle?.(accountModel)
                     }
                     className="size-4 accent-primary"
-                    aria-label={`允许账户使用 ${model.display_name}`}
+                    aria-label={t(
+                      { en: "Allow this account to use {model}", "zh-CN": "允许账户使用 {model}", ja: "このアカウントに {model} の使用を許可", ko: "이 계정에서 {model} 사용 허용" },
+                      { model: model.display_name },
+                    )}
                   />
                 ) : (
                   <input
@@ -176,7 +183,10 @@ export function RouteModelMappingsEditor({
                     checked={Boolean(mapping)}
                     onChange={() => toggleModel(model)}
                     className="size-4 accent-primary"
-                    aria-label={`开放 ${model.display_name}`}
+                    aria-label={t(
+                      { en: "Expose {model}", "zh-CN": "开放 {model}", ja: "{model} を公開", ko: "{model} 공개" },
+                      { model: model.display_name },
+                    )}
                   />
                 )}
                 <div className="min-w-0 pr-3">
@@ -189,7 +199,9 @@ export function RouteModelMappingsEditor({
                 </div>
                 {!accountModels ? (
                   <Badge variant="outline" className="w-fit">
-                    {model.media_kind === "image" ? "图片" : "视频"}
+                    {model.media_kind === "image"
+                      ? t({ en: "Image", "zh-CN": "图片", ja: "画像", ko: "이미지" })
+                      : t({ en: "Video", "zh-CN": "视频", ja: "動画", ko: "동영상" })}
                   </Badge>
                 ) : null}
                 {accountModels ? (
@@ -200,9 +212,12 @@ export function RouteModelMappingsEditor({
                       disabled={!accountModelEnabled}
                       onChange={() => toggleModel(model)}
                       className="size-4 accent-primary"
-                      aria-label={`通过 API 开放 ${model.display_name}`}
+                      aria-label={t(
+                        { en: "Expose {model} through the API", "zh-CN": "通过 API 开放 {model}", ja: "{model} を API で公開", ko: "API를 통해 {model} 공개" },
+                        { model: model.display_name },
+                      )}
                     />
-                    <span className="md:hidden">通过 API 开放</span>
+                    <span className="md:hidden">{t({ en: "Expose through API", "zh-CN": "通过 API 开放", ja: "API で公開", ko: "API로 공개" })}</span>
                   </label>
                 ) : null}
                 <div
@@ -213,7 +228,7 @@ export function RouteModelMappingsEditor({
                   }
                 >
                   <span className="text-xs text-muted-foreground md:hidden">
-                    外部模型 ID
+                    {t({ en: "Public model ID", "zh-CN": "外部模型 ID", ja: "公開モデル ID", ko: "공개 모델 ID" })}
                   </span>
                   <Input
                     value={mapping?.publicModelId ?? ""}
@@ -223,7 +238,10 @@ export function RouteModelMappingsEditor({
                     disabled={!mapping || !accountModelEnabled}
                     className="mt-1 h-8 w-full min-w-0 max-w-full font-mono text-xs md:mt-0"
                     maxLength={255}
-                    aria-label={`${model.display_name} 外部模型 ID`}
+                    aria-label={t(
+                      { en: "Public model ID for {model}", "zh-CN": "{model} 外部模型 ID", ja: "{model} の公開モデル ID", ko: "{model} 공개 모델 ID" },
+                      { model: model.display_name },
+                    )}
                     aria-invalid={Boolean(publicModelIdError)}
                   />
                   {publicModelIdError ? (
@@ -241,7 +259,11 @@ export function RouteModelMappingsEditor({
   );
 }
 
-export function apiProfilesFor(providerId: string, operationId: string) {
+export function apiProfilesFor(
+  providerId: string,
+  operationId: string,
+  t?: Translate,
+) {
   if (providerId === "openai-codex")
     return [{ id: "openai-images-v1", label: "OpenAI Images API" }];
   if (providerId === "grok-cli" && operationId === "images.generations")
@@ -250,17 +272,46 @@ export function apiProfilesFor(providerId: string, operationId: string) {
     return [{ id: "xai-videos-v1", label: "xAI Video API" }];
   if (providerId === "dreamina-cli" && operationId === "images.generations") {
     return [
-      { id: "volcengine-ark-images-v3", label: "火山方舟 Images API" },
-      { id: "dreamina-cli-images-v1", label: "即梦 CLI Images API" },
+      {
+        id: "volcengine-ark-images-v3",
+        label: localize(t, {
+          en: "Volcengine Ark Images API",
+          "zh-CN": "火山方舟图片 API",
+          ja: "Volcengine Ark Images API",
+          ko: "Volcengine Ark Images API",
+        }),
+      },
+      {
+        id: "dreamina-cli-images-v1",
+        label: localize(t, {
+          en: "Dreamina CLI Images API",
+          "zh-CN": "即梦 CLI 图片 API",
+          ja: "Dreamina CLI Images API",
+          ko: "Dreamina CLI Images API",
+        }),
+      },
     ];
   }
   if (providerId === "dreamina-cli" && operationId === "videos.generations") {
     return [
       {
         id: "volcengine-ark-content-generation-v3",
-        label: "火山方舟 Content API",
+        label: localize(t, {
+          en: "Volcengine Ark Content API",
+          "zh-CN": "火山方舟内容生成 API",
+          ja: "Volcengine Ark Content API",
+          ko: "Volcengine Ark Content API",
+        }),
       },
-      { id: "dreamina-cli-videos-v1", label: "即梦 CLI Video API" },
+      {
+        id: "dreamina-cli-videos-v1",
+        label: localize(t, {
+          en: "Dreamina CLI Video API",
+          "zh-CN": "即梦 CLI 视频 API",
+          ja: "Dreamina CLI Video API",
+          ko: "Dreamina CLI Video API",
+        }),
+      },
     ];
   }
   return [];
@@ -349,10 +400,16 @@ function accountModelKey(
 function routeModelMappingError(
   mapping: EditableRouteModelMapping,
   mappings: EditableRouteModelMapping[],
+  t?: Translate,
 ) {
   const publicModelId = mapping.publicModelId.trim();
   if (!/^[A-Za-z0-9_.:-]{1,255}$/.test(publicModelId)) {
-    return "仅支持字母、数字及 _ . : -";
+    return localize(t, {
+      en: "Use only letters, numbers, and _ . : -",
+      "zh-CN": "仅支持字母、数字及 _ . : -",
+      ja: "英数字と _ . : - のみ使用できます",
+      ko: "문자, 숫자 및 _ . : - 만 사용할 수 있습니다",
+    });
   }
   if (
     mappings.filter(
@@ -361,9 +418,21 @@ function routeModelMappingError(
         candidate.publicModelId.trim() === publicModelId,
     ).length > 1
   ) {
-    return "同一 API 协议下模型 ID 不能重复";
+    return localize(t, {
+      en: "Model IDs must be unique within an API protocol",
+      "zh-CN": "同一 API 协议下模型 ID 不能重复",
+      ja: "同じ API プロトコル内でモデル ID を重複させることはできません",
+      ko: "동일한 API 프로토콜에서 모델 ID는 중복될 수 없습니다",
+    });
   }
   return null;
+}
+
+function localize(
+  t: Translate | undefined,
+  text: Parameters<Translate>[0],
+) {
+  return t ? t(text) : text.en;
 }
 
 function defaultPublicModelId(

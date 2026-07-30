@@ -2,6 +2,7 @@
 name = "image-api-contracts"
 version = "0.1.0"
 edition = "2024"
+license.workspace = true
 
 [dependencies]
 hex = "0.4.3"

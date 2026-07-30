@@ -144,7 +144,11 @@ async function responseMessage(response: Response) {
   } catch {
     // The status-specific fallback is safer than exposing an upstream body.
   }
-  if (response.status === 403) return "当前账号没有查看平台运营数据的权限";
-  if (response.status === 429) return "管理查询暂时繁忙，请稍后重试";
-  return "管理数据暂时不可用";
+  if (response.status === 403) {
+    return "This account cannot view platform operations data";
+  }
+  if (response.status === 429) {
+    return "The admin query service is busy. Please try again shortly";
+  }
+  return "Admin data is temporarily unavailable";
 }

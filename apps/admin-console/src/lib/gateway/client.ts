@@ -357,11 +357,20 @@ export function isAllowedGatewayProxy(method: string, path: string) {
 export async function proxyGatewayRequest(path: string, request: Request) {
   const credentials = gatewayCredentials(request);
   if (!credentials) {
-    return authJson({ error: "Unauthorized" }, 401);
+    return authJson(
+      { error: "Unauthorized", code: "console_gateway_unauthorized" },
+      401,
+    );
   }
 
   if (!isAllowedGatewayProxy(request.method, path)) {
-    return authJson({ error: "Gateway route is not allowed" }, 403);
+    return authJson(
+      {
+        error: "Gateway route is not allowed",
+        code: "console_gateway_route_not_allowed",
+      },
+      403,
+    );
   }
 
   if (isMutation(request.method)) {
@@ -377,15 +386,33 @@ export async function proxyGatewayRequest(path: string, request: Request) {
     const maxBodyBytes = gatewayMaxMutationBodyBytes(path, request.method);
     const contentLength = request.headers.get("content-length");
     if (contentLength && /^\d+$/.test(contentLength) && Number(contentLength) > maxBodyBytes) {
-      return authJson({ error: "Gateway request body is too large" }, 413);
+      return authJson(
+        {
+          error: "Gateway request body is too large",
+          code: "console_gateway_request_too_large",
+        },
+        413,
+      );
     }
     try {
       body = await request.arrayBuffer();
     } catch {
-      return authJson({ error: "Gateway request body is invalid" }, 400);
+      return authJson(
+        {
+          error: "Gateway request body is invalid",
+          code: "console_gateway_request_invalid",
+        },
+        400,
+      );
     }
     if (body.byteLength > maxBodyBytes) {
-      return authJson({ error: "Gateway request body is too large" }, 413);
+      return authJson(
+        {
+          error: "Gateway request body is too large",
+          code: "console_gateway_request_too_large",
+        },
+        413,
+      );
     }
   }
 
@@ -410,7 +437,12 @@ export async function proxyGatewayRequest(path: string, request: Request) {
   } catch (error) {
     const timedOut = error instanceof Error && error.name === "TimeoutError";
     return authJson(
-      { error: timedOut ? "Gateway request timed out" : "Gateway request failed" },
+      {
+        error: timedOut ? "Gateway request timed out" : "Gateway request failed",
+        code: timedOut
+          ? "console_gateway_timeout"
+          : "console_gateway_unavailable",
+      },
       timedOut ? 504 : 502,
     );
   }
