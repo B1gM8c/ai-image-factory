@@ -5493,7 +5493,7 @@ async fn submit_recovery_claim_is_scoped_fenced_and_reclaimable() -> TestResult 
                 &scope,
                 &first.recovery_owner,
                 first_claim_command,
-                200,
+                2_000,
             )
             .await
             .map_err(debug_error)?

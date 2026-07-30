@@ -645,7 +645,7 @@ async fn outcome_unknown_recovery_observes_without_relaunching_cli() -> TestResu
         let lease = seed_running_submission_with_lease(
             &database.pool,
             "gated-unknown-recovery-worker",
-            200,
+            60_000,
         )
         .await?;
         let journal = tempfile::tempdir().map_err(debug_error)?;
@@ -672,7 +672,31 @@ async fn outcome_unknown_recovery_observes_without_relaunching_cli() -> TestResu
             format!("invalid receipt did not create one unknown attempt: {first:?}"),
         )?;
 
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        let now = database_now(&database.pool).await?;
+        sqlx::query(
+            r#"
+            UPDATE executor_executions
+            SET lease_expires_at_ms = $2 - 1
+            WHERE executor_execution_id = $1
+            "#,
+        )
+        .bind(lease.executor_execution_id)
+        .bind(now)
+        .execute(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        sqlx::query(
+            r#"
+            UPDATE provider_submit_recoveries
+            SET next_recovery_at_ms = $2 - 1
+            WHERE submission_id = $1
+            "#,
+        )
+        .bind(lease.submission_id)
+        .bind(now)
+        .execute(&database.pool)
+        .await
+        .map_err(debug_error)?;
         let store = PostgresProviderTaskStore::new(database.pool.clone());
         let recovery = store
             .claim_submit_recovery(
