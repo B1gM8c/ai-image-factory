@@ -5388,7 +5388,8 @@ async fn submit_recovery_claim_is_scoped_fenced_and_reclaimable() -> TestResult 
             "raw SQL rewrote the absolute provider deadline",
         )?;
 
-        tokio::time::sleep(Duration::from_millis(2_500)).await;
+        sleep_until_database_time(&database.pool, executor.executor_lease_expires_at_ms + 20)
+            .await?;
         let wrong_scope = ProviderTaskClaimScope {
             provider_id: "provider-test".to_string(),
             provider_account_id: Uuid::new_v4(),
@@ -5528,7 +5529,7 @@ async fn submit_recovery_claim_is_scoped_fenced_and_reclaimable() -> TestResult 
                 .heartbeat_submit_recovery(&stale_recovery, 10_000)
                 .await
         });
-        tokio::time::sleep(Duration::from_millis(10_500)).await;
+        sleep_until_database_time(&database.pool, first.recovery_lease_expires_at_ms + 20).await?;
         require(
             !blocked_heartbeat.is_finished(),
             "submit recovery heartbeat did not wait for its fence lock",
@@ -5561,7 +5562,7 @@ async fn submit_recovery_claim_is_scoped_fenced_and_reclaimable() -> TestResult 
                 &scope,
                 "recovery-after-expired-heartbeat",
                 "claim-after-expired-heartbeat",
-                20_000,
+                60_000,
             )
             .await
             .map_err(debug_error)?
@@ -5617,7 +5618,7 @@ async fn submit_recovery_claim_is_scoped_fenced_and_reclaimable() -> TestResult 
                 &scope,
                 &first.recovery_owner,
                 "claim-after-expired-heartbeat",
-                20_000,
+                60_000,
             )
             .await
             .map_err(debug_error)?
