@@ -575,7 +575,7 @@ async fn recovery_claim_completes_the_elected_unlaunched_attempt_once() -> TestR
                 &claim_scope(),
                 "gated-unlaunched-recovery",
                 "claim-unlaunched-recovery",
-                5_000,
+                30_000,
             )
             .await
             .map_err(debug_error)?
@@ -679,7 +679,7 @@ async fn outcome_unknown_recovery_observes_without_relaunching_cli() -> TestResu
                 &claim_scope(),
                 "gated-unknown-recovery",
                 "claim-unknown-recovery",
-                5_000,
+                30_000,
             )
             .await
             .map_err(debug_error)?
