@@ -5600,7 +5600,6 @@ async fn submit_recovery_claim_is_scoped_fenced_and_reclaimable() -> TestResult 
             .is_err(),
             "database accepted a recovery lease beyond the provider deadline",
         )?;
-        tokio::time::sleep(Duration::from_millis(10)).await;
         let renewed = store
             .heartbeat_submit_recovery(&first, 30_000)
             .await
@@ -5715,13 +5714,20 @@ async fn submit_recovery_claim_is_scoped_fenced_and_reclaimable() -> TestResult 
                 .is_none(),
             "deferred recovery became immediately claimable",
         )?;
-        tokio::time::sleep(Duration::from_millis(120)).await;
+        let deferred_until: i64 = sqlx::query_scalar(
+            "SELECT next_recovery_at_ms FROM provider_submit_recoveries WHERE submission_id = $1",
+        )
+        .bind(executor.submission_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        sleep_until_database_time(&database.pool, deferred_until + 20).await?;
         let reclaimed = store
             .claim_submit_recovery(
                 &claim_scope(),
                 "recovery-c",
                 "claim-after-defer/due",
-                2_000,
+                20_000,
             )
             .await
             .map_err(debug_error)?
@@ -5788,7 +5794,7 @@ async fn submit_recovery_claim_is_scoped_fenced_and_reclaimable() -> TestResult 
                 &scope,
                 &reclaimed.recovery_owner,
                 "claim-after-defer/due",
-                2_000,
+                20_000,
             )
             .await
             .map_err(debug_error)?
@@ -5803,9 +5809,9 @@ async fn submit_recovery_claim_is_scoped_fenced_and_reclaimable() -> TestResult 
             .map_err(debug_error)?;
 
         let deadline_executor =
-            seed_running_submission_with_lease(&database.pool, "recovery-deadline", 20).await?;
+            seed_running_submission_with_lease(&database.pool, "recovery-deadline", 1_000).await?;
         let mut deadline_reservation = reservation_request(&deadline_executor);
-        deadline_reservation.provider_timeout_ms = 120;
+        deadline_reservation.provider_timeout_ms = 5_000;
         store
             .reserve_submit(&deadline_reservation)
             .await
@@ -5814,7 +5820,11 @@ async fn submit_recovery_claim_is_scoped_fenced_and_reclaimable() -> TestResult 
             .start_submit(&deadline_reservation)
             .await
             .map_err(debug_error)?;
-        tokio::time::sleep(Duration::from_millis(30)).await;
+        sleep_until_database_time(
+            &database.pool,
+            deadline_executor.executor_lease_expires_at_ms + 20,
+        )
+        .await?;
         let deadline_lease = store
             .claim_submit_recovery(
                 &claim_scope(),
@@ -5833,7 +5843,11 @@ async fn submit_recovery_claim_is_scoped_fenced_and_reclaimable() -> TestResult 
             ))
             .await
             .map_err(debug_error)?;
-        tokio::time::sleep(Duration::from_millis(120)).await;
+        sleep_until_database_time(
+            &database.pool,
+            deadline_lease.context().provider_deadline_at_ms() + 20,
+        )
+        .await?;
         let mut deadline_attach = attach_request!(&store,
             &deadline_executor,
             "operation-after-deadline",
@@ -5849,7 +5863,7 @@ async fn submit_recovery_claim_is_scoped_fenced_and_reclaimable() -> TestResult 
         )?;
 
         let rejected_executor =
-            seed_running_submission_with_lease(&database.pool, "recovery-reject", 200).await?;
+            seed_running_submission_with_lease(&database.pool, "recovery-reject", 1_000).await?;
         let rejected_reservation = reservation_request(&rejected_executor);
         store
             .reserve_submit(&rejected_reservation)
@@ -5859,13 +5873,17 @@ async fn submit_recovery_claim_is_scoped_fenced_and_reclaimable() -> TestResult 
             .start_submit(&rejected_reservation)
             .await
             .map_err(debug_error)?;
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        sleep_until_database_time(
+            &database.pool,
+            rejected_executor.executor_lease_expires_at_ms + 20,
+        )
+        .await?;
         let rejection_lease = store
             .claim_submit_recovery(
                 &claim_scope(),
                 "recovery-rejector",
                 "claim-recovery-rejector",
-                2_000,
+                20_000,
             )
             .await
             .map_err(debug_error)?
@@ -5881,10 +5899,10 @@ async fn submit_recovery_claim_is_scoped_fenced_and_reclaimable() -> TestResult 
             recovery_lease_epoch: rejection_lease.recovery_lease_epoch,
         });
         let (concurrent_heartbeat, rejected) = tokio::time::timeout(
-            Duration::from_secs(2),
+            Duration::from_secs(5),
             async {
                 tokio::join!(
-                    store.heartbeat_submit_recovery(&rejection_lease, 2_000),
+                    store.heartbeat_submit_recovery(&rejection_lease, 20_000),
                     store.record_submit_failure(&rejection),
                 )
             },
@@ -5904,7 +5922,7 @@ async fn submit_recovery_claim_is_scoped_fenced_and_reclaimable() -> TestResult 
         )?;
         require(
             store
-                .heartbeat_submit_recovery(&rejection_lease, 2_000)
+                .heartbeat_submit_recovery(&rejection_lease, 20_000)
                 .await
                 == Err(ProviderTaskStoreError::StaleLease),
             "confirmed recovered rejection did not close its recovery lease",
