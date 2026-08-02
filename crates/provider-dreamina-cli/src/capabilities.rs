@@ -1,7 +1,7 @@
 use image_provider_contracts::{
     ArtifactDelivery, BillingMetric, CallbackMode, CancellationMode, CompletionMode,
     IdempotencyMode, MediaKind, MediaOperation, OfficialParamsContract, OfficialParamsKind,
-    OperationDescriptor, OutputCardinality, RemoteTaskControls, StreamingMode,
+    OperationDescriptor, OutputCardinality, RemoteTaskControls, SpatialEditMode, StreamingMode,
 };
 
 pub const DREAMINA_CLI_REMOTE_TASK_CONTROLS_V1: RemoteTaskControls = RemoteTaskControls {
@@ -22,6 +22,7 @@ pub const DREAMINA_IMAGE_GENERATION_OPERATION_V1: OperationDescriptor = Operatio
     idempotency: IdempotencyMode::SubmissionBound,
     billing_metric: BillingMetric::Output,
     output_cardinality: OutputCardinality::ExactlyOne,
+    spatial_edit_mode: SpatialEditMode::Unsupported,
     official_params: OfficialParamsContract {
         kind: OfficialParamsKind::DreaminaCli,
         schema_id: "dreamina-cli/text2image-v1",
@@ -42,6 +43,7 @@ pub const DREAMINA_VIDEO_GENERATION_OPERATION_V1: OperationDescriptor = Operatio
     idempotency: IdempotencyMode::SubmissionBound,
     billing_metric: BillingMetric::VideoSecond,
     output_cardinality: OutputCardinality::ExactlyOne,
+    spatial_edit_mode: SpatialEditMode::Unsupported,
     official_params: OfficialParamsContract {
         kind: OfficialParamsKind::DreaminaCli,
         schema_id: "dreamina-cli/text2video-v1",

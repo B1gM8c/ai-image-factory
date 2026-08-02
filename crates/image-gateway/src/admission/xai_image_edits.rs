@@ -11,6 +11,13 @@ use crate::generator::EditJob;
 
 use super::{EDIT_INPUT_MANIFEST_SCHEMA, EditCommandV1, EditInputDescriptorV1, EditInputRoleV1};
 
+const SEMANTIC_MASK_PROMPT_MARKER: &str = "[factory-spatial-edit:semantic-mask-v1]";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum XaiImageEditFallbackMode {
+    SemanticMask,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct XaiImageEditAdmissionPlan {
     source_command: EditCommandV1,
@@ -22,20 +29,42 @@ impl XaiImageEditAdmissionPlan {
         job: &EditJob,
         inputs: Vec<EditInputDescriptorV1>,
     ) -> Result<Self, XaiImageEditAdmissionError> {
-        validate_supported_fields(job)?;
+        Self::for_grok_cli_inner(job, inputs, None)
+    }
+
+    pub fn for_grok_cli_with_fallback(
+        job: &EditJob,
+        inputs: Vec<EditInputDescriptorV1>,
+        fallback: XaiImageEditFallbackMode,
+    ) -> Result<Self, XaiImageEditAdmissionError> {
+        Self::for_grok_cli_inner(job, inputs, Some(fallback))
+    }
+
+    fn for_grok_cli_inner(
+        job: &EditJob,
+        inputs: Vec<EditInputDescriptorV1>,
+        fallback: Option<XaiImageEditFallbackMode>,
+    ) -> Result<Self, XaiImageEditAdmissionError> {
+        validate_supported_fields(job, fallback)?;
         let source_command =
             EditCommandV1::from_edit_job(job, inputs, XAI_IMAGES_API_PROFILE, PROVIDER_ID);
+        let source_image_count = source_command
+            .inputs
+            .iter()
+            .filter(|input| input.role == EditInputRoleV1::Image)
+            .count();
         let staged_images = source_command
             .inputs
             .iter()
-            .map(staged_image)
+            .map(|input| staged_image(input, fallback))
             .collect::<Result<Vec<_>, _>>()?;
-        let aspect_ratio = if staged_images.len() == 1 {
+        let aspect_ratio = if source_image_count == 1 {
             ImageAspectRatio::Auto
         } else {
             parse_aspect_ratio(&job.size)?
         };
-        let request = GrokImageEditRequestV1::new(job.prompt.clone(), staged_images, aspect_ratio)?;
+        let prompt = semantic_mask_prompt(&job.prompt, job.mask.is_some(), fallback);
+        let request = GrokImageEditRequestV1::new(prompt, staged_images, aspect_ratio)?;
         let payload = GrokImageEditPayloadV1::new(source_command.request_hash_hex(), request)
             .map_err(|_| XaiImageEditAdmissionError::InvalidProviderCommand)?;
         let command = SingleOutputCommand::new(
@@ -95,8 +124,11 @@ pub enum XaiImageEditAdmissionError {
     InvalidProviderCommand,
 }
 
-fn validate_supported_fields(job: &EditJob) -> Result<(), XaiImageEditAdmissionError> {
-    if job.mask.is_some() {
+fn validate_supported_fields(
+    job: &EditJob,
+    fallback: Option<XaiImageEditFallbackMode>,
+) -> Result<(), XaiImageEditAdmissionError> {
+    if job.mask.is_some() && fallback.is_none() {
         return Err(XaiImageEditAdmissionError::UnsupportedMask);
     }
     if job.n != 1 {
@@ -113,10 +145,13 @@ fn validate_supported_fields(job: &EditJob) -> Result<(), XaiImageEditAdmissionE
 
 fn staged_image(
     input: &EditInputDescriptorV1,
+    fallback: Option<XaiImageEditFallbackMode>,
 ) -> Result<StagedImageV1, XaiImageEditAdmissionError> {
-    if input.role != EditInputRoleV1::Image {
-        return Err(XaiImageEditAdmissionError::UnsupportedMask);
-    }
+    let filename_prefix = match (input.role, fallback) {
+        (EditInputRoleV1::Image, _) => format!("image-{}", input.index),
+        (EditInputRoleV1::Mask, Some(XaiImageEditFallbackMode::SemanticMask)) => "mask".to_owned(),
+        (EditInputRoleV1::Mask, None) => return Err(XaiImageEditAdmissionError::UnsupportedMask),
+    };
     let extension = match input.media_type.as_str() {
         "image/png" => "png",
         "image/jpeg" => "jpg",
@@ -124,9 +159,25 @@ fn staged_image(
         _ => return Err(XaiImageEditAdmissionError::InvalidProviderCommand),
     };
     Ok(StagedImageV1::new(
-        format!("image-{}.{}", input.index, extension),
+        format!("{filename_prefix}.{extension}"),
         input.sha256_hex.clone(),
     )?)
+}
+
+fn semantic_mask_prompt(
+    user_prompt: &str,
+    has_mask: bool,
+    fallback: Option<XaiImageEditFallbackMode>,
+) -> String {
+    if !has_mask
+        || fallback != Some(XaiImageEditFallbackMode::SemanticMask)
+        || user_prompt.contains(SEMANTIC_MASK_PROMPT_MARKER)
+    {
+        return user_prompt.to_owned();
+    }
+    format!(
+        "{user_prompt}\n\n{SEMANTIC_MASK_PROMPT_MARKER}\nThe final reference image is mask.png. Its transparent pixels identify the requested edit region. Apply the requested change only inside that region and preserve pixels outside it as closely as possible. This is a semantic region hint, not pixel-exact inpainting."
+    )
 }
 
 fn parse_aspect_ratio(value: &str) -> Result<ImageAspectRatio, XaiImageEditAdmissionError> {
@@ -184,6 +235,16 @@ mod tests {
             .collect()
     }
 
+    fn mask_descriptor() -> EditInputDescriptorV1 {
+        EditInputDescriptorV1 {
+            byte_size: 16,
+            index: 0,
+            media_type: "image/png".to_owned(),
+            role: EditInputRoleV1::Mask,
+            sha256_hex: format!("{:064x}", 99),
+        }
+    }
+
     #[test]
     fn plan_binds_every_reference_into_the_grok_command() {
         let plan = XaiImageEditAdmissionPlan::for_grok_cli(&job(), descriptors(2)).unwrap();
@@ -218,5 +279,67 @@ mod tests {
             XaiImageEditAdmissionPlan::for_grok_cli(&request, descriptors(1)),
             Err(XaiImageEditAdmissionError::UnsupportedOutputCount)
         );
+    }
+
+    #[test]
+    fn strict_xai_projection_still_rejects_masks() {
+        let mut request = job();
+        request.mask = Some(crate::generator::InputImage {
+            bytes: Vec::new(),
+            content_type: Some("image/png".to_owned()),
+            filename: Some("mask.png".to_owned()),
+        });
+        let mut inputs = descriptors(1);
+        inputs.push(mask_descriptor());
+
+        assert_eq!(
+            XaiImageEditAdmissionPlan::for_grok_cli(&request, inputs),
+            Err(XaiImageEditAdmissionError::UnsupportedMask)
+        );
+    }
+
+    #[test]
+    fn opted_in_semantic_mask_becomes_a_final_reference_and_prompt_hint() {
+        let mut request = job();
+        request.mask = Some(crate::generator::InputImage {
+            bytes: Vec::new(),
+            content_type: Some("image/png".to_owned()),
+            filename: Some("mask.png".to_owned()),
+        });
+        let mut inputs = descriptors(1);
+        inputs.push(mask_descriptor());
+
+        let plan = XaiImageEditAdmissionPlan::for_grok_cli_with_fallback(
+            &request,
+            inputs,
+            XaiImageEditFallbackMode::SemanticMask,
+        )
+        .unwrap();
+        let bytes = serde_json::to_vec(plan.provider_command()).unwrap();
+        let payload = image_provider_grok_cli::parse_image_edit_payload(&bytes).unwrap();
+
+        assert_eq!(payload.request().images().len(), 2);
+        assert_eq!(payload.request().images()[1].filename(), "mask.png");
+        assert_eq!(
+            payload.request().aspect_ratio(),
+            image_provider_grok_cli::ImageAspectRatio::Auto
+        );
+        assert_eq!(
+            payload
+                .request()
+                .prompt()
+                .matches(SEMANTIC_MASK_PROMPT_MARKER)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn semantic_mask_marker_is_not_appended_twice() {
+        let prompt = format!("edit the marked region\n{SEMANTIC_MASK_PROMPT_MARKER}");
+        let projected =
+            semantic_mask_prompt(&prompt, true, Some(XaiImageEditFallbackMode::SemanticMask));
+
+        assert_eq!(projected.matches(SEMANTIC_MASK_PROMPT_MARKER).count(), 1);
     }
 }

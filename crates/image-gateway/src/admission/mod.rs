@@ -34,7 +34,9 @@ pub use dreamina::{
 };
 pub use memory::InMemoryAdmissionStore;
 pub use postgres::PostgresAdmissionStore;
-pub use xai_image_edits::{XaiImageEditAdmissionError, XaiImageEditAdmissionPlan};
+pub use xai_image_edits::{
+    XaiImageEditAdmissionError, XaiImageEditAdmissionPlan, XaiImageEditFallbackMode,
+};
 pub use xai_images::{XaiImageAdmissionError, XaiImageAdmissionPlan};
 pub use xai_videos::{
     VIDEO_GENERATION_OPERATION, XAI_VIDEO_INPUT_MANIFEST_SCHEMA, XaiVideoAdmissionError,

@@ -8,7 +8,7 @@ pub mod provider;
 pub use capability::{
     ArtifactDelivery, BillingMetric, CallbackMode, CancellationMode, CompletionMode,
     IdempotencyMode, OperationDescriptor, OutputCardinality, ProviderCapabilities,
-    RemoteTaskControls,
+    RemoteTaskControls, SpatialEditMode,
 };
 pub use cost::{
     ProviderCostAuthority, ProviderCostConfidence, ProviderCostEvidenceScope,
@@ -52,6 +52,14 @@ mod tests {
         assert_eq!(
             providers[0].capabilities[0].output_cardinality,
             OutputCardinality::ExactlyOne
+        );
+        assert_eq!(
+            providers[0].capabilities[0].spatial_edit_mode,
+            SpatialEditMode::Unsupported
+        );
+        assert_eq!(
+            providers[0].capabilities[1].spatial_edit_mode,
+            SpatialEditMode::SemanticMask
         );
     }
 
@@ -110,6 +118,20 @@ mod tests {
         assert_eq!(
             edit.canonical_sha256_v1_hex(),
             "c9a714ae667cab60f8130b841aa8887077232a29a1c3bb59ba7ecb77b8ddb471"
+        );
+    }
+
+    #[test]
+    fn catalog_spatial_edit_mode_does_not_change_execution_identity() {
+        let base = *openai_codex::operation("images.edits").unwrap();
+        let changed_catalog_metadata = OperationDescriptor {
+            spatial_edit_mode: SpatialEditMode::VisualRegion,
+            ..base
+        };
+
+        assert_eq!(
+            changed_catalog_metadata.canonical_sha256_v1(),
+            base.canonical_sha256_v1()
         );
     }
 

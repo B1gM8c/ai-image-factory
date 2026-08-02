@@ -4,7 +4,7 @@ use image_api_contracts::xai::{
 use image_provider_contracts::{
     ArtifactDelivery, BillingMetric, CompletionMode, IdempotencyMode, MediaKind, MediaOperation,
     OfficialParamsContract, OfficialParamsKind, OperationDescriptor, OutputCardinality,
-    StreamingMode,
+    SpatialEditMode, StreamingMode,
 };
 
 pub const GROK_IMAGE_GENERATION_OPERATION_V1: OperationDescriptor = OperationDescriptor {
@@ -22,6 +22,7 @@ pub const GROK_IMAGE_GENERATION_OPERATION_V1: OperationDescriptor = OperationDes
     idempotency: IdempotencyMode::SubmissionBound,
     billing_metric: BillingMetric::Output,
     output_cardinality: OutputCardinality::ExactlyOne,
+    spatial_edit_mode: SpatialEditMode::Unsupported,
     official_params: OfficialParamsContract {
         kind: OfficialParamsKind::XaiImage,
         schema_id: XAI_IMAGE_GENERATION_COMMAND_SCHEMA,
@@ -44,6 +45,7 @@ pub const GROK_IMAGE_EDIT_OPERATION_V1: OperationDescriptor = OperationDescripto
     idempotency: IdempotencyMode::SubmissionBound,
     billing_metric: BillingMetric::Output,
     output_cardinality: OutputCardinality::ExactlyOne,
+    spatial_edit_mode: SpatialEditMode::SemanticMask,
     official_params: OfficialParamsContract {
         kind: OfficialParamsKind::XaiImage,
         schema_id: "xai.images.edits/grok-cli-subset-v1",
@@ -67,6 +69,7 @@ pub const GROK_VIDEO_GENERATION_OPERATION_V1: OperationDescriptor = OperationDes
     idempotency: IdempotencyMode::SubmissionBound,
     billing_metric: BillingMetric::VideoSecond,
     output_cardinality: OutputCardinality::ExactlyOne,
+    spatial_edit_mode: SpatialEditMode::Unsupported,
     official_params: OfficialParamsContract {
         kind: OfficialParamsKind::XaiVideo,
         schema_id: XAI_VIDEO_GENERATION_COMMAND_SCHEMA,

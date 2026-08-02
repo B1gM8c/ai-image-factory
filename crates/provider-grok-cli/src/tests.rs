@@ -8,7 +8,7 @@ use image_api_contracts::xai::{
 };
 use image_cli_runtime::WorkingDirectory;
 use image_provider_contracts::{
-    ArtifactDelivery, BillingMetric, CompletionMode, OfficialParamsKind,
+    ArtifactDelivery, BillingMetric, CompletionMode, OfficialParamsKind, SpatialEditMode,
 };
 use image_provider_sdk::{OutputSlot, SingleOutputCommand};
 use serde_json::json;
@@ -33,6 +33,10 @@ fn image_edit_descriptor_hash_is_stable() {
 fn capability_descriptors_expose_only_the_exact_cli_completion_model() {
     assert_eq!(GROK_IMAGE_GENERATION_OPERATION_V1.id, "images.generations");
     assert_eq!(GROK_IMAGE_EDIT_OPERATION_V1.id, "images.edits");
+    assert_eq!(
+        GROK_IMAGE_EDIT_OPERATION_V1.spatial_edit_mode,
+        SpatialEditMode::SemanticMask
+    );
     assert_eq!(GROK_VIDEO_GENERATION_OPERATION_V1.id, "videos.generations");
     assert_eq!(
         GROK_IMAGE_GENERATION_OPERATION_V1.completion,

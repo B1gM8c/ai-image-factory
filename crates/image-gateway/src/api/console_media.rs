@@ -10,6 +10,7 @@ use image_api_contracts::{
     ark::{ARK_IMAGES_API_PROFILE, ArkImageGenerationRequest, ArkSequentialImageGenerationOptions},
     dreamina::{DREAMINA_IMAGES_API_PROFILE, DreaminaImageGenerationRequest},
 };
+use image_provider_contracts::SpatialEditMode;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -23,13 +24,14 @@ use super::{
     AppState, IMAGE_EDIT_ROUTE_OPERATION, IMAGE_GENERATION_ROUTE_OPERATION, RequestId,
     admin::authorize_project,
     ark, dreamina, filter_project_models,
-    images::{self, generate_with_resolved_auth},
+    images::{self, ConsoleSpatialEditMode, generate_with_resolved_auth},
     resolve_surface_model,
     sessions::private_json,
 };
 
 const OPENAI_IMAGES_API_PROFILE: &str = "openai-images-v1";
 const XAI_IMAGES_API_PROFILE: &str = "xai-images-v1";
+const SPATIAL_EDIT_MODE_HEADER: &str = "x-ai-factory-spatial-edit-mode";
 
 #[derive(Serialize)]
 struct ConsoleMediaModels {
@@ -46,6 +48,7 @@ struct ConsoleMediaModel {
     operation: String,
     created: i64,
     supports_edit: bool,
+    spatial_edit_mode: SpatialEditMode,
     max_reference_images: u32,
     controls: ConsoleImageControls,
 }
@@ -155,7 +158,7 @@ pub(super) async fn edit_image(
     headers: HeaderMap,
     State(state): State<Arc<AppState>>,
     Path(project_id): Path<String>,
-    request: Request,
+    mut request: Request,
 ) -> Result<Response, ImageGatewayError> {
     let principal = authorize_project(&headers, &state, &project_id, "workspace:write").await?;
     let project_defaults = state
@@ -187,7 +190,26 @@ pub(super) async fn edit_image(
             && principal.scopes.iter().any(|scope| scope == "admin:*"),
     };
     crate::request_observability::capture_auth(&auth);
+    if let Some(mode) = console_spatial_edit_mode(request.headers())? {
+        request.extensions_mut().insert(mode);
+    }
     images::edit_with_resolved_auth(&state, auth, request).await
+}
+
+fn console_spatial_edit_mode(
+    headers: &HeaderMap,
+) -> Result<Option<ConsoleSpatialEditMode>, ImageGatewayError> {
+    let Some(value) = headers.get(SPATIAL_EDIT_MODE_HEADER) else {
+        return Ok(None);
+    };
+    match value.to_str().ok() {
+        Some("semantic_mask") => Ok(Some(ConsoleSpatialEditMode::SemanticMask)),
+        _ => Err(ImageGatewayError::invalid_request(
+            "x-ai-factory-spatial-edit-mode must be semantic_mask",
+            Some("spatial_edit_mode".to_owned()),
+            "invalid_value",
+        )),
+    }
 }
 
 pub(super) async fn generate_image(
@@ -358,6 +380,7 @@ fn console_model(model: PublicModelRoute, supports_edit: bool) -> Option<Console
         }
         _ => 0,
     };
+    let spatial_edit_mode = spatial_edit_mode_for_model(&model, supports_edit);
     Some(ConsoleMediaModel {
         id: model.id,
         provider: model.provider_id,
@@ -366,9 +389,28 @@ fn console_model(model: PublicModelRoute, supports_edit: bool) -> Option<Console
         operation: model.operation_id,
         created: model.created_at_ms.div_euclid(1_000),
         supports_edit,
+        spatial_edit_mode,
         max_reference_images,
         controls,
     })
+}
+
+fn spatial_edit_mode_for_model(model: &PublicModelRoute, supports_edit: bool) -> SpatialEditMode {
+    if !supports_edit {
+        return SpatialEditMode::Unsupported;
+    }
+    match model.provider_id.as_str() {
+        image_provider_contracts::openai_codex::PROVIDER_ID => {
+            image_provider_contracts::openai_codex::operation("images.edits")
+                .map_or(SpatialEditMode::Unsupported, |operation| {
+                    operation.spatial_edit_mode
+                })
+        }
+        image_provider_grok_cli::PROVIDER_ID => {
+            image_provider_grok_cli::GROK_IMAGE_EDIT_OPERATION_V1.spatial_edit_mode
+        }
+        _ => SpatialEditMode::Unsupported,
+    }
 }
 
 fn controls_for_model(
@@ -658,7 +700,46 @@ fn reject_unsupported(value: Option<String>, param: &str) -> Result<(), ImageGat
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::HeaderValue;
     use uuid::Uuid;
+
+    #[test]
+    fn console_spatial_edit_fallback_requires_explicit_semantic_mask_header() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(console_spatial_edit_mode(&headers).unwrap(), None);
+
+        headers.insert(
+            SPATIAL_EDIT_MODE_HEADER,
+            HeaderValue::from_static("semantic_mask"),
+        );
+        assert_eq!(
+            console_spatial_edit_mode(&headers).unwrap(),
+            Some(ConsoleSpatialEditMode::SemanticMask)
+        );
+
+        headers.insert(
+            SPATIAL_EDIT_MODE_HEADER,
+            HeaderValue::from_static("visual_region"),
+        );
+        assert!(console_spatial_edit_mode(&headers).is_err());
+    }
+
+    #[test]
+    fn console_catalog_serializes_grok_semantic_mask_capability() {
+        let model = PublicModelRoute {
+            id: "grok-imagine-image-quality".to_owned(),
+            provider_model_id: Some("grok-imagine-image-quality".to_owned()),
+            api_profile: XAI_IMAGES_API_PROFILE.to_owned(),
+            provider_id: image_provider_grok_cli::PROVIDER_ID.to_owned(),
+            operation_id: IMAGE_GENERATION_ROUTE_OPERATION.to_owned(),
+            media_kind: "image".to_owned(),
+            created_at_ms: 0,
+        };
+        let model = console_model(model, true).expect("Grok console model");
+        let value = serde_json::to_value(model).unwrap();
+
+        assert_eq!(value["spatial_edit_mode"], "semantic_mask");
+    }
 
     #[test]
     fn provider_model_binding_enables_edits_for_public_aliases() {

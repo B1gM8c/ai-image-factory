@@ -138,7 +138,7 @@ pub mod openai_codex {
     use crate::{
         ArtifactDelivery, BillingMetric, CompletionMode, IdempotencyMode, MediaKind,
         MediaOperation, OfficialParamsContract, OfficialParamsKind, OutputCardinality,
-        StreamingMode,
+        SpatialEditMode, StreamingMode,
     };
 
     pub const PROVIDER_ID: &str = "openai-codex";
@@ -170,6 +170,7 @@ pub mod openai_codex {
             idempotency: IdempotencyMode::SubmissionBound,
             billing_metric: BillingMetric::Output,
             output_cardinality: OutputCardinality::ExactlyOne,
+            spatial_edit_mode: SpatialEditMode::Unsupported,
             official_params: OFFICIAL_PARAMS,
         },
         OperationDescriptor {
@@ -187,6 +188,7 @@ pub mod openai_codex {
             idempotency: IdempotencyMode::SubmissionBound,
             billing_metric: BillingMetric::Output,
             output_cardinality: OutputCardinality::ExactlyOne,
+            spatial_edit_mode: SpatialEditMode::SemanticMask,
             official_params: OFFICIAL_PARAMS,
         },
     ];

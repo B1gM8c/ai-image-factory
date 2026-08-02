@@ -24,7 +24,7 @@ use crate::{
         EDIT_INPUT_MANIFEST_SCHEMA, EDIT_OPERATION, EditCommandV1, EditInputDescriptorV1,
         EditInputRoleV1, GENERATION_COMMAND_SCHEMA, GENERATION_OPERATION, GenerationCommandV1,
         PricingProcessingMode, XaiImageEditAdmissionError, XaiImageEditAdmissionPlan,
-        idempotency_key_digest,
+        XaiImageEditFallbackMode, idempotency_key_digest,
     },
     artifacts::{GENERATION_RESPONSE_SCHEMA, StoredGenerationResult, sha256_hex},
     auth::{ApiKeyCapability, AuthContext},
@@ -44,6 +44,11 @@ const ADMISSION_DEADLINE_GRACE: Duration = Duration::from_secs(5);
 const ATTACH_RETRY_DELAY: Duration = Duration::from_millis(25);
 const ATTACH_ATTEMPTS: usize = 3;
 const RESULT_POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ConsoleSpatialEditMode {
+    SemanticMask,
+}
 
 use super::{
     AppState, GenerationExecutionMode, IMAGE_EDIT_ROUTE_OPERATION,
@@ -821,6 +826,10 @@ pub(super) async fn edit_with_resolved_auth(
     request: Request,
 ) -> Result<Response, ImageGatewayError> {
     let headers = request.headers().clone();
+    let console_spatial_edit_mode = request
+        .extensions()
+        .get::<ConsoleSpatialEditMode>()
+        .copied();
     let upload_permit = state.upload_scheduler.acquire(&auth.tenant_id).await?;
 
     let request_id = request
@@ -886,8 +895,17 @@ pub(super) async fn edit_with_resolved_auth(
     let (command_schema, command_json, provider_command_hash, input_manifest_hash) = if provider_id
         == image_provider_grok_cli::PROVIDER_ID
     {
-        let plan = XaiImageEditAdmissionPlan::for_grok_cli(&job, descriptors)
-            .map_err(xai_edit_admission_error)?;
+        let plan = match console_spatial_edit_mode {
+            Some(ConsoleSpatialEditMode::SemanticMask) => {
+                XaiImageEditAdmissionPlan::for_grok_cli_with_fallback(
+                    &job,
+                    descriptors,
+                    XaiImageEditFallbackMode::SemanticMask,
+                )
+            }
+            None => XaiImageEditAdmissionPlan::for_grok_cli(&job, descriptors),
+        }
+        .map_err(xai_edit_admission_error)?;
         (
             plan.command_schema().to_owned(),
             plan.provider_command().clone(),

@@ -1,5 +1,26 @@
 use crate::{MediaKind, MediaOperation, OfficialParamsContract, StreamingMode};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpatialEditMode {
+    NativeMask,
+    SemanticMask,
+    VisualRegion,
+    Unsupported,
+}
+
+impl SpatialEditMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NativeMask => "native_mask",
+            Self::SemanticMask => "semantic_mask",
+            Self::VisualRegion => "visual_region",
+            Self::Unsupported => "unsupported",
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CallbackMode {
@@ -128,6 +149,7 @@ pub struct OperationDescriptor {
     pub idempotency: IdempotencyMode,
     pub billing_metric: BillingMetric,
     pub output_cardinality: OutputCardinality,
+    pub spatial_edit_mode: SpatialEditMode,
     pub official_params: OfficialParamsContract,
 }
 
