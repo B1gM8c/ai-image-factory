@@ -17,7 +17,10 @@ use crate::{
     admission::{AdmissionStore, InMemoryAdmissionStore},
     api_keys::{ApiKeyStore, InMemoryApiKeyStore},
     artifacts::{ArtifactBlobStore, InMemoryArtifactBlobStore},
-    auth::{AuthContext, RequestRouteAttribution, authorize_legacy, bearer_token},
+    auth::{
+        ApiKeyCapability, ApiKeyPermissionMode, ApiKeyPermissions, AuthContext,
+        RequestRouteAttribution, authorize_legacy, bearer_token,
+    },
     batches::BatchService,
     billing_control::BillingAccountControlService,
     billing_integrity::BillingIntegrityService,
@@ -1045,6 +1048,84 @@ pub(super) async fn authenticate_image_request(
         return Ok(context);
     }
     Err(ImageGatewayError::authentication())
+}
+
+pub(super) async fn authenticate_project_media_request(
+    headers: &HeaderMap,
+    state: &Arc<AppState>,
+    project_id: &str,
+    workspace_scope: &str,
+    api_key_capability: ApiKeyCapability,
+) -> Result<AuthContext, ImageGatewayError> {
+    let bearer = bearer_token(headers)?;
+    if let Some(auth) = state.api_key_store.authenticate(bearer).await? {
+        auth.require_api_key_capability(api_key_capability)?;
+        if auth.project_id != project_id {
+            return Err(ImageGatewayError::not_found(
+                "Project was not found",
+                Some("project_id".to_owned()),
+                "project_not_found",
+            ));
+        }
+        crate::request_observability::capture_auth(&auth);
+        return Ok(auth);
+    }
+
+    let principal = admin::authorize_project(headers, state, project_id, workspace_scope).await?;
+    let project_defaults = state
+        .api_key_store
+        .project_runtime_defaults(project_id)
+        .await?
+        .ok_or_else(|| {
+            ImageGatewayError::not_found(
+                "Project was not found",
+                Some("project_id".to_owned()),
+                "project_not_found",
+            )
+        })?;
+    let auth = AuthContext {
+        tenant_id: project_defaults.tenant_id,
+        project_id: project_id.to_owned(),
+        project_service_tier: project_defaults.service_tier,
+        service_account_id: None,
+        api_key_id: None,
+        credential_authz_version: None,
+        credential_owner_user_id: None,
+        actor_user_id: Some(principal.user_id),
+        actor_session_id: Some(principal.session_id),
+        actor_authz_version: Some(principal.authz_version),
+        api_key_permission_mode: ApiKeyPermissionMode::All,
+        api_key_permissions: ApiKeyPermissions::default(),
+        route: None,
+        is_admin: principal.roles.iter().any(|role| role == "platform_owner")
+            && principal.scopes.iter().any(|scope| scope == "admin:*"),
+    };
+    crate::request_observability::capture_auth(&auth);
+    Ok(auth)
+}
+
+pub(super) async fn list_project_media_models(
+    state: &Arc<AppState>,
+    auth: &AuthContext,
+    operation_id: &str,
+) -> Result<Vec<crate::model_routing::PublicModelRoute>, ImageGatewayError> {
+    let store = state
+        .model_routing_store
+        .as_ref()
+        .ok_or_else(|| ImageGatewayError::service_unavailable("model routing is unavailable"))?;
+    if let (Some(api_key_id), Some(authz_version)) =
+        (auth.api_key_id.as_deref(), auth.credential_authz_version)
+    {
+        return Ok(store
+            .list_api_key_models(&auth.project_id, api_key_id, authz_version)
+            .await?
+            .into_iter()
+            .filter(|model| model.operation_id == operation_id)
+            .collect());
+    }
+    store
+        .list_console_models(&auth.project_id, operation_id)
+        .await
 }
 
 #[allow(clippy::too_many_arguments)]

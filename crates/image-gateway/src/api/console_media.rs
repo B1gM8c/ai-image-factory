@@ -16,16 +16,15 @@ use serde_json::{Value, json};
 
 use crate::{
     ImageGatewayError,
-    auth::AuthContext,
+    auth::ApiKeyCapability,
     model_routing::{PublicModelRoute, ResolvedModelRoute},
 };
 
 use super::{
-    AppState, IMAGE_EDIT_ROUTE_OPERATION, IMAGE_GENERATION_ROUTE_OPERATION, RequestId,
-    admin::authorize_project,
-    ark, dreamina, filter_project_models,
+    AppState, IMAGE_EDIT_ROUTE_OPERATION, IMAGE_GENERATION_ROUTE_OPERATION, RequestId, ark,
+    authenticate_project_media_request, dreamina, filter_project_models,
     images::{self, ConsoleSpatialEditMode, generate_with_resolved_auth},
-    resolve_surface_model,
+    list_project_media_models, resolve_surface_model,
     sessions::private_json,
 };
 
@@ -104,17 +103,17 @@ pub(super) async fn image_models(
     State(state): State<Arc<AppState>>,
     Path(project_id): Path<String>,
 ) -> Result<Response, ImageGatewayError> {
-    authorize_project(&headers, &state, &project_id, "workspace:read").await?;
-    let store = state
-        .model_routing_store
-        .as_ref()
-        .ok_or_else(|| ImageGatewayError::service_unavailable("model routing is unavailable"))?;
-    let generation_models = store
-        .list_console_models(&project_id, IMAGE_GENERATION_ROUTE_OPERATION)
-        .await?;
-    let edit_models = store
-        .list_console_models(&project_id, IMAGE_EDIT_ROUTE_OPERATION)
-        .await?;
+    let auth = authenticate_project_media_request(
+        &headers,
+        &state,
+        &project_id,
+        "workspace:read",
+        ApiKeyCapability::ModelsRead,
+    )
+    .await?;
+    let generation_models =
+        list_project_media_models(&state, &auth, IMAGE_GENERATION_ROUTE_OPERATION).await?;
+    let edit_models = list_project_media_models(&state, &auth, IMAGE_EDIT_ROUTE_OPERATION).await?;
     let edit_models = filter_project_models(&state, &project_id, edit_models).await?;
     let edit_public_capabilities = edit_models
         .iter()
@@ -160,36 +159,14 @@ pub(super) async fn edit_image(
     Path(project_id): Path<String>,
     mut request: Request,
 ) -> Result<Response, ImageGatewayError> {
-    let principal = authorize_project(&headers, &state, &project_id, "workspace:write").await?;
-    let project_defaults = state
-        .api_key_store
-        .project_runtime_defaults(&project_id)
-        .await?
-        .ok_or_else(|| {
-            ImageGatewayError::not_found(
-                "Project was not found",
-                Some("project_id".to_owned()),
-                "project_not_found",
-            )
-        })?;
-    let auth = AuthContext {
-        tenant_id: project_defaults.tenant_id,
-        project_id,
-        project_service_tier: project_defaults.service_tier,
-        service_account_id: None,
-        api_key_id: None,
-        credential_authz_version: None,
-        credential_owner_user_id: None,
-        actor_user_id: Some(principal.user_id),
-        actor_session_id: Some(principal.session_id),
-        actor_authz_version: Some(principal.authz_version),
-        api_key_permission_mode: crate::auth::ApiKeyPermissionMode::All,
-        api_key_permissions: crate::auth::ApiKeyPermissions::default(),
-        route: None,
-        is_admin: principal.roles.iter().any(|role| role == "platform_owner")
-            && principal.scopes.iter().any(|scope| scope == "admin:*"),
-    };
-    crate::request_observability::capture_auth(&auth);
+    let auth = authenticate_project_media_request(
+        &headers,
+        &state,
+        &project_id,
+        "workspace:write",
+        ApiKeyCapability::ImagesWrite,
+    )
+    .await?;
     if let Some(mode) = console_spatial_edit_mode(request.headers())? {
         request.extensions_mut().insert(mode);
     }
@@ -219,7 +196,14 @@ pub(super) async fn generate_image(
     Path(project_id): Path<String>,
     body: Result<Json<ConsoleImageGenerationRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Response, ImageGatewayError> {
-    let principal = authorize_project(&headers, &state, &project_id, "workspace:write").await?;
+    let mut auth = authenticate_project_media_request(
+        &headers,
+        &state,
+        &project_id,
+        "workspace:write",
+        ApiKeyCapability::ImagesWrite,
+    )
+    .await?;
     let Json(request) = body.map_err(|error| {
         ImageGatewayError::invalid_request(
             format!("Invalid JSON request: {error}"),
@@ -234,35 +218,6 @@ pub(super) async fn generate_image(
             "invalid_request",
         ));
     }
-    let project_defaults = state
-        .api_key_store
-        .project_runtime_defaults(&project_id)
-        .await?
-        .ok_or_else(|| {
-            ImageGatewayError::not_found(
-                "Project was not found",
-                Some("project_id".to_owned()),
-                "project_not_found",
-            )
-        })?;
-    let mut auth = AuthContext {
-        tenant_id: project_defaults.tenant_id,
-        project_id,
-        project_service_tier: project_defaults.service_tier,
-        service_account_id: None,
-        api_key_id: None,
-        credential_authz_version: None,
-        credential_owner_user_id: None,
-        actor_user_id: Some(principal.user_id),
-        actor_session_id: Some(principal.session_id),
-        actor_authz_version: Some(principal.authz_version),
-        api_key_permission_mode: crate::auth::ApiKeyPermissionMode::All,
-        api_key_permissions: crate::auth::ApiKeyPermissions::default(),
-        route: None,
-        is_admin: principal.roles.iter().any(|role| role == "platform_owner")
-            && principal.scopes.iter().any(|scope| scope == "admin:*"),
-    };
-    crate::request_observability::capture_auth(&auth);
     let resolved = resolve_surface_model(
         &state,
         &mut auth,

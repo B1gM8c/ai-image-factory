@@ -20,15 +20,15 @@ use uuid::Uuid;
 
 use crate::{
     ImageGatewayError,
-    auth::AuthContext,
+    auth::ApiKeyCapability,
     model_routing::{PublicModelRoute, ResolvedModelRoute},
     settlement::{StoredVideoArtifact, VideoPendingStage, VideoResultStatus},
 };
 
 use super::{
-    AppState, RequestId, VIDEO_GENERATION_ROUTE_OPERATION, admin::authorize_project, ark, dreamina,
-    filter_project_models, resolve_surface_model, sessions::private_json,
-    videos::create_video_with_auth,
+    AppState, RequestId, VIDEO_GENERATION_ROUTE_OPERATION, ark, authenticate_project_media_request,
+    dreamina, filter_project_models, list_project_media_models, resolve_surface_model,
+    sessions::private_json, videos::create_video_with_auth,
 };
 
 #[derive(Serialize)]
@@ -119,13 +119,15 @@ pub(super) async fn video_models(
     State(state): State<Arc<AppState>>,
     Path(project_id): Path<String>,
 ) -> Result<Response, ImageGatewayError> {
-    authorize_project(&headers, &state, &project_id, "workspace:read").await?;
-    let models = state
-        .model_routing_store
-        .as_ref()
-        .ok_or_else(|| ImageGatewayError::service_unavailable("model routing is unavailable"))?
-        .list_console_models(&project_id, VIDEO_GENERATION_ROUTE_OPERATION)
-        .await?;
+    let auth = authenticate_project_media_request(
+        &headers,
+        &state,
+        &project_id,
+        "workspace:read",
+        ApiKeyCapability::ModelsRead,
+    )
+    .await?;
+    let models = list_project_media_models(&state, &auth, VIDEO_GENERATION_ROUTE_OPERATION).await?;
     let models =
         prefer_official_dreamina_aliases(filter_project_models(&state, &project_id, models).await?)
             .into_iter()
@@ -145,7 +147,14 @@ pub(super) async fn generate_video(
     Path(project_id): Path<String>,
     body: Result<Json<ConsoleVideoGenerationRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Response, ImageGatewayError> {
-    let principal = authorize_project(&headers, &state, &project_id, "workspace:write").await?;
+    let mut auth = authenticate_project_media_request(
+        &headers,
+        &state,
+        &project_id,
+        "workspace:write",
+        ApiKeyCapability::VideosWrite,
+    )
+    .await?;
     let Json(request) = body.map_err(|error| {
         ImageGatewayError::invalid_request(
             format!("Invalid JSON request: {error}"),
@@ -160,35 +169,6 @@ pub(super) async fn generate_video(
             "invalid_request",
         ));
     }
-    let project_defaults = state
-        .api_key_store
-        .project_runtime_defaults(&project_id)
-        .await?
-        .ok_or_else(|| {
-            ImageGatewayError::not_found(
-                "Project was not found",
-                Some("project_id".to_owned()),
-                "project_not_found",
-            )
-        })?;
-    let mut auth = AuthContext {
-        tenant_id: project_defaults.tenant_id,
-        project_id,
-        project_service_tier: project_defaults.service_tier,
-        service_account_id: None,
-        api_key_id: None,
-        credential_authz_version: None,
-        credential_owner_user_id: None,
-        actor_user_id: Some(principal.user_id),
-        actor_session_id: Some(principal.session_id),
-        actor_authz_version: Some(principal.authz_version),
-        api_key_permission_mode: crate::auth::ApiKeyPermissionMode::All,
-        api_key_permissions: crate::auth::ApiKeyPermissions::default(),
-        route: None,
-        is_admin: principal.roles.iter().any(|role| role == "platform_owner")
-            && principal.scopes.iter().any(|scope| scope == "admin:*"),
-    };
-    crate::request_observability::capture_auth(&auth);
     let resolved = resolve_surface_model(
         &state,
         &mut auth,
@@ -249,9 +229,16 @@ pub(super) async fn get_console_video(
     State(state): State<Arc<AppState>>,
     Path((project_id, task_id)): Path<(String, String)>,
 ) -> Result<Response, ImageGatewayError> {
-    let principal = authorize_project(&headers, &state, &project_id, "workspace:read").await?;
+    let auth = authenticate_project_media_request(
+        &headers,
+        &state,
+        &project_id,
+        "workspace:read",
+        ApiKeyCapability::VideosRead,
+    )
+    .await?;
     let tenant_id = project_tenant(&state, &project_id).await?;
-    let actor_user_id = task_actor_scope(&principal);
+    let actor_user_id = (!auth.is_admin).then_some(auth.actor_user_id).flatten();
     let job_id = parse_console_uuid(&task_id, "task_id")?;
     let status = state
         .settlement_store
@@ -270,9 +257,16 @@ pub(super) async fn get_console_video_content(
     State(state): State<Arc<AppState>>,
     Path((project_id, file_id)): Path<(String, String)>,
 ) -> Result<Response, ImageGatewayError> {
-    let principal = authorize_project(&headers, &state, &project_id, "workspace:read").await?;
+    let auth = authenticate_project_media_request(
+        &headers,
+        &state,
+        &project_id,
+        "workspace:read",
+        ApiKeyCapability::VideosRead,
+    )
+    .await?;
     let tenant_id = project_tenant(&state, &project_id).await?;
-    let actor_user_id = task_actor_scope(&principal);
+    let actor_user_id = (!auth.is_admin).then_some(auth.actor_user_id).flatten();
     let artifact_id = parse_console_uuid(&file_id, "file_id")?;
     let StoredVideoArtifact { media_type, bytes } = state
         .settlement_store
@@ -673,12 +667,6 @@ fn console_video_error_message(error_code: Option<&str>) -> &'static str {
         }
         _ => "Video generation failed",
     }
-}
-
-fn task_actor_scope(principal: &factory_identity::AuthenticatedPrincipal) -> Option<Uuid> {
-    let platform_admin = principal.roles.iter().any(|role| role == "platform_owner")
-        && principal.scopes.iter().any(|scope| scope == "admin:*");
-    (!platform_admin).then_some(principal.user_id)
 }
 
 #[cfg(test)]
