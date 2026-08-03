@@ -13,7 +13,7 @@ use gpt_image_2_gateway::{
     provider_management::{
         CreateProviderRouteMemberRequest, PostgresProviderManagementService,
         ProviderManagementService, UpdateProviderAccountSchedulingRequest,
-        UpdateProviderRouteRequest,
+        UpdateProviderRouteRequest, reconcile_execution_profile_routes,
     },
     service_tiers::ProjectServiceTier,
 };
@@ -1006,6 +1006,211 @@ async fn routed_service_account_creation_is_atomic_and_visible_in_key_listing() 
                 "stale authorization version returned {}",
                 stale.status_code()
             ),
+        )
+    }
+    .await;
+    let cleanup = database.cleanup().await;
+    cleanup?;
+    result
+}
+
+#[tokio::test]
+async fn replacement_profiles_advance_bound_routes_without_losing_catalog_models() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+
+    let result = async {
+        let project_id = format!("proj_{}", Uuid::new_v4().simple());
+        insert_project(&database.setup_pool, &project_id).await?;
+        let image_account_route = insert_codex_route(&database.setup_pool).await?;
+        let image_route = insert_codex_group_route_with_policy(
+            &database.setup_pool,
+            &[(image_account_route, 3, 70, 15)],
+            "quota_aware_least_loaded",
+            "allow",
+        )
+        .await?;
+        let (video_route, video_model_id) =
+            insert_test_video_route(&database.setup_pool, image_account_route).await?;
+        let store = PostgresApiKeyStore::new(database.pool("profile_upgrade").await?, test_keyring());
+        let permissions = ApiKeyPermissions(BTreeMap::from([
+            ("models".to_string(), ApiKeyPermissionLevel::Read),
+            ("images".to_string(), ApiKeyPermissionLevel::Write),
+            ("videos".to_string(), ApiKeyPermissionLevel::Write),
+        ]));
+        let created = store
+            .create_service_account_with_route(
+                &project_id,
+                "Profile upgrade",
+                image_route,
+                ApiKeyPermissionMode::Restricted,
+                permissions,
+            )
+            .await
+            .map_err(|error| format!("failed to create routed API key: {error:?}"))?;
+        bind_test_api_key_route(
+            &database.setup_pool,
+            &project_id,
+            &created.api_key.id,
+            video_route,
+        )
+        .await?;
+        bind_test_console_routes(
+            &database.setup_pool,
+            &project_id,
+            image_route,
+            video_route,
+        )
+        .await?;
+
+        let initial_report = reconcile_execution_profile_routes(&database.setup_pool)
+            .await
+            .map_err(|error| format!("new-install reconciliation failed: {error:?}"))?;
+        require(
+            initial_report.inspected_routes == 0 && initial_report.revised_routes == 0,
+            format!("healthy new routes were unexpectedly revised: {initial_report:?}"),
+        )?;
+        let model_routing = PostgresModelRoutingStore::new(database.pool("upgrade_models").await?);
+        let initial_authz_version: i64 = sqlx::query_scalar(
+            "SELECT authz_version FROM gateway_api_keys WHERE id = $1",
+        )
+        .bind(&created.api_key.id)
+        .fetch_one(&database.setup_pool)
+        .await
+        .map_err(|error| format!("failed to read initial authz version: {error}"))?;
+        let initial_models = model_routing
+            .list_api_key_models(
+                &project_id,
+                &created.api_key.id,
+                initial_authz_version,
+            )
+            .await
+            .map_err(|error| format!("failed to list initial models: {error:?}"))?;
+        require(
+            initial_models.iter().any(|model| model.id == "gpt-image-2")
+                && initial_models.iter().any(|model| model.id == video_model_id),
+            format!("initial image/video catalog was incomplete: {initial_models:?}"),
+        )?;
+
+        let replacements = replace_current_route_profiles(
+            &database.setup_pool,
+            &[image_account_route, image_route, video_route],
+        )
+        .await?;
+        let empty_models = model_routing
+            .list_api_key_models(
+                &project_id,
+                &created.api_key.id,
+                initial_authz_version,
+            )
+            .await
+            .map_err(|error| format!("failed to observe stale catalog: {error:?}"))?;
+        require(
+            empty_models.is_empty(),
+            format!("disabled legacy profiles remained visible: {empty_models:?}"),
+        )?;
+
+        let report = reconcile_execution_profile_routes(&database.setup_pool)
+            .await
+            .map_err(|error| format!("historical route reconciliation failed: {error:?}"))?;
+        require(
+            report.inspected_routes == 3
+                && report.revised_routes == 3
+                && report.unresolved_routes == 0
+                && report.api_key_bindings_moved == 2
+                && report.project_bindings_moved == 1
+                && report.platform_bindings_moved == 1,
+            format!("unexpected route reconciliation report: {report:?}"),
+        )?;
+        let current_authz_version: i64 = sqlx::query_scalar(
+            "SELECT authz_version FROM gateway_api_keys WHERE id = $1",
+        )
+        .bind(&created.api_key.id)
+        .fetch_one(&database.setup_pool)
+        .await
+        .map_err(|error| format!("failed to read reconciled authz version: {error}"))?;
+        require(
+            current_authz_version == initial_authz_version + 2,
+            format!(
+                "route binding migration did not invalidate authorization snapshots: {initial_authz_version} -> {current_authz_version}"
+            ),
+        )?;
+        let models = model_routing
+            .list_api_key_models(
+                &project_id,
+                &created.api_key.id,
+                current_authz_version,
+            )
+            .await
+            .map_err(|error| format!("failed to list reconciled models: {error:?}"))?;
+        require(
+            models.iter().any(|model| model.id == "gpt-image-2")
+                && models.iter().any(|model| model.id == video_model_id),
+            format!("reconciled image/video catalog was incomplete: {models:?}"),
+        )?;
+        assert_reconciled_route_copies(
+            &database.setup_pool,
+            &[image_account_route, image_route, video_route],
+        )
+        .await?;
+
+        let repeated = reconcile_execution_profile_routes(&database.setup_pool)
+            .await
+            .map_err(|error| format!("repeated reconciliation failed: {error:?}"))?;
+        require(
+            repeated.inspected_routes == 0 && repeated.revised_routes == 0,
+            format!("repeated reconciliation was not idempotent: {repeated:?}"),
+        )?;
+        let revision_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM provider_routes WHERE route_id = ANY($1)",
+        )
+        .bind(vec![image_account_route, image_route, video_route])
+        .fetch_one(&database.setup_pool)
+        .await
+        .map_err(|error| format!("failed to count route revisions: {error}"))?;
+        require(
+            revision_count == 6,
+            format!("repeated reconciliation created duplicate revisions: {revision_count}"),
+        )?;
+
+        let (_, manually_disabled_profile) = replacements
+            .iter()
+            .find(|(route_id, _)| *route_id == video_route)
+            .copied()
+            .ok_or_else(|| "video replacement profile was not recorded".to_string())?;
+        sqlx::query(
+            "UPDATE provider_execution_profiles SET state = 'disabled', updated_at_ms = updated_at_ms + 1 WHERE execution_profile_id = $1",
+        )
+        .bind(manually_disabled_profile)
+        .execute(&database.setup_pool)
+        .await
+        .map_err(|error| format!("failed to manually disable replacement profile: {error}"))?;
+        let disabled_report = reconcile_execution_profile_routes(&database.setup_pool)
+            .await
+            .map_err(|error| format!("manual-disable reconciliation failed: {error:?}"))?;
+        require(
+            disabled_report.revised_routes == 0 && disabled_report.unresolved_routes == 1,
+            format!("manual disable unexpectedly rewrote a route: {disabled_report:?}"),
+        )?;
+        let disabled_state: (String, i64, i64) = sqlx::query_as(
+            r#"
+            SELECT profile.state, head.current_revision, COUNT(route.revision)
+            FROM provider_execution_profiles profile
+            CROSS JOIN provider_route_heads head
+            JOIN provider_routes route ON route.route_id = head.route_id
+            WHERE profile.execution_profile_id = $1 AND head.route_id = $2
+            GROUP BY profile.state, head.current_revision
+            "#,
+        )
+        .bind(manually_disabled_profile)
+        .bind(video_route)
+        .fetch_one(&database.setup_pool)
+        .await
+        .map_err(|error| format!("failed to inspect manual disable boundary: {error}"))?;
+        require(
+            disabled_state == ("disabled".to_string(), 2, 2),
+            format!("manual disable was not preserved: {disabled_state:?}"),
         )
     }
     .await;
@@ -2423,6 +2628,373 @@ fn keyring_v2_only() -> ApiKeyKeyring {
 
 fn legacy_digest(value: &str) -> String {
     hex::encode(Sha256::digest(value.as_bytes()))
+}
+
+async fn insert_test_video_route(
+    pool: &PgPool,
+    source_route_id: Uuid,
+) -> TestResult<(Uuid, String)> {
+    let now: i64 =
+        sqlx::query_scalar("SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT")
+            .fetch_one(pool)
+            .await
+            .map_err(|error| format!("failed to read database clock: {error}"))?;
+    let source_profile_id: Uuid = sqlx::query_scalar(
+        "SELECT execution_profile_id FROM provider_route_members WHERE route_id = $1 AND route_revision = 1",
+    )
+    .bind(source_route_id)
+    .fetch_one(pool)
+    .await
+    .map_err(|error| format!("failed to read source execution profile: {error}"))?;
+    let execution_profile_id = Uuid::new_v4();
+    let route_id = Uuid::new_v4();
+    let video_model_id = format!("test-video-{}", route_id.simple());
+    sqlx::query(
+        r#"
+        INSERT INTO provider_models
+          (provider_id, model_id, execution_model_id, media_kind, display_name,
+           adapter_state, lifecycle_state, operation_ids, source_kind,
+           first_seen_at_ms, last_seen_at_ms, metadata_json)
+        VALUES ('openai-codex', $1, $1, 'video', 'Test video',
+                'supported', 'enabled', ARRAY['videos.generations'],
+                'adapter_contract', $2, $2, '{}'::JSONB)
+        "#,
+    )
+    .bind(&video_model_id)
+    .bind(now)
+    .execute(pool)
+    .await
+    .map_err(|error| format!("failed to insert test video model: {error}"))?;
+    sqlx::query(
+        r#"
+        INSERT INTO provider_execution_profiles
+          (execution_profile_id, profile_key, provider_id, command_schema,
+           operation_id, operation_descriptor_revision,
+           operation_descriptor_sha256_v1, completion_mode, idempotency_mode,
+           adapter_revision, credential_pool_id, provider_account_id,
+           credential_ref, credential_revision, resource_policy_id,
+           resource_policy_revision, state, created_at_ms, updated_at_ms)
+        SELECT $1, $2, provider_id, 'test.videos.generation.v1',
+               'videos.generations', 'test/videos.generations/v1', $3,
+               'remote_task', 'provider_token', 'test-video-v1',
+               credential_pool_id, provider_account_id, credential_ref,
+               credential_revision, resource_policy_id,
+               resource_policy_revision, 'enabled', $4, $4
+        FROM provider_execution_profiles
+        WHERE execution_profile_id = $5
+        "#,
+    )
+    .bind(execution_profile_id)
+    .bind(format!("profile.{}", execution_profile_id.simple()))
+    .bind("c".repeat(64))
+    .bind(now)
+    .bind(source_profile_id)
+    .execute(pool)
+    .await
+    .map_err(|error| format!("failed to insert test video profile: {error}"))?;
+    sqlx::query(
+        r#"
+        INSERT INTO provider_routes
+          (route_id, revision, route_key, display_name, provider_id, operation_id,
+           command_schema, route_kind, selection_strategy, state, created_at_ms)
+        VALUES ($1, 1, $2, 'Video test', 'openai-codex',
+                'videos.generations', 'test.videos.generation.v1', 'account',
+                'quota_aware_least_loaded', 'enabled', $3)
+        "#,
+    )
+    .bind(route_id)
+    .bind(format!("route.{}", route_id.simple()))
+    .bind(now)
+    .execute(pool)
+    .await
+    .map_err(|error| format!("failed to insert test video route: {error}"))?;
+    sqlx::query(
+        r#"
+        INSERT INTO provider_route_heads
+          (route_id, route_key, provider_id, operation_id, command_schema,
+           route_kind, current_revision, state, created_at_ms, updated_at_ms)
+        VALUES ($1, $2, 'openai-codex', 'videos.generations',
+                'test.videos.generation.v1', 'account', 1, 'enabled', $3, $3)
+        "#,
+    )
+    .bind(route_id)
+    .bind(format!("route.{}", route_id.simple()))
+    .bind(now)
+    .execute(pool)
+    .await
+    .map_err(|error| format!("failed to insert test video route head: {error}"))?;
+    sqlx::query(
+        r#"
+        INSERT INTO provider_route_members
+          (route_id, route_revision, provider_id, operation_id, command_schema,
+           provider_account_id, execution_profile_id, priority, weight, state,
+           minimum_remaining_percent, created_at_ms)
+        SELECT $1, 1, provider_id, operation_id, command_schema,
+               provider_account_id, execution_profile_id, 7, 37, 'enabled', 12, $2
+        FROM provider_execution_profiles WHERE execution_profile_id = $3
+        "#,
+    )
+    .bind(route_id)
+    .bind(now)
+    .bind(execution_profile_id)
+    .execute(pool)
+    .await
+    .map_err(|error| format!("failed to insert test video route member: {error}"))?;
+    sqlx::query(
+        r#"
+        INSERT INTO provider_route_model_mappings
+          (route_id, route_revision, provider_id, operation_id, command_schema,
+           api_profile, public_model_id, provider_model_id, execution_model_id,
+           media_kind, created_at_ms)
+        VALUES ($1, 1, 'openai-codex', 'videos.generations',
+                'test.videos.generation.v1', 'test-videos-v1', $2, $2, $2,
+                'video', $3)
+        "#,
+    )
+    .bind(route_id)
+    .bind(&video_model_id)
+    .bind(now)
+    .execute(pool)
+    .await
+    .map_err(|error| format!("failed to insert test video mapping: {error}"))?;
+    Ok((route_id, video_model_id))
+}
+
+async fn bind_test_api_key_route(
+    pool: &PgPool,
+    project_id: &str,
+    api_key_id: &str,
+    route_id: Uuid,
+) -> TestResult {
+    let inserted = sqlx::query(
+        r#"
+        INSERT INTO gateway_api_key_provider_routes
+          (api_key_id, service_account_id, project_id, tenant_id, provider_id,
+           operation_id, command_schema, route_id, route_revision, bound_at_ms)
+        SELECT api_key.id, api_key.service_account_id, api_key.project_id,
+               api_key.tenant_id, head.provider_id, head.operation_id,
+               head.command_schema, head.route_id, head.current_revision,
+               floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT
+        FROM gateway_api_keys api_key
+        CROSS JOIN provider_route_heads head
+        WHERE api_key.id = $1 AND api_key.project_id = $2 AND head.route_id = $3
+        "#,
+    )
+    .bind(api_key_id)
+    .bind(project_id)
+    .bind(route_id)
+    .execute(pool)
+    .await
+    .map_err(|error| format!("failed to bind test API key route: {error}"))?;
+    require(
+        inserted.rows_affected() == 1,
+        "test API key route binding was not inserted".to_string(),
+    )
+}
+
+async fn bind_test_console_routes(
+    pool: &PgPool,
+    project_id: &str,
+    platform_route_id: Uuid,
+    project_route_id: Uuid,
+) -> TestResult {
+    sqlx::query(
+        r#"
+        INSERT INTO gateway_platform_provider_routes
+          (provider_id, operation_id, command_schema, route_id, route_revision,
+           state, created_at_ms, updated_at_ms)
+        SELECT provider_id, operation_id, command_schema, route_id,
+               current_revision, 'enabled', updated_at_ms, updated_at_ms
+        FROM provider_route_heads WHERE route_id = $1
+        "#,
+    )
+    .bind(platform_route_id)
+    .execute(pool)
+    .await
+    .map_err(|error| format!("failed to bind platform test route: {error}"))?;
+    sqlx::query(
+        r#"
+        INSERT INTO gateway_project_provider_routes
+          (project_id, provider_id, operation_id, command_schema, route_id,
+           route_revision, state, created_at_ms, updated_at_ms)
+        SELECT $1, provider_id, operation_id, command_schema, route_id,
+               current_revision, 'enabled', updated_at_ms, updated_at_ms
+        FROM provider_route_heads WHERE route_id = $2
+        "#,
+    )
+    .bind(project_id)
+    .bind(project_route_id)
+    .execute(pool)
+    .await
+    .map_err(|error| format!("failed to bind project test route: {error}"))?;
+    Ok(())
+}
+
+async fn replace_current_route_profiles(
+    pool: &PgPool,
+    route_ids: &[Uuid],
+) -> TestResult<Vec<(Uuid, Uuid)>> {
+    let old_profile_ids = sqlx::query_scalar::<_, Uuid>(
+        r#"
+        SELECT DISTINCT member.execution_profile_id
+        FROM provider_route_heads head
+        JOIN provider_route_members member
+          ON member.route_id = head.route_id
+         AND member.route_revision = head.current_revision
+         AND member.state = 'enabled'
+        WHERE head.route_id = ANY($1)
+        ORDER BY member.execution_profile_id
+        "#,
+    )
+    .bind(route_ids)
+    .fetch_all(pool)
+    .await
+    .map_err(|error| format!("failed to read legacy route profiles: {error}"))?;
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|error| format!("failed to begin profile replacement: {error}"))?;
+    let mut profile_replacements = Vec::new();
+    for old_profile_id in old_profile_ids {
+        let new_profile_id = Uuid::new_v4();
+        sqlx::query(
+            r#"
+            INSERT INTO provider_execution_profiles
+              (execution_profile_id, profile_key, provider_id, command_schema,
+               operation_id, operation_descriptor_revision,
+               operation_descriptor_sha256_v1, completion_mode, idempotency_mode,
+               adapter_revision, credential_pool_id, provider_account_id,
+               credential_ref, credential_revision, resource_policy_id,
+               resource_policy_revision, state, created_at_ms, updated_at_ms)
+            SELECT $1, $2, provider_id, command_schema, operation_id,
+                   operation_descriptor_revision, operation_descriptor_sha256_v1,
+                   completion_mode, idempotency_mode,
+                   adapter_revision || '.runtime-v1', credential_pool_id,
+                   provider_account_id, credential_ref, credential_revision,
+                   resource_policy_id, resource_policy_revision, 'enabled',
+                   updated_at_ms + 1, updated_at_ms + 1
+            FROM provider_execution_profiles
+            WHERE execution_profile_id = $3
+            "#,
+        )
+        .bind(new_profile_id)
+        .bind(format!("runtime.{}", new_profile_id.simple()))
+        .bind(old_profile_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| format!("failed to insert replacement profile: {error}"))?;
+        sqlx::query(
+            "UPDATE provider_execution_profiles SET state = 'disabled', updated_at_ms = updated_at_ms + 1 WHERE execution_profile_id = $1",
+        )
+        .bind(old_profile_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| format!("failed to disable legacy profile: {error}"))?;
+        profile_replacements.push((old_profile_id, new_profile_id));
+    }
+    tx.commit()
+        .await
+        .map_err(|error| format!("failed to commit profile replacement: {error}"))?;
+
+    let mut route_replacements = Vec::new();
+    for route_id in route_ids {
+        let old_profile_id: Uuid = sqlx::query_scalar(
+            "SELECT execution_profile_id FROM provider_route_members WHERE route_id = $1 AND route_revision = 1 AND state = 'enabled' LIMIT 1",
+        )
+        .bind(route_id)
+        .fetch_one(pool)
+        .await
+        .map_err(|error| format!("failed to read route legacy profile: {error}"))?;
+        let new_profile_id = profile_replacements
+            .iter()
+            .find_map(|(old, new)| (*old == old_profile_id).then_some(*new))
+            .ok_or_else(|| "route replacement profile was not created".to_string())?;
+        route_replacements.push((*route_id, new_profile_id));
+    }
+    Ok(route_replacements)
+}
+
+async fn assert_reconciled_route_copies(pool: &PgPool, route_ids: &[Uuid]) -> TestResult {
+    let heads_at_revision_two: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM provider_route_heads WHERE route_id = ANY($1) AND current_revision = 2",
+    )
+    .bind(route_ids)
+    .fetch_one(pool)
+    .await
+    .map_err(|error| format!("failed to inspect reconciled route heads: {error}"))?;
+    let lost_mappings: i64 = sqlx::query_scalar(
+        r#"
+        SELECT COUNT(*)
+        FROM provider_route_model_mappings old_mapping
+        LEFT JOIN provider_route_model_mappings new_mapping
+          ON new_mapping.route_id = old_mapping.route_id
+         AND new_mapping.route_revision = 2
+         AND new_mapping.provider_id = old_mapping.provider_id
+         AND new_mapping.operation_id = old_mapping.operation_id
+         AND new_mapping.command_schema = old_mapping.command_schema
+         AND new_mapping.api_profile = old_mapping.api_profile
+         AND new_mapping.public_model_id = old_mapping.public_model_id
+         AND new_mapping.provider_model_id = old_mapping.provider_model_id
+         AND new_mapping.execution_model_id = old_mapping.execution_model_id
+         AND new_mapping.media_kind = old_mapping.media_kind
+        WHERE old_mapping.route_id = ANY($1)
+          AND old_mapping.route_revision = 1
+          AND new_mapping.route_id IS NULL
+        "#,
+    )
+    .bind(route_ids)
+    .fetch_one(pool)
+    .await
+    .map_err(|error| format!("failed to compare route mappings: {error}"))?;
+    let changed_member_policies: i64 = sqlx::query_scalar(
+        r#"
+        SELECT COUNT(*)
+        FROM provider_route_members old_member
+        JOIN provider_route_members new_member
+          ON new_member.route_id = old_member.route_id
+         AND new_member.route_revision = 2
+         AND new_member.provider_account_id = old_member.provider_account_id
+        WHERE old_member.route_id = ANY($1)
+          AND old_member.route_revision = 1
+          AND (
+            new_member.priority <> old_member.priority
+            OR new_member.weight <> old_member.weight
+            OR new_member.minimum_remaining_percent <>
+               old_member.minimum_remaining_percent
+            OR new_member.state <> old_member.state
+          )
+        "#,
+    )
+    .bind(route_ids)
+    .fetch_one(pool)
+    .await
+    .map_err(|error| format!("failed to compare route member policies: {error}"))?;
+    let inactive_current_profiles: i64 = sqlx::query_scalar(
+        r#"
+        SELECT COUNT(*)
+        FROM provider_route_heads head
+        JOIN provider_route_members member
+          ON member.route_id = head.route_id
+         AND member.route_revision = head.current_revision
+         AND member.state = 'enabled'
+        JOIN provider_execution_profiles profile
+          ON profile.execution_profile_id = member.execution_profile_id
+        WHERE head.route_id = ANY($1) AND profile.state <> 'enabled'
+        "#,
+    )
+    .bind(route_ids)
+    .fetch_one(pool)
+    .await
+    .map_err(|error| format!("failed to inspect current route profiles: {error}"))?;
+    require(
+        heads_at_revision_two == route_ids.len() as i64
+            && lost_mappings == 0
+            && changed_member_policies == 0
+            && inactive_current_profiles == 0,
+        format!(
+            "route copy invariants failed: heads={heads_at_revision_two}, lost_mappings={lost_mappings}, changed_policies={changed_member_policies}, inactive_profiles={inactive_current_profiles}"
+        ),
+    )
 }
 
 async fn insert_codex_route(pool: &PgPool) -> TestResult<Uuid> {

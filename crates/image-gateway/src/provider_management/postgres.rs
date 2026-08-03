@@ -59,6 +59,7 @@ use super::{
     grok_billing::{GrokQuotaSnapshot, observe_grok_quota},
     grok_login::{GrokLoginProcess, copy_proxy_environment, refresh_grok_auth},
     model_catalog::{self, ProviderModelExecutables},
+    reconcile_execution_profile_routes,
 };
 
 const LOGIN_TTL: Duration = Duration::from_secs(15 * 60);
@@ -412,6 +413,7 @@ impl PostgresProviderManagementService {
         if service.dreamina_executable.is_some() {
             Self::reconcile_dreamina_video_profiles(&service.pool).await?;
         }
+        reconcile_execution_profile_routes(&service.pool).await?;
         Ok(service)
     }
 

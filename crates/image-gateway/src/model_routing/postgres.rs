@@ -255,6 +255,10 @@ impl ModelRoutingStore for PostgresModelRoutingStore {
         .fetch_all(&self.pool)
         .await
         .map_err(store_unavailable)?;
+        if models.is_empty() {
+            self.warn_if_api_key_routes_have_no_active_profiles(project_id, api_key_id)
+                .await?;
+        }
         self.ensure_api_key_version(project_id, api_key_id, credential_authz_version)
             .await?;
         self.filter_allowed_models(project_id, models).await
@@ -858,6 +862,52 @@ impl ModelRoutingStore for PostgresModelRoutingStore {
             Some(route) => self.ensure_model_allowed(project_id, route).await.map(Some),
             None => Ok(None),
         }
+    }
+}
+
+impl PostgresModelRoutingStore {
+    async fn warn_if_api_key_routes_have_no_active_profiles(
+        &self,
+        project_id: &str,
+        api_key_id: &str,
+    ) -> Result<(), ImageGatewayError> {
+        let broken_route_bindings: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM gateway_api_key_provider_routes binding
+            JOIN provider_route_heads head
+              ON head.route_id = binding.route_id AND head.state = 'enabled'
+            WHERE binding.api_key_id = $1 AND binding.project_id = $2
+              AND NOT EXISTS (
+                SELECT 1
+                FROM provider_route_members member
+                JOIN provider_execution_profiles profile
+                  ON profile.execution_profile_id = member.execution_profile_id
+                 AND profile.provider_account_id = member.provider_account_id
+                 AND profile.provider_id = member.provider_id
+                 AND profile.operation_id = member.operation_id
+                 AND profile.command_schema = member.command_schema
+                WHERE member.route_id = binding.route_id
+                  AND member.route_revision = binding.route_revision
+                  AND member.state = 'enabled'
+                  AND profile.state = 'enabled'
+              )
+            "#,
+        )
+        .bind(api_key_id)
+        .bind(project_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(store_unavailable)?;
+        if broken_route_bindings > 0 {
+            tracing::warn!(
+                project_id,
+                api_key_id,
+                broken_route_bindings,
+                "API key model catalog is empty because route bindings have no active execution profile"
+            );
+        }
+        Ok(())
     }
 }
 

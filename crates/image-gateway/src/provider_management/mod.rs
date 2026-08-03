@@ -11,12 +11,16 @@ mod grok_login;
 mod grok_video_output;
 mod model_catalog;
 mod postgres;
+mod route_reconciliation;
 
 pub use model_catalog::{
     ProviderAccountModelView, ProviderAccountModelsView, ProviderModelRefreshView,
     ProviderModelView, ProviderModelsSnapshot,
 };
 pub use postgres::PostgresProviderManagementService;
+pub use route_reconciliation::{
+    ExecutionProfileRouteReconciliationReport, reconcile_execution_profile_routes,
+};
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]

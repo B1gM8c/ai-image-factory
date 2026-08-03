@@ -125,6 +125,9 @@ pub use provider_cost_allocations::{
 pub use provider_cost_obligations::{
     PostgresProviderCostObligationService, ProviderCostObligationService,
 };
+pub use provider_management::{
+    ExecutionProfileRouteReconciliationReport, reconcile_execution_profile_routes,
+};
 pub use provider_tasks::{
     GatedCliBinding, GatedCliCommand, GatedCliObservation, GatedCliPreparedSubmission,
     GatedCliProcessError, GatedCliProcessOutcome, GatedCliProcessTerminal, GatedCliReady,

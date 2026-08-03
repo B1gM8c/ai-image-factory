@@ -10,7 +10,8 @@ use gpt_image_2_gateway::{
         database_url_from_env, verify_migrations,
     },
     identity::PostgresIdentityMaintenanceStore,
-    init_telemetry, reconcile_artifact_retention, reconcile_input_cleanup,
+    init_telemetry, reconcile_artifact_retention, reconcile_execution_profile_routes,
+    reconcile_input_cleanup,
 };
 
 const DEFAULT_INTERVAL_MS: u64 = 1_000;
@@ -26,6 +27,7 @@ const DEFAULT_IDENTITY_SESSION_RETENTION_MS: u64 = 7 * 24 * 60 * 60_000;
 const DEFAULT_IDENTITY_THROTTLE_RETENTION_MS: u64 = 24 * 60 * 60_000;
 const DEFAULT_IDENTITY_AUDIT_RETENTION_MS: u64 = 180 * 24 * 60 * 60_000;
 const PROVIDER_UPLOAD_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
+const PROVIDER_ROUTE_RECONCILE_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Copy)]
 struct ReconcileConfig {
@@ -56,7 +58,7 @@ async fn main() -> Result<(), ImageGatewayError> {
     let reconciler = PostgresReconciliationStore::new(pool.clone());
     let artifact_retention = PostgresArtifactRetentionStore::new(pool.clone());
     let identity_maintenance = PostgresIdentityMaintenanceStore::new(pool.clone());
-    let executor_reconciler = PostgresExecutorSubmissionStore::new(pool);
+    let executor_reconciler = PostgresExecutorSubmissionStore::new(pool.clone());
     let artifact_root = artifact_root_from_env()?;
     let input_blobs = Arc::new(FilesystemArtifactBlobStore::new(&artifact_root)?);
     let provider_uploads = ProviderUploadService::new(&artifact_root, None)?;
@@ -102,6 +104,7 @@ async fn main() -> Result<(), ImageGatewayError> {
     let identity_maintenance_config = identity_maintenance_config(batch_size)?;
     let mut next_identity_maintenance = tokio::time::Instant::now();
     let mut next_provider_upload_cleanup = tokio::time::Instant::now();
+    let mut next_provider_route_reconcile = tokio::time::Instant::now();
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
     tracing::info!(batch_size, "reconcilerd started");
@@ -204,6 +207,13 @@ async fn main() -> Result<(), ImageGatewayError> {
             }
             next_provider_upload_cleanup =
                 tokio::time::Instant::now() + PROVIDER_UPLOAD_CLEANUP_INTERVAL;
+        }
+        if tokio::time::Instant::now() >= next_provider_route_reconcile {
+            if let Err(error) = reconcile_execution_profile_routes(&pool).await {
+                tracing::error!(error = ?error, "provider route reconciliation failed");
+            }
+            next_provider_route_reconcile =
+                tokio::time::Instant::now() + PROVIDER_ROUTE_RECONCILE_INTERVAL;
         }
         tokio::select! {
             _ = &mut shutdown => break,
