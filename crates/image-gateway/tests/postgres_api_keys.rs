@@ -1092,6 +1092,11 @@ async fn replacement_profiles_advance_bound_routes_without_losing_catalog_models
                 && initial_models.iter().any(|model| model.id == video_model_id),
             format!("initial image/video catalog was incomplete: {initial_models:?}"),
         )?;
+        insert_legacy_codex_snapshot_mappings(
+            &database.setup_pool,
+            &[image_account_route, image_route],
+        )
+        .await?;
 
         let replacements = replace_current_route_profiles(
             &database.setup_pool,
@@ -1146,9 +1151,17 @@ async fn replacement_profiles_advance_bound_routes_without_losing_catalog_models
             .map_err(|error| format!("failed to list reconciled models: {error:?}"))?;
         require(
             models.iter().any(|model| model.id == "gpt-image-2")
+                && models
+                    .iter()
+                    .any(|model| model.id == "gpt-image-2-2026-04-21")
                 && models.iter().any(|model| model.id == video_model_id),
             format!("reconciled image/video catalog was incomplete: {models:?}"),
         )?;
+        assert_codex_snapshot_mapping_reconciled(
+            &database.setup_pool,
+            &[image_account_route, image_route],
+        )
+        .await?;
         assert_reconciled_route_copies(
             &database.setup_pool,
             &[image_account_route, image_route, video_route],
@@ -2914,6 +2927,93 @@ async fn replace_current_route_profiles(
     Ok(route_replacements)
 }
 
+async fn insert_legacy_codex_snapshot_mappings(pool: &PgPool, route_ids: &[Uuid]) -> TestResult {
+    sqlx::query(
+        r#"
+        INSERT INTO provider_models
+          (provider_id, model_id, execution_model_id, media_kind, display_name,
+           adapter_state, lifecycle_state, operation_ids, source_kind,
+           first_seen_at_ms, last_seen_at_ms, metadata_json)
+        VALUES ('openai-codex', 'gpt-image-2-2026-04-21',
+                'gpt-image-2-2026-04-21', 'image', 'GPT Image 2 snapshot',
+                'supported', 'enabled',
+                ARRAY['images.generations', 'images.edits'],
+                'adapter_contract',
+                floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT,
+                floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT,
+                '{}'::JSONB)
+        ON CONFLICT (provider_id, model_id, media_kind) DO NOTHING
+        "#,
+    )
+    .execute(pool)
+    .await
+    .map_err(|error| format!("failed to insert legacy snapshot model: {error}"))?;
+    let inserted = sqlx::query(
+        r#"
+        INSERT INTO provider_route_model_mappings
+          (route_id, route_revision, provider_id, operation_id, command_schema,
+           api_profile, public_model_id, provider_model_id, execution_model_id,
+           media_kind, created_at_ms)
+        SELECT head.route_id, head.current_revision, head.provider_id,
+               head.operation_id, head.command_schema, 'openai-images-v1',
+               'gpt-image-2-2026-04-21', 'gpt-image-2-2026-04-21',
+               'gpt-image-2-2026-04-21', 'image', head.updated_at_ms
+        FROM provider_route_heads head
+        WHERE head.route_id = ANY($1)
+        "#,
+    )
+    .bind(route_ids)
+    .execute(pool)
+    .await
+    .map_err(|error| format!("failed to insert legacy snapshot mappings: {error}"))?;
+    require(
+        inserted.rows_affected() == route_ids.len() as u64,
+        format!(
+            "inserted {} legacy snapshot mappings",
+            inserted.rows_affected()
+        ),
+    )
+}
+
+async fn assert_codex_snapshot_mapping_reconciled(pool: &PgPool, route_ids: &[Uuid]) -> TestResult {
+    let state: (i64, i64, i64) = sqlx::query_as(
+        r#"
+        SELECT
+          (SELECT COUNT(*)
+           FROM provider_route_model_mappings mapping
+           WHERE mapping.route_id = ANY($1)
+             AND mapping.route_revision = 1
+             AND mapping.public_model_id = 'gpt-image-2-2026-04-21'
+             AND mapping.provider_model_id = 'gpt-image-2-2026-04-21'
+             AND mapping.execution_model_id = 'gpt-image-2-2026-04-21'),
+          (SELECT COUNT(*)
+           FROM provider_route_heads head
+           JOIN provider_route_model_mappings mapping
+             ON mapping.route_id = head.route_id
+            AND mapping.route_revision = head.current_revision
+           WHERE head.route_id = ANY($1)
+             AND mapping.public_model_id = 'gpt-image-2-2026-04-21'
+             AND mapping.provider_model_id = 'gpt-image-2'
+             AND mapping.execution_model_id = 'gpt-image-2-2026-04-21'),
+          (SELECT COUNT(*) FROM provider_routes route
+           WHERE route.route_id = ANY($1))
+        "#,
+    )
+    .bind(route_ids)
+    .fetch_one(pool)
+    .await
+    .map_err(|error| format!("failed to inspect snapshot route reconciliation: {error}"))?;
+    require(
+        state
+            == (
+                route_ids.len() as i64,
+                route_ids.len() as i64,
+                (route_ids.len() * 2) as i64,
+            ),
+        format!("snapshot route reconciliation lost immutable identity: {state:?}"),
+    )
+}
+
 async fn assert_reconciled_route_copies(pool: &PgPool, route_ids: &[Uuid]) -> TestResult {
     let heads_at_revision_two: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM provider_route_heads WHERE route_id = ANY($1) AND current_revision = 2",
@@ -2934,7 +3034,13 @@ async fn assert_reconciled_route_copies(pool: &PgPool, route_ids: &[Uuid]) -> Te
          AND new_mapping.command_schema = old_mapping.command_schema
          AND new_mapping.api_profile = old_mapping.api_profile
          AND new_mapping.public_model_id = old_mapping.public_model_id
-         AND new_mapping.provider_model_id = old_mapping.provider_model_id
+         AND new_mapping.provider_model_id = CASE
+           WHEN old_mapping.provider_id = 'openai-codex'
+            AND old_mapping.provider_model_id = 'gpt-image-2-2026-04-21'
+            AND old_mapping.execution_model_id = 'gpt-image-2-2026-04-21'
+           THEN 'gpt-image-2'
+           ELSE old_mapping.provider_model_id
+         END
          AND new_mapping.execution_model_id = old_mapping.execution_model_id
          AND new_mapping.media_kind = old_mapping.media_kind
         WHERE old_mapping.route_id = ANY($1)

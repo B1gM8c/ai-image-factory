@@ -4160,14 +4160,25 @@ async fn validated_route_model_mappings(
     let mut execution_targets = HashSet::new();
     let mut validated = Vec::with_capacity(candidates.len());
     for (api_profile, public_model_id, provider_model_id, media_kind) in candidates {
-        let Some(model) = by_target.get(&(provider_model_id.as_str(), media_kind.as_str())) else {
+        let execution_provider_model_id = provider_model_id;
+        let Some(execution_model) =
+            by_target.get(&(execution_provider_model_id.as_str(), media_kind.as_str()))
+        else {
             return Err(invalid_route_models());
         };
+        let provider_model_id =
+            pricing_provider_model_id(provider_id, &execution_provider_model_id).to_owned();
+        if !by_target.contains_key(&(provider_model_id.as_str(), media_kind.as_str())) {
+            return Err(invalid_route_models());
+        }
         if !valid_simple_identifier(&api_profile)
             || !supported_api_profile(provider_id, operation_id, &api_profile)
             || !valid_public_model_id(&public_model_id)
             || !public_ids.insert((api_profile.clone(), public_model_id.clone()))
-            || !execution_targets.insert((api_profile.clone(), model.execution_model_id.clone()))
+            || !execution_targets.insert((
+                api_profile.clone(),
+                execution_model.execution_model_id.clone(),
+            ))
         {
             return Err(invalid_route_models());
         }
@@ -4177,7 +4188,7 @@ async fn validated_route_model_mappings(
                 provider_id,
                 operation_id,
                 member_ids,
-                &provider_model_id,
+                &execution_provider_model_id,
                 &media_kind,
             )
             .await?
@@ -4188,8 +4199,8 @@ async fn validated_route_model_mappings(
                 "unroutable_provider_model",
             ));
         }
-        let execution_model_id = model.execution_model_id.clone();
-        let provider_model_display_name = model.display_name.clone();
+        let execution_model_id = execution_model.execution_model_id.clone();
+        let provider_model_display_name = execution_model.display_name.clone();
         validated.push(ValidatedRouteModelMapping {
             api_profile,
             public_model_id,
@@ -4203,6 +4214,16 @@ async fn validated_route_model_mappings(
         return Err(invalid_route_models());
     }
     Ok(validated)
+}
+
+fn pricing_provider_model_id<'a>(provider_id: &str, provider_model_id: &'a str) -> &'a str {
+    if provider_id == openai_codex::PROVIDER_ID
+        && provider_model_id == openai_codex::MODEL_GPT_IMAGE_2_SNAPSHOT
+    {
+        openai_codex::MODEL_GPT_IMAGE_2
+    } else {
+        provider_model_id
+    }
 }
 
 async fn route_members_support_model(

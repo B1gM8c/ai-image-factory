@@ -263,6 +263,78 @@ async fn customer_pricing_v4_accept_is_atomic_and_replayable() -> TestResult {
 }
 
 #[tokio::test]
+async fn codex_snapshot_generation_uses_canonical_price_and_snapshot_command() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        seed_customer_price_v4(&database.pool, 11).await?;
+        seed_billing_account(&database.pool, 1000).await?;
+
+        let store = PostgresAdmissionStore::new(database.pool.clone());
+        let (ticket, command_json) = claim_customer_pricing_owner_with_identity(
+            &store,
+            1,
+            "openai-codex",
+            "gpt-image-2-2026-04-21",
+            "openai-images-v1",
+        )
+        .await?;
+        let job_id =
+            insert_job_for_ticket(&database.pool, &ticket, "tenant-a", "generation", None).await?;
+        set_job_execution_model(&database.pool, job_id, "gpt-image-2-2026-04-21").await?;
+        seed_codex_snapshot_job_project_attribution(
+            &database.pool,
+            job_id,
+            "images.generations",
+            GENERATION_COMMAND_SCHEMA,
+        )
+        .await?;
+        let mut request = attach_request(ticket, job_id);
+        request.command_json = command_json;
+        request.contract = AdmissionContract::CustomerPricingV4;
+        request.customer_pricing = Some(codex_snapshot_pricing_intent());
+
+        store
+            .attach(request)
+            .await
+            .map_err(|error| format!("snapshot generation admission failed: {error:?}"))?;
+
+        let identity: (String, String, String, String, String, String) = sqlx::query_as(
+            r#"
+            SELECT job.model, payload.command_json ->> 'model',
+                   quote.public_model_id, quote.provider_model_id,
+                   version.public_model_id, version.provider_model_id
+            FROM jobs job
+            JOIN job_payloads payload ON payload.job_id = job.job_id
+            JOIN customer_price_quotes quote ON quote.job_id = job.job_id
+            JOIN price_book_versions version
+              ON version.price_book_version_id = quote.price_book_version_id
+            WHERE job.job_id = $1
+            "#,
+        )
+        .bind(job_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(|error| format!("failed to inspect snapshot generation identity: {error}"))?;
+        require(
+            identity
+                == (
+                    "gpt-image-2-2026-04-21".to_string(),
+                    "gpt-image-2-2026-04-21".to_string(),
+                    "gpt-image-2".to_string(),
+                    "gpt-image-2".to_string(),
+                    "gpt-image-2".to_string(),
+                    "gpt-image-2".to_string(),
+                ),
+            format!("snapshot generation identity drifted: {identity:?}"),
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
 async fn configured_soft_project_budget_does_not_block_customer_admission() -> TestResult {
     let Some(database) = TestDatabase::new().await? else {
         return Ok(());
@@ -506,6 +578,77 @@ async fn edit_customer_pricing_v4_freezes_quote_and_preserves_input_manifest() -
                     command.input_manifest_hash_hex(),
                 ),
             format!("unexpected frozen v4 edit quote: {frozen:?}"),
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
+async fn codex_snapshot_edit_uses_canonical_price_and_snapshot_command() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        seed_customer_price_v4_for_operation(&database.pool, "edit", 13).await?;
+        seed_billing_account(&database.pool, 1000).await?;
+
+        let store = PostgresAdmissionStore::new(database.pool.clone());
+        let provisional_inputs = edit_input_specs(Uuid::new_v4(), None);
+        let provisional_command =
+            edit_command_for_model(&provisional_inputs, "gpt-image-2-2026-04-21");
+        let ticket = claim_edit_owner(&store, &provisional_command).await?;
+        let inputs = edit_input_specs(ticket.session_id, None);
+        let command = edit_command_for_model(&inputs, "gpt-image-2-2026-04-21");
+        let job_id =
+            insert_job_for_ticket(&database.pool, &ticket, "tenant-a", "edit", None).await?;
+        set_job_execution_model(&database.pool, job_id, "gpt-image-2-2026-04-21").await?;
+        seed_codex_snapshot_job_project_attribution(
+            &database.pool,
+            job_id,
+            "images.edits",
+            EDIT_COMMAND_SCHEMA,
+        )
+        .await?;
+
+        let mut request = edit_attach_request(ticket, job_id, command, inputs);
+        request.contract = AdmissionContract::CustomerPricingV4;
+        request.customer_pricing = Some(codex_snapshot_pricing_intent());
+        store
+            .attach(request)
+            .await
+            .map_err(|error| format!("snapshot edit admission failed: {error:?}"))?;
+
+        let identity: (String, String, String, String, String, String, i64) = sqlx::query_as(
+            r#"
+            SELECT job.model, payload.command_json ->> 'model',
+                   quote.public_model_id, quote.provider_model_id,
+                   version.public_model_id, version.provider_model_id,
+                   (SELECT COUNT(*) FROM job_input_objects WHERE job_id = job.job_id)
+            FROM jobs job
+            JOIN job_payloads payload ON payload.job_id = job.job_id
+            JOIN customer_price_quotes quote ON quote.job_id = job.job_id
+            JOIN price_book_versions version
+              ON version.price_book_version_id = quote.price_book_version_id
+            WHERE job.job_id = $1
+            "#,
+        )
+        .bind(job_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(|error| format!("failed to inspect snapshot edit identity: {error}"))?;
+        require(
+            identity
+                == (
+                    "gpt-image-2-2026-04-21".to_string(),
+                    "gpt-image-2-2026-04-21".to_string(),
+                    "gpt-image-2".to_string(),
+                    "gpt-image-2".to_string(),
+                    "gpt-image-2".to_string(),
+                    "gpt-image-2".to_string(),
+                    2,
+                ),
+            format!("snapshot edit identity drifted: {identity:?}"),
         )
     }
     .await;
@@ -2624,6 +2767,15 @@ fn customer_pricing_intent() -> CustomerPricingIntent {
     }
 }
 
+fn codex_snapshot_pricing_intent() -> CustomerPricingIntent {
+    CustomerPricingIntent {
+        public_model_id: "gpt-image-2-2026-04-21".to_string(),
+        provider_model_id: "gpt-image-2".to_string(),
+        execution_model_id: "gpt-image-2-2026-04-21".to_string(),
+        ..customer_pricing_intent()
+    }
+}
+
 async fn claim_customer_pricing_owner(
     store: &PostgresAdmissionStore,
     output_count: u32,
@@ -3287,6 +3439,45 @@ async fn seed_codex_job_project_attribution(
     operation_id: &str,
     command_schema: &str,
 ) -> TestResult {
+    seed_codex_job_project_attribution_with_models(
+        pool,
+        job_id,
+        operation_id,
+        command_schema,
+        "gpt-image-2",
+        "gpt-image-2",
+        "gpt-image-2",
+    )
+    .await
+}
+
+async fn seed_codex_snapshot_job_project_attribution(
+    pool: &PgPool,
+    job_id: Uuid,
+    operation_id: &str,
+    command_schema: &str,
+) -> TestResult {
+    seed_codex_job_project_attribution_with_models(
+        pool,
+        job_id,
+        operation_id,
+        command_schema,
+        "gpt-image-2-2026-04-21",
+        "gpt-image-2",
+        "gpt-image-2-2026-04-21",
+    )
+    .await
+}
+
+async fn seed_codex_job_project_attribution_with_models(
+    pool: &PgPool,
+    job_id: Uuid,
+    operation_id: &str,
+    command_schema: &str,
+    public_model_id: &str,
+    provider_model_id: &str,
+    execution_model_id: &str,
+) -> TestResult {
     let route_id = Uuid::new_v4();
     let route_key = format!("admission.{}", route_id.simple());
     sqlx::query(
@@ -3338,6 +3529,28 @@ async fn seed_codex_job_project_attribution(
     .execute(pool)
     .await
     .map_err(|error| format!("failed to seed v4 provider model: {error}"))?;
+    if execution_model_id != "gpt-image-2" {
+        sqlx::query(
+            r#"
+            INSERT INTO provider_models (
+                provider_id, model_id, execution_model_id, media_kind,
+                display_name, adapter_state, lifecycle_state, operation_ids,
+                source_kind, first_seen_at_ms, last_seen_at_ms, metadata_json
+            )
+            VALUES (
+                'openai-codex', $1, $1, 'image',
+                'GPT Image 2 snapshot', 'supported', 'enabled',
+                ARRAY[$2], 'adapter_contract', 1, 1, '{}'::JSONB
+            )
+            ON CONFLICT (provider_id, model_id, media_kind) DO NOTHING
+            "#,
+        )
+        .bind(execution_model_id)
+        .bind(operation_id)
+        .execute(pool)
+        .await
+        .map_err(|error| format!("failed to seed v4 snapshot model: {error}"))?;
+    }
     sqlx::query(
         r#"
         INSERT INTO provider_routes (
@@ -3369,13 +3582,16 @@ async fn seed_codex_job_project_attribution(
         VALUES (
             $1, 1, 'openai-codex', $2,
             $3, 'openai-images-v1',
-            'gpt-image-2', 'gpt-image-2', 'gpt-image-2', 'image', 1
+            $4, $5, $6, 'image', 1
         )
         "#,
     )
     .bind(route_id)
     .bind(operation_id)
     .bind(command_schema)
+    .bind(public_model_id)
+    .bind(provider_model_id)
+    .bind(execution_model_id)
     .execute(pool)
     .await
     .map_err(|error| format!("failed to seed v4 model mapping: {error}"))?;
@@ -3711,6 +3927,19 @@ async fn insert_job_for_ticket(
     .await
 }
 
+async fn set_job_execution_model(pool: &PgPool, job_id: Uuid, model: &str) -> TestResult {
+    let updated = sqlx::query("UPDATE jobs SET model = $2 WHERE job_id = $1")
+        .bind(job_id)
+        .bind(model)
+        .execute(pool)
+        .await
+        .map_err(|error| format!("failed to set test job execution model: {error}"))?;
+    require(
+        updated.rows_affected() == 1,
+        "test job execution model was not updated",
+    )
+}
+
 async fn insert_unbound_job(pool: &PgPool, tenant_id: &str, operation: &str) -> TestResult<Uuid> {
     insert_job_record(
         pool,
@@ -3864,10 +4093,14 @@ fn edit_input_specs(session_id: Uuid, image_object_key: Option<String>) -> Vec<A
 }
 
 fn edit_command(inputs: &[AttachInputObject]) -> EditCommandV1 {
+    edit_command_for_model(inputs, "gpt-image-2")
+}
+
+fn edit_command_for_model(inputs: &[AttachInputObject], model: &str) -> EditCommandV1 {
     EditCommandV1::from_edit_job(
         &EditJob {
             request_id: "request-edit".to_string(),
-            model: "gpt-image-2".to_string(),
+            model: model.to_string(),
             prompt: "replace the sky".to_string(),
             moderation: "auto".to_string(),
             images: Vec::new(),

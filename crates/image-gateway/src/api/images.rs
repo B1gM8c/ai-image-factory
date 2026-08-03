@@ -219,6 +219,7 @@ async fn generate_after_surface_resolution(
 ) -> Result<Response, ImageGatewayError> {
     let contract = generation_admission_contract(state.config.generation_admission_contract);
     let mut execution_model_id = None;
+    let mut pricing_provider_model_id = None;
     let mut public_model_id = resolved_surface
         .as_ref()
         .map(|resolved| resolved.public_model_id.clone())
@@ -231,7 +232,8 @@ async fn generate_after_surface_resolution(
         .unwrap_or_else(|| "gpt-image-2".to_string());
     if let Some(resolved) = resolved_surface {
         execution_model_id = Some(resolved.execution_model_id.clone());
-        set_request_model(&mut value, resolved.provider_model_id)?;
+        pricing_provider_model_id = Some(resolved.provider_model_id.clone());
+        set_request_model(&mut value, resolved.execution_model_id.clone())?;
         match (resolved.provider_id.as_str(), resolved.api_profile.as_str()) {
             (image_provider_grok_cli::PROVIDER_ID, XAI_IMAGES_API_PROFILE) => {
                 return xai_images::create_image(
@@ -281,10 +283,13 @@ async fn generate_after_surface_resolution(
         .await?
     {
         public_model_id = resolved.public_model_id;
-        execution_model_id = Some(resolved.execution_model_id);
-        set_request_model(&mut value, resolved.provider_model_id)?;
+        pricing_provider_model_id = Some(resolved.provider_model_id);
+        execution_model_id = Some(resolved.execution_model_id.clone());
+        set_request_model(&mut value, resolved.execution_model_id)?;
     }
-    if contract == AdmissionContract::CustomerPricingV4 && execution_model_id.is_none() {
+    if contract == AdmissionContract::CustomerPricingV4
+        && (execution_model_id.is_none() || pricing_provider_model_id.is_none())
+    {
         return Err(ImageGatewayError::service_unavailable(
             "customer pricing requires an enabled model route",
         ));
@@ -346,7 +351,7 @@ async fn generate_after_surface_resolution(
         }
     };
     let units = job.n;
-    let provider_model_id = job.model.clone();
+    let job_execution_model_id = job.model.clone();
 
     let _inline_permit = if state.generation_execution_mode == GenerationExecutionMode::Inline {
         match state.scheduler.acquire(&auth.tenant_id).await {
@@ -368,7 +373,7 @@ async fn generate_after_surface_resolution(
             admission_session_id: Some(ticket.session_id),
             operation: "generation",
             provider_id: openai_codex::PROVIDER_ID.to_string(),
-            model: provider_model_id.clone(),
+            model: job_execution_model_id,
             output_count: units,
             billable_units: units,
             billing_metric: BillingMetric::Output,
@@ -403,7 +408,8 @@ async fn generate_after_surface_resolution(
         customer_pricing: (contract == AdmissionContract::CustomerPricingV4).then(|| {
             CustomerPricingIntent {
                 public_model_id,
-                provider_model_id,
+                provider_model_id: pricing_provider_model_id
+                    .expect("v4 pricing model was validated before admission"),
                 execution_model_id: execution_model_id
                     .expect("v4 execution model was validated before admission"),
                 provider_command_hash: Some(provider_command_hash),
@@ -884,13 +890,17 @@ pub(super) async fn edit_with_resolved_auth(
             "Grok image editing requires external provider execution",
         ));
     }
+    let job_execution_model_id = execution_model_id
+        .as_deref()
+        .unwrap_or(&provider_model_id)
+        .to_owned();
     form.model = Some(if provider_id == image_provider_grok_cli::PROVIDER_ID {
         "gpt-image-2".to_owned()
     } else {
-        provider_model_id.clone()
+        job_execution_model_id.clone()
     });
     let mut job = form.into_job(request_id.clone())?;
-    job.model = provider_model_id.clone();
+    job.model = job_execution_model_id;
     let descriptors = edit_input_descriptors(&job)?;
     let (command_schema, command_json, provider_command_hash, input_manifest_hash) = if provider_id
         == image_provider_grok_cli::PROVIDER_ID
@@ -977,7 +987,7 @@ pub(super) async fn edit_with_resolved_auth(
         }
     };
     let units = job.n;
-    let provider_model_id = job.model.clone();
+    let job_execution_model_id = job.model.clone();
 
     let _inline_permit = if state.generation_execution_mode == GenerationExecutionMode::Inline {
         match state.scheduler.acquire(&auth.tenant_id).await {
@@ -999,7 +1009,7 @@ pub(super) async fn edit_with_resolved_auth(
             admission_session_id: Some(ticket.session_id),
             operation: EDIT_OPERATION,
             provider_id: provider_id.clone(),
-            model: provider_model_id.clone(),
+            model: job_execution_model_id,
             output_count: units,
             billable_units: units,
             billing_metric: BillingMetric::Output,

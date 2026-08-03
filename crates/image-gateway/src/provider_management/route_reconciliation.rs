@@ -1,3 +1,4 @@
+use image_provider_contracts::openai_codex;
 use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
@@ -78,10 +79,22 @@ pub async fn reconcile_execution_profile_routes(
                   AND member.route_revision = head.current_revision
                   AND member.state = 'enabled'
             )
+            OR EXISTS (
+                SELECT 1
+                FROM provider_route_model_mappings mapping
+                WHERE mapping.route_id = head.route_id
+                  AND mapping.route_revision = head.current_revision
+                  AND mapping.provider_id = $1
+                  AND mapping.execution_model_id = $2
+                  AND mapping.provider_model_id <> $3
+            )
           )
         ORDER BY head.route_id
         "#,
     )
+    .bind(openai_codex::PROVIDER_ID)
+    .bind(openai_codex::MODEL_GPT_IMAGE_2_SNAPSHOT)
+    .bind(openai_codex::MODEL_GPT_IMAGE_2)
     .fetch_all(pool)
     .await
     .map_err(store_unavailable)?;
@@ -133,6 +146,7 @@ async fn reconcile_route(
         return Ok(RouteReconciliationOutcome::Skipped);
     };
     let members = route_members(&mut tx, &route).await?;
+    let needs_model_reconciliation = route_needs_model_reconciliation(&mut tx, &route).await?;
     let mut replacements = Vec::new();
     let mut has_stale_member = false;
 
@@ -156,11 +170,14 @@ async fn reconcile_route(
         }
         replacements.push((member.execution_profile_id, candidates[0]));
     }
-    if !has_stale_member && members.iter().any(|member| member.state == "enabled") {
+    if !has_stale_member
+        && !needs_model_reconciliation
+        && members.iter().any(|member| member.state == "enabled")
+    {
         tx.commit().await.map_err(store_unavailable)?;
         return Ok(RouteReconciliationOutcome::Skipped);
     }
-    if !has_stale_member {
+    if !members.iter().any(|member| member.state == "enabled") {
         tracing::warn!(
             route_id = %route.route_id,
             route_revision = route.revision,
@@ -317,6 +334,33 @@ async fn route_members(
     .map_err(store_unavailable)
 }
 
+async fn route_needs_model_reconciliation(
+    tx: &mut Transaction<'_, Postgres>,
+    route: &RouteRevision,
+) -> Result<bool, ImageGatewayError> {
+    sqlx::query_scalar(
+        r#"
+        SELECT EXISTS (
+          SELECT 1
+          FROM provider_route_model_mappings mapping
+          WHERE mapping.route_id = $1
+            AND mapping.route_revision = $2
+            AND mapping.provider_id = $3
+            AND mapping.execution_model_id = $4
+            AND mapping.provider_model_id <> $5
+        )
+        "#,
+    )
+    .bind(route.route_id)
+    .bind(route.revision)
+    .bind(openai_codex::PROVIDER_ID)
+    .bind(openai_codex::MODEL_GPT_IMAGE_2_SNAPSHOT)
+    .bind(openai_codex::MODEL_GPT_IMAGE_2)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(store_unavailable)
+}
+
 async fn compatible_replacements(
     tx: &mut Transaction<'_, Postgres>,
     route: &RouteRevision,
@@ -429,7 +473,14 @@ async fn copy_route_model_mappings(
            api_profile, public_model_id, provider_model_id, execution_model_id,
            media_kind, created_at_ms)
         SELECT route_id, $3, provider_id, operation_id, command_schema,
-               api_profile, public_model_id, provider_model_id, execution_model_id,
+               api_profile, public_model_id,
+               CASE
+                 WHEN provider_id = $5
+                  AND execution_model_id = $6
+                   THEN $7
+                 ELSE provider_model_id
+               END,
+               execution_model_id,
                media_kind, $4
         FROM provider_route_model_mappings
         WHERE route_id = $1 AND route_revision = $2
@@ -439,6 +490,9 @@ async fn copy_route_model_mappings(
     .bind(route.revision)
     .bind(next_revision)
     .bind(now)
+    .bind(openai_codex::PROVIDER_ID)
+    .bind(openai_codex::MODEL_GPT_IMAGE_2_SNAPSHOT)
+    .bind(openai_codex::MODEL_GPT_IMAGE_2)
     .execute(&mut **tx)
     .await
     .map_err(store_unavailable)?;

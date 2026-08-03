@@ -15,7 +15,10 @@ use image_api_contracts::{
     dreamina::{DREAMINA_IMAGES_API_PROFILE, DREAMINA_VIDEOS_API_PROFILE},
     xai::{XAI_IMAGES_API_PROFILE, XAI_VIDEOS_API_PROFILE, XaiVideoAspectRatio},
 };
-use image_provider_contracts::provider::openai_codex::PROVIDER_ID as CODEX_PROVIDER_ID;
+use image_provider_contracts::provider::openai_codex::{
+    MODEL_GPT_IMAGE_2 as CODEX_PRICING_MODEL_ID,
+    MODEL_GPT_IMAGE_2_SNAPSHOT as CODEX_SNAPSHOT_MODEL_ID, PROVIDER_ID as CODEX_PROVIDER_ID,
+};
 use image_provider_dreamina_cli::{
     DREAMINA_SUBMIT_COMMAND_SCHEMA, DreaminaSubmitRequestV1, PROVIDER_ID as DREAMINA_PROVIDER_ID,
     parse_submit_command,
@@ -164,6 +167,7 @@ struct LockedPricingJob {
 struct CommandPricingFacts {
     provider_id: String,
     provider_model_id: String,
+    command_execution_model_id: Option<String>,
     api_profile: String,
     operation: String,
     output_count: i32,
@@ -283,6 +287,7 @@ pub(crate) async fn admit_customer_pricing_v4(
         return Err(AdmissionError::InvalidOwner);
     }
 
+    let price_public_model_id = customer_price_public_model_id(&job.provider_id, intent).to_owned();
     let resolution = PriceResolutionRequest {
         purpose: "customer_sale".to_string(),
         organization_id: Some(job.tenant_id.clone()),
@@ -292,7 +297,7 @@ pub(crate) async fn admit_customer_pricing_v4(
         api_profile: api_profile.to_string(),
         operation: job.operation.clone(),
         provider_model_id: Some(intent.provider_model_id.clone()),
-        public_model_id: intent.public_model_id.clone(),
+        public_model_id: price_public_model_id.clone(),
         media_kind: intent.media_kind.clone(),
         service_tier: intent.service_tier.clone(),
         execution_surface: intent.execution_surface.clone(),
@@ -346,7 +351,7 @@ pub(crate) async fn admit_customer_pricing_v4(
             operation: job.operation,
             provider_id: Some(job.provider_id),
             provider_model_id: Some(intent.provider_model_id.clone()),
-            public_model_id: intent.public_model_id.clone(),
+            public_model_id: price_public_model_id,
             media_kind: intent.media_kind.clone(),
             service_tier: intent.service_tier.clone(),
             execution_surface: intent.execution_surface.clone(),
@@ -639,7 +644,10 @@ async fn validate_customer_pricing_v4_with_facts(
     .bind(request.job_id)
     .bind(api_profile)
     .bind(&intent.provider_model_id)
-    .bind(&intent.public_model_id)
+    .bind(customer_price_public_model_id(
+        &command_facts.provider_id,
+        intent,
+    ))
     .bind(&intent.media_kind)
     .bind(&intent.service_tier)
     .bind(&intent.execution_surface)
@@ -767,12 +775,30 @@ fn validate_command_pricing_identity(
     command_facts: &CommandPricingFacts,
 ) -> Result<(), AdmissionError> {
     if command_facts.provider_model_id != intent.provider_model_id
+        || command_facts
+            .command_execution_model_id
+            .as_deref()
+            .is_some_and(|model| model != intent.execution_model_id)
         || command_facts.api_profile != api_profile
         || command_facts.operation.trim().is_empty()
     {
         return Err(AdmissionError::PricingUnavailable);
     }
     Ok(())
+}
+
+fn customer_price_public_model_id<'a>(
+    provider_id: &str,
+    intent: &'a CustomerPricingIntent,
+) -> &'a str {
+    if provider_id == CODEX_PROVIDER_ID
+        && intent.provider_model_id == CODEX_PRICING_MODEL_ID
+        && intent.execution_model_id == CODEX_SNAPSHOT_MODEL_ID
+    {
+        CODEX_PRICING_MODEL_ID
+    } else {
+        &intent.public_model_id
+    }
 }
 
 fn command_pricing_facts(
@@ -1072,9 +1098,18 @@ fn command_pricing_facts(
     {
         return Err(AdmissionError::InvalidCommand);
     }
+    let command_execution_model_id =
+        (provider_id == CODEX_PROVIDER_ID).then(|| provider_model_id.clone());
+    let provider_model_id =
+        if provider_id == CODEX_PROVIDER_ID && provider_model_id == CODEX_SNAPSHOT_MODEL_ID {
+            CODEX_PRICING_MODEL_ID.to_owned()
+        } else {
+            provider_model_id
+        };
     let facts = CommandPricingFacts {
         provider_id,
         provider_model_id,
+        command_execution_model_id,
         api_profile,
         operation,
         output_count,
