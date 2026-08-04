@@ -375,7 +375,8 @@ impl ExecutorLaunchContextStore for PostgresExecutorSubmissionStore {
               ON i.job_id = m.job_id
              AND i.admission_session_id = m.admission_session_id
             WHERE m.job_id = $1
-            ORDER BY i.input_index
+            ORDER BY CASE i.role WHEN 'image' THEN 0 WHEN 'mask' THEN 1 ELSE 2 END,
+                     i.input_index
             "#,
         )
         .bind(lease.job_id)

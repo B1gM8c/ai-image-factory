@@ -240,7 +240,7 @@ impl GrokProcessSupervisor {
         context: &ExecutorLaunchContext,
         spool: &ExecutionSpool,
     ) -> Result<(), RunnerError> {
-        let expected = match request {
+        let expected_inputs = match request {
             GrokExecutionRequest::ImageGeneration(_) => {
                 if context.inputs().is_empty() {
                     return Ok(());
@@ -257,7 +257,7 @@ impl GrokProcessSupervisor {
                 image_provider_grok_cli::GrokVideoGenerationRequestV1::ReferenceToVideo(request),
             ) => request.images().iter().collect(),
         };
-        if expected.len() != context.inputs().len() {
+        if expected_inputs.len() != context.inputs().len() {
             return Err(RunnerError::Definite {
                 error_code: "grok_input_manifest_invalid".to_owned(),
             });
@@ -265,9 +265,26 @@ impl GrokProcessSupervisor {
         let blobs = self.input_blobs.as_ref().ok_or(RunnerError::Definite {
             error_code: "grok_input_store_unavailable".to_owned(),
         })?;
-        for (index, (expected, input)) in expected.iter().zip(context.inputs()).enumerate() {
-            if input.role() != "image"
-                || usize::from(input.index()) != index
+        for (position, (expected, input)) in
+            expected_inputs.iter().zip(context.inputs()).enumerate()
+        {
+            let valid_binding = match request {
+                GrokExecutionRequest::ImageEdit(request) => {
+                    crate::admission::expected_grok_image_edit_input_binding(
+                        request.prompt(),
+                        expected_inputs.len(),
+                        position,
+                        input.media_type(),
+                    )
+                    .is_some_and(|binding| {
+                        input.role() == binding.role.as_str()
+                            && input.index() == binding.index
+                            && expected.filename() == binding.filename
+                    })
+                }
+                _ => input.role() == "image" && usize::from(input.index()) == position,
+            };
+            if !valid_binding
                 || input.blob().sha256_hex != expected.sha256()
                 || input.blob().byte_size == 0
                 || input.blob().byte_size > MAX_INPUT_IMAGE_BYTES
@@ -1258,6 +1275,78 @@ mod tests {
                 )
                 .unwrap(),
                 *bytes
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn supervisor_stages_opted_in_semantic_mask_as_mask_png() {
+        let fixture = GrokFixture::new();
+        let mut staged = Vec::new();
+        let mut inputs = Vec::new();
+        let mut expected_files = Vec::new();
+
+        for (position, (role, index, filename)) in [
+            ("image", 0_u16, "image-0.png"),
+            ("image", 1_u16, "image-1.png"),
+            ("mask", 0_u16, "mask.png"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut image_bytes = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::new_rgba8(position as u32 + 2, 2)
+                .write_to(&mut image_bytes, image::ImageFormat::Png)
+                .unwrap();
+            let image_bytes = image_bytes.into_inner();
+            let blob = fixture
+                .input_blobs
+                .put(
+                    InputBlobKey {
+                        admission_session_id: Uuid::new_v4(),
+                        input_id: Uuid::new_v4(),
+                    },
+                    &image_bytes,
+                )
+                .await
+                .unwrap();
+            staged.push(StagedImageV1::new(filename, &blob.sha256_hex).unwrap());
+            inputs.push(ExecutorInputObject::new(blob, role, index, "image/png").unwrap());
+            expected_files.push((filename, image_bytes));
+        }
+
+        let request = GrokImageEditRequestV1::new(
+            "replace the selection\n[factory-spatial-edit:semantic-mask-v1]",
+            staged,
+            ImageAspectRatio::R16x9,
+        )
+        .unwrap();
+        let payload = GrokImageEditPayloadV1::new("a".repeat(64), request).unwrap();
+        let command = serde_json::from_slice::<Value>(
+            &payload.into_canonical_bytes(OutputSlot::new(0, 1).unwrap()),
+        )
+        .unwrap();
+        let hash = hex::encode(Sha256::digest(serde_json::to_vec(&command).unwrap()));
+        let mut lease = fixture.lease();
+        lease.command_schema = GROK_IMAGE_EDIT_COMMAND_SCHEMA.to_owned();
+        lease.command_hash.clone_from(&hash);
+        let context = ExecutorLaunchContext {
+            request_id: "request-semantic-mask-edit".to_owned(),
+            api_profile: XAI_IMAGES_API_PROFILE.to_owned(),
+            output_index: 0,
+            command_schema: lease.command_schema.clone(),
+            command_hash: hash,
+            command_json: command,
+            inputs,
+        };
+
+        fixture.journal.start_or_attach(&lease).unwrap();
+        fixture.supervisor.prepare(&lease, &context).await.unwrap();
+        let spool = ExecutionSpool::for_lease(&fixture.journal, &lease).unwrap();
+        for (filename, bytes) in expected_files {
+            assert_eq!(
+                fs::read(spool.provider_attempt_path().unwrap().join(filename)).unwrap(),
+                bytes
             );
         }
     }

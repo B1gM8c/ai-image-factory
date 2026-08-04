@@ -1,21 +1,22 @@
 use std::env;
 
 use gpt_image_2_gateway::{
-    CreditGrantService, EditJob, PostgresCreditGrantService,
+    CreditGrantService, EditJob, InputImage, PostgresCreditGrantService,
     admission::{
         AdmissionClaim, AdmissionContract, AdmissionError, AdmissionStore, AdmissionTicket,
         AttachInputManifest, AttachInputObject, AttachJob, ClaimAdmission, CustomerPricingIntent,
         DreaminaImageAdmissionPlan, DreaminaVideoAdmissionPlan, EDIT_COMMAND_SCHEMA,
         EDIT_INPUT_MANIFEST_SCHEMA, EditCommandV1, EditInputDescriptorV1, EditInputRoleV1,
         GENERATION_COMMAND_SCHEMA, GenerationCommandV1, PostgresAdmissionStore,
-        VIDEO_GENERATION_OPERATION, WorkOutcome, XaiImageAdmissionPlan,
+        VIDEO_GENERATION_OPERATION, WorkOutcome, XaiImageAdmissionPlan, XaiImageEditAdmissionPlan,
+        XaiImageEditFallbackMode,
     },
     credit_grants::{CreateCreditGrantRequest, CreditGrantActor},
     database::{connect_test_pool_with_search_path, run_migrations},
     input_blobs::{InputBlobKey, InputBlobRef},
 };
 use image_api_contracts::xai::{
-    XaiImageGenerationRequest, XaiImageResolution, XaiImageResponseFormat,
+    XAI_IMAGES_API_PROFILE, XaiImageGenerationRequest, XaiImageResolution, XaiImageResponseFormat,
 };
 use image_api_contracts::{
     ark::{ARK_CONTENT_GENERATION_API_PROFILE, ARK_IMAGES_API_PROFILE},
@@ -25,7 +26,9 @@ use image_api_contracts::{
     },
 };
 use image_provider_dreamina_cli::DREAMINA_SUBMIT_COMMAND_SCHEMA;
-use image_provider_grok_cli::GROK_IMAGE_GENERATION_COMMAND_SCHEMA;
+use image_provider_grok_cli::{
+    GROK_IMAGE_EDIT_COMMAND_SCHEMA, GROK_IMAGE_GENERATION_COMMAND_SCHEMA,
+};
 use serde_json::json;
 use sqlx::{AssertSqlSafe, PgPool};
 use uuid::Uuid;
@@ -649,6 +652,124 @@ async fn codex_snapshot_edit_uses_canonical_price_and_snapshot_command() -> Test
                     2,
                 ),
             format!("snapshot edit identity drifted: {identity:?}"),
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
+async fn grok_semantic_mask_edit_attach_persists_mask_and_work() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let store = PostgresAdmissionStore::new(database.pool.clone());
+        let provisional_inputs = grok_semantic_mask_input_specs(Uuid::new_v4());
+        let provisional_plan = grok_semantic_mask_plan(&provisional_inputs)?;
+        let ticket = claim_grok_edit_owner(&store, provisional_plan.source_request_hash()).await?;
+        let inputs = grok_semantic_mask_input_specs(ticket.session_id);
+        let plan = grok_semantic_mask_plan(&inputs)?;
+        let job_id =
+            insert_job_for_ticket(&database.pool, &ticket, "tenant-a", "edit", None).await?;
+        set_job_provider_model(
+            &database.pool,
+            job_id,
+            image_provider_grok_cli::PROVIDER_ID,
+            plan.provider_model(),
+        )
+        .await?;
+
+        store
+            .attach(grok_edit_attach_request(ticket, job_id, &plan, inputs))
+            .await
+            .map_err(|error| format!("semantic-mask Grok edit attach failed: {error:?}"))?;
+
+        let state: (i64, i64, i64, String, String) = sqlx::query_as(
+            r#"
+            SELECT
+              (SELECT COUNT(*) FROM job_payloads WHERE job_id = $1),
+              (SELECT COUNT(*) FROM work_items WHERE job_id = $1),
+              (SELECT COUNT(*) FROM job_input_objects WHERE job_id = $1),
+              (SELECT command_schema FROM job_payloads WHERE job_id = $1),
+              (SELECT string_agg(role || ':' || input_index::TEXT, ','
+                         ORDER BY CASE role WHEN 'image' THEN 0 ELSE 1 END, input_index)
+                 FROM job_input_objects WHERE job_id = $1)
+            "#,
+        )
+        .bind(job_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(|error| format!("failed to inspect semantic-mask admission: {error}"))?;
+        require(
+            state
+                == (
+                    1,
+                    1,
+                    3,
+                    GROK_IMAGE_EDIT_COMMAND_SCHEMA.to_owned(),
+                    "image:0,image:1,mask:0".to_owned(),
+                ),
+            format!("semantic-mask admission lost durable inputs or work: {state:?}"),
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
+async fn grok_non_semantic_edit_attach_rejects_mask_before_writes() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let store = PostgresAdmissionStore::new(database.pool.clone());
+        let provisional_inputs = grok_image_input_specs(Uuid::new_v4(), 2);
+        let provisional_plan = grok_strict_edit_plan(&provisional_inputs)?;
+        let ticket = claim_grok_edit_owner(&store, provisional_plan.source_request_hash()).await?;
+        let mut inputs = grok_image_input_specs(ticket.session_id, 2);
+        let plan = grok_strict_edit_plan(&inputs)?;
+        inputs[1].role = EditInputRoleV1::Mask;
+        inputs[1].index = 0;
+        let manifest_hash = edit_input_manifest_hash(&inputs);
+        let job_id =
+            insert_job_for_ticket(&database.pool, &ticket, "tenant-a", "edit", None).await?;
+        set_job_provider_model(
+            &database.pool,
+            job_id,
+            image_provider_grok_cli::PROVIDER_ID,
+            plan.provider_model(),
+        )
+        .await?;
+        let mut request = grok_edit_attach_request(ticket, job_id, &plan, inputs);
+        request
+            .input_manifest
+            .as_mut()
+            .expect("Grok edits always have an input manifest")
+            .manifest_hash = manifest_hash;
+
+        require(
+            matches!(
+                store.attach(request).await,
+                Err(AdmissionError::InvalidCommand)
+            ),
+            "non-semantic Grok edit accepted a mask role",
+        )?;
+        let state: (i64, i64, i64) = sqlx::query_as(
+            r#"
+            SELECT
+              (SELECT COUNT(*) FROM job_payloads WHERE job_id = $1),
+              (SELECT COUNT(*) FROM work_items WHERE job_id = $1),
+              (SELECT COUNT(*) FROM job_input_objects WHERE job_id = $1)
+            "#,
+        )
+        .bind(job_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(|error| format!("failed to inspect rejected Grok edit: {error}"))?;
+        require(
+            state == (0, 0, 0),
+            format!("rejected Grok edit left durable payload state: {state:?}"),
         )
     }
     .await;
@@ -3940,6 +4061,25 @@ async fn set_job_execution_model(pool: &PgPool, job_id: Uuid, model: &str) -> Te
     )
 }
 
+async fn set_job_provider_model(
+    pool: &PgPool,
+    job_id: Uuid,
+    provider_id: &str,
+    model: &str,
+) -> TestResult {
+    let updated = sqlx::query("UPDATE jobs SET provider_id = $2, model = $3 WHERE job_id = $1")
+        .bind(job_id)
+        .bind(provider_id)
+        .bind(model)
+        .execute(pool)
+        .await
+        .map_err(|error| format!("failed to set test job provider model: {error}"))?;
+    require(
+        updated.rows_affected() == 1,
+        "test job provider model was not updated",
+    )
+}
+
 async fn insert_unbound_job(pool: &PgPool, tenant_id: &str, operation: &str) -> TestResult<Uuid> {
     insert_job_record(
         pool,
@@ -4030,6 +4170,157 @@ async fn claim_edit_owner(
     {
         AdmissionClaim::Owner(ticket) => Ok(ticket),
         other => Err(format!("expected edit owner, got {other:?}")),
+    }
+}
+
+async fn claim_grok_edit_owner(
+    store: &PostgresAdmissionStore,
+    request_hash: String,
+) -> TestResult<AdmissionTicket> {
+    let claim = ClaimAdmission {
+        owner_token: Uuid::new_v4(),
+        tenant_id: "tenant-a".to_owned(),
+        project_id: "project-a".to_owned(),
+        api_profile: XAI_IMAGES_API_PROFILE.to_owned(),
+        operation: "edit".to_owned(),
+        request_id: format!("req_{}", Uuid::new_v4().simple()),
+        idempotency_key_digest: None,
+        request_hash,
+        deadline_at_ms: i64::MAX,
+    };
+    match store
+        .claim(claim)
+        .await
+        .map_err(|error| format!("Grok edit claim failed: {error}"))?
+    {
+        AdmissionClaim::Owner(ticket) => Ok(ticket),
+        other => Err(format!("expected Grok edit owner, got {other:?}")),
+    }
+}
+
+fn grok_image_input_specs(session_id: Uuid, count: u16) -> Vec<AttachInputObject> {
+    (0..count)
+        .map(|index| AttachInputObject {
+            blob: InputBlobRef {
+                key: InputBlobKey {
+                    admission_session_id: session_id,
+                    input_id: Uuid::new_v4(),
+                },
+                storage_backend: "filesystem".to_owned(),
+                object_key: format!("inputs/{}/image-{index}", session_id.simple()),
+                sha256_hex: format!("{:064x}", u64::from(index) + 1),
+                byte_size: 100 + u64::from(index),
+            },
+            role: EditInputRoleV1::Image,
+            index,
+            media_type: "image/png".to_owned(),
+        })
+        .collect()
+}
+
+fn grok_semantic_mask_input_specs(session_id: Uuid) -> Vec<AttachInputObject> {
+    let mut inputs = grok_image_input_specs(session_id, 2);
+    inputs.push(AttachInputObject {
+        blob: InputBlobRef {
+            key: InputBlobKey {
+                admission_session_id: session_id,
+                input_id: Uuid::new_v4(),
+            },
+            storage_backend: "filesystem".to_owned(),
+            object_key: format!("inputs/{}/mask-0", session_id.simple()),
+            sha256_hex: "f".repeat(64),
+            byte_size: 45,
+        },
+        role: EditInputRoleV1::Mask,
+        index: 0,
+        media_type: "image/png".to_owned(),
+    });
+    inputs
+}
+
+fn grok_edit_job(has_mask: bool) -> EditJob {
+    EditJob {
+        request_id: "request-grok-edit".to_owned(),
+        model: "grok-imagine-image-quality".to_owned(),
+        prompt: "replace only the selected region".to_owned(),
+        moderation: "auto".to_owned(),
+        images: Vec::new(),
+        mask: has_mask.then(|| InputImage {
+            bytes: Vec::new(),
+            content_type: Some("image/png".to_owned()),
+            filename: Some("mask.png".to_owned()),
+        }),
+        n: 1,
+        size: "16:9".to_owned(),
+        quality: "auto".to_owned(),
+        output_format: "png".to_owned(),
+        output_compression: None,
+        background: "opaque".to_owned(),
+        stream: false,
+        partial_images: 0,
+    }
+}
+
+fn grok_edit_descriptors(inputs: &[AttachInputObject]) -> Vec<EditInputDescriptorV1> {
+    inputs
+        .iter()
+        .map(|input| EditInputDescriptorV1 {
+            byte_size: input.blob.byte_size,
+            index: input.index,
+            media_type: input.media_type.clone(),
+            role: input.role,
+            sha256_hex: input.blob.sha256_hex.clone(),
+        })
+        .collect()
+}
+
+fn grok_semantic_mask_plan(inputs: &[AttachInputObject]) -> TestResult<XaiImageEditAdmissionPlan> {
+    XaiImageEditAdmissionPlan::for_grok_cli_with_fallback(
+        &grok_edit_job(true),
+        grok_edit_descriptors(inputs),
+        XaiImageEditFallbackMode::SemanticMask,
+    )
+    .map_err(|error| format!("failed to build semantic-mask Grok edit plan: {error:?}"))
+}
+
+fn grok_strict_edit_plan(inputs: &[AttachInputObject]) -> TestResult<XaiImageEditAdmissionPlan> {
+    XaiImageEditAdmissionPlan::for_grok_cli(&grok_edit_job(false), grok_edit_descriptors(inputs))
+        .map_err(|error| format!("failed to build strict Grok edit plan: {error:?}"))
+}
+
+fn edit_input_manifest_hash(inputs: &[AttachInputObject]) -> String {
+    EditCommandV1::from_edit_job(
+        &grok_edit_job(true),
+        grok_edit_descriptors(inputs),
+        XAI_IMAGES_API_PROFILE,
+        image_provider_grok_cli::PROVIDER_ID,
+    )
+    .input_manifest_hash_hex()
+}
+
+fn grok_edit_attach_request(
+    ticket: AdmissionTicket,
+    job_id: Uuid,
+    plan: &XaiImageEditAdmissionPlan,
+    inputs: Vec<AttachInputObject>,
+) -> AttachJob {
+    AttachJob {
+        ticket,
+        job_id,
+        command_schema: plan.command_schema().to_owned(),
+        command_json: plan.provider_command().clone(),
+        input_manifest: Some(AttachInputManifest {
+            manifest_schema: plan.input_manifest_schema().to_owned(),
+            manifest_hash: plan.input_manifest_hash(),
+            inputs,
+        }),
+        work_kind: "image_batch".to_owned(),
+        schedule_scope: "tenant-a".to_owned(),
+        schedule_weight: 1,
+        schedule_priority: 1,
+        schedule_cost: 1,
+        contract: AdmissionContract::LegacyV1,
+        customer_pricing: None,
     }
 }
 

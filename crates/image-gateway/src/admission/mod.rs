@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, HashSet};
 use async_trait::async_trait;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use tracing::warn;
 use uuid::Uuid;
 
 use crate::input_blobs::InputBlobRef;
@@ -34,6 +35,7 @@ pub use dreamina::{
 };
 pub use memory::InMemoryAdmissionStore;
 pub use postgres::PostgresAdmissionStore;
+pub(crate) use xai_image_edits::expected_grok_image_edit_input_binding;
 pub use xai_image_edits::{
     XaiImageEditAdmissionError, XaiImageEditAdmissionPlan, XaiImageEditFallbackMode,
 };
@@ -390,51 +392,77 @@ fn validate_grok_image_edit_attach_request(
     request: &AttachJob,
     manifest: &AttachInputManifest,
 ) -> Result<(), AdmissionError> {
+    let invalid = |reason: &'static str| {
+        warn!(
+            job_id = %request.job_id,
+            admission_session_id = %request.ticket.session_id,
+            reason,
+            "Grok image edit attach validation failed"
+        );
+        AdmissionError::InvalidCommand
+    };
     if manifest.manifest_schema != EDIT_INPUT_MANIFEST_SCHEMA
         || manifest.inputs.is_empty()
         || manifest.inputs.len() > image_provider_grok_cli::MAX_IMAGE_EDIT_REFERENCES
         || !is_sha256(&manifest.manifest_hash)
     {
-        return Err(AdmissionError::InvalidCommand);
+        return Err(invalid("invalid_input_manifest_envelope"));
     }
-    let bytes =
-        serde_json::to_vec(&request.command_json).map_err(|_| AdmissionError::InvalidCommand)?;
-    let payload = parse_image_edit_payload(&bytes).map_err(|_| AdmissionError::InvalidCommand)?;
-    if payload.source_command_sha256() != provider_command_hash(request)?
-        || payload.request().images().len() != manifest.inputs.len()
-    {
-        return Err(AdmissionError::InvalidCommand);
+    let bytes = serde_json::to_vec(&request.command_json)
+        .map_err(|_| invalid("provider_command_encoding_failed"))?;
+    let payload = parse_image_edit_payload(&bytes)
+        .map_err(|_| invalid("provider_command_payload_invalid"))?;
+    if payload.source_command_sha256() != provider_command_hash(request)? {
+        return Err(invalid("provider_command_hash_mismatch"));
+    }
+    if payload.request().images().len() != manifest.inputs.len() {
+        return Err(invalid("provider_input_count_mismatch"));
     }
 
     let mut descriptors = Vec::with_capacity(manifest.inputs.len());
     let mut input_ids = HashSet::new();
     let mut object_keys = HashSet::new();
-    for (index, (expected, input)) in payload
+    for (position, (expected, input)) in payload
         .request()
         .images()
         .iter()
         .zip(&manifest.inputs)
         .enumerate()
     {
-        if input.role != EditInputRoleV1::Image
-            || usize::from(input.index) != index
-            || input.blob.key.admission_session_id != request.ticket.session_id
-            || input.blob.sha256_hex != expected.sha256()
-            || input.blob.byte_size == 0
+        let Some(binding) = expected_grok_image_edit_input_binding(
+            payload.request().prompt(),
+            manifest.inputs.len(),
+            position,
+            &input.media_type,
+        ) else {
+            return Err(invalid("provider_input_binding_invalid"));
+        };
+        if input.role != binding.role || input.index != binding.index {
+            return Err(invalid("provider_input_role_or_index_mismatch"));
+        }
+        if expected.filename() != binding.filename {
+            return Err(invalid("provider_input_filename_mismatch"));
+        }
+        if input.blob.key.admission_session_id != request.ticket.session_id {
+            return Err(invalid("provider_input_session_mismatch"));
+        }
+        if input.blob.sha256_hex != expected.sha256() {
+            return Err(invalid("provider_input_digest_mismatch"));
+        }
+        if input.blob.byte_size == 0
             || input.blob.storage_backend.is_empty()
             || input.blob.object_key.is_empty()
             || !is_sha256(&input.blob.sha256_hex)
-            || !matches!(
-                input.media_type.as_str(),
-                "image/png" | "image/jpeg" | "image/webp"
-            )
-            || !input_ids.insert(input.blob.key.input_id)
+        {
+            return Err(invalid("provider_input_blob_metadata_invalid"));
+        }
+        if !input_ids.insert(input.blob.key.input_id)
             || !object_keys.insert((
                 input.blob.storage_backend.as_str(),
                 input.blob.object_key.as_str(),
             ))
         {
-            return Err(AdmissionError::InvalidCommand);
+            return Err(invalid("provider_input_object_identity_reused"));
         }
         descriptors.push(EditInputDescriptorV1 {
             byte_size: input.blob.byte_size,
@@ -445,9 +473,9 @@ fn validate_grok_image_edit_attach_request(
         });
     }
     let descriptor_bytes =
-        serde_json::to_vec(&descriptors).map_err(|_| AdmissionError::InvalidCommand)?;
+        serde_json::to_vec(&descriptors).map_err(|_| invalid("manifest_encoding_failed"))?;
     if hex::encode(Sha256::digest(descriptor_bytes)) != manifest.manifest_hash {
-        return Err(AdmissionError::InvalidCommand);
+        return Err(invalid("input_manifest_hash_mismatch"));
     }
     Ok(())
 }

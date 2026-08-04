@@ -6316,15 +6316,12 @@ async fn launch_context_restores_digest_bound_input_metadata() -> TestResult {
         .fetch_one(&database.pool)
         .await
         .map_err(debug_error)?;
-        let input_id = Uuid::new_v4();
-        let object_key = format!("sealed/{input_id}");
-        let digest = "d".repeat(64);
         let now = database_now(&database.pool).await?;
         sqlx::query(
             r#"
             INSERT INTO job_input_manifests
               (job_id, admission_session_id, manifest_schema, manifest_hash, input_count, created_at_ms)
-            VALUES ($1, $2, 'xai.video.inputs.v1', $3, 1, $4)
+            VALUES ($1, $2, 'openai.images.edit.inputs.v1', $3, 3, $4)
             "#,
         )
         .bind(work.job_id)
@@ -6334,24 +6331,39 @@ async fn launch_context_restores_digest_bound_input_metadata() -> TestResult {
         .execute(&database.pool)
         .await
         .map_err(debug_error)?;
-        sqlx::query(
-            r#"
-            INSERT INTO job_input_objects
-              (input_id, job_id, admission_session_id, role, input_index, media_type,
-               storage_backend, object_key, sha256_hex, byte_size, created_at_ms)
-            VALUES ($1, $2, $3, 'image', 0, 'image/jpeg',
-                    'filesystem-input-v1', $4, $5, 123, $6)
-            "#,
-        )
-        .bind(input_id)
-        .bind(work.job_id)
-        .bind(admission_session_id)
-        .bind(&object_key)
-        .bind(&digest)
-        .bind(now)
-        .execute(&database.pool)
-        .await
-        .map_err(debug_error)?;
+        let input_specs = [
+            ("mask", 0_i16, "image/png", "f".repeat(64), 45_i64),
+            ("image", 1_i16, "image/png", "e".repeat(64), 124_i64),
+            ("image", 0_i16, "image/jpeg", "d".repeat(64), 123_i64),
+        ];
+        let mut expected = Vec::new();
+        for (role, index, media_type, digest, byte_size) in input_specs {
+            let input_id = Uuid::new_v4();
+            let object_key = format!("sealed/{role}-{index}-{input_id}");
+            sqlx::query(
+                r#"
+                INSERT INTO job_input_objects
+                  (input_id, job_id, admission_session_id, role, input_index, media_type,
+                   storage_backend, object_key, sha256_hex, byte_size, created_at_ms)
+                VALUES ($1, $2, $3, $4, $5, $6,
+                        'filesystem-input-v1', $7, $8, $9, $10)
+                "#,
+            )
+            .bind(input_id)
+            .bind(work.job_id)
+            .bind(admission_session_id)
+            .bind(role)
+            .bind(index)
+            .bind(media_type)
+            .bind(&object_key)
+            .bind(&digest)
+            .bind(byte_size)
+            .bind(now)
+            .execute(&database.pool)
+            .await
+            .map_err(debug_error)?;
+            expected.push((role, index, media_type, input_id, object_key, digest, byte_size));
+        }
 
         let store = PostgresExecutorSubmissionStore::new(database.pool.clone());
         store
@@ -6364,27 +6376,43 @@ async fn launch_context_restores_digest_bound_input_metadata() -> TestResult {
             .load_launch_context(&lease)
             .await
             .map_err(debug_error)?;
-        let [input] = context.inputs() else {
+        let [source, reference, mask] = context.inputs() else {
             return Err(format!(
-                "launch context did not restore exactly one input: {:?}",
+                "launch context did not restore the semantic-mask inputs: {:?}",
                 context.inputs()
             ));
         };
+        let source_expected = &expected[2];
+        let reference_expected = &expected[1];
+        let mask_expected = &expected[0];
         require(
-            input.role() == "image"
-                && input.index() == 0
-                && input.media_type() == "image/jpeg"
-                && input.blob().key.admission_session_id == admission_session_id
-                && input.blob().key.input_id == input_id
-                && input.blob().storage_backend == "filesystem-input-v1"
-                && input.blob().object_key == object_key
-                && input.blob().sha256_hex == digest
-                && input.blob().byte_size == 123,
-            format!("launch context changed sealed input authority: {input:?}"),
+            restored_input_matches(source, admission_session_id, source_expected)
+                && restored_input_matches(reference, admission_session_id, reference_expected)
+                && restored_input_matches(mask, admission_session_id, mask_expected),
+            format!(
+                "launch context changed sealed input authority or ordering: {:?}",
+                context.inputs()
+            ),
         )
     }
     .await;
     combine(result, database.cleanup().await)
+}
+
+fn restored_input_matches(
+    input: &gpt_image_2_gateway::executor::ExecutorInputObject,
+    admission_session_id: Uuid,
+    expected: &(&str, i16, &str, Uuid, String, String, i64),
+) -> bool {
+    input.role() == expected.0
+        && i16::try_from(input.index()).ok() == Some(expected.1)
+        && input.media_type() == expected.2
+        && input.blob().key.admission_session_id == admission_session_id
+        && input.blob().key.input_id == expected.3
+        && input.blob().storage_backend == "filesystem-input-v1"
+        && input.blob().object_key == expected.4
+        && input.blob().sha256_hex == expected.5
+        && i64::try_from(input.blob().byte_size).ok() == Some(expected.6)
 }
 
 #[tokio::test]

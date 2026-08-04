@@ -13,6 +13,46 @@ use super::{EDIT_INPUT_MANIFEST_SCHEMA, EditCommandV1, EditInputDescriptorV1, Ed
 
 const SEMANTIC_MASK_PROMPT_MARKER: &str = "[factory-spatial-edit:semantic-mask-v1]";
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct XaiImageEditInputBinding {
+    pub role: EditInputRoleV1,
+    pub index: u16,
+    pub filename: String,
+}
+
+pub(crate) fn expected_grok_image_edit_input_binding(
+    prompt: &str,
+    input_count: usize,
+    position: usize,
+    media_type: &str,
+) -> Option<XaiImageEditInputBinding> {
+    if input_count == 0 || position >= input_count {
+        return None;
+    }
+    if semantic_mask_prompt_enabled(prompt) && position + 1 == input_count {
+        return (input_count > 1 && media_type == "image/png").then(|| XaiImageEditInputBinding {
+            role: EditInputRoleV1::Mask,
+            index: 0,
+            filename: "mask.png".to_owned(),
+        });
+    }
+    let extension = match media_type {
+        "image/png" => "png",
+        "image/jpeg" => "jpg",
+        "image/webp" => "webp",
+        _ => return None,
+    };
+    Some(XaiImageEditInputBinding {
+        role: EditInputRoleV1::Image,
+        index: u16::try_from(position).ok()?,
+        filename: format!("image-{position}.{extension}"),
+    })
+}
+
+pub(crate) fn semantic_mask_prompt_enabled(prompt: &str) -> bool {
+    prompt.contains(SEMANTIC_MASK_PROMPT_MARKER)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum XaiImageEditFallbackMode {
     SemanticMask,
@@ -171,7 +211,7 @@ fn semantic_mask_prompt(
 ) -> String {
     if !has_mask
         || fallback != Some(XaiImageEditFallbackMode::SemanticMask)
-        || user_prompt.contains(SEMANTIC_MASK_PROMPT_MARKER)
+        || semantic_mask_prompt_enabled(user_prompt)
     {
         return user_prompt.to_owned();
     }
