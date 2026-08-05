@@ -31,6 +31,10 @@ use super::{
     sessions::private_json, videos::create_video_with_auth,
 };
 
+const GROK_REFERENCE_VIDEO_MODEL: &str = "grok-imagine-video";
+const MIN_GROK_REFERENCE_IMAGES: usize = 2;
+const MAX_GROK_REFERENCE_IMAGES: usize = 7;
+
 #[derive(Serialize)]
 struct ConsoleVideoModels {
     object: &'static str,
@@ -56,12 +60,23 @@ struct ConsoleVideoControls {
     duration: ConsoleNumericChoiceControl,
     resolution: ConsoleChoiceControl,
     first_frame: ConsoleFirstFrameControl,
+    reference_images: ConsoleReferenceImagesControl,
 }
 
 #[derive(Serialize)]
 struct ConsoleFirstFrameControl {
     supported: bool,
     required: bool,
+    required_for: &'static [&'static str],
+}
+
+#[derive(Serialize)]
+struct ConsoleReferenceImagesControl {
+    supported: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    min_items: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_items: Option<usize>,
     required_for: &'static [&'static str],
 }
 
@@ -115,6 +130,8 @@ pub(super) struct ConsoleVideoGenerationRequest {
     resolution: Option<String>,
     #[serde(default)]
     image: Option<String>,
+    #[serde(default)]
+    reference_images: Vec<String>,
 }
 
 pub(super) async fn video_models(
@@ -346,7 +363,7 @@ fn console_video_modes(
     if api_profile == XAI_VIDEOS_API_PROFILE
         && provider_model_id == Some("grok-imagine-video-1.5-preview")
     {
-        return Some(&["text_to_video", "image_to_video"]);
+        return Some(&["text_to_video", "image_to_video", "reference_to_video"]);
     }
     matches!(
         api_profile,
@@ -369,7 +386,7 @@ fn console_video_controls(
             aspect_ratio: Some(ConsoleChoiceControl {
                 default: "16:9",
                 options: &["1:1", "16:9", "9:16", "3:2", "2:3"],
-                supported_for: &["text_to_video"],
+                supported_for: &["text_to_video", "reference_to_video"],
             }),
             duration: ConsoleNumericChoiceControl {
                 default: 6,
@@ -378,12 +395,18 @@ fn console_video_controls(
             resolution: ConsoleChoiceControl {
                 default: "480p",
                 options: &["480p", "720p"],
-                supported_for: &["text_to_video", "image_to_video"],
+                supported_for: &["text_to_video", "image_to_video", "reference_to_video"],
             },
             first_frame: ConsoleFirstFrameControl {
                 supported: true,
                 required: false,
                 required_for: &["image_to_video"],
+            },
+            reference_images: ConsoleReferenceImagesControl {
+                supported: true,
+                min_items: Some(MIN_GROK_REFERENCE_IMAGES),
+                max_items: Some(MAX_GROK_REFERENCE_IMAGES),
+                required_for: &["reference_to_video"],
             },
         });
     }
@@ -426,6 +449,12 @@ fn console_video_controls(
             required: false,
             required_for: &[],
         },
+        reference_images: ConsoleReferenceImagesControl {
+            supported: false,
+            min_items: None,
+            max_items: None,
+            required_for: &[],
+        },
     })
 }
 
@@ -454,8 +483,27 @@ fn console_video_request(
             "invalid_value",
         ));
     }
+    if request.image.is_some() && !request.reference_images.is_empty() {
+        return Err(ImageGatewayError::invalid_request(
+            "image and reference_images are mutually exclusive",
+            Some("reference_images".to_owned()),
+            "invalid_value",
+        ));
+    }
+    if !request.reference_images.is_empty()
+        && !(MIN_GROK_REFERENCE_IMAGES..=MAX_GROK_REFERENCE_IMAGES)
+            .contains(&request.reference_images.len())
+    {
+        return Err(ImageGatewayError::invalid_request(
+            "reference_images must contain between 2 and 7 images",
+            Some("reference_images".to_owned()),
+            "invalid_value",
+        ));
+    }
     let mode = if request.image.is_some() {
         "image_to_video"
+    } else if !request.reference_images.is_empty() {
+        "reference_to_video"
     } else {
         "text_to_video"
     };
@@ -468,7 +516,11 @@ fn console_video_request(
         })?;
     if !modes.contains(&mode) {
         return Err(ImageGatewayError::unsupported(
-            "image",
+            if mode == "reference_to_video" {
+                "reference_images"
+            } else {
+                "image"
+            },
             "video workflow is not supported by this model",
         ));
     }
@@ -527,6 +579,12 @@ fn console_video_request(
             "image is not supported by this model",
         ));
     }
+    if !request.reference_images.is_empty() && !controls.reference_images.supported {
+        return Err(ImageGatewayError::unsupported(
+            "reference_images",
+            "reference_images are not supported by this model",
+        ));
+    }
     match resolved.api_profile.as_str() {
         XAI_VIDEOS_API_PROFILE => Ok(ConsoleVideoDispatchRequest::Xai(
             XaiVideoGenerationRequest {
@@ -543,10 +601,22 @@ fn console_video_request(
                     file_id: None,
                     url: Some(url),
                 }),
-                model: Some(resolved.provider_model_id.clone()),
+                // Grok exposes reference-to-video through the stable video model binding.
+                model: Some(if mode == "reference_to_video" {
+                    GROK_REFERENCE_VIDEO_MODEL.to_owned()
+                } else {
+                    resolved.provider_model_id.clone()
+                }),
                 output: None,
                 prompt: Some(prompt),
-                reference_images: Vec::new(),
+                reference_images: request
+                    .reference_images
+                    .into_iter()
+                    .map(|url| XaiVideoImageUrl {
+                        file_id: None,
+                        url: Some(url),
+                    })
+                    .collect(),
                 resolution: Some(match resolution.as_str() {
                     "480p" => XaiVideoResolution::P480,
                     "720p" => XaiVideoResolution::P720,
@@ -738,6 +808,7 @@ mod tests {
             aspect_ratio: None,
             resolution: Some("720p".to_owned()),
             image: Some("data:image/png;base64,AA==".to_owned()),
+            reference_images: Vec::new(),
         };
         let ConsoleVideoDispatchRequest::Xai(projected) =
             console_video_request(request, &resolved_route(XAI_VIDEOS_API_PROFILE)).unwrap()
@@ -769,6 +840,7 @@ mod tests {
             aspect_ratio: Some("9:16".to_owned()),
             resolution: Some("480p".to_owned()),
             image: None,
+            reference_images: Vec::new(),
         };
         let ConsoleVideoDispatchRequest::Xai(projected) =
             console_video_request(request, &resolved_route(XAI_VIDEOS_API_PROFILE)).unwrap()
@@ -789,7 +861,7 @@ mod tests {
                 XAI_VIDEOS_API_PROFILE,
                 Some("grok-imagine-video-1.5-preview")
             ),
-            Some(&["text_to_video", "image_to_video"][..])
+            Some(&["text_to_video", "image_to_video", "reference_to_video"][..])
         );
         let controls = console_video_controls(
             XAI_VIDEOS_API_PROFILE,
@@ -799,9 +871,99 @@ mod tests {
         assert_eq!(controls.duration.options, &[6, 10]);
         assert_eq!(controls.resolution.options, &["480p", "720p"]);
         assert_eq!(controls.first_frame.required_for, &["image_to_video"]);
+        assert!(controls.reference_images.supported);
+        assert_eq!(controls.reference_images.min_items, Some(2));
+        assert_eq!(controls.reference_images.max_items, Some(7));
+        assert_eq!(
+            controls.reference_images.required_for,
+            &["reference_to_video"]
+        );
         assert_eq!(
             controls.aspect_ratio.unwrap().supported_for,
-            &["text_to_video"]
+            &["text_to_video", "reference_to_video"]
+        );
+    }
+
+    #[test]
+    fn console_video_request_accepts_two_reference_images_from_json() {
+        let request: ConsoleVideoGenerationRequest = serde_json::from_value(json!({
+            "model": "public-video",
+            "prompt": "blend the reference compositions into a cinematic scene",
+            "duration": 6,
+            "aspect_ratio": "16:9",
+            "resolution": "480p",
+            "reference_images": [
+                "data:image/png;base64,AA==",
+                "data:image/jpeg;base64,AQ=="
+            ]
+        }))
+        .unwrap();
+        let ConsoleVideoDispatchRequest::Xai(projected) =
+            console_video_request(request, &resolved_route(XAI_VIDEOS_API_PROFILE)).unwrap()
+        else {
+            panic!("xAI request was dispatched to the wrong adapter");
+        };
+        assert_eq!(projected.model.as_deref(), Some(GROK_REFERENCE_VIDEO_MODEL));
+        assert!(projected.image.is_none());
+        assert_eq!(projected.reference_images.len(), 2);
+        assert_eq!(
+            projected
+                .reference_images
+                .iter()
+                .filter_map(|image| image.url.as_deref())
+                .collect::<Vec<_>>(),
+            vec!["data:image/png;base64,AA==", "data:image/jpeg;base64,AQ=="]
+        );
+        assert_eq!(
+            projected.aspect_ratio,
+            Some(image_api_contracts::xai::XaiVideoAspectRatio::R16x9)
+        );
+    }
+
+    #[test]
+    fn console_video_request_accepts_seven_reference_images() {
+        let request = grok_reference_request(7);
+        let ConsoleVideoDispatchRequest::Xai(projected) =
+            console_video_request(request, &resolved_route(XAI_VIDEOS_API_PROFILE)).unwrap()
+        else {
+            panic!("xAI request was dispatched to the wrong adapter");
+        };
+        assert_eq!(projected.reference_images.len(), 7);
+    }
+
+    #[test]
+    fn console_video_request_rejects_reference_image_counts_outside_two_to_seven() {
+        assert!(
+            console_video_request(
+                grok_reference_request(1),
+                &resolved_route(XAI_VIDEOS_API_PROFILE)
+            )
+            .is_err()
+        );
+        assert!(
+            console_video_request(
+                grok_reference_request(8),
+                &resolved_route(XAI_VIDEOS_API_PROFILE)
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn console_video_request_rejects_first_frame_with_reference_images() {
+        let mut request = grok_reference_request(2);
+        request.image = Some("data:image/png;base64,Ag==".to_owned());
+        assert!(console_video_request(request, &resolved_route(XAI_VIDEOS_API_PROFILE)).is_err());
+    }
+
+    #[test]
+    fn console_video_request_rejects_reference_images_for_non_grok_models() {
+        assert!(
+            console_video_request(
+                grok_reference_request(2),
+                &resolved_route(DREAMINA_VIDEOS_API_PROFILE)
+            )
+            .is_err()
         );
     }
 
@@ -814,6 +976,7 @@ mod tests {
             aspect_ratio: Some("16:9".to_owned()),
             resolution: Some("480p".to_owned()),
             image: Some("data:image/png;base64,AA==".to_owned()),
+            reference_images: Vec::new(),
         };
         assert!(console_video_request(request, &resolved_route(XAI_VIDEOS_API_PROFILE)).is_err());
     }
@@ -827,6 +990,7 @@ mod tests {
             aspect_ratio: Some("4:3".to_owned()),
             resolution: Some("1080p".to_owned()),
             image: Some("data:image/png;base64,AA==".to_owned()),
+            reference_images: Vec::new(),
         };
         assert!(console_video_request(request, &resolved_route(XAI_VIDEOS_API_PROFILE)).is_err());
     }
@@ -840,6 +1004,7 @@ mod tests {
             aspect_ratio: Some("21:9".to_owned()),
             resolution: Some("720p".to_owned()),
             image: None,
+            reference_images: Vec::new(),
         };
         let ConsoleVideoDispatchRequest::Dreamina(projected) =
             console_video_request(request, &resolved_route(DREAMINA_VIDEOS_API_PROFILE)).unwrap()
@@ -861,6 +1026,7 @@ mod tests {
             aspect_ratio: Some("16:9".to_owned()),
             resolution: Some("720p".to_owned()),
             image: None,
+            reference_images: Vec::new(),
         };
         let ConsoleVideoDispatchRequest::Ark(projected) =
             console_video_request(request, &resolved_route(ARK_CONTENT_GENERATION_API_PROFILE))
@@ -955,6 +1121,20 @@ mod tests {
             media_kind: "video".to_owned(),
             route_id: Uuid::new_v4(),
             route_revision: 1,
+        }
+    }
+
+    fn grok_reference_request(count: usize) -> ConsoleVideoGenerationRequest {
+        ConsoleVideoGenerationRequest {
+            model: "public-video".to_owned(),
+            prompt: "blend the reference compositions into a cinematic scene".to_owned(),
+            duration: Some(6),
+            aspect_ratio: Some("16:9".to_owned()),
+            resolution: Some("480p".to_owned()),
+            image: None,
+            reference_images: (0..count)
+                .map(|index| format!("data:image/png;base64,{index:02}"))
+                .collect(),
         }
     }
 
