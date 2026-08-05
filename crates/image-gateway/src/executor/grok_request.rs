@@ -2,7 +2,8 @@ use image_provider_grok_cli::{
     ADAPTER_REVISION, GROK_IMAGE_EDIT_COMMAND_SCHEMA, GROK_IMAGE_GENERATION_COMMAND_SCHEMA,
     GROK_VIDEO_GENERATION_COMMAND_SCHEMA, GrokCliRequestV1, GrokImageEditRequestV1,
     GrokImageGenerationRequestV1, GrokVideoGenerationRequestV1, PROVIDER_ID,
-    parse_image_edit_command, parse_image_generation_command, parse_video_generation_command,
+    VIDEO_ADAPTER_REVISION, parse_image_edit_command, parse_image_generation_command,
+    parse_video_generation_command,
 };
 use sha2::{Digest, Sha256};
 
@@ -32,6 +33,9 @@ impl GrokExecutionRequest {
         match self {
             Self::ImageGeneration(request) => request.model().as_str(),
             Self::ImageEdit(_) => "grok-imagine-image-quality",
+            Self::VideoGeneration(GrokVideoGenerationRequestV1::TextToVideo(_)) => {
+                "grok-imagine-video-1.5-preview"
+            }
             Self::VideoGeneration(GrokVideoGenerationRequestV1::ImageToVideo(_)) => {
                 "grok-imagine-video-1.5-preview"
             }
@@ -59,7 +63,8 @@ pub fn project_grok_execution_request(
     context: &ExecutorLaunchContext,
 ) -> Result<GrokExecutionRequest, GrokRequestProjectionError> {
     if lease.provider_id != PROVIDER_ID
-        || lease.adapter_revision != ADAPTER_REVISION
+        || Some(lease.adapter_revision.as_str())
+            != expected_grok_adapter_revision(lease.command_schema.as_str())
         || lease.output_index != context.output_index()
         || lease.command_schema != context.command_schema()
         || lease.command_hash != context.command_hash()
@@ -104,6 +109,16 @@ pub fn project_grok_execution_request(
         return Err(GrokRequestProjectionError::UnsupportedCommand);
     }
     Ok(request)
+}
+
+pub(super) fn expected_grok_adapter_revision(command_schema: &str) -> Option<&'static str> {
+    match command_schema {
+        GROK_IMAGE_GENERATION_COMMAND_SCHEMA | GROK_IMAGE_EDIT_COMMAND_SCHEMA => {
+            Some(ADAPTER_REVISION)
+        }
+        GROK_VIDEO_GENERATION_COMMAND_SCHEMA => Some(VIDEO_ADAPTER_REVISION),
+        _ => None,
+    }
 }
 
 fn require_api_profile(

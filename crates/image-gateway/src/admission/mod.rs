@@ -235,6 +235,22 @@ pub(crate) fn validate_attach_request(request: &AttachJob) -> Result<(), Admissi
                     Err(AdmissionError::InvalidCommand)
                 }
             }
+            GROK_VIDEO_GENERATION_COMMAND_SCHEMA => {
+                let bytes = serde_json::to_vec(&request.command_json)
+                    .map_err(|_| AdmissionError::InvalidCommand)?;
+                let payload = parse_video_generation_payload(&bytes)
+                    .map_err(|_| AdmissionError::InvalidCommand)?;
+                if payload.source_command_sha256() == provider_command_hash
+                    && matches!(
+                        payload.request(),
+                        GrokVideoGenerationRequestV1::TextToVideo(_)
+                    )
+                {
+                    Ok(())
+                } else {
+                    Err(AdmissionError::InvalidCommand)
+                }
+            }
             DREAMINA_SUBMIT_COMMAND_SCHEMA => {
                 let bytes = serde_json::to_vec(&request.command_json)
                     .map_err(|_| AdmissionError::InvalidCommand)?;
@@ -501,6 +517,7 @@ fn validate_video_attach_request(
         return Err(AdmissionError::InvalidCommand);
     }
     let expected_images: &[StagedImageV1] = match payload.request() {
+        GrokVideoGenerationRequestV1::TextToVideo(_) => &[],
         GrokVideoGenerationRequestV1::ImageToVideo(video) => std::slice::from_ref(video.image()),
         GrokVideoGenerationRequestV1::ReferenceToVideo(video) => video.images(),
     };

@@ -41,6 +41,7 @@ pub struct DimensionContract {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 pub enum Selector {
     ProviderModel,
+    Dimension(&'static str),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -470,6 +471,7 @@ impl Selector {
     fn value<'a>(self, request: &'a SurfaceRequest<'a>) -> Option<&'a str> {
         match self {
             Self::ProviderModel => Some(request.provider_model_id),
+            Self::Dimension(key) => request.value(key),
         }
     }
 }
@@ -669,7 +671,7 @@ const GROK_VIDEO_DIMENSIONS: &[DimensionContract] = &[
     DimensionContract {
         key: "input_image_count",
         required: true,
-        domain: ValueDomain::IntegerClosed { min: 1, max: 7 },
+        domain: ValueDomain::IntegerClosed { min: 0, max: 7 },
     },
     DimensionContract {
         key: "aspect_ratio",
@@ -690,7 +692,7 @@ const GROK_VIDEO_PRESENCE: &[ConditionalPresenceCase] = &[
             "grok-imagine-video-1.5-2026-05-30",
         ],
         required: &[],
-        forbidden: &["aspect_ratio"],
+        forbidden: &[],
     },
 ];
 const GROK_VIDEO_INPUT_COUNTS: &[ConditionalEnumCase] = &[
@@ -704,7 +706,24 @@ const GROK_VIDEO_INPUT_COUNTS: &[ConditionalEnumCase] = &[
             "grok-imagine-video-1.5-preview",
             "grok-imagine-video-1.5-2026-05-30",
         ],
-        allowed_values: &["1"],
+        allowed_values: &["0", "1"],
+    },
+];
+const GROK_VIDEO_INPUT_PRESENCE: &[ConditionalPresenceCase] = &[
+    ConditionalPresenceCase {
+        selector_values: &["0"],
+        required: &["aspect_ratio"],
+        forbidden: &[],
+    },
+    ConditionalPresenceCase {
+        selector_values: &["1"],
+        required: &[],
+        forbidden: &["aspect_ratio"],
+    },
+    ConditionalPresenceCase {
+        selector_values: &["2", "3", "4", "5", "6", "7"],
+        required: &["aspect_ratio"],
+        forbidden: &[],
     },
 ];
 const GROK_VIDEO_CONSTRAINTS: &[Constraint] = &[
@@ -716,6 +735,10 @@ const GROK_VIDEO_CONSTRAINTS: &[Constraint] = &[
         selector: Selector::ProviderModel,
         field: "input_image_count",
         cases: GROK_VIDEO_INPUT_COUNTS,
+    },
+    Constraint::ConditionalPresence {
+        selector: Selector::Dimension("input_image_count"),
+        cases: GROK_VIDEO_INPUT_PRESENCE,
     },
 ];
 
@@ -896,7 +919,7 @@ const CONTRACTS: &[PricingSurfaceContract] = &[
     },
     PricingSurfaceContract {
         contract_id: "grok-cli.videos.generations.pricing-surface",
-        contract_version: 2,
+        contract_version: 3,
         provider_id: "grok-cli",
         route_operation: "videos.generations",
         pricing_operation: "video_generation",
@@ -1280,6 +1303,29 @@ mod tests {
             output_count: 1,
         };
         assert_eq!(contract.validate(&image_to_video), Ok(()));
+        assert_eq!(
+            contract.validate(&SurfaceRequest {
+                dimensions: &[
+                    value("duration", "10"),
+                    value("input_image_count", "0"),
+                    value("resolution", "720p"),
+                    value("aspect_ratio", "9:16"),
+                ],
+                ..image_to_video
+            }),
+            Ok(())
+        );
+        assert_eq!(
+            contract.validate(&SurfaceRequest {
+                dimensions: &[
+                    value("duration", "10"),
+                    value("input_image_count", "0"),
+                    value("resolution", "720p"),
+                ],
+                ..image_to_video
+            }),
+            Err(ValidationError::ConstraintViolation("conditional_presence"))
+        );
         assert_eq!(
             contract.validate(&SurfaceRequest {
                 dimensions: &[

@@ -13,6 +13,7 @@ use image_api_contracts::xai::{
 };
 use image_provider_grok_cli::{
     ADAPTER_REVISION, GROK_IMAGE_GENERATION_COMMAND_SCHEMA, GROK_VIDEO_GENERATION_COMMAND_SCHEMA,
+    VIDEO_ADAPTER_REVISION,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -310,6 +311,7 @@ fn video_lease(command_hash: String) -> ExecutorSubmissionLease {
     ExecutorSubmissionLease {
         model: "grok-imagine-video-1.5-preview".to_owned(),
         command_schema: GROK_VIDEO_GENERATION_COMMAND_SCHEMA.to_owned(),
+        adapter_revision: VIDEO_ADAPTER_REVISION.to_owned(),
         ..lease(command_hash)
     }
 }

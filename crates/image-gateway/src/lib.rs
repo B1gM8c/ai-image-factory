@@ -111,7 +111,8 @@ pub use executor::{
     provision_grok_edit_execution_profile, provision_grok_edit_execution_profile_in_transaction,
     provision_grok_execution_profile, provision_grok_execution_profile_in_transaction,
     provision_grok_video_execution_profile, provision_grok_video_execution_profile_in_transaction,
-    run_codex_runner_child, run_grok_runner_child,
+    provision_grok_video_execution_profile_replacement, run_codex_runner_child,
+    run_grok_runner_child,
 };
 pub use generator::{
     CodexImageGenerator, EditJob, GeneratedImage, GenerationJob, ImageGenerator, InputImage,

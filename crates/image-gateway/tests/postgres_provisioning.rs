@@ -12,6 +12,7 @@ use gpt_image_2_gateway::{
     identify_executor_profile_binding, provision_codex_execution_profile,
     provision_dreamina_execution_profile, provision_dreamina_video_execution_profile,
     provision_grok_execution_profile, provision_grok_video_execution_profile,
+    provision_grok_video_execution_profile_replacement,
 };
 use image_provider_dreamina_cli::{
     DREAMINA_IMAGE_GENERATION_OPERATION_V1, DREAMINA_SUBMIT_COMMAND_SCHEMA,
@@ -436,6 +437,124 @@ async fn grok_video_profile_has_a_distinct_runtime_binding() -> TestResult {
                 && identify_executor_profile_binding(&loaded)
                     == Ok(ExecutorProfileBinding::GrokVideoGeneration),
             format!("provisioned Grok video profile has the wrong binding: {loaded:?}"),
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
+async fn grok_video_profile_replacement_is_immutable_idempotent_and_respects_disable() -> TestResult
+{
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let identity = grok_fixture("replacement-identity");
+        let identity_profile = provision_grok_execution_profile(&database.pool, &identity)
+            .await
+            .map_err(debug_error)?;
+        let provisioning = grok_video_fixture("replacement-source");
+        let source_profile_id = Uuid::new_v4();
+        let operation = image_provider_grok_cli::GROK_VIDEO_GENERATION_OPERATION_V1;
+        sqlx::query(
+            r#"
+            INSERT INTO provider_execution_profiles
+              (execution_profile_id, profile_key, provider_id, command_schema,
+               operation_id, operation_descriptor_revision,
+               operation_descriptor_sha256_v1, completion_mode, idempotency_mode,
+               adapter_revision, credential_pool_id, provider_account_id,
+               credential_ref, credential_revision, resource_policy_id,
+               resource_policy_revision, state, created_at_ms, updated_at_ms)
+            SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+                   credential_pool_id, provider_account_id, credential_ref,
+                   credential_revision, resource_policy_id,
+                   resource_policy_revision, 'enabled', 1, 1
+            FROM provider_execution_profiles
+            WHERE execution_profile_id = $11
+            "#,
+        )
+        .bind(source_profile_id)
+        .bind(&provisioning.profile_key)
+        .bind(image_provider_grok_cli::PROVIDER_ID)
+        .bind(image_provider_grok_cli::GROK_VIDEO_GENERATION_COMMAND_SCHEMA)
+        .bind(operation.id)
+        .bind(operation.descriptor_revision)
+        .bind(operation.canonical_sha256_v1_hex())
+        .bind(operation.completion.as_str())
+        .bind(operation.idempotency.as_str())
+        .bind(image_provider_grok_cli::ADAPTER_REVISION)
+        .bind(identity_profile.execution_profile_id)
+        .execute(&database.pool)
+        .await
+        .map_err(debug_error)?;
+
+        let source = PostgresExecutorSubmissionStore::new(database.pool.clone())
+            .load_execution_profile(&provisioning.profile_key)
+            .await
+            .map_err(debug_error)?;
+
+        let replacement_key = format!("{}.runtime-v2", provisioning.profile_key);
+        let replacement = provision_grok_video_execution_profile_replacement(
+            &database.pool,
+            &provisioning.profile_key,
+            &replacement_key,
+        )
+        .await
+        .map_err(debug_error)?;
+        require(
+            replacement.execution_profile_id != source.execution_profile_id
+                && replacement.credential_pool_id == source.credential_pool_id
+                && replacement.provider_account_id == source.provider_account_id
+                && replacement.resource_policy_id == source.resource_policy_id
+                && replacement.resource_policy_revision == source.resource_policy_revision,
+            "replacement did not preserve the immutable execution identity graph",
+        )?;
+        let loaded = PostgresExecutorSubmissionStore::new(database.pool.clone())
+            .load_execution_profile(&replacement_key)
+            .await
+            .map_err(debug_error)?;
+        require(
+            loaded.execution_profile_id == replacement.execution_profile_id
+                && loaded.adapter_revision == image_provider_grok_cli::VIDEO_ADAPTER_REVISION
+                && identify_executor_profile_binding(&loaded)
+                    == Ok(ExecutorProfileBinding::GrokVideoGeneration),
+            format!("replacement has the wrong video runtime binding: {loaded:?}"),
+        )?;
+
+        let replay = provision_grok_video_execution_profile_replacement(
+            &database.pool,
+            &provisioning.profile_key,
+            &replacement_key,
+        )
+        .await
+        .map_err(debug_error)?;
+        require(replay == replacement, "replacement provisioning was not idempotent")?;
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM provider_execution_profiles WHERE profile_key = ANY($1)",
+        )
+        .bind(vec![provisioning.profile_key.clone(), replacement_key.clone()])
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(count == 2, format!("replacement provisioning duplicated profiles: {count}"))?;
+
+        sqlx::query(
+            "UPDATE provider_execution_profiles SET state = 'disabled' WHERE execution_profile_id = $1",
+        )
+        .bind(replacement.execution_profile_id)
+        .execute(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        let disabled = provision_grok_video_execution_profile_replacement(
+            &database.pool,
+            &provisioning.profile_key,
+            &replacement_key,
+        )
+        .await;
+        require(
+            disabled == Err(CodexProfileProvisioningError::Conflict),
+            format!("disabled replacement was unexpectedly revived: {disabled:?}"),
         )
     }
     .await;

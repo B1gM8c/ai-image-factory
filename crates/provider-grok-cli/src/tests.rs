@@ -30,6 +30,14 @@ fn image_edit_descriptor_hash_is_stable() {
 }
 
 #[test]
+fn video_generation_descriptor_hash_is_stable() {
+    assert_eq!(
+        GROK_VIDEO_GENERATION_OPERATION_V1.canonical_sha256_v1_hex(),
+        "13d4f2db461ddddd1b8dbd8cd33df94556e3280453de83ea3de9ef60276cccd0"
+    );
+}
+
+#[test]
 fn capability_descriptors_expose_only_the_exact_cli_completion_model() {
     assert_eq!(GROK_IMAGE_GENERATION_OPERATION_V1.id, "images.generations");
     assert_eq!(GROK_IMAGE_EDIT_OPERATION_V1.id, "images.edits");
@@ -247,6 +255,37 @@ fn canonical_commands_are_strict_and_round_trip_the_cli_subset() {
 
 #[test]
 fn video_command_preserves_the_two_distinct_fixed_model_workflows() {
+    let text_source = XaiVideoGenerationCommandV1::from_request(XaiVideoGenerationRequest {
+        aspect_ratio: Some(OfficialVideoAspectRatio::R9x16),
+        duration: Some(6),
+        image: None,
+        model: Some("grok-imagine-video-1.5-preview".to_owned()),
+        output: None,
+        prompt: Some("a paper boat crossing a moonlit lake".to_owned()),
+        reference_images: Vec::new(),
+        resolution: Some(OfficialVideoResolution::P480),
+        storage_options: None,
+        user: None,
+    })
+    .unwrap();
+    let text_command = SingleOutputCommand::new(
+        OutputSlot::new(0, 1).unwrap(),
+        GrokVideoGenerationPayloadV1::from_xai_command(text_source, Vec::new()).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        parse_video_generation_command(text_command.canonical_payload()).unwrap(),
+        GrokVideoGenerationRequestV1::TextToVideo(
+            TextToVideoRequestV1::new(
+                "a paper boat crossing a moonlit lake",
+                VideoAspectRatio::R9x16,
+                VideoDuration::Seconds6,
+                VideoResolution::P480,
+            )
+            .unwrap()
+        )
+    );
+
     let source = XaiVideoGenerationCommandV1::from_request(XaiVideoGenerationRequest {
         aspect_ratio: None,
         duration: Some(10),
@@ -411,7 +450,7 @@ fn policy_separates_runtime_credentials_workspace_and_user_prompt() {
 }
 
 #[test]
-fn video_policy_enables_the_cli_zdr_output_binding() {
+fn image_to_video_policy_keeps_the_native_tool_enabled() {
     let fixture = PolicyFixture::new();
     let request = GrokVideoGenerationRequestV1::ImageToVideo(
         ImageToVideoRequestV1::new(
@@ -426,13 +465,15 @@ fn video_policy_enables_the_cli_zdr_output_binding() {
         .policy
         .command_spec_in(&request.into(), SESSION_ID, fixture.workspace.clone())
         .unwrap();
-    assert_eq!(
+    assert!(
         video_command
             .environment()
             .get(OsStr::new("GROK_DISABLE_ZDR_INCOMPATIBLE_TOOLS"))
-            .unwrap(),
-        OsStr::new("true")
+            .is_none()
     );
+    let prompt = std::str::from_utf8(video_command.stdin_bytes()).unwrap();
+    assert!(prompt.starts_with("Call the enabled `image_to_video` tool exactly once"));
+    assert!(!prompt.contains("Execute these enabled tool calls in order"));
 
     let fixture = PolicyFixture::new();
     let image_request =
@@ -447,6 +488,108 @@ fn video_policy_enables_the_cli_zdr_output_binding() {
             .environment()
             .get(OsStr::new("GROK_DISABLE_ZDR_INCOMPATIBLE_TOOLS"))
             .is_none()
+    );
+}
+
+#[test]
+fn text_video_policy_binds_the_exact_two_step_cli_workflow() {
+    let fixture = PolicyFixture::new();
+    let request = GrokVideoGenerationRequestV1::TextToVideo(
+        TextToVideoRequestV1::new(
+            "a paper boat crossing a moonlit lake",
+            VideoAspectRatio::R9x16,
+            VideoDuration::Seconds10,
+            VideoResolution::P720,
+        )
+        .unwrap(),
+    );
+    let (command, invocation) = fixture
+        .policy
+        .command_spec_in(&request.into(), SESSION_ID, fixture.workspace.clone())
+        .unwrap();
+
+    assert!(
+        command
+            .arguments()
+            .iter()
+            .any(|argument| argument == "image_gen,image_to_video")
+    );
+    assert!(command.arguments().iter().any(|argument| argument == "5"));
+    assert_eq!(
+        command
+            .environment()
+            .get(OsStr::new("GROK_IMAGE_GEN_MODEL_OVERRIDE"))
+            .unwrap(),
+        OsStr::new("grok-imagine-image")
+    );
+    let prompt = std::str::from_utf8(command.stdin_bytes()).unwrap();
+    assert!(prompt.starts_with("Execute these enabled tool calls in order"));
+    assert_eq!(invocation.expected_tool_calls().len(), 2);
+    assert_eq!(
+        invocation.expected_tool_calls()[0].tool(),
+        GrokTool::ImageGeneration
+    );
+    assert_eq!(
+        invocation.expected_tool_calls()[0].arguments(),
+        &json!({
+            "prompt": "a paper boat crossing a moonlit lake",
+            "aspect_ratio": "9:16"
+        })
+    );
+    assert_eq!(
+        invocation.expected_tool_calls()[1].tool(),
+        GrokTool::ImageToVideo
+    );
+    assert_eq!(
+        invocation.expected_tool_calls()[1].arguments(),
+        &json!({
+            "prompt": "a paper boat crossing a moonlit lake",
+            "image": invocation.expected_tool_calls()[0].artifact_path(),
+            "duration": 10,
+            "resolution_name": "720p"
+        })
+    );
+    assert!(
+        invocation.expected_tool_calls()[0]
+            .artifact_path()
+            .ends_with(PathBuf::from("images").join("1.jpg"))
+    );
+    assert!(
+        invocation
+            .artifact_path()
+            .ends_with(PathBuf::from("videos").join("1.mp4"))
+    );
+}
+
+#[test]
+fn text_video_receipt_requires_the_exact_two_step_sequence() {
+    let fixture = PolicyFixture::new();
+    let request = GrokVideoGenerationRequestV1::TextToVideo(
+        TextToVideoRequestV1::new(
+            "a paper boat crossing a moonlit lake",
+            VideoAspectRatio::R16x9,
+            VideoDuration::Seconds6,
+            VideoResolution::P480,
+        )
+        .unwrap(),
+    );
+    let (_, invocation) = fixture
+        .policy
+        .command_spec_in(&request.into(), SESSION_ID, fixture.workspace.clone())
+        .unwrap();
+    write_artifact(&invocation);
+    assert!(
+        parse_invocation_receipt(&valid_stdout(), &valid_history(&invocation), &invocation).is_ok()
+    );
+
+    let only_final = history_with(
+        &invocation,
+        invocation.expected_arguments().clone(),
+        invocation.artifact_path(),
+    );
+    assert_eq!(
+        parse_invocation_receipt(&valid_stdout(), &only_final, &invocation).unwrap_err(),
+        GrokReceiptError::UnexpectedToolCall
     );
 }
 
@@ -695,11 +838,38 @@ fn valid_stdout() -> Vec<u8> {
 }
 
 fn valid_history(invocation: &GrokInvocationV1) -> Vec<u8> {
-    history_with(
-        invocation,
-        invocation.expected_arguments().clone(),
-        invocation.artifact_path(),
-    )
+    let mut records = String::new();
+    for (index, expected) in invocation.expected_tool_calls().iter().enumerate() {
+        let call_id = format!("call-{}", index + 1);
+        let call = json!({
+            "type":"assistant",
+            "tool_calls":[{
+                "id":call_id,
+                "name":expected.tool().name(),
+                "arguments":serde_json::to_string(expected.arguments()).unwrap()
+            }]
+        });
+        let content = json!({
+            "path":expected.artifact_path(),
+            "filename":expected.artifact_path().file_name().unwrap().to_str().unwrap(),
+            "session_folder":expected
+                .artifact_path()
+                .parent()
+                .unwrap()
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "message":"saved"
+        });
+        let result = json!({
+            "type":"tool_result",
+            "tool_call_id":format!("call-{}", index + 1),
+            "content":serde_json::to_string(&content).unwrap()
+        });
+        records.push_str(&format!("{call}\n{result}\n"));
+    }
+    records.into_bytes()
 }
 
 fn history_with(

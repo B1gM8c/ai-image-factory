@@ -7,8 +7,9 @@ use crate::{
     ADAPTER_REVISION, GrokImageEditRequestV1, GrokImageGenerationRequestV1,
     GrokVideoGenerationRequestV1, ImageAspectRatio, ImageModel, ImageToVideoRequestV1,
     REQUEST_SCHEMA_VERSION, ReferenceToVideoRequestV1, RequestValidationError, StagedImageV1,
-    VideoAspectRatio, VideoDuration, VideoResolution, XaiGrokProjectionError,
-    XaiGrokVideoProjectionError, project_xai_image_generation, project_xai_video_generation,
+    TextToVideoRequestV1, VIDEO_ADAPTER_REVISION, VideoAspectRatio, VideoDuration, VideoResolution,
+    XaiGrokProjectionError, XaiGrokVideoProjectionError, project_xai_image_generation,
+    project_xai_video_generation,
 };
 
 pub const GROK_IMAGE_GENERATION_COMMAND_SCHEMA: &str = "grok-cli.images.generate.v1";
@@ -154,7 +155,7 @@ impl GrokVideoGenerationPayloadV1 {
 
 impl CanonicalCommandPayload for GrokVideoGenerationPayloadV1 {
     const SCHEMA_ID: &'static str = GROK_VIDEO_GENERATION_COMMAND_SCHEMA;
-    const ADAPTER_REVISION: &'static str = ADAPTER_REVISION;
+    const ADAPTER_REVISION: &'static str = VIDEO_ADAPTER_REVISION;
 
     fn source_command_sha256(&self) -> &str {
         &self.source_command_sha256
@@ -345,8 +346,19 @@ impl TryFrom<CanonicalImageEditV1> for GrokImageEditRequestV1 {
 #[derive(Deserialize, Serialize)]
 #[serde(tag = "workflow", deny_unknown_fields)]
 enum CanonicalVideoGenerationV1 {
+    #[serde(rename = "text_to_video")]
+    Text {
+        schema_version: u16,
+        source_command: XaiVideoGenerationCommandV1,
+        source_command_sha256: String,
+        model: String,
+        prompt: String,
+        aspect_ratio: String,
+        duration: u8,
+        resolution: String,
+    },
     #[serde(rename = "image_to_video")]
-    ImageToVideo {
+    Image {
         schema_version: u16,
         source_command: XaiVideoGenerationCommandV1,
         source_command_sha256: String,
@@ -357,7 +369,7 @@ enum CanonicalVideoGenerationV1 {
         resolution: String,
     },
     #[serde(rename = "reference_to_video")]
-    ReferenceToVideo {
+    Reference {
         schema_version: u16,
         source_command: XaiVideoGenerationCommandV1,
         source_command_sha256: String,
@@ -378,7 +390,17 @@ impl From<GrokVideoGenerationPayloadV1> for CanonicalVideoGenerationV1 {
             request,
         } = payload;
         match request {
-            GrokVideoGenerationRequestV1::ImageToVideo(request) => Self::ImageToVideo {
+            GrokVideoGenerationRequestV1::TextToVideo(request) => Self::Text {
+                schema_version: REQUEST_SCHEMA_VERSION,
+                source_command,
+                source_command_sha256,
+                model: "grok-imagine-video-1.5-preview".to_owned(),
+                prompt: request.prompt().to_owned(),
+                aspect_ratio: request.aspect_ratio().as_str().to_owned(),
+                duration: request.duration().seconds(),
+                resolution: request.resolution().as_str().to_owned(),
+            },
+            GrokVideoGenerationRequestV1::ImageToVideo(request) => Self::Image {
                 schema_version: REQUEST_SCHEMA_VERSION,
                 source_command,
                 source_command_sha256,
@@ -388,7 +410,7 @@ impl From<GrokVideoGenerationPayloadV1> for CanonicalVideoGenerationV1 {
                 duration: request.duration().seconds(),
                 resolution: request.resolution().as_str().to_owned(),
             },
-            GrokVideoGenerationRequestV1::ReferenceToVideo(request) => Self::ReferenceToVideo {
+            GrokVideoGenerationRequestV1::ReferenceToVideo(request) => Self::Reference {
                 schema_version: REQUEST_SCHEMA_VERSION,
                 source_command,
                 source_command_sha256,
@@ -408,7 +430,29 @@ impl TryFrom<CanonicalVideoGenerationV1> for GrokVideoGenerationRequestV1 {
 
     fn try_from(value: CanonicalVideoGenerationV1) -> Result<Self, Self::Error> {
         match value {
-            CanonicalVideoGenerationV1::ImageToVideo {
+            CanonicalVideoGenerationV1::Text {
+                schema_version,
+                source_command: _,
+                source_command_sha256: _,
+                model,
+                prompt,
+                aspect_ratio,
+                duration,
+                resolution,
+            } => {
+                validate_schema(schema_version)?;
+                if model != "grok-imagine-video-1.5-preview" {
+                    return Err(GrokCommandError::UnsupportedCliOption);
+                }
+                Ok(TextToVideoRequestV1::new(
+                    prompt,
+                    parse_video_ratio(&aspect_ratio)?,
+                    parse_video_duration(duration)?,
+                    parse_video_resolution(&resolution)?,
+                )?
+                .into())
+            }
+            CanonicalVideoGenerationV1::Image {
                 schema_version,
                 source_command: _,
                 source_command_sha256: _,
@@ -430,7 +474,7 @@ impl TryFrom<CanonicalVideoGenerationV1> for GrokVideoGenerationRequestV1 {
                 )?
                 .into())
             }
-            CanonicalVideoGenerationV1::ReferenceToVideo {
+            CanonicalVideoGenerationV1::Reference {
                 schema_version,
                 source_command: _,
                 source_command_sha256: _,
@@ -461,18 +505,23 @@ impl TryFrom<CanonicalVideoGenerationV1> for GrokVideoGenerationRequestV1 {
 impl CanonicalVideoGenerationV1 {
     fn source_command(&self) -> &XaiVideoGenerationCommandV1 {
         match self {
-            Self::ImageToVideo { source_command, .. }
-            | Self::ReferenceToVideo { source_command, .. } => source_command,
+            Self::Text { source_command, .. }
+            | Self::Image { source_command, .. }
+            | Self::Reference { source_command, .. } => source_command,
         }
     }
 
     fn source_command_sha256(&self) -> &str {
         match self {
-            Self::ImageToVideo {
+            Self::Text {
                 source_command_sha256,
                 ..
             }
-            | Self::ReferenceToVideo {
+            | Self::Image {
+                source_command_sha256,
+                ..
+            }
+            | Self::Reference {
                 source_command_sha256,
                 ..
             } => source_command_sha256,
@@ -481,8 +530,9 @@ impl CanonicalVideoGenerationV1 {
 
     fn staged_images(&self) -> Result<Vec<StagedImageV1>, GrokCommandError> {
         match self {
-            Self::ImageToVideo { image, .. } => Ok(vec![StagedImageV1::try_from(image.clone())?]),
-            Self::ReferenceToVideo { images, .. } => images
+            Self::Text { .. } => Ok(Vec::new()),
+            Self::Image { image, .. } => Ok(vec![StagedImageV1::try_from(image.clone())?]),
+            Self::Reference { images, .. } => images
                 .iter()
                 .cloned()
                 .map(TryInto::try_into)

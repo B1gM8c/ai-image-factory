@@ -69,11 +69,31 @@ impl GrokTool {
 #[derive(Clone, Debug)]
 pub struct GrokInvocationV1 {
     session_id: String,
-    tool: GrokTool,
-    expected_arguments: Value,
+    expected_tool_calls: Vec<GrokExpectedToolCallV1>,
     session_directory: std::path::PathBuf,
     history_path: std::path::PathBuf,
     artifact_path: std::path::PathBuf,
+}
+
+#[derive(Clone, Debug)]
+pub struct GrokExpectedToolCallV1 {
+    tool: GrokTool,
+    arguments: Value,
+    artifact_path: std::path::PathBuf,
+}
+
+impl GrokExpectedToolCallV1 {
+    pub fn tool(&self) -> GrokTool {
+        self.tool
+    }
+
+    pub fn arguments(&self) -> &Value {
+        &self.arguments
+    }
+
+    pub fn artifact_path(&self) -> &Path {
+        &self.artifact_path
+    }
 }
 
 impl GrokInvocationV1 {
@@ -82,11 +102,22 @@ impl GrokInvocationV1 {
     }
 
     pub fn tool(&self) -> GrokTool {
-        self.tool
+        self.expected_tool_calls
+            .last()
+            .expect("Grok invocation has at least one tool call")
+            .tool
     }
 
     pub fn expected_arguments(&self) -> &Value {
-        &self.expected_arguments
+        &self
+            .expected_tool_calls
+            .last()
+            .expect("Grok invocation has at least one tool call")
+            .arguments
+    }
+
+    pub fn expected_tool_calls(&self) -> &[GrokExpectedToolCallV1] {
+        &self.expected_tool_calls
     }
 
     pub fn session_directory(&self) -> &Path {
@@ -160,7 +191,18 @@ impl GrokCliPolicyV1 {
             return Err(GrokCliPolicyError::SessionAlreadyExists);
         }
 
-        let prompt = dispatch_prompt(invocation.tool, &invocation.expected_arguments)?;
+        let prompt = dispatch_prompt(invocation.expected_tool_calls())?;
+        let enabled_tools = invocation
+            .expected_tool_calls()
+            .iter()
+            .map(|call| call.tool().name())
+            .collect::<Vec<_>>()
+            .join(",");
+        let max_turns = if invocation.expected_tool_calls().len() == 1 {
+            "3"
+        } else {
+            "5"
+        };
         let mut command = CommandSpec::new_receipt(
             self.executable.clone(),
             workspace.clone(),
@@ -182,9 +224,9 @@ impl GrokCliPolicyV1 {
         .arg("--disable-web-search")?
         .arg("--always-approve")?
         .arg("--tools")?
-        .arg(invocation.tool.name())?
+        .arg(enabled_tools)?
         .arg("--max-turns")?
-        .arg("3")?
+        .arg(max_turns)?
         .arg("--no-wait-for-background")?
         .arg("--session-id")?
         .arg(session_id)?
@@ -196,8 +238,11 @@ impl GrokCliPolicyV1 {
 
         if let GrokCliRequestV1::ImageGeneration(request) = request {
             command = command.env("GROK_IMAGE_GEN_MODEL_OVERRIDE", request.model().as_str())?;
-        } else if matches!(request, GrokCliRequestV1::VideoGeneration(_)) {
-            command = command.env("GROK_DISABLE_ZDR_INCOMPATIBLE_TOOLS", "true")?;
+        } else if matches!(
+            request,
+            GrokCliRequestV1::VideoGeneration(GrokVideoGenerationRequestV1::TextToVideo(_))
+        ) {
+            command = command.env("GROK_IMAGE_GEN_MODEL_OVERRIDE", "grok-imagine-image")?;
         }
         Ok((command, invocation))
     }
@@ -268,54 +313,84 @@ fn build_invocation(
         return Err(GrokCliPolicyError::LongWorkspacePathUnsupported);
     }
 
-    let (tool, expected_arguments) = expected_tool_call(request, workspace);
     let session_directory = grok_home
         .join("sessions")
         .join(encoded_workspace.as_ref())
         .join(session_id);
+    let expected_tool_calls = expected_tool_calls(request, workspace, &session_directory);
+    let final_tool = expected_tool_calls
+        .last()
+        .expect("every Grok request has at least one tool call")
+        .tool;
     let artifact_path = session_directory
-        .join(tool.artifact_folder())
-        .join(tool.artifact_filename());
+        .join(final_tool.artifact_folder())
+        .join(final_tool.artifact_filename());
     let history_path = session_directory.join("chat_history.jsonl");
     Ok(GrokInvocationV1 {
         session_id: session_id.to_owned(),
-        tool,
-        expected_arguments,
+        expected_tool_calls,
         session_directory,
         history_path,
         artifact_path,
     })
 }
 
-fn expected_tool_call(request: &GrokCliRequestV1, workspace: &Path) -> (GrokTool, Value) {
-    match request {
-        GrokCliRequestV1::ImageGeneration(request) => (
+fn expected_tool_calls(
+    request: &GrokCliRequestV1,
+    workspace: &Path,
+    session_directory: &Path,
+) -> Vec<GrokExpectedToolCallV1> {
+    let calls = match request {
+        GrokCliRequestV1::ImageGeneration(request) => vec![(
             GrokTool::ImageGeneration,
             json!({
                 "prompt": request.prompt(),
                 "aspect_ratio": request.aspect_ratio().as_str(),
             }),
-        ),
-        GrokCliRequestV1::ImageEdit(request) => (
+        )],
+        GrokCliRequestV1::ImageEdit(request) => vec![(
             GrokTool::ImageEdit,
             json!({
                 "prompt": request.prompt(),
                 "image": absolute_image_paths(workspace, request.images()),
                 "aspect_ratio": request.aspect_ratio().as_str(),
             }),
-        ),
-        GrokCliRequestV1::VideoGeneration(GrokVideoGenerationRequestV1::ImageToVideo(request)) => (
-            GrokTool::ImageToVideo,
-            json!({
-                "prompt": request.prompt(),
-                "image": workspace.join(request.image().filename()),
-                "duration": request.duration().seconds(),
-                "resolution_name": request.resolution().as_str(),
-            }),
-        ),
+        )],
+        GrokCliRequestV1::VideoGeneration(GrokVideoGenerationRequestV1::TextToVideo(request)) => {
+            let source_image = session_directory.join("images").join("1.jpg");
+            vec![
+                (
+                    GrokTool::ImageGeneration,
+                    json!({
+                        "prompt": request.prompt(),
+                        "aspect_ratio": request.aspect_ratio().as_str(),
+                    }),
+                ),
+                (
+                    GrokTool::ImageToVideo,
+                    json!({
+                        "prompt": request.prompt(),
+                        "image": source_image,
+                        "duration": request.duration().seconds(),
+                        "resolution_name": request.resolution().as_str(),
+                    }),
+                ),
+            ]
+        }
+        GrokCliRequestV1::VideoGeneration(GrokVideoGenerationRequestV1::ImageToVideo(request)) => {
+            vec![(
+                GrokTool::ImageToVideo,
+                json!({
+                    "prompt": request.prompt(),
+                    "image": workspace.join(request.image().filename()),
+                    "duration": request.duration().seconds(),
+                    "resolution_name": request.resolution().as_str(),
+                }),
+            )]
+        }
         GrokCliRequestV1::VideoGeneration(GrokVideoGenerationRequestV1::ReferenceToVideo(
             request,
-        )) => (
+        )) => vec![(
             GrokTool::ReferenceToVideo,
             json!({
                 "prompt": request.prompt(),
@@ -324,8 +399,18 @@ fn expected_tool_call(request: &GrokCliRequestV1, workspace: &Path) -> (GrokTool
                 "duration": request.duration().seconds(),
                 "resolution_name": request.resolution().as_str(),
             }),
-        ),
-    }
+        )],
+    };
+    calls
+        .into_iter()
+        .map(|(tool, arguments)| GrokExpectedToolCallV1 {
+            tool,
+            arguments,
+            artifact_path: session_directory
+                .join(tool.artifact_folder())
+                .join(tool.artifact_filename()),
+        })
+        .collect()
 }
 
 fn absolute_image_paths(
@@ -338,12 +423,30 @@ fn absolute_image_paths(
         .collect()
 }
 
-fn dispatch_prompt(tool: GrokTool, arguments: &Value) -> Result<String, GrokCliPolicyError> {
-    let arguments =
-        serde_json::to_string(arguments).map_err(|_| GrokCliPolicyError::PromptSerialization)?;
+fn dispatch_prompt(calls: &[GrokExpectedToolCallV1]) -> Result<String, GrokCliPolicyError> {
+    if let [call] = calls {
+        let arguments = serde_json::to_string(call.arguments())
+            .map_err(|_| GrokCliPolicyError::PromptSerialization)?;
+        return Ok(format!(
+            "Call the enabled `{}` tool exactly once with exactly this JSON object as its arguments:\n{}\nDo not call any other tool. After the tool result, end immediately.",
+            call.tool().name(),
+            arguments
+        ));
+    }
+
+    let mut steps = Vec::with_capacity(calls.len());
+    for (index, call) in calls.iter().enumerate() {
+        let arguments = serde_json::to_string(call.arguments())
+            .map_err(|_| GrokCliPolicyError::PromptSerialization)?;
+        steps.push(format!(
+            "{}. Call `{}` exactly once with exactly this JSON object as its arguments:\n{}",
+            index + 1,
+            call.tool().name(),
+            arguments
+        ));
+    }
     Ok(format!(
-        "Call the enabled `{}` tool exactly once with exactly this JSON object as its arguments:\n{}\nDo not call any other tool. After the tool result, end immediately.",
-        tool.name(),
-        arguments
+        "Execute these enabled tool calls in order. Wait for each result before starting the next call. Do not call any other tool and do not change any argument:\n{}\nAfter the final tool result, end immediately.",
+        steps.join("\n")
     ))
 }

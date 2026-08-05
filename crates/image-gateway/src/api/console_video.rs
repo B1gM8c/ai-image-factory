@@ -45,6 +45,7 @@ struct ConsoleVideoModel {
     media_kind: String,
     operation: String,
     created: i64,
+    modes: &'static [&'static str],
     controls: ConsoleVideoControls,
 }
 
@@ -61,12 +62,14 @@ struct ConsoleVideoControls {
 struct ConsoleFirstFrameControl {
     supported: bool,
     required: bool,
+    required_for: &'static [&'static str],
 }
 
 #[derive(Serialize)]
 struct ConsoleChoiceControl {
     default: &'static str,
     options: &'static [&'static str],
+    supported_for: &'static [&'static str],
 }
 
 #[derive(Serialize)]
@@ -323,6 +326,7 @@ fn prefer_official_dreamina_aliases(models: Vec<PublicModelRoute>) -> Vec<Public
 
 fn console_video_model(model: PublicModelRoute) -> Option<ConsoleVideoModel> {
     let controls = console_video_controls(&model.api_profile, model.provider_model_id.as_deref())?;
+    let modes = console_video_modes(&model.api_profile, model.provider_model_id.as_deref())?;
     Some(ConsoleVideoModel {
         id: model.id,
         provider: model.provider_id,
@@ -330,8 +334,25 @@ fn console_video_model(model: PublicModelRoute) -> Option<ConsoleVideoModel> {
         media_kind: model.media_kind,
         operation: model.operation_id,
         created: model.created_at_ms.div_euclid(1_000),
+        modes,
         controls,
     })
+}
+
+fn console_video_modes(
+    api_profile: &str,
+    provider_model_id: Option<&str>,
+) -> Option<&'static [&'static str]> {
+    if api_profile == XAI_VIDEOS_API_PROFILE
+        && provider_model_id == Some("grok-imagine-video-1.5-preview")
+    {
+        return Some(&["text_to_video", "image_to_video"]);
+    }
+    matches!(
+        api_profile,
+        DREAMINA_VIDEOS_API_PROFILE | ARK_CONTENT_GENERATION_API_PROFILE
+    )
+    .then_some(&["text_to_video"] as &'static [&'static str])
 }
 
 fn console_video_controls(
@@ -345,7 +366,11 @@ fn console_video_controls(
             return None;
         }
         return Some(ConsoleVideoControls {
-            aspect_ratio: None,
+            aspect_ratio: Some(ConsoleChoiceControl {
+                default: "16:9",
+                options: &["1:1", "16:9", "9:16", "3:2", "2:3"],
+                supported_for: &["text_to_video"],
+            }),
             duration: ConsoleNumericChoiceControl {
                 default: 6,
                 options: &[6, 10],
@@ -353,10 +378,12 @@ fn console_video_controls(
             resolution: ConsoleChoiceControl {
                 default: "480p",
                 options: &["480p", "720p"],
+                supported_for: &["text_to_video", "image_to_video"],
             },
             first_frame: ConsoleFirstFrameControl {
                 supported: true,
-                required: true,
+                required: false,
+                required_for: &["image_to_video"],
             },
         });
     }
@@ -383,6 +410,7 @@ fn console_video_controls(
         aspect_ratio: Some(ConsoleChoiceControl {
             default: "16:9",
             options: DREAMINA_RATIOS,
+            supported_for: &["text_to_video"],
         }),
         duration: ConsoleNumericChoiceControl {
             default: 5,
@@ -391,10 +419,12 @@ fn console_video_controls(
         resolution: ConsoleChoiceControl {
             default: "720p",
             options: resolutions,
+            supported_for: &["text_to_video"],
         },
         first_frame: ConsoleFirstFrameControl {
             supported: false,
             required: false,
+            required_for: &[],
         },
     })
 }
@@ -424,8 +454,26 @@ fn console_video_request(
             "invalid_value",
         ));
     }
+    let mode = if request.image.is_some() {
+        "image_to_video"
+    } else {
+        "text_to_video"
+    };
+    let modes = console_video_modes(&resolved.api_profile, Some(&resolved.provider_model_id))
+        .ok_or_else(|| {
+            ImageGatewayError::unsupported(
+                "model",
+                "model is not supported by the console video workflow",
+            )
+        })?;
+    if !modes.contains(&mode) {
+        return Err(ImageGatewayError::unsupported(
+            "image",
+            "video workflow is not supported by this model",
+        ));
+    }
     let aspect_ratio = match controls.aspect_ratio.as_ref() {
-        Some(control) => {
+        Some(control) if control.supported_for.contains(&mode) => {
             let value = request
                 .aspect_ratio
                 .unwrap_or_else(|| control.default.to_owned());
@@ -438,6 +486,14 @@ fn console_video_request(
             }
             Some(value)
         }
+        Some(_) if request.aspect_ratio.is_some() => {
+            return Err(ImageGatewayError::invalid_request(
+                "aspect_ratio is not supported by this video workflow",
+                Some("aspect_ratio".to_owned()),
+                "invalid_value",
+            ));
+        }
+        Some(_) => None,
         None if request.aspect_ratio.is_some() => {
             return Err(ImageGatewayError::invalid_request(
                 "aspect_ratio is not supported by this model",
@@ -465,13 +521,6 @@ fn console_video_request(
             "invalid_request",
         ));
     }
-    if request.image.is_none() && controls.first_frame.required {
-        return Err(ImageGatewayError::invalid_request(
-            "image is required by this model",
-            Some("image".to_owned()),
-            "missing_required_parameter",
-        ));
-    }
     if request.image.is_some() && !controls.first_frame.supported {
         return Err(ImageGatewayError::unsupported(
             "image",
@@ -481,7 +530,14 @@ fn console_video_request(
     match resolved.api_profile.as_str() {
         XAI_VIDEOS_API_PROFILE => Ok(ConsoleVideoDispatchRequest::Xai(
             XaiVideoGenerationRequest {
-                aspect_ratio: None,
+                aspect_ratio: aspect_ratio.map(|value| match value.as_str() {
+                    "1:1" => image_api_contracts::xai::XaiVideoAspectRatio::R1x1,
+                    "16:9" => image_api_contracts::xai::XaiVideoAspectRatio::R16x9,
+                    "9:16" => image_api_contracts::xai::XaiVideoAspectRatio::R9x16,
+                    "3:2" => image_api_contracts::xai::XaiVideoAspectRatio::R3x2,
+                    "2:3" => image_api_contracts::xai::XaiVideoAspectRatio::R2x3,
+                    _ => unreachable!("validated console video aspect ratio"),
+                }),
                 duration: Some(duration),
                 image: request.image.map(|url| XaiVideoImageUrl {
                     file_id: None,
@@ -702,6 +758,64 @@ mod tests {
                 .and_then(|image| image.url.as_deref()),
             Some("data:image/png;base64,AA==")
         );
+    }
+
+    #[test]
+    fn console_video_request_projects_grok_text_workflow_without_a_first_frame() {
+        let request = ConsoleVideoGenerationRequest {
+            model: "public-video".to_owned(),
+            prompt: "a paper boat crossing a moonlit lake".to_owned(),
+            duration: Some(6),
+            aspect_ratio: Some("9:16".to_owned()),
+            resolution: Some("480p".to_owned()),
+            image: None,
+        };
+        let ConsoleVideoDispatchRequest::Xai(projected) =
+            console_video_request(request, &resolved_route(XAI_VIDEOS_API_PROFILE)).unwrap()
+        else {
+            panic!("xAI request was dispatched to the wrong adapter");
+        };
+        assert_eq!(
+            projected.aspect_ratio,
+            Some(image_api_contracts::xai::XaiVideoAspectRatio::R9x16)
+        );
+        assert!(projected.image.is_none());
+    }
+
+    #[test]
+    fn grok_catalog_exposes_only_real_mode_specific_controls() {
+        assert_eq!(
+            console_video_modes(
+                XAI_VIDEOS_API_PROFILE,
+                Some("grok-imagine-video-1.5-preview")
+            ),
+            Some(&["text_to_video", "image_to_video"][..])
+        );
+        let controls = console_video_controls(
+            XAI_VIDEOS_API_PROFILE,
+            Some("grok-imagine-video-1.5-preview"),
+        )
+        .unwrap();
+        assert_eq!(controls.duration.options, &[6, 10]);
+        assert_eq!(controls.resolution.options, &["480p", "720p"]);
+        assert_eq!(controls.first_frame.required_for, &["image_to_video"]);
+        assert_eq!(
+            controls.aspect_ratio.unwrap().supported_for,
+            &["text_to_video"]
+        );
+    }
+
+    #[test]
+    fn grok_image_workflow_rejects_text_only_aspect_ratio() {
+        let request = ConsoleVideoGenerationRequest {
+            model: "public-video".to_owned(),
+            prompt: "slow camera push".to_owned(),
+            duration: Some(6),
+            aspect_ratio: Some("16:9".to_owned()),
+            resolution: Some("480p".to_owned()),
+            image: Some("data:image/png;base64,AA==".to_owned()),
+        };
+        assert!(console_video_request(request, &resolved_route(XAI_VIDEOS_API_PROFILE)).is_err());
     }
 
     #[test]

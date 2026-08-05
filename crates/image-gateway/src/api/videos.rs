@@ -226,7 +226,10 @@ fn video_pricing_dimensions(
             enum_or_integer_wire_value(command.resolution)?,
         ),
     ]);
-    if plan.provider_model() == "grok-imagine-video" {
+    if matches!(
+        command.workflow(),
+        XaiVideoWorkflow::TextToVideo | XaiVideoWorkflow::ReferenceToVideo
+    ) {
         dimensions.insert(
             "aspect_ratio".to_owned(),
             enum_or_integer_wire_value(
@@ -674,7 +677,11 @@ fn video_not_found(param: &str) -> ImageGatewayError {
 
 #[cfg(test)]
 mod tests {
-    use image_api_contracts::xai::XaiVideoRequestError;
+    use image_api_contracts::xai::{
+        XaiVideoAspectRatio, XaiVideoImageUrl, XaiVideoRequestError, XaiVideoResolution,
+    };
+
+    use crate::admission::XaiVideoAdmissionPlan;
 
     use super::*;
 
@@ -731,5 +738,84 @@ mod tests {
         let error = admission_error(AdmissionError::BillingLimitExceeded);
         assert_eq!(error.status_code(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(error.error_code(), Some("billing_limit_exceeded"));
+    }
+
+    #[test]
+    fn grok_text_video_pricing_keeps_aspect_ratio_for_preview_model() {
+        let plan = XaiVideoAdmissionPlan::for_grok_cli(
+            XaiVideoGenerationRequest {
+                aspect_ratio: Some(XaiVideoAspectRatio::R16x9),
+                duration: Some(6),
+                image: None,
+                model: Some("grok-imagine-video-1.5-preview".to_owned()),
+                output: None,
+                prompt: Some("a sunrise over the ocean".to_owned()),
+                reference_images: Vec::new(),
+                resolution: Some(XaiVideoResolution::P480),
+                storage_options: None,
+                user: None,
+            },
+            Vec::new(),
+        )
+        .expect("valid Grok text-to-video plan");
+
+        assert_eq!(
+            video_pricing_dimensions(&plan).expect("pricing dimensions"),
+            BTreeMap::from([
+                ("aspect_ratio".to_owned(), "16:9".to_owned()),
+                ("duration".to_owned(), "6".to_owned()),
+                ("input_image_count".to_owned(), "0".to_owned()),
+                ("resolution".to_owned(), "480p".to_owned()),
+            ])
+        );
+    }
+
+    #[test]
+    fn grok_image_video_pricing_omits_forbidden_aspect_ratio() {
+        let session_id = Uuid::new_v4();
+        let plan = XaiVideoAdmissionPlan::for_grok_cli(
+            XaiVideoGenerationRequest {
+                aspect_ratio: None,
+                duration: Some(10),
+                image: Some(XaiVideoImageUrl {
+                    file_id: None,
+                    url: Some("data:image/png;base64,AA==".to_owned()),
+                }),
+                model: Some("grok-imagine-video-1.5-preview".to_owned()),
+                output: None,
+                prompt: Some("the camera slowly moves forward".to_owned()),
+                reference_images: Vec::new(),
+                resolution: Some(XaiVideoResolution::P720),
+                storage_options: None,
+                user: None,
+            },
+            vec![
+                XaiVideoAdmissionInput::new(
+                    "input.png",
+                    InputBlobRef {
+                        key: InputBlobKey {
+                            admission_session_id: session_id,
+                            input_id: Uuid::new_v4(),
+                        },
+                        storage_backend: "test".to_owned(),
+                        object_key: "input.png".to_owned(),
+                        sha256_hex: "a".repeat(64),
+                        byte_size: 1,
+                    },
+                    "image/png",
+                )
+                .expect("valid staged first frame"),
+            ],
+        )
+        .expect("valid Grok image-to-video plan");
+
+        assert_eq!(
+            video_pricing_dimensions(&plan).expect("pricing dimensions"),
+            BTreeMap::from([
+                ("duration".to_owned(), "10".to_owned()),
+                ("input_image_count".to_owned(), "1".to_owned()),
+                ("resolution".to_owned(), "720p".to_owned()),
+            ])
+        );
     }
 }

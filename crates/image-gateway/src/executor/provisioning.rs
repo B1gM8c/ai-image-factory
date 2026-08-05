@@ -9,6 +9,7 @@ use image_provider_grok_cli::{
     GROK_IMAGE_EDIT_OPERATION_V1, GROK_IMAGE_GENERATION_COMMAND_SCHEMA,
     GROK_IMAGE_GENERATION_OPERATION_V1, GROK_VIDEO_GENERATION_COMMAND_SCHEMA,
     GROK_VIDEO_GENERATION_OPERATION_V1, PROVIDER_ID as GROK_PROVIDER_ID,
+    VIDEO_ADAPTER_REVISION as GROK_VIDEO_ADAPTER_REVISION,
 };
 use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
@@ -227,7 +228,7 @@ pub async fn provision_grok_video_execution_profile(
             provider_id: GROK_PROVIDER_ID,
             command_schema: GROK_VIDEO_GENERATION_COMMAND_SCHEMA,
             operation: &GROK_VIDEO_GENERATION_OPERATION_V1,
-            adapter_revision: GROK_ADAPTER_REVISION,
+            adapter_revision: GROK_VIDEO_ADAPTER_REVISION,
             advisory_lock_key: "factoryctl.provision-grok-video-profile",
         },
     )
@@ -245,11 +246,174 @@ pub async fn provision_grok_video_execution_profile_in_transaction(
             provider_id: GROK_PROVIDER_ID,
             command_schema: GROK_VIDEO_GENERATION_COMMAND_SCHEMA,
             operation: &GROK_VIDEO_GENERATION_OPERATION_V1,
-            adapter_revision: GROK_ADAPTER_REVISION,
+            adapter_revision: GROK_VIDEO_ADAPTER_REVISION,
             advisory_lock_key: "factoryctl.provision-grok-video-profile",
         },
     )
     .await
+}
+
+pub async fn provision_grok_video_execution_profile_replacement(
+    pool: &PgPool,
+    source_profile_key: &str,
+    replacement_profile_key: &str,
+) -> Result<ProvisionedGrokExecutionProfile, GrokProfileProvisioningError> {
+    if !valid_key(source_profile_key)
+        || !valid_key(replacement_profile_key)
+        || source_profile_key == replacement_profile_key
+    {
+        return Err(GrokProfileProvisioningError::InvalidInput);
+    }
+
+    let binding = ProvisioningBinding {
+        provider_id: GROK_PROVIDER_ID,
+        command_schema: GROK_VIDEO_GENERATION_COMMAND_SCHEMA,
+        operation: &GROK_VIDEO_GENERATION_OPERATION_V1,
+        adapter_revision: GROK_VIDEO_ADAPTER_REVISION,
+        advisory_lock_key: "factoryctl.provision-grok-video-profile-replacement",
+    };
+    let mut tx = pool.begin().await.map_err(map_sql_error)?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(binding.advisory_lock_key)
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sql_error)?;
+
+    let source: Option<ExecutionProfileRow> = sqlx::query_as(
+        r#"
+        SELECT profile.execution_profile_id, profile.provider_id,
+               profile.command_schema, profile.operation_id,
+               profile.operation_descriptor_revision,
+               profile.operation_descriptor_sha256_v1,
+               profile.completion_mode, profile.idempotency_mode,
+               profile.adapter_revision, profile.credential_pool_id,
+               profile.provider_account_id, profile.credential_ref,
+               profile.credential_revision, profile.resource_policy_id,
+               profile.resource_policy_revision, profile.state
+        FROM provider_execution_profiles profile
+        JOIN provider_credential_pools pool
+          ON pool.credential_pool_id = profile.credential_pool_id
+         AND pool.state = 'enabled'
+        JOIN provider_accounts account
+          ON account.provider_account_id = profile.provider_account_id
+         AND account.credential_pool_id = profile.credential_pool_id
+         AND account.provider_id = profile.provider_id
+         AND account.state = 'enabled'
+        JOIN executor_resource_policies policy
+          ON policy.resource_policy_id = profile.resource_policy_id
+         AND policy.revision = profile.resource_policy_revision
+         AND policy.credential_pool_id = profile.credential_pool_id
+         AND policy.provider_account_id = profile.provider_account_id
+         AND policy.provider_id = profile.provider_id
+         AND policy.state = 'enabled'
+        WHERE profile.profile_key = $1
+        FOR UPDATE OF profile, pool, account, policy
+        "#,
+    )
+    .bind(source_profile_key)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(map_sql_error)?;
+    let source = source.ok_or(GrokProfileProvisioningError::Conflict)?;
+    let operation = binding.operation;
+    let operation_descriptor_sha256_v1 = operation.canonical_sha256_v1_hex();
+    if source.provider_id != binding.provider_id
+        || source.command_schema != binding.command_schema
+        || source.operation_id != operation.id
+        || source.state != "enabled"
+        || (source.operation_descriptor_revision == operation.descriptor_revision
+            && source.operation_descriptor_sha256_v1 == operation_descriptor_sha256_v1
+            && source.completion_mode == operation.completion.as_str()
+            && source.idempotency_mode == operation.idempotency.as_str()
+            && source.adapter_revision == binding.adapter_revision)
+    {
+        return Err(GrokProfileProvisioningError::Conflict);
+    }
+
+    let existing: Option<ExecutionProfileRow> = sqlx::query_as(
+        r#"
+        SELECT execution_profile_id, provider_id, command_schema, operation_id,
+               operation_descriptor_revision, operation_descriptor_sha256_v1,
+               completion_mode, idempotency_mode, adapter_revision,
+               credential_pool_id, provider_account_id, credential_ref,
+               credential_revision, resource_policy_id,
+               resource_policy_revision, state
+        FROM provider_execution_profiles
+        WHERE profile_key = $1
+        FOR UPDATE
+        "#,
+    )
+    .bind(replacement_profile_key)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(map_sql_error)?;
+    let execution_profile_id = if let Some(existing) = existing {
+        if existing.provider_id != binding.provider_id
+            || existing.command_schema != binding.command_schema
+            || existing.operation_id != operation.id
+            || existing.operation_descriptor_revision != operation.descriptor_revision
+            || existing.operation_descriptor_sha256_v1 != operation_descriptor_sha256_v1
+            || existing.completion_mode != operation.completion.as_str()
+            || existing.idempotency_mode != operation.idempotency.as_str()
+            || existing.adapter_revision != binding.adapter_revision
+            || existing.credential_pool_id != source.credential_pool_id
+            || existing.provider_account_id != source.provider_account_id
+            || existing.credential_ref != source.credential_ref
+            || existing.credential_revision != source.credential_revision
+            || existing.resource_policy_id != source.resource_policy_id
+            || existing.resource_policy_revision != source.resource_policy_revision
+            || existing.state != "enabled"
+        {
+            return Err(GrokProfileProvisioningError::Conflict);
+        }
+        existing.execution_profile_id
+    } else {
+        let execution_profile_id = Uuid::new_v4();
+        let now = database_now(&mut tx).await?;
+        sqlx::query(
+            r#"
+            INSERT INTO provider_execution_profiles
+              (execution_profile_id, profile_key, provider_id, command_schema,
+               operation_id, operation_descriptor_revision,
+               operation_descriptor_sha256_v1, completion_mode, idempotency_mode,
+               adapter_revision, credential_pool_id, provider_account_id,
+               credential_ref, credential_revision, resource_policy_id,
+               resource_policy_revision, state, created_at_ms, updated_at_ms)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+                    $13, $14, $15, $16, 'enabled', $17, $17)
+            "#,
+        )
+        .bind(execution_profile_id)
+        .bind(replacement_profile_key)
+        .bind(binding.provider_id)
+        .bind(binding.command_schema)
+        .bind(operation.id)
+        .bind(operation.descriptor_revision)
+        .bind(&operation_descriptor_sha256_v1)
+        .bind(operation.completion.as_str())
+        .bind(operation.idempotency.as_str())
+        .bind(binding.adapter_revision)
+        .bind(source.credential_pool_id)
+        .bind(source.provider_account_id)
+        .bind(&source.credential_ref)
+        .bind(source.credential_revision)
+        .bind(source.resource_policy_id)
+        .bind(source.resource_policy_revision)
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sql_error)?;
+        execution_profile_id
+    };
+
+    tx.commit().await.map_err(map_sql_error)?;
+    Ok(ProvisionedGrokExecutionProfile {
+        execution_profile_id,
+        credential_pool_id: source.credential_pool_id,
+        provider_account_id: source.provider_account_id,
+        resource_policy_id: source.resource_policy_id,
+        resource_policy_revision: source.resource_policy_revision,
+    })
 }
 
 pub async fn provision_dreamina_execution_profile(

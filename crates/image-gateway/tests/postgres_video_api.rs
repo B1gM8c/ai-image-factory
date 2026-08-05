@@ -28,7 +28,7 @@ use gpt_image_2_gateway::{
 };
 use image::{ImageBuffer, ImageFormat, Rgba};
 use image_provider_grok_cli::{
-    ADAPTER_REVISION, GROK_VIDEO_GENERATION_COMMAND_SCHEMA, PROVIDER_ID,
+    GROK_VIDEO_GENERATION_COMMAND_SCHEMA, PROVIDER_ID, VIDEO_ADAPTER_REVISION,
 };
 use serde_json::{Value, json};
 use sqlx::{AssertSqlSafe, PgPool};
@@ -201,7 +201,7 @@ async fn xai_video_api_runs_one_tenant_scoped_billed_mp4_job_end_to_end() -> Tes
                     execution_profile_id: profile.execution_profile_id,
                     provider_id: PROVIDER_ID.to_owned(),
                     command_schema: GROK_VIDEO_GENERATION_COMMAND_SCHEMA.to_owned(),
-                    adapter_revision: ADAPTER_REVISION.to_owned(),
+                    adapter_revision: VIDEO_ADAPTER_REVISION.to_owned(),
                 },
                 "video-e2e-executor",
                 60_000,

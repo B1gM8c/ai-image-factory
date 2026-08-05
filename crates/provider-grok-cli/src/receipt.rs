@@ -4,7 +4,7 @@ use image_provider_contracts::{ProviderCostEvidenceScope, ProviderReportedCostEv
 use serde_json::{Map, Value};
 use thiserror::Error;
 
-use crate::{GrokInvocationV1, PROVIDER_ID};
+use crate::{GrokExpectedToolCallV1, GrokInvocationV1, PROVIDER_ID};
 
 pub const MAX_STDOUT_BYTES: usize = 64 * 1024;
 pub const MAX_HISTORY_BYTES: usize = 1024 * 1024;
@@ -91,7 +91,7 @@ pub enum GrokReceiptError {
     InvalidHistoryJson,
     #[error("Grok history contains an unexpected tool call")]
     UnexpectedToolCall,
-    #[error("Grok history must contain exactly one expected tool call and result")]
+    #[error("Grok history does not contain the exact expected tool call sequence")]
     MissingToolResult,
     #[error("Grok tool arguments differ from the admitted request")]
     ToolArgumentsMismatch,
@@ -173,8 +173,10 @@ fn parse_history(
         return Err(GrokReceiptError::InvalidHistorySize);
     }
     let text = std::str::from_utf8(history).map_err(|_| GrokReceiptError::InvalidHistoryJson)?;
-    let mut expected_call: Option<(String, Value)> = None;
-    let mut matching_result: Option<Value> = None;
+    let expected_calls = invocation.expected_tool_calls();
+    let mut pending_call: Option<(String, Value)> = None;
+    let mut completed_calls = 0_usize;
+    let mut effective_tool_prompt = None;
     let mut record_count = 0_usize;
 
     for line in text.lines().filter(|line| !line.trim().is_empty()) {
@@ -193,14 +195,15 @@ fn parse_history(
                     .as_array()
                     .ok_or(GrokReceiptError::InvalidHistoryJson)?;
                 for call in calls {
-                    if expected_call.is_some() {
+                    if pending_call.is_some() || completed_calls >= expected_calls.len() {
                         return Err(GrokReceiptError::UnexpectedToolCall);
                     }
+                    let expected = &expected_calls[completed_calls];
                     let name = call
                         .get("name")
                         .and_then(Value::as_str)
                         .ok_or(GrokReceiptError::InvalidHistoryJson)?;
-                    if name != invocation.tool().name() {
+                    if name != expected.tool().name() {
                         return Err(GrokReceiptError::UnexpectedToolCall);
                     }
                     let id = call
@@ -214,18 +217,18 @@ fn parse_history(
                         .ok_or(GrokReceiptError::InvalidHistoryJson)?;
                     let arguments: Value = serde_json::from_str(arguments)
                         .map_err(|_| GrokReceiptError::InvalidHistoryJson)?;
-                    expected_call = Some((id.to_owned(), arguments));
+                    if arguments != *expected.arguments() {
+                        return Err(GrokReceiptError::ToolArgumentsMismatch);
+                    }
+                    pending_call = Some((id.to_owned(), arguments));
                 }
             }
             Some("tool_result") => {
-                let Some((call_id, _)) = expected_call.as_ref() else {
+                let Some((call_id, actual_arguments)) = pending_call.as_ref() else {
                     return Err(GrokReceiptError::UnexpectedToolCall);
                 };
                 if value.get("tool_call_id").and_then(Value::as_str) != Some(call_id) {
                     return Err(GrokReceiptError::UnexpectedToolCall);
-                }
-                if matching_result.is_some() {
-                    return Err(GrokReceiptError::MissingToolResult);
                 }
                 let content = value
                     .get("content")
@@ -240,36 +243,31 @@ fn parse_history(
                 if content.starts_with("Tool `") && content.contains("` failed:") {
                     return Err(GrokReceiptError::ToolExecutionFailed);
                 }
-                matching_result = Some(
-                    serde_json::from_str(content)
-                        .map_err(|_| GrokReceiptError::InvalidToolResult)?,
-                );
+                let tool_result = serde_json::from_str(content)
+                    .map_err(|_| GrokReceiptError::InvalidToolResult)?;
+                validate_tool_result(&tool_result, &expected_calls[completed_calls])?;
+                effective_tool_prompt = actual_arguments
+                    .get("prompt")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                completed_calls += 1;
+                pending_call = None;
             }
             _ => {}
         }
     }
 
-    let Some((_, actual_arguments)) = expected_call else {
+    if pending_call.is_some() || completed_calls != expected_calls.len() {
         return Err(GrokReceiptError::MissingToolResult);
-    };
-    let Some(tool_result) = matching_result else {
-        return Err(GrokReceiptError::MissingToolResult);
-    };
-    if actual_arguments != *invocation.expected_arguments() {
-        return Err(GrokReceiptError::ToolArgumentsMismatch);
     }
-    validate_tool_result(&tool_result, invocation)?;
     Ok(ParsedToolResult {
-        effective_tool_prompt: actual_arguments
-            .get("prompt")
-            .and_then(Value::as_str)
-            .map(str::to_owned),
+        effective_tool_prompt,
     })
 }
 
 fn validate_tool_result(
     tool_result: &Value,
-    invocation: &GrokInvocationV1,
+    expected: &GrokExpectedToolCallV1,
 ) -> Result<(), GrokReceiptError> {
     let path = tool_result
         .get("path")
@@ -283,13 +281,13 @@ fn validate_tool_result(
         .get("session_folder")
         .and_then(Value::as_str)
         .ok_or(GrokReceiptError::InvalidToolResult)?;
-    if std::path::Path::new(path) != invocation.artifact_path()
-        || invocation
+    if std::path::Path::new(path) != expected.artifact_path()
+        || expected
             .artifact_path()
             .file_name()
             .and_then(|name| name.to_str())
             != Some(filename)
-        || invocation
+        || expected
             .artifact_path()
             .parent()
             .and_then(|parent| parent.file_name())

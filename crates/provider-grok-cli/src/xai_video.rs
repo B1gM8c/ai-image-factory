@@ -5,7 +5,8 @@ use thiserror::Error;
 
 use crate::{
     GrokVideoGenerationRequestV1, ImageToVideoRequestV1, ReferenceToVideoRequestV1,
-    RequestValidationError, StagedImageV1, VideoAspectRatio, VideoDuration, VideoResolution,
+    RequestValidationError, StagedImageV1, TextToVideoRequestV1, VideoAspectRatio, VideoDuration,
+    VideoResolution,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -53,7 +54,23 @@ pub fn project_xai_video_generation(
     let resolution = map_resolution(command.resolution)?;
     let provider_request = match command.workflow() {
         XaiVideoWorkflow::TextToVideo => {
-            return Err(XaiGrokVideoProjectionError::UnsupportedWorkflow);
+            require_model(
+                command.model.as_deref(),
+                &[
+                    "grok-imagine-video-1.5",
+                    "grok-imagine-video-1.5-preview",
+                    "grok-imagine-video-1.5-2026-05-30",
+                ],
+            )?;
+            let aspect_ratio =
+                map_aspect_ratio(command.aspect_ratio.unwrap_or(XaiVideoAspectRatio::R16x9))?;
+            TextToVideoRequestV1::new(
+                command.prompt.unwrap_or_default(),
+                aspect_ratio,
+                duration,
+                resolution,
+            )?
+            .into()
         }
         XaiVideoWorkflow::ImageToVideo => {
             require_model(
@@ -103,8 +120,6 @@ pub enum XaiGrokVideoProjectionError {
     ModelRequired,
     #[error("xAI video model is not bound by this Grok CLI workflow")]
     UnsupportedModel,
-    #[error("xAI video workflow is not exposed by Grok CLI")]
-    UnsupportedWorkflow,
     #[error("xAI field `duration` is not supported by Grok CLI")]
     UnsupportedDuration,
     #[error("xAI field `resolution` is not supported by Grok CLI")]
@@ -128,7 +143,6 @@ impl XaiGrokVideoProjectionError {
         match self {
             Self::InvalidSourceCommand | Self::InputManifestMismatch => None,
             Self::ModelRequired | Self::UnsupportedModel => Some("model"),
-            Self::UnsupportedWorkflow => Some("image"),
             Self::UnsupportedDuration => Some("duration"),
             Self::UnsupportedResolution => Some("resolution"),
             Self::UnsupportedAspectRatio => Some("aspect_ratio"),
@@ -225,6 +239,31 @@ mod tests {
         assert_eq!(request.duration(), VideoDuration::Seconds6);
         assert_eq!(request.resolution(), VideoResolution::P480);
         assert_eq!(projection.user(), Some("customer-1"));
+    }
+
+    #[test]
+    fn text_to_video_maps_aspect_ratio_without_staged_inputs() {
+        let source = XaiVideoGenerationCommandV1::from_request(XaiVideoGenerationRequest {
+            aspect_ratio: Some(XaiVideoAspectRatio::R9x16),
+            duration: Some(10),
+            image: None,
+            model: Some("grok-imagine-video-1.5-preview".to_owned()),
+            output: None,
+            prompt: Some("a paper boat crossing a moonlit lake".to_owned()),
+            reference_images: Vec::new(),
+            resolution: Some(XaiVideoResolution::P720),
+            storage_options: None,
+            user: None,
+        })
+        .unwrap();
+        let projection = project_xai_video_generation(source, Vec::new()).unwrap();
+        let GrokVideoGenerationRequestV1::TextToVideo(request) = projection.provider_request()
+        else {
+            panic!("expected text-to-video")
+        };
+        assert_eq!(request.aspect_ratio(), VideoAspectRatio::R9x16);
+        assert_eq!(request.duration(), VideoDuration::Seconds10);
+        assert_eq!(request.resolution(), VideoResolution::P720);
     }
 
     #[test]

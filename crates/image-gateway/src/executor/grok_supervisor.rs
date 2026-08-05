@@ -14,8 +14,8 @@ use image_cli_runtime::{
     SpawnEvidence, SpawnObserver, VerifiedExecutable, WorkingDirectory,
 };
 use image_provider_grok_cli::{
-    ADAPTER_REVISION, GrokCliPolicyV1, GrokCliReceiptV1, GrokCliRequestV1, GrokInvocationV1,
-    MAX_HISTORY_BYTES, parse_invocation_receipt,
+    GrokCliPolicyV1, GrokCliReceiptV1, GrokCliRequestV1, GrokInvocationV1, MAX_HISTORY_BYTES,
+    parse_invocation_receipt,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -23,6 +23,7 @@ use sha2::{Digest, Sha256};
 use tokio::{process::Command, time::Instant};
 use uuid::Uuid;
 
+use super::grok_request::expected_grok_adapter_revision;
 use super::{
     ExecutorLaunchContext, ExecutorSubmissionLease, GrokExecutionRequest, RunnerError,
     SingleOutputSupervisor, SupervisedOutput, private_auth, project_grok_execution_request,
@@ -250,6 +251,16 @@ impl GrokProcessSupervisor {
                 });
             }
             GrokExecutionRequest::ImageEdit(request) => request.images().iter().collect(),
+            GrokExecutionRequest::VideoGeneration(
+                image_provider_grok_cli::GrokVideoGenerationRequestV1::TextToVideo(_),
+            ) => {
+                if context.inputs().is_empty() {
+                    return Ok(());
+                }
+                return Err(RunnerError::Definite {
+                    error_code: "grok_input_manifest_invalid".to_owned(),
+                });
+            }
             GrokExecutionRequest::VideoGeneration(
                 image_provider_grok_cli::GrokVideoGenerationRequestV1::ImageToVideo(request),
             ) => vec![request.image()],
@@ -745,7 +756,8 @@ fn validate_child_request(
         ImageGatewayError::service_unavailable("Grok runner lease binding is invalid")
     })?;
     if request.schema_version != 1
-        || lease.adapter_revision != ADAPTER_REVISION
+        || Some(lease.adapter_revision.as_str())
+            != expected_grok_adapter_revision(lease.command_schema.as_str())
         || lease.executor_execution_id != executor_execution_id
         || request.timeout_ms == 0
         || request.timeout_ms > MAX_RUNNER_TIMEOUT.as_millis() as u64
@@ -1179,6 +1191,7 @@ mod tests {
         lease.model = "grok-imagine-video-1.5-preview".to_owned();
         lease.command_schema =
             image_provider_grok_cli::GROK_VIDEO_GENERATION_COMMAND_SCHEMA.to_owned();
+        lease.adapter_revision = image_provider_grok_cli::VIDEO_ADAPTER_REVISION.to_owned();
         lease.command_hash.clone_from(&hash);
         let context = ExecutorLaunchContext {
             request_id: "request-video".to_owned(),
@@ -1205,6 +1218,58 @@ mod tests {
                 .contains("endpoint = \"http://127.0.0.1:8787/v1/internal/provider-uploads/s3/\"")
         );
         assert!(projected.contains("[tools.zdr_video_output_s3.read_write]"));
+    }
+
+    #[tokio::test]
+    async fn supervisor_accepts_text_video_without_staging_a_first_frame() {
+        let fixture = GrokFixture::new();
+        let source = XaiVideoGenerationCommandV1::from_request(XaiVideoGenerationRequest {
+            aspect_ratio: Some(image_api_contracts::xai::XaiVideoAspectRatio::R9x16),
+            duration: Some(6),
+            image: None,
+            model: Some("grok-imagine-video-1.5-preview".to_owned()),
+            output: None,
+            prompt: Some("a paper boat crossing a moonlit lake".to_owned()),
+            reference_images: Vec::new(),
+            resolution: Some(OfficialVideoResolution::P480),
+            storage_options: None,
+            user: None,
+        })
+        .unwrap();
+        let payload = GrokVideoGenerationPayloadV1::from_xai_command(source, Vec::new()).unwrap();
+        let command = serde_json::from_slice::<Value>(
+            &payload.into_canonical_bytes(OutputSlot::new(0, 1).unwrap()),
+        )
+        .unwrap();
+        let hash = hex::encode(Sha256::digest(serde_json::to_vec(&command).unwrap()));
+        let mut lease = fixture.lease();
+        lease.model = "grok-imagine-video-1.5-preview".to_owned();
+        lease.command_schema =
+            image_provider_grok_cli::GROK_VIDEO_GENERATION_COMMAND_SCHEMA.to_owned();
+        lease.adapter_revision = image_provider_grok_cli::VIDEO_ADAPTER_REVISION.to_owned();
+        lease.command_hash.clone_from(&hash);
+        let context = ExecutorLaunchContext {
+            request_id: "request-text-video".to_owned(),
+            api_profile: XAI_VIDEOS_API_PROFILE.to_owned(),
+            output_index: 0,
+            command_schema: lease.command_schema.clone(),
+            command_hash: hash,
+            command_json: command,
+            inputs: Vec::new(),
+        };
+
+        fixture.journal.start_or_attach(&lease).unwrap();
+        fixture.supervisor.prepare(&lease, &context).await.unwrap();
+
+        let spool = ExecutionSpool::for_lease(&fixture.journal, &lease).unwrap();
+        assert!(spool.provider_attempt_path().unwrap().is_dir());
+        assert!(
+            !spool
+                .provider_attempt_path()
+                .unwrap()
+                .join("input.jpg")
+                .exists()
+        );
     }
 
     #[tokio::test]
@@ -1461,7 +1526,7 @@ mod tests {
                 command_schema: GROK_IMAGE_GENERATION_COMMAND_SCHEMA.to_owned(),
                 command_hash: self.command_hash.clone(),
                 execution_profile_id: Uuid::new_v4(),
-                adapter_revision: ADAPTER_REVISION.to_owned(),
+                adapter_revision: image_provider_grok_cli::ADAPTER_REVISION.to_owned(),
                 executor_owner: "executor-1".to_owned(),
                 executor_lease_epoch: 1,
                 executor_lease_expires_at_ms: i64::MAX,

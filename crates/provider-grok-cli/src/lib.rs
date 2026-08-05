@@ -20,7 +20,8 @@ pub use command::{
     parse_image_generation_payload, parse_video_generation_command, parse_video_generation_payload,
 };
 pub use policy::{
-    GrokCliPolicyError, GrokCliPolicyV1, GrokCliRequestV1, GrokInvocationV1, GrokTool,
+    GrokCliPolicyError, GrokCliPolicyV1, GrokCliRequestV1, GrokExpectedToolCallV1,
+    GrokInvocationV1, GrokTool,
 };
 pub use receipt::{
     GrokCliReceiptV1, GrokReceiptError, MAX_HISTORY_BYTES, MAX_STDOUT_BYTES,
@@ -30,7 +31,7 @@ pub use request::{
     GrokImageEditRequestV1, GrokImageGenerationRequestV1, GrokVideoGenerationRequestV1,
     ImageAspectRatio, ImageModel, ImageToVideoRequestV1, MAX_IMAGE_EDIT_REFERENCES,
     MAX_PROMPT_CHARS, ReferenceToVideoRequestV1, RequestValidationError, StagedImageV1,
-    VideoAspectRatio, VideoDuration, VideoResolution,
+    TextToVideoRequestV1, VideoAspectRatio, VideoDuration, VideoResolution,
 };
 pub use xai::{
     GROK_CLI_IMAGE_MAX_OUTPUTS, GROK_CLI_IMAGE_RESOLUTION, GROK_CLI_IMAGE_RESPONSE_FORMAT,
@@ -43,6 +44,7 @@ pub use xai_video::{
 pub const PROVIDER_ID: &str = "grok-cli";
 pub const GROK_CLI_COMPATIBILITY_VERSION: &str = "0.2.102";
 pub const ADAPTER_REVISION: &str = "grok-cli-0.2.102.agentic-media.v1";
+pub const VIDEO_ADAPTER_REVISION: &str = "grok-cli-0.2.102.agentic-video.v2";
 pub const REQUEST_SCHEMA_VERSION: u16 = 1;
 
 #[cfg(test)]

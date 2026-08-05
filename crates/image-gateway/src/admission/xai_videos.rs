@@ -3,8 +3,8 @@ use image_api_contracts::xai::{
     XaiVideoRequestError, XaiVideoWorkflow,
 };
 use image_provider_grok_cli::{
-    ADAPTER_REVISION, GROK_VIDEO_GENERATION_COMMAND_SCHEMA, GrokCommandError,
-    GrokVideoGenerationPayloadV1, GrokVideoGenerationRequestV1, PROVIDER_ID, StagedImageV1,
+    GROK_VIDEO_GENERATION_COMMAND_SCHEMA, GrokCommandError, GrokVideoGenerationPayloadV1,
+    GrokVideoGenerationRequestV1, PROVIDER_ID, StagedImageV1, VIDEO_ADAPTER_REVISION,
     XaiGrokVideoProjectionError,
 };
 use image_provider_sdk::{CanonicalCommandPayload, OutputSlot};
@@ -169,6 +169,7 @@ impl XaiVideoAdmissionPlan {
                 _ => XaiVideoAdmissionError::InvalidProviderCommand,
             })?;
         let provider_model = match payload.request() {
+            GrokVideoGenerationRequestV1::TextToVideo(_) => "grok-imagine-video-1.5-preview",
             GrokVideoGenerationRequestV1::ImageToVideo(_) => "grok-imagine-video-1.5-preview",
             GrokVideoGenerationRequestV1::ReferenceToVideo(_) => "grok-imagine-video",
         }
@@ -212,7 +213,7 @@ impl XaiVideoAdmissionPlan {
     }
 
     pub fn adapter_revision(&self) -> &'static str {
-        ADAPTER_REVISION
+        VIDEO_ADAPTER_REVISION
     }
 
     pub fn inputs(&self) -> &[XaiVideoAdmissionInput] {
@@ -265,7 +266,7 @@ impl XaiVideoAdmissionPlan {
         schedule_scope: impl Into<String>,
         contract: AdmissionContract,
     ) -> AttachJob {
-        let inputs = self
+        let inputs: Vec<AttachInputObject> = self
             .inputs
             .iter()
             .enumerate()
@@ -276,16 +277,17 @@ impl XaiVideoAdmissionPlan {
                 media_type: input.media_type.clone(),
             })
             .collect();
+        let input_manifest = (!inputs.is_empty()).then(|| AttachInputManifest {
+            manifest_schema: XAI_VIDEO_INPUT_MANIFEST_SCHEMA.to_owned(),
+            manifest_hash: self.input_manifest_hash.clone(),
+            inputs,
+        });
         AttachJob {
             ticket,
             job_id,
             command_schema: GROK_VIDEO_GENERATION_COMMAND_SCHEMA.to_owned(),
             command_json: self.provider_command.clone(),
-            input_manifest: Some(AttachInputManifest {
-                manifest_schema: XAI_VIDEO_INPUT_MANIFEST_SCHEMA.to_owned(),
-                manifest_hash: self.input_manifest_hash.clone(),
-                inputs,
-            }),
+            input_manifest,
             work_kind: "video_single".to_owned(),
             schedule_scope: schedule_scope.into(),
             schedule_weight: 1,
@@ -412,6 +414,21 @@ mod tests {
         }
     }
 
+    fn text_request() -> XaiVideoGenerationRequest {
+        XaiVideoGenerationRequest {
+            aspect_ratio: Some(image_api_contracts::xai::XaiVideoAspectRatio::R9x16),
+            duration: Some(10),
+            image: None,
+            model: Some("grok-imagine-video-1.5-preview".to_owned()),
+            output: None,
+            prompt: Some("a paper boat crossing a moonlit lake".to_owned()),
+            reference_images: Vec::new(),
+            resolution: Some(XaiVideoResolution::P720),
+            storage_options: None,
+            user: None,
+        }
+    }
+
     #[test]
     fn plan_separates_output_cardinality_billing_and_schedule_cost() {
         let plan = XaiVideoAdmissionPlan::for_grok_cli(request(Some(6)), vec![input()]).unwrap();
@@ -476,5 +493,44 @@ mod tests {
             .blob
             .sha256_hex = "b".repeat(64);
         assert!(crate::admission::validate_attach_request(&forged).is_err());
+    }
+
+    #[test]
+    fn text_video_attach_is_a_single_input_free_durable_job() {
+        let intent = XaiVideoAdmissionIntent::new(text_request()).unwrap();
+        let session_id = Uuid::new_v4();
+        let ticket = AdmissionTicket {
+            session_id,
+            owner_token: Uuid::new_v4(),
+            request_hash: intent.source_request_hash().to_owned(),
+        };
+        let plan = intent.bind_grok_cli(Vec::new()).unwrap();
+        let attach = plan.attach(
+            ticket,
+            Uuid::new_v4(),
+            "tenant:tenant-1",
+            AdmissionContract::MediaEconomicsV3,
+        );
+
+        assert!(attach.input_manifest.is_none());
+        assert_eq!(attach.work_kind, "video_single");
+        assert_eq!(attach.schedule_cost, 10);
+        crate::admission::validate_attach_request(&attach).unwrap();
+    }
+
+    #[test]
+    fn video_workflows_reject_the_wrong_input_cardinality() {
+        assert_eq!(
+            XaiVideoAdmissionPlan::for_grok_cli(text_request(), vec![input()]),
+            Err(XaiVideoAdmissionError::InvalidInputManifest)
+        );
+        assert_eq!(
+            XaiVideoAdmissionPlan::for_grok_cli(request(Some(6)), Vec::new()),
+            Err(XaiVideoAdmissionError::InvalidInputManifest)
+        );
+        assert_eq!(
+            XaiVideoAdmissionPlan::for_grok_cli(request(Some(6)), vec![input(), input()]),
+            Err(XaiVideoAdmissionError::InvalidInputManifest)
+        );
     }
 }

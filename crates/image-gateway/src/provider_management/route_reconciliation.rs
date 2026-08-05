@@ -1,4 +1,8 @@
 use image_provider_contracts::openai_codex;
+use image_provider_grok_cli::{
+    GROK_VIDEO_GENERATION_COMMAND_SCHEMA, GROK_VIDEO_GENERATION_OPERATION_V1,
+    PROVIDER_ID as GROK_PROVIDER_ID, VIDEO_ADAPTER_REVISION as GROK_VIDEO_ADAPTER_REVISION,
+};
 use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
@@ -33,6 +37,12 @@ struct RouteMember {
     minimum_remaining_percent: i16,
     profile_state: String,
     profile_is_compatible: bool,
+}
+
+#[derive(Clone, Debug)]
+struct ExpectedRuntimeBinding {
+    operation_descriptor_sha256_v1: String,
+    adapter_revision: &'static str,
 }
 
 struct ReconciledRoute {
@@ -71,6 +81,15 @@ pub async fn reconcile_execution_profile_routes(
                   OR profile.provider_id <> member.provider_id
                   OR profile.operation_id <> member.operation_id
                   OR profile.command_schema <> member.command_schema
+                  OR (
+                    head.provider_id = $4
+                    AND head.operation_id = $5
+                    AND head.command_schema = $6
+                    AND (
+                      profile.operation_descriptor_sha256_v1 <> $7
+                      OR profile.adapter_revision <> $8
+                    )
+                  )
                 )
             )
             OR NOT EXISTS (
@@ -95,6 +114,11 @@ pub async fn reconcile_execution_profile_routes(
     .bind(openai_codex::PROVIDER_ID)
     .bind(openai_codex::MODEL_GPT_IMAGE_2_SNAPSHOT)
     .bind(openai_codex::MODEL_GPT_IMAGE_2)
+    .bind(GROK_PROVIDER_ID)
+    .bind(GROK_VIDEO_GENERATION_OPERATION_V1.id)
+    .bind(GROK_VIDEO_GENERATION_COMMAND_SCHEMA)
+    .bind(GROK_VIDEO_GENERATION_OPERATION_V1.canonical_sha256_v1_hex())
+    .bind(GROK_VIDEO_ADAPTER_REVISION)
     .fetch_all(pool)
     .await
     .map_err(store_unavailable)?;
@@ -307,6 +331,7 @@ async fn route_members(
     tx: &mut Transaction<'_, Postgres>,
     route: &RouteRevision,
 ) -> Result<Vec<RouteMember>, ImageGatewayError> {
+    let expected = expected_runtime_binding(route);
     sqlx::query_as(
         r#"
         SELECT member.provider_account_id, member.execution_profile_id,
@@ -317,7 +342,14 @@ async fn route_members(
                  profile.provider_account_id = member.provider_account_id
                  AND profile.provider_id = member.provider_id
                  AND profile.operation_id = member.operation_id
-                 AND profile.command_schema = member.command_schema,
+                 AND profile.command_schema = member.command_schema
+                 AND (
+                   $3::TEXT IS NULL
+                   OR (
+                     profile.operation_descriptor_sha256_v1 = $3
+                     AND profile.adapter_revision = $4
+                   )
+                 ),
                  FALSE
                ) AS profile_is_compatible
         FROM provider_route_members member
@@ -329,6 +361,12 @@ async fn route_members(
     )
     .bind(route.route_id)
     .bind(route.revision)
+    .bind(
+        expected
+            .as_ref()
+            .map(|binding| binding.operation_descriptor_sha256_v1.as_str()),
+    )
+    .bind(expected.as_ref().map(|binding| binding.adapter_revision))
     .fetch_all(&mut **tx)
     .await
     .map_err(store_unavailable)
@@ -366,6 +404,7 @@ async fn compatible_replacements(
     route: &RouteRevision,
     member: &RouteMember,
 ) -> Result<Vec<Uuid>, ImageGatewayError> {
+    let expected = expected_runtime_binding(route);
     sqlx::query_scalar(
         r#"
         SELECT profile.execution_profile_id
@@ -376,6 +415,13 @@ async fn compatible_replacements(
           AND profile.command_schema = $4
           AND profile.state = 'enabled'
           AND profile.execution_profile_id <> $5
+          AND (
+            $6::TEXT IS NULL
+            OR (
+              profile.operation_descriptor_sha256_v1 = $6
+              AND profile.adapter_revision = $7
+            )
+          )
         ORDER BY profile.created_at_ms DESC, profile.execution_profile_id
         FOR SHARE OF profile
         "#,
@@ -385,9 +431,26 @@ async fn compatible_replacements(
     .bind(&route.operation_id)
     .bind(&route.command_schema)
     .bind(member.execution_profile_id)
+    .bind(
+        expected
+            .as_ref()
+            .map(|binding| binding.operation_descriptor_sha256_v1.as_str()),
+    )
+    .bind(expected.as_ref().map(|binding| binding.adapter_revision))
     .fetch_all(&mut **tx)
     .await
     .map_err(store_unavailable)
+}
+
+fn expected_runtime_binding(route: &RouteRevision) -> Option<ExpectedRuntimeBinding> {
+    (route.provider_id == GROK_PROVIDER_ID
+        && route.operation_id == GROK_VIDEO_GENERATION_OPERATION_V1.id
+        && route.command_schema == GROK_VIDEO_GENERATION_COMMAND_SCHEMA)
+        .then(|| ExpectedRuntimeBinding {
+            operation_descriptor_sha256_v1: GROK_VIDEO_GENERATION_OPERATION_V1
+                .canonical_sha256_v1_hex(),
+            adapter_revision: GROK_VIDEO_ADAPTER_REVISION,
+        })
 }
 
 async fn insert_route_revision(

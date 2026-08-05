@@ -260,6 +260,46 @@ impl ImageToVideoRequestV1 {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TextToVideoRequestV1 {
+    prompt: String,
+    aspect_ratio: VideoAspectRatio,
+    duration: VideoDuration,
+    resolution: VideoResolution,
+}
+
+impl TextToVideoRequestV1 {
+    pub fn new(
+        prompt: impl Into<String>,
+        aspect_ratio: VideoAspectRatio,
+        duration: VideoDuration,
+        resolution: VideoResolution,
+    ) -> Result<Self, RequestValidationError> {
+        Ok(Self {
+            prompt: validate_required_prompt(prompt.into())?,
+            aspect_ratio,
+            duration,
+            resolution,
+        })
+    }
+
+    pub fn prompt(&self) -> &str {
+        &self.prompt
+    }
+
+    pub fn aspect_ratio(&self) -> VideoAspectRatio {
+        self.aspect_ratio
+    }
+
+    pub fn duration(&self) -> VideoDuration {
+        self.duration
+    }
+
+    pub fn resolution(&self) -> VideoResolution {
+        self.resolution
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReferenceToVideoRequestV1 {
     prompt: String,
     images: Vec<StagedImageV1>,
@@ -310,8 +350,15 @@ impl ReferenceToVideoRequestV1 {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum GrokVideoGenerationRequestV1 {
+    TextToVideo(TextToVideoRequestV1),
     ImageToVideo(ImageToVideoRequestV1),
     ReferenceToVideo(ReferenceToVideoRequestV1),
+}
+
+impl From<TextToVideoRequestV1> for GrokVideoGenerationRequestV1 {
+    fn from(request: TextToVideoRequestV1) -> Self {
+        Self::TextToVideo(request)
+    }
 }
 
 impl From<ImageToVideoRequestV1> for GrokVideoGenerationRequestV1 {

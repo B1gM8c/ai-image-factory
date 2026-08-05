@@ -4,6 +4,7 @@ use image_provider_grok_cli::{
     GROK_IMAGE_EDIT_OPERATION_V1, GROK_IMAGE_GENERATION_COMMAND_SCHEMA,
     GROK_IMAGE_GENERATION_OPERATION_V1, GROK_VIDEO_GENERATION_COMMAND_SCHEMA,
     GROK_VIDEO_GENERATION_OPERATION_V1, PROVIDER_ID as GROK_PROVIDER_ID,
+    VIDEO_ADAPTER_REVISION as GROK_VIDEO_ADAPTER_REVISION,
 };
 use thiserror::Error;
 
@@ -66,24 +67,28 @@ pub fn identify_executor_profile_binding(
             Ok(ExecutorProfileBinding::CodexImageGeneration)
         }
         GROK_PROVIDER_ID => {
-            let (command_schema, operation, binding) = match profile.command_schema.as_str() {
-                GROK_IMAGE_GENERATION_COMMAND_SCHEMA => (
-                    GROK_IMAGE_GENERATION_COMMAND_SCHEMA,
-                    GROK_IMAGE_GENERATION_OPERATION_V1,
-                    ExecutorProfileBinding::GrokImageGeneration,
-                ),
-                GROK_IMAGE_EDIT_COMMAND_SCHEMA => (
-                    GROK_IMAGE_EDIT_COMMAND_SCHEMA,
-                    GROK_IMAGE_EDIT_OPERATION_V1,
-                    ExecutorProfileBinding::GrokImageEdit,
-                ),
-                GROK_VIDEO_GENERATION_COMMAND_SCHEMA => (
-                    GROK_VIDEO_GENERATION_COMMAND_SCHEMA,
-                    GROK_VIDEO_GENERATION_OPERATION_V1,
-                    ExecutorProfileBinding::GrokVideoGeneration,
-                ),
-                _ => return Err(ExecutorProfileBindingError::BindingMismatch),
-            };
+            let (command_schema, operation, adapter_revision, binding) =
+                match profile.command_schema.as_str() {
+                    GROK_IMAGE_GENERATION_COMMAND_SCHEMA => (
+                        GROK_IMAGE_GENERATION_COMMAND_SCHEMA,
+                        GROK_IMAGE_GENERATION_OPERATION_V1,
+                        GROK_ADAPTER_REVISION,
+                        ExecutorProfileBinding::GrokImageGeneration,
+                    ),
+                    GROK_IMAGE_EDIT_COMMAND_SCHEMA => (
+                        GROK_IMAGE_EDIT_COMMAND_SCHEMA,
+                        GROK_IMAGE_EDIT_OPERATION_V1,
+                        GROK_ADAPTER_REVISION,
+                        ExecutorProfileBinding::GrokImageEdit,
+                    ),
+                    GROK_VIDEO_GENERATION_COMMAND_SCHEMA => (
+                        GROK_VIDEO_GENERATION_COMMAND_SCHEMA,
+                        GROK_VIDEO_GENERATION_OPERATION_V1,
+                        GROK_VIDEO_ADAPTER_REVISION,
+                        ExecutorProfileBinding::GrokVideoGeneration,
+                    ),
+                    _ => return Err(ExecutorProfileBindingError::BindingMismatch),
+                };
             validate(
                 profile,
                 command_schema,
@@ -92,7 +97,7 @@ pub fn identify_executor_profile_binding(
                 &operation.canonical_sha256_v1_hex(),
                 operation.completion.as_str(),
                 operation.idempotency.as_str(),
-                GROK_ADAPTER_REVISION,
+                adapter_revision,
             )?;
             Ok(binding)
         }
@@ -182,6 +187,7 @@ mod tests {
         profile.operation_descriptor_sha256_v1 = operation.canonical_sha256_v1_hex();
         profile.completion_mode = operation.completion.as_str().to_owned();
         profile.idempotency_mode = operation.idempotency.as_str().to_owned();
+        profile.adapter_revision = GROK_VIDEO_ADAPTER_REVISION.to_owned();
 
         assert_eq!(
             identify_executor_profile_binding(&profile),

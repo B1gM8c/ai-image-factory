@@ -472,7 +472,7 @@ fn input_image_count(dimensions: &serde_json::Value) -> Result<u64, AdmissionErr
         .get("input_image_count")
         .and_then(serde_json::Value::as_str)
         .and_then(|count| count.parse::<u64>().ok())
-        .filter(|count| (1..=7).contains(count))
+        .filter(|count| *count <= 7)
         .ok_or(AdmissionError::PricingUnavailable)
 }
 
@@ -958,6 +958,9 @@ fn command_pricing_facts(
                 return Err(AdmissionError::InvalidCommand);
             }
             let (provider_model_id, input_image_count) = match payload.request() {
+                GrokVideoGenerationRequestV1::TextToVideo(_) => {
+                    ("grok-imagine-video-1.5-preview", 0_usize)
+                }
                 GrokVideoGenerationRequestV1::ImageToVideo(_) => {
                     ("grok-imagine-video-1.5-preview", 1_usize)
                 }
@@ -977,7 +980,11 @@ fn command_pricing_facts(
                     serialized_string_dimension(command.resolution)?,
                 ),
             ]);
-            if provider_model_id == "grok-imagine-video" {
+            if matches!(
+                payload.request(),
+                GrokVideoGenerationRequestV1::TextToVideo(_)
+                    | GrokVideoGenerationRequestV1::ReferenceToVideo(_)
+            ) {
                 dimensions.insert(
                     "aspect_ratio".to_owned(),
                     serialized_string_dimension(
@@ -1258,7 +1265,7 @@ mod tests {
     };
     use image_api_contracts::xai::{
         XaiImageAspectRatio, XaiImageGenerationRequest, XaiImageResolution, XaiImageResponseFormat,
-        XaiVideoGenerationRequest, XaiVideoImageUrl, XaiVideoResolution,
+        XaiVideoAspectRatio, XaiVideoGenerationRequest, XaiVideoImageUrl, XaiVideoResolution,
     };
     use serde_json::json;
 
@@ -1678,6 +1685,62 @@ mod tests {
     }
 
     #[test]
+    fn grok_text_video_pricing_bills_only_the_single_video_task() {
+        let plan = XaiVideoAdmissionPlan::for_grok_cli(
+            XaiVideoGenerationRequest {
+                aspect_ratio: Some(XaiVideoAspectRatio::R9x16),
+                duration: Some(10),
+                image: None,
+                model: Some("grok-imagine-video-1.5-preview".to_owned()),
+                output: None,
+                prompt: Some("a paper boat crossing a moonlit lake".to_owned()),
+                reference_images: Vec::new(),
+                resolution: Some(XaiVideoResolution::P720),
+                storage_options: None,
+                user: None,
+            },
+            Vec::new(),
+        )
+        .expect("valid Grok text video plan");
+        let claim = plan.claim(
+            Uuid::new_v4(),
+            "tenant-a",
+            "project-a",
+            "req-grok-text-video-pricing-boundary",
+            None,
+            i64::MAX,
+        );
+        let request = plan.attach(
+            AdmissionTicket {
+                session_id: Uuid::new_v4(),
+                owner_token: claim.owner_token,
+                request_hash: claim.request_hash,
+            },
+            Uuid::new_v4(),
+            "tenant-a",
+            AdmissionContract::CustomerPricingV4,
+        );
+
+        let facts = command_pricing_facts(&request, XAI_VIDEOS_API_PROFILE)
+            .expect("signed Grok text video pricing facts");
+        assert_eq!(facts.provider_model_id, "grok-imagine-video-1.5-preview");
+        assert_eq!(facts.operation, VIDEO_GENERATION_OPERATION);
+        assert_eq!(facts.output_count, 1);
+        assert_eq!(facts.billable_units, 10);
+        assert_eq!(facts.output_billable_units, 10);
+        assert_eq!(facts.billing_metric, "video_second");
+        assert_eq!(
+            facts.pricing_dimensions,
+            BTreeMap::from([
+                ("aspect_ratio".to_owned(), "9:16".to_owned()),
+                ("duration".to_owned(), "10".to_owned()),
+                ("input_image_count".to_owned(), "0".to_owned()),
+                ("resolution".to_owned(), "720p".to_owned()),
+            ])
+        );
+    }
+
+    #[test]
     fn grok_video_quote_reserves_input_images_and_requested_seconds_once() {
         let mut version =
             metering_version("image_input", "image", "request_derived", "any", "exact");
@@ -1749,6 +1812,27 @@ mod tests {
             item.metric == "video_requested_second"
                 && item.unit == "second"
                 && item.max_quantity == "6"
+        }));
+
+        let text_quantities = quote_quantities(
+            &resolved,
+            &[output_id],
+            &json!({
+                "aspect_ratio": "16:9",
+                "duration": "10",
+                "input_image_count": "0",
+                "resolution": "720p"
+            }),
+        )
+        .expect("Grok text video quote quantities");
+        assert_eq!(text_quantities.len(), 2);
+        assert!(text_quantities.iter().any(|item| {
+            item.metric == "image_input" && item.unit == "image" && item.max_quantity == "0"
+        }));
+        assert!(text_quantities.iter().any(|item| {
+            item.metric == "video_requested_second"
+                && item.unit == "second"
+                && item.max_quantity == "10"
         }));
     }
 
