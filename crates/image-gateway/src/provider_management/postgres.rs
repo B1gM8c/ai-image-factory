@@ -65,6 +65,7 @@ use super::{
 const LOGIN_TTL: Duration = Duration::from_secs(15 * 60);
 const APP_SERVER_START_TIMEOUT: Duration = Duration::from_secs(20);
 const APP_SERVER_READ_TIMEOUT: Duration = Duration::from_secs(30);
+const CODEX_LOGIN_ACCOUNT_RETRY_DELAY: Duration = Duration::from_millis(250);
 const CODEX_QUOTA_READ_TIMEOUT: Duration = Duration::from_secs(15);
 const CODEX_QUOTA_RETRY_DELAY: Duration = Duration::from_millis(250);
 const MAX_ACCOUNT_KEY_BYTES: usize = 64;
@@ -2607,14 +2608,37 @@ impl ProviderManagementService for PostgresProviderManagementService {
                 server.shutdown().await;
                 return;
             }
-            let account = timeout(APP_SERVER_READ_TIMEOUT, server.account()).await;
+            let account = timeout(
+                APP_SERVER_READ_TIMEOUT,
+                server.wait_for_account(CODEX_LOGIN_ACCOUNT_RETRY_DELAY),
+            )
+            .await;
             server.shutdown().await;
-            let Ok(Ok(account)) = account else {
-                service
-                    .set_login_failed(login_session_id, "codex_account_validation_failed")
-                    .await;
-                let _ = fs::remove_dir_all(&home);
-                return;
+            let account = match account {
+                Ok(Ok(account)) => account,
+                Ok(Err(error)) => {
+                    tracing::warn!(
+                        %login_session_id,
+                        error = ?error,
+                        "Codex account validation failed after login completion"
+                    );
+                    service
+                        .set_login_failed(login_session_id, "codex_account_validation_failed")
+                        .await;
+                    let _ = fs::remove_dir_all(&home);
+                    return;
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        %login_session_id,
+                        "Codex account was not readable before the validation timeout"
+                    );
+                    service
+                        .set_login_failed(login_session_id, "codex_account_validation_timeout")
+                        .await;
+                    let _ = fs::remove_dir_all(&home);
+                    return;
+                }
             };
             match service
                 .complete_login(

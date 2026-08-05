@@ -1,6 +1,7 @@
 use std::{
     path::{Path, PathBuf},
     process::Stdio,
+    time::Duration,
 };
 
 use axum::http::Uri;
@@ -166,6 +167,20 @@ impl CodexAppServer {
         self.read_account(false).await
     }
 
+    pub async fn wait_for_account(
+        &mut self,
+        retry_delay: Duration,
+    ) -> Result<CodexAccountSnapshot, CodexAppServerError> {
+        loop {
+            match self.account().await {
+                Err(error) if account_read_should_retry(&error) => {
+                    tokio::time::sleep(retry_delay).await;
+                }
+                result => return result,
+            }
+        }
+    }
+
     pub async fn refresh_account(&mut self) -> Result<CodexAccountSnapshot, CodexAppServerError> {
         self.read_account(true).await
     }
@@ -283,6 +298,10 @@ fn response_error(response: &Value) -> Option<CodexAppServerError> {
         .map(|error| CodexAppServerError::Request {
             code: error.get("code").and_then(Value::as_i64),
         })
+}
+
+fn account_read_should_retry(error: &CodexAppServerError) -> bool {
+    matches!(error, CodexAppServerError::Login)
 }
 
 fn parse_login_challenge(
@@ -467,6 +486,16 @@ mod tests {
         assert!(!CodexAppServerError::Request { code: Some(-32603) }.reauthorization_required());
         assert!(!CodexAppServerError::Process.reauthorization_required());
         assert!(!CodexAppServerError::Protocol.reauthorization_required());
+    }
+
+    #[test]
+    fn account_readiness_retry_only_accepts_a_temporarily_missing_account() {
+        assert!(account_read_should_retry(&CodexAppServerError::Login));
+        assert!(!account_read_should_retry(&CodexAppServerError::Request {
+            code: Some(-32603)
+        }));
+        assert!(!account_read_should_retry(&CodexAppServerError::Process));
+        assert!(!account_read_should_retry(&CodexAppServerError::Protocol));
     }
 
     #[test]
