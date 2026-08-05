@@ -1287,6 +1287,152 @@ async fn concurrent_fresh_migrations_are_repeatable() -> TestResult {
 }
 
 #[tokio::test]
+async fn platform_route_backfill_only_selects_unambiguous_mapped_routes() -> TestResult {
+    let Some(test_schema) = TestSchema::new(2).await? else {
+        return Ok(());
+    };
+
+    let result = async {
+        apply_migrations_through(&test_schema.pool, 115).await?;
+
+        let unique_route_id = Uuid::new_v4();
+        let ambiguous_route_ids = [Uuid::new_v4(), Uuid::new_v4()];
+        sqlx::query(
+            r#"
+            INSERT INTO provider_models (
+                provider_id, model_id, execution_model_id, media_kind,
+                display_name, adapter_state, lifecycle_state, operation_ids,
+                source_kind, first_seen_at_ms, last_seen_at_ms, metadata_json
+            )
+            VALUES
+              ('test-unique', 'test-image', 'test-image', 'image',
+               'Test unique image', 'supported', 'enabled',
+               ARRAY['images.generations'], 'adapter_contract', 1, 1, '{}'::JSONB),
+              ('test-ambiguous', 'test-image', 'test-image', 'image',
+               'Test ambiguous image', 'supported', 'enabled',
+               ARRAY['images.generations'], 'adapter_contract', 1, 1, '{}'::JSONB)
+            "#,
+        )
+        .execute(&test_schema.pool)
+        .await
+        .map_err(|error| format!("failed to seed provider models: {error}"))?;
+        sqlx::query(
+            r#"
+            INSERT INTO provider_routes (
+                route_id, revision, route_key, display_name, provider_id,
+                operation_id, command_schema, route_kind,
+                selection_strategy, state, created_at_ms
+            )
+            VALUES
+              ($1, 1, $2, 'Unique route', 'test-unique',
+               'images.generations', 'test.images.generation.v1',
+               'account', 'quota_aware_least_loaded', 'enabled', 1),
+              ($3, 1, $4, 'Ambiguous route one', 'test-ambiguous',
+               'images.generations', 'test.images.generation.v1',
+               'account', 'quota_aware_least_loaded', 'enabled', 1),
+              ($5, 1, $6, 'Ambiguous route two', 'test-ambiguous',
+               'images.generations', 'test.images.generation.v1',
+               'account', 'quota_aware_least_loaded', 'enabled', 1)
+            "#,
+        )
+        .bind(unique_route_id)
+        .bind(format!("test-unique-{}", unique_route_id.simple()))
+        .bind(ambiguous_route_ids[0])
+        .bind(format!(
+            "test-ambiguous-{}",
+            ambiguous_route_ids[0].simple()
+        ))
+        .bind(ambiguous_route_ids[1])
+        .bind(format!(
+            "test-ambiguous-{}",
+            ambiguous_route_ids[1].simple()
+        ))
+        .execute(&test_schema.pool)
+        .await
+        .map_err(|error| format!("failed to seed provider routes: {error}"))?;
+        sqlx::query(
+            r#"
+            INSERT INTO provider_route_heads (
+                route_id, route_key, provider_id, operation_id, command_schema,
+                route_kind, current_revision, state, created_at_ms, updated_at_ms
+            )
+            SELECT route_id, route_key, provider_id, operation_id, command_schema,
+                   route_kind, revision, state, created_at_ms, created_at_ms
+            FROM provider_routes
+            WHERE route_id = ANY($1)
+            "#,
+        )
+        .bind(vec![
+            unique_route_id,
+            ambiguous_route_ids[0],
+            ambiguous_route_ids[1],
+        ])
+        .execute(&test_schema.pool)
+        .await
+        .map_err(|error| format!("failed to seed provider route heads: {error}"))?;
+        sqlx::query(
+            r#"
+            INSERT INTO provider_route_model_mappings (
+                route_id, route_revision, provider_id, operation_id,
+                command_schema, api_profile, public_model_id,
+                provider_model_id, execution_model_id, media_kind, created_at_ms
+            )
+            SELECT route.route_id, route.revision, route.provider_id,
+                   route.operation_id, route.command_schema, 'test-images-v1',
+                   'test-image', 'test-image', 'test-image', 'image', 1
+            FROM provider_routes route
+            WHERE route.route_id = ANY($1)
+            "#,
+        )
+        .bind(vec![
+            unique_route_id,
+            ambiguous_route_ids[0],
+            ambiguous_route_ids[1],
+        ])
+        .execute(&test_schema.pool)
+        .await
+        .map_err(|error| format!("failed to seed provider route mappings: {error}"))?;
+
+        gateway_result(run_migrations(&test_schema.pool).await, "migration failed")?;
+
+        let selected_unique_route: Option<Uuid> = sqlx::query_scalar(
+            r#"
+            SELECT route_id
+            FROM gateway_platform_provider_routes
+            WHERE provider_id = 'test-unique'
+              AND operation_id = 'images.generations'
+            "#,
+        )
+        .fetch_optional(&test_schema.pool)
+        .await
+        .map_err(|error| format!("failed to read unique platform binding: {error}"))?;
+        require(
+            selected_unique_route == Some(unique_route_id),
+            "the unique mapped route must become the platform default",
+        )?;
+        let ambiguous_binding_count: i64 = sqlx::query_scalar(
+            r#"
+            SELECT count(*)
+            FROM gateway_platform_provider_routes
+            WHERE provider_id = 'test-ambiguous'
+              AND operation_id = 'images.generations'
+            "#,
+        )
+        .fetch_one(&test_schema.pool)
+        .await
+        .map_err(|error| format!("failed to inspect ambiguous platform binding: {error}"))?;
+        require(
+            ambiguous_binding_count == 0,
+            "ambiguous mapped routes must not receive a platform default",
+        )
+    }
+    .await;
+    let cleanup = test_schema.cleanup().await;
+    cleanup?;
+    result
+}
+
+#[tokio::test]
 async fn receipt_snapshot_migration_upgrades_an_existing_draft_pool() -> TestResult {
     let Some(test_schema) = TestSchema::new(2).await? else {
         return Ok(());
@@ -3042,8 +3188,8 @@ async fn shared_pool_case(pool: &PgPool) -> TestResult {
 
 async fn assert_expected_schema(pool: &PgPool) -> TestResult {
     require(
-        migration_versions(pool).await? == (0_i64..=115_i64).collect::<Vec<_>>(),
-        "applied migration versions must be exactly 0 through 115",
+        migration_versions(pool).await? == (0_i64..=116_i64).collect::<Vec<_>>(),
+        "applied migration versions must be exactly 0 through 116",
     )?;
 
     let retention_policy: (i64, i64, i64, i64) = sqlx::query_as(
