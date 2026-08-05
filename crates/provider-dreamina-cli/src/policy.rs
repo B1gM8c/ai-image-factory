@@ -128,6 +128,13 @@ impl DreaminaCliPolicyV1 {
         )?
         .env("HOME", self.account_home.path().as_os_str())?
         .env("TMPDIR", workspace.path().as_os_str())?;
+        #[cfg(target_os = "linux")]
+        {
+            command = command.env(
+                "DBUS_SESSION_BUS_ADDRESS",
+                crate::dreamina_secret_service_bus_address(self.account_home.path()),
+            )?;
+        }
         for argument in request.argv()? {
             command = command.arg(argument)?;
         }
@@ -195,6 +202,13 @@ impl DreaminaCliQueryPolicyV1 {
         .require_directory(self.account_home.clone())
         .env("HOME", self.account_home.path().as_os_str())?
         .env("TMPDIR", request.download_dir().as_os_str())?;
+        #[cfg(target_os = "linux")]
+        {
+            command = command.env(
+                "DBUS_SESSION_BUS_ADDRESS",
+                crate::dreamina_secret_service_bus_address(self.account_home.path()),
+            )?;
+        }
         for argument in request.to_argv() {
             command = command.arg(argument)?;
         }

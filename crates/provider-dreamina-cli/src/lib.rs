@@ -5,6 +5,7 @@ mod command;
 mod policy;
 mod receipt;
 mod request;
+mod runtime_environment;
 
 pub use capabilities::{
     DREAMINA_CLI_REMOTE_TASK_CONTROLS_V1, DREAMINA_IMAGE_GENERATION_OPERATION_V1,
@@ -24,6 +25,8 @@ pub use request::{
     ImageModelVersion, ImageRatio, ImageResolution, QueryResultRequestV1, RequestValidationError,
     TextToImageRequestV1, TextToVideoRequestV1, VideoModelVersion, VideoRatio, VideoResolution,
 };
+#[cfg(target_os = "linux")]
+pub use runtime_environment::dreamina_secret_service_bus_address;
 
 pub const PROVIDER_ID: &str = "dreamina-cli";
 pub const ADAPTER_REVISION: &str = "dreamina-cli.remote-task.v1";

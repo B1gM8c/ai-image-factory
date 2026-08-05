@@ -12,6 +12,9 @@ use tokio::{
     time::{Instant, sleep, timeout},
 };
 
+#[cfg(target_os = "linux")]
+use image_provider_dreamina_cli::dreamina_secret_service_bus_address;
+
 use crate::providers::dreamina_cli::prepare_dreamina_account_home;
 
 use super::{CodexLoginMethod, grok_login::copy_proxy_environment};
@@ -230,6 +233,11 @@ async fn run_cli(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    #[cfg(target_os = "linux")]
+    command.env(
+        "DBUS_SESSION_BUS_ADDRESS",
+        dreamina_secret_service_bus_address(home),
+    );
     copy_proxy_environment(&mut command);
     let mut child = command.spawn()?;
     let stdout = child

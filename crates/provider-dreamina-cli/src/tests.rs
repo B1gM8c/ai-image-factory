@@ -630,6 +630,14 @@ printf '{"submit_id":"task-1","gen_status":"querying"}'
             .map(OsString::as_os_str),
         Some(attempt.path().as_os_str())
     );
+    #[cfg(target_os = "linux")]
+    assert_eq!(
+        command
+            .environment()
+            .get(std::ffi::OsStr::new("DBUS_SESSION_BUS_ADDRESS"))
+            .and_then(|value| value.to_str()),
+        Some(crate::dreamina_secret_service_bus_address(account_home.path()).as_str())
+    );
     assert_eq!(command.working_directory().path(), attempt.path());
     assert!(
         command
@@ -696,6 +704,14 @@ fn query_policy_confines_downloads_to_one_direct_workspace_child() {
             .get(std::ffi::OsStr::new("TMPDIR"))
             .map(OsString::as_os_str),
         Some(download.as_os_str())
+    );
+    #[cfg(target_os = "linux")]
+    assert_eq!(
+        command
+            .environment()
+            .get(std::ffi::OsStr::new("DBUS_SESSION_BUS_ADDRESS"))
+            .and_then(|value| value.to_str()),
+        Some(crate::dreamina_secret_service_bus_address(account_home.path()).as_str())
     );
     assert_eq!(command.arguments(), request.to_argv());
 

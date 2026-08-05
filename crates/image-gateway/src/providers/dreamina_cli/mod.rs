@@ -34,7 +34,8 @@ mod poll;
 pub use credential_environment::{
     DreaminaCredentialEnvironmentError, DreaminaKeychainReplacement,
     dreamina_account_isolation_available, dreamina_credential_fingerprint,
-    prepare_dreamina_account_home,
+    prepare_dreamina_account_home, seed_dreamina_reauthorization_home,
+    shutdown_dreamina_account_home,
 };
 pub use poll::{
     DreaminaCliPollDriverConfigError, DreaminaCliPollDriverV1, DreaminaCliPollProcessConfig,

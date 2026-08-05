@@ -35,7 +35,8 @@ use crate::{
     provision_dreamina_video_execution_profile_in_transaction,
     provision_grok_edit_execution_profile_in_transaction,
     provision_grok_execution_profile_in_transaction,
-    provision_grok_video_execution_profile_in_transaction,
+    provision_grok_video_execution_profile_in_transaction, seed_dreamina_reauthorization_home,
+    shutdown_dreamina_account_home,
 };
 
 use super::{
@@ -356,6 +357,15 @@ struct AccountExecutionRuntimeRow {
     profiles_enabled: bool,
 }
 
+async fn remove_dreamina_login_home(home: &Path) {
+    if let Err(error) = shutdown_dreamina_account_home(home).await {
+        tracing::warn!(path = %home.display(), error = ?error, "Dreamina credential service cleanup failed");
+    }
+    if let Err(error) = fs::remove_dir_all(home) {
+        tracing::warn!(path = %home.display(), error = ?error, "Dreamina login home cleanup failed");
+    }
+}
+
 impl PostgresProviderManagementService {
     pub fn new(pool: PgPool, homes_root: PathBuf, codex_executable: PathBuf) -> Self {
         Self {
@@ -646,6 +656,18 @@ impl PostgresProviderManagementService {
 
     async fn expire_stale_logins(&self) -> Result<(), ImageGatewayError> {
         let now = now_ms()?;
+        let stale_dreamina_homes: Vec<String> = sqlx::query_scalar(
+            r#"
+            SELECT environment_ref
+            FROM provider_account_login_sessions
+            WHERE status IN ('starting', 'waiting_for_user', 'validating')
+              AND provider_id = $1
+            "#,
+        )
+        .bind(DREAMINA_PROVIDER_ID)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(store_unavailable)?;
         sqlx::query(
             r#"
             UPDATE provider_account_login_sessions
@@ -659,6 +681,14 @@ impl PostgresProviderManagementService {
         .execute(&self.pool)
         .await
         .map_err(store_unavailable)?;
+        for environment_ref in stale_dreamina_homes {
+            let home = PathBuf::from(environment_ref);
+            if home.is_absolute() && home.starts_with(self.homes_root.as_ref()) {
+                remove_dreamina_login_home(&home).await;
+            } else {
+                tracing::warn!(path = %home.display(), "stale Dreamina login home is outside the managed root");
+            }
+        }
         Ok(())
     }
 
@@ -1787,7 +1817,47 @@ impl PostgresProviderManagementService {
         }
         let login_session_id = Uuid::new_v4();
         let account_key = format!("dreamina-{}", login_session_id.simple());
+        let reauthorization_home = if let Some(provider_account_id) = request.provider_account_id {
+            let destination_ref: String = sqlx::query_scalar(
+                r#"
+                SELECT environment_ref
+                FROM provider_account_environments
+                WHERE provider_account_id = $1 AND provider_id = $2
+                "#,
+            )
+            .bind(provider_account_id)
+            .bind(DREAMINA_PROVIDER_ID)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(store_unavailable)?
+            .ok_or_else(|| {
+                ImageGatewayError::not_found(
+                    "Managed Dreamina account not found",
+                    Some("provider_account_id".to_owned()),
+                    "provider_account_not_found",
+                )
+            })?;
+            let destination_home = PathBuf::from(destination_ref);
+            if !destination_home.is_absolute()
+                || !destination_home.starts_with(self.homes_root.as_ref())
+            {
+                return Err(ImageGatewayError::service_unavailable(
+                    "Dreamina reauthorization environment is invalid",
+                ));
+            }
+            Some(destination_home)
+        } else {
+            None
+        };
         let home = self.create_login_home("dreamina", login_session_id)?;
+        if reauthorization_home.is_some_and(|destination_home| {
+            seed_dreamina_reauthorization_home(&home, &destination_home).is_err()
+        }) {
+            let _ = fs::remove_dir_all(&home);
+            return Err(ImageGatewayError::service_unavailable(
+                "Dreamina reauthorization environment is invalid",
+            ));
+        }
         let now = now_ms()?;
         let expires_at_ms = now.saturating_add(LOGIN_TTL.as_millis() as i64);
         let inserted = sqlx::query(
@@ -1826,14 +1896,14 @@ impl PostgresProviderManagementService {
                 tracing::warn!(%login_session_id, error = ?error, "Dreamina login could not start");
                 self.set_login_failed(login_session_id, "dreamina_login_start_failed")
                     .await;
-                let _ = fs::remove_dir_all(&home);
+                remove_dreamina_login_home(&home).await;
                 return Err(ImageGatewayError::service_unavailable(
                     "Dreamina login could not be started",
                 ));
             }
         };
         let updated_at_ms = now_ms()?;
-        sqlx::query(
+        let updated = sqlx::query(
             r#"
             UPDATE provider_account_login_sessions
             SET status = 'waiting_for_user', provider_login_id = $2,
@@ -1847,8 +1917,11 @@ impl PostgresProviderManagementService {
         .bind(challenge.user_code)
         .bind(updated_at_ms)
         .execute(&self.pool)
-        .await
-        .map_err(store_unavailable)?;
+        .await;
+        if let Err(error) = updated {
+            remove_dreamina_login_home(&home).await;
+            return Err(store_unavailable(error));
+        }
 
         let service = self.clone();
         let display_name = request.display_name.trim().to_owned();
@@ -1859,7 +1932,7 @@ impl PostgresProviderManagementService {
                     service
                         .set_login_failed(login_session_id, "dreamina_login_failed")
                         .await;
-                    let _ = fs::remove_dir_all(&home);
+                    remove_dreamina_login_home(&home).await;
                     return;
                 }
             };
@@ -1879,6 +1952,7 @@ impl PostgresProviderManagementService {
             .map(|result| result.rows_affected() == 1)
             .unwrap_or(false);
             if !transitioned {
+                remove_dreamina_login_home(&home).await;
                 return;
             }
             match service
@@ -1898,7 +1972,7 @@ impl PostgresProviderManagementService {
             {
                 Ok(_) => {
                     if request.provider_account_id.is_some() {
-                        let _ = fs::remove_dir_all(&home);
+                        remove_dreamina_login_home(&home).await;
                     }
                 }
                 Err(error) => {
@@ -1906,7 +1980,7 @@ impl PostgresProviderManagementService {
                     service
                         .set_login_failed(login_session_id, "provider_account_provisioning_failed")
                         .await;
-                    let _ = fs::remove_dir_all(&home);
+                    remove_dreamina_login_home(&home).await;
                 }
             }
         });
@@ -2076,9 +2150,18 @@ impl PostgresProviderManagementService {
         }
         .await;
         match result {
-            Ok(()) => Ok(provider_account_id),
+            Ok(()) => {
+                if let Err(error) = replacement.commit() {
+                    tracing::warn!(
+                        %provider_account_id,
+                        error = ?error,
+                        "Dreamina keychain backup cleanup failed"
+                    );
+                }
+                Ok(provider_account_id)
+            }
             Err(error) => {
-                if let Err(rollback_error) = replacement.rollback() {
+                if let Err(rollback_error) = replacement.rollback().await {
                     tracing::error!(
                         %provider_account_id,
                         error = ?rollback_error,
