@@ -1604,6 +1604,13 @@ function operationLabel(t: Translate, operationId: string) {
       ja: "画像生成",
       ko: "이미지 생성",
     });
+  if (operationId === "images.edits")
+    return t({
+      en: "Image editing",
+      "zh-CN": "图片编辑",
+      ja: "画像編集",
+      ko: "이미지 편집",
+    });
   if (operationId === "videos.generations")
     return t({
       en: "Video generation",
