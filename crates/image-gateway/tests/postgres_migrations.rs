@@ -1393,7 +1393,7 @@ async fn platform_route_backfill_only_selects_unambiguous_mapped_routes() -> Tes
         .await
         .map_err(|error| format!("failed to seed provider route mappings: {error}"))?;
 
-        gateway_result(run_migrations(&test_schema.pool).await, "migration failed")?;
+        apply_migration_range(&test_schema.pool, 116, 116).await?;
 
         let selected_unique_route: Option<Uuid> = sqlx::query_scalar(
             r#"
