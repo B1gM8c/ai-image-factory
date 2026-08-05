@@ -2306,8 +2306,8 @@ impl ProviderManagementService for PostgresProviderManagementService {
                         .is_none()
                         .then(|| "Grok CLI 未安装或未配置".to_owned()),
                     login_methods: vec![
-                        CodexLoginMethod::BrowserOauth,
                         CodexLoginMethod::DeviceCode,
+                        CodexLoginMethod::BrowserOauth,
                     ],
                     operation_ids: vec![
                         "images.generations".to_owned(),

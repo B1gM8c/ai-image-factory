@@ -1,8 +1,8 @@
 use std::{path::Path, process::Stdio, time::Duration};
 
 use tokio::{
-    io::{AsyncBufReadExt, BufReader},
-    process::{Child, ChildStdout, Command},
+    io::{AsyncBufRead, AsyncBufReadExt, BufReader},
+    process::{Child, ChildStderr, ChildStdout, Command},
     time::timeout,
 };
 
@@ -18,7 +18,8 @@ pub(super) struct GrokLoginChallenge {
 
 pub(super) struct GrokLoginProcess {
     child: Child,
-    output: BufReader<ChildStdout>,
+    stdout: BufReader<ChildStdout>,
+    stderr: BufReader<ChildStderr>,
 }
 
 impl GrokLoginProcess {
@@ -38,7 +39,7 @@ impl GrokLoginProcess {
             .env("PATH", "/usr/local/bin:/usr/bin:/bin")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .kill_on_drop(true);
         copy_proxy_environment(&mut command);
         let mut child = command.spawn()?;
@@ -46,9 +47,14 @@ impl GrokLoginProcess {
             .stdout
             .take()
             .ok_or_else(|| std::io::Error::other("Grok login output is unavailable"))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| std::io::Error::other("Grok login error output is unavailable"))?;
         let mut process = Self {
             child,
-            output: BufReader::new(stdout),
+            stdout: BufReader::new(stdout),
+            stderr: BufReader::new(stderr),
         };
         let challenge = timeout(CHALLENGE_TIMEOUT, process.read_challenge(method))
             .await
@@ -56,61 +62,109 @@ impl GrokLoginProcess {
         Ok((process, challenge))
     }
 
-    pub async fn wait(mut self) -> std::io::Result<bool> {
-        let mut total = 0_usize;
-        let mut line = String::new();
-        loop {
-            line.clear();
-            let read = self.output.read_line(&mut line).await?;
-            if read == 0 {
-                break;
-            }
-            total = total.saturating_add(read);
-            if total > MAX_LOGIN_OUTPUT_BYTES {
-                let _ = self.child.kill().await;
-                return Err(std::io::Error::other("Grok login output exceeded limit"));
-            }
-        }
-        Ok(self.child.wait().await?.success())
+    pub async fn wait(self) -> std::io::Result<bool> {
+        let Self {
+            mut child,
+            mut stdout,
+            mut stderr,
+        } = self;
+        let (_, _, status) = tokio::try_join!(
+            drain_bounded_output(&mut stdout),
+            drain_bounded_output(&mut stderr),
+            child.wait(),
+        )?;
+        Ok(status.success())
     }
 
     async fn read_challenge(
         &mut self,
         method: CodexLoginMethod,
     ) -> std::io::Result<GrokLoginChallenge> {
-        let mut output = String::new();
-        loop {
-            let mut line = String::new();
-            let read = self.output.read_line(&mut line).await?;
-            if read == 0 {
-                return Err(std::io::Error::other(
-                    "Grok login exited before returning a challenge",
-                ));
+        let mut stdout = String::new();
+        let mut stderr = String::new();
+        let mut stdout_open = true;
+        let mut stderr_open = true;
+        while stdout_open || stderr_open {
+            let (from_stdout, read) = match (stdout_open, stderr_open) {
+                (true, true) => tokio::select! {
+                    read = read_output_line(&mut self.stdout, &mut stdout) => (true, read?),
+                    read = read_output_line(&mut self.stderr, &mut stderr) => (false, read?),
+                },
+                (true, false) => (true, read_output_line(&mut self.stdout, &mut stdout).await?),
+                (false, true) => (
+                    false,
+                    read_output_line(&mut self.stderr, &mut stderr).await?,
+                ),
+                (false, false) => unreachable!(),
+            };
+            if from_stdout {
+                stdout_open = read != 0;
+            } else {
+                stderr_open = read != 0;
             }
-            output.push_str(&strip_ansi(&line));
-            if output.len() > MAX_LOGIN_OUTPUT_BYTES {
+            if stdout.len().saturating_add(stderr.len()) > MAX_LOGIN_OUTPUT_BYTES {
                 return Err(std::io::Error::other("Grok login output exceeded limit"));
             }
-            let Some(url) = first_https_url(&output) else {
-                continue;
-            };
-            if !allowed_login_url(&url, method) {
-                return Err(std::io::Error::other("Grok login returned an invalid URL"));
+            for output in [&stdout, &stderr] {
+                if let Some(challenge) = challenge_from_output(output, method)? {
+                    return Ok(challenge);
+                }
             }
-            let user_code = if method == CodexLoginMethod::DeviceCode {
-                query_value(&url, "user_code")
-            } else {
-                None
-            };
-            if method == CodexLoginMethod::DeviceCode && user_code.is_none() {
-                continue;
-            }
-            return Ok(GrokLoginChallenge {
-                authorization_url: url,
-                user_code,
-            });
+        }
+        Err(std::io::Error::other(
+            "Grok login exited before returning a challenge",
+        ))
+    }
+}
+
+async fn read_output_line(
+    reader: &mut (impl AsyncBufRead + Unpin),
+    output: &mut String,
+) -> std::io::Result<usize> {
+    let mut line = Vec::new();
+    let read = reader.read_until(b'\n', &mut line).await?;
+    output.push_str(&strip_ansi(&String::from_utf8_lossy(&line)));
+    Ok(read)
+}
+
+async fn drain_bounded_output(reader: &mut (impl AsyncBufRead + Unpin)) -> std::io::Result<()> {
+    let mut total = 0_usize;
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        let read = reader.read_until(b'\n', &mut line).await?;
+        if read == 0 {
+            return Ok(());
+        }
+        total = total.saturating_add(read);
+        if total > MAX_LOGIN_OUTPUT_BYTES {
+            return Err(std::io::Error::other("Grok login output exceeded limit"));
         }
     }
+}
+
+fn challenge_from_output(
+    output: &str,
+    method: CodexLoginMethod,
+) -> std::io::Result<Option<GrokLoginChallenge>> {
+    let Some(url) = first_https_url(output) else {
+        return Ok(None);
+    };
+    if !allowed_login_url(&url, method) {
+        return Err(std::io::Error::other("Grok login returned an invalid URL"));
+    }
+    let user_code = if method == CodexLoginMethod::DeviceCode {
+        query_value(&url, "user_code")
+    } else {
+        None
+    };
+    if method == CodexLoginMethod::DeviceCode && user_code.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(GrokLoginChallenge {
+        authorization_url: url,
+        user_code,
+    }))
 }
 
 #[cfg(target_os = "macos")]
@@ -233,6 +287,9 @@ fn query_value(url: &str, key: &str) -> Option<String> {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    use std::{fs, os::unix::fs::PermissionsExt};
+
     #[test]
     fn parses_bounded_device_challenge() {
         let output =
@@ -249,5 +306,31 @@ mod tests {
             "https://example.test/oauth2/authorize?x=1",
             CodexLoginMethod::BrowserOauth,
         ));
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn accepts_device_challenge_written_to_stderr() {
+        let root = tempfile::tempdir().expect("temporary root");
+        let executable = root.path().join("grok");
+        fs::write(
+            &executable,
+            "#!/bin/sh\nprintf '%s\\n' 'https://accounts.x.ai/oauth2/device?user_code=ABCD-1234' >&2\n",
+        )
+        .expect("write fake Grok CLI");
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700))
+            .expect("make fake Grok CLI executable");
+
+        let (process, challenge) =
+            GrokLoginProcess::start(&executable, root.path(), CodexLoginMethod::DeviceCode)
+                .await
+                .expect("read challenge from stderr");
+
+        assert_eq!(
+            challenge.authorization_url,
+            "https://accounts.x.ai/oauth2/device?user_code=ABCD-1234"
+        );
+        assert_eq!(challenge.user_code.as_deref(), Some("ABCD-1234"));
+        assert!(process.wait().await.expect("wait for fake Grok CLI"));
     }
 }

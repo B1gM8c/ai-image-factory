@@ -1843,6 +1843,7 @@ function AddCliAccountDialog({
   const [displayName, setDisplayName] = useState("");
   const [loginMethod, setLoginMethod] =
     useState<ProviderLoginSession["login_method"]>("browser_oauth");
+  const [localBrowserOAuth, setLocalBrowserOAuth] = useState(false);
   const [maxConcurrency, setMaxConcurrency] = useState(1);
   const [selectedOperations, setSelectedOperations] = useState<Set<string>>(
     new Set(["images.generations"]),
@@ -1856,6 +1857,27 @@ function AddCliAccountDialog({
     Number.isInteger(maxConcurrency) &&
     maxConcurrency >= 1 &&
     maxConcurrency <= maxConcurrencyLimit;
+
+  useEffect(() => {
+    setLocalBrowserOAuth(
+      ["localhost", "127.0.0.1", "::1"].includes(window.location.hostname),
+    );
+  }, []);
+
+  const browserOAuthAvailable =
+    selectedProvider?.login_methods.includes("browser_oauth") &&
+    (provider !== "grok-cli" || localBrowserOAuth);
+
+  useEffect(() => {
+    if (
+      open &&
+      provider === "grok-cli" &&
+      !localBrowserOAuth &&
+      loginMethod === "browser_oauth"
+    ) {
+      setLoginMethod("device_code");
+    }
+  }, [localBrowserOAuth, loginMethod, open, provider]);
 
   useEffect(() => {
     if (open && account) {
@@ -2136,9 +2158,7 @@ function AddCliAccountDialog({
                 <TabsList className="grid w-full grid-cols-2">
                   <TabsTrigger
                     value="browser_oauth"
-                    disabled={
-                      !selectedProvider?.login_methods.includes("browser_oauth")
-                    }
+                    disabled={!browserOAuthAvailable}
                   >
                     {t({
                       en: "Browser OAuth",
