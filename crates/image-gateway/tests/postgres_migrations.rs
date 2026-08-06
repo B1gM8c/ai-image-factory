@@ -3314,8 +3314,8 @@ async fn shared_pool_case(pool: &PgPool) -> TestResult {
 
 async fn assert_expected_schema(pool: &PgPool) -> TestResult {
     require(
-        migration_versions(pool).await? == (0_i64..=118_i64).collect::<Vec<_>>(),
-        "applied migration versions must be exactly 0 through 118",
+        migration_versions(pool).await? == (0_i64..=119_i64).collect::<Vec<_>>(),
+        "applied migration versions must be exactly 0 through 119",
     )?;
 
     let default_codex_prices: Vec<(String, i64, i64)> = sqlx::query_as(
@@ -3410,6 +3410,41 @@ async fn assert_expected_schema(pool: &PgPool) -> TestResult {
                 ),
             ],
         "fresh migrations must publish bound Grok generation and edit prices",
+    )?;
+
+    let grok_provider_actual: Vec<(String, String, String, i64)> = sqlx::query_as(
+        r#"
+        SELECT version.media_kind, version.api_profile, version.operation,
+               count(component.price_component_id)::BIGINT
+        FROM price_books book
+        JOIN price_book_versions version USING (price_book_id)
+        LEFT JOIN price_components component USING (price_book_version_id)
+        WHERE book.price_book_key = 'provider_actual.grok-cli.reported'
+          AND book.purpose = 'provider_actual'
+          AND book.scope_type = 'platform'
+          AND book.provider_id = 'grok-cli'
+          AND book.state = 'active'
+          AND version.state = 'active'
+          AND version.provider_id = 'grok-cli'
+          AND version.provider_model_id IS NULL
+          AND version.public_model_id = '*'
+          AND version.service_tier = '*'
+          AND version.execution_surface = 'provider_cli'
+          AND version.billing_mode = 'provider_reported'
+        GROUP BY version.media_kind, version.api_profile, version.operation
+        ORDER BY version.media_kind
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|error| format!("failed to inspect Grok provider actual pricing: {error}"))?;
+    require(
+        grok_provider_actual
+            == vec![
+                ("image".to_string(), "*".to_string(), "*".to_string(), 0),
+                ("video".to_string(), "*".to_string(), "*".to_string(), 0),
+            ],
+        "fresh migrations must accept provider-reported Grok image and video costs",
     )?;
 
     let retention_policy: (i64, i64, i64, i64) = sqlx::query_as(

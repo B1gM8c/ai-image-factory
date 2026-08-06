@@ -2,6 +2,7 @@
 Description=AI Image Factory executor for profile %i
 PartOf=ai-image-factory-processes.target
 Requires=ai-image-factory-recovery-gate.service
+Wants=ai-image-factory-workerd@%i.service
 After=network-online.target ai-image-factory-recovery-gate.service ai-image-factory-reconcilerd.service
 Before=ai-image-factory-reducerd.service
 
