@@ -3314,8 +3314,8 @@ async fn shared_pool_case(pool: &PgPool) -> TestResult {
 
 async fn assert_expected_schema(pool: &PgPool) -> TestResult {
     require(
-        migration_versions(pool).await? == (0_i64..=117_i64).collect::<Vec<_>>(),
-        "applied migration versions must be exactly 0 through 117",
+        migration_versions(pool).await? == (0_i64..=118_i64).collect::<Vec<_>>(),
+        "applied migration versions must be exactly 0 through 118",
     )?;
 
     let default_codex_prices: Vec<(String, i64, i64)> = sqlx::query_as(
@@ -3353,6 +3353,63 @@ async fn assert_expected_schema(pool: &PgPool) -> TestResult {
                 ("generation".to_string(), 40000, 1),
             ],
         "fresh migrations must publish bound Codex generation and edit prices",
+    )?;
+
+    let default_grok_prices: Vec<(String, String, i64, i64)> = sqlx::query_as(
+        r#"
+        SELECT version.operation, version.provider_model_id,
+               component.unit_price_micros,
+               count(binding.contract_key)::BIGINT
+        FROM price_books book
+        JOIN price_book_versions version USING (price_book_id)
+        JOIN price_components component USING (price_book_version_id)
+        LEFT JOIN price_book_version_surface_contract_bindings binding
+          USING (price_book_version_id)
+        WHERE book.purpose = 'customer_sale'
+          AND book.scope_type = 'platform'
+          AND book.state = 'active'
+          AND version.state = 'active'
+          AND version.api_profile = 'xai-images-v1'
+          AND version.operation IN ('generation', 'edit')
+          AND version.provider_id = 'grok-cli'
+          AND version.provider_model_id IN (
+              'grok-imagine-image', 'grok-imagine-image-quality'
+          )
+          AND version.public_model_id = version.provider_model_id
+          AND version.media_kind = 'image'
+          AND version.execution_surface = 'provider_cli'
+          AND component.outcome = 'succeeded'
+        GROUP BY version.operation, version.provider_model_id,
+                 component.unit_price_micros
+        ORDER BY version.operation, version.provider_model_id
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|error| format!("failed to inspect default Grok pricing: {error}"))?;
+    require(
+        default_grok_prices
+            == vec![
+                (
+                    "edit".to_string(),
+                    "grok-imagine-image-quality".to_string(),
+                    50000,
+                    1,
+                ),
+                (
+                    "generation".to_string(),
+                    "grok-imagine-image".to_string(),
+                    20000,
+                    1,
+                ),
+                (
+                    "generation".to_string(),
+                    "grok-imagine-image-quality".to_string(),
+                    50000,
+                    1,
+                ),
+            ],
+        "fresh migrations must publish bound Grok generation and edit prices",
     )?;
 
     let retention_policy: (i64, i64, i64, i64) = sqlx::query_as(
