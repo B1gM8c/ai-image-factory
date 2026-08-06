@@ -1,0 +1,40 @@
+name: Temporary inline Codex workerd build
+
+on:
+  push:
+    branches:
+      - codex/fix-inline-codex-output
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends libssl-dev pkg-config
+
+      - name: Build workerd
+        env:
+          CARGO_BUILD_JOBS: 2
+        run: cargo build --locked --release --package gpt-image-2-gateway --bin workerd
+
+      - name: Collect binary
+        run: |
+          mkdir -p dist/bin
+          install -m 0755 target/release/workerd dist/bin/workerd
+          sha256sum dist/bin/workerd > dist/SHA256SUMS
+          git rev-parse HEAD > dist/COMMIT_SHA
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: inline-codex-workerd-linux-x86_64
+          path: dist
+          if-no-files-found: error
+          retention-days: 1
