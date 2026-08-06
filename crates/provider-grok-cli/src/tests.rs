@@ -713,7 +713,7 @@ fn receipt_rejects_fractional_or_incomplete_exact_ticks() {
 }
 
 #[test]
-fn receipt_rejects_agent_argument_drift_and_artifact_escape() {
+fn image_generation_receipt_accepts_bounded_prompt_normalization() {
     let fixture = PolicyFixture::new();
     let request =
         GrokImageGenerationRequestV1::new("original", ImageModel::Quality, ImageAspectRatio::R1x1)
@@ -726,10 +726,72 @@ fn receipt_rejects_agent_argument_drift_and_artifact_escape() {
 
     let drifted_arguments = json!({"prompt":"rewritten", "aspect_ratio":"1:1"});
     let history = history_with(&invocation, drifted_arguments, invocation.artifact_path());
+    let receipt = parse_invocation_receipt(&valid_stdout(), &history, &invocation).unwrap();
+    assert_eq!(receipt.effective_tool_prompt(), Some("rewritten"));
+}
+
+#[test]
+fn image_generation_receipt_rejects_execution_argument_drift() {
+    let fixture = PolicyFixture::new();
+    let request =
+        GrokImageGenerationRequestV1::new("original", ImageModel::Quality, ImageAspectRatio::R1x1)
+            .unwrap();
+    let (_, invocation) = fixture
+        .policy
+        .command_spec_in(&request.into(), SESSION_ID, fixture.workspace.clone())
+        .unwrap();
+    write_artifact(&invocation);
+
+    for drifted_arguments in [
+        json!({"prompt":"rewritten", "aspect_ratio":"16:9"}),
+        json!({"prompt":"rewritten", "aspect_ratio":"1:1", "model":"other"}),
+        json!({"prompt":"rewritten"}),
+        json!({"prompt":"", "aspect_ratio":"1:1"}),
+        json!({"prompt":"x".repeat(1_025), "aspect_ratio":"1:1"}),
+    ] {
+        let history = history_with(&invocation, drifted_arguments, invocation.artifact_path());
+        assert!(matches!(
+            parse_invocation_receipt(&valid_stdout(), &history, &invocation),
+            Err(GrokReceiptError::ToolArgumentsMismatch)
+        ));
+    }
+}
+
+#[test]
+fn image_edit_receipt_keeps_exact_prompt_binding() {
+    let fixture = PolicyFixture::new();
+    let request = GrokImageEditRequestV1::new(
+        "original",
+        vec![staged("one.png"), staged("two.png")],
+        ImageAspectRatio::R1x1,
+    )
+    .unwrap();
+    let (_, invocation) = fixture
+        .policy
+        .command_spec_in(&request.into(), SESSION_ID, fixture.workspace.clone())
+        .unwrap();
+    write_artifact(&invocation);
+
+    let mut drifted_arguments = invocation.expected_arguments().clone();
+    drifted_arguments["prompt"] = json!("rewritten");
+    let history = history_with(&invocation, drifted_arguments, invocation.artifact_path());
     assert!(matches!(
         parse_invocation_receipt(&valid_stdout(), &history, &invocation),
         Err(GrokReceiptError::ToolArgumentsMismatch)
     ));
+}
+
+#[test]
+fn image_generation_receipt_still_rejects_artifact_escape() {
+    let fixture = PolicyFixture::new();
+    let request =
+        GrokImageGenerationRequestV1::new("original", ImageModel::Quality, ImageAspectRatio::R1x1)
+            .unwrap();
+    let (_, invocation) = fixture
+        .policy
+        .command_spec_in(&request.into(), SESSION_ID, fixture.workspace.clone())
+        .unwrap();
+    write_artifact(&invocation);
 
     let history = history_with(
         &invocation,

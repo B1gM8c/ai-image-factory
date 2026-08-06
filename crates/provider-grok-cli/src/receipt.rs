@@ -4,7 +4,7 @@ use image_provider_contracts::{ProviderCostEvidenceScope, ProviderReportedCostEv
 use serde_json::{Map, Value};
 use thiserror::Error;
 
-use crate::{GrokExpectedToolCallV1, GrokInvocationV1, PROVIDER_ID};
+use crate::{GrokExpectedToolCallV1, GrokInvocationV1, GrokTool, MAX_PROMPT_CHARS, PROVIDER_ID};
 
 pub const MAX_STDOUT_BYTES: usize = 64 * 1024;
 pub const MAX_HISTORY_BYTES: usize = 1024 * 1024;
@@ -217,9 +217,7 @@ fn parse_history(
                         .ok_or(GrokReceiptError::InvalidHistoryJson)?;
                     let arguments: Value = serde_json::from_str(arguments)
                         .map_err(|_| GrokReceiptError::InvalidHistoryJson)?;
-                    if arguments != *expected.arguments() {
-                        return Err(GrokReceiptError::ToolArgumentsMismatch);
-                    }
+                    validate_tool_arguments(expected, &arguments)?;
                     pending_call = Some((id.to_owned(), arguments));
                 }
             }
@@ -263,6 +261,49 @@ fn parse_history(
     Ok(ParsedToolResult {
         effective_tool_prompt,
     })
+}
+
+fn validate_tool_arguments(
+    expected: &GrokExpectedToolCallV1,
+    actual: &Value,
+) -> Result<(), GrokReceiptError> {
+    if actual == expected.arguments() {
+        return Ok(());
+    }
+    if expected.tool() != GrokTool::ImageGeneration {
+        return Err(GrokReceiptError::ToolArgumentsMismatch);
+    }
+
+    // The agent may normalize image prompts; routing and execution controls remain exact.
+    let expected = expected
+        .arguments()
+        .as_object()
+        .ok_or(GrokReceiptError::ToolArgumentsMismatch)?;
+    let actual = actual
+        .as_object()
+        .ok_or(GrokReceiptError::ToolArgumentsMismatch)?;
+    if expected.len() != actual.len()
+        || expected.iter().any(|(field, expected_value)| {
+            field != "prompt" && actual.get(field) != Some(expected_value)
+        })
+        || actual.keys().any(|field| !expected.contains_key(field))
+    {
+        return Err(GrokReceiptError::ToolArgumentsMismatch);
+    }
+
+    actual
+        .get("prompt")
+        .and_then(Value::as_str)
+        .filter(|prompt| {
+            !prompt.trim().is_empty()
+                && !prompt.contains('\0')
+                && prompt.chars().count() <= MAX_PROMPT_CHARS
+        })
+        .ok_or(GrokReceiptError::ToolArgumentsMismatch)?;
+    if !expected.get("prompt").is_some_and(Value::is_string) {
+        return Err(GrokReceiptError::ToolArgumentsMismatch);
+    }
+    Ok(())
 }
 
 fn validate_tool_result(

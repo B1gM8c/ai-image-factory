@@ -630,6 +630,11 @@ async fn run_grok_child(
         }
     };
     let artifact_path = invocation.artifact_path().to_path_buf();
+    let admitted_prompt_sha256 = invocation
+        .expected_arguments()
+        .get("prompt")
+        .and_then(Value::as_str)
+        .map(|prompt| sha256(prompt.as_bytes()));
     let provider_home = match spool.provider_home_path() {
         Ok(path) => path,
         Err(_) => return ChildOutcome::Uncertain("grok_provider_home_invalid"),
@@ -657,6 +662,20 @@ async fn run_grok_child(
         Ok(success) => {
             if success.receipt.artifact_path() != artifact_path {
                 return ChildOutcome::Uncertain("grok_artifact_invalid");
+            }
+            if let (Some(admitted), Some(effective)) = (
+                admitted_prompt_sha256.as_deref(),
+                success.receipt.effective_tool_prompt(),
+            ) {
+                let effective = sha256(effective.as_bytes());
+                if effective != admitted {
+                    tracing::info!(
+                        executor.execution_id = %executor_execution_id,
+                        prompt.admitted_sha256 = admitted,
+                        prompt.effective_sha256 = effective,
+                        "Grok agent normalized the admitted tool prompt"
+                    );
+                }
             }
             let provider_reported_cost = success.receipt.provider_reported_cost().cloned();
             match spool
