@@ -101,6 +101,7 @@ const MANAGED_PROVIDERS_ENDPOINT = "/admin/v1/managed-cli-providers";
 const PROVIDER_MODELS_ENDPOINT = "/admin/v1/provider-models";
 const ACCOUNT_RUNTIME_EVENTS_ENDPOINT =
   "/api/gateway/admin/v1/provider-account-runtime-events";
+const RUNTIME_RESYNC_DEBOUNCE_MS = 500;
 const EMPTY_QUEUE_PRESSURE: ProviderQueuePressure = {
   queued_work_items: "0",
   pending_batch_requests: "0",
@@ -132,6 +133,7 @@ export function AdminProviderAccounts() {
     useState<ProviderQueuePressure>(EMPTY_QUEUE_PRESSURE);
   const runtimeSequence = useRef(-1);
   const runtimeAsOf = useRef(-1);
+  const runtimeResyncTimer = useRef<number | null>(null);
 
   const accounts = useMemo(
     () =>
@@ -183,7 +185,13 @@ export function AdminProviderAccounts() {
       if (event.kind === "resync_required") {
         setRuntimeAccounts({});
         setRuntimeQueue(EMPTY_QUEUE_PRESSURE);
-        accountsQuery.retry();
+        if (runtimeResyncTimer.current) {
+          window.clearTimeout(runtimeResyncTimer.current);
+        }
+        runtimeResyncTimer.current = window.setTimeout(() => {
+          runtimeResyncTimer.current = null;
+          accountsQuery.retry();
+        }, RUNTIME_RESYNC_DEBOUNCE_MS);
         return;
       }
       if (event.kind === "delta" && event.sequence <= runtimeSequence.current)
@@ -210,7 +218,13 @@ export function AdminProviderAccounts() {
         return next;
       });
     };
-    return () => source.close();
+    return () => {
+      source.close();
+      if (runtimeResyncTimer.current) {
+        window.clearTimeout(runtimeResyncTimer.current);
+        runtimeResyncTimer.current = null;
+      }
+    };
   }, [accountsQuery.retry]);
 
   useEffect(() => {

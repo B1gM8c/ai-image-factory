@@ -22,8 +22,9 @@ export function SessionKeeper() {
 
     const expire = () => {
       if (!active) return;
+      active = false;
+      if (timer) clearTimeout(timer);
       router.replace("/login");
-      router.refresh();
     };
 
     const schedule = async () => {

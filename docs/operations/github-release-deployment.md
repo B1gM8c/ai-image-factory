@@ -359,10 +359,12 @@ sudo systemctl enable ai-image-factory-webhookd.service
 sudo systemctl restart ai-image-factory-processes.target
 ```
 
-Additional executor profiles use escaped systemd instances:
+Each enabled execution profile uses paired, escaped dispatcher and executor
+instances. Enable both instances after provisioning the profile:
 
 ```bash
 sudo systemctl enable --now \
+  "ai-image-factory-workerd@$(systemd-escape 'PROFILE_KEY').service" \
   "ai-image-factory-executord@$(systemd-escape 'PROFILE_KEY').service"
 ```
 

@@ -1,20 +1,20 @@
 [Unit]
-Description=AI Image Factory executor for profile %i
+Description=AI Image Factory durable work dispatcher for profile %i
 PartOf=ai-image-factory-processes.target
 Requires=ai-image-factory-recovery-gate.service
-After=network-online.target ai-image-factory-recovery-gate.service ai-image-factory-reconcilerd.service
-Before=ai-image-factory-reducerd.service
+Requires=ai-image-factory-executord@%i.service
+After=network-online.target ai-image-factory-recovery-gate.service ai-image-factory-reconcilerd.service ai-image-factory-reducerd.service ai-image-factory-executord@%i.service
+Before=ai-image-factory-provider-submitd.service ai-image-factory-provider-pollerd.service ai-image-factory-gateway.service
 
 [Service]
 Type=simple
 User=ai-image-factory
 Group=ai-image-factory
 EnvironmentFile=/etc/ai-image-factory/app.env
-EnvironmentFile=-/etc/ai-image-factory/executors/%I.env
+Environment=WORKER_EXECUTION_MODE=executor-handoff
 Environment=EXECUTOR_PROFILE_KEY=%I
-Environment=EXECUTOR_OWNER=executord-%H-%I
 WorkingDirectory=/opt/ai-image-factory/current
-ExecStart=/opt/ai-image-factory/current/bin/executord
+ExecStart=/opt/ai-image-factory/current/bin/workerd
 Restart=on-failure
 RestartSec=5s
 TimeoutStopSec=15min
