@@ -29,7 +29,10 @@ use super::{
 use crate::{
     ImageGatewayError, ProxyConfig,
     generator::GenerationJob,
-    providers::openai_codex::{build_codex_prompt_for_output, provider_output_filename},
+    providers::openai_codex::{
+        build_codex_prompt_for_output, provider_output_filename, read_codex_output,
+        select_image_output,
+    },
     runner::{
         FilesystemRunnerJournal, LaunchDecision,
         process::{
@@ -545,11 +548,14 @@ async fn run_codex_child(
         Ok(result) => ChildOutcome::Succeeded(result.sink),
         Err(error) if ephemeral_capture_fallback_allowed(&error) => match captured {
             Ok(Some(bytes)) => ChildOutcome::Succeeded(bytes),
-            Ok(None) => match final_workspace_output(
+            Ok(None) => match final_fallback_output(
                 &spool,
                 capture_filename,
+                codex_home,
                 &request.output.output_format,
-            ) {
+            )
+            .await
+            {
                 Ok(Some(bytes)) => ChildOutcome::Succeeded(bytes),
                 Ok(None) => map_cli_runtime_error(error),
                 Err(ProcessSpoolError::Integrity) => {
@@ -571,6 +577,30 @@ async fn run_codex_child(
             ) => ChildOutcome::Uncertain("codex_ephemeral_output_unavailable"),
         },
         Err(error) => map_cli_runtime_error(error),
+    }
+}
+
+async fn final_fallback_output(
+    spool: &ExecutionSpool,
+    workspace_filename: &str,
+    codex_home: &Path,
+    output_format: &str,
+) -> Result<Option<Vec<u8>>, ProcessSpoolError> {
+    if let Some(bytes) = final_workspace_output(spool, workspace_filename, output_format)? {
+        return Ok(Some(bytes));
+    }
+
+    let generated_images = codex_home.join("generated_images");
+    let Some(path) = select_image_output(&generated_images, output_format) else {
+        return Ok(None);
+    };
+    let bytes = read_codex_output(&path)
+        .await
+        .map_err(|_| ProcessSpoolError::Unavailable)?;
+    if valid_captured_image(&bytes, output_format) {
+        Ok(Some(bytes))
+    } else {
+        Err(ProcessSpoolError::Integrity)
     }
 }
 
@@ -1371,6 +1401,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recovers_isolated_codex_generated_image_when_prompt_sealing_is_missing() {
+        let fixture = CodexFixture::generated_images_output_only();
+        let lease = fixture.lease();
+        let context = fixture.context(&lease);
+        let expected = fs::read(fixture._temp.path().join("source.png")).unwrap();
+        fixture.journal.start_or_attach(&lease).unwrap();
+        fixture.supervisor.prepare(&lease, &context).await.unwrap();
+        assert_eq!(
+            fixture.journal.commit_launch(&lease).unwrap(),
+            LaunchDecision::LaunchOnce
+        );
+        let spool = ExecutionSpool::for_lease(&fixture.journal, &lease).unwrap();
+
+        run_codex_runner_child(fixture.journal.root_path(), lease.executor_execution_id)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            spool.observe().unwrap(),
+            ProcessObservation::Succeeded(SupervisedOutput::without_provider_cost(expected))
+        );
+        let execution_root = fixture
+            .journal
+            .root_path()
+            .join(lease.executor_execution_id.simple().to_string());
+        assert!(!execution_root.join("codex-home").exists());
+        assert!(!execution_root.join("workspace").exists());
+        assert!(!execution_root.join("runtime-home").exists());
+    }
+
+    #[tokio::test]
     async fn captured_output_is_never_published_after_failed_codex_exit() {
         let fixture = CodexFixture::ephemeral_workspace_output(1);
         let lease = fixture.lease();
@@ -1609,6 +1670,16 @@ mod tests {
                     "#!/bin/sh\nset -eu\n/bin/cat >/dev/null\nprintf '1\\n' >> '{}'\nworkspace=''\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = '--cd' ]; then\n    shift\n    workspace=\"$1\"\n    break\n  fi\n  shift\ndone\ntest -n \"$workspace\"\n/bin/cp '{}' \"$workspace/provider-output.png\"\n/bin/cp '{}' sealed-output.bin\n/bin/rm sealed-output.bin\n",
                     invocations.display(),
                     image.display(),
+                    image.display(),
+                )
+            })
+        }
+
+        fn generated_images_output_only() -> Self {
+            Self::with_script(|invocations, image, _root| {
+                format!(
+                    "#!/bin/sh\nset -eu\n/bin/cat >/dev/null\nprintf '1\\n' >> '{}'\n/bin/mkdir -p \"$CODEX_HOME/generated_images\"\n/bin/cp '{}' \"$CODEX_HOME/generated_images/generated.png\"\n",
+                    invocations.display(),
                     image.display(),
                 )
             })

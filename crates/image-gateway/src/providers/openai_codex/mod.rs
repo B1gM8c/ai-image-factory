@@ -573,7 +573,7 @@ fn collect_image_files(root: &Path) -> Vec<PathBuf> {
     paths
 }
 
-fn select_image_output(root: &Path, output_format: &str) -> Option<PathBuf> {
+pub(crate) fn select_image_output(root: &Path, output_format: &str) -> Option<PathBuf> {
     let candidates = collect_image_files(root);
     for filename in preferred_output_filenames(output_format) {
         if let Some(path) = candidates
