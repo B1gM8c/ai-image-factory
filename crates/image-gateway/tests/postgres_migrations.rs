@@ -1433,6 +1433,132 @@ async fn platform_route_backfill_only_selects_unambiguous_mapped_routes() -> Tes
 }
 
 #[tokio::test]
+async fn default_codex_customer_pricing_preserves_an_existing_generation_price() -> TestResult {
+    let Some(test_schema) = TestSchema::new(2).await? else {
+        return Ok(());
+    };
+
+    let result = async {
+        apply_migrations_through(&test_schema.pool, 84).await?;
+
+        let book_id = Uuid::new_v4();
+        let version_id = Uuid::new_v4();
+        sqlx::query(
+            r#"
+            INSERT INTO price_books (
+                price_book_id, price_book_key, display_name, purpose,
+                scope_type, currency, state, created_at_ms, updated_at_ms
+            )
+            VALUES ($1, 'customer_sale.platform.operator', 'Operator pricing',
+                    'customer_sale', 'platform', 'USD', 'active', 1, 1)
+            "#,
+        )
+        .bind(book_id)
+        .execute(&test_schema.pool)
+        .await
+        .map_err(|error| format!("failed to seed operator price book: {error}"))?;
+        sqlx::query(
+            r#"
+            INSERT INTO price_book_versions (
+                price_book_version_id, price_book_id, version, api_profile,
+                operation, provider_id, provider_model_id, public_model_id,
+                media_kind, service_tier, execution_surface, billing_mode,
+                is_free, state, effective_from_ms, source_kind,
+                created_at_ms, updated_at_ms
+            )
+            VALUES (
+                $1, $2, 1, 'openai-images-v1', 'generation',
+                'openai-codex', 'gpt-image-2', 'gpt-image-2', 'image',
+                'standard', 'provider_cli', 'customer_rate', FALSE,
+                'active', 1, 'manual', 1, 1
+            )
+            "#,
+        )
+        .bind(version_id)
+        .bind(book_id)
+        .execute(&test_schema.pool)
+        .await
+        .map_err(|error| format!("failed to seed operator price version: {error}"))?;
+        sqlx::query(
+            r#"
+            INSERT INTO price_components (
+                price_component_id, price_book_version_id, component_key,
+                metric, unit, unit_size, unit_price_micros, outcome,
+                quantity_source, required_confidence, rounding_mode,
+                dimensions_json, created_at_ms
+            )
+            VALUES (
+                $1, $2, 'operator-image-output', 'image_output', 'image',
+                1, 12345, 'succeeded', 'request_derived', 'exact',
+                'exact', '{}'::JSONB, 1
+            )
+            "#,
+        )
+        .bind(Uuid::new_v4())
+        .bind(version_id)
+        .execute(&test_schema.pool)
+        .await
+        .map_err(|error| format!("failed to seed operator price component: {error}"))?;
+
+        apply_migration_range(&test_schema.pool, 85, 117).await?;
+
+        let generation_prices: Vec<(Uuid, i64)> = sqlx::query_as(
+            r#"
+            SELECT version.price_book_version_id, component.unit_price_micros
+            FROM price_books book
+            JOIN price_book_versions version USING (price_book_id)
+            JOIN price_components component USING (price_book_version_id)
+            WHERE book.purpose = 'customer_sale'
+              AND book.scope_type = 'platform'
+              AND book.state = 'active'
+              AND version.state = 'active'
+              AND version.api_profile = 'openai-images-v1'
+              AND version.operation = 'generation'
+              AND version.provider_id = 'openai-codex'
+              AND version.provider_model_id = 'gpt-image-2'
+              AND version.public_model_id = 'gpt-image-2'
+              AND component.outcome = 'succeeded'
+            "#,
+        )
+        .fetch_all(&test_schema.pool)
+        .await
+        .map_err(|error| format!("failed to inspect preserved generation price: {error}"))?;
+        require(
+            generation_prices == vec![(version_id, 12345)],
+            "default pricing migration must preserve an existing generation price",
+        )?;
+
+        let edit_price: Option<i64> = sqlx::query_scalar(
+            r#"
+            SELECT component.unit_price_micros
+            FROM price_books book
+            JOIN price_book_versions version USING (price_book_id)
+            JOIN price_components component USING (price_book_version_id)
+            WHERE book.purpose = 'customer_sale'
+              AND book.scope_type = 'platform'
+              AND book.state = 'active'
+              AND version.state = 'active'
+              AND version.operation = 'edit'
+              AND version.provider_id = 'openai-codex'
+              AND version.public_model_id = 'gpt-image-2'
+              AND component.outcome = 'succeeded'
+            "#,
+        )
+        .fetch_optional(&test_schema.pool)
+        .await
+        .map_err(|error| format!("failed to inspect default edit price: {error}"))?;
+        require(
+            edit_price == Some(40000),
+            "default pricing migration must fill a missing edit price",
+        )
+    }
+    .await;
+    let cleanup = test_schema.cleanup().await;
+    cleanup?;
+    result
+}
+
+#[tokio::test]
 async fn receipt_snapshot_migration_upgrades_an_existing_draft_pool() -> TestResult {
     let Some(test_schema) = TestSchema::new(2).await? else {
         return Ok(());
@@ -3188,8 +3314,45 @@ async fn shared_pool_case(pool: &PgPool) -> TestResult {
 
 async fn assert_expected_schema(pool: &PgPool) -> TestResult {
     require(
-        migration_versions(pool).await? == (0_i64..=116_i64).collect::<Vec<_>>(),
-        "applied migration versions must be exactly 0 through 116",
+        migration_versions(pool).await? == (0_i64..=117_i64).collect::<Vec<_>>(),
+        "applied migration versions must be exactly 0 through 117",
+    )?;
+
+    let default_codex_prices: Vec<(String, i64, i64)> = sqlx::query_as(
+        r#"
+        SELECT version.operation, component.unit_price_micros,
+               count(binding.contract_key)::BIGINT
+        FROM price_books book
+        JOIN price_book_versions version USING (price_book_id)
+        JOIN price_components component USING (price_book_version_id)
+        LEFT JOIN price_book_version_surface_contract_bindings binding
+          USING (price_book_version_id)
+        WHERE book.purpose = 'customer_sale'
+          AND book.scope_type = 'platform'
+          AND book.state = 'active'
+          AND version.state = 'active'
+          AND version.api_profile = 'openai-images-v1'
+          AND version.operation IN ('generation', 'edit')
+          AND version.provider_id = 'openai-codex'
+          AND version.provider_model_id = 'gpt-image-2'
+          AND version.public_model_id = 'gpt-image-2'
+          AND version.media_kind = 'image'
+          AND version.execution_surface = 'provider_cli'
+          AND component.outcome = 'succeeded'
+        GROUP BY version.operation, component.unit_price_micros
+        ORDER BY version.operation
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|error| format!("failed to inspect default Codex pricing: {error}"))?;
+    require(
+        default_codex_prices
+            == vec![
+                ("edit".to_string(), 40000, 1),
+                ("generation".to_string(), 40000, 1),
+            ],
+        "fresh migrations must publish bound Codex generation and edit prices",
     )?;
 
     let retention_policy: (i64, i64, i64, i64) = sqlx::query_as(

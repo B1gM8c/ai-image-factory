@@ -545,7 +545,22 @@ async fn run_codex_child(
         Ok(result) => ChildOutcome::Succeeded(result.sink),
         Err(error) if ephemeral_capture_fallback_allowed(&error) => match captured {
             Ok(Some(bytes)) => ChildOutcome::Succeeded(bytes),
-            Ok(None) => map_cli_runtime_error(error),
+            Ok(None) => match final_workspace_output(
+                &spool,
+                capture_filename,
+                &request.output.output_format,
+            ) {
+                Ok(Some(bytes)) => ChildOutcome::Succeeded(bytes),
+                Ok(None) => map_cli_runtime_error(error),
+                Err(ProcessSpoolError::Integrity) => {
+                    ChildOutcome::Failed("codex_ephemeral_output_invalid")
+                }
+                Err(
+                    ProcessSpoolError::InvalidInput
+                    | ProcessSpoolError::Conflict
+                    | ProcessSpoolError::Unavailable,
+                ) => ChildOutcome::Uncertain("codex_ephemeral_output_unavailable"),
+            },
             Err(ProcessSpoolError::Integrity) => {
                 ChildOutcome::Failed("codex_ephemeral_output_invalid")
             }
@@ -556,6 +571,20 @@ async fn run_codex_child(
             ) => ChildOutcome::Uncertain("codex_ephemeral_output_unavailable"),
         },
         Err(error) => map_cli_runtime_error(error),
+    }
+}
+
+fn final_workspace_output(
+    spool: &ExecutionSpool,
+    filename: &str,
+    output_format: &str,
+) -> Result<Option<Vec<u8>>, ProcessSpoolError> {
+    match spool.read_workspace_output(filename, MAX_CODEX_RUNTIME_OUTPUT_BYTES)? {
+        WorkspaceOutputSnapshot::Missing | WorkspaceOutputSnapshot::Incomplete => Ok(None),
+        WorkspaceOutputSnapshot::Bytes(bytes) if valid_captured_image(&bytes, output_format) => {
+            Ok(Some(bytes))
+        }
+        WorkspaceOutputSnapshot::Bytes(_) => Err(ProcessSpoolError::Integrity),
     }
 }
 
@@ -1318,6 +1347,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recovers_retained_workspace_output_after_runtime_output_disappears() {
+        let fixture = CodexFixture::disappearing_runtime_output();
+        let lease = fixture.lease();
+        let context = fixture.context(&lease);
+        let expected = fs::read(fixture._temp.path().join("source.png")).unwrap();
+        fixture.journal.start_or_attach(&lease).unwrap();
+        fixture.supervisor.prepare(&lease, &context).await.unwrap();
+        assert_eq!(
+            fixture.journal.commit_launch(&lease).unwrap(),
+            LaunchDecision::LaunchOnce
+        );
+        let spool = ExecutionSpool::for_lease(&fixture.journal, &lease).unwrap();
+
+        run_codex_runner_child(fixture.journal.root_path(), lease.executor_execution_id)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            spool.observe().unwrap(),
+            ProcessObservation::Succeeded(SupervisedOutput::without_provider_cost(expected))
+        );
+    }
+
+    #[tokio::test]
     async fn captured_output_is_never_published_after_failed_codex_exit() {
         let fixture = CodexFixture::ephemeral_workspace_output(1);
         let lease = fixture.lease();
@@ -1546,6 +1599,17 @@ mod tests {
                     root.join("provider-output-created").display(),
                     root.join("provider-output-deleted").display(),
                     exit_code,
+                )
+            })
+        }
+
+        fn disappearing_runtime_output() -> Self {
+            Self::with_script(|invocations, image, _root| {
+                format!(
+                    "#!/bin/sh\nset -eu\n/bin/cat >/dev/null\nprintf '1\\n' >> '{}'\nworkspace=''\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = '--cd' ]; then\n    shift\n    workspace=\"$1\"\n    break\n  fi\n  shift\ndone\ntest -n \"$workspace\"\n/bin/cp '{}' \"$workspace/provider-output.png\"\n/bin/cp '{}' sealed-output.bin\n/bin/rm sealed-output.bin\n",
+                    invocations.display(),
+                    image.display(),
+                    image.display(),
                 )
             })
         }

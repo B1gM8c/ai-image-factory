@@ -460,8 +460,25 @@ pub(crate) fn build_codex_prompt_for_output(
         prompt.push_str(&format!(" 输出压缩 {compression}。"));
     }
     prompt.push_str(" 背景必须是不透明背景，不要生成透明背景或 alpha 通道。");
+    let cleanup_instruction = if request_dir == output_dir {
+        format!(
+            "、`/bin/rm {}/{}`。这里允许 cp、mv、rm，因为它们不能修改图片像素。退出前确认该目录只剩唯一最终图片 {}/{}，不要留下其它 png、jpg、jpeg 或 webp 图片文件",
+            request_dir.display(),
+            provider_filename,
+            output_dir.display(),
+            final_filename,
+        )
+    } else {
+        format!(
+            "。这里允许 cp、mv，因为它们不能修改图片像素。不要删除 {}/{}；runner 会在读取并封存结果后清理隔离工作目录。退出前确认最终图片已写入 {}/{}",
+            request_dir.display(),
+            provider_filename,
+            output_dir.display(),
+            final_filename,
+        )
+    };
     prompt.push_str(&format!(
-        " 不要再启动 codex、openai 或其它 AI CLI 子进程来委托生成；不要用 sips、ImageMagick、Python、Rust、ffmpeg、canvas 或其他本地图像处理工具裁切、拉伸、重采样、扩边、转绘或修改像素。请先让图像生成能力把原生结果保存为 {}/{}。生成彻底完成后，必须依次执行 `/bin/cp {}/{} {}/{}.partial`、`/bin/mv {}/{}.partial {}/{}`、`/bin/rm {}/{}`。这里允许 cp、mv、rm，因为它们不能修改图片像素。不要让图像生成能力直接管理最终文件，不要使用硬链接或符号链接。退出前确认该目录只剩唯一最终图片 {}/{}，不要留下其它 png、jpg、jpeg 或 webp 图片文件。不要在图片中加入水印。",
+        " 不要再启动 codex、openai 或其它 AI CLI 子进程来委托生成；不要用 sips、ImageMagick、Python、Rust、ffmpeg、canvas 或其他本地图像处理工具裁切、拉伸、重采样、扩边、转绘或修改像素。请先让图像生成能力把原生结果保存为 {}/{}。生成彻底完成后，必须依次执行 `/bin/cp {}/{} {}/{}.partial`、`/bin/mv {}/{}.partial {}/{}`{cleanup_instruction}。不要让图像生成能力直接管理最终文件，不要使用硬链接或符号链接。不要在图片中加入水印。",
         request_dir.display(),
         provider_filename,
         request_dir.display(),
@@ -470,10 +487,6 @@ pub(crate) fn build_codex_prompt_for_output(
         final_filename,
         output_dir.display(),
         final_filename,
-        output_dir.display(),
-        final_filename,
-        request_dir.display(),
-        provider_filename,
         output_dir.display(),
         final_filename,
     ));
@@ -938,6 +951,10 @@ mod tests {
         ));
         assert!(prompt.contains(
             "/bin/mv /tmp/output/sealed-output.bin.partial /tmp/output/sealed-output.bin"
+        ));
+        assert!(!prompt.contains("/bin/rm /tmp/workspace/provider-output.png"));
+        assert!(prompt.contains(
+            "不要删除 /tmp/workspace/provider-output.png；runner 会在读取并封存结果后清理隔离工作目录"
         ));
         assert!(!prompt.contains("/tmp/output/final.png"));
     }
