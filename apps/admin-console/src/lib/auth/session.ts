@@ -96,6 +96,14 @@ export async function hasConsoleSession() {
   );
 }
 
+export async function hasActiveConsoleSession() {
+  const cookieStore = await cookies();
+  return Boolean(
+    isAccessTokenCurrent(cookieStore.get(accessCookieName())?.value) ||
+      isValidEmergencySession(cookieStore.get(consoleSessionCookieName())?.value),
+  );
+}
+
 export async function publicSession(): Promise<PublicSession> {
   const cookieStore = await cookies();
   const accessToken = cookieStore.get(accessCookieName())?.value;

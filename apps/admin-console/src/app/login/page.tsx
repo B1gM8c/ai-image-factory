@@ -1,9 +1,14 @@
 import { redirect } from "next/navigation";
 import { LoginPanel } from "@/components/auth/login-panel";
-import { hasConsoleSession } from "@/lib/auth/session";
+import { hasActiveConsoleSession } from "@/lib/auth/session";
 
-export default async function LoginPage() {
-  if (await hasConsoleSession()) {
+type LoginPageProps = {
+  searchParams: Promise<{ reason?: string | string[] }>;
+};
+
+export default async function LoginPage({ searchParams }: LoginPageProps) {
+  const reason = (await searchParams).reason;
+  if (reason !== "session_expired" && (await hasActiveConsoleSession())) {
     redirect("/overview");
   }
 

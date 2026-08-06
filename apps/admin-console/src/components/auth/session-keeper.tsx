@@ -1,7 +1,6 @@
 "use client";
 
 import { useEffect } from "react";
-import { useRouter } from "next/navigation";
 import {
   onSessionExpired,
   refreshConsoleSession,
@@ -12,7 +11,6 @@ const REFRESH_EARLY_SECONDS = 60;
 const FALLBACK_CHECK_MS = 4 * 60 * 1_000;
 
 export function SessionKeeper() {
-  const router = useRouter();
   const { loading, reload, session } = useConsoleSession();
 
   useEffect(() => {
@@ -24,7 +22,7 @@ export function SessionKeeper() {
       if (!active) return;
       active = false;
       if (timer) clearTimeout(timer);
-      router.replace("/login");
+      window.location.replace("/login?reason=session_expired");
     };
 
     const schedule = async () => {
@@ -68,7 +66,7 @@ export function SessionKeeper() {
       stopListening();
       document.removeEventListener("visibilitychange", onVisible);
     };
-  }, [loading, reload, router, session]);
+  }, [loading, reload, session]);
 
   return null;
 }
