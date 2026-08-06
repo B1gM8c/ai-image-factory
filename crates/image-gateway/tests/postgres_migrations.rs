@@ -3428,7 +3428,7 @@ async fn assert_expected_schema(pool: &PgPool) -> TestResult {
           AND version.provider_id = 'grok-cli'
           AND version.provider_model_id IS NULL
           AND version.public_model_id = '*'
-          AND version.service_tier = '*'
+          AND version.service_tier = 'standard'
           AND version.execution_surface = 'provider_cli'
           AND version.billing_mode = 'provider_reported'
         GROUP BY version.media_kind, version.api_profile, version.operation

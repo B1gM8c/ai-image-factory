@@ -62,7 +62,7 @@ BEGIN
               AND version.provider_model_id IS NULL
               AND version.public_model_id = '*'
               AND version.media_kind = media_kind_value
-              AND version.service_tier = '*'
+              AND version.service_tier = 'standard'
               AND version.execution_surface = 'provider_cli'
               AND version.billing_mode = 'provider_reported'
               AND version.effective_from_ms <= now_ms
@@ -94,7 +94,7 @@ BEGIN
         )
         VALUES (
             target_version_id, target_book_id, next_version,
-            '*', '*', 'grok-cli', NULL, '*', media_kind_value, '*',
+            '*', '*', 'grok-cli', NULL, '*', media_kind_value, 'standard',
             'provider_cli', 'provider_reported', FALSE, 'draft',
             now_ms, NULL, 'imported', NULL, NULL,
             'Uses the authoritative cost reported by the Grok CLI terminal receipt',
