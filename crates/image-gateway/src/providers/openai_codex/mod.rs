@@ -8,9 +8,10 @@ use std::{
 };
 
 use async_trait::async_trait;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tracing::{Instrument, info_span, warn};
+use uuid::Uuid;
 
 use crate::{
     AppConfig, ImageGatewayError,
@@ -222,8 +223,9 @@ async fn run_codex_once(
         .arg("--skip-git-repo-check")
         .arg("--cd")
         .arg(&request_dir)
+        .arg("--json")
         .stdin(Stdio::piped())
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .kill_on_drop(true);
     configure_codex_process_group(&mut command);
@@ -236,6 +238,10 @@ async fn run_codex_once(
         .spawn()
         .map_err(|_| ImageGatewayError::service_unavailable("Codex CLI is not available"))?;
     let mut process_group_guard = CodexProcessGroupGuard::new(child.id());
+    let codex_event_task = child
+        .stdout
+        .take()
+        .map(|stdout| tokio::spawn(capture_codex_thread_id(stdout)));
     if let Some(mut stdin) = child.stdin.take() {
         stdin
             .write_all(prompt.as_bytes())
@@ -263,7 +269,25 @@ async fn run_codex_once(
     }
 
     process_group_guard.kill();
+    let codex_thread_id = match codex_event_task {
+        Some(task) => tokio::time::timeout(CODEX_REAP_TIMEOUT, task)
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .flatten(),
+        None => None,
+    };
     let image_path = select_image_output(&request_dir, &job.output_format)
+        .or_else(|| {
+            let thread_id = codex_thread_id.as_deref()?;
+            let path = select_native_codex_output(config, thread_id, &job.output_format)?;
+            warn!(
+                request.id = %job.request_id,
+                codex.thread.id = thread_id,
+                "recovered Codex image from its request-scoped native output directory"
+            );
+            Some(path)
+        })
         .ok_or_else(ImageGatewayError::codex_no_image_output)?;
     let bytes = read_codex_output(&image_path).await?;
 
@@ -272,6 +296,51 @@ async fn run_codex_once(
     }
 
     Ok(GeneratedImage { bytes })
+}
+
+async fn capture_codex_thread_id<R>(stdout: R) -> Option<String>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut lines = BufReader::new(stdout).lines();
+    let mut thread_id = None;
+    while let Ok(Some(line)) = lines.next_line().await {
+        if thread_id.is_some() {
+            continue;
+        }
+        thread_id = codex_thread_id_from_event(line.as_bytes());
+    }
+    thread_id
+}
+
+fn codex_thread_id_from_event(event: &[u8]) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_slice(event).ok()?;
+    if value.get("type")?.as_str()? != "thread.started" {
+        return None;
+    }
+    let thread_id = value.get("thread_id")?.as_str()?;
+    Uuid::parse_str(thread_id).ok()?;
+    Some(thread_id.to_string())
+}
+
+fn select_native_codex_output(
+    config: &AppConfig,
+    thread_id: &str,
+    output_format: &str,
+) -> Option<PathBuf> {
+    Uuid::parse_str(thread_id).ok()?;
+    let root = codex_generated_images_root(config)?;
+    let canonical_root = root.canonicalize().ok()?;
+    let thread_root = root.join(thread_id);
+    let metadata = std::fs::symlink_metadata(&thread_root).ok()?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return None;
+    }
+    let canonical_thread_root = thread_root.canonicalize().ok()?;
+    if !canonical_thread_root.starts_with(&canonical_root) {
+        return None;
+    }
+    select_image_output(&canonical_thread_root, output_format)
 }
 
 fn append_input_image_arguments(command: &mut Command, input_paths: &[PathBuf]) {
@@ -824,6 +893,77 @@ mod tests {
             codex_generated_images_root(&config),
             Some(generated_images.canonicalize().unwrap())
         );
+    }
+
+    #[test]
+    fn parses_only_valid_codex_thread_started_events() {
+        let thread_id = "019fd666-0416-7da2-bcc3-7f2f51efd3c8";
+
+        assert_eq!(
+            codex_thread_id_from_event(
+                format!(r#"{{"type":"thread.started","thread_id":"{thread_id}"}}"#).as_bytes()
+            ),
+            Some(thread_id.to_string())
+        );
+        assert!(
+            codex_thread_id_from_event(
+                br#"{"type":"item.completed","thread_id":"019fd666-0416-7da2-bcc3-7f2f51efd3c8"}"#
+            )
+            .is_none()
+        );
+        assert!(
+            codex_thread_id_from_event(
+                br#"{"type":"thread.started","thread_id":"../../other-run"}"#
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn native_codex_output_is_scoped_to_the_reported_thread() {
+        let codex_home = tempfile::tempdir().unwrap();
+        let generated_images = codex_home.path().join("generated_images");
+        let thread_id = "019fd666-0416-7da2-bcc3-7f2f51efd3c8";
+        let other_thread_id = "019fd666-0416-7da2-bcc3-7f2f51efd3c9";
+        let thread_root = generated_images.join(thread_id);
+        let other_thread_root = generated_images.join(other_thread_id);
+        std::fs::create_dir_all(&thread_root).unwrap();
+        std::fs::create_dir_all(&other_thread_root).unwrap();
+        let expected = thread_root.join("exec-request.png");
+        std::fs::write(&expected, png_with_dimensions(1, 1)).unwrap();
+        std::fs::write(
+            other_thread_root.join("exec-unrelated.png"),
+            png_with_dimensions(1, 1),
+        )
+        .unwrap();
+        let mut config = test_config();
+        config.codex_home = Some(codex_home.path().to_string_lossy().into_owned());
+
+        assert_eq!(
+            select_native_codex_output(&config, thread_id, "png"),
+            Some(expected.canonicalize().unwrap())
+        );
+        assert!(select_native_codex_output(&config, "../../other-run", "png").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_codex_output_rejects_symlinked_thread_directory() {
+        let codex_home = tempfile::tempdir().unwrap();
+        let generated_images = codex_home.path().join("generated_images");
+        let outside = tempfile::tempdir().unwrap();
+        let thread_id = "019fd666-0416-7da2-bcc3-7f2f51efd3c8";
+        std::fs::create_dir(&generated_images).unwrap();
+        std::fs::write(
+            outside.path().join("exec-outside.png"),
+            png_with_dimensions(1, 1),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(outside.path(), generated_images.join(thread_id)).unwrap();
+        let mut config = test_config();
+        config.codex_home = Some(codex_home.path().to_string_lossy().into_owned());
+
+        assert!(select_native_codex_output(&config, thread_id, "png").is_none());
     }
 
     #[test]
