@@ -2,7 +2,6 @@ use std::path::{Component, Path};
 
 use thiserror::Error;
 
-pub const MAX_PROMPT_CHARS: usize = 1_024;
 pub const MAX_IMAGE_EDIT_REFERENCES: usize = 3;
 pub const MAX_REFERENCE_VIDEO_IMAGES: usize = 7;
 
@@ -377,8 +376,6 @@ impl From<ReferenceToVideoRequestV1> for GrokVideoGenerationRequestV1 {
 pub enum RequestValidationError {
     #[error("prompt must contain non-whitespace text")]
     EmptyPrompt,
-    #[error("prompt exceeds the 1024 character Grok media limit")]
-    PromptTooLong,
     #[error("prompt contains a NUL byte")]
     InvalidPrompt,
     #[error("staged image filename must be one safe path component")]
@@ -397,7 +394,7 @@ fn validate_required_prompt(prompt: String) -> Result<String, RequestValidationE
     if prompt.trim().is_empty() {
         return Err(RequestValidationError::EmptyPrompt);
     }
-    validate_prompt_bytes(&prompt)?;
+    validate_prompt_safety(&prompt)?;
     Ok(prompt)
 }
 
@@ -410,16 +407,13 @@ fn validate_optional_prompt(
     if prompt.trim().is_empty() {
         return Ok(None);
     }
-    validate_prompt_bytes(&prompt)?;
+    validate_prompt_safety(&prompt)?;
     Ok(Some(prompt))
 }
 
-fn validate_prompt_bytes(prompt: &str) -> Result<(), RequestValidationError> {
+fn validate_prompt_safety(prompt: &str) -> Result<(), RequestValidationError> {
     if prompt.contains('\0') {
         return Err(RequestValidationError::InvalidPrompt);
-    }
-    if prompt.chars().count() > MAX_PROMPT_CHARS {
-        return Err(RequestValidationError::PromptTooLong);
     }
     Ok(())
 }

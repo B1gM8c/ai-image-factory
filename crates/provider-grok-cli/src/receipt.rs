@@ -4,7 +4,7 @@ use image_provider_contracts::{ProviderCostEvidenceScope, ProviderReportedCostEv
 use serde_json::{Map, Value};
 use thiserror::Error;
 
-use crate::{GrokExpectedToolCallV1, GrokInvocationV1, GrokTool, MAX_PROMPT_CHARS, PROVIDER_ID};
+use crate::{GrokExpectedToolCallV1, GrokInvocationV1, GrokTool, PROVIDER_ID};
 
 pub const MAX_STDOUT_BYTES: usize = 64 * 1024;
 pub const MAX_HISTORY_BYTES: usize = 1024 * 1024;
@@ -294,11 +294,7 @@ fn validate_tool_arguments(
     actual
         .get("prompt")
         .and_then(Value::as_str)
-        .filter(|prompt| {
-            !prompt.trim().is_empty()
-                && !prompt.contains('\0')
-                && prompt.chars().count() <= MAX_PROMPT_CHARS
-        })
+        .filter(|prompt| !prompt.trim().is_empty() && !prompt.contains('\0'))
         .ok_or(GrokReceiptError::ToolArgumentsMismatch)?;
     if !expected.get("prompt").is_some_and(Value::is_string) {
         return Err(GrokReceiptError::ToolArgumentsMismatch);

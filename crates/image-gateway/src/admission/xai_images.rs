@@ -146,9 +146,7 @@ pub enum XaiImageAdmissionError {
 #[cfg(test)]
 mod tests {
     use image_api_contracts::xai::{XaiImageAspectRatio, XaiImageResolution};
-    use image_provider_grok_cli::{
-        MAX_PROMPT_CHARS, RequestValidationError, parse_image_generation_payload,
-    };
+    use image_provider_grok_cli::parse_image_generation_payload;
 
     use super::*;
     use crate::admission::{
@@ -324,20 +322,7 @@ mod tests {
         );
 
         let mut long_prompt = request();
-        long_prompt.prompt = "x".repeat(MAX_PROMPT_CHARS + 1);
-        let error = XaiImageAdmissionPlan::for_grok_cli(long_prompt).unwrap_err();
-        assert_eq!(
-            error,
-            XaiImageAdmissionError::UnsupportedBinding(
-                XaiGrokProjectionError::InvalidProviderRequest(
-                    RequestValidationError::PromptTooLong
-                )
-            )
-        );
-        assert_eq!(
-            XaiGrokProjectionError::InvalidProviderRequest(RequestValidationError::PromptTooLong)
-                .parameter(),
-            Some("prompt")
-        );
+        long_prompt.prompt = "x".repeat(1_025);
+        assert!(XaiImageAdmissionPlan::for_grok_cli(long_prompt).is_ok());
     }
 }

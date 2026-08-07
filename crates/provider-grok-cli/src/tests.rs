@@ -90,13 +90,13 @@ fn requests_reject_prompt_reference_and_staging_boundary_violations() {
         GrokImageGenerationRequestV1::new(" ", ImageModel::Base, ImageAspectRatio::Auto),
         Err(RequestValidationError::EmptyPrompt)
     );
-    assert_eq!(
+    assert!(
         GrokImageGenerationRequestV1::new(
             "x".repeat(1_025),
             ImageModel::Base,
             ImageAspectRatio::Auto,
-        ),
-        Err(RequestValidationError::PromptTooLong)
+        )
+        .is_ok()
     );
     assert_eq!(
         StagedImageV1::new("../secret.png", IMAGE_SHA256),
@@ -144,6 +144,57 @@ fn requests_reject_prompt_reference_and_staging_boundary_violations() {
             ImageAspectRatio::R16x9,
         ),
         Err(RequestValidationError::InvalidReferenceCount)
+    );
+}
+
+#[test]
+fn media_requests_accept_prompts_beyond_the_rest_model_metadata_limit() {
+    let prompt = "x".repeat(1_025);
+
+    assert!(
+        GrokImageGenerationRequestV1::new(
+            prompt.clone(),
+            ImageModel::Base,
+            ImageAspectRatio::R1x1,
+        )
+        .is_ok()
+    );
+    assert!(
+        GrokImageEditRequestV1::new(
+            prompt.clone(),
+            vec![staged("source.png")],
+            ImageAspectRatio::Auto,
+        )
+        .is_ok()
+    );
+
+    assert!(
+        TextToVideoRequestV1::new(
+            prompt.clone(),
+            VideoAspectRatio::R16x9,
+            VideoDuration::Seconds6,
+            VideoResolution::P480,
+        )
+        .is_ok()
+    );
+    assert!(
+        ImageToVideoRequestV1::new(
+            Some(prompt.clone()),
+            staged("source.png"),
+            VideoDuration::Seconds6,
+            VideoResolution::P480,
+        )
+        .is_ok()
+    );
+    assert!(
+        ReferenceToVideoRequestV1::new(
+            prompt,
+            vec![staged("one.png"), staged("two.png")],
+            VideoAspectRatio::R16x9,
+            VideoDuration::Seconds6,
+            VideoResolution::P480,
+        )
+        .is_ok()
     );
 }
 
@@ -713,7 +764,7 @@ fn receipt_rejects_fractional_or_incomplete_exact_ticks() {
 }
 
 #[test]
-fn image_generation_receipt_accepts_bounded_prompt_normalization() {
+fn image_generation_receipt_accepts_safe_prompt_normalization() {
     let fixture = PolicyFixture::new();
     let request =
         GrokImageGenerationRequestV1::new("original", ImageModel::Quality, ImageAspectRatio::R1x1)
@@ -728,6 +779,14 @@ fn image_generation_receipt_accepts_bounded_prompt_normalization() {
     let history = history_with(&invocation, drifted_arguments, invocation.artifact_path());
     let receipt = parse_invocation_receipt(&valid_stdout(), &history, &invocation).unwrap();
     assert_eq!(receipt.effective_tool_prompt(), Some("rewritten"));
+
+    let long_prompt = "x".repeat(1_025);
+    let history = history_with(
+        &invocation,
+        json!({"prompt":long_prompt,"aspect_ratio":"1:1"}),
+        invocation.artifact_path(),
+    );
+    assert!(parse_invocation_receipt(&valid_stdout(), &history, &invocation).is_ok());
 }
 
 #[test]
@@ -747,7 +806,6 @@ fn image_generation_receipt_rejects_execution_argument_drift() {
         json!({"prompt":"rewritten", "aspect_ratio":"1:1", "model":"other"}),
         json!({"prompt":"rewritten"}),
         json!({"prompt":"", "aspect_ratio":"1:1"}),
-        json!({"prompt":"x".repeat(1_025), "aspect_ratio":"1:1"}),
     ] {
         let history = history_with(&invocation, drifted_arguments, invocation.artifact_path());
         assert!(matches!(

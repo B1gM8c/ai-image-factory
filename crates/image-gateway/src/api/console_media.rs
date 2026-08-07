@@ -329,9 +329,7 @@ fn prefer_official_dreamina_aliases(models: Vec<PublicModelRoute>) -> Vec<Public
 
 fn console_model(model: PublicModelRoute, supports_edit: bool) -> Option<ConsoleMediaModel> {
     let controls = controls_for_model(&model.api_profile, model.provider_model_id.as_deref())?;
-    let max_prompt_chars = (model.provider_id == image_provider_grok_cli::PROVIDER_ID
-        || model.api_profile == XAI_IMAGES_API_PROFILE)
-        .then_some(image_provider_grok_cli::MAX_PROMPT_CHARS);
+    let max_prompt_chars = None;
     let max_reference_images = match (supports_edit, model.api_profile.as_str()) {
         (true, OPENAI_IMAGES_API_PROFILE) => 16,
         (true, XAI_IMAGES_API_PROFILE) => {
@@ -700,7 +698,7 @@ mod tests {
         let value = serde_json::to_value(model).unwrap();
 
         assert_eq!(value["spatial_edit_mode"], "semantic_mask");
-        assert_eq!(value["max_prompt_chars"], 1_024);
+        assert!(value["max_prompt_chars"].is_null());
     }
 
     #[test]

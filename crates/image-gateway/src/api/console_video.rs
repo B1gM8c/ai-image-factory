@@ -346,9 +346,6 @@ fn prefer_official_dreamina_aliases(models: Vec<PublicModelRoute>) -> Vec<Public
 fn console_video_model(model: PublicModelRoute) -> Option<ConsoleVideoModel> {
     let controls = console_video_controls(&model.api_profile, model.provider_model_id.as_deref())?;
     let modes = console_video_modes(&model.api_profile, model.provider_model_id.as_deref())?;
-    let max_prompt_chars = (model.provider_id == image_provider_grok_cli::PROVIDER_ID
-        || model.api_profile == XAI_VIDEOS_API_PROFILE)
-        .then_some(image_provider_grok_cli::MAX_PROMPT_CHARS);
     Some(ConsoleVideoModel {
         id: model.id,
         provider: model.provider_id,
@@ -356,7 +353,7 @@ fn console_video_model(model: PublicModelRoute) -> Option<ConsoleVideoModel> {
         media_kind: model.media_kind,
         operation: model.operation_id,
         created: model.created_at_ms.div_euclid(1_000),
-        max_prompt_chars,
+        max_prompt_chars: None,
         modes,
         controls,
     })
@@ -899,7 +896,7 @@ mod tests {
             created_at_ms: 0,
         };
         let value = serde_json::to_value(console_video_model(model).unwrap()).unwrap();
-        assert_eq!(value["max_prompt_chars"], 1_024);
+        assert!(value["max_prompt_chars"].is_null());
     }
 
     #[test]

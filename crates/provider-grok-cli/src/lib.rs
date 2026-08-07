@@ -30,8 +30,8 @@ pub use receipt::{
 pub use request::{
     GrokImageEditRequestV1, GrokImageGenerationRequestV1, GrokVideoGenerationRequestV1,
     ImageAspectRatio, ImageModel, ImageToVideoRequestV1, MAX_IMAGE_EDIT_REFERENCES,
-    MAX_PROMPT_CHARS, ReferenceToVideoRequestV1, RequestValidationError, StagedImageV1,
-    TextToVideoRequestV1, VideoAspectRatio, VideoDuration, VideoResolution,
+    ReferenceToVideoRequestV1, RequestValidationError, StagedImageV1, TextToVideoRequestV1,
+    VideoAspectRatio, VideoDuration, VideoResolution,
 };
 pub use xai::{
     GROK_CLI_IMAGE_MAX_OUTPUTS, GROK_CLI_IMAGE_RESOLUTION, GROK_CLI_IMAGE_RESPONSE_FORMAT,
