@@ -63,6 +63,10 @@ pub trait SpawnObserver {
     type Error: Display + Send;
 
     fn observe_spawn(&mut self, evidence: &SpawnEvidence) -> Result<(), Self::Error>;
+
+    fn observe_completion(&mut self, _completion: &ProcessCompletion) -> Result<(), Self::Error> {
+        Ok(())
+    }
 }
 
 pub trait ProcessBackend {
@@ -316,12 +320,19 @@ where
                         ),
                         None => (CapturedStream::default(), CapturedStream::default()),
                     };
-                    Ok(ProcessCompletion {
+                    let completion = ProcessCompletion {
                         evidence,
                         status,
                         stdout,
                         stderr,
-                    })
+                    };
+                    observer.observe_completion(&completion).map_err(|error| {
+                        ProcessError::Observer {
+                            message: error.to_string(),
+                            cleanup_error: None,
+                        }
+                    })?;
+                    Ok(completion)
                 }
                 Ok(true) => {
                     process.disarm();
@@ -359,7 +370,7 @@ fn build_command(spec: &CommandSpec) -> Command {
         .env_clear()
         .kill_on_drop(true)
         .process_group(0);
-    if spec.output().is_none() {
+    if spec.output().is_none() || spec.captures_process_output() {
         command.stdout(Stdio::piped()).stderr(Stdio::piped());
     } else {
         command.stdout(Stdio::null()).stderr(Stdio::null());

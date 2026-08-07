@@ -45,6 +45,7 @@ pub struct CommandSpec {
     wall_timeout: Duration,
     termination_grace: Duration,
     output: Option<OutputContract>,
+    capture_process_output: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -343,6 +344,13 @@ impl CommandSpec {
         self
     }
 
+    /// Captures bounded stdout and stderr for the completion observer even when an artifact
+    /// output contract is configured.
+    pub fn capture_process_output(mut self) -> Self {
+        self.capture_process_output = true;
+        self
+    }
+
     pub fn executable(&self) -> &VerifiedExecutable {
         &self.executable
     }
@@ -375,6 +383,10 @@ impl CommandSpec {
         self.output.as_ref()
     }
 
+    pub(crate) fn captures_process_output(&self) -> bool {
+        self.capture_process_output
+    }
+
     pub(crate) fn revalidate(&self) -> Result<(), CommandSpecError> {
         self.executable.revalidate()?;
         self.working_directory.revalidate()?;
@@ -404,6 +416,7 @@ impl CommandSpec {
             wall_timeout,
             termination_grace,
             output,
+            capture_process_output: false,
         })
     }
 }

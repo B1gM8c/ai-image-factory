@@ -3,13 +3,16 @@ use std::{
     env,
     path::{Path, PathBuf},
     process::Stdio,
-    sync::{LazyLock, Mutex},
+    sync::{Arc, LazyLock, Mutex},
     time::{Duration, SystemTime},
 };
 
 use async_trait::async_trait;
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
+use tokio::{
+    io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader},
+    sync::oneshot,
+};
 use tracing::{Instrument, info_span, warn};
 use uuid::Uuid;
 
@@ -27,6 +30,8 @@ const MAX_OUTPUT_SCAN_ENTRIES: usize = 512;
 const MAX_CODEX_OUTPUT_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_CODEX_BATCH_BYTES: u64 = 64 * 1024 * 1024;
 const CODEX_REAP_TIMEOUT: Duration = Duration::from_secs(5);
+const CODEX_OUTPUT_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const MAX_CODEX_DIAGNOSTIC_STREAM_BYTES: usize = 64 * 1024;
 
 static CODEX_OUTPUT_CLEANUP: LazyLock<Mutex<HashMap<PathBuf, CodexOutputCleanupBucket>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -35,6 +40,20 @@ static CODEX_OUTPUT_CLEANUP: LazyLock<Mutex<HashMap<PathBuf, CodexOutputCleanupB
 struct CodexOutputCleanupBucket {
     active_runs: usize,
     baseline: HashSet<PathBuf>,
+}
+
+#[derive(Clone, Default)]
+struct CodexCliEventSummary {
+    thread_id: Option<String>,
+    saw_image_generation: bool,
+    completed_image_generation: bool,
+    malformed_events: usize,
+}
+
+#[derive(Clone, Copy, Default)]
+struct CodexStderrSummary {
+    present: bool,
+    truncated: bool,
 }
 
 struct CodexProcessGroupGuard {
@@ -226,7 +245,7 @@ async fn run_codex_once(
         .arg("--json")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .kill_on_drop(true);
     configure_codex_process_group(&mut command);
 
@@ -238,58 +257,113 @@ async fn run_codex_once(
         .spawn()
         .map_err(|_| ImageGatewayError::service_unavailable("Codex CLI is not available"))?;
     let mut process_group_guard = CodexProcessGroupGuard::new(child.id());
+    let codex_events = Arc::new(Mutex::new(CodexCliEventSummary::default()));
     let codex_event_task = child
         .stdout
         .take()
-        .map(|stdout| tokio::spawn(capture_codex_thread_id(stdout)));
+        .map(|stdout| tokio::spawn(capture_codex_events(stdout, Arc::clone(&codex_events))));
+    let codex_stderr_task = child
+        .stderr
+        .take()
+        .map(|stderr| tokio::spawn(capture_codex_stderr(stderr)));
+    let (stop_output_capture, output_capture_stop) = oneshot::channel();
+    let output_capture = tokio::spawn(capture_inline_codex_output(
+        config.clone(),
+        request_dir.clone(),
+        job.output_format.clone(),
+        Arc::clone(&codex_events),
+        output_capture_stop,
+    ));
     if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(prompt.as_bytes())
-            .await
-            .map_err(|_| ImageGatewayError::backend("Failed to write prompt to Codex CLI"))?;
+        if stdin.write_all(prompt.as_bytes()).await.is_err() {
+            process_group_guard.kill();
+            let _ = child.start_kill();
+            let _ = tokio::time::timeout(CODEX_REAP_TIMEOUT, child.wait()).await;
+            let _ = stop_output_capture.send(());
+            let _ = tokio::time::timeout(CODEX_REAP_TIMEOUT, output_capture).await;
+            return Err(ImageGatewayError::backend(
+                "Failed to write prompt to Codex CLI",
+            ));
+        }
     }
 
     let status = match tokio::time::timeout(config.request_timeout, child.wait()).await {
         Ok(Ok(status)) => status,
         Ok(Err(_)) => {
+            process_group_guard.kill();
+            let _ = stop_output_capture.send(());
+            let _ = tokio::time::timeout(CODEX_REAP_TIMEOUT, output_capture).await;
             return Err(ImageGatewayError::codex_cli_failed());
         }
         Err(_) => {
             process_group_guard.kill();
             let _ = child.start_kill();
             let _ = tokio::time::timeout(CODEX_REAP_TIMEOUT, child.wait()).await;
+            let _ = stop_output_capture.send(());
+            let _ = tokio::time::timeout(CODEX_REAP_TIMEOUT, output_capture).await;
             warn!(request.id = %job.request_id, "Codex CLI timed out and was terminated");
             return Err(ImageGatewayError::timeout());
         }
     };
 
-    if !status.success() {
-        process_group_guard.kill();
-        return Err(ImageGatewayError::codex_cli_failed());
-    }
-
     process_group_guard.kill();
-    let codex_thread_id = match codex_event_task {
+    let events = match codex_event_task {
         Some(task) => tokio::time::timeout(CODEX_REAP_TIMEOUT, task)
             .await
             .ok()
             .and_then(Result::ok)
-            .flatten(),
-        None => None,
+            .unwrap_or_else(|| codex_events.lock().expect("Codex event lock").clone()),
+        None => CodexCliEventSummary::default(),
     };
-    let image_path = select_image_output(&request_dir, &job.output_format)
-        .or_else(|| {
-            let thread_id = codex_thread_id.as_deref()?;
-            let path = select_native_codex_output(config, thread_id, &job.output_format)?;
-            warn!(
-                request.id = %job.request_id,
-                codex.thread.id = thread_id,
-                "recovered Codex image from its request-scoped native output directory"
-            );
-            Some(path)
-        })
-        .ok_or_else(ImageGatewayError::codex_no_image_output)?;
-    let bytes = read_codex_output(&image_path).await?;
+    let stderr = match codex_stderr_task {
+        Some(task) => tokio::time::timeout(CODEX_REAP_TIMEOUT, task)
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or_default(),
+        None => CodexStderrSummary::default(),
+    };
+    let _ = stop_output_capture.send(());
+    let captured_output = tokio::time::timeout(CODEX_REAP_TIMEOUT, output_capture)
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .flatten();
+
+    if !status.success() {
+        warn_codex_terminal_without_output(job, index, &events, stderr, "codex_cli_failed");
+        return Err(ImageGatewayError::codex_cli_failed());
+    }
+
+    let bytes = if let Some(path) = select_image_output(&request_dir, &job.output_format) {
+        read_codex_output(&path).await?
+    } else if let Some(path) = events
+        .thread_id
+        .as_deref()
+        .and_then(|thread_id| select_native_codex_output(config, thread_id, &job.output_format))
+    {
+        warn!(
+            request.id = %job.request_id,
+            codex.thread.id = events.thread_id.as_deref().unwrap_or_default(),
+            "recovered Codex image from its request-scoped native output directory"
+        );
+        read_codex_output(&path).await?
+    } else if let Some(bytes) = captured_output {
+        warn!(
+            request.id = %job.request_id,
+            codex.thread.id = ?events.thread_id,
+            "recovered transient Codex image before its output path disappeared"
+        );
+        bytes
+    } else {
+        let error_code = if events.completed_image_generation {
+            "codex_image_output_disappeared"
+        } else {
+            "codex_no_image_output"
+        };
+        warn_codex_terminal_without_output(job, index, &events, stderr, error_code);
+        return Err(ImageGatewayError::codex_no_image_output());
+    };
 
     if !config.cleanup_codex_outputs {
         let _ = request_temp_dir.keep();
@@ -298,29 +372,160 @@ async fn run_codex_once(
     Ok(GeneratedImage { bytes })
 }
 
-async fn capture_codex_thread_id<R>(stdout: R) -> Option<String>
+async fn capture_codex_events<R>(
+    stdout: R,
+    state: Arc<Mutex<CodexCliEventSummary>>,
+) -> CodexCliEventSummary
 where
     R: AsyncRead + Unpin,
 {
     let mut lines = BufReader::new(stdout).lines();
-    let mut thread_id = None;
     while let Ok(Some(line)) = lines.next_line().await {
-        if thread_id.is_some() {
+        let Ok(event) = serde_json::from_slice::<serde_json::Value>(line.as_bytes()) else {
+            let mut summary = state.lock().expect("Codex event lock");
+            summary.malformed_events = summary.malformed_events.saturating_add(1);
             continue;
+        };
+        let mut summary = state.lock().expect("Codex event lock");
+        if summary.thread_id.is_none() {
+            summary.thread_id = codex_thread_id_from_value(&event);
         }
-        thread_id = codex_thread_id_from_event(line.as_bytes());
+        let image_event = codex_image_event_state(&event);
+        summary.saw_image_generation |= image_event.0;
+        summary.completed_image_generation |= image_event.1;
     }
-    thread_id
+    state.lock().expect("Codex event lock").clone()
 }
 
+async fn capture_codex_stderr<R>(mut stderr: R) -> CodexStderrSummary
+where
+    R: AsyncRead + Unpin,
+{
+    let mut summary = CodexStderrSummary::default();
+    let mut retained = 0usize;
+    let mut buffer = [0u8; 8192];
+    while let Ok(count) = stderr.read(&mut buffer).await {
+        if count == 0 {
+            break;
+        }
+        summary.present = true;
+        retained = retained.saturating_add(count);
+        summary.truncated |= retained > MAX_CODEX_DIAGNOSTIC_STREAM_BYTES;
+    }
+    summary
+}
+
+#[cfg(test)]
 fn codex_thread_id_from_event(event: &[u8]) -> Option<String> {
     let value: serde_json::Value = serde_json::from_slice(event).ok()?;
+    codex_thread_id_from_value(&value)
+}
+
+fn codex_thread_id_from_value(value: &serde_json::Value) -> Option<String> {
     if value.get("type")?.as_str()? != "thread.started" {
         return None;
     }
     let thread_id = value.get("thread_id")?.as_str()?;
     Uuid::parse_str(thread_id).ok()?;
     Some(thread_id.to_string())
+}
+
+fn codex_image_event_state(value: &serde_json::Value) -> (bool, bool) {
+    match value {
+        serde_json::Value::Object(fields) => {
+            let event_type = fields
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            let mut state = (
+                matches!(
+                    event_type,
+                    "image_generation_call" | "image_generation_begin" | "image_generation_end"
+                ),
+                event_type == "image_generation_end",
+            );
+            for value in fields.values() {
+                let child = codex_image_event_state(value);
+                state.0 |= child.0;
+                state.1 |= child.1;
+            }
+            if event_type == "item.completed" && state.0 {
+                state.1 = true;
+            }
+            state
+        }
+        serde_json::Value::Array(values) => values.iter().fold((false, false), |state, value| {
+            let child = codex_image_event_state(value);
+            (state.0 | child.0, state.1 | child.1)
+        }),
+        _ => (false, false),
+    }
+}
+
+async fn capture_inline_codex_output(
+    config: AppConfig,
+    request_dir: PathBuf,
+    output_format: String,
+    events: Arc<Mutex<CodexCliEventSummary>>,
+    mut stop: oneshot::Receiver<()>,
+) -> Option<Vec<u8>> {
+    let mut captured = None;
+    loop {
+        if let Some(bytes) =
+            snapshot_inline_codex_output(&config, &request_dir, &output_format, &events).await
+        {
+            captured = Some(bytes);
+        }
+        tokio::select! {
+            biased;
+            _ = &mut stop => {
+                if let Some(bytes) = snapshot_inline_codex_output(
+                    &config,
+                    &request_dir,
+                    &output_format,
+                    &events,
+                ).await {
+                    captured = Some(bytes);
+                }
+                return captured;
+            }
+            _ = tokio::time::sleep(CODEX_OUTPUT_POLL_INTERVAL) => {}
+        }
+    }
+}
+
+async fn snapshot_inline_codex_output(
+    config: &AppConfig,
+    request_dir: &Path,
+    output_format: &str,
+    events: &Arc<Mutex<CodexCliEventSummary>>,
+) -> Option<Vec<u8>> {
+    let path = select_image_output(request_dir, output_format).or_else(|| {
+        let thread_id = events.lock().expect("Codex event lock").thread_id.clone()?;
+        select_native_codex_output(config, &thread_id, output_format)
+    })?;
+    read_codex_output(&path).await.ok()
+}
+
+fn warn_codex_terminal_without_output(
+    job: &GenerationJob,
+    index: u32,
+    events: &CodexCliEventSummary,
+    stderr: CodexStderrSummary,
+    error_code: &'static str,
+) {
+    warn!(
+        request.id = %job.request_id,
+        image.index = index,
+        codex.thread.id = ?events.thread_id,
+        codex.image_generation.seen = events.saw_image_generation,
+        codex.image_generation.completed = events.completed_image_generation,
+        codex.events.malformed = events.malformed_events,
+        codex.stderr.present = stderr.present,
+        codex.stderr.truncated = stderr.truncated,
+        error.code = error_code,
+        "Codex terminated without a recoverable image artifact"
+    );
 }
 
 fn select_native_codex_output(
@@ -917,6 +1122,49 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn recognizes_completed_image_generation_without_scanning_message_text() {
+        let completed = serde_json::json!({
+            "type": "item.completed",
+            "item": {"type": "image_generation_call"}
+        });
+        let message = serde_json::json!({
+            "type": "item.completed",
+            "item": {
+                "type": "agent_message",
+                "text": "image_generation_call"
+            }
+        });
+
+        assert_eq!(codex_image_event_state(&completed), (true, true));
+        assert_eq!(codex_image_event_state(&message), (false, false));
+    }
+
+    #[tokio::test]
+    async fn captures_short_lived_inline_output_before_path_cleanup() {
+        let request = tempfile::tempdir().unwrap();
+        let expected = png_with_dimensions(2, 1);
+        let events = Arc::new(Mutex::new(CodexCliEventSummary::default()));
+        let (stop, stop_rx) = oneshot::channel();
+        let capture = tokio::spawn(capture_inline_codex_output(
+            test_config(),
+            request.path().to_path_buf(),
+            "png".to_string(),
+            events,
+            stop_rx,
+        ));
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let path = request.path().join("provider-output.png");
+        std::fs::write(&path, &expected).unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        std::fs::remove_file(path).unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let _ = stop.send(());
+
+        assert_eq!(capture.await.unwrap(), Some(expected));
     }
 
     #[test]

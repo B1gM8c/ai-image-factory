@@ -11,8 +11,8 @@ use std::{
 use async_trait::async_trait;
 use image_cli_runtime::{
     CliPolicy, CliRuntime, CommandSpec, CommandSpecError, ExitClassification, OutputContract,
-    OutputError, ProcessError, RuntimeError, SpawnEvidence, SpawnObserver, VerifiedExecutable,
-    WorkingDirectory,
+    OutputError, ProcessCompletion, ProcessError, RuntimeError, SpawnEvidence, SpawnObserver,
+    VerifiedExecutable, WorkingDirectory,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -104,6 +104,18 @@ struct CodexSpawnObserver {
     spool: Arc<ExecutionSpool>,
     runner_lock: Arc<RunnerLock>,
     helper: crate::runner::process::ProcessIdentity,
+    events: CodexEventSummary,
+}
+
+#[derive(Default)]
+struct CodexEventSummary {
+    thread_id: Option<Uuid>,
+    saw_image_generation: bool,
+    completed_image_generation: bool,
+    stdout_truncated: bool,
+    stderr_truncated: bool,
+    stderr_present: bool,
+    malformed_events: usize,
 }
 
 impl CodexProcessSupervisor {
@@ -515,6 +527,7 @@ async fn run_codex_child(
         spool: Arc::clone(&spool),
         runner_lock: Arc::clone(&runner_lock),
         helper,
+        events: CodexEventSummary::default(),
     };
     let capture_filename = provider_output_filename(&request.output.output_format);
     match spool.read_workspace_output(capture_filename, MAX_CODEX_RUNTIME_OUTPUT_BYTES) {
@@ -552,12 +565,28 @@ async fn run_codex_child(
                 &spool,
                 capture_filename,
                 codex_home,
+                observer.events.thread_id,
                 &request.output.output_format,
             )
             .await
             {
                 Ok(Some(bytes)) => ChildOutcome::Succeeded(bytes),
-                Ok(None) => map_cli_runtime_error(error),
+                Ok(None) => {
+                    tracing::warn!(
+                        request.id = %request.output.request_id,
+                        output.index = request.output.candidate_index,
+                        codex.thread.id = ?observer.events.thread_id,
+                        codex.image_generation.seen = observer.events.saw_image_generation,
+                        codex.image_generation.completed = observer.events.completed_image_generation,
+                        codex.events.malformed = observer.events.malformed_events,
+                        codex.stdout.truncated = observer.events.stdout_truncated,
+                        codex.stderr.truncated = observer.events.stderr_truncated,
+                        codex.stderr.present = observer.events.stderr_present,
+                        error.code = codex_output_error_code(&error),
+                        "Codex completed without a recoverable image artifact"
+                    );
+                    map_cli_runtime_error_with_events(error, &observer.events)
+                }
                 Err(ProcessSpoolError::Integrity) => {
                     ChildOutcome::Failed("codex_ephemeral_output_invalid")
                 }
@@ -584,6 +613,7 @@ async fn final_fallback_output(
     spool: &ExecutionSpool,
     workspace_filename: &str,
     codex_home: &Path,
+    thread_id: Option<Uuid>,
     output_format: &str,
 ) -> Result<Option<Vec<u8>>, ProcessSpoolError> {
     if let Some(bytes) = final_workspace_output(spool, workspace_filename, output_format)? {
@@ -591,7 +621,9 @@ async fn final_fallback_output(
     }
 
     let generated_images = codex_home.join("generated_images");
-    let Some(path) = select_image_output(&generated_images, output_format) else {
+    let thread_root = thread_id.map(|id| generated_images.join(id.to_string()));
+    let root = thread_root.as_deref().unwrap_or(&generated_images);
+    let Some(path) = select_image_output(root, output_format) else {
         return Ok(None);
     };
     let bytes = read_codex_output(&path)
@@ -624,8 +656,7 @@ async fn capture_ephemeral_output(
     output_format: String,
     mut stop: oneshot::Receiver<()>,
 ) -> Result<Option<Vec<u8>>, ProcessSpoolError> {
-    let mut previous: Option<Vec<u8>> = None;
-    let mut stable: Option<Vec<u8>> = None;
+    let mut captured: Option<Vec<u8>> = None;
     let mut first_poll = true;
     loop {
         if first_poll {
@@ -633,7 +664,7 @@ async fn capture_ephemeral_output(
         } else {
             tokio::select! {
                 biased;
-                _ = &mut stop => return Ok(stable),
+                _ = &mut stop => return Ok(captured),
                 _ = tokio::time::sleep(EPHEMERAL_OUTPUT_POLL_INTERVAL) => {}
             }
         }
@@ -644,32 +675,17 @@ async fn capture_ephemeral_output(
         .await
         .map_err(|_| ProcessSpoolError::Unavailable)??;
         match snapshot {
-            WorkspaceOutputSnapshot::Missing => previous = None,
-            WorkspaceOutputSnapshot::Incomplete => {
-                previous = None;
-                stable = None;
-            }
+            WorkspaceOutputSnapshot::Missing | WorkspaceOutputSnapshot::Incomplete => {}
             WorkspaceOutputSnapshot::Bytes(bytes) => {
-                if stable.as_deref() == Some(bytes.as_slice()) {
-                    previous = Some(bytes);
-                } else if previous.as_deref() == Some(bytes.as_slice()) {
-                    let format = output_format.clone();
-                    let (bytes, valid) = tokio::task::spawn_blocking(move || {
-                        let valid = valid_captured_image(&bytes, &format);
-                        (bytes, valid)
-                    })
-                    .await
-                    .map_err(|_| ProcessSpoolError::Unavailable)?;
-                    if valid {
-                        stable = Some(bytes.clone());
-                        previous = Some(bytes);
-                    } else {
-                        stable = None;
-                        previous = None;
-                    }
-                } else {
-                    stable = None;
-                    previous = Some(bytes);
+                let format = output_format.clone();
+                let (bytes, valid) = tokio::task::spawn_blocking(move || {
+                    let valid = valid_captured_image(&bytes, &format);
+                    (bytes, valid)
+                })
+                .await
+                .map_err(|_| ProcessSpoolError::Unavailable)?;
+                if valid {
+                    captured = Some(bytes);
                 }
             }
         }
@@ -743,6 +759,7 @@ impl CliPolicy for CodexCliPolicy {
             .arg(request.workspace.as_os_str())?
             .arg("--add-dir")?
             .arg(request.output_dir.as_os_str())?
+            .arg("--json")?
             .arg("-")?;
         for (name, value) in [
             ("HOME", request.codex_home.to_string_lossy().into_owned()),
@@ -758,7 +775,9 @@ impl CliPolicy for CodexCliPolicy {
         for (name, value) in &request.environment {
             command = command.env(name, value)?;
         }
-        command.stdin(request.prompt.clone())
+        command
+            .stdin(request.prompt.clone())
+            .map(CommandSpec::capture_process_output)
     }
 
     fn classify_exit(&self, status: &std::process::ExitStatus) -> ExitClassification {
@@ -780,6 +799,129 @@ impl SpawnObserver for CodexSpawnObserver {
             self.spool
                 .publish_provider_process(&self.runner_lock, &self.helper, &provider)
         })
+    }
+
+    fn observe_completion(&mut self, completion: &ProcessCompletion) -> Result<(), Self::Error> {
+        self.events = summarize_codex_events(completion);
+        Ok(())
+    }
+}
+
+fn summarize_codex_events(completion: &ProcessCompletion) -> CodexEventSummary {
+    summarize_codex_event_stream(
+        completion.stdout.bytes(),
+        completion.stdout.is_truncated(),
+        completion.stderr.bytes(),
+        completion.stderr.is_truncated(),
+    )
+}
+
+fn summarize_codex_event_stream(
+    stdout: &[u8],
+    stdout_truncated: bool,
+    stderr: &[u8],
+    stderr_truncated: bool,
+) -> CodexEventSummary {
+    let mut summary = CodexEventSummary {
+        stdout_truncated,
+        stderr_truncated,
+        stderr_present: !stderr.is_empty(),
+        ..CodexEventSummary::default()
+    };
+    for line in stdout.split(|byte| *byte == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(event) = serde_json::from_slice::<serde_json::Value>(line) else {
+            summary.malformed_events = summary.malformed_events.saturating_add(1);
+            continue;
+        };
+        if event.get("type").and_then(serde_json::Value::as_str) == Some("thread.started") {
+            summary.thread_id = event
+                .get("thread_id")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|value| Uuid::parse_str(value).ok());
+        }
+        let image_event = codex_image_event_state(&event);
+        if image_event.seen {
+            summary.saw_image_generation = true;
+        }
+        if image_event.completed {
+            summary.completed_image_generation = true;
+        }
+    }
+    summary
+}
+
+#[derive(Clone, Copy, Default)]
+struct CodexImageEventState {
+    seen: bool,
+    completed: bool,
+}
+
+fn codex_image_event_state(value: &serde_json::Value) -> CodexImageEventState {
+    match value {
+        serde_json::Value::Object(fields) => {
+            let event_type = fields
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            let mut state = CodexImageEventState {
+                seen: matches!(
+                    event_type,
+                    "image_generation_call" | "image_generation_begin" | "image_generation_end"
+                ),
+                completed: event_type == "image_generation_end",
+            };
+            for value in fields.values() {
+                let child = codex_image_event_state(value);
+                state.seen |= child.seen;
+                state.completed |= child.completed;
+            }
+            if event_type == "item.completed" && state.seen {
+                state.completed = true;
+            }
+            state
+        }
+        serde_json::Value::Array(values) => {
+            values
+                .iter()
+                .fold(CodexImageEventState::default(), |mut state, value| {
+                    let child = codex_image_event_state(value);
+                    state.seen |= child.seen;
+                    state.completed |= child.completed;
+                    state
+                })
+        }
+        _ => CodexImageEventState::default(),
+    }
+}
+
+fn map_cli_runtime_error_with_events(
+    error: RuntimeError,
+    events: &CodexEventSummary,
+) -> ChildOutcome {
+    if events.completed_image_generation
+        && matches!(
+            error,
+            RuntimeError::Output(OutputError::Missing)
+                | RuntimeError::Output(OutputError::Unavailable(_))
+        )
+    {
+        return ChildOutcome::Failed("codex_image_output_disappeared");
+    }
+    map_cli_runtime_error(error)
+}
+
+fn codex_output_error_code(error: &RuntimeError) -> &'static str {
+    match error {
+        RuntimeError::Output(OutputError::Missing) => "codex_no_image_output",
+        RuntimeError::Output(OutputError::Unavailable(error))
+            if error.kind() == std::io::ErrorKind::NotFound =>
+        {
+            "codex_image_output_disappeared"
+        }
+        _ => "codex_runtime_failed",
     }
 }
 
@@ -1176,6 +1318,46 @@ mod tests {
     }
 
     #[test]
+    fn codex_json_events_bind_native_output_and_terminal_diagnostics() {
+        let thread_id = Uuid::new_v4();
+        let stdout = format!(
+            "{{\"type\":\"thread.started\",\"thread_id\":\"{thread_id}\"}}\n\
+             {{\"type\":\"item.completed\",\"item\":{{\"type\":\"image_generation_call\"}}}}\n\
+             not-json\n"
+        );
+
+        let summary = summarize_codex_event_stream(stdout.as_bytes(), false, b"warning", true);
+
+        assert_eq!(summary.thread_id, Some(thread_id));
+        assert!(summary.saw_image_generation);
+        assert!(summary.completed_image_generation);
+        assert_eq!(summary.malformed_events, 1);
+        assert!(summary.stderr_present);
+        assert!(summary.stderr_truncated);
+    }
+
+    #[test]
+    fn completed_image_event_distinguishes_lost_artifact_from_no_generation() {
+        let events = CodexEventSummary {
+            saw_image_generation: true,
+            completed_image_generation: true,
+            ..CodexEventSummary::default()
+        };
+
+        assert!(matches!(
+            map_cli_runtime_error_with_events(RuntimeError::Output(OutputError::Missing), &events,),
+            ChildOutcome::Failed("codex_image_output_disappeared")
+        ));
+        assert!(matches!(
+            map_cli_runtime_error_with_events(
+                RuntimeError::Output(OutputError::Missing),
+                &CodexEventSummary::default(),
+            ),
+            ChildOutcome::Failed("codex_no_image_output")
+        ));
+    }
+
+    #[test]
     fn auth_digest_uses_the_same_private_file_contract_as_runtime() {
         let temp = TempDir::new().unwrap();
         let auth = temp.path().join(AUTH_FILE);
@@ -1379,6 +1561,30 @@ mod tests {
     #[tokio::test]
     async fn recovers_retained_workspace_output_after_runtime_output_disappears() {
         let fixture = CodexFixture::disappearing_runtime_output();
+        let lease = fixture.lease();
+        let context = fixture.context(&lease);
+        let expected = fs::read(fixture._temp.path().join("source.png")).unwrap();
+        fixture.journal.start_or_attach(&lease).unwrap();
+        fixture.supervisor.prepare(&lease, &context).await.unwrap();
+        assert_eq!(
+            fixture.journal.commit_launch(&lease).unwrap(),
+            LaunchDecision::LaunchOnce
+        );
+        let spool = ExecutionSpool::for_lease(&fixture.journal, &lease).unwrap();
+
+        run_codex_runner_child(fixture.journal.root_path(), lease.executor_execution_id)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            spool.observe().unwrap(),
+            ProcessObservation::Succeeded(SupervisedOutput::without_provider_cost(expected))
+        );
+    }
+
+    #[tokio::test]
+    async fn recovers_short_lived_workspace_output_from_one_complete_snapshot() {
+        let fixture = CodexFixture::short_lived_workspace_output();
         let lease = fixture.lease();
         let context = fixture.context(&lease);
         let expected = fs::read(fixture._temp.path().join("source.png")).unwrap();
@@ -1675,10 +1881,20 @@ mod tests {
             })
         }
 
+        fn short_lived_workspace_output() -> Self {
+            Self::with_script(|invocations, image, _root| {
+                format!(
+                    "#!/bin/sh\nset -eu\n/bin/cat >/dev/null\nprintf '1\\n' >> '{}'\nworkspace=''\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = '--cd' ]; then\n    shift\n    workspace=\"$1\"\n    break\n  fi\n  shift\ndone\ntest -n \"$workspace\"\n/bin/sleep 0.05\n/bin/cp '{}' \"$workspace/provider-output.png\"\n/bin/sleep 0.25\n/bin/rm \"$workspace/provider-output.png\"\n",
+                    invocations.display(),
+                    image.display(),
+                )
+            })
+        }
+
         fn generated_images_output_only() -> Self {
             Self::with_script(|invocations, image, _root| {
                 format!(
-                    "#!/bin/sh\nset -eu\n/bin/cat >/dev/null\nprintf '1\\n' >> '{}'\n/bin/mkdir -p \"$CODEX_HOME/generated_images\"\n/bin/cp '{}' \"$CODEX_HOME/generated_images/generated.png\"\n",
+                    "#!/bin/sh\nset -eu\n/bin/cat >/dev/null\nprintf '1\\n' >> '{}'\nthread_id='019fd9f5-badb-7dd3-8903-28ffded0ef54'\n/bin/mkdir -p \"$CODEX_HOME/generated_images/$thread_id\"\n/bin/cp '{}' \"$CODEX_HOME/generated_images/$thread_id/generated.png\"\nprintf '{{\"type\":\"thread.started\",\"thread_id\":\"%s\"}}\\n' \"$thread_id\"\nprintf '{{\"type\":\"item.completed\",\"item\":{{\"type\":\"image_generation_call\"}}}}\\n'\n",
                     invocations.display(),
                     image.display(),
                 )

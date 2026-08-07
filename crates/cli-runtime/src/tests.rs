@@ -16,8 +16,8 @@ use tempfile::TempDir;
 use crate::{
     AsyncOutputSealError, AsyncOutputSink, CliPolicy, CliRuntime, CommandSpec, CommandSpecError,
     ExitClassification, FreshOutputDirectory, NoopSpawnObserver, OutputContract, OutputError,
-    ProcessError, ReceiptCliPolicy, RuntimeError, SpawnEvidence, SpawnObserver, VerifiedExecutable,
-    WorkingDirectory, default_exit_classification,
+    ProcessCompletion, ProcessError, ReceiptCliPolicy, RuntimeError, SpawnEvidence, SpawnObserver,
+    VerifiedExecutable, WorkingDirectory, default_exit_classification,
 };
 
 #[derive(Clone)]
@@ -166,6 +166,27 @@ impl SpawnObserver for RecordingObserver {
     }
 }
 
+#[derive(Default)]
+struct CompletionRecordingObserver {
+    completion: Arc<Mutex<Option<(Vec<u8>, Vec<u8>)>>>,
+}
+
+impl SpawnObserver for CompletionRecordingObserver {
+    type Error = Infallible;
+
+    fn observe_spawn(&mut self, _evidence: &SpawnEvidence) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    fn observe_completion(&mut self, completion: &ProcessCompletion) -> Result<(), Self::Error> {
+        *self.completion.lock().expect("observer mutex") = Some((
+            completion.stdout.bytes().to_vec(),
+            completion.stderr.bytes().to_vec(),
+        ));
+        Ok(())
+    }
+}
+
 #[test]
 fn private_working_directory_requires_current_owner_and_mode_0700() {
     let directory = TempDir::new().expect("temp directory");
@@ -272,6 +293,32 @@ async fn clears_environment_and_discards_artifact_process_output() {
         .expect("command succeeds");
 
     assert_eq!(result.sink, b"unset|present");
+}
+
+#[tokio::test]
+async fn artifact_command_can_capture_bounded_process_output_for_observer() {
+    let directory = TempDir::new().expect("temp directory");
+    let command = command(
+        directory.path(),
+        "printf event; printf diagnostic >&2; printf artifact > result.bin",
+        1024,
+    )
+    .capture_process_output();
+    let completion = Arc::new(Mutex::new(None));
+    let mut observer = CompletionRecordingObserver {
+        completion: Arc::clone(&completion),
+    };
+
+    let result = CliRuntime::new(StaticPolicy { command })
+        .run_to_sink(&(), &mut observer, Vec::new())
+        .await
+        .expect("command succeeds");
+
+    assert_eq!(result.sink, b"artifact");
+    assert_eq!(
+        completion.lock().expect("observer mutex").as_ref(),
+        Some(&(b"event".to_vec(), b"diagnostic".to_vec()))
+    );
 }
 
 #[tokio::test]
