@@ -49,6 +49,8 @@ struct ConsoleVideoModel {
     media_kind: String,
     operation: String,
     created: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_prompt_chars: Option<usize>,
     modes: &'static [&'static str],
     controls: ConsoleVideoControls,
 }
@@ -344,6 +346,9 @@ fn prefer_official_dreamina_aliases(models: Vec<PublicModelRoute>) -> Vec<Public
 fn console_video_model(model: PublicModelRoute) -> Option<ConsoleVideoModel> {
     let controls = console_video_controls(&model.api_profile, model.provider_model_id.as_deref())?;
     let modes = console_video_modes(&model.api_profile, model.provider_model_id.as_deref())?;
+    let max_prompt_chars = (model.provider_id == image_provider_grok_cli::PROVIDER_ID
+        || model.api_profile == XAI_VIDEOS_API_PROFILE)
+        .then_some(image_provider_grok_cli::MAX_PROMPT_CHARS);
     Some(ConsoleVideoModel {
         id: model.id,
         provider: model.provider_id,
@@ -351,6 +356,7 @@ fn console_video_model(model: PublicModelRoute) -> Option<ConsoleVideoModel> {
         media_kind: model.media_kind,
         operation: model.operation_id,
         created: model.created_at_ms.div_euclid(1_000),
+        max_prompt_chars,
         modes,
         controls,
     })
@@ -882,6 +888,18 @@ mod tests {
             controls.aspect_ratio.unwrap().supported_for,
             &["text_to_video", "reference_to_video"]
         );
+
+        let model = PublicModelRoute {
+            id: "grok-imagine-video-1.5-preview".to_owned(),
+            provider_model_id: Some("grok-imagine-video-1.5-preview".to_owned()),
+            api_profile: XAI_VIDEOS_API_PROFILE.to_owned(),
+            provider_id: image_provider_grok_cli::PROVIDER_ID.to_owned(),
+            operation_id: VIDEO_GENERATION_ROUTE_OPERATION.to_owned(),
+            media_kind: "video".to_owned(),
+            created_at_ms: 0,
+        };
+        let value = serde_json::to_value(console_video_model(model).unwrap()).unwrap();
+        assert_eq!(value["max_prompt_chars"], 1_024);
     }
 
     #[test]

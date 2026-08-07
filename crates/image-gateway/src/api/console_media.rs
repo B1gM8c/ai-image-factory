@@ -46,6 +46,8 @@ struct ConsoleMediaModel {
     media_kind: String,
     operation: String,
     created: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_prompt_chars: Option<usize>,
     supports_edit: bool,
     spatial_edit_mode: SpatialEditMode,
     max_reference_images: u32,
@@ -327,6 +329,9 @@ fn prefer_official_dreamina_aliases(models: Vec<PublicModelRoute>) -> Vec<Public
 
 fn console_model(model: PublicModelRoute, supports_edit: bool) -> Option<ConsoleMediaModel> {
     let controls = controls_for_model(&model.api_profile, model.provider_model_id.as_deref())?;
+    let max_prompt_chars = (model.provider_id == image_provider_grok_cli::PROVIDER_ID
+        || model.api_profile == XAI_IMAGES_API_PROFILE)
+        .then_some(image_provider_grok_cli::MAX_PROMPT_CHARS);
     let max_reference_images = match (supports_edit, model.api_profile.as_str()) {
         (true, OPENAI_IMAGES_API_PROFILE) => 16,
         (true, XAI_IMAGES_API_PROFILE) => {
@@ -343,6 +348,7 @@ fn console_model(model: PublicModelRoute, supports_edit: bool) -> Option<Console
         media_kind: model.media_kind,
         operation: model.operation_id,
         created: model.created_at_ms.div_euclid(1_000),
+        max_prompt_chars,
         supports_edit,
         spatial_edit_mode,
         max_reference_images,
@@ -694,6 +700,7 @@ mod tests {
         let value = serde_json::to_value(model).unwrap();
 
         assert_eq!(value["spatial_edit_mode"], "semantic_mask");
+        assert_eq!(value["max_prompt_chars"], 1_024);
     }
 
     #[test]
