@@ -584,6 +584,7 @@ async fn admin_read_case(pool: &PgPool) -> TestResult {
         "delayed usage seed returned an invalid job",
     )?;
 
+    let scheduler_before_blocked = store.scheduler(60_000).await.map_err(debug_error)?;
     let blocked = seed_blocked_terminal_reduction(pool).await?;
     let scheduler = store.scheduler(60_000).await.map_err(debug_error)?;
     require(
@@ -600,6 +601,14 @@ async fn admin_read_case(pool: &PgPool) -> TestResult {
             && projected.blocked_by == "admin-read-reducer"
             && projected.blocked_at_ms > 0,
         "scheduler blocked terminal list lost stable diagnostic fields",
+    )?;
+    require(
+        scheduler.work_items == scheduler_before_blocked.work_items
+            && scheduler
+                .active_jobs
+                .iter()
+                .all(|job| job.job_id != blocked.job_id.to_string()),
+        "blocked terminal work must not remain in the live scheduler projection",
     )
 }
 

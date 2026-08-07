@@ -3314,8 +3314,8 @@ async fn shared_pool_case(pool: &PgPool) -> TestResult {
 
 async fn assert_expected_schema(pool: &PgPool) -> TestResult {
     require(
-        migration_versions(pool).await? == (0_i64..=119_i64).collect::<Vec<_>>(),
-        "applied migration versions must be exactly 0 through 119",
+        migration_versions(pool).await? == (0_i64..=120_i64).collect::<Vec<_>>(),
+        "applied migration versions must be exactly 0 through 120",
     )?;
 
     let default_codex_prices: Vec<(String, i64, i64)> = sqlx::query_as(

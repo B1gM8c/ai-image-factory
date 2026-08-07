@@ -1203,6 +1203,22 @@ impl AdminReadStore for PostgresAdminReadStore {
                    COUNT(*)::TEXT AS count
             FROM work_items
             WHERE state IN ('ready', 'leased', 'running', 'awaiting_executor')
+              AND (
+                  state <> 'awaiting_executor'
+                  OR EXISTS (
+                      SELECT 1
+                      FROM provider_submissions submission
+                      LEFT JOIN executor_terminal_reductions reduction
+                        ON reduction.submission_id = submission.submission_id
+                       AND reduction.executor_execution_id =
+                           submission.executor_execution_id
+                      WHERE submission.work_item_id = work_items.work_item_id
+                        AND (
+                            reduction.submission_id IS NULL
+                            OR reduction.state IN ('ready', 'leased')
+                        )
+                  )
+              )
             GROUP BY state, ready_timing
             ORDER BY state, ready_timing
             "#,
@@ -1334,6 +1350,22 @@ impl AdminReadStore for PostgresAdminReadStore {
               ON environment.provider_account_id = profile.provider_account_id
              AND environment.provider_id = profile.provider_id
             WHERE work.state IN ('ready', 'leased', 'running', 'awaiting_executor')
+              AND (
+                  work.state <> 'awaiting_executor'
+                  OR EXISTS (
+                      SELECT 1
+                      FROM provider_submissions submission
+                      LEFT JOIN executor_terminal_reductions reduction
+                        ON reduction.submission_id = submission.submission_id
+                       AND reduction.executor_execution_id =
+                           submission.executor_execution_id
+                      WHERE submission.work_item_id = work.work_item_id
+                        AND (
+                            reduction.submission_id IS NULL
+                            OR reduction.state IN ('ready', 'leased')
+                        )
+                  )
+              )
               AND job.state IN (
                   'accepted', 'reserved', 'queued', 'leased', 'running',
                   'provider_waiting', 'artifact_ready'
