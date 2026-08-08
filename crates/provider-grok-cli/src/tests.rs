@@ -816,7 +816,7 @@ fn image_generation_receipt_rejects_execution_argument_drift() {
 }
 
 #[test]
-fn image_edit_receipt_keeps_exact_prompt_binding() {
+fn image_edit_receipt_accepts_safe_prompt_normalization() {
     let fixture = PolicyFixture::new();
     let request = GrokImageEditRequestV1::new(
         "original",
@@ -833,10 +833,53 @@ fn image_edit_receipt_keeps_exact_prompt_binding() {
     let mut drifted_arguments = invocation.expected_arguments().clone();
     drifted_arguments["prompt"] = json!("rewritten");
     let history = history_with(&invocation, drifted_arguments, invocation.artifact_path());
-    assert!(matches!(
-        parse_invocation_receipt(&valid_stdout(), &history, &invocation),
-        Err(GrokReceiptError::ToolArgumentsMismatch)
-    ));
+    let receipt = parse_invocation_receipt(&valid_stdout(), &history, &invocation).unwrap();
+    assert_eq!(receipt.effective_tool_prompt(), Some("rewritten"));
+}
+
+#[test]
+fn image_edit_receipt_rejects_input_and_execution_argument_drift() {
+    let fixture = PolicyFixture::new();
+    let request = GrokImageEditRequestV1::new(
+        "original",
+        vec![staged("one.png"), staged("two.png")],
+        ImageAspectRatio::R1x1,
+    )
+    .unwrap();
+    let (_, invocation) = fixture
+        .policy
+        .command_spec_in(&request.into(), SESSION_ID, fixture.workspace.clone())
+        .unwrap();
+    write_artifact(&invocation);
+
+    let expected = invocation.expected_arguments();
+    let image_paths = expected["image"].as_array().unwrap();
+    for drifted_arguments in [
+        json!({
+            "prompt": "rewritten",
+            "image": [image_paths[1].clone(), image_paths[0].clone()],
+            "aspect_ratio": "1:1"
+        }),
+        json!({
+            "prompt": "rewritten",
+            "image": image_paths,
+            "aspect_ratio": "16:9"
+        }),
+        json!({
+            "prompt": "rewritten",
+            "image": image_paths,
+            "aspect_ratio": "1:1",
+            "model": "other"
+        }),
+        json!({"prompt": "rewritten", "aspect_ratio": "1:1"}),
+        json!({"prompt": "", "image": image_paths, "aspect_ratio": "1:1"}),
+    ] {
+        let history = history_with(&invocation, drifted_arguments, invocation.artifact_path());
+        assert!(matches!(
+            parse_invocation_receipt(&valid_stdout(), &history, &invocation),
+            Err(GrokReceiptError::ToolArgumentsMismatch)
+        ));
+    }
 }
 
 #[test]

@@ -270,11 +270,14 @@ fn validate_tool_arguments(
     if actual == expected.arguments() {
         return Ok(());
     }
-    if expected.tool() != GrokTool::ImageGeneration {
+    if !matches!(
+        expected.tool(),
+        GrokTool::ImageGeneration | GrokTool::ImageEdit
+    ) {
         return Err(GrokReceiptError::ToolArgumentsMismatch);
     }
 
-    // The agent may normalize image prompts; routing and execution controls remain exact.
+    // The agent may normalize image prompts; routing, inputs, and execution controls remain exact.
     let expected = expected
         .arguments()
         .as_object()
