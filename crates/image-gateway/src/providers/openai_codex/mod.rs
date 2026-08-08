@@ -50,6 +50,7 @@ struct CodexCliEventSummary {
     saw_image_generation: bool,
     completed_image_generation: bool,
     malformed_events: usize,
+    capture_complete: bool,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -433,7 +434,10 @@ async fn run_codex_attempt(
 }
 
 fn retryable_codex_no_image_generation(events: &CodexCliEventSummary) -> bool {
-    !events.saw_image_generation && !events.completed_image_generation
+    events.capture_complete
+        && events.malformed_events == 0
+        && !events.saw_image_generation
+        && !events.completed_image_generation
 }
 
 async fn capture_codex_events<R>(
@@ -444,19 +448,28 @@ where
     R: AsyncRead + Unpin,
 {
     let mut lines = BufReader::new(stdout).lines();
-    while let Ok(Some(line)) = lines.next_line().await {
-        let Ok(event) = serde_json::from_slice::<serde_json::Value>(line.as_bytes()) else {
-            let mut summary = state.lock().expect("Codex event lock");
-            summary.malformed_events = summary.malformed_events.saturating_add(1);
-            continue;
-        };
-        let mut summary = state.lock().expect("Codex event lock");
-        if summary.thread_id.is_none() {
-            summary.thread_id = codex_thread_id_from_value(&event);
+    loop {
+        match lines.next_line().await {
+            Ok(Some(line)) => {
+                let Ok(event) = serde_json::from_slice::<serde_json::Value>(line.as_bytes()) else {
+                    let mut summary = state.lock().expect("Codex event lock");
+                    summary.malformed_events = summary.malformed_events.saturating_add(1);
+                    continue;
+                };
+                let mut summary = state.lock().expect("Codex event lock");
+                if summary.thread_id.is_none() {
+                    summary.thread_id = codex_thread_id_from_value(&event);
+                }
+                let image_event = codex_image_event_state(&event);
+                summary.saw_image_generation |= image_event.0;
+                summary.completed_image_generation |= image_event.1;
+            }
+            Ok(None) => {
+                state.lock().expect("Codex event lock").capture_complete = true;
+                break;
+            }
+            Err(_) => break,
         }
-        let image_event = codex_image_event_state(&event);
-        summary.saw_image_generation |= image_event.0;
-        summary.completed_image_generation |= image_event.1;
     }
     state.lock().expect("Codex event lock").clone()
 }
@@ -1210,22 +1223,140 @@ mod tests {
 
     #[test]
     fn retries_only_when_codex_never_invoked_image_generation() {
-        assert!(retryable_codex_no_image_generation(
+        assert!(retryable_codex_no_image_generation(&CodexCliEventSummary {
+            capture_complete: true,
+            ..CodexCliEventSummary::default()
+        }));
+        assert!(!retryable_codex_no_image_generation(
             &CodexCliEventSummary::default()
         ));
         assert!(!retryable_codex_no_image_generation(
             &CodexCliEventSummary {
+                capture_complete: true,
+                malformed_events: 1,
+                ..CodexCliEventSummary::default()
+            }
+        ));
+        assert!(!retryable_codex_no_image_generation(
+            &CodexCliEventSummary {
+                capture_complete: true,
                 saw_image_generation: true,
                 ..CodexCliEventSummary::default()
             }
         ));
         assert!(!retryable_codex_no_image_generation(
             &CodexCliEventSummary {
+                capture_complete: true,
                 saw_image_generation: true,
                 completed_image_generation: true,
                 ..CodexCliEventSummary::default()
             }
         ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn does_not_retry_after_an_image_tool_event_without_output() {
+        let temp = tempfile::tempdir().unwrap();
+        let executable = temp.path().join("fake-codex");
+        let invocations = temp.path().join("invocations");
+        std::fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\n/bin/cat >/dev/null\nprintf '1\\n' >> '{invocations}'\nprintf '{{\"type\":\"item.started\",\"item\":{{\"type\":\"image_generation_call\"}}}}\\n'\n",
+                invocations = invocations.display(),
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut config = test_config();
+        config.codex_home = Some(
+            temp.path()
+                .join("codex-home")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        config.cleanup_codex_outputs = true;
+        config.request_timeout = Duration::from_secs(10);
+
+        let result = run_codex_once_with_executable(
+            &config,
+            &test_generation_job("req-tool-event"),
+            1,
+            &[],
+            &executable,
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            std::fs::read_to_string(invocations)
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn does_not_retry_after_a_malformed_event_stream() {
+        let temp = tempfile::tempdir().unwrap();
+        let executable = temp.path().join("fake-codex");
+        let invocations = temp.path().join("invocations");
+        std::fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\n/bin/cat >/dev/null\nprintf '1\\n' >> '{invocations}'\nprintf 'not-json\\n'\n",
+                invocations = invocations.display(),
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut config = test_config();
+        config.codex_home = Some(
+            temp.path()
+                .join("codex-home")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        config.cleanup_codex_outputs = true;
+        config.request_timeout = Duration::from_secs(10);
+
+        let result = run_codex_once_with_executable(
+            &config,
+            &test_generation_job("req-malformed"),
+            1,
+            &[],
+            &executable,
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            std::fs::read_to_string(invocations)
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+    }
+
+    fn test_generation_job(request_id: &str) -> GenerationJob {
+        GenerationJob {
+            request_id: request_id.to_string(),
+            model: "gpt-image-2".to_string(),
+            prompt: "generate an image".to_string(),
+            moderation: "auto".to_string(),
+            n: 1,
+            size: "1:1".to_string(),
+            quality: "auto".to_string(),
+            output_format: "png".to_string(),
+            output_compression: None,
+            background: "auto".to_string(),
+            stream: false,
+            partial_images: 0,
+        }
     }
 
     #[test]
@@ -1281,20 +1412,7 @@ mod tests {
         );
         config.cleanup_codex_outputs = true;
         config.request_timeout = Duration::from_secs(10);
-        let job = GenerationJob {
-            request_id: "req-retry".to_string(),
-            model: "gpt-image-2".to_string(),
-            prompt: "generate an image".to_string(),
-            moderation: "auto".to_string(),
-            n: 1,
-            size: "1:1".to_string(),
-            quality: "auto".to_string(),
-            output_format: "png".to_string(),
-            output_compression: None,
-            background: "auto".to_string(),
-            stream: false,
-            partial_images: 0,
-        };
+        let job = test_generation_job("req-retry");
 
         let image = run_codex_once_with_executable(&config, &job, 1, &[input], &executable)
             .await
