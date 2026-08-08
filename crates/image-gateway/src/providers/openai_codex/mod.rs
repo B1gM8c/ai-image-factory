@@ -32,6 +32,8 @@ const MAX_CODEX_BATCH_BYTES: u64 = 64 * 1024 * 1024;
 const CODEX_REAP_TIMEOUT: Duration = Duration::from_secs(5);
 const CODEX_OUTPUT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const MAX_CODEX_DIAGNOSTIC_STREAM_BYTES: usize = 64 * 1024;
+const MAX_CODEX_NO_TOOL_ATTEMPTS: u8 = 2;
+const CODEX_NO_TOOL_RETRY_INSTRUCTION: &str = "\n\nThe previous attempt completed without calling the image generation tool. You MUST call the enabled image generation tool now and save exactly one image at the required output path. Do not answer with text only.";
 
 static CODEX_OUTPUT_CLEANUP: LazyLock<Mutex<HashMap<PathBuf, CodexOutputCleanupBucket>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -59,6 +61,17 @@ struct CodexStderrSummary {
 struct CodexProcessGroupGuard {
     #[cfg(unix)]
     pid: Option<u32>,
+}
+
+enum CodexAttemptError {
+    Gateway(ImageGatewayError),
+    NoImageGeneration,
+}
+
+impl From<ImageGatewayError> for CodexAttemptError {
+    fn from(error: ImageGatewayError) -> Self {
+        Self::Gateway(error)
+    }
 }
 
 impl CodexProcessGroupGuard {
@@ -219,15 +232,61 @@ async fn run_codex_once(
     index: u32,
     input_paths: &[PathBuf],
 ) -> Result<GeneratedImage, ImageGatewayError> {
+    run_codex_once_with_executable(config, job, index, input_paths, Path::new("codex")).await
+}
+
+async fn run_codex_once_with_executable(
+    config: &AppConfig,
+    job: &GenerationJob,
+    index: u32,
+    input_paths: &[PathBuf],
+    codex_executable: &Path,
+) -> Result<GeneratedImage, ImageGatewayError> {
+    for attempt in 1..=MAX_CODEX_NO_TOOL_ATTEMPTS {
+        match run_codex_attempt(config, job, index, input_paths, attempt, codex_executable).await {
+            Ok(image) => return Ok(image),
+            Err(CodexAttemptError::Gateway(error)) => return Err(error),
+            Err(CodexAttemptError::NoImageGeneration) if attempt < MAX_CODEX_NO_TOOL_ATTEMPTS => {
+                warn!(
+                    request.id = %job.request_id,
+                    image.index = index,
+                    codex.attempt = attempt,
+                    retry.max_attempts = MAX_CODEX_NO_TOOL_ATTEMPTS,
+                    retry.reason = "image_generation_not_invoked",
+                    "retrying Codex image generation after a successful text-only completion"
+                );
+            }
+            Err(CodexAttemptError::NoImageGeneration) => {
+                return Err(ImageGatewayError::codex_no_image_output());
+            }
+        }
+    }
+    unreachable!("Codex attempt loop always returns")
+}
+
+async fn run_codex_attempt(
+    config: &AppConfig,
+    job: &GenerationJob,
+    index: u32,
+    input_paths: &[PathBuf],
+    attempt: u8,
+    codex_executable: &Path,
+) -> Result<GeneratedImage, CodexAttemptError> {
     let request_temp_dir = tempfile::Builder::new()
-        .prefix(&format!("gpt-image-2-gateway-{}-{index}-", job.request_id))
+        .prefix(&format!(
+            "gpt-image-2-gateway-{}-{index}-{attempt}-",
+            job.request_id
+        ))
         .tempdir()
         .map_err(ImageGatewayError::from)?;
     let request_dir = request_temp_dir.path().to_path_buf();
     let _codex_output_cleanup = begin_codex_output_cleanup(config);
 
-    let prompt = build_codex_prompt(job, &request_dir, index);
-    let mut command = Command::new("codex");
+    let mut prompt = build_codex_prompt(job, &request_dir, index);
+    if attempt > 1 {
+        prompt.push_str(CODEX_NO_TOOL_RETRY_INSTRUCTION);
+    }
+    let mut command = Command::new(codex_executable);
     command
         .arg("exec")
         .arg("--ephemeral")
@@ -281,9 +340,7 @@ async fn run_codex_once(
             let _ = tokio::time::timeout(CODEX_REAP_TIMEOUT, child.wait()).await;
             let _ = stop_output_capture.send(());
             let _ = tokio::time::timeout(CODEX_REAP_TIMEOUT, output_capture).await;
-            return Err(ImageGatewayError::backend(
-                "Failed to write prompt to Codex CLI",
-            ));
+            return Err(ImageGatewayError::backend("Failed to write prompt to Codex CLI").into());
         }
     }
 
@@ -293,7 +350,7 @@ async fn run_codex_once(
             process_group_guard.kill();
             let _ = stop_output_capture.send(());
             let _ = tokio::time::timeout(CODEX_REAP_TIMEOUT, output_capture).await;
-            return Err(ImageGatewayError::codex_cli_failed());
+            return Err(ImageGatewayError::codex_cli_failed().into());
         }
         Err(_) => {
             process_group_guard.kill();
@@ -302,7 +359,7 @@ async fn run_codex_once(
             let _ = stop_output_capture.send(());
             let _ = tokio::time::timeout(CODEX_REAP_TIMEOUT, output_capture).await;
             warn!(request.id = %job.request_id, "Codex CLI timed out and was terminated");
-            return Err(ImageGatewayError::timeout());
+            return Err(ImageGatewayError::timeout().into());
         }
     };
 
@@ -332,7 +389,7 @@ async fn run_codex_once(
 
     if !status.success() {
         warn_codex_terminal_without_output(job, index, &events, stderr, "codex_cli_failed");
-        return Err(ImageGatewayError::codex_cli_failed());
+        return Err(ImageGatewayError::codex_cli_failed().into());
     }
 
     let bytes = if let Some(path) = select_image_output(&request_dir, &job.output_format) {
@@ -362,7 +419,10 @@ async fn run_codex_once(
             "codex_no_image_output"
         };
         warn_codex_terminal_without_output(job, index, &events, stderr, error_code);
-        return Err(ImageGatewayError::codex_no_image_output());
+        if retryable_codex_no_image_generation(&events) {
+            return Err(CodexAttemptError::NoImageGeneration);
+        }
+        return Err(ImageGatewayError::codex_no_image_output().into());
     };
 
     if !config.cleanup_codex_outputs {
@@ -370,6 +430,10 @@ async fn run_codex_once(
     }
 
     Ok(GeneratedImage { bytes })
+}
+
+fn retryable_codex_no_image_generation(events: &CodexCliEventSummary) -> bool {
+    !events.saw_image_generation && !events.completed_image_generation
 }
 
 async fn capture_codex_events<R>(
@@ -953,6 +1017,8 @@ fn validate_mask_for_first_image(
 mod tests {
     use super::*;
     use image::ImageFormat;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use std::{
         collections::{BTreeMap, HashSet},
         io::Cursor,
@@ -1140,6 +1206,108 @@ mod tests {
 
         assert_eq!(codex_image_event_state(&completed), (true, true));
         assert_eq!(codex_image_event_state(&message), (false, false));
+    }
+
+    #[test]
+    fn retries_only_when_codex_never_invoked_image_generation() {
+        assert!(retryable_codex_no_image_generation(
+            &CodexCliEventSummary::default()
+        ));
+        assert!(!retryable_codex_no_image_generation(
+            &CodexCliEventSummary {
+                saw_image_generation: true,
+                ..CodexCliEventSummary::default()
+            }
+        ));
+        assert!(!retryable_codex_no_image_generation(
+            &CodexCliEventSummary {
+                saw_image_generation: true,
+                completed_image_generation: true,
+                ..CodexCliEventSummary::default()
+            }
+        ));
+    }
+
+    #[test]
+    fn retry_instruction_requires_the_image_tool_and_output_contract() {
+        assert!(CODEX_NO_TOOL_RETRY_INSTRUCTION.contains("MUST call"));
+        assert!(CODEX_NO_TOOL_RETRY_INSTRUCTION.contains("exactly one image"));
+        assert!(CODEX_NO_TOOL_RETRY_INSTRUCTION.contains("Do not answer with text only"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn retries_a_text_only_completion_once_and_returns_the_second_image() {
+        let temp = tempfile::tempdir().unwrap();
+        let executable = temp.path().join("fake-codex");
+        let invocations = temp.path().join("invocations");
+        let input = temp.path().join("reference.png");
+        let source = temp.path().join("source.png");
+        let expected = valid_png_with_dimensions(2, 1);
+        std::fs::write(&input, valid_png_with_dimensions(1, 1)).unwrap();
+        std::fs::write(&source, &expected).unwrap();
+        std::fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\n\
+                 request_dir=''\n\
+                 image_path=''\n\
+                 while [ \"$#\" -gt 0 ]; do\n\
+                   if [ \"$1\" = '--cd' ]; then shift; request_dir=\"$1\"; fi\n\
+                   if [ \"$1\" = '--image' ]; then shift; image_path=\"$1\"; fi\n\
+                   shift\n\
+                 done\n\
+                 /bin/cat >/dev/null\n\
+                 if [ \"$image_path\" != '{input}' ]; then exit 4; fi\n\
+                 printf '1\\n' >> '{invocations}'\n\
+                 count=$(/usr/bin/wc -l < '{invocations}')\n\
+                 printf '{{\"type\":\"thread.started\",\"thread_id\":\"019fd666-0416-7da2-bcc3-7f2f51efd3c8\"}}\\n'\n\
+                 if [ \"$count\" -eq 1 ]; then exit 0; fi\n\
+                 /bin/cp '{source}' \"$request_dir/provider-output.png\"\n\
+                 printf '{{\"type\":\"item.completed\",\"item\":{{\"type\":\"image_generation_call\"}}}}\\n'\n",
+                invocations = invocations.display(),
+                input = input.display(),
+                source = source.display(),
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut config = test_config();
+        config.codex_home = Some(
+            temp.path()
+                .join("codex-home")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        config.cleanup_codex_outputs = true;
+        config.request_timeout = Duration::from_secs(10);
+        let job = GenerationJob {
+            request_id: "req-retry".to_string(),
+            model: "gpt-image-2".to_string(),
+            prompt: "generate an image".to_string(),
+            moderation: "auto".to_string(),
+            n: 1,
+            size: "1:1".to_string(),
+            quality: "auto".to_string(),
+            output_format: "png".to_string(),
+            output_compression: None,
+            background: "auto".to_string(),
+            stream: false,
+            partial_images: 0,
+        };
+
+        let image = run_codex_once_with_executable(&config, &job, 1, &[input], &executable)
+            .await
+            .unwrap();
+
+        assert_eq!(image.bytes, expected);
+        assert_eq!(
+            std::fs::read_to_string(invocations)
+                .unwrap()
+                .lines()
+                .count(),
+            2
+        );
     }
 
     #[tokio::test]
