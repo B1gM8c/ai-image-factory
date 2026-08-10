@@ -436,6 +436,15 @@ pub(super) async fn claim_work(
     execution_profile_id: Option<Uuid>,
 ) -> Result<Option<WorkLease>, AdmissionError> {
     let mut tx = pool.begin().await.map_err(unavailable)?;
+    if let Some(execution_profile_id) = execution_profile_id {
+        sqlx::query(
+            "SELECT pg_advisory_xact_lock(hashtextextended('work-claim-profile:' || $1::TEXT, 0))",
+        )
+        .bind(execution_profile_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(unavailable)?;
+    }
     let now = database_now(&mut tx).await?;
     let row: Option<(Uuid, Uuid, i64, String, Value)> = sqlx::query_as(
         r#"
@@ -448,6 +457,29 @@ pub(super) async fn claim_work(
           AND ($3::SMALLINT IS NULL OR j.economics_contract_version = $3)
           AND ($4::TEXT IS NULL OR p.command_schema = $4)
           AND ($5::UUID IS NULL OR w.execution_profile_id IS NULL OR w.execution_profile_id = $5)
+          AND (
+            $5::UUID IS NULL
+            OR EXISTS (
+              SELECT 1
+              FROM provider_execution_profiles claim_profile
+              JOIN executor_resource_policies claim_policy
+                ON claim_policy.resource_policy_id = claim_profile.resource_policy_id
+               AND claim_policy.revision = claim_profile.resource_policy_revision
+               AND claim_policy.provider_account_id = claim_profile.provider_account_id
+              JOIN provider_account_execution_controls claim_control
+                ON claim_control.provider_account_id = claim_profile.provider_account_id
+              WHERE claim_profile.execution_profile_id = $5
+                AND (
+                  SELECT COUNT(*)
+                  FROM work_items active_work
+                  WHERE active_work.execution_profile_id = claim_profile.execution_profile_id
+                    AND active_work.state IN ('leased', 'running')
+                ) < LEAST(
+                  claim_policy.max_concurrency,
+                  claim_control.desired_max_concurrency
+                )
+            )
+          )
           AND (
             $5::UUID IS NULL
             OR NOT EXISTS (

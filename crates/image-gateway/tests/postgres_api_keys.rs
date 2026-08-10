@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, env, path::PathBuf, str::FromStr, time::Duration};
+use std::{collections::BTreeMap, env, path::PathBuf, str::FromStr, sync::Arc, time::Duration};
 
 use gpt_image_2_gateway::{
     ApiKeyCapability, ApiKeyKeyring, ApiKeyPermissionLevel, ApiKeyPermissionMode,
@@ -6,7 +6,7 @@ use gpt_image_2_gateway::{
     UsageCharge, UsageLimits, UsageStore,
     admission::{
         AdmissionClaim, AdmissionContract, AdmissionError, AdmissionStore, AttachJob,
-        ClaimAdmission, PostgresAdmissionStore,
+        ClaimAdmission, PostgresAdmissionStore, WorkOutcome,
     },
     database::run_migrations,
     model_routing::{ModelRoutingStore, PostgresModelRoutingStore},
@@ -1854,6 +1854,117 @@ async fn routed_work_enforces_quota_pressure_reserve_and_unknown_policy() -> Tes
 }
 
 #[tokio::test]
+async fn profile_claims_are_atomically_bounded_and_released_at_terminal_state() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+
+    let result = async {
+        let project_id = format!("proj_{}", Uuid::new_v4().simple());
+        insert_project(&database.setup_pool, &project_id).await?;
+        let route_id = insert_codex_route_with_max_concurrency(&database.setup_pool, 2).await?;
+        let profile_id: Uuid = sqlx::query_scalar(
+            "SELECT execution_profile_id FROM provider_route_members WHERE route_id = $1 AND route_revision = 1",
+        )
+        .bind(route_id)
+        .fetch_one(&database.setup_pool)
+        .await
+        .map_err(|error| format!("failed to read bounded profile: {error}"))?;
+        let account_id: Uuid = sqlx::query_scalar(
+            "SELECT provider_account_id FROM provider_execution_profiles WHERE execution_profile_id = $1",
+        )
+        .bind(profile_id)
+        .fetch_one(&database.setup_pool)
+        .await
+        .map_err(|error| format!("failed to read bounded account: {error}"))?;
+        sqlx::query(
+            "UPDATE provider_account_execution_controls SET desired_max_concurrency = 2 WHERE provider_account_id = $1",
+        )
+        .bind(account_id)
+        .execute(&database.setup_pool)
+        .await
+        .map_err(|error| format!("failed to set bounded account concurrency: {error}"))?;
+        for sequence in 0..3 {
+            insert_ready_profile_work(
+                &database.setup_pool,
+                &project_id,
+                profile_id,
+                sequence,
+            )
+            .await?;
+        }
+
+        let admission = Arc::new(PostgresAdmissionStore::new(
+            database.pool("bounded_profile_claim").await?,
+        ));
+        let barrier = Arc::new(Barrier::new(4));
+        let mut claimers = Vec::new();
+        for lane in 0..4 {
+            let admission = Arc::clone(&admission);
+            let barrier = Arc::clone(&barrier);
+            claimers.push(tokio::spawn(async move {
+                barrier.wait().await;
+                admission
+                    .claim_ready_for_profile(
+                        &format!("bounded-worker/lane-{lane}"),
+                        30_000,
+                        AdmissionContract::CustomerPricingV4,
+                        "openai.images.generation.v1",
+                        profile_id,
+                    )
+                    .await
+            }));
+        }
+        let mut leases = Vec::new();
+        for claimer in claimers {
+            if let Some(lease) = claimer
+                .await
+                .map_err(|error| format!("bounded claim task failed: {error}"))?
+                .map_err(|error| format!("bounded claim failed: {error:?}"))?
+            {
+                leases.push(lease);
+            }
+        }
+        require(
+            leases.len() == 2,
+            format!("profile limit 2 admitted {} concurrent leases", leases.len()),
+        )?;
+        require(
+            leases[0].work_item_id != leases[1].work_item_id
+                && leases[0].worker_id != leases[1].worker_id,
+            "concurrent claims reused work or lane identity".to_string(),
+        )?;
+
+        admission
+            .start(&leases[0])
+            .await
+            .map_err(|error| format!("failed to start bounded lease: {error:?}"))?;
+        admission
+            .settle(&leases[0], WorkOutcome::Succeeded, None)
+            .await
+            .map_err(|error| format!("failed to settle bounded lease: {error:?}"))?;
+        let replacement = admission
+            .claim_ready_for_profile(
+                "bounded-worker/lane-replacement",
+                30_000,
+                AdmissionContract::CustomerPricingV4,
+                "openai.images.generation.v1",
+                profile_id,
+            )
+            .await
+            .map_err(|error| format!("replacement claim failed: {error:?}"))?;
+        require(
+            replacement.is_some(),
+            "terminal work did not release profile claim capacity".to_string(),
+        )
+    }
+    .await;
+    let cleanup = database.cleanup().await;
+    cleanup?;
+    result
+}
+
+#[tokio::test]
 async fn priority_weighted_rendezvous_tracks_configured_member_share() -> TestResult {
     let Some(database) = TestDatabase::new().await? else {
         return Ok(());
@@ -3104,6 +3215,13 @@ async fn assert_reconciled_route_copies(pool: &PgPool, route_ids: &[Uuid]) -> Te
 }
 
 async fn insert_codex_route(pool: &PgPool) -> TestResult<Uuid> {
+    insert_codex_route_with_max_concurrency(pool, 4).await
+}
+
+async fn insert_codex_route_with_max_concurrency(
+    pool: &PgPool,
+    max_concurrency: i32,
+) -> TestResult<Uuid> {
     let now: i64 =
         sqlx::query_scalar("SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT")
             .fetch_one(pool)
@@ -3153,11 +3271,12 @@ async fn insert_codex_route(pool: &PgPool) -> TestResult<Uuid> {
     .await
     .map_err(|error| format!("failed to insert provider account: {error}"))?;
     sqlx::query(
-        "INSERT INTO executor_resource_policies (resource_policy_id, revision, credential_pool_id, provider_account_id, provider_id, execution_class, max_concurrency, state, created_at_ms) VALUES ($1, 1, $2, $3, 'openai-codex', 'agentic-cli', 4, 'enabled', $4)",
+        "INSERT INTO executor_resource_policies (resource_policy_id, revision, credential_pool_id, provider_account_id, provider_id, execution_class, max_concurrency, state, created_at_ms) VALUES ($1, 1, $2, $3, 'openai-codex', 'agentic-cli', $4, 'enabled', $5)",
     )
     .bind(resource_policy_id)
     .bind(credential_pool_id)
     .bind(provider_account_id)
+    .bind(max_concurrency)
     .bind(now)
     .execute(pool)
     .await
@@ -3231,6 +3350,98 @@ async fn insert_codex_route(pool: &PgPool) -> TestResult<Uuid> {
     .await
     .map_err(|error| format!("failed to insert route model mapping: {error}"))?;
     Ok(route_id)
+}
+
+async fn insert_ready_profile_work(
+    pool: &PgPool,
+    project_id: &str,
+    profile_id: Uuid,
+    sequence: u32,
+) -> TestResult<Uuid> {
+    let now: i64 =
+        sqlx::query_scalar("SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT")
+            .fetch_one(pool)
+            .await
+            .map_err(|error| format!("failed to read database clock: {error}"))?;
+    let job_id = Uuid::new_v4();
+    let session_id = Uuid::new_v4();
+    let request_id = format!("bounded-profile-{sequence}-{}", Uuid::new_v4().simple());
+    let request_hash = hex::encode(Sha256::digest(request_id.as_bytes()));
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|error| format!("failed to begin ready work seed: {error}"))?;
+    sqlx::query(
+        r#"
+        INSERT INTO jobs
+          (job_id, tenant_id, request_id, operation, provider_id, model, state,
+           requested_units, output_count, billable_units, billing_metric, billing_unit,
+           economics_contract_version, created_at_ms, updated_at_ms)
+        VALUES ($1, $2, $3, 'generation', 'openai-codex', 'gpt-image-2', 'reserved',
+                1, 1, 1, 'output', 'output', 4, $4, $4)
+        "#,
+    )
+    .bind(job_id)
+    .bind(project_id)
+    .bind(&request_id)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .map_err(|error| format!("failed to insert bounded job: {error}"))?;
+    sqlx::query(
+        r#"
+        INSERT INTO admission_sessions
+          (session_id, owner_token, tenant_id, project_id, api_profile, operation,
+           request_id, request_hash, state, job_id, deadline_at_ms, created_at_ms, updated_at_ms)
+        VALUES ($1, $2, $3, $3, 'openai-images-v1', 'generation', $4, $5,
+                'attached', $6, $7, $8, $8)
+        "#,
+    )
+    .bind(session_id)
+    .bind(Uuid::new_v4())
+    .bind(project_id)
+    .bind(&request_id)
+    .bind(&request_hash)
+    .bind(job_id)
+    .bind(i64::MAX)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .map_err(|error| format!("failed to insert bounded admission: {error}"))?;
+    sqlx::query(
+        r#"
+        INSERT INTO job_payloads
+          (job_id, admission_session_id, command_schema, command_json, request_hash, created_at_ms)
+        VALUES ($1, $2, 'openai.images.generation.v1', $3, $4, $5)
+        "#,
+    )
+    .bind(job_id)
+    .bind(session_id)
+    .bind(json!({"schema_version": 1, "operation": "generation", "n": 1}))
+    .bind(&request_hash)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .map_err(|error| format!("failed to insert bounded payload: {error}"))?;
+    sqlx::query(
+        r#"
+        INSERT INTO work_items
+          (work_item_id, job_id, kind, state, available_at_ms, execution_profile_id,
+           created_at_ms, updated_at_ms)
+        VALUES ($1, $2, 'generation', 'ready', $3, $4, $3, $3)
+        "#,
+    )
+    .bind(Uuid::new_v4())
+    .bind(job_id)
+    .bind(now)
+    .bind(profile_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(|error| format!("failed to insert bounded work: {error}"))?;
+    tx.commit()
+        .await
+        .map_err(|error| format!("failed to commit bounded work: {error}"))?;
+    Ok(job_id)
 }
 
 async fn insert_codex_group_route_with_policy(

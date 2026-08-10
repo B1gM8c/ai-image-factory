@@ -176,11 +176,18 @@ impl Workerd {
     }
 
     pub async fn run_once(&self) -> Result<Option<Uuid>, ImageGatewayError> {
+        self.run_once_with_worker_id(&self.worker_id).await
+    }
+
+    pub async fn run_once_with_worker_id(
+        &self,
+        worker_id: &str,
+    ) -> Result<Option<Uuid>, ImageGatewayError> {
         let claimed = match self.executor_handoff.as_ref() {
             Some(target) => {
                 self.admission
                     .claim_ready_for_profile(
-                        &self.worker_id,
+                        worker_id,
                         duration_ms(self.lease_duration),
                         self.contract,
                         &target.command_schema,
@@ -196,7 +203,7 @@ impl Workerd {
                     (Some(command_schema), Some(execution_profile_id)) => {
                         self.admission
                             .claim_ready_for_profile(
-                                &self.worker_id,
+                                worker_id,
                                 duration_ms(self.lease_duration),
                                 self.contract,
                                 command_schema,
@@ -207,7 +214,7 @@ impl Workerd {
                     (Some(command_schema), None) => {
                         self.admission
                             .claim_ready_for_schema(
-                                &self.worker_id,
+                                worker_id,
                                 duration_ms(self.lease_duration),
                                 self.contract,
                                 command_schema,
@@ -216,11 +223,7 @@ impl Workerd {
                     }
                     (None, None) => {
                         self.admission
-                            .claim_ready(
-                                &self.worker_id,
-                                duration_ms(self.lease_duration),
-                                self.contract,
-                            )
+                            .claim_ready(worker_id, duration_ms(self.lease_duration), self.contract)
                             .await
                     }
                     (None, Some(_)) => unreachable!("claim profile requires a command schema"),

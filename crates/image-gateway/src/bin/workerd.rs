@@ -1,5 +1,7 @@
 use std::{env, sync::Arc, time::Duration};
 
+use tokio::{sync::watch, task::JoinSet};
+
 use gpt_image_2_gateway::admission::AdmissionContract;
 use gpt_image_2_gateway::{
     AppConfig, CODEX_EDIT_INLINE_ADAPTER_REVISION, CodexImageGenerator, ExecutorExecutionProfile,
@@ -25,6 +27,8 @@ use image_provider_dreamina_cli::{
 
 const DEFAULT_POLL_INTERVAL_MS: u64 = 250;
 const DEFAULT_HANDOFF_LEASE_MS: u64 = 60_000;
+const DEFAULT_MAX_IN_FLIGHT: usize = 1;
+const MAX_WORKER_LANES: usize = 64;
 const SHUTDOWN_DRAIN_GRACE: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy)]
@@ -66,7 +70,8 @@ async fn main() -> Result<(), ImageGatewayError> {
     let contexts = Arc::new(PostgresExecutionContextStore::new(pool.clone()));
     let worker_id = optional_env("WORKER_ID")
         .unwrap_or_else(|| format!("workerd-{}", uuid::Uuid::new_v4().simple()));
-    let (workerd, shutdown_drain_timeout) = match execution_mode {
+    let configured_max_in_flight = worker_max_in_flight()?;
+    let (workerd, shutdown_drain_timeout, max_in_flight) = match execution_mode {
         WorkerExecutionMode::LegacyInline => {
             config.validate_worker_startup()?;
             let artifact_root = artifact_root_from_env()?;
@@ -91,7 +96,7 @@ async fn main() -> Result<(), ImageGatewayError> {
                 artifact_store,
                 config.request_timeout,
             )?;
-            let workerd = match config.generation_admission_contract {
+            let (workerd, max_in_flight) = match config.generation_admission_contract {
                 GenerationAdmissionContract::CustomerPricingV4 => {
                     let profile_key = optional_env("EXECUTOR_PROFILE_KEY").ok_or_else(|| {
                         ImageGatewayError::config(
@@ -130,20 +135,46 @@ async fn main() -> Result<(), ImageGatewayError> {
                         execution.profile.key = %profile.profile_key,
                         "workerd inline edit profile enabled"
                     );
-                    workerd.with_claim_profile(
-                        AdmissionContract::CustomerPricingV4,
-                        EDIT_COMMAND_SCHEMA,
-                        profile.execution_profile_id,
-                    )?
+                    let profile_max_in_flight =
+                        usize::try_from(profile.max_concurrency).map_err(|_| {
+                            ImageGatewayError::config(
+                                "workerd inline edit profile concurrency is invalid",
+                            )
+                        })?;
+                    let max_in_flight = configured_max_in_flight.min(profile_max_in_flight);
+                    if max_in_flight == 0 {
+                        return Err(ImageGatewayError::config(
+                            "workerd inline edit concurrency is unavailable",
+                        ));
+                    }
+                    (
+                        workerd.with_claim_profile(
+                            AdmissionContract::CustomerPricingV4,
+                            EDIT_COMMAND_SCHEMA,
+                            profile.execution_profile_id,
+                        )?,
+                        max_in_flight,
+                    )
                 }
-                _ => workerd,
+                _ if configured_max_in_flight == 1 => (workerd, 1),
+                _ => {
+                    return Err(ImageGatewayError::config(
+                        "WORKER_MAX_IN_FLIGHT above 1 requires an inline V4 execution profile",
+                    ));
+                }
             };
             (
                 workerd,
                 config.request_timeout.saturating_add(SHUTDOWN_DRAIN_GRACE),
+                max_in_flight,
             )
         }
         WorkerExecutionMode::ExecutorHandoff => {
+            if configured_max_in_flight != 1 {
+                return Err(ImageGatewayError::config(
+                    "WORKER_MAX_IN_FLIGHT is only supported in legacy-inline mode",
+                ));
+            }
             let profile_key = optional_env("EXECUTOR_PROFILE_KEY").ok_or_else(|| {
                 ImageGatewayError::config(
                     "EXECUTOR_PROFILE_KEY is required in executor-handoff mode",
@@ -179,47 +210,148 @@ async fn main() -> Result<(), ImageGatewayError> {
                 handoff_lease,
                 contract,
             )?;
-            (workerd, handoff_lease.saturating_add(SHUTDOWN_DRAIN_GRACE))
+            (
+                workerd,
+                handoff_lease.saturating_add(SHUTDOWN_DRAIN_GRACE),
+                1,
+            )
         }
     };
     let poll_interval = Duration::from_millis(poll_interval_ms()?);
-    tracing::info!(%worker_id, execution.mode = execution_mode.as_str(), "workerd started");
-    let shutdown = shutdown_signal();
+    tracing::info!(
+        %worker_id,
+        execution.mode = execution_mode.as_str(),
+        worker.max_in_flight = max_in_flight,
+        "workerd started"
+    );
+    run_worker_lanes(
+        Arc::new(workerd),
+        &worker_id,
+        max_in_flight,
+        poll_interval,
+        shutdown_drain_timeout,
+        shutdown_signal(),
+    )
+    .await?;
+    telemetry.shutdown();
+    Ok(())
+}
+
+async fn run_worker_lanes<S>(
+    workerd: Arc<Workerd>,
+    worker_id: &str,
+    max_in_flight: usize,
+    poll_interval: Duration,
+    shutdown_drain_timeout: Duration,
+    shutdown: S,
+) -> Result<(), ImageGatewayError>
+where
+    S: std::future::Future<Output = ()>,
+{
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let mut lanes = JoinSet::new();
+    for lane in 0..max_in_flight {
+        lanes.spawn(run_worker_lane(
+            Arc::clone(&workerd),
+            lane_worker_id(worker_id, lane),
+            poll_interval,
+            shutdown_rx.clone(),
+        ));
+    }
+    drop(shutdown_rx);
     tokio::pin!(shutdown);
 
-    'worker: loop {
-        let run = workerd.run_once();
-        tokio::pin!(run);
-        let (result, shutting_down) = tokio::select! {
-            _ = &mut shutdown => {
-                tracing::info!("workerd draining in-flight work");
-                match tokio::time::timeout(shutdown_drain_timeout, &mut run).await {
-                    Ok(result) => (result, true),
-                    Err(_) => {
-                        telemetry.shutdown();
-                        return Err(ImageGatewayError::service_unavailable(
-                            "workerd shutdown drain timed out",
-                        ));
-                    }
-                }
-            }
-            result = &mut run => (result, false),
-        };
-        match result {
-            Ok(Some(job_id)) => tracing::info!(%job_id, "durable work processed"),
-            Ok(None) => {}
-            Err(error) => tracing::error!(error = ?error, "durable work execution failed"),
+    tokio::select! {
+        _ = &mut shutdown => {
+            tracing::info!(worker.max_in_flight = max_in_flight, "workerd draining in-flight work");
         }
-        if shutting_down {
-            break 'worker;
+        result = lanes.join_next() => {
+            trace_lane_termination(result);
+            let _ = shutdown_tx.send(true);
+            lanes.abort_all();
+            while lanes.join_next().await.is_some() {}
+            return Err(ImageGatewayError::service_unavailable(
+                "workerd execution lane terminated",
+            ));
+        }
+    }
+
+    let _ = shutdown_tx.send(true);
+    match tokio::time::timeout(shutdown_drain_timeout, async {
+        while let Some(result) = lanes.join_next().await {
+            if let Err(error) = result {
+                tracing::error!(
+                    task.id = ?error.id(),
+                    task.cancelled = error.is_cancelled(),
+                    task.panicked = error.is_panic(),
+                    "workerd execution lane failed while draining"
+                );
+                return Err(ImageGatewayError::service_unavailable(
+                    "workerd execution lane terminated",
+                ));
+            }
+        }
+        Ok(())
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => {
+            lanes.abort_all();
+            while lanes.join_next().await.is_some() {}
+            Err(ImageGatewayError::service_unavailable(
+                "workerd shutdown drain timed out",
+            ))
+        }
+    }
+}
+
+async fn run_worker_lane(
+    workerd: Arc<Workerd>,
+    worker_id: String,
+    poll_interval: Duration,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    loop {
+        if *shutdown.borrow_and_update() {
+            return;
+        }
+        match workerd.run_once_with_worker_id(&worker_id).await {
+            Ok(Some(job_id)) => tracing::info!(%worker_id, %job_id, "durable work processed"),
+            Ok(None) => {}
+            Err(error) => {
+                tracing::error!(%worker_id, error = ?error, "durable work execution failed")
+            }
+        }
+        if *shutdown.borrow() {
+            return;
         }
         tokio::select! {
-            _ = &mut shutdown => break 'worker,
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    return;
+                }
+            }
             _ = tokio::time::sleep(poll_interval) => {}
         }
     }
-    telemetry.shutdown();
-    Ok(())
+}
+
+fn trace_lane_termination(result: Option<Result<(), tokio::task::JoinError>>) {
+    match result {
+        Some(Ok(())) => tracing::error!("workerd execution lane exited before shutdown"),
+        Some(Err(error)) => tracing::error!(
+            task.id = ?error.id(),
+            task.cancelled = error.is_cancelled(),
+            task.panicked = error.is_panic(),
+            "workerd execution lane failed"
+        ),
+        None => tracing::error!("workerd lost all execution lanes"),
+    }
+}
+
+fn lane_worker_id(worker_id: &str, lane: usize) -> String {
+    format!("{worker_id}/lane-{lane}")
 }
 
 fn validate_inline_edit_profile(profile: &ExecutorExecutionProfile) -> Result<(), ()> {
@@ -280,6 +412,22 @@ fn poll_interval_ms() -> Result<u64, ImageGatewayError> {
             })
         })
         .unwrap_or(Ok(DEFAULT_POLL_INTERVAL_MS))
+}
+
+fn worker_max_in_flight() -> Result<usize, ImageGatewayError> {
+    let max_in_flight = env::var("WORKER_MAX_IN_FLIGHT")
+        .map(|value| {
+            value
+                .parse::<usize>()
+                .map_err(|_| ImageGatewayError::config("WORKER_MAX_IN_FLIGHT must be an integer"))
+        })
+        .unwrap_or(Ok(DEFAULT_MAX_IN_FLIGHT))?;
+    if !(1..=MAX_WORKER_LANES).contains(&max_in_flight) {
+        return Err(ImageGatewayError::config(
+            "WORKER_MAX_IN_FLIGHT must be between 1 and 64",
+        ));
+    }
+    Ok(max_in_flight)
 }
 
 fn handoff_lease_ms() -> Result<u64, ImageGatewayError> {
@@ -357,5 +505,11 @@ mod tests {
             ),
             AdmissionContract::MediaEconomicsV3,
         );
+    }
+
+    #[test]
+    fn lane_ids_are_stable_and_distinct() {
+        assert_eq!(lane_worker_id("codex-edits", 0), "codex-edits/lane-0");
+        assert_eq!(lane_worker_id("codex-edits", 1), "codex-edits/lane-1");
     }
 }
