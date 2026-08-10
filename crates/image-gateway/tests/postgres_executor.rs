@@ -1757,6 +1757,166 @@ async fn v4_terminal_success_settles_customer_and_provider_cost_once() -> TestRe
 }
 
 #[tokio::test]
+async fn v4_terminal_retries_when_provider_actual_price_arrives_after_evidence() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let work =
+            seed_codex_generation_lease(&database.pool, "v4-provider-price-retry-worker").await?;
+        seed_v4_customer_quote(&database.pool, &work, 7).await?;
+        let initial_provider_price = seed_provider_reported_actual_price_at(
+            &database.pool,
+            &work,
+            V4CustomerQuoteIdentity::openai(),
+            database_now(&database.pool).await? - 1_000,
+        )
+        .await?;
+        let executor = PostgresExecutorSubmissionStore::new(database.pool.clone());
+        let (executor_artifacts, artifact_root) = artifact_publisher(&executor)?;
+        let prepared = executor
+            .prepare_and_handoff(&work, profile_id_for_lease(&work))
+            .await
+            .map_err(debug_error)?;
+        require(prepared.len() == 1, "expected one v4 prepared output")?;
+        seed_terminal_quota(&database.pool, &work).await?;
+
+        let scope = ExecutorClaimScope {
+            execution_profile_id: CODEX_PROFILE_ID,
+            provider_id: "openai-codex".to_string(),
+            command_schema: GENERATION_COMMAND_SCHEMA.to_string(),
+            adapter_revision: CODEX_GENERATION_ADAPTER_REVISION.to_string(),
+        };
+        let executor_lease = executor
+            .claim_prepared(&scope, "v4-provider-price-retry-executor", 60_000)
+            .await
+            .map_err(debug_error)?
+            .ok_or_else(|| "v4 retry executor claim returned none".to_string())?;
+        executor.start(&executor_lease).await.map_err(debug_error)?;
+        let provider_cost = ProviderReportedCostEvidenceV1::usd_ticks(
+            ProviderCostEvidenceScope::CliInvocation,
+            "openai-codex",
+            "provider_cli",
+            &format!("provider-operation-{}", Uuid::new_v4().simple()),
+            200_000_000,
+            br#"{"total_cost_usd_ticks":200000000}"#,
+            "end.total_cost_usd_ticks",
+        )
+        .map_err(debug_error)?;
+        let manifest = publish_result_authority(&executor_artifacts, &executor_lease)
+            .await?
+            .with_provider_reported_cost(Some(provider_cost))
+            .ok_or("provider cost evidence was rejected")?;
+        executor
+            .record_outcome(
+                &executor_lease,
+                &ExecutorSubmissionOutcome::Succeeded(manifest),
+            )
+            .await
+            .map_err(debug_error)?;
+        let evidence_at_ms: i64 = sqlx::query_scalar(
+            "SELECT created_at_ms FROM executor_provider_cost_evidence WHERE submission_id = $1",
+        )
+        .bind(executor_lease.submission_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require_one(
+            sqlx::query(
+                r#"
+                UPDATE price_book_versions
+                SET state = 'retired', effective_until_ms = $2,
+                    control_version = control_version + 1, updated_at_ms = $2
+                WHERE price_book_version_id = $1
+                "#,
+            )
+            .bind(initial_provider_price)
+            .bind(evidence_at_ms)
+            .execute(&database.pool)
+            .await
+            .map_err(debug_error)?,
+            "provider actual price gap setup",
+        )?;
+
+        let reductions = PostgresExecutorTerminalStore::new(database.pool.clone());
+        let terminal = reductions
+            .claim_terminal("v4-provider-price-retry-reducer", 60_000)
+            .await
+            .map_err(debug_error)?
+            .ok_or_else(|| "v4 retry terminal reduction was not queued".to_string())?;
+        let customer_blobs =
+            Arc::new(FilesystemArtifactBlobStore::new(artifact_root.path()).map_err(debug_error)?);
+        let customer = CustomerArtifactPublisher::new(customer_blobs)
+            .publish(&terminal)
+            .await
+            .map_err(debug_error)?;
+        let missing_price_result = reductions
+            .complete_terminal(&terminal, Some(&customer))
+            .await;
+        require(
+            missing_price_result == Err(ExecutorTerminalError::Unavailable),
+            format!(
+                "missing provider actual price returned {missing_price_result:?} instead of a retryable error"
+            ),
+        )?;
+        let before_retry: (String, i64, i64) = sqlx::query_as(
+            r#"
+            SELECT reduction.state,
+                   (SELECT COUNT(*) FROM provider_receipts WHERE submission_id = $1),
+                   (SELECT COUNT(*) FROM provider_cost_observations
+                    WHERE provider_id = 'openai-codex')
+            FROM executor_terminal_reductions reduction
+            WHERE reduction.submission_id = $1
+            "#,
+        )
+        .bind(terminal.submission_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(
+            before_retry == ("leased".to_string(), 0, 0),
+            format!("retryable provider price gap leaked effects: {before_retry:?}"),
+        )?;
+
+        seed_provider_reported_actual_price_at(
+            &database.pool,
+            &work,
+            V4CustomerQuoteIdentity::openai(),
+            evidence_at_ms,
+        )
+        .await?;
+        let completion = reductions
+            .complete_terminal(&terminal, Some(&customer))
+            .await
+            .map_err(debug_error)?;
+        require(
+            completion.parent_state == ExecutorParentTerminalState::Succeeded,
+            "terminal reduction did not complete after provider price publication",
+        )?;
+        let after_retry: (String, i64, i64) = sqlx::query_as(
+            r#"
+            SELECT reduction.state,
+                   (SELECT COUNT(*) FROM provider_receipts WHERE submission_id = $1),
+                   (SELECT COUNT(*) FROM provider_cost_observations
+                    WHERE provider_id = 'openai-codex')
+            FROM executor_terminal_reductions reduction
+            WHERE reduction.submission_id = $1
+            "#,
+        )
+        .bind(terminal.submission_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(
+            after_retry == ("completed".to_string(), 1, 1),
+            format!("provider price retry was not exactly once: {after_retry:?}"),
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
 async fn v4_dreamina_terminal_success_settles_the_native_quote_once() -> TestResult {
     verify_v4_dreamina_terminal_success(
         DREAMINA_IMAGES_API_PROFILE,
@@ -6779,6 +6939,16 @@ async fn seed_provider_reported_actual_price(
     work: &WorkLease,
     identity: V4CustomerQuoteIdentity,
 ) -> TestResult<Uuid> {
+    let effective_from_ms = database_now(pool).await?;
+    seed_provider_reported_actual_price_at(pool, work, identity, effective_from_ms).await
+}
+
+async fn seed_provider_reported_actual_price_at(
+    pool: &PgPool,
+    work: &WorkLease,
+    identity: V4CustomerQuoteIdentity,
+    effective_from_ms: i64,
+) -> TestResult<Uuid> {
     let provider_id: String = sqlx::query_scalar("SELECT provider_id FROM jobs WHERE job_id = $1")
         .bind(work.job_id)
         .fetch_one(pool)
@@ -6821,7 +6991,7 @@ async fn seed_provider_reported_actual_price(
         )
         VALUES ($1, $2, 1, $3, $4, $5, $6, $7, $8, 'standard',
                 'provider_cli', 'provider_reported', FALSE, 'draft',
-                $9, 'manual', $9, $9)
+                $9, 'manual', $10, $10)
         "#,
     )
     .bind(price_book_version_id)
@@ -6832,6 +7002,7 @@ async fn seed_provider_reported_actual_price(
     .bind(identity.provider_model_id)
     .bind(identity.public_model_id)
     .bind(identity.media_kind)
+    .bind(effective_from_ms)
     .bind(now)
     .execute(&mut *tx)
     .await

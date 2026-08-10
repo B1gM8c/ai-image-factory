@@ -1073,7 +1073,7 @@ async fn persist_provider_actual_cost(
     };
     let resolved = resolve_provider_actual_price_version_in_transaction(tx, &resolution)
         .await
-        .map_err(map_price_resolution_error)?;
+        .map_err(map_provider_actual_price_resolution_error)?;
     let source_manifest_id = row.manifest_id.ok_or(ExecutorTerminalError::Conflict)?;
     apply_executor_provider_reported_cost(tx, receipt_id, &resolved, source_manifest_id)
         .await
@@ -2312,13 +2312,15 @@ fn map_customer_rating_error(error: CustomerRatingStoreError) -> ExecutorTermina
     }
 }
 
-fn map_price_resolution_error(error: PriceResolutionError) -> ExecutorTerminalError {
+fn map_provider_actual_price_resolution_error(
+    error: PriceResolutionError,
+) -> ExecutorTerminalError {
     match error {
-        PriceResolutionError::StoreUnavailable => ExecutorTerminalError::Unavailable,
-        PriceResolutionError::InvalidRequest => ExecutorTerminalError::InvalidInput,
-        PriceResolutionError::NotFound | PriceResolutionError::Ambiguous => {
-            ExecutorTerminalError::Conflict
+        PriceResolutionError::StoreUnavailable | PriceResolutionError::NotFound => {
+            ExecutorTerminalError::Unavailable
         }
+        PriceResolutionError::InvalidRequest => ExecutorTerminalError::InvalidInput,
+        PriceResolutionError::Ambiguous => ExecutorTerminalError::Conflict,
     }
 }
 

@@ -14,7 +14,7 @@ use uuid::Uuid;
 
 type TestResult<T = ()> = Result<T, String>;
 
-const REQUIRED_COLUMNS: [(&str, &str); 940] = [
+const REQUIRED_COLUMNS: [(&str, &str); 957] = [
     ("usage_events", "tenant_id"),
     ("usage_events", "job_id"),
     ("quota_reservations", "tenant_id"),
@@ -134,6 +134,29 @@ const REQUIRED_COLUMNS: [(&str, &str); 940] = [
     ("provider_account_operations", "state"),
     ("price_books", "control_version"),
     ("price_book_versions", "control_version"),
+    ("provider_actual_price_backfills", "media_kind"),
+    ("provider_actual_price_backfills", "price_book_id"),
+    (
+        "provider_actual_price_backfills",
+        "source_price_book_version_id",
+    ),
+    (
+        "provider_actual_price_backfills",
+        "historical_price_book_version_id",
+    ),
+    (
+        "provider_actual_price_backfills",
+        "source_effective_from_ms",
+    ),
+    (
+        "provider_actual_price_backfills",
+        "historical_effective_from_ms",
+    ),
+    (
+        "provider_actual_price_backfills",
+        "historical_effective_until_ms",
+    ),
+    ("provider_actual_price_backfills", "created_at_ms"),
     ("price_book_version_rollbacks", "rollback_version_id"),
     ("price_book_version_rollbacks", "source_version_id"),
     ("price_book_version_rollbacks", "created_by_user_id"),
@@ -598,6 +621,30 @@ const REQUIRED_COLUMNS: [(&str, &str); 940] = [
     ("executor_terminal_reductions", "provider_receipt_id"),
     ("executor_terminal_reductions", "customer_artifact_id"),
     ("executor_terminal_reductions", "quota_reservation_id"),
+    ("executor_terminal_reduction_recoveries", "submission_id"),
+    (
+        "executor_terminal_reduction_recoveries",
+        "executor_execution_id",
+    ),
+    (
+        "executor_terminal_reduction_recoveries",
+        "prior_lease_epoch",
+    ),
+    (
+        "executor_terminal_reduction_recoveries",
+        "prior_claimed_at_ms",
+    ),
+    (
+        "executor_terminal_reduction_recoveries",
+        "prior_blocked_error_code",
+    ),
+    ("executor_terminal_reduction_recoveries", "prior_blocked_by"),
+    (
+        "executor_terminal_reduction_recoveries",
+        "prior_blocked_at_ms",
+    ),
+    ("executor_terminal_reduction_recoveries", "recovery_reason"),
+    ("executor_terminal_reduction_recoveries", "recovered_at_ms"),
     ("provider_remote_tasks", "remote_operation_id"),
     ("provider_remote_tasks", "state"),
     ("provider_remote_tasks", "poll_lease_epoch"),
@@ -3314,8 +3361,8 @@ async fn shared_pool_case(pool: &PgPool) -> TestResult {
 
 async fn assert_expected_schema(pool: &PgPool) -> TestResult {
     require(
-        migration_versions(pool).await? == (0_i64..=120_i64).collect::<Vec<_>>(),
-        "applied migration versions must be exactly 0 through 120",
+        migration_versions(pool).await? == (0_i64..=121_i64).collect::<Vec<_>>(),
+        "applied migration versions must be exactly 0 through 121",
     )?;
 
     let default_codex_prices: Vec<(String, i64, i64)> = sqlx::query_as(
