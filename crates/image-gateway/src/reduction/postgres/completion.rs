@@ -28,8 +28,9 @@ use crate::{
     },
     pricing::{
         PriceResolutionError, PriceResolutionRequest,
-        official_metering::{
-            OPENAI_GPT_IMAGE_2_CALCULATOR_SOURCE, gpt_image_2_output_tokens_from_dimensions,
+        customer_usage::{
+            CustomerUsageAuthority, CustomerUsageFactError, CustomerUsageOutput,
+            persist_customer_usage_facts,
         },
         postgres_rating::{CustomerRatingStoreError, settle_customer_quote},
         provider_cost::{ProviderCostStoreError, apply_executor_provider_reported_cost},
@@ -146,19 +147,6 @@ struct StoredArtifactRow {
     sha256_hex: String,
     byte_size: i64,
     media_type: String,
-}
-
-#[derive(sqlx::FromRow)]
-struct FrozenCustomerUsageBasis {
-    metric: String,
-    unit: String,
-    quantity_source: String,
-}
-
-#[derive(sqlx::FromRow)]
-struct FrozenCustomerUsageContext {
-    provider_model_id: Option<String>,
-    request_dimensions_json: serde_json::Value,
 }
 
 #[derive(sqlx::FromRow)]
@@ -1239,202 +1227,36 @@ async fn persist_v4_customer_usage_facts(
     terminal_outcome: &str,
     now: i64,
 ) -> Result<(), ExecutorTerminalError> {
-    let image_output = quota.billing_metric == "output"
-        && quota.billing_unit == "output"
-        && quota.output_billable_units == 1;
-    let video_output = quota.billing_metric == "video_second"
-        && quota.billing_unit == "second"
-        && quota.output_billable_units > 0;
-    if !image_output && !video_output {
-        return Err(ExecutorTerminalError::Conflict);
-    }
-    let context: FrozenCustomerUsageContext = sqlx::query_as(
-        r#"
-        SELECT provider_model_id, request_dimensions_json
-        FROM customer_price_quotes
-        WHERE job_id = $1
-        "#,
+    persist_customer_usage_facts(
+        tx,
+        &CustomerUsageOutput {
+            job_id: row.job_id,
+            output_id: row.output_id,
+            provider_id: &row.provider_id,
+            provider_account_id: row.provider_account_id,
+            operation: &row.operation,
+            billing_metric: &quota.billing_metric,
+            billing_unit: &quota.billing_unit,
+            output_billable_units: quota.output_billable_units,
+            terminal_outcome,
+        },
+        CustomerUsageAuthority::Durable {
+            submission_id: row.submission_id,
+            receipt_id,
+        },
+        now,
+    )
+    .await
+    .map_err(map_customer_usage_fact_error)?;
+    let context: Value = sqlx::query_scalar(
+        "SELECT request_dimensions_json FROM customer_price_quotes WHERE job_id = $1",
     )
     .bind(row.job_id)
     .fetch_optional(&mut **tx)
     .await
     .map_err(unavailable)?
     .ok_or(ExecutorTerminalError::Conflict)?;
-    let partition_key = format!("output:{}", row.output_id);
-    let bases: Vec<FrozenCustomerUsageBasis> = sqlx::query_as(
-        r#"
-        SELECT DISTINCT metric, unit, quantity_source
-        FROM customer_price_quote_lines
-        WHERE job_id = $1
-          AND partition_key = $2
-          AND terminal_outcome = $3
-        ORDER BY metric, unit, quantity_source
-        "#,
-    )
-    .bind(row.job_id)
-    .bind(&partition_key)
-    .bind(terminal_outcome)
-    .fetch_all(&mut **tx)
-    .await
-    .map_err(unavailable)?;
-    if bases.is_empty() {
-        return Err(ExecutorTerminalError::Conflict);
-    }
-
-    for basis in bases {
-        let (quantity, confidence, evidence_path, basis_name) = match (
-            basis.metric.as_str(),
-            basis.unit.as_str(),
-            basis.quantity_source.as_str(),
-        ) {
-            ("image_output", "image", "request_derived") => (
-                i64::from(quota.output_billable_units),
-                "exact",
-                "job_outputs.billable_units",
-                "admitted_output_quantity",
-            ),
-            ("image_input", "image", "request_derived")
-                if row.provider_id == "grok-cli" && video_output =>
-            {
-                (
-                    frozen_input_image_count(&context.request_dimensions_json)?,
-                    "exact",
-                    "customer_price_quotes.request_dimensions_json",
-                    "admitted_input_image_count",
-                )
-            }
-            ("image_output_token", "token", "official_lookup")
-                if row.provider_id == "openai-codex"
-                    && context.provider_model_id.as_deref() == Some("gpt-image-2") =>
-            {
-                let quantity = if terminal_outcome == "succeeded" {
-                    i64::try_from(
-                        gpt_image_2_output_tokens_from_dimensions(&context.request_dimensions_json)
-                            .map_err(|_| ExecutorTerminalError::Conflict)?,
-                    )
-                    .map_err(|_| ExecutorTerminalError::Conflict)?
-                } else {
-                    0
-                };
-                (
-                    quantity,
-                    "estimated",
-                    OPENAI_GPT_IMAGE_2_CALCULATOR_SOURCE,
-                    "official_gpt_image_2_output_token_calculator",
-                )
-            }
-            ("video_requested_second", "second", "request_derived")
-                if video_output
-                    && frozen_video_duration_seconds(&context.request_dimensions_json)?
-                        == i64::from(quota.output_billable_units) =>
-            {
-                (
-                    i64::from(quota.output_billable_units),
-                    "exact",
-                    "job_outputs.billable_units",
-                    "admitted_video_duration_seconds",
-                )
-            }
-            // Immutable customer price versions published before migration 0068 retain this alias.
-            ("video_output_second", "second", "request_derived")
-                if video_output
-                    && frozen_video_duration_seconds(&context.request_dimensions_json)?
-                        == i64::from(quota.output_billable_units) =>
-            {
-                (
-                    i64::from(quota.output_billable_units),
-                    "exact",
-                    "job_outputs.billable_units",
-                    "legacy_admitted_video_duration_seconds",
-                )
-            }
-            _ => return Err(ExecutorTerminalError::Conflict),
-        };
-        let metadata = merge_usage_metadata(
-            &context.request_dimensions_json,
-            &row.operation,
-            &quota.billing_metric,
-            &quota.billing_unit,
-            basis_name,
-        )?;
-        let semantic_key = format!(
-            "{receipt_id}:{}:{}:{}:v1",
-            basis.metric, basis.unit, basis.quantity_source
-        );
-        let exact_replay: bool = sqlx::query_scalar(
-            r#"
-            WITH inserted AS (
-                INSERT INTO provider_usage_facts (
-                    usage_fact_id, semantic_key, job_id, output_id, submission_id,
-                    receipt_id, provider_id, provider_account_id, execution_surface,
-                    fact_domain, metric, quantity, unit, quantity_source, confidence, evidence_path,
-                    metadata_json, billing_partition_key, terminal_outcome, created_at_ms
-                )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'provider_cli',
-                        'customer_billable', $9, $10, $11, $12, $13, $14,
-                        $15, $16, $17, $18)
-                ON CONFLICT (semantic_key) DO NOTHING
-                RETURNING 1
-            )
-            SELECT EXISTS (SELECT 1 FROM inserted)
-                OR EXISTS (
-                    SELECT 1
-                    FROM provider_usage_facts existing
-                    WHERE existing.semantic_key = $2
-                      AND existing.job_id = $3
-                      AND existing.output_id IS NOT DISTINCT FROM $4
-                      AND existing.submission_id IS NOT DISTINCT FROM $5
-                      AND existing.receipt_id IS NOT DISTINCT FROM $6
-                      AND existing.provider_id = $7
-                      AND existing.provider_account_id IS NOT DISTINCT FROM $8
-                      AND existing.execution_surface = 'provider_cli'
-                      AND existing.fact_domain = 'customer_billable'
-                      AND existing.metric = $9
-                      AND existing.quantity = $10
-                      AND existing.unit = $11
-                      AND existing.quantity_source = $12
-                      AND existing.confidence = $13
-                      AND existing.evidence_path = $14
-                      AND existing.metadata_json = $15
-                      AND existing.billing_partition_key IS NOT DISTINCT FROM $16
-                      AND existing.terminal_outcome IS NOT DISTINCT FROM $17
-                )
-            "#,
-        )
-        .bind(Uuid::new_v4())
-        .bind(semantic_key)
-        .bind(row.job_id)
-        .bind(row.output_id)
-        .bind(row.submission_id)
-        .bind(receipt_id)
-        .bind(&row.provider_id)
-        .bind(row.provider_account_id)
-        .bind(&basis.metric)
-        .bind(quantity)
-        .bind(&basis.unit)
-        .bind(&basis.quantity_source)
-        .bind(confidence)
-        .bind(evidence_path)
-        .bind(metadata)
-        .bind(&partition_key)
-        .bind(terminal_outcome)
-        .bind(now)
-        .fetch_one(&mut **tx)
-        .await
-        .map_err(unavailable)?;
-        if !exact_replay {
-            return Err(ExecutorTerminalError::Conflict);
-        }
-    }
-    persist_media_inspected_video_usage(
-        tx,
-        row,
-        receipt_id,
-        terminal_outcome,
-        &context.request_dimensions_json,
-        now,
-    )
-    .await
+    persist_media_inspected_video_usage(tx, row, receipt_id, terminal_outcome, &context, now).await
 }
 
 async fn persist_media_inspected_video_usage(
@@ -1543,24 +1365,6 @@ async fn persist_media_inspected_video_usage(
     }
 }
 
-fn frozen_video_duration_seconds(dimensions: &Value) -> Result<i64, ExecutorTerminalError> {
-    dimensions
-        .get("duration")
-        .and_then(Value::as_str)
-        .and_then(|duration| duration.parse::<i64>().ok())
-        .filter(|duration| (4..=15).contains(duration))
-        .ok_or(ExecutorTerminalError::Conflict)
-}
-
-fn frozen_input_image_count(dimensions: &Value) -> Result<i64, ExecutorTerminalError> {
-    dimensions
-        .get("input_image_count")
-        .and_then(Value::as_str)
-        .and_then(|count| count.parse::<i64>().ok())
-        .filter(|count| (1..=7).contains(count))
-        .ok_or(ExecutorTerminalError::Conflict)
-}
-
 fn merge_usage_metadata(
     dimensions: &serde_json::Value,
     operation: &str,
@@ -1577,6 +1381,13 @@ fn merge_usage_metadata(
     metadata.insert("billing_unit".to_string(), json!(billing_unit));
     metadata.insert("basis".to_string(), json!(basis));
     Ok(serde_json::Value::Object(metadata))
+}
+
+fn map_customer_usage_fact_error(error: CustomerUsageFactError) -> ExecutorTerminalError {
+    match error {
+        CustomerUsageFactError::Conflict => ExecutorTerminalError::Conflict,
+        CustomerUsageFactError::Unavailable => ExecutorTerminalError::Unavailable,
+    }
 }
 
 async fn mark_completed(

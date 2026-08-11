@@ -17,6 +17,7 @@ use crate::{
         ArtifactBlobStore, ArtifactIdentity, ArtifactMetadata, ArtifactReadError,
         GenerationResultManifest, hydrate_generation_result,
     },
+    pricing::inline_settlement::settle_inline_customer_quote,
     usage::{UsageReservation, UsageSnapshot},
 };
 
@@ -68,6 +69,14 @@ impl ExecutionSettlementStore for PostgresExecutionSettlementStore {
         if is_completed(&quota_job, &work_attempt) {
             validate_completed_state(&quota_job, &work_attempt, &idempotency)?;
             validate_completed_result(&mut tx, result).await?;
+            settle_inline_customer_quote(
+                &mut tx,
+                lease.job_id,
+                lease.execution_id,
+                "succeeded",
+                now,
+            )
+            .await?;
             tx.commit().await.map_err(settlement_unavailable)?;
             return Ok(reservation.snapshot.clone());
         }
@@ -82,6 +91,8 @@ impl ExecutionSettlementStore for PostgresExecutionSettlementStore {
         succeed_job(&mut tx, &quota_job, now).await?;
         insert_metering_events(&mut tx, &quota_job, now).await?;
         append_succeeded_events(&mut tx, lease, now).await?;
+        settle_inline_customer_quote(&mut tx, lease.job_id, lease.execution_id, "succeeded", now)
+            .await?;
 
         tx.commit().await.map_err(settlement_unavailable)?;
         Ok(reservation.snapshot.clone())

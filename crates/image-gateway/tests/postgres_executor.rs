@@ -6,14 +6,19 @@ use std::{
 use gpt_image_2_gateway::database::{connect_test_pool_with_search_path, run_migrations};
 use gpt_image_2_gateway::{
     CODEX_GENERATION_ADAPTER_REVISION, CanonicalExecutorOutcome, CustomerArtifactPublisher,
-    ExecutorParentTerminalState, ExecutorTerminalBlockReason, ExecutorTerminalError,
-    ExecutorTerminalStore, GenerationJob, PostgresExecutorTerminalStore,
-    PostgresReconciliationStore, ReconciliationOutcome, ReconciliationStore,
+    ExecutionSettlementStore, ExecutorParentTerminalState, ExecutorTerminalBlockReason,
+    ExecutorTerminalError, ExecutorTerminalStore, GenerationJob, PostgresExecutionSettlementStore,
+    PostgresExecutorTerminalStore, PostgresReconciliationStore, ReconciliationOutcome,
+    ReconciliationStore, UsageCharge, UsageLimits, UsageReservation, UsageSnapshot,
     admission::{
         AdmissionTicket, DreaminaImageAdmissionPlan, DreaminaVideoAdmissionPlan,
         GENERATION_COMMAND_SCHEMA, GenerationCommandV1, VIDEO_GENERATION_OPERATION, WorkLease,
     },
-    artifacts::{ArtifactBlobStore, ExecutorArtifactPublisher, FilesystemArtifactBlobStore},
+    artifacts::{
+        ArtifactBlobStore, ArtifactIdentity, ExecutorArtifactPublisher,
+        FilesystemArtifactBlobStore, GENERATION_RESPONSE_SCHEMA, GenerationResponseProjection,
+        GenerationResultManifest, InMemoryArtifactBlobStore,
+    },
     economics::{
         EconomicReceipt, EconomicReceiptOutcome, EconomicSettlementStore,
         PostgresEconomicSettlementStore,
@@ -25,13 +30,16 @@ use gpt_image_2_gateway::{
         ExecutorSubmissionOutcome, ExecutorSubmissionStore, PostgresExecutorOwnerGuard,
         PostgresExecutorSubmissionStore,
     },
+    reconcile_inline_customer_settlement,
 };
 use image::{DynamicImage, ImageFormat, Rgba, RgbaImage};
 use image_api_contracts::dreamina::{
     DREAMINA_IMAGES_API_PROFILE, DREAMINA_VIDEOS_API_PROFILE, DreaminaImageGenerationRequest,
     DreaminaVideoGenerationRequest,
 };
-use image_provider_contracts::{ProviderCostEvidenceScope, ProviderReportedCostEvidenceV1};
+use image_provider_contracts::{
+    BillingMetric, ProviderCostEvidenceScope, ProviderReportedCostEvidenceV1,
+};
 use image_provider_dreamina_cli::{
     ADAPTER_REVISION as DREAMINA_ADAPTER_REVISION, DREAMINA_IMAGE_GENERATION_OPERATION_V1,
     DREAMINA_SUBMIT_COMMAND_SCHEMA, DREAMINA_VIDEO_GENERATION_OPERATION_V1,
@@ -121,6 +129,23 @@ struct V4TerminalEconomicState {
     hold_state: String,
     hold_captured_micros: i64,
     hold_released_micros: i64,
+    account_held_micros: i64,
+    account_captured_micros: i64,
+}
+
+#[derive(Debug, Eq, PartialEq, sqlx::FromRow)]
+struct InlineCustomerSettlementState {
+    job_state: String,
+    charged_units: i32,
+    quota_state: String,
+    committed_units: i32,
+    released_units: i32,
+    usage_fact_count: i64,
+    customer_rating_count: i64,
+    customer_charge_count: i64,
+    hold_state: String,
+    captured_micros: i64,
+    released_micros: i64,
     account_held_micros: i64,
     account_captured_micros: i64,
 }
@@ -1341,6 +1366,159 @@ async fn terminal_reduction_claim_reads_only_canonical_success_authority() -> Te
                 .await
                 .is_err(),
             "terminal reduction queue item was deleted",
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
+async fn inline_v4_success_captures_customer_hold_once() -> TestResult {
+    let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let work = seed_codex_generation_lease(&database.pool, "inline-v4-success-worker").await?;
+        bind_inline_profile(&database.pool, &work).await?;
+        seed_v4_customer_quote(&database.pool, &work, 7).await?;
+        seed_terminal_quota(&database.pool, &work).await?;
+        let reservation = inline_usage_reservation(&database.pool, &work).await?;
+        let artifacts = Arc::new(InMemoryArtifactBlobStore::default());
+        let manifest = inline_generation_manifest(artifacts.as_ref(), &work, &reservation).await?;
+        let settlement = PostgresExecutionSettlementStore::new(database.pool.clone(), artifacts);
+
+        settlement
+            .succeed(&work, &reservation, &manifest)
+            .await
+            .map_err(debug_error)?;
+        settlement
+            .succeed(&work, &reservation, &manifest)
+            .await
+            .map_err(debug_error)?;
+
+        let state = inline_customer_settlement_state(&database.pool, &work).await?;
+        require(
+            state
+                == InlineCustomerSettlementState {
+                    job_state: "succeeded".to_string(),
+                    charged_units: 1,
+                    quota_state: "committed".to_string(),
+                    committed_units: 1,
+                    released_units: 0,
+                    usage_fact_count: 1,
+                    customer_rating_count: 1,
+                    customer_charge_count: 1,
+                    hold_state: "settled".to_string(),
+                    captured_micros: 7,
+                    released_micros: 0,
+                    account_held_micros: 0,
+                    account_captured_micros: 7,
+                },
+            format!("inline success settlement was not exact or idempotent: {state:?}"),
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
+async fn inline_v4_failure_releases_customer_hold_once() -> TestResult {
+    let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let work = seed_codex_generation_lease(&database.pool, "inline-v4-failure-worker").await?;
+        bind_inline_profile(&database.pool, &work).await?;
+        seed_v4_customer_quote(&database.pool, &work, 7).await?;
+        seed_terminal_quota(&database.pool, &work).await?;
+        let reservation = inline_usage_reservation(&database.pool, &work).await?;
+        let settlement = PostgresExecutionSettlementStore::new(
+            database.pool.clone(),
+            Arc::new(InMemoryArtifactBlobStore::default()),
+        );
+
+        settlement
+            .fail(&work, &reservation, "provider_rejected")
+            .await
+            .map_err(debug_error)?;
+        settlement
+            .fail(&work, &reservation, "provider_rejected")
+            .await
+            .map_err(debug_error)?;
+
+        let state = inline_customer_settlement_state(&database.pool, &work).await?;
+        require(
+            state
+                == InlineCustomerSettlementState {
+                    job_state: "failed".to_string(),
+                    charged_units: 0,
+                    quota_state: "released".to_string(),
+                    committed_units: 0,
+                    released_units: 1,
+                    usage_fact_count: 1,
+                    customer_rating_count: 1,
+                    customer_charge_count: 0,
+                    hold_state: "settled".to_string(),
+                    captured_micros: 0,
+                    released_micros: 7,
+                    account_held_micros: 0,
+                    account_captured_micros: 0,
+                },
+            format!("inline failure settlement was not exact or idempotent: {state:?}"),
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
+async fn inline_v4_reconcile_is_idempotent_for_an_existing_terminal_job() -> TestResult {
+    let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let work =
+            seed_codex_generation_lease(&database.pool, "inline-v4-reconcile-worker").await?;
+        bind_inline_profile(&database.pool, &work).await?;
+        seed_terminal_quota(&database.pool, &work).await?;
+        let reservation = inline_usage_reservation(&database.pool, &work).await?;
+        let artifacts = Arc::new(InMemoryArtifactBlobStore::default());
+        let manifest = inline_generation_manifest(artifacts.as_ref(), &work, &reservation).await?;
+        PostgresExecutionSettlementStore::new(database.pool.clone(), artifacts)
+            .succeed(&work, &reservation, &manifest)
+            .await
+            .map_err(debug_error)?;
+        seed_v4_customer_quote(&database.pool, &work, 7).await?;
+
+        reconcile_inline_customer_settlement(&database.pool, work.job_id)
+            .await
+            .map_err(debug_error)?;
+        reconcile_inline_customer_settlement(&database.pool, work.job_id)
+            .await
+            .map_err(debug_error)?;
+
+        let state = inline_customer_settlement_state(&database.pool, &work).await?;
+        require(
+            state
+                == InlineCustomerSettlementState {
+                    job_state: "succeeded".to_string(),
+                    charged_units: 1,
+                    quota_state: "committed".to_string(),
+                    committed_units: 1,
+                    released_units: 0,
+                    usage_fact_count: 1,
+                    customer_rating_count: 1,
+                    customer_charge_count: 1,
+                    hold_state: "settled".to_string(),
+                    captured_micros: 7,
+                    released_micros: 0,
+                    account_held_micros: 0,
+                    account_captured_micros: 7,
+                },
+            format!("inline reconcile was not exact or idempotent: {state:?}"),
         )
     }
     .await;
@@ -7529,6 +7707,209 @@ async fn seed_terminal_quota(pool: &PgPool, work: &WorkLease) -> TestResult {
     .rows_affected();
     require(changed == 1, "terminal quota did not bind its job")?;
     tx.commit().await.map_err(debug_error)
+}
+
+async fn bind_inline_profile(pool: &PgPool, work: &WorkLease) -> TestResult {
+    let mut tx = pool.begin().await.map_err(debug_error)?;
+    require_one(
+        sqlx::query(
+            r#"
+            UPDATE work_items
+            SET execution_profile_id = $2,
+                state = 'running',
+                updated_at_ms = updated_at_ms + 1
+            WHERE work_item_id = $1
+              AND state = 'leased'
+              AND execution_profile_id IS NULL
+            "#,
+        )
+        .bind(work.work_item_id)
+        .bind(CODEX_PROFILE_ID)
+        .execute(&mut *tx)
+        .await
+        .map_err(debug_error)?,
+        "inline profile binding",
+    )?;
+    require_one(
+        sqlx::query(
+            r#"
+            UPDATE job_attempts
+            SET state = 'running',
+                started_at_ms = updated_at_ms,
+                updated_at_ms = updated_at_ms + 1
+            WHERE execution_id = $1
+              AND state = 'claimed'
+            "#,
+        )
+        .bind(work.execution_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(debug_error)?,
+        "inline attempt start",
+    )?;
+    tx.commit().await.map_err(debug_error)
+}
+
+async fn inline_usage_reservation(pool: &PgPool, work: &WorkLease) -> TestResult<UsageReservation> {
+    let (
+        reservation_id,
+        tenant_id,
+        request_id,
+        provider_id,
+        model,
+        output_count,
+        billable_units,
+        billing_metric,
+        limit_5h,
+        remaining_5h,
+        limit_7d,
+        remaining_7d,
+    ): (
+        Uuid,
+        String,
+        String,
+        String,
+        String,
+        i32,
+        i32,
+        String,
+        i32,
+        i32,
+        i32,
+        i32,
+    ) = sqlx::query_as(
+        r#"
+        SELECT quota.reservation_id, job.tenant_id, job.request_id,
+               job.provider_id, job.model, job.output_count, job.billable_units,
+               job.billing_metric, quota.limit_5h, quota.remaining_5h,
+               quota.limit_7d, quota.remaining_7d
+        FROM jobs job
+        JOIN quota_reservations quota ON quota.reservation_id = job.reservation_id
+        WHERE job.job_id = $1
+        "#,
+    )
+    .bind(work.job_id)
+    .fetch_one(pool)
+    .await
+    .map_err(debug_error)?;
+    let billing_metric = match billing_metric.as_str() {
+        "output" => BillingMetric::Output,
+        "request" => BillingMetric::Request,
+        "video_second" => BillingMetric::VideoSecond,
+        _ => {
+            return Err(format!(
+                "unsupported inline billing metric {billing_metric}"
+            ));
+        }
+    };
+    Ok(UsageReservation {
+        reservation_id,
+        job_id: work.job_id,
+        charge: UsageCharge {
+            tenant_id,
+            attribution: None,
+            request_id,
+            admission_session_id: None,
+            operation: "generation",
+            provider_id,
+            model,
+            output_count: u32::try_from(output_count).map_err(debug_error)?,
+            billable_units: u32::try_from(billable_units).map_err(debug_error)?,
+            billing_metric,
+            limits: UsageLimits {
+                five_hour_image_limit: u32::try_from(limit_5h).map_err(debug_error)?,
+                seven_day_image_limit: u32::try_from(limit_7d).map_err(debug_error)?,
+            },
+        },
+        snapshot: UsageSnapshot {
+            limit_5h: u32::try_from(limit_5h).map_err(debug_error)?,
+            remaining_5h: u32::try_from(remaining_5h).map_err(debug_error)?,
+            limit_7d: u32::try_from(limit_7d).map_err(debug_error)?,
+            remaining_7d: u32::try_from(remaining_7d).map_err(debug_error)?,
+        },
+    })
+}
+
+async fn inline_generation_manifest(
+    artifacts: &dyn ArtifactBlobStore,
+    work: &WorkLease,
+    reservation: &UsageReservation,
+) -> TestResult<GenerationResultManifest> {
+    let artifact = artifacts
+        .put(
+            ArtifactIdentity {
+                artifact_id: Uuid::new_v4(),
+                tenant_id: reservation.charge.tenant_id.clone(),
+                job_id: work.job_id,
+                work_item_id: work.work_item_id,
+                execution_id: work.execution_id,
+                lease_epoch: work.lease_epoch,
+                output_index: 0,
+                media_type: "image/png".to_string(),
+            },
+            &png_bytes([10, 20, 30, 255]),
+        )
+        .await
+        .map_err(debug_error)?;
+    Ok(GenerationResultManifest {
+        job_id: work.job_id,
+        tenant_id: reservation.charge.tenant_id.clone(),
+        projection: GenerationResponseProjection {
+            api_profile: "openai-images-v1".to_string(),
+            operation: "generation".to_string(),
+            response_schema: GENERATION_RESPONSE_SCHEMA.to_string(),
+            created_at_seconds: 1_800_000_000,
+            output_format: "png".to_string(),
+            quality: "high".to_string(),
+            size: "1024x1024".to_string(),
+            background: "opaque".to_string(),
+            stream: false,
+            usage: reservation.snapshot.clone(),
+        },
+        artifacts: vec![artifact],
+    })
+}
+
+async fn inline_customer_settlement_state(
+    pool: &PgPool,
+    work: &WorkLease,
+) -> TestResult<InlineCustomerSettlementState> {
+    sqlx::query_as(
+        r#"
+        SELECT job.state AS job_state, job.charged_units,
+               quota.state AS quota_state, quota.committed_units,
+               quota.released_units,
+               (SELECT COUNT(*) FROM provider_usage_facts fact
+                WHERE fact.job_id = job.job_id
+                  AND fact.attempt_execution_id = $2
+                  AND fact.submission_id IS NULL
+                  AND fact.receipt_id IS NULL
+                  AND fact.fact_domain = 'customer_billable'
+                  AND fact.metric = 'image_output'
+                  AND fact.quantity = 1) AS usage_fact_count,
+               (SELECT COUNT(*) FROM customer_rated_usage rating
+                WHERE rating.job_id = job.job_id) AS customer_rating_count,
+               (SELECT COUNT(*) FROM ledger_transactions ledger
+                WHERE ledger.source_job_id = job.job_id
+                  AND ledger.transaction_type = 'customer_job_charge')
+                 AS customer_charge_count,
+               hold.state AS hold_state, hold.captured_micros,
+               hold.released_micros, account.held_micros AS account_held_micros,
+               account.captured_micros AS account_captured_micros
+        FROM jobs job
+        JOIN quota_reservations quota ON quota.reservation_id = job.reservation_id
+        JOIN customer_billing_holds hold ON hold.job_id = job.job_id
+        JOIN billing_accounts account
+          ON account.tenant_id = job.tenant_id
+         AND account.currency = hold.currency
+        WHERE job.job_id = $1
+        "#,
+    )
+    .bind(work.job_id)
+    .bind(work.execution_id)
+    .fetch_one(pool)
+    .await
+    .map_err(debug_error)
 }
 
 async fn seed_lease(pool: &PgPool, worker_id: &str, requested_units: i32) -> TestResult<WorkLease> {

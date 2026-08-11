@@ -117,6 +117,7 @@ pub use executor::{
 pub use generator::{
     CodexImageGenerator, EditJob, GeneratedImage, GenerationJob, ImageGenerator, InputImage,
 };
+pub use pricing::inline_settlement::reconcile_inline_customer_settlement;
 pub use project_governance::{PostgresProjectGovernanceService, ProjectGovernanceService};
 pub use project_limits::{PostgresProjectSpendBudgetService, ProjectSpendBudgetService};
 pub use project_model_policy::{PostgresProjectModelPolicyService, ProjectModelPolicyService};

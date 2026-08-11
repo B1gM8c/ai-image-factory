@@ -7,7 +7,10 @@ use super::{
     lock_quota_and_job, lock_tenant_quota, lock_work_and_attempt, require_one_row,
     settlement_unavailable, validate_lease_identity, validate_reservation_handle,
 };
-use crate::{ImageGatewayError, admission::WorkLease, usage::UsageReservation};
+use crate::{
+    ImageGatewayError, admission::WorkLease,
+    pricing::inline_settlement::settle_inline_customer_quote, usage::UsageReservation,
+};
 
 pub(super) async fn settle(
     pool: &PgPool,
@@ -31,6 +34,8 @@ pub(super) async fn settle(
 
     if is_failed(&quota_job, &work_attempt) {
         validate_failed_state(&quota_job, &work_attempt, &idempotency, error_code)?;
+        settle_inline_customer_quote(&mut tx, lease.job_id, lease.execution_id, "failed", now)
+            .await?;
         tx.commit().await.map_err(settlement_unavailable)?;
         return Ok(());
     }
@@ -43,6 +48,7 @@ pub(super) async fn settle(
     fail_job(&mut tx, &quota_job, error_code, now).await?;
     insert_metering_events(&mut tx, &quota_job, error_code, now).await?;
     append_events(&mut tx, lease, error_code, now).await?;
+    settle_inline_customer_quote(&mut tx, lease.job_id, lease.execution_id, "failed", now).await?;
 
     tx.commit().await.map_err(settlement_unavailable)
 }

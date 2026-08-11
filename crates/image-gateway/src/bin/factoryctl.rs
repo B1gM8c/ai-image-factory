@@ -1,5 +1,7 @@
 use std::{env, path::PathBuf};
 
+use uuid::Uuid;
+
 use gpt_image_2_gateway::{
     CodexExecutionProfileProvisioning, CodexProfileProvisioningError, ImageGatewayError,
     codex_auth_file_sha256,
@@ -11,7 +13,7 @@ use gpt_image_2_gateway::{
     provider_management::PostgresProviderManagementService,
     provision_codex_execution_profile, provision_grok_execution_profile,
     provision_grok_video_execution_profile, provision_grok_video_execution_profile_replacement,
-    reconcile_execution_profile_routes,
+    reconcile_execution_profile_routes, reconcile_inline_customer_settlement,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -26,6 +28,9 @@ enum Command {
     },
     ReconcileExecutionProfileRoutes,
     ReconcileDreaminaProfiles,
+    ReconcileInlineCustomerSettlement {
+        job_id: Uuid,
+    },
     BootstrapAdmin {
         email: String,
         display_name: String,
@@ -39,7 +44,7 @@ where
 {
     let mut args = args.into_iter();
     let command = args.next().ok_or_else(|| {
-        "missing command: expected `migrate`, `bootstrap-admin`, `provision-codex-profile`, `provision-grok-profile`, `provision-grok-video-profile`, `provision-grok-video-profile-replacement`, `reconcile-execution-profile-routes`, or `reconcile-dreamina-profiles`"
+        "missing command: expected `migrate`, `bootstrap-admin`, `provision-codex-profile`, `provision-grok-profile`, `provision-grok-video-profile`, `provision-grok-video-profile-replacement`, `reconcile-execution-profile-routes`, `reconcile-dreamina-profiles`, or `reconcile-inline-customer-settlement`"
             .to_string()
     })?;
     let command = match command.as_ref() {
@@ -73,9 +78,18 @@ where
         }
         "reconcile-execution-profile-routes" => Command::ReconcileExecutionProfileRoutes,
         "reconcile-dreamina-profiles" => Command::ReconcileDreaminaProfiles,
+        "reconcile-inline-customer-settlement" => {
+            let job_id =
+                required_argument(&mut args, "reconcile-inline-customer-settlement", "job id")?
+                    .parse()
+                    .map_err(|_| {
+                        "reconcile-inline-customer-settlement requires a UUID job id".to_string()
+                    })?;
+            Command::ReconcileInlineCustomerSettlement { job_id }
+        }
         value => {
             return Err(format!(
-                "unknown command `{value}`: expected `migrate`, `bootstrap-admin`, `provision-codex-profile`, `provision-grok-profile`, `provision-grok-video-profile`, `provision-grok-video-profile-replacement`, `reconcile-execution-profile-routes`, or `reconcile-dreamina-profiles`"
+                "unknown command `{value}`: expected `migrate`, `bootstrap-admin`, `provision-codex-profile`, `provision-grok-profile`, `provision-grok-video-profile`, `provision-grok-video-profile-replacement`, `reconcile-execution-profile-routes`, `reconcile-dreamina-profiles`, or `reconcile-inline-customer-settlement`"
             ));
         }
     };
@@ -127,7 +141,8 @@ async fn main() -> Result<(), ImageGatewayError> {
         Command::BootstrapAdmin { .. }
         | Command::ProvisionGrokVideoProfileReplacement { .. }
         | Command::ReconcileExecutionProfileRoutes
-        | Command::ReconcileDreaminaProfiles => None,
+        | Command::ReconcileDreaminaProfiles
+        | Command::ReconcileInlineCustomerSettlement { .. } => None,
     };
     let database_url = database_url_from_env()?;
     let database_schema = database_schema_from_env()?;
@@ -212,6 +227,11 @@ async fn main() -> Result<(), ImageGatewayError> {
             let created =
                 PostgresProviderManagementService::reconcile_dreamina_video_profiles(&pool).await?;
             println!("Dreamina video profiles reconciled: {created} created");
+        }
+        Command::ReconcileInlineCustomerSettlement { job_id } => {
+            verify_migrations(&pool).await?;
+            reconcile_inline_customer_settlement(&pool, job_id).await?;
+            println!("inline customer settlement reconciled: {job_id}");
         }
         Command::BootstrapAdmin {
             email,
@@ -437,10 +457,27 @@ mod tests {
     }
 
     #[test]
+    fn accepts_inline_customer_settlement_job() {
+        let job_id = uuid::Uuid::new_v4();
+        assert_eq!(
+            parse_command(["reconcile-inline-customer-settlement", &job_id.to_string()]),
+            Ok(Command::ReconcileInlineCustomerSettlement { job_id })
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_inline_customer_settlement_job() {
+        assert_eq!(
+            parse_command(["reconcile-inline-customer-settlement", "not-a-uuid"]),
+            Err("reconcile-inline-customer-settlement requires a UUID job id".to_string())
+        );
+    }
+
+    #[test]
     fn rejects_missing_command() {
         assert_eq!(
             parse_command([] as [&str; 0]),
-            Err("missing command: expected `migrate`, `bootstrap-admin`, `provision-codex-profile`, `provision-grok-profile`, `provision-grok-video-profile`, `provision-grok-video-profile-replacement`, `reconcile-execution-profile-routes`, or `reconcile-dreamina-profiles`".to_string())
+            Err("missing command: expected `migrate`, `bootstrap-admin`, `provision-codex-profile`, `provision-grok-profile`, `provision-grok-video-profile`, `provision-grok-video-profile-replacement`, `reconcile-execution-profile-routes`, `reconcile-dreamina-profiles`, or `reconcile-inline-customer-settlement`".to_string())
         );
     }
 
@@ -449,7 +486,7 @@ mod tests {
         assert_eq!(
             parse_command(["status"]),
             Err(
-                "unknown command `status`: expected `migrate`, `bootstrap-admin`, `provision-codex-profile`, `provision-grok-profile`, `provision-grok-video-profile`, `provision-grok-video-profile-replacement`, `reconcile-execution-profile-routes`, or `reconcile-dreamina-profiles`"
+                "unknown command `status`: expected `migrate`, `bootstrap-admin`, `provision-codex-profile`, `provision-grok-profile`, `provision-grok-video-profile`, `provision-grok-video-profile-replacement`, `reconcile-execution-profile-routes`, `reconcile-dreamina-profiles`, or `reconcile-inline-customer-settlement`"
                     .to_string()
             )
         );

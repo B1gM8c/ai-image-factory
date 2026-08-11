@@ -8,6 +8,8 @@ use crate::ImageGatewayError;
 
 pub(crate) mod admission;
 mod coverage;
+pub(crate) mod customer_usage;
+pub(crate) mod inline_settlement;
 mod official_catalog;
 pub(crate) mod official_metering;
 mod postgres;
