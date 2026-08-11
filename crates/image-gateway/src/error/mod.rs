@@ -26,6 +26,8 @@ const CODE_USER_API_KEYS_DISABLED: &str = "user_api_keys_disabled";
 const CODE_IMAGE_GENERATION_FAILED: &str = "image_generation_failed";
 const CODE_CODEX_CLI_FAILED: &str = "codex_cli_failed";
 const CODE_CODEX_NO_IMAGE_OUTPUT: &str = "codex_no_image_output";
+const CODE_CODEX_IMAGE_TOOL_NOT_INVOKED: &str = "codex_image_tool_not_invoked";
+const CODE_CODEX_IMAGE_OUTPUT_DISAPPEARED: &str = "codex_image_output_disappeared";
 const CODE_TIMEOUT: &str = "timeout";
 const CODE_SERVICE_UNAVAILABLE: &str = "service_unavailable";
 const CODE_CONFIGURATION_ERROR: &str = "configuration_error";
@@ -453,6 +455,26 @@ impl ImageGatewayError {
             TYPE_SERVER,
             None,
             CODE_CODEX_NO_IMAGE_OUTPUT,
+        )
+    }
+
+    pub fn codex_image_tool_not_invoked() -> Self {
+        Self::new(
+            StatusCode::BAD_GATEWAY,
+            "Codex CLI completed without invoking the required image generation tool",
+            TYPE_SERVER,
+            None,
+            CODE_CODEX_IMAGE_TOOL_NOT_INVOKED,
+        )
+    }
+
+    pub fn codex_image_output_disappeared() -> Self {
+        Self::new(
+            StatusCode::BAD_GATEWAY,
+            "Codex generated an image but its output could not be durably recovered",
+            TYPE_SERVER,
+            None,
+            CODE_CODEX_IMAGE_OUTPUT_DISAPPEARED,
         )
     }
 

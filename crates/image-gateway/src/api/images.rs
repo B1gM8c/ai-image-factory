@@ -559,6 +559,10 @@ fn persisted_generation_error(error_code: Option<&str>) -> ImageGatewayError {
         Some("timeout") => ImageGatewayError::timeout(),
         Some("codex_cli_failed") => ImageGatewayError::codex_cli_failed(),
         Some("codex_no_image_output") => ImageGatewayError::codex_no_image_output(),
+        Some("codex_image_tool_not_invoked") => ImageGatewayError::codex_image_tool_not_invoked(),
+        Some("codex_image_output_disappeared") => {
+            ImageGatewayError::codex_image_output_disappeared()
+        }
         Some("service_unavailable") => {
             ImageGatewayError::service_unavailable("Image generation backend unavailable")
         }
@@ -1344,6 +1348,16 @@ mod tests {
 
         let no_output = persisted_generation_error(Some("codex_no_image_output"));
         assert_eq!(no_output.error_code(), Some("codex_no_image_output"));
+        let tool_not_invoked = persisted_generation_error(Some("codex_image_tool_not_invoked"));
+        assert_eq!(
+            tool_not_invoked.error_code(),
+            Some("codex_image_tool_not_invoked")
+        );
+        let output_disappeared = persisted_generation_error(Some("codex_image_output_disappeared"));
+        assert_eq!(
+            output_disappeared.error_code(),
+            Some("codex_image_output_disappeared")
+        );
 
         let unavailable = persisted_generation_error(Some("service_unavailable"));
         assert_eq!(

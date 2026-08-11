@@ -118,6 +118,26 @@ struct CodexEventSummary {
     malformed_events: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CodexOutputSource {
+    Workspace,
+    Runtime,
+    Native,
+}
+
+struct CapturedCodexOutput {
+    bytes: Vec<u8>,
+    source: CodexOutputSource,
+}
+
+#[derive(Default)]
+struct CodexOutputCapture {
+    output: Option<CapturedCodexOutput>,
+    workspace_observed: bool,
+    runtime_observed: bool,
+    native_observed: bool,
+}
+
 impl CodexProcessSupervisor {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -540,10 +560,13 @@ async fn run_codex_child(
     let (stop_capture, capture_stop) = oneshot::channel();
     let capture_spool = Arc::clone(&spool);
     let capture_format = request.output.output_format.clone();
+    let capture_codex_home = codex_home.to_path_buf();
     let capture = tokio::spawn(async move {
         capture_ephemeral_output(
             capture_spool,
             capture_filename,
+            CODEX_RUNTIME_OUTPUT_FILE,
+            capture_codex_home,
             capture_format,
             capture_stop,
         )
@@ -560,8 +583,20 @@ async fn run_codex_child(
     match runtime_result {
         Ok(result) => ChildOutcome::Succeeded(result.sink),
         Err(error) if ephemeral_capture_fallback_allowed(&error) => match captured {
-            Ok(Some(bytes)) => ChildOutcome::Succeeded(bytes),
-            Ok(None) => match final_fallback_output(
+            Ok(capture) if capture.output.is_some() => {
+                let output = capture.output.expect("capture output checked");
+                tracing::warn!(
+                    request.id = %request.output.request_id,
+                    output.index = request.output.candidate_index,
+                    codex.output.recovery_source = ?output.source,
+                    codex.output.workspace_observed = capture.workspace_observed,
+                    codex.output.runtime_observed = capture.runtime_observed,
+                    codex.output.native_observed = capture.native_observed,
+                    "recovered Codex output before an ephemeral provider path disappeared"
+                );
+                ChildOutcome::Succeeded(output.bytes)
+            }
+            Ok(capture) => match final_fallback_output(
                 &spool,
                 capture_filename,
                 codex_home,
@@ -582,6 +617,10 @@ async fn run_codex_child(
                         codex.stdout.truncated = observer.events.stdout_truncated,
                         codex.stderr.truncated = observer.events.stderr_truncated,
                         codex.stderr.present = observer.events.stderr_present,
+                        codex.output.stage = "post_exit_recovery",
+                        codex.output.workspace_observed = capture.workspace_observed,
+                        codex.output.runtime_observed = capture.runtime_observed,
+                        codex.output.native_observed = capture.native_observed,
                         error.code = codex_output_error_code(&error),
                         "Codex completed without a recoverable image artifact"
                     );
@@ -652,44 +691,90 @@ fn final_workspace_output(
 
 async fn capture_ephemeral_output(
     spool: Arc<ExecutionSpool>,
-    filename: &'static str,
+    workspace_filename: &'static str,
+    runtime_filename: &'static str,
+    codex_home: PathBuf,
     output_format: String,
     mut stop: oneshot::Receiver<()>,
-) -> Result<Option<Vec<u8>>, ProcessSpoolError> {
-    let mut captured: Option<Vec<u8>> = None;
+) -> Result<CodexOutputCapture, ProcessSpoolError> {
+    let mut capture = CodexOutputCapture::default();
     let mut first_poll = true;
     loop {
+        let mut stopping = false;
         if first_poll {
             first_poll = false;
         } else {
             tokio::select! {
                 biased;
-                _ = &mut stop => return Ok(captured),
+                _ = &mut stop => stopping = true,
                 _ = tokio::time::sleep(EPHEMERAL_OUTPUT_POLL_INTERVAL) => {}
             }
         }
         let read_spool = Arc::clone(&spool);
-        let snapshot = tokio::task::spawn_blocking(move || {
-            read_spool.read_workspace_output(filename, MAX_CODEX_RUNTIME_OUTPUT_BYTES)
+        let snapshots = tokio::task::spawn_blocking(move || {
+            Ok::<_, ProcessSpoolError>((
+                read_spool
+                    .read_workspace_output(workspace_filename, MAX_CODEX_RUNTIME_OUTPUT_BYTES)?,
+                read_spool.read_runtime_output(runtime_filename, MAX_CODEX_RUNTIME_OUTPUT_BYTES)?,
+            ))
         })
         .await
         .map_err(|_| ProcessSpoolError::Unavailable)??;
-        match snapshot {
-            WorkspaceOutputSnapshot::Missing | WorkspaceOutputSnapshot::Incomplete => {}
-            WorkspaceOutputSnapshot::Bytes(bytes) => {
-                let format = output_format.clone();
-                let (bytes, valid) = tokio::task::spawn_blocking(move || {
-                    let valid = valid_captured_image(&bytes, &format);
-                    (bytes, valid)
-                })
-                .await
-                .map_err(|_| ProcessSpoolError::Unavailable)?;
-                if valid {
-                    captured = Some(bytes);
-                }
-            }
+        let workspace =
+            validated_snapshot(snapshots.0, CodexOutputSource::Workspace, &output_format).await?;
+        let runtime =
+            validated_snapshot(snapshots.1, CodexOutputSource::Runtime, &output_format).await?;
+        let native = snapshot_native_codex_output(&codex_home, &output_format).await?;
+
+        if workspace.is_some() {
+            capture.workspace_observed = true;
+        }
+        if runtime.is_some() {
+            capture.runtime_observed = true;
+        }
+        if native.is_some() {
+            capture.native_observed = true;
+        }
+        capture.output = runtime.or(workspace).or(native).or(capture.output);
+        if stopping {
+            return Ok(capture);
         }
     }
+}
+
+async fn validated_snapshot(
+    snapshot: WorkspaceOutputSnapshot,
+    source: CodexOutputSource,
+    output_format: &str,
+) -> Result<Option<CapturedCodexOutput>, ProcessSpoolError> {
+    let WorkspaceOutputSnapshot::Bytes(bytes) = snapshot else {
+        return Ok(None);
+    };
+    let format = output_format.to_string();
+    tokio::task::spawn_blocking(move || {
+        Ok(valid_captured_image(&bytes, &format).then_some(CapturedCodexOutput { bytes, source }))
+    })
+    .await
+    .map_err(|_| ProcessSpoolError::Unavailable)?
+}
+
+async fn snapshot_native_codex_output(
+    codex_home: &Path,
+    output_format: &str,
+) -> Result<Option<CapturedCodexOutput>, ProcessSpoolError> {
+    let Some(path) = select_image_output(&codex_home.join("generated_images"), output_format)
+    else {
+        return Ok(None);
+    };
+    let bytes = read_codex_output(&path)
+        .await
+        .map_err(|_| ProcessSpoolError::Unavailable)?;
+    Ok(
+        valid_captured_image(&bytes, output_format).then_some(CapturedCodexOutput {
+            bytes,
+            source: CodexOutputSource::Native,
+        }),
+    )
 }
 
 fn valid_captured_image(bytes: &[u8], output_format: &str) -> bool {
@@ -1603,6 +1688,79 @@ mod tests {
         assert_eq!(
             spool.observe().unwrap(),
             ProcessObservation::Succeeded(SupervisedOutput::without_provider_cost(expected))
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_signal_takes_one_final_runtime_output_snapshot() {
+        let fixture = CodexFixture::new();
+        let lease = fixture.lease();
+        fixture.journal.start_or_attach(&lease).unwrap();
+        let spool = Arc::new(ExecutionSpool::for_lease(&fixture.journal, &lease).unwrap());
+        let expected = fs::read(fixture._temp.path().join("source.png")).unwrap();
+        let runtime_output = spool
+            .runtime_home_path()
+            .unwrap()
+            .join(CODEX_RUNTIME_OUTPUT_FILE);
+        let codex_home = spool.codex_home_path().unwrap().to_path_buf();
+        let (stop, stop_rx) = oneshot::channel();
+        let capture_spool = Arc::clone(&spool);
+        let capture = tokio::spawn(async move {
+            capture_ephemeral_output(
+                capture_spool,
+                "provider-output.png",
+                CODEX_RUNTIME_OUTPUT_FILE,
+                codex_home,
+                "png".to_string(),
+                stop_rx,
+            )
+            .await
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        fs::write(runtime_output, &expected).unwrap();
+        stop.send(()).unwrap();
+        let capture = capture.await.unwrap().unwrap();
+        let output = capture.output.expect("final snapshot should retain output");
+
+        assert_eq!(output.source, CodexOutputSource::Runtime);
+        assert_eq!(output.bytes, expected);
+        assert!(capture.runtime_observed);
+        assert!(!capture.workspace_observed);
+    }
+
+    #[tokio::test]
+    async fn native_output_capture_is_scoped_to_the_execution_codex_home() {
+        let fixture = CodexFixture::new();
+        let first_lease = fixture.lease();
+        let second_lease = fixture.lease();
+        fixture.journal.start_or_attach(&first_lease).unwrap();
+        fixture.journal.start_or_attach(&second_lease).unwrap();
+        let first_spool = ExecutionSpool::for_lease(&fixture.journal, &first_lease).unwrap();
+        let second_spool = ExecutionSpool::for_lease(&fixture.journal, &second_lease).unwrap();
+        let expected = fs::read(fixture._temp.path().join("source.png")).unwrap();
+        let second_home = second_spool.codex_home_path().unwrap().to_path_buf();
+        let second_output = second_home
+            .join("generated_images")
+            .join("019fd9f5-badb-7dd3-8903-28ffded0ef54")
+            .join("generated.png");
+        fs::create_dir_all(second_output.parent().unwrap()).unwrap();
+        fs::write(&second_output, &expected).unwrap();
+
+        let first = snapshot_native_codex_output(first_spool.codex_home_path().unwrap(), "png")
+            .await
+            .unwrap();
+        let second = snapshot_native_codex_output(&second_home, "png")
+            .await
+            .unwrap()
+            .expect("the owning execution should recover its native output");
+
+        assert!(first.is_none());
+        assert_eq!(second.source, CodexOutputSource::Native);
+        assert_eq!(second.bytes, expected);
+        assert_ne!(
+            first_spool.codex_home_path().unwrap(),
+            second_spool.codex_home_path().unwrap()
         );
     }
 

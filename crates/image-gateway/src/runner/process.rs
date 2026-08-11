@@ -419,6 +419,18 @@ impl ExecutionSpool {
         read_workspace_output(&self.workspace.fd, filename, max_bytes)
     }
 
+    pub(crate) fn read_runtime_output(
+        &self,
+        filename: &str,
+        max_bytes: u64,
+    ) -> Result<WorkspaceOutputSnapshot, ProcessSpoolError> {
+        if !valid_single_component(filename) || max_bytes == 0 {
+            return Err(ProcessSpoolError::InvalidInput);
+        }
+        validate_bound_path(&self.runtime_home.path, &self.runtime_home.fd)?;
+        read_workspace_output(&self.runtime_home.fd, filename, max_bytes)
+    }
+
     pub(crate) fn codex_home_path(&self) -> Result<&Path, ProcessSpoolError> {
         validate_bound_path(&self.codex_home.path, &self.codex_home.fd)?;
         Ok(&self.codex_home.path)
@@ -1324,6 +1336,27 @@ mod tests {
         assert_eq!(
             spool
                 .read_workspace_output("provider-output.png", 1024)
+                .unwrap(),
+            WorkspaceOutputSnapshot::Bytes(b"complete-image".to_vec())
+        );
+    }
+
+    #[test]
+    fn runtime_output_reader_uses_the_same_bounded_snapshot_contract() {
+        let (_temp, journal, lease) = fixture();
+        let spool = ExecutionSpool::for_lease(&journal, &lease).unwrap();
+        let output = spool.runtime_home_path().unwrap().join("sealed-output.bin");
+
+        assert_eq!(
+            spool
+                .read_runtime_output("sealed-output.bin", 1024)
+                .unwrap(),
+            WorkspaceOutputSnapshot::Missing
+        );
+        fs::write(&output, b"complete-image").unwrap();
+        assert_eq!(
+            spool
+                .read_runtime_output("sealed-output.bin", 1024)
                 .unwrap(),
             WorkspaceOutputSnapshot::Bytes(b"complete-image".to_vec())
         );
