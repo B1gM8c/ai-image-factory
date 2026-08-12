@@ -1105,6 +1105,45 @@ mod tests {
     }
 
     #[test]
+    fn grok_video_15_preview_bindings_are_deterministic() {
+        let canonical = contract("grok-cli.videos.generations.pricing-surface")
+            .binding_snapshot(ExactSurfaceIdentity {
+                api_profile: "xai-videos-v1",
+                provider_model_id: "grok-imagine-video-1.5-preview",
+                public_model_id: "grok-imagine-video-1.5",
+                service_tier: "standard",
+                execution_surface: "provider_cli",
+            })
+            .unwrap();
+        let preview = contract("grok-cli.videos.generations.pricing-surface")
+            .binding_snapshot(ExactSurfaceIdentity {
+                api_profile: "xai-videos-v1",
+                provider_model_id: "grok-imagine-video-1.5-preview",
+                public_model_id: "grok-imagine-video-1.5-preview",
+                service_tier: "standard",
+                execution_surface: "provider_cli",
+            })
+            .unwrap();
+
+        assert_eq!(
+            canonical.contract_key,
+            "grok-cli.videos.generations.pricing-surface:49388adc2d36987c"
+        );
+        assert_eq!(
+            canonical.contract_hash,
+            "691501d655945c9195e88931e040cdd92a773f13d4e3dc19449401b9e0d4c83f"
+        );
+        assert_eq!(
+            preview.contract_key,
+            "grok-cli.videos.generations.pricing-surface:7bd88c8c1783c05c"
+        );
+        assert_eq!(
+            preview.contract_hash,
+            "3cb4343abbd125bf363705376fc9a18e21c7155507106f83ec1a2afe8fd026ce"
+        );
+    }
+
+    #[test]
     fn codex_edit_has_a_distinct_identity_with_the_same_pricing_shape() {
         let generation = contract("openai-codex.images.generations.pricing-surface");
         let edit = contract("openai-codex.images.edits.pricing-surface");

@@ -3361,8 +3361,8 @@ async fn shared_pool_case(pool: &PgPool) -> TestResult {
 
 async fn assert_expected_schema(pool: &PgPool) -> TestResult {
     require(
-        migration_versions(pool).await? == (0_i64..=121_i64).collect::<Vec<_>>(),
-        "applied migration versions must be exactly 0 through 121",
+        migration_versions(pool).await? == (0_i64..=123_i64).collect::<Vec<_>>(),
+        "applied migration versions must be exactly 0 through 123",
     )?;
 
     let default_codex_prices: Vec<(String, i64, i64)> = sqlx::query_as(
@@ -3457,6 +3457,89 @@ async fn assert_expected_schema(pool: &PgPool) -> TestResult {
                 ),
             ],
         "fresh migrations must publish bound Grok generation and edit prices",
+    )?;
+
+    let default_grok_video_prices: Vec<(String, String, String, i64, i64)> = sqlx::query_as(
+        r#"
+        SELECT version.public_model_id, component.metric,
+               component.dimensions_json::TEXT, component.unit_price_micros,
+               count(binding.contract_key)::BIGINT
+        FROM price_books book
+        JOIN price_book_versions version USING (price_book_id)
+        JOIN price_components component USING (price_book_version_id)
+        LEFT JOIN price_book_version_surface_contract_bindings binding
+          USING (price_book_version_id)
+        WHERE book.purpose = 'customer_sale'
+          AND book.scope_type = 'platform'
+          AND book.state = 'active'
+          AND version.state = 'active'
+          AND version.api_profile = 'xai-videos-v1'
+          AND version.operation = 'video_generation'
+          AND version.provider_id = 'grok-cli'
+          AND version.provider_model_id = 'grok-imagine-video-1.5-preview'
+          AND version.public_model_id IN (
+              'grok-imagine-video-1.5',
+              'grok-imagine-video-1.5-preview'
+          )
+          AND version.media_kind = 'video'
+          AND version.execution_surface = 'provider_cli'
+          AND component.outcome = 'succeeded'
+        GROUP BY version.public_model_id, component.metric,
+                 component.dimensions_json, component.unit_price_micros
+        ORDER BY version.public_model_id, component.metric,
+                 component.dimensions_json::TEXT
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|error| format!("failed to inspect default Grok video pricing: {error}"))?;
+    require(
+        default_grok_video_prices
+            == vec![
+                (
+                    "grok-imagine-video-1.5".to_string(),
+                    "image_input".to_string(),
+                    "{}".to_string(),
+                    10000,
+                    1,
+                ),
+                (
+                    "grok-imagine-video-1.5".to_string(),
+                    "video_requested_second".to_string(),
+                    "{\"resolution\": \"720p\"}".to_string(),
+                    140000,
+                    1,
+                ),
+                (
+                    "grok-imagine-video-1.5".to_string(),
+                    "video_requested_second".to_string(),
+                    "{}".to_string(),
+                    80000,
+                    1,
+                ),
+                (
+                    "grok-imagine-video-1.5-preview".to_string(),
+                    "image_input".to_string(),
+                    "{}".to_string(),
+                    10000,
+                    1,
+                ),
+                (
+                    "grok-imagine-video-1.5-preview".to_string(),
+                    "video_requested_second".to_string(),
+                    "{\"resolution\": \"720p\"}".to_string(),
+                    140000,
+                    1,
+                ),
+                (
+                    "grok-imagine-video-1.5-preview".to_string(),
+                    "video_requested_second".to_string(),
+                    "{}".to_string(),
+                    80000,
+                    1,
+                ),
+            ],
+        "fresh migrations must publish bound Grok Video 1.5 prices for canonical and preview public IDs",
     )?;
 
     let grok_provider_actual: Vec<(String, String, String, i64)> = sqlx::query_as(
