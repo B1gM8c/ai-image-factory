@@ -90,14 +90,18 @@ jobs:
           set -Eeuo pipefail
           shellcheck \
             scripts/package-release.sh \
+            scripts/test-gateway-runtime-gate.sh \
             deploy/hooks/* \
             deploy/install-release \
             deploy/upgrade-updater
           bash -n \
             scripts/package-release.sh \
+            scripts/test-gateway-runtime-gate.sh \
             deploy/hooks/* \
             deploy/install-release \
             deploy/upgrade-updater
+
+          scripts/test-gateway-runtime-gate.sh
 
           sudo install -d \
             /etc/ai-image-factory \
@@ -157,6 +161,7 @@ jobs:
           ! grep -Fq 'AIF_UPDATE_ADMISSION_CLOSE_HOOK' \
             deploy/hooks/fail-closed
           grep -Fq '"ops/hooks/fail-closed"' deploy/install-release
+          grep -Fq '"ops/hooks/verify-gateway-runtime"' deploy/install-release
           grep -Fq \
             '"ops/systemd/ai-image-factory-updater-recover@.service"' \
             deploy/install-release

@@ -292,6 +292,7 @@ required_files = {
     "ops/hooks/resume",
     "ops/hooks/start-processes",
     "ops/hooks/verify",
+    "ops/hooks/verify-gateway-runtime",
     "ops/install-release",
     "ops/systemd/ai-image-factory-processes.target",
     "ops/systemd/ai-image-factory-recovery-failed.service",

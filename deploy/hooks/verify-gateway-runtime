@@ -1,0 +1,77 @@
+#!/bin/bash
+set -Eeuo pipefail
+IFS=$'\n\t'
+export PATH="${AIF_VERIFY_COMMAND_PATH:-/usr/sbin:/usr/bin:/sbin:/bin}"
+
+die() {
+  printf 'gateway runtime gate: %s\n' "$*" >&2
+  exit 1
+}
+
+readonly GATEWAY_UNIT="${AIF_VERIFY_GATEWAY_UNIT:-ai-image-factory-gateway.service}"
+readonly GATEWAY_BASE_URL="${AIF_VERIFY_GATEWAY_BASE_URL:-http://127.0.0.1:8787}"
+readonly CURRENT_LINK="${AIF_VERIFY_CURRENT_RELEASE_LINK:-/opt/ai-image-factory/current}"
+readonly PROC_ROOT="${AIF_VERIFY_PROC_ROOT:-/proc}"
+readonly NGINX_CONFIG="${AIF_VERIFY_NGINX_CONFIG_PATH:-}"
+readonly LEGACY_UNITS="${AIF_VERIFY_LEGACY_GATEWAY_UNITS:-gpt-image-2-gateway.service}"
+readonly FORBIDDEN_NGINX_PORTS="${AIF_VERIFY_FORBIDDEN_NGINX_PORTS:-}"
+
+[[ "$GATEWAY_BASE_URL" =~ ^http://127\.0\.0\.1:([0-9]+)(/.*)?$ ]] \
+  || die "gateway base URL must use an explicit 127.0.0.1 port"
+readonly GATEWAY_PORT="${BASH_REMATCH[1]}"
+
+main_pid="$(systemctl show "$GATEWAY_UNIT" --property=MainPID --value)"
+[[ "$main_pid" =~ ^[1-9][0-9]*$ ]] || die "gateway unit has no live MainPID"
+[[ -d "${PROC_ROOT}/${main_pid}" ]] || die "gateway MainPID is not running: ${main_pid}"
+
+owner_pids=()
+while IFS= read -r owner_pid; do
+  [[ -n "$owner_pid" ]] && owner_pids+=("$owner_pid")
+done < <(
+  ss -H -ltnp "sport = :${GATEWAY_PORT}" \
+    | grep -oE 'pid=[0-9]+' \
+    | cut -d= -f2 \
+    | sort -u
+)
+[[ "${#owner_pids[@]}" -eq 1 ]] \
+  || die "gateway port ${GATEWAY_PORT} must have exactly one owner"
+[[ "${owner_pids[0]}" == "$main_pid" ]] \
+  || die "gateway port owner ${owner_pids[0]} does not match unit MainPID ${main_pid}"
+
+release_root="$(readlink -f "$CURRENT_LINK")"
+gateway_exe="$(readlink -f "${PROC_ROOT}/${main_pid}/exe")"
+[[ "$release_root" == */releases/* ]] \
+  || die "current release does not resolve inside an immutable releases directory"
+case "$gateway_exe" in
+  "${release_root}"/*) ;;
+  *) die "gateway executable is outside the current release: ${gateway_exe}" ;;
+esac
+
+while IFS= read -r legacy_unit; do
+  [[ -n "$legacy_unit" ]] || continue
+  load_state="$(systemctl show "$legacy_unit" --property=LoadState --value 2>/dev/null || true)"
+  [[ -n "$load_state" && "$load_state" != "not-found" ]] || continue
+  ! systemctl is-enabled --quiet "$legacy_unit" \
+    || die "legacy gateway unit is enabled: ${legacy_unit}"
+  ! systemctl is-active --quiet "$legacy_unit" \
+    || die "legacy gateway unit is active: ${legacy_unit}"
+done < <(printf '%s\n' "$LEGACY_UNITS" | tr ',' '\n')
+
+if [[ -n "$NGINX_CONFIG" ]]; then
+  [[ -f "$NGINX_CONFIG" ]] || die "nginx config does not exist: ${NGINX_CONFIG}"
+  grep -Eq \
+    "^[[:space:]]*proxy_pass[[:space:]]+http://127\\.0\\.0\\.1:${GATEWAY_PORT}([/;[:space:]]|$)" \
+    "$NGINX_CONFIG" \
+    || die "nginx config does not route to gateway port ${GATEWAY_PORT}"
+  while IFS= read -r forbidden_port; do
+    [[ -n "$forbidden_port" ]] || continue
+    if grep -Eq \
+      "^[[:space:]]*proxy_pass[[:space:]]+http://127\\.0\\.0\\.1:${forbidden_port}([/;[:space:]]|$)" \
+      "$NGINX_CONFIG"; then
+      die "nginx config still routes to forbidden gateway port ${forbidden_port}"
+    fi
+  done < <(printf '%s\n' "$FORBIDDEN_NGINX_PORTS" | tr ',' '\n')
+fi
+
+printf 'gateway runtime gate passed: unit=%s pid=%s port=%s release=%s\n' \
+  "$GATEWAY_UNIT" "$main_pid" "$GATEWAY_PORT" "$release_root"

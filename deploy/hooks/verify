@@ -7,6 +7,7 @@ readonly GATEWAY_BASE_URL="${AIF_VERIFY_GATEWAY_BASE_URL:-http://127.0.0.1:8787}
 readonly ADMIN_BASE_URL="${AIF_VERIFY_ADMIN_BASE_URL:-http://127.0.0.1:3010}"
 readonly MAX_ATTEMPTS="${AIF_VERIFY_MAX_ATTEMPTS:-60}"
 readonly PROCESS_SCOPE="${AIF_UPDATE_PROCESS_SCOPE:-full}"
+readonly RUNTIME_GATE="${AIF_VERIFY_GATEWAY_RUNTIME_GATE:-/usr/libexec/ai-image-factory/hooks/verify-gateway-runtime}"
 case "$PROCESS_SCOPE" in
   validation | full) ;;
   *)
@@ -62,6 +63,7 @@ for ((attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1)); do
     && curl --fail --silent --show-error "${GATEWAY_BASE_URL}/readyz" >/dev/null \
     && curl --fail --silent --show-error "${GATEWAY_BASE_URL}/openapi.json" >/dev/null \
     && curl --fail --silent --show-error "${ADMIN_BASE_URL}/login" >/dev/null; then
+    "$RUNTIME_GATE"
     if [[ "$PROCESS_SCOPE" == "full" ]]; then
       for unit in "${OPTIONAL_UNITS[@]}"; do
         if systemctl is-enabled --quiet "$unit" && ! systemctl is-active --quiet "$unit"; then
