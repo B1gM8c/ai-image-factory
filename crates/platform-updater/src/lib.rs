@@ -169,6 +169,7 @@ pub struct UpdaterConfig {
     recover_hook: Option<PathBuf>,
     activate_hook: Option<PathBuf>,
     verify_hook: Option<PathBuf>,
+    verify_context: BTreeMap<String, String>,
     poll_interval: Duration,
     lease_duration: Duration,
 }
@@ -221,6 +222,7 @@ impl UpdaterConfig {
         let recover_hook = optional_absolute_env_path("AIF_UPDATE_RECOVER_HOOK")?;
         let activate_hook = optional_absolute_env_path("AIF_UPDATE_ACTIVATE_HOOK")?;
         let verify_hook = optional_absolute_env_path("AIF_UPDATE_VERIFY_HOOK")?;
+        let verify_context = configured_verify_context();
         for hook in [
             &admission_close_hook,
             &admission_open_hook,
@@ -258,6 +260,7 @@ impl UpdaterConfig {
             recover_hook,
             activate_hook,
             verify_hook,
+            verify_context,
             poll_interval: duration_env("AIF_UPDATE_POLL_INTERVAL_MS", DEFAULT_POLL_INTERVAL)?,
             lease_duration: duration_env("AIF_UPDATE_LEASE_MS", DEFAULT_LEASE_DURATION)?,
         })
@@ -1216,6 +1219,7 @@ impl Updater {
             "validation".to_string(),
         );
         context.insert("AIF_UPDATE_START_MODE".to_string(), "direct".to_string());
+        context.extend(self.config.verify_context.clone());
         context
     }
 
@@ -1662,7 +1666,7 @@ impl Updater {
         claim: &ClaimedCommand,
         startup_gate: bool,
     ) -> BTreeMap<String, String> {
-        BTreeMap::from([
+        let mut context = BTreeMap::from([
             (
                 "AIF_UPDATE_COMMAND_ID".to_string(),
                 claim.command_id.to_string(),
@@ -1680,7 +1684,9 @@ impl Updater {
                 "AIF_UPDATE_PROCESS_SCOPE".to_string(),
                 "validation".to_string(),
             ),
-        ])
+        ]);
+        context.extend(self.config.verify_context.clone());
+        context
     }
 
     async fn try_recovery_takeover(
@@ -1887,6 +1893,7 @@ impl Updater {
             "AIF_UPDATE_PROCESS_SCOPE".to_string(),
             "validation".to_string(),
         );
+        context.extend(self.config.verify_context.clone());
         context
     }
 
@@ -3819,6 +3826,31 @@ fn optional_env(name: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+const VERIFY_CONTEXT_NAMES: &[&str] = &[
+    "AIF_VERIFY_ADMIN_BASE_URL",
+    "AIF_VERIFY_COMMAND_PATH",
+    "AIF_VERIFY_CURRENT_RELEASE_LINK",
+    "AIF_VERIFY_FORBIDDEN_NGINX_PORTS",
+    "AIF_VERIFY_GATEWAY_BASE_URL",
+    "AIF_VERIFY_GATEWAY_RUNTIME_GATE",
+    "AIF_VERIFY_GATEWAY_UNIT",
+    "AIF_VERIFY_LEGACY_GATEWAY_UNITS",
+    "AIF_VERIFY_MAX_ATTEMPTS",
+    "AIF_VERIFY_NGINX_CONFIG_PATH",
+    "AIF_VERIFY_PROC_ROOT",
+];
+
+fn configured_verify_context() -> BTreeMap<String, String> {
+    verify_context_from(optional_env)
+}
+
+fn verify_context_from(mut get: impl FnMut(&str) -> Option<String>) -> BTreeMap<String, String> {
+    VERIFY_CONTEXT_NAMES
+        .iter()
+        .filter_map(|name| get(name).map(|value| ((*name).to_string(), value)))
+        .collect()
+}
+
 fn boolean_env(name: &str, default: bool) -> Result<bool, UpdaterError> {
     let Some(value) = optional_env(name) else {
         return Ok(default);
@@ -3923,6 +3955,37 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn verify_context_is_explicitly_allowlisted() {
+        let values = BTreeMap::from([
+            (
+                "AIF_VERIFY_GATEWAY_BASE_URL".to_string(),
+                "http://127.0.0.1:8789".to_string(),
+            ),
+            (
+                "AIF_VERIFY_NGINX_CONFIG_PATH".to_string(),
+                "/etc/nginx/sites-enabled/sol42.cn".to_string(),
+            ),
+            ("DATABASE_URL".to_string(), "must-not-pass".to_string()),
+        ]);
+
+        let context = verify_context_from(|name| values.get(name).cloned());
+
+        assert_eq!(
+            context
+                .get("AIF_VERIFY_GATEWAY_BASE_URL")
+                .map(String::as_str),
+            Some("http://127.0.0.1:8789")
+        );
+        assert_eq!(
+            context
+                .get("AIF_VERIFY_NGINX_CONFIG_PATH")
+                .map(String::as_str),
+            Some("/etc/nginx/sites-enabled/sol42.cn")
+        );
+        assert!(!context.contains_key("DATABASE_URL"));
+    }
 
     fn valid_manifest() -> ReleaseManifest {
         ReleaseManifest {
