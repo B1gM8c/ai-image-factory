@@ -641,6 +641,157 @@ async fn concurrent_authentication_does_not_deadlock_on_last_used_update() -> Te
 }
 
 #[tokio::test]
+async fn standard_service_keys_inherit_effective_routes_without_widening_pinned_keys() -> TestResult
+{
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+
+    let result = async {
+        let project_id = format!("proj_{}", Uuid::new_v4().simple());
+        let owner_user_id = Uuid::new_v4();
+        insert_project(&database.setup_pool, &project_id).await?;
+        insert_project_member(&database.setup_pool, &project_id, owner_user_id).await?;
+
+        let platform_account_route = insert_codex_route(&database.setup_pool).await?;
+        let project_account_route = insert_codex_route(&database.setup_pool).await?;
+        let project_route = insert_codex_group_route_with_policy(
+            &database.setup_pool,
+            &[(project_account_route, 0, 100, 0)],
+            "quota_aware_least_loaded",
+            "allow",
+        )
+        .await?;
+        let pinned_route = insert_codex_group_route_with_policy(
+            &database.setup_pool,
+            &[(platform_account_route, 0, 100, 0)],
+            "quota_aware_least_loaded",
+            "allow",
+        )
+        .await?;
+        bind_test_console_routes(
+            &database.setup_pool,
+            &project_id,
+            platform_account_route,
+            project_route,
+        )
+        .await?;
+
+        let store =
+            PostgresApiKeyStore::new(database.pool("standard_routes").await?, test_keyring());
+        let standard = store
+            .create_service_account(
+                &project_id,
+                "Standard service",
+                ApiKeyPermissionMode::All,
+                ApiKeyPermissions::default(),
+            )
+            .await
+            .map_err(|error| format!("failed to create standard service key: {error:?}"))?;
+        assert_single_api_key_route(
+            &database.setup_pool,
+            &standard.api_key.id,
+            project_route,
+            "standard service key did not prefer the project route",
+        )
+        .await?;
+
+        let personal = store
+            .create_user_api_key(
+                &project_id,
+                owner_user_id,
+                "Project owner",
+                "owner@example.test",
+                "Personal standard key",
+                ApiKeyPermissionMode::All,
+                ApiKeyPermissions::default(),
+            )
+            .await
+            .map_err(|error| format!("failed to create personal standard key: {error:?}"))?;
+        assert_single_api_key_route(
+            &database.setup_pool,
+            &personal.id,
+            project_route,
+            "personal standard key did not prefer the project route",
+        )
+        .await?;
+
+        let pinned = store
+            .create_service_account_with_route(
+                &project_id,
+                "Pinned service",
+                pinned_route,
+                ApiKeyPermissionMode::All,
+                ApiKeyPermissions::default(),
+            )
+            .await
+            .map_err(|error| format!("failed to create pinned service key: {error:?}"))?;
+        assert_single_api_key_route(
+            &database.setup_pool,
+            &pinned.api_key.id,
+            pinned_route,
+            "pinned service key inherited a standard route",
+        )
+        .await?;
+
+        sqlx::query("DELETE FROM gateway_api_key_provider_routes WHERE api_key_id = ANY($1)")
+            .bind(vec![standard.api_key.id.clone(), personal.id.clone()])
+            .execute(&database.setup_pool)
+            .await
+            .map_err(|error| format!("failed to recreate pre-migration standard keys: {error}"))?;
+        sqlx::raw_sql(include_str!(
+            "../migrations/0124_standard_service_api_key_routes.sql"
+        ))
+        .execute(&database.setup_pool)
+        .await
+        .map_err(|error| format!("failed to backfill standard service routes: {error}"))?;
+        assert_single_api_key_route(
+            &database.setup_pool,
+            &standard.api_key.id,
+            project_route,
+            "migration did not backfill the standard service key",
+        )
+        .await?;
+        assert_single_api_key_route(
+            &database.setup_pool,
+            &personal.id,
+            project_route,
+            "migration did not backfill the personal standard key",
+        )
+        .await?;
+        assert_single_api_key_route(
+            &database.setup_pool,
+            &pinned.api_key.id,
+            pinned_route,
+            "migration widened the pinned service key",
+        )
+        .await?;
+
+        let authz_version: i64 =
+            sqlx::query_scalar("SELECT authz_version FROM gateway_api_keys WHERE id = $1")
+                .bind(&standard.api_key.id)
+                .fetch_one(&database.setup_pool)
+                .await
+                .map_err(|error| {
+                    format!("failed to read standard key authorization version: {error}")
+                })?;
+        let model_routing = PostgresModelRoutingStore::new(database.pool("standard_models").await?);
+        let models = model_routing
+            .list_api_key_models(&project_id, &standard.api_key.id, authz_version)
+            .await
+            .map_err(|error| format!("failed to list standard service models: {error:?}"))?;
+        require(
+            models.len() == 1 && models[0].id == "gpt-image-2",
+            format!("standard service model catalog was unexpected: {models:?}"),
+        )
+    }
+    .await;
+    let cleanup = database.cleanup().await;
+    cleanup?;
+    result
+}
+
+#[tokio::test]
 async fn routed_service_account_creation_is_atomic_and_visible_in_key_listing() -> TestResult {
     let Some(database) = TestDatabase::new().await? else {
         return Ok(());
@@ -2914,6 +3065,22 @@ async fn bind_test_api_key_route(
         inserted.rows_affected() == 1,
         "test API key route binding was not inserted".to_string(),
     )
+}
+
+async fn assert_single_api_key_route(
+    pool: &PgPool,
+    api_key_id: &str,
+    expected_route_id: Uuid,
+    message: &str,
+) -> TestResult {
+    let route_ids = sqlx::query_scalar::<_, Uuid>(
+        "SELECT route_id FROM gateway_api_key_provider_routes WHERE api_key_id = $1",
+    )
+    .bind(api_key_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|error| format!("failed to inspect API key routes: {error}"))?;
+    require(route_ids == vec![expected_route_id], message.to_string())
 }
 
 async fn bind_test_console_routes(

@@ -6,7 +6,7 @@ use std::{
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use sqlx::PgPool;
+use sqlx::{PgPool, Postgres, Transaction};
 use utoipa::ToSchema;
 use uuid::Uuid;
 
@@ -1300,6 +1300,16 @@ impl PostgresApiKeyStore {
             .execute(&mut *tx)
             .await
             .map_err(|_| ImageGatewayError::service_unavailable("provider route unavailable"))?;
+        } else {
+            bind_standard_service_routes(
+                &mut tx,
+                &key_id,
+                &service_account_id,
+                project_id,
+                &tenant_id,
+                created_at_ms,
+            )
+            .await?;
         }
 
         if let Some(actor_user_id) = actor_user_id {
@@ -1445,6 +1455,15 @@ impl PostgresApiKeyStore {
         .execute(&mut *tx)
         .await
         .map_err(|_| ImageGatewayError::service_unavailable("api key state unavailable"))?;
+        bind_standard_service_routes(
+            &mut tx,
+            &key_id,
+            &service_account_id,
+            project_id,
+            &owner.0,
+            created_at_ms,
+        )
+        .await?;
         sqlx::query(
             r#"
             INSERT INTO identity_audit_events
@@ -1561,6 +1580,68 @@ impl PostgresApiKeyStore {
             deleted: true,
         })
     }
+}
+
+async fn bind_standard_service_routes(
+    tx: &mut Transaction<'_, Postgres>,
+    api_key_id: &str,
+    service_account_id: &str,
+    project_id: &str,
+    tenant_id: &str,
+    bound_at_ms: i64,
+) -> Result<(), ImageGatewayError> {
+    sqlx::query(
+        r#"
+        WITH effective_routes AS (
+          SELECT project.provider_id, project.operation_id, project.command_schema,
+                 project.route_id, project.route_revision
+          FROM gateway_project_provider_routes project
+          JOIN provider_route_heads head
+            ON head.route_id = project.route_id
+           AND head.current_revision = project.route_revision
+           AND head.provider_id = project.provider_id
+           AND head.operation_id = project.operation_id
+           AND head.command_schema = project.command_schema
+           AND head.state = 'enabled'
+          WHERE project.project_id = $3 AND project.state = 'enabled'
+          UNION ALL
+          SELECT platform.provider_id, platform.operation_id, platform.command_schema,
+                 platform.route_id, platform.route_revision
+          FROM gateway_platform_provider_routes platform
+          JOIN provider_route_heads head
+            ON head.route_id = platform.route_id
+           AND head.current_revision = platform.route_revision
+           AND head.provider_id = platform.provider_id
+           AND head.operation_id = platform.operation_id
+           AND head.command_schema = platform.command_schema
+           AND head.state = 'enabled'
+          WHERE platform.state = 'enabled'
+            AND NOT EXISTS (
+              SELECT 1
+              FROM gateway_project_provider_routes project
+              WHERE project.project_id = $3
+                AND project.provider_id = platform.provider_id
+                AND project.operation_id = platform.operation_id
+            )
+        )
+        INSERT INTO gateway_api_key_provider_routes
+          (api_key_id, service_account_id, project_id, tenant_id,
+           provider_id, operation_id, command_schema, route_id,
+           route_revision, bound_at_ms)
+        SELECT $1, $2, $3, $4, provider_id, operation_id, command_schema,
+               route_id, route_revision, $5
+        FROM effective_routes
+        "#,
+    )
+    .bind(api_key_id)
+    .bind(service_account_id)
+    .bind(project_id)
+    .bind(tenant_id)
+    .bind(bound_at_ms)
+    .execute(&mut **tx)
+    .await
+    .map_err(|_| ImageGatewayError::service_unavailable("provider route unavailable"))?;
+    Ok(())
 }
 
 #[derive(sqlx::FromRow)]
