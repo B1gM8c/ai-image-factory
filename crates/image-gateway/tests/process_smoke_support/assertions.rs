@@ -277,7 +277,6 @@ fn assert_codex_invocation(
 ) -> TestResult {
     let expected_prefix = [
         "exec",
-        "--ephemeral",
         "--ignore-user-config",
         "--ignore-rules",
         "--disable",

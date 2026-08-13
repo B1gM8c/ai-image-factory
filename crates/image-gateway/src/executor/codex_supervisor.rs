@@ -1,6 +1,6 @@
 use std::{
     env, fs,
-    io::{Cursor, Read},
+    io::{self, BufRead, BufReader, Cursor, Read},
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::Stdio,
@@ -9,6 +9,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use image_cli_runtime::{
     CliPolicy, CliRuntime, CommandSpec, CommandSpecError, ExitClassification, OutputContract,
     OutputError, ProcessCompletion, ProcessError, RuntimeError, SpawnEvidence, SpawnObserver,
@@ -53,6 +54,11 @@ const CODEX_RUNTIME_OUTPUT_FILE: &str = "sealed-output.bin";
 const EPHEMERAL_OUTPUT_POLL_INTERVAL: Duration = Duration::from_millis(200);
 const MAX_DECODED_IMAGE_PIXELS: u64 = 16 * 1024 * 1024;
 const MAX_DECODED_IMAGE_DIMENSION: u32 = 8 * 1024;
+const MAX_CODEX_SESSION_FILES: usize = 32;
+const MAX_CODEX_SESSION_DEPTH: usize = 8;
+const MAX_CODEX_SESSION_LINE_BYTES: usize =
+    ((MAX_CODEX_RUNTIME_OUTPUT_BYTES as usize + 2) / 3) * 4 + 64 * 1024;
+const MAX_CODEX_SESSION_FILE_BYTES: u64 = (MAX_CODEX_SESSION_LINE_BYTES as u64) * 4;
 
 pub struct CodexProcessSupervisor {
     journal: Arc<FilesystemRunnerJournal>,
@@ -123,6 +129,7 @@ enum CodexOutputSource {
     Workspace,
     Runtime,
     Native,
+    Session,
 }
 
 struct CapturedCodexOutput {
@@ -605,7 +612,15 @@ async fn run_codex_child(
             )
             .await
             {
-                Ok(Some(bytes)) => ChildOutcome::Succeeded(bytes),
+                Ok(Some(output)) => {
+                    tracing::warn!(
+                        request.id = %request.output.request_id,
+                        output.index = request.output.candidate_index,
+                        codex.output.recovery_source = ?output.source,
+                        "recovered Codex output after process exit"
+                    );
+                    ChildOutcome::Succeeded(output.bytes)
+                }
                 Ok(None) => {
                     tracing::warn!(
                         request.id = %request.output.request_id,
@@ -654,24 +669,224 @@ async fn final_fallback_output(
     codex_home: &Path,
     thread_id: Option<Uuid>,
     output_format: &str,
-) -> Result<Option<Vec<u8>>, ProcessSpoolError> {
+) -> Result<Option<CapturedCodexOutput>, ProcessSpoolError> {
     if let Some(bytes) = final_workspace_output(spool, workspace_filename, output_format)? {
-        return Ok(Some(bytes));
+        return Ok(Some(CapturedCodexOutput {
+            bytes,
+            source: CodexOutputSource::Workspace,
+        }));
     }
 
     let generated_images = codex_home.join("generated_images");
     let thread_root = thread_id.map(|id| generated_images.join(id.to_string()));
     let root = thread_root.as_deref().unwrap_or(&generated_images);
-    let Some(path) = select_image_output(root, output_format) else {
+    if let Some(path) = select_image_output(root, output_format) {
+        let bytes = read_codex_output(&path)
+            .await
+            .map_err(|_| ProcessSpoolError::Unavailable)?;
+        if !valid_captured_image(&bytes, output_format) {
+            return Err(ProcessSpoolError::Integrity);
+        }
+        return Ok(Some(CapturedCodexOutput {
+            bytes,
+            source: CodexOutputSource::Native,
+        }));
+    }
+
+    recover_codex_session_output(codex_home, thread_id, output_format).await
+}
+
+async fn recover_codex_session_output(
+    codex_home: &Path,
+    thread_id: Option<Uuid>,
+    output_format: &str,
+) -> Result<Option<CapturedCodexOutput>, ProcessSpoolError> {
+    let Some(thread_id) = thread_id else {
         return Ok(None);
     };
-    let bytes = read_codex_output(&path)
-        .await
-        .map_err(|_| ProcessSpoolError::Unavailable)?;
-    if valid_captured_image(&bytes, output_format) {
-        Ok(Some(bytes))
-    } else {
-        Err(ProcessSpoolError::Integrity)
+    let codex_home = codex_home.to_path_buf();
+    let output_format = output_format.to_string();
+    tokio::task::spawn_blocking(move || {
+        recover_codex_session_output_blocking(&codex_home, thread_id, &output_format)
+    })
+    .await
+    .map_err(|_| ProcessSpoolError::Unavailable)?
+}
+
+fn recover_codex_session_output_blocking(
+    codex_home: &Path,
+    thread_id: Uuid,
+    output_format: &str,
+) -> Result<Option<CapturedCodexOutput>, ProcessSpoolError> {
+    let mut session_files = Vec::new();
+    collect_codex_session_files(
+        &codex_home.join("sessions"),
+        0,
+        thread_id,
+        &mut session_files,
+    )?;
+    session_files.sort();
+    session_files.reverse();
+
+    for path in session_files {
+        let mut options = fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW);
+        }
+        let file = options
+            .open(path)
+            .map_err(|_| ProcessSpoolError::Unavailable)?;
+        let metadata = file
+            .metadata()
+            .map_err(|_| ProcessSpoolError::Unavailable)?;
+        if !metadata.is_file() || metadata.len() > MAX_CODEX_SESSION_FILE_BYTES {
+            return Err(ProcessSpoolError::Integrity);
+        }
+        let mut reader = BufReader::new(file);
+        let mut line = Vec::new();
+        let mut recovered = None;
+        loop {
+            let bytes = read_bounded_line(&mut reader, &mut line, MAX_CODEX_SESSION_LINE_BYTES)
+                .map_err(|error| match error.kind() {
+                    io::ErrorKind::InvalidData => ProcessSpoolError::Integrity,
+                    _ => ProcessSpoolError::Unavailable,
+                })?;
+            if bytes == 0 {
+                break;
+            }
+            let Ok(event) = serde_json::from_slice::<serde_json::Value>(&line) else {
+                continue;
+            };
+            let Some(result) = codex_inline_image_result(&event) else {
+                continue;
+            };
+            let encoded = result
+                .split_once(",")
+                .filter(|(prefix, _)| {
+                    prefix.starts_with("data:image/") && prefix.ends_with(";base64")
+                })
+                .map_or(result, |(_, encoded)| encoded);
+            if encoded.len() > MAX_CODEX_SESSION_LINE_BYTES {
+                return Err(ProcessSpoolError::Integrity);
+            }
+            let bytes = STANDARD
+                .decode(encoded)
+                .map_err(|_| ProcessSpoolError::Integrity)?;
+            if bytes.is_empty() || bytes.len() as u64 > MAX_CODEX_RUNTIME_OUTPUT_BYTES {
+                return Err(ProcessSpoolError::Integrity);
+            }
+            if !valid_captured_image(&bytes, output_format) {
+                return Err(ProcessSpoolError::Integrity);
+            }
+            recovered = Some(CapturedCodexOutput {
+                bytes,
+                source: CodexOutputSource::Session,
+            });
+        }
+        if recovered.is_some() {
+            return Ok(recovered);
+        }
+    }
+    Ok(None)
+}
+
+fn collect_codex_session_files(
+    directory: &Path,
+    depth: usize,
+    thread_id: Uuid,
+    files: &mut Vec<PathBuf>,
+) -> Result<(), ProcessSpoolError> {
+    if depth > MAX_CODEX_SESSION_DEPTH {
+        return Err(ProcessSpoolError::Integrity);
+    }
+    let metadata = match fs::symlink_metadata(directory) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => return Err(ProcessSpoolError::Unavailable),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(ProcessSpoolError::Integrity);
+    }
+    let entries = fs::read_dir(directory).map_err(|_| ProcessSpoolError::Unavailable)?;
+    for entry in entries {
+        let entry = entry.map_err(|_| ProcessSpoolError::Unavailable)?;
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path).map_err(|_| ProcessSpoolError::Unavailable)?;
+        if metadata.file_type().is_symlink() {
+            continue;
+        }
+        if metadata.is_dir() {
+            collect_codex_session_files(&path, depth + 1, thread_id, files)?;
+            continue;
+        }
+        if metadata.is_file()
+            && path.extension().and_then(|value| value.to_str()) == Some("jsonl")
+            && path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .is_some_and(|name| name.contains(&thread_id.to_string()))
+        {
+            if files.len() == MAX_CODEX_SESSION_FILES {
+                return Err(ProcessSpoolError::Integrity);
+            }
+            files.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn read_bounded_line(
+    reader: &mut impl BufRead,
+    line: &mut Vec<u8>,
+    max_bytes: usize,
+) -> io::Result<usize> {
+    line.clear();
+    loop {
+        let buffer = reader.fill_buf()?;
+        if buffer.is_empty() {
+            return Ok(line.len());
+        }
+        let count = buffer
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(buffer.len(), |index| index + 1);
+        if line.len().saturating_add(count) > max_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Codex session event exceeds the bounded recovery limit",
+            ));
+        }
+        line.extend_from_slice(&buffer[..count]);
+        reader.consume(count);
+        if line.last() == Some(&b'\n') {
+            return Ok(line.len());
+        }
+    }
+}
+
+fn codex_inline_image_result(value: &serde_json::Value) -> Option<&str> {
+    match value {
+        serde_json::Value::Object(fields) => {
+            let event_type = fields
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            if matches!(event_type, "image_generation_call" | "image_generation_end") {
+                if let Some(result) = fields
+                    .get("result")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|result| !result.is_empty())
+                {
+                    return Some(result);
+                }
+            }
+            fields.values().find_map(codex_inline_image_result)
+        }
+        serde_json::Value::Array(values) => values.iter().find_map(codex_inline_image_result),
+        _ => None,
     }
 }
 
@@ -826,7 +1041,6 @@ impl CliPolicy for CodexCliPolicy {
         .require_directory(WorkingDirectory::new(&request.workspace)?);
         for argument in [
             "exec",
-            "--ephemeral",
             "--ignore-user-config",
             "--ignore-rules",
             "--disable",
@@ -1796,6 +2010,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recovers_inline_image_from_the_execution_session_before_cleanup() {
+        let fixture = CodexFixture::session_output_only();
+        let lease = fixture.lease();
+        let context = fixture.context(&lease);
+        let expected = fs::read(fixture._temp.path().join("source.png")).unwrap();
+        fixture.journal.start_or_attach(&lease).unwrap();
+        fixture.supervisor.prepare(&lease, &context).await.unwrap();
+        assert_eq!(
+            fixture.journal.commit_launch(&lease).unwrap(),
+            LaunchDecision::LaunchOnce
+        );
+        let spool = ExecutionSpool::for_lease(&fixture.journal, &lease).unwrap();
+
+        run_codex_runner_child(fixture.journal.root_path(), lease.executor_execution_id)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            spool.observe().unwrap(),
+            ProcessObservation::Succeeded(SupervisedOutput::without_provider_cost(expected))
+        );
+        let execution_root = fixture
+            .journal
+            .root_path()
+            .join(lease.executor_execution_id.simple().to_string());
+        assert!(!execution_root.join("codex-home").exists());
+        assert!(!execution_root.join("workspace").exists());
+        assert!(!execution_root.join("runtime-home").exists());
+    }
+
+    #[tokio::test]
+    async fn concurrent_session_recovery_is_scoped_to_each_execution_home() {
+        let root = TempDir::new().unwrap();
+        let first_home = root.path().join("first");
+        let second_home = root.path().join("second");
+        let first_thread = Uuid::new_v4();
+        let second_thread = Uuid::new_v4();
+        let first = png_bytes(1, 1);
+        let second = png_bytes(2, 1);
+        write_session_rollout(&first_home, first_thread, &first);
+        write_session_rollout(&second_home, second_thread, &second);
+
+        let (first_recovery, second_recovery) = tokio::join!(
+            recover_codex_session_output(&first_home, Some(first_thread), "png"),
+            recover_codex_session_output(&second_home, Some(second_thread), "png"),
+        );
+
+        let first_recovery = first_recovery.unwrap().unwrap();
+        let second_recovery = second_recovery.unwrap().unwrap();
+        assert_eq!(first_recovery.source, CodexOutputSource::Session);
+        assert_eq!(second_recovery.source, CodexOutputSource::Session);
+        assert_eq!(first_recovery.bytes, first);
+        assert_eq!(second_recovery.bytes, second);
+        assert!(
+            recover_codex_session_output(&first_home, Some(second_thread), "png")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn session_recovery_uses_the_latest_image_after_a_bounded_tool_retry() {
+        let root = TempDir::new().unwrap();
+        let thread_id = Uuid::new_v4();
+        let first = png_bytes(1, 1);
+        let retried = png_bytes(2, 1);
+        write_session_rollout_with_images(root.path(), thread_id, &[&first, &retried]);
+
+        let recovered = recover_codex_session_output(root.path(), Some(thread_id), "png")
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(recovered.source, CodexOutputSource::Session);
+        assert_eq!(recovered.bytes, retried);
+    }
+
+    #[tokio::test]
     async fn captured_output_is_never_published_after_failed_codex_exit() {
         let fixture = CodexFixture::ephemeral_workspace_output(1);
         let lease = fixture.lease();
@@ -2059,6 +2352,17 @@ mod tests {
             })
         }
 
+        fn session_output_only() -> Self {
+            Self::with_script(|invocations, image, _root| {
+                let encoded = STANDARD.encode(fs::read(image).unwrap());
+                format!(
+                    "#!/bin/sh\nset -eu\n/bin/cat >/dev/null\nprintf '1\\n' >> '{}'\nfor argument in \"$@\"; do\n  test \"$argument\" != '--ephemeral'\ndone\nthread_id='019fd9f5-badb-7dd3-8903-28ffded0ef54'\nsession_dir=\"$CODEX_HOME/sessions/2026/08/13\"\n/bin/mkdir -p \"$session_dir\"\nprintf '%s\\n' '{{\"timestamp\":\"2026-08-13T00:00:00Z\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"image_generation_end\",\"call_id\":\"ig-test\",\"status\":\"generating\",\"result\":\"{}\"}}}}' > \"$session_dir/rollout-2026-08-13T00-00-00-$thread_id.jsonl\"\nprintf '{{\"type\":\"thread.started\",\"thread_id\":\"%s\"}}\\n' \"$thread_id\"\nprintf '{{\"type\":\"item.completed\",\"item\":{{\"type\":\"image_generation_call\"}}}}\\n'\n",
+                    invocations.display(),
+                    encoded,
+                )
+            })
+        }
+
         fn changing_workspace_output() -> Self {
             Self::with_script(|invocations, image, root| {
                 let second = root.join("source-2.png");
@@ -2169,5 +2473,45 @@ mod tests {
                 inputs: Vec::new(),
             }
         }
+    }
+
+    fn png_bytes(width: u32, height: u32) -> Vec<u8> {
+        let mut bytes = Cursor::new(Vec::new());
+        image::DynamicImage::new_rgba8(width, height)
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .unwrap();
+        bytes.into_inner()
+    }
+
+    fn write_session_rollout(codex_home: &Path, thread_id: Uuid, image: &[u8]) {
+        write_session_rollout_with_images(codex_home, thread_id, &[image]);
+    }
+
+    fn write_session_rollout_with_images(codex_home: &Path, thread_id: Uuid, images: &[&[u8]]) {
+        let directory = codex_home.join("sessions/2026/08/13");
+        fs::create_dir_all(&directory).unwrap();
+        let events = images
+            .iter()
+            .enumerate()
+            .map(|(index, image)| {
+                serde_json::json!({
+                    "timestamp": "2026-08-13T00:00:00Z",
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "image_generation_end",
+                        "call_id": format!("ig-test-{index}"),
+                        "status": "generating",
+                        "result": STANDARD.encode(image),
+                    }
+                })
+                .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(
+            directory.join(format!("rollout-2026-08-13T00-00-00-{thread_id}.jsonl")),
+            format!("{events}\n"),
+        )
+        .unwrap();
     }
 }
