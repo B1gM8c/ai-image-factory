@@ -23,10 +23,12 @@ VALIDATION_UNITS=(
 )
 REQUIRED_UNITS=(
   ai-image-factory-reconcilerd.service
-  ai-image-factory-executord@default.service
   ai-image-factory-reducerd.service
-  ai-image-factory-workerd.service
   "${VALIDATION_UNITS[@]}"
+)
+readonly LEGACY_EXECUTION_UNITS=(
+  ai-image-factory-executord@default.service
+  ai-image-factory-workerd.service
 )
 readonly OPTIONAL_UNITS=(
   ai-image-factory-provider-submitd.service
@@ -55,11 +57,15 @@ append_required_unit() {
 if [[ "$PROCESS_SCOPE" == "validation" ]]; then
   REQUIRED_UNITS=("${VALIDATION_UNITS[@]}")
 else
+  for unit in "${LEGACY_EXECUTION_UNITS[@]}"; do
+    if systemctl is-enabled --quiet "$unit"; then
+      append_required_unit "$unit"
+    fi
+  done
   while IFS= read -r unit; do
     case "$unit" in
       ai-image-factory-executord@*.service)
-        [[ "$unit" == "ai-image-factory-executord@default.service" ]] \
-          || append_required_unit "$unit"
+        append_required_unit "$unit"
         ;;
       ai-image-factory-workerd@*.service)
         append_required_unit "$unit"

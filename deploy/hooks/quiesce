@@ -62,6 +62,9 @@ systemctl stop ai-image-factory-processes.target "${PROCESS_UNITS[@]}"
 for unit in ai-image-factory-processes.target "${PROCESS_UNITS[@]}"; do
   active_state="$(systemctl show "$unit" --property=ActiveState --value)"
   main_pid="$(systemctl show "$unit" --property=MainPID --value)"
+  # systemd targets do not have a process and report an empty MainPID rather
+  # than zero. Treat only that empty value as the process-free state.
+  [[ -n "$main_pid" ]] || main_pid=0
   if [[ "$active_state" != "inactive" && "$active_state" != "failed" ]] \
     || [[ "$main_pid" != "0" ]]; then
     printf 'application process unit did not stop cleanly: %s state=%s pid=%s\n' \

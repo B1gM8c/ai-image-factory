@@ -15,10 +15,22 @@ cat >"$TEST_ROOT/bin/systemctl" <<'EOF'
 #!/bin/bash
 phase="$(cat "$MOCK_PHASE_FILE")"
 case "$1" in
-  list-unit-files | list-units)
+  list-unit-files)
+    if [[ "${MOCK_MANAGED_UNITS:-false}" == true ]]; then
+      printf '%s enabled\n' \
+        ai-image-factory-executord@managed.codex.images.test.service \
+        ai-image-factory-workerd@managed.codex.images.test.service
+    fi
+    exit 0
+    ;;
+  list-units)
     exit 0
     ;;
   is-enabled)
+    if [[ "${MOCK_LEGACY_ENABLED:-false}" == true ]] \
+      && [[ "${@: -1}" == ai-image-factory-workerd.service ]]; then
+      exit 0
+    fi
     exit 1
     ;;
   is-active)
@@ -34,6 +46,9 @@ case "$1" in
       MainPID)
         if [[ "${MOCK_QUIESCE_STUCK_UNIT:-}" == "$unit" ]]; then
           echo 999
+        elif [[ "${MOCK_TARGET_EMPTY_PID:-false}" == true \
+          && "$unit" == ai-image-factory-processes.target ]]; then
+          echo
         elif [[ "${MOCK_QUIESCE_MODE:-false}" == true ]]; then
           echo 0
         elif [[ "${MOCK_UNSTABLE:-false}" == true && "$phase" == stable-window ]]; then
@@ -115,13 +130,27 @@ run_quiesce() {
 run_verify >/dev/null
 [[ "$(wc -l <"$TEST_ROOT/gate.log" | tr -d ' ')" == 2 ]]
 grep -Fq 'ai-image-factory-gateway.service' "$TEST_ROOT/gate.log"
+if grep -Fq 'ai-image-factory-executord@default.service' "$TEST_ROOT/gate.log" \
+  || grep -Fq 'ai-image-factory-workerd.service' "$TEST_ROOT/gate.log"; then
+  echo "disabled legacy execution units must not be required" >&2
+  exit 1
+fi
+
+: >"$TEST_ROOT/gate.log"
+run_verify MOCK_MANAGED_UNITS=true >/dev/null
+grep -Fq 'ai-image-factory-executord@managed.codex.images.test.service' "$TEST_ROOT/gate.log"
+grep -Fq 'ai-image-factory-workerd@managed.codex.images.test.service' "$TEST_ROOT/gate.log"
+
+: >"$TEST_ROOT/gate.log"
+run_verify MOCK_LEGACY_ENABLED=true >/dev/null
+grep -Fq 'ai-image-factory-workerd.service' "$TEST_ROOT/gate.log"
 
 if run_verify MOCK_UNSTABLE=true >/dev/null 2>&1; then
   echo "expected a PID/restart change during the stability window to fail" >&2
   exit 1
 fi
 
-run_quiesce >/dev/null
+run_quiesce MOCK_TARGET_EMPTY_PID=true >/dev/null
 grep -Fq 'stop ai-image-factory-processes.target' "$TEST_ROOT/stop.log"
 
 if run_quiesce MOCK_QUIESCE_STUCK_UNIT=ai-image-factory-workerd.service >/dev/null 2>&1; then
