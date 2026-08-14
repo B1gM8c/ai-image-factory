@@ -37,8 +37,15 @@ if [[ "$PROCESS_SCOPE" == "validation" ]]; then
   REQUIRED_UNITS=("${VALIDATION_UNITS[@]}")
 else
   while IFS= read -r unit; do
-    [[ "$unit" == ai-image-factory-executord@*.service ]] || continue
-    [[ "$unit" == "ai-image-factory-executord@default.service" ]] || REQUIRED_UNITS+=("$unit")
+    case "$unit" in
+      ai-image-factory-executord@*.service)
+        [[ "$unit" == "ai-image-factory-executord@default.service" ]] \
+          || REQUIRED_UNITS+=("$unit")
+        ;;
+      ai-image-factory-workerd@*.service)
+        REQUIRED_UNITS+=("$unit")
+        ;;
+    esac
   done < <(
     systemctl list-unit-files \
       --type=service \
@@ -46,6 +53,7 @@ else
       --no-legend \
       --plain \
       'ai-image-factory-executord@*.service' \
+      'ai-image-factory-workerd@*.service' \
       | awk '{print $1}'
   )
 fi
@@ -63,7 +71,12 @@ for ((attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1)); do
     && curl --fail --silent --show-error "${GATEWAY_BASE_URL}/readyz" >/dev/null \
     && curl --fail --silent --show-error "${GATEWAY_BASE_URL}/openapi.json" >/dev/null \
     && curl --fail --silent --show-error "${ADMIN_BASE_URL}/login" >/dev/null; then
-    "$RUNTIME_GATE"
+    RELEASE_UNITS=()
+    for unit in "${REQUIRED_UNITS[@]}"; do
+      [[ "$unit" == "ai-image-factory-admin.service" ]] || RELEASE_UNITS+=("$unit")
+    done
+    AIF_VERIFY_RELEASE_UNITS="$(IFS=,; printf '%s' "${RELEASE_UNITS[*]}")" \
+      "$RUNTIME_GATE"
     if [[ "$PROCESS_SCOPE" == "full" ]]; then
       for unit in "${OPTIONAL_UNITS[@]}"; do
         if systemctl is-enabled --quiet "$unit" && ! systemctl is-active --quiet "$unit"; then

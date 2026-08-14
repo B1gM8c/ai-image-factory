@@ -16,8 +16,11 @@ PROCESS_UNITS=(
 )
 
 while IFS= read -r unit; do
-  [[ "$unit" == ai-image-factory-executord@*.service ]] || continue
-  PROCESS_UNITS+=("$unit")
+  case "$unit" in
+    ai-image-factory-executord@*.service | ai-image-factory-workerd@*.service)
+      PROCESS_UNITS+=("$unit")
+      ;;
+  esac
 done < <(
   systemctl list-units \
     --type=service \
@@ -25,6 +28,7 @@ done < <(
     --no-legend \
     --plain \
     'ai-image-factory-executord@*.service' \
+    'ai-image-factory-workerd@*.service' \
     | awk '{print $1}'
 )
 

@@ -24,7 +24,7 @@ readonly VALIDATION_UNITS=(
   ai-image-factory-gateway.service
   ai-image-factory-admin.service
 )
-REQUIRED_EXECUTOR_UNITS=(
+REQUIRED_PROFILE_UNITS=(
   ai-image-factory-executord@default.service
 )
 readonly REQUIRED_PREFIX_UNITS=(
@@ -42,9 +42,15 @@ readonly OPTIONAL_UNITS=(
 
 if [[ "$PROCESS_SCOPE" == "full" ]]; then
   while IFS= read -r unit; do
-    [[ "$unit" == ai-image-factory-executord@*.service ]] || continue
-    [[ "$unit" == "ai-image-factory-executord@default.service" ]] \
-      || REQUIRED_EXECUTOR_UNITS+=("$unit")
+    case "$unit" in
+      ai-image-factory-executord@*.service)
+        [[ "$unit" == "ai-image-factory-executord@default.service" ]] \
+          || REQUIRED_PROFILE_UNITS+=("$unit")
+        ;;
+      ai-image-factory-workerd@*.service)
+        REQUIRED_PROFILE_UNITS+=("$unit")
+        ;;
+    esac
   done < <(
     systemctl list-unit-files \
       --type=service \
@@ -52,6 +58,7 @@ if [[ "$PROCESS_SCOPE" == "full" ]]; then
       --no-legend \
       --plain \
       'ai-image-factory-executord@*.service' \
+      'ai-image-factory-workerd@*.service' \
       | awk '{print $1}'
   )
 fi
@@ -64,7 +71,7 @@ if [[ "$START_MODE" == "gate" ]]; then
   fi
 
   systemctl --job-mode=ignore-dependencies start "${REQUIRED_PREFIX_UNITS[@]}"
-  systemctl --job-mode=ignore-dependencies start "${REQUIRED_EXECUTOR_UNITS[@]}"
+  systemctl --job-mode=ignore-dependencies start "${REQUIRED_PROFILE_UNITS[@]}"
   systemctl --job-mode=ignore-dependencies start "${REQUIRED_SUFFIX_UNITS[0]}"
   systemctl --job-mode=ignore-dependencies start "${REQUIRED_SUFFIX_UNITS[1]}"
   for unit in "${OPTIONAL_UNITS[@]}"; do
@@ -89,7 +96,7 @@ fi
 
 "${START_COMMAND[@]}" \
   "${REQUIRED_PREFIX_UNITS[@]}" \
-  "${REQUIRED_EXECUTOR_UNITS[@]}" \
+  "${REQUIRED_PROFILE_UNITS[@]}" \
   "${REQUIRED_SUFFIX_UNITS[@]}" \
   "${VALIDATION_UNITS[@]}"
 for unit in "${OPTIONAL_UNITS[@]}"; do

@@ -12,6 +12,7 @@ readonly GATEWAY_UNIT="${AIF_VERIFY_GATEWAY_UNIT:-ai-image-factory-gateway.servi
 readonly GATEWAY_BASE_URL="${AIF_VERIFY_GATEWAY_BASE_URL:-http://127.0.0.1:8787}"
 readonly CURRENT_LINK="${AIF_VERIFY_CURRENT_RELEASE_LINK:-/opt/ai-image-factory/current}"
 readonly PROC_ROOT="${AIF_VERIFY_PROC_ROOT:-/proc}"
+readonly RELEASE_UNITS="${AIF_VERIFY_RELEASE_UNITS:-${GATEWAY_UNIT}}"
 readonly NGINX_CONFIG="${AIF_VERIFY_NGINX_CONFIG_PATH:-}"
 readonly LEGACY_UNITS="${AIF_VERIFY_LEGACY_GATEWAY_UNITS:-gpt-image-2-gateway.service}"
 readonly FORBIDDEN_NGINX_PORTS="${AIF_VERIFY_FORBIDDEN_NGINX_PORTS:-}"
@@ -46,6 +47,20 @@ case "$gateway_exe" in
   "${release_root}"/*) ;;
   *) die "gateway executable is outside the current release: ${gateway_exe}" ;;
 esac
+
+while IFS= read -r release_unit; do
+  [[ -n "$release_unit" ]] || continue
+  unit_pid="$(systemctl show "$release_unit" --property=MainPID --value)"
+  [[ "$unit_pid" =~ ^[1-9][0-9]*$ ]] \
+    || die "release unit has no live MainPID: ${release_unit}"
+  [[ -d "${PROC_ROOT}/${unit_pid}" ]] \
+    || die "release unit MainPID is not running: ${release_unit} ${unit_pid}"
+  unit_exe="$(readlink -f "${PROC_ROOT}/${unit_pid}/exe")"
+  case "$unit_exe" in
+    "${release_root}"/*) ;;
+    *) die "release unit executable is outside the current release: ${release_unit} ${unit_exe}" ;;
+  esac
+done < <(printf '%s\n' "$RELEASE_UNITS" | tr ',' '\n')
 
 while IFS= read -r legacy_unit; do
   [[ -n "$legacy_unit" ]] || continue

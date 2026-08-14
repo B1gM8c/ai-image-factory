@@ -10,15 +10,19 @@ trap 'rm -rf -- "$TEST_ROOT"' EXIT
 mkdir -p \
   "$TEST_ROOT/bin" \
   "$TEST_ROOT/proc/101" \
+  "$TEST_ROOT/proc/102" \
   "$TEST_ROOT/releases/v1/bin"
 ln -s "$TEST_ROOT/releases/v1" "$TEST_ROOT/current"
 ln -s "$TEST_ROOT/releases/v1/bin/gpt-image-2-gateway" "$TEST_ROOT/proc/101/exe"
+ln -s "$TEST_ROOT/releases/v1/bin/workerd" "$TEST_ROOT/proc/102/exe"
 : >"$TEST_ROOT/releases/v1/bin/gpt-image-2-gateway"
+: >"$TEST_ROOT/releases/v1/bin/workerd"
 
 cat >"$TEST_ROOT/bin/systemctl" <<'EOF'
 #!/bin/bash
 case "$*" in
   "show ai-image-factory-gateway.service --property=MainPID --value") echo "${MOCK_MAIN_PID:-101}" ;;
+  "show ai-image-factory-workerd@managed.service --property=MainPID --value") echo 102 ;;
   "show gpt-image-2-gateway.service --property=LoadState --value") echo loaded ;;
   "is-enabled --quiet gpt-image-2-gateway.service") [[ "${MOCK_LEGACY_ENABLED:-false}" == true ]] ;;
   "is-active --quiet gpt-image-2-gateway.service") [[ "${MOCK_LEGACY_ACTIVE:-false}" == true ]] ;;
@@ -46,6 +50,7 @@ run_gate() {
     AIF_VERIFY_GATEWAY_BASE_URL=http://127.0.0.1:8789 \
     AIF_VERIFY_CURRENT_RELEASE_LINK="$TEST_ROOT/current" \
     AIF_VERIFY_PROC_ROOT="$TEST_ROOT/proc" \
+    AIF_VERIFY_RELEASE_UNITS=ai-image-factory-gateway.service,ai-image-factory-workerd@managed.service \
     AIF_VERIFY_NGINX_CONFIG_PATH="$TEST_ROOT/nginx.conf" \
     AIF_VERIFY_FORBIDDEN_NGINX_PORTS=8787 \
     "$@" \
@@ -67,6 +72,14 @@ if run_gate >/dev/null 2>&1; then
   exit 1
 fi
 ln -sfn "$TEST_ROOT/releases/v1/bin/gpt-image-2-gateway" "$TEST_ROOT/proc/101/exe"
+
+: >"$TEST_ROOT/releases/v0/bin/workerd"
+ln -sfn "$TEST_ROOT/releases/v0/bin/workerd" "$TEST_ROOT/proc/102/exe"
+if run_gate >/dev/null 2>&1; then
+  echo "expected stale worker executable to fail" >&2
+  exit 1
+fi
+ln -sfn "$TEST_ROOT/releases/v1/bin/workerd" "$TEST_ROOT/proc/102/exe"
 
 if run_gate MOCK_LEGACY_ACTIVE=true >/dev/null 2>&1; then
   echo "expected active legacy unit to fail" >&2
