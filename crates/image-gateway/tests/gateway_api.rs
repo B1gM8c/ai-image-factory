@@ -500,6 +500,19 @@ async fn liveness_stays_dependency_free_and_in_memory_readiness_is_empty() {
                 "active": 0,
                 "draining": 0,
                 "blocked": 0
+            },
+            "execution_queue": {
+                "ready_work_items": 0,
+                "active_work_leases": 0,
+                "oldest_ready_work_age_ms": 0,
+                "stalled_work_profiles": 0,
+                "prepared_executions": 0,
+                "active_executor_leases": 0,
+                "oldest_prepared_execution_age_ms": 0,
+                "stalled_executor_profiles": 0,
+                "ready_reductions": 0,
+                "active_reducer_leases": 0,
+                "oldest_ready_reduction_age_ms": 0
             }
         })
     );
