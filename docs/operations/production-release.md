@@ -79,7 +79,8 @@ the native platform binary, not the Node launcher.
 ## Migration And Startup Order
 
 1. Stop new admission at the reverse proxy.
-2. Allow active HTTP requests and leased work to drain.
+2. Allow active HTTP requests and leased work to drain, then prove every
+   business process unit is `inactive` or `failed` with `MainPID=0`.
 3. Verify there are no unsafe `running` migrations or unresolved manual repair
    operations.
 4. Back up PostgreSQL and the artifact root as one logical recovery point.
@@ -95,7 +96,11 @@ the native platform binary, not the Node launcher.
 13. Pass the release gates below, then reopen admission.
 
 Every daemon verifies the migration version at startup and must fail closed on
-schema drift.
+schema drift. Do not run a migration while an old worker or executor can still
+restart. After migration, admission stays closed until the new process set has
+held stable MainPID, restart count, release path, and health/readiness results
+for the configured verification window. A failed post-migration activation is
+a recovery event; it must not leave the gateway accepting new work.
 
 ## Release Gates
 
@@ -124,10 +129,17 @@ curl --fail http://127.0.0.1:8787/readyz
 curl --fail http://127.0.0.1:8787/openapi.json >/dev/null
 ```
 
+`/readyz` fails closed when an aged work or executor backlog has no valid
+consumer lease for its own execution profile, or when the global reducer queue
+has no valid reducer lease. The response exposes only bounded aggregate counts,
+not profile identities. `GATEWAY_READINESS_STALL_THRESHOLD_SECS` controls the
+age threshold and defaults to 60 seconds.
+
 `/readyz` alone is insufficient. Before opening traffic, verify:
 
 - the `provider_profiles` aggregate covers remote-task runtime profiles only;
-  validate local Codex/Grok executor ownership and capacity separately;
+  local durable consumer state is reported under `execution_queue`;
+- `stalled_work_profiles` and `stalled_executor_profiles` are both zero;
 - ready-work depth and oldest age are bounded;
 - expired `leased` work is being reclaimed by `reconcilerd`;
 - no `running` work is past its lease without becoming `uncertain`;
@@ -140,6 +152,10 @@ curl --fail http://127.0.0.1:8787/openapi.json >/dev/null
 - every sealed ledger transaction is balanced;
 - artifact metadata resolves to an existing object with matching size and hash;
 - webhook backlog is bounded when webhooks are enabled.
+
+Configured account concurrency is an upper bound, not evidence of live
+capacity. For example, `desired_max_concurrency=20` with zero workerd or
+executord leases has effective capacity zero and must not be reported as ready.
 
 Run one low-cost canary through the public API and one through Batch. The Batch
 canary must prove:
@@ -162,6 +178,15 @@ Browser gates:
 - overview, API logs, usage, keys, images, videos, Batch, and operator pages;
 - desktop and `390x844` mobile layouts without horizontal overflow;
 - no browser console errors during the canary workflow.
+
+## Client Timeout And Late Completion
+
+An HTTP client timeout is not a durable job cancellation. Clients must submit a
+stable `Idempotency-Key` and reconcile the same operation after reconnecting;
+retrying with a different key may create duplicate provider work. Refund or
+downstream failure should become final only after the Factory terminal outcome
+is known. A late successful terminal outcome remains authoritative for artifact
+and customer settlement even when the original HTTP connection has closed.
 
 ## Batch Limits
 

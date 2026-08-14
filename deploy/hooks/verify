@@ -1,11 +1,12 @@
 #!/bin/bash
 set -Eeuo pipefail
 IFS=$'\n\t'
-export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH="${AIF_VERIFY_COMMAND_PATH:-/usr/sbin:/usr/bin:/sbin:/bin}"
 
 readonly GATEWAY_BASE_URL="${AIF_VERIFY_GATEWAY_BASE_URL:-http://127.0.0.1:8787}"
 readonly ADMIN_BASE_URL="${AIF_VERIFY_ADMIN_BASE_URL:-http://127.0.0.1:3010}"
 readonly MAX_ATTEMPTS="${AIF_VERIFY_MAX_ATTEMPTS:-60}"
+readonly STABILITY_SECONDS="${AIF_VERIFY_STABILITY_SECONDS:-12}"
 readonly PROCESS_SCOPE="${AIF_UPDATE_PROCESS_SCOPE:-full}"
 readonly RUNTIME_GATE="${AIF_VERIFY_GATEWAY_RUNTIME_GATE:-/usr/libexec/ai-image-factory/hooks/verify-gateway-runtime}"
 case "$PROCESS_SCOPE" in
@@ -33,6 +34,24 @@ readonly OPTIONAL_UNITS=(
   ai-image-factory-webhookd.service
 )
 
+append_required_unit() {
+  local candidate existing
+  candidate="$1"
+  for existing in "${REQUIRED_UNITS[@]}"; do
+    [[ "$existing" == "$candidate" ]] && return
+  done
+  REQUIRED_UNITS+=("$candidate")
+}
+
+[[ "$MAX_ATTEMPTS" =~ ^[1-9][0-9]*$ ]] || {
+  printf 'AIF_VERIFY_MAX_ATTEMPTS must be a positive integer\n' >&2
+  exit 1
+}
+[[ "$STABILITY_SECONDS" =~ ^[0-9]+$ ]] || {
+  printf 'AIF_VERIFY_STABILITY_SECONDS must be a non-negative integer\n' >&2
+  exit 1
+}
+
 if [[ "$PROCESS_SCOPE" == "validation" ]]; then
   REQUIRED_UNITS=("${VALIDATION_UNITS[@]}")
 else
@@ -40,10 +59,10 @@ else
     case "$unit" in
       ai-image-factory-executord@*.service)
         [[ "$unit" == "ai-image-factory-executord@default.service" ]] \
-          || REQUIRED_UNITS+=("$unit")
+          || append_required_unit "$unit"
         ;;
       ai-image-factory-workerd@*.service)
-        REQUIRED_UNITS+=("$unit")
+        append_required_unit "$unit"
         ;;
     esac
   done < <(
@@ -58,33 +77,70 @@ else
   )
 fi
 
-for ((attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1)); do
-  ready=true
-  for unit in "${REQUIRED_UNITS[@]}"; do
-    if ! systemctl is-active --quiet "$unit"; then
-      ready=false
-      break
+if [[ "$PROCESS_SCOPE" == "full" ]]; then
+  for unit in "${OPTIONAL_UNITS[@]}"; do
+    if systemctl is-enabled --quiet "$unit"; then
+      append_required_unit "$unit"
     fi
   done
-  if "$ready" \
-    && curl --fail --silent --show-error "${GATEWAY_BASE_URL}/healthz" >/dev/null \
+fi
+
+release_units() {
+  local unit
+  for unit in "${REQUIRED_UNITS[@]}"; do
+    [[ "$unit" == "ai-image-factory-admin.service" ]] || printf '%s\n' "$unit"
+  done
+}
+
+check_services_and_http() {
+  local unit
+  for unit in "${REQUIRED_UNITS[@]}"; do
+    systemctl is-active --quiet "$unit" || return 1
+  done
+  curl --fail --silent --show-error "${GATEWAY_BASE_URL}/healthz" >/dev/null \
     && curl --fail --silent --show-error "${GATEWAY_BASE_URL}/readyz" >/dev/null \
     && curl --fail --silent --show-error "${GATEWAY_BASE_URL}/openapi.json" >/dev/null \
-    && curl --fail --silent --show-error "${ADMIN_BASE_URL}/login" >/dev/null; then
-    RELEASE_UNITS=()
-    for unit in "${REQUIRED_UNITS[@]}"; do
-      [[ "$unit" == "ai-image-factory-admin.service" ]] || RELEASE_UNITS+=("$unit")
-    done
-    AIF_VERIFY_RELEASE_UNITS="$(IFS=,; printf '%s' "${RELEASE_UNITS[*]}")" \
-      "$RUNTIME_GATE"
-    if [[ "$PROCESS_SCOPE" == "full" ]]; then
-      for unit in "${OPTIONAL_UNITS[@]}"; do
-        if systemctl is-enabled --quiet "$unit" && ! systemctl is-active --quiet "$unit"; then
-          printf 'enabled optional unit is not active: %s\n' "$unit" >&2
-          exit 1
-        fi
-      done
+    && curl --fail --silent --show-error "${ADMIN_BASE_URL}/login" >/dev/null
+}
+
+unit_snapshot() {
+  local unit main_pid restarts
+  for unit in "${REQUIRED_UNITS[@]}"; do
+    main_pid="$(systemctl show "$unit" --property=MainPID --value)"
+    restarts="$(systemctl show "$unit" --property=NRestarts --value)"
+    [[ "$main_pid" =~ ^[1-9][0-9]*$ ]] || return 1
+    [[ "$restarts" =~ ^[0-9]+$ ]] || return 1
+    printf '%s|%s|%s\n' "$unit" "$main_pid" "$restarts"
+  done
+}
+
+run_runtime_gate() {
+  local release_csv
+  release_csv="$(release_units | paste -sd, -)"
+  AIF_VERIFY_RELEASE_UNITS="$release_csv" "$RUNTIME_GATE"
+}
+
+for ((attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1)); do
+  if check_services_and_http && run_runtime_gate; then
+    first_snapshot="$(unit_snapshot)" || {
+      printf 'release unit snapshot is incomplete\n' >&2
+      exit 1
+    }
+    sleep "$STABILITY_SECONDS"
+    if ! check_services_and_http || ! run_runtime_gate; then
+      printf 'release became unhealthy during the stability window\n' >&2
+      exit 1
     fi
+    second_snapshot="$(unit_snapshot)" || {
+      printf 'release unit snapshot is incomplete after the stability window\n' >&2
+      exit 1
+    }
+    if [[ "$first_snapshot" != "$second_snapshot" ]]; then
+      printf 'release process identity or restart count changed during the stability window\n' >&2
+      diff -u <(printf '%s\n' "$first_snapshot") <(printf '%s\n' "$second_snapshot") >&2 || true
+      exit 1
+    fi
+    printf 'release passed continuous stability checks for %s seconds\n' "$STABILITY_SECONDS"
     exit 0
   fi
   sleep 2

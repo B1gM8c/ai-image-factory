@@ -91,17 +91,20 @@ jobs:
           shellcheck \
             scripts/package-release.sh \
             scripts/test-gateway-runtime-gate.sh \
+            scripts/test-release-process-hooks.sh \
             deploy/hooks/* \
             deploy/install-release \
             deploy/upgrade-updater
           bash -n \
             scripts/package-release.sh \
             scripts/test-gateway-runtime-gate.sh \
+            scripts/test-release-process-hooks.sh \
             deploy/hooks/* \
             deploy/install-release \
             deploy/upgrade-updater
 
           scripts/test-gateway-runtime-gate.sh
+          scripts/test-release-process-hooks.sh
 
           sudo install -d \
             /etc/ai-image-factory \

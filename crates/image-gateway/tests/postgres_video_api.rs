@@ -452,6 +452,7 @@ fn config() -> AppConfig {
         queue_timeout: Duration::from_secs(5),
         request_timeout: Duration::from_secs(30),
         readiness_timeout: Duration::from_millis(500),
+        readiness_stall_threshold: Duration::from_secs(60),
         max_upload_bytes: 1024 * 1024,
         proxy: ProxyConfig::default(),
         codex_home: None,

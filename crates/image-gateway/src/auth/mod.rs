@@ -279,6 +279,7 @@ mod tests {
             queue_timeout: Duration::from_secs(1),
             request_timeout: Duration::from_secs(1),
             readiness_timeout: Duration::from_millis(500),
+            readiness_stall_threshold: Duration::from_secs(60),
             max_upload_bytes: 1024,
             proxy: Default::default(),
             codex_home: None,

@@ -11,6 +11,8 @@ use uuid::Uuid;
 
 const DEFAULT_READINESS_TIMEOUT_MS: u64 = 500;
 const MAX_READINESS_TIMEOUT_MS: u64 = 60_000;
+const DEFAULT_READINESS_STALL_THRESHOLD_SECS: u64 = 60;
+const MAX_READINESS_STALL_THRESHOLD_SECS: u64 = 3_600;
 const DEFAULT_UNBOUNDED_DATABASE_QUOTA: u32 = i32::MAX as u32;
 
 #[derive(Clone, Debug)]
@@ -33,6 +35,7 @@ pub struct AppConfig {
     pub queue_timeout: Duration,
     pub request_timeout: Duration,
     pub readiness_timeout: Duration,
+    pub readiness_stall_threshold: Duration,
     pub max_upload_bytes: usize,
     pub proxy: ProxyConfig,
     pub codex_home: Option<String>,
@@ -135,6 +138,10 @@ impl AppConfig {
                 DEFAULT_READINESS_TIMEOUT_MS,
                 MAX_READINESS_TIMEOUT_MS,
             )?,
+            readiness_stall_threshold: Duration::from_secs(env_u64(
+                "GATEWAY_READINESS_STALL_THRESHOLD_SECS",
+                DEFAULT_READINESS_STALL_THRESHOLD_SECS,
+            )?),
             max_upload_bytes: env_usize("GATEWAY_MAX_UPLOAD_BYTES", 32 * 1024 * 1024)?,
             proxy: ProxyConfig {
                 http_proxy: env::var("GATEWAY_HTTP_PROXY")
@@ -198,6 +205,14 @@ impl AppConfig {
         {
             return Err(ImageGatewayError::config(
                 "GATEWAY_READINESS_TIMEOUT_MS must be between 1 and 60000",
+            ));
+        }
+        if self.readiness_stall_threshold.is_zero()
+            || self.readiness_stall_threshold
+                > Duration::from_secs(MAX_READINESS_STALL_THRESHOLD_SECS)
+        {
+            return Err(ImageGatewayError::config(
+                "GATEWAY_READINESS_STALL_THRESHOLD_SECS must be between 1 and 3600",
             ));
         }
         Ok(())
@@ -365,6 +380,7 @@ mod tests {
             queue_timeout: Duration::from_secs(1),
             request_timeout: Duration::from_secs(1),
             readiness_timeout: Duration::from_millis(DEFAULT_READINESS_TIMEOUT_MS),
+            readiness_stall_threshold: Duration::from_secs(DEFAULT_READINESS_STALL_THRESHOLD_SECS),
             max_upload_bytes: 1024,
             proxy: ProxyConfig::default(),
             codex_home: None,
@@ -452,6 +468,21 @@ mod tests {
                 .validate_startup()
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn readiness_stall_threshold_is_positive_and_operationally_bounded() {
+        for threshold in [
+            Duration::ZERO,
+            Duration::from_secs(MAX_READINESS_STALL_THRESHOLD_SECS + 1),
+        ] {
+            let mut config = config_for_bind("127.0.0.1:8787", Some("token"));
+            config.readiness_stall_threshold = threshold;
+
+            let error = format!("{:?}", config.validate_startup().unwrap_err());
+
+            assert!(error.contains("GATEWAY_READINESS_STALL_THRESHOLD_SECS"));
+        }
     }
 
     #[test]

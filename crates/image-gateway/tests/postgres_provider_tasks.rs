@@ -473,6 +473,60 @@ async fn runtime_readiness_summary_is_bounded_and_preserves_status_precedence() 
 }
 
 #[tokio::test]
+async fn execution_queue_readiness_is_profile_scoped() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        seed_dreamina_execution_profile(&database.pool).await?;
+        let stalled = seed_work_lease(&database.pool, "stalled-profile-worker").await?;
+        let active = seed_work_lease(&database.pool, "active-profile-worker").await?;
+        let now = database_now(&database.pool).await?;
+
+        sqlx::query(
+            r#"
+            UPDATE work_items
+            SET execution_profile_id = $2, state = 'ready',
+                available_at_ms = $3, lease_owner = NULL,
+                lease_expires_at_ms = NULL, updated_at_ms = $4
+            WHERE work_item_id = $1
+            "#,
+        )
+        .bind(stalled.work_item_id)
+        .bind(PROFILE_ID)
+        .bind(now - 120_000)
+        .bind(now)
+        .execute(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        sqlx::query(
+            "UPDATE work_items SET execution_profile_id = $2, updated_at_ms = $3 WHERE work_item_id = $1",
+        )
+        .bind(active.work_item_id)
+        .bind(DREAMINA_PROFILE_ID)
+        .bind(now)
+        .execute(&database.pool)
+        .await
+        .map_err(debug_error)?;
+
+        let summary = PostgresProviderTaskStore::new(database.pool.clone())
+            .summarize_execution_queue_readiness(60_000)
+            .await
+            .map_err(debug_error)?;
+        require(
+            summary.ready_work_items == 1
+                && summary.active_work_leases == 1
+                && summary.oldest_ready_work_age_ms >= 120_000
+                && summary.stalled_work_profiles == 1
+                && summary.is_stalled(60_000),
+            format!("unexpected profile-scoped queue readiness summary: {summary:?}"),
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
 async fn runtime_readiness_blocks_disabled_profile_dependencies() -> TestResult {
     let Some(database) = TestDatabase::new().await? else {
         return Ok(());

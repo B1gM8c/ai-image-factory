@@ -2517,8 +2517,8 @@ async fn healthz() {}
     path = "/readyz",
     tag = "System",
     responses(
-        (status = 200, description = "Gateway dependencies are ready; provider profile states are diagnostic aggregates", body = ReadinessResponse),
-        (status = 503, description = "Gateway database readiness probe failed or timed out", body = ReadinessResponse)
+        (status = 200, description = "Gateway dependencies and durable execution consumers are ready", body = ReadinessResponse),
+        (status = 503, description = "Readiness probe failed, timed out, or found an aged profile-scoped execution backlog without an active consumer lease", body = ReadinessResponse)
     )
 )]
 #[allow(dead_code)]

@@ -6,10 +6,10 @@ use crate::provider_tasks::{
 };
 
 use super::{
-    ProviderProfileReadiness, ProviderProfileReadinessStatus, ProviderProfileReadinessStore,
-    ProviderProfileReadinessSummary, ProviderRuntimeLease, ProviderRuntimeLeaseState,
-    ProviderRuntimeReadinessStore, ProviderRuntimeRegistration, ProviderRuntimeRole,
-    validate_lease, validate_registration,
+    ExecutionQueueReadinessSummary, ProviderProfileReadiness, ProviderProfileReadinessStatus,
+    ProviderProfileReadinessStore, ProviderProfileReadinessSummary, ProviderRuntimeLease,
+    ProviderRuntimeLeaseState, ProviderRuntimeReadinessStore, ProviderRuntimeRegistration,
+    ProviderRuntimeRole, validate_lease, validate_registration,
 };
 
 #[derive(FromRow)]
@@ -59,6 +59,21 @@ struct ProfileReadinessSummaryRow {
     blocked: i64,
 }
 
+#[derive(FromRow)]
+struct ExecutionQueueReadinessRow {
+    ready_work_items: i64,
+    active_work_leases: i64,
+    oldest_ready_work_age_ms: i64,
+    stalled_work_profiles: i64,
+    prepared_executions: i64,
+    active_executor_leases: i64,
+    oldest_prepared_execution_age_ms: i64,
+    stalled_executor_profiles: i64,
+    ready_reductions: i64,
+    active_reducer_leases: i64,
+    oldest_ready_reduction_age_ms: i64,
+}
+
 impl TryFrom<ProfileReadinessRow> for ProviderProfileReadiness {
     type Error = ProviderTaskStoreError;
 
@@ -98,6 +113,122 @@ impl ProviderProfileReadinessStore for PostgresProviderTaskStore {
             active: row.active,
             draining: row.draining,
             blocked: row.blocked,
+        })
+    }
+
+    async fn summarize_execution_queue_readiness(
+        &self,
+        stalled_after_ms: i64,
+    ) -> Result<ExecutionQueueReadinessSummary, ProviderTaskStoreError> {
+        let row: ExecutionQueueReadinessRow = sqlx::query_as(
+            r#"
+            WITH db_clock AS (
+                SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT AS now_ms
+            ),
+            work_profile_queue AS (
+                SELECT work.execution_profile_id,
+                       COUNT(*)::BIGINT AS ready_count,
+                       GREATEST(db_clock.now_ms - MIN(work.available_at_ms), 0)::BIGINT
+                           AS oldest_age_ms
+                FROM work_items work
+                CROSS JOIN db_clock
+                WHERE work.state = 'ready'
+                  AND work.available_at_ms <= db_clock.now_ms
+                GROUP BY work.execution_profile_id, db_clock.now_ms
+            ),
+            work_profile_leases AS (
+                SELECT work.execution_profile_id, COUNT(*)::BIGINT AS active_count
+                FROM work_items work
+                CROSS JOIN db_clock
+                WHERE work.state IN ('leased', 'running')
+                  AND work.lease_expires_at_ms > db_clock.now_ms
+                GROUP BY work.execution_profile_id
+            ),
+            executor_profile_queue AS (
+                SELECT submission.execution_profile_id,
+                       COUNT(*)::BIGINT AS prepared_count,
+                       GREATEST(db_clock.now_ms - MIN(execution.created_at_ms), 0)::BIGINT
+                           AS oldest_age_ms
+                FROM executor_executions execution
+                JOIN provider_submissions submission
+                  ON submission.executor_execution_id = execution.executor_execution_id
+                 AND submission.submission_id = execution.submission_id
+                CROSS JOIN db_clock
+                WHERE execution.state = 'prepared'
+                GROUP BY submission.execution_profile_id, db_clock.now_ms
+            ),
+            executor_profile_leases AS (
+                SELECT submission.execution_profile_id, COUNT(*)::BIGINT AS active_count
+                FROM executor_executions execution
+                JOIN provider_submissions submission
+                  ON submission.executor_execution_id = execution.executor_execution_id
+                 AND submission.submission_id = execution.submission_id
+                CROSS JOIN db_clock
+                WHERE execution.state IN ('leased', 'running')
+                  AND execution.lease_expires_at_ms > db_clock.now_ms
+                GROUP BY submission.execution_profile_id
+            )
+            SELECT
+                COALESCE((SELECT SUM(ready_count)::BIGINT FROM work_profile_queue), 0)
+                    AS ready_work_items,
+                COALESCE((SELECT SUM(active_count)::BIGINT FROM work_profile_leases), 0)
+                    AS active_work_leases,
+                COALESCE((SELECT MAX(oldest_age_ms)::BIGINT FROM work_profile_queue), 0)
+                    AS oldest_ready_work_age_ms,
+                (SELECT COUNT(*)::BIGINT
+                 FROM work_profile_queue queued
+                 WHERE queued.oldest_age_ms >= $1
+                   AND NOT EXISTS (
+                       SELECT 1
+                       FROM work_profile_leases leased
+                       WHERE leased.execution_profile_id IS NOT DISTINCT FROM
+                             queued.execution_profile_id
+                         AND leased.active_count > 0
+                   )) AS stalled_work_profiles,
+                COALESCE((SELECT SUM(prepared_count)::BIGINT FROM executor_profile_queue), 0)
+                    AS prepared_executions,
+                COALESCE((SELECT SUM(active_count)::BIGINT FROM executor_profile_leases), 0)
+                    AS active_executor_leases,
+                COALESCE((SELECT MAX(oldest_age_ms)::BIGINT FROM executor_profile_queue), 0)
+                    AS oldest_prepared_execution_age_ms,
+                (SELECT COUNT(*)::BIGINT
+                 FROM executor_profile_queue queued
+                 WHERE queued.oldest_age_ms >= $1
+                   AND NOT EXISTS (
+                       SELECT 1
+                       FROM executor_profile_leases leased
+                       WHERE leased.execution_profile_id IS NOT DISTINCT FROM
+                             queued.execution_profile_id
+                         AND leased.active_count > 0
+                   )) AS stalled_executor_profiles,
+                (SELECT COUNT(*)::BIGINT FROM executor_terminal_reductions
+                 WHERE state = 'ready') AS ready_reductions,
+                (SELECT COUNT(*)::BIGINT FROM executor_terminal_reductions, db_clock
+                 WHERE state = 'leased' AND lease_expires_at_ms > db_clock.now_ms)
+                    AS active_reducer_leases,
+                COALESCE((SELECT GREATEST(db_clock.now_ms - MIN(created_at_ms), 0)::BIGINT
+                          FROM executor_terminal_reductions, db_clock
+                          WHERE state = 'ready'
+                          GROUP BY db_clock.now_ms), 0)
+                    AS oldest_ready_reduction_age_ms
+            "#,
+        )
+        .bind(stalled_after_ms)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(unavailable)?;
+        Ok(ExecutionQueueReadinessSummary {
+            ready_work_items: row.ready_work_items,
+            active_work_leases: row.active_work_leases,
+            oldest_ready_work_age_ms: row.oldest_ready_work_age_ms,
+            stalled_work_profiles: row.stalled_work_profiles,
+            prepared_executions: row.prepared_executions,
+            active_executor_leases: row.active_executor_leases,
+            oldest_prepared_execution_age_ms: row.oldest_prepared_execution_age_ms,
+            stalled_executor_profiles: row.stalled_executor_profiles,
+            ready_reductions: row.ready_reductions,
+            active_reducer_leases: row.active_reducer_leases,
+            oldest_ready_reduction_age_ms: row.oldest_ready_reduction_age_ms,
         })
     }
 }

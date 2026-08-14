@@ -115,11 +115,43 @@ pub struct ProviderProfileReadinessSummary {
     pub blocked: i64,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct ExecutionQueueReadinessSummary {
+    pub ready_work_items: i64,
+    pub active_work_leases: i64,
+    pub oldest_ready_work_age_ms: i64,
+    pub stalled_work_profiles: i64,
+    pub prepared_executions: i64,
+    pub active_executor_leases: i64,
+    pub oldest_prepared_execution_age_ms: i64,
+    pub stalled_executor_profiles: i64,
+    pub ready_reductions: i64,
+    pub active_reducer_leases: i64,
+    pub oldest_ready_reduction_age_ms: i64,
+}
+
+impl ExecutionQueueReadinessSummary {
+    pub fn is_stalled(self, stalled_after_ms: i64) -> bool {
+        self.stalled_work_profiles > 0
+            || self.stalled_executor_profiles > 0
+            || (self.ready_reductions > 0
+                && self.active_reducer_leases == 0
+                && self.oldest_ready_reduction_age_ms >= stalled_after_ms)
+    }
+}
+
 #[async_trait]
 pub trait ProviderProfileReadinessStore: Send + Sync + 'static {
     async fn summarize_profile_readiness(
         &self,
     ) -> Result<ProviderProfileReadinessSummary, ProviderTaskStoreError>;
+
+    async fn summarize_execution_queue_readiness(
+        &self,
+        _stalled_after_ms: i64,
+    ) -> Result<ExecutionQueueReadinessSummary, ProviderTaskStoreError> {
+        Ok(ExecutionQueueReadinessSummary::default())
+    }
 }
 
 #[async_trait]
@@ -197,6 +229,31 @@ mod tests {
             role: ProviderRuntimeRole::Submit,
             runtime_owner: "provider-submitd-a".to_string(),
         }
+    }
+
+    #[test]
+    fn profile_scoped_stall_is_not_hidden_by_other_active_leases() {
+        let summary = ExecutionQueueReadinessSummary {
+            ready_work_items: 2,
+            active_work_leases: 1,
+            oldest_ready_work_age_ms: 60_000,
+            stalled_work_profiles: 1,
+            ..ExecutionQueueReadinessSummary::default()
+        };
+
+        assert!(summary.is_stalled(60_000));
+    }
+
+    #[test]
+    fn young_or_consumed_profile_backlog_is_not_stalled() {
+        let summary = ExecutionQueueReadinessSummary {
+            ready_work_items: 1,
+            active_work_leases: 1,
+            oldest_ready_work_age_ms: 59_999,
+            ..ExecutionQueueReadinessSummary::default()
+        };
+
+        assert!(!summary.is_stalled(60_000));
     }
 
     #[test]

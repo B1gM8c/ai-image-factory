@@ -373,10 +373,13 @@ sudo systemctl enable --now \
 The fixed hooks and site admission hooks:
 
 - close public admission before mutation and reopen it only after verification;
-- stop and resume the internal application process target;
+- stop the internal application process target and prove every enabled dynamic
+  workerd/executord is quiesced with `MainPID=0` before migration;
 - create one PostgreSQL plus artifact recovery point;
 - activate the complete new process set;
 - check required services, Gateway health/readiness/OpenAPI, and the admin login;
+- sample MainPID, `NRestarts`, and immutable release ownership twice across the
+  stability window before admission can reopen;
 - restore both PostgreSQL and artifacts after a post-migration failure.
 
 Database recovery uses a plain, clean SQL recovery image through
@@ -388,6 +391,12 @@ transaction is rolled back on cancellation so a lock cannot return to the pool.
 Both the advisory-lock probe and command-lease heartbeat have a ten-second
 deadline. A timeout cancels the current hook process group, closes admission,
 and quiesces application processes.
+
+The stability check defaults to 12 seconds and may be extended with
+`AIF_VERIFY_STABILITY_SECONDS`. Any process identity change, restart increment,
+release-path mismatch, or health/readiness failure aborts activation while
+admission remains closed. Manual migration or symlink switching outside this
+updater sequence is not a supported production release path.
 Artifact recovery extracts into
 a sibling temporary directory, verifies the archive and recovery digests, fsyncs
 the restored tree, and then switches directories with same-filesystem renames.

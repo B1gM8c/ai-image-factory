@@ -115,10 +115,26 @@ pub struct ProviderProfileReadinessCounts {
 }
 
 #[derive(Debug, Serialize, ToSchema)]
+pub struct ExecutionQueueReadinessCounts {
+    pub ready_work_items: i64,
+    pub active_work_leases: i64,
+    pub oldest_ready_work_age_ms: i64,
+    pub stalled_work_profiles: i64,
+    pub prepared_executions: i64,
+    pub active_executor_leases: i64,
+    pub oldest_prepared_execution_age_ms: i64,
+    pub stalled_executor_profiles: i64,
+    pub ready_reductions: i64,
+    pub active_reducer_leases: i64,
+    pub oldest_ready_reduction_age_ms: i64,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
 pub struct ReadinessResponse {
     #[schema(value_type = String)]
     pub status: &'static str,
     pub provider_profiles: Option<ProviderProfileReadinessCounts>,
+    pub execution_queue: Option<ExecutionQueueReadinessCounts>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]

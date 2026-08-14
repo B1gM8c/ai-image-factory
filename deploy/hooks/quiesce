@@ -1,7 +1,7 @@
 #!/bin/bash
 set -Eeuo pipefail
 IFS=$'\n\t'
-export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH="${AIF_QUIESCE_COMMAND_PATH:-/usr/sbin:/usr/bin:/sbin:/bin}"
 
 PROCESS_UNITS=(
   ai-image-factory-reconcilerd.service
@@ -15,10 +15,19 @@ PROCESS_UNITS=(
   ai-image-factory-webhookd.service
 )
 
+append_process_unit() {
+  local candidate existing
+  candidate="$1"
+  for existing in "${PROCESS_UNITS[@]}"; do
+    [[ "$existing" == "$candidate" ]] && return
+  done
+  PROCESS_UNITS+=("$candidate")
+}
+
 while IFS= read -r unit; do
   case "$unit" in
     ai-image-factory-executord@*.service | ai-image-factory-workerd@*.service)
-      PROCESS_UNITS+=("$unit")
+      append_process_unit "$unit"
       ;;
   esac
 done < <(
@@ -32,10 +41,31 @@ done < <(
     | awk '{print $1}'
 )
 
+while IFS= read -r unit; do
+  case "$unit" in
+    ai-image-factory-executord@*.service | ai-image-factory-workerd@*.service)
+      append_process_unit "$unit"
+      ;;
+  esac
+done < <(
+  systemctl list-unit-files \
+    --type=service \
+    --state=enabled \
+    --no-legend \
+    --plain \
+    'ai-image-factory-executord@*.service' \
+    'ai-image-factory-workerd@*.service' \
+    | awk '{print $1}'
+)
+
 systemctl stop ai-image-factory-processes.target "${PROCESS_UNITS[@]}"
 for unit in ai-image-factory-processes.target "${PROCESS_UNITS[@]}"; do
-  if systemctl is-active --quiet "$unit"; then
-    printf 'application process unit did not stop cleanly: %s\n' "$unit" >&2
+  active_state="$(systemctl show "$unit" --property=ActiveState --value)"
+  main_pid="$(systemctl show "$unit" --property=MainPID --value)"
+  if [[ "$active_state" != "inactive" && "$active_state" != "failed" ]] \
+    || [[ "$main_pid" != "0" ]]; then
+    printf 'application process unit did not stop cleanly: %s state=%s pid=%s\n' \
+      "$unit" "$active_state" "$main_pid" >&2
     exit 1
   fi
 done
