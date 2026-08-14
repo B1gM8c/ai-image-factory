@@ -587,7 +587,7 @@ async fn run_codex_child(
         Ok(result) => result,
         Err(_) => Err(ProcessSpoolError::Unavailable),
     };
-    match runtime_result {
+    let outcome = match runtime_result {
         Ok(result) => ChildOutcome::Succeeded(result.sink),
         Err(error) if ephemeral_capture_fallback_allowed(&error) => match captured {
             Ok(capture) if capture.output.is_some() => {
@@ -660,7 +660,56 @@ async fn run_codex_child(
             ) => ChildOutcome::Uncertain("codex_ephemeral_output_unavailable"),
         },
         Err(error) => map_cli_runtime_error(error),
+    };
+    match outcome {
+        ChildOutcome::Succeeded(bytes) => match normalize_captured_image(
+            bytes,
+            &job.size,
+            &job.output_format,
+            job.output_compression,
+        ) {
+            Ok(bytes) => ChildOutcome::Succeeded(bytes),
+            Err(()) => ChildOutcome::Failed("codex_ephemeral_output_invalid"),
+        },
+        outcome => outcome,
     }
+}
+
+fn normalize_captured_image(
+    bytes: Vec<u8>,
+    requested_size: &str,
+    output_format: &str,
+    output_compression: Option<u8>,
+) -> Result<Vec<u8>, ()> {
+    let actual_format = image::ImageReader::new(Cursor::new(&bytes))
+        .with_guessed_format()
+        .ok()
+        .and_then(|reader| reader.format())
+        .ok_or(())?;
+    let requested_format = match output_format {
+        "png" => image::ImageFormat::Png,
+        "jpeg" => image::ImageFormat::Jpeg,
+        "webp" => image::ImageFormat::WebP,
+        _ => return Err(()),
+    };
+    if actual_format == requested_format {
+        return Ok(bytes);
+    }
+
+    // Codex's native image tool can emit PNG even when the Images API caller
+    // requested JPEG or WebP. Keep the CLI sandbox strict and perform the
+    // required format conversion in the trusted gateway normalization layer.
+    let mut images = crate::core::normalize_generated_images(
+        vec![crate::core::GeneratedImage { bytes }],
+        requested_size,
+        output_format,
+        output_compression,
+    )
+    .map_err(|_| ())?;
+    if images.len() != 1 {
+        return Err(());
+    }
+    Ok(images.remove(0).bytes)
 }
 
 async fn final_fallback_output(
@@ -670,7 +719,7 @@ async fn final_fallback_output(
     thread_id: Option<Uuid>,
     output_format: &str,
 ) -> Result<Option<CapturedCodexOutput>, ProcessSpoolError> {
-    if let Some(bytes) = final_workspace_output(spool, workspace_filename, output_format)? {
+    if let Some(bytes) = final_workspace_output(spool, workspace_filename)? {
         return Ok(Some(CapturedCodexOutput {
             bytes,
             source: CodexOutputSource::Workspace,
@@ -684,7 +733,7 @@ async fn final_fallback_output(
         let bytes = read_codex_output(&path)
             .await
             .map_err(|_| ProcessSpoolError::Unavailable)?;
-        if !valid_captured_image(&bytes, output_format) {
+        if !valid_captured_image(&bytes) {
             return Err(ProcessSpoolError::Integrity);
         }
         return Ok(Some(CapturedCodexOutput {
@@ -693,21 +742,19 @@ async fn final_fallback_output(
         }));
     }
 
-    recover_codex_session_output(codex_home, thread_id, output_format).await
+    recover_codex_session_output(codex_home, thread_id).await
 }
 
 async fn recover_codex_session_output(
     codex_home: &Path,
     thread_id: Option<Uuid>,
-    output_format: &str,
 ) -> Result<Option<CapturedCodexOutput>, ProcessSpoolError> {
     let Some(thread_id) = thread_id else {
         return Ok(None);
     };
     let codex_home = codex_home.to_path_buf();
-    let output_format = output_format.to_string();
     tokio::task::spawn_blocking(move || {
-        recover_codex_session_output_blocking(&codex_home, thread_id, &output_format)
+        recover_codex_session_output_blocking(&codex_home, thread_id)
     })
     .await
     .map_err(|_| ProcessSpoolError::Unavailable)?
@@ -716,7 +763,6 @@ async fn recover_codex_session_output(
 fn recover_codex_session_output_blocking(
     codex_home: &Path,
     thread_id: Uuid,
-    output_format: &str,
 ) -> Result<Option<CapturedCodexOutput>, ProcessSpoolError> {
     let mut session_files = Vec::new();
     collect_codex_session_files(
@@ -778,7 +824,7 @@ fn recover_codex_session_output_blocking(
             if bytes.is_empty() || bytes.len() as u64 > MAX_CODEX_RUNTIME_OUTPUT_BYTES {
                 return Err(ProcessSpoolError::Integrity);
             }
-            if !valid_captured_image(&bytes, output_format) {
+            if !valid_captured_image(&bytes) {
                 return Err(ProcessSpoolError::Integrity);
             }
             recovered = Some(CapturedCodexOutput {
@@ -893,13 +939,10 @@ fn codex_inline_image_result(value: &serde_json::Value) -> Option<&str> {
 fn final_workspace_output(
     spool: &ExecutionSpool,
     filename: &str,
-    output_format: &str,
 ) -> Result<Option<Vec<u8>>, ProcessSpoolError> {
     match spool.read_workspace_output(filename, MAX_CODEX_RUNTIME_OUTPUT_BYTES)? {
         WorkspaceOutputSnapshot::Missing | WorkspaceOutputSnapshot::Incomplete => Ok(None),
-        WorkspaceOutputSnapshot::Bytes(bytes) if valid_captured_image(&bytes, output_format) => {
-            Ok(Some(bytes))
-        }
+        WorkspaceOutputSnapshot::Bytes(bytes) if valid_captured_image(&bytes) => Ok(Some(bytes)),
         WorkspaceOutputSnapshot::Bytes(_) => Err(ProcessSpoolError::Integrity),
     }
 }
@@ -935,10 +978,8 @@ async fn capture_ephemeral_output(
         })
         .await
         .map_err(|_| ProcessSpoolError::Unavailable)??;
-        let workspace =
-            validated_snapshot(snapshots.0, CodexOutputSource::Workspace, &output_format).await?;
-        let runtime =
-            validated_snapshot(snapshots.1, CodexOutputSource::Runtime, &output_format).await?;
+        let workspace = validated_snapshot(snapshots.0, CodexOutputSource::Workspace).await?;
+        let runtime = validated_snapshot(snapshots.1, CodexOutputSource::Runtime).await?;
         let native = snapshot_native_codex_output(&codex_home, &output_format).await?;
 
         if workspace.is_some() {
@@ -960,14 +1001,12 @@ async fn capture_ephemeral_output(
 async fn validated_snapshot(
     snapshot: WorkspaceOutputSnapshot,
     source: CodexOutputSource,
-    output_format: &str,
 ) -> Result<Option<CapturedCodexOutput>, ProcessSpoolError> {
     let WorkspaceOutputSnapshot::Bytes(bytes) = snapshot else {
         return Ok(None);
     };
-    let format = output_format.to_string();
     tokio::task::spawn_blocking(move || {
-        Ok(valid_captured_image(&bytes, &format).then_some(CapturedCodexOutput { bytes, source }))
+        Ok(valid_captured_image(&bytes).then_some(CapturedCodexOutput { bytes, source }))
     })
     .await
     .map_err(|_| ProcessSpoolError::Unavailable)?
@@ -984,23 +1023,22 @@ async fn snapshot_native_codex_output(
     let bytes = read_codex_output(&path)
         .await
         .map_err(|_| ProcessSpoolError::Unavailable)?;
-    Ok(
-        valid_captured_image(&bytes, output_format).then_some(CapturedCodexOutput {
-            bytes,
-            source: CodexOutputSource::Native,
-        }),
-    )
+    Ok(valid_captured_image(&bytes).then_some(CapturedCodexOutput {
+        bytes,
+        source: CodexOutputSource::Native,
+    }))
 }
 
-fn valid_captured_image(bytes: &[u8], output_format: &str) -> bool {
-    let expected = match output_format {
-        "png" => image::ImageFormat::Png,
-        "jpeg" => image::ImageFormat::Jpeg,
-        "webp" => image::ImageFormat::WebP,
-        _ => return false,
-    };
+fn valid_captured_image(bytes: &[u8]) -> bool {
     let mut reader = match image::ImageReader::new(Cursor::new(bytes)).with_guessed_format() {
-        Ok(reader) if reader.format() == Some(expected) => reader,
+        Ok(reader)
+            if matches!(
+                reader.format(),
+                Some(image::ImageFormat::Png | image::ImageFormat::Jpeg | image::ImageFormat::WebP)
+            ) =>
+        {
+            reader
+        }
         _ => return false,
     };
     let mut limits = image::Limits::default();
@@ -1979,6 +2017,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_png_is_published_as_the_requested_jpeg_format() {
+        let fixture = CodexFixture::generated_images_output_only();
+        let mut command = fixture.command();
+        command.output_format = "jpeg".to_string();
+        command.output_compression = Some(80);
+        let lease = fixture.lease_for_command(&command);
+        let context = fixture.context_for_command(&lease, command);
+        let expected = normalize_captured_image(
+            fs::read(fixture._temp.path().join("source.png")).unwrap(),
+            "1024x1024",
+            "jpeg",
+            Some(80),
+        )
+        .unwrap();
+        fixture.journal.start_or_attach(&lease).unwrap();
+        fixture.supervisor.prepare(&lease, &context).await.unwrap();
+        assert_eq!(
+            fixture.journal.commit_launch(&lease).unwrap(),
+            LaunchDecision::LaunchOnce
+        );
+        let spool = ExecutionSpool::for_lease(&fixture.journal, &lease).unwrap();
+
+        run_codex_runner_child(fixture.journal.root_path(), lease.executor_execution_id)
+            .await
+            .unwrap();
+
+        assert!(expected.starts_with(&[0xff, 0xd8, 0xff]));
+        assert_eq!(
+            spool.observe().unwrap(),
+            ProcessObservation::Succeeded(SupervisedOutput::without_provider_cost(expected))
+        );
+    }
+
+    #[tokio::test]
     async fn recovers_isolated_codex_generated_image_when_prompt_sealing_is_missing() {
         let fixture = CodexFixture::generated_images_output_only();
         let lease = fixture.lease();
@@ -2053,8 +2125,8 @@ mod tests {
         write_session_rollout(&second_home, second_thread, &second);
 
         let (first_recovery, second_recovery) = tokio::join!(
-            recover_codex_session_output(&first_home, Some(first_thread), "png"),
-            recover_codex_session_output(&second_home, Some(second_thread), "png"),
+            recover_codex_session_output(&first_home, Some(first_thread)),
+            recover_codex_session_output(&second_home, Some(second_thread)),
         );
 
         let first_recovery = first_recovery.unwrap().unwrap();
@@ -2064,7 +2136,7 @@ mod tests {
         assert_eq!(first_recovery.bytes, first);
         assert_eq!(second_recovery.bytes, second);
         assert!(
-            recover_codex_session_output(&first_home, Some(second_thread), "png")
+            recover_codex_session_output(&first_home, Some(second_thread))
                 .await
                 .unwrap()
                 .is_none()
@@ -2079,7 +2151,7 @@ mod tests {
         let retried = png_bytes(2, 1);
         write_session_rollout_with_images(root.path(), thread_id, &[&first, &retried]);
 
-        let recovered = recover_codex_session_output(root.path(), Some(thread_id), "png")
+        let recovered = recover_codex_session_output(root.path(), Some(thread_id))
             .await
             .unwrap()
             .unwrap();
@@ -2441,6 +2513,10 @@ mod tests {
 
         fn lease(&self) -> ExecutorSubmissionLease {
             let command = self.command();
+            self.lease_for_command(&command)
+        }
+
+        fn lease_for_command(&self, command: &GenerationCommandV1) -> ExecutorSubmissionLease {
             ExecutorSubmissionLease {
                 submission_id: Uuid::new_v4(),
                 executor_execution_id: Uuid::new_v4(),
@@ -2463,6 +2539,14 @@ mod tests {
 
         fn context(&self, lease: &ExecutorSubmissionLease) -> ExecutorLaunchContext {
             let command = self.command();
+            self.context_for_command(lease, command)
+        }
+
+        fn context_for_command(
+            &self,
+            lease: &ExecutorSubmissionLease,
+            command: GenerationCommandV1,
+        ) -> ExecutorLaunchContext {
             ExecutorLaunchContext {
                 request_id: "request-1".to_string(),
                 api_profile: command.source_api_profile.clone(),
