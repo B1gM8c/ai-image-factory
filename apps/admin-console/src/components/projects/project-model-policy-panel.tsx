@@ -110,6 +110,7 @@ export function ProjectModelPolicyPanel({
         (media === "all" || model.media_kind === media) &&
         (!normalized ||
           model.public_model_id.toLowerCase().includes(normalized) ||
+          model.operation_id.toLowerCase().includes(normalized) ||
           model.providers.some((provider) =>
             provider.toLowerCase().includes(normalized),
           )),
@@ -351,7 +352,7 @@ function ModelRow({
           disabled={!canManage || saving}
           aria-label={t(model.allowed
             ? { en: "Disable {model}", "zh-CN": "停用 {model}", ja: "{model} を無効化", ko: "{model} 비활성화" }
-            : { en: "Enable {model}", "zh-CN": "启用 {model}", ja: "{model} を有効化", ko: "{model} 활성화" }, { model: model.public_model_id })}
+            : { en: "Enable {model}", "zh-CN": "启用 {model}", ja: "{model} を有効化", ko: "{model} 활성화" }, { model: `${model.public_model_id} (${model.operation_id})` })}
           className="mt-0.5"
         />
         <div className="min-w-0">
@@ -367,7 +368,7 @@ function ModelRow({
             ) : null}
           </div>
           <p className="mt-1 truncate text-xs text-muted-foreground">
-            {model.providers.join(", ")} · {model.api_profile}
+            {model.operation_id} · {model.providers.join(", ")} · {model.api_profile}
           </p>
           {model.rate_limit.shared ? (
             <p className="mt-1 text-xs text-muted-foreground">

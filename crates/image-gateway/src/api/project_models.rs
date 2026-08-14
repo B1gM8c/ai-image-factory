@@ -14,7 +14,8 @@ use crate::{
 };
 
 use super::{
-    AppState, IMAGE_GENERATION_ROUTE_OPERATION, VIDEO_GENERATION_ROUTE_OPERATION,
+    AppState, IMAGE_EDIT_ROUTE_OPERATION, IMAGE_GENERATION_ROUTE_OPERATION,
+    VIDEO_GENERATION_ROUTE_OPERATION,
     admin::{authorize_project, authorize_project_owner},
     sessions::private_json,
 };
@@ -65,12 +66,22 @@ async fn configurable_models(
     project_id: &str,
 ) -> Result<Vec<PublicModelRoute>, ImageGatewayError> {
     let store = model_routing(state)?;
-    let (mut images, videos) = tokio::try_join!(
+    let (images, edits, videos) = tokio::try_join!(
         store.list_console_models(project_id, IMAGE_GENERATION_ROUTE_OPERATION),
+        store.list_console_models(project_id, IMAGE_EDIT_ROUTE_OPERATION),
         store.list_console_models(project_id, VIDEO_GENERATION_ROUTE_OPERATION),
     )?;
-    images.extend(videos);
-    Ok(images)
+    Ok(combine_configurable_models(images, edits, videos))
+}
+
+fn combine_configurable_models(
+    mut generations: Vec<PublicModelRoute>,
+    edits: Vec<PublicModelRoute>,
+    videos: Vec<PublicModelRoute>,
+) -> Vec<PublicModelRoute> {
+    generations.extend(edits);
+    generations.extend(videos);
+    generations
 }
 
 fn model_routing(state: &AppState) -> Result<&Arc<dyn ModelRoutingStore>, ImageGatewayError> {
@@ -86,4 +97,37 @@ fn project_model_policy(
     state.project_model_policy_service.as_ref().ok_or_else(|| {
         ImageGatewayError::service_unavailable("Project model policy is not configured")
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn configurable_models_include_image_edit_routes() {
+        let edit = model("images.edits", "gpt-image-2");
+        let models = combine_configurable_models(
+            vec![model("images.generations", "gpt-image-2")],
+            vec![edit.clone()],
+            vec![model("videos.generations", "grok-imagine-video")],
+        );
+
+        assert!(
+            models
+                .iter()
+                .any(|model| { model.operation_id == edit.operation_id && model.id == edit.id })
+        );
+    }
+
+    fn model(operation_id: &str, public_model_id: &str) -> PublicModelRoute {
+        PublicModelRoute {
+            id: public_model_id.to_string(),
+            provider_model_id: Some(public_model_id.to_string()),
+            api_profile: "openai-images-v1".to_string(),
+            provider_id: "openai-codex".to_string(),
+            operation_id: operation_id.to_string(),
+            media_kind: "image".to_string(),
+            created_at_ms: 0,
+        }
+    }
 }
