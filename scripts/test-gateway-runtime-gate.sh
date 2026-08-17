@@ -2,7 +2,8 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+readonly REPO_ROOT
 readonly GATE="${REPO_ROOT}/deploy/hooks/verify-gateway-runtime"
 TEST_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/aif-gateway-gate.XXXXXXXX")"
 trap 'rm -rf -- "$TEST_ROOT"' EXIT

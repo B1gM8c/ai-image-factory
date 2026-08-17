@@ -17,8 +17,10 @@ readonly BACKUP_ROOT="${AIF_BACKUP_ROOT:-/var/lib/ai-image-factory/backups}"
 readonly SERVICE_USER="${AIF_SERVICE_USER:-ai-image-factory}"
 readonly SERVICE_GROUP="${AIF_SERVICE_GROUP:-ai-image-factory}"
 readonly RECOVERY_LEASE_FLOOR_MS=300000
-readonly RESOLVED_BACKUP_ROOT="$(realpath -e "$BACKUP_ROOT")"
-readonly RECOVERY_DIRECTORY="$(realpath -e "$AIF_UPDATE_BACKUP_TOKEN")"
+RESOLVED_BACKUP_ROOT="$(realpath -e "$BACKUP_ROOT")"
+readonly RESOLVED_BACKUP_ROOT
+RECOVERY_DIRECTORY="$(realpath -e "$AIF_UPDATE_BACKUP_TOKEN")"
+readonly RECOVERY_DIRECTORY
 
 [[ "$GATEWAY_DATABASE_SCHEMA" =~ ^[A-Za-z_][A-Za-z0-9_]{0,62}$ ]] || {
   printf 'GATEWAY_DATABASE_SCHEMA is invalid\n' >&2
@@ -116,8 +118,10 @@ SQL
   printf 'GATEWAY_ARTIFACT_ROOT must be an absolute non-root path\n' >&2
   exit 1
 }
-readonly ARTIFACT_PARENT="$(dirname "$GATEWAY_ARTIFACT_ROOT")"
-readonly ARTIFACT_NAME="$(basename "$GATEWAY_ARTIFACT_ROOT")"
+ARTIFACT_PARENT="$(dirname "$GATEWAY_ARTIFACT_ROOT")"
+readonly ARTIFACT_PARENT
+ARTIFACT_NAME="$(basename "$GATEWAY_ARTIFACT_ROOT")"
+readonly ARTIFACT_NAME
 readonly PREVIOUS_ARTIFACT_ROOT="${ARTIFACT_PARENT}/.${ARTIFACT_NAME}.before-recovery-${AIF_UPDATE_COMMAND_ID}"
 install -d -m 0755 "$ARTIFACT_PARENT"
 if [[ ! -d "$GATEWAY_ARTIFACT_ROOT" && -d "$PREVIOUS_ARTIFACT_ROOT" ]]; then
@@ -128,7 +132,8 @@ fi
   exit 1
 }
 rm -rf -- "$PREVIOUS_ARTIFACT_ROOT"
-readonly RESTORED_ARTIFACT_ROOT="$(mktemp -d "${ARTIFACT_PARENT}/.${ARTIFACT_NAME}.restore.XXXXXXXX")"
+RESTORED_ARTIFACT_ROOT="$(mktemp -d "${ARTIFACT_PARENT}/.${ARTIFACT_NAME}.restore.XXXXXXXX")"
+readonly RESTORED_ARTIFACT_ROOT
 cleanup() {
   rm -rf -- "$RESTORED_ARTIFACT_ROOT"
 }

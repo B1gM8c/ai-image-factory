@@ -7,8 +7,10 @@ export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 readonly RELEASE_ROOT="${AIF_RELEASE_ROOT:-/opt/ai-image-factory}"
 readonly FIXED_UPDATER="${AIF_FIXED_UPDATER:-/usr/libexec/ai-image-factory/updated}"
 readonly CANDIDATE_INPUT="${1:-${RELEASE_ROOT}/current/bin/updated}"
-readonly CANDIDATE="$(realpath -e "$CANDIDATE_INPUT")"
-readonly RELEASES_ROOT="$(realpath -e "${RELEASE_ROOT}/releases")"
+CANDIDATE="$(realpath -e "$CANDIDATE_INPUT")"
+readonly CANDIDATE
+RELEASES_ROOT="$(realpath -e "${RELEASE_ROOT}/releases")"
+readonly RELEASES_ROOT
 
 case "$CANDIDATE" in
   "${RELEASES_ROOT}/"*/bin/updated) ;;
@@ -35,10 +37,14 @@ readonly CANDIDATE_MODE="$((8#$(stat --format='%a' "$CANDIDATE")))"
   exit 1
 }
 
-readonly FIXED_DIRECTORY="$(dirname "$FIXED_UPDATER")"
+FIXED_DIRECTORY="$(dirname "$FIXED_UPDATER")"
+readonly FIXED_DIRECTORY
 readonly TEMPORARY_UPDATER="${FIXED_DIRECTORY}/.updated.new.$$"
 readonly PREVIOUS_UPDATER="${FIXED_DIRECTORY}/.updated.previous"
+# Invoked indirectly by the EXIT trap below.
+# shellcheck disable=SC2329
 cleanup() {
+  # shellcheck disable=SC2317
   rm -f -- "$TEMPORARY_UPDATER"
 }
 trap cleanup EXIT

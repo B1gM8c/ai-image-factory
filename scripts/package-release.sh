@@ -3,8 +3,10 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 022
 
-readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
-readonly REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd -P)"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+readonly SCRIPT_DIR
+REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd -P)"
+readonly REPO_ROOT
 
 usage() {
   cat <<'EOF'
@@ -306,7 +308,8 @@ readonly NEXT_ROOT="${REPO_ROOT}/apps/admin-console"
 readonly NEXT_STANDALONE="${NEXT_ROOT}/.next/standalone"
 readonly NEXT_STATIC="${NEXT_ROOT}/.next/static"
 readonly NEXT_PUBLIC="${NEXT_ROOT}/public"
-readonly OUTPUT_DIR="$(mkdir -p "$OUTPUT_DIR_INPUT" && cd "$OUTPUT_DIR_INPUT" && pwd -P)"
+OUTPUT_DIR="$(mkdir -p "$OUTPUT_DIR_INPUT" && cd "$OUTPUT_DIR_INPUT" && pwd -P)"
+readonly OUTPUT_DIR
 readonly ASSET_PREFIX="ai-image-factory-${RELEASE_VERSION}-${TARGET_TRIPLE}"
 readonly BUNDLE_PATH="${OUTPUT_DIR}/${ASSET_PREFIX}.tar.gz"
 readonly MANIFEST_PATH="${OUTPUT_DIR}/${ASSET_PREFIX}.manifest.json"
@@ -331,7 +334,8 @@ readonly -a GATEWAY_BINARIES=(
   || die "Next.js standalone server entry is missing"
 [[ -d "$NEXT_STATIC" ]] || die "Next.js static output is missing"
 
-readonly WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/aif-release.XXXXXXXX")"
+WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/aif-release.XXXXXXXX")"
+readonly WORK_DIR
 cleanup() {
   rm -rf -- "$WORK_DIR"
 }
@@ -376,13 +380,14 @@ install -m 0644 \
   "${REPO_ROOT}/docs/operations/production-release.md" \
   "${RELEASE_ROOT}/ops/docs/production-release.md"
 
-readonly MIGRATION_PREFIX="$(
+MIGRATION_PREFIX="$(
   find "${REPO_ROOT}/crates/image-gateway/migrations" -maxdepth 1 -type f -name '*.sql' \
     -exec basename {} \; \
     | sed -nE 's/^([0-9]{4})_.*/\1/p' \
     | LC_ALL=C sort \
     | tail -n 1
 )"
+readonly MIGRATION_PREFIX
 [[ -n "$MIGRATION_PREFIX" ]] || die "no numbered database migration was found"
 readonly MIGRATION_VERSION="$((10#${MIGRATION_PREFIX}))"
 
@@ -428,7 +433,8 @@ create_deterministic_tarball \
   "$ADMIN_RUNTIME_ROOT" \
   "$ADMIN_FILE_LIST" \
   "${RELEASE_ROOT}/admin/standalone.tar.gz"
-readonly ADMIN_ARCHIVE_SHA256="$(sha256_file "${RELEASE_ROOT}/admin/standalone.tar.gz")"
+ADMIN_ARCHIVE_SHA256="$(sha256_file "${RELEASE_ROOT}/admin/standalone.tar.gz")"
+readonly ADMIN_ARCHIVE_SHA256
 
 cat >"${RELEASE_ROOT}/admin/server.js" <<EOF
 "use strict";
@@ -501,8 +507,10 @@ done <"$RELEASE_FILE_LIST"
 
 create_deterministic_tarball "$RELEASE_ROOT" "$RELEASE_FILE_LIST" "$BUNDLE_PATH"
 
-readonly BUNDLE_SHA256="$(sha256_file "$BUNDLE_PATH")"
-readonly BUNDLE_BYTES="$(file_size "$BUNDLE_PATH")"
+BUNDLE_SHA256="$(sha256_file "$BUNDLE_PATH")"
+readonly BUNDLE_SHA256
+BUNDLE_BYTES="$(file_size "$BUNDLE_PATH")"
+readonly BUNDLE_BYTES
 readonly MIN_SCHEMA_VERSION="${MIN_SCHEMA_VERSION:-$((MIGRATION_VERSION - 1))}"
 [[ "$MIN_SCHEMA_VERSION" =~ ^[0-9]+$ ]] \
   || die "MIN_SCHEMA_VERSION must be a non-negative integer"

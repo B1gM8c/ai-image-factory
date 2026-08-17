@@ -40,7 +40,8 @@ fi
 }
 
 install -d -m 0700 "$BACKUP_ROOT"
-readonly TEMPORARY_DIRECTORY="$(mktemp -d "${BACKUP_ROOT}/.backup.XXXXXXXX")"
+TEMPORARY_DIRECTORY="$(mktemp -d "${BACKUP_ROOT}/.backup.XXXXXXXX")"
+readonly TEMPORARY_DIRECTORY
 cleanup() {
   rm -rf -- "$TEMPORARY_DIRECTORY"
 }

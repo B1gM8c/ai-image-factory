@@ -41,8 +41,10 @@ readonly BUNDLE_INPUT="$3"
 readonly MANIFEST_INPUT="$4"
 [[ ! -L "$BUNDLE_INPUT" && ! -L "$MANIFEST_INPUT" ]] \
   || die "bundle and manifest must not be symbolic links"
-readonly BUNDLE="$(canonical_path "$BUNDLE_INPUT")"
-readonly MANIFEST="$(canonical_path "$MANIFEST_INPUT")"
+BUNDLE="$(canonical_path "$BUNDLE_INPUT")"
+readonly BUNDLE
+MANIFEST="$(canonical_path "$MANIFEST_INPUT")"
+readonly MANIFEST
 readonly INSTALL_ROOT="${AIF_INSTALL_ROOT:-/opt/ai-image-factory}"
 readonly LIBEXEC_ROOT="${AIF_LIBEXEC_ROOT:-/usr/libexec/ai-image-factory}"
 readonly BOOTSTRAP_ROOT="${INSTALL_ROOT}/bootstrap/${VERSION}"
