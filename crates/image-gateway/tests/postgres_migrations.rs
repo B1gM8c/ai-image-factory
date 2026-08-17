@@ -1517,7 +1517,7 @@ async fn default_codex_customer_pricing_preserves_an_existing_generation_price()
                 $1, $2, 1, 'openai-images-v1', 'generation',
                 'openai-codex', 'gpt-image-2', 'gpt-image-2', 'image',
                 'standard', 'provider_cli', 'customer_rate', FALSE,
-                'active', 1, 'manual', 1, 1
+                'draft', 1, 'manual', 1, 1
             )
             "#,
         )
@@ -1546,6 +1546,13 @@ async fn default_codex_customer_pricing_preserves_an_existing_generation_price()
         .execute(&test_schema.pool)
         .await
         .map_err(|error| format!("failed to seed operator price component: {error}"))?;
+        sqlx::query(
+            "UPDATE price_book_versions SET state = 'active' WHERE price_book_version_id = $1",
+        )
+        .bind(version_id)
+        .execute(&test_schema.pool)
+        .await
+        .map_err(|error| format!("failed to publish operator price version: {error}"))?;
 
         apply_migration_range(&test_schema.pool, 85, 117).await?;
 
@@ -3486,8 +3493,9 @@ async fn assert_expected_schema(pool: &PgPool) -> TestResult {
           AND component.outcome = 'succeeded'
         GROUP BY version.public_model_id, component.metric,
                  component.dimensions_json, component.unit_price_micros
-        ORDER BY version.public_model_id, component.metric,
-                 component.dimensions_json::TEXT
+        ORDER BY version.public_model_id COLLATE "C",
+                 component.metric COLLATE "C",
+                 component.dimensions_json::TEXT COLLATE "C"
         "#,
     )
     .fetch_all(pool)

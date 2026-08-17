@@ -2504,10 +2504,13 @@ async fn pricing_service_case(pool: &PgPool) -> TestResult {
         .catalog()
         .await
         .map_err(|error| format!("catalog should load: {error:?}"))?;
+    let catalog_book = catalog
+        .price_books
+        .iter()
+        .find(|book| book.price_book_id == price_book.price_book_id)
+        .ok_or_else(|| "catalog is missing the created price book".to_string())?;
     require(
-        catalog.price_books.len() == 1
-            && catalog.price_books[0].versions.len() == 1
-            && catalog.price_books[0].versions[0].state == "active",
+        catalog_book.versions.len() == 1 && catalog_book.versions[0].state == "active",
         "blocked retirement must leave the current price unchanged",
     )
 }
@@ -2539,7 +2542,12 @@ async fn scheduled_price_cutover_case(pool: &PgPool) -> TestResult {
         .catalog()
         .await
         .map_err(|error| format!("catalog should load: {error:?}"))?;
-    let versions = &catalog.price_books[0].versions;
+    let versions = &catalog
+        .price_books
+        .iter()
+        .find(|book| book.price_book_id == price_book.price_book_id)
+        .ok_or_else(|| "catalog is missing the scheduled price book".to_string())?
+        .versions;
     let version = |id| {
         versions
             .iter()
@@ -2772,7 +2780,12 @@ async fn price_rollback_case(pool: &PgPool) -> TestResult {
         .catalog()
         .await
         .map_err(|error| format!("rollback catalog should load: {error:?}"))?;
-    let versions = &catalog.price_books[0].versions;
+    let versions = &catalog
+        .price_books
+        .iter()
+        .find(|catalog_book| catalog_book.price_book_id == book.price_book_id)
+        .ok_or_else(|| "catalog is missing the rollback price book".to_string())?
+        .versions;
     require(
         versions
             .iter()
