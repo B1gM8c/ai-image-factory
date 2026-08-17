@@ -111,8 +111,14 @@ impl AppConfig {
             database_url,
             generation_admission_contract: GenerationAdmissionContract::from_env()?,
             enable_xai_video_api: env_bool_strict("GATEWAY_ENABLE_XAI_VIDEO_API", false)?,
-            five_hour_image_limit: env_u32("GATEWAY_IMAGE_LIMIT_5H", 40)?,
-            seven_day_image_limit: env_u32("GATEWAY_IMAGE_LIMIT_7D", 200)?,
+            five_hour_image_limit: env_u32(
+                "GATEWAY_IMAGE_LIMIT_5H",
+                DEFAULT_UNBOUNDED_DATABASE_QUOTA,
+            )?,
+            seven_day_image_limit: env_u32(
+                "GATEWAY_IMAGE_LIMIT_7D",
+                DEFAULT_UNBOUNDED_DATABASE_QUOTA,
+            )?,
             five_hour_video_second_limit: env_u32(
                 "GATEWAY_VIDEO_SECOND_LIMIT_5H",
                 DEFAULT_UNBOUNDED_DATABASE_QUOTA,
@@ -420,6 +426,18 @@ mod tests {
         for value in ["", "True", "on", " true"] {
             assert!(parse_bool("GATEWAY_ENABLE_XAI_VIDEO_API", value).is_err());
         }
+    }
+
+    #[test]
+    fn image_usage_limits_default_to_database_safe_unbounded() {
+        let limit = env_u32(
+            "AI_IMAGE_FACTORY_TEST_UNSET_IMAGE_USAGE_LIMIT_9F4F5C4D",
+            DEFAULT_UNBOUNDED_DATABASE_QUOTA,
+        )
+        .unwrap();
+
+        assert_eq!(limit, i32::MAX as u32);
+        assert_eq!(i32::try_from(limit).unwrap(), i32::MAX);
     }
 
     fn config_for_bind_with_admin(bind: &str, admin_token: Option<&str>) -> AppConfig {

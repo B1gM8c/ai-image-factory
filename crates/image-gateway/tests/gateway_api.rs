@@ -1171,6 +1171,42 @@ async fn usage_limits_apply_across_router_restarts() {
 }
 
 #[tokio::test]
+async fn unbounded_image_limits_allow_usage_above_legacy_caps_and_multi_output() {
+    let mut cfg = config();
+    cfg.five_hour_image_limit = i32::MAX as u32;
+    cfg.seven_day_image_limit = i32::MAX as u32;
+    let app = build_router(cfg, Arc::new(FakeGenerator::default()), usage_store());
+
+    for batch in 0..21 {
+        let (status, _headers, body) = send_json(
+            app.clone(),
+            Some("test-token"),
+            json!({
+                "model": "gpt-image-2",
+                "prompt": format!("unbounded batch {batch}"),
+                "n": 10
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "batch {batch}: {body}");
+    }
+
+    let (status, headers, body) = send_json(
+        app,
+        Some("test-token"),
+        json!({
+            "model": "gpt-image-2",
+            "prompt": "two images after 210 committed outputs",
+            "n": 2
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(headers["x-ratelimit-limit-5h"], i32::MAX.to_string());
+}
+
+#[tokio::test]
 async fn failed_generation_releases_reserved_quota() {
     let store = usage_store();
     let mut cfg = config();

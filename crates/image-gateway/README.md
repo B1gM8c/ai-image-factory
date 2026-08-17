@@ -304,8 +304,11 @@ Current MVP behavior:
 - Legacy SHA-256 rows are readable only when the explicit migration switch is enabled; no new legacy rows are created.
 - `last_used_at` writes are coalesced to at most once per minute per key.
 - Usage is isolated by project/tenant. Legacy `GATEWAY_API_TOKEN` calls use the `proj_default` tenant.
-- `GATEWAY_IMAGE_LIMIT_5H` defaults to `40`.
-- `GATEWAY_IMAGE_LIMIT_7D` defaults to `200`.
+- `GATEWAY_IMAGE_LIMIT_5H` and `GATEWAY_IMAGE_LIMIT_7D` default to `2147483647`,
+  the database-safe unbounded sentinel. Set either variable explicitly to enforce
+  a smaller customer usage quota. Billing admission, project budgets, queue and
+  concurrency controls, request validation, timeouts, and upstream provider
+  limits remain independent safeguards.
 - After validation and queue admission, a request reserves `n` image units before Codex generation starts.
 - Successful generation commits the reservation. Provider failures release it. A failure after the provider returned, such as artifact persistence failure, marks the work uncertain and leaves the reservation for reconciliation instead of falsely declaring that no provider cost occurred.
 - Generation artifacts are persisted before success settlement. Completed idempotent generation requests replay the original response projection and verified bytes without reserving quota again.
