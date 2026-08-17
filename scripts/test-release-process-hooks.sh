@@ -6,6 +6,7 @@ REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
 readonly REPO_ROOT
 readonly VERIFY="${REPO_ROOT}/deploy/hooks/verify"
 readonly QUIESCE="${REPO_ROOT}/deploy/hooks/quiesce"
+readonly START_PROCESSES="${REPO_ROOT}/deploy/hooks/start-processes"
 TEST_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/aif-release-hooks.XXXXXXXX")"
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
 
@@ -39,6 +40,10 @@ case "$1" in
     ;;
   stop)
     printf '%s\n' "$*" >"$MOCK_STOP_LOG"
+    [[ "${MOCK_STOP_FAILURE:-false}" != true ]]
+    ;;
+  start)
+    printf '%s\n' "$*" >>"$MOCK_START_LOG"
     ;;
   show)
     unit="$2"
@@ -112,6 +117,7 @@ run_verify() {
     AIF_VERIFY_STABILITY_SECONDS=12 \
     MOCK_PHASE_FILE="$TEST_ROOT/phase" \
     MOCK_GATE_LOG="$TEST_ROOT/gate.log" \
+    MOCK_START_LOG="$TEST_ROOT/start.log" \
     MOCK_STOP_LOG="$TEST_ROOT/stop.log" \
     "$@" \
     "$VERIFY"
@@ -122,9 +128,20 @@ run_quiesce() {
     AIF_QUIESCE_COMMAND_PATH="$TEST_ROOT/bin:/usr/bin:/bin" \
     MOCK_QUIESCE_MODE=true \
     MOCK_PHASE_FILE="$TEST_ROOT/phase" \
+    MOCK_START_LOG="$TEST_ROOT/start.log" \
     MOCK_STOP_LOG="$TEST_ROOT/stop.log" \
     "$@" \
     "$QUIESCE"
+}
+
+run_start_processes() {
+  env \
+    AIF_START_COMMAND_PATH="$TEST_ROOT/bin:/usr/bin:/bin" \
+    MOCK_PHASE_FILE="$TEST_ROOT/phase" \
+    MOCK_START_LOG="$TEST_ROOT/start.log" \
+    MOCK_STOP_LOG="$TEST_ROOT/stop.log" \
+    "$@" \
+    "$START_PROCESSES"
 }
 
 : >"$TEST_ROOT/gate.log"
@@ -154,9 +171,35 @@ fi
 run_quiesce MOCK_TARGET_EMPTY_PID=true >/dev/null
 grep -Fq 'stop ai-image-factory-processes.target' "$TEST_ROOT/stop.log"
 
+run_quiesce MOCK_TARGET_EMPTY_PID=true MOCK_STOP_FAILURE=true >/dev/null
+
 if run_quiesce MOCK_QUIESCE_STUCK_UNIT=ai-image-factory-workerd.service >/dev/null 2>&1; then
   echo "expected quiesce to fail while a process unit still has a MainPID" >&2
   exit 1
 fi
+
+: >"$TEST_ROOT/start.log"
+run_start_processes >/dev/null
+grep -Fq 'ai-image-factory-processes.target' "$TEST_ROOT/start.log"
+if grep -Fq 'ai-image-factory-executord@default.service' "$TEST_ROOT/start.log" \
+  || grep -Fq 'ai-image-factory-workerd.service' "$TEST_ROOT/start.log"; then
+  echo "disabled legacy execution units must not be started" >&2
+  exit 1
+fi
+
+: >"$TEST_ROOT/start.log"
+run_start_processes MOCK_MANAGED_UNITS=true >/dev/null
+grep -Fq 'ai-image-factory-executord@managed.codex.images.test.service' "$TEST_ROOT/start.log"
+grep -Fq 'ai-image-factory-workerd@managed.codex.images.test.service' "$TEST_ROOT/start.log"
+grep -Fq 'ai-image-factory-processes.target' "$TEST_ROOT/start.log"
+if grep -Fq 'ai-image-factory-executord@default.service' "$TEST_ROOT/start.log" \
+  || grep -Fq 'ai-image-factory-workerd.service' "$TEST_ROOT/start.log"; then
+  echo "disabled legacy execution units must not be started" >&2
+  exit 1
+fi
+
+: >"$TEST_ROOT/start.log"
+run_start_processes MOCK_LEGACY_ENABLED=true >/dev/null
+grep -Fq 'ai-image-factory-workerd.service' "$TEST_ROOT/start.log"
 
 echo "release process hook tests passed"

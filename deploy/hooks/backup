@@ -47,7 +47,8 @@ cleanup() {
 }
 trap cleanup EXIT
 
-PGDATABASE="$DATABASE_URL" pg_dump \
+pg_dump \
+  --dbname="$DATABASE_URL" \
   --format=plain \
   --no-owner \
   --no-privileges \

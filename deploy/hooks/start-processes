@@ -1,7 +1,7 @@
 #!/bin/bash
 set -Eeuo pipefail
 IFS=$'\n\t'
-export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH="${AIF_START_COMMAND_PATH:-/usr/sbin:/usr/bin:/sbin:/bin}"
 
 readonly PROCESS_SCOPE="${AIF_UPDATE_PROCESS_SCOPE:-full}"
 readonly START_MODE="${AIF_UPDATE_START_MODE:-target}"
@@ -24,15 +24,16 @@ readonly VALIDATION_UNITS=(
   ai-image-factory-gateway.service
   ai-image-factory-admin.service
 )
-REQUIRED_PROFILE_UNITS=(
+REQUIRED_PROFILE_UNITS=()
+readonly LEGACY_EXECUTION_UNITS=(
   ai-image-factory-executord@default.service
+  ai-image-factory-workerd.service
 )
 readonly REQUIRED_PREFIX_UNITS=(
   ai-image-factory-reconcilerd.service
 )
 readonly REQUIRED_SUFFIX_UNITS=(
   ai-image-factory-reducerd.service
-  ai-image-factory-workerd.service
 )
 readonly OPTIONAL_UNITS=(
   ai-image-factory-provider-submitd.service
@@ -41,11 +42,15 @@ readonly OPTIONAL_UNITS=(
 )
 
 if [[ "$PROCESS_SCOPE" == "full" ]]; then
+  for unit in "${LEGACY_EXECUTION_UNITS[@]}"; do
+    if systemctl is-enabled --quiet "$unit"; then
+      REQUIRED_PROFILE_UNITS+=("$unit")
+    fi
+  done
   while IFS= read -r unit; do
     case "$unit" in
       ai-image-factory-executord@*.service)
-        [[ "$unit" == "ai-image-factory-executord@default.service" ]] \
-          || REQUIRED_PROFILE_UNITS+=("$unit")
+        REQUIRED_PROFILE_UNITS+=("$unit")
         ;;
       ai-image-factory-workerd@*.service)
         REQUIRED_PROFILE_UNITS+=("$unit")
@@ -71,9 +76,10 @@ if [[ "$START_MODE" == "gate" ]]; then
   fi
 
   systemctl --job-mode=ignore-dependencies start "${REQUIRED_PREFIX_UNITS[@]}"
-  systemctl --job-mode=ignore-dependencies start "${REQUIRED_PROFILE_UNITS[@]}"
-  systemctl --job-mode=ignore-dependencies start "${REQUIRED_SUFFIX_UNITS[0]}"
-  systemctl --job-mode=ignore-dependencies start "${REQUIRED_SUFFIX_UNITS[1]}"
+  if (( ${#REQUIRED_PROFILE_UNITS[@]} > 0 )); then
+    systemctl --job-mode=ignore-dependencies start "${REQUIRED_PROFILE_UNITS[@]}"
+  fi
+  systemctl --job-mode=ignore-dependencies start "${REQUIRED_SUFFIX_UNITS[@]}"
   for unit in "${OPTIONAL_UNITS[@]}"; do
     if systemctl is-enabled --quiet "$unit"; then
       systemctl --job-mode=ignore-dependencies start "$unit"
@@ -81,6 +87,8 @@ if [[ "$START_MODE" == "gate" ]]; then
   done
   systemctl --job-mode=ignore-dependencies start "${VALIDATION_UNITS[0]}"
   systemctl --job-mode=ignore-dependencies start "${VALIDATION_UNITS[1]}"
+  systemctl --job-mode=ignore-dependencies start ai-image-factory-processes.target
+  systemctl is-active --quiet ai-image-factory-processes.target
   exit 0
 fi
 
@@ -94,11 +102,12 @@ if [[ "$PROCESS_SCOPE" == "validation" ]]; then
   exit 0
 fi
 
-"${START_COMMAND[@]}" \
-  "${REQUIRED_PREFIX_UNITS[@]}" \
-  "${REQUIRED_PROFILE_UNITS[@]}" \
-  "${REQUIRED_SUFFIX_UNITS[@]}" \
-  "${VALIDATION_UNITS[@]}"
+START_UNITS=("${REQUIRED_PREFIX_UNITS[@]}")
+if (( ${#REQUIRED_PROFILE_UNITS[@]} > 0 )); then
+  START_UNITS+=("${REQUIRED_PROFILE_UNITS[@]}")
+fi
+START_UNITS+=("${REQUIRED_SUFFIX_UNITS[@]}" "${VALIDATION_UNITS[@]}")
+"${START_COMMAND[@]}" "${START_UNITS[@]}"
 for unit in "${OPTIONAL_UNITS[@]}"; do
   if systemctl is-enabled --quiet "$unit"; then
     "${START_COMMAND[@]}" "$unit"
@@ -108,6 +117,8 @@ if [[ "$START_MODE" == "direct" ]]; then
   "${START_COMMAND[@]}" \
     ai-image-factory-processes.target \
     ai-image-factory.target
-  systemctl is-active --quiet ai-image-factory-processes.target
   systemctl is-active --quiet ai-image-factory.target
+else
+  "${START_COMMAND[@]}" ai-image-factory-processes.target
 fi
+systemctl is-active --quiet ai-image-factory-processes.target

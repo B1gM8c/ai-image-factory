@@ -58,7 +58,9 @@ done < <(
     | awk '{print $1}'
 )
 
-systemctl stop ai-image-factory-processes.target "${PROCESS_UNITS[@]}"
+if ! systemctl stop ai-image-factory-processes.target "${PROCESS_UNITS[@]}"; then
+  printf 'systemctl reported a process stop failure; checking final unit state\n' >&2
+fi
 for unit in ai-image-factory-processes.target "${PROCESS_UNITS[@]}"; do
   active_state="$(systemctl show "$unit" --property=ActiveState --value)"
   main_pid="$(systemctl show "$unit" --property=MainPID --value)"

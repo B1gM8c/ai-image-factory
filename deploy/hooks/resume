@@ -3,10 +3,4 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 
-if [[ "${AIF_UPDATE_START_MODE:-target}" =~ ^(direct|gate)$ \
-  || "${AIF_UPDATE_PROCESS_SCOPE:-full}" == "validation" ]]; then
-  /usr/libexec/ai-image-factory/hooks/start-processes
-else
-  systemctl start ai-image-factory-processes.target
-  systemctl is-active --quiet ai-image-factory-processes.target
-fi
+/usr/libexec/ai-image-factory/hooks/start-processes

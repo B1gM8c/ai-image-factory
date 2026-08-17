@@ -104,7 +104,8 @@ SELECT EXISTS(
   \quit 1
 \endif
 SQL
-} | PGDATABASE="$DATABASE_URL" psql \
+} | psql \
+  --dbname="$DATABASE_URL" \
   --set=ON_ERROR_STOP=1 \
   --single-transaction \
   --set="database_schema=${GATEWAY_DATABASE_SCHEMA}" \
@@ -154,10 +155,4 @@ trap - EXIT
 sync -f "$ARTIFACT_PARENT"
 rm -rf -- "$PREVIOUS_ARTIFACT_ROOT"
 
-if [[ "${AIF_UPDATE_START_MODE:-target}" =~ ^(direct|gate)$ \
-  || "${AIF_UPDATE_PROCESS_SCOPE:-full}" == "validation" ]]; then
-  /usr/libexec/ai-image-factory/hooks/start-processes
-else
-  systemctl start ai-image-factory-processes.target
-  systemctl is-active --quiet ai-image-factory-processes.target
-fi
+/usr/libexec/ai-image-factory/hooks/start-processes
