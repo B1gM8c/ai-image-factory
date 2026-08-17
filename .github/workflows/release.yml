@@ -191,7 +191,7 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Test Rust workspace
-        run: cargo test --locked --workspace --all-targets
+        run: cargo test --locked --workspace --all-targets -- --test-threads=1
 
       - name: Install admin dependencies
         run: npm ci
