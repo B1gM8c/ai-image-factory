@@ -370,7 +370,7 @@ jobs:
               "$(jq --raw-output '.bundle_bytes' "$manifest")"
             tar -tzf "$bundle" >/dev/null
 
-            install_root="/opt/ai-image-factory-ci-${target}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+            install_root="/var/lib/ai-image-factory-ci-${target}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
             libexec_root="/usr/libexec/ai-image-factory-ci-${target}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
             sudo install -d -o root -g root -m 0755 "$install_root" "$libexec_root"
             protected_assets="${install_root}/bootstrap/${RELEASE_VERSION}"
