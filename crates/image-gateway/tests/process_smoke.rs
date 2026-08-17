@@ -429,8 +429,8 @@ fn assert_generation_v2_response(
     )?;
     require(
         header(headers, "openai-project")? == "proj_default"
-            && header(headers, "x-image-units-limit-5h")? == "40"
-            && header(headers, "x-image-units-remaining-5h")? == "38",
+            && header(headers, "x-image-units-limit-5h")? == "2147483647"
+            && header(headers, "x-image-units-remaining-5h")? == "2147483645",
         "unexpected V2 response usage metadata",
     )?;
     let encoded = body["data"]

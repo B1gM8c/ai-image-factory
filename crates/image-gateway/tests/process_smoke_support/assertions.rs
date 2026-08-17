@@ -30,11 +30,11 @@ pub(crate) fn assert_response(
         "unexpected project metadata",
     )?;
     require(
-        header(headers, "x-image-units-limit-5h")? == "40",
+        header(headers, "x-image-units-limit-5h")? == "2147483647",
         "unexpected 5h limit metadata",
     )?;
     require(
-        header(headers, "x-image-units-remaining-5h")? == "39",
+        header(headers, "x-image-units-remaining-5h")? == "2147483646",
         "unexpected 5h remaining metadata",
     )?;
 
