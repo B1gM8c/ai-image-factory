@@ -111,6 +111,7 @@ jobs:
             /opt/ai-image-factory/current/bin \
             /opt/ai-image-factory/current/admin \
             /usr/libexec/ai-image-factory \
+            /usr/libexec/ai-image-factory/hooks \
             /usr/share/doc/ai-image-factory \
             /var/lib/ai-image-factory/admin-runtime \
             /var/lib/ai-image-factory/artifacts \
@@ -145,6 +146,8 @@ jobs:
           done
           sudo install -m 0755 /usr/bin/true \
             /usr/libexec/ai-image-factory/updated
+          sudo install -m 0755 deploy/hooks/fail-closed \
+            /usr/libexec/ai-image-factory/hooks/fail-closed
           sudo touch /opt/ai-image-factory/current/admin/server.js
           systemd-analyze verify --recursive-errors=yes \
             deploy/systemd/*.service \
