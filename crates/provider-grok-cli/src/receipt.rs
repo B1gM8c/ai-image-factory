@@ -270,6 +270,12 @@ fn validate_tool_arguments(
     if actual == expected.arguments() {
         return Ok(());
     }
+    if matches!(
+        expected.tool(),
+        GrokTool::ImageToVideo | GrokTool::ReferenceToVideo
+    ) {
+        return validate_video_tool_arguments(expected.arguments(), actual);
+    }
     if !matches!(
         expected.tool(),
         GrokTool::ImageGeneration | GrokTool::ImageEdit
@@ -303,6 +309,51 @@ fn validate_tool_arguments(
         return Err(GrokReceiptError::ToolArgumentsMismatch);
     }
     Ok(())
+}
+
+fn validate_video_tool_arguments(expected: &Value, actual: &Value) -> Result<(), GrokReceiptError> {
+    let expected = expected
+        .as_object()
+        .ok_or(GrokReceiptError::ToolArgumentsMismatch)?;
+    let actual = actual
+        .as_object()
+        .ok_or(GrokReceiptError::ToolArgumentsMismatch)?;
+
+    // Grok's video tool schema accepts duration as either a JSON number or a numeric string.
+    // It also defaults omitted/null duration to 6 seconds and omitted resolution to 480p.
+    // Every business-semantic input remains exact, and non-default controls cannot be omitted.
+    if actual.keys().any(|field| !expected.contains_key(field))
+        || expected.iter().any(|(field, expected_value)| {
+            let actual_value = actual.get(field);
+            match field.as_str() {
+                "duration" => !equivalent_video_duration(expected_value, actual_value),
+                "resolution_name" => {
+                    actual_value != Some(expected_value)
+                        && !(actual_value.is_none() && expected_value == "480p")
+                }
+                _ if expected_value.is_null() => actual_value.is_some_and(|value| !value.is_null()),
+                _ => actual_value != Some(expected_value),
+            }
+        })
+    {
+        return Err(GrokReceiptError::ToolArgumentsMismatch);
+    }
+    Ok(())
+}
+
+fn equivalent_video_duration(expected: &Value, actual: Option<&Value>) -> bool {
+    let Some(expected) = expected
+        .as_u64()
+        .and_then(|value| u32::try_from(value).ok())
+    else {
+        return false;
+    };
+    match actual {
+        Some(Value::Number(actual)) => actual.as_u64() == Some(u64::from(expected)),
+        Some(Value::String(actual)) => actual.trim().parse::<u32>() == Ok(expected),
+        None | Some(Value::Null) => expected == 6,
+        _ => false,
+    }
 }
 
 fn validate_tool_result(

@@ -645,6 +645,109 @@ fn text_video_receipt_requires_the_exact_two_step_sequence() {
 }
 
 #[test]
+fn image_to_video_receipt_accepts_schema_equivalent_duration_and_defaults() {
+    let fixture = PolicyFixture::new();
+    let request = GrokVideoGenerationRequestV1::ImageToVideo(
+        ImageToVideoRequestV1::new(
+            Some("slow push in".to_owned()),
+            staged("first.png"),
+            VideoDuration::Seconds6,
+            VideoResolution::P480,
+        )
+        .unwrap(),
+    );
+    let (_, invocation) = fixture
+        .policy
+        .command_spec_in(&request.into(), SESSION_ID, fixture.workspace.clone())
+        .unwrap();
+    write_artifact(&invocation);
+
+    let mut string_duration = invocation.expected_arguments().clone();
+    string_duration["duration"] = json!(" 6 ");
+    let history = history_with(&invocation, string_duration, invocation.artifact_path());
+    assert!(parse_invocation_receipt(&valid_stdout(), &history, &invocation).is_ok());
+
+    let mut omitted_defaults = invocation.expected_arguments().clone();
+    omitted_defaults.as_object_mut().unwrap().remove("duration");
+    omitted_defaults
+        .as_object_mut()
+        .unwrap()
+        .remove("resolution_name");
+    let history = history_with(&invocation, omitted_defaults, invocation.artifact_path());
+    assert!(parse_invocation_receipt(&valid_stdout(), &history, &invocation).is_ok());
+}
+
+#[test]
+fn image_to_video_receipt_rejects_semantic_argument_drift() {
+    let fixture = PolicyFixture::new();
+    let request = GrokVideoGenerationRequestV1::ImageToVideo(
+        ImageToVideoRequestV1::new(
+            Some("slow push in".to_owned()),
+            staged("first.png"),
+            VideoDuration::Seconds10,
+            VideoResolution::P720,
+        )
+        .unwrap(),
+    );
+    let (_, invocation) = fixture
+        .policy
+        .command_spec_in(&request.into(), SESSION_ID, fixture.workspace.clone())
+        .unwrap();
+    write_artifact(&invocation);
+
+    let expected = invocation.expected_arguments();
+    for drifted_arguments in [
+        json!({
+            "prompt": "different motion",
+            "image": expected["image"],
+            "duration": "10",
+            "resolution_name": "720p"
+        }),
+        json!({
+            "prompt": expected["prompt"],
+            "image": "/tmp/other.png",
+            "duration": "10",
+            "resolution_name": "720p"
+        }),
+        json!({
+            "prompt": expected["prompt"],
+            "image": expected["image"],
+            "duration": "6",
+            "resolution_name": "720p"
+        }),
+        json!({
+            "prompt": expected["prompt"],
+            "image": expected["image"],
+            "duration": "10",
+            "resolution_name": "480p"
+        }),
+        json!({
+            "prompt": expected["prompt"],
+            "image": expected["image"],
+            "duration": "10",
+            "resolution_name": "720p",
+            "model": "other"
+        }),
+        json!({
+            "prompt": expected["prompt"],
+            "image": expected["image"],
+            "resolution_name": "720p"
+        }),
+        json!({
+            "prompt": expected["prompt"],
+            "image": expected["image"],
+            "duration": "10"
+        }),
+    ] {
+        let history = history_with(&invocation, drifted_arguments, invocation.artifact_path());
+        assert!(matches!(
+            parse_invocation_receipt(&valid_stdout(), &history, &invocation),
+            Err(GrokReceiptError::ToolArgumentsMismatch)
+        ));
+    }
+}
+
+#[test]
 fn receipt_requires_matching_terminal_tool_arguments_and_local_artifact() {
     let fixture = PolicyFixture::new();
     let request = GrokImageGenerationRequestV1::new(
