@@ -445,7 +445,7 @@ impl TestDatabase {
                 && durable.lease_epoch == 1
                 && durable.has_execution_id
                 && durable.attempt_state == "succeeded"
-                && durable.worker_id == "process-smoke-workerd"
+                && durable.worker_id == "process-smoke-workerd/lane-0"
                 && durable.idempotency_state == "succeeded"
                 && durable.projection_count == 1
                 && durable.artifact_count == 1,
@@ -826,7 +826,7 @@ impl TestDatabase {
                 && graph.command_schema == "openai.images.generation.v1"
                 && graph.work_state == "succeeded"
                 && graph.attempt_state == "succeeded"
-                && graph.worker_id == "process-smoke-v2-workerd"
+                && graph.worker_id == "process-smoke-v2-workerd/lane-0"
                 && graph.idempotency_state == "succeeded"
                 && graph.projection_operation == "generation"
                 && graph.projection_response_schema == "openai.images.response.v1"

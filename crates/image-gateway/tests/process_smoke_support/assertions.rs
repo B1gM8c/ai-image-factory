@@ -275,21 +275,26 @@ fn assert_codex_invocation(
     expects_image: bool,
     expects_runtime_home: bool,
 ) -> TestResult {
-    let expected_prefix = [
-        "exec",
-        "--ignore-user-config",
-        "--ignore-rules",
-        "--disable",
-        "plugins",
-        "--disable",
-        "apps",
-        "--sandbox",
-        "workspace-write",
-        "--skip-git-repo-check",
-        "--cd",
-        request_dir,
-    ]
-    .map(str::to_string);
+    let mut expected_prefix = vec!["exec".to_string()];
+    if !expects_runtime_home {
+        expected_prefix.push("--ephemeral".to_string());
+    }
+    expected_prefix.extend(
+        [
+            "--ignore-user-config",
+            "--ignore-rules",
+            "--disable",
+            "plugins",
+            "--disable",
+            "apps",
+            "--sandbox",
+            "workspace-write",
+            "--skip-git-repo-check",
+            "--cd",
+            request_dir,
+        ]
+        .map(str::to_string),
+    );
     require(
         argv.starts_with(&expected_prefix),
         format!(
@@ -317,6 +322,11 @@ fn assert_codex_invocation(
         )?;
         argument_index += 2;
     }
+    require(
+        argv.get(argument_index).map(String::as_str) == Some("--json"),
+        format!("Codex argv is missing --json: {argv:?}"),
+    )?;
+    argument_index += 1;
     if expects_image {
         require(
             argv.len() == argument_index + 3
