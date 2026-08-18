@@ -50,6 +50,7 @@ const MAX_INPUT_IMAGE_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_RUNNER_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 const CHILD_REAP_TIMEOUT: Duration = Duration::from_secs(5);
 
+#[derive(Clone)]
 pub struct GrokProcessSupervisor {
     journal: Arc<FilesystemRunnerJournal>,
     helper_executable: PathBuf,

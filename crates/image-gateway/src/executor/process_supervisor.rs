@@ -6,6 +6,7 @@ use super::{
 };
 use crate::runner::LaunchDecision;
 
+#[derive(Clone)]
 pub enum ExecutorProcessSupervisor {
     Codex(CodexProcessSupervisor),
     Grok(GrokProcessSupervisor),

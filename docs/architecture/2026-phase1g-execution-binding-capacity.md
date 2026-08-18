@@ -112,7 +112,16 @@ publishing terminal evidence.
 - `EXECUTOR_PROFILE_KEY`;
 - `EXECUTOR_CREDENTIAL_REF`;
 - `EXECUTOR_CREDENTIAL_REVISION`;
+- optional `EXECUTOR_MAX_IN_FLIGHT` (default `1`, maximum `64`);
 - private runner, artifact, helper, executable, and credential-home paths.
+
+`EXECUTOR_MAX_IN_FLIGHT` controls the number of local execution lanes for one
+profile-bound process. Each lane has a stable, distinct executor owner, while
+lane zero retains the configured owner for restart compatibility. Provider
+credentials are copied into each execution's private spool before launch, so
+parallel lanes do not share writable provider session directories. This local
+limit is independent of, and cannot exceed, the atomic database account and
+resource-policy capacity checks.
 
 `workerd` enables V2 generation handoff only with
 `WORKER_EXECUTION_MODE=executor-handoff` and the same

@@ -1,6 +1,9 @@
 use std::{env, path::PathBuf, sync::Arc, time::Duration};
 
-use gpt_image_2_gateway::executor::{ExecutorDaemon, ExecutorDaemonRun};
+use gpt_image_2_gateway::executor::{
+    DurableEvidenceRecovery, DurableRunner, ExecutorDaemon, ExecutorDaemonRun,
+    ExecutorEvidenceStore, ExecutorSubmissionStore,
+};
 use gpt_image_2_gateway::{
     CodexProcessSupervisor, ExecutorExecutionProfileStore, ExecutorOwnerGuardError,
     ExecutorProcessSupervisor, ExecutorProfileBinding, GrokProcessSupervisor, ImageGatewayError,
@@ -18,6 +21,7 @@ use gpt_image_2_gateway::{
     identify_executor_profile_binding, init_telemetry,
     runner::FilesystemRunnerJournal,
 };
+use tokio::{sync::watch, task::JoinSet};
 
 const DEFAULT_LEASE_MS: u64 = 60_000;
 const DEFAULT_HEARTBEAT_MS: u64 = 10_000;
@@ -26,6 +30,8 @@ const DEFAULT_PROCESS_POLL_MS: u64 = 100;
 const DEFAULT_PROCESS_STARTUP_GRACE_MS: u64 = 60_000;
 const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 15 * 60 * 1_000;
 const DEFAULT_OWNER_GUARD_TIMEOUT_MS: u64 = 5_000;
+const DEFAULT_MAX_IN_FLIGHT: usize = 1;
+const MAX_IN_FLIGHT: usize = 64;
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
 
 struct ExecutorConfig {
@@ -42,6 +48,7 @@ struct ExecutorConfig {
     process_startup_grace: Duration,
     request_timeout: Duration,
     owner_guard_timeout: Duration,
+    max_in_flight: usize,
     proxy: ProxyConfig,
 }
 
@@ -79,6 +86,15 @@ impl ExecutorConfig {
             "EXECUTOR_OWNER_GUARD_TIMEOUT_MS",
             DEFAULT_OWNER_GUARD_TIMEOUT_MS,
         )?;
+        let max_in_flight = usize::try_from(env_u64(
+            "EXECUTOR_MAX_IN_FLIGHT",
+            DEFAULT_MAX_IN_FLIGHT as u64,
+        )?)
+        .ok()
+        .filter(|value| (1..=MAX_IN_FLIGHT).contains(value))
+        .ok_or_else(|| {
+            ImageGatewayError::config("EXECUTOR_MAX_IN_FLIGHT must be between 1 and 64")
+        })?;
         if lease_ms == 0
             || lease_ms > 24 * 60 * 60 * 1_000
             || heartbeat_ms == 0
@@ -109,6 +125,7 @@ impl ExecutorConfig {
             process_startup_grace: Duration::from_millis(process_startup_grace_ms),
             request_timeout: Duration::from_millis(request_timeout_ms),
             owner_guard_timeout: Duration::from_millis(owner_guard_timeout_ms),
+            max_in_flight,
             proxy: proxy_from_env(),
         })
     }
@@ -187,14 +204,6 @@ async fn main() -> Result<(), ImageGatewayError> {
         ));
     }
     let scope = profile.claim_scope();
-    let mut owner_guard = PostgresExecutorOwnerGuard::acquire(
-        &pool,
-        &config.owner,
-        &scope,
-        config.owner_guard_timeout,
-    )
-    .await
-    .map_err(|error| ImageGatewayError::service_unavailable(error.to_string()))?;
     let supervisor = match binding {
         ExecutorProfileBinding::CodexImageGeneration => ExecutorProcessSupervisor::Codex(
             CodexProcessSupervisor::new(
@@ -231,16 +240,18 @@ async fn main() -> Result<(), ImageGatewayError> {
     };
     let publisher = ExecutorArtifactPublisher::with_filesystem_store(artifacts, store.clone());
     let runner = JournaledDurableRunner::new(store.clone(), journal, supervisor, publisher);
-    let daemon = ExecutorDaemon::new(
-        store,
-        runner,
-        scope.clone(),
-        config.owner.clone(),
-        config.lease_ms,
-        config.heartbeat_interval,
-    );
+    let lane_owners = executor_lane_owners(&config.owner, config.max_in_flight)?;
+    let mut owner_guard = PostgresExecutorOwnerGuard::acquire(
+        &pool,
+        &config.owner,
+        &scope,
+        config.owner_guard_timeout,
+    )
+    .await
+    .map_err(|error| ImageGatewayError::service_unavailable(error.to_string()))?;
     tracing::info!(
         owner = %config.owner,
+        executor.max_in_flight = config.max_in_flight,
         execution.profile.id = %scope.execution_profile_id,
         execution.profile.key = %profile.profile_key,
         provider.id = %scope.provider_id,
@@ -248,18 +259,83 @@ async fn main() -> Result<(), ImageGatewayError> {
         adapter.revision = %scope.adapter_revision,
         "executord started"
     );
-    let shutdown = shutdown_signal();
-    tokio::pin!(shutdown);
     let drain_timeout = config
         .request_timeout
         .saturating_add(config.process_startup_grace)
         .saturating_add(SHUTDOWN_GRACE);
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let mut lanes = JoinSet::new();
+    for (lane_index, owner) in lane_owners.into_iter().enumerate() {
+        let daemon = ExecutorDaemon::new(
+            store.clone(),
+            runner.clone(),
+            scope.clone(),
+            owner.clone(),
+            config.lease_ms,
+            config.heartbeat_interval,
+        );
+        lanes.spawn(run_executor_lane(
+            lane_index,
+            owner,
+            daemon,
+            config.poll_interval,
+            drain_timeout,
+            shutdown_rx.clone(),
+        ));
+    }
+    let guard_watch = monitor_owner_guard(&mut owner_guard, config.heartbeat_interval);
+    tokio::pin!(guard_watch);
+    let mut result = tokio::select! {
+        _ = shutdown_signal() => Ok(()),
+        guard = &mut guard_watch => Err(ImageGatewayError::service_unavailable(guard.to_string())),
+        completed = lanes.join_next() => match completed {
+            Some(Ok(Err(error))) => Err(error),
+            Some(Ok(Ok(()))) => Err(ImageGatewayError::service_unavailable(
+                "executor lane exited unexpectedly",
+            )),
+            Some(Err(_)) => Err(ImageGatewayError::service_unavailable(
+                "executor lane task failed",
+            )),
+            None => Err(ImageGatewayError::service_unavailable(
+                "executor has no active lanes",
+            )),
+        },
+    };
+    let _ = shutdown_tx.send(true);
+    while let Some(completed) = lanes.join_next().await {
+        let lane_error = match completed {
+            Ok(Ok(())) => None,
+            Ok(Err(error)) => Some(error),
+            Err(_) => Some(ImageGatewayError::service_unavailable(
+                "executor lane task failed",
+            )),
+        };
+        if result.is_ok()
+            && let Some(error) = lane_error
+        {
+            result = Err(error);
+        }
+    }
+    telemetry.shutdown();
+    result
+}
 
-    'executor: loop {
-        owner_guard
-            .verify()
-            .await
-            .map_err(|error| ImageGatewayError::service_unavailable(error.to_string()))?;
+async fn run_executor_lane<S, R>(
+    lane_index: usize,
+    owner: String,
+    daemon: ExecutorDaemon<S, R>,
+    poll_interval: Duration,
+    drain_timeout: Duration,
+    mut shutdown: watch::Receiver<bool>,
+) -> Result<(), ImageGatewayError>
+where
+    S: ExecutorSubmissionStore + ExecutorEvidenceStore,
+    R: DurableRunner + DurableEvidenceRecovery,
+{
+    loop {
+        if *shutdown.borrow() {
+            break;
+        }
         let run = async {
             match daemon.recover_evidence_once().await? {
                 ExecutorDaemonRun::Recorded => Ok(ExecutorDaemonRun::Recorded),
@@ -267,44 +343,73 @@ async fn main() -> Result<(), ImageGatewayError> {
             }
         };
         tokio::pin!(run);
-        let guard_watch = monitor_owner_guard(&mut owner_guard, config.heartbeat_interval);
-        tokio::pin!(guard_watch);
         let (result, shutting_down) = tokio::select! {
-            guard = &mut guard_watch => {
-                telemetry.shutdown();
-                return Err(ImageGatewayError::service_unavailable(guard.to_string()));
-            }
-            _ = &mut shutdown => {
-                tracing::info!("executord draining in-flight execution");
-                match tokio::time::timeout(drain_timeout, &mut run).await {
-                    Ok(result) => (result, true),
-                    Err(_) => {
-                        telemetry.shutdown();
-                        return Err(ImageGatewayError::service_unavailable(
-                            "executord shutdown drain timed out; durable helper evidence was retained",
-                        ));
-                    }
-                }
+            _ = shutdown.changed() => {
+                tracing::info!(
+                    executor.lane = lane_index,
+                    executor.owner = %owner,
+                    "executor lane draining in-flight execution"
+                );
+                let result = tokio::time::timeout(drain_timeout, &mut run)
+                    .await
+                    .map_err(|_| ImageGatewayError::service_unavailable(
+                        "executord shutdown drain timed out; durable helper evidence was retained",
+                    ))?;
+                (result, true)
             }
             result = &mut run => (result, false),
         };
         match result {
             Ok(ExecutorDaemonRun::Recorded) => {
-                tracing::info!("executor outcome recorded");
+                tracing::info!(
+                    executor.lane = lane_index,
+                    executor.owner = %owner,
+                    "executor outcome recorded"
+                );
             }
             Ok(ExecutorDaemonRun::Idle) => {}
-            Err(error) => tracing::error!(error = ?error, "executor iteration failed"),
+            Err(error) => tracing::error!(
+                executor.lane = lane_index,
+                executor.owner = %owner,
+                error = ?error,
+                "executor iteration failed"
+            ),
         }
         if shutting_down {
-            break 'executor;
+            break;
         }
         tokio::select! {
-            _ = &mut shutdown => break 'executor,
-            _ = tokio::time::sleep(config.poll_interval) => {}
+            _ = shutdown.changed() => break,
+            _ = tokio::time::sleep(poll_interval) => {}
         }
     }
-    telemetry.shutdown();
     Ok(())
+}
+
+fn executor_lane_owners(
+    base_owner: &str,
+    max_in_flight: usize,
+) -> Result<Vec<String>, ImageGatewayError> {
+    if base_owner.is_empty() || max_in_flight == 0 || max_in_flight > MAX_IN_FLIGHT {
+        return Err(ImageGatewayError::config(
+            "executor lane owner configuration is invalid",
+        ));
+    }
+    (0..max_in_flight)
+        .map(|lane_index| {
+            let owner = if lane_index == 0 {
+                base_owner.to_string()
+            } else {
+                format!("{base_owner}.lane-{lane_index}")
+            };
+            if owner.len() > 128 || !owner.bytes().all(|byte| byte.is_ascii_graphic()) {
+                return Err(ImageGatewayError::config(
+                    "executor lane owner must contain at most 128 visible ASCII bytes",
+                ));
+            }
+            Ok(owner)
+        })
+        .collect()
 }
 
 async fn monitor_owner_guard(
@@ -436,5 +541,33 @@ mod tests {
         std::fs::create_dir(&credentials).unwrap();
 
         assert!(validate_isolated_trees(&artifact, &runner, &credentials).is_err());
+    }
+
+    #[test]
+    fn single_lane_preserves_legacy_owner_for_recovery() {
+        assert_eq!(
+            executor_lane_owners("executord-host-profile", 1).unwrap(),
+            ["executord-host-profile"]
+        );
+    }
+
+    #[test]
+    fn parallel_lanes_have_stable_distinct_owners() {
+        assert_eq!(
+            executor_lane_owners("executord-host-profile", 4).unwrap(),
+            [
+                "executord-host-profile",
+                "executord-host-profile.lane-1",
+                "executord-host-profile.lane-2",
+                "executord-host-profile.lane-3",
+            ]
+        );
+    }
+
+    #[test]
+    fn parallel_lane_owner_must_fit_database_limit() {
+        let base = "x".repeat(128);
+        assert!(executor_lane_owners(&base, 1).is_ok());
+        assert!(executor_lane_owners(&base, 2).is_err());
     }
 }

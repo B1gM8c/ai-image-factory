@@ -100,6 +100,7 @@ impl ExecutorArtifactBlobStore for InMemoryArtifactBlobStore {
     }
 }
 
+#[derive(Clone)]
 pub struct ExecutorArtifactPublisher {
     blobs: Arc<dyn ExecutorArtifactBlobStore>,
     authorities: Arc<dyn ExecutorArtifactAuthorityStore>,

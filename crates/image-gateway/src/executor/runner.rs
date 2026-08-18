@@ -264,6 +264,7 @@ pub trait ExecutorArtifactSink: Send + Sync + 'static {
     ) -> Result<ExecutorResultManifest, RunnerError>;
 }
 
+#[derive(Clone)]
 pub struct JournaledDurableRunner<C, S, A> {
     contexts: C,
     journal: Arc<FilesystemRunnerJournal>,

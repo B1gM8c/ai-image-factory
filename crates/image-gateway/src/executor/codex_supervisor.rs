@@ -60,6 +60,7 @@ const MAX_CODEX_SESSION_LINE_BYTES: usize =
     ((MAX_CODEX_RUNTIME_OUTPUT_BYTES as usize + 2) / 3) * 4 + 64 * 1024;
 const MAX_CODEX_SESSION_FILE_BYTES: u64 = (MAX_CODEX_SESSION_LINE_BYTES as u64) * 4;
 
+#[derive(Clone)]
 pub struct CodexProcessSupervisor {
     journal: Arc<FilesystemRunnerJournal>,
     helper_executable: PathBuf,
