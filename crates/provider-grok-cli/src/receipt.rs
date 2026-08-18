@@ -94,7 +94,7 @@ pub enum GrokReceiptError {
     #[error("Grok history does not contain the exact expected tool call sequence")]
     MissingToolResult,
     #[error("Grok tool arguments differ from the admitted request")]
-    ToolArgumentsMismatch,
+    ToolArgumentsMismatch { field: &'static str },
     #[error("Grok video generation requires output.upload_url for a Zero Data Retention team")]
     VideoOutputUploadUrlRequired,
     #[error("Grok tool execution failed")]
@@ -103,6 +103,19 @@ pub enum GrokReceiptError {
     InvalidToolResult,
     #[error("Grok tool result points outside the expected session artifact path")]
     ArtifactPathMismatch,
+}
+
+impl GrokReceiptError {
+    pub fn tool_arguments_mismatch_field(&self) -> Option<&'static str> {
+        match self {
+            Self::ToolArgumentsMismatch { field } => Some(field),
+            _ => None,
+        }
+    }
+}
+
+fn tool_arguments_mismatch(field: &'static str) -> GrokReceiptError {
+    GrokReceiptError::ToolArgumentsMismatch { field }
 }
 
 struct EndEvent {
@@ -280,33 +293,33 @@ fn validate_tool_arguments(
         expected.tool(),
         GrokTool::ImageGeneration | GrokTool::ImageEdit
     ) {
-        return Err(GrokReceiptError::ToolArgumentsMismatch);
+        return Err(tool_arguments_mismatch("arguments"));
     }
 
     // The agent may normalize image prompts; routing, inputs, and execution controls remain exact.
     let expected = expected
         .arguments()
         .as_object()
-        .ok_or(GrokReceiptError::ToolArgumentsMismatch)?;
+        .ok_or_else(|| tool_arguments_mismatch("arguments"))?;
     let actual = actual
         .as_object()
-        .ok_or(GrokReceiptError::ToolArgumentsMismatch)?;
+        .ok_or_else(|| tool_arguments_mismatch("arguments"))?;
     if expected.len() != actual.len()
         || expected.iter().any(|(field, expected_value)| {
             field != "prompt" && actual.get(field) != Some(expected_value)
         })
         || actual.keys().any(|field| !expected.contains_key(field))
     {
-        return Err(GrokReceiptError::ToolArgumentsMismatch);
+        return Err(tool_arguments_mismatch("arguments"));
     }
 
     actual
         .get("prompt")
         .and_then(Value::as_str)
         .filter(|prompt| !prompt.trim().is_empty() && !prompt.contains('\0'))
-        .ok_or(GrokReceiptError::ToolArgumentsMismatch)?;
+        .ok_or_else(|| tool_arguments_mismatch("prompt"))?;
     if !expected.get("prompt").is_some_and(Value::is_string) {
-        return Err(GrokReceiptError::ToolArgumentsMismatch);
+        return Err(tool_arguments_mismatch("prompt"));
     }
     Ok(())
 }
@@ -314,29 +327,39 @@ fn validate_tool_arguments(
 fn validate_video_tool_arguments(expected: &Value, actual: &Value) -> Result<(), GrokReceiptError> {
     let expected = expected
         .as_object()
-        .ok_or(GrokReceiptError::ToolArgumentsMismatch)?;
+        .ok_or_else(|| tool_arguments_mismatch("arguments"))?;
     let actual = actual
         .as_object()
-        .ok_or(GrokReceiptError::ToolArgumentsMismatch)?;
+        .ok_or_else(|| tool_arguments_mismatch("arguments"))?;
 
     // Grok's video tool schema accepts duration as either a JSON number or a numeric string.
     // It also defaults omitted/null duration to 6 seconds and omitted resolution to 480p.
     // Every business-semantic input remains exact, and non-default controls cannot be omitted.
-    if actual.keys().any(|field| !expected.contains_key(field))
-        || expected.iter().any(|(field, expected_value)| {
-            let actual_value = actual.get(field);
-            match field.as_str() {
-                "duration" => !equivalent_video_duration(expected_value, actual_value),
-                "resolution_name" => {
-                    actual_value != Some(expected_value)
-                        && !(actual_value.is_none() && expected_value == "480p")
-                }
-                _ if expected_value.is_null() => actual_value.is_some_and(|value| !value.is_null()),
-                _ => actual_value != Some(expected_value),
+    if actual.keys().any(|field| !expected.contains_key(field)) {
+        return Err(tool_arguments_mismatch("keys"));
+    }
+    for (field, expected_value) in expected {
+        let actual_value = actual.get(field);
+        let equivalent = match field.as_str() {
+            "duration" => equivalent_video_duration(expected_value, actual_value),
+            "resolution_name" => {
+                actual_value == Some(expected_value)
+                    || (actual_value.is_none() && expected_value == "480p")
             }
-        })
-    {
-        return Err(GrokReceiptError::ToolArgumentsMismatch);
+            _ if expected_value.is_null() => actual_value.is_none_or(Value::is_null),
+            _ => actual_value == Some(expected_value),
+        };
+        if !equivalent {
+            return Err(tool_arguments_mismatch(match field.as_str() {
+                "prompt" => "prompt",
+                "image" => "image",
+                "images" => "images",
+                "aspect_ratio" => "aspect_ratio",
+                "duration" => "duration",
+                "resolution_name" => "resolution_name",
+                _ => "arguments",
+            }));
+        }
     }
     Ok(())
 }

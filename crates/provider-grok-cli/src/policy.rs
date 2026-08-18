@@ -6,6 +6,8 @@ use thiserror::Error;
 
 use crate::{GrokImageEditRequestV1, GrokImageGenerationRequestV1, GrokVideoGenerationRequestV1};
 
+const EXACT_VIDEO_DISPATCH_SYSTEM_PROMPT: &str = "You are a deterministic media tool dispatcher. Execute only the enabled tool calls requested by the user. Copy every JSON argument exactly without rewriting, omitting, adding, or normalizing any value. After the final tool result, end immediately.";
+
 const MAX_SESSION_CWD_COMPONENT_BYTES: usize = 255;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -203,7 +205,7 @@ impl GrokCliPolicyV1 {
         } else {
             "5"
         };
-        let mut command = CommandSpec::new_receipt(
+        let command = CommandSpec::new_receipt(
             self.executable.clone(),
             workspace.clone(),
             self.wall_timeout,
@@ -221,20 +223,29 @@ impl GrokCliPolicyV1 {
         .arg("--no-memory")?
         .arg("--no-plan")?
         .arg("--no-subagents")?
-        .arg("--disable-web-search")?
-        .arg("--always-approve")?
-        .arg("--tools")?
-        .arg(enabled_tools)?
-        .arg("--max-turns")?
-        .arg(max_turns)?
-        .arg("--no-wait-for-background")?
-        .arg("--session-id")?
-        .arg(session_id)?
-        .arg("--output-format")?
-        .arg("streaming-json")?
-        .arg("--prompt-file")?
-        .arg("/dev/stdin")?
-        .stdin(prompt.into_bytes())?;
+        .arg("--disable-web-search")?;
+        let command = if matches!(request, GrokCliRequestV1::VideoGeneration(_)) {
+            command
+                .arg("--verbatim")?
+                .arg("--system-prompt-override")?
+                .arg(EXACT_VIDEO_DISPATCH_SYSTEM_PROMPT)?
+        } else {
+            command
+        };
+        let mut command = command
+            .arg("--always-approve")?
+            .arg("--tools")?
+            .arg(enabled_tools)?
+            .arg("--max-turns")?
+            .arg(max_turns)?
+            .arg("--no-wait-for-background")?
+            .arg("--session-id")?
+            .arg(session_id)?
+            .arg("--output-format")?
+            .arg("streaming-json")?
+            .arg("--prompt-file")?
+            .arg("/dev/stdin")?
+            .stdin(prompt.into_bytes())?;
 
         if let GrokCliRequestV1::ImageGeneration(request) = request {
             command = command.env("GROK_IMAGE_GEN_MODEL_OVERRIDE", request.model().as_str())?;

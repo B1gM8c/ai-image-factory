@@ -91,6 +91,7 @@ enum ChildOutcome {
 struct GrokReceiptPolicy {
     command: CommandSpec,
     invocation: GrokInvocationV1,
+    executor_execution_id: Uuid,
     spool: Arc<ExecutionSpool>,
     history_relative_path: PathBuf,
 }
@@ -656,6 +657,7 @@ async fn run_grok_child(
     let runtime = CliRuntime::new(GrokReceiptPolicy {
         command,
         invocation,
+        executor_execution_id,
         spool: Arc::clone(&spool),
         history_relative_path,
     });
@@ -753,7 +755,16 @@ impl ReceiptCliPolicy for GrokReceiptPolicy {
             .map_err(|_| GrokReceiptPolicyError::History)?;
         let history = read_bounded_regular_file(history_file, MAX_HISTORY_BYTES as u64)
             .map_err(|_| GrokReceiptPolicyError::History)?;
-        parse_invocation_receipt(stdout, &history, &self.invocation).map_err(Into::into)
+        parse_invocation_receipt(stdout, &history, &self.invocation).map_err(|error| {
+            if let Some(field) = error.tool_arguments_mismatch_field() {
+                tracing::info!(
+                    executor.execution_id = %self.executor_execution_id,
+                    grok.receipt.mismatch_field = field,
+                    "Grok tool arguments differ from the admitted request"
+                );
+            }
+            error.into()
+        })
     }
 }
 

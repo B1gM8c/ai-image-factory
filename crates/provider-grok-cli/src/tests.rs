@@ -503,9 +503,10 @@ fn policy_separates_runtime_credentials_workspace_and_user_prompt() {
 #[test]
 fn image_to_video_policy_keeps_the_native_tool_enabled() {
     let fixture = PolicyFixture::new();
+    let prompt = "x".repeat(1_181);
     let request = GrokVideoGenerationRequestV1::ImageToVideo(
         ImageToVideoRequestV1::new(
-            Some("slow push in".to_owned()),
+            Some(prompt.clone()),
             staged("first.png"),
             VideoDuration::Seconds6,
             VideoResolution::P480,
@@ -522,9 +523,19 @@ fn image_to_video_policy_keeps_the_native_tool_enabled() {
             .get(OsStr::new("GROK_DISABLE_ZDR_INCOMPATIBLE_TOOLS"))
             .is_none()
     );
+    let arguments = video_command.arguments();
+    assert!(arguments.iter().any(|argument| argument == "--verbatim"));
+    let system_prompt = arguments
+        .windows(2)
+        .find(|pair| pair[0] == "--system-prompt-override")
+        .map(|pair| pair[1].to_string_lossy())
+        .unwrap();
+    assert!(system_prompt.contains("deterministic media tool dispatcher"));
+    assert!(system_prompt.contains("Copy every JSON argument exactly"));
     let prompt = std::str::from_utf8(video_command.stdin_bytes()).unwrap();
     assert!(prompt.starts_with("Call the enabled `image_to_video` tool exactly once"));
     assert!(!prompt.contains("Execute these enabled tool calls in order"));
+    assert!(prompt.contains(&"x".repeat(1_181)));
 
     let fixture = PolicyFixture::new();
     let image_request =
@@ -539,6 +550,18 @@ fn image_to_video_policy_keeps_the_native_tool_enabled() {
             .environment()
             .get(OsStr::new("GROK_DISABLE_ZDR_INCOMPATIBLE_TOOLS"))
             .is_none()
+    );
+    assert!(
+        !image_command
+            .arguments()
+            .iter()
+            .any(|argument| argument == "--verbatim")
+    );
+    assert!(
+        !image_command
+            .arguments()
+            .iter()
+            .any(|argument| argument == "--system-prompt-override")
     );
 }
 
@@ -564,6 +587,18 @@ fn text_video_policy_binds_the_exact_two_step_cli_workflow() {
             .arguments()
             .iter()
             .any(|argument| argument == "image_gen,image_to_video")
+    );
+    assert!(
+        command
+            .arguments()
+            .iter()
+            .any(|argument| argument == "--verbatim")
+    );
+    assert!(
+        command
+            .arguments()
+            .iter()
+            .any(|argument| argument == "--system-prompt-override")
     );
     assert!(command.arguments().iter().any(|argument| argument == "5"));
     assert_eq!(
@@ -742,9 +777,29 @@ fn image_to_video_receipt_rejects_semantic_argument_drift() {
         let history = history_with(&invocation, drifted_arguments, invocation.artifact_path());
         assert!(matches!(
             parse_invocation_receipt(&valid_stdout(), &history, &invocation),
-            Err(GrokReceiptError::ToolArgumentsMismatch)
+            Err(GrokReceiptError::ToolArgumentsMismatch { .. })
         ));
     }
+
+    let mut prompt_drift = invocation.expected_arguments().clone();
+    prompt_drift["prompt"] = json!("different motion");
+    let history = history_with(&invocation, prompt_drift, invocation.artifact_path());
+    assert_eq!(
+        parse_invocation_receipt(&valid_stdout(), &history, &invocation)
+            .unwrap_err()
+            .tool_arguments_mismatch_field(),
+        Some("prompt")
+    );
+
+    let mut resolution_drift = invocation.expected_arguments().clone();
+    resolution_drift["resolution_name"] = json!("480p");
+    let history = history_with(&invocation, resolution_drift, invocation.artifact_path());
+    assert_eq!(
+        parse_invocation_receipt(&valid_stdout(), &history, &invocation)
+            .unwrap_err()
+            .tool_arguments_mismatch_field(),
+        Some("resolution_name")
+    );
 }
 
 #[test]
@@ -913,7 +968,7 @@ fn image_generation_receipt_rejects_execution_argument_drift() {
         let history = history_with(&invocation, drifted_arguments, invocation.artifact_path());
         assert!(matches!(
             parse_invocation_receipt(&valid_stdout(), &history, &invocation),
-            Err(GrokReceiptError::ToolArgumentsMismatch)
+            Err(GrokReceiptError::ToolArgumentsMismatch { .. })
         ));
     }
 }
@@ -980,7 +1035,7 @@ fn image_edit_receipt_rejects_input_and_execution_argument_drift() {
         let history = history_with(&invocation, drifted_arguments, invocation.artifact_path());
         assert!(matches!(
             parse_invocation_receipt(&valid_stdout(), &history, &invocation),
-            Err(GrokReceiptError::ToolArgumentsMismatch)
+            Err(GrokReceiptError::ToolArgumentsMismatch { .. })
         ));
     }
 }
