@@ -76,6 +76,7 @@ type ConsoleVideoModel = {
     aspect_ratio?: {
       default: string;
       options: string[];
+      supported_for: string[];
     };
     duration: {
       default: number;
@@ -259,6 +260,10 @@ export function VideoWorkspace() {
     () => models.find((model) => model.id === modelId) ?? null,
     [modelId, models],
   );
+  const videoMode = firstFrame ? "image_to_video" : "text_to_video";
+  const aspectRatioSupported = Boolean(
+    selectedModel?.controls.aspect_ratio?.supported_for.includes(videoMode),
+  );
   const generationActive = submitting || task?.status === "pending";
   const canSubmit =
     Boolean(projectId && selectedModel && prompt.trim()) &&
@@ -334,7 +339,7 @@ export function VideoWorkspace() {
         prompt: nextPrompt,
         duration: Number(duration),
         resolution,
-        ...(selectedModel.controls.aspect_ratio
+        ...(aspectRatioSupported
           ? { aspect_ratio: aspectRatio }
           : {}),
         ...(firstFrame ? { image: firstFrame.dataUrl } : {}),
@@ -1319,7 +1324,7 @@ export function VideoWorkspace() {
                 </SelectContent>
               </Select>
 
-              {selectedModel?.controls.aspect_ratio ? (
+              {selectedModel?.controls.aspect_ratio && aspectRatioSupported ? (
                 <Select value={aspectRatio} onValueChange={setAspectRatio}>
                   <SelectTrigger className="h-8 w-24 border-0 bg-muted px-2 shadow-none">
                     <SelectValue />
