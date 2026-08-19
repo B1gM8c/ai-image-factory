@@ -1,7 +1,10 @@
 use image_provider_contracts::openai_codex;
 use image_provider_grok_cli::{
-    GROK_VIDEO_GENERATION_COMMAND_SCHEMA, GROK_VIDEO_GENERATION_OPERATION_V1,
-    PROVIDER_ID as GROK_PROVIDER_ID, VIDEO_ADAPTER_REVISION as GROK_VIDEO_ADAPTER_REVISION,
+    ADAPTER_REVISION as GROK_ADAPTER_REVISION, GROK_IMAGE_EDIT_COMMAND_SCHEMA,
+    GROK_IMAGE_EDIT_OPERATION_V1, GROK_IMAGE_GENERATION_COMMAND_SCHEMA,
+    GROK_IMAGE_GENERATION_OPERATION_V1, GROK_VIDEO_GENERATION_COMMAND_SCHEMA,
+    GROK_VIDEO_GENERATION_OPERATION_V1, PROVIDER_ID as GROK_PROVIDER_ID,
+    VIDEO_ADAPTER_REVISION as GROK_VIDEO_ADAPTER_REVISION,
 };
 use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
@@ -81,15 +84,32 @@ pub async fn reconcile_execution_profile_routes(
                   OR profile.provider_id <> member.provider_id
                   OR profile.operation_id <> member.operation_id
                   OR profile.command_schema <> member.command_schema
-                  OR (
-                    head.provider_id = $4
-                    AND head.operation_id = $5
-                    AND head.command_schema = $6
-                    AND (
-                      profile.operation_descriptor_sha256_v1 <> $7
-                      OR profile.adapter_revision <> $8
+                  OR (head.provider_id = $4 AND (
+                    (
+                      head.operation_id = $5
+                      AND head.command_schema = $6
+                      AND (
+                        profile.operation_descriptor_sha256_v1 <> $7
+                        OR profile.adapter_revision <> $8
+                      )
                     )
-                  )
+                    OR (
+                      head.operation_id = $9
+                      AND head.command_schema = $10
+                      AND (
+                        profile.operation_descriptor_sha256_v1 <> $11
+                        OR profile.adapter_revision <> $12
+                      )
+                    )
+                    OR (
+                      head.operation_id = $13
+                      AND head.command_schema = $14
+                      AND (
+                        profile.operation_descriptor_sha256_v1 <> $15
+                        OR profile.adapter_revision <> $16
+                      )
+                    )
+                  ))
                 )
             )
             OR NOT EXISTS (
@@ -119,6 +139,14 @@ pub async fn reconcile_execution_profile_routes(
     .bind(GROK_VIDEO_GENERATION_COMMAND_SCHEMA)
     .bind(GROK_VIDEO_GENERATION_OPERATION_V1.canonical_sha256_v1_hex())
     .bind(GROK_VIDEO_ADAPTER_REVISION)
+    .bind(GROK_IMAGE_GENERATION_OPERATION_V1.id)
+    .bind(GROK_IMAGE_GENERATION_COMMAND_SCHEMA)
+    .bind(GROK_IMAGE_GENERATION_OPERATION_V1.canonical_sha256_v1_hex())
+    .bind(GROK_ADAPTER_REVISION)
+    .bind(GROK_IMAGE_EDIT_OPERATION_V1.id)
+    .bind(GROK_IMAGE_EDIT_COMMAND_SCHEMA)
+    .bind(GROK_IMAGE_EDIT_OPERATION_V1.canonical_sha256_v1_hex())
+    .bind(GROK_ADAPTER_REVISION)
     .fetch_all(pool)
     .await
     .map_err(store_unavailable)?;
@@ -443,14 +471,42 @@ async fn compatible_replacements(
 }
 
 fn expected_runtime_binding(route: &RouteRevision) -> Option<ExpectedRuntimeBinding> {
-    (route.provider_id == GROK_PROVIDER_ID
-        && route.operation_id == GROK_VIDEO_GENERATION_OPERATION_V1.id
-        && route.command_schema == GROK_VIDEO_GENERATION_COMMAND_SCHEMA)
-        .then(|| ExpectedRuntimeBinding {
-            operation_descriptor_sha256_v1: GROK_VIDEO_GENERATION_OPERATION_V1
-                .canonical_sha256_v1_hex(),
-            adapter_revision: GROK_VIDEO_ADAPTER_REVISION,
-        })
+    if route.provider_id != GROK_PROVIDER_ID {
+        return None;
+    }
+    match (route.operation_id.as_str(), route.command_schema.as_str()) {
+        (operation, schema)
+            if operation == GROK_VIDEO_GENERATION_OPERATION_V1.id
+                && schema == GROK_VIDEO_GENERATION_COMMAND_SCHEMA =>
+        {
+            Some(ExpectedRuntimeBinding {
+                operation_descriptor_sha256_v1: GROK_VIDEO_GENERATION_OPERATION_V1
+                    .canonical_sha256_v1_hex(),
+                adapter_revision: GROK_VIDEO_ADAPTER_REVISION,
+            })
+        }
+        (operation, schema)
+            if operation == GROK_IMAGE_GENERATION_OPERATION_V1.id
+                && schema == GROK_IMAGE_GENERATION_COMMAND_SCHEMA =>
+        {
+            Some(ExpectedRuntimeBinding {
+                operation_descriptor_sha256_v1: GROK_IMAGE_GENERATION_OPERATION_V1
+                    .canonical_sha256_v1_hex(),
+                adapter_revision: GROK_ADAPTER_REVISION,
+            })
+        }
+        (operation, schema)
+            if operation == GROK_IMAGE_EDIT_OPERATION_V1.id
+                && schema == GROK_IMAGE_EDIT_COMMAND_SCHEMA =>
+        {
+            Some(ExpectedRuntimeBinding {
+                operation_descriptor_sha256_v1: GROK_IMAGE_EDIT_OPERATION_V1
+                    .canonical_sha256_v1_hex(),
+                adapter_revision: GROK_ADAPTER_REVISION,
+            })
+        }
+        _ => None,
+    }
 }
 
 async fn insert_route_revision(
@@ -571,4 +627,43 @@ async fn database_now(tx: &mut Transaction<'_, Postgres>) -> Result<i64, ImageGa
 
 fn store_unavailable(_: impl std::fmt::Display) -> ImageGatewayError {
     ImageGatewayError::service_unavailable("provider route reconciliation is unavailable")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn route(operation_id: &str, command_schema: &str) -> RouteRevision {
+        RouteRevision {
+            route_id: Uuid::nil(),
+            revision: 1,
+            provider_id: GROK_PROVIDER_ID.to_owned(),
+            operation_id: operation_id.to_owned(),
+            command_schema: command_schema.to_owned(),
+        }
+    }
+
+    #[test]
+    fn grok_routes_require_the_operation_specific_current_adapter() {
+        let image = expected_runtime_binding(&route(
+            GROK_IMAGE_GENERATION_OPERATION_V1.id,
+            GROK_IMAGE_GENERATION_COMMAND_SCHEMA,
+        ))
+        .unwrap();
+        assert_eq!(image.adapter_revision, GROK_ADAPTER_REVISION);
+
+        let edit = expected_runtime_binding(&route(
+            GROK_IMAGE_EDIT_OPERATION_V1.id,
+            GROK_IMAGE_EDIT_COMMAND_SCHEMA,
+        ))
+        .unwrap();
+        assert_eq!(edit.adapter_revision, GROK_ADAPTER_REVISION);
+
+        let video = expected_runtime_binding(&route(
+            GROK_VIDEO_GENERATION_OPERATION_V1.id,
+            GROK_VIDEO_GENERATION_COMMAND_SCHEMA,
+        ))
+        .unwrap();
+        assert_eq!(video.adapter_revision, GROK_VIDEO_ADAPTER_REVISION);
+    }
 }

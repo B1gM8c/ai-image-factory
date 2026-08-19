@@ -8,6 +8,7 @@ use crate::admission::WorkLease;
 mod codex_request;
 mod codex_supervisor;
 mod daemon;
+mod grok_direct_video;
 mod grok_request;
 mod grok_supervisor;
 mod owner_guard;
@@ -53,8 +54,10 @@ pub use provisioning::{
     provision_dreamina_video_execution_profile,
     provision_dreamina_video_execution_profile_in_transaction,
     provision_grok_edit_execution_profile, provision_grok_edit_execution_profile_in_transaction,
-    provision_grok_execution_profile, provision_grok_execution_profile_in_transaction,
-    provision_grok_video_execution_profile, provision_grok_video_execution_profile_in_transaction,
+    provision_grok_edit_execution_profile_replacement, provision_grok_execution_profile,
+    provision_grok_execution_profile_in_transaction,
+    provision_grok_image_execution_profile_replacement, provision_grok_video_execution_profile,
+    provision_grok_video_execution_profile_in_transaction,
     provision_grok_video_execution_profile_replacement,
 };
 pub use runner::{

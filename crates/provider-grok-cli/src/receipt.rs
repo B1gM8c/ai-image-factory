@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use image_provider_contracts::{ProviderCostEvidenceScope, ProviderReportedCostEvidenceV1};
 use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::{GrokExpectedToolCallV1, GrokInvocationV1, GrokTool, PROVIDER_ID};
@@ -9,6 +10,14 @@ use crate::{GrokExpectedToolCallV1, GrokInvocationV1, GrokTool, PROVIDER_ID};
 pub const MAX_STDOUT_BYTES: usize = 64 * 1024;
 pub const MAX_HISTORY_BYTES: usize = 1024 * 1024;
 const MAX_JSONL_RECORDS: usize = 2_048;
+
+pub type GrokToolArgumentsMismatchSummary<'a> = (
+    &'static str,
+    &'static str,
+    Option<&'a str>,
+    &'static str,
+    Option<&'a str>,
+);
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct GrokCliReceiptV1 {
@@ -94,11 +103,22 @@ pub enum GrokReceiptError {
     #[error("Grok history does not contain the exact expected tool call sequence")]
     MissingToolResult,
     #[error("Grok tool arguments differ from the admitted request")]
-    ToolArgumentsMismatch { field: &'static str },
+    ToolArgumentsMismatch {
+        field: &'static str,
+        expected_type: &'static str,
+        expected_sha256: Option<String>,
+        actual_type: &'static str,
+        actual_sha256: Option<String>,
+    },
     #[error("Grok video generation requires output.upload_url for a Zero Data Retention team")]
     VideoOutputUploadUrlRequired,
     #[error("Grok tool execution failed")]
-    ToolExecutionFailed,
+    ToolExecutionFailed {
+        upstream_code: Option<String>,
+        upstream_type: Option<String>,
+        message_sha256: String,
+        message_bytes: u64,
+    },
     #[error("Grok tool result is invalid")]
     InvalidToolResult,
     #[error("Grok tool result points outside the expected session artifact path")]
@@ -108,14 +128,62 @@ pub enum GrokReceiptError {
 impl GrokReceiptError {
     pub fn tool_arguments_mismatch_field(&self) -> Option<&'static str> {
         match self {
-            Self::ToolArgumentsMismatch { field } => Some(field),
+            Self::ToolArgumentsMismatch { field, .. } => Some(field),
+            _ => None,
+        }
+    }
+
+    pub fn tool_arguments_mismatch_summary(&self) -> Option<GrokToolArgumentsMismatchSummary<'_>> {
+        match self {
+            Self::ToolArgumentsMismatch {
+                field,
+                expected_type,
+                expected_sha256,
+                actual_type,
+                actual_sha256,
+            } => Some((
+                field,
+                expected_type,
+                expected_sha256.as_deref(),
+                actual_type,
+                actual_sha256.as_deref(),
+            )),
+            _ => None,
+        }
+    }
+
+    pub fn tool_execution_failure_summary(
+        &self,
+    ) -> Option<(Option<&str>, Option<&str>, &str, u64)> {
+        match self {
+            Self::ToolExecutionFailed {
+                upstream_code,
+                upstream_type,
+                message_sha256,
+                message_bytes,
+            } => Some((
+                upstream_code.as_deref(),
+                upstream_type.as_deref(),
+                message_sha256,
+                *message_bytes,
+            )),
             _ => None,
         }
     }
 }
 
-fn tool_arguments_mismatch(field: &'static str) -> GrokReceiptError {
-    GrokReceiptError::ToolArgumentsMismatch { field }
+fn tool_arguments_mismatch(
+    field: &'static str,
+    expected: Option<&Value>,
+    actual: Option<&Value>,
+) -> GrokReceiptError {
+    GrokReceiptError::ToolArgumentsMismatch {
+        field,
+        expected_type: expected.map(json_type).unwrap_or("missing"),
+        expected_sha256: expected.and_then(json_sha256),
+        actual_type: actual.map(json_type).unwrap_or("missing"),
+        actual_sha256: actual.and_then(json_sha256),
+    }
 }
 
 struct EndEvent {
@@ -252,7 +320,7 @@ fn parse_history(
                     return Err(GrokReceiptError::VideoOutputUploadUrlRequired);
                 }
                 if content.starts_with("Tool `") && content.contains("` failed:") {
-                    return Err(GrokReceiptError::ToolExecutionFailed);
+                    return Err(tool_execution_failed(content));
                 }
                 let tool_result = serde_json::from_str(content)
                     .map_err(|_| GrokReceiptError::InvalidToolResult)?;
@@ -293,33 +361,47 @@ fn validate_tool_arguments(
         expected.tool(),
         GrokTool::ImageGeneration | GrokTool::ImageEdit
     ) {
-        return Err(tool_arguments_mismatch("arguments"));
+        return Err(tool_arguments_mismatch(
+            "arguments",
+            Some(expected.arguments()),
+            Some(actual),
+        ));
     }
 
     // The agent may normalize image prompts; routing, inputs, and execution controls remain exact.
     let expected = expected
         .arguments()
         .as_object()
-        .ok_or_else(|| tool_arguments_mismatch("arguments"))?;
+        .ok_or_else(|| tool_arguments_mismatch("arguments", Some(expected.arguments()), None))?;
     let actual = actual
         .as_object()
-        .ok_or_else(|| tool_arguments_mismatch("arguments"))?;
+        .ok_or_else(|| tool_arguments_mismatch("arguments", None, Some(actual)))?;
     if expected.len() != actual.len()
         || expected.iter().any(|(field, expected_value)| {
             field != "prompt" && actual.get(field) != Some(expected_value)
         })
         || actual.keys().any(|field| !expected.contains_key(field))
     {
-        return Err(tool_arguments_mismatch("arguments"));
+        return Err(tool_arguments_mismatch(
+            "arguments",
+            Some(&Value::Object(expected.clone())),
+            Some(&Value::Object(actual.clone())),
+        ));
     }
 
     actual
         .get("prompt")
         .and_then(Value::as_str)
         .filter(|prompt| !prompt.trim().is_empty() && !prompt.contains('\0'))
-        .ok_or_else(|| tool_arguments_mismatch("prompt"))?;
+        .ok_or_else(|| {
+            tool_arguments_mismatch("prompt", expected.get("prompt"), actual.get("prompt"))
+        })?;
     if !expected.get("prompt").is_some_and(Value::is_string) {
-        return Err(tool_arguments_mismatch("prompt"));
+        return Err(tool_arguments_mismatch(
+            "prompt",
+            expected.get("prompt"),
+            actual.get("prompt"),
+        ));
     }
     Ok(())
 }
@@ -327,16 +409,20 @@ fn validate_tool_arguments(
 fn validate_video_tool_arguments(expected: &Value, actual: &Value) -> Result<(), GrokReceiptError> {
     let expected = expected
         .as_object()
-        .ok_or_else(|| tool_arguments_mismatch("arguments"))?;
+        .ok_or_else(|| tool_arguments_mismatch("arguments", Some(expected), None))?;
     let actual = actual
         .as_object()
-        .ok_or_else(|| tool_arguments_mismatch("arguments"))?;
+        .ok_or_else(|| tool_arguments_mismatch("arguments", None, Some(actual)))?;
 
     // Grok's video tool schema accepts duration as either a JSON number or a numeric string.
     // It also defaults omitted/null duration to 6 seconds and omitted resolution to 480p.
     // Every business-semantic input remains exact, and non-default controls cannot be omitted.
     if actual.keys().any(|field| !expected.contains_key(field)) {
-        return Err(tool_arguments_mismatch("keys"));
+        return Err(tool_arguments_mismatch(
+            "keys",
+            Some(&Value::Object(expected.clone())),
+            Some(&Value::Object(actual.clone())),
+        ));
     }
     for (field, expected_value) in expected {
         let actual_value = actual.get(field);
@@ -350,7 +436,7 @@ fn validate_video_tool_arguments(expected: &Value, actual: &Value) -> Result<(),
             _ => actual_value == Some(expected_value),
         };
         if !equivalent {
-            return Err(tool_arguments_mismatch(match field.as_str() {
+            let field_name = match field.as_str() {
                 "prompt" => "prompt",
                 "image" => "image",
                 "images" => "images",
@@ -358,7 +444,12 @@ fn validate_video_tool_arguments(expected: &Value, actual: &Value) -> Result<(),
                 "duration" => "duration",
                 "resolution_name" => "resolution_name",
                 _ => "arguments",
-            }));
+            };
+            return Err(tool_arguments_mismatch(
+                field_name,
+                Some(expected_value),
+                actual_value,
+            ));
         }
     }
     Ok(())
@@ -377,6 +468,71 @@ fn equivalent_video_duration(expected: &Value, actual: Option<&Value>) -> bool {
         None | Some(Value::Null) => expected == 6,
         _ => false,
     }
+}
+
+fn tool_execution_failed(content: &str) -> GrokReceiptError {
+    let detail = content
+        .split_once("` failed:")
+        .map(|(_, detail)| detail.trim())
+        .filter(|detail| !detail.is_empty())
+        .unwrap_or(content);
+    let parsed: Option<Value> = serde_json::from_str(detail).ok();
+    let error = parsed.as_ref().and_then(|value| value.get("error"));
+    let safe_token = |value: &str| {
+        let value = value.trim();
+        (!value.is_empty()
+            && value.len() <= 128
+            && value.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':')
+            }))
+        .then(|| value.to_owned())
+    };
+    let upstream_code = error
+        .and_then(|value| value.get("code"))
+        .and_then(Value::as_str)
+        .and_then(safe_token);
+    let upstream_type = error
+        .and_then(|value| value.get("type"))
+        .and_then(Value::as_str)
+        .and_then(safe_token);
+    let message = error
+        .and_then(|value| value.get("message"))
+        .and_then(Value::as_str)
+        .or_else(|| error.and_then(Value::as_str))
+        .unwrap_or(detail);
+    GrokReceiptError::ToolExecutionFailed {
+        upstream_code,
+        upstream_type,
+        message_sha256: hex_sha256(message.as_bytes()),
+        message_bytes: message.len() as u64,
+    }
+}
+
+fn json_type(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
+fn json_sha256(value: &Value) -> Option<String> {
+    serde_json::to_vec(value)
+        .ok()
+        .map(|bytes| hex_sha256(&bytes))
+}
+
+fn hex_sha256(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    Sha256::digest(bytes)
+        .iter()
+        .fold(String::with_capacity(64), |mut output, byte| {
+            let _ = write!(output, "{byte:02x}");
+            output
+        })
 }
 
 fn validate_tool_result(

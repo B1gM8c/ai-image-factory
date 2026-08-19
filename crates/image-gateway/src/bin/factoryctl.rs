@@ -11,7 +11,8 @@ use gpt_image_2_gateway::{
     },
     grok_auth_file_sha256,
     provider_management::PostgresProviderManagementService,
-    provision_codex_execution_profile, provision_grok_execution_profile,
+    provision_codex_execution_profile, provision_grok_edit_execution_profile_replacement,
+    provision_grok_execution_profile, provision_grok_image_execution_profile_replacement,
     provision_grok_video_execution_profile, provision_grok_video_execution_profile_replacement,
     reconcile_execution_profile_routes, reconcile_inline_customer_settlement,
 };
@@ -23,6 +24,14 @@ enum Command {
     ProvisionGrokProfile,
     ProvisionGrokVideoProfile,
     ProvisionGrokVideoProfileReplacement {
+        source_profile_key: String,
+        replacement_profile_key: String,
+    },
+    ProvisionGrokImageProfileReplacement {
+        source_profile_key: String,
+        replacement_profile_key: String,
+    },
+    ProvisionGrokEditProfileReplacement {
         source_profile_key: String,
         replacement_profile_key: String,
     },
@@ -44,7 +53,7 @@ where
 {
     let mut args = args.into_iter();
     let command = args.next().ok_or_else(|| {
-        "missing command: expected `migrate`, `bootstrap-admin`, `provision-codex-profile`, `provision-grok-profile`, `provision-grok-video-profile`, `provision-grok-video-profile-replacement`, `reconcile-execution-profile-routes`, `reconcile-dreamina-profiles`, or `reconcile-inline-customer-settlement`"
+        "missing command: expected `migrate`, `bootstrap-admin`, `provision-codex-profile`, `provision-grok-profile`, `provision-grok-video-profile`, `provision-grok-image-profile-replacement`, `provision-grok-edit-profile-replacement`, `provision-grok-video-profile-replacement`, `reconcile-execution-profile-routes`, `reconcile-dreamina-profiles`, or `reconcile-inline-customer-settlement`"
             .to_string()
     })?;
     let command = match command.as_ref() {
@@ -76,6 +85,32 @@ where
                 replacement_profile_key,
             }
         }
+        "provision-grok-image-profile-replacement" => {
+            Command::ProvisionGrokImageProfileReplacement {
+                source_profile_key: required_argument(
+                    &mut args,
+                    "provision-grok-image-profile-replacement",
+                    "source profile key",
+                )?,
+                replacement_profile_key: required_argument(
+                    &mut args,
+                    "provision-grok-image-profile-replacement",
+                    "replacement profile key",
+                )?,
+            }
+        }
+        "provision-grok-edit-profile-replacement" => Command::ProvisionGrokEditProfileReplacement {
+            source_profile_key: required_argument(
+                &mut args,
+                "provision-grok-edit-profile-replacement",
+                "source profile key",
+            )?,
+            replacement_profile_key: required_argument(
+                &mut args,
+                "provision-grok-edit-profile-replacement",
+                "replacement profile key",
+            )?,
+        },
         "reconcile-execution-profile-routes" => Command::ReconcileExecutionProfileRoutes,
         "reconcile-dreamina-profiles" => Command::ReconcileDreaminaProfiles,
         "reconcile-inline-customer-settlement" => {
@@ -89,7 +124,7 @@ where
         }
         value => {
             return Err(format!(
-                "unknown command `{value}`: expected `migrate`, `bootstrap-admin`, `provision-codex-profile`, `provision-grok-profile`, `provision-grok-video-profile`, `provision-grok-video-profile-replacement`, `reconcile-execution-profile-routes`, `reconcile-dreamina-profiles`, or `reconcile-inline-customer-settlement`"
+                "unknown command `{value}`: expected `migrate`, `bootstrap-admin`, `provision-codex-profile`, `provision-grok-profile`, `provision-grok-video-profile`, `provision-grok-image-profile-replacement`, `provision-grok-edit-profile-replacement`, `provision-grok-video-profile-replacement`, `reconcile-execution-profile-routes`, `reconcile-dreamina-profiles`, or `reconcile-inline-customer-settlement`"
             ));
         }
     };
@@ -139,6 +174,8 @@ async fn main() -> Result<(), ImageGatewayError> {
             )?)?)
         }
         Command::BootstrapAdmin { .. }
+        | Command::ProvisionGrokImageProfileReplacement { .. }
+        | Command::ProvisionGrokEditProfileReplacement { .. }
         | Command::ProvisionGrokVideoProfileReplacement { .. }
         | Command::ReconcileExecutionProfileRoutes
         | Command::ReconcileDreaminaProfiles
@@ -206,6 +243,40 @@ async fn main() -> Result<(), ImageGatewayError> {
             .map_err(|error| map_provisioning_error("Grok video replacement", error))?;
             println!(
                 "Grok video replacement profile provisioned: {}",
+                provisioned.execution_profile_id
+            );
+        }
+        Command::ProvisionGrokImageProfileReplacement {
+            source_profile_key,
+            replacement_profile_key,
+        } => {
+            verify_migrations(&pool).await?;
+            let provisioned = provision_grok_image_execution_profile_replacement(
+                &pool,
+                &source_profile_key,
+                &replacement_profile_key,
+            )
+            .await
+            .map_err(|error| map_provisioning_error("Grok image replacement", error))?;
+            println!(
+                "Grok image replacement profile provisioned: {}",
+                provisioned.execution_profile_id
+            );
+        }
+        Command::ProvisionGrokEditProfileReplacement {
+            source_profile_key,
+            replacement_profile_key,
+        } => {
+            verify_migrations(&pool).await?;
+            let provisioned = provision_grok_edit_execution_profile_replacement(
+                &pool,
+                &source_profile_key,
+                &replacement_profile_key,
+            )
+            .await
+            .map_err(|error| map_provisioning_error("Grok edit replacement", error))?;
+            println!(
+                "Grok edit replacement profile provisioned: {}",
                 provisioned.execution_profile_id
             );
         }
@@ -441,6 +512,26 @@ mod tests {
     }
 
     #[test]
+    fn accepts_grok_image_and_edit_profile_replacements() {
+        assert!(matches!(
+            parse_command([
+                "provision-grok-image-profile-replacement",
+                "managed.grok.images.old",
+                "managed.grok.images.v105",
+            ]),
+            Ok(Command::ProvisionGrokImageProfileReplacement { .. })
+        ));
+        assert!(matches!(
+            parse_command([
+                "provision-grok-edit-profile-replacement",
+                "managed.grok.edits.old",
+                "managed.grok.edits.v105",
+            ]),
+            Ok(Command::ProvisionGrokEditProfileReplacement { .. })
+        ));
+    }
+
+    #[test]
     fn accepts_exactly_reconcile_execution_profile_routes() {
         assert_eq!(
             parse_command(["reconcile-execution-profile-routes"]),
@@ -477,7 +568,7 @@ mod tests {
     fn rejects_missing_command() {
         assert_eq!(
             parse_command([] as [&str; 0]),
-            Err("missing command: expected `migrate`, `bootstrap-admin`, `provision-codex-profile`, `provision-grok-profile`, `provision-grok-video-profile`, `provision-grok-video-profile-replacement`, `reconcile-execution-profile-routes`, `reconcile-dreamina-profiles`, or `reconcile-inline-customer-settlement`".to_string())
+            Err("missing command: expected `migrate`, `bootstrap-admin`, `provision-codex-profile`, `provision-grok-profile`, `provision-grok-video-profile`, `provision-grok-image-profile-replacement`, `provision-grok-edit-profile-replacement`, `provision-grok-video-profile-replacement`, `reconcile-execution-profile-routes`, `reconcile-dreamina-profiles`, or `reconcile-inline-customer-settlement`".to_string())
         );
     }
 
@@ -486,7 +577,7 @@ mod tests {
         assert_eq!(
             parse_command(["status"]),
             Err(
-                "unknown command `status`: expected `migrate`, `bootstrap-admin`, `provision-codex-profile`, `provision-grok-profile`, `provision-grok-video-profile`, `provision-grok-video-profile-replacement`, `reconcile-execution-profile-routes`, `reconcile-dreamina-profiles`, or `reconcile-inline-customer-settlement`"
+                "unknown command `status`: expected `migrate`, `bootstrap-admin`, `provision-codex-profile`, `provision-grok-profile`, `provision-grok-video-profile`, `provision-grok-image-profile-replacement`, `provision-grok-edit-profile-replacement`, `provision-grok-video-profile-replacement`, `reconcile-execution-profile-routes`, `reconcile-dreamina-profiles`, or `reconcile-inline-customer-settlement`"
                     .to_string()
             )
         );

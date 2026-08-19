@@ -10,19 +10,20 @@ use std::{
 
 use async_trait::async_trait;
 use image_cli_runtime::{
-    CliRuntime, CommandSpec, ExitClassification, ProcessError, ReceiptCliPolicy, RuntimeError,
-    SpawnEvidence, SpawnObserver, VerifiedExecutable, WorkingDirectory,
+    CliRuntime, CommandSpec, ExitClassification, ProcessCompletion, ProcessError, ReceiptCliPolicy,
+    RuntimeError, SpawnEvidence, SpawnObserver, VerifiedExecutable, WorkingDirectory,
 };
 use image_provider_grok_cli::{
-    GrokCliPolicyV1, GrokCliReceiptV1, GrokCliRequestV1, GrokInvocationV1, MAX_HISTORY_BYTES,
-    parse_invocation_receipt,
+    GrokCliPolicyV1, GrokCliReceiptV1, GrokCliRequestV1, GrokInvocationV1,
+    GrokVideoGenerationRequestV1, MAX_HISTORY_BYTES, parse_invocation_receipt,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use tokio::{process::Command, time::Instant};
+use tokio::{io::AsyncReadExt, process::Command, time::Instant};
 use uuid::Uuid;
 
+use super::grok_direct_video::{GrokDiagnosticV1, generate_image_to_video};
 use super::grok_request::expected_grok_adapter_revision;
 use super::{
     ExecutorLaunchContext, ExecutorSubmissionLease, GrokExecutionRequest, RunnerError,
@@ -74,6 +75,7 @@ struct GrokChildRequest {
     launch: RunnerLaunchBinding,
     grok_executable: String,
     grok_executable_sha256: String,
+    credential_auth_sha256: String,
     timeout_ms: u64,
     command_json: Value,
     api_profile: String,
@@ -222,15 +224,17 @@ impl GrokProcessSupervisor {
         &self,
         lease: &ExecutorSubmissionLease,
         context: &ExecutorLaunchContext,
+        credential_auth_sha256: &str,
     ) -> Result<GrokChildRequest, RunnerError> {
         project_grok_execution_request(lease, context).map_err(|_| RunnerError::Definite {
             error_code: "executor_command_rejected".to_owned(),
         })?;
         Ok(GrokChildRequest {
-            schema_version: 1,
+            schema_version: 2,
             launch: RunnerLaunchBinding::from_lease(lease),
             grok_executable: self.grok_executable.to_string_lossy().into_owned(),
             grok_executable_sha256: self.grok_executable_sha256.clone(),
+            credential_auth_sha256: credential_auth_sha256.to_owned(),
             timeout_ms: self.request_timeout.as_millis() as u64,
             command_json: context.command_json().clone(),
             api_profile: context.api_profile().to_owned(),
@@ -334,15 +338,30 @@ impl GrokProcessSupervisor {
             .arg(lease.executor_execution_id.to_string())
             .env_clear()
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
             .kill_on_drop(false);
         for (name, value) in &self.child_env {
             command.env(name, value);
         }
-        command.spawn().map_err(|_| RunnerError::Unknown {
+        let mut child = command.spawn().map_err(|_| RunnerError::Unknown {
             error_code: "runner_spawn_failed".to_owned(),
         })?;
+        let stdout = child.stdout.take().ok_or_else(|| RunnerError::Unknown {
+            error_code: "runner_capture_failed".to_owned(),
+        })?;
+        let stderr = child.stderr.take().ok_or_else(|| RunnerError::Unknown {
+            error_code: "runner_capture_failed".to_owned(),
+        })?;
+        let root = self.journal.root_path().to_path_buf();
+        let execution_id = lease.executor_execution_id;
+        tokio::spawn(capture_helper_stream(
+            root.clone(),
+            execution_id,
+            "stdout",
+            stdout,
+        ));
+        tokio::spawn(capture_helper_stream(root, execution_id, "stderr", stderr));
         Ok(())
     }
 
@@ -374,6 +393,39 @@ impl GrokProcessSupervisor {
     }
 }
 
+async fn capture_helper_stream<R>(
+    runner_root: PathBuf,
+    executor_execution_id: Uuid,
+    stream: &'static str,
+    mut reader: R,
+) where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    const MAX_CAPTURE_BYTES: usize = 64 * 1024;
+    let mut captured = Vec::new();
+    let mut buffer = [0_u8; 8 * 1024];
+    let mut truncated = false;
+    loop {
+        match reader.read(&mut buffer).await {
+            Ok(0) => break,
+            Ok(read) => {
+                let remaining = MAX_CAPTURE_BYTES.saturating_sub(captured.len());
+                let retained = remaining.min(read);
+                captured.extend_from_slice(&buffer[..retained]);
+                truncated |= retained != read;
+            }
+            Err(_) => {
+                truncated = true;
+                break;
+            }
+        }
+    }
+    if let Ok(spool) = ExecutionSpool::open(&runner_root, executor_execution_id) {
+        let diagnostic = GrokDiagnosticV1::io(stream, &captured, truncated);
+        let _ = spool.publish_diagnostic(&format!("grok-helper-{stream}.json"), &diagnostic);
+    }
+}
+
 pub fn grok_auth_file_sha256(
     credential_home: impl AsRef<Path>,
 ) -> Result<String, ImageGatewayError> {
@@ -395,7 +447,7 @@ impl SingleOutputSupervisor for GrokProcessSupervisor {
             project_grok_execution_request(lease, context).map_err(|_| RunnerError::Definite {
                 error_code: "executor_command_rejected".to_owned(),
             })?;
-        let request = self.child_request(lease, context)?;
+        let request = self.child_request(lease, context, &credential_auth_sha256)?;
         let bytes = serde_json::to_vec(&request).map_err(|_| RunnerError::Internal)?;
         let spool = ExecutionSpool::for_lease(&self.journal, lease).map_err(map_spool_error)?;
         private_auth::prepare_isolated_auth(
@@ -602,6 +654,46 @@ async fn run_grok_child(
         Ok((_, request)) => request,
         Err(_) => return ChildOutcome::Uncertain("runner_request_invalid"),
     };
+    if let GrokCliRequestV1::VideoGeneration(GrokVideoGenerationRequestV1::ImageToVideo(
+        image_to_video,
+    )) = &cli_request
+    {
+        return match generate_image_to_video(
+            &spool,
+            image_to_video,
+            &request.credential_auth_sha256,
+            Duration::from_millis(request.timeout_ms),
+        )
+        .await
+        {
+            Ok(success) => {
+                let diagnostic = GrokDiagnosticV1::direct_success(&success.remote_task_id);
+                if spool
+                    .publish_diagnostic("grok-direct-video.json", &diagnostic)
+                    .is_err()
+                {
+                    ChildOutcome::Uncertain("grok_diagnostic_persist_failed")
+                } else {
+                    ChildOutcome::Succeeded {
+                        bytes: success.bytes,
+                        provider_reported_cost: None,
+                    }
+                }
+            }
+            Err(error) => {
+                if spool
+                    .publish_diagnostic("grok-direct-video.json", &error.diagnostic)
+                    .is_err()
+                {
+                    ChildOutcome::Uncertain("grok_diagnostic_persist_failed")
+                } else if error.definite {
+                    ChildOutcome::Failed(error.error_code)
+                } else {
+                    ChildOutcome::Uncertain(error.error_code)
+                }
+            }
+        };
+    }
     let workspace = match spool.provider_attempt_path() {
         Ok(path) => path,
         Err(_) => return ChildOutcome::Uncertain("runner_workspace_invalid"),
@@ -755,16 +847,50 @@ impl ReceiptCliPolicy for GrokReceiptPolicy {
             .map_err(|_| GrokReceiptPolicyError::History)?;
         let history = read_bounded_regular_file(history_file, MAX_HISTORY_BYTES as u64)
             .map_err(|_| GrokReceiptPolicyError::History)?;
-        parse_invocation_receipt(stdout, &history, &self.invocation).map_err(|error| {
-            if let Some(field) = error.tool_arguments_mismatch_field() {
-                tracing::info!(
-                    executor.execution_id = %self.executor_execution_id,
-                    grok.receipt.mismatch_field = field,
-                    "Grok tool arguments differ from the admitted request"
-                );
+        match parse_invocation_receipt(stdout, &history, &self.invocation) {
+            Ok(receipt) => Ok(receipt),
+            Err(error) => {
+                let diagnostic = if let Some((
+                    field,
+                    expected_type,
+                    expected_sha256,
+                    actual_type,
+                    actual_sha256,
+                )) = error.tool_arguments_mismatch_summary()
+                {
+                    tracing::info!(
+                        executor.execution_id = %self.executor_execution_id,
+                        grok.receipt.mismatch_field = field,
+                        "Grok tool arguments differ from the admitted request"
+                    );
+                    GrokDiagnosticV1::receipt_mismatch_summary(
+                        field,
+                        expected_type,
+                        expected_sha256,
+                        actual_type,
+                        actual_sha256,
+                    )
+                } else if let Some((upstream_code, upstream_type, message_sha256, message_bytes)) =
+                    error.tool_execution_failure_summary()
+                {
+                    GrokDiagnosticV1::receipt_tool_failure(
+                        upstream_code,
+                        upstream_type,
+                        message_sha256,
+                        message_bytes,
+                    )
+                } else {
+                    GrokDiagnosticV1::receipt_failure(
+                        grok_receipt_error_code(&error.to_string()),
+                        Some(&error.to_string()),
+                    )
+                };
+                self.spool
+                    .publish_diagnostic("grok-receipt-diagnostic.json", &diagnostic)
+                    .map_err(|_| GrokReceiptPolicyError::History)?;
+                Err(error.into())
             }
-            error.into()
-        })
+        }
     }
 }
 
@@ -777,6 +903,25 @@ impl SpawnObserver for GrokSpawnObserver {
                 .publish_provider_process(&self.runner_lock, &self.helper, &provider)
         })
     }
+
+    fn observe_completion(&mut self, completion: &ProcessCompletion) -> Result<(), Self::Error> {
+        self.spool.publish_diagnostic(
+            "grok-cli-stdout.json",
+            &GrokDiagnosticV1::io(
+                "stdout",
+                completion.stdout.bytes(),
+                completion.stdout.is_truncated(),
+            ),
+        )?;
+        self.spool.publish_diagnostic(
+            "grok-cli-stderr.json",
+            &GrokDiagnosticV1::io(
+                "stderr",
+                completion.stderr.bytes(),
+                completion.stderr.is_truncated(),
+            ),
+        )
+    }
 }
 
 fn validate_child_request(
@@ -786,7 +931,7 @@ fn validate_child_request(
     let lease = request.launch.to_lease().ok_or_else(|| {
         ImageGatewayError::service_unavailable("Grok runner lease binding is invalid")
     })?;
-    if request.schema_version != 1
+    if request.schema_version != 2
         || Some(lease.adapter_revision.as_str())
             != expected_grok_adapter_revision(lease.command_schema.as_str())
         || lease.executor_execution_id != executor_execution_id
@@ -794,6 +939,7 @@ fn validate_child_request(
         || request.timeout_ms > MAX_RUNNER_TIMEOUT.as_millis() as u64
         || lease.provider_id != image_provider_grok_cli::PROVIDER_ID
         || lease.output_index != 0
+        || parse_sha256(&request.credential_auth_sha256).is_err()
     {
         return Err(ImageGatewayError::service_unavailable(
             "Grok runner request is invalid",

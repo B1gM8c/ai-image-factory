@@ -5,6 +5,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use toml::{Table, Value};
 
 use crate::provider_uploads::GrokVideoOutputS3Configuration;
@@ -29,6 +30,75 @@ pub(crate) fn read_verified_auth(home: &Path, expected_sha256: &str) -> std::io:
     let bytes = read_private_auth(&home.join(AUTH_FILE))?;
     ensure_auth_digest(&bytes, expected_sha256)?;
     Ok(bytes)
+}
+
+pub(super) fn read_verified_bearer(
+    home: &Path,
+    expected_sha256: &str,
+    minimum_valid_for: std::time::Duration,
+) -> std::io::Result<String> {
+    let bytes = read_verified_auth(home, expected_sha256)?;
+    let document: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| invalid_auth())?;
+    let entries = document.as_object().ok_or_else(invalid_auth)?;
+    let now = OffsetDateTime::now_utc();
+    let minimum_valid_for =
+        time::Duration::try_from(minimum_valid_for).map_err(|_| invalid_auth())?;
+    let mut eligible = entries
+        .iter()
+        .filter_map(|(authority, entry)| {
+            let entry = entry.as_object()?;
+            let issuer = entry.get("oidc_issuer")?.as_str()?;
+            if !authority.starts_with("https://auth.x.ai") || issuer != "https://auth.x.ai" {
+                return None;
+            }
+            let key = entry.get("key")?.as_str()?;
+            if key.trim().is_empty() || key.len() > 32 * 1024 || key.contains(['\r', '\n', '\0']) {
+                return None;
+            }
+            let expires_at = entry
+                .get("expires_at")?
+                .as_str()
+                .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok())?;
+            if expires_at <= now + minimum_valid_for {
+                return None;
+            }
+            Some((expires_at, key.to_owned()))
+        })
+        .collect::<Vec<_>>();
+    eligible.sort_unstable_by_key(|(expires_at, _)| *expires_at);
+    eligible.pop().map(|(_, key)| key).ok_or_else(invalid_auth)
+}
+
+pub(super) fn read_isolated_grok_video_output(
+    home: &Path,
+) -> std::io::Result<GrokVideoOutputS3Configuration> {
+    let output = read_grok_video_output(home)?.ok_or_else(invalid_auth)?;
+    let credentials = output
+        .get("read_write")
+        .and_then(Value::as_table)
+        .ok_or_else(invalid_auth)?;
+    let text = |table: &Table, name: &str| {
+        table
+            .get(name)
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .filter(|value| !value.trim().is_empty() && !value.contains('\0'))
+            .ok_or_else(invalid_auth)
+    };
+    let expires_secs = output
+        .get("expires_secs")
+        .and_then(Value::as_integer)
+        .filter(|value| (60..=3_600).contains(value))
+        .ok_or_else(invalid_auth)?;
+    Ok(GrokVideoOutputS3Configuration {
+        bucket: text(&output, "bucket")?,
+        region: text(&output, "region")?,
+        endpoint: text(&output, "endpoint")?,
+        key_prefix: text(&output, "key_prefix")?,
+        expires_secs,
+        access_key_id: text(credentials, "access_key_id")?,
+        secret_access_key: text(credentials, "secret_access_key")?,
+    })
 }
 
 pub(super) fn validate_auth_source(home: &Path, expected_sha256: &str) -> std::io::Result<PathBuf> {
@@ -412,5 +482,32 @@ secret_access_key = "sk"
         .unwrap();
 
         assert!(prepare_isolated_grok_config(&destination, &source).is_err());
+    }
+
+    #[test]
+    fn verified_bearer_selects_only_a_live_xai_oidc_entry() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        private_directory(&home);
+        let auth = br#"{
+          "legacy": {"key":"do-not-use"},
+          "https://auth.x.ai::account": {
+            "key":"live-bearer",
+            "oidc_issuer":"https://auth.x.ai",
+            "expires_at":"2099-01-01T00:00:00Z"
+          }
+        }"#;
+        fs::write(home.join(AUTH_FILE), auth).unwrap();
+        fs::set_permissions(home.join(AUTH_FILE), fs::Permissions::from_mode(0o600)).unwrap();
+        let digest = sha256(auth);
+
+        assert_eq!(
+            read_verified_bearer(&home, &digest, std::time::Duration::from_secs(60)).unwrap(),
+            "live-bearer"
+        );
+        assert!(
+            read_verified_bearer(&home, &"0".repeat(64), std::time::Duration::from_secs(60))
+                .is_err()
+        );
     }
 }

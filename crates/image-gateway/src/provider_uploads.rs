@@ -41,7 +41,7 @@ pub struct ProviderUploadService {
     public_endpoint: Option<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub(crate) struct GrokVideoOutputS3Configuration {
     pub(crate) bucket: String,
     pub(crate) region: String,
@@ -50,6 +50,101 @@ pub(crate) struct GrokVideoOutputS3Configuration {
     pub(crate) expires_secs: i64,
     pub(crate) access_key_id: String,
     pub(crate) secret_access_key: String,
+}
+
+impl std::fmt::Debug for GrokVideoOutputS3Configuration {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GrokVideoOutputS3Configuration")
+            .field("bucket", &self.bucket)
+            .field("region", &self.region)
+            .field("endpoint", &self.endpoint)
+            .field("key_prefix", &self.key_prefix)
+            .field("expires_secs", &self.expires_secs)
+            .field("access_key_id", &"[redacted]")
+            .field("secret_access_key", &"[redacted]")
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct GrokVideoOutputUrls {
+    pub(crate) upload_url: String,
+    pub(crate) download_url: String,
+}
+
+impl GrokVideoOutputS3Configuration {
+    pub(crate) fn presign_video_output(
+        &self,
+        object_nonce: Uuid,
+    ) -> Result<GrokVideoOutputUrls, ProviderUploadError> {
+        if self.expires_secs < 60
+            || self.expires_secs > MAX_TTL.as_secs() as i64
+            || !valid_s3_component(&self.bucket, false)
+            || !valid_s3_component(&self.region, false)
+            || !valid_s3_component(&self.key_prefix, true)
+            || self.access_key_id.trim().is_empty()
+            || self.secret_access_key.trim().is_empty()
+        {
+            return Err(ProviderUploadError::Unavailable);
+        }
+        let key = format!(
+            "{}/{}.mp4",
+            self.key_prefix.trim_matches('/'),
+            object_nonce.simple()
+        );
+        let mut endpoint =
+            reqwest::Url::parse(&self.endpoint).map_err(|_| ProviderUploadError::Unavailable)?;
+        let secure = endpoint.scheme() == "https";
+        let local_http = endpoint.scheme() == "http"
+            && endpoint
+                .host_str()
+                .is_some_and(|host| matches!(host, "localhost" | "127.0.0.1" | "::1"));
+        if (!secure && !local_http)
+            || endpoint.username() != ""
+            || endpoint.password().is_some()
+            || endpoint.query().is_some()
+            || endpoint.fragment().is_some()
+        {
+            return Err(ProviderUploadError::Unavailable);
+        }
+        let base_path = endpoint.path().trim_end_matches('/');
+        let canonical_uri = format!(
+            "{}/{}/{}",
+            base_path,
+            aws_uri_encode(&self.bucket, false),
+            aws_uri_encode(&key, true)
+        );
+        endpoint.set_path(&canonical_uri);
+        let host = endpoint
+            .host_str()
+            .map(str::to_owned)
+            .ok_or(ProviderUploadError::Unavailable)?;
+        let host = match endpoint.port() {
+            Some(port) => format!("{host}:{port}"),
+            None => host,
+        };
+        let upload_url = presigned_s3_url(
+            &endpoint,
+            &host,
+            &Method::PUT,
+            "content-type;host",
+            &format!("content-type:video/mp4\nhost:{host}\n"),
+            self,
+        )?;
+        let download_url = presigned_s3_url(
+            &endpoint,
+            &host,
+            &Method::GET,
+            "host",
+            &format!("host:{host}\n"),
+            self,
+        )?;
+        Ok(GrokVideoOutputUrls {
+            upload_url,
+            download_url,
+        })
+    }
 }
 
 #[derive(Clone)]
@@ -517,6 +612,97 @@ fn provider_upload_endpoint(value: &str) -> Result<String, ImageGatewayError> {
     Ok(url.to_string())
 }
 
+fn valid_s3_component(value: &str, allow_slash: bool) -> bool {
+    !value.is_empty()
+        && value.len() <= 512
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(byte, b'-' | b'_' | b'.')
+                || (allow_slash && byte == b'/')
+        })
+}
+
+fn aws_uri_encode(value: &str, preserve_slash: bool) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric()
+            || matches!(byte, b'-' | b'_' | b'.' | b'~')
+            || (preserve_slash && byte == b'/')
+        {
+            encoded.push(char::from(byte));
+        } else {
+            use std::fmt::Write as _;
+            let _ = write!(encoded, "%{byte:02X}");
+        }
+    }
+    encoded
+}
+
+fn presigned_s3_url(
+    endpoint: &reqwest::Url,
+    host: &str,
+    method: &Method,
+    signed_headers: &str,
+    canonical_headers: &str,
+    config: &GrokVideoOutputS3Configuration,
+) -> Result<String, ProviderUploadError> {
+    let now = OffsetDateTime::now_utc();
+    let date = format!(
+        "{:04}{:02}{:02}",
+        now.year(),
+        u8::from(now.month()),
+        now.day()
+    );
+    let amz_date = format!(
+        "{date}T{:02}{:02}{:02}Z",
+        now.hour(),
+        now.minute(),
+        now.second()
+    );
+    let credential_scope = format!("{date}/{}/s3/aws4_request", config.region);
+    let mut pairs = [
+        ("X-Amz-Algorithm", "AWS4-HMAC-SHA256".to_owned()),
+        (
+            "X-Amz-Credential",
+            aws_uri_encode(
+                &format!("{}/{}", config.access_key_id, credential_scope),
+                false,
+            ),
+        ),
+        ("X-Amz-Date", amz_date.clone()),
+        ("X-Amz-Expires", config.expires_secs.to_string()),
+        ("X-Amz-SignedHeaders", aws_uri_encode(signed_headers, false)),
+    ];
+    pairs.sort_unstable();
+    let canonical_query = pairs
+        .iter()
+        .map(|(name, value)| format!("{name}={value}"))
+        .collect::<Vec<_>>()
+        .join("&");
+    let canonical_request = format!(
+        "{}\n{}\n{}\n{}\n{}\nUNSIGNED-PAYLOAD",
+        method,
+        endpoint.path(),
+        canonical_query,
+        canonical_headers,
+        signed_headers
+    );
+    let string_to_sign = format!(
+        "AWS4-HMAC-SHA256\n{amz_date}\n{credential_scope}\n{}",
+        hex::encode(Sha256::digest(canonical_request.as_bytes()))
+    );
+    let key = signing_key(&config.secret_access_key, &date, &config.region, "s3")?;
+    let signature = hex::encode(hmac(&key, string_to_sign.as_bytes())?);
+    let mut url = endpoint.clone();
+    url.set_query(Some(&format!(
+        "{canonical_query}&X-Amz-Signature={signature}"
+    )));
+    if url.host_str().is_none() || host.is_empty() {
+        return Err(ProviderUploadError::Unavailable);
+    }
+    Ok(url.to_string())
+}
+
 fn ticket_id(execution_id: Uuid, lease_epoch: i64) -> String {
     let mut hasher = Sha256::new();
     hasher.update(b"aif-provider-upload-v1");
@@ -939,6 +1125,43 @@ mod tests {
     }
 
     #[test]
+    fn production_video_presigner_binds_put_content_type_and_get_host() {
+        let root = tempfile::tempdir().unwrap();
+        let service =
+            ProviderUploadService::new(root.path(), Some("http://127.0.0.1:8787")).unwrap();
+        let config = service
+            .issue_grok_video_output(&lease(), Duration::from_secs(900))
+            .unwrap()
+            .unwrap();
+        let urls = config.presign_video_output(Uuid::nil()).unwrap();
+
+        let put = reqwest::Url::parse(&urls.upload_url).unwrap();
+        let mut put_headers = HeaderMap::new();
+        put_headers.insert("host", HeaderValue::from_static("127.0.0.1:8787"));
+        put_headers.insert("content-type", HeaderValue::from_static("video/mp4"));
+        let put_uri = format!("{}?{}", put.path(), put.query().unwrap())
+            .parse::<Uri>()
+            .unwrap();
+        assert!(
+            service
+                .authorize(&Method::PUT, &put_uri, put.query(), &put_headers,)
+                .is_ok()
+        );
+
+        let get = reqwest::Url::parse(&urls.download_url).unwrap();
+        let mut get_headers = HeaderMap::new();
+        get_headers.insert("host", HeaderValue::from_static("127.0.0.1:8787"));
+        let get_uri = format!("{}?{}", get.path(), get.query().unwrap())
+            .parse::<Uri>()
+            .unwrap();
+        assert!(
+            service
+                .authorize(&Method::GET, &get_uri, get.query(), &get_headers,)
+                .is_ok()
+        );
+    }
+
+    #[test]
     fn canonical_headers_accepts_aws_sdk_signed_header_order() {
         let mut headers = HeaderMap::new();
         headers.insert("host", HeaderValue::from_static("uploads.example.com"));
@@ -1062,7 +1285,7 @@ mod tests {
             "{}%2F{}%2F{}%2Fs3%2Faws4_request",
             config.access_key_id, date, config.region
         );
-        let mut pairs = vec![
+        let mut pairs = [
             ("X-Amz-Algorithm", "AWS4-HMAC-SHA256".to_owned()),
             ("X-Amz-Credential", credential),
             ("X-Amz-Date", amz_date.clone()),

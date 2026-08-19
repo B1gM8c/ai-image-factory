@@ -5,8 +5,8 @@
 > fenced execution, bounded image/MP4 artifact publication, Media Economics V3,
 > and the default-off public asynchronous video routes are implemented
 >
-> Verified: 2026-07-18 against the official xAI documentation and OpenAPI,
-> the official `xai-org/grok-build` source, installed Grok CLI `0.2.102`, fake
+> Verified: 2026-08-19 against the official xAI documentation and OpenAPI,
+> the official `xai-org/grok-build` source, pinned Grok CLI `1.0.5`, fake
 > crash/replay tests, PostgreSQL migration/profile/launch-context tests, and one
 > explicitly approved real 6-second 480p image-to-video invocation through the
 > durable supervisor. It produced a validated 431,280-byte MP4 with SHA-256
@@ -49,7 +49,7 @@ unrelated image model through `active_providers()`.
 | `POST /v1/images/generations` | synchronous; official request and response schemas include model, count, ratio, resolution, response format, storage, user attribution, file output, and usage | `image_gen`; one local JPEG; effective `1k`; no upstream URL or Files API handle is exposed | retain the full official DTO; currently admit only `n=1`, omitted/`1k` resolution, explicit `b64_json`, and no `storage_options` |
 | `POST /v1/images/edits` | synchronous image edit | `image_edit`; 1-3 source images; quality model; one `1k` image | keep inactive until the full official edit DTO, typed source hash, sealed input staging, and cleanup path are implemented |
 | `POST /v1/videos/generations` text-only | asynchronous | no direct CLI tool | reject; do not hide an image generation plus image-to-video double charge |
-| `POST /v1/videos/generations` with one image | asynchronous | `image_to_video`; 6 or 10 seconds; `480p` or `720p` | support as a platform async job even though the CLI polls internally |
+| `POST /v1/videos/generations` with one image | asynchronous | direct xAI REST adapter; 6 or 10 seconds; `480p` or `720p` | submit the admitted fields without an agent rewriting them, then poll the remote task as a platform async job |
 | `POST /v1/videos/generations` with reference images | asynchronous | `reference_to_video`; 2-7 images; five ratios; 6 or 10 seconds; `480p` or `720p` | support as a platform async job |
 | `POST /v1/videos/edits` | asynchronous | no CLI tool | reject |
 | `POST /v1/videos/extensions` | asynchronous | no CLI tool | reject |
@@ -80,7 +80,7 @@ The official CLI source currently binds tools as follows:
 | --- | --- |
 | `image_gen` | `grok-imagine-image-quality` by default; generation can explicitly bind `grok-imagine-image` through the CLI model override |
 | `image_edit` | `grok-imagine-image-quality` |
-| `image_to_video` | `grok-imagine-video-1.5-preview`, an official alias of `grok-imagine-video-1.5` |
+| direct image-to-video adapter | `grok-imagine-video-1.5` |
 | `reference_to_video` | `grok-imagine-video` |
 
 These model identities are part of the canonical provider command. The xAI
@@ -91,11 +91,11 @@ image-generation projector activates both `grok-imagine-image` and
 the durable command, and execution. Image editing remains quality-only. A
 request cannot claim an unrelated model while the CLI executes another.
 
-The adapter contract revision remains pinned to the validated `0.2.102`
-contract baseline. Runtime profiles additionally bind the executable digest;
-the base-generation path was exercised end to end with installed Grok CLI
-`0.2.106`. A CLI upgrade still requires capability revalidation before
-activation.
+The agentic image and reference-video adapter contract is pinned to validated
+Grok CLI `1.0.5`. Image-to-video uses a separate direct-API adapter revision so
+that prompt, image, duration, and resolution are exactly the values admitted by
+the factory. Runtime profiles additionally bind the executable digest. A CLI or
+direct-adapter upgrade still requires capability revalidation before activation.
 
 ## Runtime boundary
 
@@ -267,10 +267,28 @@ quota, then enable the public routes with
 `workerd` uses `WORKER_EXECUTION_MODE=executor-handoff` and the exact profile
 key. `executord` accepts provider-neutral `EXECUTOR_PROVIDER_EXECUTABLE` and
 `EXECUTOR_CREDENTIAL_HOME`; the existing Codex-specific names and the new
-`EXECUTOR_GROK_EXECUTABLE` / `EXECUTOR_GROK_CREDENTIAL_HOME` remain explicit
+`GATEWAY_MANAGED_GROK_EXECUTABLE` / `EXECUTOR_GROK_CREDENTIAL_HOME` remain explicit
 fallbacks. It defaults `EXECUTOR_PROCESS_STARTUP_GRACE_MS` to 60 seconds so a
 signed provider CLI cold start is not misclassified as a missing durable
 process.
+
+The immutable release owns the provider executable. `providers/grok-cli.lock.json`
+pins the official xAI download URL, version, target architecture, byte size, and
+SHA-256; release packaging installs it as `bin/grok` and emits
+`provider-manifest.json`. Production executors must set
+`GATEWAY_MANAGED_GROK_EXECUTABLE=/opt/ai-image-factory/current/bin/grok`. The runtime
+gate reads that binding from each running executor PID, resolves the absolute
+path, verifies its digest, and executes the packaged binary's `--version`.
+
+Single-frame `image_to_video` is deterministic in adapter revision
+`grok-api-1.0.5.direct-image-video.v3`: Factory sends the admitted prompt,
+staged image bytes, duration, and resolution directly to the official xAI
+video API, then polls the returned request ID. It does not ask the Grok agent
+to reconstruct tool arguments, and it never truncates long prompts. Other
+agentic media calls retain strict receipt comparison. Before isolated provider
+history is removed, failures persist only bounded diagnostic classes, field
+names, JSON types, lengths, and SHA-256 values—never prompt text, image URLs,
+credentials, or raw helper output.
 
 The real image smoke is ignored by default and requires all three variables:
 
@@ -297,7 +315,7 @@ cargo test -p gpt-image-2-gateway --lib \
   -- --ignored --exact --nocapture
 ```
 
-It stages a digest-bound JPEG, invokes `image_to_video` once at 6 seconds and
+It stages a digest-bound JPEG, submits `image_to_video` once at 6 seconds and
 480p, validates the MP4, publishes and replays the sealed bytes, and verifies
 that provider-private inputs and outputs are absent or empty. The approved real
 invocation completed successfully. Its first test run then found that the

@@ -23,6 +23,7 @@ const PROVIDER_PROCESS_FILE: &str = "provider-process.json";
 const LOCK_FILE: &str = "runner.lock";
 const OUTPUT_FILE: &str = "output.bin";
 const RESULT_FILE: &str = "result.json";
+const MAX_DIAGNOSTIC_BYTES: u64 = 64 * 1024;
 const WORKSPACE_DIR: &str = "workspace";
 const CODEX_HOME_DIR: &str = "codex-home";
 const RUNTIME_HOME_DIR: &str = "runtime-home";
@@ -474,6 +475,57 @@ impl ExecutionSpool {
         }
         validate_bound_path(&self.provider_attempt.path, &self.provider_attempt.fd)?;
         publish_or_compare(&self.provider_attempt.fd, filename, bytes, max_bytes)
+    }
+
+    pub(crate) fn open_provider_input(
+        &self,
+        filename: &str,
+    ) -> Result<fs::File, ProcessSpoolError> {
+        let mut components = Path::new(filename).components();
+        if !matches!(components.next(), Some(Component::Normal(_)))
+            || components.next().is_some()
+            || filename.is_empty()
+            || filename.len() > 255
+        {
+            return Err(ProcessSpoolError::InvalidInput);
+        }
+        validate_bound_path(&self.provider_attempt.path, &self.provider_attempt.fd)?;
+        let fd = rfs::openat(
+            &self.provider_attempt.fd,
+            filename,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
+            Mode::empty(),
+        )
+        .map_err(|_| ProcessSpoolError::Unavailable)?;
+        let stat = rfs::fstat(&fd).map_err(|_| ProcessSpoolError::Unavailable)?;
+        if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile
+            || stat.st_nlink != 1
+            || stat.st_uid != unsafe { libc::geteuid() }
+            || stat.st_mode & 0o077 != 0
+        {
+            return Err(ProcessSpoolError::Integrity);
+        }
+        Ok(fs::File::from(fd))
+    }
+
+    pub(crate) fn publish_diagnostic<T>(
+        &self,
+        filename: &str,
+        diagnostic: &T,
+    ) -> Result<(), ProcessSpoolError>
+    where
+        T: Serialize + DeserializeOwned + Eq,
+    {
+        let valid_name = filename.starts_with("grok-")
+            && filename.ends_with(".json")
+            && filename.len() <= 64
+            && filename.bytes().all(|byte| {
+                byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'.')
+            });
+        if !valid_name {
+            return Err(ProcessSpoolError::InvalidInput);
+        }
+        publish_json_or_compare(&self.directory, filename, diagnostic, MAX_DIAGNOSTIC_BYTES)
     }
 
     pub(crate) fn cleanup_provider_runtime(&self) -> Result<(), ProcessSpoolError> {

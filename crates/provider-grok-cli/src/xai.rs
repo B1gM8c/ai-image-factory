@@ -7,7 +7,7 @@ use thiserror::Error;
 use crate::{GrokImageGenerationRequestV1, ImageAspectRatio, ImageModel, RequestValidationError};
 
 pub const GROK_CLI_IMAGE_MAX_OUTPUTS: u32 = 1;
-/// Grok CLI 0.2.102 does not expose image resolution; observed output is fixed at 1K.
+/// Grok CLI 1.0.5 fixes image-tool output at 1K and exposes no resolution input.
 pub const GROK_CLI_IMAGE_RESOLUTION: XaiImageResolution = XaiImageResolution::R1k;
 /// Grok CLI yields a local artifact, so the factory can faithfully project only Base64.
 pub const GROK_CLI_IMAGE_RESPONSE_FORMAT: XaiImageResponseFormat = XaiImageResponseFormat::B64Json;

@@ -258,6 +258,67 @@ pub async fn provision_grok_video_execution_profile_replacement(
     source_profile_key: &str,
     replacement_profile_key: &str,
 ) -> Result<ProvisionedGrokExecutionProfile, GrokProfileProvisioningError> {
+    provision_grok_execution_profile_replacement_with_binding(
+        pool,
+        source_profile_key,
+        replacement_profile_key,
+        ProvisioningBinding {
+            provider_id: GROK_PROVIDER_ID,
+            command_schema: GROK_VIDEO_GENERATION_COMMAND_SCHEMA,
+            operation: &GROK_VIDEO_GENERATION_OPERATION_V1,
+            adapter_revision: GROK_VIDEO_ADAPTER_REVISION,
+            advisory_lock_key: "factoryctl.provision-grok-video-profile-replacement",
+        },
+    )
+    .await
+}
+
+pub async fn provision_grok_image_execution_profile_replacement(
+    pool: &PgPool,
+    source_profile_key: &str,
+    replacement_profile_key: &str,
+) -> Result<ProvisionedGrokExecutionProfile, GrokProfileProvisioningError> {
+    provision_grok_execution_profile_replacement_with_binding(
+        pool,
+        source_profile_key,
+        replacement_profile_key,
+        ProvisioningBinding {
+            provider_id: GROK_PROVIDER_ID,
+            command_schema: GROK_IMAGE_GENERATION_COMMAND_SCHEMA,
+            operation: &GROK_IMAGE_GENERATION_OPERATION_V1,
+            adapter_revision: GROK_ADAPTER_REVISION,
+            advisory_lock_key: "factoryctl.provision-grok-image-profile-replacement",
+        },
+    )
+    .await
+}
+
+pub async fn provision_grok_edit_execution_profile_replacement(
+    pool: &PgPool,
+    source_profile_key: &str,
+    replacement_profile_key: &str,
+) -> Result<ProvisionedGrokExecutionProfile, GrokProfileProvisioningError> {
+    provision_grok_execution_profile_replacement_with_binding(
+        pool,
+        source_profile_key,
+        replacement_profile_key,
+        ProvisioningBinding {
+            provider_id: GROK_PROVIDER_ID,
+            command_schema: GROK_IMAGE_EDIT_COMMAND_SCHEMA,
+            operation: &GROK_IMAGE_EDIT_OPERATION_V1,
+            adapter_revision: GROK_ADAPTER_REVISION,
+            advisory_lock_key: "factoryctl.provision-grok-edit-profile-replacement",
+        },
+    )
+    .await
+}
+
+async fn provision_grok_execution_profile_replacement_with_binding(
+    pool: &PgPool,
+    source_profile_key: &str,
+    replacement_profile_key: &str,
+    binding: ProvisioningBinding,
+) -> Result<ProvisionedGrokExecutionProfile, GrokProfileProvisioningError> {
     if !valid_key(source_profile_key)
         || !valid_key(replacement_profile_key)
         || source_profile_key == replacement_profile_key
@@ -265,13 +326,6 @@ pub async fn provision_grok_video_execution_profile_replacement(
         return Err(GrokProfileProvisioningError::InvalidInput);
     }
 
-    let binding = ProvisioningBinding {
-        provider_id: GROK_PROVIDER_ID,
-        command_schema: GROK_VIDEO_GENERATION_COMMAND_SCHEMA,
-        operation: &GROK_VIDEO_GENERATION_OPERATION_V1,
-        adapter_revision: GROK_VIDEO_ADAPTER_REVISION,
-        advisory_lock_key: "factoryctl.provision-grok-video-profile-replacement",
-    };
     let mut tx = pool.begin().await.map_err(map_sql_error)?;
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
         .bind(binding.advisory_lock_key)

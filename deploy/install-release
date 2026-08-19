@@ -285,6 +285,7 @@ required_files = {
     "admin/server.js",
     "admin/standalone.tar.gz",
     "bin/factoryctl",
+    "bin/grok",
     "bin/gpt-image-2-gateway",
     "bin/updated",
     "ops/hooks/activate",
@@ -303,6 +304,7 @@ required_files = {
     "ops/systemd/ai-image-factory-updater.service",
     "ops/systemd/ai-image-factory.target",
     "ops/upgrade-updater",
+    "provider-manifest.json",
     "release.json",
 }
 if not required_files.issubset(expected):

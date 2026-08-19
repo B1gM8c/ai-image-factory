@@ -125,7 +125,7 @@ async fn detached_grok_runner_replays_sealed_output_without_a_second_cli_launch(
 }
 
 #[tokio::test]
-async fn detached_video_runner_stages_input_replays_mp4_and_cleans_cli_files() {
+async fn detached_reference_video_runner_stages_inputs_replays_mp4_and_cleans_cli_files() {
     let temp = TempDir::new().unwrap();
     let credentials = private_credentials(temp.path());
     let invocations = temp.path().join("video-invocations");
@@ -147,23 +147,42 @@ async fn detached_video_runner_stages_input_replays_mp4_and_cleans_cli_files() {
         )
         .await
         .unwrap();
+    let second_blob = blobs
+        .put(
+            InputBlobKey {
+                admission_session_id: Uuid::new_v4(),
+                input_id: Uuid::new_v4(),
+            },
+            &input_bytes,
+        )
+        .await
+        .unwrap();
     let plan = XaiVideoAdmissionPlan::for_grok_cli(
         XaiVideoGenerationRequest {
-            aspect_ratio: None,
+            aspect_ratio: Some(image_api_contracts::xai::XaiVideoAspectRatio::R16x9),
             duration: Some(6),
-            image: Some(XaiVideoImageUrl {
-                file_id: None,
-                url: Some("data:image/jpeg;base64,AA==".to_owned()),
-            }),
-            model: Some("grok-imagine-video-1.5".to_owned()),
+            image: None,
+            model: Some("grok-imagine-video".to_owned()),
             output: None,
-            prompt: None,
-            reference_images: Vec::new(),
+            prompt: Some("cinematic motion".to_owned()),
+            reference_images: vec![
+                XaiVideoImageUrl {
+                    file_id: None,
+                    url: Some("data:image/jpeg;base64,AA==".to_owned()),
+                },
+                XaiVideoImageUrl {
+                    file_id: None,
+                    url: Some("data:image/jpeg;base64,AQ==".to_owned()),
+                },
+            ],
             resolution: Some(XaiVideoResolution::P480),
             storage_options: None,
             user: Some("grok-video-smoke".to_owned()),
         },
-        vec![XaiVideoAdmissionInput::new("input.jpg", blob.clone(), "image/jpeg").unwrap()],
+        vec![
+            XaiVideoAdmissionInput::new("input.jpg", blob.clone(), "image/jpeg").unwrap(),
+            XaiVideoAdmissionInput::new("input-1.jpg", second_blob.clone(), "image/jpeg").unwrap(),
+        ],
     )
     .unwrap();
     assert_eq!(plan.output_count(), 1);
@@ -183,6 +202,7 @@ async fn detached_video_runner_stages_input_replays_mp4_and_cleans_cli_files() {
     .unwrap()
     .with_inputs(vec![
         ExecutorInputObject::new(blob, "image", 0, "image/jpeg").unwrap(),
+        ExecutorInputObject::new(second_blob, "image", 1, "image/jpeg").unwrap(),
     ])
     .unwrap();
     let available = Arc::new(AtomicBool::new(true));
@@ -374,13 +394,14 @@ while [ "$#" -gt 0 ]; do
 done
 /bin/cat >/dev/null
 test -f "$cwd/input.jpg" || exit 71
+test -f "$cwd/input-1.jpg" || exit 72
 printf '1\n' >> '{}'
 encoded=$(printf '%s' "$cwd" | /usr/bin/sed 's/%/%25/g; s|/|%2F|g')
 session_dir="$GROK_HOME/sessions/$encoded/$session"
 /bin/mkdir -p "$session_dir/videos"
 /bin/cp '{}' "$session_dir/videos/1.mp4"
 artifact="$session_dir/videos/1.mp4"
-printf '{{"type":"assistant","tool_calls":[{{"name":"image_to_video","id":"call-1","arguments":"{{\\"duration\\":6,\\"image\\":\\"%s/input.jpg\\",\\"prompt\\":null,\\"resolution_name\\":\\"480p\\"}}"}}]}}\n' "$cwd" > "$session_dir/chat_history.jsonl"
+printf '{{"type":"assistant","tool_calls":[{{"name":"reference_to_video","id":"call-1","arguments":"{{\\"aspect_ratio\\":\\"16:9\\",\\"duration\\":6,\\"images\\":[\\"%s/input.jpg\\",\\"%s/input-1.jpg\\"],\\"prompt\\":\\"cinematic motion\\",\\"resolution_name\\":\\"480p\\"}}"}}]}}\n' "$cwd" "$cwd" > "$session_dir/chat_history.jsonl"
 printf '{{"type":"tool_result","tool_call_id":"call-1","content":"{{\\"path\\":\\"%s\\",\\"filename\\":\\"1.mp4\\",\\"session_folder\\":\\"videos\\"}}"}}\n' "$artifact" >> "$session_dir/chat_history.jsonl"
 printf '{{"type":"end","sessionId":"%s","requestId":"headless-video-1","stopReason":"end_turn","total_cost_usd_ticks":300000000}}\n' "$session"
 "#,
@@ -432,7 +453,7 @@ fn lease(command_hash: String) -> ExecutorSubmissionLease {
 
 fn video_lease(command_hash: String) -> ExecutorSubmissionLease {
     ExecutorSubmissionLease {
-        model: "grok-imagine-video-1.5-preview".to_owned(),
+        model: "grok-imagine-video".to_owned(),
         command_schema: GROK_VIDEO_GENERATION_COMMAND_SCHEMA.to_owned(),
         adapter_revision: VIDEO_ADAPTER_REVISION.to_owned(),
         ..lease(command_hash)

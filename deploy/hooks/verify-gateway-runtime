@@ -16,6 +16,7 @@ readonly RELEASE_UNITS="${AIF_VERIFY_RELEASE_UNITS:-${GATEWAY_UNIT}}"
 readonly NGINX_CONFIG="${AIF_VERIFY_NGINX_CONFIG_PATH:-}"
 readonly LEGACY_UNITS="${AIF_VERIFY_LEGACY_GATEWAY_UNITS:-gpt-image-2-gateway.service}"
 readonly FORBIDDEN_NGINX_PORTS="${AIF_VERIFY_FORBIDDEN_NGINX_PORTS:-}"
+readonly PROVIDER_MANIFEST_NAME="provider-manifest.json"
 
 [[ "$GATEWAY_BASE_URL" =~ ^http://127\.0\.0\.1:([0-9]+)(/.*)?$ ]] \
   || die "gateway base URL must use an explicit 127.0.0.1 port"
@@ -48,6 +49,43 @@ case "$gateway_exe" in
   *) die "gateway executable is outside the current release: ${gateway_exe}" ;;
 esac
 
+provider_manifest="${release_root}/${PROVIDER_MANIFEST_NAME}"
+provider_executable="$(readlink -f "${release_root}/bin/grok")"
+[[ -f "$provider_manifest" && ! -L "$provider_manifest" ]] \
+  || die "Grok provider manifest is missing from the current release"
+[[ "$provider_executable" == "${release_root}/bin/grok" && -x "$provider_executable" ]] \
+  || die "Grok provider executable is outside the current release"
+provider_fields="$(
+  env PROVIDER_MANIFEST="$provider_manifest" python3 <<'PY'
+import json
+import os
+import re
+
+with open(os.environ["PROVIDER_MANIFEST"], "r", encoding="utf-8") as handle:
+    manifest = json.load(handle)
+if (
+    manifest.get("schema_version") != 1
+    or manifest.get("provider") != "xai-grok-cli"
+    or manifest.get("binary_path") != "bin/grok"
+    or not re.fullmatch(r"[0-9a-f]{64}", str(manifest.get("binary_sha256", "")))
+    or not re.fullmatch(r"grok 1\.0\.5 \([0-9a-f]+\)", str(manifest.get("version_output", "")))
+    or manifest.get("compatibility_revision") != "grok-cli-1.0.5"
+    or manifest.get("image_adapter_revision") != "grok-cli-1.0.5.agentic-media.v2"
+    or manifest.get("video_adapter_revision") != "grok-api-1.0.5.direct-image-video.v3"
+):
+    raise SystemExit("invalid provider manifest")
+print(manifest["binary_sha256"])
+print(manifest["version_output"])
+PY
+)" || die "Grok provider manifest is invalid"
+provider_sha256="$(printf '%s\n' "$provider_fields" | sed -n '1p')"
+provider_version="$(printf '%s\n' "$provider_fields" | sed -n '2p')"
+[[ "$(sha256sum "$provider_executable" | awk '{print $1}')" == "$provider_sha256" ]] \
+  || die "Grok provider executable digest differs from the release manifest"
+[[ "$($provider_executable --version)" == "$provider_version" ]] \
+  || die "Grok provider executable version differs from the release manifest"
+
+provider_binding_count=0
 while IFS= read -r release_unit; do
   [[ -n "$release_unit" ]] || continue
   unit_pid="$(systemctl show "$release_unit" --property=MainPID --value)"
@@ -60,7 +98,27 @@ while IFS= read -r release_unit; do
     "${release_root}"/*) ;;
     *) die "release unit executable is outside the current release: ${release_unit} ${unit_exe}" ;;
   esac
+  case "$release_unit" in
+    ai-image-factory-executord@*.service)
+      managed_provider="$(
+        tr '\0' '\n' <"${PROC_ROOT}/${unit_pid}/environ" \
+          | sed -n 's/^GATEWAY_MANAGED_GROK_EXECUTABLE=//p'
+      )"
+      fallback_provider="$(
+        tr '\0' '\n' <"${PROC_ROOT}/${unit_pid}/environ" \
+          | sed -n 's/^EXECUTOR_GROK_EXECUTABLE=//p'
+      )"
+      configured_provider="${managed_provider:-${fallback_provider}}"
+      [[ -n "$configured_provider" ]] \
+        || die "executor PID does not expose its Grok provider binding: ${release_unit}"
+      [[ "$(readlink -f "$configured_provider")" == "$provider_executable" ]] \
+        || die "executor PID is not bound to the current release Grok provider: ${release_unit}"
+      provider_binding_count=$((provider_binding_count + 1))
+      ;;
+  esac
 done < <(printf '%s\n' "$RELEASE_UNITS" | tr ',' '\n')
+((provider_binding_count > 0)) \
+  || die "no running executor PID proved the current Grok provider binding"
 
 while IFS= read -r legacy_unit; do
   [[ -n "$legacy_unit" ]] || continue

@@ -17,6 +17,16 @@ use tempfile::TempDir;
 
 use super::*;
 
+#[test]
+fn immutable_provider_lock_matches_runtime_compatibility_revisions() {
+    let lock: serde_json::Value =
+        serde_json::from_str(include_str!("../../../providers/grok-cli.lock.json")).unwrap();
+    assert_eq!(lock["version"], GROK_CLI_COMPATIBILITY_VERSION);
+    assert_eq!(lock["compatibility_revision"], "grok-cli-1.0.5");
+    assert_eq!(lock["image_adapter_revision"], ADAPTER_REVISION);
+    assert_eq!(lock["video_adapter_revision"], VIDEO_ADAPTER_REVISION);
+}
+
 const SESSION_ID: &str = "019f6ded-4ffe-73f3-80e1-d1f11287bd96";
 const SOURCE_SHA256: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const IMAGE_SHA256: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -1083,15 +1093,9 @@ fn receipt_classifies_grok_tool_failures_before_artifact_validation() {
         }]
     });
 
-    for (content, expected) in [
-        (
-            "Tool `image_to_video` failed: Video generation failed with HTTP 400 Bad Request: {\"code\":\"invalid-argument\",\"error\":\"Zero Data Retention teams must provide output.upload_url for video generation.\"}",
-            GrokReceiptError::VideoOutputUploadUrlRequired,
-        ),
-        (
-            "Tool `image_to_video` failed: upstream unavailable",
-            GrokReceiptError::ToolExecutionFailed,
-        ),
+    for content in [
+        "Tool `image_to_video` failed: Video generation failed with HTTP 400 Bad Request: {\"code\":\"invalid-argument\",\"error\":\"Zero Data Retention teams must provide output.upload_url for video generation.\"}",
+        "Tool `image_to_video` failed: upstream unavailable",
     ] {
         let result = json!({
             "type": "tool_result",
@@ -1099,11 +1103,58 @@ fn receipt_classifies_grok_tool_failures_before_artifact_validation() {
             "content": content
         });
         let history = format!("{assistant}\n{result}\n");
-        assert_eq!(
-            parse_invocation_receipt(&valid_stdout(), history.as_bytes(), &invocation).unwrap_err(),
-            expected
-        );
+        let error =
+            parse_invocation_receipt(&valid_stdout(), history.as_bytes(), &invocation).unwrap_err();
+        if content.contains("Zero Data Retention") {
+            assert_eq!(error, GrokReceiptError::VideoOutputUploadUrlRequired);
+        } else {
+            let (_, _, message_sha256, message_bytes) =
+                error.tool_execution_failure_summary().unwrap();
+            assert_eq!(message_bytes, "upstream unavailable".len() as u64);
+            assert_eq!(message_sha256.len(), 64);
+            assert!(!format!("{error:?}").contains("upstream unavailable"));
+        }
     }
+}
+
+#[test]
+fn receipt_retains_only_safe_structured_upstream_failure_metadata() {
+    let fixture = PolicyFixture::new();
+    let request =
+        GrokImageGenerationRequestV1::new("prompt", ImageModel::Quality, ImageAspectRatio::Auto)
+            .unwrap();
+    let (_, invocation) = fixture
+        .policy
+        .command_spec_in(&request.into(), SESSION_ID, fixture.workspace.clone())
+        .unwrap();
+    let message = "private provider diagnostic";
+    let tool_call_id = "tool-call-1";
+    let assistant = json!({
+        "type": "assistant",
+        "tool_calls": [{
+            "id": tool_call_id,
+            "name": invocation.tool().name(),
+            "arguments": serde_json::to_string(invocation.expected_arguments()).unwrap()
+        }]
+    });
+    let result = json!({
+        "type": "tool_result",
+        "tool_call_id": tool_call_id,
+        "content": format!(
+            "Tool `image_gen` failed: {{\"error\":{{\"code\":\"rate_limit_exceeded\",\"type\":\"rate_limit_error\",\"message\":\"{message}\"}}}}"
+        )
+    });
+    let history = format!("{assistant}\n{result}\n");
+
+    let error =
+        parse_invocation_receipt(&valid_stdout(), history.as_bytes(), &invocation).unwrap_err();
+    let (code, error_type, message_sha256, message_bytes) =
+        error.tool_execution_failure_summary().unwrap();
+    assert_eq!(code, Some("rate_limit_exceeded"));
+    assert_eq!(error_type, Some("rate_limit_error"));
+    assert_eq!(message_bytes, message.len() as u64);
+    assert_eq!(message_sha256.len(), 64);
+    assert!(!format!("{error:?}").contains(message));
 }
 
 #[test]

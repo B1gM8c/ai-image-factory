@@ -133,7 +133,7 @@ flowchart LR
     SUBMIT --> ROUTE
     POLL --> ROUTE
     ROUTE --> CODEX["Codex CLI"]
-    ROUTE --> GROK["Grok CLI"]
+    ROUTE --> GROK["Grok CLI/API adapter"]
     ROUTE --> DREAM["Dreamina / Seedance CLI"]
     ROUTE -. roadmap .-> MANAGED["Managed provider APIs"]
 ```

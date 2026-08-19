@@ -46,12 +46,18 @@ cargo build --locked --release -p ai-image-factory-updater \
   --bin updated
 npm ci
 npm run build:admin
+scripts/fetch-grok-cli.sh x86_64-unknown-linux-gnu dist/grok-provider
 ```
 
 Record the Git commit, migration version, binary checksums, frontend build
 identifier, and configuration revision in the release manifest. Never mix old
 workers with a newer schema unless the release notes explicitly define that
 compatibility window.
+
+Do not install or upgrade the Grok CLI independently on a production host. The
+official binary must match `providers/grok-cli.lock.json`, live inside the same
+immutable release as Gateway and executors, and be verified through the running
+executor PID by `verify-gateway-runtime`.
 
 ## Storage And Secret Preconditions
 

@@ -90,6 +90,7 @@ jobs:
           set -Eeuo pipefail
           shellcheck \
             scripts/package-release.sh \
+            scripts/fetch-grok-cli.sh \
             scripts/test-gateway-runtime-gate.sh \
             scripts/test-release-process-hooks.sh \
             deploy/hooks/* \
@@ -97,6 +98,7 @@ jobs:
             deploy/upgrade-updater
           bash -n \
             scripts/package-release.sh \
+            scripts/fetch-grok-cli.sh \
             scripts/test-gateway-runtime-gate.sh \
             scripts/test-release-process-hooks.sh \
             deploy/hooks/* \
@@ -144,6 +146,8 @@ jobs:
             sudo install -m 0755 /usr/bin/true \
               "/opt/ai-image-factory/current/bin/${binary}"
           done
+          sudo install -m 0755 /usr/bin/true \
+            /opt/ai-image-factory/current/bin/grok
           sudo install -m 0755 /usr/bin/true \
             /usr/libexec/ai-image-factory/updated
           sudo install -m 0755 deploy/hooks/fail-closed \
@@ -260,8 +264,14 @@ jobs:
           npm ci
           npm run build:admin
 
+      - name: Fetch lock-verified official Grok CLI
+        env:
+          RELEASE_TARGET: ${{ matrix.target }}
+        run: scripts/fetch-grok-cli.sh "$RELEASE_TARGET" dist/grok-provider
+
       - name: Package deterministic release assets
         env:
+          GROK_PROVIDER_BINARY: ${{ github.workspace }}/dist/grok-provider
           RELEASE_TARGET: ${{ matrix.target }}
           RELEASE_VERSION: ${{ github.ref_name }}
           RELEASE_COMMIT: ${{ github.sha }}

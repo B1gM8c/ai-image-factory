@@ -346,6 +346,14 @@ same fully verified release after a crash, but it never replaces different
 existing content or a pointer to another release; later changes must use the
 updater state machine.
 
+Each bundle also contains `bin/grok` and `provider-manifest.json`. The build
+downloads the target-specific official xAI binary from the pinned HTTPS URL,
+checks its size, SHA-256, ELF machine, and `--version`, then includes it in the
+attested release. `GATEWAY_MANAGED_GROK_EXECUTABLE` must resolve to
+`/opt/ai-image-factory/current/bin/grok`; the post-activation runtime gate
+rejects a host-level or stale provider executable even if Gateway itself is
+healthy.
+
 Automatic application updates do not overwrite root-owned systemd units or
 hooks. If a release changes `ops/`, review the diff and copy those files through
 a separate privileged maintenance window before enabling application Apply.
