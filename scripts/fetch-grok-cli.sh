@@ -71,11 +71,16 @@ NODE
 } 2>/dev/null)" || die "provider lock is invalid"
 [[ "$(printf '%s\n' "$metadata" | wc -l | tr -d ' ')" -eq 5 ]] \
   || die "provider lock metadata is incomplete"
-readonly URL="$(printf '%s\n' "$metadata" | sed -n '1p')"
-readonly EXPECTED_SHA256="$(printf '%s\n' "$metadata" | sed -n '2p')"
-readonly EXPECTED_BYTES="$(printf '%s\n' "$metadata" | sed -n '3p')"
-readonly EXPECTED_MACHINE="$(printf '%s\n' "$metadata" | sed -n '4p')"
-readonly EXPECTED_VERSION_OUTPUT="$(printf '%s\n' "$metadata" | sed -n '5p')"
+readonly URL
+readonly EXPECTED_SHA256
+readonly EXPECTED_BYTES
+readonly EXPECTED_MACHINE
+readonly EXPECTED_VERSION_OUTPUT
+URL="$(printf '%s\n' "$metadata" | sed -n '1p')"
+EXPECTED_SHA256="$(printf '%s\n' "$metadata" | sed -n '2p')"
+EXPECTED_BYTES="$(printf '%s\n' "$metadata" | sed -n '3p')"
+EXPECTED_MACHINE="$(printf '%s\n' "$metadata" | sed -n '4p')"
+EXPECTED_VERSION_OUTPUT="$(printf '%s\n' "$metadata" | sed -n '5p')"
 
 output_parent="$(dirname -- "$OUTPUT_PATH")"
 mkdir -p -- "$output_parent"

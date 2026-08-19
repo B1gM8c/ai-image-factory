@@ -421,7 +421,7 @@ fs.writeFileSync(
   { mode: 0o644 },
 );
 NODE
-[[ "$(${RELEASE_ROOT}/bin/grok --version)" = "$(
+[[ "$("${RELEASE_ROOT}/bin/grok" --version)" = "$(
   node -p "require('${GROK_LOCK_FILE}').version_output"
 )" ]] || die "packaged Grok provider version output does not match the lock"
 
