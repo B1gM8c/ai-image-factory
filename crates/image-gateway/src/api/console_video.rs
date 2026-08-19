@@ -32,6 +32,7 @@ use super::{
 };
 
 const GROK_REFERENCE_VIDEO_MODEL: &str = "grok-imagine-video";
+const GROK_VIDEO_MAX_PROMPT_CHARS: usize = 1_024;
 const MIN_GROK_REFERENCE_IMAGES: usize = 2;
 const MAX_GROK_REFERENCE_IMAGES: usize = 7;
 
@@ -346,6 +347,9 @@ fn prefer_official_dreamina_aliases(models: Vec<PublicModelRoute>) -> Vec<Public
 fn console_video_model(model: PublicModelRoute) -> Option<ConsoleVideoModel> {
     let controls = console_video_controls(&model.api_profile, model.provider_model_id.as_deref())?;
     let modes = console_video_modes(&model.api_profile, model.provider_model_id.as_deref())?;
+    let max_prompt_chars = (model.api_profile == XAI_VIDEOS_API_PROFILE
+        && model.provider_model_id.as_deref() == Some("grok-imagine-video-1.5-preview"))
+    .then_some(GROK_VIDEO_MAX_PROMPT_CHARS);
     Some(ConsoleVideoModel {
         id: model.id,
         provider: model.provider_id,
@@ -353,7 +357,7 @@ fn console_video_model(model: PublicModelRoute) -> Option<ConsoleVideoModel> {
         media_kind: model.media_kind,
         operation: model.operation_id,
         created: model.created_at_ms.div_euclid(1_000),
-        max_prompt_chars: None,
+        max_prompt_chars,
         modes,
         controls,
     })
@@ -912,7 +916,33 @@ mod tests {
             created_at_ms: 0,
         };
         let value = serde_json::to_value(console_video_model(model).unwrap()).unwrap();
-        assert!(value["max_prompt_chars"].is_null());
+        assert_eq!(value["max_prompt_chars"], GROK_VIDEO_MAX_PROMPT_CHARS);
+
+        let other_video = PublicModelRoute {
+            id: "seedance-2".to_owned(),
+            provider_model_id: Some("seedance2.0".to_owned()),
+            api_profile: DREAMINA_VIDEOS_API_PROFILE.to_owned(),
+            provider_id: image_provider_dreamina_cli::PROVIDER_ID.to_owned(),
+            operation_id: VIDEO_GENERATION_ROUTE_OPERATION.to_owned(),
+            media_kind: "video".to_owned(),
+            created_at_ms: 0,
+        };
+        let other_value = serde_json::to_value(console_video_model(other_video).unwrap()).unwrap();
+        assert!(other_value["max_prompt_chars"].is_null());
+    }
+
+    #[test]
+    fn console_video_catalog_is_not_cacheable() {
+        let response = private_json(ConsoleVideoModels {
+            object: "list",
+            data: Vec::new(),
+        });
+
+        assert_eq!(
+            response.headers()[header::CACHE_CONTROL],
+            "no-store, max-age=0"
+        );
+        assert_eq!(response.headers()[header::PRAGMA], "no-cache");
     }
 
     #[test]
