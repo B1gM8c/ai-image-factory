@@ -50,20 +50,20 @@ if [[ "$PROCESS_SCOPE" == "full" ]]; then
   while IFS= read -r unit; do
     case "$unit" in
       ai-image-factory-executord@*.service)
-        REQUIRED_PROFILE_UNITS+=("$unit")
+        systemctl is-enabled --quiet "$unit" \
+          && REQUIRED_PROFILE_UNITS+=("$unit")
         ;;
       ai-image-factory-workerd@*.service)
-        REQUIRED_PROFILE_UNITS+=("$unit")
+        systemctl is-enabled --quiet "$unit" \
+          && REQUIRED_PROFILE_UNITS+=("$unit")
         ;;
     esac
   done < <(
-    systemctl list-unit-files \
-      --type=service \
-      --state=enabled \
+    systemctl list-dependencies \
       --no-legend \
       --plain \
-      'ai-image-factory-executord@*.service' \
-      'ai-image-factory-workerd@*.service' \
+      --full \
+      ai-image-factory-processes.target \
       | awk '{print $1}'
   )
 fi

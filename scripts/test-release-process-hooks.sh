@@ -17,6 +17,18 @@ cat >"$TEST_ROOT/bin/systemctl" <<'EOF'
 #!/bin/bash
 phase="$(cat "$MOCK_PHASE_FILE")"
 case "$1" in
+  list-dependencies)
+    printf '%s\n' \
+      ai-image-factory-processes.target \
+      ai-image-factory-executord@default.service \
+      ai-image-factory-workerd@default.service
+    if [[ "${MOCK_MANAGED_UNITS:-false}" == true ]]; then
+      printf '%s\n' \
+        ai-image-factory-executord@managed.codex.images.test.service \
+        ai-image-factory-workerd@managed.codex.images.test.service
+    fi
+    exit 0
+    ;;
   list-unit-files)
     if [[ "${MOCK_MANAGED_UNITS:-false}" == true ]]; then
       printf '%s enabled\n' \
@@ -29,6 +41,11 @@ case "$1" in
     exit 0
     ;;
   is-enabled)
+    if [[ "${MOCK_MANAGED_UNITS:-false}" == true ]] \
+      && [[ "${@: -1}" == ai-image-factory-executord@managed.codex.images.test.service \
+        || "${@: -1}" == ai-image-factory-workerd@managed.codex.images.test.service ]]; then
+      exit 0
+    fi
     if [[ "${MOCK_LEGACY_ENABLED:-false}" == true ]] \
       && [[ "${@: -1}" == ai-image-factory-workerd.service ]]; then
       exit 0
@@ -172,6 +189,10 @@ run_quiesce MOCK_TARGET_EMPTY_PID=true >/dev/null
 grep -Fq 'stop ai-image-factory-processes.target' "$TEST_ROOT/stop.log"
 
 run_quiesce MOCK_TARGET_EMPTY_PID=true MOCK_STOP_FAILURE=true >/dev/null
+
+run_quiesce MOCK_TARGET_EMPTY_PID=true MOCK_MANAGED_UNITS=true >/dev/null
+grep -Fq 'ai-image-factory-executord@managed.codex.images.test.service' "$TEST_ROOT/stop.log"
+grep -Fq 'ai-image-factory-workerd@managed.codex.images.test.service' "$TEST_ROOT/stop.log"
 
 if run_quiesce MOCK_QUIESCE_STUCK_UNIT=ai-image-factory-workerd.service >/dev/null 2>&1; then
   echo "expected quiesce to fail while a process unit still has a MainPID" >&2
