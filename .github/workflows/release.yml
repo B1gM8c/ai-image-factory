@@ -79,6 +79,13 @@ jobs:
 
       - name: Install native build dependencies
         run: |
+          if command -v shellcheck >/dev/null 2>&1 \
+            && command -v pkg-config >/dev/null 2>&1 \
+            && pkg-config --exists openssl; then
+            shellcheck --version
+            pkg-config --modversion openssl
+            exit 0
+          fi
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends \
             libssl-dev \
@@ -224,6 +231,11 @@ jobs:
 
       - name: Install native build dependencies
         run: |
+          if command -v pkg-config >/dev/null 2>&1 \
+            && pkg-config --exists openssl; then
+            pkg-config --modversion openssl
+            exit 0
+          fi
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends libssl-dev pkg-config
 
