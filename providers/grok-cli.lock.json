@@ -6,7 +6,7 @@
   "version_output": "grok 1.0.5 (5115b46bc9)",
   "compatibility_revision": "grok-cli-1.0.5",
   "image_adapter_revision": "grok-cli-1.0.5.agentic-media.v2",
-  "video_adapter_revision": "grok-api-1.0.5.direct-image-video.v3",
+  "video_adapter_revision": "grok-api-1.0.5.direct-image-video.v4",
   "artifacts": {
     "x86_64-unknown-linux-gnu": {
       "url": "https://x.ai/cli/grok-1.0.5-linux-x86_64",

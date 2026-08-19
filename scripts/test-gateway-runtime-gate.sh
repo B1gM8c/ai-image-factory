@@ -33,7 +33,7 @@ EOF
 chmod 0755 "$TEST_ROOT/releases/v1/bin/grok"
 grok_sha256="$(sha256_file "$TEST_ROOT/releases/v1/bin/grok")"
 cat >"$TEST_ROOT/releases/v1/provider-manifest.json" <<EOF
-{"schema_version":1,"provider":"xai-grok-cli","version_output":"grok 1.0.5 (5115b46bc9)","binary_path":"bin/grok","binary_sha256":"${grok_sha256}","compatibility_revision":"grok-cli-1.0.5","image_adapter_revision":"grok-cli-1.0.5.agentic-media.v2","video_adapter_revision":"grok-api-1.0.5.direct-image-video.v3"}
+{"schema_version":1,"provider":"xai-grok-cli","version_output":"grok 1.0.5 (5115b46bc9)","binary_path":"bin/grok","binary_sha256":"${grok_sha256}","compatibility_revision":"grok-cli-1.0.5","image_adapter_revision":"grok-cli-1.0.5.agentic-media.v2","video_adapter_revision":"grok-api-1.0.5.direct-image-video.v4"}
 EOF
 printf 'GATEWAY_MANAGED_GROK_EXECUTABLE=%s\0' \
   "$TEST_ROOT/releases/v1/bin/grok" >"$TEST_ROOT/proc/102/environ"

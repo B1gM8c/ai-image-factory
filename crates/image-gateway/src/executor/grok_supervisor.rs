@@ -1389,6 +1389,7 @@ mod tests {
         );
         let projected =
             fs::read_to_string(spool.provider_home_path().unwrap().join("config.toml")).unwrap();
+        assert!(projected.contains("disable_zdr_incompatible_tools = true"));
         assert!(projected.contains("[tools.zdr_video_output_s3]"));
         assert!(
             projected
@@ -1757,6 +1758,7 @@ secret_access_key = "sk"
         let spool = ExecutionSpool::for_lease(&fixture.journal, &lease).unwrap();
         let projected =
             fs::read_to_string(spool.provider_home_path().unwrap().join("config.toml")).unwrap();
+        assert!(projected.contains("disable_zdr_incompatible_tools = true"));
         assert!(projected.contains("[tools.zdr_video_output_s3]"));
         assert!(projected.contains("[tools.zdr_video_output_s3.read_write]"));
         assert!(!projected.contains("marketplace"));

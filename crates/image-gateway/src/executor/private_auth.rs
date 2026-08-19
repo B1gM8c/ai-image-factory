@@ -193,6 +193,12 @@ pub(super) fn prepare_isolated_grok_fallback_config(
 
 fn write_isolated_grok_video_output(destination_home: &Path, output: Table) -> std::io::Result<()> {
     let mut tools = Table::new();
+    // Grok 1.0.5 only attaches the configured S3 presign target when this
+    // ZDR guard is enabled; otherwise it sends video requests without output.
+    tools.insert(
+        "disable_zdr_incompatible_tools".to_owned(),
+        Value::Boolean(true),
+    );
     tools.insert("zdr_video_output_s3".to_owned(), Value::Table(output));
     let mut document = Table::new();
     document.insert("tools".to_owned(), Value::Table(tools));
@@ -373,6 +379,9 @@ mod tests {
 [marketplace]
 enabled = true
 
+[tools]
+disable_zdr_incompatible_tools = false
+
 [tools.zdr_video_output_s3]
 bucket = "video-output"
 region = "z2"
@@ -392,6 +401,7 @@ secret_access_key = "sk"
 
         let projected = fs::read_to_string(destination.join(CONFIG_FILE)).unwrap();
         assert!(!projected.contains("marketplace"));
+        assert!(projected.contains("disable_zdr_incompatible_tools = true"));
         assert!(projected.contains("[tools.zdr_video_output_s3]"));
         assert!(projected.contains("[tools.zdr_video_output_s3.read_write]"));
         assert_eq!(
@@ -439,6 +449,10 @@ secret_access_key = "sk"
 
         let projected = fs::read_to_string(destination.join(CONFIG_FILE)).unwrap();
         let document = projected.parse::<Table>().unwrap();
+        assert_eq!(
+            document["tools"]["disable_zdr_incompatible_tools"].as_bool(),
+            Some(true)
+        );
         assert_eq!(
             document["tools"]["zdr_video_output_s3"]["endpoint"].as_str(),
             Some(configuration.endpoint.as_str())
