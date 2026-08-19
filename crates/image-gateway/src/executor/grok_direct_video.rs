@@ -43,6 +43,8 @@ pub(super) struct GrokDiagnosticV1 {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     message_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    message_class: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     remote_task_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     mismatch_field: Option<String>,
@@ -67,6 +69,7 @@ impl GrokDiagnosticV1 {
             upstream_type: None,
             message_sha256: Some(sha256(bytes)),
             message_bytes: Some(bytes.len() as u64),
+            message_class: None,
             remote_task_id: None,
             mismatch_field: None,
             expected_type: None,
@@ -91,6 +94,7 @@ impl GrokDiagnosticV1 {
             upstream_type: None,
             message_sha256: None,
             message_bytes: None,
+            message_class: None,
             remote_task_id: None,
             mismatch_field: safe_token(field),
             expected_type: expected.map(json_type).map(str::to_owned),
@@ -116,6 +120,7 @@ impl GrokDiagnosticV1 {
             upstream_type: None,
             message_sha256: None,
             message_bytes: None,
+            message_class: None,
             remote_task_id: None,
             mismatch_field: safe_token(field),
             expected_type: safe_token(expected_type),
@@ -140,6 +145,7 @@ impl GrokDiagnosticV1 {
             upstream_type: upstream_type.and_then(safe_token),
             message_sha256: safe_sha256(message_sha256),
             message_bytes: Some(message_bytes),
+            message_class: None,
             remote_task_id: None,
             mismatch_field: None,
             expected_type: None,
@@ -159,6 +165,7 @@ impl GrokDiagnosticV1 {
             upstream_type: None,
             message_sha256: None,
             message_bytes: None,
+            message_class: None,
             remote_task_id: safe_remote_id(remote_task_id),
             mismatch_field: None,
             expected_type: None,
@@ -179,6 +186,7 @@ impl GrokDiagnosticV1 {
             upstream_type: None,
             message_sha256,
             message_bytes,
+            message_class: None,
             remote_task_id: None,
             mismatch_field: None,
             expected_type: None,
@@ -432,16 +440,35 @@ fn http_error(
     let upstream_code = error
         .and_then(|value| value.get("code"))
         .and_then(Value::as_str)
+        .or_else(|| {
+            parsed
+                .as_ref()
+                .and_then(|value| value.get("code"))
+                .and_then(Value::as_str)
+        })
         .and_then(safe_token);
     let upstream_type = error
         .and_then(|value| value.get("type"))
         .and_then(Value::as_str)
+        .or_else(|| {
+            parsed
+                .as_ref()
+                .and_then(|value| value.get("type"))
+                .and_then(Value::as_str)
+        })
         .and_then(safe_token);
     let message = error
         .and_then(|value| value.get("message"))
         .and_then(Value::as_str)
-        .or_else(|| error.and_then(Value::as_str));
+        .or_else(|| error.and_then(Value::as_str))
+        .or_else(|| {
+            parsed
+                .as_ref()
+                .and_then(|value| value.get("message"))
+                .and_then(Value::as_str)
+        });
     let (message_sha256, message_bytes) = message_digest(message);
+    let message_class = classify_upstream_message(message).map(str::to_owned);
     let retryable = status == StatusCode::REQUEST_TIMEOUT
         || status == StatusCode::TOO_MANY_REQUESTS
         || status.is_server_error();
@@ -450,7 +477,7 @@ fn http_error(
         error_code: if retryable {
             "grok_video_upstream_unavailable"
         } else {
-            "grok_video_upstream_rejected"
+            upstream_rejection_error_code(message_class.as_deref())
         },
         definite,
         diagnostic: Box::new(GrokDiagnosticV1 {
@@ -467,6 +494,7 @@ fn http_error(
             upstream_type,
             message_sha256,
             message_bytes,
+            message_class,
             remote_task_id: remote_task_id.and_then(safe_remote_id),
             mismatch_field: None,
             expected_type: None,
@@ -558,6 +586,7 @@ fn diagnostic_error(
             upstream_type: None,
             message_sha256: message.map(sha256),
             message_bytes: message.map(|value| value.len() as u64),
+            message_class: None,
             remote_task_id: remote_task_id.and_then(safe_remote_id),
             mismatch_field: None,
             expected_type: None,
@@ -573,6 +602,70 @@ fn message_digest(message: Option<&str>) -> (Option<String>, Option<u64>) {
         message.map(|value| sha256(value.as_bytes())),
         message.map(|value| value.len() as u64),
     )
+}
+
+fn classify_upstream_message(message: Option<&str>) -> Option<&'static str> {
+    let message = message?.to_ascii_lowercase();
+    let contains_any = |needles: &[&str]| needles.iter().any(|needle| message.contains(needle));
+
+    if message.contains("prompt")
+        && contains_any(&[
+            "too long",
+            "max length",
+            "maximum length",
+            "exceed",
+            "less than",
+            "at most",
+            "longer than",
+            "length limit",
+            "character limit",
+            "byte limit",
+        ])
+    {
+        Some("prompt_length")
+    } else if message.contains("output.upload_url")
+        || (message.contains("upload") && message.contains("url"))
+    {
+        Some("output_upload_url")
+    } else if contains_any(&[
+        "content policy",
+        "content moderation",
+        "safety policy",
+        "moderation",
+    ]) {
+        Some("content_policy")
+    } else if message.contains("image")
+        && contains_any(&[
+            "invalid",
+            "unsupported",
+            "decode",
+            "format",
+            "dimension",
+            "too large",
+            "fetch",
+        ])
+    {
+        Some("input_image")
+    } else if message.contains("duration") {
+        Some("duration")
+    } else if message.contains("resolution") {
+        Some("resolution")
+    } else if message.contains("model") {
+        Some("model")
+    } else {
+        None
+    }
+}
+
+fn upstream_rejection_error_code(message_class: Option<&str>) -> &'static str {
+    match message_class {
+        Some("prompt_length") => "grok_video_prompt_rejected",
+        Some("input_image") => "grok_video_input_image_rejected",
+        Some("output_upload_url") => "grok_video_output_upload_url_rejected",
+        Some("content_policy") => "grok_video_content_policy_rejected",
+        Some("duration" | "resolution" | "model") => "grok_video_invalid_parameter",
+        _ => "grok_video_upstream_rejected",
+    }
 }
 
 fn safe_token(value: &str) -> Option<String> {
@@ -703,6 +796,52 @@ mod tests {
         );
         assert!(!poll.definite);
         assert_eq!(poll.diagnostic.remote_task_id.as_deref(), Some("task_123"));
+    }
+
+    #[test]
+    fn top_level_upstream_errors_keep_only_safe_classification() {
+        let body = br#"{"code":"invalid-argument","error":"Prompt exceeds the maximum length of 4096 bytes."}"#;
+        let error = http_error("start", StatusCode::BAD_REQUEST, body, None);
+        let serialized = serde_json::to_string(&error.diagnostic).unwrap();
+
+        assert!(error.definite);
+        assert_eq!(error.error_code, "grok_video_prompt_rejected");
+        assert_eq!(
+            error.diagnostic.upstream_code.as_deref(),
+            Some("invalid-argument")
+        );
+        assert_eq!(
+            error.diagnostic.message_class.as_deref(),
+            Some("prompt_length")
+        );
+        assert_eq!(error.diagnostic.message_bytes, Some(48));
+        assert!(!serialized.contains("Prompt"));
+        assert!(!serialized.contains("4096"));
+    }
+
+    #[test]
+    fn upstream_message_classes_cover_video_request_boundaries() {
+        let cases = [
+            (
+                "The output.upload_url field is invalid.",
+                "output_upload_url",
+            ),
+            ("The input image format is unsupported.", "input_image"),
+            (
+                "The request was blocked by content policy.",
+                "content_policy",
+            ),
+            ("The duration is invalid.", "duration"),
+            ("The resolution is invalid.", "resolution"),
+        ];
+
+        for (message, expected) in cases {
+            assert_eq!(classify_upstream_message(Some(message)), Some(expected));
+        }
+        assert_eq!(
+            classify_upstream_message(Some("Private provider detail")),
+            None
+        );
     }
 
     #[test]

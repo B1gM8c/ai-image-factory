@@ -44,7 +44,7 @@ pub use xai_video::{
 pub const PROVIDER_ID: &str = "grok-cli";
 pub const GROK_CLI_COMPATIBILITY_VERSION: &str = "1.0.5";
 pub const ADAPTER_REVISION: &str = "grok-cli-1.0.5.agentic-media.v2";
-pub const VIDEO_ADAPTER_REVISION: &str = "grok-api-1.0.5.direct-image-video.v4";
+pub const VIDEO_ADAPTER_REVISION: &str = "grok-api-1.0.5.direct-image-video.v5";
 pub const REQUEST_SCHEMA_VERSION: u16 = 1;
 
 #[cfg(test)]

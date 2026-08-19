@@ -395,7 +395,7 @@ if (
   !/^grok 1\.0\.5 \([0-9a-f]+\)$/.test(lock.version_output) ||
   lock.compatibility_revision !== "grok-cli-1.0.5" ||
   lock.image_adapter_revision !== "grok-cli-1.0.5.agentic-media.v2" ||
-  lock.video_adapter_revision !== "grok-api-1.0.5.direct-image-video.v4"
+  lock.video_adapter_revision !== "grok-api-1.0.5.direct-image-video.v5"
 ) {
   throw new Error("Grok provider binary does not match the immutable provider lock");
 }

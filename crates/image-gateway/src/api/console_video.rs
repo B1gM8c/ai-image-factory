@@ -782,6 +782,12 @@ fn console_video_error_code(error_code: Option<&str>) -> &'static str {
     match error_code {
         Some("permission_denied" | "authentication_failed") => "permission_denied",
         Some("invalid_argument" | "executor_command_rejected") => "invalid_argument",
+        Some(
+            "grok_video_prompt_rejected"
+            | "grok_video_input_image_rejected"
+            | "grok_video_invalid_parameter",
+        ) => "invalid_argument",
+        Some("grok_video_content_policy_rejected") => "content_policy_rejected",
         Some("failed_precondition") => "failed_precondition",
         Some("grok_video_output_upload_url_required") => "grok_video_output_upload_url_required",
         Some("service_unavailable" | "timeout" | "grok_cli_failed") => "service_unavailable",
@@ -793,6 +799,16 @@ fn console_video_error_message(error_code: Option<&str>) -> &'static str {
     match error_code {
         Some("grok_video_output_upload_url_required") => {
             "Grok Zero Data Retention accounts require a video upload target"
+        }
+        Some("grok_video_prompt_rejected") => "The video prompt was rejected by the provider",
+        Some("grok_video_input_image_rejected") => {
+            "The video input image was rejected by the provider"
+        }
+        Some("grok_video_invalid_parameter") => {
+            "A video generation parameter was rejected by the provider"
+        }
+        Some("grok_video_content_policy_rejected") => {
+            "The video request was rejected by the provider content policy"
         }
         _ => "Video generation failed",
     }
@@ -1115,6 +1131,42 @@ mod tests {
             error.message,
             "Grok Zero Data Retention accounts require a video upload target"
         );
+    }
+
+    #[test]
+    fn provider_rejections_keep_a_safe_actionable_console_category() {
+        let cases = [
+            (
+                "grok_video_prompt_rejected",
+                "invalid_argument",
+                "The video prompt was rejected by the provider",
+            ),
+            (
+                "grok_video_input_image_rejected",
+                "invalid_argument",
+                "The video input image was rejected by the provider",
+            ),
+            (
+                "grok_video_content_policy_rejected",
+                "content_policy_rejected",
+                "The video request was rejected by the provider content policy",
+            ),
+        ];
+
+        for (error_code, expected_code, expected_message) in cases {
+            let status = console_video_status(
+                "proj_one",
+                "task-one",
+                VideoResultStatus::Failed {
+                    model: "grok-imagine-video".to_owned(),
+                    duration: 6,
+                    error_code: Some(error_code.to_owned()),
+                },
+            );
+            let error = status.error.unwrap();
+            assert_eq!(error.code, expected_code);
+            assert_eq!(error.message, expected_message);
+        }
     }
 
     fn resolved_route(api_profile: &str) -> ResolvedModelRoute {

@@ -71,7 +71,7 @@ if (
     or not re.fullmatch(r"grok 1\.0\.5 \([0-9a-f]+\)", str(manifest.get("version_output", "")))
     or manifest.get("compatibility_revision") != "grok-cli-1.0.5"
     or manifest.get("image_adapter_revision") != "grok-cli-1.0.5.agentic-media.v2"
-    or manifest.get("video_adapter_revision") != "grok-api-1.0.5.direct-image-video.v4"
+    or manifest.get("video_adapter_revision") != "grok-api-1.0.5.direct-image-video.v5"
 ):
     raise SystemExit("invalid provider manifest")
 print(manifest["binary_sha256"])
