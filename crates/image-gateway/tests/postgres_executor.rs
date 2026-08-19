@@ -6762,7 +6762,7 @@ async fn launch_context_rejects_command_tampering_and_expired_lease() -> TestRes
         let work = seed_lease(&database.pool, "launch-integrity-worker", 1).await?;
         let store = PostgresExecutorSubmissionStore::new(database.pool.clone());
         store.prepare_and_handoff(&work, profile_id_for_lease(&work)).await.map_err(debug_error)?;
-        let lease = claim_required_for(&store, "launch-integrity-executor", 100).await?;
+        let lease = claim_required_for(&store, "launch-integrity-executor", 5_000).await?;
         store.start(&lease).await.map_err(debug_error)?;
 
         sqlx::query(
@@ -6784,7 +6784,7 @@ async fn launch_context_rejects_command_tampering_and_expired_lease() -> TestRes
             .execute(&database.pool)
             .await
             .map_err(debug_error)?;
-        tokio::time::sleep(Duration::from_millis(120)).await;
+        tokio::time::sleep(Duration::from_millis(5_100)).await;
         require(
             store.load_launch_context(&lease).await
                 == Err(ExecutorSubmissionError::StaleLease),

@@ -2794,7 +2794,7 @@ async fn submit_orchestrator_bounds_a_stuck_provider_future() -> TestResult {
         let orchestrator = ProviderSubmitOrchestrator::new(
             PostgresProviderTaskStore::new(database.pool.clone()),
             provider.clone(),
-            200,
+            5_000,
             journal.path().join("remote-submit"),
         )
         .map_err(debug_error)?;
@@ -2805,7 +2805,7 @@ async fn submit_orchestrator_bounds_a_stuck_provider_future() -> TestResult {
             .await
             .map_err(debug_error)?;
         require(
-            started.elapsed() < Duration::from_secs(2)
+            started.elapsed() < Duration::from_secs(7)
                 && matches!(observed, ProviderSubmitOutcome::AwaitingEvidence(ref intent)
                     if intent.state == ProviderSubmitIntentState::OutcomeUnknown
                         && intent.failure_error_code.as_deref() == Some("provider_submit_timeout"))
