@@ -136,7 +136,7 @@ async fn terminalize_unstarted_job(
           AND job.state = 'reserved'
           AND job.charged_units = 0
           AND job.economics_contract_version = 4
-          AND work.kind = 'edit'
+          AND work.kind IN ('edit', 'image_batch')
           AND work.state = 'ready'
           AND work.execution_id IS NULL
           AND work.lease_owner IS NULL

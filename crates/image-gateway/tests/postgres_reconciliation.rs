@@ -1083,7 +1083,7 @@ async fn unstarted_v4_edit(pool: &PgPool, key: &str) -> TestResult<Uuid> {
                 manifest_hash,
                 inputs: vec![input],
             }),
-            work_kind: "edit".to_string(),
+            work_kind: "image_batch".to_string(),
             schedule_scope: format!("tenant:{tenant_id}"),
             schedule_weight: 1,
             schedule_priority: 1,
