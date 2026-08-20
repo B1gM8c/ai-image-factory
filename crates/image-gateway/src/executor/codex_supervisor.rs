@@ -439,19 +439,6 @@ pub async fn run_codex_runner_child(
     match outcome {
         ChildOutcome::Succeeded(bytes) => {
             spool.publish_output(&bytes).map_err(child_spool_error)?;
-            if spool.cleanup_codex_runtime().is_err() {
-                spool
-                    .publish_terminal(
-                        &runner_lock,
-                        &ProcessTerminal::Uncertain {
-                            helper_nonce: identity.nonce.clone(),
-                            error_code: "codex_local_cleanup_failed".to_owned(),
-                        },
-                    )
-                    .map_err(child_spool_error)?;
-                drop(runner_lock);
-                return Ok(());
-            }
             spool
                 .publish_terminal(
                     &runner_lock,
@@ -465,38 +452,30 @@ pub async fn run_codex_runner_child(
                 .map_err(child_spool_error)?;
         }
         ChildOutcome::Failed(error_code) => {
-            let cleanup_failed = spool.cleanup_codex_runtime().is_err();
-            let terminal = if cleanup_failed {
-                ProcessTerminal::Uncertain {
-                    helper_nonce: identity.nonce.clone(),
-                    error_code: "codex_local_cleanup_failed".to_owned(),
-                }
-            } else {
-                ProcessTerminal::Failed {
-                    helper_nonce: identity.nonce.clone(),
-                    error_code: error_code.to_owned(),
-                }
+            let terminal = ProcessTerminal::Failed {
+                helper_nonce: identity.nonce.clone(),
+                error_code: error_code.to_owned(),
             };
             spool
                 .publish_terminal(&runner_lock, &terminal)
                 .map_err(child_spool_error)?
         }
-        ChildOutcome::Uncertain(error_code) => {
-            let cleanup_failed = spool.cleanup_codex_runtime().is_err();
-            spool
-                .publish_terminal(
-                    &runner_lock,
-                    &ProcessTerminal::Uncertain {
-                        helper_nonce: identity.nonce.clone(),
-                        error_code: if cleanup_failed {
-                            "codex_local_cleanup_failed".to_owned()
-                        } else {
-                            error_code.to_owned()
-                        },
-                    },
-                )
-                .map_err(child_spool_error)?
-        }
+        ChildOutcome::Uncertain(error_code) => spool
+            .publish_terminal(
+                &runner_lock,
+                &ProcessTerminal::Uncertain {
+                    helper_nonce: identity.nonce.clone(),
+                    error_code: error_code.to_owned(),
+                },
+            )
+            .map_err(child_spool_error)?,
+    }
+    if let Err(error) = spool.cleanup_codex_runtime() {
+        tracing::warn!(
+            %executor_execution_id,
+            ?error,
+            "Codex runtime cleanup failed after durable terminal; runtime retained"
+        );
     }
     drop(runner_lock);
     Ok(())

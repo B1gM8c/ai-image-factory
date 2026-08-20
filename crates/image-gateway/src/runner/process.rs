@@ -1366,6 +1366,61 @@ mod tests {
     }
 
     #[test]
+    fn orphan_output_without_terminal_is_never_promoted() {
+        let (_temp, journal, lease) = fixture();
+        let spool = ExecutionSpool::for_lease(&journal, &lease).unwrap();
+        let lock = spool.acquire_runner_lock().unwrap();
+        let identity = lock.identity().unwrap();
+        spool.publish_process(&lock, &identity).unwrap();
+        spool.publish_output(b"orphan-output").unwrap();
+
+        drop(lock);
+
+        assert_eq!(
+            spool.observe().unwrap(),
+            ProcessObservation::Lost { provider: None }
+        );
+    }
+
+    #[test]
+    fn durable_success_survives_runtime_cleanup_failure() {
+        let (_temp, journal, lease) = fixture();
+        let spool = ExecutionSpool::for_lease(&journal, &lease).unwrap();
+        let lock = spool.acquire_runner_lock().unwrap();
+        let identity = lock.identity().unwrap();
+        spool.publish_process(&lock, &identity).unwrap();
+        let bytes = b"durable-output";
+        spool.publish_output(bytes).unwrap();
+        spool
+            .publish_terminal(
+                &lock,
+                &ProcessTerminal::Succeeded {
+                    helper_nonce: identity.nonce,
+                    sha256_hex: sha256(bytes),
+                    byte_size: bytes.len() as u64,
+                    provider_reported_cost: None,
+                },
+            )
+            .unwrap();
+
+        let workspace = spool.workspace_path().unwrap();
+        let displaced = workspace.with_extension("displaced");
+        fs::rename(&workspace, &displaced).unwrap();
+        fs::create_dir(&workspace).unwrap();
+        assert_eq!(
+            spool.cleanup_codex_runtime(),
+            Err(ProcessSpoolError::Integrity)
+        );
+
+        assert_eq!(
+            spool.observe().unwrap(),
+            ProcessObservation::Succeeded(
+                SupervisedOutput::from_parts(bytes.to_vec(), None).unwrap()
+            )
+        );
+    }
+
+    #[test]
     fn workspace_output_reader_accepts_owned_read_only_regular_files() {
         let (_temp, journal, lease) = fixture();
         let spool = ExecutionSpool::for_lease(&journal, &lease).unwrap();

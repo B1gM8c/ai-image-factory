@@ -575,19 +575,6 @@ pub async fn run_grok_runner_child(
             provider_reported_cost,
         } => {
             spool.publish_output(&bytes).map_err(child_spool_error)?;
-            if spool.cleanup_provider_runtime().is_err() {
-                spool
-                    .publish_terminal(
-                        &runner_lock,
-                        &ProcessTerminal::Uncertain {
-                            helper_nonce: identity.nonce.clone(),
-                            error_code: "grok_local_cleanup_failed".to_owned(),
-                        },
-                    )
-                    .map_err(child_spool_error)?;
-                drop(runner_lock);
-                return Ok(());
-            }
             spool
                 .publish_terminal(
                     &runner_lock,
@@ -601,38 +588,30 @@ pub async fn run_grok_runner_child(
                 .map_err(child_spool_error)?;
         }
         ChildOutcome::Failed(error_code) => {
-            let cleanup_failed = spool.cleanup_provider_runtime().is_err();
-            let terminal = if cleanup_failed {
-                ProcessTerminal::Uncertain {
-                    helper_nonce: identity.nonce.clone(),
-                    error_code: "grok_local_cleanup_failed".to_owned(),
-                }
-            } else {
-                ProcessTerminal::Failed {
-                    helper_nonce: identity.nonce.clone(),
-                    error_code: error_code.to_owned(),
-                }
+            let terminal = ProcessTerminal::Failed {
+                helper_nonce: identity.nonce.clone(),
+                error_code: error_code.to_owned(),
             };
             spool
                 .publish_terminal(&runner_lock, &terminal)
                 .map_err(child_spool_error)?
         }
-        ChildOutcome::Uncertain(error_code) => {
-            let cleanup_failed = spool.cleanup_provider_runtime().is_err();
-            spool
-                .publish_terminal(
-                    &runner_lock,
-                    &ProcessTerminal::Uncertain {
-                        helper_nonce: identity.nonce.clone(),
-                        error_code: if cleanup_failed {
-                            "grok_local_cleanup_failed".to_owned()
-                        } else {
-                            error_code.to_owned()
-                        },
-                    },
-                )
-                .map_err(child_spool_error)?
-        }
+        ChildOutcome::Uncertain(error_code) => spool
+            .publish_terminal(
+                &runner_lock,
+                &ProcessTerminal::Uncertain {
+                    helper_nonce: identity.nonce.clone(),
+                    error_code: error_code.to_owned(),
+                },
+            )
+            .map_err(child_spool_error)?,
+    }
+    if let Err(error) = spool.cleanup_provider_runtime() {
+        tracing::warn!(
+            %executor_execution_id,
+            ?error,
+            "Grok runtime cleanup failed after durable terminal; runtime retained"
+        );
     }
     drop(runner_lock);
     Ok(())
