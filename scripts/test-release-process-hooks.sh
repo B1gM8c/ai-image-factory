@@ -50,6 +50,10 @@ case "$1" in
       && [[ "${@: -1}" == ai-image-factory-workerd.service ]]; then
       exit 0
     fi
+    if [[ "${MOCK_CODEX_EDITS_ENABLED:-false}" == true ]] \
+      && [[ "${@: -1}" == ai-image-factory-workerd-codex-edits.service ]]; then
+      exit 0
+    fi
     exit 1
     ;;
   is-active)
@@ -180,6 +184,10 @@ grep -Fq 'ai-image-factory-workerd@managed.codex.images.test.service' "$TEST_ROO
 run_verify MOCK_LEGACY_ENABLED=true >/dev/null
 grep -Fq 'ai-image-factory-workerd.service' "$TEST_ROOT/gate.log"
 
+: >"$TEST_ROOT/gate.log"
+run_verify MOCK_CODEX_EDITS_ENABLED=true >/dev/null
+grep -Fq 'ai-image-factory-workerd-codex-edits.service' "$TEST_ROOT/gate.log"
+
 if run_verify MOCK_UNSTABLE=true >/dev/null 2>&1; then
   echo "expected a PID/restart change during the stability window to fail" >&2
   exit 1
@@ -222,5 +230,12 @@ fi
 : >"$TEST_ROOT/start.log"
 run_start_processes MOCK_LEGACY_ENABLED=true >/dev/null
 grep -Fq 'ai-image-factory-workerd.service' "$TEST_ROOT/start.log"
+
+: >"$TEST_ROOT/start.log"
+run_start_processes \
+  MOCK_CODEX_EDITS_ENABLED=true \
+  MOCK_INACTIVE_UNIT=ai-image-factory-workerd-codex-edits.service \
+  >/dev/null
+grep -Fq 'ai-image-factory-workerd-codex-edits.service' "$TEST_ROOT/start.log"
 
 echo "release process hook tests passed"

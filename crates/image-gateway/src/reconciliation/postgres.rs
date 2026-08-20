@@ -1,11 +1,11 @@
 use async_trait::async_trait;
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use sqlx::{PgPool, Postgres, Transaction};
+use sqlx::{AssertSqlSafe, PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
-use super::{ReconciliationOutcome, ReconciliationStore};
-use crate::ImageGatewayError;
+use super::{ReconciliationOutcome, ReconciliationStore, UnstartedJobTerminalization};
+use crate::{ImageGatewayError, credit_grants::settle_credit_grant_reservations};
 
 const SERIALIZABLE_RETRY_ATTEMPTS: usize = 3;
 
@@ -18,6 +18,31 @@ impl PostgresReconciliationStore {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
     }
+
+    pub async fn terminalize_unstarted_job(
+        &self,
+        job_id: Uuid,
+    ) -> Result<UnstartedJobTerminalization, ImageGatewayError> {
+        terminalize_unstarted_job(&self.pool, job_id).await
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct LockedUnstartedJob {
+    tenant_id: String,
+    request_id: String,
+    operation: String,
+    output_count: i32,
+    reservation_id: Uuid,
+    requested_units: i32,
+    billing_metric: String,
+    billing_unit: String,
+    work_item_id: Uuid,
+    hold_id: Uuid,
+    currency: String,
+    held_micros: i64,
+    grant_held_micros: i64,
+    account_held_micros: i64,
 }
 
 #[derive(sqlx::FromRow)]
@@ -62,6 +87,342 @@ struct LockedOrphanReservation {
     job_state: String,
     charged_units: i32,
     job_created_at_ms: i64,
+}
+
+async fn terminalize_unstarted_job(
+    pool: &PgPool,
+    job_id: Uuid,
+) -> Result<UnstartedJobTerminalization, ImageGatewayError> {
+    if job_id.is_nil() {
+        return Err(ImageGatewayError::config(
+            "unstarted job terminalization requires a job id",
+        ));
+    }
+    let mut tx = pool.begin().await.map_err(reconciliation_unavailable)?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
+        .execute(&mut *tx)
+        .await
+        .map_err(reconciliation_unavailable)?;
+    let tenant_id: String = sqlx::query_scalar("SELECT tenant_id FROM jobs WHERE job_id = $1")
+        .bind(job_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(reconciliation_unavailable)?
+        .ok_or_else(|| ImageGatewayError::config("job does not exist"))?;
+    lock_tenant_quota(&mut tx, &tenant_id).await?;
+
+    let locked: LockedUnstartedJob = sqlx::query_as(
+        r#"
+        SELECT job.tenant_id, job.request_id, job.operation,
+               job.output_count, quota.reservation_id, quota.requested_units,
+               quota.billing_metric, quota.billing_unit,
+               work.work_item_id, hold.hold_id, hold.currency,
+               hold.held_micros, hold.grant_held_micros,
+               hold.account_held_micros
+        FROM jobs job
+        JOIN quota_reservations quota
+          ON quota.reservation_id = job.reservation_id
+         AND quota.job_id = job.job_id
+         AND quota.tenant_id = job.tenant_id
+        JOIN work_items work ON work.job_id = job.job_id
+        JOIN admission_sessions session
+          ON session.session_id = quota.admission_session_id
+         AND session.job_id = job.job_id
+         AND session.tenant_id = job.tenant_id
+         AND session.request_id = job.request_id
+        JOIN customer_billing_holds hold ON hold.job_id = job.job_id
+        WHERE job.job_id = $1
+          AND job.operation = 'edit'
+          AND job.state = 'reserved'
+          AND job.charged_units = 0
+          AND job.economics_contract_version = 4
+          AND work.kind = 'edit'
+          AND work.state = 'ready'
+          AND work.execution_id IS NULL
+          AND work.lease_owner IS NULL
+          AND work.lease_expires_at_ms IS NULL
+          AND work.lease_epoch = 0
+          AND quota.state IN ('reserved', 'expired')
+          AND quota.committed_units = 0
+          AND quota.started_units = 0
+          AND quota.released_units = 0
+          AND quota.requested_units = job.billable_units
+          AND session.state = 'attached'
+          AND hold.state = 'held'
+          AND hold.captured_micros = 0
+          AND hold.released_micros = 0
+          AND hold.grant_captured_micros = 0
+          AND hold.account_captured_micros = 0
+          AND hold.grant_released_micros = 0
+          AND hold.account_released_micros = 0
+        FOR UPDATE OF job, quota, work, session, hold
+        "#,
+    )
+    .bind(job_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(reconciliation_unavailable)?
+    .ok_or_else(|| {
+        ImageGatewayError::conflict(
+            "Job is not an untouched queued edit",
+            None,
+            "unstarted_job_terminalization_conflict",
+        )
+    })?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(format!("budget:{}:{}", locked.tenant_id, locked.currency))
+        .execute(&mut *tx)
+        .await
+        .map_err(reconciliation_unavailable)?;
+    sqlx::query("SELECT 1 FROM billing_accounts WHERE tenant_id = $1 AND currency = $2 FOR UPDATE")
+        .bind(&locked.tenant_id)
+        .bind(&locked.currency)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(reconciliation_unavailable)?;
+
+    let valid_outputs: i64 = sqlx::query_scalar(
+        r#"
+        SELECT COUNT(*) FROM job_outputs
+        WHERE job_id = $1 AND state = 'pending'
+          AND started_at_ms IS NULL AND finished_at_ms IS NULL
+          AND error_code IS NULL
+        "#,
+    )
+    .bind(job_id)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(reconciliation_unavailable)?;
+    let idempotency_rows: (i64, i64) = sqlx::query_as(
+        r#"
+        SELECT COUNT(*), COUNT(*) FILTER (
+            WHERE state = 'accepted' AND terminal_outcome IS NULL
+        )
+        FROM idempotency_requests WHERE job_id = $1
+        "#,
+    )
+    .bind(job_id)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(reconciliation_unavailable)?;
+    let side_effects: bool = sqlx::query_scalar(
+        r#"
+        SELECT EXISTS (SELECT 1 FROM job_attempts attempt
+                       JOIN work_items work ON work.work_item_id = attempt.work_item_id
+                       WHERE work.job_id = $1)
+            OR EXISTS (SELECT 1 FROM provider_submissions WHERE job_id = $1)
+            OR EXISTS (SELECT 1 FROM artifacts WHERE job_id = $1)
+            OR EXISTS (SELECT 1 FROM provider_usage_facts WHERE job_id = $1)
+            OR EXISTS (SELECT 1 FROM customer_rated_usage WHERE job_id = $1)
+            OR EXISTS (SELECT 1 FROM ledger_transactions WHERE source_job_id = $1)
+        "#,
+    )
+    .bind(job_id)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(reconciliation_unavailable)?;
+    if valid_outputs != i64::from(locked.output_count)
+        || idempotency_rows.0 == 0
+        || idempotency_rows.0 != idempotency_rows.1
+        || side_effects
+        || locked.held_micros < 0
+        || locked.grant_held_micros < 0
+        || locked.account_held_micros < 0
+        || locked.grant_held_micros + locked.account_held_micros != locked.held_micros
+    {
+        return Err(ImageGatewayError::conflict(
+            "Job has execution or economic effects and cannot be terminalized as unstarted",
+            None,
+            "unstarted_job_terminalization_conflict",
+        ));
+    }
+
+    let now = database_now(&mut tx).await?;
+    settle_credit_grant_reservations(
+        &mut tx,
+        locked.hold_id,
+        &locked.tenant_id,
+        &locked.currency,
+        locked.grant_held_micros,
+        0,
+        now,
+    )
+    .await?;
+    require_one(
+        sqlx::query(
+            r#"
+            UPDATE billing_accounts
+            SET held_micros = held_micros - $3, updated_at_ms = $4
+            WHERE tenant_id = $1 AND currency = $2 AND held_micros >= $3
+            "#,
+        )
+        .bind(&locked.tenant_id)
+        .bind(&locked.currency)
+        .bind(locked.account_held_micros)
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .map_err(reconciliation_unavailable)?,
+        "unstarted job billing account release",
+    )?;
+    require_one(
+        sqlx::query(
+            r#"
+            UPDATE customer_billing_holds
+            SET captured_micros = 0, released_micros = held_micros,
+                grant_captured_micros = 0,
+                account_captured_micros = 0,
+                grant_released_micros = grant_held_micros,
+                account_released_micros = account_held_micros,
+                state = 'released', updated_at_ms = $2
+            WHERE hold_id = $1 AND state = 'held'
+              AND captured_micros = 0 AND released_micros = 0
+            "#,
+        )
+        .bind(locked.hold_id)
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .map_err(reconciliation_unavailable)?,
+        "unstarted job billing hold release",
+    )?;
+    require_one(
+        sqlx::query(
+            r#"
+            UPDATE work_items
+            SET state = 'failed', updated_at_ms = $3
+            WHERE work_item_id = $1 AND job_id = $2 AND state = 'ready'
+              AND execution_id IS NULL AND lease_owner IS NULL
+            "#,
+        )
+        .bind(locked.work_item_id)
+        .bind(job_id)
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .map_err(reconciliation_unavailable)?,
+        "unstarted work terminalization",
+    )?;
+    let outputs = sqlx::query(
+        r#"
+        UPDATE job_outputs
+        SET state = 'failed', started_at_ms = COALESCE(started_at_ms, $2),
+            finished_at_ms = $2, updated_at_ms = $2,
+            error_code = 'client_timeout_before_provider'
+        WHERE job_id = $1 AND state = 'pending'
+        "#,
+    )
+    .bind(job_id)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .map_err(reconciliation_unavailable)?;
+    if outputs.rows_affected() != u64::try_from(locked.output_count).unwrap_or(u64::MAX) {
+        return Err(ImageGatewayError::internal(
+            "unstarted output terminalization changed an unexpected number of rows",
+        ));
+    }
+    require_one(
+        sqlx::query(
+            r#"
+            UPDATE quota_reservations
+            SET released_units = requested_units, state = 'released', updated_at_ms = $2
+            WHERE reservation_id = $1 AND job_id = $3
+              AND state IN ('reserved', 'expired')
+              AND committed_units = 0 AND started_units = 0 AND released_units = 0
+            "#,
+        )
+        .bind(locked.reservation_id)
+        .bind(now)
+        .bind(job_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(reconciliation_unavailable)?,
+        "unstarted quota release",
+    )?;
+    require_one(
+        sqlx::query(
+            r#"
+            UPDATE jobs
+            SET state = 'failed', charged_units = 0, finished_at_ms = $2,
+                updated_at_ms = $2,
+                last_error_code = 'client_timeout_before_provider'
+            WHERE job_id = $1 AND state = 'reserved' AND charged_units = 0
+            "#,
+        )
+        .bind(job_id)
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .map_err(reconciliation_unavailable)?,
+        "unstarted job terminalization",
+    )?;
+    let idempotency = sqlx::query(
+        r#"
+        UPDATE idempotency_requests
+        SET state = 'failed', terminal_outcome = 'failed', updated_at_ms = $2
+        WHERE job_id = $1 AND state = 'accepted' AND terminal_outcome IS NULL
+        "#,
+    )
+    .bind(job_id)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .map_err(reconciliation_unavailable)?;
+    if idempotency.rows_affected() != u64::try_from(idempotency_rows.0).unwrap_or(u64::MAX) {
+        return Err(ImageGatewayError::internal(
+            "unstarted idempotency terminalization changed an unexpected number of rows",
+        ));
+    }
+    for event_type in ["quota_released", "job_failed"] {
+        sqlx::query(
+            r#"
+            INSERT INTO metering_events
+              (event_id, tenant_id, job_id, reservation_id, request_id, operation,
+               event_type, units, outcome, billing_metric, billing_unit, created_at_ms)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8,
+                    'client_timeout_before_provider', $9, $10, $11)
+            "#,
+        )
+        .bind(Uuid::new_v4())
+        .bind(&locked.tenant_id)
+        .bind(job_id)
+        .bind(locked.reservation_id)
+        .bind(&locked.request_id)
+        .bind(&locked.operation)
+        .bind(event_type)
+        .bind(locked.requested_units)
+        .bind(&locked.billing_metric)
+        .bind(&locked.billing_unit)
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .map_err(reconciliation_unavailable)?;
+    }
+    let payload = json!({
+        "reason": "client_timeout_before_provider",
+        "reservation_id": locked.reservation_id.to_string(),
+        "work_item_id": locked.work_item_id.to_string(),
+    });
+    for table in ["job_events", "outbox_events"] {
+        let query = format!(
+            "INSERT INTO {table} (event_id, job_id, event_type, semantic_key, payload_json, created_at_ms) VALUES ($1, $2, 'job.failed', 'job.client_timeout_before_provider', $3, $4) ON CONFLICT (job_id, semantic_key) DO NOTHING"
+        );
+        sqlx::query(AssertSqlSafe(query))
+            .bind(Uuid::new_v4())
+            .bind(job_id)
+            .bind(&payload)
+            .bind(now)
+            .execute(&mut *tx)
+            .await
+            .map_err(reconciliation_unavailable)?;
+    }
+    tx.commit().await.map_err(reconciliation_unavailable)?;
+    Ok(UnstartedJobTerminalization {
+        job_id,
+        released_units: u32::try_from(locked.requested_units).unwrap_or(u32::MAX),
+        released_micros: u64::try_from(locked.held_micros).unwrap_or(u64::MAX),
+    })
 }
 
 #[async_trait]

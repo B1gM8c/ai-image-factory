@@ -3,11 +3,13 @@ use std::env;
 use async_trait::async_trait;
 
 use gpt_image_2_gateway::{
-    GenerationJob, PostgresReconciliationStore, PostgresUsageStore, ReconciliationStore,
+    EditJob, GenerationJob, PostgresReconciliationStore, PostgresUsageStore, ReconciliationStore,
     UsageCharge, UsageLimits, UsageReservation, UsageStore,
     admission::{
-        AdmissionClaim, AdmissionContract, AdmissionStore, AdmissionTicket, AttachJob,
-        ClaimAdmission, GenerationCommandV1, PostgresAdmissionStore, WorkLease,
+        AdmissionClaim, AdmissionContract, AdmissionStore, AdmissionTicket, AttachInputManifest,
+        AttachInputObject, AttachJob, ClaimAdmission, EDIT_COMMAND_SCHEMA,
+        EDIT_INPUT_MANIFEST_SCHEMA, EditCommandV1, EditInputDescriptorV1, EditInputRoleV1,
+        GenerationCommandV1, PostgresAdmissionStore, WorkLease,
     },
     artifacts::InMemoryArtifactBlobStore,
     database::{connect_test_pool_with_search_path, run_migrations},
@@ -22,6 +24,83 @@ use sqlx::{AssertSqlSafe, PgPool};
 use uuid::Uuid;
 
 type TestResult<T = ()> = Result<T, String>;
+
+#[tokio::test]
+async fn terminalize_unstarted_v4_edit_releases_holds_and_refuses_replay() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let job_id = unstarted_v4_edit(&database.pool, "terminalize-success").await?;
+        let reconciler = PostgresReconciliationStore::new(database.pool.clone());
+
+        let outcome = reconciler
+            .terminalize_unstarted_job(job_id)
+            .await
+            .map_err(|error| format!("terminalization failed: {error:?}"))?;
+        require(
+            outcome.job_id == job_id
+                && outcome.released_units == 1
+                && outcome.released_micros == 100,
+            format!("unexpected terminalization outcome: {outcome:?}"),
+        )?;
+
+        let states: (
+            String,
+            String,
+            String,
+            i32,
+            String,
+            i64,
+            i64,
+            String,
+            String,
+        ) = sqlx::query_as(
+            r#"
+                SELECT job.state, work.state, quota.state, quota.released_units,
+                       hold.state, hold.released_micros, account.held_micros,
+                       output.state, idem.state
+                FROM jobs job
+                JOIN work_items work ON work.job_id = job.job_id
+                JOIN quota_reservations quota ON quota.job_id = job.job_id
+                JOIN customer_billing_holds hold ON hold.job_id = job.job_id
+                JOIN billing_accounts account
+                  ON account.tenant_id = job.tenant_id AND account.currency = hold.currency
+                JOIN job_outputs output ON output.job_id = job.job_id
+                JOIN idempotency_requests idem ON idem.job_id = job.job_id
+                WHERE job.job_id = $1
+                "#,
+        )
+        .bind(job_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(|error| format!("terminal state query failed: {error}"))?;
+        require(
+            states
+                == (
+                    "failed".to_string(),
+                    "failed".to_string(),
+                    "released".to_string(),
+                    1,
+                    "released".to_string(),
+                    100,
+                    0,
+                    "failed".to_string(),
+                    "failed".to_string(),
+                ),
+            format!("terminalization did not release every local hold: {states:?}"),
+        )?;
+
+        let replay = reconciler.terminalize_unstarted_job(job_id).await;
+        require(
+            replay.as_ref().err().map(|error| error.status_code())
+                == Some(axum::http::StatusCode::CONFLICT),
+            format!("terminalization replay was not rejected: {replay:?}"),
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
 
 #[tokio::test]
 async fn expired_claimed_work_requeues_but_expired_running_work_becomes_uncertain() -> TestResult {
@@ -864,6 +943,390 @@ async fn assert_orphan_terminal_state(pool: &PgPool, orphan: &OrphanFixture) -> 
         effects == (1, 1, 0, 1, 1),
         format!("orphan effects were not exactly once: {effects:?}"),
     )
+}
+
+async fn unstarted_v4_edit(pool: &PgPool, key: &str) -> TestResult<Uuid> {
+    let now: i64 =
+        sqlx::query_scalar("SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT")
+            .fetch_one(pool)
+            .await
+            .map_err(|error| format!("database clock query failed: {error}"))?;
+    let tenant_id = format!("tenant_{}", Uuid::new_v4().simple());
+    let project_id = format!("project-{key}-{}", Uuid::new_v4().simple());
+    sqlx::query(
+        r#"
+        INSERT INTO identity_organizations (
+            organization_id, display_name, organization_kind,
+            owner_user_id, created_at_ms, updated_at_ms
+        ) VALUES ($1, 'reconciliation test', 'system', NULL, $2, $2)
+        "#,
+    )
+    .bind(&tenant_id)
+    .bind(now)
+    .execute(pool)
+    .await
+    .map_err(|error| format!("test organization insert failed: {error}"))?;
+    sqlx::query(
+        "INSERT INTO gateway_projects (id, tenant_id, name, created_at) VALUES ($1, $2, 'reconciliation test', $3)",
+    )
+    .bind(&project_id)
+    .bind(&tenant_id)
+    .bind(now / 1_000)
+    .execute(pool)
+    .await
+    .map_err(|error| format!("test project insert failed: {error}"))?;
+
+    let admission = PostgresAdmissionStore::new(pool.clone());
+    let claim = admission
+        .claim(ClaimAdmission {
+            owner_token: Uuid::new_v4(),
+            tenant_id: tenant_id.clone(),
+            project_id: project_id.clone(),
+            api_profile: "openai-images-v1".to_string(),
+            operation: "edit".to_string(),
+            request_id: format!("req_{}", Uuid::new_v4().simple()),
+            idempotency_key_digest: Some("7".repeat(64)),
+            request_hash: "8".repeat(64),
+            deadline_at_ms: i64::MAX,
+        })
+        .await
+        .map_err(|error| format!("edit admission failed: {error}"))?;
+    let AdmissionClaim::Owner(mut ticket) = claim else {
+        return Err(format!("unexpected edit claim: {claim:?}"));
+    };
+    let input_id = Uuid::new_v4();
+    let input = AttachInputObject {
+        blob: InputBlobRef {
+            key: InputBlobKey {
+                admission_session_id: ticket.session_id,
+                input_id,
+            },
+            storage_backend: "test-input-v1".to_string(),
+            object_key: format!("tests/{input_id}"),
+            sha256_hex: "9".repeat(64),
+            byte_size: 4,
+        },
+        role: EditInputRoleV1::Image,
+        index: 0,
+        media_type: "image/png".to_string(),
+    };
+    let descriptor = EditInputDescriptorV1 {
+        byte_size: input.blob.byte_size,
+        index: input.index,
+        media_type: input.media_type.clone(),
+        role: input.role,
+        sha256_hex: input.blob.sha256_hex.clone(),
+    };
+    let edit = EditJob {
+        request_id: format!("req_{}", Uuid::new_v4().simple()),
+        model: "gpt-image-2".to_string(),
+        prompt: "terminalization fixture".to_string(),
+        moderation: "auto".to_string(),
+        images: Vec::new(),
+        mask: None,
+        n: 1,
+        size: "auto".to_string(),
+        quality: "high".to_string(),
+        output_format: "png".to_string(),
+        output_compression: None,
+        background: "opaque".to_string(),
+        stream: false,
+        partial_images: 0,
+    };
+    let command =
+        EditCommandV1::from_edit_job(&edit, vec![descriptor], "openai-images-v1", "openai-codex");
+    let command_hash = command.request_hash_hex();
+    let manifest_hash = command.input_manifest_hash_hex();
+    for table in ["admission_sessions", "idempotency_requests"] {
+        let query = format!("UPDATE {table} SET request_hash = $2 WHERE session_id = $1");
+        sqlx::query(AssertSqlSafe(query))
+            .bind(ticket.session_id)
+            .bind(&command_hash)
+            .execute(pool)
+            .await
+            .map_err(|error| format!("{table} hash update failed: {error}"))?;
+    }
+    ticket.request_hash = command_hash;
+    let request_id: String =
+        sqlx::query_scalar("SELECT request_id FROM admission_sessions WHERE session_id = $1")
+            .bind(ticket.session_id)
+            .fetch_one(pool)
+            .await
+            .map_err(|error| format!("session request query failed: {error}"))?;
+    let reservation = PostgresUsageStore::new(pool.clone())
+        .reserve(UsageCharge {
+            tenant_id: tenant_id.clone(),
+            attribution: None,
+            request_id,
+            admission_session_id: Some(ticket.session_id),
+            operation: "edit",
+            provider_id: "openai-codex".to_string(),
+            model: "gpt-image-2".to_string(),
+            output_count: 1,
+            billable_units: 1,
+            billing_metric: image_provider_contracts::BillingMetric::Output,
+            limits: UsageLimits {
+                five_hour_image_limit: 10,
+                seven_day_image_limit: 20,
+            },
+        })
+        .await
+        .map_err(|error| format!("edit usage reserve failed: {error:?}"))?;
+    admission
+        .attach(AttachJob {
+            ticket,
+            job_id: reservation.job_id,
+            command_schema: EDIT_COMMAND_SCHEMA.to_string(),
+            command_json: to_value(command).map_err(|error| error.to_string())?,
+            input_manifest: Some(AttachInputManifest {
+                manifest_schema: EDIT_INPUT_MANIFEST_SCHEMA.to_string(),
+                manifest_hash,
+                inputs: vec![input],
+            }),
+            work_kind: "edit".to_string(),
+            schedule_scope: format!("tenant:{tenant_id}"),
+            schedule_weight: 1,
+            schedule_priority: 1,
+            schedule_cost: 1,
+            contract: AdmissionContract::LegacyV1,
+            customer_pricing: None,
+        })
+        .await
+        .map_err(|error| format!("edit attach failed: {error}"))?;
+
+    seed_unstarted_v4_economics(pool, reservation.job_id, &tenant_id, &project_id, now).await?;
+    Ok(reservation.job_id)
+}
+
+async fn seed_unstarted_v4_economics(
+    pool: &PgPool,
+    job_id: Uuid,
+    tenant_id: &str,
+    project_id: &str,
+    now: i64,
+) -> TestResult {
+    sqlx::query(
+        r#"
+        INSERT INTO job_auth_attributions (
+            job_id, tenant_id, project_id, auth_kind, admitted_at_ms
+        ) VALUES ($1, $2, $3, 'legacy', $4)
+        "#,
+    )
+    .bind(job_id)
+    .bind(tenant_id)
+    .bind(project_id)
+    .bind(now)
+    .execute(pool)
+    .await
+    .map_err(|error| format!("job attribution insert failed: {error}"))?;
+    let admitted_at_ms: i64 =
+        sqlx::query_scalar("SELECT admitted_at_ms FROM job_auth_attributions WHERE job_id = $1")
+            .bind(job_id)
+            .fetch_one(pool)
+            .await
+            .map_err(|error| format!("job attribution query failed: {error}"))?;
+    let price_book_id = Uuid::new_v4();
+    let version_id = Uuid::new_v4();
+    let component_id = Uuid::new_v4();
+    let quote_id = Uuid::new_v4();
+    let output_id = Uuid::new_v4();
+    let mut tx = pool.begin().await.map_err(|error| error.to_string())?;
+    sqlx::query(
+        "UPDATE jobs SET economics_contract_version = 4, updated_at_ms = $2 WHERE job_id = $1",
+    )
+    .bind(job_id)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .map_err(|error| format!("job economics update failed: {error}"))?;
+    sqlx::query(
+        r#"
+        INSERT INTO price_books (
+            price_book_id, price_book_key, display_name, purpose, scope_type,
+            currency, state, created_at_ms, updated_at_ms
+        ) VALUES ($1, $2, 'reconciliation test', 'customer_sale', 'platform',
+                  'USD', 'active', $3, $3)
+        "#,
+    )
+    .bind(price_book_id)
+    .bind(format!("test.reconcile.{}", price_book_id.simple()))
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .map_err(|error| format!("price book insert failed: {error}"))?;
+    sqlx::query(
+        r#"
+        INSERT INTO price_book_versions (
+            price_book_version_id, price_book_id, version, api_profile, operation,
+            provider_id, provider_model_id, public_model_id, media_kind,
+            service_tier, execution_surface, billing_mode, is_free, state,
+            effective_from_ms, source_kind, created_at_ms, updated_at_ms
+        ) VALUES ($1, $2, 1, 'openai-images-v1', 'edit', 'openai-codex',
+                  'gpt-image-2', 'gpt-image-2', 'image', 'standard',
+                  'provider_cli', 'customer_rate', FALSE, 'draft', 0,
+                  'manual', $3, $3)
+        "#,
+    )
+    .bind(version_id)
+    .bind(price_book_id)
+    .bind(admitted_at_ms)
+    .execute(&mut *tx)
+    .await
+    .map_err(|error| format!("price version insert failed: {error}"))?;
+    sqlx::query(
+        r#"
+        INSERT INTO price_components (
+            price_component_id, price_book_version_id, component_key,
+            metric, unit, unit_size, unit_price_micros, outcome,
+            quantity_source, required_confidence, rounding_mode,
+            dimensions_json, created_at_ms
+        ) VALUES ($1, $2, 'image.output.succeeded', 'image_output', 'image',
+                  1, 100, 'succeeded', 'request_derived', 'exact', 'exact',
+                  '{}'::JSONB, $3)
+        "#,
+    )
+    .bind(component_id)
+    .bind(version_id)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .map_err(|error| format!("price component insert failed: {error}"))?;
+    let contract_key = format!("test.reconcile.{}", version_id.simple());
+    let contract_hash = "b".repeat(64);
+    sqlx::query(
+        r#"
+        INSERT INTO pricing_surface_contract_revisions (
+            contract_key, revision, contract_hash, contract_schema_version,
+            api_profile, operation, provider_id, provider_model_id,
+            public_model_id, media_kind, service_tier, execution_surface,
+            normalizer_key, normalizer_revision, contract_json, created_at_ms
+        ) VALUES ($1, 1, $2, 1, 'openai-images-v1', 'edit', 'openai-codex',
+                  'gpt-image-2', 'gpt-image-2', 'image', 'standard',
+                  'provider_cli', 'test.reconcile', 1, '{}'::JSONB, $3)
+        "#,
+    )
+    .bind(&contract_key)
+    .bind(&contract_hash)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .map_err(|error| format!("surface contract insert failed: {error}"))?;
+    sqlx::query(
+        r#"
+        INSERT INTO price_book_version_surface_contract_bindings (
+            price_book_version_id, contract_key, contract_revision,
+            contract_hash, bound_at_ms
+        ) VALUES ($1, $2, 1, $3, $4)
+        "#,
+    )
+    .bind(version_id)
+    .bind(&contract_key)
+    .bind(&contract_hash)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .map_err(|error| format!("surface contract binding failed: {error}"))?;
+    sqlx::query(
+        "UPDATE price_book_versions SET state = 'active', updated_at_ms = $2 WHERE price_book_version_id = $1",
+    )
+    .bind(version_id)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .map_err(|error| format!("price version publication failed: {error}"))?;
+    sqlx::query(
+        r#"
+        INSERT INTO customer_price_quotes (
+            quote_id, job_id, tenant_id, project_id, price_book_id,
+            price_book_version_id, api_profile, operation, provider_id,
+            provider_model_id, public_model_id, media_kind, service_tier,
+            execution_surface, request_dimensions_json, billing_mode, is_free, currency,
+            max_total_micros, quote_hash, created_at_ms
+        ) VALUES ($1, $2, $3, $4, $5, $6, 'openai-images-v1', 'edit',
+                  'openai-codex', 'gpt-image-2', 'gpt-image-2', 'image',
+                  'standard', 'provider_cli', '{}'::JSONB, 'customer_rate', FALSE, 'USD',
+                  100, $7, $8)
+        "#,
+    )
+    .bind(quote_id)
+    .bind(job_id)
+    .bind(tenant_id)
+    .bind(project_id)
+    .bind(price_book_id)
+    .bind(version_id)
+    .bind("a".repeat(64))
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .map_err(|error| format!("customer quote insert failed: {error}"))?;
+    sqlx::query(
+        r#"
+        INSERT INTO customer_price_quote_lines (
+            quote_line_id, quote_id, job_id, price_component_id, component_key,
+            partition_key, terminal_outcome, metric, unit, unit_size,
+            unit_price_micros, quantity_source, required_confidence,
+            rounding_mode, reservation_quantity_source,
+            reservation_confidence, dimensions_json, max_quantity,
+            max_amount_micros, created_at_ms
+        ) VALUES ($1, $2, $3, $4, 'image.output.succeeded', 'output:0',
+                  'succeeded', 'image_output', 'image', 1, 100,
+                  'request_derived', 'exact', 'exact',
+                  'request_derived', 'exact', '{}'::JSONB, 1, 100, $5)
+        "#,
+    )
+    .bind(Uuid::new_v4())
+    .bind(quote_id)
+    .bind(job_id)
+    .bind(component_id)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .map_err(|error| format!("customer quote line insert failed: {error}"))?;
+    sqlx::query(
+        r#"
+        INSERT INTO billing_accounts (
+            tenant_id, currency, credit_limit_micros, held_micros,
+            captured_micros, created_at_ms, updated_at_ms
+        ) VALUES ($1, 'USD', 1000, 100, 0, $2, $2)
+        "#,
+    )
+    .bind(tenant_id)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .map_err(|error| format!("billing account insert failed: {error}"))?;
+    sqlx::query(
+        r#"
+        INSERT INTO customer_billing_holds (
+            hold_id, quote_id, job_id, tenant_id, currency, held_micros,
+            account_held_micros, state, created_at_ms, updated_at_ms
+        ) VALUES ($1, $2, $3, $4, 'USD', 100, 100, 'held', $5, $5)
+        "#,
+    )
+    .bind(Uuid::new_v4())
+    .bind(quote_id)
+    .bind(job_id)
+    .bind(tenant_id)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .map_err(|error| format!("customer hold insert failed: {error}"))?;
+    sqlx::query(
+        r#"
+        INSERT INTO job_outputs (
+            output_id, job_id, output_index, state, created_at_ms, updated_at_ms
+        ) VALUES ($1, $2, 0, 'pending', $3, $3)
+        "#,
+    )
+    .bind(output_id)
+    .bind(job_id)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .map_err(|error| format!("job output insert failed: {error}"))?;
+    tx.commit()
+        .await
+        .map_err(|error| format!("v4 fixture commit failed: {error}"))
 }
 
 async fn ready_lease(

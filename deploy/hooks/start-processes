@@ -28,6 +28,7 @@ REQUIRED_PROFILE_UNITS=()
 readonly LEGACY_EXECUTION_UNITS=(
   ai-image-factory-executord@default.service
   ai-image-factory-workerd.service
+  ai-image-factory-workerd-codex-edits.service
 )
 readonly REQUIRED_PREFIX_UNITS=(
   ai-image-factory-reconcilerd.service

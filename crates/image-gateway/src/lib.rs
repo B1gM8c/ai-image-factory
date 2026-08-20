@@ -181,7 +181,7 @@ pub use providers::dreamina_cli::{
 };
 pub use reconciliation::{
     InputCleanupOutcome, PostgresReconciliationStore, ReconciliationOutcome, ReconciliationStore,
-    reconcile_input_cleanup,
+    UnstartedJobTerminalization, reconcile_input_cleanup,
 };
 pub use reduction::{
     CanonicalExecutorOutcome, CustomerArtifactPublishError, CustomerArtifactPublisher,

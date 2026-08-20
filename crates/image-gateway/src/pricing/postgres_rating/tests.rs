@@ -921,6 +921,65 @@ async fn credit_grant_funding_case(pool: &PgPool) -> TestResult {
     require(
         account == (0, 10_000, 10_000),
         format!("hard-credit refund counters are invalid: {account:?}"),
+    )?;
+
+    grant_service
+        .create(
+            "partial-settlement-grant",
+            actor,
+            CreateCreditGrantRequest {
+                organization_id: "org-rating".to_string(),
+                currency: "USD".to_string(),
+                amount_micros: "40000".to_string(),
+                expires_at_ms: now + 172_800_000,
+                source_reference: "partial-settlement".to_string(),
+                reason: "Partial reservation settlement regression".to_string(),
+            },
+        )
+        .await
+        .map_err(|error| format!("{error:?}"))?;
+    let partial = seed_customer_job_with_credit_grants(
+        pool,
+        &pricing,
+        &execution,
+        1,
+        "rating-partial-credit-grant",
+    )
+    .await?;
+    let partial_settlement = settle(pool, partial.job_id).await?;
+    require(
+        partial_settlement.total_amount_micros == 20_000,
+        "partially consumed grant should charge 20000 micros",
+    )?;
+    let partial_funding: (i64, i64, i64, i64, String) = sqlx::query_as(
+        r#"
+        SELECT grant_held_micros, grant_captured_micros,
+               grant_released_micros, account_captured_micros, state
+        FROM customer_billing_holds
+        WHERE job_id = $1
+        "#,
+    )
+    .bind(partial.job_id)
+    .fetch_one(pool)
+    .await
+    .map_err(debug_error)?;
+    require(
+        partial_funding == (40_000, 20_000, 20_000, 0, "settled".to_string()),
+        format!("partial grant settlement did not release unused credit: {partial_funding:?}"),
+    )?;
+    let partial_grant: (i64, i64, i64) = sqlx::query_as(
+        r#"
+        SELECT available_micros, reserved_micros, consumed_micros
+        FROM credit_grants
+        WHERE source_reference = 'partial-settlement'
+        "#,
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(debug_error)?;
+    require(
+        partial_grant == (25_000, 0, 15_000),
+        format!("partially consumed grant counters are invalid: {partial_grant:?}"),
     )
 }
 

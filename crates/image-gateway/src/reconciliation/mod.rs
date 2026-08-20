@@ -21,6 +21,13 @@ pub struct InputCleanupOutcome {
     pub failed: u32,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UnstartedJobTerminalization {
+    pub job_id: Uuid,
+    pub released_units: u32,
+    pub released_micros: u64,
+}
+
 #[async_trait]
 pub trait ReconciliationStore: Send + Sync + 'static {
     async fn reconcile_expired_work(

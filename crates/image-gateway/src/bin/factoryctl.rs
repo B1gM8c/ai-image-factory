@@ -4,7 +4,7 @@ use uuid::Uuid;
 
 use gpt_image_2_gateway::{
     CodexExecutionProfileProvisioning, CodexProfileProvisioningError, ImageGatewayError,
-    codex_auth_file_sha256,
+    PostgresReconciliationStore, codex_auth_file_sha256,
     database::{
         DEFAULT_MAX_CONNECTIONS, connect_pool_with_schema, database_schema_from_env,
         database_url_from_env, run_migrations, verify_migrations,
@@ -40,6 +40,9 @@ enum Command {
     ReconcileInlineCustomerSettlement {
         job_id: Uuid,
     },
+    TerminalizeUnstartedJob {
+        job_id: Uuid,
+    },
     BootstrapAdmin {
         email: String,
         display_name: String,
@@ -53,7 +56,7 @@ where
 {
     let mut args = args.into_iter();
     let command = args.next().ok_or_else(|| {
-        "missing command: expected `migrate`, `bootstrap-admin`, `provision-codex-profile`, `provision-grok-profile`, `provision-grok-video-profile`, `provision-grok-image-profile-replacement`, `provision-grok-edit-profile-replacement`, `provision-grok-video-profile-replacement`, `reconcile-execution-profile-routes`, `reconcile-dreamina-profiles`, or `reconcile-inline-customer-settlement`"
+        "missing command: expected `migrate`, `bootstrap-admin`, `provision-codex-profile`, `provision-grok-profile`, `provision-grok-video-profile`, `provision-grok-image-profile-replacement`, `provision-grok-edit-profile-replacement`, `provision-grok-video-profile-replacement`, `reconcile-execution-profile-routes`, `reconcile-dreamina-profiles`, `reconcile-inline-customer-settlement`, or `terminalize-unstarted-job`"
             .to_string()
     })?;
     let command = match command.as_ref() {
@@ -122,9 +125,15 @@ where
                     })?;
             Command::ReconcileInlineCustomerSettlement { job_id }
         }
+        "terminalize-unstarted-job" => {
+            let job_id = required_argument(&mut args, "terminalize-unstarted-job", "job id")?
+                .parse()
+                .map_err(|_| "terminalize-unstarted-job requires a UUID job id".to_string())?;
+            Command::TerminalizeUnstartedJob { job_id }
+        }
         value => {
             return Err(format!(
-                "unknown command `{value}`: expected `migrate`, `bootstrap-admin`, `provision-codex-profile`, `provision-grok-profile`, `provision-grok-video-profile`, `provision-grok-image-profile-replacement`, `provision-grok-edit-profile-replacement`, `provision-grok-video-profile-replacement`, `reconcile-execution-profile-routes`, `reconcile-dreamina-profiles`, or `reconcile-inline-customer-settlement`"
+                "unknown command `{value}`: expected `migrate`, `bootstrap-admin`, `provision-codex-profile`, `provision-grok-profile`, `provision-grok-video-profile`, `provision-grok-image-profile-replacement`, `provision-grok-edit-profile-replacement`, `provision-grok-video-profile-replacement`, `reconcile-execution-profile-routes`, `reconcile-dreamina-profiles`, `reconcile-inline-customer-settlement`, or `terminalize-unstarted-job`"
             ));
         }
     };
@@ -179,7 +188,8 @@ async fn main() -> Result<(), ImageGatewayError> {
         | Command::ProvisionGrokVideoProfileReplacement { .. }
         | Command::ReconcileExecutionProfileRoutes
         | Command::ReconcileDreaminaProfiles
-        | Command::ReconcileInlineCustomerSettlement { .. } => None,
+        | Command::ReconcileInlineCustomerSettlement { .. }
+        | Command::TerminalizeUnstartedJob { .. } => None,
     };
     let database_url = database_url_from_env()?;
     let database_schema = database_schema_from_env()?;
@@ -303,6 +313,16 @@ async fn main() -> Result<(), ImageGatewayError> {
             verify_migrations(&pool).await?;
             reconcile_inline_customer_settlement(&pool, job_id).await?;
             println!("inline customer settlement reconciled: {job_id}");
+        }
+        Command::TerminalizeUnstartedJob { job_id } => {
+            verify_migrations(&pool).await?;
+            let outcome = PostgresReconciliationStore::new(pool.clone())
+                .terminalize_unstarted_job(job_id)
+                .await?;
+            println!(
+                "unstarted job terminalized: job_id={}, released_units={}, released_micros={}",
+                outcome.job_id, outcome.released_units, outcome.released_micros
+            );
         }
         Command::BootstrapAdmin {
             email,
@@ -565,10 +585,23 @@ mod tests {
     }
 
     #[test]
+    fn accepts_unstarted_job_terminalization() {
+        let job_id = uuid::Uuid::new_v4();
+        assert_eq!(
+            parse_command(["terminalize-unstarted-job", &job_id.to_string()]),
+            Ok(Command::TerminalizeUnstartedJob { job_id })
+        );
+        assert_eq!(
+            parse_command(["terminalize-unstarted-job", "not-a-uuid"]),
+            Err("terminalize-unstarted-job requires a UUID job id".to_string())
+        );
+    }
+
+    #[test]
     fn rejects_missing_command() {
         assert_eq!(
             parse_command([] as [&str; 0]),
-            Err("missing command: expected `migrate`, `bootstrap-admin`, `provision-codex-profile`, `provision-grok-profile`, `provision-grok-video-profile`, `provision-grok-image-profile-replacement`, `provision-grok-edit-profile-replacement`, `provision-grok-video-profile-replacement`, `reconcile-execution-profile-routes`, `reconcile-dreamina-profiles`, or `reconcile-inline-customer-settlement`".to_string())
+            Err("missing command: expected `migrate`, `bootstrap-admin`, `provision-codex-profile`, `provision-grok-profile`, `provision-grok-video-profile`, `provision-grok-image-profile-replacement`, `provision-grok-edit-profile-replacement`, `provision-grok-video-profile-replacement`, `reconcile-execution-profile-routes`, `reconcile-dreamina-profiles`, `reconcile-inline-customer-settlement`, or `terminalize-unstarted-job`".to_string())
         );
     }
 
@@ -577,7 +610,7 @@ mod tests {
         assert_eq!(
             parse_command(["status"]),
             Err(
-                "unknown command `status`: expected `migrate`, `bootstrap-admin`, `provision-codex-profile`, `provision-grok-profile`, `provision-grok-video-profile`, `provision-grok-image-profile-replacement`, `provision-grok-edit-profile-replacement`, `provision-grok-video-profile-replacement`, `reconcile-execution-profile-routes`, `reconcile-dreamina-profiles`, or `reconcile-inline-customer-settlement`"
+                "unknown command `status`: expected `migrate`, `bootstrap-admin`, `provision-codex-profile`, `provision-grok-profile`, `provision-grok-video-profile`, `provision-grok-image-profile-replacement`, `provision-grok-edit-profile-replacement`, `provision-grok-video-profile-replacement`, `reconcile-execution-profile-routes`, `reconcile-dreamina-profiles`, `reconcile-inline-customer-settlement`, or `terminalize-unstarted-job`"
                     .to_string()
             )
         );

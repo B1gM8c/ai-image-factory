@@ -876,39 +876,73 @@ pub(crate) async fn settle_credit_grant_reservations(
             .reserved_micros
             .checked_sub(consumed)
             .ok_or_else(|| ImageGatewayError::internal("credit grant settlement underflow"))?;
-        let event_count = i64::from(consumed > 0) + i64::from(released > 0);
-        let next_version = reservation
-            .grant_control_version
-            .checked_add(event_count)
-            .ok_or_else(|| ImageGatewayError::internal("credit grant version overflow"))?;
-        let changed = sqlx::query(
-            r#"
-            UPDATE credit_grants
-            SET reserved_micros = reserved_micros - $2,
-                consumed_micros = consumed_micros + $3,
-                control_version = $4,
-                updated_at_ms = $5
-            WHERE grant_id = $1
-              AND control_version = $6
-              AND reserved_micros >= $2
-            "#,
-        )
-        .bind(reservation.grant_id)
-        .bind(reservation.reserved_micros)
-        .bind(consumed)
-        .bind(next_version)
-        .bind(now)
-        .bind(reservation.grant_control_version)
-        .execute(&mut **transaction)
-        .await
-        .map_err(mutation_error)?
-        .rows_affected();
-        if changed != 1 {
-            return Err(ImageGatewayError::conflict(
-                "Credit grant changed while settling",
-                None,
-                "credit_grant_settlement_conflict",
-            ));
+        let mut sequence = reservation.grant_control_version;
+        if consumed > 0 {
+            let next_sequence = sequence
+                .checked_add(1)
+                .ok_or_else(|| ImageGatewayError::internal("credit grant version overflow"))?;
+            let changed = sqlx::query(
+                r#"
+                UPDATE credit_grants
+                SET reserved_micros = reserved_micros - $2,
+                    consumed_micros = consumed_micros + $2,
+                    control_version = $3,
+                    updated_at_ms = $4
+                WHERE grant_id = $1
+                  AND control_version = $5
+                  AND reserved_micros >= $2
+                "#,
+            )
+            .bind(reservation.grant_id)
+            .bind(consumed)
+            .bind(next_sequence)
+            .bind(now)
+            .bind(sequence)
+            .execute(&mut **transaction)
+            .await
+            .map_err(mutation_error)?
+            .rows_affected();
+            if changed != 1 {
+                return Err(ImageGatewayError::conflict(
+                    "Credit grant changed while settling",
+                    None,
+                    "credit_grant_settlement_conflict",
+                ));
+            }
+            sequence = next_sequence;
+        }
+        if released > 0 {
+            let next_sequence = sequence
+                .checked_add(1)
+                .ok_or_else(|| ImageGatewayError::internal("credit grant version overflow"))?;
+            let changed = sqlx::query(
+                r#"
+                UPDATE credit_grants
+                SET reserved_micros = reserved_micros - $2,
+                    control_version = $3,
+                    updated_at_ms = $4
+                WHERE grant_id = $1
+                  AND control_version = $5
+                  AND reserved_micros >= $2
+                "#,
+            )
+            .bind(reservation.grant_id)
+            .bind(released)
+            .bind(next_sequence)
+            .bind(now)
+            .bind(sequence)
+            .execute(&mut **transaction)
+            .await
+            .map_err(mutation_error)?
+            .rows_affected();
+            if changed != 1 {
+                return Err(ImageGatewayError::conflict(
+                    "Credit grant changed while settling",
+                    None,
+                    "credit_grant_settlement_conflict",
+                ));
+            }
+            sequence = next_sequence;
         }
         let reservation_state = if consumed > 0 { "consumed" } else { "released" };
         let changed = sqlx::query(
@@ -939,7 +973,8 @@ pub(crate) async fn settle_credit_grant_reservations(
             ));
         }
 
-        let mut sequence = reservation.grant_control_version;
+        let final_sequence = sequence;
+        sequence = reservation.grant_control_version;
         if consumed > 0 {
             sequence = sequence
                 .checked_add(1)
@@ -1017,7 +1052,7 @@ pub(crate) async fn settle_credit_grant_reservations(
             )
             .await?;
         }
-        if sequence != next_version {
+        if sequence != final_sequence {
             return Err(ImageGatewayError::internal(
                 "credit grant event sequence is invalid",
             ));
