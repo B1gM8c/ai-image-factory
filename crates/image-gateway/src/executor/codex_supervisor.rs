@@ -683,24 +683,37 @@ fn normalize_captured_image(
     output_format: &str,
     output_compression: Option<u8>,
 ) -> Result<Vec<u8>, ()> {
-    let actual_format = image::ImageReader::new(Cursor::new(&bytes))
+    let reader = image::ImageReader::new(Cursor::new(&bytes))
         .with_guessed_format()
-        .ok()
-        .and_then(|reader| reader.format())
-        .ok_or(())?;
+        .map_err(|_| ())?;
+    let actual_format = reader.format().ok_or(())?;
+    let actual_dimensions = reader.into_dimensions().map_err(|_| ())?;
     let requested_format = match output_format {
         "png" => image::ImageFormat::Png,
         "jpeg" => image::ImageFormat::Jpeg,
         "webp" => image::ImageFormat::WebP,
         _ => return Err(()),
     };
-    if actual_format == requested_format {
+    let symbolic_ratio_needs_normalization =
+        match crate::size::parse_size_constraint(requested_size) {
+            Some(crate::size::SizeConstraint::AspectRatio { width, height }) => {
+                !crate::size::aspect_ratio_matches(
+                    actual_dimensions.0,
+                    actual_dimensions.1,
+                    width,
+                    height,
+                )
+            }
+            Some(_) => false,
+            None => return Err(()),
+        };
+    if actual_format == requested_format && !symbolic_ratio_needs_normalization {
         return Ok(bytes);
     }
 
     // Codex's native image tool can emit PNG even when the Images API caller
-    // requested JPEG or WebP. Keep the CLI sandbox strict and perform the
-    // required format conversion in the trusted gateway normalization layer.
+    // requested JPEG or WebP, and native dimensions can drift slightly from a
+    // requested symbolic ratio. Normalize both in the trusted gateway layer.
     let mut images = crate::core::normalize_generated_images(
         vec![crate::core::GeneratedImage { bytes }],
         requested_size,
@@ -2112,6 +2125,15 @@ mod tests {
             spool.observe().unwrap(),
             ProcessObservation::Succeeded(SupervisedOutput::without_provider_cost(expected))
         );
+    }
+
+    #[test]
+    fn native_png_with_small_symbolic_ratio_drift_is_center_cropped() {
+        let normalized =
+            normalize_captured_image(png_bytes(1659, 948), "16:9", "png", None).unwrap();
+        let decoded = image::load_from_memory(&normalized).unwrap();
+
+        assert_eq!((decoded.width(), decoded.height()), (1659, 933));
     }
 
     #[tokio::test]

@@ -12,6 +12,7 @@ use crate::{
 
 const MAX_DECODED_IMAGE_PIXELS: u64 = 16 * 1024 * 1024;
 const MAX_DECODED_IMAGE_DIMENSION: u32 = 8 * 1024;
+const MAX_ASPECT_RATIO_CENTER_CROP_FRACTION: f64 = 0.02;
 
 pub fn normalize_generated_images(
     images: Vec<GeneratedImage>,
@@ -35,8 +36,8 @@ fn normalize_generated_image(
     output_compression: Option<u8>,
 ) -> Result<GeneratedImage, ImageGatewayError> {
     let decoded = decode_generated_image(&image.bytes)?;
-    match requested_size {
-        SizeConstraint::Auto => {}
+    let decoded = match requested_size {
+        SizeConstraint::Auto => decoded,
         SizeConstraint::Dimensions { width, height } => {
             if !aspect_ratio_matches(decoded.width(), decoded.height(), width, height) {
                 return Err(ImageGatewayError::backend(format!(
@@ -48,26 +49,50 @@ fn normalize_generated_image(
                     aspect_ratio_tolerance_percent()
                 )));
             }
+            decoded
         }
         SizeConstraint::AspectRatio { width, height } => {
-            if !aspect_ratio_matches(decoded.width(), decoded.height(), width, height) {
-                return Err(ImageGatewayError::backend(format!(
-                    "Codex CLI produced an image with dimensions {}x{}, not the requested {}:{} aspect ratio within {:.2}% tolerance",
-                    decoded.width(),
-                    decoded.height(),
-                    width,
-                    height,
-                    aspect_ratio_tolerance_percent()
-                )));
-            }
+            center_crop_to_aspect_ratio(decoded, width, height)?
         }
-    }
+    };
     encode_image(
         flatten_to_opaque(decoded),
         output_format,
         output_compression,
     )
     .map(|bytes| GeneratedImage { bytes })
+}
+
+fn center_crop_to_aspect_ratio(
+    image: DynamicImage,
+    target_width: u32,
+    target_height: u32,
+) -> Result<DynamicImage, ImageGatewayError> {
+    let width = image.width();
+    let height = image.height();
+    let actual_ratio = f64::from(width) / f64::from(height);
+    let target_ratio = f64::from(target_width) / f64::from(target_height);
+
+    let (crop_width, crop_height) = if actual_ratio > target_ratio {
+        ((f64::from(height) * target_ratio).round() as u32, height)
+    } else {
+        (width, (f64::from(width) / target_ratio).round() as u32)
+    };
+    let cropped_fraction = if crop_width < width {
+        f64::from(width - crop_width) / f64::from(width)
+    } else {
+        f64::from(height - crop_height) / f64::from(height)
+    };
+    if cropped_fraction > MAX_ASPECT_RATIO_CENTER_CROP_FRACTION {
+        return Err(ImageGatewayError::backend(format!(
+            "Codex CLI produced an image with dimensions {}x{}, too far from the requested {}:{} aspect ratio for a safe center crop",
+            width, height, target_width, target_height
+        )));
+    }
+
+    let x = (width - crop_width) / 2;
+    let y = (height - crop_height) / 2;
+    Ok(image.crop_imm(x, y, crop_width, crop_height))
 }
 
 fn requested_size_constraint(size: &str) -> Result<SizeConstraint, ImageGatewayError> {
@@ -208,6 +233,24 @@ mod tests {
         };
 
         assert!(normalize_generated_images(vec![image], "16:9", "png", None).is_ok());
+    }
+
+    #[test]
+    fn center_crops_small_codex_aspect_ratio_drift() {
+        let image = GeneratedImage {
+            bytes: valid_png_with_dimensions(1659, 948),
+        };
+
+        let normalized = normalize_generated_images(vec![image], "16:9", "png", None).unwrap();
+        let decoded = image::load_from_memory(&normalized[0].bytes).unwrap();
+
+        assert_eq!((decoded.width(), decoded.height()), (1659, 933));
+        assert!(aspect_ratio_matches(
+            decoded.width(),
+            decoded.height(),
+            16,
+            9
+        ));
     }
 
     #[test]
