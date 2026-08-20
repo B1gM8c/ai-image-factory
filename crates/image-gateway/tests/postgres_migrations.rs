@@ -14,7 +14,7 @@ use uuid::Uuid;
 
 type TestResult<T = ()> = Result<T, String>;
 
-const REQUIRED_COLUMNS: [(&str, &str); 957] = [
+const REQUIRED_COLUMNS: [(&str, &str); 967] = [
     ("usage_events", "tenant_id"),
     ("usage_events", "job_id"),
     ("quota_reservations", "tenant_id"),
@@ -1152,6 +1152,28 @@ const REQUIRED_COLUMNS: [(&str, &str); 957] = [
     ("platform_update_events", "outcome"),
     ("platform_update_events", "details"),
     ("platform_update_events", "created_at_ms"),
+    ("operator_terminal_reduction_requeues", "submission_id"),
+    (
+        "operator_terminal_reduction_requeues",
+        "executor_execution_id",
+    ),
+    ("operator_terminal_reduction_requeues", "prior_lease_epoch"),
+    (
+        "operator_terminal_reduction_requeues",
+        "prior_claimed_at_ms",
+    ),
+    (
+        "operator_terminal_reduction_requeues",
+        "prior_blocked_error_code",
+    ),
+    ("operator_terminal_reduction_requeues", "prior_blocked_by"),
+    (
+        "operator_terminal_reduction_requeues",
+        "prior_blocked_at_ms",
+    ),
+    ("operator_terminal_reduction_requeues", "repair_revision"),
+    ("operator_terminal_reduction_requeues", "requeued_by"),
+    ("operator_terminal_reduction_requeues", "requeued_at_ms"),
 ];
 
 const REQUIRED_INDEXES: [&str; 152] = [
@@ -3368,8 +3390,8 @@ async fn shared_pool_case(pool: &PgPool) -> TestResult {
 
 async fn assert_expected_schema(pool: &PgPool) -> TestResult {
     require(
-        migration_versions(pool).await? == (0_i64..=124_i64).collect::<Vec<_>>(),
-        "applied migration versions must be exactly 0 through 124",
+        migration_versions(pool).await? == (0_i64..=125_i64).collect::<Vec<_>>(),
+        "applied migration versions must be exactly 0 through 125",
     )?;
 
     let default_codex_prices: Vec<(String, i64, i64)> = sqlx::query_as(

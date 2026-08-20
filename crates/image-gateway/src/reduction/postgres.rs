@@ -3,9 +3,9 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use super::{
-    CanonicalExecutorOutcome, ExecutorTerminalArtifact, ExecutorTerminalBlockReason,
-    ExecutorTerminalCompletion, ExecutorTerminalError, ExecutorTerminalLease,
-    ExecutorTerminalStore,
+    BlockedTerminalRequeue, BlockedTerminalRequeueError, CanonicalExecutorOutcome,
+    ExecutorTerminalArtifact, ExecutorTerminalBlockReason, ExecutorTerminalCompletion,
+    ExecutorTerminalError, ExecutorTerminalLease, ExecutorTerminalStore,
 };
 use crate::artifacts::ArtifactMetadata;
 
@@ -21,6 +21,204 @@ pub struct PostgresExecutorTerminalStore {
 impl PostgresExecutorTerminalStore {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
+    }
+
+    pub async fn requeue_blocked_canonical_conflict(
+        &self,
+        submission_id: Uuid,
+        repair_revision: &str,
+        requeued_by: &str,
+    ) -> Result<BlockedTerminalRequeue, BlockedTerminalRequeueError> {
+        validate_requeue_input(submission_id, repair_revision, requeued_by)?;
+        let mut tx = self.pool.begin().await.map_err(requeue_unavailable)?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(format!("terminal-requeue:{submission_id}"))
+            .execute(&mut *tx)
+            .await
+            .map_err(requeue_unavailable)?;
+        let existing: Option<(Uuid, String)> = sqlx::query_as(
+            r#"
+            SELECT executor_execution_id, repair_revision
+            FROM operator_terminal_reduction_requeues
+            WHERE submission_id = $1
+            "#,
+        )
+        .bind(submission_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(requeue_unavailable)?;
+        if let Some((executor_execution_id, stored_revision)) = existing {
+            if stored_revision != repair_revision {
+                return Err(BlockedTerminalRequeueError::Conflict);
+            }
+            let state: Option<String> = sqlx::query_scalar(
+                "SELECT state FROM executor_terminal_reductions WHERE submission_id = $1",
+            )
+            .bind(submission_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(requeue_unavailable)?;
+            if state.as_deref() == Some("blocked") || state.is_none() {
+                return Err(BlockedTerminalRequeueError::Conflict);
+            }
+            tx.commit().await.map_err(requeue_unavailable)?;
+            return Ok(BlockedTerminalRequeue {
+                submission_id,
+                executor_execution_id,
+                repair_revision: stored_revision,
+                already_requeued: true,
+            });
+        }
+
+        let inserted: Option<Uuid> = sqlx::query_scalar(
+            r#"
+            INSERT INTO operator_terminal_reduction_requeues (
+                submission_id, executor_execution_id, prior_lease_epoch,
+                prior_claimed_at_ms, prior_blocked_error_code, prior_blocked_by,
+                prior_blocked_at_ms, repair_revision, requeued_by, requeued_at_ms
+            )
+            SELECT reduction.submission_id, reduction.executor_execution_id,
+                   reduction.lease_epoch, reduction.claimed_at_ms,
+                   reduction.blocked_error_code, reduction.blocked_by,
+                   reduction.blocked_at_ms, $2, $3,
+                   floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT
+            FROM executor_terminal_reductions reduction
+            JOIN provider_submissions submission
+              ON submission.submission_id = reduction.submission_id
+             AND submission.executor_execution_id = reduction.executor_execution_id
+             AND submission.resolution_decision_id = reduction.resolution_decision_id
+             AND submission.state = reduction.resolved_state
+            JOIN executor_executions execution
+              ON execution.executor_execution_id = submission.executor_execution_id
+             AND execution.submission_id = submission.submission_id
+             AND execution.resolution_decision_id = reduction.resolution_decision_id
+             AND execution.state = reduction.resolved_state
+            JOIN executor_resolution_decisions decision
+              ON decision.decision_id = reduction.resolution_decision_id
+             AND decision.executor_execution_id = reduction.executor_execution_id
+             AND decision.submission_id = reduction.submission_id
+             AND decision.resolved_state = reduction.resolved_state
+            JOIN jobs job
+              ON job.job_id = submission.job_id
+             AND job.state IN ('reserved', 'running')
+             AND job.economics_contract_version = 4
+            JOIN job_outputs output
+              ON output.output_id = submission.output_id
+             AND output.job_id = submission.job_id
+             AND output.state = 'pending'
+            JOIN work_items work
+              ON work.work_item_id = submission.work_item_id
+             AND work.job_id = submission.job_id
+             AND work.execution_id = submission.created_by_execution_id
+             AND work.lease_epoch = submission.created_by_lease_epoch
+             AND work.state = 'awaiting_executor'
+            JOIN job_attempts attempt
+              ON attempt.execution_id = submission.created_by_execution_id
+             AND attempt.work_item_id = submission.work_item_id
+             AND attempt.lease_epoch = submission.created_by_lease_epoch
+             AND attempt.state = 'handed_off'
+            LEFT JOIN executor_result_manifests manifest
+              ON manifest.manifest_id = decision.result_manifest_id
+             AND manifest.executor_execution_id = reduction.executor_execution_id
+             AND manifest.submission_id = reduction.submission_id
+            LEFT JOIN executor_artifact_authorities authority
+              ON authority.authority_id = manifest.artifact_authority_id
+             AND authority.executor_execution_id = manifest.executor_execution_id
+             AND authority.submission_id = manifest.submission_id
+            WHERE reduction.submission_id = $1
+              AND reduction.state = 'blocked'
+              AND reduction.blocked_error_code = 'canonical_conflict'
+              AND reduction.resolved_state IN ('succeeded', 'failed')
+              AND submission.provider_id = 'openai-codex'
+              AND submission.adapter_revision = 'openai-codex-generation-v1'
+              AND reduction.completion_owner IS NULL
+              AND reduction.provider_receipt_id IS NULL
+              AND reduction.customer_artifact_id IS NULL
+              AND reduction.quota_reservation_id IS NULL
+              AND (
+                (
+                  reduction.resolved_state = 'succeeded'
+                  AND decision.error_code IS NULL
+                  AND submission.result_manifest_id = manifest.manifest_id
+                  AND manifest.manifest_id IS NOT NULL
+                  AND authority.authority_id IS NOT NULL
+                )
+                OR
+                (
+                  reduction.resolved_state = 'failed'
+                  AND decision.error_code IS NOT NULL
+                  AND submission.result_manifest_id IS NULL
+                  AND manifest.manifest_id IS NULL
+                  AND authority.authority_id IS NULL
+                )
+              )
+              AND NOT EXISTS (
+                SELECT 1 FROM provider_receipts receipt
+                WHERE receipt.submission_id = reduction.submission_id
+              )
+              AND NOT EXISTS (
+                SELECT 1 FROM artifacts artifact
+                WHERE artifact.job_id = submission.job_id
+                  AND artifact.output_index = output.output_index
+              )
+              AND NOT EXISTS (
+                SELECT 1 FROM provider_usage_facts fact
+                WHERE fact.submission_id = reduction.submission_id
+              )
+              AND NOT EXISTS (
+                SELECT 1 FROM provider_remote_tasks remote
+                WHERE remote.submission_id = reduction.submission_id
+              )
+            RETURNING executor_execution_id
+            "#,
+        )
+        .bind(submission_id)
+        .bind(repair_revision)
+        .bind(requeued_by)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(requeue_unavailable)?;
+        let Some(executor_execution_id) = inserted else {
+            return Err(BlockedTerminalRequeueError::Conflict);
+        };
+        let changed = sqlx::query(
+            r#"
+            UPDATE executor_terminal_reductions reduction
+            SET state = 'ready',
+                lease_owner = NULL,
+                lease_expires_at_ms = NULL,
+                claimed_at_ms = NULL,
+                blocked_error_code = NULL,
+                blocked_by = NULL,
+                blocked_at_ms = NULL,
+                updated_at_ms = requeue.requeued_at_ms
+            FROM operator_terminal_reduction_requeues requeue
+            WHERE reduction.submission_id = requeue.submission_id
+              AND reduction.executor_execution_id = requeue.executor_execution_id
+              AND reduction.submission_id = $1
+              AND reduction.state = 'blocked'
+              AND reduction.lease_epoch = requeue.prior_lease_epoch
+              AND reduction.claimed_at_ms = requeue.prior_claimed_at_ms
+              AND reduction.blocked_error_code = requeue.prior_blocked_error_code
+              AND reduction.blocked_by = requeue.prior_blocked_by
+              AND reduction.blocked_at_ms = requeue.prior_blocked_at_ms
+            "#,
+        )
+        .bind(submission_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(requeue_unavailable)?
+        .rows_affected();
+        if changed != 1 {
+            return Err(BlockedTerminalRequeueError::Conflict);
+        }
+        tx.commit().await.map_err(requeue_unavailable)?;
+        Ok(BlockedTerminalRequeue {
+            submission_id,
+            executor_execution_id,
+            repair_revision: repair_revision.to_string(),
+            already_requeued: false,
+        })
     }
 }
 
@@ -328,6 +526,32 @@ fn validate_claim(owner: &str, lease_ms: i64) -> Result<(), ExecutorTerminalErro
     }
 }
 
+fn validate_requeue_input(
+    submission_id: Uuid,
+    repair_revision: &str,
+    requeued_by: &str,
+) -> Result<(), BlockedTerminalRequeueError> {
+    let mut revision = repair_revision.bytes();
+    let valid_first = revision
+        .next()
+        .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit());
+    let valid_rest = revision.all(|byte| {
+        byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'_' | b'-')
+    });
+    if submission_id.is_nil()
+        || repair_revision.len() > 128
+        || !valid_first
+        || !valid_rest
+        || requeued_by.is_empty()
+        || requeued_by.len() > 255
+        || requeued_by.bytes().any(|byte| byte.is_ascii_control())
+    {
+        Err(BlockedTerminalRequeueError::InvalidInput)
+    } else {
+        Ok(())
+    }
+}
+
 fn validate_lease(
     lease: &ExecutorTerminalLease,
     lease_ms: i64,
@@ -352,4 +576,8 @@ fn validate_lease(
 
 fn unavailable(_: sqlx::Error) -> ExecutorTerminalError {
     ExecutorTerminalError::Unavailable
+}
+
+fn requeue_unavailable(_: sqlx::Error) -> BlockedTerminalRequeueError {
+    BlockedTerminalRequeueError::Unavailable
 }

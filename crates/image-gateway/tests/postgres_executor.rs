@@ -5,11 +5,12 @@ use std::{
 
 use gpt_image_2_gateway::database::{connect_test_pool_with_search_path, run_migrations};
 use gpt_image_2_gateway::{
-    CODEX_GENERATION_ADAPTER_REVISION, CanonicalExecutorOutcome, CustomerArtifactPublisher,
-    ExecutionSettlementStore, ExecutorParentTerminalState, ExecutorTerminalBlockReason,
-    ExecutorTerminalError, ExecutorTerminalStore, GenerationJob, PostgresExecutionSettlementStore,
-    PostgresExecutorTerminalStore, PostgresReconciliationStore, ReconciliationOutcome,
-    ReconciliationStore, UsageCharge, UsageLimits, UsageReservation, UsageSnapshot,
+    BlockedTerminalRequeueError, CODEX_GENERATION_ADAPTER_REVISION, CanonicalExecutorOutcome,
+    CustomerArtifactPublisher, ExecutionSettlementStore, ExecutorParentTerminalState,
+    ExecutorTerminalBlockReason, ExecutorTerminalError, ExecutorTerminalStore, GenerationJob,
+    PostgresExecutionSettlementStore, PostgresExecutorTerminalStore, PostgresReconciliationStore,
+    ReconciliationOutcome, ReconciliationStore, UsageCharge, UsageLimits, UsageReservation,
+    UsageSnapshot,
     admission::{
         AdmissionTicket, DreaminaImageAdmissionPlan, DreaminaVideoAdmissionPlan,
         GENERATION_COMMAND_SCHEMA, GenerationCommandV1, VIDEO_GENERATION_OPERATION, WorkLease,
@@ -131,6 +132,25 @@ struct V4TerminalEconomicState {
     hold_released_micros: i64,
     account_held_micros: i64,
     account_captured_micros: i64,
+}
+
+#[derive(Debug, Eq, PartialEq, sqlx::FromRow)]
+struct V4MixedSettlementState {
+    job_state: String,
+    last_error_code: String,
+    charged_units: i32,
+    committed_units: i32,
+    released_units: i32,
+    quota_state: String,
+    artifact_count: i64,
+    submission_count: i64,
+    blocked_count: i64,
+    rating_count: i64,
+    rating_line_count: i64,
+    hold_state: String,
+    captured_micros: i64,
+    released_micros: i64,
+    charge_count: i64,
 }
 
 #[derive(Debug, Eq, PartialEq, sqlx::FromRow)]
@@ -3055,6 +3075,162 @@ async fn v4_terminal_multi_output_rates_every_token_partition_once() -> TestResu
 }
 
 #[tokio::test]
+async fn v4_four_output_one_success_settles_without_blocking() -> TestResult {
+    assert_v4_four_output_mixed_settlement(&[0]).await
+}
+
+#[tokio::test]
+async fn v4_four_output_three_successes_settle_without_blocking() -> TestResult {
+    assert_v4_four_output_mixed_settlement(&[0, 1, 2]).await
+}
+
+async fn assert_v4_four_output_mixed_settlement(successful_outputs: &[i32]) -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let work = seed_codex_generation_lease_with_outputs(
+            &database.pool,
+            "v4-four-output-mixed-worker",
+            4,
+        )
+        .await?;
+        seed_v4_customer_quote(&database.pool, &work, 40_000).await?;
+        let executor = PostgresExecutorSubmissionStore::new(database.pool.clone());
+        let (executor_artifacts, artifact_root) = artifact_publisher(&executor)?;
+        let prepared = executor
+            .prepare_and_handoff(&work, profile_id_for_lease(&work))
+            .await
+            .map_err(debug_error)?;
+        require(prepared.len() == 4, "expected four prepared outputs")?;
+        seed_terminal_quota(&database.pool, &work).await?;
+
+        let scope = ExecutorClaimScope {
+            execution_profile_id: CODEX_PROFILE_ID,
+            provider_id: "openai-codex".to_string(),
+            command_schema: GENERATION_COMMAND_SCHEMA.to_string(),
+            adapter_revision: CODEX_GENERATION_ADAPTER_REVISION.to_string(),
+        };
+        for index in 0..4 {
+            let lease = executor
+                .claim_prepared(&scope, &format!("v4-four-output-executor-{index}"), 60_000)
+                .await
+                .map_err(debug_error)?
+                .ok_or_else(|| format!("mixed output {index} was not claimable"))?;
+            executor.start(&lease).await.map_err(debug_error)?;
+            let outcome = if successful_outputs.contains(&lease.output_index) {
+                ExecutorSubmissionOutcome::Succeeded(
+                    publish_result_authority(&executor_artifacts, &lease).await?,
+                )
+            } else {
+                ExecutorSubmissionOutcome::Failed {
+                    error_code: "codex_image_output_disappeared".to_string(),
+                }
+            };
+            executor
+                .record_outcome(&lease, &outcome)
+                .await
+                .map_err(debug_error)?;
+        }
+
+        let reductions = PostgresExecutorTerminalStore::new(database.pool.clone());
+        let customer_publisher = CustomerArtifactPublisher::new(Arc::new(
+            FilesystemArtifactBlobStore::new(artifact_root.path()).map_err(debug_error)?,
+        ));
+        for index in 0..4 {
+            let terminal = reductions
+                .claim_terminal(&format!("v4-four-output-reducer-{index}"), 60_000)
+                .await
+                .map_err(debug_error)?
+                .ok_or_else(|| format!("mixed reduction {index} was not queued"))?;
+            let artifact = if matches!(terminal.outcome, CanonicalExecutorOutcome::Succeeded(_)) {
+                Some(
+                    customer_publisher
+                        .publish(&terminal)
+                        .await
+                        .map_err(debug_error)?,
+                )
+            } else {
+                None
+            };
+            let completion = reductions
+                .complete_terminal(&terminal, artifact.as_ref())
+                .await
+                .map_err(debug_error)?;
+            let expected_parent = if index == 3 {
+                ExecutorParentTerminalState::Failed
+            } else {
+                ExecutorParentTerminalState::Pending
+            };
+            require(
+                completion.parent_state == expected_parent,
+                format!("mixed reduction {index} returned {completion:?}"),
+            )?;
+        }
+
+        let success_count = i64::try_from(successful_outputs.len()).map_err(debug_error)?;
+        let failed_count = 4_i64 - success_count;
+        let state: V4MixedSettlementState = sqlx::query_as(
+            r#"
+            SELECT job.state AS job_state, job.last_error_code, job.charged_units,
+                   quota.committed_units, quota.released_units,
+                   quota.state AS quota_state,
+                   (SELECT COUNT(*) FROM artifacts WHERE job_id = job.job_id)
+                     AS artifact_count,
+                   (SELECT COUNT(*) FROM provider_submissions WHERE job_id = job.job_id)
+                     AS submission_count,
+                   (SELECT COUNT(*) FROM executor_terminal_reductions reduction
+                      JOIN provider_submissions submission USING (submission_id)
+                      WHERE submission.job_id = job.job_id AND reduction.state = 'blocked')
+                     AS blocked_count,
+                   (SELECT COUNT(*) FROM customer_rated_usage WHERE job_id = job.job_id)
+                     AS rating_count,
+                   (SELECT COUNT(*) FROM customer_rated_usage_lines line
+                      JOIN customer_rated_usage rating
+                        ON rating.rated_usage_id = line.rated_usage_id
+                      WHERE rating.job_id = job.job_id) AS rating_line_count,
+                   hold.state AS hold_state, hold.captured_micros,
+                   hold.released_micros,
+                   (SELECT COUNT(*) FROM ledger_transactions
+                      WHERE source_job_id = job.job_id
+                        AND transaction_type = 'customer_job_charge') AS charge_count
+            FROM jobs job
+            JOIN quota_reservations quota ON quota.job_id = job.job_id
+            JOIN customer_billing_holds hold ON hold.job_id = job.job_id
+            WHERE job.job_id = $1
+            "#,
+        )
+        .bind(work.job_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(
+            state
+                == V4MixedSettlementState {
+                    job_state: "failed".to_string(),
+                    last_error_code: "partial_output_failure".to_string(),
+                    charged_units: i32::try_from(success_count).map_err(debug_error)?,
+                    committed_units: i32::try_from(success_count).map_err(debug_error)?,
+                    released_units: i32::try_from(failed_count).map_err(debug_error)?,
+                    quota_state: "committed".to_string(),
+                    artifact_count: success_count,
+                    submission_count: 4,
+                    blocked_count: 0,
+                    rating_count: 1,
+                    rating_line_count: 4,
+                    hold_state: "settled".to_string(),
+                    captured_micros: success_count * 40_000,
+                    released_micros: failed_count * 40_000,
+                    charge_count: 1,
+                },
+            format!("v4 mixed settlement did not close canonically: {state:?}"),
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
 async fn v4_terminal_failure_releases_the_customer_hold_without_a_charge() -> TestResult {
     let Some(database) = TestDatabase::new().await? else {
         return Ok(());
@@ -4171,14 +4347,27 @@ async fn blocked_terminal_reduction_is_durable_and_fences_its_lease() -> TestRes
         return Ok(());
     };
     let result = async {
-        let work = seed_lease(&database.pool, "blocked-terminal-worker", 1).await?;
+        let work = seed_codex_generation_lease(&database.pool, "blocked-terminal-worker").await?;
         seed_terminal_quota(&database.pool, &work).await?;
         let executor = PostgresExecutorSubmissionStore::new(database.pool.clone());
         executor
             .prepare_and_handoff(&work, profile_id_for_lease(&work))
             .await
             .map_err(debug_error)?;
-        let executor_lease = claim_required(&executor, "blocked-terminal-executor").await?;
+        let executor_lease = executor
+            .claim_prepared(
+                &ExecutorClaimScope {
+                    execution_profile_id: CODEX_PROFILE_ID,
+                    provider_id: "openai-codex".to_string(),
+                    command_schema: GENERATION_COMMAND_SCHEMA.to_string(),
+                    adapter_revision: CODEX_GENERATION_ADAPTER_REVISION.to_string(),
+                },
+                "blocked-terminal-executor",
+                60_000,
+            )
+            .await
+            .map_err(debug_error)?
+            .ok_or_else(|| "blocked Codex submission was not claimable".to_string())?;
         executor.start(&executor_lease).await.map_err(debug_error)?;
         executor
             .record_outcome(
@@ -4191,6 +4380,17 @@ async fn blocked_terminal_reduction_is_durable_and_fences_its_lease() -> TestRes
             .map_err(debug_error)?;
 
         let reductions = PostgresExecutorTerminalStore::new(database.pool.clone());
+        require(
+            reductions
+                .requeue_blocked_canonical_conflict(
+                    Uuid::nil(),
+                    "credit-grant-partial-settle-v1",
+                    "test-operator",
+                )
+                .await
+                == Err(BlockedTerminalRequeueError::InvalidInput),
+            "terminal requeue accepted a nil submission identity",
+        )?;
         let lease = reductions
             .claim_terminal("blocked-terminal-reducer", 60_000)
             .await
@@ -4256,6 +4456,295 @@ async fn blocked_terminal_reduction_is_durable_and_fences_its_lease() -> TestRes
         require(
             completion == Err(ExecutorTerminalError::StaleLease),
             format!("blocked terminal lease retained completion authority: {completion:?}"),
+        )?;
+
+        sqlx::query("UPDATE jobs SET economics_contract_version = 4 WHERE job_id = $1")
+            .bind(lease.job_id)
+            .execute(&database.pool)
+            .await
+            .map_err(debug_error)?;
+        let submission_id = lease.submission_id;
+        let prior_reducer_lease_epoch = lease.reducer_lease_epoch;
+        let first_store = reductions.clone();
+        let second_store = reductions.clone();
+        let first_requeue = tokio::spawn(async move {
+            first_store
+                .requeue_blocked_canonical_conflict(
+                    submission_id,
+                    "credit-grant-partial-settle-v1",
+                    "test-operator-a",
+                )
+                .await
+        });
+        let second_requeue = tokio::spawn(async move {
+            second_store
+                .requeue_blocked_canonical_conflict(
+                    submission_id,
+                    "credit-grant-partial-settle-v1",
+                    "test-operator-b",
+                )
+                .await
+        });
+        let requeues = [
+            first_requeue
+                .await
+                .map_err(debug_error)?
+                .map_err(debug_error)?,
+            second_requeue
+                .await
+                .map_err(debug_error)?
+                .map_err(debug_error)?,
+        ];
+        require(
+            requeues
+                .iter()
+                .filter(|result| !result.already_requeued)
+                .count()
+                == 1
+                && requeues
+                    .iter()
+                    .filter(|result| result.already_requeued)
+                    .count()
+                    == 1,
+            format!("concurrent terminal requeue was not idempotent: {requeues:?}"),
+        )?;
+        let evidence_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM operator_terminal_reduction_requeues WHERE submission_id = $1",
+        )
+        .bind(submission_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(
+            evidence_count == 1,
+            "terminal requeue evidence was duplicated",
+        )?;
+        let requeued = reductions
+            .claim_terminal("requeued-terminal-reducer", 60_000)
+            .await
+            .map_err(debug_error)?
+            .ok_or_else(|| "requeued terminal reduction was not claimable".to_string())?;
+        require(
+            requeued.submission_id == submission_id
+                && requeued.reducer_lease_epoch == prior_reducer_lease_epoch + 1,
+            format!("requeued terminal lease did not preserve fencing: {requeued:?}"),
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
+async fn succeeded_blocked_terminal_requeues_without_provider_replay() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let work = seed_codex_generation_lease(&database.pool, "blocked-success-worker").await?;
+        seed_v4_customer_quote(&database.pool, &work, 40_000).await?;
+        let executor = PostgresExecutorSubmissionStore::new(database.pool.clone());
+        let (executor_artifacts, artifact_root) = artifact_publisher(&executor)?;
+        executor
+            .prepare_and_handoff(&work, profile_id_for_lease(&work))
+            .await
+            .map_err(debug_error)?;
+        seed_terminal_quota(&database.pool, &work).await?;
+        let executor_lease = executor
+            .claim_prepared(
+                &ExecutorClaimScope {
+                    execution_profile_id: CODEX_PROFILE_ID,
+                    provider_id: "openai-codex".to_string(),
+                    command_schema: GENERATION_COMMAND_SCHEMA.to_string(),
+                    adapter_revision: CODEX_GENERATION_ADAPTER_REVISION.to_string(),
+                },
+                "blocked-success-executor",
+                60_000,
+            )
+            .await
+            .map_err(debug_error)?
+            .ok_or_else(|| "successful blocked submission was not claimable".to_string())?;
+        executor.start(&executor_lease).await.map_err(debug_error)?;
+        let manifest = publish_result_authority(&executor_artifacts, &executor_lease).await?;
+        executor
+            .record_outcome(
+                &executor_lease,
+                &ExecutorSubmissionOutcome::Succeeded(manifest),
+            )
+            .await
+            .map_err(debug_error)?;
+
+        let reductions = PostgresExecutorTerminalStore::new(database.pool.clone());
+        let first_lease = reductions
+            .claim_terminal("blocked-success-reducer", 60_000)
+            .await
+            .map_err(debug_error)?
+            .ok_or_else(|| "successful terminal reduction was not queued".to_string())?;
+        reductions
+            .block_terminal(&first_lease, ExecutorTerminalBlockReason::CanonicalConflict)
+            .await
+            .map_err(debug_error)?;
+        let requeue = reductions
+            .requeue_blocked_canonical_conflict(
+                first_lease.submission_id,
+                "credit-grant-partial-settle-v1",
+                "test-operator",
+            )
+            .await
+            .map_err(debug_error)?;
+        require(
+            !requeue.already_requeued,
+            "first terminal requeue was a replay",
+        )?;
+        let requeued_lease = reductions
+            .claim_terminal("requeued-success-reducer", 60_000)
+            .await
+            .map_err(debug_error)?
+            .ok_or_else(|| "successful requeued reduction was not claimable".to_string())?;
+        require(
+            requeued_lease.reducer_lease_epoch == first_lease.reducer_lease_epoch + 1,
+            "successful requeue did not advance the reducer fence",
+        )?;
+        let customer = CustomerArtifactPublisher::new(Arc::new(
+            FilesystemArtifactBlobStore::new(artifact_root.path()).map_err(debug_error)?,
+        ))
+        .publish(&requeued_lease)
+        .await
+        .map_err(debug_error)?;
+        let completion = reductions
+            .complete_terminal(&requeued_lease, Some(&customer))
+            .await
+            .map_err(debug_error)?;
+        require(
+            completion.parent_state == ExecutorParentTerminalState::Succeeded,
+            format!("requeued successful reduction did not complete: {completion:?}"),
+        )?;
+        let replay = reductions
+            .requeue_blocked_canonical_conflict(
+                first_lease.submission_id,
+                "credit-grant-partial-settle-v1",
+                "test-operator",
+            )
+            .await
+            .map_err(debug_error)?;
+        require(
+            replay.already_requeued,
+            "completed terminal requeue was not idempotent",
+        )?;
+
+        let state: (String, String, i64, i64, i64, i64) = sqlx::query_as(
+            r#"
+            SELECT job.state, hold.state,
+                   (SELECT COUNT(*) FROM provider_submissions WHERE job_id = job.job_id),
+                   (SELECT COUNT(*) FROM artifacts WHERE job_id = job.job_id),
+                   (SELECT COUNT(*) FROM operator_terminal_reduction_requeues
+                      WHERE submission_id = $2),
+                   hold.captured_micros
+            FROM jobs job
+            JOIN customer_billing_holds hold ON hold.job_id = job.job_id
+            WHERE job.job_id = $1
+            "#,
+        )
+        .bind(work.job_id)
+        .bind(first_lease.submission_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(
+            state
+                == (
+                    "succeeded".to_string(),
+                    "settled".to_string(),
+                    1,
+                    1,
+                    1,
+                    40_000,
+                ),
+            format!("successful terminal requeue changed canonical effects: {state:?}"),
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
+async fn noncanonical_blocked_terminal_is_not_requeued() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let work = seed_codex_generation_lease(&database.pool, "noncanonical-block-worker").await?;
+        seed_terminal_quota(&database.pool, &work).await?;
+        sqlx::query("UPDATE jobs SET economics_contract_version = 4 WHERE job_id = $1")
+            .bind(work.job_id)
+            .execute(&database.pool)
+            .await
+            .map_err(debug_error)?;
+        let executor = PostgresExecutorSubmissionStore::new(database.pool.clone());
+        executor
+            .prepare_and_handoff(&work, profile_id_for_lease(&work))
+            .await
+            .map_err(debug_error)?;
+        let executor_lease = executor
+            .claim_prepared(
+                &ExecutorClaimScope {
+                    execution_profile_id: CODEX_PROFILE_ID,
+                    provider_id: "openai-codex".to_string(),
+                    command_schema: GENERATION_COMMAND_SCHEMA.to_string(),
+                    adapter_revision: CODEX_GENERATION_ADAPTER_REVISION.to_string(),
+                },
+                "noncanonical-block-executor",
+                60_000,
+            )
+            .await
+            .map_err(debug_error)?
+            .ok_or_else(|| "noncanonical Codex submission was not claimable".to_string())?;
+        executor.start(&executor_lease).await.map_err(debug_error)?;
+        executor
+            .record_outcome(
+                &executor_lease,
+                &ExecutorSubmissionOutcome::Failed {
+                    error_code: "provider_failed".to_string(),
+                },
+            )
+            .await
+            .map_err(debug_error)?;
+        let reductions = PostgresExecutorTerminalStore::new(database.pool.clone());
+        let lease = reductions
+            .claim_terminal("noncanonical-block-reducer", 60_000)
+            .await
+            .map_err(debug_error)?
+            .ok_or_else(|| "noncanonical reduction was not queued".to_string())?;
+        reductions
+            .block_terminal(&lease, ExecutorTerminalBlockReason::ArtifactIntegrity)
+            .await
+            .map_err(debug_error)?;
+        require(
+            reductions
+                .requeue_blocked_canonical_conflict(
+                    lease.submission_id,
+                    "credit-grant-partial-settle-v1",
+                    "test-operator",
+                )
+                .await
+                == Err(BlockedTerminalRequeueError::Conflict),
+            "artifact-integrity block was requeued",
+        )?;
+        let state: (String, i64) = sqlx::query_as(
+            r#"
+            SELECT state,
+                   (SELECT COUNT(*) FROM operator_terminal_reduction_requeues
+                      WHERE submission_id = $1)
+            FROM executor_terminal_reductions
+            WHERE submission_id = $1
+            "#,
+        )
+        .bind(lease.submission_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(
+            state == ("blocked".to_string(), 0),
+            format!("noncanonical block changed during requeue refusal: {state:?}"),
         )
     }
     .await;

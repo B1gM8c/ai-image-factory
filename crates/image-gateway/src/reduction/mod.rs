@@ -63,6 +63,24 @@ pub struct ExecutorTerminalCompletion {
     pub parent_state: ExecutorParentTerminalState,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BlockedTerminalRequeue {
+    pub submission_id: Uuid,
+    pub executor_execution_id: Uuid,
+    pub repair_revision: String,
+    pub already_requeued: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum BlockedTerminalRequeueError {
+    #[error("blocked terminal requeue input is invalid")]
+    InvalidInput,
+    #[error("blocked terminal reduction does not match safe canonical evidence")]
+    Conflict,
+    #[error("blocked terminal requeue storage is unavailable")]
+    Unavailable,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ExecutorTerminalBlockReason {
     CanonicalConflict,

@@ -3,8 +3,9 @@ use std::{env, path::PathBuf};
 use uuid::Uuid;
 
 use gpt_image_2_gateway::{
-    CodexExecutionProfileProvisioning, CodexProfileProvisioningError, ImageGatewayError,
-    PostgresReconciliationStore, codex_auth_file_sha256,
+    BlockedTerminalRequeueError, CodexExecutionProfileProvisioning, CodexProfileProvisioningError,
+    ImageGatewayError, PostgresExecutorTerminalStore, PostgresReconciliationStore,
+    codex_auth_file_sha256,
     database::{
         DEFAULT_MAX_CONNECTIONS, connect_pool_with_schema, database_schema_from_env,
         database_url_from_env, run_migrations, verify_migrations,
@@ -43,6 +44,10 @@ enum Command {
     TerminalizeUnstartedJob {
         job_id: Uuid,
     },
+    RetryBlockedTerminal {
+        submission_id: Uuid,
+        repair_revision: String,
+    },
     BootstrapAdmin {
         email: String,
         display_name: String,
@@ -56,7 +61,7 @@ where
 {
     let mut args = args.into_iter();
     let command = args.next().ok_or_else(|| {
-        "missing command: expected `migrate`, `bootstrap-admin`, `provision-codex-profile`, `provision-grok-profile`, `provision-grok-video-profile`, `provision-grok-image-profile-replacement`, `provision-grok-edit-profile-replacement`, `provision-grok-video-profile-replacement`, `reconcile-execution-profile-routes`, `reconcile-dreamina-profiles`, `reconcile-inline-customer-settlement`, or `terminalize-unstarted-job`"
+        "missing command: expected `migrate`, `bootstrap-admin`, `provision-codex-profile`, `provision-grok-profile`, `provision-grok-video-profile`, `provision-grok-image-profile-replacement`, `provision-grok-edit-profile-replacement`, `provision-grok-video-profile-replacement`, `reconcile-execution-profile-routes`, `reconcile-dreamina-profiles`, `reconcile-inline-customer-settlement`, `terminalize-unstarted-job`, or `retry-blocked-terminal`"
             .to_string()
     })?;
     let command = match command.as_ref() {
@@ -131,9 +136,27 @@ where
                 .map_err(|_| "terminalize-unstarted-job requires a UUID job id".to_string())?;
             Command::TerminalizeUnstartedJob { job_id }
         }
+        "retry-blocked-terminal" => {
+            let submission_id =
+                required_argument(&mut args, "retry-blocked-terminal", "submission id")?
+                    .parse()
+                    .map_err(|_| {
+                        "retry-blocked-terminal requires a UUID submission id".to_string()
+                    })?;
+            let reason = required_argument(&mut args, "retry-blocked-terminal", "block reason")?;
+            if reason != "canonical_conflict" {
+                return Err("retry-blocked-terminal only accepts canonical_conflict".to_string());
+            }
+            let repair_revision =
+                required_argument(&mut args, "retry-blocked-terminal", "repair revision")?;
+            Command::RetryBlockedTerminal {
+                submission_id,
+                repair_revision,
+            }
+        }
         value => {
             return Err(format!(
-                "unknown command `{value}`: expected `migrate`, `bootstrap-admin`, `provision-codex-profile`, `provision-grok-profile`, `provision-grok-video-profile`, `provision-grok-image-profile-replacement`, `provision-grok-edit-profile-replacement`, `provision-grok-video-profile-replacement`, `reconcile-execution-profile-routes`, `reconcile-dreamina-profiles`, `reconcile-inline-customer-settlement`, or `terminalize-unstarted-job`"
+                "unknown command `{value}`: expected `migrate`, `bootstrap-admin`, `provision-codex-profile`, `provision-grok-profile`, `provision-grok-video-profile`, `provision-grok-image-profile-replacement`, `provision-grok-edit-profile-replacement`, `provision-grok-video-profile-replacement`, `reconcile-execution-profile-routes`, `reconcile-dreamina-profiles`, `reconcile-inline-customer-settlement`, `terminalize-unstarted-job`, or `retry-blocked-terminal`"
             ));
         }
     };
@@ -189,7 +212,8 @@ async fn main() -> Result<(), ImageGatewayError> {
         | Command::ReconcileExecutionProfileRoutes
         | Command::ReconcileDreaminaProfiles
         | Command::ReconcileInlineCustomerSettlement { .. }
-        | Command::TerminalizeUnstartedJob { .. } => None,
+        | Command::TerminalizeUnstartedJob { .. }
+        | Command::RetryBlockedTerminal { .. } => None,
     };
     let database_url = database_url_from_env()?;
     let database_schema = database_schema_from_env()?;
@@ -324,6 +348,20 @@ async fn main() -> Result<(), ImageGatewayError> {
                 outcome.job_id, outcome.released_units, outcome.released_micros
             );
         }
+        Command::RetryBlockedTerminal {
+            submission_id,
+            repair_revision,
+        } => {
+            verify_migrations(&pool).await?;
+            let outcome = PostgresExecutorTerminalStore::new(pool.clone())
+                .requeue_blocked_canonical_conflict(submission_id, &repair_revision, "factoryctl")
+                .await
+                .map_err(map_blocked_terminal_requeue_error)?;
+            println!(
+                "blocked terminal reduction requeued: submission_id={}, repair_revision={}, already_requeued={}",
+                outcome.submission_id, outcome.repair_revision, outcome.already_requeued
+            );
+        }
         Command::BootstrapAdmin {
             email,
             display_name,
@@ -377,6 +415,22 @@ fn map_identity_error(error: factory_identity::IdentityError) -> ImageGatewayErr
             ImageGatewayError::service_unavailable("identity storage is unavailable")
         }
         _ => ImageGatewayError::internal("administrator bootstrap failed"),
+    }
+}
+
+fn map_blocked_terminal_requeue_error(error: BlockedTerminalRequeueError) -> ImageGatewayError {
+    match error {
+        BlockedTerminalRequeueError::InvalidInput => {
+            ImageGatewayError::config("blocked terminal requeue input is invalid")
+        }
+        BlockedTerminalRequeueError::Conflict => ImageGatewayError::conflict(
+            "blocked terminal reduction does not match safe canonical evidence",
+            None,
+            "blocked_terminal_requeue_conflict",
+        ),
+        BlockedTerminalRequeueError::Unavailable => ImageGatewayError::service_unavailable(
+            "blocked terminal reduction storage is unavailable",
+        ),
     }
 }
 
@@ -598,10 +652,36 @@ mod tests {
     }
 
     #[test]
+    fn accepts_only_canonical_conflict_terminal_requeue() {
+        let submission_id = uuid::Uuid::new_v4();
+        assert_eq!(
+            parse_command([
+                "retry-blocked-terminal",
+                &submission_id.to_string(),
+                "canonical_conflict",
+                "credit-grant-partial-settle-v1",
+            ]),
+            Ok(Command::RetryBlockedTerminal {
+                submission_id,
+                repair_revision: "credit-grant-partial-settle-v1".to_string(),
+            })
+        );
+        assert_eq!(
+            parse_command([
+                "retry-blocked-terminal",
+                &submission_id.to_string(),
+                "artifact_integrity",
+                "credit-grant-partial-settle-v1",
+            ]),
+            Err("retry-blocked-terminal only accepts canonical_conflict".to_string())
+        );
+    }
+
+    #[test]
     fn rejects_missing_command() {
         assert_eq!(
             parse_command([] as [&str; 0]),
-            Err("missing command: expected `migrate`, `bootstrap-admin`, `provision-codex-profile`, `provision-grok-profile`, `provision-grok-video-profile`, `provision-grok-image-profile-replacement`, `provision-grok-edit-profile-replacement`, `provision-grok-video-profile-replacement`, `reconcile-execution-profile-routes`, `reconcile-dreamina-profiles`, `reconcile-inline-customer-settlement`, or `terminalize-unstarted-job`".to_string())
+            Err("missing command: expected `migrate`, `bootstrap-admin`, `provision-codex-profile`, `provision-grok-profile`, `provision-grok-video-profile`, `provision-grok-image-profile-replacement`, `provision-grok-edit-profile-replacement`, `provision-grok-video-profile-replacement`, `reconcile-execution-profile-routes`, `reconcile-dreamina-profiles`, `reconcile-inline-customer-settlement`, `terminalize-unstarted-job`, or `retry-blocked-terminal`".to_string())
         );
     }
 
@@ -610,7 +690,7 @@ mod tests {
         assert_eq!(
             parse_command(["status"]),
             Err(
-                "unknown command `status`: expected `migrate`, `bootstrap-admin`, `provision-codex-profile`, `provision-grok-profile`, `provision-grok-video-profile`, `provision-grok-image-profile-replacement`, `provision-grok-edit-profile-replacement`, `provision-grok-video-profile-replacement`, `reconcile-execution-profile-routes`, `reconcile-dreamina-profiles`, `reconcile-inline-customer-settlement`, or `terminalize-unstarted-job`"
+                "unknown command `status`: expected `migrate`, `bootstrap-admin`, `provision-codex-profile`, `provision-grok-profile`, `provision-grok-video-profile`, `provision-grok-image-profile-replacement`, `provision-grok-edit-profile-replacement`, `provision-grok-video-profile-replacement`, `reconcile-execution-profile-routes`, `reconcile-dreamina-profiles`, `reconcile-inline-customer-settlement`, `terminalize-unstarted-job`, or `retry-blocked-terminal`"
                     .to_string()
             )
         );

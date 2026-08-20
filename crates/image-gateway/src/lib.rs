@@ -184,10 +184,11 @@ pub use reconciliation::{
     UnstartedJobTerminalization, reconcile_input_cleanup,
 };
 pub use reduction::{
-    CanonicalExecutorOutcome, CustomerArtifactPublishError, CustomerArtifactPublisher,
-    ExecutorParentTerminalState, ExecutorTerminalArtifact, ExecutorTerminalBlockReason,
-    ExecutorTerminalCompletion, ExecutorTerminalError, ExecutorTerminalLease,
-    ExecutorTerminalStore, PostgresExecutorTerminalStore,
+    BlockedTerminalRequeue, BlockedTerminalRequeueError, CanonicalExecutorOutcome,
+    CustomerArtifactPublishError, CustomerArtifactPublisher, ExecutorParentTerminalState,
+    ExecutorTerminalArtifact, ExecutorTerminalBlockReason, ExecutorTerminalCompletion,
+    ExecutorTerminalError, ExecutorTerminalLease, ExecutorTerminalStore,
+    PostgresExecutorTerminalStore,
 };
 pub use request_observability::RequestObservationSink;
 pub use retention::{

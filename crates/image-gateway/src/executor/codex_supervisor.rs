@@ -51,7 +51,8 @@ const CHILD_REAP_TIMEOUT: Duration = Duration::from_secs(5);
 const CODEX_CHILD_PATH: &str = "/usr/bin:/bin";
 const MAX_CODEX_RUNTIME_OUTPUT_BYTES: u64 = 32 * 1024 * 1024;
 const CODEX_RUNTIME_OUTPUT_FILE: &str = "sealed-output.bin";
-const EPHEMERAL_OUTPUT_POLL_INTERVAL: Duration = Duration::from_millis(200);
+const EPHEMERAL_OUTPUT_DISCOVERY_INTERVAL: Duration = Duration::from_millis(10);
+const EPHEMERAL_OUTPUT_REFRESH_INTERVAL: Duration = Duration::from_millis(200);
 const MAX_DECODED_IMAGE_PIXELS: u64 = 16 * 1024 * 1024;
 const MAX_DECODED_IMAGE_DIMENSION: u32 = 8 * 1024;
 const MAX_CODEX_SESSION_FILES: usize = 32;
@@ -958,15 +959,21 @@ async fn capture_ephemeral_output(
 ) -> Result<CodexOutputCapture, ProcessSpoolError> {
     let mut capture = CodexOutputCapture::default();
     let mut first_poll = true;
+    let mut next_native_poll = Instant::now();
     loop {
         let mut stopping = false;
         if first_poll {
             first_poll = false;
         } else {
+            let interval = if capture.output.is_some() {
+                EPHEMERAL_OUTPUT_REFRESH_INTERVAL
+            } else {
+                EPHEMERAL_OUTPUT_DISCOVERY_INTERVAL
+            };
             tokio::select! {
                 biased;
                 _ = &mut stop => stopping = true,
-                _ = tokio::time::sleep(EPHEMERAL_OUTPUT_POLL_INTERVAL) => {}
+                _ = tokio::time::sleep(interval) => {}
             }
         }
         let read_spool = Arc::clone(&spool);
@@ -981,7 +988,13 @@ async fn capture_ephemeral_output(
         .map_err(|_| ProcessSpoolError::Unavailable)??;
         let workspace = validated_snapshot(snapshots.0, CodexOutputSource::Workspace).await?;
         let runtime = validated_snapshot(snapshots.1, CodexOutputSource::Runtime).await?;
-        let native = snapshot_native_codex_output(&codex_home, &output_format).await?;
+        let now = Instant::now();
+        let native = if stopping || now >= next_native_poll {
+            next_native_poll = now + EPHEMERAL_OUTPUT_REFRESH_INTERVAL;
+            snapshot_native_codex_output(&codex_home, &output_format).await?
+        } else {
+            None
+        };
 
         if workspace.is_some() {
             capture.workspace_observed = true;
@@ -1945,6 +1958,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_short_lived_outputs_are_captured_per_execution() {
+        let fixtures =
+            std::array::from_fn::<_, 4, _>(|_| CodexFixture::short_lived_workspace_output());
+        let leases = fixtures.each_ref().map(CodexFixture::lease);
+        for (fixture, lease) in fixtures.iter().zip(&leases) {
+            fixture.journal.start_or_attach(lease).unwrap();
+            fixture
+                .supervisor
+                .prepare(lease, &fixture.context(lease))
+                .await
+                .unwrap();
+            assert_eq!(
+                fixture.journal.commit_launch(lease).unwrap(),
+                LaunchDecision::LaunchOnce
+            );
+        }
+
+        let results = tokio::join!(
+            run_codex_runner_child(
+                fixtures[0].journal.root_path(),
+                leases[0].executor_execution_id,
+            ),
+            run_codex_runner_child(
+                fixtures[1].journal.root_path(),
+                leases[1].executor_execution_id,
+            ),
+            run_codex_runner_child(
+                fixtures[2].journal.root_path(),
+                leases[2].executor_execution_id,
+            ),
+            run_codex_runner_child(
+                fixtures[3].journal.root_path(),
+                leases[3].executor_execution_id,
+            ),
+        );
+        [results.0, results.1, results.2, results.3]
+            .into_iter()
+            .for_each(|result| result.unwrap());
+
+        for (fixture, lease) in fixtures.iter().zip(&leases) {
+            let expected = fs::read(fixture._temp.path().join("source.png")).unwrap();
+            let spool = ExecutionSpool::for_lease(&fixture.journal, lease).unwrap();
+            assert_eq!(
+                spool.observe().unwrap(),
+                ProcessObservation::Succeeded(SupervisedOutput::without_provider_cost(expected))
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn stop_signal_takes_one_final_runtime_output_snapshot() {
         let fixture = CodexFixture::new();
         let lease = fixture.lease();
@@ -2408,7 +2471,7 @@ mod tests {
         fn short_lived_workspace_output() -> Self {
             Self::with_script(|invocations, image, _root| {
                 format!(
-                    "#!/bin/sh\nset -eu\n/bin/cat >/dev/null\nprintf '1\\n' >> '{}'\nworkspace=''\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = '--cd' ]; then\n    shift\n    workspace=\"$1\"\n    break\n  fi\n  shift\ndone\ntest -n \"$workspace\"\n/bin/sleep 0.05\n/bin/cp '{}' \"$workspace/provider-output.png\"\n/bin/sleep 0.25\n/bin/rm \"$workspace/provider-output.png\"\n",
+                    "#!/bin/sh\nset -eu\n/bin/cat >/dev/null\nprintf '1\\n' >> '{}'\nworkspace=''\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = '--cd' ]; then\n    shift\n    workspace=\"$1\"\n    break\n  fi\n  shift\ndone\ntest -n \"$workspace\"\n/bin/sleep 0.05\n/bin/cp '{}' \"$workspace/provider-output.png\"\n/bin/sleep 0.05\n/bin/rm \"$workspace/provider-output.png\"\n",
                     invocations.display(),
                     image.display(),
                 )
