@@ -1,5 +1,6 @@
 use std::{
     env,
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::Stdio,
     sync::{Arc, Mutex},
@@ -27,11 +28,14 @@ const MAX_CODEX_BATCH_BYTES: u64 = 64 * 1024 * 1024;
 const CODEX_REAP_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_CODEX_DIAGNOSTIC_STREAM_BYTES: usize = 64 * 1024;
 const MAX_CODEX_NO_TOOL_ATTEMPTS: u8 = 2;
-const CODEX_NO_TOOL_RETRY_INSTRUCTION: &str = "\n\nThe previous attempt completed without calling the image generation tool. You MUST call the enabled image generation tool now and save exactly one image at the required output path. Do not answer with text only.";
+const CODEX_NO_TOOL_RETRY_INSTRUCTION: &str = "\n\nThe previous attempt completed without calling the image generation tool. You MUST call the enabled image generation tool exactly once now, then stop. Do not answer with text only and do not copy, move, rename, or delete the generated artifact.";
 
 #[derive(Clone, Debug, Default)]
 struct CodexCliEventSummary {
     thread_id: Option<String>,
+    thread_id_ambiguous: bool,
+    image_call_id: Option<String>,
+    image_call_ambiguous: bool,
     events: usize,
     image_events: usize,
     saw_image_generation: bool,
@@ -295,6 +299,32 @@ async fn run_codex_attempt(
         .tempdir()
         .map_err(ImageGatewayError::from)?;
     let request_dir = request_temp_dir.path().to_path_buf();
+    let source_codex_home = resolved_codex_home(config).ok_or_else(|| {
+        ImageGatewayError::service_unavailable("Codex credentials are unavailable")
+    })?;
+    let request_codex_home = tempfile::Builder::new()
+        .prefix("codex-home-")
+        .tempdir_in(&request_dir)
+        .map_err(ImageGatewayError::from)?;
+    std::fs::set_permissions(
+        request_codex_home.path(),
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .map_err(ImageGatewayError::from)?;
+    let auth_sha256 = crate::executor::codex_auth_file_sha256(&source_codex_home)
+        .map_err(|_| ImageGatewayError::service_unavailable("Codex credentials are unavailable"))?;
+    crate::executor::prepare_codex_auth_copy(
+        request_codex_home.path(),
+        &source_codex_home,
+        &auth_sha256,
+    )
+    .map_err(|_| ImageGatewayError::service_unavailable("Codex credentials are unavailable"))?;
+    let native_output_root = crate::runner::process::CodexExtensionOutputRoot::open(
+        request_codex_home.path(),
+    )
+    .map_err(|_| {
+        ImageGatewayError::service_unavailable("Codex native output storage is unavailable")
+    })?;
 
     let mut prompt = build_codex_prompt(job, &request_dir, index);
     if attempt > 1 {
@@ -325,6 +355,9 @@ async fn run_codex_attempt(
     append_input_image_arguments(&mut command, input_paths);
     command.arg("-");
     apply_codex_env(&mut command, config);
+    command
+        .env("CODEX_HOME", request_codex_home.path())
+        .env("HOME", request_codex_home.path());
 
     let mut child = command
         .spawn()
@@ -392,18 +425,39 @@ async fn run_codex_attempt(
         return Err(ImageGatewayError::codex_cli_failed().into());
     }
 
-    let final_output = request_dir.join(final_output_filename(&job.output_format));
-    let final_output_exists = match tokio::fs::symlink_metadata(&final_output).await {
-        Ok(metadata) => metadata.is_file() && !metadata.file_type().is_symlink(),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-        Err(_) => {
-            return Err(
-                ImageGatewayError::backend("Codex sealed output could not be inspected").into(),
-            );
+    let native_output = if events.completed_image_generation
+        && !events.thread_id_ambiguous
+        && !events.image_call_ambiguous
+    {
+        match (events.thread_id.as_deref(), events.image_call_id.as_deref()) {
+            (Some(thread_id), Some(call_id)) => {
+                let thread_id = thread_id.to_string();
+                let call_id = call_id.to_string();
+                tokio::task::spawn_blocking(move || {
+                    native_output_root.read(&thread_id, &call_id, MAX_CODEX_OUTPUT_BYTES)
+                })
+                .await
+                .map_err(|_| ImageGatewayError::backend("Codex native output validation failed"))?
+                .map_err(|error| match error {
+                    crate::runner::process::ProcessSpoolError::Unavailable => {
+                        ImageGatewayError::service_unavailable(
+                            "Codex native output storage is unavailable",
+                        )
+                    }
+                    crate::runner::process::ProcessSpoolError::InvalidInput
+                    | crate::runner::process::ProcessSpoolError::Conflict
+                    | crate::runner::process::ProcessSpoolError::Integrity => {
+                        ImageGatewayError::codex_image_output_disappeared()
+                    }
+                })?
+            }
+            _ => None,
         }
+    } else {
+        None
     };
-    let bytes = if final_output_exists {
-        read_codex_output(&final_output).await?
+    let bytes = if let Some(bytes) = native_output {
+        bytes
     } else {
         let error_code = if events.completed_image_generation {
             "codex_image_output_disappeared"
@@ -474,9 +528,8 @@ where
                 };
                 let mut summary = state.lock().expect("Codex event lock");
                 summary.events = summary.events.saturating_add(1);
-                if summary.thread_id.is_none() {
-                    summary.thread_id = codex_thread_id_from_value(&event);
-                }
+                record_codex_thread_id(&event, &mut summary);
+                record_codex_image_call_ids(&event, &mut summary);
                 let image_event = codex_image_event_state(&event);
                 summary.image_events = summary
                     .image_events
@@ -562,6 +615,67 @@ fn codex_image_event_state(value: &serde_json::Value) -> (bool, bool) {
     }
 }
 
+fn record_codex_image_call_ids(value: &serde_json::Value, summary: &mut CodexCliEventSummary) {
+    match value {
+        serde_json::Value::Object(fields) => {
+            let event_type = fields
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            let candidate = match event_type {
+                "image_generation_call" => fields.get("id"),
+                "image_generation_begin" | "image_generation_end" => fields.get("call_id"),
+                _ => None,
+            }
+            .and_then(serde_json::Value::as_str);
+            if let Some(candidate) = candidate {
+                if !valid_codex_image_call_id(candidate) {
+                    summary.image_call_id = None;
+                    summary.image_call_ambiguous = true;
+                } else if let Some(existing) = summary.image_call_id.as_deref() {
+                    if existing != candidate {
+                        summary.image_call_id = None;
+                        summary.image_call_ambiguous = true;
+                    }
+                } else if !summary.image_call_ambiguous {
+                    summary.image_call_id = Some(candidate.to_string());
+                }
+            }
+            for value in fields.values() {
+                record_codex_image_call_ids(value, summary);
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                record_codex_image_call_ids(value, summary);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn record_codex_thread_id(value: &serde_json::Value, summary: &mut CodexCliEventSummary) {
+    let Some(candidate) = codex_thread_id_from_value(value) else {
+        return;
+    };
+    if let Some(existing) = summary.thread_id.as_deref() {
+        if existing != candidate {
+            summary.thread_id = None;
+            summary.thread_id_ambiguous = true;
+        }
+    } else if !summary.thread_id_ambiguous {
+        summary.thread_id = Some(candidate);
+    }
+}
+
+fn valid_codex_image_call_id(call_id: &str) -> bool {
+    !call_id.is_empty()
+        && call_id.len() <= 255 - ".png".len()
+        && call_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
 fn warn_codex_terminal_without_output(
     job: &GenerationJob,
     index: u32,
@@ -594,109 +708,6 @@ fn append_input_image_arguments(command: &mut Command, input_paths: &[PathBuf]) 
     }
 }
 
-pub(crate) async fn read_codex_output(image_path: &Path) -> Result<Vec<u8>, ImageGatewayError> {
-    let path = image_path.to_path_buf();
-    tokio::task::spawn_blocking(move || read_codex_output_blocking(&path, || {}))
-        .await
-        .map_err(|_| ImageGatewayError::backend("Codex CLI output validation failed"))?
-        .map_err(|_| {
-            ImageGatewayError::backend("Codex CLI output is not a bounded regular image file")
-        })
-}
-
-fn read_codex_output_blocking<F>(image_path: &Path, after_open: F) -> std::io::Result<Vec<u8>>
-where
-    F: FnOnce(),
-{
-    use std::io::Read;
-
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW);
-    }
-    let mut file = options.open(image_path)?;
-    let metadata = file.metadata()?;
-    if !metadata.is_file() || metadata.len() == 0 || metadata.len() > MAX_CODEX_OUTPUT_BYTES {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "Codex output is not a bounded regular file",
-        ));
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-
-        if metadata.nlink() != 1
-            || metadata.uid() != unsafe { libc::geteuid() }
-            || metadata.mode() & 0o022 != 0
-        {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "Codex output has an unsafe owner, mode, or link count",
-            ));
-        }
-    }
-
-    after_open();
-
-    let expected_len = metadata.len();
-    let mut bytes = Vec::with_capacity(usize::try_from(expected_len).unwrap_or(0));
-    file.by_ref()
-        .take(MAX_CODEX_OUTPUT_BYTES + 1)
-        .read_to_end(&mut bytes)?;
-    let metadata_after = file.metadata()?;
-    let current = options.open(image_path)?;
-    let current_metadata = current.metadata()?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-
-        let identity = |value: &std::fs::Metadata| {
-            (
-                value.dev(),
-                value.ino(),
-                value.len(),
-                value.mtime(),
-                value.mtime_nsec(),
-                value.ctime(),
-                value.ctime_nsec(),
-            )
-        };
-        if identity(&metadata) != identity(&metadata_after)
-            || identity(&metadata) != identity(&current_metadata)
-        {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "Codex output changed while it was being read",
-            ));
-        }
-    }
-
-    #[cfg(not(unix))]
-    if metadata.len() != metadata_after.len()
-        || metadata.len() != current_metadata.len()
-        || metadata.modified().ok() != metadata_after.modified().ok()
-        || metadata.modified().ok() != current_metadata.modified().ok()
-    {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "Codex output changed while it was being read",
-        ));
-    }
-
-    if bytes.len() as u64 != expected_len || bytes.len() as u64 > MAX_CODEX_OUTPUT_BYTES {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "Codex output changed while it was being read",
-        ));
-    }
-    Ok(bytes)
-}
-
 fn resolved_codex_home(config: &AppConfig) -> Option<PathBuf> {
     config
         .codex_home
@@ -725,10 +736,10 @@ pub(crate) fn build_codex_prompt(job: &GenerationJob, request_dir: &Path, index:
 
 pub(crate) fn build_codex_prompt_for_output(
     job: &GenerationJob,
-    request_dir: &Path,
+    _request_dir: &Path,
     index: u32,
-    output_dir: &Path,
-    final_filename: &str,
+    _output_dir: &Path,
+    _final_filename: &str,
 ) -> String {
     let size_instruction = match parse_size_constraint(&job.size).unwrap_or(SizeConstraint::Auto) {
         SizeConstraint::Auto => "尺寸 auto，由图像生成器选择合适画布。".to_string(),
@@ -746,7 +757,6 @@ pub(crate) fn build_codex_prompt_for_output(
             )
         }
     };
-    let provider_filename = provider_output_filename(&job.output_format);
     let candidate_instruction = if job.n > 1 {
         format!(
             "请求参数 n={} 表示整个 API 请求需要返回 {} 张图片，网关会分 {} 次调用 Codex。当前只生成第 {index}/{} 张候选图片；请只输出这一张最终图片，不要在同一张画布里拼出多张图。请生成一个独立候选结果，保持用户需求一致，但构图、细节或风格处理不要与其它候选完全重复。",
@@ -764,36 +774,9 @@ pub(crate) fn build_codex_prompt_for_output(
         prompt.push_str(&format!(" 输出压缩 {compression}。"));
     }
     prompt.push_str(" 背景必须是不透明背景，不要生成透明背景或 alpha 通道。");
-    let cleanup_instruction = if request_dir == output_dir {
-        format!(
-            "、`/bin/rm {}/{}`。这里允许 cp、mv、rm，因为它们不能修改图片像素。退出前确认该目录只剩唯一最终图片 {}/{}，不要留下其它 png、jpg、jpeg 或 webp 图片文件",
-            request_dir.display(),
-            provider_filename,
-            output_dir.display(),
-            final_filename,
-        )
-    } else {
-        format!(
-            "。这里允许 cp、mv，因为它们不能修改图片像素。不要删除 {}/{}；runner 会在读取并封存结果后清理隔离工作目录。退出前确认最终图片已写入 {}/{}",
-            request_dir.display(),
-            provider_filename,
-            output_dir.display(),
-            final_filename,
-        )
-    };
-    prompt.push_str(&format!(
-        " 不要再启动 codex、openai 或其它 AI CLI 子进程来委托生成；不要用 sips、ImageMagick、Python、Rust、ffmpeg、canvas 或其他本地图像处理工具裁切、拉伸、重采样、扩边、转绘或修改像素。请先让图像生成能力把原生结果保存为 {}/{}。生成彻底完成后，必须依次执行 `/bin/cp {}/{} {}/{}.partial`、`/bin/mv {}/{}.partial {}/{}`{cleanup_instruction}。不要让图像生成能力直接管理最终文件，不要使用硬链接或符号链接。不要在图片中加入水印。",
-        request_dir.display(),
-        provider_filename,
-        request_dir.display(),
-        provider_filename,
-        output_dir.display(),
-        final_filename,
-        output_dir.display(),
-        final_filename,
-        output_dir.display(),
-        final_filename,
-    ));
+    prompt.push_str(
+        " 不要再启动 codex、openai 或其它 AI CLI 子进程来委托生成；不要用 shell、sips、ImageMagick、Python、Rust、ffmpeg、canvas 或其他本地工具复制、移动、重命名、删除、裁切、拉伸、重采样、扩边、转绘或修改图像生成工具产物。必须只调用一次当前启用的图像生成工具；工具成功后立即停止，由 Factory 从该工具的受控原生产物路径完成封存。不要在图片中加入水印。",
+    );
     prompt
 }
 
@@ -860,14 +843,6 @@ pub(crate) fn final_output_filename(output_format: &str) -> &'static str {
         "jpeg" => "final.jpg",
         "webp" => "final.webp",
         _ => "final.png",
-    }
-}
-
-pub(crate) fn provider_output_filename(output_format: &str) -> &'static str {
-    match output_format {
-        "jpeg" => "provider-output.jpg",
-        "webp" => "provider-output.webp",
-        _ => "provider-output.png",
     }
 }
 
@@ -946,6 +921,28 @@ mod tests {
             codex_home: Some("/tmp/gateway-codex-home".to_string()),
             cleanup_codex_outputs: false,
         }
+    }
+
+    #[cfg(unix)]
+    fn configure_private_test_codex_home(
+        config: &mut AppConfig,
+        root: &Path,
+        directory: &str,
+    ) -> PathBuf {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let home = root.join(directory);
+        std::fs::create_dir(&home).unwrap();
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(home.join("auth.json"))
+            .and_then(|mut file| std::io::Write::write_all(&mut file, b"{}"))
+            .unwrap();
+        config.codex_home = Some(home.to_string_lossy().into_owned());
+        home
     }
 
     #[test]
@@ -1038,6 +1035,70 @@ mod tests {
     }
 
     #[test]
+    fn binds_one_safe_image_call_id_and_rejects_ambiguous_or_unsafe_ids() {
+        let mut summary = CodexCliEventSummary::default();
+        record_codex_image_call_ids(
+            &serde_json::json!({
+                "type": "item.started",
+                "item": {"type": "image_generation_call", "id": "call_exact_image"}
+            }),
+            &mut summary,
+        );
+        record_codex_image_call_ids(
+            &serde_json::json!({
+                "type": "item.completed",
+                "item": {"type": "image_generation_call", "id": "call_exact_image"}
+            }),
+            &mut summary,
+        );
+        assert_eq!(summary.image_call_id.as_deref(), Some("call_exact_image"));
+        assert!(!summary.image_call_ambiguous);
+
+        record_codex_image_call_ids(
+            &serde_json::json!({
+                "type": "item.completed",
+                "item": {"type": "image_generation_call", "id": "call_other_image"}
+            }),
+            &mut summary,
+        );
+        assert!(summary.image_call_id.is_none());
+        assert!(summary.image_call_ambiguous);
+
+        let mut unsafe_summary = CodexCliEventSummary::default();
+        record_codex_image_call_ids(
+            &serde_json::json!({
+                "type": "image_generation_end",
+                "call_id": "../other-call"
+            }),
+            &mut unsafe_summary,
+        );
+        assert!(unsafe_summary.image_call_id.is_none());
+        assert!(unsafe_summary.image_call_ambiguous);
+    }
+
+    #[test]
+    fn multiple_thread_ids_fail_closed() {
+        let mut summary = CodexCliEventSummary::default();
+        record_codex_thread_id(
+            &serde_json::json!({
+                "type": "thread.started",
+                "thread_id": "019fd666-0416-7da2-bcc3-7f2f51efd3c8"
+            }),
+            &mut summary,
+        );
+        record_codex_thread_id(
+            &serde_json::json!({
+                "type": "thread.started",
+                "thread_id": "019fd666-0416-7da2-bcc3-7f2f51efd3c9"
+            }),
+            &mut summary,
+        );
+
+        assert!(summary.thread_id.is_none());
+        assert!(summary.thread_id_ambiguous);
+    }
+
+    #[test]
     fn retries_only_when_codex_never_invoked_image_generation() {
         assert!(retryable_codex_no_image_generation(&CodexCliEventSummary {
             capture_complete: true,
@@ -1086,12 +1147,7 @@ mod tests {
         .unwrap();
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
         let mut config = test_config();
-        config.codex_home = Some(
-            temp.path()
-                .join("codex-home")
-                .to_string_lossy()
-                .into_owned(),
-        );
+        configure_private_test_codex_home(&mut config, temp.path(), "codex-home");
         config.cleanup_codex_outputs = true;
         config.request_timeout = Duration::from_secs(10);
 
@@ -1130,12 +1186,7 @@ mod tests {
         .unwrap();
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
         let mut config = test_config();
-        config.codex_home = Some(
-            temp.path()
-                .join("codex-home")
-                .to_string_lossy()
-                .into_owned(),
-        );
+        configure_private_test_codex_home(&mut config, temp.path(), "codex-home");
         config.cleanup_codex_outputs = true;
         config.request_timeout = Duration::from_secs(10);
 
@@ -1178,8 +1229,9 @@ mod tests {
     #[test]
     fn retry_instruction_requires_the_image_tool_and_output_contract() {
         assert!(CODEX_NO_TOOL_RETRY_INSTRUCTION.contains("MUST call"));
-        assert!(CODEX_NO_TOOL_RETRY_INSTRUCTION.contains("exactly one image"));
+        assert!(CODEX_NO_TOOL_RETRY_INSTRUCTION.contains("exactly once"));
         assert!(CODEX_NO_TOOL_RETRY_INSTRUCTION.contains("Do not answer with text only"));
+        assert!(CODEX_NO_TOOL_RETRY_INSTRUCTION.contains("do not copy, move, rename, or delete"));
 
         let prompt = build_codex_prompt(
             &test_generation_job("req-initial-tool-gate"),
@@ -1220,12 +1272,7 @@ mod tests {
         .unwrap();
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
         let mut config = test_config();
-        config.codex_home = Some(
-            temp.path()
-                .join("codex-home")
-                .to_string_lossy()
-                .into_owned(),
-        );
+        configure_private_test_codex_home(&mut config, temp.path(), "codex-home");
         config.cleanup_codex_outputs = true;
         config.request_timeout = Duration::from_secs(10);
 
@@ -1264,10 +1311,8 @@ mod tests {
             &executable,
             format!(
                 "#!/bin/sh\n\
-                 request_dir=''\n\
                  image_path=''\n\
                  while [ \"$#\" -gt 0 ]; do\n\
-                   if [ \"$1\" = '--cd' ]; then shift; request_dir=\"$1\"; fi\n\
                    if [ \"$1\" = '--image' ]; then shift; image_path=\"$1\"; fi\n\
                    shift\n\
                  done\n\
@@ -1275,11 +1320,16 @@ mod tests {
                  if [ \"$image_path\" != '{input}' ]; then exit 4; fi\n\
                  printf '1\\n' >> '{invocations}'\n\
                  count=$(/usr/bin/wc -l < '{invocations}')\n\
-                 printf '{{\"type\":\"thread.started\",\"thread_id\":\"019fd666-0416-7da2-bcc3-7f2f51efd3c8\"}}\\n'\n\
+                 thread_id='019fd666-0416-7da2-bcc3-7f2f51efd3c8'\n\
+                 printf '{{\"type\":\"thread.started\",\"thread_id\":\"%s\"}}\\n' \"$thread_id\"\n\
                  if [ \"$count\" -eq 1 ]; then exit 0; fi\n\
-                 /bin/cp '{source}' \"$request_dir/final.png.partial\"\n\
-                 /bin/mv \"$request_dir/final.png.partial\" \"$request_dir/final.png\"\n\
-                 printf '{{\"type\":\"item.completed\",\"item\":{{\"type\":\"image_generation_call\"}}}}\\n'\n",
+                 call_id='call_retry_image'\n\
+                 output_dir=\"$CODEX_HOME/generated_images/$thread_id\"\n\
+                 /bin/mkdir -p \"$output_dir\"\n\
+                 /bin/chmod 700 \"$CODEX_HOME/generated_images\" \"$output_dir\"\n\
+                 /bin/cp '{source}' \"$output_dir/$call_id.png\"\n\
+                 /bin/chmod 600 \"$output_dir/$call_id.png\"\n\
+                 printf '{{\"type\":\"item.completed\",\"item\":{{\"type\":\"image_generation_call\",\"id\":\"%s\"}}}}\\n' \"$call_id\"\n",
                 invocations = invocations.display(),
                 input = input.display(),
                 source = source.display(),
@@ -1288,12 +1338,7 @@ mod tests {
         .unwrap();
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
         let mut config = test_config();
-        config.codex_home = Some(
-            temp.path()
-                .join("codex-home")
-                .to_string_lossy()
-                .into_owned(),
-        );
+        configure_private_test_codex_home(&mut config, temp.path(), "codex-home");
         config.cleanup_codex_outputs = true;
         config.request_timeout = Duration::from_secs(10);
         let job = test_generation_job("req-retry");
@@ -1324,28 +1369,74 @@ mod tests {
             format!(
                 "#!/bin/sh\n\
                  /bin/cat >/dev/null\n\
-                 output_dir=\"$CODEX_HOME/generated_images/thread\"\n\
+                 thread_id='019fd666-0416-7da2-bcc3-7f2f51efd3c8'\n\
+                 call_id='call_transient_image'\n\
+                 output_dir=\"$CODEX_HOME/generated_images/$thread_id\"\n\
                  /bin/mkdir -p \"$output_dir\"\n\
-                 /bin/cp '{source}' \"$output_dir/generated.png\"\n\
-                 /bin/rm \"$output_dir/generated.png\"\n\
-                 printf '{{\"type\":\"item.completed\",\"item\":{{\"type\":\"image_generation_call\"}}}}\\n'\n",
+                 /bin/chmod 700 \"$CODEX_HOME/generated_images\" \"$output_dir\"\n\
+                 /bin/cp '{source}' \"$output_dir/$call_id.png\"\n\
+                 /bin/rm \"$output_dir/$call_id.png\"\n\
+                 printf '{{\"type\":\"thread.started\",\"thread_id\":\"%s\"}}\\n' \"$thread_id\"\n\
+                 printf '{{\"type\":\"item.completed\",\"item\":{{\"type\":\"image_generation_call\",\"id\":\"%s\"}}}}\\n' \"$call_id\"\n",
                 source = source.display(),
             ),
         )
         .unwrap();
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
         let mut config = test_config();
-        config.codex_home = Some(
-            temp.path()
-                .join("codex-home")
-                .to_string_lossy()
-                .into_owned(),
-        );
+        configure_private_test_codex_home(&mut config, temp.path(), "codex-home");
         config.request_timeout = Duration::from_secs(10);
 
         let error = run_codex_once_with_executable(
             &config,
             &test_generation_job("req-transient-native-is-not-authority"),
+            1,
+            &[],
+            &executable,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.error_code(), Some("codex_image_output_disappeared"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn replacement_codex_home_is_not_a_success_authority() {
+        let temp = tempfile::tempdir().unwrap();
+        let executable = temp.path().join("fake-codex");
+        let source = temp.path().join("source.png");
+        std::fs::write(&source, valid_png_with_dimensions(2, 1)).unwrap();
+        std::fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\n\
+                 /bin/cat >/dev/null\n\
+                 displaced_home=\"$CODEX_HOME.displaced\"\n\
+                 /bin/mv \"$CODEX_HOME\" \"$displaced_home\"\n\
+                 /bin/mkdir \"$CODEX_HOME\"\n\
+                 /bin/chmod 700 \"$CODEX_HOME\"\n\
+                 thread_id='019fd666-0416-7da2-bcc3-7f2f51efd3c8'\n\
+                 call_id='call_replacement_home'\n\
+                 output_dir=\"$CODEX_HOME/generated_images/$thread_id\"\n\
+                 /bin/mkdir -p \"$output_dir\"\n\
+                 /bin/chmod 700 \"$CODEX_HOME/generated_images\" \"$output_dir\"\n\
+                 /bin/cp '{source}' \"$output_dir/$call_id.png\"\n\
+                 /bin/chmod 600 \"$output_dir/$call_id.png\"\n\
+                 printf '{{\"type\":\"thread.started\",\"thread_id\":\"%s\"}}\\n' \"$thread_id\"\n\
+                 printf '{{\"type\":\"item.completed\",\"item\":{{\"type\":\"image_generation_call\",\"id\":\"%s\"}}}}\\n' \"$call_id\"\n",
+                source = source.display(),
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut config = test_config();
+        configure_private_test_codex_home(&mut config, temp.path(), "codex-home");
+        config.request_timeout = Duration::from_secs(10);
+
+        let error = run_codex_once_with_executable(
+            &config,
+            &test_generation_job("req-replacement-home-is-not-authority"),
             1,
             &[],
             &executable,
@@ -1375,19 +1466,15 @@ mod tests {
                  /bin/cat >/dev/null\n\
                  /bin/cp '{source}' \"$request_dir/final.png.partial\"\n\
                  /bin/rm \"$request_dir/final.png.partial\"\n\
-                 printf '{{\"type\":\"item.completed\",\"item\":{{\"type\":\"image_generation_call\"}}}}\\n'\n",
+                 printf '{{\"type\":\"thread.started\",\"thread_id\":\"019fd666-0416-7da2-bcc3-7f2f51efd3c8\"}}\\n'\n\
+                 printf '{{\"type\":\"item.completed\",\"item\":{{\"type\":\"image_generation_call\",\"id\":\"call_unlinked_partial\"}}}}\\n'\n",
                 source = source.display(),
             ),
         )
         .unwrap();
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
         let mut config = test_config();
-        config.codex_home = Some(
-            temp.path()
-                .join("codex-home")
-                .to_string_lossy()
-                .into_owned(),
-        );
+        configure_private_test_codex_home(&mut config, temp.path(), "codex-home");
         config.request_timeout = Duration::from_secs(10);
 
         let error = run_codex_once_with_executable(
@@ -1404,41 +1491,6 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn read_codex_output_rejects_same_name_replacement_after_open() {
-        let temp = tempfile::tempdir().unwrap();
-        let output = temp.path().join("final.png");
-        let opened_output = temp.path().join("opened.png");
-        let original = valid_png_with_dimensions(2, 1);
-        let replacement = valid_png_with_dimensions(3, 1);
-        std::fs::write(&output, &original).unwrap();
-
-        let opened = Arc::new(std::sync::Barrier::new(2));
-        let continue_read = Arc::new(std::sync::Barrier::new(2));
-        let reader = {
-            let output = output.clone();
-            let opened = Arc::clone(&opened);
-            let continue_read = Arc::clone(&continue_read);
-            std::thread::spawn(move || {
-                read_codex_output_blocking(&output, || {
-                    opened.wait();
-                    continue_read.wait();
-                })
-            })
-        };
-
-        opened.wait();
-        std::fs::rename(&output, &opened_output).unwrap();
-        std::fs::write(&output, &replacement).unwrap();
-        continue_read.wait();
-
-        let error = reader.join().unwrap().unwrap_err();
-        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
-        assert_eq!(std::fs::read(opened_output).unwrap(), original);
-        assert_eq!(std::fs::read(output).unwrap(), replacement);
-    }
-
-    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "40-process stress gate; run explicitly to avoid starving unrelated process tests"]
     async fn forty_legacy_runs_with_shared_codex_home_are_execution_scoped() {
@@ -1449,28 +1501,27 @@ mod tests {
         std::fs::write(
             &executable,
             "#!/bin/sh\n\
-             request_dir=''\n\
              image_path=''\n\
              while [ \"$#\" -gt 0 ]; do\n\
-               if [ \"$1\" = '--cd' ]; then shift; request_dir=\"$1\"; fi\n\
                if [ \"$1\" = '--image' ]; then shift; image_path=\"$1\"; fi\n\
                shift\n\
              done\n\
              /bin/cat >/dev/null\n\
-             /bin/cp \"$image_path\" \"$request_dir/final.png.partial\"\n\
-             /bin/mv \"$request_dir/final.png.partial\" \"$request_dir/final.png\"\n\
-             printf '{\"type\":\"item.completed\",\"item\":{\"type\":\"image_generation_call\"}}\\n'\n",
+             thread_id='019fd666-0416-7da2-bcc3-7f2f51efd3c8'\n\
+             call_id='call_concurrent_image'\n\
+             output_dir=\"$CODEX_HOME/generated_images/$thread_id\"\n\
+             /bin/mkdir -p \"$output_dir\"\n\
+             /bin/chmod 700 \"$CODEX_HOME/generated_images\" \"$output_dir\"\n\
+             /bin/cp \"$image_path\" \"$output_dir/$call_id.png\"\n\
+             /bin/chmod 600 \"$output_dir/$call_id.png\"\n\
+             printf '{\"type\":\"thread.started\",\"thread_id\":\"%s\"}\\n' \"$thread_id\"\n\
+             printf '{\"type\":\"item.completed\",\"item\":{\"type\":\"image_generation_call\",\"id\":\"%s\"}}\\n' \"$call_id\"\n",
         )
         .unwrap();
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let mut config = test_config();
-        config.codex_home = Some(
-            temp.path()
-                .join("shared-codex-home")
-                .to_string_lossy()
-                .into_owned(),
-        );
+        configure_private_test_codex_home(&mut config, temp.path(), "shared-codex-home");
         config.cleanup_codex_outputs = true;
         config.request_timeout = Duration::from_secs(30);
         let config = Arc::new(config);
@@ -1584,7 +1635,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_size_prompt_includes_reduced_aspect_ratio() {
+    fn explicit_size_prompt_uses_factory_owned_handoff() {
         let job = GenerationJob {
             request_id: "req-test".to_string(),
             model: "gpt-image-2".to_string(),
@@ -1605,16 +1656,16 @@ mod tests {
         assert!(prompt.contains("exactly 1536x1024 pixels"));
         assert!(prompt.contains("宽高比必须为 3:2"));
         assert!(prompt.contains("不透明背景"));
-        assert!(prompt.contains("不要用 sips"));
-        assert!(prompt.contains("/tmp/out/provider-output.png"));
-        assert!(prompt.contains("/bin/cp /tmp/out/provider-output.png /tmp/out/final.png.partial"));
-        assert!(prompt.contains("/bin/mv /tmp/out/final.png.partial /tmp/out/final.png"));
-        assert!(prompt.contains("不要使用硬链接或符号链接"));
-        assert!(prompt.contains("/tmp/out/final.png"));
+        assert!(prompt.contains("sips"));
+        assert!(prompt.contains("只调用一次当前启用的图像生成工具"));
+        assert!(prompt.contains("由 Factory 从该工具的受控原生产物路径完成封存"));
+        assert!(!prompt.contains("/tmp/out"));
+        assert!(!prompt.contains("/bin/cp"));
+        assert!(!prompt.contains("/bin/mv"));
     }
 
     #[test]
-    fn executor_prompt_seals_media_bytes_under_a_non_media_filename() {
+    fn executor_prompt_does_not_delegate_handoff_to_the_agent() {
         let job = GenerationJob {
             request_id: "req-test".to_string(),
             model: "gpt-image-2".to_string(),
@@ -1638,18 +1689,13 @@ mod tests {
             "sealed-output.bin",
         );
 
-        assert!(prompt.contains("/tmp/workspace/provider-output.png"));
-        assert!(prompt.contains(
-            "/bin/cp /tmp/workspace/provider-output.png /tmp/output/sealed-output.bin.partial"
-        ));
-        assert!(prompt.contains(
-            "/bin/mv /tmp/output/sealed-output.bin.partial /tmp/output/sealed-output.bin"
-        ));
-        assert!(!prompt.contains("/bin/rm /tmp/workspace/provider-output.png"));
-        assert!(prompt.contains(
-            "不要删除 /tmp/workspace/provider-output.png；runner 会在读取并封存结果后清理隔离工作目录"
-        ));
-        assert!(!prompt.contains("/tmp/output/final.png"));
+        assert!(prompt.contains("只调用一次当前启用的图像生成工具"));
+        assert!(prompt.contains("由 Factory 从该工具的受控原生产物路径完成封存"));
+        assert!(!prompt.contains("/tmp/workspace"));
+        assert!(!prompt.contains("/tmp/output"));
+        assert!(!prompt.contains("sealed-output.bin"));
+        assert!(!prompt.contains("/bin/cp"));
+        assert!(!prompt.contains("/bin/mv"));
     }
 
     #[test]
@@ -1701,7 +1747,7 @@ mod tests {
     }
 
     #[test]
-    fn prompt_mentions_candidate_index_and_final_jpeg_filename() {
+    fn prompt_mentions_candidate_index_without_a_handoff_filename() {
         let job = GenerationJob {
             request_id: "req-test".to_string(),
             model: "gpt-image-2".to_string(),
@@ -1726,7 +1772,8 @@ mod tests {
         assert!(prompt.contains("不要在同一张画布里拼出多张图"));
         assert!(prompt.contains("第 2/3 张候选图片"));
         assert!(prompt.contains("独立候选结果"));
-        assert!(prompt.contains("/tmp/out/final.jpg"));
+        assert!(prompt.contains("输出格式 jpeg"));
+        assert!(!prompt.contains("/tmp/out"));
     }
 
     #[test]
@@ -1768,40 +1815,6 @@ mod tests {
                 "/tmp/reference-3.jpg",
             ]
         );
-    }
-
-    #[tokio::test]
-    async fn oversized_codex_output_is_rejected_before_reading() {
-        let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("final.png");
-        let file = std::fs::File::create(&path).unwrap();
-        file.set_len(MAX_CODEX_OUTPUT_BYTES + 1).unwrap();
-
-        assert!(read_codex_output(&path).await.is_err());
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn symlinked_codex_output_is_rejected() {
-        let root = tempfile::tempdir().unwrap();
-        let target = root.path().join("target.png");
-        let link = root.path().join("final.png");
-        std::fs::write(&target, png_with_dimensions(1, 1)).unwrap();
-        std::os::unix::fs::symlink(&target, &link).unwrap();
-
-        assert!(read_codex_output(&link).await.is_err());
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn hardlinked_codex_output_is_rejected() {
-        let root = tempfile::tempdir().unwrap();
-        let target = root.path().join("target.png");
-        let link = root.path().join("final.png");
-        std::fs::write(&target, png_with_dimensions(1, 1)).unwrap();
-        std::fs::hard_link(&target, &link).unwrap();
-
-        assert!(read_codex_output(&link).await.is_err());
     }
 
     #[test]

@@ -37,7 +37,7 @@ use crate::{
         FilesystemRunnerJournal, LaunchDecision,
         process::{
             ExecutionSpool, ProcessObservation, ProcessSpoolError, ProcessTerminal,
-            ProviderProcessIdentity, RunnerLock, sha256,
+            ProviderProcessIdentity, RunnerLock, WorkspaceOutputSnapshot, sha256,
         },
     },
 };
@@ -108,12 +108,26 @@ struct CodexSpawnObserver {
 #[derive(Default)]
 struct CodexEventSummary {
     thread_id: Option<Uuid>,
+    thread_id_ambiguous: bool,
+    image_call_id: Option<String>,
+    image_call_ambiguous: bool,
+    native_handoff: CodexNativeHandoff,
     saw_image_generation: bool,
     completed_image_generation: bool,
     stdout_truncated: bool,
     stderr_truncated: bool,
     stderr_present: bool,
     malformed_events: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum CodexNativeHandoff {
+    #[default]
+    NotAttempted,
+    Sealed,
+    Missing,
+    Invalid,
+    Unavailable,
 }
 
 impl CodexProcessSupervisor {
@@ -591,8 +605,6 @@ impl CliPolicy for CodexCliPolicy {
         }
         command = command
             .arg(request.workspace.as_os_str())?
-            .arg("--add-dir")?
-            .arg(request.output_dir.as_os_str())?
             .arg("--json")?
             .arg("-")?;
         for (name, value) in [
@@ -637,6 +649,52 @@ impl SpawnObserver for CodexSpawnObserver {
 
     fn observe_completion(&mut self, completion: &ProcessCompletion) -> Result<(), Self::Error> {
         self.events = summarize_codex_events(completion);
+        if self.events.completed_image_generation {
+            self.events.native_handoff = match self
+                .spool
+                .read_runtime_output(CODEX_RUNTIME_OUTPUT_FILE, MAX_CODEX_RUNTIME_OUTPUT_BYTES)
+            {
+                Ok(WorkspaceOutputSnapshot::Missing)
+                    if !self.events.thread_id_ambiguous && !self.events.image_call_ambiguous =>
+                {
+                    match (self.events.thread_id, self.events.image_call_id.as_deref()) {
+                        (Some(thread_id), Some(call_id)) => {
+                            match self.spool.seal_codex_extension_output(
+                                &thread_id.to_string(),
+                                call_id,
+                                CODEX_RUNTIME_OUTPUT_FILE,
+                                MAX_CODEX_RUNTIME_OUTPUT_BYTES,
+                            ) {
+                                Ok(true) => CodexNativeHandoff::Sealed,
+                                Ok(false) => CodexNativeHandoff::Missing,
+                                Err(ProcessSpoolError::Unavailable) => {
+                                    CodexNativeHandoff::Unavailable
+                                }
+                                Err(
+                                    ProcessSpoolError::InvalidInput
+                                    | ProcessSpoolError::Conflict
+                                    | ProcessSpoolError::Integrity,
+                                ) => CodexNativeHandoff::Invalid,
+                            }
+                        }
+                        _ => CodexNativeHandoff::NotAttempted,
+                    }
+                }
+                Ok(WorkspaceOutputSnapshot::Missing) => CodexNativeHandoff::Invalid,
+                Ok(WorkspaceOutputSnapshot::Incomplete)
+                | Ok(WorkspaceOutputSnapshot::Bytes(_))
+                | Err(
+                    ProcessSpoolError::InvalidInput
+                    | ProcessSpoolError::Conflict
+                    | ProcessSpoolError::Integrity,
+                ) => match self.spool.discard_runtime_output(CODEX_RUNTIME_OUTPUT_FILE) {
+                    Ok(()) => CodexNativeHandoff::Invalid,
+                    Err(ProcessSpoolError::Unavailable) => CodexNativeHandoff::Unavailable,
+                    Err(error) => return Err(error),
+                },
+                Err(ProcessSpoolError::Unavailable) => CodexNativeHandoff::Unavailable,
+            };
+        }
         Ok(())
     }
 }
@@ -670,12 +728,8 @@ fn summarize_codex_event_stream(
             summary.malformed_events = summary.malformed_events.saturating_add(1);
             continue;
         };
-        if event.get("type").and_then(serde_json::Value::as_str) == Some("thread.started") {
-            summary.thread_id = event
-                .get("thread_id")
-                .and_then(serde_json::Value::as_str)
-                .and_then(|value| Uuid::parse_str(value).ok());
-        }
+        record_codex_thread_id(&event, &mut summary);
+        record_codex_image_call_ids(&event, &mut summary);
         let image_event = codex_image_event_state(&event);
         if image_event.seen {
             summary.saw_image_generation = true;
@@ -685,6 +739,74 @@ fn summarize_codex_event_stream(
         }
     }
     summary
+}
+
+fn record_codex_image_call_ids(value: &serde_json::Value, summary: &mut CodexEventSummary) {
+    match value {
+        serde_json::Value::Object(fields) => {
+            let event_type = fields
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            let candidate = match event_type {
+                "image_generation_call" => fields.get("id"),
+                "image_generation_begin" | "image_generation_end" => fields.get("call_id"),
+                _ => None,
+            }
+            .and_then(serde_json::Value::as_str);
+            if let Some(candidate) = candidate {
+                if !valid_codex_image_call_id(candidate) {
+                    summary.image_call_id = None;
+                    summary.image_call_ambiguous = true;
+                } else if let Some(existing) = summary.image_call_id.as_deref() {
+                    if existing != candidate {
+                        summary.image_call_id = None;
+                        summary.image_call_ambiguous = true;
+                    }
+                } else if !summary.image_call_ambiguous {
+                    summary.image_call_id = Some(candidate.to_string());
+                }
+            }
+            for value in fields.values() {
+                record_codex_image_call_ids(value, summary);
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                record_codex_image_call_ids(value, summary);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn record_codex_thread_id(value: &serde_json::Value, summary: &mut CodexEventSummary) {
+    if value.get("type").and_then(serde_json::Value::as_str) != Some("thread.started") {
+        return;
+    }
+    let Some(candidate) = value
+        .get("thread_id")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|value| Uuid::parse_str(value).ok())
+    else {
+        return;
+    };
+    if let Some(existing) = summary.thread_id {
+        if existing != candidate {
+            summary.thread_id = None;
+            summary.thread_id_ambiguous = true;
+        }
+    } else if !summary.thread_id_ambiguous {
+        summary.thread_id = Some(candidate);
+    }
+}
+
+fn valid_codex_image_call_id(call_id: &str) -> bool {
+    !call_id.is_empty()
+        && call_id.len() <= 255 - ".png".len()
+        && call_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
 #[derive(Clone, Copy, Default)]
@@ -735,6 +857,23 @@ fn map_cli_runtime_error_with_events(
     error: RuntimeError,
     events: &CodexEventSummary,
 ) -> ChildOutcome {
+    if matches!(
+        error,
+        RuntimeError::Output(OutputError::Missing)
+            | RuntimeError::Output(OutputError::Unavailable(_))
+    ) {
+        match events.native_handoff {
+            CodexNativeHandoff::Invalid => {
+                return ChildOutcome::Failed("codex_image_output_disappeared");
+            }
+            CodexNativeHandoff::Unavailable => {
+                return ChildOutcome::Uncertain("service_unavailable");
+            }
+            CodexNativeHandoff::NotAttempted
+            | CodexNativeHandoff::Sealed
+            | CodexNativeHandoff::Missing => {}
+        }
+    }
     if events.completed_image_generation
         && matches!(
             error,
@@ -1157,18 +1296,51 @@ mod tests {
         let thread_id = Uuid::new_v4();
         let stdout = format!(
             "{{\"type\":\"thread.started\",\"thread_id\":\"{thread_id}\"}}\n\
-             {{\"type\":\"item.completed\",\"item\":{{\"type\":\"image_generation_call\"}}}}\n\
+             {{\"type\":\"item.completed\",\"item\":{{\"type\":\"image_generation_call\",\"id\":\"call_exact_image\"}}}}\n\
              not-json\n"
         );
 
         let summary = summarize_codex_event_stream(stdout.as_bytes(), false, b"warning", true);
 
         assert_eq!(summary.thread_id, Some(thread_id));
+        assert_eq!(summary.image_call_id.as_deref(), Some("call_exact_image"));
+        assert!(!summary.image_call_ambiguous);
         assert!(summary.saw_image_generation);
         assert!(summary.completed_image_generation);
         assert_eq!(summary.malformed_events, 1);
         assert!(summary.stderr_present);
         assert!(summary.stderr_truncated);
+    }
+
+    #[test]
+    fn multiple_native_image_call_ids_fail_closed() {
+        let thread_id = Uuid::new_v4();
+        let stdout = format!(
+            "{{\"type\":\"thread.started\",\"thread_id\":\"{thread_id}\"}}\n\
+             {{\"type\":\"item.started\",\"item\":{{\"type\":\"image_generation_call\",\"id\":\"call_first\"}}}}\n\
+             {{\"type\":\"item.completed\",\"item\":{{\"type\":\"image_generation_call\",\"id\":\"call_second\"}}}}\n"
+        );
+
+        let summary = summarize_codex_event_stream(stdout.as_bytes(), false, &[], false);
+
+        assert!(summary.image_call_id.is_none());
+        assert!(summary.image_call_ambiguous);
+    }
+
+    #[test]
+    fn multiple_thread_ids_fail_closed() {
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        let stdout = format!(
+            "{{\"type\":\"thread.started\",\"thread_id\":\"{first}\"}}\n\
+             {{\"type\":\"thread.started\",\"thread_id\":\"{second}\"}}\n\
+             {{\"type\":\"item.completed\",\"item\":{{\"type\":\"image_generation_call\",\"id\":\"call_exact\"}}}}\n"
+        );
+
+        let summary = summarize_codex_event_stream(stdout.as_bytes(), false, &[], false);
+
+        assert!(summary.thread_id.is_none());
+        assert!(summary.thread_id_ambiguous);
     }
 
     #[test]
@@ -1342,8 +1514,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn transient_native_file_with_sealed_handoff_succeeds_without_polling() {
-        let fixture = CodexFixture::transient_native_with_sealed_output();
+    async fn exact_native_artifact_is_sealed_by_factory_without_polling() {
+        let fixture = CodexFixture::exact_native_output();
         let mut command = fixture.command();
         command.output_format = "jpeg".to_string();
         command.output_compression = Some(80);
@@ -1372,6 +1544,36 @@ mod tests {
             spool.observe().unwrap(),
             ProcessObservation::Succeeded(SupervisedOutput::without_provider_cost(expected))
         );
+    }
+
+    #[tokio::test]
+    async fn agent_written_runtime_output_is_not_a_success_authority() {
+        let fixture = CodexFixture::agent_written_output_with_native();
+        let lease = fixture.lease();
+        let context = fixture.context(&lease);
+        fixture.journal.start_or_attach(&lease).unwrap();
+        fixture.supervisor.prepare(&lease, &context).await.unwrap();
+        assert_eq!(
+            fixture.journal.commit_launch(&lease).unwrap(),
+            LaunchDecision::LaunchOnce
+        );
+        let spool = ExecutionSpool::for_lease(&fixture.journal, &lease).unwrap();
+
+        run_codex_runner_child(fixture.journal.root_path(), lease.executor_execution_id)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            spool.observe().unwrap(),
+            ProcessObservation::Failed {
+                error_code: "codex_image_output_disappeared".to_string(),
+            }
+        );
+        let execution_root = fixture
+            .journal
+            .root_path()
+            .join(lease.executor_execution_id.simple().to_string());
+        assert!(!execution_root.join("output.bin").exists());
     }
 
     #[tokio::test]
@@ -1539,8 +1741,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn transient_output_is_never_published_after_failed_codex_exit() {
-        let fixture = CodexFixture::transient_workspace_output_on_failed_exit();
+    async fn native_output_is_never_published_after_failed_codex_exit() {
+        let fixture = CodexFixture::native_output_on_failed_exit();
         let lease = fixture.lease();
         let context = fixture.context(&lease);
         fixture.journal.start_or_attach(&lease).unwrap();
@@ -1714,7 +1916,7 @@ mod tests {
         fn new() -> Self {
             Self::with_script(|invocations, image, _root| {
                 format!(
-                    "#!/bin/sh\n/bin/cat >/dev/null\nprintf '1\\n' >> '{}'\n/bin/cp '{}' sealed-output.bin\n",
+                    "#!/bin/sh\nset -eu\n/bin/cat >/dev/null\nprintf '1\\n' >> '{}'\nthread_id='019fd9f5-badb-7dd3-8903-28ffded0ef54'\ncall_id='call_fixture_image'\noutput_dir=\"$CODEX_HOME/generated_images/$thread_id\"\n/bin/mkdir -p \"$output_dir\"\n/bin/chmod 700 \"$CODEX_HOME/generated_images\" \"$output_dir\"\n/bin/cp '{}' \"$output_dir/$call_id.png\"\n/bin/chmod 600 \"$output_dir/$call_id.png\"\nprintf '{{\"type\":\"thread.started\",\"thread_id\":\"%s\"}}\\n' \"$thread_id\"\nprintf '{{\"type\":\"item.completed\",\"item\":{{\"type\":\"image_generation_call\",\"id\":\"%s\"}}}}\\n' \"$call_id\"\n",
                     invocations.display(),
                     image.display()
                 )
@@ -1724,7 +1926,7 @@ mod tests {
         fn slow() -> Self {
             Self::with_script(|invocations, image, root| {
                 format!(
-                    "#!/bin/sh\n/bin/cat >/dev/null\nprintf '1\\n' >> '{}'\nprintf 'started\\n' > '{}'\n/bin/sleep 30\nprintf 'completed\\n' > '{}'\n/bin/cp '{}' sealed-output.bin\n",
+                    "#!/bin/sh\nset -eu\n/bin/cat >/dev/null\nprintf '1\\n' >> '{}'\nprintf 'started\\n' > '{}'\n/bin/sleep 30\nprintf 'completed\\n' > '{}'\nthread_id='019fd9f5-badb-7dd3-8903-28ffded0ef54'\ncall_id='call_slow_image'\noutput_dir=\"$CODEX_HOME/generated_images/$thread_id\"\n/bin/mkdir -p \"$output_dir\"\n/bin/chmod 700 \"$CODEX_HOME/generated_images\" \"$output_dir\"\n/bin/cp '{}' \"$output_dir/$call_id.png\"\n/bin/chmod 600 \"$output_dir/$call_id.png\"\nprintf '{{\"type\":\"thread.started\",\"thread_id\":\"%s\"}}\\n' \"$thread_id\"\nprintf '{{\"type\":\"item.completed\",\"item\":{{\"type\":\"image_generation_call\",\"id\":\"%s\"}}}}\\n' \"$call_id\"\n",
                     invocations.display(),
                     root.join("provider-started").display(),
                     root.join("provider-completed").display(),
@@ -1733,10 +1935,10 @@ mod tests {
             })
         }
 
-        fn transient_workspace_output_on_failed_exit() -> Self {
+        fn native_output_on_failed_exit() -> Self {
             Self::with_script(|invocations, image, _root| {
                 format!(
-                    "#!/bin/sh\nset -eu\n/bin/cat >/dev/null\nprintf '1\\n' >> '{}'\nworkspace=''\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = '--cd' ]; then\n    shift\n    workspace=\"$1\"\n    break\n  fi\n  shift\ndone\ntest -n \"$workspace\"\n/bin/cp '{}' \"$workspace/provider-output.png\"\n/bin/rm \"$workspace/provider-output.png\"\nexit 1\n",
+                    "#!/bin/sh\nset -eu\n/bin/cat >/dev/null\nprintf '1\\n' >> '{}'\nthread_id='019fd9f5-badb-7dd3-8903-28ffded0ef54'\ncall_id='call_failed_process_image'\noutput_dir=\"$CODEX_HOME/generated_images/$thread_id\"\n/bin/mkdir -p \"$output_dir\"\n/bin/chmod 700 \"$CODEX_HOME/generated_images\" \"$output_dir\"\n/bin/cp '{}' \"$output_dir/$call_id.png\"\n/bin/chmod 600 \"$output_dir/$call_id.png\"\nprintf '{{\"type\":\"thread.started\",\"thread_id\":\"%s\"}}\\n' \"$thread_id\"\nprintf '{{\"type\":\"item.completed\",\"item\":{{\"type\":\"image_generation_call\",\"id\":\"%s\"}}}}\\n' \"$call_id\"\nexit 1\n",
                     invocations.display(),
                     image.display(),
                 )
@@ -1746,18 +1948,29 @@ mod tests {
         fn transient_native_output_only() -> Self {
             Self::with_script(|invocations, image, _root| {
                 format!(
-                    "#!/bin/sh\nset -eu\n/bin/cat >/dev/null\nprintf '1\\n' >> '{}'\nthread_id='019fd9f5-badb-7dd3-8903-28ffded0ef54'\noutput_dir=\"$CODEX_HOME/generated_images/$thread_id\"\n/bin/mkdir -p \"$output_dir\"\n/bin/cp '{}' \"$output_dir/generated.png\"\n/bin/rm \"$output_dir/generated.png\"\nprintf '{{\"type\":\"thread.started\",\"thread_id\":\"%s\"}}\\n' \"$thread_id\"\nprintf '{{\"type\":\"item.completed\",\"item\":{{\"type\":\"image_generation_call\"}}}}\\n'\n",
+                    "#!/bin/sh\nset -eu\n/bin/cat >/dev/null\nprintf '1\\n' >> '{}'\nthread_id='019fd9f5-badb-7dd3-8903-28ffded0ef54'\ncall_id='call_transient_image'\noutput_dir=\"$CODEX_HOME/generated_images/$thread_id\"\n/bin/mkdir -p \"$output_dir\"\n/bin/chmod 700 \"$CODEX_HOME/generated_images\" \"$output_dir\"\n/bin/cp '{}' \"$output_dir/$call_id.png\"\n/bin/rm \"$output_dir/$call_id.png\"\nprintf '{{\"type\":\"thread.started\",\"thread_id\":\"%s\"}}\\n' \"$thread_id\"\nprintf '{{\"type\":\"item.completed\",\"item\":{{\"type\":\"image_generation_call\",\"id\":\"%s\"}}}}\\n' \"$call_id\"\n",
                     invocations.display(),
                     image.display(),
                 )
             })
         }
 
-        fn transient_native_with_sealed_output() -> Self {
+        fn exact_native_output() -> Self {
             Self::with_script(|invocations, image, _root| {
                 format!(
-                    "#!/bin/sh\nset -eu\n/bin/cat >/dev/null\nprintf '1\\n' >> '{}'\nthread_id='019fd9f5-badb-7dd3-8903-28ffded0ef54'\noutput_dir=\"$CODEX_HOME/generated_images/$thread_id\"\n/bin/mkdir -p \"$output_dir\"\n/bin/cp '{}' \"$output_dir/generated.png\"\n/bin/cp \"$output_dir/generated.png\" sealed-output.bin.partial\n/bin/mv sealed-output.bin.partial sealed-output.bin\n/bin/rm \"$output_dir/generated.png\"\nprintf '{{\"type\":\"thread.started\",\"thread_id\":\"%s\"}}\\n' \"$thread_id\"\nprintf '{{\"type\":\"item.completed\",\"item\":{{\"type\":\"image_generation_call\"}}}}\\n'\n",
+                    "#!/bin/sh\nset -eu\n/bin/cat >/dev/null\nprintf '1\\n' >> '{}'\nthread_id='019fd9f5-badb-7dd3-8903-28ffded0ef54'\ncall_id='call_durable_image'\noutput_dir=\"$CODEX_HOME/generated_images/$thread_id\"\n/bin/mkdir -p \"$output_dir\"\n/bin/chmod 700 \"$CODEX_HOME/generated_images\" \"$output_dir\"\n/bin/cp '{}' \"$output_dir/$call_id.png\"\n/bin/chmod 600 \"$output_dir/$call_id.png\"\nprintf '{{\"type\":\"thread.started\",\"thread_id\":\"%s\"}}\\n' \"$thread_id\"\nprintf '{{\"type\":\"item.completed\",\"item\":{{\"type\":\"image_generation_call\",\"id\":\"%s\"}}}}\\n' \"$call_id\"\n",
                     invocations.display(),
+                    image.display(),
+                )
+            })
+        }
+
+        fn agent_written_output_with_native() -> Self {
+            Self::with_script(|invocations, image, _root| {
+                format!(
+                    "#!/bin/sh\nset -eu\n/bin/cat >/dev/null\nprintf '1\\n' >> '{}'\nthread_id='019fd9f5-badb-7dd3-8903-28ffded0ef54'\ncall_id='call_untrusted_handoff'\noutput_dir=\"$CODEX_HOME/generated_images/$thread_id\"\n/bin/mkdir -p \"$output_dir\"\n/bin/chmod 700 \"$CODEX_HOME/generated_images\" \"$output_dir\"\n/bin/cp '{}' \"$output_dir/$call_id.png\"\n/bin/chmod 600 \"$output_dir/$call_id.png\"\n/bin/cp '{}' sealed-output.bin\nprintf '{{\"type\":\"thread.started\",\"thread_id\":\"%s\"}}\\n' \"$thread_id\"\nprintf '{{\"type\":\"item.completed\",\"item\":{{\"type\":\"image_generation_call\",\"id\":\"%s\"}}}}\\n' \"$call_id\"\n",
+                    invocations.display(),
+                    image.display(),
                     image.display(),
                 )
             })
@@ -1777,7 +1990,7 @@ mod tests {
             Self::with_script_and_journal(journal, |invocations, image, _root| {
                 fs::write(image, png_bytes(u32::from(marker) + 1, 1)).unwrap();
                 format!(
-                    "#!/bin/sh\nset -eu\n/bin/cat >/dev/null\nprintf '1\\n' >> '{}'\n/bin/cp '{}' sealed-output.bin.partial\n/bin/mv sealed-output.bin.partial sealed-output.bin\n",
+                    "#!/bin/sh\nset -eu\n/bin/cat >/dev/null\nprintf '1\\n' >> '{}'\nthread_id='019fd9f5-badb-7dd3-8903-28ffded0ef54'\ncall_id='call_concurrent_image'\noutput_dir=\"$CODEX_HOME/generated_images/$thread_id\"\n/bin/mkdir -p \"$output_dir\"\n/bin/chmod 700 \"$CODEX_HOME/generated_images\" \"$output_dir\"\n/bin/cp '{}' \"$output_dir/$call_id.png\"\n/bin/chmod 600 \"$output_dir/$call_id.png\"\nprintf '{{\"type\":\"thread.started\",\"thread_id\":\"%s\"}}\\n' \"$thread_id\"\nprintf '{{\"type\":\"item.completed\",\"item\":{{\"type\":\"image_generation_call\",\"id\":\"%s\"}}}}\\n' \"$call_id\"\n",
                     invocations.display(),
                     image.display(),
                 )

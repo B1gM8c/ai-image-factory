@@ -46,6 +46,10 @@ pub(crate) struct ExecutionSpool {
     provider_attempt: PrivateDirectory,
 }
 
+pub(crate) struct CodexExtensionOutputRoot {
+    directory: PrivateDirectory,
+}
+
 struct PrivateDirectory {
     fd: OwnedFd,
     path: PathBuf,
@@ -113,7 +117,6 @@ pub(crate) enum ProcessObservation {
 }
 
 #[derive(Debug, Eq, PartialEq)]
-#[cfg(test)]
 pub(crate) enum WorkspaceOutputSnapshot {
     Missing,
     Incomplete,
@@ -422,7 +425,6 @@ impl ExecutionSpool {
         read_workspace_output(&self.workspace.fd, filename, max_bytes)
     }
 
-    #[cfg(test)]
     pub(crate) fn read_runtime_output(
         &self,
         filename: &str,
@@ -433,6 +435,44 @@ impl ExecutionSpool {
         }
         validate_bound_path(&self.runtime_home.path, &self.runtime_home.fd)?;
         read_workspace_output(&self.runtime_home.fd, filename, max_bytes)
+    }
+
+    pub(crate) fn discard_runtime_output(&self, filename: &str) -> Result<(), ProcessSpoolError> {
+        if !valid_single_component(filename) {
+            return Err(ProcessSpoolError::InvalidInput);
+        }
+        validate_bound_path(&self.runtime_home.path, &self.runtime_home.fd)?;
+        match rfs::unlinkat(&self.runtime_home.fd, filename, AtFlags::empty()) {
+            Ok(()) => rfs::fsync(&self.runtime_home.fd).map_err(|_| ProcessSpoolError::Unavailable),
+            Err(Errno::NOENT) => Ok(()),
+            Err(_) => Err(ProcessSpoolError::Integrity),
+        }
+    }
+
+    pub(crate) fn seal_codex_extension_output(
+        &self,
+        thread_id: &str,
+        call_id: &str,
+        output_filename: &str,
+        max_bytes: u64,
+    ) -> Result<bool, ProcessSpoolError> {
+        if !valid_single_component(output_filename) || max_bytes == 0 {
+            return Err(ProcessSpoolError::InvalidInput);
+        }
+        validate_bound_path(&self.codex_home.path, &self.codex_home.fd)?;
+        validate_bound_path(&self.runtime_home.path, &self.runtime_home.fd)?;
+        let Some(bytes) = read_codex_extension_output_at(
+            &self.codex_home.fd,
+            thread_id,
+            call_id,
+            max_bytes,
+            || {},
+        )?
+        else {
+            return Ok(false);
+        };
+        publish_or_compare(&self.runtime_home.fd, output_filename, &bytes, max_bytes)?;
+        Ok(true)
     }
 
     pub(crate) fn codex_home_path(&self) -> Result<&Path, ProcessSpoolError> {
@@ -588,6 +628,23 @@ impl ExecutionSpool {
     #[cfg(test)]
     fn root_path(&self) -> &Path {
         &self.path
+    }
+}
+
+impl CodexExtensionOutputRoot {
+    pub(crate) fn open(codex_home: &Path) -> Result<Self, ProcessSpoolError> {
+        open_private_directory(codex_home, ProcessSpoolError::Integrity)
+            .map(|directory| Self { directory })
+    }
+
+    pub(crate) fn read(
+        &self,
+        thread_id: &str,
+        call_id: &str,
+        max_bytes: u64,
+    ) -> Result<Option<Vec<u8>>, ProcessSpoolError> {
+        validate_bound_path(&self.directory.path, &self.directory.fd)?;
+        read_codex_extension_output_at(&self.directory.fd, thread_id, call_id, max_bytes, || {})
     }
 }
 
@@ -1011,12 +1068,23 @@ fn read_optional_bytes(
     Ok(Some(bytes))
 }
 
-#[cfg(test)]
 fn read_workspace_output(
     directory: &OwnedFd,
     name: &str,
     max_bytes: u64,
 ) -> Result<WorkspaceOutputSnapshot, ProcessSpoolError> {
+    read_workspace_output_with_hook(directory, name, max_bytes, || {})
+}
+
+fn read_workspace_output_with_hook<F>(
+    directory: &OwnedFd,
+    name: &str,
+    max_bytes: u64,
+    after_open: F,
+) -> Result<WorkspaceOutputSnapshot, ProcessSpoolError>
+where
+    F: FnOnce(),
+{
     let fd = match rfs::openat(
         directory,
         name,
@@ -1032,6 +1100,7 @@ fn read_workspace_output(
     let Some(size) = validate_workspace_output_stat(&initial, max_bytes)? else {
         return Ok(WorkspaceOutputSnapshot::Incomplete);
     };
+    after_open();
     let mut bytes = Vec::with_capacity(size);
     Read::by_ref(&mut file)
         .take(max_bytes + 1)
@@ -1064,7 +1133,6 @@ fn read_workspace_output(
     Ok(WorkspaceOutputSnapshot::Bytes(bytes))
 }
 
-#[cfg(test)]
 fn validate_workspace_output_stat(
     stat: &rfs::Stat,
     max_bytes: u64,
@@ -1086,7 +1154,6 @@ fn validate_workspace_output_stat(
         .map_err(|_| ProcessSpoolError::Integrity)
 }
 
-#[cfg(test)]
 fn same_file_snapshot(first: &rfs::Stat, second: &rfs::Stat) -> bool {
     first.st_dev == second.st_dev
         && first.st_ino == second.st_ino
@@ -1102,6 +1169,92 @@ fn same_file_snapshot(first: &rfs::Stat, second: &rfs::Stat) -> bool {
 }
 
 #[cfg(test)]
+pub(crate) fn read_codex_extension_output(
+    codex_home: &Path,
+    thread_id: &str,
+    call_id: &str,
+    max_bytes: u64,
+) -> Result<Option<Vec<u8>>, ProcessSpoolError> {
+    if max_bytes == 0 {
+        return Err(ProcessSpoolError::InvalidInput);
+    }
+    validate_private_directory_path(codex_home, ProcessSpoolError::Integrity)?;
+    let root = rfs::open(
+        codex_home,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|_| ProcessSpoolError::Integrity)?;
+    read_codex_extension_output_at(&root, thread_id, call_id, max_bytes, || {})
+}
+
+fn read_codex_extension_output_at<F>(
+    codex_home: &OwnedFd,
+    thread_id: &str,
+    call_id: &str,
+    max_bytes: u64,
+    after_open: F,
+) -> Result<Option<Vec<u8>>, ProcessSpoolError>
+where
+    F: FnOnce(),
+{
+    if Uuid::parse_str(thread_id).map(|value| value.to_string()) != Ok(thread_id.to_string())
+        || !valid_codex_call_id(call_id)
+        || max_bytes == 0
+    {
+        return Err(ProcessSpoolError::InvalidInput);
+    }
+    let generated = match open_private_artifact_directory_at(codex_home, "generated_images")? {
+        Some(directory) => directory,
+        None => return Ok(None),
+    };
+    let thread = match open_private_artifact_directory_at(&generated, thread_id)? {
+        Some(directory) => directory,
+        None => return Ok(None),
+    };
+    let filename = format!("{call_id}.png");
+    match read_workspace_output_with_hook(&thread, &filename, max_bytes, after_open)? {
+        WorkspaceOutputSnapshot::Missing => Ok(None),
+        WorkspaceOutputSnapshot::Incomplete => Err(ProcessSpoolError::Integrity),
+        WorkspaceOutputSnapshot::Bytes(bytes) => Ok(Some(bytes)),
+    }
+}
+
+fn valid_codex_call_id(call_id: &str) -> bool {
+    !call_id.is_empty()
+        && call_id.len() <= 255 - ".png".len()
+        && call_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+fn open_private_artifact_directory_at(
+    parent: &OwnedFd,
+    name: &str,
+) -> Result<Option<OwnedFd>, ProcessSpoolError> {
+    if !valid_single_component(name) {
+        return Err(ProcessSpoolError::InvalidInput);
+    }
+    let fd = match rfs::openat(
+        parent,
+        name,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(fd) => fd,
+        Err(Errno::NOENT) => return Ok(None),
+        Err(_) => return Err(ProcessSpoolError::Integrity),
+    };
+    let stat = rfs::fstat(&fd).map_err(|_| ProcessSpoolError::Unavailable)?;
+    if FileType::from_raw_mode(stat.st_mode) != FileType::Directory
+        || stat.st_uid != unsafe { libc::geteuid() }
+        || Mode::from_raw_mode(stat.st_mode).bits() & 0o077 != 0
+    {
+        return Err(ProcessSpoolError::Integrity);
+    }
+    Ok(Some(fd))
+}
+
 fn valid_single_component(name: &str) -> bool {
     let mut components = Path::new(name).components();
     matches!(components.next(), Some(Component::Normal(_)))
@@ -1474,6 +1627,165 @@ mod tests {
                 .unwrap(),
             WorkspaceOutputSnapshot::Bytes(b"complete-image".to_vec())
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_extension_output_is_bound_to_exact_thread_and_call() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_temp, journal, lease) = fixture();
+        let spool = ExecutionSpool::for_lease(&journal, &lease).unwrap();
+        let thread_id = "019fd9f5-badb-7dd3-8903-28ffded0ef54";
+        let call_id = "call_exact_image";
+        assert_eq!(
+            read_codex_extension_output(spool.codex_home_path().unwrap(), thread_id, call_id, 1024)
+                .unwrap(),
+            None
+        );
+        let generated = spool.codex_home_path().unwrap().join("generated_images");
+        let thread = generated.join(thread_id);
+        fs::create_dir(&generated).unwrap();
+        fs::create_dir(&thread).unwrap();
+        fs::set_permissions(&generated, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&thread, fs::Permissions::from_mode(0o700)).unwrap();
+        let output = thread.join(format!("{call_id}.png"));
+        fs::write(&output, b"exact-native-image").unwrap();
+        fs::set_permissions(&output, fs::Permissions::from_mode(0o600)).unwrap();
+
+        assert_eq!(
+            read_codex_extension_output(spool.codex_home_path().unwrap(), thread_id, call_id, 1024)
+                .unwrap(),
+            Some(b"exact-native-image".to_vec())
+        );
+        assert!(
+            spool
+                .seal_codex_extension_output(thread_id, call_id, "sealed-output.bin", 1024)
+                .unwrap()
+        );
+        assert_eq!(
+            spool
+                .read_runtime_output("sealed-output.bin", 1024)
+                .unwrap(),
+            WorkspaceOutputSnapshot::Bytes(b"exact-native-image".to_vec())
+        );
+        assert_eq!(
+            read_codex_extension_output(
+                spool.codex_home_path().unwrap(),
+                thread_id,
+                "call_other_image",
+                1024,
+            )
+            .unwrap(),
+            None
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_extension_output_rejects_aliases_bounds_and_unsafe_identifiers() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let (temp, journal, lease) = fixture();
+        let spool = ExecutionSpool::for_lease(&journal, &lease).unwrap();
+        let thread_id = "019fd9f5-badb-7dd3-8903-28ffded0ef54";
+        let call_id = "call_exact_image";
+        let generated = spool.codex_home_path().unwrap().join("generated_images");
+        let thread = generated.join(thread_id);
+        fs::create_dir(&generated).unwrap();
+        fs::create_dir(&thread).unwrap();
+        fs::set_permissions(&generated, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&thread, fs::Permissions::from_mode(0o700)).unwrap();
+        let output = thread.join(format!("{call_id}.png"));
+        let outside = temp.path().join("outside.png");
+        fs::write(&outside, b"outside").unwrap();
+
+        symlink(&outside, &output).unwrap();
+        assert_eq!(
+            read_codex_extension_output(spool.codex_home_path().unwrap(), thread_id, call_id, 1024),
+            Err(ProcessSpoolError::Integrity)
+        );
+        fs::remove_file(&output).unwrap();
+        fs::hard_link(&outside, &output).unwrap();
+        assert_eq!(
+            read_codex_extension_output(spool.codex_home_path().unwrap(), thread_id, call_id, 1024),
+            Err(ProcessSpoolError::Integrity)
+        );
+        fs::remove_file(&output).unwrap();
+        let file = fs::File::create(&output).unwrap();
+        file.set_len(1025).unwrap();
+        fs::set_permissions(&output, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            read_codex_extension_output(spool.codex_home_path().unwrap(), thread_id, call_id, 1024),
+            Err(ProcessSpoolError::Integrity)
+        );
+        assert_eq!(
+            read_codex_extension_output(
+                spool.codex_home_path().unwrap(),
+                "../../other-thread",
+                call_id,
+                1024,
+            ),
+            Err(ProcessSpoolError::InvalidInput)
+        );
+        assert_eq!(
+            read_codex_extension_output(
+                spool.codex_home_path().unwrap(),
+                thread_id,
+                "../other-call",
+                1024,
+            ),
+            Err(ProcessSpoolError::InvalidInput)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_extension_output_rejects_same_name_replacement_after_open() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_temp, journal, lease) = fixture();
+        let spool = ExecutionSpool::for_lease(&journal, &lease).unwrap();
+        let thread_id = "019fd9f5-badb-7dd3-8903-28ffded0ef54";
+        let call_id = "call_exact_image";
+        let generated = spool.codex_home_path().unwrap().join("generated_images");
+        let thread = generated.join(thread_id);
+        fs::create_dir(&generated).unwrap();
+        fs::create_dir(&thread).unwrap();
+        fs::set_permissions(&generated, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&thread, fs::Permissions::from_mode(0o700)).unwrap();
+        let output = thread.join(format!("{call_id}.png"));
+        let displaced = thread.join("displaced.png");
+        fs::write(&output, b"original-native-image").unwrap();
+        fs::set_permissions(&output, fs::Permissions::from_mode(0o600)).unwrap();
+        let opened = Arc::new(std::sync::Barrier::new(2));
+        let continue_read = Arc::new(std::sync::Barrier::new(2));
+        let reader = {
+            let opened = Arc::clone(&opened);
+            let continue_read = Arc::clone(&continue_read);
+            std::thread::spawn(move || {
+                read_codex_extension_output_at(
+                    &spool.codex_home.fd,
+                    thread_id,
+                    call_id,
+                    1024,
+                    || {
+                        opened.wait();
+                        continue_read.wait();
+                    },
+                )
+            })
+        };
+
+        opened.wait();
+        fs::rename(&output, &displaced).unwrap();
+        fs::write(&output, b"replacement-native-image").unwrap();
+        fs::set_permissions(&output, fs::Permissions::from_mode(0o600)).unwrap();
+        continue_read.wait();
+
+        assert_eq!(reader.join().unwrap(), Err(ProcessSpoolError::Integrity));
+        assert_eq!(fs::read(displaced).unwrap(), b"original-native-image");
+        assert_eq!(fs::read(output).unwrap(), b"replacement-native-image");
     }
 
     #[cfg(unix)]
