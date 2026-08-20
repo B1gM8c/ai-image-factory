@@ -664,59 +664,27 @@ async fn run_codex_child(
         Err(error) => map_cli_runtime_error(error),
     };
     match outcome {
-        ChildOutcome::Succeeded(bytes) => match normalize_captured_image(
-            bytes,
-            &job.size,
-            &job.output_format,
-            job.output_compression,
-        ) {
-            Ok(bytes) => ChildOutcome::Succeeded(bytes),
-            Err(()) => ChildOutcome::Failed("codex_ephemeral_output_invalid"),
-        },
+        ChildOutcome::Succeeded(bytes) => {
+            match normalize_captured_image(bytes, &job.output_format, job.output_compression) {
+                Ok(bytes) => ChildOutcome::Succeeded(bytes),
+                Err(()) => ChildOutcome::Failed("codex_ephemeral_output_invalid"),
+            }
+        }
         outcome => outcome,
     }
 }
 
 fn normalize_captured_image(
     bytes: Vec<u8>,
-    requested_size: &str,
     output_format: &str,
     output_compression: Option<u8>,
 ) -> Result<Vec<u8>, ()> {
-    let reader = image::ImageReader::new(Cursor::new(&bytes))
-        .with_guessed_format()
-        .map_err(|_| ())?;
-    let actual_format = reader.format().ok_or(())?;
-    let actual_dimensions = reader.into_dimensions().map_err(|_| ())?;
-    let requested_format = match output_format {
-        "png" => image::ImageFormat::Png,
-        "jpeg" => image::ImageFormat::Jpeg,
-        "webp" => image::ImageFormat::WebP,
-        _ => return Err(()),
-    };
-    let symbolic_ratio_needs_normalization =
-        match crate::size::parse_size_constraint(requested_size) {
-            Some(crate::size::SizeConstraint::AspectRatio { width, height }) => {
-                !crate::size::aspect_ratio_matches(
-                    actual_dimensions.0,
-                    actual_dimensions.1,
-                    width,
-                    height,
-                )
-            }
-            Some(_) => false,
-            None => return Err(()),
-        };
-    if actual_format == requested_format && !symbolic_ratio_needs_normalization {
-        return Ok(bytes);
-    }
-
     // Codex's native image tool can emit PNG even when the Images API caller
-    // requested JPEG or WebP, and native dimensions can drift slightly from a
-    // requested symbolic ratio. Normalize both in the trusted gateway layer.
+    // requested JPEG or WebP. Always use the trusted gateway normalization
+    // path so validation, metadata stripping, alpha flattening, compression,
+    // and geometry preservation cannot diverge from inline execution.
     let mut images = crate::core::normalize_generated_images(
         vec![crate::core::GeneratedImage { bytes }],
-        requested_size,
         output_format,
         output_compression,
     )
@@ -1875,7 +1843,7 @@ mod tests {
         let fixture = CodexFixture::ephemeral_workspace_output(0);
         let lease = fixture.lease();
         let context = fixture.context(&lease);
-        let expected = fs::read(fixture._temp.path().join("source.png")).unwrap();
+        let expected = normalized_fixture_png(&fixture._temp.path().join("source.png"));
         fixture.journal.start_or_attach(&lease).unwrap();
         fixture.supervisor.prepare(&lease, &context).await.unwrap();
         assert_eq!(
@@ -1927,7 +1895,7 @@ mod tests {
         let fixture = CodexFixture::disappearing_runtime_output();
         let lease = fixture.lease();
         let context = fixture.context(&lease);
-        let expected = fs::read(fixture._temp.path().join("source.png")).unwrap();
+        let expected = normalized_fixture_png(&fixture._temp.path().join("source.png"));
         fixture.journal.start_or_attach(&lease).unwrap();
         fixture.supervisor.prepare(&lease, &context).await.unwrap();
         assert_eq!(
@@ -1951,7 +1919,7 @@ mod tests {
         let fixture = CodexFixture::short_lived_workspace_output();
         let lease = fixture.lease();
         let context = fixture.context(&lease);
-        let expected = fs::read(fixture._temp.path().join("source.png")).unwrap();
+        let expected = normalized_fixture_png(&fixture._temp.path().join("source.png"));
         fixture.journal.start_or_attach(&lease).unwrap();
         fixture.supervisor.prepare(&lease, &context).await.unwrap();
         assert_eq!(
@@ -2011,7 +1979,7 @@ mod tests {
             .for_each(|result| result.unwrap());
 
         for (fixture, lease) in fixtures.iter().zip(&leases) {
-            let expected = fs::read(fixture._temp.path().join("source.png")).unwrap();
+            let expected = normalized_fixture_png(&fixture._temp.path().join("source.png"));
             let spool = ExecutionSpool::for_lease(&fixture.journal, lease).unwrap();
             assert_eq!(
                 spool.observe().unwrap(),
@@ -2103,7 +2071,6 @@ mod tests {
         let context = fixture.context_for_command(&lease, command);
         let expected = normalize_captured_image(
             fs::read(fixture._temp.path().join("source.png")).unwrap(),
-            "1024x1024",
             "jpeg",
             Some(80),
         )
@@ -2128,12 +2095,49 @@ mod tests {
     }
 
     #[test]
-    fn native_png_with_small_symbolic_ratio_drift_is_center_cropped() {
-        let normalized =
-            normalize_captured_image(png_bytes(1659, 948), "16:9", "png", None).unwrap();
+    fn native_png_provider_geometry_is_preserved() {
+        let normalized = normalize_captured_image(png_bytes(1659, 948), "png", None).unwrap();
         let decoded = image::load_from_memory(&normalized).unwrap();
 
-        assert_eq!((decoded.width(), decoded.height()), (1659, 933));
+        assert_eq!((decoded.width(), decoded.height()), (1659, 948));
+    }
+
+    #[test]
+    fn native_png_with_matching_format_preserves_provider_dimensions() {
+        let normalized = normalize_captured_image(png_bytes(1254, 1254), "png", None).unwrap();
+        let decoded = image::load_from_memory(&normalized).unwrap();
+
+        assert_eq!((decoded.width(), decoded.height()), (1254, 1254));
+    }
+
+    #[test]
+    fn native_png_non_square_dimensions_match_core_normalization() {
+        let normalized = normalize_captured_image(png_bytes(1600, 909), "png", None).unwrap();
+        let decoded = image::load_from_memory(&normalized).unwrap();
+
+        assert_eq!((decoded.width(), decoded.height()), (1600, 909));
+    }
+
+    #[test]
+    fn native_same_format_png_still_flattens_alpha() {
+        let normalized = normalize_captured_image(png_bytes(8, 8), "png", None).unwrap();
+        let decoded = image::load_from_memory(&normalized).unwrap();
+
+        assert!(!decoded.color().has_alpha());
+    }
+
+    #[test]
+    fn native_same_format_jpeg_strips_metadata_and_applies_compression() {
+        let secret = b"provider-metadata-must-not-survive";
+        let normalized =
+            normalize_captured_image(jpeg_with_comment(secret), "jpeg", Some(65)).unwrap();
+
+        assert!(normalized.starts_with(&[0xff, 0xd8, 0xff]));
+        assert!(
+            !normalized
+                .windows(secret.len())
+                .any(|window| window == secret)
+        );
     }
 
     #[tokio::test]
@@ -2141,7 +2145,7 @@ mod tests {
         let fixture = CodexFixture::generated_images_output_only();
         let lease = fixture.lease();
         let context = fixture.context(&lease);
-        let expected = fs::read(fixture._temp.path().join("source.png")).unwrap();
+        let expected = normalized_fixture_png(&fixture._temp.path().join("source.png"));
         fixture.journal.start_or_attach(&lease).unwrap();
         fixture.supervisor.prepare(&lease, &context).await.unwrap();
         assert_eq!(
@@ -2172,7 +2176,7 @@ mod tests {
         let fixture = CodexFixture::session_output_only();
         let lease = fixture.lease();
         let context = fixture.context(&lease);
-        let expected = fs::read(fixture._temp.path().join("source.png")).unwrap();
+        let expected = normalized_fixture_png(&fixture._temp.path().join("source.png"));
         fixture.journal.start_or_attach(&lease).unwrap();
         fixture.supervisor.prepare(&lease, &context).await.unwrap();
         assert_eq!(
@@ -2525,7 +2529,7 @@ mod tests {
             Self::with_script(|invocations, image, root| {
                 let second = root.join("source-2.png");
                 let mut bytes = std::io::Cursor::new(Vec::new());
-                image::DynamicImage::new_rgb8(2, 1)
+                image::DynamicImage::new_rgb8(2, 2)
                     .write_to(&mut bytes, image::ImageFormat::Png)
                     .unwrap();
                 fs::write(&second, bytes.into_inner()).unwrap();
@@ -2651,6 +2655,24 @@ mod tests {
             .write_to(&mut bytes, image::ImageFormat::Png)
             .unwrap();
         bytes.into_inner()
+    }
+
+    fn jpeg_with_comment(comment: &[u8]) -> Vec<u8> {
+        let mut bytes = Cursor::new(Vec::new());
+        image::DynamicImage::new_rgb8(8, 8)
+            .write_to(&mut bytes, image::ImageFormat::Jpeg)
+            .unwrap();
+        let encoded = bytes.into_inner();
+        let segment_len = u16::try_from(comment.len() + 2).unwrap();
+        let mut with_comment = vec![0xff, 0xd8, 0xff, 0xfe];
+        with_comment.extend_from_slice(&segment_len.to_be_bytes());
+        with_comment.extend_from_slice(comment);
+        with_comment.extend_from_slice(&encoded[2..]);
+        with_comment
+    }
+
+    fn normalized_fixture_png(path: &Path) -> Vec<u8> {
+        normalize_captured_image(fs::read(path).unwrap(), "png", None).unwrap()
     }
 
     fn write_session_rollout(codex_home: &Path, thread_id: Uuid, image: &[u8]) {

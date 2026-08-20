@@ -376,7 +376,7 @@ fn controls_for_model(
     api_profile: &str,
     provider_model_id: Option<&str>,
 ) -> Option<ConsoleImageControls> {
-    const STANDARD_RATIOS: &[&str] = &["1:1", "3:4", "4:3", "9:16", "16:9"];
+    const STANDARD_RATIOS: &[&str] = &["auto", "1:1", "3:4", "4:3", "9:16", "16:9"];
     const DREAMINA_RATIOS: &[&str] = &["21:9", "16:9", "3:2", "4:3", "1:1", "3:4", "2:3", "9:16"];
     let xai = api_profile == XAI_IMAGES_API_PROFILE;
     if api_profile == DREAMINA_IMAGES_API_PROFILE || api_profile == ARK_IMAGES_API_PROFILE {
@@ -416,7 +416,7 @@ fn controls_for_model(
     }
     Some(ConsoleImageControls {
         aspect_ratio: ConsoleChoiceControl {
-            default: "1:1",
+            default: "auto",
             options: STANDARD_RATIOS,
         },
         count: ConsoleRangeControl {
@@ -699,6 +699,42 @@ mod tests {
 
         assert_eq!(value["spatial_edit_mode"], "semantic_mask");
         assert!(value["max_prompt_chars"].is_null());
+    }
+
+    #[test]
+    fn standard_image_catalog_defaults_to_auto_geometry() {
+        for api_profile in [OPENAI_IMAGES_API_PROFILE, XAI_IMAGES_API_PROFILE] {
+            let controls = controls_for_model(api_profile, Some("provider-model")).unwrap();
+
+            assert_eq!(controls.aspect_ratio.default, "auto");
+            assert_eq!(controls.aspect_ratio.options.first(), Some(&"auto"));
+        }
+    }
+
+    #[test]
+    fn standard_image_requests_default_to_auto_geometry() {
+        for (api_profile, field) in [
+            (OPENAI_IMAGES_API_PROFILE, "size"),
+            (XAI_IMAGES_API_PROFILE, "aspect_ratio"),
+        ] {
+            let request = ConsoleImageGenerationRequest {
+                model: "public-image".to_owned(),
+                prompt: "a studio portrait".to_owned(),
+                count: None,
+                aspect_ratio: None,
+                resolution: None,
+                quality: None,
+                output_format: None,
+                background: None,
+            };
+            let ConsoleImageDispatchRequest::Standard(value) =
+                console_image_request(request, &resolved_route(api_profile)).unwrap()
+            else {
+                panic!("standard image request used the wrong adapter");
+            };
+
+            assert_eq!(value[field], "auto");
+        }
     }
 
     #[test]

@@ -2,102 +2,39 @@ use std::io::Cursor;
 
 use image::{DynamicImage, ImageFormat, ImageReader, Rgb, RgbImage};
 
-use crate::{
-    ImageGatewayError,
-    core::provider::GeneratedImage,
-    size::{
-        SizeConstraint, aspect_ratio_matches, aspect_ratio_tolerance_percent, parse_size_constraint,
-    },
-};
+use crate::{ImageGatewayError, core::provider::GeneratedImage};
 
 const MAX_DECODED_IMAGE_PIXELS: u64 = 16 * 1024 * 1024;
 const MAX_DECODED_IMAGE_DIMENSION: u32 = 8 * 1024;
-const MAX_ASPECT_RATIO_CENTER_CROP_FRACTION: f64 = 0.02;
 
 pub fn normalize_generated_images(
     images: Vec<GeneratedImage>,
-    size: &str,
     output_format: &str,
     output_compression: Option<u8>,
 ) -> Result<Vec<GeneratedImage>, ImageGatewayError> {
-    let requested_size = requested_size_constraint(size)?;
+    if images.is_empty() {
+        return Err(ImageGatewayError::backend(
+            "Provider returned no generated images",
+        ));
+    }
     images
         .into_iter()
-        .map(|image| {
-            normalize_generated_image(image, requested_size, output_format, output_compression)
-        })
+        .map(|image| normalize_generated_image(image, output_format, output_compression))
         .collect()
 }
 
 fn normalize_generated_image(
     image: GeneratedImage,
-    requested_size: SizeConstraint,
     output_format: &str,
     output_compression: Option<u8>,
 ) -> Result<GeneratedImage, ImageGatewayError> {
     let decoded = decode_generated_image(&image.bytes)?;
-    let decoded = match requested_size {
-        SizeConstraint::Auto => decoded,
-        SizeConstraint::Dimensions { width, height } => {
-            if !aspect_ratio_matches(decoded.width(), decoded.height(), width, height) {
-                return Err(ImageGatewayError::backend(format!(
-                    "Codex CLI produced an image with dimensions {}x{}, not the requested {}x{} aspect ratio within {:.2}% tolerance",
-                    decoded.width(),
-                    decoded.height(),
-                    width,
-                    height,
-                    aspect_ratio_tolerance_percent()
-                )));
-            }
-            decoded
-        }
-        SizeConstraint::AspectRatio { width, height } => {
-            center_crop_to_aspect_ratio(decoded, width, height)?
-        }
-    };
     encode_image(
         flatten_to_opaque(decoded),
         output_format,
         output_compression,
     )
     .map(|bytes| GeneratedImage { bytes })
-}
-
-fn center_crop_to_aspect_ratio(
-    image: DynamicImage,
-    target_width: u32,
-    target_height: u32,
-) -> Result<DynamicImage, ImageGatewayError> {
-    let width = image.width();
-    let height = image.height();
-    let actual_ratio = f64::from(width) / f64::from(height);
-    let target_ratio = f64::from(target_width) / f64::from(target_height);
-
-    let (crop_width, crop_height) = if actual_ratio > target_ratio {
-        ((f64::from(height) * target_ratio).round() as u32, height)
-    } else {
-        (width, (f64::from(width) / target_ratio).round() as u32)
-    };
-    let cropped_fraction = if crop_width < width {
-        f64::from(width - crop_width) / f64::from(width)
-    } else {
-        f64::from(height - crop_height) / f64::from(height)
-    };
-    if cropped_fraction > MAX_ASPECT_RATIO_CENTER_CROP_FRACTION {
-        return Err(ImageGatewayError::backend(format!(
-            "Codex CLI produced an image with dimensions {}x{}, too far from the requested {}:{} aspect ratio for a safe center crop",
-            width, height, target_width, target_height
-        )));
-    }
-
-    let x = (width - crop_width) / 2;
-    let y = (height - crop_height) / 2;
-    Ok(image.crop_imm(x, y, crop_width, crop_height))
-}
-
-fn requested_size_constraint(size: &str) -> Result<SizeConstraint, ImageGatewayError> {
-    parse_size_constraint(size)
-        .ok_or_else(|| ImageGatewayError::backend("Invalid requested image size"))
 }
 
 fn encode_image(
@@ -209,48 +146,97 @@ mod tests {
     }
 
     #[test]
-    fn accepts_png_with_requested_dimension_ratio() {
+    fn rejects_empty_provider_output() {
+        assert!(normalize_generated_images(Vec::new(), "png", None).is_err());
+    }
+
+    #[test]
+    fn accepts_valid_provider_png() {
         let image = GeneratedImage {
             bytes: valid_png_with_dimensions(1254, 1254),
         };
 
-        assert!(normalize_generated_images(vec![image], "1024x1024", "png", None).is_ok());
+        assert!(normalize_generated_images(vec![image], "png", None).is_ok());
     }
 
     #[test]
-    fn rejects_png_with_unexpected_dimension_ratio() {
+    fn preserves_square_provider_geometry() {
         let image = GeneratedImage {
             bytes: valid_png_with_dimensions(1254, 1254),
         };
 
-        assert!(normalize_generated_images(vec![image], "1536x1024", "png", None).is_err());
+        let normalized = normalize_generated_images(vec![image], "png", None).unwrap();
+        let decoded = image::load_from_memory(&normalized[0].bytes).unwrap();
+
+        assert_eq!((decoded.width(), decoded.height()), (1254, 1254));
     }
 
     #[test]
-    fn accepts_png_with_requested_aspect_ratio() {
+    fn accepts_widescreen_provider_png() {
         let image = GeneratedImage {
             bytes: valid_png_with_dimensions(1672, 941),
         };
 
-        assert!(normalize_generated_images(vec![image], "16:9", "png", None).is_ok());
+        assert!(normalize_generated_images(vec![image], "png", None).is_ok());
     }
 
     #[test]
-    fn center_crops_small_codex_aspect_ratio_drift() {
+    fn preserves_near_widescreen_provider_geometry() {
         let image = GeneratedImage {
             bytes: valid_png_with_dimensions(1659, 948),
         };
 
-        let normalized = normalize_generated_images(vec![image], "16:9", "png", None).unwrap();
+        let normalized = normalize_generated_images(vec![image], "png", None).unwrap();
         let decoded = image::load_from_memory(&normalized[0].bytes).unwrap();
 
-        assert_eq!((decoded.width(), decoded.height()), (1659, 933));
-        assert!(aspect_ratio_matches(
-            decoded.width(),
-            decoded.height(),
-            16,
-            9
-        ));
+        assert_eq!((decoded.width(), decoded.height()), (1659, 948));
+    }
+
+    #[test]
+    fn preserves_portrait_provider_geometry_and_content_alignment() {
+        let mut source = image::RgbaImage::new(948, 1659);
+        for (x, _y, pixel) in source.enumerate_pixels_mut() {
+            *pixel = image::Rgba([(x % 256) as u8, 0, 0, 255]);
+        }
+        let mut cursor = Cursor::new(Vec::new());
+        DynamicImage::ImageRgba8(source)
+            .write_to(&mut cursor, ImageFormat::Png)
+            .unwrap();
+
+        let normalized = normalize_generated_images(
+            vec![GeneratedImage {
+                bytes: cursor.into_inner(),
+            }],
+            "png",
+            None,
+        )
+        .unwrap();
+        let decoded = image::load_from_memory(&normalized[0].bytes).unwrap();
+
+        assert_eq!((decoded.width(), decoded.height()), (948, 1659));
+        assert_eq!(decoded.to_rgb8().get_pixel(0, 0).0[0], 0);
+        assert_eq!(decoded.to_rgb8().get_pixel(947, 0).0[0], 179);
+    }
+
+    #[test]
+    fn geometry_preservation_keeps_requested_output_format() {
+        for (format, compression, prefix) in [
+            ("jpeg", Some(80), &[0xff, 0xd8, 0xff][..]),
+            ("webp", None, &b"RIFF"[..]),
+        ] {
+            let normalized = normalize_generated_images(
+                vec![GeneratedImage {
+                    bytes: valid_png_with_dimensions(1659, 948),
+                }],
+                format,
+                compression,
+            )
+            .unwrap();
+            let decoded = image::load_from_memory(&normalized[0].bytes).unwrap();
+
+            assert!(normalized[0].bytes.starts_with(prefix));
+            assert_eq!((decoded.width(), decoded.height()), (1659, 948));
+        }
     }
 
     #[test]
@@ -260,7 +246,6 @@ mod tests {
             vec![GeneratedImage {
                 bytes: jpeg_with_comment(secret),
             }],
-            "auto",
             "jpeg",
             None,
         )
@@ -275,12 +260,15 @@ mod tests {
     }
 
     #[test]
-    fn rejects_png_with_unexpected_aspect_ratio() {
+    fn preserves_provider_geometry_without_ratio_enforcement() {
         let image = GeneratedImage {
             bytes: valid_png_with_dimensions(1254, 1254),
         };
 
-        assert!(normalize_generated_images(vec![image], "16:9", "png", None).is_err());
+        let normalized = normalize_generated_images(vec![image], "png", None).unwrap();
+        let decoded = image::load_from_memory(&normalized[0].bytes).unwrap();
+
+        assert_eq!((decoded.width(), decoded.height()), (1254, 1254));
     }
 
     #[test]
@@ -289,8 +277,7 @@ mod tests {
             bytes: valid_png_with_dimensions(1024, 1024),
         };
 
-        let normalized =
-            normalize_generated_images(vec![image], "1024x1024", "jpeg", Some(80)).unwrap();
+        let normalized = normalize_generated_images(vec![image], "jpeg", Some(80)).unwrap();
 
         assert!(normalized[0].bytes.starts_with(&[0xff, 0xd8, 0xff]));
     }
@@ -301,7 +288,7 @@ mod tests {
             bytes: transparent_png_with_dimensions(1024, 1024),
         };
 
-        let normalized = normalize_generated_images(vec![image], "1024x1024", "png", None).unwrap();
+        let normalized = normalize_generated_images(vec![image], "png", None).unwrap();
         let decoded = image::load_from_memory(&normalized[0].bytes).unwrap();
 
         assert!(is_png(&normalized[0].bytes));

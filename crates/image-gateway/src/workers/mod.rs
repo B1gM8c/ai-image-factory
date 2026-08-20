@@ -70,7 +70,6 @@ struct ImageExecutionSpec<'a> {
     output_format: &'a str,
     output_compression: Option<u8>,
     quality: &'a str,
-    size: &'a str,
     background: &'a str,
     stream: bool,
     failure_code: &'static str,
@@ -123,7 +122,6 @@ impl GenerationWorker {
                 output_format: &job.output_format,
                 output_compression: job.output_compression,
                 quality: &job.quality,
-                size: &job.size,
                 background: &job.background,
                 stream: job.stream,
                 failure_code: "image_generation_failed",
@@ -155,7 +153,6 @@ impl GenerationWorker {
                 output_format: &job.output_format,
                 output_compression: job.output_compression,
                 quality: &job.quality,
-                size: &job.size,
                 background: &job.background,
                 stream: job.stream,
                 failure_code: "image_edit_failed",
@@ -187,12 +184,7 @@ impl GenerationWorker {
                 .map_err(|_| ImageGatewayError::timeout())
                 .and_then(|result| result)
                 .and_then(|images| {
-                    normalize_generated_images(
-                        images,
-                        spec.size,
-                        spec.output_format,
-                        spec.output_compression,
-                    )
+                    normalize_generated_images(images, spec.output_format, spec.output_compression)
                 }),
             Err(LeaseLost) => {
                 heartbeat.stop().await;

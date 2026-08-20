@@ -5,8 +5,6 @@ pub enum SizeConstraint {
     AspectRatio { width: u32, height: u32 },
 }
 
-const ASPECT_RATIO_TOLERANCE: f64 = 0.01;
-
 pub fn parse_size_constraint(size: &str) -> Option<SizeConstraint> {
     if size == "auto" {
         return Some(SizeConstraint::Auto);
@@ -53,25 +51,6 @@ pub fn is_valid_gpt_image_2_size(size: &str) -> bool {
         }
         None => false,
     }
-}
-
-pub fn aspect_ratio_matches(
-    actual_width: u32,
-    actual_height: u32,
-    target_width: u32,
-    target_height: u32,
-) -> bool {
-    if actual_height == 0 || target_height == 0 {
-        return false;
-    }
-
-    let actual = actual_width as f64 / actual_height as f64;
-    let target = target_width as f64 / target_height as f64;
-    ((actual - target).abs() / target) <= ASPECT_RATIO_TOLERANCE
-}
-
-pub fn aspect_ratio_tolerance_percent() -> f64 {
-    ASPECT_RATIO_TOLERANCE * 100.0
 }
 
 pub fn gcd(mut a: u32, mut b: u32) -> u32 {
@@ -132,12 +111,5 @@ mod tests {
                 "unexpected validity for {size}"
             );
         }
-    }
-
-    #[test]
-    fn accepts_close_native_ratio_outputs() {
-        assert!(aspect_ratio_matches(1672, 941, 16, 9));
-        assert!(aspect_ratio_matches(1448, 1086, 4, 3));
-        assert!(!aspect_ratio_matches(1254, 1254, 16, 9));
     }
 }
