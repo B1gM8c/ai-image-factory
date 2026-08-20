@@ -101,9 +101,7 @@ fn startup_bind_failure_is_retryable() -> TestResult {
 #[test]
 fn prompt_contract_is_semantic_not_full_text_equality() -> TestResult {
     let request_dir = "/tmp/process-smoke-request";
-    let prompt = format!(
-        "prefix may evolve\n用户原始需求：process smoke opaque fixture\n尺寸 auto；质量 low；输出格式 png。\n不要再启动 codex、openai 或其它 AI CLI 子进程来委托生成。\n不要用 sips、ImageMagick、Python、Rust、ffmpeg、canvas 或其他本地图像处理工具裁切、拉伸、重采样、扩边、转绘或修改像素。\n请保存为 {request_dir}/final.png\nsuffix may evolve"
-    );
+    let prompt = "prefix may evolve\n用户原始需求：process smoke opaque fixture\n尺寸 auto；质量 low；输出格式 png。\n不要再启动 codex、openai 或其它 AI CLI 子进程来委托生成。\n不要用 shell、sips、ImageMagick、Python、Rust、ffmpeg、canvas 或其他本地工具复制、移动、重命名、删除、裁切、拉伸、重采样、扩边、转绘或修改图像生成工具产物。必须只调用一次当前启用的图像生成工具；工具成功后立即停止，由 Factory 从该工具的受控原生产物路径完成封存。\nsuffix may evolve";
     assert_prompt_semantics(&prompt, request_dir)
 }
 

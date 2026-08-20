@@ -62,15 +62,9 @@ pub(crate) fn assert_executor_codex_outputs(
     files: &SmokeFiles,
     expected_invocations: usize,
 ) -> TestResult {
-    let (prompt, _request_dir) =
+    let (prompt, request_dir) =
         codex_output_evidence(files, None, false, true, expected_invocations)?;
-    let argv = read_nul_strings(&files.argv_log)?;
-    let output_dir = argv_value(&argv, "--add-dir")?;
-    let final_output = Path::new(&output_dir)
-        .join("sealed-output.bin")
-        .display()
-        .to_string();
-    assert_prompt_semantics_for_output(&prompt, &final_output)
+    assert_prompt_semantics(&prompt, &request_dir)
 }
 
 pub(crate) fn assert_codex_edit_outputs(
@@ -225,10 +219,6 @@ pub(crate) fn alternate_opaque_png() -> TestResult<Vec<u8>> {
 }
 
 pub(crate) fn assert_prompt_semantics(prompt: &str, request_dir: &str) -> TestResult {
-    assert_prompt_semantics_for_output(prompt, &format!("{request_dir}/final.png"))
-}
-
-fn assert_prompt_semantics_for_output(prompt: &str, final_output: &str) -> TestResult {
     for (description, required) in [
         (
             "original prompt",
@@ -237,24 +227,38 @@ fn assert_prompt_semantics_for_output(prompt: &str, final_output: &str) -> TestR
         ("auto size", "尺寸 auto".to_string()),
         ("low quality", "质量 low".to_string()),
         ("PNG output format", "输出格式 png".to_string()),
-        ("request-local final image", final_output.to_string()),
         (
             "no delegated AI CLI",
             "不要再启动 codex、openai 或其它 AI CLI 子进程".to_string(),
         ),
         (
-            "no local image manipulation tools",
-            "不要用 sips、ImageMagick、Python、Rust、ffmpeg、canvas 或其他本地图像处理工具"
+            "single native image tool invocation",
+            "必须只调用一次当前启用的图像生成工具".to_string(),
+        ),
+        (
+            "Factory-owned native artifact sealing",
+            "由 Factory 从该工具的受控原生产物路径完成封存".to_string(),
+        ),
+        (
+            "no local artifact manipulation tools",
+            "不要用 shell、sips、ImageMagick、Python、Rust、ffmpeg、canvas 或其他本地工具"
                 .to_string(),
         ),
         (
-            "no local pixel manipulation",
-            "裁切、拉伸、重采样、扩边、转绘或修改像素".to_string(),
+            "no local artifact or pixel manipulation",
+            "复制、移动、重命名、删除、裁切、拉伸、重采样、扩边、转绘或修改图像生成工具产物"
+                .to_string(),
         ),
     ] {
         require(
             prompt.contains(&required),
             format!("Codex prompt is missing {description} semantics: {prompt}"),
+        )?;
+    }
+    for forbidden in [request_dir, "final.png", "sealed-output.bin"] {
+        require(
+            !prompt.contains(forbidden),
+            format!("Codex prompt exposed a deprecated output path {forbidden}: {prompt}"),
         )?;
     }
     Ok(())
@@ -304,23 +308,9 @@ fn assert_codex_invocation(
     let mut argument_index = expected_prefix.len();
     if expects_runtime_home {
         require(
-            argv.get(argument_index).map(String::as_str) == Some("--add-dir"),
-            format!("managed Codex argv is missing --add-dir: {argv:?}"),
+            !argv.iter().any(|argument| argument == "--add-dir"),
+            format!("managed Codex argv exposed the Factory runtime output directory: {argv:?}"),
         )?;
-        let runtime_home = argv
-            .get(argument_index + 1)
-            .ok_or_else(|| format!("managed Codex argv is missing runtime home: {argv:?}"))?;
-        require(
-            Path::new(runtime_home)
-                .file_name()
-                .and_then(|name| name.to_str())
-                == Some("runtime-home")
-                && Path::new(runtime_home).parent() == Path::new(request_dir).parent(),
-            format!(
-                "managed Codex runtime home is outside the request runner root: {runtime_home}"
-            ),
-        )?;
-        argument_index += 2;
     }
     require(
         argv.get(argument_index).map(String::as_str) == Some("--json"),

@@ -914,16 +914,11 @@ printf '%s\0' "$@" > {argv_log}
 cat > {stdin_log}
 sleep "$(cat {fake_delay})"
 request_dir=
-output_dir=
 while [ "$#" -gt 0 ]; do
     if [ "$1" = "--cd" ]; then
         shift
         [ "$#" -gt 0 ] || exit 27
         request_dir=$1
-    elif [ "$1" = "--add-dir" ]; then
-        shift
-        [ "$#" -gt 0 ] || exit 32
-        output_dir=$1
     fi
     shift
 done
@@ -933,11 +928,16 @@ if /usr/bin/grep -q '第 2/2 张候选图片' {stdin_log}; then
 else
     selected_fixture={fixture}
 fi
-if [ -n "$output_dir" ]; then
-    cp "$selected_fixture" "$output_dir/sealed-output.bin"
-else
-    cp "$selected_fixture" "$request_dir/final.png"
-fi
+thread_id='019fd9f5-badb-7dd3-8903-28ffded0ef54'
+call_id="call_process_smoke_$$"
+output_dir="$CODEX_HOME/generated_images/$thread_id"
+mkdir -p "$output_dir"
+chmod 700 "$CODEX_HOME/generated_images" "$output_dir"
+cp "$selected_fixture" "$output_dir/$call_id.png.partial"
+chmod 600 "$output_dir/$call_id.png.partial"
+mv "$output_dir/$call_id.png.partial" "$output_dir/$call_id.png"
+printf '{{"type":"thread.started","thread_id":"%s"}}\n' "$thread_id"
+printf '{{"type":"item.completed","item":{{"type":"image_generation_call","id":"%s"}}}}\n' "$call_id"
 "#,
         codex_home = shell_quote(paths.codex_home),
         codex_auth = shell_quote(&paths.codex_home.join("auth.json")),
