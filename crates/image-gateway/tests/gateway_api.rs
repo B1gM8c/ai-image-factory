@@ -789,14 +789,14 @@ async fn generation_passes_arbitrary_gpt_image_2_size_through_exactly() {
 }
 
 #[tokio::test]
-async fn generation_rejects_returned_png_with_wrong_aspect_ratio() {
+async fn generation_preserves_provider_geometry_when_it_differs_from_the_hint() {
     let fake = FakeGenerator {
         calls: Arc::default(),
         delay: Duration::ZERO,
         image_bytes: png_bytes(1254, 1254),
         failure: None,
     };
-    let app = build_router(config(), Arc::new(fake), usage_store());
+    let app = build_router(config(), Arc::new(fake.clone()), usage_store());
 
     let (status, _headers, body) = send_json(
         app,
@@ -810,14 +810,25 @@ async fn generation_rejects_returned_png_with_wrong_aspect_ratio() {
     )
     .await;
 
-    assert_eq!(status, StatusCode::BAD_GATEWAY);
-    assert_eq!(body["error"]["type"], "server_error");
-    assert_eq!(body["error"]["code"], "image_generation_failed");
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["size"], "1254x1254");
+    let bytes = STANDARD
+        .decode(body["data"][0]["b64_json"].as_str().unwrap())
+        .unwrap();
+    let decoded = image::load_from_memory_with_format(&bytes, ImageFormat::Png).unwrap();
+    assert_eq!((decoded.width(), decoded.height()), (1254, 1254));
     assert!(
-        body["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("not the requested 16:9 aspect ratio")
+        !decoded.color().has_alpha(),
+        "trusted normalization still flattens provider alpha"
+    );
+    assert_eq!(
+        fake.calls.lock().unwrap().as_slice(),
+        &[FakeCall::Generate {
+            prompt: "a tiny terminal icon".to_string(),
+            n: 1,
+            size: "16:9".to_string(),
+            output_format: "png".to_string(),
+        }]
     );
 }
 
