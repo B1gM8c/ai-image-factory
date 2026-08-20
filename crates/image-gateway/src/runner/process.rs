@@ -113,6 +113,7 @@ pub(crate) enum ProcessObservation {
 }
 
 #[derive(Debug, Eq, PartialEq)]
+#[cfg(test)]
 pub(crate) enum WorkspaceOutputSnapshot {
     Missing,
     Incomplete,
@@ -408,6 +409,7 @@ impl ExecutionSpool {
         Ok(&self.workspace.path)
     }
 
+    #[cfg(test)]
     pub(crate) fn read_workspace_output(
         &self,
         filename: &str,
@@ -420,6 +422,7 @@ impl ExecutionSpool {
         read_workspace_output(&self.workspace.fd, filename, max_bytes)
     }
 
+    #[cfg(test)]
     pub(crate) fn read_runtime_output(
         &self,
         filename: &str,
@@ -1008,6 +1011,7 @@ fn read_optional_bytes(
     Ok(Some(bytes))
 }
 
+#[cfg(test)]
 fn read_workspace_output(
     directory: &OwnedFd,
     name: &str,
@@ -1060,6 +1064,7 @@ fn read_workspace_output(
     Ok(WorkspaceOutputSnapshot::Bytes(bytes))
 }
 
+#[cfg(test)]
 fn validate_workspace_output_stat(
     stat: &rfs::Stat,
     max_bytes: u64,
@@ -1081,6 +1086,7 @@ fn validate_workspace_output_stat(
         .map_err(|_| ProcessSpoolError::Integrity)
 }
 
+#[cfg(test)]
 fn same_file_snapshot(first: &rfs::Stat, second: &rfs::Stat) -> bool {
     first.st_dev == second.st_dev
         && first.st_ino == second.st_ino
@@ -1095,6 +1101,7 @@ fn same_file_snapshot(first: &rfs::Stat, second: &rfs::Stat) -> bool {
         && first.st_ctime_nsec == second.st_ctime_nsec
 }
 
+#[cfg(test)]
 fn valid_single_component(name: &str) -> bool {
     let mut components = Path::new(name).components();
     matches!(components.next(), Some(Component::Normal(_)))

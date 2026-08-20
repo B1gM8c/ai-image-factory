@@ -1,6 +1,6 @@
 use std::{
     env, fs,
-    io::{self, BufRead, BufReader, Cursor, Read},
+    io::Read,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::Stdio,
@@ -8,8 +8,10 @@ use std::{
     time::Duration,
 };
 
+#[cfg(test)]
+use std::io::Cursor;
+
 use async_trait::async_trait;
-use base64::{Engine as _, engine::general_purpose::STANDARD};
 use image_cli_runtime::{
     CliPolicy, CliRuntime, CommandSpec, CommandSpecError, ExitClassification, OutputContract,
     OutputError, ProcessCompletion, ProcessError, RuntimeError, SpawnEvidence, SpawnObserver,
@@ -17,7 +19,7 @@ use image_cli_runtime::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::{process::Command, sync::oneshot, time::Instant};
+use tokio::{process::Command, time::Instant};
 use uuid::Uuid;
 
 use super::{
@@ -30,15 +32,12 @@ use super::{
 use crate::{
     ImageGatewayError, ProxyConfig,
     generator::GenerationJob,
-    providers::openai_codex::{
-        build_codex_prompt_for_output, provider_output_filename, read_codex_output,
-        select_image_output,
-    },
+    providers::openai_codex::build_codex_prompt_for_output,
     runner::{
         FilesystemRunnerJournal, LaunchDecision,
         process::{
             ExecutionSpool, ProcessObservation, ProcessSpoolError, ProcessTerminal,
-            ProviderProcessIdentity, RunnerLock, WorkspaceOutputSnapshot, sha256,
+            ProviderProcessIdentity, RunnerLock, sha256,
         },
     },
 };
@@ -51,15 +50,6 @@ const CHILD_REAP_TIMEOUT: Duration = Duration::from_secs(5);
 const CODEX_CHILD_PATH: &str = "/usr/bin:/bin";
 const MAX_CODEX_RUNTIME_OUTPUT_BYTES: u64 = 32 * 1024 * 1024;
 const CODEX_RUNTIME_OUTPUT_FILE: &str = "sealed-output.bin";
-const EPHEMERAL_OUTPUT_DISCOVERY_INTERVAL: Duration = Duration::from_millis(10);
-const EPHEMERAL_OUTPUT_REFRESH_INTERVAL: Duration = Duration::from_millis(200);
-const MAX_DECODED_IMAGE_PIXELS: u64 = 16 * 1024 * 1024;
-const MAX_DECODED_IMAGE_DIMENSION: u32 = 8 * 1024;
-const MAX_CODEX_SESSION_FILES: usize = 32;
-const MAX_CODEX_SESSION_DEPTH: usize = 8;
-const MAX_CODEX_SESSION_LINE_BYTES: usize =
-    ((MAX_CODEX_RUNTIME_OUTPUT_BYTES as usize + 2) / 3) * 4 + 64 * 1024;
-const MAX_CODEX_SESSION_FILE_BYTES: u64 = (MAX_CODEX_SESSION_LINE_BYTES as u64) * 4;
 
 #[derive(Clone)]
 pub struct CodexProcessSupervisor {
@@ -124,27 +114,6 @@ struct CodexEventSummary {
     stderr_truncated: bool,
     stderr_present: bool,
     malformed_events: usize,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum CodexOutputSource {
-    Workspace,
-    Runtime,
-    Native,
-    Session,
-}
-
-struct CapturedCodexOutput {
-    bytes: Vec<u8>,
-    source: CodexOutputSource,
-}
-
-#[derive(Default)]
-struct CodexOutputCapture {
-    output: Option<CapturedCodexOutput>,
-    workspace_observed: bool,
-    runtime_observed: bool,
-    native_observed: bool,
 }
 
 impl CodexProcessSupervisor {
@@ -537,116 +506,34 @@ async fn run_codex_child(
         helper,
         events: CodexEventSummary::default(),
     };
-    let capture_filename = provider_output_filename(&request.output.output_format);
-    match spool.read_workspace_output(capture_filename, MAX_CODEX_RUNTIME_OUTPUT_BYTES) {
-        Ok(WorkspaceOutputSnapshot::Missing) => {}
-        Ok(WorkspaceOutputSnapshot::Incomplete | WorkspaceOutputSnapshot::Bytes(_)) => {
-            return ChildOutcome::Uncertain("codex_workspace_output_preexisting");
-        }
-        Err(_) => return ChildOutcome::Uncertain("codex_ephemeral_output_unavailable"),
-    }
-    let (stop_capture, capture_stop) = oneshot::channel();
-    let capture_spool = Arc::clone(&spool);
-    let capture_format = request.output.output_format.clone();
-    let capture_codex_home = codex_home.to_path_buf();
-    let capture = tokio::spawn(async move {
-        capture_ephemeral_output(
-            capture_spool,
-            capture_filename,
-            CODEX_RUNTIME_OUTPUT_FILE,
-            capture_codex_home,
-            capture_format,
-            capture_stop,
-        )
-        .await
-    });
     let runtime_result = CliRuntime::new(CodexCliPolicy)
         .run_to_sink(&invocation, &mut observer, Vec::new())
         .await;
-    let _ = stop_capture.send(());
-    let captured = match capture.await {
-        Ok(result) => result,
-        Err(_) => Err(ProcessSpoolError::Unavailable),
-    };
     let outcome = match runtime_result {
         Ok(result) => ChildOutcome::Succeeded(result.sink),
-        Err(error) if ephemeral_capture_fallback_allowed(&error) => match captured {
-            Ok(capture) if capture.output.is_some() => {
-                let output = capture.output.expect("capture output checked");
-                tracing::warn!(
-                    request.id = %request.output.request_id,
-                    output.index = request.output.candidate_index,
-                    codex.output.recovery_source = ?output.source,
-                    codex.output.workspace_observed = capture.workspace_observed,
-                    codex.output.runtime_observed = capture.runtime_observed,
-                    codex.output.native_observed = capture.native_observed,
-                    "recovered Codex output before an ephemeral provider path disappeared"
-                );
-                ChildOutcome::Succeeded(output.bytes)
-            }
-            Ok(capture) => match final_fallback_output(
-                &spool,
-                capture_filename,
-                codex_home,
-                observer.events.thread_id,
-                &request.output.output_format,
-            )
-            .await
-            {
-                Ok(Some(output)) => {
-                    tracing::warn!(
-                        request.id = %request.output.request_id,
-                        output.index = request.output.candidate_index,
-                        codex.output.recovery_source = ?output.source,
-                        "recovered Codex output after process exit"
-                    );
-                    ChildOutcome::Succeeded(output.bytes)
-                }
-                Ok(None) => {
-                    tracing::warn!(
-                        request.id = %request.output.request_id,
-                        output.index = request.output.candidate_index,
-                        codex.thread.id = ?observer.events.thread_id,
-                        codex.image_generation.seen = observer.events.saw_image_generation,
-                        codex.image_generation.completed = observer.events.completed_image_generation,
-                        codex.events.malformed = observer.events.malformed_events,
-                        codex.stdout.truncated = observer.events.stdout_truncated,
-                        codex.stderr.truncated = observer.events.stderr_truncated,
-                        codex.stderr.present = observer.events.stderr_present,
-                        codex.output.stage = "post_exit_recovery",
-                        codex.output.workspace_observed = capture.workspace_observed,
-                        codex.output.runtime_observed = capture.runtime_observed,
-                        codex.output.native_observed = capture.native_observed,
-                        error.code = codex_output_error_code(&error),
-                        "Codex completed without a recoverable image artifact"
-                    );
-                    map_cli_runtime_error_with_events(error, &observer.events)
-                }
-                Err(ProcessSpoolError::Integrity) => {
-                    ChildOutcome::Failed("codex_ephemeral_output_invalid")
-                }
-                Err(
-                    ProcessSpoolError::InvalidInput
-                    | ProcessSpoolError::Conflict
-                    | ProcessSpoolError::Unavailable,
-                ) => ChildOutcome::Uncertain("codex_ephemeral_output_unavailable"),
-            },
-            Err(ProcessSpoolError::Integrity) => {
-                ChildOutcome::Failed("codex_ephemeral_output_invalid")
-            }
-            Err(
-                ProcessSpoolError::InvalidInput
-                | ProcessSpoolError::Conflict
-                | ProcessSpoolError::Unavailable,
-            ) => ChildOutcome::Uncertain("codex_ephemeral_output_unavailable"),
-        },
-        Err(error) => map_cli_runtime_error(error),
+        Err(error) => {
+            tracing::warn!(
+                request.id = %request.output.request_id,
+                output.index = request.output.candidate_index,
+                codex.thread.id = ?observer.events.thread_id,
+                codex.image_generation.seen = observer.events.saw_image_generation,
+                codex.image_generation.completed = observer.events.completed_image_generation,
+                codex.events.malformed = observer.events.malformed_events,
+                codex.stdout.truncated = observer.events.stdout_truncated,
+                codex.stderr.truncated = observer.events.stderr_truncated,
+                codex.stderr.present = observer.events.stderr_present,
+                codex.output.stage = "sealed_handoff",
+                error.code = codex_output_error_code(&error),
+                "Codex completed without a valid sealed image handoff"
+            );
+            map_cli_runtime_error_with_events(error, &observer.events)
+        }
     };
     match outcome {
         ChildOutcome::Succeeded(bytes) => {
             match normalize_captured_image(bytes, &job.output_format, job.output_compression) {
                 Ok(bytes) => ChildOutcome::Succeeded(bytes),
-                Err(()) => ChildOutcome::Failed("codex_ephemeral_output_invalid"),
+                Err(()) => ChildOutcome::Failed("codex_durable_output_invalid"),
             }
         }
         outcome => outcome,
@@ -672,370 +559,6 @@ fn normalize_captured_image(
         return Err(());
     }
     Ok(images.remove(0).bytes)
-}
-
-async fn final_fallback_output(
-    spool: &ExecutionSpool,
-    workspace_filename: &str,
-    codex_home: &Path,
-    thread_id: Option<Uuid>,
-    output_format: &str,
-) -> Result<Option<CapturedCodexOutput>, ProcessSpoolError> {
-    if let Some(bytes) = final_workspace_output(spool, workspace_filename)? {
-        return Ok(Some(CapturedCodexOutput {
-            bytes,
-            source: CodexOutputSource::Workspace,
-        }));
-    }
-
-    let generated_images = codex_home.join("generated_images");
-    let thread_root = thread_id.map(|id| generated_images.join(id.to_string()));
-    let root = thread_root.as_deref().unwrap_or(&generated_images);
-    if let Some(path) = select_image_output(root, output_format) {
-        let bytes = read_codex_output(&path)
-            .await
-            .map_err(|_| ProcessSpoolError::Unavailable)?;
-        if !valid_captured_image(&bytes) {
-            return Err(ProcessSpoolError::Integrity);
-        }
-        return Ok(Some(CapturedCodexOutput {
-            bytes,
-            source: CodexOutputSource::Native,
-        }));
-    }
-
-    recover_codex_session_output(codex_home, thread_id).await
-}
-
-async fn recover_codex_session_output(
-    codex_home: &Path,
-    thread_id: Option<Uuid>,
-) -> Result<Option<CapturedCodexOutput>, ProcessSpoolError> {
-    let Some(thread_id) = thread_id else {
-        return Ok(None);
-    };
-    let codex_home = codex_home.to_path_buf();
-    tokio::task::spawn_blocking(move || {
-        recover_codex_session_output_blocking(&codex_home, thread_id)
-    })
-    .await
-    .map_err(|_| ProcessSpoolError::Unavailable)?
-}
-
-fn recover_codex_session_output_blocking(
-    codex_home: &Path,
-    thread_id: Uuid,
-) -> Result<Option<CapturedCodexOutput>, ProcessSpoolError> {
-    let mut session_files = Vec::new();
-    collect_codex_session_files(
-        &codex_home.join("sessions"),
-        0,
-        thread_id,
-        &mut session_files,
-    )?;
-    session_files.sort();
-    session_files.reverse();
-
-    for path in session_files {
-        let mut options = fs::OpenOptions::new();
-        options.read(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.custom_flags(libc::O_NOFOLLOW);
-        }
-        let file = options
-            .open(path)
-            .map_err(|_| ProcessSpoolError::Unavailable)?;
-        let metadata = file
-            .metadata()
-            .map_err(|_| ProcessSpoolError::Unavailable)?;
-        if !metadata.is_file() || metadata.len() > MAX_CODEX_SESSION_FILE_BYTES {
-            return Err(ProcessSpoolError::Integrity);
-        }
-        let mut reader = BufReader::new(file);
-        let mut line = Vec::new();
-        let mut recovered = None;
-        loop {
-            let bytes = read_bounded_line(&mut reader, &mut line, MAX_CODEX_SESSION_LINE_BYTES)
-                .map_err(|error| match error.kind() {
-                    io::ErrorKind::InvalidData => ProcessSpoolError::Integrity,
-                    _ => ProcessSpoolError::Unavailable,
-                })?;
-            if bytes == 0 {
-                break;
-            }
-            let Ok(event) = serde_json::from_slice::<serde_json::Value>(&line) else {
-                continue;
-            };
-            let Some(result) = codex_inline_image_result(&event) else {
-                continue;
-            };
-            let encoded = result
-                .split_once(",")
-                .filter(|(prefix, _)| {
-                    prefix.starts_with("data:image/") && prefix.ends_with(";base64")
-                })
-                .map_or(result, |(_, encoded)| encoded);
-            if encoded.len() > MAX_CODEX_SESSION_LINE_BYTES {
-                return Err(ProcessSpoolError::Integrity);
-            }
-            let bytes = STANDARD
-                .decode(encoded)
-                .map_err(|_| ProcessSpoolError::Integrity)?;
-            if bytes.is_empty() || bytes.len() as u64 > MAX_CODEX_RUNTIME_OUTPUT_BYTES {
-                return Err(ProcessSpoolError::Integrity);
-            }
-            if !valid_captured_image(&bytes) {
-                return Err(ProcessSpoolError::Integrity);
-            }
-            recovered = Some(CapturedCodexOutput {
-                bytes,
-                source: CodexOutputSource::Session,
-            });
-        }
-        if recovered.is_some() {
-            return Ok(recovered);
-        }
-    }
-    Ok(None)
-}
-
-fn collect_codex_session_files(
-    directory: &Path,
-    depth: usize,
-    thread_id: Uuid,
-    files: &mut Vec<PathBuf>,
-) -> Result<(), ProcessSpoolError> {
-    if depth > MAX_CODEX_SESSION_DEPTH {
-        return Err(ProcessSpoolError::Integrity);
-    }
-    let metadata = match fs::symlink_metadata(directory) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(_) => return Err(ProcessSpoolError::Unavailable),
-    };
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Err(ProcessSpoolError::Integrity);
-    }
-    let entries = fs::read_dir(directory).map_err(|_| ProcessSpoolError::Unavailable)?;
-    for entry in entries {
-        let entry = entry.map_err(|_| ProcessSpoolError::Unavailable)?;
-        let path = entry.path();
-        let metadata = fs::symlink_metadata(&path).map_err(|_| ProcessSpoolError::Unavailable)?;
-        if metadata.file_type().is_symlink() {
-            continue;
-        }
-        if metadata.is_dir() {
-            collect_codex_session_files(&path, depth + 1, thread_id, files)?;
-            continue;
-        }
-        if metadata.is_file()
-            && path.extension().and_then(|value| value.to_str()) == Some("jsonl")
-            && path
-                .file_name()
-                .and_then(|value| value.to_str())
-                .is_some_and(|name| name.contains(&thread_id.to_string()))
-        {
-            if files.len() == MAX_CODEX_SESSION_FILES {
-                return Err(ProcessSpoolError::Integrity);
-            }
-            files.push(path);
-        }
-    }
-    Ok(())
-}
-
-fn read_bounded_line(
-    reader: &mut impl BufRead,
-    line: &mut Vec<u8>,
-    max_bytes: usize,
-) -> io::Result<usize> {
-    line.clear();
-    loop {
-        let buffer = reader.fill_buf()?;
-        if buffer.is_empty() {
-            return Ok(line.len());
-        }
-        let count = buffer
-            .iter()
-            .position(|byte| *byte == b'\n')
-            .map_or(buffer.len(), |index| index + 1);
-        if line.len().saturating_add(count) > max_bytes {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Codex session event exceeds the bounded recovery limit",
-            ));
-        }
-        line.extend_from_slice(&buffer[..count]);
-        reader.consume(count);
-        if line.last() == Some(&b'\n') {
-            return Ok(line.len());
-        }
-    }
-}
-
-fn codex_inline_image_result(value: &serde_json::Value) -> Option<&str> {
-    match value {
-        serde_json::Value::Object(fields) => {
-            let event_type = fields
-                .get("type")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default();
-            if matches!(event_type, "image_generation_call" | "image_generation_end") {
-                if let Some(result) = fields
-                    .get("result")
-                    .and_then(serde_json::Value::as_str)
-                    .filter(|result| !result.is_empty())
-                {
-                    return Some(result);
-                }
-            }
-            fields.values().find_map(codex_inline_image_result)
-        }
-        serde_json::Value::Array(values) => values.iter().find_map(codex_inline_image_result),
-        _ => None,
-    }
-}
-
-fn final_workspace_output(
-    spool: &ExecutionSpool,
-    filename: &str,
-) -> Result<Option<Vec<u8>>, ProcessSpoolError> {
-    match spool.read_workspace_output(filename, MAX_CODEX_RUNTIME_OUTPUT_BYTES)? {
-        WorkspaceOutputSnapshot::Missing | WorkspaceOutputSnapshot::Incomplete => Ok(None),
-        WorkspaceOutputSnapshot::Bytes(bytes) if valid_captured_image(&bytes) => Ok(Some(bytes)),
-        WorkspaceOutputSnapshot::Bytes(_) => Err(ProcessSpoolError::Integrity),
-    }
-}
-
-async fn capture_ephemeral_output(
-    spool: Arc<ExecutionSpool>,
-    workspace_filename: &'static str,
-    runtime_filename: &'static str,
-    codex_home: PathBuf,
-    output_format: String,
-    mut stop: oneshot::Receiver<()>,
-) -> Result<CodexOutputCapture, ProcessSpoolError> {
-    let mut capture = CodexOutputCapture::default();
-    let mut first_poll = true;
-    let mut next_native_poll = Instant::now();
-    loop {
-        let mut stopping = false;
-        if first_poll {
-            first_poll = false;
-        } else {
-            let interval = if capture.output.is_some() {
-                EPHEMERAL_OUTPUT_REFRESH_INTERVAL
-            } else {
-                EPHEMERAL_OUTPUT_DISCOVERY_INTERVAL
-            };
-            tokio::select! {
-                biased;
-                _ = &mut stop => stopping = true,
-                _ = tokio::time::sleep(interval) => {}
-            }
-        }
-        let read_spool = Arc::clone(&spool);
-        let snapshots = tokio::task::spawn_blocking(move || {
-            Ok::<_, ProcessSpoolError>((
-                read_spool
-                    .read_workspace_output(workspace_filename, MAX_CODEX_RUNTIME_OUTPUT_BYTES)?,
-                read_spool.read_runtime_output(runtime_filename, MAX_CODEX_RUNTIME_OUTPUT_BYTES)?,
-            ))
-        })
-        .await
-        .map_err(|_| ProcessSpoolError::Unavailable)??;
-        let workspace = validated_snapshot(snapshots.0, CodexOutputSource::Workspace).await?;
-        let runtime = validated_snapshot(snapshots.1, CodexOutputSource::Runtime).await?;
-        let now = Instant::now();
-        let native = if stopping || now >= next_native_poll {
-            next_native_poll = now + EPHEMERAL_OUTPUT_REFRESH_INTERVAL;
-            snapshot_native_codex_output(&codex_home, &output_format).await?
-        } else {
-            None
-        };
-
-        if workspace.is_some() {
-            capture.workspace_observed = true;
-        }
-        if runtime.is_some() {
-            capture.runtime_observed = true;
-        }
-        if native.is_some() {
-            capture.native_observed = true;
-        }
-        capture.output = runtime.or(workspace).or(native).or(capture.output);
-        if stopping {
-            return Ok(capture);
-        }
-    }
-}
-
-async fn validated_snapshot(
-    snapshot: WorkspaceOutputSnapshot,
-    source: CodexOutputSource,
-) -> Result<Option<CapturedCodexOutput>, ProcessSpoolError> {
-    let WorkspaceOutputSnapshot::Bytes(bytes) = snapshot else {
-        return Ok(None);
-    };
-    tokio::task::spawn_blocking(move || {
-        Ok(valid_captured_image(&bytes).then_some(CapturedCodexOutput { bytes, source }))
-    })
-    .await
-    .map_err(|_| ProcessSpoolError::Unavailable)?
-}
-
-async fn snapshot_native_codex_output(
-    codex_home: &Path,
-    output_format: &str,
-) -> Result<Option<CapturedCodexOutput>, ProcessSpoolError> {
-    let Some(path) = select_image_output(&codex_home.join("generated_images"), output_format)
-    else {
-        return Ok(None);
-    };
-    let bytes = read_codex_output(&path)
-        .await
-        .map_err(|_| ProcessSpoolError::Unavailable)?;
-    Ok(valid_captured_image(&bytes).then_some(CapturedCodexOutput {
-        bytes,
-        source: CodexOutputSource::Native,
-    }))
-}
-
-fn valid_captured_image(bytes: &[u8]) -> bool {
-    let mut reader = match image::ImageReader::new(Cursor::new(bytes)).with_guessed_format() {
-        Ok(reader)
-            if matches!(
-                reader.format(),
-                Some(image::ImageFormat::Png | image::ImageFormat::Jpeg | image::ImageFormat::WebP)
-            ) =>
-        {
-            reader
-        }
-        _ => return false,
-    };
-    let mut limits = image::Limits::default();
-    limits.max_image_width = Some(MAX_DECODED_IMAGE_DIMENSION);
-    limits.max_image_height = Some(MAX_DECODED_IMAGE_DIMENSION);
-    limits.max_alloc = Some(MAX_DECODED_IMAGE_PIXELS * 8);
-    reader.limits(limits);
-    reader.decode().is_ok_and(|image| {
-        image.width() > 0
-            && image.height() > 0
-            && u64::from(image.width()).saturating_mul(u64::from(image.height()))
-                <= MAX_DECODED_IMAGE_PIXELS
-    })
-}
-
-fn ephemeral_capture_fallback_allowed(error: &RuntimeError) -> bool {
-    match error {
-        RuntimeError::Output(OutputError::Missing) => true,
-        RuntimeError::Output(OutputError::Unavailable(error)) => {
-            error.kind() == std::io::ErrorKind::NotFound
-        }
-        _ => false,
-    }
 }
 
 impl CliPolicy for CodexCliPolicy {
@@ -1569,6 +1092,7 @@ fn child_spool_error(_error: ProcessSpoolError) -> ImageGatewayError {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::os::unix::fs::{PermissionsExt, symlink};
 
     use tempfile::TempDir;
@@ -1818,231 +1342,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn captures_provider_output_before_codex_deletes_it_on_clean_exit() {
-        let fixture = CodexFixture::ephemeral_workspace_output(0);
-        let lease = fixture.lease();
-        let context = fixture.context(&lease);
-        let expected = normalized_fixture_png(&fixture._temp.path().join("source.png"));
-        fixture.journal.start_or_attach(&lease).unwrap();
-        fixture.supervisor.prepare(&lease, &context).await.unwrap();
-        assert_eq!(
-            fixture.journal.commit_launch(&lease).unwrap(),
-            LaunchDecision::LaunchOnce
-        );
-        let spool = ExecutionSpool::for_lease(&fixture.journal, &lease).unwrap();
-
-        run_codex_runner_child(fixture.journal.root_path(), lease.executor_execution_id)
-            .await
-            .unwrap();
-
-        assert!(
-            fixture
-                ._temp
-                .path()
-                .join("provider-output-created")
-                .is_file()
-        );
-        assert!(
-            fixture
-                ._temp
-                .path()
-                .join("provider-output-deleted")
-                .is_file()
-        );
-        assert_eq!(
-            spool.observe().unwrap(),
-            ProcessObservation::Succeeded(SupervisedOutput::without_provider_cost(
-                expected.clone()
-            ))
-        );
-        let execution_root = fixture
-            .journal
-            .root_path()
-            .join(lease.executor_execution_id.simple().to_string());
-        assert_eq!(
-            fs::read(execution_root.join("output.bin")).unwrap(),
-            expected
-        );
-        assert!(!execution_root.join("codex-home").exists());
-        assert!(!execution_root.join("workspace").exists());
-        assert!(!execution_root.join("runtime-home").exists());
-        assert_eq!(fs::read_to_string(&fixture.invocations).unwrap(), "1\n");
-    }
-
-    #[tokio::test]
-    async fn recovers_retained_workspace_output_after_runtime_output_disappears() {
-        let fixture = CodexFixture::disappearing_runtime_output();
-        let lease = fixture.lease();
-        let context = fixture.context(&lease);
-        let expected = normalized_fixture_png(&fixture._temp.path().join("source.png"));
-        fixture.journal.start_or_attach(&lease).unwrap();
-        fixture.supervisor.prepare(&lease, &context).await.unwrap();
-        assert_eq!(
-            fixture.journal.commit_launch(&lease).unwrap(),
-            LaunchDecision::LaunchOnce
-        );
-        let spool = ExecutionSpool::for_lease(&fixture.journal, &lease).unwrap();
-
-        run_codex_runner_child(fixture.journal.root_path(), lease.executor_execution_id)
-            .await
-            .unwrap();
-
-        assert_eq!(
-            spool.observe().unwrap(),
-            ProcessObservation::Succeeded(SupervisedOutput::without_provider_cost(expected))
-        );
-    }
-
-    #[tokio::test]
-    async fn recovers_short_lived_workspace_output_from_one_complete_snapshot() {
-        let fixture = CodexFixture::short_lived_workspace_output();
-        let lease = fixture.lease();
-        let context = fixture.context(&lease);
-        let expected = normalized_fixture_png(&fixture._temp.path().join("source.png"));
-        fixture.journal.start_or_attach(&lease).unwrap();
-        fixture.supervisor.prepare(&lease, &context).await.unwrap();
-        assert_eq!(
-            fixture.journal.commit_launch(&lease).unwrap(),
-            LaunchDecision::LaunchOnce
-        );
-        let spool = ExecutionSpool::for_lease(&fixture.journal, &lease).unwrap();
-
-        run_codex_runner_child(fixture.journal.root_path(), lease.executor_execution_id)
-            .await
-            .unwrap();
-
-        assert_eq!(
-            spool.observe().unwrap(),
-            ProcessObservation::Succeeded(SupervisedOutput::without_provider_cost(expected))
-        );
-    }
-
-    #[tokio::test]
-    async fn concurrent_short_lived_outputs_are_captured_per_execution() {
-        let fixtures =
-            std::array::from_fn::<_, 4, _>(|_| CodexFixture::short_lived_workspace_output());
-        let leases = fixtures.each_ref().map(CodexFixture::lease);
-        for (fixture, lease) in fixtures.iter().zip(&leases) {
-            fixture.journal.start_or_attach(lease).unwrap();
-            fixture
-                .supervisor
-                .prepare(lease, &fixture.context(lease))
-                .await
-                .unwrap();
-            assert_eq!(
-                fixture.journal.commit_launch(lease).unwrap(),
-                LaunchDecision::LaunchOnce
-            );
-        }
-
-        let results = tokio::join!(
-            run_codex_runner_child(
-                fixtures[0].journal.root_path(),
-                leases[0].executor_execution_id,
-            ),
-            run_codex_runner_child(
-                fixtures[1].journal.root_path(),
-                leases[1].executor_execution_id,
-            ),
-            run_codex_runner_child(
-                fixtures[2].journal.root_path(),
-                leases[2].executor_execution_id,
-            ),
-            run_codex_runner_child(
-                fixtures[3].journal.root_path(),
-                leases[3].executor_execution_id,
-            ),
-        );
-        [results.0, results.1, results.2, results.3]
-            .into_iter()
-            .for_each(|result| result.unwrap());
-
-        for (fixture, lease) in fixtures.iter().zip(&leases) {
-            let expected = normalized_fixture_png(&fixture._temp.path().join("source.png"));
-            let spool = ExecutionSpool::for_lease(&fixture.journal, lease).unwrap();
-            assert_eq!(
-                spool.observe().unwrap(),
-                ProcessObservation::Succeeded(SupervisedOutput::without_provider_cost(expected))
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn stop_signal_takes_one_final_runtime_output_snapshot() {
-        let fixture = CodexFixture::new();
-        let lease = fixture.lease();
-        fixture.journal.start_or_attach(&lease).unwrap();
-        let spool = Arc::new(ExecutionSpool::for_lease(&fixture.journal, &lease).unwrap());
-        let expected = fs::read(fixture._temp.path().join("source.png")).unwrap();
-        let runtime_output = spool
-            .runtime_home_path()
-            .unwrap()
-            .join(CODEX_RUNTIME_OUTPUT_FILE);
-        let codex_home = spool.codex_home_path().unwrap().to_path_buf();
-        let (stop, stop_rx) = oneshot::channel();
-        let capture_spool = Arc::clone(&spool);
-        let capture = tokio::spawn(async move {
-            capture_ephemeral_output(
-                capture_spool,
-                "provider-output.png",
-                CODEX_RUNTIME_OUTPUT_FILE,
-                codex_home,
-                "png".to_string(),
-                stop_rx,
-            )
-            .await
-        });
-
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        fs::write(runtime_output, &expected).unwrap();
-        stop.send(()).unwrap();
-        let capture = capture.await.unwrap().unwrap();
-        let output = capture.output.expect("final snapshot should retain output");
-
-        assert_eq!(output.source, CodexOutputSource::Runtime);
-        assert_eq!(output.bytes, expected);
-        assert!(capture.runtime_observed);
-        assert!(!capture.workspace_observed);
-    }
-
-    #[tokio::test]
-    async fn native_output_capture_is_scoped_to_the_execution_codex_home() {
-        let fixture = CodexFixture::new();
-        let first_lease = fixture.lease();
-        let second_lease = fixture.lease();
-        fixture.journal.start_or_attach(&first_lease).unwrap();
-        fixture.journal.start_or_attach(&second_lease).unwrap();
-        let first_spool = ExecutionSpool::for_lease(&fixture.journal, &first_lease).unwrap();
-        let second_spool = ExecutionSpool::for_lease(&fixture.journal, &second_lease).unwrap();
-        let expected = fs::read(fixture._temp.path().join("source.png")).unwrap();
-        let second_home = second_spool.codex_home_path().unwrap().to_path_buf();
-        let second_output = second_home
-            .join("generated_images")
-            .join("019fd9f5-badb-7dd3-8903-28ffded0ef54")
-            .join("generated.png");
-        fs::create_dir_all(second_output.parent().unwrap()).unwrap();
-        fs::write(&second_output, &expected).unwrap();
-
-        let first = snapshot_native_codex_output(first_spool.codex_home_path().unwrap(), "png")
-            .await
-            .unwrap();
-        let second = snapshot_native_codex_output(&second_home, "png")
-            .await
-            .unwrap()
-            .expect("the owning execution should recover its native output");
-
-        assert!(first.is_none());
-        assert_eq!(second.source, CodexOutputSource::Native);
-        assert_eq!(second.bytes, expected);
-        assert_ne!(
-            first_spool.codex_home_path().unwrap(),
-            second_spool.codex_home_path().unwrap()
-        );
-    }
-
-    #[tokio::test]
-    async fn native_png_is_published_as_the_requested_jpeg_format() {
-        let fixture = CodexFixture::generated_images_output_only();
+    async fn transient_native_file_with_sealed_handoff_succeeds_without_polling() {
+        let fixture = CodexFixture::transient_native_with_sealed_output();
         let mut command = fixture.command();
         command.output_format = "jpeg".to_string();
         command.output_compression = Some(80);
@@ -2071,6 +1372,124 @@ mod tests {
             spool.observe().unwrap(),
             ProcessObservation::Succeeded(SupervisedOutput::without_provider_cost(expected))
         );
+    }
+
+    #[tokio::test]
+    async fn transient_native_file_without_durable_handoff_fails_closed() {
+        let fixture = CodexFixture::transient_native_output_only();
+        let lease = fixture.lease();
+        let context = fixture.context(&lease);
+        fixture.journal.start_or_attach(&lease).unwrap();
+        fixture.supervisor.prepare(&lease, &context).await.unwrap();
+        assert_eq!(
+            fixture.journal.commit_launch(&lease).unwrap(),
+            LaunchDecision::LaunchOnce
+        );
+        let spool = ExecutionSpool::for_lease(&fixture.journal, &lease).unwrap();
+
+        run_codex_runner_child(fixture.journal.root_path(), lease.executor_execution_id)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            spool.observe().unwrap(),
+            ProcessObservation::Failed {
+                error_code: "codex_image_output_disappeared".to_string(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "40-process stress gate; run explicitly to avoid starving unrelated process tests"]
+    async fn forty_concurrent_durable_handoffs_are_execution_scoped() {
+        const CONCURRENCY: usize = 40;
+        let shared_root = TempDir::new().unwrap();
+        let shared_journal =
+            Arc::new(FilesystemRunnerJournal::new(shared_root.path().join("journal")).unwrap());
+        let fixtures = (0..CONCURRENCY)
+            .map(|index| {
+                let mut fixture = CodexFixture::sealed_output_with_marker_on(
+                    Arc::clone(&shared_journal),
+                    index as u8,
+                );
+                fixture.supervisor.request_timeout = Duration::from_secs(30);
+                fixture
+            })
+            .collect::<Vec<_>>();
+        let leases = fixtures.iter().map(CodexFixture::lease).collect::<Vec<_>>();
+        for (fixture, lease) in fixtures.iter().zip(&leases) {
+            fixture.journal.start_or_attach(lease).unwrap();
+            fixture
+                .supervisor
+                .prepare(lease, &fixture.context(lease))
+                .await
+                .unwrap();
+            assert_eq!(
+                fixture.journal.commit_launch(lease).unwrap(),
+                LaunchDecision::LaunchOnce
+            );
+        }
+
+        let mut tasks = tokio::task::JoinSet::new();
+        for (fixture, lease) in fixtures.iter().zip(&leases) {
+            let root = fixture.journal.root_path().to_path_buf();
+            let execution_id = lease.executor_execution_id;
+            tasks.spawn(async move { run_codex_runner_child(root, execution_id).await });
+        }
+        while let Some(result) = tasks.join_next().await {
+            result.unwrap().unwrap();
+        }
+
+        let expected = fixtures
+            .iter()
+            .map(|fixture| normalized_fixture_png(&fixture._temp.path().join("source.png")))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            expected
+                .iter()
+                .map(|bytes| sha256(bytes))
+                .collect::<HashSet<_>>()
+                .len(),
+            CONCURRENCY
+        );
+
+        for ((fixture, lease), expected) in fixtures.iter().zip(&leases).zip(expected) {
+            let spool = ExecutionSpool::for_lease(&fixture.journal, lease).unwrap();
+            assert_eq!(
+                spool.observe().unwrap(),
+                ProcessObservation::Succeeded(SupervisedOutput::without_provider_cost(expected))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unlinked_partial_handoff_is_never_published() {
+        let fixture = CodexFixture::unlinked_partial_output();
+        let lease = fixture.lease();
+        let context = fixture.context(&lease);
+        fixture.journal.start_or_attach(&lease).unwrap();
+        fixture.supervisor.prepare(&lease, &context).await.unwrap();
+        assert_eq!(
+            fixture.journal.commit_launch(&lease).unwrap(),
+            LaunchDecision::LaunchOnce
+        );
+        let spool = ExecutionSpool::for_lease(&fixture.journal, &lease).unwrap();
+
+        run_codex_runner_child(fixture.journal.root_path(), lease.executor_execution_id)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            spool.observe().unwrap(),
+            ProcessObservation::Failed {
+                error_code: "codex_image_output_disappeared".to_string(),
+            }
+        );
+        let execution_root = fixture
+            .journal
+            .root_path()
+            .join(lease.executor_execution_id.simple().to_string());
+        assert!(!execution_root.join("output.bin").exists());
     }
 
     #[test]
@@ -2120,118 +1539,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recovers_isolated_codex_generated_image_when_prompt_sealing_is_missing() {
-        let fixture = CodexFixture::generated_images_output_only();
-        let lease = fixture.lease();
-        let context = fixture.context(&lease);
-        let expected = normalized_fixture_png(&fixture._temp.path().join("source.png"));
-        fixture.journal.start_or_attach(&lease).unwrap();
-        fixture.supervisor.prepare(&lease, &context).await.unwrap();
-        assert_eq!(
-            fixture.journal.commit_launch(&lease).unwrap(),
-            LaunchDecision::LaunchOnce
-        );
-        let spool = ExecutionSpool::for_lease(&fixture.journal, &lease).unwrap();
-
-        run_codex_runner_child(fixture.journal.root_path(), lease.executor_execution_id)
-            .await
-            .unwrap();
-
-        assert_eq!(
-            spool.observe().unwrap(),
-            ProcessObservation::Succeeded(SupervisedOutput::without_provider_cost(expected))
-        );
-        let execution_root = fixture
-            .journal
-            .root_path()
-            .join(lease.executor_execution_id.simple().to_string());
-        assert!(!execution_root.join("codex-home").exists());
-        assert!(!execution_root.join("workspace").exists());
-        assert!(!execution_root.join("runtime-home").exists());
-    }
-
-    #[tokio::test]
-    async fn recovers_inline_image_from_the_execution_session_before_cleanup() {
-        let fixture = CodexFixture::session_output_only();
-        let lease = fixture.lease();
-        let context = fixture.context(&lease);
-        let expected = normalized_fixture_png(&fixture._temp.path().join("source.png"));
-        fixture.journal.start_or_attach(&lease).unwrap();
-        fixture.supervisor.prepare(&lease, &context).await.unwrap();
-        assert_eq!(
-            fixture.journal.commit_launch(&lease).unwrap(),
-            LaunchDecision::LaunchOnce
-        );
-        let spool = ExecutionSpool::for_lease(&fixture.journal, &lease).unwrap();
-
-        run_codex_runner_child(fixture.journal.root_path(), lease.executor_execution_id)
-            .await
-            .unwrap();
-
-        assert_eq!(
-            spool.observe().unwrap(),
-            ProcessObservation::Succeeded(SupervisedOutput::without_provider_cost(expected))
-        );
-        let execution_root = fixture
-            .journal
-            .root_path()
-            .join(lease.executor_execution_id.simple().to_string());
-        assert!(!execution_root.join("codex-home").exists());
-        assert!(!execution_root.join("workspace").exists());
-        assert!(!execution_root.join("runtime-home").exists());
-    }
-
-    #[tokio::test]
-    async fn concurrent_session_recovery_is_scoped_to_each_execution_home() {
-        let root = TempDir::new().unwrap();
-        let first_home = root.path().join("first");
-        let second_home = root.path().join("second");
-        let first_thread = Uuid::new_v4();
-        let second_thread = Uuid::new_v4();
-        let first = png_bytes(1, 1);
-        let second = png_bytes(2, 1);
-        write_session_rollout(&first_home, first_thread, &first);
-        write_session_rollout(&second_home, second_thread, &second);
-
-        let (first_recovery, second_recovery) = tokio::join!(
-            recover_codex_session_output(&first_home, Some(first_thread)),
-            recover_codex_session_output(&second_home, Some(second_thread)),
-        );
-
-        let first_recovery = first_recovery.unwrap().unwrap();
-        let second_recovery = second_recovery.unwrap().unwrap();
-        assert_eq!(first_recovery.source, CodexOutputSource::Session);
-        assert_eq!(second_recovery.source, CodexOutputSource::Session);
-        assert_eq!(first_recovery.bytes, first);
-        assert_eq!(second_recovery.bytes, second);
-        assert!(
-            recover_codex_session_output(&first_home, Some(second_thread))
-                .await
-                .unwrap()
-                .is_none()
-        );
-    }
-
-    #[tokio::test]
-    async fn session_recovery_uses_the_latest_image_after_a_bounded_tool_retry() {
-        let root = TempDir::new().unwrap();
-        let thread_id = Uuid::new_v4();
-        let first = png_bytes(1, 1);
-        let retried = png_bytes(2, 1);
-        write_session_rollout_with_images(root.path(), thread_id, &[&first, &retried]);
-
-        let recovered = recover_codex_session_output(root.path(), Some(thread_id))
-            .await
-            .unwrap()
-            .unwrap();
-
-        assert_eq!(recovered.source, CodexOutputSource::Session);
-        assert_eq!(recovered.bytes, retried);
-    }
-
-    #[tokio::test]
-    async fn captured_output_is_never_published_after_failed_codex_exit() {
-        let fixture = CodexFixture::ephemeral_workspace_output(1);
+    async fn transient_output_is_never_published_after_failed_codex_exit() {
+        let fixture = CodexFixture::transient_workspace_output_on_failed_exit();
         let lease = fixture.lease();
         let context = fixture.context(&lease);
         fixture.journal.start_or_attach(&lease).unwrap();
@@ -2260,7 +1569,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn preexisting_workspace_output_is_never_attributed_to_a_new_process() {
+    async fn preexisting_workspace_output_is_ignored_as_non_authoritative() {
         let fixture = CodexFixture::new();
         let lease = fixture.lease();
         let context = fixture.context(&lease);
@@ -2271,38 +1580,12 @@ mod tests {
             LaunchDecision::LaunchOnce
         );
         let spool = ExecutionSpool::for_lease(&fixture.journal, &lease).unwrap();
-        fs::copy(
-            fixture._temp.path().join("source.png"),
+        fs::write(
             spool.workspace_path().unwrap().join("provider-output.png"),
+            png_bytes(9, 1),
         )
         .unwrap();
-
-        run_codex_runner_child(fixture.journal.root_path(), lease.executor_execution_id)
-            .await
-            .unwrap();
-
-        assert_eq!(
-            spool.observe().unwrap(),
-            ProcessObservation::Uncertain {
-                error_code: "codex_workspace_output_preexisting".to_string(),
-            }
-        );
-        assert!(!fixture.invocations.exists());
-    }
-
-    #[tokio::test]
-    async fn capture_tracks_the_latest_stable_workspace_output_until_exit() {
-        let fixture = CodexFixture::changing_workspace_output();
-        let lease = fixture.lease();
-        let context = fixture.context(&lease);
-        let expected = fs::read(fixture._temp.path().join("source-2.png")).unwrap();
-        fixture.journal.start_or_attach(&lease).unwrap();
-        fixture.supervisor.prepare(&lease, &context).await.unwrap();
-        assert_eq!(
-            fixture.journal.commit_launch(&lease).unwrap(),
-            LaunchDecision::LaunchOnce
-        );
-        let spool = ExecutionSpool::for_lease(&fixture.journal, &lease).unwrap();
+        let expected = normalized_fixture_png(&fixture._temp.path().join("source.png"));
 
         run_codex_runner_child(fixture.journal.root_path(), lease.executor_execution_id)
             .await
@@ -2312,6 +1595,7 @@ mod tests {
             spool.observe().unwrap(),
             ProcessObservation::Succeeded(SupervisedOutput::without_provider_cost(expected))
         );
+        assert_eq!(fs::read_to_string(&fixture.invocations).unwrap(), "1\n");
     }
 
     #[tokio::test]
@@ -2449,74 +1733,53 @@ mod tests {
             })
         }
 
-        fn ephemeral_workspace_output(exit_code: u8) -> Self {
-            Self::with_script(|invocations, image, root| {
-                format!(
-                    "#!/bin/sh\nset -eu\n/bin/cat >/dev/null\nprintf '1\\n' >> '{}'\nworkspace=''\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = '--cd' ]; then\n    shift\n    workspace=\"$1\"\n    break\n  fi\n  shift\ndone\ntest -n \"$workspace\"\n/bin/cp '{}' \"$workspace/provider-output.png\"\nprintf 'created\\n' > '{}'\n/bin/sleep 1\n/bin/rm \"$workspace/provider-output.png\"\nprintf 'deleted\\n' > '{}'\nexit {}\n",
-                    invocations.display(),
-                    image.display(),
-                    root.join("provider-output-created").display(),
-                    root.join("provider-output-deleted").display(),
-                    exit_code,
-                )
-            })
-        }
-
-        fn disappearing_runtime_output() -> Self {
+        fn transient_workspace_output_on_failed_exit() -> Self {
             Self::with_script(|invocations, image, _root| {
                 format!(
-                    "#!/bin/sh\nset -eu\n/bin/cat >/dev/null\nprintf '1\\n' >> '{}'\nworkspace=''\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = '--cd' ]; then\n    shift\n    workspace=\"$1\"\n    break\n  fi\n  shift\ndone\ntest -n \"$workspace\"\n/bin/cp '{}' \"$workspace/provider-output.png\"\n/bin/cp '{}' sealed-output.bin\n/bin/rm sealed-output.bin\n",
+                    "#!/bin/sh\nset -eu\n/bin/cat >/dev/null\nprintf '1\\n' >> '{}'\nworkspace=''\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = '--cd' ]; then\n    shift\n    workspace=\"$1\"\n    break\n  fi\n  shift\ndone\ntest -n \"$workspace\"\n/bin/cp '{}' \"$workspace/provider-output.png\"\n/bin/rm \"$workspace/provider-output.png\"\nexit 1\n",
                     invocations.display(),
-                    image.display(),
                     image.display(),
                 )
             })
         }
 
-        fn short_lived_workspace_output() -> Self {
+        fn transient_native_output_only() -> Self {
             Self::with_script(|invocations, image, _root| {
                 format!(
-                    "#!/bin/sh\nset -eu\n/bin/cat >/dev/null\nprintf '1\\n' >> '{}'\nworkspace=''\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = '--cd' ]; then\n    shift\n    workspace=\"$1\"\n    break\n  fi\n  shift\ndone\ntest -n \"$workspace\"\n/bin/sleep 0.05\n/bin/cp '{}' \"$workspace/provider-output.png\"\n/bin/sleep 0.05\n/bin/rm \"$workspace/provider-output.png\"\n",
+                    "#!/bin/sh\nset -eu\n/bin/cat >/dev/null\nprintf '1\\n' >> '{}'\nthread_id='019fd9f5-badb-7dd3-8903-28ffded0ef54'\noutput_dir=\"$CODEX_HOME/generated_images/$thread_id\"\n/bin/mkdir -p \"$output_dir\"\n/bin/cp '{}' \"$output_dir/generated.png\"\n/bin/rm \"$output_dir/generated.png\"\nprintf '{{\"type\":\"thread.started\",\"thread_id\":\"%s\"}}\\n' \"$thread_id\"\nprintf '{{\"type\":\"item.completed\",\"item\":{{\"type\":\"image_generation_call\"}}}}\\n'\n",
                     invocations.display(),
                     image.display(),
                 )
             })
         }
 
-        fn generated_images_output_only() -> Self {
+        fn transient_native_with_sealed_output() -> Self {
             Self::with_script(|invocations, image, _root| {
                 format!(
-                    "#!/bin/sh\nset -eu\n/bin/cat >/dev/null\nprintf '1\\n' >> '{}'\nthread_id='019fd9f5-badb-7dd3-8903-28ffded0ef54'\n/bin/mkdir -p \"$CODEX_HOME/generated_images/$thread_id\"\n/bin/cp '{}' \"$CODEX_HOME/generated_images/$thread_id/generated.png\"\nprintf '{{\"type\":\"thread.started\",\"thread_id\":\"%s\"}}\\n' \"$thread_id\"\nprintf '{{\"type\":\"item.completed\",\"item\":{{\"type\":\"image_generation_call\"}}}}\\n'\n",
+                    "#!/bin/sh\nset -eu\n/bin/cat >/dev/null\nprintf '1\\n' >> '{}'\nthread_id='019fd9f5-badb-7dd3-8903-28ffded0ef54'\noutput_dir=\"$CODEX_HOME/generated_images/$thread_id\"\n/bin/mkdir -p \"$output_dir\"\n/bin/cp '{}' \"$output_dir/generated.png\"\n/bin/cp \"$output_dir/generated.png\" sealed-output.bin.partial\n/bin/mv sealed-output.bin.partial sealed-output.bin\n/bin/rm \"$output_dir/generated.png\"\nprintf '{{\"type\":\"thread.started\",\"thread_id\":\"%s\"}}\\n' \"$thread_id\"\nprintf '{{\"type\":\"item.completed\",\"item\":{{\"type\":\"image_generation_call\"}}}}\\n'\n",
                     invocations.display(),
                     image.display(),
                 )
             })
         }
 
-        fn session_output_only() -> Self {
+        fn unlinked_partial_output() -> Self {
             Self::with_script(|invocations, image, _root| {
-                let encoded = STANDARD.encode(fs::read(image).unwrap());
                 format!(
-                    "#!/bin/sh\nset -eu\n/bin/cat >/dev/null\nprintf '1\\n' >> '{}'\nfor argument in \"$@\"; do\n  test \"$argument\" != '--ephemeral'\ndone\nthread_id='019fd9f5-badb-7dd3-8903-28ffded0ef54'\nsession_dir=\"$CODEX_HOME/sessions/2026/08/13\"\n/bin/mkdir -p \"$session_dir\"\nprintf '%s\\n' '{{\"timestamp\":\"2026-08-13T00:00:00Z\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"image_generation_end\",\"call_id\":\"ig-test\",\"status\":\"generating\",\"result\":\"{}\"}}}}' > \"$session_dir/rollout-2026-08-13T00-00-00-$thread_id.jsonl\"\nprintf '{{\"type\":\"thread.started\",\"thread_id\":\"%s\"}}\\n' \"$thread_id\"\nprintf '{{\"type\":\"item.completed\",\"item\":{{\"type\":\"image_generation_call\"}}}}\\n'\n",
+                    "#!/bin/sh\nset -eu\n/bin/cat >/dev/null\nprintf '1\\n' >> '{}'\n/bin/dd if='{}' of=sealed-output.bin.partial bs=1 count=16 2>/dev/null\n/bin/rm sealed-output.bin.partial\n",
                     invocations.display(),
-                    encoded,
+                    image.display(),
                 )
             })
         }
 
-        fn changing_workspace_output() -> Self {
-            Self::with_script(|invocations, image, root| {
-                let second = root.join("source-2.png");
-                let mut bytes = std::io::Cursor::new(Vec::new());
-                image::DynamicImage::new_rgb8(2, 2)
-                    .write_to(&mut bytes, image::ImageFormat::Png)
-                    .unwrap();
-                fs::write(&second, bytes.into_inner()).unwrap();
+        fn sealed_output_with_marker_on(journal: Arc<FilesystemRunnerJournal>, marker: u8) -> Self {
+            Self::with_script_and_journal(journal, |invocations, image, _root| {
+                fs::write(image, png_bytes(u32::from(marker) + 1, 1)).unwrap();
                 format!(
-                    "#!/bin/sh\nset -eu\n/bin/cat >/dev/null\nprintf '1\\n' >> '{}'\nworkspace=''\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = '--cd' ]; then\n    shift\n    workspace=\"$1\"\n    break\n  fi\n  shift\ndone\ntest -n \"$workspace\"\n/bin/cp '{}' \"$workspace/provider-output.png\"\n/bin/sleep 1\n/bin/cp '{}' \"$workspace/provider-output.png\"\n/bin/sleep 1\n/bin/rm \"$workspace/provider-output.png\"\nexit 0\n",
+                    "#!/bin/sh\nset -eu\n/bin/cat >/dev/null\nprintf '1\\n' >> '{}'\n/bin/cp '{}' sealed-output.bin.partial\n/bin/mv sealed-output.bin.partial sealed-output.bin\n",
                     invocations.display(),
                     image.display(),
-                    second.display(),
                 )
             })
         }
@@ -2525,6 +1788,21 @@ mod tests {
             let temp = TempDir::new().unwrap();
             let journal =
                 Arc::new(FilesystemRunnerJournal::new(temp.path().join("journal")).unwrap());
+            Self::with_temp_script_and_journal(temp, journal, build_script)
+        }
+
+        fn with_script_and_journal(
+            journal: Arc<FilesystemRunnerJournal>,
+            build_script: impl FnOnce(&Path, &Path, &Path) -> String,
+        ) -> Self {
+            Self::with_temp_script_and_journal(TempDir::new().unwrap(), journal, build_script)
+        }
+
+        fn with_temp_script_and_journal(
+            temp: TempDir,
+            journal: Arc<FilesystemRunnerJournal>,
+            build_script: impl FnOnce(&Path, &Path, &Path) -> String,
+        ) -> Self {
             let credentials = temp.path().join("credentials");
             fs::create_dir(&credentials).unwrap();
             let auth = credentials.join(AUTH_FILE);
@@ -2652,37 +1930,5 @@ mod tests {
 
     fn normalized_fixture_png(path: &Path) -> Vec<u8> {
         normalize_captured_image(fs::read(path).unwrap(), "png", None).unwrap()
-    }
-
-    fn write_session_rollout(codex_home: &Path, thread_id: Uuid, image: &[u8]) {
-        write_session_rollout_with_images(codex_home, thread_id, &[image]);
-    }
-
-    fn write_session_rollout_with_images(codex_home: &Path, thread_id: Uuid, images: &[&[u8]]) {
-        let directory = codex_home.join("sessions/2026/08/13");
-        fs::create_dir_all(&directory).unwrap();
-        let events = images
-            .iter()
-            .enumerate()
-            .map(|(index, image)| {
-                serde_json::json!({
-                    "timestamp": "2026-08-13T00:00:00Z",
-                    "type": "event_msg",
-                    "payload": {
-                        "type": "image_generation_end",
-                        "call_id": format!("ig-test-{index}"),
-                        "status": "generating",
-                        "result": STANDARD.encode(image),
-                    }
-                })
-                .to_string()
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        fs::write(
-            directory.join(format!("rollout-2026-08-13T00-00-00-{thread_id}.jsonl")),
-            format!("{events}\n"),
-        )
-        .unwrap();
     }
 }
