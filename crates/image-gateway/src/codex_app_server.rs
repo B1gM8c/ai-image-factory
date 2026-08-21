@@ -163,7 +163,7 @@ struct StreamDiagnostic {
     sha256: String,
     bytes: usize,
     truncated: bool,
-    class: &'static str,
+    class: String,
 }
 
 #[derive(Debug, Default)]
@@ -553,7 +553,7 @@ where
             sha256: hex::encode(digest.finalize()),
             bytes: total,
             truncated: total > MAX_STDERR_DIGEST_BYTES,
-            class: classify_bytes(&sample),
+            class: classify_stream_bytes(&sample),
         }
     });
     let mut stdout = BufReader::new(stdout);
@@ -836,6 +836,36 @@ fn classify_bytes(value: &[u8]) -> &'static str {
     } else {
         "unknown"
     }
+}
+
+fn classify_stream_bytes(value: &[u8]) -> String {
+    let normalized = String::from_utf8_lossy(value);
+    if let Some(code) = extract_stable_api_error_code(&normalized) {
+        return format!("api_code:{code}");
+    }
+    for status in [400_u16, 401, 403, 404, 409, 422, 429, 500, 502, 503, 504] {
+        if normalized.contains(&format!("http {status}")) {
+            return format!("http_status:{status}");
+        }
+    }
+    classify_bytes(value).to_string()
+}
+
+fn extract_stable_api_error_code(value: &str) -> Option<String> {
+    for marker in [r#""code":""#, r#"\"code\":\""#] {
+        let Some(start) = value.find(marker).map(|index| index + marker.len()) else {
+            continue;
+        };
+        let code: String = value[start..]
+            .chars()
+            .take(64)
+            .take_while(|value| value.is_ascii_alphanumeric() || matches!(value, '_' | '-' | '.'))
+            .collect();
+        if !code.is_empty() {
+            return Some(code.to_ascii_lowercase());
+        }
+    }
+    None
 }
 
 async fn await_stderr_diagnostic(
@@ -1392,7 +1422,7 @@ mod tests {
                 sha256: hex::encode(Sha256::digest(b"stderr-sensitive-material")),
                 bytes: 25,
                 truncated: false,
-                class: "authentication",
+                class: "authentication".to_string(),
             }),
             &ExitDiagnostic {
                 observed: true,
@@ -1475,6 +1505,16 @@ mod tests {
             "forbidden"
         );
         assert_eq!(classify_bytes(b"policy rejected"), "policy");
+        assert_eq!(
+            classify_stream_bytes(
+                br#"image generation failed: http 400 Bad Request: Some("{\"error\":{\"code\":\"content_policy\"}}")"#,
+            ),
+            "api_code:content_policy"
+        );
+        assert_eq!(
+            classify_stream_bytes(b"image generation failed: http 422 Unprocessable Entity"),
+            "http_status:422"
+        );
     }
 
     fn announced_state(home: &Path, thread_id: Uuid) -> ProtocolState {
