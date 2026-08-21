@@ -653,7 +653,7 @@ async fn runtime_supervisor_stops_when_postgres_lease_authority_is_lost() -> Tes
             registration.clone(),
             ProviderRuntimeSupervisorConfig {
                 lease_ms: 5_000,
-                heartbeat_interval: Duration::from_millis(20),
+                heartbeat_interval: Duration::from_millis(200),
             },
         );
         let started = Arc::new(tokio::sync::Semaphore::new(0));
@@ -2074,7 +2074,9 @@ async fn submit_service_resumes_unacknowledged_fresh_claim_without_reclaiming() 
             .first()
             .ok_or_else(|| "lost claim fixture was not prepared".to_owned())?;
         let command = submit_iteration_command("submit-service-lost-claim");
-        let config = submit_service_config(200);
+        let mut config = submit_service_config(200);
+        config.executor_lease_ms = 2_000;
+        config.recovery_lease_ms = 2_000;
         let claimed = executor_store
             .claim_prepared(
                 &config.executor_scope,
@@ -2310,10 +2312,10 @@ async fn submit_service_heartbeats_fresh_authority_during_provider_timeout() -> 
         let provider = ScriptedFakeProvider::default();
         provider.push_submit(SubmitStep::Never);
         let journal = tempfile::tempdir().map_err(debug_error)?;
-        let mut config = submit_service_config(150);
-        config.executor_lease_ms = 80;
-        config.recovery_lease_ms = 80;
-        config.heartbeat_interval = Duration::from_millis(20);
+        let mut config = submit_service_config(1_500);
+        config.executor_lease_ms = 800;
+        config.recovery_lease_ms = 800;
+        config.heartbeat_interval = Duration::from_millis(200);
         let service = ProviderSubmitService::new(
             executor_store,
             PostgresProviderTaskStore::new(database.pool.clone()),
@@ -2348,8 +2350,8 @@ async fn submit_service_heartbeats_fresh_authority_during_provider_timeout() -> 
             run == ProviderSubmitRun::FreshSubmitted
                 && provider.calls().submit == 1
                 && projection.0 == "outcome_unknown"
-                && projection.2.saturating_sub(projection.1) >= 120
-                && started.elapsed() >= Duration::from_millis(100),
+                && projection.2.saturating_sub(projection.1) >= 1_200
+                && started.elapsed() >= Duration::from_millis(1_000),
             format!("fresh submit authority was not heartbeated: {run:?}/{projection:?}"),
         )
     }
