@@ -425,37 +425,26 @@ async fn run_codex_attempt(
         return Err(ImageGatewayError::codex_cli_failed().into());
     }
 
-    let native_output = if events.completed_image_generation
-        && !events.thread_id_ambiguous
-        && !events.image_call_ambiguous
-    {
-        match (events.thread_id.as_deref(), events.image_call_id.as_deref()) {
-            (Some(thread_id), Some(call_id)) => {
-                let thread_id = thread_id.to_string();
-                let call_id = call_id.to_string();
-                tokio::task::spawn_blocking(move || {
-                    native_output_root.read(&thread_id, &call_id, MAX_CODEX_OUTPUT_BYTES)
-                })
-                .await
-                .map_err(|_| ImageGatewayError::backend("Codex native output validation failed"))?
-                .map_err(|error| match error {
-                    crate::runner::process::ProcessSpoolError::Unavailable => {
-                        ImageGatewayError::service_unavailable(
-                            "Codex native output storage is unavailable",
-                        )
-                    }
-                    crate::runner::process::ProcessSpoolError::InvalidInput
-                    | crate::runner::process::ProcessSpoolError::Conflict
-                    | crate::runner::process::ProcessSpoolError::Integrity => {
-                        ImageGatewayError::codex_image_output_disappeared()
-                    }
-                })?
-            }
-            _ => None,
+    let events_for_output = events.clone();
+    let native_output = tokio::task::spawn_blocking(move || {
+        read_exact_codex_native_output(
+            &native_output_root,
+            &events_for_output,
+            MAX_CODEX_OUTPUT_BYTES,
+        )
+    })
+    .await
+    .map_err(|_| ImageGatewayError::backend("Codex native output validation failed"))?
+    .map_err(|error| match error {
+        crate::runner::process::ProcessSpoolError::Unavailable => {
+            ImageGatewayError::service_unavailable("Codex native output storage is unavailable")
         }
-    } else {
-        None
-    };
+        crate::runner::process::ProcessSpoolError::InvalidInput
+        | crate::runner::process::ProcessSpoolError::Conflict
+        | crate::runner::process::ProcessSpoolError::Integrity => {
+            ImageGatewayError::codex_image_output_disappeared()
+        }
+    })?;
     let bytes = if let Some(bytes) = native_output {
         bytes
     } else {
@@ -508,6 +497,31 @@ fn retryable_codex_no_image_generation(events: &CodexCliEventSummary) -> bool {
         && events.malformed_events == 0
         && !events.saw_image_generation
         && !events.completed_image_generation
+}
+
+fn exact_codex_native_output_identity(events: &CodexCliEventSummary) -> Option<(&str, &str)> {
+    if !events.capture_complete
+        || !events.completed_image_generation
+        || events.thread_id_ambiguous
+        || events.image_call_ambiguous
+    {
+        return None;
+    }
+    Some((
+        events.thread_id.as_deref()?,
+        events.image_call_id.as_deref()?,
+    ))
+}
+
+fn read_exact_codex_native_output(
+    native_output_root: &crate::runner::process::CodexExtensionOutputRoot,
+    events: &CodexCliEventSummary,
+    max_bytes: u64,
+) -> Result<Option<Vec<u8>>, crate::runner::process::ProcessSpoolError> {
+    let Some((thread_id, call_id)) = exact_codex_native_output_identity(events) else {
+        return Ok(None);
+    };
+    native_output_root.read(thread_id, call_id, max_bytes)
 }
 
 async fn capture_codex_events<R>(
@@ -865,9 +879,98 @@ fn validate_mask_for_first_image(
 mod tests {
     use super::*;
     use image::ImageFormat;
+    use image_cli_runtime::VerifiedExecutable;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
-    use std::{collections::BTreeMap, io::Cursor};
+    use std::{
+        collections::BTreeMap,
+        io::Cursor,
+        pin::Pin,
+        task::{Context, Poll},
+    };
+    use tokio::io::ReadBuf;
+
+    enum PartialReadEnd {
+        Error,
+        Pending,
+    }
+
+    struct PartialEventReader {
+        visible: Vec<u8>,
+        hidden: Vec<u8>,
+        offset: usize,
+        end: PartialReadEnd,
+    }
+
+    impl AsyncRead for PartialEventReader {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+            buffer: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            if self.offset < self.visible.len() {
+                let count = buffer
+                    .remaining()
+                    .min(self.visible.len().saturating_sub(self.offset));
+                let end = self.offset + count;
+                buffer.put_slice(&self.visible[self.offset..end]);
+                self.offset = end;
+                return Poll::Ready(Ok(()));
+            }
+            debug_assert!(!self.hidden.is_empty());
+            match self.end {
+                PartialReadEnd::Error => Poll::Ready(Err(std::io::Error::other(
+                    "injected Codex stdout reader failure",
+                ))),
+                PartialReadEnd::Pending => Poll::Pending,
+            }
+        }
+    }
+
+    fn partial_event_reader(end: PartialReadEnd) -> PartialEventReader {
+        PartialEventReader {
+            visible: b"{\"type\":\"thread.started\",\"thread_id\":\"019fd666-0416-7da2-bcc3-7f2f51efd3c8\"}\n{\"type\":\"item.completed\",\"item\":{\"type\":\"image_generation_call\",\"id\":\"call_visible_image\"}}\n".to_vec(),
+            hidden: b"{\"type\":\"thread.started\",\"thread_id\":\"019fd666-0416-7da2-bcc3-7f2f51efd3c9\"}\n{\"type\":\"item.completed\",\"item\":{\"type\":\"image_generation_call\",\"id\":\"call_hidden_image\"}}\n".to_vec(),
+            offset: 0,
+            end,
+        }
+    }
+
+    #[cfg(unix)]
+    fn assert_incomplete_capture_blocks_native_read(summary: &CodexCliEventSummary) {
+        assert!(!summary.capture_complete);
+        assert!(summary.completed_image_generation);
+        assert_eq!(
+            summary.thread_id.as_deref(),
+            Some("019fd666-0416-7da2-bcc3-7f2f51efd3c8")
+        );
+        assert_eq!(summary.image_call_id.as_deref(), Some("call_visible_image"));
+        assert!(exact_codex_native_output_identity(summary).is_none());
+
+        let home = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(home.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let generated = home.path().join("generated_images");
+        let thread = generated.join("019fd666-0416-7da2-bcc3-7f2f51efd3c8");
+        std::fs::create_dir(&generated).unwrap();
+        std::fs::create_dir(&thread).unwrap();
+        std::fs::set_permissions(&generated, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&thread, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let output = thread.join("call_visible_image.png");
+        std::fs::write(&output, b"readable-native-output").unwrap();
+        std::fs::set_permissions(&output, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let root = crate::runner::process::CodexExtensionOutputRoot::open(home.path()).unwrap();
+
+        assert_eq!(
+            read_exact_codex_native_output(&root, summary, 1024).unwrap(),
+            None
+        );
+        let mut complete = summary.clone();
+        complete.capture_complete = true;
+        assert_eq!(
+            read_exact_codex_native_output(&root, &complete, 1024).unwrap(),
+            Some(b"readable-native-output".to_vec())
+        );
+    }
 
     fn png_with_dimensions(width: u32, height: u32) -> Vec<u8> {
         let mut bytes = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
@@ -890,6 +993,163 @@ mod tests {
         let mut cursor = Cursor::new(Vec::new());
         image.write_to(&mut cursor, ImageFormat::Jpeg).unwrap();
         cursor.into_inner()
+    }
+
+    #[tokio::test]
+    #[ignore = "runs the real pinned Codex CLI image tool and may consume image quota"]
+    async fn pinned_codex_cli_preserves_exact_native_output_after_exit() {
+        let executable_path = env::var("FACTORY_CODEX_CONTRACT_EXECUTABLE")
+            .expect("FACTORY_CODEX_CONTRACT_EXECUTABLE must be set");
+        let expected_version = env::var("FACTORY_CODEX_CONTRACT_VERSION")
+            .expect("FACTORY_CODEX_CONTRACT_VERSION must be set");
+        let expected_sha256 = env::var("FACTORY_CODEX_CONTRACT_EXECUTABLE_SHA256")
+            .expect("FACTORY_CODEX_CONTRACT_EXECUTABLE_SHA256 must be set");
+        let expected_sha256 = hex::decode(expected_sha256)
+            .expect("FACTORY_CODEX_CONTRACT_EXECUTABLE_SHA256 must be hexadecimal");
+        let expected_sha256: [u8; 32] = expected_sha256
+            .try_into()
+            .expect("FACTORY_CODEX_CONTRACT_EXECUTABLE_SHA256 must contain 32 bytes");
+        let executable = VerifiedExecutable::new_with_sha256(executable_path, expected_sha256)
+            .expect("pinned Codex executable must match the expected SHA-256");
+
+        let version = Command::new(executable.path())
+            .arg("--version")
+            .output()
+            .await
+            .expect("pinned Codex CLI --version must run");
+        assert!(
+            version.status.success(),
+            "pinned Codex CLI --version failed"
+        );
+        assert!(
+            version.stdout.len() <= 1024 && version.stderr.len() <= 1024,
+            "pinned Codex CLI --version output exceeded the contract bound"
+        );
+        assert_eq!(
+            std::str::from_utf8(&version.stdout)
+                .expect("pinned Codex CLI --version must be UTF-8")
+                .trim(),
+            expected_version
+        );
+
+        let source_codex_home = PathBuf::from(
+            env::var("GATEWAY_CODEX_HOME")
+                .expect("GATEWAY_CODEX_HOME must select the contract-test credentials"),
+        );
+        let request_root = tempfile::tempdir().expect("private request root");
+        std::fs::set_permissions(request_root.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("secure request root permissions");
+        let request_dir = request_root.path().join("workspace");
+        let request_codex_home = request_root.path().join("codex-home");
+        std::fs::create_dir(&request_dir).expect("private request workspace");
+        std::fs::create_dir(&request_codex_home).expect("private request Codex home");
+        std::fs::set_permissions(&request_dir, std::fs::Permissions::from_mode(0o700))
+            .expect("secure request workspace permissions");
+        std::fs::set_permissions(&request_codex_home, std::fs::Permissions::from_mode(0o700))
+            .expect("secure request Codex home permissions");
+        let auth_sha256 = crate::executor::codex_auth_file_sha256(&source_codex_home)
+            .expect("contract-test Codex credentials must be valid");
+        crate::executor::prepare_codex_auth_copy(
+            &request_codex_home,
+            &source_codex_home,
+            &auth_sha256,
+        )
+        .expect("contract-test Codex credentials must copy into the private home");
+        let native_output_root =
+            crate::runner::process::CodexExtensionOutputRoot::open(&request_codex_home)
+                .expect("private Codex native output root");
+
+        let mut command = Command::new(executable.path());
+        command
+            .arg("exec")
+            .arg("--ephemeral")
+            .arg("--ignore-user-config")
+            .arg("--ignore-rules")
+            .arg("--disable")
+            .arg("plugins")
+            .arg("--disable")
+            .arg("apps")
+            .arg("--sandbox")
+            .arg("workspace-write")
+            .arg("--skip-git-repo-check")
+            .arg("--cd")
+            .arg(&request_dir)
+            .arg("--json")
+            .arg("-")
+            .env_clear()
+            .env("CODEX_HOME", &request_codex_home)
+            .env("HOME", &request_codex_home)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        for name in [
+            "PATH",
+            "TMPDIR",
+            "TEMP",
+            "TMP",
+            "LANG",
+            "LC_ALL",
+            "SSL_CERT_FILE",
+            "SSL_CERT_DIR",
+            "SHELL",
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "NO_PROXY",
+        ] {
+            if let Some(value) = env::var_os(name) {
+                command.env(name, value);
+            }
+        }
+
+        let mut child = command.spawn().expect("pinned Codex CLI must start");
+        child
+            .stdin
+            .take()
+            .expect("pinned Codex CLI stdin")
+            .write_all(
+                b"Generate one minimal blue square icon on an opaque white background. Call the enabled image generation tool exactly once, then stop. Do not copy, move, rename, delete, or modify the tool output.",
+            )
+            .await
+            .expect("contract prompt must be written");
+        let output = tokio::time::timeout(Duration::from_secs(900), child.wait_with_output())
+            .await
+            .expect("pinned Codex CLI contract run timed out")
+            .expect("pinned Codex CLI contract run failed");
+        assert!(
+            output.status.success(),
+            "pinned Codex CLI contract run failed"
+        );
+        assert!(
+            output.stdout.len() <= image_cli_runtime::MAX_CAPTURED_STREAM_BYTES
+                && output.stderr.len() <= image_cli_runtime::MAX_CAPTURED_STREAM_BYTES,
+            "pinned Codex CLI event capture was incomplete"
+        );
+
+        let state = Arc::new(Mutex::new(CodexCliEventSummary::default()));
+        let events = capture_codex_events(output.stdout.as_slice(), state).await;
+        assert!(
+            events.capture_complete,
+            "Codex event capture must reach EOF"
+        );
+        assert_eq!(
+            events.malformed_events, 0,
+            "Codex events must be JSON lines"
+        );
+        assert!(
+            events.completed_image_generation,
+            "Codex must emit a completed image_generation_call"
+        );
+        let (thread_id, call_id) = exact_codex_native_output_identity(&events)
+            .expect("Codex must emit one thread.started and one image_generation_call identity");
+        let bytes = native_output_root
+            .read(thread_id, call_id, MAX_CODEX_OUTPUT_BYTES)
+            .expect("exact native output must pass secure stat/open/read validation")
+            .expect("exact native output must remain after Codex exits");
+        assert!(!bytes.is_empty(), "exact native output must not be empty");
+        image::load_from_memory_with_format(&bytes, ImageFormat::Png)
+            .expect("exact native output must decode as PNG");
     }
 
     fn test_config() -> AppConfig {
@@ -1129,6 +1389,48 @@ mod tests {
                 ..CodexCliEventSummary::default()
             }
         ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reader_error_never_authorizes_partial_native_identity() {
+        let state = Arc::new(Mutex::new(CodexCliEventSummary::default()));
+        let summary = capture_codex_events(
+            partial_event_reader(PartialReadEnd::Error),
+            Arc::clone(&state),
+        )
+        .await;
+
+        assert_incomplete_capture_blocks_native_read(&summary);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn join_timeout_never_authorizes_partial_native_identity() {
+        let state = Arc::new(Mutex::new(CodexCliEventSummary::default()));
+        let mut task = tokio::spawn(capture_codex_events(
+            partial_event_reader(PartialReadEnd::Pending),
+            Arc::clone(&state),
+        ));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if state.lock().expect("Codex event lock").events == 2 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut task)
+                .await
+                .is_err()
+        );
+        task.abort();
+        let summary = state.lock().expect("Codex event lock").clone();
+
+        assert_incomplete_capture_blocks_native_read(&summary);
     }
 
     #[cfg(unix)]
