@@ -5,6 +5,12 @@ use uuid::Uuid;
 
 #[tokio::main]
 async fn main() -> Result<(), ImageGatewayError> {
+    tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::WARN)
+        .with_target(false)
+        .compact()
+        .try_init()
+        .map_err(|_| ImageGatewayError::service_unavailable("Codex runner tracing unavailable"))?;
     let mut args = env::args_os().skip(1);
     let root = args
         .next()
