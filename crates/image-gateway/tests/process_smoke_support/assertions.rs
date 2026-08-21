@@ -342,6 +342,10 @@ fn assert_codex_invocation(argv: &[String], expects_runtime_home: bool) -> TestR
         "plugins",
         "--disable",
         "apps",
+        "--disable",
+        "shell_tool",
+        "--disable",
+        "unified_exec",
     ]
     .map(str::to_string)
     .to_vec();
