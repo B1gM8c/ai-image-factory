@@ -590,6 +590,9 @@ impl CliPolicy for CodexCliPolicy {
         .require_directory(WorkingDirectory::new(&request.workspace)?);
         for argument in [
             "exec",
+            "--ephemeral",
+            "--enable",
+            "image_generation",
             "--ignore-user-config",
             "--ignore-rules",
             "--disable",
@@ -649,6 +652,15 @@ impl SpawnObserver for CodexSpawnObserver {
 
     fn observe_completion(&mut self, completion: &ProcessCompletion) -> Result<(), Self::Error> {
         self.events = summarize_codex_events(completion);
+        if !self.events.completed_image_generation {
+            self.events.native_handoff =
+                match self.spool.discard_runtime_output(CODEX_RUNTIME_OUTPUT_FILE) {
+                    Ok(()) => CodexNativeHandoff::NotAttempted,
+                    Err(ProcessSpoolError::Unavailable) => CodexNativeHandoff::Unavailable,
+                    Err(error) => return Err(error),
+                };
+            return Ok(());
+        }
         if self.events.completed_image_generation {
             if self.events.stdout_truncated || self.events.malformed_events > 0 {
                 self.events.native_handoff =
@@ -891,6 +903,16 @@ fn map_cli_runtime_error_with_events(
         )
     {
         return ChildOutcome::Failed("codex_image_output_disappeared");
+    }
+    if !events.completed_image_generation
+        && (matches!(&error, RuntimeError::Output(OutputError::Missing))
+            || matches!(
+                &error,
+                RuntimeError::Output(OutputError::Unavailable(source))
+                    if source.kind() == std::io::ErrorKind::NotFound
+            ))
+    {
+        return ChildOutcome::Failed("codex_no_image_output");
     }
     map_cli_runtime_error(error)
 }
@@ -1371,6 +1393,15 @@ mod tests {
             ),
             ChildOutcome::Failed("codex_no_image_output")
         ));
+        assert!(matches!(
+            map_cli_runtime_error_with_events(
+                RuntimeError::Output(OutputError::Unavailable(std::io::Error::from(
+                    std::io::ErrorKind::NotFound,
+                ))),
+                &CodexEventSummary::default(),
+            ),
+            ChildOutcome::Failed("codex_no_image_output")
+        ));
     }
 
     #[test]
@@ -1616,6 +1647,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn orphan_runtime_output_without_image_event_never_succeeds() {
+        let fixture = CodexFixture::orphan_runtime_output_without_image_event();
+        let lease = fixture.lease();
+        let context = fixture.context(&lease);
+        fixture.journal.start_or_attach(&lease).unwrap();
+        fixture.supervisor.prepare(&lease, &context).await.unwrap();
+        assert_eq!(
+            fixture.journal.commit_launch(&lease).unwrap(),
+            LaunchDecision::LaunchOnce
+        );
+        let spool = ExecutionSpool::for_lease(&fixture.journal, &lease).unwrap();
+
+        run_codex_runner_child(fixture.journal.root_path(), lease.executor_execution_id)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            spool.observe().unwrap(),
+            ProcessObservation::Failed {
+                error_code: "codex_no_image_output".to_string(),
+            }
+        );
+        let execution_root = fixture
+            .journal
+            .root_path()
+            .join(lease.executor_execution_id.simple().to_string());
+        assert!(!execution_root.join("output.bin").exists());
+    }
+
+    #[tokio::test]
     async fn agent_written_runtime_output_is_not_a_success_authority() {
         let fixture = CodexFixture::agent_written_output_with_native();
         let lease = fixture.lease();
@@ -1670,14 +1731,11 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    #[ignore = "40-process stress gate; run explicitly to avoid starving unrelated process tests"]
-    async fn forty_concurrent_durable_handoffs_are_execution_scoped() {
-        const CONCURRENCY: usize = 40;
+    async fn assert_concurrent_durable_handoffs_are_execution_scoped(concurrency: usize) {
         let shared_root = TempDir::new().unwrap();
         let shared_journal =
             Arc::new(FilesystemRunnerJournal::new(shared_root.path().join("journal")).unwrap());
-        let fixtures = (0..CONCURRENCY)
+        let fixtures = (0..concurrency)
             .map(|index| {
                 let mut fixture = CodexFixture::sealed_output_with_marker_on(
                     Arc::clone(&shared_journal),
@@ -1721,7 +1779,7 @@ mod tests {
                 .map(|bytes| sha256(bytes))
                 .collect::<HashSet<_>>()
                 .len(),
-            CONCURRENCY
+            concurrency
         );
 
         for ((fixture, lease), expected) in fixtures.iter().zip(&leases).zip(expected) {
@@ -1729,6 +1787,21 @@ mod tests {
             assert_eq!(
                 spool.observe().unwrap(),
                 ProcessObservation::Succeeded(SupervisedOutput::without_provider_cost(expected))
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "61-process stress gate; run explicitly to avoid starving unrelated process tests"]
+    async fn concurrent_durable_handoffs_are_scoped_at_1_20_40() {
+        for concurrency in [1, 20, 40] {
+            let started = Instant::now();
+            assert_concurrent_durable_handoffs_are_execution_scoped(concurrency).await;
+            let elapsed = started.elapsed();
+            eprintln!("managed Codex handoff concurrency={concurrency} elapsed={elapsed:?}");
+            assert!(
+                elapsed < Duration::from_secs(60),
+                "managed Codex handoff concurrency={concurrency} exceeded 60 seconds"
             );
         }
     }
@@ -1753,7 +1826,7 @@ mod tests {
         assert_eq!(
             spool.observe().unwrap(),
             ProcessObservation::Failed {
-                error_code: "codex_image_output_disappeared".to_string(),
+                error_code: "codex_no_image_output".to_string(),
             }
         );
         let execution_root = fixture
@@ -2048,6 +2121,16 @@ mod tests {
             Self::with_script(|invocations, image, _root| {
                 format!(
                     "#!/bin/sh\nset -eu\n/bin/cat >/dev/null\nprintf '1\\n' >> '{}'\nthread_id='019fd9f5-badb-7dd3-8903-28ffded0ef54'\ncall_id='call_visible_image'\noutput_dir=\"$CODEX_HOME/generated_images/$thread_id\"\n/bin/mkdir -p \"$output_dir\"\n/bin/chmod 700 \"$CODEX_HOME/generated_images\" \"$output_dir\"\n/bin/cp '{}' \"$output_dir/$call_id.png\"\n/bin/chmod 600 \"$output_dir/$call_id.png\"\nprintf '{{\"type\":\"thread.started\",\"thread_id\":\"%s\"}}\\n' \"$thread_id\"\nprintf '{{\"type\":\"item.completed\",\"item\":{{\"type\":\"image_generation_call\",\"id\":\"%s\"}}}}\\n' \"$call_id\"\nprintf '{{\"type\":\"thread.started\",\"thread_id\":'\n",
+                    invocations.display(),
+                    image.display(),
+                )
+            })
+        }
+
+        fn orphan_runtime_output_without_image_event() -> Self {
+            Self::with_script(|invocations, image, _root| {
+                format!(
+                    "#!/bin/sh\nset -eu\n/bin/cat >/dev/null\nprintf '1\\n' >> '{}'\n/bin/cp '{}' sealed-output.bin\n",
                     invocations.display(),
                     image.display(),
                 )

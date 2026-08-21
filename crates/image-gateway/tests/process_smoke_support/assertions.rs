@@ -279,10 +279,9 @@ fn assert_codex_invocation(
     expects_image: bool,
     expects_runtime_home: bool,
 ) -> TestResult {
-    let mut expected_prefix = vec!["exec".to_string()];
-    if !expects_runtime_home {
-        expected_prefix.push("--ephemeral".to_string());
-    }
+    let mut expected_prefix = ["exec", "--ephemeral", "--enable", "image_generation"]
+        .map(str::to_string)
+        .to_vec();
     expected_prefix.extend(
         [
             "--ignore-user-config",

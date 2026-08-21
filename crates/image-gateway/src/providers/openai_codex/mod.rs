@@ -334,6 +334,8 @@ async fn run_codex_attempt(
     command
         .arg("exec")
         .arg("--ephemeral")
+        .arg("--enable")
+        .arg("image_generation")
         .arg("--ignore-user-config")
         .arg("--ignore-rules")
         .arg("--disable")
@@ -1070,6 +1072,8 @@ mod tests {
         command
             .arg("exec")
             .arg("--ephemeral")
+            .arg("--enable")
+            .arg("image_generation")
             .arg("--ignore-user-config")
             .arg("--ignore-rules")
             .arg("--disable")
@@ -1822,10 +1826,8 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    #[ignore = "40-process stress gate; run explicitly to avoid starving unrelated process tests"]
-    async fn forty_legacy_runs_with_shared_codex_home_are_execution_scoped() {
-        const CONCURRENCY: usize = 40;
-
+    #[ignore = "61-process stress gate; run explicitly to avoid starving unrelated process tests"]
+    async fn legacy_runs_are_scoped_at_1_20_40() {
         let temp = tempfile::tempdir().unwrap();
         let executable = temp.path().join("fake-codex");
         std::fs::write(
@@ -1857,47 +1859,58 @@ mod tests {
         let config = Arc::new(config);
         let executable = Arc::new(executable);
 
-        let mut expected = Vec::with_capacity(CONCURRENCY);
-        let mut tasks = tokio::task::JoinSet::new();
-        for index in 0..CONCURRENCY {
-            let bytes = valid_png_with_dimensions(index as u32 + 1, 1);
-            let input = temp.path().join(format!("input-{index}.png"));
-            std::fs::write(&input, &bytes).unwrap();
-            expected.push(bytes);
+        for concurrency in [1, 20, 40] {
+            let started = tokio::time::Instant::now();
+            let mut expected = Vec::with_capacity(concurrency);
+            let mut tasks = tokio::task::JoinSet::new();
+            for index in 0..concurrency {
+                let bytes = valid_png_with_dimensions(index as u32 + 1, 1);
+                let input = temp.path().join(format!("input-{concurrency}-{index}.png"));
+                std::fs::write(&input, &bytes).unwrap();
+                expected.push(bytes);
 
-            let config = Arc::clone(&config);
-            let executable = Arc::clone(&executable);
-            tasks.spawn(async move {
-                let job = test_generation_job(&format!("req-legacy-concurrent-{index}"));
-                let image = run_codex_once_with_executable(
-                    config.as_ref(),
-                    &job,
-                    1,
-                    &[input],
-                    executable.as_path(),
-                )
-                .await
-                .unwrap();
-                (index, image.bytes)
-            });
+                let config = Arc::clone(&config);
+                let executable = Arc::clone(&executable);
+                tasks.spawn(async move {
+                    let job = test_generation_job(&format!(
+                        "req-legacy-concurrent-{concurrency}-{index}"
+                    ));
+                    let image = run_codex_once_with_executable(
+                        config.as_ref(),
+                        &job,
+                        1,
+                        &[input],
+                        executable.as_path(),
+                    )
+                    .await
+                    .unwrap();
+                    (index, image.bytes)
+                });
+            }
+
+            let mut actual = vec![None; concurrency];
+            while let Some(result) = tasks.join_next().await {
+                let (index, bytes) = result.unwrap();
+                actual[index] = Some(bytes);
+            }
+            let actual = actual.into_iter().map(Option::unwrap).collect::<Vec<_>>();
+
+            assert_eq!(actual, expected);
+            assert_eq!(
+                actual
+                    .iter()
+                    .map(|bytes| hex::encode(Sha256::digest(bytes)))
+                    .collect::<std::collections::HashSet<_>>()
+                    .len(),
+                concurrency
+            );
+            let elapsed = started.elapsed();
+            eprintln!("legacy Codex handoff concurrency={concurrency} elapsed={elapsed:?}");
+            assert!(
+                elapsed < Duration::from_secs(60),
+                "legacy Codex handoff concurrency={concurrency} exceeded 60 seconds"
+            );
         }
-
-        let mut actual = vec![None; CONCURRENCY];
-        while let Some(result) = tasks.join_next().await {
-            let (index, bytes) = result.unwrap();
-            actual[index] = Some(bytes);
-        }
-        let actual = actual.into_iter().map(Option::unwrap).collect::<Vec<_>>();
-
-        assert_eq!(actual, expected);
-        assert_eq!(
-            actual
-                .iter()
-                .map(|bytes| hex::encode(Sha256::digest(bytes)))
-                .collect::<std::collections::HashSet<_>>()
-                .len(),
-            CONCURRENCY
-        );
     }
 
     #[test]

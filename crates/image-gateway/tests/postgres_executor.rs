@@ -8926,7 +8926,7 @@ impl ExecutordFixture {
         fs::write(
             &fake_codex,
             format!(
-                "#!/bin/sh\n/bin/cat >/dev/null\nprintf '1\\n' >> '{}'\n{delay}/bin/cp '{}' sealed-output.bin\n",
+                "#!/bin/sh\nset -eu\n/bin/cat >/dev/null\nprintf '1\\n' >> '{}'\n{delay}thread_id='019fd9f5-badb-7dd3-8903-28ffded0ef54'\ncall_id='call_executor_process_test'\noutput_dir=\"$CODEX_HOME/generated_images/$thread_id\"\n/bin/mkdir -p \"$output_dir\"\n/bin/chmod 700 \"$CODEX_HOME/generated_images\" \"$output_dir\"\n/bin/cp '{}' \"$output_dir/$call_id.png\"\n/bin/chmod 600 \"$output_dir/$call_id.png\"\nprintf '{{\"type\":\"thread.started\",\"thread_id\":\"%s\"}}\\n' \"$thread_id\"\nprintf '{{\"type\":\"item.completed\",\"item\":{{\"type\":\"image_generation_call\",\"id\":\"%s\"}}}}\\n' \"$call_id\"\n",
                 invocations.display(),
                 source.display()
             ),
