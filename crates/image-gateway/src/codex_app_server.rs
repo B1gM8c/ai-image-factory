@@ -792,7 +792,19 @@ fn classify_failure(code: Option<&str>, message: Option<&str>) -> &'static str {
 
 fn classify_bytes(value: &[u8]) -> &'static str {
     let normalized = String::from_utf8_lossy(value).to_ascii_lowercase();
-    if normalized.contains("rate_limit")
+    if normalized.contains("originator") {
+        "originator_policy"
+    } else if normalized.contains("entitlement") || normalized.contains("not entitled") {
+        "entitlement"
+    } else if normalized.contains("content_policy") || normalized.contains("cyber_policy") {
+        "content_policy"
+    } else if normalized.contains("status 403")
+        || normalized.contains("status: 403")
+        || normalized.contains("\"status\":403")
+        || normalized.contains("forbidden")
+    {
+        "forbidden"
+    } else if normalized.contains("rate_limit")
         || normalized.contains("rate limit")
         || normalized.contains("quota")
         || normalized.contains("resource_exhausted")
@@ -1448,6 +1460,21 @@ mod tests {
             failure_numeric_code(&json!({ "code": -32001, "message": value })),
             Some(-32001)
         );
+    }
+
+    #[test]
+    fn stderr_classification_preserves_actionable_policy_boundaries() {
+        assert_eq!(
+            classify_bytes(b"originator is not allowed"),
+            "originator_policy"
+        );
+        assert_eq!(classify_bytes(b"account is not entitled"), "entitlement");
+        assert_eq!(classify_bytes(b"code=content_policy"), "content_policy");
+        assert_eq!(
+            classify_bytes(b"request failed with status 403"),
+            "forbidden"
+        );
+        assert_eq!(classify_bytes(b"policy rejected"), "policy");
     }
 
     fn announced_state(home: &Path, thread_id: Uuid) -> ProtocolState {
