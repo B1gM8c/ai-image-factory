@@ -5,6 +5,9 @@ use std::{
 };
 
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+#[cfg(unix)]
+use std::os::unix::process::ExitStatusExt;
 use tokio::{
     io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::{Child, ChildStdin, Command},
@@ -17,6 +20,8 @@ const MAX_CODEX_OUTPUT_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_PROTOCOL_LINE_BYTES: usize = 48 * 1024 * 1024;
 const MAX_PROTOCOL_CAPTURE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_PROTOCOL_REQUEST_BYTES: usize = 1024 * 1024;
+const MAX_DIAGNOSTIC_FIELD_BYTES: usize = 4 * 1024;
+const MAX_STDERR_DIGEST_BYTES: usize = 64 * 1024;
 const REAP_TIMEOUT: Duration = Duration::from_secs(5);
 
 const IMAGE_GENERATION_DEVELOPER_INSTRUCTIONS: &str = "For this thread, image requests MUST invoke the enabled namespaced tool image_gen.imagegen (wire name image_gen__imagegen) exactly once. Never answer an image request with text only. Do not use shell or local programs to create, copy, move, rename, edit, or delete the generated artifact. After the image tool completes, stop.";
@@ -24,6 +29,9 @@ const IMAGE_GENERATION_DIRECT_TOOL_CONFIG: &str =
     "features.code_mode.direct_only_tool_namespaces=[\"image_gen\"]";
 
 pub(crate) struct CodexAppServerRequest<'a> {
+    pub(crate) request_id: &'a str,
+    pub(crate) image_index: u32,
+    pub(crate) attempt: u8,
     pub(crate) executable: &'a Path,
     pub(crate) workspace: &'a Path,
     pub(crate) codex_home: &'a Path,
@@ -43,6 +51,7 @@ pub(crate) enum CodexAppServerError {
     ProcessExited,
     RequestRejected,
     TurnFailed,
+    ImageToolFailed,
     NoImage,
     ImageIncomplete,
     MultipleImages,
@@ -60,7 +69,9 @@ impl CodexAppServerError {
             Self::Timeout => "codex_timeout",
             Self::Protocol => "codex_event_capture_invalid",
             Self::ProcessExited => "codex_process_exited_without_terminal",
-            Self::RequestRejected | Self::TurnFailed => "codex_cli_failed",
+            Self::RequestRejected => "codex_app_server_request_rejected",
+            Self::TurnFailed => "codex_turn_failed",
+            Self::ImageToolFailed => "codex_image_tool_failed",
             Self::NoImage => "codex_no_image_output",
             Self::ImageIncomplete | Self::OutputMissing | Self::OutputInvalid => {
                 "codex_image_output_disappeared"
@@ -84,9 +95,79 @@ struct ProtocolState {
     completed_image_count: usize,
     image_failed: bool,
     image_incomplete: bool,
+    failure_diagnostic: Option<FailureDiagnostic>,
+}
+
+#[derive(Debug)]
+struct FailureDiagnostic {
+    source: &'static str,
+    class: &'static str,
+    numeric_code: Option<i64>,
+    code: FieldDiagnostic,
+    message: FieldDiagnostic,
+}
+
+#[derive(Debug, Default)]
+struct FieldDiagnostic {
+    sha256: Option<String>,
+    bytes: usize,
+    truncated: bool,
+}
+
+#[derive(Debug, Default)]
+struct StreamDiagnostic {
+    sha256: String,
+    bytes: usize,
+    truncated: bool,
+    class: &'static str,
+}
+
+#[derive(Debug, Default)]
+struct ExitDiagnostic {
+    observed: bool,
+    code: Option<i32>,
+    signal: Option<i32>,
 }
 
 impl ProtocolState {
+    fn record_failure(&mut self, source: &'static str, value: &Value) {
+        if self.failure_diagnostic.is_some() {
+            return;
+        }
+        let code = failure_string(
+            value,
+            &[
+                "/code",
+                "/error/code",
+                "/result/code",
+                "/result/error/code",
+                "/type",
+                "/error/type",
+                "/result/type",
+                "/result/error/type",
+            ],
+        );
+        let message = failure_string(
+            value,
+            &[
+                "/message",
+                "/error",
+                "/error/message",
+                "/result",
+                "/result/message",
+                "/result/error",
+                "/result/error/message",
+            ],
+        );
+        self.failure_diagnostic = Some(FailureDiagnostic {
+            source,
+            class: classify_failure(code, message),
+            numeric_code: failure_numeric_code(value),
+            code: summarize_field(code),
+            message: summarize_field(message),
+        });
+    }
+
     fn bind_thread(&mut self, thread_id: Uuid) -> Result<(), CodexAppServerError> {
         if self
             .thread_id
@@ -230,7 +311,13 @@ impl ProtocolState {
                             return Err(CodexAppServerError::Protocol);
                         }
                     }
-                    Some("failed") => self.image_failed = true,
+                    Some("failed") => {
+                        self.image_failed = true;
+                        self.record_failure(
+                            "image_generation_item",
+                            params.pointer("/item").unwrap_or(&Value::Null),
+                        );
+                    }
                     _ => self.image_incomplete = true,
                 }
             }
@@ -242,11 +329,20 @@ impl ProtocolState {
                 self.observe_turn_identity(params, candidate)?;
                 return match params.pointer("/turn/status").and_then(Value::as_str) {
                     Some("completed") => Ok(true),
-                    Some("failed" | "interrupted") => Err(CodexAppServerError::TurnFailed),
+                    Some("failed" | "interrupted") => {
+                        self.record_failure(
+                            "turn_terminal",
+                            params.pointer("/turn/error").unwrap_or(&Value::Null),
+                        );
+                        Err(CodexAppServerError::TurnFailed)
+                    }
                     _ => Err(CodexAppServerError::Protocol),
                 };
             }
-            "error" => return Err(CodexAppServerError::RequestRejected),
+            "error" => {
+                self.record_failure("server_error_notification", params);
+                return Err(CodexAppServerError::RequestRejected);
+            }
             _ => {}
         }
         Ok(false)
@@ -301,7 +397,7 @@ impl ProtocolState {
             return Err(CodexAppServerError::Protocol);
         }
         if self.image_failed {
-            return Err(CodexAppServerError::TurnFailed);
+            return Err(CodexAppServerError::ImageToolFailed);
         }
         if self.image_incomplete
             || (self.saw_image_generation
@@ -392,11 +488,28 @@ where
     let stderr_task = tokio::spawn(async move {
         let mut reader = BufReader::new(stderr);
         let mut buffer = [0_u8; 8192];
+        let mut digest = Sha256::new();
+        let mut sample = Vec::with_capacity(MAX_STDERR_DIGEST_BYTES);
+        let mut captured = 0_usize;
+        let mut total = 0_usize;
         loop {
             match tokio::io::AsyncReadExt::read(&mut reader, &mut buffer).await {
                 Ok(0) | Err(_) => break,
-                Ok(_) => {}
+                Ok(read) => {
+                    total = total.saturating_add(read);
+                    let remaining = MAX_STDERR_DIGEST_BYTES.saturating_sub(captured);
+                    let take = remaining.min(read);
+                    digest.update(&buffer[..take]);
+                    sample.extend_from_slice(&buffer[..take]);
+                    captured = captured.saturating_add(take);
+                }
             }
+        }
+        StreamDiagnostic {
+            sha256: hex::encode(digest.finalize()),
+            bytes: total,
+            truncated: total > MAX_STDERR_DIGEST_BYTES,
+            class: classify_bytes(&sample),
         }
     });
     let mut stdout = BufReader::new(stdout);
@@ -533,20 +646,30 @@ where
     let authority = match protocol_result {
         Ok(Ok(authority)) => authority,
         Ok(Err(error)) => {
+            let exit = observe_child_exit(&mut child);
             terminate_child(&mut child).await;
-            let _ = tokio::time::timeout(REAP_TIMEOUT, stderr_task).await;
+            let stderr = await_stderr_diagnostic(stderr_task).await;
+            trace_failure(&request, &state, error, stderr.as_ref(), &exit);
             return Err(error);
         }
         Err(_) => {
+            let exit = observe_child_exit(&mut child);
             terminate_child(&mut child).await;
-            let _ = tokio::time::timeout(REAP_TIMEOUT, stderr_task).await;
+            let stderr = await_stderr_diagnostic(stderr_task).await;
+            trace_failure(
+                &request,
+                &state,
+                CodexAppServerError::Timeout,
+                stderr.as_ref(),
+                &exit,
+            );
             return Err(CodexAppServerError::Timeout);
         }
     };
 
     let (thread_id, call_id) = authority;
     terminate_child(&mut child).await;
-    let _ = tokio::time::timeout(REAP_TIMEOUT, stderr_task).await;
+    let _ = await_stderr_diagnostic(stderr_task).await;
     let output = tokio::task::spawn_blocking(move || {
         native_output_root.read(&thread_id, &call_id, MAX_CODEX_OUTPUT_BYTES)
     })
@@ -577,9 +700,145 @@ async fn wait_for_response<R: AsyncBufRead + Unpin>(
         }
         match (message.get("result"), message.get("error")) {
             (Some(result), None) => return Ok(result.clone()),
-            (None, Some(_)) => return Err(CodexAppServerError::RequestRejected),
+            (None, Some(error)) => {
+                state.record_failure("rpc_rejection", error);
+                return Err(CodexAppServerError::RequestRejected);
+            }
             _ => return Err(CodexAppServerError::Protocol),
         }
+    }
+}
+
+fn failure_string<'a>(value: &'a Value, pointers: &[&str]) -> Option<&'a str> {
+    value.as_str().or_else(|| {
+        pointers
+            .iter()
+            .find_map(|pointer| value.pointer(pointer)?.as_str())
+    })
+}
+
+fn failure_numeric_code(value: &Value) -> Option<i64> {
+    ["/code", "/error/code", "/result/code", "/result/error/code"]
+        .iter()
+        .find_map(|pointer| value.pointer(pointer)?.as_i64())
+}
+
+fn summarize_field(value: Option<&str>) -> FieldDiagnostic {
+    let Some(value) = value else {
+        return FieldDiagnostic::default();
+    };
+    let bytes = value.as_bytes();
+    let captured = &bytes[..bytes.len().min(MAX_DIAGNOSTIC_FIELD_BYTES)];
+    FieldDiagnostic {
+        sha256: Some(hex::encode(Sha256::digest(captured))),
+        bytes: bytes.len(),
+        truncated: bytes.len() > MAX_DIAGNOSTIC_FIELD_BYTES,
+    }
+}
+
+fn classify_failure(code: Option<&str>, message: Option<&str>) -> &'static str {
+    let mut sample = Vec::with_capacity(MAX_DIAGNOSTIC_FIELD_BYTES * 2);
+    for value in [code, message].into_iter().flatten() {
+        let bytes = value.as_bytes();
+        sample.extend_from_slice(&bytes[..bytes.len().min(MAX_DIAGNOSTIC_FIELD_BYTES)]);
+        sample.push(b' ');
+    }
+    classify_bytes(&sample)
+}
+
+fn classify_bytes(value: &[u8]) -> &'static str {
+    let normalized = String::from_utf8_lossy(value).to_ascii_lowercase();
+    if normalized.contains("rate_limit")
+        || normalized.contains("rate limit")
+        || normalized.contains("quota")
+        || normalized.contains("resource_exhausted")
+    {
+        "rate_limit"
+    } else if normalized.contains("unauthorized")
+        || normalized.contains("authentication")
+        || normalized.contains("credential")
+    {
+        "authentication"
+    } else if normalized.contains("invalid_argument")
+        || normalized.contains("invalid argument")
+        || normalized.contains("unsupported")
+    {
+        "invalid_request"
+    } else if normalized.contains("safety")
+        || normalized.contains("policy")
+        || normalized.contains("rejected")
+    {
+        "policy"
+    } else if normalized.contains("timeout")
+        || normalized.contains("unavailable")
+        || normalized.contains("overloaded")
+        || normalized.contains("network")
+    {
+        "availability"
+    } else if normalized.contains("tool") || normalized.contains("image_generation") {
+        "tool_failure"
+    } else {
+        "unknown"
+    }
+}
+
+async fn await_stderr_diagnostic(
+    task: tokio::task::JoinHandle<StreamDiagnostic>,
+) -> Option<StreamDiagnostic> {
+    tokio::time::timeout(REAP_TIMEOUT, task)
+        .await
+        .ok()
+        .and_then(Result::ok)
+}
+
+fn trace_failure(
+    request: &CodexAppServerRequest<'_>,
+    state: &ProtocolState,
+    error: CodexAppServerError,
+    stderr: Option<&StreamDiagnostic>,
+    exit: &ExitDiagnostic,
+) {
+    let diagnostic = state.failure_diagnostic.as_ref();
+    tracing::warn!(
+        request.id = request.request_id,
+        image.index = request.image_index,
+        codex.attempt = request.attempt,
+        codex.failure.category = error.code(),
+        codex.failure.source = diagnostic.map_or("none", |value| value.source),
+        codex.failure.class = diagnostic.map_or("unknown", |value| value.class),
+        codex.failure.numeric_code = diagnostic.and_then(|value| value.numeric_code),
+        codex.failure.code_sha256 = diagnostic
+            .and_then(|value| value.code.sha256.as_deref())
+            .unwrap_or("none"),
+        codex.failure.code_bytes = diagnostic.map_or(0, |value| value.code.bytes),
+        codex.failure.code_truncated = diagnostic.is_some_and(|value| value.code.truncated),
+        codex.failure.message_sha256 = diagnostic
+            .and_then(|value| value.message.sha256.as_deref())
+            .unwrap_or("none"),
+        codex.failure.message_bytes = diagnostic.map_or(0, |value| value.message.bytes),
+        codex.failure.message_truncated = diagnostic.is_some_and(|value| value.message.truncated),
+        codex.stderr.class = stderr.map_or("unknown", |value| value.class),
+        codex.stderr.sha256 = stderr.map_or("unavailable", |value| value.sha256.as_str()),
+        codex.stderr.bytes = stderr.map_or(0, |value| value.bytes),
+        codex.stderr.truncated = stderr.is_some_and(|value| value.truncated),
+        codex.exit.observed = exit.observed,
+        codex.exit.code = exit.code,
+        codex.exit.signal = exit.signal,
+        "Codex app-server failed with bounded redacted diagnostics"
+    );
+}
+
+fn observe_child_exit(child: &mut Child) -> ExitDiagnostic {
+    let Ok(Some(status)) = child.try_wait() else {
+        return ExitDiagnostic::default();
+    };
+    ExitDiagnostic {
+        observed: true,
+        code: status.code(),
+        #[cfg(unix)]
+        signal: status.signal(),
+        #[cfg(not(unix))]
+        signal: None,
     }
 }
 
@@ -829,6 +1088,9 @@ mod tests {
         async fn run(&self, timeout: Duration) -> Result<Vec<u8>, CodexAppServerError> {
             run_codex_app_server(
                 CodexAppServerRequest {
+                    request_id: "req_test",
+                    image_index: 1,
+                    attempt: 1,
                     executable: &self.executable,
                     workspace: &self.workspace,
                     codex_home: &self.codex_home,
@@ -944,6 +1206,132 @@ mod tests {
             late.run(Duration::from_secs(30)).await,
             Err(CodexAppServerError::Protocol)
         );
+    }
+
+    #[test]
+    fn image_tool_failure_keeps_only_bounded_redacted_diagnostics() {
+        let home = Path::new("/private/codex-home");
+        let thread_id = Uuid::parse_str(THREAD_ID).unwrap();
+        let mut state = announced_state(home, thread_id);
+        state
+            .observe_notification(
+                &json!({
+                    "method": "item/started",
+                    "params": {
+                        "threadId": THREAD_ID,
+                        "turnId": TURN_ID,
+                        "item": {
+                            "type": "imageGeneration",
+                            "id": CALL_ID,
+                            "status": "inProgress"
+                        }
+                    }
+                }),
+                home,
+            )
+            .unwrap();
+        let sensitive_sample = "hidden-user-material";
+        state
+            .observe_notification(
+                &json!({
+                    "method": "item/completed",
+                    "params": {
+                        "threadId": THREAD_ID,
+                        "turnId": TURN_ID,
+                        "item": {
+                            "type": "imageGeneration",
+                            "id": CALL_ID,
+                            "status": "failed",
+                            "result": {
+                                "code": "rate_limit_exceeded",
+                                "message": sensitive_sample
+                            }
+                        }
+                    }
+                }),
+                home,
+            )
+            .unwrap();
+
+        assert_eq!(state.authority(), Err(CodexAppServerError::ImageToolFailed));
+        let diagnostic = state.failure_diagnostic.unwrap();
+        assert_eq!(diagnostic.source, "image_generation_item");
+        assert_eq!(diagnostic.class, "rate_limit");
+        assert_eq!(diagnostic.message.bytes, sensitive_sample.len());
+        assert!(!diagnostic.message.truncated);
+        let digest = diagnostic.message.sha256.unwrap();
+        assert_eq!(digest.len(), 64);
+        assert!(!digest.contains("hidden-user-material"));
+    }
+
+    #[test]
+    fn turn_failure_classifies_without_retaining_upstream_text() {
+        let home = Path::new("/private/codex-home");
+        let thread_id = Uuid::parse_str(THREAD_ID).unwrap();
+        let mut state = announced_state(home, thread_id);
+        let error = state.observe_notification(
+            &json!({
+                "method": "turn/completed",
+                "params": {
+                    "threadId": THREAD_ID,
+                    "turn": {
+                        "id": TURN_ID,
+                        "status": "failed",
+                        "error": {
+                            "code": "invalid_argument",
+                            "message": "unsupported hidden-user-material"
+                        }
+                    }
+                }
+            }),
+            home,
+        );
+
+        assert_eq!(error, Err(CodexAppServerError::TurnFailed));
+        let diagnostic = state.failure_diagnostic.unwrap();
+        assert_eq!(diagnostic.source, "turn_terminal");
+        assert_eq!(diagnostic.class, "invalid_request");
+        assert_eq!(diagnostic.code.sha256.unwrap().len(), 64);
+        assert_eq!(diagnostic.message.sha256.unwrap().len(), 64);
+    }
+
+    #[test]
+    fn diagnostic_fields_are_strictly_bounded() {
+        let value = "x".repeat(MAX_DIAGNOSTIC_FIELD_BYTES + 1);
+        let summary = summarize_field(Some(&value));
+        assert_eq!(summary.bytes, MAX_DIAGNOSTIC_FIELD_BYTES + 1);
+        assert!(summary.truncated);
+        assert_eq!(summary.sha256.unwrap().len(), 64);
+
+        assert_eq!(
+            failure_numeric_code(&json!({ "code": -32001, "message": value })),
+            Some(-32001)
+        );
+    }
+
+    fn announced_state(home: &Path, thread_id: Uuid) -> ProtocolState {
+        let mut state = ProtocolState::default();
+        state.bind_thread(thread_id).unwrap();
+        state.bind_turn(TURN_ID.to_string()).unwrap();
+        state
+            .observe_notification(
+                &json!({
+                    "method": "thread/started",
+                    "params": { "thread": { "id": THREAD_ID } }
+                }),
+                home,
+            )
+            .unwrap();
+        state
+            .observe_notification(
+                &json!({
+                    "method": "turn/started",
+                    "params": { "threadId": THREAD_ID, "turn": { "id": TURN_ID } }
+                }),
+                home,
+            )
+            .unwrap();
+        state
     }
 
     #[test]

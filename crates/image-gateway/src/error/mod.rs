@@ -25,6 +25,14 @@ const CODE_PROJECT_BUDGET_EXCEEDED: &str = "project_budget_exceeded";
 const CODE_USER_API_KEYS_DISABLED: &str = "user_api_keys_disabled";
 const CODE_IMAGE_GENERATION_FAILED: &str = "image_generation_failed";
 const CODE_CODEX_CLI_FAILED: &str = "codex_cli_failed";
+const CODE_CODEX_APP_SERVER_REQUEST_REJECTED: &str = "codex_app_server_request_rejected";
+const CODE_CODEX_TURN_FAILED: &str = "codex_turn_failed";
+const CODE_CODEX_IMAGE_TOOL_FAILED: &str = "codex_image_tool_failed";
+const CODE_CODEX_EVENT_CAPTURE_INVALID: &str = "codex_event_capture_invalid";
+const CODE_CODEX_PROCESS_EXITED_WITHOUT_TERMINAL: &str = "codex_process_exited_without_terminal";
+const CODE_CODEX_MULTIPLE_IMAGE_OUTPUTS: &str = "codex_multiple_image_outputs";
+const CODE_CODEX_STDIN_FAILED: &str = "codex_stdin_failed";
+const CODE_CODEX_PROCESS_IDENTITY_UNAVAILABLE: &str = "codex_process_identity_unavailable";
 const CODE_CODEX_NO_IMAGE_OUTPUT: &str = "codex_no_image_output";
 const CODE_CODEX_IMAGE_TOOL_NOT_INVOKED: &str = "codex_image_tool_not_invoked";
 const CODE_CODEX_IMAGE_OUTPUT_DISAPPEARED: &str = "codex_image_output_disappeared";
@@ -446,6 +454,44 @@ impl ImageGatewayError {
             None,
             CODE_CODEX_CLI_FAILED,
         )
+    }
+
+    pub(crate) fn codex_app_server_failure(code: &str) -> Self {
+        let (message, code) = match code {
+            CODE_CODEX_APP_SERVER_REQUEST_REJECTED => (
+                "Codex app-server rejected the image request",
+                CODE_CODEX_APP_SERVER_REQUEST_REJECTED,
+            ),
+            CODE_CODEX_TURN_FAILED => {
+                ("Codex image generation turn failed", CODE_CODEX_TURN_FAILED)
+            }
+            CODE_CODEX_IMAGE_TOOL_FAILED => (
+                "Codex image generation tool failed",
+                CODE_CODEX_IMAGE_TOOL_FAILED,
+            ),
+            CODE_CODEX_EVENT_CAPTURE_INVALID => (
+                "Codex app-server event stream failed validation",
+                CODE_CODEX_EVENT_CAPTURE_INVALID,
+            ),
+            CODE_CODEX_PROCESS_EXITED_WITHOUT_TERMINAL => (
+                "Codex app-server exited without a terminal event",
+                CODE_CODEX_PROCESS_EXITED_WITHOUT_TERMINAL,
+            ),
+            CODE_CODEX_MULTIPLE_IMAGE_OUTPUTS => (
+                "Codex app-server produced conflicting image outputs",
+                CODE_CODEX_MULTIPLE_IMAGE_OUTPUTS,
+            ),
+            CODE_CODEX_STDIN_FAILED => (
+                "Codex app-server input channel failed",
+                CODE_CODEX_STDIN_FAILED,
+            ),
+            CODE_CODEX_PROCESS_IDENTITY_UNAVAILABLE => (
+                "Codex app-server process identity is unavailable",
+                CODE_CODEX_PROCESS_IDENTITY_UNAVAILABLE,
+            ),
+            _ => return Self::codex_cli_failed(),
+        };
+        Self::new(StatusCode::BAD_GATEWAY, message, TYPE_SERVER, None, code)
     }
 
     pub fn codex_no_image_output() -> Self {

@@ -446,6 +446,9 @@ async fn run_codex_child(
     environment.push(("PATH".to_string(), CODEX_CHILD_PATH.to_string()));
     let runtime_result = crate::codex_app_server::run_codex_app_server(
         crate::codex_app_server::CodexAppServerRequest {
+            request_id: &request.output.request_id,
+            image_index: request.output.candidate_index,
+            attempt: 1,
             executable: Path::new(&request.codex_executable),
             workspace,
             codex_home,
@@ -494,9 +497,11 @@ fn map_codex_app_server_child_error(
 
     match error {
         CodexAppServerError::Unavailable => ChildOutcome::Failed("codex_cli_unavailable"),
-        CodexAppServerError::RequestRejected | CodexAppServerError::TurnFailed => {
-            ChildOutcome::Failed("codex_cli_failed")
+        CodexAppServerError::RequestRejected => {
+            ChildOutcome::Failed("codex_app_server_request_rejected")
         }
+        CodexAppServerError::TurnFailed => ChildOutcome::Failed("codex_turn_failed"),
+        CodexAppServerError::ImageToolFailed => ChildOutcome::Failed("codex_image_tool_failed"),
         CodexAppServerError::NoImage => ChildOutcome::Failed("codex_no_image_output"),
         CodexAppServerError::ImageIncomplete
         | CodexAppServerError::OutputMissing
@@ -858,6 +863,30 @@ mod tests {
 
         fs::set_permissions(&auth, fs::Permissions::from_mode(0o644)).unwrap();
         assert!(codex_auth_file_sha256(temp.path()).is_err());
+    }
+
+    #[test]
+    fn app_server_failures_keep_stable_terminal_categories() {
+        use crate::codex_app_server::CodexAppServerError;
+
+        for (error, expected) in [
+            (
+                CodexAppServerError::RequestRejected,
+                "codex_app_server_request_rejected",
+            ),
+            (CodexAppServerError::TurnFailed, "codex_turn_failed"),
+            (
+                CodexAppServerError::ImageToolFailed,
+                "codex_image_tool_failed",
+            ),
+        ] {
+            match map_codex_app_server_child_error(error) {
+                ChildOutcome::Failed(actual) => assert_eq!(actual, expected),
+                ChildOutcome::Succeeded(_) | ChildOutcome::Uncertain(_) => {
+                    panic!("stable app-server failure was not terminalized as failed")
+                }
+            }
+        }
     }
 
     #[test]
@@ -1341,7 +1370,7 @@ mod tests {
         assert_eq!(
             spool.observe().unwrap(),
             ProcessObservation::Failed {
-                error_code: "codex_cli_failed".to_string(),
+                error_code: "codex_turn_failed".to_string(),
             }
         );
         let execution_root = fixture

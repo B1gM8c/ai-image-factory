@@ -231,8 +231,8 @@ async fn fail_job(
         r#"
         UPDATE jobs
         SET state = 'failed', charged_units = 0, finished_at_ms = $4,
-            updated_at_ms = $4, last_error_code = $5
-        WHERE job_id = $1 AND tenant_id = $2 AND reservation_id = $3 AND state = $6
+            updated_at_ms = $4, last_error_code = $5, last_error_message = $6
+        WHERE job_id = $1 AND tenant_id = $2 AND reservation_id = $3 AND state = $7
         "#,
     )
     .bind(locked.quota_job_id)
@@ -240,6 +240,7 @@ async fn fail_job(
     .bind(locked.reservation_id)
     .bind(now)
     .bind(error_code)
+    .bind(safe_failure_message(error_code))
     .bind(&locked.job_state)
     .execute(&mut **tx)
     .await
@@ -286,11 +287,16 @@ async fn append_events(
     now: i64,
 ) -> Result<(), ImageGatewayError> {
     let semantic_key = format!("work.{}.failed", lease.work_item_id);
-    let payload = json!({
+    let mut payload = json!({
         "error_code": error_code,
         "execution_id": lease.execution_id.to_string(),
         "lease_epoch": lease.lease_epoch,
     });
+    if let (Some(message), Some(object)) =
+        (safe_failure_message(error_code), payload.as_object_mut())
+    {
+        object.insert("error_message".to_string(), json!(message));
+    }
     sqlx::query(
         r#"
         INSERT INTO job_events
@@ -324,4 +330,34 @@ async fn append_events(
     .await
     .map_err(settlement_unavailable)?;
     Ok(())
+}
+
+fn safe_failure_message(error_code: &str) -> Option<&'static str> {
+    match error_code {
+        "codex_app_server_request_rejected" => Some("Codex app-server request rejected"),
+        "codex_turn_failed" => Some("Codex image generation turn failed"),
+        "codex_image_tool_failed" => Some("Codex image generation tool failed"),
+        "codex_event_capture_invalid" => Some("Codex event stream validation failed"),
+        "codex_process_exited_without_terminal" => {
+            Some("Codex app-server exited without a terminal event")
+        }
+        "codex_multiple_image_outputs" => Some("Codex image output authority conflicted"),
+        "codex_stdin_failed" => Some("Codex app-server input channel failed"),
+        "codex_process_identity_unavailable" => Some("Codex process identity unavailable"),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::safe_failure_message;
+
+    #[test]
+    fn only_known_codex_failures_receive_persisted_messages() {
+        assert_eq!(
+            safe_failure_message("codex_image_tool_failed"),
+            Some("Codex image generation tool failed")
+        );
+        assert_eq!(safe_failure_message("arbitrary upstream text"), None);
+    }
 }

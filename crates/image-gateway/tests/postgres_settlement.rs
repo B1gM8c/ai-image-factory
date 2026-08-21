@@ -482,7 +482,11 @@ async fn failure_settlement_releases_quota_and_transitions_every_state_atomicall
         let store = PostgresExecutionSettlementStore::new(database.pool.clone(), artifacts);
 
         store
-            .fail(&fixture.lease, &fixture.reservation, "provider_rejected")
+            .fail(
+                &fixture.lease,
+                &fixture.reservation,
+                "codex_image_tool_failed",
+            )
             .await
             .map_err(|error| format!("failure settlement failed: {error:?}"))?;
         let first = failure_state(&database.pool, &fixture).await?;
@@ -496,14 +500,18 @@ async fn failure_settlement_releases_quota_and_transitions_every_state_atomicall
             .map_err(|error| format!("failure status load failed: {error:?}"))?
         {
             gpt_image_2_gateway::GenerationResultStatus::Failed { error_code } => require(
-                error_code.as_deref() == Some("provider_rejected"),
+                error_code.as_deref() == Some("codex_image_tool_failed"),
                 format!("failure status lost its error code: {error_code:?}"),
             )?,
             status => return Err(format!("unexpected failure status: {status:?}")),
         }
 
         store
-            .fail(&fixture.lease, &fixture.reservation, "provider_rejected")
+            .fail(
+                &fixture.lease,
+                &fixture.reservation,
+                "codex_image_tool_failed",
+            )
             .await
             .map_err(|error| format!("duplicate failure settlement failed: {error:?}"))?;
         let repeated = failure_state(&database.pool, &fixture).await?;
@@ -528,6 +536,8 @@ struct FailureState {
     failed_metering: i64,
     job_events: i64,
     outbox: i64,
+    job_error_message: Option<String>,
+    event_error_message: Option<String>,
 }
 
 impl FailureState {
@@ -543,6 +553,8 @@ impl FailureState {
             failed_metering: 1,
             job_events: 1,
             outbox: 1,
+            job_error_message: Some("Codex image generation tool failed".to_string()),
+            event_error_message: Some("Codex image generation tool failed".to_string()),
         }
     }
 }
@@ -566,7 +578,10 @@ async fn failure_state(pool: &PgPool, fixture: &RunningFixture) -> TestResult<Fa
           (SELECT COUNT(*) FROM job_events
            WHERE job_id = $3 AND event_type = 'job.failed') AS job_events,
           (SELECT COUNT(*) FROM outbox_events
-           WHERE job_id = $3 AND event_type = 'job.failed') AS outbox
+           WHERE job_id = $3 AND event_type = 'job.failed') AS outbox,
+          (SELECT last_error_message FROM jobs WHERE job_id = $3) AS job_error_message,
+          (SELECT payload_json ->> 'error_message' FROM job_events
+           WHERE job_id = $3 AND event_type = 'job.failed') AS event_error_message
         "#,
     )
     .bind(fixture.lease.work_item_id)

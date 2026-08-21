@@ -558,6 +558,16 @@ fn persisted_generation_error(error_code: Option<&str>) -> ImageGatewayError {
     match error_code {
         Some("timeout") => ImageGatewayError::timeout(),
         Some("codex_cli_failed") => ImageGatewayError::codex_cli_failed(),
+        Some(
+            code @ ("codex_app_server_request_rejected"
+            | "codex_turn_failed"
+            | "codex_image_tool_failed"
+            | "codex_event_capture_invalid"
+            | "codex_process_exited_without_terminal"
+            | "codex_multiple_image_outputs"
+            | "codex_stdin_failed"
+            | "codex_process_identity_unavailable"),
+        ) => ImageGatewayError::codex_app_server_failure(code),
         Some("codex_no_image_output") => ImageGatewayError::codex_no_image_output(),
         Some("codex_image_tool_not_invoked") => ImageGatewayError::codex_image_tool_not_invoked(),
         Some("codex_image_output_disappeared") => {
@@ -1345,6 +1355,21 @@ mod tests {
         let cli = persisted_generation_error(Some("codex_cli_failed"));
         assert_eq!(cli.status_code(), axum::http::StatusCode::BAD_GATEWAY);
         assert_eq!(cli.error_code(), Some("codex_cli_failed"));
+
+        for code in [
+            "codex_app_server_request_rejected",
+            "codex_turn_failed",
+            "codex_image_tool_failed",
+            "codex_event_capture_invalid",
+            "codex_process_exited_without_terminal",
+            "codex_multiple_image_outputs",
+            "codex_stdin_failed",
+            "codex_process_identity_unavailable",
+        ] {
+            let error = persisted_generation_error(Some(code));
+            assert_eq!(error.status_code(), axum::http::StatusCode::BAD_GATEWAY);
+            assert_eq!(error.error_code(), Some(code));
+        }
 
         let no_output = persisted_generation_error(Some("codex_no_image_output"));
         assert_eq!(no_output.error_code(), Some("codex_no_image_output"));

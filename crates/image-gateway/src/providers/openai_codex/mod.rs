@@ -243,6 +243,9 @@ async fn run_codex_attempt(
     let environment = codex_app_server_environment(config);
     let bytes = match crate::codex_app_server::run_codex_app_server(
         crate::codex_app_server::CodexAppServerRequest {
+            request_id: &job.request_id,
+            image_index: index,
+            attempt,
             executable: codex_executable,
             workspace: &request_dir,
             codex_home: request_codex_home.path(),
@@ -299,7 +302,10 @@ fn map_codex_app_server_error(
         | CodexAppServerError::ProcessExited
         | CodexAppServerError::RequestRejected
         | CodexAppServerError::TurnFailed
-        | CodexAppServerError::MultipleImages => ImageGatewayError::codex_cli_failed(),
+        | CodexAppServerError::ImageToolFailed
+        | CodexAppServerError::MultipleImages => {
+            ImageGatewayError::codex_app_server_failure(error.code())
+        }
     }
 }
 
@@ -530,6 +536,9 @@ mod tests {
         }
         let bytes = crate::codex_app_server::run_codex_app_server(
             crate::codex_app_server::CodexAppServerRequest {
+                request_id: "req_contract_generate",
+                image_index: 1,
+                attempt: 1,
                 executable: executable.path(),
                 workspace: &request_dir,
                 codex_home: &request_codex_home,
@@ -638,6 +647,9 @@ mod tests {
         }
         let bytes = crate::codex_app_server::run_codex_app_server(
             crate::codex_app_server::CodexAppServerRequest {
+                request_id: "req_contract_edit",
+                image_index: 1,
+                attempt: 1,
                 executable: executable.path(),
                 workspace: &request_dir,
                 codex_home: &request_codex_home,
