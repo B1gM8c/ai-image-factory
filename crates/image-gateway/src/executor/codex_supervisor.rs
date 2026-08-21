@@ -650,7 +650,7 @@ impl SpawnObserver for CodexSpawnObserver {
     fn observe_completion(&mut self, completion: &ProcessCompletion) -> Result<(), Self::Error> {
         self.events = summarize_codex_events(completion);
         if self.events.completed_image_generation {
-            if self.events.stdout_truncated {
+            if self.events.stdout_truncated || self.events.malformed_events > 0 {
                 self.events.native_handoff =
                     match self.spool.discard_runtime_output(CODEX_RUNTIME_OUTPUT_FILE) {
                         Ok(()) => CodexNativeHandoff::Invalid,
@@ -1586,6 +1586,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn malformed_event_suffix_never_seals_prefix_native_identity() {
+        let fixture = CodexFixture::malformed_event_suffix_after_native_identity();
+        let lease = fixture.lease();
+        let context = fixture.context(&lease);
+        fixture.journal.start_or_attach(&lease).unwrap();
+        fixture.supervisor.prepare(&lease, &context).await.unwrap();
+        assert_eq!(
+            fixture.journal.commit_launch(&lease).unwrap(),
+            LaunchDecision::LaunchOnce
+        );
+        let spool = ExecutionSpool::for_lease(&fixture.journal, &lease).unwrap();
+
+        run_codex_runner_child(fixture.journal.root_path(), lease.executor_execution_id)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            spool.observe().unwrap(),
+            ProcessObservation::Failed {
+                error_code: "codex_image_output_disappeared".to_string(),
+            }
+        );
+        let execution_root = fixture
+            .journal
+            .root_path()
+            .join(lease.executor_execution_id.simple().to_string());
+        assert!(!execution_root.join("output.bin").exists());
+    }
+
+    #[tokio::test]
     async fn agent_written_runtime_output_is_not_a_success_authority() {
         let fixture = CodexFixture::agent_written_output_with_native();
         let lease = fixture.lease();
@@ -2008,6 +2038,16 @@ mod tests {
             Self::with_script(|invocations, image, _root| {
                 format!(
                     "#!/bin/sh\nset -eu\n/bin/cat >/dev/null\nprintf '1\\n' >> '{}'\nthread_id='019fd9f5-badb-7dd3-8903-28ffded0ef54'\ncall_id='call_visible_image'\noutput_dir=\"$CODEX_HOME/generated_images/$thread_id\"\n/bin/mkdir -p \"$output_dir\"\n/bin/chmod 700 \"$CODEX_HOME/generated_images\" \"$output_dir\"\n/bin/cp '{}' \"$output_dir/$call_id.png\"\n/bin/chmod 600 \"$output_dir/$call_id.png\"\nprintf '{{\"type\":\"thread.started\",\"thread_id\":\"%s\"}}\\n' \"$thread_id\"\nprintf '{{\"type\":\"item.completed\",\"item\":{{\"type\":\"image_generation_call\",\"id\":\"%s\"}}}}\\n' \"$call_id\"\n/usr/bin/head -c 70000 /dev/zero | /usr/bin/tr '\\000' x\nprintf '\\n{{\"type\":\"thread.started\",\"thread_id\":\"019fd9f5-badb-7dd3-8903-28ffded0ef55\"}}\\n'\nprintf '{{\"type\":\"item.completed\",\"item\":{{\"type\":\"image_generation_call\",\"id\":\"call_hidden_image\"}}}}\\n'\n",
+                    invocations.display(),
+                    image.display(),
+                )
+            })
+        }
+
+        fn malformed_event_suffix_after_native_identity() -> Self {
+            Self::with_script(|invocations, image, _root| {
+                format!(
+                    "#!/bin/sh\nset -eu\n/bin/cat >/dev/null\nprintf '1\\n' >> '{}'\nthread_id='019fd9f5-badb-7dd3-8903-28ffded0ef54'\ncall_id='call_visible_image'\noutput_dir=\"$CODEX_HOME/generated_images/$thread_id\"\n/bin/mkdir -p \"$output_dir\"\n/bin/chmod 700 \"$CODEX_HOME/generated_images\" \"$output_dir\"\n/bin/cp '{}' \"$output_dir/$call_id.png\"\n/bin/chmod 600 \"$output_dir/$call_id.png\"\nprintf '{{\"type\":\"thread.started\",\"thread_id\":\"%s\"}}\\n' \"$thread_id\"\nprintf '{{\"type\":\"item.completed\",\"item\":{{\"type\":\"image_generation_call\",\"id\":\"%s\"}}}}\\n' \"$call_id\"\nprintf '{{\"type\":\"thread.started\",\"thread_id\":'\n",
                     invocations.display(),
                     image.display(),
                 )

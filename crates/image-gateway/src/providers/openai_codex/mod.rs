@@ -501,6 +501,7 @@ fn retryable_codex_no_image_generation(events: &CodexCliEventSummary) -> bool {
 
 fn exact_codex_native_output_identity(events: &CodexCliEventSummary) -> Option<(&str, &str)> {
     if !events.capture_complete
+        || events.malformed_events > 0
         || !events.completed_image_generation
         || events.thread_id_ambiguous
         || events.image_call_ambiguous
@@ -937,14 +938,7 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn assert_incomplete_capture_blocks_native_read(summary: &CodexCliEventSummary) {
-        assert!(!summary.capture_complete);
-        assert!(summary.completed_image_generation);
-        assert_eq!(
-            summary.thread_id.as_deref(),
-            Some("019fd666-0416-7da2-bcc3-7f2f51efd3c8")
-        );
-        assert_eq!(summary.image_call_id.as_deref(), Some("call_visible_image"));
+    fn assert_native_read_blocked(summary: &CodexCliEventSummary) {
         assert!(exact_codex_native_output_identity(summary).is_none());
 
         let home = tempfile::tempdir().unwrap();
@@ -966,10 +960,23 @@ mod tests {
         );
         let mut complete = summary.clone();
         complete.capture_complete = true;
+        complete.malformed_events = 0;
         assert_eq!(
             read_exact_codex_native_output(&root, &complete, 1024).unwrap(),
             Some(b"readable-native-output".to_vec())
         );
+    }
+
+    #[cfg(unix)]
+    fn assert_incomplete_capture_blocks_native_read(summary: &CodexCliEventSummary) {
+        assert!(!summary.capture_complete);
+        assert!(summary.completed_image_generation);
+        assert_eq!(
+            summary.thread_id.as_deref(),
+            Some("019fd666-0416-7da2-bcc3-7f2f51efd3c8")
+        );
+        assert_eq!(summary.image_call_id.as_deref(), Some("call_visible_image"));
+        assert_native_read_blocked(summary);
     }
 
     fn png_with_dimensions(width: u32, height: u32) -> Vec<u8> {
@@ -1431,6 +1438,27 @@ mod tests {
         let summary = state.lock().expect("Codex event lock").clone();
 
         assert_incomplete_capture_blocks_native_read(&summary);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn malformed_event_suffix_never_authorizes_prefix_native_identity() {
+        let state = Arc::new(Mutex::new(CodexCliEventSummary::default()));
+        let summary = capture_codex_events(
+            &b"{\"type\":\"thread.started\",\"thread_id\":\"019fd666-0416-7da2-bcc3-7f2f51efd3c8\"}\n{\"type\":\"item.completed\",\"item\":{\"type\":\"image_generation_call\",\"id\":\"call_visible_image\"}}\n{\"type\":\"thread.started\",\"thread_id\":"[..],
+            Arc::clone(&state),
+        )
+        .await;
+
+        assert!(summary.capture_complete);
+        assert_eq!(summary.malformed_events, 1);
+        assert!(summary.completed_image_generation);
+        assert_eq!(
+            summary.thread_id.as_deref(),
+            Some("019fd666-0416-7da2-bcc3-7f2f51efd3c8")
+        );
+        assert_eq!(summary.image_call_id.as_deref(), Some("call_visible_image"));
+        assert_native_read_blocked(&summary);
     }
 
     #[cfg(unix)]
