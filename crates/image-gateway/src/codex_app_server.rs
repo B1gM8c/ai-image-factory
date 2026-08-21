@@ -20,6 +20,8 @@ const MAX_PROTOCOL_REQUEST_BYTES: usize = 1024 * 1024;
 const REAP_TIMEOUT: Duration = Duration::from_secs(5);
 
 const IMAGE_GENERATION_DEVELOPER_INSTRUCTIONS: &str = "For this thread, image requests MUST invoke the enabled namespaced tool image_gen.imagegen (wire name image_gen__imagegen) exactly once. Never answer an image request with text only. Do not use shell or local programs to create, copy, move, rename, edit, or delete the generated artifact. After the image tool completes, stop.";
+const IMAGE_GENERATION_DIRECT_TOOL_CONFIG: &str =
+    "features.code_mode.direct_only_tool_namespaces=[\"image_gen\"]";
 
 pub(crate) struct CodexAppServerRequest<'a> {
     pub(crate) executable: &'a Path,
@@ -348,6 +350,9 @@ where
         .arg("app-server")
         .arg("--listen")
         .arg("stdio://")
+        .arg("--strict-config")
+        .arg("-c")
+        .arg(IMAGE_GENERATION_DIRECT_TOOL_CONFIG)
         .arg("--enable")
         .arg("image_generation")
         .arg("--disable")
