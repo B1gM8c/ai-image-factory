@@ -533,7 +533,7 @@ async fn expired_execution_recovers_late_success_evidence_without_relaunching_pr
         let files = ExecutordFixture::new(Duration::from_millis(1_200))?;
         let owner = "late-evidence-executord";
         let mut first = files
-            .command_with_lease(&database, owner, 800, 100)
+            .command_with_lease(&database, owner, 2_500, 250)
             .await?
             .spawn()
             .map_err(debug_error)?;
