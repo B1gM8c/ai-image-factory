@@ -911,24 +911,28 @@ printf 'invoked\n' >> {invocation_log}
 printf '%s\n' "$$" > {fake_active_pid}
 trap 'rm -f {fake_active_pid}' EXIT
 printf '%s\0' "$@" > {argv_log}
-cat > {stdin_log}
+: > {stdin_log}
+read_and_log() {{
+    IFS= read -r line || exit 32
+    printf '%s\n' "$line" >> {stdin_log}
+}}
+read_and_log
+printf '{{"id":1,"result":{{"codexHome":"%s"}}}}\n' "$CODEX_HOME"
+read_and_log
+read_and_log
+thread_id='019fd9f5-badb-7dd3-8903-28ffded0ef54'
+turn_id='019fd9f5-badb-7dd3-8903-28ffded0ef55'
+printf '{{"method":"thread/started","params":{{"thread":{{"id":"%s"}}}}}}\n' "$thread_id"
+printf '{{"id":2,"result":{{"thread":{{"id":"%s"}}}}}}\n' "$thread_id"
+read_and_log
+printf '{{"method":"turn/started","params":{{"threadId":"%s","turn":{{"id":"%s"}}}}}}\n' "$thread_id" "$turn_id"
+printf '{{"id":3,"result":{{"turn":{{"id":"%s"}}}}}}\n' "$turn_id"
 sleep "$(cat {fake_delay})"
-request_dir=
-while [ "$#" -gt 0 ]; do
-    if [ "$1" = "--cd" ]; then
-        shift
-        [ "$#" -gt 0 ] || exit 27
-        request_dir=$1
-    fi
-    shift
-done
-[ -n "$request_dir" ] || exit 28
 if /usr/bin/grep -q '第 2/2 张候选图片' {stdin_log}; then
     selected_fixture={second_fixture}
 else
     selected_fixture={fixture}
 fi
-thread_id='019fd9f5-badb-7dd3-8903-28ffded0ef54'
 call_id="call_process_smoke_$$"
 output_dir="$CODEX_HOME/generated_images/$thread_id"
 mkdir -p "$output_dir"
@@ -936,8 +940,10 @@ chmod 700 "$CODEX_HOME/generated_images" "$output_dir"
 cp "$selected_fixture" "$output_dir/$call_id.png.partial"
 chmod 600 "$output_dir/$call_id.png.partial"
 mv "$output_dir/$call_id.png.partial" "$output_dir/$call_id.png"
-printf '{{"type":"thread.started","thread_id":"%s"}}\n' "$thread_id"
-printf '{{"type":"item.completed","item":{{"type":"image_generation_call","id":"%s"}}}}\n' "$call_id"
+printf '{{"method":"item/started","params":{{"threadId":"%s","turnId":"%s","item":{{"type":"imageGeneration","id":"%s","status":"inProgress"}}}}}}\n' "$thread_id" "$turn_id" "$call_id"
+printf '{{"method":"item/completed","params":{{"threadId":"%s","turnId":"%s","item":{{"type":"imageGeneration","id":"%s","status":"completed","result":"fixture","savedPath":"%s"}}}}}}\n' "$thread_id" "$turn_id" "$call_id" "$output_dir/$call_id.png"
+printf '{{"method":"turn/completed","params":{{"threadId":"%s","turn":{{"id":"%s","status":"completed"}}}}}}\n' "$thread_id" "$turn_id"
+while IFS= read -r ignored; do :; done
 "#,
         codex_home = shell_quote(paths.codex_home),
         codex_auth = shell_quote(&paths.codex_home.join("auth.json")),

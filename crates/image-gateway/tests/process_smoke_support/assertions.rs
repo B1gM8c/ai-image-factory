@@ -102,15 +102,73 @@ fn codex_output_evidence(
         ),
     )?;
     let argv = read_nul_strings(&files.argv_log)?;
-    let request_dir = argv_value(&argv, "--cd")?;
-    assert_codex_invocation(
-        &argv,
-        &request_dir,
-        expects_image,
-        expected_parent_pid.is_none(),
+    assert_codex_invocation(&argv, expected_parent_pid.is_none())?;
+    let messages = fs::read_to_string(&files.stdin_log)
+        .map_err(|error| format!("failed to read fake Codex stdin log: {error}"))?
+        .lines()
+        .map(|line| {
+            serde_json::from_str::<Value>(line)
+                .map_err(|error| format!("fake Codex stdin contained invalid JSON: {error}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let thread_start = rpc_request(&messages, "thread/start")?;
+    let turn_start = rpc_request(&messages, "turn/start")?;
+    let request_dir = thread_start
+        .pointer("/params/cwd")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "Codex thread/start omitted its cwd".to_string())?
+        .to_string();
+    require(
+        turn_start.pointer("/params/cwd").and_then(Value::as_str) == Some(request_dir.as_str()),
+        "Codex turn/start cwd did not match thread/start",
     )?;
-    let prompt = fs::read_to_string(&files.stdin_log)
-        .map_err(|error| format!("failed to read fake Codex stdin log: {error}"))?;
+    let developer_instructions = thread_start
+        .pointer("/params/developerInstructions")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "Codex thread/start omitted developerInstructions".to_string())?;
+    require(
+        developer_instructions.contains("image_gen.imagegen")
+            && developer_instructions.contains("image_gen__imagegen")
+            && developer_instructions.contains("exactly once"),
+        format!(
+            "Codex developer instructions did not force the exact image tool: {developer_instructions}"
+        ),
+    )?;
+    let input = turn_start
+        .pointer("/params/input")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "Codex turn/start omitted its input array".to_string())?;
+    let prompt = input
+        .iter()
+        .find(|item| item.get("type").and_then(Value::as_str) == Some("text"))
+        .and_then(|item| item.get("text"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| "Codex turn/start omitted its text prompt".to_string())?
+        .to_string();
+    let image_paths = input
+        .iter()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("localImage"))
+        .map(|item| {
+            item.get("path")
+                .and_then(Value::as_str)
+                .filter(|path| !path.is_empty())
+                .ok_or_else(|| "Codex localImage omitted its path".to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    require(
+        image_paths.len() == usize::from(expects_image),
+        format!(
+            "Codex turn/start had {} localImage inputs, expected {}",
+            image_paths.len(),
+            usize::from(expects_image)
+        ),
+    )?;
+    for image_path in image_paths {
+        require(
+            !Path::new(image_path).exists(),
+            format!("cleaned edit input file still exists: {image_path}"),
+        )?;
+    }
     let fake_pid = read_pid(&files.fake_pid_log)?;
     require(
         fake_pid > 0,
@@ -233,7 +291,7 @@ pub(crate) fn assert_prompt_semantics(prompt: &str, request_dir: &str) -> TestRe
         ),
         (
             "single native image tool invocation",
-            "必须只调用一次当前启用的图像生成工具".to_string(),
+            "必须只调用一次当前启用的 image_gen.imagegen 图像生成工具".to_string(),
         ),
         (
             "Factory-owned native artifact sealing",
@@ -273,74 +331,43 @@ pub(crate) fn header(headers: &reqwest::header::HeaderMap, name: &str) -> TestRe
         .map_err(|error| format!("response header {name} was invalid: {error}"))
 }
 
-fn assert_codex_invocation(
-    argv: &[String],
-    request_dir: &str,
-    expects_image: bool,
-    expects_runtime_home: bool,
-) -> TestResult {
-    let mut expected_prefix = ["exec", "--ephemeral", "--enable", "image_generation"]
-        .map(str::to_string)
-        .to_vec();
-    expected_prefix.extend(
-        [
-            "--ignore-user-config",
-            "--ignore-rules",
-            "--disable",
-            "plugins",
-            "--disable",
-            "apps",
-            "--sandbox",
-            "workspace-write",
-            "--skip-git-repo-check",
-            "--cd",
-            request_dir,
-        ]
-        .map(str::to_string),
-    );
+fn assert_codex_invocation(argv: &[String], expects_runtime_home: bool) -> TestResult {
+    let expected = [
+        "app-server",
+        "--listen",
+        "stdio://",
+        "--enable",
+        "image_generation",
+        "--disable",
+        "plugins",
+        "--disable",
+        "apps",
+    ]
+    .map(str::to_string)
+    .to_vec();
     require(
-        argv.starts_with(&expected_prefix),
-        format!(
-            "unexpected Codex argv prefix:\nactual: {argv:?}\nexpected prefix: {expected_prefix:?}"
-        ),
+        argv == expected,
+        format!("unexpected Codex argv:\nactual: {argv:?}\nexpected: {expected:?}"),
     )?;
-    let mut argument_index = expected_prefix.len();
     if expects_runtime_home {
         require(
             !argv.iter().any(|argument| argument == "--add-dir"),
             format!("managed Codex argv exposed the Factory runtime output directory: {argv:?}"),
         )?;
     }
-    require(
-        argv.get(argument_index).map(String::as_str) == Some("--json"),
-        format!("Codex argv is missing --json: {argv:?}"),
-    )?;
-    argument_index += 1;
-    if expects_image {
-        require(
-            argv.len() == argument_index + 3
-                && argv[argument_index] == "--image"
-                && !argv[argument_index + 1].is_empty()
-                && argv[argument_index + 2] == "-",
-            format!("unexpected edit Codex argv: {argv:?}"),
-        )?;
-        require(
-            !Path::new(&argv[argument_index + 1]).exists(),
-            "cleaned edit input file still exists",
-        )
-    } else {
-        require(
-            argv.len() == argument_index + 1 && argv[argument_index] == "-",
-            format!("unexpected generation Codex argv: {argv:?}"),
-        )
-    }
+    Ok(())
 }
 
-fn argv_value(argv: &[String], flag: &str) -> TestResult<String> {
-    argv.windows(2)
-        .find(|pair| pair[0] == flag)
-        .map(|pair| pair[1].clone())
-        .ok_or_else(|| format!("fake Codex argv did not contain {flag}: {argv:?}"))
+fn rpc_request<'a>(messages: &'a [Value], method: &str) -> TestResult<&'a Value> {
+    let matches = messages
+        .iter()
+        .filter(|message| message.get("method").and_then(Value::as_str) == Some(method))
+        .collect::<Vec<_>>();
+    require(
+        matches.len() == 1,
+        format!("Codex stdin contained {} {method} requests", matches.len()),
+    )?;
+    Ok(matches[0])
 }
 
 fn read_nul_strings(path: &Path) -> TestResult<Vec<String>> {

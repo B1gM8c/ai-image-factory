@@ -425,6 +425,7 @@ impl ExecutionSpool {
         read_workspace_output(&self.workspace.fd, filename, max_bytes)
     }
 
+    #[cfg(test)]
     pub(crate) fn read_runtime_output(
         &self,
         filename: &str,
@@ -437,18 +438,7 @@ impl ExecutionSpool {
         read_workspace_output(&self.runtime_home.fd, filename, max_bytes)
     }
 
-    pub(crate) fn discard_runtime_output(&self, filename: &str) -> Result<(), ProcessSpoolError> {
-        if !valid_single_component(filename) {
-            return Err(ProcessSpoolError::InvalidInput);
-        }
-        validate_bound_path(&self.runtime_home.path, &self.runtime_home.fd)?;
-        match rfs::unlinkat(&self.runtime_home.fd, filename, AtFlags::empty()) {
-            Ok(()) => rfs::fsync(&self.runtime_home.fd).map_err(|_| ProcessSpoolError::Unavailable),
-            Err(Errno::NOENT) => Ok(()),
-            Err(_) => Err(ProcessSpoolError::Integrity),
-        }
-    }
-
+    #[cfg(test)]
     pub(crate) fn seal_codex_extension_output(
         &self,
         thread_id: &str,
@@ -1068,6 +1058,7 @@ fn read_optional_bytes(
     Ok(Some(bytes))
 }
 
+#[cfg(test)]
 fn read_workspace_output(
     directory: &OwnedFd,
     name: &str,

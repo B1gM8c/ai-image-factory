@@ -7,6 +7,7 @@ mod auth;
 pub mod batches;
 pub mod billing_control;
 pub mod billing_integrity;
+mod codex_app_server;
 mod config;
 mod core;
 pub mod credentials;

@@ -12,11 +12,6 @@ use std::{
 use std::io::Cursor;
 
 use async_trait::async_trait;
-use image_cli_runtime::{
-    CliPolicy, CliRuntime, CommandSpec, CommandSpecError, ExitClassification, OutputContract,
-    OutputError, ProcessCompletion, ProcessError, RuntimeError, SpawnEvidence, SpawnObserver,
-    VerifiedExecutable, WorkingDirectory,
-};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::{process::Command, time::Instant};
@@ -32,12 +27,12 @@ use super::{
 use crate::{
     ImageGatewayError, ProxyConfig,
     generator::GenerationJob,
-    providers::openai_codex::build_codex_prompt_for_output,
+    providers::openai_codex::build_codex_prompt,
     runner::{
         FilesystemRunnerJournal, LaunchDecision,
         process::{
             ExecutionSpool, ProcessObservation, ProcessSpoolError, ProcessTerminal,
-            ProviderProcessIdentity, RunnerLock, WorkspaceOutputSnapshot, sha256,
+            ProviderProcessIdentity, RunnerLock, sha256,
         },
     },
 };
@@ -48,8 +43,6 @@ const MAX_SHEBANG_BYTES: usize = 4096;
 const MAX_RUNNER_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 const CHILD_REAP_TIMEOUT: Duration = Duration::from_secs(5);
 const CODEX_CHILD_PATH: &str = "/usr/bin:/bin";
-const MAX_CODEX_RUNTIME_OUTPUT_BYTES: u64 = 32 * 1024 * 1024;
-const CODEX_RUNTIME_OUTPUT_FILE: &str = "sealed-output.bin";
 
 #[derive(Clone)]
 pub struct CodexProcessSupervisor {
@@ -83,51 +76,6 @@ enum ChildOutcome {
     Succeeded(Vec<u8>),
     Failed(&'static str),
     Uncertain(&'static str),
-}
-
-struct CodexCliPolicy;
-
-struct CodexCliInvocation {
-    executable: PathBuf,
-    workspace: PathBuf,
-    output_dir: PathBuf,
-    codex_home: PathBuf,
-    timeout: Duration,
-    prompt: Vec<u8>,
-    output_filename: &'static str,
-    environment: Vec<(String, String)>,
-}
-
-struct CodexSpawnObserver {
-    spool: Arc<ExecutionSpool>,
-    runner_lock: Arc<RunnerLock>,
-    helper: crate::runner::process::ProcessIdentity,
-    events: CodexEventSummary,
-}
-
-#[derive(Default)]
-struct CodexEventSummary {
-    thread_id: Option<Uuid>,
-    thread_id_ambiguous: bool,
-    image_call_id: Option<String>,
-    image_call_ambiguous: bool,
-    native_handoff: CodexNativeHandoff,
-    saw_image_generation: bool,
-    completed_image_generation: bool,
-    stdout_truncated: bool,
-    stderr_truncated: bool,
-    stderr_present: bool,
-    malformed_events: usize,
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-enum CodexNativeHandoff {
-    #[default]
-    NotAttempted,
-    Sealed,
-    Missing,
-    Invalid,
-    Unavailable,
 }
 
 impl CodexProcessSupervisor {
@@ -492,55 +440,40 @@ async fn run_codex_child(
         Ok(path) => path,
         Err(_) => return ChildOutcome::Uncertain("runner_codex_home_invalid"),
     };
-    let output_dir = match spool.runtime_home_path() {
-        Ok(path) => path,
-        Err(_) => return ChildOutcome::Uncertain("runner_output_directory_invalid"),
-    };
     let job = generation_job(&request.output);
-    let prompt = build_codex_prompt_for_output(
-        &job,
-        workspace,
-        request.output.candidate_index,
-        output_dir,
-        CODEX_RUNTIME_OUTPUT_FILE,
-    );
-    let invocation = CodexCliInvocation {
-        executable: PathBuf::from(&request.codex_executable),
-        workspace: workspace.to_path_buf(),
-        output_dir: output_dir.to_path_buf(),
-        codex_home: codex_home.to_path_buf(),
-        timeout: Duration::from_millis(request.timeout_ms),
-        prompt: prompt.into_bytes(),
-        output_filename: CODEX_RUNTIME_OUTPUT_FILE,
-        environment: allowed_child_environment(),
-    };
-    let mut observer = CodexSpawnObserver {
-        spool: Arc::clone(&spool),
-        runner_lock: Arc::clone(&runner_lock),
-        helper,
-        events: CodexEventSummary::default(),
-    };
-    let runtime_result = CliRuntime::new(CodexCliPolicy)
-        .run_to_sink(&invocation, &mut observer, Vec::new())
-        .await;
+    let prompt = build_codex_prompt(&job, workspace, request.output.candidate_index);
+    let mut environment = allowed_child_environment();
+    environment.push(("PATH".to_string(), CODEX_CHILD_PATH.to_string()));
+    let runtime_result = crate::codex_app_server::run_codex_app_server(
+        crate::codex_app_server::CodexAppServerRequest {
+            executable: Path::new(&request.codex_executable),
+            workspace,
+            codex_home,
+            prompt: &prompt,
+            input_paths: &[],
+            timeout: Duration::from_millis(request.timeout_ms),
+            environment: &environment,
+        },
+        |pid| {
+            ProviderProcessIdentity::capture(pid, &helper.nonce)
+                .and_then(|provider| {
+                    spool.publish_provider_process(&runner_lock, &helper, &provider)
+                })
+                .map_err(|_| ())
+        },
+    )
+    .await;
     let outcome = match runtime_result {
-        Ok(result) => ChildOutcome::Succeeded(result.sink),
+        Ok(bytes) => ChildOutcome::Succeeded(bytes),
         Err(error) => {
             tracing::warn!(
                 request.id = %request.output.request_id,
                 output.index = request.output.candidate_index,
-                codex.thread.id = ?observer.events.thread_id,
-                codex.image_generation.seen = observer.events.saw_image_generation,
-                codex.image_generation.completed = observer.events.completed_image_generation,
-                codex.events.malformed = observer.events.malformed_events,
-                codex.stdout.truncated = observer.events.stdout_truncated,
-                codex.stderr.truncated = observer.events.stderr_truncated,
-                codex.stderr.present = observer.events.stderr_present,
                 codex.output.stage = "sealed_handoff",
-                error.code = codex_output_error_code(&error),
+                error.code = error.code(),
                 "Codex completed without a valid sealed image handoff"
             );
-            map_cli_runtime_error_with_events(error, &observer.events)
+            map_codex_app_server_child_error(error)
         }
     };
     match outcome {
@@ -551,6 +484,36 @@ async fn run_codex_child(
             }
         }
         outcome => outcome,
+    }
+}
+
+fn map_codex_app_server_child_error(
+    error: crate::codex_app_server::CodexAppServerError,
+) -> ChildOutcome {
+    use crate::codex_app_server::CodexAppServerError;
+
+    match error {
+        CodexAppServerError::Unavailable => ChildOutcome::Failed("codex_cli_unavailable"),
+        CodexAppServerError::RequestRejected | CodexAppServerError::TurnFailed => {
+            ChildOutcome::Failed("codex_cli_failed")
+        }
+        CodexAppServerError::NoImage => ChildOutcome::Failed("codex_no_image_output"),
+        CodexAppServerError::ImageIncomplete
+        | CodexAppServerError::OutputMissing
+        | CodexAppServerError::OutputInvalid => {
+            ChildOutcome::Failed("codex_image_output_disappeared")
+        }
+        CodexAppServerError::MultipleImages => ChildOutcome::Failed("codex_multiple_image_outputs"),
+        CodexAppServerError::SpawnIdentity => {
+            ChildOutcome::Uncertain("codex_process_identity_unavailable")
+        }
+        CodexAppServerError::Stdin => ChildOutcome::Uncertain("codex_stdin_failed"),
+        CodexAppServerError::Timeout => ChildOutcome::Uncertain("codex_timeout"),
+        CodexAppServerError::Protocol => ChildOutcome::Uncertain("codex_event_capture_invalid"),
+        CodexAppServerError::ProcessExited => {
+            ChildOutcome::Uncertain("codex_process_exited_without_terminal")
+        }
+        CodexAppServerError::OutputUnavailable => ChildOutcome::Uncertain("service_unavailable"),
     }
 }
 
@@ -573,416 +536,6 @@ fn normalize_captured_image(
         return Err(());
     }
     Ok(images.remove(0).bytes)
-}
-
-impl CliPolicy for CodexCliPolicy {
-    type Request = CodexCliInvocation;
-    type Error = CommandSpecError;
-
-    fn command(&self, request: &Self::Request) -> Result<CommandSpec, Self::Error> {
-        let mut command = CommandSpec::new(
-            VerifiedExecutable::new(&request.executable)?,
-            WorkingDirectory::new(&request.output_dir)?,
-            OutputContract::new(request.output_filename, MAX_CODEX_RUNTIME_OUTPUT_BYTES)?,
-            request.timeout,
-            CHILD_REAP_TIMEOUT,
-        )?
-        .require_directory(WorkingDirectory::new(&request.workspace)?);
-        for argument in [
-            "exec",
-            "--ephemeral",
-            "--enable",
-            "image_generation",
-            "--ignore-user-config",
-            "--ignore-rules",
-            "--disable",
-            "plugins",
-            "--disable",
-            "apps",
-            "--sandbox",
-            "workspace-write",
-            "--skip-git-repo-check",
-            "--cd",
-        ] {
-            command = command.arg(argument)?;
-        }
-        command = command
-            .arg(request.workspace.as_os_str())?
-            .arg("--json")?
-            .arg("-")?;
-        for (name, value) in [
-            ("HOME", request.codex_home.to_string_lossy().into_owned()),
-            (
-                "CODEX_HOME",
-                request.codex_home.to_string_lossy().into_owned(),
-            ),
-            ("TMPDIR", request.workspace.to_string_lossy().into_owned()),
-            ("PATH", CODEX_CHILD_PATH.to_string()),
-        ] {
-            command = command.env(name, value)?;
-        }
-        for (name, value) in &request.environment {
-            command = command.env(name, value)?;
-        }
-        command
-            .stdin(request.prompt.clone())
-            .map(CommandSpec::capture_process_output)
-    }
-
-    fn classify_exit(&self, status: &std::process::ExitStatus) -> ExitClassification {
-        if status.success() {
-            ExitClassification::Success
-        } else {
-            ExitClassification::Failed {
-                code: "codex_cli_failed".to_string(),
-            }
-        }
-    }
-}
-
-impl SpawnObserver for CodexSpawnObserver {
-    type Error = ProcessSpoolError;
-
-    fn observe_spawn(&mut self, evidence: &SpawnEvidence) -> Result<(), Self::Error> {
-        ProviderProcessIdentity::capture(evidence.pid, &self.helper.nonce).and_then(|provider| {
-            self.spool
-                .publish_provider_process(&self.runner_lock, &self.helper, &provider)
-        })
-    }
-
-    fn observe_completion(&mut self, completion: &ProcessCompletion) -> Result<(), Self::Error> {
-        self.events = summarize_codex_events(completion);
-        if !self.events.completed_image_generation {
-            self.events.native_handoff =
-                match self.spool.discard_runtime_output(CODEX_RUNTIME_OUTPUT_FILE) {
-                    Ok(()) => CodexNativeHandoff::NotAttempted,
-                    Err(ProcessSpoolError::Unavailable) => CodexNativeHandoff::Unavailable,
-                    Err(error) => return Err(error),
-                };
-            return Ok(());
-        }
-        if self.events.completed_image_generation {
-            if self.events.stdout_truncated || self.events.malformed_events > 0 {
-                self.events.native_handoff =
-                    match self.spool.discard_runtime_output(CODEX_RUNTIME_OUTPUT_FILE) {
-                        Ok(()) => CodexNativeHandoff::Invalid,
-                        Err(ProcessSpoolError::Unavailable) => CodexNativeHandoff::Unavailable,
-                        Err(error) => return Err(error),
-                    };
-                return Ok(());
-            }
-            self.events.native_handoff = match self
-                .spool
-                .read_runtime_output(CODEX_RUNTIME_OUTPUT_FILE, MAX_CODEX_RUNTIME_OUTPUT_BYTES)
-            {
-                Ok(WorkspaceOutputSnapshot::Missing)
-                    if !self.events.thread_id_ambiguous && !self.events.image_call_ambiguous =>
-                {
-                    match (self.events.thread_id, self.events.image_call_id.as_deref()) {
-                        (Some(thread_id), Some(call_id)) => {
-                            match self.spool.seal_codex_extension_output(
-                                &thread_id.to_string(),
-                                call_id,
-                                CODEX_RUNTIME_OUTPUT_FILE,
-                                MAX_CODEX_RUNTIME_OUTPUT_BYTES,
-                            ) {
-                                Ok(true) => CodexNativeHandoff::Sealed,
-                                Ok(false) => CodexNativeHandoff::Missing,
-                                Err(ProcessSpoolError::Unavailable) => {
-                                    CodexNativeHandoff::Unavailable
-                                }
-                                Err(
-                                    ProcessSpoolError::InvalidInput
-                                    | ProcessSpoolError::Conflict
-                                    | ProcessSpoolError::Integrity,
-                                ) => CodexNativeHandoff::Invalid,
-                            }
-                        }
-                        _ => CodexNativeHandoff::NotAttempted,
-                    }
-                }
-                Ok(WorkspaceOutputSnapshot::Missing) => CodexNativeHandoff::Invalid,
-                Ok(WorkspaceOutputSnapshot::Incomplete)
-                | Ok(WorkspaceOutputSnapshot::Bytes(_))
-                | Err(
-                    ProcessSpoolError::InvalidInput
-                    | ProcessSpoolError::Conflict
-                    | ProcessSpoolError::Integrity,
-                ) => match self.spool.discard_runtime_output(CODEX_RUNTIME_OUTPUT_FILE) {
-                    Ok(()) => CodexNativeHandoff::Invalid,
-                    Err(ProcessSpoolError::Unavailable) => CodexNativeHandoff::Unavailable,
-                    Err(error) => return Err(error),
-                },
-                Err(ProcessSpoolError::Unavailable) => CodexNativeHandoff::Unavailable,
-            };
-        }
-        Ok(())
-    }
-}
-
-fn summarize_codex_events(completion: &ProcessCompletion) -> CodexEventSummary {
-    summarize_codex_event_stream(
-        completion.stdout.bytes(),
-        completion.stdout.is_truncated(),
-        completion.stderr.bytes(),
-        completion.stderr.is_truncated(),
-    )
-}
-
-fn summarize_codex_event_stream(
-    stdout: &[u8],
-    stdout_truncated: bool,
-    stderr: &[u8],
-    stderr_truncated: bool,
-) -> CodexEventSummary {
-    let mut summary = CodexEventSummary {
-        stdout_truncated,
-        stderr_truncated,
-        stderr_present: !stderr.is_empty(),
-        ..CodexEventSummary::default()
-    };
-    for line in stdout.split(|byte| *byte == b'\n') {
-        if line.is_empty() {
-            continue;
-        }
-        let Ok(event) = serde_json::from_slice::<serde_json::Value>(line) else {
-            summary.malformed_events = summary.malformed_events.saturating_add(1);
-            continue;
-        };
-        record_codex_thread_id(&event, &mut summary);
-        record_codex_image_call_ids(&event, &mut summary);
-        let image_event = codex_image_event_state(&event);
-        if image_event.seen {
-            summary.saw_image_generation = true;
-        }
-        if image_event.completed {
-            summary.completed_image_generation = true;
-        }
-    }
-    summary
-}
-
-fn record_codex_image_call_ids(value: &serde_json::Value, summary: &mut CodexEventSummary) {
-    match value {
-        serde_json::Value::Object(fields) => {
-            let event_type = fields
-                .get("type")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default();
-            let candidate = match event_type {
-                "image_generation_call" => fields.get("id"),
-                "image_generation_begin" | "image_generation_end" => fields.get("call_id"),
-                _ => None,
-            }
-            .and_then(serde_json::Value::as_str);
-            if let Some(candidate) = candidate {
-                if !valid_codex_image_call_id(candidate) {
-                    summary.image_call_id = None;
-                    summary.image_call_ambiguous = true;
-                } else if let Some(existing) = summary.image_call_id.as_deref() {
-                    if existing != candidate {
-                        summary.image_call_id = None;
-                        summary.image_call_ambiguous = true;
-                    }
-                } else if !summary.image_call_ambiguous {
-                    summary.image_call_id = Some(candidate.to_string());
-                }
-            }
-            for value in fields.values() {
-                record_codex_image_call_ids(value, summary);
-            }
-        }
-        serde_json::Value::Array(values) => {
-            for value in values {
-                record_codex_image_call_ids(value, summary);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn record_codex_thread_id(value: &serde_json::Value, summary: &mut CodexEventSummary) {
-    if value.get("type").and_then(serde_json::Value::as_str) != Some("thread.started") {
-        return;
-    }
-    let Some(candidate) = value
-        .get("thread_id")
-        .and_then(serde_json::Value::as_str)
-        .and_then(|value| Uuid::parse_str(value).ok())
-    else {
-        return;
-    };
-    if let Some(existing) = summary.thread_id {
-        if existing != candidate {
-            summary.thread_id = None;
-            summary.thread_id_ambiguous = true;
-        }
-    } else if !summary.thread_id_ambiguous {
-        summary.thread_id = Some(candidate);
-    }
-}
-
-fn valid_codex_image_call_id(call_id: &str) -> bool {
-    !call_id.is_empty()
-        && call_id.len() <= 255 - ".png".len()
-        && call_id
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-}
-
-#[derive(Clone, Copy, Default)]
-struct CodexImageEventState {
-    seen: bool,
-    completed: bool,
-}
-
-fn codex_image_event_state(value: &serde_json::Value) -> CodexImageEventState {
-    match value {
-        serde_json::Value::Object(fields) => {
-            let event_type = fields
-                .get("type")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default();
-            let mut state = CodexImageEventState {
-                seen: matches!(
-                    event_type,
-                    "image_generation_call" | "image_generation_begin" | "image_generation_end"
-                ),
-                completed: event_type == "image_generation_end",
-            };
-            for value in fields.values() {
-                let child = codex_image_event_state(value);
-                state.seen |= child.seen;
-                state.completed |= child.completed;
-            }
-            if event_type == "item.completed" && state.seen {
-                state.completed = true;
-            }
-            state
-        }
-        serde_json::Value::Array(values) => {
-            values
-                .iter()
-                .fold(CodexImageEventState::default(), |mut state, value| {
-                    let child = codex_image_event_state(value);
-                    state.seen |= child.seen;
-                    state.completed |= child.completed;
-                    state
-                })
-        }
-        _ => CodexImageEventState::default(),
-    }
-}
-
-fn map_cli_runtime_error_with_events(
-    error: RuntimeError,
-    events: &CodexEventSummary,
-) -> ChildOutcome {
-    if matches!(
-        error,
-        RuntimeError::Output(OutputError::Missing)
-            | RuntimeError::Output(OutputError::Unavailable(_))
-    ) {
-        match events.native_handoff {
-            CodexNativeHandoff::Invalid => {
-                return ChildOutcome::Failed("codex_image_output_disappeared");
-            }
-            CodexNativeHandoff::Unavailable => {
-                return ChildOutcome::Uncertain("service_unavailable");
-            }
-            CodexNativeHandoff::NotAttempted
-            | CodexNativeHandoff::Sealed
-            | CodexNativeHandoff::Missing => {}
-        }
-    }
-    if events.completed_image_generation
-        && matches!(
-            error,
-            RuntimeError::Output(OutputError::Missing)
-                | RuntimeError::Output(OutputError::Unavailable(_))
-        )
-    {
-        return ChildOutcome::Failed("codex_image_output_disappeared");
-    }
-    if !events.completed_image_generation
-        && (matches!(&error, RuntimeError::Output(OutputError::Missing))
-            || matches!(
-                &error,
-                RuntimeError::Output(OutputError::Unavailable(source))
-                    if source.kind() == std::io::ErrorKind::NotFound
-            ))
-    {
-        return ChildOutcome::Failed("codex_no_image_output");
-    }
-    map_cli_runtime_error(error)
-}
-
-fn codex_output_error_code(error: &RuntimeError) -> &'static str {
-    match error {
-        RuntimeError::Output(OutputError::Missing) => "codex_no_image_output",
-        RuntimeError::Output(OutputError::Unavailable(error))
-            if error.kind() == std::io::ErrorKind::NotFound =>
-        {
-            "codex_image_output_disappeared"
-        }
-        _ => "codex_runtime_failed",
-    }
-}
-
-fn map_cli_runtime_error(error: RuntimeError) -> ChildOutcome {
-    match error {
-        RuntimeError::ProcessFailed { .. } => ChildOutcome::Failed("codex_cli_failed"),
-        RuntimeError::Process(ProcessError::Spawn(_)) => {
-            ChildOutcome::Failed("codex_cli_unavailable")
-        }
-        RuntimeError::Process(ProcessError::TimedOut { .. }) => {
-            ChildOutcome::Uncertain("codex_timeout")
-        }
-        RuntimeError::Process(ProcessError::Observer { .. })
-        | RuntimeError::Process(ProcessError::IdentityUnavailable) => {
-            ChildOutcome::Uncertain("codex_process_identity_unavailable")
-        }
-        RuntimeError::Process(ProcessError::Stdin { .. }) => {
-            ChildOutcome::Uncertain("codex_stdin_failed")
-        }
-        RuntimeError::Output(error) => match error {
-            OutputError::Missing => ChildOutcome::Failed("codex_no_image_output"),
-            OutputError::MultipleEntries => ChildOutcome::Failed("codex_multiple_image_outputs"),
-            OutputError::NotRegular => ChildOutcome::Failed("codex_image_output_not_regular"),
-            OutputError::Empty => ChildOutcome::Failed("codex_image_output_empty"),
-            OutputError::TooLarge => ChildOutcome::Failed("codex_image_output_too_large"),
-            OutputError::ChangedDuringRead => ChildOutcome::Uncertain("codex_image_output_changed"),
-            OutputError::Unavailable(error) => match error.kind() {
-                std::io::ErrorKind::NotFound => {
-                    ChildOutcome::Failed("codex_image_output_disappeared")
-                }
-                std::io::ErrorKind::PermissionDenied => {
-                    ChildOutcome::Failed("codex_image_output_unreadable")
-                }
-                _ => ChildOutcome::Uncertain("codex_output_unavailable"),
-            },
-            OutputError::UnsafeDirectory => {
-                ChildOutcome::Uncertain("codex_output_directory_unsafe")
-            }
-            OutputError::InvalidLimit => ChildOutcome::Uncertain("codex_output_contract_invalid"),
-            OutputError::DirectoryNotEmpty => {
-                ChildOutcome::Failed("codex_output_directory_not_empty")
-            }
-            OutputError::Sink(_) => ChildOutcome::Uncertain("codex_output_sink_failed"),
-        },
-        RuntimeError::Policy(_)
-        | RuntimeError::MissingOutputContract
-        | RuntimeError::UnexpectedOutputContract
-        | RuntimeError::CapturedOutputTooLarge { .. }
-        | RuntimeError::Receipt(_)
-        | RuntimeError::OutputTask(_)
-        | RuntimeError::Process(ProcessError::InvalidCommand(_))
-        | RuntimeError::Process(ProcessError::Capture { .. })
-        | RuntimeError::Process(ProcessError::ResidualProcessGroup { .. })
-        | RuntimeError::Process(ProcessError::Wait { .. }) => {
-            ChildOutcome::Uncertain("codex_runtime_failed")
-        }
-    }
 }
 
 fn validate_child_request(
@@ -1293,118 +846,6 @@ mod tests {
     }
 
     #[test]
-    fn output_seal_failures_preserve_actionable_terminal_codes() {
-        assert!(matches!(
-            map_cli_runtime_error(RuntimeError::Output(OutputError::Missing)),
-            ChildOutcome::Failed("codex_no_image_output")
-        ));
-        assert!(matches!(
-            map_cli_runtime_error(RuntimeError::Output(OutputError::MultipleEntries)),
-            ChildOutcome::Failed("codex_multiple_image_outputs")
-        ));
-        assert!(matches!(
-            map_cli_runtime_error(RuntimeError::Output(OutputError::NotRegular)),
-            ChildOutcome::Failed("codex_image_output_not_regular")
-        ));
-        assert!(matches!(
-            map_cli_runtime_error(RuntimeError::Output(OutputError::TooLarge)),
-            ChildOutcome::Failed("codex_image_output_too_large")
-        ));
-        assert!(matches!(
-            map_cli_runtime_error(RuntimeError::Output(OutputError::ChangedDuringRead)),
-            ChildOutcome::Uncertain("codex_image_output_changed")
-        ));
-        assert!(matches!(
-            map_cli_runtime_error(RuntimeError::Output(OutputError::Unavailable(
-                std::io::Error::from(std::io::ErrorKind::NotFound),
-            ))),
-            ChildOutcome::Failed("codex_image_output_disappeared")
-        ));
-    }
-
-    #[test]
-    fn codex_json_events_bind_native_output_and_terminal_diagnostics() {
-        let thread_id = Uuid::new_v4();
-        let stdout = format!(
-            "{{\"type\":\"thread.started\",\"thread_id\":\"{thread_id}\"}}\n\
-             {{\"type\":\"item.completed\",\"item\":{{\"type\":\"image_generation_call\",\"id\":\"call_exact_image\"}}}}\n\
-             not-json\n"
-        );
-
-        let summary = summarize_codex_event_stream(stdout.as_bytes(), false, b"warning", true);
-
-        assert_eq!(summary.thread_id, Some(thread_id));
-        assert_eq!(summary.image_call_id.as_deref(), Some("call_exact_image"));
-        assert!(!summary.image_call_ambiguous);
-        assert!(summary.saw_image_generation);
-        assert!(summary.completed_image_generation);
-        assert_eq!(summary.malformed_events, 1);
-        assert!(summary.stderr_present);
-        assert!(summary.stderr_truncated);
-    }
-
-    #[test]
-    fn multiple_native_image_call_ids_fail_closed() {
-        let thread_id = Uuid::new_v4();
-        let stdout = format!(
-            "{{\"type\":\"thread.started\",\"thread_id\":\"{thread_id}\"}}\n\
-             {{\"type\":\"item.started\",\"item\":{{\"type\":\"image_generation_call\",\"id\":\"call_first\"}}}}\n\
-             {{\"type\":\"item.completed\",\"item\":{{\"type\":\"image_generation_call\",\"id\":\"call_second\"}}}}\n"
-        );
-
-        let summary = summarize_codex_event_stream(stdout.as_bytes(), false, &[], false);
-
-        assert!(summary.image_call_id.is_none());
-        assert!(summary.image_call_ambiguous);
-    }
-
-    #[test]
-    fn multiple_thread_ids_fail_closed() {
-        let first = Uuid::new_v4();
-        let second = Uuid::new_v4();
-        let stdout = format!(
-            "{{\"type\":\"thread.started\",\"thread_id\":\"{first}\"}}\n\
-             {{\"type\":\"thread.started\",\"thread_id\":\"{second}\"}}\n\
-             {{\"type\":\"item.completed\",\"item\":{{\"type\":\"image_generation_call\",\"id\":\"call_exact\"}}}}\n"
-        );
-
-        let summary = summarize_codex_event_stream(stdout.as_bytes(), false, &[], false);
-
-        assert!(summary.thread_id.is_none());
-        assert!(summary.thread_id_ambiguous);
-    }
-
-    #[test]
-    fn completed_image_event_distinguishes_lost_artifact_from_no_generation() {
-        let events = CodexEventSummary {
-            saw_image_generation: true,
-            completed_image_generation: true,
-            ..CodexEventSummary::default()
-        };
-
-        assert!(matches!(
-            map_cli_runtime_error_with_events(RuntimeError::Output(OutputError::Missing), &events,),
-            ChildOutcome::Failed("codex_image_output_disappeared")
-        ));
-        assert!(matches!(
-            map_cli_runtime_error_with_events(
-                RuntimeError::Output(OutputError::Missing),
-                &CodexEventSummary::default(),
-            ),
-            ChildOutcome::Failed("codex_no_image_output")
-        ));
-        assert!(matches!(
-            map_cli_runtime_error_with_events(
-                RuntimeError::Output(OutputError::Unavailable(std::io::Error::from(
-                    std::io::ErrorKind::NotFound,
-                ))),
-                &CodexEventSummary::default(),
-            ),
-            ChildOutcome::Failed("codex_no_image_output")
-        ));
-    }
-
-    #[test]
     fn auth_digest_uses_the_same_private_file_contract_as_runtime() {
         let temp = TempDir::new().unwrap();
         let auth = temp.path().join(AUTH_FILE);
@@ -1605,8 +1046,8 @@ mod tests {
 
         assert_eq!(
             spool.observe().unwrap(),
-            ProcessObservation::Failed {
-                error_code: "codex_image_output_disappeared".to_string(),
+            ProcessObservation::Uncertain {
+                error_code: "codex_event_capture_invalid".to_string(),
             }
         );
         let execution_root = fixture
@@ -1635,8 +1076,8 @@ mod tests {
 
         assert_eq!(
             spool.observe().unwrap(),
-            ProcessObservation::Failed {
-                error_code: "codex_image_output_disappeared".to_string(),
+            ProcessObservation::Uncertain {
+                error_code: "codex_event_capture_invalid".to_string(),
             }
         );
         let execution_root = fixture
@@ -1677,7 +1118,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn agent_written_runtime_output_is_not_a_success_authority() {
+    async fn agent_written_runtime_output_cannot_replace_exact_native_authority() {
         let fixture = CodexFixture::agent_written_output_with_native();
         let lease = fixture.lease();
         let context = fixture.context(&lease);
@@ -1693,17 +1134,15 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(
+        assert!(matches!(
             spool.observe().unwrap(),
-            ProcessObservation::Failed {
-                error_code: "codex_image_output_disappeared".to_string(),
-            }
-        );
+            ProcessObservation::Succeeded(_)
+        ));
         let execution_root = fixture
             .journal
             .root_path()
             .join(lease.executor_execution_id.simple().to_string());
-        assert!(!execution_root.join("output.bin").exists());
+        assert!(execution_root.join("output.bin").exists());
     }
 
     #[tokio::test]
@@ -2054,6 +1493,66 @@ mod tests {
         invocations: PathBuf,
     }
 
+    fn app_server_fixture_script(exec_body: String) -> String {
+        let force_malformed = usize::from(
+            exec_body.contains("/usr/bin/head -c 70000")
+                || exec_body.contains("printf '{\"type\":\"thread.started\",\"thread_id\":'")
+                || exec_body.contains("printf '{{\"type\":\"thread.started\",\"thread_id\":'"),
+        );
+        let exec_body = exec_body
+            .lines()
+            .filter(|line| !line.starts_with("#!") && *line != "set -eu")
+            .collect::<Vec<_>>()
+            .join("\n")
+            .replace("/bin/cat >/dev/null", ":");
+        format!(
+            r#"#!/bin/sh
+set -eu
+thread_id='019fd9f5-badb-7dd3-8903-28ffded0ef54'
+turn_id='019fd9f5-badb-7dd3-8903-28ffded0ef55'
+IFS= read -r initialize
+printf '{{"id":1,"result":{{"codexHome":"%s"}}}}\n' "$CODEX_HOME"
+IFS= read -r initialized
+IFS= read -r thread_start
+printf '{{"method":"thread/started","params":{{"thread":{{"id":"%s"}}}}}}\n' "$thread_id"
+printf '{{"id":2,"result":{{"thread":{{"id":"%s"}}}}}}\n' "$thread_id"
+IFS= read -r turn_start
+printf '{{"method":"turn/started","params":{{"threadId":"%s","turn":{{"id":"%s"}}}}}}\n' "$thread_id" "$turn_id"
+printf '{{"id":3,"result":{{"turn":{{"id":"%s"}}}}}}\n' "$turn_id"
+legacy_events="$CODEX_HOME/legacy-events.jsonl"
+set +e
+(
+{exec_body}
+) > "$legacy_events"
+legacy_status=$?
+set -e
+malformed={force_malformed}
+while IFS= read -r event; do
+  case "$event" in
+    '{{"type":"thread.started","thread_id":"'*'"}}') ;;
+    '{{"type":"item.completed","item":{{"type":"image_generation_call","id":"'*'"}}}}') ;;
+    '') ;;
+    *) malformed=1 ;;
+  esac
+done < "$legacy_events"
+if [ "$malformed" -eq 0 ]; then
+/usr/bin/sed -n 's/.*"type":"image_generation_call","id":"\([^"]*\)".*/\1/p' "$legacy_events" | while IFS= read -r call_id; do
+  output_path="$CODEX_HOME/generated_images/$thread_id/$call_id.png"
+  printf '{{"method":"item/started","params":{{"threadId":"%s","turnId":"%s","item":{{"type":"imageGeneration","id":"%s","status":"inProgress"}}}}}}\n' "$thread_id" "$turn_id" "$call_id"
+  printf '{{"method":"item/completed","params":{{"threadId":"%s","turnId":"%s","item":{{"type":"imageGeneration","id":"%s","status":"completed","result":"cG5n","savedPath":"%s"}}}}}}\n' "$thread_id" "$turn_id" "$call_id" "$output_path"
+done
+fi
+if [ "$legacy_status" -eq 0 ]; then
+  printf '{{"method":"turn/completed","params":{{"threadId":"%s","turn":{{"id":"%s","status":"completed"}}}}}}\n' "$thread_id" "$turn_id"
+else
+  printf '{{"method":"turn/completed","params":{{"threadId":"%s","turn":{{"id":"%s","status":"failed"}}}}}}\n' "$thread_id" "$turn_id"
+fi
+if [ "$malformed" -ne 0 ]; then printf 'not-json\n'; fi
+while IFS= read -r ignored; do :; done
+"#
+        )
+    }
+
     impl CodexFixture {
         fn new() -> Self {
             Self::with_script(|invocations, image, _root| {
@@ -2201,7 +1700,8 @@ mod tests {
             fs::write(&image, bytes.into_inner()).unwrap();
             let invocations = temp.path().join("invocations");
             let executable = temp.path().join("fake-codex");
-            fs::write(&executable, build_script(&invocations, &image, temp.path())).unwrap();
+            let exec_body = build_script(&invocations, &image, temp.path());
+            fs::write(&executable, app_server_fixture_script(exec_body)).unwrap();
             fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
             let supervisor = CodexProcessSupervisor::new(
                 journal.clone(),
@@ -2209,7 +1709,7 @@ mod tests {
                 &executable,
                 &credentials,
                 &sha256(b"{}"),
-                Duration::from_secs(5),
+                Duration::from_secs(30),
                 Duration::from_millis(10),
                 Duration::from_secs(1),
                 &ProxyConfig::default(),
