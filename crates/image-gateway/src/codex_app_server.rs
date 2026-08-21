@@ -843,12 +843,46 @@ fn classify_stream_bytes(value: &[u8]) -> String {
     if let Some(code) = extract_stable_api_error_code(&normalized) {
         return format!("api_code:{code}");
     }
+    let lowercase = normalized.to_ascii_lowercase();
+    let signals = stream_policy_signals(&lowercase);
     for status in [400_u16, 401, 403, 404, 409, 422, 429, 500, 502, 503, 504] {
-        if normalized.contains(&format!("http {status}")) {
-            return format!("http_status:{status}");
+        if lowercase.contains(&format!("http {status}")) {
+            return if signals.is_empty() {
+                format!("http_status:{status}")
+            } else {
+                format!("http_status:{status}:{}", signals.join("+"))
+            };
         }
     }
+    if !signals.is_empty() {
+        return signals.join("+");
+    }
     classify_bytes(value).to_string()
+}
+
+fn stream_policy_signals(value: &str) -> Vec<&'static str> {
+    let mut signals = Vec::new();
+    for (signal, needles) in [
+        ("originator", &["originator"][..]),
+        ("entitlement", &["entitlement", "not entitled"]),
+        ("content_policy", &["content_policy", "content policy"]),
+        ("cyber_policy", &["cyber_policy", "cyber policy"]),
+        ("safety", &["safety"]),
+        ("moderation", &["moderation"]),
+        ("retention", &["retention", "zero data", "zdr"]),
+        ("organization", &["organization", "organisation"]),
+        ("account", &["account"]),
+        ("prompt", &["prompt"]),
+        ("rejected", &["rejected"]),
+        ("unsupported", &["unsupported"]),
+        ("blocked", &["blocked"]),
+        ("policy", &["policy"]),
+    ] {
+        if needles.iter().any(|needle| value.contains(needle)) {
+            signals.push(signal);
+        }
+    }
+    signals
 }
 
 fn extract_stable_api_error_code(value: &str) -> Option<String> {
@@ -1514,6 +1548,12 @@ mod tests {
         assert_eq!(
             classify_stream_bytes(b"image generation failed: http 422 Unprocessable Entity"),
             "http_status:422"
+        );
+        assert_eq!(
+            classify_stream_bytes(
+                b"image generation failed: http 400 Bad Request: organization zero data retention policy rejected",
+            ),
+            "http_status:400:retention+organization+rejected+policy"
         );
     }
 
