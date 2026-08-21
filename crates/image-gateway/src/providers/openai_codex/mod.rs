@@ -297,6 +297,7 @@ fn map_codex_app_server_error(
         | CodexAppServerError::OutputMissing
         | CodexAppServerError::OutputInvalid => ImageGatewayError::codex_image_output_disappeared(),
         CodexAppServerError::NoImage => ImageGatewayError::codex_image_tool_not_invoked(),
+        CodexAppServerError::ContentPolicyRejected => ImageGatewayError::content_policy_rejected(),
         CodexAppServerError::SpawnIdentity
         | CodexAppServerError::Stdin
         | CodexAppServerError::Protocol

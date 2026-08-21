@@ -57,6 +57,7 @@ pub(crate) enum CodexAppServerError {
     RequestRejected,
     TurnFailed,
     ImageToolFailed,
+    ContentPolicyRejected,
     NoImage,
     ImageIncomplete,
     MultipleImages,
@@ -77,6 +78,7 @@ impl CodexAppServerError {
             Self::RequestRejected => "codex_app_server_request_rejected",
             Self::TurnFailed => "codex_turn_failed",
             Self::ImageToolFailed => "codex_image_tool_failed",
+            Self::ContentPolicyRejected => "content_policy_rejected",
             Self::NoImage => "codex_no_image_output",
             Self::ImageIncomplete | Self::OutputMissing | Self::OutputInvalid => {
                 "codex_image_output_disappeared"
@@ -693,6 +695,7 @@ where
             let exit = observe_child_exit(&mut child);
             terminate_child(&mut child).await;
             let stderr = await_stderr_diagnostic(stderr_task).await;
+            let error = refine_image_tool_error(error, stderr.as_ref());
             report_failure(&request, &state, error, stderr.as_ref(), &exit);
             return Err(error);
         }
@@ -722,6 +725,26 @@ where
     .map_err(map_output_read_error)?
     .ok_or(CodexAppServerError::OutputMissing);
     output
+}
+
+fn refine_image_tool_error(
+    error: CodexAppServerError,
+    stderr: Option<&StreamDiagnostic>,
+) -> CodexAppServerError {
+    if error == CodexAppServerError::ImageToolFailed
+        && stderr.is_some_and(|value| {
+            value.class.split([':', '+']).any(|signal| {
+                matches!(
+                    signal,
+                    "content_policy" | "cyber_policy" | "safety" | "moderation"
+                )
+            })
+        })
+    {
+        CodexAppServerError::ContentPolicyRejected
+    } else {
+        error
+    }
 }
 
 async fn wait_for_response<R: AsyncBufRead + Unpin>(
@@ -1554,6 +1577,44 @@ mod tests {
                 b"image generation failed: http 400 Bad Request: organization zero data retention policy rejected",
             ),
             "http_status:400:retention+organization+rejected+policy"
+        );
+    }
+
+    #[test]
+    fn only_explicit_content_safety_signals_refine_image_tool_failures() {
+        let diagnostic = |class: &str| StreamDiagnostic {
+            class: class.to_string(),
+            ..StreamDiagnostic::default()
+        };
+        for class in [
+            "api_code:content_policy",
+            "api_code:cyber_policy",
+            "http_status:400:safety+moderation+rejected+blocked",
+        ] {
+            assert_eq!(
+                refine_image_tool_error(
+                    CodexAppServerError::ImageToolFailed,
+                    Some(&diagnostic(class)),
+                ),
+                CodexAppServerError::ContentPolicyRejected,
+            );
+        }
+        for class in [
+            "http_status:400:retention+organization+rejected+policy",
+            "http_status:400:prompt+unsupported",
+            "http_status:429",
+        ] {
+            assert_eq!(
+                refine_image_tool_error(
+                    CodexAppServerError::ImageToolFailed,
+                    Some(&diagnostic(class)),
+                ),
+                CodexAppServerError::ImageToolFailed,
+            );
+        }
+        assert_eq!(
+            refine_image_tool_error(CodexAppServerError::TurnFailed, Some(&diagnostic("safety"))),
+            CodexAppServerError::TurnFailed,
         );
     }
 

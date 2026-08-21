@@ -337,6 +337,9 @@ fn safe_failure_message(error_code: &str) -> Option<&'static str> {
         "codex_app_server_request_rejected" => Some("Codex app-server request rejected"),
         "codex_turn_failed" => Some("Codex image generation turn failed"),
         "codex_image_tool_failed" => Some("Codex image generation tool failed"),
+        "content_policy_rejected" => {
+            Some("The image request was rejected by the provider safety policy")
+        }
         "codex_event_capture_invalid" => Some("Codex event stream validation failed"),
         "codex_process_exited_without_terminal" => {
             Some("Codex app-server exited without a terminal event")
@@ -357,6 +360,10 @@ mod tests {
         assert_eq!(
             safe_failure_message("codex_image_tool_failed"),
             Some("Codex image generation tool failed")
+        );
+        assert_eq!(
+            safe_failure_message("content_policy_rejected"),
+            Some("The image request was rejected by the provider safety policy")
         );
         assert_eq!(safe_failure_message("arbitrary upstream text"), None);
     }

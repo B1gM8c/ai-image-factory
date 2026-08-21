@@ -509,6 +509,9 @@ fn map_codex_app_server_child_error(
         }
         CodexAppServerError::TurnFailed => ChildOutcome::Failed("codex_turn_failed"),
         CodexAppServerError::ImageToolFailed => ChildOutcome::Failed("codex_image_tool_failed"),
+        CodexAppServerError::ContentPolicyRejected => {
+            ChildOutcome::Failed("content_policy_rejected")
+        }
         CodexAppServerError::NoImage => ChildOutcome::Failed("codex_no_image_output"),
         CodexAppServerError::ImageIncomplete
         | CodexAppServerError::OutputMissing
@@ -885,6 +888,10 @@ mod tests {
             (
                 CodexAppServerError::ImageToolFailed,
                 "codex_image_tool_failed",
+            ),
+            (
+                CodexAppServerError::ContentPolicyRejected,
+                "content_policy_rejected",
             ),
         ] {
             match map_codex_app_server_child_error(error) {

@@ -558,6 +558,7 @@ fn persisted_generation_error(error_code: Option<&str>) -> ImageGatewayError {
     match error_code {
         Some("timeout") => ImageGatewayError::timeout(),
         Some("codex_cli_failed") => ImageGatewayError::codex_cli_failed(),
+        Some("content_policy_rejected") => ImageGatewayError::content_policy_rejected(),
         Some(
             code @ ("codex_app_server_request_rejected"
             | "codex_turn_failed"
@@ -1355,6 +1356,13 @@ mod tests {
         let cli = persisted_generation_error(Some("codex_cli_failed"));
         assert_eq!(cli.status_code(), axum::http::StatusCode::BAD_GATEWAY);
         assert_eq!(cli.error_code(), Some("codex_cli_failed"));
+
+        let content_policy = persisted_generation_error(Some("content_policy_rejected"));
+        assert_eq!(
+            content_policy.status_code(),
+            axum::http::StatusCode::BAD_REQUEST
+        );
+        assert_eq!(content_policy.error_code(), Some("content_policy_rejected"));
 
         for code in [
             "codex_app_server_request_rejected",
