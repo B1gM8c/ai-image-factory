@@ -24,6 +24,7 @@ const LOCK_FILE: &str = "runner.lock";
 const OUTPUT_FILE: &str = "output.bin";
 const RESULT_FILE: &str = "result.json";
 const MAX_DIAGNOSTIC_BYTES: u64 = 64 * 1024;
+pub(crate) const CODEX_APP_SERVER_FAILURE_DIAGNOSTIC_FILE: &str = "codex-app-server-failure.json";
 const WORKSPACE_DIR: &str = "workspace";
 const CODEX_HOME_DIR: &str = "codex-home";
 const RUNTIME_HOME_DIR: &str = "runtime-home";
@@ -549,12 +550,15 @@ impl ExecutionSpool {
     where
         T: Serialize + DeserializeOwned + Eq,
     {
-        let valid_name = filename.starts_with("grok-")
-            && filename.ends_with(".json")
-            && filename.len() <= 64
-            && filename.bytes().all(|byte| {
-                byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'.')
-            });
+        let valid_name = filename == CODEX_APP_SERVER_FAILURE_DIAGNOSTIC_FILE
+            || (filename.starts_with("grok-")
+                && filename.ends_with(".json")
+                && filename.len() <= 64
+                && filename.bytes().all(|byte| {
+                    byte.is_ascii_lowercase()
+                        || byte.is_ascii_digit()
+                        || matches!(byte, b'-' | b'.')
+                }));
         if !valid_name {
             return Err(ProcessSpoolError::InvalidInput);
         }
@@ -1828,6 +1832,83 @@ mod tests {
             spool.read_workspace_output("provider-output.png", 4),
             Err(ProcessSpoolError::Integrity)
         );
+    }
+
+    #[test]
+    fn codex_failure_diagnostic_is_exact_bounded_and_idempotent() {
+        let (_temp, journal, lease) = fixture();
+        let spool = ExecutionSpool::for_lease(&journal, &lease).unwrap();
+        let diagnostic = serde_json::json!({
+            "schema_version": 1,
+            "failure_category": "codex_image_tool_failed",
+            "class": "rate_limit"
+        });
+
+        spool
+            .publish_diagnostic(CODEX_APP_SERVER_FAILURE_DIAGNOSTIC_FILE, &diagnostic)
+            .unwrap();
+        spool
+            .publish_diagnostic(CODEX_APP_SERVER_FAILURE_DIAGNOSTIC_FILE, &diagnostic)
+            .unwrap();
+        assert_eq!(
+            spool.publish_diagnostic(
+                CODEX_APP_SERVER_FAILURE_DIAGNOSTIC_FILE,
+                &serde_json::json!({ "schema_version": 2 })
+            ),
+            Err(ProcessSpoolError::Conflict)
+        );
+        assert_eq!(
+            spool.publish_diagnostic("codex-other.json", &diagnostic),
+            Err(ProcessSpoolError::InvalidInput)
+        );
+        assert_eq!(
+            spool.publish_diagnostic(
+                CODEX_APP_SERVER_FAILURE_DIAGNOSTIC_FILE,
+                &serde_json::json!({ "payload": "x".repeat(MAX_DIAGNOSTIC_BYTES as usize) })
+            ),
+            Err(ProcessSpoolError::InvalidInput)
+        );
+        assert!(
+            fs::metadata(
+                spool
+                    .root_path()
+                    .join(CODEX_APP_SERVER_FAILURE_DIAGNOSTIC_FILE)
+            )
+            .unwrap()
+            .len()
+                <= MAX_DIAGNOSTIC_BYTES
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_failure_diagnostic_rejects_symlink_and_hardlink_targets() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        for hardlink in [false, true] {
+            let (temp, journal, lease) = fixture();
+            let spool = ExecutionSpool::for_lease(&journal, &lease).unwrap();
+            let outside = temp.path().join("outside-diagnostic");
+            fs::write(&outside, b"outside-must-remain").unwrap();
+            fs::set_permissions(&outside, fs::Permissions::from_mode(0o600)).unwrap();
+            let diagnostic = spool
+                .root_path()
+                .join(CODEX_APP_SERVER_FAILURE_DIAGNOSTIC_FILE);
+            if hardlink {
+                fs::hard_link(&outside, &diagnostic).unwrap();
+            } else {
+                symlink(&outside, &diagnostic).unwrap();
+            }
+
+            assert_eq!(
+                spool.publish_diagnostic(
+                    CODEX_APP_SERVER_FAILURE_DIAGNOSTIC_FILE,
+                    &serde_json::json!({ "schema_version": 1 })
+                ),
+                Err(ProcessSpoolError::Integrity)
+            );
+            assert_eq!(fs::read(&outside).unwrap(), b"outside-must-remain");
+        }
     }
 
     #[test]

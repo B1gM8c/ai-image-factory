@@ -253,6 +253,7 @@ async fn run_codex_attempt(
             input_paths,
             timeout: config.request_timeout,
             environment: &environment,
+            failure_diagnostic_sink: None,
         },
         |_| Ok(()),
     )
@@ -546,6 +547,7 @@ mod tests {
                 input_paths: &[],
                 timeout: Duration::from_secs(900),
                 environment: &environment,
+                failure_diagnostic_sink: None,
             },
             |_| Ok(()),
         )
@@ -657,6 +659,7 @@ mod tests {
                 input_paths: std::slice::from_ref(&input_path),
                 timeout: Duration::from_secs(900),
                 environment: &environment,
+                failure_diagnostic_sink: None,
             },
             |_| Ok(()),
         )

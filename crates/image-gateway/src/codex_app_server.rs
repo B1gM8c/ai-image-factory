@@ -4,6 +4,7 @@ use std::{
     time::Duration,
 };
 
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 #[cfg(unix)]
@@ -28,6 +29,9 @@ const IMAGE_GENERATION_DEVELOPER_INSTRUCTIONS: &str = "For this thread, image re
 const IMAGE_GENERATION_DIRECT_TOOL_CONFIG: &str =
     "features.code_mode.direct_only_tool_namespaces=[\"image_gen\"]";
 
+type FailureDiagnosticSink<'a> =
+    &'a (dyn Fn(&CodexAppServerFailureDiagnosticV1) -> Result<(), ()> + Sync);
+
 pub(crate) struct CodexAppServerRequest<'a> {
     pub(crate) request_id: &'a str,
     pub(crate) image_index: u32,
@@ -39,6 +43,7 @@ pub(crate) struct CodexAppServerRequest<'a> {
     pub(crate) input_paths: &'a [PathBuf],
     pub(crate) timeout: Duration,
     pub(crate) environment: &'a [(String, String)],
+    pub(crate) failure_diagnostic_sink: Option<FailureDiagnosticSink<'a>>,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -105,6 +110,45 @@ struct FailureDiagnostic {
     numeric_code: Option<i64>,
     code: FieldDiagnostic,
     message: FieldDiagnostic,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CodexAppServerFailureDiagnosticV1 {
+    schema_version: u16,
+    failure_category: String,
+    source: String,
+    class: String,
+    numeric_code: Option<i64>,
+    code: PersistedFieldDiagnostic,
+    message: PersistedFieldDiagnostic,
+    stderr: Option<PersistedStreamDiagnostic>,
+    exit: PersistedExitDiagnostic,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedFieldDiagnostic {
+    sha256: Option<String>,
+    bytes: usize,
+    truncated: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedStreamDiagnostic {
+    sha256: String,
+    bytes: usize,
+    truncated: bool,
+    class: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedExitDiagnostic {
+    observed: bool,
+    code: Option<i32>,
+    signal: Option<i32>,
 }
 
 #[derive(Debug, Default)]
@@ -649,14 +693,14 @@ where
             let exit = observe_child_exit(&mut child);
             terminate_child(&mut child).await;
             let stderr = await_stderr_diagnostic(stderr_task).await;
-            trace_failure(&request, &state, error, stderr.as_ref(), &exit);
+            report_failure(&request, &state, error, stderr.as_ref(), &exit);
             return Err(error);
         }
         Err(_) => {
             let exit = observe_child_exit(&mut child);
             terminate_child(&mut child).await;
             let stderr = await_stderr_diagnostic(stderr_task).await;
-            trace_failure(
+            report_failure(
                 &request,
                 &state,
                 CodexAppServerError::Timeout,
@@ -791,39 +835,104 @@ async fn await_stderr_diagnostic(
         .and_then(Result::ok)
 }
 
-fn trace_failure(
+fn report_failure(
     request: &CodexAppServerRequest<'_>,
     state: &ProtocolState,
     error: CodexAppServerError,
     stderr: Option<&StreamDiagnostic>,
     exit: &ExitDiagnostic,
 ) {
-    let diagnostic = state.failure_diagnostic.as_ref();
+    let diagnostic = build_failure_diagnostic(state, error, stderr, exit);
+    trace_failure(request, &diagnostic);
+    if request
+        .failure_diagnostic_sink
+        .is_some_and(|sink| sink(&diagnostic).is_err())
+    {
+        tracing::warn!(
+            request.id = request.request_id,
+            image.index = request.image_index,
+            codex.attempt = request.attempt,
+            codex.failure.category = error.code(),
+            "Codex app-server failure diagnostic could not be persisted"
+        );
+    }
+}
+
+fn build_failure_diagnostic(
+    state: &ProtocolState,
+    error: CodexAppServerError,
+    stderr: Option<&StreamDiagnostic>,
+    exit: &ExitDiagnostic,
+) -> CodexAppServerFailureDiagnosticV1 {
+    let failure = state.failure_diagnostic.as_ref();
+    CodexAppServerFailureDiagnosticV1 {
+        schema_version: 1,
+        failure_category: error.code().to_string(),
+        source: failure.map_or("none", |value| value.source).to_string(),
+        class: failure.map_or("unknown", |value| value.class).to_string(),
+        numeric_code: failure.and_then(|value| value.numeric_code),
+        code: failure
+            .map(|value| PersistedFieldDiagnostic {
+                sha256: value.code.sha256.clone(),
+                bytes: value.code.bytes,
+                truncated: value.code.truncated,
+            })
+            .unwrap_or_default(),
+        message: failure
+            .map(|value| PersistedFieldDiagnostic {
+                sha256: value.message.sha256.clone(),
+                bytes: value.message.bytes,
+                truncated: value.message.truncated,
+            })
+            .unwrap_or_default(),
+        stderr: stderr.map(|value| PersistedStreamDiagnostic {
+            sha256: value.sha256.clone(),
+            bytes: value.bytes,
+            truncated: value.truncated,
+            class: value.class.to_string(),
+        }),
+        exit: PersistedExitDiagnostic {
+            observed: exit.observed,
+            code: exit.code,
+            signal: exit.signal,
+        },
+    }
+}
+
+fn trace_failure(
+    request: &CodexAppServerRequest<'_>,
+    diagnostic: &CodexAppServerFailureDiagnosticV1,
+) {
     tracing::warn!(
         request.id = request.request_id,
         image.index = request.image_index,
         codex.attempt = request.attempt,
-        codex.failure.category = error.code(),
-        codex.failure.source = diagnostic.map_or("none", |value| value.source),
-        codex.failure.class = diagnostic.map_or("unknown", |value| value.class),
-        codex.failure.numeric_code = diagnostic.and_then(|value| value.numeric_code),
-        codex.failure.code_sha256 = diagnostic
-            .and_then(|value| value.code.sha256.as_deref())
-            .unwrap_or("none"),
-        codex.failure.code_bytes = diagnostic.map_or(0, |value| value.code.bytes),
-        codex.failure.code_truncated = diagnostic.is_some_and(|value| value.code.truncated),
-        codex.failure.message_sha256 = diagnostic
-            .and_then(|value| value.message.sha256.as_deref())
-            .unwrap_or("none"),
-        codex.failure.message_bytes = diagnostic.map_or(0, |value| value.message.bytes),
-        codex.failure.message_truncated = diagnostic.is_some_and(|value| value.message.truncated),
-        codex.stderr.class = stderr.map_or("unknown", |value| value.class),
-        codex.stderr.sha256 = stderr.map_or("unavailable", |value| value.sha256.as_str()),
-        codex.stderr.bytes = stderr.map_or(0, |value| value.bytes),
-        codex.stderr.truncated = stderr.is_some_and(|value| value.truncated),
-        codex.exit.observed = exit.observed,
-        codex.exit.code = exit.code,
-        codex.exit.signal = exit.signal,
+        codex.failure.category = diagnostic.failure_category,
+        codex.failure.source = diagnostic.source,
+        codex.failure.class = diagnostic.class,
+        codex.failure.numeric_code = diagnostic.numeric_code,
+        codex.failure.code_sha256 = diagnostic.code.sha256.as_deref().unwrap_or("none"),
+        codex.failure.code_bytes = diagnostic.code.bytes,
+        codex.failure.code_truncated = diagnostic.code.truncated,
+        codex.failure.message_sha256 = diagnostic.message.sha256.as_deref().unwrap_or("none"),
+        codex.failure.message_bytes = diagnostic.message.bytes,
+        codex.failure.message_truncated = diagnostic.message.truncated,
+        codex.stderr.class = diagnostic
+            .stderr
+            .as_ref()
+            .map_or("unknown", |value| &value.class),
+        codex.stderr.sha256 = diagnostic
+            .stderr
+            .as_ref()
+            .map_or("unavailable", |value| value.sha256.as_str()),
+        codex.stderr.bytes = diagnostic.stderr.as_ref().map_or(0, |value| value.bytes),
+        codex.stderr.truncated = diagnostic
+            .stderr
+            .as_ref()
+            .is_some_and(|value| value.truncated),
+        codex.exit.observed = diagnostic.exit.observed,
+        codex.exit.code = diagnostic.exit.code,
+        codex.exit.signal = diagnostic.exit.signal,
         "Codex app-server failed with bounded redacted diagnostics"
     );
 }
@@ -1098,6 +1207,7 @@ mod tests {
                     input_paths: &[],
                     timeout,
                     environment: &[("PATH".to_string(), "/usr/bin:/bin".to_string())],
+                    failure_diagnostic_sink: None,
                 },
                 |_| Ok(()),
             )
@@ -1254,14 +1364,45 @@ mod tests {
             .unwrap();
 
         assert_eq!(state.authority(), Err(CodexAppServerError::ImageToolFailed));
-        let diagnostic = state.failure_diagnostic.unwrap();
+        let diagnostic = state.failure_diagnostic.as_ref().unwrap();
         assert_eq!(diagnostic.source, "image_generation_item");
         assert_eq!(diagnostic.class, "rate_limit");
         assert_eq!(diagnostic.message.bytes, sensitive_sample.len());
         assert!(!diagnostic.message.truncated);
-        let digest = diagnostic.message.sha256.unwrap();
+        let digest = diagnostic.message.sha256.as_ref().unwrap();
         assert_eq!(digest.len(), 64);
         assert!(!digest.contains("hidden-user-material"));
+
+        let persisted = build_failure_diagnostic(
+            &state,
+            CodexAppServerError::ImageToolFailed,
+            Some(&StreamDiagnostic {
+                sha256: hex::encode(Sha256::digest(b"stderr-sensitive-material")),
+                bytes: 25,
+                truncated: false,
+                class: "authentication",
+            }),
+            &ExitDiagnostic {
+                observed: true,
+                code: Some(1),
+                signal: None,
+            },
+        );
+        let encoded = serde_json::to_vec(&persisted).unwrap();
+        assert!(encoded.len() < 64 * 1024);
+        assert!(
+            !encoded
+                .windows(sensitive_sample.len())
+                .any(|value| { value == sensitive_sample.as_bytes() })
+        );
+        assert!(
+            !encoded
+                .windows(b"stderr-sensitive-material".len())
+                .any(|value| { value == b"stderr-sensitive-material" })
+        );
+        assert_eq!(persisted.schema_version, 1);
+        assert_eq!(persisted.failure_category, "codex_image_tool_failed");
+        assert_eq!(persisted.class, "rate_limit");
     }
 
     #[test]

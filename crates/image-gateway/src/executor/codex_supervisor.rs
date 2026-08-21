@@ -31,8 +31,8 @@ use crate::{
     runner::{
         FilesystemRunnerJournal, LaunchDecision,
         process::{
-            ExecutionSpool, ProcessObservation, ProcessSpoolError, ProcessTerminal,
-            ProviderProcessIdentity, RunnerLock, sha256,
+            CODEX_APP_SERVER_FAILURE_DIAGNOSTIC_FILE, ExecutionSpool, ProcessObservation,
+            ProcessSpoolError, ProcessTerminal, ProviderProcessIdentity, RunnerLock, sha256,
         },
     },
 };
@@ -444,6 +444,12 @@ async fn run_codex_child(
     let prompt = build_codex_prompt(&job, workspace, request.output.candidate_index);
     let mut environment = allowed_child_environment();
     environment.push(("PATH".to_string(), CODEX_CHILD_PATH.to_string()));
+    let diagnostic_sink =
+        |diagnostic: &crate::codex_app_server::CodexAppServerFailureDiagnosticV1| {
+            spool
+                .publish_diagnostic(CODEX_APP_SERVER_FAILURE_DIAGNOSTIC_FILE, diagnostic)
+                .map_err(|_| ())
+        };
     let runtime_result = crate::codex_app_server::run_codex_app_server(
         crate::codex_app_server::CodexAppServerRequest {
             request_id: &request.output.request_id,
@@ -456,6 +462,7 @@ async fn run_codex_child(
             input_paths: &[],
             timeout: Duration::from_millis(request.timeout_ms),
             environment: &environment,
+            failure_diagnostic_sink: Some(&diagnostic_sink),
         },
         |pid| {
             ProviderProcessIdentity::capture(pid, &helper.nonce)
@@ -1013,6 +1020,11 @@ mod tests {
         assert!(!execution_root.join("workspace").exists());
         assert!(!execution_root.join("runtime-home").exists());
         assert!(execution_root.join("output.bin").is_file());
+        assert!(
+            !execution_root
+                .join(CODEX_APP_SERVER_FAILURE_DIAGNOSTIC_FILE)
+                .exists()
+        );
         let replay = fixture
             .supervisor
             .start_or_attach(&lease, LaunchDecision::Attach)
@@ -1021,6 +1033,70 @@ mod tests {
 
         assert_eq!(first, replay);
         assert_eq!(fs::read_to_string(&fixture.invocations).unwrap(), "1\n");
+    }
+
+    #[tokio::test]
+    async fn image_tool_failure_persists_redacted_diagnostic_before_terminal_cleanup() {
+        let fixture = CodexFixture::image_tool_failure();
+        let lease = fixture.lease();
+        let context = fixture.context(&lease);
+        fixture.journal.start_or_attach(&lease).unwrap();
+        fixture.supervisor.prepare(&lease, &context).await.unwrap();
+        assert_eq!(
+            fixture.journal.commit_launch(&lease).unwrap(),
+            LaunchDecision::LaunchOnce
+        );
+        let spool = ExecutionSpool::for_lease(&fixture.journal, &lease).unwrap();
+
+        run_codex_runner_child(fixture.journal.root_path(), lease.executor_execution_id)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            spool.observe().unwrap(),
+            ProcessObservation::Failed {
+                error_code: "codex_image_tool_failed".to_string(),
+            }
+        );
+        let execution_root = fixture
+            .journal
+            .root_path()
+            .join(lease.executor_execution_id.simple().to_string());
+        let diagnostic_path = execution_root.join(CODEX_APP_SERVER_FAILURE_DIAGNOSTIC_FILE);
+        let diagnostic_bytes = fs::read(&diagnostic_path).unwrap();
+        assert!(diagnostic_bytes.len() <= 64 * 1024);
+        assert!(
+            !diagnostic_bytes
+                .windows(b"provider-sensitive-prompt-fragment".len())
+                .any(|value| value == b"provider-sensitive-prompt-fragment")
+        );
+        let diagnostic: serde_json::Value = serde_json::from_slice(&diagnostic_bytes).unwrap();
+        assert_eq!(diagnostic["schema_version"], 1);
+        assert_eq!(diagnostic["failure_category"], "codex_image_tool_failed");
+        assert_eq!(diagnostic["source"], "image_generation_item");
+        assert_eq!(diagnostic["class"], "rate_limit");
+        assert_eq!(
+            diagnostic["message"]["bytes"],
+            b"provider-sensitive-prompt-fragment".len()
+        );
+        assert_eq!(diagnostic["message"]["sha256"].as_str().unwrap().len(), 64);
+        assert!(execution_root.join("result.json").is_file());
+        assert!(!execution_root.join("output.bin").exists());
+        assert!(!execution_root.join("codex-home").exists());
+        assert!(!execution_root.join("workspace").exists());
+        assert!(!execution_root.join("runtime-home").exists());
+        assert!(diagnostic_path.is_file());
+
+        assert_eq!(
+            fixture
+                .supervisor
+                .start_or_attach(&lease, LaunchDecision::Attach)
+                .await,
+            Err(RunnerError::Definite {
+                error_code: "codex_image_tool_failed".to_string(),
+            })
+        );
+        assert_eq!(fs::read(diagnostic_path).unwrap(), diagnostic_bytes);
     }
 
     #[tokio::test]
@@ -1523,6 +1599,7 @@ mod tests {
     }
 
     fn app_server_fixture_script(exec_body: String) -> String {
+        let image_tool_failure = usize::from(exec_body.contains("codex-test-image-tool-failure"));
         let force_malformed = usize::from(
             exec_body.contains("/usr/bin/head -c 70000")
                 || exec_body.contains("printf '{\"type\":\"thread.started\",\"thread_id\":'")
@@ -1555,6 +1632,7 @@ set +e
 ) > "$legacy_events"
 legacy_status=$?
 set -e
+image_tool_failure={image_tool_failure}
 malformed={force_malformed}
 while IFS= read -r event; do
   case "$event" in
@@ -1570,6 +1648,11 @@ if [ "$malformed" -eq 0 ]; then
   printf '{{"method":"item/started","params":{{"threadId":"%s","turnId":"%s","item":{{"type":"imageGeneration","id":"%s","status":"inProgress"}}}}}}\n' "$thread_id" "$turn_id" "$call_id"
   printf '{{"method":"item/completed","params":{{"threadId":"%s","turnId":"%s","item":{{"type":"imageGeneration","id":"%s","status":"completed","result":"cG5n","savedPath":"%s"}}}}}}\n' "$thread_id" "$turn_id" "$call_id" "$output_path"
 done
+fi
+if [ "$image_tool_failure" -eq 1 ]; then
+  call_id='call_failed_image'
+  printf '{{"method":"item/started","params":{{"threadId":"%s","turnId":"%s","item":{{"type":"imageGeneration","id":"%s","status":"inProgress"}}}}}}\n' "$thread_id" "$turn_id" "$call_id"
+  printf '{{"method":"item/completed","params":{{"threadId":"%s","turnId":"%s","item":{{"type":"imageGeneration","id":"%s","status":"failed","result":{{"code":"rate_limit_exceeded","message":"provider-sensitive-prompt-fragment"}}}}}}}}\n' "$thread_id" "$turn_id" "$call_id"
 fi
 if [ "$legacy_status" -eq 0 ]; then
   printf '{{"method":"turn/completed","params":{{"threadId":"%s","turn":{{"id":"%s","status":"completed"}}}}}}\n' "$thread_id" "$turn_id"
@@ -1589,6 +1672,15 @@ while IFS= read -r ignored; do :; done
                     "#!/bin/sh\nset -eu\n/bin/cat >/dev/null\nprintf '1\\n' >> '{}'\nthread_id='019fd9f5-badb-7dd3-8903-28ffded0ef54'\ncall_id='call_fixture_image'\noutput_dir=\"$CODEX_HOME/generated_images/$thread_id\"\n/bin/mkdir -p \"$output_dir\"\n/bin/chmod 700 \"$CODEX_HOME/generated_images\" \"$output_dir\"\n/bin/cp '{}' \"$output_dir/$call_id.png\"\n/bin/chmod 600 \"$output_dir/$call_id.png\"\nprintf '{{\"type\":\"thread.started\",\"thread_id\":\"%s\"}}\\n' \"$thread_id\"\nprintf '{{\"type\":\"item.completed\",\"item\":{{\"type\":\"image_generation_call\",\"id\":\"%s\"}}}}\\n' \"$call_id\"\n",
                     invocations.display(),
                     image.display()
+                )
+            })
+        }
+
+        fn image_tool_failure() -> Self {
+            Self::with_script(|invocations, _image, _root| {
+                format!(
+                    "#!/bin/sh\nset -eu\n/bin/cat >/dev/null\nprintf '1\\n' >> '{}'\n# codex-test-image-tool-failure\n",
+                    invocations.display()
                 )
             })
         }
