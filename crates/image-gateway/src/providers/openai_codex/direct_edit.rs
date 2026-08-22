@@ -1,7 +1,7 @@
 use std::{path::Path, time::Duration};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use futures_util::{StreamExt, future::join_all};
+use futures_util::StreamExt;
 use reqwest::{Client, StatusCode, redirect::Policy};
 use serde::{Deserialize, Serialize};
 
@@ -108,12 +108,11 @@ async fn edit_at(
         .redirect(Policy::none())
         .build()
         .map_err(|_| unavailable())?;
-    let requests = (0..n).map(|_| post_one(&client, endpoint, &auth, &payload, timeout));
-    let responses = join_all(requests).await;
     let mut total = 0usize;
     let mut outputs = Vec::with_capacity(n as usize);
-    for response in responses {
-        let mut response = response?;
+    for output_index in 0..n {
+        let mut response =
+            post_one(&client, endpoint, &auth, &payload, timeout, output_index).await?;
         let image = response.pop().ok_or_else(invalid_response)?;
         total = total
             .checked_add(image.bytes.len())
@@ -132,6 +131,7 @@ async fn post_one(
     auth: &DirectAuth,
     payload: &EditRequest<'_>,
     timeout: Duration,
+    output_index: u32,
 ) -> Result<Vec<GeneratedImage>, ImageGatewayError> {
     let mut request = client
         .post(endpoint)
@@ -147,6 +147,13 @@ async fn post_one(
     let status = response.status();
     let body = read_bounded_body(response).await?;
     if !status.is_success() {
+        let upstream_code = structured_error_code(&body);
+        tracing::warn!(
+            codex.edit.output_index = output_index,
+            http.status = status.as_u16(),
+            upstream.code = safe_upstream_token(upstream_code.as_deref()),
+            "Codex image edit upstream rejected request"
+        );
         return Err(map_http_error(status, &body));
     }
     decode_outputs(&body, 1)
@@ -265,10 +272,7 @@ fn decode_outputs(body: &[u8], expected: u32) -> Result<Vec<GeneratedImage>, Ima
 }
 
 fn map_http_error(status: StatusCode, body: &[u8]) -> ImageGatewayError {
-    let code = serde_json::from_slice::<ErrorEnvelope>(body)
-        .ok()
-        .and_then(|value| value.error)
-        .and_then(|error| error.code)
+    let code = structured_error_code(body)
         .unwrap_or_default()
         .to_ascii_lowercase();
     if matches!(
@@ -282,6 +286,29 @@ fn map_http_error(status: StatusCode, body: &[u8]) -> ImageGatewayError {
         StatusCode::TOO_MANY_REQUESTS => ImageGatewayError::queue_overloaded(),
         status if status.is_server_error() => unavailable(),
         _ => ImageGatewayError::backend("Codex image edit request was rejected"),
+    }
+}
+
+fn structured_error_code(body: &[u8]) -> Option<String> {
+    serde_json::from_slice::<ErrorEnvelope>(body)
+        .ok()
+        .and_then(|value| value.error)
+        .and_then(|error| error.code)
+}
+
+fn safe_upstream_token(value: Option<&str>) -> &str {
+    match value {
+        Some(value)
+            if !value.is_empty()
+                && value.len() <= 64
+                && value.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.')
+                }) =>
+        {
+            value
+        }
+        Some(_) => "redacted",
+        None => "none",
     }
 }
 
@@ -313,6 +340,8 @@ mod tests {
         account_bound: bool,
         originator_bound: bool,
         request_count: usize,
+        active_requests: usize,
+        max_active_requests: usize,
         upstream_counts: Vec<u64>,
         body: Option<Value>,
     }
@@ -366,7 +395,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn direct_edit_fans_out_authenticated_single_output_requests_without_exposing_auth() {
+    async fn direct_edit_serializes_authenticated_single_output_requests_without_exposing_auth() {
         let observed = Arc::new(Mutex::new(ObservedRequest::default()));
         let app = Router::new()
             .route("/images/edits", post(capture_edit))
@@ -402,6 +431,7 @@ mod tests {
         assert!(observed.account_bound);
         assert!(observed.originator_bound);
         assert_eq!(observed.request_count, 7);
+        assert_eq!(observed.max_active_requests, 1);
         assert!(observed.upstream_counts.iter().all(|count| *count == 1));
         assert_eq!(observed.body.as_ref().unwrap()["n"], 1);
         assert_eq!(observed.body.as_ref().unwrap()["model"], "gpt-image-2");
@@ -412,23 +442,30 @@ mod tests {
         headers: HeaderMap,
         Json(body): Json<Value>,
     ) -> Json<Value> {
-        let mut observed = observed.lock().unwrap();
-        observed.authorized = headers
-            .get(reqwest::header::AUTHORIZATION)
-            .and_then(|value| value.to_str().ok())
-            == Some("Bearer access-test");
-        observed.account_bound = headers
-            .get("ChatGPT-Account-ID")
-            .and_then(|value| value.to_str().ok())
-            == Some("account-test");
-        observed.originator_bound = headers
-            .get("originator")
-            .and_then(|value| value.to_str().ok())
-            == Some("codex_cli_rs");
-        observed.request_count += 1;
         let n = body["n"].as_u64().unwrap();
-        observed.upstream_counts.push(n);
-        observed.body = Some(body);
+        {
+            let mut observed = observed.lock().unwrap();
+            observed.authorized = headers
+                .get(reqwest::header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                == Some("Bearer access-test");
+            observed.account_bound = headers
+                .get("ChatGPT-Account-ID")
+                .and_then(|value| value.to_str().ok())
+                == Some("account-test");
+            observed.originator_bound = headers
+                .get("originator")
+                .and_then(|value| value.to_str().ok())
+                == Some("codex_cli_rs");
+            observed.request_count += 1;
+            observed.active_requests += 1;
+            observed.max_active_requests =
+                observed.max_active_requests.max(observed.active_requests);
+            observed.upstream_counts.push(n);
+            observed.body = Some(body);
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        observed.lock().unwrap().active_requests -= 1;
         Json(serde_json::json!({
             "created": 1,
             "data": (0..n)
