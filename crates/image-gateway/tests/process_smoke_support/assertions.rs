@@ -114,11 +114,8 @@ fn codex_output_evidence(
     let thread_start = rpc_request(&messages, "thread/start")?;
     let turn_start = rpc_request(&messages, "turn/start")?;
     require(
-        thread_start
-            .pointer("/params/model")
-            .and_then(Value::as_str)
-            == Some("gpt-5.4"),
-        "Codex thread/start did not pin the direct-tool image orchestrator model",
+        thread_start.pointer("/params/model").is_none(),
+        "Codex thread/start unexpectedly overrode the production orchestrator model",
     )?;
     let request_dir = thread_start
         .pointer("/params/cwd")
@@ -134,8 +131,9 @@ fn codex_output_evidence(
         .and_then(Value::as_str)
         .ok_or_else(|| "Codex thread/start omitted developerInstructions".to_string())?;
     require(
-        developer_instructions.contains("image_gen.imagegen")
-            && developer_instructions.contains("image_gen__imagegen")
+        developer_instructions.contains("code-mode exec")
+            && developer_instructions.contains("tools.image_gen__imagegen")
+            && developer_instructions.contains("generatedImage(result)")
             && developer_instructions.contains("exactly once"),
         format!(
             "Codex developer instructions did not force the exact image tool: {developer_instructions}"
@@ -344,8 +342,6 @@ fn assert_codex_invocation(argv: &[String], expects_runtime_home: bool) -> TestR
         "--listen",
         "stdio://",
         "--strict-config",
-        "-c",
-        "features.code_mode.direct_only_tool_namespaces=[\"image_gen\"]",
         "--enable",
         "image_generation",
         "--disable",
