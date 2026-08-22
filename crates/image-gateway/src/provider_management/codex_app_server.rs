@@ -79,20 +79,38 @@ impl CodexAppServer {
         if !executable.is_absolute() || !codex_home.is_absolute() {
             return Err(CodexAppServerError::Process);
         }
-        let mut child = Command::new(executable)
+        let mut command = Command::new(executable);
+        command
             .arg("app-server")
             .arg("--stdio")
+            .env_clear()
+            .env("HOME", codex_home)
             .env("CODEX_HOME", codex_home)
-            .env_remove("CODEX_API_KEY")
-            .env_remove("OPENAI_API_KEY")
-            .env_remove("XAI_API_KEY")
             .current_dir(codex_home)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|_| CodexAppServerError::Process)?;
+            .kill_on_drop(true);
+        for name in [
+            "PATH",
+            "LANG",
+            "LC_ALL",
+            "SSL_CERT_FILE",
+            "SSL_CERT_DIR",
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "NO_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+            "no_proxy",
+        ] {
+            if let Some(value) = std::env::var_os(name) {
+                command.env(name, value);
+            }
+        }
+        let mut child = command.spawn().map_err(|_| CodexAppServerError::Process)?;
         let stdin = child.stdin.take().ok_or(CodexAppServerError::Process)?;
         let stdout = child.stdout.take().ok_or(CodexAppServerError::Process)?;
         let mut server = Self {

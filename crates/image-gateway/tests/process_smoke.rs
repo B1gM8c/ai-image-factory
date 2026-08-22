@@ -2,8 +2,9 @@
 
 mod process_smoke_support;
 
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
+use axum::{Json, Router, extract::State, http::HeaderMap, routing::post};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde_json::{Value, json};
 
@@ -182,11 +183,17 @@ async fn run_generation_v2_process_smoke(database: &TestDatabase) -> TestResult 
 async fn run_edit_process_smoke(database: &TestDatabase) -> TestResult {
     let fixture = opaque_png()?;
     let files = SmokeFiles::new(&fixture)?;
+    let direct_edit = DirectEditMock::start(&fixture).await?;
     let client = reqwest::Client::builder()
         .timeout(HTTP_TIMEOUT)
         .build()
         .map_err(|error| format!("failed to build HTTP client: {error}"))?;
-    let mut workerd = WorkerdProcess::start(database, &files).await?;
+    let mut workerd = WorkerdProcess::start_with_direct_edit_endpoint(
+        database,
+        &files,
+        Some(&direct_edit.endpoint),
+    )
+    .await?;
     let (mut gateway, address) = start_gateway_with_retry(&client, database, &files).await?;
     let result = exercise_edit_gateway(
         &client,
@@ -196,6 +203,7 @@ async fn run_edit_process_smoke(database: &TestDatabase) -> TestResult {
         &fixture,
         workerd.pid(),
         &mut gateway,
+        &direct_edit,
     )
     .await;
     let gateway_shutdown = gateway.terminate().await;
@@ -559,6 +567,7 @@ async fn exercise_edit_gateway(
     fixture: &[u8],
     workerd_pid: u32,
     gateway: &mut GatewayProcess,
+    direct_edit: &DirectEditMock,
 ) -> TestResult {
     let base_url = format!("http://{address}");
     poll_health(client, &base_url, gateway).await?;
@@ -580,10 +589,14 @@ async fn exercise_edit_gateway(
         .map_err(|error| format!("edit response was not JSON: {error}"))?;
     require(
         status == reqwest::StatusCode::OK,
-        format!("edit returned {status}: {body:#}"),
+        format!(
+            "edit returned {status}: {body:#}\n{}",
+            files.process_diagnostics()
+        ),
     )?;
     assert_response(&body, &headers, fixture)?;
     assert_codex_edit_outputs(files, workerd_pid)?;
+    direct_edit.assert_single_request().await?;
     assert_artifact_bytes(files, fixture)?;
 
     gateway.terminate().await?;
@@ -613,7 +626,115 @@ async fn exercise_edit_gateway(
         "edit replay must receive a fresh request id",
     )?;
     assert_codex_edit_outputs(files, workerd_pid)?;
+    direct_edit.assert_single_request().await?;
     database.assert_edit_transitions(&request_id).await
+}
+
+#[derive(Default)]
+struct DirectEditObservation {
+    headers: Option<HeaderMap>,
+    bodies: Vec<Value>,
+}
+
+struct DirectEditMock {
+    endpoint: String,
+    observation: Arc<tokio::sync::Mutex<DirectEditObservation>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl DirectEditMock {
+    async fn start(fixture: &[u8]) -> TestResult<Self> {
+        #[derive(Clone)]
+        struct MockState {
+            encoded_fixture: String,
+            observation: Arc<tokio::sync::Mutex<DirectEditObservation>>,
+        }
+
+        async fn edit(
+            State(state): State<MockState>,
+            headers: HeaderMap,
+            Json(body): Json<Value>,
+        ) -> Json<Value> {
+            let mut observation = state.observation.lock().await;
+            observation.headers = Some(headers);
+            observation.bodies.push(body);
+            Json(json!({"data": [{"b64_json": state.encoded_fixture}]}))
+        }
+
+        let observation = Arc::new(tokio::sync::Mutex::new(DirectEditObservation::default()));
+        let state = MockState {
+            encoded_fixture: STANDARD.encode(fixture),
+            observation: Arc::clone(&observation),
+        };
+        let app = Router::new()
+            .route("/backend-api/codex/images/edits", post(edit))
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .map_err(|error| format!("failed to bind fake Codex edit upstream: {error}"))?;
+        let endpoint = format!(
+            "http://{}/backend-api/codex/images/edits",
+            listener
+                .local_addr()
+                .map_err(|error| format!("failed to read fake Codex edit address: {error}"))?
+        );
+        let task = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        Ok(Self {
+            endpoint,
+            observation,
+            task,
+        })
+    }
+
+    async fn assert_single_request(&self) -> TestResult {
+        let observation = self.observation.lock().await;
+        require(
+            observation.bodies.len() == 1,
+            format!(
+                "fake Codex edit upstream received {} requests, expected 1",
+                observation.bodies.len()
+            ),
+        )?;
+        let headers = observation
+            .headers
+            .as_ref()
+            .ok_or_else(|| "fake Codex edit upstream received no headers".to_string())?;
+        require(
+            headers
+                .get(reqwest::header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                == Some("Bearer process-smoke-access"),
+            "direct edit did not use the refreshed access token",
+        )?;
+        require(
+            headers
+                .get("ChatGPT-Account-ID")
+                .and_then(|value| value.to_str().ok())
+                == Some("process-smoke-account"),
+            "direct edit did not preserve the refreshed account binding",
+        )?;
+        let body = &observation.bodies[0];
+        require(
+            body["model"] == "gpt-image-2"
+                && body["n"] == 1
+                && body["images"].as_array().map(Vec::len) == Some(1),
+            format!("unexpected direct edit request contract: {body:#}"),
+        )?;
+        require(
+            body["prompt"]
+                .as_str()
+                .is_some_and(|prompt| prompt.contains("这是图生图编辑任务")),
+            "direct edit request lost edit semantics",
+        )
+    }
+}
+
+impl Drop for DirectEditMock {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
 }
 
 fn generation_request() -> Value {

@@ -206,6 +206,14 @@ pub(crate) struct WorkerdProcess {
 
 impl WorkerdProcess {
     pub(crate) async fn start(database: &TestDatabase, files: &SmokeFiles) -> TestResult<Self> {
+        Self::start_with_direct_edit_endpoint(database, files, None).await
+    }
+
+    pub(crate) async fn start_with_direct_edit_endpoint(
+        database: &TestDatabase,
+        files: &SmokeFiles,
+        direct_edit_endpoint: Option<&str>,
+    ) -> TestResult<Self> {
         let log = File::create(&files.workerd_log)
             .map_err(|error| format!("failed to create workerd log: {error}"))?;
         let stderr = log
@@ -234,6 +242,9 @@ impl WorkerdProcess {
             .stdout(Stdio::from(log))
             .stderr(Stdio::from(stderr))
             .kill_on_drop(true);
+        if let Some(endpoint) = direct_edit_endpoint {
+            command.env("GATEWAY_TEST_CODEX_IMAGE_EDITS_URL", endpoint);
+        }
         command.process_group(0);
         let child = command
             .spawn()
@@ -892,10 +903,16 @@ fn fake_codex_script(paths: FakeCodexPaths<'_>) -> String {
     format!(
         r#"#!/bin/sh
 set -eu
-[ "${{HOME-}}" = "${{CODEX_HOME-}}" ] || exit 20
-if [ "${{HOME-}}" != {codex_home} ]; then
-    [ -f "${{HOME-}}/auth.json" ] || exit 21
-    /usr/bin/cmp -s "${{HOME-}}/auth.json" {codex_auth} || exit 21
+refresh_mode=false
+if [ "$#" -eq 2 ] && [ "$1" = "app-server" ] && [ "$2" = "--stdio" ]; then
+    refresh_mode=true
+fi
+if [ "$refresh_mode" = false ]; then
+    [ "${{HOME-}}" = "${{CODEX_HOME-}}" ] || exit 20
+    if [ "${{HOME-}}" != {codex_home} ]; then
+        [ -f "${{HOME-}}/auth.json" ] || exit 21
+        /usr/bin/cmp -s "${{HOME-}}/auth.json" {codex_auth} || exit 21
+    fi
 fi
 [ -z "${{GATEWAY_API_TOKEN+x}}" ] || exit 22
 [ -z "${{GATEWAY_ADMIN_TOKEN+x}}" ] || exit 23
@@ -920,6 +937,15 @@ read_and_log
 printf '{{"id":1,"result":{{"codexHome":"%s"}}}}\n' "$CODEX_HOME"
 read_and_log
 read_and_log
+if printf '%s' "$line" | /usr/bin/grep -F '"method":"account/read"' >/dev/null; then
+    printf '%s' "$line" | /usr/bin/grep -F '"refreshToken":true' >/dev/null
+    printf '%s' '{{"tokens":{{"access_token":"process-smoke-access","account_id":"process-smoke-account"}}}}' > "$CODEX_HOME/auth.json.next"
+    chmod 600 "$CODEX_HOME/auth.json.next"
+    mv "$CODEX_HOME/auth.json.next" "$CODEX_HOME/auth.json"
+    printf '{{"id":3,"result":{{"account":{{"email":"process-smoke@example.invalid","planType":"test"}}}}}}\n'
+    while IFS= read -r ignored; do :; done
+    exit 0
+fi
 thread_id='019fd9f5-badb-7dd3-8903-28ffded0ef54'
 turn_id='019fd9f5-badb-7dd3-8903-28ffded0ef55'
 printf '{{"method":"thread/started","params":{{"thread":{{"id":"%s"}}}}}}\n' "$thread_id"

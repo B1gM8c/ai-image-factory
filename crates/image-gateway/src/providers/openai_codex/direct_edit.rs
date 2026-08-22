@@ -1,4 +1,7 @@
-use std::{path::Path, time::Duration};
+use std::{borrow::Cow, path::Path, time::Duration};
+
+#[cfg(debug_assertions)]
+use std::net::IpAddr;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use futures_util::StreamExt;
@@ -11,6 +14,8 @@ use crate::{
 };
 
 const CODEX_IMAGE_EDITS_URL: &str = "https://chatgpt.com/backend-api/codex/images/edits";
+#[cfg(debug_assertions)]
+const TEST_CODEX_IMAGE_EDITS_URL_ENV: &str = "GATEWAY_TEST_CODEX_IMAGE_EDITS_URL";
 const CODEX_IMAGE_MODEL: &str = "gpt-image-2";
 const CODEX_ORIGINATOR: &str = "codex_cli_rs";
 const CODEX_USER_AGENT: &str = "codex_cli_rs/0.145.0";
@@ -78,16 +83,35 @@ pub(super) async fn edit(
     n: u32,
     timeout: Duration,
 ) -> Result<Vec<GeneratedImage>, ImageGatewayError> {
-    edit_at(
-        CODEX_IMAGE_EDITS_URL,
-        auth_home,
-        images,
-        mask,
-        prompt,
-        n,
-        timeout,
-    )
-    .await
+    let endpoint = image_edits_endpoint()?;
+    edit_at(&endpoint, auth_home, images, mask, prompt, n, timeout).await
+}
+
+fn image_edits_endpoint() -> Result<Cow<'static, str>, ImageGatewayError> {
+    #[cfg(debug_assertions)]
+    if let Ok(endpoint) = std::env::var(TEST_CODEX_IMAGE_EDITS_URL_ENV) {
+        validate_test_endpoint(&endpoint)?;
+        return Ok(Cow::Owned(endpoint));
+    }
+    Ok(Cow::Borrowed(CODEX_IMAGE_EDITS_URL))
+}
+
+#[cfg(debug_assertions)]
+fn validate_test_endpoint(endpoint: &str) -> Result<(), ImageGatewayError> {
+    let url = reqwest::Url::parse(endpoint).map_err(|_| unavailable())?;
+    if url.scheme() != "http" || url.username() != "" || url.password().is_some() {
+        return Err(unavailable());
+    }
+    let host = url.host_str().ok_or_else(unavailable)?;
+    let ip_host = host.trim_start_matches('[').trim_end_matches(']');
+    let loopback = host == "localhost"
+        || ip_host
+            .parse::<IpAddr>()
+            .is_ok_and(|address| address.is_loopback());
+    if !loopback {
+        return Err(unavailable());
+    }
+    Ok(())
 }
 
 async fn edit_at(
@@ -397,6 +421,16 @@ mod tests {
             br#"{"error":{"message":"content policy"}}"#,
         );
         assert_eq!(generic.error_code(), Some("image_generation_failed"));
+    }
+
+    #[test]
+    fn direct_edit_test_endpoint_is_restricted_to_plain_loopback_http() {
+        assert!(validate_test_endpoint("http://127.0.0.1:1234/images/edits").is_ok());
+        assert!(validate_test_endpoint("http://[::1]:1234/images/edits").is_ok());
+        assert!(validate_test_endpoint("http://localhost:1234/images/edits").is_ok());
+        assert!(validate_test_endpoint("https://127.0.0.1:1234/images/edits").is_err());
+        assert!(validate_test_endpoint("http://example.com/images/edits").is_err());
+        assert!(validate_test_endpoint("http://user:secret@127.0.0.1/images/edits").is_err());
     }
 
     #[tokio::test]
