@@ -342,6 +342,8 @@ fn assert_codex_invocation(argv: &[String], expects_runtime_home: bool) -> TestR
         "--listen",
         "stdio://",
         "--strict-config",
+        "-c",
+        "features.code_mode.direct_only_tool_namespaces=[\"image_gen\"]",
         "--enable",
         "image_generation",
         "--disable",

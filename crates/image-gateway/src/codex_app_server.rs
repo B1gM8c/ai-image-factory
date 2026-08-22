@@ -25,7 +25,9 @@ const MAX_DIAGNOSTIC_FIELD_BYTES: usize = 4 * 1024;
 const MAX_STDERR_DIGEST_BYTES: usize = 64 * 1024;
 const REAP_TIMEOUT: Duration = Duration::from_secs(5);
 
-const IMAGE_GENERATION_DEVELOPER_INSTRUCTIONS: &str = "For this thread, image requests MUST use the code-mode exec tool exactly once. Its JavaScript MUST call tools.image_gen__imagegen(...) exactly once and pass that result to generatedImage(result). Never answer an image request with text only. Do not call any other tool. Do not use shell or local programs to create, copy, move, rename, edit, or delete the generated artifact. After the image tool completes, stop.";
+const IMAGE_GENERATION_DEVELOPER_INSTRUCTIONS: &str = "For this thread, image requests MUST invoke the enabled namespaced tool image_gen.imagegen (wire name image_gen__imagegen) exactly once. Never answer an image request with text only. Do not use shell or local programs to create, copy, move, rename, edit, or delete the generated artifact. After the image tool completes, stop.";
+const IMAGE_GENERATION_DIRECT_TOOL_CONFIG: &str =
+    "features.code_mode.direct_only_tool_namespaces=[\"image_gen\"]";
 
 type FailureDiagnosticSink<'a> =
     &'a (dyn Fn(&CodexAppServerFailureDiagnosticV1) -> Result<(), ()> + Sync);
@@ -494,6 +496,8 @@ where
         .arg("--listen")
         .arg("stdio://")
         .arg("--strict-config")
+        .arg("-c")
+        .arg(IMAGE_GENERATION_DIRECT_TOOL_CONFIG)
         .arg("--enable")
         .arg("image_generation")
         .arg("--disable")

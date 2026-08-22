@@ -1,0 +1,407 @@
+use std::{path::Path, time::Duration};
+
+use base64::{Engine as _, engine::general_purpose::STANDARD};
+use futures_util::StreamExt;
+use reqwest::{Client, StatusCode, redirect::Policy};
+use serde::{Deserialize, Serialize};
+
+use crate::{
+    ImageGatewayError,
+    core::provider::{GeneratedImage, InputImage},
+};
+
+const CODEX_IMAGE_EDITS_URL: &str = "https://chatgpt.com/backend-api/codex/images/edits";
+const CODEX_IMAGE_MODEL: &str = "gpt-image-2";
+const CODEX_ORIGINATOR: &str = "codex_cli_rs";
+const CODEX_USER_AGENT: &str = "codex_cli_rs/0.145.0";
+const MAX_AUTH_BYTES: u64 = 64 * 1024;
+const MAX_RESPONSE_BYTES: usize = 96 * 1024 * 1024;
+const MAX_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
+
+#[derive(Deserialize)]
+struct AuthFile {
+    tokens: Option<AuthTokens>,
+}
+
+#[derive(Deserialize)]
+struct AuthTokens {
+    access_token: String,
+    account_id: Option<String>,
+}
+
+struct DirectAuth {
+    access_token: String,
+    account_id: Option<String>,
+}
+
+#[derive(Serialize)]
+struct EditRequest<'a> {
+    images: Vec<ImageUrl>,
+    prompt: &'a str,
+    background: &'static str,
+    model: &'static str,
+    n: u32,
+    quality: &'static str,
+    size: &'static str,
+}
+
+#[derive(Serialize)]
+struct ImageUrl {
+    image_url: String,
+}
+
+#[derive(Deserialize)]
+struct EditResponse {
+    data: Vec<ImageData>,
+}
+
+#[derive(Deserialize)]
+struct ImageData {
+    b64_json: String,
+}
+
+#[derive(Deserialize)]
+struct ErrorEnvelope {
+    error: Option<ErrorBody>,
+}
+
+#[derive(Deserialize)]
+struct ErrorBody {
+    code: Option<String>,
+}
+
+pub(super) async fn edit(
+    auth_home: &Path,
+    images: &[InputImage],
+    mask: Option<&InputImage>,
+    prompt: &str,
+    n: u32,
+    timeout: Duration,
+) -> Result<Vec<GeneratedImage>, ImageGatewayError> {
+    edit_at(
+        CODEX_IMAGE_EDITS_URL,
+        auth_home,
+        images,
+        mask,
+        prompt,
+        n,
+        timeout,
+    )
+    .await
+}
+
+async fn edit_at(
+    endpoint: &str,
+    auth_home: &Path,
+    images: &[InputImage],
+    mask: Option<&InputImage>,
+    prompt: &str,
+    n: u32,
+    timeout: Duration,
+) -> Result<Vec<GeneratedImage>, ImageGatewayError> {
+    let auth = read_auth(auth_home)?;
+    let payload = edit_request(images, mask, prompt, n)?;
+    let client = Client::builder()
+        .redirect(Policy::none())
+        .build()
+        .map_err(|_| unavailable())?;
+    let mut request = client
+        .post(endpoint)
+        .bearer_auth(auth.access_token)
+        .header("originator", CODEX_ORIGINATOR)
+        .header(reqwest::header::USER_AGENT, CODEX_USER_AGENT)
+        .timeout(timeout)
+        .json(&payload);
+    if let Some(account_id) = auth.account_id {
+        request = request.header("ChatGPT-Account-ID", account_id);
+    }
+    let response = request.send().await.map_err(|_| unavailable())?;
+    let status = response.status();
+    let body = read_bounded_body(response).await?;
+    if !status.is_success() {
+        return Err(map_http_error(status, &body));
+    }
+    decode_outputs(&body, n)
+}
+
+fn edit_request<'a>(
+    images: &[InputImage],
+    mask: Option<&InputImage>,
+    prompt: &'a str,
+    n: u32,
+) -> Result<EditRequest<'a>, ImageGatewayError> {
+    let mut encoded = Vec::with_capacity(images.len() + usize::from(mask.is_some()));
+    for image in images.iter().chain(mask) {
+        encoded.push(ImageUrl {
+            image_url: data_url(image)?,
+        });
+    }
+    Ok(EditRequest {
+        images: encoded,
+        prompt,
+        background: "auto",
+        model: CODEX_IMAGE_MODEL,
+        n,
+        quality: "auto",
+        size: "auto",
+    })
+}
+
+fn data_url(image: &InputImage) -> Result<String, ImageGatewayError> {
+    let mime = match ::image::guess_format(&image.bytes) {
+        Ok(::image::ImageFormat::Png) => "image/png",
+        Ok(::image::ImageFormat::Jpeg) => "image/jpeg",
+        Ok(::image::ImageFormat::WebP) => "image/webp",
+        _ => {
+            return Err(ImageGatewayError::invalid_request(
+                "Unsupported input image format",
+                Some("image".to_string()),
+                "invalid_image_format",
+            ));
+        }
+    };
+    Ok(format!(
+        "data:{mime};base64,{}",
+        STANDARD.encode(&image.bytes)
+    ))
+}
+
+fn read_auth(home: &Path) -> Result<DirectAuth, ImageGatewayError> {
+    let path = home.join("auth.json");
+    let metadata = std::fs::metadata(&path).map_err(|_| credentials_unavailable())?;
+    if !metadata.is_file() || metadata.len() == 0 || metadata.len() > MAX_AUTH_BYTES {
+        return Err(credentials_unavailable());
+    }
+    let auth: AuthFile =
+        serde_json::from_slice(&std::fs::read(path).map_err(|_| credentials_unavailable())?)
+            .map_err(|_| credentials_unavailable())?;
+    let tokens = auth.tokens.ok_or_else(credentials_unavailable)?;
+    if tokens.access_token.trim().is_empty() || tokens.access_token.len() > 16 * 1024 {
+        return Err(credentials_unavailable());
+    }
+    if tokens
+        .account_id
+        .as_deref()
+        .is_some_and(|value| value.trim().is_empty() || value.len() > 512)
+    {
+        return Err(credentials_unavailable());
+    }
+    Ok(DirectAuth {
+        access_token: tokens.access_token,
+        account_id: tokens.account_id,
+    })
+}
+
+async fn read_bounded_body(response: reqwest::Response) -> Result<Vec<u8>, ImageGatewayError> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_RESPONSE_BYTES as u64)
+    {
+        return Err(invalid_response());
+    }
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|_| unavailable())?;
+        if body.len().saturating_add(chunk.len()) > MAX_RESPONSE_BYTES {
+            return Err(invalid_response());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+fn decode_outputs(body: &[u8], expected: u32) -> Result<Vec<GeneratedImage>, ImageGatewayError> {
+    let response: EditResponse = serde_json::from_slice(body).map_err(|_| invalid_response())?;
+    if response.data.len() != expected as usize {
+        return Err(invalid_response());
+    }
+    let mut total = 0usize;
+    let mut outputs = Vec::with_capacity(response.data.len());
+    for item in response.data {
+        let bytes = STANDARD
+            .decode(item.b64_json.as_bytes())
+            .map_err(|_| invalid_response())?;
+        if bytes.is_empty() {
+            return Err(invalid_response());
+        }
+        total = total
+            .checked_add(bytes.len())
+            .ok_or_else(invalid_response)?;
+        if total > MAX_OUTPUT_BYTES {
+            return Err(invalid_response());
+        }
+        outputs.push(GeneratedImage { bytes });
+    }
+    Ok(outputs)
+}
+
+fn map_http_error(status: StatusCode, body: &[u8]) -> ImageGatewayError {
+    let code = serde_json::from_slice::<ErrorEnvelope>(body)
+        .ok()
+        .and_then(|value| value.error)
+        .and_then(|error| error.code)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if matches!(
+        code.as_str(),
+        "content_policy" | "content_policy_violation" | "safety"
+    ) {
+        return ImageGatewayError::content_policy_rejected();
+    }
+    match status {
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => credentials_unavailable(),
+        StatusCode::TOO_MANY_REQUESTS => ImageGatewayError::queue_overloaded(),
+        status if status.is_server_error() => unavailable(),
+        _ => ImageGatewayError::backend("Codex image edit request was rejected"),
+    }
+}
+
+fn credentials_unavailable() -> ImageGatewayError {
+    ImageGatewayError::service_unavailable("Codex credentials are unavailable")
+}
+
+fn unavailable() -> ImageGatewayError {
+    ImageGatewayError::service_unavailable("Codex image edit service is unavailable")
+}
+
+fn invalid_response() -> ImageGatewayError {
+    ImageGatewayError::backend("Codex image edit response is invalid")
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use axum::{Json, Router, extract::State, http::HeaderMap, routing::post};
+    use serde_json::Value;
+    use tempfile::TempDir;
+
+    use super::*;
+
+    #[derive(Default)]
+    struct ObservedRequest {
+        authorized: bool,
+        account_bound: bool,
+        originator_bound: bool,
+        body: Option<Value>,
+    }
+
+    fn png() -> InputImage {
+        InputImage {
+            filename: Some("input.png".to_string()),
+            content_type: Some("image/png".to_string()),
+            bytes: vec![
+                137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0,
+                1, 8, 6, 0, 0, 0, 31, 21, 196, 137,
+            ],
+        }
+    }
+
+    #[test]
+    fn direct_edit_payload_preserves_batch_cardinality() {
+        let request = edit_request(&[png()], None, "edit", 4).unwrap();
+        let value = serde_json::to_value(request).unwrap();
+        assert_eq!(value["model"], "gpt-image-2");
+        assert_eq!(value["n"], 4);
+        assert_eq!(value["size"], "auto");
+        assert_eq!(value["quality"], "auto");
+        assert_eq!(value["images"].as_array().map(Vec::len), Some(1));
+    }
+
+    #[test]
+    fn direct_edit_requires_exact_output_count() {
+        let one = STANDARD.encode(b"one");
+        let body = serde_json::to_vec(&serde_json::json!({
+            "data": [{"b64_json": one}]
+        }))
+        .unwrap();
+        assert!(decode_outputs(&body, 2).is_err());
+        let outputs = decode_outputs(&body, 1).unwrap();
+        assert_eq!(outputs[0].bytes, b"one");
+    }
+
+    #[test]
+    fn direct_edit_maps_only_structured_policy_codes() {
+        let policy = map_http_error(
+            StatusCode::BAD_REQUEST,
+            br#"{"error":{"code":"content_policy"}}"#,
+        );
+        assert_eq!(policy.error_code(), Some("content_policy_rejected"));
+        let generic = map_http_error(
+            StatusCode::BAD_REQUEST,
+            br#"{"error":{"message":"content policy"}}"#,
+        );
+        assert_eq!(generic.error_code(), Some("image_generation_failed"));
+    }
+
+    #[tokio::test]
+    async fn direct_edit_posts_one_authenticated_batch_without_exposing_auth() {
+        let observed = Arc::new(Mutex::new(ObservedRequest::default()));
+        let app = Router::new()
+            .route("/images/edits", post(capture_edit))
+            .with_state(Arc::clone(&observed));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/images/edits", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let auth_home = TempDir::new().unwrap();
+        std::fs::write(
+            auth_home.path().join("auth.json"),
+            br#"{"tokens":{"access_token":"access-test","refresh_token":"refresh-test","account_id":"account-test"}}"#,
+        )
+        .unwrap();
+
+        for n in [1, 2, 4] {
+            let outputs = edit_at(
+                &endpoint,
+                auth_home.path(),
+                &[png()],
+                None,
+                "edit",
+                n,
+                Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+            assert_eq!(outputs.len(), n as usize);
+        }
+        server.abort();
+
+        let observed = observed.lock().unwrap();
+        assert!(observed.authorized);
+        assert!(observed.account_bound);
+        assert!(observed.originator_bound);
+        assert_eq!(observed.body.as_ref().unwrap()["n"], 4);
+        assert_eq!(observed.body.as_ref().unwrap()["model"], "gpt-image-2");
+    }
+
+    async fn capture_edit(
+        State(observed): State<Arc<Mutex<ObservedRequest>>>,
+        headers: HeaderMap,
+        Json(body): Json<Value>,
+    ) -> Json<Value> {
+        let mut observed = observed.lock().unwrap();
+        observed.authorized = headers
+            .get(reqwest::header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            == Some("Bearer access-test");
+        observed.account_bound = headers
+            .get("ChatGPT-Account-ID")
+            .and_then(|value| value.to_str().ok())
+            == Some("account-test");
+        observed.originator_bound = headers
+            .get("originator")
+            .and_then(|value| value.to_str().ok())
+            == Some("codex_cli_rs");
+        let n = body["n"].as_u64().unwrap();
+        observed.body = Some(body);
+        Json(serde_json::json!({
+            "created": 1,
+            "data": (0..n)
+                .map(|index| serde_json::json!({
+                    "b64_json": STANDARD.encode(format!("image-{index}"))
+                }))
+                .collect::<Vec<_>>()
+        }))
+    }
+}

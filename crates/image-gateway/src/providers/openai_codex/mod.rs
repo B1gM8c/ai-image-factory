@@ -18,6 +18,8 @@ use crate::{
     size::{SizeConstraint, parse_size_constraint},
 };
 
+mod direct_edit;
+
 const MAX_CODEX_BATCH_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_CODEX_NO_TOOL_ATTEMPTS: u8 = 2;
 const CODEX_NO_TOOL_RETRY_INSTRUCTION: &str = "\n\nThe previous attempt completed without calling the image generation tool. You MUST call the enabled image generation tool exactly once now, then stop. Do not answer with text only and do not copy, move, rename, or delete the generated artifact.";
@@ -71,55 +73,46 @@ impl ImageGenerator for OpenAiCodexImageProvider {
     }
 
     async fn edit(&self, job: EditJob) -> Result<Vec<GeneratedImage>, ImageGatewayError> {
-        let temp_dir = tempfile::Builder::new()
-            .prefix("gpt-image-2-edit-")
-            .tempdir()
-            .map_err(ImageGatewayError::from)?;
-
-        let mut image_paths = Vec::new();
-        for (idx, image) in job.images.iter().enumerate() {
-            let extension = extension_for_content_type(image.content_type.as_deref());
-            let path = temp_dir.path().join(format!("input-{idx}.{extension}"));
-            tokio::fs::write(&path, &image.bytes).await?;
-            image_paths.push(path);
-        }
-
         if let Some(mask) = &job.mask {
             validate_mask_for_first_image(job.images.first(), mask)?;
-            let path = temp_dir.path().join("mask.png");
-            tokio::fs::write(&path, &mask.bytes).await?;
-            image_paths.push(path);
         }
-
-        let generation_job = GenerationJob {
-            request_id: job.request_id,
-            model: job.model,
-            prompt: build_edit_prompt(&job.prompt, job.images.len(), job.mask.is_some()),
-            moderation: job.moderation,
-            n: job.n,
-            size: job.size,
-            quality: job.quality,
-            output_format: job.output_format,
-            output_compression: job.output_compression,
-            background: job.background,
-            stream: job.stream,
-            partial_images: job.partial_images,
-        };
-
-        let mut images = Vec::new();
-        let mut total_bytes = 0_u64;
-        for index in 0..generation_job.n {
-            let image = run_codex_once(&self.config, &generation_job, index + 1, &image_paths)
-                .instrument(info_span!(
-                    "generator.codex.exec",
-                    request.id = %generation_job.request_id,
-                    image.index = index + 1,
-                    generator.name = "codex"
-                ))
-                .await?;
-            push_bounded_output(&mut images, image, &mut total_bytes)?;
-        }
-        Ok(images)
+        let source_codex_home = resolved_codex_home(&self.config).ok_or_else(|| {
+            ImageGatewayError::service_unavailable("Codex credentials are unavailable")
+        })?;
+        let request_root = tempfile::Builder::new()
+            .prefix("gpt-image-2-direct-edit-")
+            .tempdir()
+            .map_err(ImageGatewayError::from)?;
+        let request_codex_home = request_root.path().join("codex-home");
+        std::fs::create_dir(&request_codex_home).map_err(ImageGatewayError::from)?;
+        std::fs::set_permissions(&request_codex_home, std::fs::Permissions::from_mode(0o700))
+            .map_err(ImageGatewayError::from)?;
+        let auth_sha256 =
+            crate::executor::codex_auth_file_sha256(&source_codex_home).map_err(|_| {
+                ImageGatewayError::service_unavailable("Codex credentials are unavailable")
+            })?;
+        crate::executor::prepare_codex_auth_copy(
+            &request_codex_home,
+            &source_codex_home,
+            &auth_sha256,
+        )
+        .map_err(|_| ImageGatewayError::service_unavailable("Codex credentials are unavailable"))?;
+        let prompt = build_edit_prompt(&job.prompt, job.images.len(), job.mask.is_some());
+        direct_edit::edit(
+            &request_codex_home,
+            &job.images,
+            job.mask.as_ref(),
+            &prompt,
+            job.n,
+            self.config.request_timeout,
+        )
+        .instrument(info_span!(
+            "generator.codex.direct_edit",
+            request.id = %job.request_id,
+            image.units = job.n,
+            generator.name = "codex"
+        ))
+        .await
     }
 }
 
@@ -407,14 +400,6 @@ fn codex_app_server_environment(config: &AppConfig) -> Vec<(String, String)> {
         }
     }
     environment
-}
-
-fn extension_for_content_type(content_type: Option<&str>) -> &'static str {
-    match content_type {
-        Some("image/jpeg") => "jpg",
-        Some("image/webp") => "webp",
-        _ => "png",
-    }
 }
 
 fn validate_mask_for_first_image(
