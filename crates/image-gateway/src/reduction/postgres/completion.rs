@@ -1483,10 +1483,10 @@ async fn aggregate_parent(
     }
     let parent_state = if aggregate.uncertain_count > 0 {
         ExecutorParentTerminalState::Uncertain
-    } else if aggregate.failed_count > 0 {
-        ExecutorParentTerminalState::Failed
-    } else if aggregate.succeeded_count == aggregate.output_count {
+    } else if aggregate.succeeded_count > 0 {
         ExecutorParentTerminalState::Succeeded
+    } else if aggregate.failed_count == aggregate.output_count {
+        ExecutorParentTerminalState::Failed
     } else {
         return Err(ExecutorTerminalError::Conflict);
     };
@@ -1542,7 +1542,9 @@ async fn terminalize_parent(
         ExecutorParentTerminalState::Pending => return Err(ExecutorTerminalError::Conflict),
     };
     if parent_state == ExecutorParentTerminalState::Succeeded {
-        persist_projection(tx, lease, quota, now).await?;
+        let artifact_count = i32::try_from(aggregate.succeeded_count)
+            .map_err(|_| ExecutorTerminalError::Conflict)?;
+        persist_projection(tx, lease, quota, artifact_count, now).await?;
     }
     require_one(
         sqlx::query(
@@ -1631,6 +1633,7 @@ async fn persist_projection(
     tx: &mut Transaction<'_, Postgres>,
     lease: &ExecutorTerminalLease,
     quota: &QuotaSliceRow,
+    artifact_count: i32,
     now: i64,
 ) -> Result<(), ExecutorTerminalError> {
     let (command_schema, command_json, api_profile): (String, Value, String) = sqlx::query_as(
@@ -1648,20 +1651,40 @@ async fn persist_projection(
     .ok_or(ExecutorTerminalError::Conflict)?;
     match command_schema.as_str() {
         GENERATION_COMMAND_SCHEMA => {
-            persist_image_projection(tx, lease, quota, command_json, now).await
+            persist_image_projection(tx, lease, quota, artifact_count, command_json, now).await
         }
-        EDIT_COMMAND_SCHEMA => persist_edit_projection(tx, lease, quota, command_json, now).await,
+        EDIT_COMMAND_SCHEMA => {
+            persist_edit_projection(tx, lease, quota, artifact_count, command_json, now).await
+        }
         GROK_IMAGE_GENERATION_COMMAND_SCHEMA => {
-            persist_grok_image_generation_projection(tx, lease, quota, command_json, now).await
+            persist_grok_image_generation_projection(
+                tx,
+                lease,
+                quota,
+                artifact_count,
+                command_json,
+                now,
+            )
+            .await
         }
         GROK_IMAGE_EDIT_COMMAND_SCHEMA => {
-            persist_grok_image_edit_projection(tx, lease, quota, command_json, now).await
+            persist_grok_image_edit_projection(tx, lease, quota, artifact_count, command_json, now)
+                .await
         }
         GROK_VIDEO_GENERATION_COMMAND_SCHEMA => {
-            persist_video_projection(tx, lease, quota, command_json, now).await
+            persist_video_projection(tx, lease, quota, artifact_count, command_json, now).await
         }
         DREAMINA_SUBMIT_COMMAND_SCHEMA => {
-            persist_dreamina_projection(tx, lease, quota, command_json, &api_profile, now).await
+            persist_dreamina_projection(
+                tx,
+                lease,
+                quota,
+                artifact_count,
+                command_json,
+                &api_profile,
+                now,
+            )
+            .await
         }
         _ => Err(ExecutorTerminalError::Conflict),
     }
@@ -1671,6 +1694,7 @@ async fn persist_dreamina_projection(
     tx: &mut Transaction<'_, Postgres>,
     lease: &ExecutorTerminalLease,
     quota: &QuotaSliceRow,
+    artifact_count: i32,
     command_json: Value,
     api_profile: &str,
     now: i64,
@@ -1703,6 +1727,7 @@ async fn persist_dreamina_projection(
                 &size,
                 "opaque",
                 quota,
+                artifact_count,
                 now,
             )
             .await
@@ -1729,6 +1754,7 @@ async fn persist_dreamina_projection(
                 request.resolution().as_str(),
                 NOT_APPLICABLE,
                 quota,
+                artifact_count,
                 now,
             )
             .await
@@ -1748,6 +1774,7 @@ async fn insert_response_projection(
     size: &str,
     background: &str,
     quota: &QuotaSliceRow,
+    artifact_count: i32,
     now: i64,
 ) -> Result<(), ExecutorTerminalError> {
     sqlx::query(
@@ -1774,7 +1801,7 @@ async fn insert_response_projection(
     .bind(quota.remaining_5h)
     .bind(quota.limit_7d)
     .bind(quota.remaining_7d)
-    .bind(quota.output_count)
+    .bind(artifact_count)
     .bind(now)
     .execute(&mut **tx)
     .await
@@ -1786,6 +1813,7 @@ async fn persist_image_projection(
     tx: &mut Transaction<'_, Postgres>,
     lease: &ExecutorTerminalLease,
     quota: &QuotaSliceRow,
+    artifact_count: i32,
     command_json: Value,
     now: i64,
 ) -> Result<(), ExecutorTerminalError> {
@@ -1823,7 +1851,7 @@ async fn persist_image_projection(
     .bind(quota.remaining_5h)
     .bind(quota.limit_7d)
     .bind(quota.remaining_7d)
-    .bind(quota.output_count)
+    .bind(artifact_count)
     .bind(now)
     .execute(&mut **tx)
     .await
@@ -1835,6 +1863,7 @@ async fn persist_edit_projection(
     tx: &mut Transaction<'_, Postgres>,
     lease: &ExecutorTerminalLease,
     quota: &QuotaSliceRow,
+    artifact_count: i32,
     command_json: Value,
     now: i64,
 ) -> Result<(), ExecutorTerminalError> {
@@ -1862,6 +1891,7 @@ async fn persist_edit_projection(
         &command.size,
         &command.background,
         quota,
+        artifact_count,
         now,
     )
     .await
@@ -1871,6 +1901,7 @@ async fn persist_grok_image_generation_projection(
     tx: &mut Transaction<'_, Postgres>,
     lease: &ExecutorTerminalLease,
     quota: &QuotaSliceRow,
+    artifact_count: i32,
     command_json: Value,
     now: i64,
 ) -> Result<(), ExecutorTerminalError> {
@@ -1901,6 +1932,7 @@ async fn persist_grok_image_generation_projection(
         &size,
         "opaque",
         quota,
+        artifact_count,
         now,
     )
     .await
@@ -1910,6 +1942,7 @@ async fn persist_grok_image_edit_projection(
     tx: &mut Transaction<'_, Postgres>,
     lease: &ExecutorTerminalLease,
     quota: &QuotaSliceRow,
+    artifact_count: i32,
     command_json: Value,
     now: i64,
 ) -> Result<(), ExecutorTerminalError> {
@@ -1934,6 +1967,7 @@ async fn persist_grok_image_edit_projection(
         payload.request().aspect_ratio().as_str(),
         "opaque",
         quota,
+        artifact_count,
         now,
     )
     .await
@@ -1950,6 +1984,7 @@ async fn persist_video_projection(
     tx: &mut Transaction<'_, Postgres>,
     lease: &ExecutorTerminalLease,
     quota: &QuotaSliceRow,
+    artifact_count: i32,
     command_json: Value,
     now: i64,
 ) -> Result<(), ExecutorTerminalError> {
@@ -1994,7 +2029,7 @@ async fn persist_video_projection(
     .bind(quota.remaining_5h)
     .bind(quota.limit_7d)
     .bind(quota.remaining_7d)
-    .bind(quota.output_count)
+    .bind(artifact_count)
     .bind(now)
     .execute(&mut **tx)
     .await

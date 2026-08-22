@@ -128,6 +128,38 @@ pub(crate) struct CodexAppServerFailureDiagnosticV1 {
     exit: PersistedExitDiagnostic,
 }
 
+impl CodexAppServerFailureDiagnosticV1 {
+    pub(crate) fn is_retryable_authentication_rejection(&self) -> bool {
+        if self.failure_category != CodexAppServerError::ImageToolFailed.code() {
+            return false;
+        }
+        let stderr_class = self
+            .stderr
+            .as_ref()
+            .map_or("unknown", |value| value.class.as_str());
+        let is_nonretryable = |classification: &str| {
+            classification.split([':', '+']).any(|signal| {
+                matches!(
+                    signal,
+                    "content_policy"
+                        | "cyber_policy"
+                        | "safety"
+                        | "moderation"
+                        | "policy"
+                        | "rejected"
+                        | "blocked"
+                        | "invalid_request"
+                        | "unsupported"
+                )
+            })
+        };
+        if is_nonretryable(&self.class) || is_nonretryable(stderr_class) {
+            return false;
+        }
+        self.numeric_code == Some(401) || stderr_class.starts_with("http_status:401")
+    }
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct PersistedFieldDiagnostic {
@@ -1581,6 +1613,56 @@ mod tests {
             ),
             "http_status:400:retention+organization+rejected+policy"
         );
+    }
+
+    #[test]
+    fn only_definitive_authentication_rejections_are_retryable() {
+        let persisted = |failure_category: &str, numeric_code: Option<i64>, stderr_class: &str| {
+            CodexAppServerFailureDiagnosticV1 {
+                schema_version: 1,
+                failure_category: failure_category.to_string(),
+                source: "image_generation_item".to_string(),
+                class: "tool_failure".to_string(),
+                numeric_code,
+                code: PersistedFieldDiagnostic::default(),
+                message: PersistedFieldDiagnostic::default(),
+                stderr: Some(PersistedStreamDiagnostic {
+                    sha256: "a".repeat(64),
+                    bytes: 32,
+                    truncated: false,
+                    class: stderr_class.to_string(),
+                }),
+                exit: PersistedExitDiagnostic {
+                    observed: true,
+                    code: Some(0),
+                    signal: None,
+                },
+            }
+        };
+
+        for diagnostic in [
+            persisted("codex_image_tool_failed", Some(401), "unknown"),
+            persisted("codex_image_tool_failed", None, "http_status:401"),
+        ] {
+            assert!(diagnostic.is_retryable_authentication_rejection());
+        }
+        let mut policy_with_numeric_status =
+            persisted("codex_image_tool_failed", Some(401), "unknown");
+        policy_with_numeric_status.class = "policy".to_string();
+        for diagnostic in [
+            policy_with_numeric_status,
+            persisted(
+                "codex_image_tool_failed",
+                Some(401),
+                "http_status:401:policy+rejected",
+            ),
+            persisted("codex_image_tool_failed", None, "rejected"),
+            persisted("codex_image_tool_failed", None, "http_status:429"),
+            persisted("codex_image_tool_failed", None, "http_status:503"),
+            persisted("codex_turn_failed", Some(401), "http_status:401"),
+        ] {
+            assert!(!diagnostic.is_retryable_authentication_rejection());
+        }
     }
 
     #[test]

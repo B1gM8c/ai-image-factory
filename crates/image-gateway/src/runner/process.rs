@@ -255,6 +255,28 @@ impl ExecutionSpool {
         )
     }
 
+    pub(crate) fn retire_provider_process(
+        &self,
+        runner_lock: &RunnerLock,
+        helper: &ProcessIdentity,
+        provider: &ProviderProcessIdentity,
+    ) -> Result<(), ProcessSpoolError> {
+        helper.validate()?;
+        runner_lock.validate_identity(helper)?;
+        self.validate_lock_binding(helper)?;
+        self.validate_persisted_process(helper)?;
+        provider.validate()?;
+        let persisted = self
+            .read_provider_process(helper)?
+            .ok_or(ProcessSpoolError::Integrity)?;
+        if persisted != *provider || provider.is_current_process_group()? {
+            return Err(ProcessSpoolError::Conflict);
+        }
+        rfs::unlinkat(&self.directory, PROVIDER_PROCESS_FILE, AtFlags::empty())
+            .map_err(|_| ProcessSpoolError::Unavailable)?;
+        rfs::fsync(&self.directory).map_err(|_| ProcessSpoolError::Unavailable)
+    }
+
     pub(crate) fn publish_output(&self, bytes: &[u8]) -> Result<(), ProcessSpoolError> {
         if bytes.is_empty() || bytes.len() as u64 > MAX_OUTPUT_BYTES {
             return Err(ProcessSpoolError::InvalidInput);
@@ -2030,6 +2052,49 @@ mod tests {
         assert!(child.try_wait().unwrap().is_none());
         assert!(identity.kill_process_group_if_current().unwrap());
         child.wait().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dead_provider_marker_can_be_rotated_for_one_bounded_retry() {
+        use std::{os::unix::process::CommandExt, process::Command};
+
+        let (_temp, journal, lease) = fixture();
+        let spool = ExecutionSpool::for_lease(&journal, &lease).unwrap();
+        let lock = spool.acquire_runner_lock().unwrap();
+        let helper = lock.identity().unwrap();
+        spool.publish_process(&lock, &helper).unwrap();
+
+        let mut first = Command::new("/bin/sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let first_provider = ProviderProcessIdentity::capture(first.id(), &helper.nonce).unwrap();
+        spool
+            .publish_provider_process(&lock, &helper, &first_provider)
+            .unwrap();
+        assert_eq!(
+            spool.retire_provider_process(&lock, &helper, &first_provider),
+            Err(ProcessSpoolError::Conflict)
+        );
+        first.kill().unwrap();
+        first.wait().unwrap();
+        spool
+            .retire_provider_process(&lock, &helper, &first_provider)
+            .unwrap();
+
+        let mut second = Command::new("/bin/sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let second_provider = ProviderProcessIdentity::capture(second.id(), &helper.nonce).unwrap();
+        spool
+            .publish_provider_process(&lock, &helper, &second_provider)
+            .unwrap();
+        second.kill().unwrap();
+        second.wait().unwrap();
     }
 
     fn fixture() -> (

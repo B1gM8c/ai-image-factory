@@ -137,12 +137,14 @@ struct V4TerminalEconomicState {
 #[derive(Debug, Eq, PartialEq, sqlx::FromRow)]
 struct V4MixedSettlementState {
     job_state: String,
-    last_error_code: String,
+    last_error_code: Option<String>,
     charged_units: i32,
     committed_units: i32,
     released_units: i32,
     quota_state: String,
     artifact_count: i64,
+    projection_count: i64,
+    projection_artifact_count: Option<i32>,
     submission_count: i64,
     blocked_count: i64,
     rating_count: i64,
@@ -3075,13 +3077,18 @@ async fn v4_terminal_multi_output_rates_every_token_partition_once() -> TestResu
 }
 
 #[tokio::test]
-async fn v4_four_output_one_success_settles_without_blocking() -> TestResult {
+async fn v4_four_output_one_success_returns_the_durable_output() -> TestResult {
     assert_v4_four_output_mixed_settlement(&[0]).await
 }
 
 #[tokio::test]
-async fn v4_four_output_three_successes_settle_without_blocking() -> TestResult {
+async fn v4_four_output_three_successes_return_the_durable_outputs() -> TestResult {
     assert_v4_four_output_mixed_settlement(&[0, 1, 2]).await
+}
+
+#[tokio::test]
+async fn v4_four_output_all_failed_remains_failed_without_a_projection() -> TestResult {
+    assert_v4_four_output_mixed_settlement(&[]).await
 }
 
 async fn assert_v4_four_output_mixed_settlement(successful_outputs: &[i32]) -> TestResult {
@@ -3157,8 +3164,10 @@ async fn assert_v4_four_output_mixed_settlement(successful_outputs: &[i32]) -> T
                 .complete_terminal(&terminal, artifact.as_ref())
                 .await
                 .map_err(debug_error)?;
-            let expected_parent = if index == 3 {
+            let expected_parent = if index == 3 && successful_outputs.is_empty() {
                 ExecutorParentTerminalState::Failed
+            } else if index == 3 {
+                ExecutorParentTerminalState::Succeeded
             } else {
                 ExecutorParentTerminalState::Pending
             };
@@ -3170,6 +3179,7 @@ async fn assert_v4_four_output_mixed_settlement(successful_outputs: &[i32]) -> T
 
         let success_count = i64::try_from(successful_outputs.len()).map_err(debug_error)?;
         let failed_count = 4_i64 - success_count;
+        let has_success = success_count > 0;
         let state: V4MixedSettlementState = sqlx::query_as(
             r#"
             SELECT job.state AS job_state, job.last_error_code, job.charged_units,
@@ -3177,6 +3187,10 @@ async fn assert_v4_four_output_mixed_settlement(successful_outputs: &[i32]) -> T
                    quota.state AS quota_state,
                    (SELECT COUNT(*) FROM artifacts WHERE job_id = job.job_id)
                      AS artifact_count,
+                   (SELECT COUNT(*) FROM job_response_projections
+                      WHERE job_id = job.job_id) AS projection_count,
+                   (SELECT artifact_count FROM job_response_projections
+                      WHERE job_id = job.job_id) AS projection_artifact_count,
                    (SELECT COUNT(*) FROM provider_submissions WHERE job_id = job.job_id)
                      AS submission_count,
                    (SELECT COUNT(*) FROM executor_terminal_reductions reduction
@@ -3207,13 +3221,17 @@ async fn assert_v4_four_output_mixed_settlement(successful_outputs: &[i32]) -> T
         require(
             state
                 == V4MixedSettlementState {
-                    job_state: "failed".to_string(),
-                    last_error_code: "partial_output_failure".to_string(),
+                    job_state: if has_success { "succeeded" } else { "failed" }.to_string(),
+                    last_error_code: (!has_success)
+                        .then(|| "codex_image_output_disappeared".to_string()),
                     charged_units: i32::try_from(success_count).map_err(debug_error)?,
                     committed_units: i32::try_from(success_count).map_err(debug_error)?,
                     released_units: i32::try_from(failed_count).map_err(debug_error)?,
-                    quota_state: "committed".to_string(),
+                    quota_state: if has_success { "committed" } else { "released" }.to_string(),
                     artifact_count: success_count,
+                    projection_count: i64::from(has_success),
+                    projection_artifact_count: has_success
+                        .then_some(i32::try_from(success_count).map_err(debug_error)?),
                     submission_count: 4,
                     blocked_count: 0,
                     rating_count: 1,
@@ -3221,7 +3239,7 @@ async fn assert_v4_four_output_mixed_settlement(successful_outputs: &[i32]) -> T
                     hold_state: "settled".to_string(),
                     captured_micros: success_count * 40_000,
                     released_micros: failed_count * 40_000,
-                    charge_count: 1,
+                    charge_count: i64::from(has_success),
                 },
             format!("v4 mixed settlement did not close canonically: {state:?}"),
         )
@@ -3913,7 +3931,7 @@ async fn concurrent_multi_output_completion_finalizes_parent_once() -> TestResul
 }
 
 #[tokio::test]
-async fn partial_failure_settles_outputs_and_fails_parent() -> TestResult {
+async fn partial_failure_settles_outputs_and_returns_successful_artifacts() -> TestResult {
     let Some(database) = TestDatabase::new().await? else {
         return Ok(());
     };
@@ -3982,7 +4000,7 @@ async fn partial_failure_settles_outputs_and_fails_parent() -> TestResult {
                 .await
                 .map_err(debug_error)?;
             let expected = if index == 2 {
-                ExecutorParentTerminalState::Failed
+                ExecutorParentTerminalState::Succeeded
             } else {
                 ExecutorParentTerminalState::Pending
             };
@@ -4010,9 +4028,9 @@ async fn partial_failure_settles_outputs_and_fails_parent() -> TestResult {
                    (SELECT COUNT(*) FROM output_holds WHERE job_id = $1 AND state = 'held')
                      AS held_hold_count,
                    (SELECT COUNT(*) FROM job_events WHERE job_id = $1
-                      AND event_type = 'job.failed') AS terminal_job_event_count,
+                      AND event_type = 'job.succeeded') AS terminal_job_event_count,
                    (SELECT COUNT(*) FROM outbox_events WHERE job_id = $1
-                      AND event_type = 'job.failed') AS terminal_outbox_count
+                      AND event_type = 'job.succeeded') AS terminal_outbox_count
             FROM work_items work
             JOIN job_attempts attempt ON attempt.execution_id = work.execution_id
             JOIN jobs job ON job.job_id = work.job_id
@@ -4027,9 +4045,9 @@ async fn partial_failure_settles_outputs_and_fails_parent() -> TestResult {
         require(
             state
                 == TerminalParentSnapshot {
-                    work_state: "failed".to_string(),
-                    attempt_state: "failed".to_string(),
-                    job_state: "failed".to_string(),
+                    work_state: "succeeded".to_string(),
+                    attempt_state: "succeeded".to_string(),
+                    job_state: "succeeded".to_string(),
                     quota_state: "committed".to_string(),
                     committed_units: 2,
                     released_units: 1,
@@ -4038,7 +4056,7 @@ async fn partial_failure_settles_outputs_and_fails_parent() -> TestResult {
                     economic_meter_count: 3,
                     rating_count: 3,
                     artifact_count: 2,
-                    projection_count: 0,
+                    projection_count: 1,
                     held_hold_count: 0,
                     terminal_job_event_count: 1,
                     terminal_outbox_count: 1,

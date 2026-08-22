@@ -4,7 +4,7 @@ use std::{
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::Stdio,
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -444,46 +444,96 @@ async fn run_codex_child(
     let prompt = build_codex_prompt(&job, workspace, request.output.candidate_index);
     let mut environment = allowed_child_environment();
     environment.push(("PATH".to_string(), CODEX_CHILD_PATH.to_string()));
-    let diagnostic_sink =
-        |diagnostic: &crate::codex_app_server::CodexAppServerFailureDiagnosticV1| {
-            spool
-                .publish_diagnostic(CODEX_APP_SERVER_FAILURE_DIAGNOSTIC_FILE, diagnostic)
-                .map_err(|_| ())
-        };
-    let runtime_result = crate::codex_app_server::run_codex_app_server(
-        crate::codex_app_server::CodexAppServerRequest {
-            request_id: &request.output.request_id,
-            image_index: request.output.candidate_index,
-            attempt: 1,
-            executable: Path::new(&request.codex_executable),
-            workspace,
-            codex_home,
-            prompt: &prompt,
-            input_paths: &[],
-            timeout: Duration::from_millis(request.timeout_ms),
-            environment: &environment,
-            failure_diagnostic_sink: Some(&diagnostic_sink),
-        },
-        |pid| {
-            ProviderProcessIdentity::capture(pid, &helper.nonce)
-                .and_then(|provider| {
-                    spool.publish_provider_process(&runner_lock, &helper, &provider)
-                })
-                .map_err(|_| ())
-        },
-    )
-    .await;
-    let outcome = match runtime_result {
-        Ok(bytes) => ChildOutcome::Succeeded(bytes),
-        Err(error) => {
-            tracing::warn!(
-                request.id = %request.output.request_id,
-                output.index = request.output.candidate_index,
-                codex.output.stage = "sealed_handoff",
-                error.code = error.code(),
-                "Codex completed without a valid sealed image handoff"
-            );
-            map_codex_app_server_child_error(error)
+    let request_timeout = Duration::from_millis(request.timeout_ms);
+    let deadline = Instant::now() + request_timeout;
+    let mut attempt = 1_u8;
+    let outcome = loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break ChildOutcome::Uncertain("codex_timeout");
+        }
+        let diagnostic = Mutex::new(None);
+        let provider_process = Mutex::new(None);
+        let diagnostic_sink =
+            |value: &crate::codex_app_server::CodexAppServerFailureDiagnosticV1| {
+                *diagnostic.lock().map_err(|_| ())? = Some(value.clone());
+                Ok(())
+            };
+        let runtime_result = crate::codex_app_server::run_codex_app_server(
+            crate::codex_app_server::CodexAppServerRequest {
+                request_id: &request.output.request_id,
+                image_index: request.output.candidate_index,
+                attempt,
+                executable: Path::new(&request.codex_executable),
+                workspace,
+                codex_home,
+                prompt: &prompt,
+                input_paths: &[],
+                timeout: remaining,
+                environment: &environment,
+                failure_diagnostic_sink: Some(&diagnostic_sink),
+            },
+            |pid| {
+                ProviderProcessIdentity::capture(pid, &helper.nonce)
+                    .and_then(|provider| {
+                        spool.publish_provider_process(&runner_lock, &helper, &provider)?;
+                        *provider_process
+                            .lock()
+                            .map_err(|_| ProcessSpoolError::Unavailable)? = Some(provider);
+                        Ok(())
+                    })
+                    .map_err(|_| ())
+            },
+        )
+        .await;
+        match runtime_result {
+            Ok(bytes) => break ChildOutcome::Succeeded(bytes),
+            Err(error) => {
+                let diagnostic = diagnostic.into_inner().ok().flatten();
+                let provider_process = provider_process.into_inner().ok().flatten();
+                let retryable = attempt == 1
+                    && diagnostic
+                        .as_ref()
+                        .is_some_and(|value| value.is_retryable_authentication_rejection())
+                    && deadline.saturating_duration_since(Instant::now())
+                        > Duration::from_millis(250)
+                    && provider_process.as_ref().is_some_and(|provider| {
+                        spool
+                            .retire_provider_process(&runner_lock, &helper, provider)
+                            .is_ok()
+                    });
+                if retryable {
+                    tracing::warn!(
+                        request.id = %request.output.request_id,
+                        output.index = request.output.candidate_index,
+                        codex.attempt = attempt,
+                        error.code = error.code(),
+                        "retrying one definitive Codex authentication rejection"
+                    );
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    attempt = 2;
+                    continue;
+                }
+                if let Some(diagnostic) = diagnostic.as_ref()
+                    && spool
+                        .publish_diagnostic(CODEX_APP_SERVER_FAILURE_DIAGNOSTIC_FILE, diagnostic)
+                        .is_err()
+                {
+                    tracing::warn!(
+                        request.id = %request.output.request_id,
+                        output.index = request.output.candidate_index,
+                        "Codex failure diagnostic could not be persisted"
+                    );
+                }
+                tracing::warn!(
+                    request.id = %request.output.request_id,
+                    output.index = request.output.candidate_index,
+                    codex.output.stage = "sealed_handoff",
+                    error.code = error.code(),
+                    "Codex completed without a valid sealed image handoff"
+                );
+                break map_codex_app_server_child_error(error);
+            }
         }
     };
     match outcome {
@@ -1093,6 +1143,7 @@ mod tests {
         assert!(!execution_root.join("workspace").exists());
         assert!(!execution_root.join("runtime-home").exists());
         assert!(diagnostic_path.is_file());
+        assert_eq!(fs::read_to_string(&fixture.invocations).unwrap(), "1\n");
 
         assert_eq!(
             fixture
@@ -1104,6 +1155,41 @@ mod tests {
             })
         );
         assert_eq!(fs::read(diagnostic_path).unwrap(), diagnostic_bytes);
+    }
+
+    #[tokio::test]
+    async fn definitive_http_401_is_retried_once_and_returns_the_second_output() {
+        let fixture = CodexFixture::transient_http_401_then_success();
+        let lease = fixture.lease();
+        let context = fixture.context(&lease);
+        fixture.journal.start_or_attach(&lease).unwrap();
+        fixture.supervisor.prepare(&lease, &context).await.unwrap();
+        assert_eq!(
+            fixture.journal.commit_launch(&lease).unwrap(),
+            LaunchDecision::LaunchOnce
+        );
+        let spool = ExecutionSpool::for_lease(&fixture.journal, &lease).unwrap();
+
+        run_codex_runner_child(fixture.journal.root_path(), lease.executor_execution_id)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            spool.observe().unwrap(),
+            ProcessObservation::Succeeded(_)
+        ));
+        assert_eq!(fs::read_to_string(&fixture.invocations).unwrap(), "1\n1\n");
+        let execution_root = fixture
+            .journal
+            .root_path()
+            .join(lease.executor_execution_id.simple().to_string());
+        assert!(execution_root.join("output.bin").is_file());
+        assert!(execution_root.join("result.json").is_file());
+        assert!(
+            !execution_root
+                .join(CODEX_APP_SERVER_FAILURE_DIAGNOSTIC_FILE)
+                .exists()
+        );
     }
 
     #[tokio::test]
@@ -1607,6 +1693,7 @@ mod tests {
 
     fn app_server_fixture_script(exec_body: String) -> String {
         let image_tool_failure = usize::from(exec_body.contains("codex-test-image-tool-failure"));
+        let transient_http_401 = usize::from(exec_body.contains("codex-test-transient-http-401"));
         let force_malformed = usize::from(
             exec_body.contains("/usr/bin/head -c 70000")
                 || exec_body.contains("printf '{\"type\":\"thread.started\",\"thread_id\":'")
@@ -1640,6 +1727,10 @@ set +e
 legacy_status=$?
 set -e
 image_tool_failure={image_tool_failure}
+transient_http_401={transient_http_401}
+if [ "$transient_http_401" -eq 1 ] && [ -f "$CODEX_HOME/transient-http-401" ]; then
+  image_tool_failure=1
+fi
 malformed={force_malformed}
 while IFS= read -r event; do
   case "$event" in
@@ -1688,6 +1779,18 @@ while IFS= read -r ignored; do :; done
                 format!(
                     "#!/bin/sh\nset -eu\n/bin/cat >/dev/null\nprintf '1\\n' >> '{}'\n# codex-test-image-tool-failure\n",
                     invocations.display()
+                )
+            })
+        }
+
+        fn transient_http_401_then_success() -> Self {
+            Self::with_script(|invocations, image, _root| {
+                format!(
+                    "#!/bin/sh\nset -eu\n/bin/cat >/dev/null\n# codex-test-transient-http-401\nif [ ! -f '{}' ]; then\n  printf '1\\n' >> '{}'\n  printf 'HTTP 401 Unauthorized\\n' >&2\n  : > \"$CODEX_HOME/transient-http-401\"\nelse\n  printf '1\\n' >> '{}'\n  /bin/rm -f \"$CODEX_HOME/transient-http-401\"\n  thread_id='019fd9f5-badb-7dd3-8903-28ffded0ef54'\n  call_id='call_retry_image'\n  output_dir=\"$CODEX_HOME/generated_images/$thread_id\"\n  /bin/mkdir -p \"$output_dir\"\n  /bin/chmod 700 \"$CODEX_HOME/generated_images\" \"$output_dir\"\n  /bin/cp '{}' \"$output_dir/$call_id.png\"\n  /bin/chmod 600 \"$output_dir/$call_id.png\"\n  printf '{{\"type\":\"thread.started\",\"thread_id\":\"%s\"}}\\n' \"$thread_id\"\n  printf '{{\"type\":\"item.completed\",\"item\":{{\"type\":\"image_generation_call\",\"id\":\"%s\"}}}}\\n' \"$call_id\"\nfi\n",
+                    invocations.display(),
+                    invocations.display(),
+                    invocations.display(),
+                    image.display(),
                 )
             })
         }
