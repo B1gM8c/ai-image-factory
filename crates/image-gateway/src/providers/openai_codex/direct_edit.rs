@@ -1,7 +1,7 @@
 use std::{path::Path, time::Duration};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use futures_util::StreamExt;
+use futures_util::{StreamExt, future::join_all};
 use reqwest::{Client, StatusCode, redirect::Policy};
 use serde::{Deserialize, Serialize};
 
@@ -99,20 +99,48 @@ async fn edit_at(
     n: u32,
     timeout: Duration,
 ) -> Result<Vec<GeneratedImage>, ImageGatewayError> {
+    if n == 0 {
+        return Err(invalid_response());
+    }
     let auth = read_auth(auth_home)?;
-    let payload = edit_request(images, mask, prompt, n)?;
+    let payload = edit_request(images, mask, prompt, 1)?;
     let client = Client::builder()
         .redirect(Policy::none())
         .build()
         .map_err(|_| unavailable())?;
+    let requests = (0..n).map(|_| post_one(&client, endpoint, &auth, &payload, timeout));
+    let responses = join_all(requests).await;
+    let mut total = 0usize;
+    let mut outputs = Vec::with_capacity(n as usize);
+    for response in responses {
+        let mut response = response?;
+        let image = response.pop().ok_or_else(invalid_response)?;
+        total = total
+            .checked_add(image.bytes.len())
+            .ok_or_else(invalid_response)?;
+        if total > MAX_OUTPUT_BYTES {
+            return Err(invalid_response());
+        }
+        outputs.push(image);
+    }
+    Ok(outputs)
+}
+
+async fn post_one(
+    client: &Client,
+    endpoint: &str,
+    auth: &DirectAuth,
+    payload: &EditRequest<'_>,
+    timeout: Duration,
+) -> Result<Vec<GeneratedImage>, ImageGatewayError> {
     let mut request = client
         .post(endpoint)
-        .bearer_auth(auth.access_token)
+        .bearer_auth(&auth.access_token)
         .header("originator", CODEX_ORIGINATOR)
         .header(reqwest::header::USER_AGENT, CODEX_USER_AGENT)
         .timeout(timeout)
-        .json(&payload);
-    if let Some(account_id) = auth.account_id {
+        .json(payload);
+    if let Some(account_id) = &auth.account_id {
         request = request.header("ChatGPT-Account-ID", account_id);
     }
     let response = request.send().await.map_err(|_| unavailable())?;
@@ -121,7 +149,7 @@ async fn edit_at(
     if !status.is_success() {
         return Err(map_http_error(status, &body));
     }
-    decode_outputs(&body, n)
+    decode_outputs(&body, 1)
 }
 
 fn edit_request<'a>(
@@ -284,6 +312,8 @@ mod tests {
         authorized: bool,
         account_bound: bool,
         originator_bound: bool,
+        request_count: usize,
+        upstream_counts: Vec<u64>,
         body: Option<Value>,
     }
 
@@ -299,11 +329,11 @@ mod tests {
     }
 
     #[test]
-    fn direct_edit_payload_preserves_batch_cardinality() {
-        let request = edit_request(&[png()], None, "edit", 4).unwrap();
+    fn direct_edit_payload_uses_the_official_single_output_contract() {
+        let request = edit_request(&[png()], None, "edit", 1).unwrap();
         let value = serde_json::to_value(request).unwrap();
         assert_eq!(value["model"], "gpt-image-2");
-        assert_eq!(value["n"], 4);
+        assert_eq!(value["n"], 1);
         assert_eq!(value["size"], "auto");
         assert_eq!(value["quality"], "auto");
         assert_eq!(value["images"].as_array().map(Vec::len), Some(1));
@@ -336,7 +366,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn direct_edit_posts_one_authenticated_batch_without_exposing_auth() {
+    async fn direct_edit_fans_out_authenticated_single_output_requests_without_exposing_auth() {
         let observed = Arc::new(Mutex::new(ObservedRequest::default()));
         let app = Router::new()
             .route("/images/edits", post(capture_edit))
@@ -371,7 +401,9 @@ mod tests {
         assert!(observed.authorized);
         assert!(observed.account_bound);
         assert!(observed.originator_bound);
-        assert_eq!(observed.body.as_ref().unwrap()["n"], 4);
+        assert_eq!(observed.request_count, 7);
+        assert!(observed.upstream_counts.iter().all(|count| *count == 1));
+        assert_eq!(observed.body.as_ref().unwrap()["n"], 1);
         assert_eq!(observed.body.as_ref().unwrap()["model"], "gpt-image-2");
     }
 
@@ -393,7 +425,9 @@ mod tests {
             .get("originator")
             .and_then(|value| value.to_str().ok())
             == Some("codex_cli_rs");
+        observed.request_count += 1;
         let n = body["n"].as_u64().unwrap();
+        observed.upstream_counts.push(n);
         observed.body = Some(body);
         Json(serde_json::json!({
             "created": 1,
