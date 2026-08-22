@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
     process::Stdio,
     sync::Arc,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use async_trait::async_trait;
@@ -50,6 +50,7 @@ const MAX_VIDEO_ARTIFACT_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_INPUT_IMAGE_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_RUNNER_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 const CHILD_REAP_TIMEOUT: Duration = Duration::from_secs(5);
+const DIRECT_VIDEO_AUTH_SAFETY_MARGIN: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 pub struct GrokProcessSupervisor {
@@ -190,12 +191,13 @@ impl GrokProcessSupervisor {
         Ok(self)
     }
 
-    async fn credential_source(&self) -> Result<(PathBuf, String, i64), RunnerError> {
+    async fn credential_source(&self) -> Result<(PathBuf, String, i64, Option<i64>), RunnerError> {
         let Some((provider_account_id, resolver)) = &self.credential_resolver else {
             return Ok((
                 self.credential_auth_file.clone(),
                 self.credential_auth_sha256.clone(),
                 1,
+                None,
             ));
         };
         let credential = resolver
@@ -217,6 +219,7 @@ impl GrokProcessSupervisor {
             source,
             credential.material_fingerprint_sha256,
             credential.revision,
+            credential.access_expires_at_ms,
         ))
     }
 
@@ -441,12 +444,27 @@ impl SingleOutputSupervisor for GrokProcessSupervisor {
         lease: &ExecutorSubmissionLease,
         context: &ExecutorLaunchContext,
     ) -> Result<(), RunnerError> {
-        let (credential_auth_file, credential_auth_sha256, credential_revision) =
-            self.credential_source().await?;
         let projected =
             project_grok_execution_request(lease, context).map_err(|_| RunnerError::Definite {
                 error_code: "executor_command_rejected".to_owned(),
             })?;
+        let (
+            credential_auth_file,
+            credential_auth_sha256,
+            credential_revision,
+            access_expires_at_ms,
+        ) = self.credential_source().await?;
+        if matches!(&projected, GrokExecutionRequest::VideoGeneration(_))
+            && !credential_valid_for_video(
+                access_expires_at_ms,
+                unix_time_ms().ok_or(RunnerError::Unavailable)?,
+                self.request_timeout,
+            )
+        {
+            return Err(RunnerError::Definite {
+                error_code: "grok_credential_refresh_pending".to_owned(),
+            });
+        }
         let request = self.child_request(lease, context, &credential_auth_sha256)?;
         let bytes = serde_json::to_vec(&request).map_err(|_| RunnerError::Internal)?;
         let spool = ExecutionSpool::for_lease(&self.journal, lease).map_err(map_spool_error)?;
@@ -464,7 +482,7 @@ impl SingleOutputSupervisor for GrokProcessSupervisor {
                 .ok_or(RunnerError::Unavailable)?,
         )
         .map_err(|_| RunnerError::Unavailable)?;
-        if matches!(projected, GrokExecutionRequest::VideoGeneration(_))
+        if matches!(&projected, GrokExecutionRequest::VideoGeneration(_))
             && !has_managed_video_output
         {
             let configuration = self
@@ -533,6 +551,31 @@ impl SingleOutputSupervisor for GrokProcessSupervisor {
             tokio::time::sleep(self.poll_interval).await;
         }
     }
+}
+
+fn unix_time_ms() -> Option<i64> {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_millis();
+    i64::try_from(millis).ok()
+}
+
+fn credential_valid_for_video(
+    access_expires_at_ms: Option<i64>,
+    now_ms: i64,
+    request_timeout: Duration,
+) -> bool {
+    let Some(access_expires_at_ms) = access_expires_at_ms else {
+        return true;
+    };
+    let required_ms = request_timeout
+        .saturating_add(DIRECT_VIDEO_AUTH_SAFETY_MARGIN)
+        .as_millis();
+    let Ok(required_ms) = i64::try_from(required_ms) else {
+        return false;
+    };
+    access_expires_at_ms > now_ms.saturating_add(required_ms)
 }
 
 pub async fn run_grok_runner_child(
@@ -1192,6 +1235,25 @@ mod tests {
         executor::{ExecutorInputObject, XAI_IMAGES_API_PROFILE, XAI_VIDEOS_API_PROFILE},
         input_blobs::{InputBlobKey, InputBlobStore},
     };
+
+    #[test]
+    fn video_credential_must_cover_the_full_execution_window() {
+        let now_ms = 1_000_000;
+        let timeout = Duration::from_secs(15 * 60);
+        let required_ms = 15 * 60 * 1_000 + 30 * 1_000;
+
+        assert!(credential_valid_for_video(None, now_ms, timeout));
+        assert!(!credential_valid_for_video(
+            Some(now_ms + required_ms),
+            now_ms,
+            timeout
+        ));
+        assert!(credential_valid_for_video(
+            Some(now_ms + required_ms + 1),
+            now_ms,
+            timeout
+        ));
+    }
 
     #[test]
     fn receipt_errors_keep_a_stable_diagnostic_category() {

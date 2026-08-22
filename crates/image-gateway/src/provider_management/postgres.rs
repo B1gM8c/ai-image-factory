@@ -73,7 +73,8 @@ const MAX_ACCOUNT_KEY_BYTES: usize = 64;
 const MAX_DISPLAY_NAME_CHARS: usize = 128;
 const MAX_AUTH_BYTES: usize = 1024 * 1024;
 const CREDENTIAL_REFRESH_INTERVAL_MS: i64 = 6 * 60 * 60 * 1_000;
-const CREDENTIAL_REFRESH_SKEW_MS: i64 = 15 * 60 * 1_000;
+const DEFAULT_CREDENTIAL_REFRESH_SKEW_MS: i64 = 15 * 60 * 1_000;
+const GROK_CREDENTIAL_REFRESH_SKEW_MS: i64 = 30 * 60 * 1_000;
 static CODEX_QUOTA_REFRESHES: LazyLock<Mutex<HashSet<Uuid>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
 static GROK_QUOTA_REFRESHES: LazyLock<Mutex<HashSet<Uuid>>> =
@@ -616,11 +617,18 @@ impl PostgresProviderManagementService {
             SELECT head.provider_account_id
             FROM provider_account_credential_heads head
             JOIN provider_accounts account USING (provider_account_id)
+            JOIN provider_account_credential_revisions revision
+              ON revision.provider_account_id = head.provider_account_id
+             AND revision.revision = head.active_revision
             WHERE head.refresh_strategy IN ('broker_managed', 'cli_managed')
               AND head.lifecycle_state IN ('active', 'refresh_due', 'refreshing')
               AND account.state = 'enabled'
               AND (head.next_refresh_at_ms IS NULL OR head.next_refresh_at_ms <=
                    floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT
+                   OR (account.provider_id = $1
+                       AND revision.access_expires_at_ms IS NOT NULL
+                       AND revision.access_expires_at_ms - $2 <=
+                           floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT)
                    OR (head.lifecycle_state = 'refreshing'
                        AND head.lease_expires_at_ms <=
                            floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT))
@@ -628,6 +636,8 @@ impl PostgresProviderManagementService {
             LIMIT 32
             "#,
         )
+        .bind(GROK_PROVIDER_ID)
+        .bind(GROK_CREDENTIAL_REFRESH_SKEW_MS)
         .fetch_all(&self.pool)
         .await
         .map_err(store_unavailable)?;
@@ -994,7 +1004,8 @@ impl PostgresProviderManagementService {
                 .map_err(store_unavailable)?;
                 next_revision
             };
-            let refresh_at = credential_refresh_deadline(access_expires_at_ms, now);
+            let refresh_at =
+                credential_refresh_deadline(&target.provider_id, access_expires_at_ms, now);
             sqlx::query(
                 r#"
                 UPDATE provider_account_credential_heads
@@ -5239,13 +5250,18 @@ fn atomic_write_auth(
     Ok(())
 }
 
-fn credential_refresh_deadline(access_expires_at_ms: Option<i64>, now_ms: i64) -> i64 {
+fn credential_refresh_deadline(
+    provider_id: &str,
+    access_expires_at_ms: Option<i64>,
+    now_ms: i64,
+) -> i64 {
+    let refresh_skew_ms = if provider_id == GROK_PROVIDER_ID {
+        GROK_CREDENTIAL_REFRESH_SKEW_MS
+    } else {
+        DEFAULT_CREDENTIAL_REFRESH_SKEW_MS
+    };
     access_expires_at_ms
-        .map(|expires| {
-            expires
-                .saturating_sub(CREDENTIAL_REFRESH_SKEW_MS)
-                .max(now_ms)
-        })
+        .map(|expires| expires.saturating_sub(refresh_skew_ms).max(now_ms))
         .unwrap_or_else(|| now_ms.saturating_add(CREDENTIAL_REFRESH_INTERVAL_MS))
 }
 
@@ -5437,6 +5453,21 @@ fn map_route_insert(error: sqlx::Error) -> ImageGatewayError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn managed_login_refreshes_before_the_video_credential_cutoff() {
+        let now_ms = 1_000_000;
+        let expires_at_ms = now_ms + 6 * 60 * 60 * 1_000;
+
+        assert_eq!(
+            credential_refresh_deadline(GROK_PROVIDER_ID, Some(expires_at_ms), now_ms),
+            expires_at_ms - 30 * 60 * 1_000
+        );
+        assert_eq!(
+            credential_refresh_deadline("openai-codex", Some(expires_at_ms), now_ms),
+            expires_at_ms - 15 * 60 * 1_000
+        );
+    }
 
     #[test]
     fn account_key_validation_rejects_path_material() {

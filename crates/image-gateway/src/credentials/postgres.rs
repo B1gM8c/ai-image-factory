@@ -1,6 +1,7 @@
 use std::{path::PathBuf, sync::Arc};
 
 use async_trait::async_trait;
+use image_provider_grok_cli::PROVIDER_ID as GROK_PROVIDER_ID;
 use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
@@ -8,7 +9,13 @@ use super::{CredentialResolveError, OperationalCredential, OperationalCredential
 
 const DEFAULT_REFRESH_INTERVAL_MS: i64 = 6 * 60 * 60 * 1_000;
 const MAX_BACKOFF_MS: i64 = 60 * 60 * 1_000;
-const REFRESH_SKEW_MS: i64 = 15 * 60 * 1_000;
+const DEFAULT_REFRESH_SKEW_MS: i64 = 15 * 60 * 1_000;
+// Grok video executions require a credential that remains valid for the full
+// 15-minute execution window plus a safety margin. The pinned Grok CLI is
+// configured to refresh 30 minutes before expiry, so the broker must schedule
+// Grok refreshes in the same window instead of waiting until the credential is
+// no longer eligible for a video execution.
+const GROK_REFRESH_SKEW_MS: i64 = 30 * 60 * 1_000;
 
 #[derive(Clone)]
 pub struct PostgresCredentialStore {
@@ -99,6 +106,9 @@ impl PostgresCredentialStore {
                   AND head.lifecycle_state <> 'reauth_required'
                   AND ($4 OR head.next_refresh_at_ms IS NULL
                        OR head.next_refresh_at_ms <= db_clock.now_ms
+                       OR (account.provider_id = $5
+                           AND revision.access_expires_at_ms IS NOT NULL
+                           AND revision.access_expires_at_ms - $6 <= db_clock.now_ms)
                        OR head.lifecycle_state = 'refreshing')
                   AND (head.lease_owner IS NULL
                        OR head.lease_expires_at_ms <= db_clock.now_ms)
@@ -125,6 +135,8 @@ impl PostgresCredentialStore {
         .bind(owner)
         .bind(lease_ms)
         .bind(force)
+        .bind(GROK_PROVIDER_ID)
+        .bind(GROK_REFRESH_SKEW_MS)
         .fetch_optional(&mut *tx)
         .await
         .map_err(|_| CredentialResolveError::Unavailable)?;
@@ -196,7 +208,7 @@ impl PostgresCredentialStore {
             .map_err(unavailable)?;
             next
         };
-        let refresh_at = refresh_deadline(access_expires_at_ms, now_ms);
+        let refresh_at = refresh_deadline(&lease.provider_id, access_expires_at_ms, now_ms);
         sqlx::query(
             r#"
             UPDATE provider_account_credential_heads
@@ -491,9 +503,14 @@ fn refresh_row(row: RefreshRow) -> Result<CredentialRefreshLease, CredentialReso
     })
 }
 
-fn refresh_deadline(expires_at_ms: Option<i64>, now_ms: i64) -> i64 {
+fn refresh_deadline(provider_id: &str, expires_at_ms: Option<i64>, now_ms: i64) -> i64 {
+    let refresh_skew_ms = if provider_id == GROK_PROVIDER_ID {
+        GROK_REFRESH_SKEW_MS
+    } else {
+        DEFAULT_REFRESH_SKEW_MS
+    };
     expires_at_ms
-        .map(|expires| expires.saturating_sub(REFRESH_SKEW_MS).max(now_ms))
+        .map(|expires| expires.saturating_sub(refresh_skew_ms).max(now_ms))
         .unwrap_or_else(|| now_ms.saturating_add(DEFAULT_REFRESH_INTERVAL_MS))
 }
 
@@ -515,4 +532,24 @@ fn valid_error_code(value: &str) -> bool {
 fn unavailable(error: sqlx::Error) -> CredentialResolveError {
     tracing::warn!(error = ?error, "provider credential database operation failed");
     CredentialResolveError::Unavailable
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn schedules_refresh_before_the_video_credential_cutoff() {
+        let now_ms = 1_000_000;
+        let expires_at_ms = now_ms + 6 * 60 * 60 * 1_000;
+
+        assert_eq!(
+            refresh_deadline(GROK_PROVIDER_ID, Some(expires_at_ms), now_ms),
+            expires_at_ms - 30 * 60 * 1_000
+        );
+        assert_eq!(
+            refresh_deadline("openai-codex", Some(expires_at_ms), now_ms),
+            expires_at_ms - 15 * 60 * 1_000
+        );
+    }
 }

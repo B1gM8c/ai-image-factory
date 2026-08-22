@@ -794,7 +794,12 @@ fn console_video_error_code(error_code: Option<&str>) -> &'static str {
         Some("grok_video_content_policy_rejected") => "content_policy_rejected",
         Some("failed_precondition") => "failed_precondition",
         Some("grok_video_output_upload_url_required") => "grok_video_output_upload_url_required",
-        Some("service_unavailable" | "timeout" | "grok_cli_failed") => "service_unavailable",
+        Some(
+            "service_unavailable"
+            | "timeout"
+            | "grok_cli_failed"
+            | "grok_credential_refresh_pending",
+        ) => "service_unavailable",
         _ => "internal_error",
     }
 }
@@ -821,6 +826,14 @@ fn console_video_error_message(error_code: Option<&str>) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn credential_refresh_pending_is_retryable_at_the_console_boundary() {
+        assert_eq!(
+            console_video_error_code(Some("grok_credential_refresh_pending")),
+            "service_unavailable"
+        );
+    }
 
     #[test]
     fn console_video_request_projects_only_supported_grok_controls() {

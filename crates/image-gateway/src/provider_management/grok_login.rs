@@ -10,6 +10,10 @@ use super::CodexLoginMethod;
 
 const MAX_LOGIN_OUTPUT_BYTES: usize = 64 * 1024;
 const CHALLENGE_TIMEOUT: Duration = Duration::from_secs(30);
+// The longest Factory video execution is 15 minutes. Refresh far enough ahead
+// that a newly prepared execution never enters the CLI's default five-minute
+// refresh window with an ineligible credential.
+const GROK_AUTH_EARLY_INVALIDATION_SECS: &str = "1800";
 
 pub(super) struct GrokLoginChallenge {
     pub authorization_url: String,
@@ -221,6 +225,10 @@ pub(super) async fn refresh_grok_auth(executable: &Path, home: &Path) -> std::io
         .env("HOME", home)
         .env("GROK_HOME", home)
         .env("GROK_DISABLE_AUTOUPDATER", "1")
+        .env(
+            "GROK_AUTH_EARLY_INVALIDATION_SECS",
+            GROK_AUTH_EARLY_INVALIDATION_SECS,
+        )
         .env("TERM", "dumb")
         .env("PATH", "/usr/local/bin:/usr/bin:/bin")
         .current_dir(home)
@@ -332,5 +340,27 @@ mod tests {
         );
         assert_eq!(challenge.user_code.as_deref(), Some("ABCD-1234"));
         assert!(process.wait().await.expect("wait for fake Grok CLI"));
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn refreshes_before_factory_video_credentials_become_ineligible() {
+        let root = tempfile::tempdir().expect("temporary root");
+        let executable = root.path().join("grok");
+        fs::write(
+            &executable,
+            concat!(
+                "#!/bin/sh\n",
+                "test \"$GROK_AUTH_EARLY_INVALIDATION_SECS\" = 1800\n",
+                "test \"$HOME\" = \"$GROK_HOME\"\n",
+            ),
+        )
+        .expect("write fake Grok CLI");
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700))
+            .expect("make fake Grok CLI executable");
+
+        refresh_grok_auth(&executable, root.path())
+            .await
+            .expect("refresh with the Factory lead time");
     }
 }

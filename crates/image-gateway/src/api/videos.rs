@@ -477,7 +477,12 @@ fn map_terminal_error(error_code: Option<&str>) -> image_api_contracts::xai::Xai
         Some("permission_denied" | "authentication_failed") => "permission_denied",
         Some("invalid_argument" | "executor_command_rejected") => "invalid_argument",
         Some("failed_precondition") => "failed_precondition",
-        Some("service_unavailable" | "timeout" | "grok_cli_failed") => "service_unavailable",
+        Some(
+            "service_unavailable"
+            | "timeout"
+            | "grok_cli_failed"
+            | "grok_credential_refresh_pending",
+        ) => "service_unavailable",
         _ => "internal_error",
     };
     image_api_contracts::xai::XaiVideoError {
@@ -722,6 +727,12 @@ mod tests {
         assert!(response.model.is_none());
         assert!(response.video.is_none());
         assert_eq!(response.error.unwrap().code, "service_unavailable");
+    }
+
+    #[test]
+    fn credential_refresh_pending_is_retryable_at_the_xai_boundary() {
+        let error = map_terminal_error(Some("grok_credential_refresh_pending"));
+        assert_eq!(error.code, "service_unavailable");
     }
 
     #[test]
