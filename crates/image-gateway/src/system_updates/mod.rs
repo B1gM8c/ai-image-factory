@@ -594,13 +594,21 @@ fn verified_update_available(
     current_version: &str,
     current_commit_sha: Option<&str>,
 ) -> bool {
-    if !latest_verified || latest_version.is_none_or(|version| version == current_version) {
+    let Some(latest_version) = latest_version else {
+        return false;
+    };
+    if !latest_verified || !release_version_is_newer(latest_version, current_version) {
         return false;
     }
     !matches!(
         (latest_commit_sha, current_commit_sha),
         (Some(latest), Some(current)) if latest.eq_ignore_ascii_case(current)
     )
+}
+
+fn release_version_is_newer(candidate: &str, current: &str) -> bool {
+    let parse = |value: &str| semver::Version::parse(value.strip_prefix('v').unwrap_or(value));
+    matches!((parse(candidate), parse(current)), (Ok(candidate), Ok(current)) if candidate > current)
 }
 
 async fn command_by_idempotency(
@@ -885,30 +893,58 @@ mod tests {
 
         assert!(!verified_update_available(
             false,
-            Some("v2"),
+            Some("v2.0.0"),
             Some(latest),
-            "v1",
+            "v1.0.0",
             Some(current),
         ));
         assert!(!verified_update_available(
             true,
-            Some("v1"),
+            Some("v1.0.0"),
             Some(latest),
-            "v1",
+            "v1.0.0",
             Some(current),
         ));
         assert!(!verified_update_available(
             true,
-            Some("v2"),
+            Some("v2.0.0"),
             Some(current),
-            "v1",
+            "v1.0.0",
             Some(current),
         ));
         assert!(verified_update_available(
             true,
-            Some("v2"),
+            Some("v2.0.0"),
             Some(latest),
-            "v1",
+            "v1.0.0",
+            Some(current),
+        ));
+    }
+
+    #[test]
+    fn update_requires_a_newer_semantic_release() {
+        let current = "0123456789abcdef0123456789abcdef01234567";
+        let latest = "89abcdef0123456789abcdef0123456789abcdef";
+
+        assert!(verified_update_available(
+            true,
+            Some("v0.1.0-20260823.abcdef0"),
+            Some(latest),
+            "v0.1.0-20260822.fae9648",
+            Some(current),
+        ));
+        assert!(!verified_update_available(
+            true,
+            Some("v0.1.0-20260817.f35c5d0"),
+            Some(latest),
+            "v0.1.0-20260822.fae9648",
+            Some(current),
+        ));
+        assert!(!verified_update_available(
+            true,
+            Some("rolling"),
+            Some(latest),
+            "v0.1.0-20260822.fae9648",
             Some(current),
         ));
     }
