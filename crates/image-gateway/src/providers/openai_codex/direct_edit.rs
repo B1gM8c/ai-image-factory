@@ -114,7 +114,7 @@ fn validate_test_endpoint(endpoint: &str) -> Result<(), ImageGatewayError> {
     Ok(())
 }
 
-async fn edit_at(
+pub(super) async fn edit_at(
     endpoint: &str,
     auth_home: &Path,
     images: &[InputImage],

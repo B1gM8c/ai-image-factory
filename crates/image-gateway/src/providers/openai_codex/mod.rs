@@ -81,33 +81,15 @@ impl ImageGenerator for OpenAiCodexImageProvider {
         let source_codex_home = resolved_codex_home(&self.config).ok_or_else(|| {
             ImageGatewayError::service_unavailable("Codex credentials are unavailable")
         })?;
-        refresh_codex_auth_for_edit(&source_codex_home).await?;
-        let request_root = tempfile::Builder::new()
-            .prefix("gpt-image-2-direct-edit-")
-            .tempdir()
-            .map_err(ImageGatewayError::from)?;
-        let request_codex_home = request_root.path().join("codex-home");
-        std::fs::create_dir(&request_codex_home).map_err(ImageGatewayError::from)?;
-        std::fs::set_permissions(&request_codex_home, std::fs::Permissions::from_mode(0o700))
-            .map_err(ImageGatewayError::from)?;
-        let auth_sha256 =
-            crate::executor::codex_auth_file_sha256(&source_codex_home).map_err(|_| {
-                ImageGatewayError::service_unavailable("Codex credentials are unavailable")
-            })?;
-        crate::executor::prepare_codex_auth_copy(
-            &request_codex_home,
-            &source_codex_home,
-            &auth_sha256,
-        )
-        .map_err(|_| ImageGatewayError::service_unavailable("Codex credentials are unavailable"))?;
+        let executable = resolved_codex_edit_executable()?;
         let prompt = build_edit_prompt(&job.prompt, job.images.len(), job.mask.is_some());
-        direct_edit::edit(
-            &request_codex_home,
-            &job.images,
-            job.mask.as_ref(),
+        edit_outputs_with_executable(
+            &source_codex_home,
+            &executable,
+            &job,
             &prompt,
-            job.n,
             self.config.request_timeout,
+            None,
         )
         .instrument(info_span!(
             "generator.codex.direct_edit",
@@ -119,16 +101,85 @@ impl ImageGenerator for OpenAiCodexImageProvider {
     }
 }
 
-async fn refresh_codex_auth_for_edit(codex_home: &Path) -> Result<(), ImageGatewayError> {
+fn resolved_codex_edit_executable() -> Result<PathBuf, ImageGatewayError> {
     let configured_executable = env::var_os("GATEWAY_MANAGED_CODEX_EXECUTABLE")
         .or_else(|| env::var_os("EXECUTOR_CODEX_EXECUTABLE"))
         .unwrap_or_else(|| "codex".into());
-    let executable =
-        crate::provider_management::resolve_codex_executable(PathBuf::from(configured_executable))
-            .map_err(|_| {
+    crate::provider_management::resolve_codex_executable(PathBuf::from(configured_executable))
+        .map_err(|_| ImageGatewayError::service_unavailable("Codex credentials are unavailable"))
+}
+
+async fn edit_outputs_with_executable(
+    source_codex_home: &Path,
+    executable: &Path,
+    job: &EditJob,
+    prompt: &str,
+    timeout: std::time::Duration,
+    endpoint: Option<&str>,
+) -> Result<Vec<GeneratedImage>, ImageGatewayError> {
+    if job.n == 0 {
+        return Err(ImageGatewayError::backend(
+            "Codex image edit output count is invalid",
+        ));
+    }
+    let mut images = Vec::with_capacity(job.n as usize);
+    let mut total_bytes = 0_u64;
+    for output_index in 1..=job.n {
+        refresh_codex_auth_for_edit_with_executable(source_codex_home, executable).await?;
+        let request_root = tempfile::Builder::new()
+            .prefix("gpt-image-2-direct-edit-")
+            .tempdir()
+            .map_err(ImageGatewayError::from)?;
+        let request_codex_home = request_root.path().join("codex-home");
+        std::fs::create_dir(&request_codex_home).map_err(ImageGatewayError::from)?;
+        std::fs::set_permissions(&request_codex_home, std::fs::Permissions::from_mode(0o700))
+            .map_err(ImageGatewayError::from)?;
+        let auth_sha256 =
+            crate::executor::codex_auth_file_sha256(source_codex_home).map_err(|_| {
                 ImageGatewayError::service_unavailable("Codex credentials are unavailable")
             })?;
-    refresh_codex_auth_for_edit_with_executable(codex_home, &executable).await
+        crate::executor::prepare_codex_auth_copy(
+            &request_codex_home,
+            source_codex_home,
+            &auth_sha256,
+        )
+        .map_err(|_| ImageGatewayError::service_unavailable("Codex credentials are unavailable"))?;
+        let mut output = match endpoint {
+            Some(endpoint) => {
+                direct_edit::edit_at(
+                    endpoint,
+                    &request_codex_home,
+                    &job.images,
+                    job.mask.as_ref(),
+                    prompt,
+                    1,
+                    timeout,
+                )
+                .await?
+            }
+            None => {
+                direct_edit::edit(
+                    &request_codex_home,
+                    &job.images,
+                    job.mask.as_ref(),
+                    prompt,
+                    1,
+                    timeout,
+                )
+                .await?
+            }
+        };
+        let image = output
+            .pop()
+            .ok_or_else(|| ImageGatewayError::backend("Codex image edit response is invalid"))?;
+        push_bounded_output(&mut images, image, &mut total_bytes)?;
+        tracing::info!(
+            image.index = output_index,
+            image.units = job.n,
+            "Codex image edit output completed after an authenticated refresh"
+        );
+    }
+    Ok(images)
 }
 
 async fn refresh_codex_auth_for_edit_with_executable(
@@ -451,6 +502,8 @@ fn validate_mask_for_first_image(
 mod tests {
     use super::*;
     use crate::ProxyConfig;
+    use axum::{Json, Router, extract::State, http::HeaderMap, routing::post};
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
     use image::ImageFormat;
     use image_cli_runtime::VerifiedExecutable;
     use std::io::Cursor;
@@ -786,6 +839,125 @@ while IFS= read -r ignored; do :; done
         assert_eq!(
             std::fs::read_to_string(auth).unwrap(),
             r#"{"tokens":{"access_token":"after-test"}}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn multi_output_direct_edit_refreshes_before_every_output() {
+        #[derive(Clone)]
+        struct StateFixture {
+            output: String,
+            authorizations: Arc<tokio::sync::Mutex<Vec<String>>>,
+        }
+
+        async fn edit(
+            State(state): State<StateFixture>,
+            headers: HeaderMap,
+            Json(body): Json<serde_json::Value>,
+        ) -> Json<serde_json::Value> {
+            assert_eq!(body["n"], 1);
+            state.authorizations.lock().await.push(
+                headers
+                    .get(reqwest::header::AUTHORIZATION)
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or_default()
+                    .to_string(),
+            );
+            Json(serde_json::json!({"data": [{"b64_json": state.output}]}))
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let credential_home = temp.path().join("credentials");
+        std::fs::create_dir(&credential_home).unwrap();
+        std::fs::set_permissions(&credential_home, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let auth = credential_home.join("auth.json");
+        std::fs::write(
+            &auth,
+            br#"{"tokens":{"access_token":"before-test","account_id":"account-test"}}"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&auth, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let executable = temp.path().join("codex-refresh-each-output");
+        std::fs::write(
+            &executable,
+            r#"#!/bin/sh
+set -eu
+IFS= read -r initialize
+printf '{"id":1,"result":{"codexHome":"%s"}}\n' "$CODEX_HOME"
+IFS= read -r initialized
+IFS= read -r account_read
+printf '%s' "$account_read" | /usr/bin/grep -F '"refreshToken":true' >/dev/null
+count=1
+if [ -f "$CODEX_HOME/refresh-count" ]; then
+    count=$(( $(/usr/bin/wc -l < "$CODEX_HOME/refresh-count") + 1 ))
+fi
+printf 'refresh\n' >> "$CODEX_HOME/refresh-count"
+printf '{"tokens":{"access_token":"access-test-%s","account_id":"account-test"}}' "$count" > "$CODEX_HOME/auth.json.next"
+/bin/chmod 600 "$CODEX_HOME/auth.json.next"
+/bin/mv "$CODEX_HOME/auth.json.next" "$CODEX_HOME/auth.json"
+printf '{"id":3,"result":{"account":{"email":"test@example.invalid","planType":"test"}}}\n'
+while IFS= read -r ignored; do :; done
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let authorizations = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let app = Router::new()
+            .route("/images/edits", post(edit))
+            .with_state(StateFixture {
+                output: STANDARD.encode(valid_png_with_dimensions(2, 1)),
+                authorizations: Arc::clone(&authorizations),
+            });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/images/edits", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let job = EditJob {
+            request_id: "req-refresh-each-output".to_string(),
+            model: "gpt-image-2".to_string(),
+            prompt: "edit".to_string(),
+            moderation: "auto".to_string(),
+            images: vec![InputImage {
+                filename: Some("input.png".to_string()),
+                content_type: Some("image/png".to_string()),
+                bytes: valid_png_with_dimensions(1, 1),
+            }],
+            mask: None,
+            n: 4,
+            size: "auto".to_string(),
+            quality: "auto".to_string(),
+            output_format: "png".to_string(),
+            output_compression: None,
+            background: "auto".to_string(),
+            stream: false,
+            partial_images: 0,
+        };
+
+        let outputs = edit_outputs_with_executable(
+            &credential_home,
+            &executable,
+            &job,
+            "edit",
+            Duration::from_secs(5),
+            Some(&endpoint),
+        )
+        .await
+        .unwrap();
+        server.abort();
+
+        assert_eq!(outputs.len(), 4);
+        assert_eq!(
+            std::fs::read_to_string(credential_home.join("refresh-count"))
+                .unwrap()
+                .lines()
+                .count(),
+            4
+        );
+        assert_eq!(
+            *authorizations.lock().await,
+            (1..=4)
+                .map(|index| format!("Bearer access-test-{index}"))
+                .collect::<Vec<_>>()
         );
     }
 
