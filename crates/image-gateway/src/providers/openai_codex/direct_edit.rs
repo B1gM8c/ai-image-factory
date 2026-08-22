@@ -277,7 +277,7 @@ fn map_http_error(status: StatusCode, body: &[u8]) -> ImageGatewayError {
         .to_ascii_lowercase();
     if matches!(
         code.as_str(),
-        "content_policy" | "content_policy_violation" | "safety"
+        "content_policy" | "content_policy_violation" | "moderation_blocked" | "safety"
     ) {
         return ImageGatewayError::content_policy_rejected();
     }
@@ -387,6 +387,11 @@ mod tests {
             br#"{"error":{"code":"content_policy"}}"#,
         );
         assert_eq!(policy.error_code(), Some("content_policy_rejected"));
+        let moderation = map_http_error(
+            StatusCode::BAD_REQUEST,
+            br#"{"error":{"code":"moderation_blocked"}}"#,
+        );
+        assert_eq!(moderation.error_code(), Some("content_policy_rejected"));
         let generic = map_http_error(
             StatusCode::BAD_REQUEST,
             br#"{"error":{"message":"content policy"}}"#,
