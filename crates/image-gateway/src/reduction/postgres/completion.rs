@@ -130,6 +130,7 @@ struct OutputAggregate {
     failed_billable_units: i64,
     uncertain_count: i64,
     active_count: i64,
+    partial_success_allowed: bool,
     first_error_code: Option<String>,
 }
 
@@ -1453,6 +1454,13 @@ async fn aggregate_parent(
                COUNT(*) FILTER (WHERE output.state = 'uncertain')::BIGINT AS uncertain_count,
                COUNT(*) FILTER (WHERE output.state IN ('pending', 'running'))::BIGINT
                    AS active_count,
+               COALESCE((
+                   SELECT payload.command_schema IN (
+                       'openai.images.generation.v1', 'openai.images.edit.v1'
+                   )
+                   FROM job_payloads payload
+                   WHERE payload.job_id = job.job_id
+               ), FALSE) AS partial_success_allowed,
                (array_agg(output.error_code ORDER BY output.output_index)
                     FILTER (WHERE output.error_code IS NOT NULL))[1] AS first_error_code
         FROM jobs job
@@ -1481,15 +1489,13 @@ async fn aggregate_parent(
         }
         return Ok(ExecutorParentTerminalState::Pending);
     }
-    let parent_state = if aggregate.uncertain_count > 0 {
-        ExecutorParentTerminalState::Uncertain
-    } else if aggregate.succeeded_count > 0 {
-        ExecutorParentTerminalState::Succeeded
-    } else if aggregate.failed_count == aggregate.output_count {
-        ExecutorParentTerminalState::Failed
-    } else {
-        return Err(ExecutorTerminalError::Conflict);
-    };
+    let parent_state = terminal_parent_state(
+        aggregate.succeeded_count,
+        aggregate.failed_count,
+        aggregate.uncertain_count,
+        aggregate.output_count,
+        aggregate.partial_success_allowed,
+    )?;
     let expected_quota_state = match parent_state {
         ExecutorParentTerminalState::Uncertain => "reserved",
         ExecutorParentTerminalState::Succeeded | ExecutorParentTerminalState::Failed
@@ -1506,6 +1512,25 @@ async fn aggregate_parent(
     }
     terminalize_parent(tx, lease, quota, &aggregate, parent_state, now).await?;
     Ok(parent_state)
+}
+
+fn terminal_parent_state(
+    succeeded_count: i64,
+    failed_count: i64,
+    uncertain_count: i64,
+    output_count: i64,
+    partial_success_allowed: bool,
+) -> Result<ExecutorParentTerminalState, ExecutorTerminalError> {
+    let state = if uncertain_count > 0 {
+        ExecutorParentTerminalState::Uncertain
+    } else if succeeded_count == output_count || (partial_success_allowed && succeeded_count > 0) {
+        ExecutorParentTerminalState::Succeeded
+    } else if failed_count > 0 {
+        ExecutorParentTerminalState::Failed
+    } else {
+        return Err(ExecutorTerminalError::Conflict);
+    };
+    Ok(state)
 }
 
 async fn terminalize_parent(
@@ -2209,6 +2234,26 @@ mod tests {
                 },
             )
             .is_ok()
+        );
+    }
+
+    #[test]
+    fn partial_parent_success_is_scoped_and_fail_closed() {
+        assert_eq!(
+            terminal_parent_state(3, 1, 0, 4, true),
+            Ok(ExecutorParentTerminalState::Succeeded)
+        );
+        assert_eq!(
+            terminal_parent_state(3, 1, 0, 4, false),
+            Ok(ExecutorParentTerminalState::Failed)
+        );
+        assert_eq!(
+            terminal_parent_state(0, 4, 0, 4, true),
+            Ok(ExecutorParentTerminalState::Failed)
+        );
+        assert_eq!(
+            terminal_parent_state(3, 0, 1, 4, true),
+            Ok(ExecutorParentTerminalState::Uncertain)
         );
     }
 
