@@ -13,6 +13,7 @@ mod model_catalog;
 mod postgres;
 mod route_reconciliation;
 
+pub(crate) use codex_app_server::{CodexAppServer, resolve_executable as resolve_codex_executable};
 pub use model_catalog::{
     ProviderAccountModelView, ProviderAccountModelsView, ProviderModelRefreshView,
     ProviderModelView, ProviderModelsSnapshot,
