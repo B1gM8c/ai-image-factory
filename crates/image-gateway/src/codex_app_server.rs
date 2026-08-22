@@ -293,7 +293,10 @@ impl ProtocolState {
                     .ok_or(CodexAppServerError::Protocol)?;
                 self.observe_bound_identity(params)?;
                 if item_type != "imageGeneration" {
-                    return if matches!(item_type, "userMessage" | "reasoning" | "agentMessage") {
+                    return if matches!(
+                        item_type,
+                        "userMessage" | "reasoning" | "agentMessage" | "plan"
+                    ) {
                         Ok(false)
                     } else {
                         Err(CodexAppServerError::Protocol)
@@ -1749,7 +1752,7 @@ mod tests {
     }
 
     #[test]
-    fn non_image_tool_items_fail_closed() {
+    fn informational_items_are_allowed_but_non_image_tools_fail_closed() {
         let home = Path::new("/private/codex-home");
         let thread_id = Uuid::parse_str("019fd666-0416-7da2-bcc3-7f2f51efd3c8").unwrap();
         let turn_id = "019fd666-0416-7da2-bcc3-7f2f51efd3c9".to_string();
@@ -1772,6 +1775,7 @@ mod tests {
                 .observe_notification(&item("reasoning"), home)
                 .unwrap()
         );
+        assert!(!state.observe_notification(&item("plan"), home).unwrap());
         assert_eq!(
             state.observe_notification(&item("commandExecution"), home),
             Err(CodexAppServerError::Protocol)
