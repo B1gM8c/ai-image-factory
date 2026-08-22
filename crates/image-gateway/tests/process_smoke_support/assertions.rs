@@ -113,6 +113,13 @@ fn codex_output_evidence(
         .collect::<Result<Vec<_>, _>>()?;
     let thread_start = rpc_request(&messages, "thread/start")?;
     let turn_start = rpc_request(&messages, "turn/start")?;
+    require(
+        thread_start
+            .pointer("/params/model")
+            .and_then(Value::as_str)
+            == Some("gpt-5.4"),
+        "Codex thread/start did not pin the direct-tool image orchestrator model",
+    )?;
     let request_dir = thread_start
         .pointer("/params/cwd")
         .and_then(Value::as_str)

@@ -26,6 +26,7 @@ const MAX_STDERR_DIGEST_BYTES: usize = 64 * 1024;
 const REAP_TIMEOUT: Duration = Duration::from_secs(5);
 
 const IMAGE_GENERATION_DEVELOPER_INSTRUCTIONS: &str = "For this thread, image requests MUST invoke the enabled namespaced tool image_gen.imagegen (wire name image_gen__imagegen) exactly once. Never answer an image request with text only. Do not use shell or local programs to create, copy, move, rename, edit, or delete the generated artifact. After the image tool completes, stop.";
+const IMAGE_GENERATION_ORCHESTRATOR_MODEL: &str = "gpt-5.4";
 const IMAGE_GENERATION_DIRECT_TOOL_CONFIG: &str =
     "features.code_mode.direct_only_tool_namespaces=[\"image_gen\"]";
 
@@ -607,6 +608,7 @@ where
                     "approvalPolicy": "never",
                     "sandbox": "workspace-write",
                     "ephemeral": true,
+                    "model": IMAGE_GENERATION_ORCHESTRATOR_MODEL,
                     "developerInstructions": IMAGE_GENERATION_DEVELOPER_INSTRUCTIONS
                 }
             }),
