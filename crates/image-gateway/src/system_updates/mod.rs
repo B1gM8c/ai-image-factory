@@ -221,18 +221,24 @@ impl PostgresSystemUpdateService {
             SET latest_version = CASE
                     WHEN platform_release_state.repository IS NOT DISTINCT FROM EXCLUDED.repository
                      AND platform_release_state.target_triple = EXCLUDED.target_triple
+                     AND platform_release_state.current_version = EXCLUDED.current_version
+                     AND platform_release_state.current_commit_sha IS NOT DISTINCT FROM EXCLUDED.current_commit_sha
                     THEN platform_release_state.latest_version
                     ELSE NULL
                 END,
                 latest_commit_sha = CASE
                     WHEN platform_release_state.repository IS NOT DISTINCT FROM EXCLUDED.repository
                      AND platform_release_state.target_triple = EXCLUDED.target_triple
+                     AND platform_release_state.current_version = EXCLUDED.current_version
+                     AND platform_release_state.current_commit_sha IS NOT DISTINCT FROM EXCLUDED.current_commit_sha
                     THEN platform_release_state.latest_commit_sha
                     ELSE NULL
                 END,
                 latest_verified = CASE
                     WHEN platform_release_state.repository IS NOT DISTINCT FROM EXCLUDED.repository
                      AND platform_release_state.target_triple = EXCLUDED.target_triple
+                     AND platform_release_state.current_version = EXCLUDED.current_version
+                     AND platform_release_state.current_commit_sha IS NOT DISTINCT FROM EXCLUDED.current_commit_sha
                     THEN platform_release_state.latest_verified
                     ELSE FALSE
                 END,
@@ -303,11 +309,13 @@ impl SystemUpdateService for PostgresSystemUpdateService {
                 )
             })
             .cloned();
-        let update_available = state.latest_verified
-            && state
-                .latest_version
-                .as_deref()
-                .is_some_and(|version| version != state.current_version);
+        let update_available = verified_update_available(
+            state.latest_verified,
+            state.latest_version.as_deref(),
+            state.latest_commit_sha.as_deref(),
+            &state.current_version,
+            state.current_commit_sha.as_deref(),
+        );
         Ok(SystemUpdateSnapshot {
             object: "system.update",
             configured: state.repository.is_some(),
@@ -410,7 +418,8 @@ impl SystemUpdateService for PostgresSystemUpdateService {
         if action == SystemUpdateAction::Apply {
             let expected = sqlx::query_as::<_, LatestReleaseRow>(
                 r#"
-                SELECT latest_version, latest_verified
+                SELECT current_version, current_commit_sha,
+                       latest_version, latest_commit_sha, latest_verified
                 FROM platform_release_state
                 WHERE singleton = TRUE
                 "#,
@@ -418,8 +427,14 @@ impl SystemUpdateService for PostgresSystemUpdateService {
             .fetch_one(&mut *tx)
             .await
             .map_err(unavailable)?;
-            if !expected.latest_verified
-                || expected.latest_version.as_deref() != target_version.as_deref()
+            if expected.latest_version.as_deref() != target_version.as_deref()
+                || !verified_update_available(
+                    expected.latest_verified,
+                    expected.latest_version.as_deref(),
+                    expected.latest_commit_sha.as_deref(),
+                    &expected.current_version,
+                    expected.current_commit_sha.as_deref(),
+                )
             {
                 return Err(ImageGatewayError::conflict(
                     "The requested release is not the latest verified release",
@@ -565,8 +580,27 @@ impl IdempotentCommandRow {
 
 #[derive(Debug, FromRow)]
 struct LatestReleaseRow {
+    current_version: String,
+    current_commit_sha: Option<String>,
     latest_version: Option<String>,
+    latest_commit_sha: Option<String>,
     latest_verified: bool,
+}
+
+fn verified_update_available(
+    latest_verified: bool,
+    latest_version: Option<&str>,
+    latest_commit_sha: Option<&str>,
+    current_version: &str,
+    current_commit_sha: Option<&str>,
+) -> bool {
+    if !latest_verified || latest_version.is_none_or(|version| version == current_version) {
+        return false;
+    }
+    !matches!(
+        (latest_commit_sha, current_commit_sha),
+        (Some(latest), Some(current)) if latest.eq_ignore_ascii_case(current)
+    )
 }
 
 async fn command_by_idempotency(
@@ -842,5 +876,40 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn update_requires_a_distinct_verified_release_identity() {
+        let current = "0123456789abcdef0123456789abcdef01234567";
+        let latest = "89abcdef0123456789abcdef0123456789abcdef";
+
+        assert!(!verified_update_available(
+            false,
+            Some("v2"),
+            Some(latest),
+            "v1",
+            Some(current),
+        ));
+        assert!(!verified_update_available(
+            true,
+            Some("v1"),
+            Some(latest),
+            "v1",
+            Some(current),
+        ));
+        assert!(!verified_update_available(
+            true,
+            Some("v2"),
+            Some(current),
+            "v1",
+            Some(current),
+        ));
+        assert!(verified_update_available(
+            true,
+            Some("v2"),
+            Some(latest),
+            "v1",
+            Some(current),
+        ));
     }
 }
