@@ -28,6 +28,12 @@ pub struct UnstartedJobTerminalization {
     pub released_micros: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UnlaunchedJobCancellation {
+    pub job_id: Uuid,
+    pub canceled_outputs: u32,
+}
+
 #[async_trait]
 pub trait ReconciliationStore: Send + Sync + 'static {
     async fn reconcile_expired_work(

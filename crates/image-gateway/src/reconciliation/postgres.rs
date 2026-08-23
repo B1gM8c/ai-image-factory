@@ -4,7 +4,10 @@ use sha2::{Digest, Sha256};
 use sqlx::{AssertSqlSafe, PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
-use super::{ReconciliationOutcome, ReconciliationStore, UnstartedJobTerminalization};
+use super::{
+    ReconciliationOutcome, ReconciliationStore, UnlaunchedJobCancellation,
+    UnstartedJobTerminalization,
+};
 use crate::{ImageGatewayError, credit_grants::settle_credit_grant_reservations};
 
 const SERIALIZABLE_RETRY_ATTEMPTS: usize = 3;
@@ -25,6 +28,41 @@ impl PostgresReconciliationStore {
     ) -> Result<UnstartedJobTerminalization, ImageGatewayError> {
         terminalize_unstarted_job(&self.pool, job_id).await
     }
+
+    pub async fn cancel_unlaunched_job(
+        &self,
+        job_id: Uuid,
+    ) -> Result<UnlaunchedJobCancellation, ImageGatewayError> {
+        cancel_unlaunched_job(&self.pool, job_id).await
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct LockedUnlaunchedJob {
+    output_count: i32,
+    work_item_id: Uuid,
+}
+
+#[derive(sqlx::FromRow)]
+struct LockedPreparedOutput {
+    submission_id: Uuid,
+    executor_execution_id: Uuid,
+    submission_state: String,
+    submission_started_at_ms: Option<i64>,
+    submission_finished_at_ms: Option<i64>,
+    submission_result_manifest_id: Option<Uuid>,
+    submission_error_code: Option<String>,
+    submission_resolution_decision_id: Option<Uuid>,
+    execution_state: String,
+    executor_owner: Option<String>,
+    executor_lease_epoch: i64,
+    executor_lease_expires_at_ms: Option<i64>,
+    execution_started_at_ms: Option<i64>,
+    execution_finished_at_ms: Option<i64>,
+    launch_owner: Option<String>,
+    launch_lease_epoch: Option<i64>,
+    execution_error_code: Option<String>,
+    execution_resolution_decision_id: Option<Uuid>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -87,6 +125,238 @@ struct LockedOrphanReservation {
     job_state: String,
     charged_units: i32,
     job_created_at_ms: i64,
+}
+
+async fn cancel_unlaunched_job(
+    pool: &PgPool,
+    job_id: Uuid,
+) -> Result<UnlaunchedJobCancellation, ImageGatewayError> {
+    if job_id.is_nil() {
+        return Err(ImageGatewayError::config(
+            "unlaunched job cancellation requires a job id",
+        ));
+    }
+    let mut tx = pool.begin().await.map_err(reconciliation_unavailable)?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
+        .execute(&mut *tx)
+        .await
+        .map_err(reconciliation_unavailable)?;
+    let locked: LockedUnlaunchedJob = sqlx::query_as(
+        r#"
+        SELECT job.output_count, work.work_item_id
+        FROM jobs job
+        JOIN work_items work ON work.job_id = job.job_id
+        JOIN job_attempts attempt
+          ON attempt.work_item_id = work.work_item_id
+         AND attempt.execution_id = work.execution_id
+         AND attempt.lease_epoch = work.lease_epoch
+        JOIN quota_reservations quota
+          ON quota.reservation_id = job.reservation_id
+         AND quota.job_id = job.job_id
+        JOIN customer_billing_holds hold ON hold.job_id = job.job_id
+        WHERE job.job_id = $1
+          AND job.operation IN ('generation', 'edit')
+          AND job.state = 'reserved' AND job.charged_units = 0
+          AND job.economics_contract_version = 4
+          AND work.kind = 'image_batch' AND work.state = 'awaiting_executor'
+          AND work.execution_id IS NOT NULL AND work.lease_epoch > 0
+          AND work.lease_owner IS NULL AND work.lease_expires_at_ms IS NULL
+          AND work.handed_off_at_ms IS NOT NULL
+          AND attempt.state = 'handed_off'
+          AND attempt.started_at_ms IS NULL AND attempt.finished_at_ms IS NULL
+          AND attempt.error_code IS NULL AND attempt.handed_off_at_ms IS NOT NULL
+          AND quota.state IN ('reserved', 'expired')
+          AND quota.requested_units = job.billable_units
+          AND quota.committed_units = 0 AND quota.started_units = 0
+          AND quota.released_units = 0
+          AND hold.state = 'held' AND hold.captured_micros = 0
+          AND hold.released_micros = 0
+        FOR UPDATE OF job, work, attempt, quota, hold
+        "#,
+    )
+    .bind(job_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(reconciliation_unavailable)?
+    .ok_or_else(|| {
+        ImageGatewayError::conflict(
+            "Job is not an unlaunched image handoff",
+            None,
+            "unlaunched_job_cancellation_conflict",
+        )
+    })?;
+    let outputs: Vec<LockedPreparedOutput> = sqlx::query_as(
+        r#"
+        SELECT submission.submission_id, execution.executor_execution_id,
+               submission.state AS submission_state,
+               submission.started_at_ms AS submission_started_at_ms,
+               submission.finished_at_ms AS submission_finished_at_ms,
+               submission.result_manifest_id AS submission_result_manifest_id,
+               submission.error_code AS submission_error_code,
+               submission.resolution_decision_id AS submission_resolution_decision_id,
+               execution.state AS execution_state,
+               execution.executor_owner, execution.lease_epoch AS executor_lease_epoch,
+               execution.lease_expires_at_ms AS executor_lease_expires_at_ms,
+               execution.started_at_ms AS execution_started_at_ms,
+               execution.finished_at_ms AS execution_finished_at_ms,
+               execution.launch_owner, execution.launch_lease_epoch,
+               execution.error_code AS execution_error_code,
+               execution.resolution_decision_id AS execution_resolution_decision_id
+        FROM provider_submissions submission
+        JOIN executor_executions execution
+          ON execution.executor_execution_id = submission.executor_execution_id
+         AND execution.submission_id = submission.submission_id
+        WHERE submission.job_id = $1 AND submission.work_item_id = $2
+        ORDER BY submission.output_id
+        FOR UPDATE OF submission, execution
+        "#,
+    )
+    .bind(job_id)
+    .bind(locked.work_item_id)
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(reconciliation_unavailable)?;
+    let expected_outputs = usize::try_from(locked.output_count).unwrap_or(usize::MAX);
+    let prepared = outputs.len() == expected_outputs
+        && outputs.iter().all(|output| {
+            output.submission_state == "prepared"
+                && output.submission_started_at_ms.is_none()
+                && output.submission_finished_at_ms.is_none()
+                && output.submission_result_manifest_id.is_none()
+                && output.submission_error_code.is_none()
+                && output.submission_resolution_decision_id.is_none()
+                && output.execution_state == "prepared"
+                && output.executor_owner.is_none()
+                && output.executor_lease_epoch == 0
+                && output.executor_lease_expires_at_ms.is_none()
+                && output.execution_started_at_ms.is_none()
+                && output.execution_finished_at_ms.is_none()
+                && output.launch_owner.is_none()
+                && output.launch_lease_epoch.is_none()
+                && output.execution_error_code.is_none()
+                && output.execution_resolution_decision_id.is_none()
+        });
+    let side_effects: bool = sqlx::query_scalar(
+        r#"
+        SELECT EXISTS (SELECT 1 FROM artifacts WHERE job_id = $1)
+            OR EXISTS (SELECT 1 FROM provider_usage_facts WHERE job_id = $1)
+            OR EXISTS (SELECT 1 FROM customer_rated_usage WHERE job_id = $1)
+            OR EXISTS (SELECT 1 FROM ledger_transactions WHERE source_job_id = $1)
+            OR EXISTS (
+                SELECT 1 FROM executor_runner_observations observation
+                JOIN provider_submissions submission
+                  ON submission.executor_execution_id = observation.executor_execution_id
+                 AND submission.submission_id = observation.submission_id
+                WHERE submission.job_id = $1
+            )
+            OR EXISTS (
+                SELECT 1 FROM executor_result_manifests manifest
+                JOIN provider_submissions submission
+                  ON submission.executor_execution_id = manifest.executor_execution_id
+                 AND submission.submission_id = manifest.submission_id
+                WHERE submission.job_id = $1
+            )
+            OR EXISTS (
+                SELECT 1 FROM provider_remote_tasks remote
+                JOIN provider_submissions submission USING (submission_id)
+                WHERE submission.job_id = $1
+            )
+            OR EXISTS (
+                SELECT 1 FROM provider_remote_submit_intents intent
+                JOIN provider_submissions submission USING (submission_id)
+                WHERE submission.job_id = $1
+            )
+            OR EXISTS (
+                SELECT 1 FROM executor_capacity_allocations allocation
+                JOIN provider_submissions submission
+                  ON submission.executor_execution_id = allocation.executor_execution_id
+                 AND submission.submission_id = allocation.submission_id
+                WHERE submission.job_id = $1
+            )
+        "#,
+    )
+    .bind(job_id)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(reconciliation_unavailable)?;
+    if !prepared || side_effects {
+        return Err(ImageGatewayError::conflict(
+            "Job has launch or economic effects and cannot be canceled as unlaunched",
+            None,
+            "unlaunched_job_cancellation_conflict",
+        ));
+    }
+    let now = database_now(&mut tx).await?;
+    for output in &outputs {
+        require_one(
+            sqlx::query(
+                r#"
+                INSERT INTO executor_resolution_decisions (
+                    decision_id, executor_execution_id, submission_id, source,
+                    observation_id, resolved_state, result_manifest_id,
+                    error_code, decided_at_ms
+                ) VALUES ($1, $1, $2, 'executor_start_abandoned', NULL,
+                          'canceled', NULL, 'executor_start_abandoned', $3)
+                "#,
+            )
+            .bind(output.executor_execution_id)
+            .bind(output.submission_id)
+            .bind(now)
+            .execute(&mut *tx)
+            .await
+            .map_err(reconciliation_unavailable)?,
+            "unlaunched executor resolution",
+        )?;
+        require_one(
+            sqlx::query(
+                r#"
+                UPDATE executor_executions
+                SET state = 'canceled', resolution_decision_id = $1,
+                    finished_at_ms = $3, updated_at_ms = $3,
+                    error_code = 'executor_start_abandoned'
+                WHERE executor_execution_id = $1 AND submission_id = $2
+                  AND state = 'prepared' AND executor_owner IS NULL
+                  AND lease_epoch = 0 AND lease_expires_at_ms IS NULL
+                  AND launch_owner IS NULL AND launch_lease_epoch IS NULL
+                "#,
+            )
+            .bind(output.executor_execution_id)
+            .bind(output.submission_id)
+            .bind(now)
+            .execute(&mut *tx)
+            .await
+            .map_err(reconciliation_unavailable)?,
+            "unlaunched executor cancellation",
+        )?;
+        require_one(
+            sqlx::query(
+                r#"
+                UPDATE provider_submissions
+                SET state = 'canceled', resolution_decision_id = $2,
+                    finished_at_ms = $3, updated_at_ms = $3,
+                    error_code = 'executor_start_abandoned'
+                WHERE submission_id = $1 AND executor_execution_id = $2
+                  AND job_id = $4 AND work_item_id = $5
+                  AND state = 'prepared' AND started_at_ms IS NULL
+                  AND result_manifest_id IS NULL
+                "#,
+            )
+            .bind(output.submission_id)
+            .bind(output.executor_execution_id)
+            .bind(now)
+            .bind(job_id)
+            .bind(locked.work_item_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(reconciliation_unavailable)?,
+            "unlaunched provider submission cancellation",
+        )?;
+    }
+    tx.commit().await.map_err(reconciliation_unavailable)?;
+    Ok(UnlaunchedJobCancellation {
+        job_id,
+        canceled_outputs: u32::try_from(outputs.len()).unwrap_or(u32::MAX),
+    })
 }
 
 async fn terminalize_unstarted_job(

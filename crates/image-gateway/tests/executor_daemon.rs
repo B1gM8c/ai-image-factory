@@ -5,8 +5,9 @@ use std::{
 
 use async_trait::async_trait;
 use gpt_image_2_gateway::executor::{
-    DurableRunner, DurableRunnerResult, ExecutorClaimScope, ExecutorDaemon, ExecutorDaemonError,
-    ExecutorDaemonRun, ExecutorSubmissionError, ExecutorSubmissionLease, ExecutorSubmissionOutcome,
+    DurableEvidenceRecovery, DurableRunner, DurableRunnerResult, ExecutorClaimScope,
+    ExecutorDaemon, ExecutorDaemonError, ExecutorDaemonRun, ExecutorEvidenceStore,
+    ExecutorSubmissionError, ExecutorSubmissionLease, ExecutorSubmissionOutcome,
     ExecutorSubmissionResume, ExecutorSubmissionStore, RunnerError, RunnerLaunchAuthority,
     RunnerOutcome,
 };
@@ -186,6 +187,8 @@ impl ExecutorSubmissionStore for FakeStore {
     ) -> Result<(), ExecutorSubmissionError> {
         self.push_event("record");
         let mut state = self.state.lock().expect("fake store lock");
+        state.resumed = None;
+        state.claimed = None;
         state.observed = state
             .observed
             .iter()
@@ -198,6 +201,18 @@ impl ExecutorSubmissionStore for FakeStore {
 
     async fn reconcile_expired(&self, _limit: u32) -> Result<u64, ExecutorSubmissionError> {
         unreachable!("daemon does not reconcile")
+    }
+}
+
+#[async_trait]
+impl ExecutorEvidenceStore for FakeStore {
+    async fn load_pending_evidence(
+        &self,
+        _scope: &ExecutorClaimScope,
+        _owner: &str,
+    ) -> Result<Option<ExecutorSubmissionLease>, ExecutorSubmissionError> {
+        self.push_event("recover");
+        Ok(self.snapshot().resumed)
     }
 }
 
@@ -231,6 +246,18 @@ impl DurableRunner for FakeRunner {
         } else {
             tokio::time::sleep(self.delay).await;
         }
+        self.outcome.clone()
+    }
+}
+
+#[async_trait]
+impl DurableEvidenceRecovery for FakeRunner {
+    async fn recover_evidence(&self, lease: ExecutorSubmissionLease) -> DurableRunnerResult {
+        self.events
+            .lock()
+            .expect("fake event lock")
+            .push("runner_recover");
+        self.calls.lock().expect("fake runner lock").push(lease);
         self.outcome.clone()
     }
 }
@@ -273,6 +300,51 @@ async fn resumed_retryable_runner_neither_renews_nor_records() {
     assert_eq!(snapshot.heartbeat_calls, 0);
     assert!(snapshot.observed.is_empty());
     assert!(snapshot.recorded.is_empty());
+}
+
+#[tokio::test]
+async fn recovery_without_launch_evidence_is_observed_once_and_does_not_livelock() {
+    let lease = executor_lease();
+    let store = FakeStore::running(lease);
+    let mut runner = store.runner(Duration::ZERO);
+    runner.outcome = DurableRunnerResult::Retryable {
+        error_code: "runner_launch_evidence_missing".to_string(),
+    };
+    let daemon = daemon(store.clone(), runner);
+
+    assert_eq!(
+        daemon.recover_evidence_once().await,
+        Ok(ExecutorDaemonRun::Recorded)
+    );
+    assert_eq!(store.events(), vec!["recover", "runner_recover", "record"]);
+    assert_eq!(
+        store.snapshot().recorded,
+        vec![ExecutorSubmissionOutcome::Uncertain {
+            error_code: "runner_launch_evidence_missing".to_string(),
+        }]
+    );
+    assert_eq!(
+        daemon.recover_evidence_once().await,
+        Ok(ExecutorDaemonRun::Idle)
+    );
+}
+
+#[tokio::test]
+async fn other_retryable_evidence_errors_remain_retryable() {
+    let store = FakeStore::running(executor_lease());
+    let mut runner = store.runner(Duration::ZERO);
+    runner.outcome = DurableRunnerResult::Retryable {
+        error_code: "artifact_authority_unavailable".to_string(),
+    };
+    let daemon = daemon(store.clone(), runner);
+
+    assert_eq!(
+        daemon.recover_evidence_once().await,
+        Err(ExecutorDaemonError::RunnerRetryable {
+            error_code: "artifact_authority_unavailable".to_string(),
+        })
+    );
+    assert!(store.snapshot().recorded.is_empty());
 }
 
 #[tokio::test]

@@ -3249,6 +3249,130 @@ async fn assert_v4_four_output_mixed_settlement(successful_outputs: &[i32]) -> T
 }
 
 #[tokio::test]
+async fn v4_unlaunched_batch_cancellation_releases_every_hold_without_provider_launch() -> TestResult
+{
+    let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let work = seed_codex_generation_lease_with_outputs(
+            &database.pool,
+            "v4-unlaunched-cancel-worker",
+            2,
+        )
+        .await?;
+        seed_v4_customer_quote(&database.pool, &work, 40_000).await?;
+        let executor = PostgresExecutorSubmissionStore::new(database.pool.clone());
+        let prepared = executor
+            .prepare_and_handoff(&work, profile_id_for_lease(&work))
+            .await
+            .map_err(debug_error)?;
+        require(prepared.len() == 2, "expected two prepared outputs")?;
+        seed_terminal_quota(&database.pool, &work).await?;
+        sqlx::query("UPDATE jobs SET state = 'reserved' WHERE job_id = $1")
+            .bind(work.job_id)
+            .execute(&database.pool)
+            .await
+            .map_err(debug_error)?;
+
+        let canceled = PostgresReconciliationStore::new(database.pool.clone())
+            .cancel_unlaunched_job(work.job_id)
+            .await
+            .map_err(debug_error)?;
+        require(
+            canceled.job_id == work.job_id && canceled.canceled_outputs == 2,
+            format!("unexpected cancellation: {canceled:?}"),
+        )?;
+        let durable: (i64, i64, i64, i64, i64) = sqlx::query_as(
+            r#"
+            SELECT
+              (SELECT COUNT(*) FROM provider_submissions
+               WHERE job_id = $1 AND state = 'canceled'
+                 AND error_code = 'executor_start_abandoned'),
+              (SELECT COUNT(*) FROM executor_executions execution
+               JOIN provider_submissions submission USING (submission_id)
+               WHERE submission.job_id = $1 AND execution.state = 'canceled'
+                 AND execution.error_code = 'executor_start_abandoned'),
+              (SELECT COUNT(*) FROM executor_terminal_reductions reduction
+               JOIN provider_submissions submission USING (submission_id)
+               WHERE submission.job_id = $1 AND reduction.state = 'ready'),
+              (SELECT COUNT(*) FROM executor_runner_observations observation
+               JOIN provider_submissions submission USING (submission_id)
+               WHERE submission.job_id = $1),
+              (SELECT COUNT(*) FROM artifacts WHERE job_id = $1)
+            "#,
+        )
+        .bind(work.job_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(
+            durable == (2, 2, 2, 0, 0),
+            format!("unlaunched cancellation was not side-effect free: {durable:?}"),
+        )?;
+        let replay = PostgresReconciliationStore::new(database.pool.clone())
+            .cancel_unlaunched_job(work.job_id)
+            .await;
+        require(
+            replay.as_ref().err().map(|error| error.status_code())
+                == Some(axum::http::StatusCode::CONFLICT),
+            format!("unlaunched cancellation replay was accepted: {replay:?}"),
+        )?;
+
+        let reductions = PostgresExecutorTerminalStore::new(database.pool.clone());
+        let mut parent = ExecutorParentTerminalState::Pending;
+        for index in 0..2 {
+            let terminal = reductions
+                .claim_terminal(&format!("v4-unlaunched-cancel-reducer-{index}"), 60_000)
+                .await
+                .map_err(|error| format!("claim canceled terminal {index}: {error:?}"))?
+                .ok_or_else(|| "canceled terminal reduction was not queued".to_string())?;
+            parent = reductions
+                .complete_terminal(&terminal, None)
+                .await
+                .map_err(|error| format!("complete canceled terminal {index}: {error:?}"))?
+                .parent_state;
+        }
+        require(
+            parent == ExecutorParentTerminalState::Failed,
+            format!("canceled parent did not fail canonically: {parent:?}"),
+        )?;
+        let economics: (String, i32, i32, String, i64, i64, String, i32) = sqlx::query_as(
+            r#"
+            SELECT job.state, job.charged_units, quota.released_units,
+                   hold.state, hold.captured_micros, hold.released_micros,
+                   quota.state, quota.committed_units
+            FROM jobs job
+            JOIN quota_reservations quota ON quota.job_id = job.job_id
+            JOIN customer_billing_holds hold ON hold.job_id = job.job_id
+            WHERE job.job_id = $1
+            "#,
+        )
+        .bind(work.job_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(
+            economics
+                == (
+                    "failed".to_string(),
+                    0,
+                    2,
+                    "settled".to_string(),
+                    0,
+                    80_000,
+                    "released".to_string(),
+                    0,
+                ),
+            format!("unlaunched cancellation did not release economics: {economics:?}"),
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
 async fn v4_terminal_failure_releases_the_customer_hold_without_a_charge() -> TestResult {
     let Some(database) = TestDatabase::new().await? else {
         return Ok(());
@@ -7843,6 +7967,7 @@ async fn seed_v4_customer_quote_with_basis(
     let price_book_version_id = Uuid::new_v4();
     let success_price_component_id = Uuid::new_v4();
     let failed_price_component_id = Uuid::new_v4();
+    let no_effect_price_component_id = Uuid::new_v4();
     let quote_id = Uuid::new_v4();
     let mut tx = pool.begin().await.map_err(debug_error)?;
     sqlx::query(
@@ -7949,6 +8074,7 @@ async fn seed_v4_customer_quote_with_basis(
             basis.unit_price_micros,
         ),
         (failed_price_component_id, "failed", "failed", 0),
+        (no_effect_price_component_id, "no-effect", "no_effect", 0),
     ] {
         sqlx::query(
             r#"
@@ -8098,6 +8224,7 @@ async fn seed_v4_customer_quote_with_basis(
                 basis.max_amount_micros,
             ),
             (failed_price_component_id, "failed", "failed", 0, 0),
+            (no_effect_price_component_id, "no-effect", "no_effect", 0, 0),
         ] {
             sqlx::query(
                 r#"

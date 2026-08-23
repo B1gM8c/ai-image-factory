@@ -183,7 +183,17 @@ where
         else {
             return Ok(ExecutorDaemonRun::Idle);
         };
-        let outcome = terminal_outcome(self.runner.recover_evidence(lease.clone()).await)?;
+        let outcome = match self.runner.recover_evidence(lease.clone()).await {
+            DurableRunnerResult::Terminal(outcome) => ExecutorSubmissionOutcome::from(outcome),
+            DurableRunnerResult::Retryable { error_code }
+                if error_code == "runner_launch_evidence_missing" =>
+            {
+                ExecutorSubmissionOutcome::Uncertain { error_code }
+            }
+            DurableRunnerResult::Retryable { error_code } => {
+                return Err(ExecutorDaemonError::RunnerRetryable { error_code });
+            }
+        };
         self.store.record_outcome(&lease, &outcome).await?;
         Ok(ExecutorDaemonRun::Recorded)
     }
