@@ -11,7 +11,7 @@ use gpt_image_2_gateway::{
         database_url_from_env, run_migrations, verify_migrations,
     },
     grok_auth_file_sha256,
-    provider_management::PostgresProviderManagementService,
+    provider_management::{PostgresProviderManagementService, ProviderManagementService},
     provision_codex_execution_profile, provision_grok_edit_execution_profile_replacement,
     provision_grok_execution_profile, provision_grok_image_execution_profile_replacement,
     provision_grok_video_execution_profile, provision_grok_video_execution_profile_replacement,
@@ -47,6 +47,9 @@ enum Command {
     CancelUnlaunchedJob {
         job_id: Uuid,
     },
+    RefreshProviderQuota {
+        provider_account_id: Uuid,
+    },
     RetryBlockedTerminal {
         submission_id: Uuid,
         repair_revision: String,
@@ -64,7 +67,7 @@ where
 {
     let mut args = args.into_iter();
     let command = args.next().ok_or_else(|| {
-        "missing command: expected `migrate`, `bootstrap-admin`, `provision-codex-profile`, `provision-grok-profile`, `provision-grok-video-profile`, `provision-grok-image-profile-replacement`, `provision-grok-edit-profile-replacement`, `provision-grok-video-profile-replacement`, `reconcile-execution-profile-routes`, `reconcile-dreamina-profiles`, `reconcile-inline-customer-settlement`, `terminalize-unstarted-job`, `cancel-unlaunched-job`, or `retry-blocked-terminal`"
+        "missing command: expected `migrate`, `bootstrap-admin`, `provision-codex-profile`, `provision-grok-profile`, `provision-grok-video-profile`, `provision-grok-image-profile-replacement`, `provision-grok-edit-profile-replacement`, `provision-grok-video-profile-replacement`, `reconcile-execution-profile-routes`, `reconcile-dreamina-profiles`, `reconcile-inline-customer-settlement`, `terminalize-unstarted-job`, `cancel-unlaunched-job`, `refresh-provider-quota`, or `retry-blocked-terminal`"
             .to_string()
     })?;
     let command = match command.as_ref() {
@@ -145,6 +148,17 @@ where
                 .map_err(|_| "cancel-unlaunched-job requires a UUID job id".to_string())?;
             Command::CancelUnlaunchedJob { job_id }
         }
+        "refresh-provider-quota" => {
+            let provider_account_id =
+                required_argument(&mut args, "refresh-provider-quota", "provider account id")?
+                    .parse()
+                    .map_err(|_| {
+                        "refresh-provider-quota requires a UUID provider account id".to_string()
+                    })?;
+            Command::RefreshProviderQuota {
+                provider_account_id,
+            }
+        }
         "retry-blocked-terminal" => {
             let submission_id =
                 required_argument(&mut args, "retry-blocked-terminal", "submission id")?
@@ -165,7 +179,7 @@ where
         }
         value => {
             return Err(format!(
-                "unknown command `{value}`: expected `migrate`, `bootstrap-admin`, `provision-codex-profile`, `provision-grok-profile`, `provision-grok-video-profile`, `provision-grok-image-profile-replacement`, `provision-grok-edit-profile-replacement`, `provision-grok-video-profile-replacement`, `reconcile-execution-profile-routes`, `reconcile-dreamina-profiles`, `reconcile-inline-customer-settlement`, `terminalize-unstarted-job`, `cancel-unlaunched-job`, or `retry-blocked-terminal`"
+                "unknown command `{value}`: expected `migrate`, `bootstrap-admin`, `provision-codex-profile`, `provision-grok-profile`, `provision-grok-video-profile`, `provision-grok-image-profile-replacement`, `provision-grok-edit-profile-replacement`, `provision-grok-video-profile-replacement`, `reconcile-execution-profile-routes`, `reconcile-dreamina-profiles`, `reconcile-inline-customer-settlement`, `terminalize-unstarted-job`, `cancel-unlaunched-job`, `refresh-provider-quota`, or `retry-blocked-terminal`"
             ));
         }
     };
@@ -223,6 +237,7 @@ async fn main() -> Result<(), ImageGatewayError> {
         | Command::ReconcileInlineCustomerSettlement { .. }
         | Command::TerminalizeUnstartedJob { .. }
         | Command::CancelUnlaunchedJob { .. }
+        | Command::RefreshProviderQuota { .. }
         | Command::RetryBlockedTerminal { .. } => None,
     };
     let database_url = database_url_from_env()?;
@@ -367,6 +382,16 @@ async fn main() -> Result<(), ImageGatewayError> {
                 "unlaunched job cancellation recorded: job_id={}, canceled_outputs={}",
                 outcome.job_id, outcome.canceled_outputs
             );
+        }
+        Command::RefreshProviderQuota {
+            provider_account_id,
+        } => {
+            verify_migrations(&pool).await?;
+            PostgresProviderManagementService::from_env(pool.clone())
+                .await?
+                .refresh_provider_quota(provider_account_id)
+                .await?;
+            println!("provider quota and credential refreshed: {provider_account_id}");
         }
         Command::RetryBlockedTerminal {
             submission_id,
@@ -685,6 +710,29 @@ mod tests {
     }
 
     #[test]
+    fn accepts_provider_quota_refresh() {
+        let provider_account_id = uuid::Uuid::new_v4();
+        assert_eq!(
+            parse_command(["refresh-provider-quota", &provider_account_id.to_string()]),
+            Ok(Command::RefreshProviderQuota {
+                provider_account_id,
+            })
+        );
+        assert_eq!(
+            parse_command(["refresh-provider-quota", "not-a-uuid"]),
+            Err("refresh-provider-quota requires a UUID provider account id".to_string())
+        );
+        assert_eq!(
+            parse_command([
+                "refresh-provider-quota",
+                &provider_account_id.to_string(),
+                "again",
+            ]),
+            Err("unexpected argument `again`: command accepts no arguments".to_string())
+        );
+    }
+
+    #[test]
     fn accepts_only_canonical_conflict_terminal_requeue() {
         let submission_id = uuid::Uuid::new_v4();
         assert_eq!(
@@ -714,7 +762,7 @@ mod tests {
     fn rejects_missing_command() {
         assert_eq!(
             parse_command([] as [&str; 0]),
-            Err("missing command: expected `migrate`, `bootstrap-admin`, `provision-codex-profile`, `provision-grok-profile`, `provision-grok-video-profile`, `provision-grok-image-profile-replacement`, `provision-grok-edit-profile-replacement`, `provision-grok-video-profile-replacement`, `reconcile-execution-profile-routes`, `reconcile-dreamina-profiles`, `reconcile-inline-customer-settlement`, `terminalize-unstarted-job`, `cancel-unlaunched-job`, or `retry-blocked-terminal`".to_string())
+            Err("missing command: expected `migrate`, `bootstrap-admin`, `provision-codex-profile`, `provision-grok-profile`, `provision-grok-video-profile`, `provision-grok-image-profile-replacement`, `provision-grok-edit-profile-replacement`, `provision-grok-video-profile-replacement`, `reconcile-execution-profile-routes`, `reconcile-dreamina-profiles`, `reconcile-inline-customer-settlement`, `terminalize-unstarted-job`, `cancel-unlaunched-job`, `refresh-provider-quota`, or `retry-blocked-terminal`".to_string())
         );
     }
 
@@ -723,7 +771,7 @@ mod tests {
         assert_eq!(
             parse_command(["status"]),
             Err(
-                "unknown command `status`: expected `migrate`, `bootstrap-admin`, `provision-codex-profile`, `provision-grok-profile`, `provision-grok-video-profile`, `provision-grok-image-profile-replacement`, `provision-grok-edit-profile-replacement`, `provision-grok-video-profile-replacement`, `reconcile-execution-profile-routes`, `reconcile-dreamina-profiles`, `reconcile-inline-customer-settlement`, `terminalize-unstarted-job`, `cancel-unlaunched-job`, or `retry-blocked-terminal`"
+                "unknown command `status`: expected `migrate`, `bootstrap-admin`, `provision-codex-profile`, `provision-grok-profile`, `provision-grok-video-profile`, `provision-grok-image-profile-replacement`, `provision-grok-edit-profile-replacement`, `provision-grok-video-profile-replacement`, `reconcile-execution-profile-routes`, `reconcile-dreamina-profiles`, `reconcile-inline-customer-settlement`, `terminalize-unstarted-job`, `cancel-unlaunched-job`, `refresh-provider-quota`, or `retry-blocked-terminal`"
                     .to_string()
             )
         );

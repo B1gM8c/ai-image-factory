@@ -79,7 +79,11 @@ impl SmokeFiles {
             )?;
         }
         let auth_path = codex_home.join("auth.json");
-        fs::write(&auth_path, b"{}\n")
+        fs::write(
+            &auth_path,
+            br#"{"tokens":{"access_token":"process-smoke-access","account_id":"process-smoke-account"}}
+"#,
+        )
             .map_err(|error| format!("failed to write fake Codex credentials: {error}"))?;
         fs::set_permissions(&auth_path, fs::Permissions::from_mode(0o600))
             .map_err(|error| format!("failed to protect fake Codex credentials: {error}"))?;

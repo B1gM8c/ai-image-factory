@@ -201,7 +201,6 @@ async fn run_edit_process_smoke(database: &TestDatabase) -> TestResult {
         database,
         &files,
         &fixture,
-        workerd.pid(),
         &mut gateway,
         &direct_edit,
     )
@@ -565,7 +564,6 @@ async fn exercise_edit_gateway(
     database: &TestDatabase,
     files: &SmokeFiles,
     fixture: &[u8],
-    workerd_pid: u32,
     gateway: &mut GatewayProcess,
     direct_edit: &DirectEditMock,
 ) -> TestResult {
@@ -595,7 +593,7 @@ async fn exercise_edit_gateway(
         ),
     )?;
     assert_response(&body, &headers, fixture)?;
-    assert_codex_edit_outputs(files, workerd_pid)?;
+    assert_codex_edit_outputs(files)?;
     direct_edit.assert_single_request().await?;
     assert_artifact_bytes(files, fixture)?;
 
@@ -625,7 +623,7 @@ async fn exercise_edit_gateway(
         replay_request_id != request_id,
         "edit replay must receive a fresh request id",
     )?;
-    assert_codex_edit_outputs(files, workerd_pid)?;
+    assert_codex_edit_outputs(files)?;
     direct_edit.assert_single_request().await?;
     database.assert_edit_transitions(&request_id).await
 }
@@ -706,14 +704,14 @@ impl DirectEditMock {
                 .get(reqwest::header::AUTHORIZATION)
                 .and_then(|value| value.to_str().ok())
                 == Some("Bearer process-smoke-access"),
-            "direct edit did not use the refreshed access token",
+            "direct edit did not use the broker-managed access token",
         )?;
         require(
             headers
                 .get("ChatGPT-Account-ID")
                 .and_then(|value| value.to_str().ok())
                 == Some("process-smoke-account"),
-            "direct edit did not preserve the refreshed account binding",
+            "direct edit did not preserve the broker-managed account binding",
         )?;
         let body = &observation.bodies[0];
         require(

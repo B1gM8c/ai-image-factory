@@ -67,55 +67,10 @@ pub(crate) fn assert_executor_codex_outputs(
     assert_prompt_semantics(&prompt, &request_dir)
 }
 
-pub(crate) fn assert_codex_edit_outputs(
-    files: &SmokeFiles,
-    expected_parent_pid: u32,
-) -> TestResult {
-    let invocation_count = fs::read_to_string(&files.invocation_log)
-        .map_err(|error| format!("failed to read fake Codex invocation log: {error}"))?
-        .lines()
-        .count();
+pub(crate) fn assert_codex_edit_outputs(files: &SmokeFiles) -> TestResult {
     require(
-        invocation_count == 1,
-        format!("fake Codex refresh invocation count was {invocation_count}, expected 1"),
-    )?;
-    let argv = read_nul_strings(&files.argv_log)?;
-    require(
-        argv == ["app-server", "--stdio"],
-        format!("unexpected Codex refresh argv: {argv:?}"),
-    )?;
-    let messages = fs::read_to_string(&files.stdin_log)
-        .map_err(|error| format!("failed to read fake Codex refresh stdin log: {error}"))?
-        .lines()
-        .map(|line| {
-            serde_json::from_str::<Value>(line).map_err(|error| {
-                format!("fake Codex refresh stdin contained invalid JSON: {error}")
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let account_read = rpc_request(&messages, "account/read")?;
-    require(
-        account_read
-            .pointer("/params/refreshToken")
-            .and_then(Value::as_bool)
-            == Some(true),
-        "Codex account/read did not request an authenticated refresh",
-    )?;
-    require(
-        !messages.iter().any(|message| {
-            matches!(
-                message.get("method").and_then(Value::as_str),
-                Some("thread/start" | "turn/start")
-            )
-        }),
-        "credential refresh unexpectedly started a Codex thread or turn",
-    )?;
-    let fake_parent_pid = read_pid(&files.fake_parent_pid_log)?;
-    require(
-        fake_parent_pid == expected_parent_pid as i32,
-        format!(
-            "fake Codex refresh parent PID was {fake_parent_pid}, expected workerd PID {expected_parent_pid}"
-        ),
+        !files.invocation_log.exists(),
+        "direct edit must not launch Codex against the broker-managed credential home",
     )
 }
 
