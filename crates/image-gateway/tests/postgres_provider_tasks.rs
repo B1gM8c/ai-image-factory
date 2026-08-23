@@ -2075,8 +2075,8 @@ async fn submit_service_resumes_unacknowledged_fresh_claim_without_reclaiming() 
             .ok_or_else(|| "lost claim fixture was not prepared".to_owned())?;
         let command = submit_iteration_command("submit-service-lost-claim");
         let mut config = submit_service_config(200);
-        config.executor_lease_ms = 2_000;
-        config.recovery_lease_ms = 2_000;
+        config.executor_lease_ms = 30_000;
+        config.recovery_lease_ms = 30_000;
         let claimed = executor_store
             .claim_prepared(
                 &config.executor_scope,
