@@ -333,6 +333,8 @@ fn assert_codex_invocation(argv: &[String], expects_runtime_home: bool) -> TestR
         "--strict-config",
         "-c",
         "features.code_mode.direct_only_tool_namespaces=[\"image_gen\"]",
+        "-c",
+        "web_search=\"disabled\"",
         "--enable",
         "image_generation",
         "--disable",
@@ -343,6 +345,8 @@ fn assert_codex_invocation(argv: &[String], expects_runtime_home: bool) -> TestR
         "shell_tool",
         "--disable",
         "unified_exec",
+        "--disable",
+        "standalone_web_search",
     ]
     .map(str::to_string)
     .to_vec();

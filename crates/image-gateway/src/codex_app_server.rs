@@ -28,6 +28,7 @@ const REAP_TIMEOUT: Duration = Duration::from_secs(5);
 const IMAGE_GENERATION_DEVELOPER_INSTRUCTIONS: &str = "For this thread, image requests MUST invoke the enabled namespaced tool image_gen.imagegen (wire name image_gen__imagegen) exactly once. Never answer an image request with text only. Do not use shell or local programs to create, copy, move, rename, edit, or delete the generated artifact. After the image tool completes, stop.";
 const IMAGE_GENERATION_DIRECT_TOOL_CONFIG: &str =
     "features.code_mode.direct_only_tool_namespaces=[\"image_gen\"]";
+const WEB_SEARCH_DISABLED_CONFIG: &str = "web_search=\"disabled\"";
 
 type FailureDiagnosticSink<'a> =
     &'a (dyn Fn(&CodexAppServerFailureDiagnosticV1) -> Result<(), ()> + Sync);
@@ -530,6 +531,8 @@ where
         .arg("--strict-config")
         .arg("-c")
         .arg(IMAGE_GENERATION_DIRECT_TOOL_CONFIG)
+        .arg("-c")
+        .arg(WEB_SEARCH_DISABLED_CONFIG)
         .arg("--enable")
         .arg("image_generation")
         .arg("--disable")
@@ -540,6 +543,8 @@ where
         .arg("shell_tool")
         .arg("--disable")
         .arg("unified_exec")
+        .arg("--disable")
+        .arg("standalone_web_search")
         .env_clear()
         .current_dir(&workspace)
         .stdin(Stdio::piped())
@@ -1860,6 +1865,10 @@ mod tests {
         assert!(!state.observe_notification(&item("plan"), home).unwrap());
         assert_eq!(
             state.observe_notification(&item("commandExecution"), home),
+            Err(CodexAppServerError::Protocol)
+        );
+        assert_eq!(
+            state.observe_notification(&item("webSearch"), home),
             Err(CodexAppServerError::Protocol)
         );
     }
