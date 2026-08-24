@@ -721,10 +721,8 @@ impl DirectEditMock {
             format!("unexpected direct edit request contract: {body:#}"),
         )?;
         require(
-            body["prompt"]
-                .as_str()
-                .is_some_and(|prompt| prompt.contains("这是图生图编辑任务")),
-            "direct edit request lost edit semantics",
+            body["prompt"] == "process smoke opaque fixture",
+            "direct edit did not preserve the exact admitted prompt",
         )
     }
 }
