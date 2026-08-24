@@ -39,15 +39,53 @@ struct DirectAuth {
     account_id: Option<String>,
 }
 
+pub(crate) struct DirectEditFailure {
+    error: ImageGatewayError,
+    error_code: &'static str,
+    http_status: Option<u16>,
+    outcome_uncertain: bool,
+}
+
+pub(crate) struct DirectEditParameters<'a> {
+    pub(crate) prompt: &'a str,
+    pub(crate) background: &'a str,
+    pub(crate) quality: &'a str,
+    pub(crate) size: &'a str,
+    pub(crate) output_index: u32,
+}
+
+impl DirectEditFailure {
+    pub(crate) fn error_code(&self) -> &'static str {
+        self.error_code
+    }
+
+    pub(crate) fn http_status(&self) -> Option<u16> {
+        self.http_status
+    }
+
+    pub(crate) fn is_authentication_rejection(&self) -> bool {
+        self.error_code == "codex_authentication_rejected"
+            && self.http_status == Some(StatusCode::UNAUTHORIZED.as_u16())
+    }
+
+    pub(crate) fn outcome_uncertain(&self) -> bool {
+        self.outcome_uncertain
+    }
+
+    fn into_gateway_error(self) -> ImageGatewayError {
+        self.error
+    }
+}
+
 #[derive(Serialize)]
 struct EditRequest<'a> {
     images: Vec<ImageUrl>,
     prompt: &'a str,
-    background: &'static str,
+    background: &'a str,
     model: &'static str,
     n: u32,
-    quality: &'static str,
-    size: &'static str,
+    quality: &'a str,
+    size: &'a str,
 }
 
 #[derive(Serialize)]
@@ -85,6 +123,17 @@ pub(super) async fn edit(
 ) -> Result<Vec<GeneratedImage>, ImageGatewayError> {
     let endpoint = image_edits_endpoint()?;
     edit_at(&endpoint, auth_home, images, mask, prompt, n, timeout).await
+}
+
+pub(crate) async fn edit_one(
+    auth_home: &Path,
+    images: &[InputImage],
+    mask: Option<&InputImage>,
+    parameters: DirectEditParameters<'_>,
+    timeout: Duration,
+) -> Result<GeneratedImage, DirectEditFailure> {
+    let endpoint = image_edits_endpoint().map_err(local_unavailable)?;
+    edit_one_at(&endpoint, auth_home, images, mask, parameters, timeout).await
 }
 
 fn image_edits_endpoint() -> Result<Cow<'static, str>, ImageGatewayError> {
@@ -126,18 +175,25 @@ pub(super) async fn edit_at(
     if n == 0 {
         return Err(invalid_response());
     }
-    let auth = read_auth(auth_home)?;
-    let payload = edit_request(images, mask, prompt, 1)?;
-    let client = Client::builder()
-        .redirect(Policy::none())
-        .build()
-        .map_err(|_| unavailable())?;
     let mut total = 0usize;
     let mut outputs = Vec::with_capacity(n as usize);
     for output_index in 0..n {
-        let mut response =
-            post_one(&client, endpoint, &auth, &payload, timeout, output_index).await?;
-        let image = response.pop().ok_or_else(invalid_response)?;
+        let image = edit_one_at(
+            endpoint,
+            auth_home,
+            images,
+            mask,
+            DirectEditParameters {
+                prompt,
+                background: "auto",
+                quality: "auto",
+                size: "auto",
+                output_index,
+            },
+            timeout,
+        )
+        .await
+        .map_err(DirectEditFailure::into_gateway_error)?;
         total = total
             .checked_add(image.bytes.len())
             .ok_or_else(invalid_response)?;
@@ -149,6 +205,41 @@ pub(super) async fn edit_at(
     Ok(outputs)
 }
 
+pub(crate) async fn edit_one_at(
+    endpoint: &str,
+    auth_home: &Path,
+    images: &[InputImage],
+    mask: Option<&InputImage>,
+    parameters: DirectEditParameters<'_>,
+    timeout: Duration,
+) -> Result<GeneratedImage, DirectEditFailure> {
+    let auth = read_auth(auth_home).map_err(local_credentials_unavailable)?;
+    let payload = edit_request(
+        images,
+        mask,
+        parameters.prompt,
+        parameters.background,
+        parameters.quality,
+        parameters.size,
+        1,
+    )
+    .map_err(local_invalid_request)?;
+    let client = Client::builder()
+        .redirect(Policy::none())
+        .build()
+        .map_err(|_| local_unavailable(unavailable()))?;
+    let mut outputs = post_one(
+        &client,
+        endpoint,
+        &auth,
+        &payload,
+        timeout,
+        parameters.output_index,
+    )
+    .await?;
+    outputs.pop().ok_or_else(direct_invalid_response)
+}
+
 async fn post_one(
     client: &Client,
     endpoint: &str,
@@ -156,7 +247,7 @@ async fn post_one(
     payload: &EditRequest<'_>,
     timeout: Duration,
     output_index: u32,
-) -> Result<Vec<GeneratedImage>, ImageGatewayError> {
+) -> Result<Vec<GeneratedImage>, DirectEditFailure> {
     let mut request = client
         .post(endpoint)
         .bearer_auth(&auth.access_token)
@@ -167,9 +258,17 @@ async fn post_one(
     if let Some(account_id) = &auth.account_id {
         request = request.header("ChatGPT-Account-ID", account_id);
     }
-    let response = request.send().await.map_err(|_| unavailable())?;
+    let response = request.send().await.map_err(|error| {
+        if error.is_connect() {
+            local_unavailable(unavailable())
+        } else {
+            uncertain_transport()
+        }
+    })?;
     let status = response.status();
-    let body = read_bounded_body(response).await?;
+    let body = read_bounded_body(response)
+        .await
+        .map_err(|_| uncertain_transport())?;
     if !status.is_success() {
         let upstream_code = structured_error_code(&body);
         tracing::warn!(
@@ -180,13 +279,16 @@ async fn post_one(
         );
         return Err(map_http_error(status, &body));
     }
-    decode_outputs(&body, 1)
+    decode_outputs(&body, 1).map_err(|_| direct_invalid_response())
 }
 
 fn edit_request<'a>(
     images: &[InputImage],
     mask: Option<&InputImage>,
     prompt: &'a str,
+    background: &'a str,
+    quality: &'a str,
+    size: &'a str,
     n: u32,
 ) -> Result<EditRequest<'a>, ImageGatewayError> {
     let mut encoded = Vec::with_capacity(images.len() + usize::from(mask.is_some()));
@@ -198,11 +300,11 @@ fn edit_request<'a>(
     Ok(EditRequest {
         images: encoded,
         prompt,
-        background: "auto",
+        background,
         model: CODEX_IMAGE_MODEL,
         n,
-        quality: "auto",
-        size: "auto",
+        quality,
+        size,
     })
 }
 
@@ -295,7 +397,7 @@ fn decode_outputs(body: &[u8], expected: u32) -> Result<Vec<GeneratedImage>, Ima
     Ok(outputs)
 }
 
-fn map_http_error(status: StatusCode, body: &[u8]) -> ImageGatewayError {
+fn map_http_error(status: StatusCode, body: &[u8]) -> DirectEditFailure {
     let code = structured_error_code(body)
         .unwrap_or_default()
         .to_ascii_lowercase();
@@ -303,13 +405,77 @@ fn map_http_error(status: StatusCode, body: &[u8]) -> ImageGatewayError {
         code.as_str(),
         "content_policy" | "content_policy_violation" | "moderation_blocked" | "safety"
     ) {
-        return ImageGatewayError::content_policy_rejected();
+        return DirectEditFailure {
+            error: ImageGatewayError::content_policy_rejected(),
+            error_code: "content_policy_rejected",
+            http_status: Some(status.as_u16()),
+            outcome_uncertain: false,
+        };
     }
-    match status {
-        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => credentials_unavailable(),
-        StatusCode::TOO_MANY_REQUESTS => ImageGatewayError::queue_overloaded(),
-        status if status.is_server_error() => unavailable(),
-        _ => ImageGatewayError::backend("Codex image edit request was rejected"),
+    let (error, error_code) = match status {
+        StatusCode::UNAUTHORIZED => (credentials_unavailable(), "codex_authentication_rejected"),
+        StatusCode::TOO_MANY_REQUESTS => (
+            ImageGatewayError::queue_overloaded(),
+            "codex_image_edit_rate_limited",
+        ),
+        status if status.is_server_error() => {
+            (unavailable(), "codex_image_edit_upstream_unavailable")
+        }
+        _ => (
+            ImageGatewayError::backend("Codex image edit request was rejected"),
+            "codex_image_edit_rejected",
+        ),
+    };
+    DirectEditFailure {
+        error,
+        error_code,
+        http_status: Some(status.as_u16()),
+        outcome_uncertain: false,
+    }
+}
+
+fn local_credentials_unavailable(error: ImageGatewayError) -> DirectEditFailure {
+    DirectEditFailure {
+        error,
+        error_code: "codex_credentials_unavailable",
+        http_status: None,
+        outcome_uncertain: false,
+    }
+}
+
+fn local_invalid_request(error: ImageGatewayError) -> DirectEditFailure {
+    DirectEditFailure {
+        error,
+        error_code: "codex_image_edit_request_invalid",
+        http_status: None,
+        outcome_uncertain: false,
+    }
+}
+
+fn local_unavailable(error: ImageGatewayError) -> DirectEditFailure {
+    DirectEditFailure {
+        error,
+        error_code: "codex_image_edit_upstream_unavailable",
+        http_status: None,
+        outcome_uncertain: false,
+    }
+}
+
+fn uncertain_transport() -> DirectEditFailure {
+    DirectEditFailure {
+        error: unavailable(),
+        error_code: "codex_image_edit_outcome_unknown",
+        http_status: None,
+        outcome_uncertain: true,
+    }
+}
+
+fn direct_invalid_response() -> DirectEditFailure {
+    DirectEditFailure {
+        error: invalid_response(),
+        error_code: "codex_image_edit_invalid_response",
+        http_status: Some(StatusCode::OK.as_u16()),
+        outcome_uncertain: true,
     }
 }
 
@@ -383,7 +549,7 @@ mod tests {
 
     #[test]
     fn direct_edit_payload_uses_the_official_single_output_contract() {
-        let request = edit_request(&[png()], None, "edit", 1).unwrap();
+        let request = edit_request(&[png()], None, "edit", "auto", "auto", "auto", 1).unwrap();
         let value = serde_json::to_value(request).unwrap();
         assert_eq!(value["model"], "gpt-image-2");
         assert_eq!(value["n"], 1);
@@ -410,17 +576,28 @@ mod tests {
             StatusCode::BAD_REQUEST,
             br#"{"error":{"code":"content_policy"}}"#,
         );
-        assert_eq!(policy.error_code(), Some("content_policy_rejected"));
+        assert_eq!(policy.error_code(), "content_policy_rejected");
         let moderation = map_http_error(
             StatusCode::BAD_REQUEST,
             br#"{"error":{"code":"moderation_blocked"}}"#,
         );
-        assert_eq!(moderation.error_code(), Some("content_policy_rejected"));
+        assert_eq!(moderation.error_code(), "content_policy_rejected");
         let generic = map_http_error(
             StatusCode::BAD_REQUEST,
             br#"{"error":{"message":"content policy"}}"#,
         );
-        assert_eq!(generic.error_code(), Some("image_generation_failed"));
+        assert_eq!(generic.error_code(), "codex_image_edit_rejected");
+        assert!(!generic.is_authentication_rejection());
+
+        let unauthorized = map_http_error(StatusCode::UNAUTHORIZED, br#"{}"#);
+        assert!(unauthorized.is_authentication_rejection());
+        let unauthorized_policy = map_http_error(
+            StatusCode::UNAUTHORIZED,
+            br#"{"error":{"code":"content_policy"}}"#,
+        );
+        assert!(!unauthorized_policy.is_authentication_rejection());
+        let forbidden = map_http_error(StatusCode::FORBIDDEN, br#"{}"#);
+        assert!(!forbidden.is_authentication_rejection());
     }
 
     #[test]
@@ -449,7 +626,7 @@ mod tests {
         )
         .unwrap();
 
-        for n in [1, 2, 4] {
+        for n in [1, 2, 3, 4] {
             let outputs = edit_at(
                 &endpoint,
                 auth_home.path(),
@@ -469,7 +646,7 @@ mod tests {
         assert!(observed.authorized);
         assert!(observed.account_bound);
         assert!(observed.originator_bound);
-        assert_eq!(observed.request_count, 7);
+        assert_eq!(observed.request_count, 10);
         assert_eq!(observed.max_active_requests, 1);
         assert!(observed.upstream_counts.iter().all(|count| *count == 1));
         assert_eq!(observed.body.as_ref().unwrap()["n"], 1);

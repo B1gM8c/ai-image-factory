@@ -574,6 +574,16 @@ fn persisted_generation_error(error_code: Option<&str>) -> ImageGatewayError {
         Some("codex_image_output_disappeared") => {
             ImageGatewayError::codex_image_output_disappeared()
         }
+        Some(
+            code @ ("codex_authentication_rejected"
+            | "codex_credentials_unavailable"
+            | "codex_image_edit_rate_limited"
+            | "codex_image_edit_upstream_unavailable"
+            | "codex_image_edit_rejected"
+            | "codex_image_edit_request_invalid"
+            | "codex_image_edit_invalid_response"
+            | "codex_image_edit_outcome_unknown"),
+        ) => ImageGatewayError::codex_image_edit_failure(code),
         Some("service_unavailable") => {
             ImageGatewayError::service_unavailable("Image generation backend unavailable")
         }
@@ -1390,6 +1400,28 @@ mod tests {
         assert_eq!(
             output_disappeared.error_code(),
             Some("codex_image_output_disappeared")
+        );
+
+        for code in [
+            "codex_authentication_rejected",
+            "codex_credentials_unavailable",
+            "codex_image_edit_rate_limited",
+            "codex_image_edit_upstream_unavailable",
+            "codex_image_edit_rejected",
+            "codex_image_edit_request_invalid",
+            "codex_image_edit_invalid_response",
+            "codex_image_edit_outcome_unknown",
+        ] {
+            let error = persisted_generation_error(Some(code));
+            assert_eq!(error.error_code(), Some(code));
+        }
+        assert_eq!(
+            persisted_generation_error(Some("codex_image_edit_rate_limited")).status_code(),
+            axum::http::StatusCode::TOO_MANY_REQUESTS
+        );
+        assert_eq!(
+            persisted_generation_error(Some("codex_authentication_rejected")).status_code(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
         );
 
         let unavailable = persisted_generation_error(Some("service_unavailable"));

@@ -18,8 +18,8 @@ use tokio::{process::Command, time::Instant};
 use uuid::Uuid;
 
 use super::{
-    CodexExecutionRequest, CodexOutputRequest, ExecutorLaunchContext, ExecutorSubmissionLease,
-    RunnerError, SingleOutputSupervisor, SupervisedOutput,
+    CodexEditOutputRequest, CodexExecutionRequest, CodexOutputRequest, ExecutorLaunchContext,
+    ExecutorSubmissionLease, RunnerError, SingleOutputSupervisor, SupervisedOutput,
     private_auth::{
         PrivateAuthSnapshot, auth_file_sha256, auth_file_snapshot,
         prepare_isolated_codex_auth_tokens, replace_isolated_codex_auth_tokens,
@@ -31,16 +31,19 @@ use super::{
 use crate::{
     ImageGatewayError, ProxyConfig,
     artifacts::media_type_from_bytes,
+    core::provider::InputImage,
     generator::GenerationJob,
     input_blobs::InputBlobStore,
-    providers::openai_codex::{build_codex_prompt, build_edit_prompt},
+    providers::openai_codex::{build_codex_prompt, direct_edit},
     runner::{
         FilesystemRunnerJournal, LaunchDecision,
         process::{
             CODEX_APP_SERVER_FAILURE_DIAGNOSTIC_FILE, CODEX_AUTH_ATTEMPT_1_FINISH_FILE,
             CODEX_AUTH_ATTEMPT_1_START_FILE, CODEX_AUTH_ATTEMPT_2_FINISH_FILE,
             CODEX_AUTH_ATTEMPT_2_START_FILE, CODEX_AUTH_REFRESH_REQUEST_FILE,
-            CODEX_AUTH_REFRESH_RESULT_FILE, ExecutionSpool, ProcessObservation, ProcessSpoolError,
+            CODEX_AUTH_REFRESH_RESULT_FILE, CODEX_EDIT_ATTEMPT_1_FINISH_FILE,
+            CODEX_EDIT_ATTEMPT_1_START_FILE, CODEX_EDIT_ATTEMPT_2_FINISH_FILE,
+            CODEX_EDIT_ATTEMPT_2_START_FILE, ExecutionSpool, ProcessObservation, ProcessSpoolError,
             ProcessTerminal, ProviderProcessIdentity, RunnerLock, sha256,
         },
     },
@@ -140,6 +143,37 @@ struct CodexAuthAttemptBindingV1 {
     provider_start_token: String,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CodexEditAttemptDiagnosticV1 {
+    schema_version: u16,
+    executor_execution_id: String,
+    attempt: u8,
+    phase: String,
+    output_index: u32,
+    credential_revision: i64,
+    credential_fingerprint_sha256: String,
+    isolated_auth_sha256: String,
+    auth_device: u64,
+    auth_inode: u64,
+    auth_byte_size: u64,
+    auth_modified_seconds: i64,
+    auth_modified_nanoseconds: i64,
+    auth_changed_seconds: i64,
+    auth_changed_nanoseconds: i64,
+    terminal_state: Option<String>,
+    error_code: Option<String>,
+    http_status: Option<u16>,
+    output_sha256: Option<String>,
+    output_byte_size: Option<u64>,
+}
+
+struct PromotedCodexAuth {
+    revision: i64,
+    fingerprint_sha256: String,
+    isolated_auth_sha256: String,
+}
+
 enum ChildOutcome {
     Succeeded(Vec<u8>),
     Failed(&'static str),
@@ -210,6 +244,85 @@ fn auth_binding_unchanged(
         && start.auth_changed_nanoseconds == finish.auth_changed_nanoseconds
         && start.provider_pid == finish.provider_pid
         && start.provider_start_token == finish.provider_start_token
+}
+
+fn edit_attempt_files(attempt: u8) -> Option<(&'static str, &'static str)> {
+    match attempt {
+        1 => Some((
+            CODEX_EDIT_ATTEMPT_1_START_FILE,
+            CODEX_EDIT_ATTEMPT_1_FINISH_FILE,
+        )),
+        2 => Some((
+            CODEX_EDIT_ATTEMPT_2_START_FILE,
+            CODEX_EDIT_ATTEMPT_2_FINISH_FILE,
+        )),
+        _ => None,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn edit_attempt_diagnostic(
+    request: &CodexChildRequest,
+    attempt: u8,
+    phase: &str,
+    output_index: u32,
+    credential_revision: i64,
+    credential_fingerprint_sha256: &str,
+    snapshot: &PrivateAuthSnapshot,
+    terminal_state: Option<&str>,
+    error_code: Option<&str>,
+    http_status: Option<u16>,
+    output: Option<&[u8]>,
+) -> CodexEditAttemptDiagnosticV1 {
+    CodexEditAttemptDiagnosticV1 {
+        schema_version: 1,
+        executor_execution_id: request.executor_execution_id.clone(),
+        attempt,
+        phase: phase.to_owned(),
+        output_index,
+        credential_revision,
+        credential_fingerprint_sha256: credential_fingerprint_sha256.to_owned(),
+        isolated_auth_sha256: snapshot.sha256.clone(),
+        auth_device: snapshot.device,
+        auth_inode: snapshot.inode,
+        auth_byte_size: snapshot.byte_size,
+        auth_modified_seconds: snapshot.modified_seconds,
+        auth_modified_nanoseconds: snapshot.modified_nanoseconds,
+        auth_changed_seconds: snapshot.changed_seconds,
+        auth_changed_nanoseconds: snapshot.changed_nanoseconds,
+        terminal_state: terminal_state.map(str::to_owned),
+        error_code: error_code.map(str::to_owned),
+        http_status,
+        output_sha256: output.map(sha256),
+        output_byte_size: output.map(|bytes| bytes.len() as u64),
+    }
+}
+
+fn edit_attempt_binding_unchanged(
+    start: &CodexEditAttemptDiagnosticV1,
+    finish: &CodexEditAttemptDiagnosticV1,
+) -> bool {
+    start.schema_version == finish.schema_version
+        && start.executor_execution_id == finish.executor_execution_id
+        && start.attempt == finish.attempt
+        && start.phase == "image_generation_started"
+        && finish.phase == "image_generation_finished"
+        && start.output_index == finish.output_index
+        && start.credential_revision == finish.credential_revision
+        && start.credential_fingerprint_sha256 == finish.credential_fingerprint_sha256
+        && start.isolated_auth_sha256 == finish.isolated_auth_sha256
+        && start.auth_device == finish.auth_device
+        && start.auth_inode == finish.auth_inode
+        && start.auth_byte_size == finish.auth_byte_size
+        && start.auth_modified_seconds == finish.auth_modified_seconds
+        && start.auth_modified_nanoseconds == finish.auth_modified_nanoseconds
+        && start.auth_changed_seconds == finish.auth_changed_seconds
+        && start.auth_changed_nanoseconds == finish.auth_changed_nanoseconds
+        && start.terminal_state.is_none()
+        && start.error_code.is_none()
+        && start.http_status.is_none()
+        && start.output_sha256.is_none()
+        && start.output_byte_size.is_none()
 }
 
 impl CodexProcessSupervisor {
@@ -757,6 +870,258 @@ pub async fn run_codex_runner_child(
     Ok(())
 }
 
+async fn wait_for_promoted_codex_auth(
+    spool: &ExecutionSpool,
+    request: &CodexChildRequest,
+    codex_home: &Path,
+    deadline: Instant,
+    observed_revision: i64,
+    observed_fingerprint_sha256: &str,
+    observed_isolated_auth_sha256: &str,
+) -> Result<PromotedCodexAuth, ChildOutcome> {
+    let refresh_request = CodexAuthRefreshRequestV1 {
+        schema_version: 1,
+        executor_execution_id: request.executor_execution_id.clone(),
+        observed_revision,
+        observed_fingerprint_sha256: observed_fingerprint_sha256.to_owned(),
+        observed_isolated_auth_sha256: observed_isolated_auth_sha256.to_owned(),
+    };
+    if spool
+        .publish_diagnostic(CODEX_AUTH_REFRESH_REQUEST_FILE, &refresh_request)
+        .is_err()
+    {
+        return Err(ChildOutcome::Uncertain("codex_auth_refresh_handoff_failed"));
+    }
+    let refresh_result = loop {
+        match spool.read_diagnostic::<CodexAuthRefreshResultV1>(CODEX_AUTH_REFRESH_RESULT_FILE) {
+            Ok(Some(result)) => break result,
+            Ok(None) => {}
+            Err(_) => return Err(ChildOutcome::Uncertain("codex_auth_refresh_handoff_failed")),
+        }
+        if deadline.saturating_duration_since(Instant::now()).is_zero() {
+            return Err(ChildOutcome::Failed("codex_authentication_rejected"));
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    match refresh_result {
+        CodexAuthRefreshResultV1::Succeeded {
+            schema_version: 1,
+            executor_execution_id,
+            observed_revision: result_observed_revision,
+            observed_fingerprint_sha256: result_observed_fingerprint,
+            observed_isolated_auth_sha256: result_observed_isolated,
+            promoted_revision,
+            promoted_fingerprint_sha256,
+            promoted_isolated_auth_sha256,
+        } if executor_execution_id == request.executor_execution_id
+            && result_observed_revision == observed_revision
+            && result_observed_fingerprint == observed_fingerprint_sha256
+            && result_observed_isolated == observed_isolated_auth_sha256
+            && promoted_revision > observed_revision
+            && promoted_fingerprint_sha256 != observed_fingerprint_sha256
+            && auth_file_sha256(codex_home).ok().as_deref()
+                == Some(promoted_isolated_auth_sha256.as_str()) =>
+        {
+            Ok(PromotedCodexAuth {
+                revision: promoted_revision,
+                fingerprint_sha256: promoted_fingerprint_sha256,
+                isolated_auth_sha256: promoted_isolated_auth_sha256,
+            })
+        }
+        _ => Err(ChildOutcome::Failed("codex_authentication_rejected")),
+    }
+}
+
+fn read_direct_edit_inputs(
+    spool: &ExecutionSpool,
+    request: &CodexEditOutputRequest,
+) -> Result<(Vec<InputImage>, Option<InputImage>), ChildOutcome> {
+    let mut images = Vec::new();
+    let mut mask = None;
+    for input in &request.inputs {
+        let mut file = spool
+            .open_provider_input(&input.filename)
+            .map_err(|_| ChildOutcome::Failed("codex_input_integrity_failed"))?;
+        let capacity = usize::try_from(input.byte_size)
+            .ok()
+            .filter(|size| *size <= MAX_INPUT_IMAGE_BYTES as usize)
+            .ok_or(ChildOutcome::Failed("codex_input_integrity_failed"))?;
+        let mut bytes = Vec::with_capacity(capacity);
+        Read::by_ref(&mut file)
+            .take(MAX_INPUT_IMAGE_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| ChildOutcome::Failed("codex_input_integrity_failed"))?;
+        if bytes.len() as u64 != input.byte_size
+            || sha256(&bytes) != input.sha256_hex
+            || media_type_from_bytes(&bytes).ok() != Some(input.media_type.as_str())
+        {
+            return Err(ChildOutcome::Failed("codex_input_integrity_failed"));
+        }
+        let image = InputImage {
+            filename: Some(input.filename.clone()),
+            content_type: Some(input.media_type.clone()),
+            bytes,
+        };
+        match input.role.as_str() {
+            "image" => images.push(image),
+            "mask" if mask.is_none() => mask = Some(image),
+            _ => return Err(ChildOutcome::Failed("codex_input_integrity_failed")),
+        }
+    }
+    if images.is_empty() {
+        return Err(ChildOutcome::Failed("codex_input_integrity_failed"));
+    }
+    Ok((images, mask))
+}
+
+async fn run_direct_edit_child(
+    spool: &ExecutionSpool,
+    request: &CodexChildRequest,
+    edit: &CodexEditOutputRequest,
+    codex_home: &Path,
+    deadline: Instant,
+    endpoint: Option<&str>,
+) -> ChildOutcome {
+    let (images, mask) = match read_direct_edit_inputs(spool, edit) {
+        Ok(inputs) => inputs,
+        Err(outcome) => return outcome,
+    };
+    let mut attempt = 1_u8;
+    let mut active_revision = request.credential_revision;
+    let mut active_fingerprint = request.credential_auth_sha256.clone();
+    let mut active_isolated_sha256 = request.isolated_auth_sha256.clone();
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return ChildOutcome::Uncertain("codex_timeout");
+        }
+        let start_snapshot = match auth_file_snapshot(codex_home) {
+            Ok(snapshot) if snapshot.sha256 == active_isolated_sha256 => snapshot,
+            _ => return ChildOutcome::Uncertain("codex_auth_binding_invalid"),
+        };
+        let Some((start_file, finish_file)) = edit_attempt_files(attempt) else {
+            return ChildOutcome::Uncertain("codex_edit_attempt_invalid");
+        };
+        let started = edit_attempt_diagnostic(
+            request,
+            attempt,
+            "image_generation_started",
+            edit.candidate_index,
+            active_revision,
+            &active_fingerprint,
+            &start_snapshot,
+            None,
+            None,
+            None,
+            None,
+        );
+        if spool.publish_diagnostic(start_file, &started).is_err() {
+            return ChildOutcome::Uncertain("codex_edit_start_not_durable");
+        }
+        let result = match endpoint {
+            Some(endpoint) => {
+                direct_edit::edit_one_at(
+                    endpoint,
+                    codex_home,
+                    &images,
+                    mask.as_ref(),
+                    direct_edit::DirectEditParameters {
+                        prompt: &edit.prompt,
+                        background: &edit.background,
+                        quality: &edit.quality,
+                        size: &edit.size,
+                        output_index: edit.candidate_index,
+                    },
+                    remaining,
+                )
+                .await
+            }
+            None => {
+                direct_edit::edit_one(
+                    codex_home,
+                    &images,
+                    mask.as_ref(),
+                    direct_edit::DirectEditParameters {
+                        prompt: &edit.prompt,
+                        background: &edit.background,
+                        quality: &edit.quality,
+                        size: &edit.size,
+                        output_index: edit.candidate_index,
+                    },
+                    remaining,
+                )
+                .await
+            }
+        };
+        let finish_snapshot = match auth_file_snapshot(codex_home) {
+            Ok(snapshot) => snapshot,
+            Err(_) => return ChildOutcome::Uncertain("codex_auth_binding_invalid"),
+        };
+        let (terminal_state, error_code, http_status, output) = match &result {
+            Ok(image) => (
+                Some("image_generation_completed"),
+                None,
+                Some(200),
+                Some(image.bytes.as_slice()),
+            ),
+            Err(error) => (
+                Some("image_generation_failed"),
+                Some(error.error_code()),
+                error.http_status(),
+                None,
+            ),
+        };
+        let finished = edit_attempt_diagnostic(
+            request,
+            attempt,
+            "image_generation_finished",
+            edit.candidate_index,
+            active_revision,
+            &active_fingerprint,
+            &finish_snapshot,
+            terminal_state,
+            error_code,
+            http_status,
+            output,
+        );
+        let binding_unchanged = edit_attempt_binding_unchanged(&started, &finished);
+        let finish_durable = spool.publish_diagnostic(finish_file, &finished).is_ok();
+        if !binding_unchanged {
+            return ChildOutcome::Uncertain("codex_auth_binding_changed");
+        }
+        if !finish_durable {
+            return ChildOutcome::Uncertain("codex_edit_completion_not_durable");
+        }
+        match result {
+            Ok(image) => return ChildOutcome::Succeeded(image.bytes),
+            Err(error) if attempt == 1 && error.is_authentication_rejection() => {
+                let promoted = match wait_for_promoted_codex_auth(
+                    spool,
+                    request,
+                    codex_home,
+                    deadline,
+                    active_revision,
+                    &active_fingerprint,
+                    &active_isolated_sha256,
+                )
+                .await
+                {
+                    Ok(promoted) => promoted,
+                    Err(outcome) => return outcome,
+                };
+                active_revision = promoted.revision;
+                active_fingerprint = promoted.fingerprint_sha256;
+                active_isolated_sha256 = promoted.isolated_auth_sha256;
+                attempt = 2;
+            }
+            Err(error) if error.outcome_uncertain() => {
+                return ChildOutcome::Uncertain(error.error_code());
+            }
+            Err(error) => return ChildOutcome::Failed(error.error_code()),
+        }
+    }
+}
+
 async fn run_codex_child(
     spool: Arc<ExecutionSpool>,
     runner_lock: Arc<RunnerLock>,
@@ -785,14 +1150,19 @@ async fn run_codex_child(
         Ok(path) => path,
         Err(_) => return ChildOutcome::Uncertain("runner_codex_home_invalid"),
     };
-    let (prompt, input_paths) = match child_invocation(&request.output, &spool, workspace) {
+    let request_timeout = Duration::from_millis(request.timeout_ms);
+    let deadline = Instant::now() + request_timeout;
+    if let CodexExecutionRequest::Edit(edit) = &request.output {
+        let outcome =
+            run_direct_edit_child(&spool, &request, edit, codex_home, deadline, None).await;
+        return normalize_child_outcome(outcome, &request.output);
+    }
+    let (prompt, input_paths) = match child_invocation(&request.output, workspace) {
         Ok(invocation) => invocation,
         Err(outcome) => return outcome,
     };
     let mut environment = allowed_child_environment();
     environment.push(("PATH".to_string(), CODEX_CHILD_PATH.to_string()));
-    let request_timeout = Duration::from_millis(request.timeout_ms);
-    let deadline = Instant::now() + request_timeout;
     let mut attempt = 1_u8;
     let mut active_credential_revision = request.credential_revision;
     let mut active_credential_fingerprint_sha256 = request.credential_auth_sha256.clone();
@@ -1003,12 +1373,16 @@ async fn run_codex_child(
             }
         }
     };
+    normalize_child_outcome(outcome, &request.output)
+}
+
+fn normalize_child_outcome(outcome: ChildOutcome, request: &CodexExecutionRequest) -> ChildOutcome {
     match outcome {
         ChildOutcome::Succeeded(bytes) => {
             match normalize_captured_image(
                 bytes,
-                request.output.output_format(),
-                request.output.output_compression(),
+                request.output_format(),
+                request.output_compression(),
             ) {
                 Ok(bytes) => ChildOutcome::Succeeded(bytes),
                 Err(()) => ChildOutcome::Failed("codex_durable_output_invalid"),
@@ -1132,7 +1506,6 @@ fn validate_child_request(
 
 fn child_invocation(
     request: &CodexExecutionRequest,
-    spool: &ExecutionSpool,
     workspace: &Path,
 ) -> Result<(String, Vec<PathBuf>), ChildOutcome> {
     match request {
@@ -1143,42 +1516,8 @@ fn child_invocation(
                 Vec::new(),
             ))
         }
-        CodexExecutionRequest::Edit(request) => {
-            let image_count = request
-                .inputs
-                .iter()
-                .filter(|input| input.role == "image")
-                .count();
-            let has_mask = request.inputs.iter().any(|input| input.role == "mask");
-            let mut prompt = build_edit_prompt(&request.prompt, image_count, has_mask);
-            if request.original_n > 1 {
-                prompt.push_str(&format!(
-                    "\n整个请求需要 {} 张候选结果；当前只生成第 {}/{} 张。请只输出这一张，并让它保持用户需求一致但与其他候选有独立细节。",
-                    request.original_n, request.candidate_index, request.original_n
-                ));
-            }
-            let root = spool
-                .provider_attempt_path()
-                .map_err(|_| ChildOutcome::Uncertain("codex_input_integrity_failed"))?;
-            let mut paths = Vec::with_capacity(request.inputs.len());
-            for input in &request.inputs {
-                let mut file = spool
-                    .open_provider_input(&input.filename)
-                    .map_err(|_| ChildOutcome::Failed("codex_input_integrity_failed"))?;
-                let mut bytes = Vec::with_capacity(input.byte_size as usize);
-                Read::by_ref(&mut file)
-                    .take(MAX_INPUT_IMAGE_BYTES + 1)
-                    .read_to_end(&mut bytes)
-                    .map_err(|_| ChildOutcome::Failed("codex_input_integrity_failed"))?;
-                if bytes.len() as u64 != input.byte_size
-                    || sha256(&bytes) != input.sha256_hex
-                    || media_type_from_bytes(&bytes).ok() != Some(input.media_type.as_str())
-                {
-                    return Err(ChildOutcome::Failed("codex_input_integrity_failed"));
-                }
-                paths.push(root.join(&input.filename));
-            }
-            Ok((prompt, paths))
+        CodexExecutionRequest::Edit(_) => {
+            Err(ChildOutcome::Uncertain("codex_edit_dispatch_invalid"))
         }
     }
 }
@@ -1429,9 +1768,18 @@ fn child_spool_error(_error: ProcessSpoolError) -> ImageGatewayError {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use std::collections::{HashSet, VecDeque};
     use std::os::unix::fs::{PermissionsExt, symlink};
 
+    use axum::{
+        Json, Router,
+        extract::State,
+        http::{HeaderMap, StatusCode},
+        response::{IntoResponse, Response},
+        routing::post,
+    };
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use serde_json::{Value, json};
     use tempfile::TempDir;
 
     use super::*;
@@ -1449,6 +1797,191 @@ mod tests {
             r#"{{"auth_mode":"chatgpt","OPENAI_API_KEY":null,"tokens":{{"id_token":"header.payload.signature","access_token":"{access_token}","refresh_token":"{refresh_token}","account_id":"account-1"}},"last_refresh":"2026-08-24T03:21:17Z"}}"#
         )
         .into_bytes()
+    }
+
+    #[derive(Default)]
+    struct DirectEditServerState {
+        statuses: Mutex<VecDeque<StatusCode>>,
+        requests: Mutex<Vec<Value>>,
+        authorizations: Mutex<Vec<String>>,
+        concurrency: Mutex<(usize, usize)>,
+        output: Vec<u8>,
+        delay: Duration,
+    }
+
+    async fn direct_edit_handler(
+        State(state): State<Arc<DirectEditServerState>>,
+        headers: HeaderMap,
+        Json(body): Json<Value>,
+    ) -> Response {
+        state.requests.lock().unwrap().push(body);
+        state.authorizations.lock().unwrap().push(
+            headers
+                .get(reqwest::header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_string(),
+        );
+        {
+            let mut concurrency = state.concurrency.lock().unwrap();
+            concurrency.0 += 1;
+            concurrency.1 = concurrency.1.max(concurrency.0);
+        }
+        if !state.delay.is_zero() {
+            tokio::time::sleep(state.delay).await;
+        }
+        let status = state
+            .statuses
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or(StatusCode::OK);
+        let response = if status == StatusCode::OK {
+            (
+                status,
+                Json(json!({"data": [{"b64_json": STANDARD.encode(&state.output)}]})),
+            )
+                .into_response()
+        } else {
+            (
+                status,
+                Json(json!({"error": {"code": "authentication_error"}})),
+            )
+                .into_response()
+        };
+        state.concurrency.lock().unwrap().0 -= 1;
+        response
+    }
+
+    async fn start_direct_edit_server(
+        statuses: impl IntoIterator<Item = StatusCode>,
+    ) -> (
+        String,
+        Arc<DirectEditServerState>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        start_direct_edit_server_with_delay(statuses, Duration::ZERO).await
+    }
+
+    async fn start_direct_edit_server_with_delay(
+        statuses: impl IntoIterator<Item = StatusCode>,
+        delay: Duration,
+    ) -> (
+        String,
+        Arc<DirectEditServerState>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let state = Arc::new(DirectEditServerState {
+            statuses: Mutex::new(statuses.into_iter().collect()),
+            output: png_bytes(3, 2),
+            delay,
+            ..DirectEditServerState::default()
+        });
+        let app = Router::new()
+            .route("/images/edits", post(direct_edit_handler))
+            .with_state(Arc::clone(&state));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/images/edits", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (endpoint, state, task)
+    }
+
+    async fn prepare_managed_edit_output(
+        fixture: &CodexFixture,
+        blobs: Arc<InMemoryArtifactBlobStore>,
+        n: u32,
+        candidate_index: u32,
+    ) -> (
+        ExecutorSubmissionLease,
+        Arc<ExecutionSpool>,
+        CodexChildRequest,
+    ) {
+        let input_bytes = png_bytes(2, 3);
+        let input = blobs
+            .put(
+                InputBlobKey {
+                    admission_session_id: Uuid::new_v4(),
+                    input_id: Uuid::new_v4(),
+                },
+                &input_bytes,
+            )
+            .await
+            .unwrap();
+        let command = EditCommandV1::from_edit_job(
+            &crate::EditJob {
+                request_id: format!("edit-request-{n}-{candidate_index}"),
+                model: "gpt-image-2".to_string(),
+                prompt: "use the exact user edit instruction".to_string(),
+                moderation: "auto".to_string(),
+                images: Vec::new(),
+                mask: None,
+                n,
+                size: "1024x1024".to_string(),
+                quality: "high".to_string(),
+                output_format: "png".to_string(),
+                output_compression: None,
+                background: "opaque".to_string(),
+                stream: false,
+                partial_images: 0,
+            },
+            vec![EditInputDescriptorV1 {
+                byte_size: input.byte_size,
+                index: 0,
+                media_type: "image/png".to_string(),
+                role: EditInputRoleV1::Image,
+                sha256_hex: input.sha256_hex.clone(),
+            }],
+            "openai-images-v1",
+            "openai-codex",
+        );
+        let lease = ExecutorSubmissionLease {
+            submission_id: Uuid::new_v4(),
+            executor_execution_id: Uuid::new_v4(),
+            output_id: Uuid::new_v4(),
+            job_id: Uuid::new_v4(),
+            tenant_id: "tenant-1".to_string(),
+            provider_id: "openai-codex".to_string(),
+            model: "gpt-image-2".to_string(),
+            work_item_id: Uuid::new_v4(),
+            output_index: i32::try_from(candidate_index - 1).unwrap(),
+            command_schema: EDIT_COMMAND_SCHEMA.to_string(),
+            command_hash: command.request_hash_hex(),
+            execution_profile_id: Uuid::new_v4(),
+            adapter_revision: crate::executor::CODEX_EDIT_INLINE_ADAPTER_REVISION.to_string(),
+            executor_owner: "executor-owner-1".to_string(),
+            executor_lease_epoch: 1,
+            executor_lease_expires_at_ms: i64::MAX,
+        };
+        let context = ExecutorLaunchContext::new(
+            format!("edit-request-{n}-{candidate_index}"),
+            "openai-images-v1",
+            lease.output_index,
+            EDIT_COMMAND_SCHEMA,
+            command.request_hash_hex(),
+            serde_json::to_value(&command).unwrap(),
+        )
+        .unwrap()
+        .with_inputs(vec![
+            crate::executor::ExecutorInputObject::new(input, "image", 0, "image/png").unwrap(),
+        ])
+        .unwrap();
+        fixture.journal.start_or_attach(&lease).unwrap();
+        fixture
+            .supervisor
+            .clone()
+            .with_input_blobs(blobs)
+            .prepare(&lease, &context)
+            .await
+            .unwrap();
+        assert_eq!(
+            fixture.journal.commit_launch(&lease).unwrap(),
+            LaunchDecision::LaunchOnce
+        );
+        let spool = Arc::new(ExecutionSpool::for_lease(&fixture.journal, &lease).unwrap());
+        let request = serde_json::from_slice(&spool.read_request().unwrap()).unwrap();
+        (lease, spool, request)
     }
 
     #[test]
@@ -2056,6 +2589,350 @@ mod tests {
             fs::read(spool.provider_attempt_path().unwrap().join("input-0.png")).unwrap(),
             input_bytes
         );
+    }
+
+    #[tokio::test]
+    async fn managed_edits_use_one_deterministic_direct_request_per_output_at_n_1_2_3_4() {
+        let fixture = CodexFixture::new();
+        let blobs = Arc::new(InMemoryArtifactBlobStore::default());
+        let (endpoint, state, server) =
+            start_direct_edit_server_with_delay([], Duration::from_millis(25)).await;
+
+        for n in [1, 2, 3, 4] {
+            let mut tasks = tokio::task::JoinSet::new();
+            for candidate_index in 1..=n {
+                let (_lease, spool, request) =
+                    prepare_managed_edit_output(&fixture, Arc::clone(&blobs), n, candidate_index)
+                        .await;
+                let CodexExecutionRequest::Edit(edit) = request.output.clone() else {
+                    panic!("managed edit projected as generation");
+                };
+                let endpoint = endpoint.clone();
+                tasks.spawn(async move {
+                    let codex_home = spool.codex_home_path().unwrap();
+                    let outcome = run_direct_edit_child(
+                        &spool,
+                        &request,
+                        &edit,
+                        codex_home,
+                        Instant::now() + Duration::from_secs(5),
+                        Some(&endpoint),
+                    )
+                    .await;
+                    (spool, candidate_index, outcome)
+                });
+            }
+            while let Some(result) = tasks.join_next().await {
+                let (spool, candidate_index, outcome) = result.unwrap();
+                assert!(matches!(outcome, ChildOutcome::Succeeded(_)));
+                let start: CodexEditAttemptDiagnosticV1 = spool
+                    .read_diagnostic(CODEX_EDIT_ATTEMPT_1_START_FILE)
+                    .unwrap()
+                    .unwrap();
+                let finish: CodexEditAttemptDiagnosticV1 = spool
+                    .read_diagnostic(CODEX_EDIT_ATTEMPT_1_FINISH_FILE)
+                    .unwrap()
+                    .unwrap();
+                assert!(edit_attempt_binding_unchanged(&start, &finish));
+                assert_eq!(start.phase, "image_generation_started");
+                assert_eq!(finish.phase, "image_generation_finished");
+                assert_eq!(
+                    finish.terminal_state.as_deref(),
+                    Some("image_generation_completed")
+                );
+                assert_eq!(finish.output_index, candidate_index);
+                assert!(finish.output_sha256.is_some());
+            }
+        }
+
+        let requests = state.requests.lock().unwrap();
+        assert_eq!(requests.len(), 10);
+        assert!(requests.iter().all(|request| {
+            request["n"] == 1
+                && request["prompt"] == "use the exact user edit instruction"
+                && request["size"] == "1024x1024"
+                && request["quality"] == "high"
+                && request["background"] == "opaque"
+                && request["images"].as_array().map(Vec::len) == Some(1)
+        }));
+        assert_eq!(state.concurrency.lock().unwrap().1, 4);
+        assert!(
+            !fixture.invocations.exists(),
+            "the adversarial text-only app-server fixture must never be invoked for edits"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn managed_edit_rebinds_once_after_exact_http_401_and_stops_after_a_second_401() {
+        for (statuses, expected) in [
+            (vec![StatusCode::UNAUTHORIZED, StatusCode::OK], "succeeded"),
+            (
+                vec![StatusCode::UNAUTHORIZED, StatusCode::UNAUTHORIZED],
+                "failed",
+            ),
+        ] {
+            let fixture = CodexFixture::new();
+            let blobs = Arc::new(InMemoryArtifactBlobStore::default());
+            let (endpoint, state, server) = start_direct_edit_server(statuses).await;
+            let (_lease, spool, request) = prepare_managed_edit_output(&fixture, blobs, 1, 1).await;
+            let CodexExecutionRequest::Edit(edit) = request.output.clone() else {
+                panic!("managed edit projected as generation");
+            };
+            let task_spool = Arc::clone(&spool);
+            let task_request = request.clone();
+            let task_endpoint = endpoint.clone();
+            let child = tokio::spawn(async move {
+                let codex_home = task_spool.codex_home_path().unwrap();
+                run_direct_edit_child(
+                    &task_spool,
+                    &task_request,
+                    &edit,
+                    codex_home,
+                    Instant::now() + Duration::from_secs(5),
+                    Some(&task_endpoint),
+                )
+                .await
+            });
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if spool
+                        .read_diagnostic::<CodexAuthRefreshRequestV1>(
+                            CODEX_AUTH_REFRESH_REQUEST_FILE,
+                        )
+                        .unwrap()
+                        .is_some()
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            let prepared: CodexChildRequest =
+                serde_json::from_slice(&spool.read_request().unwrap()).unwrap();
+            let replacement_home = fixture._temp.path().join("direct-edit-replacement");
+            fs::create_dir(&replacement_home).unwrap();
+            let replacement = replacement_home.join(AUTH_FILE);
+            let replacement_bytes = managed_codex_auth("fresh-access", "fresh-refresh");
+            fs::write(&replacement, &replacement_bytes).unwrap();
+            fs::set_permissions(&replacement, fs::Permissions::from_mode(0o600)).unwrap();
+            let replacement_sha = sha256(&replacement_bytes);
+            let replacement_isolated_sha = replace_isolated_codex_auth_tokens(
+                spool.codex_home_path().unwrap(),
+                &replacement,
+                &prepared.isolated_auth_sha256,
+                &replacement_sha,
+            )
+            .unwrap();
+            spool
+                .publish_diagnostic(
+                    CODEX_AUTH_REFRESH_RESULT_FILE,
+                    &CodexAuthRefreshResultV1::Succeeded {
+                        schema_version: 1,
+                        executor_execution_id: request.executor_execution_id.clone(),
+                        observed_revision: prepared.credential_revision,
+                        observed_fingerprint_sha256: prepared.credential_auth_sha256.clone(),
+                        observed_isolated_auth_sha256: prepared.isolated_auth_sha256.clone(),
+                        promoted_revision: prepared.credential_revision + 1,
+                        promoted_fingerprint_sha256: replacement_sha,
+                        promoted_isolated_auth_sha256: replacement_isolated_sha,
+                    },
+                )
+                .unwrap();
+            let outcome = child.await.unwrap();
+            match expected {
+                "succeeded" => assert!(matches!(outcome, ChildOutcome::Succeeded(_))),
+                "failed" => assert!(matches!(
+                    outcome,
+                    ChildOutcome::Failed("codex_authentication_rejected")
+                )),
+                _ => unreachable!(),
+            }
+            assert_eq!(state.requests.lock().unwrap().len(), 2);
+            let first: CodexEditAttemptDiagnosticV1 = spool
+                .read_diagnostic(CODEX_EDIT_ATTEMPT_1_FINISH_FILE)
+                .unwrap()
+                .unwrap();
+            let second: CodexEditAttemptDiagnosticV1 = spool
+                .read_diagnostic(CODEX_EDIT_ATTEMPT_2_FINISH_FILE)
+                .unwrap()
+                .unwrap();
+            assert_eq!(first.http_status, Some(401));
+            assert_eq!(
+                first.error_code.as_deref(),
+                Some("codex_authentication_rejected")
+            );
+            assert_eq!(second.credential_revision, prepared.credential_revision + 1);
+            assert!(
+                !fixture.invocations.exists(),
+                "authentication recovery must not fall back to app-server"
+            );
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn managed_edit_never_retries_non_authentication_failures() {
+        for (status, expected_code) in [
+            (StatusCode::FORBIDDEN, "codex_image_edit_rejected"),
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                "codex_image_edit_rate_limited",
+            ),
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "codex_image_edit_upstream_unavailable",
+            ),
+        ] {
+            let fixture = CodexFixture::new();
+            let blobs = Arc::new(InMemoryArtifactBlobStore::default());
+            let (endpoint, state, server) = start_direct_edit_server([status]).await;
+            let (_lease, spool, request) = prepare_managed_edit_output(&fixture, blobs, 1, 1).await;
+            let CodexExecutionRequest::Edit(edit) = &request.output else {
+                panic!("managed edit projected as generation");
+            };
+            let outcome = run_direct_edit_child(
+                &spool,
+                &request,
+                edit,
+                spool.codex_home_path().unwrap(),
+                Instant::now() + Duration::from_secs(5),
+                Some(&endpoint),
+            )
+            .await;
+            assert!(matches!(outcome, ChildOutcome::Failed(code) if code == expected_code));
+            assert_eq!(state.requests.lock().unwrap().len(), 1);
+            assert!(
+                spool
+                    .read_diagnostic::<CodexAuthRefreshRequestV1>(CODEX_AUTH_REFRESH_REQUEST_FILE,)
+                    .unwrap()
+                    .is_none()
+            );
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn killed_direct_edit_helper_is_never_relaunched_or_submitted_twice() {
+        let fixture = CodexFixture::new();
+        let blobs = Arc::new(InMemoryArtifactBlobStore::default());
+        let (endpoint, state, server) =
+            start_direct_edit_server_with_delay([], Duration::from_secs(5)).await;
+        let (lease, spool, _request) = prepare_managed_edit_output(&fixture, blobs, 1, 1).await;
+        let mut helper = Command::new(std::env::current_exe().unwrap());
+        helper
+            .arg("orphan_helper_subprocess_entry")
+            .arg("--nocapture")
+            .arg("--test-threads=1")
+            .env("CODEX_TEST_RUNNER_ROOT", fixture.journal.root_path())
+            .env(
+                "CODEX_TEST_EXECUTION_ID",
+                lease.executor_execution_id.to_string(),
+            )
+            .env("GATEWAY_TEST_CODEX_IMAGE_EDITS_URL", &endpoint)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        let mut helper = helper.spawn().unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let started = spool
+                    .read_diagnostic::<CodexEditAttemptDiagnosticV1>(
+                        CODEX_EDIT_ATTEMPT_1_START_FILE,
+                    )
+                    .unwrap()
+                    .is_some();
+                if started && state.requests.lock().unwrap().len() == 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        helper.start_kill().unwrap();
+        helper.wait().await.unwrap();
+
+        assert!(matches!(
+            spool.observe().unwrap(),
+            ProcessObservation::Lost { provider: None }
+        ));
+        assert_eq!(
+            fixture
+                .supervisor
+                .start_or_attach(&lease, LaunchDecision::Attach)
+                .await,
+            Err(RunnerError::Unknown {
+                error_code: "runner_process_lost".to_string(),
+            })
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(state.requests.lock().unwrap().len(), 1);
+        assert!(
+            spool
+                .read_diagnostic::<CodexEditAttemptDiagnosticV1>(CODEX_EDIT_ATTEMPT_1_FINISH_FILE,)
+                .unwrap()
+                .is_none()
+        );
+        let execution_root = fixture
+            .journal
+            .root_path()
+            .join(lease.executor_execution_id.simple().to_string());
+        assert!(!execution_root.join("output.bin").exists());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn managed_edit_runner_publishes_output_then_terminal_without_app_server() {
+        let fixture = CodexFixture::new();
+        let blobs = Arc::new(InMemoryArtifactBlobStore::default());
+        let (endpoint, state, server) = start_direct_edit_server([]).await;
+        let (lease, spool, _request) = prepare_managed_edit_output(&fixture, blobs, 1, 1).await;
+        let status = Command::new(std::env::current_exe().unwrap())
+            .arg("orphan_helper_subprocess_entry")
+            .arg("--nocapture")
+            .arg("--test-threads=1")
+            .env("CODEX_TEST_RUNNER_ROOT", fixture.journal.root_path())
+            .env(
+                "CODEX_TEST_EXECUTION_ID",
+                lease.executor_execution_id.to_string(),
+            )
+            .env("GATEWAY_TEST_CODEX_IMAGE_EDITS_URL", &endpoint)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await
+            .unwrap();
+
+        assert!(status.success());
+        assert!(matches!(
+            spool.observe().unwrap(),
+            ProcessObservation::Succeeded(_)
+        ));
+        assert_eq!(state.requests.lock().unwrap().len(), 1);
+        let execution_root = fixture
+            .journal
+            .root_path()
+            .join(lease.executor_execution_id.simple().to_string());
+        assert!(execution_root.join("output.bin").is_file());
+        assert!(execution_root.join("result.json").is_file());
+        assert!(
+            execution_root
+                .join(CODEX_EDIT_ATTEMPT_1_START_FILE)
+                .is_file()
+        );
+        assert!(
+            execution_root
+                .join(CODEX_EDIT_ATTEMPT_1_FINISH_FILE)
+                .is_file()
+        );
+        assert!(!execution_root.join("codex-home").exists());
+        assert!(!fixture.invocations.exists());
+        server.abort();
     }
 
     #[tokio::test]

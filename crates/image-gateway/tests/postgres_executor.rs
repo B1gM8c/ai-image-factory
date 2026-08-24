@@ -3142,6 +3142,16 @@ async fn v4_two_output_edit_all_succeed_and_settle_once() -> TestResult {
 }
 
 #[tokio::test]
+async fn v4_one_output_edit_succeeds_and_settles_once() -> TestResult {
+    assert_v4_codex_mixed_settlement(CodexBatchOperation::Edit, 1, &[0]).await
+}
+
+#[tokio::test]
+async fn v4_one_output_edit_failure_releases_the_full_hold() -> TestResult {
+    assert_v4_codex_mixed_settlement(CodexBatchOperation::Edit, 1, &[]).await
+}
+
+#[tokio::test]
 async fn v4_two_output_edit_preserves_one_success_and_releases_one_failure() -> TestResult {
     assert_v4_codex_mixed_settlement(CodexBatchOperation::Edit, 2, &[1]).await
 }
@@ -3152,8 +3162,28 @@ async fn v4_two_output_edit_all_failed_releases_the_full_hold() -> TestResult {
 }
 
 #[tokio::test]
+async fn v4_three_output_edit_preserves_two_successes_and_releases_one_failure() -> TestResult {
+    assert_v4_codex_mixed_settlement(CodexBatchOperation::Edit, 3, &[0, 2]).await
+}
+
+#[tokio::test]
+async fn v4_three_output_edit_all_succeed_and_settle_once() -> TestResult {
+    assert_v4_codex_mixed_settlement(CodexBatchOperation::Edit, 3, &[0, 1, 2]).await
+}
+
+#[tokio::test]
 async fn v4_four_output_edit_preserves_two_successes_and_releases_two_failures() -> TestResult {
     assert_v4_codex_mixed_settlement(CodexBatchOperation::Edit, 4, &[0, 2]).await
+}
+
+#[tokio::test]
+async fn v4_four_output_edit_all_succeed_and_settle_once() -> TestResult {
+    assert_v4_codex_mixed_settlement(CodexBatchOperation::Edit, 4, &[0, 1, 2, 3]).await
+}
+
+#[tokio::test]
+async fn v4_four_output_edit_all_failed_releases_the_full_hold() -> TestResult {
+    assert_v4_codex_mixed_settlement(CodexBatchOperation::Edit, 4, &[]).await
 }
 
 #[derive(Clone, Copy)]

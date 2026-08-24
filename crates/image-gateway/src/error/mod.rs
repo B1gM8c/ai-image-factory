@@ -37,6 +37,14 @@ const CODE_CODEX_PROCESS_IDENTITY_UNAVAILABLE: &str = "codex_process_identity_un
 const CODE_CODEX_NO_IMAGE_OUTPUT: &str = "codex_no_image_output";
 const CODE_CODEX_IMAGE_TOOL_NOT_INVOKED: &str = "codex_image_tool_not_invoked";
 const CODE_CODEX_IMAGE_OUTPUT_DISAPPEARED: &str = "codex_image_output_disappeared";
+const CODE_CODEX_AUTHENTICATION_REJECTED: &str = "codex_authentication_rejected";
+const CODE_CODEX_CREDENTIALS_UNAVAILABLE: &str = "codex_credentials_unavailable";
+const CODE_CODEX_IMAGE_EDIT_RATE_LIMITED: &str = "codex_image_edit_rate_limited";
+const CODE_CODEX_IMAGE_EDIT_UPSTREAM_UNAVAILABLE: &str = "codex_image_edit_upstream_unavailable";
+const CODE_CODEX_IMAGE_EDIT_REJECTED: &str = "codex_image_edit_rejected";
+const CODE_CODEX_IMAGE_EDIT_REQUEST_INVALID: &str = "codex_image_edit_request_invalid";
+const CODE_CODEX_IMAGE_EDIT_INVALID_RESPONSE: &str = "codex_image_edit_invalid_response";
+const CODE_CODEX_IMAGE_EDIT_OUTCOME_UNKNOWN: &str = "codex_image_edit_outcome_unknown";
 const CODE_TIMEOUT: &str = "timeout";
 const CODE_SERVICE_UNAVAILABLE: &str = "service_unavailable";
 const CODE_CONFIGURATION_ERROR: &str = "configuration_error";
@@ -531,6 +539,61 @@ impl ImageGatewayError {
             None,
             CODE_CODEX_IMAGE_OUTPUT_DISAPPEARED,
         )
+    }
+
+    pub(crate) fn codex_image_edit_failure(code: &str) -> Self {
+        let (status, message, error_type, code) = match code {
+            CODE_CODEX_AUTHENTICATION_REJECTED => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Codex image edit authentication was rejected",
+                TYPE_SERVER,
+                CODE_CODEX_AUTHENTICATION_REJECTED,
+            ),
+            CODE_CODEX_CREDENTIALS_UNAVAILABLE => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Codex image edit credentials are unavailable",
+                TYPE_SERVER,
+                CODE_CODEX_CREDENTIALS_UNAVAILABLE,
+            ),
+            CODE_CODEX_IMAGE_EDIT_RATE_LIMITED => (
+                StatusCode::TOO_MANY_REQUESTS,
+                "Codex image edit rate limit reached",
+                TYPE_RATE_LIMIT,
+                CODE_CODEX_IMAGE_EDIT_RATE_LIMITED,
+            ),
+            CODE_CODEX_IMAGE_EDIT_UPSTREAM_UNAVAILABLE => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Codex image edit service is unavailable",
+                TYPE_SERVER,
+                CODE_CODEX_IMAGE_EDIT_UPSTREAM_UNAVAILABLE,
+            ),
+            CODE_CODEX_IMAGE_EDIT_REJECTED => (
+                StatusCode::BAD_GATEWAY,
+                "Codex image edit request was rejected",
+                TYPE_SERVER,
+                CODE_CODEX_IMAGE_EDIT_REJECTED,
+            ),
+            CODE_CODEX_IMAGE_EDIT_REQUEST_INVALID => (
+                StatusCode::BAD_GATEWAY,
+                "Codex image edit request contract is invalid",
+                TYPE_SERVER,
+                CODE_CODEX_IMAGE_EDIT_REQUEST_INVALID,
+            ),
+            CODE_CODEX_IMAGE_EDIT_INVALID_RESPONSE => (
+                StatusCode::BAD_GATEWAY,
+                "Codex image edit response is invalid",
+                TYPE_SERVER,
+                CODE_CODEX_IMAGE_EDIT_INVALID_RESPONSE,
+            ),
+            CODE_CODEX_IMAGE_EDIT_OUTCOME_UNKNOWN => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Codex image edit outcome is unknown",
+                TYPE_SERVER,
+                CODE_CODEX_IMAGE_EDIT_OUTCOME_UNKNOWN,
+            ),
+            _ => return Self::backend("Image generation failed"),
+        };
+        Self::new(status, message, error_type, None, code)
     }
 
     pub fn timeout() -> Self {

@@ -347,6 +347,14 @@ fn safe_failure_message(error_code: &str) -> Option<&'static str> {
         "codex_multiple_image_outputs" => Some("Codex image output authority conflicted"),
         "codex_stdin_failed" => Some("Codex app-server input channel failed"),
         "codex_process_identity_unavailable" => Some("Codex process identity unavailable"),
+        "codex_authentication_rejected" => Some("Codex image edit authentication was rejected"),
+        "codex_credentials_unavailable" => Some("Codex image edit credentials are unavailable"),
+        "codex_image_edit_rate_limited" => Some("Codex image edit rate limit reached"),
+        "codex_image_edit_upstream_unavailable" => Some("Codex image edit service is unavailable"),
+        "codex_image_edit_rejected" => Some("Codex image edit request was rejected"),
+        "codex_image_edit_request_invalid" => Some("Codex image edit request contract is invalid"),
+        "codex_image_edit_invalid_response" => Some("Codex image edit response is invalid"),
+        "codex_image_edit_outcome_unknown" => Some("Codex image edit outcome is unknown"),
         _ => None,
     }
 }
@@ -364,6 +372,10 @@ mod tests {
         assert_eq!(
             safe_failure_message("content_policy_rejected"),
             Some("The image request was rejected by the provider safety policy")
+        );
+        assert_eq!(
+            safe_failure_message("codex_image_edit_rate_limited"),
+            Some("Codex image edit rate limit reached")
         );
         assert_eq!(safe_failure_message("arbitrary upstream text"), None);
     }

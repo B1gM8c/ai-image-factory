@@ -31,6 +31,10 @@ pub(crate) const CODEX_AUTH_ATTEMPT_1_START_FILE: &str = "codex-auth-attempt-1-s
 pub(crate) const CODEX_AUTH_ATTEMPT_1_FINISH_FILE: &str = "codex-auth-attempt-1-finish.json";
 pub(crate) const CODEX_AUTH_ATTEMPT_2_START_FILE: &str = "codex-auth-attempt-2-start.json";
 pub(crate) const CODEX_AUTH_ATTEMPT_2_FINISH_FILE: &str = "codex-auth-attempt-2-finish.json";
+pub(crate) const CODEX_EDIT_ATTEMPT_1_START_FILE: &str = "codex-edit-attempt-1-start.json";
+pub(crate) const CODEX_EDIT_ATTEMPT_1_FINISH_FILE: &str = "codex-edit-attempt-1-finish.json";
+pub(crate) const CODEX_EDIT_ATTEMPT_2_START_FILE: &str = "codex-edit-attempt-2-start.json";
+pub(crate) const CODEX_EDIT_ATTEMPT_2_FINISH_FILE: &str = "codex-edit-attempt-2-finish.json";
 const WORKSPACE_DIR: &str = "workspace";
 const CODEX_HOME_DIR: &str = "codex-home";
 const RUNTIME_HOME_DIR: &str = "runtime-home";
@@ -587,6 +591,10 @@ impl ExecutionSpool {
                 | CODEX_AUTH_ATTEMPT_1_FINISH_FILE
                 | CODEX_AUTH_ATTEMPT_2_START_FILE
                 | CODEX_AUTH_ATTEMPT_2_FINISH_FILE
+                | CODEX_EDIT_ATTEMPT_1_START_FILE
+                | CODEX_EDIT_ATTEMPT_1_FINISH_FILE
+                | CODEX_EDIT_ATTEMPT_2_START_FILE
+                | CODEX_EDIT_ATTEMPT_2_FINISH_FILE
         ) || (filename.starts_with("grok-")
             && filename.ends_with(".json")
             && filename.len() <= 64
@@ -611,6 +619,10 @@ impl ExecutionSpool {
                 | CODEX_AUTH_ATTEMPT_1_FINISH_FILE
                 | CODEX_AUTH_ATTEMPT_2_START_FILE
                 | CODEX_AUTH_ATTEMPT_2_FINISH_FILE
+                | CODEX_EDIT_ATTEMPT_1_START_FILE
+                | CODEX_EDIT_ATTEMPT_1_FINISH_FILE
+                | CODEX_EDIT_ATTEMPT_2_START_FILE
+                | CODEX_EDIT_ATTEMPT_2_FINISH_FILE
         ) {
             return Err(ProcessSpoolError::InvalidInput);
         }
