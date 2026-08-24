@@ -21,7 +21,7 @@ use super::{
     CodexExecutionRequest, CodexOutputRequest, ExecutorLaunchContext, ExecutorSubmissionLease,
     RunnerError, SingleOutputSupervisor, SupervisedOutput,
     private_auth::{
-        PrivateAuthSnapshot, auth_file_sha256, auth_file_snapshot, prepare_isolated_auth,
+        PrivateAuthSnapshot, auth_file_sha256, auth_file_snapshot,
         prepare_isolated_codex_auth_tokens, replace_isolated_codex_auth_tokens,
         validate_auth_source,
     },
@@ -575,7 +575,8 @@ pub fn prepare_codex_auth_copy(
 ) -> Result<(), ImageGatewayError> {
     let source = validate_auth_source(source_home.as_ref(), expected_sha256)
         .map_err(|_| ImageGatewayError::config("managed Codex auth source is invalid"))?;
-    prepare_isolated_auth(destination_home.as_ref(), &source, expected_sha256)
+    prepare_isolated_codex_auth_tokens(destination_home.as_ref(), &source, expected_sha256)
+        .map(|_| ())
         .map_err(|_| ImageGatewayError::config("managed Codex auth copy is invalid"))
 }
 

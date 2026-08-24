@@ -797,7 +797,7 @@ mod tests {
         let auth = credential_home.join("auth.json");
         std::fs::write(
             &auth,
-            br#"{"tokens":{"access_token":"before-test","account_id":"account-test"}}"#,
+            br#"{"auth_mode":"chatgpt","OPENAI_API_KEY":null,"tokens":{"id_token":"test-id","access_token":"before-test","refresh_token":"test-refresh","account_id":"account-test"}}"#,
         )
         .unwrap();
         std::fs::set_permissions(&auth, std::fs::Permissions::from_mode(0o600)).unwrap();
@@ -893,7 +893,11 @@ mod tests {
         std::fs::create_dir(&credential_home).unwrap();
         std::fs::set_permissions(&credential_home, std::fs::Permissions::from_mode(0o700)).unwrap();
         let auth = credential_home.join("auth.json");
-        std::fs::write(&auth, b"{}").unwrap();
+        std::fs::write(
+            &auth,
+            br#"{"auth_mode":"chatgpt","OPENAI_API_KEY":null,"tokens":{"id_token":"test-id","access_token":"test-access","refresh_token":"test-refresh","account_id":"test-account"}}"#,
+        )
+        .unwrap();
         std::fs::set_permissions(&auth, std::fs::Permissions::from_mode(0o600)).unwrap();
         let input = temp.path().join("input.png");
         let source = temp.path().join("source.png");
@@ -929,7 +933,11 @@ mod tests {
         std::fs::create_dir(&credential_home).unwrap();
         std::fs::set_permissions(&credential_home, std::fs::Permissions::from_mode(0o700)).unwrap();
         let auth = credential_home.join("auth.json");
-        std::fs::write(&auth, b"{}").unwrap();
+        std::fs::write(
+            &auth,
+            br#"{"auth_mode":"chatgpt","OPENAI_API_KEY":null,"tokens":{"id_token":"test-id","access_token":"test-access","refresh_token":"test-refresh","account_id":"test-account"}}"#,
+        )
+        .unwrap();
         std::fs::set_permissions(&auth, std::fs::Permissions::from_mode(0o600)).unwrap();
         let mut config = test_config();
         config.codex_home = Some(credential_home.to_string_lossy().into_owned());

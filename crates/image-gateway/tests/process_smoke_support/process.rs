@@ -81,7 +81,7 @@ impl SmokeFiles {
         let auth_path = codex_home.join("auth.json");
         fs::write(
             &auth_path,
-            br#"{"tokens":{"access_token":"process-smoke-access","account_id":"process-smoke-account"}}
+            br#"{"auth_mode":"chatgpt","OPENAI_API_KEY":null,"tokens":{"id_token":"process-smoke-id","access_token":"process-smoke-access","refresh_token":"process-smoke-refresh","account_id":"process-smoke-account"}}
 "#,
         )
             .map_err(|error| format!("failed to write fake Codex credentials: {error}"))?;
@@ -915,7 +915,11 @@ if [ "$refresh_mode" = false ]; then
     [ "${{HOME-}}" = "${{CODEX_HOME-}}" ] || exit 20
     if [ "${{HOME-}}" != {codex_home} ]; then
         [ -f "${{HOME-}}/auth.json" ] || exit 21
-        /usr/bin/cmp -s "${{HOME-}}/auth.json" {codex_auth} || exit 21
+        /usr/bin/grep -F '"auth_mode":"chatgptAuthTokens"' "${{HOME-}}/auth.json" >/dev/null || exit 21
+        /usr/bin/grep -F '"id_token":"process-smoke-id"' "${{HOME-}}/auth.json" >/dev/null || exit 21
+        /usr/bin/grep -F '"access_token":"process-smoke-access"' "${{HOME-}}/auth.json" >/dev/null || exit 21
+        /usr/bin/grep -F '"refresh_token":""' "${{HOME-}}/auth.json" >/dev/null || exit 21
+        ! /usr/bin/grep -F 'process-smoke-refresh' "${{HOME-}}/auth.json" >/dev/null || exit 21
     fi
 fi
 [ -z "${{GATEWAY_API_TOKEN+x}}" ] || exit 22
@@ -943,7 +947,7 @@ read_and_log
 read_and_log
 if printf '%s' "$line" | /usr/bin/grep -F '"method":"account/read"' >/dev/null; then
     printf '%s' "$line" | /usr/bin/grep -F '"refreshToken":true' >/dev/null
-    printf '%s' '{{"tokens":{{"access_token":"process-smoke-access","account_id":"process-smoke-account"}}}}' > "$CODEX_HOME/auth.json.next"
+    printf '%s' '{{"auth_mode":"chatgpt","OPENAI_API_KEY":null,"tokens":{{"id_token":"process-smoke-id-refreshed","access_token":"process-smoke-access-refreshed","refresh_token":"process-smoke-refresh-refreshed","account_id":"process-smoke-account"}}}}' > "$CODEX_HOME/auth.json.next"
     chmod 600 "$CODEX_HOME/auth.json.next"
     mv "$CODEX_HOME/auth.json.next" "$CODEX_HOME/auth.json"
     printf '{{"id":3,"result":{{"account":{{"email":"process-smoke@example.invalid","planType":"test"}}}}}}\n'
@@ -976,7 +980,6 @@ printf '{{"method":"turn/completed","params":{{"threadId":"%s","turn":{{"id":"%s
 while IFS= read -r ignored; do :; done
 "#,
         codex_home = shell_quote(paths.codex_home),
-        codex_auth = shell_quote(&paths.codex_home.join("auth.json")),
         argv_log = shell_quote(paths.argv_log),
         stdin_log = shell_quote(paths.stdin_log),
         fake_pid_log = shell_quote(paths.fake_pid_log),
