@@ -1727,6 +1727,10 @@ fn child_environment(proxy: &ProxyConfig) -> Vec<(String, String)> {
             values.push((name.to_ascii_lowercase(), value.clone()));
         }
     }
+    #[cfg(debug_assertions)]
+    if let Ok(value) = env::var("GATEWAY_TEST_CODEX_IMAGE_EDITS_URL") {
+        values.push(("GATEWAY_TEST_CODEX_IMAGE_EDITS_URL".to_string(), value));
+    }
     values
 }
 

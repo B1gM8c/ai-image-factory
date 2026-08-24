@@ -1,8 +1,15 @@
 use std::{
-    collections::HashSet, env, fs, os::unix::fs::PermissionsExt, process::Stdio, sync::Arc,
+    collections::HashSet,
+    env, fs,
+    os::unix::fs::PermissionsExt,
+    process::Stdio,
+    sync::Arc,
+    sync::atomic::{AtomicUsize, Ordering},
     time::Duration,
 };
 
+use axum::{Json, Router, extract::State, routing::post};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use gpt_image_2_gateway::database::{connect_test_pool_with_search_path, run_migrations};
 use gpt_image_2_gateway::{
     BlockedTerminalRequeueError, CODEX_EDIT_INLINE_ADAPTER_REVISION,
@@ -366,6 +373,9 @@ async fn restarted_edit_executord_attaches_running_helper_without_relaunching_pr
     };
     let result = async {
         let files = ExecutordFixture::new(Duration::from_secs(2))?;
+        let direct_edit =
+            DelayedDirectEditMock::start(&png_bytes([30, 40, 50, 255]), Duration::from_secs(2))
+                .await?;
         let input_blobs = FilesystemArtifactBlobStore::new(&files.artifact_root)
             .map_err(debug_error)?;
         let input = gpt_image_2_gateway::input_blobs::InputBlobStore::put(
@@ -396,9 +406,14 @@ async fn restarted_edit_executord_attaches_running_helper_without_relaunching_pr
             "expected one prepared output",
         )?;
         let owner = "executord-restart-smoke";
-        let mut first = files
+        let mut first_command = files
             .command_for_profile(&database, owner, "openai-codex-edit-v1")
-            .await?
+            .await?;
+        first_command.env(
+            "GATEWAY_TEST_CODEX_IMAGE_EDITS_URL",
+            direct_edit.endpoint(),
+        );
+        let mut first = first_command
             .spawn()
             .map_err(debug_error)?;
         tokio::time::timeout(PROCESS_STATE_TIMEOUT, async {
@@ -415,8 +430,7 @@ async fn restarted_edit_executord_attaches_running_helper_without_relaunching_pr
                 .fetch_optional(&database.pool)
                 .await
                 .map_err(debug_error)?;
-                if state.as_deref() == Some("running")
-                    && fs::read_to_string(&files.invocations).is_ok_and(|value| value == "1\n")
+                if state.as_deref() == Some("running") && direct_edit.request_count() == 1
                 {
                     break Ok::<_, String>(());
                 }
@@ -478,9 +492,14 @@ async fn restarted_edit_executord_attaches_running_helper_without_relaunching_pr
         .map_err(debug_error)?;
         disable.commit().await.map_err(debug_error)?;
 
-        let mut second = files
+        let mut second_command = files
             .command_for_profile(&database, owner, "openai-codex-edit-v1")
-            .await?
+            .await?;
+        second_command.env(
+            "GATEWAY_TEST_CODEX_IMAGE_EDITS_URL",
+            direct_edit.endpoint(),
+        );
+        let mut second = second_command
             .spawn()
             .map_err(debug_error)?;
         let terminal = tokio::time::timeout(PROCESS_STATE_TIMEOUT, async {
@@ -543,8 +562,12 @@ async fn restarted_edit_executord_attaches_running_helper_without_relaunching_pr
             ),
         )?;
         require(
-            fs::read_to_string(&files.invocations).map_err(debug_error)? == "1\n",
-            "restart launched the provider more than once",
+            direct_edit.request_count() == 1,
+            "restart submitted the direct edit more than once",
+        )?;
+        require(
+            !files.invocations.exists(),
+            "deterministic direct edit unexpectedly launched the Codex CLI",
         )
     }
     .await;
@@ -9281,6 +9304,67 @@ async fn seed_generation_lease(
         command_schema: seed.command_schema,
         command_json: seed.command_json,
     })
+}
+
+#[derive(Clone)]
+struct DelayedDirectEditState {
+    encoded_fixture: String,
+    delay: Duration,
+    requests: Arc<AtomicUsize>,
+}
+
+struct DelayedDirectEditMock {
+    endpoint: String,
+    requests: Arc<AtomicUsize>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl DelayedDirectEditMock {
+    async fn start(fixture: &[u8], delay: Duration) -> TestResult<Self> {
+        async fn edit(State(state): State<DelayedDirectEditState>) -> Json<serde_json::Value> {
+            state.requests.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(state.delay).await;
+            Json(json!({"data": [{"b64_json": state.encoded_fixture}]}))
+        }
+
+        let requests = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route("/backend-api/codex/images/edits", post(edit))
+            .with_state(DelayedDirectEditState {
+                encoded_fixture: STANDARD.encode(fixture),
+                delay,
+                requests: Arc::clone(&requests),
+            });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .map_err(debug_error)?;
+        let endpoint = format!(
+            "http://{}/backend-api/codex/images/edits",
+            listener.local_addr().map_err(debug_error)?
+        );
+        let task = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        Ok(Self {
+            endpoint,
+            requests,
+            task,
+        })
+    }
+
+    fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+
+    fn request_count(&self) -> usize {
+        self.requests.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for DelayedDirectEditMock {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
 }
 
 struct ExecutordFixture {
