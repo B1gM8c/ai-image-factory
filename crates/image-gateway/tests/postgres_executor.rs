@@ -71,7 +71,9 @@ const DREAMINA_POLICY_ID: Uuid = Uuid::from_u128(0xa00);
 const DREAMINA_POOL_ID: Uuid = Uuid::from_u128(0xb00);
 const DREAMINA_ACCOUNT_ID: Uuid = Uuid::from_u128(0xc00);
 const TEST_AUTH_SHA256: &str = "1111111111111111111111111111111111111111111111111111111111111111";
-const CODEX_AUTH_SHA256: &str = "ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356";
+const CODEX_AUTH_JSON: &[u8] =
+    br#"{"auth_mode":"chatgpt","OPENAI_API_KEY":null,"tokens":{"id_token":"header.payload.signature","access_token":"fixture-access","refresh_token":"fixture-refresh","account_id":"fixture-account"}}"#;
+const CODEX_AUTH_SHA256: &str = "10cc80481a4e163a618145aaa2aa3da4c3758d3634e3bc3f002a85f8b3e46eaf";
 const DREAMINA_AUTH_SHA256: &str =
     "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
 const PROCESS_STATE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -335,7 +337,9 @@ async fn executord_rejects_auth_home_that_does_not_match_database_credential() -
         fs::set_permissions(&wrong_auth, fs::Permissions::from_mode(0o600)).map_err(debug_error)?;
 
         let mut command = files.command(&database, "executord-wrong-auth").await?;
-        command.env("EXECUTOR_CODEX_CREDENTIAL_HOME", &wrong_credentials);
+        command
+            .env("EXECUTOR_CREDENTIAL_HOME", &wrong_credentials)
+            .env("EXECUTOR_CODEX_CREDENTIAL_HOME", &wrong_credentials);
         let output = tokio::time::timeout(Duration::from_secs(5), command.output())
             .await
             .map_err(|_| "executord did not reject mismatched credentials".to_string())?
@@ -9271,7 +9275,7 @@ impl ExecutordFixture {
         fs::set_permissions(&credentials, fs::Permissions::from_mode(0o700))
             .map_err(debug_error)?;
         let auth = credentials.join("auth.json");
-        fs::write(&auth, b"{}\n").map_err(debug_error)?;
+        fs::write(&auth, CODEX_AUTH_JSON).map_err(debug_error)?;
         fs::set_permissions(&auth, fs::Permissions::from_mode(0o600)).map_err(debug_error)?;
         let source = temp.path().join("source.png");
         let mut bytes = std::io::Cursor::new(Vec::new());
