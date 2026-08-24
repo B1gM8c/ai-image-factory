@@ -21,7 +21,9 @@ use super::{
     CodexExecutionRequest, CodexOutputRequest, ExecutorLaunchContext, ExecutorSubmissionLease,
     RunnerError, SingleOutputSupervisor, SupervisedOutput,
     private_auth::{
-        auth_file_sha256, prepare_isolated_auth, replace_isolated_auth, validate_auth_source,
+        PrivateAuthSnapshot, auth_file_sha256, auth_file_snapshot, prepare_isolated_auth,
+        prepare_isolated_codex_auth_tokens, replace_isolated_codex_auth_tokens,
+        validate_auth_source,
     },
     project_codex_execution_request,
     runner::RunnerLaunchBinding,
@@ -35,7 +37,9 @@ use crate::{
     runner::{
         FilesystemRunnerJournal, LaunchDecision,
         process::{
-            CODEX_APP_SERVER_FAILURE_DIAGNOSTIC_FILE, CODEX_AUTH_REFRESH_REQUEST_FILE,
+            CODEX_APP_SERVER_FAILURE_DIAGNOSTIC_FILE, CODEX_AUTH_ATTEMPT_1_FINISH_FILE,
+            CODEX_AUTH_ATTEMPT_1_START_FILE, CODEX_AUTH_ATTEMPT_2_FINISH_FILE,
+            CODEX_AUTH_ATTEMPT_2_START_FILE, CODEX_AUTH_REFRESH_REQUEST_FILE,
             CODEX_AUTH_REFRESH_RESULT_FILE, ExecutionSpool, ProcessObservation, ProcessSpoolError,
             ProcessTerminal, ProviderProcessIdentity, RunnerLock, sha256,
         },
@@ -78,6 +82,7 @@ struct CodexChildRequest {
     codex_executable_sha256: String,
     credential_revision: i64,
     credential_auth_sha256: String,
+    isolated_auth_sha256: String,
     timeout_ms: u64,
     output: CodexExecutionRequest,
 }
@@ -89,6 +94,7 @@ struct CodexAuthRefreshRequestV1 {
     executor_execution_id: String,
     observed_revision: i64,
     observed_fingerprint_sha256: String,
+    observed_isolated_auth_sha256: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -99,21 +105,111 @@ enum CodexAuthRefreshResultV1 {
         executor_execution_id: String,
         observed_revision: i64,
         observed_fingerprint_sha256: String,
+        observed_isolated_auth_sha256: String,
         promoted_revision: i64,
         promoted_fingerprint_sha256: String,
+        promoted_isolated_auth_sha256: String,
     },
     Failed {
         schema_version: u16,
         executor_execution_id: String,
         observed_revision: i64,
         observed_fingerprint_sha256: String,
+        observed_isolated_auth_sha256: String,
     },
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CodexAuthAttemptBindingV1 {
+    schema_version: u16,
+    executor_execution_id: String,
+    attempt: u8,
+    phase: String,
+    credential_revision: i64,
+    credential_fingerprint_sha256: String,
+    isolated_auth_sha256: String,
+    auth_device: u64,
+    auth_inode: u64,
+    auth_byte_size: u64,
+    auth_modified_seconds: i64,
+    auth_modified_nanoseconds: i64,
+    auth_changed_seconds: i64,
+    auth_changed_nanoseconds: i64,
+    provider_pid: u32,
+    provider_start_token: String,
 }
 
 enum ChildOutcome {
     Succeeded(Vec<u8>),
     Failed(&'static str),
     Uncertain(&'static str),
+}
+
+fn auth_attempt_files(attempt: u8) -> Option<(&'static str, &'static str)> {
+    match attempt {
+        1 => Some((
+            CODEX_AUTH_ATTEMPT_1_START_FILE,
+            CODEX_AUTH_ATTEMPT_1_FINISH_FILE,
+        )),
+        2 => Some((
+            CODEX_AUTH_ATTEMPT_2_START_FILE,
+            CODEX_AUTH_ATTEMPT_2_FINISH_FILE,
+        )),
+        _ => None,
+    }
+}
+
+fn auth_attempt_binding(
+    request: &CodexChildRequest,
+    attempt: u8,
+    phase: &str,
+    credential_revision: i64,
+    credential_fingerprint_sha256: &str,
+    snapshot: &PrivateAuthSnapshot,
+    provider: &ProviderProcessIdentity,
+) -> CodexAuthAttemptBindingV1 {
+    CodexAuthAttemptBindingV1 {
+        schema_version: 1,
+        executor_execution_id: request.executor_execution_id.clone(),
+        attempt,
+        phase: phase.to_owned(),
+        credential_revision,
+        credential_fingerprint_sha256: credential_fingerprint_sha256.to_owned(),
+        isolated_auth_sha256: snapshot.sha256.clone(),
+        auth_device: snapshot.device,
+        auth_inode: snapshot.inode,
+        auth_byte_size: snapshot.byte_size,
+        auth_modified_seconds: snapshot.modified_seconds,
+        auth_modified_nanoseconds: snapshot.modified_nanoseconds,
+        auth_changed_seconds: snapshot.changed_seconds,
+        auth_changed_nanoseconds: snapshot.changed_nanoseconds,
+        provider_pid: provider.pid(),
+        provider_start_token: provider.start_token().to_owned(),
+    }
+}
+
+fn auth_binding_unchanged(
+    start: &CodexAuthAttemptBindingV1,
+    finish: &CodexAuthAttemptBindingV1,
+) -> bool {
+    start.schema_version == finish.schema_version
+        && start.executor_execution_id == finish.executor_execution_id
+        && start.attempt == finish.attempt
+        && start.phase == "start"
+        && finish.phase == "finish"
+        && start.credential_revision == finish.credential_revision
+        && start.credential_fingerprint_sha256 == finish.credential_fingerprint_sha256
+        && start.isolated_auth_sha256 == finish.isolated_auth_sha256
+        && start.auth_device == finish.auth_device
+        && start.auth_inode == finish.auth_inode
+        && start.auth_byte_size == finish.auth_byte_size
+        && start.auth_modified_seconds == finish.auth_modified_seconds
+        && start.auth_modified_nanoseconds == finish.auth_modified_nanoseconds
+        && start.auth_changed_seconds == finish.auth_changed_seconds
+        && start.auth_changed_nanoseconds == finish.auth_changed_nanoseconds
+        && start.provider_pid == finish.provider_pid
+        && start.provider_start_token == finish.provider_start_token
 }
 
 impl CodexProcessSupervisor {
@@ -229,6 +325,7 @@ impl CodexProcessSupervisor {
         context: &ExecutorLaunchContext,
         credential_revision: i64,
         credential_auth_sha256: &str,
+        isolated_auth_sha256: &str,
     ) -> Result<CodexChildRequest, RunnerError> {
         if !matches!(
             lease.adapter_revision.as_str(),
@@ -243,7 +340,7 @@ impl CodexProcessSupervisor {
                 error_code: "executor_command_rejected".to_string(),
             })?;
         Ok(CodexChildRequest {
-            schema_version: 2,
+            schema_version: 3,
             adapter_revision: lease.adapter_revision.clone(),
             executor_execution_id: lease.executor_execution_id.to_string(),
             launch: RunnerLaunchBinding::from_lease(lease),
@@ -251,6 +348,7 @@ impl CodexProcessSupervisor {
             codex_executable_sha256: self.codex_executable_sha256.clone(),
             credential_revision,
             credential_auth_sha256: credential_auth_sha256.to_string(),
+            isolated_auth_sha256: isolated_auth_sha256.to_string(),
             timeout_ms: self.request_timeout.as_millis() as u64,
             output,
         })
@@ -380,6 +478,7 @@ impl CodexProcessSupervisor {
             || request.executor_execution_id != lease.executor_execution_id.to_string()
             || request.observed_revision <= 0
             || !is_sha256(&request.observed_fingerprint_sha256)
+            || !is_sha256(&request.observed_isolated_auth_sha256)
         {
             return Err(RunnerError::Unknown {
                 error_code: "codex_auth_refresh_request_invalid".to_string(),
@@ -417,19 +516,23 @@ impl CodexProcessSupervisor {
                     (Ok(source), Ok(destination)) => rebind_isolated_auth(
                         destination,
                         &source,
-                        &request.observed_fingerprint_sha256,
+                        &request.observed_isolated_auth_sha256,
                         &credential.material_fingerprint_sha256,
                     ),
                     _ => Err(()),
                 };
-                if rebound.is_ok() {
+                if let Ok(promoted_isolated_auth_sha256) = rebound {
                     CodexAuthRefreshResultV1::Succeeded {
                         schema_version: 1,
                         executor_execution_id: request.executor_execution_id.clone(),
                         observed_revision: request.observed_revision,
                         observed_fingerprint_sha256: request.observed_fingerprint_sha256.clone(),
+                        observed_isolated_auth_sha256: request
+                            .observed_isolated_auth_sha256
+                            .clone(),
                         promoted_revision: credential.revision,
                         promoted_fingerprint_sha256: credential.material_fingerprint_sha256,
+                        promoted_isolated_auth_sha256,
                     }
                 } else {
                     CodexAuthRefreshResultV1::Failed {
@@ -437,6 +540,9 @@ impl CodexProcessSupervisor {
                         executor_execution_id: request.executor_execution_id.clone(),
                         observed_revision: request.observed_revision,
                         observed_fingerprint_sha256: request.observed_fingerprint_sha256.clone(),
+                        observed_isolated_auth_sha256: request
+                            .observed_isolated_auth_sha256
+                            .clone(),
                     }
                 }
             }
@@ -445,6 +551,7 @@ impl CodexProcessSupervisor {
                 executor_execution_id: request.executor_execution_id.clone(),
                 observed_revision: request.observed_revision,
                 observed_fingerprint_sha256: request.observed_fingerprint_sha256.clone(),
+                observed_isolated_auth_sha256: request.observed_isolated_auth_sha256.clone(),
             },
         };
         spool
@@ -475,15 +582,18 @@ pub fn prepare_codex_auth_copy(
 fn rebind_isolated_auth(
     destination_home: &Path,
     source: &Path,
-    observed_sha256: &str,
-    promoted_sha256: &str,
-) -> Result<(), ()> {
+    observed_isolated_sha256: &str,
+    promoted_source_sha256: &str,
+) -> Result<String, ()> {
+    let promoted_isolated_sha256 = replace_isolated_codex_auth_tokens(
+        destination_home,
+        source,
+        observed_isolated_sha256,
+        promoted_source_sha256,
+    )
+    .map_err(|_| ())?;
     match auth_file_sha256(destination_home) {
-        Ok(current) if current == promoted_sha256 => Ok(()),
-        Ok(current) if current == observed_sha256 => {
-            replace_isolated_auth(destination_home, source, observed_sha256, promoted_sha256)
-                .map_err(|_| ())
-        }
+        Ok(current) if current == promoted_isolated_sha256 => Ok(promoted_isolated_sha256),
         _ => Err(()),
     }
 }
@@ -497,17 +607,22 @@ impl SingleOutputSupervisor for CodexProcessSupervisor {
     ) -> Result<(), RunnerError> {
         let (credential_auth_file, credential_auth_sha256, credential_revision) =
             self.credential_source().await?;
-        let request =
-            self.child_request(lease, context, credential_revision, &credential_auth_sha256)?;
-        let bytes = serde_json::to_vec(&request).map_err(|_| RunnerError::Internal)?;
         let spool = ExecutionSpool::for_lease(&self.journal, lease).map_err(map_spool_error)?;
-        self.stage_inputs(&request.output, context, &spool).await?;
-        prepare_isolated_auth(
+        let isolated_auth_sha256 = prepare_isolated_codex_auth_tokens(
             spool.codex_home_path().map_err(map_spool_error)?,
             &credential_auth_file,
             &credential_auth_sha256,
         )
         .map_err(|_| RunnerError::Unavailable)?;
+        let request = self.child_request(
+            lease,
+            context,
+            credential_revision,
+            &credential_auth_sha256,
+            &isolated_auth_sha256,
+        )?;
+        self.stage_inputs(&request.output, context, &spool).await?;
+        let bytes = serde_json::to_vec(&request).map_err(|_| RunnerError::Internal)?;
         tracing::debug!(
             execution.profile.id = %lease.execution_profile_id,
             credential.revision = credential_revision,
@@ -678,12 +793,20 @@ async fn run_codex_child(
     let request_timeout = Duration::from_millis(request.timeout_ms);
     let deadline = Instant::now() + request_timeout;
     let mut attempt = 1_u8;
+    let mut active_credential_revision = request.credential_revision;
+    let mut active_credential_fingerprint_sha256 = request.credential_auth_sha256.clone();
+    let mut active_isolated_auth_sha256 = request.isolated_auth_sha256.clone();
     let outcome = loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             break ChildOutcome::Uncertain("codex_timeout");
         }
         let diagnostic = Mutex::new(None);
+        if auth_file_sha256(codex_home).ok().as_deref()
+            != Some(active_isolated_auth_sha256.as_str())
+        {
+            break ChildOutcome::Uncertain("codex_auth_binding_invalid");
+        }
         let provider_process = Mutex::new(None);
         let diagnostic_sink =
             |value: &crate::codex_app_server::CodexAppServerFailureDiagnosticV1| {
@@ -707,28 +830,72 @@ async fn run_codex_child(
             |pid| {
                 ProviderProcessIdentity::capture(pid, &helper.nonce)
                     .and_then(|provider| {
+                        let snapshot = auth_file_snapshot(codex_home)
+                            .map_err(|_| ProcessSpoolError::Integrity)?;
+                        if snapshot.sha256 != active_isolated_auth_sha256 {
+                            return Err(ProcessSpoolError::Integrity);
+                        }
+                        let binding = auth_attempt_binding(
+                            &request,
+                            attempt,
+                            "start",
+                            active_credential_revision,
+                            &active_credential_fingerprint_sha256,
+                            &snapshot,
+                            &provider,
+                        );
+                        let (start_file, _) =
+                            auth_attempt_files(attempt).ok_or(ProcessSpoolError::InvalidInput)?;
+                        spool.publish_diagnostic(start_file, &binding)?;
                         spool.publish_provider_process(&runner_lock, &helper, &provider)?;
                         *provider_process
                             .lock()
-                            .map_err(|_| ProcessSpoolError::Unavailable)? = Some(provider);
+                            .map_err(|_| ProcessSpoolError::Unavailable)? =
+                            Some((provider, binding));
                         Ok(())
                     })
                     .map_err(|_| ())
             },
         )
         .await;
+        let provider_process = provider_process.into_inner().ok().flatten();
+        if let Some((provider, start_binding)) = provider_process.as_ref() {
+            let finish_binding = match auth_file_snapshot(codex_home) {
+                Ok(snapshot) => auth_attempt_binding(
+                    &request,
+                    attempt,
+                    "finish",
+                    active_credential_revision,
+                    &active_credential_fingerprint_sha256,
+                    &snapshot,
+                    provider,
+                ),
+                Err(_) => break ChildOutcome::Uncertain("codex_auth_binding_invalid"),
+            };
+            let Some((_, finish_file)) = auth_attempt_files(attempt) else {
+                break ChildOutcome::Uncertain("codex_auth_binding_invalid");
+            };
+            if !auth_binding_unchanged(start_binding, &finish_binding)
+                || spool
+                    .publish_diagnostic(finish_file, &finish_binding)
+                    .is_err()
+            {
+                break ChildOutcome::Uncertain("codex_auth_binding_changed");
+            }
+        } else if runtime_result.is_ok() {
+            break ChildOutcome::Uncertain("codex_auth_binding_invalid");
+        }
         match runtime_result {
             Ok(bytes) => break ChildOutcome::Succeeded(bytes),
             Err(error) => {
                 let diagnostic = diagnostic.into_inner().ok().flatten();
-                let provider_process = provider_process.into_inner().ok().flatten();
                 let retryable = attempt == 1
                     && diagnostic
                         .as_ref()
                         .is_some_and(|value| value.is_retryable_authentication_rejection())
                     && deadline.saturating_duration_since(Instant::now())
                         > Duration::from_millis(250)
-                    && provider_process.as_ref().is_some_and(|provider| {
+                    && provider_process.as_ref().is_some_and(|(provider, _)| {
                         spool
                             .retire_provider_process(&runner_lock, &helper, provider)
                             .is_ok()
@@ -746,6 +913,7 @@ async fn run_codex_child(
                         executor_execution_id: request.executor_execution_id.clone(),
                         observed_revision: request.credential_revision,
                         observed_fingerprint_sha256: request.credential_auth_sha256.clone(),
+                        observed_isolated_auth_sha256: request.isolated_auth_sha256.clone(),
                     };
                     if spool
                         .publish_diagnostic(CODEX_AUTH_REFRESH_REQUEST_FILE, &refresh_request)
@@ -767,6 +935,9 @@ async fn run_codex_child(
                                     observed_fingerprint_sha256: request
                                         .credential_auth_sha256
                                         .clone(),
+                                    observed_isolated_auth_sha256: request
+                                        .isolated_auth_sha256
+                                        .clone(),
                                 };
                             }
                         }
@@ -776,6 +947,7 @@ async fn run_codex_child(
                                 executor_execution_id: request.executor_execution_id.clone(),
                                 observed_revision: request.credential_revision,
                                 observed_fingerprint_sha256: request.credential_auth_sha256.clone(),
+                                observed_isolated_auth_sha256: request.isolated_auth_sha256.clone(),
                             };
                         }
                         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -786,16 +958,22 @@ async fn run_codex_child(
                             executor_execution_id,
                             observed_revision,
                             observed_fingerprint_sha256,
+                            observed_isolated_auth_sha256,
                             promoted_revision,
                             promoted_fingerprint_sha256,
+                            promoted_isolated_auth_sha256,
                         } if executor_execution_id == request.executor_execution_id
                             && observed_revision == request.credential_revision
                             && observed_fingerprint_sha256 == request.credential_auth_sha256
+                            && observed_isolated_auth_sha256 == request.isolated_auth_sha256
                             && promoted_revision > observed_revision
                             && promoted_fingerprint_sha256 != observed_fingerprint_sha256
                             && auth_file_sha256(codex_home).ok().as_deref()
-                                == Some(promoted_fingerprint_sha256.as_str()) =>
+                                == Some(promoted_isolated_auth_sha256.as_str()) =>
                         {
+                            active_credential_revision = promoted_revision;
+                            active_credential_fingerprint_sha256 = promoted_fingerprint_sha256;
+                            active_isolated_auth_sha256 = promoted_isolated_auth_sha256;
                             attempt = 2;
                             continue;
                         }
@@ -918,7 +1096,7 @@ fn validate_child_request(
             super::CODEX_EDIT_INLINE_ADAPTER_REVISION
         )
     );
-    if request.schema_version != 2
+    if request.schema_version != 3
         || request.adapter_revision != lease.adapter_revision
         || request.executor_execution_id != executor_execution_id.to_string()
         || lease.executor_execution_id != executor_execution_id
@@ -931,6 +1109,7 @@ fn validate_child_request(
             != Some(request.output.candidate_index())
         || request.credential_revision <= 0
         || !is_sha256(&request.credential_auth_sha256)
+        || !is_sha256(&request.isolated_auth_sha256)
         || request.timeout_ms == 0
         || request.timeout_ms > MAX_RUNNER_TIMEOUT.as_millis() as u64
         || request.output.validate().is_err()
@@ -1264,6 +1443,13 @@ mod tests {
     use crate::executor::private_auth::{AUTH_FILE, MAX_AUTH_BYTES};
     use crate::input_blobs::{InputBlobKey, InputBlobStore};
 
+    fn managed_codex_auth(access_token: &str, refresh_token: &str) -> Vec<u8> {
+        format!(
+            r#"{{"auth_mode":"chatgpt","OPENAI_API_KEY":null,"tokens":{{"id_token":"header.payload.signature","access_token":"{access_token}","refresh_token":"{refresh_token}","account_id":"account-1"}},"last_refresh":"2026-08-24T03:21:17Z"}}"#
+        )
+        .into_bytes()
+    }
+
     #[test]
     fn child_environment_excludes_gateway_and_database_secrets() {
         let proxy = ProxyConfig::default();
@@ -1306,28 +1492,57 @@ mod tests {
         fs::create_dir(&source).unwrap();
         fs::set_permissions(&destination, fs::Permissions::from_mode(0o700)).unwrap();
         fs::set_permissions(&source, fs::Permissions::from_mode(0o700)).unwrap();
-        let old = br#"{"revision":1}"#;
-        let new = br#"{"revision":2}"#;
-        fs::write(destination.join(AUTH_FILE), old).unwrap();
+        let old = managed_codex_auth("old-access", "old-refresh");
+        let new = managed_codex_auth("new-access", "new-refresh");
+        fs::write(source.join(AUTH_FILE), &old).unwrap();
+        fs::set_permissions(source.join(AUTH_FILE), fs::Permissions::from_mode(0o600)).unwrap();
+        let observed = prepare_isolated_codex_auth_tokens(
+            &destination,
+            &source.join(AUTH_FILE),
+            &sha256(&old),
+        )
+        .unwrap();
         fs::write(source.join(AUTH_FILE), new).unwrap();
+        fs::set_permissions(source.join(AUTH_FILE), fs::Permissions::from_mode(0o600)).unwrap();
+
+        let promoted_source = sha256(&fs::read(source.join(AUTH_FILE)).unwrap());
+        let promoted = rebind_isolated_auth(
+            &destination,
+            &source.join(AUTH_FILE),
+            &observed,
+            &promoted_source,
+        )
+        .unwrap();
+        assert_eq!(
+            rebind_isolated_auth(
+                &destination,
+                &source.join(AUTH_FILE),
+                &observed,
+                &promoted_source,
+            )
+            .unwrap(),
+            promoted
+        );
+        assert_eq!(codex_auth_file_sha256(&destination).unwrap(), promoted);
+
+        let foreign = sha256(b"foreign");
+        fs::write(destination.join(AUTH_FILE), b"foreign").unwrap();
         fs::set_permissions(
             destination.join(AUTH_FILE),
             fs::Permissions::from_mode(0o600),
         )
         .unwrap();
-        fs::set_permissions(source.join(AUTH_FILE), fs::Permissions::from_mode(0o600)).unwrap();
-
-        let observed = sha256(old);
-        let promoted = sha256(new);
-        rebind_isolated_auth(&destination, &source.join(AUTH_FILE), &observed, &promoted).unwrap();
-        rebind_isolated_auth(&destination, &source.join(AUTH_FILE), &observed, &promoted).unwrap();
-        assert_eq!(codex_auth_file_sha256(&destination).unwrap(), promoted);
-
-        let foreign = sha256(b"foreign");
         assert!(
-            rebind_isolated_auth(&destination, &source.join(AUTH_FILE), &foreign, &observed,)
-                .is_err()
+            rebind_isolated_auth(
+                &destination,
+                &source.join(AUTH_FILE),
+                &observed,
+                &promoted_source,
+            )
+            .is_err(),
+            "an unobserved current digest must not be rebound"
         );
+        assert_eq!(codex_auth_file_sha256(&destination).unwrap(), foreign);
     }
 
     #[test]
@@ -1509,7 +1724,6 @@ mod tests {
             LaunchDecision::LaunchOnce
         );
         let spool = ExecutionSpool::for_lease(&fixture.journal, &lease).unwrap();
-
         run_codex_runner_child(fixture.journal.root_path(), lease.executor_execution_id)
             .await
             .unwrap();
@@ -1574,12 +1788,14 @@ mod tests {
             LaunchDecision::LaunchOnce
         );
         let spool = ExecutionSpool::for_lease(&fixture.journal, &lease).unwrap();
+        let prepared: CodexChildRequest =
+            serde_json::from_slice(&spool.read_request().unwrap()).unwrap();
 
         let runner_root = fixture.journal.root_path().to_path_buf();
         let execution_id = lease.executor_execution_id;
         let child =
             tokio::spawn(async move { run_codex_runner_child(runner_root, execution_id).await });
-        tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::time::timeout(Duration::from_secs(15), async {
             loop {
                 if spool
                     .read_diagnostic::<CodexAuthRefreshRequestV1>(CODEX_AUTH_REFRESH_REQUEST_FILE)
@@ -1596,13 +1812,14 @@ mod tests {
         let replacement_home = fixture._temp.path().join("replacement-credentials");
         fs::create_dir(&replacement_home).unwrap();
         let replacement = replacement_home.join(AUTH_FILE);
-        fs::write(&replacement, br#"{"fresh":true}"#).unwrap();
+        let replacement_bytes = managed_codex_auth("fresh-access", "fresh-refresh");
+        fs::write(&replacement, &replacement_bytes).unwrap();
         fs::set_permissions(&replacement, fs::Permissions::from_mode(0o600)).unwrap();
-        let replacement_sha = sha256(br#"{"fresh":true}"#);
-        replace_isolated_auth(
+        let replacement_sha = sha256(&replacement_bytes);
+        let replacement_isolated_sha = replace_isolated_codex_auth_tokens(
             spool.codex_home_path().unwrap(),
             &replacement,
-            &sha256(b"{}"),
+            &prepared.isolated_auth_sha256,
             &replacement_sha,
         )
         .unwrap();
@@ -1613,9 +1830,11 @@ mod tests {
                     schema_version: 1,
                     executor_execution_id: lease.executor_execution_id.to_string(),
                     observed_revision: 1,
-                    observed_fingerprint_sha256: sha256(b"{}"),
+                    observed_fingerprint_sha256: prepared.credential_auth_sha256.clone(),
+                    observed_isolated_auth_sha256: prepared.isolated_auth_sha256.clone(),
                     promoted_revision: 2,
                     promoted_fingerprint_sha256: replacement_sha,
+                    promoted_isolated_auth_sha256: replacement_isolated_sha,
                 },
             )
             .unwrap();
@@ -1626,6 +1845,43 @@ mod tests {
             ProcessObservation::Succeeded(_)
         ));
         assert_eq!(fs::read_to_string(&fixture.invocations).unwrap(), "1\n1\n");
+        let attempt_1_start: CodexAuthAttemptBindingV1 = spool
+            .read_diagnostic(CODEX_AUTH_ATTEMPT_1_START_FILE)
+            .unwrap()
+            .unwrap();
+        let attempt_1_finish: CodexAuthAttemptBindingV1 = spool
+            .read_diagnostic(CODEX_AUTH_ATTEMPT_1_FINISH_FILE)
+            .unwrap()
+            .unwrap();
+        let attempt_2_start: CodexAuthAttemptBindingV1 = spool
+            .read_diagnostic(CODEX_AUTH_ATTEMPT_2_START_FILE)
+            .unwrap()
+            .unwrap();
+        let attempt_2_finish: CodexAuthAttemptBindingV1 = spool
+            .read_diagnostic(CODEX_AUTH_ATTEMPT_2_FINISH_FILE)
+            .unwrap()
+            .unwrap();
+        assert!(auth_binding_unchanged(&attempt_1_start, &attempt_1_finish));
+        assert!(auth_binding_unchanged(&attempt_2_start, &attempt_2_finish));
+        assert_eq!(attempt_1_start.credential_revision, 1);
+        assert_eq!(attempt_2_start.credential_revision, 2);
+        assert_eq!(
+            attempt_1_start.credential_fingerprint_sha256,
+            prepared.credential_auth_sha256
+        );
+        assert_eq!(
+            attempt_1_start.isolated_auth_sha256,
+            prepared.isolated_auth_sha256
+        );
+        assert_ne!(
+            attempt_1_start.isolated_auth_sha256,
+            attempt_2_start.isolated_auth_sha256
+        );
+        assert_ne!(attempt_1_start.provider_pid, attempt_2_start.provider_pid);
+        assert_ne!(
+            attempt_1_start.provider_start_token,
+            attempt_2_start.provider_start_token
+        );
         let execution_root = fixture
             .journal
             .root_path()
@@ -1651,12 +1907,14 @@ mod tests {
             LaunchDecision::LaunchOnce
         );
         let spool = ExecutionSpool::for_lease(&fixture.journal, &lease).unwrap();
+        let prepared: CodexChildRequest =
+            serde_json::from_slice(&spool.read_request().unwrap()).unwrap();
 
         let runner_root = fixture.journal.root_path().to_path_buf();
         let execution_id = lease.executor_execution_id;
         let child =
             tokio::spawn(async move { run_codex_runner_child(runner_root, execution_id).await });
-        tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::time::timeout(Duration::from_secs(15), async {
             loop {
                 if spool
                     .read_diagnostic::<CodexAuthRefreshRequestV1>(CODEX_AUTH_REFRESH_REQUEST_FILE)
@@ -1673,13 +1931,14 @@ mod tests {
         let replacement_home = fixture._temp.path().join("replacement-credentials");
         fs::create_dir(&replacement_home).unwrap();
         let replacement = replacement_home.join(AUTH_FILE);
-        fs::write(&replacement, br#"{"fresh":true}"#).unwrap();
+        let replacement_bytes = managed_codex_auth("fresh-access", "fresh-refresh");
+        fs::write(&replacement, &replacement_bytes).unwrap();
         fs::set_permissions(&replacement, fs::Permissions::from_mode(0o600)).unwrap();
-        let replacement_sha = sha256(br#"{"fresh":true}"#);
-        replace_isolated_auth(
+        let replacement_sha = sha256(&replacement_bytes);
+        let replacement_isolated_sha = replace_isolated_codex_auth_tokens(
             spool.codex_home_path().unwrap(),
             &replacement,
-            &sha256(b"{}"),
+            &prepared.isolated_auth_sha256,
             &replacement_sha,
         )
         .unwrap();
@@ -1690,9 +1949,11 @@ mod tests {
                     schema_version: 1,
                     executor_execution_id: lease.executor_execution_id.to_string(),
                     observed_revision: 1,
-                    observed_fingerprint_sha256: sha256(b"{}"),
+                    observed_fingerprint_sha256: prepared.credential_auth_sha256.clone(),
+                    observed_isolated_auth_sha256: prepared.isolated_auth_sha256.clone(),
                     promoted_revision: 2,
                     promoted_fingerprint_sha256: replacement_sha,
+                    promoted_isolated_auth_sha256: replacement_isolated_sha,
                 },
             )
             .unwrap();
@@ -2154,6 +2415,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn provider_auth_mutation_fails_closed_before_output_publication() {
+        let fixture = CodexFixture::mutates_external_auth_after_output();
+        let lease = fixture.lease();
+        let context = fixture.context(&lease);
+        fixture.journal.start_or_attach(&lease).unwrap();
+        fixture.supervisor.prepare(&lease, &context).await.unwrap();
+        assert_eq!(
+            fixture.journal.commit_launch(&lease).unwrap(),
+            LaunchDecision::LaunchOnce
+        );
+        let spool = ExecutionSpool::for_lease(&fixture.journal, &lease).unwrap();
+
+        run_codex_runner_child(fixture.journal.root_path(), lease.executor_execution_id)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            spool.observe().unwrap(),
+            ProcessObservation::Uncertain {
+                error_code: "codex_auth_binding_changed".to_string(),
+            }
+        );
+        let execution_root = fixture
+            .journal
+            .root_path()
+            .join(lease.executor_execution_id.simple().to_string());
+        assert!(!execution_root.join("output.bin").exists());
+        assert!(
+            execution_root
+                .join(CODEX_AUTH_ATTEMPT_1_START_FILE)
+                .is_file()
+        );
+        assert!(
+            !execution_root
+                .join(CODEX_AUTH_ATTEMPT_1_FINISH_FILE)
+                .exists()
+        );
+    }
+
+    #[tokio::test]
     async fn preexisting_workspace_output_is_ignored_as_non_authoritative() {
         let fixture = CodexFixture::new();
         let lease = fixture.lease();
@@ -2312,6 +2613,8 @@ mod tests {
         format!(
             r#"#!/bin/sh
 set -eu
+grep -Fq '"auth_mode":"chatgptAuthTokens"' "$CODEX_HOME/auth.json"
+grep -Fq '"refresh_token":""' "$CODEX_HOME/auth.json"
 thread_id='019fd9f5-badb-7dd3-8903-28ffded0ef54'
 turn_id='019fd9f5-badb-7dd3-8903-28ffded0ef55'
 IFS= read -r initialize
@@ -2430,6 +2733,16 @@ while IFS= read -r ignored; do :; done
             })
         }
 
+        fn mutates_external_auth_after_output() -> Self {
+            Self::with_script(|invocations, image, _root| {
+                format!(
+                    "#!/bin/sh\nset -eu\n/bin/cat >/dev/null\nprintf '1\\n' >> '{}'\nthread_id='019fd9f5-badb-7dd3-8903-28ffded0ef54'\ncall_id='call_mutated_auth_image'\noutput_dir=\"$CODEX_HOME/generated_images/$thread_id\"\n/bin/mkdir -p \"$output_dir\"\n/bin/chmod 700 \"$CODEX_HOME/generated_images\" \"$output_dir\"\n/bin/cp '{}' \"$output_dir/$call_id.png\"\n/bin/chmod 600 \"$output_dir/$call_id.png\"\nprintf '{{\"type\":\"thread.started\",\"thread_id\":\"%s\"}}\\n' \"$thread_id\"\nprintf '{{\"type\":\"item.completed\",\"item\":{{\"type\":\"image_generation_call\",\"id\":\"%s\"}}}}\\n' \"$call_id\"\nprintf '%s' '{{\"auth_mode\":\"chatgptAuthTokens\",\"OPENAI_API_KEY\":null,\"tokens\":{{\"id_token\":\"header.payload.signature\",\"access_token\":\"mutated-access\",\"refresh_token\":\"\",\"account_id\":\"account-1\"}},\"last_refresh\":\"2026-08-24T03:21:17Z\"}}' > \"$CODEX_HOME/auth.json\"\n/bin/chmod 600 \"$CODEX_HOME/auth.json\"\n",
+                    invocations.display(),
+                    image.display(),
+                )
+            })
+        }
+
         fn transient_native_output_only() -> Self {
             Self::with_script(|invocations, image, _root| {
                 format!(
@@ -2534,7 +2847,8 @@ while IFS= read -r ignored; do :; done
             let credentials = temp.path().join("credentials");
             fs::create_dir(&credentials).unwrap();
             let auth = credentials.join(AUTH_FILE);
-            fs::write(&auth, b"{}").unwrap();
+            let managed_auth = managed_codex_auth("fixture-access", "fixture-refresh");
+            fs::write(&auth, &managed_auth).unwrap();
             fs::set_permissions(&auth, fs::Permissions::from_mode(0o600)).unwrap();
             let image = temp.path().join("source.png");
             let mut bytes = std::io::Cursor::new(Vec::new());
@@ -2552,7 +2866,7 @@ while IFS= read -r ignored; do :; done
                 &executable,
                 &executable,
                 &credentials,
-                &sha256(b"{}"),
+                &sha256(&managed_auth),
                 Duration::from_secs(30),
                 Duration::from_millis(10),
                 Duration::from_secs(1),

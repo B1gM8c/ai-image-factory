@@ -8,6 +8,8 @@ use std::{
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use toml::{Table, Value};
 
+use serde_json::Value as JsonValue;
+
 use crate::provider_uploads::GrokVideoOutputS3Configuration;
 use crate::runner::process::sha256;
 
@@ -16,11 +18,37 @@ pub(super) const MAX_AUTH_BYTES: u64 = 1024 * 1024;
 const CONFIG_FILE: &str = "config.toml";
 const MAX_CONFIG_BYTES: u64 = 256 * 1024;
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct PrivateAuthSnapshot {
+    pub(super) sha256: String,
+    pub(super) device: u64,
+    pub(super) inode: u64,
+    pub(super) byte_size: u64,
+    pub(super) modified_seconds: i64,
+    pub(super) modified_nanoseconds: i64,
+    pub(super) changed_seconds: i64,
+    pub(super) changed_nanoseconds: i64,
+}
+
 pub(crate) fn auth_file_sha256(home: &Path) -> std::io::Result<String> {
+    auth_file_snapshot(home).map(|snapshot| snapshot.sha256)
+}
+
+pub(super) fn auth_file_snapshot(home: &Path) -> std::io::Result<PrivateAuthSnapshot> {
     if !home.is_absolute() {
         return Err(invalid_auth());
     }
-    read_private_auth(&home.join(AUTH_FILE)).map(|bytes| sha256(&bytes))
+    let (bytes, metadata) = read_private_auth_with_metadata(&home.join(AUTH_FILE))?;
+    Ok(PrivateAuthSnapshot {
+        sha256: sha256(&bytes),
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        byte_size: metadata.len(),
+        modified_seconds: metadata.mtime(),
+        modified_nanoseconds: metadata.mtime_nsec(),
+        changed_seconds: metadata.ctime(),
+        changed_nanoseconds: metadata.ctime_nsec(),
+    })
 }
 
 pub(crate) fn read_verified_auth(home: &Path, expected_sha256: &str) -> std::io::Result<Vec<u8>> {
@@ -139,24 +167,76 @@ pub(super) fn prepare_isolated_auth(
     fs::File::open(destination_home)?.sync_all()
 }
 
-pub(super) fn replace_isolated_auth(
+pub(super) fn prepare_isolated_codex_auth_tokens(
     destination_home: &Path,
     source: &Path,
+    expected_source_sha256: &str,
+) -> std::io::Result<String> {
+    if !destination_home.is_absolute() || !is_sha256(expected_source_sha256) {
+        return Err(invalid_auth());
+    }
+    let source_bytes = read_private_auth(source)?;
+    ensure_auth_digest(&source_bytes, expected_source_sha256)?;
+    let isolated_bytes = codex_external_auth_tokens(&source_bytes)?;
+    let isolated_sha256 = sha256(&isolated_bytes);
+    write_private_file_if_absent_or_equal(
+        destination_home,
+        &destination_home.join(AUTH_FILE),
+        &isolated_bytes,
+        MAX_AUTH_BYTES,
+    )?;
+    ensure_auth_digest(
+        &read_private_auth(&destination_home.join(AUTH_FILE))?,
+        &isolated_sha256,
+    )?;
+    Ok(isolated_sha256)
+}
+
+pub(super) fn replace_isolated_codex_auth_tokens(
+    destination_home: &Path,
+    source: &Path,
+    observed_isolated_sha256: &str,
+    expected_source_sha256: &str,
+) -> std::io::Result<String> {
+    if !destination_home.is_absolute()
+        || !is_sha256(observed_isolated_sha256)
+        || !is_sha256(expected_source_sha256)
+    {
+        return Err(invalid_auth());
+    }
+    let source_bytes = read_private_auth(source)?;
+    ensure_auth_digest(&source_bytes, expected_source_sha256)?;
+    let replacement = codex_external_auth_tokens(&source_bytes)?;
+    let replacement_sha256 = sha256(&replacement);
+    let current_sha256 = auth_file_sha256(destination_home)?;
+    if current_sha256 == replacement_sha256 {
+        return Ok(replacement_sha256);
+    }
+    if current_sha256 != observed_isolated_sha256 {
+        return Err(invalid_auth());
+    }
+    if replacement_sha256 == observed_isolated_sha256 {
+        return Ok(replacement_sha256);
+    }
+    replace_private_auth_bytes(destination_home, observed_isolated_sha256, &replacement)?;
+    Ok(replacement_sha256)
+}
+
+fn replace_private_auth_bytes(
+    destination_home: &Path,
     observed_sha256: &str,
-    replacement_sha256: &str,
+    replacement: &[u8],
 ) -> std::io::Result<()> {
     if !destination_home.is_absolute()
         || !is_sha256(observed_sha256)
-        || !is_sha256(replacement_sha256)
-        || observed_sha256 == replacement_sha256
+        || replacement.is_empty()
+        || replacement.len() as u64 > MAX_AUTH_BYTES
     {
         return Err(invalid_auth());
     }
     let destination = destination_home.join(AUTH_FILE);
-    let current = read_private_auth(&destination)?;
-    ensure_auth_digest(&current, observed_sha256)?;
-    let replacement = read_private_auth(source)?;
-    ensure_auth_digest(&replacement, replacement_sha256)?;
+    ensure_auth_digest(&read_private_auth(&destination)?, observed_sha256)?;
+    let replacement_sha256 = sha256(replacement);
 
     let temporary =
         destination_home.join(format!(".auth-refresh-{}", uuid::Uuid::new_v4().simple()));
@@ -171,13 +251,47 @@ pub(super) fn replace_isolated_auth(
         temporary_file.sync_all()?;
         ensure_auth_digest(&read_private_auth(&destination)?, observed_sha256)?;
         fs::rename(&temporary, &destination)?;
-        ensure_auth_digest(&read_private_auth(&destination)?, replacement_sha256)?;
+        ensure_auth_digest(&read_private_auth(&destination)?, &replacement_sha256)?;
         fs::File::open(destination_home)?.sync_all()
     })();
     if result.is_err() {
         let _ = fs::remove_file(&temporary);
     }
     result
+}
+
+fn codex_external_auth_tokens(source: &[u8]) -> std::io::Result<Vec<u8>> {
+    // The broker owns refresh authority. Request-private app-server processes receive the
+    // externally managed access-token shape used by Codex itself, so concurrent executions
+    // cannot rotate or reuse the account refresh token independently.
+    let mut document: JsonValue = serde_json::from_slice(source).map_err(|_| invalid_auth())?;
+    let object = document.as_object_mut().ok_or_else(invalid_auth)?;
+    let tokens = object
+        .get_mut("tokens")
+        .and_then(JsonValue::as_object_mut)
+        .ok_or_else(invalid_auth)?;
+    if tokens
+        .get("access_token")
+        .and_then(JsonValue::as_str)
+        .is_none_or(str::is_empty)
+        || tokens.get("id_token").is_none()
+    {
+        return Err(invalid_auth());
+    }
+    tokens.insert("refresh_token".to_owned(), JsonValue::String(String::new()));
+    object.insert(
+        "auth_mode".to_owned(),
+        JsonValue::String("chatgptAuthTokens".to_owned()),
+    );
+    object.insert("OPENAI_API_KEY".to_owned(), JsonValue::Null);
+    object.remove("agent_identity");
+    object.remove("personal_access_token");
+    object.remove("bedrock_api_key");
+    let bytes = serde_json::to_vec(&document).map_err(|_| invalid_auth())?;
+    if bytes.is_empty() || bytes.len() as u64 > MAX_AUTH_BYTES {
+        return Err(invalid_auth());
+    }
+    Ok(bytes)
 }
 
 pub(super) fn prepare_isolated_grok_config(
@@ -317,6 +431,32 @@ fn write_private_file_if_absent_or_equal(
 
 fn read_private_auth(path: &Path) -> std::io::Result<Vec<u8>> {
     read_bounded_private_file(path, MAX_AUTH_BYTES)
+}
+
+fn read_private_auth_with_metadata(path: &Path) -> std::io::Result<(Vec<u8>, fs::Metadata)> {
+    let mut file = open_private_file(path)?;
+    let before = file.metadata()?;
+    let size = before.len();
+    if size == 0 || size > MAX_AUTH_BYTES {
+        return Err(invalid_auth());
+    }
+    let mut bytes = Vec::with_capacity(size as usize);
+    Read::by_ref(&mut file)
+        .take(MAX_AUTH_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    let after = file.metadata()?;
+    if bytes.len() as u64 != size
+        || before.dev() != after.dev()
+        || before.ino() != after.ino()
+        || before.len() != after.len()
+        || before.mtime() != after.mtime()
+        || before.mtime_nsec() != after.mtime_nsec()
+        || before.ctime() != after.ctime()
+        || before.ctime_nsec() != after.ctime_nsec()
+    {
+        return Err(invalid_auth());
+    }
+    Ok((bytes, after))
 }
 
 fn read_bounded_private_file(path: &Path, max_bytes: u64) -> std::io::Result<Vec<u8>> {
@@ -540,44 +680,138 @@ secret_access_key = "sk"
     }
 
     #[test]
-    fn isolated_auth_refresh_atomically_replaces_only_the_observed_revision() {
+    fn isolated_codex_auth_uses_external_tokens_without_refresh_authority() {
         let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
         let destination = root.path().join("destination");
-        let replacement = root.path().join("replacement");
+        private_directory(&source);
         private_directory(&destination);
-        private_directory(&replacement);
-        let old = br#"{"revision":1}"#;
-        let new = br#"{"revision":2}"#;
-        fs::write(destination.join(AUTH_FILE), old).unwrap();
-        fs::set_permissions(
-            destination.join(AUTH_FILE),
-            fs::Permissions::from_mode(0o600),
-        )
-        .unwrap();
-        fs::write(replacement.join(AUTH_FILE), new).unwrap();
-        fs::set_permissions(
-            replacement.join(AUTH_FILE),
-            fs::Permissions::from_mode(0o600),
+        let managed = br#"{
+          "auth_mode":"chatgpt",
+          "OPENAI_API_KEY":"unused-api-key",
+          "tokens":{
+            "id_token":"header.payload.signature",
+            "access_token":"live-access-token",
+            "refresh_token":"provider-refresh-secret",
+            "account_id":"account-1"
+          },
+          "last_refresh":"2026-08-24T03:21:17Z",
+          "personal_access_token":"unused-personal-token"
+        }"#;
+        fs::write(source.join(AUTH_FILE), managed).unwrap();
+        fs::set_permissions(source.join(AUTH_FILE), fs::Permissions::from_mode(0o600)).unwrap();
+
+        let isolated_sha = prepare_isolated_codex_auth_tokens(
+            &destination,
+            &source.join(AUTH_FILE),
+            &sha256(managed),
         )
         .unwrap();
 
-        replace_isolated_auth(
+        let isolated_bytes = fs::read(destination.join(AUTH_FILE)).unwrap();
+        let isolated: JsonValue = serde_json::from_slice(&isolated_bytes).unwrap();
+        assert_eq!(isolated["auth_mode"], "chatgptAuthTokens");
+        assert_eq!(isolated["OPENAI_API_KEY"], JsonValue::Null);
+        assert_eq!(isolated["tokens"]["access_token"], "live-access-token");
+        assert_eq!(isolated["tokens"]["refresh_token"], "");
+        assert!(isolated.get("personal_access_token").is_none());
+        assert!(!String::from_utf8_lossy(&isolated_bytes).contains("provider-refresh-secret"));
+        assert_eq!(isolated_sha, sha256(&isolated_bytes));
+        assert_ne!(isolated_sha, sha256(managed));
+        assert_eq!(fs::read(source.join(AUTH_FILE)).unwrap(), managed);
+    }
+
+    #[test]
+    fn isolated_codex_auth_rebinds_only_the_observed_projection() {
+        let root = tempfile::tempdir().unwrap();
+        let old_source = root.path().join("old-source");
+        let new_source = root.path().join("new-source");
+        let destination = root.path().join("destination");
+        private_directory(&old_source);
+        private_directory(&new_source);
+        private_directory(&destination);
+        let auth = |access: &str, refresh: &str| {
+            format!(
+                r#"{{"auth_mode":"chatgpt","OPENAI_API_KEY":null,"tokens":{{"id_token":"header.payload.signature","access_token":"{access}","refresh_token":"{refresh}","account_id":"account-1"}},"last_refresh":"2026-08-24T03:21:17Z"}}"#
+            )
+            .into_bytes()
+        };
+        let old = auth("old-access", "old-refresh");
+        let new = auth("new-access", "new-refresh");
+        for (home, bytes) in [(&old_source, &old), (&new_source, &new)] {
+            fs::write(home.join(AUTH_FILE), bytes).unwrap();
+            fs::set_permissions(home.join(AUTH_FILE), fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let old_isolated = prepare_isolated_codex_auth_tokens(
             &destination,
-            &replacement.join(AUTH_FILE),
-            &sha256(old),
-            &sha256(new),
+            &old_source.join(AUTH_FILE),
+            &sha256(&old),
         )
         .unwrap();
-        assert_eq!(fs::read(destination.join(AUTH_FILE)).unwrap(), new);
-        assert!(
-            replace_isolated_auth(
+
+        let new_isolated = replace_isolated_codex_auth_tokens(
+            &destination,
+            &new_source.join(AUTH_FILE),
+            &old_isolated,
+            &sha256(&new),
+        )
+        .unwrap();
+
+        assert_ne!(old_isolated, new_isolated);
+        assert_eq!(auth_file_sha256(&destination).unwrap(), new_isolated);
+        let projected: JsonValue =
+            serde_json::from_slice(&fs::read(destination.join(AUTH_FILE)).unwrap()).unwrap();
+        assert_eq!(projected["auth_mode"], "chatgptAuthTokens");
+        assert_eq!(projected["tokens"]["access_token"], "new-access");
+        assert_eq!(projected["tokens"]["refresh_token"], "");
+        assert_eq!(
+            replace_isolated_codex_auth_tokens(
                 &destination,
-                &replacement.join(AUTH_FILE),
-                &sha256(old),
-                &sha256(new),
+                &new_source.join(AUTH_FILE),
+                &old_isolated,
+                &sha256(&new),
             )
-            .is_err()
+            .unwrap(),
+            new_isolated
         );
+    }
+
+    #[test]
+    fn forty_isolated_codex_children_cannot_share_refresh_authority() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        private_directory(&source);
+        let managed = br#"{"auth_mode":"chatgpt","OPENAI_API_KEY":null,"tokens":{"id_token":"header.payload.signature","access_token":"shared-access","refresh_token":"singleflight-refresh-secret","account_id":"account-1"},"last_refresh":"2026-08-24T03:21:17Z"}"#;
+        fs::write(source.join(AUTH_FILE), managed).unwrap();
+        fs::set_permissions(source.join(AUTH_FILE), fs::Permissions::from_mode(0o600)).unwrap();
+        let source_digest = sha256(managed);
+        let destinations = (0..40)
+            .map(|index| root.path().join(format!("child-{index}")))
+            .collect::<Vec<_>>();
+        for destination in &destinations {
+            private_directory(destination);
+        }
+
+        std::thread::scope(|scope| {
+            for destination in &destinations {
+                let source = source.join(AUTH_FILE);
+                let source_digest = source_digest.clone();
+                scope.spawn(move || {
+                    prepare_isolated_codex_auth_tokens(destination, &source, &source_digest)
+                        .unwrap();
+                    let bytes = fs::read(destination.join(AUTH_FILE)).unwrap();
+                    let isolated: JsonValue = serde_json::from_slice(&bytes).unwrap();
+                    assert_eq!(isolated["auth_mode"], "chatgptAuthTokens");
+                    assert_eq!(isolated["tokens"]["refresh_token"], "");
+                    assert!(
+                        !String::from_utf8_lossy(&bytes).contains("singleflight-refresh-secret")
+                    );
+                });
+            }
+        });
+
+        assert_eq!(fs::read(source.join(AUTH_FILE)).unwrap(), managed);
+        assert_eq!(auth_file_sha256(&source).unwrap(), source_digest);
     }
 
     #[test]

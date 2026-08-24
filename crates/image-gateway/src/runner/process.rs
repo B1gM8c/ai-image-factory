@@ -27,6 +27,10 @@ const MAX_DIAGNOSTIC_BYTES: u64 = 64 * 1024;
 pub(crate) const CODEX_APP_SERVER_FAILURE_DIAGNOSTIC_FILE: &str = "codex-app-server-failure.json";
 pub(crate) const CODEX_AUTH_REFRESH_REQUEST_FILE: &str = "codex-auth-refresh-request.json";
 pub(crate) const CODEX_AUTH_REFRESH_RESULT_FILE: &str = "codex-auth-refresh-result.json";
+pub(crate) const CODEX_AUTH_ATTEMPT_1_START_FILE: &str = "codex-auth-attempt-1-start.json";
+pub(crate) const CODEX_AUTH_ATTEMPT_1_FINISH_FILE: &str = "codex-auth-attempt-1-finish.json";
+pub(crate) const CODEX_AUTH_ATTEMPT_2_START_FILE: &str = "codex-auth-attempt-2-start.json";
+pub(crate) const CODEX_AUTH_ATTEMPT_2_FINISH_FILE: &str = "codex-auth-attempt-2-finish.json";
 const WORKSPACE_DIR: &str = "workspace";
 const CODEX_HOME_DIR: &str = "codex-home";
 const RUNTIME_HOME_DIR: &str = "runtime-home";
@@ -579,6 +583,10 @@ impl ExecutionSpool {
             CODEX_APP_SERVER_FAILURE_DIAGNOSTIC_FILE
                 | CODEX_AUTH_REFRESH_REQUEST_FILE
                 | CODEX_AUTH_REFRESH_RESULT_FILE
+                | CODEX_AUTH_ATTEMPT_1_START_FILE
+                | CODEX_AUTH_ATTEMPT_1_FINISH_FILE
+                | CODEX_AUTH_ATTEMPT_2_START_FILE
+                | CODEX_AUTH_ATTEMPT_2_FINISH_FILE
         ) || (filename.starts_with("grok-")
             && filename.ends_with(".json")
             && filename.len() <= 64
@@ -597,7 +605,12 @@ impl ExecutionSpool {
     {
         if !matches!(
             filename,
-            CODEX_AUTH_REFRESH_REQUEST_FILE | CODEX_AUTH_REFRESH_RESULT_FILE
+            CODEX_AUTH_REFRESH_REQUEST_FILE
+                | CODEX_AUTH_REFRESH_RESULT_FILE
+                | CODEX_AUTH_ATTEMPT_1_START_FILE
+                | CODEX_AUTH_ATTEMPT_1_FINISH_FILE
+                | CODEX_AUTH_ATTEMPT_2_START_FILE
+                | CODEX_AUTH_ATTEMPT_2_FINISH_FILE
         ) {
             return Err(ProcessSpoolError::InvalidInput);
         }
@@ -797,6 +810,14 @@ impl ProviderProcessIdentity {
         };
         identity.validate()?;
         Ok(identity)
+    }
+
+    pub(crate) fn pid(&self) -> u32 {
+        self.pid
+    }
+
+    pub(crate) fn start_token(&self) -> &str {
+        &self.start_token
     }
 
     fn validate(&self) -> Result<(), ProcessSpoolError> {
