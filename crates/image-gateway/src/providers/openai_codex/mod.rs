@@ -426,6 +426,9 @@ pub(crate) fn build_edit_prompt(user_prompt: &str, image_count: usize, has_mask:
             "\n已附加 mask.png 作为编辑遮罩。透明 mask 像素表示需要编辑的区域；请尽量保留非遮罩区域不变。Codex 原生图像能力无法保证像素级 inpainting，但应尽最大可能遵循遮罩语义。",
         );
     }
+    prompt.push_str(
+        "\n必须只调用一次当前启用的 image_gen.imagegen 图像生成工具（wire name: image_gen__imagegen）完成编辑，并把所有已附加输入图片作为该次编辑的参考图。纯文本回复、生成方案、确认说明或未调用工具都不算完成。不要用 shell、本地程序或其它工具复制、移动、重命名、删除或修改图像工具产物。工具成功后立即停止，由 Factory 从受控原生产物路径完成封存。",
+    );
     prompt
 }
 
@@ -880,7 +883,7 @@ mod tests {
     fn fake_edit_app_server_script(source: &Path, input: &Path) -> String {
         let marker = "IFS= read -r turn_start\n";
         let assertion = format!(
-            "{marker}printf '%s' \"$turn_start\" | /usr/bin/grep -F '\"type\":\"localImage\"' >/dev/null\nprintf '%s' \"$turn_start\" | /usr/bin/grep -F '\"path\":\"{}\"' >/dev/null\n",
+            "{marker}printf '%s' \"$turn_start\" | /usr/bin/grep -F '\"type\":\"localImage\"' >/dev/null\nprintf '%s' \"$turn_start\" | /usr/bin/grep -F '\"path\":\"{}\"' >/dev/null\nprintf '%s' \"$turn_start\" | /usr/bin/grep -F 'image_gen.imagegen' >/dev/null\nprintf '%s' \"$turn_start\" | /usr/bin/grep -F 'image_gen__imagegen' >/dev/null\n",
             input.display()
         );
         fake_app_server_script(source).replacen(marker, &assertion, 1)
@@ -1208,6 +1211,11 @@ mod tests {
         assert!(prompt.contains("不要把输入图逐张简单拼贴成网格"));
         assert!(prompt.contains("mask.png"));
         assert!(prompt.contains("非遮罩区域"));
+        assert!(prompt.contains("必须只调用一次"));
+        assert!(prompt.contains("image_gen.imagegen"));
+        assert!(prompt.contains("image_gen__imagegen"));
+        assert!(prompt.contains("纯文本回复"));
+        assert!(prompt.contains("所有已附加输入图片"));
     }
 
     #[test]
