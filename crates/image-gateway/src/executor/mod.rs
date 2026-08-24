@@ -22,7 +22,8 @@ mod runner;
 pub(crate) use private_auth::read_verified_auth;
 
 pub use codex_request::{
-    CodexOutputRequest, CodexRequestProjectionError, project_codex_output_request,
+    CodexEditInputRequest, CodexEditOutputRequest, CodexExecutionRequest, CodexOutputRequest,
+    CodexRequestProjectionError, project_codex_execution_request, project_codex_output_request,
 };
 pub use codex_supervisor::{
     CODEX_GENERATION_ADAPTER_REVISION, CodexProcessSupervisor, codex_auth_file_sha256,

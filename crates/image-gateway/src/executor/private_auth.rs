@@ -139,6 +139,47 @@ pub(super) fn prepare_isolated_auth(
     fs::File::open(destination_home)?.sync_all()
 }
 
+pub(super) fn replace_isolated_auth(
+    destination_home: &Path,
+    source: &Path,
+    observed_sha256: &str,
+    replacement_sha256: &str,
+) -> std::io::Result<()> {
+    if !destination_home.is_absolute()
+        || !is_sha256(observed_sha256)
+        || !is_sha256(replacement_sha256)
+        || observed_sha256 == replacement_sha256
+    {
+        return Err(invalid_auth());
+    }
+    let destination = destination_home.join(AUTH_FILE);
+    let current = read_private_auth(&destination)?;
+    ensure_auth_digest(&current, observed_sha256)?;
+    let replacement = read_private_auth(source)?;
+    ensure_auth_digest(&replacement, replacement_sha256)?;
+
+    let temporary =
+        destination_home.join(format!(".auth-refresh-{}", uuid::Uuid::new_v4().simple()));
+    let result = (|| {
+        let mut temporary_file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&temporary)?;
+        temporary_file.write_all(&replacement)?;
+        temporary_file.sync_all()?;
+        ensure_auth_digest(&read_private_auth(&destination)?, observed_sha256)?;
+        fs::rename(&temporary, &destination)?;
+        ensure_auth_digest(&read_private_auth(&destination)?, replacement_sha256)?;
+        fs::File::open(destination_home)?.sync_all()
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
 pub(super) fn prepare_isolated_grok_config(
     destination_home: &Path,
     source_home: &Path,
@@ -496,6 +537,47 @@ secret_access_key = "sk"
         .unwrap();
 
         assert!(prepare_isolated_grok_config(&destination, &source).is_err());
+    }
+
+    #[test]
+    fn isolated_auth_refresh_atomically_replaces_only_the_observed_revision() {
+        let root = tempfile::tempdir().unwrap();
+        let destination = root.path().join("destination");
+        let replacement = root.path().join("replacement");
+        private_directory(&destination);
+        private_directory(&replacement);
+        let old = br#"{"revision":1}"#;
+        let new = br#"{"revision":2}"#;
+        fs::write(destination.join(AUTH_FILE), old).unwrap();
+        fs::set_permissions(
+            destination.join(AUTH_FILE),
+            fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        fs::write(replacement.join(AUTH_FILE), new).unwrap();
+        fs::set_permissions(
+            replacement.join(AUTH_FILE),
+            fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+
+        replace_isolated_auth(
+            &destination,
+            &replacement.join(AUTH_FILE),
+            &sha256(old),
+            &sha256(new),
+        )
+        .unwrap();
+        assert_eq!(fs::read(destination.join(AUTH_FILE)).unwrap(), new);
+        assert!(
+            replace_isolated_auth(
+                &destination,
+                &replacement.join(AUTH_FILE),
+                &sha256(old),
+                &sha256(new),
+            )
+            .is_err()
+        );
     }
 
     #[test]

@@ -25,6 +25,8 @@ const OUTPUT_FILE: &str = "output.bin";
 const RESULT_FILE: &str = "result.json";
 const MAX_DIAGNOSTIC_BYTES: u64 = 64 * 1024;
 pub(crate) const CODEX_APP_SERVER_FAILURE_DIAGNOSTIC_FILE: &str = "codex-app-server-failure.json";
+pub(crate) const CODEX_AUTH_REFRESH_REQUEST_FILE: &str = "codex-auth-refresh-request.json";
+pub(crate) const CODEX_AUTH_REFRESH_RESULT_FILE: &str = "codex-auth-refresh-result.json";
 const WORKSPACE_DIR: &str = "workspace";
 const CODEX_HOME_DIR: &str = "codex-home";
 const RUNTIME_HOME_DIR: &str = "runtime-home";
@@ -572,19 +574,34 @@ impl ExecutionSpool {
     where
         T: Serialize + DeserializeOwned + Eq,
     {
-        let valid_name = filename == CODEX_APP_SERVER_FAILURE_DIAGNOSTIC_FILE
-            || (filename.starts_with("grok-")
-                && filename.ends_with(".json")
-                && filename.len() <= 64
-                && filename.bytes().all(|byte| {
-                    byte.is_ascii_lowercase()
-                        || byte.is_ascii_digit()
-                        || matches!(byte, b'-' | b'.')
-                }));
+        let valid_name = matches!(
+            filename,
+            CODEX_APP_SERVER_FAILURE_DIAGNOSTIC_FILE
+                | CODEX_AUTH_REFRESH_REQUEST_FILE
+                | CODEX_AUTH_REFRESH_RESULT_FILE
+        ) || (filename.starts_with("grok-")
+            && filename.ends_with(".json")
+            && filename.len() <= 64
+            && filename.bytes().all(|byte| {
+                byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'.')
+            }));
         if !valid_name {
             return Err(ProcessSpoolError::InvalidInput);
         }
         publish_json_or_compare(&self.directory, filename, diagnostic, MAX_DIAGNOSTIC_BYTES)
+    }
+
+    pub(crate) fn read_diagnostic<T>(&self, filename: &str) -> Result<Option<T>, ProcessSpoolError>
+    where
+        T: DeserializeOwned,
+    {
+        if !matches!(
+            filename,
+            CODEX_AUTH_REFRESH_REQUEST_FILE | CODEX_AUTH_REFRESH_RESULT_FILE
+        ) {
+            return Err(ProcessSpoolError::InvalidInput);
+        }
+        read_optional_json(&self.directory, filename, MAX_DIAGNOSTIC_BYTES)
     }
 
     pub(crate) fn cleanup_provider_runtime(&self) -> Result<(), ProcessSpoolError> {

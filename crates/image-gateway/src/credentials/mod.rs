@@ -39,3 +39,13 @@ pub trait OperationalCredentialResolver: Send + Sync + 'static {
         provider_account_id: Uuid,
     ) -> Result<OperationalCredential, CredentialResolveError>;
 }
+
+#[async_trait]
+pub trait OperationalCredentialRefresher: Send + Sync + 'static {
+    async fn refresh_after_authentication_rejection(
+        &self,
+        provider_account_id: Uuid,
+        observed_revision: i64,
+        observed_fingerprint_sha256: &str,
+    ) -> Result<OperationalCredential, CredentialResolveError>;
+}

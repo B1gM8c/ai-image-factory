@@ -1,13 +1,15 @@
-use std::{env, time::Duration};
+use std::{env, fs, os::unix::fs::PermissionsExt, time::Duration};
 
 use gpt_image_2_gateway::{
     ApiKeyKeyring, ApiKeyPermissionMode, ApiKeyPermissions, ApiKeyStore, CredentialResolveError,
-    ImageGatewayError, OperationalCredentialResolver, PostgresApiKeyStore, PostgresCredentialStore,
+    ImageGatewayError, OperationalCredentialRefresher, OperationalCredentialResolver,
+    PostgresApiKeyStore, PostgresCredentialStore, PostgresProviderManagementService,
     PostgresUsageStore, UsageCharge, UsageLimits, UsageStore,
     database::{
         connect_pool, connect_test_pool_with_search_path, run_migrations, verify_migrations,
     },
 };
+use sha2::{Digest, Sha256};
 use sqlx::{AssertSqlSafe, PgPool, postgres::PgListener};
 use tokio::time::timeout;
 use uuid::Uuid;
@@ -2397,6 +2399,115 @@ async fn credential_broker_serializes_refresh_and_promotes_observed_metadata() -
             refresh_state == ("active".to_owned(), 0, true),
             "Dreamina CLI-managed refresh did not schedule its next health check",
         )
+    }
+    .await;
+    let cleanup = test_schema.cleanup().await;
+    cleanup?;
+    result
+}
+
+#[tokio::test]
+async fn authentication_rejection_refresh_is_singleflight_and_waiters_observe_promotion()
+-> TestResult {
+    let Some(test_schema) = TestSchema::new(4).await? else {
+        return Ok(());
+    };
+    let result = async {
+        gateway_result(run_migrations(&test_schema.pool).await, "migration failed")?;
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let home = temp.path().join("account");
+        fs::create_dir(&home).map_err(|error| error.to_string())?;
+        fs::set_permissions(&home, fs::Permissions::from_mode(0o700))
+            .map_err(|error| error.to_string())?;
+        let old_auth = br#"{"tokens":{"account_id":"account-1","access_token":"old"}}"#;
+        let new_auth = br#"{"tokens":{"account_id":"account-1","access_token":"new"}}"#;
+        let old_fingerprint = hex::encode(Sha256::digest(old_auth));
+        let new_fingerprint = hex::encode(Sha256::digest(new_auth));
+        let identity = hex::encode(Sha256::digest(b"account-1"));
+        let auth_path = home.join("auth.json");
+        fs::write(&auth_path, old_auth).map_err(|error| error.to_string())?;
+        fs::set_permissions(&auth_path, fs::Permissions::from_mode(0o600))
+            .map_err(|error| error.to_string())?;
+
+        let credential_pool_id = Uuid::new_v4();
+        let provider_account_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO provider_credential_pools (credential_pool_id, pool_key, provider_id, state, created_at_ms, updated_at_ms) VALUES ($1, $2, 'openai-codex', 'enabled', 1, 1)",
+        )
+        .bind(credential_pool_id)
+        .bind(format!("singleflight-{provider_account_id}"))
+        .execute(&test_schema.pool)
+        .await
+        .map_err(|error| error.to_string())?;
+        sqlx::query(
+            "INSERT INTO provider_accounts (provider_account_id, credential_pool_id, provider_id, account_key, credential_ref, credential_revision, credential_auth_sha256, state, created_at_ms, updated_at_ms) VALUES ($1, $2, 'openai-codex', $3, $4, 1, $5, 'enabled', 1, 1)",
+        )
+        .bind(provider_account_id)
+        .bind(credential_pool_id)
+        .bind(format!("singleflight-{provider_account_id}"))
+        .bind(format!("managed://singleflight-{provider_account_id}"))
+        .bind(&old_fingerprint)
+        .execute(&test_schema.pool)
+        .await
+        .map_err(|error| error.to_string())?;
+        sqlx::query(
+            "INSERT INTO provider_account_environments (provider_account_id, provider_id, environment_kind, environment_ref, upstream_identity_sha256, display_name, state, created_at_ms, updated_at_ms) VALUES ($1, 'openai-codex', 'codex_home_v1', $2, $3, 'Singleflight', 'active', 1, 1)",
+        )
+        .bind(provider_account_id)
+        .bind(home.to_string_lossy().as_ref())
+        .bind(identity)
+        .execute(&test_schema.pool)
+        .await
+        .map_err(|error| error.to_string())?;
+
+        let fake_codex = temp.path().join("fake-codex");
+        fs::write(
+            &fake_codex,
+            format!(
+                "#!/bin/sh\nset -eu\nIFS= read -r initialize\nprintf '{{\"id\":1,\"result\":{{}}}}\\n'\nIFS= read -r initialized\nIFS= read -r account_read\n/bin/sleep 0.3\nprintf '%s' '{}' > \"$CODEX_HOME/auth.json.next\"\n/bin/chmod 600 \"$CODEX_HOME/auth.json.next\"\n/bin/mv \"$CODEX_HOME/auth.json.next\" \"$CODEX_HOME/auth.json\"\nprintf '{{\"id\":3,\"result\":{{\"account\":{{\"email\":\"singleflight@example.invalid\",\"planType\":\"test\"}}}}}}\\n'\nwhile IFS= read -r ignored; do :; done\n",
+                String::from_utf8_lossy(new_auth),
+            ),
+        )
+        .map_err(|error| error.to_string())?;
+        fs::set_permissions(&fake_codex, fs::Permissions::from_mode(0o755))
+            .map_err(|error| error.to_string())?;
+        let service = PostgresProviderManagementService::new(
+            test_schema.pool.clone(),
+            temp.path().to_path_buf(),
+            fake_codex,
+        );
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..20 {
+            let service = service.clone();
+            let old_fingerprint = old_fingerprint.clone();
+            tasks.spawn(async move {
+                service
+                    .refresh_after_authentication_rejection(
+                        provider_account_id,
+                        1,
+                        &old_fingerprint,
+                    )
+                    .await
+            });
+        }
+        while let Some(result) = tasks.join_next().await {
+            let credential = result
+                .map_err(|error| error.to_string())?
+                .map_err(|error| format!("singleflight waiter failed: {error:?}"))?;
+            require(
+                credential.revision == 2
+                    && credential.material_fingerprint_sha256 == new_fingerprint,
+                "singleflight waiter did not observe the promoted credential revision",
+            )?;
+        }
+        let claims: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM provider_account_credential_events WHERE provider_account_id = $1 AND event_type = 'refresh_claimed'",
+        )
+        .bind(provider_account_id)
+        .fetch_one(&test_schema.pool)
+        .await
+        .map_err(|error| error.to_string())?;
+        require(claims == 1, "concurrent authentication failures triggered multiple refreshes")
     }
     .await;
     let cleanup = test_schema.cleanup().await;

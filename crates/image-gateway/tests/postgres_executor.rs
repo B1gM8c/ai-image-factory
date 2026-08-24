@@ -5,15 +5,17 @@ use std::{
 
 use gpt_image_2_gateway::database::{connect_test_pool_with_search_path, run_migrations};
 use gpt_image_2_gateway::{
-    BlockedTerminalRequeueError, CODEX_GENERATION_ADAPTER_REVISION, CanonicalExecutorOutcome,
-    CustomerArtifactPublisher, ExecutionSettlementStore, ExecutorParentTerminalState,
-    ExecutorTerminalBlockReason, ExecutorTerminalError, ExecutorTerminalStore, GenerationJob,
-    PostgresExecutionSettlementStore, PostgresExecutorTerminalStore, PostgresReconciliationStore,
-    ReconciliationOutcome, ReconciliationStore, UsageCharge, UsageLimits, UsageReservation,
-    UsageSnapshot,
+    BlockedTerminalRequeueError, CODEX_EDIT_INLINE_ADAPTER_REVISION,
+    CODEX_GENERATION_ADAPTER_REVISION, CanonicalExecutorOutcome, CustomerArtifactPublisher,
+    EditJob, ExecutionSettlementStore, ExecutorParentTerminalState, ExecutorTerminalBlockReason,
+    ExecutorTerminalError, ExecutorTerminalStore, GenerationJob, PostgresExecutionSettlementStore,
+    PostgresExecutorTerminalStore, PostgresReconciliationStore, ReconciliationOutcome,
+    ReconciliationStore, UsageCharge, UsageLimits, UsageReservation, UsageSnapshot,
     admission::{
         AdmissionTicket, DreaminaImageAdmissionPlan, DreaminaVideoAdmissionPlan,
-        GENERATION_COMMAND_SCHEMA, GenerationCommandV1, VIDEO_GENERATION_OPERATION, WorkLease,
+        EDIT_COMMAND_SCHEMA, EDIT_INPUT_MANIFEST_SCHEMA, EditCommandV1, EditInputDescriptorV1,
+        EditInputRoleV1, GENERATION_COMMAND_SCHEMA, GenerationCommandV1,
+        VIDEO_GENERATION_OPERATION, WorkLease,
     },
     artifacts::{
         ArtifactBlobStore, ArtifactIdentity, ExecutorArtifactPublisher,
@@ -31,6 +33,7 @@ use gpt_image_2_gateway::{
         ExecutorSubmissionOutcome, ExecutorSubmissionStore, PostgresExecutorOwnerGuard,
         PostgresExecutorSubmissionStore,
     },
+    input_blobs::{InputBlobKey, InputBlobRef},
     reconcile_inline_customer_settlement,
 };
 use image::{DynamicImage, ImageFormat, Rgba, RgbaImage};
@@ -55,6 +58,7 @@ type TestResult<T = ()> = Result<T, String>;
 
 const TEST_PROFILE_ID: Uuid = Uuid::from_u128(0x100);
 const CODEX_PROFILE_ID: Uuid = Uuid::from_u128(0x200);
+const CODEX_EDIT_PROFILE_ID: Uuid = Uuid::from_u128(0xe00);
 const TEST_POLICY_ID: Uuid = Uuid::from_u128(0x300);
 const CODEX_POLICY_ID: Uuid = Uuid::from_u128(0x400);
 const TEST_POOL_ID: Uuid = Uuid::from_u128(0x500);
@@ -175,6 +179,7 @@ struct InlineCustomerSettlementState {
 fn profile_id_for_lease(lease: &WorkLease) -> Uuid {
     match lease.command_schema.as_str() {
         GENERATION_COMMAND_SCHEMA => CODEX_PROFILE_ID,
+        EDIT_COMMAND_SCHEMA => CODEX_EDIT_PROFILE_ID,
         DREAMINA_SUBMIT_COMMAND_SCHEMA => DREAMINA_PROFILE_ID,
         _ => TEST_PROFILE_ID,
     }
@@ -349,14 +354,33 @@ async fn executord_rejects_auth_home_that_does_not_match_database_credential() -
 }
 
 #[tokio::test]
-async fn restarted_executord_attaches_running_helper_without_relaunching_provider() -> TestResult {
+async fn restarted_edit_executord_attaches_running_helper_without_relaunching_provider()
+-> TestResult {
     let _process_guard = EXECUTORD_PROCESS_TEST_LOCK.lock().await;
     let Some(database) = TestDatabase::new().await? else {
         return Ok(());
     };
     let result = async {
-        let lease =
-            seed_codex_generation_lease(&database.pool, "executord-restart-workerd").await?;
+        let files = ExecutordFixture::new(Duration::from_secs(2))?;
+        let input_blobs = FilesystemArtifactBlobStore::new(&files.artifact_root)
+            .map_err(debug_error)?;
+        let input = gpt_image_2_gateway::input_blobs::InputBlobStore::put(
+            &input_blobs,
+            InputBlobKey {
+                admission_session_id: Uuid::new_v4(),
+                input_id: Uuid::new_v4(),
+            },
+            &png_bytes([20, 30, 40, 255]),
+        )
+        .await
+        .map_err(debug_error)?;
+        let lease = seed_codex_edit_lease_with_input(
+            &database.pool,
+            "executord-restart-workerd",
+            1,
+            input,
+        )
+        .await?;
         let store = PostgresExecutorSubmissionStore::new(database.pool.clone());
         require(
             store
@@ -367,10 +391,9 @@ async fn restarted_executord_attaches_running_helper_without_relaunching_provide
                 == 1,
             "expected one prepared output",
         )?;
-        let files = ExecutordFixture::new(Duration::from_secs(2))?;
         let owner = "executord-restart-smoke";
         let mut first = files
-            .command(&database, owner)
+            .command_for_profile(&database, owner, "openai-codex-edit-v1")
             .await?
             .spawn()
             .map_err(debug_error)?;
@@ -392,6 +415,14 @@ async fn restarted_executord_attaches_running_helper_without_relaunching_provide
                     && fs::read_to_string(&files.invocations).is_ok_and(|value| value == "1\n")
                 {
                     break Ok::<_, String>(());
+                }
+                if state
+                    .as_deref()
+                    .is_some_and(|state| matches!(state, "failed" | "uncertain" | "succeeded"))
+                {
+                    break Err(format!(
+                        "edit execution became terminal before provider start: {state:?}"
+                    ));
                 }
                 if let Some(status) = first.try_wait().map_err(debug_error)? {
                     break Err(format!("first executord exited early with {status}"));
@@ -421,7 +452,7 @@ async fn restarted_executord_attaches_running_helper_without_relaunching_provide
         sqlx::query(
             "UPDATE provider_execution_profiles SET state = 'disabled', updated_at_ms = $2 WHERE execution_profile_id = $1",
         )
-        .bind(CODEX_PROFILE_ID)
+        .bind(CODEX_EDIT_PROFILE_ID)
         .bind(now)
         .execute(&mut *disable)
         .await
@@ -444,7 +475,7 @@ async fn restarted_executord_attaches_running_helper_without_relaunching_provide
         disable.commit().await.map_err(debug_error)?;
 
         let mut second = files
-            .command(&database, owner)
+            .command_for_profile(&database, owner, "openai-codex-edit-v1")
             .await?
             .spawn()
             .map_err(debug_error)?;
@@ -3077,31 +3108,83 @@ async fn v4_terminal_multi_output_rates_every_token_partition_once() -> TestResu
 }
 
 #[tokio::test]
+async fn v4_four_output_all_succeed_and_settle_once() -> TestResult {
+    assert_v4_codex_mixed_settlement(CodexBatchOperation::Generation, 4, &[0, 1, 2, 3]).await
+}
+
+#[tokio::test]
 async fn v4_four_output_one_success_returns_the_durable_output() -> TestResult {
-    assert_v4_four_output_mixed_settlement(&[0]).await
+    assert_v4_codex_mixed_settlement(CodexBatchOperation::Generation, 4, &[0]).await
+}
+
+#[tokio::test]
+async fn v4_four_output_two_successes_return_the_durable_outputs() -> TestResult {
+    assert_v4_codex_mixed_settlement(CodexBatchOperation::Generation, 4, &[0, 2]).await
 }
 
 #[tokio::test]
 async fn v4_four_output_three_successes_return_the_durable_outputs() -> TestResult {
-    assert_v4_four_output_mixed_settlement(&[0, 1, 2]).await
+    assert_v4_codex_mixed_settlement(CodexBatchOperation::Generation, 4, &[0, 1, 2]).await
 }
 
 #[tokio::test]
 async fn v4_four_output_all_failed_remains_failed_without_a_projection() -> TestResult {
-    assert_v4_four_output_mixed_settlement(&[]).await
+    assert_v4_codex_mixed_settlement(CodexBatchOperation::Generation, 4, &[]).await
 }
 
-async fn assert_v4_four_output_mixed_settlement(successful_outputs: &[i32]) -> TestResult {
+#[tokio::test]
+async fn v4_two_output_edit_all_succeed_and_settle_once() -> TestResult {
+    assert_v4_codex_mixed_settlement(CodexBatchOperation::Edit, 2, &[0, 1]).await
+}
+
+#[tokio::test]
+async fn v4_two_output_edit_preserves_one_success_and_releases_one_failure() -> TestResult {
+    assert_v4_codex_mixed_settlement(CodexBatchOperation::Edit, 2, &[1]).await
+}
+
+#[tokio::test]
+async fn v4_two_output_edit_all_failed_releases_the_full_hold() -> TestResult {
+    assert_v4_codex_mixed_settlement(CodexBatchOperation::Edit, 2, &[]).await
+}
+
+#[tokio::test]
+async fn v4_four_output_edit_preserves_two_successes_and_releases_two_failures() -> TestResult {
+    assert_v4_codex_mixed_settlement(CodexBatchOperation::Edit, 4, &[0, 2]).await
+}
+
+#[derive(Clone, Copy)]
+enum CodexBatchOperation {
+    Generation,
+    Edit,
+}
+
+async fn assert_v4_codex_mixed_settlement(
+    operation: CodexBatchOperation,
+    output_count: u32,
+    successful_outputs: &[i32],
+) -> TestResult {
     let Some(database) = TestDatabase::new().await? else {
         return Ok(());
     };
     let result = async {
-        let work = seed_codex_generation_lease_with_outputs(
-            &database.pool,
-            "v4-four-output-mixed-worker",
-            4,
-        )
-        .await?;
+        let work = match operation {
+            CodexBatchOperation::Generation => {
+                seed_codex_generation_lease_with_outputs(
+                    &database.pool,
+                    "v4-codex-mixed-worker",
+                    output_count,
+                )
+                .await?
+            }
+            CodexBatchOperation::Edit => {
+                seed_codex_edit_lease_with_outputs(
+                    &database.pool,
+                    "v4-codex-mixed-worker",
+                    output_count,
+                )
+                .await?
+            }
+        };
         seed_v4_customer_quote(&database.pool, &work, 40_000).await?;
         let executor = PostgresExecutorSubmissionStore::new(database.pool.clone());
         let (executor_artifacts, artifact_root) = artifact_publisher(&executor)?;
@@ -3109,16 +3192,23 @@ async fn assert_v4_four_output_mixed_settlement(successful_outputs: &[i32]) -> T
             .prepare_and_handoff(&work, profile_id_for_lease(&work))
             .await
             .map_err(debug_error)?;
-        require(prepared.len() == 4, "expected four prepared outputs")?;
+        require(
+            prepared.len() == usize::try_from(output_count).map_err(debug_error)?,
+            "expected one prepared submission per output",
+        )?;
         seed_terminal_quota(&database.pool, &work).await?;
 
         let scope = ExecutorClaimScope {
-            execution_profile_id: CODEX_PROFILE_ID,
+            execution_profile_id: profile_id_for_lease(&work),
             provider_id: "openai-codex".to_string(),
-            command_schema: GENERATION_COMMAND_SCHEMA.to_string(),
-            adapter_revision: CODEX_GENERATION_ADAPTER_REVISION.to_string(),
+            command_schema: work.command_schema.clone(),
+            adapter_revision: match operation {
+                CodexBatchOperation::Generation => CODEX_GENERATION_ADAPTER_REVISION,
+                CodexBatchOperation::Edit => CODEX_EDIT_INLINE_ADAPTER_REVISION,
+            }
+            .to_string(),
         };
-        for index in 0..4 {
+        for index in 0..output_count {
             let lease = executor
                 .claim_prepared(&scope, &format!("v4-four-output-executor-{index}"), 60_000)
                 .await
@@ -3144,7 +3234,7 @@ async fn assert_v4_four_output_mixed_settlement(successful_outputs: &[i32]) -> T
         let customer_publisher = CustomerArtifactPublisher::new(Arc::new(
             FilesystemArtifactBlobStore::new(artifact_root.path()).map_err(debug_error)?,
         ));
-        for index in 0..4 {
+        for index in 0..output_count {
             let terminal = reductions
                 .claim_terminal(&format!("v4-four-output-reducer-{index}"), 60_000)
                 .await
@@ -3164,9 +3254,9 @@ async fn assert_v4_four_output_mixed_settlement(successful_outputs: &[i32]) -> T
                 .complete_terminal(&terminal, artifact.as_ref())
                 .await
                 .map_err(debug_error)?;
-            let expected_parent = if index == 3 && successful_outputs.is_empty() {
+            let expected_parent = if index + 1 == output_count && successful_outputs.is_empty() {
                 ExecutorParentTerminalState::Failed
-            } else if index == 3 {
+            } else if index + 1 == output_count {
                 ExecutorParentTerminalState::Succeeded
             } else {
                 ExecutorParentTerminalState::Pending
@@ -3178,7 +3268,7 @@ async fn assert_v4_four_output_mixed_settlement(successful_outputs: &[i32]) -> T
         }
 
         let success_count = i64::try_from(successful_outputs.len()).map_err(debug_error)?;
-        let failed_count = 4_i64 - success_count;
+        let failed_count = i64::from(output_count) - success_count;
         let has_success = success_count > 0;
         let state: V4MixedSettlementState = sqlx::query_as(
             r#"
@@ -3232,10 +3322,10 @@ async fn assert_v4_four_output_mixed_settlement(successful_outputs: &[i32]) -> T
                     projection_count: i64::from(has_success),
                     projection_artifact_count: has_success
                         .then_some(i32::try_from(success_count).map_err(debug_error)?),
-                    submission_count: 4,
+                    submission_count: i64::from(output_count),
                     blocked_count: 0,
                     rating_count: 1,
-                    rating_line_count: 4,
+                    rating_line_count: i64::from(output_count),
                     hold_state: "settled".to_string(),
                     captured_micros: success_count * 40_000,
                     released_micros: failed_count * 40_000,
@@ -8725,6 +8815,134 @@ async fn seed_codex_generation_lease_with_outputs(
     .await
 }
 
+async fn seed_codex_edit_lease_with_outputs(
+    pool: &PgPool,
+    worker_id: &str,
+    output_count: u32,
+) -> TestResult<WorkLease> {
+    let admission_session_id = Uuid::new_v4();
+    let input_id = Uuid::new_v4();
+    seed_codex_edit_lease_with_input(
+        pool,
+        worker_id,
+        output_count,
+        InputBlobRef {
+            key: InputBlobKey {
+                admission_session_id,
+                input_id,
+            },
+            storage_backend: "filesystem".to_string(),
+            object_key: format!("inputs/{}/source.png", admission_session_id.simple()),
+            sha256_hex: "a".repeat(64),
+            byte_size: 128,
+        },
+    )
+    .await
+}
+
+async fn seed_codex_edit_lease_with_input(
+    pool: &PgPool,
+    worker_id: &str,
+    output_count: u32,
+    input: InputBlobRef,
+) -> TestResult<WorkLease> {
+    let job_id = Uuid::new_v4();
+    let admission_session_id = input.key.admission_session_id;
+    let input_id = input.key.input_id;
+    let request_id = format!("request-{}", Uuid::new_v4().simple());
+    let descriptor = EditInputDescriptorV1 {
+        byte_size: input.byte_size,
+        index: 0,
+        media_type: "image/png".to_string(),
+        role: EditInputRoleV1::Image,
+        sha256_hex: input.sha256_hex.clone(),
+    };
+    let command = EditCommandV1::from_edit_job(
+        &EditJob {
+            request_id: request_id.clone(),
+            model: "gpt-image-2".to_string(),
+            prompt: "edit the process-smoke lighthouse".to_string(),
+            moderation: "auto".to_string(),
+            images: Vec::new(),
+            mask: None,
+            n: output_count,
+            size: "auto".to_string(),
+            quality: "high".to_string(),
+            output_format: "png".to_string(),
+            output_compression: None,
+            background: "opaque".to_string(),
+            stream: false,
+            partial_images: 0,
+        },
+        vec![descriptor],
+        "openai-images-v1",
+        "openai-codex",
+    );
+    let request_hash = command.request_hash_hex();
+    let manifest_hash = command.input_manifest_hash_hex();
+    let lease = seed_generation_lease(
+        pool,
+        worker_id,
+        GenerationLeaseSeed {
+            job_id,
+            admission_session_id,
+            owner_token: Uuid::new_v4(),
+            api_profile: "openai-images-v1".to_string(),
+            provider_id: "openai-codex".to_string(),
+            model: "gpt-image-2".to_string(),
+            request_id,
+            request_hash,
+            command_schema: EDIT_COMMAND_SCHEMA.to_string(),
+            command_json: serde_json::to_value(&command).map_err(debug_error)?,
+            operation: "edit".to_string(),
+            work_kind: "image_batch".to_string(),
+            output_count,
+            billable_units: output_count,
+            output_billable_units: 1,
+            billing_metric: "output".to_string(),
+            billing_unit: "output".to_string(),
+        },
+    )
+    .await?;
+    let now = database_now(pool).await?;
+    sqlx::query(
+        r#"
+        INSERT INTO job_input_manifests
+          (job_id, admission_session_id, manifest_schema, manifest_hash, input_count, created_at_ms)
+        VALUES ($1, $2, $3, $4, 1, $5)
+        "#,
+    )
+    .bind(job_id)
+    .bind(admission_session_id)
+    .bind(EDIT_INPUT_MANIFEST_SCHEMA)
+    .bind(manifest_hash)
+    .bind(now)
+    .execute(pool)
+    .await
+    .map_err(debug_error)?;
+    sqlx::query(
+        r#"
+        INSERT INTO job_input_objects
+          (input_id, job_id, admission_session_id, role, input_index, media_type,
+           storage_backend, object_key, sha256_hex, byte_size, created_at_ms)
+        VALUES ($1, $2, $3, 'image', 0, 'image/png',
+                $4, $5, $6, $7, $8)
+        "#,
+    )
+    .bind(input_id)
+    .bind(job_id)
+    .bind(admission_session_id)
+    .bind(&input.storage_backend)
+    .bind(&input.object_key)
+    .bind(&input.sha256_hex)
+    .bind(i64::try_from(input.byte_size).map_err(debug_error)?)
+    .bind(now)
+    .execute(pool)
+    .await
+    .map_err(debug_error)?;
+    Ok(lease)
+}
+
 async fn seed_dreamina_generation_lease_for_profile(
     pool: &PgPool,
     worker_id: &str,
@@ -9093,13 +9311,48 @@ impl ExecutordFixture {
         database: &TestDatabase,
         owner: &str,
     ) -> TestResult<tokio::process::Command> {
-        self.command_with_lease(database, owner, 10_000, 250).await
+        self.command_with_profile_and_lease(
+            database,
+            owner,
+            "openai-codex-generation-v1",
+            10_000,
+            250,
+        )
+        .await
+    }
+
+    async fn command_for_profile(
+        &self,
+        database: &TestDatabase,
+        owner: &str,
+        profile_key: &str,
+    ) -> TestResult<tokio::process::Command> {
+        self.command_with_profile_and_lease(database, owner, profile_key, 10_000, 250)
+            .await
     }
 
     async fn command_with_lease(
         &self,
         database: &TestDatabase,
         owner: &str,
+        lease_ms: u64,
+        heartbeat_ms: u64,
+    ) -> TestResult<tokio::process::Command> {
+        self.command_with_profile_and_lease(
+            database,
+            owner,
+            "openai-codex-generation-v1",
+            lease_ms,
+            heartbeat_ms,
+        )
+        .await
+    }
+
+    async fn command_with_profile_and_lease(
+        &self,
+        database: &TestDatabase,
+        owner: &str,
+        profile_key: &str,
         lease_ms: u64,
         heartbeat_ms: u64,
     ) -> TestResult<tokio::process::Command> {
@@ -9144,7 +9397,7 @@ impl ExecutordFixture {
             .env("EXECUTOR_CODEX_EXECUTABLE", &self.fake_codex)
             .env("EXECUTOR_CODEX_CREDENTIAL_HOME", &self.credentials)
             .env("EXECUTOR_OWNER", owner)
-            .env("EXECUTOR_PROFILE_KEY", "openai-codex-generation-v1")
+            .env("EXECUTOR_PROFILE_KEY", profile_key)
             .env("EXECUTOR_CREDENTIAL_REF", "test-vault.openai-codex.1")
             .env("EXECUTOR_CREDENTIAL_REVISION", "1")
             .env("EXECUTOR_LEASE_MS", lease_ms.to_string())
@@ -9364,6 +9617,22 @@ async fn seed_execution_profiles(pool: &PgPool) -> TestResult {
             "inline",
             "submission_bound",
             CODEX_GENERATION_ADAPTER_REVISION,
+            CODEX_POOL_ID,
+            CODEX_ACCOUNT_ID,
+            "test-vault.openai-codex.1",
+            CODEX_POLICY_ID,
+        ),
+        (
+            CODEX_EDIT_PROFILE_ID,
+            "openai-codex-edit-v1",
+            "openai-codex",
+            EDIT_COMMAND_SCHEMA,
+            "images.edits",
+            "openai-codex/images.edits/v1",
+            "c9a714ae667cab60f8130b841aa8887077232a29a1c3bb59ba7ecb77b8ddb471".to_string(),
+            "inline",
+            "submission_bound",
+            CODEX_EDIT_INLINE_ADAPTER_REVISION,
             CODEX_POOL_ID,
             CODEX_ACCOUNT_ID,
             "test-vault.openai-codex.1",

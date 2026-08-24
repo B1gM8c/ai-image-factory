@@ -8,8 +8,8 @@ use gpt_image_2_gateway::{
     CodexProcessSupervisor, ExecutorExecutionProfileStore, ExecutorOwnerGuardError,
     ExecutorProcessSupervisor, ExecutorProfileBinding, GrokProcessSupervisor, ImageGatewayError,
     JournaledDurableRunner, OperationalCredentialResolver, PostgresCredentialStore,
-    PostgresExecutorOwnerGuard, PostgresExecutorSubmissionStore, ProviderUploadService,
-    ProxyConfig,
+    PostgresExecutorOwnerGuard, PostgresExecutorSubmissionStore, PostgresProviderManagementService,
+    ProviderUploadService, ProxyConfig,
     artifacts::{
         ExecutorArtifactPublisher, FilesystemArtifactBlobStore, artifact_root_from_env,
         validate_artifact_root_isolated,
@@ -205,20 +205,36 @@ async fn main() -> Result<(), ImageGatewayError> {
     }
     let scope = profile.claim_scope();
     let supervisor = match binding {
-        ExecutorProfileBinding::CodexImageGeneration => ExecutorProcessSupervisor::Codex(
-            CodexProcessSupervisor::new(
-                journal.clone(),
-                &config.helper_executable,
-                &provider_runtime.executable,
-                &provider_runtime.credential_home,
-                &operational_credential.material_fingerprint_sha256,
-                config.request_timeout,
-                config.process_poll_interval,
-                config.process_startup_grace,
-                &config.proxy,
-            )?
-            .with_credential_resolver(profile.provider_account_id, credential_resolver.clone())?,
-        ),
+        ExecutorProfileBinding::CodexImageGeneration | ExecutorProfileBinding::CodexImageEdit => {
+            let credential_root = provider_runtime
+                .credential_home
+                .parent()
+                .ok_or_else(|| {
+                    ImageGatewayError::config("Codex credential home parent is unavailable")
+                })?
+                .to_path_buf();
+            let refresher = Arc::new(PostgresProviderManagementService::new(
+                pool.clone(),
+                credential_root,
+                provider_runtime.executable.clone(),
+            ));
+            ExecutorProcessSupervisor::Codex(
+                CodexProcessSupervisor::new(
+                    journal.clone(),
+                    &config.helper_executable,
+                    &provider_runtime.executable,
+                    &provider_runtime.credential_home,
+                    &operational_credential.material_fingerprint_sha256,
+                    config.request_timeout,
+                    config.process_poll_interval,
+                    config.process_startup_grace,
+                    &config.proxy,
+                )?
+                .with_credential_resolver(profile.provider_account_id, credential_resolver.clone())?
+                .with_credential_refresher(refresher)
+                .with_input_blobs(artifacts.clone()),
+            )
+        }
         ExecutorProfileBinding::GrokImageGeneration
         | ExecutorProfileBinding::GrokImageEdit
         | ExecutorProfileBinding::GrokVideoGeneration => ExecutorProcessSupervisor::Grok(

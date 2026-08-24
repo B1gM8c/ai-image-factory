@@ -26,9 +26,10 @@ use uuid::Uuid;
 use crate::{
     CodexExecutionProfileProvisioning, CredentialResolveError,
     DreaminaExecutionProfileProvisioning, DreaminaKeychainReplacement,
-    GrokExecutionProfileProvisioning, ImageGatewayError, OperationalCredentialResolver,
-    PostgresCredentialStore, codex_auth_file_sha256, dreamina_account_isolation_available,
-    dreamina_credential_fingerprint, grok_auth_file_sha256, prepare_codex_auth_copy,
+    GrokExecutionProfileProvisioning, ImageGatewayError, OperationalCredential,
+    OperationalCredentialRefresher, OperationalCredentialResolver, PostgresCredentialStore,
+    codex_auth_file_sha256, dreamina_account_isolation_available, dreamina_credential_fingerprint,
+    grok_auth_file_sha256, prepare_codex_auth_copy,
     provision_codex_edit_execution_profile_in_transaction,
     provision_codex_execution_profile_in_transaction,
     provision_dreamina_execution_profile_in_transaction,
@@ -75,6 +76,8 @@ const MAX_AUTH_BYTES: usize = 1024 * 1024;
 const CREDENTIAL_REFRESH_INTERVAL_MS: i64 = 6 * 60 * 60 * 1_000;
 const DEFAULT_CREDENTIAL_REFRESH_SKEW_MS: i64 = 15 * 60 * 1_000;
 const GROK_CREDENTIAL_REFRESH_SKEW_MS: i64 = 30 * 60 * 1_000;
+const AUTH_REJECTION_REFRESH_WAIT: Duration = Duration::from_secs(90);
+const AUTH_REJECTION_REFRESH_POLL: Duration = Duration::from_millis(50);
 static CODEX_QUOTA_REFRESHES: LazyLock<Mutex<HashSet<Uuid>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
 static GROK_QUOTA_REFRESHES: LazyLock<Mutex<HashSet<Uuid>>> =
@@ -2362,6 +2365,84 @@ impl PostgresProviderManagementService {
         }
         tx.commit().await.map_err(store_unavailable)?;
         Ok(provider_account_id)
+    }
+}
+
+#[async_trait]
+impl OperationalCredentialRefresher for PostgresProviderManagementService {
+    async fn refresh_after_authentication_rejection(
+        &self,
+        provider_account_id: Uuid,
+        observed_revision: i64,
+        observed_fingerprint_sha256: &str,
+    ) -> Result<OperationalCredential, CredentialResolveError> {
+        if provider_account_id.is_nil()
+            || observed_revision <= 0
+            || observed_fingerprint_sha256.len() != 64
+            || !observed_fingerprint_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        {
+            return Err(CredentialResolveError::Invalid);
+        }
+        if let Ok(current) = self.credential_store.resolve(provider_account_id).await
+            && (current.revision > observed_revision
+                || current.material_fingerprint_sha256 != observed_fingerprint_sha256)
+        {
+            return Ok(current);
+        }
+
+        let owner = format!("executor-auth.{}", Uuid::new_v4().simple());
+        if let Some(lease) = self
+            .credential_store
+            .claim_refresh_if_current(
+                provider_account_id,
+                observed_revision,
+                observed_fingerprint_sha256,
+                &owner,
+                90_000,
+            )
+            .await?
+            && let Err((error_code, reauthorization_required)) =
+                self.refresh_claimed_credential(&lease).await
+        {
+            let _ = self
+                .credential_store
+                .fail_refresh(&lease, error_code, reauthorization_required)
+                .await;
+            return Err(if reauthorization_required {
+                CredentialResolveError::ReauthorizationRequired
+            } else {
+                CredentialResolveError::Unavailable
+            });
+        }
+
+        let deadline = tokio::time::Instant::now() + AUTH_REJECTION_REFRESH_WAIT;
+        loop {
+            match self.credential_store.resolve(provider_account_id).await {
+                Ok(current)
+                    if current.revision > observed_revision
+                        || current.material_fingerprint_sha256 != observed_fingerprint_sha256 =>
+                {
+                    return Ok(current);
+                }
+                Ok(_) => {}
+                Err(CredentialResolveError::ReauthorizationRequired) => {
+                    return Err(CredentialResolveError::ReauthorizationRequired);
+                }
+                Err(CredentialResolveError::Invalid) => {
+                    return Err(CredentialResolveError::Invalid);
+                }
+                Err(CredentialResolveError::Unsupported) => {
+                    return Err(CredentialResolveError::Unsupported);
+                }
+                Err(CredentialResolveError::Unavailable) => {}
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(CredentialResolveError::Unavailable);
+            }
+            tokio::time::sleep(AUTH_REJECTION_REFRESH_POLL).await;
+        }
     }
 }
 

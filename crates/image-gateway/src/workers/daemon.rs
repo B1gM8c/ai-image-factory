@@ -300,6 +300,9 @@ impl Workerd {
         &self,
         lease: &crate::admission::WorkLease,
     ) -> Result<(), ImageGatewayError> {
+        if self.executor_handoff.is_some() {
+            return self.handoff_generation(lease).await;
+        }
         let context = match self.contexts.load_edit(lease).await {
             Ok(context) => context,
             Err(ExecutionContextError::Invalid { reservation }) => {

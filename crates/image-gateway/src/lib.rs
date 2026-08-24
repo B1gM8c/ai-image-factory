@@ -75,7 +75,7 @@ pub use billing_integrity::{BillingIntegrityService, PostgresBillingIntegritySer
 pub use config::{AppConfig, GenerationAdmissionContract, ProxyConfig};
 pub use credentials::{
     CredentialRefreshLease, CredentialResolveError, OperationalCredential,
-    OperationalCredentialResolver, PostgresCredentialStore,
+    OperationalCredentialRefresher, OperationalCredentialResolver, PostgresCredentialStore,
 };
 pub use credit_grants::{CreditGrantService, PostgresCreditGrantService};
 pub use customer_refunds::{CustomerRefundService, PostgresCustomerRefundService};
@@ -131,7 +131,8 @@ pub use provider_cost_obligations::{
     PostgresProviderCostObligationService, ProviderCostObligationService,
 };
 pub use provider_management::{
-    ExecutionProfileRouteReconciliationReport, reconcile_execution_profile_routes,
+    ExecutionProfileRouteReconciliationReport, PostgresProviderManagementService,
+    reconcile_execution_profile_routes,
 };
 pub use provider_tasks::{
     GatedCliBinding, GatedCliCommand, GatedCliObservation, GatedCliPreparedSubmission,

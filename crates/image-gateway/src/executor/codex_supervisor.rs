@@ -18,21 +18,26 @@ use tokio::{process::Command, time::Instant};
 use uuid::Uuid;
 
 use super::{
-    CodexOutputRequest, ExecutorLaunchContext, ExecutorSubmissionLease, RunnerError,
-    SingleOutputSupervisor, SupervisedOutput,
-    private_auth::{auth_file_sha256, prepare_isolated_auth, validate_auth_source},
-    project_codex_output_request,
+    CodexExecutionRequest, CodexOutputRequest, ExecutorLaunchContext, ExecutorSubmissionLease,
+    RunnerError, SingleOutputSupervisor, SupervisedOutput,
+    private_auth::{
+        auth_file_sha256, prepare_isolated_auth, replace_isolated_auth, validate_auth_source,
+    },
+    project_codex_execution_request,
     runner::RunnerLaunchBinding,
 };
 use crate::{
     ImageGatewayError, ProxyConfig,
+    artifacts::media_type_from_bytes,
     generator::GenerationJob,
-    providers::openai_codex::build_codex_prompt,
+    input_blobs::InputBlobStore,
+    providers::openai_codex::{build_codex_prompt, build_edit_prompt},
     runner::{
         FilesystemRunnerJournal, LaunchDecision,
         process::{
-            CODEX_APP_SERVER_FAILURE_DIAGNOSTIC_FILE, ExecutionSpool, ProcessObservation,
-            ProcessSpoolError, ProcessTerminal, ProviderProcessIdentity, RunnerLock, sha256,
+            CODEX_APP_SERVER_FAILURE_DIAGNOSTIC_FILE, CODEX_AUTH_REFRESH_REQUEST_FILE,
+            CODEX_AUTH_REFRESH_RESULT_FILE, ExecutionSpool, ProcessObservation, ProcessSpoolError,
+            ProcessTerminal, ProviderProcessIdentity, RunnerLock, sha256,
         },
     },
 };
@@ -43,6 +48,7 @@ const MAX_SHEBANG_BYTES: usize = 4096;
 const MAX_RUNNER_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 const CHILD_REAP_TIMEOUT: Duration = Duration::from_secs(5);
 const CODEX_CHILD_PATH: &str = "/usr/bin:/bin";
+const MAX_INPUT_IMAGE_BYTES: u64 = 32 * 1024 * 1024;
 
 #[derive(Clone)]
 pub struct CodexProcessSupervisor {
@@ -53,10 +59,12 @@ pub struct CodexProcessSupervisor {
     credential_auth_file: PathBuf,
     credential_auth_sha256: String,
     credential_resolver: Option<(Uuid, Arc<dyn crate::OperationalCredentialResolver>)>,
+    credential_refresher: Option<Arc<dyn crate::OperationalCredentialRefresher>>,
     request_timeout: Duration,
     poll_interval: Duration,
     startup_grace: Duration,
     child_env: Vec<(String, String)>,
+    input_blobs: Option<Arc<dyn InputBlobStore>>,
 }
 
 #[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
@@ -68,8 +76,38 @@ struct CodexChildRequest {
     launch: RunnerLaunchBinding,
     codex_executable: String,
     codex_executable_sha256: String,
+    credential_revision: i64,
+    credential_auth_sha256: String,
     timeout_ms: u64,
-    output: CodexOutputRequest,
+    output: CodexExecutionRequest,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CodexAuthRefreshRequestV1 {
+    schema_version: u16,
+    executor_execution_id: String,
+    observed_revision: i64,
+    observed_fingerprint_sha256: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+enum CodexAuthRefreshResultV1 {
+    Succeeded {
+        schema_version: u16,
+        executor_execution_id: String,
+        observed_revision: i64,
+        observed_fingerprint_sha256: String,
+        promoted_revision: i64,
+        promoted_fingerprint_sha256: String,
+    },
+    Failed {
+        schema_version: u16,
+        executor_execution_id: String,
+        observed_revision: i64,
+        observed_fingerprint_sha256: String,
+    },
 }
 
 enum ChildOutcome {
@@ -121,10 +159,12 @@ impl CodexProcessSupervisor {
             credential_auth_file,
             credential_auth_sha256: credential_auth_sha256.to_string(),
             credential_resolver: None,
+            credential_refresher: None,
             request_timeout,
             poll_interval,
             startup_grace,
             child_env: child_environment(proxy),
+            input_blobs: None,
         })
     }
 
@@ -140,6 +180,19 @@ impl CodexProcessSupervisor {
         }
         self.credential_resolver = Some((provider_account_id, resolver));
         Ok(self)
+    }
+
+    pub fn with_credential_refresher(
+        mut self,
+        refresher: Arc<dyn crate::OperationalCredentialRefresher>,
+    ) -> Self {
+        self.credential_refresher = Some(refresher);
+        self
+    }
+
+    pub fn with_input_blobs(mut self, input_blobs: Arc<dyn InputBlobStore>) -> Self {
+        self.input_blobs = Some(input_blobs);
+        self
     }
 
     async fn credential_source(&self) -> Result<(PathBuf, String, i64), RunnerError> {
@@ -174,26 +227,89 @@ impl CodexProcessSupervisor {
         &self,
         lease: &ExecutorSubmissionLease,
         context: &ExecutorLaunchContext,
+        credential_revision: i64,
+        credential_auth_sha256: &str,
     ) -> Result<CodexChildRequest, RunnerError> {
-        if lease.adapter_revision != CODEX_GENERATION_ADAPTER_REVISION {
+        if !matches!(
+            lease.adapter_revision.as_str(),
+            CODEX_GENERATION_ADAPTER_REVISION | super::CODEX_EDIT_INLINE_ADAPTER_REVISION
+        ) {
             return Err(RunnerError::Definite {
                 error_code: "executor_adapter_revision_mismatch".to_string(),
             });
         }
         let output =
-            project_codex_output_request(lease, context).map_err(|_| RunnerError::Definite {
+            project_codex_execution_request(lease, context).map_err(|_| RunnerError::Definite {
                 error_code: "executor_command_rejected".to_string(),
             })?;
         Ok(CodexChildRequest {
-            schema_version: 1,
-            adapter_revision: CODEX_GENERATION_ADAPTER_REVISION.to_string(),
+            schema_version: 2,
+            adapter_revision: lease.adapter_revision.clone(),
             executor_execution_id: lease.executor_execution_id.to_string(),
             launch: RunnerLaunchBinding::from_lease(lease),
             codex_executable: self.codex_executable.to_string_lossy().into_owned(),
             codex_executable_sha256: self.codex_executable_sha256.clone(),
+            credential_revision,
+            credential_auth_sha256: credential_auth_sha256.to_string(),
             timeout_ms: self.request_timeout.as_millis() as u64,
             output,
         })
+    }
+
+    async fn stage_inputs(
+        &self,
+        request: &CodexExecutionRequest,
+        context: &ExecutorLaunchContext,
+        spool: &ExecutionSpool,
+    ) -> Result<(), RunnerError> {
+        let CodexExecutionRequest::Edit(request) = request else {
+            return if context.inputs().is_empty() {
+                Ok(())
+            } else {
+                Err(RunnerError::Definite {
+                    error_code: "codex_input_manifest_invalid".to_string(),
+                })
+            };
+        };
+        if request.inputs.len() != context.inputs().len() {
+            return Err(RunnerError::Definite {
+                error_code: "codex_input_manifest_invalid".to_string(),
+            });
+        }
+        let blobs = self.input_blobs.as_ref().ok_or(RunnerError::Definite {
+            error_code: "codex_input_store_unavailable".to_string(),
+        })?;
+        for (expected, input) in request.inputs.iter().zip(context.inputs()) {
+            if expected.role != input.role()
+                || expected.index != input.index()
+                || expected.media_type != input.media_type()
+                || expected.sha256_hex != input.blob().sha256_hex
+                || expected.byte_size != input.blob().byte_size
+                || expected.byte_size > MAX_INPUT_IMAGE_BYTES
+            {
+                return Err(RunnerError::Definite {
+                    error_code: "codex_input_manifest_invalid".to_string(),
+                });
+            }
+            let bytes = blobs.get(input.blob()).await.map_err(|error| match error {
+                crate::input_blobs::InputBlobReadError::Unavailable => RunnerError::Unavailable,
+                crate::input_blobs::InputBlobReadError::Integrity => RunnerError::Definite {
+                    error_code: "codex_input_integrity_failed".to_string(),
+                },
+            })?;
+            if bytes.len() as u64 != expected.byte_size
+                || sha256(&bytes) != expected.sha256_hex
+                || media_type_from_bytes(&bytes).ok() != Some(expected.media_type.as_str())
+            {
+                return Err(RunnerError::Definite {
+                    error_code: "codex_input_integrity_failed".to_string(),
+                });
+            }
+            spool
+                .stage_provider_input(&expected.filename, &bytes, MAX_INPUT_IMAGE_BYTES)
+                .map_err(map_spool_error)?;
+        }
+        Ok(())
     }
 
     fn spawn_helper(&self, lease: &ExecutorSubmissionLease) -> Result<(), RunnerError> {
@@ -241,6 +357,100 @@ impl CodexProcessSupervisor {
             tokio::time::sleep(self.poll_interval.min(Duration::from_millis(50))).await;
         }
     }
+
+    async fn handle_auth_refresh_request(
+        &self,
+        lease: &ExecutorSubmissionLease,
+        spool: &ExecutionSpool,
+    ) -> Result<(), RunnerError> {
+        if spool
+            .read_diagnostic::<CodexAuthRefreshResultV1>(CODEX_AUTH_REFRESH_RESULT_FILE)
+            .map_err(map_spool_error)?
+            .is_some()
+        {
+            return Ok(());
+        }
+        let Some(request) = spool
+            .read_diagnostic::<CodexAuthRefreshRequestV1>(CODEX_AUTH_REFRESH_REQUEST_FILE)
+            .map_err(map_spool_error)?
+        else {
+            return Ok(());
+        };
+        if request.schema_version != 1
+            || request.executor_execution_id != lease.executor_execution_id.to_string()
+            || request.observed_revision <= 0
+            || !is_sha256(&request.observed_fingerprint_sha256)
+        {
+            return Err(RunnerError::Unknown {
+                error_code: "codex_auth_refresh_request_invalid".to_string(),
+            });
+        }
+        let Some((provider_account_id, _)) = &self.credential_resolver else {
+            return Err(RunnerError::Unavailable);
+        };
+        let Some(refresher) = &self.credential_refresher else {
+            return Err(RunnerError::Unavailable);
+        };
+        let refreshed = refresher
+            .refresh_after_authentication_rejection(
+                *provider_account_id,
+                request.observed_revision,
+                &request.observed_fingerprint_sha256,
+            )
+            .await;
+        let result = match refreshed {
+            Ok(credential)
+                if credential.provider_account_id == *provider_account_id
+                    && credential.provider_id
+                        == image_provider_contracts::openai_codex::PROVIDER_ID
+                    && credential.revision > request.observed_revision
+                    && credential.material_fingerprint_sha256
+                        != request.observed_fingerprint_sha256 =>
+            {
+                let rebound = match (
+                    validate_auth_source(
+                        credential.home(),
+                        &credential.material_fingerprint_sha256,
+                    ),
+                    spool.codex_home_path(),
+                ) {
+                    (Ok(source), Ok(destination)) => rebind_isolated_auth(
+                        destination,
+                        &source,
+                        &request.observed_fingerprint_sha256,
+                        &credential.material_fingerprint_sha256,
+                    ),
+                    _ => Err(()),
+                };
+                if rebound.is_ok() {
+                    CodexAuthRefreshResultV1::Succeeded {
+                        schema_version: 1,
+                        executor_execution_id: request.executor_execution_id.clone(),
+                        observed_revision: request.observed_revision,
+                        observed_fingerprint_sha256: request.observed_fingerprint_sha256.clone(),
+                        promoted_revision: credential.revision,
+                        promoted_fingerprint_sha256: credential.material_fingerprint_sha256,
+                    }
+                } else {
+                    CodexAuthRefreshResultV1::Failed {
+                        schema_version: 1,
+                        executor_execution_id: request.executor_execution_id.clone(),
+                        observed_revision: request.observed_revision,
+                        observed_fingerprint_sha256: request.observed_fingerprint_sha256.clone(),
+                    }
+                }
+            }
+            _ => CodexAuthRefreshResultV1::Failed {
+                schema_version: 1,
+                executor_execution_id: request.executor_execution_id.clone(),
+                observed_revision: request.observed_revision,
+                observed_fingerprint_sha256: request.observed_fingerprint_sha256.clone(),
+            },
+        };
+        spool
+            .publish_diagnostic(CODEX_AUTH_REFRESH_RESULT_FILE, &result)
+            .map_err(map_spool_error)
+    }
 }
 
 pub fn codex_auth_file_sha256(
@@ -262,6 +472,22 @@ pub fn prepare_codex_auth_copy(
         .map_err(|_| ImageGatewayError::config("managed Codex auth copy is invalid"))
 }
 
+fn rebind_isolated_auth(
+    destination_home: &Path,
+    source: &Path,
+    observed_sha256: &str,
+    promoted_sha256: &str,
+) -> Result<(), ()> {
+    match auth_file_sha256(destination_home) {
+        Ok(current) if current == promoted_sha256 => Ok(()),
+        Ok(current) if current == observed_sha256 => {
+            replace_isolated_auth(destination_home, source, observed_sha256, promoted_sha256)
+                .map_err(|_| ())
+        }
+        _ => Err(()),
+    }
+}
+
 #[async_trait]
 impl SingleOutputSupervisor for CodexProcessSupervisor {
     async fn prepare(
@@ -271,9 +497,11 @@ impl SingleOutputSupervisor for CodexProcessSupervisor {
     ) -> Result<(), RunnerError> {
         let (credential_auth_file, credential_auth_sha256, credential_revision) =
             self.credential_source().await?;
-        let request = self.child_request(lease, context)?;
+        let request =
+            self.child_request(lease, context, credential_revision, &credential_auth_sha256)?;
         let bytes = serde_json::to_vec(&request).map_err(|_| RunnerError::Internal)?;
         let spool = ExecutionSpool::for_lease(&self.journal, lease).map_err(map_spool_error)?;
+        self.stage_inputs(&request.output, context, &spool).await?;
         prepare_isolated_auth(
             spool.codex_home_path().map_err(map_spool_error)?,
             &credential_auth_file,
@@ -300,6 +528,7 @@ impl SingleOutputSupervisor for CodexProcessSupervisor {
         let started = Instant::now();
         let supervision_timeout = self.request_timeout.saturating_add(self.startup_grace);
         loop {
+            self.handle_auth_refresh_request(lease, &spool).await?;
             match spool.observe().map_err(map_spool_error)? {
                 ProcessObservation::Succeeded(bytes) => return Ok(bytes),
                 ProcessObservation::Failed { error_code } => {
@@ -440,8 +669,10 @@ async fn run_codex_child(
         Ok(path) => path,
         Err(_) => return ChildOutcome::Uncertain("runner_codex_home_invalid"),
     };
-    let job = generation_job(&request.output);
-    let prompt = build_codex_prompt(&job, workspace, request.output.candidate_index);
+    let (prompt, input_paths) = match child_invocation(&request.output, &spool, workspace) {
+        Ok(invocation) => invocation,
+        Err(outcome) => return outcome,
+    };
     let mut environment = allowed_child_environment();
     environment.push(("PATH".to_string(), CODEX_CHILD_PATH.to_string()));
     let request_timeout = Duration::from_millis(request.timeout_ms);
@@ -461,14 +692,14 @@ async fn run_codex_child(
             };
         let runtime_result = crate::codex_app_server::run_codex_app_server(
             crate::codex_app_server::CodexAppServerRequest {
-                request_id: &request.output.request_id,
-                image_index: request.output.candidate_index,
+                request_id: request.output.request_id(),
+                image_index: request.output.candidate_index(),
                 attempt,
                 executable: Path::new(&request.codex_executable),
                 workspace,
                 codex_home,
                 prompt: &prompt,
-                input_paths: &[],
+                input_paths: &input_paths,
                 timeout: remaining,
                 environment: &environment,
                 failure_diagnostic_sink: Some(&diagnostic_sink),
@@ -504,15 +735,72 @@ async fn run_codex_child(
                     });
                 if retryable {
                     tracing::warn!(
-                        request.id = %request.output.request_id,
-                        output.index = request.output.candidate_index,
+                        request.id = %request.output.request_id(),
+                        output.index = request.output.candidate_index(),
                         codex.attempt = attempt,
                         error.code = error.code(),
                         "retrying one definitive Codex authentication rejection"
                     );
-                    tokio::time::sleep(Duration::from_millis(250)).await;
-                    attempt = 2;
-                    continue;
+                    let refresh_request = CodexAuthRefreshRequestV1 {
+                        schema_version: 1,
+                        executor_execution_id: request.executor_execution_id.clone(),
+                        observed_revision: request.credential_revision,
+                        observed_fingerprint_sha256: request.credential_auth_sha256.clone(),
+                    };
+                    if spool
+                        .publish_diagnostic(CODEX_AUTH_REFRESH_REQUEST_FILE, &refresh_request)
+                        .is_err()
+                    {
+                        break ChildOutcome::Uncertain("codex_auth_refresh_handoff_failed");
+                    }
+                    let refresh_result = loop {
+                        match spool.read_diagnostic::<CodexAuthRefreshResultV1>(
+                            CODEX_AUTH_REFRESH_RESULT_FILE,
+                        ) {
+                            Ok(Some(result)) => break result,
+                            Ok(None) => {}
+                            Err(_) => {
+                                break CodexAuthRefreshResultV1::Failed {
+                                    schema_version: 1,
+                                    executor_execution_id: request.executor_execution_id.clone(),
+                                    observed_revision: request.credential_revision,
+                                    observed_fingerprint_sha256: request
+                                        .credential_auth_sha256
+                                        .clone(),
+                                };
+                            }
+                        }
+                        if deadline.saturating_duration_since(Instant::now()).is_zero() {
+                            break CodexAuthRefreshResultV1::Failed {
+                                schema_version: 1,
+                                executor_execution_id: request.executor_execution_id.clone(),
+                                observed_revision: request.credential_revision,
+                                observed_fingerprint_sha256: request.credential_auth_sha256.clone(),
+                            };
+                        }
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    };
+                    match refresh_result {
+                        CodexAuthRefreshResultV1::Succeeded {
+                            schema_version: 1,
+                            executor_execution_id,
+                            observed_revision,
+                            observed_fingerprint_sha256,
+                            promoted_revision,
+                            promoted_fingerprint_sha256,
+                        } if executor_execution_id == request.executor_execution_id
+                            && observed_revision == request.credential_revision
+                            && observed_fingerprint_sha256 == request.credential_auth_sha256
+                            && promoted_revision > observed_revision
+                            && promoted_fingerprint_sha256 != observed_fingerprint_sha256
+                            && auth_file_sha256(codex_home).ok().as_deref()
+                                == Some(promoted_fingerprint_sha256.as_str()) =>
+                        {
+                            attempt = 2;
+                            continue;
+                        }
+                        _ => break ChildOutcome::Failed("codex_authentication_rejected"),
+                    }
                 }
                 if let Some(diagnostic) = diagnostic.as_ref()
                     && spool
@@ -520,14 +808,14 @@ async fn run_codex_child(
                         .is_err()
                 {
                     tracing::warn!(
-                        request.id = %request.output.request_id,
-                        output.index = request.output.candidate_index,
+                        request.id = %request.output.request_id(),
+                        output.index = request.output.candidate_index(),
                         "Codex failure diagnostic could not be persisted"
                     );
                 }
                 tracing::warn!(
-                    request.id = %request.output.request_id,
-                    output.index = request.output.candidate_index,
+                    request.id = %request.output.request_id(),
+                    output.index = request.output.candidate_index(),
                     codex.output.stage = "sealed_handoff",
                     error.code = error.code(),
                     "Codex completed without a valid sealed image handoff"
@@ -538,7 +826,11 @@ async fn run_codex_child(
     };
     match outcome {
         ChildOutcome::Succeeded(bytes) => {
-            match normalize_captured_image(bytes, &job.output_format, job.output_compression) {
+            match normalize_captured_image(
+                bytes,
+                request.output.output_format(),
+                request.output.output_compression(),
+            ) {
                 Ok(bytes) => ChildOutcome::Succeeded(bytes),
                 Err(()) => ChildOutcome::Failed("codex_durable_output_invalid"),
             }
@@ -610,18 +902,35 @@ fn validate_child_request(
     let lease = request.launch.to_lease().ok_or_else(|| {
         ImageGatewayError::service_unavailable("Codex runner lease binding is invalid")
     })?;
-    if request.schema_version != 1
-        || request.adapter_revision != CODEX_GENERATION_ADAPTER_REVISION
+    let valid_binding = matches!(
+        (
+            &request.output,
+            lease.command_schema.as_str(),
+            lease.adapter_revision.as_str()
+        ),
+        (
+            CodexExecutionRequest::Generation(_),
+            crate::admission::GENERATION_COMMAND_SCHEMA,
+            CODEX_GENERATION_ADAPTER_REVISION
+        ) | (
+            CodexExecutionRequest::Edit(_),
+            crate::admission::EDIT_COMMAND_SCHEMA,
+            super::CODEX_EDIT_INLINE_ADAPTER_REVISION
+        )
+    );
+    if request.schema_version != 2
+        || request.adapter_revision != lease.adapter_revision
         || request.executor_execution_id != executor_execution_id.to_string()
         || lease.executor_execution_id != executor_execution_id
         || lease.provider_id != image_provider_contracts::openai_codex::PROVIDER_ID
-        || lease.adapter_revision != CODEX_GENERATION_ADAPTER_REVISION
-        || lease.command_schema != crate::admission::GENERATION_COMMAND_SCHEMA
-        || lease.model != request.output.model
+        || !valid_binding
+        || lease.model != request.output.model()
         || u32::try_from(lease.output_index)
             .ok()
             .map(|index| index + 1)
-            != Some(request.output.candidate_index)
+            != Some(request.output.candidate_index())
+        || request.credential_revision <= 0
+        || !is_sha256(&request.credential_auth_sha256)
         || request.timeout_ms == 0
         || request.timeout_ms > MAX_RUNNER_TIMEOUT.as_millis() as u64
         || request.output.validate().is_err()
@@ -641,6 +950,59 @@ fn validate_child_request(
     Ok(lease)
 }
 
+fn child_invocation(
+    request: &CodexExecutionRequest,
+    spool: &ExecutionSpool,
+    workspace: &Path,
+) -> Result<(String, Vec<PathBuf>), ChildOutcome> {
+    match request {
+        CodexExecutionRequest::Generation(request) => {
+            let job = generation_job(request);
+            Ok((
+                build_codex_prompt(&job, workspace, request.candidate_index),
+                Vec::new(),
+            ))
+        }
+        CodexExecutionRequest::Edit(request) => {
+            let image_count = request
+                .inputs
+                .iter()
+                .filter(|input| input.role == "image")
+                .count();
+            let has_mask = request.inputs.iter().any(|input| input.role == "mask");
+            let mut prompt = build_edit_prompt(&request.prompt, image_count, has_mask);
+            if request.original_n > 1 {
+                prompt.push_str(&format!(
+                    "\n整个请求需要 {} 张候选结果；当前只生成第 {}/{} 张。请只输出这一张，并让它保持用户需求一致但与其他候选有独立细节。",
+                    request.original_n, request.candidate_index, request.original_n
+                ));
+            }
+            let root = spool
+                .provider_attempt_path()
+                .map_err(|_| ChildOutcome::Uncertain("codex_input_integrity_failed"))?;
+            let mut paths = Vec::with_capacity(request.inputs.len());
+            for input in &request.inputs {
+                let mut file = spool
+                    .open_provider_input(&input.filename)
+                    .map_err(|_| ChildOutcome::Failed("codex_input_integrity_failed"))?;
+                let mut bytes = Vec::with_capacity(input.byte_size as usize);
+                Read::by_ref(&mut file)
+                    .take(MAX_INPUT_IMAGE_BYTES + 1)
+                    .read_to_end(&mut bytes)
+                    .map_err(|_| ChildOutcome::Failed("codex_input_integrity_failed"))?;
+                if bytes.len() as u64 != input.byte_size
+                    || sha256(&bytes) != input.sha256_hex
+                    || media_type_from_bytes(&bytes).ok() != Some(input.media_type.as_str())
+                {
+                    return Err(ChildOutcome::Failed("codex_input_integrity_failed"));
+                }
+                paths.push(root.join(&input.filename));
+            }
+            Ok((prompt, paths))
+        }
+    }
+}
+
 fn generation_job(request: &CodexOutputRequest) -> GenerationJob {
     GenerationJob {
         request_id: request.request_id.clone(),
@@ -656,6 +1018,13 @@ fn generation_job(request: &CodexOutputRequest) -> GenerationJob {
         stream: request.stream,
         partial_images: request.partial_images,
     }
+}
+
+fn is_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
 
 fn canonical_executable(path: &Path) -> Result<PathBuf, ImageGatewayError> {
@@ -887,10 +1256,13 @@ mod tests {
 
     use super::*;
     use crate::admission::{
+        EDIT_COMMAND_SCHEMA, EditCommandV1, EditInputDescriptorV1, EditInputRoleV1,
         GENERATION_COMMAND_SCHEMA, GENERATION_COMMAND_SCHEMA_VERSION, GENERATION_OPERATION,
         GenerationCommandV1,
     };
+    use crate::artifacts::InMemoryArtifactBlobStore;
     use crate::executor::private_auth::{AUTH_FILE, MAX_AUTH_BYTES};
+    use crate::input_blobs::{InputBlobKey, InputBlobStore};
 
     #[test]
     fn child_environment_excludes_gateway_and_database_secrets() {
@@ -923,6 +1295,39 @@ mod tests {
 
         fs::set_permissions(&auth, fs::Permissions::from_mode(0o644)).unwrap();
         assert!(codex_auth_file_sha256(temp.path()).is_err());
+    }
+
+    #[test]
+    fn auth_rebind_replay_accepts_the_same_promoted_revision_after_parent_crash() {
+        let root = TempDir::new().unwrap();
+        let destination = root.path().join("destination");
+        let source = root.path().join("source");
+        fs::create_dir(&destination).unwrap();
+        fs::create_dir(&source).unwrap();
+        fs::set_permissions(&destination, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o700)).unwrap();
+        let old = br#"{"revision":1}"#;
+        let new = br#"{"revision":2}"#;
+        fs::write(destination.join(AUTH_FILE), old).unwrap();
+        fs::write(source.join(AUTH_FILE), new).unwrap();
+        fs::set_permissions(
+            destination.join(AUTH_FILE),
+            fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        fs::set_permissions(source.join(AUTH_FILE), fs::Permissions::from_mode(0o600)).unwrap();
+
+        let observed = sha256(old);
+        let promoted = sha256(new);
+        rebind_isolated_auth(&destination, &source.join(AUTH_FILE), &observed, &promoted).unwrap();
+        rebind_isolated_auth(&destination, &source.join(AUTH_FILE), &observed, &promoted).unwrap();
+        assert_eq!(codex_auth_file_sha256(&destination).unwrap(), promoted);
+
+        let foreign = sha256(b"foreign");
+        assert!(
+            rebind_isolated_auth(&destination, &source.join(AUTH_FILE), &foreign, &observed,)
+                .is_err()
+        );
     }
 
     #[test]
@@ -1170,9 +1575,51 @@ mod tests {
         );
         let spool = ExecutionSpool::for_lease(&fixture.journal, &lease).unwrap();
 
-        run_codex_runner_child(fixture.journal.root_path(), lease.executor_execution_id)
-            .await
+        let runner_root = fixture.journal.root_path().to_path_buf();
+        let execution_id = lease.executor_execution_id;
+        let child =
+            tokio::spawn(async move { run_codex_runner_child(runner_root, execution_id).await });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if spool
+                    .read_diagnostic::<CodexAuthRefreshRequestV1>(CODEX_AUTH_REFRESH_REQUEST_FILE)
+                    .unwrap()
+                    .is_some()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let replacement_home = fixture._temp.path().join("replacement-credentials");
+        fs::create_dir(&replacement_home).unwrap();
+        let replacement = replacement_home.join(AUTH_FILE);
+        fs::write(&replacement, br#"{"fresh":true}"#).unwrap();
+        fs::set_permissions(&replacement, fs::Permissions::from_mode(0o600)).unwrap();
+        let replacement_sha = sha256(br#"{"fresh":true}"#);
+        replace_isolated_auth(
+            spool.codex_home_path().unwrap(),
+            &replacement,
+            &sha256(b"{}"),
+            &replacement_sha,
+        )
+        .unwrap();
+        spool
+            .publish_diagnostic(
+                CODEX_AUTH_REFRESH_RESULT_FILE,
+                &CodexAuthRefreshResultV1::Succeeded {
+                    schema_version: 1,
+                    executor_execution_id: lease.executor_execution_id.to_string(),
+                    observed_revision: 1,
+                    observed_fingerprint_sha256: sha256(b"{}"),
+                    promoted_revision: 2,
+                    promoted_fingerprint_sha256: replacement_sha,
+                },
+            )
             .unwrap();
+        child.await.unwrap().unwrap();
 
         assert!(matches!(
             spool.observe().unwrap(),
@@ -1189,6 +1636,163 @@ mod tests {
             !execution_root
                 .join(CODEX_APP_SERVER_FAILURE_DIAGNOSTIC_FILE)
                 .exists()
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_http_401_stops_after_one_rebound_retry() {
+        let fixture = CodexFixture::permanent_http_401();
+        let lease = fixture.lease();
+        let context = fixture.context(&lease);
+        fixture.journal.start_or_attach(&lease).unwrap();
+        fixture.supervisor.prepare(&lease, &context).await.unwrap();
+        assert_eq!(
+            fixture.journal.commit_launch(&lease).unwrap(),
+            LaunchDecision::LaunchOnce
+        );
+        let spool = ExecutionSpool::for_lease(&fixture.journal, &lease).unwrap();
+
+        let runner_root = fixture.journal.root_path().to_path_buf();
+        let execution_id = lease.executor_execution_id;
+        let child =
+            tokio::spawn(async move { run_codex_runner_child(runner_root, execution_id).await });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if spool
+                    .read_diagnostic::<CodexAuthRefreshRequestV1>(CODEX_AUTH_REFRESH_REQUEST_FILE)
+                    .unwrap()
+                    .is_some()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let replacement_home = fixture._temp.path().join("replacement-credentials");
+        fs::create_dir(&replacement_home).unwrap();
+        let replacement = replacement_home.join(AUTH_FILE);
+        fs::write(&replacement, br#"{"fresh":true}"#).unwrap();
+        fs::set_permissions(&replacement, fs::Permissions::from_mode(0o600)).unwrap();
+        let replacement_sha = sha256(br#"{"fresh":true}"#);
+        replace_isolated_auth(
+            spool.codex_home_path().unwrap(),
+            &replacement,
+            &sha256(b"{}"),
+            &replacement_sha,
+        )
+        .unwrap();
+        spool
+            .publish_diagnostic(
+                CODEX_AUTH_REFRESH_RESULT_FILE,
+                &CodexAuthRefreshResultV1::Succeeded {
+                    schema_version: 1,
+                    executor_execution_id: lease.executor_execution_id.to_string(),
+                    observed_revision: 1,
+                    observed_fingerprint_sha256: sha256(b"{}"),
+                    promoted_revision: 2,
+                    promoted_fingerprint_sha256: replacement_sha,
+                },
+            )
+            .unwrap();
+        child.await.unwrap().unwrap();
+
+        assert_eq!(
+            spool.observe().unwrap(),
+            ProcessObservation::Failed {
+                error_code: "codex_image_tool_failed".to_string(),
+            }
+        );
+        assert_eq!(fs::read_to_string(&fixture.invocations).unwrap(), "1\n1\n");
+    }
+
+    #[tokio::test]
+    async fn edit_prepare_stages_the_exact_digest_bound_input_for_one_output() {
+        let fixture = CodexFixture::new();
+        let blobs = Arc::new(InMemoryArtifactBlobStore::default());
+        let input_bytes = png_bytes(2, 3);
+        let input = blobs
+            .put(
+                InputBlobKey {
+                    admission_session_id: Uuid::new_v4(),
+                    input_id: Uuid::new_v4(),
+                },
+                &input_bytes,
+            )
+            .await
+            .unwrap();
+        let command = EditCommandV1::from_edit_job(
+            &crate::EditJob {
+                request_id: "edit-request-1".to_string(),
+                model: "gpt-image-2".to_string(),
+                prompt: "replace the sky".to_string(),
+                moderation: "auto".to_string(),
+                images: Vec::new(),
+                mask: None,
+                n: 2,
+                size: "auto".to_string(),
+                quality: "high".to_string(),
+                output_format: "png".to_string(),
+                output_compression: None,
+                background: "opaque".to_string(),
+                stream: false,
+                partial_images: 0,
+            },
+            vec![EditInputDescriptorV1 {
+                byte_size: input.byte_size,
+                index: 0,
+                media_type: "image/png".to_string(),
+                role: EditInputRoleV1::Image,
+                sha256_hex: input.sha256_hex.clone(),
+            }],
+            "openai-images-v1",
+            "openai-codex",
+        );
+        let lease = ExecutorSubmissionLease {
+            submission_id: Uuid::new_v4(),
+            executor_execution_id: Uuid::new_v4(),
+            output_id: Uuid::new_v4(),
+            job_id: Uuid::new_v4(),
+            tenant_id: "tenant-1".to_string(),
+            provider_id: "openai-codex".to_string(),
+            model: "gpt-image-2".to_string(),
+            work_item_id: Uuid::new_v4(),
+            output_index: 1,
+            command_schema: EDIT_COMMAND_SCHEMA.to_string(),
+            command_hash: command.request_hash_hex(),
+            execution_profile_id: Uuid::new_v4(),
+            adapter_revision: crate::executor::CODEX_EDIT_INLINE_ADAPTER_REVISION.to_string(),
+            executor_owner: "executor-owner-1".to_string(),
+            executor_lease_epoch: 1,
+            executor_lease_expires_at_ms: i64::MAX,
+        };
+        let context = ExecutorLaunchContext::new(
+            "edit-request-1",
+            "openai-images-v1",
+            1,
+            EDIT_COMMAND_SCHEMA,
+            command.request_hash_hex(),
+            serde_json::to_value(&command).unwrap(),
+        )
+        .unwrap()
+        .with_inputs(vec![
+            crate::executor::ExecutorInputObject::new(input, "image", 0, "image/png").unwrap(),
+        ])
+        .unwrap();
+        fixture.journal.start_or_attach(&lease).unwrap();
+        fixture
+            .supervisor
+            .clone()
+            .with_input_blobs(blobs)
+            .prepare(&lease, &context)
+            .await
+            .unwrap();
+        let spool = ExecutionSpool::for_lease(&fixture.journal, &lease).unwrap();
+
+        assert_eq!(
+            fs::read(spool.provider_attempt_path().unwrap().join("input-0.png")).unwrap(),
+            input_bytes
         );
     }
 
@@ -1791,6 +2395,15 @@ while IFS= read -r ignored; do :; done
                     invocations.display(),
                     invocations.display(),
                     image.display(),
+                )
+            })
+        }
+
+        fn permanent_http_401() -> Self {
+            Self::with_script(|invocations, _image, _root| {
+                format!(
+                    "#!/bin/sh\nset -eu\n/bin/cat >/dev/null\n# codex-test-transient-http-401\nprintf '1\\n' >> '{}'\nprintf 'HTTP 401 Unauthorized\\n' >&2\n: > \"$CODEX_HOME/transient-http-401\"\n",
+                    invocations.display(),
                 )
             })
         }

@@ -8,12 +8,15 @@ use image_provider_grok_cli::{
 };
 use thiserror::Error;
 
-use super::{CODEX_GENERATION_ADAPTER_REVISION, ExecutorExecutionProfile};
-use crate::admission::GENERATION_COMMAND_SCHEMA;
+use super::{
+    CODEX_EDIT_INLINE_ADAPTER_REVISION, CODEX_GENERATION_ADAPTER_REVISION, ExecutorExecutionProfile,
+};
+use crate::admission::{EDIT_COMMAND_SCHEMA, GENERATION_COMMAND_SCHEMA};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ExecutorProfileBinding {
     CodexImageGeneration,
+    CodexImageEdit,
     GrokImageGeneration,
     GrokImageEdit,
     GrokVideoGeneration,
@@ -22,7 +25,7 @@ pub enum ExecutorProfileBinding {
 impl ExecutorProfileBinding {
     pub fn provider_executable_env(self) -> &'static str {
         match self {
-            Self::CodexImageGeneration => "EXECUTOR_CODEX_EXECUTABLE",
+            Self::CodexImageGeneration | Self::CodexImageEdit => "EXECUTOR_CODEX_EXECUTABLE",
             Self::GrokImageGeneration | Self::GrokImageEdit | Self::GrokVideoGeneration => {
                 "EXECUTOR_GROK_EXECUTABLE"
             }
@@ -31,7 +34,7 @@ impl ExecutorProfileBinding {
 
     pub fn credential_home_env(self) -> &'static str {
         match self {
-            Self::CodexImageGeneration => "EXECUTOR_CODEX_CREDENTIAL_HOME",
+            Self::CodexImageGeneration | Self::CodexImageEdit => "EXECUTOR_CODEX_CREDENTIAL_HOME",
             Self::GrokImageGeneration | Self::GrokImageEdit | Self::GrokVideoGeneration => {
                 "EXECUTOR_GROK_CREDENTIAL_HOME"
             }
@@ -52,19 +55,35 @@ pub fn identify_executor_profile_binding(
 ) -> Result<ExecutorProfileBinding, ExecutorProfileBindingError> {
     match profile.provider_id.as_str() {
         openai_codex::PROVIDER_ID => {
-            let operation = openai_codex::operation("images.generations")
+            let (command_schema, operation_id, adapter_revision, binding) =
+                match profile.command_schema.as_str() {
+                    GENERATION_COMMAND_SCHEMA => (
+                        GENERATION_COMMAND_SCHEMA,
+                        "images.generations",
+                        CODEX_GENERATION_ADAPTER_REVISION,
+                        ExecutorProfileBinding::CodexImageGeneration,
+                    ),
+                    EDIT_COMMAND_SCHEMA => (
+                        EDIT_COMMAND_SCHEMA,
+                        "images.edits",
+                        CODEX_EDIT_INLINE_ADAPTER_REVISION,
+                        ExecutorProfileBinding::CodexImageEdit,
+                    ),
+                    _ => return Err(ExecutorProfileBindingError::BindingMismatch),
+                };
+            let operation = openai_codex::operation(operation_id)
                 .ok_or(ExecutorProfileBindingError::BindingMismatch)?;
             validate(
                 profile,
-                GENERATION_COMMAND_SCHEMA,
+                command_schema,
                 operation.id,
                 operation.descriptor_revision,
                 &operation.canonical_sha256_v1_hex(),
                 operation.completion.as_str(),
                 operation.idempotency.as_str(),
-                CODEX_GENERATION_ADAPTER_REVISION,
+                adapter_revision,
             )?;
-            Ok(ExecutorProfileBinding::CodexImageGeneration)
+            Ok(binding)
         }
         GROK_PROVIDER_ID => {
             let (command_schema, operation, adapter_revision, binding) =
@@ -158,6 +177,43 @@ mod tests {
             resource_policy_revision: 1,
             max_concurrency: 1,
         }
+    }
+
+    fn codex_profile(operation_id: &str, command_schema: &str) -> ExecutorExecutionProfile {
+        let operation = openai_codex::operation(operation_id).unwrap();
+        ExecutorExecutionProfile {
+            execution_profile_id: Uuid::new_v4(),
+            profile_key: format!("codex-{operation_id}"),
+            provider_id: openai_codex::PROVIDER_ID.to_owned(),
+            command_schema: command_schema.to_owned(),
+            operation_id: operation.id.to_owned(),
+            operation_descriptor_revision: operation.descriptor_revision.to_owned(),
+            operation_descriptor_sha256_v1: operation.canonical_sha256_v1_hex(),
+            completion_mode: operation.completion.as_str().to_owned(),
+            idempotency_mode: operation.idempotency.as_str().to_owned(),
+            adapter_revision: if operation_id == "images.edits" {
+                CODEX_EDIT_INLINE_ADAPTER_REVISION
+            } else {
+                CODEX_GENERATION_ADAPTER_REVISION
+            }
+            .to_owned(),
+            credential_pool_id: Uuid::new_v4(),
+            provider_account_id: Uuid::new_v4(),
+            credential_ref: "codex-oauth".to_owned(),
+            credential_revision: 1,
+            credential_auth_sha256: "a".repeat(64),
+            resource_policy_id: Uuid::new_v4(),
+            resource_policy_revision: 1,
+            max_concurrency: 1,
+        }
+    }
+
+    #[test]
+    fn codex_edit_profile_is_bound_to_the_durable_executor() {
+        assert_eq!(
+            identify_executor_profile_binding(&codex_profile("images.edits", EDIT_COMMAND_SCHEMA)),
+            Ok(ExecutorProfileBinding::CodexImageEdit)
+        );
     }
 
     #[test]

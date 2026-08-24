@@ -73,6 +73,39 @@ impl PostgresCredentialStore {
         lease_ms: i64,
         force: bool,
     ) -> Result<Option<CredentialRefreshLease>, CredentialResolveError> {
+        self.claim_refresh_matching(provider_account_id, owner, lease_ms, force, None)
+            .await
+    }
+
+    pub async fn claim_refresh_if_current(
+        &self,
+        provider_account_id: Uuid,
+        observed_revision: i64,
+        observed_fingerprint_sha256: &str,
+        owner: &str,
+        lease_ms: i64,
+    ) -> Result<Option<CredentialRefreshLease>, CredentialResolveError> {
+        if observed_revision <= 0 || !valid_sha256(observed_fingerprint_sha256) {
+            return Err(CredentialResolveError::Invalid);
+        }
+        self.claim_refresh_matching(
+            provider_account_id,
+            owner,
+            lease_ms,
+            true,
+            Some((observed_revision, observed_fingerprint_sha256)),
+        )
+        .await
+    }
+
+    async fn claim_refresh_matching(
+        &self,
+        provider_account_id: Uuid,
+        owner: &str,
+        lease_ms: i64,
+        force: bool,
+        expected: Option<(i64, &str)>,
+    ) -> Result<Option<CredentialRefreshLease>, CredentialResolveError> {
         if provider_account_id.is_nil()
             || owner.is_empty()
             || owner.len() > 128
@@ -104,6 +137,9 @@ impl PostgresCredentialStore {
                 WHERE head.provider_account_id = $1
                   AND head.refresh_strategy IN ('broker_managed', 'cli_managed')
                   AND head.lifecycle_state <> 'reauth_required'
+                  AND ($7::BIGINT IS NULL OR (
+                        head.active_revision = $7
+                        AND revision.material_fingerprint_sha256 = $8))
                   AND ($4 OR head.next_refresh_at_ms IS NULL
                        OR head.next_refresh_at_ms <= db_clock.now_ms
                        OR (account.provider_id = $5
@@ -137,6 +173,8 @@ impl PostgresCredentialStore {
         .bind(force)
         .bind(GROK_PROVIDER_ID)
         .bind(GROK_REFRESH_SKEW_MS)
+        .bind(expected.map(|value| value.0))
+        .bind(expected.map(|value| value.1))
         .fetch_optional(&mut *tx)
         .await
         .map_err(|_| CredentialResolveError::Unavailable)?;
