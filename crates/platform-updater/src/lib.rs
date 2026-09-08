@@ -3896,8 +3896,9 @@ where
     tokio::pin!(shutdown);
     loop {
         tokio::select! {
-            _ = poll.tick() => work().await,
+            biased;
             _ = &mut shutdown => return,
+            _ = poll.tick() => work().await,
         }
     }
 }
@@ -3974,14 +3975,20 @@ mod tests {
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
         let passes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let shutdown_polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let completed_passes = Arc::clone(&passes);
+        let observed_shutdown_polls = Arc::clone(&shutdown_polls);
         let mut started_tx = Some(started_tx);
         let mut release_rx = Some(release_rx);
+        let mut shutdown_rx = shutdown_rx;
         let task = tokio::spawn(poll_until_shutdown(
             Duration::from_secs(60),
-            async move {
-                let _ = shutdown_rx.await;
-            },
+            std::future::poll_fn(move |context| {
+                observed_shutdown_polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                std::pin::Pin::new(&mut shutdown_rx)
+                    .poll(context)
+                    .map(|_| ())
+            }),
             move || {
                 let started_tx = started_tx.take();
                 let release_rx = release_rx.take();
@@ -3995,6 +4002,10 @@ mod tests {
         ));
 
         started_rx.await.expect("update pass started");
+        assert!(
+            shutdown_polls.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "shutdown listener must be polled before the first pass"
+        );
         shutdown_tx.send(()).expect("shutdown receiver alive");
         tokio::task::yield_now().await;
         assert!(
