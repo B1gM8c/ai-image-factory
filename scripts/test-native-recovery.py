@@ -461,12 +461,46 @@ def install_host_files(bundle, manifest, selected=None):
 
 
 def updater_identity(expected_hash, apply_enabled, *, require_safe_mounts=True):
-    pid = run(['systemctl', 'show', PREFIX + 'updater.service', '-p', 'MainPID', '--value']).stdout.strip()
+    started = time.monotonic()
+    deadline = started + 10
+    samples = []
+
+    def service_state():
+        result = run(['systemctl', 'show', PREFIX + 'updater.service', '-p', 'MainPID',
+                      '-p', 'ActiveState', '-p', 'NRestarts', '-p', 'InvocationID'],
+                     timeout=max(0.001, min(2, deadline - time.monotonic())))
+        return dict(line.split('=', 1) for line in result.stdout.splitlines() if '=' in line)
+
+    initial = service_state()
+    pid = initial['MainPID']
     require(re.fullmatch('[1-9][0-9]*', pid), 'updater has no real MainPID')
     process = Path('/proc') / pid
-    executable = (process / 'exe').resolve(strict=True)
-    require(executable == LIB / 'updated' and digest(process / 'exe') == expected_hash,
-            'running updater executable differs from the expected release binary')
+    state = initial
+    while True:
+        require(state == initial and state['ActiveState'] == 'active',
+                'updater exited or restarted during identity readiness: '
+                + json.dumps({'expected_sha256': expected_hash, 'state': state, 'samples': samples}))
+        try:
+            executable = (process / 'exe').resolve(strict=True)
+            actual_hash = digest(process / 'exe')
+        except OSError as error:
+            raise RuntimeError('updater process disappeared during identity readiness: '
+                               + json.dumps({'state': state, 'samples': samples})) from error
+        sample = {'expected_executable': str(LIB / 'updated'), 'expected_sha256': expected_hash,
+                  'actual_executable': str(executable), 'actual_sha256': actual_hash, **state}
+        if not samples or sample != samples[-1]:
+            samples.append(sample)
+            progress('Updater identity sample: ' + json.dumps(sample))
+        detail = json.dumps(sample)
+        if executable == LIB / 'updated':
+            require(actual_hash == expected_hash, 'running updater SHA mismatch: ' + detail)
+            break
+        require(time.monotonic() < deadline, 'updater exec readiness timeout: ' + detail)
+        # Type=simple reports startup before execve; this same PID may still be
+        # systemd-executor. Never accept a different path or a replacement PID.
+        time.sleep(max(0, min(0.1, deadline - time.monotonic())))
+        require(time.monotonic() < deadline, 'updater exec readiness timeout: ' + detail)
+        state = service_state()
     environment = dict(entry.split(b'=', 1) for entry in (process / 'environ').read_bytes().split(b'\0') if b'=' in entry)
     require(environment.get(b'AIF_UPDATE_APPLY_ENABLED') == apply_enabled.encode(),
             'running updater Apply policy differs from the expected phase')
@@ -481,8 +515,14 @@ def updater_identity(expected_hash, apply_enabled, *, require_safe_mounts=True):
         artifact = str(STATE / 'artifacts')
         require(not any(path == artifact or path.startswith(artifact + '/') for path in state_mountpoints),
                 'actual updater namespace contains an artifact mountpoint that prevents safe recovery')
+    final = service_state()
+    require(final == initial and final['ActiveState'] == 'active'
+            and (process / 'exe').resolve(strict=True) == executable
+            and digest(process / 'exe') == expected_hash,
+            'updater identity changed while reading policy/mounts: ' + json.dumps(final))
     return {'pid': int(pid), 'executable': str(executable), 'sha256': expected_hash,
-            'apply_enabled': apply_enabled, 'state_mountpoints': sorted(state_mountpoints)}
+            'apply_enabled': apply_enabled, 'state_mountpoints': sorted(state_mountpoints),
+            'startup_samples': samples, 'identity_wait_seconds': round(time.monotonic() - started, 3)}
 
 
 def prepare_recovery_host_files(candidate_bundle, candidate, environment, installed):
