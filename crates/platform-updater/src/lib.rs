@@ -3982,7 +3982,7 @@ mod tests {
         let mut release_rx = Some(release_rx);
         let mut shutdown_rx = shutdown_rx;
         let task = tokio::spawn(poll_until_shutdown(
-            Duration::from_secs(60),
+            Duration::from_millis(1),
             std::future::poll_fn(move |context| {
                 observed_shutdown_polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 std::pin::Pin::new(&mut shutdown_rx)
@@ -4007,7 +4007,7 @@ mod tests {
             "shutdown listener must be polled before the first pass"
         );
         shutdown_tx.send(()).expect("shutdown receiver alive");
-        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
         assert!(
             !task.is_finished(),
             "shutdown must not abort an active pass"
