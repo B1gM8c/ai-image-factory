@@ -796,6 +796,12 @@ def execute(args, admin, output, diagnostics):
     progress(f"Installing original baseline host/runtime and real schema {baseline['target_schema_version']}")
     for directory in (ROOT / 'releases', STATE, CONFIG, LIB / 'hooks'):
         directory.mkdir(parents=True, mode=0o755)
+    # pathlib creates missing parents with 0777 subject to the runner umask.
+    # Mirror install-release before the old updater trusts candidate binaries.
+    ROOT.chmod(0o755)
+    root_metadata = ROOT.stat()
+    require(root_metadata.st_uid == 0 and root_metadata.st_mode & 0o022 == 0,
+            'synthetic install root is not protected like a real installation')
     run(['useradd', '--system', '--home-dir', str(STATE), '--shell', '/usr/sbin/nologin',
          'ai-image-factory'])
     service = pwd.getpwnam('ai-image-factory')
