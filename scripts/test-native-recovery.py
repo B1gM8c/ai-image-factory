@@ -51,6 +51,11 @@ RECOVERY_HOST_FILES = {
     'ops/systemd/' + PREFIX + name for name in
     ('updater.service', 'updater-recover@.service', 'recovery-gate.service')
 }
+MAX_UPDATER_EVENT_BYTES = 256 * 1024
+MAX_UPDATER_EVENT_LINES = 800
+MAX_DIAGNOSTIC_MESSAGE_CHARS = 4096
+UPDATER_EVENT_FIELDS = ('command_id', 'action', 'target_version', 'phase', 'details',
+                        'created_at_ms')
 
 
 def require(condition, message):
@@ -81,6 +86,174 @@ def write(path, text, mode=0o600):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding='utf-8')
     path.chmod(mode)
+
+
+def bounded_updater_events(path):
+    metadata = {'present': False, 'source_bytes': 0, 'truncated': False,
+                'lines_read': 0, 'events_exported': 0, 'invalid_lines': 0}
+    if not path.is_file() or path.is_symlink():
+        return [], metadata
+    size = path.stat().st_size
+    offset = max(0, size - MAX_UPDATER_EVENT_BYTES)
+    with path.open('rb') as handle:
+        handle.seek(offset)
+        data = handle.read(MAX_UPDATER_EVENT_BYTES)
+    if offset:
+        _, separator, data = data.partition(b'\n')
+        if not separator:
+            data = b''
+    lines = data.splitlines()[-MAX_UPDATER_EVENT_LINES:]
+    events = []
+    invalid = 0
+    for raw in lines:
+        try:
+            value = json.loads(sanitized(raw.decode('utf-8', errors='replace')))
+        except (json.JSONDecodeError, UnicodeError):
+            invalid += 1
+            continue
+        if not isinstance(value, dict):
+            invalid += 1
+            continue
+        events.append({key: value[key] for key in UPDATER_EVENT_FIELDS if key in value})
+    metadata.update(present=True, source_bytes=size,
+                    truncated=offset > 0 or len(data.splitlines()) > MAX_UPDATER_EVENT_LINES,
+                    lines_read=len(lines), events_exported=len(events), invalid_lines=invalid)
+    return events, metadata
+
+
+def limited_message(value):
+    if value is None:
+        return None
+    return sanitized(str(value))[-MAX_DIAGNOSTIC_MESSAGE_CHARS:]
+
+
+def failure_event_summary(events, command_id):
+    selected = [event for event in events if event.get('command_id') == command_id]
+    restoring_index = next((index for index, event in enumerate(selected)
+                            if event.get('phase') == 'restoring'
+                            and isinstance(event.get('details'), dict)), None)
+    restore_required = next((event for event in reversed(selected)
+                             if event.get('phase') == 'restore_required'
+                             and isinstance(event.get('details'), dict)), None)
+    original = {'phase': None, 'phase_basis': 'last_journal_phase_before_recovery',
+                'message': None}
+    if restoring_index is not None:
+        restoring = selected[restoring_index]
+        original['phase'] = (selected[restoring_index - 1].get('phase')
+                             if restoring_index else None)
+        original['message'] = limited_message(restoring['details'].get('error'))
+    recovery = {'phase': None, 'message': None}
+    if restore_required:
+        recovery['phase'] = restore_required.get('phase')
+        recovery['message'] = limited_message(
+            restore_required['details'].get('recovery_error',
+                                            restore_required['details'].get('error')))
+    return {'original_apply': original, 'recover': recovery}
+
+
+def fault_markers(fixture):
+    verify_events = []
+    verify_path = fixture / 'verify-runs.jsonl'
+    if verify_path.is_file() and not verify_path.is_symlink():
+        for raw in verify_path.read_text(encoding='utf-8', errors='replace').splitlines()[-100:]:
+            try:
+                value = json.loads(sanitized(raw))
+            except json.JSONDecodeError:
+                continue
+            if isinstance(value, dict):
+                verify_events.append({key: value.get(key) for key in
+                                      ('release', 'scope', 'exit_code', 'reader_denial_42501')})
+    candidate_validation_verify_seen = any(
+        event.get('scope') == 'validation' for event in verify_events)
+    post_validation = (fixture / 'fault-evidence.json').is_file()
+    first_recovery = (fixture / 'recovery-fault-observed').is_file()
+    return {'post_validation_fault_observed': post_validation,
+            'first_recovery_fault_observed': first_recovery,
+            'candidate_validation_verify_seen': candidate_validation_verify_seen,
+            'verify_runs': verify_events}
+
+
+def command_snapshot(environment, command_id):
+    if not environment or not command_id:
+        return None
+    raw = sql(environment,
+        "SELECT json_build_object('status',status,'phase',phase,'epoch',lease_epoch,"
+        "'failure_code',failure_code,'failure_message',failure_message) "
+        "FROM platform_update_commands WHERE command_id='"
+        + str(uuid.UUID(command_id)) + "';")
+    return json.loads(raw) if raw else None
+
+
+def collect_recovery_evidence(output, diagnostics, original_error):
+    command_id = diagnostics.get('failure_command')
+    try:
+        events, event_metadata = bounded_updater_events(STATE / 'updater/events.jsonl')
+    except Exception as error:
+        events = []
+        event_metadata = {'present': False, 'source_bytes': 0, 'truncated': False,
+                          'lines_read': 0, 'events_exported': 0, 'invalid_lines': 0,
+                          'collection_error': limited_message(error)}
+    observations = failure_event_summary(events, command_id)
+    try:
+        write(output / 'updater-events.jsonl', ''.join(
+            json.dumps(event, separators=(',', ':'), ensure_ascii=False) + '\n'
+            for event in events))
+    except Exception as error:
+        event_metadata['artifact_error'] = limited_message(error)
+    command = None
+    command_error = None
+    try:
+        command = command_snapshot(diagnostics.get('owner_environment'), command_id)
+    except Exception as error:
+        command_error = limited_message(error)
+    if command:
+        observations['recover']['command_phase'] = command.get('phase')
+        observations['recover']['command_message'] = limited_message(command.get('failure_message'))
+    try:
+        markers = fault_markers(diagnostics.get('fixture', STATE / 'updater/fixture'))
+        automatic_recovery_seen = any(
+            event.get('command_id') == command_id
+            and event.get('phase') in ('restoring', 'restore_required')
+            for event in events)
+        markers['automatic_recovery_seen_before_candidate_validation_verify'] = (
+            automatic_recovery_seen and not markers['candidate_validation_verify_seen'])
+        marker_error = None
+    except Exception as error:
+        markers = None
+        marker_error = limited_message(error)
+    evidence = {'failure_command': command_id, 'command': command,
+                'command_snapshot_error': command_error,
+                'updater_events': event_metadata, 'markers': markers,
+                'marker_collection_error': marker_error, **observations}
+    summary_path = output / 'summary.json'
+    try:
+        summary = json.loads(summary_path.read_text()) if summary_path.is_file() else {}
+    except (OSError, json.JSONDecodeError):
+        summary = {}
+    summary.setdefault('passed', original_error is None)
+    if original_error is not None:
+        summary.setdefault('error', limited_message(original_error))
+    summary['failure_evidence'] = evidence
+    write(summary_path, sanitized(json.dumps(summary, indent=2, ensure_ascii=False)))
+
+
+def collect_recovery_evidence_best_effort(output, diagnostics, original_error):
+    try:
+        collect_recovery_evidence(output, diagnostics, original_error)
+        return None
+    except Exception as error:
+        message = limited_message(error)
+        try:
+            summary_path = output / 'summary.json'
+            summary = json.loads(summary_path.read_text()) if summary_path.is_file() else {}
+            summary.setdefault('passed', original_error is None)
+            if original_error is not None:
+                summary.setdefault('error', limited_message(original_error))
+            summary['evidence_export_error'] = message
+            write(summary_path, sanitized(json.dumps(summary, indent=2, ensure_ascii=False)))
+        except Exception:
+            pass
+        return message
 
 
 def digest(path):
@@ -594,11 +767,8 @@ def wait_command(environment, command_id, expected, timeout=480):
     deadline = time.monotonic() + timeout
     last = None
     while time.monotonic() < deadline:
-        raw = sql(environment, "SELECT json_build_object('status',status,'phase',phase,'epoch',lease_epoch,"
-                  "'failure_code',failure_code) FROM platform_update_commands WHERE command_id='"
-                  + str(uuid.UUID(command_id)) + "';")
-        if raw:
-            last = json.loads(raw)
+        last = command_snapshot(environment, command_id)
+        if last:
             if last['status'] in expected:
                 return last
             require(last['status'] not in ('failed', 'restore_required', 'restored', 'succeeded'),
@@ -615,7 +785,7 @@ def enqueue(token, action, version=None):
     return json.loads(data)['command_id']
 
 
-def execute(args, admin, output):
+def execute(args, admin, output, diagnostics):
     started = time.monotonic()
     progress('Validating release bundle contents; no GitHub signature claim is made by this fixture job')
     baseline = validate_bundle(args.baseline_bundle, args.baseline_manifest)
@@ -671,6 +841,7 @@ def execute(args, admin, output):
     reader_dsn = f'postgresql://{reader}:{db_password}@{host_port}/{database}'
     SECRET_VALUES.extend([dsn, reader_dsn])
     owner_env = pg_environment(dsn)
+    diagnostics['owner_environment'] = owner_env
     sql(owner_env, f'ALTER SCHEMA public OWNER TO {owner}; REVOKE CREATE ON SCHEMA public FROM PUBLIC;')
     application = {'PATH': str(codex_runtime / 'bin') + ':/usr/sbin:/usr/bin:/sbin:/bin', 'DATABASE_URL': dsn,
         'GATEWAY_DATABASE_SCHEMA': 'public', 'GATEWAY_ARTIFACT_ROOT': str(STATE / 'artifacts'),
@@ -744,6 +915,7 @@ RESET ROLE;
     env_file(CONFIG / 'update-policy.env', policy)
     install_fixtures(candidate, args.candidate_bundle, args.candidate_manifest, owner_env)
     fixture = STATE / 'updater/fixture'
+    diagnostics['fixture'] = fixture
     write(fixture / 'reader-role', reader)
     updater = {'AIF_RELEASE_ROOT': str(ROOT), 'AIF_UPDATE_JOURNAL_ROOT': str(STATE / 'updater'),
         'AIF_UPDATER_DATABASE_URL': dsn, 'AIF_MIGRATOR_DATABASE_URL': dsn,
@@ -820,6 +992,7 @@ WHERE n.nspname='public' AND c.relname='ci_recovery_sequence' AND c.relkind='S';
     progress('Baseline authenticated API/BFF and reader passed; running real Apply with two explicit fault points')
     write(fixture / 'inject-validation-failure', 'once\n')
     failure_id = enqueue(token, 'apply', candidate['release_version'])
+    diagnostics['failure_command'] = failure_id
     failed_state = wait_command(owner_env, failure_id, {'restore_required'})
     require((fixture / 'fault-evidence.json').is_file() and (fixture / 'recovery-fault-observed').is_file(),
             'expected post-validation and first-recovery fault points were not reached')
@@ -897,7 +1070,13 @@ WHERE n.nspname='public' AND c.relname='ci_recovery_sequence' AND c.relkind='S';
     installed_host_files['bin/updated'] = {'destination': str(LIB / 'updated'), 'sha256': candidate_updater_hash}
     journal = (STATE / 'updater/events.jsonl').read_text()
     require(failure_id in journal and success_id in journal, 'missing native updater journal identity')
-    write(output / 'updater-events.jsonl', sanitized(journal))
+    exported_events, _ = bounded_updater_events(STATE / 'updater/events.jsonl')
+    exported_ids = {event.get('command_id') for event in exported_events}
+    require(failure_id in exported_ids and success_id in exported_ids,
+            'bounded updater evidence omitted a required command identity')
+    write(output / 'updater-events.jsonl', ''.join(
+        json.dumps(event, separators=(',', ':'), ensure_ascii=False) + '\n'
+        for event in exported_events))
     write(output / 'verify-runs.jsonl', (fixture / 'verify-runs.jsonl').read_text())
     write(output / 'reader-gates.json', json.dumps(reader_receipts, indent=2))
     write(output / 'systemd-effective.json', json.dumps(units, indent=2))
@@ -947,22 +1126,36 @@ def main():
         parser.add_argument('--' + option, type=Path, required=True)
     args = parser.parse_args()
     admin, output = preflight(args)
+    diagnostics = {}
+    original_error = None
     try:
-        execute(args, admin, output)
+        execute(args, admin, output, diagnostics)
     except Exception as error:
-        write(output / 'summary.json', json.dumps({'passed': False, 'error': sanitized(str(error))}, indent=2))
+        original_error = error
+        try:
+            write(output / 'summary.json', json.dumps(
+                {'passed': False, 'error': sanitized(str(error))}, indent=2))
+        except Exception:
+            pass
         raise
     finally:
         # The disposable VM is discarded by Actions. Preserve its synthetic
         # state on disk for the job's diagnostics, never recursively delete a
         # broad path or export database dumps, EnvironmentFiles or private keys.
-        result = run(['journalctl', '--no-pager', '-n', '800', '-u', 'ai-image-factory-*'],
-                     timeout=20, check=False)
-        write(output / 'services.log', sanitized(result.stdout + result.stderr))
+        collect_recovery_evidence_best_effort(output, diagnostics, original_error)
+        try:
+            result = run(['journalctl', '--no-pager', '-n', '800', '-u', 'ai-image-factory-*'],
+                         timeout=20, check=False)
+            write(output / 'services.log', sanitized(result.stdout + result.stderr))
+        except Exception:
+            pass
         # The workflow exports only its explicit sanitized evidence allowlist
         # using sudo, never this private directory recursively.
-        run(['systemctl', 'stop', PREFIX + 'updater.service', PREFIX + 'processes.target',
-             'aif-native-admission.service'], timeout=180, check=False)
+        try:
+            run(['systemctl', 'stop', PREFIX + 'updater.service', PREFIX + 'processes.target',
+                 'aif-native-admission.service'], timeout=180, check=False)
+        except Exception:
+            pass
 
 
 if __name__ == '__main__':
