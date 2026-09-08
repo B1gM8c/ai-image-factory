@@ -106,3 +106,22 @@ Its HMAC poll handle binds user, task, result index, asset and segmentation, bec
 project service key itself is shared among Blog users. Cross-user/task/result, expiry, tampering
 and cross-asset response checks are covered by Blog-side tests. Blog owns its UI and commits;
 Factory does not edit that repository or claim production/browser rollout from this local smoke.
+
+Both Blog repositories completed non-force main merges, independently confirmed by remote ref reads:
+
+| Repository | Feature commit | Main merge |
+| --- | --- | --- |
+| `B1gM8c/fancypig_backend` | `c181d3a7e2c1deea502c3c637bfbcb76a9b7a64e` | `f30abb7825138685205c84fc4e0af25d3783021e` |
+| `B1gM8c/fancypig_front` | `3b6fcdf46791a50e27cecced6f5e4f4d7b8b1dda` | `78087d9439c062da0e65c07bb0238130bca81ba3` |
+
+Blog reported: backend API/controller/service and six contract/security tests passed; frontend
+17 tests, scoped lint, full TypeScript check and Vite build passed. Its pre-push hooks were bypassed
+only after those direct gates: existing backend auth/middleware tests need ignored local config,
+and the existing frontend global lint reports 1418 errors/393 warnings. These are explicitly not
+claimed green. Factory's normal pre-push hook ran but found no generic npm script; the Rust and
+release-hook gates above were run directly. GitHub CI is separate and was still running at handoff.
+
+Factory's feature commit is `f265e08eed2d79bf34d1c8bac10afde1a6145a21` (fast-forwarded to main);
+the later delivery-record commit changes this document only. Push output also reported an existing
+high-severity npm `nanoid` advisory about zero-size custom generators in `package-lock.json`.
+Dependencies and the Factory frontend were not changed; the unrelated advisory remains open.
