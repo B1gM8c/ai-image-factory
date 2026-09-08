@@ -44,8 +44,19 @@ jobs:
           systemctl --version
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends postgresql-client-16 shellcheck
-          "$TEST_PSQL" --version
-          "$TEST_PG_DUMP" --version
+          # Fixed hooks reset PATH and may otherwise hit a Debian wrapper for
+          # another installed client. Pin only this disposable runner's tools.
+          for client in psql pg_dump pg_restore; do
+            selected="/usr/lib/postgresql/16/bin/$client"
+            expected="$("$selected" --version)"
+            actual="$(env PATH=/usr/sbin:/usr/bin:/sbin:/bin "$client" --version)"
+            if [[ "$actual" != "$expected" ]]; then
+              sudo ln -sf "$selected" "/usr/bin/$client"
+            fi
+            actual="$(env PATH=/usr/sbin:/usr/bin:/sbin:/bin "$client" --version)"
+            test "$actual" = "$expected"
+            printf '%s\n' "$actual"
+          done
 
       - name: Validate release hook syntax
         run: |
