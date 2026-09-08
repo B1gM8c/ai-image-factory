@@ -127,7 +127,7 @@ SQL
 }
 
 prepare_database_sql() {
-  local directory extension_sql security_query security_before security_after extension_count
+  local directory extension_sql schema_public_acl_sql security_query security_before security_after extension_count
   directory="$1"
   database_dependency_guard | psql -X --dbname="$DATABASE_URL" -qAt --set=ON_ERROR_STOP=1 \
     --set="database_schema=${GATEWAY_DATABASE_SCHEMA}"
@@ -228,6 +228,22 @@ SQL
     | psql -X --dbname="$DATABASE_URL" -qAt --set=ON_ERROR_STOP=1 \
       --set="database_schema=${GATEWAY_DATABASE_SCHEMA}")"
   [[ -n "$security_before" ]] || return 1
+  # pg_dump compares the public schema against its bootstrap ACL even after our
+  # recovery drops and recreates it. Replay only the actual saved PUBLIC grants;
+  # the native ACL block remains authoritative for every role and revocation.
+  schema_public_acl_sql="$(psql -X --dbname="$DATABASE_URL" -qAt --set=ON_ERROR_STOP=1 \
+    --set="database_schema=${GATEWAY_DATABASE_SCHEMA}" <<'SQL'
+SET search_path = pg_catalog;
+SELECT format('SET ROLE %I;%sGRANT %s ON SCHEMA %I TO PUBLIC%s;%sRESET ROLE;',
+  pg_get_userbyid(grantor), chr(10),
+  string_agg(privilege_type, ', ' ORDER BY privilege_type), nspname,
+  CASE WHEN is_grantable THEN ' WITH GRANT OPTION' ELSE '' END, chr(10))
+FROM pg_namespace CROSS JOIN LATERAL aclexplode(nspacl)
+WHERE nspname = :'database_schema' AND grantee = 0
+GROUP BY nspname, grantor, is_grantable
+ORDER BY pg_get_userbyid(grantor), is_grantable;
+SQL
+  )"
   # Native owner/ACL/default-ACL statements are essential. Do not add no-owner
   # or no-privileges: a data-only equality check cannot detect lost permissions.
   pg_dump \
@@ -261,7 +277,8 @@ SQL
     # Native pg_dump puts schema grants after object ownership changes. Move
     # that exact ACL block earlier: a second saved owner may need its original
     # CREATE permission before ALTER TABLE OWNER can run. No new grants are made.
-    awk -v extension_file="${directory}/extension.sql" -v schema="$GATEWAY_DATABASE_SCHEMA" '
+    printf '%s\n' "$schema_public_acl_sql" >"${directory}/schema-public-acl.sql"
+    awk -v extension_file="${directory}/extension.sql" -v schema_acl_file="${directory}/schema-public-acl.sql" -v schema="$GATEWAY_DATABASE_SCHEMA" '
       FNR == NR {
         if (acl_start && !acl_end && /^-- (Name:|PostgreSQL database dump complete)/) acl_end = FNR - 1
         if (index($0, "-- Name: SCHEMA \"" schema "\"; Type: ACL;") == 1) { acl_start = FNR; acl_count++ }
@@ -283,6 +300,8 @@ SQL
         } else print
         if (index($0, "ALTER SCHEMA \"" schema "\" OWNER TO ") == 1 || index($0, "ALTER SCHEMA " schema " OWNER TO ") == 1) {
           for (j = acl_start; acl_start && j <= acl_end; j++) print acl[j]
+          while ((getline line < schema_acl_file) > 0) print line
+          close(schema_acl_file)
         }
       }
     ' "${directory}/database.pre.sql" "${directory}/database.pre.sql"
@@ -304,7 +323,8 @@ SQL
 \endif
 SQL
   } >"${directory}/database.sql"
-  rm -f -- "${directory}/database.dump" "${directory}/database.pre.sql" "${directory}/extension.sql"
+  rm -f -- "${directory}/database.dump" "${directory}/database.pre.sql" \
+    "${directory}/extension.sql" "${directory}/schema-public-acl.sql"
 }
 
 prepare_database_sql "$TEMPORARY_DIRECTORY"

@@ -151,9 +151,9 @@ RESET ROLE;
 ''')
         self.assertEqual(result.returncode, 0, result.stderr)
 
-    def security(self):
+    def security(self, schema='app'):
         extracted = subprocess.run(['bash', '-c', hook_function('backup', 'database_security_query') + '\ndatabase_security_query'], capture_output=True, text=True, check=True)
-        result = self.sql('SET search_path = pg_catalog;\n' + extracted.stdout + ';')
+        result = self.sql('\\set database_schema ' + schema + '\nSET search_path = pg_catalog;\n' + extracted.stdout + ';')
         self.assertEqual(result.returncode, 0, result.stderr)
         return result.stdout.strip()
 
@@ -199,6 +199,43 @@ RESET ROLE;
         created = self.sql('CREATE TABLE app.future(id integer);', role=self.roles['owner'])
         self.assertEqual(created.returncode, 0, created.stderr)
         self.assertEqual(self.sql('SELECT count(*) FROM app.future', role=reader).returncode, 0)
+
+    def test_public_schema_acl_is_replayed_from_saved_state(self):
+        r = self.roles
+        prepared = self.sql(f'''DROP SCHEMA app CASCADE;
+ALTER SCHEMA public OWNER TO {r['owner']};
+REVOKE ALL ON SCHEMA public FROM PUBLIC;
+GRANT USAGE ON SCHEMA public TO PUBLIC;
+GRANT USAGE ON SCHEMA public TO {r['reader']};
+GRANT USAGE, CREATE ON SCHEMA public TO {r['object_owner']};
+SET ROLE {r['owner']};
+CREATE EXTENSION btree_gist WITH SCHEMA public VERSION '1.7';
+CREATE TABLE public.public_acl_probe(id integer);
+RESET ROLE;''')
+        self.assertEqual(prepared.returncode, 0, prepared.stderr)
+        try:
+            with_public = self.security('public')
+            result, image = self.backup(schema='public')
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn('GRANT USAGE ON SCHEMA public TO PUBLIC;', image)
+            self.assertEqual(self.sql('REVOKE ALL ON SCHEMA public FROM PUBLIC;').returncode, 0)
+            restored = self.sql('\\set database_schema public\n' + image,
+                                role=r['migrator'])
+            self.assertEqual(restored.returncode, 0, restored.stderr)
+            self.assertEqual(self.security('public'), with_public)
+
+            self.assertEqual(self.sql('REVOKE ALL ON SCHEMA public FROM PUBLIC;').returncode, 0)
+            without_public = self.security('public')
+            result, image = self.backup(schema='public')
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotIn('GRANT USAGE ON SCHEMA public TO PUBLIC;', image)
+            self.assertEqual(self.sql('GRANT USAGE ON SCHEMA public TO PUBLIC;').returncode, 0)
+            restored = self.sql('\\set database_schema public\n' + image,
+                                role=r['migrator'])
+            self.assertEqual(restored.returncode, 0, restored.stderr)
+            self.assertEqual(self.security('public'), without_public)
+        finally:
+            self.assertEqual(self.sql('DROP EXTENSION IF EXISTS btree_gist CASCADE;').returncode, 0)
 
     def test_implicit_extension_arrays_keep_owner_without_role_escalation(self):
         # PG16 represents these as array --i--> base --e--> extension; PG18
@@ -259,6 +296,7 @@ WHERE a.typnamespace='app'::regnamespace AND a.typnamespace=b.typnamespace
                     difference = json.loads(line[len(prefix):])
                     self.assertEqual(set(difference), {'limit', 'total_differences', 'truncated', 'items'})
                     self.assertEqual(difference['limit'], 12)
+                    self.assertGreaterEqual(difference['total_differences'], 1)
                     self.assertLessEqual(len(difference['items']), 12)
                     self.assertTrue(any(item['direction'] == 'missing'
                         and item['kind'].startswith('relation:') and item['identity'] == 'jobs'
