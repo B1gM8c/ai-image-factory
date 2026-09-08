@@ -24,7 +24,17 @@ pub struct MediaAsset {
     pub digest: String,
     pub image: ImageSize,
     pub blob: InputBlobRef,
+    pub source_state: SourceState,
     pub expires_at_ms: i64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, sqlx::Type)]
+#[serde(rename_all = "snake_case")]
+#[sqlx(type_name = "text", rename_all = "snake_case")]
+pub enum SourceState {
+    Retained,
+    Releasing,
+    Released,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -57,6 +67,10 @@ impl MediaAsset {
 #[serde(deny_unknown_fields)]
 pub struct SegmentRequest {
     pub asset_id: String,
+    /// Optional for existing clients. Automated callers pin readiness.analyzer_key
+    /// so a retry after a deploy cannot silently run a second analyzer revision.
+    #[serde(default, deserialize_with = "provided_analyzer_key")]
+    pub expected_analyzer_key: Option<String>,
     #[serde(default = "default_cached_only")]
     pub cached_only: bool,
     #[serde(default = "default_detail")]
@@ -65,6 +79,12 @@ pub struct SegmentRequest {
     pub language: String,
     #[serde(default = "default_mask_format")]
     pub mask_format: String,
+}
+
+fn provided_analyzer_key<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    String::deserialize(deserializer).map(Some)
 }
 
 fn default_cached_only() -> bool {
@@ -224,6 +244,16 @@ pub struct SegmentWork {
 
 #[async_trait]
 pub trait SegmentStore: Send + Sync {
+    async fn worker_heartbeat(
+        &self,
+        analyzer_key: &str,
+    ) -> Result<Option<super::SegmentWorkerHeartbeat>, ImageGatewayError>;
+    async fn result_for_analyzer(
+        &self,
+        scope: &MediaScope,
+        asset_id: Uuid,
+        analyzer_key: &str,
+    ) -> Result<Option<Segmentation>, ImageGatewayError>;
     async fn find_asset(
         &self,
         scope: &MediaScope,
@@ -266,6 +296,16 @@ pub trait SegmentStore: Send + Sync {
     ) -> Result<bool, ImageGatewayError>;
     /// Fail expired active leases without rerunning a possibly charged model call.
     async fn expire_leases(&self) -> Result<u64, ImageGatewayError>;
+    /// Fence new enqueue/restore before returning exact sources to delete. Releasing
+    /// sources are returned again after failure or restart; deletion is idempotent.
+    async fn claim_sources_for_release(
+        &self,
+        limit: i64,
+        release_terminal: bool,
+    ) -> Result<Vec<MediaAsset>, ImageGatewayError>;
+    /// Confirm the exact claimed blob was deleted; stale confirmations cannot
+    /// release a reuploaded source with a different session key.
+    async fn finish_source_release(&self, asset: &MediaAsset) -> Result<bool, ImageGatewayError>;
     async fn expired_assets(&self, limit: i64) -> Result<Vec<MediaAsset>, ImageGatewayError>;
     async fn delete_expired_asset(&self, id: Uuid) -> Result<(), ImageGatewayError>;
 }

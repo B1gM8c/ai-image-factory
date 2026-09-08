@@ -422,9 +422,11 @@ fs.writeFileSync(
   { mode: 0o644 },
 );
 NODE
-[[ "$("${RELEASE_ROOT}/bin/grok" --version)" = "$(
-  node -p "require('${GROK_LOCK_FILE}').version_output"
-)" ]] || die "packaged Grok provider version output does not match the lock"
+if [[ "$(uname -s)" == "Linux" ]]; then
+  [[ "$("${RELEASE_ROOT}/bin/grok" --version)" = "$(
+    node -p "require('${GROK_LOCK_FILE}').version_output"
+  )" ]] || die "packaged Grok provider version output does not match the lock"
+fi
 
 cp -aL "${REPO_ROOT}/deploy/hooks/." "${RELEASE_ROOT}/ops/hooks/"
 cp -aL "${REPO_ROOT}/deploy/systemd/." "${RELEASE_ROOT}/ops/systemd/"

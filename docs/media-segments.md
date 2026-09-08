@@ -8,28 +8,40 @@ masks.
 Image generation remains unchanged. In particular,
 `POST /v1/images/generations` and `POST /v1/images/edits` keep their existing
 request and response contracts and do not wait for segmentation. A client first
-displays the final image. Only after the user explicitly clicks its analysis
-button does the client register those bytes and request analysis asynchronously.
+displays the final image. An explicitly enabled consumer may then register
+the final bytes and enqueue analysis asynchronously, without delaying image
+delivery. The consumer owns automatic first-use admission and durable reuse;
+Factory does not schedule analysis from image-generation or image-read routes.
 
-## User-triggered client lifecycle
+## Client lifecycle and persistent reuse
 
 The same interface accepts newly generated and older images; registration uses
 the final bytes, not the generation date or generator identity. Integrations
 must still authorize access to the source image before submitting it.
 
-- Opening, switching or reopening an image does not register an asset, request
-  segmentation, probe the segmentation cache, or resume polling automatically.
-  Existing image/task-detail loading is independent and remains unchanged.
-- Show a clear "生成分层" action for an eligible final image. Only a click may
-  register/start analysis; prevent duplicate clicks while a request is pending.
-- Reuse a completed local cached result without a segmentation request. If only
-  the server cache remains, the next explicit click may register identical bytes
-  and request the result; the server reuses the existing asset/result within TTL.
-- Poll only a user-started `processing` result. Stop on terminal state, close or
-  image change. Reopening an unfinished image requires another explicit action
-  to resume polling; it must not silently start another model invocation.
-- Cache expiry is not permission to recompute. A subsequent explicit click is
-  required. Analysis failure never blocks the original image.
+- When enabled, a newly completed generation/edit result is automatically
+  admitted once per authorized task/result binding after displaying the image.
+  An eligible historical image first reads its consumer-owned state; only
+  `not_started` may automatically ensure a task on first open. This is not a
+  bulk historical backfill.
+- The consumer uses a database-unique task/result binding and single-flight
+  admission across repeated opens, tabs, concurrent requests and restarts.
+  Only the owning durable job submits analysis to Factory. A GET remains
+  read-only; UI state loading never directly invokes an analyzer.
+- Reuse a completed persisted result without contacting Factory. A
+  `processing` result resumes bounded status reads, not another submission.
+  `failed` or expired work is never implicitly resubmitted. An uncertain prior
+  submission may recover the same saved analyzer key through cache-only lookup;
+  a cache miss is not permission to repeat possibly billable analysis.
+- A consumer's durable background job may poll its own `processing` result;
+  UI polling stops on terminal state, close or image change. Reopening an image
+  reads the consumer's saved state and never silently invokes the model again.
+- Save successful JSON, actual dimensions, image digest, schema/analyzer
+  revision, and authorized task/result binding in the consumer's storage.
+  Factory's temporary `asset_id`/`segmentation.id` are not permanent storage
+  handles. A successful saved result remains usable after Factory's TTL.
+- Cache expiry or failure is not permission to automatically recompute.
+  Analysis failure never blocks the original image.
 
 For Blog, the current authorization contract addresses an authenticated user's
 task ID and result index. It covers available historical task results without a
@@ -47,13 +59,45 @@ Authorization: Bearer $API_KEY
 ```json
 {
   "supports_bbox_sidecar": true,
-  "supports_mask_sidecar": false
+  "supports_mask_sidecar": false,
+  "supports_terminal_source_release": true,
+  "supports_analyzer_key_pin": true
 }
 ```
 
 This endpoint requires `images:read`. Both values are `false` when the optional
 sidecar service is not configured. Capability discovery therefore does not
 return `503` merely because the worker is disabled.
+
+Capabilities describe protocol support, not worker liveness. All four flags
+are false when the optional service is not configured.
+
+### Read-only worker readiness
+
+`GET /v1/media/readiness` requires `images:read` and never starts work. Example:
+
+```json
+{
+  "object": "media.readiness",
+  "status": "ready",
+  "analyzer_key": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+  "last_heartbeat_at_ms": 1788848639234,
+  "heartbeat_age_ms": 1200,
+  "heartbeat_ttl_ms": 150000,
+  "source_release_enabled": true
+}
+```
+
+The opaque key is exactly 64 lowercase hexadecimal ASCII characters and
+contains no account identity or credentials. The heartbeat must match the
+gateway's analyzer key and be at most 150 seconds old. A missing, future-dated,
+stale, or unreadable heartbeat returns `503` with `status="not_ready"` and a
+bounded `reason`; the response uses `Cache-Control: no-store`. A fresh heartbeat
+proves the worker loop progressed, **not** that a future model call will succeed.
+The isolated bbox worker does not make the image-generation `/readyz` fail.
+Fresh workers with inconsistent cleanup modes return `503` with reason
+`worker_configuration_mismatch` and `source_release_enabled=null`; a last-writer
+heartbeat cannot hide an older worker still deleting source bytes.
 
 ## Register final image bytes
 
@@ -85,8 +129,10 @@ The endpoint requires `images:write` and returns:
 ```
 
 Assets are isolated by tenant, project, and credential owner. Re-registering
-identical bytes in the same scope reuses the asset. Assets and their sidecars
-have a 24-hour retention window.
+identical bytes in the same scope reuses the asset. Asset metadata and its
+sidecars have a 24-hour retention window. With terminal-source cleanup enabled,
+source bytes may be deleted earlier, after every associated analysis is
+terminal; cached JSON and IDs remain available until the original expiry.
 
 The standard Images API currently returns image bytes (for example,
 `b64_json`) rather than a persistent media asset identifier. Registering final
@@ -105,7 +151,8 @@ Content-Type: application/json
   "cached_only": false,
   "detail": "bbox",
   "language": "zh-CN",
-  "mask_format": "none"
+  "mask_format": "none",
+  "expected_analyzer_key": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 }
 ```
 
@@ -121,9 +168,52 @@ identifiers remain stable English-compatible keys. The JSON body is limited to
   one analysis job and returns `202 Accepted` with `Retry-After: 2`.
 - A cached `completed` or `failed` result returns `200 OK`.
 
+Repeated `cached_only=false` submissions of the same scoped content and analyzer
+configuration reuse the same queued, processing, completed, or failed result.
+They do not reset the TTL or create a second model attempt. Transport retries
+therefore reuse the original result even after an uncertain POST response.
+Queue saturation is a rejected enqueue, not an accepted model attempt; callers
+may retry admission with bounded backoff. Stop retrying once a result is known.
+
 The cache key covers the asset content digest, analyzer provider/model and
 prompt revision, schema version, language, detail, and mask format. It is not
 coupled to the provider that generated the image.
+
+`expected_analyzer_key` is optional for compatibility; new durable consumers
+must obtain it from readiness and save it **before** their first POST. It must
+match `^[0-9a-f]{64}$`. Keep that same value for every ensure/cache recovery of
+the business task, including recovery after a lost HTTP response. If the gateway
+configuration has changed, Factory can still return an existing result for the
+same scope, asset, and opaque key without reconstructing the old model config.
+If no such result exists, `409 segmentation_analyzer_changed` stops submission;
+it never silently creates a result under the new configuration. Do not replace
+the saved key merely to turn this conflict into success.
+
+### Source ownership and errors
+
+The existing 64-source/512 MiB per-project limits count sources still owned by
+Factory, including expired bytes awaiting deletion. Metadata/results are
+separately bounded to 4096 assets per project and retain the original 24-hour
+TTL. Active analysis limits remain 64 globally and 16 per project.
+
+Terminal cleanup moves sources through `retained → releasing → released`.
+Queued/processing analyses prevent release. Deletion failures keep the source
+charged to storage capacity; retries and crash recovery use the exact immutable
+blob session. Capacity is freed only after deletion is confirmed. Result reads
+do not require the pixels and remain available throughout cleanup.
+
+- `409 asset_source_releasing`: source cleanup is in progress; retry the same
+  registration with bounded backoff. Do not start another analysis.
+- `409 asset_source_released`: the requested result is absent and source bytes
+  have been reclaimed. First try `cached_only=true` with the saved analyzer key.
+  If genuinely absent and the key has not changed, register the same final bytes
+  to restore source ownership, then ensure with the same key. Existing completed
+  and failed results are reused, never reset by re-registration.
+- `404 asset_not_found` / `segmentation_not_found`: unknown, expired, or outside
+  the caller's scope. A persisted consumer result remains usable independently;
+  expiry is not automatic permission to run the model again.
+
+Neither registration nor source restoration extends the existing asset TTL.
 
 ## Poll a segmentation
 

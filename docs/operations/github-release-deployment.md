@@ -517,6 +517,14 @@ modeled.
 The packaging script consumes prebuilt Linux binaries and a completed Next.js
 standalone build:
 
+Cross-built packages can be assembled on macOS: Grok's SHA-256, byte size and
+ELF target are still checked, but its Linux executable cannot be run there.
+Verify the packaged Grok `--version` on the target Linux host before activation.
+When upgrading across more than one migration, explicitly set
+`MIN_SCHEMA_VERSION` to the oldest **tested** source schema; the default is only
+the target schema minus one. In particular, the tested 128-to-131 lifecycle
+upgrade requires `MIN_SCHEMA_VERSION=128`.
+
 ```bash
 npm ci
 npm run build:admin
@@ -535,10 +543,20 @@ SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)" \
   /tmp/ai-image-factory-release
 ```
 
-Validate systemd and shell files on a Linux host:
+Validate systemd, shell files and the Python media gate on a Linux host:
 
 ```bash
 systemd-analyze verify deploy/systemd/*.service deploy/systemd/*.target
-shellcheck scripts/package-release.sh deploy/hooks/* deploy/install-release deploy/upgrade-updater
-bash -n scripts/package-release.sh deploy/hooks/* deploy/install-release deploy/upgrade-updater
+shell_scripts=(scripts/package-release.sh deploy/install-release deploy/upgrade-updater)
+for hook in deploy/hooks/*; do
+  if [[ "$hook" != deploy/hooks/verify-media-segments ]]; then
+    shell_scripts+=("$hook")
+  fi
+done
+shellcheck "${shell_scripts[@]}"
+for script in "${shell_scripts[@]}"; do
+  bash -n "$script"
+done
+python3 -c 'import ast, pathlib; ast.parse(pathlib.Path("deploy/hooks/verify-media-segments").read_text())'
+PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-media-runtime-gate.py
 ```

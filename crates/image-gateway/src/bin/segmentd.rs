@@ -2,12 +2,13 @@ use gpt_image_2_gateway::{
     ImageGatewayError,
     artifacts::{FilesystemArtifactBlobStore, artifact_root_from_env},
     database::{
-        connect_pool_with_schema, database_schema_from_env, database_url_from_env,
+        connect_media_segments_pool_with_schema, database_schema_from_env, database_url_from_env,
         verify_migrations,
     },
     init_telemetry,
     media_segments::{
         CodexBboxAnalyzer, PostgresSegmentStore, SegmentWorker, analyzer_config_from_env,
+        analyzer_key, store_operation,
     },
 };
 use std::{path::PathBuf, sync::Arc, time::Duration};
@@ -30,11 +31,26 @@ async fn main() -> Result<(), ImageGatewayError> {
     )?);
     let database_url = database_url_from_env()?;
     let schema = database_schema_from_env()?;
-    let pool = connect_pool_with_schema(&database_url, 3, &schema).await?;
-    verify_migrations(&pool).await?;
+    let pool = connect_media_segments_pool_with_schema(&database_url, &schema).await?;
+    store_operation(verify_migrations(&pool)).await?;
     let store = Arc::new(PostgresSegmentStore::new(pool.clone()));
     let blobs = Arc::new(FilesystemArtifactBlobStore::new(artifact_root_from_env()?)?);
-    let worker = SegmentWorker::new(store, blobs, analyzer, &config);
+    let release_terminal_sources = match std::env::var("GATEWAY_BBOX_RELEASE_TERMINAL_SOURCES") {
+        Err(std::env::VarError::NotPresent) => false,
+        Ok(value) if value == "false" => false,
+        Ok(value) if value == "true" => true,
+        _ => {
+            return Err(ImageGatewayError::config(
+                "GATEWAY_BBOX_RELEASE_TERMINAL_SOURCES must be true or false",
+            ));
+        }
+    };
+    let worker = SegmentWorker::new(store.clone(), blobs, analyzer, &config)
+        .with_terminal_source_release(release_terminal_sources);
+    tracing::info!(
+        release_terminal_sources,
+        "Segmentation source lifecycle configured"
+    );
     let mut listener = sqlx::postgres::PgListener::connect_with(&pool)
         .await
         .map_err(|_| {
@@ -57,6 +73,13 @@ async fn main() -> Result<(), ImageGatewayError> {
     tokio::pin!(shutdown);
     // One in-flight CLI per process. PostgreSQL leases arbitrate multiple workers.
     loop {
+        if let Err(error) = store_operation(
+            store.record_worker_heartbeat(&analyzer_key(&config), release_terminal_sources),
+        )
+        .await
+        {
+            tracing::warn!(?error, "Segmentation heartbeat failed");
+        }
         if let Err(error) = worker.maintain().await {
             tracing::warn!(?error, "Segmentation maintenance failed");
         }

@@ -64,6 +64,7 @@ async fn main() -> Result<(), ImageGatewayError> {
     let provider_readiness_store = Arc::new(PostgresProviderTaskStore::new(pool.clone()));
     let provider_management_service =
         Arc::new(PostgresProviderManagementService::from_env(pool.clone()).await?);
+    let quota_refresh_worker = provider_management_service.spawn_codex_quota_refresh();
     let model_routing_store = Arc::new(PostgresModelRoutingStore::new(pool.clone()));
     let pricing_admin_service = Arc::new(PostgresPricingAdminService::new(pool.clone()));
     let project_governance_service = Arc::new(PostgresProjectGovernanceService::new(pool.clone()));
@@ -115,7 +116,11 @@ async fn main() -> Result<(), ImageGatewayError> {
             };
             Some(Arc::new(MediaSegmentsService::new(
                 Arc::new(PostgresSegmentStore::new(
-                    connect_pool_with_schema(&database_url, 3, &database_schema).await?,
+                    gpt_image_2_gateway::database::connect_media_segments_pool_with_schema(
+                        &database_url,
+                        &database_schema,
+                    )
+                    .await?,
                 )),
                 artifact_store.clone(),
                 analyzer_config_from_env()?,
@@ -211,6 +216,10 @@ async fn main() -> Result<(), ImageGatewayError> {
         .await
         .map_err(|_| ImageGatewayError::internal("HTTP server failed"))?;
 
+    if let Some(worker) = quota_refresh_worker {
+        worker.abort();
+        let _ = worker.await;
+    }
     telemetry.shutdown();
     Ok(())
 }

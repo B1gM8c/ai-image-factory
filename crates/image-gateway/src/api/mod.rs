@@ -134,7 +134,8 @@ use files::{
 use images::{edits, generations, healthz, models};
 use media_segments::{
     ASSET_UPLOAD_BODY_LIMIT, SEGMENT_REQUEST_BODY_LIMIT, capabilities as media_capabilities,
-    get_segments, register_asset as register_media_asset, request_segments,
+    get_segments, readiness as media_readiness, register_asset as register_media_asset,
+    request_segments,
 };
 use pricing::{
     apply_official_price_snapshot, create_price_book, create_price_book_version,
@@ -637,6 +638,7 @@ fn build_router_with_execution_mode(
         .route("/v1/images/generations", post(generations))
         .route("/v1/images/edits", post(edits))
         .route("/v1/media/capabilities", get(media_capabilities))
+        .route("/v1/media/readiness", get(media_readiness))
         .route(
             "/v1/media/assets",
             post(register_media_asset).layer(DefaultBodyLimit::max(ASSET_UPLOAD_BODY_LIMIT)),

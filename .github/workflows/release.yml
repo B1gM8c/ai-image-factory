@@ -95,22 +95,25 @@ jobs:
       - name: Validate release scripts and systemd topology
         run: |
           set -Eeuo pipefail
-          shellcheck \
-            scripts/package-release.sh \
-            scripts/fetch-grok-cli.sh \
-            scripts/test-gateway-runtime-gate.sh \
-            scripts/test-release-process-hooks.sh \
-            deploy/hooks/* \
-            deploy/install-release \
+          shell_scripts=(
+            scripts/package-release.sh
+            scripts/fetch-grok-cli.sh
+            scripts/test-gateway-runtime-gate.sh
+            scripts/test-release-process-hooks.sh
+            deploy/install-release
             deploy/upgrade-updater
-          bash -n \
-            scripts/package-release.sh \
-            scripts/fetch-grok-cli.sh \
-            scripts/test-gateway-runtime-gate.sh \
-            scripts/test-release-process-hooks.sh \
-            deploy/hooks/* \
-            deploy/install-release \
-            deploy/upgrade-updater
+          )
+          for hook in deploy/hooks/*; do
+            if [[ "$hook" != deploy/hooks/verify-media-segments ]]; then
+              shell_scripts+=("$hook")
+            fi
+          done
+          shellcheck "${shell_scripts[@]}"
+          for script in "${shell_scripts[@]}"; do
+            bash -n "$script"
+          done
+          python3 -c 'import ast, pathlib; ast.parse(pathlib.Path("deploy/hooks/verify-media-segments").read_text())'
+          PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-media-runtime-gate.py
 
           scripts/test-gateway-runtime-gate.sh
           scripts/test-release-process-hooks.sh
