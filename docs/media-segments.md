@@ -7,9 +7,35 @@ masks.
 
 Image generation remains unchanged. In particular,
 `POST /v1/images/generations` and `POST /v1/images/edits` keep their existing
-request and response contracts and do not wait for segmentation. A client that
-wants a sidecar registers the final image bytes after displaying the image,
-then requests analysis asynchronously.
+request and response contracts and do not wait for segmentation. A client first
+displays the final image. Only after the user explicitly clicks its analysis
+button does the client register those bytes and request analysis asynchronously.
+
+## User-triggered client lifecycle
+
+The same interface accepts newly generated and older images; registration uses
+the final bytes, not the generation date or generator identity. Integrations
+must still authorize access to the source image before submitting it.
+
+- Opening, switching or reopening an image does not register an asset, request
+  segmentation, probe the segmentation cache, or resume polling automatically.
+  Existing image/task-detail loading is independent and remains unchanged.
+- Show a clear "生成分层" action for an eligible final image. Only a click may
+  register/start analysis; prevent duplicate clicks while a request is pending.
+- Reuse a completed local cached result without a segmentation request. If only
+  the server cache remains, the next explicit click may register identical bytes
+  and request the result; the server reuses the existing asset/result within TTL.
+- Poll only a user-started `processing` result. Stop on terminal state, close or
+  image change. Reopening an unfinished image requires another explicit action
+  to resume polling; it must not silently start another model invocation.
+- Cache expiry is not permission to recompute. A subsequent explicit click is
+  required. Analysis failure never blocks the original image.
+
+For Blog, the current authorization contract addresses an authenticated user's
+task ID and result index. It covers available historical task results without a
+date restriction, but not arbitrary external URLs, public gallery images lacking
+a task mapping, or reference uploads. Source deletion/unavailability must remain
+an explicit error rather than bypassing ownership checks.
 
 ## Capabilities
 
