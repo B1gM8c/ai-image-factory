@@ -798,10 +798,12 @@ def execute(args, admin, output, diagnostics):
         directory.mkdir(parents=True, mode=0o755)
     # pathlib creates missing parents with 0777 subject to the runner umask.
     # Mirror install-release before the old updater trusts candidate binaries.
-    ROOT.chmod(0o755)
-    root_metadata = ROOT.stat()
-    require(root_metadata.st_uid == 0 and root_metadata.st_mode & 0o022 == 0,
-            'synthetic install root is not protected like a real installation')
+    for protected in (ROOT.parent, ROOT):
+        protected.chmod(0o755)
+    for protected in (Path('/'), ROOT.parent, ROOT):
+        metadata = protected.stat()
+        require(metadata.st_uid == 0 and metadata.st_mode & 0o022 == 0,
+                f'synthetic install ancestor is not protected: {protected}')
     run(['useradd', '--system', '--home-dir', str(STATE), '--shell', '/usr/sbin/nologin',
          'ai-image-factory'])
     service = pwd.getpwnam('ai-image-factory')

@@ -167,8 +167,9 @@ class NativeRecoveryEvidenceTests(unittest.TestCase):
         self.assertIn('command_snapshot', wait_source)
         self.assertIn('failure_message', snapshot_source)
         self.assertIn("write(output / 'updater-events.jsonl'", execute_source)
-        self.assertLess(execute_source.index('ROOT.chmod(0o755)'),
+        self.assertLess(execute_source.index('for protected in (ROOT.parent, ROOT)'),
                         execute_source.index('unpack(args.baseline_bundle'))
+        self.assertIn("for protected in (Path('/'), ROOT.parent, ROOT)", execute_source)
 
     def test_workflow_public_artifact_allowlist_is_unchanged(self):
         workflow = (ROOT / '.github/workflows/recovery-rehearsal.yml').read_text()
