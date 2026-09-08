@@ -63,7 +63,7 @@ def progress(message):
 
 
 def sanitized(text):
-    for value in sorted(SECRET_VALUES, key=len, reverse=True):
+    for value in sorted((value for value in SECRET_VALUES if value), key=len, reverse=True):
         text = text.replace(value, '[REDACTED]')
     return re.sub(r'postgres(?:ql)?://[^\s\"\']+', '[REDACTED-DSN]', text)
 
@@ -287,7 +287,7 @@ def authenticated_acceptance(password, account_id):
     for key, value in response_headers:
         if key.lower() == 'set-cookie':
             cookies.load(value)
-            SECRET_VALUES.extend(m.value for m in cookies.values())
+            SECRET_VALUES.extend(m.value for m in cookies.values() if m.value)
     cookie_header = {'Cookie': '; '.join(f'{k}={v.value}' for k, v in cookies.items())}
     for path in ('overview', 'provider-accounts', 'usage'):
         status, data, _ = http(3010, '/api/gateway/admin/v1/' + path, headers=cookie_header)
@@ -802,7 +802,17 @@ RESET ROLE;
     initial_probe = sql(owner_env, 'SELECT row_to_json(t) FROM public.ci_recovery_probe t ORDER BY id;')
     account_query = "SELECT json_build_array(provider_account_id,account_key,provider_id,credential_ref,credential_revision,credential_auth_sha256) FROM provider_accounts WHERE account_key='ci-account';"
     initial_account = sql(owner_env, account_query)
-    sequence_query = 'SELECT row_to_json(t) FROM public.ci_recovery_sequence t;'
+    sequence_query = """
+SELECT json_build_object(
+  'seqstart', s.seqstart, 'seqincrement', s.seqincrement,
+  'seqmax', s.seqmax, 'seqmin', s.seqmin,
+  'seqcache', s.seqcache, 'seqcycle', s.seqcycle,
+  'last_value', q.last_value, 'is_called', q.is_called)
+FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+JOIN pg_sequence s ON s.seqrelid=c.oid
+CROSS JOIN public.ci_recovery_sequence q
+WHERE n.nspname='public' AND c.relname='ci_recovery_sequence' AND c.relkind='S';
+"""
     initial_sequence = sql(owner_env, sequence_query)
     write(output / 'initial-security.json', json.dumps(initial_security, indent=2))
     check_id = enqueue(token, 'check')
