@@ -262,7 +262,7 @@ GATEWAY_BBOX_REASONING_EFFORT=none
 The independent worker additionally reads `segments.env`:
 
 ```dotenv
-GATEWAY_BBOX_CODEX_BIN=/opt/ai-image-factory/codex/0.151.0/bin/codex
+GATEWAY_BBOX_CODEX_BIN=/opt/ai-image-factory/provider-tools/codex/0.153.4/bin/codex
 GATEWAY_BBOX_CODEX_HOME=/var/lib/ai-image-factory/bbox-codex
 GATEWAY_BBOX_MODEL=gpt-5.6-luna
 GATEWAY_BBOX_REASONING_EFFORT=none
