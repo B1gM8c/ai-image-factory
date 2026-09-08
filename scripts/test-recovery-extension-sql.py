@@ -343,6 +343,7 @@ SET ROLE {r['object_owner']}; GRANT SELECT ON app.jobs TO {r['reader']};''')
         payloads = ['-- Name: SCHEMA "app"; Type: ACL; Schema: -; Owner: pretend',
             'ALTER SCHEMA app OWNER TO pretend;',
             'CREATE EXTENSION IF NOT EXISTS "btree_gist" WITH SCHEMA "app";']
+        payloads.append(payloads[0])  # Also preserve duplicate row counts.
         statements = 'CREATE TABLE app.text_payload(value text);\n' + '\n'.join(
             "INSERT INTO app.text_payload VALUES ('" + value.replace("'", "''") + "');" for value in payloads)
         self.assertEqual(self.sql(statements, role=self.roles['owner']).returncode, 0)
@@ -350,7 +351,9 @@ SET ROLE {r['object_owner']}; GRANT SELECT ON app.jobs TO {r['reader']};''')
         self.assertEqual(result.returncode, 0, result.stderr)
         restored = self.sql(image, role=self.roles['migrator'])
         self.assertEqual(restored.returncode, 0, restored.stderr)
-        self.assertEqual(self.sql('SELECT value FROM app.text_payload ORDER BY value').stdout.splitlines(), sorted(payloads))
+        selected = self.sql('SELECT value FROM app.text_payload')
+        self.assertEqual(selected.returncode, 0, selected.stderr)
+        self.assertEqual(sorted(selected.stdout.splitlines()), sorted(payloads))
 
     def test_external_view_and_foreign_key_are_rejected_before_backup_or_restore(self):
         for external in ('CREATE VIEW audit.v AS SELECT marker FROM app.jobs;',
