@@ -5,11 +5,13 @@ use gpt_image_2_gateway::provider_management::{
     ProviderRouteModelMappingRequest, UpdateProviderAccountModelConfigurationRequest,
 };
 use gpt_image_2_gateway::{
+    CODEX_EDIT_CLI_ADAPTER_REVISION, CODEX_EDIT_INLINE_ADAPTER_REVISION,
     CodexExecutionProfileProvisioning, CodexProfileProvisioningError,
     DreaminaExecutionProfileProvisioning, ExecutorExecutionProfileStore, ExecutorProfileBinding,
     GrokExecutionProfileProvisioning, PostgresExecutorSubmissionStore,
     database::{connect_test_pool_with_search_path, run_migrations},
-    identify_executor_profile_binding, provision_codex_execution_profile,
+    identify_executor_profile_binding, provision_codex_cli_edit_execution_profile,
+    provision_codex_edit_execution_profile_in_transaction, provision_codex_execution_profile,
     provision_dreamina_execution_profile, provision_dreamina_video_execution_profile,
     provision_grok_execution_profile, provision_grok_video_execution_profile,
     provision_grok_video_execution_profile_replacement,
@@ -615,6 +617,60 @@ async fn exact_enabled_provisioning_is_repeatable() -> TestResult {
         )
     }
     .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
+async fn cli_edit_provisioning_is_opt_in_and_preserves_http_and_kill_switches() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let mut provisioning = fixture("cli-edit");
+        let http_key = provisioning.profile_key.clone();
+        let mut tx = database.pool.begin().await.map_err(debug_error)?;
+        let http = provision_codex_edit_execution_profile_in_transaction(&mut tx, &provisioning)
+            .await.map_err(debug_error)?;
+        tx.commit().await.map_err(debug_error)?;
+        require(
+            provision_codex_cli_edit_execution_profile(&database.pool, &provisioning).await
+                == Err(CodexProfileProvisioningError::Conflict),
+            "CLI provisioning replaced an existing HTTP profile",
+        )?;
+        provisioning.profile_key.push_str("-opt-in");
+        sqlx::query("UPDATE provider_account_operations SET state = 'disabled' WHERE provider_account_id = $1 AND operation_id = 'images.edits'")
+            .bind(http.provider_account_id).execute(&database.pool).await.map_err(debug_error)?;
+        require(
+            provision_codex_cli_edit_execution_profile(&database.pool, &provisioning).await
+                == Err(CodexProfileProvisioningError::Conflict),
+            "CLI opt-in revived a disabled shared account operation",
+        )?;
+        let disabled: (String, i64) = sqlx::query_as("SELECT state, (SELECT COUNT(*) FROM provider_execution_profiles WHERE profile_key = $2) FROM provider_account_operations WHERE provider_account_id = $1 AND operation_id = 'images.edits'")
+            .bind(http.provider_account_id).bind(&provisioning.profile_key)
+            .fetch_one(&database.pool).await.map_err(debug_error)?;
+        require(disabled == ("disabled".to_owned(), 0), "CLI conflict did not roll back atomically")?;
+        sqlx::query("UPDATE provider_account_operations SET state = 'enabled' WHERE provider_account_id = $1 AND operation_id = 'images.edits'")
+            .bind(http.provider_account_id).execute(&database.pool).await.map_err(debug_error)?;
+        let cli = provision_codex_cli_edit_execution_profile(&database.pool, &provisioning)
+            .await.map_err(debug_error)?;
+        require(cli == provision_codex_cli_edit_execution_profile(&database.pool, &provisioning)
+            .await.map_err(debug_error)?, "CLI replay changed durable identity")?;
+        let store = PostgresExecutorSubmissionStore::new(database.pool.clone());
+        let http_loaded = store.load_execution_profile(&http_key).await.map_err(debug_error)?;
+        let cli_loaded = store.load_execution_profile(&provisioning.profile_key).await.map_err(debug_error)?;
+        require(http_loaded.execution_profile_id == http.execution_profile_id
+            && http_loaded.adapter_revision == CODEX_EDIT_INLINE_ADAPTER_REVISION
+            && cli_loaded.adapter_revision == CODEX_EDIT_CLI_ADAPTER_REVISION
+            && identify_executor_profile_binding(&cli_loaded) == Ok(ExecutorProfileBinding::CodexImageEdit),
+            "CLI opt-in changed the HTTP or edit descriptor binding")?;
+        sqlx::query("UPDATE provider_execution_profiles SET state = 'disabled' WHERE execution_profile_id = $1")
+            .bind(cli.execution_profile_id).execute(&database.pool).await.map_err(debug_error)?;
+        require(
+            provision_codex_cli_edit_execution_profile(&database.pool, &provisioning).await
+                == Err(CodexProfileProvisioningError::Conflict),
+            "CLI provisioning revived a disabled profile",
+        )
+    }.await;
     combine(result, database.cleanup().await)
 }
 

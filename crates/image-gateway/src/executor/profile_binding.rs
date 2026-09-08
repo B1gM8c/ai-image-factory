@@ -9,7 +9,8 @@ use image_provider_grok_cli::{
 use thiserror::Error;
 
 use super::{
-    CODEX_EDIT_INLINE_ADAPTER_REVISION, CODEX_GENERATION_ADAPTER_REVISION, ExecutorExecutionProfile,
+    CODEX_EDIT_CLI_ADAPTER_REVISION, CODEX_EDIT_INLINE_ADAPTER_REVISION,
+    CODEX_GENERATION_ADAPTER_REVISION, ExecutorExecutionProfile,
 };
 use crate::admission::{EDIT_COMMAND_SCHEMA, GENERATION_COMMAND_SCHEMA};
 
@@ -66,7 +67,11 @@ pub fn identify_executor_profile_binding(
                     EDIT_COMMAND_SCHEMA => (
                         EDIT_COMMAND_SCHEMA,
                         "images.edits",
-                        CODEX_EDIT_INLINE_ADAPTER_REVISION,
+                        if profile.adapter_revision == CODEX_EDIT_CLI_ADAPTER_REVISION {
+                            CODEX_EDIT_CLI_ADAPTER_REVISION
+                        } else {
+                            CODEX_EDIT_INLINE_ADAPTER_REVISION
+                        },
                         ExecutorProfileBinding::CodexImageEdit,
                     ),
                     _ => return Err(ExecutorProfileBindingError::BindingMismatch),
@@ -213,6 +218,27 @@ mod tests {
         assert_eq!(
             identify_executor_profile_binding(&codex_profile("images.edits", EDIT_COMMAND_SCHEMA)),
             Ok(ExecutorProfileBinding::CodexImageEdit)
+        );
+    }
+
+    #[test]
+    fn codex_cli_edit_requires_explicit_revision_and_edit_descriptor() {
+        let mut profile = codex_profile("images.edits", EDIT_COMMAND_SCHEMA);
+        profile.adapter_revision = CODEX_EDIT_CLI_ADAPTER_REVISION.to_owned();
+        assert_eq!(
+            identify_executor_profile_binding(&profile),
+            Ok(ExecutorProfileBinding::CodexImageEdit)
+        );
+        profile.adapter_revision = "openai-codex-edit-cli-v2".to_owned();
+        assert_eq!(
+            identify_executor_profile_binding(&profile),
+            Err(ExecutorProfileBindingError::BindingMismatch)
+        );
+        let mut generation = codex_profile("images.generations", GENERATION_COMMAND_SCHEMA);
+        generation.adapter_revision = CODEX_EDIT_CLI_ADAPTER_REVISION.to_owned();
+        assert_eq!(
+            identify_executor_profile_binding(&generation),
+            Err(ExecutorProfileBindingError::BindingMismatch)
         );
     }
 

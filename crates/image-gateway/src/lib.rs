@@ -86,9 +86,9 @@ pub use execution::{
     PersistedEditInput, PostgresExecutionContextStore,
 };
 pub use executor::{
-    CODEX_EDIT_INLINE_ADAPTER_REVISION, CODEX_GENERATION_ADAPTER_REVISION,
-    CodexExecutionProfileProvisioning, CodexOutputRequest, CodexProcessSupervisor,
-    CodexProfileProvisioningError, CodexRequestProjectionError,
+    CODEX_EDIT_CLI_ADAPTER_REVISION, CODEX_EDIT_INLINE_ADAPTER_REVISION,
+    CODEX_GENERATION_ADAPTER_REVISION, CodexExecutionProfileProvisioning, CodexOutputRequest,
+    CodexProcessSupervisor, CodexProfileProvisioningError, CodexRequestProjectionError,
     DreaminaExecutionProfileProvisioning, DreaminaProfileProvisioningError,
     DurableEvidenceRecovery, DurableRunnerResult, ExecutionProfileProvisioning,
     ExecutionProfileProvisioningError, ExecutorArtifactSink, ExecutorClaimScope,
@@ -105,6 +105,7 @@ pub use executor::{
     ProvisionedGrokExecutionProfile, RunnerLaunchAuthority, SingleOutputSupervisor,
     codex_auth_file_sha256, grok_auth_file_sha256, identify_executor_profile_binding,
     prepare_codex_auth_copy, project_codex_output_request, project_grok_execution_request,
+    provision_codex_cli_edit_execution_profile,
     provision_codex_edit_execution_profile_in_transaction, provision_codex_execution_profile,
     provision_codex_execution_profile_in_transaction, provision_dreamina_execution_profile,
     provision_dreamina_execution_profile_in_transaction,
