@@ -138,6 +138,8 @@ jobs:
             /etc/ai-image-factory/admin.env
           sudo install -m 0600 deploy/systemd/app.env.example \
             /etc/ai-image-factory/app.env
+          sudo install -m 0600 deploy/systemd/segments.env.example \
+            /etc/ai-image-factory/segments.env
           sudo install -m 0600 deploy/systemd/update-policy.env.example \
             /etc/ai-image-factory/update-policy.env
           sudo install -m 0600 deploy/systemd/updater.env.example \
@@ -151,6 +153,7 @@ jobs:
             provider-submitd \
             reconcilerd \
             reducerd \
+            segmentd \
             webhookd \
             workerd; do
             sudo install -m 0755 /usr/bin/true \
