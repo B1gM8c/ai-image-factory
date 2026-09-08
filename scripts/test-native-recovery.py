@@ -414,6 +414,7 @@ def unit_evidence(recovery_command_id='00000000-0000-0000-0000-000000000001'):
         unit = PREFIX + name
         output = run(['systemctl', 'show', unit, '-p', 'ReadWritePaths', '-p', 'ProtectSystem',
                       '-p', 'NoNewPrivileges', '-p', 'PrivateTmp', '-p', 'DropInPaths',
+                      '-p', 'BindPaths', '-p', 'BindReadOnlyPaths',
                       '-p', 'FragmentPath', '-p', 'ExecStart']).stdout
         fields = dict(line.split('=', 1) for line in output.splitlines() if '=' in line)
         require(set(fields['ReadWritePaths'].split()) == {str(ROOT), str(STATE)},
@@ -421,6 +422,8 @@ def unit_evidence(recovery_command_id='00000000-0000-0000-0000-000000000001'):
         require(fields['ProtectSystem'] == 'strict' and fields['NoNewPrivileges'] == 'yes'
                 and fields['PrivateTmp'] == 'yes' and fields['DropInPaths'] == '',
                 'effective recovery hardening/drop-ins differ from repository units')
+        require(fields['BindPaths'] == '' and fields['BindReadOnlyPaths'] == '',
+                'effective recovery unit contains an unexpected explicit bind mount')
         evidence[unit] = fields
     return evidence
 
@@ -457,7 +460,7 @@ def install_host_files(bundle, manifest, selected=None):
     return installed
 
 
-def updater_identity(expected_hash, apply_enabled):
+def updater_identity(expected_hash, apply_enabled, *, require_safe_mounts=True):
     pid = run(['systemctl', 'show', PREFIX + 'updater.service', '-p', 'MainPID', '--value']).stdout.strip()
     require(re.fullmatch('[1-9][0-9]*', pid), 'updater has no real MainPID')
     process = Path('/proc') / pid
@@ -467,8 +470,19 @@ def updater_identity(expected_hash, apply_enabled):
     environment = dict(entry.split(b'=', 1) for entry in (process / 'environ').read_bytes().split(b'\0') if b'=' in entry)
     require(environment.get(b'AIF_UPDATE_APPLY_ENABLED') == apply_enabled.encode(),
             'running updater Apply policy differs from the expected phase')
+    state_mountpoints = []
+    for line in (process / 'mountinfo').read_text().splitlines():
+        fields = line.split()
+        require(len(fields) >= 6, 'malformed updater mountinfo')
+        mountpoint = re.sub(r'\\([0-7]{3})', lambda match: chr(int(match[1], 8)), fields[4])
+        if mountpoint == str(STATE) or mountpoint.startswith(str(STATE) + '/'):
+            state_mountpoints.append(mountpoint)
+    if require_safe_mounts:
+        artifact = str(STATE / 'artifacts')
+        require(not any(path == artifact or path.startswith(artifact + '/') for path in state_mountpoints),
+                'actual updater namespace contains an artifact mountpoint that prevents safe recovery')
     return {'pid': int(pid), 'executable': str(executable), 'sha256': expected_hash,
-            'apply_enabled': apply_enabled}
+            'apply_enabled': apply_enabled, 'state_mountpoints': sorted(state_mountpoints)}
 
 
 def prepare_recovery_host_files(candidate_bundle, candidate, environment, installed):
@@ -673,7 +687,7 @@ RESET ROLE;
     run(['systemctl', 'daemon-reload'])
     run(['systemctl', 'enable', PREFIX + 'executord@ci-grok.service', PREFIX + 'workerd@ci-grok.service'])
     run(['systemctl', 'start', 'aif-native-admission.service', PREFIX + 'updater.service'])
-    baseline_updater_before = updater_identity(baseline_updater_hash, 'false')
+    baseline_updater_before = updater_identity(baseline_updater_hash, 'false', require_safe_mounts=False)
     run([LIB / 'hooks/start-processes'], env={'PATH': '/usr/sbin:/usr/bin:/sbin:/bin',
         'AIF_UPDATE_START_MODE': 'direct'}, timeout=180)
     wait_http(8787, '/readyz')

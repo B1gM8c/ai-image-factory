@@ -61,7 +61,9 @@ def validate(name, source):
         if service.get(key) != [value]:
             raise ValueError(f'{name}: changed {key} contract')
     if service.get('ReadWritePaths') != ['/opt/ai-image-factory', STATE]:
-        raise ValueError(f'{name}: require exact state parent without child bind mounts')
+        raise ValueError(f'{name}: require exact state parent write allow-list')
+    if service.get('BindPaths') or service.get('BindReadOnlyPaths'):
+        raise ValueError(f'{name}: unexpected explicit bind mounts')
     if name == 'ai-image-factory-updater-recover@.service':
         if unit.get('Conflicts') != ['ai-image-factory-updater.service']:
             raise ValueError('manual recovery must conflict with the updater daemon')
@@ -76,7 +78,7 @@ class SandboxContractTests(unittest.TestCase):
             with self.subTest(unit=name):
                 validate(name, (ROOT / 'deploy/systemd' / name).read_text())
 
-    def test_reject_missing_parent_nested_bind_and_broad_write_access(self):
+    def test_reject_missing_parent_redundant_paths_and_broad_write_access(self):
         for replacement in (
             f'ReadWritePaths={STATE}/artifacts',
             f'ReadWritePaths={STATE}\nReadWritePaths={STATE}/artifacts',
@@ -88,6 +90,13 @@ class SandboxContractTests(unittest.TestCase):
                     source = (ROOT / 'deploy/systemd' / name).read_text()
                     with self.assertRaises(ValueError):
                         validate(name, source.replace(f'ReadWritePaths={STATE}\n', replacement + '\n'))
+
+    def test_reject_explicit_bind_mounts(self):
+        for name in UNITS:
+            source = (ROOT / 'deploy/systemd' / name).read_text()
+            for key in ('BindPaths', 'BindReadOnlyPaths'):
+                with self.subTest(unit=name, directive=key), self.assertRaises(ValueError):
+                    validate(name, source.replace('[Service]\n', f'[Service]\n{key}={STATE}/artifacts\n'))
 
     def test_reject_weakened_hardening(self):
         for name in UNITS:
@@ -110,28 +119,47 @@ class SandboxContractTests(unittest.TestCase):
 
 # The same filesystem operations as recover: sibling mktemp, old-root rename,
 # staged-root rename, and cleanup. OSError is reported without hiding errno.
-PROBE = '''import errno, json, os, pathlib, shutil, sys, tempfile
+PROBE = '''import errno, json, os, pathlib, shutil, stat, sys, tempfile
 parent = pathlib.Path(sys.argv[1])
+artifacts = parent / "artifacts"
+# All fixture paths are generated below /var/lib without mountinfo escapes.
+mountinfo = []
+artifact_mounts = []
+for line in pathlib.Path("/proc/self/mountinfo").read_text().splitlines():
+    mountpoint = pathlib.Path(line.split()[4])
+    if mountpoint == parent or mountpoint in parent.parents or parent in mountpoint.parents:
+        mountinfo.append(line)
+    if mountpoint == artifacts or artifacts in mountpoint.parents:
+        artifact_mounts.append(str(mountpoint))
 status = pathlib.Path("/proc/self/status").read_text()
-assert "NoNewPrivs:\\t1" in status, "NoNewPrivileges was not applied"
+outcome = {
+    "stage": "hardening", "errno": None, "mountinfo": mountinfo,
+    "artifact_mounts": artifact_mounts, "parent_mode": stat.S_IMODE(parent.stat().st_mode),
+    "no_new_privileges": "NoNewPrivs:\\t1" in status, "readonly_errno": None,
+}
 try:
-    pathlib.Path(sys.argv[2], "must-stay-read-only").write_text("unexpected")
-except OSError as error:
-    assert error.errno == errno.EROFS, error
-else:
-    raise AssertionError("out-of-scope directory became writable")
-stage = "mktemp"
-try:
-    restored = pathlib.Path(tempfile.mkdtemp(prefix=".artifacts.restore.", dir=parent))
-    (restored / "marker").write_text("restored")
-    stage = "rename_old"
-    os.rename(parent / "artifacts", parent / ".artifacts.before-recovery")
-    stage = "rename_restored"
-    os.rename(restored, parent / "artifacts")
-    shutil.rmtree(parent / ".artifacts.before-recovery")
-    print(json.dumps({"stage": "completed", "errno": 0}))
-except OSError as error:
-    print(json.dumps({"stage": stage, "errno": error.errno}))
+    assert outcome["no_new_privileges"], "NoNewPrivileges was not applied"
+    try:
+        pathlib.Path(sys.argv[2], "must-stay-read-only").write_text("unexpected")
+    except OSError as error:
+        outcome["readonly_errno"] = error.errno
+        assert error.errno == errno.EROFS, error
+    else:
+        raise AssertionError("out-of-scope directory became writable")
+    outcome["stage"] = "mktemp"
+    try:
+        restored = pathlib.Path(tempfile.mkdtemp(prefix=".artifacts.restore.", dir=parent))
+        (restored / "marker").write_text("restored")
+        outcome["stage"] = "rename_old"
+        os.rename(artifacts, parent / ".artifacts.before-recovery")
+        outcome["stage"] = "rename_restored"
+        os.rename(restored, artifacts)
+        shutil.rmtree(parent / ".artifacts.before-recovery")
+        outcome.update(stage="completed", errno=0)
+    except OSError as error:
+        outcome["errno"] = error.errno
+finally:
+    print(json.dumps(outcome), flush=True)
 '''
 
 
@@ -147,10 +175,13 @@ def runtime():
         readonly.mkdir()
         script = root / 'probe.py'
         script.write_text(PROBE)
-        for case, expected_stage, expected_errno in (
-            ('child-only', 'mktemp', errno.EROFS),
-            ('parent-and-child', 'rename_old', errno.EBUSY),
-            ('parent-only', 'completed', 0),
+        # systemd v255 namespace.c:drop_nop folds same-mode ReadWritePaths
+        # descendants; explicit BindPaths entries are not folded.
+        for case, expected_stage, expected_errno, expected_child_mount in (
+            ('child-only', 'mktemp', errno.EROFS, True),
+            ('parent-and-child', 'completed', 0, False),
+            ('parent-only', 'completed', 0, False),
+            ('parent-and-bind-child', 'rename_old', errno.EBUSY, True),
         ):
             parent = root / case
             parent.mkdir(mode=0o750)
@@ -163,20 +194,32 @@ def runtime():
             if case == 'parent-and-child':
                 paths.append(artifacts)
             properties = dict(HARDENING, ReadOnlyPaths=str(readonly), User='root', Group='root')
+            if case == 'parent-and-bind-child':
+                properties['BindPaths'] = f'{artifacts}:{artifacts}:norbind'
             command = [runner, '--quiet', '--wait', '--pipe', '--collect',
                 '--unit=aif-recovery-sandbox-' + uuid.uuid4().hex,
                 '--property=Type=oneshot', '--property=TimeoutStartSec=30s']
             command.extend('--property=' + key + '=' + value for key, value in properties.items())
             command.append('--property=ReadWritePaths=' + ' '.join(map(str, paths)))
             result = subprocess.run(command + [sys.executable, str(script), str(parent), str(readonly)],
-                capture_output=True, text=True, check=True, timeout=45)
+                capture_output=True, text=True, timeout=45)
+            if result.returncode:
+                raise AssertionError(f'{case}: probe exited {result.returncode}; '
+                    f'stdout={result.stdout}; stderr={result.stderr}')
             outcome = json.loads(result.stdout.strip())
-            if outcome != {'stage': expected_stage, 'errno': expected_errno}:
+            print(json.dumps({'runtime': 'real-systemd', 'case': case, **outcome}), flush=True)
+            if (outcome['stage'], outcome['errno']) != (expected_stage, expected_errno):
                 raise AssertionError(f'{case}: {outcome}, expected {expected_stage}/{expected_errno}')
-            marker = 'restored' if case == 'parent-only' else 'original'
+            expected_mounts = [str(artifacts)] if expected_child_mount else []
+            if outcome['artifact_mounts'] != expected_mounts:
+                raise AssertionError(f'{case}: unexpected artifact mounts: {outcome}')
+            if not outcome['no_new_privileges'] or outcome['readonly_errno'] != errno.EROFS:
+                raise AssertionError(f'{case}: hardening was not applied: {outcome}')
+            if outcome['parent_mode'] != 0o750 or parent.stat().st_mode & 0o777 != 0o750:
+                raise AssertionError(f'{case}: state parent mode changed: {outcome}')
+            marker = 'restored' if expected_stage == 'completed' else 'original'
             if (artifacts / 'marker').read_text() != marker:
                 raise AssertionError(f'{case}: artifact marker mismatch')
-            print(json.dumps({'runtime': 'real-systemd', 'case': case, **outcome}), flush=True)
 
 
 if __name__ == '__main__':

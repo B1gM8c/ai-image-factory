@@ -385,7 +385,7 @@ done
 sudo systemctl daemon-reload
 sudo systemctl show ai-image-factory-updater.service \
   ai-image-factory-updater-recover@preflight.service ai-image-factory-recovery-gate.service \
-  --property=ExecStart,ReadWritePaths,ReadOnlyPaths,ProtectSystem,NoNewPrivileges,DropInPaths
+  --property=ExecStart,ReadWritePaths,ReadOnlyPaths,BindPaths,BindReadOnlyPaths,ProtectSystem,NoNewPrivileges,DropInPaths
 sudo /usr/libexec/ai-image-factory/hooks/verify-admin-reader
 ```
 
@@ -394,6 +394,11 @@ Inspect the effective units, including all drop-ins: no artifact-child bind or
 broad `/var/lib` write allowance may override the exact parent contract. Confirm
 the configured updater hook paths point at these installed files, then restart
 only the updater as approved and inspect its actual PID/hook configuration.
+Check the running updater's `/proc/PID/mountinfo` as well: neither the artifact
+root nor its descendants may be separate mountpoints. Redundant nested
+`ReadWritePaths` can be normalized by systemd; they are not by themselves proof
+of a child mount. Explicit `BindPaths`/`BindReadOnlyPaths` and the actual process
+mount namespace must be checked independently.
 Installing a new application bundle alone does not perform this host update.
 If installation/preflight fails, keep Apply disabled and restore the saved fixed
 files through the same maintenance procedure; do not switch the live application.
