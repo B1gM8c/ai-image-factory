@@ -58,16 +58,29 @@ jobs:
             printf '%s\n' "$actual"
           done
 
-      - name: Validate release hook syntax
+      - name: Validate release script syntax
         run: |
           set -Eeuo pipefail
+          shell_scripts=(
+            scripts/package-release.sh
+            scripts/fetch-grok-cli.sh
+            scripts/test-gateway-runtime-gate.sh
+            scripts/test-release-process-hooks.sh
+            scripts/generate-admin-identity-secrets.sh
+            deploy/install-release
+            deploy/upgrade-updater
+          )
           for hook in deploy/hooks/*; do
             case "$hook" in
               deploy/hooks/verify-media-segments|deploy/hooks/verify-admin-reader)
                 python3 -c 'import ast, pathlib, sys; ast.parse(pathlib.Path(sys.argv[1]).read_text())' "$hook"
                 ;;
-              *) shellcheck "$hook"; bash -n "$hook" ;;
+              *) shell_scripts+=("$hook") ;;
             esac
+          done
+          shellcheck "${shell_scripts[@]}"
+          for script in "${shell_scripts[@]}"; do
+            bash -n "$script"
           done
 
       - name: Test real database backup and reader permission contracts

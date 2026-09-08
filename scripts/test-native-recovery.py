@@ -42,6 +42,13 @@ UNITS = Path('/etc/systemd/system')
 TARGET = 'x86_64-unknown-linux-gnu'
 PREFIX = 'ai-image-factory-'
 SECRET_VALUES = []
+RECOVERY_HOST_FILES = {
+    'ops/hooks/' + name for name in
+    ('backup', 'recover', 'verify', 'verify-admin-reader', 'verify-gateway-runtime')
+} | {
+    'ops/systemd/' + PREFIX + name for name in
+    ('updater.service', 'updater-recover@.service', 'recovery-gate.service')
+}
 
 
 def require(condition, message):
@@ -418,13 +425,13 @@ def unit_evidence(recovery_command_id='00000000-0000-0000-0000-000000000001'):
     return evidence
 
 
-def install_candidate_host_files(bundle, manifest):
+def install_host_files(bundle, manifest, selected=None):
     installed = {}
     expected = {item['path']: item for item in manifest['files']}
     with tarfile.open(bundle) as archive:
         for member in archive.getmembers():
             name = member.name.removeprefix('./')
-            if not member.isfile():
+            if not member.isfile() or (selected is not None and name not in selected):
                 continue
             if name.startswith('ops/hooks/') and name.count('/') == 2:
                 destination = LIB / 'hooks' / Path(name).name
@@ -432,17 +439,76 @@ def install_candidate_host_files(bundle, manifest):
                 destination = UNITS / Path(name).name
             elif name == 'bin/updated':
                 destination = LIB / 'updated'
+            elif name == 'ops/upgrade-updater':
+                destination = LIB / 'upgrade-updater'
             else:
                 continue
             with archive.extractfile(member) as source, destination.open('wb') as target:
                 shutil.copyfileobj(source, target)
             destination.chmod(expected[name]['mode'])
             actual = digest(destination)
-            require(actual == expected[name]['sha256'], 'installed host file differs from candidate manifest')
+            require(actual == expected[name]['sha256'], 'installed host file differs from release manifest')
             installed[name] = {'destination': str(destination), 'sha256': actual}
-    require('ops/hooks/verify-admin-reader' in installed and 'bin/updated' in installed,
-            'candidate is missing permanent reader gate or updater')
+    if selected is not None:
+        require(set(installed) == selected, 'candidate is missing required recovery preparation files')
+    else:
+        require('bin/updated' in installed and 'ops/upgrade-updater' in installed,
+                'baseline is missing the fixed updater or its native upgrade helper')
     return installed
+
+
+def updater_identity(expected_hash, apply_enabled):
+    pid = run(['systemctl', 'show', PREFIX + 'updater.service', '-p', 'MainPID', '--value']).stdout.strip()
+    require(re.fullmatch('[1-9][0-9]*', pid), 'updater has no real MainPID')
+    process = Path('/proc') / pid
+    executable = (process / 'exe').resolve(strict=True)
+    require(executable == LIB / 'updated' and digest(process / 'exe') == expected_hash,
+            'running updater executable differs from the expected release binary')
+    environment = dict(entry.split(b'=', 1) for entry in (process / 'environ').read_bytes().split(b'\0') if b'=' in entry)
+    require(environment.get(b'AIF_UPDATE_APPLY_ENABLED') == apply_enabled.encode(),
+            'running updater Apply policy differs from the expected phase')
+    return {'pid': int(pid), 'executable': str(executable), 'sha256': expected_hash,
+            'apply_enabled': apply_enabled}
+
+
+def prepare_recovery_host_files(candidate_bundle, candidate, environment, installed):
+    # Mirror the separately authorized runbook maintenance window exactly. A
+    # fresh CI baseline has no old-format recovery to finish; production must
+    # prove the same condition rather than converting an incomplete old backup.
+    require('AIF_UPDATE_APPLY_ENABLED="false"' in (CONFIG / 'update-policy.env').read_text(),
+            'host preparation requires Apply=false')
+    run(['systemctl', 'stop', PREFIX + 'updater.service'])
+    require(run(['systemctl', 'show', PREFIX + 'updater.service', '-p', 'MainPID', '--value']).stdout.strip() == '0',
+            'updater is still running before fixed file replacement')
+    require(sql(environment, "SELECT count(*) FROM platform_update_commands WHERE status IN ('queued','running','restoring','restore_required');") == '0',
+            'pending update must be resolved before changing recovery hooks')
+    descriptors = STATE / 'updater/recovery'
+    require(not descriptors.exists() or (descriptors.is_dir() and not descriptors.is_symlink()
+            and not list(descriptors.iterdir())), 'protected recovery descriptor must be resolved first')
+    saved = STATE / 'updater/host-preparation-backup'
+    saved.mkdir(mode=0o700)
+    previous = {}
+    for name in sorted(RECOVERY_HOST_FILES):
+        if name in installed:
+            source = Path(installed[name]['destination'])
+            require(digest(source) == installed[name]['sha256'], 'baseline fixed file drift before preparation')
+            destination = saved / name
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, destination)
+            previous[name] = {'existed': True, 'sha256': digest(destination),
+                              'backup': str(destination), 'mode': source.stat().st_mode & 0o777}
+        else:
+            require(name == 'ops/hooks/verify-admin-reader' and not (LIB / 'hooks/verify-admin-reader').exists(),
+                    'unexpected missing baseline recovery file')
+            previous[name] = {'existed': False}
+    write(saved / 'manifest.json', json.dumps(previous, indent=2))
+    prepared = install_host_files(candidate_bundle, candidate, RECOVERY_HOST_FILES)
+    for name in ('bin/updated', 'ops/hooks/quiesce', 'ops/hooks/start-processes'):
+        require(digest(Path(installed[name]['destination'])) == installed[name]['sha256'],
+                'recovery preparation changed a file outside its five-hook/three-unit scope')
+    run(['systemctl', 'daemon-reload'])
+    return prepared, {'apply_disabled': True, 'updater_stopped': True,
+                      'pending_commands': 0, 'protected_descriptors': 0, 'previous': previous}
 
 
 def updater_hook_environment():
@@ -495,7 +561,7 @@ def execute(args, admin, output):
     require(baseline['target_schema_version'] < candidate['target_schema_version'],
             'requires a genuine old-schema baseline, not renamed same-build fixtures')
     require(baseline['commit_sha'] != candidate['commit_sha'], 'baseline/candidate commits must differ')
-    progress(f"Installing candidate host hooks/units and real baseline schema {baseline['target_schema_version']}")
+    progress(f"Installing original baseline host/runtime and real schema {baseline['target_schema_version']}")
     for directory in (ROOT / 'releases', STATE, CONFIG, LIB / 'hooks'):
         directory.mkdir(parents=True, mode=0o755)
     run(['useradd', '--system', '--home-dir', str(STATE), '--shell', '/usr/sbin/nologin',
@@ -507,11 +573,12 @@ def execute(args, admin, output):
         os.chown(path, service.pw_uid, service.pw_gid)
     (STATE / 'credentials').chmod(0o755)
     (STATE / 'updater').mkdir(mode=0o700)
+    (STATE / 'backups').mkdir(mode=0o700)
     unpack(args.baseline_bundle, ROOT / 'releases' / baseline['release_version'])
-    # Host wiring is installed from the already manifest-verified *candidate
-    # bundle*, never from the checkout. Candidate release staging/symlink switch
-    # itself remains exclusively native updated's responsibility.
-    installed_host_files = install_candidate_host_files(args.candidate_bundle, candidate)
+    installed_host_files = install_host_files(args.baseline_bundle, baseline)
+    baseline_host_files = dict(installed_host_files)
+    baseline_updater_hash = installed_host_files['bin/updated']['sha256']
+    candidate_updater_hash = next(item['sha256'] for item in candidate['files'] if item['path'] == 'bin/updated')
     (ROOT / 'current').symlink_to(ROOT / 'releases' / baseline['release_version'])
     suffix = uuid.uuid4().hex[:12]
     database, owner, reader, second = (f'aif_native_{suffix}{ending}' for ending in ('', '_owner', '_reader', '_other'))
@@ -585,7 +652,7 @@ RESET ROLE;
     env_file(CONFIG / 'admin.env', {'GATEWAY_BASE_URL': 'http://127.0.0.1:8787',
         'ADMIN_CONSOLE_ORIGIN': 'http://127.0.0.1:3010', 'ADMIN_CONSOLE_CLIENT_ID': 'ai-image-factory-admin-bff'})
     policy = {'AIF_UPDATE_GITHUB_REPOSITORY': 'fixture/native', 'AIF_RELEASE_TARGET': TARGET,
-              'AIF_RELEASE_METADATA_PATH': str(ROOT / 'current/release.json'), 'AIF_UPDATE_APPLY_ENABLED': 'true'}
+              'AIF_RELEASE_METADATA_PATH': str(ROOT / 'current/release.json'), 'AIF_UPDATE_APPLY_ENABLED': 'false'}
     env_file(CONFIG / 'update-policy.env', policy)
     install_fixtures(candidate, args.candidate_bundle, args.candidate_manifest, owner_env)
     fixture = STATE / 'updater/fixture'
@@ -604,19 +671,42 @@ RESET ROLE;
         updater['AIF_UPDATE_' + name.upper() + '_HOOK'] = str(LIB / 'hooks' / name)
     env_file(CONFIG / 'updater.env', updater)
     run(['systemctl', 'daemon-reload'])
-    units = unit_evidence()
-    write(output / 'systemd-effective.json', json.dumps(units, indent=2))
-    write(output / 'host-hook-provenance.json', json.dumps({'candidate_manifest_sha256': digest(args.candidate_manifest),
-        'installed': installed_host_files}, indent=2))
     run(['systemctl', 'enable', PREFIX + 'executord@ci-grok.service', PREFIX + 'workerd@ci-grok.service'])
     run(['systemctl', 'start', 'aif-native-admission.service', PREFIX + 'updater.service'])
-    runtime_hook_environment = updater_hook_environment()
+    baseline_updater_before = updater_identity(baseline_updater_hash, 'false')
     run([LIB / 'hooks/start-processes'], env={'PATH': '/usr/sbin:/usr/bin:/sbin:/bin',
         'AIF_UPDATE_START_MODE': 'direct'}, timeout=180)
     wait_http(8787, '/readyz')
     wait_http(3010, '/login')
-    token, initial_http = authenticated_acceptance(password, account_id)
+    _, original_http = authenticated_acceptance(password, account_id)
     run([LIB / 'hooks/verify'], timeout=180)
+    stable_application_pids = {name: run(['systemctl', 'show', PREFIX + name + '.service', '-p', 'MainPID', '--value']).stdout.strip()
+                               for name in ('gateway', 'admin')}
+    progress('Original baseline is serving; Apply=false, stopping old updater and preparing exactly five hooks/three units')
+    prepared, host_preparation = prepare_recovery_host_files(args.candidate_bundle, candidate, owner_env, installed_host_files)
+    installed_host_files.update(prepared)
+    units = unit_evidence()
+    require(not (UNITS / (PREFIX + 'segmentd.service')).exists(), 'segmentd is outside recovery preparation')
+    for name, pid in stable_application_pids.items():
+        require(run(['systemctl', 'show', PREFIX + name + '.service', '-p', 'MainPID', '--value']).stdout.strip() == pid,
+                'host preparation restarted the live baseline application')
+    run([LIB / 'hooks/verify'], timeout=180)
+    run(['systemctl', 'start', PREFIX + 'updater.service'])
+    baseline_updater_prepared = updater_identity(baseline_updater_hash, 'false')
+    write(output / 'systemd-effective.json', json.dumps(units, indent=2))
+    write(output / 'host-hook-provenance.json', json.dumps({'baseline_manifest_sha256': digest(args.baseline_manifest),
+        'candidate_manifest_sha256': digest(args.candidate_manifest), 'baseline_installed': baseline_host_files,
+        'installed': installed_host_files, 'host_preparation': host_preparation,
+        'baseline_updater_before': baseline_updater_before, 'baseline_updater_prepared': baseline_updater_prepared}, indent=2))
+    # Enabling Apply is a separate, explicit CI acceptance phase. Restart the
+    # old gateway so its startup-read policy matches the daemon, not a stale UI.
+    policy['AIF_UPDATE_APPLY_ENABLED'] = 'true'
+    env_file(CONFIG / 'update-policy.env', policy)
+    run(['systemctl', 'restart', PREFIX + 'updater.service', PREFIX + 'gateway.service'])
+    wait_http(8787, '/readyz')
+    baseline_updater_apply = updater_identity(baseline_updater_hash, 'true')
+    runtime_hook_environment = updater_hook_environment()
+    token, initial_http = authenticated_acceptance(password, account_id)
     reader_receipts = {'initial': run([LIB / 'hooks/verify-admin-reader']).stdout.strip()}
     require(http(8788, '/healthz')[0] == 200, 'initial real admission endpoint is not open')
     initial_security, initial_artifacts = security_snapshot(owner_env), artifact_snapshot()
@@ -670,6 +760,7 @@ RESET ROLE;
     write(output / 'restored-security.json', json.dumps(restored_security, indent=2))
     progress('Recovery catalog/data/artifact equivalence and authenticated reads passed; running positive real Apply')
     run(['systemctl', 'start', PREFIX + 'updater.service'])
+    baseline_updater_positive = updater_identity(baseline_updater_hash, 'true')
     check_id = enqueue(token, 'check')
     wait_command(owner_env, check_id, {'succeeded'})
     success_id = enqueue(token, 'apply', candidate['release_version'])
@@ -681,13 +772,43 @@ RESET ROLE;
     _, successful_http = authenticated_acceptance(password, account_id)
     require(artifact_snapshot() == initial_artifacts and http(8788, '/healthz')[0] == 200,
             'positive upgrade changed artifact content or kept admission closed')
+    # Only after the application passes does the existing supervisor-controlled
+    # helper replace the fixed updater. This is not a precondition for recovery:
+    # both Apply paths above ran the original baseline binary from /proc/PID/exe.
+    progress('Application upgrade verified with baseline updater; disabling Apply before the existing fixed-binary helper')
+    policy['AIF_UPDATE_APPLY_ENABLED'] = 'false'
+    env_file(CONFIG / 'update-policy.env', policy)
+    run(['systemctl', 'restart', PREFIX + 'gateway.service'])
+    wait_http(8787, '/readyz')
+    require(sql(owner_env, "SELECT count(*) FROM platform_update_commands WHERE status IN ('queued','running','restoring','restore_required');") == '0',
+            'fixed updater helper must not interrupt an active command')
+    application_before_helper = {name: run(['systemctl', 'show', PREFIX + name + '.service', '-p', 'MainPID', '--value']).stdout.strip()
+                                 for name in ('gateway', 'admin')}
+    helper_result = run([LIB / 'upgrade-updater', ROOT / 'current/bin/updated'],
+        env={'PATH': '/usr/sbin:/usr/bin:/sbin:/bin'}, timeout=180)
+    candidate_updater_after_helper = updater_identity(candidate_updater_hash, 'false')
+    require(digest(LIB / '.updated.previous') == baseline_updater_hash,
+            'native helper did not retain the original fixed binary')
+    for name, pid in application_before_helper.items():
+        require(run(['systemctl', 'show', PREFIX + name + '.service', '-p', 'MainPID', '--value']).stdout.strip() == pid,
+                'fixed updater helper restarted the verified application')
+    _, helper_http = authenticated_acceptance(password, account_id)
+    require(http(8788, '/healthz')[0] == 200 and artifact_snapshot() == initial_artifacts,
+            'fixed updater helper changed admission or artifact content')
+    installed_host_files['bin/updated'] = {'destination': str(LIB / 'updated'), 'sha256': candidate_updater_hash}
     journal = (STATE / 'updater/events.jsonl').read_text()
     require(failure_id in journal and success_id in journal, 'missing native updater journal identity')
     write(output / 'updater-events.jsonl', sanitized(journal))
     write(output / 'verify-runs.jsonl', (fixture / 'verify-runs.jsonl').read_text())
     write(output / 'reader-gates.json', json.dumps(reader_receipts, indent=2))
     write(output / 'systemd-effective.json', json.dumps(units, indent=2))
-    write(output / 'host-hook-provenance.json', json.dumps({'candidate_manifest_sha256': digest(args.candidate_manifest),
+    write(output / 'host-hook-provenance.json', json.dumps({'baseline_manifest_sha256': digest(args.baseline_manifest),
+        'candidate_manifest_sha256': digest(args.candidate_manifest), 'baseline_installed': baseline_host_files,
+        'host_preparation': host_preparation, 'candidate_preparation_files': sorted(RECOVERY_HOST_FILES),
+        'baseline_updater_before': baseline_updater_before, 'baseline_updater_prepared': baseline_updater_prepared,
+        'baseline_updater_apply': baseline_updater_apply, 'baseline_updater_positive': baseline_updater_positive,
+        'candidate_updater_after_helper': candidate_updater_after_helper,
+        'updater_helper_receipt': helper_result.stdout.strip(), 'previous_updater_sha256': digest(LIB / '.updated.previous'),
         'installed': installed_host_files, 'runtime_hook_environment': runtime_hook_environment,
         'fault_wrapper_delegation': {'ci-verify': str(LIB / 'hooks/verify'), 'ci-recover': str(LIB / 'hooks/recover')}}, indent=2))
     write(output / 'artifact-equivalence.json', json.dumps(initial_artifacts, indent=2))
@@ -702,10 +823,13 @@ RESET ROLE;
         'failure_command': failure_id, 'failure_state': failed_state, 'restored_state': restored_state,
         'protected_descriptor_sha256': descriptor_digest,
         'positive_command': success_id, 'positive_state': successful_state,
-        'http': {'initial': initial_http, 'restored': restored_http, 'upgraded': successful_http},
+        'http': {'original_baseline': original_http, 'prepared_baseline': initial_http,
+                 'restored': restored_http, 'upgraded': successful_http, 'after_updater_helper': helper_http},
         'boundaries': ['GitHub release transport and signature/attestation responses are explicit fixtures, not cryptographic acceptance',
                        'Real loopback admission proxy, not production nginx',
                        'Authenticated page shells and real BFF data with explicit Secure Cookie replay, not browser-rendered data/TLS policy acceptance',
+                       'Recovery preparation is exactly five hooks/three units with baseline updater retained; segmentd and segmentation host wiring are not enabled',
+                       'Candidate fixed updater is installed only after application verification through the existing native helper, with Apply disabled',
                        'Synthetic DB/roles/identity/account/artifacts only; no provider/model request'],
         'data_equivalence_scope': ['ci_recovery_probe row', 'provider account stable identity/credential fields',
                                    'ci_recovery_sequence state', 'ci_recovery_view and function read results',

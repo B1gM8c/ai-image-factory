@@ -358,8 +358,8 @@ Automatic application updates do not overwrite root-owned systemd units or
 hooks. If a release changes `ops/`, review the diff and copy those files through
 a separate privileged maintenance window before enabling application Apply.
 
-For recovery format 2, that window must install the complete reviewed fixed-hook
-set, including `verify-admin-reader`, **before** testing or enabling Apply. First
+For recovery format 2, that window must install the five fixed hooks and three
+updater/recovery units listed below, **before** testing or enabling Apply. First
 keep Apply disabled, stop the updater daemon, and prove no pending command or
 protected recovery descriptor needs an old-format backup. Keep a recoverable
 copy of the old fixed files and unit configuration. Obtain the new package by
@@ -397,6 +397,23 @@ only the updater as approved and inspect its actual PID/hook configuration.
 Installing a new application bundle alone does not perform this host update.
 If installation/preflight fails, keep Apply disabled and restore the saved fixed
 files through the same maintenance procedure; do not switch the live application.
+
+This is a recovery-safety preparation window, not feature activation. Keep the
+existing fixed `updated` binary and the other existing host hooks/units; leave
+`segmentd` disabled. The isolated native rehearsal must start from that same
+baseline host layout, apply only the five-hook/three-unit preparation, and drive
+the failed upgrade and fenced recovery with the baseline fixed updater. Record
+its actual PID/executable digest as well as the installed hook/unit digests.
+Any required fixed-updater replacement is a later step, after application
+verification, through the two-phase helper below; preinstalling a candidate
+updater is not evidence for this staged procedure.
+
+Before separately enabling segmentation, review and install its complete host
+contract from the verified feature release: `quiesce`, `start-processes`, the
+`ai-image-factory-segmentd.service` unit, and its `segments.env` configuration.
+Run the opt-in `verify-media-segments` gate as well. Ordinary `verify` success
+does not prove segmentation readiness, and the recovery-only rehearsal does not
+authorize or validate feature activation.
 
 Enable conditional daemons only when their corresponding feature is configured:
 

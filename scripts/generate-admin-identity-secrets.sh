@@ -12,7 +12,9 @@ fail() {
   exit 1
 }
 
-[ "$#" -ge 1 ] && [ "$#" -le 2 ] || usage
+if [ "$#" -lt 1 ] || [ "$#" -gt 2 ]; then
+  usage
+fi
 
 output_dir=$1
 key_id=${2:-admin-es256-v1}
