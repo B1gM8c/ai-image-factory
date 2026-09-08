@@ -32,6 +32,7 @@ readonly LEGACY_EXECUTION_UNITS=(
   ai-image-factory-workerd-codex-edits.service
 )
 readonly OPTIONAL_UNITS=(
+  ai-image-factory-segmentd.service
   ai-image-factory-provider-submitd.service
   ai-image-factory-provider-pollerd.service
   ai-image-factory-webhookd.service

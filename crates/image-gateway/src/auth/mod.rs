@@ -81,6 +81,7 @@ pub struct ApiKeyPermissions(pub BTreeMap<String, ApiKeyPermissionLevel>);
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ApiKeyCapability {
     ModelsRead,
+    ImagesRead,
     ImagesWrite,
     VideosRead,
     VideosWrite,
@@ -94,7 +95,7 @@ impl ApiKeyCapability {
     fn resource(self) -> &'static str {
         match self {
             Self::ModelsRead => "models",
-            Self::ImagesWrite => "images",
+            Self::ImagesRead | Self::ImagesWrite => "images",
             Self::VideosRead | Self::VideosWrite => "videos",
             Self::FilesRead | Self::FilesWrite => "files",
             Self::BatchesRead | Self::BatchesWrite => "batches",

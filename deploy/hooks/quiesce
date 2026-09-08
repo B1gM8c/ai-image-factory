@@ -4,6 +4,7 @@ IFS=$'\n\t'
 export PATH="${AIF_QUIESCE_COMMAND_PATH:-/usr/sbin:/usr/bin:/sbin:/bin}"
 
 PROCESS_UNITS=(
+  ai-image-factory-segmentd.service
   ai-image-factory-reconcilerd.service
   ai-image-factory-executord@default.service
   ai-image-factory-reducerd.service

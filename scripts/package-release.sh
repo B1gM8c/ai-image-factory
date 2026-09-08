@@ -328,6 +328,7 @@ readonly -a GATEWAY_BINARIES=(
   reconcilerd
   reducerd
   remote-submit-runner
+  segmentd
   webhookd
   workerd
 )

@@ -1,0 +1,59 @@
+{
+  "object": "media.segmentation",
+  "id": "seg_0123456789abcdef0123456789abcdef",
+  "asset_id": "img_0123456789abcdef0123456789abcdef",
+  "status": "completed",
+  "schema_version": "1.0",
+  "image": {
+    "width": 1024,
+    "height": 1024,
+    "coordinate_system": "pixel_xyxy"
+  },
+  "groups": [
+    {
+      "group_id": "grp_0123456789abcdef0123456789abcdef_0",
+      "parent_group_id": null,
+      "名称": "橘猫",
+      "mask_key": "group_0",
+      "类别": "主体",
+      "ui_rank": 0,
+      "bbox_xyxy": [188, 116, 828, 914],
+      "confidence": 0.98,
+      "segments": [
+        {
+          "segment_id": "segitem_0123456789abcdef0123456789abcdef_0_0",
+          "名称": "猫头",
+          "mask_key": "segment_0_0",
+          "bbox_xyxy": [284, 122, 716, 512],
+          "confidence": 0.97
+        },
+        {
+          "segment_id": "segitem_0123456789abcdef0123456789abcdef_0_1",
+          "名称": "猫身",
+          "mask_key": "segment_0_1",
+          "bbox_xyxy": [218, 438, 808, 902],
+          "confidence": 0.96
+        }
+      ]
+    },
+    {
+      "group_id": "grp_0123456789abcdef0123456789abcdef_1",
+      "parent_group_id": null,
+      "名称": "花园背景",
+      "mask_key": "group_1",
+      "类别": "背景",
+      "ui_rank": 1,
+      "bbox_xyxy": [0, 0, 1024, 1024],
+      "confidence": 0.94,
+      "segments": [
+        {
+          "segment_id": "segitem_0123456789abcdef0123456789abcdef_1_0",
+          "名称": "花丛",
+          "mask_key": "segment_1_0",
+          "bbox_xyxy": [0, 574, 1024, 1024],
+          "confidence": 0.91
+        }
+      ]
+    }
+  ]
+}

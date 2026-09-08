@@ -23,6 +23,7 @@ mod generator;
 pub mod identity;
 pub mod input_blobs;
 mod jobs;
+pub mod media_segments;
 pub mod model_routing;
 mod models;
 pub mod pricing;

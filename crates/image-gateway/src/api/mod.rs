@@ -29,6 +29,7 @@ use crate::{
     docs::{openapi_json, scalar_docs_html},
     generator::ImageGenerator,
     input_blobs::InputBlobStore,
+    media_segments::MediaSegmentsService,
     model_routing::{ModelRoutingStore, ResolvedModelRoute},
     pricing::PricingAdminService,
     project_governance::ProjectGovernanceService,
@@ -62,6 +63,7 @@ mod dreamina;
 mod edit_input;
 mod files;
 mod images;
+mod media_segments;
 mod middleware;
 mod pricing;
 mod project_governance;
@@ -130,6 +132,10 @@ use files::{
     get_console_file_content, get_file, get_file_content, list_console_files, list_files,
 };
 use images::{edits, generations, healthz, models};
+use media_segments::{
+    ASSET_UPLOAD_BODY_LIMIT, SEGMENT_REQUEST_BODY_LIMIT, capabilities as media_capabilities,
+    get_segments, register_asset as register_media_asset, request_segments,
+};
 use pricing::{
     apply_official_price_snapshot, create_price_book, create_price_book_version,
     create_price_rollback_draft, list_official_price_catalogs, list_price_books,
@@ -191,6 +197,7 @@ pub(super) struct AppState {
     pub(super) provider_management_service: Option<Arc<dyn ProviderManagementService>>,
     pub(super) provider_upload_service: Option<Arc<ProviderUploadService>>,
     pub(super) model_routing_store: Option<Arc<dyn ModelRoutingStore>>,
+    pub(super) media_segments_service: Option<Arc<MediaSegmentsService>>,
     pub(super) pricing_admin_service: Option<Arc<dyn PricingAdminService>>,
     pub(super) billing_account_control_service: Option<Arc<dyn BillingAccountControlService>>,
     pub(super) billing_integrity_service: Option<Arc<dyn BillingIntegrityService>>,
@@ -216,6 +223,7 @@ pub struct ExternalControlPlaneServices {
     pub provider_upload_service: Option<Arc<ProviderUploadService>>,
     pub provider_account_runtime_event_hub: Option<Arc<ProviderAccountRuntimeEventHub>>,
     pub model_routing_store: Option<Arc<dyn ModelRoutingStore>>,
+    pub media_segments_service: Option<Arc<MediaSegmentsService>>,
     pub pricing_admin_service: Option<Arc<dyn PricingAdminService>>,
     pub billing_account_control_service: Option<Arc<dyn BillingAccountControlService>>,
     pub billing_integrity_service: Option<Arc<dyn BillingIntegrityService>>,
@@ -459,6 +467,7 @@ pub fn build_router_with_external_execution_and_control_plane_and_runtime_events
             provider_upload_service: None,
             provider_account_runtime_event_hub,
             model_routing_store,
+            media_segments_service: None,
             pricing_admin_service: None,
             billing_account_control_service: None,
             billing_integrity_service: None,
@@ -560,6 +569,7 @@ fn build_router_with_execution_mode(
         provider_upload_service,
         provider_account_runtime_event_hub,
         model_routing_store,
+        media_segments_service,
         pricing_admin_service,
         billing_account_control_service,
         billing_integrity_service,
@@ -594,6 +604,7 @@ fn build_router_with_execution_mode(
         provider_management_service,
         provider_upload_service,
         model_routing_store,
+        media_segments_service,
         pricing_admin_service,
         billing_account_control_service,
         billing_integrity_service,
@@ -625,6 +636,16 @@ fn build_router_with_execution_mode(
         .route("/v1/models", get(models))
         .route("/v1/images/generations", post(generations))
         .route("/v1/images/edits", post(edits))
+        .route("/v1/media/capabilities", get(media_capabilities))
+        .route(
+            "/v1/media/assets",
+            post(register_media_asset).layer(DefaultBodyLimit::max(ASSET_UPLOAD_BODY_LIMIT)),
+        )
+        .route(
+            "/v1/media/segments",
+            post(request_segments).layer(DefaultBodyLimit::max(SEGMENT_REQUEST_BODY_LIMIT)),
+        )
+        .route("/v1/media/segments/{id}", get(get_segments))
         .route(
             "/v1/files",
             get(list_files)

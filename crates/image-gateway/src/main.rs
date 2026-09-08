@@ -108,6 +108,26 @@ async fn main() -> Result<(), ImageGatewayError> {
     ));
     let system_update_service = Arc::new(PostgresSystemUpdateService::from_env(pool.clone())?);
     let request_observation_sink = RequestObservationSink::from_env(pool.clone())?;
+    let media_segments_service = match std::env::var("GATEWAY_BBOX_ENABLED").as_deref() {
+        Ok("true" | "1") => {
+            use gpt_image_2_gateway::media_segments::{
+                MediaSegmentsService, PostgresSegmentStore, analyzer_config_from_env,
+            };
+            Some(Arc::new(MediaSegmentsService::new(
+                Arc::new(PostgresSegmentStore::new(
+                    connect_pool_with_schema(&database_url, 3, &database_schema).await?,
+                )),
+                artifact_store.clone(),
+                analyzer_config_from_env()?,
+            )))
+        }
+        Err(std::env::VarError::NotPresent) | Ok("false" | "0") => None,
+        _ => {
+            return Err(ImageGatewayError::config(
+                "GATEWAY_BBOX_ENABLED must be true or false",
+            ));
+        }
+    };
     let project_spend_budget_evaluator = project_spend_budget_service.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
@@ -157,6 +177,7 @@ async fn main() -> Result<(), ImageGatewayError> {
             provider_readiness_store,
         },
         ExternalControlPlaneServices {
+            media_segments_service,
             identity_service,
             admin_read_store: Some(admin_read_store),
             provider_management_service: Some(provider_management_service),

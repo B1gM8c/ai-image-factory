@@ -37,6 +37,7 @@ readonly REQUIRED_SUFFIX_UNITS=(
   ai-image-factory-reducerd.service
 )
 readonly OPTIONAL_UNITS=(
+  ai-image-factory-segmentd.service
   ai-image-factory-provider-submitd.service
   ai-image-factory-provider-pollerd.service
   ai-image-factory-webhookd.service
