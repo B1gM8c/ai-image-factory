@@ -16,6 +16,9 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  recovery-rehearsal:
+    uses: ./.github/workflows/recovery-rehearsal.yml
+
   quality:
     name: Release gates
     runs-on: ubuntu-24.04
@@ -104,9 +107,12 @@ jobs:
             deploy/upgrade-updater
           )
           for hook in deploy/hooks/*; do
-            if [[ "$hook" != deploy/hooks/verify-media-segments ]]; then
-              shell_scripts+=("$hook")
-            fi
+            case "$hook" in
+              deploy/hooks/verify-media-segments|deploy/hooks/verify-admin-reader)
+                python3 -c 'import ast, pathlib, sys; ast.parse(pathlib.Path(sys.argv[1]).read_text())' "$hook"
+                ;;
+              *) shell_scripts+=("$hook") ;;
+            esac
           done
           shellcheck "${shell_scripts[@]}"
           for script in "${shell_scripts[@]}"; do
@@ -114,6 +120,7 @@ jobs:
           done
           python3 -c 'import ast, pathlib; ast.parse(pathlib.Path("deploy/hooks/verify-media-segments").read_text())'
           PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-media-runtime-gate.py
+          PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-recovery-systemd-sandbox.py
 
           scripts/test-gateway-runtime-gate.sh
           scripts/test-release-process-hooks.sh
@@ -218,7 +225,7 @@ jobs:
 
   build-linux:
     name: Build ${{ matrix.target }}
-    needs: quality
+    needs: [quality, recovery-rehearsal]
     strategy:
       fail-fast: false
       matrix:

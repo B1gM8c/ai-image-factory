@@ -17,6 +17,9 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  recovery-rehearsal:
+    uses: ./.github/workflows/recovery-rehearsal.yml
+
   rust:
     name: Rust workspace / PostgreSQL ${{ matrix.postgres }}
     runs-on: ubuntu-24.04

@@ -358,6 +358,68 @@ Automatic application updates do not overwrite root-owned systemd units or
 hooks. If a release changes `ops/`, review the diff and copy those files through
 a separate privileged maintenance window before enabling application Apply.
 
+For recovery format 2, that window must install the five fixed hooks and three
+updater/recovery units listed below, **before** testing or enabling Apply. First
+keep Apply disabled, stop the updater daemon, and prove no pending command or
+protected recovery descriptor needs an old-format backup. Keep a recoverable
+copy of the old fixed files and unit configuration. Obtain the new package by
+the signed-tag, immutable-release, asset and attestation checks above, validate
+every manifest file, and use that verified extracted tree as the source. Never
+copy privileged hooks from an unverified checkout or modify an old signed tree.
+
+Inside that separately approved window (replace the example version):
+
+```bash
+AIF_VERIFIED_OPS=/opt/ai-image-factory/bootstrap/NEW_SIGNED_VERSION/verified/ops
+for hook in backup recover verify verify-admin-reader verify-gateway-runtime; do
+  sudo install -o root -g root -m 0755 "$AIF_VERIFIED_OPS/hooks/$hook" \
+    "/usr/libexec/ai-image-factory/hooks/$hook"
+  sudo sha256sum "$AIF_VERIFIED_OPS/hooks/$hook" \
+    "/usr/libexec/ai-image-factory/hooks/$hook"
+done
+for unit in ai-image-factory-updater.service \
+  ai-image-factory-updater-recover@.service ai-image-factory-recovery-gate.service; do
+  sudo install -o root -g root -m 0644 "$AIF_VERIFIED_OPS/systemd/$unit" \
+    "/etc/systemd/system/$unit"
+done
+sudo systemctl daemon-reload
+sudo systemctl show ai-image-factory-updater.service \
+  ai-image-factory-updater-recover@preflight.service ai-image-factory-recovery-gate.service \
+  --property=ExecStart,ReadWritePaths,ReadOnlyPaths,BindPaths,BindReadOnlyPaths,ProtectSystem,NoNewPrivileges,DropInPaths
+sudo /usr/libexec/ai-image-factory/hooks/verify-admin-reader
+```
+
+Every source/destination hook digest must equal its new signed manifest entry.
+Inspect the effective units, including all drop-ins: no artifact-child bind or
+broad `/var/lib` write allowance may override the exact parent contract. Confirm
+the configured updater hook paths point at these installed files, then restart
+only the updater as approved and inspect its actual PID/hook configuration.
+Check the running updater's `/proc/PID/mountinfo` as well: neither the artifact
+root nor its descendants may be separate mountpoints. Redundant nested
+`ReadWritePaths` can be normalized by systemd; they are not by themselves proof
+of a child mount. Explicit `BindPaths`/`BindReadOnlyPaths` and the actual process
+mount namespace must be checked independently.
+Installing a new application bundle alone does not perform this host update.
+If installation/preflight fails, keep Apply disabled and restore the saved fixed
+files through the same maintenance procedure; do not switch the live application.
+
+This is a recovery-safety preparation window, not feature activation. Keep the
+existing fixed `updated` binary and the other existing host hooks/units; leave
+`segmentd` disabled. The isolated native rehearsal must start from that same
+baseline host layout, apply only the five-hook/three-unit preparation, and drive
+the failed upgrade and fenced recovery with the baseline fixed updater. Record
+its actual PID/executable digest as well as the installed hook/unit digests.
+Any required fixed-updater replacement is a later step, after application
+verification, through the two-phase helper below; preinstalling a candidate
+updater is not evidence for this staged procedure.
+
+Before separately enabling segmentation, review and install its complete host
+contract from the verified feature release: `quiesce`, `start-processes`, the
+`ai-image-factory-segmentd.service` unit, and its `segments.env` configuration.
+Run the opt-in `verify-media-segments` gate as well. Ordinary `verify` success
+does not prove segmentation readiness, and the recovery-only rehearsal does not
+authorize or validate feature activation.
+
 Enable conditional daemons only when their corresponding feature is configured:
 
 ```bash
@@ -386,6 +448,8 @@ The fixed hooks and site admission hooks:
 - create one PostgreSQL plus artifact recovery point;
 - activate the complete new process set;
 - check required services, Gateway health/readiness/OpenAPI, and the admin login;
+- verify the live Gateway's dedicated admin database login can read the account,
+  jobs and usage tables and cannot write, even with transaction read-only off;
 - sample MainPID, `NRestarts`, and immutable release ownership twice across the
   stability window before admission can reopen;
 - restore both PostgreSQL and artifacts after a post-migration failure.
@@ -393,7 +457,33 @@ The fixed hooks and site admission hooks:
 Database recovery uses a plain, clean SQL recovery image through
 `psql --single-transaction`, so a failed restore cannot commit a partial
 schema. The restored update command and its recovery lease are reasserted in
-that same transaction. A PostgreSQL transaction advisory lock serializes every
+that same transaction. Recovery format 2 retains native object owners, ACLs and
+owner-scoped schema default privileges; `btree_gist` is recreated with its saved
+schema, version and owner before dependent constraints. A catalog comparison
+inside the restore transaction rejects security or extension identity drift.
+The migration login must be able to restore the saved owners. Other extensions
+inside the application schema and cross-schema extension layouts are not
+supported by this schema-scoped recovery contract; preflight refuses them.
+The dependency check also refuses external-schema objects that `DROP SCHEMA
+CASCADE` could remove, and runs again before the recovery transaction's drop.
+Delegated ACL grantors that the migrator cannot restore with native session
+authorization, and modified extension-member ACLs that cannot be replayed, are
+rejected at backup preflight rather than silently discarded.
+Global (not schema-scoped) default privileges are also refused at backup
+preflight, and their introduction during migration prevents recovery from
+committing. Such a migration needs a separately designed global-ACL recovery
+contract; this hook never silently changes privileges in other schemas.
+Role attributes, passwords and memberships are not schema objects and must not
+be changed by these migrations.
+
+Legacy backups created with `--no-owner --no-privileges` lack the information
+needed for equivalent recovery. The new hook refuses them before stopping
+processes or executing destructive SQL. Do not rewrite their checksums or
+pretend missing ACLs can be inferred. Resolve any outstanding old-format
+recovery before replacing fixed host hooks; retain the old signed artifacts
+and require a separate operator-approved recovery plan where necessary.
+
+A PostgreSQL transaction advisory lock serializes every
 check, apply, startup recovery, and operator recovery across updater hosts; the
 transaction is rolled back on cancellation so a lock cannot return to the pool.
 Both the advisory-lock probe and command-lease heartbeat have a ten-second
@@ -408,6 +498,17 @@ updater sequence is not a supported production release path.
 Artifact recovery extracts into
 a sibling temporary directory, verifies the archive and recovery digests, fsyncs
 the restored tree, and then switches directories with same-filesystem renames.
+The updater and both recovery units permit writes to the exact
+`/var/lib/ai-image-factory` parent under `ProtectSystem=strict`; separately binding
+its artifact child blocks atomic renames with `EBUSY`, while binding only the
+child makes sibling creation fail with `EROFS`. Existing parent permissions
+must remain unchanged.
+
+Both validation and full-process verification run the database reader gate
+before and after the stability window. Validation scope does not require an
+executor that has intentionally not started yet. Full scope still verifies
+enabled executors and their immutable Grok binary binding. Passing the reader
+gate supplements, but does not replace, authenticated admin API/page acceptance.
 
 Before closing admission, the updater atomically writes a mode-0600 recovery
 descriptor under `/var/lib/ai-image-factory/updater/recovery`. After a recovery

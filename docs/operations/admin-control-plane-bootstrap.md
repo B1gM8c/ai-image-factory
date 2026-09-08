@@ -58,14 +58,27 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA public
 The admin adapter also sets `default_transaction_read_only=on`, but that client setting is defense
 in depth; PostgreSQL grants remain the authority.
 
-Verify both sides of the boundary before release:
+After starting the Gateway, verify both sides using its actual dedicated reader
+connection, not `SET ROLE` on a privileged connection:
 
-```sql
-SET ROLE aif_admin_reader;
-SELECT count(*) FROM jobs;
-INSERT INTO jobs DEFAULT VALUES; -- must fail with insufficient_privilege
-RESET ROLE;
+```bash
+sudo /usr/libexec/ai-image-factory/hooks/verify-admin-reader
 ```
+
+The hook obtains only the reader URL and schema from the verified live Gateway
+PID. It performs bounded real reads, requires a distinct unprivileged login,
+checks schema/table privileges, and requires SQLSTATE `42501` for a non-executing
+`EXPLAIN UPDATE` inside `BEGIN READ WRITE`. A session-level read-only error
+(`25006`) is not proof of database write denial. Passwords are passed only in the
+child's private connection environment, never in argv or diagnostics.
+
+The release gate requires a dedicated login without any `SET ROLE` membership.
+Use an explicit TCP `postgresql://user:password@host:port/database` URL, with
+percent-encoded credentials. Its supported query options are `sslmode`,
+`sslrootcert`, `sslcert`, `sslkey`, `sslcrl` and `options`; unknown or duplicate
+options fail closed. SQLx-specific options, aliases and Unix-socket URLs are not
+part of this gate's connection contract. Run this preflight before scheduling
+an upgrade rather than discovering a configuration incompatibility during it.
 
 ## 4. Configure Axum Identity
 

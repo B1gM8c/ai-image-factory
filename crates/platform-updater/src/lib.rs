@@ -317,18 +317,13 @@ impl Updater {
 
     pub async fn run(self) -> Result<(), UpdaterError> {
         tokio::fs::create_dir_all(&self.config.journal_root).await?;
-        let mut poll = interval(self.config.poll_interval);
-        poll.set_missed_tick_behavior(MissedTickBehavior::Skip);
-        loop {
-            tokio::select! {
-                _ = poll.tick() => {
-                    if let Err(error) = self.run_once().await {
-                        tracing::error!(?error, "system update pass failed");
-                    }
-                }
-                _ = shutdown_signal() => return Ok(()),
+        poll_until_shutdown(self.config.poll_interval, shutdown_signal(), || async {
+            if let Err(error) = self.run_once().await {
+                tracing::error!(?error, "system update pass failed");
             }
-        }
+        })
+        .await;
+        Ok(())
     }
 
     pub async fn run_once(&self) -> Result<bool, UpdaterError> {
@@ -3890,6 +3885,24 @@ fn required_hook(path: &Option<PathBuf>, name: &str) -> Result<PathBuf, UpdaterE
     })
 }
 
+async fn poll_until_shutdown<S, W, F>(poll_interval: Duration, shutdown: S, mut work: W)
+where
+    S: Future<Output = ()>,
+    W: FnMut() -> F,
+    F: Future<Output = ()>,
+{
+    let mut poll = interval(poll_interval);
+    poll.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    tokio::pin!(shutdown);
+    loop {
+        tokio::select! {
+            biased;
+            _ = &mut shutdown => return,
+            _ = poll.tick() => work().await,
+        }
+    }
+}
+
 fn duration_env(name: &str, default: Duration) -> Result<Duration, UpdaterError> {
     let Some(value) = optional_env(name) else {
         return Ok(default);
@@ -3955,6 +3968,57 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn shutdown_during_update_pass_is_observed_after_the_pass() {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let passes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let shutdown_polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let completed_passes = Arc::clone(&passes);
+        let observed_shutdown_polls = Arc::clone(&shutdown_polls);
+        let mut started_tx = Some(started_tx);
+        let mut release_rx = Some(release_rx);
+        let mut shutdown_rx = shutdown_rx;
+        let task = tokio::spawn(poll_until_shutdown(
+            Duration::from_millis(1),
+            std::future::poll_fn(move |context| {
+                observed_shutdown_polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                std::pin::Pin::new(&mut shutdown_rx)
+                    .poll(context)
+                    .map(|_| ())
+            }),
+            move || {
+                let started_tx = started_tx.take();
+                let release_rx = release_rx.take();
+                let completed_passes = Arc::clone(&completed_passes);
+                async move {
+                    started_tx.expect("one update pass").send(()).ok();
+                    release_rx.expect("one update pass").await.ok();
+                    completed_passes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            },
+        ));
+
+        started_rx.await.expect("update pass started");
+        assert!(
+            shutdown_polls.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "shutdown listener must be polled before the first pass"
+        );
+        shutdown_tx.send(()).expect("shutdown receiver alive");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(
+            !task.is_finished(),
+            "shutdown must not abort an active pass"
+        );
+        release_tx.send(()).expect("update pass still running");
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("updater observed queued shutdown")
+            .expect("poll loop task completed");
+        assert_eq!(passes.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
 
     #[test]
     fn verify_context_is_explicitly_allowlisted() {

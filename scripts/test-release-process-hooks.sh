@@ -4,14 +4,28 @@ IFS=$'\n\t'
 
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
 readonly REPO_ROOT
-readonly VERIFY="${REPO_ROOT}/deploy/hooks/verify"
 readonly QUIESCE="${REPO_ROOT}/deploy/hooks/quiesce"
 readonly START_PROCESSES="${REPO_ROOT}/deploy/hooks/start-processes"
 TEST_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/aif-release-hooks.XXXXXXXX")"
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
+readonly VERIFY="$TEST_ROOT/hooks/verify"
 
-mkdir -p "$TEST_ROOT/bin"
+mkdir -p "$TEST_ROOT/bin" "$TEST_ROOT/hooks"
+cp "$REPO_ROOT/deploy/hooks/verify" "$VERIFY"
 : >"$TEST_ROOT/phase"
+
+# Process orchestration fixtures only. The sibling gate has no runtime bypass;
+# real reader login/SQL/42501 evidence lives in test-admin-reader-gate.py.
+cat >"$TEST_ROOT/hooks/verify-admin-reader" <<'EOF'
+#!/bin/bash
+printf '%s\n' "${AIF_UPDATE_PROCESS_SCOPE:-full}" >>"$MOCK_READER_LOG"
+[[ "${MOCK_READER_FAILED:-false}" != true ]] || exit 1
+if [[ "${MOCK_READER_UNSTABLE:-false}" == true \
+  && "$(cat "$MOCK_PHASE_FILE")" == stable-window ]]; then
+  exit 1
+fi
+EOF
+chmod 0755 "$VERIFY" "$TEST_ROOT/hooks/verify-admin-reader"
 
 cat >"$TEST_ROOT/bin/systemctl" <<'EOF'
 #!/bin/bash
@@ -138,6 +152,7 @@ run_verify() {
     AIF_VERIFY_STABILITY_SECONDS=12 \
     MOCK_PHASE_FILE="$TEST_ROOT/phase" \
     MOCK_GATE_LOG="$TEST_ROOT/gate.log" \
+    MOCK_READER_LOG="$TEST_ROOT/reader.log" \
     MOCK_START_LOG="$TEST_ROOT/start.log" \
     MOCK_STOP_LOG="$TEST_ROOT/stop.log" \
     "$@" \
@@ -166,14 +181,30 @@ run_start_processes() {
 }
 
 : >"$TEST_ROOT/gate.log"
+: >"$TEST_ROOT/reader.log"
 run_verify >/dev/null
 [[ "$(wc -l <"$TEST_ROOT/gate.log" | tr -d ' ')" == 2 ]]
+[[ "$(wc -l <"$TEST_ROOT/reader.log" | tr -d ' ')" == 2 ]]
 grep -Fq 'ai-image-factory-gateway.service' "$TEST_ROOT/gate.log"
 if grep -Fq 'ai-image-factory-executord@default.service' "$TEST_ROOT/gate.log" \
   || grep -Fq 'ai-image-factory-workerd.service' "$TEST_ROOT/gate.log"; then
   echo "disabled legacy execution units must not be required" >&2
   exit 1
 fi
+
+for scope in validation full; do
+  : >"$TEST_ROOT/reader.log"
+  run_verify AIF_UPDATE_PROCESS_SCOPE="$scope" >/dev/null
+  [[ "$(wc -l <"$TEST_ROOT/reader.log" | tr -d ' ')" == 2 ]]
+  if run_verify AIF_UPDATE_PROCESS_SCOPE="$scope" MOCK_READER_FAILED=true >/dev/null 2>&1; then
+    echo "expected ${scope} scope to fail when reader verification fails" >&2
+    exit 1
+  fi
+  if run_verify AIF_UPDATE_PROCESS_SCOPE="$scope" MOCK_READER_UNSTABLE=true >/dev/null 2>&1; then
+    echo "expected ${scope} scope to fail when reader verification fails after stability window" >&2
+    exit 1
+  fi
+done
 
 : >"$TEST_ROOT/gate.log"
 run_verify MOCK_MANAGED_UNITS=true >/dev/null
