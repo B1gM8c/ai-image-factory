@@ -11,6 +11,7 @@ mod grok_login;
 mod grok_video_output;
 mod model_catalog;
 mod postgres;
+mod quota_refresh;
 mod route_reconciliation;
 
 pub use model_catalog::{
@@ -18,6 +19,7 @@ pub use model_catalog::{
     ProviderModelView, ProviderModelsSnapshot,
 };
 pub use postgres::PostgresProviderManagementService;
+pub use quota_refresh::CodexQuotaRefreshRuntimeView;
 pub use route_reconciliation::{
     ExecutionProfileRouteReconciliationReport, reconcile_execution_profile_routes,
 };
@@ -328,6 +330,10 @@ pub struct ApiKeyRouteBindingView {
 
 #[async_trait]
 pub trait ProviderManagementService: Send + Sync + 'static {
+    fn codex_quota_refresh_runtime(&self) -> Option<CodexQuotaRefreshRuntimeView> {
+        None
+    }
+
     async fn managed_cli_providers(&self)
     -> Result<ManagedCliProvidersSnapshot, ImageGatewayError>;
 

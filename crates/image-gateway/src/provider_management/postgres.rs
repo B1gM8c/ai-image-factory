@@ -61,6 +61,7 @@ use super::{
     grok_billing::{GrokQuotaSnapshot, observe_grok_quota},
     grok_login::{GrokLoginProcess, copy_proxy_environment, refresh_grok_auth},
     model_catalog::{self, ProviderModelExecutables},
+    quota_refresh::{QuotaRefreshConfig, QuotaRefreshRuntime},
     reconcile_execution_profile_routes,
 };
 
@@ -78,41 +79,12 @@ const DEFAULT_CREDENTIAL_REFRESH_SKEW_MS: i64 = 15 * 60 * 1_000;
 const GROK_CREDENTIAL_REFRESH_SKEW_MS: i64 = 30 * 60 * 1_000;
 const AUTH_REJECTION_REFRESH_WAIT: Duration = Duration::from_secs(90);
 const AUTH_REJECTION_REFRESH_POLL: Duration = Duration::from_millis(50);
-static CODEX_QUOTA_REFRESHES: LazyLock<Mutex<HashSet<Uuid>>> =
-    LazyLock::new(|| Mutex::new(HashSet::new()));
 static GROK_QUOTA_REFRESHES: LazyLock<Mutex<HashSet<Uuid>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
 static DREAMINA_QUOTA_REFRESHES: LazyLock<Mutex<HashSet<Uuid>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
 static GROK_VIDEO_OUTPUT_UPDATES: LazyLock<Mutex<HashSet<Uuid>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
-
-#[derive(Debug)]
-struct CodexQuotaRefreshGuard(Uuid);
-
-impl CodexQuotaRefreshGuard {
-    fn acquire(provider_account_id: Uuid) -> Result<Self, ImageGatewayError> {
-        let mut in_flight = CODEX_QUOTA_REFRESHES
-            .lock()
-            .map_err(|_| ImageGatewayError::service_unavailable("Quota refresh is unavailable"))?;
-        if !in_flight.insert(provider_account_id) {
-            return Err(ImageGatewayError::conflict(
-                "A Codex quota refresh is already in progress",
-                Some("provider_account_id".to_owned()),
-                "quota_refresh_in_progress",
-            ));
-        }
-        Ok(Self(provider_account_id))
-    }
-}
-
-impl Drop for CodexQuotaRefreshGuard {
-    fn drop(&mut self) {
-        if let Ok(mut in_flight) = CODEX_QUOTA_REFRESHES.lock() {
-            in_flight.remove(&self.0);
-        }
-    }
-}
 
 struct GrokQuotaRefreshGuard(Uuid);
 
@@ -194,7 +166,8 @@ impl Drop for DreaminaQuotaRefreshGuard {
 
 #[derive(Clone)]
 pub struct PostgresProviderManagementService {
-    pool: PgPool,
+    pub(super) pool: PgPool,
+    pub(super) quota_refresh: Arc<QuotaRefreshRuntime>,
     credential_store: PostgresCredentialStore,
     homes_root: Arc<PathBuf>,
     codex_executable: Arc<PathBuf>,
@@ -373,6 +346,7 @@ async fn remove_dreamina_login_home(home: &Path) {
 impl PostgresProviderManagementService {
     pub fn new(pool: PgPool, homes_root: PathBuf, codex_executable: PathBuf) -> Self {
         Self {
+            quota_refresh: Arc::new(QuotaRefreshRuntime::new(QuotaRefreshConfig::default())),
             credential_store: PostgresCredentialStore::new(pool.clone()),
             pool,
             homes_root: Arc::new(homes_root),
@@ -414,6 +388,7 @@ impl PostgresProviderManagementService {
             "dreamina",
         )?;
         let service = Self {
+            quota_refresh: Arc::new(QuotaRefreshRuntime::new(QuotaRefreshConfig::from_env()?)),
             credential_store: PostgresCredentialStore::new(pool.clone()),
             pool,
             homes_root: Arc::new(root),
@@ -1381,6 +1356,44 @@ impl PostgresProviderManagementService {
             })?;
         server.shutdown().await;
         Ok((account, quota))
+    }
+
+    pub(super) async fn observe_codex_account_quota(
+        &self,
+        provider_account_id: Uuid,
+    ) -> Result<(CodexAccountSnapshot, CodexQuotaSnapshot), ImageGatewayError> {
+        self.refresh_operational_credential(provider_account_id, false)
+            .await?;
+        let mut credential = self
+            .credential_store
+            .resolve(provider_account_id)
+            .await
+            .map_err(map_credential_store_error)?;
+        if credential.provider_id != openai_codex::PROVIDER_ID {
+            return Err(ImageGatewayError::not_found(
+                "Managed Codex account not found",
+                Some("provider_account_id".to_owned()),
+                "provider_account_not_found",
+            ));
+        }
+        match self
+            .observe_quota(credential.home(), &credential.material_fingerprint_sha256)
+            .await
+        {
+            Ok(observation) => Ok(observation),
+            Err(_) => {
+                self.refresh_operational_credential(provider_account_id, true)
+                    .await?;
+                credential = self
+                    .credential_store
+                    .resolve(provider_account_id)
+                    .await
+                    .map_err(map_credential_store_error)?;
+                tokio::time::sleep(CODEX_QUOTA_RETRY_DELAY).await;
+                self.observe_quota(credential.home(), &credential.material_fingerprint_sha256)
+                    .await
+            }
+        }
     }
 
     async fn refresh_grok_quota(&self, provider_account_id: Uuid) -> Result<(), ImageGatewayError> {
@@ -2448,6 +2461,9 @@ impl OperationalCredentialRefresher for PostgresProviderManagementService {
 
 #[async_trait]
 impl ProviderManagementService for PostgresProviderManagementService {
+    fn codex_quota_refresh_runtime(&self) -> Option<super::CodexQuotaRefreshRuntimeView> {
+        Some(self.quota_refresh.snapshot())
+    }
     async fn managed_cli_providers(
         &self,
     ) -> Result<ManagedCliProvidersSnapshot, ImageGatewayError> {
@@ -2889,86 +2905,8 @@ impl ProviderManagementService for PostgresProviderManagementService {
         &self,
         provider_account_id: Uuid,
     ) -> Result<(), ImageGatewayError> {
-        let _refresh_guard = CodexQuotaRefreshGuard::acquire(provider_account_id)?;
-        self.refresh_operational_credential(provider_account_id, false)
-            .await?;
-        let mut credential = self
-            .credential_store
-            .resolve(provider_account_id)
+        self.refresh_codex_quota_bounded(provider_account_id, true)
             .await
-            .map_err(map_credential_store_error)?;
-        if credential.provider_id != openai_codex::PROVIDER_ID {
-            return Err(ImageGatewayError::not_found(
-                "Managed Codex account not found",
-                Some("provider_account_id".to_string()),
-                "provider_account_not_found",
-            ));
-        }
-        let first = self
-            .observe_quota(credential.home(), &credential.material_fingerprint_sha256)
-            .await;
-        let (account, quota) = match first {
-            Ok(observation) => observation,
-            Err(first_error) => {
-                tracing::warn!(
-                    %provider_account_id,
-                    error = ?first_error,
-                    "Codex quota observation failed; verifying the account credential"
-                );
-                if let Err(error) = self
-                    .refresh_operational_credential(provider_account_id, true)
-                    .await
-                {
-                    let _ = mark_codex_quota_unavailable(
-                        &self.pool,
-                        provider_account_id,
-                        "quota_credential_verification_failed",
-                    )
-                    .await;
-                    return Err(error);
-                }
-                credential = self
-                    .credential_store
-                    .resolve(provider_account_id)
-                    .await
-                    .map_err(map_credential_store_error)?;
-                tokio::time::sleep(CODEX_QUOTA_RETRY_DELAY).await;
-                match self
-                    .observe_quota(credential.home(), &credential.material_fingerprint_sha256)
-                    .await
-                {
-                    Ok(observation) => observation,
-                    Err(error) => {
-                        tracing::warn!(
-                            %provider_account_id,
-                            error = ?error,
-                            "Codex quota observation unavailable after retry"
-                        );
-                        let _ = mark_codex_quota_unavailable(
-                            &self.pool,
-                            provider_account_id,
-                            "quota_observer_failed",
-                        )
-                        .await;
-                        return Err(error);
-                    }
-                }
-            }
-        };
-        let mut tx = self.pool.begin().await.map_err(store_unavailable)?;
-        let now = database_now(&mut tx).await?;
-        sqlx::query(
-            "UPDATE provider_account_environments SET account_email = COALESCE($2, account_email), updated_at_ms = $3 WHERE provider_account_id = $1",
-        )
-        .bind(provider_account_id)
-        .bind(account.email)
-        .bind(now)
-        .execute(&mut *tx)
-        .await
-        .map_err(store_unavailable)?;
-        persist_quota(&mut tx, provider_account_id, &quota, now).await?;
-        tx.commit().await.map_err(store_unavailable)?;
-        Ok(())
     }
 
     async fn refresh_provider_quota(
@@ -3948,7 +3886,7 @@ fn assemble_routes(
         .collect()
 }
 
-async fn persist_quota(
+pub(super) async fn persist_quota(
     tx: &mut Transaction<'_, Postgres>,
     provider_account_id: Uuid,
     quota: &CodexQuotaSnapshot,
@@ -4061,32 +3999,6 @@ async fn persist_grok_quota(
         .await
         .map_err(store_unavailable)?;
     }
-    Ok(())
-}
-
-async fn mark_codex_quota_unavailable(
-    pool: &PgPool,
-    provider_account_id: Uuid,
-    error_code: &str,
-) -> Result<(), ImageGatewayError> {
-    let now = now_ms()?;
-    sqlx::query(
-        r#"
-        INSERT INTO provider_account_quota_snapshots
-          (provider_account_id, provider_id, status, observed_at_ms, last_error_code)
-        VALUES ($1, $2, 'unavailable', $3, $4)
-        ON CONFLICT (provider_account_id) DO UPDATE
-        SET status = 'unavailable', observed_at_ms = EXCLUDED.observed_at_ms,
-            last_error_code = EXCLUDED.last_error_code
-        "#,
-    )
-    .bind(provider_account_id)
-    .bind(openai_codex::PROVIDER_ID)
-    .bind(now)
-    .bind(error_code)
-    .execute(pool)
-    .await
-    .map_err(store_unavailable)?;
     Ok(())
 }
 
@@ -5564,19 +5476,6 @@ mod tests {
         let key = managed_codex_account_key(login_session_id);
         assert_eq!(key, "codex-9be138ac61c6410f81fd496235ef5897");
         assert!(valid_simple_key(&key));
-    }
-
-    #[test]
-    fn codex_quota_refresh_guard_is_single_flight_per_account() {
-        let provider_account_id = Uuid::new_v4();
-        let guard = CodexQuotaRefreshGuard::acquire(provider_account_id).expect("first refresh");
-        let duplicate = CodexQuotaRefreshGuard::acquire(provider_account_id)
-            .expect_err("duplicate refresh must be rejected");
-        assert_eq!(duplicate.status_code(), axum::http::StatusCode::CONFLICT);
-        assert_eq!(duplicate.error_code(), Some("quota_refresh_in_progress"));
-
-        drop(guard);
-        CodexQuotaRefreshGuard::acquire(provider_account_id).expect("guard released");
     }
 
     #[test]

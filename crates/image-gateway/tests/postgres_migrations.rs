@@ -1358,6 +1358,48 @@ async fn concurrent_fresh_migrations_are_repeatable() -> TestResult {
 }
 
 #[tokio::test]
+async fn schema_128_upgrades_to_131_without_changing_existing_provider_rows() -> TestResult {
+    let Some(test_schema) = TestSchema::new(2).await? else {
+        return Ok(());
+    };
+    let result = async {
+        let mut legacy = sqlx::migrate!("./migrations");
+        legacy.migrations = legacy
+            .iter()
+            .filter(|migration| migration.version <= 128)
+            .cloned()
+            .collect::<Vec<_>>()
+            .into();
+        legacy.run(&test_schema.pool).await.map_err(|error| error.to_string())?;
+        require(migration_versions(&test_schema.pool).await?.last() == Some(&128), "fixture must start at 128")?;
+        let pool_id = Uuid::new_v4();
+        sqlx::query("INSERT INTO provider_credential_pools (credential_pool_id,pool_key,provider_id,state,created_at_ms,updated_at_ms) VALUES ($1,'migration-fixture','openai_codex','disabled',1,1)")
+            .bind(pool_id).execute(&test_schema.pool).await.map_err(|error| error.to_string())?;
+        sqlx::query("INSERT INTO provider_accounts (provider_account_id,credential_pool_id,provider_id,account_key,credential_ref,credential_revision,credential_auth_sha256,state,created_at_ms,updated_at_ms) VALUES ($1,$2,'openai_codex','migration-fixture','unused-fixture-ref',1,$3,'disabled',1,1)")
+            .bind(Uuid::new_v4()).bind(pool_id).bind("a".repeat(64))
+            .execute(&test_schema.pool).await.map_err(|error| error.to_string())?;
+        let before: serde_json::Value = sqlx::query_scalar(
+            "SELECT COALESCE(jsonb_agg(to_jsonb(account) ORDER BY provider_account_id), '[]'::jsonb) FROM provider_accounts account",
+        ).fetch_one(&test_schema.pool).await.map_err(|error| error.to_string())?;
+        require(before.as_array().is_some_and(|rows| rows.len() == 1), "fixture must contain an existing account")?;
+        gateway_result(run_migrations(&test_schema.pool).await, "128-to-131 migration")?;
+        gateway_result(verify_migrations(&test_schema.pool).await, "131 verification")?;
+        let after: serde_json::Value = sqlx::query_scalar(
+            "SELECT COALESCE(jsonb_agg(to_jsonb(account) ORDER BY provider_account_id), '[]'::jsonb) FROM provider_accounts account",
+        ).fetch_one(&test_schema.pool).await.map_err(|error| error.to_string())?;
+        require(before == after, "sidecar migrations changed existing provider accounts")?;
+        require(migration_versions(&test_schema.pool).await?.last() == Some(&131), "upgrade must end at 131")?;
+        let new_rows: i64 = sqlx::query_scalar(
+            "SELECT (SELECT COUNT(*) FROM media_segment_assets) + (SELECT COUNT(*) FROM media_segment_results) + (SELECT COUNT(*) FROM media_segment_worker_heartbeats) + (SELECT COUNT(*) FROM provider_account_quota_refreshes)",
+        ).fetch_one(&test_schema.pool).await.map_err(|error| error.to_string())?;
+        require(new_rows == 0, "migration must not enqueue analysis or quota observations")?;
+        gateway_result(run_migrations(&test_schema.pool).await, "repeat migration")
+    }.await;
+    test_schema.cleanup().await?;
+    result
+}
+
+#[tokio::test]
 async fn platform_route_backfill_only_selects_unambiguous_mapped_routes() -> TestResult {
     let Some(test_schema) = TestSchema::new(2).await? else {
         return Ok(());
@@ -3501,8 +3543,8 @@ async fn shared_pool_case(pool: &PgPool) -> TestResult {
 
 async fn assert_expected_schema(pool: &PgPool) -> TestResult {
     require(
-        migration_versions(pool).await? == (0_i64..=129_i64).collect::<Vec<_>>(),
-        "applied migration versions must be exactly 0 through 129",
+        migration_versions(pool).await? == (0_i64..=131_i64).collect::<Vec<_>>(),
+        "applied migration versions must be exactly 0 through 131",
     )?;
 
     let default_codex_prices: Vec<(String, i64, i64)> = sqlx::query_as(

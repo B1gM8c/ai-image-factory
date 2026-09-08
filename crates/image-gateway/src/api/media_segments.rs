@@ -35,7 +35,28 @@ pub(super) async fn capabilities(
         },
         |service| service.capabilities(),
     );
-    Ok(private_json(capabilities))
+    Ok(private_json(serde_json::json!({
+        "supports_bbox_sidecar": capabilities.supports_bbox_sidecar,
+        "supports_mask_sidecar": capabilities.supports_mask_sidecar,
+        "supports_terminal_source_release": capabilities.supports_bbox_sidecar,
+        "supports_analyzer_key_pin": capabilities.supports_bbox_sidecar,
+    })))
+}
+
+pub(super) async fn readiness(
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+) -> Result<Response, ImageGatewayError> {
+    let auth = authenticate_image_request(&headers, &state).await?;
+    auth.require_api_key_capability(ApiKeyCapability::ImagesRead)?;
+    let readiness = service(&state)?.readiness().await;
+    let ready = readiness.status == "ready";
+    let mut response = private_json(readiness);
+    if !ready {
+        *response.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
+        set_retry_after(&mut response);
+    }
+    Ok(response)
 }
 
 pub(super) async fn register_asset(

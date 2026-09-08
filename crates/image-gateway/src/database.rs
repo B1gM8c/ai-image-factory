@@ -55,6 +55,33 @@ pub async fn connect_admin_read_pool_with_schema(
         .map_err(connection_error)
 }
 
+/// The optional sidecar has its own fault budget; never apply it to image jobs.
+pub async fn connect_media_segments_pool_with_schema(
+    database_url: &str,
+    schema: &str,
+) -> Result<PgPool, ImageGatewayError> {
+    if !is_simple_identifier(schema) {
+        return Err(ImageGatewayError::config(
+            "database search_path must be a simple identifier",
+        ));
+    }
+    let connect_options = PgConnectOptions::from_str(database_url)
+        .map_err(connection_error)?
+        .application_name("ai-image-factory-media-segments")
+        .options([
+            ("search_path", schema),
+            ("statement_timeout", "4s"),
+            ("lock_timeout", "2s"),
+            ("idle_in_transaction_session_timeout", "10s"),
+        ]);
+    PgPoolOptions::new()
+        .max_connections(3)
+        .acquire_timeout(Duration::from_secs(1))
+        .connect_with(connect_options)
+        .await
+        .map_err(connection_error)
+}
+
 #[doc(hidden)]
 pub async fn connect_test_pool_with_search_path(
     database_url: &str,

@@ -141,6 +141,7 @@ fn request_defaults_are_cache_only_and_unknown_fields_are_rejected() {
     let request: SegmentRequest =
         serde_json::from_value(serde_json::json!({"asset_id":"img_test"})).unwrap();
     assert!(request.cached_only);
+    assert!(request.expected_analyzer_key.is_none());
     assert_eq!(
         (
             request.language.as_str(),
@@ -153,6 +154,12 @@ fn request_defaults_are_cache_only_and_unknown_fields_are_rejected() {
         serde_json::from_value::<SegmentRequest>(
             serde_json::json!({"asset_id":"img_test", "provider":"grok"})
         )
+        .is_err()
+    );
+    assert!(
+        serde_json::from_value::<SegmentRequest>(serde_json::json!({
+            "asset_id":"img_test", "expected_analyzer_key":null
+        }))
         .is_err()
     );
 }

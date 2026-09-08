@@ -22,6 +22,7 @@ use gpt_image_2_gateway::{
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Command {
     Migrate,
+    VerifyMigrations,
     ProvisionCodexProfile,
     ProvisionCodexCliEditProfile,
     ProvisionGrokProfile,
@@ -74,6 +75,7 @@ where
     })?;
     let command = match command.as_ref() {
         "migrate" => Command::Migrate,
+        "verify-migrations" => Command::VerifyMigrations,
         "bootstrap-admin" => {
             let email = required_argument(&mut args, "bootstrap-admin", "email")?;
             let display_name = required_argument(&mut args, "bootstrap-admin", "display name")?;
@@ -218,7 +220,7 @@ async fn main() -> Result<(), ImageGatewayError> {
     init_tracing();
     let command = parse_command(env::args().skip(1)).map_err(ImageGatewayError::config)?;
     let provisioning = match &command {
-        Command::Migrate => None,
+        Command::Migrate | Command::VerifyMigrations => None,
         Command::ProvisionCodexProfile | Command::ProvisionCodexCliEditProfile => {
             let credential_home = provider_credential_home("EXECUTOR_CODEX_CREDENTIAL_HOME")?;
             Some(provisioning_from_env(codex_auth_file_sha256(
@@ -251,6 +253,10 @@ async fn main() -> Result<(), ImageGatewayError> {
         Command::Migrate => {
             run_migrations(&pool).await?;
             println!("database migrations complete");
+        }
+        Command::VerifyMigrations => {
+            verify_migrations(&pool).await?;
+            println!("database migration identities verified (read-only)");
         }
         Command::ProvisionCodexProfile => {
             verify_migrations(&pool).await?;
@@ -594,6 +600,15 @@ mod tests {
     #[test]
     fn accepts_exactly_migrate() {
         assert_eq!(parse_command(["migrate"]), Ok(Command::Migrate));
+    }
+
+    #[test]
+    fn accepts_exactly_read_only_migration_verification() {
+        assert_eq!(
+            parse_command(["verify-migrations"]),
+            Ok(Command::VerifyMigrations)
+        );
+        assert!(parse_command(["verify-migrations", "extra"]).is_err());
     }
 
     #[test]

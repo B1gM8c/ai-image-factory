@@ -1,0 +1,111 @@
+#!/usr/bin/env python3
+"""Opt-in, read-only segmentation/quota rollout gate. Never submits model work."""
+import argparse
+import json
+from pathlib import Path
+import re
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+
+
+class GateError(Exception):
+    pass
+
+
+def require(condition, message):
+    if not condition:
+        raise GateError(message)
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise GateError('redirect rejected')
+
+
+def read_json(opener, base, path, token=None):
+    headers = {'Authorization': 'Bearer ' + token} if token else {}
+    request = urllib.request.Request(base + path, headers=headers, method='GET')
+    try:
+        with opener.open(request, timeout=5) as response:
+            require(response.status == 200, path + ' not ready')
+            data = response.read(65537)
+            require(len(data) <= 65536, path + ' response too large')
+            return json.loads(data)
+    except (urllib.error.URLError, TimeoutError, ValueError):
+        raise GateError(path + ' unavailable or invalid') from None
+
+
+def validate_views(capabilities, worker, gateway, source_release, quota_refresh):
+    require(all(capabilities.get(key) is True for key in (
+        'supports_bbox_sidecar', 'supports_terminal_source_release',
+        'supports_analyzer_key_pin')), 'required media protocol capability missing')
+    require(worker.get('object') == 'media.readiness' and worker.get('status') == 'ready',
+            'bbox worker not ready')
+    require(re.fullmatch('[0-9a-f]{64}', str(worker.get('analyzer_key', ''))),
+            'invalid analyzer identity')
+    age = worker.get('heartbeat_age_ms')
+    require(type(age) is int and 0 <= age <= 150000, 'bbox heartbeat stale')
+    require(type(worker.get('last_heartbeat_at_ms')) is int
+            and worker['last_heartbeat_at_ms'] > 0, 'bbox heartbeat missing')
+    require(worker.get('heartbeat_ttl_ms') == 150000, 'unexpected heartbeat TTL')
+    require(worker.get('source_release_enabled') is source_release,
+            'source-release rollout configuration mismatch')
+    require(gateway.get('status') == 'ready', 'gateway not ready')
+    quota = gateway.get('codex_quota_refresh')
+    if quota_refresh:
+        require(isinstance(quota, dict) and quota.get('enabled') is True
+                and quota.get('running') is True and quota.get('healthy') is True
+                and type(quota.get('last_pass_at_ms')) is int
+                and quota['last_pass_at_ms'] > 0, 'quota refresh loop not ready')
+    else:
+        require(quota is None or (isinstance(quota, dict) and quota.get('enabled') is False),
+                'quota refresh rollback configuration mismatch')
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--base-url', required=True)
+    parser.add_argument('--api-key-file', type=Path, required=True)
+    parser.add_argument('--factoryctl', type=Path, required=True)
+    parser.add_argument('--source-release', choices=('enabled', 'disabled'), default='enabled')
+    parser.add_argument('--quota-refresh', choices=('enabled', 'disabled'), default='enabled')
+    args = parser.parse_args()
+    require(re.fullmatch(r'http://127\.0\.0\.1:[0-9]{1,5}', args.base_url),
+            'base URL must be explicit loopback HTTP without credentials or path')
+    require(args.factoryctl.is_absolute() and args.factoryctl.is_file(),
+            'factoryctl must be an absolute release binary path')
+    require(args.api_key_file.is_file() and not args.api_key_file.is_symlink()
+            and args.api_key_file.stat().st_mode & 0o077 == 0, 'API key file must be private')
+    # Uses the normal DATABASE_URL/GATEWAY_DATABASE_SCHEMA environment. No auth
+    # material is passed on the command line or emitted into failure messages.
+    try:
+        migration = subprocess.run([str(args.factoryctl), 'verify-migrations'],
+            capture_output=True, timeout=15, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        raise GateError('migration identity check unavailable') from None
+    require(migration.returncode == 0, 'migration identity check failed')
+    token = args.api_key_file.read_text().strip()
+    require(0 < len(token) <= 4096 and '\n' not in token and '\r' not in token,
+            'invalid API key file')
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
+    capabilities = read_json(opener, args.base_url, '/v1/media/capabilities', token)
+    worker = read_json(opener, args.base_url, '/v1/media/readiness', token)
+    gateway = read_json(opener, args.base_url, '/readyz')
+    validate_views(capabilities, worker, gateway,
+                   args.source_release == 'enabled', args.quota_refresh == 'enabled')
+    print(json.dumps({'status': 'passed', 'migrations': 'verified',
+        'analyzer_key': worker['analyzer_key'],
+        'last_heartbeat_at_ms': worker['last_heartbeat_at_ms'],
+        'source_release': args.source_release, 'quota_refresh': args.quota_refresh}))
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (GateError, OSError) as error:
+        # OSError text may contain a credential file path, so keep it generic.
+        message = str(error) if isinstance(error, GateError) else 'local input unavailable'
+        print('media runtime gate: ' + message, file=sys.stderr)
+        raise SystemExit(1)

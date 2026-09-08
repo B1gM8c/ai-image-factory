@@ -135,6 +135,8 @@ pub struct ReadinessResponse {
     pub status: &'static str,
     pub provider_profiles: Option<ProviderProfileReadinessCounts>,
     pub execution_queue: Option<ExecutionQueueReadinessCounts>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub codex_quota_refresh: Option<crate::provider_management::CodexQuotaRefreshRuntimeView>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]

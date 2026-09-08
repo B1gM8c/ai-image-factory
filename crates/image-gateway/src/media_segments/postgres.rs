@@ -5,11 +5,12 @@ use uuid::Uuid;
 
 use super::{
     ImageSize, MediaAsset, MediaScope, SCHEMA_VERSION, SegmentError, SegmentStatus, SegmentStore,
-    SegmentTimings, SegmentWork, Segmentation, now_ms,
+    SegmentTimings, SegmentWork, Segmentation, SourceState, now_ms, source_unavailable,
 };
 use crate::{ImageGatewayError, input_blobs::InputBlobRef};
 
-const MAX_PROJECT_ASSETS: i64 = 64;
+const MAX_PROJECT_SOURCES: i64 = 64;
+const MAX_PROJECT_METADATA: i64 = 4096;
 const MAX_PROJECT_ASSET_BYTES: i64 = 512 * 1024 * 1024;
 const MAX_ACTIVE_RESULTS: i64 = 64;
 const MAX_PROJECT_ACTIVE_RESULTS: i64 = 16;
@@ -35,6 +36,7 @@ struct AssetRow {
     digest: String,
     metadata: serde_json::Value,
     byte_size: i64,
+    source_state: SourceState,
     expires_at_ms: i64,
 }
 
@@ -58,6 +60,7 @@ struct WorkRow {
     digest: String,
     metadata: serde_json::Value,
     byte_size: i64,
+    source_state: SourceState,
     expires_at_ms: i64,
 }
 
@@ -65,10 +68,67 @@ impl PostgresSegmentStore {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
     }
+
+    pub async fn record_worker_heartbeat(
+        &self,
+        analyzer_key: &str,
+        release_terminal_sources: bool,
+    ) -> Result<(), ImageGatewayError> {
+        let now = now_ms();
+        sqlx::query("INSERT INTO media_segment_worker_heartbeats (analyzer_key, observed_at_ms, release_terminal_sources) VALUES ($1, $2, $3) ON CONFLICT (analyzer_key, release_terminal_sources) DO UPDATE SET observed_at_ms = EXCLUDED.observed_at_ms")
+            .bind(analyzer_key).bind(now).bind(release_terminal_sources).execute(&self.pool).await.map_err(unavailable)?;
+        sqlx::query("DELETE FROM media_segment_worker_heartbeats WHERE observed_at_ms < $1")
+            .bind(now - super::ASSET_TTL_MS)
+            .execute(&self.pool)
+            .await
+            .map_err(unavailable)?;
+        Ok(())
+    }
 }
 
 #[async_trait]
 impl SegmentStore for PostgresSegmentStore {
+    async fn worker_heartbeat(
+        &self,
+        analyzer_key: &str,
+    ) -> Result<Option<super::SegmentWorkerHeartbeat>, ImageGatewayError> {
+        // Analysis liveness is config-specific, but every segmentd maintains
+        // shared source storage. Old analyzer revisions must not hide a live
+        // source-deleting worker during a configuration rollback.
+        sqlx::query_as(
+            r#"SELECT observed_at_ms, release_terminal_sources,
+                (SELECT COUNT(DISTINCT release_terminal_sources) > 1
+                 FROM media_segment_worker_heartbeats WHERE observed_at_ms >= $2)
+                    AS configuration_mismatch
+               FROM media_segment_worker_heartbeats WHERE analyzer_key = $1
+               ORDER BY observed_at_ms DESC LIMIT 1"#,
+        )
+        .bind(analyzer_key)
+        .bind(now_ms() - super::WORKER_HEARTBEAT_TTL_MS)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(unavailable)
+    }
+
+    async fn result_for_analyzer(
+        &self,
+        scope: &MediaScope,
+        asset_id: Uuid,
+        analyzer_key: &str,
+    ) -> Result<Option<Segmentation>, ImageGatewayError> {
+        let row = sqlx::query_as::<_, ResultRow>(
+            r#"SELECT result.result_json, result.status, result.queue_deadline_at_ms, result.lease_deadline_at_ms
+               FROM media_segment_results result
+               JOIN media_segment_assets asset ON asset.asset_id = result.asset_id
+               WHERE result.asset_id = $1 AND result.analyzer_key = $2
+                 AND result.tenant_id = $3 AND result.project_id = $4 AND result.owner_id = $5
+                 AND asset.expires_at_ms > $6
+               ORDER BY result.created_at_ms DESC LIMIT 1"#,
+        ).bind(asset_id).bind(analyzer_key).bind(&scope.tenant_id).bind(&scope.project_id).bind(&scope.owner_id).bind(now_ms())
+            .fetch_optional(&self.pool).await.map_err(unavailable)?;
+        row.map(|row| result_from_row(row, now_ms())).transpose()
+    }
+
     async fn find_asset(
         &self,
         scope: &MediaScope,
@@ -78,7 +138,7 @@ impl SegmentStore for PostgresSegmentStore {
         let row = sqlx::query_as::<_, AssetRow>(
             r#"
             SELECT asset_id, tenant_id, project_id, owner_id, digest,
-                   metadata, byte_size, expires_at_ms
+                   metadata, byte_size, source_state, expires_at_ms
             FROM media_segment_assets
             WHERE tenant_id = $1 AND project_id = $2 AND owner_id = $3
               AND digest = $4 AND expires_at_ms > $5
@@ -96,9 +156,6 @@ impl SegmentStore for PostgresSegmentStore {
     }
 
     async fn insert_asset(&self, asset: &MediaAsset) -> Result<MediaAsset, ImageGatewayError> {
-        if let Some(existing) = self.find_asset(&asset.scope, &asset.digest).await? {
-            return Ok(existing);
-        }
         let byte_size = i64::try_from(asset.blob.byte_size)
             .map_err(|_| ImageGatewayError::internal("Media asset size overflow"))?;
         let metadata = serde_json::to_value(AssetMetadata {
@@ -125,25 +182,43 @@ impl SegmentStore for PostgresSegmentStore {
             .await
             .map_err(unavailable)?;
 
-        if let Some(row) = asset_by_digest(&mut tx, &asset.scope, &asset.digest, now).await? {
-            tx.commit().await.map_err(unavailable)?;
-            return asset_from_row(row);
+        // Project lock bounds concurrent admissions; the asset row lock also
+        // serializes source restoration with cleanup and enqueue.
+        let existing = asset_by_digest_any_age(&mut tx, &asset.scope, &asset.digest).await?;
+        if let Some(row) = &existing {
+            if row.expires_at_ms <= now {
+                return Err(ImageGatewayError::conflict(
+                    "An expired copy of this media asset is pending cleanup; retry shortly",
+                    None,
+                    "asset_expired",
+                ));
+            }
+            match row.source_state {
+                SourceState::Retained => {
+                    tx.commit().await.map_err(unavailable)?;
+                    return asset_from_row(existing.expect("existing asset"));
+                }
+                SourceState::Releasing => return Err(source_unavailable(row.source_state)),
+                SourceState::Released => {}
+            }
         }
 
-        let (asset_count, stored_bytes): (i64, i64) = sqlx::query_as(
+        let (metadata_count, asset_count, stored_bytes): (i64, i64, i64) = sqlx::query_as(
             r#"
-            SELECT COUNT(*)::BIGINT, COALESCE(SUM(byte_size), 0)::BIGINT
+            SELECT COUNT(*)::BIGINT,
+                   COUNT(*) FILTER (WHERE source_state <> 'released')::BIGINT,
+                   COALESCE(SUM(byte_size) FILTER (WHERE source_state <> 'released'), 0)::BIGINT
             FROM media_segment_assets
-            WHERE tenant_id = $1 AND project_id = $2 AND expires_at_ms > $3
+            WHERE tenant_id = $1 AND project_id = $2
             "#,
         )
         .bind(&asset.scope.tenant_id)
         .bind(&asset.scope.project_id)
-        .bind(now)
         .fetch_one(&mut *tx)
         .await
         .map_err(unavailable)?;
-        if asset_count >= MAX_PROJECT_ASSETS
+        if (existing.is_none() && metadata_count >= MAX_PROJECT_METADATA)
+            || asset_count >= MAX_PROJECT_SOURCES
             || stored_bytes.saturating_add(byte_size) > MAX_PROJECT_ASSET_BYTES
         {
             return Err(ImageGatewayError::conflict(
@@ -151,6 +226,19 @@ impl SegmentStore for PostgresSegmentStore {
                 None,
                 "media_asset_capacity_exceeded",
             ));
+        }
+
+        if let Some(row) = existing {
+            let id = row.asset_id;
+            let expires_at_ms = row.expires_at_ms;
+            sqlx::query("UPDATE media_segment_assets SET metadata = $2, byte_size = $3, source_state = 'retained', source_waiting_for_result = true WHERE asset_id = $1")
+                .bind(id).bind(metadata).bind(byte_size).execute(&mut *tx).await.map_err(unavailable)?;
+            tx.commit().await.map_err(unavailable)?;
+            return Ok(MediaAsset {
+                id,
+                expires_at_ms,
+                ..asset.clone()
+            });
         }
 
         let inserted = sqlx::query(
@@ -202,7 +290,7 @@ impl SegmentStore for PostgresSegmentStore {
         let row = sqlx::query_as::<_, AssetRow>(
             r#"
             SELECT asset_id, tenant_id, project_id, owner_id, digest,
-                   metadata, byte_size, expires_at_ms
+                   metadata, byte_size, source_state, expires_at_ms
             FROM media_segment_assets
             WHERE asset_id = $1 AND tenant_id = $2 AND project_id = $3
               AND owner_id = $4 AND expires_at_ms > $5
@@ -285,13 +373,12 @@ impl SegmentStore for PostgresSegmentStore {
         let now = now_ms();
         let mut tx = self.pool.begin().await.map_err(unavailable)?;
 
-        let asset_exists: bool = sqlx::query_scalar(
+        let source_state: Option<SourceState> = sqlx::query_scalar(
             r#"
-            SELECT EXISTS(
-                SELECT 1 FROM media_segment_assets
+                SELECT source_state FROM media_segment_assets
                 WHERE asset_id = $1 AND tenant_id = $2 AND project_id = $3
                   AND owner_id = $4 AND expires_at_ms > $5
-            )
+                FOR UPDATE
             "#,
         )
         .bind(asset.id)
@@ -299,10 +386,10 @@ impl SegmentStore for PostgresSegmentStore {
         .bind(&asset.scope.project_id)
         .bind(&asset.scope.owner_id)
         .bind(now)
-        .fetch_one(&mut *tx)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(unavailable)?;
-        if !asset_exists {
+        if source_state.is_none() {
             return Err(ImageGatewayError::conflict(
                 "Media asset is missing or expired",
                 None,
@@ -317,6 +404,11 @@ impl SegmentStore for PostgresSegmentStore {
         if let Some(row) = result_by_cache(&mut tx, &asset.scope, cache_key).await? {
             tx.commit().await.map_err(unavailable)?;
             return result_from_row(row, now);
+        }
+        if source_state != Some(SourceState::Retained) {
+            return Err(source_unavailable(
+                source_state.expect("existing source state"),
+            ));
         }
 
         let (active, project_active): (i64, i64) = sqlx::query_as(
@@ -390,6 +482,13 @@ impl SegmentStore for PostgresSegmentStore {
             return result_from_row(row, now);
         }
 
+        sqlx::query(
+            "UPDATE media_segment_assets SET source_waiting_for_result = false WHERE asset_id = $1",
+        )
+        .bind(asset.id)
+        .execute(&mut *tx)
+        .await
+        .map_err(unavailable)?;
         sqlx::query("SELECT pg_notify('media_segments_ready', '')")
             .execute(&mut *tx)
             .await
@@ -419,6 +518,7 @@ impl SegmentStore for PostgresSegmentStore {
                 WHERE result.status = 'queued' AND result.analyzer_key = $1
                   AND result.queue_deadline_at_ms > $2
                   AND asset.expires_at_ms > $2
+                  AND asset.source_state = 'retained'
                 ORDER BY result.created_at_ms, result.result_id
                 FOR UPDATE OF result SKIP LOCKED
                 LIMIT 1
@@ -433,7 +533,7 @@ impl SegmentStore for PostgresSegmentStore {
             RETURNING result.result_id, result.lease_token, result.result_json,
                       asset.asset_id, asset.tenant_id, asset.project_id,
                       asset.owner_id, asset.digest, asset.metadata,
-                      asset.byte_size, asset.expires_at_ms
+                      asset.byte_size, asset.source_state, asset.expires_at_ms
             "#,
         )
         .bind(analyzer_key)
@@ -526,6 +626,66 @@ impl SegmentStore for PostgresSegmentStore {
         Ok(updated.rows_affected())
     }
 
+    async fn claim_sources_for_release(
+        &self,
+        limit: i64,
+        release_terminal: bool,
+    ) -> Result<Vec<MediaAsset>, ImageGatewayError> {
+        if limit <= 0 {
+            return Ok(Vec::new());
+        }
+        let mut tx = self.pool.begin().await.map_err(unavailable)?;
+        let candidates: Vec<Uuid> = sqlx::query_scalar(
+            r#"
+                SELECT asset.asset_id
+                FROM media_segment_assets asset
+                WHERE asset.source_state <> 'released'
+                  AND (asset.source_state = 'releasing' OR asset.expires_at_ms <= $1
+                       OR ($3 AND NOT asset.source_waiting_for_result AND EXISTS (SELECT 1 FROM media_segment_results result WHERE result.asset_id = asset.asset_id)))
+                  AND NOT EXISTS (
+                      SELECT 1 FROM media_segment_results result
+                      WHERE result.asset_id = asset.asset_id AND result.status IN ('queued', 'processing')
+                  )
+                ORDER BY asset.source_release_attempt_at_ms, asset.expires_at_ms, asset.asset_id
+                FOR UPDATE OF asset SKIP LOCKED
+                LIMIT $2
+            "#,
+        ).bind(now_ms()).bind(limit.min(256)).bind(release_terminal)
+            .fetch_all(&mut *tx).await.map_err(unavailable)?;
+        // A separate statement takes a fresh READ COMMITTED snapshot after the
+        // asset locks. An enqueue that committed just before those locks must
+        // be visible; a one-statement CTE could miss that newly active result.
+        let rows = sqlx::query_as::<_, AssetRow>(
+            r#"
+            UPDATE media_segment_assets asset
+            SET source_state = 'releasing', source_release_attempt_at_ms = $2
+            WHERE asset.asset_id = ANY($1)
+              AND NOT EXISTS (SELECT 1 FROM media_segment_results result
+                  WHERE result.asset_id = asset.asset_id AND result.status IN ('queued', 'processing'))
+            RETURNING asset.asset_id, asset.tenant_id, asset.project_id,
+                      asset.owner_id, asset.digest, asset.metadata,
+                      asset.byte_size, asset.source_state, asset.expires_at_ms
+            "#,
+        ).bind(candidates).bind(now_ms())
+            .fetch_all(&mut *tx).await.map_err(unavailable)?;
+        tx.commit().await.map_err(unavailable)?;
+        rows.into_iter().map(asset_from_row).collect()
+    }
+
+    async fn finish_source_release(&self, asset: &MediaAsset) -> Result<bool, ImageGatewayError> {
+        let updated = sqlx::query(
+            r#"UPDATE media_segment_assets SET source_state = 'released'
+               WHERE asset_id = $1 AND source_state = 'releasing'
+                 AND metadata #>> '{blob,key,admission_session_id}' = $2"#,
+        )
+        .bind(asset.id)
+        .bind(asset.blob.key.admission_session_id.to_string())
+        .execute(&self.pool)
+        .await
+        .map_err(unavailable)?;
+        Ok(updated.rows_affected() == 1)
+    }
+
     async fn expired_assets(&self, limit: i64) -> Result<Vec<MediaAsset>, ImageGatewayError> {
         if limit <= 0 {
             return Ok(Vec::new());
@@ -534,9 +694,10 @@ impl SegmentStore for PostgresSegmentStore {
             r#"
             SELECT asset.asset_id, asset.tenant_id, asset.project_id,
                    asset.owner_id, asset.digest, asset.metadata,
-                   asset.byte_size, asset.expires_at_ms
+                   asset.byte_size, asset.source_state, asset.expires_at_ms
             FROM media_segment_assets asset
             WHERE asset.expires_at_ms <= $1
+              AND asset.source_state = 'released'
               AND NOT EXISTS (
                   SELECT 1 FROM media_segment_results result
                   WHERE result.asset_id = asset.asset_id
@@ -559,6 +720,7 @@ impl SegmentStore for PostgresSegmentStore {
             r#"
             DELETE FROM media_segment_assets asset
             WHERE asset.asset_id = $1 AND asset.expires_at_ms <= $2
+              AND asset.source_state = 'released'
               AND NOT EXISTS (
                   SELECT 1 FROM media_segment_results result
                   WHERE result.asset_id = asset.asset_id
@@ -575,31 +737,6 @@ impl SegmentStore for PostgresSegmentStore {
     }
 }
 
-async fn asset_by_digest(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    scope: &MediaScope,
-    digest: &str,
-    now: i64,
-) -> Result<Option<AssetRow>, ImageGatewayError> {
-    sqlx::query_as::<_, AssetRow>(
-        r#"
-        SELECT asset_id, tenant_id, project_id, owner_id, digest,
-               metadata, byte_size, expires_at_ms
-        FROM media_segment_assets
-        WHERE tenant_id = $1 AND project_id = $2 AND owner_id = $3
-          AND digest = $4 AND expires_at_ms > $5
-        "#,
-    )
-    .bind(&scope.tenant_id)
-    .bind(&scope.project_id)
-    .bind(&scope.owner_id)
-    .bind(digest)
-    .bind(now)
-    .fetch_optional(&mut **tx)
-    .await
-    .map_err(unavailable)
-}
-
 async fn asset_by_digest_any_age(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     scope: &MediaScope,
@@ -608,10 +745,11 @@ async fn asset_by_digest_any_age(
     sqlx::query_as::<_, AssetRow>(
         r#"
         SELECT asset_id, tenant_id, project_id, owner_id, digest,
-               metadata, byte_size, expires_at_ms
+               metadata, byte_size, source_state, expires_at_ms
         FROM media_segment_assets
         WHERE tenant_id = $1 AND project_id = $2 AND owner_id = $3
           AND digest = $4
+        FOR UPDATE
         "#,
     )
     .bind(&scope.tenant_id)
@@ -665,6 +803,7 @@ fn asset_from_row(row: AssetRow) -> Result<MediaAsset, ImageGatewayError> {
         digest: row.digest,
         image: metadata.image,
         blob: metadata.blob,
+        source_state: row.source_state,
         expires_at_ms: row.expires_at_ms,
     })
 }
@@ -713,6 +852,7 @@ fn work_from_row(row: WorkRow) -> Result<SegmentWork, ImageGatewayError> {
         digest: row.digest,
         metadata: row.metadata,
         byte_size: row.byte_size,
+        source_state: row.source_state,
         expires_at_ms: row.expires_at_ms,
     })?;
     Ok(SegmentWork {

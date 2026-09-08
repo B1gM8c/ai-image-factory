@@ -1,0 +1,80 @@
+{
+  "contract": "ai-image-factory.media-lifecycle.v1",
+  "analyzer_key_pattern": "^[0-9a-f]{64}$",
+  "capabilities": {
+    "supports_bbox_sidecar": true,
+    "supports_mask_sidecar": false,
+    "supports_terminal_source_release": true,
+    "supports_analyzer_key_pin": true
+  },
+  "readiness_ready": {
+    "http_status": 200,
+    "body": {
+      "object": "media.readiness",
+      "status": "ready",
+      "analyzer_key": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "last_heartbeat_at_ms": 1788848639234,
+      "heartbeat_age_ms": 1200,
+      "heartbeat_ttl_ms": 150000,
+      "source_release_enabled": true
+    }
+  },
+  "readiness_missing": {
+    "http_status": 503,
+    "body": {
+      "object": "media.readiness",
+      "status": "not_ready",
+      "analyzer_key": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "last_heartbeat_at_ms": null,
+      "heartbeat_age_ms": null,
+      "heartbeat_ttl_ms": 150000,
+      "source_release_enabled": null,
+      "reason": "worker_heartbeat_missing"
+    }
+  },
+  "ensure_request": {
+    "asset_id": "img_0123456789abcdef0123456789abcdef",
+    "cached_only": false,
+    "detail": "bbox",
+    "language": "zh-CN",
+    "mask_format": "none",
+    "expected_analyzer_key": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+  },
+  "errors": [
+    {
+      "http_status": 404,
+      "body": {"error": {
+        "message": "Segmentation is not cached",
+        "type": "invalid_request_error", "param": "asset_id", "code": "segments_not_cached"
+      }}
+    },
+    {
+      "http_status": 409,
+      "body": {"error": {
+        "message": "Media source is being released; retry registration shortly",
+        "type": "invalid_request_error", "param": "asset_id", "code": "asset_source_releasing"
+      }}
+    },
+    {
+      "http_status": 409,
+      "body": {"error": {
+        "message": "Media source was released; register the original bytes again before analysis",
+        "type": "invalid_request_error", "param": "asset_id", "code": "asset_source_released"
+      }}
+    },
+    {
+      "http_status": 409,
+      "body": {"error": {
+        "message": "Segmentation analyzer changed; no result exists for the expected analyzer",
+        "type": "invalid_request_error", "param": "expected_analyzer_key", "code": "segmentation_analyzer_changed"
+      }}
+    },
+    {
+      "http_status": 400,
+      "body": {"error": {
+        "message": "expected_analyzer_key must be 64 lowercase hexadecimal characters",
+        "type": "invalid_request_error", "param": "expected_analyzer_key", "code": "invalid_analyzer_key"
+      }}
+    }
+  ]
+}
