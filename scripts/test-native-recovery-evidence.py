@@ -80,7 +80,31 @@ class NativeRecoveryEvidenceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             markers = HARNESS_MODULE.fault_markers(Path(directory))
         self.assertEqual(markers['verify_runs'], [])
+        self.assertIsNone(markers['recovery_security_diff'])
         self.assertFalse(markers['candidate_validation_verify_seen'])
+
+    def test_recovery_security_diff_is_strict_and_bounded(self):
+        difference = {'limit': 12, 'total_differences': 2, 'truncated': False, 'items': [
+            {'direction': 'missing', 'kind': 'relation:r', 'identity': 'jobs',
+             'owner': 'owner', 'normalized_acl': '[["owner","reader","SELECT",false]]'},
+            {'direction': 'extra', 'kind': 'extension', 'identity': 'btree_gist',
+             'owner': 'owner', 'normalized_acl': None}]}
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Path(directory)
+            (fixture / 'recovery-security-diff.json').write_text(json.dumps(difference))
+            markers = HARNESS_MODULE.fault_markers(fixture)
+        self.assertEqual(markers['recovery_security_diff'], difference)
+
+    def test_malformed_or_oversized_security_diff_is_ignored(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Path(directory)
+            path = fixture / 'recovery-security-diff.json'
+            path.write_text(json.dumps({'limit': 12, 'total_differences': 1,
+                'truncated': False, 'items': [{'direction': 'missing', 'kind': 'relation:r',
+                    'identity': 'x' * 257, 'owner': 'owner', 'normalized_acl': None}]}))
+            self.assertIsNone(HARNESS_MODULE.fault_markers(fixture)['recovery_security_diff'])
+            path.write_bytes(b'x' * (HARNESS_MODULE.MAX_RECOVERY_SECURITY_DIFF_BYTES + 1))
+            self.assertIsNone(HARNESS_MODULE.fault_markers(fixture)['recovery_security_diff'])
 
     def test_database_down_does_not_hide_event_causes_or_original_error(self):
         command_id = '6f4ec29d-a3d7-4e93-93f5-c54574ef06da'
@@ -170,6 +194,15 @@ class NativeRecoveryEvidenceTests(unittest.TestCase):
         self.assertLess(execute_source.index('for protected in (ROOT.parent, ROOT)'),
                         execute_source.index('unpack(args.baseline_bundle'))
         self.assertIn("for protected in (Path('/'), ROOT.parent, ROOT)", execute_source)
+        fixture_source = ast.get_source_segment(HARNESS.read_text(), functions['install_fixtures'])
+        self.assertIn("line.startswith(prefix) and len(line.encode()) <= 16*1024", fixture_source)
+        self.assertIn("set(value)=={'limit','total_differences','truncated','items'}", fixture_source)
+        recovery_wrapper = next(node.args[1].value for node in ast.walk(functions['install_fixtures'])
+            if isinstance(node, ast.Call) and len(node.args) >= 2
+            and isinstance(node.args[1], ast.Constant)
+            and isinstance(node.args[1].value, str)
+            and 'AIF_RECOVERY_SECURITY_DIFF=' in node.args[1].value)
+        compile(recovery_wrapper, 'ci-recover', 'exec')
 
     def test_workflow_public_artifact_allowlist_is_unchanged(self):
         workflow = (ROOT / '.github/workflows/recovery-rehearsal.yml').read_text()

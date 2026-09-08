@@ -6,6 +6,7 @@ Native updater, artifacts and authenticated HTTP are a separate rehearsal gate.
 """
 from pathlib import Path
 import hashlib
+import json
 import os
 import re
 import shutil
@@ -252,6 +253,20 @@ WHERE a.typnamespace='app'::regnamespace AND a.typnamespace=b.typnamespace
                 failed = self.sql(broken, role=self.roles['migrator'])
                 self.assertEqual(failed.returncode, 3, failed.stderr)
                 self.assertIn('identity mismatch' if broken == missing_acl else 'deliberately_missing_recovery_function', failed.stderr)
+                if broken == missing_acl:
+                    prefix = 'AIF_RECOVERY_SECURITY_DIFF='
+                    line = next(line for line in failed.stdout.splitlines() if line.startswith(prefix))
+                    difference = json.loads(line[len(prefix):])
+                    self.assertEqual(set(difference), {'limit', 'total_differences', 'truncated', 'items'})
+                    self.assertEqual(difference['limit'], 12)
+                    self.assertLessEqual(len(difference['items']), 12)
+                    self.assertTrue(any(item['direction'] == 'missing'
+                        and item['kind'].startswith('relation:') and item['identity'] == 'jobs'
+                        for item in difference['items']))
+                    self.assertTrue(all(set(item) == {
+                        'direction', 'kind', 'identity', 'owner', 'normalized_acl'}
+                        for item in difference['items']))
+                    self.assertNotIn('original', line)
                 self.assertEqual(self.security(), before)
                 self.assertEqual(self.sql('SELECT marker FROM app.jobs').stdout.strip(), 'original')
 

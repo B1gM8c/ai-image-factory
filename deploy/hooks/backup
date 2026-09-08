@@ -294,6 +294,12 @@ SQL
     cat <<'SQL'
 \if :recovery_security_matches
 \else
+  \pset format unaligned
+  \pset tuples_only on
+SQL
+    printf "WITH expected(snapshot) AS (VALUES ('%s'::jsonb)), actual(snapshot) AS (SELECT (%s)), differences(direction, item) AS (SELECT 'missing', saved.item FROM expected CROSS JOIN LATERAL jsonb_array_elements(expected.snapshot) AS saved(item) WHERE NOT EXISTS (SELECT 1 FROM actual CROSS JOIN LATERAL jsonb_array_elements(actual.snapshot) AS restored(item) WHERE restored.item = saved.item) UNION ALL SELECT 'extra', restored.item FROM actual CROSS JOIN LATERAL jsonb_array_elements(actual.snapshot) AS restored(item) WHERE NOT EXISTS (SELECT 1 FROM expected CROSS JOIN LATERAL jsonb_array_elements(expected.snapshot) AS saved(item) WHERE saved.item = restored.item)), counts AS (SELECT count(*)::integer AS total FROM differences), limited AS (SELECT direction, item FROM differences ORDER BY direction, item::text LIMIT 12) SELECT 'AIF_RECOVERY_SECURITY_DIFF=' || jsonb_build_object('limit', 12, 'total_differences', counts.total, 'truncated', counts.total > 12, 'items', coalesce(jsonb_agg(jsonb_build_object('direction', limited.direction, 'kind', left(limited.item->>0, 64), 'identity', left(limited.item->>1, 256), 'owner', left(limited.item->>2, 128), 'normalized_acl', CASE WHEN jsonb_array_length(limited.item) = 4 THEN left((limited.item->3)::text, 512) ELSE NULL END) ORDER BY limited.direction, limited.item::text) FILTER (WHERE limited.item IS NOT NULL), '[]'::jsonb))::text FROM counts LEFT JOIN limited ON true GROUP BY counts.total;\n" \
+      "${security_before//\'/\'\'}" "$security_query"
+    cat <<'SQL'
   DO $aif$ BEGIN RAISE EXCEPTION 'restored schema owner/ACL/default privileges/extension identity mismatch'; END $aif$;
 \endif
 SQL

@@ -54,6 +54,8 @@ RECOVERY_HOST_FILES = {
 MAX_UPDATER_EVENT_BYTES = 256 * 1024
 MAX_UPDATER_EVENT_LINES = 800
 MAX_DIAGNOSTIC_MESSAGE_CHARS = 4096
+MAX_RECOVERY_SECURITY_DIFF_BYTES = 16 * 1024
+MAX_RECOVERY_SECURITY_DIFF_ITEMS = 12
 UPDATER_EVENT_FIELDS = ('command_id', 'action', 'target_version', 'phase', 'details',
                         'created_at_ms')
 
@@ -151,6 +153,47 @@ def failure_event_summary(events, command_id):
     return {'original_apply': original, 'recover': recovery}
 
 
+def validated_recovery_security_diff(value):
+    if not isinstance(value, dict) or set(value) != {
+            'limit', 'total_differences', 'truncated', 'items'}:
+        return None
+    items = value.get('items')
+    total = value.get('total_differences')
+    if (value.get('limit') != MAX_RECOVERY_SECURITY_DIFF_ITEMS
+            or not isinstance(total, int) or isinstance(total, bool) or total < 0
+            or not isinstance(value.get('truncated'), bool)
+            or not isinstance(items, list)
+            or len(items) > MAX_RECOVERY_SECURITY_DIFF_ITEMS
+            or len(items) > total
+            or value['truncated'] != (total > MAX_RECOVERY_SECURITY_DIFF_ITEMS)):
+        return None
+    limits = {'kind': 64, 'identity': 256, 'owner': 128, 'normalized_acl': 512}
+    for item in items:
+        if (not isinstance(item, dict)
+                or set(item) != {'direction', *limits}
+                or item.get('direction') not in ('missing', 'extra')):
+            return None
+        for field, limit in limits.items():
+            field_value = item.get(field)
+            if field == 'normalized_acl' and field_value is None:
+                continue
+            if not isinstance(field_value, str) or len(field_value) > limit:
+                return None
+    return value
+
+
+def recovery_security_diff(fixture):
+    path = fixture / 'recovery-security-diff.json'
+    try:
+        if (not path.is_file() or path.is_symlink()
+                or path.stat().st_size > MAX_RECOVERY_SECURITY_DIFF_BYTES):
+            return None
+        value = json.loads(sanitized(path.read_text(encoding='utf-8', errors='strict')))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    return validated_recovery_security_diff(value)
+
+
 def fault_markers(fixture):
     verify_events = []
     verify_path = fixture / 'verify-runs.jsonl'
@@ -170,6 +213,7 @@ def fault_markers(fixture):
     return {'post_validation_fault_observed': post_validation,
             'first_recovery_fault_observed': first_recovery,
             'candidate_validation_verify_seen': candidate_validation_verify_seen,
+            'recovery_security_diff': recovery_security_diff(fixture),
             'verify_runs': verify_events}
 
 
@@ -559,13 +603,39 @@ if (r/'inject-validation-failure').exists() and current==m['release_version'] an
  raise SystemExit(42)
 ''', 0o755)
     write(LIB / 'ci-recover', '''#!/usr/bin/python3
-import os, pathlib
+import json, os, pathlib, re, subprocess, sys
 r=pathlib.Path('/var/lib/ai-image-factory/updater/fixture')
 if (r/'fail-first-recover').exists():
  (r/'fail-first-recover').unlink()
  (r/'recovery-fault-observed').write_text('43\\n')
  raise SystemExit(43)
-os.execv('/usr/libexec/ai-image-factory/hooks/recover',['recover'])
+result=subprocess.run(['/usr/libexec/ai-image-factory/hooks/recover'],capture_output=True,text=True)
+sys.stdout.write(result.stdout); sys.stderr.write(result.stderr)
+prefix='AIF_RECOVERY_SECURITY_DIFF='
+candidates=[line[len(prefix):] for line in (result.stdout+'\\n'+result.stderr).splitlines()
+            if line.startswith(prefix) and len(line.encode()) <= 16*1024]
+if len(candidates)==1:
+ try:
+  value=json.loads(re.sub(r'postgres(?:ql)?://[^\\s\"\\\']+','[REDACTED-DSN]',candidates[0]))
+  limits={'kind':64,'identity':256,'owner':128,'normalized_acl':512}
+  items=value.get('items') if isinstance(value,dict) else None
+  valid=(isinstance(value,dict) and set(value)=={'limit','total_differences','truncated','items'}
+   and value.get('limit')==12 and isinstance(value.get('total_differences'),int)
+   and not isinstance(value.get('total_differences'),bool) and value['total_differences']>=0
+   and isinstance(value.get('truncated'),bool) and isinstance(items,list) and len(items)<=12
+   and len(items)<=value['total_differences'] and value['truncated']==(value['total_differences']>12))
+  for item in items if valid else []:
+   valid=valid and isinstance(item,dict) and set(item)=={'direction',*limits}
+   valid=valid and item.get('direction') in ('missing','extra')
+   for field,limit in limits.items():
+    field_value=item.get(field)
+    valid=valid and ((field=='normalized_acl' and field_value is None)
+                     or (isinstance(field_value,str) and len(field_value)<=limit))
+  if valid:
+   (r/'recovery-security-diff.json').write_text(json.dumps(value,separators=(',',':')))
+ except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+  pass
+raise SystemExit(result.returncode)
 ''', 0o755)
     for action, value in (('close', 'closed'), ('open', 'open')):
         write(LIB / ('ci-admission-' + action), '#!/bin/sh\nset -eu\n'
