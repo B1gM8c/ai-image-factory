@@ -79,6 +79,23 @@ profile. Exact enabled replay returns the same identities. A disabled row or
 any credential, revision, adapter, or capacity drift fails closed; this command
 never overrides an operational kill switch.
 
+Codex CLI image edits are a separate, explicit opt-in. With a **new**
+`EXECUTOR_PROFILE_KEY` and the same credential provisioning variables, run:
+
+```bash
+cargo run -p gpt-image-2-gateway --bin factoryctl -- provision-codex-cli-edit-profile
+```
+
+This provisions `openai-codex-edit-cli-v1`; it does not replace existing
+`openai-codex-edit-inline-v1` HTTP profiles or change API defaults. Bind the edit
+route to the new profile and run `workerd` in `executor-handoff` mode plus
+`executord` and `reducerd`. No schema migration is required. The CLI adapter uses
+the native Codex `app-server` image tool with verified original images and the
+mask as the final reference. Masks are **semantic guidance**, not native
+pixel-locked inpainting. It requires one real image-tool artifact and does not
+retry failed CLI edits or fall back to HTTP. Existing generation and HTTP edit
+profiles retain their behavior.
+
 `workerd` uses `WORKER_EXECUTION_MODE=executor-handoff` and the same
 `EXECUTOR_PROFILE_KEY`; `executord` additionally requires its owner, mounted
 credential identity, runner root, helper executable, and Codex executable.

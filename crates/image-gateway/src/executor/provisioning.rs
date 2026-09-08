@@ -23,6 +23,7 @@ const MAX_KEY_BYTES: usize = 128;
 const MAX_CREDENTIAL_REF_BYTES: usize = 1_024;
 const MAX_CONCURRENCY: i32 = 1_000_000;
 pub const CODEX_EDIT_INLINE_ADAPTER_REVISION: &str = "openai-codex-edit-inline-v1";
+pub const CODEX_EDIT_CLI_ADAPTER_REVISION: &str = "openai-codex-edit-cli-v1";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExecutionProfileProvisioning {
@@ -143,6 +144,22 @@ pub async fn provision_codex_edit_execution_profile_in_transaction(
 ) -> Result<ProvisionedCodexExecutionProfile, CodexProfileProvisioningError> {
     provision_execution_profile_in_transaction(tx, provisioning, codex_edit_provisioning_binding()?)
         .await
+}
+
+/// Explicit opt-in; existing edit profiles retain their direct HTTP adapter.
+pub async fn provision_codex_cli_edit_execution_profile(
+    pool: &PgPool,
+    provisioning: &CodexExecutionProfileProvisioning,
+) -> Result<ProvisionedCodexExecutionProfile, CodexProfileProvisioningError> {
+    provision_execution_profile(
+        pool,
+        provisioning,
+        ProvisioningBinding {
+            adapter_revision: CODEX_EDIT_CLI_ADAPTER_REVISION,
+            ..codex_edit_provisioning_binding()?
+        },
+    )
+    .await
 }
 
 pub async fn provision_grok_execution_profile(
@@ -587,22 +604,27 @@ async fn ensure_account_operation(
     binding: ProvisioningBinding,
     now: i64,
 ) -> Result<(), CodexProfileProvisioningError> {
-    sqlx::query(
+    let result = sqlx::query(
         r#"
         INSERT INTO provider_account_operations
           (provider_account_id, provider_id, operation_id, state, created_at_ms, updated_at_ms)
         VALUES ($1, $2, $3, 'enabled', $4, $4)
         ON CONFLICT (provider_account_id, operation_id) DO UPDATE
         SET state = 'enabled', updated_at_ms = EXCLUDED.updated_at_ms
+        WHERE NOT $5::BOOLEAN OR provider_account_operations.state = 'enabled'
         "#,
     )
     .bind(provider_account_id)
     .bind(binding.provider_id)
     .bind(binding.operation.id)
     .bind(now)
+    .bind(binding.adapter_revision == CODEX_EDIT_CLI_ADAPTER_REVISION)
     .execute(&mut **tx)
     .await
     .map_err(map_sql_error)?;
+    if result.rows_affected() != 1 {
+        return Err(CodexProfileProvisioningError::Conflict);
+    }
     Ok(())
 }
 

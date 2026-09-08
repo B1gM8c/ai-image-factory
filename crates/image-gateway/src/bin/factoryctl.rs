@@ -12,16 +12,18 @@ use gpt_image_2_gateway::{
     },
     grok_auth_file_sha256,
     provider_management::{PostgresProviderManagementService, ProviderManagementService},
-    provision_codex_execution_profile, provision_grok_edit_execution_profile_replacement,
-    provision_grok_execution_profile, provision_grok_image_execution_profile_replacement,
-    provision_grok_video_execution_profile, provision_grok_video_execution_profile_replacement,
-    reconcile_execution_profile_routes, reconcile_inline_customer_settlement,
+    provision_codex_cli_edit_execution_profile, provision_codex_execution_profile,
+    provision_grok_edit_execution_profile_replacement, provision_grok_execution_profile,
+    provision_grok_image_execution_profile_replacement, provision_grok_video_execution_profile,
+    provision_grok_video_execution_profile_replacement, reconcile_execution_profile_routes,
+    reconcile_inline_customer_settlement,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Command {
     Migrate,
     ProvisionCodexProfile,
+    ProvisionCodexCliEditProfile,
     ProvisionGrokProfile,
     ProvisionGrokVideoProfile,
     ProvisionGrokVideoProfileReplacement {
@@ -67,7 +69,7 @@ where
 {
     let mut args = args.into_iter();
     let command = args.next().ok_or_else(|| {
-        "missing command: expected `migrate`, `bootstrap-admin`, `provision-codex-profile`, `provision-grok-profile`, `provision-grok-video-profile`, `provision-grok-image-profile-replacement`, `provision-grok-edit-profile-replacement`, `provision-grok-video-profile-replacement`, `reconcile-execution-profile-routes`, `reconcile-dreamina-profiles`, `reconcile-inline-customer-settlement`, `terminalize-unstarted-job`, `cancel-unlaunched-job`, `refresh-provider-quota`, or `retry-blocked-terminal`"
+        "missing command: expected `migrate`, `bootstrap-admin`, `provision-codex-profile`, `provision-codex-cli-edit-profile`, `provision-grok-profile`, `provision-grok-video-profile`, `provision-grok-image-profile-replacement`, `provision-grok-edit-profile-replacement`, `provision-grok-video-profile-replacement`, `reconcile-execution-profile-routes`, `reconcile-dreamina-profiles`, `reconcile-inline-customer-settlement`, `terminalize-unstarted-job`, `cancel-unlaunched-job`, `refresh-provider-quota`, or `retry-blocked-terminal`"
             .to_string()
     })?;
     let command = match command.as_ref() {
@@ -81,6 +83,7 @@ where
             }
         }
         "provision-codex-profile" => Command::ProvisionCodexProfile,
+        "provision-codex-cli-edit-profile" => Command::ProvisionCodexCliEditProfile,
         "provision-grok-profile" => Command::ProvisionGrokProfile,
         "provision-grok-video-profile" => Command::ProvisionGrokVideoProfile,
         "provision-grok-video-profile-replacement" => {
@@ -179,7 +182,7 @@ where
         }
         value => {
             return Err(format!(
-                "unknown command `{value}`: expected `migrate`, `bootstrap-admin`, `provision-codex-profile`, `provision-grok-profile`, `provision-grok-video-profile`, `provision-grok-image-profile-replacement`, `provision-grok-edit-profile-replacement`, `provision-grok-video-profile-replacement`, `reconcile-execution-profile-routes`, `reconcile-dreamina-profiles`, `reconcile-inline-customer-settlement`, `terminalize-unstarted-job`, `cancel-unlaunched-job`, `refresh-provider-quota`, or `retry-blocked-terminal`"
+                "unknown command `{value}`: expected `migrate`, `bootstrap-admin`, `provision-codex-profile`, `provision-codex-cli-edit-profile`, `provision-grok-profile`, `provision-grok-video-profile`, `provision-grok-image-profile-replacement`, `provision-grok-edit-profile-replacement`, `provision-grok-video-profile-replacement`, `reconcile-execution-profile-routes`, `reconcile-dreamina-profiles`, `reconcile-inline-customer-settlement`, `terminalize-unstarted-job`, `cancel-unlaunched-job`, `refresh-provider-quota`, or `retry-blocked-terminal`"
             ));
         }
     };
@@ -216,7 +219,7 @@ async fn main() -> Result<(), ImageGatewayError> {
     let command = parse_command(env::args().skip(1)).map_err(ImageGatewayError::config)?;
     let provisioning = match &command {
         Command::Migrate => None,
-        Command::ProvisionCodexProfile => {
+        Command::ProvisionCodexProfile | Command::ProvisionCodexCliEditProfile => {
             let credential_home = provider_credential_home("EXECUTOR_CODEX_CREDENTIAL_HOME")?;
             Some(provisioning_from_env(codex_auth_file_sha256(
                 credential_home,
@@ -259,6 +262,19 @@ async fn main() -> Result<(), ImageGatewayError> {
                 .map_err(|error| map_provisioning_error("Codex", error))?;
             println!(
                 "Codex execution profile provisioned: {}",
+                provisioned.execution_profile_id
+            );
+        }
+        Command::ProvisionCodexCliEditProfile => {
+            verify_migrations(&pool).await?;
+            let provisioning = provisioning.ok_or_else(|| {
+                ImageGatewayError::config("Codex CLI edit profile provisioning is missing")
+            })?;
+            let provisioned = provision_codex_cli_edit_execution_profile(&pool, &provisioning)
+                .await
+                .map_err(|error| map_provisioning_error("Codex CLI edit", error))?;
+            println!(
+                "Codex CLI edit execution profile provisioned: {}",
                 provisioned.execution_profile_id
             );
         }
@@ -600,6 +616,15 @@ mod tests {
     }
 
     #[test]
+    fn accepts_only_explicit_codex_cli_edit_profile_command() {
+        assert_eq!(
+            parse_command(["provision-codex-cli-edit-profile"]),
+            Ok(Command::ProvisionCodexCliEditProfile)
+        );
+        assert!(parse_command(["provision-codex-cli-edit-profile", "unexpected"]).is_err());
+    }
+
+    #[test]
     fn accepts_exactly_provision_grok_profile() {
         assert_eq!(
             parse_command(["provision-grok-profile"]),
@@ -762,7 +787,7 @@ mod tests {
     fn rejects_missing_command() {
         assert_eq!(
             parse_command([] as [&str; 0]),
-            Err("missing command: expected `migrate`, `bootstrap-admin`, `provision-codex-profile`, `provision-grok-profile`, `provision-grok-video-profile`, `provision-grok-image-profile-replacement`, `provision-grok-edit-profile-replacement`, `provision-grok-video-profile-replacement`, `reconcile-execution-profile-routes`, `reconcile-dreamina-profiles`, `reconcile-inline-customer-settlement`, `terminalize-unstarted-job`, `cancel-unlaunched-job`, `refresh-provider-quota`, or `retry-blocked-terminal`".to_string())
+            Err("missing command: expected `migrate`, `bootstrap-admin`, `provision-codex-profile`, `provision-codex-cli-edit-profile`, `provision-grok-profile`, `provision-grok-video-profile`, `provision-grok-image-profile-replacement`, `provision-grok-edit-profile-replacement`, `provision-grok-video-profile-replacement`, `reconcile-execution-profile-routes`, `reconcile-dreamina-profiles`, `reconcile-inline-customer-settlement`, `terminalize-unstarted-job`, `cancel-unlaunched-job`, `refresh-provider-quota`, or `retry-blocked-terminal`".to_string())
         );
     }
 
@@ -771,7 +796,7 @@ mod tests {
         assert_eq!(
             parse_command(["status"]),
             Err(
-                "unknown command `status`: expected `migrate`, `bootstrap-admin`, `provision-codex-profile`, `provision-grok-profile`, `provision-grok-video-profile`, `provision-grok-image-profile-replacement`, `provision-grok-edit-profile-replacement`, `provision-grok-video-profile-replacement`, `reconcile-execution-profile-routes`, `reconcile-dreamina-profiles`, `reconcile-inline-customer-settlement`, `terminalize-unstarted-job`, `cancel-unlaunched-job`, `refresh-provider-quota`, or `retry-blocked-terminal`"
+                "unknown command `status`: expected `migrate`, `bootstrap-admin`, `provision-codex-profile`, `provision-codex-cli-edit-profile`, `provision-grok-profile`, `provision-grok-video-profile`, `provision-grok-image-profile-replacement`, `provision-grok-edit-profile-replacement`, `provision-grok-video-profile-replacement`, `reconcile-execution-profile-routes`, `reconcile-dreamina-profiles`, `reconcile-inline-customer-settlement`, `terminalize-unstarted-job`, `cancel-unlaunched-job`, `refresh-provider-quota`, or `retry-blocked-terminal`"
                     .to_string()
             )
         );
