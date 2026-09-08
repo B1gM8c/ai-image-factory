@@ -199,6 +199,48 @@ RESET ROLE;
         self.assertEqual(created.returncode, 0, created.stderr)
         self.assertEqual(self.sql('SELECT count(*) FROM app.future', role=reader).returncode, 0)
 
+    def test_implicit_extension_arrays_keep_owner_without_role_escalation(self):
+        # PG16 represents these as array --i--> base --e--> extension; PG18
+        # additionally gives dependent types their own direct e membership.
+        # Neither representation requires granting the bootstrap owner role.
+        query = '''SELECT a.typname, pg_get_userbyid(a.typowner),
+  EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid='pg_type'::regclass
+    AND d.objid=a.oid AND d.objsubid=0 AND d.refclassid='pg_extension'::regclass
+    AND d.refobjid=x.oid AND d.deptype='e') AS direct_member,
+  pg_has_role(a.typowner, 'SET') AS can_set_owner
+FROM pg_type a JOIN pg_type b ON a.typelem=b.oid AND b.typarray=a.oid
+JOIN pg_depend i ON i.classid='pg_type'::regclass AND i.objid=a.oid AND i.objsubid=0
+  AND i.refclassid='pg_type'::regclass AND i.refobjid=b.oid AND i.refobjsubid=0 AND i.deptype='i'
+JOIN pg_depend e ON e.classid='pg_type'::regclass AND e.objid=b.oid AND e.objsubid=0
+  AND e.refclassid='pg_extension'::regclass AND e.deptype='e'
+JOIN pg_extension x ON x.oid=e.refobjid AND x.extname='btree_gist'
+WHERE a.typnamespace='app'::regnamespace AND a.typnamespace=b.typnamespace
+  AND a.typowner=b.typowner ORDER BY a.typname;'''
+        before = self.sql(query, role=self.roles['migrator'])
+        self.assertEqual(before.returncode, 0, before.stderr)
+        rows = before.stdout.splitlines()
+        self.assertGreater(len(rows), 0, 'fixture must contain implicit btree_gist array types')
+        self.assertTrue(all(row.endswith('|f') for row in rows), rows)
+        fingerprint = self.security()
+        result, image = self.backup()
+        self.assertEqual(result.returncode, 0, result.stderr + '\narray catalog: ' + before.stdout)
+        restored = self.sql(image, role=self.roles['migrator'])
+        self.assertEqual(restored.returncode, 0, restored.stderr)
+        self.assertEqual(self.security(), fingerprint)
+        after = self.sql(query, role=self.roles['migrator'])
+        self.assertEqual(after.returncode, 0, after.stderr)
+        self.assertEqual(after.stdout, before.stdout)
+
+    def test_non_extension_array_owner_permission_failure_is_not_exempted(self):
+        # An ordinary type/array with the same inaccessible bootstrap owner is
+        # not reconstructed by CREATE EXTENSION and still requires owner rights.
+        created = self.sql("CREATE TYPE app.independent_type AS ENUM ('value');")
+        self.assertEqual(created.returncode, 0, created.stderr)
+        result, image = self.backup()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('cannot restore saved schema/object owners', result.stderr)
+        self.assertIsNone(image)
+
     def test_acl_loss_and_injected_sql_fault_each_roll_back(self):
         before = self.security()
         result, image = self.backup()
@@ -315,10 +357,10 @@ SET ROLE {r['object_owner']}; GRANT SELECT ON app.jobs TO {r['reader']};''')
                 'CREATE TABLE audit.child(id bigint REFERENCES app.jobs(id));'):
             with self.subTest(external=external):
                 self.assertEqual(self.sql('ALTER TABLE app.jobs ADD PRIMARY KEY(id);').returncode, 0)
-                result, image = self.backup()
-                self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertEqual(self.sql('CREATE SCHEMA audit; ' + external).returncode, 0)
                 try:
+                    result, image = self.backup()
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(self.sql('CREATE SCHEMA audit; ' + external).returncode, 0)
                     rejected, rejected_image = self.backup()
                     self.assertNotEqual(rejected.returncode, 0)
                     self.assertIn('external or unsupported dependencies', rejected.stderr)
@@ -329,7 +371,7 @@ SET ROLE {r['object_owner']}; GRANT SELECT ON app.jobs TO {r['reader']};''')
                     self.assertEqual(self.sql("SELECT count(*) FROM pg_class WHERE relnamespace='audit'::regnamespace AND relkind IN ('v','r')").stdout.strip(), '1')
                     self.assertEqual(self.sql('SELECT marker FROM app.jobs').stdout.strip(), 'original')
                 finally:
-                    self.assertEqual(self.sql('DROP SCHEMA audit CASCADE; ALTER TABLE app.jobs DROP CONSTRAINT jobs_pkey;').returncode, 0)
+                    self.assertEqual(self.sql('DROP SCHEMA IF EXISTS audit CASCADE; ALTER TABLE app.jobs DROP CONSTRAINT jobs_pkey;').returncode, 0)
 
 
 if __name__ == '__main__':

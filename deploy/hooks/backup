@@ -161,7 +161,18 @@ SELECT has_database_privilege(current_database(), 'CREATE') AND pg_has_role(exto
 \else
   DO $aif$ BEGIN RAISE EXCEPTION 'migration role cannot restore the saved extension owner; no backup published'; END $aif$;
 \endif
-WITH objects(classid, object_id, owner) AS (
+-- PG16 does not record direct extension membership for implicit array types.
+-- CREATE EXTENSION rebuilds these arrays with their original bootstrap owner;
+-- ordinary types/arrays still require migration-role ownership privileges.
+WITH extension_arrays(object_id) AS (
+  SELECT a.oid FROM pg_type a JOIN pg_type b ON a.typelem = b.oid AND b.typarray = a.oid
+  JOIN pg_depend i ON i.classid = 'pg_type'::regclass AND i.objid = a.oid AND i.objsubid = 0
+    AND i.refclassid = 'pg_type'::regclass AND i.refobjid = b.oid AND i.refobjsubid = 0 AND i.deptype = 'i'
+  JOIN pg_depend e ON e.classid = 'pg_type'::regclass AND e.objid = b.oid AND e.objsubid = 0
+    AND e.refclassid = 'pg_extension'::regclass AND e.deptype = 'e'
+  JOIN pg_extension x ON x.oid = e.refobjid AND x.extname = 'btree_gist'
+  WHERE a.typnamespace = b.typnamespace AND a.typowner = b.typowner
+), objects(classid, object_id, owner) AS (
   SELECT 'pg_class'::regclass, oid, relowner FROM pg_class WHERE relnamespace = quote_ident(:'database_schema')::regnamespace
   UNION ALL SELECT 'pg_proc'::regclass, oid, proowner FROM pg_proc WHERE pronamespace = quote_ident(:'database_schema')::regnamespace
   UNION ALL SELECT 'pg_type'::regclass, oid, typowner FROM pg_type WHERE typnamespace = quote_ident(:'database_schema')::regnamespace
@@ -176,6 +187,7 @@ WITH objects(classid, object_id, owner) AS (
 )
 SELECT pg_has_role(nspowner, 'USAGE') AND has_schema_privilege(current_user, nspname, 'CREATE')
   AND NOT EXISTS (SELECT 1 FROM objects o WHERE NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid = o.classid AND d.objid = o.object_id AND d.deptype = 'e')
+    AND NOT EXISTS (SELECT 1 FROM extension_arrays a WHERE o.classid = 'pg_type'::regclass AND a.object_id = o.object_id)
     AND (NOT pg_has_role(o.owner, 'SET') OR NOT has_schema_privilege(o.owner, :'database_schema', 'CREATE')))
   AS can_restore_owners FROM pg_namespace WHERE nspname = :'database_schema' \gset
 \if :can_restore_owners
