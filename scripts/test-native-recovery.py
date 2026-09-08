@@ -7,8 +7,9 @@ independent reader and authenticated Next BFF are real. No provider task is sent
 Secure cookies are replayed explicitly by this HTTP client: this is authenticated
 SSR/BFF acceptance, not a browser/TLS/SameSite acceptance claim.
 
-Requires four prebuilt release inputs, root on a fresh GitHub-hosted Linux VM,
-and AIF_NATIVE_TEST_ADMIN_DSN pointing at its synthetic loopback /postgres DB.
+Requires four prebuilt release inputs, the real pinned Codex runtime for the
+baseline's startup dependency, root on a fresh GitHub-hosted Linux VM, and
+AIF_NATIVE_TEST_ADMIN_DSN pointing at its synthetic loopback /postgres DB.
 Never run this on a developer machine, persistent runner or production host.
 """
 
@@ -41,6 +42,7 @@ LIB = Path('/usr/libexec/ai-image-factory')
 UNITS = Path('/etc/systemd/system')
 TARGET = 'x86_64-unknown-linux-gnu'
 PREFIX = 'ai-image-factory-'
+CODEX_VERSION = '0.153.4'
 SECRET_VALUES = []
 RECOVERY_HOST_FILES = {
     'ops/hooks/' + name for name in
@@ -120,7 +122,13 @@ def preflight(args):
     require(not list(UNITS.glob(PREFIX + '*')), 'refusing existing Factory units')
     require(run(['getent', 'passwd', 'ai-image-factory'], check=False).returncode != 0,
             'refusing existing Factory service account')
-    for command in ('psql', 'pg_dump', 'systemctl', 'ss', 'curl', 'node', 'openssl'):
+    codex_runtime = args.codex_runtime.resolve(strict=True)
+    require(runner_temp in codex_runtime.parents and codex_runtime.is_dir()
+            and (codex_runtime / 'bin/codex').is_file(), 'Codex runtime must be the pinned runner-local input')
+    require(run([codex_runtime / 'bin/codex', '--version'],
+                env={'PATH': '/usr/bin:/bin'}, timeout=15).stdout.strip() == 'codex-cli ' + CODEX_VERSION,
+            'the native startup dependency must be the real pinned Codex CLI')
+    for command in ('psql', 'pg_dump', 'systemctl', 'ss', 'curl', 'node', 'openssl', 'runuser'):
         require(shutil.which(command), f'missing prerequisite {command}')
     require(Path('/usr/bin/node').is_file(), 'repo admin unit requires /usr/bin/node')
     admin_dsn = os.environ.get('AIF_NATIVE_TEST_ADMIN_DSN', '')
@@ -621,7 +629,7 @@ def execute(args, admin, output):
     run(['useradd', '--system', '--home-dir', str(STATE), '--shell', '/usr/sbin/nologin',
          'ai-image-factory'])
     service = pwd.getpwnam('ai-image-factory')
-    for directory in ('artifacts', 'admin-runtime', 'runner', 'credentials/grok'):
+    for directory in ('artifacts', 'admin-runtime', 'runner', 'credentials/grok', 'provider-homes'):
         path = STATE / directory
         path.mkdir(parents=True, mode=0o700)
         os.chown(path, service.pw_uid, service.pw_gid)
@@ -629,6 +637,24 @@ def execute(args, admin, output):
     (STATE / 'updater').mkdir(mode=0o700)
     (STATE / 'backups').mkdir(mode=0o700)
     unpack(args.baseline_bundle, ROOT / 'releases' / baseline['release_version'])
+    # ProtectHome hides /home/runner from the real service. Keep the complete
+    # pinned runtime in this disposable installation, outside immutable releases.
+    codex_runtime = ROOT / 'provider-tools/codex' / CODEX_VERSION
+    shutil.copytree(args.codex_runtime, codex_runtime)
+    codex_binary = codex_runtime / 'bin/codex'
+    codex_dependency = {'version': CODEX_VERSION, 'executable': str(codex_binary),
+                        'sha256': digest(codex_binary), 'purpose': 'startup prerequisite only'}
+    require(codex_dependency['sha256'] == digest(args.codex_runtime / 'bin/codex'),
+            'copied Codex startup dependency differs from pinned input')
+    service_version = run(['runuser', '-u', service.pw_name, '--', '/usr/bin/env', '-i',
+                           'PATH=/usr/bin:/bin', codex_binary, '--version'],
+                          env={'PATH': '/usr/sbin:/usr/bin:/sbin:/bin'}, timeout=15)
+    require(service_version.stdout.strip() == 'codex-cli ' + CODEX_VERSION,
+            'service UID cannot execute the copied pinned Codex startup dependency')
+    codex_dependency['service_uid_version_check'] = {
+        'uid': service.pw_uid, 'user': service.pw_name,
+        'version_output': service_version.stdout.strip(), 'exit_code': service_version.returncode}
+    progress('Real pinned startup dependency: ' + json.dumps(codex_dependency))
     installed_host_files = install_host_files(args.baseline_bundle, baseline)
     baseline_host_files = dict(installed_host_files)
     baseline_updater_hash = installed_host_files['bin/updated']['sha256']
@@ -646,11 +672,16 @@ def execute(args, admin, output):
     SECRET_VALUES.extend([dsn, reader_dsn])
     owner_env = pg_environment(dsn)
     sql(owner_env, f'ALTER SCHEMA public OWNER TO {owner}; REVOKE CREATE ON SCHEMA public FROM PUBLIC;')
-    application = {'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'DATABASE_URL': dsn,
+    application = {'PATH': str(codex_runtime / 'bin') + ':/usr/sbin:/usr/bin:/sbin:/bin', 'DATABASE_URL': dsn,
         'GATEWAY_DATABASE_SCHEMA': 'public', 'GATEWAY_ARTIFACT_ROOT': str(STATE / 'artifacts'),
+        'GATEWAY_PROVIDER_HOME_ROOT': str(STATE / 'provider-homes'),
+        'GATEWAY_MANAGED_CODEX_EXECUTABLE': str(codex_binary),
         'GATEWAY_ADMIN_READ_DATABASE_URL': reader_dsn, 'GATEWAY_BIND': '127.0.0.1:8787',
         'GATEWAY_API_TOKEN': secrets.token_hex(32), 'GATEWAY_API_KEY_PEPPERS': '1:' + secrets.token_hex(32),
         'GATEWAY_API_KEY_CURRENT_PEPPER_VERSION': '1', 'GATEWAY_IDENTITY_ENABLED': 'true',
+        'GATEWAY_IMAGES_GENERATION_CONTRACT': 'customer-pricing-v4',
+        'GATEWAY_WEBHOOK_SIGNING_KEYS': '1:' + secrets.token_hex(32),
+        'GATEWAY_WEBHOOK_CURRENT_SIGNING_KEY_VERSION': '1',
         'GATEWAY_AUTH_ISSUER': 'http://127.0.0.1:8787', 'GATEWAY_AUTH_AUDIENCE': 'ai-image-factory-admin',
         'GATEWAY_AUTH_CLIENT_ID': 'ai-image-factory-admin-bff', 'GATEWAY_JWT_ACTIVE_KID': 'admin-es256-v1',
         'GATEWAY_JWT_PRIVATE_KEY_PATH': str(STATE / 'identity/admin-jwt-es256-private.pem'),
@@ -660,6 +691,8 @@ def execute(args, admin, output):
         'GATEWAY_CODEX_QUOTA_AUTO_REFRESH_ENABLED': 'false', 'GATEWAY_BBOX_ENABLED': 'false',
         'RECONCILER_INTERVAL_MS': '1000', 'RUST_LOG': 'info'}
     SECRET_VALUES.extend([application['GATEWAY_API_TOKEN'], application['GATEWAY_API_KEY_PEPPERS']])
+    SECRET_VALUES.extend([application['GATEWAY_WEBHOOK_SIGNING_KEYS'],
+                          application['GATEWAY_WEBHOOK_SIGNING_KEYS'].split(':', 1)[1]])
     run([ROOT / 'current/bin/factoryctl', 'migrate'], env=application, timeout=180)
     require(int(sql(owner_env, 'SELECT max(version) FROM _sqlx_migrations;')) == baseline['target_schema_version'],
             'real baseline migration ledger differs from release manifest')
@@ -669,7 +702,8 @@ def execute(args, admin, output):
     bootstrap(ROOT / 'current/bin/factoryctl', application, password)
     auth_path = STATE / 'credentials/grok/auth.json'
     write(auth_path, '{"access_token":"synthetic-never-send","refresh_token":"synthetic-never-send"}\n')
-    executor = {'EXECUTOR_PROFILE_KEY': 'ci-grok', 'EXECUTOR_CREDENTIAL_POOL_KEY': 'ci-pool',
+    # The unit uses %I (unescaped instance); a literal hyphen would become '/'.
+    executor = {'EXECUTOR_PROFILE_KEY': 'ci.grok', 'EXECUTOR_CREDENTIAL_POOL_KEY': 'ci-pool',
         'EXECUTOR_PROVIDER_ACCOUNT_KEY': 'ci-account', 'EXECUTOR_CREDENTIAL_REF': 'ci.synthetic.grok',
         'EXECUTOR_CREDENTIAL_REVISION': '1', 'EXECUTOR_MAX_CONCURRENCY': '1',
         'EXECUTOR_GROK_CREDENTIAL_HOME': str(auth_path.parent),
@@ -702,7 +736,7 @@ RESET ROLE;
     write(STATE / 'artifacts/ci-original.bin', 'baseline-artifact\n')
     os.chown(STATE / 'artifacts/ci-original.bin', service.pw_uid, service.pw_gid)
     env_file(CONFIG / 'app.env', application)
-    env_file(CONFIG / 'executors/ci-grok.env', executor)
+    env_file(CONFIG / 'executors/ci.grok.env', executor)
     env_file(CONFIG / 'admin.env', {'GATEWAY_BASE_URL': 'http://127.0.0.1:8787',
         'ADMIN_CONSOLE_ORIGIN': 'http://127.0.0.1:3010', 'ADMIN_CONSOLE_CLIENT_ID': 'ai-image-factory-admin-bff'})
     policy = {'AIF_UPDATE_GITHUB_REPOSITORY': 'fixture/native', 'AIF_RELEASE_TARGET': TARGET,
@@ -725,7 +759,7 @@ RESET ROLE;
         updater['AIF_UPDATE_' + name.upper() + '_HOOK'] = str(LIB / 'hooks' / name)
     env_file(CONFIG / 'updater.env', updater)
     run(['systemctl', 'daemon-reload'])
-    run(['systemctl', 'enable', PREFIX + 'executord@ci-grok.service', PREFIX + 'workerd@ci-grok.service'])
+    run(['systemctl', 'enable', PREFIX + 'executord@ci.grok.service', PREFIX + 'workerd@ci.grok.service'])
     run(['systemctl', 'start', 'aif-native-admission.service', PREFIX + 'updater.service'])
     baseline_updater_before = updater_identity(baseline_updater_hash, 'false', require_safe_mounts=False)
     run([LIB / 'hooks/start-processes'], env={'PATH': '/usr/sbin:/usr/bin:/sbin:/bin',
@@ -750,6 +784,7 @@ RESET ROLE;
     write(output / 'systemd-effective.json', json.dumps(units, indent=2))
     write(output / 'host-hook-provenance.json', json.dumps({'baseline_manifest_sha256': digest(args.baseline_manifest),
         'candidate_manifest_sha256': digest(args.candidate_manifest), 'baseline_installed': baseline_host_files,
+        'codex_startup_dependency': codex_dependency,
         'installed': installed_host_files, 'host_preparation': host_preparation,
         'baseline_updater_before': baseline_updater_before, 'baseline_updater_prepared': baseline_updater_prepared}, indent=2))
     # Enabling Apply is a separate, explicit CI acceptance phase. Restart the
@@ -858,6 +893,7 @@ RESET ROLE;
     write(output / 'systemd-effective.json', json.dumps(units, indent=2))
     write(output / 'host-hook-provenance.json', json.dumps({'baseline_manifest_sha256': digest(args.baseline_manifest),
         'candidate_manifest_sha256': digest(args.candidate_manifest), 'baseline_installed': baseline_host_files,
+        'codex_startup_dependency': codex_dependency,
         'host_preparation': host_preparation, 'candidate_preparation_files': sorted(RECOVERY_HOST_FILES),
         'baseline_updater_before': baseline_updater_before, 'baseline_updater_prepared': baseline_updater_prepared,
         'baseline_updater_apply': baseline_updater_apply, 'baseline_updater_positive': baseline_updater_positive,
@@ -884,6 +920,7 @@ RESET ROLE;
                        'Authenticated page shells and real BFF data with explicit Secure Cookie replay, not browser-rendered data/TLS policy acceptance',
                        'Recovery preparation is exactly five hooks/three units with baseline updater retained; segmentd and segmentation host wiring are not enabled',
                        'Candidate fixed updater is installed only after application verification through the existing native helper, with Apply disabled',
+                       'Real pinned Codex CLI is only a startup dependency; no credentials or inference and no segmentation capability claim',
                        'Synthetic DB/roles/identity/account/artifacts only; no provider/model request'],
         'data_equivalence_scope': ['ci_recovery_probe row', 'provider account stable identity/credential fields',
                                    'ci_recovery_sequence state', 'ci_recovery_view and function read results',
@@ -896,7 +933,7 @@ RESET ROLE;
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    for option in ('baseline-bundle', 'baseline-manifest', 'candidate-bundle', 'candidate-manifest', 'output-dir'):
+    for option in ('baseline-bundle', 'baseline-manifest', 'candidate-bundle', 'candidate-manifest', 'codex-runtime', 'output-dir'):
         parser.add_argument('--' + option, type=Path, required=True)
     args = parser.parse_args()
     admin, output = preflight(args)

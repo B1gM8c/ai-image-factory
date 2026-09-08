@@ -117,6 +117,16 @@ jobs:
             scripts/package-release.sh "v0.1.0-rehearsal.${GITHUB_SHA:0:7}" \
               x86_64-unknown-linux-gnu "$GITHUB_SHA" "$RUNNER_TEMP/aif-candidate"
 
+      - name: Install pinned real Codex startup dependency in the disposable runner
+        run: |
+          npm install --prefix "$RUNNER_TEMP/aif-codex" --ignore-scripts --no-audit --no-fund \
+            --save-exact --registry=https://registry.npmjs.org @openai/codex@0.153.4
+          codex_runtime="$RUNNER_TEMP/aif-codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl"
+          test "$("$codex_runtime/bin/codex" --version)" = 'codex-cli 0.153.4'
+          sha256sum "$codex_runtime/bin/codex" "$RUNNER_TEMP/aif-codex/package-lock.json"
+          node -e 'const lock=require(process.argv[1]); for (const name of ["node_modules/@openai/codex", "node_modules/@openai/codex-linux-x64"]) { const p=lock.packages[name]; if (!p?.integrity) throw Error("missing pinned Codex integrity"); console.log(JSON.stringify({name,version:p.version,resolved:p.resolved,integrity:p.integrity})); }' \
+            "$RUNNER_TEMP/aif-codex/package-lock.json"
+
       - name: Fetch the immutable previous-schema baseline (read only)
         env:
           GH_TOKEN: ${{ github.token }}
@@ -138,6 +148,7 @@ jobs:
             python3 scripts/test-native-recovery.py \
               --baseline-bundle "$baseline.tar.gz" --baseline-manifest "$baseline.manifest.json" \
               --candidate-bundle "$candidate.tar.gz" --candidate-manifest "$candidate.manifest.json" \
+              --codex-runtime "$RUNNER_TEMP/aif-codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl" \
               --output-dir "$RUNNER_TEMP/aif-recovery-evidence"
 
       - name: Export only the explicit sanitized evidence files
