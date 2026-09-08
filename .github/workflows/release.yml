@@ -289,6 +289,7 @@ jobs:
 
       - name: Package deterministic release assets
         env:
+          MIN_SCHEMA_VERSION: "128"
           GROK_PROVIDER_BINARY: ${{ github.workspace }}/dist/grok-provider
           RELEASE_TARGET: ${{ matrix.target }}
           RELEASE_VERSION: ${{ github.ref_name }}
@@ -373,6 +374,8 @@ jobs:
                 and .commit_sha == $commit
                 and .target_triple == $target
                 and .migration_version == .target_schema_version
+                and .min_schema_version == 128
+                and .target_schema_version == 131
                 and .min_schema_version <= .target_schema_version
                 and .rollback_mode == "backup_restore"
                 and (.files | length > 0)
