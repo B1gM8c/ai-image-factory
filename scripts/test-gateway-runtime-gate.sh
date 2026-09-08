@@ -42,7 +42,7 @@ cat >"$TEST_ROOT/bin/systemctl" <<'EOF'
 #!/bin/bash
 case "$*" in
   "show ai-image-factory-gateway.service --property=MainPID --value") echo "${MOCK_MAIN_PID:-101}" ;;
-  "show ai-image-factory-executord@managed.service --property=MainPID --value") echo 102 ;;
+  "show ai-image-factory-executord@managed.service --property=MainPID --value") echo "${MOCK_EXECUTOR_PID:-102}" ;;
   "show gpt-image-2-gateway.service --property=LoadState --value") echo loaded ;;
   "is-enabled --quiet gpt-image-2-gateway.service") [[ "${MOCK_LEGACY_ENABLED:-false}" == true ]] ;;
   "is-active --quiet gpt-image-2-gateway.service") [[ "${MOCK_LEGACY_ACTIVE:-false}" == true ]] ;;
@@ -83,8 +83,42 @@ run_gate() {
 
 run_gate >/dev/null
 
+run_gate \
+  AIF_UPDATE_PROCESS_SCOPE=validation \
+  AIF_VERIFY_RELEASE_UNITS=ai-image-factory-gateway.service \
+  MOCK_EXECUTOR_PID=0 >/dev/null
+
+for scope in full unknown; do
+  if run_gate \
+    AIF_UPDATE_PROCESS_SCOPE="$scope" \
+    AIF_VERIFY_RELEASE_UNITS=ai-image-factory-gateway.service \
+    MOCK_EXECUTOR_PID=0 >/dev/null 2>&1; then
+    echo "expected ${scope} scope without a proven executor binding to fail" >&2
+    exit 1
+  fi
+done
+if run_gate AIF_UPDATE_PROCESS_SCOPE=unknown >/dev/null 2>&1; then
+  echo "expected unknown scope to fail even with healthy gateway and executor" >&2
+  exit 1
+fi
+if run_gate AIF_VERIFY_RELEASE_UNITS=ai-image-factory-gateway.service >/dev/null 2>&1; then
+  echo "expected default full scope without a proven executor binding to fail" >&2
+  exit 1
+fi
+if run_gate AIF_UPDATE_PROCESS_SCOPE=full MOCK_EXECUTOR_PID=0 >/dev/null 2>&1; then
+  echo "expected full scope with a stopped executor to fail" >&2
+  exit 1
+fi
+
 if run_gate MOCK_OWNER_PID=202 >/dev/null 2>&1; then
   echo "expected mismatched port owner to fail" >&2
+  exit 1
+fi
+if run_gate \
+  AIF_UPDATE_PROCESS_SCOPE=validation \
+  AIF_VERIFY_RELEASE_UNITS=ai-image-factory-gateway.service \
+  MOCK_OWNER_PID=202 >/dev/null 2>&1; then
+  echo "expected validation scope to retain the gateway port-owner gate" >&2
   exit 1
 fi
 
@@ -93,6 +127,12 @@ mkdir -p "$TEST_ROOT/releases/v0/bin"
 ln -sfn "$TEST_ROOT/releases/v0/bin/gpt-image-2-gateway" "$TEST_ROOT/proc/101/exe"
 if run_gate >/dev/null 2>&1; then
   echo "expected stale executable to fail" >&2
+  exit 1
+fi
+if run_gate \
+  AIF_UPDATE_PROCESS_SCOPE=validation \
+  AIF_VERIFY_RELEASE_UNITS=ai-image-factory-gateway.service >/dev/null 2>&1; then
+  echo "expected validation scope to retain the gateway release-identity gate" >&2
   exit 1
 fi
 ln -sfn "$TEST_ROOT/releases/v1/bin/gpt-image-2-gateway" "$TEST_ROOT/proc/101/exe"

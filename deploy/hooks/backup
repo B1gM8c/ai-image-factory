@@ -47,18 +47,249 @@ cleanup() {
 }
 trap cleanup EXIT
 
-pg_dump \
-  --dbname="$DATABASE_URL" \
-  --format=plain \
-  --no-owner \
-  --no-privileges \
-  --schema="$GATEWAY_DATABASE_SCHEMA" \
-  --file="${TEMPORARY_DIRECTORY}/database.dump.sql"
-{
-  printf 'DROP SCHEMA IF EXISTS "%s" CASCADE;\n' "$GATEWAY_DATABASE_SCHEMA"
-  cat "${TEMPORARY_DIRECTORY}/database.dump.sql"
-} >"${TEMPORARY_DIRECTORY}/database.sql"
-rm -f -- "${TEMPORARY_DIRECTORY}/database.dump.sql"
+database_dependency_guard() {
+  # DROP SCHEMA CASCADE also follows internal/extension ownership in reverse
+  # (notably an external view rule -> its owning view). Reject that layout,
+  # rather than expanding a one-schema recovery point to unrelated objects.
+  cat <<'SQL'
+SET search_path = pg_catalog;
+WITH RECURSIVE edges AS (
+  SELECT refclassid src_class, refobjid src_id, refobjsubid src_sub, classid dst_class, objid dst_id, objsubid dst_sub FROM pg_depend
+  UNION ALL SELECT classid, objid, objsubid, refclassid, refobjid, refobjsubid FROM pg_depend WHERE deptype IN ('i', 'e')
+), affected(classid, objid, objsubid) AS (
+  SELECT 'pg_namespace'::regclass::oid, oid, 0 FROM pg_namespace WHERE nspname = :'database_schema'
+  UNION SELECT e.dst_class, e.dst_id, e.dst_sub FROM affected a JOIN edges e
+    ON e.src_class = a.classid AND e.src_id = a.objid AND (a.objsubid = 0 OR e.src_sub = a.objsubid)
+), relation_scope AS (
+  SELECT c.oid, CASE WHEN n.nspname = 'pg_toast' THEN (
+    SELECT owner_ns.nspname FROM pg_class owner_table JOIN pg_namespace owner_ns ON owner_ns.oid = owner_table.relnamespace
+    WHERE owner_table.reltoastrelid = coalesce((SELECT indrelid FROM pg_index WHERE indexrelid = c.oid), c.oid)
+  ) ELSE n.nspname END AS schema_name FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+), scopes AS (
+  SELECT a.*, CASE a.classid
+    WHEN 'pg_namespace'::regclass THEN (SELECT nspname FROM pg_namespace WHERE oid = a.objid)
+    WHEN 'pg_class'::regclass THEN (SELECT schema_name FROM relation_scope WHERE oid = a.objid)
+    WHEN 'pg_extension'::regclass THEN (SELECT nspname FROM pg_extension e JOIN pg_namespace n ON n.oid = e.extnamespace WHERE e.oid = a.objid AND e.extname = 'btree_gist')
+    WHEN 'pg_default_acl'::regclass THEN (SELECT nspname FROM pg_default_acl d JOIN pg_namespace n ON n.oid = d.defaclnamespace WHERE d.oid = a.objid)
+    WHEN 'pg_rewrite'::regclass THEN (SELECT schema_name FROM pg_rewrite r JOIN relation_scope s ON s.oid = r.ev_class WHERE r.oid = a.objid)
+    WHEN 'pg_trigger'::regclass THEN (SELECT schema_name FROM pg_trigger t JOIN relation_scope s ON s.oid = t.tgrelid WHERE t.oid = a.objid)
+    WHEN 'pg_attrdef'::regclass THEN (SELECT schema_name FROM pg_attrdef d JOIN relation_scope s ON s.oid = d.adrelid WHERE d.oid = a.objid)
+    WHEN 'pg_policy'::regclass THEN (SELECT schema_name FROM pg_policy p JOIN relation_scope s ON s.oid = p.polrelid WHERE p.oid = a.objid)
+    WHEN 'pg_amop'::regclass THEN (SELECT nspname FROM pg_amop aop JOIN pg_opfamily f ON f.oid = aop.amopfamily JOIN pg_namespace n ON n.oid = f.opfnamespace WHERE aop.oid = a.objid)
+    WHEN 'pg_amproc'::regclass THEN (SELECT nspname FROM pg_amproc ap JOIN pg_opfamily f ON f.oid = ap.amprocfamily JOIN pg_namespace n ON n.oid = f.opfnamespace WHERE ap.oid = a.objid)
+    ELSE (parse_ident((pg_identify_object(a.classid, a.objid, a.objsubid)).schema, true))[1] END AS schema_name FROM affected a
+)
+SELECT NOT EXISTS (SELECT 1 FROM scopes WHERE schema_name IS DISTINCT FROM :'database_schema') AS recovery_scope_safe \gset
+\if :recovery_scope_safe
+\else
+  DO $aif$ BEGIN RAISE EXCEPTION 'schema recovery would affect external or unsupported dependencies'; END $aif$;
+\endif
+SQL
+}
+
+database_security_query() {
+  # Compare stable identities, not catalog OIDs or ACL array ordering. Extension
+  # members are included: pg_dump must also preserve their non-default ACLs.
+  cat <<'SQL'
+WITH objects(kind, identity, owner, acl) AS (
+  SELECT 'schema', nspname, nspowner, nspacl FROM pg_namespace WHERE nspname = :'database_schema'
+  UNION ALL SELECT 'relation:' || relkind::text, relname, relowner, relacl FROM pg_class WHERE relnamespace = quote_ident(:'database_schema')::regnamespace
+  UNION ALL SELECT 'column', c.relname || '.' || a.attname, c.relowner, a.attacl FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid WHERE c.relnamespace = quote_ident(:'database_schema')::regnamespace AND a.attnum > 0 AND NOT a.attisdropped
+  UNION ALL SELECT 'function', p.oid::regprocedure::text, proowner, proacl FROM pg_proc p WHERE pronamespace = quote_ident(:'database_schema')::regnamespace
+  UNION ALL SELECT 'type', typname, typowner, typacl FROM pg_type WHERE typnamespace = quote_ident(:'database_schema')::regnamespace
+  UNION ALL SELECT 'collation', collname || ':' || collencoding, collowner, NULL::aclitem[] FROM pg_collation WHERE collnamespace = quote_ident(:'database_schema')::regnamespace
+  UNION ALL SELECT 'conversion', conname, conowner, NULL::aclitem[] FROM pg_conversion WHERE connamespace = quote_ident(:'database_schema')::regnamespace
+  UNION ALL SELECT 'operator', oid::regoperator::text, oprowner, NULL::aclitem[] FROM pg_operator WHERE oprnamespace = quote_ident(:'database_schema')::regnamespace
+  UNION ALL SELECT 'operator_class', opcname || ':' || amname, opcowner, NULL::aclitem[] FROM pg_opclass JOIN pg_am ON pg_am.oid = opcmethod WHERE opcnamespace = quote_ident(:'database_schema')::regnamespace
+  UNION ALL SELECT 'operator_family', opfname || ':' || amname, opfowner, NULL::aclitem[] FROM pg_opfamily JOIN pg_am ON pg_am.oid = opfmethod WHERE opfnamespace = quote_ident(:'database_schema')::regnamespace
+  UNION ALL SELECT 'text_search_config', cfgname, cfgowner, NULL::aclitem[] FROM pg_ts_config WHERE cfgnamespace = quote_ident(:'database_schema')::regnamespace
+  UNION ALL SELECT 'text_search_dictionary', dictname, dictowner, NULL::aclitem[] FROM pg_ts_dict WHERE dictnamespace = quote_ident(:'database_schema')::regnamespace
+  UNION ALL SELECT 'default_acl:' || CASE WHEN defaclnamespace = 0 THEN 'global' ELSE 'schema' END, defaclrole::regrole::text || ':' || defaclobjtype::text, defaclrole, defaclacl FROM pg_default_acl WHERE defaclnamespace = 0 OR defaclnamespace = quote_ident(:'database_schema')::regnamespace
+), normalized AS (
+  SELECT kind, identity, owner, coalesce(acl,
+    CASE WHEN kind = 'schema' THEN acldefault('n', owner)
+         WHEN kind = 'relation:S' THEN acldefault('s', owner)
+         WHEN kind LIKE 'relation:%' THEN acldefault('r', owner)
+         WHEN kind = 'column' THEN acldefault('c', owner)
+         WHEN kind = 'function' THEN acldefault('f', owner)
+         WHEN kind = 'type' THEN acldefault('T', owner) END) AS acl
+  FROM objects
+), security AS (
+  SELECT kind, identity, owner::regrole::text AS owner,
+    (SELECT jsonb_agg(jsonb_build_array(grantor::regrole::text, CASE WHEN grantee = 0 THEN 'PUBLIC' ELSE grantee::regrole::text END, privilege_type, is_grantable) ORDER BY grantor::regrole::text, grantee::regrole::text, privilege_type, is_grantable) FROM aclexplode(acl)) AS acl
+  FROM normalized
+), identities AS (
+  SELECT jsonb_build_array(kind, identity, owner, acl) AS value FROM security
+  UNION ALL SELECT jsonb_build_array('extension', extname, extowner::regrole::text, nspname, extversion) FROM pg_extension JOIN pg_namespace ON pg_namespace.oid = extnamespace WHERE extname = 'btree_gist'
+)
+SELECT coalesce(jsonb_agg(value ORDER BY value::text), '[]'::jsonb) FROM identities
+SQL
+}
+
+prepare_database_sql() {
+  local directory extension_sql security_query security_before security_after extension_count
+  directory="$1"
+  database_dependency_guard | psql -X --dbname="$DATABASE_URL" -qAt --set=ON_ERROR_STOP=1 \
+    --set="database_schema=${GATEWAY_DATABASE_SCHEMA}"
+  # A schema-filtered dump does not include extension definitions by default.
+  # Only the dependency used by our migrations is supported, never invented.
+  extension_sql="$(psql -X --dbname="$DATABASE_URL" -qAt --set=ON_ERROR_STOP=1 \
+    --set="database_schema=${GATEWAY_DATABASE_SCHEMA}" <<'SQL'
+SELECT set_config('search_path', 'pg_catalog', false) \g /dev/null
+SELECT NOT EXISTS (SELECT 1 FROM pg_default_acl WHERE defaclnamespace = 0) AS defaults_supported \gset
+\if :defaults_supported
+\else
+  DO $aif$ BEGIN RAISE EXCEPTION 'schema recovery does not support global default privileges; no backup published'; END $aif$;
+\endif
+SELECT count(*) = 1 AND bool_and(n.nspname = :'database_schema') AS extension_supported
+FROM pg_extension e JOIN pg_namespace n ON n.oid = e.extnamespace
+WHERE e.extname = 'btree_gist' \gset
+\if :extension_supported
+\else
+  DO $aif$ BEGIN RAISE EXCEPTION 'recovery requires the existing btree_gist extension in the application schema'; END $aif$;
+\endif
+SELECT NOT EXISTS (SELECT 1 FROM pg_extension e JOIN pg_namespace n ON n.oid = e.extnamespace WHERE n.nspname = :'database_schema' AND e.extname <> 'btree_gist') AS extensions_supported \gset
+\if :extensions_supported
+\else
+  DO $aif$ BEGIN RAISE EXCEPTION 'recovery does not support additional extensions in the application schema'; END $aif$;
+\endif
+SELECT has_database_privilege(current_database(), 'CREATE') AND pg_has_role(extowner, 'SET')
+  AND has_database_privilege(extowner, current_database(), 'CREATE')
+  AND has_schema_privilege(extowner, :'database_schema', 'CREATE')
+  AS can_restore_extension FROM pg_extension WHERE extname = 'btree_gist' \gset
+\if :can_restore_extension
+\else
+  DO $aif$ BEGIN RAISE EXCEPTION 'migration role cannot restore the saved extension owner; no backup published'; END $aif$;
+\endif
+WITH objects(classid, object_id, owner) AS (
+  SELECT 'pg_class'::regclass, oid, relowner FROM pg_class WHERE relnamespace = quote_ident(:'database_schema')::regnamespace
+  UNION ALL SELECT 'pg_proc'::regclass, oid, proowner FROM pg_proc WHERE pronamespace = quote_ident(:'database_schema')::regnamespace
+  UNION ALL SELECT 'pg_type'::regclass, oid, typowner FROM pg_type WHERE typnamespace = quote_ident(:'database_schema')::regnamespace
+  UNION ALL SELECT 'pg_collation'::regclass, oid, collowner FROM pg_collation WHERE collnamespace = quote_ident(:'database_schema')::regnamespace
+  UNION ALL SELECT 'pg_conversion'::regclass, oid, conowner FROM pg_conversion WHERE connamespace = quote_ident(:'database_schema')::regnamespace
+  UNION ALL SELECT 'pg_operator'::regclass, oid, oprowner FROM pg_operator WHERE oprnamespace = quote_ident(:'database_schema')::regnamespace
+  UNION ALL SELECT 'pg_opclass'::regclass, oid, opcowner FROM pg_opclass WHERE opcnamespace = quote_ident(:'database_schema')::regnamespace
+  UNION ALL SELECT 'pg_opfamily'::regclass, oid, opfowner FROM pg_opfamily WHERE opfnamespace = quote_ident(:'database_schema')::regnamespace
+  UNION ALL SELECT 'pg_ts_config'::regclass, oid, cfgowner FROM pg_ts_config WHERE cfgnamespace = quote_ident(:'database_schema')::regnamespace
+  UNION ALL SELECT 'pg_ts_dict'::regclass, oid, dictowner FROM pg_ts_dict WHERE dictnamespace = quote_ident(:'database_schema')::regnamespace
+  UNION ALL SELECT 'pg_default_acl'::regclass, oid, defaclrole FROM pg_default_acl WHERE defaclnamespace = quote_ident(:'database_schema')::regnamespace
+)
+SELECT pg_has_role(nspowner, 'USAGE') AND has_schema_privilege(current_user, nspname, 'CREATE')
+  AND NOT EXISTS (SELECT 1 FROM objects o WHERE NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid = o.classid AND d.objid = o.object_id AND d.deptype = 'e')
+    AND (NOT pg_has_role(o.owner, 'SET') OR NOT has_schema_privilege(o.owner, :'database_schema', 'CREATE')))
+  AS can_restore_owners FROM pg_namespace WHERE nspname = :'database_schema' \gset
+\if :can_restore_owners
+\else
+  DO $aif$ BEGIN RAISE EXCEPTION 'migration role cannot restore saved schema/object owners; no backup published'; END $aif$;
+\endif
+WITH acl_objects(owner, acl) AS (
+  SELECT nspowner, nspacl FROM pg_namespace WHERE nspname = :'database_schema'
+  UNION ALL SELECT relowner, relacl FROM pg_class WHERE relnamespace = quote_ident(:'database_schema')::regnamespace
+  UNION ALL SELECT c.relowner, a.attacl FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid WHERE c.relnamespace = quote_ident(:'database_schema')::regnamespace
+  UNION ALL SELECT proowner, proacl FROM pg_proc WHERE pronamespace = quote_ident(:'database_schema')::regnamespace
+  UNION ALL SELECT typowner, typacl FROM pg_type WHERE typnamespace = quote_ident(:'database_schema')::regnamespace
+)
+SELECT (SELECT rolsuper FROM pg_roles WHERE rolname = session_user)
+  OR NOT EXISTS (SELECT 1 FROM acl_objects o CROSS JOIN LATERAL aclexplode(o.acl) a WHERE a.grantor <> o.owner AND a.grantor <> session_user::regrole)
+  AS can_restore_grantors \gset
+\if :can_restore_grantors
+\else
+  DO $aif$ BEGIN RAISE EXCEPTION 'native ACL recovery requires unavailable session authorization for a non-owner grantor'; END $aif$;
+\endif
+WITH acl_objects(classid, object_id, owner, acl) AS (
+  SELECT 'pg_class'::regclass, oid, relowner, relacl FROM pg_class WHERE relnamespace = quote_ident(:'database_schema')::regnamespace
+  UNION ALL SELECT 'pg_proc'::regclass, oid, proowner, proacl FROM pg_proc WHERE pronamespace = quote_ident(:'database_schema')::regnamespace
+  UNION ALL SELECT 'pg_type'::regclass, oid, typowner, typacl FROM pg_type WHERE typnamespace = quote_ident(:'database_schema')::regnamespace
+)
+SELECT NOT EXISTS (SELECT 1 FROM acl_objects o LEFT JOIN pg_init_privs p ON p.classoid = o.classid AND p.objoid = o.object_id AND p.objsubid = 0
+  WHERE EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid = o.classid AND d.objid = o.object_id AND d.deptype = 'e')
+    AND o.acl IS DISTINCT FROM p.initprivs AND NOT pg_has_role(o.owner, 'USAGE')) AS can_restore_extension_acls \gset
+\if :can_restore_extension_acls
+\else
+  DO $aif$ BEGIN RAISE EXCEPTION 'migration role cannot restore modified extension member ACLs'; END $aif$;
+\endif
+SELECT format('SET ROLE %I;%sCREATE EXTENSION %I WITH SCHEMA %I VERSION %L;%sRESET ROLE;', pg_get_userbyid(extowner), chr(10), extname, n.nspname, extversion, chr(10)) FROM pg_extension e JOIN pg_namespace n ON n.oid = e.extnamespace WHERE extname = 'btree_gist';
+SQL
+  )"
+  security_query="$(database_security_query)"
+  security_before="$(printf 'SET search_path = pg_catalog;\n%s;\n' "$security_query" \
+    | psql -X --dbname="$DATABASE_URL" -qAt --set=ON_ERROR_STOP=1 \
+      --set="database_schema=${GATEWAY_DATABASE_SCHEMA}")"
+  [[ -n "$security_before" ]] || return 1
+  # Native owner/ACL/default-ACL statements are essential. Do not add no-owner
+  # or no-privileges: a data-only equality check cannot detect lost permissions.
+  pg_dump \
+    --dbname="$DATABASE_URL" \
+    --format=custom \
+    --quote-all-identifiers \
+    --schema="\"${GATEWAY_DATABASE_SCHEMA}\"" \
+    --extension=btree_gist \
+    --strict-names \
+    --file="${directory}/database.dump"
+  # One archive supplies every section from the same pg_dump snapshot. Never
+  # parse COPY data as SQL metadata when relocating the schema ACL below.
+  pg_restore --section=pre-data --file="${directory}/database.pre.sql" "${directory}/database.dump"
+  security_after="$(printf 'SET search_path = pg_catalog;\n%s;\n' "$security_query" \
+    | psql -X --dbname="$DATABASE_URL" -qAt --set=ON_ERROR_STOP=1 \
+      --set="database_schema=${GATEWAY_DATABASE_SCHEMA}")"
+  [[ "$security_after" == "$security_before" ]] || {
+    printf 'schema security metadata changed during backup; no backup published\n' >&2
+    return 1
+  }
+  extension_count="$(grep -c '^CREATE EXTENSION IF NOT EXISTS "btree_gist" WITH SCHEMA ' "${directory}/database.pre.sql")"
+  [[ "$extension_count" == "1" ]] || {
+    printf 'expected exactly one native btree_gist definition\n' >&2
+    return 1
+  }
+  printf '%s\n' "$extension_sql" >"${directory}/extension.sql"
+  {
+    printf '%s\n' '-- AIF database recovery format 2: owners-acls-extension'
+    database_dependency_guard
+    printf 'DROP SCHEMA IF EXISTS "%s" CASCADE;\n' "$GATEWAY_DATABASE_SCHEMA"
+    # Native pg_dump puts schema grants after object ownership changes. Move
+    # that exact ACL block earlier: a second saved owner may need its original
+    # CREATE permission before ALTER TABLE OWNER can run. No new grants are made.
+    awk -v extension_file="${directory}/extension.sql" -v schema="$GATEWAY_DATABASE_SCHEMA" '
+      FNR == NR {
+        if (acl_start && !acl_end && /^-- (Name:|PostgreSQL database dump complete)/) acl_end = FNR - 1
+        if (index($0, "-- Name: SCHEMA \"" schema "\"; Type: ACL;") == 1) { acl_start = FNR; acl_count++ }
+        if (acl_start && !acl_end) acl[FNR] = $0
+        if (index($0, "ALTER SCHEMA \"" schema "\" OWNER TO ") == 1 || index($0, "ALTER SCHEMA " schema " OWNER TO ") == 1) owner_count++
+        next
+      }
+      FNR == 1 {
+        if (owner_count != 1 || acl_count > 1 || (acl_start && !acl_end)) {
+          print "unrecognized native schema owner/ACL block" > "/dev/stderr"
+          exit 1
+        }
+      }
+      {
+        if (acl_start && FNR >= acl_start && FNR <= acl_end) next
+        if (/^CREATE EXTENSION IF NOT EXISTS "btree_gist" WITH SCHEMA /) {
+          while ((getline line < extension_file) > 0) print line
+          close(extension_file)
+        } else print
+        if (index($0, "ALTER SCHEMA \"" schema "\" OWNER TO ") == 1 || index($0, "ALTER SCHEMA " schema " OWNER TO ") == 1) {
+          for (j = acl_start; acl_start && j <= acl_end; j++) print acl[j]
+        }
+      }
+    ' "${directory}/database.pre.sql" "${directory}/database.pre.sql"
+    pg_restore --section=data --file=- "${directory}/database.dump"
+    pg_restore --section=post-data --file=- "${directory}/database.dump"
+    printf '\nSET search_path = pg_catalog;\n'
+    printf "SELECT (%s) = '%s'::jsonb AS recovery_security_matches \\gset\n" \
+      "$security_query" "${security_before//\'/\'\'}"
+    cat <<'SQL'
+\if :recovery_security_matches
+\else
+  DO $aif$ BEGIN RAISE EXCEPTION 'restored schema owner/ACL/default privileges/extension identity mismatch'; END $aif$;
+\endif
+SQL
+  } >"${directory}/database.sql"
+  rm -f -- "${directory}/database.dump" "${directory}/database.pre.sql" "${directory}/extension.sql"
+}
+
+prepare_database_sql "$TEMPORARY_DIRECTORY"
 [[ -s "${TEMPORARY_DIRECTORY}/database.sql" ]] || {
   printf 'database recovery image is empty\n' >&2
   exit 1
@@ -72,17 +303,18 @@ tar \
 tar --list --verbose --gzip --file="${TEMPORARY_DIRECTORY}/artifacts.tar.gz" \
   | awk 'substr($1, 1, 1) != "-" && substr($1, 1, 1) != "d" { exit 1 }'
 
-(
-  cd "$TEMPORARY_DIRECTORY"
-  sha256sum database.sql artifacts.tar.gz >SHA256SUMS
-)
 cat >"${TEMPORARY_DIRECTORY}/recovery.env" <<EOF
+DATABASE_RECOVERY_FORMAT=2
 UPDATE_COMMAND_ID=${AIF_UPDATE_COMMAND_ID}
 RELEASE_VERSION=${AIF_UPDATE_RELEASE_VERSION}
 RELEASE_COMMIT=${AIF_UPDATE_RELEASE_COMMIT:-unknown}
 MIGRATION_VERSION=${AIF_UPDATE_MIGRATION_VERSION:-unknown}
 DATABASE_SCHEMA=${GATEWAY_DATABASE_SCHEMA}
 EOF
+(
+  cd "$TEMPORARY_DIRECTORY"
+  sha256sum database.sql artifacts.tar.gz recovery.env >SHA256SUMS
+)
 chmod 0600 "${TEMPORARY_DIRECTORY}/"*
 sync -f "${TEMPORARY_DIRECTORY}/database.sql"
 sync -f "${TEMPORARY_DIRECTORY}/artifacts.tar.gz"

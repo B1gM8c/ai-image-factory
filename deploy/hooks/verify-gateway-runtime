@@ -17,6 +17,12 @@ readonly NGINX_CONFIG="${AIF_VERIFY_NGINX_CONFIG_PATH:-}"
 readonly LEGACY_UNITS="${AIF_VERIFY_LEGACY_GATEWAY_UNITS:-gpt-image-2-gateway.service}"
 readonly FORBIDDEN_NGINX_PORTS="${AIF_VERIFY_FORBIDDEN_NGINX_PORTS:-}"
 readonly PROVIDER_MANIFEST_NAME="provider-manifest.json"
+readonly PROCESS_SCOPE="${AIF_UPDATE_PROCESS_SCOPE:-full}"
+
+case "$PROCESS_SCOPE" in
+  validation | full) ;;
+  *) die "unsupported process scope: ${PROCESS_SCOPE}" ;;
+esac
 
 [[ "$GATEWAY_BASE_URL" =~ ^http://127\.0\.0\.1:([0-9]+)(/.*)?$ ]] \
   || die "gateway base URL must use an explicit 127.0.0.1 port"
@@ -117,8 +123,12 @@ while IFS= read -r release_unit; do
       ;;
   esac
 done < <(printf '%s\n' "$RELEASE_UNITS" | tr ',' '\n')
-((provider_binding_count > 0)) \
-  || die "no running executor PID proved the current Grok provider binding"
+# Validation intentionally starts only gateway/admin. The updater must pass the
+# full gate after starting workers and before reopening public admission.
+if [[ "$PROCESS_SCOPE" == "full" ]]; then
+  ((provider_binding_count > 0)) \
+    || die "no running executor PID proved the current Grok provider binding"
+fi
 
 while IFS= read -r legacy_unit; do
   [[ -n "$legacy_unit" ]] || continue

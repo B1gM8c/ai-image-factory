@@ -9,6 +9,7 @@ export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 : "${GATEWAY_ARTIFACT_ROOT:?GATEWAY_ARTIFACT_ROOT is required}"
 : "${AIF_UPDATE_BACKUP_TOKEN:?AIF_UPDATE_BACKUP_TOKEN is required}"
 : "${AIF_UPDATE_COMMAND_ID:?AIF_UPDATE_COMMAND_ID is required}"
+: "${AIF_UPDATE_RELEASE_VERSION:?AIF_UPDATE_RELEASE_VERSION is required}"
 : "${AIF_UPDATE_LEASE_OWNER:?AIF_UPDATE_LEASE_OWNER is required}"
 : "${AIF_UPDATE_LEASE_EPOCH:?AIF_UPDATE_LEASE_EPOCH is required}"
 : "${AIF_UPDATE_LEASE_DURATION_MS:?AIF_UPDATE_LEASE_DURATION_MS is required}"
@@ -47,6 +48,21 @@ case "$RECOVERY_DIRECTORY" in
     ;;
 esac
 
+validate_database_backup() {
+  local directory first_line
+  directory="$1"
+  IFS= read -r first_line <"${directory}/database.sql"
+  [[ "$first_line" == '-- AIF database recovery format 2: owners-acls-extension' ]] \
+    && grep -Fqx 'DATABASE_RECOVERY_FORMAT=2' "${directory}/recovery.env" \
+    && grep -Fqx "UPDATE_COMMAND_ID=${AIF_UPDATE_COMMAND_ID}" "${directory}/recovery.env" \
+    && grep -Fqx "RELEASE_VERSION=${AIF_UPDATE_RELEASE_VERSION}" "${directory}/recovery.env" \
+    && grep -Fqx "DATABASE_SCHEMA=${GATEWAY_DATABASE_SCHEMA}" "${directory}/recovery.env" \
+    && grep -Eq '^[0-9a-f]{64}  recovery.env$' "${directory}/SHA256SUMS" || {
+      printf 'recovery backup lacks verified owner/ACL/extension metadata or has a different identity; legacy data-only backups require separate operator recovery\n' >&2
+      return 1
+    }
+}
+
 [[ -f "${RECOVERY_DIRECTORY}/database.sql" ]] || {
   printf 'database recovery image is missing\n' >&2
   exit 1
@@ -55,8 +71,11 @@ esac
   printf 'artifact recovery image is missing\n' >&2
   exit 1
 }
-[[ ! -L "${RECOVERY_DIRECTORY}/database.sql" \
-  && ! -L "${RECOVERY_DIRECTORY}/artifacts.tar.gz" ]] || {
+[[ -f "${RECOVERY_DIRECTORY}/recovery.env" && -f "${RECOVERY_DIRECTORY}/SHA256SUMS" \
+  && ! -L "${RECOVERY_DIRECTORY}/database.sql" \
+  && ! -L "${RECOVERY_DIRECTORY}/artifacts.tar.gz" \
+  && ! -L "${RECOVERY_DIRECTORY}/recovery.env" \
+  && ! -L "${RECOVERY_DIRECTORY}/SHA256SUMS" ]] || {
   printf 'recovery images must not be symbolic links\n' >&2
   exit 1
 }
@@ -67,6 +86,9 @@ esac
     | awk 'substr($1, 1, 1) != "-" && substr($1, 1, 1) != "d" { exit 1 }'
 )
 
+# Never fabricate owners/ACLs missing from an old backup. Validate the format and
+# command identity before stopping processes or sending destructive SQL to psql.
+validate_database_backup "$RECOVERY_DIRECTORY"
 systemctl stop ai-image-factory-processes.target
 {
   cat "${RECOVERY_DIRECTORY}/database.sql"
@@ -100,11 +122,10 @@ SELECT EXISTS(
 ) AS update_lease_reasserted \gset
 \if :update_lease_reasserted
 \else
-  \echo 'restored database did not contain the claimed update command'
-  \quit 1
+  DO $aif$ BEGIN RAISE EXCEPTION 'restored database did not contain the claimed update command'; END $aif$;
 \endif
 SQL
-} | psql \
+} | psql -X \
   --dbname="$DATABASE_URL" \
   --set=ON_ERROR_STOP=1 \
   --single-transaction \
@@ -124,7 +145,7 @@ readonly ARTIFACT_PARENT
 ARTIFACT_NAME="$(basename "$GATEWAY_ARTIFACT_ROOT")"
 readonly ARTIFACT_NAME
 readonly PREVIOUS_ARTIFACT_ROOT="${ARTIFACT_PARENT}/.${ARTIFACT_NAME}.before-recovery-${AIF_UPDATE_COMMAND_ID}"
-install -d -m 0755 "$ARTIFACT_PARENT"
+[[ -d "$ARTIFACT_PARENT" ]] || install -d -m 0755 "$ARTIFACT_PARENT"
 if [[ ! -d "$GATEWAY_ARTIFACT_ROOT" && -d "$PREVIOUS_ARTIFACT_ROOT" ]]; then
   mv -T "$PREVIOUS_ARTIFACT_ROOT" "$GATEWAY_ARTIFACT_ROOT"
 fi

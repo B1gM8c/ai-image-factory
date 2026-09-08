@@ -1,0 +1,139 @@
+name: Isolated native recovery
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  recovery-rehearsal:
+    name: Isolated recovery / PostgreSQL 16 / systemd
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: ai_image_factory_rehearsal
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_USER: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d ai_image_factory_rehearsal"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      TEST_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/ai_image_factory_rehearsal
+      TEST_PSQL: /usr/lib/postgresql/16/bin/psql
+      TEST_PG_DUMP: /usr/lib/postgresql/16/bin/pg_dump
+      TEST_PG_RESTORE: /usr/lib/postgresql/16/bin/pg_restore
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - name: Check out source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Require real Linux systemd and PostgreSQL tools
+        run: |
+          test "$(cat /proc/1/comm)" = systemd
+          systemctl --version
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends postgresql-client-16 shellcheck
+          "$TEST_PSQL" --version
+          "$TEST_PG_DUMP" --version
+
+      - name: Validate release hook syntax
+        run: |
+          set -Eeuo pipefail
+          for hook in deploy/hooks/*; do
+            case "$hook" in
+              deploy/hooks/verify-media-segments|deploy/hooks/verify-admin-reader)
+                python3 -c 'import ast, pathlib, sys; ast.parse(pathlib.Path(sys.argv[1]).read_text())' "$hook"
+                ;;
+              *) shellcheck "$hook"; bash -n "$hook" ;;
+            esac
+          done
+
+      - name: Test real database backup and reader permission contracts
+        run: |
+          python3 scripts/test-recovery-extension-sql.py
+          python3 scripts/test-admin-reader-gate.py
+
+      - name: Exercise actual systemd recovery sandbox
+        run: sudo PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-recovery-systemd-sandbox.py --runtime
+
+      - name: Test process and runtime gate fixtures
+        run: |
+          scripts/test-gateway-runtime-gate.sh
+          scripts/test-release-process-hooks.sh
+
+      - name: Install Node.js for the real admin console
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Build the complete native candidate
+        run: |
+          # The packaged unit uses this fixed path, not the interactive PATH.
+          # This is the disposable runner only, never a deployment operation.
+          sudo install -m 0755 "$(command -v node)" /usr/bin/node
+          cargo build --locked --release --target x86_64-unknown-linux-gnu \
+            -p gpt-image-2-gateway -p ai-image-factory-updater --bins
+          npm ci
+          npm run build:admin
+          scripts/fetch-grok-cli.sh x86_64-unknown-linux-gnu "$RUNNER_TEMP/aif-grok"
+          MIN_SCHEMA_VERSION=128 GROK_PROVIDER_BINARY="$RUNNER_TEMP/aif-grok" \
+            scripts/package-release.sh "v0.1.0-rehearsal.${GITHUB_SHA:0:7}" \
+              x86_64-unknown-linux-gnu "$GITHUB_SHA" "$RUNNER_TEMP/aif-candidate"
+
+      - name: Fetch the immutable previous-schema baseline (read only)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download v0.1.0-20260824.40c7432 --repo "$GITHUB_REPOSITORY" \
+            --pattern 'ai-image-factory-*-x86_64-unknown-linux-gnu.tar.gz' \
+            --pattern 'ai-image-factory-*-x86_64-unknown-linux-gnu.manifest.json' \
+            --dir "$RUNNER_TEMP/aif-baseline"
+
+      - name: Exercise native upgrade, injected failure and fenced recovery
+        run: |
+          set -Eeuo pipefail
+          baseline="$RUNNER_TEMP/aif-baseline/ai-image-factory-v0.1.0-20260824.40c7432-x86_64-unknown-linux-gnu"
+          candidate="$RUNNER_TEMP/aif-candidate/ai-image-factory-v0.1.0-rehearsal.${GITHUB_SHA:0:7}-x86_64-unknown-linux-gnu"
+          sudo env \
+            GITHUB_ACTIONS=true RUNNER_ENVIRONMENT=github-hosted RUNNER_TEMP="$RUNNER_TEMP" \
+            AIF_NATIVE_TEST_ADMIN_DSN=postgresql://postgres:postgres@127.0.0.1:5432/postgres \
+            PYTHONDONTWRITEBYTECODE=1 \
+            python3 scripts/test-native-recovery.py \
+              --baseline-bundle "$baseline.tar.gz" --baseline-manifest "$baseline.manifest.json" \
+              --candidate-bundle "$candidate.tar.gz" --candidate-manifest "$candidate.manifest.json" \
+              --output-dir "$RUNNER_TEMP/aif-recovery-evidence"
+
+      - name: Export only the explicit sanitized evidence files
+        if: always()
+        run: |
+          mkdir -p "$RUNNER_TEMP/aif-recovery-public-evidence"
+          for name in summary.json systemd-effective.json host-hook-provenance.json \
+            artifact-equivalence.json initial-security.json restored-security.json \
+            updater-events.jsonl services.log; do
+            if sudo test -f "$RUNNER_TEMP/aif-recovery-evidence/$name"; then
+              sudo install -m 0644 "$RUNNER_TEMP/aif-recovery-evidence/$name" \
+                "$RUNNER_TEMP/aif-recovery-public-evidence/$name"
+            fi
+          done
+
+      - name: Preserve bounded synthetic rehearsal evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: native-recovery-evidence-${{ github.sha }}
+          if-no-files-found: ignore
+          retention-days: 7
+          path: ${{ runner.temp }}/aif-recovery-public-evidence/

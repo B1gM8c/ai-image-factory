@@ -429,6 +429,12 @@ if [[ "$(uname -s)" == "Linux" ]]; then
 fi
 
 cp -aL "${REPO_ROOT}/deploy/hooks/." "${RELEASE_ROOT}/ops/hooks/"
+# Check new builds without retroactively changing the protocol-1 manifest
+# contract used to validate historical signed releases and recovery descriptors.
+for required_hook in backup recover verify verify-admin-reader verify-gateway-runtime; do
+  [[ -s "${RELEASE_ROOT}/ops/hooks/${required_hook}" ]] \
+    || die "packaged release is missing required hook: ${required_hook}"
+done
 cp -aL "${REPO_ROOT}/deploy/systemd/." "${RELEASE_ROOT}/ops/systemd/"
 install -m 0755 \
   "${REPO_ROOT}/deploy/install-release" \

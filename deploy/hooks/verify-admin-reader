@@ -1,0 +1,153 @@
+#!/usr/bin/env python3
+"""Prove the running gateway's dedicated admin login can read, but cannot write."""
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+from urllib.parse import parse_qsl, unquote, urlsplit
+
+
+class GateError(Exception):
+    pass
+
+
+def require(condition, message):
+    if not condition:
+        raise GateError(message)
+
+
+def main_pid(environment, unit):
+    result = subprocess.run(
+        ['systemctl', 'show', unit, '--property=MainPID', '--value'],
+        env=environment, capture_output=True, text=True, timeout=5, check=False)
+    pid = result.stdout.strip()
+    require(result.returncode == 0 and re.fullmatch('[1-9][0-9]*', pid),
+            'gateway has no live MainPID')
+    return pid
+
+
+def connection_environment(dsn):
+    connection = urlsplit(dsn)
+    require(connection.scheme in ('postgres', 'postgresql')
+            and connection.hostname and connection.username
+            and connection.path.startswith('/') and len(connection.path) > 1
+            and not connection.fragment, 'reader must use an explicit PostgreSQL login URL')
+    # libpq does not expand a URI supplied through PGDATABASE. Map only the URL
+    # fields supported by this deployment; never place the full DSN in argv.
+    environment = {'PGHOST': connection.hostname, 'PGPORT': str(connection.port or 5432),
+                   'PGUSER': unquote(connection.username, errors='strict'),
+                   'PGDATABASE': unquote(connection.path[1:], errors='strict')}
+    if connection.password is not None:
+        environment['PGPASSWORD'] = unquote(connection.password, errors='strict')
+    allowed = {'sslmode': 'PGSSLMODE', 'sslrootcert': 'PGSSLROOTCERT',
+               'sslcert': 'PGSSLCERT', 'sslkey': 'PGSSLKEY',
+               'sslcrl': 'PGSSLCRL', 'options': 'PGOPTIONS'}
+    for key, value in (parse_qsl(connection.query, keep_blank_values=True, strict_parsing=True)
+                       if connection.query else []):
+        require(key in allowed and allowed[key] not in environment,
+                'reader URL has unsupported or duplicate connection options')
+        environment[allowed[key]] = value
+    environment.update(PGCONNECT_TIMEOUT='5',
+        PGOPTIONS=environment.get('PGOPTIONS', '') + ' -c statement_timeout=5000 -c lock_timeout=2000',
+        PGAPPNAME='ai-image-factory-admin-reader-gate')
+    return environment
+
+
+def main():
+    # Do not forward updater credentials, PGOPTIONS, .psqlrc, or the gateway's
+    # broader environment. In particular the reader DSN must never be an argv.
+    environment = {'PATH': os.environ.get('AIF_VERIFY_COMMAND_PATH',
+                                         '/usr/sbin:/usr/bin:/sbin:/bin'),
+                   'LC_ALL': 'C'}
+    unit = os.environ.get('AIF_VERIFY_GATEWAY_UNIT', 'ai-image-factory-gateway.service')
+    pid = main_pid(environment, unit)
+    process = Path(os.environ.get('AIF_VERIFY_PROC_ROOT', '/proc')) / pid
+    current = Path(os.environ.get('AIF_VERIFY_CURRENT_RELEASE_LINK',
+                                 '/opt/ai-image-factory/current')).resolve(strict=True)
+    executable = (process / 'exe').resolve(strict=True)
+    require('releases' in current.parts and current in executable.parents,
+            'gateway is not running the current release')
+    with (process / 'environ').open('rb') as handle:
+        raw = handle.read(1048577)
+    require(len(raw) <= 1048576, 'gateway environment exceeds the verification bound')
+    gateway = {}
+    for item in raw.split(b'\0'):
+        key, separator, value = item.partition(b'=')
+        if separator and key in (b'GATEWAY_ADMIN_READ_DATABASE_URL', b'GATEWAY_DATABASE_SCHEMA'):
+            require(key not in gateway, 'gateway has duplicate reader configuration')
+            gateway[key] = value.decode('utf-8')
+    dsn = gateway.get(b'GATEWAY_ADMIN_READ_DATABASE_URL', '').strip()
+    require(dsn, 'gateway must configure a dedicated admin reader login')
+    environment.update(connection_environment(dsn))
+    schema = gateway.get(b'GATEWAY_DATABASE_SCHEMA', 'public').strip()
+    require(re.fullmatch('[A-Za-z_][A-Za-z0-9_]{0,62}', schema),
+            'gateway database schema is invalid')
+    # Only names and boolean markers reach stdout. The bounded real reads prove
+    # the overview, usage and account tables are accessible even when empty.
+    sql = f"""
+BEGIN READ ONLY;
+SELECT 'login|' || session_user;
+SELECT 'identity|' || (session_user = current_user AND NOT EXISTS (
+    SELECT 1 FROM pg_roles WHERE rolname = current_user
+    AND (rolsuper OR rolcreaterole OR rolcreatedb OR rolbypassrls)))::text;
+-- Dedicated reader contract: no other role may be reachable via SET ROLE,
+-- including NOINHERIT memberships that hide privileges in the current role.
+SELECT 'no_role_switching|' || (NOT EXISTS (
+    SELECT 1 FROM pg_roles WHERE rolname <> current_user
+    AND pg_has_role(current_user, oid, 'SET')))::text;
+SELECT 'privileges|' || (
+    has_schema_privilege(current_user, '{schema}', 'USAGE')
+    AND NOT has_schema_privilege(current_user, '{schema}', 'CREATE')
+    AND NOT has_schema_privilege(current_user, '{schema}', 'USAGE WITH GRANT OPTION')
+    AND NOT EXISTS (
+        SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = '{schema}' AND c.relkind IN ('r', 'p', 'v', 'm', 'f')
+        AND (NOT has_table_privilege(current_user, c.oid, 'SELECT')
+             OR has_table_privilege(current_user, c.oid,
+                 'INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER,SELECT WITH GRANT OPTION')
+             OR has_any_column_privilege(current_user, c.oid,
+                 'INSERT,UPDATE,REFERENCES,SELECT WITH GRANT OPTION')))
+    )::text;
+SELECT 'jobs|' || count(*) FROM (SELECT job_id FROM "{schema}".jobs LIMIT 1) probe;
+SELECT 'usage|' || count(*) FROM (SELECT billing_metric FROM "{schema}".usage_events LIMIT 1) probe;
+SELECT 'accounts|' || count(*) FROM (SELECT provider_account_id FROM "{schema}".provider_accounts LIMIT 1) probe;
+ROLLBACK;
+BEGIN READ WRITE;
+SELECT 'transaction_read_only|' || current_setting('transaction_read_only');
+\\set ON_ERROR_STOP off
+EXPLAIN UPDATE "{schema}".jobs SET job_id = job_id WHERE false;
+\\echo denied_sqlstate|:SQLSTATE
+\\set ON_ERROR_STOP on
+ROLLBACK;
+"""
+    result = subprocess.run(['psql', '-X', '-w', '-qAt', '--set=ON_ERROR_STOP=1',
+                             '--set=VERBOSITY=sqlstate'], input=sql, env=environment,
+                            capture_output=True, text=True, timeout=20, check=False)
+    # Do not include psql errors or exceptions: malformed connection strings can
+    # cause libpq to echo credentials. SQLSTATE is inspected only in memory.
+    require(result.returncode == 0, 'reader connection or representative read failed')
+    lines = result.stdout.splitlines()
+    require('identity|true' in lines and 'login|' + environment['PGUSER'] in lines,
+            'reader must be a direct unprivileged login')
+    require('no_role_switching|true' in lines, 'dedicated reader must not be able to SET ROLE')
+    require('privileges|true' in lines, 'reader schema/table privileges are not read-only')
+    require(all(any(line in (name + '|0', name + '|1') for line in lines)
+                for name in ('jobs', 'usage', 'accounts')), 'representative reads failed')
+    require('transaction_read_only|off' in lines and 'denied_sqlstate|42501' in lines,
+            'reader write rejection must be database permission error 42501')
+    require(main_pid({'PATH': environment['PATH'], 'LC_ALL': 'C'}, unit) == pid
+            and (process / 'exe').resolve(strict=True) == executable,
+            'gateway identity changed during reader verification')
+    print('admin reader gate passed: direct login; bounded reads; database write denial 42501')
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except GateError as error:
+        print('admin reader gate: ' + str(error), file=sys.stderr)
+        sys.exit(1)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        print('admin reader gate: verification unavailable', file=sys.stderr)
+        sys.exit(1)

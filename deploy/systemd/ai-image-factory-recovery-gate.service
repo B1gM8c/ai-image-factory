@@ -28,9 +28,8 @@ ProtectKernelTunables=yes
 ProtectSystem=strict
 ReadOnlyPaths=/usr/libexec/ai-image-factory
 ReadWritePaths=/opt/ai-image-factory
-ReadWritePaths=/var/lib/ai-image-factory/artifacts
-ReadWritePaths=/var/lib/ai-image-factory/backups
-ReadWritePaths=/var/lib/ai-image-factory/updater
+# Recovery stages and atomically renames artifact siblings in this directory.
+ReadWritePaths=/var/lib/ai-image-factory
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 RestrictSUIDSGID=yes
 SystemCallArchitectures=native
