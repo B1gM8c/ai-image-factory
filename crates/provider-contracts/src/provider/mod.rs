@@ -145,8 +145,21 @@ pub mod openai_codex {
     pub const PROVIDER_DISPLAY_NAME: &str = "OpenAI GPT Image via Codex CLI";
     pub const MODEL_GPT_IMAGE_2: &str = "gpt-image-2";
     pub const MODEL_GPT_IMAGE_2_SNAPSHOT: &str = "gpt-image-2-2026-04-21";
+    pub const MODEL_GPT_IMAGE_25_SUNBURST: &str = "gpt-image-2.5-sunburst";
+    pub const MODEL_GPT_IMAGE_25_SUNBURST_SNAPSHOT: &str = "gpt-image-2.5-sunburst-2026-09-08";
+    pub const MODEL_GPT_IMAGE_25_FLARE: &str = "gpt-image-2.5-flare";
+    pub const MODEL_GPT_IMAGE_25_FLARE_SNAPSHOT: &str = "gpt-image-2.5-flare-2026-09-08";
     pub const OWNER: &str = "openai";
+    /// Models with a verified execution binding in the current Codex adapter.
     pub const MODELS: &[&str] = &[MODEL_GPT_IMAGE_2, MODEL_GPT_IMAGE_2_SNAPSHOT];
+    /// Models exposed by the catalog but kept unroutable until the Codex image
+    /// protocol can bind and report the exact upstream model.
+    pub const CATALOG_ONLY_MODELS: &[&str] = &[
+        MODEL_GPT_IMAGE_25_SUNBURST,
+        MODEL_GPT_IMAGE_25_SUNBURST_SNAPSHOT,
+        MODEL_GPT_IMAGE_25_FLARE,
+        MODEL_GPT_IMAGE_25_FLARE_SNAPSHOT,
+    ];
 
     const OFFICIAL_PARAMS: OfficialParamsContract = OfficialParamsContract {
         kind: OfficialParamsKind::OpenAiCodexCli,
@@ -211,6 +224,10 @@ pub mod openai_codex {
 
     pub fn is_supported_model(model: &str) -> bool {
         MODELS.contains(&model)
+    }
+
+    pub fn is_catalog_model(model: &str) -> bool {
+        is_supported_model(model) || CATALOG_ONLY_MODELS.contains(&model)
     }
 }
 

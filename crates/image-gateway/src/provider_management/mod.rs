@@ -14,8 +14,10 @@ mod postgres;
 mod quota_refresh;
 mod route_reconciliation;
 
+pub(crate) use model_catalog::provider_model_contract_metadata;
 pub use model_catalog::{
-    ProviderAccountModelView, ProviderAccountModelsView, ProviderModelRefreshView,
+    ProviderAccountModelView, ProviderAccountModelsView, ProviderModelActualCostView,
+    ProviderModelPricingView, ProviderModelRefreshView, ProviderModelTokenRatesView,
     ProviderModelView, ProviderModelsSnapshot,
 };
 pub use postgres::PostgresProviderManagementService;

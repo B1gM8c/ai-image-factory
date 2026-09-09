@@ -6,6 +6,7 @@ use uuid::Uuid;
 use super::{PriceBookVersionDraft, PriceComponentDraft};
 
 const CHECKED_AT_MS: i64 = 1_784_822_400_000;
+const OPENAI_CHECKED_AT_MS: i64 = 1_788_796_800_000;
 
 #[derive(Clone, Debug, Serialize, ToSchema, PartialEq, Eq)]
 pub struct OfficialPriceCatalogDescriptor {
@@ -246,60 +247,83 @@ fn openai_catalog() -> OfficialPriceCatalog {
         display_name: "OpenAI API 图片模型".to_string(),
         currency: "USD".to_string(),
         source_url: "https://developers.openai.com/api/docs/pricing".to_string(),
-        source_checked_at_ms: CHECKED_AT_MS,
-        source_revision: Some("observed-2026-07-24".to_string()),
+        source_checked_at_ms: OPENAI_CHECKED_AT_MS,
+        source_revision: Some("observed-2026-09-08".to_string()),
         parser_version: "curated-v1".to_string(),
-        items: vec![OfficialPriceItem {
-            item_key: "gpt-image-2".to_string(),
-            price_book_key: "provider_benchmark.openai.gpt-image-2.usd".to_string(),
-            display_name: "OpenAI GPT Image 2 官方 API 基准价".to_string(),
-            target_provider_id: "openai-codex".to_string(),
-            api_profile: "openai-images-v1".to_string(),
-            operation: "*".to_string(),
-            provider_model_id: "gpt-image-2".to_string(),
-            public_model_id: "gpt-image-2".to_string(),
-            media_kind: "image".to_string(),
-            service_tier: "standard".to_string(),
-            execution_surface: "provider_cli".to_string(),
-            components: vec![
-                token_component(
-                    "text-input",
-                    "text_input_token",
-                    "5000000",
-                    "provider_reported",
-                ),
-                token_component(
-                    "cached-text-input",
-                    "cached_text_input_token",
-                    "1250000",
-                    "provider_reported",
-                ),
-                token_component(
-                    "image-input",
-                    "image_input_token",
-                    "8000000",
-                    "provider_reported",
-                ),
-                token_component(
-                    "cached-image-input",
-                    "cached_image_input_token",
-                    "2000000",
-                    "provider_reported",
-                ),
-                token_component(
-                    "image-output-reported",
-                    "image_output_token",
-                    "30000000",
-                    "provider_reported",
-                ),
-                token_component(
-                    "image-output-official-lookup",
-                    "image_output_token",
-                    "30000000",
-                    "official_lookup",
-                ),
-            ],
-        }],
+        items: vec![
+            openai_image_item("gpt-image-2", "OpenAI GPT Image 2 官方 API 基准价", true),
+            openai_image_item(
+                "gpt-image-2.5-sunburst",
+                "OpenAI GPT Image 2.5 Sunburst 官方 API 基准价",
+                false,
+            ),
+            openai_image_item(
+                "gpt-image-2.5-flare",
+                "OpenAI GPT Image 2.5 Flare 官方 API 基准价",
+                false,
+            ),
+        ],
+    }
+}
+
+fn openai_image_item(
+    model_id: &str,
+    display_name: &str,
+    include_official_lookup: bool,
+) -> OfficialPriceItem {
+    let mut components = vec![
+        token_component(
+            "text-input",
+            "text_input_token",
+            "5000000",
+            "provider_reported",
+        ),
+        token_component(
+            "cached-text-input",
+            "cached_text_input_token",
+            "1250000",
+            "provider_reported",
+        ),
+        token_component(
+            "image-input",
+            "image_input_token",
+            "8000000",
+            "provider_reported",
+        ),
+        token_component(
+            "cached-image-input",
+            "cached_image_input_token",
+            "2000000",
+            "provider_reported",
+        ),
+        token_component(
+            "image-output-reported",
+            "image_output_token",
+            "30000000",
+            "provider_reported",
+        ),
+    ];
+    if include_official_lookup {
+        components.push(token_component(
+            "image-output-official-lookup",
+            "image_output_token",
+            "30000000",
+            "official_lookup",
+        ));
+    }
+    OfficialPriceItem {
+        item_key: model_id.to_owned(),
+        price_book_key: format!("provider_benchmark.openai.{model_id}.usd"),
+        display_name: display_name.to_owned(),
+        target_provider_id: "openai-codex".to_string(),
+        api_profile: "openai-images-v1".to_string(),
+        operation: "*".to_string(),
+        provider_model_id: model_id.to_owned(),
+        public_model_id: model_id.to_owned(),
+        media_kind: "image".to_string(),
+        service_tier: "standard".to_string(),
+        execution_surface: "provider_cli".to_string(),
+        components,
     }
 }
 
@@ -552,6 +576,25 @@ mod tests {
             .find(|component| component.quantity_source == "official_lookup")
             .expect("official lookup component");
         assert_eq!(official_lookup.required_confidence, "estimated");
+    }
+
+    #[test]
+    fn openai_gpt_image_25_catalog_requires_provider_reported_usage() {
+        let catalog = catalog("openai-api-pricing").expect("OpenAI catalog");
+        for model in ["gpt-image-2.5-sunburst", "gpt-image-2.5-flare"] {
+            let item = item(&catalog.items, model);
+            let rates = rates(item);
+            assert_eq!(rates["text-input"].3, "5000000");
+            assert_eq!(rates["cached-text-input"].3, "1250000");
+            assert_eq!(rates["image-input"].3, "8000000");
+            assert_eq!(rates["cached-image-input"].3, "2000000");
+            assert_eq!(rates["image-output-reported"].3, "30000000");
+            assert!(
+                item.components
+                    .iter()
+                    .all(|component| component.quantity_source == "provider_reported")
+            );
+        }
     }
 
     #[test]

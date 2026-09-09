@@ -47,9 +47,17 @@ struct ConsoleMediaModel {
     operation: String,
     created: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
+    aliases: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    legacy_predecessors: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     max_prompt_chars: Option<usize>,
     supports_edit: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    supports_mask: Option<bool>,
     spatial_edit_mode: SpatialEditMode,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pricing: Option<crate::provider_management::ProviderModelPricingView>,
     max_reference_images: u32,
     controls: ConsoleImageControls,
 }
@@ -329,6 +337,9 @@ fn prefer_official_dreamina_aliases(models: Vec<PublicModelRoute>) -> Vec<Public
 
 fn console_model(model: PublicModelRoute, supports_edit: bool) -> Option<ConsoleMediaModel> {
     let controls = controls_for_model(&model.api_profile, model.provider_model_id.as_deref())?;
+    let contract = model.provider_model_id.as_deref().and_then(|model_id| {
+        crate::provider_management::provider_model_contract_metadata(&model.provider_id, model_id)
+    });
     let max_prompt_chars = None;
     let max_reference_images = match (supports_edit, model.api_profile.as_str()) {
         (true, OPENAI_IMAGES_API_PROFILE) => 16,
@@ -338,7 +349,16 @@ fn console_model(model: PublicModelRoute, supports_edit: bool) -> Option<Console
         }
         _ => 0,
     };
-    let spatial_edit_mode = spatial_edit_mode_for_model(&model, supports_edit);
+    let spatial_edit_mode = contract.as_ref().map_or_else(
+        || spatial_edit_mode_for_model(&model, supports_edit),
+        |contract| {
+            if supports_edit {
+                contract.spatial_edit_mode
+            } else {
+                SpatialEditMode::Unsupported
+            }
+        },
+    );
     Some(ConsoleMediaModel {
         id: model.id,
         provider: model.provider_id,
@@ -346,9 +366,17 @@ fn console_model(model: PublicModelRoute, supports_edit: bool) -> Option<Console
         media_kind: model.media_kind,
         operation: model.operation_id,
         created: model.created_at_ms.div_euclid(1_000),
+        aliases: contract.as_ref().map(|contract| contract.aliases.clone()),
+        legacy_predecessors: contract
+            .as_ref()
+            .map(|contract| contract.legacy_predecessors.clone()),
         max_prompt_chars,
         supports_edit,
+        supports_mask: contract
+            .as_ref()
+            .map(|contract| contract.supports_mask && supports_edit),
         spatial_edit_mode,
+        pricing: contract.as_ref().map(|contract| contract.pricing.clone()),
         max_reference_images,
         controls,
     })
@@ -760,6 +788,54 @@ mod tests {
             &public_capabilities,
             &provider_capabilities
         ));
+    }
+
+    #[test]
+    fn routed_sunburst_exposes_read_only_migration_metadata() {
+        let model = PublicModelRoute {
+            id: "public-sunburst".to_owned(),
+            provider_model_id: Some(
+                image_provider_contracts::openai_codex::MODEL_GPT_IMAGE_25_SUNBURST.to_owned(),
+            ),
+            api_profile: OPENAI_IMAGES_API_PROFILE.to_owned(),
+            provider_id: image_provider_contracts::openai_codex::PROVIDER_ID.to_owned(),
+            operation_id: IMAGE_GENERATION_ROUTE_OPERATION.to_owned(),
+            media_kind: "image".to_owned(),
+            created_at_ms: 0,
+        };
+
+        let value = serde_json::to_value(console_model(model, true).unwrap()).unwrap();
+
+        assert_eq!(value["aliases"], json!([]));
+        assert_eq!(
+            value["legacy_predecessors"],
+            json!([image_provider_contracts::openai_codex::MODEL_GPT_IMAGE_2])
+        );
+        assert_eq!(value["supports_mask"], true);
+        assert_eq!(value["spatial_edit_mode"], "native_mask");
+        assert_eq!(value["pricing"]["actual_cost"]["status"], "unavailable");
+    }
+
+    #[test]
+    fn routed_flare_does_not_claim_edit_or_mask_support() {
+        let model = PublicModelRoute {
+            id: "public-flare".to_owned(),
+            provider_model_id: Some(
+                image_provider_contracts::openai_codex::MODEL_GPT_IMAGE_25_FLARE.to_owned(),
+            ),
+            api_profile: OPENAI_IMAGES_API_PROFILE.to_owned(),
+            provider_id: image_provider_contracts::openai_codex::PROVIDER_ID.to_owned(),
+            operation_id: IMAGE_GENERATION_ROUTE_OPERATION.to_owned(),
+            media_kind: "image".to_owned(),
+            created_at_ms: 0,
+        };
+
+        let value = serde_json::to_value(console_model(model, false).unwrap()).unwrap();
+
+        assert_eq!(value["aliases"], json!([]));
+        assert_eq!(value["legacy_predecessors"], json!([]));
+        assert_eq!(value["supports_mask"], false);
+        assert_eq!(value["spatial_edit_mode"], "unsupported");
     }
 
     #[test]

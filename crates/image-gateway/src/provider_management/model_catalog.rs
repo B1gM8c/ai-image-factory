@@ -12,6 +12,8 @@ use sqlx::{FromRow, PgPool, Postgres, Transaction};
 use tokio::{process::Command, sync::Semaphore, time::timeout};
 use uuid::Uuid;
 
+use image_provider_contracts::{SpatialEditMode, openai_codex};
+
 use crate::ImageGatewayError;
 
 use super::{UpdateProviderAccountModelsRequest, grok_login::copy_proxy_environment};
@@ -47,6 +49,44 @@ pub struct ProviderModelView {
     pub last_observed_at_ms: Option<i64>,
     pub last_successful_refresh_at_ms: Option<i64>,
     pub availability: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub aliases: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub legacy_predecessors: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub supports_mask: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spatial_edit_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pricing: Option<ProviderModelPricingView>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ProviderModelPricingView {
+    pub strategy: String,
+    pub billing_basis: String,
+    pub currency: String,
+    pub unit: String,
+    pub effective_at: String,
+    pub source_revision: String,
+    pub business_pricing_included: bool,
+    pub rates: ProviderModelTokenRatesView,
+    pub actual_cost: ProviderModelActualCostView,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ProviderModelTokenRatesView {
+    pub text_input: String,
+    pub cached_text_input: String,
+    pub image_input: String,
+    pub cached_image_input: String,
+    pub image_output: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ProviderModelActualCostView {
+    pub status: String,
+    pub reason: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -96,6 +136,7 @@ struct AdapterModel {
     display_name: &'static str,
     media_kind: &'static str,
     operation_ids: &'static [&'static str],
+    execution_verified: bool,
 }
 
 const ADAPTER_MODELS: &[AdapterModel] = &[
@@ -112,6 +153,34 @@ const ADAPTER_MODELS: &[AdapterModel] = &[
         "GPT Image 2 (2026-04-21)",
         "image",
         &["images.generations", "images.edits"],
+    ),
+    catalog_only_model(
+        CODEX_PROVIDER_ID,
+        openai_codex::MODEL_GPT_IMAGE_25_SUNBURST,
+        "GPT Image 2.5 Sunburst",
+        "image",
+        &["images.generations", "images.edits"],
+    ),
+    catalog_only_model(
+        CODEX_PROVIDER_ID,
+        openai_codex::MODEL_GPT_IMAGE_25_SUNBURST_SNAPSHOT,
+        "GPT Image 2.5 Sunburst (2026-09-08)",
+        "image",
+        &["images.generations", "images.edits"],
+    ),
+    catalog_only_model(
+        CODEX_PROVIDER_ID,
+        openai_codex::MODEL_GPT_IMAGE_25_FLARE,
+        "GPT Image 2.5 Flare",
+        "image",
+        &["images.generations"],
+    ),
+    catalog_only_model(
+        CODEX_PROVIDER_ID,
+        openai_codex::MODEL_GPT_IMAGE_25_FLARE_SNAPSHOT,
+        "GPT Image 2.5 Flare (2026-09-08)",
+        "image",
+        &["images.generations"],
     ),
     adapter_model(
         GROK_PROVIDER_ID,
@@ -254,6 +323,24 @@ const fn adapter_model(
         display_name,
         media_kind,
         operation_ids,
+        execution_verified: true,
+    }
+}
+
+const fn catalog_only_model(
+    provider_id: &'static str,
+    model_id: &'static str,
+    display_name: &'static str,
+    media_kind: &'static str,
+    operation_ids: &'static [&'static str],
+) -> AdapterModel {
+    AdapterModel {
+        provider_id,
+        model_id,
+        display_name,
+        media_kind,
+        operation_ids,
+        execution_verified: false,
     }
 }
 
@@ -337,12 +424,14 @@ pub(super) async fn reconcile_adapter_models(pool: &PgPool) -> Result<(), ImageG
               (provider_id, model_id, execution_model_id, media_kind, display_name, adapter_state,
                lifecycle_state, operation_ids, source_kind, first_seen_at_ms,
                last_seen_at_ms, metadata_json)
-            VALUES ($1, $2, $3, $4, $5, 'supported', 'enabled', $6,
-                    'adapter_contract', $7, $7, '{}'::JSONB)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8,
+                    'adapter_contract', $9, $9, '{}'::JSONB)
             ON CONFLICT (provider_id, model_id, media_kind) DO UPDATE SET
               display_name = EXCLUDED.display_name,
               execution_model_id = EXCLUDED.execution_model_id,
-              adapter_state = 'supported',
+              adapter_state = EXCLUDED.adapter_state,
+              lifecycle_state = CASE WHEN EXCLUDED.adapter_state = 'supported'
+                                     THEN provider_models.lifecycle_state ELSE 'disabled' END,
               operation_ids = EXCLUDED.operation_ids
             "#,
         )
@@ -355,6 +444,16 @@ pub(super) async fn reconcile_adapter_models(pool: &PgPool) -> Result<(), ImageG
         ))
         .bind(model.media_kind)
         .bind(model.display_name)
+        .bind(if model.execution_verified {
+            "supported"
+        } else {
+            "discovered"
+        })
+        .bind(if model.execution_verified {
+            "enabled"
+        } else {
+            "disabled"
+        })
         .bind(operations)
         .bind(now)
         .execute(&mut *tx)
@@ -872,12 +971,13 @@ async fn persist_discovery(
             || discovered.model_id.clone(),
             |model| model.display_name.to_owned(),
         );
-        let adapter_state = if adapter.is_some() {
+        let execution_verified = adapter.is_some_and(|model| model.execution_verified);
+        let adapter_state = if execution_verified {
             "supported"
         } else {
             "discovered"
         };
-        let lifecycle_state = if adapter.is_some() {
+        let lifecycle_state = if execution_verified {
             "enabled"
         } else {
             "disabled"
@@ -903,8 +1003,9 @@ async fn persist_discovery(
               execution_model_id = EXCLUDED.execution_model_id,
               adapter_state = CASE WHEN EXCLUDED.adapter_state = 'supported'
                                    THEN 'supported' ELSE provider_models.adapter_state END,
-              lifecycle_state = CASE WHEN EXCLUDED.adapter_state = 'supported'
-                                     THEN 'enabled' ELSE provider_models.lifecycle_state END,
+              lifecycle_state = CASE WHEN EXCLUDED.adapter_state = 'supported' THEN 'enabled'
+                                     WHEN $12 THEN 'disabled'
+                                     ELSE provider_models.lifecycle_state END,
               operation_ids = CASE WHEN EXCLUDED.adapter_state = 'supported'
                                    THEN EXCLUDED.operation_ids ELSE provider_models.operation_ids END,
               source_kind = EXCLUDED.source_kind,
@@ -928,6 +1029,7 @@ async fn persist_discovery(
         .bind(discovered.source_kind)
         .bind(now)
         .bind(&discovered.metadata)
+        .bind(adapter.is_some())
         .execute(&mut *tx)
         .await
         .map_err(store_unavailable)?;
@@ -1227,6 +1329,7 @@ fn model_view(row: ProviderModelRow) -> ProviderModelView {
     } else {
         "unobserved"
     };
+    let contract = provider_model_contract_metadata(&row.provider_id, &row.model_id);
     ProviderModelView {
         provider_display_name: provider_display_name(&row.provider_id).to_owned(),
         provider_id: row.provider_id,
@@ -1243,7 +1346,72 @@ fn model_view(row: ProviderModelRow) -> ProviderModelView {
         last_observed_at_ms: row.last_observed_at_ms,
         last_successful_refresh_at_ms: row.last_successful_refresh_at_ms,
         availability: availability.to_owned(),
+        aliases: contract.as_ref().map(|contract| contract.aliases.clone()),
+        legacy_predecessors: contract
+            .as_ref()
+            .map(|contract| contract.legacy_predecessors.clone()),
+        supports_mask: contract.as_ref().map(|contract| contract.supports_mask),
+        spatial_edit_mode: contract
+            .as_ref()
+            .map(|contract| contract.spatial_edit_mode.as_str().to_owned()),
+        pricing: contract.map(|contract| contract.pricing),
     }
+}
+
+pub(crate) struct ProviderModelContractMetadata {
+    pub(crate) aliases: Vec<String>,
+    pub(crate) legacy_predecessors: Vec<String>,
+    pub(crate) supports_mask: bool,
+    pub(crate) spatial_edit_mode: SpatialEditMode,
+    pub(crate) pricing: ProviderModelPricingView,
+}
+
+pub(crate) fn provider_model_contract_metadata(
+    provider_id: &str,
+    model_id: &str,
+) -> Option<ProviderModelContractMetadata> {
+    if provider_id != CODEX_PROVIDER_ID || !openai_codex::CATALOG_ONLY_MODELS.contains(&model_id) {
+        return None;
+    }
+    let sunburst = matches!(
+        model_id,
+        openai_codex::MODEL_GPT_IMAGE_25_SUNBURST
+            | openai_codex::MODEL_GPT_IMAGE_25_SUNBURST_SNAPSHOT
+    );
+    Some(ProviderModelContractMetadata {
+        aliases: Vec::new(),
+        legacy_predecessors: if model_id == openai_codex::MODEL_GPT_IMAGE_25_SUNBURST {
+            vec![openai_codex::MODEL_GPT_IMAGE_2.to_owned()]
+        } else {
+            Vec::new()
+        },
+        supports_mask: sunburst,
+        spatial_edit_mode: if sunburst {
+            SpatialEditMode::NativeMask
+        } else {
+            SpatialEditMode::Unsupported
+        },
+        pricing: ProviderModelPricingView {
+            strategy: "token_usage".to_owned(),
+            billing_basis: "provider_cost".to_owned(),
+            currency: "USD".to_owned(),
+            unit: "per_1m_tokens".to_owned(),
+            effective_at: "2026-09-08".to_owned(),
+            source_revision: "openai-gpt-image-2.5-2026-09-08".to_owned(),
+            business_pricing_included: false,
+            rates: ProviderModelTokenRatesView {
+                text_input: "5.00".to_owned(),
+                cached_text_input: "1.25".to_owned(),
+                image_input: "8.00".to_owned(),
+                cached_image_input: "2.00".to_owned(),
+                image_output: "30.00".to_owned(),
+            },
+            actual_cost: ProviderModelActualCostView {
+                status: "unavailable".to_owned(),
+                reason: "provider_usage_not_exposed".to_owned(),
+            },
+        },
+    })
 }
 
 impl From<RefreshRow> for ProviderModelRefreshView {
@@ -1276,7 +1444,11 @@ fn store_unavailable(_: impl std::fmt::Display) -> ImageGatewayError {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_model_versions;
+    use super::{
+        CODEX_PROVIDER_ID, ProviderModelRow, model_view, parse_model_versions,
+        provider_model_contract_metadata,
+    };
+    use image_provider_contracts::{SpatialEditMode, openai_codex};
 
     #[test]
     fn parses_only_the_declared_model_version_line() {
@@ -1292,5 +1464,57 @@ mod tests {
             parse_model_versions("- model_version: ok, bad/model"),
             ["ok"]
         );
+    }
+
+    #[test]
+    fn gpt_image_25_contract_is_exact_and_provider_cost_only() {
+        let sunburst = provider_model_contract_metadata(
+            CODEX_PROVIDER_ID,
+            openai_codex::MODEL_GPT_IMAGE_25_SUNBURST,
+        )
+        .unwrap();
+        assert!(sunburst.aliases.is_empty());
+        assert_eq!(
+            sunburst.legacy_predecessors,
+            [openai_codex::MODEL_GPT_IMAGE_2]
+        );
+        assert!(sunburst.supports_mask);
+        assert_eq!(sunburst.spatial_edit_mode, SpatialEditMode::NativeMask);
+        assert_eq!(sunburst.pricing.strategy, "token_usage");
+        assert!(!sunburst.pricing.business_pricing_included);
+        assert_eq!(sunburst.pricing.rates.image_output, "30.00");
+        assert_eq!(sunburst.pricing.actual_cost.status, "unavailable");
+
+        let flare = provider_model_contract_metadata(
+            CODEX_PROVIDER_ID,
+            openai_codex::MODEL_GPT_IMAGE_25_FLARE,
+        )
+        .unwrap();
+        assert!(flare.aliases.is_empty());
+        assert!(flare.legacy_predecessors.is_empty());
+        assert!(!flare.supports_mask);
+        assert_eq!(flare.spatial_edit_mode, SpatialEditMode::Unsupported);
+        assert!(provider_model_contract_metadata(CODEX_PROVIDER_ID, "gpt-image-2.5").is_none());
+    }
+
+    #[test]
+    fn gpt_image_25_stays_unroutable_without_verified_execution_binding() {
+        let view = model_view(ProviderModelRow {
+            provider_id: CODEX_PROVIDER_ID.to_owned(),
+            model_id: openai_codex::MODEL_GPT_IMAGE_25_SUNBURST.to_owned(),
+            display_name: "GPT Image 2.5 Sunburst".to_owned(),
+            media_kind: "image".to_owned(),
+            operation_ids: vec!["images.generations".to_owned(), "images.edits".to_owned()],
+            source_kind: "adapter_contract".to_owned(),
+            adapter_state: "discovered".to_owned(),
+            lifecycle_state: "disabled".to_owned(),
+            observed_account_count: 0,
+            routable_account_count: 0,
+            latest_cli_version: Some("0.153.4".to_owned()),
+            last_observed_at_ms: None,
+            last_successful_refresh_at_ms: None,
+        });
+        assert_eq!(view.availability, "not_supported");
+        assert_eq!(view.pricing.unwrap().actual_cost.status, "unavailable");
     }
 }

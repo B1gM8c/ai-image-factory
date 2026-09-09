@@ -16,7 +16,6 @@ use crate::{
 const CODEX_IMAGE_EDITS_URL: &str = "https://chatgpt.com/backend-api/codex/images/edits";
 #[cfg(debug_assertions)]
 const TEST_CODEX_IMAGE_EDITS_URL_ENV: &str = "GATEWAY_TEST_CODEX_IMAGE_EDITS_URL";
-const CODEX_IMAGE_MODEL: &str = "gpt-image-2";
 const CODEX_ORIGINATOR: &str = "codex_cli_rs";
 const CODEX_USER_AGENT: &str = "codex_cli_rs/0.145.0";
 const MAX_AUTH_BYTES: u64 = 64 * 1024;
@@ -47,11 +46,18 @@ pub(crate) struct DirectEditFailure {
 }
 
 pub(crate) struct DirectEditParameters<'a> {
+    pub(crate) model: &'a str,
     pub(crate) prompt: &'a str,
     pub(crate) background: &'a str,
     pub(crate) quality: &'a str,
     pub(crate) size: &'a str,
     pub(crate) output_index: u32,
+}
+
+pub(super) struct DirectEditBatchParameters<'a> {
+    pub(super) model: &'a str,
+    pub(super) prompt: &'a str,
+    pub(super) n: u32,
 }
 
 impl DirectEditFailure {
@@ -82,7 +88,7 @@ struct EditRequest<'a> {
     images: Vec<ImageUrl>,
     prompt: &'a str,
     background: &'a str,
-    model: &'static str,
+    model: &'a str,
     n: u32,
     quality: &'a str,
     size: &'a str,
@@ -117,12 +123,11 @@ pub(super) async fn edit(
     auth_home: &Path,
     images: &[InputImage],
     mask: Option<&InputImage>,
-    prompt: &str,
-    n: u32,
+    parameters: DirectEditBatchParameters<'_>,
     timeout: Duration,
 ) -> Result<Vec<GeneratedImage>, ImageGatewayError> {
     let endpoint = image_edits_endpoint()?;
-    edit_at(&endpoint, auth_home, images, mask, prompt, n, timeout).await
+    edit_at(&endpoint, auth_home, images, mask, parameters, timeout).await
 }
 
 pub(crate) async fn edit_one(
@@ -168,23 +173,23 @@ pub(super) async fn edit_at(
     auth_home: &Path,
     images: &[InputImage],
     mask: Option<&InputImage>,
-    prompt: &str,
-    n: u32,
+    parameters: DirectEditBatchParameters<'_>,
     timeout: Duration,
 ) -> Result<Vec<GeneratedImage>, ImageGatewayError> {
-    if n == 0 {
+    if parameters.n == 0 {
         return Err(invalid_response());
     }
     let mut total = 0usize;
-    let mut outputs = Vec::with_capacity(n as usize);
-    for output_index in 0..n {
+    let mut outputs = Vec::with_capacity(parameters.n as usize);
+    for output_index in 0..parameters.n {
         let image = edit_one_at(
             endpoint,
             auth_home,
             images,
             mask,
             DirectEditParameters {
-                prompt,
+                model: parameters.model,
+                prompt: parameters.prompt,
                 background: "auto",
                 quality: "auto",
                 size: "auto",
@@ -214,16 +219,7 @@ pub(crate) async fn edit_one_at(
     timeout: Duration,
 ) -> Result<GeneratedImage, DirectEditFailure> {
     let auth = read_auth(auth_home).map_err(local_credentials_unavailable)?;
-    let payload = edit_request(
-        images,
-        mask,
-        parameters.prompt,
-        parameters.background,
-        parameters.quality,
-        parameters.size,
-        1,
-    )
-    .map_err(local_invalid_request)?;
+    let payload = edit_request(images, mask, &parameters).map_err(local_invalid_request)?;
     let client = Client::builder()
         .redirect(Policy::none())
         .build()
@@ -285,11 +281,7 @@ async fn post_one(
 fn edit_request<'a>(
     images: &[InputImage],
     mask: Option<&InputImage>,
-    prompt: &'a str,
-    background: &'a str,
-    quality: &'a str,
-    size: &'a str,
-    n: u32,
+    parameters: &'a DirectEditParameters<'a>,
 ) -> Result<EditRequest<'a>, ImageGatewayError> {
     let mut encoded = Vec::with_capacity(images.len() + usize::from(mask.is_some()));
     for image in images.iter().chain(mask) {
@@ -299,12 +291,12 @@ fn edit_request<'a>(
     }
     Ok(EditRequest {
         images: encoded,
-        prompt,
-        background,
-        model: CODEX_IMAGE_MODEL,
-        n,
-        quality,
-        size,
+        prompt: parameters.prompt,
+        background: parameters.background,
+        model: parameters.model,
+        n: 1,
+        quality: parameters.quality,
+        size: parameters.size,
     })
 }
 
@@ -549,9 +541,17 @@ mod tests {
 
     #[test]
     fn direct_edit_payload_uses_the_official_single_output_contract() {
-        let request = edit_request(&[png()], None, "edit", "auto", "auto", "auto", 1).unwrap();
+        let parameters = DirectEditParameters {
+            model: "gpt-image-2.5-sunburst",
+            prompt: "edit",
+            background: "auto",
+            quality: "auto",
+            size: "auto",
+            output_index: 0,
+        };
+        let request = edit_request(&[png()], None, &parameters).unwrap();
         let value = serde_json::to_value(request).unwrap();
-        assert_eq!(value["model"], "gpt-image-2");
+        assert_eq!(value["model"], "gpt-image-2.5-sunburst");
         assert_eq!(value["n"], 1);
         assert_eq!(value["size"], "auto");
         assert_eq!(value["quality"], "auto");
@@ -632,8 +632,11 @@ mod tests {
                 auth_home.path(),
                 &[png()],
                 None,
-                "edit",
-                n,
+                DirectEditBatchParameters {
+                    model: "gpt-image-2",
+                    prompt: "edit",
+                    n,
+                },
                 Duration::from_secs(5),
             )
             .await
