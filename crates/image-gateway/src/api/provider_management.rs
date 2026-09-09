@@ -67,6 +67,16 @@ struct ConsoleProviderModel {
     #[serde(skip_serializing_if = "Option::is_none")]
     last_successful_refresh_at_ms: Option<i64>,
     availability: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    aliases: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    legacy_predecessors: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    supports_mask: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    spatial_edit_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pricing: Option<crate::provider_management::ProviderModelPricingView>,
 }
 
 pub(super) async fn start_codex_login(
@@ -356,6 +366,11 @@ fn console_provider_model(
             .then_some(model.last_successful_refresh_at_ms)
             .flatten(),
         availability: model.availability,
+        aliases: model.aliases,
+        legacy_predecessors: model.legacy_predecessors,
+        supports_mask: model.supports_mask,
+        spatial_edit_mode: model.spatial_edit_mode,
+        pricing: model.pricing,
     }
 }
 
@@ -482,6 +497,11 @@ mod tests {
             last_observed_at_ms: Some(10),
             last_successful_refresh_at_ms: Some(11),
             availability: "routable".to_string(),
+            aliases: None,
+            legacy_predecessors: None,
+            supports_mask: None,
+            spatial_edit_mode: None,
+            pricing: None,
         }
     }
 

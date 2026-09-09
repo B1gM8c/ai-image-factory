@@ -957,6 +957,30 @@ export type ProviderModelView = {
   last_observed_at_ms?: EpochMs | null;
   last_successful_refresh_at_ms?: EpochMs | null;
   availability: "routable" | "observed" | "unobserved" | "not_supported";
+  aliases?: string[];
+  legacy_predecessors?: string[];
+  supports_mask?: boolean;
+  spatial_edit_mode?: "native_mask" | "semantic_mask" | "visual_region" | "unsupported";
+  pricing?: {
+    strategy: "token_usage";
+    billing_basis: "provider_cost";
+    currency: "USD";
+    unit: "per_1m_tokens";
+    effective_at: string;
+    source_revision: string;
+    business_pricing_included: false;
+    rates: {
+      text_input: string;
+      cached_text_input: string;
+      image_input: string;
+      cached_image_input: string;
+      image_output: string;
+    };
+    actual_cost: {
+      status: "unavailable";
+      reason: "provider_usage_not_exposed";
+    };
+  };
 };
 
 export type ProviderModelsSnapshot = {

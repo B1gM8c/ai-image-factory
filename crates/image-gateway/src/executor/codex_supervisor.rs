@@ -1035,6 +1035,7 @@ async fn run_direct_edit_child(
                     &images,
                     mask.as_ref(),
                     direct_edit::DirectEditParameters {
+                        model: &edit.model,
                         prompt: &edit.prompt,
                         background: &edit.background,
                         quality: &edit.quality,
@@ -1051,6 +1052,7 @@ async fn run_direct_edit_child(
                     &images,
                     mask.as_ref(),
                     direct_edit::DirectEditParameters {
+                        model: &edit.model,
                         prompt: &edit.prompt,
                         background: &edit.background,
                         quality: &edit.quality,

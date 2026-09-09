@@ -67,6 +67,16 @@ mod tests {
     fn roadmap_keeps_future_cli_providers_out_of_active_set() {
         assert!(openai_codex::is_supported_model("gpt-image-2"));
         assert!(openai_codex::is_supported_model("gpt-image-2-2026-04-21"));
+        assert!(openai_codex::is_catalog_model("gpt-image-2.5-sunburst"));
+        assert!(openai_codex::is_catalog_model(
+            "gpt-image-2.5-sunburst-2026-09-08"
+        ));
+        assert!(openai_codex::is_catalog_model("gpt-image-2.5-flare"));
+        assert!(openai_codex::is_catalog_model(
+            "gpt-image-2.5-flare-2026-09-08"
+        ));
+        assert!(!openai_codex::is_catalog_model("gpt-image-2.5"));
+        assert!(!openai_codex::is_supported_model("gpt-image-2.5-sunburst"));
         assert!(!openai_codex::is_supported_model("midjourney-v7"));
         assert!(
             all_provider_roadmap()

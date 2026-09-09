@@ -136,8 +136,11 @@ async fn edit_outputs(
                     &request_codex_home,
                     &job.images,
                     job.mask.as_ref(),
-                    prompt,
-                    1,
+                    direct_edit::DirectEditBatchParameters {
+                        model: &job.model,
+                        prompt,
+                        n: 1,
+                    },
                     timeout,
                 )
                 .await?
@@ -147,8 +150,11 @@ async fn edit_outputs(
                     &request_codex_home,
                     &job.images,
                     job.mask.as_ref(),
-                    prompt,
-                    1,
+                    direct_edit::DirectEditBatchParameters {
+                        model: &job.model,
+                        prompt,
+                        n: 1,
+                    },
                     timeout,
                 )
                 .await?
