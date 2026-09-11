@@ -72,6 +72,16 @@ fn png_bytes(width: u32, height: u32) -> Vec<u8> {
     cursor.into_inner()
 }
 
+fn png_header(width: u32, height: u32) -> Vec<u8> {
+    let mut bytes = vec![0_u8; 26];
+    bytes[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
+    bytes[12..16].copy_from_slice(b"IHDR");
+    bytes[16..20].copy_from_slice(&width.to_be_bytes());
+    bytes[20..24].copy_from_slice(&height.to_be_bytes());
+    bytes[25] = 6;
+    bytes
+}
+
 #[derive(Clone)]
 struct FakeGenerator {
     calls: Arc<Mutex<Vec<FakeCall>>>,
@@ -2044,6 +2054,144 @@ async fn edits_reject_input_fidelity_for_gpt_image_2() {
     .await;
 
     assert_error_fixture(status, &body, "edit_input_fidelity");
+    assert!(fake.calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn edits_reject_oversized_multipart_image_before_generation() {
+    let fake = FakeGenerator::default();
+    let app = build_router(config(), Arc::new(fake.clone()), usage_store());
+    let boundary = "x-test-boundary";
+    let oversized_png = png_header(6929, 6929);
+    let mut body = Vec::new();
+    body.extend_from_slice(
+        b"--x-test-boundary\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\ngpt-image-2\r\n",
+    );
+    body.extend_from_slice(
+        b"--x-test-boundary\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\nuse the reference\r\n",
+    );
+    body.extend_from_slice(
+        b"--x-test-boundary\r\nContent-Disposition: form-data; name=\"image[]\"; filename=\"input.png\"\r\nContent-Type: image/png\r\n\r\n",
+    );
+    body.extend_from_slice(&oversized_png);
+    body.extend_from_slice(b"\r\n--x-test-boundary--\r\n");
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/images/edits")
+                .header(header::AUTHORIZATION, "Bearer test-token")
+                .header(
+                    header::CONTENT_TYPE,
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["param"], "image");
+    assert_eq!(body["error"]["code"], "invalid_image_size");
+    assert!(fake.calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn edits_reject_oversized_multipart_mask_before_generation() {
+    let fake = FakeGenerator::default();
+    let app = build_router(config(), Arc::new(fake.clone()), usage_store());
+    let boundary = "x-test-boundary";
+    let image = png_bytes(1, 1);
+    let oversized_mask = png_header(6929, 6929);
+    let mut body = Vec::new();
+    body.extend_from_slice(
+        b"--x-test-boundary\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\ngpt-image-2\r\n",
+    );
+    body.extend_from_slice(
+        b"--x-test-boundary\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\nuse the mask\r\n",
+    );
+    body.extend_from_slice(
+        b"--x-test-boundary\r\nContent-Disposition: form-data; name=\"image[]\"; filename=\"input.png\"\r\nContent-Type: image/png\r\n\r\n",
+    );
+    body.extend_from_slice(&image);
+    body.extend_from_slice(b"\r\n");
+    body.extend_from_slice(
+        b"--x-test-boundary\r\nContent-Disposition: form-data; name=\"mask\"; filename=\"mask.png\"\r\nContent-Type: image/png\r\n\r\n",
+    );
+    body.extend_from_slice(&oversized_mask);
+    body.extend_from_slice(b"\r\n--x-test-boundary--\r\n");
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/images/edits")
+                .header(header::AUTHORIZATION, "Bearer test-token")
+                .header(
+                    header::CONTENT_TYPE,
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["param"], "mask");
+    assert_eq!(body["error"]["code"], "invalid_image_size");
+    assert!(fake.calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn edits_reject_damaged_multipart_image_as_invalid_format() {
+    let fake = FakeGenerator::default();
+    let app = build_router(config(), Arc::new(fake.clone()), usage_store());
+    let boundary = "x-test-boundary";
+    let damaged_png = b"\x89PNG\r\n\x1a\nbroken";
+    let mut body = Vec::new();
+    body.extend_from_slice(
+        b"--x-test-boundary\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\ngpt-image-2\r\n",
+    );
+    body.extend_from_slice(
+        b"--x-test-boundary\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\nuse the reference\r\n",
+    );
+    body.extend_from_slice(
+        b"--x-test-boundary\r\nContent-Disposition: form-data; name=\"image[]\"; filename=\"input.png\"\r\nContent-Type: image/png\r\n\r\n",
+    );
+    body.extend_from_slice(damaged_png);
+    body.extend_from_slice(b"\r\n--x-test-boundary--\r\n");
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/images/edits")
+                .header(header::AUTHORIZATION, "Bearer test-token")
+                .header(
+                    header::CONTENT_TYPE,
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["param"], "image");
+    assert_eq!(body["error"]["code"], "invalid_image_format");
     assert!(fake.calls.lock().unwrap().is_empty());
 }
 

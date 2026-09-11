@@ -60,10 +60,34 @@ pub trait ImageGenerator: Send + Sync + 'static {
 }
 
 pub(crate) fn validate_edit_job(job: &EditJob) -> Result<(), ImageGatewayError> {
+    for image in &job.images {
+        validate_edit_input_dimensions(image, "image")?;
+    }
     if let Some(mask) = &job.mask {
         validate_edit_mask(job.images.first(), mask)?;
     }
     Ok(())
+}
+
+fn validate_edit_input_dimensions(
+    input: &InputImage,
+    param: &'static str,
+) -> Result<(u32, u32), ImageGatewayError> {
+    let dimensions = image_dimensions(&input.bytes).ok_or_else(|| {
+        ImageGatewayError::invalid_request(
+            "input image dimensions could not be read",
+            Some(param.to_string()),
+            "invalid_image_format",
+        )
+    })?;
+    if !dimensions_within_input_budget(dimensions) {
+        return Err(ImageGatewayError::invalid_request(
+            "input image dimensions exceed the decode budget",
+            Some(param.to_string()),
+            "invalid_image_size",
+        ));
+    }
+    Ok(dimensions)
 }
 
 pub(crate) fn validate_edit_mask(
@@ -84,29 +108,9 @@ pub(crate) fn validate_edit_mask(
             "invalid_image_format",
         ));
     }
+    let mask_dims = validate_edit_input_dimensions(mask, "mask")?;
     if let Some(image) = image {
-        let image_dims = image_dimensions(&image.bytes).ok_or_else(|| {
-            ImageGatewayError::invalid_request(
-                "image dimensions could not be read",
-                Some("image".to_string()),
-                "invalid_image_format",
-            )
-        })?;
-        let mask_dims = image_dimensions(&mask.bytes).ok_or_else(|| {
-            ImageGatewayError::invalid_request(
-                "mask dimensions could not be read",
-                Some("mask".to_string()),
-                "invalid_image_format",
-            )
-        })?;
-        if !dimensions_within_input_budget(image_dims) || !dimensions_within_input_budget(mask_dims)
-        {
-            return Err(ImageGatewayError::invalid_request(
-                "image dimensions exceed the decode budget",
-                Some("image".to_string()),
-                "image_too_large",
-            ));
-        }
+        let image_dims = validate_edit_input_dimensions(image, "image")?;
         if image_dims != mask_dims {
             return Err(ImageGatewayError::invalid_request(
                 "mask dimensions must match the first image",
@@ -122,14 +126,83 @@ pub(crate) fn validate_edit_mask(
 mod tests {
     use super::*;
 
-    fn oversized_png_header() -> Vec<u8> {
+    fn png_header(width: u32, height: u32) -> Vec<u8> {
         let mut bytes = vec![0_u8; 26];
         bytes[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
         bytes[12..16].copy_from_slice(b"IHDR");
-        bytes[16..20].copy_from_slice(&8192_u32.to_be_bytes());
-        bytes[20..24].copy_from_slice(&8192_u32.to_be_bytes());
+        bytes[16..20].copy_from_slice(&width.to_be_bytes());
+        bytes[20..24].copy_from_slice(&height.to_be_bytes());
         bytes[25] = 6;
         bytes
+    }
+
+    fn edit_job(image: InputImage, mask: Option<InputImage>) -> EditJob {
+        EditJob {
+            request_id: "request".to_string(),
+            model: "gpt-image-2".to_string(),
+            prompt: "edit".to_string(),
+            moderation: "auto".to_string(),
+            images: vec![image],
+            mask,
+            n: 1,
+            size: "auto".to_string(),
+            quality: "auto".to_string(),
+            output_format: "png".to_string(),
+            output_compression: None,
+            background: "opaque".to_string(),
+            stream: false,
+            partial_images: 0,
+        }
+    }
+
+    #[test]
+    fn oversized_image_dimensions_are_rejected_without_a_mask() {
+        let image = InputImage {
+            filename: None,
+            content_type: Some("image/png".to_string()),
+            bytes: png_header(6929, 6929),
+        };
+
+        let error = validate_edit_job(&edit_job(image, None)).unwrap_err();
+        assert_eq!(error.status_code(), axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(error.error_code(), Some("invalid_image_size"));
+    }
+
+    #[test]
+    fn image_side_above_limit_is_rejected_without_a_mask() {
+        let image = InputImage {
+            filename: None,
+            content_type: Some("image/png".to_string()),
+            bytes: png_header(8193, 1),
+        };
+
+        let error = validate_edit_job(&edit_job(image, None)).unwrap_err();
+        assert_eq!(error.status_code(), axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(error.error_code(), Some("invalid_image_size"));
+    }
+
+    #[test]
+    fn normal_image_dimensions_are_accepted_without_a_mask() {
+        let image = InputImage {
+            filename: None,
+            content_type: Some("image/png".to_string()),
+            bytes: png_header(1024, 1024),
+        };
+
+        validate_edit_job(&edit_job(image, None)).unwrap();
+    }
+
+    #[test]
+    fn unreadable_image_dimensions_keep_the_invalid_format_error() {
+        let image = InputImage {
+            filename: None,
+            content_type: Some("image/png".to_string()),
+            bytes: b"not-an-image".to_vec(),
+        };
+
+        let error = validate_edit_job(&edit_job(image, None)).unwrap_err();
+        assert_eq!(error.status_code(), axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(error.error_code(), Some("invalid_image_format"));
     }
 
     #[test]
@@ -137,15 +210,15 @@ mod tests {
         let image = InputImage {
             filename: None,
             content_type: Some("image/png".to_string()),
-            bytes: oversized_png_header(),
+            bytes: png_header(8192, 8192),
         };
         let mask = InputImage {
             filename: None,
             content_type: Some("image/png".to_string()),
-            bytes: oversized_png_header(),
+            bytes: png_header(8192, 8192),
         };
 
         let error = validate_edit_mask(Some(&image), &mask).unwrap_err();
-        assert_eq!(error.error_code(), Some("image_too_large"));
+        assert_eq!(error.error_code(), Some("invalid_image_size"));
     }
 }
