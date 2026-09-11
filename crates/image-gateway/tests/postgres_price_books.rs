@@ -586,9 +586,9 @@ async fn official_price_snapshot_case(pool: &PgPool) -> TestResult {
         catalogs.catalogs.iter().any(|catalog| {
             catalog.catalog_key == "openai-api-pricing"
                 && catalog.available
-                && catalog.item_count == 1
+                && catalog.item_count == 3
         }),
-        "OpenAI official catalog must be available with one reviewed model",
+        "OpenAI official catalog must be available with three reviewed models",
     )?;
     require(
         catalogs.catalogs.iter().any(|catalog| {
