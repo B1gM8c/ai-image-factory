@@ -2,7 +2,7 @@
 
 Date: 2026-09-18
 
-Status: proposed for implementation
+Status: approved for implementation on 2026-09-19
 
 Scope owner: AI Image Factory
 
