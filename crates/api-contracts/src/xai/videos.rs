@@ -36,7 +36,7 @@ pub struct XaiVideoGenerationRequest {
     pub model: Option<String>,
     #[serde(default)]
     pub output: Option<XaiVideoOutput>,
-    /// Optional only for image-to-video; xAI requires it for text/reference workflows.
+    /// Optional when an image, frame, or reference is supplied; required for text-to-video.
     #[serde(default)]
     pub prompt: Option<String>,
     #[serde(default)]
@@ -160,15 +160,19 @@ pub struct XaiVideoGenerationCommandV2 {
 
 impl XaiVideoGenerationCommandV1 {
     pub fn from_request(request: XaiVideoGenerationRequest) -> Result<Self, XaiVideoRequestError> {
-        if request.generate_audio.is_some()
-            || request.last_frame.is_some()
-            || !request.reference_audios.is_empty()
-        {
-            return Err(XaiVideoRequestError::UnsupportedV2Field);
+        if request.generate_audio.is_some() {
+            return Err(XaiVideoRequestError::UnsupportedGenerateAudio);
+        }
+        if request.last_frame.is_some() {
+            return Err(XaiVideoRequestError::UnsupportedLastFrame);
+        }
+        if !request.reference_audios.is_empty() {
+            return Err(XaiVideoRequestError::UnsupportedReferenceAudios);
         }
         validate_model(request.model.as_deref())?;
         validate_user(request.user.as_deref())?;
-        validate_prompt(request.prompt.as_deref())?;
+        let prompt = normalize_prompt(request.prompt);
+        validate_prompt(prompt.as_deref())?;
         if let Some(image) = request.image.as_ref() {
             validate_image(image)?;
         }
@@ -185,7 +189,7 @@ impl XaiVideoGenerationCommandV1 {
         } else {
             XaiVideoWorkflow::ReferenceToVideo
         };
-        if workflow != XaiVideoWorkflow::ImageToVideo && request.prompt.is_none() {
+        if workflow != XaiVideoWorkflow::ImageToVideo && prompt.is_none() {
             return Err(XaiVideoRequestError::PromptRequired);
         }
         let duration = request.duration.unwrap_or(DEFAULT_DURATION_SECONDS);
@@ -210,7 +214,7 @@ impl XaiVideoGenerationCommandV1 {
             image: request.image,
             model: request.model,
             output: request.output,
-            prompt: normalize_prompt(request.prompt),
+            prompt,
             reference_images: request.reference_images,
             resolution: request.resolution.unwrap_or(XaiVideoResolution::P480),
             storage_options: request.storage_options,
@@ -239,15 +243,16 @@ impl XaiVideoGenerationCommandV2 {
     pub fn from_request(request: XaiVideoGenerationRequest) -> Result<Self, XaiVideoRequestError> {
         validate_model(request.model.as_deref())?;
         validate_user(request.user.as_deref())?;
-        validate_prompt(request.prompt.as_deref())?;
+        let prompt = normalize_prompt(request.prompt);
+        validate_prompt(prompt.as_deref())?;
         if let Some(image) = request.image.as_ref() {
-            validate_image(image)?;
+            validate_image(image).map_err(|_| XaiVideoRequestError::InvalidImage)?;
         }
         if let Some(last_frame) = request.last_frame.as_ref() {
-            validate_image(last_frame)?;
+            validate_image(last_frame).map_err(|_| XaiVideoRequestError::InvalidLastFrame)?;
         }
         for image in &request.reference_images {
-            validate_image(image)?;
+            validate_image(image).map_err(|_| XaiVideoRequestError::InvalidReferenceImage)?;
         }
         if request.reference_images.len() > 7 {
             return Err(XaiVideoRequestError::TooManyReferenceImages);
@@ -262,7 +267,7 @@ impl XaiVideoGenerationCommandV2 {
             || request.last_frame.is_some()
             || !request.reference_images.is_empty()
             || !request.reference_audios.is_empty();
-        if !has_frame_or_reference && request.prompt.is_none() {
+        if !has_frame_or_reference && prompt.is_none() {
             return Err(XaiVideoRequestError::PromptRequired);
         }
         let duration = request.duration.unwrap_or(DEFAULT_DURATION_SECONDS);
@@ -289,7 +294,7 @@ impl XaiVideoGenerationCommandV2 {
             last_frame: request.last_frame,
             model: request.model,
             output: request.output,
-            prompt: normalize_prompt(request.prompt),
+            prompt,
             reference_audios: request.reference_audios,
             reference_images: request.reference_images,
             resolution: request.resolution.unwrap_or(XaiVideoResolution::P480),
@@ -338,8 +343,16 @@ pub enum XaiVideoRequestError {
     InvalidOutput,
     #[error("xAI video storage options are invalid")]
     InvalidStorageOptions,
-    #[error("xAI video v2-only field is not supported by the v1 command")]
-    UnsupportedV2Field,
+    #[error("xAI video generate_audio is not supported by the v1 command")]
+    UnsupportedGenerateAudio,
+    #[error("xAI video last_frame is not supported by the v1 command")]
+    UnsupportedLastFrame,
+    #[error("xAI video reference_audios are not supported by the v1 command")]
+    UnsupportedReferenceAudios,
+    #[error("xAI video last_frame input is invalid")]
+    InvalidLastFrame,
+    #[error("xAI video reference image input is invalid")]
+    InvalidReferenceImage,
     #[error("xAI video reference image count exceeds seven")]
     TooManyReferenceImages,
     #[error("xAI video reference audio is invalid")]
@@ -359,7 +372,10 @@ impl XaiVideoRequestError {
             Self::ConflictingInputs => "reference_images",
             Self::InvalidOutput => "output",
             Self::InvalidStorageOptions => "storage_options",
-            Self::UnsupportedV2Field => "generate_audio",
+            Self::UnsupportedGenerateAudio => "generate_audio",
+            Self::UnsupportedLastFrame | Self::InvalidLastFrame => "last_frame",
+            Self::UnsupportedReferenceAudios => "reference_audios",
+            Self::InvalidReferenceImage => "reference_images",
             Self::TooManyReferenceImages => "reference_images",
             Self::InvalidReferenceAudio | Self::TooManyReferenceAudios => "reference_audios",
         }
@@ -570,6 +586,172 @@ mod tests {
             XaiVideoGenerationCommandV2::from_request(request),
             Err(XaiVideoRequestError::InvalidReferenceAudio)
         );
+        assert_eq!(
+            XaiVideoRequestError::InvalidReferenceAudio.parameter(),
+            "reference_audios"
+        );
+    }
+
+    #[test]
+    fn v2_requires_nonblank_prompt_only_for_text_video() {
+        let mut text = v1_text_request();
+        text.prompt = Some("   ".to_owned());
+        assert_eq!(
+            XaiVideoGenerationCommandV2::from_request(text),
+            Err(XaiVideoRequestError::PromptRequired)
+        );
+
+        let mut image = v1_text_request();
+        image.prompt = Some("   ".to_owned());
+        image.image = Some(XaiVideoImageUrl {
+            file_id: None,
+            url: Some("https://example.com/first.png".to_owned()),
+        });
+        assert!(XaiVideoGenerationCommandV2::from_request(image).is_ok());
+
+        let mut reference = v1_text_request();
+        reference.prompt = Some("   ".to_owned());
+        reference.reference_images = vec![XaiVideoImageUrl {
+            file_id: None,
+            url: Some("https://example.com/reference.png".to_owned()),
+        }];
+        assert!(XaiVideoGenerationCommandV2::from_request(reference).is_ok());
+    }
+
+    #[test]
+    fn v1_rejects_each_v2_only_field_with_its_parameter() {
+        let mut generate_audio = v1_text_request();
+        generate_audio.generate_audio = Some(true);
+        assert_eq!(
+            XaiVideoGenerationCommandV1::from_request(generate_audio),
+            Err(XaiVideoRequestError::UnsupportedGenerateAudio)
+        );
+        assert_eq!(
+            XaiVideoRequestError::UnsupportedGenerateAudio.parameter(),
+            "generate_audio"
+        );
+
+        let mut last_frame = v1_text_request();
+        last_frame.last_frame = Some(XaiVideoImageUrl {
+            file_id: None,
+            url: Some("https://example.com/last.png".to_owned()),
+        });
+        assert_eq!(
+            XaiVideoGenerationCommandV1::from_request(last_frame),
+            Err(XaiVideoRequestError::UnsupportedLastFrame)
+        );
+        assert_eq!(
+            XaiVideoRequestError::UnsupportedLastFrame.parameter(),
+            "last_frame"
+        );
+
+        let mut audios = v1_text_request();
+        audios.reference_audios = vec![XaiVideoAudioReference {
+            url: None,
+            voice_id: Some("eve".to_owned()),
+        }];
+        assert_eq!(
+            XaiVideoGenerationCommandV1::from_request(audios),
+            Err(XaiVideoRequestError::UnsupportedReferenceAudios)
+        );
+        assert_eq!(
+            XaiVideoRequestError::UnsupportedReferenceAudios.parameter(),
+            "reference_audios"
+        );
+    }
+
+    #[test]
+    fn v2_enforces_audio_limit_and_source_parameter() {
+        let mut request = v1_text_request();
+        request.reference_audios = (0..3)
+            .map(|index| XaiVideoAudioReference {
+                url: None,
+                voice_id: Some(format!("voice-{index}")),
+            })
+            .collect();
+        assert!(XaiVideoGenerationCommandV2::from_request(request.clone()).is_ok());
+        request.reference_audios.push(XaiVideoAudioReference {
+            url: None,
+            voice_id: Some("voice-3".to_owned()),
+        });
+        assert_eq!(
+            XaiVideoGenerationCommandV2::from_request(request),
+            Err(XaiVideoRequestError::TooManyReferenceAudios)
+        );
+        assert_eq!(
+            XaiVideoRequestError::TooManyReferenceAudios.parameter(),
+            "reference_audios"
+        );
+
+        let mut missing = v1_text_request();
+        missing.reference_audios = vec![XaiVideoAudioReference {
+            url: None,
+            voice_id: None,
+        }];
+        assert_eq!(
+            XaiVideoGenerationCommandV2::from_request(missing),
+            Err(XaiVideoRequestError::InvalidReferenceAudio)
+        );
+    }
+
+    #[test]
+    fn v2_preserves_field_parameters_and_combined_frame_precedence() {
+        let mut invalid_image = v1_text_request();
+        invalid_image.prompt = None;
+        invalid_image.image = Some(XaiVideoImageUrl {
+            file_id: None,
+            url: None,
+        });
+        assert_eq!(
+            XaiVideoGenerationCommandV2::from_request(invalid_image),
+            Err(XaiVideoRequestError::InvalidImage)
+        );
+        assert_eq!(XaiVideoRequestError::InvalidImage.parameter(), "image");
+
+        let mut invalid_last = v1_text_request();
+        invalid_last.last_frame = Some(XaiVideoImageUrl {
+            file_id: None,
+            url: None,
+        });
+        assert_eq!(
+            XaiVideoGenerationCommandV2::from_request(invalid_last),
+            Err(XaiVideoRequestError::InvalidLastFrame)
+        );
+        assert_eq!(
+            XaiVideoRequestError::InvalidLastFrame.parameter(),
+            "last_frame"
+        );
+
+        let mut invalid_reference = v1_text_request();
+        invalid_reference.reference_images = vec![XaiVideoImageUrl {
+            file_id: None,
+            url: None,
+        }];
+        assert_eq!(
+            XaiVideoGenerationCommandV2::from_request(invalid_reference),
+            Err(XaiVideoRequestError::InvalidReferenceImage)
+        );
+        assert_eq!(
+            XaiVideoRequestError::InvalidReferenceImage.parameter(),
+            "reference_images"
+        );
+
+        let mut combined = v1_text_request();
+        combined.prompt = None;
+        combined.image = Some(XaiVideoImageUrl {
+            file_id: None,
+            url: Some("https://example.com/first.png".to_owned()),
+        });
+        combined.last_frame = Some(XaiVideoImageUrl {
+            file_id: None,
+            url: Some("https://example.com/last.png".to_owned()),
+        });
+        assert_eq!(
+            XaiVideoGenerationCommandV2::from_request(combined)
+                .unwrap()
+                .workflow(),
+            XaiVideoWorkflow::ReferenceToVideo
+        );
     }
 
     #[test]
@@ -605,7 +787,11 @@ mod tests {
     }
 
     fn v1_text_command() -> XaiVideoGenerationCommandV1 {
-        XaiVideoGenerationCommandV1::from_request(XaiVideoGenerationRequest {
+        XaiVideoGenerationCommandV1::from_request(v1_text_request()).unwrap()
+    }
+
+    fn v1_text_request() -> XaiVideoGenerationRequest {
+        XaiVideoGenerationRequest {
             aspect_ratio: Some(XaiVideoAspectRatio::R16x9),
             duration: Some(6),
             generate_audio: None,
@@ -619,8 +805,7 @@ mod tests {
             resolution: None,
             storage_options: None,
             user: None,
-        })
-        .unwrap()
+        }
     }
 
     #[test]
