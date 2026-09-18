@@ -787,11 +787,28 @@ mod tests {
         assert!(crate::admission::validate_attach_request(&digest_tamper).is_err());
 
         let mut semantic_role_tamper = attach.clone();
-        semantic_role_tamper
-            .input_manifest
-            .as_mut()
-            .unwrap()
-            .manifest_hash = "e".repeat(64);
+        let manifest = semantic_role_tamper.input_manifest.as_mut().unwrap();
+        let descriptors = manifest
+            .inputs
+            .iter()
+            .enumerate()
+            .map(|(index, input)| ManifestDescriptorV2 {
+                byte_size: input.blob.byte_size,
+                filename: plan.inputs()[index].filename(),
+                index: index as u16,
+                media_type: &input.media_type,
+                role: match index {
+                    0 => "last_frame",
+                    1 => "last_frame",
+                    _ => "reference_image",
+                },
+                role_index: 0,
+                sha256_hex: &input.blob.sha256_hex,
+            })
+            .collect::<Vec<_>>();
+        manifest.manifest_hash = hex::encode(Sha256::digest(
+            serde_json::to_vec(&descriptors).expect("tampered V2 descriptor encoding"),
+        ));
         assert!(crate::admission::validate_attach_request(&semantic_role_tamper).is_err());
     }
 
