@@ -1,11 +1,12 @@
 use image_api_contracts::xai::{
-    XAI_VIDEOS_API_PROFILE, XaiVideoGenerationCommandV1, XaiVideoGenerationRequest,
-    XaiVideoRequestError, XaiVideoWorkflow,
+    XAI_VIDEOS_API_PROFILE, XaiVideoGenerationCommandV1, XaiVideoGenerationCommandV2,
+    XaiVideoGenerationRequest, XaiVideoRequestError, XaiVideoWorkflow,
 };
 use image_provider_grok_cli::{
-    GROK_VIDEO_GENERATION_COMMAND_SCHEMA, GrokCommandError, GrokVideoGenerationPayloadV1,
+    GROK_VIDEO_GENERATION_COMMAND_SCHEMA, GROK_VIDEO_GENERATION_COMMAND_SCHEMA_V2,
+    GrokCommandError, GrokVideoGenerationPayloadV1, GrokVideoGenerationPayloadV2,
     GrokVideoGenerationRequestV1, PROVIDER_ID, StagedImageV1, VIDEO_ADAPTER_REVISION,
-    XaiGrokVideoProjectionError,
+    VIDEO_ADAPTER_REVISION_V2, XaiGrokVideoProjectionError,
 };
 use image_provider_sdk::{CanonicalCommandPayload, OutputSlot};
 use serde::Serialize;
@@ -23,12 +24,32 @@ use super::{
 
 pub const VIDEO_GENERATION_OPERATION: &str = "video_generation";
 pub const XAI_VIDEO_INPUT_MANIFEST_SCHEMA: &str = "xai.videos.inputs.v1";
+pub const XAI_VIDEO_INPUT_MANIFEST_SCHEMA_V2: &str = "xai.videos.inputs.v2";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum XaiVideoInputRoleV2 {
+    FirstFrame,
+    LastFrame,
+    ReferenceImage,
+}
+
+impl XaiVideoInputRoleV2 {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::FirstFrame => "first_frame",
+            Self::LastFrame => "last_frame",
+            Self::ReferenceImage => "reference_image",
+        }
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct XaiVideoAdmissionInput {
     filename: String,
     blob: InputBlobRef,
     media_type: String,
+    role_v2: Option<XaiVideoInputRoleV2>,
+    role_index_v2: u8,
 }
 
 impl XaiVideoAdmissionInput {
@@ -53,7 +74,22 @@ impl XaiVideoAdmissionInput {
             filename,
             blob,
             media_type,
+            role_v2: None,
+            role_index_v2: 0,
         })
+    }
+
+    fn new_v2(
+        filename: impl Into<String>,
+        blob: InputBlobRef,
+        media_type: impl Into<String>,
+        role: XaiVideoInputRoleV2,
+        role_index: u8,
+    ) -> Result<Self, XaiVideoAdmissionError> {
+        let mut input = Self::new(filename, blob, media_type)?;
+        input.role_v2 = Some(role);
+        input.role_index_v2 = role_index;
+        Ok(input)
     }
 
     pub fn filename(&self) -> &str {
@@ -67,11 +103,20 @@ impl XaiVideoAdmissionInput {
     pub fn media_type(&self) -> &str {
         &self.media_type
     }
+
+    pub fn role(&self) -> XaiVideoInputRoleV2 {
+        self.role_v2.unwrap_or(XaiVideoInputRoleV2::ReferenceImage)
+    }
+
+    pub fn role_index(&self) -> u8 {
+        self.role_index_v2
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct XaiVideoAdmissionIntent {
     source_command: XaiVideoGenerationCommandV1,
+    source_command_v2: Option<XaiVideoGenerationCommandV2>,
     source_request_hash: String,
 }
 
@@ -81,7 +126,34 @@ impl XaiVideoAdmissionIntent {
         let source_request_hash = source_command.canonical_sha256_hex();
         Ok(Self {
             source_command,
+            source_command_v2: None,
             source_request_hash,
+        })
+    }
+
+    /// Constructs the explicit 1.0.34/Grok CLI V2 admission path.  V1 remains
+    /// the default constructor so replayed requests cannot be silently
+    /// reinterpreted merely because they use the same public model name.
+    pub fn new_v2(request: XaiVideoGenerationRequest) -> Result<Self, XaiVideoAdmissionError> {
+        let source_command_v2 = XaiVideoGenerationCommandV2::from_request(request.clone())?;
+        let source_command = XaiVideoGenerationCommandV1 {
+            schema_version: 1,
+            operation: source_command_v2.operation.clone(),
+            aspect_ratio: source_command_v2.aspect_ratio,
+            duration: source_command_v2.duration,
+            image: None,
+            model: source_command_v2.model.clone(),
+            output: source_command_v2.output.clone(),
+            prompt: source_command_v2.prompt.clone(),
+            reference_images: Vec::new(),
+            resolution: source_command_v2.resolution,
+            storage_options: source_command_v2.storage_options.clone(),
+            user: source_command_v2.user.clone(),
+        };
+        Ok(Self {
+            source_command,
+            source_request_hash: source_command_v2.canonical_sha256_hex(),
+            source_command_v2: Some(source_command_v2),
         })
     }
 
@@ -91,6 +163,10 @@ impl XaiVideoAdmissionIntent {
 
     pub fn source_request_hash(&self) -> &str {
         &self.source_request_hash
+    }
+
+    pub fn source_command_v2(&self) -> Option<&XaiVideoGenerationCommandV2> {
+        self.source_command_v2.as_ref()
     }
 
     pub fn claim(
@@ -126,6 +202,7 @@ impl XaiVideoAdmissionIntent {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct XaiVideoAdmissionPlan {
     source_command: XaiVideoGenerationCommandV1,
+    source_command_v2: Option<XaiVideoGenerationCommandV2>,
     source_request_hash: String,
     provider_model: String,
     provider_command: Value,
@@ -141,10 +218,25 @@ impl XaiVideoAdmissionPlan {
         XaiVideoAdmissionIntent::new(request)?.bind_grok_cli(inputs)
     }
 
+    pub fn for_grok_cli_v2(
+        request: XaiVideoGenerationRequest,
+        inputs: Vec<XaiVideoAdmissionInput>,
+    ) -> Result<Self, XaiVideoAdmissionError> {
+        XaiVideoAdmissionIntent::new_v2(request)?.bind_grok_cli(inputs)
+    }
+
     fn from_intent(
         intent: XaiVideoAdmissionIntent,
         inputs: Vec<XaiVideoAdmissionInput>,
     ) -> Result<Self, XaiVideoAdmissionError> {
+        if let Some(source_command_v2) = intent.source_command_v2.clone() {
+            return Self::from_intent_v2(
+                intent.source_command,
+                source_command_v2,
+                intent.source_request_hash,
+                inputs,
+            );
+        }
         let source_command = intent.source_command;
         let expected_inputs = match source_command.workflow() {
             XaiVideoWorkflow::TextToVideo => 0,
@@ -180,10 +272,74 @@ impl XaiVideoAdmissionPlan {
         let input_manifest_hash = input_manifest_hash(&inputs)?;
         Ok(Self {
             source_command,
+            source_command_v2: None,
             source_request_hash,
             provider_model,
             provider_command,
             inputs,
+            input_manifest_hash,
+        })
+    }
+
+    fn from_intent_v2(
+        source_command: XaiVideoGenerationCommandV1,
+        source_command_v2: XaiVideoGenerationCommandV2,
+        source_request_hash: String,
+        inputs: Vec<XaiVideoAdmissionInput>,
+    ) -> Result<Self, XaiVideoAdmissionError> {
+        let expected_inputs = usize::from(source_command_v2.image.is_some())
+            + usize::from(source_command_v2.last_frame.is_some())
+            + source_command_v2.reference_images.len();
+        if inputs.len() != expected_inputs {
+            return Err(XaiVideoAdmissionError::InvalidInputManifest);
+        }
+        let mut semantic_inputs = Vec::with_capacity(inputs.len());
+        let first_count = usize::from(source_command_v2.image.is_some());
+        let last_count = usize::from(source_command_v2.last_frame.is_some());
+        for (position, input) in inputs.into_iter().enumerate() {
+            let (role, role_index) = if position < first_count {
+                (XaiVideoInputRoleV2::FirstFrame, 0)
+            } else if position < first_count + last_count {
+                (XaiVideoInputRoleV2::LastFrame, 0)
+            } else {
+                (
+                    XaiVideoInputRoleV2::ReferenceImage,
+                    u8::try_from(position - first_count - last_count)
+                        .map_err(|_| XaiVideoAdmissionError::InvalidInputManifest)?,
+                )
+            };
+            semantic_inputs.push(XaiVideoAdmissionInput::new_v2(
+                input.filename,
+                input.blob,
+                input.media_type,
+                role,
+                role_index,
+            )?);
+        }
+        let staged_images = semantic_inputs
+            .iter()
+            .map(|input| StagedImageV1::new(&input.filename, &input.blob.sha256_hex))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| XaiVideoAdmissionError::InvalidInputManifest)?;
+        let payload = GrokVideoGenerationPayloadV2::from_xai_command(
+            source_command_v2.clone(),
+            staged_images,
+        )
+        .map_err(XaiVideoAdmissionError::UnsupportedBindingV2)?;
+        let provider_command = serde_json::from_slice(
+            &payload
+                .clone()
+                .into_canonical_bytes(OutputSlot::new(0, 1).unwrap()),
+        )
+        .map_err(|_| XaiVideoAdmissionError::InvalidProviderCommand)?;
+        let input_manifest_hash = input_manifest_hash_v2(&semantic_inputs)?;
+        Ok(Self {
+            source_command,
+            source_command_v2: Some(source_command_v2),
+            source_request_hash,
+            provider_model: "grok-imagine-video-1.5".to_owned(),
+            provider_command,
+            inputs: semantic_inputs,
             input_manifest_hash,
         })
     }
@@ -196,6 +352,10 @@ impl XaiVideoAdmissionPlan {
         &self.source_request_hash
     }
 
+    pub fn source_command_v2(&self) -> Option<&XaiVideoGenerationCommandV2> {
+        self.source_command_v2.as_ref()
+    }
+
     pub fn provider_id(&self) -> &'static str {
         PROVIDER_ID
     }
@@ -205,7 +365,11 @@ impl XaiVideoAdmissionPlan {
     }
 
     pub fn command_schema(&self) -> &'static str {
-        GROK_VIDEO_GENERATION_COMMAND_SCHEMA
+        if self.source_command_v2.is_some() {
+            GROK_VIDEO_GENERATION_COMMAND_SCHEMA_V2
+        } else {
+            GROK_VIDEO_GENERATION_COMMAND_SCHEMA
+        }
     }
 
     pub fn command_json(&self) -> &Value {
@@ -213,11 +377,23 @@ impl XaiVideoAdmissionPlan {
     }
 
     pub fn adapter_revision(&self) -> &'static str {
-        VIDEO_ADAPTER_REVISION
+        if self.source_command_v2.is_some() {
+            VIDEO_ADAPTER_REVISION_V2
+        } else {
+            VIDEO_ADAPTER_REVISION
+        }
     }
 
     pub fn inputs(&self) -> &[XaiVideoAdmissionInput] {
         &self.inputs
+    }
+
+    pub fn reference_image_count(&self) -> usize {
+        self.source_command_v2
+            .as_ref()
+            .map_or(self.source_command.reference_images.len(), |command| {
+                command.reference_images.len()
+            })
     }
 
     pub fn input_manifest_hash(&self) -> &str {
@@ -247,6 +423,7 @@ impl XaiVideoAdmissionPlan {
     ) -> ClaimAdmission {
         XaiVideoAdmissionIntent {
             source_command: self.source_command.clone(),
+            source_command_v2: self.source_command_v2.clone(),
             source_request_hash: self.source_request_hash.clone(),
         }
         .claim(
@@ -278,14 +455,18 @@ impl XaiVideoAdmissionPlan {
             })
             .collect();
         let input_manifest = (!inputs.is_empty()).then(|| AttachInputManifest {
-            manifest_schema: XAI_VIDEO_INPUT_MANIFEST_SCHEMA.to_owned(),
+            manifest_schema: if self.source_command_v2.is_some() {
+                XAI_VIDEO_INPUT_MANIFEST_SCHEMA_V2.to_owned()
+            } else {
+                XAI_VIDEO_INPUT_MANIFEST_SCHEMA.to_owned()
+            },
             manifest_hash: self.input_manifest_hash.clone(),
             inputs,
         });
         AttachJob {
             ticket,
             job_id,
-            command_schema: GROK_VIDEO_GENERATION_COMMAND_SCHEMA.to_owned(),
+            command_schema: self.command_schema().to_owned(),
             command_json: self.provider_command.clone(),
             input_manifest,
             work_kind: "video_single".to_owned(),
@@ -299,12 +480,14 @@ impl XaiVideoAdmissionPlan {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum XaiVideoAdmissionError {
     #[error(transparent)]
     InvalidRequest(#[from] XaiVideoRequestError),
     #[error(transparent)]
     UnsupportedBinding(#[from] XaiGrokVideoProjectionError),
+    #[error(transparent)]
+    UnsupportedBindingV2(#[from] image_provider_grok_cli::XaiGrokVideoProjectionErrorV2),
     #[error("xAI video sealed input manifest is invalid")]
     InvalidInputManifest,
     #[error("xAI video provider command is invalid")]
@@ -318,6 +501,17 @@ struct ManifestDescriptor<'a> {
     index: u16,
     media_type: &'a str,
     role: &'static str,
+    sha256_hex: &'a str,
+}
+
+#[derive(Serialize)]
+struct ManifestDescriptorV2<'a> {
+    byte_size: u64,
+    filename: &'a str,
+    index: u16,
+    media_type: &'a str,
+    role: &'static str,
+    role_index: u8,
     sha256_hex: &'a str,
 }
 
@@ -346,6 +540,30 @@ fn input_manifest_hash(
     Ok(hex::encode(Sha256::digest(bytes)))
 }
 
+fn input_manifest_hash_v2(
+    inputs: &[XaiVideoAdmissionInput],
+) -> Result<String, XaiVideoAdmissionError> {
+    let descriptors = inputs
+        .iter()
+        .enumerate()
+        .map(|(index, input)| {
+            Ok(ManifestDescriptorV2 {
+                byte_size: input.blob.byte_size,
+                filename: &input.filename,
+                index: u16::try_from(index)
+                    .map_err(|_| XaiVideoAdmissionError::InvalidInputManifest)?,
+                media_type: &input.media_type,
+                role: input.role().as_str(),
+                role_index: input.role_index(),
+                sha256_hex: &input.blob.sha256_hex,
+            })
+        })
+        .collect::<Result<Vec<_>, XaiVideoAdmissionError>>()?;
+    let bytes = serde_json::to_vec(&descriptors)
+        .map_err(|_| XaiVideoAdmissionError::InvalidInputManifest)?;
+    Ok(hex::encode(Sha256::digest(bytes)))
+}
+
 pub(super) fn video_input_manifest_hash_matches(
     expected_images: &[StagedImageV1],
     manifest: &AttachInputManifest,
@@ -367,9 +585,43 @@ pub(super) fn video_input_manifest_hash_matches(
         .unwrap_or(false)
 }
 
+pub(super) fn video_input_manifest_hash_matches_v2(
+    expected_images: &[(XaiVideoInputRoleV2, u8, StagedImageV1)],
+    manifest: &AttachInputManifest,
+) -> bool {
+    if expected_images.len() != manifest.inputs.len() {
+        return false;
+    }
+    let descriptors = expected_images
+        .iter()
+        .zip(&manifest.inputs)
+        .enumerate()
+        .map(|(index, ((role, role_index, expected), input))| {
+            if input.index != index as u16 {
+                return None;
+            }
+            Some(ManifestDescriptorV2 {
+                byte_size: input.blob.byte_size,
+                filename: expected.filename(),
+                index: index as u16,
+                media_type: &input.media_type,
+                role: role.as_str(),
+                role_index: *role_index,
+                sha256_hex: &input.blob.sha256_hex,
+            })
+        })
+        .collect::<Option<Vec<_>>>();
+    let Some(descriptors) = descriptors else {
+        return false;
+    };
+    serde_json::to_vec(&descriptors)
+        .map(|bytes| hex::encode(Sha256::digest(bytes)) == manifest.manifest_hash)
+        .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
-    use image_api_contracts::xai::{XaiVideoImageUrl, XaiVideoResolution};
+    use image_api_contracts::xai::{XaiVideoAudioReference, XaiVideoImageUrl, XaiVideoResolution};
 
     use super::*;
     use crate::input_blobs::InputBlobKey;
@@ -433,6 +685,133 @@ mod tests {
             storage_options: None,
             user: None,
         }
+    }
+
+    fn v2_reference_request() -> XaiVideoGenerationRequest {
+        XaiVideoGenerationRequest {
+            aspect_ratio: Some(image_api_contracts::xai::XaiVideoAspectRatio::R16x9),
+            duration: Some(8),
+            generate_audio: Some(true),
+            image: Some(XaiVideoImageUrl {
+                file_id: None,
+                url: Some("data:image/png;base64,AA==".to_owned()),
+            }),
+            last_frame: Some(XaiVideoImageUrl {
+                file_id: None,
+                url: Some("data:image/png;base64,AA==".to_owned()),
+            }),
+            model: Some("grok-imagine-video-1.5".to_owned()),
+            output: None,
+            prompt: None,
+            reference_audios: vec![XaiVideoAudioReference {
+                url: None,
+                voice_id: Some("eve".to_owned()),
+            }],
+            reference_images: vec![XaiVideoImageUrl {
+                file_id: None,
+                url: Some("data:image/png;base64,AA==".to_owned()),
+            }],
+            resolution: Some(XaiVideoResolution::P480),
+            storage_options: None,
+            user: None,
+        }
+    }
+
+    #[test]
+    fn v2_manifest_binds_first_last_and_reference_roles() {
+        let session_id = Uuid::new_v4();
+        let inputs = (0..3)
+            .map(|index| {
+                XaiVideoAdmissionInput::new(
+                    format!("input-{index}.png"),
+                    InputBlobRef {
+                        key: InputBlobKey {
+                            admission_session_id: session_id,
+                            input_id: Uuid::from_u128(index as u128 + 1),
+                        },
+                        storage_backend: "test".to_owned(),
+                        object_key: format!("input-{index}.png"),
+                        sha256_hex: format!("{index:064x}"),
+                        byte_size: 128,
+                    },
+                    "image/png",
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let plan = XaiVideoAdmissionPlan::for_grok_cli_v2(v2_reference_request(), inputs).unwrap();
+        assert_eq!(
+            plan.command_schema(),
+            image_provider_grok_cli::GROK_VIDEO_GENERATION_COMMAND_SCHEMA_V2
+        );
+        assert_eq!(
+            plan.adapter_revision(),
+            image_provider_grok_cli::VIDEO_ADAPTER_REVISION_V2
+        );
+        assert_eq!(plan.inputs().len(), 3);
+        assert_eq!(plan.inputs()[0].role(), XaiVideoInputRoleV2::FirstFrame);
+        assert_eq!(plan.inputs()[1].role(), XaiVideoInputRoleV2::LastFrame);
+        assert_eq!(plan.inputs()[2].role(), XaiVideoInputRoleV2::ReferenceImage);
+        assert_eq!(plan.inputs()[2].role_index(), 0);
+        assert!(plan.input_manifest_hash().len() == 64);
+    }
+
+    #[test]
+    fn voice_only_v2_reference_has_no_input_manifest() {
+        let mut request = v2_reference_request();
+        request.image = None;
+        request.last_frame = None;
+        request.reference_images.clear();
+        let plan = XaiVideoAdmissionPlan::for_grok_cli_v2(request, Vec::new()).unwrap();
+        assert!(plan.inputs().is_empty());
+        assert!(
+            plan.attach(
+                AdmissionTicket {
+                    session_id: Uuid::new_v4(),
+                    owner_token: Uuid::new_v4(),
+                    request_hash: plan.source_request_hash().to_owned(),
+                },
+                Uuid::new_v4(),
+                "tenant:test",
+                AdmissionContract::MediaEconomicsV3,
+            )
+            .input_manifest
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn first_last_plus_seven_references_has_seven_reference_count() {
+        let mut request = v2_reference_request();
+        request.reference_images = (0..7)
+            .map(|_| XaiVideoImageUrl {
+                file_id: None,
+                url: Some("data:image/png;base64,AA==".to_owned()),
+            })
+            .collect();
+        let session_id = Uuid::new_v4();
+        let inputs = (0..9)
+            .map(|index| {
+                XaiVideoAdmissionInput::new(
+                    format!("input-{index}.png"),
+                    InputBlobRef {
+                        key: InputBlobKey {
+                            admission_session_id: session_id,
+                            input_id: Uuid::from_u128(index as u128 + 1),
+                        },
+                        storage_backend: "test".to_owned(),
+                        object_key: format!("input-{index}.png"),
+                        sha256_hex: format!("{index:064x}"),
+                        byte_size: 128,
+                    },
+                    "image/png",
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let plan = XaiVideoAdmissionPlan::for_grok_cli_v2(request, inputs).unwrap();
+        assert_eq!(plan.reference_image_count(), 7);
+        assert_eq!(plan.inputs().len(), 9);
     }
 
     #[test]

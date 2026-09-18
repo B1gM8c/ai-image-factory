@@ -12,7 +12,6 @@ use image_api_contracts::xai::{
     XaiVideoResponse, XaiVideoWorkflow,
 };
 use image_provider_contracts::BillingMetric;
-use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::{
@@ -23,15 +22,15 @@ use crate::{
         idempotency_key_digest,
     },
     auth::{ApiKeyCapability, AuthContext},
-    generator::InputImage,
-    input_blobs::{InputBlobKey, InputBlobRef, InputBlobWriteError},
+    input_blobs::{InputBlobKey, InputBlobWriteError},
     settlement::{StoredVideoArtifact, VideoResultStatus},
     usage::{UsageCharge, UsageLimits, UsageReservation},
 };
 
 use super::{
     AppState, GenerationExecutionMode, RequestId, authenticate_image_request,
-    edit_input::decode_data_url_image, resolve_request_model,
+    resolve_request_model,
+    video_inputs::{DecodedVideoInput, decode_video_inputs_v2},
 };
 
 const RETRY_DELAY: Duration = Duration::from_millis(25);
@@ -52,11 +51,7 @@ pub(super) async fn create_video(
             "invalid_json",
         )
     })?;
-    let default_model = if request.image.is_some() {
-        "grok-imagine-video-1.5-preview"
-    } else {
-        "grok-imagine-video"
-    };
+    let default_model = "grok-imagine-video-1.5";
     if let Some(resolved) = resolve_request_model(
         &state,
         &mut auth,
@@ -87,9 +82,15 @@ pub(super) async fn create_video_with_auth(
             "video generation requires external execution",
         ));
     }
-    let intent = XaiVideoAdmissionIntent::new(request).map_err(video_admission_error)?;
-    let decoded = decode_video_inputs(intent.source_command(), state.config.max_upload_bytes)?;
-    preflight_grok_binding(&intent, &decoded)?;
+    let intent = XaiVideoAdmissionIntent::new_v2(request).map_err(video_admission_error)?;
+    preflight_grok_binding_v2(&intent)?;
+    let decoded = decode_video_inputs_v2(
+        intent
+            .source_command_v2()
+            .ok_or_else(|| ImageGatewayError::internal("video V2 intent missing source command"))?,
+        state.config.max_upload_bytes,
+    )
+    .await?;
     let idempotency_key_digest = video_idempotency_digest(&headers, &auth)?;
     let contract = video_admission_contract(state.config.generation_admission_contract);
     let mut claim = intent.claim(
@@ -209,33 +210,46 @@ fn video_admission_contract(
 fn video_pricing_dimensions(
     plan: &crate::admission::XaiVideoAdmissionPlan,
 ) -> Result<BTreeMap<String, String>, ImageGatewayError> {
-    let command = plan.source_command();
-    let input_image_count = if command.image.is_some() {
-        1
-    } else {
-        command.reference_images.len()
-    };
+    let (duration, resolution, input_image_count, aspect_ratio, workflow) =
+        if let Some(command) = plan.source_command_v2() {
+            (
+                command.duration,
+                command.resolution,
+                usize::from(command.image.is_some())
+                    + usize::from(command.last_frame.is_some())
+                    + command.reference_images.len(),
+                command.aspect_ratio,
+                command.workflow(),
+            )
+        } else {
+            let command = plan.source_command();
+            (
+                command.duration,
+                command.resolution,
+                usize::from(command.image.is_some()) + command.reference_images.len(),
+                command.aspect_ratio,
+                command.workflow(),
+            )
+        };
     let mut dimensions = BTreeMap::from([
-        ("duration".to_owned(), command.duration.to_string()),
+        ("duration".to_owned(), duration.to_string()),
         (
             "input_image_count".to_owned(),
             enum_or_integer_wire_value(input_image_count)?,
         ),
         (
             "resolution".to_owned(),
-            enum_or_integer_wire_value(command.resolution)?,
+            enum_or_integer_wire_value(resolution)?,
         ),
     ]);
     if matches!(
-        command.workflow(),
+        workflow,
         XaiVideoWorkflow::TextToVideo | XaiVideoWorkflow::ReferenceToVideo
     ) {
         dimensions.insert(
             "aspect_ratio".to_owned(),
             enum_or_integer_wire_value(
-                command
-                    .aspect_ratio
-                    .unwrap_or(image_api_contracts::xai::XaiVideoAspectRatio::R16x9),
+                aspect_ratio.unwrap_or(image_api_contracts::xai::XaiVideoAspectRatio::R16x9),
             )?,
         );
     }
@@ -311,96 +325,12 @@ pub(super) async fn get_video_content_with_auth(
         .map_err(|_| ImageGatewayError::internal("failed to build video response"))
 }
 
-#[derive(Clone)]
-struct DecodedVideoInput {
-    filename: String,
-    media_type: String,
-    bytes: Vec<u8>,
-}
-
-fn decode_video_inputs(
-    command: &image_api_contracts::xai::XaiVideoGenerationCommandV1,
-    max_upload_bytes: usize,
-) -> Result<Vec<DecodedVideoInput>, ImageGatewayError> {
-    let urls = match command.workflow() {
-        XaiVideoWorkflow::TextToVideo => Vec::new(),
-        XaiVideoWorkflow::ImageToVideo => vec![(
-            "image".to_owned(),
-            command
-                .image
-                .as_ref()
-                .and_then(|image| image.url.as_deref())
-                .ok_or_else(|| unsupported_video_input("image"))?,
-        )],
-        XaiVideoWorkflow::ReferenceToVideo => command
-            .reference_images
-            .iter()
-            .enumerate()
-            .map(|(index, image)| {
-                image
-                    .url
-                    .as_deref()
-                    .map(|url| (format!("reference_images[{index}]"), url))
-                    .ok_or_else(|| unsupported_video_input("reference_images"))
-            })
-            .collect::<Result<Vec<_>, _>>()?,
-    };
-    let mut total_bytes = 0;
-    urls.into_iter()
-        .enumerate()
-        .map(|(index, (param, url))| {
-            let InputImage {
-                content_type,
-                bytes,
-                ..
-            } = decode_data_url_image(&param, url, false, &mut total_bytes, max_upload_bytes)?;
-            let media_type = content_type.ok_or_else(|| {
-                ImageGatewayError::internal("decoded video input has no media type")
-            })?;
-            let extension = match media_type.as_str() {
-                "image/png" => "png",
-                "image/jpeg" => "jpg",
-                "image/webp" => "webp",
-                _ => return Err(ImageGatewayError::artifact_integrity()),
-            };
-            Ok(DecodedVideoInput {
-                filename: format!("input-{index}.{extension}"),
-                media_type,
-                bytes,
-            })
-        })
-        .collect()
-}
-
-fn preflight_grok_binding(
-    intent: &XaiVideoAdmissionIntent,
-    inputs: &[DecodedVideoInput],
-) -> Result<(), ImageGatewayError> {
-    let projected = inputs
-        .iter()
-        .enumerate()
-        .map(|(index, input)| {
-            XaiVideoAdmissionInput::new(
-                input.filename.clone(),
-                InputBlobRef {
-                    key: InputBlobKey {
-                        admission_session_id: Uuid::nil(),
-                        input_id: Uuid::from_u128(index as u128 + 1),
-                    },
-                    storage_backend: "preflight".to_owned(),
-                    object_key: format!("preflight/{index}"),
-                    sha256_hex: hex::encode(Sha256::digest(&input.bytes)),
-                    byte_size: input.bytes.len() as u64,
-                },
-                input.media_type.clone(),
-            )
-            .map_err(video_admission_error)
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    intent
-        .clone()
-        .bind_grok_cli(projected)
-        .map(|_| ())
+fn preflight_grok_binding_v2(intent: &XaiVideoAdmissionIntent) -> Result<(), ImageGatewayError> {
+    let command = intent
+        .source_command_v2()
+        .ok_or_else(|| ImageGatewayError::internal("video V2 intent missing source command"))?;
+    image_provider_grok_cli::GrokVideoGenerationPayloadV2::preflight(command)
+        .map_err(XaiVideoAdmissionError::UnsupportedBindingV2)
         .map_err(video_admission_error)
 }
 
@@ -502,6 +432,40 @@ fn video_admission_error(error: XaiVideoAdmissionError) -> ImageGatewayError {
             error.parameter().unwrap_or("request"),
             error.to_string(),
         ),
+        XaiVideoAdmissionError::UnsupportedBindingV2(error) => ImageGatewayError::unsupported(
+            match error {
+                image_provider_grok_cli::XaiGrokVideoProjectionErrorV2::InvalidSourceCommand
+                | image_provider_grok_cli::XaiGrokVideoProjectionErrorV2::InputManifestMismatch =>
+                    "request",
+                image_provider_grok_cli::XaiGrokVideoProjectionErrorV2::ModelRequired
+                | image_provider_grok_cli::XaiGrokVideoProjectionErrorV2::UnsupportedModel =>
+                    "model",
+                image_provider_grok_cli::XaiGrokVideoProjectionErrorV2::UnsupportedGenerateAudio =>
+                    "generate_audio",
+                image_provider_grok_cli::XaiGrokVideoProjectionErrorV2::UnsupportedReferenceAudioUrl
+                | image_provider_grok_cli::XaiGrokVideoProjectionErrorV2::InvalidVoiceId =>
+                    "reference_audios",
+                image_provider_grok_cli::XaiGrokVideoProjectionErrorV2::UnsupportedFileId => {
+                    "image"
+                }
+                image_provider_grok_cli::XaiGrokVideoProjectionErrorV2::UnsupportedDuration => {
+                    "duration"
+                }
+                image_provider_grok_cli::XaiGrokVideoProjectionErrorV2::UnsupportedResolution => {
+                    "resolution"
+                }
+                image_provider_grok_cli::XaiGrokVideoProjectionErrorV2::UnsupportedAspectRatio => {
+                    "aspect_ratio"
+                }
+                image_provider_grok_cli::XaiGrokVideoProjectionErrorV2::InputCountExceeded => {
+                    "reference_images"
+                }
+                image_provider_grok_cli::XaiGrokVideoProjectionErrorV2::InvalidRequest(_) => {
+                    "prompt"
+                }
+            },
+            error.to_string(),
+        ),
         XaiVideoAdmissionError::InvalidInputManifest => ImageGatewayError::invalid_request(
             "Video input manifest is invalid",
             Some("image".to_owned()),
@@ -511,13 +475,6 @@ fn video_admission_error(error: XaiVideoAdmissionError) -> ImageGatewayError {
             ImageGatewayError::internal("failed to encode durable video command")
         }
     }
-}
-
-fn unsupported_video_input(param: &str) -> ImageGatewayError {
-    ImageGatewayError::unsupported(
-        param,
-        "Grok CLI video inputs currently require base64 data URLs; file_id is retained by the official DTO but is not bound",
-    )
 }
 
 fn video_idempotency_digest(
@@ -687,6 +644,7 @@ mod tests {
     };
 
     use crate::admission::XaiVideoAdmissionPlan;
+    use crate::input_blobs::InputBlobRef;
 
     use super::*;
 
@@ -733,6 +691,32 @@ mod tests {
     fn credential_refresh_pending_is_retryable_at_the_xai_boundary() {
         let error = map_terminal_error(Some("grok_credential_refresh_pending"));
         assert_eq!(error.code, "service_unavailable");
+    }
+
+    #[test]
+    fn v2_capability_rejection_precedes_input_fetch() {
+        let request = XaiVideoGenerationRequest {
+            aspect_ratio: None,
+            duration: Some(8),
+            generate_audio: Some(false),
+            image: Some(XaiVideoImageUrl {
+                file_id: None,
+                url: Some("https://127.0.0.1/private.png".to_owned()),
+            }),
+            last_frame: None,
+            model: Some("grok-imagine-video-1.5".to_owned()),
+            output: None,
+            prompt: Some("wind in grass".to_owned()),
+            reference_audios: Vec::new(),
+            reference_images: Vec::new(),
+            resolution: Some(XaiVideoResolution::P480),
+            storage_options: None,
+            user: None,
+        };
+        let intent = XaiVideoAdmissionIntent::new_v2(request).unwrap();
+        let error = preflight_grok_binding_v2(&intent).unwrap_err();
+        assert_eq!(error.status_code(), StatusCode::BAD_REQUEST);
+        assert_eq!(error.error_code(), Some("unsupported_parameter"));
     }
 
     #[test]

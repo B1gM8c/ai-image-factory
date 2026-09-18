@@ -78,6 +78,7 @@ mod responses;
 mod sessions;
 mod system_updates;
 mod users;
+mod video_inputs;
 mod videos;
 mod webhooks;
 mod xai_images;
