@@ -324,6 +324,9 @@ impl GrokVideoGenerationPayloadV2 {
                     return Err(XaiGrokVideoProjectionErrorV2::UnsupportedDuration);
                 }
             }
+            XaiVideoWorkflow::ReferenceToVideo if !(1..=15).contains(&command.duration) => {
+                return Err(XaiGrokVideoProjectionErrorV2::UnsupportedDuration);
+            }
             XaiVideoWorkflow::ReferenceToVideo => {}
             XaiVideoWorkflow::TextToVideo => {}
         }
@@ -416,16 +419,17 @@ pub fn parse_video_generation_payload_v2(
         .map(|input| StagedImageV1::new(input.filename.clone(), input.sha256.clone()))
         .collect::<Result<Vec<_>, _>>()
         .map_err(|_| GrokCommandError::InvalidCanonicalCommand)?;
+    let canonical_inputs = canonical_inputs(&canonical.inputs)?;
+    validate_redacted_staged_bindings(&canonical.source_command, &canonical_inputs)?;
     let mut payload =
         GrokVideoGenerationPayloadV2::from_xai_command(canonical.source_command.clone(), staged)
             .map_err(|_| GrokCommandError::InvalidCanonicalCommand)?;
     // The canonical source is intentionally redacted to staged digests. Preserve the
     // digest of the original public command captured before redaction.
     payload.source_command_sha256 = canonical.source_command_sha256.clone();
-    if payload.source_command_sha256 != canonical.source_command_sha256
-        || payload.request.workflow_name() != canonical.workflow
+    if payload.request.workflow_name() != canonical.workflow
         || payload.source_command.model.as_deref() != Some(canonical.model.as_str())
-        || payload.inputs != canonical_inputs(&canonical.inputs)?
+        || payload.inputs != canonical_inputs
         || payload.request.controls() != canonical.controls()
         || canonical.generate_audio != payload.source_command.generate_audio
         || canonical.voices != canonical_voices(payload.request.voice_bindings())
@@ -484,7 +488,7 @@ fn project_request(
     };
     match command.workflow() {
         XaiVideoWorkflow::TextToVideo => {
-            if !inputs.ordered().next().is_none() {
+            if inputs.ordered().next().is_some() {
                 return Err(XaiGrokVideoProjectionErrorV2::InputManifestMismatch);
             }
             let prompt = command
@@ -492,7 +496,7 @@ fn project_request(
                 .clone()
                 .ok_or(XaiGrokVideoProjectionErrorV2::InvalidSourceCommand)?;
             let aspect_ratio =
-                map_ratio(command.aspect_ratio.unwrap_or(XaiVideoAspectRatio::R16x9))?;
+                map_ratio(command.aspect_ratio.unwrap_or(XaiVideoAspectRatio::R16x9));
             let duration = image_duration(command.duration)?;
             Ok(GrokVideoGenerationRequestV2::TextToVideo(
                 TextToVideoRequestV2 {
@@ -528,7 +532,7 @@ fn project_request(
         XaiVideoWorkflow::ReferenceToVideo => {
             let duration = ReferenceVideoDurationV2::new(command.duration)?;
             let aspect_ratio =
-                map_ratio(command.aspect_ratio.unwrap_or(XaiVideoAspectRatio::R16x9))?;
+                map_ratio(command.aspect_ratio.unwrap_or(XaiVideoAspectRatio::R16x9));
             let voices = command
                 .reference_audios
                 .iter()
@@ -561,10 +565,8 @@ fn image_duration(seconds: u8) -> Result<u8, XaiGrokVideoProjectionErrorV2> {
     }
 }
 
-fn map_ratio(
-    value: XaiVideoAspectRatio,
-) -> Result<VideoAspectRatioV2, XaiGrokVideoProjectionErrorV2> {
-    Ok(match value {
+fn map_ratio(value: XaiVideoAspectRatio) -> VideoAspectRatioV2 {
+    match value {
         XaiVideoAspectRatio::R1x1 => VideoAspectRatioV2::R1x1,
         XaiVideoAspectRatio::R16x9 => VideoAspectRatioV2::R16x9,
         XaiVideoAspectRatio::R9x16 => VideoAspectRatioV2::R9x16,
@@ -572,7 +574,7 @@ fn map_ratio(
         XaiVideoAspectRatio::R3x4 => VideoAspectRatioV2::R3x4,
         XaiVideoAspectRatio::R3x2 => VideoAspectRatioV2::R3x2,
         XaiVideoAspectRatio::R2x3 => VideoAspectRatioV2::R2x3,
-    })
+    }
 }
 
 fn is_supported_model(value: &str) -> bool {
@@ -651,6 +653,29 @@ fn validate_staged_bindings(
                 }
             }
         }
+    }
+    Ok(())
+}
+
+fn validate_redacted_staged_bindings(
+    command: &XaiVideoGenerationCommandV2,
+    inputs: &GrokVideoGenerationInputsV2,
+) -> Result<(), GrokCommandError> {
+    let staged: Vec<_> = inputs.ordered().map(|(_, _, image)| image).collect();
+    let references: Vec<_> = command
+        .image
+        .iter()
+        .chain(command.last_frame.iter())
+        .chain(command.reference_images.iter())
+        .collect();
+    if references.len() != staged.len()
+        || references.iter().zip(staged).any(|(reference, image)| {
+            reference.file_id.is_some()
+                || reference.url.as_deref()
+                    != Some(format!("{STAGED_INPUT_URL_PREFIX}{}", image.sha256()).as_str())
+        })
+    {
+        return Err(GrokCommandError::InvalidCanonicalCommand);
     }
     Ok(())
 }
@@ -882,6 +907,55 @@ mod tests {
         .unwrap()
     }
 
+    fn text_command() -> XaiVideoGenerationCommandV2 {
+        XaiVideoGenerationCommandV2::from_request(XaiVideoGenerationRequest {
+            aspect_ratio: Some(XaiVideoAspectRatio::R16x9),
+            duration: Some(10),
+            generate_audio: Some(true),
+            image: None,
+            last_frame: None,
+            model: Some("grok-imagine-video-1.5".into()),
+            output: None,
+            prompt: Some("moonlit lake".into()),
+            reference_audios: Vec::new(),
+            reference_images: Vec::new(),
+            resolution: Some(XaiVideoResolution::P720),
+            storage_options: None,
+            user: None,
+        })
+        .unwrap()
+    }
+
+    fn image_command() -> XaiVideoGenerationCommandV2 {
+        XaiVideoGenerationCommandV2::from_request(XaiVideoGenerationRequest {
+            aspect_ratio: None,
+            duration: Some(6),
+            generate_audio: Some(true),
+            image: Some(XaiVideoImageUrl {
+                file_id: None,
+                url: Some("data:image/png;base64,AA==".into()),
+            }),
+            last_frame: None,
+            model: Some("grok-imagine-video-1.5".into()),
+            output: None,
+            prompt: Some("camera pan".into()),
+            reference_audios: Vec::new(),
+            reference_images: Vec::new(),
+            resolution: Some(XaiVideoResolution::P480),
+            storage_options: None,
+            user: None,
+        })
+        .unwrap()
+    }
+
+    fn recompute_integrity(value: serde_json::Value) -> Vec<u8> {
+        let mut canonical: CanonicalVideoGenerationV2 = serde_json::from_value(value).unwrap();
+        canonical.integrity_sha256 = None;
+        let digest = super::hex_sha256(&serde_json::to_vec(&canonical).unwrap());
+        canonical.integrity_sha256 = Some(digest);
+        serde_json::to_vec(&canonical).unwrap()
+    }
+
     #[test]
     fn v2_projects_inputs_in_semantic_order() {
         let payload = GrokVideoGenerationPayloadV2::from_xai_command(
@@ -925,6 +999,153 @@ mod tests {
     }
 
     #[test]
+    fn v2_preflight_rejects_reference_duration_outside_one_through_fifteen() {
+        let mut zero = command();
+        zero.duration = 0;
+        assert_eq!(
+            GrokVideoGenerationPayloadV2::preflight(&zero),
+            Err(XaiGrokVideoProjectionErrorV2::UnsupportedDuration)
+        );
+        let mut sixteen = command();
+        sixteen.duration = 16;
+        assert_eq!(
+            GrokVideoGenerationPayloadV2::preflight(&sixteen),
+            Err(XaiGrokVideoProjectionErrorV2::UnsupportedDuration)
+        );
+        let mut one = command();
+        one.duration = 1;
+        assert!(GrokVideoGenerationPayloadV2::preflight(&one).is_ok());
+        let mut fifteen = command();
+        fifteen.duration = 15;
+        assert!(GrokVideoGenerationPayloadV2::preflight(&fifteen).is_ok());
+    }
+
+    #[test]
+    fn v2_parser_rejects_raw_source_urls_even_with_recomputed_integrity() {
+        let payload = GrokVideoGenerationPayloadV2::from_xai_command(
+            command(),
+            vec![
+                staged("first.png"),
+                staged("last.png"),
+                staged("reference-0.png"),
+            ],
+        )
+        .unwrap();
+        let bytes = payload.into_canonical_bytes(OutputSlot::new(0, 1).unwrap());
+        let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        value["source_command"]["image"]["url"] = serde_json::json!("https://example.test/raw.png");
+        let source_command: XaiVideoGenerationCommandV2 =
+            serde_json::from_value(value["source_command"].clone()).unwrap();
+        value["source_command_sha256"] = serde_json::json!(source_command.canonical_sha256_hex());
+        assert_eq!(
+            parse_video_generation_payload_v2(&recompute_integrity(value)),
+            Err(GrokCommandError::InvalidCanonicalCommand)
+        );
+    }
+
+    #[test]
+    fn v2_accepts_text_and_image_workflows_and_rejects_i2v_boundaries() {
+        let text =
+            GrokVideoGenerationPayloadV2::from_xai_command(text_command(), Vec::new()).unwrap();
+        assert_eq!(text.request().as_text().unwrap().duration(), 10);
+
+        let image = GrokVideoGenerationPayloadV2::from_xai_command(
+            image_command(),
+            vec![staged("first.png")],
+        )
+        .unwrap();
+        assert_eq!(
+            image.request().as_image().unwrap().image().filename(),
+            "first.png"
+        );
+
+        let mut duration = image_command();
+        duration.duration = 8;
+        assert_eq!(
+            GrokVideoGenerationPayloadV2::preflight(&duration),
+            Err(XaiGrokVideoProjectionErrorV2::UnsupportedDuration)
+        );
+
+        let mut ratio = image_command();
+        ratio.aspect_ratio = Some(XaiVideoAspectRatio::R16x9);
+        assert_eq!(
+            GrokVideoGenerationPayloadV2::preflight(&ratio),
+            Err(XaiGrokVideoProjectionErrorV2::UnsupportedAspectRatio)
+        );
+
+        let mut near_model = image_command();
+        near_model.model = Some("grok-imagine-video-1.5x".into());
+        assert_eq!(
+            GrokVideoGenerationPayloadV2::preflight(&near_model),
+            Err(XaiGrokVideoProjectionErrorV2::UnsupportedModel)
+        );
+
+        let mut file_id = image_command();
+        file_id.image.as_mut().unwrap().file_id = Some("file-1".into());
+        assert_eq!(
+            GrokVideoGenerationPayloadV2::preflight(&file_id),
+            Err(XaiGrokVideoProjectionErrorV2::UnsupportedFileId)
+        );
+
+        let mut audio_url = command();
+        audio_url.reference_audios[0].url = Some("https://example.test/audio.wav".into());
+        assert_eq!(
+            GrokVideoGenerationPayloadV2::preflight(&audio_url),
+            Err(XaiGrokVideoProjectionErrorV2::UnsupportedReferenceAudioUrl)
+        );
+    }
+
+    #[test]
+    fn v2_enforces_reference_and_voice_limits_and_supports_audio_only_without_prompt() {
+        let mut too_many_refs = command();
+        too_many_refs.reference_images = (0..8)
+            .map(|index| XaiVideoImageUrl {
+                file_id: None,
+                url: Some(format!("data:image/png;base64,{index}")),
+            })
+            .collect();
+        assert_eq!(
+            GrokVideoGenerationPayloadV2::preflight(&too_many_refs),
+            Err(XaiGrokVideoProjectionErrorV2::InputCountExceeded)
+        );
+        let mut seven_refs = too_many_refs.clone();
+        seven_refs.reference_images.truncate(7);
+        assert!(GrokVideoGenerationPayloadV2::preflight(&seven_refs).is_ok());
+
+        let mut too_many_voices = command();
+        too_many_voices.reference_audios = (0..4)
+            .map(|index| XaiVideoAudioReference {
+                url: None,
+                voice_id: Some(format!("voice-{index}")),
+            })
+            .collect();
+        assert_eq!(
+            GrokVideoGenerationPayloadV2::preflight(&too_many_voices),
+            Err(XaiGrokVideoProjectionErrorV2::InputCountExceeded)
+        );
+        let mut three_voices = too_many_voices.clone();
+        three_voices.reference_audios.truncate(3);
+        assert!(GrokVideoGenerationPayloadV2::preflight(&three_voices).is_ok());
+
+        let mut audio_only = command();
+        audio_only.image = None;
+        audio_only.last_frame = None;
+        audio_only.reference_images.clear();
+        audio_only.prompt = None;
+        let payload =
+            GrokVideoGenerationPayloadV2::from_xai_command(audio_only, Vec::new()).unwrap();
+        assert!(
+            payload
+                .request()
+                .as_reference()
+                .unwrap()
+                .first_frame()
+                .is_none()
+        );
+        assert!(payload.request().as_reference().unwrap().prompt().is_none());
+    }
+
+    #[test]
     fn v2_canonical_rejects_role_tampering_and_v1_fixture_is_unchanged() {
         let payload = GrokVideoGenerationPayloadV2::from_xai_command(
             command(),
@@ -953,7 +1174,14 @@ mod tests {
         else {
             panic!("expected reference fixture")
         };
+        assert_eq!(request.prompt(), "cinematic motion");
+        assert_eq!(request.images()[0].filename(), "one.png");
+        assert_eq!(request.images()[0].sha256(), SHA);
+        assert_eq!(request.images()[1].filename(), "two.png");
+        assert_eq!(request.images()[1].sha256(), SHA);
+        assert_eq!(request.aspect_ratio(), crate::VideoAspectRatio::R2x3);
         assert_eq!(request.duration().seconds(), 6);
+        assert_eq!(request.resolution(), crate::VideoResolution::P480);
     }
 
     #[test]
