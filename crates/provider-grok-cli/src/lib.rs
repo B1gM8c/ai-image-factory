@@ -5,12 +5,13 @@ mod command;
 mod policy;
 mod receipt;
 mod request;
+mod video_v2;
 mod xai;
 mod xai_video;
 
 pub use capabilities::{
     GROK_IMAGE_EDIT_OPERATION_V1, GROK_IMAGE_GENERATION_OPERATION_V1,
-    GROK_VIDEO_GENERATION_OPERATION_V1,
+    GROK_VIDEO_GENERATION_OPERATION_V1, GROK_VIDEO_GENERATION_OPERATION_V2,
 };
 pub use command::{
     GROK_IMAGE_EDIT_COMMAND_SCHEMA, GROK_IMAGE_GENERATION_COMMAND_SCHEMA,
@@ -32,6 +33,13 @@ pub use request::{
     ImageAspectRatio, ImageModel, ImageToVideoRequestV1, MAX_IMAGE_EDIT_REFERENCES,
     ReferenceToVideoRequestV1, RequestValidationError, StagedImageV1, TextToVideoRequestV1,
     VideoAspectRatio, VideoDuration, VideoResolution,
+};
+pub use video_v2::{
+    GROK_VIDEO_GENERATION_COMMAND_SCHEMA_V2, GrokVideoGenerationInputsV2,
+    GrokVideoGenerationPayloadV2, GrokVideoGenerationRequestV2, ImageToVideoRequestV2,
+    ReferenceAudioV2, ReferenceToVideoRequestV2, ReferenceVideoDurationV2, TextToVideoRequestV2,
+    VIDEO_ADAPTER_REVISION_V2, VideoAspectRatioV2, XaiGrokVideoProjectionErrorV2,
+    parse_video_generation_command_v2, parse_video_generation_payload_v2,
 };
 pub use xai::{
     GROK_CLI_IMAGE_MAX_OUTPUTS, GROK_CLI_IMAGE_RESOLUTION, GROK_CLI_IMAGE_RESPONSE_FORMAT,
