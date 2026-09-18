@@ -1440,7 +1440,7 @@ fn v2_text_video_dispatches_image_gen_then_image_to_video() {
 }
 
 #[test]
-fn v2_receipt_rejects_omitted_required_field() {
+fn v2_receipt_rejects_omitted_expected_field() {
     let fixture = PolicyFixture::new();
     let request = v2_i2v_request("first.png", "camera pan", 6, OfficialVideoResolution::P480);
     let (_, invocation) = fixture
