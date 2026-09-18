@@ -161,10 +161,13 @@ async fn detached_reference_video_runner_stages_inputs_replays_mp4_and_cleans_cl
         XaiVideoGenerationRequest {
             aspect_ratio: Some(image_api_contracts::xai::XaiVideoAspectRatio::R16x9),
             duration: Some(6),
+            generate_audio: None,
             image: None,
+            last_frame: None,
             model: Some("grok-imagine-video".to_owned()),
             output: None,
             prompt: Some("cinematic motion".to_owned()),
+            reference_audios: Vec::new(),
             reference_images: vec![
                 XaiVideoImageUrl {
                     file_id: None,

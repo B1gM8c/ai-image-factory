@@ -123,6 +123,7 @@ async fn xai_image_to_video_runs_through_the_real_durable_grok_supervisor() {
         XaiVideoGenerationRequest {
             aspect_ratio: None,
             duration: Some(6),
+            generate_audio: None,
             image: Some(XaiVideoImageUrl {
                 file_id: None,
                 url: Some(format!(
@@ -130,12 +131,14 @@ async fn xai_image_to_video_runs_through_the_real_durable_grok_supervisor() {
                     STANDARD.encode(&input_bytes)
                 )),
             }),
+            last_frame: None,
             model: Some("grok-imagine-video-1.5".to_owned()),
             output: None,
             prompt: Some(
                 "A slow cinematic push-in; the blue square gently rotates while the white background remains still"
                     .to_owned(),
             ),
+            reference_audios: Vec::new(),
             reference_images: Vec::new(),
             resolution: Some(XaiVideoResolution::P480),
             storage_options: None,

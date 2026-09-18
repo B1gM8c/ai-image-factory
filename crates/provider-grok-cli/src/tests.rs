@@ -319,10 +319,13 @@ fn video_command_preserves_the_two_distinct_fixed_model_workflows() {
     let text_source = XaiVideoGenerationCommandV1::from_request(XaiVideoGenerationRequest {
         aspect_ratio: Some(OfficialVideoAspectRatio::R9x16),
         duration: Some(6),
+        generate_audio: None,
         image: None,
+        last_frame: None,
         model: Some("grok-imagine-video-1.5-preview".to_owned()),
         output: None,
         prompt: Some("a paper boat crossing a moonlit lake".to_owned()),
+        reference_audios: Vec::new(),
         reference_images: Vec::new(),
         resolution: Some(OfficialVideoResolution::P480),
         storage_options: None,
@@ -350,13 +353,16 @@ fn video_command_preserves_the_two_distinct_fixed_model_workflows() {
     let source = XaiVideoGenerationCommandV1::from_request(XaiVideoGenerationRequest {
         aspect_ratio: None,
         duration: Some(10),
+        generate_audio: None,
         image: Some(XaiVideoImageUrl {
             file_id: None,
             url: Some("data:image/png;base64,AA==".to_owned()),
         }),
+        last_frame: None,
         model: Some("grok-imagine-video-1.5".to_owned()),
         output: None,
         prompt: Some("slow push in".to_owned()),
+        reference_audios: Vec::new(),
         reference_images: Vec::new(),
         resolution: Some(OfficialVideoResolution::P720),
         storage_options: None,
@@ -423,10 +429,13 @@ fn video_command_preserves_the_two_distinct_fixed_model_workflows() {
     let source = XaiVideoGenerationCommandV1::from_request(XaiVideoGenerationRequest {
         aspect_ratio: Some(OfficialVideoAspectRatio::R2x3),
         duration: Some(6),
+        generate_audio: None,
         image: None,
+        last_frame: None,
         model: Some("grok-imagine-video".to_owned()),
         output: None,
         prompt: Some("cinematic motion".to_owned()),
+        reference_audios: Vec::new(),
         reference_images: vec![
             XaiVideoImageUrl {
                 file_id: None,
