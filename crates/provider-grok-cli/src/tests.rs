@@ -31,7 +31,7 @@ fn immutable_provider_lock_matches_runtime_compatibility_revisions() {
 #[test]
 fn grok_cli_1034_video_capability_fixture_is_pinned_and_redacted() {
     const EXPECTED_SHA256: &str =
-        "465b0a6cbe8126cc25b3f099debe37c9d869f3902a3886deb52e42f684e78ab5";
+        "03ad050fa6bac4f425b61853674d25afdaa30ae51c2479da8d568a931318ddb5";
     let bytes = include_bytes!("../../../providers/grok-cli-1.0.34-video-capabilities.json");
     let actual_sha256 =
         Sha256::digest(bytes)
@@ -1440,7 +1440,7 @@ fn v2_text_video_dispatches_image_gen_then_image_to_video() {
 }
 
 #[test]
-fn v2_receipt_rejects_omitted_default_and_extra_arguments() {
+fn v2_receipt_rejects_omitted_required_field() {
     let fixture = PolicyFixture::new();
     let request = v2_i2v_request("first.png", "camera pan", 6, OfficialVideoResolution::P480);
     let (_, invocation) = fixture
@@ -1449,8 +1449,43 @@ fn v2_receipt_rejects_omitted_default_and_extra_arguments() {
         .unwrap();
     write_artifact(&invocation);
     let mut actual = invocation.expected_arguments().clone();
-    actual.as_object_mut().unwrap().remove("resolution_name");
+    actual.as_object_mut().unwrap().remove("duration");
+    let history = history_with(&invocation, actual, invocation.artifact_path());
+    assert!(matches!(
+        parse_invocation_receipt(&valid_stdout(), &history, &invocation),
+        Err(GrokReceiptError::ToolArgumentsMismatch { .. })
+    ));
+}
+
+#[test]
+fn v2_receipt_rejects_extra_argument() {
+    let fixture = PolicyFixture::new();
+    let request = v2_i2v_request("first.png", "camera pan", 6, OfficialVideoResolution::P480);
+    let (_, invocation) = fixture
+        .policy
+        .command_spec_video_v2(&request, SESSION_ID, fixture.workspace.clone())
+        .unwrap();
+    write_artifact(&invocation);
+    let mut actual = invocation.expected_arguments().clone();
     actual["unexpected"] = json!(true);
+    let history = history_with(&invocation, actual, invocation.artifact_path());
+    assert!(matches!(
+        parse_invocation_receipt(&valid_stdout(), &history, &invocation),
+        Err(GrokReceiptError::ToolArgumentsMismatch { .. })
+    ));
+}
+
+#[test]
+fn v2_receipt_rejects_changed_duration_value() {
+    let fixture = PolicyFixture::new();
+    let request = v2_i2v_request("first.png", "camera pan", 6, OfficialVideoResolution::P480);
+    let (_, invocation) = fixture
+        .policy
+        .command_spec_video_v2(&request, SESSION_ID, fixture.workspace.clone())
+        .unwrap();
+    write_artifact(&invocation);
+    let mut actual = invocation.expected_arguments().clone();
+    actual["duration"] = json!(10);
     let history = history_with(&invocation, actual, invocation.artifact_path());
     assert!(matches!(
         parse_invocation_receipt(&valid_stdout(), &history, &invocation),

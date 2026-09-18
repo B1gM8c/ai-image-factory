@@ -1,9 +1,8 @@
 {
-  "schema_version": 1,
   "observed_cli_version": "1.0.34 (3736acbc8658)",
+  "schema_version": 1,
   "tools": [
     {
-      "source": "same-version repo_spider registered tool definitions",
       "function": {
         "description": "Generate a new image from a text description using Imagine; returns the saved image's absolute path. When telling the user where it was saved, refer to it by its short session-relative path (e.g. `images/1.jpg`) rather than the absolute path, so it renders as a clickable link that opens the image. To produce multiple images, emit multiple tool calls with distinct prompts.",
         "name": "image_gen",
@@ -26,10 +25,10 @@
           "type": "object"
         }
       },
+      "source": "same-version repo_spider registered tool definitions",
       "type": "function"
     },
     {
-      "source": "same-version ai-image-factory registered tool definitions",
       "function": {
         "description": "Generate a video from a single source image; returns the saved video's absolute path. When telling the user where it was saved, refer to it by its short session-relative path (e.g. `videos/1.mp4`) rather than the absolute path, so it renders as a clickable link that opens the video. Provide `image` for the image to animate and optionally a `prompt` to guide the animation. Use this tool when the user provides an image and wants it animated, turned into a video, or used as the first frame. Example: image_to_video(image=\"/Users/me/photo.jpg\", prompt=\"gentle camera push-in with wind moving the hair\", duration=6, resolution_name=\"480p\")",
         "name": "image_to_video",
@@ -69,10 +68,10 @@
           "type": "object"
         }
       },
+      "source": "same-version ai-image-factory registered tool definitions",
       "type": "function"
     },
     {
-      "source": "same-version ai-image-factory registered tool definitions",
       "function": {
         "description": "Generate a video from reference images, preset voices, and/or pinned keyframes, guided by a required text prompt; returns the saved video's absolute path. When telling the user where it was saved, refer to it by its short session-relative path (e.g. `videos/1.mp4`) rather than the absolute path, so it renders as a clickable link that opens the video. Provide up to 14 `images` (style/content references: people, objects, clothing, settings — they appear re-rendered, not as literal frames) and/or up to 3 `voices` (preset voice identifiers the subjects speak in). To pin EXACT frames instead, set `first_frame` and/or `last_frame` (those images appear literally as the video's first/last frame; set both to interpolate, or the same image for a perfect loop) and/or `keyframes` (up to 4 `{image, timestamp_s}` anchors strictly inside the clip, snapped to a 1/3-second grid). At least one of `images`, `voices`, `first_frame`, `last_frame`, or `keyframes` is required. Tag references in the prompt as `<IMAGE_i>` and voices as `<AUDIO_0>`, ...; the index space follows the upload order `first_frame`, `images`, `keyframes`, `last_frame` — so with `first_frame` set, the first `images` entry is `<IMAGE_1>`, not `<IMAGE_0>`. Pinned frames never need prompt tags (their timing is explicit). Example: reference_to_video(prompt=\"The person from <IMAGE_1> walks toward the camera, speaking with the voice from <AUDIO_0>\", first_frame=\"/Users/me/wide_shot.jpg\", images=[\"/Users/me/person.jpg\"], keyframes=[{\"image\": \"/Users/me/closeup.jpg\", \"timestamp_s\": 3.0}], last_frame=\"/Users/me/closeup.jpg\", voices=[\"eve\"], aspect_ratio=\"16:9\", duration=6, resolution_name=\"480p\")",
         "name": "reference_to_video",
@@ -159,6 +158,7 @@
           "type": "object"
         }
       },
+      "source": "same-version ai-image-factory registered tool definitions",
       "type": "function"
     }
   ]
