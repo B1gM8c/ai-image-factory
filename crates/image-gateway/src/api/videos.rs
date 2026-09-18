@@ -329,9 +329,45 @@ fn preflight_grok_binding_v2(intent: &XaiVideoAdmissionIntent) -> Result<(), Ima
     let command = intent
         .source_command_v2()
         .ok_or_else(|| ImageGatewayError::internal("video V2 intent missing source command"))?;
-    image_provider_grok_cli::GrokVideoGenerationPayloadV2::preflight(command)
-        .map_err(XaiVideoAdmissionError::UnsupportedBindingV2)
-        .map_err(video_admission_error)
+    match image_provider_grok_cli::GrokVideoGenerationPayloadV2::preflight(command) {
+        Ok(()) => Ok(()),
+        Err(image_provider_grok_cli::XaiGrokVideoProjectionErrorV2::UnsupportedFileId) => {
+            Err(ImageGatewayError::unsupported(
+                &unsupported_file_id_parameter(command),
+                "xAI file_id inputs are not supported by Grok CLI",
+            ))
+        }
+        Err(error) => Err(video_admission_error(
+            XaiVideoAdmissionError::UnsupportedBindingV2(error),
+        )),
+    }
+}
+
+fn unsupported_file_id_parameter(
+    command: &image_api_contracts::xai::XaiVideoGenerationCommandV2,
+) -> String {
+    if command
+        .image
+        .as_ref()
+        .is_some_and(|image| image.file_id.is_some())
+    {
+        return "image".to_owned();
+    }
+    if command
+        .last_frame
+        .as_ref()
+        .is_some_and(|image| image.file_id.is_some())
+    {
+        return "last_frame".to_owned();
+    }
+    if let Some(index) = command
+        .reference_images
+        .iter()
+        .position(|image| image.file_id.is_some())
+    {
+        return format!("reference_images[{index}]");
+    }
+    "image".to_owned()
 }
 
 async fn stage_and_bind(
@@ -717,6 +753,60 @@ mod tests {
         let error = preflight_grok_binding_v2(&intent).unwrap_err();
         assert_eq!(error.status_code(), StatusCode::BAD_REQUEST);
         assert_eq!(error.error_code(), Some("unsupported_parameter"));
+    }
+
+    #[test]
+    fn v2_file_id_errors_identify_the_source_slot_before_fetch() {
+        let mut cases = Vec::new();
+        let mut image = XaiVideoGenerationRequest {
+            aspect_ratio: None,
+            duration: Some(6),
+            generate_audio: Some(true),
+            image: Some(XaiVideoImageUrl {
+                file_id: Some("file-image".to_owned()),
+                url: None,
+            }),
+            last_frame: None,
+            model: Some("grok-imagine-video-1.5".to_owned()),
+            output: None,
+            prompt: Some("move".to_owned()),
+            reference_audios: Vec::new(),
+            reference_images: Vec::new(),
+            resolution: Some(XaiVideoResolution::P480),
+            storage_options: None,
+            user: None,
+        };
+        cases.push((image.clone(), "image"));
+        image.image = None;
+        image.last_frame = Some(XaiVideoImageUrl {
+            file_id: Some("file-last".to_owned()),
+            url: None,
+        });
+        cases.push((image.clone(), "last_frame"));
+        image.last_frame = None;
+        image.reference_images = vec![
+            XaiVideoImageUrl {
+                file_id: None,
+                url: Some("data:image/png;base64,iVBORw0KGgo=".to_owned()),
+            },
+            XaiVideoImageUrl {
+                file_id: Some("file-ref".to_owned()),
+                url: None,
+            },
+        ];
+        cases.push((image, "reference_images[1]"));
+
+        for (request, expected_parameter) in cases {
+            let intent = XaiVideoAdmissionIntent::new_v2(request).expect("valid V2 request");
+            let error = preflight_grok_binding_v2(&intent).expect_err("file_id must be rejected");
+            assert_eq!(error.error_code(), Some("unsupported_parameter"));
+            assert_eq!(error.status_code(), StatusCode::BAD_REQUEST);
+            assert_eq!(
+                expected_parameter,
+                unsupported_file_id_parameter(intent.source_command_v2().unwrap())
+            );
+            assert!(format!("{error:?}").contains(expected_parameter));
+        }
     }
 
     #[test]

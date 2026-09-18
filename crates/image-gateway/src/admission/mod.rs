@@ -590,6 +590,7 @@ fn validate_video_attach_request_v2(
         request.contract,
         AdmissionContract::MediaEconomicsV3 | AdmissionContract::CustomerPricingV4
     ) || manifest.manifest_schema != xai_videos::XAI_VIDEO_INPUT_MANIFEST_SCHEMA_V2
+        || manifest.inputs.is_empty()
         || manifest.inputs.len() > 9
         || !is_sha256(&manifest.manifest_hash)
     {

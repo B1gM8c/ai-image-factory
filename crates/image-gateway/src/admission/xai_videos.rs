@@ -754,6 +754,45 @@ mod tests {
         assert_eq!(plan.inputs()[2].role(), XaiVideoInputRoleV2::ReferenceImage);
         assert_eq!(plan.inputs()[2].role_index(), 0);
         assert!(plan.input_manifest_hash().len() == 64);
+
+        let attach = plan.attach(
+            AdmissionTicket {
+                session_id,
+                owner_token: Uuid::new_v4(),
+                request_hash: plan.source_request_hash().to_owned(),
+            },
+            Uuid::new_v4(),
+            "tenant:test",
+            AdmissionContract::MediaEconomicsV3,
+        );
+        crate::admission::validate_attach_request(&attach).unwrap();
+
+        let mut role_tamper = attach.clone();
+        role_tamper.input_manifest.as_mut().unwrap().inputs[0].role = EditInputRoleV1::Mask;
+        assert!(crate::admission::validate_attach_request(&role_tamper).is_err());
+
+        let mut order_tamper = attach.clone();
+        order_tamper
+            .input_manifest
+            .as_mut()
+            .unwrap()
+            .inputs
+            .swap(0, 1);
+        assert!(crate::admission::validate_attach_request(&order_tamper).is_err());
+
+        let mut digest_tamper = attach.clone();
+        digest_tamper.input_manifest.as_mut().unwrap().inputs[2]
+            .blob
+            .sha256_hex = "f".repeat(64);
+        assert!(crate::admission::validate_attach_request(&digest_tamper).is_err());
+
+        let mut semantic_role_tamper = attach.clone();
+        semantic_role_tamper
+            .input_manifest
+            .as_mut()
+            .unwrap()
+            .manifest_hash = "e".repeat(64);
+        assert!(crate::admission::validate_attach_request(&semantic_role_tamper).is_err());
     }
 
     #[test]
@@ -778,6 +817,25 @@ mod tests {
             .input_manifest
             .is_none()
         );
+        let attach = plan.attach(
+            AdmissionTicket {
+                session_id: Uuid::new_v4(),
+                owner_token: Uuid::new_v4(),
+                request_hash: plan.source_request_hash().to_owned(),
+            },
+            Uuid::new_v4(),
+            "tenant:test",
+            AdmissionContract::MediaEconomicsV3,
+        );
+        crate::admission::validate_attach_request(&attach).unwrap();
+
+        let mut empty_manifest = attach;
+        empty_manifest.input_manifest = Some(AttachInputManifest {
+            manifest_schema: XAI_VIDEO_INPUT_MANIFEST_SCHEMA_V2.to_owned(),
+            manifest_hash: "a".repeat(64),
+            inputs: Vec::new(),
+        });
+        assert!(crate::admission::validate_attach_request(&empty_manifest).is_err());
     }
 
     #[test]
@@ -812,6 +870,17 @@ mod tests {
         let plan = XaiVideoAdmissionPlan::for_grok_cli_v2(request, inputs).unwrap();
         assert_eq!(plan.reference_image_count(), 7);
         assert_eq!(plan.inputs().len(), 9);
+        let attach = plan.attach(
+            AdmissionTicket {
+                session_id,
+                owner_token: Uuid::new_v4(),
+                request_hash: plan.source_request_hash().to_owned(),
+            },
+            Uuid::new_v4(),
+            "tenant:test",
+            AdmissionContract::MediaEconomicsV3,
+        );
+        crate::admission::validate_attach_request(&attach).unwrap();
     }
 
     #[test]

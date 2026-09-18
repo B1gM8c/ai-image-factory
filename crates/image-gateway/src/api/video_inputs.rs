@@ -1,6 +1,7 @@
 use std::{
     collections::HashMap,
     net::{IpAddr, Ipv4Addr, SocketAddr},
+    time::Duration,
 };
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -13,6 +14,8 @@ use crate::ImageGatewayError;
 use super::super::admission::XaiVideoInputRoleV2;
 
 pub(super) const MAX_VIDEO_INPUT_BYTES: usize = 32 * 1024 * 1024;
+const HTTPS_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const HTTPS_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct DecodedVideoInput {
@@ -155,7 +158,10 @@ async fn decode_https_url(
     let port = 443;
     let addresses = resolve_public_addresses(&host, port, param).await?;
     let client = Client::builder()
+        .no_proxy()
         .redirect(Policy::none())
+        .connect_timeout(HTTPS_CONNECT_TIMEOUT)
+        .timeout(HTTPS_REQUEST_TIMEOUT)
         .resolve_to_addrs(&host, &addresses)
         .build()
         .map_err(|_| ImageGatewayError::service_unavailable("video input client unavailable"))?;
@@ -418,7 +424,7 @@ mod tests {
             storage_options: None,
             user: None,
         };
-        let inputs = decode_video_inputs_v2(&command, 1024).await.unwrap();
+        let inputs = decode_video_inputs_v2(&command, 12).await.unwrap();
         assert_eq!(inputs.len(), 2);
         assert_eq!(inputs[0].bytes, inputs[1].bytes);
     }
