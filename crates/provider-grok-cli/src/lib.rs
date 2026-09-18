@@ -22,7 +22,7 @@ pub use command::{
 };
 pub use policy::{
     GrokCliPolicyError, GrokCliPolicyV1, GrokCliRequestV1, GrokExpectedToolCallV1,
-    GrokInvocationV1, GrokTool,
+    GrokInvocationV1, GrokTool, GrokToolArgumentPolicy,
 };
 pub use receipt::{
     GrokCliReceiptV1, GrokReceiptError, MAX_HISTORY_BYTES, MAX_STDOUT_BYTES,

@@ -5,7 +5,9 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::{GrokExpectedToolCallV1, GrokInvocationV1, GrokTool, PROVIDER_ID};
+use crate::{
+    GrokExpectedToolCallV1, GrokInvocationV1, GrokTool, GrokToolArgumentPolicy, PROVIDER_ID,
+};
 
 pub const MAX_STDOUT_BYTES: usize = 64 * 1024;
 pub const MAX_HISTORY_BYTES: usize = 1024 * 1024;
@@ -348,6 +350,31 @@ fn validate_tool_arguments(
     expected: &GrokExpectedToolCallV1,
     actual: &Value,
 ) -> Result<(), GrokReceiptError> {
+    match expected.argument_policy() {
+        GrokToolArgumentPolicy::Exact => {
+            if actual == expected.arguments() {
+                Ok(())
+            } else {
+                Err(tool_arguments_mismatch(
+                    "arguments",
+                    Some(expected.arguments()),
+                    Some(actual),
+                ))
+            }
+        }
+        GrokToolArgumentPolicy::LegacyVideoDefaults => {
+            validate_legacy_tool_arguments(expected, actual)
+        }
+        GrokToolArgumentPolicy::ImagePromptMayNormalize => {
+            validate_image_tool_arguments(expected, actual)
+        }
+    }
+}
+
+fn validate_legacy_tool_arguments(
+    expected: &GrokExpectedToolCallV1,
+    actual: &Value,
+) -> Result<(), GrokReceiptError> {
     if actual == expected.arguments() {
         return Ok(());
     }
@@ -357,17 +384,20 @@ fn validate_tool_arguments(
     ) {
         return validate_video_tool_arguments(expected.arguments(), actual);
     }
-    if !matches!(
-        expected.tool(),
-        GrokTool::ImageGeneration | GrokTool::ImageEdit
-    ) {
-        return Err(tool_arguments_mismatch(
-            "arguments",
-            Some(expected.arguments()),
-            Some(actual),
-        ));
-    }
+    Err(tool_arguments_mismatch(
+        "arguments",
+        Some(expected.arguments()),
+        Some(actual),
+    ))
+}
 
+fn validate_image_tool_arguments(
+    expected: &GrokExpectedToolCallV1,
+    actual: &Value,
+) -> Result<(), GrokReceiptError> {
+    if actual == expected.arguments() {
+        return Ok(());
+    }
     // The agent may normalize image prompts; routing, inputs, and execution controls remain exact.
     let expected = expected
         .arguments()
