@@ -1358,7 +1358,7 @@ async fn concurrent_fresh_migrations_are_repeatable() -> TestResult {
 }
 
 #[tokio::test]
-async fn schema_128_upgrades_to_131_without_changing_existing_provider_rows() -> TestResult {
+async fn schema_128_upgrades_to_132_without_changing_existing_provider_rows() -> TestResult {
     let Some(test_schema) = TestSchema::new(2).await? else {
         return Ok(());
     };
@@ -1382,13 +1382,13 @@ async fn schema_128_upgrades_to_131_without_changing_existing_provider_rows() ->
             "SELECT COALESCE(jsonb_agg(to_jsonb(account) ORDER BY provider_account_id), '[]'::jsonb) FROM provider_accounts account",
         ).fetch_one(&test_schema.pool).await.map_err(|error| error.to_string())?;
         require(before.as_array().is_some_and(|rows| rows.len() == 1), "fixture must contain an existing account")?;
-        gateway_result(run_migrations(&test_schema.pool).await, "128-to-131 migration")?;
-        gateway_result(verify_migrations(&test_schema.pool).await, "131 verification")?;
+        gateway_result(run_migrations(&test_schema.pool).await, "128-to-132 migration")?;
+        gateway_result(verify_migrations(&test_schema.pool).await, "132 verification")?;
         let after: serde_json::Value = sqlx::query_scalar(
             "SELECT COALESCE(jsonb_agg(to_jsonb(account) ORDER BY provider_account_id), '[]'::jsonb) FROM provider_accounts account",
         ).fetch_one(&test_schema.pool).await.map_err(|error| error.to_string())?;
         require(before == after, "sidecar migrations changed existing provider accounts")?;
-        require(migration_versions(&test_schema.pool).await?.last() == Some(&131), "upgrade must end at 131")?;
+        require(migration_versions(&test_schema.pool).await?.last() == Some(&132), "upgrade must end at 132")?;
         let new_rows: i64 = sqlx::query_scalar(
             "SELECT (SELECT COUNT(*) FROM media_segment_assets) + (SELECT COUNT(*) FROM media_segment_results) + (SELECT COUNT(*) FROM media_segment_worker_heartbeats) + (SELECT COUNT(*) FROM provider_account_quota_refreshes)",
         ).fetch_one(&test_schema.pool).await.map_err(|error| error.to_string())?;
@@ -3543,8 +3543,8 @@ async fn shared_pool_case(pool: &PgPool) -> TestResult {
 
 async fn assert_expected_schema(pool: &PgPool) -> TestResult {
     require(
-        migration_versions(pool).await? == (0_i64..=131_i64).collect::<Vec<_>>(),
-        "applied migration versions must be exactly 0 through 131",
+        migration_versions(pool).await? == (0_i64..=132_i64).collect::<Vec<_>>(),
+        "applied migration versions must be exactly 0 through 132",
     )?;
 
     let default_codex_prices: Vec<(String, i64, i64)> = sqlx::query_as(
