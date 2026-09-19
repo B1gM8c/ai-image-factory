@@ -1077,7 +1077,7 @@ async fn xai_video_v2_wrong_descriptor_revision_is_not_reconciled() -> TestResul
             ),
         ];
         for (index, (label, descriptor, hash, adapter)) in cases.into_iter().enumerate() {
-            let wrong_profile = insert_v2_reconciliation_negative(
+            let (wrong_route, wrong_profile) = insert_v2_reconciliation_negative(
                 &database.pool,
                 v2_profile,
                 v2_route,
@@ -1091,18 +1091,33 @@ async fn xai_video_v2_wrong_descriptor_revision_is_not_reconciled() -> TestResul
             let report = reconcile_execution_profile_routes(&database.pool)
                 .await
                 .map_err(debug_error)?;
-            let selected: Uuid = sqlx::query_scalar(
-                "SELECT execution_profile_id FROM provider_route_members
-                 WHERE execution_profile_id = $1",
+            let selected: (i64, String, Uuid) = sqlx::query_as(
+                "SELECT head.current_revision, head.state, member.execution_profile_id
+                 FROM provider_route_heads head
+                 JOIN provider_route_members member
+                   ON member.route_id = head.route_id
+                  AND member.route_revision = head.current_revision
+                  AND member.state = 'enabled'
+                 WHERE head.route_id = $1",
             )
-            .bind(wrong_profile)
+            .bind(wrong_route)
             .fetch_one(&database.pool)
             .await
             .map_err(debug_error)?;
             require(
-                selected == wrong_profile && report.unresolved_routes >= 1,
-                format!("wrong {label} was reconciled: {report:?} profile={selected}"),
+                selected == (1, "enabled".to_owned(), wrong_profile)
+                    && report.unresolved_routes == 1,
+                format!("wrong {label} was reconciled: {report:?} profile={selected:?}"),
             )?;
+            sqlx::query(
+                "UPDATE provider_route_heads SET state = 'disabled', updated_at_ms = $2
+                 WHERE route_id = $1",
+            )
+            .bind(wrong_route)
+            .bind(now)
+            .execute(&database.pool)
+            .await
+            .map_err(debug_error)?;
         }
         Ok(())
     }
@@ -1119,7 +1134,7 @@ async fn insert_v2_reconciliation_negative(
     descriptor_revision: &str,
     descriptor_hash: &str,
     adapter_revision: &str,
-) -> TestResult<Uuid> {
+) -> TestResult<(Uuid, Uuid)> {
     let policy_id: Uuid = sqlx::query_scalar(
         "SELECT resource_policy_id FROM provider_execution_profiles
          WHERE execution_profile_id = $1",
@@ -1215,7 +1230,7 @@ async fn insert_v2_reconciliation_negative(
     .execute(pool)
     .await
     .map_err(debug_error)?;
-    Ok(wrong_profile)
+    Ok((wrong_route, wrong_profile))
 }
 
 async fn assert_project_video_isolation(
