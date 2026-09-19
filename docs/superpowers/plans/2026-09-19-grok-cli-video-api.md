@@ -638,7 +638,60 @@ git commit -m "feat: admit xai video v2 requests"
 git push
 ```
 
-### Task 5: Durable V2 Execution, Pricing, and Replay Isolation
+### Task 5A: Versioned Grok Runtime Identity Prerequisite
+
+This narrow prerequisite must land before durable V2 execution. It preserves the
+existing 1.0.5 release contract while making the independently verified 1.0.34
+identity available to the executor. It does not yet package or activate a V2
+runtime.
+
+**Files:**
+
+- Create: `providers/grok-cli-v1.lock.json` as an exact copy of the pre-change 1.0.5 lock
+- Modify: `providers/grok-cli.lock.json` to verified 1.0.34
+- Create: `crates/provider-grok-cli/src/runtime_identity.rs`
+- Modify: `crates/provider-grok-cli/src/lib.rs`
+- Modify: `crates/provider-grok-cli/src/tests.rs`
+- Modify: `scripts/fetch-grok-cli.sh`
+- Modify: `scripts/package-release.sh`
+
+**Interfaces:**
+
+- Produces: explicit V1/V2 target-to-lock runtime identity lookup.
+- Preserves: the old two-argument fetch command defaults to V1, and the current
+  single-runtime release package continues to contain only verified V1.
+
+- [ ] **Step 1: Freeze both official locks**
+
+Copy the current lock byte-for-byte to `providers/grok-cli-v1.lock.json`. Update
+the primary lock to 1.0.34 using the independently downloaded official x86_64
+and aarch64 bytes, SHA-256 values, ELF machine IDs, and version output. The V2
+lock carries only the V2 video adapter claim; do not claim that existing image
+bindings moved to 1.0.34.
+
+- [ ] **Step 2: Add fail-closed runtime identity lookup**
+
+Parse the versioned lock at compile time/runtime through the provider crate and
+return an approved identity only for an explicit runtime generation and exact
+target triple. Unknown targets and crossed V1/V2 requests fail; hashes remain
+single-sourced in the lock files rather than copied into Rust constants.
+
+- [ ] **Step 3: Preserve current fetch and package behavior**
+
+Add an explicit runtime-generation selector to `fetch-grok-cli.sh`, while the
+existing two-argument invocation keeps selecting V1. Point the current
+single-runtime package flow at `grok-cli-v1.lock.json`; dual packaging remains
+Task 6B.
+
+- [ ] **Step 4: Verify and commit**
+
+Verify both downloaded official artifacts against the new lock, run the provider
+crate tests and existing runtime-gate test, run a workspace check, then commit
+and push as `build: pin versioned grok runtime identities`. A matching Linux
+`--version` execution remains an explicit Task 7 runtime gate; embedded strings
+are not counted as execution proof.
+
+### Task 5B: Durable V2 Execution, Pricing, and Replay Isolation
 
 **Files:**
 
@@ -651,6 +704,8 @@ git push
 - Modify: `crates/image-gateway/src/provider_management/route_reconciliation.rs`
 - Modify: `crates/image-gateway/src/workers/daemon.rs`
 - Modify: `crates/image-gateway/src/pricing/admission.rs`
+- Modify: `crates/image-gateway/src/pricing/surface_contract.rs`
+- Modify: `crates/image-gateway/src/pricing/readiness.rs`
 - Modify: `crates/image-gateway/src/reduction/postgres/completion.rs`
 - Modify: `crates/image-gateway/tests/grok_process_smoke.rs`
 - Modify: `crates/image-gateway/tests/postgres_video_api.rs`
@@ -770,17 +825,18 @@ git commit -m "feat: execute grok video v2 durably"
 git push
 ```
 
-### Task 6: Dual CLI Release Lock, OpenAPI, and Operations
+### Task 6B: Dual CLI Release Packaging, OpenAPI, and Operations
 
 **Files:**
 
-- Create: `providers/grok-cli-v1.lock.json` as an exact copy of current 1.0.5 lock
-- Modify: `providers/grok-cli.lock.json` to verified 1.0.34
 - Modify: `scripts/fetch-grok-cli.sh`
 - Modify: `scripts/package-release.sh`
 - Modify: `scripts/test-gateway-runtime-gate.sh`
 - Modify: `deploy/hooks/verify-gateway-runtime`
+- Modify: `deploy/install-release`
 - Modify: `deploy/systemd/app.env.example`
+- Modify: `.github/workflows/release.yml`
+- Modify: `.github/workflows/recovery-rehearsal.yml`
 - Modify: `crates/image-gateway/src/docs/mod.rs`
 - Modify: `docs/architecture/2026-grok-cli-xai-media-binding.md`
 - Modify: `docs/operations/production-release.md`
@@ -800,23 +856,15 @@ bash scripts/test-gateway-runtime-gate.sh
 
 Expected: new assertions fail before dual-lock support.
 
-- [ ] **Step 2: Fetch and verify official 1.0.34 artifacts**
+- [ ] **Step 2: Package and verify both binaries**
 
-Download both official Linux artifacts into a temporary directory. Record exact bytes/SHA-256, validate ELF machine 62/183, and verify `grok 1.0.34 (3736acbc8658)` on a runnable matching architecture. Do not commit binaries.
+`scripts/package-release.sh` accepts two explicit sources, validates each lock, installs `bin/grok-v1`/`bin/grok-v2`, and writes both identities in the release manifest. Keep `bin/grok` as a regular-file V1 compatibility copy for historical installers. Hooks verify files, sizes, hashes, architecture, version output, and adapter pairing before activation. Update both release workflows to fetch and pass both binaries.
 
-- [ ] **Step 3: Preserve V1 and update the primary lock**
-
-Copy current lock verbatim to `providers/grok-cli-v1.lock.json`. Update primary lock to 1.0.34 with official URLs, exact sizes/hashes, compatibility `grok-cli-1.0.34`, and the V2 video adapter. Keep V1 image adapter only in the V1 lock; do not claim image binding upgrade.
-
-- [ ] **Step 4: Package and verify both binaries**
-
-`scripts/package-release.sh` accepts two explicit sources, validates each lock, installs `bin/grok-v1`/`bin/grok-v2`, and writes both identities in the release manifest. Hooks verify files, sizes, hashes, architecture, version output, and adapter pairing before activation.
-
-- [ ] **Step 5: Update OpenAPI and operator documentation**
+- [ ] **Step 3: Update OpenAPI and operator documentation**
 
 Document public V2 fields and accepted/rejected intersection. Keep edit/extension absent. Document separate profile keys/executables, default-off activation, V1 pending/replay checks, disable-and-drain rollback, and the requirement that rollback still understands V2 until V2 jobs drain.
 
-- [ ] **Step 6: Run release and docs checks**
+- [ ] **Step 4: Run release and docs checks**
 
 ```bash
 bash scripts/test-gateway-runtime-gate.sh
@@ -828,7 +876,7 @@ npm run build:admin
 
 Expected: all commands exit 0.
 
-- [ ] **Step 7: Commit and push**
+- [ ] **Step 5: Commit and push**
 
 ```bash
 git add providers scripts deploy crates/image-gateway/src/docs docs
