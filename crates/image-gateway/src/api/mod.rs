@@ -3,7 +3,7 @@ use std::sync::Arc;
 use axum::{
     Router,
     extract::DefaultBodyLimit,
-    http::HeaderMap,
+    http::{HeaderMap, Request},
     middleware as axum_middleware,
     response::IntoResponse,
     routing::{delete, get, post},
@@ -1024,7 +1024,16 @@ fn build_router_with_execution_mode(
     };
     Ok(router
         .layer(DefaultBodyLimit::max(body_limit))
-        .layer(TraceLayer::new_for_http())
+        .layer(
+            TraceLayer::new_for_http().make_span_with(|request: &Request<_>| {
+                tracing::debug_span!(
+                    "request",
+                    method = %request.method(),
+                    uri = %request.uri().path(),
+                    version = ?request.version(),
+                )
+            }),
+        )
         .layer(axum_middleware::from_fn_with_state(
             state.clone(),
             observe_request,
