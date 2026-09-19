@@ -3582,7 +3582,21 @@ fn ensure_upgrade_version(target: &str, current_release: &Path) -> Result<(), Up
         })
     };
     let target_version = parse(target)?;
-    let current_version = parse(current)?;
+    // Production hotfix releases keep one explicit `hotfix-` marker followed
+    // by the normal `v`-prefixed release name. Strip exactly that marker and
+    // require the remaining value to retain its single `v`; malformed or
+    // repeated markers therefore remain rejected by `parse`.
+    let current_semver = if let Some(version) = current.strip_prefix("hotfix-") {
+        if !version.starts_with('v') {
+            return Err(UpdaterError::InvalidRelease(format!(
+                "release version {current} is not semantic: hotfix release must retain v prefix"
+            )));
+        }
+        version
+    } else {
+        current
+    };
+    let current_version = parse(current_semver)?;
     if target_version <= current_version {
         return Err(UpdaterError::InvalidRelease(format!(
             "apply requires a version newer than {current}; requested {target}"
@@ -4183,6 +4197,47 @@ mod tests {
         assert!(ensure_upgrade_version("v1.2.3", current).is_err());
         assert!(ensure_upgrade_version("v1.2.2", current).is_err());
         assert!(ensure_upgrade_version("rolling", current).is_err());
+    }
+
+    #[test]
+    fn apply_version_accepts_hotfix_current_release_and_still_compares_versions() {
+        let current = Path::new("/opt/ai-image-factory/releases/hotfix-v0.1.0-20260911.22ba194");
+        ensure_upgrade_version("v0.1.0-20260919.abcdef0", current).unwrap();
+        assert!(ensure_upgrade_version("v0.1.0-20260911.22ba194", current).is_err());
+        assert!(ensure_upgrade_version("v0.1.0-20260910.abcdef0", current).is_err());
+    }
+
+    #[test]
+    fn apply_version_rejects_invalid_or_repeated_hotfix_prefixes() {
+        for current in [
+            "/opt/ai-image-factory/releases/hotfix-",
+            "/opt/ai-image-factory/releases/hotfix-0.1.0-20260911.22ba194",
+            "/opt/ai-image-factory/releases/hotfix-hotfix-v0.1.0-20260911.22ba194",
+            "/opt/ai-image-factory/releases/hotfix-vv0.1.0-20260911.22ba194",
+        ] {
+            assert!(
+                ensure_upgrade_version("v0.1.0-20260919.abcdef0", Path::new(current)).is_err(),
+                "{current}"
+            );
+        }
+        assert!(
+            ensure_upgrade_version(
+                "hotfix-v0.1.0-20260919.abcdef0",
+                Path::new("/opt/ai-image-factory/releases/v0.1.0-20260911.22ba194")
+            )
+            .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn apply_version_rejects_non_utf8_current_release_name() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let mut path = PathBuf::from("/opt/ai-image-factory/releases");
+        path.push(OsString::from_vec(b"v0.1.0-20260911.\xff".to_vec()));
+        assert!(ensure_upgrade_version("v0.1.0-20260919.abcdef0", &path).is_err());
     }
 
     #[test]

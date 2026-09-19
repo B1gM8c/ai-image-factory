@@ -577,6 +577,42 @@ The helper accepts only a root-owned candidate beneath the verified releases
 tree, checks its protocol identity, atomically replaces the fixed binary,
 restarts the updater, and restores the previous binary if startup fails.
 
+### Legacy `hotfix-v...` current exception
+
+This is a narrow bootstrap exception for a host whose current symlink basename
+is `hotfix-v...` and whose candidate release contains the corresponding
+compatibility fix. It is not a second update path for normal releases. Keep
+`AIF_UPDATE_APPLY_ENABLED=false` throughout the preparation:
+
+1. Use the authorized platform-owner `POST /admin/v1/system/update/check`
+   endpoint (with a fresh `Idempotency-Key`). Wait for the command to finish;
+   this is the updater's `execute_check`, including immutable-release
+   verification and `stage_release`, and must leave the candidate at
+   `/opt/ai-image-factory/releases/NEW_TAG`.
+2. Read the authenticated update snapshot and the database command state. Do
+   not continue while any command is active or pending (`queued`, `running`,
+   or `restoring`), or any recovery is required (`restore_required`). Confirm
+   that `NEW_TAG` is the verified staged release.
+3. Capture the current symlink, schema version, business-service MainPIDs, and
+   `/healthz` plus `/readyz`. From the staged tree only, run the fixed helper
+   with an explicit candidate; never use `install-release`, edit `current`, or
+   change the database by hand:
+
+   ```bash
+   sudo /usr/libexec/ai-image-factory/upgrade-updater \
+     /opt/ai-image-factory/releases/NEW_TAG/bin/updated
+   ```
+
+4. Verify that the fixed updater now has the staged candidate's
+   protocol/version and digest from the release manifest. Recheck that
+   `current`, schema, business-service MainPIDs, and both health endpoints are
+   unchanged and healthy. A successful helper run is only a fixed-updater
+   replacement; do not describe it as an application Apply.
+5. Only after these checks, use the normal authorized Apply command for
+   `NEW_TAG`, enable Apply for that fenced operation, and follow the ordinary
+   recovery and post-activation gates. If any preparation check fails, leave
+   Apply disabled and keep the existing current release serving.
+
 Keep `AIF_UPDATE_APPLY_ENABLED=false` for initial deployment. Enable automatic
 apply only after all of the following have passed on a production-shaped clone:
 
