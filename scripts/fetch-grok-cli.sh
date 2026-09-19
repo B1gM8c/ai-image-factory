@@ -170,8 +170,12 @@ if (
 NODE
 chmod 0755 "$temporary"
 if [[ "$(uname -s)" == "Linux" ]]; then
-  [[ "$($temporary --version)" = "$EXPECTED_VERSION_OUTPUT" ]] \
-    || die "provider binary version output does not match the lock"
+  case "${TARGET_TRIPLE}:$(uname -m)" in
+    x86_64-unknown-linux-gnu:x86_64|aarch64-unknown-linux-gnu:aarch64)
+      [[ "$($temporary --version)" = "$EXPECTED_VERSION_OUTPUT" ]] \
+        || die "provider binary version output does not match the lock"
+      ;;
+  esac
 fi
 mv -f -- "$temporary" "$OUTPUT_PATH"
 trap - EXIT

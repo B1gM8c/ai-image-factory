@@ -19,6 +19,19 @@ prepare_case() {
   cat >"${case_root}/bin/curl" <<'EOF'
 #!/usr/bin/env bash
 set -Eeuo pipefail
+output=""
+while (($#)); do
+  if [[ "$1" == "--output" ]]; then
+    output="$2"
+    shift 2
+  else
+    shift
+  fi
+done
+if [[ -n "${FETCH_CURL_PAYLOAD:-}" ]]; then
+  cp "$FETCH_CURL_PAYLOAD" "$output"
+  exit 0
+fi
 : >"${FETCH_CURL_MARKER}"
 exit 99
 EOF
@@ -45,6 +58,14 @@ switch (process.env.MUTATION) {
     lock.artifacts["x86_64-unknown-linux-gnu"].url =
       "https://x.ai/cli/grok-1.0.34-linux-aarch64";
     break;
+  case "cross-arch": {
+    const bytes = fs.readFileSync(process.env.SYNTHETIC_PATH);
+    const crypto = require("node:crypto");
+    const artifact = lock.artifacts["aarch64-unknown-linux-gnu"];
+    artifact.sha256 = crypto.createHash("sha256").update(bytes).digest("hex");
+    artifact.bytes = bytes.length;
+    break;
+  }
   default:
     throw new Error(`unknown mutation: ${process.env.MUTATION}`);
 }
@@ -107,4 +128,39 @@ assert_valid_lock_reaches_download_stub
 assert_rejected_before_download version
 assert_rejected_before_download machine
 assert_rejected_before_download url
+
+assert_cross_arch_defers_native_version() {
+  local case_root
+  case_root="$(prepare_case cross-arch)"
+  local synthetic="${case_root}/synthetic-aarch64"
+  SYNTHETIC_PATH="$synthetic" node <<'NODE'
+const fs = require("node:fs");
+const bytes = Buffer.alloc(20);
+bytes.set([0x7f, 0x45, 0x4c, 0x46]);
+bytes[4] = 2;
+bytes[5] = 1;
+bytes.writeUInt16LE(183, 18);
+fs.writeFileSync(process.env.SYNTHETIC_PATH, bytes, { mode: 0o755 });
+NODE
+  SYNTHETIC_PATH="$synthetic" \
+    mutate_lock "${case_root}/providers/grok-cli.lock.json" cross-arch
+  cat >"${case_root}/bin/uname" <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+case "$1" in
+  -s) printf 'Linux\n' ;;
+  -m) printf 'x86_64\n' ;;
+  *) exit 2 ;;
+esac
+EOF
+  chmod 0755 "${case_root}/bin/uname"
+  PATH="${case_root}/bin:${PATH}" \
+    FETCH_CURL_PAYLOAD="$synthetic" \
+    "${case_root}/scripts/fetch-grok-cli.sh" \
+    v2 aarch64-unknown-linux-gnu "${case_root}/output/grok" \
+    >"${case_root}/stdout" 2>"${case_root}/stderr"
+  cmp -s "$synthetic" "${case_root}/output/grok"
+}
+
+assert_cross_arch_defers_native_version
 echo "fetch Grok lock regression tests passed"

@@ -347,8 +347,15 @@ with tarfile.open(bundle_path, mode="r:gz") as archive:
 provider_manifest_path = destination / "provider-manifest.json"
 with provider_manifest_path.open("r", encoding="utf-8") as source:
     provider_manifest = json.load(source)
-runtimes = provider_manifest.get("runtimes")
-if runtimes is not None:
+runtime_inventory_paths = {"bin/grok-v1", "bin/grok-v2"}
+has_runtime_key = "runtimes" in provider_manifest
+has_runtime_inventory = bool(runtime_inventory_paths & expected.keys())
+if has_runtime_key or has_runtime_inventory:
+    if not runtime_inventory_paths.issubset(expected):
+        raise SystemExit("dual runtime inventory is incomplete")
+    runtimes = provider_manifest.get("runtimes")
+    if not isinstance(runtimes, dict):
+        raise SystemExit("dual runtime manifest must be an object")
     if set(runtimes) != {"v1", "v2"}:
         raise SystemExit("dual runtime manifest must contain exactly v1 and v2")
     runtime_fields = {
@@ -416,6 +423,24 @@ if runtimes is not None:
         raise SystemExit("V1 compatibility copy does not match bin/grok-v1")
     if provider_manifest.get("binary_bytes") != runtimes["v1"]["binary_bytes"] or provider_manifest.get("binary_sha256") != runtimes["v1"]["binary_sha256"]:
         raise SystemExit("V1 compatibility manifest does not match runtimes.v1")
+    v1 = runtimes["v1"]
+    expected_top_level = {
+        "schema_version": 1,
+        "provider": "xai-grok-cli",
+        "source_repository": "https://github.com/xai-org/grok-build",
+        "version": v1["version"],
+        "version_output": v1["version_output"],
+        "target_triple": target_triple,
+        "binary_path": "bin/grok",
+        "binary_sha256": v1["binary_sha256"],
+        "binary_bytes": v1["binary_bytes"],
+        "compatibility_revision": v1["compatibility_revision"],
+        "image_adapter_revision": v1["image_adapter_revision"],
+        "video_adapter_revision": v1["video_adapter_revision"],
+    }
+    for field, value in expected_top_level.items():
+        if provider_manifest.get(field) != value:
+            raise SystemExit(f"dual V1 top-level identity mismatch: {field}")
 
 expected_machine = {
     "x86_64-unknown-linux-gnu": 62,
