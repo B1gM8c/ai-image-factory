@@ -182,7 +182,8 @@ async fn xai_image_to_video_runs_through_the_real_durable_grok_supervisor() {
         &ProxyConfig::default(),
     )
     .unwrap()
-    .with_input_blobs(blobs);
+    .with_input_blobs(blobs)
+    .with_local_video_uploads(live_video_uploads().1);
     let bytes = Arc::new(Mutex::new(Vec::new()));
     let runner = JournaledDurableRunner::new(
         LiveContextStore(context),
@@ -292,6 +293,11 @@ async fn xai_image_to_video_v2_runs_through_the_real_durable_grok_supervisor() {
     let command = plan.command_json().clone();
     let command_hash = hex::encode(Sha256::digest(serde_json::to_vec(&command).unwrap()));
     let lease = video_lease_v2(command_hash);
+    let (provider_artifact_root, local_video_uploads) = live_video_uploads();
+    let provider_output = local_video_uploads
+        .issue_grok_video_output(&lease, Duration::from_secs(15 * 60))
+        .expect("shared Gateway provider upload service must issue a video output ticket")
+        .expect("shared Gateway provider upload service must expose a video output ticket");
     let context = ExecutorLaunchContext::new(
         "grok-live-video-v2-smoke",
         image_api_contracts::xai::XAI_VIDEOS_API_PROFILE,
@@ -317,7 +323,8 @@ async fn xai_image_to_video_v2_runs_through_the_real_durable_grok_supervisor() {
         &ProxyConfig::default(),
     )
     .unwrap()
-    .with_input_blobs(blobs);
+    .with_input_blobs(blobs)
+    .with_local_video_uploads(Arc::clone(&local_video_uploads));
     let bytes = Arc::new(Mutex::new(Vec::new()));
     let runner = JournaledDurableRunner::new(
         LiveContextStore(context),
@@ -335,22 +342,39 @@ async fn xai_image_to_video_v2_runs_through_the_real_durable_grok_supervisor() {
         first,
         DurableRunnerResult::Terminal(RunnerOutcome::Succeeded(_))
     ) {
-        let execution_root = journal_root.join(lease.executor_execution_id.simple().to_string());
-        let _ = fs::remove_dir_all(execution_root.join("provider-home"));
+        cleanup_sensitive_v2_execution_paths(&journal_root, &lease);
         panic!(
             "unexpected Grok V2 video outcome after {elapsed_ms}ms: {first:?}; journal={}",
             journal_root.display()
         );
     }
+    let provider_ticket_root = provider_artifact_root
+        .join(".provider-uploads")
+        .join(&provider_output.access_key_id);
+    let provider_object = provider_ticket_root.join("object.mp4");
+    assert!(
+        provider_object.is_file(),
+        "shared Gateway provider upload object is missing"
+    );
+    let provider_entries_before_replay = directory_entries(&provider_ticket_root);
     assert_eq!(
         runner
             .start_or_attach(lease.clone(), RunnerLaunchAuthority::AttachOnly)
             .await,
         first
     );
+    assert_eq!(
+        provider_entries_before_replay,
+        directory_entries(&provider_ticket_root),
+        "Grok V2 replay must not create another provider object"
+    );
     let bytes = bytes.lock().unwrap().clone();
     assert_eq!(media_type_from_bytes(&bytes).unwrap(), "video/mp4");
     assert!(!bytes.is_empty());
+    let uploaded = fs::read(&provider_object)
+        .expect("shared Gateway provider upload object must be readable by the smoke UID");
+    assert_eq!(uploaded.len(), bytes.len());
+    assert_eq!(sha256(&uploaded), sha256(&bytes));
     eprintln!(
         "verified Grok V2 video first execution: elapsed_ms={} bytes={} sha256={}",
         elapsed_ms,
@@ -369,6 +393,53 @@ fn assert_absent_or_empty(path: &Path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => panic!("failed to inspect {}: {error}", path.display()),
     }
+}
+
+fn live_video_uploads() -> (PathBuf, Arc<ProviderUploadService>) {
+    let artifact_root = env::var("GROK_SMOKE_PROVIDER_UPLOAD_ARTIFACT_ROOT")
+        .expect("GROK_SMOKE_PROVIDER_UPLOAD_ARTIFACT_ROOT must select the existing artifact root shared with the running Gateway and the same Unix UID");
+    let public_base_url = env::var("GROK_SMOKE_PROVIDER_UPLOAD_PUBLIC_BASE_URL")
+        .expect("GROK_SMOKE_PROVIDER_UPLOAD_PUBLIC_BASE_URL must select the publicly reachable HTTPS Gateway origin");
+    let parsed_url = reqwest::Url::parse(public_base_url.trim())
+        .expect("GROK_SMOKE_PROVIDER_UPLOAD_PUBLIC_BASE_URL must be a valid HTTPS Gateway origin");
+    assert_eq!(
+        parsed_url.scheme(),
+        "https",
+        "GROK_SMOKE_PROVIDER_UPLOAD_PUBLIC_BASE_URL must use HTTPS for the running public Gateway"
+    );
+    let artifact_root = fs::canonicalize(&artifact_root).expect(
+        "GROK_SMOKE_PROVIDER_UPLOAD_ARTIFACT_ROOT must point to an existing Gateway artifact root",
+    );
+    let uploads = ProviderUploadService::new(&artifact_root, Some(public_base_url.trim()))
+        .expect("shared Gateway provider upload artifact root and HTTPS public origin are invalid");
+    (artifact_root, Arc::new(uploads))
+}
+
+fn cleanup_sensitive_v2_execution_paths(journal_root: &Path, lease: &ExecutorSubmissionLease) {
+    let execution_root = journal_root.join(lease.executor_execution_id.simple().to_string());
+    for relative in ["provider-home", "provider-workspaces/attempt"] {
+        let path = execution_root.join(relative);
+        match fs::remove_dir_all(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => panic!("failed to clean sensitive V2 smoke execution paths"),
+        }
+    }
+}
+
+fn directory_entries(path: &Path) -> Vec<String> {
+    let mut entries = fs::read_dir(path)
+        .expect("shared Gateway provider upload ticket directory must be readable")
+        .map(|entry| {
+            entry
+                .expect("shared Gateway provider upload ticket entry must be readable")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect::<Vec<_>>();
+    entries.sort_unstable();
+    entries
 }
 
 struct LiveContextStore(ExecutorLaunchContext);
