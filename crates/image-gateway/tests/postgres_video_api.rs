@@ -277,6 +277,41 @@ async fn xai_video_api_runs_one_tenant_scoped_billed_mp4_job_end_to_end() -> Tes
             v1_after_schema == GROK_VIDEO_GENERATION_COMMAND_SCHEMA,
             format!("legacy V1 route changed after V2 activation: {v1_after_schema}"),
         )?;
+        let invalid_counts_before: (i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT (SELECT COUNT(*) FROM jobs), (SELECT COUNT(*) FROM quota_reservations),
+                    (SELECT COUNT(*) FROM customer_price_quotes),
+                    (SELECT COUNT(*) FROM job_provider_route_attributions)",
+        )
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        let mut invalid_v2 = video_request_v2();
+        invalid_v2["output"] = json!({"upload_url": "https://upload.example/video"});
+        let (invalid_status, invalid_body) = json_request(
+            app.clone(),
+            Method::POST,
+            "/v1/videos/generations",
+            &owner.api_key.value,
+            Some("v2-invalid-delivery"),
+            Some(&invalid_v2),
+        )
+        .await?;
+        let invalid_counts_after: (i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT (SELECT COUNT(*) FROM jobs), (SELECT COUNT(*) FROM quota_reservations),
+                    (SELECT COUNT(*) FROM customer_price_quotes),
+                    (SELECT COUNT(*) FROM job_provider_route_attributions)",
+        )
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(
+            invalid_status == StatusCode::BAD_REQUEST
+                && invalid_body["error"]["code"] == "unsupported_parameter"
+                && invalid_counts_before == invalid_counts_after,
+            format!(
+                "invalid V2 delivery had side effects: {invalid_status} {invalid_body} {invalid_counts_before:?}->{invalid_counts_after:?}"
+            ),
+        )?;
         let body = video_request_v2();
         let (created_status, created) = json_request(
             app.clone(),
