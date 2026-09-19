@@ -277,10 +277,53 @@ async fn xai_video_api_runs_one_tenant_scoped_billed_mp4_job_end_to_end() -> Tes
             v1_after_schema == GROK_VIDEO_GENERATION_COMMAND_SCHEMA,
             format!("legacy V1 route changed after V2 activation: {v1_after_schema}"),
         )?;
-        let invalid_counts_before: (i64, i64, i64, i64) = sqlx::query_as(
+        let console_body = json!({
+            "model": "grok-imagine-video-1.5",
+            "prompt": "slow camera push from the console",
+            "duration": DURATION_SECONDS,
+            "resolution": "480p",
+            "image": v1_body["image"]["url"].clone(),
+        });
+        let console_uri = format!(
+            "/v1/console/projects/{}/videos/generations",
+            v1_project.id
+        );
+        let (console_status, console_response) = json_request(
+            app.clone(),
+            Method::POST,
+            &console_uri,
+            &v1_owner.api_key.value,
+            None,
+            Some(&console_body),
+        )
+        .await?;
+        require(
+            console_status == StatusCode::OK && console_response["task_id"].is_string(),
+            format!("console V1 video admission failed: {console_status} {console_response}"),
+        )?;
+        let console_job_id = Uuid::parse_str(
+            console_response["task_id"]
+                .as_str()
+                .ok_or_else(|| "console V1 response omitted task_id".to_owned())?,
+        )
+        .map_err(debug_error)?;
+        let console_schema: String = sqlx::query_scalar(
+            "SELECT command_schema FROM job_payloads WHERE job_id = $1",
+        )
+        .bind(console_job_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(
+            console_schema == GROK_VIDEO_GENERATION_COMMAND_SCHEMA,
+            format!("console V1 admission used unexpected schema: {console_schema}"),
+        )?;
+        let invalid_counts_before: (i64, i64, i64, i64, i64, i64) = sqlx::query_as(
             "SELECT (SELECT COUNT(*) FROM jobs), (SELECT COUNT(*) FROM quota_reservations),
                     (SELECT COUNT(*) FROM customer_price_quotes),
-                    (SELECT COUNT(*) FROM job_provider_route_attributions)",
+                    (SELECT COUNT(*) FROM job_provider_route_attributions),
+                    (SELECT COUNT(*) FROM admission_sessions),
+                    (SELECT COUNT(*) FROM idempotency_requests)",
         )
         .fetch_one(&database.pool)
         .await
@@ -296,10 +339,12 @@ async fn xai_video_api_runs_one_tenant_scoped_billed_mp4_job_end_to_end() -> Tes
             Some(&invalid_v2),
         )
         .await?;
-        let invalid_counts_after: (i64, i64, i64, i64) = sqlx::query_as(
+        let invalid_counts_after: (i64, i64, i64, i64, i64, i64) = sqlx::query_as(
             "SELECT (SELECT COUNT(*) FROM jobs), (SELECT COUNT(*) FROM quota_reservations),
                     (SELECT COUNT(*) FROM customer_price_quotes),
-                    (SELECT COUNT(*) FROM job_provider_route_attributions)",
+                    (SELECT COUNT(*) FROM job_provider_route_attributions),
+                    (SELECT COUNT(*) FROM admission_sessions),
+                    (SELECT COUNT(*) FROM idempotency_requests)",
         )
         .fetch_one(&database.pool)
         .await
@@ -713,10 +758,12 @@ async fn xai_video_v2_migration_stays_disabled_then_claims_exactly() -> TestResu
         .execute(&database.pool)
         .await
         .map_err(debug_error)?;
-        let disabled_counts_before: (i64, i64, i64, i64) = sqlx::query_as(
+        let disabled_counts_before: (i64, i64, i64, i64, i64, i64) = sqlx::query_as(
             "SELECT (SELECT COUNT(*) FROM jobs), (SELECT COUNT(*) FROM quota_reservations),
                     (SELECT COUNT(*) FROM customer_price_quotes),
-                    (SELECT COUNT(*) FROM job_provider_route_attributions)",
+                    (SELECT COUNT(*) FROM job_provider_route_attributions),
+                    (SELECT COUNT(*) FROM admission_sessions),
+                    (SELECT COUNT(*) FROM idempotency_requests)",
         )
         .fetch_one(&database.pool)
         .await
@@ -730,10 +777,12 @@ async fn xai_video_v2_migration_stays_disabled_then_claims_exactly() -> TestResu
             Some(&video_request_v2()),
         )
         .await?;
-        let disabled_counts_after: (i64, i64, i64, i64) = sqlx::query_as(
+        let disabled_counts_after: (i64, i64, i64, i64, i64, i64) = sqlx::query_as(
             "SELECT (SELECT COUNT(*) FROM jobs), (SELECT COUNT(*) FROM quota_reservations),
                     (SELECT COUNT(*) FROM customer_price_quotes),
-                    (SELECT COUNT(*) FROM job_provider_route_attributions)",
+                    (SELECT COUNT(*) FROM job_provider_route_attributions),
+                    (SELECT COUNT(*) FROM admission_sessions),
+                    (SELECT COUNT(*) FROM idempotency_requests)",
         )
         .fetch_one(&database.pool)
         .await
