@@ -6,7 +6,9 @@ use std::{
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use futures_util::StreamExt;
-use image_api_contracts::xai::XaiVideoGenerationCommandV2;
+use image_api_contracts::xai::{
+    XaiVideoGenerationCommandV1, XaiVideoGenerationCommandV2, XaiVideoWorkflow,
+};
 use reqwest::{Client, Url, redirect::Policy};
 
 use crate::ImageGatewayError;
@@ -86,6 +88,56 @@ pub(super) async fn decode_video_inputs_v2(
         });
     }
     Ok(inputs)
+}
+
+/// Decode the original V1 input contract.  V1 intentionally remains limited
+/// to inline data URLs; public HTTPS fetching is a V2-only capability.
+pub(super) fn decode_video_inputs_v1(
+    command: &XaiVideoGenerationCommandV1,
+    max_upload_bytes: usize,
+) -> Result<Vec<DecodedVideoInput>, ImageGatewayError> {
+    let sources = match command.workflow() {
+        XaiVideoWorkflow::TextToVideo => Vec::new(),
+        XaiVideoWorkflow::ImageToVideo => vec![(
+            "image".to_owned(),
+            command
+                .image
+                .as_ref()
+                .and_then(|image| image.url.as_deref())
+                .ok_or_else(|| unsupported_source("image"))?,
+        )],
+        XaiVideoWorkflow::ReferenceToVideo => command
+            .reference_images
+            .iter()
+            .enumerate()
+            .map(|(index, image)| {
+                image
+                    .url
+                    .as_deref()
+                    .map(|url| (format!("reference_images[{index}]"), url))
+                    .ok_or_else(|| unsupported_source("reference_images"))
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+    };
+    let limit = max_upload_bytes.min(MAX_VIDEO_INPUT_BYTES);
+    let mut total_bytes = 0usize;
+    sources
+        .into_iter()
+        .enumerate()
+        .map(|(index, (param, source))| {
+            let decoded = decode_data_url(&param, source, limit, &mut total_bytes)?;
+            let extension = match decoded.media_type.as_str() {
+                "image/png" => "png",
+                "image/jpeg" => "jpg",
+                "image/webp" => "webp",
+                _ => return Err(invalid_image(&param, "unsupported image format")),
+            };
+            Ok(DecodedVideoInput {
+                filename: format!("input-{index}.{extension}"),
+                ..decoded
+            })
+        })
+        .collect()
 }
 
 async fn decode_source(
@@ -427,5 +479,46 @@ mod tests {
         let inputs = decode_video_inputs_v2(&command, 12).await.unwrap();
         assert_eq!(inputs.len(), 2);
         assert_eq!(inputs[0].bytes, inputs[1].bytes);
+    }
+
+    #[test]
+    fn v1_decoder_preserves_inline_only_input_contract() {
+        let command = XaiVideoGenerationCommandV1::from_request(
+            image_api_contracts::xai::XaiVideoGenerationRequest {
+                aspect_ratio: None,
+                duration: Some(6),
+                generate_audio: None,
+                image: Some(XaiVideoImageUrl {
+                    file_id: None,
+                    url: Some("data:image/png;base64,iVBORw0KGgo=".to_owned()),
+                }),
+                last_frame: None,
+                model: Some("grok-imagine-video-1.5-preview".to_owned()),
+                output: None,
+                prompt: None,
+                reference_audios: Vec::new(),
+                reference_images: Vec::new(),
+                resolution: Some(image_api_contracts::xai::XaiVideoResolution::P480),
+                storage_options: None,
+                user: None,
+            },
+        )
+        .unwrap();
+        let inputs = decode_video_inputs_v1(&command, 1024).unwrap();
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(inputs[0].filename, "input-0.png");
+        assert!(
+            decode_video_inputs_v1(
+                &XaiVideoGenerationCommandV1 {
+                    image: Some(XaiVideoImageUrl {
+                        file_id: None,
+                        url: Some("https://example.com/input.png".to_owned()),
+                    }),
+                    ..command
+                },
+                1024,
+            )
+            .is_err()
+        );
     }
 }

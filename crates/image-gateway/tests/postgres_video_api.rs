@@ -125,12 +125,6 @@ async fn xai_video_api_runs_one_tenant_scoped_billed_mp4_job_end_to_end() -> Tes
         )
         .await?;
         seed_video_economics(&database.pool, &owner_project.id).await?;
-        let v2_profile_id = activate_v2_fixture(
-            &database.pool,
-            &owner.api_key.id,
-            profile.provider_account_id,
-        )
-        .await?;
         let settlement = Arc::new(PostgresExecutionSettlementStore::new(
             database.pool.clone(),
             blobs.clone(),
@@ -139,7 +133,7 @@ async fn xai_video_api_runs_one_tenant_scoped_billed_mp4_job_end_to_end() -> Tes
             config(),
             ExternalImageGatewayComponents {
                 usage_store: Arc::new(PostgresUsageStore::new(database.pool.clone())),
-                api_key_store: keys,
+                api_key_store: keys.clone(),
                 admission_store: Arc::new(PostgresAdmissionStore::new(database.pool.clone())),
                 settlement_store: settlement.clone(),
                 input_blob_store: blobs.clone(),
@@ -149,6 +143,45 @@ async fn xai_video_api_runs_one_tenant_scoped_billed_mp4_job_end_to_end() -> Tes
             },
         )
         .map_err(debug_error)?;
+        // The route seeded above is the legacy V1 binding.  Exercise it before
+        // opting this key into the additive V2 fixture so a V2 rollout cannot
+        // silently reinterpret existing video traffic.
+        let v1_body = video_request();
+        let (v1_status, v1_created) = json_request(
+            app.clone(),
+            Method::POST,
+            "/v1/videos/generations",
+            &owner.api_key.value,
+            Some("video-v1-compatibility"),
+            Some(&v1_body),
+        )
+        .await?;
+        require(
+            v1_status == StatusCode::OK,
+            format!("legacy V1 video creation failed: {v1_status} {v1_created}"),
+        )?;
+        let v1_job_id = Uuid::parse_str(
+            v1_created["request_id"]
+                .as_str()
+                .ok_or_else(|| "legacy V1 creation omitted request_id".to_owned())?,
+        )
+        .map_err(debug_error)?;
+        let v1_schema: String =
+            sqlx::query_scalar("SELECT command_schema FROM job_payloads WHERE job_id = $1")
+                .bind(v1_job_id)
+                .fetch_one(&database.pool)
+                .await
+                .map_err(debug_error)?;
+        require(
+            v1_schema == GROK_VIDEO_GENERATION_COMMAND_SCHEMA,
+            format!("legacy V1 route was not preserved: {v1_schema}"),
+        )?;
+        let v2_profile_id = activate_v2_fixture(
+            &database.pool,
+            &owner.api_key.id,
+            profile.provider_account_id,
+        )
+        .await?;
         let body = video_request_v2();
         let (created_status, created) = json_request(
             app.clone(),

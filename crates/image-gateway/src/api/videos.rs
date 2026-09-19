@@ -12,6 +12,7 @@ use image_api_contracts::xai::{
     XaiVideoResponse, XaiVideoWorkflow,
 };
 use image_provider_contracts::BillingMetric;
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::{
@@ -30,7 +31,7 @@ use crate::{
 use super::{
     AppState, GenerationExecutionMode, RequestId, authenticate_image_request,
     resolve_request_model,
-    video_inputs::{DecodedVideoInput, decode_video_inputs_v2},
+    video_inputs::{DecodedVideoInput, decode_video_inputs_v1, decode_video_inputs_v2},
 };
 
 const RETRY_DELAY: Duration = Duration::from_millis(25);
@@ -51,7 +52,14 @@ pub(super) async fn create_video(
             "invalid_json",
         )
     })?;
-    let default_model = "grok-imagine-video-1.5";
+    // Keep the public API's historical defaults stable.  The V2 model is an
+    // explicit routed/canary surface and must not become the implicit model
+    // merely because the V2 executor is installed.
+    let default_model = if request.image.is_some() {
+        "grok-imagine-video-1.5-preview"
+    } else {
+        "grok-imagine-video"
+    };
     if let Some(resolved) = resolve_request_model(
         &state,
         &mut auth,
@@ -82,15 +90,33 @@ pub(super) async fn create_video_with_auth(
             "video generation requires external execution",
         ));
     }
-    let intent = XaiVideoAdmissionIntent::new_v2(request).map_err(video_admission_error)?;
-    preflight_grok_binding_v2(&intent)?;
-    let decoded = decode_video_inputs_v2(
-        intent
-            .source_command_v2()
-            .ok_or_else(|| ImageGatewayError::internal("video V2 intent missing source command"))?,
-        state.config.max_upload_bytes,
-    )
-    .await?;
+    let api_version = select_video_api_version(
+        auth.route
+            .as_ref()
+            .map(|route| route.command_schema.as_str()),
+        &request,
+    )?;
+    let (intent, decoded) = match api_version {
+        VideoApiVersion::V1 => {
+            let intent = XaiVideoAdmissionIntent::new(request).map_err(video_admission_error)?;
+            let decoded =
+                decode_video_inputs_v1(intent.source_command(), state.config.max_upload_bytes)?;
+            preflight_grok_binding_v1(&intent, &decoded)?;
+            (intent, decoded)
+        }
+        VideoApiVersion::V2 => {
+            let intent = XaiVideoAdmissionIntent::new_v2(request).map_err(video_admission_error)?;
+            preflight_grok_binding_v2(&intent)?;
+            let decoded = decode_video_inputs_v2(
+                intent.source_command_v2().ok_or_else(|| {
+                    ImageGatewayError::internal("video V2 intent missing source command")
+                })?,
+                state.config.max_upload_bytes,
+            )
+            .await?;
+            (intent, decoded)
+        }
+    };
     let idempotency_key_digest = video_idempotency_digest(&headers, &auth)?;
     let contract = video_admission_contract(state.config.generation_admission_contract);
     let mut claim = intent.claim(
@@ -191,6 +217,51 @@ pub(super) async fn create_video_with_auth(
         return Err(admission_error(error));
     }
     Ok(start_response(reservation.job_id))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum VideoApiVersion {
+    V1,
+    V2,
+}
+
+fn select_video_api_version(
+    route_schema: Option<&str>,
+    request: &XaiVideoGenerationRequest,
+) -> Result<VideoApiVersion, ImageGatewayError> {
+    let version = match route_schema {
+        None => VideoApiVersion::V1,
+        Some(image_provider_grok_cli::GROK_VIDEO_GENERATION_COMMAND_SCHEMA) => VideoApiVersion::V1,
+        Some(image_provider_grok_cli::GROK_VIDEO_GENERATION_COMMAND_SCHEMA_V2) => {
+            VideoApiVersion::V2
+        }
+        Some(schema) => {
+            return Err(ImageGatewayError::invalid_request(
+                format!("video route command schema is unsupported: {schema}"),
+                Some("model".to_owned()),
+                "invalid_value",
+            ));
+        }
+    };
+
+    let model = request.model.as_deref();
+    let model_allowed = match version {
+        VideoApiVersion::V1 => model.is_none_or(|model| {
+            matches!(
+                model,
+                "grok-imagine-video" | "grok-imagine-video-1.5-preview"
+            )
+        }),
+        VideoApiVersion::V2 => model.is_some_and(|model| model == "grok-imagine-video-1.5"),
+    };
+    if !model_allowed {
+        return Err(ImageGatewayError::invalid_request(
+            "video model does not match the selected route command schema",
+            Some("model".to_owned()),
+            "invalid_value",
+        ));
+    }
+    Ok(version)
 }
 
 fn video_admission_contract(
@@ -353,6 +424,38 @@ fn preflight_grok_binding_v2(intent: &XaiVideoAdmissionIntent) -> Result<(), Ima
             XaiVideoAdmissionError::UnsupportedBindingV2(error),
         )),
     }
+}
+
+fn preflight_grok_binding_v1(
+    intent: &XaiVideoAdmissionIntent,
+    inputs: &[DecodedVideoInput],
+) -> Result<(), ImageGatewayError> {
+    let projected = inputs
+        .iter()
+        .enumerate()
+        .map(|(index, input)| {
+            XaiVideoAdmissionInput::new(
+                input.filename.clone(),
+                crate::input_blobs::InputBlobRef {
+                    key: InputBlobKey {
+                        admission_session_id: Uuid::nil(),
+                        input_id: Uuid::from_u128(index as u128 + 1),
+                    },
+                    storage_backend: "preflight".to_owned(),
+                    object_key: format!("preflight/{index}"),
+                    sha256_hex: hex::encode(Sha256::digest(&input.bytes)),
+                    byte_size: input.bytes.len() as u64,
+                },
+                input.media_type.clone(),
+            )
+            .map_err(video_admission_error)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    intent
+        .clone()
+        .bind_grok_cli(projected)
+        .map(|_| ())
+        .map_err(video_admission_error)
 }
 
 fn unsupported_file_id_parameter(
@@ -700,6 +803,59 @@ mod tests {
 
     use crate::admission::XaiVideoAdmissionPlan;
     use crate::input_blobs::InputBlobRef;
+
+    fn version_request(model: Option<&str>) -> XaiVideoGenerationRequest {
+        XaiVideoGenerationRequest {
+            aspect_ratio: None,
+            duration: Some(6),
+            generate_audio: None,
+            image: None,
+            last_frame: None,
+            model: model.map(str::to_owned),
+            output: None,
+            prompt: Some("a paper boat on a lake".to_owned()),
+            reference_audios: Vec::new(),
+            reference_images: Vec::new(),
+            resolution: Some(XaiVideoResolution::P480),
+            storage_options: None,
+            user: None,
+        }
+    }
+
+    #[test]
+    fn video_route_schema_selects_v1_or_v2_and_rejects_crossed_models() {
+        assert_eq!(
+            select_video_api_version(None, &version_request(None)).unwrap(),
+            VideoApiVersion::V1
+        );
+        assert_eq!(
+            select_video_api_version(
+                Some(image_provider_grok_cli::GROK_VIDEO_GENERATION_COMMAND_SCHEMA),
+                &version_request(Some("grok-imagine-video")),
+            )
+            .unwrap(),
+            VideoApiVersion::V1
+        );
+        assert_eq!(
+            select_video_api_version(
+                Some(image_provider_grok_cli::GROK_VIDEO_GENERATION_COMMAND_SCHEMA_V2),
+                &version_request(Some("grok-imagine-video-1.5")),
+            )
+            .unwrap(),
+            VideoApiVersion::V2
+        );
+        assert!(
+            select_video_api_version(
+                Some(image_provider_grok_cli::GROK_VIDEO_GENERATION_COMMAND_SCHEMA),
+                &version_request(Some("grok-imagine-video-1.5")),
+            )
+            .is_err()
+        );
+        assert!(
+            select_video_api_version(Some("unknown.video.schema"), &version_request(None),)
+                .is_err()
+        );
+    }
 
     use super::*;
 
