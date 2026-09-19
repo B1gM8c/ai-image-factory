@@ -2346,31 +2346,36 @@ mod tests {
     #[test]
     fn grok_video_v2_terminal_evidence_is_signed_and_quota_bound() {
         use image_api_contracts::xai::{
-            XaiVideoAspectRatio, XaiVideoGenerationCommandV2, XaiVideoGenerationRequest,
-            XaiVideoResolution,
+            XaiVideoAspectRatio, XaiVideoGenerationCommandV1, XaiVideoGenerationCommandV2,
+            XaiVideoGenerationRequest, XaiVideoResolution,
         };
         use image_provider_grok_cli::{
-            GrokVideoGenerationPayloadV2, parse_video_generation_payload_v2,
+            GrokVideoGenerationPayloadV1, GrokVideoGenerationPayloadV2,
+            parse_video_generation_payload_v2,
         };
-        use image_provider_sdk::OutputSlot;
+        use image_provider_sdk::{CanonicalCommandPayload, OutputSlot};
 
-        let command = XaiVideoGenerationCommandV2::from_request(XaiVideoGenerationRequest {
-            aspect_ratio: Some(XaiVideoAspectRatio::R16x9),
-            duration: Some(10),
-            generate_audio: Some(true),
-            image: None,
-            last_frame: None,
-            model: Some("grok-imagine-video-1.5".to_owned()),
-            output: None,
-            prompt: Some("terminal evidence".to_owned()),
-            reference_audios: Vec::new(),
-            reference_images: Vec::new(),
-            resolution: Some(XaiVideoResolution::P720),
-            storage_options: None,
-            user: None,
-        })
-        .unwrap();
-        let payload = GrokVideoGenerationPayloadV2::from_xai_command(command, Vec::new()).unwrap();
+        fn payload_for_model(model: &str) -> GrokVideoGenerationPayloadV2 {
+            let command = XaiVideoGenerationCommandV2::from_request(XaiVideoGenerationRequest {
+                aspect_ratio: Some(XaiVideoAspectRatio::R16x9),
+                duration: Some(10),
+                generate_audio: Some(true),
+                image: None,
+                last_frame: None,
+                model: Some(model.to_owned()),
+                output: None,
+                prompt: Some("terminal evidence".to_owned()),
+                reference_audios: Vec::new(),
+                reference_images: Vec::new(),
+                resolution: Some(XaiVideoResolution::P720),
+                storage_options: None,
+                user: None,
+            })
+            .unwrap();
+            GrokVideoGenerationPayloadV2::from_xai_command(command, Vec::new()).unwrap()
+        }
+
+        let payload = payload_for_model("grok-imagine-video-1.5");
         let bytes = payload.into_canonical_bytes(OutputSlot::new(0, 1).unwrap());
         let payload = parse_video_generation_payload_v2(&bytes).unwrap();
         assert_eq!(
@@ -2411,11 +2416,29 @@ mod tests {
                 VIDEO_GENERATION_OPERATION,
                 1,
                 9,
-                10,
+                9,
                 "video_second",
                 "second",
             ),
-            (4, VIDEO_GENERATION_OPERATION, 1, 10, 10, "output", "output"),
+            (
+                4,
+                VIDEO_GENERATION_OPERATION,
+                1,
+                10,
+                9,
+                "video_second",
+                "second",
+            ),
+            (4, VIDEO_GENERATION_OPERATION, 1, 10, 10, "output", "second"),
+            (
+                4,
+                VIDEO_GENERATION_OPERATION,
+                1,
+                10,
+                10,
+                "video_second",
+                "millisecond",
+            ),
         ] {
             assert!(
                 validate_video_v2_terminal_evidence(
@@ -2431,6 +2454,47 @@ mod tests {
                 .is_err()
             );
         }
+
+        for model in [
+            "grok-imagine-video-1.5-preview",
+            "grok-imagine-video-1.5-2026-05-30",
+        ] {
+            let preview = payload_for_model(model);
+            assert!(
+                validate_video_v2_terminal_evidence(
+                    &preview,
+                    4,
+                    VIDEO_GENERATION_OPERATION,
+                    1,
+                    10,
+                    10,
+                    "video_second",
+                    "second",
+                )
+                .is_err()
+            );
+        }
+
+        let v1_command = XaiVideoGenerationCommandV1::from_request(XaiVideoGenerationRequest {
+            aspect_ratio: Some(XaiVideoAspectRatio::R16x9),
+            duration: Some(6),
+            generate_audio: None,
+            image: None,
+            last_frame: None,
+            model: Some("grok-imagine-video-1.5-preview".to_owned()),
+            output: None,
+            prompt: Some("v1 body".to_owned()),
+            reference_audios: Vec::new(),
+            reference_images: Vec::new(),
+            resolution: Some(XaiVideoResolution::P480),
+            storage_options: None,
+            user: None,
+        })
+        .unwrap();
+        let v1_payload =
+            GrokVideoGenerationPayloadV1::from_xai_command(v1_command, Vec::new()).unwrap();
+        let v1_bytes = v1_payload.into_canonical_bytes(OutputSlot::new(0, 1).unwrap());
+        assert!(parse_video_generation_payload_v2(&v1_bytes).is_err());
     }
 
     fn succeeded(media_type: &str) -> CanonicalExecutorOutcome {

@@ -1287,9 +1287,79 @@ mod tests {
                 ],
                 output_count: 1,
             },
+            SurfaceRequest {
+                provider_model_id: "grok-imagine-video-1.5",
+                dimensions: &[
+                    value("duration", "0"),
+                    value("resolution", "480p"),
+                    value("input_image_count", "0"),
+                    value("aspect_ratio", "1:1"),
+                ],
+                output_count: 1,
+            },
+            SurfaceRequest {
+                provider_model_id: "grok-imagine-video-1.5",
+                dimensions: &[
+                    value("duration", "6"),
+                    value("resolution", "480p"),
+                    value("input_image_count", "10"),
+                    value("aspect_ratio", "1:1"),
+                ],
+                output_count: 1,
+            },
+            SurfaceRequest {
+                provider_model_id: "grok-imagine-video-1.5",
+                dimensions: &[
+                    value("duration", "6"),
+                    value("resolution", "480p"),
+                    value("input_image_count", "0"),
+                    value("aspect_ratio", "5:4"),
+                ],
+                output_count: 1,
+            },
+            SurfaceRequest {
+                provider_model_id: "grok-imagine-video-1.5",
+                dimensions: &[
+                    value("duration", "6"),
+                    value("resolution", "1080p"),
+                    value("input_image_count", "0"),
+                    value("aspect_ratio", "1:1"),
+                ],
+                output_count: 1,
+            },
+            SurfaceRequest {
+                provider_model_id: "grok-imagine-video-1.5",
+                dimensions: &[
+                    value("duration", "6"),
+                    value("resolution", "480p"),
+                    value("input_image_count", "0"),
+                    value("aspect_ratio", "1:1"),
+                ],
+                output_count: 2,
+            },
+            SurfaceRequest {
+                provider_model_id: "grok-imagine-video-1.5",
+                dimensions: &[
+                    value("duration", "6"),
+                    value("resolution", "480p"),
+                    value("input_image_count", "0"),
+                ],
+                output_count: 1,
+            },
         ] {
             assert!(contract.validate(&request).is_err());
         }
+        assert_ne!(
+            find_contract(
+                "grok-cli",
+                "videos.generations",
+                "grok-cli.videos.generate.v1",
+                "video",
+            )
+            .unwrap()
+            .command_schema,
+            contract.command_schema
+        );
     }
 
     #[test]
