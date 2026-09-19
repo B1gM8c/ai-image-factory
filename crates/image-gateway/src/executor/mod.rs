@@ -61,7 +61,7 @@ pub use provisioning::{
     provision_grok_execution_profile_in_transaction,
     provision_grok_image_execution_profile_replacement, provision_grok_video_execution_profile,
     provision_grok_video_execution_profile_in_transaction,
-    provision_grok_video_execution_profile_replacement,
+    provision_grok_video_execution_profile_replacement, provision_grok_video_v2_execution_profile,
 };
 pub use runner::{
     DurableEvidenceRecovery, DurableRunner, DurableRunnerResult, ExecutorArtifactSink,

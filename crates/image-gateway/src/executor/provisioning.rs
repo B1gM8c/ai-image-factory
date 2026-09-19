@@ -8,8 +8,10 @@ use image_provider_grok_cli::{
     ADAPTER_REVISION as GROK_ADAPTER_REVISION, GROK_IMAGE_EDIT_COMMAND_SCHEMA,
     GROK_IMAGE_EDIT_OPERATION_V1, GROK_IMAGE_GENERATION_COMMAND_SCHEMA,
     GROK_IMAGE_GENERATION_OPERATION_V1, GROK_VIDEO_GENERATION_COMMAND_SCHEMA,
-    GROK_VIDEO_GENERATION_OPERATION_V1, PROVIDER_ID as GROK_PROVIDER_ID,
+    GROK_VIDEO_GENERATION_COMMAND_SCHEMA_V2, GROK_VIDEO_GENERATION_OPERATION_V1,
+    GROK_VIDEO_GENERATION_OPERATION_V2, PROVIDER_ID as GROK_PROVIDER_ID,
     VIDEO_ADAPTER_REVISION as GROK_VIDEO_ADAPTER_REVISION,
+    VIDEO_ADAPTER_REVISION_V2 as GROK_VIDEO_ADAPTER_REVISION_V2,
 };
 use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
@@ -268,6 +270,76 @@ pub async fn provision_grok_video_execution_profile_in_transaction(
         },
     )
     .await
+}
+
+/// Explicit opt-in provisioning for the isolated Grok video V2 runtime.
+///
+/// Unlike the shared V1 kernel this entry point may enable only the exact V2
+/// profile. Existing account capability rows are preserved; a new account
+/// capability created by the profile trigger is removed before commit.
+pub async fn provision_grok_video_v2_execution_profile(
+    pool: &PgPool,
+    provisioning: &GrokExecutionProfileProvisioning,
+) -> Result<ProvisionedGrokExecutionProfile, GrokProfileProvisioningError> {
+    let mut tx = pool.begin().await.map_err(map_sql_error)?;
+    let binding = grok_video_v2_provisioning_binding();
+    validate(provisioning)?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(binding.advisory_lock_key)
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sql_error)?;
+    let now = database_now(&mut tx).await?;
+    let credential_pool_id = ensure_pool(&mut tx, provisioning, binding, now).await?;
+    let provider_account_id =
+        ensure_account(&mut tx, provisioning, binding, credential_pool_id, now).await?;
+    let (resource_policy_id, resource_policy_revision) = ensure_policy(
+        &mut tx,
+        provisioning,
+        binding,
+        credential_pool_id,
+        provider_account_id,
+        now,
+    )
+    .await?;
+    let had_account_operation: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM provider_account_operations WHERE provider_account_id = $1 AND operation_id = $2)",
+    )
+    .bind(provider_account_id)
+    .bind(binding.operation.id)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(map_sql_error)?;
+    let execution_profile_id = ensure_profile(
+        &mut tx,
+        provisioning,
+        binding,
+        credential_pool_id,
+        provider_account_id,
+        resource_policy_id,
+        resource_policy_revision,
+        now,
+        true,
+    )
+    .await?;
+    if !had_account_operation {
+        sqlx::query(
+            "DELETE FROM provider_account_operations WHERE provider_account_id = $1 AND operation_id = $2",
+        )
+        .bind(provider_account_id)
+        .bind(binding.operation.id)
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sql_error)?;
+    }
+    tx.commit().await.map_err(map_sql_error)?;
+    Ok(ProvisionedGrokExecutionProfile {
+        execution_profile_id,
+        credential_pool_id,
+        provider_account_id,
+        resource_policy_id,
+        resource_policy_revision,
+    })
 }
 
 pub async fn provision_grok_video_execution_profile_replacement(
@@ -541,6 +613,16 @@ fn dreamina_video_provisioning_binding() -> ProvisioningBinding {
     }
 }
 
+fn grok_video_v2_provisioning_binding() -> ProvisioningBinding {
+    ProvisioningBinding {
+        provider_id: GROK_PROVIDER_ID,
+        command_schema: GROK_VIDEO_GENERATION_COMMAND_SCHEMA_V2,
+        operation: &GROK_VIDEO_GENERATION_OPERATION_V2,
+        adapter_revision: GROK_VIDEO_ADAPTER_REVISION_V2,
+        advisory_lock_key: "factoryctl.provision-grok-video-v2-profile",
+    }
+}
+
 async fn provision_execution_profile(
     pool: &PgPool,
     provisioning: &CodexExecutionProfileProvisioning,
@@ -586,6 +668,7 @@ async fn provision_execution_profile_in_transaction(
         resource_policy_id,
         resource_policy_revision,
         now,
+        false,
     )
     .await?;
     ensure_account_operation(tx, provider_account_id, binding, now).await?;
@@ -837,6 +920,7 @@ async fn ensure_profile(
     resource_policy_id: Uuid,
     resource_policy_revision: i64,
     now: i64,
+    allow_disabled_existing: bool,
 ) -> Result<Uuid, CodexProfileProvisioningError> {
     let operation = binding.operation;
     let operation_descriptor_sha256_v1 = operation.canonical_sha256_v1_hex();
@@ -873,9 +957,21 @@ async fn ensure_profile(
             || existing.credential_revision != provisioning.credential_revision
             || existing.resource_policy_id != resource_policy_id
             || existing.resource_policy_revision != resource_policy_revision
-            || existing.state != "enabled"
+            || (!allow_disabled_existing && existing.state != "enabled")
+            || (allow_disabled_existing
+                && !matches!(existing.state.as_str(), "enabled" | "disabled"))
         {
             return Err(CodexProfileProvisioningError::Conflict);
+        }
+        if allow_disabled_existing && existing.state == "disabled" {
+            sqlx::query(
+                "UPDATE provider_execution_profiles SET state = 'enabled', updated_at_ms = $2 WHERE execution_profile_id = $1",
+            )
+            .bind(existing.execution_profile_id)
+            .bind(now)
+            .execute(&mut **tx)
+            .await
+            .map_err(map_sql_error)?;
         }
         existing.execution_profile_id
     } else {
