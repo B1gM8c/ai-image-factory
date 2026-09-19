@@ -70,8 +70,40 @@ assert_rejected_before_download() {
     echo "fetch downloaded before rejecting ${mutation} lock mutation" >&2
     exit 1
   fi
+  if ! grep -Fxq 'fetch-grok-cli: provider lock is invalid' "${case_root}/stderr"; then
+    echo "expected ${mutation} lock mutation to report provider lock validation failure" >&2
+    cat "${case_root}/stderr" >&2
+    exit 1
+  fi
 }
 
+assert_valid_lock_reaches_download_stub() {
+  local case_root
+  case_root="$(prepare_case valid)"
+  local marker="${case_root}/curl-called"
+  local status=0
+  if PATH="${case_root}/bin:${PATH}" \
+    FETCH_CURL_MARKER="$marker" \
+    "${case_root}/scripts/fetch-grok-cli.sh" \
+    v2 x86_64-unknown-linux-gnu "${case_root}/output/grok" \
+    >"${case_root}/stdout" 2>"${case_root}/stderr"; then
+    echo "expected the download stub to return status 99" >&2
+    exit 1
+  else
+    status=$?
+  fi
+  [[ "$status" -eq 99 ]] || {
+    echo "expected the download stub to return status 99, got ${status}" >&2
+    cat "${case_root}/stderr" >&2
+    exit 1
+  }
+  [[ -e "$marker" ]] || {
+    echo "expected the unchanged V2 lock to reach the download stub" >&2
+    exit 1
+  }
+}
+
+assert_valid_lock_reaches_download_stub
 assert_rejected_before_download version
 assert_rejected_before_download machine
 assert_rejected_before_download url
