@@ -241,6 +241,16 @@ impl XaiVideoGenerationCommandV1 {
 
 impl XaiVideoGenerationCommandV2 {
     pub fn from_request(request: XaiVideoGenerationRequest) -> Result<Self, XaiVideoRequestError> {
+        // The public DTO keeps the official xAI delivery fields for shape
+        // compatibility, but the Grok CLI V2 binding has no delivery adapter.
+        // Reject them before any validation, admission claim, persistence, or
+        // billing can observe a request that the provider cannot honor.
+        if request.output.is_some() {
+            return Err(XaiVideoRequestError::UnsupportedOutput);
+        }
+        if request.storage_options.is_some() {
+            return Err(XaiVideoRequestError::UnsupportedStorageOptions);
+        }
         validate_model(request.model.as_deref())?;
         validate_user(request.user.as_deref())?;
         let prompt = normalize_prompt(request.prompt);
@@ -343,6 +353,10 @@ pub enum XaiVideoRequestError {
     InvalidOutput,
     #[error("xAI video storage options are invalid")]
     InvalidStorageOptions,
+    #[error("xAI video output delivery is not supported by the v2 Grok CLI binding")]
+    UnsupportedOutput,
+    #[error("xAI video storage options are not supported by the v2 Grok CLI binding")]
+    UnsupportedStorageOptions,
     #[error("xAI video generate_audio is not supported by the v1 command")]
     UnsupportedGenerateAudio,
     #[error("xAI video last_frame is not supported by the v1 command")]
@@ -372,6 +386,8 @@ impl XaiVideoRequestError {
             Self::ConflictingInputs => "reference_images",
             Self::InvalidOutput => "output",
             Self::InvalidStorageOptions => "storage_options",
+            Self::UnsupportedOutput => "output",
+            Self::UnsupportedStorageOptions => "storage_options",
             Self::UnsupportedGenerateAudio => "generate_audio",
             Self::UnsupportedLastFrame | Self::InvalidLastFrame => "last_frame",
             Self::UnsupportedReferenceAudios => "reference_audios",
@@ -562,6 +578,51 @@ mod tests {
         let command = XaiVideoGenerationCommandV2::from_request(request).unwrap();
         assert_eq!(command.duration, 8);
         assert_eq!(command.resolution, XaiVideoResolution::P480);
+    }
+
+    #[test]
+    fn v2_rejects_delivery_options_before_projection() {
+        let mut output = v1_text_request();
+        output.output = Some(XaiVideoOutput {
+            upload_url: "https://upload.example/video".to_owned(),
+        });
+        assert_eq!(
+            XaiVideoGenerationCommandV2::from_request(output),
+            Err(XaiVideoRequestError::UnsupportedOutput)
+        );
+        assert_eq!(
+            XaiVideoRequestError::UnsupportedOutput.parameter(),
+            "output"
+        );
+
+        let mut storage = v1_text_request();
+        storage.storage_options = Some(XaiVideoStorageOptions {
+            expires_after: Some(3600),
+            filename: "video.mp4".to_owned(),
+            public_url: None,
+        });
+        assert_eq!(
+            XaiVideoGenerationCommandV2::from_request(storage),
+            Err(XaiVideoRequestError::UnsupportedStorageOptions)
+        );
+        assert_eq!(
+            XaiVideoRequestError::UnsupportedStorageOptions.parameter(),
+            "storage_options"
+        );
+    }
+
+    #[test]
+    fn v1_still_accepts_delivery_options() {
+        let mut request = v1_text_request();
+        request.output = Some(XaiVideoOutput {
+            upload_url: "https://upload.example/video".to_owned(),
+        });
+        request.storage_options = Some(XaiVideoStorageOptions {
+            expires_after: Some(3600),
+            filename: "video.mp4".to_owned(),
+            public_url: None,
+        });
+        assert!(XaiVideoGenerationCommandV1::from_request(request).is_ok());
     }
 
     #[test]
