@@ -656,12 +656,11 @@ fn validate_staged_bindings(
         return Err(XaiGrokVideoProjectionErrorV2::InputManifestMismatch);
     }
     for (reference, image) in references.into_iter().zip(staged) {
-        if let Some(url) = reference.url.as_deref() {
-            if let Some(hash) = url.strip_prefix(STAGED_INPUT_URL_PREFIX) {
-                if hash != image.sha256() {
-                    return Err(XaiGrokVideoProjectionErrorV2::InputManifestMismatch);
-                }
-            }
+        if let Some(url) = reference.url.as_deref()
+            && let Some(hash) = url.strip_prefix(STAGED_INPUT_URL_PREFIX)
+            && hash != image.sha256()
+        {
+            return Err(XaiGrokVideoProjectionErrorV2::InputManifestMismatch);
         }
     }
     Ok(())
