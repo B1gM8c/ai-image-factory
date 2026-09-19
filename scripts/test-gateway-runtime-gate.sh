@@ -20,29 +20,53 @@ mkdir -p \
   "$TEST_ROOT/bin" \
   "$TEST_ROOT/proc/101" \
   "$TEST_ROOT/proc/102" \
+  "$TEST_ROOT/proc/103" \
   "$TEST_ROOT/releases/v1/bin"
 ln -s "$TEST_ROOT/releases/v1" "$TEST_ROOT/current"
 ln -s "$TEST_ROOT/releases/v1/bin/gpt-image-2-gateway" "$TEST_ROOT/proc/101/exe"
 ln -s "$TEST_ROOT/releases/v1/bin/executord" "$TEST_ROOT/proc/102/exe"
 : >"$TEST_ROOT/releases/v1/bin/gpt-image-2-gateway"
-cat >"$TEST_ROOT/releases/v1/bin/grok" <<'EOF'
-#!/bin/sh
-printf 'grok 1.0.5 (5115b46bc9)\n'
+cat >"$TEST_ROOT/releases/v1/release.json" <<'EOF'
+{"schema_version":1,"release_version":"test","commit_sha":"0000000000000000000000000000000000000000000000000000000000000000","target_triple":"aarch64-unknown-linux-gnu"}
 EOF
+python3 - "$TEST_ROOT/releases/v1/bin/grok" "$TEST_ROOT/releases/v1/bin/grok-v1" "$TEST_ROOT/releases/v1/bin/grok-v2" <<'PY'
+import pathlib, struct, sys
+for name, machine in zip(sys.argv[1:], (183, 183, 183)):
+    data = bytearray(64)
+    data[:4] = b'\x7fELF'; data[4] = 2; data[5] = 1
+    struct.pack_into('<H', data, 18, machine)
+    pathlib.Path(name).write_bytes(data)
+PY
 : >"$TEST_ROOT/releases/v1/bin/executord"
-chmod 0755 "$TEST_ROOT/releases/v1/bin/grok"
+: >"$TEST_ROOT/releases/v1/bin/grok-runner"
+chmod 0755 "$TEST_ROOT/releases/v1/bin/grok" "$TEST_ROOT/releases/v1/bin/grok-v1" "$TEST_ROOT/releases/v1/bin/grok-v2" "$TEST_ROOT/releases/v1/bin/grok-runner"
+: >"$TEST_ROOT/releases/v1/bin/codex-runner"
+: >"$TEST_ROOT/releases/v1/bin/codex-cli"
+chmod 0755 "$TEST_ROOT/releases/v1/bin/codex-runner" "$TEST_ROOT/releases/v1/bin/codex-cli"
 grok_sha256="$(sha256_file "$TEST_ROOT/releases/v1/bin/grok")"
+grok_v2_sha256="$(sha256_file "$TEST_ROOT/releases/v1/bin/grok-v2")"
 cat >"$TEST_ROOT/releases/v1/provider-manifest.json" <<EOF
-{"schema_version":1,"provider":"xai-grok-cli","version_output":"grok 1.0.5 (5115b46bc9)","binary_path":"bin/grok","binary_sha256":"${grok_sha256}","compatibility_revision":"grok-cli-1.0.5","image_adapter_revision":"grok-cli-1.0.5.agentic-media.v2","video_adapter_revision":"grok-api-1.0.5.direct-image-video.v5"}
+{"schema_version":1,"provider":"xai-grok-cli","version":"1.0.5","version_output":"grok 1.0.5 (5115b46bc9)","target_triple":"aarch64-unknown-linux-gnu","binary_path":"bin/grok","binary_sha256":"${grok_sha256}","binary_bytes":64,"compatibility_revision":"grok-cli-1.0.5","image_adapter_revision":"grok-cli-1.0.5.agentic-media.v2","video_adapter_revision":"grok-api-1.0.5.direct-image-video.v5","runtimes":{"v1":{"generation":"v1","version":"1.0.5","version_output":"grok 1.0.5 (5115b46bc9)","target_triple":"aarch64-unknown-linux-gnu","binary_path":"bin/grok-v1","binary_sha256":"${grok_sha256}","binary_bytes":64,"elf_machine":183,"compatibility_revision":"grok-cli-1.0.5","image_adapter_revision":"grok-cli-1.0.5.agentic-media.v2","video_adapter_revision":"grok-api-1.0.5.direct-image-video.v5"},"v2":{"generation":"v2","version":"1.0.34","version_output":"grok 1.0.34 (3736acbc8658)","target_triple":"aarch64-unknown-linux-gnu","binary_path":"bin/grok-v2","binary_sha256":"${grok_v2_sha256}","binary_bytes":64,"elf_machine":183,"compatibility_revision":"grok-cli-1.0.34","image_adapter_revision":null,"video_adapter_revision":"grok-cli-1.0.34.agentic-video.v1"}}}
 EOF
-printf 'GATEWAY_MANAGED_GROK_EXECUTABLE=%s\0' \
-  "$TEST_ROOT/releases/v1/bin/grok" >"$TEST_ROOT/proc/102/environ"
+python3 - "$TEST_ROOT/releases/v1/provider-manifest.json" <<'PY'
+import json, sys
+p = sys.argv[1]
+m = json.load(open(p))
+m['source_repository'] = 'https://github.com/xai-org/grok-build'
+json.dump(m, open(p, 'w'))
+PY
+printf 'EXECUTOR_HELPER_EXECUTABLE=%s\0EXECUTOR_GROK_EXECUTABLE=%s\0' \
+  "$TEST_ROOT/releases/v1/bin/grok-runner" "$TEST_ROOT/releases/v1/bin/grok-v1" >"$TEST_ROOT/proc/102/environ"
+ln -s "$TEST_ROOT/releases/v1/bin/codex-runner" "$TEST_ROOT/proc/103/exe"
+printf 'EXECUTOR_HELPER_EXECUTABLE=%s\0EXECUTOR_CODEX_EXECUTABLE=%s\0' \
+  "$TEST_ROOT/releases/v1/bin/codex-runner" "$TEST_ROOT/releases/v1/bin/codex-cli" >"$TEST_ROOT/proc/103/environ"
 
 cat >"$TEST_ROOT/bin/systemctl" <<'EOF'
 #!/bin/bash
 case "$*" in
   "show ai-image-factory-gateway.service --property=MainPID --value") echo "${MOCK_MAIN_PID:-101}" ;;
   "show ai-image-factory-executord@managed.service --property=MainPID --value") echo "${MOCK_EXECUTOR_PID:-102}" ;;
+  "show ai-image-factory-executord@codex.service --property=MainPID --value") echo "103" ;;
   "show gpt-image-2-gateway.service --property=LoadState --value") echo loaded ;;
   "is-enabled --quiet gpt-image-2-gateway.service") [[ "${MOCK_LEGACY_ENABLED:-false}" == true ]] ;;
   "is-active --quiet gpt-image-2-gateway.service") [[ "${MOCK_LEGACY_ACTIVE:-false}" == true ]] ;;
@@ -82,6 +106,80 @@ run_gate() {
 }
 
 run_gate >/dev/null
+
+# Historical schema-1 manifests without runtimes remain accepted.
+cp "$TEST_ROOT/releases/v1/provider-manifest.json" "$TEST_ROOT/provider-manifest.dual.json"
+python3 - "$TEST_ROOT/releases/v1/provider-manifest.json" <<'PY'
+import json, sys
+p = sys.argv[1]
+m = json.load(open(p))
+m.pop('runtimes', None)
+json.dump(m, open(p, 'w'))
+PY
+run_gate AIF_UPDATE_PROCESS_SCOPE=validation AIF_VERIFY_RELEASE_UNITS=ai-image-factory-gateway.service >/dev/null
+cp "$TEST_ROOT/provider-manifest.dual.json" "$TEST_ROOT/releases/v1/provider-manifest.json"
+
+# The actual executord precedence is generic override first; management's
+# GATEWAY_MANAGED_GROK_EXECUTABLE must not influence process binding.
+printf 'EXECUTOR_HELPER_EXECUTABLE=%s\0EXECUTOR_PROVIDER_EXECUTABLE=%s\0EXECUTOR_GROK_EXECUTABLE=%s\0GATEWAY_MANAGED_GROK_EXECUTABLE=/outside\0' \
+  "$TEST_ROOT/releases/v1/bin/grok-runner" "$TEST_ROOT/releases/v1/bin/grok-v2" "$TEST_ROOT/releases/v1/bin/grok-v1" >"$TEST_ROOT/proc/102/environ"
+run_gate >/dev/null
+
+# A Codex executor may coexist with a Grok executor and is not forced onto a
+# Grok binary merely because the release has a managed Grok path.
+run_gate AIF_VERIFY_RELEASE_UNITS=ai-image-factory-gateway.service,ai-image-factory-executord@managed.service,ai-image-factory-executord@codex.service >/dev/null
+
+expect_manifest_reject() {
+  python3 - "$TEST_ROOT/releases/v1/provider-manifest.json" "$1" <<'PY'
+import json, sys
+p, mutation = sys.argv[1:]; m = json.load(open(p))
+if mutation == 'incomplete': m['runtimes'].pop('v2')
+elif mutation == 'crossed': m['runtimes']['v2']['binary_path'] = 'bin/grok-v1'
+elif mutation == 'adapter': m['runtimes']['v2']['video_adapter_revision'] = 'wrong'
+elif mutation == 'target': m['runtimes']['v2']['target_triple'] = 'x86_64-unknown-linux-gnu'
+elif mutation == 'size': m['runtimes']['v1']['binary_bytes'] += 1
+elif mutation == 'hash': m['runtimes']['v2']['binary_sha256'] = '0' * 64
+elif mutation == 'version': m['runtimes']['v2']['version_output'] = 'grok wrong'
+elif mutation == 'top': m['version_output'] = 'grok wrong'
+json.dump(m, open(p, 'w'))
+PY
+  if run_gate >/dev/null 2>&1; then echo "expected manifest mutation ${1} to fail" >&2; exit 1; fi
+  cp "$TEST_ROOT/provider-manifest.dual.json" "$TEST_ROOT/releases/v1/provider-manifest.json"
+}
+for mutation in incomplete crossed adapter target size hash version top; do expect_manifest_reject "$mutation"; done
+cp "$TEST_ROOT/releases/v1/provider-manifest.json" "$TEST_ROOT/provider-manifest.dual.json"
+python3 - "$TEST_ROOT/releases/v1/bin/grok-v2" "$TEST_ROOT/releases/v1/provider-manifest.json" <<'PY'
+import hashlib, json, pathlib, sys
+binary, manifest = sys.argv[1:]
+data = bytearray(pathlib.Path(binary).read_bytes()); data[4] = 1; pathlib.Path(binary).write_bytes(data)
+m = json.load(open(manifest)); m['runtimes']['v2']['binary_sha256'] = hashlib.sha256(data).hexdigest(); json.dump(m, open(manifest, 'w'))
+PY
+if run_gate >/dev/null 2>&1; then echo "expected invalid ELF runtime to fail" >&2; exit 1; fi
+cp "$TEST_ROOT/provider-manifest.dual.json" "$TEST_ROOT/releases/v1/provider-manifest.json"
+python3 - "$TEST_ROOT/releases/v1/bin/grok-v2" <<'PY'
+import pathlib, sys
+p = pathlib.Path(sys.argv[1]); data = bytearray(p.read_bytes()); data[4] = 2; p.write_bytes(data)
+PY
+mv "$TEST_ROOT/releases/v1/bin/grok-v2" "$TEST_ROOT/releases/v1/bin/grok-v2.saved"
+ln -s "$TEST_ROOT/releases/v1/bin/grok-v1" "$TEST_ROOT/releases/v1/bin/grok-v2"
+if run_gate >/dev/null 2>&1; then echo "expected symlink runtime to fail" >&2; exit 1; fi
+rm "$TEST_ROOT/releases/v1/bin/grok-v2"; mv "$TEST_ROOT/releases/v1/bin/grok-v2.saved" "$TEST_ROOT/releases/v1/bin/grok-v2"
+ln "$TEST_ROOT/releases/v1/bin/grok-v2" "$TEST_ROOT/releases/v1/bin/grok-v2.hardlink"
+if run_gate >/dev/null 2>&1; then echo "expected hardlink runtime to fail" >&2; exit 1; fi
+rm "$TEST_ROOT/releases/v1/bin/grok-v2.hardlink"
+
+printf 'EXECUTOR_HELPER_EXECUTABLE=%s\0EXECUTOR_GROK_EXECUTABLE=%s\0' \
+  "$TEST_ROOT/releases/v1/bin/codex-runner" "$TEST_ROOT/releases/v1/bin/grok-v1" >"$TEST_ROOT/proc/102/environ"
+ : >"$TEST_ROOT/releases/v1/bin/unknown-runner"
+chmod 0755 "$TEST_ROOT/releases/v1/bin/unknown-runner"
+printf 'EXECUTOR_HELPER_EXECUTABLE=%s\0EXECUTOR_GROK_EXECUTABLE=%s\0' \
+  "$TEST_ROOT/releases/v1/bin/unknown-runner" "$TEST_ROOT/releases/v1/bin/grok-v1" >"$TEST_ROOT/proc/102/environ"
+if run_gate >/dev/null 2>&1; then
+  echo "expected unknown helper classification to fail" >&2
+  exit 1
+fi
+printf 'EXECUTOR_HELPER_EXECUTABLE=%s\0EXECUTOR_GROK_EXECUTABLE=%s\0' \
+  "$TEST_ROOT/releases/v1/bin/grok-runner" "$TEST_ROOT/releases/v1/bin/grok-v1" >"$TEST_ROOT/proc/102/environ"
 
 run_gate \
   AIF_UPDATE_PROCESS_SCOPE=validation \

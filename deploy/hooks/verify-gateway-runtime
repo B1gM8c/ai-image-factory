@@ -56,40 +56,104 @@ case "$gateway_exe" in
 esac
 
 provider_manifest="${release_root}/${PROVIDER_MANIFEST_NAME}"
-provider_executable="$(readlink -f "${release_root}/bin/grok")"
 [[ -f "$provider_manifest" && ! -L "$provider_manifest" ]] \
   || die "Grok provider manifest is missing from the current release"
-[[ "$provider_executable" == "${release_root}/bin/grok" && -x "$provider_executable" ]] \
-  || die "Grok provider executable is outside the current release"
+release_identity="${release_root}/release.json"
+[[ -f "$release_identity" && ! -L "$release_identity" ]] \
+  || die "release identity is missing from the current release"
 provider_fields="$(
-  env PROVIDER_MANIFEST="$provider_manifest" python3 <<'PY'
+  env PROVIDER_MANIFEST="$provider_manifest" RELEASE_IDENTITY="$release_identity" python3 <<'PY'
 import json
 import os
 import re
+import stat
+import struct
+import hashlib
 
 with open(os.environ["PROVIDER_MANIFEST"], "r", encoding="utf-8") as handle:
     manifest = json.load(handle)
-if (
-    manifest.get("schema_version") != 1
-    or manifest.get("provider") != "xai-grok-cli"
-    or manifest.get("binary_path") != "bin/grok"
-    or not re.fullmatch(r"[0-9a-f]{64}", str(manifest.get("binary_sha256", "")))
-    or not re.fullmatch(r"grok 1\.0\.5 \([0-9a-f]+\)", str(manifest.get("version_output", "")))
-    or manifest.get("compatibility_revision") != "grok-cli-1.0.5"
-    or manifest.get("image_adapter_revision") != "grok-cli-1.0.5.agentic-media.v2"
-    or manifest.get("video_adapter_revision") != "grok-api-1.0.5.direct-image-video.v5"
-):
-    raise SystemExit("invalid provider manifest")
-print(manifest["binary_sha256"])
-print(manifest["version_output"])
+with open(os.environ["RELEASE_IDENTITY"], "r", encoding="utf-8") as handle:
+    identity = json.load(handle)
+if identity.get("schema_version") != 1:
+    raise SystemExit("invalid release identity")
+target = identity.get("target_triple")
+machines = {"x86_64-unknown-linux-gnu": 62, "aarch64-unknown-linux-gnu": 183}
+if target not in machines or manifest.get("schema_version") != 1 or manifest.get("provider") != "xai-grok-cli":
+    raise SystemExit("invalid provider manifest identity")
+root = os.path.dirname(os.environ["PROVIDER_MANIFEST"])
+required = {"generation", "version", "version_output", "target_triple", "binary_path", "binary_sha256", "binary_bytes", "elf_machine", "compatibility_revision", "image_adapter_revision", "video_adapter_revision"}
+def check(generation, entry, expected_path):
+    if not isinstance(entry, dict) or set(entry) != required or entry.get("generation") != generation or entry.get("binary_path") != expected_path:
+        raise SystemExit(f"incomplete {generation} runtime manifest")
+    if entry.get("target_triple") != target or entry.get("elf_machine") != machines[target]:
+        raise SystemExit(f"{generation} target mismatch")
+    expected = {
+        "v1": ("1.0.5", "grok 1.0.5 (5115b46bc9)", "grok-cli-1.0.5", "grok-cli-1.0.5.agentic-media.v2", "grok-api-1.0.5.direct-image-video.v5"),
+        "v2": ("1.0.34", "grok 1.0.34 (3736acbc8658)", "grok-cli-1.0.34", None, "grok-cli-1.0.34.agentic-video.v1"),
+    }[generation]
+    if tuple(entry.get(k) for k in ("version", "version_output", "compatibility_revision", "image_adapter_revision", "video_adapter_revision")) != expected:
+        raise SystemExit(f"{generation} runtime version/adapter metadata mismatch")
+    digest, size = entry.get("binary_sha256"), entry.get("binary_bytes")
+    if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest) or not isinstance(size, int) or size <= 0:
+        raise SystemExit(f"invalid {generation} digest/size")
+    path = os.path.join(root, expected_path)
+    try:
+        st = os.lstat(path); data = open(path, "rb").read()
+    except OSError:
+        raise SystemExit(f"missing {generation} runtime")
+    if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1 or not st.st_mode & 0o111:
+        raise SystemExit(f"{generation} runtime is not a regular executable")
+    if len(data) != size or hashlib.sha256(data).hexdigest() != digest:
+        raise SystemExit(f"{generation} runtime identity mismatch")
+    if len(data) < 20 or data[:4] != b"\x7fELF" or data[4] != 2 or data[5] != 1 or struct.unpack_from("<H", data, 18)[0] != machines[target]:
+        raise SystemExit(f"{generation} runtime is not target ELF64 LE")
+    return entry
+runtimes = manifest.get("runtimes")
+if runtimes is None:
+    if manifest.get("binary_path") != "bin/grok":
+        raise SystemExit("legacy provider manifest path mismatch")
+    path = os.path.join(root, "bin/grok")
+    size = os.stat(path).st_size
+    entry = {"generation": "v1", "version": manifest.get("version", "1.0.5"), "version_output": manifest.get("version_output"), "target_triple": target, "binary_path": "bin/grok", "binary_sha256": manifest.get("binary_sha256"), "binary_bytes": manifest.get("binary_bytes") or size, "elf_machine": machines[target], "compatibility_revision": manifest.get("compatibility_revision"), "image_adapter_revision": manifest.get("image_adapter_revision"), "video_adapter_revision": manifest.get("video_adapter_revision")}
+    check("v1", entry, "bin/grok")
+    if (manifest.get("provider") != "xai-grok-cli" or manifest.get("source_repository") != "https://github.com/xai-org/grok-build"
+            or not isinstance(entry["version_output"], str)):
+        raise SystemExit("invalid legacy version output")
+    print("legacy|v1|bin/grok|" + entry["binary_sha256"] + "|" + entry["version_output"])
+else:
+    if not isinstance(runtimes, dict) or set(runtimes) != {"v1", "v2"}:
+        raise SystemExit("dual provider manifest must contain exactly v1 and v2")
+    v1, v2 = check("v1", runtimes["v1"], "bin/grok-v1"), check("v2", runtimes["v2"], "bin/grok-v2")
+    if manifest.get("binary_path") != "bin/grok":
+        raise SystemExit("dual compatibility path mismatch")
+    compat = os.path.join(root, "bin/grok")
+    st, data = os.lstat(compat), open(compat, "rb").read()
+    if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1 or not st.st_mode & 0o111 or len(data) != v1["binary_bytes"] or hashlib.sha256(data).hexdigest() != v1["binary_sha256"]:
+        raise SystemExit("compatibility copy differs from V1")
+    if manifest.get("binary_sha256") != v1["binary_sha256"] or manifest.get("binary_bytes") != v1["binary_bytes"]:
+        raise SystemExit("top-level identity differs from V1")
+    for key in ("version", "version_output", "target_triple", "compatibility_revision", "image_adapter_revision", "video_adapter_revision"):
+        if manifest.get(key) != v1.get(key):
+            raise SystemExit(f"top-level V1 identity differs for {key}")
+    if manifest.get("source_repository") != "https://github.com/xai-org/grok-build":
+        raise SystemExit("dual provider source repository mismatch")
+    for entry in (v1, v2):
+        print("dual|" + entry["generation"] + "|" + entry["binary_path"] + "|" + entry["binary_sha256"] + "|" + entry["version_output"])
+    print("dual|compat|bin/grok|" + v1["binary_sha256"] + "|" + v1["version_output"])
 PY
 )" || die "Grok provider manifest is invalid"
-provider_sha256="$(printf '%s\n' "$provider_fields" | sed -n '1p')"
-provider_version="$(printf '%s\n' "$provider_fields" | sed -n '2p')"
-[[ "$(sha256sum "$provider_executable" | awk '{print $1}')" == "$provider_sha256" ]] \
-  || die "Grok provider executable digest differs from the release manifest"
-[[ "$($provider_executable --version)" == "$provider_version" ]] \
-  || die "Grok provider executable version differs from the release manifest"
+target_triple="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["target_triple"])' "$release_identity")"
+target_arch="${target_triple%%-*}"
+version_checks=false
+[[ "$(uname -s)" == Linux && "$(uname -m)" == "$target_arch" ]] && version_checks=true
+while IFS='|' read -r mode generation binary_path expected_sha expected_version; do
+  [[ -n "$mode" ]] || continue
+  binary_executable="${release_root}/${binary_path}"
+  [[ "$(sha256sum "$binary_executable" | awk '{print $1}')" == "$expected_sha" ]] || die "${generation} Grok provider executable digest differs from the release manifest"
+  if [[ "$version_checks" == true ]]; then
+    [[ "$($binary_executable --version)" == "$expected_version" ]] || die "${generation} Grok provider executable version differs from the release manifest"
+  fi
+done <<< "$provider_fields"
 
 provider_binding_count=0
 while IFS= read -r release_unit; do
@@ -106,20 +170,41 @@ while IFS= read -r release_unit; do
   esac
   case "$release_unit" in
     ai-image-factory-executord@*.service)
-      managed_provider="$(
-        tr '\0' '\n' <"${PROC_ROOT}/${unit_pid}/environ" \
-          | sed -n 's/^GATEWAY_MANAGED_GROK_EXECUTABLE=//p'
-      )"
-      fallback_provider="$(
-        tr '\0' '\n' <"${PROC_ROOT}/${unit_pid}/environ" \
-          | sed -n 's/^EXECUTOR_GROK_EXECUTABLE=//p'
-      )"
-      configured_provider="${managed_provider:-${fallback_provider}}"
-      [[ -n "$configured_provider" ]] \
-        || die "executor PID does not expose its Grok provider binding: ${release_unit}"
-      [[ "$(readlink -f "$configured_provider")" == "$provider_executable" ]] \
-        || die "executor PID is not bound to the current release Grok provider: ${release_unit}"
-      provider_binding_count=$((provider_binding_count + 1))
+      env_file="${PROC_ROOT}/${unit_pid}/environ"
+      [[ -r "$env_file" ]] || die "executor PID environment is unavailable: ${release_unit}"
+      env_lines="$(tr '\0' '\n' <"$env_file")"
+      helper="$(printf '%s\n' "$env_lines" | sed -n 's/^EXECUTOR_HELPER_EXECUTABLE=//p' | head -n1)"
+      [[ -n "$helper" ]] || die "executor helper is missing: ${release_unit}"
+      helper_path="$(readlink -f "$helper")"
+      case "$helper_path" in
+        "${release_root}"/*) ;;
+        *) die "executor helper is outside the current release: ${release_unit}" ;;
+      esac
+      case "$(basename "$helper_path")" in
+        grok-runner) executor_kind=grok ;;
+        codex-runner) executor_kind=codex ;;
+        *) die "unknown executor helper: ${release_unit}" ;;
+      esac
+      if printf '%s\n' "$env_lines" | grep -q '^EXECUTOR_PROVIDER_EXECUTABLE='; then
+        configured_provider="$(printf '%s\n' "$env_lines" | sed -n 's/^EXECUTOR_PROVIDER_EXECUTABLE=//p' | head -n1)"
+      elif [[ "$executor_kind" == grok ]]; then
+        configured_provider="$(printf '%s\n' "$env_lines" | sed -n 's/^EXECUTOR_GROK_EXECUTABLE=//p' | head -n1)"
+      else
+        configured_provider="$(printf '%s\n' "$env_lines" | sed -n 's/^EXECUTOR_CODEX_EXECUTABLE=//p' | head -n1)"
+      fi
+      [[ -n "$configured_provider" ]] || die "executor provider executable is missing: ${release_unit}"
+      provider_path="$(readlink -f "$configured_provider")"
+      case "$provider_path" in
+        "${release_root}"/*) ;;
+        *) die "executor provider executable is outside current release: ${release_unit}" ;;
+      esac
+      if [[ "$executor_kind" == grok ]]; then
+        case "$provider_path" in
+          "${release_root}/bin/grok"|"${release_root}/bin/grok-v1"|"${release_root}/bin/grok-v2") ;;
+          *) die "Grok executor is not bound to a manifest runtime: ${release_unit}" ;;
+        esac
+        provider_binding_count=$((provider_binding_count + 1))
+      fi
       ;;
   esac
 done < <(printf '%s\n' "$RELEASE_UNITS" | tr ',' '\n')
