@@ -3,7 +3,7 @@ use std::{sync::Arc, time::Duration};
 use image_provider_dreamina_cli::DREAMINA_SUBMIT_COMMAND_SCHEMA;
 use image_provider_grok_cli::{
     GROK_IMAGE_EDIT_COMMAND_SCHEMA, GROK_IMAGE_GENERATION_COMMAND_SCHEMA,
-    GROK_VIDEO_GENERATION_COMMAND_SCHEMA,
+    GROK_VIDEO_GENERATION_COMMAND_SCHEMA, GROK_VIDEO_GENERATION_COMMAND_SCHEMA_V2,
 };
 use uuid::Uuid;
 
@@ -236,10 +236,7 @@ impl Workerd {
         };
         match lease.command_schema.as_str() {
             GENERATION_COMMAND_SCHEMA => self.execute_generation(&lease).await?,
-            GROK_IMAGE_GENERATION_COMMAND_SCHEMA
-            | GROK_IMAGE_EDIT_COMMAND_SCHEMA
-            | GROK_VIDEO_GENERATION_COMMAND_SCHEMA
-            | DREAMINA_SUBMIT_COMMAND_SCHEMA => self.handoff_generation(&lease).await?,
+            schema if is_handoff_schema(schema) => self.handoff_generation(&lease).await?,
             EDIT_COMMAND_SCHEMA => self.execute_edit(&lease).await?,
             _ => {
                 return Err(ImageGatewayError::internal(
@@ -386,6 +383,32 @@ impl Workerd {
             .await
             .map(drop)
             .map_err(map_handoff_error)
+    }
+}
+
+fn is_handoff_schema(schema: &str) -> bool {
+    matches!(
+        schema,
+        GROK_IMAGE_GENERATION_COMMAND_SCHEMA
+            | GROK_IMAGE_EDIT_COMMAND_SCHEMA
+            | GROK_VIDEO_GENERATION_COMMAND_SCHEMA
+            | GROK_VIDEO_GENERATION_COMMAND_SCHEMA_V2
+            | DREAMINA_SUBMIT_COMMAND_SCHEMA
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        GROK_VIDEO_GENERATION_COMMAND_SCHEMA, GROK_VIDEO_GENERATION_COMMAND_SCHEMA_V2,
+        is_handoff_schema,
+    };
+
+    #[test]
+    fn v2_video_handoff_is_explicit_and_unknown_schemas_are_rejected() {
+        assert!(is_handoff_schema(GROK_VIDEO_GENERATION_COMMAND_SCHEMA_V2));
+        assert!(is_handoff_schema(GROK_VIDEO_GENERATION_COMMAND_SCHEMA));
+        assert!(!is_handoff_schema("grok-cli.videos.generate.v3"));
     }
 }
 
