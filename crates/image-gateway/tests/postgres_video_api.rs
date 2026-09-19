@@ -841,13 +841,15 @@ async fn xai_video_v2_migration_stays_disabled_then_claims_exactly() -> TestResu
             crossed_v2.run_once().await.map_err(debug_error)?.is_none(),
             "crossed V2 schema/V1 profile workerd claimed the V2 job",
         )?;
-        let pending: (String, i64, i64) = sqlx::query_as(
+        let pending: (String, i64, i64, i64) = sqlx::query_as(
             r#"SELECT work.state,
                       (SELECT COUNT(*) FROM provider_submissions WHERE job_id = work.job_id),
                       (SELECT COUNT(*) FROM executor_executions execution
                        JOIN provider_submissions submission
                          ON submission.submission_id = execution.submission_id
-                       WHERE submission.job_id = work.job_id)
+                       WHERE submission.job_id = work.job_id),
+                      (SELECT COUNT(*) FROM job_attempts attempt
+                       WHERE attempt.work_item_id = work.work_item_id)
                FROM work_items work WHERE work.job_id = $1"#,
         )
         .bind(job_id)
@@ -855,7 +857,7 @@ async fn xai_video_v2_migration_stays_disabled_then_claims_exactly() -> TestResu
         .await
         .map_err(debug_error)?;
         require(
-            pending == ("ready".to_owned(), 0, 0),
+            pending == ("ready".to_owned(), 0, 0, 0),
             format!("crossed profile claim changed V2 work: {pending:?}"),
         )?;
         let workerd = Workerd::new_handoff_only_with_contract(
@@ -1051,108 +1053,169 @@ async fn xai_video_v2_wrong_descriptor_revision_is_not_reconciled() -> TestResul
         .fetch_one(&database.pool)
         .await
         .map_err(debug_error)?;
-        let wrong_policy: Uuid = sqlx::query_scalar(
-            "SELECT resource_policy_id FROM provider_execution_profiles WHERE execution_profile_id = $1",
-        )
-        .bind(v2_profile)
-        .fetch_one(&database.pool)
-        .await
-        .map_err(debug_error)?;
-        sqlx::query(
-            "INSERT INTO executor_resource_policies
-             (resource_policy_id, revision, credential_pool_id, provider_account_id, provider_id,
-              execution_class, max_concurrency, allocated_count, state, created_at_ms)
-             SELECT resource_policy_id, 2, credential_pool_id, provider_account_id, provider_id,
-                    execution_class, max_concurrency, 0, 'disabled', $2
-             FROM executor_resource_policies
-             WHERE resource_policy_id = $1 AND revision = 1",
-        )
-        .bind(wrong_policy)
-        .bind(now)
-        .execute(&database.pool)
-        .await
-        .map_err(debug_error)?;
-        let wrong_profile = Uuid::new_v4();
-        let wrong_key = format!("grok.v2.wrong-revision.{}", wrong_profile.simple());
-        sqlx::query(
-            "INSERT INTO provider_execution_profiles
-             (execution_profile_id, profile_key, provider_id, command_schema, adapter_revision,
-              credential_pool_id, provider_account_id, credential_ref, credential_revision,
-              resource_policy_id, resource_policy_revision, state, created_at_ms, updated_at_ms,
-              operation_id, operation_descriptor_revision, operation_descriptor_sha256_v1,
-              completion_mode, idempotency_mode)
-             SELECT $1, $2, provider_id, command_schema, adapter_revision,
-                    credential_pool_id, provider_account_id, credential_ref, credential_revision,
-                    resource_policy_id, 2, 'enabled', $3, $3,
-                    operation_id, 'grok-cli/videos.generations/v1', $4, completion_mode,
-                    idempotency_mode
-             FROM provider_execution_profiles WHERE execution_profile_id = $5",
-        )
-        .bind(wrong_profile)
-        .bind(&wrong_key)
-        .bind(now)
-        .bind(GROK_VIDEO_GENERATION_OPERATION_V2.canonical_sha256_v1_hex())
-        .bind(v2_profile)
-        .execute(&database.pool)
-        .await
-        .map_err(debug_error)?;
-        let wrong_route = Uuid::new_v4();
-        sqlx::query(
-            "INSERT INTO provider_routes
-             (route_id, revision, route_key, display_name, provider_id, operation_id,
-              command_schema, route_kind, selection_strategy, state, created_at_ms,
-              quota_freshness_ms, unknown_quota_policy)
-             SELECT $1, 1, $2, display_name, provider_id, operation_id, command_schema,
-                    route_kind, selection_strategy, 'enabled', $3, quota_freshness_ms,
-                    unknown_quota_policy
-             FROM provider_routes WHERE route_id = $4 AND revision = 1",
-        )
-        .bind(wrong_route)
-        .bind(format!("wrong-revision-{wrong_route}"))
-        .bind(now)
-        .bind(v2_route)
-        .execute(&database.pool)
-        .await
-        .map_err(debug_error)?;
-        sqlx::query(
-            "INSERT INTO provider_route_heads
-             (route_id, route_key, provider_id, operation_id, command_schema, route_kind,
-              current_revision, state, created_at_ms, updated_at_ms)
-             SELECT $1, route_key, provider_id, operation_id, command_schema, route_kind,
-                    1, 'enabled', $2, $2
-             FROM provider_routes WHERE route_id = $1 AND revision = 1",
-        )
-        .bind(wrong_route)
-        .bind(now)
-        .execute(&database.pool)
-        .await
-        .map_err(debug_error)?;
-        sqlx::query(
-            "INSERT INTO provider_route_members
-             (route_id, route_revision, provider_id, operation_id, command_schema,
-              provider_account_id, execution_profile_id, priority, weight, state,
-              created_at_ms, minimum_remaining_percent)
-             SELECT $1, 1, provider_id, operation_id, command_schema, provider_account_id,
-                    $2, priority, weight, 'enabled', $3, minimum_remaining_percent
-             FROM provider_route_members WHERE route_id = $4 AND route_revision = 1",
-        )
-        .bind(wrong_route)
-        .bind(wrong_profile)
-        .bind(now)
-        .bind(v2_route)
-        .execute(&database.pool)
-        .await
-        .map_err(debug_error)?;
-        let report = reconcile_execution_profile_routes(&database.pool)
+        let exact_hash = GROK_VIDEO_GENERATION_OPERATION_V2.canonical_sha256_v1_hex();
+        let exact_descriptor = GROK_VIDEO_GENERATION_OPERATION_V2.descriptor_revision;
+        let exact_adapter = VIDEO_ADAPTER_REVISION_V2;
+        let cases = [
+            (
+                "descriptor revision",
+                "grok-cli/videos.generations/v1".to_owned(),
+                exact_hash.clone(),
+                exact_adapter.to_owned(),
+            ),
+            (
+                "descriptor hash",
+                exact_descriptor.to_owned(),
+                "0".repeat(64),
+                exact_adapter.to_owned(),
+            ),
+            (
+                "adapter revision",
+                exact_descriptor.to_owned(),
+                exact_hash,
+                "grok-cli-1.0.34.agentic-video.v0".to_owned(),
+            ),
+        ];
+        for (index, (label, descriptor, hash, adapter)) in cases.into_iter().enumerate() {
+            let wrong_profile = insert_v2_reconciliation_negative(
+                &database.pool,
+                v2_profile,
+                v2_route,
+                now,
+                (index + 2) as i64,
+                &descriptor,
+                &hash,
+                &adapter,
+            )
+            .await?;
+            let report = reconcile_execution_profile_routes(&database.pool)
+                .await
+                .map_err(debug_error)?;
+            let selected: Uuid = sqlx::query_scalar(
+                "SELECT execution_profile_id FROM provider_route_members
+                 WHERE execution_profile_id = $1",
+            )
+            .bind(wrong_profile)
+            .fetch_one(&database.pool)
             .await
             .map_err(debug_error)?;
-        require(
-            report.unresolved_routes >= 1,
-            format!("wrong descriptor revision was reconciled: {report:?}"),
-        )
+            require(
+                selected == wrong_profile && report.unresolved_routes >= 1,
+                format!("wrong {label} was reconciled: {report:?} profile={selected}"),
+            )?;
+        }
+        Ok(())
     }
     .await;
     combine(result, database.cleanup().await)
+}
+
+async fn insert_v2_reconciliation_negative(
+    pool: &PgPool,
+    exact_profile: Uuid,
+    exact_route: Uuid,
+    now: i64,
+    policy_revision: i64,
+    descriptor_revision: &str,
+    descriptor_hash: &str,
+    adapter_revision: &str,
+) -> TestResult<Uuid> {
+    let policy_id: Uuid = sqlx::query_scalar(
+        "SELECT resource_policy_id FROM provider_execution_profiles
+         WHERE execution_profile_id = $1",
+    )
+    .bind(exact_profile)
+    .fetch_one(pool)
+    .await
+    .map_err(debug_error)?;
+    sqlx::query(
+        "INSERT INTO executor_resource_policies
+         (resource_policy_id, revision, credential_pool_id, provider_account_id, provider_id,
+          execution_class, max_concurrency, allocated_count, state, created_at_ms)
+         SELECT resource_policy_id, $2, credential_pool_id, provider_account_id, provider_id,
+                execution_class, max_concurrency, 0, 'disabled', $3
+         FROM executor_resource_policies WHERE resource_policy_id = $1 AND revision = 1",
+    )
+    .bind(policy_id)
+    .bind(policy_revision)
+    .bind(now)
+    .execute(pool)
+    .await
+    .map_err(debug_error)?;
+    let wrong_profile = Uuid::new_v4();
+    let wrong_key = format!("grok.v2.wrong-binding.{}", wrong_profile.simple());
+    sqlx::query(
+        "INSERT INTO provider_execution_profiles
+         (execution_profile_id, profile_key, provider_id, command_schema, adapter_revision,
+          credential_pool_id, provider_account_id, credential_ref, credential_revision,
+          resource_policy_id, resource_policy_revision, state, created_at_ms, updated_at_ms,
+          operation_id, operation_descriptor_revision, operation_descriptor_sha256_v1,
+          completion_mode, idempotency_mode)
+         SELECT $1, $2, provider_id, command_schema, $3,
+                credential_pool_id, provider_account_id, credential_ref, credential_revision,
+                resource_policy_id, $4, 'enabled', $5, $5,
+                operation_id, $6, $7, completion_mode, idempotency_mode
+         FROM provider_execution_profiles WHERE execution_profile_id = $8",
+    )
+    .bind(wrong_profile)
+    .bind(&wrong_key)
+    .bind(adapter_revision)
+    .bind(policy_revision)
+    .bind(now)
+    .bind(descriptor_revision)
+    .bind(descriptor_hash)
+    .bind(exact_profile)
+    .execute(pool)
+    .await
+    .map_err(debug_error)?;
+    let wrong_route = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO provider_routes
+         (route_id, revision, route_key, display_name, provider_id, operation_id,
+          command_schema, route_kind, selection_strategy, state, created_at_ms,
+          quota_freshness_ms, unknown_quota_policy)
+         SELECT $1, 1, $2, display_name, provider_id, operation_id, command_schema,
+                route_kind, selection_strategy, 'enabled', $3, quota_freshness_ms,
+                unknown_quota_policy
+         FROM provider_routes WHERE route_id = $4 AND revision = 1",
+    )
+    .bind(wrong_route)
+    .bind(format!("wrong-binding-{wrong_route}"))
+    .bind(now)
+    .bind(exact_route)
+    .execute(pool)
+    .await
+    .map_err(debug_error)?;
+    sqlx::query(
+        "INSERT INTO provider_route_heads
+         (route_id, route_key, provider_id, operation_id, command_schema, route_kind,
+          current_revision, state, created_at_ms, updated_at_ms)
+         SELECT $1, route_key, provider_id, operation_id, command_schema, route_kind,
+                1, 'enabled', $2, $2
+         FROM provider_routes WHERE route_id = $1 AND revision = 1",
+    )
+    .bind(wrong_route)
+    .bind(now)
+    .execute(pool)
+    .await
+    .map_err(debug_error)?;
+    sqlx::query(
+        "INSERT INTO provider_route_members
+         (route_id, route_revision, provider_id, operation_id, command_schema,
+          provider_account_id, execution_profile_id, priority, weight, state,
+          created_at_ms, minimum_remaining_percent)
+         SELECT $1, 1, provider_id, operation_id, command_schema, provider_account_id,
+                $2, priority, weight, 'enabled', $3, minimum_remaining_percent
+         FROM provider_route_members WHERE route_id = $4 AND route_revision = 1",
+    )
+    .bind(wrong_route)
+    .bind(wrong_profile)
+    .bind(now)
+    .bind(exact_route)
+    .execute(pool)
+    .await
+    .map_err(debug_error)?;
+    Ok(wrong_profile)
 }
 
 async fn assert_project_video_isolation(
@@ -1797,6 +1860,16 @@ async fn assert_v2_billing(pool: &PgPool, job_id: Uuid, tenant_id: &str) -> Test
     require(
         quota == (DURATION_SECONDS, 0, "committed".to_owned()),
         format!("V2 video quota did not commit once: {quota:?}"),
+    )?;
+    let quota_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM quota_reservations WHERE job_id = $1")
+            .bind(job_id)
+            .fetch_one(pool)
+            .await
+            .map_err(debug_error)?;
+    require(
+        quota_count == 1,
+        format!("V2 replay created duplicate quota reservations: {quota_count}"),
     )?;
     let rating: Vec<(String, i64, i64)> = sqlx::query_as(
         r#"
