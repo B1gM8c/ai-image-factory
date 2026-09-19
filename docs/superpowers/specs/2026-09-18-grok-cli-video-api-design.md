@@ -65,7 +65,13 @@ Extend the current `XaiVideoGenerationRequest` with only published generation fi
 }
 ```
 
-Existing official fields such as `output`, `storage_options`, `user`, URL/data-URI inputs, and the `input_reference` alias keep their current behavior. `file_id` remains represented but fails closed until the Factory has a verified xAI Files API fetch binding.
+The DTO retains official fields such as `output`, `storage_options`, `user`,
+URL/data-URI inputs, and the `input_reference` alias for wire-shape
+compatibility. The Grok CLI V2 binding rejects `output` and `storage_options`
+with HTTP 400 before admission because it has no remote delivery adapter.
+Image inputs may be base64 data URLs or bounded public HTTPS URLs (no redirects
+or private-address resolution). `file_id` remains represented but is rejected
+before admission until the Factory has a verified xAI Files API fetch binding.
 
 The DTO also represents `generate_audio`, because it is a published field, but the CLI projection accepts only omitted or `true`. `false` returns the existing xAI-shaped invalid-request response with `param=generate_audio`. Reference-audio entries accept `voice_id`; caller-supplied audio `url` entries fail with `param=reference_audios` because the live CLI tool exposes preset voices rather than arbitrary audio clips.
 
@@ -87,6 +93,7 @@ Validation runs before remote image fetching and before durable side effects:
 - each audio specifies exactly one of `voice_id` or `url`, followed by the CLI-binding rejection of `url`;
 - voice IDs are trimmed, bounded, and compared case-insensitively while preserving the original value in the canonical command;
 - 1080p, `generate_audio=false`, edit, and extension fail closed;
+- V2 `output` and `storage_options` fail closed with HTTP 400 before admission;
 - image-to-video rejects explicit `aspect_ratio` if the CLI would ignore it;
 - all source images are fetched once, size/type bounded, digest sealed, and staged before admission completes;
 - a CLI capability mismatch produces a stable public parameter error, never a silent downgrade.

@@ -188,12 +188,15 @@ executord leases has effective capacity zero and must not be reported as ready.
 Run one low-cost canary through each explicitly enabled public API and one
 through Batch. For the Grok V2 video canary, use an admitted image-to-video
 request with `generate_audio` omitted or `true`, `resolution=480p`, and a
-6-second duration. Verify that the response is an asynchronous Factory job,
+6-second duration. Input images may be base64 data URLs or bounded public HTTPS
+URLs; redirects, private-address resolution, and malformed image signatures
+must fail closed. Verify that the response is an asynchronous Factory job,
 the final MP4 is private and hash-validated, the quote/ledger uses six
 `video_second` units, and repeating the same idempotency key does not create a
 second job or charge. Also prove `generate_audio=false`, `1080p`, URL audio,
-`file_id`, more than seven reference images, and more than three voice IDs are
-rejected before scheduling. The Batch canary must prove:
+`file_id`, `output`, `storage_options`, more than seven reference images, and
+more than three voice IDs are rejected with HTTP 400 before scheduling. The
+Batch canary must prove:
 
 - one input line creates one job, one work item, and one provider submission;
 - the quote records `processing_mode=batch`;
@@ -278,11 +281,15 @@ not generated media bytes.
 Migrations are immutable. Do not edit an applied migration or attempt ad hoc
 down-migration SQL during an incident.
 
-If only the V2 canary is unhealthy, close the xAI video route, stop the V2
-executor instance, and leave the V1 replay executor untouched. A V2 rollback is
-complete only after `verify-gateway-runtime` proves the selected V1/V2 paths and
-the public route remains disabled. Do not solve a V2 failure by replacing the
-shared `bin/grok` compatibility executable.
+If only the V2 canary is unhealthy, first disable new V2 admission/binding while
+keeping the compatible V2 executor, worker, reducer, and any poller components
+running. Drain pending and running V2 work, then allow attach, replay, terminal
+reduction, and settlement to complete. Only after those queues and leases are
+empty may the V2 executor/poller be stopped; leave the V1 replay executor
+untouched. A V2 rollback is complete only after
+`verify-gateway-runtime` proves the selected V1/V2 paths and the public route
+remains disabled. Do not solve a V2 failure by replacing the shared `bin/grok`
+compatibility executable.
 
 The updater intentionally rejects a downgrade after an Apply has committed.
 Do not perform an ad hoc in-place rollback by separately restoring PostgreSQL,

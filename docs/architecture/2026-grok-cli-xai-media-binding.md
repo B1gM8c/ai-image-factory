@@ -64,8 +64,10 @@ inputs, `reference_audios` may contain only CLI-supported `voice_id` values (at
 most three; URL audio is not in the intersection), and `resolution` is only
 `480p` or `720p`. Text-to-video and image-to-video accept only 6 or 10 seconds;
 reference-to-video accepts 1-15 seconds. `file_id`, video edit, video extension,
-and any output/storage option that the CLI cannot honor fail closed before
-execution. Fields are never silently dropped or approximated.
+`output`, and `storage_options` fail closed with HTTP 400 before admission. The
+official DTO retains those fields for wire-shape compatibility, but the V2 CLI
+binding does not execute them. Fields are never silently dropped or
+approximated.
 
 The CLI supports no `/v1/videos/edits` or `/v1/videos/extensions` operation.
 Those official xAI routes remain outside this binding and are not advertised by
@@ -161,9 +163,11 @@ xAI source command as well as `source_command_sha256`. Admission reparses that
 source, recomputes its hash, reprojects it into the Grok request, and requires
 an exact field-for-field match before the work item can be attached. Supported
 facade-only fields such as `user` therefore survive restart; unsupported
-official fields never reach the queue. Video data URLs are decoded and sealed
-before attachment; durable command JSON stores only staged SHA-256 references,
-while the original source-command hash remains the idempotency binding.
+official fields never reach the queue. Video base64 data URLs and bounded public
+HTTPS image URLs are fetched with no redirects and no private-address
+resolution, then decoded and sealed before attachment; durable command JSON
+stores only staged SHA-256 references, while the original source-command hash
+remains the idempotency binding.
 
 A CLI exit code alone is insufficient. A successful receipt requires all of:
 
@@ -268,7 +272,7 @@ EXECUTOR_MAX_CONCURRENCY=1 \
 cargo run -p gpt-image-2-gateway --bin factoryctl -- provision-grok-profile
 ```
 
-Use `provision-grok-video-profile` with a distinct
+Use `provision-grok-video-v2-profile` with a distinct
 `EXECUTOR_PROFILE_KEY`, and bind new V2 work to the V2 executable explicitly:
 
 ```ini
@@ -288,11 +292,11 @@ startup.
 
 `workerd` uses `WORKER_EXECUTION_MODE=executor-handoff` and the exact profile
 key. `executord` accepts provider-neutral `EXECUTOR_PROVIDER_EXECUTABLE` and
-`EXECUTOR_CREDENTIAL_HOME`; the existing Codex-specific names and the new
-`GATEWAY_MANAGED_GROK_EXECUTABLE` / `EXECUTOR_GROK_CREDENTIAL_HOME` remain explicit
-fallbacks. It defaults `EXECUTOR_PROCESS_STARTUP_GRACE_MS` to 60 seconds so a
-signed provider CLI cold start is not misclassified as a missing durable
-process.
+`EXECUTOR_CREDENTIAL_HOME`; for Grok the explicit fallbacks are
+`EXECUTOR_GROK_EXECUTABLE` and `EXECUTOR_GROK_CREDENTIAL_HOME` (Codex keeps its
+own provider fallback). It defaults `EXECUTOR_PROCESS_STARTUP_GRACE_MS` to 60
+seconds so a signed provider CLI cold start is not misclassified as a missing
+durable process.
 
 The immutable release owns both provider executables. The V1 and V2 lock files
 pin the official xAI download URL, version, target architecture, byte size, and

@@ -618,7 +618,7 @@ Cache decoded results by exact source string during one request so the same sour
 
 - [ ] **Step 6: Bind V2 admission**
 
-`XaiVideoAdmissionPlan` emits `GROK_VIDEO_GENERATION_COMMAND_SCHEMA_V2` and `VIDEO_ADAPTER_REVISION_V2`, uses model `grok-imagine-video-1.5`, supports zero-image voice-only R2V, and preserves output/billing/schedule behavior. V1 validation remains a separate match arm.
+`XaiVideoAdmissionPlan` emits `GROK_VIDEO_GENERATION_COMMAND_SCHEMA_V2` and `VIDEO_ADAPTER_REVISION_V2`, uses model `grok-imagine-video-1.5`, supports zero-image voice-only R2V, rejects V2 `output` and `storage_options` before claim/reservation, and preserves billing/schedule behavior for the Factory-local artifact. V1 validation remains a separate match arm.
 
 - [ ] **Step 7: Run focused and compile tests**
 

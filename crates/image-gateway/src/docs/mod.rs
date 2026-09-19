@@ -584,7 +584,7 @@ async fn edit_image() {}
     request_body(
         content = VideoGenerationRequestDoc,
         content_type = "application/json",
-        description = "xAI-shaped asynchronous video request. New requests use the opt-in Grok CLI 1.0.34 V2 binding: generated audio is required, image inputs are base64/data URLs, reference_images accepts at most seven images, reference_audios accepts at most three voice_id entries (audio URLs are rejected), and only 480p/720p are executable. Existing V1 jobs remain replayable through their stored command schema."
+        description = "xAI-shaped asynchronous video request. New requests use the opt-in Grok CLI 1.0.34 V2 binding: generated audio is required, image inputs are base64 data URLs or bounded public HTTPS URLs (no redirects or private-address resolution), reference_images accepts at most seven images, reference_audios accepts at most three voice_id entries (audio URLs are rejected), and only 480p/720p are executable. file_id, output, and storage_options are retained for official DTO shape but rejected with HTTP 400 before admission by this CLI binding. Existing V1 jobs remain replayable through their stored command schema."
     ),
     responses(
         (status = 200, description = "Video request accepted", body = VideoStartResponseDoc),
@@ -2756,6 +2756,7 @@ struct ImageReferenceDoc {
 struct VideoGenerationRequestDoc {
     #[schema(inline)]
     aspect_ratio: Option<VideoAspectRatioDoc>,
+    /// Official default is 8 seconds. The V2 CLI binding requires explicit 6 or 10 seconds for text-to-video and image-to-video; reference-to-video accepts 1-15 seconds.
     #[schema(minimum = 1, maximum = 15, default = 8)]
     duration: Option<u8>,
     /// V2 defaults to true and rejects an explicit false value.
@@ -2780,7 +2781,8 @@ struct VideoGenerationRequestDoc {
 #[allow(dead_code)]
 struct VideoImageReferenceDoc {
     file_id: Option<String>,
-    /// Base64/data URL for the Grok CLI binding. `file_id` is shaped for xAI
+    /// Base64 data URL or bounded public HTTPS image URL. HTTPS redirects and
+    /// private-address resolution are rejected; `file_id` is shaped for xAI
     /// compatibility but is rejected before admission by this binding.
     url: Option<String>,
 }
@@ -2797,12 +2799,16 @@ struct VideoAudioReferenceDoc {
 #[derive(Debug, Serialize, ToSchema)]
 #[allow(dead_code)]
 struct VideoOutputDoc {
+    /// Retained for official xAI request shape; V2 rejects this delivery option
+    /// before admission because the CLI publishes a Factory-local artifact.
     upload_url: String,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
 #[allow(dead_code)]
 struct VideoStorageOptionsDoc {
+    /// Retained for official xAI request shape; V2 rejects storage options
+    /// before admission because the CLI binding has no remote delivery adapter.
     #[schema(minimum = 3600, maximum = 2592000)]
     expires_after: Option<i64>,
     filename: String,
@@ -3771,6 +3777,32 @@ mod tests {
                 .is_some_and(|schema| schema.to_string().contains("\"closure\"")),
             "allocation detail must expose immutable closure evidence"
         );
+    }
+
+    #[test]
+    fn grok_video_v2_openapi_exposes_cli_boundary() {
+        let axum::Json(document) = openapi_json();
+        let schema = &document["components"]["schemas"]["VideoGenerationRequest"];
+        assert_eq!(schema["properties"]["duration"]["default"], 8);
+        assert_eq!(
+            schema["properties"]["duration"]["description"],
+            "Official default is 8 seconds. The V2 CLI binding requires explicit 6 or 10 seconds for text-to-video and image-to-video; reference-to-video accepts 1-15 seconds."
+        );
+        assert_eq!(schema["properties"]["reference_images"]["maxItems"], 7);
+        assert_eq!(schema["properties"]["reference_audios"]["maxItems"], 3);
+        assert_eq!(
+            schema["properties"]["resolution"]["oneOf"][1]["enum"],
+            serde_json::json!(["480p", "720p"])
+        );
+        assert!(schema["properties"]["last_frame"].is_object());
+        assert!(schema["properties"]["generate_audio"].is_object());
+        let description =
+            document["paths"]["/v1/videos/generations"]["post"]["requestBody"]["description"]
+                .as_str()
+                .expect("video request description");
+        assert!(description.contains("HTTP 400"));
+        assert!(description.contains("public HTTPS"));
+        assert!(description.contains("file_id"));
     }
 }
 
