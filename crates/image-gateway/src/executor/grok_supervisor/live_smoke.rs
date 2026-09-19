@@ -2,7 +2,7 @@ use std::{
     env, fs,
     os::unix::fs::PermissionsExt,
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use async_trait::async_trait;
@@ -13,7 +13,7 @@ use image_api_contracts::xai::{
 };
 use image_provider_grok_cli::{
     ADAPTER_REVISION, GROK_IMAGE_GENERATION_COMMAND_SCHEMA, GROK_VIDEO_GENERATION_COMMAND_SCHEMA,
-    VIDEO_ADAPTER_REVISION,
+    GROK_VIDEO_GENERATION_COMMAND_SCHEMA_V2, VIDEO_ADAPTER_REVISION, VIDEO_ADAPTER_REVISION_V2,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -219,6 +219,150 @@ async fn xai_image_to_video_runs_through_the_real_durable_grok_supervisor() {
     assert_absent_or_empty(&execution_root.join("provider-workspaces/attempt"));
 }
 
+#[tokio::test]
+#[ignore = "runs one real 6-second 480p Grok CLI 1.0.34 V2 video generation and consumes membership allowance"]
+async fn xai_image_to_video_v2_runs_through_the_real_durable_grok_supervisor() {
+    let source_home = env::var("GROK_SMOKE_CREDENTIAL_HOME")
+        .expect("GROK_SMOKE_CREDENTIAL_HOME must explicitly select the logged-in Grok home");
+    let grok_executable = env::var("GROK_SMOKE_EXECUTABLE")
+        .expect("GROK_SMOKE_EXECUTABLE must explicitly select the Grok CLI executable");
+    let helper_executable = env::var("GROK_SMOKE_HELPER_EXECUTABLE")
+        .expect("GROK_SMOKE_HELPER_EXECUTABLE must select the built grok-runner binary");
+    let temp = TempDir::new().unwrap();
+    let credentials = private_credentials(temp.path(), Path::new(&source_home));
+    // Keep the journal outside the credential TempDir so a real-provider
+    // failure leaves an inspectable, auth-free path for diagnosis.
+    let journal_root =
+        env::temp_dir().join(format!("grok-v2-live-smoke-{}", Uuid::new_v4().simple()));
+    let journal =
+        Arc::new(FilesystemRunnerJournal::new(&journal_root).expect("private runner journal"));
+    let blobs = Arc::new(InMemoryArtifactBlobStore::default());
+    let input_bytes = video_source_image();
+    let blob = blobs
+        .put(
+            InputBlobKey {
+                admission_session_id: Uuid::new_v4(),
+                input_id: Uuid::new_v4(),
+            },
+            &input_bytes,
+        )
+        .await
+        .unwrap();
+    let plan = XaiVideoAdmissionPlan::for_grok_cli_v2(
+        XaiVideoGenerationRequest {
+            aspect_ratio: None,
+            duration: Some(6),
+            generate_audio: Some(true),
+            image: Some(XaiVideoImageUrl {
+                file_id: None,
+                url: Some(format!(
+                    "data:image/jpeg;base64,{}",
+                    STANDARD.encode(&input_bytes)
+                )),
+            }),
+            last_frame: None,
+            model: Some("grok-imagine-video-1.5".to_owned()),
+            output: None,
+            prompt: Some(
+                "A slow cinematic push-in; the blue square gently rotates while the white background remains still"
+                    .to_owned(),
+            ),
+            reference_audios: Vec::new(),
+            reference_images: Vec::new(),
+            resolution: Some(XaiVideoResolution::P480),
+            storage_options: None,
+            user: Some("grok-durable-video-v2-smoke".to_owned()),
+        },
+        vec![XaiVideoAdmissionInput::new(
+            "input.jpg",
+            blob.clone(),
+            "image/jpeg",
+        )
+        .unwrap()],
+    )
+    .unwrap();
+    assert_eq!(plan.provider_model(), "grok-imagine-video-1.5");
+    assert_eq!(
+        plan.command_schema(),
+        GROK_VIDEO_GENERATION_COMMAND_SCHEMA_V2
+    );
+    assert_eq!(plan.adapter_revision(), VIDEO_ADAPTER_REVISION_V2);
+    assert_eq!(plan.billing_units(), 6);
+    assert_eq!(plan.schedule_cost(), 6);
+    let command = plan.command_json().clone();
+    let command_hash = hex::encode(Sha256::digest(serde_json::to_vec(&command).unwrap()));
+    let lease = video_lease_v2(command_hash);
+    let context = ExecutorLaunchContext::new(
+        "grok-live-video-v2-smoke",
+        image_api_contracts::xai::XAI_VIDEOS_API_PROFILE,
+        0,
+        lease.command_schema.clone(),
+        lease.command_hash.clone(),
+        command,
+    )
+    .unwrap()
+    .with_inputs(vec![
+        ExecutorInputObject::new(blob, "image", 0, "image/jpeg").unwrap(),
+    ])
+    .unwrap();
+    let supervisor = GrokProcessSupervisor::new(
+        Arc::clone(&journal),
+        &helper_executable,
+        &grok_executable,
+        &credentials,
+        &grok_auth_file_sha256(&credentials).unwrap(),
+        Duration::from_secs(15 * 60),
+        Duration::from_millis(100),
+        Duration::from_secs(5),
+        &ProxyConfig::default(),
+    )
+    .unwrap()
+    .with_input_blobs(blobs);
+    let bytes = Arc::new(Mutex::new(Vec::new()));
+    let runner = JournaledDurableRunner::new(
+        LiveContextStore(context),
+        journal,
+        supervisor,
+        LiveArtifactSink(bytes.clone()),
+    );
+
+    let started = Instant::now();
+    let first = runner
+        .start_or_attach(lease.clone(), RunnerLaunchAuthority::AllowLaunch)
+        .await;
+    let elapsed_ms = started.elapsed().as_millis();
+    if !matches!(
+        first,
+        DurableRunnerResult::Terminal(RunnerOutcome::Succeeded(_))
+    ) {
+        let execution_root = journal_root.join(lease.executor_execution_id.simple().to_string());
+        let _ = fs::remove_dir_all(execution_root.join("provider-home"));
+        panic!(
+            "unexpected Grok V2 video outcome after {elapsed_ms}ms: {first:?}; journal={}",
+            journal_root.display()
+        );
+    }
+    assert_eq!(
+        runner
+            .start_or_attach(lease.clone(), RunnerLaunchAuthority::AttachOnly)
+            .await,
+        first
+    );
+    let bytes = bytes.lock().unwrap().clone();
+    assert_eq!(media_type_from_bytes(&bytes).unwrap(), "video/mp4");
+    assert!(!bytes.is_empty());
+    eprintln!(
+        "verified Grok V2 video first execution: elapsed_ms={} bytes={} sha256={}",
+        elapsed_ms,
+        bytes.len(),
+        sha256(&bytes)
+    );
+    let execution_root = journal_root.join(lease.executor_execution_id.simple().to_string());
+    assert_absent_or_empty(&execution_root.join("provider-home"));
+    assert_absent_or_empty(&execution_root.join("provider-workspaces/attempt"));
+    fs::remove_dir_all(&journal_root).expect("remove successful V2 smoke journal");
+}
+
 fn assert_absent_or_empty(path: &Path) {
     match fs::read_dir(path) {
         Ok(entries) => assert_eq!(entries.count(), 0, "{} is not empty", path.display()),
@@ -315,6 +459,15 @@ fn video_lease(command_hash: String) -> ExecutorSubmissionLease {
         model: "grok-imagine-video-1.5-preview".to_owned(),
         command_schema: GROK_VIDEO_GENERATION_COMMAND_SCHEMA.to_owned(),
         adapter_revision: VIDEO_ADAPTER_REVISION.to_owned(),
+        ..lease(command_hash)
+    }
+}
+
+fn video_lease_v2(command_hash: String) -> ExecutorSubmissionLease {
+    ExecutorSubmissionLease {
+        model: "grok-imagine-video-1.5".to_owned(),
+        command_schema: GROK_VIDEO_GENERATION_COMMAND_SCHEMA_V2.to_owned(),
+        adapter_revision: VIDEO_ADAPTER_REVISION_V2.to_owned(),
         ..lease(command_hash)
     }
 }
