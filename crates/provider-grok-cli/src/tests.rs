@@ -16,6 +16,8 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
+use crate::runtime_identity::lookup_runtime_identity_from_lock;
+
 use super::*;
 
 #[test]
@@ -46,6 +48,22 @@ fn versioned_provider_locks_keep_v1_and_pin_v2_without_an_image_claim() {
         v2["video_adapter_revision"],
         "grok-cli-1.0.34.agentic-video.v1"
     );
+}
+
+#[test]
+fn v1_lock_whole_file_identity_is_stable() {
+    const EXPECTED_SHA256: &str =
+        "115fa350806568e7d4fd23b10aedbe7c0018c4e86f9fd341abf5b51a6646c2ac";
+    let bytes = include_bytes!("../../../providers/grok-cli-v1.lock.json");
+    let actual_sha256 =
+        Sha256::digest(bytes)
+            .iter()
+            .fold(String::with_capacity(64), |mut output, byte| {
+                use std::fmt::Write as _;
+                write!(&mut output, "{byte:02x}").unwrap();
+                output
+            });
+    assert_eq!(actual_sha256, EXPECTED_SHA256);
 }
 
 #[test]
@@ -98,6 +116,52 @@ fn runtime_identity_rejects_unknown_and_crossed_inputs() {
     );
     assert!(lookup_runtime_identity(GrokRuntimeGeneration::V2, "x86_64-unknown-freebsd").is_err());
     assert!("v3".parse::<GrokRuntimeGeneration>().is_err());
+}
+
+#[test]
+fn v2_lock_requires_an_explicit_null_image_adapter_field() {
+    let mut missing: serde_json::Value =
+        serde_json::from_str(include_str!("../../../providers/grok-cli.lock.json")).unwrap();
+    missing
+        .as_object_mut()
+        .unwrap()
+        .remove("image_adapter_revision");
+    assert!(
+        lookup_runtime_identity_from_lock(
+            GrokRuntimeGeneration::V2,
+            "x86_64-unknown-linux-gnu",
+            &serde_json::to_string(&missing).unwrap(),
+        )
+        .is_err()
+    );
+
+    let mut explicit_null = missing;
+    explicit_null
+        .as_object_mut()
+        .unwrap()
+        .insert("image_adapter_revision".to_owned(), serde_json::Value::Null);
+    assert!(
+        lookup_runtime_identity_from_lock(
+            GrokRuntimeGeneration::V2,
+            "x86_64-unknown-linux-gnu",
+            &serde_json::to_string(&explicit_null).unwrap(),
+        )
+        .is_ok()
+    );
+
+    let mut non_null = explicit_null;
+    non_null.as_object_mut().unwrap().insert(
+        "image_adapter_revision".to_owned(),
+        serde_json::Value::String("grok-cli-1.0.34.agentic-media.v2".to_owned()),
+    );
+    assert!(
+        lookup_runtime_identity_from_lock(
+            GrokRuntimeGeneration::V2,
+            "x86_64-unknown-linux-gnu",
+            &serde_json::to_string(&non_null).unwrap(),
+        )
+        .is_err()
+    );
 }
 
 #[test]

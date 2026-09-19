@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+IFS=$'\n\t'
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+readonly SCRIPT_DIR
+REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd -P)"
+readonly REPO_ROOT
+TEST_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/aif-fetch-lock.XXXXXXXX")"
+trap 'rm -rf -- "$TEST_ROOT"' EXIT
+
+prepare_case() {
+  local name="$1"
+  local case_root="${TEST_ROOT}/${name}"
+  mkdir -p "${case_root}/bin" "${case_root}/providers" "${case_root}/scripts"
+  cp "${REPO_ROOT}/scripts/fetch-grok-cli.sh" "${case_root}/scripts/fetch-grok-cli.sh"
+  cp "${REPO_ROOT}/providers/grok-cli.lock.json" "${case_root}/providers/grok-cli.lock.json"
+  chmod 0755 "${case_root}/scripts/fetch-grok-cli.sh"
+  cat >"${case_root}/bin/curl" <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: >"${FETCH_CURL_MARKER}"
+exit 99
+EOF
+  chmod 0755 "${case_root}/bin/curl"
+  printf '%s\n' "$case_root"
+}
+
+mutate_lock() {
+  local lock_path="$1"
+  local mutation="$2"
+  LOCK_PATH="$lock_path" MUTATION="$mutation" node <<'NODE'
+const fs = require("node:fs");
+
+const lockPath = process.env.LOCK_PATH;
+const lock = JSON.parse(fs.readFileSync(lockPath, "utf8"));
+switch (process.env.MUTATION) {
+  case "version":
+    lock.version_output = "grok 1.0.5 (5115b46bc9)";
+    break;
+  case "machine":
+    lock.artifacts["x86_64-unknown-linux-gnu"].elf_machine = 183;
+    break;
+  case "url":
+    lock.artifacts["x86_64-unknown-linux-gnu"].url =
+      "https://x.ai/cli/grok-1.0.34-linux-aarch64";
+    break;
+  default:
+    throw new Error(`unknown mutation: ${process.env.MUTATION}`);
+}
+fs.writeFileSync(lockPath, `${JSON.stringify(lock, null, 2)}\n`);
+NODE
+}
+
+assert_rejected_before_download() {
+  local mutation="$1"
+  local case_root
+  case_root="$(prepare_case "$mutation")"
+  mutate_lock "${case_root}/providers/grok-cli.lock.json" "$mutation"
+  local marker="${case_root}/curl-called"
+  if PATH="${case_root}/bin:${PATH}" \
+    FETCH_CURL_MARKER="$marker" \
+    "${case_root}/scripts/fetch-grok-cli.sh" \
+    v2 x86_64-unknown-linux-gnu "${case_root}/output/grok" \
+    >"${case_root}/stdout" 2>"${case_root}/stderr"; then
+    echo "expected ${mutation} lock mutation to be rejected" >&2
+    exit 1
+  fi
+  if [[ -e "$marker" ]]; then
+    echo "fetch downloaded before rejecting ${mutation} lock mutation" >&2
+    exit 1
+  fi
+}
+
+assert_rejected_before_download version
+assert_rejected_before_download machine
+assert_rejected_before_download url
+echo "fetch Grok lock regression tests passed"

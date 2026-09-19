@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, str::FromStr};
 
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use thiserror::Error;
 
 const V1_LOCK: &str = include_str!("../../../providers/grok-cli-v1.lock.json");
@@ -71,7 +71,8 @@ struct ProviderLock {
     version: String,
     version_output: String,
     compatibility_revision: String,
-    image_adapter_revision: Option<String>,
+    #[serde(deserialize_with = "deserialize_image_adapter_revision")]
+    image_adapter_revision: ImageAdapterRevision,
     video_adapter_revision: String,
     artifacts: BTreeMap<String, ProviderArtifact>,
 }
@@ -84,9 +85,39 @@ struct ProviderArtifact {
     elf_machine: u16,
 }
 
+#[derive(Debug)]
+enum ImageAdapterRevision {
+    Null,
+    Value(String),
+}
+
+fn deserialize_image_adapter_revision<'de, D>(
+    deserializer: D,
+) -> Result<ImageAdapterRevision, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(match Option::<String>::deserialize(deserializer)? {
+        Some(value) => ImageAdapterRevision::Value(value),
+        None => ImageAdapterRevision::Null,
+    })
+}
+
 pub fn lookup_runtime_identity(
     generation: GrokRuntimeGeneration,
     target: &str,
+) -> Result<GrokRuntimeIdentity, GrokRuntimeIdentityError> {
+    let lock_text = match generation {
+        GrokRuntimeGeneration::V1 => V1_LOCK,
+        GrokRuntimeGeneration::V2 => V2_LOCK,
+    };
+    lookup_runtime_identity_from_lock(generation, target, lock_text)
+}
+
+pub(crate) fn lookup_runtime_identity_from_lock(
+    generation: GrokRuntimeGeneration,
+    target: &str,
+    lock_text: &str,
 ) -> Result<GrokRuntimeIdentity, GrokRuntimeIdentityError> {
     let expected_machine = match target {
         "x86_64-unknown-linux-gnu" => 62,
@@ -97,10 +128,6 @@ pub fn lookup_runtime_identity(
                 target: target.to_owned(),
             });
         }
-    };
-    let lock_text = match generation {
-        GrokRuntimeGeneration::V1 => V1_LOCK,
-        GrokRuntimeGeneration::V2 => V2_LOCK,
     };
     let lock: ProviderLock = serde_json::from_str(lock_text)
         .map_err(|source| GrokRuntimeIdentityError::InvalidLock { generation, source })?;
@@ -124,7 +151,10 @@ pub fn lookup_runtime_identity(
         version: lock.version,
         version_output: lock.version_output,
         compatibility_revision: lock.compatibility_revision,
-        image_adapter_revision: lock.image_adapter_revision,
+        image_adapter_revision: match lock.image_adapter_revision {
+            ImageAdapterRevision::Null => None,
+            ImageAdapterRevision::Value(value) => Some(value),
+        },
         video_adapter_revision: lock.video_adapter_revision,
         url: artifact.url.clone(),
         sha256: artifact.sha256.clone(),
@@ -160,7 +190,11 @@ fn validate_lock(
             if lock.version != "1.0.5"
                 || lock.version_output != "grok 1.0.5 (5115b46bc9)"
                 || lock.compatibility_revision != "grok-cli-1.0.5"
-                || lock.image_adapter_revision.as_deref() != Some("grok-cli-1.0.5.agentic-media.v2")
+                || !matches!(
+                    &lock.image_adapter_revision,
+                    ImageAdapterRevision::Value(value)
+                        if value == "grok-cli-1.0.5.agentic-media.v2"
+                )
                 || lock.video_adapter_revision != "grok-api-1.0.5.direct-image-video.v5"
             {
                 return Err(GrokRuntimeIdentityError::InvalidLockShape {
@@ -173,7 +207,7 @@ fn validate_lock(
             if lock.version != "1.0.34"
                 || lock.version_output != "grok 1.0.34 (3736acbc8658)"
                 || lock.compatibility_revision != "grok-cli-1.0.34"
-                || lock.image_adapter_revision.is_some()
+                || !matches!(lock.image_adapter_revision, ImageAdapterRevision::Null)
                 || lock.video_adapter_revision != "grok-cli-1.0.34.agentic-video.v1"
             {
                 return Err(GrokRuntimeIdentityError::InvalidLockShape {
