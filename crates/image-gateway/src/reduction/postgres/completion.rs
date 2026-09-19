@@ -11,8 +11,9 @@ use image_provider_dreamina_cli::{
 };
 use image_provider_grok_cli::{
     GROK_IMAGE_EDIT_COMMAND_SCHEMA, GROK_IMAGE_GENERATION_COMMAND_SCHEMA,
-    GROK_VIDEO_GENERATION_COMMAND_SCHEMA, parse_image_edit_payload, parse_image_generation_payload,
-    parse_video_generation_payload,
+    GROK_VIDEO_GENERATION_COMMAND_SCHEMA, GROK_VIDEO_GENERATION_COMMAND_SCHEMA_V2,
+    GrokVideoGenerationPayloadV2, parse_image_edit_payload, parse_image_generation_payload,
+    parse_video_generation_payload, parse_video_generation_payload_v2,
 };
 
 use crate::{
@@ -1699,6 +1700,9 @@ async fn persist_projection(
         GROK_VIDEO_GENERATION_COMMAND_SCHEMA => {
             persist_video_projection(tx, lease, quota, artifact_count, command_json, now).await
         }
+        GROK_VIDEO_GENERATION_COMMAND_SCHEMA_V2 => {
+            persist_video_v2_projection(tx, lease, quota, artifact_count, command_json, now).await
+        }
         DREAMINA_SUBMIT_COMMAND_SCHEMA => {
             persist_dreamina_projection(
                 tx,
@@ -2062,6 +2066,88 @@ async fn persist_video_projection(
     Ok(())
 }
 
+fn validate_video_v2_terminal_evidence(
+    payload: &GrokVideoGenerationPayloadV2,
+    economics_contract_version: i16,
+    operation: &str,
+    output_count: i32,
+    billable_units: i32,
+    output_billable_units: i32,
+    billing_metric: &str,
+    billing_unit: &str,
+) -> Result<String, ExecutorTerminalError> {
+    let command = payload.source_command();
+    if !matches!(economics_contract_version, 3 | 4)
+        || command.schema_version != 2
+        || command.operation != "videos.generations"
+        || command.model.as_deref() != Some("grok-imagine-video-1.5")
+        || operation != VIDEO_GENERATION_OPERATION
+        || output_count != 1
+        || billable_units != i32::from(command.duration)
+        || output_billable_units != billable_units
+        || billing_metric != "video_second"
+        || billing_unit != "second"
+    {
+        return Err(ExecutorTerminalError::Conflict);
+    }
+    serde_json::to_value(command.resolution)
+        .ok()
+        .and_then(|value| value.as_str().map(ToOwned::to_owned))
+        .ok_or(ExecutorTerminalError::Conflict)
+}
+
+async fn persist_video_v2_projection(
+    tx: &mut Transaction<'_, Postgres>,
+    lease: &ExecutorTerminalLease,
+    quota: &QuotaSliceRow,
+    artifact_count: i32,
+    command_json: Value,
+    now: i64,
+) -> Result<(), ExecutorTerminalError> {
+    let command_bytes =
+        serde_json::to_vec(&command_json).map_err(|_| ExecutorTerminalError::Conflict)?;
+    let payload = parse_video_generation_payload_v2(&command_bytes)
+        .map_err(|_| ExecutorTerminalError::Conflict)?;
+    let resolution = validate_video_v2_terminal_evidence(
+        &payload,
+        quota.economics_contract_version,
+        &quota.operation,
+        quota.output_count,
+        quota.billable_units,
+        quota.output_billable_units,
+        &quota.billing_metric,
+        &quota.billing_unit,
+    )?;
+    sqlx::query(
+        r#"
+        INSERT INTO job_response_projections
+          (job_id, api_profile, operation, response_schema, created_at_seconds,
+           output_format, quality, size, background, stream,
+           limit_5h, remaining_5h, limit_7d, remaining_7d,
+           artifact_count, created_at_ms)
+        VALUES ($1, $2, $3, $4, $5, 'mp4', $6, $7, $6, FALSE,
+                $8, $9, $10, $11, $12, $13)
+        "#,
+    )
+    .bind(lease.job_id)
+    .bind(XAI_VIDEOS_API_PROFILE)
+    .bind(VIDEO_GENERATION_OPERATION)
+    .bind(XAI_VIDEO_RESPONSE_SCHEMA)
+    .bind(now / 1_000)
+    .bind(NOT_APPLICABLE)
+    .bind(resolution)
+    .bind(quota.limit_5h)
+    .bind(quota.remaining_5h)
+    .bind(quota.limit_7d)
+    .bind(quota.remaining_7d)
+    .bind(artifact_count)
+    .bind(now)
+    .execute(&mut **tx)
+    .await
+    .map_err(unavailable)?;
+    Ok(())
+}
+
 async fn append_parent_events(
     tx: &mut Transaction<'_, Postgres>,
     lease: &ExecutorTerminalLease,
@@ -2255,6 +2341,96 @@ mod tests {
             terminal_parent_state(3, 0, 1, 4, true),
             Ok(ExecutorParentTerminalState::Uncertain)
         );
+    }
+
+    #[test]
+    fn grok_video_v2_terminal_evidence_is_signed_and_quota_bound() {
+        use image_api_contracts::xai::{
+            XaiVideoAspectRatio, XaiVideoGenerationCommandV2, XaiVideoGenerationRequest,
+            XaiVideoResolution,
+        };
+        use image_provider_grok_cli::{
+            GrokVideoGenerationPayloadV2, parse_video_generation_payload_v2,
+        };
+        use image_provider_sdk::OutputSlot;
+
+        let command = XaiVideoGenerationCommandV2::from_request(XaiVideoGenerationRequest {
+            aspect_ratio: Some(XaiVideoAspectRatio::R16x9),
+            duration: Some(10),
+            generate_audio: Some(true),
+            image: None,
+            last_frame: None,
+            model: Some("grok-imagine-video-1.5".to_owned()),
+            output: None,
+            prompt: Some("terminal evidence".to_owned()),
+            reference_audios: Vec::new(),
+            reference_images: Vec::new(),
+            resolution: Some(XaiVideoResolution::P720),
+            storage_options: None,
+            user: None,
+        })
+        .unwrap();
+        let payload = GrokVideoGenerationPayloadV2::from_xai_command(command, Vec::new()).unwrap();
+        let bytes = payload.into_canonical_bytes(OutputSlot::new(0, 1).unwrap());
+        let payload = parse_video_generation_payload_v2(&bytes).unwrap();
+        assert_eq!(
+            validate_video_v2_terminal_evidence(
+                &payload,
+                4,
+                VIDEO_GENERATION_OPERATION,
+                1,
+                10,
+                10,
+                "video_second",
+                "second"
+            ),
+            Ok("720p".to_owned())
+        );
+        for (economics, operation, output_count, billed, output_billed, metric, unit) in [
+            (
+                2,
+                VIDEO_GENERATION_OPERATION,
+                1,
+                10,
+                10,
+                "video_second",
+                "second",
+            ),
+            (4, GENERATION_OPERATION, 1, 10, 10, "video_second", "second"),
+            (
+                4,
+                VIDEO_GENERATION_OPERATION,
+                2,
+                10,
+                10,
+                "video_second",
+                "second",
+            ),
+            (
+                4,
+                VIDEO_GENERATION_OPERATION,
+                1,
+                9,
+                10,
+                "video_second",
+                "second",
+            ),
+            (4, VIDEO_GENERATION_OPERATION, 1, 10, 10, "output", "output"),
+        ] {
+            assert!(
+                validate_video_v2_terminal_evidence(
+                    &payload,
+                    economics,
+                    operation,
+                    output_count,
+                    billed,
+                    output_billed,
+                    metric,
+                    unit
+                )
+                .is_err()
+            );
+        }
     }
 
     fn succeeded(media_type: &str) -> CanonicalExecutorOutcome {

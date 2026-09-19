@@ -839,9 +839,11 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        PriceBookVersionView, PriceComponentView, has_required_customer_metering_bases,
-        selectors_can_tie, validate_component_dimensions, validate_price_shape,
+        PriceBookVersionView, PriceComponentView, contract_snapshot_for_surface,
+        has_required_customer_metering_bases, selectors_can_tie, validate_component_dimensions,
+        validate_price_shape,
     };
+    use crate::pricing::coverage::CoverageSurfaceRow;
 
     fn component(outcome: &str, dimensions: serde_json::Value) -> PriceComponentView {
         PriceComponentView {
@@ -945,6 +947,38 @@ mod tests {
             &version(vec![image_input, requested_seconds]),
             contract,
         ));
+    }
+
+    #[test]
+    fn grok_video_v2_snapshot_requires_exact_schema_and_model_identity() {
+        let mut version = version(Vec::new());
+        version.api_profile = "xai-videos-v1".to_owned();
+        version.operation = "video_generation".to_owned();
+        version.provider_id = Some("grok-cli".to_owned());
+        version.provider_model_id = Some("grok-imagine-video-1.5".to_owned());
+        version.public_model_id = "grok-imagine-video-1.5".to_owned();
+        version.media_kind = "video".to_owned();
+        let surface = CoverageSurfaceRow {
+            provider_id: "grok-cli".to_owned(),
+            provider_model_id: "grok-imagine-video-1.5".to_owned(),
+            provider_model_display_name: "Grok Imagine Video 1.5".to_owned(),
+            media_kind: "video".to_owned(),
+            operation: "videos.generations".to_owned(),
+            command_schema: Some("grok-cli.videos.generate.v2".to_owned()),
+            api_profile: Some("xai-videos-v1".to_owned()),
+            public_model_id: Some("grok-imagine-video-1.5".to_owned()),
+            route_id: Some(Uuid::new_v4()),
+            routable_account_count: 1,
+        };
+        let (contract, snapshot) =
+            contract_snapshot_for_surface(&version, &surface).expect("exact V2 snapshot");
+        assert_eq!(contract.command_schema, "grok-cli.videos.generate.v2");
+        assert_eq!(snapshot.provider_model_id, "grok-imagine-video-1.5");
+        assert_eq!(snapshot.normalizer_key, "grok-cli.videos.generate.v2");
+
+        let mut crossed = surface.clone();
+        crossed.provider_model_id = "grok-imagine-video-1.5-preview".to_owned();
+        assert!(contract_snapshot_for_surface(&version, &crossed).is_err());
     }
 
     #[test]

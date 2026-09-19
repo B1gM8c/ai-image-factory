@@ -742,6 +742,50 @@ const GROK_VIDEO_CONSTRAINTS: &[Constraint] = &[
     },
 ];
 
+const GROK_VIDEO_V2_DIMENSIONS: &[DimensionContract] = &[
+    DimensionContract {
+        key: "duration",
+        required: true,
+        domain: ValueDomain::IntegerClosed { min: 1, max: 15 },
+    },
+    DimensionContract {
+        key: "resolution",
+        required: true,
+        domain: ValueDomain::Enum(&["480p", "720p"]),
+    },
+    DimensionContract {
+        key: "input_image_count",
+        required: true,
+        domain: ValueDomain::IntegerClosed { min: 0, max: 9 },
+    },
+    DimensionContract {
+        key: "aspect_ratio",
+        required: false,
+        domain: ValueDomain::Enum(&["1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3"]),
+    },
+];
+const GROK_VIDEO_V2_INPUT_PRESENCE: &[ConditionalPresenceCase] = &[
+    ConditionalPresenceCase {
+        selector_values: &["0"],
+        required: &["aspect_ratio"],
+        forbidden: &[],
+    },
+    ConditionalPresenceCase {
+        selector_values: &["1"],
+        required: &[],
+        forbidden: &[],
+    },
+    ConditionalPresenceCase {
+        selector_values: &["2", "3", "4", "5", "6", "7", "8", "9"],
+        required: &["aspect_ratio"],
+        forbidden: &[],
+    },
+];
+const GROK_VIDEO_V2_CONSTRAINTS: &[Constraint] = &[Constraint::ConditionalPresence {
+    selector: Selector::Dimension("input_image_count"),
+    cases: GROK_VIDEO_V2_INPUT_PRESENCE,
+}];
+
 const IMAGE_OUTPUT_BASIS: &[MeteringBasisContract] = &[MeteringBasisContract {
     metric: "image_output",
     unit: "image",
@@ -935,6 +979,24 @@ const CONTRACTS: &[PricingSurfaceContract] = &[
         normalizer_revision: 1,
         support: SurfaceSupport::Supported,
     },
+    PricingSurfaceContract {
+        contract_id: "grok-cli.videos.generations.v2.pricing-surface",
+        contract_version: 1,
+        provider_id: "grok-cli",
+        route_operation: "videos.generations",
+        pricing_operation: "video_generation",
+        command_schema: "grok-cli.videos.generate.v2",
+        media_kind: "video",
+        api_profiles: &["xai-videos-v1"],
+        provider_models: &["grok-imagine-video-1.5"],
+        dimensions: GROK_VIDEO_V2_DIMENSIONS,
+        constraints: GROK_VIDEO_V2_CONSTRAINTS,
+        output_cardinality: OutputCardinality::Fixed(1),
+        metering_bases: GROK_VIDEO_BASES,
+        normalizer_key: "grok-cli.videos.generate.v2",
+        normalizer_revision: 1,
+        support: SurfaceSupport::Supported,
+    },
 ];
 
 #[cfg(test)]
@@ -994,7 +1056,7 @@ mod tests {
 
     #[test]
     fn registry_identity_and_hash_are_deterministic() {
-        assert_eq!(registry().len(), 7);
+        assert_eq!(registry().len(), 8);
         assert_eq!(registry_hash(), registry_hash());
         assert_eq!(registry_hash().len(), 64);
         let generation = registry()[0]
@@ -1141,6 +1203,93 @@ mod tests {
             preview.contract_hash,
             "3cb4343abbd125bf363705376fc9a18e21c7155507106f83ec1a2afe8fd026ce"
         );
+    }
+
+    #[test]
+    fn grok_video_v2_surface_binds_exact_identity_and_input_presence() {
+        let contract = contract("grok-cli.videos.generations.v2.pricing-surface");
+        assert_eq!(contract.command_schema, "grok-cli.videos.generate.v2");
+        assert_eq!(contract.provider_models, &["grok-imagine-video-1.5"]);
+        assert_eq!(contract.normalizer_key, "grok-cli.videos.generate.v2");
+        assert_eq!(contract.api_profiles, &["xai-videos-v1"]);
+        assert_eq!(
+            contract.validate(&SurfaceRequest {
+                provider_model_id: "grok-imagine-video-1.5",
+                dimensions: &[
+                    value("duration", "8"),
+                    value("resolution", "720p"),
+                    value("input_image_count", "3"),
+                    value("aspect_ratio", "16:9"),
+                ],
+                output_count: 1,
+            }),
+            Ok(())
+        );
+        assert_eq!(
+            contract.validate(&SurfaceRequest {
+                provider_model_id: "grok-imagine-video-1.5",
+                dimensions: &[
+                    value("duration", "6"),
+                    value("resolution", "480p"),
+                    value("input_image_count", "1"),
+                ],
+                output_count: 1,
+            }),
+            Ok(())
+        );
+        for (count, has_ratio) in [(0, true), (1, false), (1, true), (2, true), (9, true)] {
+            let count_string = count.to_string();
+            let mut dimensions = vec![
+                value("duration", "6"),
+                value("resolution", "480p"),
+                value("input_image_count", &count_string),
+            ];
+            if has_ratio {
+                dimensions.push(value("aspect_ratio", "1:1"));
+            }
+            assert_eq!(
+                contract.validate(&SurfaceRequest {
+                    provider_model_id: "grok-imagine-video-1.5",
+                    dimensions: &dimensions,
+                    output_count: 1,
+                }),
+                Ok(()),
+                "count={count} has_ratio={has_ratio}"
+            );
+        }
+        for request in [
+            SurfaceRequest {
+                provider_model_id: "grok-imagine-video-1.5-preview",
+                dimensions: &[
+                    value("duration", "6"),
+                    value("resolution", "480p"),
+                    value("input_image_count", "0"),
+                    value("aspect_ratio", "1:1"),
+                ],
+                output_count: 1,
+            },
+            SurfaceRequest {
+                provider_model_id: "grok-imagine-video-1.5",
+                dimensions: &[
+                    value("duration", "16"),
+                    value("resolution", "480p"),
+                    value("input_image_count", "0"),
+                    value("aspect_ratio", "1:1"),
+                ],
+                output_count: 1,
+            },
+            SurfaceRequest {
+                provider_model_id: "grok-imagine-video-1.5",
+                dimensions: &[
+                    value("duration", "6"),
+                    value("resolution", "480p"),
+                    value("input_image_count", "2"),
+                ],
+                output_count: 1,
+            },
+        ] {
+            assert!(contract.validate(&request).is_err());
+        }
     }
 
     #[test]
