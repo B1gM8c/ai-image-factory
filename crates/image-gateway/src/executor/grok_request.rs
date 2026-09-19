@@ -1,9 +1,10 @@
 use image_provider_grok_cli::{
     ADAPTER_REVISION, GROK_IMAGE_EDIT_COMMAND_SCHEMA, GROK_IMAGE_GENERATION_COMMAND_SCHEMA,
-    GROK_VIDEO_GENERATION_COMMAND_SCHEMA, GrokCliRequestV1, GrokImageEditRequestV1,
-    GrokImageGenerationRequestV1, GrokVideoGenerationRequestV1, PROVIDER_ID,
-    VIDEO_ADAPTER_REVISION, parse_image_edit_command, parse_image_generation_command,
-    parse_video_generation_command,
+    GROK_VIDEO_GENERATION_COMMAND_SCHEMA, GROK_VIDEO_GENERATION_COMMAND_SCHEMA_V2,
+    GrokImageEditRequestV1, GrokImageGenerationRequestV1, GrokVideoGenerationRequestV1,
+    GrokVideoGenerationRequestV2, PROVIDER_ID, VIDEO_ADAPTER_REVISION, VIDEO_ADAPTER_REVISION_V2,
+    parse_image_edit_command, parse_image_generation_command, parse_video_generation_command,
+    parse_video_generation_command_v2,
 };
 use sha2::{Digest, Sha256};
 
@@ -18,17 +19,10 @@ pub enum GrokExecutionRequest {
     ImageGeneration(GrokImageGenerationRequestV1),
     ImageEdit(GrokImageEditRequestV1),
     VideoGeneration(GrokVideoGenerationRequestV1),
+    VideoGenerationV2(GrokVideoGenerationRequestV2),
 }
 
 impl GrokExecutionRequest {
-    pub fn into_cli_request(self) -> GrokCliRequestV1 {
-        match self {
-            Self::ImageGeneration(request) => request.into(),
-            Self::ImageEdit(request) => request.into(),
-            Self::VideoGeneration(request) => request.into(),
-        }
-    }
-
     pub(super) fn model(&self) -> &'static str {
         match self {
             Self::ImageGeneration(request) => request.model().as_str(),
@@ -42,6 +36,7 @@ impl GrokExecutionRequest {
             Self::VideoGeneration(GrokVideoGenerationRequestV1::ReferenceToVideo(_)) => {
                 "grok-imagine-video"
             }
+            Self::VideoGenerationV2(_) => "grok-imagine-video-1.5",
         }
     }
 }
@@ -103,6 +98,13 @@ pub fn project_grok_execution_request(
                     .map_err(|_| GrokRequestProjectionError::InvalidCommand)?,
             )
         }
+        GROK_VIDEO_GENERATION_COMMAND_SCHEMA_V2 => {
+            require_api_profile(context, XAI_VIDEOS_API_PROFILE)?;
+            GrokExecutionRequest::VideoGenerationV2(
+                parse_video_generation_command_v2(&command_bytes)
+                    .map_err(|_| GrokRequestProjectionError::InvalidCommand)?,
+            )
+        }
         _ => return Err(GrokRequestProjectionError::UnsupportedCommand),
     };
     if lease.model != request.model() {
@@ -117,6 +119,7 @@ pub(super) fn expected_grok_adapter_revision(command_schema: &str) -> Option<&'s
             Some(ADAPTER_REVISION)
         }
         GROK_VIDEO_GENERATION_COMMAND_SCHEMA => Some(VIDEO_ADAPTER_REVISION),
+        GROK_VIDEO_GENERATION_COMMAND_SCHEMA_V2 => Some(VIDEO_ADAPTER_REVISION_V2),
         _ => None,
     }
 }
@@ -251,6 +254,149 @@ mod tests {
         assert_eq!(
             project_grok_execution_request(&lease, &context),
             Err(GrokRequestProjectionError::OutputOutOfRange)
+        );
+    }
+
+    #[test]
+    fn projects_v2_video_with_its_exact_schema_adapter_and_canonical_model() {
+        use image_api_contracts::xai::{
+            XaiVideoGenerationCommandV2, XaiVideoGenerationRequest, XaiVideoResolution,
+        };
+        use image_provider_grok_cli::{
+            GROK_VIDEO_GENERATION_COMMAND_SCHEMA_V2, GrokVideoGenerationPayloadV2,
+            VIDEO_ADAPTER_REVISION_V2,
+        };
+
+        let source = XaiVideoGenerationCommandV2::from_request(XaiVideoGenerationRequest {
+            aspect_ratio: None,
+            duration: Some(6),
+            generate_audio: Some(true),
+            image: None,
+            last_frame: None,
+            model: Some("grok-imagine-video-1.5-preview".to_owned()),
+            output: None,
+            prompt: Some("a paper boat crossing a moonlit lake".to_owned()),
+            reference_audios: Vec::new(),
+            reference_images: Vec::new(),
+            resolution: Some(XaiVideoResolution::P480),
+            storage_options: None,
+            user: None,
+        })
+        .unwrap();
+        let payload = GrokVideoGenerationPayloadV2::from_xai_command(source, Vec::new()).unwrap();
+        let command_json = serde_json::from_slice::<Value>(
+            &payload.into_canonical_bytes(OutputSlot::new(0, 1).unwrap()),
+        )
+        .unwrap();
+        let command_hash = hex::encode(Sha256::digest(serde_json::to_vec(&command_json).unwrap()));
+        let lease = ExecutorSubmissionLease {
+            submission_id: Uuid::new_v4(),
+            executor_execution_id: Uuid::new_v4(),
+            output_id: Uuid::new_v4(),
+            job_id: Uuid::new_v4(),
+            tenant_id: "tenant-1".to_owned(),
+            provider_id: PROVIDER_ID.to_owned(),
+            model: "grok-imagine-video-1.5".to_owned(),
+            work_item_id: Uuid::new_v4(),
+            output_index: 0,
+            command_schema: GROK_VIDEO_GENERATION_COMMAND_SCHEMA_V2.to_owned(),
+            command_hash: command_hash.clone(),
+            execution_profile_id: Uuid::new_v4(),
+            adapter_revision: VIDEO_ADAPTER_REVISION_V2.to_owned(),
+            executor_owner: "executor-1".to_owned(),
+            executor_lease_epoch: 1,
+            executor_lease_expires_at_ms: i64::MAX,
+        };
+        let context = ExecutorLaunchContext {
+            request_id: "request-v2".to_owned(),
+            api_profile: XAI_VIDEOS_API_PROFILE.to_owned(),
+            output_index: 0,
+            command_schema: GROK_VIDEO_GENERATION_COMMAND_SCHEMA_V2.to_owned(),
+            command_hash,
+            command_json,
+            inputs: Vec::new(),
+        };
+
+        let request = project_grok_execution_request(&lease, &context).unwrap();
+        assert!(matches!(
+            request,
+            GrokExecutionRequest::VideoGenerationV2(_)
+        ));
+    }
+
+    #[test]
+    fn v2_crossed_schema_adapter_and_model_pairs_are_rejected() {
+        use image_api_contracts::xai::{
+            XaiVideoGenerationCommandV2, XaiVideoGenerationRequest, XaiVideoResolution,
+        };
+        use image_provider_grok_cli::{
+            GROK_VIDEO_GENERATION_COMMAND_SCHEMA_V2, GrokVideoGenerationPayloadV2,
+            VIDEO_ADAPTER_REVISION_V2,
+        };
+        let source = XaiVideoGenerationCommandV2::from_request(XaiVideoGenerationRequest {
+            aspect_ratio: None,
+            duration: Some(6),
+            generate_audio: Some(true),
+            image: None,
+            last_frame: None,
+            model: Some("grok-imagine-video-1.5-preview".to_owned()),
+            output: None,
+            prompt: Some("a paper boat crossing a moonlit lake".to_owned()),
+            reference_audios: Vec::new(),
+            reference_images: Vec::new(),
+            resolution: Some(XaiVideoResolution::P480),
+            storage_options: None,
+            user: None,
+        })
+        .unwrap();
+        let payload = GrokVideoGenerationPayloadV2::from_xai_command(source, Vec::new()).unwrap();
+        let command_json = serde_json::from_slice::<Value>(
+            &payload.into_canonical_bytes(OutputSlot::new(0, 1).unwrap()),
+        )
+        .unwrap();
+        let command_hash = hex::encode(Sha256::digest(serde_json::to_vec(&command_json).unwrap()));
+        let mut lease = ExecutorSubmissionLease {
+            submission_id: Uuid::new_v4(),
+            executor_execution_id: Uuid::new_v4(),
+            output_id: Uuid::new_v4(),
+            job_id: Uuid::new_v4(),
+            tenant_id: "tenant-1".to_owned(),
+            provider_id: PROVIDER_ID.to_owned(),
+            model: "grok-imagine-video-1.5".to_owned(),
+            work_item_id: Uuid::new_v4(),
+            output_index: 0,
+            command_schema: GROK_VIDEO_GENERATION_COMMAND_SCHEMA_V2.to_owned(),
+            command_hash: command_hash.clone(),
+            execution_profile_id: Uuid::new_v4(),
+            adapter_revision: VIDEO_ADAPTER_REVISION_V2.to_owned(),
+            executor_owner: "executor-1".to_owned(),
+            executor_lease_epoch: 1,
+            executor_lease_expires_at_ms: i64::MAX,
+        };
+        let mut context = ExecutorLaunchContext {
+            request_id: "request-v2".to_owned(),
+            api_profile: XAI_VIDEOS_API_PROFILE.to_owned(),
+            output_index: 0,
+            command_schema: GROK_VIDEO_GENERATION_COMMAND_SCHEMA_V2.to_owned(),
+            command_hash,
+            command_json,
+            inputs: Vec::new(),
+        };
+        lease.adapter_revision = VIDEO_ADAPTER_REVISION.to_owned();
+        assert_eq!(
+            project_grok_execution_request(&lease, &context),
+            Err(GrokRequestProjectionError::ContextMismatch)
+        );
+        lease.adapter_revision = VIDEO_ADAPTER_REVISION_V2.to_owned();
+        lease.model = "grok-imagine-video".to_owned();
+        assert_eq!(
+            project_grok_execution_request(&lease, &context),
+            Err(GrokRequestProjectionError::UnsupportedCommand)
+        );
+        context.api_profile = XAI_IMAGES_API_PROFILE.to_owned();
+        assert_eq!(
+            project_grok_execution_request(&lease, &context),
+            Err(GrokRequestProjectionError::UnsupportedCommand)
         );
     }
 }

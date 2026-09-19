@@ -21,6 +21,7 @@ use gpt_image_2_gateway::{
     identify_executor_profile_binding, init_telemetry,
     runner::FilesystemRunnerJournal,
 };
+use image_provider_grok_cli::{GrokRuntimeGeneration, lookup_runtime_identity};
 use tokio::{sync::watch, task::JoinSet};
 
 const DEFAULT_LEASE_MS: u64 = 60_000;
@@ -184,6 +185,19 @@ async fn main() -> Result<(), ImageGatewayError> {
         ));
     }
     let provider_runtime = ProviderRuntimeConfig::from_env(binding)?;
+    let grok_runtime = match binding {
+        ExecutorProfileBinding::GrokVideoGenerationV2 => Some(
+            lookup_runtime_identity(GrokRuntimeGeneration::V2, compiled_linux_target()?)
+                .map_err(|_| ImageGatewayError::config("Grok V2 runtime target is unsupported"))?,
+        ),
+        ExecutorProfileBinding::GrokImageGeneration
+        | ExecutorProfileBinding::GrokImageEdit
+        | ExecutorProfileBinding::GrokVideoGeneration => Some(
+            lookup_runtime_identity(GrokRuntimeGeneration::V1, compiled_linux_target()?)
+                .map_err(|_| ImageGatewayError::config("Grok V1 runtime target is unsupported"))?,
+        ),
+        _ => None,
+    };
     validate_isolated_trees(
         &artifact_root,
         &config.runner_root,
@@ -238,12 +252,30 @@ async fn main() -> Result<(), ImageGatewayError> {
         ExecutorProfileBinding::GrokImageGeneration
         | ExecutorProfileBinding::GrokImageEdit
         | ExecutorProfileBinding::GrokVideoGeneration => ExecutorProcessSupervisor::Grok(
-            GrokProcessSupervisor::new(
+            GrokProcessSupervisor::new_with_expected_sha256(
                 journal.clone(),
                 &config.helper_executable,
                 &provider_runtime.executable,
                 &provider_runtime.credential_home,
                 &operational_credential.material_fingerprint_sha256,
+                &grok_runtime.as_ref().expect("Grok runtime identity").sha256,
+                config.request_timeout,
+                config.process_poll_interval,
+                config.process_startup_grace,
+                &config.proxy,
+            )?
+            .with_credential_resolver(profile.provider_account_id, credential_resolver.clone())?
+            .with_input_blobs(artifacts.clone())
+            .with_local_video_uploads(provider_uploads),
+        ),
+        ExecutorProfileBinding::GrokVideoGenerationV2 => ExecutorProcessSupervisor::Grok(
+            GrokProcessSupervisor::new_with_expected_sha256(
+                journal.clone(),
+                &config.helper_executable,
+                &provider_runtime.executable,
+                &provider_runtime.credential_home,
+                &operational_credential.material_fingerprint_sha256,
+                &grok_runtime.as_ref().expect("Grok runtime identity").sha256,
                 config.request_timeout,
                 config.process_poll_interval,
                 config.process_startup_grace,
@@ -540,6 +572,26 @@ async fn shutdown_signal() {
         _ = ctrl_c => {},
         _ = terminate => {},
     }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn compiled_linux_target() -> Result<&'static str, ImageGatewayError> {
+    Ok("x86_64-unknown-linux-gnu")
+}
+
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+fn compiled_linux_target() -> Result<&'static str, ImageGatewayError> {
+    Ok("aarch64-unknown-linux-gnu")
+}
+
+#[cfg(not(any(
+    all(target_os = "linux", target_arch = "x86_64"),
+    all(target_os = "linux", target_arch = "aarch64")
+)))]
+fn compiled_linux_target() -> Result<&'static str, ImageGatewayError> {
+    Err(ImageGatewayError::config(
+        "Grok executord supports only pinned Linux x86_64 or aarch64 targets",
+    ))
 }
 
 #[cfg(test)]
