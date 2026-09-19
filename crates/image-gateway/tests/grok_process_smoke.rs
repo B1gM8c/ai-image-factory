@@ -63,12 +63,14 @@ async fn detached_grok_runner_replays_sealed_output_without_a_second_cli_launch(
     let context_available = Arc::new(AtomicBool::new(true));
     let published = Arc::new(Mutex::new(Vec::new()));
     let publish_attempts = Arc::new(AtomicUsize::new(0));
-    let supervisor = GrokProcessSupervisor::new(
+    let fake_grok_sha256 = hex::encode(Sha256::digest(fs::read(&fake_grok).unwrap()));
+    let supervisor = GrokProcessSupervisor::new_with_expected_sha256(
         Arc::clone(&journal),
         helper,
         fake_grok,
         &credentials,
         &grok_auth_file_sha256(&credentials).unwrap(),
+        &fake_grok_sha256,
         Duration::from_secs(5),
         Duration::from_millis(10),
         Duration::from_secs(2),
@@ -85,6 +87,7 @@ async fn detached_grok_runner_replays_sealed_output_without_a_second_cli_launch(
         FailFirstArtifactSink {
             bytes: Arc::clone(&published),
             attempts: Arc::clone(&publish_attempts),
+            validate_video: false,
         },
     );
 
@@ -216,12 +219,14 @@ async fn detached_reference_video_runner_stages_inputs_replays_mp4_and_cleans_cl
     let provider_uploads = Arc::new(
         ProviderUploadService::new(&provider_artifacts, Some("http://127.0.0.1:8787")).unwrap(),
     );
-    let supervisor = GrokProcessSupervisor::new(
+    let fake_grok_sha256 = hex::encode(Sha256::digest(fs::read(&fake_grok).unwrap()));
+    let supervisor = GrokProcessSupervisor::new_with_expected_sha256(
         Arc::clone(&journal),
         helper,
         fake_grok,
         &credentials,
         &grok_auth_file_sha256(&credentials).unwrap(),
+        &fake_grok_sha256,
         Duration::from_secs(5),
         Duration::from_millis(10),
         Duration::from_secs(2),
@@ -240,6 +245,7 @@ async fn detached_reference_video_runner_stages_inputs_replays_mp4_and_cleans_cl
         FailFirstArtifactSink {
             bytes: published.clone(),
             attempts: attempts.clone(),
+            validate_video: false,
         },
     );
 
@@ -361,12 +367,14 @@ async fn detached_v2_image_to_video_uses_one_cli_launch_and_validated_mp4() {
     let provider_uploads = Arc::new(
         ProviderUploadService::new(&provider_artifacts, Some("http://127.0.0.1:8787")).unwrap(),
     );
-    let supervisor = GrokProcessSupervisor::new(
+    let fake_grok_sha256 = hex::encode(Sha256::digest(fs::read(&fake_grok).unwrap()));
+    let supervisor = GrokProcessSupervisor::new_with_expected_sha256(
         Arc::clone(&journal),
         helper,
         fake_grok,
         &credentials,
         &grok_auth_file_sha256(&credentials).unwrap(),
+        &fake_grok_sha256,
         Duration::from_secs(5),
         Duration::from_millis(10),
         Duration::from_secs(2),
@@ -387,6 +395,7 @@ async fn detached_v2_image_to_video_uses_one_cli_launch_and_validated_mp4() {
         FailFirstArtifactSink {
             bytes: Arc::clone(&published),
             attempts: Arc::clone(&attempts),
+            validate_video: true,
         },
     );
     let first = runner
@@ -409,6 +418,22 @@ async fn detached_v2_image_to_video_uses_one_cli_launch_and_validated_mp4() {
     assert_eq!(fs::read_to_string(invocations).unwrap(), "1\n");
     assert_eq!(*published.lock().unwrap(), expected_video);
     assert_eq!(attempts.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn artifact_sink_rejects_container_only_mp4() {
+    let sink = FailFirstArtifactSink {
+        bytes: Arc::new(Mutex::new(Vec::new())),
+        attempts: Arc::new(AtomicUsize::new(1)),
+        validate_video: true,
+    };
+    let result = sink
+        .publish(&lease(String::new()), &container_only_mp4())
+        .await;
+    assert!(matches!(
+        result,
+        Err(RunnerError::Definite { error_code }) if error_code == "invalid_video_artifact"
+    ));
 }
 
 struct GatedContextStore {
@@ -437,6 +462,7 @@ impl ExecutorLaunchContextStore for GatedContextStore {
 struct FailFirstArtifactSink {
     bytes: Arc<Mutex<Vec<u8>>>,
     attempts: Arc<AtomicUsize>,
+    validate_video: bool,
 }
 
 #[async_trait]
@@ -448,6 +474,11 @@ impl ExecutorArtifactSink for FailFirstArtifactSink {
     ) -> Result<ExecutorResultManifest, RunnerError> {
         if self.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
             return Err(RunnerError::Unavailable);
+        }
+        if self.validate_video && !valid_video_mp4(bytes) {
+            return Err(RunnerError::Definite {
+                error_code: "invalid_video_artifact".to_owned(),
+            });
         }
         *self.bytes.lock().map_err(|_| RunnerError::Internal)? = bytes.to_vec();
         ExecutorResultManifest::new(Uuid::new_v4(), Uuid::new_v4()).ok_or(RunnerError::Internal)
@@ -629,6 +660,41 @@ fn jpeg() -> Vec<u8> {
 }
 
 fn minimal_mp4() -> Vec<u8> {
+    let config = mp4::Mp4Config {
+        major_brand: "isom".parse().unwrap(),
+        minor_version: 512,
+        compatible_brands: vec!["isom".parse().unwrap(), "avc1".parse().unwrap()],
+        timescale: 1_000,
+    };
+    let mut writer = mp4::Mp4Writer::write_start(Cursor::new(Vec::new()), &config).unwrap();
+    writer
+        .add_track(
+            &mp4::AvcConfig {
+                width: 16,
+                height: 16,
+                seq_param_set: vec![0x67, 0x42, 0x00, 0x1e],
+                pic_param_set: vec![0x68, 0xce, 0x3c, 0x80],
+            }
+            .into(),
+        )
+        .unwrap();
+    writer
+        .write_sample(
+            1,
+            &mp4::Mp4Sample {
+                start_time: 0,
+                duration: 8_000,
+                rendering_offset: 0,
+                is_sync: true,
+                bytes: vec![0, 0, 0, 1, 0x65].into(),
+            },
+        )
+        .unwrap();
+    writer.write_end().unwrap();
+    writer.into_writer().into_inner()
+}
+
+fn container_only_mp4() -> Vec<u8> {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(&24_u32.to_be_bytes());
     bytes.extend_from_slice(b"ftypisom\0\0\0\0isommp42");
@@ -639,4 +705,17 @@ fn minimal_mp4() -> Vec<u8> {
     bytes.extend_from_slice(&9_u32.to_be_bytes());
     bytes.extend_from_slice(b"mdat\0");
     bytes
+}
+
+fn valid_video_mp4(bytes: &[u8]) -> bool {
+    let Ok(reader) = mp4::Mp4Reader::read_header(Cursor::new(bytes), bytes.len() as u64) else {
+        return false;
+    };
+    reader.tracks().values().any(|track| {
+        matches!(track.track_type(), Ok(mp4::TrackType::Video))
+            && track.sample_count() > 0
+            && track.width() > 0
+            && track.height() > 0
+            && track.duration().as_nanos() > 0
+    })
 }

@@ -24,7 +24,7 @@ use tokio::{io::AsyncReadExt, process::Command, time::Instant};
 use uuid::Uuid;
 
 use super::grok_direct_video::{GrokDiagnosticV1, generate_image_to_video};
-use super::grok_request::expected_grok_adapter_revision;
+use super::grok_request::{GrokDispatch, expected_grok_adapter_revision, grok_dispatch};
 use super::{
     ExecutorLaunchContext, ExecutorSubmissionLease, GrokExecutionRequest, RunnerError,
     SingleOutputSupervisor, SupervisedOutput, private_auth, project_grok_execution_request,
@@ -115,7 +115,7 @@ struct GrokSpawnObserver {
 
 impl GrokProcessSupervisor {
     #[allow(clippy::too_many_arguments)]
-    pub fn new(
+    fn new_unchecked(
         journal: Arc<FilesystemRunnerJournal>,
         helper_executable: impl AsRef<Path>,
         grok_executable: impl AsRef<Path>,
@@ -164,6 +164,32 @@ impl GrokProcessSupervisor {
         })
     }
 
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn new(
+        journal: Arc<FilesystemRunnerJournal>,
+        helper_executable: impl AsRef<Path>,
+        grok_executable: impl AsRef<Path>,
+        credential_home: impl AsRef<Path>,
+        credential_auth_sha256: &str,
+        request_timeout: Duration,
+        poll_interval: Duration,
+        startup_grace: Duration,
+        proxy: &ProxyConfig,
+    ) -> Result<Self, ImageGatewayError> {
+        Self::new_unchecked(
+            journal,
+            helper_executable,
+            grok_executable,
+            credential_home,
+            credential_auth_sha256,
+            request_timeout,
+            poll_interval,
+            startup_grace,
+            proxy,
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new_with_expected_sha256(
         journal: Arc<FilesystemRunnerJournal>,
@@ -178,7 +204,7 @@ impl GrokProcessSupervisor {
         proxy: &ProxyConfig,
     ) -> Result<Self, ImageGatewayError> {
         let expected = parse_expected_sha256(expected_grok_executable_sha256)?;
-        let supervisor = Self::new(
+        let supervisor = Self::new_unchecked(
             journal,
             helper_executable,
             grok_executable,
@@ -195,32 +221,6 @@ impl GrokProcessSupervisor {
             ));
         }
         Ok(supervisor)
-    }
-
-    pub fn new_pinned(
-        journal: Arc<FilesystemRunnerJournal>,
-        helper_executable: impl AsRef<Path>,
-        grok_executable: impl AsRef<Path>,
-        credential_home: impl AsRef<Path>,
-        credential_auth_sha256: &str,
-        expected_grok_executable_sha256: &str,
-        request_timeout: Duration,
-        poll_interval: Duration,
-        startup_grace: Duration,
-        proxy: &ProxyConfig,
-    ) -> Result<Self, ImageGatewayError> {
-        Self::new_with_expected_sha256(
-            journal,
-            helper_executable,
-            grok_executable,
-            credential_home,
-            credential_auth_sha256,
-            expected_grok_executable_sha256,
-            request_timeout,
-            poll_interval,
-            startup_grace,
-            proxy,
-        )
     }
 
     pub fn with_input_blobs(mut self, input_blobs: Arc<dyn InputBlobStore>) -> Self {
@@ -758,10 +758,13 @@ async fn run_grok_child(
         Ok((_, request)) => request,
         Err(_) => return ChildOutcome::Uncertain("runner_request_invalid"),
     };
-    if let GrokExecutionRequest::VideoGeneration(GrokVideoGenerationRequestV1::ImageToVideo(
-        image_to_video,
-    )) = &media_request
-    {
+    if grok_dispatch(&media_request) == GrokDispatch::DirectHttp {
+        let GrokExecutionRequest::VideoGeneration(GrokVideoGenerationRequestV1::ImageToVideo(
+            image_to_video,
+        )) = &media_request
+        else {
+            return ChildOutcome::Uncertain("grok_dispatch_mismatch");
+        };
         return match generate_image_to_video(
             &spool,
             image_to_video,
@@ -1823,12 +1826,14 @@ mod tests {
                 ProviderUploadService::new(&provider_artifacts, Some("http://127.0.0.1:8787"))
                     .unwrap(),
             );
-            let supervisor = GrokProcessSupervisor::new(
+            let executable_sha256 = hash_bounded_file(&executable).unwrap();
+            let supervisor = GrokProcessSupervisor::new_with_expected_sha256(
                 Arc::clone(&journal),
                 &executable,
                 &executable,
                 &credentials,
                 &sha256(b"{}"),
+                &executable_sha256,
                 Duration::from_secs(30),
                 Duration::from_millis(10),
                 Duration::from_secs(1),

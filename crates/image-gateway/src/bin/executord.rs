@@ -185,19 +185,13 @@ async fn main() -> Result<(), ImageGatewayError> {
         ));
     }
     let provider_runtime = ProviderRuntimeConfig::from_env(binding)?;
-    let grok_runtime = match binding {
-        ExecutorProfileBinding::GrokVideoGenerationV2 => Some(
-            lookup_runtime_identity(GrokRuntimeGeneration::V2, compiled_linux_target()?)
-                .map_err(|_| ImageGatewayError::config("Grok V2 runtime target is unsupported"))?,
-        ),
-        ExecutorProfileBinding::GrokImageGeneration
-        | ExecutorProfileBinding::GrokImageEdit
-        | ExecutorProfileBinding::GrokVideoGeneration => Some(
-            lookup_runtime_identity(GrokRuntimeGeneration::V1, compiled_linux_target()?)
-                .map_err(|_| ImageGatewayError::config("Grok V1 runtime target is unsupported"))?,
-        ),
-        _ => None,
-    };
+    let grok_runtime = grok_runtime_generation(binding)
+        .map(|generation| {
+            lookup_runtime_identity(generation, compiled_linux_target()?).map_err(|_| {
+                ImageGatewayError::config("Grok runtime target or generation is unsupported")
+            })
+        })
+        .transpose()?;
     validate_isolated_trees(
         &artifact_root,
         &config.runner_root,
@@ -574,24 +568,49 @@ async fn shutdown_signal() {
     }
 }
 
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-fn compiled_linux_target() -> Result<&'static str, ImageGatewayError> {
-    Ok("x86_64-unknown-linux-gnu")
+fn grok_runtime_generation(binding: ExecutorProfileBinding) -> Option<GrokRuntimeGeneration> {
+    match binding {
+        ExecutorProfileBinding::GrokImageGeneration
+        | ExecutorProfileBinding::GrokImageEdit
+        | ExecutorProfileBinding::GrokVideoGeneration => Some(GrokRuntimeGeneration::V1),
+        ExecutorProfileBinding::GrokVideoGenerationV2 => Some(GrokRuntimeGeneration::V2),
+        ExecutorProfileBinding::CodexImageGeneration | ExecutorProfileBinding::CodexImageEdit => {
+            None
+        }
+    }
 }
 
-#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
-fn compiled_linux_target() -> Result<&'static str, ImageGatewayError> {
-    Ok("aarch64-unknown-linux-gnu")
+fn target_triple_for(os: &str, arch: &str, env: &str) -> Option<&'static str> {
+    match (os, arch, env) {
+        ("linux", "x86_64", "gnu") => Some("x86_64-unknown-linux-gnu"),
+        ("linux", "aarch64", "gnu") => Some("aarch64-unknown-linux-gnu"),
+        _ => None,
+    }
 }
 
-#[cfg(not(any(
-    all(target_os = "linux", target_arch = "x86_64"),
-    all(target_os = "linux", target_arch = "aarch64")
-)))]
 fn compiled_linux_target() -> Result<&'static str, ImageGatewayError> {
-    Err(ImageGatewayError::config(
-        "Grok executord supports only pinned Linux x86_64 or aarch64 targets",
-    ))
+    let os = if cfg!(target_os = "linux") {
+        "linux"
+    } else {
+        "unsupported"
+    };
+    let arch = if cfg!(target_arch = "x86_64") {
+        "x86_64"
+    } else if cfg!(target_arch = "aarch64") {
+        "aarch64"
+    } else {
+        "unsupported"
+    };
+    let env = if cfg!(target_env = "gnu") {
+        "gnu"
+    } else {
+        "unsupported"
+    };
+    target_triple_for(os, arch, env).ok_or_else(|| {
+        ImageGatewayError::config(
+            "Grok executord supports only pinned Linux GNU x86_64 or aarch64 targets",
+        )
+    })
 }
 
 #[cfg(test)]
@@ -637,5 +656,40 @@ mod tests {
         let base = "x".repeat(128);
         assert!(executor_lane_owners(&base, 1).is_ok());
         assert!(executor_lane_owners(&base, 2).is_err());
+    }
+
+    #[test]
+    fn grok_profiles_select_the_expected_runtime_generation() {
+        assert_eq!(
+            grok_runtime_generation(ExecutorProfileBinding::GrokImageGeneration),
+            Some(GrokRuntimeGeneration::V1)
+        );
+        assert_eq!(
+            grok_runtime_generation(ExecutorProfileBinding::GrokVideoGeneration),
+            Some(GrokRuntimeGeneration::V1)
+        );
+        assert_eq!(
+            grok_runtime_generation(ExecutorProfileBinding::GrokVideoGenerationV2),
+            Some(GrokRuntimeGeneration::V2)
+        );
+        assert_eq!(
+            grok_runtime_generation(ExecutorProfileBinding::CodexImageGeneration),
+            None
+        );
+    }
+
+    #[test]
+    fn runtime_target_requires_linux_gnu_and_rejects_musl() {
+        assert_eq!(
+            target_triple_for("linux", "x86_64", "gnu"),
+            Some("x86_64-unknown-linux-gnu")
+        );
+        assert_eq!(
+            target_triple_for("linux", "aarch64", "gnu"),
+            Some("aarch64-unknown-linux-gnu")
+        );
+        assert_eq!(target_triple_for("linux", "x86_64", "musl"), None);
+        assert_eq!(target_triple_for("linux", "aarch64", "musl"), None);
+        assert_eq!(target_triple_for("darwin", "x86_64", "gnu"), None);
     }
 }
