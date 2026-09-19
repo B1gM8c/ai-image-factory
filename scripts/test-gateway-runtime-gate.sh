@@ -91,7 +91,8 @@ printf 'LISTEN 0 128 127.0.0.1:8789 0.0.0.0:* users:(("gateway",pid=%s,fd=9))\n'
 EOF
 cat >"$TEST_ROOT/bin/sha256sum" <<'EOF'
 #!/bin/bash
-shasum -a 256 "$@"
+echo "sha256sum mock must not be called" >&2
+exit 99
 EOF
 chmod 0755 "$TEST_ROOT/bin/systemctl" "$TEST_ROOT/bin/ss" "$TEST_ROOT/bin/sha256sum"
 
@@ -156,8 +157,15 @@ cp "$TEST_ROOT/provider-manifest.dual.json" "$TEST_ROOT/releases/v1/provider-man
 # The actual executord precedence is generic override first; management's
 # GATEWAY_MANAGED_GROK_EXECUTABLE must not influence process binding.
 printf 'EXECUTOR_HELPER_EXECUTABLE=%s\0EXECUTOR_PROVIDER_EXECUTABLE=%s\0EXECUTOR_GROK_EXECUTABLE=%s\0GATEWAY_MANAGED_GROK_EXECUTABLE=/outside\0' \
-  "$TEST_ROOT/releases/v1/bin/grok-runner" "$TEST_ROOT/releases/v1/bin/grok-v2" "$TEST_ROOT/releases/v1/bin/grok-v1" >"$TEST_ROOT/proc/102/environ"
+  "$TEST_ROOT/releases/v1/bin/grok-runner" "$TEST_ROOT/releases/v1/bin/grok-v2" /outside >"$TEST_ROOT/proc/102/environ"
 run_gate >/dev/null
+
+printf 'EXECUTOR_HELPER_EXECUTABLE=%s\0EXECUTOR_PROVIDER_EXECUTABLE=/outside\0EXECUTOR_GROK_EXECUTABLE=%s\0' \
+  "$TEST_ROOT/releases/v1/bin/grok-runner" "$TEST_ROOT/releases/v1/bin/grok-v1" >"$TEST_ROOT/proc/102/environ"
+if run_gate >/dev/null 2>&1; then
+  echo "expected non-empty generic override to win and fail" >&2
+  exit 1
+fi
 
 printf 'EXECUTOR_HELPER_EXECUTABLE=  %s  \0EXECUTOR_PROVIDER_EXECUTABLE=   \0EXECUTOR_GROK_EXECUTABLE=  %s  \0' \
   "$TEST_ROOT/releases/v1/bin/grok-runner" "$TEST_ROOT/releases/v1/bin/grok-v1" >"$TEST_ROOT/proc/102/environ"
