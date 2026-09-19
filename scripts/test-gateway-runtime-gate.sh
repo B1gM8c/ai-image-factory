@@ -168,9 +168,7 @@ ln "$TEST_ROOT/releases/v1/bin/grok-v2" "$TEST_ROOT/releases/v1/bin/grok-v2.hard
 if run_gate >/dev/null 2>&1; then echo "expected hardlink runtime to fail" >&2; exit 1; fi
 rm "$TEST_ROOT/releases/v1/bin/grok-v2.hardlink"
 
-printf 'EXECUTOR_HELPER_EXECUTABLE=%s\0EXECUTOR_GROK_EXECUTABLE=%s\0' \
-  "$TEST_ROOT/releases/v1/bin/codex-runner" "$TEST_ROOT/releases/v1/bin/grok-v1" >"$TEST_ROOT/proc/102/environ"
- : >"$TEST_ROOT/releases/v1/bin/unknown-runner"
+: >"$TEST_ROOT/releases/v1/bin/unknown-runner"
 chmod 0755 "$TEST_ROOT/releases/v1/bin/unknown-runner"
 printf 'EXECUTOR_HELPER_EXECUTABLE=%s\0EXECUTOR_GROK_EXECUTABLE=%s\0' \
   "$TEST_ROOT/releases/v1/bin/unknown-runner" "$TEST_ROOT/releases/v1/bin/grok-v1" >"$TEST_ROOT/proc/102/environ"
