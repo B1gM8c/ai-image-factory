@@ -342,7 +342,6 @@ async fn xai_image_to_video_v2_runs_through_the_real_durable_grok_supervisor() {
         first,
         DurableRunnerResult::Terminal(RunnerOutcome::Succeeded(_))
     ) {
-        cleanup_sensitive_v2_execution_paths(&journal_root, &lease);
         panic!(
             "unexpected Grok V2 video outcome after {elapsed_ms}ms: {first:?}; journal={}",
             journal_root.display()
@@ -413,18 +412,6 @@ fn live_video_uploads() -> (PathBuf, Arc<ProviderUploadService>) {
     let uploads = ProviderUploadService::new(&artifact_root, Some(public_base_url.trim()))
         .expect("shared Gateway provider upload artifact root and HTTPS public origin are invalid");
     (artifact_root, Arc::new(uploads))
-}
-
-fn cleanup_sensitive_v2_execution_paths(journal_root: &Path, lease: &ExecutorSubmissionLease) {
-    let execution_root = journal_root.join(lease.executor_execution_id.simple().to_string());
-    for relative in ["provider-home", "provider-workspaces/attempt"] {
-        let path = execution_root.join(relative);
-        match fs::remove_dir_all(&path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(_) => panic!("failed to clean sensitive V2 smoke execution paths"),
-        }
-    }
 }
 
 fn directory_entries(path: &Path) -> Vec<String> {
