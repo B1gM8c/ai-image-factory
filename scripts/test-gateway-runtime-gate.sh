@@ -22,16 +22,24 @@ mkdir -p \
   "$TEST_ROOT/proc/102" \
   "$TEST_ROOT/proc/103" \
   "$TEST_ROOT/releases/v1/bin"
+if [[ "$(uname -m)" == x86_64 ]]; then
+  TEST_TARGET_TRIPLE=aarch64-unknown-linux-gnu
+  TEST_ELF_MACHINE=183
+else
+  TEST_TARGET_TRIPLE=x86_64-unknown-linux-gnu
+  TEST_ELF_MACHINE=62
+fi
 ln -s "$TEST_ROOT/releases/v1" "$TEST_ROOT/current"
 ln -s "$TEST_ROOT/releases/v1/bin/gpt-image-2-gateway" "$TEST_ROOT/proc/101/exe"
 ln -s "$TEST_ROOT/releases/v1/bin/executord" "$TEST_ROOT/proc/102/exe"
 : >"$TEST_ROOT/releases/v1/bin/gpt-image-2-gateway"
-cat >"$TEST_ROOT/releases/v1/release.json" <<'EOF'
-{"schema_version":1,"release_version":"test","commit_sha":"0000000000000000000000000000000000000000000000000000000000000000","target_triple":"aarch64-unknown-linux-gnu"}
+cat >"$TEST_ROOT/releases/v1/release.json" <<EOF
+{"schema_version":1,"release_version":"test","commit_sha":"0000000000000000000000000000000000000000000000000000000000000000","target_triple":"${TEST_TARGET_TRIPLE}"}
 EOF
-python3 - "$TEST_ROOT/releases/v1/bin/grok" "$TEST_ROOT/releases/v1/bin/grok-v1" "$TEST_ROOT/releases/v1/bin/grok-v2" <<'PY'
+python3 - "$TEST_ROOT/releases/v1/bin/grok" "$TEST_ROOT/releases/v1/bin/grok-v1" "$TEST_ROOT/releases/v1/bin/grok-v2" "$TEST_ELF_MACHINE" <<'PY'
 import pathlib, struct, sys
-for name, machine in zip(sys.argv[1:], (183, 183, 183)):
+machine = int(sys.argv[-1])
+for name in sys.argv[1:-1]:
     data = bytearray(64)
     data[:4] = b'\x7fELF'; data[4] = 2; data[5] = 1
     struct.pack_into('<H', data, 18, machine)
@@ -48,11 +56,15 @@ grok_v2_sha256="$(sha256_file "$TEST_ROOT/releases/v1/bin/grok-v2")"
 cat >"$TEST_ROOT/releases/v1/provider-manifest.json" <<EOF
 {"schema_version":1,"provider":"xai-grok-cli","version":"1.0.5","version_output":"grok 1.0.5 (5115b46bc9)","target_triple":"aarch64-unknown-linux-gnu","binary_path":"bin/grok","binary_sha256":"${grok_sha256}","binary_bytes":64,"compatibility_revision":"grok-cli-1.0.5","image_adapter_revision":"grok-cli-1.0.5.agentic-media.v2","video_adapter_revision":"grok-api-1.0.5.direct-image-video.v5","runtimes":{"v1":{"generation":"v1","version":"1.0.5","version_output":"grok 1.0.5 (5115b46bc9)","target_triple":"aarch64-unknown-linux-gnu","binary_path":"bin/grok-v1","binary_sha256":"${grok_sha256}","binary_bytes":64,"elf_machine":183,"compatibility_revision":"grok-cli-1.0.5","image_adapter_revision":"grok-cli-1.0.5.agentic-media.v2","video_adapter_revision":"grok-api-1.0.5.direct-image-video.v5"},"v2":{"generation":"v2","version":"1.0.34","version_output":"grok 1.0.34 (3736acbc8658)","target_triple":"aarch64-unknown-linux-gnu","binary_path":"bin/grok-v2","binary_sha256":"${grok_v2_sha256}","binary_bytes":64,"elf_machine":183,"compatibility_revision":"grok-cli-1.0.34","image_adapter_revision":null,"video_adapter_revision":"grok-cli-1.0.34.agentic-video.v1"}}}
 EOF
-python3 - "$TEST_ROOT/releases/v1/provider-manifest.json" <<'PY'
+python3 - "$TEST_ROOT/releases/v1/provider-manifest.json" <<PY
 import json, sys
 p = sys.argv[1]
 m = json.load(open(p))
 m['source_repository'] = 'https://github.com/xai-org/grok-build'
+m['target_triple'] = '${TEST_TARGET_TRIPLE}'
+for runtime in m['runtimes'].values():
+    runtime['target_triple'] = '${TEST_TARGET_TRIPLE}'
+    runtime['elf_machine'] = int('${TEST_ELF_MACHINE}')
 json.dump(m, open(p, 'w'))
 PY
 printf 'EXECUTOR_HELPER_EXECUTABLE=%s\0EXECUTOR_GROK_EXECUTABLE=%s\0' \
@@ -117,12 +129,38 @@ m.pop('runtimes', None)
 json.dump(m, open(p, 'w'))
 PY
 run_gate AIF_UPDATE_PROCESS_SCOPE=validation AIF_VERIFY_RELEASE_UNITS=ai-image-factory-gateway.service >/dev/null
+cp "$TEST_ROOT/releases/v1/provider-manifest.json" "$TEST_ROOT/provider-manifest.legacy.json"
+for legacy_field in version binary_bytes target_triple; do
+  python3 - "$TEST_ROOT/releases/v1/provider-manifest.json" "$legacy_field" <<'PY'
+import json, sys
+p, field = sys.argv[1:]; m = json.load(open(p)); m.pop(field, None); json.dump(m, open(p, 'w'))
+PY
+  if run_gate AIF_UPDATE_PROCESS_SCOPE=validation AIF_VERIFY_RELEASE_UNITS=ai-image-factory-gateway.service >/dev/null 2>&1; then
+    echo "expected legacy missing ${legacy_field} to fail" >&2
+    exit 1
+  fi
+  cp "$TEST_ROOT/provider-manifest.legacy.json" "$TEST_ROOT/releases/v1/provider-manifest.json"
+done
+python3 - "$TEST_ROOT/releases/v1/provider-manifest.json" <<'PY'
+import json, sys
+p = sys.argv[1]; m = json.load(open(p)); m['target_triple'] = 'aarch64-unknown-linux-gnu' if m['target_triple'].startswith('x86_64') else 'x86_64-unknown-linux-gnu'; json.dump(m, open(p, 'w'))
+PY
+if run_gate AIF_UPDATE_PROCESS_SCOPE=validation AIF_VERIFY_RELEASE_UNITS=ai-image-factory-gateway.service >/dev/null 2>&1; then
+  echo "expected legacy target mismatch to fail" >&2
+  exit 1
+fi
+cp "$TEST_ROOT/provider-manifest.legacy.json" "$TEST_ROOT/releases/v1/provider-manifest.json"
+rm "$TEST_ROOT/provider-manifest.legacy.json"
 cp "$TEST_ROOT/provider-manifest.dual.json" "$TEST_ROOT/releases/v1/provider-manifest.json"
 
 # The actual executord precedence is generic override first; management's
 # GATEWAY_MANAGED_GROK_EXECUTABLE must not influence process binding.
 printf 'EXECUTOR_HELPER_EXECUTABLE=%s\0EXECUTOR_PROVIDER_EXECUTABLE=%s\0EXECUTOR_GROK_EXECUTABLE=%s\0GATEWAY_MANAGED_GROK_EXECUTABLE=/outside\0' \
   "$TEST_ROOT/releases/v1/bin/grok-runner" "$TEST_ROOT/releases/v1/bin/grok-v2" "$TEST_ROOT/releases/v1/bin/grok-v1" >"$TEST_ROOT/proc/102/environ"
+run_gate >/dev/null
+
+printf 'EXECUTOR_HELPER_EXECUTABLE=  %s  \0EXECUTOR_PROVIDER_EXECUTABLE=   \0EXECUTOR_GROK_EXECUTABLE=  %s  \0' \
+  "$TEST_ROOT/releases/v1/bin/grok-runner" "$TEST_ROOT/releases/v1/bin/grok-v1" >"$TEST_ROOT/proc/102/environ"
 run_gate >/dev/null
 
 # A Codex executor may coexist with a Grok executor and is not forced onto a
@@ -136,7 +174,7 @@ p, mutation = sys.argv[1:]; m = json.load(open(p))
 if mutation == 'incomplete': m['runtimes'].pop('v2')
 elif mutation == 'crossed': m['runtimes']['v2']['binary_path'] = 'bin/grok-v1'
 elif mutation == 'adapter': m['runtimes']['v2']['video_adapter_revision'] = 'wrong'
-elif mutation == 'target': m['runtimes']['v2']['target_triple'] = 'x86_64-unknown-linux-gnu'
+elif mutation == 'target': m['runtimes']['v2']['target_triple'] = 'aarch64-unknown-linux-gnu' if m['runtimes']['v2']['target_triple'].startswith('x86_64') else 'x86_64-unknown-linux-gnu'
 elif mutation == 'size': m['runtimes']['v1']['binary_bytes'] += 1
 elif mutation == 'hash': m['runtimes']['v2']['binary_sha256'] = '0' * 64
 elif mutation == 'version': m['runtimes']['v2']['version_output'] = 'grok wrong'
