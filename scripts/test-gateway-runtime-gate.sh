@@ -21,6 +21,7 @@ mkdir -p \
   "$TEST_ROOT/proc/101" \
   "$TEST_ROOT/proc/102" \
   "$TEST_ROOT/proc/103" \
+  "$TEST_ROOT/external" \
   "$TEST_ROOT/releases/v1/bin"
 if [[ "$(uname -m)" == x86_64 ]]; then
   TEST_TARGET_TRIPLE=aarch64-unknown-linux-gnu
@@ -49,8 +50,8 @@ PY
 : >"$TEST_ROOT/releases/v1/bin/grok-runner"
 chmod 0755 "$TEST_ROOT/releases/v1/bin/grok" "$TEST_ROOT/releases/v1/bin/grok-v1" "$TEST_ROOT/releases/v1/bin/grok-v2" "$TEST_ROOT/releases/v1/bin/grok-runner"
 : >"$TEST_ROOT/releases/v1/bin/codex-runner"
-: >"$TEST_ROOT/releases/v1/bin/codex-cli"
-chmod 0755 "$TEST_ROOT/releases/v1/bin/codex-runner" "$TEST_ROOT/releases/v1/bin/codex-cli"
+: >"$TEST_ROOT/external/codex-cli"
+chmod 0755 "$TEST_ROOT/releases/v1/bin/codex-runner" "$TEST_ROOT/external/codex-cli"
 grok_sha256="$(sha256_file "$TEST_ROOT/releases/v1/bin/grok")"
 grok_v2_sha256="$(sha256_file "$TEST_ROOT/releases/v1/bin/grok-v2")"
 cat >"$TEST_ROOT/releases/v1/provider-manifest.json" <<EOF
@@ -71,7 +72,7 @@ printf 'EXECUTOR_HELPER_EXECUTABLE=%s\0EXECUTOR_GROK_EXECUTABLE=%s\0' \
   "$TEST_ROOT/releases/v1/bin/grok-runner" "$TEST_ROOT/releases/v1/bin/grok-v1" >"$TEST_ROOT/proc/102/environ"
 ln -s "$TEST_ROOT/releases/v1/bin/codex-runner" "$TEST_ROOT/proc/103/exe"
 printf 'EXECUTOR_HELPER_EXECUTABLE=%s\0EXECUTOR_CODEX_EXECUTABLE=%s\0' \
-  "$TEST_ROOT/releases/v1/bin/codex-runner" "$TEST_ROOT/releases/v1/bin/codex-cli" >"$TEST_ROOT/proc/103/environ"
+  "$TEST_ROOT/releases/v1/bin/codex-runner" "$TEST_ROOT/external/codex-cli" >"$TEST_ROOT/proc/103/environ"
 
 cat >"$TEST_ROOT/bin/systemctl" <<'EOF'
 #!/bin/bash

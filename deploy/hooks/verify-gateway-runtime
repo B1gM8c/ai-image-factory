@@ -212,10 +212,6 @@ while IFS= read -r release_unit; do
       fi
       [[ -n "$configured_provider" ]] || die "executor provider executable is missing: ${release_unit}"
       provider_path="$(readlink -f "$configured_provider")"
-      case "$provider_path" in
-        "${release_root}"/*) ;;
-        *) die "executor provider executable is outside current release: ${release_unit}" ;;
-      esac
       if [[ "$executor_kind" == grok ]]; then
         case "$provider_path" in
           "${release_root}/bin/grok"|"${release_root}/bin/grok-v1"|"${release_root}/bin/grok-v2") ;;
