@@ -46,7 +46,8 @@ cargo build --locked --release -p ai-image-factory-updater \
   --bin updated
 npm ci
 npm run build:admin
-scripts/fetch-grok-cli.sh x86_64-unknown-linux-gnu dist/grok-provider
+scripts/fetch-grok-cli.sh v1 x86_64-unknown-linux-gnu dist/grok-v1
+scripts/fetch-grok-cli.sh v2 x86_64-unknown-linux-gnu dist/grok-v2
 ```
 
 Record the Git commit, migration version, binary checksums, frontend build
@@ -55,9 +56,30 @@ workers with a newer schema unless the release notes explicitly define that
 compatibility window.
 
 Do not install or upgrade the Grok CLI independently on a production host. The
-official binary must match `providers/grok-cli.lock.json`, live inside the same
-immutable release as Gateway and executors, and be verified through the running
-executor PID by `verify-gateway-runtime`.
+release carries two immutable runtimes: V1 `1.0.5` for replay of existing
+commands and V2 `1.0.34` for newly admitted video jobs. They must match their
+respective lock files, live inside the same release as Gateway and executors,
+and be verified through the running executor PID by
+`verify-gateway-runtime`. Never repoint a V1 replay profile at `bin/grok-v2`.
+
+The public xAI-shaped video route remains default-off:
+`GATEWAY_ENABLE_XAI_VIDEO_API=false`. Installing V2, creating a profile, or
+publishing a price does not enable the route.
+
+For a V2 canary, create a separate executor environment (the helper and
+provider are both inside the current immutable release):
+
+```ini
+# /etc/ai-image-factory/executors/grok-video-v2.env
+EXECUTOR_HELPER_EXECUTABLE=/opt/ai-image-factory/current/bin/grok-runner
+EXECUTOR_PROVIDER_EXECUTABLE=/opt/ai-image-factory/current/bin/grok-v2
+EXECUTOR_GROK_CREDENTIAL_HOME=/var/lib/ai-image-factory/credentials/grok-video-v2
+```
+
+Keep V1 replay on `bin/grok-v1` and a separate credential home. The fixed
+privileged runtime hook must be installed at
+`/usr/libexec/ai-image-factory/hooks/verify-gateway-runtime`; a copy under the
+release tree is not active until the privileged maintenance step installs it.
 
 ## Storage And Secret Preconditions
 
@@ -163,8 +185,15 @@ Configured account concurrency is an upper bound, not evidence of live
 capacity. For example, `desired_max_concurrency=20` with zero workerd or
 executord leases has effective capacity zero and must not be reported as ready.
 
-Run one low-cost canary through the public API and one through Batch. The Batch
-canary must prove:
+Run one low-cost canary through each explicitly enabled public API and one
+through Batch. For the Grok V2 video canary, use an admitted image-to-video
+request with `generate_audio` omitted or `true`, `resolution=480p`, and a
+6-second duration. Verify that the response is an asynchronous Factory job,
+the final MP4 is private and hash-validated, the quote/ledger uses six
+`video_second` units, and repeating the same idempotency key does not create a
+second job or charge. Also prove `generate_audio=false`, `1080p`, URL audio,
+`file_id`, more than seven reference images, and more than three voice IDs are
+rejected before scheduling. The Batch canary must prove:
 
 - one input line creates one job, one work item, and one provider submission;
 - the quote records `processing_mode=batch`;
@@ -177,6 +206,10 @@ canary must prove:
 - the output JSONL has one line with the original `custom_id`, HTTP `200`, and a
   non-empty `data[0].b64_json`;
 - the downloaded JSONL hash matches the authoritative project-file record.
+
+V2 text-to-video and image-to-video accept only 6 or 10 seconds; reference-to-
+video accepts 1-15 seconds. The route does not provide `/v1/videos/edits` or
+`/v1/videos/extensions`, because the CLI binding has no corresponding tool.
 
 Browser gates:
 
@@ -244,6 +277,12 @@ not generated media bytes.
 
 Migrations are immutable. Do not edit an applied migration or attempt ad hoc
 down-migration SQL during an incident.
+
+If only the V2 canary is unhealthy, close the xAI video route, stop the V2
+executor instance, and leave the V1 replay executor untouched. A V2 rollback is
+complete only after `verify-gateway-runtime` proves the selected V1/V2 paths and
+the public route remains disabled. Do not solve a V2 failure by replacing the
+shared `bin/grok` compatibility executable.
 
 The updater intentionally rejects a downgrade after an Apply has committed.
 Do not perform an ad hoc in-place rollback by separately restoring PostgreSQL,

@@ -240,6 +240,7 @@ pub fn openapi_json() -> Json<Value> {
         ImageReferenceDoc,
         VideoGenerationRequestDoc,
         VideoImageReferenceDoc,
+        VideoAudioReferenceDoc,
         VideoOutputDoc,
         VideoStorageOptionsDoc,
         VideoStartResponseDoc,
@@ -583,7 +584,7 @@ async fn edit_image() {}
     request_body(
         content = VideoGenerationRequestDoc,
         content_type = "application/json",
-        description = "xAI-compatible asynchronous video request. Grok CLI input images currently require base64 data URLs; represented file_id, output, and storage options fail closed when the binding cannot honor them."
+        description = "xAI-shaped asynchronous video request. New requests use the opt-in Grok CLI 1.0.34 V2 binding: generated audio is required, image inputs are base64/data URLs, reference_images accepts at most seven images, reference_audios accepts at most three voice_id entries (audio URLs are rejected), and only 480p/720p are executable. Existing V1 jobs remain replayable through their stored command schema."
     ),
     responses(
         (status = 200, description = "Video request accepted", body = VideoStartResponseDoc),
@@ -2757,11 +2758,17 @@ struct VideoGenerationRequestDoc {
     aspect_ratio: Option<VideoAspectRatioDoc>,
     #[schema(minimum = 1, maximum = 15, default = 8)]
     duration: Option<u8>,
+    /// V2 defaults to true and rejects an explicit false value.
+    generate_audio: Option<bool>,
     image: Option<VideoImageReferenceDoc>,
+    /// Optional final frame; when present the request is a reference-to-video workflow.
+    last_frame: Option<VideoImageReferenceDoc>,
     model: Option<String>,
     output: Option<VideoOutputDoc>,
     prompt: Option<String>,
     #[schema(max_items = 3)]
+    reference_audios: Option<Vec<VideoAudioReferenceDoc>>,
+    #[schema(max_items = 7)]
     reference_images: Option<Vec<VideoImageReferenceDoc>>,
     #[schema(inline)]
     resolution: Option<VideoResolutionDoc>,
@@ -2773,8 +2780,18 @@ struct VideoGenerationRequestDoc {
 #[allow(dead_code)]
 struct VideoImageReferenceDoc {
     file_id: Option<String>,
-    /// Base64 data URL for the current Grok CLI binding.
+    /// Base64/data URL for the Grok CLI binding. `file_id` is shaped for xAI
+    /// compatibility but is rejected before admission by this binding.
     url: Option<String>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+#[allow(dead_code)]
+struct VideoAudioReferenceDoc {
+    /// URL audio is part of the xAI DTO but is not executable by Grok CLI 1.0.34.
+    url: Option<String>,
+    /// Grok CLI V2 accepts up to three non-empty voice identifiers.
+    voice_id: Option<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -3229,8 +3246,6 @@ enum VideoResolutionDoc {
     P480,
     #[serde(rename = "720p")]
     P720,
-    #[serde(rename = "1080p")]
-    P1080,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
