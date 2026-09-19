@@ -289,15 +289,18 @@ jobs:
           npm ci
           npm run build:admin
 
-      - name: Fetch lock-verified official Grok CLI
+      - name: Fetch lock-verified Grok V1 and V2 runtimes
         env:
           RELEASE_TARGET: ${{ matrix.target }}
-        run: scripts/fetch-grok-cli.sh "$RELEASE_TARGET" dist/grok-provider
+        run: |
+          scripts/fetch-grok-cli.sh v1 "$RELEASE_TARGET" dist/grok-provider-v1
+          scripts/fetch-grok-cli.sh v2 "$RELEASE_TARGET" dist/grok-provider-v2
 
       - name: Package deterministic release assets
         env:
           MIN_SCHEMA_VERSION: "128"
-          GROK_PROVIDER_BINARY: ${{ github.workspace }}/dist/grok-provider
+          GROK_V1_PROVIDER_BINARY: ${{ github.workspace }}/dist/grok-provider-v1
+          GROK_V2_PROVIDER_BINARY: ${{ github.workspace }}/dist/grok-provider-v2
           RELEASE_TARGET: ${{ matrix.target }}
           RELEASE_VERSION: ${{ github.ref_name }}
           RELEASE_COMMIT: ${{ github.sha }}
@@ -382,7 +385,7 @@ jobs:
                 and .target_triple == $target
                 and .migration_version == .target_schema_version
                 and .min_schema_version == 128
-                and .target_schema_version == 131
+                and .target_schema_version == 132
                 and .min_schema_version <= .target_schema_version
                 and .rollback_mode == "backup_restore"
                 and (.files | length > 0)

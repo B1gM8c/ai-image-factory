@@ -113,8 +113,11 @@ jobs:
             -p gpt-image-2-gateway -p ai-image-factory-updater --bins
           npm ci
           npm run build:admin
-          scripts/fetch-grok-cli.sh x86_64-unknown-linux-gnu "$RUNNER_TEMP/aif-grok"
-          MIN_SCHEMA_VERSION=128 GROK_PROVIDER_BINARY="$RUNNER_TEMP/aif-grok" \
+          scripts/fetch-grok-cli.sh v1 x86_64-unknown-linux-gnu "$RUNNER_TEMP/aif-grok-v1"
+          scripts/fetch-grok-cli.sh v2 x86_64-unknown-linux-gnu "$RUNNER_TEMP/aif-grok-v2"
+          MIN_SCHEMA_VERSION=128 \
+            GROK_V1_PROVIDER_BINARY="$RUNNER_TEMP/aif-grok-v1" \
+            GROK_V2_PROVIDER_BINARY="$RUNNER_TEMP/aif-grok-v2" \
             scripts/package-release.sh "v0.1.0-rehearsal.${GITHUB_SHA:0:7}" \
               x86_64-unknown-linux-gnu "$GITHUB_SHA" "$RUNNER_TEMP/aif-candidate"
 

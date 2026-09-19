@@ -344,6 +344,79 @@ with tarfile.open(bundle_path, mode="r:gz") as archive:
             raise SystemExit(f"bundle member integrity mismatch: {member.name}")
         output.chmod(entry["mode"])
 
+provider_manifest_path = destination / "provider-manifest.json"
+with provider_manifest_path.open("r", encoding="utf-8") as source:
+    provider_manifest = json.load(source)
+runtimes = provider_manifest.get("runtimes")
+if runtimes is not None:
+    if set(runtimes) != {"v1", "v2"}:
+        raise SystemExit("dual runtime manifest must contain exactly v1 and v2")
+    runtime_fields = {
+        "generation",
+        "version",
+        "version_output",
+        "target_triple",
+        "binary_path",
+        "binary_sha256",
+        "binary_bytes",
+        "elf_machine",
+        "compatibility_revision",
+        "image_adapter_revision",
+        "video_adapter_revision",
+    }
+    for generation, expected_path in (("v1", "bin/grok-v1"), ("v2", "bin/grok-v2")):
+        runtime = runtimes[generation]
+        if not isinstance(runtime, dict) or set(runtime) != runtime_fields:
+            raise SystemExit(f"{generation} runtime manifest shape is invalid")
+        if runtime.get("generation") != generation or runtime.get("target_triple") != target_triple:
+            raise SystemExit(f"{generation} runtime identity is invalid")
+        expected_identity = {
+            "v1": ("1.0.5", "grok 1.0.5 (5115b46bc9)", "grok-cli-1.0.5"),
+            "v2": ("1.0.34", "grok 1.0.34 (3736acbc8658)", "grok-cli-1.0.34"),
+        }[generation]
+        if (
+            runtime.get("version"),
+            runtime.get("version_output"),
+            runtime.get("compatibility_revision"),
+        ) != expected_identity or not isinstance(runtime.get("version_output"), str):
+            raise SystemExit(f"{generation} runtime version identity is invalid")
+        expected_machine = {
+            "x86_64-unknown-linux-gnu": 62,
+            "aarch64-unknown-linux-gnu": 183,
+        }[target_triple]
+        if runtime.get("elf_machine") != expected_machine:
+            raise SystemExit(f"{generation} runtime ELF identity is invalid")
+        if runtime.get("binary_path") != expected_path:
+            raise SystemExit(f"{generation} runtime path is invalid")
+        expected_adapters = {
+            "v1": ("grok-cli-1.0.5.agentic-media.v2", "grok-api-1.0.5.direct-image-video.v5"),
+            "v2": (None, "grok-cli-1.0.34.agentic-video.v1"),
+        }[generation]
+        if (
+            runtime.get("image_adapter_revision"),
+            runtime.get("video_adapter_revision"),
+        ) != expected_adapters:
+            raise SystemExit(f"{generation} runtime adapter pairing is invalid")
+        binary_path = destination / expected_path
+        metadata = binary_path.lstat()
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            raise SystemExit(f"{generation} runtime is not an independent regular file")
+        binary_bytes = binary_path.read_bytes()
+        digest = hashlib.sha256(binary_bytes).hexdigest()
+        if runtime.get("binary_bytes") != len(binary_bytes) or runtime.get("binary_sha256") != digest:
+            raise SystemExit(f"{generation} runtime inventory does not match the binary")
+        inventory = expected.get(expected_path)
+        if inventory is None or inventory["bytes"] != len(binary_bytes) or inventory["sha256"] != digest:
+            raise SystemExit(f"{generation} runtime is not covered by signed inventory")
+    if provider_manifest.get("binary_path") != "bin/grok":
+        raise SystemExit("dual runtime compatibility path is invalid")
+    compat = destination / "bin/grok"
+    v1_binary = destination / "bin/grok-v1"
+    if compat.stat().st_size != v1_binary.stat().st_size or hashlib.sha256(compat.read_bytes()).hexdigest() != hashlib.sha256(v1_binary.read_bytes()).hexdigest():
+        raise SystemExit("V1 compatibility copy does not match bin/grok-v1")
+    if provider_manifest.get("binary_bytes") != runtimes["v1"]["binary_bytes"] or provider_manifest.get("binary_sha256") != runtimes["v1"]["binary_sha256"]:
+        raise SystemExit("V1 compatibility manifest does not match runtimes.v1")
+
 expected_machine = {
     "x86_64-unknown-linux-gnu": 62,
     "aarch64-unknown-linux-gnu": 183,
