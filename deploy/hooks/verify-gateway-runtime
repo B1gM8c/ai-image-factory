@@ -162,8 +162,9 @@ target_triple="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))
 target_arch="${target_triple%%-*}"
 version_checks=false
 [[ "$(uname -s)" == Linux && "$(uname -m)" == "$target_arch" ]] && version_checks=true
-while IFS='|' read -r mode generation binary_path expected_sha expected_version; do
+while IFS='|' read -r mode generation binary_path _expected_sha expected_version; do
   [[ -n "$mode" ]] || continue
+  # The manifest parser above validates the SHA; retain this field for the pipe shape.
   binary_executable="${release_root}/${binary_path}"
   if [[ "$version_checks" == true ]]; then
     [[ "$($binary_executable --version)" == "$expected_version" ]] || die "${generation} Grok provider executable version differs from the release manifest"
