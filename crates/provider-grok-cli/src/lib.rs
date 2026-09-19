@@ -5,6 +5,7 @@ mod command;
 mod policy;
 mod receipt;
 mod request;
+mod runtime_identity;
 mod video_v2;
 mod xai;
 mod xai_video;
@@ -33,6 +34,9 @@ pub use request::{
     ImageAspectRatio, ImageModel, ImageToVideoRequestV1, MAX_IMAGE_EDIT_REFERENCES,
     ReferenceToVideoRequestV1, RequestValidationError, StagedImageV1, TextToVideoRequestV1,
     VideoAspectRatio, VideoDuration, VideoResolution,
+};
+pub use runtime_identity::{
+    GrokRuntimeGeneration, GrokRuntimeIdentity, GrokRuntimeIdentityError, lookup_runtime_identity,
 };
 pub use video_v2::{
     GROK_VIDEO_GENERATION_COMMAND_SCHEMA_V2, GrokVideoGenerationInputsV2,

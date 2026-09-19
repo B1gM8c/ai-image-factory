@@ -19,13 +19,85 @@ use tempfile::TempDir;
 use super::*;
 
 #[test]
-fn immutable_provider_lock_matches_runtime_compatibility_revisions() {
-    let lock: serde_json::Value =
+fn versioned_provider_locks_keep_v1_and_pin_v2_without_an_image_claim() {
+    let v1: serde_json::Value =
+        serde_json::from_str(include_str!("../../../providers/grok-cli-v1.lock.json")).unwrap();
+    let v2: serde_json::Value =
         serde_json::from_str(include_str!("../../../providers/grok-cli.lock.json")).unwrap();
-    assert_eq!(lock["version"], GROK_CLI_COMPATIBILITY_VERSION);
-    assert_eq!(lock["compatibility_revision"], "grok-cli-1.0.5");
-    assert_eq!(lock["image_adapter_revision"], ADAPTER_REVISION);
-    assert_eq!(lock["video_adapter_revision"], VIDEO_ADAPTER_REVISION);
+    assert_eq!(v1["version"], "1.0.5");
+    assert_eq!(v1["version"], GROK_CLI_COMPATIBILITY_VERSION);
+    assert_eq!(v1["version_output"], "grok 1.0.5 (5115b46bc9)");
+    assert_eq!(v1["compatibility_revision"], "grok-cli-1.0.5");
+    assert_eq!(
+        v1["image_adapter_revision"],
+        "grok-cli-1.0.5.agentic-media.v2"
+    );
+    assert_eq!(v1["image_adapter_revision"], ADAPTER_REVISION);
+    assert_eq!(
+        v1["video_adapter_revision"],
+        "grok-api-1.0.5.direct-image-video.v5"
+    );
+    assert_eq!(v1["video_adapter_revision"], VIDEO_ADAPTER_REVISION);
+    assert_eq!(v2["version"], "1.0.34");
+    assert_eq!(v2["version_output"], "grok 1.0.34 (3736acbc8658)");
+    assert_eq!(v2["compatibility_revision"], "grok-cli-1.0.34");
+    assert_eq!(v2["image_adapter_revision"], serde_json::Value::Null);
+    assert_eq!(
+        v2["video_adapter_revision"],
+        "grok-cli-1.0.34.agentic-video.v1"
+    );
+}
+
+#[test]
+fn runtime_identity_reads_exact_target_artifacts_from_the_selected_lock() {
+    let v1 =
+        lookup_runtime_identity(GrokRuntimeGeneration::V1, "x86_64-unknown-linux-gnu").unwrap();
+    let v2 =
+        lookup_runtime_identity(GrokRuntimeGeneration::V2, "x86_64-unknown-linux-gnu").unwrap();
+    let v1_arm =
+        lookup_runtime_identity(GrokRuntimeGeneration::V1, "aarch64-unknown-linux-gnu").unwrap();
+    let v2_arm =
+        lookup_runtime_identity(GrokRuntimeGeneration::V2, "aarch64-unknown-linux-gnu").unwrap();
+    let v1_lock: serde_json::Value =
+        serde_json::from_str(include_str!("../../../providers/grok-cli-v1.lock.json")).unwrap();
+    let v2_lock: serde_json::Value =
+        serde_json::from_str(include_str!("../../../providers/grok-cli.lock.json")).unwrap();
+    assert_eq!(
+        v1.sha256,
+        v1_lock["artifacts"]["x86_64-unknown-linux-gnu"]["sha256"]
+            .as_str()
+            .unwrap()
+    );
+    assert_eq!(
+        v2.sha256,
+        v2_lock["artifacts"]["x86_64-unknown-linux-gnu"]["sha256"]
+            .as_str()
+            .unwrap()
+    );
+    assert_ne!(v1.sha256, v2.sha256);
+    assert_eq!(v1_arm.elf_machine, 183);
+    assert_eq!(v2_arm.elf_machine, 183);
+    assert_ne!(v1_arm.sha256, v2_arm.sha256);
+    assert_eq!(v1.compatibility_revision, "grok-cli-1.0.5");
+    assert_eq!(v2.compatibility_revision, "grok-cli-1.0.34");
+    assert_eq!(
+        v1.image_adapter_revision,
+        Some("grok-cli-1.0.5.agentic-media.v2".to_owned())
+    );
+    assert_eq!(v2.image_adapter_revision, None);
+    assert_eq!(
+        v2.video_adapter_revision,
+        "grok-cli-1.0.34.agentic-video.v1"
+    );
+}
+
+#[test]
+fn runtime_identity_rejects_unknown_and_crossed_inputs() {
+    assert!(
+        lookup_runtime_identity(GrokRuntimeGeneration::V1, "riscv64gc-unknown-linux-gnu").is_err()
+    );
+    assert!(lookup_runtime_identity(GrokRuntimeGeneration::V2, "x86_64-unknown-freebsd").is_err());
+    assert!("v3".parse::<GrokRuntimeGeneration>().is_err());
 }
 
 #[test]

@@ -7,16 +7,31 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 readonly SCRIPT_DIR
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd -P)"
 readonly REPO_ROOT
-readonly LOCK_FILE="${REPO_ROOT}/providers/grok-cli.lock.json"
-
 die() {
   printf 'fetch-grok-cli: %s\n' "$*" >&2
   exit 1
 }
 
-[[ $# -eq 2 ]] || die "usage: scripts/fetch-grok-cli.sh <target-triple> <output-path>"
-readonly TARGET_TRIPLE="$1"
-readonly OUTPUT_PATH="$2"
+case "$#" in
+  2)
+    readonly RUNTIME_GENERATION="v1"
+    readonly TARGET_TRIPLE="$1"
+    readonly OUTPUT_PATH="$2"
+    ;;
+  3)
+    readonly RUNTIME_GENERATION="$1"
+    readonly TARGET_TRIPLE="$2"
+    readonly OUTPUT_PATH="$3"
+    ;;
+  *)
+    die "usage: scripts/fetch-grok-cli.sh [<v1|v2>] <target-triple> <output-path>"
+    ;;
+esac
+case "$RUNTIME_GENERATION" in
+  v1) readonly LOCK_FILE="${REPO_ROOT}/providers/grok-cli-v1.lock.json" ;;
+  v2) readonly LOCK_FILE="${REPO_ROOT}/providers/grok-cli.lock.json" ;;
+  *) die "unsupported runtime generation: ${RUNTIME_GENERATION}" ;;
+esac
 case "$TARGET_TRIPLE" in
   x86_64-unknown-linux-gnu | aarch64-unknown-linux-gnu) ;;
   *) die "unsupported target: ${TARGET_TRIPLE}" ;;
@@ -41,13 +56,32 @@ file_size() {
 }
 
 metadata="$({
-  env LOCK_FILE="$LOCK_FILE" TARGET_TRIPLE="$TARGET_TRIPLE" node <<'NODE'
+  env LOCK_FILE="$LOCK_FILE" RUNTIME_GENERATION="$RUNTIME_GENERATION" TARGET_TRIPLE="$TARGET_TRIPLE" node <<'NODE'
 const fs = require("node:fs");
 const lock = JSON.parse(fs.readFileSync(process.env.LOCK_FILE, "utf8"));
 const artifact = lock.artifacts?.[process.env.TARGET_TRIPLE];
+const expected = {
+  v1: {
+    version: "1.0.5",
+    compatibility_revision: "grok-cli-1.0.5",
+    image_adapter_revision: "grok-cli-1.0.5.agentic-media.v2",
+    video_adapter_revision: "grok-api-1.0.5.direct-image-video.v5",
+  },
+  v2: {
+    version: "1.0.34",
+    compatibility_revision: "grok-cli-1.0.34",
+    image_adapter_revision: null,
+    video_adapter_revision: "grok-cli-1.0.34.agentic-video.v1",
+  },
+}[process.env.RUNTIME_GENERATION];
 if (
+  !expected ||
   lock.schema_version !== 1 ||
   lock.provider !== "xai-grok-cli" ||
+  lock.version !== expected.version ||
+  lock.compatibility_revision !== expected.compatibility_revision ||
+  lock.image_adapter_revision !== expected.image_adapter_revision ||
+  lock.video_adapter_revision !== expected.video_adapter_revision ||
   typeof lock.version !== "string" ||
   typeof lock.version_output !== "string" ||
   !artifact ||

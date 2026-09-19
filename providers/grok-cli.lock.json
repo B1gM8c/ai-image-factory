@@ -2,22 +2,22 @@
   "schema_version": 1,
   "provider": "xai-grok-cli",
   "source_repository": "https://github.com/xai-org/grok-build",
-  "version": "1.0.5",
-  "version_output": "grok 1.0.5 (5115b46bc9)",
-  "compatibility_revision": "grok-cli-1.0.5",
-  "image_adapter_revision": "grok-cli-1.0.5.agentic-media.v2",
-  "video_adapter_revision": "grok-api-1.0.5.direct-image-video.v5",
+  "version": "1.0.34",
+  "version_output": "grok 1.0.34 (3736acbc8658)",
+  "compatibility_revision": "grok-cli-1.0.34",
+  "image_adapter_revision": null,
+  "video_adapter_revision": "grok-cli-1.0.34.agentic-video.v1",
   "artifacts": {
     "x86_64-unknown-linux-gnu": {
-      "url": "https://x.ai/cli/grok-1.0.5-linux-x86_64",
-      "sha256": "9ba87444e1819e8f6104adbbf4676a870c204380aa5c3e1c38a926c4ea677238",
-      "bytes": 166854368,
+      "url": "https://x.ai/cli/grok-1.0.34-linux-x86_64",
+      "sha256": "be5905e107d2b8b5f3c142d21ecfe4c8fd32a913d2fd551b788707930c4dc80d",
+      "bytes": 163035648,
       "elf_machine": 62
     },
     "aarch64-unknown-linux-gnu": {
-      "url": "https://x.ai/cli/grok-1.0.5-linux-aarch64",
-      "sha256": "1c1fe67d7c35497fb09f44a451f57acc3787add4c9aea2c56f5c7c75dc5ffcf1",
-      "bytes": 136259976,
+      "url": "https://x.ai/cli/grok-1.0.34-linux-aarch64",
+      "sha256": "39ab87666877d64ef3a40aa60fbe0c3b6a6acd7001b78fe60e2c76bb6cfc4a94",
+      "bytes": 136090504,
       "elf_machine": 183
     }
   }

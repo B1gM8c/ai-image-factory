@@ -314,7 +314,7 @@ readonly OUTPUT_DIR
 readonly ASSET_PREFIX="ai-image-factory-${RELEASE_VERSION}-${TARGET_TRIPLE}"
 readonly BUNDLE_PATH="${OUTPUT_DIR}/${ASSET_PREFIX}.tar.gz"
 readonly MANIFEST_PATH="${OUTPUT_DIR}/${ASSET_PREFIX}.manifest.json"
-readonly GROK_LOCK_FILE="${REPO_ROOT}/providers/grok-cli.lock.json"
+readonly GROK_LOCK_FILE="${REPO_ROOT}/providers/grok-cli-v1.lock.json"
 readonly GROK_PROVIDER_BINARY="${GROK_PROVIDER_BINARY:-}"
 
 readonly -a GATEWAY_BINARIES=(
