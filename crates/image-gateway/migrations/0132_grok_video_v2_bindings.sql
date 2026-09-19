@@ -200,13 +200,25 @@ JOIN LATERAL (
     SELECT route.selection_strategy, route.quota_freshness_ms,
            route.unknown_quota_policy
     FROM provider_route_members member
+    JOIN provider_route_heads head
+      ON head.route_id = member.route_id
+     AND head.provider_id = member.provider_id
+     AND head.operation_id = member.operation_id
+     AND head.command_schema = member.command_schema
+     AND head.current_revision = member.route_revision
+     AND head.state = 'enabled'
     JOIN provider_routes route
       ON route.route_id = member.route_id
-     AND route.revision = member.route_revision
+     AND route.provider_id = member.provider_id
+     AND route.operation_id = member.operation_id
+     AND route.command_schema = member.command_schema
+     AND route.revision = head.current_revision
+     AND route.state = 'enabled'
     WHERE member.provider_account_id = profile.provider_account_id
       AND member.operation_id = 'videos.generations'
       AND member.command_schema = 'grok-cli.videos.generate.v1'
-    ORDER BY route.created_at_ms, route.route_id
+      AND member.state = 'enabled'
+    ORDER BY route.created_at_ms DESC, route.route_id, route.revision DESC
     LIMIT 1
 ) source_route ON TRUE
 WHERE profile.provider_id = 'grok-cli'

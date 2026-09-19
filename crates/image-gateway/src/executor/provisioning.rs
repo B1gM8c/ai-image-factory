@@ -240,18 +240,7 @@ pub async fn provision_grok_video_execution_profile(
     pool: &PgPool,
     provisioning: &GrokExecutionProfileProvisioning,
 ) -> Result<ProvisionedGrokExecutionProfile, GrokProfileProvisioningError> {
-    provision_execution_profile(
-        pool,
-        provisioning,
-        ProvisioningBinding {
-            provider_id: GROK_PROVIDER_ID,
-            command_schema: GROK_VIDEO_GENERATION_COMMAND_SCHEMA,
-            operation: &GROK_VIDEO_GENERATION_OPERATION_V1,
-            adapter_revision: GROK_VIDEO_ADAPTER_REVISION,
-            advisory_lock_key: "factoryctl.provision-grok-video-profile",
-        },
-    )
-    .await
+    provision_execution_profile(pool, provisioning, grok_video_v1_provisioning_binding()).await
 }
 
 pub async fn provision_grok_video_execution_profile_in_transaction(
@@ -261,13 +250,7 @@ pub async fn provision_grok_video_execution_profile_in_transaction(
     provision_execution_profile_in_transaction(
         tx,
         provisioning,
-        ProvisioningBinding {
-            provider_id: GROK_PROVIDER_ID,
-            command_schema: GROK_VIDEO_GENERATION_COMMAND_SCHEMA,
-            operation: &GROK_VIDEO_GENERATION_OPERATION_V1,
-            adapter_revision: GROK_VIDEO_ADAPTER_REVISION,
-            advisory_lock_key: "factoryctl.provision-grok-video-profile",
-        },
+        grok_video_v1_provisioning_binding(),
     )
     .await
 }
@@ -620,6 +603,16 @@ fn grok_video_v2_provisioning_binding() -> ProvisioningBinding {
         operation: &GROK_VIDEO_GENERATION_OPERATION_V2,
         adapter_revision: GROK_VIDEO_ADAPTER_REVISION_V2,
         advisory_lock_key: "factoryctl.provision-grok-video-v2-profile",
+    }
+}
+
+fn grok_video_v1_provisioning_binding() -> ProvisioningBinding {
+    ProvisioningBinding {
+        provider_id: GROK_PROVIDER_ID,
+        command_schema: GROK_VIDEO_GENERATION_COMMAND_SCHEMA,
+        operation: &GROK_VIDEO_GENERATION_OPERATION_V1,
+        adapter_revision: GROK_VIDEO_ADAPTER_REVISION,
+        advisory_lock_key: "factoryctl.provision-grok-video-profile",
     }
 }
 
@@ -1070,4 +1063,39 @@ fn map_sql_error(error: sqlx::Error) -> CodexProfileProvisioningError {
         }
     }
     CodexProfileProvisioningError::Unavailable
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{grok_video_v1_provisioning_binding, grok_video_v2_provisioning_binding};
+
+    #[test]
+    fn grok_video_v1_and_v2_bindings_are_exact_and_lock_isolated() {
+        let v1 = grok_video_v1_provisioning_binding();
+        let v2 = grok_video_v2_provisioning_binding();
+        assert_eq!(v1.provider_id, "grok-cli");
+        assert_eq!(v2.provider_id, "grok-cli");
+        assert_eq!(v1.command_schema, "grok-cli.videos.generate.v1");
+        assert_eq!(v2.command_schema, "grok-cli.videos.generate.v2");
+        assert_eq!(v1.operation.id, v2.operation.id);
+        assert_eq!(
+            v1.operation.descriptor_revision,
+            "grok-cli/videos.generations/v1"
+        );
+        assert_eq!(
+            v2.operation.descriptor_revision,
+            "grok-cli/videos.generations/v2"
+        );
+        assert_eq!(
+            v1.operation.canonical_sha256_v1_hex(),
+            "13d4f2db461ddddd1b8dbd8cd33df94556e3280453de83ea3de9ef60276cccd0"
+        );
+        assert_eq!(
+            v2.operation.canonical_sha256_v1_hex(),
+            "7d9fa78e4528e9cf833abb97261c9f4a7a5c369d74b70d1462a892c4c747aa7b"
+        );
+        assert_eq!(v1.adapter_revision, "grok-api-1.0.5.direct-image-video.v5");
+        assert_eq!(v2.adapter_revision, "grok-cli-1.0.34.agentic-video.v1");
+        assert_ne!(v1.advisory_lock_key, v2.advisory_lock_key);
+    }
 }

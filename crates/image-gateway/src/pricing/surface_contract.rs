@@ -1363,6 +1363,37 @@ mod tests {
     }
 
     #[test]
+    fn grok_video_v2_migration_matches_runtime_binding_snapshot() {
+        let snapshot = contract("grok-cli.videos.generations.v2.pricing-surface")
+            .binding_snapshot(ExactSurfaceIdentity {
+                api_profile: "xai-videos-v1",
+                provider_model_id: "grok-imagine-video-1.5",
+                public_model_id: "grok-imagine-video-1.5",
+                service_tier: "standard",
+                execution_surface: "provider_cli",
+            })
+            .expect("runtime V2 pricing binding");
+        let migration = include_str!("../../migrations/0132_grok_video_v2_bindings.sql");
+        let start = migration
+            .find("$contract$\n")
+            .expect("V2 migration contract delimiter")
+            + "$contract$\n".len();
+        let end = migration[start..]
+            .find("\n    $contract$::JSONB")
+            .map(|offset| start + offset)
+            .expect("V2 migration contract terminator");
+        let migration_json: Value =
+            serde_json::from_str(migration[start..end].trim()).expect("migration contract JSON");
+        let migration_normalizer = migration_json["contract"]["normalizer_key"]
+            .as_str()
+            .expect("migration normalizer key");
+        assert_eq!(snapshot.contract_json, migration_json);
+        assert!(migration.contains(&format!("'{}'", snapshot.contract_key)));
+        assert!(migration.contains(&format!("'{}'", snapshot.contract_hash)));
+        assert_eq!(snapshot.normalizer_key, migration_normalizer);
+    }
+
+    #[test]
     fn codex_edit_has_a_distinct_identity_with_the_same_pricing_shape() {
         let generation = contract("openai-codex.images.generations.pricing-surface");
         let edit = contract("openai-codex.images.edits.pricing-surface");
