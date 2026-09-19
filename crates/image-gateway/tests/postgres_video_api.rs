@@ -20,13 +20,14 @@ use gpt_image_2_gateway::{
         XAI_VIDEO_INPUT_MANIFEST_SCHEMA_V2,
     },
     artifacts::{ExecutorArtifactPublisher, FilesystemArtifactBlobStore},
-    build_router_with_external_execution,
+    build_router_with_external_execution_and_control_plane_and_runtime_events_and_model_routing,
     database::{connect_test_pool_with_search_path, run_migrations},
     executor::{
         ExecutorClaimScope, ExecutorHandoffStore, ExecutorSubmissionOutcome,
         ExecutorSubmissionStore, GrokExecutionProfileProvisioning, PostgresExecutorSubmissionStore,
         provision_grok_video_v2_execution_profile,
     },
+    model_routing::PostgresModelRoutingStore,
     pricing::{
         CreatePriceBookRequest, CreatePriceBookVersionRequest, PostgresPricingAdminService,
         PriceBookVersionDraft, PriceComponentDraft, PricingAdminService,
@@ -75,6 +76,10 @@ async fn xai_video_api_runs_one_tenant_scoped_billed_mp4_job_end_to_end() -> Tes
             .create_project("Video project")
             .await
             .map_err(debug_error)?;
+        let v1_project = keys
+            .create_project("Legacy V1 video project")
+            .await
+            .map_err(debug_error)?;
         let other_project = keys
             .create_project("Other video project")
             .await
@@ -106,6 +111,15 @@ async fn xai_video_api_runs_one_tenant_scoped_billed_mp4_job_end_to_end() -> Tes
             )
             .await
             .map_err(debug_error)?;
+        let v1_owner = keys
+            .create_service_account(
+                &v1_project.id,
+                "Legacy V1 video owner",
+                ApiKeyPermissionMode::All,
+                ApiKeyPermissions::default(),
+            )
+            .await
+            .map_err(debug_error)?;
         let other = keys
             .create_service_account(
                 &other_project.id,
@@ -124,12 +138,43 @@ async fn xai_video_api_runs_one_tenant_scoped_billed_mp4_job_end_to_end() -> Tes
             profile.execution_profile_id,
         )
         .await?;
+        sqlx::query(
+            r#"
+            INSERT INTO gateway_api_key_provider_routes
+              (api_key_id, service_account_id, project_id, tenant_id, provider_id,
+               operation_id, command_schema, route_id, route_revision, bound_at_ms)
+            SELECT $1, $2, $3, $3, provider_id, operation_id, command_schema,
+                   route_id, route_revision, bound_at_ms
+            FROM gateway_api_key_provider_routes
+            WHERE api_key_id = $4 AND provider_id = 'grok-cli'
+              AND operation_id = 'videos.generations'
+            "#,
+        )
+        .bind(&v1_owner.api_key.id)
+        .bind(&v1_owner.id)
+        .bind(&v1_project.id)
+        .bind(&owner.api_key.id)
+        .execute(&database.pool)
+        .await
+        .map_err(debug_error)?;
         seed_video_economics(&database.pool, &owner_project.id).await?;
+        sqlx::query(
+            "INSERT INTO billing_accounts
+               (tenant_id, currency, credit_limit_micros, held_micros, captured_micros,
+                created_at_ms, updated_at_ms)
+             SELECT $1, currency, credit_limit_micros, 0, 0, created_at_ms, updated_at_ms
+             FROM billing_accounts WHERE tenant_id = $2 AND currency = 'USD'",
+        )
+        .bind(&v1_project.id)
+        .bind(&owner_project.id)
+        .execute(&database.pool)
+        .await
+        .map_err(debug_error)?;
         let settlement = Arc::new(PostgresExecutionSettlementStore::new(
             database.pool.clone(),
             blobs.clone(),
         ));
-        let app = build_router_with_external_execution(
+        let app = build_router_with_external_execution_and_control_plane_and_runtime_events_and_model_routing(
             config(),
             ExternalImageGatewayComponents {
                 usage_store: Arc::new(PostgresUsageStore::new(database.pool.clone())),
@@ -141,6 +186,11 @@ async fn xai_video_api_runs_one_tenant_scoped_billed_mp4_job_end_to_end() -> Tes
                     database.pool.clone(),
                 )),
             },
+            None,
+            None,
+            None,
+            None,
+            Some(Arc::new(PostgresModelRoutingStore::new(database.pool.clone()))),
         )
         .map_err(debug_error)?;
         // The route seeded above is the legacy V1 binding.  Exercise it before
@@ -151,7 +201,7 @@ async fn xai_video_api_runs_one_tenant_scoped_billed_mp4_job_end_to_end() -> Tes
             app.clone(),
             Method::POST,
             "/v1/videos/generations",
-            &owner.api_key.value,
+            &v1_owner.api_key.value,
             Some("video-v1-compatibility"),
             Some(&v1_body),
         )
@@ -176,12 +226,57 @@ async fn xai_video_api_runs_one_tenant_scoped_billed_mp4_job_end_to_end() -> Tes
             v1_schema == GROK_VIDEO_GENERATION_COMMAND_SCHEMA,
             format!("legacy V1 route was not preserved: {v1_schema}"),
         )?;
+        let (v1_replay_status, v1_replay) = json_request(
+            app.clone(),
+            Method::POST,
+            "/v1/videos/generations",
+            &v1_owner.api_key.value,
+            Some("video-v1-compatibility"),
+            Some(&v1_body),
+        )
+        .await?;
+        require(
+            v1_replay_status == StatusCode::OK && v1_replay == v1_created,
+            format!("legacy V1 idempotent replay diverged: {v1_replay_status} {v1_replay}"),
+        )?;
         let v2_profile_id = activate_v2_fixture(
             &database.pool,
             &owner.api_key.id,
             profile.provider_account_id,
         )
         .await?;
+        let (v1_after_status, v1_after_created) = json_request(
+            app.clone(),
+            Method::POST,
+            "/v1/videos/generations",
+            &v1_owner.api_key.value,
+            Some("video-v1-compatibility-after-v2"),
+            Some(&v1_body),
+        )
+        .await?;
+        require(
+            v1_after_status == StatusCode::OK,
+            format!(
+                "legacy V1 route failed after V2 activation: {v1_after_status} {v1_after_created}"
+            ),
+        )?;
+        let v1_after_job_id = Uuid::parse_str(
+            v1_after_created["request_id"]
+                .as_str()
+                .ok_or_else(|| "legacy V1 replay omitted request_id".to_owned())?,
+        )
+        .map_err(debug_error)?;
+        let v1_after_schema: String = sqlx::query_scalar(
+            "SELECT command_schema FROM job_payloads WHERE job_id = $1",
+        )
+        .bind(v1_after_job_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(
+            v1_after_schema == GROK_VIDEO_GENERATION_COMMAND_SCHEMA,
+            format!("legacy V1 route changed after V2 activation: {v1_after_schema}"),
+        )?;
         let body = video_request_v2();
         let (created_status, created) = json_request(
             app.clone(),
@@ -539,7 +634,7 @@ async fn xai_video_v2_migration_stays_disabled_then_claims_exactly() -> TestResu
             database.pool.clone(),
             blobs.clone(),
         ));
-        let app = build_router_with_external_execution(
+        let app = build_router_with_external_execution_and_control_plane_and_runtime_events_and_model_routing(
             config(),
             ExternalImageGatewayComponents {
                 usage_store: Arc::new(PostgresUsageStore::new(database.pool.clone())),
@@ -551,6 +646,11 @@ async fn xai_video_v2_migration_stays_disabled_then_claims_exactly() -> TestResu
                     database.pool.clone(),
                 )),
             },
+            None,
+            None,
+            None,
+            None,
+            Some(Arc::new(PostgresModelRoutingStore::new(database.pool.clone()))),
         )
         .map_err(debug_error)?;
         let now: i64 = sqlx::query_scalar(
@@ -611,13 +711,10 @@ async fn xai_video_v2_migration_stays_disabled_then_claims_exactly() -> TestResu
         .await
         .map_err(debug_error)?;
         require(
-            disabled_status == StatusCode::INTERNAL_SERVER_ERROR
-                && disabled_body["error"]["message"]
-                    == "durable video admission integrity check failed"
-                && disabled_states.iter().all(|(kind, state)| {
-                    (kind == "job" && matches!(state.as_str(), "failed" | "aborted" | "canceled"))
-                        || (kind == "quota" && matches!(state.as_str(), "released" | "canceled"))
-                }),
+            disabled_status == StatusCode::BAD_REQUEST
+                && disabled_body["error"]["code"] == "invalid_value"
+                && disabled_counts_before == disabled_counts_after
+                && disabled_states.is_empty(),
             format!("disabled V2 route admitted active work: {disabled_status} {disabled_body} {disabled_counts_before:?}->{disabled_counts_after:?} states={disabled_states:?}"),
         )?;
 

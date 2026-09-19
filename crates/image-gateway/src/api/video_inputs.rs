@@ -11,9 +11,9 @@ use image_api_contracts::xai::{
 };
 use reqwest::{Client, Url, redirect::Policy};
 
-use crate::ImageGatewayError;
+use crate::{ImageGatewayError, generator::InputImage};
 
-use super::super::admission::XaiVideoInputRoleV2;
+use super::{super::admission::XaiVideoInputRoleV2, edit_input::decode_data_url_image};
 
 pub(super) const MAX_VIDEO_INPUT_BYTES: usize = 32 * 1024 * 1024;
 const HTTPS_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -119,14 +119,20 @@ pub(super) fn decode_video_inputs_v1(
             })
             .collect::<Result<Vec<_>, _>>()?,
     };
-    let limit = max_upload_bytes.min(MAX_VIDEO_INPUT_BYTES);
     let mut total_bytes = 0usize;
     sources
         .into_iter()
         .enumerate()
         .map(|(index, (param, source))| {
-            let decoded = decode_data_url(&param, source, limit, &mut total_bytes)?;
-            let extension = match decoded.media_type.as_str() {
+            let InputImage {
+                content_type,
+                bytes,
+                ..
+            } = decode_data_url_image(&param, source, false, &mut total_bytes, max_upload_bytes)?;
+            let media_type = content_type.ok_or_else(|| {
+                ImageGatewayError::internal("decoded video input has no media type")
+            })?;
+            let extension = match media_type.as_str() {
                 "image/png" => "png",
                 "image/jpeg" => "jpg",
                 "image/webp" => "webp",
@@ -134,7 +140,8 @@ pub(super) fn decode_video_inputs_v1(
             };
             Ok(DecodedVideoInput {
                 filename: format!("input-{index}.{extension}"),
-                ..decoded
+                media_type,
+                bytes,
             })
         })
         .collect()
@@ -520,5 +527,31 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn v1_decoder_uses_configured_limit_and_handles_padded_base64() {
+        let mut bytes = vec![0x89, b'P', b'N', b'G', b'\r', b'\n', b'\x1a', b'\n'];
+        bytes.extend(std::iter::repeat_n(0_u8, 32 * 1024 * 1024 + 1));
+        let command = XaiVideoGenerationCommandV1 {
+            schema_version: 1,
+            operation: "videos.generations".to_owned(),
+            aspect_ratio: None,
+            duration: 6,
+            image: Some(XaiVideoImageUrl {
+                file_id: None,
+                url: Some(format!("data:image/png;base64,{}", STANDARD.encode(&bytes))),
+            }),
+            model: Some("grok-imagine-video-1.5-preview".to_owned()),
+            output: None,
+            prompt: None,
+            reference_images: Vec::new(),
+            resolution: image_api_contracts::xai::XaiVideoResolution::P480,
+            storage_options: None,
+            user: None,
+        };
+        let inputs = decode_video_inputs_v1(&command, 33 * 1024 * 1024).unwrap();
+        assert_eq!(inputs[0].bytes.len(), 32 * 1024 * 1024 + 9);
+        assert!(decode_video_inputs_v1(&command, 32 * 1024 * 1024).is_err());
     }
 }

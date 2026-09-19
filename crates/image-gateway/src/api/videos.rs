@@ -94,7 +94,6 @@ pub(super) async fn create_video_with_auth(
         auth.route
             .as_ref()
             .map(|route| route.command_schema.as_str()),
-        &request,
     )?;
     let (intent, decoded) = match api_version {
         VideoApiVersion::V1 => {
@@ -227,7 +226,6 @@ enum VideoApiVersion {
 
 fn select_video_api_version(
     route_schema: Option<&str>,
-    request: &XaiVideoGenerationRequest,
 ) -> Result<VideoApiVersion, ImageGatewayError> {
     let version = match route_schema {
         None => VideoApiVersion::V1,
@@ -244,23 +242,6 @@ fn select_video_api_version(
         }
     };
 
-    let model = request.model.as_deref();
-    let model_allowed = match version {
-        VideoApiVersion::V1 => model.is_none_or(|model| {
-            matches!(
-                model,
-                "grok-imagine-video" | "grok-imagine-video-1.5-preview"
-            )
-        }),
-        VideoApiVersion::V2 => model.is_some_and(|model| model == "grok-imagine-video-1.5"),
-    };
-    if !model_allowed {
-        return Err(ImageGatewayError::invalid_request(
-            "video model does not match the selected route command schema",
-            Some("model".to_owned()),
-            "invalid_value",
-        ));
-    }
     Ok(version)
 }
 
@@ -804,57 +785,24 @@ mod tests {
     use crate::admission::XaiVideoAdmissionPlan;
     use crate::input_blobs::InputBlobRef;
 
-    fn version_request(model: Option<&str>) -> XaiVideoGenerationRequest {
-        XaiVideoGenerationRequest {
-            aspect_ratio: None,
-            duration: Some(6),
-            generate_audio: None,
-            image: None,
-            last_frame: None,
-            model: model.map(str::to_owned),
-            output: None,
-            prompt: Some("a paper boat on a lake".to_owned()),
-            reference_audios: Vec::new(),
-            reference_images: Vec::new(),
-            resolution: Some(XaiVideoResolution::P480),
-            storage_options: None,
-            user: None,
-        }
-    }
-
     #[test]
-    fn video_route_schema_selects_v1_or_v2_and_rejects_crossed_models() {
+    fn video_route_schema_selects_v1_or_v2_and_rejects_unknown_schema() {
+        assert_eq!(select_video_api_version(None).unwrap(), VideoApiVersion::V1);
         assert_eq!(
-            select_video_api_version(None, &version_request(None)).unwrap(),
-            VideoApiVersion::V1
-        );
-        assert_eq!(
-            select_video_api_version(
-                Some(image_provider_grok_cli::GROK_VIDEO_GENERATION_COMMAND_SCHEMA),
-                &version_request(Some("grok-imagine-video")),
-            )
+            select_video_api_version(Some(
+                image_provider_grok_cli::GROK_VIDEO_GENERATION_COMMAND_SCHEMA,
+            ))
             .unwrap(),
             VideoApiVersion::V1
         );
         assert_eq!(
-            select_video_api_version(
-                Some(image_provider_grok_cli::GROK_VIDEO_GENERATION_COMMAND_SCHEMA_V2),
-                &version_request(Some("grok-imagine-video-1.5")),
-            )
+            select_video_api_version(Some(
+                image_provider_grok_cli::GROK_VIDEO_GENERATION_COMMAND_SCHEMA_V2,
+            ))
             .unwrap(),
             VideoApiVersion::V2
         );
-        assert!(
-            select_video_api_version(
-                Some(image_provider_grok_cli::GROK_VIDEO_GENERATION_COMMAND_SCHEMA),
-                &version_request(Some("grok-imagine-video-1.5")),
-            )
-            .is_err()
-        );
-        assert!(
-            select_video_api_version(Some("unknown.video.schema"), &version_request(None),)
-                .is_err()
-        );
+        assert!(select_video_api_version(Some("unknown.video.schema")).is_err());
     }
 
     use super::*;
