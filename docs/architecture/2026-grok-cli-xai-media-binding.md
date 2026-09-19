@@ -1,16 +1,18 @@
 # Grok CLI to xAI media API binding
 
-> Status: xAI image and video contracts, Grok projection, schema-scoped
-> handoff, digest-bound input staging, separate image/video runtime profiles,
-> fenced execution, bounded image/MP4 artifact publication, Media Economics V3,
-> and the default-off public asynchronous video routes are implemented
+> Status: xAI-shaped image and video contracts, Grok CLI projection,
+> schema-scoped handoff, digest-bound input staging, separate V1/V2 runtime
+> profiles, fenced execution, bounded image/MP4 artifact publication, Media
+> Economics V3, and the default-off public asynchronous video route are
+> implemented. This is a provider binding, not a claim that the CLI is the
+> official xAI REST API.
 >
-> Verified: 2026-08-19 against the official xAI documentation and OpenAPI,
-> the official `xai-org/grok-build` source, pinned Grok CLI `1.0.5`, fake
-> crash/replay tests, PostgreSQL migration/profile/launch-context tests, and one
-> explicitly approved real 6-second 480p image-to-video invocation through the
-> durable supervisor. It produced a validated 431,280-byte MP4 with SHA-256
-> `0fe33c5cc6ca999409f9a370dbdf6138160817b3dbe2f3bc560d7fc50e65e5d9`.
+> Verified: 2026-09-19 against the official xAI documentation and OpenAPI,
+> the official `xai-org/grok-build` source, locked Grok CLI V1 `1.0.5` and V2
+> `1.0.34`, fake crash/replay tests, PostgreSQL migration/profile/launch-context
+> tests, and the V2 capability/projection suite. A paid V2 production smoke is
+> still a deployment gate; no V2 real-media success is implied by this source
+> document.
 
 ## Decision
 
@@ -48,19 +50,30 @@ unrelated image model through `active_providers()`.
 | --- | --- | --- | --- |
 | `POST /v1/images/generations` | synchronous; official request and response schemas include model, count, ratio, resolution, response format, storage, user attribution, file output, and usage | `image_gen`; one local JPEG; effective `1k`; no upstream URL or Files API handle is exposed | retain the full official DTO; currently admit only `n=1`, omitted/`1k` resolution, explicit `b64_json`, and no `storage_options` |
 | `POST /v1/images/edits` | synchronous image edit | `image_edit`; 1-3 source images; quality model; one `1k` image | keep inactive until the full official edit DTO, typed source hash, sealed input staging, and cleanup path are implemented |
-| `POST /v1/videos/generations` text-only | asynchronous | no direct CLI tool | reject; do not hide an image generation plus image-to-video double charge |
-| `POST /v1/videos/generations` with one image | asynchronous | direct xAI REST adapter; 6 or 10 seconds; `480p` or `720p` | submit the admitted fields without an agent rewriting them, then poll the remote task as a platform async job |
-| `POST /v1/videos/generations` with reference images | asynchronous | `reference_to_video`; 2-7 images; five ratios; 6 or 10 seconds; `480p` or `720p` | support as a platform async job |
+| `POST /v1/videos/generations` text-only | asynchronous | Grok CLI V2 agentic video; 6 or 10 seconds; `480p` or `720p`; generated audio required | support only when the V2 profile is explicitly selected; bill one admitted duration and expose a Factory job |
+| `POST /v1/videos/generations` with one image | asynchronous | Grok CLI V2 image-to-video; one base64/data-URL image or bounded public HTTPS image (no redirects or private targets); optional prompt; 6 or 10 seconds; `480p` or `720p`; no aspect-ratio override | support only through V2; the image is staged by digest and the CLI reconstructs the media request |
+| `POST /v1/videos/generations` with reference inputs | asynchronous | Grok CLI V2 reference-to-video; `last_frame` and reference images accept base64/data-URL or bounded public HTTPS (no redirects or private targets); up to 7 reference images, up to 3 voice IDs; 1-15 seconds; `480p` or `720p` | support only for CLI-expressible local inputs; reference-audio URLs and `file_id` are rejected |
 | `POST /v1/videos/edits` | asynchronous | no CLI tool | reject |
 | `POST /v1/videos/extensions` | asynchronous | no CLI tool | reject |
 | `GET /v1/videos/{request_id}` | returns provider task progress and final URL | CLI hides the provider request ID and returns after polling | expose the factory job ID and factory state, not a fabricated xAI provider ID |
 
-Image `2k`, batches, `response_format=url`, `storage_options`, video edits,
-video extensions, and text-only video are not part of the CLI binding. These
-official fields remain in `api-contracts`; the projector returns a field-specific
-unsupported error before admission instead of dropping them. A future direct
-xAI API adapter can add them without changing the public facade or scheduler
-contracts.
+The public DTO follows the xAI route shape, but the V2 CLI intersection is
+deliberately narrower: `generate_audio` must be omitted or `true` (explicit
+`false` is rejected), `last_frame` and `reference_images` are staged image
+inputs, `reference_audios` may contain only CLI-supported `voice_id` values (at
+most three; URL audio is not in the intersection), and `resolution` is only
+`480p` or `720p`. Text-to-video and image-to-video accept only 6 or 10 seconds;
+reference-to-video accepts 1-15 seconds. `file_id`, video edit, and video
+extension are outside this binding. The official DTO also retains `output` and
+`storage_options` for wire-shape compatibility; the Grok CLI V2 provider
+projection rejects those two fields with HTTP 400 before admission. A future
+provider-specific binding may classify them independently. Fields are never
+silently dropped or approximated.
+
+The CLI supports no `/v1/videos/edits` or `/v1/videos/extensions` operation.
+Those official xAI routes remain outside this binding and are not advertised by
+the Factory. A future direct xAI API adapter can add them without changing the
+public facade or scheduler contracts.
 
 The versioned request DTO rejects unknown fields. This is deliberate for a paid
 execution boundary: a newly added official field must first be modeled and
@@ -80,8 +93,7 @@ The official CLI source currently binds tools as follows:
 | --- | --- |
 | `image_gen` | `grok-imagine-image-quality` by default; generation can explicitly bind `grok-imagine-image` through the CLI model override |
 | `image_edit` | `grok-imagine-image-quality` |
-| direct image-to-video adapter | `grok-imagine-video-1.5` |
-| `reference_to_video` | `grok-imagine-video` |
+| V2 `grok-runner` video workflow | `grok-imagine-video-1.5` (including the validated preview/dated aliases) |
 
 These model identities are part of the canonical provider command. The xAI
 projector accepts the official 1.5 model name and its preview/dated aliases for
@@ -91,11 +103,12 @@ image-generation projector activates both `grok-imagine-image` and
 the durable command, and execution. Image editing remains quality-only. A
 request cannot claim an unrelated model while the CLI executes another.
 
-The agentic image and reference-video adapter contract is pinned to validated
-Grok CLI `1.0.5`. Image-to-video uses a separate direct-API adapter revision so
-that prompt, image, duration, and resolution are exactly the values admitted by
-the factory. Runtime profiles additionally bind the executable digest. A CLI or
-direct-adapter upgrade still requires capability revalidation before activation.
+V1 replay remains pinned to Grok CLI `1.0.5` and its stored command schemas.
+New V2 jobs bind Grok CLI `1.0.34` and adapter revision
+`grok-cli-1.0.34.agentic-video.v1`. Runtime profiles bind the executable
+digest and helper classification independently. The V2 binary is never
+substituted into a V1 replay, and a CLI upgrade requires capability and receipt
+revalidation before activation.
 
 ## Runtime boundary
 
@@ -151,9 +164,11 @@ xAI source command as well as `source_command_sha256`. Admission reparses that
 source, recomputes its hash, reprojects it into the Grok request, and requires
 an exact field-for-field match before the work item can be attached. Supported
 facade-only fields such as `user` therefore survive restart; unsupported
-official fields never reach the queue. Video data URLs are decoded and sealed
-before attachment; durable command JSON stores only staged SHA-256 references,
-while the original source-command hash remains the idempotency binding.
+official fields never reach the queue. Video base64 data URLs and bounded public
+HTTPS image URLs are fetched with no redirects and no private-address
+resolution, then decoded and sealed before attachment; durable command JSON
+stores only staged SHA-256 references, while the original source-command hash
+remains the idempotency binding.
 
 A CLI exit code alone is insufficient. A successful receipt requires all of:
 
@@ -258,37 +273,50 @@ EXECUTOR_MAX_CONCURRENCY=1 \
 cargo run -p gpt-image-2-gateway --bin factoryctl -- provision-grok-profile
 ```
 
-Use `provision-grok-video-profile` with a distinct
-`EXECUTOR_PROFILE_KEY`. Publish an explicit positive `video_second` price for
-`xai-videos-v1` / `video_generation` / `grok-cli`, configure tenant credit and
-quota, then enable the public routes with
-`GATEWAY_ENABLE_XAI_VIDEO_API=true`. An invalid boolean value fails startup.
+Use `provision-grok-video-v2-profile` with a distinct
+`EXECUTOR_PROFILE_KEY`, and bind new V2 work to the V2 executable explicitly:
+
+```ini
+# /etc/ai-image-factory/executors/grok-video-v2.env
+EXECUTOR_HELPER_EXECUTABLE=/opt/ai-image-factory/current/bin/grok-runner
+EXECUTOR_PROVIDER_EXECUTABLE=/opt/ai-image-factory/current/bin/grok-v2
+EXECUTOR_GROK_CREDENTIAL_HOME=/var/lib/ai-image-factory/credentials/grok-video-v2
+```
+
+Keep any V1 replay profile bound to `bin/grok-v1` (or the compatibility copy
+`bin/grok`) and a separate credential home. Publish an explicit positive
+`video_second` price for `xai-videos-v1` / `video_generation` / `grok-cli`,
+configure tenant credit and quota, then enable the public route with
+`GATEWAY_ENABLE_XAI_VIDEO_API=true`. The route is default-off; provisioning a
+profile or installing V2 does not enable it. An invalid boolean value fails
+startup.
 
 `workerd` uses `WORKER_EXECUTION_MODE=executor-handoff` and the exact profile
 key. `executord` accepts provider-neutral `EXECUTOR_PROVIDER_EXECUTABLE` and
-`EXECUTOR_CREDENTIAL_HOME`; the existing Codex-specific names and the new
-`GATEWAY_MANAGED_GROK_EXECUTABLE` / `EXECUTOR_GROK_CREDENTIAL_HOME` remain explicit
-fallbacks. It defaults `EXECUTOR_PROCESS_STARTUP_GRACE_MS` to 60 seconds so a
-signed provider CLI cold start is not misclassified as a missing durable
-process.
+`EXECUTOR_CREDENTIAL_HOME`; for Grok the explicit fallbacks are
+`EXECUTOR_GROK_EXECUTABLE` and `EXECUTOR_GROK_CREDENTIAL_HOME` (Codex keeps its
+own provider fallback). It defaults `EXECUTOR_PROCESS_STARTUP_GRACE_MS` to 60
+seconds so a signed provider CLI cold start is not misclassified as a missing
+durable process.
 
-The immutable release owns the provider executable. `providers/grok-cli.lock.json`
-pins the official xAI download URL, version, target architecture, byte size, and
-SHA-256; release packaging installs it as `bin/grok` and emits
-`provider-manifest.json`. Production executors must set
-`GATEWAY_MANAGED_GROK_EXECUTABLE=/opt/ai-image-factory/current/bin/grok`. The runtime
-gate reads that binding from each running executor PID, resolves the absolute
-path, verifies its digest, and executes the packaged binary's `--version`.
+The immutable release owns both provider executables. The V1 and V2 lock files
+pin the official xAI download URL, version, target architecture, byte size, and
+SHA-256; release packaging installs them as `bin/grok-v1` and `bin/grok-v2` and
+keeps `bin/grok` as a V1 compatibility copy. `provider-manifest.json` records
+both generations and their adapter revisions. The fixed privileged
+`verify-gateway-runtime` hook validates both binaries, classifies each running
+executor by helper (`grok-runner` versus `codex-runner`), and requires a Grok
+executor's selected provider path to be one of the manifest runtimes. On a
+matching Linux host it also verifies each packaged `--version`; cross-compiled
+artifacts are checked by digest/ELF identity only until target-host activation.
 
-Single-frame `image_to_video` is deterministic in adapter revision
-`grok-api-1.0.5.direct-image-video.v3`: Factory sends the admitted prompt,
-staged image bytes, duration, and resolution directly to the official xAI
-video API, then polls the returned request ID. It does not ask the Grok agent
-to reconstruct tool arguments, and it never truncates long prompts. Other
-agentic media calls retain strict receipt comparison. Before isolated provider
-history is removed, failures persist only bounded diagnostic classes, field
-names, JSON types, lengths, and SHA-256 values—never prompt text, image URLs,
-credentials, or raw helper output.
+V2 image-to-video and reference-to-video are agentic CLI workflows. The Factory
+stages inputs by digest, passes only the admitted V2 command, requires the
+receipt/schema comparison, and publishes one bounded MP4 artifact. It does not
+call a hidden direct xAI video adapter or invent a provider request ID.
+Before isolated provider history is removed, failures persist only bounded
+diagnostic classes, field names, JSON types, lengths, and SHA-256 values—never
+prompt text, image URLs, credentials, or raw helper output.
 
 The real image smoke is ignored by default and requires all three variables:
 
@@ -342,35 +370,46 @@ requires all gates below to pass in the deployment environment:
 
 1. xAI listener routing is independent from the OpenAI facade and is enabled
    only by `GATEWAY_ENABLE_XAI_VIDEO_API` (implemented and default-off);
-2. the agentic CLI runs inside the production isolation and egress boundary;
-3. runtime profiles bind account credential digest, operation descriptor
+2. V2 is provisioned and canaried as a distinct profile bound to `bin/grok-v2`;
+   V1 replay profiles remain bound to `bin/grok-v1` and are not rewritten;
+3. the fixed privileged `verify-gateway-runtime` hook is installed at
+   `/usr/libexec/ai-image-factory/hooks/verify-gateway-runtime` from the
+   verified release tree before activation; bundling a hook under `/opt` does
+   not activate the host gate;
+4. the agentic CLI runs inside the production isolation and egress boundary;
+5. runtime profiles bind account credential digest, operation descriptor
    digest, and adapter revision (implemented); a trusted deployment manifest
-   must additionally authorize the provider and helper executable digests (the
-   current supervisor self-pins the selected provider file only against later
-   replacement);
-4. the executor reads bounded `chat_history.jsonl` and invokes the provider
+   must additionally authorize the provider and helper executable digests;
+6. the executor reads bounded `chat_history.jsonl` and invokes the provider
    receipt parser under its fenced launch lease (implemented for image and
    video generation);
-5. staged input bytes are sealed and verified against their canonical hashes
+7. staged input bytes are sealed and verified against their canonical hashes
    (implemented for Grok video generation);
-6. image artifacts pass current decode validation through the artifact sink;
-7. video artifacts use bounded MP4 validation and a true file-to-object-store
+8. image artifacts pass current decode validation through the artifact sink;
+9. video artifacts use bounded MP4 validation and a true file-to-object-store
    streaming commit; validation is implemented, while the current truthful
    runtime descriptor remains `InlineBounded(256 MiB)`;
-8. scheduler capacity, reservation, settlement, timeout, and ambiguous-result
+10. scheduler capacity, reservation, settlement, timeout, and ambiguous-result
    tests cover the Grok account (schema-scoped claim, separate video profile,
    V3 video-second settlement, and public-contract database E2E are implemented;
    uncertain expiry policy remains a deployment gate);
-9. opt-in real image and image-to-video smokes pass through the durable Grok
-   supervisor; the public-contract gateway E2E passes with a fake MP4 authority.
+11. opt-in real image and V2 video smokes pass through the durable Grok
+    supervisor; the public-contract gateway E2E passes with a fake MP4
+    authority. If a V2 canary fails, first disable new V2 route/key bindings
+    while retaining the compatible V2 executor, worker, reducer, and poller;
+    drain pending/running jobs, attach/replay work, reservations, and
+    settlement before stopping those components. Only then roll back to the
+    previous signed release/profile; do not repoint a V1 replay profile at the
+    V2 binary.
 
-The current supervisor accepts the exact Grok image-generation and
-video-generation schemas. Image-to-video has real durable-supervisor evidence;
-reference-to-video has projection and fake-boundary coverage but no paid runtime
-smoke. Image edits remain inactive. Video bytes currently traverse the existing
-bounded 256 MiB durable spool and Files content response in memory; high-volume
-production activation requires streaming/range delivery and a bounded download
-concurrency lane rather than increasing that bound.
+The current supervisor accepts the exact Grok image-generation and V1/V2
+video-generation schemas. V2 projection and receipt tests cover text-to-video,
+image-to-video, last-frame/reference-image, and voice-ID inputs; a paid V2
+runtime smoke is still required at deployment. Image edits remain inactive.
+Video bytes currently traverse the existing bounded 256 MiB durable spool and
+Files content response in memory; high-volume production activation requires
+streaming/range delivery and a bounded download concurrency lane rather than
+increasing that bound.
 
 OAuth `auth.json` is copied into the execution-private provider home for local
 verification. Production activation additionally requires an account-level

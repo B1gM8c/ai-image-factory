@@ -4,7 +4,8 @@ use image_api_contracts::xai::{
     XAI_IMAGE_GENERATION_COMMAND_SCHEMA, XaiImageAspectRatio, XaiImageGenerationCommandV1,
     XaiImageGenerationRequest, XaiImageResolution, XaiImageResponseFormat,
     XaiVideoAspectRatio as OfficialVideoAspectRatio, XaiVideoGenerationCommandV1,
-    XaiVideoGenerationRequest, XaiVideoImageUrl, XaiVideoResolution as OfficialVideoResolution,
+    XaiVideoGenerationCommandV2, XaiVideoGenerationRequest, XaiVideoImageUrl,
+    XaiVideoResolution as OfficialVideoResolution,
 };
 use image_cli_runtime::WorkingDirectory;
 use image_provider_contracts::{
@@ -15,16 +16,180 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
+use crate::runtime_identity::lookup_runtime_identity_from_lock;
+
 use super::*;
 
 #[test]
-fn immutable_provider_lock_matches_runtime_compatibility_revisions() {
-    let lock: serde_json::Value =
+fn versioned_provider_locks_keep_v1_and_pin_v2_without_an_image_claim() {
+    let v1: serde_json::Value =
+        serde_json::from_str(include_str!("../../../providers/grok-cli-v1.lock.json")).unwrap();
+    let v2: serde_json::Value =
         serde_json::from_str(include_str!("../../../providers/grok-cli.lock.json")).unwrap();
-    assert_eq!(lock["version"], GROK_CLI_COMPATIBILITY_VERSION);
-    assert_eq!(lock["compatibility_revision"], "grok-cli-1.0.5");
-    assert_eq!(lock["image_adapter_revision"], ADAPTER_REVISION);
-    assert_eq!(lock["video_adapter_revision"], VIDEO_ADAPTER_REVISION);
+    assert_eq!(v1["version"], "1.0.5");
+    assert_eq!(v1["version"], GROK_CLI_COMPATIBILITY_VERSION);
+    assert_eq!(v1["version_output"], "grok 1.0.5 (5115b46bc9)");
+    assert_eq!(v1["compatibility_revision"], "grok-cli-1.0.5");
+    assert_eq!(
+        v1["image_adapter_revision"],
+        "grok-cli-1.0.5.agentic-media.v2"
+    );
+    assert_eq!(v1["image_adapter_revision"], ADAPTER_REVISION);
+    assert_eq!(
+        v1["video_adapter_revision"],
+        "grok-api-1.0.5.direct-image-video.v5"
+    );
+    assert_eq!(v1["video_adapter_revision"], VIDEO_ADAPTER_REVISION);
+    assert_eq!(v2["version"], "1.0.34");
+    assert_eq!(v2["version_output"], "grok 1.0.34 (3736acbc8658)");
+    assert_eq!(v2["compatibility_revision"], "grok-cli-1.0.34");
+    assert_eq!(v2["image_adapter_revision"], serde_json::Value::Null);
+    assert_eq!(
+        v2["video_adapter_revision"],
+        "grok-cli-1.0.34.agentic-video.v1"
+    );
+}
+
+#[test]
+fn v1_lock_whole_file_identity_is_stable() {
+    const EXPECTED_SHA256: &str =
+        "115fa350806568e7d4fd23b10aedbe7c0018c4e86f9fd341abf5b51a6646c2ac";
+    let bytes = include_bytes!("../../../providers/grok-cli-v1.lock.json");
+    let actual_sha256 =
+        Sha256::digest(bytes)
+            .iter()
+            .fold(String::with_capacity(64), |mut output, byte| {
+                use std::fmt::Write as _;
+                write!(&mut output, "{byte:02x}").unwrap();
+                output
+            });
+    assert_eq!(actual_sha256, EXPECTED_SHA256);
+}
+
+#[test]
+fn runtime_identity_reads_exact_target_artifacts_from_the_selected_lock() {
+    let v1 =
+        lookup_runtime_identity(GrokRuntimeGeneration::V1, "x86_64-unknown-linux-gnu").unwrap();
+    let v2 =
+        lookup_runtime_identity(GrokRuntimeGeneration::V2, "x86_64-unknown-linux-gnu").unwrap();
+    let v1_arm =
+        lookup_runtime_identity(GrokRuntimeGeneration::V1, "aarch64-unknown-linux-gnu").unwrap();
+    let v2_arm =
+        lookup_runtime_identity(GrokRuntimeGeneration::V2, "aarch64-unknown-linux-gnu").unwrap();
+    let v1_lock: serde_json::Value =
+        serde_json::from_str(include_str!("../../../providers/grok-cli-v1.lock.json")).unwrap();
+    let v2_lock: serde_json::Value =
+        serde_json::from_str(include_str!("../../../providers/grok-cli.lock.json")).unwrap();
+    assert_eq!(
+        v1.sha256,
+        v1_lock["artifacts"]["x86_64-unknown-linux-gnu"]["sha256"]
+            .as_str()
+            .unwrap()
+    );
+    assert_eq!(
+        v2.sha256,
+        v2_lock["artifacts"]["x86_64-unknown-linux-gnu"]["sha256"]
+            .as_str()
+            .unwrap()
+    );
+    assert_ne!(v1.sha256, v2.sha256);
+    assert_eq!(v1_arm.elf_machine, 183);
+    assert_eq!(v2_arm.elf_machine, 183);
+    assert_ne!(v1_arm.sha256, v2_arm.sha256);
+    assert_eq!(v1.compatibility_revision, "grok-cli-1.0.5");
+    assert_eq!(v2.compatibility_revision, "grok-cli-1.0.34");
+    assert_eq!(
+        v1.image_adapter_revision,
+        Some("grok-cli-1.0.5.agentic-media.v2".to_owned())
+    );
+    assert_eq!(v2.image_adapter_revision, None);
+    assert_eq!(
+        v2.video_adapter_revision,
+        "grok-cli-1.0.34.agentic-video.v1"
+    );
+}
+
+#[test]
+fn runtime_identity_rejects_unknown_and_crossed_inputs() {
+    assert!(
+        lookup_runtime_identity(GrokRuntimeGeneration::V1, "riscv64gc-unknown-linux-gnu").is_err()
+    );
+    assert!(lookup_runtime_identity(GrokRuntimeGeneration::V2, "x86_64-unknown-freebsd").is_err());
+    assert!("v3".parse::<GrokRuntimeGeneration>().is_err());
+}
+
+#[test]
+fn v2_lock_requires_an_explicit_null_image_adapter_field() {
+    let mut missing: serde_json::Value =
+        serde_json::from_str(include_str!("../../../providers/grok-cli.lock.json")).unwrap();
+    missing
+        .as_object_mut()
+        .unwrap()
+        .remove("image_adapter_revision");
+    assert!(
+        lookup_runtime_identity_from_lock(
+            GrokRuntimeGeneration::V2,
+            "x86_64-unknown-linux-gnu",
+            &serde_json::to_string(&missing).unwrap(),
+        )
+        .is_err()
+    );
+
+    let mut explicit_null = missing;
+    explicit_null
+        .as_object_mut()
+        .unwrap()
+        .insert("image_adapter_revision".to_owned(), serde_json::Value::Null);
+    assert!(
+        lookup_runtime_identity_from_lock(
+            GrokRuntimeGeneration::V2,
+            "x86_64-unknown-linux-gnu",
+            &serde_json::to_string(&explicit_null).unwrap(),
+        )
+        .is_ok()
+    );
+
+    let mut non_null = explicit_null;
+    non_null.as_object_mut().unwrap().insert(
+        "image_adapter_revision".to_owned(),
+        serde_json::Value::String("grok-cli-1.0.34.agentic-media.v2".to_owned()),
+    );
+    assert!(
+        lookup_runtime_identity_from_lock(
+            GrokRuntimeGeneration::V2,
+            "x86_64-unknown-linux-gnu",
+            &serde_json::to_string(&non_null).unwrap(),
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn grok_cli_1034_video_capability_fixture_is_pinned_and_redacted() {
+    const EXPECTED_SHA256: &str =
+        "03ad050fa6bac4f425b61853674d25afdaa30ae51c2479da8d568a931318ddb5";
+    let bytes = include_bytes!("../../../providers/grok-cli-1.0.34-video-capabilities.json");
+    let actual_sha256 =
+        Sha256::digest(bytes)
+            .iter()
+            .fold(String::with_capacity(64), |mut output, byte| {
+                use std::fmt::Write as _;
+                write!(&mut output, "{byte:02x}").unwrap();
+                output
+            });
+    assert_eq!(actual_sha256, EXPECTED_SHA256);
+    let fixture: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+    assert_eq!(fixture["observed_cli_version"], "1.0.34 (3736acbc8658)");
+    let tools = fixture["tools"].as_array().unwrap();
+    assert_eq!(
+        tools
+            .iter()
+            .map(|tool| tool["function"]["name"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["image_gen", "image_to_video", "reference_to_video"]
+    );
+    let text = std::str::from_utf8(bytes).unwrap();
+    assert!(!text.contains("api_key") && !text.contains("Bearer ") && !text.contains("sk-"));
 }
 
 const SESSION_ID: &str = "019f6ded-4ffe-73f3-80e1-d1f11287bd96";
@@ -319,10 +484,13 @@ fn video_command_preserves_the_two_distinct_fixed_model_workflows() {
     let text_source = XaiVideoGenerationCommandV1::from_request(XaiVideoGenerationRequest {
         aspect_ratio: Some(OfficialVideoAspectRatio::R9x16),
         duration: Some(6),
+        generate_audio: None,
         image: None,
+        last_frame: None,
         model: Some("grok-imagine-video-1.5-preview".to_owned()),
         output: None,
         prompt: Some("a paper boat crossing a moonlit lake".to_owned()),
+        reference_audios: Vec::new(),
         reference_images: Vec::new(),
         resolution: Some(OfficialVideoResolution::P480),
         storage_options: None,
@@ -350,13 +518,16 @@ fn video_command_preserves_the_two_distinct_fixed_model_workflows() {
     let source = XaiVideoGenerationCommandV1::from_request(XaiVideoGenerationRequest {
         aspect_ratio: None,
         duration: Some(10),
+        generate_audio: None,
         image: Some(XaiVideoImageUrl {
             file_id: None,
             url: Some("data:image/png;base64,AA==".to_owned()),
         }),
+        last_frame: None,
         model: Some("grok-imagine-video-1.5".to_owned()),
         output: None,
         prompt: Some("slow push in".to_owned()),
+        reference_audios: Vec::new(),
         reference_images: Vec::new(),
         resolution: Some(OfficialVideoResolution::P720),
         storage_options: None,
@@ -423,10 +594,13 @@ fn video_command_preserves_the_two_distinct_fixed_model_workflows() {
     let source = XaiVideoGenerationCommandV1::from_request(XaiVideoGenerationRequest {
         aspect_ratio: Some(OfficialVideoAspectRatio::R2x3),
         duration: Some(6),
+        generate_audio: None,
         image: None,
+        last_frame: None,
         model: Some("grok-imagine-video".to_owned()),
         output: None,
         prompt: Some("cinematic motion".to_owned()),
+        reference_audios: Vec::new(),
         reference_images: vec![
             XaiVideoImageUrl {
                 file_id: None,
@@ -1326,4 +1500,291 @@ fn private_directory(path: PathBuf) -> WorkingDirectory {
     fs::create_dir_all(&path).unwrap();
     fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
     WorkingDirectory::new_private(path).unwrap()
+}
+
+#[test]
+fn v2_i2v_dispatches_one_exact_image_to_video_call() {
+    let fixture = PolicyFixture::new();
+    let request = v2_i2v_request("first.png", "camera pan", 6, OfficialVideoResolution::P480);
+    let (_, invocation) = fixture
+        .policy
+        .command_spec_video_v2(&request, SESSION_ID, fixture.workspace.clone())
+        .unwrap();
+
+    assert_eq!(invocation.expected_tool_calls().len(), 1);
+    assert_eq!(
+        invocation.expected_tool_calls()[0].tool(),
+        GrokTool::ImageToVideo
+    );
+    assert_eq!(
+        invocation.expected_tool_calls()[0].arguments(),
+        &json!({
+            "prompt": "camera pan",
+            "image": fixture.workspace.path().join("first.png"),
+            "duration": 6,
+            "resolution_name": "480p"
+        })
+    );
+}
+
+#[test]
+fn v2_reference_dispatch_maps_frames_references_and_voice_strings() {
+    let fixture = PolicyFixture::new();
+    let request = v2_reference_request();
+    let (_, invocation) = fixture
+        .policy
+        .command_spec_video_v2(&request, SESSION_ID, fixture.workspace.clone())
+        .unwrap();
+
+    assert_eq!(invocation.expected_tool_calls().len(), 1);
+    assert_eq!(
+        invocation.expected_tool_calls()[0].arguments(),
+        &json!({
+            "prompt": "",
+            "images": [fixture.workspace.path().join("reference-0.png")],
+            "first_frame": fixture.workspace.path().join("first.png"),
+            "last_frame": fixture.workspace.path().join("last.png"),
+            "voices": ["eve", "leo"],
+            "aspect_ratio": "16:9",
+            "duration": 8,
+            "resolution_name": "720p"
+        })
+    );
+}
+
+#[test]
+fn v2_text_video_dispatches_image_gen_then_image_to_video() {
+    let fixture = PolicyFixture::new();
+    let request = v2_text_request();
+    let (_, invocation) = fixture
+        .policy
+        .command_spec_video_v2(&request, SESSION_ID, fixture.workspace.clone())
+        .unwrap();
+
+    assert_eq!(
+        invocation
+            .expected_tool_calls()
+            .iter()
+            .map(|call| call.tool())
+            .collect::<Vec<_>>(),
+        vec![GrokTool::ImageGeneration, GrokTool::ImageToVideo]
+    );
+    assert_eq!(
+        invocation.expected_tool_calls()[1].arguments()["image"],
+        json!(invocation.expected_tool_calls()[0].artifact_path())
+    );
+}
+
+#[test]
+fn v2_receipt_rejects_omitted_expected_field() {
+    let fixture = PolicyFixture::new();
+    let request = v2_i2v_request("first.png", "camera pan", 6, OfficialVideoResolution::P480);
+    let (_, invocation) = fixture
+        .policy
+        .command_spec_video_v2(&request, SESSION_ID, fixture.workspace.clone())
+        .unwrap();
+    write_artifact(&invocation);
+    let mut actual = invocation.expected_arguments().clone();
+    actual.as_object_mut().unwrap().remove("duration");
+    let history = history_with(&invocation, actual, invocation.artifact_path());
+    assert!(matches!(
+        parse_invocation_receipt(&valid_stdout(), &history, &invocation),
+        Err(GrokReceiptError::ToolArgumentsMismatch { .. })
+    ));
+}
+
+#[test]
+fn v2_receipt_rejects_extra_argument() {
+    let fixture = PolicyFixture::new();
+    let request = v2_i2v_request("first.png", "camera pan", 6, OfficialVideoResolution::P480);
+    let (_, invocation) = fixture
+        .policy
+        .command_spec_video_v2(&request, SESSION_ID, fixture.workspace.clone())
+        .unwrap();
+    write_artifact(&invocation);
+    let mut actual = invocation.expected_arguments().clone();
+    actual["unexpected"] = json!(true);
+    let history = history_with(&invocation, actual, invocation.artifact_path());
+    assert!(matches!(
+        parse_invocation_receipt(&valid_stdout(), &history, &invocation),
+        Err(GrokReceiptError::ToolArgumentsMismatch { .. })
+    ));
+}
+
+#[test]
+fn v2_receipt_rejects_changed_duration_value() {
+    let fixture = PolicyFixture::new();
+    let request = v2_i2v_request("first.png", "camera pan", 6, OfficialVideoResolution::P480);
+    let (_, invocation) = fixture
+        .policy
+        .command_spec_video_v2(&request, SESSION_ID, fixture.workspace.clone())
+        .unwrap();
+    write_artifact(&invocation);
+    let mut actual = invocation.expected_arguments().clone();
+    actual["duration"] = json!(10);
+    let history = history_with(&invocation, actual, invocation.artifact_path());
+    assert!(matches!(
+        parse_invocation_receipt(&valid_stdout(), &history, &invocation),
+        Err(GrokReceiptError::ToolArgumentsMismatch { .. })
+    ));
+}
+
+#[test]
+fn v2_receipt_rejects_wrong_tool_order_and_duplicate_results() {
+    let fixture = PolicyFixture::new();
+    let request = v2_text_request();
+    let (_, invocation) = fixture
+        .policy
+        .command_spec_video_v2(&request, SESSION_ID, fixture.workspace.clone())
+        .unwrap();
+    write_artifact(&invocation);
+
+    let mut reversed = String::new();
+    for (index, expected) in invocation.expected_tool_calls().iter().enumerate().rev() {
+        let call_id = format!("call-{}", index + 1);
+        let call = json!({
+            "type":"assistant",
+            "tool_calls":[{"id":call_id,"name":expected.tool().name(),"arguments":serde_json::to_string(expected.arguments()).unwrap()}]
+        });
+        let content = json!({
+            "path":expected.artifact_path(),
+            "filename":expected.artifact_path().file_name().unwrap().to_str().unwrap(),
+            "session_folder":expected.artifact_path().parent().unwrap().file_name().unwrap().to_str().unwrap(),
+        });
+        let result = json!({"type":"tool_result","tool_call_id":call_id,"content":serde_json::to_string(&content).unwrap()});
+        reversed.push_str(&format!("{call}\n{result}\n"));
+    }
+    assert_eq!(
+        parse_invocation_receipt(&valid_stdout(), reversed.as_bytes(), &invocation),
+        Err(GrokReceiptError::UnexpectedToolCall)
+    );
+
+    let duplicate = [valid_history(&invocation), valid_history(&invocation)].concat();
+    assert_eq!(
+        parse_invocation_receipt(&valid_stdout(), &duplicate, &invocation),
+        Err(GrokReceiptError::UnexpectedToolCall)
+    );
+}
+
+#[test]
+fn v1_receipt_keeps_legacy_numeric_and_default_equivalence() {
+    let fixture = PolicyFixture::new();
+    let request = GrokVideoGenerationRequestV1::ImageToVideo(
+        ImageToVideoRequestV1::new(
+            Some("slow push in".to_owned()),
+            staged("first.png"),
+            VideoDuration::Seconds6,
+            VideoResolution::P480,
+        )
+        .unwrap(),
+    );
+    let (_, invocation) = fixture
+        .policy
+        .command_spec_in(&request.into(), SESSION_ID, fixture.workspace.clone())
+        .unwrap();
+    write_artifact(&invocation);
+    let mut omitted = invocation.expected_arguments().clone();
+    omitted.as_object_mut().unwrap().remove("duration");
+    omitted.as_object_mut().unwrap().remove("resolution_name");
+    let history = history_with(&invocation, omitted, invocation.artifact_path());
+    assert!(parse_invocation_receipt(&valid_stdout(), &history, &invocation).is_ok());
+}
+
+fn v2_i2v_request(
+    filename: &str,
+    prompt: &str,
+    duration: u8,
+    resolution: OfficialVideoResolution,
+) -> GrokVideoGenerationRequestV2 {
+    let command = XaiVideoGenerationCommandV2::from_request(XaiVideoGenerationRequest {
+        aspect_ratio: None,
+        duration: Some(duration),
+        generate_audio: Some(true),
+        image: Some(XaiVideoImageUrl {
+            file_id: None,
+            url: Some("data:image/png;base64,AA==".to_owned()),
+        }),
+        last_frame: None,
+        model: Some("grok-imagine-video-1.5".to_owned()),
+        output: None,
+        prompt: Some(prompt.to_owned()),
+        reference_audios: Vec::new(),
+        reference_images: Vec::new(),
+        resolution: Some(resolution),
+        storage_options: None,
+        user: None,
+    })
+    .unwrap();
+    GrokVideoGenerationPayloadV2::from_xai_command(command, vec![staged(filename)])
+        .unwrap()
+        .into_request()
+}
+
+fn v2_reference_request() -> GrokVideoGenerationRequestV2 {
+    let command = XaiVideoGenerationCommandV2::from_request(XaiVideoGenerationRequest {
+        aspect_ratio: Some(OfficialVideoAspectRatio::R16x9),
+        duration: Some(8),
+        generate_audio: Some(true),
+        image: Some(XaiVideoImageUrl {
+            file_id: None,
+            url: Some("data:image/png;base64,AA==".to_owned()),
+        }),
+        last_frame: Some(XaiVideoImageUrl {
+            file_id: None,
+            url: Some("data:image/png;base64,AQ==".to_owned()),
+        }),
+        model: Some("grok-imagine-video-1.5".to_owned()),
+        output: None,
+        prompt: None,
+        reference_audios: vec![
+            image_api_contracts::xai::XaiVideoAudioReference {
+                url: None,
+                voice_id: Some(" Eve ".to_owned()),
+            },
+            image_api_contracts::xai::XaiVideoAudioReference {
+                url: None,
+                voice_id: Some("LEO".to_owned()),
+            },
+        ],
+        reference_images: vec![XaiVideoImageUrl {
+            file_id: None,
+            url: Some("data:image/png;base64,Ag==".to_owned()),
+        }],
+        resolution: Some(OfficialVideoResolution::P720),
+        storage_options: None,
+        user: None,
+    })
+    .unwrap();
+    GrokVideoGenerationPayloadV2::from_xai_command(
+        command,
+        vec![
+            staged("first.png"),
+            staged("last.png"),
+            staged("reference-0.png"),
+        ],
+    )
+    .unwrap()
+    .into_request()
+}
+
+fn v2_text_request() -> GrokVideoGenerationRequestV2 {
+    let command = XaiVideoGenerationCommandV2::from_request(XaiVideoGenerationRequest {
+        aspect_ratio: Some(OfficialVideoAspectRatio::R16x9),
+        duration: Some(6),
+        generate_audio: Some(true),
+        image: None,
+        last_frame: None,
+        model: Some("grok-imagine-video-1.5".to_owned()),
+        output: None,
+        prompt: Some("moonlit lake".to_owned()),
+        reference_audios: Vec::new(),
+        reference_images: Vec::new(),
+        resolution: Some(OfficialVideoResolution::P480),
+        storage_options: None,
+        user: None,
+    })
+    .unwrap();
+    GrokVideoGenerationPayloadV2::from_xai_command(command, Vec::new())
+        .unwrap()
+        .into_request()
 }

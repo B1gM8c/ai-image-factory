@@ -4,6 +4,8 @@ use serde_json::Value;
 use sqlx::{FromRow, PgConnection};
 use uuid::Uuid;
 
+use image_provider_grok_cli::GROK_VIDEO_GENERATION_COMMAND_SCHEMA_V2;
+
 use crate::ImageGatewayError;
 
 use super::{
@@ -314,6 +316,15 @@ fn contract_snapshot_for_surface(
         .public_model_id
         .as_deref()
         .ok_or("pricing_surface_contract_missing")?;
+    if !grok_video_identity_pair_is_valid(
+        &surface.provider_id,
+        &surface.operation,
+        &surface.media_kind,
+        command_schema,
+        &surface.provider_model_id,
+    ) {
+        return Err("pricing_surface_contract_identity_mismatch");
+    }
     let contract = find_contract(
         &surface.provider_id,
         &surface.operation,
@@ -468,6 +479,15 @@ impl ActiveSelectorRow {
         let Some(public_model_id) = surface.public_model_id.as_deref() else {
             return false;
         };
+        if !grok_video_identity_pair_is_valid(
+            &surface.provider_id,
+            &surface.operation,
+            &surface.media_kind,
+            command_schema,
+            &surface.provider_model_id,
+        ) {
+            return false;
+        }
         let pricing_profile = aliases
             .get(api_profile)
             .map(String::as_str)
@@ -599,6 +619,15 @@ fn matching_surfaces<'a>(
             let Some(public_model_id) = surface.public_model_id.as_deref() else {
                 return false;
             };
+            if !grok_video_identity_pair_is_valid(
+                &surface.provider_id,
+                &surface.operation,
+                &surface.media_kind,
+                command_schema,
+                &surface.provider_model_id,
+            ) {
+                return false;
+            }
             let _ = route_id;
             let pricing_profile = aliases
                 .get(api_profile)
@@ -628,6 +657,25 @@ fn matching_surfaces<'a>(
                 .is_some_and(|operation| matches_value(&version.operation, operation))
         })
         .collect()
+}
+
+fn grok_video_identity_pair_is_valid(
+    provider_id: &str,
+    operation: &str,
+    media_kind: &str,
+    command_schema: &str,
+    provider_model_id: &str,
+) -> bool {
+    if provider_id != "grok-cli" || operation != "videos.generations" || media_kind != "video" {
+        return true;
+    }
+    if command_schema == GROK_VIDEO_GENERATION_COMMAND_SCHEMA_V2 {
+        provider_model_id == "grok-imagine-video-1.5"
+    } else if provider_model_id == "grok-imagine-video-1.5" {
+        command_schema == GROK_VIDEO_GENERATION_COMMAND_SCHEMA_V2
+    } else {
+        true
+    }
 }
 
 fn validate_source(version: &PriceBookVersionView, blocking_reasons: &mut Vec<String>) {
@@ -839,9 +887,11 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        PriceBookVersionView, PriceComponentView, has_required_customer_metering_bases,
-        selectors_can_tie, validate_component_dimensions, validate_price_shape,
+        PriceBookVersionView, PriceComponentView, contract_snapshot_for_surface,
+        has_required_customer_metering_bases, selectors_can_tie, validate_component_dimensions,
+        validate_price_shape,
     };
+    use crate::pricing::coverage::CoverageSurfaceRow;
 
     fn component(outcome: &str, dimensions: serde_json::Value) -> PriceComponentView {
         PriceComponentView {
@@ -945,6 +995,49 @@ mod tests {
             &version(vec![image_input, requested_seconds]),
             contract,
         ));
+    }
+
+    #[test]
+    fn grok_video_v2_snapshot_requires_exact_schema_and_model_identity() {
+        let mut version = version(Vec::new());
+        version.api_profile = "xai-videos-v1".to_owned();
+        version.operation = "video_generation".to_owned();
+        version.provider_id = Some("grok-cli".to_owned());
+        version.provider_model_id = Some("grok-imagine-video-1.5".to_owned());
+        version.public_model_id = "grok-imagine-video-1.5".to_owned();
+        version.media_kind = "video".to_owned();
+        let surface = CoverageSurfaceRow {
+            provider_id: "grok-cli".to_owned(),
+            provider_model_id: "grok-imagine-video-1.5".to_owned(),
+            provider_model_display_name: "Grok Imagine Video 1.5".to_owned(),
+            media_kind: "video".to_owned(),
+            operation: "videos.generations".to_owned(),
+            command_schema: Some("grok-cli.videos.generate.v2".to_owned()),
+            api_profile: Some("xai-videos-v1".to_owned()),
+            public_model_id: Some("grok-imagine-video-1.5".to_owned()),
+            route_id: Some(Uuid::new_v4()),
+            routable_account_count: 1,
+        };
+        let (contract, snapshot) =
+            contract_snapshot_for_surface(&version, &surface).expect("exact V2 snapshot");
+        assert_eq!(contract.command_schema, "grok-cli.videos.generate.v2");
+        assert_eq!(snapshot.provider_model_id, "grok-imagine-video-1.5");
+        assert_eq!(snapshot.normalizer_key, "grok-cli.videos.generate.v2");
+
+        let mut crossed = surface.clone();
+        crossed.command_schema = Some("grok-cli.videos.generate.v1".to_owned());
+        assert!(contract_snapshot_for_surface(&version, &crossed).is_err());
+        crossed.command_schema = Some("grok-cli.videos.generate.v2".to_owned());
+        crossed.provider_model_id = "grok-imagine-video-1.5-preview".to_owned();
+        assert!(contract_snapshot_for_surface(&version, &crossed).is_err());
+        crossed.provider_model_id = "grok-imagine-video-1.5".to_owned();
+        let (_, snapshot) = contract_snapshot_for_surface(&version, &crossed).unwrap();
+        assert!(
+            snapshot
+                .contract_key
+                .starts_with("grok-cli.videos.generations.v2.pricing-surface:")
+        );
+        assert_eq!(snapshot.normalizer_key, "grok-cli.videos.generate.v2");
     }
 
     #[test]

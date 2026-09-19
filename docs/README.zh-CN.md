@@ -66,7 +66,9 @@ AI Image Factory 将 Codex、Grok、即梦（Dreamina）等 CLI 转为图片和�
 
 - **xAI 风格异步视频 API**：代码已实现，但
   `GATEWAY_ENABLE_XAI_VIDEO_API` 默认为 `false`。启用前必须提供准确的 Grok 视频
-  execution profile、可用账户、正数 `video_second` 价格和可访问的媒体输出。
+  V2 execution profile（绑定 `bin/grok-v2`）、可用账户、正数 `video_second` 价格和
+  可访问的媒体输出。已有 V1 任务只通过独立的 `bin/grok-v1` replay profile 恢复，
+  不会被 V2 重新解释。
 - **即梦/Seedance 生产流量**：需要已隔离的 CLI 账户、受信任的可执行文件摘要、
   `provider-submitd`、`provider-pollerd` 及匹配的远程任务档案。
 - **项目 Webhook**：需要启用并运行 `webhookd`。
@@ -83,8 +85,12 @@ AI Image Factory 将 Codex、Grok、即梦（Dreamina）等 CLI 转为图片和�
   一致性。
 - Grok CLI 图片当前仅接收绑定能够无损执行的字段；不支持的官方字段在准入前返回明确错误，
   不会静默丢弃。
-- Grok CLI 视频当前支持图片转视频或参考图转视频的已验证子集。执行器支持的时长与分辨率由
-  已验证 CLI 契约决定，不能仅因官方 API 出现新参数就自动放行。
+- Grok CLI 视频当前支持 V2 文生视频、图生视频和参考输入视频的已验证子集：
+  `generate_audio` 必须为默认值/`true`，`last_frame`、最多 7 张
+  `reference_images`、最多 3 个 `voice_id` 可按 CLI 形态使用；URL 音频、`file_id` 和
+  `generate_audio=false` 会在排队前拒绝。可执行分辨率只有 `480p`/`720p`；文生视频和图生视频
+  只接受 6 或 10 秒，参考输入视频接受 1-15 秒。CLI 没有视频编辑或延长工具，因此不提供
+  `/v1/videos/edits` 或 `/v1/videos/extensions`。
 - 即梦 CLI、Ark Seedream/Seedance 与火山引擎视觉 OpenAPI 是不同协议边界，不共享
   认证 DTO、重试策略或任务解析器。
 - 文件系统 artifact backend 适用于单机或共享 POSIX 卷；它不是无条件的多区域对象存储方案。
@@ -184,7 +190,7 @@ crate 不拥有 SQL、租户身份、公共 HTTP DTO、定价或账户选择。
 | --- | --- | --- |
 | `POST /v1/images/generations` | 已实现 | OpenAI/xAI 风格路由；具体字段受所选 binding 能力约束 |
 | `POST /v1/images/edits` | 已实现 | 支持的模型与参考图数量由路由能力决定 |
-| `POST /v1/videos/generations` | 默认关闭 | xAI 风格异步接口；当前只开放已验证的 Grok CLI 子集 |
+| `POST /v1/videos/generations` | 默认关闭 | xAI 形状异步接口；新请求使用 Grok CLI 1.0.34 V2 子集，旧 V1 job 仅 replay |
 | `GET /v1/videos/{request_id}` | 默认关闭 | 返回 Factory Job 状态，不伪造 Provider 原生任务 ID |
 | `/v1/dreamina/images/generations` | 已实现，需配置 | 即梦原生 facade 与 CLI 任务执行 |
 | `/v1/dreamina/videos/*` | 已实现，需配置 | 即梦/Seedance 提交、查询与文件内容 |

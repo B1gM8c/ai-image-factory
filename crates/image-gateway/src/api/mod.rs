@@ -3,7 +3,7 @@ use std::sync::Arc;
 use axum::{
     Router,
     extract::DefaultBodyLimit,
-    http::HeaderMap,
+    http::{HeaderMap, Request, Uri},
     middleware as axum_middleware,
     response::IntoResponse,
     routing::{delete, get, post},
@@ -78,6 +78,7 @@ mod responses;
 mod sessions;
 mod system_updates;
 mod users;
+mod video_inputs;
 mod videos;
 mod webhooks;
 mod xai_images;
@@ -1023,13 +1024,26 @@ fn build_router_with_execution_mode(
     };
     Ok(router
         .layer(DefaultBodyLimit::max(body_limit))
-        .layer(TraceLayer::new_for_http())
+        .layer(
+            TraceLayer::new_for_http().make_span_with(|request: &Request<_>| {
+                tracing::debug_span!(
+                    "request",
+                    method = %request.method(),
+                    path = %request_trace_path(request.uri()),
+                    version = ?request.version(),
+                )
+            }),
+        )
         .layer(axum_middleware::from_fn_with_state(
             state.clone(),
             observe_request,
         ))
         .layer(axum_middleware::from_fn(add_request_id))
         .with_state(state))
+}
+
+fn request_trace_path(uri: &Uri) -> &str {
+    uri.path()
 }
 
 fn validate_component_storage(
@@ -1312,5 +1326,19 @@ mod tests {
             validate_component_storage(expected.as_ref(), expected.as_ref(), &settlement).is_ok()
         );
         assert!(validate_component_storage(other.as_ref(), other.as_ref(), &settlement).is_err());
+    }
+
+    #[test]
+    fn request_trace_path_excludes_signed_query() {
+        let uri: Uri = "/v1/internal/provider-uploads/s3/object.mp4?X-Amz-Signature=redacted&X-Amz-Expires=900"
+            .parse()
+            .unwrap();
+
+        assert_eq!(
+            request_trace_path(&uri),
+            "/v1/internal/provider-uploads/s3/object.mp4"
+        );
+        assert!(!request_trace_path(&uri).contains('?'));
+        assert!(!request_trace_path(&uri).contains("X-Amz-Signature"));
     }
 }

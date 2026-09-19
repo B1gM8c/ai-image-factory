@@ -31,7 +31,7 @@ use image_api_contracts::xai::{
 };
 use image_provider_grok_cli::{
     ADAPTER_REVISION, GROK_IMAGE_GENERATION_COMMAND_SCHEMA, GROK_VIDEO_GENERATION_COMMAND_SCHEMA,
-    VIDEO_ADAPTER_REVISION,
+    GROK_VIDEO_GENERATION_COMMAND_SCHEMA_V2, VIDEO_ADAPTER_REVISION, VIDEO_ADAPTER_REVISION_V2,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -63,12 +63,14 @@ async fn detached_grok_runner_replays_sealed_output_without_a_second_cli_launch(
     let context_available = Arc::new(AtomicBool::new(true));
     let published = Arc::new(Mutex::new(Vec::new()));
     let publish_attempts = Arc::new(AtomicUsize::new(0));
-    let supervisor = GrokProcessSupervisor::new(
+    let fake_grok_sha256 = hex::encode(Sha256::digest(fs::read(&fake_grok).unwrap()));
+    let supervisor = GrokProcessSupervisor::new_with_expected_sha256(
         Arc::clone(&journal),
         helper,
         fake_grok,
         &credentials,
         &grok_auth_file_sha256(&credentials).unwrap(),
+        &fake_grok_sha256,
         Duration::from_secs(5),
         Duration::from_millis(10),
         Duration::from_secs(2),
@@ -85,6 +87,7 @@ async fn detached_grok_runner_replays_sealed_output_without_a_second_cli_launch(
         FailFirstArtifactSink {
             bytes: Arc::clone(&published),
             attempts: Arc::clone(&publish_attempts),
+            validate_video: false,
         },
     );
 
@@ -161,10 +164,13 @@ async fn detached_reference_video_runner_stages_inputs_replays_mp4_and_cleans_cl
         XaiVideoGenerationRequest {
             aspect_ratio: Some(image_api_contracts::xai::XaiVideoAspectRatio::R16x9),
             duration: Some(6),
+            generate_audio: None,
             image: None,
+            last_frame: None,
             model: Some("grok-imagine-video".to_owned()),
             output: None,
             prompt: Some("cinematic motion".to_owned()),
+            reference_audios: Vec::new(),
             reference_images: vec![
                 XaiVideoImageUrl {
                     file_id: None,
@@ -213,12 +219,14 @@ async fn detached_reference_video_runner_stages_inputs_replays_mp4_and_cleans_cl
     let provider_uploads = Arc::new(
         ProviderUploadService::new(&provider_artifacts, Some("http://127.0.0.1:8787")).unwrap(),
     );
-    let supervisor = GrokProcessSupervisor::new(
+    let fake_grok_sha256 = hex::encode(Sha256::digest(fs::read(&fake_grok).unwrap()));
+    let supervisor = GrokProcessSupervisor::new_with_expected_sha256(
         Arc::clone(&journal),
         helper,
         fake_grok,
         &credentials,
         &grok_auth_file_sha256(&credentials).unwrap(),
+        &fake_grok_sha256,
         Duration::from_secs(5),
         Duration::from_millis(10),
         Duration::from_secs(2),
@@ -237,6 +245,7 @@ async fn detached_reference_video_runner_stages_inputs_replays_mp4_and_cleans_cl
         FailFirstArtifactSink {
             bytes: published.clone(),
             attempts: attempts.clone(),
+            validate_video: false,
         },
     );
 
@@ -286,6 +295,147 @@ async fn detached_reference_video_runner_stages_inputs_replays_mp4_and_cleans_cl
     );
 }
 
+#[tokio::test]
+async fn detached_v2_image_to_video_uses_one_cli_launch_and_validated_mp4() {
+    let temp = TempDir::new().unwrap();
+    let credentials = private_credentials(temp.path());
+    let invocations = temp.path().join("video-v2-invocations");
+    let expected_video = minimal_mp4();
+    let fake_grok = fake_grok_video_v2(temp.path(), &invocations, &expected_video);
+    let helper = PathBuf::from(env!("CARGO_BIN_EXE_grok-runner"));
+    let journal = Arc::new(
+        FilesystemRunnerJournal::new(temp.path().join("video-v2-runner-journal")).unwrap(),
+    );
+    let blobs = Arc::new(InMemoryArtifactBlobStore::default());
+    let input_bytes = jpeg();
+    let blob = blobs
+        .put(
+            InputBlobKey {
+                admission_session_id: Uuid::new_v4(),
+                input_id: Uuid::new_v4(),
+            },
+            &input_bytes,
+        )
+        .await
+        .unwrap();
+    let plan = XaiVideoAdmissionPlan::for_grok_cli_v2(
+        XaiVideoGenerationRequest {
+            aspect_ratio: None,
+            duration: Some(6),
+            generate_audio: Some(true),
+            image: Some(XaiVideoImageUrl {
+                file_id: None,
+                url: Some("data:image/jpeg;base64,AA==".to_owned()),
+            }),
+            last_frame: None,
+            model: Some("grok-imagine-video-1.5".to_owned()),
+            output: None,
+            prompt: Some("cinematic motion".to_owned()),
+            reference_audios: Vec::new(),
+            reference_images: Vec::new(),
+            resolution: Some(XaiVideoResolution::P480),
+            storage_options: None,
+            user: Some("grok-video-v2-smoke".to_owned()),
+        },
+        vec![XaiVideoAdmissionInput::new("first-frame.jpg", blob.clone(), "image/jpeg").unwrap()],
+    )
+    .unwrap();
+    let command = plan.command_json().clone();
+    let command_hash = hex::encode(Sha256::digest(serde_json::to_vec(&command).unwrap()));
+    let lease = ExecutorSubmissionLease {
+        model: "grok-imagine-video-1.5".to_owned(),
+        command_schema: GROK_VIDEO_GENERATION_COMMAND_SCHEMA_V2.to_owned(),
+        adapter_revision: VIDEO_ADAPTER_REVISION_V2.to_owned(),
+        command_hash,
+        ..lease(String::new())
+    };
+    let context = ExecutorLaunchContext::new(
+        "grok-video-v2-process-smoke",
+        image_api_contracts::xai::XAI_VIDEOS_API_PROFILE,
+        0,
+        lease.command_schema.clone(),
+        lease.command_hash.clone(),
+        command,
+    )
+    .unwrap()
+    .with_inputs(vec![
+        ExecutorInputObject::new(blob, "image", 0, "image/jpeg").unwrap(),
+    ])
+    .unwrap();
+    let provider_artifacts = temp.path().join("provider-artifacts");
+    fs::create_dir(&provider_artifacts).unwrap();
+    let provider_uploads = Arc::new(
+        ProviderUploadService::new(&provider_artifacts, Some("http://127.0.0.1:8787")).unwrap(),
+    );
+    let fake_grok_sha256 = hex::encode(Sha256::digest(fs::read(&fake_grok).unwrap()));
+    let supervisor = GrokProcessSupervisor::new_with_expected_sha256(
+        Arc::clone(&journal),
+        helper,
+        fake_grok,
+        &credentials,
+        &grok_auth_file_sha256(&credentials).unwrap(),
+        &fake_grok_sha256,
+        Duration::from_secs(5),
+        Duration::from_millis(10),
+        Duration::from_secs(2),
+        &ProxyConfig::default(),
+    )
+    .unwrap()
+    .with_input_blobs(blobs)
+    .with_local_video_uploads(provider_uploads);
+    let published = Arc::new(Mutex::new(Vec::new()));
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let runner = JournaledDurableRunner::new(
+        GatedContextStore {
+            context,
+            available: Arc::new(AtomicBool::new(true)),
+        },
+        Arc::clone(&journal),
+        supervisor,
+        FailFirstArtifactSink {
+            bytes: Arc::clone(&published),
+            attempts: Arc::clone(&attempts),
+            validate_video: true,
+        },
+    );
+    let first = runner
+        .start_or_attach(lease.clone(), RunnerLaunchAuthority::AllowLaunch)
+        .await;
+    assert!(
+        matches!(first, DurableRunnerResult::Retryable { .. }),
+        "{first:?}"
+    );
+    let completed = runner
+        .start_or_attach(lease, RunnerLaunchAuthority::AttachOnly)
+        .await;
+    assert!(
+        matches!(
+            completed,
+            DurableRunnerResult::Terminal(RunnerOutcome::Succeeded(_))
+        ),
+        "{completed:?}"
+    );
+    assert_eq!(fs::read_to_string(invocations).unwrap(), "1\n");
+    assert_eq!(*published.lock().unwrap(), expected_video);
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn artifact_sink_rejects_container_only_mp4() {
+    let sink = FailFirstArtifactSink {
+        bytes: Arc::new(Mutex::new(Vec::new())),
+        attempts: Arc::new(AtomicUsize::new(1)),
+        validate_video: true,
+    };
+    let result = sink
+        .publish(&lease(String::new()), &container_only_mp4())
+        .await;
+    assert!(matches!(
+        result,
+        Err(RunnerError::Definite { error_code }) if error_code == "invalid_video_artifact"
+    ));
+}
+
 struct GatedContextStore {
     context: ExecutorLaunchContext,
     available: Arc<AtomicBool>,
@@ -312,6 +462,7 @@ impl ExecutorLaunchContextStore for GatedContextStore {
 struct FailFirstArtifactSink {
     bytes: Arc<Mutex<Vec<u8>>>,
     attempts: Arc<AtomicUsize>,
+    validate_video: bool,
 }
 
 #[async_trait]
@@ -323,6 +474,11 @@ impl ExecutorArtifactSink for FailFirstArtifactSink {
     ) -> Result<ExecutorResultManifest, RunnerError> {
         if self.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
             return Err(RunnerError::Unavailable);
+        }
+        if self.validate_video && !valid_video_mp4(bytes) {
+            return Err(RunnerError::Definite {
+                error_code: "invalid_video_artifact".to_owned(),
+            });
         }
         *self.bytes.lock().map_err(|_| RunnerError::Internal)? = bytes.to_vec();
         ExecutorResultManifest::new(Uuid::new_v4(), Uuid::new_v4()).ok_or(RunnerError::Internal)
@@ -413,6 +569,41 @@ printf '{{"type":"end","sessionId":"%s","requestId":"headless-video-1","stopReas
     executable
 }
 
+fn fake_grok_video_v2(root: &Path, invocations: &Path, video: &[u8]) -> PathBuf {
+    let video_path = root.join("source-v2.mp4");
+    fs::write(&video_path, video).unwrap();
+    let executable = root.join("fake-grok-video-v2");
+    let script = format!(
+        r#"#!/bin/sh
+cwd=""
+session=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --cwd) cwd="$2"; shift 2 ;;
+    --session-id) session="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+/bin/cat >/dev/null
+test -f "$cwd/first-frame.jpg" || exit 71
+printf '1\n' >> '{}'
+encoded=$(printf '%s' "$cwd" | /usr/bin/sed 's/%/%25/g; s|/|%2F|g')
+session_dir="$GROK_HOME/sessions/$encoded/$session"
+/bin/mkdir -p "$session_dir/videos"
+/bin/cp '{}' "$session_dir/videos/1.mp4"
+artifact="$session_dir/videos/1.mp4"
+printf '{{"type":"assistant","tool_calls":[{{"name":"image_to_video","id":"call-1","arguments":"{{\\"duration\\":6,\\"image\\":\\"%s/first-frame.jpg\\",\\"prompt\\":\\"cinematic motion\\",\\"resolution_name\\":\\"480p\\"}}"}}]}}\n' "$cwd" > "$session_dir/chat_history.jsonl"
+printf '{{"type":"tool_result","tool_call_id":"call-1","content":"{{\\"path\\":\\"%s\\",\\"filename\\":\\"1.mp4\\",\\"session_folder\\":\\"videos\\"}}"}}\n' "$artifact" >> "$session_dir/chat_history.jsonl"
+printf '{{"type":"end","sessionId":"%s","requestId":"headless-video-v2-1","stopReason":"end_turn","total_cost_usd_ticks":300000000}}\n' "$session"
+"#,
+        invocations.display(),
+        video_path.display(),
+    );
+    fs::write(&executable, script).unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+    executable
+}
+
 fn image_command() -> (Value, String) {
     let plan = XaiImageAdmissionPlan::for_grok_cli(XaiImageGenerationRequest {
         aspect_ratio: Some(XaiImageAspectRatio::R1x1),
@@ -469,6 +660,41 @@ fn jpeg() -> Vec<u8> {
 }
 
 fn minimal_mp4() -> Vec<u8> {
+    let config = mp4::Mp4Config {
+        major_brand: "isom".parse().unwrap(),
+        minor_version: 512,
+        compatible_brands: vec!["isom".parse().unwrap(), "avc1".parse().unwrap()],
+        timescale: 1_000,
+    };
+    let mut writer = mp4::Mp4Writer::write_start(Cursor::new(Vec::new()), &config).unwrap();
+    writer
+        .add_track(
+            &mp4::AvcConfig {
+                width: 16,
+                height: 16,
+                seq_param_set: vec![0x67, 0x42, 0x00, 0x1e],
+                pic_param_set: vec![0x68, 0xce, 0x3c, 0x80],
+            }
+            .into(),
+        )
+        .unwrap();
+    writer
+        .write_sample(
+            1,
+            &mp4::Mp4Sample {
+                start_time: 0,
+                duration: 8_000,
+                rendering_offset: 0,
+                is_sync: true,
+                bytes: vec![0, 0, 0, 1, 0x65].into(),
+            },
+        )
+        .unwrap();
+    writer.write_end().unwrap();
+    writer.into_writer().into_inner()
+}
+
+fn container_only_mp4() -> Vec<u8> {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(&24_u32.to_be_bytes());
     bytes.extend_from_slice(b"ftypisom\0\0\0\0isommp42");
@@ -479,4 +705,17 @@ fn minimal_mp4() -> Vec<u8> {
     bytes.extend_from_slice(&9_u32.to_be_bytes());
     bytes.extend_from_slice(b"mdat\0");
     bytes
+}
+
+fn valid_video_mp4(bytes: &[u8]) -> bool {
+    let Ok(reader) = mp4::Mp4Reader::read_header(Cursor::new(bytes), bytes.len() as u64) else {
+        return false;
+    };
+    reader.tracks().values().any(|track| {
+        matches!(track.track_type(), Ok(mp4::TrackType::Video))
+            && track.sample_count() > 0
+            && track.width() > 0
+            && track.height() > 0
+            && track.duration().as_nanos() > 0
+    })
 }

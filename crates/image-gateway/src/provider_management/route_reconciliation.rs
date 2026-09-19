@@ -3,8 +3,10 @@ use image_provider_grok_cli::{
     ADAPTER_REVISION as GROK_ADAPTER_REVISION, GROK_IMAGE_EDIT_COMMAND_SCHEMA,
     GROK_IMAGE_EDIT_OPERATION_V1, GROK_IMAGE_GENERATION_COMMAND_SCHEMA,
     GROK_IMAGE_GENERATION_OPERATION_V1, GROK_VIDEO_GENERATION_COMMAND_SCHEMA,
-    GROK_VIDEO_GENERATION_OPERATION_V1, PROVIDER_ID as GROK_PROVIDER_ID,
+    GROK_VIDEO_GENERATION_COMMAND_SCHEMA_V2, GROK_VIDEO_GENERATION_OPERATION_V1,
+    GROK_VIDEO_GENERATION_OPERATION_V2, PROVIDER_ID as GROK_PROVIDER_ID,
     VIDEO_ADAPTER_REVISION as GROK_VIDEO_ADAPTER_REVISION,
+    VIDEO_ADAPTER_REVISION_V2 as GROK_VIDEO_ADAPTER_REVISION_V2,
 };
 use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
@@ -44,6 +46,7 @@ struct RouteMember {
 
 #[derive(Clone, Debug)]
 struct ExpectedRuntimeBinding {
+    operation_descriptor_revision: &'static str,
     operation_descriptor_sha256_v1: String,
     adapter_revision: &'static str,
 }
@@ -91,6 +94,7 @@ pub async fn reconcile_execution_profile_routes(
                       AND (
                         profile.operation_descriptor_sha256_v1 <> $7
                         OR profile.adapter_revision <> $8
+                        OR profile.operation_descriptor_revision <> $21
                       )
                     )
                     OR (
@@ -99,6 +103,7 @@ pub async fn reconcile_execution_profile_routes(
                       AND (
                         profile.operation_descriptor_sha256_v1 <> $11
                         OR profile.adapter_revision <> $12
+                        OR profile.operation_descriptor_revision <> $22
                       )
                     )
                     OR (
@@ -107,6 +112,16 @@ pub async fn reconcile_execution_profile_routes(
                       AND (
                         profile.operation_descriptor_sha256_v1 <> $15
                         OR profile.adapter_revision <> $16
+                        OR profile.operation_descriptor_revision <> $23
+                      )
+                    )
+                    OR (
+                      head.operation_id = $17
+                      AND head.command_schema = $18
+                      AND (
+                        profile.operation_descriptor_sha256_v1 <> $19
+                        OR profile.adapter_revision <> $20
+                        OR profile.operation_descriptor_revision <> $24
                       )
                     )
                   ))
@@ -147,6 +162,14 @@ pub async fn reconcile_execution_profile_routes(
     .bind(GROK_IMAGE_EDIT_COMMAND_SCHEMA)
     .bind(GROK_IMAGE_EDIT_OPERATION_V1.canonical_sha256_v1_hex())
     .bind(GROK_ADAPTER_REVISION)
+    .bind(GROK_VIDEO_GENERATION_OPERATION_V2.id)
+    .bind(GROK_VIDEO_GENERATION_COMMAND_SCHEMA_V2)
+    .bind(GROK_VIDEO_GENERATION_OPERATION_V2.canonical_sha256_v1_hex())
+    .bind(GROK_VIDEO_ADAPTER_REVISION_V2)
+    .bind(GROK_VIDEO_GENERATION_OPERATION_V1.descriptor_revision)
+    .bind(GROK_IMAGE_GENERATION_OPERATION_V1.descriptor_revision)
+    .bind(GROK_IMAGE_EDIT_OPERATION_V1.descriptor_revision)
+    .bind(GROK_VIDEO_GENERATION_OPERATION_V2.descriptor_revision)
     .fetch_all(pool)
     .await
     .map_err(store_unavailable)?;
@@ -375,6 +398,7 @@ async fn route_members(
                    $3::TEXT IS NULL
                    OR (
                      profile.operation_descriptor_sha256_v1 = $3
+                     AND profile.operation_descriptor_revision = $5
                      AND profile.adapter_revision = $4
                    )
                  ),
@@ -395,6 +419,11 @@ async fn route_members(
             .map(|binding| binding.operation_descriptor_sha256_v1.as_str()),
     )
     .bind(expected.as_ref().map(|binding| binding.adapter_revision))
+    .bind(
+        expected
+            .as_ref()
+            .map(|binding| binding.operation_descriptor_revision),
+    )
     .fetch_all(&mut **tx)
     .await
     .map_err(store_unavailable)
@@ -447,6 +476,7 @@ async fn compatible_replacements(
             $6::TEXT IS NULL
             OR (
               profile.operation_descriptor_sha256_v1 = $6
+              AND profile.operation_descriptor_revision = $8
               AND profile.adapter_revision = $7
             )
           )
@@ -465,6 +495,11 @@ async fn compatible_replacements(
             .map(|binding| binding.operation_descriptor_sha256_v1.as_str()),
     )
     .bind(expected.as_ref().map(|binding| binding.adapter_revision))
+    .bind(
+        expected
+            .as_ref()
+            .map(|binding| binding.operation_descriptor_revision),
+    )
     .fetch_all(&mut **tx)
     .await
     .map_err(store_unavailable)
@@ -480,9 +515,23 @@ fn expected_runtime_binding(route: &RouteRevision) -> Option<ExpectedRuntimeBind
                 && schema == GROK_VIDEO_GENERATION_COMMAND_SCHEMA =>
         {
             Some(ExpectedRuntimeBinding {
+                operation_descriptor_revision: GROK_VIDEO_GENERATION_OPERATION_V1
+                    .descriptor_revision,
                 operation_descriptor_sha256_v1: GROK_VIDEO_GENERATION_OPERATION_V1
                     .canonical_sha256_v1_hex(),
                 adapter_revision: GROK_VIDEO_ADAPTER_REVISION,
+            })
+        }
+        (operation, schema)
+            if operation == GROK_VIDEO_GENERATION_OPERATION_V2.id
+                && schema == GROK_VIDEO_GENERATION_COMMAND_SCHEMA_V2 =>
+        {
+            Some(ExpectedRuntimeBinding {
+                operation_descriptor_revision: GROK_VIDEO_GENERATION_OPERATION_V2
+                    .descriptor_revision,
+                operation_descriptor_sha256_v1: GROK_VIDEO_GENERATION_OPERATION_V2
+                    .canonical_sha256_v1_hex(),
+                adapter_revision: GROK_VIDEO_ADAPTER_REVISION_V2,
             })
         }
         (operation, schema)
@@ -490,6 +539,8 @@ fn expected_runtime_binding(route: &RouteRevision) -> Option<ExpectedRuntimeBind
                 && schema == GROK_IMAGE_GENERATION_COMMAND_SCHEMA =>
         {
             Some(ExpectedRuntimeBinding {
+                operation_descriptor_revision: GROK_IMAGE_GENERATION_OPERATION_V1
+                    .descriptor_revision,
                 operation_descriptor_sha256_v1: GROK_IMAGE_GENERATION_OPERATION_V1
                     .canonical_sha256_v1_hex(),
                 adapter_revision: GROK_ADAPTER_REVISION,
@@ -500,6 +551,7 @@ fn expected_runtime_binding(route: &RouteRevision) -> Option<ExpectedRuntimeBind
                 && schema == GROK_IMAGE_EDIT_COMMAND_SCHEMA =>
         {
             Some(ExpectedRuntimeBinding {
+                operation_descriptor_revision: GROK_IMAGE_EDIT_OPERATION_V1.descriptor_revision,
                 operation_descriptor_sha256_v1: GROK_IMAGE_EDIT_OPERATION_V1
                     .canonical_sha256_v1_hex(),
                 adapter_revision: GROK_ADAPTER_REVISION,
@@ -664,6 +716,36 @@ mod tests {
             GROK_VIDEO_GENERATION_COMMAND_SCHEMA,
         ))
         .unwrap();
+        assert_eq!(
+            video.operation_descriptor_revision,
+            GROK_VIDEO_GENERATION_OPERATION_V1.descriptor_revision
+        );
         assert_eq!(video.adapter_revision, GROK_VIDEO_ADAPTER_REVISION);
+
+        let video_v2 = expected_runtime_binding(&route(
+            GROK_VIDEO_GENERATION_OPERATION_V2.id,
+            GROK_VIDEO_GENERATION_COMMAND_SCHEMA_V2,
+        ))
+        .unwrap();
+        assert_eq!(
+            video_v2.operation_descriptor_sha256_v1,
+            GROK_VIDEO_GENERATION_OPERATION_V2.canonical_sha256_v1_hex()
+        );
+        assert_eq!(
+            video_v2.operation_descriptor_revision,
+            GROK_VIDEO_GENERATION_OPERATION_V2.descriptor_revision
+        );
+        assert_eq!(video_v2.adapter_revision, GROK_VIDEO_ADAPTER_REVISION_V2);
+        assert!(
+            expected_runtime_binding(&route(
+                "videos.other",
+                GROK_VIDEO_GENERATION_COMMAND_SCHEMA_V2,
+            ))
+            .is_none()
+        );
+        assert!(
+            expected_runtime_binding(&route("videos.other", GROK_VIDEO_GENERATION_COMMAND_SCHEMA,))
+                .is_none()
+        );
     }
 }

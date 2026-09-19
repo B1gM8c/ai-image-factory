@@ -14,8 +14,8 @@ use image_cli_runtime::{
     RuntimeError, SpawnEvidence, SpawnObserver, VerifiedExecutable, WorkingDirectory,
 };
 use image_provider_grok_cli::{
-    GrokCliPolicyV1, GrokCliReceiptV1, GrokCliRequestV1, GrokInvocationV1,
-    GrokVideoGenerationRequestV1, MAX_HISTORY_BYTES, parse_invocation_receipt,
+    GrokCliPolicyV1, GrokCliReceiptV1, GrokInvocationV1, GrokVideoGenerationRequestV1,
+    MAX_HISTORY_BYTES, parse_invocation_receipt,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -24,7 +24,7 @@ use tokio::{io::AsyncReadExt, process::Command, time::Instant};
 use uuid::Uuid;
 
 use super::grok_direct_video::{GrokDiagnosticV1, generate_image_to_video};
-use super::grok_request::expected_grok_adapter_revision;
+use super::grok_request::{GrokDispatch, expected_grok_adapter_revision, grok_dispatch};
 use super::{
     ExecutorLaunchContext, ExecutorSubmissionLease, GrokExecutionRequest, RunnerError,
     SingleOutputSupervisor, SupervisedOutput, private_auth, project_grok_execution_request,
@@ -115,7 +115,7 @@ struct GrokSpawnObserver {
 
 impl GrokProcessSupervisor {
     #[allow(clippy::too_many_arguments)]
-    pub fn new(
+    fn new_unchecked(
         journal: Arc<FilesystemRunnerJournal>,
         helper_executable: impl AsRef<Path>,
         grok_executable: impl AsRef<Path>,
@@ -162,6 +162,65 @@ impl GrokProcessSupervisor {
             input_blobs: None,
             local_video_uploads: None,
         })
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn new(
+        journal: Arc<FilesystemRunnerJournal>,
+        helper_executable: impl AsRef<Path>,
+        grok_executable: impl AsRef<Path>,
+        credential_home: impl AsRef<Path>,
+        credential_auth_sha256: &str,
+        request_timeout: Duration,
+        poll_interval: Duration,
+        startup_grace: Duration,
+        proxy: &ProxyConfig,
+    ) -> Result<Self, ImageGatewayError> {
+        Self::new_unchecked(
+            journal,
+            helper_executable,
+            grok_executable,
+            credential_home,
+            credential_auth_sha256,
+            request_timeout,
+            poll_interval,
+            startup_grace,
+            proxy,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_expected_sha256(
+        journal: Arc<FilesystemRunnerJournal>,
+        helper_executable: impl AsRef<Path>,
+        grok_executable: impl AsRef<Path>,
+        credential_home: impl AsRef<Path>,
+        credential_auth_sha256: &str,
+        expected_grok_executable_sha256: &str,
+        request_timeout: Duration,
+        poll_interval: Duration,
+        startup_grace: Duration,
+        proxy: &ProxyConfig,
+    ) -> Result<Self, ImageGatewayError> {
+        let expected = parse_expected_sha256(expected_grok_executable_sha256)?;
+        let supervisor = Self::new_unchecked(
+            journal,
+            helper_executable,
+            grok_executable,
+            credential_home,
+            credential_auth_sha256,
+            request_timeout,
+            poll_interval,
+            startup_grace,
+            proxy,
+        )?;
+        if supervisor.grok_executable_sha256 != hex::encode(expected) {
+            return Err(ImageGatewayError::config(
+                "Grok executable does not match the approved runtime identity",
+            ));
+        }
+        Ok(supervisor)
     }
 
     pub fn with_input_blobs(mut self, input_blobs: Arc<dyn InputBlobStore>) -> Self {
@@ -276,11 +335,28 @@ impl GrokProcessSupervisor {
             GrokExecutionRequest::VideoGeneration(
                 image_provider_grok_cli::GrokVideoGenerationRequestV1::ReferenceToVideo(request),
             ) => request.images().iter().collect(),
+            GrokExecutionRequest::VideoGenerationV2(
+                image_provider_grok_cli::GrokVideoGenerationRequestV2::TextToVideo(_),
+            ) => Vec::new(),
+            GrokExecutionRequest::VideoGenerationV2(
+                image_provider_grok_cli::GrokVideoGenerationRequestV2::ImageToVideo(request),
+            ) => vec![request.image()],
+            GrokExecutionRequest::VideoGenerationV2(
+                image_provider_grok_cli::GrokVideoGenerationRequestV2::ReferenceToVideo(request),
+            ) => request
+                .first_frame()
+                .into_iter()
+                .chain(request.last_frame())
+                .chain(request.reference_images().iter())
+                .collect(),
         };
         if expected_inputs.len() != context.inputs().len() {
             return Err(RunnerError::Definite {
                 error_code: "grok_input_manifest_invalid".to_owned(),
             });
+        }
+        if expected_inputs.is_empty() {
+            return Ok(());
         }
         let blobs = self.input_blobs.as_ref().ok_or(RunnerError::Definite {
             error_code: "grok_input_store_unavailable".to_owned(),
@@ -301,6 +377,9 @@ impl GrokProcessSupervisor {
                             && input.index() == binding.index
                             && expected.filename() == binding.filename
                     })
+                }
+                GrokExecutionRequest::VideoGenerationV2(_) => {
+                    input.role() == "image" && usize::from(input.index()) == position
                 }
                 _ => input.role() == "image" && usize::from(input.index()) == position,
             };
@@ -454,13 +533,14 @@ impl SingleOutputSupervisor for GrokProcessSupervisor {
             credential_revision,
             access_expires_at_ms,
         ) = self.credential_source().await?;
-        if matches!(&projected, GrokExecutionRequest::VideoGeneration(_))
-            && !credential_valid_for_video(
-                access_expires_at_ms,
-                unix_time_ms().ok_or(RunnerError::Unavailable)?,
-                self.request_timeout,
-            )
-        {
+        if matches!(
+            &projected,
+            GrokExecutionRequest::VideoGeneration(_) | GrokExecutionRequest::VideoGenerationV2(_)
+        ) && !credential_valid_for_video(
+            access_expires_at_ms,
+            unix_time_ms().ok_or(RunnerError::Unavailable)?,
+            self.request_timeout,
+        ) {
             return Err(RunnerError::Definite {
                 error_code: "grok_credential_refresh_pending".to_owned(),
             });
@@ -482,8 +562,10 @@ impl SingleOutputSupervisor for GrokProcessSupervisor {
                 .ok_or(RunnerError::Unavailable)?,
         )
         .map_err(|_| RunnerError::Unavailable)?;
-        if matches!(&projected, GrokExecutionRequest::VideoGeneration(_))
-            && !has_managed_video_output
+        if matches!(
+            &projected,
+            GrokExecutionRequest::VideoGeneration(_) | GrokExecutionRequest::VideoGenerationV2(_)
+        ) && !has_managed_video_output
         {
             let configuration = self
                 .local_video_uploads
@@ -672,14 +754,17 @@ async fn run_grok_child(
         Ok(request) => request,
         Err(_) => return ChildOutcome::Uncertain("runner_request_invalid"),
     };
-    let cli_request = match validate_child_request(&request, executor_execution_id) {
+    let media_request = match validate_child_request(&request, executor_execution_id) {
         Ok((_, request)) => request,
         Err(_) => return ChildOutcome::Uncertain("runner_request_invalid"),
     };
-    if let GrokCliRequestV1::VideoGeneration(GrokVideoGenerationRequestV1::ImageToVideo(
-        image_to_video,
-    )) = &cli_request
-    {
+    if grok_dispatch(&media_request) == GrokDispatch::DirectHttp {
+        let GrokExecutionRequest::VideoGeneration(GrokVideoGenerationRequestV1::ImageToVideo(
+            image_to_video,
+        )) = &media_request
+        else {
+            return ChildOutcome::Uncertain("grok_dispatch_mismatch");
+        };
         return match generate_image_to_video(
             &spool,
             image_to_video,
@@ -728,20 +813,41 @@ async fn run_grok_child(
         Ok(policy) => policy,
         Err(_) => return ChildOutcome::Uncertain("grok_runtime_policy_invalid"),
     };
-    let (command, invocation) = match policy.command_spec_in(
-        &cli_request,
-        &executor_execution_id.to_string(),
-        match WorkingDirectory::new_private(workspace) {
-            Ok(workspace) => workspace,
-            Err(_) => return ChildOutcome::Uncertain("runner_workspace_invalid"),
-        },
-    ) {
+    let working_directory = match WorkingDirectory::new_private(workspace) {
+        Ok(workspace) => workspace,
+        Err(_) => return ChildOutcome::Uncertain("runner_workspace_invalid"),
+    };
+    let prepared = match &media_request {
+        GrokExecutionRequest::VideoGenerationV2(video) => policy.command_spec_video_v2(
+            video,
+            &executor_execution_id.to_string(),
+            working_directory.clone(),
+        ),
+        GrokExecutionRequest::ImageGeneration(image) => policy.command_spec_in(
+            &image.clone().into(),
+            &executor_execution_id.to_string(),
+            working_directory.clone(),
+        ),
+        GrokExecutionRequest::ImageEdit(edit) => policy.command_spec_in(
+            &edit.clone().into(),
+            &executor_execution_id.to_string(),
+            working_directory.clone(),
+        ),
+        GrokExecutionRequest::VideoGeneration(video) => policy.command_spec_in(
+            &video.clone().into(),
+            &executor_execution_id.to_string(),
+            working_directory.clone(),
+        ),
+    };
+    let (command, invocation) = match prepared {
         Ok(prepared) => prepared,
         Err(_) => return ChildOutcome::Uncertain("grok_runtime_policy_invalid"),
     };
-    let artifact_limit = match cli_request {
-        GrokCliRequestV1::VideoGeneration(_) => MAX_VIDEO_ARTIFACT_BYTES,
-        GrokCliRequestV1::ImageGeneration(_) | GrokCliRequestV1::ImageEdit(_) => {
+    let artifact_limit = match media_request {
+        GrokExecutionRequest::VideoGenerationV2(_) | GrokExecutionRequest::VideoGeneration(_) => {
+            MAX_VIDEO_ARTIFACT_BYTES
+        }
+        GrokExecutionRequest::ImageGeneration(_) | GrokExecutionRequest::ImageEdit(_) => {
             MAX_IMAGE_ARTIFACT_BYTES
         }
     };
@@ -949,7 +1055,7 @@ impl SpawnObserver for GrokSpawnObserver {
 fn validate_child_request(
     request: &GrokChildRequest,
     executor_execution_id: Uuid,
-) -> Result<(ExecutorSubmissionLease, GrokCliRequestV1), ImageGatewayError> {
+) -> Result<(ExecutorSubmissionLease, GrokExecutionRequest), ImageGatewayError> {
     let lease = request.launch.to_lease().ok_or_else(|| {
         ImageGatewayError::service_unavailable("Grok runner lease binding is invalid")
     })?;
@@ -996,7 +1102,7 @@ fn validate_child_request(
             "Grok executable identity changed",
         ));
     }
-    Ok((lease, media_request.into_cli_request()))
+    Ok((lease, media_request))
 }
 
 fn map_cli_runtime_error(error: RuntimeError) -> ChildOutcome {
@@ -1170,6 +1276,14 @@ fn parse_sha256(value: &str) -> Result<[u8; 32], ImageGatewayError> {
     bytes
         .try_into()
         .map_err(|_| ImageGatewayError::service_unavailable("Grok executable digest is invalid"))
+}
+
+fn parse_expected_sha256(value: &str) -> Result<[u8; 32], ImageGatewayError> {
+    let bytes = hex::decode(value)
+        .map_err(|_| ImageGatewayError::config("approved Grok executable digest is invalid"))?;
+    bytes
+        .try_into()
+        .map_err(|_| ImageGatewayError::config("approved Grok executable digest is invalid"))
 }
 
 fn child_environment(proxy: &ProxyConfig) -> Vec<(String, String)> {
@@ -1386,13 +1500,16 @@ mod tests {
         let source = XaiVideoGenerationCommandV1::from_request(XaiVideoGenerationRequest {
             aspect_ratio: None,
             duration: Some(6),
+            generate_audio: None,
             image: Some(XaiVideoImageUrl {
                 file_id: None,
                 url: Some("data:image/jpeg;base64,AA==".to_owned()),
             }),
+            last_frame: None,
             model: Some("grok-imagine-video-1.5".to_owned()),
             output: None,
             prompt: None,
+            reference_audios: Vec::new(),
             reference_images: Vec::new(),
             resolution: Some(OfficialVideoResolution::P480),
             storage_options: None,
@@ -1445,10 +1562,13 @@ mod tests {
         let source = XaiVideoGenerationCommandV1::from_request(XaiVideoGenerationRequest {
             aspect_ratio: Some(image_api_contracts::xai::XaiVideoAspectRatio::R9x16),
             duration: Some(6),
+            generate_audio: None,
             image: None,
+            last_frame: None,
             model: Some("grok-imagine-video-1.5-preview".to_owned()),
             output: None,
             prompt: Some("a paper boat crossing a moonlit lake".to_owned()),
+            reference_audios: Vec::new(),
             reference_images: Vec::new(),
             resolution: Some(OfficialVideoResolution::P480),
             storage_options: None,
@@ -1638,6 +1758,7 @@ mod tests {
     struct GrokFixture {
         _temp: TempDir,
         credentials: PathBuf,
+        executable: PathBuf,
         journal: Arc<FilesystemRunnerJournal>,
         supervisor: GrokProcessSupervisor,
         input_blobs: Arc<InMemoryArtifactBlobStore>,
@@ -1705,13 +1826,15 @@ mod tests {
                 ProviderUploadService::new(&provider_artifacts, Some("http://127.0.0.1:8787"))
                     .unwrap(),
             );
-            let supervisor = GrokProcessSupervisor::new(
+            let executable_sha256 = hash_bounded_file(&executable).unwrap();
+            let supervisor = GrokProcessSupervisor::new_with_expected_sha256(
                 Arc::clone(&journal),
                 &executable,
                 &executable,
                 &credentials,
                 &sha256(b"{}"),
-                Duration::from_secs(5),
+                &executable_sha256,
+                Duration::from_secs(30),
                 Duration::from_millis(10),
                 Duration::from_secs(1),
                 &ProxyConfig::default(),
@@ -1722,6 +1845,7 @@ mod tests {
             Self {
                 _temp: temp,
                 credentials,
+                executable,
                 journal,
                 supervisor,
                 input_blobs,
@@ -1763,6 +1887,44 @@ mod tests {
                 inputs: Vec::new(),
             }
         }
+    }
+
+    #[test]
+    fn supervisor_requires_the_approved_executable_sha_before_spawn() {
+        let fixture = GrokFixture::new();
+        let auth_sha = grok_auth_file_sha256(&fixture.credentials).unwrap();
+        let wrong = "0".repeat(64);
+        assert!(
+            GrokProcessSupervisor::new_with_expected_sha256(
+                Arc::clone(&fixture.journal),
+                &fixture.executable,
+                &fixture.executable,
+                &fixture.credentials,
+                &auth_sha,
+                &wrong,
+                Duration::from_secs(5),
+                Duration::from_millis(10),
+                Duration::from_secs(1),
+                &ProxyConfig::default(),
+            )
+            .is_err()
+        );
+        let actual = hash_bounded_file(&fixture.executable).unwrap();
+        assert!(
+            GrokProcessSupervisor::new_with_expected_sha256(
+                Arc::clone(&fixture.journal),
+                &fixture.executable,
+                &fixture.executable,
+                &fixture.credentials,
+                &auth_sha,
+                &actual,
+                Duration::from_secs(5),
+                Duration::from_millis(10),
+                Duration::from_secs(1),
+                &ProxyConfig::default(),
+            )
+            .is_ok()
+        );
     }
 
     #[tokio::test]

@@ -7,16 +7,31 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 readonly SCRIPT_DIR
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd -P)"
 readonly REPO_ROOT
-readonly LOCK_FILE="${REPO_ROOT}/providers/grok-cli.lock.json"
-
 die() {
   printf 'fetch-grok-cli: %s\n' "$*" >&2
   exit 1
 }
 
-[[ $# -eq 2 ]] || die "usage: scripts/fetch-grok-cli.sh <target-triple> <output-path>"
-readonly TARGET_TRIPLE="$1"
-readonly OUTPUT_PATH="$2"
+case "$#" in
+  2)
+    readonly RUNTIME_GENERATION="v1"
+    readonly TARGET_TRIPLE="$1"
+    readonly OUTPUT_PATH="$2"
+    ;;
+  3)
+    readonly RUNTIME_GENERATION="$1"
+    readonly TARGET_TRIPLE="$2"
+    readonly OUTPUT_PATH="$3"
+    ;;
+  *)
+    die "usage: scripts/fetch-grok-cli.sh [<v1|v2>] <target-triple> <output-path>"
+    ;;
+esac
+case "$RUNTIME_GENERATION" in
+  v1) readonly LOCK_FILE="${REPO_ROOT}/providers/grok-cli-v1.lock.json" ;;
+  v2) readonly LOCK_FILE="${REPO_ROOT}/providers/grok-cli.lock.json" ;;
+  *) die "unsupported runtime generation: ${RUNTIME_GENERATION}" ;;
+esac
 case "$TARGET_TRIPLE" in
   x86_64-unknown-linux-gnu | aarch64-unknown-linux-gnu) ;;
   *) die "unsupported target: ${TARGET_TRIPLE}" ;;
@@ -41,20 +56,50 @@ file_size() {
 }
 
 metadata="$({
-  env LOCK_FILE="$LOCK_FILE" TARGET_TRIPLE="$TARGET_TRIPLE" node <<'NODE'
+  env LOCK_FILE="$LOCK_FILE" RUNTIME_GENERATION="$RUNTIME_GENERATION" TARGET_TRIPLE="$TARGET_TRIPLE" node <<'NODE'
 const fs = require("node:fs");
 const lock = JSON.parse(fs.readFileSync(process.env.LOCK_FILE, "utf8"));
 const artifact = lock.artifacts?.[process.env.TARGET_TRIPLE];
+const expected = {
+  v1: {
+    version: "1.0.5",
+    version_output: "grok 1.0.5 (5115b46bc9)",
+    compatibility_revision: "grok-cli-1.0.5",
+    image_adapter_revision: "grok-cli-1.0.5.agentic-media.v2",
+    video_adapter_revision: "grok-api-1.0.5.direct-image-video.v5",
+  },
+  v2: {
+    version: "1.0.34",
+    version_output: "grok 1.0.34 (3736acbc8658)",
+    compatibility_revision: "grok-cli-1.0.34",
+    image_adapter_revision: null,
+    video_adapter_revision: "grok-cli-1.0.34.agentic-video.v1",
+  },
+}[process.env.RUNTIME_GENERATION];
+const expectedTarget = {
+  "x86_64-unknown-linux-gnu": { elf_machine: 62, architecture: "x86_64" },
+  "aarch64-unknown-linux-gnu": { elf_machine: 183, architecture: "aarch64" },
+}[process.env.TARGET_TRIPLE];
+const expectedUrl = expected && expectedTarget
+  ? `https://x.ai/cli/grok-${expected.version}-linux-${expectedTarget.architecture}`
+  : null;
 if (
+  !expected ||
+  !expectedTarget ||
   lock.schema_version !== 1 ||
   lock.provider !== "xai-grok-cli" ||
+  lock.version !== expected.version ||
+  lock.version_output !== expected.version_output ||
+  lock.compatibility_revision !== expected.compatibility_revision ||
+  lock.image_adapter_revision !== expected.image_adapter_revision ||
+  lock.video_adapter_revision !== expected.video_adapter_revision ||
   typeof lock.version !== "string" ||
   typeof lock.version_output !== "string" ||
   !artifact ||
-  !String(artifact.url).startsWith("https://x.ai/cli/") ||
+  artifact.url !== expectedUrl ||
   !/^[0-9a-f]{64}$/.test(String(artifact.sha256)) ||
   !Number.isSafeInteger(artifact.bytes) ||
-  !Number.isSafeInteger(artifact.elf_machine)
+  artifact.elf_machine !== expectedTarget.elf_machine
 ) {
   throw new Error("provider lock is invalid");
 }
@@ -62,8 +107,8 @@ for (const value of [
   artifact.url,
   artifact.sha256,
   artifact.bytes,
-  artifact.elf_machine,
-  lock.version_output,
+  expectedTarget.elf_machine,
+  expected.version_output,
 ]) {
   process.stdout.write(`${value}\n`);
 }
@@ -125,8 +170,12 @@ if (
 NODE
 chmod 0755 "$temporary"
 if [[ "$(uname -s)" == "Linux" ]]; then
-  [[ "$($temporary --version)" = "$EXPECTED_VERSION_OUTPUT" ]] \
-    || die "provider binary version output does not match the lock"
+  case "${TARGET_TRIPLE}:$(uname -m)" in
+    x86_64-unknown-linux-gnu:x86_64|aarch64-unknown-linux-gnu:aarch64)
+      [[ "$($temporary --version)" = "$EXPECTED_VERSION_OUTPUT" ]] \
+        || die "provider binary version output does not match the lock"
+      ;;
+  esac
 fi
 mv -f -- "$temporary" "$OUTPUT_PATH"
 trap - EXIT

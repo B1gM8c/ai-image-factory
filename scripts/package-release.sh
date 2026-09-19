@@ -18,7 +18,9 @@ Example:
     scripts/package-release.sh v1.2.3 x86_64-unknown-linux-gnu "$GITHUB_SHA" dist
 
 The Rust binaries and Next.js standalone output must already be built.
-GROK_PROVIDER_BINARY must point to the fetched, lock-verified Grok CLI.
+GROK_V1_PROVIDER_BINARY and GROK_V2_PROVIDER_BINARY must point to the fetched,
+lock-verified Grok CLIs. GROK_PROVIDER_BINARY is accepted only as the V1
+compatibility fallback.
 EOF
 }
 
@@ -314,8 +316,10 @@ readonly OUTPUT_DIR
 readonly ASSET_PREFIX="ai-image-factory-${RELEASE_VERSION}-${TARGET_TRIPLE}"
 readonly BUNDLE_PATH="${OUTPUT_DIR}/${ASSET_PREFIX}.tar.gz"
 readonly MANIFEST_PATH="${OUTPUT_DIR}/${ASSET_PREFIX}.manifest.json"
-readonly GROK_LOCK_FILE="${REPO_ROOT}/providers/grok-cli.lock.json"
-readonly GROK_PROVIDER_BINARY="${GROK_PROVIDER_BINARY:-}"
+readonly GROK_V1_LOCK_FILE="${REPO_ROOT}/providers/grok-cli-v1.lock.json"
+readonly GROK_V2_LOCK_FILE="${REPO_ROOT}/providers/grok-cli.lock.json"
+readonly GROK_V1_PROVIDER_BINARY="${GROK_V1_PROVIDER_BINARY:-${GROK_PROVIDER_BINARY:-}}"
+readonly GROK_V2_PROVIDER_BINARY="${GROK_V2_PROVIDER_BINARY:-}"
 
 readonly -a GATEWAY_BINARIES=(
   codex-runner
@@ -337,9 +341,14 @@ readonly -a GATEWAY_BINARIES=(
 [[ -f "${NEXT_STANDALONE}/apps/admin-console/server.js" ]] \
   || die "Next.js standalone server entry is missing"
 [[ -d "$NEXT_STATIC" ]] || die "Next.js static output is missing"
-[[ -n "$GROK_PROVIDER_BINARY" && -f "$GROK_PROVIDER_BINARY" && -x "$GROK_PROVIDER_BINARY" ]] \
-  || die "GROK_PROVIDER_BINARY is missing or not executable"
-[[ -f "$GROK_LOCK_FILE" ]] || die "Grok provider lock is missing"
+[[ -n "$GROK_V1_PROVIDER_BINARY" && -f "$GROK_V1_PROVIDER_BINARY" && -x "$GROK_V1_PROVIDER_BINARY" ]] \
+  || die "GROK_V1_PROVIDER_BINARY (or legacy GROK_PROVIDER_BINARY) is missing or not executable"
+[[ -n "$GROK_V2_PROVIDER_BINARY" && -f "$GROK_V2_PROVIDER_BINARY" && -x "$GROK_V2_PROVIDER_BINARY" ]] \
+  || die "GROK_V2_PROVIDER_BINARY is missing or not executable"
+[[ ! -L "$GROK_V1_PROVIDER_BINARY" && ! -L "$GROK_V2_PROVIDER_BINARY" ]] \
+  || die "Grok provider binaries must be regular files"
+[[ -f "$GROK_V1_LOCK_FILE" && -f "$GROK_V2_LOCK_FILE" ]] \
+  || die "Grok provider locks are missing"
 
 WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/aif-release.XXXXXXXX")"
 readonly WORK_DIR
@@ -372,49 +381,99 @@ readonly UPDATER_SOURCE="${RUST_RELEASE_DIR}/updated"
 assert_target_binary "$UPDATER_SOURCE"
 install -m 0755 "$UPDATER_SOURCE" "${RELEASE_ROOT}/bin/updated"
 
-assert_target_binary "$GROK_PROVIDER_BINARY"
+assert_target_binary "$GROK_V1_PROVIDER_BINARY"
+assert_target_binary "$GROK_V2_PROVIDER_BINARY"
 env \
-  GROK_LOCK_FILE="$GROK_LOCK_FILE" \
-  GROK_PROVIDER_BINARY="$GROK_PROVIDER_BINARY" \
-  GROK_PROVIDER_DESTINATION="${RELEASE_ROOT}/bin/grok" \
+  GROK_V1_LOCK_FILE="$GROK_V1_LOCK_FILE" \
+  GROK_V2_LOCK_FILE="$GROK_V2_LOCK_FILE" \
+  GROK_V1_PROVIDER_BINARY="$GROK_V1_PROVIDER_BINARY" \
+  GROK_V2_PROVIDER_BINARY="$GROK_V2_PROVIDER_BINARY" \
+  GROK_RELEASE_ROOT="$RELEASE_ROOT" \
   GROK_PROVIDER_MANIFEST="${RELEASE_ROOT}/provider-manifest.json" \
   TARGET_TRIPLE="$TARGET_TRIPLE" \
   node <<'NODE'
 const crypto = require("node:crypto");
 const fs = require("node:fs");
 
-const lock = JSON.parse(fs.readFileSync(process.env.GROK_LOCK_FILE, "utf8"));
-const artifact = lock.artifacts?.[process.env.TARGET_TRIPLE];
-const bytes = fs.readFileSync(process.env.GROK_PROVIDER_BINARY);
-const sha256 = crypto.createHash("sha256").update(bytes).digest("hex");
-if (
-  lock.schema_version !== 1 ||
-  lock.provider !== "xai-grok-cli" ||
-  !artifact ||
-  sha256 !== artifact.sha256 ||
-  bytes.length !== artifact.bytes ||
-  !/^grok 1\.0\.5 \([0-9a-f]+\)$/.test(lock.version_output) ||
-  lock.compatibility_revision !== "grok-cli-1.0.5" ||
-  lock.image_adapter_revision !== "grok-cli-1.0.5.agentic-media.v2" ||
-  lock.video_adapter_revision !== "grok-api-1.0.5.direct-image-video.v5"
-) {
-  throw new Error("Grok provider binary does not match the immutable provider lock");
+const runtimes = [
+  { generation: "v1", lock: process.env.GROK_V1_LOCK_FILE, source: process.env.GROK_V1_PROVIDER_BINARY, path: "bin/grok-v1" },
+  { generation: "v2", lock: process.env.GROK_V2_LOCK_FILE, source: process.env.GROK_V2_PROVIDER_BINARY, path: "bin/grok-v2" },
+];
+const target = process.env.TARGET_TRIPLE;
+const targetMachine = { "x86_64-unknown-linux-gnu": 62, "aarch64-unknown-linux-gnu": 183 }[target];
+const expected = {
+  v1: {
+    version: "1.0.5",
+    version_output: "grok 1.0.5 (5115b46bc9)",
+    compatibility_revision: "grok-cli-1.0.5",
+    image_adapter_revision: "grok-cli-1.0.5.agentic-media.v2",
+    video_adapter_revision: "grok-api-1.0.5.direct-image-video.v5",
+  },
+  v2: {
+    version: "1.0.34",
+    version_output: "grok 1.0.34 (3736acbc8658)",
+    compatibility_revision: "grok-cli-1.0.34",
+    image_adapter_revision: null,
+    video_adapter_revision: "grok-cli-1.0.34.agentic-video.v1",
+  },
+};
+const runtimeManifest = {};
+for (const runtime of runtimes) {
+  const lock = JSON.parse(fs.readFileSync(runtime.lock, "utf8"));
+  const immutable = expected[runtime.generation];
+  const artifact = lock.artifacts?.[target];
+  const stat = fs.statSync(runtime.source);
+  const bytes = fs.readFileSync(runtime.source);
+  const sha256 = crypto.createHash("sha256").update(bytes).digest("hex");
+  const header = bytes.subarray(0, 20);
+  const elfMachine = header.length >= 20 && header.subarray(0, 4).equals(Buffer.from([0x7f, 0x45, 0x4c, 0x46]))
+    && header[4] === 2 && header[5] === 1 ? header.readUInt16LE(18) : null;
+  if (
+    !stat.isFile() || !immutable || lock.schema_version !== 1 || lock.provider !== "xai-grok-cli" ||
+    lock.source_repository !== "https://github.com/xai-org/grok-build" ||
+    !artifact || artifact.elf_machine !== targetMachine || sha256 !== artifact.sha256 ||
+    bytes.length !== artifact.bytes || elfMachine !== targetMachine ||
+    lock.version !== immutable.version || lock.version_output !== immutable.version_output ||
+    lock.compatibility_revision !== immutable.compatibility_revision ||
+    lock.image_adapter_revision !== immutable.image_adapter_revision ||
+    lock.video_adapter_revision !== immutable.video_adapter_revision
+  ) throw new Error(`${runtime.generation} Grok provider binary does not match immutable lock`);
+  const destination = `${process.env.GROK_RELEASE_ROOT}/${runtime.path}`;
+  fs.copyFileSync(runtime.source, destination);
+  fs.chmodSync(destination, 0o755);
+  runtimeManifest[runtime.generation] = {
+    generation: runtime.generation,
+    version: lock.version,
+    version_output: lock.version_output,
+    target_triple: target,
+    binary_path: runtime.path,
+    binary_sha256: sha256,
+    binary_bytes: bytes.length,
+    elf_machine: elfMachine,
+    compatibility_revision: lock.compatibility_revision,
+    image_adapter_revision: lock.image_adapter_revision,
+    video_adapter_revision: lock.video_adapter_revision,
+  };
 }
-fs.copyFileSync(process.env.GROK_PROVIDER_BINARY, process.env.GROK_PROVIDER_DESTINATION);
-fs.chmodSync(process.env.GROK_PROVIDER_DESTINATION, 0o755);
+const v1 = runtimeManifest.v1;
+const v1Compat = `${process.env.GROK_RELEASE_ROOT}/bin/grok`;
+fs.copyFileSync(`${process.env.GROK_RELEASE_ROOT}/${v1.binary_path}`, v1Compat);
+fs.chmodSync(v1Compat, 0o755);
+const v1Lock = JSON.parse(fs.readFileSync(process.env.GROK_V1_LOCK_FILE, "utf8"));
 const manifest = {
   schema_version: 1,
-  provider: lock.provider,
-  source_repository: lock.source_repository,
-  version: lock.version,
-  version_output: lock.version_output,
-  target_triple: process.env.TARGET_TRIPLE,
+  provider: v1Lock.provider,
+  source_repository: v1Lock.source_repository,
+  version: v1.version,
+  version_output: v1.version_output,
+  target_triple: target,
   binary_path: "bin/grok",
-  binary_sha256: sha256,
-  binary_bytes: bytes.length,
-  compatibility_revision: lock.compatibility_revision,
-  image_adapter_revision: lock.image_adapter_revision,
-  video_adapter_revision: lock.video_adapter_revision,
+  binary_sha256: v1.binary_sha256,
+  binary_bytes: v1.binary_bytes,
+  compatibility_revision: v1.compatibility_revision,
+  image_adapter_revision: v1.image_adapter_revision,
+  video_adapter_revision: v1.video_adapter_revision,
+  runtimes: runtimeManifest,
 };
 fs.writeFileSync(
   process.env.GROK_PROVIDER_MANIFEST,
@@ -423,9 +482,17 @@ fs.writeFileSync(
 );
 NODE
 if [[ "$(uname -s)" == "Linux" ]]; then
-  [[ "$("${RELEASE_ROOT}/bin/grok" --version)" = "$(
-    node -p "require('${GROK_LOCK_FILE}').version_output"
-  )" ]] || die "packaged Grok provider version output does not match the lock"
+  host_arch="$(uname -m)"
+  case "${TARGET_TRIPLE}:${host_arch}" in
+    x86_64-unknown-linux-gnu:x86_64|aarch64-unknown-linux-gnu:aarch64)
+      [[ "$("${RELEASE_ROOT}/bin/grok-v1" --version)" = "$(
+        node -p "require('${GROK_V1_LOCK_FILE}').version_output"
+      )" ]] || die "packaged V1 Grok provider version output does not match the lock"
+      [[ "$("${RELEASE_ROOT}/bin/grok-v2" --version)" = "$(
+        node -p "require('${GROK_V2_LOCK_FILE}').version_output"
+      )" ]] || die "packaged V2 Grok provider version output does not match the lock"
+      ;;
+  esac
 fi
 
 cp -aL "${REPO_ROOT}/deploy/hooks/." "${RELEASE_ROOT}/ops/hooks/"

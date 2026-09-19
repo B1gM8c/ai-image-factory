@@ -10,8 +10,10 @@ use crate::input_blobs::InputBlobRef;
 use image_provider_dreamina_cli::{DREAMINA_SUBMIT_COMMAND_SCHEMA, parse_submit_command};
 use image_provider_grok_cli::{
     GROK_IMAGE_EDIT_COMMAND_SCHEMA, GROK_IMAGE_GENERATION_COMMAND_SCHEMA,
-    GROK_VIDEO_GENERATION_COMMAND_SCHEMA, GrokVideoGenerationRequestV1, StagedImageV1,
-    parse_image_edit_payload, parse_image_generation_payload, parse_video_generation_payload,
+    GROK_VIDEO_GENERATION_COMMAND_SCHEMA, GROK_VIDEO_GENERATION_COMMAND_SCHEMA_V2,
+    GrokVideoGenerationRequestV1, StagedImageV1, parse_image_edit_payload,
+    parse_image_generation_payload, parse_video_generation_payload,
+    parse_video_generation_payload_v2,
 };
 
 mod ark;
@@ -41,8 +43,9 @@ pub use xai_image_edits::{
 };
 pub use xai_images::{XaiImageAdmissionError, XaiImageAdmissionPlan};
 pub use xai_videos::{
-    VIDEO_GENERATION_OPERATION, XAI_VIDEO_INPUT_MANIFEST_SCHEMA, XaiVideoAdmissionError,
-    XaiVideoAdmissionInput, XaiVideoAdmissionIntent, XaiVideoAdmissionPlan,
+    VIDEO_GENERATION_OPERATION, XAI_VIDEO_INPUT_MANIFEST_SCHEMA,
+    XAI_VIDEO_INPUT_MANIFEST_SCHEMA_V2, XaiVideoAdmissionError, XaiVideoAdmissionInput,
+    XaiVideoAdmissionIntent, XaiVideoAdmissionPlan, XaiVideoInputRoleV2,
 };
 
 #[derive(Clone, Debug)]
@@ -251,6 +254,21 @@ pub(crate) fn validate_attach_request(request: &AttachJob) -> Result<(), Admissi
                     Err(AdmissionError::InvalidCommand)
                 }
             }
+            GROK_VIDEO_GENERATION_COMMAND_SCHEMA_V2 => {
+                let bytes = serde_json::to_vec(&request.command_json)
+                    .map_err(|_| AdmissionError::InvalidCommand)?;
+                let payload = parse_video_generation_payload_v2(&bytes)
+                    .map_err(|_| AdmissionError::InvalidCommand)?;
+                if payload.source_command_sha256() == provider_command_hash
+                    && payload.inputs().ordered().next().is_none()
+                    && (payload.request().as_reference().is_some()
+                        || payload.request().as_text().is_some())
+                {
+                    Ok(())
+                } else {
+                    Err(AdmissionError::InvalidCommand)
+                }
+            }
             DREAMINA_SUBMIT_COMMAND_SCHEMA => {
                 let bytes = serde_json::to_vec(&request.command_json)
                     .map_err(|_| AdmissionError::InvalidCommand)?;
@@ -266,6 +284,9 @@ pub(crate) fn validate_attach_request(request: &AttachJob) -> Result<(), Admissi
     };
     if request.command_schema == GROK_VIDEO_GENERATION_COMMAND_SCHEMA {
         return validate_video_attach_request(request, manifest);
+    }
+    if request.command_schema == GROK_VIDEO_GENERATION_COMMAND_SCHEMA_V2 {
+        return validate_video_attach_request_v2(request, manifest);
     }
     if request.command_schema == GROK_IMAGE_EDIT_COMMAND_SCHEMA {
         return validate_grok_image_edit_attach_request(request, manifest);
@@ -381,6 +402,14 @@ pub(crate) fn provider_command_hash(request: &AttachJob) -> Result<String, Admis
             let bytes = serde_json::to_vec(&request.command_json)
                 .map_err(|_| AdmissionError::InvalidCommand)?;
             parse_video_generation_payload(&bytes)
+                .map_err(|_| AdmissionError::InvalidCommand)?
+                .source_command_sha256()
+                .to_string()
+        }
+        GROK_VIDEO_GENERATION_COMMAND_SCHEMA_V2 => {
+            let bytes = serde_json::to_vec(&request.command_json)
+                .map_err(|_| AdmissionError::InvalidCommand)?;
+            parse_video_generation_payload_v2(&bytes)
                 .map_err(|_| AdmissionError::InvalidCommand)?
                 .source_command_sha256()
                 .to_string()
@@ -553,12 +582,94 @@ fn validate_video_attach_request(
     Ok(())
 }
 
+fn validate_video_attach_request_v2(
+    request: &AttachJob,
+    manifest: &AttachInputManifest,
+) -> Result<(), AdmissionError> {
+    if !matches!(
+        request.contract,
+        AdmissionContract::MediaEconomicsV3 | AdmissionContract::CustomerPricingV4
+    ) || manifest.manifest_schema != xai_videos::XAI_VIDEO_INPUT_MANIFEST_SCHEMA_V2
+        || manifest.inputs.is_empty()
+        || manifest.inputs.len() > 9
+        || !is_sha256(&manifest.manifest_hash)
+    {
+        return Err(AdmissionError::InvalidCommand);
+    }
+    let bytes =
+        serde_json::to_vec(&request.command_json).map_err(|_| AdmissionError::InvalidCommand)?;
+    let payload =
+        parse_video_generation_payload_v2(&bytes).map_err(|_| AdmissionError::InvalidCommand)?;
+    if payload.source_command_sha256() != provider_command_hash(request)? {
+        return Err(AdmissionError::InvalidCommand);
+    }
+
+    let expected_images: Vec<_> = payload
+        .inputs()
+        .ordered()
+        .map(|(role, role_index, image)| {
+            let role = match role {
+                "first_frame" => xai_videos::XaiVideoInputRoleV2::FirstFrame,
+                "last_frame" => xai_videos::XaiVideoInputRoleV2::LastFrame,
+                "reference" => xai_videos::XaiVideoInputRoleV2::ReferenceImage,
+                _ => unreachable!("provider V2 role is closed"),
+            };
+            (
+                role,
+                u8::try_from(role_index).expect("provider V2 role index bounded"),
+                image.clone(),
+            )
+        })
+        .collect();
+    if expected_images.len() != manifest.inputs.len() {
+        return Err(AdmissionError::InvalidCommand);
+    }
+    if expected_images.is_empty() {
+        return if payload.request().as_reference().is_some() {
+            Ok(())
+        } else {
+            Err(AdmissionError::InvalidCommand)
+        };
+    }
+    if !xai_videos::video_input_manifest_hash_matches_v2(&expected_images, manifest) {
+        return Err(AdmissionError::InvalidCommand);
+    }
+
+    let mut input_ids = HashSet::new();
+    let mut object_keys = HashSet::new();
+    for (index, ((_, _, expected), input)) in
+        expected_images.iter().zip(&manifest.inputs).enumerate()
+    {
+        if input.role != EditInputRoleV1::Image
+            || usize::from(input.index) != index
+            || input.blob.key.admission_session_id != request.ticket.session_id
+            || input.blob.sha256_hex != expected.sha256()
+            || input.blob.byte_size == 0
+            || input.blob.storage_backend.is_empty()
+            || input.blob.object_key.is_empty()
+            || !matches!(
+                input.media_type.as_str(),
+                "image/png" | "image/jpeg" | "image/webp"
+            )
+            || !input_ids.insert(input.blob.key.input_id)
+            || !object_keys.insert((
+                input.blob.storage_backend.as_str(),
+                input.blob.object_key.as_str(),
+            ))
+        {
+            return Err(AdmissionError::InvalidCommand);
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn attach_operation(request: &AttachJob) -> Result<&'static str, AdmissionError> {
     match request.command_schema.as_str() {
         GENERATION_COMMAND_SCHEMA => Ok(GENERATION_OPERATION),
         GROK_IMAGE_GENERATION_COMMAND_SCHEMA => Ok(GENERATION_OPERATION),
         GROK_IMAGE_EDIT_COMMAND_SCHEMA => Ok(EDIT_OPERATION),
         GROK_VIDEO_GENERATION_COMMAND_SCHEMA => Ok(VIDEO_GENERATION_OPERATION),
+        GROK_VIDEO_GENERATION_COMMAND_SCHEMA_V2 => Ok(VIDEO_GENERATION_OPERATION),
         DREAMINA_SUBMIT_COMMAND_SCHEMA => {
             let bytes = serde_json::to_vec(&request.command_json)
                 .map_err(|_| AdmissionError::InvalidCommand)?;

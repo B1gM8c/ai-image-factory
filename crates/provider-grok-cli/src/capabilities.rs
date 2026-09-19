@@ -1,5 +1,6 @@
 use image_api_contracts::xai::{
     XAI_IMAGE_GENERATION_COMMAND_SCHEMA, XAI_VIDEO_GENERATION_COMMAND_SCHEMA,
+    XAI_VIDEO_GENERATION_COMMAND_SCHEMA_V2,
 };
 use image_provider_contracts::{
     ArtifactDelivery, BillingMetric, CompletionMode, IdempotencyMode, MediaKind, MediaOperation,
@@ -73,6 +74,29 @@ pub const GROK_VIDEO_GENERATION_OPERATION_V1: OperationDescriptor = OperationDes
     official_params: OfficialParamsContract {
         kind: OfficialParamsKind::XaiVideo,
         schema_id: XAI_VIDEO_GENERATION_COMMAND_SCHEMA,
+        passthrough_allowed: false,
+    },
+};
+
+pub const GROK_VIDEO_GENERATION_OPERATION_V2: OperationDescriptor = OperationDescriptor {
+    id: "videos.generations",
+    descriptor_revision: "grok-cli/videos.generations/v2",
+    command_schema: crate::GROK_VIDEO_GENERATION_COMMAND_SCHEMA_V2,
+    output_schema: "factory.provider-artifact.video.v1",
+    media: MediaKind::Video,
+    operation: MediaOperation::Generation,
+    completion: CompletionMode::Inline,
+    artifact_delivery: ArtifactDelivery::InlineBounded {
+        max_bytes: 256 * 1024 * 1024,
+    },
+    client_streaming: StreamingMode::None,
+    idempotency: IdempotencyMode::SubmissionBound,
+    billing_metric: BillingMetric::VideoSecond,
+    output_cardinality: OutputCardinality::ExactlyOne,
+    spatial_edit_mode: SpatialEditMode::Unsupported,
+    official_params: OfficialParamsContract {
+        kind: OfficialParamsKind::XaiVideo,
+        schema_id: XAI_VIDEO_GENERATION_COMMAND_SCHEMA_V2,
         passthrough_allowed: false,
     },
 };

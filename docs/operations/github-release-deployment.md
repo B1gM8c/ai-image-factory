@@ -26,6 +26,8 @@ bin/
   factoryctl
   gpt-image-2-gateway
   grok-runner
+  grok-v1
+  grok-v2
   provider-pollerd
   provider-submitd
   reconcilerd
@@ -346,13 +348,16 @@ same fully verified release after a crash, but it never replaces different
 existing content or a pointer to another release; later changes must use the
 updater state machine.
 
-Each bundle also contains `bin/grok` and `provider-manifest.json`. The build
-downloads the target-specific official xAI binary from the pinned HTTPS URL,
-checks its size, SHA-256, ELF machine, and `--version`, then includes it in the
-attested release. `GATEWAY_MANAGED_GROK_EXECUTABLE` must resolve to
-`/opt/ai-image-factory/current/bin/grok`; the post-activation runtime gate
-rejects a host-level or stale provider executable even if Gateway itself is
-healthy.
+Each bundle also contains `bin/grok-v1`, `bin/grok-v2`, the V1 compatibility
+copy `bin/grok`, and `provider-manifest.json`. The build downloads the two
+target-specific official xAI binaries from their pinned HTTPS URLs, checks each
+size, SHA-256, ELF machine, and matching `--version` on a native target host,
+then includes both in the attested release. `provider-manifest.json` records
+the V1 and V2 adapter revisions and the top-level compatibility identity.
+`EXECUTOR_PROVIDER_EXECUTABLE` must resolve to the intended immutable runtime
+(`bin/grok-v1` for replay or `bin/grok-v2` for new V2 jobs); the
+post-activation runtime gate rejects a host-level, crossed-generation, or stale
+provider executable even if Gateway itself is healthy.
 
 Automatic application updates do not overwrite root-owned systemd units or
 hooks. If a release changes `ops/`, review the diff and copy those files through
@@ -387,6 +392,7 @@ sudo systemctl show ai-image-factory-updater.service \
   ai-image-factory-updater-recover@preflight.service ai-image-factory-recovery-gate.service \
   --property=ExecStart,ReadWritePaths,ReadOnlyPaths,BindPaths,BindReadOnlyPaths,ProtectSystem,NoNewPrivileges,DropInPaths
 sudo /usr/libexec/ai-image-factory/hooks/verify-admin-reader
+sudo /usr/libexec/ai-image-factory/hooks/verify-gateway-runtime
 ```
 
 Every source/destination hook digest must equal its new signed manifest entry.
@@ -660,4 +666,5 @@ for script in "${shell_scripts[@]}"; do
 done
 python3 -c 'import ast, pathlib; ast.parse(pathlib.Path("deploy/hooks/verify-media-segments").read_text())'
 PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-media-runtime-gate.py
+./scripts/test-gateway-runtime-gate.sh
 ```

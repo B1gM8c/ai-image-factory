@@ -4,7 +4,10 @@ use image_cli_runtime::{CommandSpec, CommandSpecError, VerifiedExecutable, Worki
 use serde_json::{Value, json};
 use thiserror::Error;
 
-use crate::{GrokImageEditRequestV1, GrokImageGenerationRequestV1, GrokVideoGenerationRequestV1};
+use crate::{
+    GrokImageEditRequestV1, GrokImageGenerationRequestV1, GrokVideoGenerationRequestV1,
+    GrokVideoGenerationRequestV2,
+};
 
 const EXACT_VIDEO_DISPATCH_SYSTEM_PROMPT: &str = "You are a deterministic media tool dispatcher. Execute only the enabled tool calls requested by the user. Copy every JSON argument exactly without rewriting, omitting, adding, or normalizing any value. After the final tool result, end immediately.";
 
@@ -41,6 +44,13 @@ pub enum GrokTool {
     ImageEdit,
     ImageToVideo,
     ReferenceToVideo,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GrokToolArgumentPolicy {
+    Exact,
+    LegacyVideoDefaults,
+    ImagePromptMayNormalize,
 }
 
 impl GrokTool {
@@ -82,6 +92,7 @@ pub struct GrokExpectedToolCallV1 {
     tool: GrokTool,
     arguments: Value,
     artifact_path: std::path::PathBuf,
+    argument_policy: GrokToolArgumentPolicy,
 }
 
 impl GrokExpectedToolCallV1 {
@@ -95,6 +106,10 @@ impl GrokExpectedToolCallV1 {
 
     pub fn artifact_path(&self) -> &Path {
         &self.artifact_path
+    }
+
+    pub fn argument_policy(&self) -> GrokToolArgumentPolicy {
+        self.argument_policy
     }
 }
 
@@ -257,6 +272,77 @@ impl GrokCliPolicyV1 {
         }
         Ok((command, invocation))
     }
+
+    pub fn command_spec_video_v2(
+        &self,
+        request: &GrokVideoGenerationRequestV2,
+        session_id: &str,
+        workspace: WorkingDirectory,
+    ) -> Result<(CommandSpec, GrokInvocationV1), GrokCliPolicyError> {
+        if workspace.path().parent() != Some(self.workspace_root.path()) {
+            return Err(GrokCliPolicyError::ExecutionWorkspaceOutsideRoot);
+        }
+        validate_session_id(session_id)?;
+        let invocation =
+            build_invocation_v2(request, session_id, workspace.path(), self.grok_home.path())?;
+        if invocation.session_directory.exists() {
+            return Err(GrokCliPolicyError::SessionAlreadyExists);
+        }
+        let enabled_tools = invocation
+            .expected_tool_calls()
+            .iter()
+            .map(|call| call.tool().name())
+            .collect::<Vec<_>>()
+            .join(",");
+        let max_turns = if invocation.expected_tool_calls().len() == 1 {
+            "3"
+        } else {
+            "5"
+        };
+        let prompt = dispatch_prompt(invocation.expected_tool_calls())?;
+        let command = CommandSpec::new_receipt(
+            self.executable.clone(),
+            workspace.clone(),
+            self.wall_timeout,
+            self.termination_grace,
+        )?
+        .require_directory(self.runtime_home.clone())
+        .require_directory(self.grok_home.clone())
+        .env("HOME", self.runtime_home.path().as_os_str())?
+        .env("GROK_HOME", self.grok_home.path().as_os_str())?
+        .env("TMPDIR", workspace.path().as_os_str())?
+        .env("NO_COLOR", "1")?
+        .env("TERM", "dumb")?
+        .arg("--cwd")?
+        .arg(workspace.path().as_os_str())?
+        .arg("--no-memory")?
+        .arg("--no-plan")?
+        .arg("--no-subagents")?
+        .arg("--disable-web-search")?
+        .arg("--verbatim")?
+        .arg("--system-prompt-override")?
+        .arg(EXACT_VIDEO_DISPATCH_SYSTEM_PROMPT)?
+        .arg("--always-approve")?
+        .arg("--tools")?
+        .arg(enabled_tools)?
+        .arg("--max-turns")?
+        .arg(max_turns)?
+        .arg("--no-wait-for-background")?
+        .arg("--session-id")?
+        .arg(session_id)?
+        .arg("--output-format")?
+        .arg("streaming-json")?
+        .arg("--prompt-file")?
+        .arg("/dev/stdin")?
+        .stdin(prompt.into_bytes());
+        let command = command?;
+        let command = if matches!(request, GrokVideoGenerationRequestV2::TextToVideo(_)) {
+            command.env("GROK_IMAGE_GEN_MODEL_OVERRIDE", "grok-imagine-image")?
+        } else {
+            command
+        };
+        Ok((command, invocation))
+    }
 }
 
 #[derive(Debug, Error)]
@@ -346,6 +432,44 @@ fn build_invocation(
     })
 }
 
+fn build_invocation_v2(
+    request: &GrokVideoGenerationRequestV2,
+    session_id: &str,
+    workspace: &Path,
+    grok_home: &Path,
+) -> Result<GrokInvocationV1, GrokCliPolicyError> {
+    let workspace_text = workspace
+        .to_str()
+        .ok_or(GrokCliPolicyError::NonUtf8Workspace)?;
+    let encoded_workspace = urlencoding::encode(workspace_text);
+    if encoded_workspace.len() > MAX_SESSION_CWD_COMPONENT_BYTES {
+        return Err(GrokCliPolicyError::LongWorkspacePathUnsupported);
+    }
+    let session_directory = grok_home
+        .join("sessions")
+        .join(encoded_workspace.as_ref())
+        .join(session_id);
+    let expected_tool_calls = expected_tool_calls_v2(request, workspace, &session_directory);
+    let final_tool = expected_tool_calls
+        .last()
+        .expect("every Grok V2 request has at least one tool call")
+        .tool;
+    let artifact_path = session_directory
+        .join(final_tool.artifact_folder())
+        .join(final_tool.artifact_filename());
+    Ok(GrokInvocationV1 {
+        session_id: session_id.to_owned(),
+        expected_tool_calls,
+        session_directory,
+        history_path: grok_home
+            .join("sessions")
+            .join(encoded_workspace.as_ref())
+            .join(session_id)
+            .join("chat_history.jsonl"),
+        artifact_path,
+    })
+}
+
 fn expected_tool_calls(
     request: &GrokCliRequestV1,
     workspace: &Path,
@@ -420,6 +544,81 @@ fn expected_tool_calls(
             artifact_path: session_directory
                 .join(tool.artifact_folder())
                 .join(tool.artifact_filename()),
+            argument_policy: match tool {
+                GrokTool::ImageGeneration | GrokTool::ImageEdit => {
+                    GrokToolArgumentPolicy::ImagePromptMayNormalize
+                }
+                GrokTool::ImageToVideo | GrokTool::ReferenceToVideo => {
+                    GrokToolArgumentPolicy::LegacyVideoDefaults
+                }
+            },
+        })
+        .collect()
+}
+
+fn expected_tool_calls_v2(
+    request: &GrokVideoGenerationRequestV2,
+    workspace: &Path,
+    session_directory: &Path,
+) -> Vec<GrokExpectedToolCallV1> {
+    let calls = match request {
+        GrokVideoGenerationRequestV2::TextToVideo(request) => {
+            let generated = session_directory.join("images").join("1.jpg");
+            vec![
+                (
+                    GrokTool::ImageGeneration,
+                    json!({
+                        "prompt": request.prompt(),
+                        "aspect_ratio": request.aspect_ratio().as_str(),
+                    }),
+                ),
+                (
+                    GrokTool::ImageToVideo,
+                    json!({
+                        "prompt": request.prompt(),
+                        "image": generated,
+                        "duration": request.duration(),
+                        "resolution_name": request.resolution().as_str(),
+                    }),
+                ),
+            ]
+        }
+        GrokVideoGenerationRequestV2::ImageToVideo(request) => vec![(
+            GrokTool::ImageToVideo,
+            json!({
+                "prompt": request.prompt(),
+                "image": workspace.join(request.image().filename()),
+                "duration": request.duration(),
+                "resolution_name": request.resolution().as_str(),
+            }),
+        )],
+        GrokVideoGenerationRequestV2::ReferenceToVideo(request) => vec![(
+            GrokTool::ReferenceToVideo,
+            json!({
+                "prompt": request.prompt().unwrap_or(""),
+                "images": request
+                    .reference_images()
+                    .iter()
+                    .map(|image| workspace.join(image.filename()))
+                    .collect::<Vec<_>>(),
+                "first_frame": request.first_frame().map(|image| workspace.join(image.filename())),
+                "last_frame": request.last_frame().map(|image| workspace.join(image.filename())),
+                "voices": request.voices(),
+                "aspect_ratio": request.aspect_ratio().as_str(),
+                "duration": request.duration().seconds(),
+                "resolution_name": request.resolution().as_str(),
+            }),
+        )],
+    };
+    calls
+        .into_iter()
+        .map(|(tool, arguments)| GrokExpectedToolCallV1 {
+            tool,
+            arguments,
+            artifact_path: session_directory
+                .join(tool.artifact_folder())
+                .join(tool.artifact_filename()),
+            argument_policy: GrokToolArgumentPolicy::Exact,
         })
         .collect()
 }

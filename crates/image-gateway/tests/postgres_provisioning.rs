@@ -1,5 +1,8 @@
 use std::env;
 
+use serde_json::Value;
+
+use gpt_image_2_gateway::executor::provision_grok_video_v2_execution_profile;
 use gpt_image_2_gateway::provider_management::{
     PostgresProviderManagementService, ProviderAccountModelSelection, ProviderManagementService,
     ProviderRouteModelMappingRequest, UpdateProviderAccountModelConfigurationRequest,
@@ -443,6 +446,609 @@ async fn grok_video_profile_has_a_distinct_runtime_binding() -> TestResult {
     }
     .await;
     combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
+async fn grok_video_v2_profile_provisions_exact_binding_without_account_operation() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let provisioning = grok_video_v2_fixture("binding");
+        let provisioned = provision_grok_video_v2_execution_profile(&database.pool, &provisioning)
+            .await
+            .map_err(debug_error)?;
+        let loaded = PostgresExecutorSubmissionStore::new(database.pool.clone())
+            .load_execution_profile(&provisioning.profile_key)
+            .await
+            .map_err(debug_error)?;
+        let operation = image_provider_grok_cli::GROK_VIDEO_GENERATION_OPERATION_V2;
+        require(
+            loaded.execution_profile_id == provisioned.execution_profile_id
+                && loaded.command_schema
+                    == image_provider_grok_cli::GROK_VIDEO_GENERATION_COMMAND_SCHEMA_V2
+                && loaded.operation_descriptor_revision == operation.descriptor_revision
+                && loaded.operation_descriptor_sha256_v1 == operation.canonical_sha256_v1_hex()
+                && loaded.adapter_revision == image_provider_grok_cli::VIDEO_ADAPTER_REVISION_V2
+                && identify_executor_profile_binding(&loaded)
+                    == Ok(ExecutorProfileBinding::GrokVideoGenerationV2),
+            format!("provisioned V2 profile has the wrong binding: {loaded:?}"),
+        )?;
+        let account_operations: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM provider_account_operations WHERE provider_account_id = $1 AND operation_id = 'videos.generations'",
+        )
+        .bind(provisioned.provider_account_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(account_operations == 0, "V2 provisioning enabled an account operation")
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
+async fn grok_video_v2_data_migration_is_additive_disabled_and_idempotent() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let provisioning = grok_video_fixture("migration");
+        let v1 = provision_grok_video_execution_profile(&database.pool, &provisioning)
+            .await
+            .map_err(debug_error)?;
+        sqlx::query(
+            r#"
+            INSERT INTO provider_models
+              (provider_id, model_id, execution_model_id, media_kind, display_name, adapter_state,
+               lifecycle_state, operation_ids, source_kind, first_seen_at_ms,
+               last_seen_at_ms, metadata_json)
+            VALUES ('grok-cli', 'grok-imagine-video-1.5-preview', 'grok-imagine-video-1.5-preview', 'video',
+                    'Grok Imagine Video 1.5 Preview', 'supported', 'enabled',
+                    ARRAY['videos.generations'], 'adapter_contract', 1, 1, '{}'::JSONB)
+            ON CONFLICT DO NOTHING
+            "#,
+        )
+        .execute(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        let route_id = Uuid::new_v4();
+        sqlx::query(
+            r#"
+            INSERT INTO provider_routes
+              (route_id, revision, route_key, display_name, provider_id,
+               operation_id, command_schema, route_kind, selection_strategy,
+               state, created_at_ms, quota_freshness_ms, unknown_quota_policy)
+            VALUES ($1, 1, 'account.grok-video-v1-migration', 'Grok Video V1',
+                    'grok-cli', 'videos.generations',
+                    'grok-cli.videos.generate.v1', 'account',
+                    'quota_aware_least_loaded', 'enabled', 1, 900000, 'allow')
+            "#,
+        )
+        .bind(route_id)
+        .execute(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        sqlx::query(
+            r#"
+            INSERT INTO provider_route_heads
+              (route_id, route_key, provider_id, operation_id, command_schema,
+               route_kind, current_revision, state, created_at_ms, updated_at_ms)
+            VALUES ($1, 'account.grok-video-v1-migration', 'grok-cli',
+                    'videos.generations', 'grok-cli.videos.generate.v1',
+                    'account', 1, 'enabled', 1, 1)
+            "#,
+        )
+        .bind(route_id)
+        .execute(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        sqlx::query(
+            r#"
+            INSERT INTO provider_route_members
+              (route_id, route_revision, provider_id, operation_id, command_schema,
+               provider_account_id, execution_profile_id, priority, weight, state,
+               created_at_ms, minimum_remaining_percent)
+            VALUES ($1, 1, 'grok-cli', 'videos.generations',
+                    'grok-cli.videos.generate.v1', $2, $3, 0, 100, 'enabled', 1, 0)
+            "#,
+        )
+        .bind(route_id)
+        .bind(v1.provider_account_id)
+        .bind(v1.execution_profile_id)
+        .execute(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        let v1_snapshot: (String, String, String, String, String, String, String) = sqlx::query_as(
+            r#"
+            SELECT profile.state, route.state, head.state, member.state,
+                   profile.command_schema, profile.operation_descriptor_sha256_v1,
+                   profile.adapter_revision
+            FROM provider_execution_profiles profile
+            JOIN provider_route_members member
+              ON member.execution_profile_id = profile.execution_profile_id
+            JOIN provider_routes route
+              ON route.route_id = member.route_id
+             AND route.revision = member.route_revision
+            JOIN provider_route_heads head ON head.route_id = route.route_id
+            WHERE profile.execution_profile_id = $1
+            "#,
+        )
+        .bind(v1.execution_profile_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        let complete_v1_before = snapshot_grok_video_v1_rows(&database.pool).await?;
+
+        let migration = include_str!("../migrations/0132_grok_video_v2_bindings.sql");
+        sqlx::raw_sql(migration)
+            .execute(&database.pool)
+            .await
+            .map_err(debug_error)?;
+        let complete_v1_after = snapshot_grok_video_v1_rows(&database.pool).await?;
+        require(
+            complete_v1_after == complete_v1_before,
+            "migration changed a complete V1 profile/route/pricing snapshot",
+        )?;
+        sqlx::raw_sql(migration)
+            .execute(&database.pool)
+            .await
+            .map_err(debug_error)?;
+        let v2_rows: (i64, i64, i64, i64, i64) = sqlx::query_as(
+            r#"
+            SELECT
+              (SELECT COUNT(*) FROM provider_execution_profiles
+               WHERE provider_account_id = $1
+                 AND command_schema = 'grok-cli.videos.generate.v2'),
+              (SELECT COUNT(*) FROM provider_routes
+               WHERE provider_id = 'grok-cli'
+                 AND command_schema = 'grok-cli.videos.generate.v2'),
+              (SELECT COUNT(*) FROM provider_route_heads
+               WHERE provider_id = 'grok-cli'
+                 AND command_schema = 'grok-cli.videos.generate.v2'),
+              (SELECT COUNT(*) FROM provider_route_members
+               WHERE provider_account_id = $1
+                 AND command_schema = 'grok-cli.videos.generate.v2'),
+              (SELECT COUNT(*) FROM price_book_versions
+               WHERE price_book_version_id = 'f2c8d05a-a6d3-4b7f-8b0a-2be4bd8ed132'
+                 AND state = 'draft')
+            "#,
+        )
+        .bind(v1.provider_account_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(v2_rows == (1, 1, 1, 1, 1), format!("unexpected V2 migration rows: {v2_rows:?}"))?;
+        let v2_states: (String, String, String, String) = sqlx::query_as(
+            r#"
+            SELECT profile.state, route.state, head.state, member.state
+            FROM provider_execution_profiles profile
+            JOIN provider_route_members member
+              ON member.execution_profile_id = profile.execution_profile_id
+            JOIN provider_routes route
+              ON route.route_id = member.route_id
+             AND route.revision = member.route_revision
+            JOIN provider_route_heads head ON head.route_id = route.route_id
+            WHERE profile.provider_account_id = $1
+              AND profile.command_schema = 'grok-cli.videos.generate.v2'
+            "#,
+        )
+        .bind(v1.provider_account_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(v2_states == ("disabled".into(), "disabled".into(), "disabled".into(), "disabled".into()), format!("V2 migration enabled a durable row: {v2_states:?}"))?;
+        let v1_after: (String, String, String, String, String, String, String) = sqlx::query_as(
+            r#"
+            SELECT profile.state, route.state, head.state, member.state,
+                   profile.command_schema, profile.operation_descriptor_sha256_v1,
+                   profile.adapter_revision
+            FROM provider_execution_profiles profile
+            JOIN provider_route_members member
+              ON member.execution_profile_id = profile.execution_profile_id
+            JOIN provider_routes route
+              ON route.route_id = member.route_id
+             AND route.revision = member.route_revision
+            JOIN provider_route_heads head ON head.route_id = route.route_id
+            WHERE profile.execution_profile_id = $1
+            "#,
+        )
+        .bind(v1.execution_profile_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(v1_after == v1_snapshot, format!("V1 migration snapshot changed: before={v1_snapshot:?} after={v1_after:?}"))?;
+        let operation = image_provider_grok_cli::GROK_VIDEO_GENERATION_OPERATION_V2;
+        let v2_identity: (String, String, String, String, String) = sqlx::query_as(
+            r#"
+            SELECT profile.command_schema, profile.operation_descriptor_revision,
+                   profile.operation_descriptor_sha256_v1, profile.adapter_revision,
+                   version.state
+            FROM provider_execution_profiles profile
+            CROSS JOIN price_book_versions version
+            WHERE profile.provider_account_id = $1
+              AND profile.command_schema = 'grok-cli.videos.generate.v2'
+              AND version.price_book_version_id = 'f2c8d05a-a6d3-4b7f-8b0a-2be4bd8ed132'
+            "#,
+        )
+        .bind(v1.provider_account_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(
+            v2_identity
+                == (
+                    image_provider_grok_cli::GROK_VIDEO_GENERATION_COMMAND_SCHEMA_V2.into(),
+                    operation.descriptor_revision.into(),
+                    operation.canonical_sha256_v1_hex(),
+                    image_provider_grok_cli::VIDEO_ADAPTER_REVISION_V2.into(),
+                    "draft".into(),
+                ),
+            format!("V2 migration identity drifted from runtime constants: {v2_identity:?}"),
+        )?;
+        let contract_identity: (String, String, String, String) = sqlx::query_as(
+            "SELECT contract_key, contract_hash, normalizer_key, contract_json->'contract'->>'command_schema' FROM pricing_surface_contract_revisions WHERE contract_key = 'grok-cli.videos.generations.v2.pricing-surface:95737ab45d7c904a'",
+        )
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(
+            contract_identity
+                == (
+                    "grok-cli.videos.generations.v2.pricing-surface:95737ab45d7c904a".into(),
+                    "7d1f94c4cc807d9b82d4c199bd05181867b53c6268ae89b1665a1e7c2f42aa87".into(),
+                    "grok-cli.videos.generate.v2".into(),
+                    "grok-cli.videos.generate.v2".into(),
+                ),
+            format!("V2 contract binding drifted: {contract_identity:?}"),
+        )?;
+        let gateway_bindings: (i64, i64, i64) = sqlx::query_as(
+            r#"
+            SELECT
+              (SELECT COUNT(*) FROM gateway_platform_provider_routes
+               WHERE provider_id = 'grok-cli' AND command_schema = 'grok-cli.videos.generate.v2'),
+              (SELECT COUNT(*) FROM gateway_project_provider_routes
+               WHERE provider_id = 'grok-cli' AND command_schema = 'grok-cli.videos.generate.v2'),
+              (SELECT COUNT(*) FROM gateway_api_key_provider_routes
+               WHERE provider_id = 'grok-cli' AND command_schema = 'grok-cli.videos.generate.v2')
+            "#,
+        )
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(gateway_bindings == (0, 0, 0), "V2 migration created a gateway route binding")?;
+        let mut v2_provisioning = provisioning.clone();
+        v2_provisioning.profile_key = sqlx::query_scalar(
+            "SELECT profile_key FROM provider_execution_profiles WHERE provider_account_id = $1 AND command_schema = 'grok-cli.videos.generate.v2'",
+        )
+        .bind(v1.provider_account_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        let activated = provision_grok_video_v2_execution_profile(&database.pool, &v2_provisioning)
+            .await
+            .map_err(debug_error)?;
+        let replay = provision_grok_video_v2_execution_profile(&database.pool, &v2_provisioning)
+            .await
+            .map_err(debug_error)?;
+        require(activated == replay, "V2 explicit provisioning was not idempotent")?;
+        let after_activation: (String, String, String, String, String) = sqlx::query_as(
+            r#"
+            SELECT profile.state, route.state, head.state, member.state, version.state
+            FROM provider_execution_profiles profile
+            JOIN provider_route_members member
+              ON member.execution_profile_id = profile.execution_profile_id
+            JOIN provider_routes route
+              ON route.route_id = member.route_id
+             AND route.revision = member.route_revision
+            JOIN provider_route_heads head ON head.route_id = route.route_id
+            CROSS JOIN price_book_versions version
+            WHERE profile.provider_account_id = $1
+              AND profile.command_schema = 'grok-cli.videos.generate.v2'
+              AND version.price_book_version_id = 'f2c8d05a-a6d3-4b7f-8b0a-2be4bd8ed132'
+            "#,
+        )
+        .bind(v1.provider_account_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(after_activation == ("enabled".into(), "disabled".into(), "disabled".into(), "disabled".into(), "draft".into()), format!("V2 explicit activation widened durable state: {after_activation:?}"))?;
+        require(activated.execution_profile_id == replay.execution_profile_id, "V2 activation identity changed")
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
+async fn grok_video_v2_migration_uses_latest_profile_and_current_route_policy() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let first = grok_video_fixture("revision-first");
+        let first_profile = provision_grok_video_execution_profile(&database.pool, &first)
+            .await
+            .map_err(debug_error)?;
+        let operation = image_provider_grok_cli::GROK_VIDEO_GENERATION_OPERATION_V1;
+        let replacement_key = format!("{}.replacement", first.profile_key);
+        let replacement_id = Uuid::new_v4();
+        sqlx::query(
+            r#"
+            INSERT INTO executor_resource_policies
+              (resource_policy_id, revision, credential_pool_id, provider_account_id,
+               provider_id, execution_class, max_concurrency, allocated_count, state,
+               created_at_ms)
+            SELECT resource_policy_id, 2, credential_pool_id, provider_account_id,
+                   provider_id, execution_class, max_concurrency, 0, 'disabled', 20
+            FROM executor_resource_policies
+            WHERE resource_policy_id = $1 AND revision = $2
+            "#,
+        )
+        .bind(first_profile.resource_policy_id)
+        .bind(1_i64)
+        .execute(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        sqlx::query(
+            r#"
+            INSERT INTO provider_execution_profiles
+              (execution_profile_id, profile_key, provider_id, command_schema,
+               operation_id, operation_descriptor_revision, operation_descriptor_sha256_v1,
+               completion_mode, idempotency_mode, adapter_revision,
+               credential_pool_id, provider_account_id, credential_ref, credential_revision,
+               resource_policy_id, resource_policy_revision, state, created_at_ms, updated_at_ms)
+            SELECT $1, $2, profile.provider_id, profile.command_schema,
+                   profile.operation_id, profile.operation_descriptor_revision,
+                   profile.operation_descriptor_sha256_v1, profile.completion_mode,
+                   profile.idempotency_mode, profile.adapter_revision,
+                   profile.credential_pool_id, profile.provider_account_id,
+                   profile.credential_ref, profile.credential_revision,
+                   profile.resource_policy_id, 2,
+                   'enabled', 20, 9999999999999
+            FROM provider_execution_profiles profile
+            WHERE profile.execution_profile_id = $3
+            "#,
+        )
+        .bind(replacement_id)
+        .bind(&replacement_key)
+        .bind(first_profile.execution_profile_id)
+        .execute(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        let route_id = Uuid::new_v4();
+        sqlx::query(
+            r#"
+            INSERT INTO provider_routes
+              (route_id, revision, route_key, display_name, provider_id, operation_id,
+               command_schema, route_kind, selection_strategy, state, created_at_ms,
+               quota_freshness_ms, unknown_quota_policy)
+            VALUES ($1, 1, 'account.grok-video-revisioned', 'Grok Video Historical',
+                    'grok-cli', 'videos.generations', 'grok-cli.videos.generate.v1',
+                    'account', 'priority_weighted', 'enabled', 1, 111111, 'allow'),
+                   ($1, 2, 'account.grok-video-revisioned', 'Grok Video Current',
+                    'grok-cli', 'videos.generations', 'grok-cli.videos.generate.v1',
+                    'account', 'quota_aware_least_loaded', 'enabled', 2, 222222, 'block')
+            "#,
+        )
+        .bind(route_id)
+        .execute(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        sqlx::query(
+            r#"
+            INSERT INTO provider_route_heads
+              (route_id, route_key, provider_id, operation_id, command_schema, route_kind,
+               current_revision, state, created_at_ms, updated_at_ms)
+            VALUES ($1, 'account.grok-video-revisioned', 'grok-cli', 'videos.generations',
+                    'grok-cli.videos.generate.v1', 'account', 1, 'enabled', 1, 1)
+            "#,
+        )
+        .bind(route_id)
+        .execute(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        sqlx::query(
+            r#"
+            INSERT INTO provider_route_members
+              (route_id, route_revision, provider_id, operation_id, command_schema,
+               provider_account_id, execution_profile_id, priority, weight, state,
+               created_at_ms, minimum_remaining_percent)
+            VALUES ($1, 1, 'grok-cli', 'videos.generations', 'grok-cli.videos.generate.v1',
+                    $2, $3, 0, 100, 'enabled', 1, 0)
+            "#,
+        )
+        .bind(route_id)
+        .bind(first_profile.provider_account_id)
+        .bind(first_profile.execution_profile_id)
+        .execute(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        sqlx::query(
+            r#"
+            UPDATE provider_route_heads
+            SET current_revision = 2, updated_at_ms = 2
+            WHERE route_id = $1
+            "#,
+        )
+        .bind(route_id)
+        .execute(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        sqlx::query(
+            r#"
+            INSERT INTO provider_route_members
+              (route_id, route_revision, provider_id, operation_id, command_schema,
+               provider_account_id, execution_profile_id, priority, weight, state,
+               created_at_ms, minimum_remaining_percent)
+            VALUES ($1, 2, 'grok-cli', 'videos.generations', 'grok-cli.videos.generate.v1',
+                    $2, $3, 0, 100, 'enabled', 2, 0)
+            "#,
+        )
+        .bind(route_id)
+        .bind(first_profile.provider_account_id)
+        .bind(replacement_id)
+        .execute(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        let migration = include_str!("../migrations/0132_grok_video_v2_bindings.sql");
+        sqlx::raw_sql(migration)
+            .execute(&database.pool)
+            .await
+            .map_err(debug_error)?;
+        let selected: (String, i64, String, i64, String) = sqlx::query_as(
+            r#"
+            SELECT profile.credential_ref, profile.updated_at_ms,
+                   route.selection_strategy, route.quota_freshness_ms,
+                   route.unknown_quota_policy
+            FROM provider_execution_profiles profile
+            JOIN provider_routes route
+              ON route.route_key = 'account.' || replace(profile.provider_account_id::TEXT, '-', '') || '.grok-video-v2'
+             AND route.command_schema = 'grok-cli.videos.generate.v2'
+            WHERE profile.provider_account_id = $1
+              AND profile.command_schema = 'grok-cli.videos.generate.v2'
+            "#,
+        )
+        .bind(first_profile.provider_account_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(
+            selected
+                == (
+                    first.credential_ref.clone(),
+                    9999999999999,
+                    "quota_aware_least_loaded".to_string(),
+                    222222,
+                    "block".to_string(),
+                ),
+            format!("V2 migration selected stale profile/route policy: {selected:?}"),
+        )?;
+        require(operation.canonical_sha256_v1_hex().len() == 64, "V1 descriptor fixture is invalid")
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
+async fn grok_video_v2_crossed_durable_identities_conflict_without_partial_writes() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        for crossed in ["schema", "adapter", "descriptor"] {
+            let provisioning = grok_video_fixture(&format!("crossed-{crossed}"));
+            let v1 = provision_grok_video_execution_profile(&database.pool, &provisioning)
+                .await
+                .map_err(debug_error)?;
+            let operation_v1 = image_provider_grok_cli::GROK_VIDEO_GENERATION_OPERATION_V1;
+            let operation_v2 = image_provider_grok_cli::GROK_VIDEO_GENERATION_OPERATION_V2;
+            let profile_key = format!("grok-cli-video-v2-crossed-{crossed}");
+            let schema = if crossed == "schema" {
+                image_provider_grok_cli::GROK_VIDEO_GENERATION_COMMAND_SCHEMA
+            } else {
+                image_provider_grok_cli::GROK_VIDEO_GENERATION_COMMAND_SCHEMA_V2
+            };
+            let adapter = if crossed == "adapter" {
+                image_provider_grok_cli::VIDEO_ADAPTER_REVISION
+            } else {
+                image_provider_grok_cli::VIDEO_ADAPTER_REVISION_V2
+            };
+            let (descriptor_revision, descriptor_hash) = if crossed == "descriptor" {
+                (operation_v1.descriptor_revision, operation_v1.canonical_sha256_v1_hex())
+            } else {
+                (operation_v2.descriptor_revision, operation_v2.canonical_sha256_v1_hex())
+            };
+            sqlx::query(
+                r#"
+                INSERT INTO provider_execution_profiles
+                  (execution_profile_id, profile_key, provider_id, command_schema,
+                   operation_id, operation_descriptor_revision, operation_descriptor_sha256_v1,
+                   completion_mode, idempotency_mode, adapter_revision,
+                   credential_pool_id, provider_account_id, credential_ref, credential_revision,
+                   resource_policy_id, resource_policy_revision, state, created_at_ms, updated_at_ms)
+                SELECT $1, $2, profile.provider_id, $3, $4, $5, $6, $7, $8, $9,
+                       profile.credential_pool_id, profile.provider_account_id,
+                       profile.credential_ref, profile.credential_revision,
+                       profile.resource_policy_id, profile.resource_policy_revision,
+                       'disabled', 2, 2
+                FROM provider_execution_profiles profile
+                WHERE profile.execution_profile_id = $10
+                "#,
+            )
+            .bind(Uuid::new_v4())
+            .bind(&profile_key)
+            .bind(schema)
+            .bind(operation_v2.id)
+            .bind(descriptor_revision)
+            .bind(&descriptor_hash)
+            .bind(operation_v2.completion.as_str())
+            .bind(operation_v2.idempotency.as_str())
+            .bind(adapter)
+            .bind(v1.execution_profile_id)
+            .execute(&database.pool)
+            .await
+            .map_err(debug_error)?;
+            let before: (i64, i64, i64, i64, i64) = sqlx::query_as(
+                r#"
+                SELECT
+                  (SELECT COUNT(*) FROM provider_execution_profiles WHERE provider_account_id = $1),
+                  (SELECT COUNT(*) FROM provider_credential_pools),
+                  (SELECT COUNT(*) FROM provider_accounts),
+                  (SELECT COUNT(*) FROM executor_resource_policies),
+                  (SELECT COUNT(*) FROM provider_account_operations)
+                "#,
+            )
+            .bind(v1.provider_account_id)
+            .fetch_one(&database.pool)
+            .await
+            .map_err(debug_error)?;
+            let mut v2 = provisioning.clone();
+            v2.profile_key = profile_key;
+            require(
+                provision_grok_video_v2_execution_profile(&database.pool, &v2).await
+                    == Err(CodexProfileProvisioningError::Conflict),
+                format!("crossed {crossed} identity was not rejected"),
+            )?;
+            let after: (i64, i64, i64, i64, i64) = sqlx::query_as(
+                r#"
+                SELECT
+                  (SELECT COUNT(*) FROM provider_execution_profiles WHERE provider_account_id = $1),
+                  (SELECT COUNT(*) FROM provider_credential_pools),
+                  (SELECT COUNT(*) FROM provider_accounts),
+                  (SELECT COUNT(*) FROM executor_resource_policies),
+                  (SELECT COUNT(*) FROM provider_account_operations)
+                "#,
+            )
+            .bind(v1.provider_account_id)
+            .fetch_one(&database.pool)
+            .await
+            .map_err(debug_error)?;
+            require(before == after, format!("crossed {crossed} identity left partial writes"))?;
+        }
+        Ok(())
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[test]
+fn grok_video_v2_migration_contains_only_data_statements() {
+    let migration =
+        include_str!("../migrations/0132_grok_video_v2_bindings.sql").to_ascii_uppercase();
+    for keyword in [
+        "CREATE TABLE",
+        "CREATE INDEX",
+        "CREATE FUNCTION",
+        "CREATE TRIGGER",
+        "ALTER TABLE",
+        "DROP TABLE",
+        "DROP INDEX",
+    ] {
+        assert!(
+            !migration.contains(keyword),
+            "migration contains forbidden DDL: {keyword}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -1004,6 +1610,42 @@ fn grok_video_fixture(suffix: &str) -> GrokExecutionProfileProvisioning {
         credential_auth_sha256: "b".repeat(64),
         max_concurrency: 1,
     }
+}
+
+fn grok_video_v2_fixture(suffix: &str) -> GrokExecutionProfileProvisioning {
+    GrokExecutionProfileProvisioning {
+        profile_key: format!("grok-cli-video-v2-{suffix}"),
+        credential_pool_key: format!("grok-cli-video-v2-pool-{suffix}"),
+        provider_account_key: format!("grok-cli-video-v2-account-{suffix}"),
+        credential_ref: format!("mounted.grok-cli-video-v2.{suffix}.1"),
+        credential_revision: 1,
+        credential_auth_sha256: "c".repeat(64),
+        max_concurrency: 1,
+    }
+}
+
+async fn snapshot_grok_video_v1_rows(pool: &PgPool) -> TestResult<Vec<Value>> {
+    let queries = [
+        r#"SELECT COALESCE(jsonb_agg(to_jsonb(row) ORDER BY row.execution_profile_id), '[]'::JSONB) FROM (SELECT * FROM provider_execution_profiles WHERE provider_id = 'grok-cli' AND command_schema = 'grok-cli.videos.generate.v1' ORDER BY execution_profile_id) row"#,
+        r#"SELECT COALESCE(jsonb_agg(to_jsonb(row) ORDER BY row.route_id, row.revision), '[]'::JSONB) FROM (SELECT * FROM provider_routes WHERE provider_id = 'grok-cli' AND command_schema = 'grok-cli.videos.generate.v1' ORDER BY route_id, revision) row"#,
+        r#"SELECT COALESCE(jsonb_agg(to_jsonb(row) ORDER BY row.route_id), '[]'::JSONB) FROM (SELECT * FROM provider_route_heads WHERE provider_id = 'grok-cli' AND command_schema = 'grok-cli.videos.generate.v1' ORDER BY route_id) row"#,
+        r#"SELECT COALESCE(jsonb_agg(to_jsonb(row) ORDER BY row.route_id, row.route_revision, row.execution_profile_id), '[]'::JSONB) FROM (SELECT * FROM provider_route_members WHERE provider_id = 'grok-cli' AND command_schema = 'grok-cli.videos.generate.v1' ORDER BY route_id, route_revision, execution_profile_id) row"#,
+        r#"SELECT COALESCE(jsonb_agg(to_jsonb(row) ORDER BY row.route_id, row.route_revision, row.api_profile, row.public_model_id), '[]'::JSONB) FROM (SELECT * FROM provider_route_model_mappings WHERE provider_id = 'grok-cli' AND command_schema = 'grok-cli.videos.generate.v1' ORDER BY route_id, route_revision, api_profile, public_model_id) row"#,
+        r#"SELECT COALESCE(jsonb_agg(to_jsonb(row) ORDER BY row.contract_key, row.revision), '[]'::JSONB) FROM (SELECT * FROM pricing_surface_contract_revisions WHERE provider_id = 'grok-cli' AND operation = 'video_generation' AND contract_json->'contract'->>'command_schema' = 'grok-cli.videos.generate.v1' ORDER BY contract_key, revision) row"#,
+        r#"SELECT COALESCE(jsonb_agg(to_jsonb(row) ORDER BY row.price_book_version_id, row.contract_key), '[]'::JSONB) FROM (SELECT binding.* FROM price_book_version_surface_contract_bindings binding JOIN pricing_surface_contract_revisions contract ON contract.contract_key = binding.contract_key AND contract.revision = binding.contract_revision AND contract.contract_hash = binding.contract_hash WHERE contract.provider_id = 'grok-cli' AND contract.operation = 'video_generation' AND contract.contract_json->'contract'->>'command_schema' = 'grok-cli.videos.generate.v1' ORDER BY binding.price_book_version_id, binding.contract_key) row"#,
+        r#"SELECT COALESCE(jsonb_agg(to_jsonb(row) ORDER BY row.price_book_version_id), '[]'::JSONB) FROM (SELECT version.* FROM price_book_versions version WHERE version.provider_id = 'grok-cli' AND version.operation = 'video_generation' AND version.provider_model_id = 'grok-imagine-video-1.5-preview' ORDER BY version.price_book_version_id) row"#,
+        r#"SELECT COALESCE(jsonb_agg(to_jsonb(row) ORDER BY row.price_book_version_id, row.component_key), '[]'::JSONB) FROM (SELECT component.* FROM price_components component JOIN price_book_versions version ON version.price_book_version_id = component.price_book_version_id WHERE version.provider_id = 'grok-cli' AND version.operation = 'video_generation' AND version.provider_model_id = 'grok-imagine-video-1.5-preview' ORDER BY component.price_book_version_id, component.component_key) row"#,
+    ];
+    let mut snapshot = Vec::with_capacity(queries.len());
+    for query in queries {
+        snapshot.push(
+            sqlx::query_scalar::<_, Value>(query)
+                .fetch_one(pool)
+                .await
+                .map_err(debug_error)?,
+        );
+    }
+    Ok(snapshot)
 }
 
 struct TestDatabase {

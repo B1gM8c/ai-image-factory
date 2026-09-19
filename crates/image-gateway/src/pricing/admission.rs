@@ -25,9 +25,10 @@ use image_provider_dreamina_cli::{
 };
 use image_provider_grok_cli::{
     GROK_IMAGE_EDIT_COMMAND_SCHEMA, GROK_IMAGE_GENERATION_COMMAND_SCHEMA,
-    GROK_VIDEO_GENERATION_COMMAND_SCHEMA, GrokVideoGenerationRequestV1,
-    PROVIDER_ID as GROK_PROVIDER_ID, parse_image_edit_payload, parse_image_generation_payload,
-    parse_video_generation_payload,
+    GROK_VIDEO_GENERATION_COMMAND_SCHEMA, GROK_VIDEO_GENERATION_COMMAND_SCHEMA_V2,
+    GrokVideoGenerationRequestV1, GrokVideoGenerationRequestV2, PROVIDER_ID as GROK_PROVIDER_ID,
+    parse_image_edit_payload, parse_image_generation_payload, parse_video_generation_payload,
+    parse_video_generation_payload_v2,
 };
 
 use super::{
@@ -71,6 +72,12 @@ pub(super) fn pricing_operation_for_route(
         (GROK_PROVIDER_ID, "videos.generations", GROK_VIDEO_GENERATION_COMMAND_SCHEMA, "video") => {
             Some(VIDEO_GENERATION_OPERATION)
         }
+        (
+            GROK_PROVIDER_ID,
+            "videos.generations",
+            GROK_VIDEO_GENERATION_COMMAND_SCHEMA_V2,
+            "video",
+        ) => Some(VIDEO_GENERATION_OPERATION),
         _ => None,
     }
 }
@@ -106,6 +113,17 @@ pub(super) fn pricing_dimension_keys_for_route(
                 "resolution",
             ])
         }
+        (
+            GROK_PROVIDER_ID,
+            "videos.generations",
+            GROK_VIDEO_GENERATION_COMMAND_SCHEMA_V2,
+            "video",
+        ) => Some(&[
+            "aspect_ratio",
+            "duration",
+            "input_image_count",
+            "resolution",
+        ]),
         _ => None,
     }
 }
@@ -942,6 +960,74 @@ fn command_pricing_facts(
                 ]),
             )
         }
+        GROK_VIDEO_GENERATION_COMMAND_SCHEMA_V2 => {
+            if session_api_profile != XAI_VIDEOS_API_PROFILE {
+                return Err(AdmissionError::InvalidCommand);
+            }
+            let bytes = serde_json::to_vec(&request.command_json)
+                .map_err(|_| AdmissionError::InvalidCommand)?;
+            let payload = parse_video_generation_payload_v2(&bytes)
+                .map_err(|_| AdmissionError::InvalidCommand)?;
+            if payload.source_command_sha256() != provider_command_hash {
+                return Err(AdmissionError::InvalidCommand);
+            }
+            let command = payload.source_command();
+            if command.schema_version != 2
+                || command.operation != "videos.generations"
+                || command.model.as_deref() != Some("grok-imagine-video-1.5")
+            {
+                return Err(AdmissionError::InvalidCommand);
+            }
+            let input_image_count = payload.inputs().ordered().count();
+            let mut dimensions = BTreeMap::from([
+                (
+                    "duration".to_owned(),
+                    u32::from(command.duration).to_string(),
+                ),
+                (
+                    "input_image_count".to_owned(),
+                    input_image_count.to_string(),
+                ),
+                (
+                    "resolution".to_owned(),
+                    serialized_string_dimension(command.resolution)?,
+                ),
+            ]);
+            if matches!(
+                payload.request(),
+                GrokVideoGenerationRequestV2::TextToVideo(_)
+                    | GrokVideoGenerationRequestV2::ReferenceToVideo(_)
+            ) {
+                let aspect_ratio = match payload.request() {
+                    GrokVideoGenerationRequestV2::TextToVideo(request) => {
+                        request.aspect_ratio().as_str()
+                    }
+                    GrokVideoGenerationRequestV2::ReferenceToVideo(request) => {
+                        request.aspect_ratio().as_str()
+                    }
+                    GrokVideoGenerationRequestV2::ImageToVideo(_) => {
+                        unreachable!("I2V is excluded by the aspect-ratio workflow branch above")
+                    }
+                };
+                dimensions.insert("aspect_ratio".to_owned(), aspect_ratio.to_owned());
+            } else if command.aspect_ratio.is_some() {
+                return Err(AdmissionError::InvalidCommand);
+            }
+            let duration = u32::from(command.duration);
+            (
+                GROK_PROVIDER_ID.to_owned(),
+                "grok-imagine-video-1.5".to_owned(),
+                XAI_VIDEOS_API_PROFILE.to_owned(),
+                VIDEO_GENERATION_OPERATION.to_owned(),
+                1,
+                duration,
+                duration,
+                "video_second".to_owned(),
+                "second".to_owned(),
+                "video".to_owned(),
+                dimensions,
+            )
+        }
         GROK_VIDEO_GENERATION_COMMAND_SCHEMA => {
             let bytes = serde_json::to_vec(&request.command_json)
                 .map_err(|_| AdmissionError::InvalidCommand)?;
@@ -1268,6 +1354,51 @@ mod tests {
         XaiVideoAspectRatio, XaiVideoGenerationRequest, XaiVideoImageUrl, XaiVideoResolution,
     };
     use serde_json::json;
+
+    fn v2_input(session_id: Uuid, index: usize) -> XaiVideoAdmissionInput {
+        XaiVideoAdmissionInput::new(
+            format!("v2-input-{index}.png"),
+            InputBlobRef {
+                key: InputBlobKey {
+                    admission_session_id: session_id,
+                    input_id: Uuid::from_u128(index as u128 + 1),
+                },
+                storage_backend: "test".to_owned(),
+                object_key: format!("v2-input-{index}.png"),
+                sha256_hex: format!("{index:064x}"),
+                byte_size: 128,
+            },
+            "image/png",
+        )
+        .expect("valid V2 staged image")
+    }
+
+    fn v2_facts_for(
+        request: XaiVideoGenerationRequest,
+        inputs: Vec<XaiVideoAdmissionInput>,
+        session_id: Uuid,
+    ) -> Result<CommandPricingFacts, ()> {
+        let plan = XaiVideoAdmissionPlan::for_grok_cli_v2(request, inputs).map_err(|_| ())?;
+        let claim = plan.claim(
+            Uuid::new_v4(),
+            "tenant-a",
+            "project-a",
+            "req-grok-video-v2-matrix",
+            None,
+            i64::MAX,
+        );
+        let attach = plan.attach(
+            AdmissionTicket {
+                session_id,
+                owner_token: claim.owner_token,
+                request_hash: claim.request_hash,
+            },
+            Uuid::new_v4(),
+            "tenant-a",
+            AdmissionContract::MediaEconomicsV3,
+        );
+        command_pricing_facts(&attach, XAI_VIDEOS_API_PROFILE).map_err(|_| ())
+    }
 
     #[test]
     fn route_operations_map_only_to_supported_v4_pricing_facts() {
@@ -1628,13 +1759,16 @@ mod tests {
             XaiVideoGenerationRequest {
                 aspect_ratio: None,
                 duration: Some(6),
+                generate_audio: None,
                 image: Some(XaiVideoImageUrl {
                     file_id: None,
                     url: Some("data:image/png;base64,AA==".to_owned()),
                 }),
+                last_frame: None,
                 model: Some("grok-imagine-video-1.5".to_owned()),
                 output: None,
                 prompt: Some("pricing boundary".to_owned()),
+                reference_audios: Vec::new(),
                 reference_images: Vec::new(),
                 resolution: Some(XaiVideoResolution::P480),
                 storage_options: None,
@@ -1690,10 +1824,13 @@ mod tests {
             XaiVideoGenerationRequest {
                 aspect_ratio: Some(XaiVideoAspectRatio::R9x16),
                 duration: Some(10),
+                generate_audio: None,
                 image: None,
+                last_frame: None,
                 model: Some("grok-imagine-video-1.5-preview".to_owned()),
                 output: None,
                 prompt: Some("a paper boat crossing a moonlit lake".to_owned()),
+                reference_audios: Vec::new(),
                 reference_images: Vec::new(),
                 resolution: Some(XaiVideoResolution::P720),
                 storage_options: None,
@@ -1738,6 +1875,256 @@ mod tests {
                 ("resolution".to_owned(), "720p".to_owned()),
             ])
         );
+    }
+
+    #[test]
+    fn grok_video_v2_pricing_facts_use_signed_inputs_and_workflow_presence() {
+        let plan = XaiVideoAdmissionPlan::for_grok_cli_v2(
+            XaiVideoGenerationRequest {
+                aspect_ratio: Some(XaiVideoAspectRatio::R16x9),
+                duration: Some(8),
+                generate_audio: Some(true),
+                image: None,
+                last_frame: None,
+                model: Some("grok-imagine-video-1.5".to_owned()),
+                output: None,
+                prompt: Some("voice only pricing".to_owned()),
+                reference_audios: vec![image_api_contracts::xai::XaiVideoAudioReference {
+                    url: None,
+                    voice_id: Some("  Voice-A  ".to_owned()),
+                }],
+                reference_images: Vec::new(),
+                resolution: Some(XaiVideoResolution::P720),
+                storage_options: None,
+                user: None,
+            },
+            Vec::new(),
+        )
+        .expect("valid V2 voice-only plan");
+        let claim = plan.claim(
+            Uuid::new_v4(),
+            "tenant-a",
+            "project-a",
+            "req-grok-video-v2-pricing",
+            None,
+            i64::MAX,
+        );
+        let request = plan.attach(
+            AdmissionTicket {
+                session_id: Uuid::new_v4(),
+                owner_token: claim.owner_token,
+                request_hash: claim.request_hash,
+            },
+            Uuid::new_v4(),
+            "tenant-a",
+            AdmissionContract::MediaEconomicsV3,
+        );
+        let facts = command_pricing_facts(&request, XAI_VIDEOS_API_PROFILE)
+            .expect("signed V2 voice pricing facts");
+        assert_eq!(facts.provider_model_id, "grok-imagine-video-1.5");
+        assert_eq!(facts.billable_units, 8);
+        assert_eq!(
+            facts.pricing_dimensions,
+            BTreeMap::from([
+                ("aspect_ratio".to_owned(), "16:9".to_owned()),
+                ("duration".to_owned(), "8".to_owned()),
+                ("input_image_count".to_owned(), "0".to_owned()),
+                ("resolution".to_owned(), "720p".to_owned()),
+            ])
+        );
+
+        let mut tampered = request;
+        tampered.command_json["duration"] = json!(10);
+        assert!(matches!(
+            command_pricing_facts(&tampered, XAI_VIDEOS_API_PROFILE),
+            Err(AdmissionError::InvalidCommand)
+        ));
+    }
+
+    #[test]
+    fn grok_video_v2_pricing_facts_count_first_last_and_reference_inputs() {
+        let session_id = Uuid::new_v4();
+        let inputs = (0..3)
+            .map(|index| {
+                XaiVideoAdmissionInput::new(
+                    format!("frame-{index}.png"),
+                    InputBlobRef {
+                        key: InputBlobKey {
+                            admission_session_id: session_id,
+                            input_id: Uuid::from_u128(index as u128 + 1),
+                        },
+                        storage_backend: "test".to_owned(),
+                        object_key: format!("frame-{index}.png"),
+                        sha256_hex: format!("{index:064x}"),
+                        byte_size: 128,
+                    },
+                    "image/png",
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let plan = XaiVideoAdmissionPlan::for_grok_cli_v2(
+            XaiVideoGenerationRequest {
+                aspect_ratio: Some(XaiVideoAspectRatio::R16x9),
+                duration: Some(8),
+                generate_audio: Some(true),
+                image: Some(XaiVideoImageUrl {
+                    file_id: None,
+                    url: Some("data:image/png;base64,AA==".to_owned()),
+                }),
+                last_frame: Some(XaiVideoImageUrl {
+                    file_id: None,
+                    url: Some("data:image/png;base64,AA==".to_owned()),
+                }),
+                model: Some("grok-imagine-video-1.5".to_owned()),
+                output: None,
+                prompt: Some("first last reference pricing".to_owned()),
+                reference_audios: Vec::new(),
+                reference_images: vec![XaiVideoImageUrl {
+                    file_id: None,
+                    url: Some("data:image/png;base64,AA==".to_owned()),
+                }],
+                resolution: Some(XaiVideoResolution::P720),
+                storage_options: None,
+                user: None,
+            },
+            inputs,
+        )
+        .expect("valid V2 first/last/reference plan");
+        let claim = plan.claim(
+            Uuid::new_v4(),
+            "tenant-a",
+            "project-a",
+            "req-grok-video-v2-three-inputs",
+            None,
+            i64::MAX,
+        );
+        let request = plan.attach(
+            AdmissionTicket {
+                session_id,
+                owner_token: claim.owner_token,
+                request_hash: claim.request_hash,
+            },
+            Uuid::new_v4(),
+            "tenant-a",
+            AdmissionContract::MediaEconomicsV3,
+        );
+        let facts = command_pricing_facts(&request, XAI_VIDEOS_API_PROFILE).unwrap();
+        assert_eq!(facts.billable_units, 8);
+        assert_eq!(facts.pricing_dimensions["input_image_count"], "3");
+        assert_eq!(facts.pricing_dimensions["aspect_ratio"], "16:9");
+    }
+
+    #[test]
+    fn grok_video_v2_pricing_uses_effective_ratios_and_workflow_specific_presence() {
+        let t2v = XaiVideoGenerationRequest {
+            aspect_ratio: None,
+            duration: Some(6),
+            generate_audio: Some(true),
+            image: None,
+            last_frame: None,
+            model: Some("grok-imagine-video-1.5".to_owned()),
+            output: None,
+            prompt: Some("default T2V ratio".to_owned()),
+            reference_audios: Vec::new(),
+            reference_images: Vec::new(),
+            resolution: Some(XaiVideoResolution::P480),
+            storage_options: None,
+            user: None,
+        };
+        let t2v_facts = v2_facts_for(t2v.clone(), Vec::new(), Uuid::new_v4()).unwrap();
+        assert_eq!(t2v_facts.pricing_dimensions["aspect_ratio"], "16:9");
+
+        let mut voice_only = t2v.clone();
+        voice_only.duration = Some(8);
+        voice_only.prompt = Some("default R2V ratio".to_owned());
+        voice_only.reference_audios = vec![image_api_contracts::xai::XaiVideoAudioReference {
+            url: None,
+            voice_id: Some("voice-a".to_owned()),
+        }];
+        let voice_facts = v2_facts_for(voice_only, Vec::new(), Uuid::new_v4()).unwrap();
+        assert_eq!(voice_facts.pricing_dimensions["input_image_count"], "0");
+        assert_eq!(voice_facts.pricing_dimensions["aspect_ratio"], "16:9");
+
+        let session_id = Uuid::new_v4();
+        let mut multi_image = t2v.clone();
+        multi_image.duration = Some(8);
+        multi_image.prompt = Some("default multi-image R2V ratio".to_owned());
+        multi_image.reference_images = (0..2)
+            .map(|_| XaiVideoImageUrl {
+                file_id: None,
+                url: Some("data:image/png;base64,AA==".to_owned()),
+            })
+            .collect();
+        let multi_facts = v2_facts_for(
+            multi_image,
+            vec![v2_input(session_id, 0), v2_input(session_id, 1)],
+            session_id,
+        )
+        .unwrap();
+        assert_eq!(multi_facts.pricing_dimensions["input_image_count"], "2");
+        assert_eq!(multi_facts.pricing_dimensions["aspect_ratio"], "16:9");
+
+        let session_id = Uuid::new_v4();
+        let mut i2v = t2v;
+        i2v.image = Some(XaiVideoImageUrl {
+            file_id: None,
+            url: Some("data:image/png;base64,AA==".to_owned()),
+        });
+        i2v.prompt = None;
+        let i2v_facts = v2_facts_for(i2v, vec![v2_input(session_id, 0)], session_id).unwrap();
+        assert_eq!(i2v_facts.pricing_dimensions["input_image_count"], "1");
+        assert!(!i2v_facts.pricing_dimensions.contains_key("aspect_ratio"));
+    }
+
+    #[test]
+    fn grok_video_v2_pricing_rejects_crossed_identity_and_profile() {
+        let request = XaiVideoGenerationRequest {
+            aspect_ratio: None,
+            duration: Some(6),
+            generate_audio: Some(true),
+            image: None,
+            last_frame: None,
+            model: Some("grok-imagine-video-1.5".to_owned()),
+            output: None,
+            prompt: Some("identity matrix".to_owned()),
+            reference_audios: Vec::new(),
+            reference_images: Vec::new(),
+            resolution: Some(XaiVideoResolution::P480),
+            storage_options: None,
+            user: None,
+        };
+        let plan = XaiVideoAdmissionPlan::for_grok_cli_v2(request.clone(), Vec::new()).unwrap();
+        let claim = plan.claim(
+            Uuid::new_v4(),
+            "tenant-a",
+            "project-a",
+            "req-grok-video-v2-identity",
+            None,
+            i64::MAX,
+        );
+        let mut attach = plan.attach(
+            AdmissionTicket {
+                session_id: Uuid::new_v4(),
+                owner_token: claim.owner_token,
+                request_hash: claim.request_hash,
+            },
+            Uuid::new_v4(),
+            "tenant-a",
+            AdmissionContract::MediaEconomicsV3,
+        );
+        assert!(matches!(
+            command_pricing_facts(&attach, "xai-images-v1"),
+            Err(AdmissionError::InvalidCommand)
+        ));
+        attach.command_schema = GROK_VIDEO_GENERATION_COMMAND_SCHEMA.to_owned();
+        assert!(command_pricing_facts(&attach, XAI_VIDEOS_API_PROFILE).is_err());
+
+        let preview = XaiVideoGenerationRequest {
+            model: Some("grok-imagine-video-1.5-preview".to_owned()),
+            ..request
+        };
+        assert!(v2_facts_for(preview, Vec::new(), Uuid::new_v4()).is_err());
     }
 
     #[test]

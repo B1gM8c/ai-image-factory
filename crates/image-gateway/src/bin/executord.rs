@@ -21,6 +21,7 @@ use gpt_image_2_gateway::{
     identify_executor_profile_binding, init_telemetry,
     runner::FilesystemRunnerJournal,
 };
+use image_provider_grok_cli::{GrokRuntimeGeneration, lookup_runtime_identity};
 use tokio::{sync::watch, task::JoinSet};
 
 const DEFAULT_LEASE_MS: u64 = 60_000;
@@ -184,6 +185,13 @@ async fn main() -> Result<(), ImageGatewayError> {
         ));
     }
     let provider_runtime = ProviderRuntimeConfig::from_env(binding)?;
+    let grok_runtime = grok_runtime_generation(binding)
+        .map(|generation| {
+            lookup_runtime_identity(generation, compiled_linux_target()?).map_err(|_| {
+                ImageGatewayError::config("Grok runtime target or generation is unsupported")
+            })
+        })
+        .transpose()?;
     validate_isolated_trees(
         &artifact_root,
         &config.runner_root,
@@ -238,12 +246,30 @@ async fn main() -> Result<(), ImageGatewayError> {
         ExecutorProfileBinding::GrokImageGeneration
         | ExecutorProfileBinding::GrokImageEdit
         | ExecutorProfileBinding::GrokVideoGeneration => ExecutorProcessSupervisor::Grok(
-            GrokProcessSupervisor::new(
+            GrokProcessSupervisor::new_with_expected_sha256(
                 journal.clone(),
                 &config.helper_executable,
                 &provider_runtime.executable,
                 &provider_runtime.credential_home,
                 &operational_credential.material_fingerprint_sha256,
+                &grok_runtime.as_ref().expect("Grok runtime identity").sha256,
+                config.request_timeout,
+                config.process_poll_interval,
+                config.process_startup_grace,
+                &config.proxy,
+            )?
+            .with_credential_resolver(profile.provider_account_id, credential_resolver.clone())?
+            .with_input_blobs(artifacts.clone())
+            .with_local_video_uploads(provider_uploads),
+        ),
+        ExecutorProfileBinding::GrokVideoGenerationV2 => ExecutorProcessSupervisor::Grok(
+            GrokProcessSupervisor::new_with_expected_sha256(
+                journal.clone(),
+                &config.helper_executable,
+                &provider_runtime.executable,
+                &provider_runtime.credential_home,
+                &operational_credential.material_fingerprint_sha256,
+                &grok_runtime.as_ref().expect("Grok runtime identity").sha256,
                 config.request_timeout,
                 config.process_poll_interval,
                 config.process_startup_grace,
@@ -542,6 +568,51 @@ async fn shutdown_signal() {
     }
 }
 
+fn grok_runtime_generation(binding: ExecutorProfileBinding) -> Option<GrokRuntimeGeneration> {
+    match binding {
+        ExecutorProfileBinding::GrokImageGeneration
+        | ExecutorProfileBinding::GrokImageEdit
+        | ExecutorProfileBinding::GrokVideoGeneration => Some(GrokRuntimeGeneration::V1),
+        ExecutorProfileBinding::GrokVideoGenerationV2 => Some(GrokRuntimeGeneration::V2),
+        ExecutorProfileBinding::CodexImageGeneration | ExecutorProfileBinding::CodexImageEdit => {
+            None
+        }
+    }
+}
+
+fn target_triple_for(os: &str, arch: &str, env: &str) -> Option<&'static str> {
+    match (os, arch, env) {
+        ("linux", "x86_64", "gnu") => Some("x86_64-unknown-linux-gnu"),
+        ("linux", "aarch64", "gnu") => Some("aarch64-unknown-linux-gnu"),
+        _ => None,
+    }
+}
+
+fn compiled_linux_target() -> Result<&'static str, ImageGatewayError> {
+    let os = if cfg!(target_os = "linux") {
+        "linux"
+    } else {
+        "unsupported"
+    };
+    let arch = if cfg!(target_arch = "x86_64") {
+        "x86_64"
+    } else if cfg!(target_arch = "aarch64") {
+        "aarch64"
+    } else {
+        "unsupported"
+    };
+    let env = if cfg!(target_env = "gnu") {
+        "gnu"
+    } else {
+        "unsupported"
+    };
+    target_triple_for(os, arch, env).ok_or_else(|| {
+        ImageGatewayError::config(
+            "Grok executord supports only pinned Linux GNU x86_64 or aarch64 targets",
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -585,5 +656,40 @@ mod tests {
         let base = "x".repeat(128);
         assert!(executor_lane_owners(&base, 1).is_ok());
         assert!(executor_lane_owners(&base, 2).is_err());
+    }
+
+    #[test]
+    fn grok_profiles_select_the_expected_runtime_generation() {
+        assert_eq!(
+            grok_runtime_generation(ExecutorProfileBinding::GrokImageGeneration),
+            Some(GrokRuntimeGeneration::V1)
+        );
+        assert_eq!(
+            grok_runtime_generation(ExecutorProfileBinding::GrokVideoGeneration),
+            Some(GrokRuntimeGeneration::V1)
+        );
+        assert_eq!(
+            grok_runtime_generation(ExecutorProfileBinding::GrokVideoGenerationV2),
+            Some(GrokRuntimeGeneration::V2)
+        );
+        assert_eq!(
+            grok_runtime_generation(ExecutorProfileBinding::CodexImageGeneration),
+            None
+        );
+    }
+
+    #[test]
+    fn runtime_target_requires_linux_gnu_and_rejects_musl() {
+        assert_eq!(
+            target_triple_for("linux", "x86_64", "gnu"),
+            Some("x86_64-unknown-linux-gnu")
+        );
+        assert_eq!(
+            target_triple_for("linux", "aarch64", "gnu"),
+            Some("aarch64-unknown-linux-gnu")
+        );
+        assert_eq!(target_triple_for("linux", "x86_64", "musl"), None);
+        assert_eq!(target_triple_for("linux", "aarch64", "musl"), None);
+        assert_eq!(target_triple_for("darwin", "x86_64", "gnu"), None);
     }
 }

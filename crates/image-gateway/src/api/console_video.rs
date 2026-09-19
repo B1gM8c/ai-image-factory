@@ -604,10 +604,12 @@ fn console_video_request(
                     _ => unreachable!("validated console video aspect ratio"),
                 }),
                 duration: Some(duration),
+                generate_audio: None,
                 image: request.image.map(|url| XaiVideoImageUrl {
                     file_id: None,
                     url: Some(url),
                 }),
+                last_frame: None,
                 // Grok exposes reference-to-video through the stable video model binding.
                 model: Some(if mode == "reference_to_video" {
                     GROK_REFERENCE_VIDEO_MODEL.to_owned()
@@ -616,6 +618,7 @@ fn console_video_request(
                 }),
                 output: None,
                 prompt: Some(prompt),
+                reference_audios: Vec::new(),
                 reference_images: request
                     .reference_images
                     .into_iter()

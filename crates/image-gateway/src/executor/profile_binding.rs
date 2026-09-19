@@ -3,8 +3,10 @@ use image_provider_grok_cli::{
     ADAPTER_REVISION as GROK_ADAPTER_REVISION, GROK_IMAGE_EDIT_COMMAND_SCHEMA,
     GROK_IMAGE_EDIT_OPERATION_V1, GROK_IMAGE_GENERATION_COMMAND_SCHEMA,
     GROK_IMAGE_GENERATION_OPERATION_V1, GROK_VIDEO_GENERATION_COMMAND_SCHEMA,
-    GROK_VIDEO_GENERATION_OPERATION_V1, PROVIDER_ID as GROK_PROVIDER_ID,
+    GROK_VIDEO_GENERATION_COMMAND_SCHEMA_V2, GROK_VIDEO_GENERATION_OPERATION_V1,
+    GROK_VIDEO_GENERATION_OPERATION_V2, PROVIDER_ID as GROK_PROVIDER_ID,
     VIDEO_ADAPTER_REVISION as GROK_VIDEO_ADAPTER_REVISION,
+    VIDEO_ADAPTER_REVISION_V2 as GROK_VIDEO_ADAPTER_REVISION_V2,
 };
 use thiserror::Error;
 
@@ -21,24 +23,27 @@ pub enum ExecutorProfileBinding {
     GrokImageGeneration,
     GrokImageEdit,
     GrokVideoGeneration,
+    GrokVideoGenerationV2,
 }
 
 impl ExecutorProfileBinding {
     pub fn provider_executable_env(self) -> &'static str {
         match self {
             Self::CodexImageGeneration | Self::CodexImageEdit => "EXECUTOR_CODEX_EXECUTABLE",
-            Self::GrokImageGeneration | Self::GrokImageEdit | Self::GrokVideoGeneration => {
-                "EXECUTOR_GROK_EXECUTABLE"
-            }
+            Self::GrokImageGeneration
+            | Self::GrokImageEdit
+            | Self::GrokVideoGeneration
+            | Self::GrokVideoGenerationV2 => "EXECUTOR_GROK_EXECUTABLE",
         }
     }
 
     pub fn credential_home_env(self) -> &'static str {
         match self {
             Self::CodexImageGeneration | Self::CodexImageEdit => "EXECUTOR_CODEX_CREDENTIAL_HOME",
-            Self::GrokImageGeneration | Self::GrokImageEdit | Self::GrokVideoGeneration => {
-                "EXECUTOR_GROK_CREDENTIAL_HOME"
-            }
+            Self::GrokImageGeneration
+            | Self::GrokImageEdit
+            | Self::GrokVideoGeneration
+            | Self::GrokVideoGenerationV2 => "EXECUTOR_GROK_CREDENTIAL_HOME",
         }
     }
 }
@@ -110,6 +115,12 @@ pub fn identify_executor_profile_binding(
                         GROK_VIDEO_GENERATION_OPERATION_V1,
                         GROK_VIDEO_ADAPTER_REVISION,
                         ExecutorProfileBinding::GrokVideoGeneration,
+                    ),
+                    GROK_VIDEO_GENERATION_COMMAND_SCHEMA_V2 => (
+                        GROK_VIDEO_GENERATION_COMMAND_SCHEMA_V2,
+                        GROK_VIDEO_GENERATION_OPERATION_V2,
+                        GROK_VIDEO_ADAPTER_REVISION_V2,
+                        ExecutorProfileBinding::GrokVideoGenerationV2,
                     ),
                     _ => return Err(ExecutorProfileBindingError::BindingMismatch),
                 };
@@ -292,6 +303,37 @@ mod tests {
         assert_eq!(
             identify_executor_profile_binding(&profile),
             Ok(ExecutorProfileBinding::GrokImageEdit)
+        );
+    }
+
+    #[test]
+    fn grok_v2_video_profile_requires_the_v2_descriptor_and_adapter() {
+        let mut profile = grok_profile();
+        let operation = GROK_VIDEO_GENERATION_OPERATION_V2;
+        profile.profile_key = "grok-video-v2".to_owned();
+        profile.command_schema = GROK_VIDEO_GENERATION_COMMAND_SCHEMA_V2.to_owned();
+        profile.operation_id = operation.id.to_owned();
+        profile.operation_descriptor_revision = operation.descriptor_revision.to_owned();
+        profile.operation_descriptor_sha256_v1 = operation.canonical_sha256_v1_hex();
+        profile.completion_mode = operation.completion.as_str().to_owned();
+        profile.idempotency_mode = operation.idempotency.as_str().to_owned();
+        profile.adapter_revision = GROK_VIDEO_ADAPTER_REVISION_V2.to_owned();
+        assert_eq!(
+            identify_executor_profile_binding(&profile),
+            Ok(ExecutorProfileBinding::GrokVideoGenerationV2)
+        );
+
+        profile.adapter_revision = GROK_VIDEO_ADAPTER_REVISION.to_owned();
+        assert_eq!(
+            identify_executor_profile_binding(&profile),
+            Err(ExecutorProfileBindingError::BindingMismatch)
+        );
+        profile.adapter_revision = GROK_VIDEO_ADAPTER_REVISION_V2.to_owned();
+        profile.operation_descriptor_sha256_v1 =
+            GROK_VIDEO_GENERATION_OPERATION_V1.canonical_sha256_v1_hex();
+        assert_eq!(
+            identify_executor_profile_binding(&profile),
+            Err(ExecutorProfileBindingError::BindingMismatch)
         );
     }
 }
