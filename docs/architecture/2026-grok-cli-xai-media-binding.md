@@ -63,11 +63,12 @@ deliberately narrower: `generate_audio` must be omitted or `true` (explicit
 inputs, `reference_audios` may contain only CLI-supported `voice_id` values (at
 most three; URL audio is not in the intersection), and `resolution` is only
 `480p` or `720p`. Text-to-video and image-to-video accept only 6 or 10 seconds;
-reference-to-video accepts 1-15 seconds. `file_id`, video edit, video extension,
-`output`, and `storage_options` fail closed with HTTP 400 before admission. The
-official DTO retains those fields for wire-shape compatibility, but the V2 CLI
-binding does not execute them. Fields are never silently dropped or
-approximated.
+reference-to-video accepts 1-15 seconds. `file_id`, video edit, and video
+extension are outside this binding. The official DTO also retains `output` and
+`storage_options` for wire-shape compatibility; the Grok CLI V2 provider
+projection rejects those two fields with HTTP 400 before admission. A future
+provider-specific binding may classify them independently. Fields are never
+silently dropped or approximated.
 
 The CLI supports no `/v1/videos/edits` or `/v1/videos/extensions` operation.
 Those official xAI routes remain outside this binding and are not advertised by

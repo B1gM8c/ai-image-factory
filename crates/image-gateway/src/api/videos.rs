@@ -337,6 +337,18 @@ fn preflight_grok_binding_v2(intent: &XaiVideoAdmissionIntent) -> Result<(), Ima
                 "xAI file_id inputs are not supported by Grok CLI",
             ))
         }
+        Err(image_provider_grok_cli::XaiGrokVideoProjectionErrorV2::UnsupportedOutput) => {
+            Err(ImageGatewayError::unsupported(
+                "output",
+                "video output delivery is not supported by Grok CLI",
+            ))
+        }
+        Err(image_provider_grok_cli::XaiGrokVideoProjectionErrorV2::UnsupportedStorageOptions) => {
+            Err(ImageGatewayError::unsupported(
+                "storage_options",
+                "video storage options are not supported by Grok CLI",
+            ))
+        }
         Err(error) => Err(video_admission_error(
             XaiVideoAdmissionError::UnsupportedBindingV2(error),
         )),
@@ -483,6 +495,12 @@ fn video_admission_error(error: XaiVideoAdmissionError) -> ImageGatewayError {
                     "reference_audios",
                 image_provider_grok_cli::XaiGrokVideoProjectionErrorV2::UnsupportedFileId => {
                     "image"
+                }
+                image_provider_grok_cli::XaiGrokVideoProjectionErrorV2::UnsupportedOutput => {
+                    "output"
+                }
+                image_provider_grok_cli::XaiGrokVideoProjectionErrorV2::UnsupportedStorageOptions => {
+                    "storage_options"
                 }
                 image_provider_grok_cli::XaiGrokVideoProjectionErrorV2::UnsupportedDuration => {
                     "duration"
@@ -676,7 +694,8 @@ fn video_not_found(param: &str) -> ImageGatewayError {
 #[cfg(test)]
 mod tests {
     use image_api_contracts::xai::{
-        XaiVideoAspectRatio, XaiVideoImageUrl, XaiVideoRequestError, XaiVideoResolution,
+        XaiVideoAspectRatio, XaiVideoImageUrl, XaiVideoOutput, XaiVideoRequestError,
+        XaiVideoResolution, XaiVideoStorageOptions,
     };
 
     use crate::admission::XaiVideoAdmissionPlan;
@@ -753,6 +772,47 @@ mod tests {
         let error = preflight_grok_binding_v2(&intent).unwrap_err();
         assert_eq!(error.status_code(), StatusCode::BAD_REQUEST);
         assert_eq!(error.error_code(), Some("unsupported_parameter"));
+    }
+
+    #[test]
+    fn v2_delivery_rejections_are_provider_scoped_and_precede_input_fetch() {
+        let mut output = XaiVideoGenerationRequest {
+            aspect_ratio: None,
+            duration: Some(8),
+            generate_audio: Some(true),
+            image: Some(XaiVideoImageUrl {
+                file_id: None,
+                url: Some("https://127.0.0.1/private.png".to_owned()),
+            }),
+            last_frame: None,
+            model: Some("grok-imagine-video-1.5".to_owned()),
+            output: Some(XaiVideoOutput {
+                upload_url: "https://upload.example/video".to_owned(),
+            }),
+            prompt: Some("wind in grass".to_owned()),
+            reference_audios: Vec::new(),
+            reference_images: Vec::new(),
+            resolution: Some(XaiVideoResolution::P480),
+            storage_options: None,
+            user: None,
+        };
+        let intent = XaiVideoAdmissionIntent::new_v2(output.clone()).unwrap();
+        let error = preflight_grok_binding_v2(&intent).unwrap_err();
+        assert_eq!(error.status_code(), StatusCode::BAD_REQUEST);
+        assert_eq!(error.error_code(), Some("unsupported_parameter"));
+        assert!(format!("{error:?}").contains("output"));
+
+        output.output = None;
+        output.storage_options = Some(XaiVideoStorageOptions {
+            expires_after: Some(3_600),
+            filename: "video.mp4".to_owned(),
+            public_url: None,
+        });
+        let intent = XaiVideoAdmissionIntent::new_v2(output).unwrap();
+        let error = preflight_grok_binding_v2(&intent).unwrap_err();
+        assert_eq!(error.status_code(), StatusCode::BAD_REQUEST);
+        assert_eq!(error.error_code(), Some("unsupported_parameter"));
+        assert!(format!("{error:?}").contains("storage_options"));
     }
 
     #[test]

@@ -273,6 +273,12 @@ impl GrokVideoGenerationPayloadV2 {
         if command.schema_version != 2 || command.operation != "videos.generations" {
             return Err(XaiGrokVideoProjectionErrorV2::InvalidSourceCommand);
         }
+        if command.output.is_some() {
+            return Err(XaiGrokVideoProjectionErrorV2::UnsupportedOutput);
+        }
+        if command.storage_options.is_some() {
+            return Err(XaiGrokVideoProjectionErrorV2::UnsupportedStorageOptions);
+        }
         if !command.generate_audio {
             return Err(XaiGrokVideoProjectionErrorV2::UnsupportedGenerateAudio);
         }
@@ -455,6 +461,10 @@ pub enum XaiGrokVideoProjectionErrorV2 {
     UnsupportedModel,
     #[error("Grok CLI 1.0.34 requires generated audio")]
     UnsupportedGenerateAudio,
+    #[error("output delivery is not supported by Grok CLI 1.0.34")]
+    UnsupportedOutput,
+    #[error("storage options are not supported by Grok CLI 1.0.34")]
+    UnsupportedStorageOptions,
     #[error("reference audio URLs are not supported by Grok CLI 1.0.34")]
     UnsupportedReferenceAudioUrl,
     #[error("xAI file_id inputs are not supported by Grok CLI")]
@@ -869,7 +879,9 @@ impl GrokVideoGenerationRequestV2 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use image_api_contracts::xai::{XaiVideoGenerationRequest, XaiVideoImageUrl};
+    use image_api_contracts::xai::{
+        XaiVideoGenerationRequest, XaiVideoImageUrl, XaiVideoOutput, XaiVideoStorageOptions,
+    };
 
     const SHA: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
@@ -995,6 +1007,29 @@ mod tests {
         assert_eq!(
             GrokVideoGenerationPayloadV2::preflight(&hd),
             Err(XaiGrokVideoProjectionErrorV2::UnsupportedResolution)
+        );
+    }
+
+    #[test]
+    fn v2_rejects_provider_unsupported_delivery_options_before_inputs() {
+        let mut output = command();
+        output.output = Some(XaiVideoOutput {
+            upload_url: "https://upload.example/video".into(),
+        });
+        assert_eq!(
+            GrokVideoGenerationPayloadV2::preflight(&output),
+            Err(XaiGrokVideoProjectionErrorV2::UnsupportedOutput)
+        );
+
+        let mut storage = command();
+        storage.storage_options = Some(XaiVideoStorageOptions {
+            expires_after: Some(3_600),
+            filename: "video.mp4".into(),
+            public_url: None,
+        });
+        assert_eq!(
+            GrokVideoGenerationPayloadV2::preflight(&storage),
+            Err(XaiGrokVideoProjectionErrorV2::UnsupportedStorageOptions)
         );
     }
 
