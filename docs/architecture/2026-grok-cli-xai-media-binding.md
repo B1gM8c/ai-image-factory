@@ -51,8 +51,8 @@ unrelated image model through `active_providers()`.
 | `POST /v1/images/generations` | synchronous; official request and response schemas include model, count, ratio, resolution, response format, storage, user attribution, file output, and usage | `image_gen`; one local JPEG; effective `1k`; no upstream URL or Files API handle is exposed | retain the full official DTO; currently admit only `n=1`, omitted/`1k` resolution, explicit `b64_json`, and no `storage_options` |
 | `POST /v1/images/edits` | synchronous image edit | `image_edit`; 1-3 source images; quality model; one `1k` image | keep inactive until the full official edit DTO, typed source hash, sealed input staging, and cleanup path are implemented |
 | `POST /v1/videos/generations` text-only | asynchronous | Grok CLI V2 agentic video; 6 or 10 seconds; `480p` or `720p`; generated audio required | support only when the V2 profile is explicitly selected; bill one admitted duration and expose a Factory job |
-| `POST /v1/videos/generations` with one image | asynchronous | Grok CLI V2 image-to-video; one base64/data-URL image; optional prompt; 6 or 10 seconds; `480p` or `720p`; no aspect-ratio override | support only through V2; the image is staged by digest and the CLI reconstructs the media request |
-| `POST /v1/videos/generations` with reference inputs | asynchronous | Grok CLI V2 reference-to-video; `last_frame`, up to 7 reference images, up to 3 voice IDs; 1-15 seconds; `480p` or `720p` | support only for CLI-expressible local inputs; reference-audio URLs and `file_id` are rejected |
+| `POST /v1/videos/generations` with one image | asynchronous | Grok CLI V2 image-to-video; one base64/data-URL image or bounded public HTTPS image (no redirects or private targets); optional prompt; 6 or 10 seconds; `480p` or `720p`; no aspect-ratio override | support only through V2; the image is staged by digest and the CLI reconstructs the media request |
+| `POST /v1/videos/generations` with reference inputs | asynchronous | Grok CLI V2 reference-to-video; `last_frame` and reference images accept base64/data-URL or bounded public HTTPS (no redirects or private targets); up to 7 reference images, up to 3 voice IDs; 1-15 seconds; `480p` or `720p` | support only for CLI-expressible local inputs; reference-audio URLs and `file_id` are rejected |
 | `POST /v1/videos/edits` | asynchronous | no CLI tool | reject |
 | `POST /v1/videos/extensions` | asynchronous | no CLI tool | reject |
 | `GET /v1/videos/{request_id}` | returns provider task progress and final URL | CLI hides the provider request ID and returns after polling | expose the factory job ID and factory state, not a fabricated xAI provider ID |
@@ -395,9 +395,12 @@ requires all gates below to pass in the deployment environment:
    uncertain expiry policy remains a deployment gate);
 11. opt-in real image and V2 video smokes pass through the durable Grok
     supervisor; the public-contract gateway E2E passes with a fake MP4
-    authority. If a V2 canary fails, disable the route, stop the V2 executor,
-    and roll back to the previous signed release/profile; do not repoint a V1
-    replay profile at the V2 binary.
+    authority. If a V2 canary fails, first disable new V2 route/key bindings
+    while retaining the compatible V2 executor, worker, reducer, and poller;
+    drain pending/running jobs, attach/replay work, reservations, and
+    settlement before stopping those components. Only then roll back to the
+    previous signed release/profile; do not repoint a V1 replay profile at the
+    V2 binary.
 
 The current supervisor accepts the exact Grok image-generation and V1/V2
 video-generation schemas. V2 projection and receipt tests cover text-to-video,
