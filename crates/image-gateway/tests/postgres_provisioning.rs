@@ -948,7 +948,6 @@ async fn grok_video_v2_crossed_durable_identities_conflict_without_partial_write
             } else {
                 image_provider_grok_cli::GROK_VIDEO_GENERATION_COMMAND_SCHEMA_V2
             };
-            let operation = if crossed == "schema" { operation_v1 } else { operation_v2 };
             let adapter = if crossed == "adapter" {
                 image_provider_grok_cli::VIDEO_ADAPTER_REVISION
             } else {
@@ -957,7 +956,7 @@ async fn grok_video_v2_crossed_durable_identities_conflict_without_partial_write
             let (descriptor_revision, descriptor_hash) = if crossed == "descriptor" {
                 (operation_v1.descriptor_revision, operation_v1.canonical_sha256_v1_hex())
             } else {
-                (operation.descriptor_revision, operation.canonical_sha256_v1_hex())
+                (operation_v2.descriptor_revision, operation_v2.canonical_sha256_v1_hex())
             };
             sqlx::query(
                 r#"
@@ -979,11 +978,11 @@ async fn grok_video_v2_crossed_durable_identities_conflict_without_partial_write
             .bind(Uuid::new_v4())
             .bind(&profile_key)
             .bind(schema)
-            .bind(operation.id)
+            .bind(operation_v2.id)
             .bind(descriptor_revision)
             .bind(&descriptor_hash)
-            .bind(operation.completion.as_str())
-            .bind(operation.idempotency.as_str())
+            .bind(operation_v2.completion.as_str())
+            .bind(operation_v2.idempotency.as_str())
             .bind(adapter)
             .bind(v1.execution_profile_id)
             .execute(&database.pool)
