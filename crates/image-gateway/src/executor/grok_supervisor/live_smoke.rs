@@ -232,7 +232,8 @@ async fn xai_image_to_video_v2_runs_through_the_real_durable_grok_supervisor() {
     let temp = TempDir::new().unwrap();
     let credentials = private_credentials(temp.path(), Path::new(&source_home));
     // Keep the journal outside the credential TempDir so a real-provider
-    // failure leaves an inspectable, auth-free path for diagnosis.
+    // failure leaves an inspectable private diagnostic path; it may contain
+    // credential/runtime state and must be handled accordingly.
     let journal_root =
         env::temp_dir().join(format!("grok-v2-live-smoke-{}", Uuid::new_v4().simple()));
     let journal =
