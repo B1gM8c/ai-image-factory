@@ -25,6 +25,49 @@ mod readiness;
 mod resolution;
 mod surface_contract;
 
+const GROK_VIDEO_V2_CANONICAL_MODEL: &str = "grok-imagine-video-1.5";
+const GROK_VIDEO_V2_PUBLIC_ALIAS: &str = "grok-imagine-video-1.5-preview";
+
+fn canonical_customer_public_model_id<'a>(
+    provider_id: &str,
+    provider_model_id: &str,
+    public_model_id: &'a str,
+) -> &'a str {
+    if provider_id == image_provider_grok_cli::PROVIDER_ID
+        && provider_model_id == GROK_VIDEO_V2_CANONICAL_MODEL
+        && public_model_id == GROK_VIDEO_V2_PUBLIC_ALIAS
+    {
+        GROK_VIDEO_V2_CANONICAL_MODEL
+    } else {
+        public_model_id
+    }
+}
+
+#[cfg(test)]
+mod canonical_model_tests {
+    use super::canonical_customer_public_model_id;
+
+    #[test]
+    fn grok_video_v2_preview_alias_uses_the_signed_pricing_identity() {
+        assert_eq!(
+            canonical_customer_public_model_id(
+                "grok-cli",
+                "grok-imagine-video-1.5",
+                "grok-imagine-video-1.5-preview",
+            ),
+            "grok-imagine-video-1.5"
+        );
+        assert_eq!(
+            canonical_customer_public_model_id(
+                "grok-cli",
+                "grok-imagine-video-1.5-preview",
+                "grok-imagine-video-1.5-preview",
+            ),
+            "grok-imagine-video-1.5-preview"
+        );
+    }
+}
+
 pub use official_catalog::{
     ApplyOfficialPriceSnapshotRequest, OfficialPriceCatalogDescriptor, OfficialPriceCatalogs,
     OfficialPriceComponentDiffView, OfficialPriceSnapshotApplicationView,

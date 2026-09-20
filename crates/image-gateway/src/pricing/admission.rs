@@ -815,7 +815,11 @@ fn customer_price_public_model_id<'a>(
     {
         CODEX_PRICING_MODEL_ID
     } else {
-        &intent.public_model_id
+        super::canonical_customer_public_model_id(
+            provider_id,
+            &intent.provider_model_id,
+            &intent.public_model_id,
+        )
     }
 }
 

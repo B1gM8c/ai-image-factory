@@ -1391,6 +1391,10 @@ mod tests {
         assert!(migration.contains(&format!("'{}'", snapshot.contract_key)));
         assert!(migration.contains(&format!("'{}'", snapshot.contract_hash)));
         assert_eq!(snapshot.normalizer_key, migration_normalizer);
+        let alias_migration =
+            include_str!("../../migrations/0133_grok_video_v2_public_model_alias.sql");
+        assert!(alias_migration.contains("grok-imagine-video-1.5-preview"));
+        assert!(alias_migration.contains("grok-imagine-video-1.5"));
     }
 
     #[test]

@@ -13,6 +13,7 @@ use super::{
     admission::{
         CustomerMeteringContract, customer_metering_contract, pricing_operation_for_route,
     },
+    canonical_customer_public_model_id,
     coverage::{CoverageSurfaceRow, load_aliases_on, load_surfaces_on},
     surface_contract::{ContractBindingSnapshot, ExactSurfaceIdentity, find_contract},
 };
@@ -316,6 +317,11 @@ fn contract_snapshot_for_surface(
         .public_model_id
         .as_deref()
         .ok_or("pricing_surface_contract_missing")?;
+    let pricing_public_model_id = canonical_customer_public_model_id(
+        &surface.provider_id,
+        &surface.provider_model_id,
+        public_model_id,
+    );
     if !grok_video_identity_pair_is_valid(
         &surface.provider_id,
         &surface.operation,
@@ -336,7 +342,7 @@ fn contract_snapshot_for_surface(
         .binding_snapshot(ExactSurfaceIdentity {
             api_profile,
             provider_model_id: &surface.provider_model_id,
-            public_model_id,
+            public_model_id: pricing_public_model_id,
             service_tier: if version.service_tier == "*" {
                 "standard"
             } else {
@@ -505,7 +511,14 @@ impl ActiveSelectorRow {
                 .is_none_or(|model| model == surface.provider_model_id)
             && self.media_kind == surface.media_kind
             && matches!(self.service_tier.as_str(), "standard" | "*")
-            && matches_value(&self.public_model_id, public_model_id)
+            && matches_value(
+                &self.public_model_id,
+                canonical_customer_public_model_id(
+                    &surface.provider_id,
+                    &surface.provider_model_id,
+                    public_model_id,
+                ),
+            )
             && (self.api_profile == "*"
                 || self.api_profile == api_profile
                 || self.api_profile == pricing_profile)
@@ -593,7 +606,14 @@ fn selector_rank_parts(
         },
         u8::from(operation == pricing_operation),
         u8::from(provider_model_id == Some(surface.provider_model_id.as_str())),
-        u8::from(public_model_id == surface.public_model_id.as_deref().unwrap_or_default()),
+        u8::from(
+            public_model_id
+                == canonical_customer_public_model_id(
+                    &surface.provider_id,
+                    &surface.provider_model_id,
+                    surface.public_model_id.as_deref().unwrap_or_default(),
+                ),
+        ),
         u8::from(service_tier == "standard"),
     ]
 }
@@ -644,7 +664,14 @@ fn matching_surfaces<'a>(
                     .is_none_or(|model| model == surface.provider_model_id)
                 && version.media_kind == surface.media_kind
                 && matches!(version.service_tier.as_str(), "standard" | "*")
-                && matches_value(&version.public_model_id, public_model_id)
+                && matches_value(
+                    &version.public_model_id,
+                    canonical_customer_public_model_id(
+                        &surface.provider_id,
+                        &surface.provider_model_id,
+                        public_model_id,
+                    ),
+                )
                 && (version.api_profile == "*"
                     || version.api_profile == api_profile
                     || version.api_profile == pricing_profile)
@@ -1014,7 +1041,7 @@ mod tests {
             operation: "videos.generations".to_owned(),
             command_schema: Some("grok-cli.videos.generate.v2".to_owned()),
             api_profile: Some("xai-videos-v1".to_owned()),
-            public_model_id: Some("grok-imagine-video-1.5".to_owned()),
+            public_model_id: Some("grok-imagine-video-1.5-preview".to_owned()),
             route_id: Some(Uuid::new_v4()),
             routable_account_count: 1,
         };
@@ -1022,6 +1049,7 @@ mod tests {
             contract_snapshot_for_surface(&version, &surface).expect("exact V2 snapshot");
         assert_eq!(contract.command_schema, "grok-cli.videos.generate.v2");
         assert_eq!(snapshot.provider_model_id, "grok-imagine-video-1.5");
+        assert_eq!(snapshot.public_model_id, "grok-imagine-video-1.5");
         assert_eq!(snapshot.normalizer_key, "grok-cli.videos.generate.v2");
 
         let mut crossed = surface.clone();
