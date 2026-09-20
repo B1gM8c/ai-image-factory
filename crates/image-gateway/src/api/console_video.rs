@@ -35,6 +35,9 @@ const GROK_REFERENCE_VIDEO_MODEL: &str = "grok-imagine-video";
 const GROK_VIDEO_MAX_PROMPT_CHARS: usize = 1_024;
 const MIN_GROK_REFERENCE_IMAGES: usize = 2;
 const MAX_GROK_REFERENCE_IMAGES: usize = 7;
+const MAX_GROK_KEYFRAMES: usize = 4;
+const MAX_GROK_VOICES: usize = 3;
+const GROK_KEYFRAME_TIME_STEP_SECONDS: f64 = 1.0 / 3.0;
 
 #[derive(Serialize)]
 struct ConsoleVideoModels {
@@ -63,7 +66,16 @@ struct ConsoleVideoControls {
     duration: ConsoleNumericChoiceControl,
     resolution: ConsoleChoiceControl,
     first_frame: ConsoleFirstFrameControl,
+    last_frame: ConsoleSupportControl,
     reference_images: ConsoleReferenceImagesControl,
+    keyframes: ConsoleKeyframesControl,
+    voices: ConsoleVoicesControl,
+    generate_audio: ConsoleGenerateAudioControl,
+}
+
+#[derive(Serialize)]
+struct ConsoleSupportControl {
+    supported: bool,
 }
 
 #[derive(Serialize)]
@@ -81,6 +93,32 @@ struct ConsoleReferenceImagesControl {
     #[serde(skip_serializing_if = "Option::is_none")]
     max_items: Option<usize>,
     required_for: &'static [&'static str],
+}
+
+#[derive(Serialize)]
+struct ConsoleKeyframesControl {
+    supported: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_items: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    time_step_seconds: Option<f64>,
+    strictly_inside_duration: bool,
+}
+
+#[derive(Serialize)]
+struct ConsoleVoicesControl {
+    supported: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_items: Option<usize>,
+    preset_only: bool,
+}
+
+#[derive(Serialize)]
+struct ConsoleGenerateAudioControl {
+    supported: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    default: Option<bool>,
+    allowed_values: &'static [bool],
 }
 
 #[derive(Serialize)]
@@ -409,11 +447,28 @@ fn console_video_controls(
                 required: false,
                 required_for: &["image_to_video"],
             },
+            last_frame: ConsoleSupportControl { supported: true },
             reference_images: ConsoleReferenceImagesControl {
                 supported: true,
                 min_items: Some(MIN_GROK_REFERENCE_IMAGES),
                 max_items: Some(MAX_GROK_REFERENCE_IMAGES),
                 required_for: &["reference_to_video"],
+            },
+            keyframes: ConsoleKeyframesControl {
+                supported: true,
+                max_items: Some(MAX_GROK_KEYFRAMES),
+                time_step_seconds: Some(GROK_KEYFRAME_TIME_STEP_SECONDS),
+                strictly_inside_duration: true,
+            },
+            voices: ConsoleVoicesControl {
+                supported: true,
+                max_items: Some(MAX_GROK_VOICES),
+                preset_only: true,
+            },
+            generate_audio: ConsoleGenerateAudioControl {
+                supported: true,
+                default: Some(true),
+                allowed_values: &[true],
             },
         });
     }
@@ -456,11 +511,28 @@ fn console_video_controls(
             required: false,
             required_for: &[],
         },
+        last_frame: ConsoleSupportControl { supported: false },
         reference_images: ConsoleReferenceImagesControl {
             supported: false,
             min_items: None,
             max_items: None,
             required_for: &[],
+        },
+        keyframes: ConsoleKeyframesControl {
+            supported: false,
+            max_items: None,
+            time_step_seconds: None,
+            strictly_inside_duration: false,
+        },
+        voices: ConsoleVoicesControl {
+            supported: false,
+            max_items: None,
+            preset_only: false,
+        },
+        generate_audio: ConsoleGenerateAudioControl {
+            supported: false,
+            default: None,
+            allowed_values: &[],
         },
     })
 }
@@ -911,6 +983,7 @@ mod tests {
         assert_eq!(controls.duration.options, &[6, 10]);
         assert_eq!(controls.resolution.options, &["480p", "720p"]);
         assert_eq!(controls.first_frame.required_for, &["image_to_video"]);
+        assert!(controls.last_frame.supported);
         assert!(controls.reference_images.supported);
         assert_eq!(controls.reference_images.min_items, Some(2));
         assert_eq!(controls.reference_images.max_items, Some(7));
@@ -922,6 +995,16 @@ mod tests {
             controls.aspect_ratio.unwrap().supported_for,
             &["text_to_video", "reference_to_video"]
         );
+        assert!(controls.keyframes.supported);
+        assert_eq!(controls.keyframes.max_items, Some(4));
+        assert_eq!(controls.keyframes.time_step_seconds, Some(1.0 / 3.0));
+        assert!(controls.keyframes.strictly_inside_duration);
+        assert!(controls.voices.supported);
+        assert_eq!(controls.voices.max_items, Some(3));
+        assert!(controls.voices.preset_only);
+        assert!(controls.generate_audio.supported);
+        assert_eq!(controls.generate_audio.default, Some(true));
+        assert_eq!(controls.generate_audio.allowed_values, &[true]);
 
         let model = PublicModelRoute {
             id: "grok-imagine-video-1.5-preview".to_owned(),
@@ -934,6 +1017,22 @@ mod tests {
         };
         let value = serde_json::to_value(console_video_model(model).unwrap()).unwrap();
         assert_eq!(value["max_prompt_chars"], GROK_VIDEO_MAX_PROMPT_CHARS);
+        assert_eq!(value["controls"]["last_frame"]["supported"], true);
+        assert_eq!(value["controls"]["keyframes"]["max_items"], 4);
+        assert_eq!(
+            value["controls"]["keyframes"]["time_step_seconds"],
+            json!(1.0 / 3.0)
+        );
+        assert_eq!(
+            value["controls"]["keyframes"]["strictly_inside_duration"],
+            true
+        );
+        assert_eq!(value["controls"]["voices"]["max_items"], 3);
+        assert_eq!(value["controls"]["voices"]["preset_only"], true);
+        assert_eq!(
+            value["controls"]["generate_audio"]["allowed_values"],
+            json!([true])
+        );
 
         let other_video = PublicModelRoute {
             id: "seedance-2".to_owned(),
@@ -946,6 +1045,13 @@ mod tests {
         };
         let other_value = serde_json::to_value(console_video_model(other_video).unwrap()).unwrap();
         assert!(other_value["max_prompt_chars"].is_null());
+        assert_eq!(other_value["controls"]["last_frame"]["supported"], false);
+        assert_eq!(other_value["controls"]["keyframes"]["supported"], false);
+        assert_eq!(other_value["controls"]["voices"]["supported"], false);
+        assert_eq!(
+            other_value["controls"]["generate_audio"]["supported"],
+            false
+        );
     }
 
     #[test]

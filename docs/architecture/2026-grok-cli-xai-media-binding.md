@@ -76,6 +76,12 @@ projection rejects those two fields with HTTP 400 before admission. A future
 provider-specific binding may classify them independently. Fields are never
 silently dropped or approximated.
 
+The console video model catalog advertises these provider-specific controls as
+additive capability metadata. Grok reports `last_frame`, up to four keyframes on
+the 1/3-second grid, and up to three preset-only voices. It also reports that
+`generate_audio` currently allows only `true`; other console providers report
+these controls as unsupported. Consumers must ignore unknown catalog fields.
+
 The CLI assigns `<IMAGE_i>` using the semantic upload order `first_frame`, then
 `reference_images`, then `keyframes`, then `last_frame`. Pinned first, keyframe,
 and last images do not need prompt tags because their timing is explicit. Factory
