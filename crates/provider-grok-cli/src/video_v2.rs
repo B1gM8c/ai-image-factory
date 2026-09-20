@@ -1,6 +1,6 @@
 use image_api_contracts::xai::{
-    XaiVideoAspectRatio, XaiVideoAudioReference, XaiVideoGenerationCommandV2, XaiVideoResolution,
-    XaiVideoWorkflow,
+    XaiVideoAspectRatio, XaiVideoAudioReference, XaiVideoGenerationCommandV2, XaiVideoKeyframe,
+    XaiVideoResolution, XaiVideoWorkflow,
 };
 use image_provider_sdk::{CanonicalCommandPayload, OutputSlot};
 use serde::{Deserialize, Serialize};
@@ -61,6 +61,7 @@ pub struct GrokVideoGenerationInputsV2 {
     first_frame: Option<StagedImageV1>,
     last_frame: Option<StagedImageV1>,
     reference_images: Vec<StagedImageV1>,
+    keyframes: Vec<KeyframeV2>,
 }
 
 impl GrokVideoGenerationInputsV2 {
@@ -68,11 +69,13 @@ impl GrokVideoGenerationInputsV2 {
         first_frame: Option<StagedImageV1>,
         last_frame: Option<StagedImageV1>,
         reference_images: Vec<StagedImageV1>,
+        keyframes: Vec<KeyframeV2>,
     ) -> Self {
         Self {
             first_frame,
             last_frame,
             reference_images,
+            keyframes,
         }
     }
 
@@ -99,6 +102,12 @@ impl GrokVideoGenerationInputsV2 {
                     .enumerate()
                     .map(|(index, image)| ("reference", index, image)),
             )
+            .chain(
+                self.keyframes
+                    .iter()
+                    .enumerate()
+                    .map(|(index, keyframe)| ("keyframe", index, keyframe.image())),
+            )
     }
 
     fn from_staged(
@@ -107,7 +116,8 @@ impl GrokVideoGenerationInputsV2 {
     ) -> Result<Self, XaiGrokVideoProjectionErrorV2> {
         let expected = usize::from(command.image.is_some())
             + usize::from(command.last_frame.is_some())
-            + command.reference_images.len();
+            + command.reference_images.len()
+            + command.keyframes.len();
         if staged_images.len() != expected {
             return Err(XaiGrokVideoProjectionErrorV2::InputManifestMismatch);
         }
@@ -120,10 +130,52 @@ impl GrokVideoGenerationInputsV2 {
             .last_frame
             .as_ref()
             .map(|_| iter.next().expect("count checked"));
-        let reference_images = iter.collect();
-        Ok(Self::new(first_frame, last_frame, reference_images))
+        let reference_images = (0..command.reference_images.len())
+            .map(|_| iter.next().expect("count checked"))
+            .collect();
+        let keyframes = command
+            .keyframes
+            .iter()
+            .map(|keyframe| {
+                KeyframeV2::new(iter.next().expect("count checked"), keyframe.timestamp_s)
+            })
+            .collect();
+        Ok(Self::new(
+            first_frame,
+            last_frame,
+            reference_images,
+            keyframes,
+        ))
     }
 }
+
+#[derive(Clone, Debug)]
+pub(crate) struct KeyframeV2 {
+    image: StagedImageV1,
+    timestamp_s: f64,
+}
+
+impl KeyframeV2 {
+    fn new(image: StagedImageV1, timestamp_s: f64) -> Self {
+        Self { image, timestamp_s }
+    }
+
+    pub(crate) fn image(&self) -> &StagedImageV1 {
+        &self.image
+    }
+
+    pub(crate) const fn timestamp_s(&self) -> f64 {
+        self.timestamp_s
+    }
+}
+
+impl PartialEq for KeyframeV2 {
+    fn eq(&self, other: &Self) -> bool {
+        self.image == other.image && self.timestamp_s.to_bits() == other.timestamp_s.to_bits()
+    }
+}
+
+impl Eq for KeyframeV2 {}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReferenceAudioV2 {
@@ -193,6 +245,7 @@ pub struct ReferenceToVideoRequestV2 {
     first_frame: Option<StagedImageV1>,
     last_frame: Option<StagedImageV1>,
     reference_images: Vec<StagedImageV1>,
+    keyframes: Vec<KeyframeV2>,
     voices: Vec<ReferenceAudioV2>,
     normalized_voices: Vec<String>,
     aspect_ratio: VideoAspectRatioV2,
@@ -212,6 +265,9 @@ impl ReferenceToVideoRequestV2 {
     }
     pub fn reference_images(&self) -> &[StagedImageV1] {
         &self.reference_images
+    }
+    pub(crate) fn keyframes(&self) -> &[KeyframeV2] {
+        &self.keyframes
     }
     pub fn voices(&self) -> &[String] {
         &self.normalized_voices
@@ -290,6 +346,7 @@ impl GrokVideoGenerationPayloadV2 {
             .iter()
             .chain(command.last_frame.iter())
             .chain(command.reference_images.iter())
+            .chain(command.keyframes.iter().map(|keyframe| &keyframe.image))
         {
             if image.file_id.is_some() {
                 return Err(XaiGrokVideoProjectionErrorV2::UnsupportedFileId);
@@ -308,7 +365,15 @@ impl GrokVideoGenerationPayloadV2 {
                 .ok_or(XaiGrokVideoProjectionErrorV2::InvalidVoiceId)?;
             normalize_voice(voice)?;
         }
-        if command.reference_audios.len() > 3 || command.reference_images.len() > 7 {
+        if command.reference_audios.len() > 3
+            || command.reference_images.len() > 7
+            || command.keyframes.len() > 4
+            || usize::from(command.image.is_some())
+                + usize::from(command.last_frame.is_some())
+                + command.reference_images.len()
+                + command.keyframes.len()
+                > 9
+        {
             return Err(XaiGrokVideoProjectionErrorV2::InputCountExceeded);
         }
         let model = command
@@ -425,7 +490,8 @@ pub fn parse_video_generation_payload_v2(
         .map(|input| StagedImageV1::new(input.filename.clone(), input.sha256.clone()))
         .collect::<Result<Vec<_>, _>>()
         .map_err(|_| GrokCommandError::InvalidCanonicalCommand)?;
-    let canonical_inputs = canonical_inputs(&canonical.inputs)?;
+    let canonical_inputs =
+        canonical_inputs(&canonical.inputs, &canonical.source_command.keyframes)?;
     validate_redacted_staged_bindings(&canonical.source_command, &canonical_inputs)?;
     let mut payload =
         GrokVideoGenerationPayloadV2::from_xai_command(canonical.source_command.clone(), staged)
@@ -439,6 +505,7 @@ pub fn parse_video_generation_payload_v2(
         || payload.request.controls() != canonical.controls()
         || canonical.generate_audio != payload.source_command.generate_audio
         || canonical.voices != canonical_voices(payload.request.voice_bindings())
+        || canonical.keyframes != canonical_keyframes(payload.request.reference_keyframes())
     {
         return Err(GrokCommandError::InvalidCanonicalCommand);
     }
@@ -554,6 +621,7 @@ fn project_request(
                     first_frame: inputs.first_frame.clone(),
                     last_frame: inputs.last_frame.clone(),
                     reference_images: inputs.reference_images.clone(),
+                    keyframes: inputs.keyframes.clone(),
                     normalized_voices: voices
                         .iter()
                         .map(|voice| voice.normalized.clone())
@@ -630,6 +698,12 @@ fn redact_inputs(
         .iter_mut()
         .chain(command.last_frame.iter_mut())
         .chain(command.reference_images.iter_mut())
+        .chain(
+            command
+                .keyframes
+                .iter_mut()
+                .map(|keyframe| &mut keyframe.image),
+        )
         .collect();
     if refs.len() != staged.len() {
         return Err(XaiGrokVideoProjectionErrorV2::InputManifestMismatch);
@@ -651,6 +725,7 @@ fn validate_staged_bindings(
         .iter()
         .chain(command.last_frame.iter())
         .chain(command.reference_images.iter())
+        .chain(command.keyframes.iter().map(|keyframe| &keyframe.image))
         .collect();
     if references.len() != staged.len() {
         return Err(XaiGrokVideoProjectionErrorV2::InputManifestMismatch);
@@ -676,6 +751,7 @@ fn validate_redacted_staged_bindings(
         .iter()
         .chain(command.last_frame.iter())
         .chain(command.reference_images.iter())
+        .chain(command.keyframes.iter().map(|keyframe| &keyframe.image))
         .collect();
     if references.len() != staged.len()
         || references.iter().zip(staged).any(|(reference, image)| {
@@ -713,6 +789,15 @@ fn canonical_voices(voices: &[ReferenceAudioV2]) -> Vec<CanonicalVoiceV2> {
         .collect()
 }
 
+fn canonical_keyframes(keyframes: &[KeyframeV2]) -> Vec<CanonicalKeyframeV2> {
+    keyframes
+        .iter()
+        .map(|keyframe| CanonicalKeyframeV2 {
+            timestamp_s: keyframe.timestamp_s(),
+        })
+        .collect()
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct CanonicalVideoGenerationV2 {
@@ -729,6 +814,8 @@ struct CanonicalVideoGenerationV2 {
     aspect_ratio: Option<String>,
     generate_audio: bool,
     voices: Vec<CanonicalVoiceV2>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    keyframes: Vec<CanonicalKeyframeV2>,
     inputs: Vec<CanonicalInputV2>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     integrity_sha256: Option<String>,
@@ -739,6 +826,12 @@ struct CanonicalVideoGenerationV2 {
 struct CanonicalVoiceV2 {
     original: String,
     normalized: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct CanonicalKeyframeV2 {
+    timestamp_s: f64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -763,6 +856,7 @@ impl CanonicalVideoGenerationV2 {
         let resolution = payload.request.resolution().as_str().to_owned();
         let aspect_ratio = payload.request.aspect_ratio().map(str::to_owned);
         let voices = canonical_voices(payload.request.voice_bindings());
+        let keyframes = canonical_keyframes(payload.request.reference_keyframes());
         let inputs = payload
             .inputs
             .ordered()
@@ -787,6 +881,7 @@ impl CanonicalVideoGenerationV2 {
             aspect_ratio,
             generate_audio: true,
             voices,
+            keyframes,
             inputs,
             integrity_sha256: None,
         }
@@ -805,10 +900,12 @@ impl CanonicalVideoGenerationV2 {
 
 fn canonical_inputs(
     items: &[CanonicalInputV2],
+    keyframes: &[XaiVideoKeyframe],
 ) -> Result<GrokVideoGenerationInputsV2, GrokCommandError> {
     let mut first = None;
     let mut last = None;
     let mut refs = Vec::new();
+    let mut canonical_keyframes = Vec::new();
     for item in items {
         let image = StagedImageV1::new(item.filename.clone(), item.sha256.clone())
             .map_err(|_| GrokCommandError::InvalidCanonicalCommand)?;
@@ -816,10 +913,25 @@ fn canonical_inputs(
             ("first_frame", 0) if first.is_none() => first = Some(image),
             ("last_frame", 0) if last.is_none() => last = Some(image),
             ("reference", index) if index == refs.len() => refs.push(image),
+            ("keyframe", index) if index == canonical_keyframes.len() => {
+                let timestamp_s = keyframes
+                    .get(index)
+                    .ok_or(GrokCommandError::InvalidCanonicalCommand)?
+                    .timestamp_s;
+                canonical_keyframes.push(KeyframeV2::new(image, timestamp_s));
+            }
             _ => return Err(GrokCommandError::InvalidCanonicalCommand),
         }
     }
-    Ok(GrokVideoGenerationInputsV2::new(first, last, refs))
+    if canonical_keyframes.len() != keyframes.len() {
+        return Err(GrokCommandError::InvalidCanonicalCommand);
+    }
+    Ok(GrokVideoGenerationInputsV2::new(
+        first,
+        last,
+        refs,
+        canonical_keyframes,
+    ))
 }
 
 impl GrokVideoGenerationRequestV2 {
@@ -864,6 +976,12 @@ impl GrokVideoGenerationRequestV2 {
             _ => &[],
         }
     }
+    fn reference_keyframes(&self) -> &[KeyframeV2] {
+        match self {
+            Self::ReferenceToVideo(v) => &v.keyframes,
+            _ => &[],
+        }
+    }
     fn controls(&self) -> (Option<&str>, u8, &str, Option<&str>, bool) {
         (
             self.aspect_ratio(),
@@ -879,7 +997,8 @@ impl GrokVideoGenerationRequestV2 {
 mod tests {
     use super::*;
     use image_api_contracts::xai::{
-        XaiVideoGenerationRequest, XaiVideoImageUrl, XaiVideoOutput, XaiVideoStorageOptions,
+        XaiVideoGenerationRequest, XaiVideoImageUrl, XaiVideoKeyframe, XaiVideoOutput,
+        XaiVideoStorageOptions,
     };
 
     const SHA: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -896,6 +1015,7 @@ mod tests {
                 file_id: None,
                 url: Some("data:image/png;base64,AA==".into()),
             }),
+            keyframes: Vec::new(),
             last_frame: Some(XaiVideoImageUrl {
                 file_id: None,
                 url: Some("data:image/png;base64,AQ==".into()),
@@ -924,6 +1044,7 @@ mod tests {
             duration: Some(10),
             generate_audio: Some(true),
             image: None,
+            keyframes: Vec::new(),
             last_frame: None,
             model: Some("grok-imagine-video-1.5".into()),
             output: None,
@@ -946,6 +1067,7 @@ mod tests {
                 file_id: None,
                 url: Some("data:image/png;base64,AA==".into()),
             }),
+            keyframes: Vec::new(),
             last_frame: None,
             model: Some("grok-imagine-video-1.5".into()),
             output: None,
@@ -983,6 +1105,65 @@ mod tests {
         assert_eq!(request.last_frame().unwrap().filename(), "last.png");
         assert_eq!(request.reference_images()[0].filename(), "reference-0.png");
         assert_eq!(request.voice_bindings()[0].normalized(), "eve");
+    }
+
+    #[test]
+    fn v2_empty_keyframes_do_not_change_the_canonical_wire_shape() {
+        let payload = GrokVideoGenerationPayloadV2::from_xai_command(
+            command(),
+            vec![
+                staged("first.png"),
+                staged("last.png"),
+                staged("reference-0.png"),
+            ],
+        )
+        .unwrap();
+        let canonical: serde_json::Value =
+            serde_json::from_slice(&payload.into_canonical_bytes(OutputSlot::new(0, 1).unwrap()))
+                .unwrap();
+
+        assert!(canonical.get("keyframes").is_none());
+        assert!(canonical["source_command"].get("keyframes").is_none());
+    }
+
+    #[test]
+    fn v2_canonical_round_trip_and_tamper_check_keyframes() {
+        let mut source = command();
+        source.keyframes.push(XaiVideoKeyframe {
+            image: XaiVideoImageUrl {
+                file_id: None,
+                url: Some("data:image/png;base64,Aw==".into()),
+            },
+            timestamp_s: 2.0,
+        });
+        let payload = GrokVideoGenerationPayloadV2::from_xai_command(
+            source,
+            vec![
+                staged("first.png"),
+                staged("last.png"),
+                staged("reference-0.png"),
+                staged("keyframe-0.png"),
+            ],
+        )
+        .unwrap();
+        let canonical = payload
+            .clone()
+            .into_canonical_bytes(OutputSlot::new(0, 1).unwrap());
+        let parsed = parse_video_generation_payload_v2(&canonical).unwrap();
+        let request = parsed.request().as_reference().unwrap();
+        assert_eq!(request.keyframes()[0].image().filename(), "keyframe-0.png");
+        assert_eq!(request.keyframes()[0].timestamp_s(), 2.0);
+
+        let mut tampered: serde_json::Value = serde_json::from_slice(&canonical).unwrap();
+        tampered["source_command"]["keyframes"][0]["timestamp_s"] = serde_json::json!(1.0);
+        let source_command: XaiVideoGenerationCommandV2 =
+            serde_json::from_value(tampered["source_command"].clone()).unwrap();
+        tampered["source_command_sha256"] =
+            serde_json::json!(source_command.canonical_sha256_hex());
+        assert_eq!(
+            parse_video_generation_payload_v2(&recompute_integrity(tampered)),
+            Err(GrokCommandError::InvalidCanonicalCommand)
+        );
     }
 
     #[test]

@@ -612,6 +612,7 @@ fn validate_video_attach_request_v2(
                 "first_frame" => xai_videos::XaiVideoInputRoleV2::FirstFrame,
                 "last_frame" => xai_videos::XaiVideoInputRoleV2::LastFrame,
                 "reference" => xai_videos::XaiVideoInputRoleV2::ReferenceImage,
+                "keyframe" => xai_videos::XaiVideoInputRoleV2::Keyframe,
                 _ => unreachable!("provider V2 role is closed"),
             };
             (

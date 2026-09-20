@@ -4,7 +4,7 @@ use image_api_contracts::xai::{
     XAI_IMAGE_GENERATION_COMMAND_SCHEMA, XaiImageAspectRatio, XaiImageGenerationCommandV1,
     XaiImageGenerationRequest, XaiImageResolution, XaiImageResponseFormat,
     XaiVideoAspectRatio as OfficialVideoAspectRatio, XaiVideoGenerationCommandV1,
-    XaiVideoGenerationCommandV2, XaiVideoGenerationRequest, XaiVideoImageUrl,
+    XaiVideoGenerationCommandV2, XaiVideoGenerationRequest, XaiVideoImageUrl, XaiVideoKeyframe,
     XaiVideoResolution as OfficialVideoResolution,
 };
 use image_cli_runtime::WorkingDirectory;
@@ -486,6 +486,7 @@ fn video_command_preserves_the_two_distinct_fixed_model_workflows() {
         duration: Some(6),
         generate_audio: None,
         image: None,
+        keyframes: Vec::new(),
         last_frame: None,
         model: Some("grok-imagine-video-1.5-preview".to_owned()),
         output: None,
@@ -523,6 +524,7 @@ fn video_command_preserves_the_two_distinct_fixed_model_workflows() {
             file_id: None,
             url: Some("data:image/png;base64,AA==".to_owned()),
         }),
+        keyframes: Vec::new(),
         last_frame: None,
         model: Some("grok-imagine-video-1.5".to_owned()),
         output: None,
@@ -596,6 +598,7 @@ fn video_command_preserves_the_two_distinct_fixed_model_workflows() {
         duration: Some(6),
         generate_audio: None,
         image: None,
+        keyframes: Vec::new(),
         last_frame: None,
         model: Some("grok-imagine-video".to_owned()),
         output: None,
@@ -1553,6 +1556,58 @@ fn v2_reference_dispatch_maps_frames_references_and_voice_strings() {
 }
 
 #[test]
+fn v2_reference_dispatch_projects_keyframes_after_reference_images() {
+    let fixture = PolicyFixture::new();
+    let command = XaiVideoGenerationCommandV2::from_request(XaiVideoGenerationRequest {
+        aspect_ratio: Some(OfficialVideoAspectRatio::R16x9),
+        duration: Some(6),
+        generate_audio: Some(true),
+        image: None,
+        keyframes: vec![XaiVideoKeyframe {
+            image: XaiVideoImageUrl {
+                file_id: None,
+                url: Some("data:image/png;base64,AA==".to_owned()),
+            },
+            timestamp_s: 2.0,
+        }],
+        last_frame: None,
+        model: Some("grok-imagine-video-1.5".to_owned()),
+        output: None,
+        prompt: Some("transition".to_owned()),
+        reference_audios: Vec::new(),
+        reference_images: vec![XaiVideoImageUrl {
+            file_id: None,
+            url: Some("data:image/png;base64,AQ==".to_owned()),
+        }],
+        resolution: Some(OfficialVideoResolution::P480),
+        storage_options: None,
+        user: None,
+    })
+    .unwrap();
+    let request = GrokVideoGenerationPayloadV2::from_xai_command(
+        command,
+        vec![staged("reference.png"), staged("keyframe.png")],
+    )
+    .unwrap()
+    .into_request();
+    let (_, invocation) = fixture
+        .policy
+        .command_spec_video_v2(&request, SESSION_ID, fixture.workspace.clone())
+        .unwrap();
+    assert_eq!(
+        invocation.expected_tool_calls()[0].arguments()["images"],
+        json!([fixture.workspace.path().join("reference.png")])
+    );
+    assert_eq!(
+        invocation.expected_tool_calls()[0].arguments()["keyframes"],
+        json!([{
+            "image": fixture.workspace.path().join("keyframe.png"),
+            "timestamp_s": 2.0
+        }])
+    );
+}
+
+#[test]
 fn v2_text_video_dispatches_image_gen_then_image_to_video() {
     let fixture = PolicyFixture::new();
     let request = v2_text_request();
@@ -1704,6 +1759,7 @@ fn v2_i2v_request(
             file_id: None,
             url: Some("data:image/png;base64,AA==".to_owned()),
         }),
+        keyframes: Vec::new(),
         last_frame: None,
         model: Some("grok-imagine-video-1.5".to_owned()),
         output: None,
@@ -1729,6 +1785,7 @@ fn v2_reference_request() -> GrokVideoGenerationRequestV2 {
             file_id: None,
             url: Some("data:image/png;base64,AA==".to_owned()),
         }),
+        keyframes: Vec::new(),
         last_frame: Some(XaiVideoImageUrl {
             file_id: None,
             url: Some("data:image/png;base64,AQ==".to_owned()),
@@ -1773,6 +1830,7 @@ fn v2_text_request() -> GrokVideoGenerationRequestV2 {
         duration: Some(6),
         generate_audio: Some(true),
         image: None,
+        keyframes: Vec::new(),
         last_frame: None,
         model: Some("grok-imagine-video-1.5".to_owned()),
         output: None,

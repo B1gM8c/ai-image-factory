@@ -31,6 +31,7 @@ pub enum XaiVideoInputRoleV2 {
     FirstFrame,
     LastFrame,
     ReferenceImage,
+    Keyframe,
 }
 
 impl XaiVideoInputRoleV2 {
@@ -39,6 +40,7 @@ impl XaiVideoInputRoleV2 {
             Self::FirstFrame => "first_frame",
             Self::LastFrame => "last_frame",
             Self::ReferenceImage => "reference_image",
+            Self::Keyframe => "keyframe",
         }
     }
 }
@@ -289,22 +291,30 @@ impl XaiVideoAdmissionPlan {
     ) -> Result<Self, XaiVideoAdmissionError> {
         let expected_inputs = usize::from(source_command_v2.image.is_some())
             + usize::from(source_command_v2.last_frame.is_some())
-            + source_command_v2.reference_images.len();
+            + source_command_v2.reference_images.len()
+            + source_command_v2.keyframes.len();
         if inputs.len() != expected_inputs {
             return Err(XaiVideoAdmissionError::InvalidInputManifest);
         }
         let mut semantic_inputs = Vec::with_capacity(inputs.len());
         let first_count = usize::from(source_command_v2.image.is_some());
         let last_count = usize::from(source_command_v2.last_frame.is_some());
+        let reference_count = source_command_v2.reference_images.len();
         for (position, input) in inputs.into_iter().enumerate() {
             let (role, role_index) = if position < first_count {
                 (XaiVideoInputRoleV2::FirstFrame, 0)
             } else if position < first_count + last_count {
                 (XaiVideoInputRoleV2::LastFrame, 0)
-            } else {
+            } else if position < first_count + last_count + reference_count {
                 (
                     XaiVideoInputRoleV2::ReferenceImage,
                     u8::try_from(position - first_count - last_count)
+                        .map_err(|_| XaiVideoAdmissionError::InvalidInputManifest)?,
+                )
+            } else {
+                (
+                    XaiVideoInputRoleV2::Keyframe,
+                    u8::try_from(position - first_count - last_count - reference_count)
                         .map_err(|_| XaiVideoAdmissionError::InvalidInputManifest)?,
                 )
             };
@@ -621,7 +631,9 @@ pub(super) fn video_input_manifest_hash_matches_v2(
 
 #[cfg(test)]
 mod tests {
-    use image_api_contracts::xai::{XaiVideoAudioReference, XaiVideoImageUrl, XaiVideoResolution};
+    use image_api_contracts::xai::{
+        XaiVideoAudioReference, XaiVideoImageUrl, XaiVideoKeyframe, XaiVideoResolution,
+    };
 
     use super::*;
     use crate::input_blobs::InputBlobKey;
@@ -657,6 +669,7 @@ mod tests {
                 file_id: None,
                 url: Some("data:image/png;base64,AA==".to_owned()),
             }),
+            keyframes: Vec::new(),
             last_frame: None,
             model: Some("grok-imagine-video-1.5".to_owned()),
             output: None,
@@ -675,6 +688,7 @@ mod tests {
             duration: Some(10),
             generate_audio: None,
             image: None,
+            keyframes: Vec::new(),
             last_frame: None,
             model: Some("grok-imagine-video-1.5-preview".to_owned()),
             output: None,
@@ -696,6 +710,7 @@ mod tests {
                 file_id: None,
                 url: Some("data:image/png;base64,AA==".to_owned()),
             }),
+            keyframes: Vec::new(),
             last_frame: Some(XaiVideoImageUrl {
                 file_id: None,
                 url: Some("data:image/png;base64,AA==".to_owned()),
@@ -718,9 +733,17 @@ mod tests {
     }
 
     #[test]
-    fn v2_manifest_binds_first_last_and_reference_roles() {
+    fn v2_manifest_binds_first_last_reference_and_keyframe_roles() {
         let session_id = Uuid::new_v4();
-        let inputs = (0..3)
+        let mut request = v2_reference_request();
+        request.keyframes.push(XaiVideoKeyframe {
+            image: XaiVideoImageUrl {
+                file_id: None,
+                url: Some("data:image/png;base64,AA==".to_owned()),
+            },
+            timestamp_s: 2.0,
+        });
+        let inputs = (0..4)
             .map(|index| {
                 XaiVideoAdmissionInput::new(
                     format!("input-{index}.png"),
@@ -739,7 +762,7 @@ mod tests {
                 .unwrap()
             })
             .collect::<Vec<_>>();
-        let plan = XaiVideoAdmissionPlan::for_grok_cli_v2(v2_reference_request(), inputs).unwrap();
+        let plan = XaiVideoAdmissionPlan::for_grok_cli_v2(request, inputs).unwrap();
         assert_eq!(
             plan.command_schema(),
             image_provider_grok_cli::GROK_VIDEO_GENERATION_COMMAND_SCHEMA_V2
@@ -748,11 +771,13 @@ mod tests {
             plan.adapter_revision(),
             image_provider_grok_cli::VIDEO_ADAPTER_REVISION_V2
         );
-        assert_eq!(plan.inputs().len(), 3);
+        assert_eq!(plan.inputs().len(), 4);
         assert_eq!(plan.inputs()[0].role(), XaiVideoInputRoleV2::FirstFrame);
         assert_eq!(plan.inputs()[1].role(), XaiVideoInputRoleV2::LastFrame);
         assert_eq!(plan.inputs()[2].role(), XaiVideoInputRoleV2::ReferenceImage);
         assert_eq!(plan.inputs()[2].role_index(), 0);
+        assert_eq!(plan.inputs()[3].role(), XaiVideoInputRoleV2::Keyframe);
+        assert_eq!(plan.inputs()[3].role_index(), 0);
         assert!(plan.input_manifest_hash().len() == 64);
 
         let attach = plan.attach(
@@ -818,6 +843,7 @@ mod tests {
         request.image = None;
         request.last_frame = None;
         request.reference_images.clear();
+        request.keyframes.clear();
         let plan = XaiVideoAdmissionPlan::for_grok_cli_v2(request, Vec::new()).unwrap();
         assert!(plan.inputs().is_empty());
         assert!(

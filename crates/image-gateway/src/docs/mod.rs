@@ -584,7 +584,7 @@ async fn edit_image() {}
     request_body(
         content = VideoGenerationRequestDoc,
         content_type = "application/json",
-        description = "xAI-shaped asynchronous video request. New requests use the opt-in Grok CLI 1.0.34 V2 binding: generated audio is required, image inputs are base64 data URLs or bounded public HTTPS URLs (no redirects or private-address resolution), reference_images accepts at most seven images, reference_audios accepts at most three voice_id entries (audio URLs are rejected), and only 480p/720p are executable. file_id, output, and storage_options are retained for official DTO shape but rejected with HTTP 400 before admission by this CLI binding. Existing V1 jobs remain replayable through their stored command schema."
+        description = "xAI-shaped asynchronous video request. New requests use the opt-in Grok CLI 1.0.34 V2 binding: generated audio is required, image inputs are base64 data URLs or bounded public HTTPS URLs (no redirects or private-address resolution), reference_images accepts at most seven images, keyframes accepts at most four strictly increasing mid-clip anchors on the 1/3-second grid, and all first/last/reference/keyframe images together are capped at nine by the immutable V2 pricing surface. reference_audios accepts at most three voice_id entries (audio URLs are rejected), and only 480p/720p are executable. The CLI IMAGE index order is first_frame, reference_images, keyframes, then last_frame; pinned frames do not need prompt tags. file_id, output, and storage_options are retained for official DTO shape but rejected with HTTP 400 before admission by this CLI binding. Existing V1 jobs remain replayable through their stored command schema."
     ),
     responses(
         (status = 200, description = "Video request accepted", body = VideoStartResponseDoc),
@@ -2762,6 +2762,9 @@ struct VideoGenerationRequestDoc {
     /// V2 defaults to true and rejects an explicit false value.
     generate_audio: Option<bool>,
     image: Option<VideoImageReferenceDoc>,
+    /// Factory CLI extension: up to four strictly increasing mid-clip anchors on the 1/3-second grid.
+    #[schema(max_items = 4)]
+    keyframes: Option<Vec<VideoKeyframeDoc>>,
     /// Optional final frame; when present the request is a reference-to-video workflow.
     last_frame: Option<VideoImageReferenceDoc>,
     model: Option<String>,
@@ -2794,6 +2797,16 @@ struct VideoAudioReferenceDoc {
     url: Option<String>,
     /// Grok CLI V2 accepts up to three non-empty voice identifiers.
     voice_id: Option<String>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+#[allow(dead_code)]
+struct VideoKeyframeDoc {
+    image: VideoImageReferenceDoc,
+    /// Timestamp strictly inside the clip. It must be on the 1/3-second grid
+    /// and greater than the preceding keyframe timestamp.
+    #[schema(exclusive_minimum = 0)]
+    timestamp_s: f64,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -3790,11 +3803,13 @@ mod tests {
         );
         assert_eq!(schema["properties"]["reference_images"]["maxItems"], 7);
         assert_eq!(schema["properties"]["reference_audios"]["maxItems"], 3);
+        assert_eq!(schema["properties"]["keyframes"]["maxItems"], 4);
         assert_eq!(
             schema["properties"]["resolution"]["oneOf"][1]["enum"],
             serde_json::json!(["480p", "720p"])
         );
         assert!(schema["properties"]["last_frame"].is_object());
+        assert!(schema["properties"]["keyframes"].is_object());
         assert!(schema["properties"]["generate_audio"].is_object());
         let description =
             document["paths"]["/v1/videos/generations"]["post"]["requestBody"]["description"]
@@ -3803,6 +3818,8 @@ mod tests {
         assert!(description.contains("HTTP 400"));
         assert!(description.contains("public HTTPS"));
         assert!(description.contains("file_id"));
+        assert!(description.contains("1/3-second grid"));
+        assert!(description.contains("first_frame, reference_images, keyframes, then last_frame"));
     }
 }
 

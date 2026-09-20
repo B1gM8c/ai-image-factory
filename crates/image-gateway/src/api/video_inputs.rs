@@ -61,6 +61,19 @@ pub(super) async fn decode_video_inputs_v2(
                         image,
                     )
                 }),
+        )
+        .chain(
+            command
+                .keyframes
+                .iter()
+                .enumerate()
+                .map(|(index, keyframe)| {
+                    (
+                        XaiVideoInputRoleV2::Keyframe,
+                        u8::try_from(index).unwrap_or(u8::MAX),
+                        &keyframe.image,
+                    )
+                }),
         );
 
     for (role, role_index, image) in sources {
@@ -416,13 +429,14 @@ impl XaiVideoInputRoleV2 {
             Self::FirstFrame => "image",
             Self::LastFrame => "last_frame",
             Self::ReferenceImage => "reference_images",
+            Self::Keyframe => "keyframes",
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use image_api_contracts::xai::XaiVideoImageUrl;
+    use image_api_contracts::xai::{XaiVideoImageUrl, XaiVideoKeyframe};
 
     use super::*;
 
@@ -470,6 +484,13 @@ mod tests {
                 file_id: None,
                 url: Some("data:image/png;base64,iVBORw0KGgo=".to_owned()),
             }),
+            keyframes: vec![XaiVideoKeyframe {
+                image: XaiVideoImageUrl {
+                    file_id: None,
+                    url: Some("data:image/png;base64,iVBORw0KGgo=".to_owned()),
+                },
+                timestamp_s: 2.0,
+            }],
             last_frame: Some(XaiVideoImageUrl {
                 file_id: None,
                 url: Some("data:image/png;base64,iVBORw0KGgo=".to_owned()),
@@ -478,14 +499,21 @@ mod tests {
             output: None,
             prompt: None,
             reference_audios: Vec::new(),
-            reference_images: Vec::new(),
+            reference_images: vec![XaiVideoImageUrl {
+                file_id: None,
+                url: Some("data:image/png;base64,iVBORw0KGgo=".to_owned()),
+            }],
             resolution: image_api_contracts::xai::XaiVideoResolution::P480,
             storage_options: None,
             user: None,
         };
         let inputs = decode_video_inputs_v2(&command, 12).await.unwrap();
-        assert_eq!(inputs.len(), 2);
-        assert_eq!(inputs[0].bytes, inputs[1].bytes);
+        assert_eq!(inputs.len(), 4);
+        assert_eq!(inputs[0].filename, "first_frame-0.png");
+        assert_eq!(inputs[1].filename, "last_frame-0.png");
+        assert_eq!(inputs[2].filename, "reference_image-0.png");
+        assert_eq!(inputs[3].filename, "keyframe-0.png");
+        assert!(inputs.windows(2).all(|pair| pair[0].bytes == pair[1].bytes));
     }
 
     #[test]
@@ -499,6 +527,7 @@ mod tests {
                     file_id: None,
                     url: Some("data:image/png;base64,iVBORw0KGgo=".to_owned()),
                 }),
+                keyframes: Vec::new(),
                 last_frame: None,
                 model: Some("grok-imagine-video-1.5-preview".to_owned()),
                 output: None,

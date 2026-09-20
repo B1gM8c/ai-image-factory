@@ -269,7 +269,8 @@ fn video_pricing_dimensions(
                 command.resolution,
                 usize::from(command.image.is_some())
                     + usize::from(command.last_frame.is_some())
-                    + command.reference_images.len(),
+                    + command.reference_images.len()
+                    + command.keyframes.len(),
                 command.aspect_ratio,
                 command.workflow(),
             )
@@ -462,6 +463,13 @@ fn unsupported_file_id_parameter(
         .position(|image| image.file_id.is_some())
     {
         return format!("reference_images[{index}]");
+    }
+    if let Some(index) = command
+        .keyframes
+        .iter()
+        .position(|keyframe| keyframe.image.file_id.is_some())
+    {
+        return format!("keyframes[{index}].image");
     }
     "image".to_owned()
 }
@@ -778,8 +786,8 @@ fn video_not_found(param: &str) -> ImageGatewayError {
 #[cfg(test)]
 mod tests {
     use image_api_contracts::xai::{
-        XaiVideoAspectRatio, XaiVideoImageUrl, XaiVideoOutput, XaiVideoRequestError,
-        XaiVideoResolution, XaiVideoStorageOptions,
+        XaiVideoAspectRatio, XaiVideoImageUrl, XaiVideoKeyframe, XaiVideoOutput,
+        XaiVideoRequestError, XaiVideoResolution, XaiVideoStorageOptions,
     };
 
     use crate::admission::XaiVideoAdmissionPlan;
@@ -862,6 +870,7 @@ mod tests {
                 file_id: None,
                 url: Some("https://127.0.0.1/private.png".to_owned()),
             }),
+            keyframes: Vec::new(),
             last_frame: None,
             model: Some("grok-imagine-video-1.5".to_owned()),
             output: None,
@@ -888,6 +897,7 @@ mod tests {
                 file_id: None,
                 url: Some("https://127.0.0.1/private.png".to_owned()),
             }),
+            keyframes: Vec::new(),
             last_frame: None,
             model: Some("grok-imagine-video-1.5".to_owned()),
             output: Some(XaiVideoOutput {
@@ -930,6 +940,7 @@ mod tests {
                 file_id: Some("file-image".to_owned()),
                 url: None,
             }),
+            keyframes: Vec::new(),
             last_frame: None,
             model: Some("grok-imagine-video-1.5".to_owned()),
             output: None,
@@ -958,7 +969,16 @@ mod tests {
                 url: None,
             },
         ];
-        cases.push((image, "reference_images[1]"));
+        cases.push((image.clone(), "reference_images[1]"));
+        image.reference_images.clear();
+        image.keyframes = vec![XaiVideoKeyframe {
+            image: XaiVideoImageUrl {
+                file_id: Some("file-keyframe".to_owned()),
+                url: None,
+            },
+            timestamp_s: 1.0,
+        }];
+        cases.push((image, "keyframes[0].image"));
 
         for (request, expected_parameter) in cases {
             let intent = XaiVideoAdmissionIntent::new_v2(request).expect("valid V2 request");
@@ -997,6 +1017,7 @@ mod tests {
                 duration: Some(6),
                 generate_audio: None,
                 image: None,
+                keyframes: Vec::new(),
                 last_frame: None,
                 model: Some("grok-imagine-video-1.5-preview".to_owned()),
                 output: None,
@@ -1034,6 +1055,7 @@ mod tests {
                     file_id: None,
                     url: Some("data:image/png;base64,AA==".to_owned()),
                 }),
+                keyframes: Vec::new(),
                 last_frame: None,
                 model: Some("grok-imagine-video-1.5-preview".to_owned()),
                 output: None,
@@ -1070,6 +1092,63 @@ mod tests {
                 ("duration".to_owned(), "10".to_owned()),
                 ("input_image_count".to_owned(), "1".to_owned()),
                 ("resolution".to_owned(), "720p".to_owned()),
+            ])
+        );
+    }
+
+    #[test]
+    fn grok_v2_keyframe_is_counted_as_an_input_image() {
+        let session_id = Uuid::new_v4();
+        let plan = XaiVideoAdmissionPlan::for_grok_cli_v2(
+            XaiVideoGenerationRequest {
+                aspect_ratio: Some(XaiVideoAspectRatio::R16x9),
+                duration: Some(6),
+                generate_audio: Some(true),
+                image: None,
+                keyframes: vec![XaiVideoKeyframe {
+                    image: XaiVideoImageUrl {
+                        file_id: None,
+                        url: Some("data:image/png;base64,AA==".to_owned()),
+                    },
+                    timestamp_s: 2.0,
+                }],
+                last_frame: None,
+                model: Some("grok-imagine-video-1.5".to_owned()),
+                output: None,
+                prompt: Some("transition".to_owned()),
+                reference_audios: Vec::new(),
+                reference_images: Vec::new(),
+                resolution: Some(XaiVideoResolution::P480),
+                storage_options: None,
+                user: None,
+            },
+            vec![
+                XaiVideoAdmissionInput::new(
+                    "keyframe.png",
+                    InputBlobRef {
+                        key: InputBlobKey {
+                            admission_session_id: session_id,
+                            input_id: Uuid::new_v4(),
+                        },
+                        storage_backend: "test".to_owned(),
+                        object_key: "keyframe.png".to_owned(),
+                        sha256_hex: "b".repeat(64),
+                        byte_size: 1,
+                    },
+                    "image/png",
+                )
+                .expect("valid staged keyframe"),
+            ],
+        )
+        .expect("valid Grok V2 keyframe plan");
+
+        assert_eq!(
+            video_pricing_dimensions(&plan).expect("pricing dimensions"),
+            BTreeMap::from([
+                ("aspect_ratio".to_owned(), "16:9".to_owned()),
+                ("duration".to_owned(), "6".to_owned()),
+                ("input_image_count".to_owned(), "1".to_owned()),
+                ("resolution".to_owned(), "480p".to_owned()),
             ])
         );
     }

@@ -31,6 +31,8 @@ pub struct XaiVideoGenerationRequest {
     #[serde(default, alias = "input_reference")]
     pub image: Option<XaiVideoImageUrl>,
     #[serde(default)]
+    pub keyframes: Vec<XaiVideoKeyframe>,
+    #[serde(default)]
     pub last_frame: Option<XaiVideoImageUrl>,
     #[serde(default)]
     pub model: Option<String>,
@@ -87,6 +89,21 @@ pub struct XaiVideoImageUrl {
     #[serde(default, alias = "image_url")]
     pub url: Option<String>,
 }
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct XaiVideoKeyframe {
+    pub image: XaiVideoImageUrl,
+    pub timestamp_s: f64,
+}
+
+impl PartialEq for XaiVideoKeyframe {
+    fn eq(&self, other: &Self) -> bool {
+        self.image == other.image && self.timestamp_s.to_bits() == other.timestamp_s.to_bits()
+    }
+}
+
+impl Eq for XaiVideoKeyframe {}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -147,6 +164,8 @@ pub struct XaiVideoGenerationCommandV2 {
     pub duration: u8,
     pub generate_audio: bool,
     pub image: Option<XaiVideoImageUrl>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub keyframes: Vec<XaiVideoKeyframe>,
     pub last_frame: Option<XaiVideoImageUrl>,
     pub model: Option<String>,
     pub output: Option<XaiVideoOutput>,
@@ -165,6 +184,9 @@ impl XaiVideoGenerationCommandV1 {
         }
         if request.last_frame.is_some() {
             return Err(XaiVideoRequestError::UnsupportedLastFrame);
+        }
+        if !request.keyframes.is_empty() {
+            return Err(XaiVideoRequestError::UnsupportedKeyframes);
         }
         if !request.reference_audios.is_empty() {
             return Err(XaiVideoRequestError::UnsupportedReferenceAudios);
@@ -251,11 +273,22 @@ impl XaiVideoGenerationCommandV2 {
         if let Some(last_frame) = request.last_frame.as_ref() {
             validate_image(last_frame).map_err(|_| XaiVideoRequestError::InvalidLastFrame)?;
         }
+        if request.keyframes.len() > 4 {
+            return Err(XaiVideoRequestError::TooManyKeyframes);
+        }
         for image in &request.reference_images {
             validate_image(image).map_err(|_| XaiVideoRequestError::InvalidReferenceImage)?;
         }
         if request.reference_images.len() > 7 {
             return Err(XaiVideoRequestError::TooManyReferenceImages);
+        }
+        if usize::from(request.image.is_some())
+            + usize::from(request.last_frame.is_some())
+            + request.reference_images.len()
+            + request.keyframes.len()
+            > 9
+        {
+            return Err(XaiVideoRequestError::TooManyImageInputs);
         }
         for audio in &request.reference_audios {
             validate_audio(audio)?;
@@ -264,6 +297,7 @@ impl XaiVideoGenerationCommandV2 {
             return Err(XaiVideoRequestError::TooManyReferenceAudios);
         }
         let has_frame_or_reference = request.image.is_some()
+            || !request.keyframes.is_empty()
             || request.last_frame.is_some()
             || !request.reference_images.is_empty()
             || !request.reference_audios.is_empty();
@@ -274,6 +308,10 @@ impl XaiVideoGenerationCommandV2 {
         if !(MIN_DURATION_SECONDS..=MAX_DURATION_SECONDS).contains(&duration) {
             return Err(XaiVideoRequestError::InvalidDuration);
         }
+        for keyframe in &request.keyframes {
+            validate_image(&keyframe.image).map_err(|_| XaiVideoRequestError::InvalidKeyframe)?;
+        }
+        let keyframes = normalize_keyframes(request.keyframes, duration)?;
         if request
             .output
             .as_ref()
@@ -291,6 +329,7 @@ impl XaiVideoGenerationCommandV2 {
             duration,
             generate_audio: request.generate_audio.unwrap_or(true),
             image: request.image,
+            keyframes,
             last_frame: request.last_frame,
             model: request.model,
             output: request.output,
@@ -305,6 +344,7 @@ impl XaiVideoGenerationCommandV2 {
 
     pub fn workflow(&self) -> XaiVideoWorkflow {
         if self.last_frame.is_some()
+            || !self.keyframes.is_empty()
             || !self.reference_images.is_empty()
             || !self.reference_audios.is_empty()
         {
@@ -347,14 +387,22 @@ pub enum XaiVideoRequestError {
     UnsupportedGenerateAudio,
     #[error("xAI video last_frame is not supported by the v1 command")]
     UnsupportedLastFrame,
+    #[error("xAI video keyframes are not supported by the v1 command")]
+    UnsupportedKeyframes,
     #[error("xAI video reference_audios are not supported by the v1 command")]
     UnsupportedReferenceAudios,
     #[error("xAI video last_frame input is invalid")]
     InvalidLastFrame,
+    #[error("xAI video keyframe input is invalid")]
+    InvalidKeyframe,
+    #[error("xAI video keyframe count exceeds four")]
+    TooManyKeyframes,
     #[error("xAI video reference image input is invalid")]
     InvalidReferenceImage,
     #[error("xAI video reference image count exceeds seven")]
     TooManyReferenceImages,
+    #[error("xAI video image input count exceeds nine")]
+    TooManyImageInputs,
     #[error("xAI video reference audio is invalid")]
     InvalidReferenceAudio,
     #[error("xAI video reference audio count exceeds three")]
@@ -374,9 +422,13 @@ impl XaiVideoRequestError {
             Self::InvalidStorageOptions => "storage_options",
             Self::UnsupportedGenerateAudio => "generate_audio",
             Self::UnsupportedLastFrame | Self::InvalidLastFrame => "last_frame",
+            Self::UnsupportedKeyframes | Self::InvalidKeyframe | Self::TooManyKeyframes => {
+                "keyframes"
+            }
             Self::UnsupportedReferenceAudios => "reference_audios",
             Self::InvalidReferenceImage => "reference_images",
             Self::TooManyReferenceImages => "reference_images",
+            Self::TooManyImageInputs => "keyframes",
             Self::InvalidReferenceAudio | Self::TooManyReferenceAudios => "reference_audios",
         }
     }
@@ -475,6 +527,33 @@ fn validate_image(image: &XaiVideoImageUrl) -> Result<(), XaiVideoRequestError> 
     } else {
         Err(XaiVideoRequestError::InvalidImage)
     }
+}
+
+fn normalize_keyframes(
+    keyframes: Vec<XaiVideoKeyframe>,
+    duration: u8,
+) -> Result<Vec<XaiVideoKeyframe>, XaiVideoRequestError> {
+    let mut previous_tick = 0_i64;
+    let max_tick = i64::from(duration) * 3;
+    let mut normalized = Vec::with_capacity(keyframes.len());
+    for mut keyframe in keyframes {
+        let scaled = keyframe.timestamp_s * 3.0;
+        if !keyframe.timestamp_s.is_finite() || !scaled.is_finite() {
+            return Err(XaiVideoRequestError::InvalidKeyframe);
+        }
+        let tick = scaled.round();
+        if (scaled - tick).abs() > 1e-9
+            || tick < 1.0
+            || tick >= max_tick as f64
+            || tick as i64 <= previous_tick
+        {
+            return Err(XaiVideoRequestError::InvalidKeyframe);
+        }
+        previous_tick = tick as i64;
+        keyframe.timestamp_s = tick / 3.0;
+        normalized.push(keyframe);
+    }
+    Ok(normalized)
 }
 
 fn validate_audio(audio: &XaiVideoAudioReference) -> Result<(), XaiVideoRequestError> {
@@ -799,6 +878,7 @@ mod tests {
             duration: Some(8),
             generate_audio: None,
             image: None,
+            keyframes: Vec::new(),
             last_frame: None,
             model: Some("grok-imagine-video-1.5".to_owned()),
             output: None,
@@ -826,6 +906,7 @@ mod tests {
             duration: Some(6),
             generate_audio: None,
             image: None,
+            keyframes: Vec::new(),
             last_frame: None,
             model: Some("grok-imagine-video-1.5-preview".to_owned()),
             output: None,
@@ -861,6 +942,7 @@ mod tests {
             duration: None,
             generate_audio: None,
             image: command.image.clone(),
+            keyframes: Vec::new(),
             last_frame: None,
             model: command.model.clone(),
             output: None,
@@ -886,6 +968,7 @@ mod tests {
             duration: Some(6),
             generate_audio: None,
             image: Some(image.clone()),
+            keyframes: Vec::new(),
             last_frame: None,
             model: None,
             output: None,
@@ -909,6 +992,7 @@ mod tests {
             duration: Some(6),
             generate_audio: None,
             image: None,
+            keyframes: Vec::new(),
             last_frame: None,
             model: None,
             output: None,
@@ -922,6 +1006,149 @@ mod tests {
         assert_eq!(
             XaiVideoGenerationCommandV1::from_request(request),
             Err(XaiVideoRequestError::PromptRequired)
+        );
+    }
+
+    fn keyframe_request(keyframes: serde_json::Value) -> XaiVideoGenerationRequest {
+        serde_json::from_value(serde_json::json!({
+            "model": "grok-imagine-video-1.5",
+            "prompt": "camera move",
+            "duration": 6,
+            "keyframes": keyframes,
+        }))
+        .unwrap()
+    }
+
+    fn keyframe(timestamp_s: f64) -> serde_json::Value {
+        serde_json::json!({
+            "image": {"url": "https://example.com/keyframe.png"},
+            "timestamp_s": timestamp_s,
+        })
+    }
+
+    #[test]
+    fn v2_accepts_four_increasing_keyframes_on_the_third_second_grid() {
+        let command =
+            XaiVideoGenerationCommandV2::from_request(keyframe_request(serde_json::json!([
+                keyframe(1.0 / 3.0),
+                keyframe(2.0 / 3.0),
+                keyframe(1.0),
+                keyframe(5.0 + 2.0 / 3.0),
+            ])))
+            .unwrap();
+        assert_eq!(command.keyframes.len(), 4);
+        assert_eq!(command.workflow(), XaiVideoWorkflow::ReferenceToVideo);
+    }
+
+    #[test]
+    fn v2_accepts_empty_keyframes_for_backward_compatibility() {
+        let command =
+            XaiVideoGenerationCommandV2::from_request(keyframe_request(serde_json::json!([])))
+                .unwrap();
+        assert!(command.keyframes.is_empty());
+    }
+
+    #[test]
+    fn v2_canonicalizes_accepted_keyframe_wire_values_to_the_grid_tick() {
+        let exact =
+            XaiVideoGenerationCommandV2::from_request(keyframe_request(serde_json::json!([
+                keyframe(1.0 / 3.0)
+            ])))
+            .unwrap();
+        let within_float_tolerance =
+            XaiVideoGenerationCommandV2::from_request(keyframe_request(serde_json::json!([
+                keyframe(1.0 / 3.0 + 1e-12)
+            ])))
+            .unwrap();
+
+        assert_eq!(exact.keyframes[0].timestamp_s, 1.0 / 3.0);
+        assert_eq!(exact, within_float_tolerance);
+        assert_eq!(
+            exact.canonical_sha256_hex(),
+            within_float_tolerance.canonical_sha256_hex()
+        );
+    }
+
+    #[test]
+    fn v2_rejects_keyframe_at_endpoint() {
+        assert_eq!(
+            XaiVideoGenerationCommandV2::from_request(keyframe_request(serde_json::json!([
+                keyframe(0.0)
+            ]))),
+            Err(XaiVideoRequestError::InvalidKeyframe)
+        );
+        assert_eq!(
+            XaiVideoGenerationCommandV2::from_request(keyframe_request(serde_json::json!([
+                keyframe(6.0)
+            ]))),
+            Err(XaiVideoRequestError::InvalidKeyframe)
+        );
+    }
+
+    #[test]
+    fn v2_rejects_off_grid_duplicate_and_descending_keyframes() {
+        for timestamps in [vec![0.5], vec![1.0, 1.0], vec![2.0, 1.0]] {
+            let values = timestamps.into_iter().map(keyframe).collect::<Vec<_>>();
+            assert_eq!(
+                XaiVideoGenerationCommandV2::from_request(keyframe_request(
+                    serde_json::Value::Array(values),
+                )),
+                Err(XaiVideoRequestError::InvalidKeyframe)
+            );
+        }
+    }
+
+    #[test]
+    fn v2_rejects_more_than_four_keyframes() {
+        let values = (1..=5).map(|tick| keyframe(tick as f64 / 3.0)).collect();
+        assert_eq!(
+            XaiVideoGenerationCommandV2::from_request(keyframe_request(values)),
+            Err(XaiVideoRequestError::TooManyKeyframes)
+        );
+    }
+
+    #[test]
+    fn v2_rejects_ten_combined_image_inputs_without_changing_individual_limits() {
+        let mut request = keyframe_request(serde_json::json!([
+            keyframe(1.0),
+            keyframe(2.0),
+            keyframe(3.0),
+            keyframe(4.0),
+        ]));
+        request.image = Some(XaiVideoImageUrl {
+            file_id: None,
+            url: Some("https://example.com/first.png".to_owned()),
+        });
+        request.last_frame = Some(XaiVideoImageUrl {
+            file_id: None,
+            url: Some("https://example.com/last.png".to_owned()),
+        });
+        request.reference_images = (0..3)
+            .map(|index| XaiVideoImageUrl {
+                file_id: None,
+                url: Some(format!("https://example.com/reference-{index}.png")),
+            })
+            .collect();
+
+        assert!(XaiVideoGenerationCommandV2::from_request(request.clone()).is_ok());
+        request.reference_images.push(XaiVideoImageUrl {
+            file_id: None,
+            url: Some("https://example.com/reference-3.png".to_owned()),
+        });
+
+        assert_eq!(
+            XaiVideoGenerationCommandV2::from_request(request),
+            Err(XaiVideoRequestError::TooManyImageInputs)
+        );
+    }
+
+    #[test]
+    fn v1_rejects_keyframes_explicitly() {
+        assert_eq!(
+            XaiVideoGenerationCommandV1::from_request(keyframe_request(serde_json::json!([
+                keyframe(1.0)
+            ]))),
+            Err(XaiVideoRequestError::UnsupportedKeyframes)
         );
     }
 }

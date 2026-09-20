@@ -52,15 +52,21 @@ unrelated image model through `active_providers()`.
 | `POST /v1/images/edits` | synchronous image edit | `image_edit`; 1-3 source images; quality model; one `1k` image | keep inactive until the full official edit DTO, typed source hash, sealed input staging, and cleanup path are implemented |
 | `POST /v1/videos/generations` text-only | asynchronous | Grok CLI V2 agentic video; 6 or 10 seconds; `480p` or `720p`; generated audio required | support only when the V2 profile is explicitly selected; bill one admitted duration and expose a Factory job |
 | `POST /v1/videos/generations` with one image | asynchronous | Grok CLI V2 image-to-video; one base64/data-URL image or bounded public HTTPS image (no redirects or private targets); optional prompt; 6 or 10 seconds; `480p` or `720p`; no aspect-ratio override | support only through V2; the image is staged by digest and the CLI reconstructs the media request |
-| `POST /v1/videos/generations` with reference inputs | asynchronous | Grok CLI V2 reference-to-video; `last_frame` and reference images accept base64/data-URL or bounded public HTTPS (no redirects or private targets); up to 7 reference images, up to 3 voice IDs; 1-15 seconds; `480p` or `720p` | support only for CLI-expressible local inputs; reference-audio URLs and `file_id` are rejected |
+| `POST /v1/videos/generations` with reference inputs | asynchronous | Grok CLI V2 reference-to-video; `last_frame`, reference images, and keyframe images accept base64/data-URL or bounded public HTTPS (no redirects or private targets); up to 7 reference images, 4 mid-clip keyframes, and 3 voice IDs; 1-15 seconds; `480p` or `720p` | support only for CLI-expressible local inputs; `keyframes` is a documented Factory CLI extension; reference-audio URLs and `file_id` are rejected |
 | `POST /v1/videos/edits` | asynchronous | no CLI tool | reject |
 | `POST /v1/videos/extensions` | asynchronous | no CLI tool | reject |
 | `GET /v1/videos/{request_id}` | returns provider task progress and final URL | CLI hides the provider request ID and returns after polling | expose the factory job ID and factory state, not a fabricated xAI provider ID |
 
 The public DTO follows the xAI route shape, but the V2 CLI intersection is
 deliberately narrower: `generate_audio` must be omitted or `true` (explicit
-`false` is rejected), `last_frame` and `reference_images` are staged image
-inputs, `reference_audios` may contain only CLI-supported `voice_id` values (at
+`false` is rejected), `last_frame`, `reference_images`, and `keyframes` are staged image
+inputs. A keyframe is `{image, timestamp_s}`; at most four are accepted, timestamps
+must be strictly inside the clip, strictly increasing in request order, and exactly
+on the 1/3-second engine grid. The Factory rejects off-grid values instead of
+silently relying on upstream snapping. The existing immutable V2 pricing surface
+additionally caps the combined
+`image` + `last_frame` + `reference_images` + `keyframes` count at nine.
+`reference_audios` may contain only CLI-supported `voice_id` values (at
 most three; URL audio is not in the intersection), and `resolution` is only
 `480p` or `720p`. Text-to-video and image-to-video accept only 6 or 10 seconds;
 reference-to-video accepts 1-15 seconds. `file_id`, video edit, and video
@@ -69,6 +75,12 @@ extension are outside this binding. The official DTO also retains `output` and
 projection rejects those two fields with HTTP 400 before admission. A future
 provider-specific binding may classify them independently. Fields are never
 silently dropped or approximated.
+
+The CLI assigns `<IMAGE_i>` using the semantic upload order `first_frame`, then
+`reference_images`, then `keyframes`, then `last_frame`. Pinned first, keyframe,
+and last images do not need prompt tags because their timing is explicit. Factory
+manifest ordering is an internal integrity detail and must not be used to derive
+prompt indices.
 
 The CLI supports no `/v1/videos/edits` or `/v1/videos/extensions` operation.
 Those official xAI routes remain outside this binding and are not advertised by

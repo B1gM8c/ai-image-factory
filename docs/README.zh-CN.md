@@ -87,7 +87,11 @@ AI Image Factory 将 Codex、Grok、即梦（Dreamina）等 CLI 转为图片和�
   不会静默丢弃。
 - Grok CLI 视频当前支持 V2 文生视频、图生视频和参考输入视频的已验证子集：
   `generate_audio` 必须为默认值/`true`，`last_frame`、最多 7 张
-  `reference_images`、最多 3 个 `voice_id` 可按 CLI 形态使用；URL 音频、`file_id` 和
+  `reference_images`、最多 4 个 `keyframes`、最多 3 个 `voice_id` 可按 CLI 形态使用。
+  `keyframes` 是 Factory 的 CLI 扩展字段，每个时间点必须严格位于片段内部、按请求顺序递增，
+  并落在 1/3 秒网格上；首帧、尾帧、参考图和关键帧总数受现有不可变计价契约限制为 9。
+  CLI 的图片索引顺序为首帧、参考图、关键帧、尾帧，钉帧无需在提示词中
+  使用 `<IMAGE_i>`。URL 音频、`file_id` 和
   `generate_audio=false` 会在排队前拒绝。可执行分辨率只有 `480p`/`720p`；文生视频和图生视频
   只接受 6 或 10 秒，参考输入视频接受 1-15 秒。CLI 没有视频编辑或延长工具，因此不提供
   `/v1/videos/edits` 或 `/v1/videos/extensions`。

@@ -131,6 +131,7 @@ async fn xai_image_to_video_runs_through_the_real_durable_grok_supervisor() {
                     STANDARD.encode(&input_bytes)
                 )),
             }),
+            keyframes: Vec::new(),
             last_frame: None,
             model: Some("grok-imagine-video-1.5".to_owned()),
             output: None,
@@ -262,6 +263,7 @@ async fn xai_image_to_video_v2_runs_through_the_real_durable_grok_supervisor() {
                     STANDARD.encode(&input_bytes)
                 )),
             }),
+            keyframes: Vec::new(),
             last_frame: None,
             model: Some("grok-imagine-video-1.5".to_owned()),
             output: None,

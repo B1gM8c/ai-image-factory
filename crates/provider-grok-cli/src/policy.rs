@@ -592,9 +592,8 @@ fn expected_tool_calls_v2(
                 "resolution_name": request.resolution().as_str(),
             }),
         )],
-        GrokVideoGenerationRequestV2::ReferenceToVideo(request) => vec![(
-            GrokTool::ReferenceToVideo,
-            json!({
+        GrokVideoGenerationRequestV2::ReferenceToVideo(request) => {
+            let mut arguments = json!({
                 "prompt": request.prompt().unwrap_or(""),
                 "images": request
                     .reference_images()
@@ -607,8 +606,23 @@ fn expected_tool_calls_v2(
                 "aspect_ratio": request.aspect_ratio().as_str(),
                 "duration": request.duration().seconds(),
                 "resolution_name": request.resolution().as_str(),
-            }),
-        )],
+            });
+            if !request.keyframes().is_empty() {
+                arguments["keyframes"] = json!(
+                    request
+                        .keyframes()
+                        .iter()
+                        .map(|keyframe| {
+                            json!({
+                                "image": workspace.join(keyframe.image().filename()),
+                                "timestamp_s": keyframe.timestamp_s(),
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                );
+            }
+            vec![(GrokTool::ReferenceToVideo, arguments)]
+        }
     };
     calls
         .into_iter()

@@ -609,6 +609,7 @@ fn console_video_request(
                     file_id: None,
                     url: Some(url),
                 }),
+                keyframes: Vec::new(),
                 last_frame: None,
                 // Grok exposes reference-to-video through the stable video model binding.
                 model: Some(if mode == "reference_to_video" {

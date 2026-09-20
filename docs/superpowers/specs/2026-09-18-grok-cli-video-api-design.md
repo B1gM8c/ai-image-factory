@@ -15,7 +15,7 @@ Expose the existing asynchronous xAI-shaped endpoints:
 
 The public request and response vocabulary follows xAI's published video API. The executable subset is the intersection of that public contract and the media tools registered by the pinned Grok CLI 1.0.34 binary. Unsupported official fields fail before admission, billing reservation, queueing, or provider execution.
 
-This phase does not add `/v1/videos/edits`, `/v1/videos/extensions`, or a Factory-private video endpoint. It also does not expose Grok CLI-only `keyframes` or the CLI's higher reference-image count because those are not part of the public xAI generation contract we are implementing.
+This phase does not add `/v1/videos/edits`, `/v1/videos/extensions`, or a Factory-private video endpoint. The later bounded extension exposes Grok CLI-only `keyframes` on the same generation endpoint, explicitly labels them as a Factory extension, and retains the public reference-image limit rather than exposing the CLI's higher raw count.
 
 ## Evidence and authority
 
@@ -42,7 +42,7 @@ The capability guide is newer than the public OpenAPI snapshot for `last_frame` 
 | --- | --- | --- | --- |
 | Text to video | `prompt` | `image_gen` followed by `image_to_video` | 6 or 10 seconds; 480p or 720p; seven official ratios accepted by the CLI composition |
 | Image to video | `image`, optional `prompt` | one `image_to_video` CLI tool call | 6 or 10 seconds; 480p or 720p; input aspect ratio retained |
-| Reference to video | one or more of `reference_images`, `reference_audios`, `last_frame`; optional pinned first frame in `image` | one `reference_to_video` CLI tool call | 1 to 15 seconds; 480p or 720p; max 7 reference images; max 3 preset voices; seven official ratios |
+| Reference to video | one or more of `reference_images`, `reference_audios`, `last_frame`, or Factory-extension `keyframes`; optional pinned first frame in `image` | one `reference_to_video` CLI tool call | 1 to 15 seconds; 480p or 720p; max 7 reference images; max 4 mid-clip keyframes; max 3 preset voices; seven official ratios |
 | First and last frame | `image` plus `last_frame`, optional references and prompt | `reference_to_video` with `first_frame` and `last_frame` | same as reference to video |
 
 The API accepts xAI's `duration` and `seconds` alias. Default values remain official: duration 8 seconds, resolution 480p, and aspect ratio 16:9 when the selected mode uses an explicit ratio. A default must still be executable by the selected CLI tool. For example, an omitted duration on image-to-video defaults to 8 officially but is rejected by the 1.0.34 CLI binding because `image_to_video` supports only 6 or 10. The service never silently changes 8 to 6 or 10.
@@ -61,6 +61,7 @@ Extend the current `XaiVideoGenerationRequest` with only published generation fi
   "image": {"url": "https://example.invalid/first.png"},
   "last_frame": {"url": "https://example.invalid/last.png"},
   "reference_images": [{"url": "https://example.invalid/subject.png"}],
+  "keyframes": [{"image": {"url": "https://example.invalid/middle.png"}, "timestamp_s": 3.0}],
   "reference_audios": [{"voice_id": "eve"}]
 }
 ```
@@ -83,12 +84,14 @@ Classification is deterministic and independent of the executor:
 
 1. No frames or references: text-to-video; `prompt` is required.
 2. `image` only: image-to-video; `prompt` is optional.
-3. Any `last_frame`, `reference_images`, or `reference_audios`: reference-to-video; `image`, when present, is the pinned first frame; `prompt` is optional.
+3. Any `last_frame`, `reference_images`, `reference_audios`, or `keyframes`: reference-to-video; `image`, when present, is the pinned first frame; `prompt` is optional.
 
 Validation runs before remote image fetching and before durable side effects:
 
 - only `grok-imagine-video-1.5` and explicitly retained legacy aliases are accepted for newly admitted work;
-- at most 7 `reference_images` and at most 3 `reference_audios`;
+- at most 7 `reference_images`, at most 4 `keyframes`, and at most 3 `reference_audios`;
+- at most 9 combined first-frame, last-frame, reference-image, and keyframe image inputs under the existing immutable V2 pricing surface;
+- keyframe timestamps are strictly increasing, strictly inside the clip, and on the 1/3-second grid; off-grid values fail closed instead of being silently snapped;
 - each image specifies exactly one of `url` or `file_id`;
 - each audio specifies exactly one of `voice_id` or `url`, followed by the CLI-binding rejection of `url`;
 - voice IDs are trimmed, bounded, and compared case-insensitively while preserving the original value in the canonical command;
@@ -197,7 +200,7 @@ Every merge is a normal non-force merge from a current-main isolated worktree. O
 
 ## Explicit non-goals
 
-- Grok CLI `keyframes`.
+- More than four Grok CLI `keyframes`, silently snapped keyframe timestamps, or presenting `keyframes` as an official xAI REST field.
 - More than 7 reference images even though the CLI schema permits more.
 - Video edit or extension.
 - 1080p.
