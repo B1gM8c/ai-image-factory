@@ -2,7 +2,8 @@
 Description=Recover AI Image Factory update command %i
 Documentation=file:/usr/share/doc/ai-image-factory/github-release-deployment.md
 Wants=network-online.target
-After=network-online.target
+# Conflicts alone stops the daemon concurrently; wait for its host lock release.
+After=network-online.target ai-image-factory-updater.service
 Conflicts=ai-image-factory-updater.service
 OnFailure=ai-image-factory-recovery-failed.service
 RequiresMountsFor=/opt/ai-image-factory /var/lib/ai-image-factory

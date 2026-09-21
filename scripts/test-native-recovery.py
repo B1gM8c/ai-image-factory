@@ -666,7 +666,7 @@ def unit_evidence(recovery_command_id='00000000-0000-0000-0000-000000000001'):
         output = run(['systemctl', 'show', unit, '-p', 'ReadWritePaths', '-p', 'ProtectSystem',
                       '-p', 'NoNewPrivileges', '-p', 'PrivateTmp', '-p', 'DropInPaths',
                       '-p', 'BindPaths', '-p', 'BindReadOnlyPaths',
-                      '-p', 'FragmentPath', '-p', 'ExecStart']).stdout
+                      '-p', 'FragmentPath', '-p', 'ExecStart', '-p', 'After', '-p', 'Conflicts']).stdout
         fields = dict(line.split('=', 1) for line in output.splitlines() if '=' in line)
         require(set(fields['ReadWritePaths'].split()) == {str(ROOT), str(STATE)},
                 'effective recovery sandbox differs from exact parent-only contract')
@@ -675,6 +675,10 @@ def unit_evidence(recovery_command_id='00000000-0000-0000-0000-000000000001'):
                 'effective recovery hardening/drop-ins differ from repository units')
         require(fields['BindPaths'] == '' and fields['BindReadOnlyPaths'] == '',
                 'effective recovery unit contains an unexpected explicit bind mount')
+        if name.startswith('updater-recover@'):
+            require(PREFIX + 'updater.service' in fields['Conflicts'].split()
+                    and PREFIX + 'updater.service' in fields['After'].split(),
+                    'effective manual recovery must wait for the conflicting daemon to stop')
         evidence[unit] = fields
     return evidence
 
