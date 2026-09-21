@@ -17,6 +17,14 @@ SPEC.loader.exec_module(HARNESS_MODULE)
 
 
 class NativeRecoveryEvidenceTests(unittest.TestCase):
+    def test_enqueue_failure_reports_status_without_response_secrets(self):
+        with mock.patch.object(HARNESS_MODULE, 'http', return_value=(
+                409, b'{"secret":"must-not-be-exported"}', {})):
+            with self.assertRaisesRegex(RuntimeError, r'apply \(HTTP 409\)') as failure:
+                HARNESS_MODULE.enqueue('private-token', 'apply', 'v0.1.0-rehearsal.g0026914')
+        self.assertNotIn('private-token', str(failure.exception))
+        self.assertNotIn('must-not-be-exported', str(failure.exception))
+
     def test_early_apply_failure_keeps_original_and_recovery_causes(self):
         command_id = '6f4ec29d-a3d7-4e93-93f5-c54574ef06da'
         events = [

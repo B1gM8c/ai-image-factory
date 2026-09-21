@@ -2020,12 +2020,18 @@ async fn submit_service_claims_projects_and_attaches_fresh_work() -> TestResult 
             Some(25),
         )));
         let journal = tempfile::tempdir().map_err(debug_error)?;
+        // This checks successful attachment, not expiry. Leave room for journal
+        // fsync and database round trips on a loaded CI runner; short budgets
+        // belong to the separate deadline and heartbeat tests.
+        let mut config = submit_service_config(30_000);
+        config.executor_lease_ms = 30_000;
+        config.recovery_lease_ms = 30_000;
         let service = ProviderSubmitService::new(
             executor_store,
             PostgresProviderTaskStore::new(database.pool.clone()),
             provider.clone(),
             TestSubmitProjector::default(),
-            submit_service_config(200),
+            config,
             journal.path().join("remote-submit"),
         )
         .map_err(debug_error)?;
@@ -2035,9 +2041,15 @@ async fn submit_service_claims_projects_and_attaches_fresh_work() -> TestResult 
         let task_state: String =
             sqlx::query_scalar("SELECT state FROM provider_remote_tasks WHERE submission_id = $1")
                 .bind(submission.submission_id)
-                .fetch_one(&database.pool)
+                .fetch_optional(&database.pool)
                 .await
-                .map_err(debug_error)?;
+                .map_err(debug_error)?
+                .ok_or_else(|| {
+                    format!(
+                        "fresh submit produced no remote task: run={run:?}, provider_calls={:?}",
+                        provider.calls(),
+                    )
+                })?;
         let owner: String = sqlx::query_scalar(
             "SELECT submit_owner FROM provider_remote_submit_intents WHERE submission_id = $1",
         )
