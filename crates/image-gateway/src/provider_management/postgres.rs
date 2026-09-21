@@ -4268,7 +4268,6 @@ async fn validated_route_model_mappings(
     };
 
     let mut public_ids = HashSet::new();
-    let mut execution_targets = HashSet::new();
     let mut validated = Vec::with_capacity(candidates.len());
     for (api_profile, public_model_id, provider_model_id, media_kind) in candidates {
         let execution_provider_model_id = provider_model_id;
@@ -4286,10 +4285,6 @@ async fn validated_route_model_mappings(
             || !supported_api_profile(provider_id, operation_id, &api_profile)
             || !valid_public_model_id(&public_model_id)
             || !public_ids.insert((api_profile.clone(), public_model_id.clone()))
-            || !execution_targets.insert((
-                api_profile.clone(),
-                execution_model.execution_model_id.clone(),
-            ))
         {
             return Err(invalid_route_models());
         }

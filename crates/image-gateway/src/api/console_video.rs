@@ -386,7 +386,7 @@ fn console_video_model(model: PublicModelRoute) -> Option<ConsoleVideoModel> {
     let controls = console_video_controls(&model.api_profile, model.provider_model_id.as_deref())?;
     let modes = console_video_modes(&model.api_profile, model.provider_model_id.as_deref())?;
     let max_prompt_chars = (model.api_profile == XAI_VIDEOS_API_PROFILE
-        && model.provider_model_id.as_deref() == Some("grok-imagine-video-1.5-preview"))
+        && is_grok_video_15(model.provider_model_id.as_deref()))
     .then_some(GROK_VIDEO_MAX_PROMPT_CHARS);
     Some(ConsoleVideoModel {
         id: model.id,
@@ -401,13 +401,18 @@ fn console_video_model(model: PublicModelRoute) -> Option<ConsoleVideoModel> {
     })
 }
 
+fn is_grok_video_15(provider_model_id: Option<&str>) -> bool {
+    matches!(
+        provider_model_id,
+        Some("grok-imagine-video-1.5" | "grok-imagine-video-1.5-preview")
+    )
+}
+
 fn console_video_modes(
     api_profile: &str,
     provider_model_id: Option<&str>,
 ) -> Option<&'static [&'static str]> {
-    if api_profile == XAI_VIDEOS_API_PROFILE
-        && provider_model_id == Some("grok-imagine-video-1.5-preview")
-    {
+    if api_profile == XAI_VIDEOS_API_PROFILE && is_grok_video_15(provider_model_id) {
         return Some(&["text_to_video", "image_to_video", "reference_to_video"]);
     }
     matches!(
@@ -424,7 +429,7 @@ fn console_video_controls(
     const DREAMINA_RATIOS: &[&str] = &["1:1", "3:4", "16:9", "4:3", "9:16", "21:9"];
     const DREAMINA_DURATIONS: &[u8] = &[4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
     if api_profile == XAI_VIDEOS_API_PROFILE {
-        if provider_model_id != Some("grok-imagine-video-1.5-preview") {
+        if !is_grok_video_15(provider_model_id) {
             return None;
         }
         return Some(ConsoleVideoControls {
@@ -684,11 +689,15 @@ fn console_video_request(
                 keyframes: Vec::new(),
                 last_frame: None,
                 // Grok exposes reference-to-video through the stable video model binding.
-                model: Some(if mode == "reference_to_video" {
-                    GROK_REFERENCE_VIDEO_MODEL.to_owned()
-                } else {
-                    resolved.provider_model_id.clone()
-                }),
+                model: Some(
+                    if mode == "reference_to_video"
+                        && resolved.provider_model_id == "grok-imagine-video-1.5-preview"
+                    {
+                        GROK_REFERENCE_VIDEO_MODEL.to_owned()
+                    } else {
+                        resolved.provider_model_id.clone()
+                    },
+                ),
                 output: None,
                 prompt: Some(prompt),
                 reference_audios: Vec::new(),
@@ -1052,6 +1061,45 @@ mod tests {
             other_value["controls"]["generate_audio"]["supported"],
             false
         );
+    }
+
+    #[test]
+    fn grok_v2_canonical_provider_is_visible_under_both_public_names() {
+        for public_id in ["grok-imagine-video-1.5", "grok-imagine-video-1.5-preview"] {
+            let mut model =
+                public_model(public_id, XAI_VIDEOS_API_PROFILE, "grok-imagine-video-1.5");
+            model.provider_id = "grok-cli".to_owned();
+            let value = serde_json::to_value(console_video_model(model).unwrap()).unwrap();
+            assert_eq!(value["id"], public_id);
+            assert_eq!(value["max_prompt_chars"], GROK_VIDEO_MAX_PROMPT_CHARS);
+            assert_eq!(
+                value["modes"],
+                json!(["text_to_video", "image_to_video", "reference_to_video"])
+            );
+            assert_eq!(value["controls"]["voices"]["supported"], true);
+        }
+        assert!(console_video_controls(XAI_VIDEOS_API_PROFILE, Some("unknown-model")).is_none());
+    }
+
+    #[test]
+    fn grok_v2_console_preserves_canonical_execution_model_for_all_modes() {
+        let mut resolved = resolved_route(XAI_VIDEOS_API_PROFILE);
+        resolved.provider_model_id = "grok-imagine-video-1.5".to_owned();
+        resolved.execution_model_id = resolved.provider_model_id.clone();
+        resolved.command_schema = "grok-cli.videos.generate.v2".to_owned();
+        for mode in ["text", "image", "reference"] {
+            let mut request = grok_reference_request(if mode == "reference" { 2 } else { 0 });
+            if mode == "image" {
+                request.image = Some("data:image/png;base64,AA==".to_owned());
+                request.aspect_ratio = None;
+            }
+            let ConsoleVideoDispatchRequest::Xai(projected) =
+                console_video_request(request, &resolved).unwrap()
+            else {
+                panic!("expected xAI dispatch");
+            };
+            assert_eq!(projected.model.as_deref(), Some("grok-imagine-video-1.5"));
+        }
     }
 
     #[test]

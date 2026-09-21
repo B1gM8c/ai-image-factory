@@ -1178,7 +1178,8 @@ const REQUIRED_COLUMNS: [(&str, &str); 967] = [
     ("operator_terminal_reduction_requeues", "requeued_at_ms"),
 ];
 
-const REQUIRED_INDEXES: [&str; 152] = [
+const REQUIRED_INDEXES: [&str; 153] = [
+    "provider_route_model_mappings_execution_idx",
     "usage_events_tenant_created_at_ms_idx",
     "gateway_api_keys_project_id_idx",
     "quota_reservations_active_tenant_idx",
@@ -1358,7 +1359,7 @@ async fn concurrent_fresh_migrations_are_repeatable() -> TestResult {
 }
 
 #[tokio::test]
-async fn schema_128_upgrades_to_133_without_changing_existing_provider_rows() -> TestResult {
+async fn schema_128_upgrades_to_134_without_changing_existing_provider_rows() -> TestResult {
     let Some(test_schema) = TestSchema::new(2).await? else {
         return Ok(());
     };
@@ -1382,18 +1383,144 @@ async fn schema_128_upgrades_to_133_without_changing_existing_provider_rows() ->
             "SELECT COALESCE(jsonb_agg(to_jsonb(account) ORDER BY provider_account_id), '[]'::jsonb) FROM provider_accounts account",
         ).fetch_one(&test_schema.pool).await.map_err(|error| error.to_string())?;
         require(before.as_array().is_some_and(|rows| rows.len() == 1), "fixture must contain an existing account")?;
-        gateway_result(run_migrations(&test_schema.pool).await, "128-to-133 migration")?;
-        gateway_result(verify_migrations(&test_schema.pool).await, "133 verification")?;
+        gateway_result(run_migrations(&test_schema.pool).await, "128-to-134 migration")?;
+        gateway_result(verify_migrations(&test_schema.pool).await, "134 verification")?;
         let after: serde_json::Value = sqlx::query_scalar(
             "SELECT COALESCE(jsonb_agg(to_jsonb(account) ORDER BY provider_account_id), '[]'::jsonb) FROM provider_accounts account",
         ).fetch_one(&test_schema.pool).await.map_err(|error| error.to_string())?;
         require(before == after, "sidecar migrations changed existing provider accounts")?;
-        require(migration_versions(&test_schema.pool).await?.last() == Some(&133), "upgrade must end at 133")?;
+        require(migration_versions(&test_schema.pool).await?.last() == Some(&134), "upgrade must end at 134")?;
         let new_rows: i64 = sqlx::query_scalar(
             "SELECT (SELECT COUNT(*) FROM media_segment_assets) + (SELECT COUNT(*) FROM media_segment_results) + (SELECT COUNT(*) FROM media_segment_worker_heartbeats) + (SELECT COUNT(*) FROM provider_account_quota_refreshes)",
         ).fetch_one(&test_schema.pool).await.map_err(|error| error.to_string())?;
         require(new_rows == 0, "migration must not enqueue analysis or quota observations")?;
         gateway_result(run_migrations(&test_schema.pool).await, "repeat migration")
+    }.await;
+    test_schema.cleanup().await?;
+    result
+}
+
+#[tokio::test]
+async fn grok_v2_alias_upgrade_preserves_history_and_advances_bindings() -> TestResult {
+    let Some(test_schema) = TestSchema::new(2).await? else {
+        return Ok(());
+    };
+    let result = async {
+        apply_migrations_through(&test_schema.pool, 133).await?;
+        sqlx::raw_sql(
+            r#"
+            INSERT INTO provider_models (
+                provider_id, model_id, execution_model_id, media_kind, display_name,
+                adapter_state, lifecycle_state, operation_ids, source_kind,
+                first_seen_at_ms, last_seen_at_ms, metadata_json
+            ) VALUES ('grok-cli', 'grok-imagine-video-1.5', 'grok-imagine-video-1.5',
+                'video', 'Grok 1.5', 'supported', 'enabled', ARRAY['videos.generations'],
+                'adapter_contract', 1, 1, '{}') ON CONFLICT DO NOTHING;
+            INSERT INTO provider_routes (
+                route_id, revision, route_key, display_name, provider_id, operation_id,
+                command_schema, route_kind, selection_strategy, state, created_at_ms
+            ) VALUES
+                ('00000000-0000-0000-0000-000000000001', 3, 'preview', 'Preview', 'grok-cli',
+                 'videos.generations', 'grok-cli.videos.generate.v2', 'account',
+                 'quota_aware_least_loaded', 'enabled', 1),
+                ('00000000-0000-0000-0000-000000000002', 3, 'canonical', 'Canonical', 'grok-cli',
+                 'videos.generations', 'grok-cli.videos.generate.v2', 'account',
+                 'quota_aware_least_loaded', 'disabled', 1),
+                ('00000000-0000-0000-0000-000000000003', 3, 'legacy', 'Legacy', 'grok-cli',
+                 'videos.generations', 'grok-cli.videos.generate.v1', 'account',
+                 'quota_aware_least_loaded', 'enabled', 1);
+            INSERT INTO provider_route_heads (
+                route_id, route_key, provider_id, operation_id, command_schema,
+                route_kind, current_revision, state, created_at_ms, updated_at_ms
+            ) SELECT route_id, route_key, provider_id, operation_id, command_schema,
+                route_kind, revision, state, 1, 1 FROM provider_routes;
+            INSERT INTO provider_credential_pools (credential_pool_id, pool_key, provider_id, state, created_at_ms, updated_at_ms)
+                VALUES ('00000000-0000-0000-0000-000000000004', 'alias-pool', 'grok-cli', 'enabled', 1, 1);
+            INSERT INTO provider_accounts (provider_account_id, credential_pool_id, provider_id, account_key,
+                credential_ref, credential_revision, credential_auth_sha256, state, created_at_ms, updated_at_ms)
+                VALUES ('00000000-0000-0000-0000-000000000005', '00000000-0000-0000-0000-000000000004',
+                    'grok-cli', 'alias-account', 'fixture-ref', 1, repeat('a', 64), 'enabled', 1, 1);
+            INSERT INTO executor_resource_policies (resource_policy_id, revision, credential_pool_id,
+                provider_account_id, provider_id, execution_class, max_concurrency, state, created_at_ms)
+                VALUES ('00000000-0000-0000-0000-000000000006', 1, '00000000-0000-0000-0000-000000000004',
+                    '00000000-0000-0000-0000-000000000005', 'grok-cli', 'video', 1, 'enabled', 1);
+            INSERT INTO provider_execution_profiles (execution_profile_id, profile_key, provider_id,
+                command_schema, adapter_revision, credential_pool_id, provider_account_id, credential_ref,
+                credential_revision, resource_policy_id, resource_policy_revision, state, created_at_ms,
+                updated_at_ms, operation_id, operation_descriptor_revision, operation_descriptor_sha256_v1,
+                completion_mode, idempotency_mode)
+                VALUES ('00000000-0000-0000-0000-000000000007', 'alias-profile', 'grok-cli',
+                    'grok-cli.videos.generate.v2', 'fixture-v2', '00000000-0000-0000-0000-000000000004',
+                    '00000000-0000-0000-0000-000000000005', 'fixture-ref', 1,
+                    '00000000-0000-0000-0000-000000000006', 1, 'enabled', 1, 1,
+                    'videos.generations', 'fixture-v2', repeat('b', 64), 'inline', 'submission_bound');
+            INSERT INTO provider_route_members (route_id, route_revision, provider_id, operation_id,
+                command_schema, provider_account_id, execution_profile_id, priority, weight, state,
+                created_at_ms, minimum_remaining_percent)
+                SELECT route_id, revision, provider_id, operation_id, command_schema,
+                    '00000000-0000-0000-0000-000000000005', '00000000-0000-0000-0000-000000000007',
+                    7, 250, 'enabled', 1, 15 FROM provider_routes WHERE route_key = 'preview';
+            INSERT INTO provider_route_model_mappings (
+                route_id, route_revision, provider_id, operation_id, command_schema,
+                api_profile, public_model_id, provider_model_id, execution_model_id,
+                media_kind, created_at_ms
+            ) SELECT route_id, revision, provider_id, operation_id, command_schema,
+                'xai-videos-v1', CASE WHEN route_key = 'canonical' THEN 'grok-imagine-video-1.5'
+                    ELSE 'grok-imagine-video-1.5-preview' END,
+                'grok-imagine-video-1.5', 'grok-imagine-video-1.5', 'video', 1
+                FROM provider_routes;
+            INSERT INTO gateway_platform_provider_routes (
+                provider_id, operation_id, command_schema, route_id, route_revision,
+                state, created_at_ms, updated_at_ms
+            ) SELECT provider_id, operation_id, command_schema, route_id, revision, state, 1, 1
+                FROM provider_routes WHERE route_key = 'preview';
+            INSERT INTO gateway_project_provider_routes (
+                project_id, provider_id, operation_id, command_schema, route_id, route_revision,
+                state, created_at_ms, updated_at_ms
+            ) SELECT 'proj_default', provider_id, operation_id, command_schema, route_id, revision,
+                state, 1, 1 FROM provider_routes WHERE route_key = 'preview';
+            INSERT INTO gateway_service_accounts (id, project_id, tenant_id, name, role, created_at)
+                VALUES ('alias-sa', 'proj_default', 'tenant_default', 'Alias fixture', 'owner', 1);
+            INSERT INTO gateway_api_keys (
+                id, project_id, tenant_id, service_account_id, name, key_hash, redacted_value, created_at
+            ) VALUES ('alias-key', 'proj_default', 'tenant_default', 'alias-sa', 'Alias fixture',
+                repeat('a', 64), 'fixture', 1);
+            INSERT INTO gateway_api_key_provider_routes (
+                api_key_id, service_account_id, project_id, tenant_id, provider_id, operation_id,
+                command_schema, route_id, route_revision, bound_at_ms
+            ) SELECT 'alias-key', 'alias-sa', 'proj_default', 'tenant_default', provider_id,
+                operation_id, command_schema, route_id, revision, 1
+                FROM provider_routes WHERE route_key = 'preview';
+            "#,
+        ).execute(&test_schema.pool).await.map_err(|error| format!("alias fixture: {error}"))?;
+        let before: serde_json::Value = sqlx::query_scalar(
+            "SELECT jsonb_agg(to_jsonb(m) ORDER BY route_id) FROM provider_route_model_mappings m",
+        ).fetch_one(&test_schema.pool).await.map_err(|error| error.to_string())?;
+        apply_migration_range(&test_schema.pool, 134, 134).await?;
+        let after: serde_json::Value = sqlx::query_scalar(
+            "SELECT jsonb_agg(to_jsonb(m) ORDER BY route_id) FROM provider_route_model_mappings m WHERE route_revision = 3",
+        ).fetch_one(&test_schema.pool).await.map_err(|error| error.to_string())?;
+        require(before == after, "historical mappings must not change")?;
+        let members_preserved: bool = sqlx::query_scalar(
+            "SELECT (to_jsonb(old) - 'route_revision' - 'created_at_ms') = (to_jsonb(new) - 'route_revision' - 'created_at_ms') FROM provider_route_members old JOIN provider_route_members new USING (route_id, execution_profile_id) WHERE old.route_revision = 3 AND new.route_revision = 4",
+        ).fetch_one(&test_schema.pool).await.map_err(|error| error.to_string())?;
+        require(members_preserved, "member profile, state, weights and quota policy must survive")?;
+        let aliases: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM provider_route_model_mappings WHERE route_revision = 4 AND provider_model_id = 'grok-imagine-video-1.5' AND execution_model_id = 'grok-imagine-video-1.5' AND public_model_id IN ('grok-imagine-video-1.5', 'grok-imagine-video-1.5-preview')",
+        ).fetch_one(&test_schema.pool).await.map_err(|error| error.to_string())?;
+        require(aliases == 4, "both V2 routes must have both public names with canonical execution")?;
+        let revisions: Vec<(String, i64, String)> = sqlx::query_as(
+            "SELECT route_key, current_revision, state FROM provider_route_heads ORDER BY route_key",
+        ).fetch_all(&test_schema.pool).await.map_err(|error| error.to_string())?;
+        require(revisions == vec![("canonical".into(), 4, "disabled".into()), ("legacy".into(), 3, "enabled".into()), ("preview".into(), 4, "enabled".into())], "only V2 heads must advance, without enabling disabled routes")?;
+        let stale: i64 = sqlx::query_scalar(
+            "SELECT (SELECT count(*) FROM gateway_api_key_provider_routes WHERE route_revision <> 4) + (SELECT count(*) FROM gateway_project_provider_routes WHERE route_revision <> 4) + (SELECT count(*) FROM gateway_platform_provider_routes WHERE route_revision <> 4)",
+        ).fetch_one(&test_schema.pool).await.map_err(|error| error.to_string())?;
+        require(stale == 0, "all three binding kinds must advance")?;
+        apply_migration_range(&test_schema.pool, 134, 134).await?;
+        let routes: i64 = sqlx::query_scalar("SELECT count(*) FROM provider_routes")
+            .fetch_one(&test_schema.pool).await.map_err(|error| error.to_string())?;
+        require(routes == 5, "repeat migration must not create further revisions")
     }.await;
     test_schema.cleanup().await?;
     result
@@ -3543,8 +3670,8 @@ async fn shared_pool_case(pool: &PgPool) -> TestResult {
 
 async fn assert_expected_schema(pool: &PgPool) -> TestResult {
     require(
-        migration_versions(pool).await? == (0_i64..=133_i64).collect::<Vec<_>>(),
-        "applied migration versions must be exactly 0 through 133",
+        migration_versions(pool).await? == (0_i64..=134_i64).collect::<Vec<_>>(),
+        "applied migration versions must be exactly 0 through 134",
     )?;
 
     let default_codex_prices: Vec<(String, i64, i64)> = sqlx::query_as(

@@ -332,6 +332,9 @@ impl ModelRoutingStore for PostgresModelRoutingStore {
                     )
                   )
               )
+            ORDER BY (mapping.public_model_id = mapping.provider_model_id) DESC,
+                     mapping.public_model_id
+            LIMIT 1
             "#,
         )
         .bind(api_key_id)
@@ -741,7 +744,9 @@ impl ModelRoutingStore for PostgresModelRoutingStore {
                   )
               )
             ORDER BY CASE route.route_kind WHEN 'group' THEN 0 ELSE 1 END,
-                     route.route_key
+                     route.route_key,
+                     (mapping.public_model_id = mapping.provider_model_id) DESC,
+                     mapping.public_model_id
             "#,
         )
         .bind(project_id)
@@ -918,8 +923,7 @@ fn select_console_route(
         return Ok(None);
     };
     let ambiguous = rows.iter().skip(1).any(|row| {
-        row.public_model_id != first.public_model_id
-            || row.api_profile != first.api_profile
+        row.api_profile != first.api_profile
             || row.provider_id != first.provider_id
             || row.operation_id != first.operation_id
             || row.command_schema != first.command_schema
@@ -948,4 +952,107 @@ fn select_console_route(
 
 fn store_unavailable(_: sqlx::Error) -> ImageGatewayError {
     ImageGatewayError::service_unavailable("model routing is unavailable")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(
+        public_model_id: &str,
+        provider_id: &str,
+        command_schema: &str,
+        provider_model_id: &str,
+        execution_model_id: &str,
+    ) -> ConsoleModelRouteRow {
+        ConsoleModelRouteRow {
+            public_model_id: public_model_id.to_owned(),
+            api_profile: "xai-videos-v1".to_owned(),
+            provider_id: provider_id.to_owned(),
+            operation_id: "videos.generations".to_owned(),
+            command_schema: command_schema.to_owned(),
+            provider_model_id: provider_model_id.to_owned(),
+            execution_model_id: execution_model_id.to_owned(),
+            media_kind: "video".to_owned(),
+            route_id: Uuid::nil(),
+            route_revision: 1,
+            created_at_ms: 0,
+        }
+    }
+
+    #[test]
+    fn console_route_accepts_aliases_for_one_execution_and_prefers_canonical_row() {
+        let route = select_console_route(vec![
+            row(
+                "grok-imagine-video-1.5",
+                "grok-cli",
+                "grok-cli.videos.generate.v2",
+                "grok-imagine-video-1.5",
+                "grok-imagine-video-1.5",
+            ),
+            row(
+                "grok-imagine-video-1.5-preview",
+                "grok-cli",
+                "grok-cli.videos.generate.v2",
+                "grok-imagine-video-1.5",
+                "grok-imagine-video-1.5",
+            ),
+        ])
+        .expect("same execution aliases are not ambiguous")
+        .expect("route exists");
+
+        assert_eq!(route.public_model_id, "grok-imagine-video-1.5");
+        assert_eq!(route.provider_model_id, "grok-imagine-video-1.5");
+        assert_eq!(route.execution_model_id, "grok-imagine-video-1.5");
+    }
+
+    #[test]
+    fn console_route_rejects_cross_identity_aliases() {
+        let cases = [
+            (
+                row(
+                    "grok-imagine-video-1.5-preview",
+                    "other-provider",
+                    "grok-cli.videos.generate.v2",
+                    "grok-imagine-video-1.5",
+                    "grok-imagine-video-1.5",
+                ),
+                "provider",
+            ),
+            (
+                row(
+                    "grok-imagine-video-1.5-preview",
+                    "grok-cli",
+                    "other-schema",
+                    "grok-imagine-video-1.5",
+                    "grok-imagine-video-1.5",
+                ),
+                "schema",
+            ),
+            (
+                row(
+                    "grok-imagine-video-1.5-preview",
+                    "grok-cli",
+                    "grok-cli.videos.generate.v2",
+                    "other-provider-model",
+                    "other-execution-model",
+                ),
+                "execution",
+            ),
+        ];
+
+        for (conflicting, identity) in cases {
+            let result = select_console_route(vec![
+                row(
+                    "grok-imagine-video-1.5",
+                    "grok-cli",
+                    "grok-cli.videos.generate.v2",
+                    "grok-imagine-video-1.5",
+                    "grok-imagine-video-1.5",
+                ),
+                conflicting,
+            ]);
+            assert!(result.is_err(), "cross-{identity} alias must fail closed");
+        }
+    }
 }

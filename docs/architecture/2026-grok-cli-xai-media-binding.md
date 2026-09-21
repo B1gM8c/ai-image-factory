@@ -82,6 +82,17 @@ the 1/3-second grid, and up to three preset-only voices. It also reports that
 `generate_audio` currently allows only `true`; other console providers report
 these controls as unsupported. Consumers must ignore unknown catalog fields.
 
+Migration 0134 preserves both public names on existing canonical V2 routes:
+`grok-imagine-video-1.5` and `grok-imagine-video-1.5-preview`. Both execute and
+price against `grok-imagine-video-1.5`; this does not rename the CLI model or
+claim that Factory aliases are official xAI model IDs. Public names stay unique
+per route revision/API profile, but may share an execution target. Explicit
+requests retain their public name for policy and pricing checks. Default
+resolution prefers the public name matching the provider model, then lexical
+order; conflicting execution identities still fail closed. The execution lookup
+index is retained. New routes still use the existing default alias policy;
+0134 repairs existing routes without changing unrelated mappings or credentials.
+
 The CLI assigns `<IMAGE_i>` using the semantic upload order `first_frame`, then
 `reference_images`, then `keyframes`, then `last_frame`. Pinned first, keyframe,
 and last images do not need prompt tags because their timing is explicit. Factory

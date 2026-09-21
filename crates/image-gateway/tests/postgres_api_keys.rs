@@ -2307,7 +2307,7 @@ async fn account_control_shrinks_drains_and_rejects_stale_edits() -> TestResult 
 }
 
 #[tokio::test]
-async fn route_update_publishes_an_immutable_revision_and_rejects_stale_edits() -> TestResult {
+async fn route_update_preserves_aliases_and_rejects_stale_edits() -> TestResult {
     let Some(database) = TestDatabase::new().await? else {
         return Ok(());
     };
@@ -2322,6 +2322,10 @@ async fn route_update_publishes_an_immutable_revision_and_rejects_stale_edits() 
             "allow",
         )
         .await?;
+        sqlx::query(
+            "INSERT INTO provider_route_model_mappings (route_id, route_revision, provider_id, operation_id, command_schema, api_profile, public_model_id, provider_model_id, execution_model_id, media_kind, created_at_ms) SELECT route_id, route_revision, provider_id, operation_id, command_schema, api_profile, 'compat-image-alias', provider_model_id, execution_model_id, media_kind, created_at_ms FROM provider_route_model_mappings WHERE route_id = $1 AND route_revision = 1",
+        ).bind(route_id).execute(&database.setup_pool).await
+            .map_err(|error| format!("failed to add compatibility alias: {error}"))?;
         let account_ids: Vec<Uuid> = sqlx::query_scalar(
             "SELECT provider_account_id FROM provider_route_members WHERE route_id = $1 AND route_revision = 1 ORDER BY provider_account_id",
         )
@@ -2379,6 +2383,41 @@ async fn route_update_publishes_an_immutable_revision_and_rejects_stale_edits() 
             head_revision == 2 && revision_count == 2,
             "route head or immutable revision history is incomplete".to_string(),
         )?;
+        let alias_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM provider_route_model_mappings WHERE route_id = $1 AND route_revision = 2",
+        ).bind(route_id).fetch_one(&database.setup_pool).await.map_err(|error| error.to_string())?;
+        require(alias_count == 2, "route update did not inherit both public aliases".to_string())?;
+        let project_id = format!("proj_{}", Uuid::new_v4().simple());
+        insert_project(&database.setup_pool, &project_id).await?;
+        sqlx::query(
+            "INSERT INTO gateway_project_provider_routes (project_id, provider_id, operation_id, command_schema, route_id, route_revision, state, created_at_ms, updated_at_ms) SELECT $1, provider_id, operation_id, command_schema, route_id, revision, state, 1, 1 FROM provider_routes WHERE route_id = $2 AND revision = 2",
+        ).bind(&project_id).bind(route_id).execute(&database.setup_pool).await.map_err(|error| error.to_string())?;
+        let keys = PostgresApiKeyStore::new(database.pool("alias_keys").await?, test_keyring());
+        let created = keys.create_service_account_with_route(
+            &project_id, "Aliases", route_id, ApiKeyPermissionMode::All, ApiKeyPermissions::default(),
+        ).await.map_err(|error| format!("alias key: {error:?}"))?;
+        let authz_version: i64 = sqlx::query_scalar("SELECT authz_version FROM gateway_api_keys WHERE id = $1")
+            .bind(&created.api_key.id).fetch_one(&database.setup_pool).await.map_err(|error| error.to_string())?;
+        let routing = PostgresModelRoutingStore::new(database.pool("alias_routing").await?);
+        for requested in [None, Some("gpt-image-2"), Some("compat-image-alias")] {
+            let expected = requested.unwrap_or("gpt-image-2");
+            let api = routing.resolve_api_key_model(
+                &project_id, &created.api_key.id, authz_version, "openai-codex", "images.generations",
+                "openai-images-v1", requested, "gpt-image-2",
+            ).await.map_err(|error| format!("alias API resolution: {error:?}"))?
+                .ok_or_else(|| "missing alias API route".to_owned())?;
+            let console = routing.resolve_console_model(
+                &project_id, "openai-codex", "images.generations", "openai-images-v1", requested, "gpt-image-2",
+            ).await.map_err(|error| format!("alias console resolution: {error:?}"))?
+                .ok_or_else(|| "missing alias console route".to_owned())?;
+            require(api.public_model_id == expected && console.public_model_id == expected
+                && api.execution_model_id == "gpt-image-2" && console.execution_model_id == "gpt-image-2",
+                format!("alias resolution changed public identity or default: {api:?}, {console:?}"))?;
+        }
+        require(sqlx::query(
+            "INSERT INTO provider_route_model_mappings SELECT * FROM provider_route_model_mappings WHERE route_id = $1 AND route_revision = 2",
+        ).bind(route_id).execute(&database.setup_pool).await.is_err(),
+            "duplicate public names must remain rejected".to_owned())?;
         let stale = service
             .update_route(route_id, request)
             .await
