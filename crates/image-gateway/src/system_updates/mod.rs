@@ -922,6 +922,28 @@ mod tests {
     }
 
     #[test]
+    fn rehearsal_sha_segment_is_always_nonnumeric() {
+        let baseline = "v0.1.0-20260824.40c7432";
+        assert!(!release_version_is_newer(
+            "v0.1.0-rehearsal.0026914",
+            baseline
+        ));
+        let workflow = include_str!("../../../../.github/workflows/recovery-rehearsal.yml");
+        assert_eq!(
+            workflow
+                .matches("v0.1.0-rehearsal.g${GITHUB_SHA:0:7}")
+                .count(),
+            2
+        );
+        for sha in ["0026914", "0000000", "1234567", "abcdef0"] {
+            assert!(release_version_is_newer(
+                &format!("v0.1.0-rehearsal.g{sha}"),
+                baseline
+            ));
+        }
+    }
+
+    #[test]
     fn update_requires_a_newer_semantic_release() {
         let current = "0123456789abcdef0123456789abcdef01234567";
         let latest = "89abcdef0123456789abcdef0123456789abcdef";

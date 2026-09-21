@@ -118,7 +118,7 @@ jobs:
           MIN_SCHEMA_VERSION=128 \
             GROK_V1_PROVIDER_BINARY="$RUNNER_TEMP/aif-grok-v1" \
             GROK_V2_PROVIDER_BINARY="$RUNNER_TEMP/aif-grok-v2" \
-            scripts/package-release.sh "v0.1.0-rehearsal.${GITHUB_SHA:0:7}" \
+            scripts/package-release.sh "v0.1.0-rehearsal.g${GITHUB_SHA:0:7}" \
               x86_64-unknown-linux-gnu "$GITHUB_SHA" "$RUNNER_TEMP/aif-candidate"
 
       - name: Install pinned real Codex startup dependency in the disposable runner
@@ -144,7 +144,7 @@ jobs:
         run: |
           set -Eeuo pipefail
           baseline="$RUNNER_TEMP/aif-baseline/ai-image-factory-v0.1.0-20260824.40c7432-x86_64-unknown-linux-gnu"
-          candidate="$RUNNER_TEMP/aif-candidate/ai-image-factory-v0.1.0-rehearsal.${GITHUB_SHA:0:7}-x86_64-unknown-linux-gnu"
+          candidate="$RUNNER_TEMP/aif-candidate/ai-image-factory-v0.1.0-rehearsal.g${GITHUB_SHA:0:7}-x86_64-unknown-linux-gnu"
           sudo env \
             GITHUB_ACTIONS=true RUNNER_ENVIRONMENT=github-hosted RUNNER_TEMP="$RUNNER_TEMP" \
             AIF_NATIVE_TEST_ADMIN_DSN=postgresql://postgres:postgres@127.0.0.1:5432/postgres \

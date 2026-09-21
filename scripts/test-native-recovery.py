@@ -855,7 +855,7 @@ def enqueue(token, action, version=None):
     status, data, _ = http(8787, '/admin/v1/system/update/' + action, method='POST',
         body={'target_version': version} if version else None,
         headers={'Authorization': 'Bearer ' + token, 'Idempotency-Key': 'native-' + uuid.uuid4().hex})
-    require(status == 200, 'authenticated update enqueue failed: ' + action)
+    require(status == 200, f'authenticated update enqueue failed: {action} (HTTP {status})')
     return json.loads(data)['command_id']
 
 
