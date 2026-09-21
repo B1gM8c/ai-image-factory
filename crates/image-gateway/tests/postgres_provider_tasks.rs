@@ -11476,14 +11476,32 @@ async fn database_now(pool: &PgPool) -> TestResult<i64> {
 }
 
 async fn sleep_until_database_time(pool: &PgPool, target_ms: i64) -> TestResult {
-    let now = database_now(pool).await?;
-    if target_ms > now {
-        tokio::time::sleep(Duration::from_millis(
-            u64::try_from(target_ms - now).map_err(debug_error)?,
-        ))
-        .await;
+    // Claims use PostgreSQL's clock; verify that clock reached the deadline
+    // instead of assuming a local sleep did. Bound retries for stalled clocks.
+    const RESAMPLE_INTERVAL: Duration = Duration::from_secs(1);
+    let started = Instant::now();
+    let mut last_now = database_now(pool).await?;
+    // Some recovery fixtures intentionally hold a 60s executor lease.
+    let max_wait = Duration::from_millis(
+        u64::try_from(target_ms.saturating_sub(last_now).max(0)).map_err(debug_error)?,
+    ) + Duration::from_secs(30);
+
+    loop {
+        if last_now >= target_ms {
+            return Ok(());
+        }
+        if started.elapsed() >= max_wait {
+            return Err(format!(
+                "database clock did not reach lease deadline within {:?}: target_ms={target_ms}, last_now_ms={last_now}, elapsed_ms={}",
+                max_wait,
+                started.elapsed().as_millis(),
+            ));
+        }
+
+        let remaining_ms = u64::try_from(target_ms - last_now).map_err(debug_error)?;
+        tokio::time::sleep(Duration::from_millis(remaining_ms).min(RESAMPLE_INTERVAL)).await;
+        last_now = database_now(pool).await?;
     }
-    Ok(())
 }
 
 async fn capacity_heartbeat(pool: &PgPool, executor_execution_id: Uuid) -> TestResult<i64> {

@@ -569,6 +569,18 @@ async fn recovery_claim_completes_the_elected_unlaunched_attempt_once() -> TestR
         )?;
         drop(acquired);
 
+        // Prepare all local resources before taking the short recovery lease.  In
+        // particular, hashing the runner can be expensive on CI; doing that after
+        // the claim could consume the entire 30s lease before recover() fences the
+        // attempt.  The lease should measure recovery work, not test fixture setup.
+        let journal = tempfile::tempdir().map_err(debug_error)?;
+        let journal_root = journal.path().join("remote-submit");
+        let side_effect = journal.path().join("provider-invoked");
+        let codec =
+            FakeGatedSubmitCodec::new(journal.path(), &side_effect, "recovered-unlaunched")?;
+        let runner = Path::new(env!("CARGO_BIN_EXE_remote-submit-runner"));
+        let runner_sha256 = file_sha256(runner)?;
+
         tokio::time::sleep(Duration::from_millis(250)).await;
         let recovery = store
             .claim_submit_recovery(
@@ -597,16 +609,9 @@ async fn recovery_claim_completes_the_elected_unlaunched_attempt_once() -> TestR
                 && !recovery_debug.contains(&expected_command_json.to_string()),
             "recovery debug output exposed the frozen source command",
         )?;
-
-        let journal = tempfile::tempdir().map_err(debug_error)?;
-        let journal_root = journal.path().join("remote-submit");
-        let side_effect = journal.path().join("provider-invoked");
-        let codec =
-            FakeGatedSubmitCodec::new(journal.path(), &side_effect, "recovered-unlaunched")?;
-        let runner = Path::new(env!("CARGO_BIN_EXE_remote-submit-runner"));
         let recovered = ProviderSubmitOrchestrator::new(
             store,
-            gated_submit_driver(codec, runner, file_sha256(runner)?)?,
+            gated_submit_driver(codec, runner, &runner_sha256)?,
             60_000,
             &journal_root,
         )
