@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 import uuid
 
@@ -67,6 +68,8 @@ def validate(name, source):
     if name == 'ai-image-factory-updater-recover@.service':
         if unit.get('Conflicts') != ['ai-image-factory-updater.service']:
             raise ValueError('manual recovery must conflict with the updater daemon')
+        if 'ai-image-factory-updater.service' not in ' '.join(unit.get('After', [])).split():
+            raise ValueError('manual recovery must wait for the updater daemon to stop')
     if name != 'ai-image-factory-updater.service':
         if unit.get('OnFailure') != ['ai-image-factory-recovery-failed.service']:
             raise ValueError('recovery failure must remain fail closed')
@@ -115,6 +118,14 @@ class SandboxContractTests(unittest.TestCase):
         source = (ROOT / 'deploy/systemd' / name).read_text()
         with self.assertRaises(ValueError):
             validate(name, source.replace('Conflicts=ai-image-factory-updater.service', 'Conflicts='))
+
+    def test_reject_unordered_daemon_stop(self):
+        name = 'ai-image-factory-updater-recover@.service'
+        source = (ROOT / 'deploy/systemd' / name).read_text()
+        with self.assertRaisesRegex(ValueError, 'wait for the updater daemon'):
+            validate(name, source.replace(
+                'After=network-online.target ai-image-factory-updater.service',
+                'After=network-online.target'))
 
 
 # The same filesystem operations as recover: sibling mktemp, old-root rename,
@@ -220,6 +231,63 @@ def runtime():
             marker = 'restored' if expected_stage == 'completed' else 'original'
             if (artifacts / 'marker').read_text() != marker:
                 raise AssertionError(f'{case}: artifact marker mismatch')
+        runtime_lock_handoff(runner, root)
+
+
+def runtime_lock_handoff(runner, root):
+    # Reproduce the real host-lock race with a deliberately slow daemon stop.
+    # Transient fixtures never start or stop installed Factory services.
+    daemon_program = '''import fcntl, pathlib, sys, time
+with open(sys.argv[1], "w") as lock:
+    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    pathlib.Path(sys.argv[2]).touch()
+    while True:
+        time.sleep(1)
+'''
+    recovery_program = '''import fcntl, sys
+with open(sys.argv[1], "a") as lock:
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print("host-lock-busy", flush=True)
+        sys.exit(73)
+    print("host-lock-acquired", flush=True)
+'''
+    unit = directives((ROOT / 'deploy/systemd/ai-image-factory-updater-recover@.service').read_text(), 'Unit')
+    for ordered in (False, True):
+        suffix = uuid.uuid4().hex
+        daemon = 'aif-lock-daemon-' + suffix + '.service'
+        recovery = 'aif-lock-recover-' + suffix + '.service'
+        lock = root / (suffix + '.lock')
+        ready = root / (suffix + '.ready')
+        try:
+            subprocess.run([runner, '--quiet', '--collect', '--unit=' + daemon,
+                '--property=ExecStop=/bin/sleep 2', '--property=TimeoutStopSec=10s',
+                sys.executable, '-c', daemon_program, str(lock), str(ready)],
+                check=True, capture_output=True, text=True, timeout=15)
+            deadline = time.monotonic() + 10
+            while not ready.exists():
+                if time.monotonic() >= deadline:
+                    raise AssertionError('fixture daemon did not acquire the host lock')
+                time.sleep(0.05)
+            command = [runner, '--quiet', '--wait', '--pipe', '--collect',
+                '--unit=' + recovery, '--property=Type=oneshot',
+                '--property=TimeoutStartSec=15s', '--property=Conflicts=' + daemon]
+            if ordered:
+                # Use the shipped unit's ordering, replacing only the fixture name.
+                after = ' '.join(unit.get('After', [])).replace('ai-image-factory-updater.service', daemon)
+                command.append('--property=After=' + after)
+            result = subprocess.run(command + [sys.executable, '-c', recovery_program, str(lock)],
+                capture_output=True, text=True, timeout=25)
+            marker = 'host-lock-acquired' if ordered else 'host-lock-busy'
+            if (result.returncode == 0) != ordered or marker not in result.stdout:
+                raise AssertionError(f'lock handoff ordered={ordered}: {result.returncode}; '
+                    f'stdout={result.stdout}; stderr={result.stderr}')
+            print(json.dumps({'runtime': 'real-systemd', 'case': 'host-lock-handoff',
+                'ordered': ordered, 'result': marker}), flush=True)
+        finally:
+            subprocess.run(['systemctl', 'stop', recovery, daemon],
+                capture_output=True, timeout=20)
 
 
 if __name__ == '__main__':

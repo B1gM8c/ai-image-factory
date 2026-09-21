@@ -554,6 +554,10 @@ sudo systemctl start ai-image-factory-updater.service
 
 The recovery template reads the same root-only environment files as the daemon.
 Never place database URLs on the command line.
+It declares both `Conflicts=ai-image-factory-updater.service` and ordering after
+that daemon. A conflict alone schedules stop and start concurrently, allowing
+recovery to fail while the daemon still owns `updated.lock`. The ordering waits
+for daemon shutdown; never delete the lock file or disable the host-lock check.
 
 The updater receives repository access through the system GitHub CLI
 configuration. Use a read-only token scoped only to Release contents and
