@@ -147,7 +147,6 @@ impl CodexAppServerFailureDiagnosticV1 {
                         | "safety"
                         | "moderation"
                         | "policy"
-                        | "rejected"
                         | "blocked"
                         | "invalid_request"
                         | "unsupported"
@@ -883,11 +882,10 @@ fn classify_bytes(value: &[u8]) -> &'static str {
         || normalized.contains("unsupported")
     {
         "invalid_request"
-    } else if normalized.contains("safety")
-        || normalized.contains("policy")
-        || normalized.contains("rejected")
-    {
+    } else if normalized.contains("safety") || normalized.contains("policy") {
         "policy"
+    } else if normalized.contains("rejected") {
+        "rejected"
     } else if normalized.contains("timeout")
         || normalized.contains("unavailable")
         || normalized.contains("overloaded")
@@ -1602,6 +1600,7 @@ mod tests {
             "forbidden"
         );
         assert_eq!(classify_bytes(b"policy rejected"), "policy");
+        assert_eq!(classify_bytes(b"provider rejected"), "rejected");
         assert_eq!(
             classify_stream_bytes(
                 br#"image generation failed: http 400 Bad Request: Some("{\"error\":{\"code\":\"content_policy\"}}")"#,
@@ -1648,6 +1647,8 @@ mod tests {
         for diagnostic in [
             persisted("codex_image_tool_failed", Some(401), "unknown"),
             persisted("codex_image_tool_failed", None, "http_status:401"),
+            persisted("codex_image_tool_failed", None, "http_status:401:rejected"),
+            persisted("codex_image_tool_failed", Some(401), "rejected"),
         ] {
             assert!(diagnostic.is_retryable_authentication_rejection());
         }
@@ -1668,6 +1669,70 @@ mod tests {
         ] {
             assert!(!diagnostic.is_retryable_authentication_rejection());
         }
+        for explicit_nonretryable_signal in [
+            "content_policy",
+            "cyber_policy",
+            "safety",
+            "moderation",
+            "policy",
+            "blocked",
+            "invalid_request",
+            "unsupported",
+        ] {
+            let diagnostic = persisted(
+                "codex_image_tool_failed",
+                None,
+                &format!("http_status:401:{explicit_nonretryable_signal}"),
+            );
+            assert!(!diagnostic.is_retryable_authentication_rejection());
+        }
+
+        let mut state = ProtocolState::default();
+        state.record_failure(
+            "image_generation_item",
+            &json!({ "code": 401, "message": "provider rejected" }),
+        );
+        let persisted = build_failure_diagnostic(
+            &state,
+            CodexAppServerError::ImageToolFailed,
+            Some(&StreamDiagnostic {
+                sha256: "a".repeat(64),
+                bytes: 32,
+                truncated: false,
+                class: "http_status:401:rejected".to_string(),
+            }),
+            &ExitDiagnostic {
+                observed: true,
+                code: Some(0),
+                signal: None,
+            },
+        );
+        assert_eq!(persisted.class, "rejected");
+        assert_eq!(persisted.numeric_code, Some(401));
+        assert!(persisted.is_retryable_authentication_rejection());
+
+        let mut state = ProtocolState::default();
+        state.record_failure(
+            "image_generation_item",
+            &json!({ "code": 401, "message": "content policy rejected" }),
+        );
+        let persisted = build_failure_diagnostic(
+            &state,
+            CodexAppServerError::ImageToolFailed,
+            Some(&StreamDiagnostic {
+                sha256: "a".repeat(64),
+                bytes: 32,
+                truncated: false,
+                class: "http_status:401:rejected+policy".to_string(),
+            }),
+            &ExitDiagnostic {
+                observed: true,
+                code: Some(0),
+                signal: None,
+            },
+        );
+        assert_eq!(persisted.class, "policy");
+        assert!(!persisted.is_retryable_authentication_rejection());
     }
 
     #[test]

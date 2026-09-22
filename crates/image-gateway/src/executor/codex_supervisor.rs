@@ -3807,7 +3807,7 @@ while IFS= read -r ignored; do :; done
         fn transient_http_401_then_success() -> Self {
             Self::with_script(|invocations, image, _root| {
                 format!(
-                    "#!/bin/sh\nset -eu\n/bin/cat >/dev/null\n# codex-test-transient-http-401\nif [ ! -f '{}' ]; then\n  printf '1\\n' >> '{}'\n  printf 'HTTP 401 Unauthorized\\n' >&2\n  : > \"$CODEX_HOME/transient-http-401\"\nelse\n  printf '1\\n' >> '{}'\n  /bin/rm -f \"$CODEX_HOME/transient-http-401\"\n  thread_id='019fd9f5-badb-7dd3-8903-28ffded0ef54'\n  call_id='call_retry_image'\n  output_dir=\"$CODEX_HOME/generated_images/$thread_id\"\n  /bin/mkdir -p \"$output_dir\"\n  /bin/chmod 700 \"$CODEX_HOME/generated_images\" \"$output_dir\"\n  /bin/cp '{}' \"$output_dir/$call_id.png\"\n  /bin/chmod 600 \"$output_dir/$call_id.png\"\n  printf '{{\"type\":\"thread.started\",\"thread_id\":\"%s\"}}\\n' \"$thread_id\"\n  printf '{{\"type\":\"item.completed\",\"item\":{{\"type\":\"image_generation_call\",\"id\":\"%s\"}}}}\\n' \"$call_id\"\nfi\n",
+                    "#!/bin/sh\nset -eu\n/bin/cat >/dev/null\n# codex-test-transient-http-401\nif [ ! -f '{}' ]; then\n  printf '1\\n' >> '{}'\n  printf 'HTTP 401 rejected\\n' >&2\n  : > \"$CODEX_HOME/transient-http-401\"\nelse\n  printf '1\\n' >> '{}'\n  /bin/rm -f \"$CODEX_HOME/transient-http-401\"\n  thread_id='019fd9f5-badb-7dd3-8903-28ffded0ef54'\n  call_id='call_retry_image'\n  output_dir=\"$CODEX_HOME/generated_images/$thread_id\"\n  /bin/mkdir -p \"$output_dir\"\n  /bin/chmod 700 \"$CODEX_HOME/generated_images\" \"$output_dir\"\n  /bin/cp '{}' \"$output_dir/$call_id.png\"\n  /bin/chmod 600 \"$output_dir/$call_id.png\"\n  printf '{{\"type\":\"thread.started\",\"thread_id\":\"%s\"}}\\n' \"$thread_id\"\n  printf '{{\"type\":\"item.completed\",\"item\":{{\"type\":\"image_generation_call\",\"id\":\"%s\"}}}}\\n' \"$call_id\"\nfi\n",
                     invocations.display(),
                     invocations.display(),
                     invocations.display(),
@@ -3819,7 +3819,7 @@ while IFS= read -r ignored; do :; done
         fn permanent_http_401() -> Self {
             Self::with_script(|invocations, _image, _root| {
                 format!(
-                    "#!/bin/sh\nset -eu\n/bin/cat >/dev/null\n# codex-test-transient-http-401\nprintf '1\\n' >> '{}'\nprintf 'HTTP 401 Unauthorized\\n' >&2\n: > \"$CODEX_HOME/transient-http-401\"\n",
+                    "#!/bin/sh\nset -eu\n/bin/cat >/dev/null\n# codex-test-transient-http-401\nprintf '1\\n' >> '{}'\nprintf 'HTTP 401 rejected\\n' >&2\n: > \"$CODEX_HOME/transient-http-401\"\n",
                     invocations.display(),
                 )
             })
