@@ -872,18 +872,23 @@ fn classify_bytes(value: &[u8]) -> &'static str {
         || normalized.contains("resource_exhausted")
     {
         "rate_limit"
+    } else if normalized.contains("invalid_argument")
+        || normalized.contains("invalid argument")
+        || normalized.contains("invalid_request")
+        || normalized.contains("unsupported")
+    {
+        "invalid_request"
+    } else if normalized.contains("safety")
+        || normalized.contains("moderation")
+        || normalized.contains("policy")
+        || normalized.contains("blocked")
+    {
+        "policy"
     } else if normalized.contains("unauthorized")
         || normalized.contains("authentication")
         || normalized.contains("credential")
     {
         "authentication"
-    } else if normalized.contains("invalid_argument")
-        || normalized.contains("invalid argument")
-        || normalized.contains("unsupported")
-    {
-        "invalid_request"
-    } else if normalized.contains("safety") || normalized.contains("policy") {
-        "policy"
     } else if normalized.contains("rejected") {
         "rejected"
     } else if normalized.contains("timeout")
@@ -1600,6 +1605,12 @@ mod tests {
             "forbidden"
         );
         assert_eq!(classify_bytes(b"policy rejected"), "policy");
+        assert_eq!(classify_bytes(b"moderation rejected"), "policy");
+        assert_eq!(classify_bytes(b"request blocked"), "policy");
+        assert_eq!(
+            classify_bytes(b"invalid_request rejected"),
+            "invalid_request"
+        );
         assert_eq!(classify_bytes(b"provider rejected"), "rejected");
         assert_eq!(
             classify_stream_bytes(
@@ -1687,52 +1698,51 @@ mod tests {
             assert!(!diagnostic.is_retryable_authentication_rejection());
         }
 
-        let mut state = ProtocolState::default();
-        state.record_failure(
-            "image_generation_item",
-            &json!({ "code": 401, "message": "provider rejected" }),
-        );
-        let persisted = build_failure_diagnostic(
-            &state,
-            CodexAppServerError::ImageToolFailed,
-            Some(&StreamDiagnostic {
-                sha256: "a".repeat(64),
-                bytes: 32,
-                truncated: false,
-                class: "http_status:401:rejected".to_string(),
-            }),
-            &ExitDiagnostic {
-                observed: true,
-                code: Some(0),
-                signal: None,
-            },
-        );
+        let persisted_from_failure = |message: &str| {
+            let mut state = ProtocolState::default();
+            state.record_failure(
+                "image_generation_item",
+                &json!({ "code": 401, "message": message }),
+            );
+            build_failure_diagnostic(
+                &state,
+                CodexAppServerError::ImageToolFailed,
+                Some(&StreamDiagnostic {
+                    sha256: "a".repeat(64),
+                    bytes: 32,
+                    truncated: false,
+                    class: "http_status:401:rejected".to_string(),
+                }),
+                &ExitDiagnostic {
+                    observed: true,
+                    code: Some(0),
+                    signal: None,
+                },
+            )
+        };
+
+        let persisted = persisted_from_failure("provider rejected");
         assert_eq!(persisted.class, "rejected");
         assert_eq!(persisted.numeric_code, Some(401));
         assert!(persisted.is_retryable_authentication_rejection());
 
-        let mut state = ProtocolState::default();
-        state.record_failure(
-            "image_generation_item",
-            &json!({ "code": 401, "message": "content policy rejected" }),
-        );
-        let persisted = build_failure_diagnostic(
-            &state,
-            CodexAppServerError::ImageToolFailed,
-            Some(&StreamDiagnostic {
-                sha256: "a".repeat(64),
-                bytes: 32,
-                truncated: false,
-                class: "http_status:401:rejected+policy".to_string(),
-            }),
-            &ExitDiagnostic {
-                observed: true,
-                code: Some(0),
-                signal: None,
-            },
-        );
-        assert_eq!(persisted.class, "policy");
-        assert!(!persisted.is_retryable_authentication_rejection());
+        for (message, expected_class) in [
+            ("content_policy rejected", "content_policy"),
+            ("cyber_policy rejected", "content_policy"),
+            ("safety rejected", "policy"),
+            ("moderation rejected", "policy"),
+            ("policy rejected", "policy"),
+            ("blocked rejected", "policy"),
+            ("invalid_request rejected", "invalid_request"),
+            ("unsupported rejected", "invalid_request"),
+            ("authentication blocked rejected", "policy"),
+            ("unauthorized moderation rejected", "policy"),
+            ("credential invalid_request rejected", "invalid_request"),
+        ] {
+            let persisted = persisted_from_failure(message);
+            assert_eq!(persisted.class, expected_class);
+            assert!(!persisted.is_retryable_authentication_rejection());
+        }
     }
 
     #[test]
