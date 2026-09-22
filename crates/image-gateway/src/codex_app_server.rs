@@ -211,19 +211,20 @@ impl ProtocolState {
         if self.failure_diagnostic.is_some() {
             return;
         }
-        let code = failure_string(
+        let explicit_code = failure_string(
             value,
-            &[
-                "/code",
-                "/error/code",
-                "/result/code",
-                "/result/error/code",
-                "/type",
-                "/error/type",
-                "/result/type",
-                "/result/error/type",
-            ],
+            &["/code", "/error/code", "/result/code", "/result/error/code"],
         );
+        let nested_type = failure_string(
+            value,
+            &["/error/type", "/result/type", "/result/error/type"],
+        );
+        let envelope_type = value.pointer("/type").and_then(Value::as_str);
+        let explicit_type = nested_type.or_else(|| {
+            envelope_type
+                .filter(|value| source != "image_generation_item" || *value != "imageGeneration")
+        });
+        let code = explicit_code.or(explicit_type).or(envelope_type);
         let message = failure_string(
             value,
             &[
@@ -236,9 +237,23 @@ impl ProtocolState {
                 "/result/error/message",
             ],
         );
+        let mut class = classify_failure(code, message);
+        if explicit_code.into_iter().chain(explicit_type).any(|value| {
+            !matches!(
+                classify_bytes(value.as_bytes()),
+                "authentication" | "rejected"
+            )
+        }) && matches!(
+            class,
+            "unknown" | "tool_failure" | "authentication" | "rejected"
+        ) {
+            class = "explicit_failure";
+        } else if class == "unknown" && message.is_some() {
+            class = "explicit_failure";
+        }
         self.failure_diagnostic = Some(FailureDiagnostic {
             source,
-            class: classify_failure(code, message),
+            class,
             numeric_code: failure_numeric_code(value),
             code: summarize_field(code),
             message: summarize_field(message),
@@ -911,19 +926,67 @@ fn classify_stream_bytes(value: &[u8]) -> String {
     }
     let lowercase = normalized.to_ascii_lowercase();
     let signals = stream_policy_signals(&lowercase);
-    for status in [400_u16, 401, 403, 404, 409, 422, 429, 500, 502, 503, 504] {
-        if lowercase.contains(&format!("http {status}")) {
-            return if signals.is_empty() {
-                format!("http_status:{status}")
-            } else {
-                format!("http_status:{status}:{}", signals.join("+"))
-            };
-        }
+    let statuses = observed_http_statuses(&lowercase);
+    if statuses.len() > 1 {
+        return format!(
+            "http_status_conflict:{}",
+            statuses
+                .iter()
+                .map(u16::to_string)
+                .collect::<Vec<_>>()
+                .join("+")
+        );
+    }
+    if let Some(status) = statuses.first() {
+        return if signals.is_empty() {
+            format!("http_status:{status}")
+        } else {
+            format!("http_status:{status}:{}", signals.join("+"))
+        };
     }
     if !signals.is_empty() {
         return signals.join("+");
     }
     classify_bytes(value).to_string()
+}
+
+fn observed_http_statuses(value: &str) -> Vec<u16> {
+    let bytes = value.as_bytes();
+    let mut statuses = Vec::new();
+    for index in 0..bytes.len().saturating_sub(3) {
+        if &bytes[index..index + 4] != b"http"
+            || index.checked_sub(1).is_some_and(|previous| {
+                bytes[previous].is_ascii_alphanumeric() || bytes[previous] == b'_'
+            })
+        {
+            continue;
+        }
+        let mut cursor = index + 4;
+        if cursor >= bytes.len() || !bytes[cursor].is_ascii_whitespace() {
+            continue;
+        }
+        while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+            cursor += 1;
+        }
+        let start = cursor;
+        while cursor < bytes.len() && bytes[cursor].is_ascii_digit() {
+            cursor += 1;
+        }
+        if cursor - start != 3
+            || cursor < bytes.len()
+                && (bytes[cursor].is_ascii_alphanumeric() || bytes[cursor] == b'_')
+        {
+            continue;
+        }
+        let Ok(status) = value[start..cursor].parse::<u16>() else {
+            continue;
+        };
+        if (100..=599).contains(&status) && !statuses.contains(&status) {
+            statuses.push(status);
+        }
+    }
+    statuses.sort_unstable();
+    statuses
 }
 
 fn stream_policy_signals(value: &str) -> Vec<&'static str> {
@@ -1639,6 +1702,16 @@ mod tests {
         );
         assert_eq!(classify_bytes(b"provider rejected"), "rejected");
         assert_eq!(
+            classify_stream_bytes(b"HTTP 401 rejected"),
+            "http_status:401:rejected"
+        );
+        assert_eq!(classify_stream_bytes(b"HTTP 4010 rejected"), "rejected");
+        assert_eq!(classify_stream_bytes(b"HTTP 401abc rejected"), "rejected");
+        assert_eq!(
+            classify_stream_bytes(b"HTTP 401 rejected\nHTTP 503 server error"),
+            "http_status_conflict:401+503"
+        );
+        assert_eq!(
             classify_stream_bytes(
                 br#"image generation failed: http 400 Bad Request: Some("{\"error\":{\"code\":\"content_policy\"}}")"#,
             ),
@@ -1810,6 +1883,44 @@ mod tests {
             assert_eq!(persisted.class, expected_class);
             assert!(!persisted.is_retryable_authentication_rejection());
         }
+
+        for code in ["account_suspended", "retention", "future_explicit_failure"] {
+            let mut state = ProtocolState::default();
+            state.record_failure(
+                "image_generation_item",
+                &json!({
+                    "type": "imageGeneration",
+                    "status": "failed",
+                    "result": { "code": code }
+                }),
+            );
+            let persisted = build_failure_diagnostic(
+                &state,
+                CodexAppServerError::ImageToolFailed,
+                Some(&StreamDiagnostic {
+                    class: classify_stream_bytes(b"HTTP 401 rejected"),
+                    ..StreamDiagnostic::default()
+                }),
+                &ExitDiagnostic {
+                    observed: true,
+                    code: Some(0),
+                    signal: None,
+                },
+            );
+            assert_eq!(persisted.class, "explicit_failure", "{code}");
+            assert!(!persisted.is_retryable_authentication_rejection(), "{code}");
+        }
+
+        let mut state = ProtocolState::default();
+        state.record_failure(
+            "image_generation_item",
+            &json!({
+                "type": "imageGeneration",
+                "status": "failed",
+                "result": { "message": "future provider failure" }
+            }),
+        );
+        assert_eq!(state.failure_diagnostic.unwrap().class, "explicit_failure");
     }
 
     #[test]

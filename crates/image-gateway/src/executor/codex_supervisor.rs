@@ -2582,6 +2582,17 @@ mod tests {
             (Some("entitlement"), "HTTP 401 rejected", "entitlement"),
             (Some("forbidden"), "HTTP 401 rejected", "forbidden"),
             (Some("unavailable"), "HTTP 401 rejected", "availability"),
+            (
+                Some("account_suspended"),
+                "HTTP 401 rejected",
+                "explicit_failure",
+            ),
+            (
+                Some("future_explicit_failure"),
+                "HTTP 401 rejected",
+                "explicit_failure",
+            ),
+            (Some("retention"), "HTTP 401 rejected", "explicit_failure"),
             (None, "HTTP 401 retention rejected", "unknown"),
             (None, "HTTP 401 organization rejected", "unknown"),
             (None, "HTTP 401 account rejected", "unknown"),
@@ -2590,6 +2601,8 @@ mod tests {
             (None, "HTTP 401 unavailable rejected", "unknown"),
             (None, "HTTP 401 forbidden rejected", "unknown"),
             (None, "HTTP 401 invalid_request rejected", "unknown"),
+            (None, "HTTP 4010 rejected", "unknown"),
+            (None, "HTTP 401 rejected\nHTTP 503 server error", "unknown"),
         ] {
             let fixture = CodexFixture::http_401_rejection(code, stderr);
             let lease = fixture.lease();
