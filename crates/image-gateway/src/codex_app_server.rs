@@ -131,32 +131,31 @@ pub(crate) struct CodexAppServerFailureDiagnosticV1 {
 
 impl CodexAppServerFailureDiagnosticV1 {
     pub(crate) fn is_retryable_authentication_rejection(&self) -> bool {
-        if self.failure_category != CodexAppServerError::ImageToolFailed.code() {
+        if self.failure_category != CodexAppServerError::ImageToolFailed.code()
+            || !matches!(
+                self.class.as_str(),
+                "unknown" | "tool_failure" | "rejected" | "authentication"
+            )
+            || self.numeric_code.is_some_and(|code| code != 401)
+        {
             return false;
         }
         let stderr_class = self
             .stderr
             .as_ref()
             .map_or("unknown", |value| value.class.as_str());
-        let is_nonretryable = |classification: &str| {
-            classification.split([':', '+']).any(|signal| {
-                matches!(
-                    signal,
-                    "content_policy"
-                        | "cyber_policy"
-                        | "safety"
-                        | "moderation"
-                        | "policy"
-                        | "blocked"
-                        | "invalid_request"
-                        | "unsupported"
-                )
-            })
-        };
-        if is_nonretryable(&self.class) || is_nonretryable(stderr_class) {
-            return false;
+        if stderr_class == "http_status:401" {
+            return true;
         }
-        self.numeric_code == Some(401) || stderr_class.starts_with("http_status:401")
+        if let Some(signals) = stderr_class.strip_prefix("http_status:401:") {
+            return signals
+                .split('+')
+                .all(|signal| matches!(signal, "rejected" | "authentication"));
+        }
+        self.numeric_code == Some(401)
+            && stderr_class
+                .split('+')
+                .all(|signal| matches!(signal, "unknown" | "rejected" | "authentication"))
     }
 }
 
@@ -884,6 +883,13 @@ fn classify_bytes(value: &[u8]) -> &'static str {
         || normalized.contains("blocked")
     {
         "policy"
+    } else if normalized.contains("timeout")
+        || normalized.contains("unavailable")
+        || normalized.contains("availability")
+        || normalized.contains("overloaded")
+        || normalized.contains("network")
+    {
+        "availability"
     } else if normalized.contains("unauthorized")
         || normalized.contains("authentication")
         || normalized.contains("credential")
@@ -891,12 +897,6 @@ fn classify_bytes(value: &[u8]) -> &'static str {
         "authentication"
     } else if normalized.contains("rejected") {
         "rejected"
-    } else if normalized.contains("timeout")
-        || normalized.contains("unavailable")
-        || normalized.contains("overloaded")
-        || normalized.contains("network")
-    {
-        "availability"
     } else if normalized.contains("tool") || normalized.contains("image_generation") {
         "tool_failure"
     } else {
@@ -943,6 +943,32 @@ fn stream_policy_signals(value: &str) -> Vec<&'static str> {
         ("unsupported", &["unsupported"]),
         ("blocked", &["blocked"]),
         ("policy", &["policy"]),
+        (
+            "forbidden",
+            &["forbidden", "status 403", "status: 403", "\"status\":403"],
+        ),
+        (
+            "rate_limit",
+            &["rate_limit", "rate limit", "quota", "resource_exhausted"],
+        ),
+        (
+            "availability",
+            &[
+                "timeout",
+                "unavailable",
+                "availability",
+                "overloaded",
+                "network",
+            ],
+        ),
+        (
+            "invalid_request",
+            &["invalid_argument", "invalid argument", "invalid_request"],
+        ),
+        (
+            "authentication",
+            &["unauthorized", "authentication", "credential"],
+        ),
     ] {
         if needles.iter().any(|needle| value.contains(needle)) {
             signals.push(signal);
@@ -1659,6 +1685,11 @@ mod tests {
             persisted("codex_image_tool_failed", Some(401), "unknown"),
             persisted("codex_image_tool_failed", None, "http_status:401"),
             persisted("codex_image_tool_failed", None, "http_status:401:rejected"),
+            persisted(
+                "codex_image_tool_failed",
+                None,
+                "http_status:401:authentication+rejected",
+            ),
             persisted("codex_image_tool_failed", Some(401), "rejected"),
         ] {
             assert!(diagnostic.is_retryable_authentication_rejection());
@@ -1676,6 +1707,20 @@ mod tests {
             persisted("codex_image_tool_failed", None, "rejected"),
             persisted("codex_image_tool_failed", None, "http_status:429"),
             persisted("codex_image_tool_failed", None, "http_status:503"),
+            persisted("codex_image_tool_failed", Some(401), "http_status:503"),
+            persisted("codex_image_tool_failed", Some(403), "http_status:401"),
+            persisted(
+                "codex_image_tool_failed",
+                Some(401),
+                "api_code:authentication",
+            ),
+            persisted(
+                "codex_image_tool_failed",
+                Some(401),
+                "api_code:rate_limit_exceeded",
+            ),
+            persisted("codex_image_tool_failed", None, "http_status:4010"),
+            persisted("codex_image_tool_failed", None, "http_status:401:"),
             persisted("codex_turn_failed", Some(401), "http_status:401"),
         ] {
             assert!(!diagnostic.is_retryable_authentication_rejection());
@@ -1689,12 +1734,29 @@ mod tests {
             "blocked",
             "invalid_request",
             "unsupported",
+            "rate_limit",
+            "originator",
+            "entitlement",
+            "forbidden",
+            "availability",
+            "retention",
+            "organization",
+            "account",
+            "prompt",
+            "future_explicit_failure",
         ] {
             let diagnostic = persisted(
                 "codex_image_tool_failed",
                 None,
                 &format!("http_status:401:{explicit_nonretryable_signal}"),
             );
+            assert!(!diagnostic.is_retryable_authentication_rejection());
+            let mut diagnostic = persisted(
+                "codex_image_tool_failed",
+                Some(401),
+                "http_status:401:rejected",
+            );
+            diagnostic.class = explicit_nonretryable_signal.to_string();
             assert!(!diagnostic.is_retryable_authentication_rejection());
         }
 
@@ -1738,10 +1800,73 @@ mod tests {
             ("authentication blocked rejected", "policy"),
             ("unauthorized moderation rejected", "policy"),
             ("credential invalid_request rejected", "invalid_request"),
+            ("rate_limit rejected", "rate_limit"),
+            ("originator rejected", "originator_policy"),
+            ("entitlement rejected", "entitlement"),
+            ("forbidden rejected", "forbidden"),
+            ("unavailable authentication rejected", "availability"),
         ] {
             let persisted = persisted_from_failure(message);
             assert_eq!(persisted.class, expected_class);
             assert!(!persisted.is_retryable_authentication_rejection());
+        }
+    }
+
+    #[test]
+    fn production_http_401_rejection_preserves_unknown_item_shape() {
+        let mut state = ProtocolState::default();
+        state.record_failure(
+            "image_generation_item",
+            &json!({
+                "type": "imageGeneration", "status": "failed", "result": null
+            }),
+        );
+        let persisted = build_failure_diagnostic(
+            &state,
+            CodexAppServerError::ImageToolFailed,
+            Some(&StreamDiagnostic {
+                class: classify_stream_bytes(b"HTTP 401 rejected"),
+                ..StreamDiagnostic::default()
+            }),
+            &ExitDiagnostic {
+                observed: true,
+                code: Some(0),
+                signal: None,
+            },
+        );
+        assert_eq!(persisted.class, "unknown");
+        assert_eq!(persisted.numeric_code, None);
+        assert_eq!(persisted.code.bytes, "imageGeneration".len());
+        assert_eq!(persisted.message.bytes, 0);
+        assert_eq!(
+            persisted.stderr.as_ref().unwrap().class,
+            "http_status:401:rejected"
+        );
+        assert!(persisted.is_retryable_authentication_rejection());
+
+        for (signal, expected_class) in [
+            ("forbidden", "forbidden"),
+            ("rate_limit", "rate_limit"),
+            ("unavailable", "availability"),
+            ("invalid_request", "invalid_request"),
+            ("retention", "retention"),
+            ("organization", "organization"),
+            ("account", "account"),
+            ("prompt", "prompt"),
+        ] {
+            let mut diagnostic = persisted.clone();
+            let stderr_class =
+                classify_stream_bytes(format!("HTTP 401 {signal} rejected").as_bytes());
+            assert!(
+                stderr_class
+                    .split([':', '+'])
+                    .any(|value| value == expected_class)
+            );
+            diagnostic.stderr.as_mut().unwrap().class = stderr_class;
+            assert!(
+                !diagnostic.is_retryable_authentication_rejection(),
+                "{signal}"
+            );
         }
     }
 

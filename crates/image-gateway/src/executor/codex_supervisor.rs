@@ -2571,6 +2571,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn explicit_non_authentication_http_401_failures_do_not_request_refresh() {
+        for (code, stderr, expected_class) in [
+            (
+                Some("rate_limit_exceeded"),
+                "HTTP 401 rejected",
+                "rate_limit",
+            ),
+            (Some("originator"), "HTTP 401 rejected", "originator_policy"),
+            (Some("entitlement"), "HTTP 401 rejected", "entitlement"),
+            (Some("forbidden"), "HTTP 401 rejected", "forbidden"),
+            (Some("unavailable"), "HTTP 401 rejected", "availability"),
+            (None, "HTTP 401 retention rejected", "unknown"),
+            (None, "HTTP 401 organization rejected", "unknown"),
+            (None, "HTTP 401 account rejected", "unknown"),
+            (None, "HTTP 401 prompt rejected", "unknown"),
+            (None, "HTTP 401 rate_limit rejected", "unknown"),
+            (None, "HTTP 401 unavailable rejected", "unknown"),
+            (None, "HTTP 401 forbidden rejected", "unknown"),
+            (None, "HTTP 401 invalid_request rejected", "unknown"),
+        ] {
+            let fixture = CodexFixture::http_401_rejection(code, stderr);
+            let lease = fixture.lease();
+            let context = fixture.context(&lease);
+            fixture.journal.start_or_attach(&lease).unwrap();
+            fixture.supervisor.prepare(&lease, &context).await.unwrap();
+            assert_eq!(
+                fixture.journal.commit_launch(&lease).unwrap(),
+                LaunchDecision::LaunchOnce
+            );
+            let spool = ExecutionSpool::for_lease(&fixture.journal, &lease).unwrap();
+            run_codex_runner_child(fixture.journal.root_path(), lease.executor_execution_id)
+                .await
+                .unwrap();
+            assert_eq!(
+                spool.observe().unwrap(),
+                ProcessObservation::Failed {
+                    error_code: "codex_image_tool_failed".to_string(),
+                },
+                "{code:?}, {stderr}"
+            );
+            let diagnostic_path = fixture
+                .journal
+                .root_path()
+                .join(lease.executor_execution_id.simple().to_string())
+                .join(CODEX_APP_SERVER_FAILURE_DIAGNOSTIC_FILE);
+            let diagnostic: serde_json::Value =
+                serde_json::from_slice(&fs::read(diagnostic_path).unwrap()).unwrap();
+            assert_eq!(diagnostic["class"], expected_class, "{stderr}");
+            assert!(
+                spool
+                    .read_diagnostic::<CodexAuthRefreshRequestV1>(CODEX_AUTH_REFRESH_REQUEST_FILE)
+                    .unwrap()
+                    .is_none(),
+                "{code:?}, {stderr}"
+            );
+            assert_eq!(fs::read_to_string(&fixture.invocations).unwrap(), "1\n");
+        }
+    }
+
+    #[tokio::test]
     async fn edit_prepare_stages_the_exact_digest_bound_input_for_one_output() {
         let fixture = CodexFixture::new();
         let blobs = Arc::new(InMemoryArtifactBlobStore::default());
@@ -3713,6 +3773,18 @@ mod tests {
     fn app_server_fixture_script(exec_body: String) -> String {
         let image_tool_failure = usize::from(exec_body.contains("codex-test-image-tool-failure"));
         let transient_http_401 = usize::from(exec_body.contains("codex-test-transient-http-401"));
+        let failure_result = match exec_body
+            .lines()
+            .find_map(|line| line.strip_prefix("# codex-test-failure-code:"))
+        {
+            Some("none") => serde_json::Value::Null,
+            Some(code) => serde_json::json!({ "code": code }),
+            None if transient_http_401 == 1 => serde_json::Value::Null,
+            None => serde_json::json!({
+                "code": "rate_limit_exceeded",
+                "message": "provider-sensitive-prompt-fragment"
+            }),
+        };
         let force_malformed = usize::from(
             exec_body.contains("/usr/bin/head -c 70000")
                 || exec_body.contains("printf '{\"type\":\"thread.started\",\"thread_id\":'")
@@ -3771,7 +3843,7 @@ fi
 if [ "$image_tool_failure" -eq 1 ]; then
   call_id='call_failed_image'
   printf '{{"method":"item/started","params":{{"threadId":"%s","turnId":"%s","item":{{"type":"imageGeneration","id":"%s","status":"inProgress"}}}}}}\n' "$thread_id" "$turn_id" "$call_id"
-  printf '{{"method":"item/completed","params":{{"threadId":"%s","turnId":"%s","item":{{"type":"imageGeneration","id":"%s","status":"failed","result":{{"code":"rate_limit_exceeded","message":"provider-sensitive-prompt-fragment"}}}}}}}}\n' "$thread_id" "$turn_id" "$call_id"
+  printf '{{"method":"item/completed","params":{{"threadId":"%s","turnId":"%s","item":{{"type":"imageGeneration","id":"%s","status":"failed","result":{failure_result}}}}}}}\n' "$thread_id" "$turn_id" "$call_id"
 fi
 if [ "$legacy_status" -eq 0 ]; then
   printf '{{"method":"turn/completed","params":{{"threadId":"%s","turn":{{"id":"%s","status":"completed"}}}}}}\n' "$thread_id" "$turn_id"
@@ -3821,6 +3893,17 @@ while IFS= read -r ignored; do :; done
                 format!(
                     "#!/bin/sh\nset -eu\n/bin/cat >/dev/null\n# codex-test-transient-http-401\nprintf '1\\n' >> '{}'\nprintf 'HTTP 401 rejected\\n' >&2\n: > \"$CODEX_HOME/transient-http-401\"\n",
                     invocations.display(),
+                )
+            })
+        }
+
+        fn http_401_rejection(code: Option<&str>, stderr: &str) -> Self {
+            Self::with_script(|invocations, _image, _root| {
+                format!(
+                    "#!/bin/sh\nset -eu\n# codex-test-image-tool-failure\n# codex-test-failure-code:{}\nprintf '1\\n' >> '{}'\nprintf '%s\\n' '{}' >&2\n",
+                    code.unwrap_or("none"),
+                    invocations.display(),
+                    stderr,
                 )
             })
         }
