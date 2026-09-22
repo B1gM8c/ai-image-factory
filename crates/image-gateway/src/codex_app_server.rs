@@ -131,33 +131,31 @@ pub(crate) struct CodexAppServerFailureDiagnosticV1 {
 
 impl CodexAppServerFailureDiagnosticV1 {
     pub(crate) fn is_retryable_authentication_rejection(&self) -> bool {
-        if self.failure_category != CodexAppServerError::ImageToolFailed.code() {
+        if self.failure_category != CodexAppServerError::ImageToolFailed.code()
+            || !matches!(
+                self.class.as_str(),
+                "unknown" | "tool_failure" | "rejected" | "authentication"
+            )
+            || self.numeric_code.is_some_and(|code| code != 401)
+        {
             return false;
         }
         let stderr_class = self
             .stderr
             .as_ref()
             .map_or("unknown", |value| value.class.as_str());
-        let is_nonretryable = |classification: &str| {
-            classification.split([':', '+']).any(|signal| {
-                matches!(
-                    signal,
-                    "content_policy"
-                        | "cyber_policy"
-                        | "safety"
-                        | "moderation"
-                        | "policy"
-                        | "rejected"
-                        | "blocked"
-                        | "invalid_request"
-                        | "unsupported"
-                )
-            })
-        };
-        if is_nonretryable(&self.class) || is_nonretryable(stderr_class) {
-            return false;
+        if stderr_class == "http_status:401" {
+            return true;
         }
-        self.numeric_code == Some(401) || stderr_class.starts_with("http_status:401")
+        if let Some(signals) = stderr_class.strip_prefix("http_status:401:") {
+            return signals
+                .split('+')
+                .all(|signal| matches!(signal, "rejected" | "authentication"));
+        }
+        self.numeric_code == Some(401)
+            && stderr_class
+                .split('+')
+                .all(|signal| matches!(signal, "unknown" | "rejected" | "authentication"))
     }
 }
 
@@ -213,20 +211,27 @@ impl ProtocolState {
         if self.failure_diagnostic.is_some() {
             return;
         }
-        let code = failure_string(
+        let explicit_codes = failure_strings(
             value,
-            &[
-                "/code",
-                "/error/code",
-                "/result/code",
-                "/result/error/code",
-                "/type",
-                "/error/type",
-                "/result/type",
-                "/result/error/type",
-            ],
+            &["/code", "/error/code", "/result/code", "/result/error/code"],
         );
-        let message = failure_string(
+        let nested_types = failure_strings(
+            value,
+            &["/error/type", "/result/type", "/result/error/type"],
+        );
+        let envelope_type = value.pointer("/type").and_then(Value::as_str);
+        let mut explicit_types = nested_types;
+        if let Some(envelope_type) = envelope_type
+            .filter(|value| source != "image_generation_item" || *value != "imageGeneration")
+        {
+            explicit_types.push(envelope_type);
+        }
+        let code = explicit_codes
+            .first()
+            .copied()
+            .or_else(|| explicit_types.first().copied())
+            .or(envelope_type);
+        let messages = failure_strings(
             value,
             &[
                 "/message",
@@ -238,10 +243,30 @@ impl ProtocolState {
                 "/result/error/message",
             ],
         );
+        let message = messages.first().copied();
+        let (numeric_codes, invalid_numeric_code) = failure_numeric_codes(value);
+        let mut class = preferred_failure_class(&explicit_codes, &explicit_types, &messages);
+        let explicit_non_authentication = explicit_codes
+            .iter()
+            .chain(explicit_types.iter())
+            .any(|value| !explicit_authentication_rejection(value));
+        let message_non_authentication = messages
+            .iter()
+            .any(|value| !retryable_authentication_message(value));
+        let numeric_non_authentication =
+            invalid_numeric_code || numeric_codes.iter().any(|code| *code != 401);
+        if (explicit_non_authentication || message_non_authentication || numeric_non_authentication)
+            && matches!(
+                class,
+                "unknown" | "tool_failure" | "authentication" | "rejected"
+            )
+        {
+            class = "explicit_failure";
+        }
         self.failure_diagnostic = Some(FailureDiagnostic {
             source,
-            class: classify_failure(code, message),
-            numeric_code: failure_numeric_code(value),
+            class,
+            numeric_code: numeric_codes.first().copied(),
             code: summarize_field(code),
             message: summarize_field(message),
         });
@@ -816,18 +841,46 @@ async fn wait_for_response<R: AsyncBufRead + Unpin>(
     }
 }
 
-fn failure_string<'a>(value: &'a Value, pointers: &[&str]) -> Option<&'a str> {
-    value.as_str().or_else(|| {
-        pointers
-            .iter()
-            .find_map(|pointer| value.pointer(pointer)?.as_str())
-    })
+fn failure_strings<'a>(value: &'a Value, pointers: &[&str]) -> Vec<&'a str> {
+    value
+        .as_str()
+        .into_iter()
+        .chain(
+            pointers
+                .iter()
+                .filter_map(|pointer| value.pointer(pointer)?.as_str()),
+        )
+        .collect()
 }
 
+#[cfg(test)]
 fn failure_numeric_code(value: &Value) -> Option<i64> {
-    ["/code", "/error/code", "/result/code", "/result/error/code"]
-        .iter()
-        .find_map(|pointer| value.pointer(pointer)?.as_i64())
+    failure_numeric_codes(value).0.into_iter().next()
+}
+
+fn failure_numeric_codes(value: &Value) -> (Vec<i64>, bool) {
+    let mut codes = Vec::new();
+    let mut invalid_numeric_code = false;
+    for pointer in [
+        "/code",
+        "/status",
+        "/error/code",
+        "/error/status",
+        "/result/code",
+        "/result/status",
+        "/result/error/code",
+        "/result/error/status",
+    ] {
+        let Some(value) = value.pointer(pointer) else {
+            continue;
+        };
+        if let Some(code) = value.as_i64() {
+            codes.push(code);
+        } else if value.is_number() {
+            invalid_numeric_code = true;
+        }
+    }
+    (codes, invalid_numeric_code)
 }
 
 fn summarize_field(value: Option<&str>) -> FieldDiagnostic {
@@ -843,14 +896,54 @@ fn summarize_field(value: Option<&str>) -> FieldDiagnostic {
     }
 }
 
-fn classify_failure(code: Option<&str>, message: Option<&str>) -> &'static str {
-    let mut sample = Vec::with_capacity(MAX_DIAGNOSTIC_FIELD_BYTES * 2);
-    for value in [code, message].into_iter().flatten() {
-        let bytes = value.as_bytes();
-        sample.extend_from_slice(&bytes[..bytes.len().min(MAX_DIAGNOSTIC_FIELD_BYTES)]);
-        sample.push(b' ');
+fn preferred_failure_class(
+    explicit_codes: &[&str],
+    explicit_types: &[&str],
+    messages: &[&str],
+) -> &'static str {
+    let explicit_values = || explicit_codes.iter().chain(explicit_types.iter()).copied();
+    if let Some(class) = explicit_values()
+        .map(|value| classify_bytes(value.as_bytes()))
+        .find(|class| {
+            !matches!(
+                *class,
+                "unknown" | "tool_failure" | "authentication" | "rejected"
+            )
+        })
+    {
+        return class;
     }
-    classify_bytes(&sample)
+    if let Some(class) = messages
+        .iter()
+        .map(|value| classify_bytes(value.as_bytes()))
+        .find(|class| {
+            !matches!(
+                *class,
+                "unknown" | "tool_failure" | "authentication" | "rejected"
+            )
+        })
+    {
+        return class;
+    }
+    explicit_values()
+        .chain(messages.iter().copied())
+        .next()
+        .map_or("unknown", |value| classify_bytes(value.as_bytes()))
+}
+
+fn explicit_authentication_rejection(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "authentication"
+            | "authentication_error"
+            | "unauthorized"
+            | "credential_rejected"
+            | "rejected"
+    )
+}
+
+fn retryable_authentication_message(value: &str) -> bool {
+    explicit_authentication_rejection(value)
 }
 
 fn classify_bytes(value: &[u8]) -> &'static str {
@@ -861,6 +954,17 @@ fn classify_bytes(value: &[u8]) -> &'static str {
         "entitlement"
     } else if normalized.contains("content_policy") || normalized.contains("cyber_policy") {
         "content_policy"
+    } else if normalized.contains("retention")
+        || normalized.contains("zero data")
+        || normalized.contains("zdr")
+    {
+        "retention"
+    } else if normalized.contains("organization") || normalized.contains("organisation") {
+        "organization"
+    } else if normalized.contains("account") {
+        "account"
+    } else if normalized.contains("prompt") {
+        "prompt"
     } else if normalized.contains("status 403")
         || normalized.contains("status: 403")
         || normalized.contains("\"status\":403")
@@ -873,27 +977,32 @@ fn classify_bytes(value: &[u8]) -> &'static str {
         || normalized.contains("resource_exhausted")
     {
         "rate_limit"
+    } else if normalized.contains("invalid_argument")
+        || normalized.contains("invalid argument")
+        || normalized.contains("invalid_request")
+        || normalized.contains("unsupported")
+    {
+        "invalid_request"
+    } else if normalized.contains("safety")
+        || normalized.contains("moderation")
+        || normalized.contains("policy")
+        || normalized.contains("blocked")
+    {
+        "policy"
+    } else if normalized.contains("timeout")
+        || normalized.contains("unavailable")
+        || normalized.contains("availability")
+        || normalized.contains("overloaded")
+        || normalized.contains("network")
+    {
+        "availability"
     } else if normalized.contains("unauthorized")
         || normalized.contains("authentication")
         || normalized.contains("credential")
     {
         "authentication"
-    } else if normalized.contains("invalid_argument")
-        || normalized.contains("invalid argument")
-        || normalized.contains("unsupported")
-    {
-        "invalid_request"
-    } else if normalized.contains("safety")
-        || normalized.contains("policy")
-        || normalized.contains("rejected")
-    {
-        "policy"
-    } else if normalized.contains("timeout")
-        || normalized.contains("unavailable")
-        || normalized.contains("overloaded")
-        || normalized.contains("network")
-    {
-        "availability"
+    } else if normalized.contains("rejected") {
+        "rejected"
     } else if normalized.contains("tool") || normalized.contains("image_generation") {
         "tool_failure"
     } else {
@@ -908,19 +1017,67 @@ fn classify_stream_bytes(value: &[u8]) -> String {
     }
     let lowercase = normalized.to_ascii_lowercase();
     let signals = stream_policy_signals(&lowercase);
-    for status in [400_u16, 401, 403, 404, 409, 422, 429, 500, 502, 503, 504] {
-        if lowercase.contains(&format!("http {status}")) {
-            return if signals.is_empty() {
-                format!("http_status:{status}")
-            } else {
-                format!("http_status:{status}:{}", signals.join("+"))
-            };
-        }
+    let statuses = observed_http_statuses(&lowercase);
+    if statuses.len() > 1 {
+        return format!(
+            "http_status_conflict:{}",
+            statuses
+                .iter()
+                .map(u16::to_string)
+                .collect::<Vec<_>>()
+                .join("+")
+        );
+    }
+    if let Some(status) = statuses.first() {
+        return if signals.is_empty() {
+            format!("http_status:{status}")
+        } else {
+            format!("http_status:{status}:{}", signals.join("+"))
+        };
     }
     if !signals.is_empty() {
         return signals.join("+");
     }
     classify_bytes(value).to_string()
+}
+
+fn observed_http_statuses(value: &str) -> Vec<u16> {
+    let bytes = value.as_bytes();
+    let mut statuses = Vec::new();
+    for index in 0..bytes.len().saturating_sub(3) {
+        if &bytes[index..index + 4] != b"http"
+            || index.checked_sub(1).is_some_and(|previous| {
+                bytes[previous].is_ascii_alphanumeric() || bytes[previous] == b'_'
+            })
+        {
+            continue;
+        }
+        let mut cursor = index + 4;
+        if cursor >= bytes.len() || !bytes[cursor].is_ascii_whitespace() {
+            continue;
+        }
+        while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+            cursor += 1;
+        }
+        let start = cursor;
+        while cursor < bytes.len() && bytes[cursor].is_ascii_digit() {
+            cursor += 1;
+        }
+        if cursor - start != 3
+            || cursor < bytes.len()
+                && (bytes[cursor].is_ascii_alphanumeric() || bytes[cursor] == b'_')
+        {
+            continue;
+        }
+        let Ok(status) = value[start..cursor].parse::<u16>() else {
+            continue;
+        };
+        if (100..=599).contains(&status) && !statuses.contains(&status) {
+            statuses.push(status);
+        }
+    }
+    statuses.sort_unstable();
+    statuses
 }
 
 fn stream_policy_signals(value: &str) -> Vec<&'static str> {
@@ -940,6 +1097,32 @@ fn stream_policy_signals(value: &str) -> Vec<&'static str> {
         ("unsupported", &["unsupported"]),
         ("blocked", &["blocked"]),
         ("policy", &["policy"]),
+        (
+            "forbidden",
+            &["forbidden", "status 403", "status: 403", "\"status\":403"],
+        ),
+        (
+            "rate_limit",
+            &["rate_limit", "rate limit", "quota", "resource_exhausted"],
+        ),
+        (
+            "availability",
+            &[
+                "timeout",
+                "unavailable",
+                "availability",
+                "overloaded",
+                "network",
+            ],
+        ),
+        (
+            "invalid_request",
+            &["invalid_argument", "invalid argument", "invalid_request"],
+        ),
+        (
+            "authentication",
+            &["unauthorized", "authentication", "credential"],
+        ),
     ] {
         if needles.iter().any(|needle| value.contains(needle)) {
             signals.push(signal);
@@ -1602,6 +1785,27 @@ mod tests {
             "forbidden"
         );
         assert_eq!(classify_bytes(b"policy rejected"), "policy");
+        assert_eq!(classify_bytes(b"moderation rejected"), "policy");
+        assert_eq!(classify_bytes(b"request blocked"), "policy");
+        assert_eq!(
+            classify_bytes(b"invalid_request rejected"),
+            "invalid_request"
+        );
+        assert_eq!(classify_bytes(b"provider rejected"), "rejected");
+        assert_eq!(classify_bytes(b"retention rejected"), "retention");
+        assert_eq!(classify_bytes(b"organization rejected"), "organization");
+        assert_eq!(classify_bytes(b"account suspended rejected"), "account");
+        assert_eq!(classify_bytes(b"prompt rejected"), "prompt");
+        assert_eq!(
+            classify_stream_bytes(b"HTTP 401 rejected"),
+            "http_status:401:rejected"
+        );
+        assert_eq!(classify_stream_bytes(b"HTTP 4010 rejected"), "rejected");
+        assert_eq!(classify_stream_bytes(b"HTTP 401abc rejected"), "rejected");
+        assert_eq!(
+            classify_stream_bytes(b"HTTP 401 rejected\nHTTP 503 server error"),
+            "http_status_conflict:401+503"
+        );
         assert_eq!(
             classify_stream_bytes(
                 br#"image generation failed: http 400 Bad Request: Some("{\"error\":{\"code\":\"content_policy\"}}")"#,
@@ -1648,6 +1852,13 @@ mod tests {
         for diagnostic in [
             persisted("codex_image_tool_failed", Some(401), "unknown"),
             persisted("codex_image_tool_failed", None, "http_status:401"),
+            persisted("codex_image_tool_failed", None, "http_status:401:rejected"),
+            persisted(
+                "codex_image_tool_failed",
+                None,
+                "http_status:401:authentication+rejected",
+            ),
+            persisted("codex_image_tool_failed", Some(401), "rejected"),
         ] {
             assert!(diagnostic.is_retryable_authentication_rejection());
         }
@@ -1664,9 +1875,393 @@ mod tests {
             persisted("codex_image_tool_failed", None, "rejected"),
             persisted("codex_image_tool_failed", None, "http_status:429"),
             persisted("codex_image_tool_failed", None, "http_status:503"),
+            persisted("codex_image_tool_failed", Some(401), "http_status:503"),
+            persisted("codex_image_tool_failed", Some(403), "http_status:401"),
+            persisted(
+                "codex_image_tool_failed",
+                Some(401),
+                "api_code:authentication",
+            ),
+            persisted(
+                "codex_image_tool_failed",
+                Some(401),
+                "api_code:rate_limit_exceeded",
+            ),
+            persisted("codex_image_tool_failed", None, "http_status:4010"),
+            persisted("codex_image_tool_failed", None, "http_status:401:"),
             persisted("codex_turn_failed", Some(401), "http_status:401"),
         ] {
             assert!(!diagnostic.is_retryable_authentication_rejection());
+        }
+        for explicit_nonretryable_signal in [
+            "content_policy",
+            "cyber_policy",
+            "safety",
+            "moderation",
+            "policy",
+            "blocked",
+            "invalid_request",
+            "unsupported",
+            "rate_limit",
+            "originator",
+            "entitlement",
+            "forbidden",
+            "availability",
+            "retention",
+            "organization",
+            "account",
+            "prompt",
+            "future_explicit_failure",
+        ] {
+            let diagnostic = persisted(
+                "codex_image_tool_failed",
+                None,
+                &format!("http_status:401:{explicit_nonretryable_signal}"),
+            );
+            assert!(!diagnostic.is_retryable_authentication_rejection());
+            let mut diagnostic = persisted(
+                "codex_image_tool_failed",
+                Some(401),
+                "http_status:401:rejected",
+            );
+            diagnostic.class = explicit_nonretryable_signal.to_string();
+            assert!(!diagnostic.is_retryable_authentication_rejection());
+        }
+
+        let persisted_from_failure = |message: &str| {
+            let mut state = ProtocolState::default();
+            state.record_failure(
+                "image_generation_item",
+                &json!({ "code": 401, "message": message }),
+            );
+            build_failure_diagnostic(
+                &state,
+                CodexAppServerError::ImageToolFailed,
+                Some(&StreamDiagnostic {
+                    sha256: "a".repeat(64),
+                    bytes: 32,
+                    truncated: false,
+                    class: "http_status:401:rejected".to_string(),
+                }),
+                &ExitDiagnostic {
+                    observed: true,
+                    code: Some(0),
+                    signal: None,
+                },
+            )
+        };
+
+        let persisted = persisted_from_failure("rejected");
+        assert_eq!(persisted.class, "rejected");
+        assert_eq!(persisted.numeric_code, Some(401));
+        assert!(persisted.is_retryable_authentication_rejection());
+
+        for code in [
+            "authentication",
+            "authentication_error",
+            "unauthorized",
+            "credential_rejected",
+            "rejected",
+        ] {
+            let mut state = ProtocolState::default();
+            state.record_failure(
+                "image_generation_item",
+                &json!({
+                    "type": "imageGeneration",
+                    "status": "failed",
+                    "result": { "code": code }
+                }),
+            );
+            let persisted = build_failure_diagnostic(
+                &state,
+                CodexAppServerError::ImageToolFailed,
+                Some(&StreamDiagnostic {
+                    class: classify_stream_bytes(b"HTTP 401 rejected"),
+                    ..StreamDiagnostic::default()
+                }),
+                &ExitDiagnostic {
+                    observed: true,
+                    code: Some(0),
+                    signal: None,
+                },
+            );
+            assert!(persisted.is_retryable_authentication_rejection(), "{code}");
+        }
+
+        for (message, expected_class) in [
+            ("content_policy rejected", "content_policy"),
+            ("cyber_policy rejected", "content_policy"),
+            ("safety rejected", "policy"),
+            ("moderation rejected", "policy"),
+            ("policy rejected", "policy"),
+            ("blocked rejected", "policy"),
+            ("invalid_request rejected", "invalid_request"),
+            ("unsupported rejected", "invalid_request"),
+            ("authentication blocked rejected", "policy"),
+            ("unauthorized moderation rejected", "policy"),
+            ("credential invalid_request rejected", "invalid_request"),
+            ("rate_limit rejected", "rate_limit"),
+            ("originator rejected", "originator_policy"),
+            ("entitlement rejected", "entitlement"),
+            ("forbidden rejected", "forbidden"),
+            ("unavailable authentication rejected", "availability"),
+            ("retention rejected", "retention"),
+            ("organization rejected", "organization"),
+            ("account suspended rejected", "account"),
+            ("prompt rejected", "prompt"),
+        ] {
+            let persisted = persisted_from_failure(message);
+            assert_eq!(persisted.class, expected_class);
+            assert!(!persisted.is_retryable_authentication_rejection());
+        }
+
+        for (code, expected_class) in [
+            ("account_suspended", "account"),
+            ("account_suspended_rejected", "account"),
+            ("retention", "retention"),
+            ("future_explicit_failure", "explicit_failure"),
+            ("future_explicit_failure_rejected", "explicit_failure"),
+        ] {
+            let mut state = ProtocolState::default();
+            state.record_failure(
+                "image_generation_item",
+                &json!({
+                    "type": "imageGeneration",
+                    "status": "failed",
+                    "result": { "code": code }
+                }),
+            );
+            let persisted = build_failure_diagnostic(
+                &state,
+                CodexAppServerError::ImageToolFailed,
+                Some(&StreamDiagnostic {
+                    class: classify_stream_bytes(b"HTTP 401 rejected"),
+                    ..StreamDiagnostic::default()
+                }),
+                &ExitDiagnostic {
+                    observed: true,
+                    code: Some(0),
+                    signal: None,
+                },
+            );
+            assert_eq!(persisted.class, expected_class, "{code}");
+            assert!(!persisted.is_retryable_authentication_rejection(), "{code}");
+        }
+
+        let mut state = ProtocolState::default();
+        state.record_failure(
+            "image_generation_item",
+            &json!({
+                "type": "imageGeneration",
+                "status": "failed",
+                "result": { "message": "future provider failure" }
+            }),
+        );
+        assert_eq!(state.failure_diagnostic.unwrap().class, "explicit_failure");
+    }
+
+    #[test]
+    fn conflicting_structured_failure_signals_never_retry_authentication() {
+        for (value, expected_class, expected_numeric_code) in [
+            (
+                json!({
+                    "type": "imageGeneration",
+                    "status": "failed",
+                    "result": {
+                        "code": "rejected",
+                        "error": { "code": "content_policy" }
+                    }
+                }),
+                "content_policy",
+                None,
+            ),
+            (
+                json!({
+                    "type": "imageGeneration",
+                    "status": "failed",
+                    "result": {
+                        "type": "authentication_error",
+                        "error": { "type": "server_error" }
+                    }
+                }),
+                "explicit_failure",
+                None,
+            ),
+            (
+                json!({
+                    "type": "imageGeneration",
+                    "status": "failed",
+                    "result": {
+                        "message": "rejected",
+                        "error": { "message": "content_policy rejected" }
+                    }
+                }),
+                "content_policy",
+                None,
+            ),
+            (
+                json!({
+                    "type": "imageGeneration",
+                    "status": "failed",
+                    "code": 401,
+                    "result": { "code": 403 }
+                }),
+                "explicit_failure",
+                Some(401),
+            ),
+            (
+                json!({
+                    "type": "imageGeneration",
+                    "status": "failed",
+                    "result": { "code": "rejected", "status": 403 }
+                }),
+                "explicit_failure",
+                Some(403),
+            ),
+            (
+                json!({
+                    "type": "imageGeneration",
+                    "status": "failed",
+                    "result": { "code": 403.0 }
+                }),
+                "explicit_failure",
+                None,
+            ),
+            (
+                json!({
+                    "type": "imageGeneration",
+                    "status": "failed",
+                    "result": { "code": 1e100 }
+                }),
+                "explicit_failure",
+                None,
+            ),
+            (
+                json!({
+                    "type": "imageGeneration",
+                    "status": "failed",
+                    "result": {
+                        "message": "rejected",
+                        "error": { "message": "server_error" }
+                    }
+                }),
+                "explicit_failure",
+                None,
+            ),
+            (
+                json!({
+                    "type": "imageGeneration",
+                    "status": "failed",
+                    "result": { "message": "HTTP 503 rejected" }
+                }),
+                "explicit_failure",
+                None,
+            ),
+            (
+                json!({
+                    "type": "imageGeneration",
+                    "status": "failed",
+                    "result": {
+                        "message": "HTTP 401 rejected",
+                        "error": { "message": "HTTP 503" }
+                    }
+                }),
+                "explicit_failure",
+                None,
+            ),
+            (
+                json!({
+                    "type": "imageGeneration",
+                    "status": "failed",
+                    "result": {
+                        "code": "authentication_error",
+                        "message": "server_error rejected"
+                    }
+                }),
+                "explicit_failure",
+                None,
+            ),
+        ] {
+            let mut state = ProtocolState::default();
+            state.record_failure("image_generation_item", &value);
+            let persisted = build_failure_diagnostic(
+                &state,
+                CodexAppServerError::ImageToolFailed,
+                Some(&StreamDiagnostic {
+                    class: classify_stream_bytes(b"HTTP 401 rejected"),
+                    ..StreamDiagnostic::default()
+                }),
+                &ExitDiagnostic {
+                    observed: true,
+                    code: Some(0),
+                    signal: None,
+                },
+            );
+
+            assert_eq!(persisted.class, expected_class, "{value}");
+            assert_eq!(persisted.numeric_code, expected_numeric_code, "{value}");
+            assert!(
+                !persisted.is_retryable_authentication_rejection(),
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn production_http_401_rejection_preserves_unknown_item_shape() {
+        let mut state = ProtocolState::default();
+        state.record_failure(
+            "image_generation_item",
+            &json!({
+                "type": "imageGeneration", "status": "failed", "result": null
+            }),
+        );
+        let persisted = build_failure_diagnostic(
+            &state,
+            CodexAppServerError::ImageToolFailed,
+            Some(&StreamDiagnostic {
+                class: classify_stream_bytes(b"HTTP 401 rejected"),
+                ..StreamDiagnostic::default()
+            }),
+            &ExitDiagnostic {
+                observed: true,
+                code: Some(0),
+                signal: None,
+            },
+        );
+        assert_eq!(persisted.class, "unknown");
+        assert_eq!(persisted.numeric_code, None);
+        assert_eq!(persisted.code.bytes, "imageGeneration".len());
+        assert_eq!(persisted.message.bytes, 0);
+        assert_eq!(
+            persisted.stderr.as_ref().unwrap().class,
+            "http_status:401:rejected"
+        );
+        assert!(persisted.is_retryable_authentication_rejection());
+
+        for (signal, expected_class) in [
+            ("forbidden", "forbidden"),
+            ("rate_limit", "rate_limit"),
+            ("unavailable", "availability"),
+            ("invalid_request", "invalid_request"),
+            ("retention", "retention"),
+            ("organization", "organization"),
+            ("account", "account"),
+            ("prompt", "prompt"),
+        ] {
+            let mut diagnostic = persisted.clone();
+            let stderr_class =
+                classify_stream_bytes(format!("HTTP 401 {signal} rejected").as_bytes());
+            assert!(
+                stderr_class
+                    .split([':', '+'])
+                    .any(|value| value == expected_class)
+            );
+            diagnostic.stderr.as_mut().unwrap().class = stderr_class;
+            assert!(
+                !diagnostic.is_retryable_authentication_rejection(),
+                "{signal}"
+            );
         }
     }
 
