@@ -211,21 +211,27 @@ impl ProtocolState {
         if self.failure_diagnostic.is_some() {
             return;
         }
-        let explicit_code = failure_string(
+        let explicit_codes = failure_strings(
             value,
             &["/code", "/error/code", "/result/code", "/result/error/code"],
         );
-        let nested_type = failure_string(
+        let nested_types = failure_strings(
             value,
             &["/error/type", "/result/type", "/result/error/type"],
         );
         let envelope_type = value.pointer("/type").and_then(Value::as_str);
-        let explicit_type = nested_type.or_else(|| {
-            envelope_type
-                .filter(|value| source != "image_generation_item" || *value != "imageGeneration")
-        });
-        let code = explicit_code.or(explicit_type).or(envelope_type);
-        let message = failure_string(
+        let mut explicit_types = nested_types;
+        if let Some(envelope_type) = envelope_type
+            .filter(|value| source != "image_generation_item" || *value != "imageGeneration")
+        {
+            explicit_types.push(envelope_type);
+        }
+        let code = explicit_codes
+            .first()
+            .copied()
+            .or_else(|| explicit_types.first().copied())
+            .or(envelope_type);
+        let messages = failure_strings(
             value,
             &[
                 "/message",
@@ -237,24 +243,30 @@ impl ProtocolState {
                 "/result/error/message",
             ],
         );
-        let mut class = classify_failure(code, message);
-        if explicit_code
-            .into_iter()
-            .chain(explicit_type)
-            .any(|value| !explicit_authentication_rejection(value))
+        let message = messages.first().copied();
+        let (numeric_codes, invalid_numeric_code) = failure_numeric_codes(value);
+        let mut class = preferred_failure_class(&explicit_codes, &explicit_types, &messages);
+        let explicit_non_authentication = explicit_codes
+            .iter()
+            .chain(explicit_types.iter())
+            .any(|value| !explicit_authentication_rejection(value));
+        let message_non_authentication = messages
+            .iter()
+            .any(|value| !retryable_authentication_message(value));
+        let numeric_non_authentication =
+            invalid_numeric_code || numeric_codes.iter().any(|code| *code != 401);
+        if (explicit_non_authentication || message_non_authentication || numeric_non_authentication)
             && matches!(
                 class,
                 "unknown" | "tool_failure" | "authentication" | "rejected"
             )
         {
             class = "explicit_failure";
-        } else if class == "unknown" && message.is_some() {
-            class = "explicit_failure";
         }
         self.failure_diagnostic = Some(FailureDiagnostic {
             source,
             class,
-            numeric_code: failure_numeric_code(value),
+            numeric_code: numeric_codes.first().copied(),
             code: summarize_field(code),
             message: summarize_field(message),
         });
@@ -829,18 +841,46 @@ async fn wait_for_response<R: AsyncBufRead + Unpin>(
     }
 }
 
-fn failure_string<'a>(value: &'a Value, pointers: &[&str]) -> Option<&'a str> {
-    value.as_str().or_else(|| {
-        pointers
-            .iter()
-            .find_map(|pointer| value.pointer(pointer)?.as_str())
-    })
+fn failure_strings<'a>(value: &'a Value, pointers: &[&str]) -> Vec<&'a str> {
+    value
+        .as_str()
+        .into_iter()
+        .chain(
+            pointers
+                .iter()
+                .filter_map(|pointer| value.pointer(pointer)?.as_str()),
+        )
+        .collect()
 }
 
+#[cfg(test)]
 fn failure_numeric_code(value: &Value) -> Option<i64> {
-    ["/code", "/error/code", "/result/code", "/result/error/code"]
-        .iter()
-        .find_map(|pointer| value.pointer(pointer)?.as_i64())
+    failure_numeric_codes(value).0.into_iter().next()
+}
+
+fn failure_numeric_codes(value: &Value) -> (Vec<i64>, bool) {
+    let mut codes = Vec::new();
+    let mut invalid_numeric_code = false;
+    for pointer in [
+        "/code",
+        "/status",
+        "/error/code",
+        "/error/status",
+        "/result/code",
+        "/result/status",
+        "/result/error/code",
+        "/result/error/status",
+    ] {
+        let Some(value) = value.pointer(pointer) else {
+            continue;
+        };
+        if let Some(code) = value.as_i64() {
+            codes.push(code);
+        } else if value.is_number() {
+            invalid_numeric_code = true;
+        }
+    }
+    (codes, invalid_numeric_code)
 }
 
 fn summarize_field(value: Option<&str>) -> FieldDiagnostic {
@@ -856,14 +896,39 @@ fn summarize_field(value: Option<&str>) -> FieldDiagnostic {
     }
 }
 
-fn classify_failure(code: Option<&str>, message: Option<&str>) -> &'static str {
-    let mut sample = Vec::with_capacity(MAX_DIAGNOSTIC_FIELD_BYTES * 2);
-    for value in [code, message].into_iter().flatten() {
-        let bytes = value.as_bytes();
-        sample.extend_from_slice(&bytes[..bytes.len().min(MAX_DIAGNOSTIC_FIELD_BYTES)]);
-        sample.push(b' ');
+fn preferred_failure_class(
+    explicit_codes: &[&str],
+    explicit_types: &[&str],
+    messages: &[&str],
+) -> &'static str {
+    let explicit_values = || explicit_codes.iter().chain(explicit_types.iter()).copied();
+    if let Some(class) = explicit_values()
+        .map(|value| classify_bytes(value.as_bytes()))
+        .find(|class| {
+            !matches!(
+                *class,
+                "unknown" | "tool_failure" | "authentication" | "rejected"
+            )
+        })
+    {
+        return class;
     }
-    classify_bytes(&sample)
+    if let Some(class) = messages
+        .iter()
+        .map(|value| classify_bytes(value.as_bytes()))
+        .find(|class| {
+            !matches!(
+                *class,
+                "unknown" | "tool_failure" | "authentication" | "rejected"
+            )
+        })
+    {
+        return class;
+    }
+    explicit_values()
+        .chain(messages.iter().copied())
+        .next()
+        .map_or("unknown", |value| classify_bytes(value.as_bytes()))
 }
 
 fn explicit_authentication_rejection(value: &str) -> bool {
@@ -875,6 +940,10 @@ fn explicit_authentication_rejection(value: &str) -> bool {
             | "credential_rejected"
             | "rejected"
     )
+}
+
+fn retryable_authentication_message(value: &str) -> bool {
+    explicit_authentication_rejection(value)
 }
 
 fn classify_bytes(value: &[u8]) -> &'static str {
@@ -1882,7 +1951,7 @@ mod tests {
             )
         };
 
-        let persisted = persisted_from_failure("provider rejected");
+        let persisted = persisted_from_failure("rejected");
         assert_eq!(persisted.class, "rejected");
         assert_eq!(persisted.numeric_code, Some(401));
         assert!(persisted.is_retryable_authentication_rejection());
@@ -1989,6 +2058,153 @@ mod tests {
             }),
         );
         assert_eq!(state.failure_diagnostic.unwrap().class, "explicit_failure");
+    }
+
+    #[test]
+    fn conflicting_structured_failure_signals_never_retry_authentication() {
+        for (value, expected_class, expected_numeric_code) in [
+            (
+                json!({
+                    "type": "imageGeneration",
+                    "status": "failed",
+                    "result": {
+                        "code": "rejected",
+                        "error": { "code": "content_policy" }
+                    }
+                }),
+                "content_policy",
+                None,
+            ),
+            (
+                json!({
+                    "type": "imageGeneration",
+                    "status": "failed",
+                    "result": {
+                        "type": "authentication_error",
+                        "error": { "type": "server_error" }
+                    }
+                }),
+                "explicit_failure",
+                None,
+            ),
+            (
+                json!({
+                    "type": "imageGeneration",
+                    "status": "failed",
+                    "result": {
+                        "message": "rejected",
+                        "error": { "message": "content_policy rejected" }
+                    }
+                }),
+                "content_policy",
+                None,
+            ),
+            (
+                json!({
+                    "type": "imageGeneration",
+                    "status": "failed",
+                    "code": 401,
+                    "result": { "code": 403 }
+                }),
+                "explicit_failure",
+                Some(401),
+            ),
+            (
+                json!({
+                    "type": "imageGeneration",
+                    "status": "failed",
+                    "result": { "code": "rejected", "status": 403 }
+                }),
+                "explicit_failure",
+                Some(403),
+            ),
+            (
+                json!({
+                    "type": "imageGeneration",
+                    "status": "failed",
+                    "result": { "code": 403.0 }
+                }),
+                "explicit_failure",
+                None,
+            ),
+            (
+                json!({
+                    "type": "imageGeneration",
+                    "status": "failed",
+                    "result": { "code": 1e100 }
+                }),
+                "explicit_failure",
+                None,
+            ),
+            (
+                json!({
+                    "type": "imageGeneration",
+                    "status": "failed",
+                    "result": {
+                        "message": "rejected",
+                        "error": { "message": "server_error" }
+                    }
+                }),
+                "explicit_failure",
+                None,
+            ),
+            (
+                json!({
+                    "type": "imageGeneration",
+                    "status": "failed",
+                    "result": { "message": "HTTP 503 rejected" }
+                }),
+                "explicit_failure",
+                None,
+            ),
+            (
+                json!({
+                    "type": "imageGeneration",
+                    "status": "failed",
+                    "result": {
+                        "message": "HTTP 401 rejected",
+                        "error": { "message": "HTTP 503" }
+                    }
+                }),
+                "explicit_failure",
+                None,
+            ),
+            (
+                json!({
+                    "type": "imageGeneration",
+                    "status": "failed",
+                    "result": {
+                        "code": "authentication_error",
+                        "message": "server_error rejected"
+                    }
+                }),
+                "explicit_failure",
+                None,
+            ),
+        ] {
+            let mut state = ProtocolState::default();
+            state.record_failure("image_generation_item", &value);
+            let persisted = build_failure_diagnostic(
+                &state,
+                CodexAppServerError::ImageToolFailed,
+                Some(&StreamDiagnostic {
+                    class: classify_stream_bytes(b"HTTP 401 rejected"),
+                    ..StreamDiagnostic::default()
+                }),
+                &ExitDiagnostic {
+                    observed: true,
+                    code: Some(0),
+                    signal: None,
+                },
+            );
+
+            assert_eq!(persisted.class, expected_class, "{value}");
+            assert_eq!(persisted.numeric_code, expected_numeric_code, "{value}");
+            assert!(
+                !persisted.is_retryable_authentication_rejection(),
+                "{value}"
+            );
+        }
     }
 
     #[test]
