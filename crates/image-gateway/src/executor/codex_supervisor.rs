@@ -2582,17 +2582,23 @@ mod tests {
             (Some("entitlement"), "HTTP 401 rejected", "entitlement"),
             (Some("forbidden"), "HTTP 401 rejected", "forbidden"),
             (Some("unavailable"), "HTTP 401 rejected", "availability"),
+            (Some("account_suspended"), "HTTP 401 rejected", "account"),
             (
-                Some("account_suspended"),
+                Some("account_suspended_rejected"),
                 "HTTP 401 rejected",
-                "explicit_failure",
+                "account",
             ),
             (
                 Some("future_explicit_failure"),
                 "HTTP 401 rejected",
                 "explicit_failure",
             ),
-            (Some("retention"), "HTTP 401 rejected", "explicit_failure"),
+            (
+                Some("future_explicit_failure_rejected"),
+                "HTTP 401 rejected",
+                "explicit_failure",
+            ),
+            (Some("retention"), "HTTP 401 rejected", "retention"),
             (None, "HTTP 401 retention rejected", "unknown"),
             (None, "HTTP 401 organization rejected", "unknown"),
             (None, "HTTP 401 account rejected", "unknown"),
@@ -2638,6 +2644,49 @@ mod tests {
                     .unwrap()
                     .is_none(),
                 "{code:?}, {stderr}"
+            );
+            assert_eq!(fs::read_to_string(&fixture.invocations).unwrap(), "1\n");
+        }
+        for (message, expected_class) in [
+            ("retention rejected", "retention"),
+            ("organization rejected", "organization"),
+            ("account suspended rejected", "account"),
+            ("prompt rejected", "prompt"),
+        ] {
+            let fixture = CodexFixture::http_401_message_rejection(message);
+            let lease = fixture.lease();
+            let context = fixture.context(&lease);
+            fixture.journal.start_or_attach(&lease).unwrap();
+            fixture.supervisor.prepare(&lease, &context).await.unwrap();
+            assert_eq!(
+                fixture.journal.commit_launch(&lease).unwrap(),
+                LaunchDecision::LaunchOnce
+            );
+            let spool = ExecutionSpool::for_lease(&fixture.journal, &lease).unwrap();
+            run_codex_runner_child(fixture.journal.root_path(), lease.executor_execution_id)
+                .await
+                .unwrap();
+            assert_eq!(
+                spool.observe().unwrap(),
+                ProcessObservation::Failed {
+                    error_code: "codex_image_tool_failed".to_string(),
+                },
+                "{message}"
+            );
+            let diagnostic_path = fixture
+                .journal
+                .root_path()
+                .join(lease.executor_execution_id.simple().to_string())
+                .join(CODEX_APP_SERVER_FAILURE_DIAGNOSTIC_FILE);
+            let diagnostic: serde_json::Value =
+                serde_json::from_slice(&fs::read(diagnostic_path).unwrap()).unwrap();
+            assert_eq!(diagnostic["class"], expected_class, "{message}");
+            assert!(
+                spool
+                    .read_diagnostic::<CodexAuthRefreshRequestV1>(CODEX_AUTH_REFRESH_REQUEST_FILE)
+                    .unwrap()
+                    .is_none(),
+                "{message}"
             );
             assert_eq!(fs::read_to_string(&fixture.invocations).unwrap(), "1\n");
         }
@@ -3786,17 +3835,24 @@ mod tests {
     fn app_server_fixture_script(exec_body: String) -> String {
         let image_tool_failure = usize::from(exec_body.contains("codex-test-image-tool-failure"));
         let transient_http_401 = usize::from(exec_body.contains("codex-test-transient-http-401"));
-        let failure_result = match exec_body
+        let failure_message = exec_body
             .lines()
-            .find_map(|line| line.strip_prefix("# codex-test-failure-code:"))
-        {
-            Some("none") => serde_json::Value::Null,
-            Some(code) => serde_json::json!({ "code": code }),
-            None if transient_http_401 == 1 => serde_json::Value::Null,
-            None => serde_json::json!({
-                "code": "rate_limit_exceeded",
-                "message": "provider-sensitive-prompt-fragment"
-            }),
+            .find_map(|line| line.strip_prefix("# codex-test-failure-message:"));
+        let failure_result = if let Some(message) = failure_message {
+            serde_json::json!({ "message": message })
+        } else {
+            match exec_body
+                .lines()
+                .find_map(|line| line.strip_prefix("# codex-test-failure-code:"))
+            {
+                Some("none") => serde_json::Value::Null,
+                Some(code) => serde_json::json!({ "code": code }),
+                None if transient_http_401 == 1 => serde_json::Value::Null,
+                None => serde_json::json!({
+                    "code": "rate_limit_exceeded",
+                    "message": "provider-sensitive-prompt-fragment"
+                }),
+            }
         };
         let force_malformed = usize::from(
             exec_body.contains("/usr/bin/head -c 70000")
@@ -3917,6 +3973,16 @@ while IFS= read -r ignored; do :; done
                     code.unwrap_or("none"),
                     invocations.display(),
                     stderr,
+                )
+            })
+        }
+
+        fn http_401_message_rejection(message: &str) -> Self {
+            Self::with_script(|invocations, _image, _root| {
+                format!(
+                    "#!/bin/sh\nset -eu\n# codex-test-image-tool-failure\n# codex-test-failure-message:{}\nprintf '1\\n' >> '{}'\nprintf 'HTTP 401 rejected\\n' >&2\n",
+                    message,
+                    invocations.display(),
                 )
             })
         }

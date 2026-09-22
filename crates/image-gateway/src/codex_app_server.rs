@@ -238,15 +238,15 @@ impl ProtocolState {
             ],
         );
         let mut class = classify_failure(code, message);
-        if explicit_code.into_iter().chain(explicit_type).any(|value| {
-            !matches!(
-                classify_bytes(value.as_bytes()),
-                "authentication" | "rejected"
+        if explicit_code
+            .into_iter()
+            .chain(explicit_type)
+            .any(|value| !explicit_authentication_rejection(value))
+            && matches!(
+                class,
+                "unknown" | "tool_failure" | "authentication" | "rejected"
             )
-        }) && matches!(
-            class,
-            "unknown" | "tool_failure" | "authentication" | "rejected"
-        ) {
+        {
             class = "explicit_failure";
         } else if class == "unknown" && message.is_some() {
             class = "explicit_failure";
@@ -866,6 +866,17 @@ fn classify_failure(code: Option<&str>, message: Option<&str>) -> &'static str {
     classify_bytes(&sample)
 }
 
+fn explicit_authentication_rejection(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "authentication"
+            | "authentication_error"
+            | "unauthorized"
+            | "credential_rejected"
+            | "rejected"
+    )
+}
+
 fn classify_bytes(value: &[u8]) -> &'static str {
     let normalized = String::from_utf8_lossy(value).to_ascii_lowercase();
     if normalized.contains("originator") {
@@ -874,6 +885,17 @@ fn classify_bytes(value: &[u8]) -> &'static str {
         "entitlement"
     } else if normalized.contains("content_policy") || normalized.contains("cyber_policy") {
         "content_policy"
+    } else if normalized.contains("retention")
+        || normalized.contains("zero data")
+        || normalized.contains("zdr")
+    {
+        "retention"
+    } else if normalized.contains("organization") || normalized.contains("organisation") {
+        "organization"
+    } else if normalized.contains("account") {
+        "account"
+    } else if normalized.contains("prompt") {
+        "prompt"
     } else if normalized.contains("status 403")
         || normalized.contains("status: 403")
         || normalized.contains("\"status\":403")
@@ -1701,6 +1723,10 @@ mod tests {
             "invalid_request"
         );
         assert_eq!(classify_bytes(b"provider rejected"), "rejected");
+        assert_eq!(classify_bytes(b"retention rejected"), "retention");
+        assert_eq!(classify_bytes(b"organization rejected"), "organization");
+        assert_eq!(classify_bytes(b"account suspended rejected"), "account");
+        assert_eq!(classify_bytes(b"prompt rejected"), "prompt");
         assert_eq!(
             classify_stream_bytes(b"HTTP 401 rejected"),
             "http_status:401:rejected"
@@ -1861,30 +1887,13 @@ mod tests {
         assert_eq!(persisted.numeric_code, Some(401));
         assert!(persisted.is_retryable_authentication_rejection());
 
-        for (message, expected_class) in [
-            ("content_policy rejected", "content_policy"),
-            ("cyber_policy rejected", "content_policy"),
-            ("safety rejected", "policy"),
-            ("moderation rejected", "policy"),
-            ("policy rejected", "policy"),
-            ("blocked rejected", "policy"),
-            ("invalid_request rejected", "invalid_request"),
-            ("unsupported rejected", "invalid_request"),
-            ("authentication blocked rejected", "policy"),
-            ("unauthorized moderation rejected", "policy"),
-            ("credential invalid_request rejected", "invalid_request"),
-            ("rate_limit rejected", "rate_limit"),
-            ("originator rejected", "originator_policy"),
-            ("entitlement rejected", "entitlement"),
-            ("forbidden rejected", "forbidden"),
-            ("unavailable authentication rejected", "availability"),
+        for code in [
+            "authentication",
+            "authentication_error",
+            "unauthorized",
+            "credential_rejected",
+            "rejected",
         ] {
-            let persisted = persisted_from_failure(message);
-            assert_eq!(persisted.class, expected_class);
-            assert!(!persisted.is_retryable_authentication_rejection());
-        }
-
-        for code in ["account_suspended", "retention", "future_explicit_failure"] {
             let mut state = ProtocolState::default();
             state.record_failure(
                 "image_generation_item",
@@ -1907,7 +1916,66 @@ mod tests {
                     signal: None,
                 },
             );
-            assert_eq!(persisted.class, "explicit_failure", "{code}");
+            assert!(persisted.is_retryable_authentication_rejection(), "{code}");
+        }
+
+        for (message, expected_class) in [
+            ("content_policy rejected", "content_policy"),
+            ("cyber_policy rejected", "content_policy"),
+            ("safety rejected", "policy"),
+            ("moderation rejected", "policy"),
+            ("policy rejected", "policy"),
+            ("blocked rejected", "policy"),
+            ("invalid_request rejected", "invalid_request"),
+            ("unsupported rejected", "invalid_request"),
+            ("authentication blocked rejected", "policy"),
+            ("unauthorized moderation rejected", "policy"),
+            ("credential invalid_request rejected", "invalid_request"),
+            ("rate_limit rejected", "rate_limit"),
+            ("originator rejected", "originator_policy"),
+            ("entitlement rejected", "entitlement"),
+            ("forbidden rejected", "forbidden"),
+            ("unavailable authentication rejected", "availability"),
+            ("retention rejected", "retention"),
+            ("organization rejected", "organization"),
+            ("account suspended rejected", "account"),
+            ("prompt rejected", "prompt"),
+        ] {
+            let persisted = persisted_from_failure(message);
+            assert_eq!(persisted.class, expected_class);
+            assert!(!persisted.is_retryable_authentication_rejection());
+        }
+
+        for (code, expected_class) in [
+            ("account_suspended", "account"),
+            ("account_suspended_rejected", "account"),
+            ("retention", "retention"),
+            ("future_explicit_failure", "explicit_failure"),
+            ("future_explicit_failure_rejected", "explicit_failure"),
+        ] {
+            let mut state = ProtocolState::default();
+            state.record_failure(
+                "image_generation_item",
+                &json!({
+                    "type": "imageGeneration",
+                    "status": "failed",
+                    "result": { "code": code }
+                }),
+            );
+            let persisted = build_failure_diagnostic(
+                &state,
+                CodexAppServerError::ImageToolFailed,
+                Some(&StreamDiagnostic {
+                    class: classify_stream_bytes(b"HTTP 401 rejected"),
+                    ..StreamDiagnostic::default()
+                }),
+                &ExitDiagnostic {
+                    observed: true,
+                    code: Some(0),
+                    signal: None,
+                },
+            );
+            assert_eq!(persisted.class, expected_class, "{code}");
             assert!(!persisted.is_retryable_authentication_rejection(), "{code}");
         }
 
