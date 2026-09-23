@@ -13,6 +13,7 @@ use super::{
     AdmissionClaim, AdmissionError, AdmissionStore, AdmissionTicket, AttachInputManifest,
     AttachJob, AttachedWork, ClaimAdmission, WorkLease, WorkOutcome, validate_attach_request,
 };
+use crate::settlement::{ImageGenerationStatusSnapshot, ImageOutputStatus};
 
 #[derive(Default)]
 pub struct InMemoryAdmissionStore {
@@ -55,6 +56,7 @@ enum SessionState {
 
 #[derive(Clone)]
 struct IdempotencyRecord {
+    tenant_id: String,
     session_id: Uuid,
     request_hash: String,
     state: String,
@@ -100,6 +102,69 @@ impl WorkState {
 
 #[async_trait]
 impl AdmissionStore for InMemoryAdmissionStore {
+    async fn in_memory_image_generation_status(
+        &self,
+        tenant_id: &str,
+        project_id: &str,
+        api_profile: &str,
+        operation: &str,
+        key_digest: &str,
+    ) -> Result<Option<ImageGenerationStatusSnapshot>, AdmissionError> {
+        let state = self.state.lock().await;
+        let scope = IdempotencyScope {
+            project_id: project_id.to_owned(),
+            api_profile: api_profile.to_owned(),
+            operation: operation.to_owned(),
+            key_digest: key_digest.to_owned(),
+        };
+        let Some(record) = state
+            .idempotency
+            .get(&scope)
+            .filter(|record| record.tenant_id == tenant_id)
+        else {
+            return Ok(None);
+        };
+        let work = record
+            .job_id
+            .and_then(|job_id| state.work_by_job.get(&job_id))
+            .and_then(|work_item_id| state.work_items.get(work_item_id));
+        let requested_count = work
+            .and_then(|work| work.command_json.get("n"))
+            .and_then(Value::as_u64)
+            .and_then(|count| u32::try_from(count).ok())
+            .unwrap_or(0);
+        let output_state = work.map_or("pending", |work| match work.state {
+            WorkState::Ready | WorkState::Leased => "pending",
+            WorkState::Running => "running",
+            WorkState::Succeeded => "succeeded",
+            WorkState::Failed => "failed",
+            WorkState::Uncertain => "uncertain",
+        });
+        let state_name = if matches!(record.state.as_str(), "receiving" | "aborted") {
+            record.state.as_str()
+        } else {
+            output_state
+        };
+        let expected_terminal = matches!(record.state.as_str(), "succeeded" | "failed")
+            && record.state == output_state
+            && requested_count > 0;
+        let reconciliation_required = record.state == "uncertain"
+            || output_state == "uncertain"
+            || (matches!(record.state.as_str(), "succeeded" | "failed") && !expected_terminal);
+        Ok(Some(ImageGenerationStatusSnapshot {
+            state: state_name.to_owned(),
+            requested_count,
+            outputs: (0..requested_count)
+                .map(|index| ImageOutputStatus {
+                    index,
+                    state: output_state.to_owned(),
+                })
+                .collect(),
+            terminal: expected_terminal,
+            reconciliation_required,
+        }))
+    }
+
     async fn claim(&self, request: ClaimAdmission) -> Result<AdmissionClaim, AdmissionError> {
         let now = now_ms();
         let mut state = self.state.lock().await;
@@ -196,6 +261,7 @@ impl AdmissionStore for InMemoryAdmissionStore {
             state.idempotency.insert(
                 scope,
                 IdempotencyRecord {
+                    tenant_id: request.tenant_id.clone(),
                     session_id: ticket.session_id,
                     request_hash: request.request_hash,
                     state: "receiving".to_string(),

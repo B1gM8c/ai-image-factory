@@ -16,7 +16,8 @@ use serde_json::{Value, json};
 
 use crate::{
     ImageGatewayError,
-    auth::ApiKeyCapability,
+    admission::{GENERATION_OPERATION, idempotency_key_digest},
+    auth::{ApiKeyCapability, bearer_token},
     model_routing::{PublicModelRoute, ResolvedModelRoute},
 };
 
@@ -270,6 +271,58 @@ pub(super) async fn generate_image(
             Ok(private_json(response))
         }
     }
+}
+
+pub(super) async fn image_generation_status(
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+    Path(project_id): Path<String>,
+) -> Result<Response, ImageGatewayError> {
+    let token = bearer_token(&headers)?;
+    let auth = state
+        .api_key_store
+        .authenticate(token)
+        .await?
+        .ok_or_else(ImageGatewayError::authentication)?;
+    if auth.project_id != project_id {
+        return Err(ImageGatewayError::not_found(
+            "Image generation was not found",
+            None,
+            "image_generation_not_found",
+        ));
+    }
+    auth.require_api_key_capability(ApiKeyCapability::ImagesWrite)?;
+    crate::request_observability::capture_auth(&auth);
+    let key = headers
+        .get("idempotency-key")
+        .ok_or_else(ImageGatewayError::invalid_idempotency_key)?
+        .to_str()
+        .map_err(|_| ImageGatewayError::invalid_idempotency_key())?;
+    let digest = idempotency_key_digest(
+        &images::idempotency_scope(&auth),
+        OPENAI_IMAGES_API_PROFILE,
+        GENERATION_OPERATION,
+        key,
+    )
+    .map_err(|_| ImageGatewayError::invalid_idempotency_key())?;
+    let status = state
+        .settlement_store
+        .image_generation_status_by_key(
+            &auth.tenant_id,
+            &project_id,
+            OPENAI_IMAGES_API_PROFILE,
+            GENERATION_OPERATION,
+            &digest,
+        )
+        .await?
+        .ok_or_else(|| {
+            ImageGatewayError::not_found(
+                "Image generation was not found",
+                None,
+                "image_generation_not_found",
+            )
+        })?;
+    Ok(private_json(status))
 }
 
 fn is_console_image_profile(model: &PublicModelRoute) -> bool {
