@@ -8,9 +8,38 @@ use axum::{
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde_json::Value;
 
-use crate::{ImageGatewayError, generator::InputImage, models::EditForm};
+use crate::{
+    ImageGatewayError,
+    generator::{EditJob, InputImage},
+    models::EditForm,
+};
 
 use super::AppState;
+
+// Keep the executor's integrity check as well: stored bytes can change after
+// admission. Move ownership, not a copy of the uploads, off the async worker.
+pub(super) async fn validate_edit_pixels(job: EditJob) -> Result<EditJob, ImageGatewayError> {
+    tokio::task::spawn_blocking(move || {
+        for (input, param) in job
+            .images
+            .iter()
+            .map(|input| (input, "image"))
+            .chain(job.mask.iter().map(|input| (input, "mask")))
+        {
+            let actual = crate::artifacts::media_type_from_bytes(&input.bytes).ok();
+            if actual.is_none() || actual != input.content_type.as_deref() {
+                return Err(ImageGatewayError::invalid_request(
+                    "Image could not be fully decoded as the declared content type",
+                    Some(param.to_string()),
+                    "invalid_image_format",
+                ));
+            }
+        }
+        Ok(job)
+    })
+    .await
+    .map_err(|_| ImageGatewayError::internal("image validation worker failed"))?
+}
 
 pub(super) async fn parse_edit_request(
     request: Request,
