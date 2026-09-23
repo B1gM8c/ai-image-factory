@@ -8538,7 +8538,7 @@ async fn capacity_evidence_and_late_receipt_race_converges_without_deadlock() ->
                 &claim_scope(),
                 "capacity-race-owner",
                 "capacity-race-claim",
-                5_000,
+                30_000,
             )
             .await
             .map_err(debug_error)?
@@ -8583,7 +8583,7 @@ async fn capacity_evidence_and_late_receipt_race_converges_without_deadlock() ->
                         &claim_scope(),
                         "capacity-race-finisher",
                         "capacity-race-reclaim",
-                        5_000,
+                        30_000,
                     )
                     .await
                     .map_err(debug_error)?
