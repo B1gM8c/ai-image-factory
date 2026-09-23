@@ -113,6 +113,7 @@ use billing_integrity::{
 };
 use console_media::{
     edit_image as console_edit_image, generate_image as console_generate_image,
+    image_generation_status as console_image_generation_status,
     image_models as console_image_models,
 };
 use console_video::{
@@ -698,6 +699,10 @@ fn build_router_with_execution_mode(
         .route(
             "/v1/console/projects/{project_id}/images/generations",
             post(console_generate_image),
+        )
+        .route(
+            "/v1/console/projects/{project_id}/images/generations/status",
+            get(console_image_generation_status),
         )
         .route(
             "/v1/console/projects/{project_id}/images/edits",

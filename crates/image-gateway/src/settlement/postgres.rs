@@ -7,8 +7,9 @@ use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
 use super::{
-    ExecutionSettlementStore, GenerationResultLookup, GenerationResultStatus, StoredVideoArtifact,
-    VideoPendingStage, VideoResultStatus, validate_generation_result,
+    ExecutionSettlementStore, GenerationResultLookup, GenerationResultStatus,
+    ImageGenerationStatusSnapshot, ImageOutputStatus, StoredVideoArtifact, VideoPendingStage,
+    VideoResultStatus, validate_generation_result,
 };
 use crate::{
     ImageGatewayError,
@@ -42,6 +43,81 @@ impl PostgresExecutionSettlementStore {
             artifact_store,
         }
     }
+}
+
+#[derive(sqlx::FromRow)]
+struct ImageGenerationStatusRow {
+    key_state: String,
+    job_id: Option<Uuid>,
+    job_state: Option<String>,
+    requested_units: Option<i32>,
+    economics_contract_version: Option<i16>,
+    quota_state: Option<String>,
+    hold_state: Option<String>,
+    outputs: serde_json::Value,
+}
+
+fn image_generation_snapshot(
+    row: ImageGenerationStatusRow,
+) -> Result<ImageGenerationStatusSnapshot, ImageGatewayError> {
+    let requested_count = u32::try_from(row.requested_units.unwrap_or(0))
+        .map_err(|_| ImageGatewayError::internal("invalid generation output count"))?;
+    let mut outputs: Vec<ImageOutputStatus> = serde_json::from_value(row.outputs)
+        .map_err(|_| ImageGatewayError::internal("invalid generation output status"))?;
+    // The legacy contract has no job_outputs rows; its single work item owns all outputs.
+    if row.economics_contract_version == Some(1) && outputs.is_empty() {
+        let state = match row.job_state.as_deref() {
+            Some("succeeded") => "succeeded",
+            Some("failed") => "failed",
+            Some("uncertain") => "uncertain",
+            Some("running") => "running",
+            _ => "pending",
+        };
+        outputs = (0..requested_count)
+            .map(|index| ImageOutputStatus {
+                index,
+                state: state.to_owned(),
+            })
+            .collect();
+    }
+    let uncertain = row.key_state == "uncertain"
+        || row.job_state.as_deref() == Some("uncertain")
+        || outputs.iter().any(|output| output.state == "uncertain");
+    let state = if uncertain {
+        "uncertain".to_owned()
+    } else {
+        row.job_state.unwrap_or_else(|| row.key_state.clone())
+    };
+    let expected_terminal =
+        matches!(row.key_state.as_str(), "succeeded" | "failed") && row.key_state == state;
+    let outputs_complete = requested_count > 0
+        && outputs.len() == requested_count as usize
+        && outputs.iter().enumerate().all(|(index, output)| {
+            output.index == index as u32
+                && match row.key_state.as_str() {
+                    "succeeded" => output.state == "succeeded",
+                    "failed" => matches!(output.state.as_str(), "succeeded" | "failed"),
+                    _ => false,
+                }
+        });
+    let accounting_settled = matches!(row.quota_state.as_deref(), Some("committed" | "released"))
+        && (row.economics_contract_version != Some(4)
+            || matches!(row.hold_state.as_deref(), Some("settled" | "released")));
+    let reconciliation_required = uncertain
+        || (row.job_id.is_some() && row.economics_contract_version.is_none())
+        || (matches!(state.as_str(), "succeeded" | "failed") && !expected_terminal)
+        || (matches!(row.key_state.as_str(), "succeeded" | "failed")
+            && (!expected_terminal || !outputs_complete || !accounting_settled));
+    Ok(ImageGenerationStatusSnapshot {
+        state,
+        requested_count,
+        outputs,
+        terminal: expected_terminal
+            && outputs_complete
+            && accounting_settled
+            && !reconciliation_required,
+        reconciliation_required,
+    })
 }
 
 #[async_trait]
@@ -165,6 +241,65 @@ impl ExecutionSettlementStore for PostgresExecutionSettlementStore {
             Some(_) => Ok(GenerationResultStatus::Pending),
             None => Err(ImageGatewayError::internal("generation job not found")),
         }
+    }
+
+    async fn image_generation_status_by_key(
+        &self,
+        tenant_id: &str,
+        project_id: &str,
+        api_profile: &str,
+        operation: &str,
+        key_digest: &str,
+    ) -> Result<Option<ImageGenerationStatusSnapshot>, ImageGatewayError> {
+        let row: Option<ImageGenerationStatusRow> = sqlx::query_as(
+            r#"
+            SELECT idem.state AS key_state, idem.job_id,
+                   job.state AS job_state, job.requested_units,
+                   job.economics_contract_version, quota.state AS quota_state,
+                   hold.state AS hold_state,
+                   COALESCE((
+                       SELECT jsonb_agg(
+                           jsonb_build_object('index', output.output_index, 'state', output.state)
+                           ORDER BY output.output_index
+                       )
+                       FROM job_outputs output
+                       WHERE output.job_id = job.job_id
+                   ), '[]'::jsonb) AS outputs
+            FROM idempotency_requests idem
+            LEFT JOIN admission_sessions session
+              ON session.session_id = idem.session_id
+             AND session.tenant_id = idem.tenant_id
+             AND session.project_id = idem.project_id
+             AND session.api_profile = idem.api_profile
+             AND session.operation = idem.operation
+             AND session.request_hash = idem.request_hash
+             AND session.job_id = idem.job_id
+            LEFT JOIN jobs job
+              ON job.job_id = session.job_id
+             AND job.tenant_id = idem.tenant_id
+             AND job.operation = idem.operation
+             AND job.request_id = session.request_id
+            LEFT JOIN quota_reservations quota
+              ON quota.reservation_id = job.reservation_id
+             AND quota.tenant_id = idem.tenant_id
+             AND quota.job_id = job.job_id
+            LEFT JOIN customer_billing_holds hold
+              ON hold.job_id = job.job_id
+             AND hold.tenant_id = idem.tenant_id
+            WHERE idem.tenant_id = $1 AND idem.project_id = $2
+              AND idem.api_profile = $3 AND idem.operation = $4
+              AND idem.key_digest = $5
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(project_id)
+        .bind(api_profile)
+        .bind(operation)
+        .bind(key_digest)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(settlement_unavailable)?;
+        row.map(image_generation_snapshot).transpose()
     }
 
     async fn video_status(
@@ -927,4 +1062,116 @@ fn quota_lock_id(tenant_id: &str) -> i64 {
 
 fn settlement_unavailable(_: impl std::fmt::Display) -> ImageGatewayError {
     ImageGatewayError::service_unavailable("execution settlement unavailable")
+}
+
+#[cfg(test)]
+mod image_status_tests {
+    use super::*;
+
+    fn row(
+        key_state: &str,
+        job_state: Option<&str>,
+        quota: Option<&str>,
+        hold: Option<&str>,
+        outputs: serde_json::Value,
+    ) -> ImageGenerationStatusRow {
+        ImageGenerationStatusRow {
+            key_state: key_state.to_owned(),
+            job_id: job_state.map(|_| Uuid::new_v4()),
+            job_state: job_state.map(str::to_owned),
+            requested_units: job_state.map(|_| 2),
+            economics_contract_version: job_state.map(|_| 4),
+            quota_state: quota.map(str::to_owned),
+            hold_state: hold.map(str::to_owned),
+            outputs,
+        }
+    }
+
+    #[test]
+    fn settled_success_and_failure_are_terminal() {
+        let success = image_generation_snapshot(row(
+            "succeeded",
+            Some("succeeded"),
+            Some("committed"),
+            Some("settled"),
+            json!([{"index": 0, "state": "succeeded"}, {"index": 1, "state": "succeeded"}]),
+        ))
+        .expect("success status");
+        assert!(success.terminal);
+        assert!(!success.reconciliation_required);
+
+        let failure = image_generation_snapshot(row(
+            "failed",
+            Some("failed"),
+            Some("released"),
+            Some("released"),
+            json!([{"index": 0, "state": "succeeded"}, {"index": 1, "state": "failed"}]),
+        ))
+        .expect("failure status");
+        assert_eq!(failure.state, "failed");
+        assert!(failure.terminal);
+        assert!(!failure.reconciliation_required);
+    }
+
+    #[test]
+    fn uncertain_partial_success_and_held_terminal_need_reconciliation() {
+        let uncertain = image_generation_snapshot(row(
+            "uncertain",
+            Some("uncertain"),
+            Some("reserved"),
+            Some("held"),
+            json!([{"index": 0, "state": "succeeded"}, {"index": 1, "state": "uncertain"}]),
+        ))
+        .expect("uncertain status");
+        assert_eq!(uncertain.state, "uncertain");
+        assert_eq!(uncertain.outputs[0].state, "succeeded");
+        assert!(!uncertain.terminal);
+        assert!(uncertain.reconciliation_required);
+
+        let held = image_generation_snapshot(row(
+            "succeeded",
+            Some("succeeded"),
+            Some("committed"),
+            Some("held"),
+            json!([{"index": 0, "state": "succeeded"}, {"index": 1, "state": "succeeded"}]),
+        ))
+        .expect("held status");
+        assert!(!held.terminal);
+        assert!(held.reconciliation_required);
+    }
+
+    #[test]
+    fn receiving_and_aborted_have_no_final_business_outcome() {
+        for key_state in ["receiving", "aborted"] {
+            let status = image_generation_snapshot(row(key_state, None, None, None, json!([])))
+                .expect("unattached status");
+            assert_eq!(status.state, key_state);
+            assert_eq!(status.requested_count, 0);
+            assert!(status.outputs.is_empty());
+            assert!(!status.terminal);
+            assert!(!status.reconciliation_required);
+        }
+    }
+
+    #[test]
+    fn missing_joined_job_or_zero_outputs_cannot_be_terminal() {
+        let mut missing_job = row("succeeded", None, None, None, json!([]));
+        missing_job.job_id = Some(Uuid::new_v4());
+        let missing = image_generation_snapshot(missing_job).expect("missing joined job status");
+        assert!(missing.outputs.is_empty());
+        assert!(!missing.terminal);
+        assert!(missing.reconciliation_required);
+
+        let mut zero = row(
+            "succeeded",
+            Some("succeeded"),
+            Some("committed"),
+            Some("settled"),
+            json!([]),
+        );
+        zero.requested_units = Some(0);
+        let zero = image_generation_snapshot(zero).expect("zero output status");
+        assert!(!zero.terminal);
+        assert!(zero.reconciliation_required);
+    }
 }

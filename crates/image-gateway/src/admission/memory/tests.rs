@@ -32,6 +32,84 @@ fn claim_request(key_digest: Option<&str>, request_hash: &str) -> ClaimAdmission
 }
 
 #[tokio::test]
+async fn image_status_read_does_not_claim_receiving_or_aborted_key() {
+    let store = InMemoryAdmissionStore::default();
+    let ticket = owner(&store, Some("status-read-key"), "status-read-hash").await;
+    let read = || {
+        store.in_memory_image_generation_status(
+            "tenant-a",
+            "project-a",
+            "openai-images-v1",
+            "images.generate",
+            "status-read-key",
+        )
+    };
+    let receiving = read().await.expect("read receiving").expect("key exists");
+    assert_eq!(receiving.state, "receiving");
+    assert_eq!(receiving.requested_count, 0);
+    assert!(receiving.outputs.is_empty());
+    assert!(!receiving.terminal);
+    assert!(!receiving.reconciliation_required);
+    assert!(
+        store
+            .in_memory_image_generation_status(
+                "other-tenant",
+                "project-a",
+                "openai-images-v1",
+                "images.generate",
+                "status-read-key",
+            )
+            .await
+            .expect("cross-tenant read")
+            .is_none()
+    );
+
+    store.abort(&ticket).await.expect("abort claim");
+    let aborted = read().await.expect("read aborted").expect("key exists");
+    assert_eq!(aborted.state, "aborted");
+    assert!(!aborted.terminal);
+    assert!(!aborted.reconciliation_required);
+}
+
+#[tokio::test]
+async fn image_status_does_not_mark_conflicting_record_and_work_terminal() {
+    let store = InMemoryAdmissionStore::default();
+    let ticket = owner(&store, Some("status-conflict-key"), "status-conflict-hash").await;
+    attach(&store, ticket, Uuid::new_v4()).await;
+    {
+        let mut state = store.state.lock().await;
+        let scope = super::IdempotencyScope {
+            project_id: "project-a".to_string(),
+            api_profile: "openai-images-v1".to_string(),
+            operation: "images.generate".to_string(),
+            key_digest: "status-conflict-key".to_string(),
+        };
+        state
+            .idempotency
+            .get_mut(&scope)
+            .expect("fixture key exists")
+            .state = "succeeded".to_string();
+    }
+
+    let snapshot = store
+        .in_memory_image_generation_status(
+            "tenant-a",
+            "project-a",
+            "openai-images-v1",
+            "images.generate",
+            "status-conflict-key",
+        )
+        .await
+        .expect("read conflicting status")
+        .expect("fixture key exists");
+    assert_eq!(snapshot.state, "pending");
+    assert_eq!(snapshot.requested_count, 1);
+    assert_eq!(snapshot.outputs[0].state, "pending");
+    assert!(!snapshot.terminal);
+    assert!(snapshot.reconciliation_required);
+}
+
+#[tokio::test]
 async fn receiving_owner_can_recover_with_the_same_attempt_token() {
     let store = InMemoryAdmissionStore::default();
     let request = claim_request(Some("recoverable-digest"), "recoverable-hash");
