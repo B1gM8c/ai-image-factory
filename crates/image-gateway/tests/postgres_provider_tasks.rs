@@ -8556,6 +8556,11 @@ async fn capacity_evidence_and_late_receipt_race_converges_without_deadlock() ->
                 terminal_state: ProviderCapacityTerminalState::Succeeded,
             },
         };
+        require(
+            store.record_capacity_evidence(&lease, &evidence).await
+                == Err(ProviderTaskStoreError::Conflict),
+            "terminal evidence before the late receipt did not conflict",
+        )?;
         let (receipt_result, evidence_result) =
             tokio::time::timeout(Duration::from_secs(3), async {
                 tokio::join!(
@@ -8568,7 +8573,7 @@ async fn capacity_evidence_and_late_receipt_race_converges_without_deadlock() ->
         receipt_result.map_err(debug_error)?;
         match evidence_result {
             Ok(_) => {}
-            Err(ProviderTaskStoreError::StaleLease) => {
+            Err(ProviderTaskStoreError::StaleLease | ProviderTaskStoreError::Conflict) => {
                 store
                     .defer_capacity_reconciliation(&lease, "capacity-race-defer", 60_000)
                     .await
