@@ -120,6 +120,7 @@ struct ProtocolCaptureDiagnostic {
 #[derive(Debug)]
 struct FailureDiagnostic {
     source: &'static str,
+    code_source: Option<FailureCodeSource>,
     class: &'static str,
     numeric_code: Option<i64>,
     code: FieldDiagnostic,
@@ -134,12 +135,23 @@ pub(crate) struct CodexAppServerFailureDiagnosticV1 {
     source: String,
     class: String,
     numeric_code: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    code_source: Option<FailureCodeSource>,
     code: PersistedFieldDiagnostic,
     message: PersistedFieldDiagnostic,
     stderr: Option<PersistedStreamDiagnostic>,
     exit: PersistedExitDiagnostic,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     protocol: Option<PersistedProtocolDiagnostic>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum FailureCodeSource {
+    ExplicitCode,
+    ExplicitType,
+    EnvelopeFallback,
+    ScalarValue,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -287,6 +299,17 @@ impl ProtocolState {
             .copied()
             .or_else(|| explicit_types.first().copied())
             .or(envelope_type);
+        // Preserve the existing selection and retry semantics; identify whether
+        // the digest is an error field or merely the event envelope type.
+        let code_source = if value.is_string() {
+            Some(FailureCodeSource::ScalarValue)
+        } else if !explicit_codes.is_empty() {
+            Some(FailureCodeSource::ExplicitCode)
+        } else if !explicit_types.is_empty() {
+            Some(FailureCodeSource::ExplicitType)
+        } else {
+            envelope_type.map(|_| FailureCodeSource::EnvelopeFallback)
+        };
         let messages = failure_strings(
             value,
             &[
@@ -321,6 +344,7 @@ impl ProtocolState {
         }
         self.failure_diagnostic = Some(FailureDiagnostic {
             source,
+            code_source,
             class,
             numeric_code: numeric_codes.first().copied(),
             code: summarize_field(code),
@@ -1270,6 +1294,7 @@ fn build_failure_diagnostic(
         source: failure.map_or("none", |value| value.source).to_string(),
         class: failure.map_or("unknown", |value| value.class).to_string(),
         numeric_code: failure.and_then(|value| value.numeric_code),
+        code_source: failure.and_then(|value| value.code_source),
         code: failure
             .map(|value| PersistedFieldDiagnostic {
                 sha256: value.code.sha256.clone(),
@@ -1318,6 +1343,7 @@ fn trace_failure(
         codex.failure.source = diagnostic.source,
         codex.failure.class = diagnostic.class,
         codex.failure.numeric_code = diagnostic.numeric_code,
+        codex.failure.code_source = ?diagnostic.code_source,
         codex.failure.code_sha256 = diagnostic.code.sha256.as_deref().unwrap_or("none"),
         codex.failure.code_bytes = diagnostic.code.bytes,
         codex.failure.code_truncated = diagnostic.code.truncated,
@@ -2121,6 +2147,7 @@ mod tests {
                 source: "image_generation_item".to_string(),
                 class: "tool_failure".to_string(),
                 numeric_code,
+                code_source: None,
                 code: PersistedFieldDiagnostic::default(),
                 message: PersistedFieldDiagnostic::default(),
                 stderr: Some(PersistedStreamDiagnostic {
@@ -2493,6 +2520,106 @@ mod tests {
                 !persisted.is_retryable_authentication_rejection(),
                 "{value}"
             );
+        }
+    }
+
+    #[test]
+    fn failure_code_source_tracks_selection_without_persisting_text() {
+        for (value, expected) in [
+            (
+                json!({"code": "secret-code", "type": "secret-type"}),
+                Some(FailureCodeSource::ExplicitCode),
+            ),
+            (
+                json!({"error": {"code": "secret-code", "type": "secret-type"}}),
+                Some(FailureCodeSource::ExplicitCode),
+            ),
+            (
+                json!({"error": {"type": "secret-type"}}),
+                Some(FailureCodeSource::ExplicitType),
+            ),
+            (
+                json!({"type": "authentication_error"}),
+                Some(FailureCodeSource::ExplicitType),
+            ),
+            (
+                json!({"type": "imageGeneration"}),
+                Some(FailureCodeSource::EnvelopeFallback),
+            ),
+            (json!("secret-scalar"), Some(FailureCodeSource::ScalarValue)),
+            (json!({}), None),
+        ] {
+            let mut state = ProtocolState::default();
+            state.record_failure("image_generation_item", &value);
+            let diagnostic = build_failure_diagnostic(
+                &state,
+                CodexAppServerError::ImageToolFailed,
+                None,
+                &ExitDiagnostic::default(),
+            );
+            assert_eq!(diagnostic.code_source, expected);
+            let serialized = serde_json::to_string(&diagnostic).unwrap();
+            assert!(!serialized.contains("secret-"));
+            assert!(!serialized.contains("imageGeneration"));
+            assert_eq!(
+                serde_json::from_str::<CodexAppServerFailureDiagnosticV1>(&serialized).unwrap(),
+                diagnostic
+            );
+            let mut legacy = serde_json::to_value(&diagnostic).unwrap();
+            legacy.as_object_mut().unwrap().remove("code_source");
+            let legacy: CodexAppServerFailureDiagnosticV1 = serde_json::from_value(legacy).unwrap();
+            assert_eq!(legacy.code_source, None);
+            assert_eq!(
+                legacy.is_retryable_authentication_rejection(),
+                diagnostic.is_retryable_authentication_rejection()
+            );
+        }
+    }
+
+    #[test]
+    fn mixed_401_diagnostics_mark_envelope_without_enabling_retry() {
+        // Synthetic fixtures reproduce the retained production diagnostics;
+        // the original upstream payload was not retained.
+        for (stderr, expected_class) in [
+            (
+                b"HTTP 401 rejected invalid_request authentication".as_slice(),
+                "http_status:401:rejected+invalid_request+authentication",
+            ),
+            (
+                b"HTTP 401 invalid_request authentication".as_slice(),
+                "http_status:401:invalid_request+authentication",
+            ),
+        ] {
+            let mut state = ProtocolState::default();
+            state.record_failure(
+                "image_generation_item",
+                &json!({"type": "imageGeneration", "status": "failed", "result": ""}),
+            );
+            let diagnostic = build_failure_diagnostic(
+                &state,
+                CodexAppServerError::ImageToolFailed,
+                Some(&StreamDiagnostic {
+                    class: classify_stream_bytes(stderr),
+                    ..StreamDiagnostic::default()
+                }),
+                &ExitDiagnostic::default(),
+            );
+            assert_eq!(
+                diagnostic.code_source,
+                Some(FailureCodeSource::EnvelopeFallback)
+            );
+            assert_eq!(diagnostic.class, "explicit_failure");
+            assert_eq!(diagnostic.stderr.as_ref().unwrap().class, expected_class);
+            assert_eq!(diagnostic.code.bytes, 15);
+            assert_eq!(
+                diagnostic.code.sha256.as_deref(),
+                Some("5e2f2ac1457cc6d9003f3d964a7ffb514ebbc9946e4ca2c530226aadb323f459")
+            );
+            assert_eq!(diagnostic.message.bytes, 0);
+            assert!(!diagnostic.is_retryable_authentication_rejection());
+            let mut unknown = diagnostic;
+            unknown.class = "unknown".to_string();
+            assert!(!unknown.is_retryable_authentication_rejection());
         }
     }
 
