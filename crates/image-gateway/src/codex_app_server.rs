@@ -104,6 +104,17 @@ struct ProtocolState {
     image_failed: bool,
     image_incomplete: bool,
     failure_diagnostic: Option<FailureDiagnostic>,
+    capture_diagnostic: ProtocolCaptureDiagnostic,
+}
+
+#[derive(Default)]
+struct ProtocolCaptureDiagnostic {
+    phase: &'static str,
+    reason: &'static str,
+    last_message_class: &'static str,
+    message_count: usize,
+    notification_count: usize,
+    captured_bytes: usize,
 }
 
 #[derive(Debug)]
@@ -127,6 +138,19 @@ pub(crate) struct CodexAppServerFailureDiagnosticV1 {
     message: PersistedFieldDiagnostic,
     stderr: Option<PersistedStreamDiagnostic>,
     exit: PersistedExitDiagnostic,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    protocol: Option<PersistedProtocolDiagnostic>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedProtocolDiagnostic {
+    phase: String,
+    reason: String,
+    last_message_class: String,
+    message_count: usize,
+    notification_count: usize,
+    captured_bytes: usize,
 }
 
 impl CodexAppServerFailureDiagnosticV1 {
@@ -207,6 +231,38 @@ struct ExitDiagnostic {
 }
 
 impl ProtocolState {
+    fn protocol_phase(&mut self, phase: &'static str) {
+        self.capture_diagnostic.phase = phase;
+        self.capture_diagnostic.reason = "validation_failed";
+    }
+
+    fn protocol_error(&mut self, reason: &'static str) -> CodexAppServerError {
+        self.capture_diagnostic.reason = reason;
+        CodexAppServerError::Protocol
+    }
+
+    fn observe_message_class(&mut self, message: &Value, captured_bytes: usize) {
+        self.capture_diagnostic.message_count =
+            self.capture_diagnostic.message_count.saturating_add(1);
+        self.capture_diagnostic.captured_bytes = captured_bytes;
+        self.capture_diagnostic.last_message_class =
+            match message.get("method").and_then(Value::as_str) {
+                Some("thread/started") => "thread_started",
+                Some("turn/started") => "turn_started",
+                Some("item/started") => "item_started",
+                Some("item/completed") => "item_completed",
+                Some("turn/completed") => "turn_completed",
+                Some("error") => "error_notification",
+                Some(_) => "other_notification",
+                None if message.get("id").is_some() => "rpc_response",
+                None => "unclassified",
+            };
+        if message.get("method").is_some() {
+            self.capture_diagnostic.notification_count =
+                self.capture_diagnostic.notification_count.saturating_add(1);
+        }
+    }
+
     fn record_failure(&mut self, source: &'static str, value: &Value) {
         if self.failure_diagnostic.is_some() {
             return;
@@ -281,7 +337,7 @@ impl ProtocolState {
                 .announced_thread_id
                 .is_some_and(|value| value != thread_id)
         {
-            return Err(CodexAppServerError::Protocol);
+            return Err(self.protocol_error("thread_identity_mismatch"));
         }
         Ok(())
     }
@@ -297,7 +353,7 @@ impl ProtocolState {
                 .as_deref()
                 .is_some_and(|value| value != turn_id)
         {
-            return Err(CodexAppServerError::Protocol);
+            return Err(self.protocol_error("turn_identity_mismatch"));
         }
         self.turn_id = Some(turn_id);
         Ok(())
@@ -311,7 +367,14 @@ impl ProtocolState {
         let method = message
             .get("method")
             .and_then(Value::as_str)
-            .ok_or(CodexAppServerError::Protocol)?;
+            .ok_or_else(|| self.protocol_error("method_missing"))?;
+        self.capture_diagnostic.reason = match method {
+            "thread/started" => "thread_notification_invalid",
+            "turn/started" => "turn_notification_invalid",
+            "item/started" | "item/completed" => "item_notification_invalid",
+            "turn/completed" => "turn_terminal_invalid",
+            _ => "notification_invalid",
+        };
         let params = message.get("params").unwrap_or(&Value::Null);
         match method {
             "thread/started" => {
@@ -319,28 +382,28 @@ impl ProtocolState {
                     .pointer("/thread/id")
                     .and_then(Value::as_str)
                     .and_then(|value| Uuid::parse_str(value).ok())
-                    .ok_or(CodexAppServerError::Protocol)?;
+                    .ok_or_else(|| self.protocol_error("thread_notification_id_invalid"))?;
                 if self
                     .announced_thread_id
                     .replace(candidate)
                     .is_some_and(|value| value != candidate)
                     || self.thread_id.is_some_and(|value| value != candidate)
                 {
-                    return Err(CodexAppServerError::Protocol);
+                    return Err(self.protocol_error("thread_identity_mismatch"));
                 }
             }
             "turn/started" => {
                 let candidate = params
                     .pointer("/turn/id")
                     .and_then(Value::as_str)
-                    .ok_or(CodexAppServerError::Protocol)?;
+                    .ok_or_else(|| self.protocol_error("turn_notification_id_missing"))?;
                 self.observe_turn_identity(params, candidate)?;
                 if self
                     .announced_turn_id
                     .as_deref()
                     .is_some_and(|value| value != candidate)
                 {
-                    return Err(CodexAppServerError::Protocol);
+                    return Err(self.protocol_error("turn_identity_mismatch"));
                 }
                 self.announced_turn_id = Some(candidate.to_string());
             }
@@ -348,7 +411,7 @@ impl ProtocolState {
                 let item_type = params
                     .pointer("/item/type")
                     .and_then(Value::as_str)
-                    .ok_or(CodexAppServerError::Protocol)?;
+                    .ok_or_else(|| self.protocol_error("item_type_missing"))?;
                 self.observe_bound_identity(params)?;
                 if item_type != "imageGeneration" {
                     return if matches!(
@@ -357,7 +420,7 @@ impl ProtocolState {
                     ) {
                         Ok(false)
                     } else {
-                        Err(CodexAppServerError::Protocol)
+                        Err(self.protocol_error("unexpected_item_type"))
                     };
                 }
                 self.saw_image_generation = true;
@@ -365,7 +428,7 @@ impl ProtocolState {
                     .pointer("/item/id")
                     .and_then(Value::as_str)
                     .filter(|value| valid_call_id(value))
-                    .ok_or(CodexAppServerError::Protocol)?;
+                    .ok_or_else(|| self.protocol_error("image_call_id_invalid"))?;
                 if method == "item/started" {
                     self.started_image_count = self.started_image_count.saturating_add(1);
                     if self.started_image_count > 1 {
@@ -403,19 +466,21 @@ impl ProtocolState {
                             .and_then(Value::as_str)
                             .is_none_or(str::is_empty)
                         {
-                            return Err(CodexAppServerError::Protocol);
+                            return Err(self.protocol_error("image_result_missing"));
                         }
                         let saved_path = params
                             .pointer("/item/savedPath")
                             .and_then(Value::as_str)
                             .ok_or(CodexAppServerError::ImageIncomplete)?;
-                        let thread_id = self.thread_id.ok_or(CodexAppServerError::Protocol)?;
+                        let thread_id = self
+                            .thread_id
+                            .ok_or_else(|| self.protocol_error("thread_identity_missing"))?;
                         let expected = codex_home
                             .join("generated_images")
                             .join(thread_id.to_string())
                             .join(format!("{call_id}.png"));
                         if Path::new(saved_path) != expected {
-                            return Err(CodexAppServerError::Protocol);
+                            return Err(self.protocol_error("image_saved_path_mismatch"));
                         }
                     }
                     Some("failed") => {
@@ -432,7 +497,7 @@ impl ProtocolState {
                 let candidate = params
                     .pointer("/turn/id")
                     .and_then(Value::as_str)
-                    .ok_or(CodexAppServerError::Protocol)?;
+                    .ok_or_else(|| self.protocol_error("turn_terminal_id_missing"))?;
                 self.observe_turn_identity(params, candidate)?;
                 return match params.pointer("/turn/status").and_then(Value::as_str) {
                     Some("completed") => Ok(true),
@@ -443,7 +508,7 @@ impl ProtocolState {
                         );
                         Err(CodexAppServerError::TurnFailed)
                     }
-                    _ => Err(CodexAppServerError::Protocol),
+                    _ => Err(self.protocol_error("turn_terminal_status_invalid")),
                 };
             }
             "error" => {
@@ -455,30 +520,34 @@ impl ProtocolState {
         Ok(false)
     }
 
-    fn observe_bound_identity(&self, params: &Value) -> Result<(), CodexAppServerError> {
-        let expected_thread = self.thread_id.ok_or(CodexAppServerError::Protocol)?;
-        let expected_turn = self
-            .turn_id
-            .as_deref()
-            .or(self.announced_turn_id.as_deref())
-            .ok_or(CodexAppServerError::Protocol)?;
+    fn observe_bound_identity(&mut self, params: &Value) -> Result<(), CodexAppServerError> {
+        let expected_thread = self
+            .thread_id
+            .ok_or_else(|| self.protocol_error("thread_identity_missing"))?;
         let actual_thread = params
             .get("threadId")
             .and_then(Value::as_str)
             .and_then(|value| Uuid::parse_str(value).ok())
-            .ok_or(CodexAppServerError::Protocol)?;
+            .ok_or_else(|| self.protocol_error("item_thread_id_invalid"))?;
         let actual_turn = params
             .get("turnId")
             .and_then(Value::as_str)
-            .ok_or(CodexAppServerError::Protocol)?;
+            .ok_or_else(|| self.protocol_error("item_turn_id_missing"))?;
+        let Some(expected_turn) = self
+            .turn_id
+            .as_deref()
+            .or(self.announced_turn_id.as_deref())
+        else {
+            return Err(self.protocol_error("turn_identity_missing"));
+        };
         if actual_thread != expected_thread || actual_turn != expected_turn {
-            return Err(CodexAppServerError::Protocol);
+            return Err(self.protocol_error("item_identity_mismatch"));
         }
         Ok(())
     }
 
     fn observe_turn_identity(
-        &self,
+        &mut self,
         params: &Value,
         candidate_turn: &str,
     ) -> Result<(), CodexAppServerError> {
@@ -486,7 +555,7 @@ impl ProtocolState {
             .get("threadId")
             .and_then(Value::as_str)
             .and_then(|value| Uuid::parse_str(value).ok())
-            .ok_or(CodexAppServerError::Protocol)?;
+            .ok_or_else(|| self.protocol_error("turn_thread_id_invalid"))?;
         if self.thread_id.is_some_and(|value| value != actual_thread)
             || self
                 .turn_id
@@ -494,14 +563,14 @@ impl ProtocolState {
                 .is_some_and(|value| value != candidate_turn)
             || !valid_turn_id(candidate_turn)
         {
-            return Err(CodexAppServerError::Protocol);
+            return Err(self.protocol_error("turn_identity_mismatch"));
         }
         Ok(())
     }
 
-    fn authority(&self) -> Result<(String, String), CodexAppServerError> {
+    fn authority(&mut self) -> Result<(String, String), CodexAppServerError> {
         if self.thread_id != self.announced_thread_id || self.turn_id != self.announced_turn_id {
-            return Err(CodexAppServerError::Protocol);
+            return Err(self.protocol_error("terminal_identity_mismatch"));
         }
         if self.image_failed {
             return Err(CodexAppServerError::ImageToolFailed);
@@ -520,11 +589,11 @@ impl ProtocolState {
         }
         Ok((
             self.thread_id
-                .ok_or(CodexAppServerError::Protocol)?
+                .ok_or_else(|| self.protocol_error("thread_identity_missing"))?
                 .to_string(),
             self.completed_image_call_id
                 .clone()
-                .ok_or(CodexAppServerError::Protocol)?,
+                .ok_or_else(|| self.protocol_error("image_call_id_missing"))?,
         ))
     }
 }
@@ -628,6 +697,7 @@ where
     let mut capture_bytes = 0_usize;
 
     let protocol_result = tokio::time::timeout(request.timeout, async {
+        state.protocol_phase("initialize");
         send_message(
             &mut stdin,
             &json!({
@@ -655,10 +725,11 @@ where
             .and_then(Value::as_str)
             .is_none_or(|value| Path::new(value) != codex_home)
         {
-            return Err(CodexAppServerError::Protocol);
+            return Err(state.protocol_error("codex_home_mismatch"));
         }
         send_message(&mut stdin, &json!({"method": "initialized"})).await?;
 
+        state.protocol_phase("thread_start");
         send_message(
             &mut stdin,
             &json!({
@@ -680,9 +751,10 @@ where
             .pointer("/thread/id")
             .and_then(Value::as_str)
             .and_then(|value| Uuid::parse_str(value).ok())
-            .ok_or(CodexAppServerError::Protocol)?;
+            .ok_or_else(|| state.protocol_error("thread_id_invalid"))?;
         state.bind_thread(thread_id)?;
 
+        state.protocol_phase("turn_start");
         let mut input = vec![json!({
             "type": "text",
             "text": request.prompt,
@@ -715,23 +787,27 @@ where
         let turn_id = turn
             .pointer("/turn/id")
             .and_then(Value::as_str)
-            .ok_or(CodexAppServerError::Protocol)?
+            .ok_or_else(|| state.protocol_error("turn_id_missing"))?
             .to_string();
         state.bind_turn(turn_id)?;
 
+        state.protocol_phase("event_stream");
         loop {
-            let message = read_message(&mut stdout, &mut capture_bytes).await?;
+            let message = read_message(&mut stdout, &mut state, &mut capture_bytes).await?;
             if message.get("id").is_some() {
-                return Err(CodexAppServerError::Protocol);
+                return Err(state.protocol_error("unexpected_response"));
             }
             if state.observe_notification(&message, &codex_home)? {
                 break;
             }
         }
         drop(stdin);
-        while let Some(message) = read_optional_message(&mut stdout, &mut capture_bytes).await? {
+        state.protocol_phase("post_terminal");
+        while let Some(message) =
+            read_optional_message(&mut stdout, &mut state, &mut capture_bytes).await?
+        {
             if message.get("id").is_some() || message.get("method").is_none() {
-                return Err(CodexAppServerError::Protocol);
+                return Err(state.protocol_error("post_terminal_message_invalid"));
             }
             if matches!(
                 message.get("method").and_then(Value::as_str),
@@ -744,12 +820,13 @@ where
                         | "error"
                 )
             ) {
-                return Err(CodexAppServerError::Protocol);
+                return Err(state.protocol_error("post_terminal_event"));
             }
             if state.observe_notification(&message, &codex_home)? {
-                return Err(CodexAppServerError::Protocol);
+                return Err(state.protocol_error("post_terminal_event"));
             }
         }
+        state.protocol_phase("authority");
         state.authority()
     })
     .await;
@@ -820,15 +897,15 @@ async fn wait_for_response<R: AsyncBufRead + Unpin>(
     expected_id: i64,
 ) -> Result<Value, CodexAppServerError> {
     loop {
-        let message = read_message(stdout, capture_bytes).await?;
+        let message = read_message(stdout, state, capture_bytes).await?;
         if message.get("method").is_some() && message.get("id").is_none() {
             if state.observe_notification(&message, codex_home)? {
-                return Err(CodexAppServerError::Protocol);
+                return Err(state.protocol_error("terminal_before_response"));
             }
             continue;
         }
         if message.get("id").and_then(Value::as_i64) != Some(expected_id) {
-            return Err(CodexAppServerError::Protocol);
+            return Err(state.protocol_error("unexpected_response_id"));
         }
         match (message.get("result"), message.get("error")) {
             (Some(result), None) => return Ok(result.clone()),
@@ -836,7 +913,7 @@ async fn wait_for_response<R: AsyncBufRead + Unpin>(
                 state.record_failure("rpc_rejection", error);
                 return Err(CodexAppServerError::RequestRejected);
             }
-            _ => return Err(CodexAppServerError::Protocol),
+            _ => return Err(state.protocol_error("response_envelope_invalid")),
         }
     }
 }
@@ -1218,6 +1295,14 @@ fn build_failure_diagnostic(
             code: exit.code,
             signal: exit.signal,
         },
+        protocol: (error == CodexAppServerError::Protocol).then(|| PersistedProtocolDiagnostic {
+            phase: state.capture_diagnostic.phase.to_string(),
+            reason: state.capture_diagnostic.reason.to_string(),
+            last_message_class: state.capture_diagnostic.last_message_class.to_string(),
+            message_count: state.capture_diagnostic.message_count,
+            notification_count: state.capture_diagnostic.notification_count,
+            captured_bytes: state.capture_diagnostic.captured_bytes,
+        }),
     }
 }
 
@@ -1255,6 +1340,30 @@ fn trace_failure(
         codex.exit.observed = diagnostic.exit.observed,
         codex.exit.code = diagnostic.exit.code,
         codex.exit.signal = diagnostic.exit.signal,
+        codex.protocol.phase = diagnostic
+            .protocol
+            .as_ref()
+            .map_or("none", |value| value.phase.as_str()),
+        codex.protocol.reason = diagnostic
+            .protocol
+            .as_ref()
+            .map_or("none", |value| value.reason.as_str()),
+        codex.protocol.last_message_class = diagnostic
+            .protocol
+            .as_ref()
+            .map_or("none", |value| value.last_message_class.as_str()),
+        codex.protocol.message_count = diagnostic
+            .protocol
+            .as_ref()
+            .map_or(0, |value| value.message_count),
+        codex.protocol.notification_count = diagnostic
+            .protocol
+            .as_ref()
+            .map_or(0, |value| value.notification_count),
+        codex.protocol.captured_bytes = diagnostic
+            .protocol
+            .as_ref()
+            .map_or(0, |value| value.captured_bytes),
         "Codex app-server failed with bounded redacted diagnostics"
     );
 }
@@ -1291,26 +1400,50 @@ async fn send_message(stdin: &mut ChildStdin, message: &Value) -> Result<(), Cod
 
 async fn read_message<R: AsyncBufRead + Unpin>(
     reader: &mut R,
+    state: &mut ProtocolState,
     capture_bytes: &mut usize,
 ) -> Result<Value, CodexAppServerError> {
     let line = read_bounded_line(reader)
-        .await?
+        .await
+        .map_err(|error| {
+            if error == CodexAppServerError::Protocol {
+                state.protocol_error("frame_invalid")
+            } else {
+                error
+            }
+        })?
         .ok_or(CodexAppServerError::ProcessExited)?;
-    record_capture_bytes(capture_bytes, line.len())?;
-    serde_json::from_slice(&line).map_err(|_| CodexAppServerError::Protocol)
+    record_capture_bytes(capture_bytes, line.len())
+        .map_err(|_| state.protocol_error("capture_limit_exceeded"))?;
+    state.capture_diagnostic.captured_bytes = *capture_bytes;
+    let message =
+        serde_json::from_slice(&line).map_err(|_| state.protocol_error("json_invalid"))?;
+    state.observe_message_class(&message, *capture_bytes);
+    Ok(message)
 }
 
 async fn read_optional_message<R: AsyncBufRead + Unpin>(
     reader: &mut R,
+    state: &mut ProtocolState,
     capture_bytes: &mut usize,
 ) -> Result<Option<Value>, CodexAppServerError> {
-    let Some(line) = read_bounded_line(reader).await? else {
+    let Some(line) = read_bounded_line(reader).await.map_err(|error| {
+        if error == CodexAppServerError::Protocol {
+            state.protocol_error("frame_invalid")
+        } else {
+            error
+        }
+    })?
+    else {
         return Ok(None);
     };
-    record_capture_bytes(capture_bytes, line.len())?;
-    serde_json::from_slice(&line)
-        .map(Some)
-        .map_err(|_| CodexAppServerError::Protocol)
+    record_capture_bytes(capture_bytes, line.len())
+        .map_err(|_| state.protocol_error("capture_limit_exceeded"))?;
+    state.capture_diagnostic.captured_bytes = *capture_bytes;
+    let message =
+        serde_json::from_slice(&line).map_err(|_| state.protocol_error("json_invalid"))?;
+    state.observe_message_class(&message, *capture_bytes);
+    Ok(Some(message))
 }
 
 fn record_capture_bytes(total: &mut usize, bytes: usize) -> Result<(), CodexAppServerError> {
@@ -1433,6 +1566,9 @@ mod tests {
         Normal,
         NoImage,
         MultipleImages,
+        MalformedEvent,
+        UnexpectedResponse,
+        MismatchedSavedPath,
         TransientOutput,
         ReplacedOutput,
         MalformedSuffix,
@@ -1482,6 +1618,13 @@ mod tests {
             };
             let image_events = match mode {
                 FakeMode::NoImage => String::new(),
+                FakeMode::MalformedEvent => "printf 'not-json\\n'\n".to_string(),
+                FakeMode::UnexpectedResponse => {
+                    "printf '{\"id\":99,\"result\":{}}\\n'\n".to_string()
+                }
+                FakeMode::MismatchedSavedPath => format!(
+                    "printf '{{\"method\":\"item/started\",\"params\":{{\"threadId\":\"{THREAD_ID}\",\"turnId\":\"{TURN_ID}\",\"item\":{{\"type\":\"imageGeneration\",\"id\":\"{CALL_ID}\",\"status\":\"inProgress\"}}}}}}\\n'\nprintf '{{\"method\":\"item/completed\",\"params\":{{\"threadId\":\"{THREAD_ID}\",\"turnId\":\"{TURN_ID}\",\"item\":{{\"type\":\"imageGeneration\",\"id\":\"{CALL_ID}\",\"status\":\"completed\",\"result\":\"cG5n\",\"savedPath\":\"/private/secret-token.png\"}}}}}}\\n'\n"
+                ),
                 FakeMode::MultipleImages => format!(
                     "printf '{{\"method\":\"item/started\",\"params\":{{\"threadId\":\"{THREAD_ID}\",\"turnId\":\"{TURN_ID}\",\"item\":{{\"type\":\"imageGeneration\",\"id\":\"{CALL_ID}\",\"status\":\"inProgress\"}}}}}}\\n'\nprintf '{{\"method\":\"item/started\",\"params\":{{\"threadId\":\"{THREAD_ID}\",\"turnId\":\"{TURN_ID}\",\"item\":{{\"type\":\"imageGeneration\",\"id\":\"call_other_image\",\"status\":\"inProgress\"}}}}}}\\n'\n"
                 ),
@@ -1517,7 +1660,22 @@ mod tests {
         }
 
         async fn run(&self, timeout: Duration) -> Result<Vec<u8>, CodexAppServerError> {
-            run_codex_app_server(
+            self.run_capturing(timeout).await.0
+        }
+
+        async fn run_capturing(
+            &self,
+            timeout: Duration,
+        ) -> (
+            Result<Vec<u8>, CodexAppServerError>,
+            Option<CodexAppServerFailureDiagnosticV1>,
+        ) {
+            let diagnostic = std::sync::Mutex::new(None);
+            let sink = |value: &CodexAppServerFailureDiagnosticV1| {
+                *diagnostic.lock().map_err(|_| ())? = Some(value.clone());
+                Ok(())
+            };
+            let result = run_codex_app_server(
                 CodexAppServerRequest {
                     request_id: "req_test",
                     image_index: 1,
@@ -1529,11 +1687,12 @@ mod tests {
                     input_paths: &[],
                     timeout,
                     environment: &[("PATH".to_string(), "/usr/bin:/bin".to_string())],
-                    failure_diagnostic_sink: None,
+                    failure_diagnostic_sink: Some(&sink),
                 },
                 |_| Ok(()),
             )
-            .await
+            .await;
+            (result, diagnostic.into_inner().unwrap())
         }
     }
 
@@ -1637,6 +1796,135 @@ mod tests {
         assert_eq!(
             late.run(Duration::from_secs(30)).await,
             Err(CodexAppServerError::Protocol)
+        );
+    }
+
+    #[tokio::test]
+    async fn protocol_failures_persist_only_bounded_content_free_phase_and_reason() {
+        for (mode, phase, reason, last_message_class) in [
+            (
+                FakeMode::MalformedEvent,
+                "event_stream",
+                "json_invalid",
+                "rpc_response",
+            ),
+            (
+                FakeMode::UnexpectedResponse,
+                "event_stream",
+                "unexpected_response",
+                "rpc_response",
+            ),
+            (
+                FakeMode::MismatchedSavedPath,
+                "event_stream",
+                "image_saved_path_mismatch",
+                "item_completed",
+            ),
+            (
+                FakeMode::MalformedSuffix,
+                "post_terminal",
+                "json_invalid",
+                "turn_completed",
+            ),
+        ] {
+            let fixture = FakeAppServer::new(mode);
+            let (result, diagnostic) = fixture.run_capturing(Duration::from_secs(30)).await;
+            assert_eq!(result, Err(CodexAppServerError::Protocol));
+            let diagnostic = diagnostic.expect("failure diagnostic must be emitted");
+            let protocol = diagnostic.protocol.as_ref().unwrap();
+            assert_eq!(protocol.phase, phase);
+            assert_eq!(protocol.reason, reason);
+            assert_eq!(protocol.last_message_class, last_message_class);
+            assert!(protocol.message_count >= 5);
+            assert!(protocol.notification_count >= 2);
+            assert!(protocol.captured_bytes > 0);
+            let serialized = serde_json::to_string(&diagnostic).unwrap();
+            assert!(!serialized.contains("secret-token"));
+            assert!(!serialized.contains("invoke image_gen"));
+            assert!(!serialized.contains("generated_images"));
+            assert!(serialized.len() < 4096);
+
+            // Additive V1 fields do not prevent reading diagnostics from earlier releases.
+            let mut old = serde_json::to_value(&diagnostic).unwrap();
+            old.as_object_mut().unwrap().remove("protocol");
+            assert!(serde_json::from_value::<CodexAppServerFailureDiagnosticV1>(old).is_ok());
+        }
+    }
+
+    #[test]
+    fn identity_and_authority_protocol_errors_replace_stale_reasons() {
+        let thread_id = Uuid::parse_str(THREAD_ID).unwrap();
+        let reason = |state: &ProtocolState| {
+            build_failure_diagnostic(
+                state,
+                CodexAppServerError::Protocol,
+                None,
+                &ExitDiagnostic::default(),
+            )
+            .protocol
+            .unwrap()
+            .reason
+        };
+
+        let mut state = ProtocolState::default();
+        state.protocol_phase("event_stream");
+        state.thread_id = Some(thread_id);
+        state.capture_diagnostic.reason = "stale_reason";
+        assert_eq!(
+            state.observe_bound_identity(&json!({ "threadId": THREAD_ID, "turnId": TURN_ID })),
+            Err(CodexAppServerError::Protocol)
+        );
+        assert_eq!(reason(&state), "turn_identity_missing");
+
+        state.turn_id = Some(TURN_ID.to_string());
+        assert_eq!(
+            state.observe_bound_identity(&json!({ "threadId": "invalid", "turnId": TURN_ID })),
+            Err(CodexAppServerError::Protocol)
+        );
+        assert_eq!(reason(&state), "item_thread_id_invalid");
+        assert_eq!(
+            state.observe_bound_identity(&json!({ "threadId": THREAD_ID })),
+            Err(CodexAppServerError::Protocol)
+        );
+        assert_eq!(reason(&state), "item_turn_id_missing");
+        assert_eq!(
+            state.observe_turn_identity(&json!({ "threadId": "invalid" }), TURN_ID),
+            Err(CodexAppServerError::Protocol)
+        );
+        assert_eq!(reason(&state), "turn_thread_id_invalid");
+
+        let mut state = ProtocolState::default();
+        state.protocol_phase("authority");
+        state.turn_id = Some(TURN_ID.to_string());
+        state.announced_turn_id = state.turn_id.clone();
+        state.started_image_count = 1;
+        state.completed_image_count = 1;
+        state.completed_image_call_id = Some(CALL_ID.to_string());
+        state.capture_diagnostic.reason = "stale_reason";
+        assert_eq!(state.authority(), Err(CodexAppServerError::Protocol));
+        assert_eq!(reason(&state), "thread_identity_missing");
+
+        state.thread_id = Some(thread_id);
+        state.announced_thread_id = Some(thread_id);
+        state.completed_image_call_id = None;
+        assert_eq!(state.authority(), Err(CodexAppServerError::Protocol));
+        assert_eq!(reason(&state), "image_call_id_missing");
+    }
+
+    #[tokio::test]
+    async fn concurrent_outputs_keep_failure_capture_private_to_its_child() {
+        let good = FakeAppServer::new_with_payload(FakeMode::Normal, b"good-private-image");
+        let bad = FakeAppServer::new(FakeMode::MismatchedSavedPath);
+        let (good_run, bad_run) = tokio::join!(
+            good.run_capturing(Duration::from_secs(30)),
+            bad.run_capturing(Duration::from_secs(30))
+        );
+        assert_eq!(good_run.0, Ok(good.expected));
+        assert!(good_run.1.is_none());
+        assert_eq!(bad_run.0, Err(CodexAppServerError::Protocol));
+        assert_eq!(
+            bad_run.1.unwrap().protocol.unwrap().reason,
+            "image_saved_path_mismatch"
         );
     }
 
@@ -1846,6 +2134,7 @@ mod tests {
                     code: Some(0),
                     signal: None,
                 },
+                protocol: None,
             }
         };
 
