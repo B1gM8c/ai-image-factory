@@ -1,0 +1,27 @@
+name: Isolated maintenance guardian
+
+on:
+  push:
+    branches: [codex/maintenance-guardian-rehearsal-20260923]
+  pull_request:
+    paths:
+      - scripts/test-maintenance-guardian.py
+      - .github/workflows/maintenance-rehearsal.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: maintenance-drill-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  systemd-drill:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - name: Run synthetic stop and recovery failures
+        run: sudo env GITHUB_ACTIONS=true PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-maintenance-guardian.py --runtime
