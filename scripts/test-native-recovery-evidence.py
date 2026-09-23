@@ -17,6 +17,75 @@ SPEC.loader.exec_module(HARNESS_MODULE)
 
 
 class NativeRecoveryEvidenceTests(unittest.TestCase):
+    def exercise_legacy_stop(self, states, times=(0, 5)):
+        baseline = {'release_version': 'v0.1.0-20260824.40c7432',
+                    'commit_sha': '40c74329080aeaea7b4eddeaf56a20fead554c4f'}
+        samples = iter(states)
+        def command(args, **kwargs):
+            state = next(samples) if args[1] == 'show' else {}
+            return mock.Mock(returncode=0, stdout='\n'.join(f'{k}={v}' for k, v in state.items()))
+        with mock.patch.object(HARNESS_MODULE, 'require_idle_host_preparation') as idle, \
+             mock.patch.object(HARNESS_MODULE, 'baseline_stop_wait_evidence'), \
+             mock.patch.object(HARNESS_MODULE, 'updater_identity', return_value={
+                 'pid': 42, 'invocation_id': 'same', 'nrestarts': '0'}), \
+             mock.patch.object(HARNESS_MODULE, 'run', side_effect=command) as run, \
+             mock.patch.object(HARNESS_MODULE, 'progress'), \
+             mock.patch.object(HARNESS_MODULE.time, 'monotonic', side_effect=times), \
+             mock.patch.object(HARNESS_MODULE.time, 'sleep'):
+            result = HARNESS_MODULE.stop_baseline_updater(baseline, 'hash', {})
+        return result, run.call_args_list, idle.call_count
+
+    def stopped_baseline(self, **changes):
+        return dict({'MainPID': '0', 'ActiveState': 'inactive', 'Result': 'success',
+                     'ExecMainCode': '1', 'ExecMainStatus': '0', 'NRestarts': '0'}, **changes)
+
+    def stopping_baseline(self, **changes):
+        return dict({'MainPID': '42', 'ActiveState': 'deactivating', 'SubState': 'stop-sigterm',
+                     'InvocationID': 'same', 'NRestarts': '0'}, **changes)
+
+    def test_legacy_stop_clean_exit_needs_no_signal(self):
+        result, calls, _ = self.exercise_legacy_stop([self.stopped_baseline()])
+        self.assertEqual(result['additional_sigterm'], 0)
+        self.assertFalse(any(call.args[0][1] == 'kill' for call in calls))
+
+    def test_legacy_stop_rechecks_idle_before_same_invocation_sigterm(self):
+        result, calls, idle_checks = self.exercise_legacy_stop([
+            self.stopping_baseline(), self.stopped_baseline()])
+        self.assertEqual(result['additional_sigterm'], 1)
+        self.assertEqual(idle_checks, 3)
+        self.assertIn(['systemctl', 'kill', '--kill-whom=main', '--signal=SIGTERM',
+                       'ai-image-factory-updater.service'], [call.args[0] for call in calls])
+
+    def test_legacy_stop_rejects_forced_or_failed_exit(self):
+        for state in (self.stopped_baseline(Result='timeout'),
+                      self.stopped_baseline(ExecMainCode='2', ExecMainStatus='9'),
+                      self.stopped_baseline(NRestarts='1')):
+            with self.subTest(state=state), self.assertRaises(RuntimeError):
+                self.exercise_legacy_stop([state])
+
+    def test_legacy_stop_rejects_replacement_and_timeout(self):
+        for state in (self.stopping_baseline(MainPID='43'),
+                      self.stopping_baseline(InvocationID='other'),
+                      self.stopping_baseline(SubState='stop-sigkill')):
+            with self.subTest(state=state), self.assertRaises(RuntimeError):
+                self.exercise_legacy_stop([state])
+        with self.assertRaisesRegex(RuntimeError, 'no forced-stop fallback'):
+            self.exercise_legacy_stop([self.stopping_baseline()], times=(0, 30))
+
+    def test_legacy_stop_refuses_unaudited_baseline_before_any_command(self):
+        with mock.patch.object(HARNESS_MODULE, 'run') as run:
+            with self.assertRaisesRegex(RuntimeError, 'exact audited baseline'):
+                HARNESS_MODULE.stop_baseline_updater({'release_version': 'new', 'commit_sha': 'new'}, 'hash', {})
+            run.assert_not_called()
+
+    def test_legacy_stop_wait_evidence_rejects_database_lock_wait(self):
+        with mock.patch.object(HARNESS_MODULE, 'sql', return_value=json.dumps({
+                'lock_waiters': 1, 'ungranted_locks': 1, 'active_backends': 1})), \
+             mock.patch.object(Path, 'read_text', return_value='ep_poll'), \
+             mock.patch.object(HARNESS_MODULE, 'progress'):
+            with self.assertRaisesRegex(RuntimeError, 'database lock wait detected'):
+                HARNESS_MODULE.baseline_stop_wait_evidence({}, 42)
+
     def test_enqueue_failure_reports_status_without_response_secrets(self):
         with mock.patch.object(HARNESS_MODULE, 'http', return_value=(
                 409, b'{"secret":"must-not-be-exported"}', {})):

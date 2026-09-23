@@ -317,9 +317,9 @@ def pg_environment(dsn):
             'PGDATABASE': unquote(parsed.path[1:]), 'PGCONNECT_TIMEOUT': '5'}
 
 
-def sql(environment, statement, check=True):
+def sql(environment, statement, check=True, timeout=120):
     return run(['psql', '-X', '-qAt', '-v', 'ON_ERROR_STOP=1'], env=environment,
-               stdin=statement, check=check).stdout.strip()
+               stdin=statement, check=check, timeout=timeout).stdout.strip()
 
 
 def preflight(args):
@@ -775,18 +775,99 @@ def updater_identity(expected_hash, apply_enabled, *, require_safe_mounts=True):
             and (process / 'exe').resolve(strict=True) == executable
             and digest(process / 'exe') == expected_hash,
             'updater identity changed while reading policy/mounts: ' + json.dumps(final))
-    return {'pid': int(pid), 'executable': str(executable), 'sha256': expected_hash,
+    return {'pid': int(pid), 'invocation_id': initial['InvocationID'],
+            'nrestarts': initial['NRestarts'], 'executable': str(executable), 'sha256': expected_hash,
             'apply_enabled': apply_enabled, 'state_mountpoints': sorted(state_mountpoints),
             'startup_samples': samples, 'identity_wait_seconds': round(time.monotonic() - started, 3)}
 
 
-def prepare_recovery_host_files(candidate_bundle, candidate, environment, installed):
+def require_idle_host_preparation(environment):
+    require('AIF_UPDATE_APPLY_ENABLED="false"' in (CONFIG / 'update-policy.env').read_text(),
+            'host preparation requires Apply=false')
+    require(sql(environment, "SELECT count(*) FROM platform_update_commands WHERE status IN ('queued','running','restoring','restore_required');", timeout=5) == '0',
+            'pending update must be resolved before changing recovery hooks')
+    descriptors = STATE / 'updater/recovery'
+    require(not descriptors.exists() or (descriptors.is_dir() and not descriptors.is_symlink()
+            and not list(descriptors.iterdir())), 'protected recovery descriptor must be resolved first')
+
+
+def baseline_stop_wait_evidence(environment, pid):
+    evidence = json.loads(sql(environment, """
+        SELECT json_build_object(
+          'lock_waiters', (SELECT count(*) FROM pg_stat_activity
+            WHERE datname = current_database() AND wait_event_type = 'Lock'),
+          'ungranted_locks', (SELECT count(*) FROM pg_locks
+            WHERE database = (SELECT oid FROM pg_database WHERE datname = current_database())
+              AND NOT granted),
+          'active_backends', (SELECT count(*) FROM pg_stat_activity
+            WHERE datname = current_database() AND pid <> pg_backend_pid() AND state = 'active'));
+        """, timeout=5))
+    require(set(evidence) == {'lock_waiters', 'ungranted_locks', 'active_backends'}
+            and all(type(value) is int and value >= 0 for value in evidence.values()),
+            'invalid baseline database wait evidence')
+    try:
+        evidence['wchan'] = (Path('/proc') / str(pid) / 'wchan').read_text().strip()[:128]
+    except FileNotFoundError:
+        evidence['wchan'] = 'process-exited'
+    progress('Baseline stop wait evidence: ' + json.dumps(evidence, sort_keys=True))
+    require(evidence['lock_waiters'] == 0 and evidence['ungranted_locks'] == 0,
+            'baseline database lock wait detected; no signal workaround')
+    return evidence
+
+
+def stop_baseline_updater(baseline, expected_hash, environment):
+    # Only this immutable baseline predates the retained shutdown future. Never
+    # cancel an active pass or treat systemd's eventual SIGKILL as a graceful stop.
+    require(baseline['release_version'] == 'v0.1.0-20260824.40c7432'
+            and baseline['commit_sha'] == '40c74329080aeaea7b4eddeaf56a20fead554c4f',
+            'legacy shutdown workaround requires the exact audited baseline')
+    require_idle_host_preparation(environment)
+    identity = updater_identity(expected_hash, 'false', require_safe_mounts=False)
+    unit = PREFIX + 'updater.service'
+    run(['systemctl', 'stop', '--no-block', unit], timeout=10)
+    started = time.monotonic()
+    signals = 0
+    while True:
+        state = dict(line.split('=', 1) for line in run([
+            'systemctl', 'show', unit, '-p', 'MainPID', '-p', 'ActiveState',
+            '-p', 'SubState', '-p', 'Result', '-p', 'ExecMainCode',
+            '-p', 'ExecMainStatus', '-p', 'InvocationID', '-p', 'NRestarts',
+        ], timeout=5).stdout.splitlines() if '=' in line)
+        progress('Baseline graceful-stop evidence: ' + json.dumps(state, sort_keys=True))
+        require(state.get('NRestarts') == identity['nrestarts'],
+                'baseline updater restarted during stop')
+        if state.get('MainPID') == '0':
+            require(state.get('ActiveState') == 'inactive' and state.get('Result') == 'success'
+                    and state.get('ExecMainCode') == '1' and state.get('ExecMainStatus') == '0',
+                    'baseline updater did not exit cleanly; preserve failure evidence')
+            require_idle_host_preparation(environment)
+            return {'additional_sigterm': signals, 'final_state': state}
+        require(state.get('MainPID') == str(identity['pid'])
+                and state.get('InvocationID') == identity['invocation_id']
+                and state.get('NRestarts') == identity['nrestarts']
+                and state.get('ActiveState') == 'deactivating'
+                and state.get('SubState') == 'stop-sigterm',
+                'baseline updater identity or stop phase changed')
+        elapsed = time.monotonic() - started
+        require(elapsed < 30, 'baseline graceful stop still blocked after 30s; no forced-stop fallback')
+        if signals < 3 and elapsed >= (signals + 1) * 5:
+            require_idle_host_preparation(environment)
+            baseline_stop_wait_evidence(environment, identity['pid'])
+            # The same systemd invocation is already stopping: no restart or
+            # broad process matching. A concurrent clean exit is checked above
+            # on the next sample; kill errors never authorize file replacement.
+            result = run(['systemctl', 'kill', '--kill-whom=main', '--signal=SIGTERM', unit],
+                         timeout=5, check=False)
+            progress(f'Baseline additional SIGTERM {signals + 1}: exit={result.returncode}')
+            signals += 1
+        time.sleep(0.5)
+
+
+def prepare_recovery_host_files(candidate_bundle, candidate, environment, installed, baseline):
     # Mirror the separately authorized runbook maintenance window exactly. A
     # fresh CI baseline has no old-format recovery to finish; production must
     # prove the same condition rather than converting an incomplete old backup.
-    require('AIF_UPDATE_APPLY_ENABLED="false"' in (CONFIG / 'update-policy.env').read_text(),
-            'host preparation requires Apply=false')
-    run(['systemctl', 'stop', PREFIX + 'updater.service'])
+    shutdown = stop_baseline_updater(baseline, installed['bin/updated']['sha256'], environment)
     require(run(['systemctl', 'show', PREFIX + 'updater.service', '-p', 'MainPID', '--value']).stdout.strip() == '0',
             'updater is still running before fixed file replacement')
     require(sql(environment, "SELECT count(*) FROM platform_update_commands WHERE status IN ('queued','running','restoring','restore_required');") == '0',
@@ -816,7 +897,7 @@ def prepare_recovery_host_files(candidate_bundle, candidate, environment, instal
         require(digest(Path(installed[name]['destination'])) == installed[name]['sha256'],
                 'recovery preparation changed a file outside its five-hook/three-unit scope')
     run(['systemctl', 'daemon-reload'])
-    return prepared, {'apply_disabled': True, 'updater_stopped': True,
+    return prepared, {'apply_disabled': True, 'updater_stopped': True, 'baseline_shutdown': shutdown,
                       'pending_commands': 0, 'protected_descriptors': 0, 'previous': previous}
 
 
@@ -1025,7 +1106,7 @@ RESET ROLE;
     stable_application_pids = {name: run(['systemctl', 'show', PREFIX + name + '.service', '-p', 'MainPID', '--value']).stdout.strip()
                                for name in ('gateway', 'admin')}
     progress('Original baseline is serving; Apply=false, stopping old updater and preparing exactly five hooks/three units')
-    prepared, host_preparation = prepare_recovery_host_files(args.candidate_bundle, candidate, owner_env, installed_host_files)
+    prepared, host_preparation = prepare_recovery_host_files(args.candidate_bundle, candidate, owner_env, installed_host_files, baseline)
     installed_host_files.update(prepared)
     units = unit_evidence()
     require(not (UNITS / (PREFIX + 'segmentd.service')).exists(), 'segmentd is outside recovery preparation')
