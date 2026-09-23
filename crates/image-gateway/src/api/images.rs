@@ -925,6 +925,7 @@ pub(super) async fn edit_with_resolved_auth(
         job_execution_model_id.clone()
     });
     let mut job = form.into_job(request_id.clone())?;
+    job = super::edit_input::validate_edit_pixels(job).await?;
     job.model = job_execution_model_id;
     let descriptors = edit_input_descriptors(&job)?;
     let (command_schema, command_json, provider_command_hash, input_manifest_hash) = if provider_id
