@@ -393,6 +393,7 @@ impl ProtocolState {
     ) -> Result<bool, CodexAppServerError> {
         let result = self.validate_notification(message, codex_home);
         if result.is_ok() {
+            // Unknown notifications are accepted but not validated; keep the last known event.
             // Never retain arbitrary method names or payloads in diagnostics.
             self.capture_diagnostic.last_valid_notification_class =
                 match message.get("method").and_then(Value::as_str) {
@@ -401,7 +402,7 @@ impl ProtocolState {
                     Some("item/started") => "item_started",
                     Some("item/completed") => "item_completed",
                     Some("turn/completed") => "turn_completed",
-                    _ => "other_notification",
+                    _ => self.capture_diagnostic.last_valid_notification_class,
                 };
         }
         result
@@ -1962,6 +1963,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn synthetic_jsonl_unknown_notification_preserves_last_valid_event() {
+        let mut state = ProtocolState::default();
+        let known = serde_json::json!({"method": "thread/started", "params": {
+            "thread": {"id": "11111111-1111-4111-8111-111111111111"}
+        }});
+        let unknown = serde_json::json!({"method": "never-persist-me", "params": null});
+        assert!(
+            !state
+                .observe_notification(&unknown, Path::new("/unused"))
+                .unwrap()
+        );
+        assert_eq!(state.capture_diagnostic.last_valid_notification_class, "");
+        state
+            .observe_notification(&known, Path::new("/unused"))
+            .unwrap();
+        assert!(
+            !state
+                .observe_notification(&unknown, Path::new("/unused"))
+                .unwrap()
+        );
+        assert_eq!(
+            state.capture_diagnostic.last_valid_notification_class,
+            "thread_started"
+        );
+    }
+
+    #[tokio::test]
     async fn synthetic_jsonl_out_of_order_response_stays_fail_closed() {
         let mut reader = &b"{\"id\":3,\"result\":{}}\n"[..];
         let mut state = ProtocolState::default();
@@ -2020,6 +2048,29 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+        state.thread_id = Some(Uuid::parse_str(THREAD_ID).unwrap());
+        state.turn_id = Some("turn-eof".to_string());
+        assert!(state.observe_notification(&serde_json::json!({
+            "method": "turn/completed",
+            "params": {"threadId": THREAD_ID, "turn": {"id": "turn-eof", "status": "completed"}}
+        }), Path::new("/unused")).unwrap());
+        state.protocol_phase("post_terminal");
+        let mut reader = &b"{\"secret\":\"never-persist-me\"}"[..];
+        let error = read_optional_message(&mut reader, &mut state, &mut 0)
+            .await
+            .unwrap_err();
+        assert_eq!(error, CodexAppServerError::ProcessExited);
+        let diagnostic = build_failure_diagnostic(&state, error, None, &ExitDiagnostic::default());
+        let protocol = diagnostic.protocol.as_ref().unwrap();
+        assert_eq!(protocol.phase, "post_terminal");
+        assert_eq!(protocol.reason, "eof_mid_frame");
+        assert_eq!(protocol.last_valid_notification_class, "turn_completed");
+        assert!(
+            !serde_json::to_string(&diagnostic)
+                .unwrap()
+                .contains("never-persist-me")
+        );
+        assert!(!diagnostic.is_retryable_authentication_rejection());
     }
 
     #[test]
