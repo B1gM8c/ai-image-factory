@@ -124,6 +124,13 @@ def retain(env, now=None, proc=Path('/proc'), configs=None):
                 raise ValueError('invalid verified version')
             verified[version] = event
     protected = {current.name, previous.name}
+    # Some installations retain a separate operator rollback pointer. It may
+    # differ from the previous release of this specific apply transaction.
+    if os.path.lexists(root / 'previous'):
+        rollback = directory((root / 'previous').resolve(strict=True))
+        if rollback.parent != releases:
+            raise ValueError('rollback pointer outside managed releases')
+        protected.add(rollback.name)
     protected.update(sorted(verified, key=lambda v: verified[v]['created_at_ms'], reverse=True)[:KEEP])
     protected.update(references(releases, proc, configs))
     candidates = []

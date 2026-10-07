@@ -53,6 +53,12 @@ class RetentionTests(unittest.TestCase):
             self.run_gc()
         self.assertEqual(len(list(self.releases.iterdir())), 6)
 
+    def test_operator_previous_pointer_is_retained(self):
+        (self.root / 'previous').symlink_to(self.releases / 'v1.0.0')
+        self.assertEqual(self.run_gc(), {'removed_releases': 2, 'removed_backups': 2})
+        self.assertTrue((self.root / 'previous').is_dir())
+        self.assertTrue((self.backups / 'id0-v1.0.0').is_dir())
+
     def test_symlink_blocks_plan_before_deletion(self):
         (self.releases / 'v1.0.2' / 'escape').symlink_to(self.root)
         with self.assertRaises(ValueError):
