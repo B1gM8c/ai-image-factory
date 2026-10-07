@@ -294,6 +294,27 @@ fn read_markers_in_order<T, L, E>(
     Ok((terminal, launch))
 }
 
+pub(crate) fn validate_retention_identity(
+    directory: &OwnedFd,
+    execution_id: Uuid,
+    submission_id: Uuid,
+) -> Result<(), RunnerJournalError> {
+    let spec: DiskSpec =
+        read_optional_json_at(directory, SPEC_FILE)?.ok_or(RunnerJournalError::Integrity)?;
+    spec.validate()?;
+    let terminal: DiskTerminal =
+        read_optional_json_at(directory, TERMINAL_FILE)?.ok_or(RunnerJournalError::Integrity)?;
+    terminal.clone_for_validation()?;
+    if spec.executor_execution_id != execution_id.to_string()
+        || spec.submission_id != submission_id.to_string()
+        || !matches!(terminal, DiskTerminal::Succeeded { manifest_id, artifact_authority_id, .. }
+            if manifest_id == submission_id.to_string() && artifact_authority_id == execution_id.to_string())
+    {
+        return Err(RunnerJournalError::Integrity);
+    }
+    Ok(())
+}
+
 impl DiskSpec {
     fn from_lease(lease: &ExecutorSubmissionLease) -> Self {
         Self {

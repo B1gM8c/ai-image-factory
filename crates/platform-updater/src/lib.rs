@@ -169,6 +169,7 @@ pub struct UpdaterConfig {
     recover_hook: Option<PathBuf>,
     activate_hook: Option<PathBuf>,
     verify_hook: Option<PathBuf>,
+    retention_hook: Option<PathBuf>,
     verify_context: BTreeMap<String, String>,
     poll_interval: Duration,
     lease_duration: Duration,
@@ -222,6 +223,7 @@ impl UpdaterConfig {
         let recover_hook = optional_absolute_env_path("AIF_UPDATE_RECOVER_HOOK")?;
         let activate_hook = optional_absolute_env_path("AIF_UPDATE_ACTIVATE_HOOK")?;
         let verify_hook = optional_absolute_env_path("AIF_UPDATE_VERIFY_HOOK")?;
+        let retention_hook = optional_absolute_env_path("AIF_UPDATE_RETENTION_HOOK")?;
         let verify_context = configured_verify_context();
         for hook in [
             &admission_close_hook,
@@ -232,6 +234,7 @@ impl UpdaterConfig {
             &recover_hook,
             &activate_hook,
             &verify_hook,
+            &retention_hook,
         ]
         .into_iter()
         .flatten()
@@ -260,6 +263,7 @@ impl UpdaterConfig {
             recover_hook,
             activate_hook,
             verify_hook,
+            retention_hook,
             verify_context,
             poll_interval: duration_env("AIF_UPDATE_POLL_INTERVAL_MS", DEFAULT_POLL_INTERVAL)?,
             lease_duration: duration_env("AIF_UPDATE_LEASE_MS", DEFAULT_LEASE_DURATION)?,
@@ -360,10 +364,11 @@ impl Updater {
         let Some(claim) = self.claim_next().await? else {
             return Ok(false);
         };
+        let mut retention_context = None;
         let operation = async {
             match claim.action.as_str() {
                 "check" => self.execute_check(&claim).await,
-                "apply" => self.execute_apply(&claim).await,
+                "apply" => self.execute_apply(&claim, &mut retention_context).await,
                 action => Err(UpdaterError::InvalidRelease(format!(
                     "unsupported persisted action {action}"
                 ))),
@@ -372,6 +377,24 @@ impl Updater {
         let result = self
             .guard_claim_operation(&claim, cluster_loss, true, operation)
             .await;
+        if result.is_ok() {
+            if let (Some(hook), Some(context)) = (&self.config.retention_hook, retention_context) {
+                // The terminal command no longer owns a lease. Its heartbeat must
+                // be stopped before GC, but host and advisory locks remain held.
+                tokio::select! {
+                    biased;
+                    _ = wait_for_loss(cluster_loss) => {
+                        tracing::warn!("post-release retention skipped: advisory lock lost");
+                    }
+                    outcome = run_hook(hook, &context) => {
+                        match outcome {
+                            Ok(_) => tracing::info!("post-release storage retention completed"),
+                            Err(error) => tracing::warn!(?error, "post-release storage retention deferred"),
+                        }
+                    }
+                }
+            }
+        }
         if let Err(error) = result {
             tracing::error!(command.id = %claim.command_id, ?error, "system update command failed");
             if claim.action == "apply" && self.recovery_descriptor_path(&claim).exists() {
@@ -616,7 +639,11 @@ impl Updater {
         Ok(())
     }
 
-    async fn execute_apply(&self, claim: &ClaimedCommand) -> Result<(), UpdaterError> {
+    async fn execute_apply(
+        &self,
+        claim: &ClaimedCommand,
+        retention_context: &mut Option<BTreeMap<String, String>>,
+    ) -> Result<(), UpdaterError> {
         if !self.config.apply_enabled {
             return Err(UpdaterError::Config(
                 "AIF_UPDATE_APPLY_ENABLED must be enabled before apply commands can run"
@@ -925,6 +952,19 @@ impl Updater {
                 ?error,
                 "system update succeeded but the local journal could not be appended"
             );
+        } else if self.config.retention_hook.is_some() {
+            // The update is committed and its recovery descriptor removed. GC is
+            // best-effort under the same host/database locks, never a rollback trigger.
+            let mut context = hook_context(claim, &staged, Some(&backup_token));
+            for (name, path) in [
+                ("AIF_RELEASE_ROOT", &self.config.release_root),
+                ("AIF_UPDATE_JOURNAL_ROOT", &self.config.journal_root),
+                ("AIF_BACKUP_ROOT", &self.config.backup_root),
+                ("AIF_UPDATE_PREVIOUS_RELEASE", &previous_release),
+            ] {
+                context.insert(name.to_string(), path.to_string_lossy().into_owned());
+            }
+            *retention_context = Some(context);
         }
         Ok(())
     }

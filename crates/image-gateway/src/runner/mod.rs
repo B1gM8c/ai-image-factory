@@ -1,4 +1,6 @@
 mod filesystem;
+mod retention;
+pub use retention::RunnerOutputRetention;
 pub(crate) mod process;
 
 pub use filesystem::FilesystemRunnerJournal;
