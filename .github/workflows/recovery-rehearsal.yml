@@ -72,7 +72,7 @@ jobs:
           )
           for hook in deploy/hooks/*; do
             case "$hook" in
-              deploy/hooks/verify-media-segments|deploy/hooks/verify-admin-reader)
+              deploy/hooks/verify-media-segments|deploy/hooks/verify-admin-reader|deploy/hooks/retain-storage)
                 python3 -c 'import ast, pathlib, sys; ast.parse(pathlib.Path(sys.argv[1]).read_text())' "$hook"
                 ;;
               *) shell_scripts+=("$hook") ;;
@@ -86,6 +86,7 @@ jobs:
       - name: Test real database backup and reader permission contracts
         run: |
           python3 scripts/test-native-recovery-evidence.py
+          PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-storage-retention.py
           python3 scripts/test-recovery-extension-sql.py
           python3 scripts/test-admin-reader-gate.py
 

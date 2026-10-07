@@ -1514,6 +1514,116 @@ pub(crate) fn sha256(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
+// Called only after durable success and completed artifact retention have been verified.
+// Do not open ExecutionSpool: its constructor creates runtime directories.
+pub(crate) fn retention_roots(root: &Path) -> Result<Vec<PathBuf>, ProcessSpoolError> {
+    if !root.is_absolute() || root.components().any(|c| matches!(c, Component::ParentDir)) {
+        return Err(ProcessSpoolError::InvalidInput);
+    }
+    let directory = rfs::open(
+        root,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|_| ProcessSpoolError::Integrity)?;
+    let stat = rfs::fstat(&directory).map_err(|_| ProcessSpoolError::Unavailable)?;
+    if FileType::from_raw_mode(stat.st_mode) != FileType::Directory
+        || (stat.st_uid != 0 && stat.st_uid != unsafe { libc::geteuid() })
+        || Mode::from_raw_mode(stat.st_mode).bits() & 0o022 != 0
+    {
+        return Err(ProcessSpoolError::Integrity);
+    }
+    let mut roots = Vec::new();
+    for (index, entry) in fs::read_dir(root)
+        .map_err(|_| ProcessSpoolError::Unavailable)?
+        .enumerate()
+    {
+        if index >= 128 {
+            return Err(ProcessSpoolError::InvalidInput);
+        }
+        let entry = entry.map_err(|_| ProcessSpoolError::Unavailable)?;
+        let name = entry.file_name();
+        let name = name.to_str().ok_or(ProcessSpoolError::Integrity)?;
+        let child = open_private_directory_at(&directory, root, name)?;
+        roots.push(child.path);
+    }
+    let bound = rfs::statat(rfs::CWD, root, AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(|_| ProcessSpoolError::Integrity)?;
+    if bound.st_dev != stat.st_dev || bound.st_ino != stat.st_ino {
+        return Err(ProcessSpoolError::Integrity);
+    }
+    Ok(roots)
+}
+
+pub(crate) fn reclaim_output(
+    root: &Path,
+    execution_id: Uuid,
+    submission_id: Uuid,
+    expected_sha256: &str,
+    expected_size: i64,
+) -> Result<u64, ProcessSpoolError> {
+    if execution_id.is_nil() || !is_sha256(expected_sha256) || expected_size <= 0 {
+        return Err(ProcessSpoolError::InvalidInput);
+    }
+    let root = open_private_directory(root, ProcessSpoolError::InvalidInput)?;
+    let name = execution_id.simple().to_string();
+    match rfs::statat(&root.fd, name.as_str(), AtFlags::SYMLINK_NOFOLLOW) {
+        Err(Errno::NOENT) => return Ok(0),
+        Err(_) => return Err(ProcessSpoolError::Unavailable),
+        Ok(_) => {}
+    }
+    let directory = open_private_directory_at(&root.fd, &root.path, &name)?;
+    let lock = rfs::openat(
+        &directory.fd,
+        LOCK_FILE,
+        OFlags::RDWR | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
+        Mode::empty(),
+    )
+    .map_err(|_| ProcessSpoolError::Integrity)?;
+    let lock_stat = rfs::fstat(&lock).map_err(|_| ProcessSpoolError::Unavailable)?;
+    validate_lock_stat(&lock_stat)?;
+    let lock = fs::File::from(lock);
+    if !try_exclusive_lock(&lock)? {
+        return Err(ProcessSpoolError::Conflict);
+    }
+    super::filesystem::validate_retention_identity(&directory.fd, execution_id, submission_id)
+        .map_err(map_journal_error)?;
+    let identity: ProcessIdentity =
+        read_required_json(&directory.fd, PROCESS_FILE, MAX_MARKER_BYTES)?;
+    identity.validate()?;
+    if identity.lock_device != lock_stat.st_dev as u64 || identity.lock_inode != lock_stat.st_ino {
+        return Err(ProcessSpoolError::Integrity);
+    }
+    let terminal: ProcessTerminal =
+        read_required_json(&directory.fd, RESULT_FILE, MAX_MARKER_BYTES)?;
+    terminal.validate()?;
+    if !matches!(terminal, ProcessTerminal::Succeeded { ref helper_nonce, ref sha256_hex, byte_size, .. }
+        if helper_nonce == &identity.nonce && sha256_hex == expected_sha256 && byte_size == expected_size as u64)
+    {
+        return Err(ProcessSpoolError::Integrity);
+    }
+    let stat = match rfs::statat(&directory.fd, OUTPUT_FILE, AtFlags::SYMLINK_NOFOLLOW) {
+        Err(Errno::NOENT) => return Ok(0),
+        Err(_) => return Err(ProcessSpoolError::Unavailable),
+        Ok(stat) => stat,
+    };
+    validate_regular_file_stat(&stat, MAX_OUTPUT_BYTES)?;
+    if stat.st_size != expected_size {
+        return Err(ProcessSpoolError::Integrity);
+    }
+    validate_bound_path(&root.path, &root.fd)?;
+    validate_bound_path(&directory.path, &directory.fd)?;
+    let bound_lock = rfs::statat(&directory.fd, LOCK_FILE, AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(|_| ProcessSpoolError::Integrity)?;
+    if bound_lock.st_dev != lock_stat.st_dev || bound_lock.st_ino != lock_stat.st_ino {
+        return Err(ProcessSpoolError::Integrity);
+    }
+    rfs::unlinkat(&directory.fd, OUTPUT_FILE, AtFlags::empty())
+        .map_err(|_| ProcessSpoolError::Unavailable)?;
+    rfs::fsync(&directory.fd).map_err(|_| ProcessSpoolError::Unavailable)?;
+    Ok(expected_size as u64)
+}
+
 fn is_sha256(value: &str) -> bool {
     value.len() == 64
         && value
@@ -1549,6 +1659,169 @@ mod tests {
             spool.observe().unwrap(),
             ProcessObservation::Lost { provider: None }
         );
+    }
+
+    #[test]
+    fn reclaim_output_requires_success_identity_size_and_idle_lock() {
+        let (_temp, journal, lease) = fixture();
+        let spool = ExecutionSpool::for_lease(&journal, &lease).unwrap();
+        let lock = spool.acquire_runner_lock().unwrap();
+        let identity = lock.identity().unwrap();
+        spool.publish_process(&lock, &identity).unwrap();
+        let bytes = b"duplicate-output";
+        spool.publish_output(bytes).unwrap();
+        spool
+            .publish_terminal(
+                &lock,
+                &ProcessTerminal::Succeeded {
+                    helper_nonce: identity.nonce,
+                    sha256_hex: sha256(bytes),
+                    byte_size: bytes.len() as u64,
+                    provider_reported_cost: None,
+                },
+            )
+            .unwrap();
+        journal.commit_launch(&lease).unwrap();
+        journal
+            .publish_terminal(
+                &lease,
+                &crate::executor::RunnerOutcome::Succeeded(
+                    crate::executor::ExecutorResultManifest::new(
+                        lease.submission_id,
+                        lease.executor_execution_id,
+                    )
+                    .unwrap(),
+                ),
+            )
+            .unwrap();
+        let reclaim = |hash: &str, size| {
+            reclaim_output(
+                journal.root_path(),
+                lease.executor_execution_id,
+                lease.submission_id,
+                hash,
+                size,
+            )
+        };
+        assert_eq!(
+            reclaim(&sha256(bytes), bytes.len() as i64),
+            Err(ProcessSpoolError::Conflict)
+        );
+        drop(lock);
+        assert_eq!(
+            reclaim(&"a".repeat(64), bytes.len() as i64),
+            Err(ProcessSpoolError::Integrity)
+        );
+        assert_eq!(
+            reclaim(&sha256(bytes), 1),
+            Err(ProcessSpoolError::Integrity)
+        );
+        assert!(spool.path.join(OUTPUT_FILE).exists());
+        assert_eq!(
+            reclaim_output(
+                journal.root_path(),
+                lease.executor_execution_id,
+                Uuid::new_v4(),
+                &sha256(bytes),
+                bytes.len() as i64
+            ),
+            Err(ProcessSpoolError::Integrity)
+        );
+        let output = spool.path.join(OUTPUT_FILE);
+        let saved = spool.path.join("saved-output");
+        fs::rename(&output, &saved).unwrap();
+        std::os::unix::fs::symlink(&saved, &output).unwrap();
+        assert_eq!(
+            reclaim(&sha256(bytes), bytes.len() as i64),
+            Err(ProcessSpoolError::Integrity)
+        );
+        assert!(saved.exists());
+        fs::remove_file(&output).unwrap();
+        fs::rename(&saved, &output).unwrap();
+        fs::hard_link(&output, &saved).unwrap();
+        assert_eq!(
+            reclaim(&sha256(bytes), bytes.len() as i64),
+            Err(ProcessSpoolError::Integrity)
+        );
+        fs::remove_file(&saved).unwrap();
+        assert_eq!(
+            reclaim(&sha256(bytes), bytes.len() as i64),
+            Ok(bytes.len() as u64)
+        );
+        assert_eq!(reclaim(&sha256(bytes), bytes.len() as i64), Ok(0));
+        assert!(spool.path.join(RESULT_FILE).exists());
+        assert!(spool.path.join(PROCESS_FILE).exists());
+    }
+
+    #[test]
+    fn reclaim_output_retains_uncertain_and_rejects_symlink() {
+        let (_temp, journal, lease) = fixture();
+        let spool = ExecutionSpool::for_lease(&journal, &lease).unwrap();
+        let lock = spool.acquire_runner_lock().unwrap();
+        let identity = lock.identity().unwrap();
+        spool.publish_process(&lock, &identity).unwrap();
+        spool.publish_output(b"evidence").unwrap();
+        spool
+            .publish_terminal(
+                &lock,
+                &ProcessTerminal::Uncertain {
+                    helper_nonce: identity.nonce,
+                    error_code: "unknown".into(),
+                },
+            )
+            .unwrap();
+        drop(lock);
+        assert_eq!(
+            reclaim_output(
+                journal.root_path(),
+                lease.executor_execution_id,
+                lease.submission_id,
+                &sha256(b"evidence"),
+                8
+            ),
+            Err(ProcessSpoolError::Integrity)
+        );
+        assert!(spool.path.join(OUTPUT_FILE).exists());
+        let alias = journal
+            .root_path()
+            .join(Uuid::new_v4().simple().to_string());
+        std::os::unix::fs::symlink(&spool.path, &alias).unwrap();
+        let id = Uuid::parse_str(alias.file_name().unwrap().to_str().unwrap()).unwrap();
+        assert_eq!(
+            reclaim_output(
+                journal.root_path(),
+                id,
+                lease.submission_id,
+                &sha256(b"evidence"),
+                8
+            ),
+            Err(ProcessSpoolError::Integrity)
+        );
+        assert!(spool.path.join(OUTPUT_FILE).exists());
+    }
+
+    #[test]
+    fn retention_roots_reject_aliases_writable_parent_and_unbounded_entries() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = TempDir::new().unwrap();
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        let profile = temp.path().join("managed.grok");
+        fs::create_dir(&profile).unwrap();
+        fs::set_permissions(&profile, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(retention_roots(temp.path()).unwrap(), vec![profile.clone()]);
+        let alias = temp.path().join("alias");
+        std::os::unix::fs::symlink(&profile, &alias).unwrap();
+        assert!(retention_roots(temp.path()).is_err());
+        fs::remove_file(alias).unwrap();
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(retention_roots(temp.path()).is_err());
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        for i in 0..128 {
+            let path = temp.path().join(format!("profile-{i}"));
+            fs::create_dir(&path).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        assert!(retention_roots(temp.path()).is_err());
     }
 
     #[test]

@@ -108,7 +108,7 @@ jobs:
           )
           for hook in deploy/hooks/*; do
             case "$hook" in
-              deploy/hooks/verify-media-segments|deploy/hooks/verify-admin-reader)
+              deploy/hooks/verify-media-segments|deploy/hooks/verify-admin-reader|deploy/hooks/retain-storage)
                 python3 -c 'import ast, pathlib, sys; ast.parse(pathlib.Path(sys.argv[1]).read_text())' "$hook"
                 ;;
               *) shell_scripts+=("$hook") ;;
@@ -121,6 +121,7 @@ jobs:
           python3 -c 'import ast, pathlib; ast.parse(pathlib.Path("deploy/hooks/verify-media-segments").read_text())'
           PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-media-runtime-gate.py
           PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-recovery-systemd-sandbox.py
+          PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-storage-retention.py
 
           scripts/test-gateway-runtime-gate.sh
           scripts/test-release-process-hooks.sh

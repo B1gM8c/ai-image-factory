@@ -1,0 +1,174 @@
+#!/usr/bin/python3
+"""Post-verified-apply retention; caller MUST hold the updater advisory lock.
+
+Only journal-proven completed installs older than seven days are eligible.
+Unknown/legacy backups, recovery descriptors and referenced releases fail closed.
+No database, credentials, media or executor spool is accessed.
+"""
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import stat
+import sys
+import time
+
+GRACE = 7 * 86400
+KEEP = 3
+
+
+def directory(path):
+    path = Path(path)
+    if not path.is_absolute() or path == Path('/') or path.resolve(strict=True) != path:
+        raise ValueError('noncanonical retention directory')
+    if not path.is_dir():
+        raise ValueError('retention directory missing')
+    info = path.stat()
+    if info.st_uid != os.geteuid() or info.st_mode & 0o022:
+        raise ValueError('retention directory is not protected')
+    return path
+
+
+def bounded(path, limit=1024 * 1024):
+    info = path.lstat()
+    if not stat.S_ISREG(info.st_mode) or info.st_size > limit:
+        raise ValueError('unexpected retention metadata')
+    return path.read_text()
+
+
+def safe_tree(path):
+    # rmtree uses fd-based traversal; reject links, mounts and special files too.
+    device = path.lstat().st_dev
+    if device != path.parent.stat().st_dev or os.path.ismount(path):
+        raise ValueError('mounted retention candidate')
+    count = 0
+    for root, dirs, files in os.walk(path, followlinks=False):
+        for name in dirs + files:
+            entry = Path(root) / name
+            info = entry.lstat()
+            count += 1
+            if count > 100000 or info.st_dev != device or os.path.ismount(entry) or not (
+                stat.S_ISREG(info.st_mode) or stat.S_ISDIR(info.st_mode)
+            ):
+                raise ValueError('unsafe retention tree')
+
+
+def references(releases, proc=Path('/proc'), configs=None):
+    configs = configs if configs is not None else [Path('/etc/ai-image-factory'), Path('/etc/systemd/system'),
+                                                 Path('/run/systemd/system'), Path('/usr/lib/systemd/system')]
+    referenced = set()
+    prefix = str(releases) + '/'
+
+    def record(text):
+        for suffix in text.split(prefix)[1:]:
+            name = re.split(r'[/\s\x00"\'<>]', suffix, maxsplit=1)[0]
+            if name:
+                referenced.add(name)
+
+    if not proc.is_dir():
+        raise ValueError('process references unavailable')
+    for process in proc.iterdir():
+        if not process.name.isdigit():
+            continue
+        try:
+            for link in [process / 'exe', process / 'cwd', *list((process / 'fd').iterdir())]:
+                try:
+                    record(os.readlink(link))
+                except FileNotFoundError:
+                    pass
+            record((process / 'maps').read_text())
+            if (process / 'cmdline').exists():
+                record((process / 'cmdline').read_text())
+        except (FileNotFoundError, ProcessLookupError):
+            pass  # Process exited during snapshot.
+    for config in configs:
+        if not config.exists():
+            continue
+        for root, dirs, files in os.walk(config, followlinks=False):
+            for name in dirs + files:
+                path = Path(root) / name
+                if path.is_symlink():
+                    record(str(path.resolve()))
+                    if path.is_file():
+                        record(bounded(path.resolve()))
+                    elif path.is_dir():
+                        raise ValueError('unscanned configuration directory link')
+                elif path.is_file():
+                    record(bounded(path))
+    return referenced
+
+
+def retain(env, now=None, proc=Path('/proc'), configs=None):
+    now = time.time() if now is None else now
+    root = directory(env['AIF_RELEASE_ROOT'])
+    releases = directory(root / 'releases')
+    journal = directory(env['AIF_UPDATE_JOURNAL_ROOT'])
+    backups = directory(env['AIF_BACKUP_ROOT'])
+    current = directory(env['AIF_UPDATE_RELEASE_DIR'])
+    previous = directory(env['AIF_UPDATE_PREVIOUS_RELEASE'])
+    backup = directory(env['AIF_UPDATE_BACKUP_TOKEN'])
+    if current.parent != releases or previous.parent != releases or backup.parent != backups:
+        raise ValueError('protected path outside managed root')
+    if (root / 'current').resolve(strict=True) != current:
+        raise ValueError('current release changed')
+    recovery = journal / 'recovery'
+    if recovery.is_symlink() or (recovery.exists() and (not recovery.is_dir() or any(recovery.iterdir()))):
+        raise ValueError('pending or ambiguous recovery')
+    verified = {}
+    for line in bounded(journal / 'events.jsonl', 32 * 1024 * 1024).splitlines():
+        event = json.loads(line)
+        version = event.get('target_version')
+        if event.get('action') == 'apply' and event.get('phase') == 'verified':
+            if not isinstance(version, str) or not re.fullmatch(r'v[0-9][A-Za-z0-9.+-]{0,180}', version):
+                raise ValueError('invalid verified version')
+            verified[version] = event
+    protected = {current.name, previous.name}
+    protected.update(sorted(verified, key=lambda v: verified[v]['created_at_ms'], reverse=True)[:KEEP])
+    protected.update(references(releases, proc, configs))
+    candidates = []
+    for path in releases.iterdir():
+        event = verified.get(path.name)
+        if not event or path.name in protected or now - event['created_at_ms'] / 1000 < GRACE:
+            continue
+        directory(path)
+        identity = json.loads(bounded(path / 'release.json'))
+        if identity.get('release_version') != path.name or identity.get('commit_sha') != event['details'].get('commit'):
+            raise ValueError('release identity mismatch')
+        safe_tree(path)
+        candidates.append(path)
+    backup_candidates = []
+    for path in backups.iterdir():
+        if path == backup or not path.is_dir() or path.is_symlink():
+            continue
+        metadata = path / 'recovery.env'
+        if not metadata.is_file() or metadata.is_symlink():
+            continue
+        values = dict(line.split('=', 1) for line in bounded(metadata).splitlines() if '=' in line)
+        version = values.get('RELEASE_VERSION')
+        event = verified.get(version)
+        if not event or version in protected or now - event['created_at_ms'] / 1000 < GRACE:
+            continue
+        if values.get('DATABASE_RECOVERY_FORMAT') != '2' or values.get('UPDATE_COMMAND_ID') != event['command_id'] or path.name != event['command_id'] + '-' + version:
+            continue
+        if values.get('RELEASE_COMMIT') != event['details'].get('commit'):
+            continue
+        directory(path)
+        safe_tree(path)
+        backup_candidates.append(path)
+    # Validate the complete plan before any deletion. Updater lock prevents an
+    # install/recovery racing this snapshot; roots are root-owned installation data.
+    if not shutil.rmtree.avoids_symlink_attacks:
+        raise ValueError('safe recursive deletion unavailable')
+    for path in candidates + backup_candidates:
+        shutil.rmtree(path)
+    return {'removed_releases': len(candidates), 'removed_backups': len(backup_candidates)}
+
+
+if __name__ == '__main__':
+    try:
+        print(json.dumps(retain(os.environ), sort_keys=True))
+    except Exception as error:
+        # Do not print arbitrary file contents, credentials or environment.
+        print('storage retention skipped/failed: ' + type(error).__name__, file=sys.stderr)
+        sys.exit(1)

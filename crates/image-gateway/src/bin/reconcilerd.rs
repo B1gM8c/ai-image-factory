@@ -105,6 +105,18 @@ async fn main() -> Result<(), ImageGatewayError> {
     let mut next_identity_maintenance = tokio::time::Instant::now();
     let mut next_provider_upload_cleanup = tokio::time::Instant::now();
     let mut next_provider_route_reconcile = tokio::time::Instant::now();
+    let runner_root = env::var_os("RECONCILER_RUNNER_ROOT").map(std::path::PathBuf::from);
+    if runner_root.as_ref().is_some_and(|root| !root.is_absolute()) {
+        return Err(ImageGatewayError::config(
+            "RECONCILER_RUNNER_ROOT must be absolute",
+        ));
+    }
+    let mut runner_retention = gpt_image_2_gateway::runner::RunnerOutputRetention::default();
+    let mut next_runner_cleanup = tokio::time::Instant::now();
+    tracing::info!(
+        enabled = runner_root.is_some(),
+        "successful runner output retention configured"
+    );
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
     tracing::info!(batch_size, "reconcilerd started");
@@ -166,6 +178,18 @@ async fn main() -> Result<(), ImageGatewayError> {
                     }
                 }
             },
+        }
+        if tokio::time::Instant::now() >= next_runner_cleanup {
+            if let Some(root) = &runner_root {
+                match runner_retention.reconcile(&pool, root, batch_size).await {
+                    Ok(bytes) if bytes > 0 => {
+                        tracing::info!(bytes, "successful runner outputs reclaimed")
+                    }
+                    Ok(_) => {}
+                    Err(error) => tracing::error!(?error, "runner output retention failed"),
+                }
+            }
+            next_runner_cleanup = tokio::time::Instant::now() + Duration::from_secs(60);
         }
         if tokio::time::Instant::now() >= next_identity_maintenance {
             match identity_maintenance
