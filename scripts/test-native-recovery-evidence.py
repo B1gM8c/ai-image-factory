@@ -1,10 +1,13 @@
 """Local contracts for bounded native-recovery failure evidence."""
 import ast
 import importlib.util
+import io
 import json
+import os
 from pathlib import Path
 import re
 import tempfile
+import tarfile
 import unittest
 from unittest import mock
 
@@ -17,6 +20,30 @@ SPEC.loader.exec_module(HARNESS_MODULE)
 
 
 class NativeRecoveryEvidenceTests(unittest.TestCase):
+    def test_unpack_protects_release_directories_with_permissive_umask(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            archive = root / 'bundle.tar.gz'
+            with tarfile.open(archive, 'w:gz') as bundle:
+                directory = tarfile.TarInfo('bin')
+                directory.type = tarfile.DIRTYPE
+                directory.mode = 0o777
+                bundle.addfile(directory)
+                executable = tarfile.TarInfo('bin/updated')
+                payload = b'verified fixture bytes'
+                executable.size, executable.mode = len(payload), 0o755
+                bundle.addfile(executable, io.BytesIO(payload))
+            previous_umask = os.umask(0o002)
+            try:
+                destination = root / 'release'
+                HARNESS_MODULE.unpack(archive, destination)
+            finally:
+                os.umask(previous_umask)
+            for directory in (destination, destination / 'bin'):
+                self.assertEqual(directory.stat().st_mode & 0o777, 0o755)
+            self.assertEqual((destination / 'bin/updated').read_bytes(), payload)
+            self.assertEqual((destination / 'bin/updated').stat().st_mode & 0o777, 0o755)
+
     def exercise_legacy_stop(self, states, times=(0, 5)):
         baseline = {'release_version': 'v0.1.0-20260824.40c7432',
                     'commit_sha': '40c74329080aeaea7b4eddeaf56a20fead554c4f'}

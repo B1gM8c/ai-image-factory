@@ -392,8 +392,12 @@ def validate_bundle(bundle, manifest_path):
 
 
 def unpack(bundle, destination):
-    destination.mkdir(parents=True)
+    destination.mkdir(parents=True, mode=0o755)
     run(['tar', '-xzf', bundle, '-C', destination, '--no-same-owner'])
+    # Mirror install-release: mkdir/tar inherit the runner umask, but an
+    # immutable executable's ancestors must never be group/world writable.
+    for directory in [destination, *(p for p in destination.rglob('*') if p.is_dir())]:
+        directory.chmod(0o755)
 
 
 def env_file(path, values):
