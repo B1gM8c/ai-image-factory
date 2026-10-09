@@ -219,8 +219,9 @@ def main():
     parser.add_argument('--extract-updater', action='store_true')
     args = parser.parse_args()
     require(not args.extract_updater or args.target != 'publication', 'bootstrap requires one architecture')
-    gh = shutil.which('gh')
-    require(gh is not None, 'existing GitHub CLI required')
+    gh = os.environ.get('AIF_UPDATE_GH_EXECUTABLE') or shutil.which('gh')
+    require(gh is not None and Path(gh).is_absolute() and os.access(gh, os.X_OK),
+            'existing absolute executable GitHub CLI required')
     if args.extract_updater:
         require(os.geteuid() == 0, 'bootstrap extraction requires root')
         root_protected(Path(gh).resolve())

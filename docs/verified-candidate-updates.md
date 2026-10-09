@@ -16,6 +16,8 @@ immutable Release checks, add a public update API, or authorize model requests.
    unverified archive. Using the host's existing trusted `gh`, run it with
    `--repo`, `--pin`, `--target`, a new root-protected `--output` directory and
    `--extract-updater`. It verifies provenance before extracting an executable.
+   It honors the existing `AIF_UPDATE_GH_EXECUTABLE` setting; do not substitute
+   an older system `gh` when the updater already uses a protected newer binary.
    No service, policy, database or current-pointer change occurs in this step.
 4. In an approved maintenance window, keep effective Gateway/updater Apply
    disabled and configure `AIF_UPDATE_CANDIDATE_PIN` for the updater and the
