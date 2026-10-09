@@ -112,6 +112,7 @@ struct ProtocolCaptureDiagnostic {
     phase: &'static str,
     reason: &'static str,
     last_message_class: &'static str,
+    last_valid_notification_class: &'static str,
     message_count: usize,
     notification_count: usize,
     captured_bytes: usize,
@@ -160,6 +161,8 @@ struct PersistedProtocolDiagnostic {
     phase: String,
     reason: String,
     last_message_class: String,
+    #[serde(default)]
+    last_valid_notification_class: String,
     message_count: usize,
     notification_count: usize,
     captured_bytes: usize,
@@ -384,6 +387,28 @@ impl ProtocolState {
     }
 
     fn observe_notification(
+        &mut self,
+        message: &Value,
+        codex_home: &Path,
+    ) -> Result<bool, CodexAppServerError> {
+        let result = self.validate_notification(message, codex_home);
+        if result.is_ok() {
+            // Unknown notifications are accepted but not validated; keep the last known event.
+            // Never retain arbitrary method names or payloads in diagnostics.
+            self.capture_diagnostic.last_valid_notification_class =
+                match message.get("method").and_then(Value::as_str) {
+                    Some("thread/started") => "thread_started",
+                    Some("turn/started") => "turn_started",
+                    Some("item/started") => "item_started",
+                    Some("item/completed") => "item_completed",
+                    Some("turn/completed") => "turn_completed",
+                    _ => self.capture_diagnostic.last_valid_notification_class,
+                };
+        }
+        result
+    }
+
+    fn validate_notification(
         &mut self,
         message: &Value,
         codex_home: &Path,
@@ -1320,10 +1345,18 @@ fn build_failure_diagnostic(
             code: exit.code,
             signal: exit.signal,
         },
-        protocol: (error == CodexAppServerError::Protocol).then(|| PersistedProtocolDiagnostic {
+        protocol: matches!(
+            error,
+            CodexAppServerError::Protocol | CodexAppServerError::ProcessExited
+        )
+        .then(|| PersistedProtocolDiagnostic {
             phase: state.capture_diagnostic.phase.to_string(),
             reason: state.capture_diagnostic.reason.to_string(),
             last_message_class: state.capture_diagnostic.last_message_class.to_string(),
+            last_valid_notification_class: state
+                .capture_diagnostic
+                .last_valid_notification_class
+                .to_string(),
             message_count: state.capture_diagnostic.message_count,
             notification_count: state.capture_diagnostic.notification_count,
             captured_bytes: state.capture_diagnostic.captured_bytes,
@@ -1378,6 +1411,10 @@ fn trace_failure(
             .protocol
             .as_ref()
             .map_or("none", |value| value.last_message_class.as_str()),
+        codex.protocol.last_valid_notification_class = diagnostic
+            .protocol
+            .as_ref()
+            .map_or("none", |value| value.last_valid_notification_class.as_str()),
         codex.protocol.message_count = diagnostic
             .protocol
             .as_ref()
@@ -1435,10 +1472,16 @@ async fn read_message<R: AsyncBufRead + Unpin>(
             if error == CodexAppServerError::Protocol {
                 state.protocol_error("frame_invalid")
             } else {
+                if error == CodexAppServerError::ProcessExited {
+                    state.capture_diagnostic.reason = "eof_mid_frame";
+                }
                 error
             }
         })?
-        .ok_or(CodexAppServerError::ProcessExited)?;
+        .ok_or_else(|| {
+            state.capture_diagnostic.reason = "eof_before_expected_message";
+            CodexAppServerError::ProcessExited
+        })?;
     record_capture_bytes(capture_bytes, line.len())
         .map_err(|_| state.protocol_error("capture_limit_exceeded"))?;
     state.capture_diagnostic.captured_bytes = *capture_bytes;
@@ -1457,6 +1500,9 @@ async fn read_optional_message<R: AsyncBufRead + Unpin>(
         if error == CodexAppServerError::Protocol {
             state.protocol_error("frame_invalid")
         } else {
+            if error == CodexAppServerError::ProcessExited {
+                state.capture_diagnostic.reason = "eof_mid_frame";
+            }
             error
         }
     })?
@@ -1875,6 +1921,156 @@ mod tests {
             old.as_object_mut().unwrap().remove("protocol");
             assert!(serde_json::from_value::<CodexAppServerFailureDiagnosticV1>(old).is_ok());
         }
+    }
+
+    #[tokio::test]
+    async fn synthetic_jsonl_missing_fields_preserves_last_valid_notification() {
+        let bytes = b"{\"method\":\"thread/started\",\"params\":{\"thread\":{\"id\":\"11111111-1111-4111-8111-111111111111\"}}}\n{\"method\":\"turn/started\",\"params\":{\"secret\":\"never-persist-me\"}}\n";
+        let mut reader = &bytes[..];
+        let mut state = ProtocolState::default();
+        state.protocol_phase("event_stream");
+        let mut count = 0;
+        let first = read_message(&mut reader, &mut state, &mut count)
+            .await
+            .unwrap();
+        state
+            .observe_notification(&first, Path::new("/unused"))
+            .unwrap();
+        let second = read_message(&mut reader, &mut state, &mut count)
+            .await
+            .unwrap();
+        let error = state
+            .observe_notification(&second, Path::new("/unused"))
+            .unwrap_err();
+        let diagnostic = build_failure_diagnostic(&state, error, None, &ExitDiagnostic::default());
+        let p = diagnostic.protocol.as_ref().unwrap();
+        assert_eq!(p.reason, "turn_notification_id_missing");
+        assert_eq!(p.last_message_class, "turn_started");
+        assert_eq!(p.last_valid_notification_class, "thread_started");
+        assert_eq!(p.message_count, 2);
+        assert_eq!(p.notification_count, 2);
+        assert!(
+            !serde_json::to_string(&diagnostic)
+                .unwrap()
+                .contains("never-persist-me")
+        );
+        let mut old = serde_json::to_value(&diagnostic).unwrap();
+        old["protocol"]
+            .as_object_mut()
+            .unwrap()
+            .remove("last_valid_notification_class");
+        assert!(serde_json::from_value::<CodexAppServerFailureDiagnosticV1>(old).is_ok());
+    }
+
+    #[tokio::test]
+    async fn synthetic_jsonl_unknown_notification_preserves_last_valid_event() {
+        let mut state = ProtocolState::default();
+        let known = serde_json::json!({"method": "thread/started", "params": {
+            "thread": {"id": "11111111-1111-4111-8111-111111111111"}
+        }});
+        let unknown = serde_json::json!({"method": "never-persist-me", "params": null});
+        assert!(
+            !state
+                .observe_notification(&unknown, Path::new("/unused"))
+                .unwrap()
+        );
+        assert_eq!(state.capture_diagnostic.last_valid_notification_class, "");
+        state
+            .observe_notification(&known, Path::new("/unused"))
+            .unwrap();
+        assert!(
+            !state
+                .observe_notification(&unknown, Path::new("/unused"))
+                .unwrap()
+        );
+        assert_eq!(
+            state.capture_diagnostic.last_valid_notification_class,
+            "thread_started"
+        );
+    }
+
+    #[tokio::test]
+    async fn synthetic_jsonl_out_of_order_response_stays_fail_closed() {
+        let mut reader = &b"{\"id\":3,\"result\":{}}\n"[..];
+        let mut state = ProtocolState::default();
+        state.protocol_phase("initialize");
+        let error = wait_for_response(&mut reader, &mut state, Path::new("/unused"), &mut 0, 1)
+            .await
+            .unwrap_err();
+        assert_eq!(error, CodexAppServerError::Protocol);
+        assert_eq!(state.capture_diagnostic.reason, "unexpected_response_id");
+        assert_eq!(state.capture_diagnostic.last_valid_notification_class, "");
+    }
+
+    #[tokio::test]
+    async fn synthetic_jsonl_limit_and_eof_keep_bounded_context() {
+        for (bytes, initial_count, expected, reason) in [
+            (
+                &b"{}\n"[..],
+                MAX_PROTOCOL_CAPTURE_BYTES,
+                CodexAppServerError::Protocol,
+                "capture_limit_exceeded",
+            ),
+            (
+                &b""[..],
+                0,
+                CodexAppServerError::ProcessExited,
+                "eof_before_expected_message",
+            ),
+            (
+                &b"{\"secret\":\"never-persist-me\"}"[..],
+                0,
+                CodexAppServerError::ProcessExited,
+                "eof_mid_frame",
+            ),
+        ] {
+            let mut reader = bytes;
+            let mut state = ProtocolState::default();
+            state.protocol_phase("event_stream");
+            let mut count = initial_count;
+            let error = read_message(&mut reader, &mut state, &mut count)
+                .await
+                .unwrap_err();
+            assert_eq!(error, expected);
+            let diagnostic =
+                build_failure_diagnostic(&state, error, None, &ExitDiagnostic::default());
+            assert_eq!(diagnostic.protocol.as_ref().unwrap().reason, reason);
+            let json = serde_json::to_string(&diagnostic).unwrap();
+            assert!(json.len() < 4096);
+            assert!(!json.contains("never-persist-me"));
+            assert!(!diagnostic.is_retryable_authentication_rejection());
+        }
+        let mut state = ProtocolState::default();
+        let mut reader = &b""[..];
+        assert!(
+            read_optional_message(&mut reader, &mut state, &mut 0)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        state.thread_id = Some(Uuid::parse_str(THREAD_ID).unwrap());
+        state.turn_id = Some("turn-eof".to_string());
+        assert!(state.observe_notification(&serde_json::json!({
+            "method": "turn/completed",
+            "params": {"threadId": THREAD_ID, "turn": {"id": "turn-eof", "status": "completed"}}
+        }), Path::new("/unused")).unwrap());
+        state.protocol_phase("post_terminal");
+        let mut reader = &b"{\"secret\":\"never-persist-me\"}"[..];
+        let error = read_optional_message(&mut reader, &mut state, &mut 0)
+            .await
+            .unwrap_err();
+        assert_eq!(error, CodexAppServerError::ProcessExited);
+        let diagnostic = build_failure_diagnostic(&state, error, None, &ExitDiagnostic::default());
+        let protocol = diagnostic.protocol.as_ref().unwrap();
+        assert_eq!(protocol.phase, "post_terminal");
+        assert_eq!(protocol.reason, "eof_mid_frame");
+        assert_eq!(protocol.last_valid_notification_class, "turn_completed");
+        assert!(
+            !serde_json::to_string(&diagnostic)
+                .unwrap()
+                .contains("never-persist-me")
+        );
+        assert!(!diagnostic.is_retryable_authentication_rejection());
     }
 
     #[test]
