@@ -2,6 +2,9 @@ use std::path::{Component, Path};
 
 use thiserror::Error;
 
+/// Factory admission ceiling for the pinned image adapter, not a verified native
+/// CLI/API maximum. Shared by request validation, admission and model discovery.
+/// See docs/architecture/2026-grok-cli-xai-media-binding.md before changing it.
 pub const MAX_IMAGE_EDIT_REFERENCES: usize = 3;
 pub const MAX_REFERENCE_VIDEO_IMAGES: usize = 7;
 
@@ -382,7 +385,7 @@ pub enum RequestValidationError {
     InvalidStagedFilename,
     #[error("staged image SHA-256 must be 64 lowercase hexadecimal characters")]
     InvalidStagedSha256,
-    #[error("reference image count is outside the supported Grok CLI range")]
+    #[error("reference image count is outside the configured Factory adapter range")]
     InvalidReferenceCount,
     #[error("reference image filenames must be unique")]
     DuplicateReferenceFilename,

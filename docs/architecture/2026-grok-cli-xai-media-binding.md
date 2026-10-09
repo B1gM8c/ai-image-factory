@@ -49,13 +49,81 @@ unrelated image model through `active_providers()`.
 | xAI surface | Official behavior | Grok CLI binding | Factory decision |
 | --- | --- | --- | --- |
 | `POST /v1/images/generations` | synchronous; official request and response schemas include model, count, ratio, resolution, response format, storage, user attribution, file output, and usage | `image_gen`; one local JPEG; effective `1k`; no upstream URL or Files API handle is exposed | retain the full official DTO; currently admit only `n=1`, omitted/`1k` resolution, explicit `b64_json`, and no `storage_options` |
-| `POST /v1/images/edits` | synchronous image edit | `image_edit`; 1-3 source images; quality model; one `1k` image | keep inactive until the full official edit DTO, typed source hash, sealed input staging, and cleanup path are implemented |
+| `POST /v1/images/edits` | synchronous image edit | `image_edit`; quality model; one `1k` image; native reference-count maximum not established for pinned 1.0.5 | Factory currently admits 1-3 source images; this is an adapter policy, not an upstream capability claim |
 | `POST /v1/videos/generations` text-only | asynchronous | Grok CLI V2 agentic video; 6 or 10 seconds; `480p` or `720p`; generated audio required | support only when the V2 profile is explicitly selected; bill one admitted duration and expose a Factory job |
 | `POST /v1/videos/generations` with one image | asynchronous | Grok CLI V2 image-to-video; one base64/data-URL image or bounded public HTTPS image (no redirects or private targets); optional prompt; 6 or 10 seconds; `480p` or `720p`; no aspect-ratio override | support only through V2; the image is staged by digest and the CLI reconstructs the media request |
 | `POST /v1/videos/generations` with reference inputs | asynchronous | Grok CLI V2 reference-to-video; `last_frame`, reference images, and keyframe images accept base64/data-URL or bounded public HTTPS (no redirects or private targets); up to 7 reference images, 4 mid-clip keyframes, and 3 voice IDs; 1-15 seconds; `480p` or `720p` | support only for CLI-expressible local inputs; `keyframes` is a documented Factory CLI extension; reference-audio URLs and `file_id` are rejected |
 | `POST /v1/videos/edits` | asynchronous | no CLI tool | reject |
 | `POST /v1/videos/extensions` | asynchronous | no CLI tool | reject |
 | `GET /v1/videos/{request_id}` | returns provider task progress and final URL | CLI hides the provider request ID and returns after polling | expose the factory job ID and factory state, not a fabricated xAI provider ID |
+
+### Image reference-limit evidence (2026-10-09)
+
+Image execution is pinned by `providers/grok-cli-v1.lock.json` to
+`grok 1.0.5 (5115b46bc9)`, adapter `grok-cli-1.0.5.agentic-media.v2`,
+and model `grok-imagine-image-quality`. Linux x86_64 artifact SHA256:
+`9ba87444e1819e8f6104adbbf4676a870c204380aa5c3e1c38a926c4ea677238`.
+The production executable's version output was checked read-only.
+
+`MAX_IMAGE_EDIT_REFERENCES` is the single Factory ceiling consumed by typed
+request validation, staged-manifest admission and console model discovery
+(`max_reference_images`). It counts **source images**, including a staged semantic
+mask reference when used, not output `n`; this adapter still admits one output
+per execution. Clients should consume discovery rather than hardcoding 3 or 4.
+
+This ceiling was inherited from the older adapter. It is NOT evidence that CLI
+1.0.5 rejects four inputs. GitHub's official repository does not resolve the
+embedded commit `5115b46bc9` (commit API returned 422). Static strings in the
+production binary describe multi-image editing and a nonempty-input check but
+do not establish a maximum. Current official source at
+[`2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8`](https://github.com/xai-org/grok-build/blob/2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8/crates/codegen/xai-grok-tools/src/implementations/grok_build/image_edit/mod.rs)
+is not proven to be the source of that binary.
+The [current public API guide](https://docs.x.ai/developers/model-capabilities/images/multi-image-editing)
+allows five inputs with an example using `grok-imagine-image-2.0`; it does not
+prove support in this pinned CLI/model pair. Do not widen admission or claim an
+upgrade is necessary without exact runtime/model evidence or separately
+authorized, bounded native tests. Mock tests only verify Factory policy.
+
+### Content-free CLI exit diagnostics
+
+On nonzero exits, `grok-cli-exit.json` records the trusted executor execution ID, process-exit phase,
+success, exit code or signal, truncation flags, a fixed error category derived
+only from allowlisted structured error codes, and whether media tool calls were
+observed in bounded history. Unknown errors stay `unknown`; raw stderr and error
+messages are not copied. Existing stdout/stderr digest diagnostics are unchanged.
+Missing/invalid history yields `null`; `false` means only that no tool call was
+observed, not that no charge or upstream dispatch occurred. These observations
+never authorize replay, release a hold, or change `uncertain` settlement.
+Historical error text cannot be recovered from its digest; this change only
+improves future invocations. It is not a fix or diagnosis of the four historical
+nonzero CLI exits.
+
+### Bounded native probe result (2026-10-09)
+
+After explicit approval for exactly two invocations, the production-SHA binary
+was run outside Factory admission with fresh isolated homes and synthetic
+256x256 RGB inputs: three references, then four, requesting one output each.
+Only `image_edit` was enabled, with one agent turn, no retry, no automatic
+update, no shared leader. The effective upstream model could not be observed.
+
+| Sources | Session ID | Seconds | Exit | Observed media calls | Output artifacts |
+| --- | --- | --- | --- | --- | --- |
+| 3 | `2266416e-b076-4654-8d94-39ada7576abc` | 1.836 | 1 | 0 | 0 |
+| 4 | `b84944c1-a562-4258-99d7-e720cdf5dc62` | 2.238 | 1 | 0 | 0 |
+
+Both produced 595-byte stdout SHA256
+`c493e3614a0d84073f84c48552e4368dfb2fc70936649f744908d540a0b4aa93`
+and 242-byte stderr SHA256
+`8dde9a1f98e308dedc8dc68a0f0509d1ced1ffcff33a31190027128459401bf6`,
+matching the earlier failures. Each history contained three records; the probe
+did not observe an `image_edit` call. No known static error marker matched.
+These results reproduce the failure but **do not establish native input limits
+or the underlying exit reason**. In particular, four references were not shown
+to be rejected by the media tool. No billing conclusion follows from absent
+artifacts/calls. Credential and executable hashes remained unchanged; isolated
+credential/session copies were removed. Raw output was not exported/retained,
+so these summaries cannot recover the error text. A third invocation requires
+new approval. The manual probe script is not a CI test or an automatic retry.
 
 The public DTO follows the xAI route shape, but the V2 CLI intersection is
 deliberately narrower: `generate_audio` must be omitted or `true` (explicit
