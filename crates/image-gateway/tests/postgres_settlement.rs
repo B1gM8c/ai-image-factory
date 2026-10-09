@@ -24,6 +24,125 @@ use uuid::Uuid;
 type TestResult<T = ()> = Result<T, String>;
 
 #[tokio::test]
+async fn image_status_does_not_read_outputs_from_a_cross_scope_job_binding() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let owner = RunningFixture::new(&database.pool).await?;
+        let other = RunningFixture::new(&database.pool).await?;
+        assert_image_status_rejects_wrong_job_binding(
+            &database.pool,
+            &owner,
+            &other,
+            "project-settlement",
+        )
+        .await?;
+
+        let shared_tenant = format!("tenant-{}", Uuid::new_v4().simple());
+        let owner =
+            RunningFixture::new_in_scope(&database.pool, shared_tenant.clone(), "project-owner")
+                .await?;
+        let other =
+            RunningFixture::new_in_scope(&database.pool, shared_tenant, "project-other").await?;
+        assert_image_status_rejects_wrong_job_binding(
+            &database.pool,
+            &owner,
+            &other,
+            "project-owner",
+        )
+        .await
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+async fn assert_image_status_rejects_wrong_job_binding(
+    pool: &PgPool,
+    owner: &RunningFixture,
+    other: &RunningFixture,
+    project_id: &str,
+) -> TestResult {
+    let key_digest: String =
+        sqlx::query_scalar("SELECT key_digest FROM idempotency_requests WHERE job_id = $1")
+            .bind(owner.lease.job_id)
+            .fetch_one(pool)
+            .await
+            .map_err(|error| format!("failed to read fixture key digest: {error}"))?;
+    let settlement = PostgresExecutionSettlementStore::new(
+        pool.clone(),
+        Arc::new(InMemoryArtifactBlobStore::default()),
+    );
+    let valid = settlement
+        .image_generation_status_by_key(
+            &owner.reservation.charge.tenant_id,
+            project_id,
+            "openai-images-v1",
+            "generation",
+            &key_digest,
+        )
+        .await
+        .map_err(|error| format!("failed to read valid status: {error:?}"))?
+        .ok_or_else(|| "valid fixture key was not found".to_string())?;
+    require(
+        valid.requested_count == 2 && valid.outputs.len() == 2 && !valid.reconciliation_required,
+        "valid status was filtered before wrong-scope binding",
+    )?;
+    sqlx::query(
+        r#"
+        INSERT INTO job_outputs
+            (output_id, job_id, output_index, state, created_at_ms, updated_at_ms)
+        VALUES ($1, $2, 0, 'pending', 1, 1)
+        "#,
+    )
+    .bind(Uuid::new_v4())
+    .bind(other.lease.job_id)
+    .execute(pool)
+    .await
+    .map_err(|error| format!("failed to add wrong-scope output: {error}"))?;
+    let other_session_id: Uuid =
+        sqlx::query_scalar("SELECT session_id FROM admission_sessions WHERE job_id = $1")
+            .bind(other.lease.job_id)
+            .fetch_one(pool)
+            .await
+            .map_err(|error| format!("failed to read wrong-scope session: {error}"))?;
+    sqlx::query("DELETE FROM idempotency_requests WHERE job_id = $1")
+        .bind(other.lease.job_id)
+        .execute(pool)
+        .await
+        .map_err(|error| format!("failed to release wrong-scope session key: {error}"))?;
+    // Match both foreign keys so the tenant/project predicate is the only remaining fence.
+    sqlx::query("UPDATE idempotency_requests SET session_id = $2, job_id = $3 WHERE job_id = $1")
+        .bind(owner.lease.job_id)
+        .bind(other_session_id)
+        .bind(other.lease.job_id)
+        .execute(pool)
+        .await
+        .map_err(|error| format!("failed to bind key to wrong-scope job: {error}"))?;
+
+    let status = settlement
+        .image_generation_status_by_key(
+            &owner.reservation.charge.tenant_id,
+            project_id,
+            "openai-images-v1",
+            "generation",
+            &key_digest,
+        )
+        .await
+        .map_err(|error| format!("failed to read status: {error:?}"))?
+        .ok_or_else(|| "fixture key was not found".to_string())?;
+    require(
+        status.outputs.is_empty(),
+        "wrong-scope output metadata leaked",
+    )?;
+    require(!status.terminal, "wrong-scope job was marked terminal")?;
+    require(
+        status.reconciliation_required,
+        "wrong job binding did not require reconciliation",
+    )
+}
+
+#[tokio::test]
 async fn artifact_retention_expires_fences_and_deletes_without_erasing_economic_facts() -> TestResult
 {
     let Some(database) = TestDatabase::new().await? else {
@@ -613,7 +732,15 @@ struct RunningFixture {
 
 impl RunningFixture {
     async fn new(pool: &PgPool) -> TestResult<Self> {
-        let tenant_id = format!("tenant-{}", Uuid::new_v4().simple());
+        Self::new_in_scope(
+            pool,
+            format!("tenant-{}", Uuid::new_v4().simple()),
+            "project-settlement",
+        )
+        .await
+    }
+
+    async fn new_in_scope(pool: &PgPool, tenant_id: String, project_id: &str) -> TestResult<Self> {
         let request_id = format!("req_{}", Uuid::new_v4().simple());
         let key_digest = Uuid::new_v4().simple().to_string().repeat(2);
         let usage = PostgresUsageStore::new(pool.clone());
@@ -642,7 +769,7 @@ impl RunningFixture {
             .claim(ClaimAdmission {
                 owner_token: Uuid::new_v4(),
                 tenant_id,
-                project_id: "project-settlement".to_string(),
+                project_id: project_id.to_string(),
                 api_profile: "openai-images-v1".to_string(),
                 operation: "generation".to_string(),
                 request_id,

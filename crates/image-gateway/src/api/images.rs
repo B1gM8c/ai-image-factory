@@ -701,7 +701,7 @@ fn idempotency_digest(
         .map_err(|_| ImageGatewayError::invalid_idempotency_key())
 }
 
-fn idempotency_scope(auth: &AuthContext) -> String {
+pub(super) fn idempotency_scope(auth: &AuthContext) -> String {
     auth.actor_user_id.map_or_else(
         || auth.project_id.clone(),
         |user_id| format!("{}:user:{user_id}", auth.project_id),

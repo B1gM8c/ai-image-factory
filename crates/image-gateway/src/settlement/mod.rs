@@ -4,6 +4,8 @@ use std::{
 };
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
 use crate::{
     ImageGatewayError,
@@ -46,6 +48,17 @@ pub trait ExecutionSettlementStore: Send + Sync + 'static {
         &self,
         job_id: uuid::Uuid,
     ) -> Result<GenerationResultStatus, ImageGatewayError>;
+
+    async fn image_generation_status_by_key(
+        &self,
+        _tenant_id: &str,
+        _project_id: &str,
+        _api_profile: &str,
+        _operation: &str,
+        _key_digest: &str,
+    ) -> Result<Option<ImageGenerationStatusSnapshot>, ImageGatewayError> {
+        Ok(None)
+    }
 
     async fn video_status(
         &self,
@@ -98,6 +111,21 @@ pub enum GenerationResultLookup {
     Available(StoredGenerationResult),
     Expired,
     Missing,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+pub struct ImageOutputStatus {
+    pub index: u32,
+    pub state: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, ToSchema)]
+pub struct ImageGenerationStatusSnapshot {
+    pub state: String,
+    pub requested_count: u32,
+    pub outputs: Vec<ImageOutputStatus>,
+    pub terminal: bool,
+    pub reconciliation_required: bool,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -235,6 +263,26 @@ impl ExecutionSettlementStore for SequentialExecutionSettlementStore {
             GenerationResultLookup::Expired => Ok(GenerationResultStatus::Expired),
             GenerationResultLookup::Missing => Ok(GenerationResultStatus::Pending),
         }
+    }
+
+    async fn image_generation_status_by_key(
+        &self,
+        tenant_id: &str,
+        project_id: &str,
+        api_profile: &str,
+        operation: &str,
+        key_digest: &str,
+    ) -> Result<Option<ImageGenerationStatusSnapshot>, ImageGatewayError> {
+        self.admission_store
+            .in_memory_image_generation_status(
+                tenant_id,
+                project_id,
+                api_profile,
+                operation,
+                key_digest,
+            )
+            .await
+            .map_err(map_admission_error)
     }
 }
 

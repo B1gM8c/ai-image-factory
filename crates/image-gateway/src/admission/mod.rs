@@ -696,6 +696,17 @@ fn is_sha256(value: &str) -> bool {
 pub trait AdmissionStore: Send + Sync + 'static {
     async fn claim(&self, request: ClaimAdmission) -> Result<AdmissionClaim, AdmissionError>;
 
+    async fn in_memory_image_generation_status(
+        &self,
+        _tenant_id: &str,
+        _project_id: &str,
+        _api_profile: &str,
+        _operation: &str,
+        _key_digest: &str,
+    ) -> Result<Option<crate::settlement::ImageGenerationStatusSnapshot>, AdmissionError> {
+        Ok(None)
+    }
+
     async fn attach(&self, request: AttachJob) -> Result<AttachedWork, AdmissionError>;
 
     async fn attach_and_start(
