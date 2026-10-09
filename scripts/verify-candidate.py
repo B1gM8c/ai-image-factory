@@ -224,7 +224,7 @@ def main():
             'existing absolute executable GitHub CLI required')
     if args.extract_updater:
         require(os.geteuid() == 0, 'bootstrap extraction requires root')
-        root_protected(Path(gh).resolve())
+        root_protected(Path(gh))
         root_protected(args.pin)
         root_protected(args.output.parent)
     require(args.pin.stat().st_size <= 4096, 'candidate pin is too large')
