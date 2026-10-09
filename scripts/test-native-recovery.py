@@ -1123,6 +1123,13 @@ RESET ROLE;
         'codex_startup_dependency': codex_dependency,
         'installed': installed_host_files, 'host_preparation': host_preparation,
         'baseline_updater_before': baseline_updater_before, 'baseline_updater_prepared': baseline_updater_prepared}, indent=2))
+    progress('Testing different-SHA fixed updater rollback after the real helper, before application Apply')
+    candidate_spec = importlib.util.spec_from_file_location('native_candidate_cases', REPO / 'scripts/native-candidate-cases.py')
+    candidate_cases = importlib.util.module_from_spec(candidate_spec)
+    candidate_spec.loader.exec_module(candidate_cases)
+    token, _ = authenticated_acceptance(password, account_id)
+    candidate_cases.exercise(sys.modules[__name__], args, candidate, updater, policy, owner_env, token, output,
+                             different_bytes=True)
     # Enabling Apply is a separate, explicit CI acceptance phase. Restart the
     # old gateway so its startup-read policy matches the daemon, not a stale UI.
     policy['AIF_UPDATE_APPLY_ENABLED'] = 'true'
@@ -1233,9 +1240,6 @@ WHERE n.nspname='public' AND c.relname='ci_recovery_sequence' AND c.relkind='S';
             'fixed updater helper changed admission or artifact content')
     installed_host_files['bin/updated'] = {'destination': str(LIB / 'updated'), 'sha256': candidate_updater_hash}
     progress('Testing isolated candidate handoff, busy refusal, fence loss and helper rollback')
-    candidate_spec = importlib.util.spec_from_file_location('native_candidate_cases', REPO / 'scripts/native-candidate-cases.py')
-    candidate_cases = importlib.util.module_from_spec(candidate_spec)
-    candidate_spec.loader.exec_module(candidate_cases)
     candidate_cases.exercise(sys.modules[__name__], args, candidate, updater, policy, owner_env, token, output)
     journal = (STATE / 'updater/events.jsonl').read_text()
     require(failure_id in journal and success_id in journal, 'missing native updater journal identity')
@@ -1272,6 +1276,7 @@ WHERE n.nspname='public' AND c.relname='ci_recovery_sequence' AND c.relkind='S';
         'protected_descriptor_sha256': descriptor_digest,
         'positive_command': success_id, 'positive_state': successful_state,
         'candidate_handoff': json.loads((output / 'candidate-handoff.json').read_text()),
+        'candidate_different_bytes_rollback': json.loads((output / 'candidate-different-bytes-rollback.json').read_text()),
         'http': {'original_baseline': original_http, 'prepared_baseline': initial_http,
                  'restored': restored_http, 'upgraded': successful_http, 'after_updater_helper': helper_http},
         'boundaries': ['GitHub release transport and signature/attestation responses are explicit fixtures, not cryptographic acceptance',

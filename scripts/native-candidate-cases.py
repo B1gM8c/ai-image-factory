@@ -10,7 +10,7 @@ import time
 import zipfile
 
 
-def exercise(h, args, candidate, updater, policy, owner_env, token, output):
+def exercise(h, args, candidate, updater, policy, owner_env, token, output, *, different_bytes=False):
     h.require(os.environ.get('GITHUB_ACTIONS') == 'true'
               and os.environ.get('RUNNER_ENVIRONMENT') == 'github-hosted'
               and Path('/proc/1/comm').read_text().strip() == 'systemd',
@@ -22,8 +22,8 @@ def exercise(h, args, candidate, updater, policy, owner_env, token, output):
     original_github, original_helper = github.read_bytes(), helper.read_bytes()
     original_updater = dict(updater)
     old_fixed = h.digest(h.LIB / 'updated')
-    # This already verified candidate is the currently running rehearsal version.
-    # Reinstalling its bytes tests handoff/Check, not a second application Apply.
+    # The early case uses the already verified bundle before application Apply.
+    # Later cases reinstall its bytes to exercise handoff and candidate Check.
     archive = fixture / 'candidate-actions.zip'
     with zipfile.ZipFile(archive, 'w', compression=zipfile.ZIP_STORED) as zipped:
         for source in (args.candidate_manifest, args.candidate_bundle):
@@ -62,9 +62,15 @@ else: raise SystemExit('unexpected candidate GitHub fixture call')
 ''', 0o755)
     updater['AIF_UPDATE_CANDIDATE_PIN'] = str(pin_path)
     h.env_file(h.CONFIG / 'updater.env', updater)
-    h.run(['systemctl', 'restart', h.PREFIX + 'updater.service'])
+    if not different_bytes:
+        h.run(['systemctl', 'restart', h.PREFIX + 'updater.service'])
     environment = dict(os.environ) | updater | policy
     binary = h.ROOT / 'current/bin/updated'
+    if different_bytes:
+        staged = h.ROOT / 'releases' / candidate['release_version']
+        h.unpack(args.candidate_bundle, staged)
+        binary = staged / 'bin/updated'
+        h.require(h.digest(binary) != old_fixed, 'rollback case requires genuinely different executables')
     receipts = {}
 
     def bootstrap():
@@ -104,6 +110,47 @@ else: raise SystemExit('unexpected candidate GitHub fixture call')
 
     baseline = snapshot()
     try:
+        if different_bytes:
+            h.write(fixture / 'after-helper-once', 'inject after real replacement')
+            h.write(helper, '''#!/usr/bin/python3
+import hashlib, json, os, pathlib, subprocess, sys
+r=pathlib.Path('/var/lib/ai-image-factory/updater/fixture'); marker=r/'after-helper-once'
+if marker.exists():
+ marker.unlink()
+ subprocess.run([str(r/'native-helper'),*sys.argv[1:]],check=True)
+ pid=subprocess.check_output(['/usr/bin/systemctl','show','ai-image-factory-updater.service','--value','--property=MainPID'],text=True).strip()
+ def digest(path):
+  with open(path,'rb') as f: return hashlib.file_digest(f,'sha256').hexdigest()
+ evidence=dict(pid=int(pid),fixed_sha256=digest('/usr/libexec/ai-image-factory/updated'),process_sha256=digest('/proc/'+pid+'/exe'))
+ (r/'after-helper-observed.json').write_text(json.dumps(evidence))
+ raise SystemExit(42)
+os.execv(str(r/'native-helper'),[str(r/'native-helper'),*sys.argv[1:]])
+''', 0o755)
+            failed = bootstrap()
+            h.require(failed.returncode != 0 and '42' in failed.stderr,
+                      'after-helper injection did not reach the intended failure')
+            observed = json.loads((fixture / 'after-helper-observed.json').read_text())
+            candidate_digest = h.digest(binary)
+            h.require(observed['fixed_sha256'] == candidate_digest
+                      and observed['process_sha256'] == candidate_digest
+                      and candidate_digest != old_fixed,
+                      'after-helper evidence did not prove different candidate bytes running')
+            restored = h.updater_identity(old_fixed, 'false')
+            h.require(snapshot() == baseline, 'different-bytes rollback changed application state')
+            h.write(github, original_github.decode(), 0o755)
+            h.write(helper, original_helper.decode(), 0o755)
+            # The previous daemon intentionally supports ordinary Release Check,
+            # not the candidate-only receipt introduced in this PR.
+            check_id = h.enqueue(token, 'check')
+            h.wait_command(owner_env, check_id, {'succeeded'})
+            checked = json.loads(h.sql(owner_env, "SELECT progress::text FROM platform_update_commands WHERE command_id='" + check_id + "';"))
+            h.require(checked.get('immutable') is True and checked.get('source') != 'actions_candidate',
+                      'old daemon did not recover ordinary Release Check')
+            h.write(output / 'candidate-different-bytes-rollback.json', json.dumps(dict(
+                passed=True, previous_sha256=old_fixed, candidate_sha256=candidate_digest,
+                after_helper=observed, restored=restored, owner_check=check_id,
+                application_unchanged=True, provenance='synthetic GitHub fixture'), indent=2))
+            return
         # Busy refusal is a real queued command while daemon is stopped. Bootstrap
         # must refuse without helper invocation, then the normal daemon claims it.
         h.run(['systemctl', 'stop', h.PREFIX + 'updater.service'])
@@ -165,4 +212,5 @@ os.execv(str(r/'native-helper'),[str(r/'native-helper'),*sys.argv[1:]])
         updater.clear()
         updater.update(original_updater)
         h.env_file(h.CONFIG / 'updater.env', updater)
-        h.run(['systemctl', 'restart', h.PREFIX + 'updater.service'])
+        if not different_bytes:
+            h.run(['systemctl', 'restart', h.PREFIX + 'updater.service'])

@@ -534,6 +534,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RELEASE_VERSION: ${{ github.ref_name }}
           RELEASE_COMMIT: ${{ github.sha }}
+          PUBLICATION_MODE: ${{ inputs.mode }}
         run: |
           set -Eeuo pipefail
           verify_tag_commit() {
@@ -543,6 +544,9 @@ jobs:
                 "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_VERSION}" \
                 --jq '.object.sha'
             )"
+            if test "$PUBLICATION_MODE" = promote; then
+              test "$tag_object_sha" = "$(jq -r '.tag_object_sha' "$RUNNER_TEMP/publication-pin.json")"
+            fi
             test "$(
               gh api \
                 "repos/${GITHUB_REPOSITORY}/git/tags/${tag_object_sha}" \

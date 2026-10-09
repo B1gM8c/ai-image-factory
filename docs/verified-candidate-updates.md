@@ -42,7 +42,10 @@ immutable Release checks, add a public update API, or authorize model requests.
    until acceptance is complete.
 
 The isolated native rehearsal uses synthetic GitHub metadata, real systemd/PG,
-and no inference. Its same-binary bootstrap/owner-Check cases do not establish
-cryptographic acceptance or a second candidate application Apply. Real
+and no inference. Before application Apply it injects a failure after the real
+helper has installed and started the distinct candidate SHA, requiring recovery
+of the original SHA and ordinary owner Check with unchanged application state.
+Later same-binary bootstrap/owner-Check cases do not establish cryptographic
+acceptance or a second candidate application Apply. Real
 candidate provenance, promotion byte equality and production health remain
 separate acceptance evidence.
