@@ -346,7 +346,7 @@ impl RemoteSubmitJournal {
             read_required_json::<DiskLaunch>(&entry.directory, LAUNCH_FILE, MAX_MARKER_BYTES)?;
         validate_launch(&launch, spec)?;
         if launch.launch_nonce != authority.launch_nonce {
-            return Err(RemoteSubmitJournalError::Conflict);
+            return Err(diagnostic_conflict("release_dispatch_nonce"));
         }
         let release = DiskRelease {
             execution_binding_sha256: spec.execution_binding_sha256.clone(),
@@ -536,7 +536,7 @@ impl RemoteSubmitJournal {
         )?;
         actual.validate(RemoteSubmitJournalError::Integrity)?;
         if actual != *expected {
-            return Err(RemoteSubmitJournalError::Conflict);
+            return Err(diagnostic_conflict("open_prepared_spec"));
         }
         let command = read_required_bytes(&entry.directory, COMMAND_FILE, MAX_COMMAND_BYTES)?;
         validate_command(expected, &command, RemoteSubmitJournalError::Integrity)?;
@@ -917,7 +917,12 @@ where
             if existing == *value {
                 Ok(false)
             } else {
-                Err(RemoteSubmitJournalError::Conflict)
+                Err(diagnostic_conflict(match name {
+                    SPEC_FILE => "publish_spec",
+                    RELEASE_FILE => "publish_release",
+                    TERMINAL_FILE => "publish_terminal",
+                    _ => "publish_json_other",
+                }))
             }
         }
     }
@@ -936,10 +941,24 @@ pub(super) fn publish_or_compare(
             if existing == bytes {
                 Ok(())
             } else {
-                Err(RemoteSubmitJournalError::Conflict)
+                Err(diagnostic_conflict(match name {
+                    COMMAND_FILE => "publish_command",
+                    RECEIPT_EVIDENCE_FILE => "publish_receipt_evidence",
+                    _ => "publish_bytes_other",
+                }))
             }
         }
     }
+}
+
+// Temporary CI-only branch markers for diagnosing the intermittent PG16 test failure.
+// The draft diagnostic PR must not be merged with these markers in place.
+fn diagnostic_conflict(stage: &'static str) -> RemoteSubmitJournalError {
+    #[cfg(debug_assertions)]
+    eprintln!("remote_submit_journal_conflict_stage={stage}");
+    #[cfg(not(debug_assertions))]
+    let _ = stage;
+    RemoteSubmitJournalError::Conflict
 }
 
 pub(super) fn publish_bytes(
