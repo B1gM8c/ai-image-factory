@@ -323,6 +323,24 @@ fn requests_reject_prompt_reference_and_staging_boundary_violations() {
 }
 
 #[test]
+fn image_edit_admission_uses_the_discovered_factory_limit() {
+    for count in 0..=MAX_IMAGE_EDIT_REFERENCES + 1 {
+        let images = (0..count)
+            .map(|i| staged(&format!("input-{i}.png")))
+            .collect();
+        assert_eq!(
+            GrokImageEditRequestV1::new("edit", images, ImageAspectRatio::Auto).is_ok(),
+            (1..=MAX_IMAGE_EDIT_REFERENCES).contains(&count)
+        );
+    }
+    assert!(
+        RequestValidationError::InvalidReferenceCount
+            .to_string()
+            .contains("Factory adapter")
+    );
+}
+
+#[test]
 fn media_requests_accept_prompts_beyond_the_rest_model_metadata_limit() {
     let prompt = "x".repeat(1_025);
 

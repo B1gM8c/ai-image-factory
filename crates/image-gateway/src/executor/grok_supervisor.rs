@@ -2,6 +2,7 @@ use std::{
     env, fs,
     io::Read,
     os::unix::fs::{MetadataExt, PermissionsExt},
+    os::unix::process::ExitStatusExt,
     path::{Path, PathBuf},
     process::Stdio,
     sync::Arc,
@@ -111,6 +112,8 @@ struct GrokSpawnObserver {
     spool: Arc<ExecutionSpool>,
     runner_lock: Arc<RunnerLock>,
     helper: crate::runner::process::ProcessIdentity,
+    executor_execution_id: Uuid,
+    history_relative_path: PathBuf,
 }
 
 impl GrokProcessSupervisor {
@@ -873,6 +876,8 @@ async fn run_grok_child(
         spool: Arc::clone(&spool),
         runner_lock: Arc::clone(&runner_lock),
         helper,
+        executor_execution_id,
+        history_relative_path: history_relative_path.clone(),
     };
     let runtime = CliRuntime::new(GrokReceiptPolicy {
         command,
@@ -1033,6 +1038,37 @@ impl SpawnObserver for GrokSpawnObserver {
     }
 
     fn observe_completion(&mut self, completion: &ProcessCompletion) -> Result<(), Self::Error> {
+        if !completion.status.success() {
+            // The history may not exist when startup fails. Absence is unknown, not
+            // evidence of no provider dispatch, and never changes settlement/replay.
+            let history = self
+                .spool
+                .open_provider_file(&self.history_relative_path)
+                .ok()
+                .and_then(|file| read_bounded_regular_file(file, MAX_HISTORY_BYTES as u64).ok());
+            let error_class = if completion.stdout.is_truncated() {
+                image_provider_grok_cli::GrokCliErrorClass::Unknown
+            } else {
+                image_provider_grok_cli::grok_cli_error_class(completion.stdout.bytes())
+            };
+            let media_tool_call_observed =
+                image_provider_grok_cli::grok_media_tool_call_observed(history.as_deref());
+            self.spool.publish_diagnostic(
+                "grok-cli-exit.json",
+                &serde_json::json!({
+                    "schema_version": 1,
+                    "phase": "process_exit",
+                    "executor_execution_id": self.executor_execution_id,
+                    "success": completion.status.success(),
+                    "exit_code": completion.status.code(),
+                    "signal": completion.status.signal(),
+                    "error_class": error_class,
+                    "media_tool_call_observed": media_tool_call_observed,
+                    "stdout_truncated": completion.stdout.is_truncated(),
+                    "stderr_truncated": completion.stderr.is_truncated(),
+                }),
+            )?;
+        }
         self.spool.publish_diagnostic(
             "grok-cli-stdout.json",
             &GrokDiagnosticV1::io(
@@ -1431,6 +1467,52 @@ mod tests {
 
         assert_eq!(first, replay);
         assert_eq!(fs::read_to_string(&fixture.invocations).unwrap(), "1\n");
+    }
+
+    #[tokio::test]
+    async fn helper_records_nonzero_exit_without_replaying_or_leaking_content() {
+        let mut fixture = GrokFixture::new();
+        fs::write(&fixture.executable, format!(
+            "#!/bin/sh\nprintf '1\\n' >> '{}'\nprintf '%s\\n' '{{\"type\":\"error\",\"code\":\"token_expired\",\"message\":\"secret-prompt-and-credential\"}}'\nexit 23\n",
+            fixture.invocations.display()
+        )).unwrap();
+        fixture.supervisor.grok_executable_sha256 = hash_bounded_file(&fixture.executable).unwrap();
+        let lease = fixture.lease();
+        let context = fixture.context(&lease);
+        fixture.journal.start_or_attach(&lease).unwrap();
+        fixture.supervisor.prepare(&lease, &context).await.unwrap();
+        fixture.journal.commit_launch(&lease).unwrap();
+        run_grok_runner_child(fixture.journal.root_path(), lease.executor_execution_id)
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            assert_eq!(
+                fixture
+                    .supervisor
+                    .start_or_attach(&lease, LaunchDecision::Attach)
+                    .await,
+                Err(RunnerError::Unknown {
+                    error_code: "grok_cli_failed".to_owned()
+                })
+            );
+        }
+        assert_eq!(fs::read_to_string(&fixture.invocations).unwrap(), "1\n");
+        let path = fixture
+            .journal
+            .root_path()
+            .join(lease.executor_execution_id.simple().to_string())
+            .join("grok-cli-exit.json");
+        let text = fs::read_to_string(path).unwrap();
+        assert!(!text.contains("secret-prompt-and-credential"));
+        let diagnostic: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(diagnostic["exit_code"], 23);
+        assert_eq!(diagnostic["error_class"], "authentication");
+        assert_eq!(
+            diagnostic["executor_execution_id"],
+            lease.executor_execution_id.to_string()
+        );
+        assert!(diagnostic["media_tool_call_observed"].is_null());
+        assert_eq!(diagnostic["phase"], "process_exit");
     }
 
     #[tokio::test]

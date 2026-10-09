@@ -726,6 +726,11 @@ mod tests {
         let value = serde_json::to_value(model).unwrap();
 
         assert_eq!(value["spatial_edit_mode"], "semantic_mask");
+        assert_eq!(
+            value["max_reference_images"],
+            image_provider_grok_cli::MAX_IMAGE_EDIT_REFERENCES
+        );
+        assert_eq!(value["controls"]["count"]["max"], 1);
         assert!(value["max_prompt_chars"].is_null());
     }
 

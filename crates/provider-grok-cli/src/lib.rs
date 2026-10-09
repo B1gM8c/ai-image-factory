@@ -2,6 +2,7 @@
 
 mod capabilities;
 mod command;
+mod diagnostics;
 mod policy;
 mod receipt;
 mod request;
@@ -21,6 +22,7 @@ pub use command::{
     parse_image_edit_command, parse_image_edit_payload, parse_image_generation_command,
     parse_image_generation_payload, parse_video_generation_command, parse_video_generation_payload,
 };
+pub use diagnostics::{GrokCliErrorClass, grok_cli_error_class, grok_media_tool_call_observed};
 pub use policy::{
     GrokCliPolicyError, GrokCliPolicyV1, GrokCliRequestV1, GrokExpectedToolCallV1,
     GrokInvocationV1, GrokTool, GrokToolArgumentPolicy,
