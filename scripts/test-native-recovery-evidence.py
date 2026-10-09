@@ -20,6 +20,56 @@ SPEC.loader.exec_module(HARNESS_MODULE)
 
 
 class NativeRecoveryEvidenceTests(unittest.TestCase):
+    def test_candidate_checks_authenticate_each_time_without_retry(self):
+        spec = importlib.util.spec_from_file_location(
+            'candidate_cases', ROOT / 'scripts/native-candidate-cases.py')
+        cases = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cases)
+        harness = mock.Mock()
+        harness.owner_login.side_effect = ['fresh-first', 'fresh-after-timeout']
+        cases.owner_check_enqueue(harness, 'synthetic-password')
+        cases.owner_check_enqueue(harness, 'synthetic-password')
+        self.assertEqual(harness.enqueue.call_args_list, [
+            mock.call('fresh-first', 'check'), mock.call('fresh-after-timeout', 'check')])
+        self.assertEqual(harness.owner_login.call_count, 2)
+        harness.reset_mock()
+        harness.owner_login.side_effect = RuntimeError('login denied')
+        with self.assertRaisesRegex(RuntimeError, 'login denied'):
+            cases.owner_check_enqueue(harness, 'synthetic-password')
+        harness.enqueue.assert_not_called()
+        harness.reset_mock()
+        harness.owner_login.side_effect = None
+        harness.owner_login.return_value = 'fresh-but-rejected'
+        harness.enqueue.side_effect = RuntimeError('HTTP 401')
+        with self.assertRaisesRegex(RuntimeError, 'HTTP 401'):
+            cases.owner_check_enqueue(harness, 'synthetic-password')
+        harness.owner_login.assert_called_once()
+        harness.enqueue.assert_called_once()
+
+    def test_owner_login_uses_normal_auth_and_redacts_token(self):
+        with mock.patch.object(HARNESS_MODULE, 'http', return_value=(
+                200, json.dumps({'access_token': 'short-lived-test-token'}), {})) as http, \
+             mock.patch.object(HARNESS_MODULE, 'SECRET_VALUES', []):
+            self.assertEqual(HARNESS_MODULE.owner_login('test-password'), 'short-lived-test-token')
+            self.assertNotIn('short-lived-test-token', HARNESS_MODULE.sanitized('short-lived-test-token'))
+            self.assertEqual(http.call_args.args, (8787, '/admin/v1/auth/login'))
+            self.assertEqual(http.call_args.kwargs['body']['password'], 'test-password')
+
+    def test_failure_preserves_completed_candidate_receipt(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            receipt = {'passed': True, 'previous_sha256': '1' * 64,
+                       'candidate_sha256': '2' * 64, 'application_unchanged': True}
+            HARNESS_MODULE.write(output / 'candidate-different-bytes-rollback.json', json.dumps(receipt))
+            with mock.patch.object(HARNESS_MODULE, 'STATE', output), \
+                 mock.patch.object(HARNESS_MODULE, 'fault_markers', return_value={
+                     'candidate_validation_verify_seen': False}):
+                HARNESS_MODULE.collect_recovery_evidence(output, {}, RuntimeError('later failure'))
+            summary = json.loads((output / 'summary.json').read_text())
+            self.assertFalse(summary['passed'])
+            self.assertEqual(summary['error'], 'later failure')
+            self.assertEqual(summary['candidate_different_bytes_rollback'], receipt)
+
     def test_unpack_protects_release_directories_with_permissive_umask(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

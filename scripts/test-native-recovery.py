@@ -279,6 +279,13 @@ def collect_recovery_evidence(output, diagnostics, original_error):
     if original_error is not None:
         summary.setdefault('error', limited_message(original_error))
     summary['failure_evidence'] = evidence
+    for name in ('candidate-different-bytes-rollback', 'candidate-handoff'):
+        receipt = output / (name + '.json')
+        try:
+            if receipt.is_file() and receipt.stat().st_size <= 65536:
+                summary[name.replace('-', '_')] = json.loads(receipt.read_text())
+        except (OSError, json.JSONDecodeError):
+            pass
     write(summary_path, sanitized(json.dumps(summary, indent=2, ensure_ascii=False)))
 
 
@@ -467,16 +474,21 @@ def wait_http(port, path, timeout=120):
     raise RuntimeError(f'HTTP readiness timeout on loopback port {port}')
 
 
-def authenticated_acceptance(password, account_id):
-    require(http(8787, '/admin/v1/provider-accounts')[0] == 401
-            and http(3010, '/api/gateway/admin/v1/provider-accounts')[0] == 401,
-            'admin data unexpectedly accessible without authentication')
+def owner_login(password):
     status, data, _ = http(8787, '/admin/v1/auth/login', method='POST', body={
         'email': 'owner@native.invalid', 'password': password,
         'client_id': 'ai-image-factory-admin-bff'})
     require(status == 200, 'gateway owner login failed')
     token = json.loads(data)['access_token']
     SECRET_VALUES.append(token)
+    return token
+
+
+def authenticated_acceptance(password, account_id):
+    require(http(8787, '/admin/v1/provider-accounts')[0] == 401
+            and http(3010, '/api/gateway/admin/v1/provider-accounts')[0] == 401,
+            'admin data unexpectedly accessible without authentication')
+    token = owner_login(password)
     evidence = {'api': {}, 'bff': {}, 'authenticated_page_shells': {}}
     for path in ('overview', 'provider-accounts', 'usage', 'system/update'):
         status, data, _ = http(8787, '/admin/v1/' + path,
@@ -1131,8 +1143,8 @@ RESET ROLE;
     candidate_spec = importlib.util.spec_from_file_location('native_candidate_cases', REPO / 'scripts/native-candidate-cases.py')
     candidate_cases = importlib.util.module_from_spec(candidate_spec)
     candidate_spec.loader.exec_module(candidate_cases)
-    token, _ = authenticated_acceptance(password, account_id)
-    candidate_cases.exercise(sys.modules[__name__], args, candidate, updater, policy, owner_env, token, output,
+    authenticated_acceptance(password, account_id)
+    candidate_cases.exercise(sys.modules[__name__], args, candidate, updater, policy, owner_env, password, output,
                              different_bytes=True)
     # Enabling Apply is a separate, explicit CI acceptance phase. Restart the
     # old gateway so its startup-read policy matches the daemon, not a stale UI.
@@ -1244,7 +1256,7 @@ WHERE n.nspname='public' AND c.relname='ci_recovery_sequence' AND c.relkind='S';
             'fixed updater helper changed admission or artifact content')
     installed_host_files['bin/updated'] = {'destination': str(LIB / 'updated'), 'sha256': candidate_updater_hash}
     progress('Testing isolated candidate handoff, busy refusal, fence loss and helper rollback')
-    candidate_cases.exercise(sys.modules[__name__], args, candidate, updater, policy, owner_env, token, output)
+    candidate_cases.exercise(sys.modules[__name__], args, candidate, updater, policy, owner_env, password, output)
     journal = (STATE / 'updater/events.jsonl').read_text()
     require(failure_id in journal and success_id in journal, 'missing native updater journal identity')
     exported_events, _ = bounded_updater_events(STATE / 'updater/events.jsonl')

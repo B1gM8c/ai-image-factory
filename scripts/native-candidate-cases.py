@@ -10,7 +10,13 @@ import time
 import zipfile
 
 
-def exercise(h, args, candidate, updater, policy, owner_env, token, output, *, different_bytes=False):
+def owner_check_enqueue(h, password):
+    # Fault cases outlive the default five-minute access token. Authenticate
+    # normally for each command; never extend TTL or retry an unauthorized write.
+    return h.enqueue(h.owner_login(password), 'check')
+
+
+def exercise(h, args, candidate, updater, policy, owner_env, password, output, *, different_bytes=False):
     h.require(os.environ.get('GITHUB_ACTIONS') == 'true'
               and os.environ.get('RUNNER_ENVIRONMENT') == 'github-hosted'
               and Path('/proc/1/comm').read_text().strip() == 'systemd',
@@ -96,7 +102,7 @@ else: raise SystemExit('unexpected candidate GitHub fixture call')
                     artifacts=h.artifact_snapshot())
 
     def owner_check():
-        command = h.enqueue(token, 'check')
+        command = owner_check_enqueue(h, password)
         h.wait_command(owner_env, command, {'succeeded'})
         progress = json.loads(h.sql(owner_env,
             "SELECT progress::text FROM platform_update_commands WHERE command_id='" + command + "';"))
@@ -142,7 +148,7 @@ os.execv(str(r/'native-helper'),[str(r/'native-helper'),*sys.argv[1:]])
             h.write(helper, original_helper.decode(), 0o755)
             # The previous daemon intentionally supports ordinary Release Check,
             # not the candidate-only receipt introduced in this PR.
-            check_id = h.enqueue(token, 'check')
+            check_id = owner_check_enqueue(h, password)
             h.wait_command(owner_env, check_id, {'succeeded'})
             checked = json.loads(h.sql(owner_env, "SELECT progress::text FROM platform_update_commands WHERE command_id='" + check_id + "';"))
             h.require(checked.get('immutable') is True and checked.get('source') != 'actions_candidate',
@@ -155,7 +161,7 @@ os.execv(str(r/'native-helper'),[str(r/'native-helper'),*sys.argv[1:]])
         # Busy refusal is a real queued command while daemon is stopped. Bootstrap
         # must refuse without helper invocation, then the normal daemon claims it.
         h.run(['systemctl', 'stop', h.PREFIX + 'updater.service'])
-        busy_id = h.enqueue(token, 'check')
+        busy_id = owner_check_enqueue(h, password)
         denied = h.run([binary, 'bootstrap-candidate'], env=environment, check=False)
         h.require(denied.returncode != 0 and 'no pending update' in denied.stderr,
                   'busy bootstrap did not fail closed')
