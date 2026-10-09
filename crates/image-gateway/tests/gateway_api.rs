@@ -18,7 +18,8 @@ use image::{ImageBuffer, ImageFormat, Rgba};
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
-const TINY_PNG: &[u8] = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR\0\0\0\x01\0\0\0\x01\0\0\0\0";
+// Complete 1x1 RGBA PNG, including IDAT and CRCs (not merely a header).
+const TINY_PNG: &[u8] = b"\x89\x50\x4e\x47\x0d\x0a\x1a\x0a\x00\x00\x00\x0d\x49\x48\x44\x52\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\x0b\x49\x44\x41\x54\x78\x9c\x63\xf8\x0f\x04\x00\x09\xfb\x03\xfd\xfb\x5e\x6b\x2b\x00\x00\x00\x00\x49\x45\x4e\x44\xae\x42\x60\x82";
 const RUNTIME_STABLE_FIXTURE: &str =
     include_str!("fixtures/openai_images/2026-07-10/runtime-stable.json");
 const ERRORS_STABLE_FIXTURE: &str =
@@ -70,6 +71,125 @@ fn png_bytes(width: u32, height: u32) -> Vec<u8> {
         .write_to(&mut cursor, ImageFormat::Png)
         .expect("encode test png");
     cursor.into_inner()
+}
+
+fn truncated_idat_png() -> Vec<u8> {
+    let mut bytes = png_bytes(32, 32);
+    let mut offset = 8;
+    loop {
+        let size = u32::from_be_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
+        if &bytes[offset + 4..offset + 8] == b"IDAT" {
+            bytes.truncate(offset + 8 + size / 2);
+            break;
+        }
+        offset += size + 12;
+    }
+    // The configuration is valid; only complete pixel decoding catches this.
+    assert_eq!(
+        image::ImageReader::new(std::io::Cursor::new(&bytes))
+            .with_guessed_format()
+            .unwrap()
+            .into_dimensions()
+            .unwrap(),
+        (32, 32)
+    );
+    assert!(image::load_from_memory(&bytes).is_err());
+    bytes
+}
+
+#[tokio::test]
+async fn edits_full_decode_rejects_truncated_idat_image_and_mask() {
+    for param in ["image", "mask"] {
+        let fake = FakeGenerator::default();
+        let app = build_router(config(), Arc::new(fake.clone()), usage_store());
+        let mut request = json!({"prompt":"edit", "images":[{"image_url":format!(
+            "data:image/png;base64,{}", STANDARD.encode(if param == "image" {
+                truncated_idat_png()
+            } else { png_bytes(32, 32) }))}]});
+        if param == "mask" {
+            request["mask"] = json!({"image_url":format!("data:image/png;base64,{}",
+                STANDARD.encode(truncated_idat_png()))});
+        }
+        let (status, _, body) = send_edit_json(app, Some("test-token"), request).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"]["code"], "invalid_image_format");
+        assert_eq!(body["error"]["param"], param);
+        assert!(fake.calls.lock().unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn edits_full_decode_accepts_png_jpeg_webp() {
+    for (format, mime) in [
+        (ImageFormat::Png, "image/png"),
+        (ImageFormat::Jpeg, "image/jpeg"),
+        (ImageFormat::WebP, "image/webp"),
+    ] {
+        let fake = FakeGenerator::default();
+        let app = build_router(config(), Arc::new(fake.clone()), usage_store());
+        let image = image::RgbImage::from_pixel(32, 32, image::Rgb([100, 120, 140]));
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image.write_to(&mut bytes, format).unwrap();
+        let (status, _, body) = send_edit_json(
+            app,
+            Some("test-token"),
+            json!({
+                "prompt":"edit", "images":[{"image_url":format!("data:{mime};base64,{}",
+                    STANDARD.encode(bytes.into_inner()))}]
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{mime}: {body}");
+        assert_eq!(fake.calls.lock().unwrap().len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn edits_full_decode_rejects_truncated_idat_multipart() {
+    let fake = FakeGenerator::default();
+    let app = build_router(config(), Arc::new(fake.clone()), usage_store());
+    let mut body = b"--decode-test\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\nedit\r\n--decode-test\r\nContent-Disposition: form-data; name=\"image\"; filename=\"input.png\"\r\nContent-Type: image/png\r\n\r\n".to_vec();
+    body.extend_from_slice(&truncated_idat_png());
+    body.extend_from_slice(b"\r\n--decode-test--\r\n");
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/images/edits")
+                .header(header::AUTHORIZATION, "Bearer test-token")
+                .header(
+                    header::CONTENT_TYPE,
+                    "multipart/form-data; boundary=decode-test",
+                )
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(body["error"]["code"], "invalid_image_format");
+    assert_eq!(body["error"]["param"], "image");
+    assert!(fake.calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn edits_full_decode_rejects_declared_mime_mismatch() {
+    let fake = FakeGenerator::default();
+    let app = build_router(config(), Arc::new(fake.clone()), usage_store());
+    let (status, _, body) = send_edit_json(
+        app,
+        Some("test-token"),
+        json!({
+            "prompt":"edit", "images":[{"image_url":format!("data:image/jpeg;base64,{}",
+                STANDARD.encode(png_bytes(32, 32)))}]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["code"], "invalid_image_format");
+    assert!(fake.calls.lock().unwrap().is_empty());
 }
 
 fn png_header(width: u32, height: u32) -> Vec<u8> {
