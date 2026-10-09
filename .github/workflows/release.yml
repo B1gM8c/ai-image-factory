@@ -1,9 +1,22 @@
 name: Immutable Linux release
 
 on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Candidate attestation only, or promote exact previously verified candidate bytes
+        type: choice
+        options: [candidate, promote]
+        default: candidate
+        required: true
+      candidate_pin:
+        description: For promote only, exact publication artifact pin JSON from the approved candidate run
+        type: string
+        default: ""
   push:
     tags:
       - "v*"
+      - "!v*.hotfix.*"
 
 concurrency:
   group: release-${{ github.ref }}
@@ -11,15 +24,18 @@ concurrency:
 
 permissions:
   contents: read
+  actions: read
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   recovery-rehearsal:
+    if: inputs.mode != 'promote'
     uses: ./.github/workflows/recovery-rehearsal.yml
 
   quality:
+    if: inputs.mode != 'promote'
     name: Release gates
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -122,6 +138,7 @@ jobs:
           PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-media-runtime-gate.py
           PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-recovery-systemd-sandbox.py
           PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-storage-retention.py
+          PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-candidate-artifacts.py
 
           scripts/test-gateway-runtime-gate.sh
           scripts/test-release-process-hooks.sh
@@ -325,12 +342,14 @@ jobs:
           retention-days: 7
 
   attest-and-release:
-    name: Attest and publish immutable release
+    name: Verify candidate or publish immutable release
+    if: always() && (needs.build-linux.result == 'success' || (github.event_name == 'workflow_dispatch' && inputs.mode == 'promote'))
     needs: build-linux
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     environment: production-release
     permissions:
+      actions: read
       attestations: write
       contents: write
       id-token: write
@@ -353,19 +372,49 @@ jobs:
           )" = true
 
       - name: Download all architecture assets
+        if: inputs.mode != 'promote'
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: release-*
           path: dist
           merge-multiple: true
 
-      - name: Verify release assets before attestation
+      - name: Verify and reuse exact candidate publication assets
+        if: inputs.mode == 'promote'
         env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE_PIN: ${{ inputs.candidate_pin }}
           RELEASE_VERSION: ${{ github.ref_name }}
           RELEASE_COMMIT: ${{ github.sha }}
         run: |
           set -Eeuo pipefail
-          install -m 0755 deploy/install-release dist/install-release
+          test "${GITHUB_REF_PROTECTED:-false}" = true
+          printf '%s' "$CANDIDATE_PIN" > "$RUNNER_TEMP/publication-pin.json"
+          jq -e --arg version "$RELEASE_VERSION" --arg commit "$RELEASE_COMMIT" \
+            '.version == $version and .commit_sha == $commit' "$RUNNER_TEMP/publication-pin.json" >/dev/null
+          python3 scripts/verify-candidate.py --repo "$GITHUB_REPOSITORY" \
+            --pin "$RUNNER_TEMP/publication-pin.json" --target publication \
+            --output "$RUNNER_TEMP/verified-publication"
+          mkdir dist
+          for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
+            prefix="ai-image-factory-${RELEASE_VERSION}-${target}"
+            cp "$RUNNER_TEMP/verified-publication/${prefix}.manifest.json" dist/
+            cp "$RUNNER_TEMP/verified-publication/${prefix}.tar.gz" dist/
+          done
+          cp "$RUNNER_TEMP/verified-publication/install-release" dist/
+
+      - name: Verify release assets before attestation
+        env:
+          RELEASE_VERSION: ${{ github.ref_name }}
+          RELEASE_COMMIT: ${{ github.sha }}
+          PUBLICATION_MODE: ${{ inputs.mode }}
+        run: |
+          set -Eeuo pipefail
+          if test "$PUBLICATION_MODE" = promote; then
+            chmod 0755 dist/install-release
+          else
+            install -m 0755 deploy/install-release dist/install-release
+          fi
           test "$(find dist -maxdepth 1 -type f | wc -l | tr -d ' ')" = 5
           test -x dist/install-release
           for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
@@ -430,11 +479,25 @@ jobs:
           done
 
       - name: Attest release assets
+        if: inputs.mode != 'promote'
         uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4.1.0
         with:
           subject-path: "${{ github.workspace }}/dist/*"
 
+      - name: Preserve exact attested bytes for later explicit promotion
+        if: inputs.mode == 'candidate'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: candidate-publication
+          path: |
+            dist/*.manifest.json
+            dist/*.tar.gz
+            dist/install-release
+          if-no-files-found: error
+          retention-days: 7
+
       - name: Create draft release and upload every asset
+        if: inputs.mode != 'candidate'
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_VERSION: ${{ github.ref_name }}
@@ -466,10 +529,12 @@ jobs:
             --repo "$GITHUB_REPOSITORY"
 
       - name: Publish release after all uploads succeed
+        if: inputs.mode != 'candidate'
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_VERSION: ${{ github.ref_name }}
           RELEASE_COMMIT: ${{ github.sha }}
+          PUBLICATION_MODE: ${{ inputs.mode }}
         run: |
           set -Eeuo pipefail
           verify_tag_commit() {
@@ -479,6 +544,9 @@ jobs:
                 "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_VERSION}" \
                 --jq '.object.sha'
             )"
+            if test "$PUBLICATION_MODE" = promote; then
+              test "$tag_object_sha" = "$(jq -r '.tag_object_sha' "$RUNNER_TEMP/publication-pin.json")"
+            fi
             test "$(
               gh api \
                 "repos/${GITHUB_REPOSITORY}/git/tags/${tag_object_sha}" \

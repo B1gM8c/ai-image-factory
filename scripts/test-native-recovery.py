@@ -15,6 +15,7 @@ Never run this on a developer machine, persistent runner or production host.
 
 import argparse
 import hashlib
+import importlib.util
 from http.client import HTTPConnection, HTTPException
 from http.cookies import SimpleCookie
 import json
@@ -278,6 +279,13 @@ def collect_recovery_evidence(output, diagnostics, original_error):
     if original_error is not None:
         summary.setdefault('error', limited_message(original_error))
     summary['failure_evidence'] = evidence
+    for name in ('candidate-different-bytes-rollback', 'candidate-handoff'):
+        receipt = output / (name + '.json')
+        try:
+            if receipt.is_file() and receipt.stat().st_size <= 65536:
+                summary[name.replace('-', '_')] = json.loads(receipt.read_text())
+        except (OSError, json.JSONDecodeError):
+            pass
     write(summary_path, sanitized(json.dumps(summary, indent=2, ensure_ascii=False)))
 
 
@@ -391,8 +399,12 @@ def validate_bundle(bundle, manifest_path):
 
 
 def unpack(bundle, destination):
-    destination.mkdir(parents=True)
+    destination.mkdir(parents=True, mode=0o755)
     run(['tar', '-xzf', bundle, '-C', destination, '--no-same-owner'])
+    # Mirror install-release: mkdir/tar inherit the runner umask, but an
+    # immutable executable's ancestors must never be group/world writable.
+    for directory in [destination, *(p for p in destination.rglob('*') if p.is_dir())]:
+        directory.chmod(0o755)
 
 
 def env_file(path, values):
@@ -462,16 +474,21 @@ def wait_http(port, path, timeout=120):
     raise RuntimeError(f'HTTP readiness timeout on loopback port {port}')
 
 
-def authenticated_acceptance(password, account_id):
-    require(http(8787, '/admin/v1/provider-accounts')[0] == 401
-            and http(3010, '/api/gateway/admin/v1/provider-accounts')[0] == 401,
-            'admin data unexpectedly accessible without authentication')
+def owner_login(password):
     status, data, _ = http(8787, '/admin/v1/auth/login', method='POST', body={
         'email': 'owner@native.invalid', 'password': password,
         'client_id': 'ai-image-factory-admin-bff'})
     require(status == 200, 'gateway owner login failed')
     token = json.loads(data)['access_token']
     SECRET_VALUES.append(token)
+    return token
+
+
+def authenticated_acceptance(password, account_id):
+    require(http(8787, '/admin/v1/provider-accounts')[0] == 401
+            and http(3010, '/api/gateway/admin/v1/provider-accounts')[0] == 401,
+            'admin data unexpectedly accessible without authentication')
+    token = owner_login(password)
     evidence = {'api': {}, 'bff': {}, 'authenticated_page_shells': {}}
     for path in ('overview', 'provider-accounts', 'usage', 'system/update'):
         status, data, _ = http(8787, '/admin/v1/' + path,
@@ -1122,6 +1139,13 @@ RESET ROLE;
         'codex_startup_dependency': codex_dependency,
         'installed': installed_host_files, 'host_preparation': host_preparation,
         'baseline_updater_before': baseline_updater_before, 'baseline_updater_prepared': baseline_updater_prepared}, indent=2))
+    progress('Testing different-SHA fixed updater rollback after the real helper, before application Apply')
+    candidate_spec = importlib.util.spec_from_file_location('native_candidate_cases', REPO / 'scripts/native-candidate-cases.py')
+    candidate_cases = importlib.util.module_from_spec(candidate_spec)
+    candidate_spec.loader.exec_module(candidate_cases)
+    authenticated_acceptance(password, account_id)
+    candidate_cases.exercise(sys.modules[__name__], args, candidate, updater, policy, owner_env, password, output,
+                             different_bytes=True)
     # Enabling Apply is a separate, explicit CI acceptance phase. Restart the
     # old gateway so its startup-read policy matches the daemon, not a stale UI.
     policy['AIF_UPDATE_APPLY_ENABLED'] = 'true'
@@ -1231,6 +1255,8 @@ WHERE n.nspname='public' AND c.relname='ci_recovery_sequence' AND c.relkind='S';
     require(http(8788, '/healthz')[0] == 200 and artifact_snapshot() == initial_artifacts,
             'fixed updater helper changed admission or artifact content')
     installed_host_files['bin/updated'] = {'destination': str(LIB / 'updated'), 'sha256': candidate_updater_hash}
+    progress('Testing isolated candidate handoff, busy refusal, fence loss and helper rollback')
+    candidate_cases.exercise(sys.modules[__name__], args, candidate, updater, policy, owner_env, password, output)
     journal = (STATE / 'updater/events.jsonl').read_text()
     require(failure_id in journal and success_id in journal, 'missing native updater journal identity')
     exported_events, _ = bounded_updater_events(STATE / 'updater/events.jsonl')
@@ -1265,6 +1291,8 @@ WHERE n.nspname='public' AND c.relname='ci_recovery_sequence' AND c.relkind='S';
         'failure_command': failure_id, 'failure_state': failed_state, 'restored_state': restored_state,
         'protected_descriptor_sha256': descriptor_digest,
         'positive_command': success_id, 'positive_state': successful_state,
+        'candidate_handoff': json.loads((output / 'candidate-handoff.json').read_text()),
+        'candidate_different_bytes_rollback': json.loads((output / 'candidate-different-bytes-rollback.json').read_text()),
         'http': {'original_baseline': original_http, 'prepared_baseline': initial_http,
                  'restored': restored_http, 'upgraded': successful_http, 'after_updater_helper': helper_http},
         'boundaries': ['GitHub release transport and signature/attestation responses are explicit fixtures, not cryptographic acceptance',

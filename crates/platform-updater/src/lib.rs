@@ -31,6 +31,10 @@ use tokio::{
 };
 use uuid::Uuid;
 
+mod candidate;
+mod candidate_bootstrap;
+use candidate::CandidatePin;
+
 const DEFAULT_RELEASE_ROOT: &str = "/opt/ai-image-factory";
 const DEFAULT_JOURNAL_ROOT: &str = "/var/lib/ai-image-factory/updater";
 const DEFAULT_BACKUP_ROOT: &str = "/var/lib/ai-image-factory/backups";
@@ -72,12 +76,16 @@ struct DatabaseAdvisoryLock {
 
 impl DatabaseAdvisoryLock {
     async fn acquire(pool: &PgPool) -> Result<Self, UpdaterError> {
+        Self::acquire_key(pool, UPDATER_CLUSTER_LOCK_KEY).await
+    }
+
+    async fn acquire_key(pool: &PgPool, key: i64) -> Result<Self, UpdaterError> {
         let mut transaction = pool.begin().await?;
         sqlx::query("SET LOCAL idle_in_transaction_session_timeout = 0")
             .execute(&mut *transaction)
             .await?;
         sqlx::query("SELECT pg_advisory_xact_lock($1)")
-            .bind(UPDATER_CLUSTER_LOCK_KEY)
+            .bind(key)
             .execute(&mut *transaction)
             .await?;
         let (stop_tx, mut stop_rx) = watch::channel(false);
@@ -127,7 +135,9 @@ impl DatabaseAdvisoryLock {
 
     async fn release(mut self) -> Result<(), UpdaterError> {
         let _ = self.stop_tx.send(true);
-        let task = self.task.take().ok_or_else(|| {
+        // Keep ownership until the join completes so cancellation still runs Drop
+        // and aborts the guard task instead of detaching its transaction.
+        let task = self.task.as_mut().ok_or_else(|| {
             UpdaterError::Config("database advisory lock task is missing".to_string())
         })?;
         task.await.map_err(|error| {
@@ -161,6 +171,7 @@ pub struct UpdaterConfig {
     backup_root: PathBuf,
     apply_enabled: bool,
     attestation_workflow: String,
+    candidate: Option<CandidatePin>,
     admission_close_hook: Option<PathBuf>,
     admission_open_hook: Option<PathBuf>,
     quiesce_hook: Option<PathBuf>,
@@ -215,6 +226,16 @@ impl UpdaterConfig {
         } else {
             normalize_workflow_identity(&repository, &attestation_workflow)?
         };
+        let candidate = optional_absolute_env_path("AIF_UPDATE_CANDIDATE_PIN")?
+            .map(|path| CandidatePin::from_file(&path))
+            .transpose()?;
+        if candidate.is_some()
+            && attestation_workflow != format!("{repository}/.github/workflows/release.yml")
+        {
+            return Err(UpdaterError::Config(
+                "candidate requires the repository release.yml attestation identity".into(),
+            ));
+        }
         let admission_close_hook = optional_absolute_env_path("AIF_UPDATE_ADMISSION_CLOSE_HOOK")?;
         let admission_open_hook = optional_absolute_env_path("AIF_UPDATE_ADMISSION_OPEN_HOOK")?;
         let quiesce_hook = optional_absolute_env_path("AIF_UPDATE_QUIESCE_HOOK")?;
@@ -255,6 +276,7 @@ impl UpdaterConfig {
             backup_root,
             apply_enabled,
             attestation_workflow,
+            candidate,
             admission_close_hook,
             admission_open_hook,
             quiesce_hook,
@@ -619,9 +641,18 @@ impl Updater {
     async fn execute_check(&self, claim: &ClaimedCommand) -> Result<(), UpdaterError> {
         self.record_phase(claim, "preflight", "started", json!({}))
             .await?;
-        let release = self.latest_release().await?;
-        self.verify_release(&release.tag_name).await?;
-        let staged = self.stage_release(claim, &release.tag_name).await?;
+        let version = match &self.config.candidate {
+            Some(pin) => {
+                self.verify_candidate(pin).await?;
+                pin.version.clone()
+            }
+            None => {
+                let release = self.latest_release().await?;
+                self.verify_release(&release.tag_name).await?;
+                release.tag_name
+            }
+        };
+        let staged = self.stage_release(Some(claim), &version).await?;
         self.verify_schema_contract(&staged.manifest).await?;
         self.record_phase(
             claim,
@@ -630,12 +661,8 @@ impl Updater {
             json!({"manifest_sha256": staged.manifest_sha256}),
         )
         .await?;
-        self.finish_check(claim, &release, &staged.manifest).await?;
-        self.append_journal_best_effort(
-            claim,
-            "verified",
-            json!({"release": release.tag_name, "immutable": true}),
-        );
+        self.finish_check(claim, &staged.manifest).await?;
+        self.append_journal_best_effort(claim, "verified", self.source_receipt(&version));
         Ok(())
     }
 
@@ -662,8 +689,27 @@ impl Updater {
             json!({"target_version": version}),
         )
         .await?;
-        self.verify_release(version).await?;
-        let staged = self.stage_release(claim, version).await?;
+        if let Some(pin) = &self.config.candidate {
+            if version != pin.version {
+                return Err(UpdaterError::InvalidRelease(
+                    "target does not match operator candidate pin".into(),
+                ));
+            }
+            let receipt: Option<Value> = sqlx::query_scalar(
+                "SELECT progress FROM platform_update_commands WHERE action = 'check' AND status = 'succeeded' ORDER BY completed_at_ms DESC, command_id DESC LIMIT 1",
+            ).fetch_optional(&self.pool).await?;
+            let expected = self.source_receipt(version);
+            if !receipt
+                .as_ref()
+                .is_some_and(|receipt| candidate::receipt_matches(receipt, &expected))
+            {
+                return Err(UpdaterError::InvalidRelease("candidate pin differs from the latest successful Check; Check again before Apply".into()));
+            }
+            self.verify_candidate(pin).await?;
+        } else {
+            self.verify_release(version).await?;
+        }
+        let staged = self.stage_release(Some(claim), version).await?;
         self.verify_schema_contract(&staged.manifest).await?;
         self.record_phase(
             claim,
@@ -1326,7 +1372,7 @@ impl Updater {
 
     async fn stage_release(
         &self,
-        claim: &ClaimedCommand,
+        claim: Option<&ClaimedCommand>,
         version: &str,
     ) -> Result<StagedRelease, UpdaterError> {
         tokio::fs::create_dir_all(self.config.release_root.join("staging")).await?;
@@ -1342,24 +1388,33 @@ impl Updater {
             "ai-image-factory-{version}-{}.tar.gz",
             self.config.target_triple
         );
-        run_trusted(
-            &self.config.gh_executable,
-            [
-                OsStr::new("release"),
-                OsStr::new("download"),
-                OsStr::new(version),
-                OsStr::new("--repo"),
-                OsStr::new(&self.config.repository),
-                OsStr::new("--pattern"),
-                OsStr::new(&manifest_name),
-                OsStr::new("--pattern"),
-                OsStr::new(&bundle_name),
-                OsStr::new("--dir"),
-                temp.path().as_os_str(),
-            ],
-            &github_environment(),
-        )
-        .await?;
+        if let Some(pin) = &self.config.candidate {
+            if version != pin.version {
+                return Err(UpdaterError::InvalidRelease(
+                    "candidate version mismatch".into(),
+                ));
+            }
+            self.download_candidate(pin, temp.path()).await?;
+        } else {
+            run_trusted(
+                &self.config.gh_executable,
+                [
+                    OsStr::new("release"),
+                    OsStr::new("download"),
+                    OsStr::new(version),
+                    OsStr::new("--repo"),
+                    OsStr::new(&self.config.repository),
+                    OsStr::new("--pattern"),
+                    OsStr::new(&manifest_name),
+                    OsStr::new("--pattern"),
+                    OsStr::new(&bundle_name),
+                    OsStr::new("--dir"),
+                    temp.path().as_os_str(),
+                ],
+                &github_environment(),
+            )
+            .await?;
+        }
         let manifest_path = temp.path().join(&manifest_name);
         let bundle_path = temp.path().join(&bundle_name);
         let manifest_metadata = tokio::fs::metadata(&manifest_path).await?;
@@ -1368,27 +1423,44 @@ impl Updater {
                 "release manifest size is outside the supported range".to_string(),
             ));
         }
-        run_trusted(
-            &self.config.gh_executable,
-            [
-                OsStr::new("release"),
-                OsStr::new("verify-asset"),
-                OsStr::new(version),
-                manifest_path.as_os_str(),
-                OsStr::new("--repo"),
-                OsStr::new(&self.config.repository),
-            ],
-            &github_environment(),
-        )
-        .await?;
+        if let Some(pin) = &self.config.candidate {
+            verify_file_digest(
+                &manifest_path,
+                &pin.manifest_sha256,
+                manifest_metadata.len(),
+            )
+            .await?;
+        } else {
+            run_trusted(
+                &self.config.gh_executable,
+                [
+                    OsStr::new("release"),
+                    OsStr::new("verify-asset"),
+                    OsStr::new(version),
+                    manifest_path.as_os_str(),
+                    OsStr::new("--repo"),
+                    OsStr::new(&self.config.repository),
+                ],
+                &github_environment(),
+            )
+            .await?;
+        }
         let manifest_bytes = tokio::fs::read(&manifest_path).await?;
         let manifest: ReleaseManifest = serde_json::from_slice(&manifest_bytes)
             .map_err(|error| UpdaterError::InvalidRelease(error.to_string()))?;
         manifest.validate(version, &self.config.target_triple)?;
+        if let Some(pin) = &self.config.candidate
+            && (manifest.commit_sha != pin.commit_sha
+                || manifest.bundle_sha256 != pin.bundle_sha256)
+        {
+            return Err(UpdaterError::InvalidRelease(
+                "candidate manifest does not match operator pin".into(),
+            ));
+        }
 
         let source_ref = format!("refs/tags/{version}");
         for asset in [&manifest_path, &bundle_path] {
-            if asset != &manifest_path {
+            if asset != &manifest_path && self.config.candidate.is_none() {
                 run_trusted(
                     &self.config.gh_executable,
                     [
@@ -1403,7 +1475,7 @@ impl Updater {
                 )
                 .await?;
             }
-            run_trusted(
+            let attestation = run_trusted(
                 &self.config.gh_executable,
                 [
                     OsStr::new("attestation"),
@@ -1418,10 +1490,21 @@ impl Updater {
                     OsStr::new("--source-digest"),
                     OsStr::new(&manifest.commit_sha),
                     OsStr::new("--deny-self-hosted-runners"),
+                    OsStr::new("--format"),
+                    OsStr::new("json"),
                 ],
                 &github_environment(),
             )
             .await?;
+            if let Some(pin) = &self.config.candidate {
+                let verified: Value =
+                    serde_json::from_slice(&attestation.stdout).map_err(|_| {
+                        UpdaterError::InvalidRelease(
+                            "invalid attestation verification output".into(),
+                        )
+                    })?;
+                pin.check_attestation(&verified, &self.config.repository)?;
+            }
         }
         verify_file_digest(&bundle_path, &manifest.bundle_sha256, manifest.bundle_bytes).await?;
         validate_archive(&self.config.tar_executable, &bundle_path).await?;
@@ -1468,14 +1551,16 @@ impl Updater {
             sync_directory(&releases_dir)?;
         }
         let manifest_sha256 = sha256_hex(&manifest_bytes);
-        self.append_journal(
-            claim,
-            "staged",
-            json!({
-                "release_dir": release_dir,
-                "manifest_sha256": manifest_sha256
-            }),
-        )?;
+        if let Some(claim) = claim {
+            self.append_journal(
+                claim,
+                "staged",
+                json!({
+                    "release_dir": release_dir,
+                    "manifest_sha256": manifest_sha256
+                }),
+            )?;
+        }
         Ok(StagedRelease {
             _temp: temp,
             release_dir,
@@ -2269,7 +2354,6 @@ impl Updater {
     async fn finish_check(
         &self,
         claim: &ClaimedCommand,
-        release: &GitHubRelease,
         manifest: &ReleaseManifest,
     ) -> Result<(), UpdaterError> {
         let now = database_now_ms(&self.pool).await?;
@@ -2287,7 +2371,7 @@ impl Updater {
             WHERE singleton = TRUE
             "#,
         )
-        .bind(&release.tag_name)
+        .bind(&manifest.release_version)
         .bind(&manifest.commit_sha)
         .bind(now)
         .execute(&mut *tx)
@@ -2307,7 +2391,7 @@ impl Updater {
             "#,
         )
         .bind(now)
-        .bind(json!({"latest_version": release.tag_name, "immutable": true}))
+        .bind(self.source_receipt(&manifest.release_version))
         .bind(claim.command_id)
         .bind(&self.owner_id)
         .bind(claim.lease_epoch)
@@ -2907,6 +2991,19 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
+    run_trusted_output(executable, args, context, None).await
+}
+
+async fn run_trusted_output<I, S>(
+    executable: &Path,
+    args: I,
+    context: &BTreeMap<String, String>,
+    output_file: Option<(&Path, u64)>,
+) -> Result<Output, UpdaterError>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
     validate_trusted_executable(executable)?;
     let mut command = Command::new(executable);
     command
@@ -2934,7 +3031,14 @@ where
     let output = match timeout(DEFAULT_COMMAND_TIMEOUT, async {
         tokio::try_join!(
             child.wait(),
-            read_bounded_output(stdout),
+            async {
+                if let Some((path, limit)) = output_file {
+                    candidate::copy_bounded_output(stdout, path, limit).await?;
+                    Ok(Vec::new())
+                } else {
+                    read_bounded_output(stdout).await
+                }
+            },
             read_bounded_output(stderr)
         )
     })
@@ -4401,6 +4505,43 @@ mod tests {
             .is_err()
         );
         assert!(normalize_workflow_identity("owner/repository", "release.yml").is_err());
+    }
+
+    #[tokio::test]
+    async fn cancelled_guard_release_does_not_detach_lock_task() {
+        struct Dropped(tokio::sync::oneshot::Sender<()>);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                // Closing the channel proves the task future was dropped.
+                let _ = &self.0;
+            }
+        }
+        let (closed_tx, closed_rx) = tokio::sync::oneshot::channel();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (stop_tx, _stop_rx) = watch::channel(false);
+        let (_lost_tx, lost_rx) = watch::channel(false);
+        let task = tokio::spawn(async move {
+            let _dropped = Dropped(closed_tx);
+            let _ = started_tx.send(());
+            std::future::pending::<Result<(), UpdaterError>>().await
+        });
+        started_rx.await.unwrap();
+        let guard = DatabaseAdvisoryLock {
+            stop_tx,
+            lost_rx,
+            task: Some(task),
+        };
+        assert!(
+            timeout(Duration::from_millis(10), guard.release())
+                .await
+                .is_err()
+        );
+        assert!(
+            timeout(Duration::from_secs(1), closed_rx)
+                .await
+                .unwrap()
+                .is_err()
+        );
     }
 
     #[test]
