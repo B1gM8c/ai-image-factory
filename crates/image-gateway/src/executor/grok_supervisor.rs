@@ -1473,7 +1473,7 @@ mod tests {
     async fn helper_records_nonzero_exit_without_replaying_or_leaking_content() {
         let mut fixture = GrokFixture::new();
         fs::write(&fixture.executable, format!(
-            "#!/bin/sh\nprintf '1\\n' >> '{}'\nprintf '%s\\n' '{{\"type\":\"error\",\"code\":\"token_expired\",\"message\":\"secret-prompt-and-credential\"}}'\nexit 23\n",
+            "#!/bin/sh\ncat >/dev/null\nprintf '1\\n' >> '{}'\nprintf '%s\\n' '{{\"type\":\"error\",\"code\":\"token_expired\",\"message\":\"secret-prompt-and-credential\"}}'\nexit 23\n",
             fixture.invocations.display()
         )).unwrap();
         fixture.supervisor.grok_executable_sha256 = hash_bounded_file(&fixture.executable).unwrap();
