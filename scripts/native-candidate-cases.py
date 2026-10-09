@@ -67,6 +67,17 @@ else: raise SystemExit('unexpected candidate GitHub fixture call')
     binary = h.ROOT / 'current/bin/updated'
     receipts = {}
 
+    def bootstrap():
+        # The daemon legitimately takes the nonblocking host mutex each poll.
+        # Only retry this pre-mutation refusal, never a helper/verification error.
+        deadline = time.monotonic() + 30
+        while True:
+            result = h.run([binary, 'bootstrap-candidate'], env=environment, timeout=270, check=False)
+            if result.returncode == 0 or 'another updater owns the host lock' not in result.stderr:
+                return result
+            h.require(time.monotonic() < deadline, 'bootstrap never acquired idle host mutex')
+            time.sleep(0.15)
+
     def snapshot():
         units = h.run(['systemctl', 'list-units', '--all', '--plain', '--full',
                        '--no-legend', '--no-pager', '--type=service', 'ai-image-factory*']).stdout
@@ -85,8 +96,9 @@ else: raise SystemExit('unexpected candidate GitHub fixture call')
             "SELECT progress::text FROM platform_update_commands WHERE command_id='" + command + "';"))
         h.require(progress.get('source') == 'actions_candidate' and progress.get('immutable') is False,
                   'owner Check did not return the candidate source receipt')
-        for field in ('run_id', 'run_attempt', 'artifact_id', 'artifact_sha256',
-                      'tag_object_sha', 'manifest_sha256', 'bundle_sha256'):
+        h.require(progress.get('latest_version') == pin['version'], 'owner Check version mismatch')
+        for field in ('run_id', 'run_attempt', 'artifact_id', 'artifact_sha256', 'artifact_bytes',
+                      'commit_sha', 'tag_object_sha', 'manifest_sha256', 'bundle_sha256'):
             h.require(progress.get(field) == pin[field], 'owner Check candidate receipt mismatch: ' + field)
         return command
 
@@ -105,7 +117,8 @@ else: raise SystemExit('unexpected candidate GitHub fixture call')
         h.wait_command(owner_env, busy_id, {'succeeded'})
         receipts['busy'] = dict(refused=True, recovered_check=busy_id)
 
-        success = h.run([binary, 'bootstrap-candidate'], env=environment, timeout=240)
+        success = bootstrap()
+        h.require(success.returncode == 0, 'candidate handoff failed: ' + h.sanitized(success.stderr))
         result = json.loads(success.stdout.strip().splitlines()[-1])
         h.require(result.get('pending_owner_check') is True and snapshot() == baseline,
                   'successful handoff changed application or skipped owner Check')
@@ -129,8 +142,12 @@ if marker.exists():
 os.execv(str(r/'native-helper'),[str(r/'native-helper'),*sys.argv[1:]])
 ''', 0o755)
             started = time.monotonic()
-            failed = h.run([binary, 'bootstrap-candidate'], env=environment, timeout=270, check=False)
+            failed = bootstrap()
             h.require(failed.returncode != 0, fault + ' incorrectly reported success')
+            h.require(not (fixture / 'fault').exists(), fault + ' was never injected')
+            expected_error = {'helper_failure': '42', 'enqueue_loss': 'LeaseLost',
+                              'handoff_timeout': 'candidate handoff timed out'}[fault]
+            h.require(expected_error in failed.stderr, fault + ' failed for an unrelated reason')
             h.require(h.digest(h.LIB / 'updated') == old_fixed and snapshot() == baseline,
                       fault + ' did not preserve old fixed/business/current/schema')
             h.updater_identity(old_fixed, 'false')
