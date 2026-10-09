@@ -211,7 +211,10 @@ impl Updater {
             pin.version, self.config.target_triple
         );
         // Extract only the two exact regular members; no paths, links, overwrite or wildcard extraction.
-        run_trusted(Path::new("/usr/bin/python3"), [OsStr::new("-c"), OsStr::new(r#"
+        // Debian/Ubuntu python3 is an alias. Validate and execute the same
+        // canonical binary; do not weaken the shared no-symlink trust policy.
+        let python = std::fs::canonicalize("/usr/bin/python3")?;
+        run_trusted(&python, [OsStr::new("-c"), OsStr::new(r#"
 import pathlib, shutil, stat, sys, zipfile
 archive, directory, prefix = sys.argv[1:]
 with zipfile.ZipFile(archive) as zipped:

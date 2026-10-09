@@ -128,7 +128,8 @@ os.execv(str(r/'native-helper'),[str(r/'native-helper'),*sys.argv[1:]])
 ''', 0o755)
             failed = bootstrap()
             h.require(failed.returncode != 0 and '42' in failed.stderr,
-                      'after-helper injection did not reach the intended failure')
+                      'after-helper injection did not reach the intended failure; exit='
+                      + str(failed.returncode) + '; stderr=' + h.sanitized(failed.stderr)[-4096:])
             observed = json.loads((fixture / 'after-helper-observed.json').read_text())
             candidate_digest = h.digest(binary)
             h.require(observed['fixed_sha256'] == candidate_digest
@@ -191,10 +192,12 @@ os.execv(str(r/'native-helper'),[str(r/'native-helper'),*sys.argv[1:]])
             started = time.monotonic()
             failed = bootstrap()
             h.require(failed.returncode != 0, fault + ' incorrectly reported success')
-            h.require(not (fixture / 'fault').exists(), fault + ' was never injected')
+            h.require(not (fixture / 'fault').exists(), fault + ' was never injected: '
+                      + h.sanitized(failed.stderr)[-4096:])
             expected_error = {'helper_failure': '42', 'enqueue_loss': 'LeaseLost',
                               'handoff_timeout': 'candidate handoff timed out'}[fault]
-            h.require(expected_error in failed.stderr, fault + ' failed for an unrelated reason')
+            h.require(expected_error in failed.stderr, fault + ' failed for an unrelated reason: '
+                      + h.sanitized(failed.stderr)[-4096:])
             h.require(h.digest(h.LIB / 'updated') == old_fixed and snapshot() == baseline,
                       fault + ' did not preserve old fixed/business/current/schema')
             h.updater_identity(old_fixed, 'false')
