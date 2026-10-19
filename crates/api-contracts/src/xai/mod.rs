@@ -8,10 +8,11 @@ pub use images::{
     XaiImageUsage, XaiImagesResponse, XaiPublicUrlConfig, XaiPublicUrlOptions, XaiRequestError,
 };
 pub use videos::{
-    XAI_VIDEO_GENERATION_COMMAND_SCHEMA, XAI_VIDEO_GENERATION_COMMAND_SCHEMA_V2,
-    XAI_VIDEOS_API_PROFILE, XaiGeneratedVideo, XaiStartDeferredResponse, XaiVideoAspectRatio,
-    XaiVideoAudioReference, XaiVideoError, XaiVideoFileOutput, XaiVideoGenerationCommandV1,
-    XaiVideoGenerationCommandV2, XaiVideoGenerationRequest, XaiVideoImageUrl, XaiVideoKeyframe,
-    XaiVideoOutput, XaiVideoRequestError, XaiVideoResolution, XaiVideoResponse,
-    XaiVideoStorageOptions, XaiVideoUsage, XaiVideoWorkflow,
+    FactoryVideoDiagnostics, XAI_VIDEO_GENERATION_COMMAND_SCHEMA,
+    XAI_VIDEO_GENERATION_COMMAND_SCHEMA_V2, XAI_VIDEOS_API_PROFILE, XaiGeneratedVideo,
+    XaiStartDeferredResponse, XaiVideoAspectRatio, XaiVideoAudioReference, XaiVideoError,
+    XaiVideoFileOutput, XaiVideoGenerationCommandV1, XaiVideoGenerationCommandV2,
+    XaiVideoGenerationRequest, XaiVideoImageUrl, XaiVideoKeyframe, XaiVideoOutput,
+    XaiVideoRequestError, XaiVideoResolution, XaiVideoResponse, XaiVideoStorageOptions,
+    XaiVideoUsage, XaiVideoWorkflow,
 };

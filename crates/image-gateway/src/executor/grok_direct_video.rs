@@ -49,6 +49,8 @@ pub(super) struct GrokDiagnosticV1 {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     mismatch_field: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    mismatch_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     expected_type: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     expected_sha256: Option<String>,
@@ -72,6 +74,7 @@ impl GrokDiagnosticV1 {
             message_class: None,
             remote_task_id: None,
             mismatch_field: None,
+            mismatch_kind: None,
             expected_type: None,
             expected_sha256: None,
             actual_type: None,
@@ -97,6 +100,7 @@ impl GrokDiagnosticV1 {
             message_class: None,
             remote_task_id: None,
             mismatch_field: safe_token(field),
+            mismatch_kind: None,
             expected_type: expected.map(json_type).map(str::to_owned),
             expected_sha256: expected.and_then(json_sha256),
             actual_type: actual.map(json_type).map(str::to_owned),
@@ -123,6 +127,18 @@ impl GrokDiagnosticV1 {
             message_class: None,
             remote_task_id: None,
             mismatch_field: safe_token(field),
+            mismatch_kind: Some(
+                if expected_type == "missing" {
+                    "extra"
+                } else if actual_type == "missing" {
+                    "missing"
+                } else if expected_type != actual_type {
+                    "type"
+                } else {
+                    "value"
+                }
+                .to_owned(),
+            ),
             expected_type: safe_token(expected_type),
             expected_sha256: expected_sha256.and_then(safe_sha256),
             actual_type: safe_token(actual_type),
@@ -148,6 +164,7 @@ impl GrokDiagnosticV1 {
             message_class: None,
             remote_task_id: None,
             mismatch_field: None,
+            mismatch_kind: None,
             expected_type: None,
             expected_sha256: None,
             actual_type: None,
@@ -168,6 +185,7 @@ impl GrokDiagnosticV1 {
             message_class: None,
             remote_task_id: safe_remote_id(remote_task_id),
             mismatch_field: None,
+            mismatch_kind: None,
             expected_type: None,
             expected_sha256: None,
             actual_type: None,
@@ -189,6 +207,7 @@ impl GrokDiagnosticV1 {
             message_class: None,
             remote_task_id: None,
             mismatch_field: None,
+            mismatch_kind: None,
             expected_type: None,
             expected_sha256: None,
             actual_type: None,
@@ -497,6 +516,7 @@ fn http_error(
             message_class,
             remote_task_id: remote_task_id.and_then(safe_remote_id),
             mismatch_field: None,
+            mismatch_kind: None,
             expected_type: None,
             expected_sha256: None,
             actual_type: None,
@@ -589,6 +609,7 @@ fn diagnostic_error(
             message_class: None,
             remote_task_id: remote_task_id.and_then(safe_remote_id),
             mismatch_field: None,
+            mismatch_kind: None,
             expected_type: None,
             expected_sha256: None,
             actual_type: None,
@@ -730,6 +751,28 @@ struct PollResponse {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn mismatch_summary_classifies_without_values() {
+        for (expected, actual, kind) in [
+            ("null", "missing", "missing"),
+            ("missing", "null", "extra"),
+            ("number", "string", "type"),
+            ("array", "array", "value"),
+        ] {
+            let diagnostic = super::GrokDiagnosticV1::receipt_mismatch_summary(
+                "keyframes",
+                expected,
+                None,
+                actual,
+                None,
+            );
+            let json = serde_json::to_value(diagnostic).unwrap();
+            assert_eq!(json["mismatch_kind"], kind);
+            assert!(json.get("expected_sha256").is_none());
+            assert!(json.get("actual_sha256").is_none());
+        }
+    }
+
     use image_provider_grok_cli::{
         ImageToVideoRequestV1, StagedImageV1, VideoDuration, VideoResolution,
     };

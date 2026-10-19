@@ -1,5 +1,26 @@
 # Grok CLI to xAI media API binding
 
+## Factory reconciliation signal
+
+`GET /v1/videos/{request_id}` retains `status: "pending"` and omits
+`error` for an internal uncertain outcome. Only that outcome includes
+`factory_diagnostics: {"reconciliation_required": true, "retryable": false}`.
+This optional object is a Factory extension, not an official xAI field.
+Ordinary pending, succeeded and failed responses omit it.
+
+The signal does not prove provider failure or non-billing and must not trigger
+automatic resubmission. The coordinated Blog integration must consume both flags
+together, retain its existing refund policy, and display “结果待核实，请勿重复提交”.
+Factory does not change
+settlement, historical accounting, retry rules, or introduce a hold state.
+Clients ignoring the extension retain their previous polling behavior.
+
+Exact CLI receipt validation is unchanged. Mismatch diagnostics describe only
+the first differing allowlisted top-level field (unknown fields become `other`)
+and `missing`, `extra`, `type`, or `value`. Nested paths and raw values are
+never recorded; existing type/hash summaries remain. These diagnostics cannot
+recover already-cleaned historical CLI output or establish its root cause.
+
 > Status: xAI-shaped image and video contracts, Grok CLI projection,
 > schema-scoped handoff, digest-bound input staging, separate V1/V2 runtime
 > profiles, fenced execution, bounded image/MP4 artifact publication, Media

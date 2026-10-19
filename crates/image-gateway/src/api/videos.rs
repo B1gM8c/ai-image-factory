@@ -502,9 +502,16 @@ async fn stage_and_bind(
 }
 
 pub(super) fn video_response(status: VideoResultStatus) -> XaiVideoResponse {
+    let factory_diagnostics = matches!(&status, VideoResultStatus::Uncertain { .. }).then_some(
+        image_api_contracts::xai::FactoryVideoDiagnostics {
+            reconciliation_required: true,
+            retryable: false,
+        },
+    );
     match status {
         VideoResultStatus::Pending { model, .. } | VideoResultStatus::Uncertain { model, .. } => {
             XaiVideoResponse {
+                factory_diagnostics,
                 status: "pending".to_owned(),
                 error: None,
                 model: Some(model),
@@ -518,6 +525,7 @@ pub(super) fn video_response(status: VideoResultStatus) -> XaiVideoResponse {
             duration,
             artifact_id,
         } => XaiVideoResponse {
+            factory_diagnostics: None,
             status: "done".to_owned(),
             error: None,
             model: Some(model),
@@ -532,6 +540,7 @@ pub(super) fn video_response(status: VideoResultStatus) -> XaiVideoResponse {
             }),
         },
         VideoResultStatus::Failed { error_code, .. } => XaiVideoResponse {
+            factory_diagnostics: None,
             status: "failed".to_owned(),
             error: Some(map_terminal_error(error_code.as_deref())),
             model: None,
@@ -824,6 +833,12 @@ mod tests {
             artifact_id,
         });
         assert_eq!(response.status, "done");
+        assert!(
+            serde_json::to_value(&response)
+                .unwrap()
+                .get("factory_diagnostics")
+                .is_none()
+        );
         assert_eq!(response.progress, Some(100));
         assert_eq!(
             response.video.unwrap().url,
@@ -839,6 +854,27 @@ mod tests {
         });
         assert_eq!(response.status, "pending");
         assert!(response.error.is_none());
+        let value = serde_json::to_value(&response).unwrap();
+        assert!(value.get("error").is_none());
+        assert_eq!(
+            value["factory_diagnostics"],
+            serde_json::json!({
+                "reconciliation_required": true, "retryable": false
+            })
+        );
+    }
+
+    #[test]
+    fn ordinary_pending_has_no_factory_diagnostics() {
+        let response = video_response(VideoResultStatus::Pending {
+            model: "grok-imagine-video-1.5-preview".to_owned(),
+            duration: 6,
+            stage: crate::settlement::VideoPendingStage::Processing,
+        });
+        let value = serde_json::to_value(response).unwrap();
+        assert_eq!(value["status"], "pending");
+        assert!(value.get("factory_diagnostics").is_none());
+        assert!(value.get("error").is_none());
     }
 
     #[test]
@@ -849,6 +885,12 @@ mod tests {
             error_code: Some("grok_cli_failed".to_owned()),
         });
         assert_eq!(response.status, "failed");
+        assert!(
+            serde_json::to_value(&response)
+                .unwrap()
+                .get("factory_diagnostics")
+                .is_none()
+        );
         assert!(response.model.is_none());
         assert!(response.video.is_none());
         assert_eq!(response.error.unwrap().code, "service_unavailable");
