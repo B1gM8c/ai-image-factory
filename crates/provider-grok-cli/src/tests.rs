@@ -1688,6 +1688,35 @@ fn v2_receipt_accepts_only_prompt_crlf_equivalence() {
 }
 
 #[test]
+fn v2_text_video_receipt_accepts_line_endings_in_both_tool_calls() {
+    let fixture = PolicyFixture::new();
+    let request = v2_text_request_with_prompt("camera\r\npan\nslowly");
+    let (_, invocation) = fixture
+        .policy
+        .command_spec_video_v2(&request, SESSION_ID, fixture.workspace.clone())
+        .unwrap();
+    write_artifact(&invocation);
+    let history = String::from_utf8(valid_history(&invocation)).unwrap();
+    let mut records: Vec<serde_json::Value> = history
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    for record in &mut records {
+        if let Some(arguments) = record.pointer_mut("/tool_calls/0/arguments") {
+            let mut value: serde_json::Value =
+                serde_json::from_str(arguments.as_str().unwrap()).unwrap();
+            value["prompt"] = json!("camera\npan\r\nslowly");
+            *arguments = json!(serde_json::to_string(&value).unwrap());
+        }
+    }
+    let history = records
+        .iter()
+        .map(|record| format!("{record}\n"))
+        .collect::<String>();
+    assert!(parse_invocation_receipt(&valid_stdout(), history.as_bytes(), &invocation).is_ok());
+}
+
+#[test]
 fn v2_receipt_rejects_omitted_expected_field() {
     let fixture = PolicyFixture::new();
     let request = v2_i2v_request("first.png", "camera pan", 6, OfficialVideoResolution::P480);
@@ -1882,6 +1911,10 @@ fn v2_reference_request() -> GrokVideoGenerationRequestV2 {
 }
 
 fn v2_text_request() -> GrokVideoGenerationRequestV2 {
+    v2_text_request_with_prompt("moonlit lake")
+}
+
+fn v2_text_request_with_prompt(prompt: &str) -> GrokVideoGenerationRequestV2 {
     let command = XaiVideoGenerationCommandV2::from_request(XaiVideoGenerationRequest {
         aspect_ratio: Some(OfficialVideoAspectRatio::R16x9),
         duration: Some(6),
@@ -1891,7 +1924,7 @@ fn v2_text_request() -> GrokVideoGenerationRequestV2 {
         last_frame: None,
         model: Some("grok-imagine-video-1.5".to_owned()),
         output: None,
-        prompt: Some("moonlit lake".to_owned()),
+        prompt: Some(prompt.to_owned()),
         reference_audios: Vec::new(),
         reference_images: Vec::new(),
         resolution: Some(OfficialVideoResolution::P480),

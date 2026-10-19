@@ -429,6 +429,31 @@ mod mismatch_diagnostic_tests {
     use serde_json::json;
 
     #[test]
+    fn prompt_line_endings_do_not_relax_other_arguments() {
+        let expected = json!({"prompt":"a\nb\r\nc", "duration":6});
+        let equivalent = json!({"prompt":"a\r\nb\nc", "duration":6});
+        assert!(arguments_equal_with_prompt_line_endings(
+            &expected,
+            &equivalent
+        ));
+        assert!(arguments_equal_with_prompt_line_endings(
+            &equivalent,
+            &expected
+        ));
+        for actual in [
+            json!({"prompt":"a\r\nb\nc"}),
+            json!({"prompt":"a\r\nb\nc", "duration":"6"}),
+            json!({"prompt":"a\r\nb\nc", "duration":7}),
+            json!({"prompt":"a\r\nb\nc", "duration":6, "extra":null}),
+            json!({"prompt":null, "duration":6}),
+        ] {
+            assert!(!arguments_equal_with_prompt_line_endings(
+                &expected, &actual
+            ));
+        }
+    }
+
+    #[test]
     fn exact_difference_diagnostics_are_content_free() {
         for (expected, actual, field, expected_type, actual_type) in [
             (
