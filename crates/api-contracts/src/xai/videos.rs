@@ -442,6 +442,9 @@ pub struct XaiStartDeferredResponse {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct XaiVideoResponse {
     pub status: String,
+    /// Factory extension, not part of the upstream xAI contract.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub factory_diagnostics: Option<FactoryVideoDiagnostics>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<XaiVideoError>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -452,6 +455,12 @@ pub struct XaiVideoResponse {
     pub usage: Option<XaiVideoUsage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub video: Option<XaiGeneratedVideo>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct FactoryVideoDiagnostics {
+    pub reconciliation_required: bool,
+    pub retryable: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

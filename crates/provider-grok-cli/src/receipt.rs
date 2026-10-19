@@ -355,11 +355,7 @@ fn validate_tool_arguments(
             if actual == expected.arguments() {
                 Ok(())
             } else {
-                Err(tool_arguments_mismatch(
-                    "arguments",
-                    Some(expected.arguments()),
-                    Some(actual),
-                ))
+                Err(exact_arguments_mismatch(expected.arguments(), actual))
             }
         }
         GrokToolArgumentPolicy::LegacyVideoDefaults => {
@@ -367,6 +363,108 @@ fn validate_tool_arguments(
         }
         GrokToolArgumentPolicy::ImagePromptMayNormalize => {
             validate_image_tool_arguments(expected, actual)
+        }
+    }
+}
+
+/// Report only the first differing allowlisted top-level field. Never expose
+/// arbitrary keys or nested paths. Exact equality above remains the acceptance gate.
+fn exact_arguments_mismatch(expected: &Value, actual: &Value) -> GrokReceiptError {
+    const FIELDS: &[&str] = &[
+        "prompt",
+        "image",
+        "images",
+        "first_frame",
+        "last_frame",
+        "voices",
+        "aspect_ratio",
+        "duration",
+        "resolution_name",
+        "keyframes",
+    ];
+    if let (Some(expected), Some(actual)) = (expected.as_object(), actual.as_object()) {
+        for &field in FIELDS {
+            if expected.get(field) != actual.get(field) {
+                return tool_arguments_mismatch(field, expected.get(field), actual.get(field));
+            }
+        }
+        for key in expected.keys().chain(actual.keys()) {
+            if expected.get(key) != actual.get(key) {
+                return tool_arguments_mismatch("other", expected.get(key), actual.get(key));
+            }
+        }
+    }
+    tool_arguments_mismatch("arguments", Some(expected), Some(actual))
+}
+
+#[cfg(test)]
+mod mismatch_diagnostic_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn exact_difference_diagnostics_are_content_free() {
+        for (expected, actual, field, expected_type, actual_type) in [
+            (
+                json!({"first_frame":null}),
+                json!({}),
+                "first_frame",
+                "null",
+                "missing",
+            ),
+            (
+                json!({}),
+                json!({"first_frame":null}),
+                "first_frame",
+                "missing",
+                "null",
+            ),
+            (
+                json!({"duration":6}),
+                json!({"duration":"6"}),
+                "duration",
+                "number",
+                "string",
+            ),
+            (
+                json!({"duration":6}),
+                json!({"duration":10}),
+                "duration",
+                "number",
+                "number",
+            ),
+            (
+                json!({}),
+                json!({"secret-key":"secret-value"}),
+                "other",
+                "missing",
+                "string",
+            ),
+            (
+                json!({"keyframes":[{"secret-key":"secret-before"}]}),
+                json!({"keyframes":[{"secret-key":"secret-after"}]}),
+                "keyframes",
+                "array",
+                "array",
+            ),
+            (
+                json!({"prompt":"secret https://private/a"}),
+                json!({"prompt":"secret https://private/b"}),
+                "prompt",
+                "string",
+                "string",
+            ),
+        ] {
+            let error = exact_arguments_mismatch(&expected, &actual);
+            let summary = error.tool_arguments_mismatch_summary().unwrap();
+            assert_eq!(
+                (summary.0, summary.1, summary.3),
+                (field, expected_type, actual_type)
+            );
+            let diagnostic = format!("{error:?}");
+            for forbidden in ["secret", "https://", "private"] {
+                assert!(!diagnostic.contains(forbidden));
+            }
         }
     }
 }
