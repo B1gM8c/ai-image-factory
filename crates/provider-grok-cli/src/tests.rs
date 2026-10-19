@@ -1651,7 +1651,12 @@ fn v2_text_video_dispatches_image_gen_then_image_to_video() {
 #[test]
 fn v2_receipt_accepts_only_prompt_crlf_equivalence() {
     let fixture = PolicyFixture::new();
-    let request = v2_i2v_request("first.png", "camera\r\npan", 6, OfficialVideoResolution::P480);
+    let request = v2_i2v_request(
+        "first.png",
+        "camera\r\npan",
+        6,
+        OfficialVideoResolution::P480,
+    );
     let (_, invocation) = fixture
         .policy
         .command_spec_video_v2(&request, SESSION_ID, fixture.workspace.clone())
