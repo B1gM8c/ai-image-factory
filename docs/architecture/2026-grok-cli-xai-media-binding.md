@@ -15,7 +15,15 @@ Factory does not change
 settlement, historical accounting, retry rules, or introduce a hold state.
 Clients ignoring the extension retain their previous polling behavior.
 
-Exact CLI receipt validation is unchanged. Mismatch diagnostics describe only
+V2 CLI receipts accept CRLF and LF as equivalent only within the `prompt`
+string, including both calls of text-to-video. This is line-ending equivalence,
+not general prompt normalization: lone CR, whitespace/content changes, missing
+or extra keys, types, and all other argument values remain strictly checked.
+Canonical requests and hashes, session/nonce/path checks, legacy V1 policies,
+settlement, and retry behavior are unchanged. Existing uncertain tasks are not
+automatically retried or reclassified by this validator change.
+
+Mismatch diagnostics describe only
 the first differing allowlisted top-level field (unknown fields become `other`)
 and `missing`, `extra`, `type`, or `value`. Nested paths and raw values are
 never recorded; existing type/hash summaries remain. These diagnostics cannot

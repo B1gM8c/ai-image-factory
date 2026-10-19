@@ -352,7 +352,7 @@ fn validate_tool_arguments(
 ) -> Result<(), GrokReceiptError> {
     match expected.argument_policy() {
         GrokToolArgumentPolicy::Exact => {
-            if actual == expected.arguments() {
+            if arguments_equal_with_prompt_line_endings(expected.arguments(), actual) {
                 Ok(())
             } else {
                 Err(exact_arguments_mismatch(expected.arguments(), actual))
@@ -367,8 +367,34 @@ fn validate_tool_arguments(
     }
 }
 
+// CLI text transport may convert CRLF to LF. Do not normalize whitespace,
+// lone CR, prompt content, missing keys, or any other tool argument.
+fn arguments_equal_with_prompt_line_endings(expected: &Value, actual: &Value) -> bool {
+    if expected == actual {
+        return true;
+    }
+    let (Some(expected), Some(actual)) = (expected.as_object(), actual.as_object()) else {
+        return false;
+    };
+    expected.len() == actual.len()
+        && expected.iter().all(|(key, value)| {
+            let Some(other) = actual.get(key) else {
+                return false;
+            };
+            if value == other {
+                return true;
+            }
+            match (key.as_str(), value.as_str(), other.as_str()) {
+                ("prompt", Some(left), Some(right)) => {
+                    left.replace("\r\n", "\n") == right.replace("\r\n", "\n")
+                }
+                _ => false,
+            }
+        })
+}
+
 /// Report only the first differing allowlisted top-level field. Never expose
-/// arbitrary keys or nested paths. Exact equality above remains the acceptance gate.
+/// arbitrary keys or nested paths. Only prompt line endings may be equivalent.
 fn exact_arguments_mismatch(expected: &Value, actual: &Value) -> GrokReceiptError {
     const FIELDS: &[&str] = &[
         "prompt",
@@ -401,6 +427,31 @@ fn exact_arguments_mismatch(expected: &Value, actual: &Value) -> GrokReceiptErro
 mod mismatch_diagnostic_tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn prompt_line_endings_do_not_relax_other_arguments() {
+        let expected = json!({"prompt":"a\nb\r\nc", "duration":6});
+        let equivalent = json!({"prompt":"a\r\nb\nc", "duration":6});
+        assert!(arguments_equal_with_prompt_line_endings(
+            &expected,
+            &equivalent
+        ));
+        assert!(arguments_equal_with_prompt_line_endings(
+            &equivalent,
+            &expected
+        ));
+        for actual in [
+            json!({"prompt":"a\r\nb\nc"}),
+            json!({"prompt":"a\r\nb\nc", "duration":"6"}),
+            json!({"prompt":"a\r\nb\nc", "duration":7}),
+            json!({"prompt":"a\r\nb\nc", "duration":6, "extra":null}),
+            json!({"prompt":null, "duration":6}),
+        ] {
+            assert!(!arguments_equal_with_prompt_line_endings(
+                &expected, &actual
+            ));
+        }
+    }
 
     #[test]
     fn exact_difference_diagnostics_are_content_free() {
