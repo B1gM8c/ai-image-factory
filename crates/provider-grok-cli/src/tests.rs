@@ -1649,6 +1649,40 @@ fn v2_text_video_dispatches_image_gen_then_image_to_video() {
 }
 
 #[test]
+fn v2_receipt_accepts_only_prompt_crlf_equivalence() {
+    let fixture = PolicyFixture::new();
+    let request = v2_i2v_request("first.png", "camera\r\npan", 6, OfficialVideoResolution::P480);
+    let (_, invocation) = fixture
+        .policy
+        .command_spec_video_v2(&request, SESSION_ID, fixture.workspace.clone())
+        .unwrap();
+    write_artifact(&invocation);
+    for (prompt, accepted) in [
+        ("camera\r\npan", true),
+        ("camera\npan", true),
+        ("camera\rpan", false),
+        ("camera pan", false),
+        ("camera\n pan", false),
+        ("camera\npan ", false),
+        ("camera\nzoom", false),
+    ] {
+        let mut actual = invocation.expected_arguments().clone();
+        actual["prompt"] = json!(prompt);
+        let history = history_with(&invocation, actual, invocation.artifact_path());
+        assert_eq!(
+            parse_invocation_receipt(&valid_stdout(), &history, &invocation).is_ok(),
+            accepted,
+            "prompt={prompt:?}"
+        );
+    }
+    let mut actual = invocation.expected_arguments().clone();
+    actual["prompt"] = json!("camera\npan");
+    actual["duration"] = json!(10);
+    let history = history_with(&invocation, actual, invocation.artifact_path());
+    assert!(parse_invocation_receipt(&valid_stdout(), &history, &invocation).is_err());
+}
+
+#[test]
 fn v2_receipt_rejects_omitted_expected_field() {
     let fixture = PolicyFixture::new();
     let request = v2_i2v_request("first.png", "camera pan", 6, OfficialVideoResolution::P480);
