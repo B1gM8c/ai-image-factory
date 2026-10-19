@@ -45,7 +45,7 @@ pub(super) fn spawn(state: Arc<AppState>) {
     if state.batch_service.is_none() {
         return;
     }
-    supervise_task(
+    let _supervisor = supervise_task(
         "Batch file cleanup worker",
         spawn_file_cleanup(Arc::clone(&state)),
     );
@@ -112,7 +112,7 @@ pub(super) fn spawn(state: Arc<AppState>) {
             }
         }
     });
-    supervise_task("Batch worker", handle);
+    let _supervisor = supervise_task("Batch worker", handle);
 }
 
 fn spawn_file_cleanup(state: Arc<AppState>) -> JoinHandle<()> {
@@ -149,16 +149,19 @@ fn spawn_file_cleanup(state: Arc<AppState>) -> JoinHandle<()> {
     })
 }
 
-fn supervise_task(name: &'static str, handle: JoinHandle<()>) {
+fn supervise_task(name: &'static str, handle: JoinHandle<()>) -> JoinHandle<()> {
     tokio::spawn(async move {
         match handle.await {
+            // Worker handles are private to this supervisor. Runtime teardown
+            // cancels them during normal gateway shutdown; it is not a crash.
+            Err(error) if error.is_cancelled() => return,
             Ok(()) => tracing::error!(worker.name = name, "Background worker stopped"),
             Err(error) => {
                 tracing::error!(worker.name = name, ?error, "Background worker crashed");
             }
         }
         std::process::abort();
-    });
+    })
 }
 
 async fn process_file_cleanup(service: &Arc<dyn BatchService>, lease: ProjectFileCleanupLease) {
@@ -609,6 +612,15 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn cancelled_batch_worker_does_not_abort_during_shutdown() {
+        let worker = tokio::spawn(std::future::pending::<()>());
+        worker.abort();
+        supervise_task("test batch worker", worker)
+            .await
+            .expect("runtime cancellation is a normal shutdown outcome");
+    }
 
     #[test]
     fn retry_delay_is_bounded_by_attempts_and_batch_deadline() {
