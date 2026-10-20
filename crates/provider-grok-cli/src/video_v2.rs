@@ -269,6 +269,9 @@ impl ReferenceToVideoRequestV2 {
     pub(crate) fn keyframes(&self) -> &[KeyframeV2] {
         &self.keyframes
     }
+    pub fn keyframe_images(&self) -> impl Iterator<Item = &StagedImageV1> {
+        self.keyframes.iter().map(KeyframeV2::image)
+    }
     pub fn voices(&self) -> &[String] {
         &self.normalized_voices
     }
