@@ -351,6 +351,7 @@ impl GrokProcessSupervisor {
                 .into_iter()
                 .chain(request.last_frame())
                 .chain(request.reference_images().iter())
+                .chain(request.keyframe_images())
                 .collect(),
         };
         if expected_inputs.len() != context.inputs().len() {
@@ -1637,6 +1638,191 @@ mod tests {
                 .contains("endpoint = \"http://127.0.0.1:8787/v1/internal/provider-uploads/s3/\"")
         );
         assert!(projected.contains("[tools.zdr_video_output_s3.read_write]"));
+    }
+
+    async fn reference_video_v2_context(
+        fixture: &GrokFixture,
+        references: usize,
+        keyframes: usize,
+    ) -> (ExecutorSubmissionLease, ExecutorLaunchContext, Vec<Vec<u8>>) {
+        use image_api_contracts::xai::XaiVideoGenerationCommandV2;
+        use image_provider_grok_cli::{
+            GROK_VIDEO_GENERATION_COMMAND_SCHEMA_V2, GrokVideoGenerationPayloadV2,
+            VIDEO_ADAPTER_REVISION_V2,
+        };
+
+        let source = XaiVideoGenerationCommandV2::from_request(
+            serde_json::from_value(serde_json::json!({
+                "model": "grok-imagine-video-1.5",
+                "prompt": "move between frames",
+                "duration": 10,
+                "resolution": "720p",
+                "aspect_ratio": "16:9",
+                "image": {"url": "https://example.com/first.png"},
+                "last_frame": {"url": "https://example.com/last.png"},
+                "reference_images": (0..references).map(|_| serde_json::json!({
+                    "url": "https://example.com/reference.png"
+                })).collect::<Vec<_>>(),
+                "keyframes": (0..keyframes).map(|index| serde_json::json!({
+                    "image": {"url": "https://example.com/keyframe.png"},
+                    "timestamp_s": (index + 1) as f64
+                })).collect::<Vec<_>>()
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let mut staged = Vec::new();
+        let mut inputs = Vec::new();
+        let mut expected_bytes = Vec::new();
+        for index in 0..(2 + references + keyframes) {
+            let mut bytes = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::new_rgb8(index as u32 + 2, 2)
+                .write_to(&mut bytes, image::ImageFormat::Png)
+                .unwrap();
+            let bytes = bytes.into_inner();
+            let blob = fixture
+                .input_blobs
+                .put(
+                    InputBlobKey {
+                        admission_session_id: Uuid::new_v4(),
+                        input_id: Uuid::new_v4(),
+                    },
+                    &bytes,
+                )
+                .await
+                .unwrap();
+            staged
+                .push(StagedImageV1::new(format!("frame-{index}.png"), &blob.sha256_hex).unwrap());
+            inputs
+                .push(ExecutorInputObject::new(blob, "image", index as u16, "image/png").unwrap());
+            expected_bytes.push(bytes);
+        }
+        let payload = GrokVideoGenerationPayloadV2::from_xai_command(source, staged).unwrap();
+        let command: Value =
+            serde_json::from_slice(&payload.into_canonical_bytes(OutputSlot::new(0, 1).unwrap()))
+                .unwrap();
+        let mut lease = fixture.lease();
+        lease.model = "grok-imagine-video-1.5".to_owned();
+        lease.command_schema = GROK_VIDEO_GENERATION_COMMAND_SCHEMA_V2.to_owned();
+        lease.adapter_revision = VIDEO_ADAPTER_REVISION_V2.to_owned();
+        lease.command_hash = sha256(&serde_json::to_vec(&command).unwrap());
+        let context = ExecutorLaunchContext {
+            request_id: "reference-video-v2".to_owned(),
+            api_profile: XAI_VIDEOS_API_PROFILE.to_owned(),
+            output_index: 0,
+            command_schema: lease.command_schema.clone(),
+            command_hash: lease.command_hash.clone(),
+            command_json: command,
+            inputs,
+        };
+        (lease, context, expected_bytes)
+    }
+
+    #[tokio::test]
+    async fn supervisor_stages_v2_first_last_and_keyframes_without_launch() {
+        // Customer shape, mixed references/keyframes, and the existing no-keyframe path.
+        for (references, keyframes) in [(0, 1), (2, 2), (1, 0)] {
+            let fixture = GrokFixture::new();
+            let (lease, context, expected) =
+                reference_video_v2_context(&fixture, references, keyframes).await;
+            fixture.journal.start_or_attach(&lease).unwrap();
+            fixture.supervisor.prepare(&lease, &context).await.unwrap();
+            let spool = ExecutionSpool::for_lease(&fixture.journal, &lease).unwrap();
+            for (index, bytes) in expected.iter().enumerate() {
+                assert_eq!(
+                    fs::read(
+                        spool
+                            .provider_attempt_path()
+                            .unwrap()
+                            .join(format!("frame-{index}.png"))
+                    )
+                    .unwrap(),
+                    *bytes,
+                );
+            }
+            assert!(
+                fixture
+                    .journal
+                    .root_path()
+                    .join(lease.executor_execution_id.simple().to_string())
+                    .join("provider-request.json")
+                    .is_file()
+            );
+            assert!(!fixture.invocations.exists());
+            assert!(matches!(
+                spool.observe().unwrap(),
+                ProcessObservation::AwaitingProcess
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn supervisor_rejects_invalid_v2_keyframe_bindings_without_launch() {
+        for case in [
+            "missing", "extra", "role", "index", "digest", "size", "mime", "bytes",
+        ] {
+            let fixture = GrokFixture::new();
+            let (lease, mut context, _) = reference_video_v2_context(&fixture, 0, 1).await;
+            let keyframe = context.inputs.last_mut().unwrap();
+            let error_code = match case {
+                "missing" => {
+                    context.inputs.pop();
+                    "grok_input_manifest_invalid"
+                }
+                "extra" => {
+                    let extra = keyframe.clone();
+                    context.inputs.push(extra);
+                    "grok_input_manifest_invalid"
+                }
+                "role" => {
+                    keyframe.role = "mask".to_owned();
+                    "grok_input_manifest_invalid"
+                }
+                "index" => {
+                    keyframe.index = 0;
+                    "grok_input_manifest_invalid"
+                }
+                "digest" => {
+                    keyframe.blob.sha256_hex = "0".repeat(64);
+                    "grok_input_manifest_invalid"
+                }
+                "size" => {
+                    keyframe.blob.byte_size = 0;
+                    "grok_input_manifest_invalid"
+                }
+                "mime" => {
+                    keyframe.media_type = "image/jpeg".to_owned();
+                    "grok_input_integrity_failed"
+                }
+                "bytes" => {
+                    fixture
+                        .input_blobs
+                        .put(keyframe.blob.key.clone(), b"corrupt")
+                        .await
+                        .unwrap();
+                    "grok_input_integrity_failed"
+                }
+                _ => unreachable!(),
+            };
+            fixture.journal.start_or_attach(&lease).unwrap();
+            assert_eq!(
+                fixture.supervisor.prepare(&lease, &context).await,
+                Err(RunnerError::Definite {
+                    error_code: error_code.to_owned()
+                }),
+                "{case}"
+            );
+            assert!(!fixture.invocations.exists(), "{case}");
+            assert!(
+                !fixture
+                    .journal
+                    .root_path()
+                    .join(lease.executor_execution_id.simple().to_string())
+                    .join("provider-request.json")
+                    .exists(),
+                "{case}"
+            );
+        }
     }
 
     #[tokio::test]
