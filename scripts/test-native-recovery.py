@@ -1146,6 +1146,15 @@ RESET ROLE;
     authenticated_acceptance(password, account_id)
     candidate_cases.exercise(sys.modules[__name__], args, candidate, updater, policy, owner_env, password, output,
                              different_bytes=True)
+    # The rollback deliberately restored the same immutable legacy daemon whose
+    # shutdown-listener race was handled during initial host preparation. Stop
+    # it with those exact identity/idle/clean-exit guards before enabling Apply;
+    # a completed owner Check may still be finishing its polling pass.
+    rollback_stop = stop_baseline_updater(baseline, baseline_updater_hash, owner_env)
+    rollback_receipt_path = output / 'candidate-different-bytes-rollback.json'
+    rollback_receipt = json.loads(rollback_receipt_path.read_text())
+    rollback_receipt['graceful_stop_before_enable_apply'] = rollback_stop
+    write(rollback_receipt_path, json.dumps(rollback_receipt, indent=2))
     # Enabling Apply is a separate, explicit CI acceptance phase. Restart the
     # old gateway so its startup-read policy matches the daemon, not a stale UI.
     policy['AIF_UPDATE_APPLY_ENABLED'] = 'true'

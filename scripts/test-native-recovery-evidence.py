@@ -155,6 +155,27 @@ class NativeRecoveryEvidenceTests(unittest.TestCase):
                 HARNESS_MODULE.stop_baseline_updater({'release_version': 'new', 'commit_sha': 'new'}, 'hash', {})
             run.assert_not_called()
 
+    def test_restored_legacy_daemon_is_stopped_before_apply_is_enabled(self):
+        tree = ast.parse(HARNESS.read_text())
+        execute = next(node for node in tree.body
+                       if isinstance(node, ast.FunctionDef) and node.name == 'execute')
+        calls = [node for node in ast.walk(execute) if isinstance(node, ast.Call)]
+        rollback = next(node for node in calls
+                        if isinstance(node.func, ast.Attribute) and node.func.attr == 'exercise'
+                        and any(keyword.arg == 'different_bytes'
+                                and isinstance(keyword.value, ast.Constant)
+                                and keyword.value.value is True for keyword in node.keywords))
+        stop = next(node for node in calls
+                    if isinstance(node.func, ast.Name) and node.func.id == 'stop_baseline_updater'
+                    and node.lineno > rollback.lineno)
+        self.assertEqual([node.id for node in stop.args],
+                         ['baseline', 'baseline_updater_hash', 'owner_env'])
+        enable = next(node for node in ast.walk(execute)
+                      if isinstance(node, ast.Assign) and isinstance(node.value, ast.Constant)
+                      and node.value.value == 'true' and node.lineno > rollback.lineno)
+        self.assertIn('AIF_UPDATE_APPLY_ENABLED', ast.unparse(enable))
+        self.assertLess(stop.lineno, enable.lineno)
+
     def test_legacy_stop_wait_evidence_rejects_database_lock_wait(self):
         with mock.patch.object(HARNESS_MODULE, 'sql', return_value=json.dumps({
                 'lock_waiters': 1, 'ungranted_locks': 1, 'active_backends': 1})), \
