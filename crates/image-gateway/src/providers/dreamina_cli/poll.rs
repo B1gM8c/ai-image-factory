@@ -26,7 +26,7 @@ use image_provider_sdk::{
     RetryDirective,
 };
 
-const DEFAULT_POLL_AFTER_MS: u64 = 1_000;
+const DEFAULT_POLL_AFTER_MS: u64 = 5_000;
 const MEDIA_PREFIX_BYTES: usize = 12;
 const DREAMINA_POLL_ATTEMPT_PREFIX: &str = ".dreamina-poll-";
 
@@ -310,6 +310,7 @@ fn supported_model(operation_id: &str, model: &str) -> bool {
                 | "seedance2.0_vip"
                 | "seedance2.0fast_vip"
                 | "seedance2.0mini"
+                | "seedance2.5"
         ),
         _ => false,
     }

@@ -171,6 +171,25 @@ fn video_request_enforces_duration_and_vip_resolution_boundaries() {
                 .is_ok()
             );
         }
+        for duration in [3, 16] {
+            assert_eq!(
+                TextToVideoRequestV1::new(
+                    "prompt",
+                    model,
+                    VideoRatio::R16x9,
+                    duration,
+                    VideoResolution::P720,
+                ),
+                Err(RequestValidationError::InvalidVideoDuration(duration))
+            );
+        }
+        assert_eq!(
+            TextToVideoRequestV1::new("prompt", model, VideoRatio::R16x9, 5, VideoResolution::P480,),
+            Err(RequestValidationError::UnsupportedVideoResolution {
+                model,
+                resolution: VideoResolution::P480,
+            })
+        );
     }
 
     for resolution in [VideoResolution::P1080, VideoResolution::K4] {
@@ -199,19 +218,48 @@ fn video_request_enforces_duration_and_vip_resolution_boundaries() {
             ));
         }
     }
+}
 
-    for duration in [3, 16] {
-        assert!(matches!(
+#[test]
+fn seedance_25_enforces_its_own_duration_and_resolution_boundaries() {
+    let model = VideoModelVersion::Seedance2_5;
+    for resolution in [
+        VideoResolution::P480,
+        VideoResolution::P720,
+        VideoResolution::P1080,
+    ] {
+        for duration in [4, 30] {
+            assert!(
+                TextToVideoRequestV1::new(
+                    "prompt",
+                    model,
+                    VideoRatio::R16x9,
+                    duration,
+                    resolution,
+                )
+                .is_ok()
+            );
+        }
+    }
+    for duration in [0, 3, 31, u8::MAX] {
+        assert_eq!(
             TextToVideoRequestV1::new(
                 "prompt",
-                VideoModelVersion::Seedance2_0,
+                model,
                 VideoRatio::R16x9,
                 duration,
-                VideoResolution::P720,
+                VideoResolution::P480,
             ),
-            Err(RequestValidationError::InvalidVideoDuration(value)) if value == duration
-        ));
+            Err(RequestValidationError::InvalidVideoDuration(duration))
+        );
     }
+    assert_eq!(
+        TextToVideoRequestV1::new("prompt", model, VideoRatio::R16x9, 5, VideoResolution::K4),
+        Err(RequestValidationError::UnsupportedVideoResolution {
+            model,
+            resolution: VideoResolution::K4,
+        })
+    );
 }
 
 #[test]
@@ -245,6 +293,8 @@ fn every_video_ratio_and_model_projects_to_the_official_value() {
         VideoModelVersion::Seedance2_0Mini.as_str(),
         "seedance2.0mini"
     );
+    assert_eq!(VideoModelVersion::Seedance2_5.as_str(), "seedance2.5");
+    assert_eq!(VideoResolution::P480.as_str(), "480p");
     assert_eq!(VideoResolution::P720.as_str(), "720p");
     assert_eq!(VideoResolution::P1080.as_str(), "1080p");
     assert_eq!(VideoResolution::K4.as_str(), "4k");
@@ -377,6 +427,61 @@ fn canonical_submit_parser_rejects_drift_and_revalidates_official_options() {
     let parsed = parse_submit_command(batch).unwrap();
     assert_eq!(parsed.output_count(), 2);
     assert_eq!(parsed.into_single_output().output_count(), 1);
+}
+
+#[test]
+fn seedance_25_canonical_command_round_trips_to_the_exact_cli_arguments() {
+    let request = TextToVideoRequestV1::new(
+        "an orange paper airplane",
+        VideoModelVersion::Seedance2_5,
+        VideoRatio::R16x9,
+        5,
+        VideoResolution::P480,
+    )
+    .unwrap();
+    let command = SingleOutputCommand::new(
+        OutputSlot::new(0, 1).unwrap(),
+        DreaminaSubmitPayloadV1::new("a".repeat(64), request.clone().into()).unwrap(),
+    )
+    .unwrap();
+    let expected = br#"{"operation":"text2video","schema_version":1,"prompt":"an orange paper airplane","model_version":"seedance2.5","ratio":"16:9","duration":5,"video_resolution":"480p","poll":0}"#;
+    assert_eq!(command.canonical_payload(), expected);
+    assert_eq!(
+        parse_submit_command(command.canonical_payload()).unwrap(),
+        DreaminaSubmitRequestV1::TextToVideo(request)
+    );
+    assert_eq!(
+        parse_submit_command(expected).unwrap().argv().unwrap(),
+        [
+            "text2video",
+            "--prompt",
+            "an orange paper airplane",
+            "--model_version",
+            "seedance2.5",
+            "--ratio",
+            "16:9",
+            "--duration",
+            "5",
+            "--video_resolution",
+            "480p",
+            "--poll=0",
+        ]
+        .map(OsString::from)
+    );
+}
+
+#[test]
+fn canonical_video_command_revalidates_model_specific_limits() {
+    for invalid in [
+        br#"{"operation":"text2video","schema_version":1,"prompt":"p","model_version":"seedance2.5","ratio":"16:9","duration":31,"video_resolution":"480p","poll":0}"#.as_slice(),
+        br#"{"operation":"text2video","schema_version":1,"prompt":"p","model_version":"seedance2.5","ratio":"16:9","duration":5,"video_resolution":"4k","poll":0}"#.as_slice(),
+        br#"{"operation":"text2video","schema_version":1,"prompt":"p","model_version":"seedance2.0_vip","ratio":"16:9","duration":5,"video_resolution":"480p","poll":0}"#.as_slice(),
+    ] {
+        assert!(matches!(
+            parse_submit_command(invalid),
+            Err(DreaminaSubmitCommandError::InvalidRequest(_))
+        ));
+    }
 }
 
 #[test]

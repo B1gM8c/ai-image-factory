@@ -30,6 +30,7 @@ chmod 0755 "$VERIFY" "$TEST_ROOT/hooks/verify-admin-reader"
 cat >"$TEST_ROOT/bin/systemctl" <<'EOF'
 #!/bin/bash
 phase="$(cat "$MOCK_PHASE_FILE")"
+if [[ "$1" == --job-mode=* ]]; then shift; fi
 case "$1" in
   list-dependencies)
     printf '%s\n' \
@@ -40,6 +41,13 @@ case "$1" in
       printf '%s\n' \
         ai-image-factory-executord@managed.codex.images.test.service \
         ai-image-factory-workerd@managed.codex.images.test.service
+    fi
+    if [[ "${MOCK_REMOTE_UNITS:-false}" == true ]]; then
+      for operation in images videos; do
+        for daemon in remote-workerd provider-submitd provider-pollerd; do
+          printf 'ai-image-factory-%s@managed.dreamina.%s.test.service\n' "$daemon" "$operation"
+        done
+      done
     fi
     exit 0
     ;;
@@ -52,9 +60,24 @@ case "$1" in
     exit 0
     ;;
   list-units)
+    if [[ -n "${MOCK_REMOTE_ACTIVE_UNIT:-}" ]]; then
+      printf '%s loaded active running\n' "$MOCK_REMOTE_ACTIVE_UNIT"
+    fi
     exit 0
     ;;
   is-enabled)
+    if [[ "${MOCK_REMOTE_UNITS:-false}" == true ]]; then
+      case "${@: -1}" in
+        ai-image-factory-remote-workerd@managed.dreamina.*.test.service | \
+          ai-image-factory-provider-submitd@managed.dreamina.*.test.service | \
+          ai-image-factory-provider-pollerd@managed.dreamina.*.test.service) exit 0 ;;
+      esac
+    fi
+    if [[ "${MOCK_REMOTE_SINGLETONS:-false}" == true ]] \
+      && [[ "${@: -1}" == ai-image-factory-provider-submitd.service \
+        || "${@: -1}" == ai-image-factory-provider-pollerd.service ]]; then
+      exit 0
+    fi
     if [[ "${MOCK_MANAGED_UNITS:-false}" == true ]] \
       && [[ "${@: -1}" == ai-image-factory-executord@managed.codex.images.test.service \
         || "${@: -1}" == ai-image-factory-workerd@managed.codex.images.test.service ]]; then
@@ -268,5 +291,73 @@ run_start_processes \
   MOCK_INACTIVE_UNIT=ai-image-factory-workerd-codex-edits.service \
   >/dev/null
 grep -Fq 'ai-image-factory-workerd-codex-edits.service' "$TEST_ROOT/start.log"
+
+# Image and video profiles use independent consumers; all of them participate
+# in full activation, stability checks, and quiescing before migration/recovery.
+remote_units=()
+for operation in images videos; do
+  for daemon in remote-workerd provider-submitd provider-pollerd; do
+    remote_units+=("ai-image-factory-${daemon}@managed.dreamina.${operation}.test.service")
+  done
+done
+: >"$TEST_ROOT/gate.log"
+run_verify MOCK_REMOTE_UNITS=true >/dev/null
+for unit in "${remote_units[@]}"; do
+  grep -Fq "$unit" "$TEST_ROOT/gate.log"
+  if run_verify MOCK_REMOTE_UNITS=true MOCK_INACTIVE_UNIT="$unit" >/dev/null 2>&1; then
+    echo "expected verification to require remote runtime: $unit" >&2
+    exit 1
+  fi
+done
+
+run_quiesce MOCK_REMOTE_UNITS=true >/dev/null
+for unit in "${remote_units[@]}"; do
+  grep -Fq "$unit" "$TEST_ROOT/stop.log"
+done
+for daemon in remote-workerd provider-submitd provider-pollerd; do
+  unit="ai-image-factory-${daemon}@managed.dreamina.videos.test.service"
+  # Even a disabled instance that is still active must drain before recovery.
+  run_quiesce MOCK_REMOTE_ACTIVE_UNIT="$unit" >/dev/null
+  grep -Fq "$unit" "$TEST_ROOT/stop.log"
+  if run_quiesce MOCK_REMOTE_ACTIVE_UNIT="$unit" MOCK_QUIESCE_STUCK_UNIT="$unit" >/dev/null 2>&1; then
+    echo "expected quiesce to fail for a live remote process: $unit" >&2
+    exit 1
+  fi
+done
+
+for mode in target direct gate; do
+  : >"$TEST_ROOT/start.log"
+  run_start_processes MOCK_REMOTE_UNITS=true AIF_UPDATE_START_MODE="$mode" >/dev/null
+  for unit in "${remote_units[@]}"; do
+    grep -Fq "$unit" "$TEST_ROOT/start.log"
+  done
+  if grep -Fq 'ai-image-factory-executord@managed.dreamina.' "$TEST_ROOT/start.log"; then
+    echo "remote profiles must not start a local executor" >&2
+    exit 1
+  fi
+  : >"$TEST_ROOT/start.log"
+  run_start_processes MOCK_REMOTE_UNITS=true AIF_UPDATE_START_MODE="$mode" \
+    AIF_UPDATE_PROCESS_SCOPE=validation >/dev/null
+  if grep -Fq 'managed.dreamina.' "$TEST_ROOT/start.log"; then
+    echo "validation activation must not start remote consumers" >&2
+    exit 1
+  fi
+done
+: >"$TEST_ROOT/gate.log"
+run_verify MOCK_REMOTE_UNITS=true AIF_UPDATE_PROCESS_SCOPE=validation >/dev/null
+if grep -Fq 'managed.dreamina.' "$TEST_ROOT/gate.log"; then
+  echo "validation verification must not require remote consumers" >&2
+  exit 1
+fi
+
+# Existing installations may continue using the explicitly configured singletons.
+: >"$TEST_ROOT/gate.log"
+: >"$TEST_ROOT/start.log"
+run_verify MOCK_REMOTE_SINGLETONS=true >/dev/null
+run_start_processes MOCK_REMOTE_SINGLETONS=true >/dev/null
+for daemon in provider-submitd provider-pollerd; do
+  grep -Fq "ai-image-factory-${daemon}.service" "$TEST_ROOT/gate.log"
+  grep -Fq "ai-image-factory-${daemon}.service" "$TEST_ROOT/start.log"
+done
 
 echo "release process hook tests passed"

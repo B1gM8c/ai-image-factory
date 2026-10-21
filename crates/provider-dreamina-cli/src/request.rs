@@ -99,6 +99,7 @@ pub enum VideoModelVersion {
     Seedance2_0Vip,
     Seedance2_0FastVip,
     Seedance2_0Mini,
+    Seedance2_5,
 }
 
 impl VideoModelVersion {
@@ -109,12 +110,20 @@ impl VideoModelVersion {
             Self::Seedance2_0Vip => "seedance2.0_vip",
             Self::Seedance2_0FastVip => "seedance2.0fast_vip",
             Self::Seedance2_0Mini => "seedance2.0mini",
+            Self::Seedance2_5 => "seedance2.5",
         }
     }
 
     const fn supports(self, resolution: VideoResolution) -> bool {
         match self {
-            Self::Seedance2_0Vip => true,
+            Self::Seedance2_0Vip => matches!(
+                resolution,
+                VideoResolution::P720 | VideoResolution::P1080 | VideoResolution::K4
+            ),
+            Self::Seedance2_5 => matches!(
+                resolution,
+                VideoResolution::P480 | VideoResolution::P720 | VideoResolution::P1080
+            ),
             Self::Seedance2_0
             | Self::Seedance2_0Fast
             | Self::Seedance2_0FastVip
@@ -150,6 +159,7 @@ impl VideoRatio {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum VideoResolution {
+    P480,
     P720,
     P1080,
     K4,
@@ -158,6 +168,7 @@ pub enum VideoResolution {
 impl VideoResolution {
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::P480 => "480p",
             Self::P720 => "720p",
             Self::P1080 => "1080p",
             Self::K4 => "4k",
@@ -314,7 +325,12 @@ impl TextToVideoRequestV1 {
         resolution: VideoResolution,
     ) -> Result<Self, RequestValidationError> {
         let prompt = validate_prompt(prompt.into())?;
-        if !(4..=15).contains(&duration_seconds) {
+        let maximum_duration = if model == VideoModelVersion::Seedance2_5 {
+            30
+        } else {
+            15
+        };
+        if !(4..=maximum_duration).contains(&duration_seconds) {
             return Err(RequestValidationError::InvalidVideoDuration(
                 duration_seconds,
             ));
@@ -446,7 +462,7 @@ pub enum RequestValidationError {
         height: u32,
         resolution: ImageResolution,
     },
-    #[error("video duration must be between 4 and 15 seconds, got {0}")]
+    #[error("video duration must be 4–15 seconds (4–30 for Seedance 2.5), got {0}")]
     InvalidVideoDuration(u8),
     #[error("video model {model:?} does not support resolution {resolution:?}")]
     UnsupportedVideoResolution {

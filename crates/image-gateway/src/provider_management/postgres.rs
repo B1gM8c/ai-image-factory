@@ -4636,6 +4636,10 @@ fn default_model_aliases(
                 "volcengine-ark-content-generation-v3",
                 "doubao-seedance-2-0-mini-260128",
             )),
+            ("videos.generations", "seedance2.5") => Some((
+                "volcengine-ark-content-generation-v3",
+                "doubao-seedance-2-5-260628",
+            )),
             _ => None,
         };
         if let Some((profile, public_model_id)) = ark {
@@ -5441,6 +5445,23 @@ fn map_route_insert(error: sqlx::Error) -> ImageGatewayError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn seedance25_gets_native_and_ark_default_model_aliases() {
+        assert_eq!(
+            default_model_aliases(DREAMINA_PROVIDER_ID, "videos.generations", "seedance2.5"),
+            [
+                (
+                    "dreamina-cli-videos-v1".to_owned(),
+                    "seedance2.5".to_owned()
+                ),
+                (
+                    "volcengine-ark-content-generation-v3".to_owned(),
+                    "doubao-seedance-2-5-260628".to_owned(),
+                ),
+            ]
+        );
+    }
 
     #[test]
     fn managed_login_refreshes_before_the_video_credential_cutoff() {

@@ -428,6 +428,10 @@ fn console_video_controls(
 ) -> Option<ConsoleVideoControls> {
     const DREAMINA_RATIOS: &[&str] = &["1:1", "3:4", "16:9", "4:3", "9:16", "21:9"];
     const DREAMINA_DURATIONS: &[u8] = &[4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+    const SEEDANCE_25_DURATIONS: &[u8] = &[
+        4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
+        28, 29, 30,
+    ];
     if api_profile == XAI_VIDEOS_API_PROFILE {
         if !is_grok_video_15(provider_model_id) {
             return None;
@@ -485,6 +489,9 @@ fn console_video_controls(
     }
     let provider_model_id = provider_model_id?;
     let resolutions = match (api_profile, provider_model_id) {
+        (DREAMINA_VIDEOS_API_PROFILE | ARK_CONTENT_GENERATION_API_PROFILE, "seedance2.5") => {
+            &["480p", "720p", "1080p"][..]
+        }
         (DREAMINA_VIDEOS_API_PROFILE, "seedance2.0_vip") => &["720p", "1080p", "4k"][..],
         (
             DREAMINA_VIDEOS_API_PROFILE,
@@ -504,7 +511,11 @@ fn console_video_controls(
         }),
         duration: ConsoleNumericChoiceControl {
             default: 5,
-            options: DREAMINA_DURATIONS,
+            options: if provider_model_id == "seedance2.5" {
+                SEEDANCE_25_DURATIONS
+            } else {
+                DREAMINA_DURATIONS
+            },
         },
         resolution: ConsoleChoiceControl {
             default: "720p",
@@ -1404,6 +1415,24 @@ mod tests {
                 .map(|index| format!("data:image/png;base64,{index:02}"))
                 .collect(),
         }
+    }
+
+    #[test]
+    fn seedance_25_console_controls_follow_the_cli_model_limits() {
+        for profile in [
+            DREAMINA_VIDEOS_API_PROFILE,
+            ARK_CONTENT_GENERATION_API_PROFILE,
+        ] {
+            let controls = console_video_controls(profile, Some("seedance2.5")).unwrap();
+            assert_eq!(controls.resolution.options, &["480p", "720p", "1080p"]);
+            assert_eq!(controls.duration.options.first(), Some(&4));
+            assert_eq!(controls.duration.options.last(), Some(&30));
+            assert!(!controls.first_frame.supported);
+        }
+        let legacy =
+            console_video_controls(DREAMINA_VIDEOS_API_PROFILE, Some("seedance2.0fast")).unwrap();
+        assert_eq!(legacy.resolution.options, &["720p"]);
+        assert_eq!(legacy.duration.options.last(), Some(&15));
     }
 
     fn public_model(

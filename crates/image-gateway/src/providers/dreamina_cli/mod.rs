@@ -41,7 +41,9 @@ pub use poll::{
     DreaminaCliPollDriverConfigError, DreaminaCliPollDriverV1, DreaminaCliPollProcessConfig,
 };
 
-const DEFAULT_POLL_AFTER_MS: u64 = 1_000;
+// Each query starts a CLI process; five seconds bounds status latency without
+// keeping an upstream query process busy throughout generation.
+const DEFAULT_POLL_AFTER_MS: u64 = 5_000;
 
 #[derive(Clone, Eq, PartialEq)]
 pub struct DreaminaCliRuntimeBindingV1 {

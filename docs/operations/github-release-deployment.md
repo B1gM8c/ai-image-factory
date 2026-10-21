@@ -435,8 +435,8 @@ sudo systemctl enable ai-image-factory-webhookd.service
 sudo systemctl restart ai-image-factory-processes.target
 ```
 
-Each enabled execution profile uses paired, escaped dispatcher and executor
-instances. Enable both instances after provisioning the profile:
+Each enabled local Codex/Grok execution profile uses paired, escaped dispatcher
+and executor instances. Enable both instances after provisioning the profile:
 
 ```bash
 sudo systemctl enable --now \
@@ -444,13 +444,91 @@ sudo systemctl enable --now \
   "ai-image-factory-executord@$(systemd-escape 'PROFILE_KEY').service"
 ```
 
+### Dreamina remote profiles
+
+Completing a managed Dreamina login creates account credentials, image/video
+execution profiles, and routes. It does not start consumers. Each enabled
+account/operation profile needs one remote dispatcher, submitter, and poller;
+all models mapped to that profile share these three processes. Use separate
+profile instances for images and videos. Do not start a local `executord@` or
+`workerd@` for a Dreamina profile.
+
+The release bundle includes the templates below through the existing
+`ops/systemd` inventory. Bootstrap installs them with the other service files.
+On an existing host, install the templates and updated lifecycle hooks from the
+exact release tree verified by Check, during the privileged host preparation
+step. Do not enable the new instances until the application release has passed
+Apply and its ordinary gates:
+
+```bash
+REMOTE_RELEASE=/opt/ai-image-factory/releases/VERIFIED_VERSION
+for daemon in remote-workerd provider-submitd provider-pollerd; do
+  sudo install -m 0644 \
+    "$REMOTE_RELEASE/ops/systemd/ai-image-factory-${daemon}@.service" \
+    /etc/systemd/system/
+done
+for hook in quiesce start-processes verify; do
+  sudo install -m 0755 "$REMOTE_RELEASE/ops/hooks/$hook" \
+    /usr/libexec/ai-image-factory/hooks/
+done
+sudo install -d -m 0700 /etc/ai-image-factory/remote-providers
+sudo systemctl daemon-reload
+```
+
+Verify each installed file's digest against that release manifest and retain
+the previous protected host files for recovery. These fixed host hooks are not
+replaced by an application Apply. `activate` and `resume` use `start-processes`;
+the updater uses `quiesce` before migration and recovery. The updated hooks
+discover enabled remote instances under `ai-image-factory-processes.target`,
+include them in process stability verification, and require `MainPID=0` when
+draining even a disabled instance that remains active.
+
+For each provisioned profile, create a root-owned mode-0600 file at
+`/etc/ai-image-factory/remote-providers/PROFILE_KEY.env` using
+`ops/systemd/dreamina-remote.env.example`. Replace every placeholder with the
+existing account/profile identity. The three profile keys in that file must
+equal its instance name: `EnvironmentFile` values override template defaults,
+including any legacy bindings in `app.env`. Keep the shared database, artifact
+root, and admission contract in `app.env`. Account HOME is shared by that
+account's image/video profiles; submit workspace, poll workspace, and journal
+directories are private, separate, and unique to each profile.
+
+Both CLI executable paths and SHA-256 values must match the verified installed
+CLI. Set `GATEWAY_MANAGED_DREAMINA_EXECUTABLE` in `app.env` to the same CLI version
+for login, quota, and model discovery. The submit runner path and digest must
+match the active release's `bin/remote-submit-runner`. On subsequent releases,
+include a changed runner digest in the protected configuration switch while
+admission is closed and consumers are drained; restore the prior configuration
+pin when recovering the prior release. Do not change a pin while work is active.
+The poller example limits concurrent artifact downloads to one independently
+of the account's generation concurrency; raise it only within profile capacity.
+
+After filling the configuration and creating its private directories as the
+application service account, enable all three instances together:
+
+```bash
+REMOTE_PROFILE=managed.dreamina.videos.PROVISIONED_SUFFIX
+REMOTE_INSTANCE="$(systemd-escape "$REMOTE_PROFILE")"
+sudo systemctl enable --now \
+  "ai-image-factory-remote-workerd@${REMOTE_INSTANCE}.service" \
+  "ai-image-factory-provider-submitd@${REMOTE_INSTANCE}.service" \
+  "ai-image-factory-provider-pollerd@${REMOTE_INSTANCE}.service"
+```
+
+Repeat for the image profile when enabling images. Existing explicitly
+configured single-instance submit/poll services remain supported; drain and
+disable those services before moving the same profile to instances. Verify
+live work, submit, and poll consumer leases, positive account capacity, bounded
+backlogs, and the ordinary full release gates before admitting traffic. Model
+visibility and a healthy CLI login alone do not prove the runtime is ready.
+
 ## Update Hooks And Recovery
 
 The fixed hooks and site admission hooks:
 
 - close public admission before mutation and reopen it only after verification;
-- stop the internal application process target and prove every enabled dynamic
-  workerd/executord is quiesced with `MainPID=0` before migration;
+- stop the internal application process target and prove every local and remote
+  consumer instance is quiesced with `MainPID=0` before migration;
 - create one PostgreSQL plus artifact recovery point;
 - activate the complete new process set;
 - check required services, Gateway health/readiness/OpenAPI, and the admin login;

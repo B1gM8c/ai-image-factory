@@ -262,6 +262,7 @@ fn parse_video_model(value: &str) -> Result<VideoModelVersion, DreaminaSubmitCom
         "seedance2.0_vip" => Ok(VideoModelVersion::Seedance2_0Vip),
         "seedance2.0fast_vip" => Ok(VideoModelVersion::Seedance2_0FastVip),
         "seedance2.0mini" => Ok(VideoModelVersion::Seedance2_0Mini),
+        "seedance2.5" => Ok(VideoModelVersion::Seedance2_5),
         _ => Err(DreaminaSubmitCommandError::UnknownOfficialOption),
     }
 }
@@ -280,6 +281,7 @@ fn parse_video_ratio(value: &str) -> Result<VideoRatio, DreaminaSubmitCommandErr
 
 fn parse_video_resolution(value: &str) -> Result<VideoResolution, DreaminaSubmitCommandError> {
     match value {
+        "480p" => Ok(VideoResolution::P480),
         "720p" => Ok(VideoResolution::P720),
         "1080p" => Ok(VideoResolution::P1080),
         "4k" => Ok(VideoResolution::K4),

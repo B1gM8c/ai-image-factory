@@ -417,7 +417,7 @@ fn media_detection_accepts_supported_image_and_video_signatures() {
 }
 
 #[test]
-fn poll_binding_accepts_only_explicitly_supported_image_models() {
+fn poll_binding_accepts_only_explicitly_supported_models_for_the_operation() {
     for model in [
         "dreamina-image-3.0",
         "dreamina-image-3.1",
@@ -434,7 +434,10 @@ fn poll_binding_accepts_only_explicitly_supported_image_models() {
     assert!(!supported_model("images.generations", "dreamina-image-5.1"));
     assert!(!supported_model("images.generations", "dreamina-image-"));
     assert!(!supported_model("images.generations", "seedance2.0"));
+    assert!(!supported_model("images.generations", "seedance2.5"));
     assert!(supported_model("videos.generations", "seedance2.0"));
+    assert!(supported_model("videos.generations", "seedance2.5"));
+    assert!(!supported_model("videos.generations", "seedance2.6"));
     assert!(!supported_model("videos.generations", "dreamina-image-5.0"));
 }
 

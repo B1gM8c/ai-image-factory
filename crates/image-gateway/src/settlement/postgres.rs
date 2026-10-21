@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use image_provider_dreamina_cli::DREAMINA_SUBMIT_COMMAND_SCHEMA;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Postgres, Transaction};
@@ -8,7 +9,7 @@ use uuid::Uuid;
 
 use super::{
     ExecutionSettlementStore, GenerationResultLookup, GenerationResultStatus, StoredVideoArtifact,
-    VideoPendingStage, VideoResultStatus, validate_generation_result,
+    VideoPendingStage, VideoRequestMetadata, VideoResultStatus, validate_generation_result,
 };
 use crate::{
     ImageGatewayError,
@@ -233,6 +234,72 @@ impl ExecutionSettlementStore for PostgresExecutionSettlementStore {
         row.map(video_result_status).transpose()
     }
 
+    async fn project_video_status_with_metadata(
+        &self,
+        tenant_id: &str,
+        project_id: &str,
+        actor_user_id: Option<Uuid>,
+        job_id: Uuid,
+    ) -> Result<Option<(VideoResultStatus, VideoRequestMetadata)>, ImageGatewayError> {
+        let row: Option<VideoStatusWithMetadataRow> = sqlx::query_as(
+            r#"
+                SELECT j.state, w.state, j.last_error_code, j.model, j.billable_units,
+                       artifact.artifact_id,
+                       payload.command_json -> 'model_version',
+                       payload.command_json -> 'video_resolution',
+                       payload.command_json -> 'ratio'
+                FROM jobs j
+                JOIN work_items w ON w.job_id = j.job_id
+                JOIN job_auth_attributions attribution
+                  ON attribution.job_id = j.job_id
+                LEFT JOIN job_payloads payload
+                  ON payload.job_id = j.job_id
+                 AND payload.command_schema = $5
+                 AND payload.command_json -> 'schema_version' = '1'::JSONB
+                 AND payload.command_json ->> 'operation' = 'text2video'
+                LEFT JOIN artifacts artifact
+                  ON artifact.job_id = j.job_id
+                 AND artifact.output_index = 0
+                 AND artifact.state = 'ready'
+                 AND artifact.media_type = 'video/mp4'
+                WHERE j.job_id = $1 AND j.tenant_id = $2
+                  AND attribution.project_id = $3
+                  AND ($4::UUID IS NULL OR attribution.actor_user_id = $4)
+                  AND j.operation = 'video_generation'
+                  AND j.economics_contract_version IN (3, 4)
+                "#,
+        )
+        .bind(job_id)
+        .bind(tenant_id)
+        .bind(project_id)
+        .bind(actor_user_id)
+        .bind(DREAMINA_SUBMIT_COMMAND_SCHEMA)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(settlement_unavailable)?;
+        row.map(
+            |(
+                job_state,
+                work_state,
+                error_code,
+                model,
+                units,
+                artifact,
+                provider_model,
+                resolution,
+                ratio,
+            )| {
+                Ok((
+                    video_result_status((
+                        job_state, work_state, error_code, model, units, artifact,
+                    ))?,
+                    video_request_metadata(provider_model, resolution, ratio),
+                ))
+            },
+        )
+        .transpose()
+    }
+
     async fn load_video_artifact(
         &self,
         tenant_id: &str,
@@ -375,6 +442,32 @@ impl ExecutionSettlementStore for PostgresExecutionSettlementStore {
 }
 
 type VideoStatusRow = (String, String, Option<String>, String, i32, Option<Uuid>);
+type VideoStatusWithMetadataRow = (
+    String,
+    String,
+    Option<String>,
+    String,
+    i32,
+    Option<Uuid>,
+    Option<serde_json::Value>,
+    Option<serde_json::Value>,
+    Option<serde_json::Value>,
+);
+
+fn video_request_metadata(
+    provider_model: Option<serde_json::Value>,
+    resolution: Option<serde_json::Value>,
+    ratio: Option<serde_json::Value>,
+) -> VideoRequestMetadata {
+    let string_value = |value: Option<serde_json::Value>| {
+        value.and_then(|value| value.as_str().map(str::to_owned))
+    };
+    VideoRequestMetadata {
+        provider_model: string_value(provider_model),
+        resolution: string_value(resolution),
+        ratio: string_value(ratio),
+    }
+}
 
 fn video_result_status(row: VideoStatusRow) -> Result<VideoResultStatus, ImageGatewayError> {
     let (job_state, work_state, error_code, model, billable_units, artifact_id) = row;
@@ -927,4 +1020,76 @@ fn quota_lock_id(tenant_id: &str) -> i64 {
 
 fn settlement_unavailable(_: impl std::fmt::Display) -> ImageGatewayError {
     ImageGatewayError::service_unavailable("execution settlement unavailable")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use image_provider_dreamina_cli::{
+        DreaminaSubmitRequestV1, TextToVideoRequestV1, VideoModelVersion, VideoRatio,
+        VideoResolution, encode_submit_command,
+    };
+
+    #[test]
+    fn video_metadata_comes_from_the_frozen_dreamina_command() {
+        for (model, resolution, duration) in [
+            (VideoModelVersion::Seedance2_0Fast, VideoResolution::P720, 5),
+            (
+                VideoModelVersion::Seedance2_0Vip,
+                VideoResolution::P1080,
+                15,
+            ),
+            (VideoModelVersion::Seedance2_5, VideoResolution::P480, 5),
+            (VideoModelVersion::Seedance2_5, VideoResolution::P1080, 30),
+        ] {
+            let request = TextToVideoRequestV1::new(
+                "an orange paper airplane",
+                model,
+                VideoRatio::R16x9,
+                duration,
+                resolution,
+            )
+            .unwrap();
+            let command: serde_json::Value = serde_json::from_slice(&encode_submit_command(
+                DreaminaSubmitRequestV1::TextToVideo(request),
+            ))
+            .unwrap();
+            assert_eq!(command["operation"], "text2video");
+            assert_eq!(command["schema_version"], 1);
+            let metadata = video_request_metadata(
+                command.get("model_version").cloned(),
+                command.get("video_resolution").cloned(),
+                command.get("ratio").cloned(),
+            );
+            assert_eq!(metadata.provider_model.as_deref(), Some(model.as_str()));
+            assert_eq!(metadata.resolution.as_deref(), Some(resolution.as_str()));
+            assert_eq!(metadata.ratio.as_deref(), Some("16:9"));
+        }
+    }
+
+    #[test]
+    fn missing_video_metadata_remains_unknown() {
+        assert_eq!(
+            video_request_metadata(None, None, None),
+            VideoRequestMetadata::default()
+        );
+    }
+
+    #[test]
+    fn unsupported_video_metadata_types_remain_unknown() {
+        for value in [json!(null), json!(480), json!(true), json!([]), json!({})] {
+            assert_eq!(
+                video_request_metadata(Some(value.clone()), Some(value.clone()), Some(value)),
+                VideoRequestMetadata::default()
+            );
+        }
+        assert_eq!(
+            video_request_metadata(Some(json!("seedance2.5")), Some(json!(480)), None),
+            VideoRequestMetadata {
+                provider_model: Some("seedance2.5".to_owned()),
+                resolution: None,
+                ratio: None,
+            }
+        );
+    }
 }

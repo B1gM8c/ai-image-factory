@@ -398,6 +398,7 @@ fn parse_video_model(value: &str) -> Result<VideoModelVersion, DreaminaAdmission
         "seedance2.0_vip" => Ok(VideoModelVersion::Seedance2_0Vip),
         "seedance2.0fast_vip" => Ok(VideoModelVersion::Seedance2_0FastVip),
         "seedance2.0mini" => Ok(VideoModelVersion::Seedance2_0Mini),
+        "seedance2.5" => Ok(VideoModelVersion::Seedance2_5),
         _ => Err(DreaminaAdmissionError::InvalidModel),
     }
 }
@@ -416,6 +417,7 @@ fn parse_video_ratio(value: &str) -> Result<VideoRatio, DreaminaAdmissionError> 
 
 fn parse_video_resolution(value: &str) -> Result<VideoResolution, DreaminaAdmissionError> {
     match value {
+        "480p" => Ok(VideoResolution::P480),
         "720p" => Ok(VideoResolution::P720),
         "1080p" => Ok(VideoResolution::P1080),
         "4k" => Ok(VideoResolution::K4),
@@ -494,5 +496,27 @@ mod tests {
             crate::admission::attach_operation(&attach).unwrap(),
             VIDEO_GENERATION_OPERATION
         );
+    }
+
+    #[test]
+    fn seedance_25_admission_freezes_the_requested_video_specification() {
+        let request = DreaminaVideoGenerationRequest {
+            prompt: "a paper airplane".to_owned(),
+            model_version: Some("seedance2.5".to_owned()),
+            ratio: Some("16:9".to_owned()),
+            duration: Some(5),
+            video_resolution: "480p".to_owned(),
+        };
+        let plan = DreaminaVideoAdmissionPlan::new(request).unwrap();
+        assert_eq!(plan.provider_model_id(), "seedance2.5");
+        assert_eq!(plan.duration(), 5);
+        assert_eq!(plan.resolution(), "480p");
+        assert_eq!(plan.pricing_dimensions()["ratio"], "16:9");
+        let command =
+            parse_submit_command(&serde_json::to_vec(&plan.provider_command).unwrap()).unwrap();
+        let DreaminaSubmitRequestV1::TextToVideo(request) = command else {
+            panic!("video admission must preserve the video command");
+        };
+        assert_eq!(request.model().as_str(), "seedance2.5");
     }
 }

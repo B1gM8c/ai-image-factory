@@ -68,10 +68,9 @@ else
   done
   while IFS= read -r unit; do
     case "$unit" in
-      ai-image-factory-executord@*.service)
-        systemctl is-enabled --quiet "$unit" && append_required_unit "$unit"
-        ;;
-      ai-image-factory-workerd@*.service)
+      ai-image-factory-executord@*.service | ai-image-factory-workerd@*.service | \
+        ai-image-factory-remote-workerd@*.service | ai-image-factory-provider-submitd@*.service | \
+        ai-image-factory-provider-pollerd@*.service)
         systemctl is-enabled --quiet "$unit" && append_required_unit "$unit"
         ;;
     esac

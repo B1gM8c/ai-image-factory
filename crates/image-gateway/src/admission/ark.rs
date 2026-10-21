@@ -274,7 +274,9 @@ fn ark_image_model(model: &str) -> Result<&'static str, ArkAdmissionError> {
 }
 
 fn ark_video_model(model: &str) -> Result<&'static str, ArkAdmissionError> {
-    if model_matches(model, "doubao-seedance-2-0-fast") {
+    if model_matches(model, "doubao-seedance-2-5") {
+        Ok("seedance2.5")
+    } else if model_matches(model, "doubao-seedance-2-0-fast") {
         Ok("seedance2.0fast")
     } else if model_matches(model, "doubao-seedance-2-0-mini") {
         Ok("seedance2.0mini")
@@ -446,5 +448,39 @@ mod tests {
             ArkVideoAdmissionPlan::new(request).unwrap_err(),
             ArkAdmissionError::Unsupported("content")
         );
+    }
+
+    #[test]
+    fn seedance_25_aliases_preserve_requested_video_specifications() {
+        for model in ["doubao-seedance-2-5", "doubao-seedance-2-5-260628"] {
+            let request = serde_json::from_value(serde_json::json!({
+                "model": model,
+                "content": [{"type": "text", "text": "an orange paper airplane"}],
+                "resolution": "480p",
+                "ratio": "16:9",
+                "duration": 5
+            }))
+            .unwrap();
+            let plan = ArkVideoAdmissionPlan::new(request).unwrap();
+            assert_eq!(plan.public_model(), model);
+            assert_eq!(plan.provider_model(), "seedance2.5");
+            assert_eq!(plan.duration(), 5);
+            assert_eq!(plan.pricing_dimensions()["resolution"], "480p");
+            assert_eq!(plan.pricing_dimensions()["ratio"], "16:9");
+        }
+    }
+
+    #[test]
+    fn seedance_25_ark_alias_rejects_unknown_suffixes() {
+        for model in [
+            "doubao-seedance-2-50",
+            "doubao-seedance-2-5-fast",
+            "doubao-seedance-2-5-260628-extra",
+        ] {
+            assert_eq!(
+                ark_video_model(model),
+                Err(ArkAdmissionError::InvalidValue("model"))
+            );
+        }
     }
 }

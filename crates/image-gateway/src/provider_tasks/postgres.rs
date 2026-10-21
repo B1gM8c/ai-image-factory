@@ -4818,7 +4818,7 @@ fn validate_observation(value: &ProviderTaskObservation) -> Result<(), ProviderT
                 && (1..=268_435_456).contains(&publication.byte_size)
                 && matches!(
                     publication.media_type.as_str(),
-                    "image/png" | "image/jpeg" | "image/webp"
+                    "image/png" | "image/jpeg" | "image/webp" | "video/mp4"
                 )
         }
         ProviderTaskObservationOutcome::Failed { error_code }
@@ -4844,6 +4844,8 @@ fn validate_artifact_observation_binding(
     };
     if publication.manifest.manifest_id() != lease.task.submission_id
         || publication.manifest.artifact_authority_id() != lease.task.executor_execution_id
+        || (lease.context().operation_id() == "videos.generations")
+            != (publication.media_type == "video/mp4")
     {
         return Err(ProviderTaskStoreError::InvalidInput);
     }
@@ -5011,6 +5013,95 @@ fn map_executor_error(error: ExecutorSubmissionError) -> ProviderTaskStoreError 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn artifact_observation_accepts_mp4_only_for_video_operations() {
+        let mut lease = artifact_test_lease();
+        for operation in ["images.generations", "images.edits", "videos.generations"] {
+            lease.context.operation_id = operation.to_owned();
+            for media_type in ["image/png", "image/jpeg", "image/webp", "video/mp4"] {
+                let observation = ProviderTaskObservation {
+                    event_identity: "poll-artifact".to_owned(),
+                    source: ProviderTaskObservationSource::Poll,
+                    outcome: ProviderTaskObservationOutcome::ArtifactReady {
+                        artifact_ref: format!("manifest:{}", lease.task.submission_id.simple()),
+                        publication: ProviderArtifactPublication {
+                            manifest: ExecutorResultManifest::new(
+                                lease.task.submission_id,
+                                lease.task.executor_execution_id,
+                            )
+                            .unwrap(),
+                            sha256_hex: "a".repeat(64),
+                            byte_size: 1024,
+                            media_type: media_type.to_owned(),
+                        },
+                    },
+                };
+                assert_eq!(validate_observation(&observation), Ok(()));
+                let expected = if (operation == "videos.generations") == (media_type == "video/mp4")
+                {
+                    Ok(())
+                } else {
+                    Err(ProviderTaskStoreError::InvalidInput)
+                };
+                assert_eq!(
+                    validate_artifact_observation_binding(&lease, &observation),
+                    expected,
+                    "{operation}: {media_type}",
+                );
+            }
+        }
+    }
+
+    fn artifact_test_lease() -> ProviderTaskLease {
+        ProviderTaskLease {
+            task: ProviderRemoteTask {
+                submission_id: Uuid::from_u128(1),
+                executor_execution_id: Uuid::from_u128(2),
+                provider_id: "dreamina-cli".to_owned(),
+                provider_account_id: Uuid::from_u128(3),
+                remote_operation_id: "artifact-test".to_owned(),
+                provider_request_id: None,
+                state: ProviderTaskState::ProviderWaiting,
+                artifact_ref: None,
+                error_code: None,
+                next_poll_at_ms: Some(1),
+                cancel_requested: false,
+                poll_lease_epoch: 1,
+            },
+            context: ProviderExecutionContext {
+                model: "seedance2.5".to_owned(),
+                command_schema: "dreamina-cli.submit.v1".to_owned(),
+                command_hash: "a".repeat(64),
+                operation_id: "videos.generations".to_owned(),
+                operation_descriptor_revision: "test/videos.generations/v1".to_owned(),
+                operation_descriptor_sha256_v1: "b".repeat(64),
+                completion_mode: "remote_task".to_owned(),
+                idempotency_mode: "submission_bound".to_owned(),
+                operation_binding_version: 2,
+                execution_profile_id: Uuid::from_u128(4),
+                adapter_revision: "test-adapter-v1".to_owned(),
+                credential_pool_id: Uuid::from_u128(5),
+                credential_ref: "private:artifact-test".to_owned(),
+                credential_revision: 1,
+                credential_auth_sha256: "c".repeat(64),
+                resource_policy_id: Uuid::from_u128(6),
+                resource_policy_revision: 1,
+                submission_idempotency_key: "artifact-test".to_owned(),
+                provider_command_sha256: "d".repeat(64),
+                execution_binding_sha256: "e".repeat(64),
+                invocation_attempt: 1,
+                provider_timeout_ms: 60_000,
+                provider_deadline_at_ms: 9_999_999_999_999,
+            },
+            committed_artifact: None,
+            remaining_budget_ms: 60_000,
+            poll_owner: "artifact-test-poll".to_owned(),
+            poll_lease_epoch: 1,
+            poll_lease_expires_at_ms: 9_999_999_999_999,
+            authority_seal: [0; 32],
+        }
+    }
 
     #[test]
     fn elapsed_deadline_has_zero_remaining_budget() {

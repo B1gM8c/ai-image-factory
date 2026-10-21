@@ -1,11 +1,12 @@
 use std::{
-    collections::HashSet,
+    collections::{BTreeMap, HashSet},
     path::{Path, PathBuf},
     process::Stdio,
     sync::{Arc, LazyLock},
     time::Duration,
 };
 
+use futures_util::{StreamExt, TryStreamExt, stream};
 use serde::Serialize;
 use serde_json::{Value, json};
 use sqlx::{FromRow, PgPool, Postgres, Transaction};
@@ -23,6 +24,17 @@ const MAX_DISCOVERY_OUTPUT_BYTES: usize = 256 * 1024;
 const CODEX_PROVIDER_ID: &str = "openai-codex";
 const GROK_PROVIDER_ID: &str = "grok-cli";
 const DREAMINA_PROVIDER_ID: &str = "dreamina-cli";
+const DREAMINA_HELP_CONCURRENCY: usize = 2;
+const DREAMINA_WORKFLOWS: &[(&str, &str)] = &[
+    ("text2image", "image"),
+    ("image2image", "image"),
+    ("image_upscale", "image"),
+    ("text2video", "video"),
+    ("image2video", "video"),
+    ("frames2video", "video"),
+    ("multiframe2video", "video"),
+    ("multimodal2video", "video"),
+];
 static MODEL_DISCOVERY_LIMIT: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(4));
 
 #[derive(Clone)]
@@ -273,6 +285,20 @@ const ADAPTER_MODELS: &[AdapterModel] = &[
         "image",
         &["images.generations"],
     ),
+    catalog_only_model(
+        DREAMINA_PROVIDER_ID,
+        "seedance1.0fast",
+        "Seedance 1.0 Fast",
+        "video",
+        &["videos.generations"],
+    ),
+    catalog_only_model(
+        DREAMINA_PROVIDER_ID,
+        "seedance1.5pro",
+        "Seedance 1.5 Pro",
+        "video",
+        &["videos.generations"],
+    ),
     adapter_model(
         DREAMINA_PROVIDER_ID,
         "seedance2.0",
@@ -305,6 +331,13 @@ const ADAPTER_MODELS: &[AdapterModel] = &[
         DREAMINA_PROVIDER_ID,
         "seedance2.0mini",
         "Seedance 2.0 Mini",
+        "video",
+        &["videos.generations"],
+    ),
+    adapter_model(
+        DREAMINA_PROVIDER_ID,
+        "seedance2.5",
+        "Seedance 2.5",
         "video",
         &["videos.generations"],
     ),
@@ -1120,42 +1153,68 @@ async fn discover(
                 .dreamina
                 .as_ref()
                 .ok_or(DiscoveryFailure("dreamina_cli_unavailable"))?;
-            let image_help =
-                command_text(executable, home, provider_id, &["text2image", "--help"]).await?;
-            let video_help =
-                command_text(executable, home, provider_id, &["text2video", "--help"]).await?;
-            let mut models = parse_model_versions(&image_help)
-                .into_iter()
-                .map(|model_id| DiscoveredModel {
-                    model_id,
-                    media_kind: "image",
-                    source_kind: "cli_help",
-                    metadata: json!({"command": "text2image"}),
+            let help_commands = DREAMINA_WORKFLOWS
+                .iter()
+                .map(|&(command, media_kind)| async move {
+                    command_text(executable, home, provider_id, &[command, "--help"])
+                        .await
+                        .map(|output| (command, media_kind, output))
                 })
                 .collect::<Vec<_>>();
-            models.extend(
-                parse_model_versions(&video_help)
-                    .into_iter()
-                    .map(|model_id| DiscoveredModel {
-                        model_id,
-                        media_kind: "video",
-                        source_kind: "cli_help",
-                        metadata: json!({"command": "text2video"}),
-                    }),
-            );
-            if models.is_empty() {
-                return Err(DiscoveryFailure("dreamina_models_unavailable"));
-            }
+            let help = stream::iter(help_commands)
+                .buffered(DREAMINA_HELP_CONCURRENCY)
+                .try_collect::<Vec<_>>()
+                .await?;
+            let models = dreamina_discovery_models(help)?;
             let version = command_text(executable, home, provider_id, &["--version"])
                 .await
                 .ok();
             Ok(DiscoveryResult {
                 models,
-                cli_version: version.as_deref().map(first_line),
+                cli_version: version.as_deref().map(dreamina_cli_version),
             })
         }
         _ => Err(DiscoveryFailure("provider_model_discovery_unsupported")),
     }
+}
+
+fn dreamina_discovery_models(
+    help: Vec<(&'static str, &'static str, String)>,
+) -> Result<Vec<DiscoveredModel>, DiscoveryFailure> {
+    let mut commands_by_model = BTreeMap::<(&str, String), Vec<&str>>::new();
+    for (command, media_kind, output) in help {
+        // These workflows have fixed, unpublished model IDs. They are not model aliases.
+        if matches!(command, "image_upscale" | "multiframe2video") {
+            continue;
+        }
+        let versions = parse_model_versions(&output);
+        if versions.is_empty() {
+            return Err(DiscoveryFailure("dreamina_models_unavailable"));
+        }
+        for model_id in versions {
+            let commands = commands_by_model.entry((media_kind, model_id)).or_default();
+            if !commands.contains(&command) {
+                commands.push(command);
+            }
+        }
+    }
+    Ok(commands_by_model
+        .into_iter()
+        .map(|((media_kind, model_id), commands)| DiscoveredModel {
+            model_id,
+            media_kind,
+            source_kind: "cli_help",
+            metadata: json!({"commands": commands}),
+        })
+        .collect())
+}
+
+fn dreamina_cli_version(output: &str) -> String {
+    serde_json::from_str::<Value>(output)
+        .ok()
+        .and_then(|value| value.get("version")?.as_str().map(first_line))
+        .filter(|version| !version.is_empty())
+        .unwrap_or_else(|| first_line(output))
 }
 
 fn contract_discovery(provider_id: &str, cli_version: Option<String>) -> DiscoveryResult {
@@ -1230,13 +1289,22 @@ async fn mark_failed(pool: &PgPool, refresh_id: Uuid, code: &str) {
 }
 
 fn parse_model_versions(output: &str) -> Vec<String> {
-    let Some(values) = output
-        .lines()
-        .find_map(|line| line.trim().strip_prefix("- model_version:"))
-    else {
+    let Some(values) = output.lines().find_map(|line| {
+        let line = line.trim();
+        line.strip_prefix("- model_version:")
+            .or_else(|| line.strip_prefix("- model_version values:"))
+            .or_else(|| {
+                line.strip_prefix("--model_version string")?
+                    .trim_start()
+                    .strip_prefix("supported values:")
+            })
+    }) else {
         return Vec::new();
     };
     values
+        .split(';')
+        .next()
+        .unwrap_or_default()
         .split(',')
         .map(str::trim)
         .filter(|value| valid_model_id(value))
@@ -1445,8 +1513,9 @@ fn store_unavailable(_: impl std::fmt::Display) -> ImageGatewayError {
 #[cfg(test)]
 mod tests {
     use super::{
-        CODEX_PROVIDER_ID, ProviderModelRow, model_view, parse_model_versions,
-        provider_model_contract_metadata,
+        CODEX_PROVIDER_ID, DREAMINA_PROVIDER_ID, DREAMINA_WORKFLOWS, ProviderModelRow,
+        dreamina_cli_version, dreamina_discovery_models, find_adapter_model, model_view,
+        parse_model_versions, provider_model_contract_metadata,
     };
     use image_provider_contracts::{SpatialEditMode, openai_codex};
 
@@ -1464,6 +1533,138 @@ mod tests {
             parse_model_versions("- model_version: ok, bad/model"),
             ["ok"]
         );
+    }
+
+    #[test]
+    fn dreamina_parses_image_and_multimodal_video_help_formats() {
+        assert_eq!(
+            parse_model_versions(
+                "- model_version values: seedance1.0fast, seedance1.5pro, seedance2.5"
+            ),
+            ["seedance1.0fast", "seedance1.5pro", "seedance2.5"]
+        );
+        assert_eq!(
+            parse_model_versions(
+                "      --model_version string      supported values: seedance2.0, seedance2.5; default: seedance2.0_vip"
+            ),
+            ["seedance2.0", "seedance2.5"]
+        );
+        assert!(parse_model_versions("--ratio string supported values: 1:1, 16:9").is_empty());
+    }
+
+    #[test]
+    fn dreamina_discovery_unions_models_and_preserves_each_workflow() {
+        // Model declarations from CLI 1.4.21; the two fixed workflows expose no ID.
+        let output = [
+            "- model_version: 3.0, 3.1, 4.0, 4.1, 4.5, 4.6, 4.7, 5.0, 5.0Pro",
+            "- model_version: 4.0, 4.1, 4.5, 4.6, 4.7, 5.0, 5.0Pro",
+            "Usage: dreamina image_upscale [flags]",
+            "- model_version: seedance2.0, seedance2.0fast, seedance2.0_vip, seedance2.0fast_vip, seedance2.0mini, seedance2.5",
+            "- model_version values: seedance1.0fast, seedance1.5pro, seedance2.0, seedance2.0fast, seedance2.0_vip, seedance2.0fast_vip, seedance2.0mini, seedance2.5",
+            "- model_version: seedance1.5pro, seedance2.0, seedance2.0fast, seedance2.0_vip, seedance2.0fast_vip, seedance2.0mini, seedance2.5",
+            "The model is fixed and is not configurable.",
+            "--model_version string supported values: seedance2.0, seedance2.0fast, seedance2.0_vip, seedance2.0fast_vip, seedance2.0mini, seedance2.5",
+        ];
+        assert_eq!(DREAMINA_WORKFLOWS.len(), output.len());
+        let help = DREAMINA_WORKFLOWS
+            .iter()
+            .zip(output)
+            .map(|(&(command, media_kind), output)| (command, media_kind, output.to_owned()))
+            .collect();
+        let models = dreamina_discovery_models(help).expect("all declared model lists parse");
+        assert_eq!(models.len(), 17);
+        assert_eq!(
+            models
+                .iter()
+                .filter(|model| model.media_kind == "image")
+                .count(),
+            9
+        );
+        assert_eq!(
+            models
+                .iter()
+                .filter(|model| model.media_kind == "video")
+                .count(),
+            8
+        );
+        for model in &models {
+            let expected_commands = match model.model_id.as_str() {
+                "3.0" | "3.1" => vec!["text2image"],
+                "seedance1.0fast" => vec!["image2video"],
+                "seedance1.5pro" => vec!["image2video", "frames2video"],
+                _ if model.media_kind == "image" => vec!["text2image", "image2image"],
+                _ => vec![
+                    "text2video",
+                    "image2video",
+                    "frames2video",
+                    "multimodal2video",
+                ],
+            };
+            assert_eq!(
+                model.metadata["commands"],
+                serde_json::json!(expected_commands)
+            );
+            assert_eq!(model.source_kind, "cli_help");
+        }
+    }
+
+    #[test]
+    fn dreamina_discovery_rejects_a_partial_catalog() {
+        let failure = dreamina_discovery_models(vec![
+            ("text2image", "image", "- model_version: 5.0".to_owned()),
+            (
+                "image2video",
+                "video",
+                "unrecognized help format".to_owned(),
+            ),
+        ]);
+        assert!(matches!(
+            failure,
+            Err(super::DiscoveryFailure("dreamina_models_unavailable"))
+        ));
+    }
+
+    #[test]
+    fn dreamina_legacy_video_models_remain_catalog_only() {
+        for model_id in ["seedance1.0fast", "seedance1.5pro"] {
+            let model = find_adapter_model(DREAMINA_PROVIDER_ID, model_id, "video")
+                .expect("legacy model appears in the catalog");
+            assert!(!model.execution_verified);
+            let view = model_view(ProviderModelRow {
+                provider_id: DREAMINA_PROVIDER_ID.to_owned(),
+                model_id: model_id.to_owned(),
+                display_name: model.display_name.to_owned(),
+                media_kind: "video".to_owned(),
+                operation_ids: vec!["videos.generations".to_owned()],
+                source_kind: "cli_help".to_owned(),
+                adapter_state: "discovered".to_owned(),
+                lifecycle_state: "disabled".to_owned(),
+                observed_account_count: 1,
+                routable_account_count: 1,
+                latest_cli_version: Some("1.4.21".to_owned()),
+                last_observed_at_ms: Some(1),
+                last_successful_refresh_at_ms: Some(1),
+            });
+            assert_eq!(view.availability, "not_supported");
+        }
+    }
+
+    #[test]
+    fn dreamina_seedance25_is_supported_only_for_video_generation() {
+        let model = find_adapter_model(DREAMINA_PROVIDER_ID, "seedance2.5", "video")
+            .expect("Seedance 2.5 adapter is registered");
+        assert!(model.execution_verified);
+        assert_eq!(model.operation_ids, ["videos.generations"]);
+        assert!(find_adapter_model(DREAMINA_PROVIDER_ID, "seedance2.5", "image").is_none());
+    }
+
+    #[test]
+    fn dreamina_discovery_reads_the_official_json_version() {
+        assert_eq!(
+            dreamina_cli_version(r#"{"version":"1.4.21","commit":"fixture"}"#),
+            "1.4.21"
+        );
+        assert_eq!(dreamina_cli_version("1.4.15\nlegacy build"), "1.4.15");
     }
 
     #[test]

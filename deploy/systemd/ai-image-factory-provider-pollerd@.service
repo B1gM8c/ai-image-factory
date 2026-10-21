@@ -1,0 +1,37 @@
+[Unit]
+Description=AI Image Factory remote provider poller for profile %i
+PartOf=ai-image-factory-processes.target
+Requires=ai-image-factory-recovery-gate.service
+After=network-online.target ai-image-factory-recovery-gate.service ai-image-factory-remote-workerd@%i.service ai-image-factory-provider-submitd@%i.service
+Before=ai-image-factory-gateway.service
+
+[Service]
+Type=simple
+User=ai-image-factory
+Group=ai-image-factory
+EnvironmentFile=/etc/ai-image-factory/app.env
+EnvironmentFile=/etc/ai-image-factory/remote-providers/%I.env
+Environment=PROVIDER_POLLER_PROFILE_KEY=%I
+WorkingDirectory=/opt/ai-image-factory/current
+ExecStart=/opt/ai-image-factory/current/bin/provider-pollerd
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=10min
+KillMode=mixed
+UMask=0077
+NoNewPrivileges=yes
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectControlGroups=yes
+ProtectHome=yes
+ProtectKernelLogs=yes
+ProtectKernelTunables=yes
+ProtectSystem=strict
+ReadOnlyPaths=/opt/ai-image-factory/current
+ReadWritePaths=/var/lib/ai-image-factory
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictSUIDSGID=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=ai-image-factory-processes.target

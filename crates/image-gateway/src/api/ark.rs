@@ -24,7 +24,7 @@ use crate::{
     artifacts::StoredGenerationResult,
     auth::{ApiKeyCapability, AuthContext},
     model_routing::ResolvedModelRoute,
-    settlement::VideoResultStatus,
+    settlement::{VideoRequestMetadata, VideoResultStatus},
 };
 
 use super::{
@@ -327,9 +327,9 @@ pub(super) async fn get_content_task(
     let auth = authenticate_image_request(&headers, &state).await?;
     auth.require_api_key_capability(ApiKeyCapability::VideosRead)?;
     let job_id = parse_task_id(&task_id)?;
-    let status = state
+    let (status, metadata) = state
         .settlement_store
-        .project_video_status(
+        .project_video_status_with_metadata(
             &auth.tenant_id,
             &auth.project_id,
             auth.actor_user_id,
@@ -337,7 +337,7 @@ pub(super) async fn get_content_task(
         )
         .await?
         .ok_or_else(task_not_found)?;
-    Ok(Json(ark_video_task(job_id, status)))
+    Ok(Json(ark_video_task(job_id, status, metadata)))
 }
 
 fn ark_image_response(
@@ -377,9 +377,13 @@ fn ark_image_response(
     })
 }
 
-fn ark_video_task(id: Uuid, status: VideoResultStatus) -> ArkContentGenerationTask {
+fn ark_video_task(
+    id: Uuid,
+    status: VideoResultStatus,
+    metadata: VideoRequestMetadata,
+) -> ArkContentGenerationTask {
     let public_id = public_task_id(id);
-    match status {
+    let mut task = match status {
         VideoResultStatus::Pending {
             model, duration, ..
         }
@@ -391,7 +395,7 @@ fn ark_video_task(id: Uuid, status: VideoResultStatus) -> ArkContentGenerationTa
             content: None,
             usage: None,
             duration: Some(duration),
-            resolution: Some("720p".to_owned()),
+            resolution: None,
             ratio: None,
         },
         VideoResultStatus::Succeeded {
@@ -410,7 +414,7 @@ fn ark_video_task(id: Uuid, status: VideoResultStatus) -> ArkContentGenerationTa
             }),
             usage: None,
             duration: Some(duration),
-            resolution: Some("720p".to_owned()),
+            resolution: None,
             ratio: None,
         },
         VideoResultStatus::Failed {
@@ -428,10 +432,16 @@ fn ark_video_task(id: Uuid, status: VideoResultStatus) -> ArkContentGenerationTa
             content: None,
             usage: None,
             duration: Some(duration),
-            resolution: Some("720p".to_owned()),
+            resolution: None,
             ratio: None,
         },
+    };
+    if let Some(model) = metadata.provider_model {
+        task.model = public_video_model(&model).to_owned();
     }
+    task.resolution = metadata.resolution;
+    task.ratio = metadata.ratio;
+    task
 }
 
 fn public_video_model(provider_model: &str) -> &str {
@@ -439,6 +449,7 @@ fn public_video_model(provider_model: &str) -> &str {
         "seedance2.0" => "doubao-seedance-2-0-260128",
         "seedance2.0fast" => "doubao-seedance-2-0-fast-260128",
         "seedance2.0mini" => "doubao-seedance-2-0-mini-260128",
+        "seedance2.5" => "doubao-seedance-2-5-260628",
         other => other,
     }
 }
@@ -472,6 +483,7 @@ fn ark_video_model_for_provider(provider_model: &str) -> Option<&'static str> {
         "seedance2.0" => Some("doubao-seedance-2-0-260128"),
         "seedance2.0fast" => Some("doubao-seedance-2-0-fast-260128"),
         "seedance2.0mini" => Some("doubao-seedance-2-0-mini-260128"),
+        "seedance2.5" => Some("doubao-seedance-2-5-260628"),
         _ => None,
     }
 }
@@ -580,5 +592,72 @@ mod tests {
         let public = public_task_id(id);
         assert!(public.starts_with("cgt-"));
         assert_eq!(parse_task_id(&public).unwrap(), id);
+    }
+
+    #[test]
+    fn ark_video_query_preserves_frozen_seedance_25_specs_in_every_state() {
+        let artifact_id = Uuid::new_v4();
+        let statuses = [
+            VideoResultStatus::Pending {
+                model: "execution-model-id".to_owned(),
+                duration: 5,
+                stage: crate::settlement::VideoPendingStage::Queued,
+            },
+            VideoResultStatus::Uncertain {
+                model: "execution-model-id".to_owned(),
+                duration: 5,
+            },
+            VideoResultStatus::Succeeded {
+                model: "execution-model-id".to_owned(),
+                duration: 5,
+                artifact_id,
+            },
+            VideoResultStatus::Failed {
+                model: "execution-model-id".to_owned(),
+                duration: 5,
+                error_code: Some("generation_failed".to_owned()),
+            },
+        ];
+        for status in statuses {
+            let response = ark_video_task(
+                Uuid::new_v4(),
+                status,
+                VideoRequestMetadata {
+                    provider_model: Some("seedance2.5".to_owned()),
+                    resolution: Some("480p".to_owned()),
+                    ratio: Some("16:9".to_owned()),
+                },
+            );
+            assert_eq!(response.model, "doubao-seedance-2-5-260628");
+            assert_eq!(response.resolution.as_deref(), Some("480p"));
+            assert_eq!(response.ratio.as_deref(), Some("16:9"));
+            assert_eq!(response.duration, Some(5));
+            if response.status == "succeeded" {
+                assert_eq!(
+                    response.content.unwrap().video_url.as_deref(),
+                    Some(format!("/api/v3/files/{artifact_id}/content").as_str())
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ark_video_query_does_not_invent_missing_legacy_specifications() {
+        let response = ark_video_task(
+            Uuid::new_v4(),
+            VideoResultStatus::Pending {
+                model: "seedance2.0fast".to_owned(),
+                duration: 5,
+                stage: crate::settlement::VideoPendingStage::Processing,
+            },
+            VideoRequestMetadata::default(),
+        );
+        assert_eq!(response.model, "doubao-seedance-2-0-fast-260128");
+        assert!(response.resolution.is_none());
+        assert!(response.ratio.is_none());
+        assert_eq!(
+            ark_video_model_for_provider("seedance2.5"),
+            Some("doubao-seedance-2-5-260628")
+        );
     }
 }
