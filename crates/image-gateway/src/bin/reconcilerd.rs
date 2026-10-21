@@ -28,6 +28,8 @@ const DEFAULT_IDENTITY_THROTTLE_RETENTION_MS: u64 = 24 * 60 * 60_000;
 const DEFAULT_IDENTITY_AUDIT_RETENTION_MS: u64 = 180 * 24 * 60 * 60_000;
 const PROVIDER_UPLOAD_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
 const PROVIDER_ROUTE_RECONCILE_INTERVAL: Duration = Duration::from_secs(60);
+const RUNNER_PAYLOAD_CLEANUP_INTERVAL: Duration = Duration::from_secs(30);
+const RUNNER_OUTPUT_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Copy)]
 struct ReconcileConfig {
@@ -111,12 +113,19 @@ async fn main() -> Result<(), ImageGatewayError> {
             "RECONCILER_RUNNER_ROOT must be absolute",
         ));
     }
-    let mut runner_retention = gpt_image_2_gateway::runner::RunnerOutputRetention::default();
-    let mut next_runner_cleanup = tokio::time::Instant::now();
     tracing::info!(
         enabled = runner_root.is_some(),
-        "successful runner output retention configured"
+        "runner payload retention configured"
     );
+    let (runner_shutdown, runner_shutdown_receiver) = tokio::sync::watch::channel(false);
+    let runner_cleanup = runner_root.map(|root| {
+        tokio::spawn(run_runner_cleanup(
+            pool.clone(),
+            root,
+            batch_size,
+            runner_shutdown_receiver,
+        ))
+    });
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
     tracing::info!(batch_size, "reconcilerd started");
@@ -132,19 +141,15 @@ async fn main() -> Result<(), ImageGatewayError> {
                 &owner,
                 reconcile_config,
             ) => {
-                let (core_result, executor_result, artifact_result) = result;
+                let (core_result, executor_result, artifact_result, input_result) = result;
                 match core_result {
-                Ok((work, orphan, input)) => {
+                Ok((work, orphan)) => {
                     if work.requeued > 0 || work.uncertain > 0 || orphan.orphaned > 0
-                        || input.claimed > 0
                     {
                         tracing::info!(
                             requeued = work.requeued,
                             uncertain = work.uncertain,
                             orphaned = orphan.orphaned,
-                            input_cleanup_claimed = input.claimed,
-                            input_cleanup_completed = input.completed,
-                            input_cleanup_failed = input.failed,
                             "durable state reconciled"
                         );
                     }
@@ -177,19 +182,21 @@ async fn main() -> Result<(), ImageGatewayError> {
                         tracing::error!(error = ?error, "artifact retention reconciliation failed");
                     }
                 }
-            },
-        }
-        if tokio::time::Instant::now() >= next_runner_cleanup {
-            if let Some(root) = &runner_root {
-                match runner_retention.reconcile(&pool, root, batch_size).await {
-                    Ok(bytes) if bytes > 0 => {
-                        tracing::info!(bytes, "successful runner outputs reclaimed")
+                match input_result {
+                    Ok(input) if input.claimed > 0 => {
+                        tracing::info!(
+                            input_cleanup_claimed = input.claimed,
+                            input_cleanup_completed = input.completed,
+                            input_cleanup_failed = input.failed,
+                            "input cleanup reconciled"
+                        );
                     }
                     Ok(_) => {}
-                    Err(error) => tracing::error!(?error, "runner output retention failed"),
+                    Err(error) => {
+                        tracing::error!(error = ?error, "input cleanup reconciliation failed");
+                    }
                 }
-            }
-            next_runner_cleanup = tokio::time::Instant::now() + Duration::from_secs(60);
+            },
         }
         if tokio::time::Instant::now() >= next_identity_maintenance {
             match identity_maintenance
@@ -244,8 +251,67 @@ async fn main() -> Result<(), ImageGatewayError> {
             _ = tokio::time::sleep(interval) => {}
         }
     }
+    let _ = runner_shutdown.send(true);
+    if let Some(cleanup) = runner_cleanup {
+        if let Err(error) = cleanup.await {
+            tracing::error!(?error, "runner payload retention task stopped unexpectedly");
+        }
+    }
     telemetry.shutdown();
     Ok(())
+}
+
+// Keep execution-local cleanup independent of work reconciliation failures or delays.
+// A running filesystem cleanup finishes under its lock before this task acknowledges shutdown.
+async fn run_runner_cleanup(
+    pool: sqlx::PgPool,
+    root: std::path::PathBuf,
+    batch_size: u32,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    let mut retention = gpt_image_2_gateway::runner::RunnerOutputRetention::default();
+    let mut interval = tokio::time::interval(RUNNER_PAYLOAD_CLEANUP_INTERVAL);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut next_output_cleanup = tokio::time::Instant::now();
+    loop {
+        tokio::select! {
+            biased;
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    break;
+                }
+            }
+            _ = interval.tick() => {
+                match retention.reconcile_completed(&pool, &root, batch_size).await {
+                    Ok(outcome) if outcome.candidates > 0 || outcome.pending > 0 => {
+                        tracing::info!(
+                            candidates = outcome.candidates,
+                            reclaimed = outcome.reclaimed,
+                            blocked = outcome.blocked,
+                            deleted_bytes = outcome.deleted_bytes,
+                            pending = outcome.pending,
+                            blocked_pending = outcome.blocked_pending,
+                            oldest_pending_age_ms = outcome.oldest_pending_age_ms,
+                            "completed runner payload cleanup reconciled"
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(error) => tracing::error!(?error, "completed runner payload cleanup failed"),
+                }
+                // Retain the former conservative output-only path for legacy terminal rows.
+                if tokio::time::Instant::now() >= next_output_cleanup {
+                    match retention.reconcile(&pool, &root, batch_size).await {
+                        Ok(bytes) if bytes > 0 => {
+                            tracing::info!(deleted_bytes = bytes, "legacy runner outputs reclaimed");
+                        }
+                        Ok(_) => {}
+                        Err(error) => tracing::error!(?error, "legacy runner output retention failed"),
+                    }
+                    next_output_cleanup = tokio::time::Instant::now() + RUNNER_OUTPUT_CLEANUP_INTERVAL;
+                }
+            }
+        }
+    }
 }
 
 fn identity_maintenance_config(
@@ -298,15 +364,15 @@ async fn reconcile_all(
         (
             gpt_image_2_gateway::ReconciliationOutcome,
             gpt_image_2_gateway::ReconciliationOutcome,
-            gpt_image_2_gateway::InputCleanupOutcome,
         ),
         ImageGatewayError,
     >,
     Result<u64, gpt_image_2_gateway::ExecutorSubmissionError>,
     Result<gpt_image_2_gateway::ArtifactRetentionOutcome, ImageGatewayError>,
+    Result<gpt_image_2_gateway::InputCleanupOutcome, ImageGatewayError>,
 ) {
     let executor = executor_reconciler.reconcile_expired(config.batch_size);
-    let core = reconcile_core(reconciler, blobs, owner, config);
+    let core = reconcile_core(reconciler, config);
     let artifacts = reconcile_artifact_retention(
         artifact_retention,
         blobs,
@@ -314,27 +380,6 @@ async fn reconcile_all(
         config.artifact_cleanup_lease_ms,
         config.batch_size,
     );
-    let (core, executor, artifacts) = tokio::join!(core, executor, artifacts);
-    (core, executor, artifacts)
-}
-
-async fn reconcile_core(
-    reconciler: &PostgresReconciliationStore,
-    blobs: &FilesystemArtifactBlobStore,
-    owner: &str,
-    config: ReconcileConfig,
-) -> Result<
-    (
-        gpt_image_2_gateway::ReconciliationOutcome,
-        gpt_image_2_gateway::ReconciliationOutcome,
-        gpt_image_2_gateway::InputCleanupOutcome,
-    ),
-    ImageGatewayError,
-> {
-    let work = reconciler.reconcile_expired_work(config.batch_size).await?;
-    let orphan = reconciler
-        .reconcile_orphan_reservations(config.orphan_grace_ms, config.batch_size)
-        .await?;
     let input = reconcile_input_cleanup(
         reconciler,
         blobs,
@@ -342,9 +387,26 @@ async fn reconcile_core(
         config.input_cleanup_grace_ms,
         config.input_cleanup_lease_ms,
         config.batch_size,
-    )
-    .await?;
-    Ok((work, orphan, input))
+    );
+    let (core, executor, artifacts, input) = tokio::join!(core, executor, artifacts, input);
+    (core, executor, artifacts, input)
+}
+
+async fn reconcile_core(
+    reconciler: &PostgresReconciliationStore,
+    config: ReconcileConfig,
+) -> Result<
+    (
+        gpt_image_2_gateway::ReconciliationOutcome,
+        gpt_image_2_gateway::ReconciliationOutcome,
+    ),
+    ImageGatewayError,
+> {
+    let work = reconciler.reconcile_expired_work(config.batch_size).await?;
+    let orphan = reconciler
+        .reconcile_orphan_reservations(config.orphan_grace_ms, config.batch_size)
+        .await?;
+    Ok((work, orphan))
 }
 
 fn env_u64(name: &str, default: u64) -> Result<u64, ImageGatewayError> {

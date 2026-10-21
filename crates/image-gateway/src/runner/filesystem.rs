@@ -315,6 +315,48 @@ pub(crate) fn validate_retention_identity(
     Ok(())
 }
 
+pub(crate) fn validate_terminal_retention_identity(
+    directory: &OwnedFd,
+    execution_id: Uuid,
+    submission_id: Uuid,
+    execution_profile_id: Uuid,
+    expected_error: Option<&str>,
+) -> Result<(), RunnerJournalError> {
+    if execution_profile_id.is_nil()
+        || expected_error.is_some_and(|error| !error_code_is_valid(error))
+    {
+        return Err(RunnerJournalError::InvalidInput);
+    }
+    let spec: DiskSpec =
+        read_optional_json_at(directory, SPEC_FILE)?.ok_or(RunnerJournalError::Integrity)?;
+    spec.validate()?;
+    let terminal: DiskTerminal =
+        read_optional_json_at(directory, TERMINAL_FILE)?.ok_or(RunnerJournalError::Integrity)?;
+    terminal.clone_for_validation()?;
+    if spec.executor_execution_id != execution_id.to_string()
+        || spec.submission_id != submission_id.to_string()
+        || spec.execution_profile_id != execution_profile_id.to_string()
+        || !match (terminal, expected_error) {
+            (DiskTerminal::Failed { error_code }, Some(expected)) => error_code == expected,
+            (
+                DiskTerminal::Succeeded {
+                    manifest_id,
+                    artifact_authority_id,
+                    ..
+                },
+                None,
+            ) => {
+                manifest_id == submission_id.to_string()
+                    && artifact_authority_id == execution_id.to_string()
+            }
+            _ => false,
+        }
+    {
+        return Err(RunnerJournalError::Integrity);
+    }
+    Ok(())
+}
+
 impl DiskSpec {
     fn from_lease(lease: &ExecutorSubmissionLease) -> Self {
         Self {

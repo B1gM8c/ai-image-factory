@@ -1,7 +1,10 @@
 use std::{
     fs,
     io::{Read, Write},
-    os::fd::{AsRawFd, OwnedFd},
+    os::{
+        fd::{AsRawFd, OwnedFd},
+        unix::ffi::OsStrExt,
+    },
     path::{Component, Path, PathBuf},
 };
 
@@ -44,6 +47,15 @@ const PROVIDER_ATTEMPT_DIR: &str = "attempt";
 const MAX_REQUEST_BYTES: u64 = 1024 * 1024;
 const MAX_MARKER_BYTES: u64 = 64 * 1024;
 const MAX_OUTPUT_BYTES: u64 = 256 * 1024 * 1024;
+const RUNTIME_DIRECTORIES: [&str; 5] = [
+    CODEX_HOME_DIR,
+    WORKSPACE_DIR,
+    RUNTIME_HOME_DIR,
+    PROVIDER_HOME_DIR,
+    PROVIDER_WORKSPACES_DIR,
+];
+const MAX_CLEANUP_ENTRIES: usize = 100_000;
+const MAX_CLEANUP_DEPTH: usize = 64;
 
 pub(crate) struct ExecutionSpool {
     directory: OwnedFd,
@@ -146,7 +158,33 @@ pub(crate) enum ProcessSpoolError {
     Unavailable,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum TerminalPayloadCleanup<'a> {
+    Succeeded { sha256_hex: &'a str, byte_size: i64 },
+    Failed { error_code: &'a str },
+}
+
 impl ExecutionSpool {
+    /// Serialize every request/auth/input write with cleanup and a second journal check.
+    /// Opening a completed execution here must not recreate its runtime directories.
+    pub(crate) fn prepare_for_lease(
+        journal: &FilesystemRunnerJournal,
+        lease: &ExecutorSubmissionLease,
+    ) -> Result<Option<(Self, RunnerLock)>, ProcessSpoolError> {
+        let path = journal.execution_path(lease).map_err(map_journal_error)?;
+        let directory = open_private_directory(&path, ProcessSpoolError::Integrity)?;
+        ensure_lock_file(&directory.fd)?;
+        let runner_lock = acquire_runner_lock_at(&directory.fd)?;
+        match journal.start_or_attach(lease).map_err(map_journal_error)? {
+            super::RunnerJournalObservation::Prepared => Ok(Some((
+                Self::from_directory(directory.fd, path)?,
+                runner_lock,
+            ))),
+            super::RunnerJournalObservation::LaunchCommitted
+            | super::RunnerJournalObservation::Terminal(_) => Ok(None),
+        }
+    }
+
     pub(crate) fn for_lease(
         journal: &FilesystemRunnerJournal,
         lease: &ExecutorSubmissionLease,
@@ -212,24 +250,7 @@ impl ExecutionSpool {
     }
 
     pub(crate) fn acquire_runner_lock(&self) -> Result<RunnerLock, ProcessSpoolError> {
-        let fd = rfs::openat(
-            &self.directory,
-            LOCK_FILE,
-            OFlags::RDWR | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
-            Mode::empty(),
-        )
-        .map_err(|_| ProcessSpoolError::Integrity)?;
-        validate_lock_stat(&rfs::fstat(&fd).map_err(|_| ProcessSpoolError::Unavailable)?)?;
-        let stat = rfs::fstat(&fd).map_err(|_| ProcessSpoolError::Unavailable)?;
-        let file = fs::File::from(fd);
-        if !try_exclusive_lock(&file)? {
-            return Err(ProcessSpoolError::Conflict);
-        }
-        Ok(RunnerLock {
-            file,
-            device: stat.st_dev as u64,
-            inode: stat.st_ino,
-        })
+        acquire_runner_lock_at(&self.directory)
     }
 
     pub(crate) fn publish_process(
@@ -630,21 +651,30 @@ impl ExecutionSpool {
     }
 
     pub(crate) fn cleanup_provider_runtime(&self) -> Result<(), ProcessSpoolError> {
-        for directory in [
-            &self.provider_home,
-            &self.provider_workspaces,
-            &self.runtime_home,
-        ] {
-            validate_bound_path(&directory.path, &directory.fd)?;
-            fs::remove_dir_all(&directory.path).map_err(|_| ProcessSpoolError::Unavailable)?;
-        }
-        rfs::fsync(&self.directory).map_err(|_| ProcessSpoolError::Unavailable)
+        self.cleanup_runtime()
     }
 
     pub(crate) fn cleanup_codex_runtime(&self) -> Result<(), ProcessSpoolError> {
-        for directory in [&self.codex_home, &self.workspace, &self.runtime_home] {
+        self.cleanup_runtime()
+    }
+
+    fn cleanup_runtime(&self) -> Result<(), ProcessSpoolError> {
+        let mut remaining = MAX_CLEANUP_ENTRIES;
+        for (name, directory) in [
+            (CODEX_HOME_DIR, &self.codex_home),
+            (WORKSPACE_DIR, &self.workspace),
+            (RUNTIME_HOME_DIR, &self.runtime_home),
+            (PROVIDER_HOME_DIR, &self.provider_home),
+            (PROVIDER_WORKSPACES_DIR, &self.provider_workspaces),
+        ] {
+            match rfs::statat(&self.directory, name, AtFlags::SYMLINK_NOFOLLOW) {
+                Err(Errno::NOENT) => continue,
+                Err(_) => return Err(ProcessSpoolError::Unavailable),
+                Ok(_) => {}
+            }
             validate_bound_path(&directory.path, &directory.fd)?;
-            fs::remove_dir_all(&directory.path).map_err(|_| ProcessSpoolError::Unavailable)?;
+            let expected = rfs::fstat(&directory.fd).map_err(|_| ProcessSpoolError::Unavailable)?;
+            remove_private_tree_at(&self.directory, name, Some(&expected), &mut remaining)?;
         }
         rfs::fsync(&self.directory).map_err(|_| ProcessSpoolError::Unavailable)
     }
@@ -981,6 +1011,27 @@ fn ensure_lock_file(directory: &OwnedFd) -> Result<(), ProcessSpoolError> {
         }
         Err(_) => Err(ProcessSpoolError::Unavailable),
     }
+}
+
+fn acquire_runner_lock_at(directory: &OwnedFd) -> Result<RunnerLock, ProcessSpoolError> {
+    let fd = rfs::openat(
+        directory,
+        LOCK_FILE,
+        OFlags::RDWR | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
+        Mode::empty(),
+    )
+    .map_err(|_| ProcessSpoolError::Integrity)?;
+    let stat = rfs::fstat(&fd).map_err(|_| ProcessSpoolError::Unavailable)?;
+    validate_lock_stat(&stat)?;
+    let file = fs::File::from(fd);
+    if !try_exclusive_lock(&file)? {
+        return Err(ProcessSpoolError::Conflict);
+    }
+    Ok(RunnerLock {
+        file,
+        device: stat.st_dev as u64,
+        inode: stat.st_ino,
+    })
 }
 
 fn publish_json_or_compare<T: Serialize + DeserializeOwned + Eq>(
@@ -1562,12 +1613,69 @@ pub(crate) fn reclaim_output(
     expected_sha256: &str,
     expected_size: i64,
 ) -> Result<u64, ProcessSpoolError> {
-    if execution_id.is_nil() || !is_sha256(expected_sha256) || expected_size <= 0 {
+    reclaim_terminal_payload_impl(
+        root,
+        execution_id,
+        submission_id,
+        TerminalPayloadCleanup::Succeeded {
+            sha256_hex: expected_sha256,
+            byte_size: expected_size,
+        },
+        None,
+    )
+}
+
+/// The caller must first prove canonical terminal reduction and a durable customer result.
+/// Keep launch/terminal evidence intact so a late attach cannot cause another provider call.
+pub(crate) fn reclaim_terminal_payload(
+    root: &Path,
+    execution_id: Uuid,
+    submission_id: Uuid,
+    execution_profile_id: Uuid,
+    expected: TerminalPayloadCleanup<'_>,
+) -> Result<u64, ProcessSpoolError> {
+    reclaim_terminal_payload_impl(
+        root,
+        execution_id,
+        submission_id,
+        expected,
+        Some(execution_profile_id),
+    )
+}
+
+fn reclaim_terminal_payload_impl(
+    root: &Path,
+    execution_id: Uuid,
+    submission_id: Uuid,
+    expected: TerminalPayloadCleanup<'_>,
+    expected_profile_id: Option<Uuid>,
+) -> Result<u64, ProcessSpoolError> {
+    let include_runtime = expected_profile_id.is_some();
+    if execution_id.is_nil()
+        || submission_id.is_nil()
+        || expected_profile_id.is_some_and(|id| id.is_nil())
+        || match expected {
+            TerminalPayloadCleanup::Succeeded {
+                sha256_hex,
+                byte_size,
+            } => !is_sha256(sha256_hex) || byte_size <= 0,
+            TerminalPayloadCleanup::Failed { error_code } => !error_code_is_valid(error_code),
+        }
+    {
         return Err(ProcessSpoolError::InvalidInput);
+    }
+    if include_runtime
+        && matches!(
+            rfs::statat(rfs::CWD, root, AtFlags::SYMLINK_NOFOLLOW),
+            Err(Errno::NOENT)
+        )
+    {
+        return Err(ProcessSpoolError::Unavailable);
     }
     let root = open_private_directory(root, ProcessSpoolError::InvalidInput)?;
     let name = execution_id.simple().to_string();
     match rfs::statat(&root.fd, name.as_str(), AtFlags::SYMLINK_NOFOLLOW) {
+        Err(Errno::NOENT) if include_runtime => return Err(ProcessSpoolError::Unavailable),
         Err(Errno::NOENT) => return Ok(0),
         Err(_) => return Err(ProcessSpoolError::Unavailable),
         Ok(_) => {}
@@ -1586,8 +1694,24 @@ pub(crate) fn reclaim_output(
     if !try_exclusive_lock(&lock)? {
         return Err(ProcessSpoolError::Conflict);
     }
-    super::filesystem::validate_retention_identity(&directory.fd, execution_id, submission_id)
-        .map_err(map_journal_error)?;
+    match expected_profile_id {
+        Some(profile_id) => super::filesystem::validate_terminal_retention_identity(
+            &directory.fd,
+            execution_id,
+            submission_id,
+            profile_id,
+            match expected {
+                TerminalPayloadCleanup::Succeeded { .. } => None,
+                TerminalPayloadCleanup::Failed { error_code } => Some(error_code),
+            },
+        ),
+        None => super::filesystem::validate_retention_identity(
+            &directory.fd,
+            execution_id,
+            submission_id,
+        ),
+    }
+    .map_err(map_journal_error)?;
     let identity: ProcessIdentity =
         read_required_json(&directory.fd, PROCESS_FILE, MAX_MARKER_BYTES)?;
     identity.validate()?;
@@ -1597,19 +1721,62 @@ pub(crate) fn reclaim_output(
     let terminal: ProcessTerminal =
         read_required_json(&directory.fd, RESULT_FILE, MAX_MARKER_BYTES)?;
     terminal.validate()?;
-    if !matches!(terminal, ProcessTerminal::Succeeded { ref helper_nonce, ref sha256_hex, byte_size, .. }
-        if helper_nonce == &identity.nonce && sha256_hex == expected_sha256 && byte_size == expected_size as u64)
+    if terminal.helper_nonce() != identity.nonce
+        || !match (&terminal, expected) {
+            (
+                ProcessTerminal::Succeeded {
+                    sha256_hex,
+                    byte_size,
+                    ..
+                },
+                TerminalPayloadCleanup::Succeeded {
+                    sha256_hex: expected_sha256,
+                    byte_size: expected_size,
+                },
+            ) => sha256_hex == expected_sha256 && *byte_size == expected_size as u64,
+            (
+                ProcessTerminal::Failed { error_code, .. },
+                TerminalPayloadCleanup::Failed {
+                    error_code: expected_error,
+                },
+            ) => error_code == expected_error,
+            _ => false,
+        }
     {
         return Err(ProcessSpoolError::Integrity);
     }
-    let stat = match rfs::statat(&directory.fd, OUTPUT_FILE, AtFlags::SYMLINK_NOFOLLOW) {
-        Err(Errno::NOENT) => return Ok(0),
+    if include_runtime {
+        if !process_has_exited(identity.pid, &identity.start_token)? {
+            return Err(ProcessSpoolError::Conflict);
+        }
+        if let Some(provider) = read_optional_json::<ProviderProcessIdentity>(
+            &directory.fd,
+            PROVIDER_PROCESS_FILE,
+            MAX_MARKER_BYTES,
+        )? {
+            provider.validate()?;
+            if provider.helper_nonce != identity.nonce || provider.pid == identity.pid {
+                return Err(ProcessSpoolError::Integrity);
+            }
+            if !process_has_exited(provider.pid, &provider.start_token)?
+                || !process_group_has_exited(provider.pgid)?
+            {
+                return Err(ProcessSpoolError::Conflict);
+            }
+        }
+    }
+    let output_stat = match rfs::statat(&directory.fd, OUTPUT_FILE, AtFlags::SYMLINK_NOFOLLOW) {
+        Err(Errno::NOENT) => None,
         Err(_) => return Err(ProcessSpoolError::Unavailable),
-        Ok(stat) => stat,
+        Ok(stat) => Some(stat),
     };
-    validate_regular_file_stat(&stat, MAX_OUTPUT_BYTES)?;
-    if stat.st_size != expected_size {
-        return Err(ProcessSpoolError::Integrity);
+    if let Some(stat) = &output_stat {
+        validate_regular_file_stat(stat, MAX_OUTPUT_BYTES)?;
+        match expected {
+            TerminalPayloadCleanup::Succeeded { byte_size, .. } if stat.st_size == byte_size => {}
+            // A definite failure with an output is contradictory recovery evidence.
+            _ => return Err(ProcessSpoolError::Integrity),
+        }
     }
     validate_bound_path(&root.path, &root.fd)?;
     validate_bound_path(&directory.path, &directory.fd)?;
@@ -1618,10 +1785,214 @@ pub(crate) fn reclaim_output(
     if bound_lock.st_dev != lock_stat.st_dev || bound_lock.st_ino != lock_stat.st_ino {
         return Err(ProcessSpoolError::Integrity);
     }
-    rfs::unlinkat(&directory.fd, OUTPUT_FILE, AtFlags::empty())
-        .map_err(|_| ProcessSpoolError::Unavailable)?;
+    let mut reclaimed = 0_u64;
+    if include_runtime {
+        let mut remaining = MAX_CLEANUP_ENTRIES;
+        for name in RUNTIME_DIRECTORIES {
+            reclaimed = reclaimed.saturating_add(remove_private_tree_at(
+                &directory.fd,
+                name,
+                None,
+                &mut remaining,
+            )?);
+        }
+        reclaimed = reclaimed.saturating_add(remove_payload_file_at(
+            &directory.fd,
+            REQUEST_FILE,
+            MAX_REQUEST_BYTES,
+        )?);
+    }
+    if let Some(stat) = output_stat {
+        validate_entry_binding(&directory.fd, OUTPUT_FILE.as_ref(), &stat)?;
+        rfs::unlinkat(&directory.fd, OUTPUT_FILE, AtFlags::empty())
+            .map_err(|_| ProcessSpoolError::Unavailable)?;
+        reclaimed = reclaimed.saturating_add(stat.st_size as u64);
+    }
+    validate_bound_path(&root.path, &root.fd)?;
+    validate_bound_path(&directory.path, &directory.fd)?;
+    let bound_lock = rfs::statat(&directory.fd, LOCK_FILE, AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(|_| ProcessSpoolError::Integrity)?;
+    if bound_lock.st_dev != lock_stat.st_dev || bound_lock.st_ino != lock_stat.st_ino {
+        return Err(ProcessSpoolError::Integrity);
+    }
     rfs::fsync(&directory.fd).map_err(|_| ProcessSpoolError::Unavailable)?;
-    Ok(expected_size as u64)
+    Ok(reclaimed)
+}
+
+fn process_has_exited(pid: u32, expected_start: &str) -> Result<bool, ProcessSpoolError> {
+    match process_start_token(pid) {
+        Ok(start) => Ok(start != expected_start),
+        Err(ProcessSpoolError::Unavailable) => {
+            let pid = libc::pid_t::try_from(pid).map_err(|_| ProcessSpoolError::Integrity)?;
+            if unsafe { libc::kill(pid, 0) } == 0 {
+                return Err(ProcessSpoolError::Unavailable);
+            }
+            if std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+                Ok(true)
+            } else {
+                Err(ProcessSpoolError::Unavailable)
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn process_group_has_exited(pgid: u32) -> Result<bool, ProcessSpoolError> {
+    let pgid = libc::pid_t::try_from(pgid).map_err(|_| ProcessSpoolError::Integrity)?;
+    if pgid <= 1 {
+        return Err(ProcessSpoolError::Integrity);
+    }
+    if unsafe { libc::kill(-pgid, 0) } == 0 {
+        return Ok(false);
+    }
+    if std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+        Ok(true)
+    } else {
+        Err(ProcessSpoolError::Unavailable)
+    }
+}
+
+fn remove_payload_file_at(
+    parent: &OwnedFd,
+    name: &str,
+    max_bytes: u64,
+) -> Result<u64, ProcessSpoolError> {
+    let stat = match rfs::statat(parent, name, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(stat) => stat,
+        Err(Errno::NOENT) => return Ok(0),
+        Err(_) => return Err(ProcessSpoolError::Unavailable),
+    };
+    validate_regular_file_stat(&stat, max_bytes)?;
+    validate_entry_binding(parent, name.as_ref(), &stat)?;
+    rfs::unlinkat(parent, name, AtFlags::empty()).map_err(|_| ProcessSpoolError::Unavailable)?;
+    Ok(stat.st_size as u64)
+}
+
+fn remove_private_tree_at(
+    parent: &OwnedFd,
+    name: &str,
+    expected: Option<&rfs::Stat>,
+    remaining: &mut usize,
+) -> Result<u64, ProcessSpoolError> {
+    let stat = match rfs::statat(parent, name, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(stat) => stat,
+        Err(Errno::NOENT) => return Ok(0),
+        Err(_) => return Err(ProcessSpoolError::Unavailable),
+    };
+    validate_directory_stat(&stat)?;
+    if expected
+        .is_some_and(|expected| expected.st_dev != stat.st_dev || expected.st_ino != stat.st_ino)
+    {
+        return Err(ProcessSpoolError::Integrity);
+    }
+    let parent_stat = rfs::fstat(parent).map_err(|_| ProcessSpoolError::Unavailable)?;
+    if stat.st_dev != parent_stat.st_dev {
+        return Err(ProcessSpoolError::Integrity);
+    }
+    let fd = rfs::openat(
+        parent,
+        name,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|_| ProcessSpoolError::Integrity)?;
+    let opened = rfs::fstat(&fd).map_err(|_| ProcessSpoolError::Unavailable)?;
+    if opened.st_dev != stat.st_dev || opened.st_ino != stat.st_ino {
+        return Err(ProcessSpoolError::Integrity);
+    }
+    let bytes = remove_tree_contents(&fd, stat.st_dev as u64, 0, remaining)?;
+    validate_entry_binding(parent, name.as_ref(), &stat)?;
+    rfs::unlinkat(parent, name, AtFlags::REMOVEDIR).map_err(|_| ProcessSpoolError::Unavailable)?;
+    rfs::fsync(parent).map_err(|_| ProcessSpoolError::Unavailable)?;
+    Ok(bytes)
+}
+
+fn remove_tree_contents(
+    directory: &OwnedFd,
+    device: u64,
+    depth: usize,
+    remaining: &mut usize,
+) -> Result<u64, ProcessSpoolError> {
+    if depth >= MAX_CLEANUP_DEPTH {
+        return Err(ProcessSpoolError::Integrity);
+    }
+    let mut entries = Vec::new();
+    let iterator = rfs::Dir::read_from(directory).map_err(|_| ProcessSpoolError::Unavailable)?;
+    for entry in iterator {
+        let entry = entry.map_err(|_| ProcessSpoolError::Unavailable)?;
+        let name = entry.file_name();
+        if matches!(name.to_bytes(), b"." | b"..") {
+            continue;
+        }
+        *remaining = remaining
+            .checked_sub(1)
+            .ok_or(ProcessSpoolError::Integrity)?;
+        entries.push(name.to_owned());
+    }
+    let mut bytes = 0_u64;
+    for name in entries {
+        let stat = rfs::statat(directory, name.as_c_str(), AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(|_| ProcessSpoolError::Unavailable)?;
+        if stat.st_uid != unsafe { libc::geteuid() } || stat.st_dev as u64 != device {
+            return Err(ProcessSpoolError::Integrity);
+        }
+        let file_type = FileType::from_raw_mode(stat.st_mode);
+        let flags = match file_type {
+            FileType::Directory => {
+                if stat.st_mode & 0o022 != 0 {
+                    return Err(ProcessSpoolError::Integrity);
+                }
+                let fd = rfs::openat(
+                    directory,
+                    name.as_c_str(),
+                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                    Mode::empty(),
+                )
+                .map_err(|_| ProcessSpoolError::Integrity)?;
+                let opened = rfs::fstat(&fd).map_err(|_| ProcessSpoolError::Unavailable)?;
+                if opened.st_dev != stat.st_dev || opened.st_ino != stat.st_ino {
+                    return Err(ProcessSpoolError::Integrity);
+                }
+                bytes =
+                    bytes.saturating_add(remove_tree_contents(&fd, device, depth + 1, remaining)?);
+                AtFlags::REMOVEDIR
+            }
+            FileType::RegularFile => {
+                if stat.st_nlink != 1 || stat.st_size < 0 || stat.st_mode & 0o022 != 0 {
+                    return Err(ProcessSpoolError::Integrity);
+                }
+                bytes = bytes.saturating_add(stat.st_size as u64);
+                AtFlags::empty()
+            }
+            FileType::Symlink | FileType::Socket | FileType::Fifo => AtFlags::empty(),
+            _ => return Err(ProcessSpoolError::Integrity),
+        };
+        validate_entry_binding(
+            directory,
+            std::ffi::OsStr::from_bytes(name.to_bytes()),
+            &stat,
+        )?;
+        rfs::unlinkat(directory, name.as_c_str(), flags)
+            .map_err(|_| ProcessSpoolError::Unavailable)?;
+    }
+    rfs::fsync(directory).map_err(|_| ProcessSpoolError::Unavailable)?;
+    Ok(bytes)
+}
+
+fn validate_entry_binding(
+    parent: &OwnedFd,
+    name: &std::ffi::OsStr,
+    expected: &rfs::Stat,
+) -> Result<(), ProcessSpoolError> {
+    let current = rfs::statat(parent, name, AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(|_| ProcessSpoolError::Integrity)?;
+    if current.st_dev != expected.st_dev
+        || current.st_ino != expected.st_ino
+        || FileType::from_raw_mode(current.st_mode) != FileType::from_raw_mode(expected.st_mode)
+    {
+        return Err(ProcessSpoolError::Integrity);
+    }
+    Ok(())
 }
 
 fn is_sha256(value: &str) -> bool {
@@ -1798,6 +2169,417 @@ mod tests {
             Err(ProcessSpoolError::Integrity)
         );
         assert!(spool.path.join(OUTPUT_FILE).exists());
+    }
+
+    #[test]
+    fn completed_payload_cleanup_requires_an_existing_verified_execution() {
+        let (temp, journal, lease) = fixture();
+        let missing_execution = Uuid::new_v4();
+        for root in [
+            journal.root_path().to_path_buf(),
+            temp.path().join("missing-root"),
+        ] {
+            assert_eq!(
+                reclaim_terminal_payload(
+                    &root,
+                    missing_execution,
+                    lease.submission_id,
+                    lease.execution_profile_id,
+                    TerminalPayloadCleanup::Failed {
+                        error_code: "provider_rejected"
+                    },
+                ),
+                Err(ProcessSpoolError::Unavailable),
+            );
+        }
+        assert_eq!(
+            reclaim_output(
+                journal.root_path(),
+                missing_execution,
+                lease.submission_id,
+                &sha256(b"durable output"),
+                14,
+            ),
+            Ok(0),
+        );
+        assert!(!temp.path().join("missing-root").exists());
+    }
+
+    #[test]
+    fn completed_payload_cleanup_waits_for_helper_and_preserves_replay_barrier() {
+        let (_temp, journal, lease) = fixture();
+        let spool = ExecutionSpool::for_lease(&journal, &lease).unwrap();
+        spool
+            .prepare_request(br#"{"prompt":"private request"}"#)
+            .unwrap();
+        spool
+            .stage_provider_input("input-0.png", b"private input", 1024)
+            .unwrap();
+        let lock = spool.acquire_runner_lock().unwrap();
+        let identity = lock.identity().unwrap();
+        spool.publish_process(&lock, &identity).unwrap();
+        let bytes = b"duplicate result";
+        spool.publish_output(bytes).unwrap();
+        spool
+            .publish_terminal(
+                &lock,
+                &ProcessTerminal::Succeeded {
+                    helper_nonce: identity.nonce.clone(),
+                    sha256_hex: sha256(bytes),
+                    byte_size: bytes.len() as u64,
+                    provider_reported_cost: None,
+                },
+            )
+            .unwrap();
+        journal.commit_launch(&lease).unwrap();
+        let outcome = crate::executor::RunnerOutcome::Succeeded(
+            crate::executor::ExecutorResultManifest::new(
+                lease.submission_id,
+                lease.executor_execution_id,
+            )
+            .unwrap(),
+        );
+        journal.publish_terminal(&lease, &outcome).unwrap();
+        let hash = sha256(bytes);
+        let reclaim = || {
+            reclaim_terminal_payload(
+                journal.root_path(),
+                lease.executor_execution_id,
+                lease.submission_id,
+                lease.execution_profile_id,
+                TerminalPayloadCleanup::Succeeded {
+                    sha256_hex: &hash,
+                    byte_size: bytes.len() as i64,
+                },
+            )
+        };
+        assert_eq!(reclaim(), Err(ProcessSpoolError::Conflict));
+        drop(lock);
+        assert_eq!(
+            reclaim(),
+            Err(ProcessSpoolError::Conflict),
+            "an idle lock alone does not prove helper exit"
+        );
+        retire_test_helper(&spool);
+        assert_eq!(
+            reclaim_terminal_payload(
+                journal.root_path(),
+                lease.executor_execution_id,
+                lease.submission_id,
+                Uuid::new_v4(),
+                TerminalPayloadCleanup::Succeeded {
+                    sha256_hex: &hash,
+                    byte_size: bytes.len() as i64,
+                },
+            ),
+            Err(ProcessSpoolError::Integrity),
+        );
+        assert!(spool.path.join(REQUEST_FILE).exists());
+        assert!(reclaim().unwrap() > bytes.len() as u64);
+        assert_eq!(reclaim(), Ok(0));
+        for name in RUNTIME_DIRECTORIES {
+            assert!(!spool.path.join(name).exists());
+        }
+        assert!(!spool.path.join(REQUEST_FILE).exists());
+        assert!(!spool.path.join(OUTPUT_FILE).exists());
+        for name in [
+            "spec.json",
+            "launch.json",
+            "terminal.json",
+            LOCK_FILE,
+            PROCESS_FILE,
+            RESULT_FILE,
+        ] {
+            assert!(
+                spool.path.join(name).is_file(),
+                "{name} remains recovery metadata"
+            );
+        }
+        assert_eq!(
+            journal.start_or_attach(&lease).unwrap(),
+            super::super::RunnerJournalObservation::Terminal(outcome)
+        );
+    }
+
+    #[test]
+    fn paused_prepare_cannot_recreate_payload_after_terminal_cleanup() {
+        let (_temp, journal, lease) = fixture();
+        let (loaded, loaded_rx) = std::sync::mpsc::channel();
+        let (resume, resume_rx) = std::sync::mpsc::channel();
+        let delayed_journal = Arc::clone(&journal);
+        let delayed_lease = lease.clone();
+        let delayed = std::thread::spawn(move || {
+            // A second invocation of the same lease has loaded its context but has
+            // not entered the preparation critical section yet.
+            loaded.send(()).unwrap();
+            resume_rx.recv().unwrap();
+            assert!(
+                ExecutionSpool::prepare_for_lease(&delayed_journal, &delayed_lease)
+                    .unwrap()
+                    .is_none()
+            );
+        });
+        loaded_rx.recv().unwrap();
+
+        let (spool, lock) = ExecutionSpool::prepare_for_lease(&journal, &lease)
+            .unwrap()
+            .unwrap();
+        spool.prepare_request(b"private request").unwrap();
+        spool
+            .stage_provider_input("input-0.png", b"private reference", 1024)
+            .unwrap();
+        fs::write(spool.codex_home.path.join("auth.json"), b"private auth").unwrap();
+        assert!(matches!(
+            ExecutionSpool::prepare_for_lease(&journal, &lease),
+            Err(ProcessSpoolError::Conflict)
+        ));
+        let identity = lock.identity().unwrap();
+        spool.publish_process(&lock, &identity).unwrap();
+        spool
+            .publish_terminal(
+                &lock,
+                &ProcessTerminal::Failed {
+                    helper_nonce: identity.nonce,
+                    error_code: "provider_rejected".into(),
+                },
+            )
+            .unwrap();
+        journal.commit_launch(&lease).unwrap();
+        journal
+            .publish_terminal(
+                &lease,
+                &crate::executor::RunnerOutcome::Failed {
+                    error_code: "provider_rejected".into(),
+                },
+            )
+            .unwrap();
+        let reclaim = || {
+            reclaim_terminal_payload(
+                journal.root_path(),
+                lease.executor_execution_id,
+                lease.submission_id,
+                lease.execution_profile_id,
+                TerminalPayloadCleanup::Failed {
+                    error_code: "provider_rejected",
+                },
+            )
+        };
+        assert_eq!(reclaim(), Err(ProcessSpoolError::Conflict));
+        drop(lock);
+        retire_test_helper(&spool);
+        assert!(reclaim().unwrap() > 0);
+
+        resume.send(()).unwrap();
+        delayed.join().unwrap();
+        for name in RUNTIME_DIRECTORIES {
+            assert!(!spool.path.join(name).exists(), "{name} was not revived");
+        }
+        assert!(!spool.path.join(REQUEST_FILE).exists());
+        assert_eq!(reclaim(), Ok(0));
+    }
+
+    #[test]
+    fn failed_payload_cleanup_requires_matching_error_and_retains_uncertain_output() {
+        let (_temp, journal, lease) = fixture();
+        let spool = ExecutionSpool::for_lease(&journal, &lease).unwrap();
+        spool
+            .prepare_request(br#"{"prompt":"failed request"}"#)
+            .unwrap();
+        spool
+            .stage_provider_input("input-0.png", b"private input", 1024)
+            .unwrap();
+        let lock = spool.acquire_runner_lock().unwrap();
+        let identity = lock.identity().unwrap();
+        spool.publish_process(&lock, &identity).unwrap();
+        spool
+            .publish_terminal(
+                &lock,
+                &ProcessTerminal::Failed {
+                    helper_nonce: identity.nonce,
+                    error_code: "provider_rejected".into(),
+                },
+            )
+            .unwrap();
+        journal.commit_launch(&lease).unwrap();
+        journal
+            .publish_terminal(
+                &lease,
+                &crate::executor::RunnerOutcome::Failed {
+                    error_code: "provider_rejected".into(),
+                },
+            )
+            .unwrap();
+        drop(lock);
+        retire_test_helper(&spool);
+        let reclaim = |error| {
+            reclaim_terminal_payload(
+                journal.root_path(),
+                lease.executor_execution_id,
+                lease.submission_id,
+                lease.execution_profile_id,
+                TerminalPayloadCleanup::Failed { error_code: error },
+            )
+        };
+        assert_eq!(
+            reclaim("different_error"),
+            Err(ProcessSpoolError::Integrity)
+        );
+        assert_eq!(
+            reclaim_terminal_payload(
+                journal.root_path(),
+                lease.executor_execution_id,
+                lease.submission_id,
+                Uuid::new_v4(),
+                TerminalPayloadCleanup::Failed {
+                    error_code: "provider_rejected",
+                },
+            ),
+            Err(ProcessSpoolError::Integrity),
+        );
+        spool
+            .publish_output(b"contradictory recovery result")
+            .unwrap();
+        assert_eq!(
+            reclaim("provider_rejected"),
+            Err(ProcessSpoolError::Integrity)
+        );
+        assert!(spool.path.join(REQUEST_FILE).is_file());
+        fs::remove_file(spool.path.join(OUTPUT_FILE)).unwrap();
+        assert!(reclaim("provider_rejected").unwrap() > 0);
+        assert_eq!(reclaim("provider_rejected"), Ok(0));
+        assert!(spool.path.join(RESULT_FILE).is_file());
+
+        let (_temp, journal, lease) = fixture();
+        let spool = ExecutionSpool::for_lease(&journal, &lease).unwrap();
+        let lock = spool.acquire_runner_lock().unwrap();
+        let identity = lock.identity().unwrap();
+        spool.publish_process(&lock, &identity).unwrap();
+        spool.prepare_request(b"uncertain request").unwrap();
+        spool
+            .publish_terminal(
+                &lock,
+                &ProcessTerminal::Uncertain {
+                    helper_nonce: identity.nonce,
+                    error_code: "provider_unknown".into(),
+                },
+            )
+            .unwrap();
+        journal.commit_launch(&lease).unwrap();
+        journal
+            .publish_terminal(
+                &lease,
+                &crate::executor::RunnerOutcome::Uncertain {
+                    error_code: "provider_unknown".into(),
+                },
+            )
+            .unwrap();
+        drop(lock);
+        retire_test_helper(&spool);
+        assert_eq!(
+            reclaim_terminal_payload(
+                journal.root_path(),
+                lease.executor_execution_id,
+                lease.submission_id,
+                lease.execution_profile_id,
+                TerminalPayloadCleanup::Failed {
+                    error_code: "provider_unknown"
+                }
+            ),
+            Err(ProcessSpoolError::Integrity)
+        );
+        assert!(spool.path.join(REQUEST_FILE).is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn completed_payload_cleanup_retains_running_provider_group() {
+        let (_temp, journal, lease) = fixture();
+        let spool = ExecutionSpool::for_lease(&journal, &lease).unwrap();
+        let lock = spool.acquire_runner_lock().unwrap();
+        let identity = lock.identity().unwrap();
+        spool.publish_process(&lock, &identity).unwrap();
+        use std::os::unix::process::CommandExt;
+        let mut provider = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let provider_identity =
+            ProviderProcessIdentity::capture(provider.id(), &identity.nonce).unwrap();
+        spool
+            .publish_provider_process(&lock, &identity, &provider_identity)
+            .unwrap();
+        spool
+            .publish_terminal(
+                &lock,
+                &ProcessTerminal::Failed {
+                    helper_nonce: identity.nonce,
+                    error_code: "provider_rejected".into(),
+                },
+            )
+            .unwrap();
+        journal.commit_launch(&lease).unwrap();
+        journal
+            .publish_terminal(
+                &lease,
+                &crate::executor::RunnerOutcome::Failed {
+                    error_code: "provider_rejected".into(),
+                },
+            )
+            .unwrap();
+        drop(lock);
+        retire_test_helper(&spool);
+        let reclaim = || {
+            reclaim_terminal_payload(
+                journal.root_path(),
+                lease.executor_execution_id,
+                lease.submission_id,
+                lease.execution_profile_id,
+                TerminalPayloadCleanup::Failed {
+                    error_code: "provider_rejected",
+                },
+            )
+        };
+        let held = reclaim();
+        provider.kill().unwrap();
+        provider.wait().unwrap();
+        assert_eq!(held, Err(ProcessSpoolError::Conflict));
+        assert!(reclaim().is_ok());
+    }
+
+    fn retire_test_helper(spool: &ExecutionSpool) {
+        let mut identity: ProcessIdentity =
+            read_required_json(&spool.directory, PROCESS_FILE, MAX_MARKER_BYTES).unwrap();
+        identity.start_token = format!("retired:{}", identity.start_token);
+        fs::write(
+            spool.path.join(PROCESS_FILE),
+            serde_json::to_vec(&identity).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn runtime_cleanup_removes_all_private_content_without_following_links() {
+        let (temp, journal, lease) = fixture();
+        let spool = ExecutionSpool::for_lease(&journal, &lease).unwrap();
+        let outside = temp.path().join("outside-content");
+        fs::write(&outside, b"must remain").unwrap();
+        for name in RUNTIME_DIRECTORIES {
+            fs::write(spool.path.join(name).join("private-content"), b"private").unwrap();
+        }
+        std::os::unix::fs::symlink(&outside, spool.provider_home.path.join("external-link"))
+            .unwrap();
+        spool
+            .stage_provider_input("input-0.png", b"private reference", 1024)
+            .unwrap();
+        spool.publish_output(b"recoverable result").unwrap();
+        spool.cleanup_codex_runtime().unwrap();
+        spool.cleanup_provider_runtime().unwrap();
+        for name in RUNTIME_DIRECTORIES {
+            assert!(!spool.path.join(name).exists());
+        }
+        assert_eq!(fs::read(outside).unwrap(), b"must remain");
+        assert!(spool.path.join(OUTPUT_FILE).is_file());
     }
 
     #[test]

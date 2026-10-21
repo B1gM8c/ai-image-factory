@@ -721,9 +721,13 @@ impl SingleOutputSupervisor for CodexProcessSupervisor {
         lease: &ExecutorSubmissionLease,
         context: &ExecutorLaunchContext,
     ) -> Result<(), RunnerError> {
+        let Some((spool, _prepare_lock)) =
+            ExecutionSpool::prepare_for_lease(&self.journal, lease).map_err(map_spool_error)?
+        else {
+            return Ok(());
+        };
         let (credential_auth_file, credential_auth_sha256, credential_revision) =
             self.credential_source().await?;
-        let spool = ExecutionSpool::for_lease(&self.journal, lease).map_err(map_spool_error)?;
         let isolated_auth_sha256 = prepare_isolated_codex_auth_tokens(
             spool.codex_home_path().map_err(map_spool_error)?,
             &credential_auth_file,
@@ -2693,6 +2697,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn repeated_prepare_skips_committed_and_cleaned_terminal_runtime() {
+        for terminal in [false, true] {
+            let fixture = CodexFixture::new();
+            let lease = fixture.lease();
+            let context = fixture.context(&lease);
+            fixture.journal.start_or_attach(&lease).unwrap();
+            fixture.supervisor.prepare(&lease, &context).await.unwrap();
+            fixture.journal.commit_launch(&lease).unwrap();
+            if terminal {
+                fixture
+                    .journal
+                    .publish_terminal(
+                        &lease,
+                        &crate::executor::RunnerOutcome::Failed {
+                            error_code: "provider_rejected".to_owned(),
+                        },
+                    )
+                    .unwrap();
+            }
+            let spool = ExecutionSpool::for_lease(&fixture.journal, &lease).unwrap();
+            let path = fixture.journal.execution_path(&lease).unwrap();
+            spool.cleanup_codex_runtime().unwrap();
+            fs::remove_file(path.join("provider-request.json")).unwrap();
+            // No credential dependency should be consulted after launch/terminal.
+            fs::remove_file(&fixture.supervisor.credential_auth_file).unwrap();
+
+            fixture.supervisor.prepare(&lease, &context).await.unwrap();
+
+            for name in [
+                "codex-home",
+                "workspace",
+                "runtime-home",
+                "provider-home",
+                "provider-workspaces",
+                "provider-request.json",
+            ] {
+                assert!(!path.join(name).exists(), "{name} was not revived");
+            }
+            assert!(!fixture.invocations.exists());
+        }
+    }
+
+    #[tokio::test]
     async fn edit_prepare_stages_the_exact_digest_bound_input_for_one_output() {
         let fixture = CodexFixture::new();
         let blobs = Arc::new(InMemoryArtifactBlobStore::default());
@@ -3081,6 +3128,13 @@ mod tests {
         let blobs = Arc::new(InMemoryArtifactBlobStore::default());
         let (endpoint, state, server) = start_direct_edit_server([]).await;
         let (lease, spool, _request) = prepare_managed_edit_output(&fixture, blobs, 1, 1).await;
+        assert!(
+            fs::read_dir(spool.provider_attempt_path().unwrap())
+                .unwrap()
+                .next()
+                .is_some(),
+            "the helper must actually have staged edit inputs before cleanup"
+        );
         let status = Command::new(std::env::current_exe().unwrap())
             .arg("orphan_helper_subprocess_entry")
             .arg("--nocapture")
@@ -3121,6 +3175,10 @@ mod tests {
                 .is_file()
         );
         assert!(!execution_root.join("codex-home").exists());
+        assert!(!execution_root.join("workspace").exists());
+        assert!(!execution_root.join("runtime-home").exists());
+        assert!(!execution_root.join("provider-home").exists());
+        assert!(!execution_root.join("provider-workspaces").exists());
         assert!(!fixture.invocations.exists());
         server.abort();
     }
