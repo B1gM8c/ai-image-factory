@@ -1,23 +1,51 @@
 # Bounded deployment storage
 
-## Successful execution copies
+## Execution-local copies
 
 Set `RECONCILER_RUNNER_ROOT=/var/lib/ai-image-factory/executor-runners`
-in the reconciler's environment to enable duplicate `output.bin` reclamation.
+in the reconciler's environment to enable execution-local payload reclamation.
 This is the parent of private profile directories, not a single profile root.
 The parent must be owned by root or the service user and not group/world writable;
 each child must be private and owned by the service user. At most 128 profile
-directories are inspected, once per minute, with at most 100 execution candidates.
+directories are inspected; each cleanup pass handles at most 100 execution candidates.
 Profile names are not inferred from database keys: profiles may share a directory.
 
+Migration 0135 enqueues each canonical runner-observed success or definite failure
+when its terminal reduction commits, and backfills historical completed reductions.
+Every 30 seconds the reconciler independently claims due rows using fenced database
+leases. Seven of eight claims prioritize fresh completions and one serves the
+oldest due row, so historical work also progresses. Failed cleanup backs off, without provider
+retries. A success requires matching customer artifact, manifest and authority;
+a definite failure requires matching canonical error evidence. Active execution
+leases, incomplete reduction, uncertain work and mismatched/missing evidence block
+deletion. Queue logs expose pending/blocked counts and oldest pending age.
+
+Under the same runner lock used by launch preparation, cleanup rechecks the exact
+execution/submission/profile and terminal result, helper start identity, and exited
+provider process group. It removes private CLI homes/workspaces/input copies,
+`provider-request.json` and duplicate `output.bin`, without following symlinks or
+crossing filesystems. Small immutable launch/result/lock markers remain to prevent
+replay. New prepare/observe paths use durable terminal results after cleanup;
+cleanup failure never changes generation outcome or creates another charge.
+Customer downloads keep the existing 30-minute retention window. Database raw
+requests, accounting, credentials and backups are not deleted by this collector.
+
+Deploy migration 0135 and all new executord binaries through the normal drained
+Apply before enabling the fast collector. Do not mix old launch writers with new
+cleanup. Before rolling back to an older writer, disable this collector; reclaimed
+payload cannot be restored, but durable results and idempotency records remain.
+
+### Conservative legacy fallback
+
+The previous output-only path still runs once per minute with its keyset cursor:
 Jobs, outputs, submissions and executions must all have succeeded, the formal
 artifact retention must be `deleted`, and execution completion must be more than
 24 hours old. Manifest/authority, spool identity, terminal result and file size
 must agree; the runner lock must be idle. Only `output.bin` is unlinked. Failed,
 uncertain, running or ambiguous work is retained. No database records, billing,
 formal media or task markers are changed. A keyset cursor prevents early retained
-candidates from starving later ones. This uses the existing reconciler, with no
-new service or migration.
+candidates from starving later ones. It remains a fallback for legacy rows, not
+the timing policy for newly completed execution-local payloads.
 
 ## Release and backup copies
 

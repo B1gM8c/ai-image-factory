@@ -286,6 +286,23 @@ impl<C, S, A> JournaledDurableRunner<C, S, A> {
             artifacts,
         }
     }
+
+    fn terminal_outcome(&self, lease: &ExecutorSubmissionLease) -> Option<RunnerOutcome> {
+        match self.journal.start_or_attach(lease) {
+            Ok(RunnerJournalObservation::Terminal(outcome)) => Some(outcome),
+            _ => None,
+        }
+    }
+
+    fn terminal_or(
+        &self,
+        lease: &ExecutorSubmissionLease,
+        fallback: DurableRunnerResult,
+    ) -> DurableRunnerResult {
+        self.terminal_outcome(lease)
+            .map(DurableRunnerResult::from)
+            .unwrap_or(fallback)
+    }
 }
 
 #[async_trait]
@@ -314,10 +331,15 @@ where
                 }
                 let context = match self.contexts.load_launch_context(&lease).await {
                     Ok(context) => context,
-                    Err(error) => return submission_error_outcome(error).into(),
+                    Err(error) => {
+                        return self.terminal_or(&lease, submission_error_outcome(error).into());
+                    }
                 };
                 if let Err(error) = self.supervisor.prepare(&lease, &context).await {
-                    return runner_error_result(error);
+                    return self.terminal_or(&lease, runner_error_result(error));
+                }
+                if let Some(outcome) = self.terminal_outcome(&lease) {
+                    return outcome.into();
                 }
                 match self.journal.commit_launch(&lease) {
                     Ok(decision) => decision,
@@ -327,7 +349,13 @@ where
             RunnerJournalObservation::LaunchCommitted => LaunchDecision::Attach,
             RunnerJournalObservation::Terminal(outcome) => return outcome.into(),
         };
-        let outcome = match self.supervisor.start_or_attach(&lease, decision).await {
+        let observed = self.supervisor.start_or_attach(&lease, decision).await;
+        // Another observer may have committed the result and reclaimed its local bytes
+        // while this observer was paused. Durable terminal evidence takes precedence.
+        if let Some(outcome) = self.terminal_outcome(&lease) {
+            return outcome.into();
+        }
+        let outcome = match observed {
             Ok(output) => {
                 if let Err(error) = output.validate_for(&lease) {
                     return runner_error_result(error);
@@ -348,7 +376,7 @@ where
                     Err(error) => RunnerOutcome::from_error(error),
                 }
             }
-            Err(error) => return runner_error_result(error),
+            Err(error) => return self.terminal_or(&lease, runner_error_result(error)),
         };
         if let Err(error) = self.journal.publish_terminal(&lease, &outcome) {
             return journal_error_outcome(error).into();
@@ -371,11 +399,14 @@ where
                 error_code: "runner_launch_evidence_missing".to_string(),
             },
             Ok(RunnerJournalObservation::LaunchCommitted) => {
-                let outcome = match self
+                let observed = self
                     .supervisor
                     .start_or_attach(&lease, LaunchDecision::Attach)
-                    .await
-                {
+                    .await;
+                if let Some(outcome) = self.terminal_outcome(&lease) {
+                    return outcome.into();
+                }
+                let outcome = match observed {
                     Ok(output) => {
                         if let Err(error) = output.validate_for(&lease) {
                             return runner_error_result(error);
@@ -396,7 +427,7 @@ where
                             Err(error) => RunnerOutcome::from_error(error),
                         }
                     }
-                    Err(error) => return runner_error_result(error),
+                    Err(error) => return self.terminal_or(&lease, runner_error_result(error)),
                 };
                 if let Err(error) = self.journal.publish_terminal(&lease, &outcome) {
                     return journal_error_outcome(error).into();
@@ -447,6 +478,7 @@ mod tests {
 
     use serde_json::json;
     use tempfile::TempDir;
+    use tokio::sync::Notify;
     use uuid::Uuid;
 
     use super::*;
@@ -469,6 +501,28 @@ mod tests {
         ) -> Result<ExecutorLaunchContext, ExecutorSubmissionError> {
             *self.calls.lock().unwrap() += 1;
             Ok(self.context.clone())
+        }
+    }
+
+    struct PausedContexts {
+        loaded: Arc<Notify>,
+        resume: Arc<Notify>,
+        unavailable: bool,
+    }
+
+    #[async_trait]
+    impl ExecutorLaunchContextStore for PausedContexts {
+        async fn load_launch_context(
+            &self,
+            _lease: &ExecutorSubmissionLease,
+        ) -> Result<ExecutorLaunchContext, ExecutorSubmissionError> {
+            self.loaded.notify_one();
+            self.resume.notified().await;
+            if self.unavailable {
+                Err(ExecutorSubmissionError::Unavailable)
+            } else {
+                Ok(context())
+            }
         }
     }
 
@@ -495,6 +549,39 @@ mod tests {
         ) -> Result<SupervisedOutput, RunnerError> {
             self.decisions.lock().unwrap().push(decision);
             Ok(SupervisedOutput::without_provider_cost(self.bytes.clone()))
+        }
+    }
+
+    struct PausedObservation {
+        entered: Arc<Notify>,
+        resume: Arc<Notify>,
+        returns_output: bool,
+    }
+
+    #[async_trait]
+    impl SingleOutputSupervisor for PausedObservation {
+        async fn prepare(
+            &self,
+            _lease: &ExecutorSubmissionLease,
+            _context: &ExecutorLaunchContext,
+        ) -> Result<(), RunnerError> {
+            panic!("an attach observer must not prepare or launch");
+        }
+
+        async fn start_or_attach(
+            &self,
+            _lease: &ExecutorSubmissionLease,
+            decision: LaunchDecision,
+        ) -> Result<SupervisedOutput, RunnerError> {
+            assert_eq!(decision, LaunchDecision::Attach);
+            self.entered.notify_one();
+            self.resume.notified().await;
+            if self.returns_output {
+                Ok(SupervisedOutput::without_provider_cost(vec![1, 2, 3]))
+            } else {
+                // A terminal janitor may have removed output.bin before observe.
+                Err(RunnerError::Unavailable)
+            }
         }
     }
 
@@ -674,6 +761,121 @@ mod tests {
             *decisions.lock().unwrap(),
             [LaunchDecision::LaunchOnce, LaunchDecision::Attach]
         );
+    }
+
+    #[tokio::test]
+    async fn paused_context_uses_terminal_evidence_without_launching_or_publishing_again() {
+        for unavailable in [false, true] {
+            let temp = TempDir::new().unwrap();
+            let lease = lease();
+            let journal =
+                Arc::new(FilesystemRunnerJournal::new(temp.path().join("journal")).unwrap());
+            let loaded = Arc::new(Notify::new());
+            let resume = Arc::new(Notify::new());
+            let decisions = Arc::new(Mutex::new(Vec::new()));
+            let artifact_calls = Arc::new(Mutex::new(0));
+            let outcome = RunnerOutcome::Failed {
+                error_code: "provider_rejected".into(),
+            };
+            let runner = JournaledDurableRunner::new(
+                PausedContexts {
+                    loaded: loaded.clone(),
+                    resume: resume.clone(),
+                    unavailable,
+                },
+                journal.clone(),
+                FakeSupervisor {
+                    decisions: decisions.clone(),
+                    bytes: vec![1, 2, 3],
+                },
+                FakeArtifacts {
+                    calls: artifact_calls.clone(),
+                    manifest: ExecutorResultManifest::new(
+                        lease.submission_id,
+                        lease.executor_execution_id,
+                    )
+                    .unwrap(),
+                },
+            );
+            let delayed_lease = lease.clone();
+            let delayed = tokio::spawn(async move {
+                runner
+                    .start_or_attach(delayed_lease, RunnerLaunchAuthority::AllowLaunch)
+                    .await
+            });
+            loaded.notified().await;
+            // A concurrent invocation of this same lease completed while context
+            // loading was paused; no lease-owner takeover is being simulated.
+            journal.commit_launch(&lease).unwrap();
+            journal.publish_terminal(&lease, &outcome).unwrap();
+            resume.notify_one();
+
+            assert_eq!(
+                delayed.await.unwrap(),
+                DurableRunnerResult::Terminal(outcome)
+            );
+            assert!(decisions.lock().unwrap().is_empty());
+            assert_eq!(*artifact_calls.lock().unwrap(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn paused_observers_prefer_terminal_evidence_to_reclaimed_or_cached_output() {
+        for recovery in [false, true] {
+            for returns_output in [false, true] {
+                let temp = TempDir::new().unwrap();
+                let lease = lease();
+                let journal =
+                    Arc::new(FilesystemRunnerJournal::new(temp.path().join("journal")).unwrap());
+                journal.start_or_attach(&lease).unwrap();
+                journal.commit_launch(&lease).unwrap();
+                let entered = Arc::new(Notify::new());
+                let resume = Arc::new(Notify::new());
+                let artifact_calls = Arc::new(Mutex::new(0));
+                let outcome = RunnerOutcome::Failed {
+                    error_code: "provider_rejected".into(),
+                };
+                let runner = JournaledDurableRunner::new(
+                    FakeContexts {
+                        calls: Arc::new(Mutex::new(0)),
+                        context: context(),
+                    },
+                    journal.clone(),
+                    PausedObservation {
+                        entered: entered.clone(),
+                        resume: resume.clone(),
+                        returns_output,
+                    },
+                    FakeArtifacts {
+                        calls: artifact_calls.clone(),
+                        manifest: ExecutorResultManifest::new(
+                            lease.submission_id,
+                            lease.executor_execution_id,
+                        )
+                        .unwrap(),
+                    },
+                );
+                let delayed_lease = lease.clone();
+                let delayed = tokio::spawn(async move {
+                    if recovery {
+                        runner.recover_evidence(delayed_lease).await
+                    } else {
+                        runner
+                            .start_or_attach(delayed_lease, RunnerLaunchAuthority::AttachOnly)
+                            .await
+                    }
+                });
+                entered.notified().await;
+                journal.publish_terminal(&lease, &outcome).unwrap();
+                resume.notify_one();
+
+                assert_eq!(
+                    delayed.await.unwrap(),
+                    DurableRunnerResult::Terminal(outcome)
+                );
+                assert_eq!(*artifact_calls.lock().unwrap(), 0);
+            }
+        }
     }
 
     fn context() -> ExecutorLaunchContext {

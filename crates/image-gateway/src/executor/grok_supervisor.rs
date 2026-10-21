@@ -527,6 +527,11 @@ impl SingleOutputSupervisor for GrokProcessSupervisor {
         lease: &ExecutorSubmissionLease,
         context: &ExecutorLaunchContext,
     ) -> Result<(), RunnerError> {
+        let Some((spool, _prepare_lock)) =
+            ExecutionSpool::prepare_for_lease(&self.journal, lease).map_err(map_spool_error)?
+        else {
+            return Ok(());
+        };
         let projected =
             project_grok_execution_request(lease, context).map_err(|_| RunnerError::Definite {
                 error_code: "executor_command_rejected".to_owned(),
@@ -551,7 +556,6 @@ impl SingleOutputSupervisor for GrokProcessSupervisor {
         }
         let request = self.child_request(lease, context, &credential_auth_sha256)?;
         let bytes = serde_json::to_vec(&request).map_err(|_| RunnerError::Internal)?;
-        let spool = ExecutionSpool::for_lease(&self.journal, lease).map_err(map_spool_error)?;
         private_auth::prepare_isolated_auth(
             spool.provider_home_path().map_err(map_spool_error)?,
             &credential_auth_file,
@@ -1435,6 +1439,48 @@ mod tests {
             grok_receipt_error_code("unrecognized receipt failure"),
             "grok_receipt_invalid"
         );
+    }
+
+    #[tokio::test]
+    async fn repeated_prepare_skips_committed_and_cleaned_terminal_runtime() {
+        for terminal in [false, true] {
+            let fixture = GrokFixture::new();
+            let lease = fixture.lease();
+            let context = fixture.context(&lease);
+            fixture.journal.start_or_attach(&lease).unwrap();
+            fixture.supervisor.prepare(&lease, &context).await.unwrap();
+            fixture.journal.commit_launch(&lease).unwrap();
+            if terminal {
+                fixture
+                    .journal
+                    .publish_terminal(
+                        &lease,
+                        &crate::executor::RunnerOutcome::Failed {
+                            error_code: "provider_rejected".to_owned(),
+                        },
+                    )
+                    .unwrap();
+            }
+            let spool = ExecutionSpool::for_lease(&fixture.journal, &lease).unwrap();
+            let path = fixture.journal.execution_path(&lease).unwrap();
+            spool.cleanup_provider_runtime().unwrap();
+            fs::remove_file(path.join("provider-request.json")).unwrap();
+            fs::remove_file(fixture.credentials.join(private_auth::AUTH_FILE)).unwrap();
+
+            fixture.supervisor.prepare(&lease, &context).await.unwrap();
+
+            for name in [
+                "codex-home",
+                "workspace",
+                "runtime-home",
+                "provider-home",
+                "provider-workspaces",
+                "provider-request.json",
+            ] {
+                assert!(!path.join(name).exists(), "{name} was not revived");
+            }
+            assert!(!fixture.invocations.exists());
+        }
     }
 
     #[tokio::test]
