@@ -141,6 +141,21 @@ pub fn database_schema_from_env() -> Result<String, ImageGatewayError> {
     resolve_database_schema(schema.as_deref()).map(str::to_owned)
 }
 
+/// Per-process pool budget for workerd, provider-submitd and provider-pollerd.
+/// This does not change account or generation concurrency.
+pub fn worker_database_max_connections_from_env() -> Result<u32, ImageGatewayError> {
+    let value = match env::var("GATEWAY_WORKER_DB_MAX_CONNECTIONS") {
+        Ok(value) => Some(value),
+        Err(env::VarError::NotPresent) => None,
+        Err(env::VarError::NotUnicode(_)) => {
+            return Err(ImageGatewayError::config(
+                "GATEWAY_WORKER_DB_MAX_CONNECTIONS must be valid UTF-8",
+            ));
+        }
+    };
+    resolve_worker_database_max_connections(value.as_deref())
+}
+
 pub async fn verify_migrations(pool: &PgPool) -> Result<(), ImageGatewayError> {
     let migration_table: Option<String> =
         sqlx::query_scalar("SELECT to_regclass('_sqlx_migrations')::TEXT")
@@ -238,6 +253,22 @@ fn resolve_database_schema(schema: Option<&str>) -> Result<&str, ImageGatewayErr
     }
 }
 
+fn resolve_worker_database_max_connections(value: Option<&str>) -> Result<u32, ImageGatewayError> {
+    let max_connections = value
+        .map(str::parse::<u32>)
+        .transpose()
+        .map_err(|_| {
+            ImageGatewayError::config("GATEWAY_WORKER_DB_MAX_CONNECTIONS must be an integer")
+        })?
+        .unwrap_or(DEFAULT_MAX_CONNECTIONS);
+    if !(1..=64).contains(&max_connections) {
+        return Err(ImageGatewayError::config(
+            "GATEWAY_WORKER_DB_MAX_CONNECTIONS must be between 1 and 64",
+        ));
+    }
+    Ok(max_connections)
+}
+
 fn verification_query_error(error: sqlx::Error) -> ImageGatewayError {
     verification_error(error)
 }
@@ -254,7 +285,84 @@ fn verification_error(error: impl Display) -> ImageGatewayError {
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_admin_read_database_url, resolve_database_schema, resolve_database_url};
+    use super::{
+        connect_pool, resolve_admin_read_database_url, resolve_database_schema,
+        resolve_database_url, resolve_worker_database_max_connections,
+    };
+
+    #[test]
+    fn worker_database_pool_budget_preserves_default_and_validates_overrides() {
+        assert_eq!(resolve_worker_database_max_connections(None).unwrap(), 10);
+        for value in [1, 2, 10, 64] {
+            assert_eq!(
+                resolve_worker_database_max_connections(Some(&value.to_string())).unwrap(),
+                value
+            );
+        }
+        for value in ["", " ", "two", "1.5", "-1", "0", "65", "4294967296"] {
+            assert!(
+                resolve_worker_database_max_connections(Some(value)).is_err(),
+                "accepted invalid connection budget {value:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn six_worker_pools_bound_connections_and_wait_without_exceeding_budget() {
+        let Some(database_url) = std::env::var("TEST_DATABASE_URL")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+        else {
+            assert!(
+                std::env::var_os("CI").is_none(),
+                "TEST_DATABASE_URL must be set in CI"
+            );
+            eprintln!("skipping worker pool budget test: TEST_DATABASE_URL is not set");
+            return;
+        };
+        let max_connections = resolve_worker_database_max_connections(Some("2")).unwrap();
+        let mut pools = Vec::new();
+        let mut connections = Vec::new();
+        let mut backend_pids = std::collections::HashSet::new();
+        for _ in 0..6 {
+            let pool = connect_pool(&database_url, max_connections).await.unwrap();
+            // Cloned stores and heartbeat tasks share each process's budget.
+            for _ in 0..2 {
+                let mut connection = pool.clone().acquire().await.unwrap();
+                let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+                    .fetch_one(&mut *connection)
+                    .await
+                    .unwrap();
+                backend_pids.insert(pid);
+                connections.push(connection);
+            }
+            pools.push(pool);
+        }
+        assert_eq!(backend_pids.len(), 12);
+        let saturated = pools.last().unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), saturated.acquire())
+                .await
+                .is_err()
+        );
+        assert_eq!(pools.iter().map(sqlx::PgPool::size).sum::<u32>(), 12);
+        drop(connections.pop());
+        let mut resumed =
+            tokio::time::timeout(std::time::Duration::from_secs(5), saturated.acquire())
+                .await
+                .unwrap()
+                .unwrap();
+        let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *resumed)
+            .await
+            .unwrap();
+        assert!(backend_pids.contains(&pid));
+        drop(resumed);
+        drop(connections);
+        for pool in pools {
+            pool.close().await;
+        }
+    }
 
     #[test]
     fn database_url_uses_nonblank_primary_then_nonblank_fallback() {
