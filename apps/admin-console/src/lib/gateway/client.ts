@@ -227,6 +227,8 @@ const ALLOWED_GATEWAY_ROUTES: AllowedGatewayRoute[] = [
   { method: "GET", pattern: /^\/admin\/v1\/provider-routes$/ },
   { method: "POST", pattern: /^\/admin\/v1\/provider-routes$/ },
   { method: "PUT", pattern: /^\/admin\/v1\/provider-routes\/[^/]+$/ },
+  { method: "GET", pattern: /^\/admin\/v1\/provider-routes\/[^/]+\/platform-binding$/ },
+  { method: "PUT", pattern: /^\/admin\/v1\/provider-routes\/[^/]+\/platform-binding$/ },
   { method: "GET", pattern: /^\/admin\/v1\/scheduler\/queues$/ },
   { method: "GET", pattern: /^\/v1\/organization\/audit_logs$/ },
   { method: "GET", pattern: /^\/admin\/v1\/jobs$/ },

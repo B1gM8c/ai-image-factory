@@ -275,6 +275,33 @@ pub struct ProviderRoutesSnapshot {
     pub routes: Vec<ProviderRouteView>,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, sqlx::FromRow, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PlatformRouteBinding {
+    #[schema(value_type = String)]
+    pub route_id: Uuid,
+    pub route_revision: i64,
+    pub state: String,
+}
+
+#[derive(Clone, Debug, Serialize, utoipa::ToSchema)]
+pub struct PlatformRouteBindingResponse {
+    pub binding: Option<PlatformRouteBinding>,
+}
+
+#[derive(Clone, Debug, Deserialize, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct UpdatePlatformRouteBindingRequest {
+    pub expected_route_revision: i64,
+    pub expected_binding: Option<PlatformRouteBinding>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct PlatformRouteBindingActor {
+    pub user_id: Uuid,
+    pub session_id: Uuid,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BindApiKeyRouteRequest {
@@ -426,6 +453,18 @@ pub trait ProviderManagementService: Send + Sync + 'static {
         route_id: Uuid,
         request: UpdateProviderRouteRequest,
     ) -> Result<ProviderRouteView, ImageGatewayError>;
+
+    async fn platform_route_binding(
+        &self,
+        route_id: Uuid,
+    ) -> Result<PlatformRouteBindingResponse, ImageGatewayError>;
+
+    async fn update_platform_route_binding(
+        &self,
+        route_id: Uuid,
+        request: UpdatePlatformRouteBindingRequest,
+        actor: PlatformRouteBindingActor,
+    ) -> Result<PlatformRouteBindingResponse, ImageGatewayError>;
 
     async fn bind_api_key_route(
         &self,

@@ -65,6 +65,8 @@ use super::{
     reconcile_execution_profile_routes,
 };
 
+mod platform_binding;
+
 const LOGIN_TTL: Duration = Duration::from_secs(15 * 60);
 const APP_SERVER_START_TIMEOUT: Duration = Duration::from_secs(20);
 const APP_SERVER_READ_TIMEOUT: Duration = Duration::from_secs(30);
@@ -3648,6 +3650,22 @@ impl ProviderManagementService for PostgresProviderManagementService {
                 .collect(),
             created_at_ms: now,
         })
+    }
+
+    async fn platform_route_binding(
+        &self,
+        route_id: Uuid,
+    ) -> Result<super::PlatformRouteBindingResponse, ImageGatewayError> {
+        platform_binding::get(&self.pool, route_id).await
+    }
+
+    async fn update_platform_route_binding(
+        &self,
+        route_id: Uuid,
+        request: super::UpdatePlatformRouteBindingRequest,
+        actor: super::PlatformRouteBindingActor,
+    ) -> Result<super::PlatformRouteBindingResponse, ImageGatewayError> {
+        platform_binding::update(&self.pool, route_id, request, actor).await
     }
 
     async fn bind_api_key_route(

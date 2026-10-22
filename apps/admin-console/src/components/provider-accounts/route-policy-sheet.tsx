@@ -22,6 +22,7 @@ import {
   SheetTitle,
 } from "@/components/ui/sheet";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { PlatformRouteBindingPanel } from "@/components/provider-accounts/platform-route-binding-panel";
 import {
   apiProfilesFor,
   defaultRouteModelMappings,
@@ -79,7 +80,13 @@ export function RoutePolicySheet({
   const [modelMappings, setModelMappings] =
     useState<EditableRouteModelMappings>({});
   const [pending, setPending] = useState(false);
+  const [bindingPending, setBindingPending] = useState(false);
+  const [activeTab, setActiveTab] = useState("scheduling");
   const accountRoute = route?.route_kind === "account";
+
+  useEffect(() => {
+    if (open) setActiveTab(accountRoute ? "models" : "scheduling");
+  }, [open, accountRoute, route?.route_id, route?.revision]);
 
   useEffect(() => {
     if (!open) return;
@@ -364,12 +371,15 @@ export function RoutePolicySheet({
 
         <Tabs
           key={`${route?.route_id ?? "new"}:${route?.revision ?? 0}`}
-          defaultValue={accountRoute ? "models" : "scheduling"}
+          value={activeTab}
+          onValueChange={(value) => {
+            if (!pending && !bindingPending) setActiveTab(value);
+          }}
           className="flex min-h-0 flex-1 flex-col"
         >
-          {!accountRoute ? (
-            <div className="shrink-0 overflow-x-auto border-b px-5 sm:px-6">
-              <TabsList variant="line">
+          <div className="shrink-0 overflow-x-auto border-b px-5 sm:px-6">
+            <TabsList variant="line">
+              {!accountRoute ? (
                 <TabsTrigger value="scheduling" variant="line">
                   <Users className="size-4" aria-hidden="true" />
                   {t({
@@ -379,18 +389,28 @@ export function RoutePolicySheet({
                     ko: "멤버 및 스케줄링",
                   })}
                 </TabsTrigger>
-                <TabsTrigger value="models" variant="line">
-                  <Layers3 className="size-4" aria-hidden="true" />
+              ) : null}
+              <TabsTrigger value="models" variant="line">
+                <Layers3 className="size-4" aria-hidden="true" />
+                {t({
+                  en: "API models",
+                  "zh-CN": "对外模型",
+                  ja: "API モデル",
+                  ko: "API 모델",
+                })}
+              </TabsTrigger>
+              {route ? (
+                <TabsTrigger value="platform" variant="line">
                   {t({
-                    en: "API models",
-                    "zh-CN": "对外模型",
-                    ja: "API モデル",
-                    ko: "API 모델",
+                    en: "Platform route",
+                    "zh-CN": "平台路由",
+                    ja: "プラットフォームルート",
+                    ko: "플랫폼 라우트",
                   })}
                 </TabsTrigger>
-              </TabsList>
-            </div>
-          ) : null}
+              ) : null}
+            </TabsList>
+          </div>
           <TabsContent
             value="scheduling"
             className="min-h-0 flex-1 space-y-6 overflow-y-auto px-5 py-5 sm:px-6"
@@ -830,46 +850,61 @@ export function RoutePolicySheet({
               onMappingsChange={setModelMappings}
             />
           </TabsContent>
+          {route ? (
+            <TabsContent
+              value="platform"
+              className="min-h-0 flex-1 overflow-y-auto px-5 py-5 sm:px-6"
+            >
+              <PlatformRouteBindingPanel
+                key={`${route.route_id}:${route.revision}`}
+                route={route}
+                onPendingChange={setBindingPending}
+                onConflict={onSaved}
+              />
+            </TabsContent>
+          ) : null}
         </Tabs>
 
         <SheetFooter className="border-t px-5 py-4 sm:px-6">
           <Button
             variant="outline"
             onClick={() => onOpenChange(false)}
-            disabled={pending}
+            disabled={pending || bindingPending}
           >
-            {t({
-              en: "Cancel",
-              "zh-CN": "取消",
-              ja: "キャンセル",
-              ko: "취소",
-            })}
+            {activeTab === "platform"
+              ? t({ en: "Close", "zh-CN": "关闭", ja: "閉じる", ko: "닫기" })
+              : t({ en: "Cancel", "zh-CN": "取消", ja: "キャンセル", ko: "취소" })}
           </Button>
-          <Button onClick={() => void save()} disabled={pending || !routeValid}>
-            {pending ? (
-              <LoaderCircle className="animate-spin" aria-hidden="true" />
-            ) : route ? (
-              <Save aria-hidden="true" />
-            ) : (
-              <Users aria-hidden="true" />
-            )}
-            {route
-              ? t(
-                  {
-                    en: "Publish version {version}",
-                    "zh-CN": "发布版本 {version}",
-                    ja: "バージョン {version} を公開",
-                    ko: "버전 {version} 게시",
-                  },
-                  { version: route.revision + 1 },
-                )
-              : t({
-                  en: "Create account group",
-                  "zh-CN": "创建账号组",
-                  ja: "アカウントグループを作成",
-                  ko: "계정 그룹 만들기",
-                })}
-          </Button>
+          {activeTab !== "platform" ? (
+            <Button
+              onClick={() => void save()}
+              disabled={pending || bindingPending || !routeValid}
+            >
+              {pending ? (
+                <LoaderCircle className="animate-spin" aria-hidden="true" />
+              ) : route ? (
+                <Save aria-hidden="true" />
+              ) : (
+                <Users aria-hidden="true" />
+              )}
+              {route
+                ? t(
+                    {
+                      en: "Publish version {version}",
+                      "zh-CN": "发布版本 {version}",
+                      ja: "バージョン {version} を公開",
+                      ko: "버전 {version} 게시",
+                    },
+                    { version: route.revision + 1 },
+                  )
+                : t({
+                    en: "Create account group",
+                    "zh-CN": "创建账号组",
+                    ja: "アカウントグループを作成",
+                    ko: "계정 그룹 만들기",
+                  })}
+            </Button>
+          ) : null}
         </SheetFooter>
       </SheetContent>
     </Sheet>
