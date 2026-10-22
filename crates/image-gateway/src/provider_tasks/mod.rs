@@ -245,6 +245,7 @@ pub struct RemoteTaskQuarantinedReceipt {
 pub struct ProviderTaskClaimScope {
     pub provider_id: String,
     pub provider_account_id: Uuid,
+    pub execution_profile_id: Uuid,
 }
 
 #[derive(Clone, Eq, PartialEq)]

@@ -586,6 +586,7 @@ printf '{"submit_id":"%s","gen_status":"querying"}' "$submit"
         scope: ProviderTaskClaimScope {
             provider_id: DREAMINA_PROVIDER_ID.to_owned(),
             provider_account_id,
+            execution_profile_id,
         },
         owner: "poll-owner".to_owned(),
         lease_ms: 100,
@@ -687,6 +688,7 @@ fn scope() -> ProviderTaskClaimScope {
     ProviderTaskClaimScope {
         provider_id: "provider-test".to_owned(),
         provider_account_id: Uuid::from_u128(10),
+        execution_profile_id: Uuid::from_u128(3),
     }
 }
 

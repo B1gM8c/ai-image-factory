@@ -11,6 +11,7 @@ fn remote_task_profile_freezes_scope_and_capacity_without_debugging_credentials(
         ProviderTaskClaimScope {
             provider_id: "provider-test".to_owned(),
             provider_account_id: Uuid::from_u128(3),
+            execution_profile_id: Uuid::from_u128(1),
         }
     );
     assert_eq!(profile.max_in_flight(), 4);

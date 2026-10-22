@@ -1099,6 +1099,7 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
              AND allocation.submission_id = recovery.submission_id
             WHERE recovery.provider_id = $1
               AND recovery.provider_account_id = $2
+              AND submission.execution_profile_id = $3
               AND recovery.state = 'active'
               AND recovery.provider_deadline_at_ms <= floor(
                     extract(epoch FROM statement_timestamp()) * 1000
@@ -1116,6 +1117,7 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
         )
         .bind(&scope.provider_id)
         .bind(scope.provider_account_id)
+        .bind(scope.execution_profile_id)
         .fetch_optional(&mut *tx)
         .await
         .map_err(unavailable)?;
@@ -1211,6 +1213,9 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
                 return Err(ProviderTaskStoreError::Conflict);
             }
             let row = load_recovery_claim_command_in(&mut tx, scope, owner, command_id).await?;
+            if row.execution_profile_id != scope.execution_profile_id {
+                return Err(ProviderTaskStoreError::Conflict);
+            }
             let lease = recovery_lease_from_row(row)?;
             tx.commit().await.map_err(storage_conflict)?;
             return Ok(Some(lease));
@@ -1230,8 +1235,12 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
                      recovery.provider_deadline_at_ms,
                      floor(extract(epoch FROM statement_timestamp()) * 1000)::BIGINT AS now_ms
               FROM provider_submit_recoveries recovery
+              JOIN provider_submissions submission
+                ON submission.submission_id = recovery.submission_id
+               AND submission.executor_execution_id = recovery.executor_execution_id
               WHERE recovery.provider_id = $1
                 AND recovery.provider_account_id = $2
+                AND submission.execution_profile_id = $5
                 AND recovery.state = 'active'
                 AND GREATEST(
                       recovery.next_recovery_at_ms,
@@ -1313,6 +1322,7 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
         .bind(scope.provider_account_id)
         .bind(owner)
         .bind(lease_ms)
+        .bind(scope.execution_profile_id)
         .fetch_optional(&mut *tx)
         .await
         .map_err(storage_conflict)?;
@@ -1439,6 +1449,7 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
         let scope = ProviderTaskClaimScope {
             provider_id: lease.intent.provider_id.clone(),
             provider_account_id: lease.intent.provider_account_id,
+            execution_profile_id: lease.context.execution_profile_id,
         };
         lock_recovery_command(&mut tx, &scope, &lease.recovery_owner, command_id).await?;
         if let Some(command) =
@@ -1810,8 +1821,12 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
                      ) AS due_at,
                      task.provider_deadline_at_ms
               FROM provider_remote_tasks task
+              JOIN provider_submissions submission
+                ON submission.submission_id = task.submission_id
+               AND submission.executor_execution_id = task.executor_execution_id
               CROSS JOIN db_clock
               WHERE task.provider_id = $1 AND task.provider_account_id = $2
+                AND submission.execution_profile_id = $5
                 AND task.state = 'provider_waiting'
                 AND GREATEST(
                       task.next_poll_at_ms,
@@ -1917,6 +1932,7 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
         .bind(scope.provider_account_id)
         .bind(owner)
         .bind(lease_ms)
+        .bind(scope.execution_profile_id)
         .fetch_optional(&mut *tx)
         .await
         .map_err(unavailable)?;
@@ -2518,8 +2534,12 @@ impl ProviderTaskDeadlineStore for PostgresProviderTaskStore {
               SELECT task.submission_id, task.executor_execution_id,
                      task.provider_deadline_at_ms
               FROM provider_remote_tasks task
+              JOIN provider_submissions submission
+                ON submission.submission_id = task.submission_id
+               AND submission.executor_execution_id = task.executor_execution_id
               CROSS JOIN db_clock
               WHERE task.provider_id = $1 AND task.provider_account_id = $2
+                AND submission.execution_profile_id = $3
                 AND task.state = 'provider_waiting'
                 AND task.provider_deadline_at_ms <= db_clock.now_ms
               ORDER BY task.provider_deadline_at_ms, task.submission_id
@@ -2546,6 +2566,7 @@ impl ProviderTaskDeadlineStore for PostgresProviderTaskStore {
         )
         .bind(&scope.provider_id)
         .bind(scope.provider_account_id)
+        .bind(scope.execution_profile_id)
         .fetch_optional(&mut *tx)
         .await
         .map_err(unavailable)?;
@@ -4773,7 +4794,10 @@ fn validate_quarantined_receipt(
 }
 
 fn validate_scope(value: &ProviderTaskClaimScope) -> Result<(), ProviderTaskStoreError> {
-    if value.provider_account_id.is_nil() || !valid_simple_identifier(&value.provider_id, 128) {
+    if value.provider_account_id.is_nil()
+        || value.execution_profile_id.is_nil()
+        || !valid_simple_identifier(&value.provider_id, 128)
+    {
         Err(ProviderTaskStoreError::InvalidInput)
     } else {
         Ok(())

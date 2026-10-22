@@ -125,6 +125,7 @@ impl ProviderRuntimeProfile {
         ProviderTaskClaimScope {
             provider_id: self.profile.provider_id.clone(),
             provider_account_id: self.profile.provider_account_id,
+            execution_profile_id: self.profile.execution_profile_id,
         }
     }
 

@@ -249,6 +249,9 @@ impl ProviderCapacityReconciliationStore for PostgresProviderTaskStore {
         .map_err(storage_conflict)?;
         if let Some(row) = replay {
             let context = load_context(&mut tx, row.submission_id).await?;
+            if context.execution_profile_id != scope.execution_profile_id {
+                return Err(ProviderTaskStoreError::Conflict);
+            }
             let lease = replay_lease_from_row(row, context)?;
             tx.commit().await.map_err(storage_conflict)?;
             return Ok(Some(lease));
@@ -261,8 +264,12 @@ impl ProviderCapacityReconciliationStore for PostgresProviderTaskStore {
                      reconciliation.available_at_ms,
                      reconciliation.provider_deadline_at_ms
               FROM provider_capacity_reconciliations reconciliation
+              JOIN provider_submissions submission
+                ON submission.submission_id = reconciliation.submission_id
+               AND submission.executor_execution_id = reconciliation.executor_execution_id
               WHERE reconciliation.provider_id = $1
                 AND reconciliation.provider_account_id = $2
+                AND submission.execution_profile_id = $6
                 AND reconciliation.state = 'active'
                 AND reconciliation.available_at_ms <= floor(
                       extract(epoch FROM statement_timestamp()) * 1000
@@ -310,6 +317,7 @@ impl ProviderCapacityReconciliationStore for PostgresProviderTaskStore {
         .bind(owner)
         .bind(command_id)
         .bind(lease_ms)
+        .bind(scope.execution_profile_id)
         .fetch_optional(&mut *tx)
         .await
         .map_err(storage_conflict)?;
@@ -964,7 +972,10 @@ fn evidence_hash(
 }
 
 fn validate_scope(scope: &ProviderTaskClaimScope) -> Result<(), ProviderTaskStoreError> {
-    if scope.provider_account_id.is_nil() || !valid_simple_identifier(&scope.provider_id, 128) {
+    if scope.provider_account_id.is_nil()
+        || scope.execution_profile_id.is_nil()
+        || !valid_simple_identifier(&scope.provider_id, 128)
+    {
         return Err(ProviderTaskStoreError::InvalidInput);
     }
     Ok(())
