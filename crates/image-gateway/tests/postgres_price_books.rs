@@ -18,6 +18,9 @@ use sha2::Digest;
 use sqlx::{AssertSqlSafe, PgPool};
 use uuid::Uuid;
 
+#[path = "postgres_price_books/workflow_bindings.rs"]
+mod workflow_bindings;
+
 type TestResult<T = ()> = Result<T, String>;
 
 #[tokio::test]

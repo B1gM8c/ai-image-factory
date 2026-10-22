@@ -13,8 +13,8 @@ use gpt_image_2_gateway::{
         FilesystemArtifactBlobStore, artifact_root_from_env, validate_artifact_root_isolated,
     },
     database::{
-        DEFAULT_MAX_CONNECTIONS, connect_pool_with_schema, database_schema_from_env,
-        database_url_from_env, verify_migrations,
+        connect_pool_with_schema, database_schema_from_env, database_url_from_env,
+        verify_migrations, worker_database_max_connections_from_env,
     },
     identify_executor_profile_binding, init_telemetry,
 };
@@ -63,8 +63,8 @@ async fn main() -> Result<(), ImageGatewayError> {
     let telemetry = init_telemetry()?;
     let database_url = database_url_from_env()?;
     let database_schema = database_schema_from_env()?;
-    let pool =
-        connect_pool_with_schema(&database_url, DEFAULT_MAX_CONNECTIONS, &database_schema).await?;
+    let max_connections = worker_database_max_connections_from_env()?;
+    let pool = connect_pool_with_schema(&database_url, max_connections, &database_schema).await?;
     verify_migrations(&pool).await?;
     let admission = Arc::new(PostgresAdmissionStore::new(pool.clone()));
     let contexts = Arc::new(PostgresExecutionContextStore::new(pool.clone()));

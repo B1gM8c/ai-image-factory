@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use sqlx::{FromRow, PgConnection};
 use uuid::Uuid;
 
@@ -301,16 +302,14 @@ pub(super) async fn binding_snapshots_on(
     );
     let mut snapshots = BTreeMap::new();
     for surface in matches {
-        let groups = contract_groups_for_surface(&version, surface).map_err(|reason| {
+        let snapshot = binding_snapshot_for_surface(&version, surface).map_err(|reason| {
             ImageGatewayError::invalid_request(
                 "Pricing surface contract is unavailable",
                 Some("price_book_version_id".to_string()),
                 reason,
             )
         })?;
-        for (_, _, snapshot) in groups {
-            snapshots.insert((snapshot.contract_key.clone(), snapshot.revision), snapshot);
-        }
+        snapshots.insert((snapshot.contract_key.clone(), snapshot.revision), snapshot);
     }
     if snapshots.is_empty() {
         return Err(ImageGatewayError::invalid_request(
@@ -327,6 +326,45 @@ type SurfaceContractGroup = (
     &'static super::surface_contract::PricingSurfaceContract,
     ContractBindingSnapshot,
 );
+
+fn binding_snapshot_for_surface(
+    version: &PriceBookVersionView,
+    surface: &CoverageSurfaceRow,
+) -> Result<ContractBindingSnapshot, &'static str> {
+    let mut snapshots: Vec<_> = contract_groups_for_surface(version, surface)?
+        .into_iter()
+        .map(|(_, _, snapshot)| snapshot)
+        .collect();
+    snapshots.sort_by(|left, right| left.contract_key.cmp(&right.contract_key));
+    let mut snapshot = snapshots
+        .first()
+        .cloned()
+        .ok_or("price_components_missing")?;
+    if snapshots.len() == 1 {
+        return Ok(snapshot);
+    }
+
+    // A price version binds exactly one contract per API/model surface. Keep
+    // every workflow's full contract in that snapshot, without changing the
+    // canonical representation of any previously published single workflow.
+    snapshot.contract_json = serde_json::json!({
+        "schema_version": 1,
+        "exact_surface": snapshot.contract_json["exact_surface"],
+        "contracts": snapshots.into_iter().map(|member| member.contract_json).collect::<Vec<_>>(),
+    });
+    snapshot.contract_hash = hex::encode(Sha256::digest(
+        serde_json::to_vec(&snapshot.contract_json)
+            .expect("pricing workflow contract serialization"),
+    ));
+    // Content-address the workflow set so different subsets and member
+    // revisions cannot collide or overwrite an immutable historical contract.
+    snapshot.contract_key = format!("dreamina-cli.workflow-set:{}", snapshot.contract_hash);
+    snapshot.revision = 1;
+    snapshot.contract_schema_version = 1;
+    snapshot.normalizer_key = "dreamina-cli.workflow-set.v1".into();
+    snapshot.normalizer_revision = 1;
+    Ok(snapshot)
+}
 
 pub(super) fn contract_groups_for_surface(
     version: &PriceBookVersionView,
@@ -1307,6 +1345,10 @@ mod tests {
         };
         let legacy = version(vec![component("any", json!({}))]);
         let (_, original) = contract_snapshot_for_surface(&legacy, &surface).unwrap();
+        assert_eq!(
+            super::binding_snapshot_for_surface(&legacy, &surface).unwrap(),
+            original
+        );
         let mixed = version(vec![
             component("any", json!({})),
             component("any", json!({"workflow":"image2image"})),
@@ -1325,6 +1367,26 @@ mod tests {
         let (_, reference_contract, reference) = &groups[1];
         assert_ne!(reference.contract_key, original.contract_key);
         assert_ne!(reference.contract_hash, original.contract_hash);
+        let bundled = super::binding_snapshot_for_surface(&mixed, &surface).unwrap();
+        let members = bundled.contract_json["contracts"].as_array().unwrap();
+        assert_eq!(members.len(), 2);
+        assert!(members.contains(&original.contract_json));
+        assert!(members.contains(&reference.contract_json));
+        assert_eq!(bundled.normalizer_key, "dreamina-cli.workflow-set.v1");
+        assert_ne!(bundled.contract_key, original.contract_key);
+        assert_eq!(
+            bundled.contract_hash,
+            hex::encode(<sha2::Sha256 as sha2::Digest>::digest(
+                serde_json::to_vec(&bundled.contract_json).unwrap()
+            ))
+        );
+        let mut reordered = mixed.clone();
+        reordered.components.reverse();
+        reordered.components[0].unit_price_micros = "999".into();
+        assert_eq!(
+            super::binding_snapshot_for_surface(&reordered, &surface).unwrap(),
+            bundled
+        );
         assert!(
             legacy_contract
                 .validate_component_selector(&json!({"workflow":"image2image"}))
@@ -1343,6 +1405,68 @@ mod tests {
         for invalid in [json!("*"), json!("unknown_workflow"), json!(null)] {
             let bad = version(vec![component("any", json!({"workflow": invalid}))]);
             assert!(super::contract_groups_for_surface(&bad, &surface).is_err());
+        }
+    }
+
+    #[test]
+    fn dreamina_workflow_sets_have_distinct_bindings_and_keep_single_workflows() {
+        let surface = CoverageSurfaceRow {
+            provider_id: "dreamina-cli".into(),
+            provider_model_id: "seedance2.5".into(),
+            provider_model_display_name: "Seedance 2.5".into(),
+            media_kind: "video".into(),
+            operation: "videos.generations".into(),
+            command_schema: Some("dreamina-cli.submit.v1".into()),
+            api_profile: Some("volcengine-ark-content-generation-v3".into()),
+            public_model_id: Some("doubao-seedance-2-5-260628".into()),
+            route_id: Some(Uuid::new_v4()),
+            routable_account_count: 1,
+        };
+        let mut video = version(vec![
+            component("any", json!({})),
+            component("any", json!({"workflow":"image2video"})),
+        ]);
+        let two = super::binding_snapshot_for_surface(&video, &surface).unwrap();
+        video
+            .components
+            .push(component("any", json!({"workflow":"frames2video"})));
+        let three = super::binding_snapshot_for_surface(&video, &surface).unwrap();
+        assert_ne!(two.contract_key, three.contract_key);
+        assert_ne!(two.contract_hash, three.contract_hash);
+        for (model, media, profile, workflow) in [
+            (
+                "multiframe2video",
+                "video",
+                "dreamina-cli-videos-v1",
+                "multiframe2video",
+            ),
+            (
+                "image_upscale",
+                "image",
+                "dreamina-cli-images-v1",
+                "image_upscale",
+            ),
+        ] {
+            let single_surface = CoverageSurfaceRow {
+                provider_model_id: model.into(),
+                public_model_id: Some(model.into()),
+                media_kind: media.into(),
+                api_profile: Some(profile.into()),
+                operation: if media == "image" {
+                    "images.generations"
+                } else {
+                    "videos.generations"
+                }
+                .into(),
+                ..surface.clone()
+            };
+            let single = version(vec![component("any", json!({"workflow":workflow}))]);
+            assert_eq!(
+                super::binding_snapshot_for_surface(&single, &single_surface).unwrap(),
+                contract_snapshot_for_surface(&single, &single_surface)
+                    .unwrap()
+                    .1,
+            );
         }
     }
 }
