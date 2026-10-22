@@ -23,7 +23,6 @@ const DRAIN_IDEMPOTENCY_KEY: &str = "process-smoke-drain-key";
 const QUEUE_IDEMPOTENCY_KEYS: [&str; 2] = ["process-smoke-queue-a", "process-smoke-queue-b"];
 const EDIT_IDEMPOTENCY_KEY: &str = "process-smoke-edit-key";
 const V2_IDEMPOTENCY_KEY: &str = "process-smoke-generation-v2-key";
-const V2_OUTPUT_COUNT: usize = 2;
 const V2_SUCCESS_PRICE_MICROS: i64 = 7_000;
 static PROCESS_SMOKE_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
@@ -48,7 +47,19 @@ async fn production_process_composition_executes_and_replays_generation_v2() -> 
         return Ok(());
     };
 
-    let result = run_generation_v2_process_smoke(&database).await;
+    let result = run_generation_v2_process_smoke(&database, false).await;
+    let cleanup = database.cleanup().await;
+    combine_results(result, cleanup, "schema cleanup")
+}
+
+#[tokio::test]
+async fn generation_v2_recoverable_app_server_error_settles_once() -> TestResult {
+    let _serial = PROCESS_SMOKE_SERIAL.lock().await;
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+
+    let result = run_generation_v2_process_smoke(&database, true).await;
     let cleanup = database.cleanup().await;
     combine_results(result, cleanup, "schema cleanup")
 }
@@ -103,7 +114,7 @@ fn startup_bind_failure_is_retryable() -> TestResult {
 fn prompt_contract_is_semantic_not_full_text_equality() -> TestResult {
     let request_dir = "/tmp/process-smoke-request";
     let prompt = "prefix may evolve\n用户原始需求：process smoke opaque fixture\n尺寸 auto；质量 low；输出格式 png。\n不要再启动 codex、openai 或其它 AI CLI 子进程来委托生成。\n不要用 shell、sips、ImageMagick、Python、Rust、ffmpeg、canvas 或其他本地工具复制、移动、重命名、删除、裁切、拉伸、重采样、扩边、转绘或修改图像生成工具产物。必须只调用一次当前启用的 image_gen.imagegen 图像生成工具；工具成功后立即停止，由 Factory 从该工具的受控原生产物路径完成封存。\nsuffix may evolve";
-    assert_prompt_semantics(&prompt, request_dir)
+    assert_prompt_semantics(prompt, request_dir)
 }
 
 async fn run_process_smoke(database: &TestDatabase) -> TestResult {
@@ -132,12 +143,23 @@ async fn run_process_smoke(database: &TestDatabase) -> TestResult {
     combine_results(result, worker_shutdown, "workerd shutdown")
 }
 
-async fn run_generation_v2_process_smoke(database: &TestDatabase) -> TestResult {
-    let fixtures = [opaque_png()?, alternate_opaque_png()?];
+async fn run_generation_v2_process_smoke(
+    database: &TestDatabase,
+    recoverable_notice: bool,
+) -> TestResult {
+    let mut fixtures = vec![opaque_png()?];
+    if !recoverable_notice {
+        fixtures.push(alternate_opaque_png()?);
+    }
     let files = SmokeFiles::new(&fixtures[0])?;
-    files.set_second_fixture(&fixtures[1])?;
+    if let Some(fixture) = fixtures.get(1) {
+        files.set_second_fixture(fixture)?;
+    }
+    if recoverable_notice {
+        files.enable_recoverable_app_server_error()?;
+    }
     database
-        .configure_v2_pricing(V2_OUTPUT_COUNT, V2_SUCCESS_PRICE_MICROS)
+        .configure_v2_pricing(fixtures.len(), V2_SUCCESS_PRICE_MICROS)
         .await?;
     let profile = database
         .provision_codex_execution_profile(
@@ -170,6 +192,15 @@ async fn run_generation_v2_process_smoke(database: &TestDatabase) -> TestResult 
         &mut gateway,
     )
     .await;
+    let result = if recoverable_notice {
+        combine_results(
+            result,
+            files.assert_single_generation_rpc_audit(),
+            "recoverable app-server RPC audit",
+        )
+    } else {
+        result
+    };
     let gateway_shutdown = gateway.terminate().await;
     let result = combine_results(result, gateway_shutdown, "V2 gateway shutdown");
     let reducer_shutdown = reducerd.terminate().await;
@@ -324,11 +355,12 @@ async fn exercise_generation_v2_gateway(
     address: std::net::SocketAddr,
     database: &TestDatabase,
     files: &SmokeFiles,
-    fixtures: &[Vec<u8>; V2_OUTPUT_COUNT],
+    fixtures: &[Vec<u8>],
     profile: &process_smoke_support::ExecutionProfile,
     gateway: &mut GatewayProcess,
 ) -> TestResult {
-    let request_body = generation_v2_request();
+    let output_count = fixtures.len();
+    let request_body = generation_v2_request(output_count);
     let base_url = format!("http://{address}");
     poll_health(client, &base_url, gateway).await?;
     let response = client
@@ -363,13 +395,13 @@ async fn exercise_generation_v2_gateway(
         "V2 generation status changed after validation",
     )?;
     assert_generation_v2_response(&body, &headers, fixtures)?;
-    assert_executor_codex_outputs(files, V2_OUTPUT_COUNT)?;
+    assert_executor_codex_outputs(files, output_count)?;
     database
         .assert_v2_generation_graph(
             &request_id,
             profile,
             fixtures,
-            V2_OUTPUT_COUNT,
+            output_count,
             V2_SUCCESS_PRICE_MICROS,
         )
         .await?;
@@ -407,13 +439,13 @@ async fn exercise_generation_v2_gateway(
         "V2 replay must receive a fresh request id",
     )?;
     assert_generation_v2_response(&replay_body, &replay_headers, fixtures)?;
-    assert_executor_codex_outputs(files, V2_OUTPUT_COUNT)?;
+    assert_executor_codex_outputs(files, output_count)?;
     database
         .assert_v2_generation_graph(
             &request_id,
             profile,
             fixtures,
-            V2_OUTPUT_COUNT,
+            output_count,
             V2_SUCCESS_PRICE_MICROS,
         )
         .await
@@ -422,8 +454,9 @@ async fn exercise_generation_v2_gateway(
 fn assert_generation_v2_response(
     body: &Value,
     headers: &reqwest::header::HeaderMap,
-    fixtures: &[Vec<u8>; V2_OUTPUT_COUNT],
+    fixtures: &[Vec<u8>],
 ) -> TestResult {
+    let expected_remaining = (i32::MAX as usize - fixtures.len()).to_string();
     require(
         body["created"].as_i64().is_some_and(|value| value > 0)
             && body["output_format"] == "png"
@@ -435,13 +468,13 @@ fn assert_generation_v2_response(
     require(
         header(headers, "openai-project")? == "proj_default"
             && header(headers, "x-image-units-limit-5h")? == "2147483647"
-            && header(headers, "x-image-units-remaining-5h")? == "2147483645",
+            && header(headers, "x-image-units-remaining-5h")? == expected_remaining,
         "unexpected V2 response usage metadata",
     )?;
     let encoded = body["data"]
         .as_array()
-        .filter(|data| data.len() == V2_OUTPUT_COUNT)
-        .ok_or_else(|| format!("V2 response must contain exactly {V2_OUTPUT_COUNT} images"))?;
+        .filter(|data| data.len() == fixtures.len())
+        .ok_or_else(|| format!("V2 response must contain exactly {} images", fixtures.len()))?;
     for (index, image) in encoded.iter().enumerate() {
         let encoded = image["b64_json"]
             .as_str()
@@ -744,9 +777,9 @@ fn generation_request() -> Value {
     })
 }
 
-fn generation_v2_request() -> Value {
+fn generation_v2_request(output_count: usize) -> Value {
     let mut request = generation_request();
-    request["n"] = json!(V2_OUTPUT_COUNT);
+    request["n"] = json!(output_count);
     request
 }
 

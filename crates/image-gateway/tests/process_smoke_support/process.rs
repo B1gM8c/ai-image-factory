@@ -33,6 +33,8 @@ pub(crate) struct SmokeFiles {
     codex_home: PathBuf,
     fake_active_pid: PathBuf,
     fake_delay: PathBuf,
+    fake_recoverable_error: PathBuf,
+    rpc_audit: PathBuf,
     gateway_log: PathBuf,
     workerd_log: PathBuf,
     executord_log: PathBuf,
@@ -52,6 +54,8 @@ impl SmokeFiles {
         let invocation_log = root.path().join("codex.invocations");
         let fake_active_pid = root.path().join("codex.active.pid");
         let fake_delay = root.path().join("codex.delay-seconds");
+        let fake_recoverable_error = root.path().join("codex.recoverable-error");
+        let rpc_audit = root.path().join("codex.rpc-audit.jsonl");
         let fixture_path = root.path().join("opaque.png");
         let second_fixture_path = root.path().join("opaque-second.png");
         let gateway_log = root.path().join("gateway.log");
@@ -104,6 +108,8 @@ impl SmokeFiles {
             invocation_log: &invocation_log,
             fake_active_pid: &fake_active_pid,
             fake_delay: &fake_delay,
+            fake_recoverable_error: &fake_recoverable_error,
+            rpc_audit: &rpc_audit,
             fixture: &fixture_path,
             second_fixture: &second_fixture_path,
         });
@@ -129,6 +135,8 @@ impl SmokeFiles {
             codex_home,
             fake_active_pid,
             fake_delay,
+            fake_recoverable_error,
+            rpc_audit,
             gateway_log,
             workerd_log,
             executord_log,
@@ -148,6 +156,71 @@ impl SmokeFiles {
     pub(crate) fn set_second_fixture(&self, fixture: &[u8]) -> TestResult {
         fs::write(self._root.path().join("opaque-second.png"), fixture)
             .map_err(|error| format!("failed to write distinct second PNG fixture: {error}"))
+    }
+
+    pub(crate) fn enable_recoverable_app_server_error(&self) -> TestResult {
+        fs::write(&self.fake_recoverable_error, "enabled")
+            .map_err(|error| format!("failed to enable fake app-server recovery notice: {error}"))
+    }
+
+    pub(crate) fn assert_single_generation_rpc_audit(&self) -> TestResult {
+        let audit = fs::read_to_string(&self.rpc_audit)
+            .map_err(|error| format!("failed to read fake app-server RPC audit: {error}"))?;
+        let messages = audit
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<Value>(line)
+                    .map_err(|error| format!("invalid fake app-server RPC audit line: {error}"))
+            })
+            .collect::<TestResult<Vec<_>>>()?;
+        let methods = messages
+            .iter()
+            .map(|message| message.get("method").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+        require(
+            methods
+                == [
+                    Some("initialize"),
+                    Some("initialized"),
+                    Some("thread/start"),
+                    Some("turn/start"),
+                ],
+            format!(
+                "recoverable app-server error changed the single-turn RPC sequence: {methods:?}"
+            ),
+        )?;
+        let invocations = fs::read_to_string(&self.invocation_log)
+            .map_err(|error| format!("failed to read fake app-server invocation audit: {error}"))?;
+        require(
+            invocations.lines().count() == 1,
+            "recoverable app-server error launched a second provider process",
+        )?;
+        let entries = fs::read_dir(&self.runner_root)
+            .map_err(|error| format!("failed to inspect local runner evidence: {error}"))?;
+        let mut executions = 0;
+        for entry in entries {
+            let entry = entry.map_err(|error| format!("failed to read runner entry: {error}"))?;
+            if !entry
+                .file_type()
+                .map_err(|error| format!("failed to inspect runner entry type: {error}"))?
+                .is_dir()
+            {
+                continue;
+            }
+            executions += 1;
+            for forbidden in [
+                "codex-auth-refresh-request.json",
+                "codex-auth-refresh-result.json",
+                "codex-auth-attempt-2-start.json",
+                "codex-auth-attempt-2-finish.json",
+            ] {
+                require(
+                    !entry.path().join(forbidden).exists(),
+                    format!("recoverable app-server error produced {forbidden}"),
+                )?;
+            }
+        }
+        require(executions == 1, "expected one local runner execution")
     }
 
     pub(crate) async fn wait_for_fake_codex_active(&self) -> TestResult {
@@ -899,6 +972,8 @@ struct FakeCodexPaths<'a> {
     invocation_log: &'a Path,
     fake_active_pid: &'a Path,
     fake_delay: &'a Path,
+    fake_recoverable_error: &'a Path,
+    rpc_audit: &'a Path,
     fixture: &'a Path,
     second_fixture: &'a Path,
 }
@@ -940,6 +1015,7 @@ printf '%s\0' "$@" > {argv_log}
 read_and_log() {{
     IFS= read -r line || exit 32
     printf '%s\n' "$line" >> {stdin_log}
+    printf '%s\n' "$line" >> {rpc_audit}
 }}
 read_and_log
 printf '{{"id":1,"result":{{"codexHome":"%s"}}}}\n' "$CODEX_HOME"
@@ -951,7 +1027,7 @@ if printf '%s' "$line" | /usr/bin/grep -F '"method":"account/read"' >/dev/null; 
     chmod 600 "$CODEX_HOME/auth.json.next"
     mv "$CODEX_HOME/auth.json.next" "$CODEX_HOME/auth.json"
     printf '{{"id":3,"result":{{"account":{{"email":"process-smoke@example.invalid","planType":"test"}}}}}}\n'
-    while IFS= read -r ignored; do :; done
+    while IFS= read -r ignored; do printf '%s\n' "$ignored" >> {rpc_audit}; done
     exit 0
 fi
 thread_id='019fd9f5-badb-7dd3-8903-28ffded0ef54'
@@ -961,6 +1037,9 @@ printf '{{"id":2,"result":{{"thread":{{"id":"%s"}}}}}}\n' "$thread_id"
 read_and_log
 printf '{{"method":"turn/started","params":{{"threadId":"%s","turn":{{"id":"%s"}}}}}}\n' "$thread_id" "$turn_id"
 printf '{{"id":3,"result":{{"turn":{{"id":"%s"}}}}}}\n' "$turn_id"
+if [ -f {fake_recoverable_error} ]; then
+    printf '{{"method":"error","params":{{"threadId":"%s","turnId":"%s","willRetry":true,"error":{{"message":"synthetic transient stream failure","codexErrorInfo":{{"responseStreamDisconnected":{{"httpStatusCode":503}}}}}}}}}}\n' "$thread_id" "$turn_id"
+fi
 sleep "$(cat {fake_delay})"
 if /usr/bin/grep -q '第 2/2 张候选图片' {stdin_log}; then
     selected_fixture={second_fixture}
@@ -977,7 +1056,7 @@ mv "$output_dir/$call_id.png.partial" "$output_dir/$call_id.png"
 printf '{{"method":"item/started","params":{{"threadId":"%s","turnId":"%s","item":{{"type":"imageGeneration","id":"%s","status":"inProgress"}}}}}}\n' "$thread_id" "$turn_id" "$call_id"
 printf '{{"method":"item/completed","params":{{"threadId":"%s","turnId":"%s","item":{{"type":"imageGeneration","id":"%s","status":"completed","result":"fixture","savedPath":"%s"}}}}}}\n' "$thread_id" "$turn_id" "$call_id" "$output_dir/$call_id.png"
 printf '{{"method":"turn/completed","params":{{"threadId":"%s","turn":{{"id":"%s","status":"completed"}}}}}}\n' "$thread_id" "$turn_id"
-while IFS= read -r ignored; do :; done
+while IFS= read -r ignored; do printf '%s\n' "$ignored" >> {rpc_audit}; done
 "#,
         codex_home = shell_quote(paths.codex_home),
         argv_log = shell_quote(paths.argv_log),
@@ -987,6 +1066,8 @@ while IFS= read -r ignored; do :; done
         invocation_log = shell_quote(paths.invocation_log),
         fake_active_pid = shell_quote(paths.fake_active_pid),
         fake_delay = shell_quote(paths.fake_delay),
+        fake_recoverable_error = shell_quote(paths.fake_recoverable_error),
+        rpc_audit = shell_quote(paths.rpc_audit),
         fixture = shell_quote(paths.fixture),
         second_fixture = shell_quote(paths.second_fixture),
     )

@@ -24,6 +24,13 @@ const MAX_PROTOCOL_REQUEST_BYTES: usize = 1024 * 1024;
 const MAX_DIAGNOSTIC_FIELD_BYTES: usize = 4 * 1024;
 const MAX_STDERR_DIGEST_BYTES: usize = 64 * 1024;
 const REAP_TIMEOUT: Duration = Duration::from_secs(5);
+const PROTOCOL_CONTRACT_REFERENCE: &str = "rust-v0.145.0";
+const CODEX_ERROR_INFO_PATHS: [&str; 4] = [
+    "/codexErrorInfo",
+    "/error/codexErrorInfo",
+    "/result/codexErrorInfo",
+    "/result/error/codexErrorInfo",
+];
 
 const IMAGE_GENERATION_DEVELOPER_INSTRUCTIONS: &str = "For this thread, image requests MUST invoke the enabled namespaced tool image_gen.imagegen (wire name image_gen__imagegen) exactly once. Never answer an image request with text only. Do not use shell or local programs to create, copy, move, rename, edit, or delete the generated artifact. After the image tool completes, stop.";
 const IMAGE_GENERATION_DIRECT_TOOL_CONFIG: &str =
@@ -104,6 +111,8 @@ struct ProtocolState {
     image_failed: bool,
     image_incomplete: bool,
     failure_diagnostic: Option<FailureDiagnostic>,
+    last_retry_diagnostic: Option<FailureDiagnostic>,
+    retry_notification_count: usize,
     capture_diagnostic: ProtocolCaptureDiagnostic,
 }
 
@@ -125,6 +134,12 @@ struct FailureDiagnostic {
     numeric_code: Option<i64>,
     code: FieldDiagnostic,
     message: FieldDiagnostic,
+    codex_error_info: Option<CodexErrorInfoKind>,
+    http_status_code: Option<u16>,
+    will_retry: Option<bool>,
+    recovery_blocker: Option<RecoveryBlocker>,
+    policy_rejected: bool,
+    permits_stream_recovery: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -143,6 +158,79 @@ pub(crate) struct CodexAppServerFailureDiagnosticV1 {
     exit: PersistedExitDiagnostic,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     protocol: Option<PersistedProtocolDiagnostic>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    phase: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    codex_error_info: Option<CodexErrorInfoKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    http_status_code: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    will_retry: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    recovery_blocker: Option<RecoveryBlocker>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    retry_notification_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    invocation: Option<PersistedInvocationDiagnostic>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum RecoveryBlocker {
+    Auth,
+    NonTransientHttp,
+    MetadataRejected,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedInvocationDiagnostic {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    request_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    thread_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    turn_id_sha256: Option<String>,
+    image_index: u32,
+    attempt: u8,
+    protocol_contract: String,
+    client_package_version: String,
+}
+
+// The v0.145.0 protocol's closed error vocabulary, never upstream free text.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+enum CodexErrorInfoKind {
+    ContextWindowExceeded,
+    SessionBudgetExceeded,
+    UsageLimitExceeded,
+    ServerOverloaded,
+    CyberPolicy,
+    HttpConnectionFailed,
+    ResponseStreamConnectionFailed,
+    InternalServerError,
+    Unauthorized,
+    BadRequest,
+    ThreadRollbackFailed,
+    SandboxError,
+    ResponseStreamDisconnected,
+    ResponseTooManyFailedAttempts,
+    ActiveTurnNotSteerable,
+    Other,
+    Unknown,
+}
+
+fn is_zero(value: &usize) -> bool {
+    *value == 0
+}
+
+fn bounded_request_id(value: &str) -> Option<&str> {
+    (!value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.')))
+    .then_some(value)
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -173,6 +261,11 @@ impl CodexAppServerFailureDiagnosticV1 {
                 "unknown" | "tool_failure" | "rejected" | "authentication"
             )
             || self.numeric_code.is_some_and(|code| code != 401)
+            || self
+                .codex_error_info
+                .is_some_and(|kind| kind != CodexErrorInfoKind::Unauthorized)
+            || self.http_status_code.is_some_and(|code| code != 401)
+            || self.will_retry == Some(true)
         {
             return false;
         }
@@ -276,9 +369,33 @@ impl ProtocolState {
     }
 
     fn record_failure(&mut self, source: &'static str, value: &Value) {
-        if self.failure_diagnostic.is_some() {
-            return;
+        let diagnostic = Self::summarize_failure(source, value, None);
+        match self.failure_diagnostic.as_mut() {
+            Some(previous) if previous.policy_rejected => {}
+            Some(previous) if !diagnostic.policy_rejected => {
+                // Keep the first failure's classification and digests, but do
+                // not lose a later terminal reason behind a generic item error.
+                // An existing structured pair is never replaced or mixed.
+                if source == "turn_terminal"
+                    && previous.codex_error_info.is_none()
+                    && previous.http_status_code.is_none()
+                    && diagnostic
+                        .codex_error_info
+                        .is_some_and(|kind| kind != CodexErrorInfoKind::Unknown)
+                {
+                    previous.codex_error_info = diagnostic.codex_error_info;
+                    previous.http_status_code = diagnostic.http_status_code;
+                }
+            }
+            _ => self.failure_diagnostic = Some(diagnostic),
         }
+    }
+
+    fn summarize_failure(
+        source: &'static str,
+        value: &Value,
+        will_retry: Option<bool>,
+    ) -> FailureDiagnostic {
         let explicit_codes = failure_strings(
             value,
             &["/code", "/error/code", "/result/code", "/result/error/code"],
@@ -342,14 +459,88 @@ impl ProtocolState {
         {
             class = "explicit_failure";
         }
-        self.failure_diagnostic = Some(FailureDiagnostic {
+        let (codex_error_info, http_status_code) = summarize_codex_error_info(value);
+        let error_infos = CODEX_ERROR_INFO_PATHS
+            .iter()
+            .filter_map(|pointer| value.pointer(pointer).filter(|value| !value.is_null()))
+            .collect::<Vec<_>>();
+        // Error notifications add a TurnError envelope around legacy provider
+        // errors. Inspect its bounded nested fields without changing the
+        // existing primary classification or retaining any additional text.
+        let nested_error_signals = failure_strings(
+            value,
+            &[
+                "/error/error/code",
+                "/error/error/type",
+                "/error/error/message",
+                "/result/error/error/code",
+                "/result/error/error/type",
+                "/result/error/error/message",
+            ],
+        );
+        // Policy is an independent aggregate: classification precedence must
+        // not hide a later safety signal behind e.g. "prompt" or "bad_request".
+        let policy_rejected = error_infos
+            .iter()
+            .any(|info| info.as_str() == Some("cyberPolicy"))
+            || explicit_codes
+                .iter()
+                .chain(explicit_types.iter())
+                .chain(messages.iter())
+                .chain(nested_error_signals.iter())
+                .any(|value| contains_policy_signal(value));
+        let signal_blocker = explicit_codes
+            .iter()
+            .chain(explicit_types.iter())
+            .chain(messages.iter())
+            .chain(nested_error_signals.iter())
+            .find_map(|value| stream_recovery_blocker(value));
+        let permits_stream_recovery = !policy_rejected
+            && error_infos.len() == 1
+            && permits_stream_recovery(codex_error_info, http_status_code)
+            && !invalid_numeric_code
+            && signal_blocker.is_none()
+            && numeric_codes
+                .iter()
+                .all(|code| u16::try_from(*code).is_ok_and(is_transient_http_status))
+            && explicit_codes
+                .iter()
+                .chain(explicit_types.iter())
+                .all(|value| {
+                    matches!(
+                        classify_bytes(value.as_bytes()),
+                        "availability" | "rate_limit"
+                    )
+                })
+            && messages.iter().all(|value| {
+                !matches!(
+                    classify_bytes(value.as_bytes()),
+                    "authentication"
+                        | "forbidden"
+                        | "invalid_request"
+                        | "prompt"
+                        | "organization"
+                        | "account"
+                        | "entitlement"
+                        | "originator_policy"
+                        | "retention"
+                )
+            });
+        FailureDiagnostic {
             source,
             code_source,
             class,
             numeric_code: numeric_codes.first().copied(),
             code: summarize_field(code),
             message: summarize_field(message),
-        });
+            codex_error_info,
+            http_status_code,
+            will_retry,
+            recovery_blocker: (will_retry == Some(true) && !permits_stream_recovery)
+                .then(|| signal_blocker.unwrap_or(RecoveryBlocker::MetadataRejected)),
+            policy_rejected,
+            permits_stream_recovery,
+        }
     }
 
     fn bind_thread(&mut self, thread_id: Uuid) -> Result<(), CodexAppServerError> {
@@ -530,13 +721,49 @@ impl ProtocolState {
                             "turn_terminal",
                             params.pointer("/turn/error").unwrap_or(&Value::Null),
                         );
-                        Err(CodexAppServerError::TurnFailed)
+                        if self
+                            .failure_diagnostic
+                            .as_ref()
+                            .is_some_and(|value| value.policy_rejected)
+                        {
+                            Err(CodexAppServerError::ContentPolicyRejected)
+                        } else {
+                            Err(CodexAppServerError::TurnFailed)
+                        }
                     }
                     _ => Err(self.protocol_error("turn_terminal_status_invalid")),
                 };
             }
             "error" => {
-                self.record_failure("server_error_notification", params);
+                // An error must refer to the already bound/announced turn; it
+                // cannot establish identities or authorize another request.
+                self.observe_bound_identity(params)?;
+                let will_retry = match params.get("willRetry") {
+                    None => None,
+                    Some(Value::Bool(value)) => Some(*value),
+                    Some(_) => return Err(self.protocol_error("error_retry_flag_invalid")),
+                };
+                let diagnostic =
+                    Self::summarize_failure("server_error_notification", params, will_retry);
+                // Fail closed for policy rejection even if a contradictory
+                // notification claims it can retry. No client retry is added.
+                if self
+                    .failure_diagnostic
+                    .as_ref()
+                    .is_some_and(|value| value.policy_rejected)
+                {
+                    return Err(CodexAppServerError::ContentPolicyRejected);
+                }
+                if diagnostic.policy_rejected {
+                    self.failure_diagnostic = Some(diagnostic);
+                    return Err(CodexAppServerError::ContentPolicyRejected);
+                }
+                if will_retry == Some(true) && diagnostic.permits_stream_recovery {
+                    self.retry_notification_count = self.retry_notification_count.saturating_add(1);
+                    self.last_retry_diagnostic = Some(diagnostic);
+                    return Ok(false);
+                }
+                self.failure_diagnostic = Some(diagnostic);
                 return Err(CodexAppServerError::RequestRejected);
             }
             _ => {}
@@ -597,6 +824,13 @@ impl ProtocolState {
             return Err(self.protocol_error("terminal_identity_mismatch"));
         }
         if self.image_failed {
+            if self
+                .failure_diagnostic
+                .as_ref()
+                .is_some_and(|value| value.policy_rejected)
+            {
+                return Err(CodexAppServerError::ContentPolicyRejected);
+            }
             return Err(CodexAppServerError::ImageToolFailed);
         }
         if self.image_incomplete
@@ -855,6 +1089,7 @@ where
     })
     .await;
 
+    trace_retry_summary(&request, &state);
     let authority = match protocol_result {
         Ok(Ok(authority)) => authority,
         Ok(Err(error)) => {
@@ -982,6 +1217,131 @@ fn failure_numeric_codes(value: &Value) -> (Vec<i64>, bool) {
         }
     }
     (codes, invalid_numeric_code)
+}
+
+fn summarize_codex_error_info(value: &Value) -> (Option<CodexErrorInfoKind>, Option<u16>) {
+    let Some(info) = CODEX_ERROR_INFO_PATHS
+        .iter()
+        .find_map(|pointer| value.pointer(pointer).filter(|value| !value.is_null()))
+    else {
+        return (None, None);
+    };
+    let kind = match info.as_str() {
+        Some("contextWindowExceeded") => CodexErrorInfoKind::ContextWindowExceeded,
+        Some("sessionBudgetExceeded") => CodexErrorInfoKind::SessionBudgetExceeded,
+        Some("usageLimitExceeded") => CodexErrorInfoKind::UsageLimitExceeded,
+        Some("serverOverloaded") => CodexErrorInfoKind::ServerOverloaded,
+        Some("cyberPolicy") => CodexErrorInfoKind::CyberPolicy,
+        Some("internalServerError") => CodexErrorInfoKind::InternalServerError,
+        Some("unauthorized") => CodexErrorInfoKind::Unauthorized,
+        Some("badRequest") => CodexErrorInfoKind::BadRequest,
+        Some("threadRollbackFailed") => CodexErrorInfoKind::ThreadRollbackFailed,
+        Some("sandboxError") => CodexErrorInfoKind::SandboxError,
+        Some("other") => CodexErrorInfoKind::Other,
+        _ => CodexErrorInfoKind::Unknown,
+    };
+    if !info.is_object() {
+        return (Some(kind), None);
+    }
+    let Some(object) = info.as_object().filter(|value| value.len() == 1) else {
+        return (Some(CodexErrorInfoKind::Unknown), None);
+    };
+    let (variant, details) = object.iter().next().unwrap();
+    let kind = match variant.as_str() {
+        "httpConnectionFailed" => CodexErrorInfoKind::HttpConnectionFailed,
+        "responseStreamConnectionFailed" => CodexErrorInfoKind::ResponseStreamConnectionFailed,
+        "responseStreamDisconnected" => CodexErrorInfoKind::ResponseStreamDisconnected,
+        "responseTooManyFailedAttempts" => CodexErrorInfoKind::ResponseTooManyFailedAttempts,
+        "activeTurnNotSteerable" => {
+            // The kind is safe; never retain the open-ended turnKind payload.
+            let kind = if details.as_object().is_some_and(|details| {
+                details.len() == 1 && details.get("turnKind").is_some_and(Value::is_string)
+            }) {
+                CodexErrorInfoKind::ActiveTurnNotSteerable
+            } else {
+                CodexErrorInfoKind::Unknown
+            };
+            return (Some(kind), None);
+        }
+        _ => return (Some(CodexErrorInfoKind::Unknown), None),
+    };
+    let Some(details) = details.as_object().filter(|value| value.len() == 1) else {
+        return (Some(CodexErrorInfoKind::Unknown), None);
+    };
+    let Some(status) = details.get("httpStatusCode") else {
+        return (Some(CodexErrorInfoKind::Unknown), None);
+    };
+    if status.is_null() {
+        return (Some(kind), None);
+    }
+    match status.as_u64().filter(|value| (100..=599).contains(value)) {
+        Some(status) => (Some(kind), Some(status as u16)),
+        None => (Some(CodexErrorInfoKind::Unknown), None),
+    }
+}
+
+fn contains_policy_signal(value: &str) -> bool {
+    let normalized = value.to_ascii_lowercase();
+    [
+        "content_policy",
+        "cyber_policy",
+        "safety",
+        "moderation",
+        "policy",
+        "blocked",
+    ]
+    .iter()
+    .any(|signal| normalized.contains(signal))
+}
+
+fn is_transient_http_status(status: u16) -> bool {
+    matches!(status, 408 | 425 | 429 | 500..=599)
+}
+
+fn stream_recovery_blocker(value: &str) -> Option<RecoveryBlocker> {
+    let normalized = value.to_ascii_lowercase();
+    let signals = stream_policy_signals(&normalized);
+    if signals.contains(&"authentication") {
+        return Some(RecoveryBlocker::Auth);
+    }
+    if observed_http_statuses(&normalized)
+        .into_iter()
+        .any(|status| !is_transient_http_status(status))
+    {
+        return Some(RecoveryBlocker::NonTransientHttp);
+    }
+    (signals.into_iter().any(|signal| {
+        matches!(
+            signal,
+            "forbidden"
+                | "invalid_request"
+                | "unsupported"
+                | "prompt"
+                | "organization"
+                | "account"
+                | "entitlement"
+                | "originator"
+                | "retention"
+        )
+    }) || normalized.contains("bad_request")
+        || normalized.contains("bad request"))
+    .then_some(RecoveryBlocker::MetadataRejected)
+}
+
+fn permits_stream_recovery(kind: Option<CodexErrorInfoKind>, status: Option<u16>) -> bool {
+    match kind {
+        Some(CodexErrorInfoKind::ServerOverloaded | CodexErrorInfoKind::InternalServerError) => {
+            status.is_none()
+        }
+        Some(
+            CodexErrorInfoKind::HttpConnectionFailed
+            | CodexErrorInfoKind::ResponseStreamConnectionFailed
+            | CodexErrorInfoKind::ResponseStreamDisconnected,
+        ) => status.is_none_or(is_transient_http_status),
+        // Missing/unknown data, exhausted attempts, quotas, credentials and
+        // request/policy errors cannot authorize continued processing.
+        _ => false,
+    }
 }
 
 fn summarize_field(value: Option<&str>) -> FieldDiagnostic {
@@ -1265,14 +1625,26 @@ fn report_failure(
     stderr: Option<&StreamDiagnostic>,
     exit: &ExitDiagnostic,
 ) {
-    let diagnostic = build_failure_diagnostic(state, error, stderr, exit);
+    let mut diagnostic = build_failure_diagnostic(state, error, stderr, exit);
+    diagnostic.invocation = Some(PersistedInvocationDiagnostic {
+        request_id: bounded_request_id(request.request_id).map(str::to_string),
+        thread_id: state.thread_id,
+        turn_id_sha256: state
+            .turn_id
+            .as_deref()
+            .map(|value| hex::encode(Sha256::digest(value.as_bytes()))),
+        image_index: request.image_index,
+        attempt: request.attempt,
+        protocol_contract: PROTOCOL_CONTRACT_REFERENCE.to_string(),
+        client_package_version: env!("CARGO_PKG_VERSION").to_string(),
+    });
     trace_failure(request, &diagnostic);
     if request
         .failure_diagnostic_sink
         .is_some_and(|sink| sink(&diagnostic).is_err())
     {
         tracing::warn!(
-            request.id = request.request_id,
+            request.id = bounded_request_id(request.request_id).unwrap_or("redacted"),
             image.index = request.image_index,
             codex.attempt = request.attempt,
             codex.failure.category = error.code(),
@@ -1287,7 +1659,10 @@ fn build_failure_diagnostic(
     stderr: Option<&StreamDiagnostic>,
     exit: &ExitDiagnostic,
 ) -> CodexAppServerFailureDiagnosticV1 {
-    let failure = state.failure_diagnostic.as_ref();
+    let failure = state
+        .failure_diagnostic
+        .as_ref()
+        .or(state.last_retry_diagnostic.as_ref());
     CodexAppServerFailureDiagnosticV1 {
         schema_version: 1,
         failure_category: error.code().to_string(),
@@ -1328,7 +1703,35 @@ fn build_failure_diagnostic(
             notification_count: state.capture_diagnostic.notification_count,
             captured_bytes: state.capture_diagnostic.captured_bytes,
         }),
+        phase: (!state.capture_diagnostic.phase.is_empty())
+            .then(|| state.capture_diagnostic.phase.to_string()),
+        codex_error_info: failure.and_then(|value| value.codex_error_info),
+        http_status_code: failure.and_then(|value| value.http_status_code),
+        will_retry: failure.and_then(|value| value.will_retry),
+        recovery_blocker: failure.and_then(|value| value.recovery_blocker),
+        retry_notification_count: state.retry_notification_count,
+        invocation: None,
     }
+}
+
+fn trace_retry_summary(request: &CodexAppServerRequest<'_>, state: &ProtocolState) {
+    let Some(diagnostic) = state.last_retry_diagnostic.as_ref() else {
+        return;
+    };
+    // At most one content-free summary per invocation, not one log per event.
+    tracing::info!(
+        request.id = bounded_request_id(request.request_id).unwrap_or("redacted"),
+        image.index = request.image_index,
+        codex.attempt = request.attempt,
+        codex.protocol_contract = PROTOCOL_CONTRACT_REFERENCE,
+        codex.client_package_version = env!("CARGO_PKG_VERSION"),
+        codex.thread_id = ?state.thread_id,
+        codex.turn_id_sha256 = state.turn_id.as_deref().map(|value| hex::encode(Sha256::digest(value.as_bytes()))),
+        codex.retry_notification_count = state.retry_notification_count,
+        codex.error_info = ?diagnostic.codex_error_info,
+        codex.http_status_code = diagnostic.http_status_code,
+        "Codex app-server retry notifications stayed on the existing turn"
+    );
 }
 
 fn trace_failure(
@@ -1336,13 +1739,23 @@ fn trace_failure(
     diagnostic: &CodexAppServerFailureDiagnosticV1,
 ) {
     tracing::warn!(
-        request.id = request.request_id,
+        request.id = bounded_request_id(request.request_id).unwrap_or("redacted"),
         image.index = request.image_index,
         codex.attempt = request.attempt,
+        codex.protocol_contract = PROTOCOL_CONTRACT_REFERENCE,
+        codex.client_package_version = env!("CARGO_PKG_VERSION"),
+        codex.thread_id = ?diagnostic.invocation.as_ref().and_then(|value| value.thread_id),
+        codex.turn_id_sha256 = diagnostic.invocation.as_ref().and_then(|value| value.turn_id_sha256.as_deref()),
         codex.failure.category = diagnostic.failure_category,
         codex.failure.source = diagnostic.source,
         codex.failure.class = diagnostic.class,
         codex.failure.numeric_code = diagnostic.numeric_code,
+        codex.failure.phase = diagnostic.phase.as_deref().unwrap_or("none"),
+        codex.failure.error_info = ?diagnostic.codex_error_info,
+        codex.failure.http_status_code = diagnostic.http_status_code,
+        codex.failure.will_retry = diagnostic.will_retry,
+        codex.failure.recovery_blocker = ?diagnostic.recovery_blocker,
+        codex.retry_notification_count = diagnostic.retry_notification_count,
         codex.failure.code_source = ?diagnostic.code_source,
         codex.failure.code_sha256 = diagnostic.code.sha256.as_deref().unwrap_or("none"),
         codex.failure.code_bytes = diagnostic.code.bytes,
@@ -1587,6 +2000,25 @@ mod tests {
     const TURN_ID: &str = "019fd666-0416-7da2-bcc3-7f2f51efd3c9";
     const CALL_ID: &str = "call_exact_image";
 
+    fn error_notification(will_retry: Option<Value>, info: Value) -> Value {
+        let mut notification = json!({
+            "method": "error",
+            "params": {
+                "threadId": THREAD_ID,
+                "turnId": TURN_ID,
+                "error": {
+                    "message": "temporary synthetic sentinel",
+                    "codexErrorInfo": info,
+                    "additionalDetails": "synthetic-private-detail"
+                }
+            }
+        });
+        if let Some(will_retry) = will_retry {
+            notification["params"]["willRetry"] = will_retry;
+        }
+        notification
+    }
+
     #[derive(Clone, Copy)]
     enum FakeMode {
         Normal,
@@ -1600,6 +2032,15 @@ mod tests {
         MalformedSuffix,
         JoinTimeout,
         LateImage,
+        RetryThenSuccess,
+        RetryBeforeTurnResponse,
+        RetryThenFailure,
+        RetryUntilTimeout,
+        RepeatedRetryThenSuccess,
+        RetryThenExit,
+        RetryThenPartialFrame,
+        RetryThenInterrupted,
+        RetryThenLateImage,
     }
 
     struct FakeAppServer {
@@ -1630,7 +2071,9 @@ mod tests {
             std::fs::write(&replacement, b"replacement-native-image").unwrap();
 
             let output_action = match mode {
-                FakeMode::NoImage | FakeMode::LateImage => String::new(),
+                FakeMode::NoImage | FakeMode::LateImage | FakeMode::RetryThenLateImage => {
+                    String::new()
+                }
                 FakeMode::TransientOutput => format!(
                     "/bin/cp '{}' \"$output_path\"\n/bin/rm \"$output_path\"\n",
                     source.display()
@@ -1643,7 +2086,10 @@ mod tests {
                 _ => format!("/bin/cp '{}' \"$output_path\"\n", source.display()),
             };
             let image_events = match mode {
-                FakeMode::NoImage => String::new(),
+                FakeMode::NoImage
+                | FakeMode::RetryThenFailure
+                | FakeMode::RetryThenInterrupted
+                | FakeMode::RetryThenLateImage => String::new(),
                 FakeMode::MalformedEvent => "printf 'not-json\\n'\n".to_string(),
                 FakeMode::UnexpectedResponse => {
                     "printf '{\"id\":99,\"result\":{}}\\n'\n".to_string()
@@ -1661,13 +2107,65 @@ mod tests {
             let after_terminal = match mode {
                 FakeMode::MalformedSuffix => "printf 'not-json\\n'\n".to_string(),
                 FakeMode::JoinTimeout => "/bin/sleep 30\n".to_string(),
-                FakeMode::LateImage => format!(
+                FakeMode::LateImage | FakeMode::RetryThenLateImage => format!(
                     "printf '{{\"method\":\"item/started\",\"params\":{{\"threadId\":\"{THREAD_ID}\",\"turnId\":\"{TURN_ID}\",\"item\":{{\"type\":\"imageGeneration\",\"id\":\"{CALL_ID}\",\"status\":\"inProgress\"}}}}}}\\n'\nprintf '{{\"method\":\"item/completed\",\"params\":{{\"threadId\":\"{THREAD_ID}\",\"turnId\":\"{TURN_ID}\",\"item\":{{\"type\":\"imageGeneration\",\"id\":\"{CALL_ID}\",\"status\":\"completed\",\"result\":\"cG5n\",\"savedPath\":\"%s\"}}}}}}\\n' \"$output_path\"\n"
                 ),
                 _ => String::new(),
             };
+            // Capture every later stdin message too, so the same-turn test
+            // detects an accidental additional request rather than assuming it.
+            let after_terminal = format!(
+                "{after_terminal}while IFS= read -r remaining; do printf '%s\\n' \"$remaining\" >> '{}'; done\n",
+                root.path().join("requests.jsonl").display()
+            );
+            let retry_notice = format!(
+                "printf '%s\\n' '{}'\n",
+                error_notification(
+                    Some(json!(true)),
+                    json!({"httpConnectionFailed": {"httpStatusCode": 503}})
+                )
+            );
+            let before_turn_response = if matches!(mode, FakeMode::RetryBeforeTurnResponse) {
+                retry_notice.clone()
+            } else {
+                String::new()
+            };
+            let before_images = match mode {
+                FakeMode::RetryThenSuccess
+                | FakeMode::RetryThenFailure
+                | FakeMode::RetryThenInterrupted
+                | FakeMode::RetryThenLateImage => retry_notice,
+                FakeMode::RepeatedRetryThenSuccess => retry_notice.repeat(3),
+                FakeMode::RetryThenExit => format!("{retry_notice}exit 0\n"),
+                FakeMode::RetryThenPartialFrame => {
+                    format!("{retry_notice}printf '{{\"method\":'\nexit 0\n")
+                }
+                FakeMode::RetryUntilTimeout => {
+                    format!("while :; do\n{retry_notice}/bin/sleep 0.02\ndone\n")
+                }
+                _ => String::new(),
+            };
+            let terminal = if matches!(
+                mode,
+                FakeMode::RetryThenFailure | FakeMode::RetryThenInterrupted
+            ) {
+                json!({
+                    "method": "turn/completed",
+                    "params": {"threadId": THREAD_ID, "turn": {
+                        "id": TURN_ID, "status": if matches!(mode, FakeMode::RetryThenInterrupted) { "interrupted" } else { "failed" },
+                        "error": {"message": "final synthetic sentinel", "codexErrorInfo": "badRequest",
+                            "request_id": "synthetic-private-upstream", "attempt": 99}
+                    }}
+                })
+            } else {
+                json!({
+                    "method": "turn/completed",
+                    "params": {"threadId": THREAD_ID, "turn": {"id": TURN_ID, "status": "completed"}}
+                })
+            };
             let script = format!(
-                "#!/bin/sh\nset -eu\nIFS= read -r initialize\nprintf '{{\"id\":1,\"result\":{{\"codexHome\":\"%s\"}}}}\\n' \"$CODEX_HOME\"\nIFS= read -r initialized\nIFS= read -r thread_start\nprintf '{{\"method\":\"thread/started\",\"params\":{{\"thread\":{{\"id\":\"{THREAD_ID}\"}}}}}}\\n'\nprintf '{{\"id\":2,\"result\":{{\"thread\":{{\"id\":\"{THREAD_ID}\"}}}}}}\\n'\nIFS= read -r turn_start\nprintf '{{\"method\":\"turn/started\",\"params\":{{\"threadId\":\"{THREAD_ID}\",\"turn\":{{\"id\":\"{TURN_ID}\"}}}}}}\\n'\nprintf '{{\"id\":3,\"result\":{{\"turn\":{{\"id\":\"{TURN_ID}\"}}}}}}\\n'\noutput_dir=\"$CODEX_HOME/generated_images/{THREAD_ID}\"\noutput_path=\"$output_dir/{CALL_ID}.png\"\n/bin/mkdir -p \"$output_dir\"\n/bin/chmod 700 \"$CODEX_HOME/generated_images\" \"$output_dir\"\n{output_action}/bin/chmod 600 \"$output_path\" 2>/dev/null || true\n{image_events}printf '{{\"method\":\"turn/completed\",\"params\":{{\"threadId\":\"{THREAD_ID}\",\"turn\":{{\"id\":\"{TURN_ID}\",\"status\":\"completed\"}}}}}}\\n'\n{after_terminal}while IFS= read -r ignored; do :; done\n"
+                "#!/bin/sh\nset -eu\nIFS= read -r initialize\nprintf '{{\"id\":1,\"result\":{{\"codexHome\":\"%s\"}}}}\\n' \"$CODEX_HOME\"\nIFS= read -r initialized\nIFS= read -r thread_start\nprintf '{{\"method\":\"thread/started\",\"params\":{{\"thread\":{{\"id\":\"{THREAD_ID}\"}}}}}}\\n'\nprintf '{{\"id\":2,\"result\":{{\"thread\":{{\"id\":\"{THREAD_ID}\"}}}}}}\\n'\nIFS= read -r turn_start\nprintf '%s\\n%s\\n' \"$thread_start\" \"$turn_start\" > '{}'\nprintf '{{\"method\":\"turn/started\",\"params\":{{\"threadId\":\"{THREAD_ID}\",\"turn\":{{\"id\":\"{TURN_ID}\"}}}}}}\\n'\n{before_turn_response}printf '{{\"id\":3,\"result\":{{\"turn\":{{\"id\":\"{TURN_ID}\"}}}}}}\\n'\n{before_images}output_dir=\"$CODEX_HOME/generated_images/{THREAD_ID}\"\noutput_path=\"$output_dir/{CALL_ID}.png\"\n/bin/mkdir -p \"$output_dir\"\n/bin/chmod 700 \"$CODEX_HOME/generated_images\" \"$output_dir\"\n{output_action}/bin/chmod 600 \"$output_path\" 2>/dev/null || true\n{image_events}printf '%s\\n' '{terminal}'\n{after_terminal}while IFS= read -r ignored; do :; done\n",
+                root.path().join("requests.jsonl").display()
             );
             std::fs::write(&executable, script).unwrap();
             std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -1745,6 +2243,772 @@ mod tests {
             fixture.run(Duration::from_secs(30)).await.unwrap(),
             fixture.expected
         );
+    }
+
+    #[tokio::test]
+    async fn retry_notifications_continue_the_same_turn_without_new_requests() {
+        for mode in [
+            FakeMode::RetryThenSuccess,
+            FakeMode::RetryBeforeTurnResponse,
+            FakeMode::RepeatedRetryThenSuccess,
+        ] {
+            let fixture = FakeAppServer::new(mode);
+            let (result, diagnostic) = fixture.run_capturing(Duration::from_secs(30)).await;
+            assert_eq!(result, Ok(fixture.expected.clone()));
+            assert!(
+                diagnostic.is_none(),
+                "recovered errors are not terminal failures"
+            );
+            let requests =
+                std::fs::read_to_string(fixture._root.path().join("requests.jsonl")).unwrap();
+            let methods = requests
+                .lines()
+                .map(|line| serde_json::from_str::<Value>(line).unwrap()["method"].clone())
+                .collect::<Vec<_>>();
+            assert_eq!(methods, [json!("thread/start"), json!("turn/start")]);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_final_failure_replaces_transient_diagnostics() {
+        let fixture = FakeAppServer::new(FakeMode::RetryThenFailure);
+        let (result, diagnostic) = fixture.run_capturing(Duration::from_secs(30)).await;
+        assert_eq!(result, Err(CodexAppServerError::TurnFailed));
+        let diagnostic = diagnostic.unwrap();
+        assert_eq!(diagnostic.source, "turn_terminal");
+        assert_eq!(
+            diagnostic.codex_error_info,
+            Some(CodexErrorInfoKind::BadRequest)
+        );
+        assert_eq!(diagnostic.http_status_code, None);
+        assert_eq!(diagnostic.will_retry, None);
+        assert_eq!(diagnostic.retry_notification_count, 1);
+        assert_eq!(diagnostic.phase.as_deref(), Some("event_stream"));
+        assert!(!diagnostic.is_retryable_authentication_rejection());
+        let invocation = diagnostic.invocation.unwrap();
+        assert_eq!(invocation.request_id.as_deref(), Some("req_test"));
+        assert_eq!(
+            invocation.thread_id,
+            Some(Uuid::parse_str(THREAD_ID).unwrap())
+        );
+        assert_eq!(
+            invocation.turn_id_sha256,
+            Some(hex::encode(Sha256::digest(TURN_ID.as_bytes())))
+        );
+        assert_eq!(invocation.image_index, 1);
+        assert_eq!(invocation.attempt, 1);
+        assert_eq!(invocation.protocol_contract, "rust-v0.145.0");
+        assert_eq!(invocation.client_package_version, env!("CARGO_PKG_VERSION"));
+        let mut legacy = serde_json::to_value(&invocation).unwrap();
+        assert!(!legacy.to_string().contains(TURN_ID));
+        legacy.as_object_mut().unwrap().remove("thread_id");
+        legacy.as_object_mut().unwrap().remove("turn_id_sha256");
+        let legacy: PersistedInvocationDiagnostic = serde_json::from_value(legacy).unwrap();
+        assert_eq!(legacy.thread_id, None);
+        assert_eq!(legacy.turn_id_sha256, None);
+    }
+
+    #[tokio::test]
+    async fn recovering_stream_loss_cancellation_and_late_output_never_succeed() {
+        for (mode, expected) in [
+            (FakeMode::RetryThenExit, CodexAppServerError::ProcessExited),
+            (
+                FakeMode::RetryThenPartialFrame,
+                CodexAppServerError::ProcessExited,
+            ),
+            (
+                FakeMode::RetryThenInterrupted,
+                CodexAppServerError::TurnFailed,
+            ),
+            (FakeMode::RetryThenLateImage, CodexAppServerError::Protocol),
+        ] {
+            let fixture = FakeAppServer::new(mode);
+            let (result, diagnostic) = fixture.run_capturing(Duration::from_secs(30)).await;
+            assert_eq!(result, Err(expected));
+            let diagnostic = diagnostic.unwrap();
+            assert_eq!(diagnostic.retry_notification_count, 1);
+            assert!(!diagnostic.is_retryable_authentication_rejection());
+            assert!(
+                !serde_json::to_string(&diagnostic)
+                    .unwrap()
+                    .contains("synthetic-private")
+            );
+            if matches!(mode, FakeMode::RetryThenInterrupted) {
+                assert_eq!(diagnostic.source, "turn_terminal");
+                assert_eq!(diagnostic.will_retry, None);
+                assert_eq!(
+                    diagnostic.codex_error_info,
+                    Some(CodexErrorInfoKind::BadRequest)
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn retry_notifications_do_not_extend_the_invocation_deadline() {
+        let fixture = FakeAppServer::new(FakeMode::RetryUntilTimeout);
+        let started = tokio::time::Instant::now();
+        let (result, diagnostic) = fixture.run_capturing(Duration::from_millis(500)).await;
+        assert_eq!(result, Err(CodexAppServerError::Timeout));
+        assert!(started.elapsed() < REAP_TIMEOUT + Duration::from_secs(2));
+        let diagnostic = diagnostic.unwrap();
+        assert!(diagnostic.retry_notification_count > 1);
+        assert_eq!(diagnostic.will_retry, Some(true));
+        assert_eq!(diagnostic.http_status_code, Some(503));
+        assert_eq!(diagnostic.phase.as_deref(), Some("event_stream"));
+        assert!(!diagnostic.is_retryable_authentication_rejection());
+    }
+
+    #[tokio::test]
+    async fn retry_notifications_share_the_existing_capture_budget() {
+        let notification = error_notification(Some(json!(true)), json!("serverOverloaded"));
+        let line = serde_json::to_string(&notification).unwrap();
+        let input = format!("{line}\n{line}\n");
+        let mut reader = BufReader::new(input.as_bytes());
+        let home = Path::new("/private/codex-home");
+        let mut state = announced_state(home, Uuid::parse_str(THREAD_ID).unwrap());
+        state.protocol_phase("event_stream");
+        let mut captured = MAX_PROTOCOL_CAPTURE_BYTES - line.len();
+        let message = read_message(&mut reader, &mut state, &mut captured)
+            .await
+            .unwrap();
+        assert_eq!(state.observe_notification(&message, home), Ok(false));
+        assert_eq!(captured, MAX_PROTOCOL_CAPTURE_BYTES);
+        assert_eq!(
+            read_message(&mut reader, &mut state, &mut captured).await,
+            Err(CodexAppServerError::Protocol)
+        );
+        assert_eq!(state.capture_diagnostic.reason, "capture_limit_exceeded");
+        assert_eq!(state.retry_notification_count, 1);
+    }
+
+    #[test]
+    fn error_notifications_require_existing_exact_identities() {
+        let home = Path::new("/private/codex-home");
+        for (field, replacement) in [
+            ("threadId", Some(json!(Uuid::new_v4().to_string()))),
+            ("turnId", Some(json!("foreign-turn"))),
+            ("threadId", None),
+            ("turnId", None),
+        ] {
+            let mut state = announced_state(home, Uuid::parse_str(THREAD_ID).unwrap());
+            let mut notification = error_notification(Some(json!(true)), json!("serverOverloaded"));
+            if let Some(replacement) = replacement {
+                notification["params"][field] = replacement;
+            } else {
+                notification["params"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove(field);
+            }
+            assert_eq!(
+                state.observe_notification(&notification, home),
+                Err(CodexAppServerError::Protocol)
+            );
+            assert_eq!(state.retry_notification_count, 0);
+        }
+        let notification = error_notification(Some(json!(true)), json!("serverOverloaded"));
+        let mut unbound = ProtocolState::default();
+        assert_eq!(
+            unbound.observe_notification(&notification, home),
+            Err(CodexAppServerError::Protocol)
+        );
+        assert!(unbound.thread_id.is_none());
+        assert!(unbound.turn_id.is_none());
+
+        let mut announced = announced_state(home, Uuid::parse_str(THREAD_ID).unwrap());
+        announced.turn_id = None;
+        assert_eq!(
+            announced.observe_notification(&notification, home),
+            Ok(false)
+        );
+        assert!(announced.turn_id.is_none(), "error cannot bind a turn");
+    }
+
+    #[test]
+    fn final_legacy_and_malformed_error_notifications_fail_closed() {
+        let home = Path::new("/private/codex-home");
+        for flag in [Some(json!(false)), None] {
+            let mut state = announced_state(home, Uuid::parse_str(THREAD_ID).unwrap());
+            state.protocol_phase("event_stream");
+            let notification = error_notification(
+                flag.clone(),
+                json!({"httpConnectionFailed": {"httpStatusCode": 403}}),
+            );
+            assert_eq!(
+                state.observe_notification(&notification, home),
+                Err(CodexAppServerError::RequestRejected)
+            );
+            let diagnostic = build_failure_diagnostic(
+                &state,
+                CodexAppServerError::RequestRejected,
+                None,
+                &ExitDiagnostic::default(),
+            );
+            assert_eq!(
+                diagnostic.will_retry,
+                flag.and_then(|value| value.as_bool())
+            );
+            assert_eq!(diagnostic.http_status_code, Some(403));
+            assert_eq!(diagnostic.retry_notification_count, 0);
+            assert!(!diagnostic.is_retryable_authentication_rejection());
+        }
+        for flag in [json!(null), json!(1), json!("true"), json!({})] {
+            let mut state = announced_state(home, Uuid::parse_str(THREAD_ID).unwrap());
+            assert_eq!(
+                state.observe_notification(&error_notification(Some(flag), json!("other")), home),
+                Err(CodexAppServerError::Protocol)
+            );
+            assert_eq!(state.capture_diagnostic.reason, "error_retry_flag_invalid");
+            assert_eq!(state.retry_notification_count, 0);
+        }
+    }
+
+    #[test]
+    fn policy_rejections_cannot_be_made_retryable_by_a_notification() {
+        let home = Path::new("/private/codex-home");
+        for flag in [true, false] {
+            for info in [json!("cyberPolicy"), json!(null)] {
+                let mut notification = error_notification(Some(json!(flag)), info);
+                notification["params"]["error"]["message"] =
+                    json!("content_policy synthetic sentinel");
+                let mut state = announced_state(home, Uuid::parse_str(THREAD_ID).unwrap());
+                assert_eq!(
+                    state.observe_notification(&notification, home),
+                    Err(CodexAppServerError::ContentPolicyRejected)
+                );
+                assert_eq!(state.retry_notification_count, 0);
+                assert!(
+                    !build_failure_diagnostic(
+                        &state,
+                        CodexAppServerError::ContentPolicyRejected,
+                        None,
+                        &ExitDiagnostic::default(),
+                    )
+                    .is_retryable_authentication_rejection()
+                );
+            }
+        }
+        let mut state = announced_state(home, Uuid::parse_str(THREAD_ID).unwrap());
+        assert_eq!(
+            state.observe_notification(
+                &error_notification(Some(json!(true)), json!("cyberPolicy")),
+                home
+            ),
+            Err(CodexAppServerError::ContentPolicyRejected)
+        );
+    }
+
+    #[test]
+    fn policy_signals_cannot_be_hidden_by_earlier_failure_classification() {
+        let home = Path::new("/private/codex-home");
+        for error in [
+            json!({"code": "bad_request", "message": "prompt blocked by safety policy"}),
+            json!({"type": "invalid_request_error", "message": "prompt synthetic sentinel",
+                "error": {"code": "content_policy"}}),
+            json!({"code": "unavailable", "message": "synthetic sentinel",
+                "error": {"type": "moderation"}}),
+        ] {
+            for flag in [true, false] {
+                let mut notification =
+                    error_notification(Some(json!(flag)), json!("serverOverloaded"));
+                notification["params"]["error"] = error.clone();
+                notification["params"]["error"]["codexErrorInfo"] = json!("serverOverloaded");
+                let mut state = announced_state(home, Uuid::parse_str(THREAD_ID).unwrap());
+                assert_eq!(
+                    state.observe_notification(&notification, home),
+                    Err(CodexAppServerError::ContentPolicyRejected)
+                );
+                assert!(state.failure_diagnostic.as_ref().unwrap().policy_rejected);
+                assert_eq!(state.retry_notification_count, 0);
+            }
+        }
+        for flag in [true, false] {
+            let mut state = announced_state(home, Uuid::parse_str(THREAD_ID).unwrap());
+            state.record_failure(
+                "image_generation_item",
+                &json!({
+                    "type": "imageGeneration", "result": {
+                        "code": "bad_request", "message": "prompt blocked by safety policy"
+                    }
+                }),
+            );
+            state.image_failed = true;
+            assert_eq!(
+                state.authority(),
+                Err(CodexAppServerError::ContentPolicyRejected)
+            );
+            assert_eq!(
+                state.observe_notification(
+                    &error_notification(Some(json!(flag)), json!("serverOverloaded")),
+                    home,
+                ),
+                Err(CodexAppServerError::ContentPolicyRejected)
+            );
+            assert_eq!(
+                state.failure_diagnostic.as_ref().unwrap().source,
+                "image_generation_item"
+            );
+            assert!(state.failure_diagnostic.as_ref().unwrap().policy_rejected);
+            assert_eq!(state.retry_notification_count, 0);
+        }
+        let mut state = announced_state(home, Uuid::parse_str(THREAD_ID).unwrap());
+        let mut notification = error_notification(Some(json!(true)), json!("cyberPolicy"));
+        notification["params"]["codexErrorInfo"] = json!("serverOverloaded");
+        assert_eq!(
+            state.observe_notification(&notification, home),
+            Err(CodexAppServerError::ContentPolicyRejected)
+        );
+    }
+
+    #[test]
+    fn only_explicit_consistent_transient_error_kinds_can_continue() {
+        let home = Path::new("/private/codex-home");
+        for info in [
+            json!(null),
+            json!("other"),
+            json!("synthetic-private-unknown"),
+            json!({"synthetic-private-key": {}}),
+            json!("unauthorized"),
+            json!("badRequest"),
+            json!("usageLimitExceeded"),
+            json!({"responseTooManyFailedAttempts": {"httpStatusCode": 503}}),
+            json!({"httpConnectionFailed": {"httpStatusCode": 400}}),
+            json!({"httpConnectionFailed": {"httpStatusCode": 401}}),
+            json!({"httpConnectionFailed": {"httpStatusCode": 403}}),
+            json!({"httpConnectionFailed": {"httpStatusCode": "503"}}),
+            json!({"httpConnectionFailed": {"httpStatusCode": 503}, "unknown": {}}),
+        ] {
+            let mut state = announced_state(home, Uuid::parse_str(THREAD_ID).unwrap());
+            assert_eq!(
+                state.observe_notification(&error_notification(Some(json!(true)), info), home),
+                Err(CodexAppServerError::RequestRejected)
+            );
+            assert_eq!(state.retry_notification_count, 0);
+        }
+        let mut missing = error_notification(Some(json!(true)), json!(null));
+        missing["params"]["error"]
+            .as_object_mut()
+            .unwrap()
+            .remove("codexErrorInfo");
+        let mut ambiguous =
+            error_notification(Some(json!(true)), json!("synthetic-private-unknown"));
+        ambiguous["params"]["codexErrorInfo"] = json!("serverOverloaded");
+        let mut contradictory = error_notification(
+            Some(json!(true)),
+            json!({"httpConnectionFailed": {"httpStatusCode": 503}}),
+        );
+        contradictory["params"]["error"]["code"] = json!(401);
+        for notification in [missing, ambiguous, contradictory] {
+            let mut state = announced_state(home, Uuid::parse_str(THREAD_ID).unwrap());
+            assert_eq!(
+                state.observe_notification(&notification, home),
+                Err(CodexAppServerError::RequestRejected)
+            );
+            assert_eq!(state.retry_notification_count, 0);
+        }
+        for status in [
+            json!(null),
+            json!(408),
+            json!(425),
+            json!(429),
+            json!(500),
+            json!(503),
+            json!(599),
+        ] {
+            let mut state = announced_state(home, Uuid::parse_str(THREAD_ID).unwrap());
+            assert_eq!(
+                state.observe_notification(
+                    &error_notification(
+                        Some(json!(true)),
+                        json!({"responseStreamDisconnected": {"httpStatusCode": status}})
+                    ),
+                    home
+                ),
+                Ok(false)
+            );
+            assert_eq!(state.retry_notification_count, 1);
+        }
+    }
+
+    #[test]
+    fn permanent_signals_cannot_be_hidden_by_transient_error_classification() {
+        let home = Path::new("/private/codex-home");
+        for info in [
+            json!("serverOverloaded"),
+            json!({"httpConnectionFailed": {"httpStatusCode": null}}),
+            json!({"httpConnectionFailed": {"httpStatusCode": 503}}),
+        ] {
+            for error in [
+                json!({"message": "HTTP 401"}),
+                json!({"message": "HTTP 401 authentication unavailable"}),
+                json!({"message": "HTTP 400 upstream unavailable"}),
+                json!({"message": "HTTP 403 upstream unavailable"}),
+                json!({"message": "HTTP 503 then HTTP 401"}),
+                json!({"message": "authentication temporarily unavailable"}),
+                json!({"code": "authentication_unavailable"}),
+                json!({"type": "credential_unavailable"}),
+                json!({"message": "bad request; upstream unavailable"}),
+                json!({"code": "unavailable", "error": {"message": "HTTP 401"}}),
+                json!({"code": "unavailable", "error": {"code": "authentication_unavailable"}}),
+            ] {
+                let mut notification = error_notification(Some(json!(true)), info.clone());
+                notification["params"]["error"] = error;
+                notification["params"]["error"]["codexErrorInfo"] = info.clone();
+                let mut state = announced_state(home, Uuid::parse_str(THREAD_ID).unwrap());
+                assert_eq!(
+                    state.observe_notification(&notification, home),
+                    Err(CodexAppServerError::RequestRejected),
+                    "contradictory notification must not recover: {notification}"
+                );
+                assert_eq!(state.retry_notification_count, 0);
+                assert!(state.last_retry_diagnostic.is_none());
+                let diagnostic = build_failure_diagnostic(
+                    &state,
+                    CodexAppServerError::RequestRejected,
+                    None,
+                    &ExitDiagnostic::default(),
+                );
+                assert!(!diagnostic.is_retryable_authentication_rejection());
+                assert!(diagnostic.recovery_blocker.is_some());
+                let encoded = serde_json::to_string(&diagnostic).unwrap();
+                assert!(!encoded.contains("authentication_unavailable"));
+                assert!(!encoded.contains("upstream unavailable"));
+            }
+            let mut notification = error_notification(Some(json!(true)), info);
+            notification["params"]["error"]["code"] = json!("service_unavailable");
+            notification["params"]["error"]["message"] = json!("HTTP 503 upstream unavailable");
+            let mut state = announced_state(home, Uuid::parse_str(THREAD_ID).unwrap());
+            assert_eq!(state.observe_notification(&notification, home), Ok(false));
+            assert_eq!(state.retry_notification_count, 1);
+            assert_eq!(state.last_retry_diagnostic.unwrap().recovery_blocker, None);
+        }
+    }
+
+    #[test]
+    fn recovery_blockers_explain_only_denied_retry_notices_without_persisting_text() {
+        let home = Path::new("/private/codex-home");
+        for (info, message, blocker) in [
+            (
+                json!({"httpConnectionFailed": {"httpStatusCode": 503}}),
+                "HTTP 401 authentication unavailable",
+                Some(RecoveryBlocker::Auth),
+            ),
+            (
+                json!({"httpConnectionFailed": {"httpStatusCode": 503}}),
+                "HTTP 401",
+                Some(RecoveryBlocker::NonTransientHttp),
+            ),
+            (
+                json!("usageLimitExceeded"),
+                "synthetic-private-terminal-message",
+                Some(RecoveryBlocker::MetadataRejected),
+            ),
+            (
+                json!({"httpConnectionFailed": {"httpStatusCode": 503}}),
+                "HTTP 503 upstream unavailable",
+                None,
+            ),
+        ] {
+            for flag in [Some(json!(true)), Some(json!(false)), None] {
+                let retry_requested = flag.as_ref().and_then(Value::as_bool) == Some(true);
+                let mut notification = error_notification(flag, info.clone());
+                notification["params"]["error"]["message"] = json!(message);
+                let mut state = announced_state(home, Uuid::parse_str(THREAD_ID).unwrap());
+                let result = state.observe_notification(&notification, home);
+                assert_eq!(
+                    result,
+                    if retry_requested && blocker.is_none() {
+                        Ok(false)
+                    } else {
+                        Err(CodexAppServerError::RequestRejected)
+                    }
+                );
+                let diagnostic = build_failure_diagnostic(
+                    &state,
+                    CodexAppServerError::RequestRejected,
+                    None,
+                    &ExitDiagnostic::default(),
+                );
+                assert_eq!(
+                    diagnostic.recovery_blocker,
+                    if retry_requested { blocker } else { None }
+                );
+                assert!(!diagnostic.is_retryable_authentication_rejection());
+                let mut encoded = serde_json::to_value(&diagnostic).unwrap();
+                assert!(!encoded.to_string().contains(message));
+                if let Some(blocker) = diagnostic.recovery_blocker {
+                    assert_eq!(
+                        encoded["recovery_blocker"],
+                        match blocker {
+                            RecoveryBlocker::Auth => json!("auth"),
+                            RecoveryBlocker::NonTransientHttp => json!("non_transient_http"),
+                            RecoveryBlocker::MetadataRejected => json!("metadata_rejected"),
+                        }
+                    );
+                } else {
+                    assert!(
+                        !encoded
+                            .as_object()
+                            .unwrap()
+                            .contains_key("recovery_blocker")
+                    );
+                }
+                encoded.as_object_mut().unwrap().remove("recovery_blocker");
+                let legacy: CodexAppServerFailureDiagnosticV1 =
+                    serde_json::from_value(encoded.clone()).unwrap();
+                assert_eq!(legacy.recovery_blocker, None);
+                encoded["recovery_blocker"] = json!("synthetic-private-unknown");
+                assert!(
+                    serde_json::from_value::<CodexAppServerFailureDiagnosticV1>(encoded).is_err()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn terminal_reason_fills_generic_item_diagnostics_without_replacing_first_failure() {
+        let home = Path::new("/private/codex-home");
+        for (info, kind, status) in [
+            (
+                json!("usageLimitExceeded"),
+                CodexErrorInfoKind::UsageLimitExceeded,
+                None,
+            ),
+            (
+                json!({"httpConnectionFailed": {"httpStatusCode": 401}}),
+                CodexErrorInfoKind::HttpConnectionFailed,
+                Some(401),
+            ),
+            (
+                json!({"httpConnectionFailed": {"httpStatusCode": 503}}),
+                CodexErrorInfoKind::HttpConnectionFailed,
+                Some(503),
+            ),
+        ] {
+            let mut state = announced_state(home, Uuid::parse_str(THREAD_ID).unwrap());
+            let item = json!({
+                "threadId": THREAD_ID, "turnId": TURN_ID,
+                "item": {"type": "imageGeneration", "id": CALL_ID, "status": "inProgress"}
+            });
+            assert_eq!(
+                state
+                    .observe_notification(&json!({"method": "item/started", "params": item}), home),
+                Ok(false)
+            );
+            let mut item = item;
+            item["item"]["status"] = json!("failed");
+            item["item"]["result"] = json!("synthetic-private-first-error");
+            assert_eq!(
+                state.observe_notification(
+                    &json!({"method": "item/completed", "params": item}),
+                    home
+                ),
+                Ok(false)
+            );
+            let first = build_failure_diagnostic(
+                &state,
+                CodexAppServerError::ImageToolFailed,
+                None,
+                &ExitDiagnostic::default(),
+            );
+            assert_eq!(first.codex_error_info, None);
+            assert_eq!(
+                state.observe_notification(&json!({
+                    "method": "turn/completed", "params": {
+                        "threadId": THREAD_ID,
+                        "turn": {"id": TURN_ID, "status": "failed", "error": {
+                            "message": "synthetic-private-terminal-error", "codexErrorInfo": info
+                        }}
+                    }
+                }), home),
+                Err(CodexAppServerError::TurnFailed)
+            );
+            let terminal = build_failure_diagnostic(
+                &state,
+                CodexAppServerError::TurnFailed,
+                None,
+                &ExitDiagnostic::default(),
+            );
+            assert_eq!(terminal.source, first.source);
+            assert_eq!(terminal.class, first.class);
+            assert_eq!(terminal.code, first.code);
+            assert_eq!(terminal.message, first.message);
+            assert_eq!(terminal.codex_error_info, Some(kind));
+            assert_eq!(terminal.http_status_code, status);
+            assert!(!terminal.is_retryable_authentication_rejection());
+            assert!(
+                !serde_json::to_string(&terminal)
+                    .unwrap()
+                    .contains("synthetic-private")
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_reason_never_replaces_existing_structured_or_policy_evidence() {
+        for first in [
+            json!({"message": "authentication", "codexErrorInfo": {"httpConnectionFailed": {"httpStatusCode": 401}}}),
+            json!({"message": "content_policy", "codexErrorInfo": "cyberPolicy"}),
+        ] {
+            let mut state = ProtocolState::default();
+            state.record_failure("image_generation_item", &first);
+            let previous = build_failure_diagnostic(
+                &state,
+                CodexAppServerError::ImageToolFailed,
+                None,
+                &ExitDiagnostic::default(),
+            );
+            state.record_failure(
+                "turn_terminal",
+                &json!({
+                    "message": "temporary synthetic sentinel",
+                    "codexErrorInfo": {"httpConnectionFailed": {"httpStatusCode": 503}}
+                }),
+            );
+            let current = build_failure_diagnostic(
+                &state,
+                CodexAppServerError::TurnFailed,
+                None,
+                &ExitDiagnostic::default(),
+            );
+            assert_eq!(current.source, previous.source);
+            assert_eq!(current.codex_error_info, previous.codex_error_info);
+            assert_eq!(current.http_status_code, previous.http_status_code);
+            assert_eq!(current.message, previous.message);
+            assert_eq!(current.class, previous.class);
+            assert!(!current.is_retryable_authentication_rejection());
+        }
+    }
+
+    #[test]
+    fn upstream_error_metadata_is_allowlisted_bounded_and_additive() {
+        let home = Path::new("/private/codex-home");
+        let unknown = "synthetic-private-unknown".repeat(1000);
+        for info in [
+            json!(unknown),
+            json!({"synthetic-private-unknown": {"secret": unknown}}),
+        ] {
+            let mut state = announced_state(home, Uuid::parse_str(THREAD_ID).unwrap());
+            state.protocol_phase("event_stream");
+            assert_eq!(
+                state.observe_notification(&error_notification(Some(json!(false)), info), home),
+                Err(CodexAppServerError::RequestRejected)
+            );
+            let diagnostic = build_failure_diagnostic(
+                &state,
+                CodexAppServerError::RequestRejected,
+                None,
+                &ExitDiagnostic::default(),
+            );
+            assert_eq!(
+                diagnostic.codex_error_info,
+                Some(CodexErrorInfoKind::Unknown)
+            );
+            let encoded = serde_json::to_string(&diagnostic).unwrap();
+            assert!(!encoded.contains("synthetic-private"));
+            assert!(!encoded.contains("synthetic sentinel"));
+            assert!(encoded.len() < 4096);
+            let mut old = serde_json::to_value(&diagnostic).unwrap();
+            for field in [
+                "phase",
+                "codex_error_info",
+                "http_status_code",
+                "will_retry",
+                "recovery_blocker",
+                "retry_notification_count",
+                "invocation",
+            ] {
+                old.as_object_mut().unwrap().remove(field);
+            }
+            let old: CodexAppServerFailureDiagnosticV1 = serde_json::from_value(old).unwrap();
+            assert_eq!(old.phase, None);
+            assert_eq!(old.codex_error_info, None);
+            assert_eq!(old.will_retry, None);
+            assert_eq!(old.recovery_blocker, None);
+            assert_eq!(old.retry_notification_count, 0);
+        }
+        for status in [json!(99), json!(600), json!(-1), json!(403.5), json!("403")] {
+            assert_eq!(
+                summarize_codex_error_info(
+                    &json!({"codexErrorInfo": {"httpConnectionFailed": {"httpStatusCode": status}}})
+                ),
+                (Some(CodexErrorInfoKind::Unknown), None)
+            );
+        }
+        for status in [100, 403, 599] {
+            assert_eq!(
+                summarize_codex_error_info(
+                    &json!({"codexErrorInfo": {"responseStreamDisconnected": {"httpStatusCode": status}}})
+                ),
+                (
+                    Some(CodexErrorInfoKind::ResponseStreamDisconnected),
+                    Some(status)
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn invocation_request_ids_are_bounded_ascii_only() {
+        assert_eq!(bounded_request_id("req_test"), Some("req_test"));
+        assert!(bounded_request_id(&"a".repeat(128)).is_some());
+        for value in [
+            "".to_string(),
+            "a".repeat(129),
+            "req_secret\nline".to_string(),
+            "req_秘密".to_string(),
+            "https://private.invalid".to_string(),
+        ] {
+            assert_eq!(bounded_request_id(&value), None);
+        }
+    }
+
+    #[test]
+    fn invocation_identity_never_comes_from_unbound_notifications() {
+        let mut state = ProtocolState {
+            announced_thread_id: Some(Uuid::parse_str(THREAD_ID).unwrap()),
+            announced_turn_id: Some("synthetic-private-announced-turn".to_string()),
+            ..ProtocolState::default()
+        };
+        let home = Path::new("/private/codex-home");
+        let mut notification = error_notification(Some(json!(true)), json!("serverOverloaded"));
+        notification["params"]["turnId"] = json!("synthetic-private-error-turn");
+        assert_eq!(
+            state.observe_notification(&notification, home),
+            Err(CodexAppServerError::Protocol)
+        );
+        let recorded = std::sync::Mutex::new(None);
+        let sink = |value: &CodexAppServerFailureDiagnosticV1| {
+            *recorded.lock().unwrap() = Some(value.clone());
+            Ok(())
+        };
+        let request = CodexAppServerRequest {
+            request_id: "req_test",
+            image_index: 1,
+            attempt: 1,
+            executable: Path::new("/not-started"),
+            workspace: home,
+            codex_home: home,
+            prompt: "synthetic-private-prompt",
+            input_paths: &[],
+            timeout: Duration::from_secs(1),
+            environment: &[],
+            failure_diagnostic_sink: Some(&sink),
+        };
+        report_failure(
+            &request,
+            &state,
+            CodexAppServerError::Protocol,
+            None,
+            &ExitDiagnostic::default(),
+        );
+        let diagnostic = recorded.into_inner().unwrap().unwrap();
+        let encoded = serde_json::to_string(&diagnostic).unwrap();
+        assert!(!encoded.contains("synthetic-private"));
+        let invocation = diagnostic.invocation.unwrap();
+        assert_eq!(invocation.thread_id, None);
+        assert_eq!(invocation.turn_id_sha256, None);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2162,6 +3426,13 @@ mod tests {
                     signal: None,
                 },
                 protocol: None,
+                phase: None,
+                codex_error_info: None,
+                http_status_code: None,
+                will_retry: None,
+                recovery_blocker: None,
+                retry_notification_count: 0,
+                invocation: None,
             }
         };
 
