@@ -1,6 +1,6 @@
 use std::{
     fs,
-    io::Cursor,
+    io::{self, Cursor},
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     sync::{
@@ -276,24 +276,60 @@ async fn detached_reference_video_runner_stages_inputs_replays_mp4_and_cleans_cl
     assert_eq!(*published.lock().unwrap(), expected_video);
     assert_eq!(attempts.load(Ordering::SeqCst), 2);
     let execution_root = journal_root.join(lease.executor_execution_id.simple().to_string());
-    assert_eq!(
-        fs::read_dir(execution_root.join("provider-home"))
-            .unwrap()
-            .count(),
-        0
-    );
-    assert_eq!(
-        fs::read_dir(execution_root.join("runtime-home"))
-            .unwrap()
-            .count(),
-        0
-    );
-    assert_eq!(
-        fs::read_dir(execution_root.join("provider-workspaces/attempt"))
-            .unwrap()
-            .count(),
-        0
-    );
+    // Terminal publication precedes cleanup; helper-stream diagnostics may then
+    // recreate empty runtime directories. Neither state may retain CLI files.
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if [
+                "provider-home",
+                "runtime-home",
+                "provider-workspaces/attempt",
+            ]
+            .iter()
+            .all(|name| {
+                cli_directory_is_clean(&execution_root.join(name))
+                    .expect("inspect private CLI directory")
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("CLI files must be cleaned after the durable terminal");
+}
+
+fn cli_directory_is_clean(path: &Path) -> io::Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => return Err(io::Error::other("CLI path is not a directory")),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(true),
+        Err(error) => return Err(error),
+    }
+    match fs::read_dir(path) {
+        Ok(mut entries) => Ok(entries.next().transpose()?.is_none()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(error),
+    }
+}
+
+#[test]
+fn cli_cleanup_accepts_only_missing_or_empty_directories() {
+    let temp = TempDir::new().unwrap();
+    assert!(cli_directory_is_clean(&temp.path().join("missing")).unwrap());
+    let empty = temp.path().join("empty");
+    fs::create_dir(&empty).unwrap();
+    assert!(cli_directory_is_clean(&empty).unwrap());
+    let retained = temp.path().join("retained");
+    fs::create_dir(&retained).unwrap();
+    fs::write(retained.join("private-cli-file"), b"synthetic").unwrap();
+    assert!(!cli_directory_is_clean(&retained).unwrap());
+    let link = temp.path().join("link");
+    std::os::unix::fs::symlink(&empty, &link).unwrap();
+    assert!(cli_directory_is_clean(&link).is_err());
+    let file = temp.path().join("file");
+    fs::write(&file, b"synthetic").unwrap();
+    assert!(cli_directory_is_clean(&file).is_err());
 }
 
 #[tokio::test]
