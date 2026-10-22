@@ -2319,6 +2319,105 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recoverable_error_notification_keeps_one_durable_launch_and_auth_binding() {
+        let fixture = CodexFixture::with_error_notification(json!({
+            "willRetry": true,
+            "error": {
+                "message": "synthetic transient",
+                "codexErrorInfo": {
+                    "responseStreamDisconnected": { "httpStatusCode": 503 }
+                }
+            }
+        }));
+        let lease = fixture.lease();
+        let context = fixture.context(&lease);
+        fixture.journal.start_or_attach(&lease).unwrap();
+        fixture.supervisor.prepare(&lease, &context).await.unwrap();
+        assert_eq!(
+            fixture.journal.commit_launch(&lease).unwrap(),
+            LaunchDecision::LaunchOnce
+        );
+        let spool = ExecutionSpool::for_lease(&fixture.journal, &lease).unwrap();
+        run_codex_runner_child(fixture.journal.root_path(), lease.executor_execution_id)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            spool.observe().unwrap(),
+            ProcessObservation::Succeeded(_)
+        ));
+        let attached = fixture
+            .supervisor
+            .start_or_attach(&lease, LaunchDecision::Attach)
+            .await
+            .unwrap();
+        assert_eq!(
+            fixture
+                .supervisor
+                .start_or_attach(&lease, LaunchDecision::Attach)
+                .await
+                .unwrap(),
+            attached
+        );
+        let execution_root = fixture
+            .journal
+            .root_path()
+            .join(lease.executor_execution_id.simple().to_string());
+        assert!(execution_root.join("output.bin").is_file());
+        assert!(
+            !execution_root
+                .join(CODEX_APP_SERVER_FAILURE_DIAGNOSTIC_FILE)
+                .exists()
+        );
+        fixture.assert_single_turn_without_auth_refresh(&spool);
+    }
+
+    #[tokio::test]
+    async fn terminal_and_policy_error_notifications_never_refresh_auth() {
+        for (error_info, will_retry, expected) in [
+            ("badRequest", false, "codex_app_server_request_rejected"),
+            ("cyberPolicy", true, "content_policy_rejected"),
+        ] {
+            let fixture = CodexFixture::with_error_notification(json!({
+                "willRetry": will_retry,
+                "error": {
+                    "message": "synthetic-notification-sensitive-fragment",
+                    "codexErrorInfo": error_info
+                }
+            }));
+            let lease = fixture.lease();
+            let context = fixture.context(&lease);
+            fixture.journal.start_or_attach(&lease).unwrap();
+            fixture.supervisor.prepare(&lease, &context).await.unwrap();
+            assert_eq!(
+                fixture.journal.commit_launch(&lease).unwrap(),
+                LaunchDecision::LaunchOnce
+            );
+            let spool = ExecutionSpool::for_lease(&fixture.journal, &lease).unwrap();
+            run_codex_runner_child(fixture.journal.root_path(), lease.executor_execution_id)
+                .await
+                .unwrap();
+
+            assert_eq!(
+                spool.observe().unwrap(),
+                ProcessObservation::Failed {
+                    error_code: expected.to_owned(),
+                }
+            );
+            let execution_root = fixture
+                .journal
+                .root_path()
+                .join(lease.executor_execution_id.simple().to_string());
+            assert!(!execution_root.join("output.bin").exists());
+            let diagnostic =
+                fs::read_to_string(execution_root.join(CODEX_APP_SERVER_FAILURE_DIAGNOSTIC_FILE))
+                    .unwrap();
+            assert!(!diagnostic.contains("synthetic-notification-sensitive-fragment"));
+            fixture.assert_single_turn_without_auth_refresh(&spool);
+        }
+    }
+
+    #[tokio::test]
     async fn image_tool_failure_persists_redacted_diagnostic_before_terminal_cleanup() {
         let fixture = CodexFixture::image_tool_failure();
         let lease = fixture.lease();
@@ -3893,6 +3992,20 @@ mod tests {
     fn app_server_fixture_script(exec_body: String) -> String {
         let image_tool_failure = usize::from(exec_body.contains("codex-test-image-tool-failure"));
         let transient_http_401 = usize::from(exec_body.contains("codex-test-transient-http-401"));
+        let error_notification = exec_body
+            .lines()
+            .find_map(|line| line.strip_prefix("# codex-test-error-notification:"))
+            .map(|notification| format!("printf '%s\\n' '{notification}'"))
+            .unwrap_or_default();
+        let request_log = exec_body
+            .lines()
+            .find_map(|line| line.strip_prefix("# codex-test-request-log:"));
+        let initial_request_log = request_log
+            .map(|path| format!("printf '%s\\n' \"$thread_start\" \"$turn_start\" >> '{path}'"))
+            .unwrap_or_default();
+        let additional_request_log = request_log
+            .map(|path| format!("printf '%s\\n' \"$ignored\" >> '{path}'"))
+            .unwrap_or_default();
         let failure_message = exec_body
             .lines()
             .find_map(|line| line.strip_prefix("# codex-test-failure-message:"));
@@ -3937,6 +4050,7 @@ IFS= read -r thread_start
 printf '{{"method":"thread/started","params":{{"thread":{{"id":"%s"}}}}}}\n' "$thread_id"
 printf '{{"id":2,"result":{{"thread":{{"id":"%s"}}}}}}\n' "$thread_id"
 IFS= read -r turn_start
+{initial_request_log}
 printf '{{"method":"turn/started","params":{{"threadId":"%s","turn":{{"id":"%s"}}}}}}\n' "$thread_id" "$turn_id"
 printf '{{"id":3,"result":{{"turn":{{"id":"%s"}}}}}}\n' "$turn_id"
 legacy_events="$CODEX_HOME/legacy-events.jsonl"
@@ -3952,6 +4066,7 @@ if [ "$transient_http_401" -eq 1 ] && [ -f "$CODEX_HOME/transient-http-401" ]; t
   image_tool_failure=1
 fi
 malformed={force_malformed}
+{error_notification}
 while IFS= read -r event; do
   case "$event" in
     '{{"type":"thread.started","thread_id":"'*'"}}') ;;
@@ -3978,12 +4093,63 @@ else
   printf '{{"method":"turn/completed","params":{{"threadId":"%s","turn":{{"id":"%s","status":"failed"}}}}}}\n' "$thread_id" "$turn_id"
 fi
 if [ "$malformed" -ne 0 ]; then printf 'not-json\n'; fi
-while IFS= read -r ignored; do :; done
+while IFS= read -r ignored; do
+  {additional_request_log}
+  :
+done
 "#
         )
     }
 
     impl CodexFixture {
+        fn with_error_notification(mut params: Value) -> Self {
+            params["threadId"] = json!("019fd9f5-badb-7dd3-8903-28ffded0ef54");
+            params["turnId"] = json!("019fd9f5-badb-7dd3-8903-28ffded0ef55");
+            let notification = json!({ "method": "error", "params": params });
+            Self::with_script(|invocations, image, root| {
+                format!(
+                    "#!/bin/sh\nset -eu\n# codex-test-error-notification:{notification}\n# codex-test-request-log:{}\nprintf '1\\n' >> '{}'\ncall_id='call_notice_image'\noutput_dir=\"$CODEX_HOME/generated_images/$thread_id\"\n/bin/mkdir -p \"$output_dir\"\n/bin/chmod 700 \"$CODEX_HOME/generated_images\" \"$output_dir\"\n/bin/cp '{}' \"$output_dir/$call_id.png\"\n/bin/chmod 600 \"$output_dir/$call_id.png\"\nprintf '{{\"type\":\"item.completed\",\"item\":{{\"type\":\"image_generation_call\",\"id\":\"%s\"}}}}\\n' \"$call_id\"\n",
+                    root.join("protocol-requests.jsonl").display(),
+                    invocations.display(),
+                    image.display(),
+                )
+            })
+        }
+
+        fn assert_single_turn_without_auth_refresh(&self, spool: &ExecutionSpool) {
+            assert_eq!(fs::read_to_string(&self.invocations).unwrap(), "1\n");
+            let requests = fs::read_to_string(self._temp.path().join("protocol-requests.jsonl"))
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(requests.len(), 2);
+            assert_eq!(requests[0]["method"], "thread/start");
+            assert_eq!(requests[1]["method"], "turn/start");
+            assert!(
+                spool
+                    .read_diagnostic::<CodexAuthRefreshRequestV1>(CODEX_AUTH_REFRESH_REQUEST_FILE)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                spool
+                    .read_diagnostic::<CodexAuthAttemptBindingV1>(CODEX_AUTH_ATTEMPT_2_START_FILE)
+                    .unwrap()
+                    .is_none()
+            );
+            let start: CodexAuthAttemptBindingV1 = spool
+                .read_diagnostic(CODEX_AUTH_ATTEMPT_1_START_FILE)
+                .unwrap()
+                .unwrap();
+            let finish: CodexAuthAttemptBindingV1 = spool
+                .read_diagnostic(CODEX_AUTH_ATTEMPT_1_FINISH_FILE)
+                .unwrap()
+                .unwrap();
+            assert!(auth_binding_unchanged(&start, &finish));
+            assert_eq!(start.credential_revision, 1);
+        }
+
         fn new() -> Self {
             Self::with_script(|invocations, image, _root| {
                 format!(
