@@ -1,10 +1,10 @@
-name: Immutable Linux release
+name: Linux hotfix candidates and immutable releases
 
 on:
   workflow_dispatch:
     inputs:
       mode:
-        description: Candidate attestation only, or promote exact previously verified candidate bytes
+        description: Attest a candidate without a GitHub Release, or promote a full-validation candidate
         type: choice
         options: [candidate, promote]
         default: candidate
@@ -13,6 +13,12 @@ on:
         description: For promote only, exact publication artifact pin JSON from the approved candidate run
         type: string
         default: ""
+      validation_profile:
+        description: Full release validation, or scoped x86_64 hotfix candidate validation
+        type: choice
+        options: [full, hotfix]
+        default: full
+        required: true
   push:
     tags:
       - "v*"
@@ -31,12 +37,12 @@ env:
 
 jobs:
   recovery-rehearsal:
-    if: inputs.mode != 'promote'
+    if: inputs.mode != 'promote' && inputs.validation_profile != 'hotfix'
     uses: ./.github/workflows/recovery-rehearsal.yml
 
   quality:
     if: inputs.mode != 'promote'
-    name: Release gates
+    name: Validate candidate or release
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     services:
@@ -56,6 +62,26 @@ jobs:
     env:
       TEST_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/ai_image_factory_test
     steps:
+      - name: Validate candidate profile
+        env:
+          VALIDATION_PROFILE: ${{ inputs.validation_profile }}
+          PUBLICATION_MODE: ${{ inputs.mode }}
+        run: |
+          set -Eeuo pipefail
+          case "$VALIDATION_PROFILE" in
+            ""|full) ;;
+            hotfix)
+              test "$GITHUB_EVENT_NAME" = workflow_dispatch
+              test "$PUBLICATION_MODE" = candidate
+              case "$GITHUB_REF" in
+                refs/tags/v*.hotfix.*) ;;
+                *) exit 1 ;;
+              esac
+              test "${GITHUB_REF_PROTECTED:-false}" = true
+              ;;
+            *) exit 1 ;;
+          esac
+
       - name: Check out tagged source
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
@@ -233,7 +259,16 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Test Rust workspace
+        if: inputs.validation_profile != 'hotfix'
         run: cargo test --locked --workspace --all-targets -- --test-threads=1
+
+      - name: Test hotfix remote submit observations and recovery
+        if: inputs.validation_profile == 'hotfix'
+        run: |
+          cargo test --locked --package gpt-image-2-gateway \
+            --lib provider_tasks::remote_submit -- --test-threads=1
+          cargo test --locked --package gpt-image-2-gateway \
+            --test postgres_provider_tasks gated_submit:: -- --test-threads=1
 
       - name: Install admin dependencies
         run: npm ci
@@ -244,14 +279,13 @@ jobs:
   build-linux:
     name: Build ${{ matrix.target }}
     needs: [quality, recovery-rehearsal]
+    if: >-
+      !cancelled() && needs.quality.result == 'success' &&
+      (needs.recovery-rehearsal.result == 'success' ||
+      (inputs.validation_profile == 'hotfix' && needs.recovery-rehearsal.result == 'skipped'))
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - target: x86_64-unknown-linux-gnu
-            runner: ubuntu-24.04
-          - target: aarch64-unknown-linux-gnu
-            runner: ubuntu-24.04-arm
+      matrix: ${{ fromJSON(inputs.validation_profile == 'hotfix' && '{"include":[{"target":"x86_64-unknown-linux-gnu","runner":"ubuntu-24.04"}]}' || '{"include":[{"target":"x86_64-unknown-linux-gnu","runner":"ubuntu-24.04"},{"target":"aarch64-unknown-linux-gnu","runner":"ubuntu-24.04-arm"}]}') }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     steps:
@@ -342,7 +376,7 @@ jobs:
           retention-days: 7
 
   attest-and-release:
-    name: Verify candidate or publish immutable release
+    name: Attest candidate or publish immutable release
     if: always() && (needs.build-linux.result == 'success' || (github.event_name == 'workflow_dispatch' && inputs.mode == 'promote'))
     needs: build-linux
     runs-on: ubuntu-24.04
@@ -354,6 +388,26 @@ jobs:
       contents: write
       id-token: write
     steps:
+      - name: Validate candidate profile
+        env:
+          VALIDATION_PROFILE: ${{ inputs.validation_profile }}
+          PUBLICATION_MODE: ${{ inputs.mode }}
+        run: |
+          set -Eeuo pipefail
+          case "$VALIDATION_PROFILE" in
+            ""|full) ;;
+            hotfix)
+              test "$GITHUB_EVENT_NAME" = workflow_dispatch
+              test "$PUBLICATION_MODE" = candidate
+              case "$GITHUB_REF" in
+                refs/tags/v*.hotfix.*) ;;
+                *) exit 1 ;;
+              esac
+              test "${GITHUB_REF_PROTECTED:-false}" = true
+              ;;
+            *) exit 1 ;;
+          esac
+
       - name: Check out tagged release tooling
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
@@ -408,6 +462,7 @@ jobs:
           RELEASE_VERSION: ${{ github.ref_name }}
           RELEASE_COMMIT: ${{ github.sha }}
           PUBLICATION_MODE: ${{ inputs.mode }}
+          VALIDATION_PROFILE: ${{ inputs.validation_profile }}
         run: |
           set -Eeuo pipefail
           if test "$PUBLICATION_MODE" = promote; then
@@ -415,9 +470,13 @@ jobs:
           else
             install -m 0755 deploy/install-release dist/install-release
           fi
-          test "$(find dist -maxdepth 1 -type f | wc -l | tr -d ' ')" = 5
+          targets=(x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu)
+          if test "$VALIDATION_PROFILE" = hotfix; then
+            targets=(x86_64-unknown-linux-gnu)
+          fi
+          test "$(find dist -maxdepth 1 -type f | wc -l | tr -d ' ')" = "$((2 * ${#targets[@]} + 1))"
           test -x dist/install-release
-          for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
+          for target in "${targets[@]}"; do
             prefix="dist/ai-image-factory-${RELEASE_VERSION}-${target}"
             manifest="${prefix}.manifest.json"
             bundle="${prefix}.tar.gz"
@@ -485,7 +544,7 @@ jobs:
           subject-path: "${{ github.workspace }}/dist/*"
 
       - name: Preserve exact attested bytes for later explicit promotion
-        if: inputs.mode == 'candidate'
+        if: inputs.mode == 'candidate' && inputs.validation_profile != 'hotfix'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: candidate-publication
@@ -497,7 +556,7 @@ jobs:
           retention-days: 7
 
       - name: Create draft release and upload every asset
-        if: inputs.mode != 'candidate'
+        if: inputs.mode != 'candidate' && inputs.validation_profile != 'hotfix'
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_VERSION: ${{ github.ref_name }}
@@ -529,7 +588,7 @@ jobs:
             --repo "$GITHUB_REPOSITORY"
 
       - name: Publish release after all uploads succeed
-        if: inputs.mode != 'candidate'
+        if: inputs.mode != 'candidate' && inputs.validation_profile != 'hotfix'
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_VERSION: ${{ github.ref_name }}
