@@ -11,6 +11,7 @@ import {
   Pencil,
   Plus,
   RefreshCw,
+  Route,
   Trash2,
 } from "lucide-react";
 import { toast } from "sonner";
@@ -56,6 +57,7 @@ import { useConsoleSession } from "@/components/auth/console-session-provider";
 import { ProjectCreateDialog } from "@/components/projects/project-create-dialog";
 import { useI18n } from "@/i18n/locale-provider";
 import { consoleFetch } from "@/lib/auth/client";
+import type { ProviderRoutesSnapshot } from "@/lib/admin/types";
 
 type ConsoleProviderRoute = {
   route_id: string;
@@ -161,6 +163,7 @@ export function ApiKeysManager() {
   const { locale, t } = useI18n();
   const {
     activeWorkspace,
+    capabilities,
     loading: sessionLoading,
     organizations,
     projects: sessionProjects,
@@ -214,11 +217,19 @@ export function ApiKeysManager() {
     batches: "write",
   });
   const [editPending, setEditPending] = useState(false);
+  const [routeTarget, setRouteTarget] = useState<ApiKey | null>(null);
+  const [bindingRouteId, setBindingRouteId] = useState("");
+  const [keyRoutes, setKeyRoutes] = useState<ProviderRoutesSnapshot["routes"]>([]);
+  const [keyRoutesLoading, setKeyRoutesLoading] = useState(false);
+  const [routePending, setRoutePending] = useState(false);
+  const [routeError, setRouteError] = useState<string | null>(null);
   const [rotateTarget, setRotateTarget] = useState<ApiKey | null>(null);
   const [rotatePending, setRotatePending] = useState(false);
   const [unknownOutcome, setUnknownOutcome] = useState<UnknownOutcome | null>(null);
   const selectedProjectId =
     activeWorkspace?.kind === "project" ? activeWorkspace.id ?? "" : "";
+  const selectedProjectRef = useRef(selectedProjectId);
+  selectedProjectRef.current = selectedProjectId;
   const selectedMembership = sessionProjects.find(
     (project) => project.id === selectedProjectId,
   );
@@ -231,6 +242,9 @@ export function ApiKeysManager() {
             organization.id === selectedMembership?.organization_id &&
             organization.role === "owner",
         )),
+  );
+  const canManageKeyRoutes = Boolean(
+    user?.roles.includes("platform_owner") || capabilities.includes("admin:*"),
   );
   const canOwnSelectedProject =
     !selectedProjectId ||
@@ -430,6 +444,7 @@ export function ApiKeysManager() {
   useEffect(() => {
     keysRequest.current?.abort();
     setKeys([]);
+    setRouteTarget(null);
     setKeysHasMore(false);
     setKeysLastId(null);
     setKeysError(null);
@@ -693,6 +708,95 @@ export function ApiKeysManager() {
     }
   }
 
+  async function openKeyRoutes(key: ApiKey) {
+    if (!canManageKeyRoutes || !apiKeyIsUsable(key)) return;
+    setRouteTarget(key);
+    setBindingRouteId("");
+    setRouteError(null);
+    setKeyRoutes([]);
+    setKeyRoutesLoading(true);
+    try {
+      const response = await consoleFetch("/api/gateway/admin/v1/provider-routes");
+      if (!response.ok) throw new Error(await responseMessage(response, t));
+      const body = (await response.json()) as ProviderRoutesSnapshot;
+      setKeyRoutes(body.routes.filter((route) => route.state === "enabled"));
+    } catch (reason) {
+      setRouteError(reason instanceof Error ? reason.message : t({
+        en: "Service routes could not be loaded",
+        "zh-CN": "服务路由加载失败",
+        ja: "サービスルートを読み込めませんでした",
+        ko: "서비스 경로를 불러오지 못했습니다",
+      }));
+    } finally {
+      setKeyRoutesLoading(false);
+    }
+  }
+
+  async function bindKeyRoute() {
+    if (
+      !routeTarget ||
+      !selectedProjectId ||
+      !canManageKeyRoutes ||
+      keyRoutesLoading ||
+      !keyRoutes.some((route) => route.route_id === bindingRouteId)
+    ) return;
+    const projectId = selectedProjectId;
+    setRoutePending(true);
+    setRouteError(null);
+    setUnknownOutcome(null);
+    const unknownTitle = t({
+      en: "Service route update outcome is unknown",
+      "zh-CN": "服务路由更新结果未知",
+      ja: "サービスルート更新結果が不明です",
+      ko: "서비스 경로 업데이트 결과를 확인할 수 없습니다",
+    });
+    try {
+      const response = await consoleFetch(
+        `${apiKeyPath(projectId, routeTarget.id)}/provider-route`,
+        {
+          method: "PUT",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ route_id: bindingRouteId }),
+        },
+      );
+      if (selectedProjectRef.current !== projectId) return;
+      if (!response.ok) {
+        const message = await responseMessage(response, t);
+        if (selectedProjectRef.current !== projectId) return;
+        if (isUnknownMutationResponse(response)) {
+          showUnknownOutcome(unknownTitle, message);
+          setRouteTarget(null);
+        } else {
+          setRouteError(message);
+        }
+        return;
+      }
+      setRouteTarget(null);
+      await loadKeys(projectId);
+      if (selectedProjectRef.current !== projectId) return;
+      toast.success(t({
+        en: "Service route saved",
+        "zh-CN": "服务路由已保存",
+        ja: "サービスルートを保存しました",
+        ko: "서비스 경로가 저장되었습니다",
+      }));
+    } catch (reason) {
+      if (selectedProjectRef.current !== projectId) return;
+      showUnknownOutcome(
+        unknownTitle,
+        reason instanceof Error ? reason.message : t({
+          en: "The request did not return a definitive result",
+          "zh-CN": "请求未返回明确结果",
+          ja: "リクエストから明確な結果が返されませんでした",
+          ko: "요청에서 명확한 결과를 반환하지 않았습니다",
+        }),
+      );
+      setRouteTarget(null);
+    } finally {
+      setRoutePending(false);
+    }
+  }
+
   async function rotateApiKey() {
     if (!rotateTarget || !selectedProjectId || !canEditApiKey(rotateTarget)) return;
     const target = rotateTarget;
@@ -804,7 +908,7 @@ export function ApiKeysManager() {
 
   const selectedProject = projects.find((project) => project.id === selectedProjectId) ?? null;
   const mutationPending =
-    serviceCreating || editPending || rotatePending || revokePending;
+    serviceCreating || editPending || routePending || rotatePending || revokePending;
   const canEditApiKey = (key: ApiKey) =>
     apiKeyIsUsable(key) &&
     (key.owner.type === "service_account"
@@ -1145,6 +1249,17 @@ export function ApiKeysManager() {
                       </Button>
                     </DropdownMenuTrigger>
                     <DropdownMenuContent align="end">
+                      {canManageKeyRoutes && apiKeyIsUsable(key) ? (
+                        <DropdownMenuItem onSelect={() => void openKeyRoutes(key)}>
+                          <Route aria-hidden="true" />
+                          {t({
+                            en: "Manage service routes",
+                            "zh-CN": "管理服务路由",
+                            ja: "サービスルートを管理",
+                            ko: "서비스 경로 관리",
+                          })}
+                        </DropdownMenuItem>
+                      ) : null}
                       {canEditApiKey(key) ? (
                         <>
                           <DropdownMenuItem onSelect={() => openEditApiKey(key)}>
@@ -1411,6 +1526,109 @@ export function ApiKeysManager() {
                 ja: "キーを作成",
                 ko: "키 생성",
               })}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog
+        open={Boolean(routeTarget)}
+        onOpenChange={(open) => !open && !routePending && setRouteTarget(null)}
+      >
+        <DialogContent className="max-h-[85vh] overflow-y-auto sm:max-w-xl">
+          <DialogHeader>
+            <DialogTitle>
+              {t({
+                en: "Manage service routes",
+                "zh-CN": "管理服务路由",
+                ja: "サービスルートを管理",
+                ko: "서비스 경로 관리",
+              })}
+            </DialogTitle>
+            <DialogDescription>
+              {routeTarget?.name} · {t({
+                en: "Save one service route at a time. It replaces the route for the same provider and operation; other routes, key value and permissions stay unchanged.",
+                "zh-CN": "每次保存一个服务路由。同供应商、同操作的路由会被替换，其他路由、密钥和权限保持不变。",
+                ja: "サービスルートは一度に1件保存します。同じプロバイダーと操作のルートを置き換えます。他のルート、キー値、権限は変わりません。",
+                ko: "서비스 경로를 한 번에 하나씩 저장합니다. 같은 공급자와 작업의 경로를 교체하며 다른 경로, 키 값 및 권한은 유지됩니다.",
+              })}
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-2">
+            <p className="text-sm font-medium">
+              {t({
+                en: "Current routes",
+                "zh-CN": "当前已绑定路由",
+                ja: "現在のルート",
+                ko: "현재 경로",
+              })}
+            </p>
+            {routeTarget?.provider_routes.length ? (
+              <ul className="divide-y rounded-md border text-sm">
+                {routeTarget.provider_routes.map((route) => (
+                  <li key={route.route_id} className="px-3 py-2">
+                    <p>{route.display_name} · v{route.route_revision}</p>
+                    <p className="text-xs text-muted-foreground">
+                      {providerName(t, route.provider_id)} · {route.operation_id}
+                    </p>
+                  </li>
+                ))}
+              </ul>
+            ) : (
+              <p className="text-sm text-muted-foreground">
+                {t({
+                  en: "No service routes are bound to this key.",
+                  "zh-CN": "尚未绑定服务路由。",
+                  ja: "このキーにはサービスルートが設定されていません。",
+                  ko: "이 키에 연결된 서비스 경로가 없습니다.",
+                })}
+              </p>
+            )}
+          </div>
+          <div className="space-y-2">
+            <Label htmlFor="key-provider-route">
+              {t({ en: "Service option", "zh-CN": "服务方案", ja: "サービスオプション", ko: "서비스 옵션" })}
+            </Label>
+            <Select value={bindingRouteId} onValueChange={setBindingRouteId} disabled={keyRoutesLoading || routePending}>
+              <SelectTrigger id="key-provider-route">
+                <SelectValue placeholder={t({
+                  en: "Select a service route",
+                  "zh-CN": "选择服务路由",
+                  ja: "サービスルートを選択",
+                  ko: "서비스 경로 선택",
+                })} />
+              </SelectTrigger>
+              <SelectContent>
+                {keyRoutes.map((route) => (
+                  <SelectItem key={route.route_id} value={route.route_id}>
+                    {route.display_name} · {providerName(t, route.provider_id)} · {route.operation_id}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            {keyRoutesLoading ? (
+              <p className="text-sm text-muted-foreground" role="status">
+                {t({ en: "Loading service routes…", "zh-CN": "正在加载服务路由…", ja: "サービスルートを読み込み中…", ko: "서비스 경로 불러오는 중…" })}
+              </p>
+            ) : !routeError && keyRoutes.length === 0 ? (
+              <p className="text-sm text-muted-foreground">
+                {t({ en: "No service routes are available", "zh-CN": "暂无可选服务路由", ja: "利用可能なサービスルートはありません", ko: "사용 가능한 서비스 경로가 없습니다" })}
+              </p>
+            ) : null}
+            {routeError ? (
+              <p className="text-sm text-destructive" role="alert">{routeError}</p>
+            ) : null}
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setRouteTarget(null)} disabled={routePending}>
+              {t({ en: "Close", "zh-CN": "关闭", ja: "閉じる", ko: "닫기" })}
+            </Button>
+            <Button
+              onClick={() => void bindKeyRoute()}
+              disabled={routePending || keyRoutesLoading || !canManageKeyRoutes || !keyRoutes.some((route) => route.route_id === bindingRouteId)}
+            >
+              {routePending ? <LoaderCircle className="animate-spin" aria-hidden="true" /> : <Route aria-hidden="true" />}
+              {t({ en: "Save route", "zh-CN": "保存路由", ja: "ルートを保存", ko: "경로 저장" })}
             </Button>
           </DialogFooter>
         </DialogContent>
