@@ -74,6 +74,9 @@ use crate::{
         ProviderCostObligationDetail, ProviderCostObligationEventView, ProviderCostObligationList,
         ProviderCostObligationSummary, ProviderCostObligationView,
     },
+    provider_management::{
+        PlatformRouteBinding, PlatformRouteBindingResponse, UpdatePlatformRouteBindingRequest,
+    },
     webhooks::{
         CreateProjectWebhookRequest, CreatedProjectWebhook, DeletedProjectWebhook,
         ProjectWebhookDelivery, ProjectWebhookDeliveryList, ProjectWebhookEndpoint,
@@ -212,6 +215,8 @@ pub fn openapi_json() -> Json<Value> {
         admin_observe_official_price_catalog,
         admin_apply_official_price_snapshot,
         admin_provider_accounts,
+        admin_get_platform_route_binding,
+        admin_update_platform_route_binding,
         admin_provider_account_runtime_events,
         admin_scheduler_queues,
         organization_audit_logs,
@@ -472,6 +477,9 @@ pub fn openapi_json() -> Json<Value> {
         ProjectModelRateLimitView,
         UpdateProjectModelPolicyRequest,
         UpdateProjectModelRateLimit,
+        PlatformRouteBinding,
+        PlatformRouteBindingResponse,
+        UpdatePlatformRouteBindingRequest,
     )),
     modifiers(&SecurityAddon),
     tags(
@@ -2122,6 +2130,41 @@ async fn admin_price_books() {}
 )]
 #[allow(dead_code)]
 async fn admin_pricing_coverage() {}
+
+#[utoipa::path(
+    get,
+    path = "/admin/v1/provider-routes/{route_id}/platform-binding",
+    tag = "Admin Operations",
+    security(("BearerAuth" = [])),
+    params(("route_id" = String, Path, description = "Route UUID identifying the provider and operation; the current platform binding may point to a different route")),
+    responses(
+        (status = 200, description = "Current platform binding, or null when none exists", body = PlatformRouteBindingResponse),
+        (status = 401, description = "Identity JWT is required", body = ErrorResponseDoc),
+        (status = 403, description = "platform_owner role and admin:* scope are required", body = ErrorResponseDoc),
+        (status = 404, description = "Route not found", body = ErrorResponseDoc)
+    )
+)]
+#[allow(dead_code)]
+async fn admin_get_platform_route_binding() {}
+
+#[utoipa::path(
+    put,
+    path = "/admin/v1/provider-routes/{route_id}/platform-binding",
+    tag = "Admin Operations",
+    security(("BearerAuth" = [])),
+    params(("route_id" = String, Path, description = "Target enabled route UUID")),
+    request_body(content = UpdatePlatformRouteBindingRequest, description = "Publish the exact current route revision as the enabled platform default. Send expected_binding from GET, or null for first creation. Updates compare the prior route ID, revision and state. Replaying an already-applied target is idempotent only while the target head and member/model validation remain valid. API key and project route pins are unchanged; this does not publish prices."),
+    responses(
+        (status = 200, description = "Platform binding applied or safely replayed", body = PlatformRouteBindingResponse),
+        (status = 400, description = "Invalid request, route members or model mappings", body = ErrorResponseDoc),
+        (status = 401, description = "Identity JWT is required", body = ErrorResponseDoc),
+        (status = 403, description = "platform_owner role and admin:* scope are required", body = ErrorResponseDoc),
+        (status = 404, description = "Route not found", body = ErrorResponseDoc),
+        (status = 409, description = "Route head or expected platform binding changed; reload before confirming again", body = ErrorResponseDoc)
+    )
+)]
+#[allow(dead_code)]
+async fn admin_update_platform_route_binding() {}
 
 #[utoipa::path(
     get,

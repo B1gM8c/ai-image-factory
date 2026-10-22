@@ -12,9 +12,10 @@ use uuid::Uuid;
 use crate::{
     ImageGatewayError,
     provider_management::{
-        BindApiKeyRouteRequest, CreateProviderRouteRequest, ProviderModelView, ProviderRouteView,
-        StartCodexLoginRequest, StartProviderLoginRequest, StartProviderReauthorizationRequest,
-        UpdateGrokVideoOutputRequest, UpdateProviderAccountModelConfigurationRequest,
+        BindApiKeyRouteRequest, CreateProviderRouteRequest, PlatformRouteBindingActor,
+        ProviderModelView, ProviderRouteView, StartCodexLoginRequest, StartProviderLoginRequest,
+        StartProviderReauthorizationRequest, UpdateGrokVideoOutputRequest,
+        UpdatePlatformRouteBindingRequest, UpdateProviderAccountModelConfigurationRequest,
         UpdateProviderAccountModelsRequest, UpdateProviderAccountSchedulingRequest,
         UpdateProviderRouteRequest,
     },
@@ -22,7 +23,9 @@ use crate::{
 
 use super::{
     AppState,
-    sessions::{authenticate_identity, authorize_admin_scope, private_json},
+    sessions::{
+        authenticate_identity, authorize_admin_scope, authorize_platform_owner, private_json,
+    },
 };
 
 #[derive(Serialize)]
@@ -394,6 +397,39 @@ pub(super) async fn update_provider_route(
     let Json(body) = parse_body(body)?;
     Ok(private_json(
         management(&state)?.update_route(route_id, body).await?,
+    ))
+}
+
+pub(super) async fn get_platform_route_binding(
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+    Path(route_id): Path<Uuid>,
+) -> Result<Response, ImageGatewayError> {
+    authorize_platform_owner(&headers, &state).await?;
+    Ok(private_json(
+        management(&state)?.platform_route_binding(route_id).await?,
+    ))
+}
+
+pub(super) async fn update_platform_route_binding(
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+    Path(route_id): Path<Uuid>,
+    body: Result<Json<UpdatePlatformRouteBindingRequest>, axum::extract::rejection::JsonRejection>,
+) -> Result<Response, ImageGatewayError> {
+    let principal = authorize_platform_owner(&headers, &state).await?;
+    let Json(body) = parse_body(body)?;
+    Ok(private_json(
+        management(&state)?
+            .update_platform_route_binding(
+                route_id,
+                body,
+                PlatformRouteBindingActor {
+                    user_id: principal.user_id,
+                    session_id: principal.session_id,
+                },
+            )
+            .await?,
     ))
 }
 

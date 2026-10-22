@@ -16,6 +16,8 @@ use image_provider_dreamina_cli::DREAMINA_SUBMIT_COMMAND_SCHEMA;
 use image_provider_sdk::ArtifactSinkError;
 use sha2::{Digest, Sha256};
 
+#[path = "platform_binding.rs"]
+mod platform_binding;
 #[path = "dreamina_workflows.rs"]
 mod workflows;
 
@@ -817,6 +819,31 @@ async fn seed_model_route(
     home: &Path,
     model: FixtureModel,
 ) -> TestResult {
+    let route = seed_model_route_unbound(
+        pool,
+        project,
+        service_account,
+        key,
+        account,
+        profile,
+        home,
+        model,
+    )
+    .await?;
+    platform_binding::publish_fixture_route(pool, home, route).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn seed_model_route_unbound(
+    pool: &PgPool,
+    project: &str,
+    service_account: &str,
+    key: &str,
+    account: Uuid,
+    profile: Uuid,
+    home: &Path,
+    model: FixtureModel,
+) -> TestResult<Uuid> {
     let route = Uuid::new_v4();
     let route_key = format!("dreamina-api-{}", route.simple());
     sqlx::query("INSERT INTO provider_account_environments
@@ -904,19 +931,7 @@ async fn seed_model_route(
     .execute(pool)
     .await
     .map_err(debug_error)?;
-    sqlx::query(
-        "INSERT INTO gateway_platform_provider_routes
-        (provider_id, operation_id, command_schema, route_id, route_revision,
-         state, created_at_ms, updated_at_ms)
-        VALUES ('dreamina-cli', $3, $1, $2, 1, 'enabled', 1, 1)",
-    )
-    .bind(DREAMINA_SUBMIT_COMMAND_SCHEMA)
-    .bind(route)
-    .bind(model.operation())
-    .execute(pool)
-    .await
-    .map_err(debug_error)?;
-    Ok(())
+    Ok(route)
 }
 
 async fn seed_economics(pool: &PgPool, tenant: &str) -> TestResult {

@@ -53,6 +53,12 @@ routes and current capabilities; administrators must configure the applicable
 workflow price before accepting requests. Public route aliases may differ from
 the upstream `model_version`.
 
+To expose a newly discovered model, save its route mappings and explicitly set
+that saved revision as the platform route before publishing its price. Catalog
+refresh alone does not change this binding. Setting the platform route leaves
+existing project and API-key route bindings unchanged; configure the caller's
+route separately when enabling access.
+
 Model-specific input counts, duration ranges and resolution combinations are
 validated before submission. Examples include Seedance 2.5's 4–30 second output,
 480p/720p/1080p resolutions, and up to 30 images, 10 videos and 10 audio inputs

@@ -37,6 +37,7 @@ import {
 } from "@/components/ui/sheet";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Switch } from "@/components/ui/switch";
+import { PlatformRouteBindingPanel } from "@/components/provider-accounts/platform-route-binding-panel";
 import {
   apiProfilesFor,
   RouteModelMappingsEditor,
@@ -57,7 +58,11 @@ import { consoleFetch } from "@/lib/auth/client";
 
 type Translate = ReturnType<typeof useI18n>["t"];
 type SchedulingMode = "active" | "draining";
-export type AccountSettingsTab = "scheduling" | "models" | "video-storage";
+export type AccountSettingsTab =
+  | "scheduling"
+  | "models"
+  | "platform"
+  | "video-storage";
 type VideoStorageProvider = "qiniu-kodo" | "aws-s3" | "s3-compatible";
 
 const QINIU_REGIONS = [
@@ -96,6 +101,8 @@ export function AccountSchedulingSheet({
   const [maxConcurrency, setMaxConcurrency] = useState(1);
   const [mode, setMode] = useState<SchedulingMode>("active");
   const [pending, setPending] = useState(false);
+  const [bindingPending, setBindingPending] = useState(false);
+  const [bindingConflict, setBindingConflict] = useState(false);
   const [modelSettings, setModelSettings] =
     useState<ProviderAccountModels | null>(null);
   const [enabledModels, setEnabledModels] = useState<Set<string>>(new Set());
@@ -126,6 +133,7 @@ export function AccountSchedulingSheet({
   useEffect(() => {
     if (!account || !open) return;
     setTab(initialTab);
+    setBindingConflict(false);
     setMaxConcurrency(Number(account.max_concurrency));
     setMode(account.scheduling_state === "active" ? "active" : "draining");
     setModelSearch("");
@@ -541,8 +549,13 @@ export function AccountSchedulingSheet({
     }
   }
 
+  function handleOpenChange(nextOpen: boolean) {
+    onOpenChange(nextOpen);
+    if (!nextOpen && bindingConflict) onSaved();
+  }
+
   return (
-    <Sheet open={open} onOpenChange={onOpenChange}>
+    <Sheet open={open} onOpenChange={handleOpenChange}>
       <SheetContent className="flex h-full w-full flex-col gap-0 overflow-hidden p-0 sm:max-w-3xl">
         <SheetHeader className="border-b px-5 py-4 pr-14 sm:px-6">
           <div className="flex min-w-0 items-center gap-3 text-left">
@@ -566,7 +579,9 @@ export function AccountSchedulingSheet({
 
         <Tabs
           value={tab}
-          onValueChange={(value) => setTab(value as AccountSettingsTab)}
+          onValueChange={(value) => {
+            if (!pending && !bindingPending) setTab(value as AccountSettingsTab);
+          }}
           className="flex min-h-0 flex-1 flex-col gap-0"
         >
           <div className="shrink-0 overflow-x-auto border-b px-5 sm:px-6">
@@ -589,6 +604,16 @@ export function AccountSchedulingSheet({
                   ko: "모델",
                 })}
               </TabsTrigger>
+              {routes.length > 0 ? (
+                <TabsTrigger value="platform" variant="line">
+                  {t({
+                    en: "Platform route",
+                    "zh-CN": "平台路由",
+                    ja: "プラットフォームルート",
+                    ko: "플랫폼 라우트",
+                  })}
+                </TabsTrigger>
+              ) : null}
               {account.provider_id === "grok-cli" ? (
                 <TabsTrigger value="video-storage" variant="line">
                   <CloudUpload className="size-4" aria-hidden="true" />
@@ -995,6 +1020,43 @@ export function AccountSchedulingSheet({
                 ) : null}
               </>
             )}
+          </TabsContent>
+
+          <TabsContent
+            value="platform"
+            className="min-h-0 min-w-0 flex-1 space-y-5 overflow-y-auto overflow-x-hidden px-5 py-5 sm:px-6"
+          >
+            <Select
+              value={selectedRouteId}
+              onValueChange={selectRoute}
+              disabled={bindingPending}
+            >
+              <SelectTrigger
+                aria-label={t({
+                  en: "Select generation capability",
+                  "zh-CN": "选择生成能力",
+                  ja: "生成機能を選択",
+                  ko: "생성 기능 선택",
+                })}
+              >
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {routes.map((route) => (
+                  <SelectItem key={route.route_id} value={route.route_id}>
+                    {operationLabel(t, route.operation_id)} · v{route.revision}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            {selectedRoute ? (
+              <PlatformRouteBindingPanel
+                key={`${selectedRoute.route_id}:${selectedRoute.revision}`}
+                route={selectedRoute}
+                onPendingChange={setBindingPending}
+                onConflict={() => setBindingConflict(true)}
+              />
+            ) : null}
           </TabsContent>
 
           {account.provider_id === "grok-cli" ? (
@@ -1448,67 +1510,67 @@ export function AccountSchedulingSheet({
         <SheetFooter className="shrink-0 gap-2 border-t bg-background px-5 py-4 sm:px-6">
           <Button
             variant="outline"
-            onClick={() => onOpenChange(false)}
-            disabled={pending}
+            onClick={() => handleOpenChange(false)}
+            disabled={pending || bindingPending}
             className="w-full sm:w-auto"
           >
-            {t({
-              en: "Cancel",
-              "zh-CN": "取消",
-              ja: "キャンセル",
-              ko: "취소",
-            })}
+            {tab === "platform"
+              ? t({ en: "Close", "zh-CN": "关闭", ja: "閉じる", ko: "닫기" })
+              : t({ en: "Cancel", "zh-CN": "取消", ja: "キャンセル", ko: "취소" })}
           </Button>
-          <Button
-            onClick={() =>
-              void (tab === "scheduling"
-                ? saveScheduling()
+          {tab !== "platform" ? (
+            <Button
+              onClick={() =>
+                void (tab === "scheduling"
+                  ? saveScheduling()
+                  : tab === "models"
+                    ? saveModelConfiguration()
+                    : saveVideoOutput())
+              }
+              disabled={
+                pending ||
+                bindingPending ||
+                (tab === "scheduling"
+                  ? !capacityValid
+                  : tab === "models"
+                    ? modelLoading ||
+                      !modelSettings ||
+                      !selectedRoute ||
+                      !routeModelMappingsAreValid(Object.values(routeMappings))
+                    : videoOutputLoading || !videoOutput || !videoOutputValid)
+              }
+              className="w-full sm:w-auto"
+            >
+              {pending ? (
+                <LoaderCircle className="animate-spin" aria-hidden="true" />
+              ) : (
+                <Save aria-hidden="true" />
+              )}
+              {tab === "scheduling"
+                ? t({
+                    en: "Save scheduling",
+                    "zh-CN": "保存调度设置",
+                    ja: "スケジューリングを保存",
+                    ko: "스케줄링 저장",
+                  })
                 : tab === "models"
-                  ? saveModelConfiguration()
-                  : saveVideoOutput())
-            }
-            disabled={
-              pending ||
-              (tab === "scheduling"
-                ? !capacityValid
-                : tab === "models"
-                  ? modelLoading ||
-                    !modelSettings ||
-                    !selectedRoute ||
-                    !routeModelMappingsAreValid(Object.values(routeMappings))
-                  : videoOutputLoading || !videoOutput || !videoOutputValid)
-            }
-            className="w-full sm:w-auto"
-          >
-            {pending ? (
-              <LoaderCircle className="animate-spin" aria-hidden="true" />
-            ) : (
-              <Save aria-hidden="true" />
-            )}
-            {tab === "scheduling"
-              ? t({
-                  en: "Save scheduling",
-                  "zh-CN": "保存调度设置",
-                  ja: "スケジューリングを保存",
-                  ko: "스케줄링 저장",
-                })
-              : tab === "models"
-                ? t(
-                    {
-                      en: "Save model settings · v{version}",
-                      "zh-CN": "保存模型配置 · v{version}",
-                      ja: "モデル設定を保存 · v{version}",
-                      ko: "모델 설정 저장 · v{version}",
-                    },
-                    { version: (selectedRoute?.revision ?? 0) + 1 },
-                  )
-                : t({
-                    en: "Save video storage",
-                    "zh-CN": "保存视频存储",
-                    ja: "動画ストレージを保存",
-                    ko: "동영상 스토리지 저장",
-                  })}
-          </Button>
+                  ? t(
+                      {
+                        en: "Save model settings · v{version}",
+                        "zh-CN": "保存模型配置 · v{version}",
+                        ja: "モデル設定を保存 · v{version}",
+                        ko: "모델 설정 저장 · v{version}",
+                      },
+                      { version: (selectedRoute?.revision ?? 0) + 1 },
+                    )
+                  : t({
+                      en: "Save video storage",
+                      "zh-CN": "保存视频存储",
+                      ja: "動画ストレージを保存",
+                      ko: "동영상 스토리지 저장",
+                    })}
+            </Button>
+          ) : null}
         </SheetFooter>
       </SheetContent>
     </Sheet>

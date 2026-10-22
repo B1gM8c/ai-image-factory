@@ -160,11 +160,12 @@ use provider_cost_allocations::{
 };
 use provider_cost_obligations::{get_provider_cost_obligation, list_provider_cost_obligations};
 use provider_management::{
-    bind_api_key_route, create_provider_route, get_api_key_route, grok_video_output,
-    list_console_provider_models, list_console_provider_routes, list_provider_models,
-    list_provider_routes, managed_cli_providers, provider_account_models, provider_login_session,
-    provider_model_refresh, refresh_provider_quota, start_codex_login, start_provider_login,
-    start_provider_model_refresh, start_provider_reauthorization, update_grok_video_output,
+    bind_api_key_route, create_provider_route, get_api_key_route, get_platform_route_binding,
+    grok_video_output, list_console_provider_models, list_console_provider_routes,
+    list_provider_models, list_provider_routes, managed_cli_providers, provider_account_models,
+    provider_login_session, provider_model_refresh, refresh_provider_quota, start_codex_login,
+    start_provider_login, start_provider_model_refresh, start_provider_reauthorization,
+    update_grok_video_output, update_platform_route_binding,
     update_provider_account_model_configuration, update_provider_account_models,
     update_provider_account_scheduling, update_provider_route,
 };
@@ -911,6 +912,10 @@ fn build_router_with_execution_mode(
         .route(
             "/admin/v1/provider-routes/{route_id}",
             axum::routing::put(update_provider_route),
+        )
+        .route(
+            "/admin/v1/provider-routes/{route_id}/platform-binding",
+            get(get_platform_route_binding).put(update_platform_route_binding),
         )
         .route("/admin/v1/scheduler/queues", get(scheduler_queues))
         .route("/v1/organization/audit_logs", get(audit_logs))
