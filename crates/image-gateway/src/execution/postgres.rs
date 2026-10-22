@@ -407,6 +407,7 @@ fn rebuild_edit_inputs(
         match role {
             EditInputRoleV1::Image => image_count += 1,
             EditInputRoleV1::Mask => mask_count += 1,
+            EditInputRoleV1::Video | EditInputRoleV1::Audio => return Err(()),
         }
     }
     if !(1..=16).contains(&image_count) || mask_count > 1 {
@@ -478,6 +479,7 @@ fn valid_input_shape(role: EditInputRoleV1, index: u16, media_type: &str) -> boo
             index < 16 && matches!(media_type, "image/png" | "image/jpeg" | "image/webp")
         }
         EditInputRoleV1::Mask => index == 0 && media_type == "image/png",
+        EditInputRoleV1::Video | EditInputRoleV1::Audio => false,
     }
 }
 

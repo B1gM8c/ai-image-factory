@@ -444,6 +444,12 @@ async fn hydrate_edit_job(
         match input.role {
             EditInputRoleV1::Image => images.push(image),
             EditInputRoleV1::Mask => mask = Some(image),
+            EditInputRoleV1::Video | EditInputRoleV1::Audio => {
+                return Err(EditHydrationError::Terminal {
+                    error: ImageGatewayError::artifact_integrity(),
+                    error_code: "input_artifact_integrity",
+                });
+            }
         }
     }
     let command = &context.command;

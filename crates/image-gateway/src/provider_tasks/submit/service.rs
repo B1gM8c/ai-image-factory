@@ -281,7 +281,8 @@ where
                 return Ok(ProviderSubmitRun::FreshProjectionRejected);
             }
         };
-        let work = ProviderSubmitWork::<D>::new(&lease, projected)?;
+        let work =
+            ProviderSubmitWork::<D>::new(&lease, projected)?.with_inputs(context.inputs().to_vec());
         let operation = self.orchestrator.submit(work);
         let (_, outcome) = self.run_with_executor_heartbeat(lease, operation).await?;
         outcome?;

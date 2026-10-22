@@ -25,7 +25,13 @@ mod xai_image_edits;
 mod xai_images;
 mod xai_videos;
 
-pub use ark::{ArkAdmissionError, ArkImageAdmissionPlan, ArkVideoAdmissionPlan};
+#[cfg(test)]
+mod input_tests;
+
+pub use ark::{
+    ArkAdmissionError, ArkImageAdmissionPlan, ArkVideoAdmissionPlan, ark_image_workflow,
+    ark_video_workflow,
+};
 pub use command::{
     EDIT_COMMAND_SCHEMA, EDIT_COMMAND_SCHEMA_VERSION, EDIT_INPUT_MANIFEST_SCHEMA, EDIT_OPERATION,
     EditCommandV1, EditInputDescriptorV1, EditInputRoleV1, GENERATION_COMMAND_SCHEMA,
@@ -33,7 +39,9 @@ pub use command::{
     IdempotencyKeyError, idempotency_key_digest, validate_idempotency_key,
 };
 pub use dreamina::{
-    DreaminaAdmissionError, DreaminaImageAdmissionPlan, DreaminaVideoAdmissionPlan,
+    DREAMINA_INPUT_MANIFEST_SCHEMA, DreaminaAdmissionError, DreaminaImageAdmissionPlan,
+    DreaminaInputSource, DreaminaStagedInputs, DreaminaVideoAdmissionPlan,
+    DreaminaWorkflowAdmissionPlan, DreaminaWorkflowIntent,
 };
 pub use memory::InMemoryAdmissionStore;
 pub use postgres::PostgresAdmissionStore;
@@ -144,6 +152,21 @@ pub struct AttachInputObject {
     pub role: EditInputRoleV1,
     pub index: u16,
     pub media_type: String,
+}
+
+pub const MAX_JOB_INPUTS: usize = 50;
+
+pub(crate) fn valid_input_descriptor(role: &str, index: u16, media_type: &str) -> bool {
+    if usize::from(index) >= MAX_JOB_INPUTS {
+        return false;
+    }
+    match role {
+        "image" => matches!(media_type, "image/png" | "image/jpeg" | "image/webp"),
+        "mask" => index == 0 && media_type == "image/png",
+        "video" => media_type == "video/mp4",
+        "audio" => matches!(media_type, "audio/mpeg" | "audio/wav"),
+        _ => false,
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -272,8 +295,14 @@ pub(crate) fn validate_attach_request(request: &AttachJob) -> Result<(), Admissi
             DREAMINA_SUBMIT_COMMAND_SCHEMA => {
                 let bytes = serde_json::to_vec(&request.command_json)
                     .map_err(|_| AdmissionError::InvalidCommand)?;
-                parse_submit_command(&bytes).map_err(|_| AdmissionError::InvalidCommand)?;
-                if hex::encode(Sha256::digest(&bytes)) == provider_command_hash {
+                let command =
+                    parse_submit_command(&bytes).map_err(|_| AdmissionError::InvalidCommand)?;
+                if matches!(
+                    command,
+                    image_provider_dreamina_cli::DreaminaSubmitRequestV1::TextToImage(_)
+                        | image_provider_dreamina_cli::DreaminaSubmitRequestV1::TextToVideo(_)
+                ) && hex::encode(Sha256::digest(&bytes)) == provider_command_hash
+                {
                     Ok(())
                 } else {
                     Err(AdmissionError::InvalidCommand)
@@ -282,6 +311,13 @@ pub(crate) fn validate_attach_request(request: &AttachJob) -> Result<(), Admissi
             _ => Err(AdmissionError::InvalidCommand),
         };
     };
+    if manifest.inputs.len() > MAX_JOB_INPUTS
+        || manifest.inputs.iter().any(|input| {
+            !valid_input_descriptor(input.role.as_str(), input.index, &input.media_type)
+        })
+    {
+        return Err(AdmissionError::InvalidCommand);
+    }
     if request.command_schema == GROK_VIDEO_GENERATION_COMMAND_SCHEMA {
         return validate_video_attach_request(request, manifest);
     }
@@ -290,6 +326,9 @@ pub(crate) fn validate_attach_request(request: &AttachJob) -> Result<(), Admissi
     }
     if request.command_schema == GROK_IMAGE_EDIT_COMMAND_SCHEMA {
         return validate_grok_image_edit_attach_request(request, manifest);
+    }
+    if request.command_schema == DREAMINA_SUBMIT_COMMAND_SCHEMA {
+        return validate_dreamina_attach_request(request, manifest);
     }
     if request.command_schema != EDIT_COMMAND_SCHEMA
         || manifest.manifest_schema != EDIT_INPUT_MANIFEST_SCHEMA
@@ -362,10 +401,48 @@ pub(crate) fn validate_attach_request(request: &AttachJob) -> Result<(), Admissi
                     return Err(AdmissionError::InvalidCommand);
                 }
             }
+            EditInputRoleV1::Video | EditInputRoleV1::Audio => {
+                return Err(AdmissionError::InvalidCommand);
+            }
         }
     }
     if !(1..=16).contains(&image_count) || mask_count > 1 {
         return Err(AdmissionError::InvalidCommand);
+    }
+    Ok(())
+}
+
+fn validate_dreamina_attach_request(
+    request: &AttachJob,
+    manifest: &AttachInputManifest,
+) -> Result<(), AdmissionError> {
+    if request.contract != AdmissionContract::CustomerPricingV4 {
+        return Err(AdmissionError::PricingUnavailable);
+    }
+    if manifest.manifest_schema != DREAMINA_INPUT_MANIFEST_SCHEMA || manifest.inputs.is_empty() {
+        return Err(AdmissionError::InvalidCommand);
+    }
+    let bytes =
+        serde_json::to_vec(&request.command_json).map_err(|_| AdmissionError::InvalidCommand)?;
+    let command = parse_submit_command(&bytes).map_err(|_| AdmissionError::InvalidCommand)?;
+    let expected = dreamina::dreamina_input_manifest_hash(&command, &manifest.inputs)
+        .map_err(|_| AdmissionError::InvalidCommand)?;
+    if expected != manifest.manifest_hash {
+        return Err(AdmissionError::InvalidCommand);
+    }
+    let mut input_ids = HashSet::new();
+    let mut object_keys = HashSet::new();
+    for input in &manifest.inputs {
+        if input.blob.key.admission_session_id != request.ticket.session_id
+            || input.blob.byte_size == 0
+            || input.blob.storage_backend.is_empty()
+            || input.blob.object_key.is_empty()
+            || !is_sha256(&input.blob.sha256_hex)
+            || !input_ids.insert(input.blob.key.input_id)
+            || !object_keys.insert((&input.blob.storage_backend, &input.blob.object_key))
+        {
+            return Err(AdmissionError::InvalidCommand);
+        }
     }
     Ok(())
 }
@@ -680,6 +757,14 @@ pub(crate) fn attach_operation(request: &AttachJob) -> Result<&'static str, Admi
                 }
                 image_provider_dreamina_cli::DreaminaSubmitRequestV1::TextToVideo(_) => {
                     Ok(VIDEO_GENERATION_OPERATION)
+                }
+                image_provider_dreamina_cli::DreaminaSubmitRequestV1::ImageToImage(_)
+                | image_provider_dreamina_cli::DreaminaSubmitRequestV1::ImageUpscale(_)
+                | image_provider_dreamina_cli::DreaminaSubmitRequestV1::ImageToVideo(_)
+                | image_provider_dreamina_cli::DreaminaSubmitRequestV1::FramesToVideo(_)
+                | image_provider_dreamina_cli::DreaminaSubmitRequestV1::MultiframeToVideo(_)
+                | image_provider_dreamina_cli::DreaminaSubmitRequestV1::MultimodalToVideo(_) => {
+                    Err(AdmissionError::InvalidCommand)
                 }
             }
         }

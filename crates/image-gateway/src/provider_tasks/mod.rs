@@ -1,11 +1,11 @@
-use std::fmt;
+use std::{fmt, sync::Arc};
 
 use async_trait::async_trait;
 use image_provider_sdk::{DurableArtifactManifest, OutputSlot, ProviderCommandIdentity};
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::executor::{ExecutorResultManifest, ExecutorSubmissionLease};
+use crate::executor::{ExecutorInputObject, ExecutorResultManifest, ExecutorSubmissionLease};
 
 mod account_home;
 mod capacity;
@@ -41,10 +41,10 @@ pub use readiness::{
     ProviderRuntimeSupervisorConfig, ProviderRuntimeSupervisorError,
 };
 pub use remote_submit::{
-    GatedCliBinding, GatedCliCommand, GatedCliObservation, GatedCliPreparedSubmission,
-    GatedCliProcessError, GatedCliProcessOutcome, GatedCliProcessTerminal, GatedCliReady,
-    GatedCliSubmission, GatedCliSubmitCodec, GatedCliSubmitDriver, run_remote_submit_gate,
-    run_remote_submit_runner,
+    GatedCliBinding, GatedCliCommand, GatedCliInputFile, GatedCliObservation,
+    GatedCliPreparedSubmission, GatedCliProcessError, GatedCliProcessOutcome,
+    GatedCliProcessTerminal, GatedCliReady, GatedCliSubmission, GatedCliSubmitCodec,
+    GatedCliSubmitDriver, run_remote_submit_gate, run_remote_submit_runner,
 };
 pub use runtime_profile::{ProviderRuntimeProfile, ProviderRuntimeProfileStore};
 pub use submit::{
@@ -521,6 +521,7 @@ pub struct ProviderSubmitRecoveryLease {
     pub intent: ProviderSubmitIntent,
     context: ProviderExecutionContext,
     command_json: Value,
+    inputs: Arc<[ExecutorInputObject]>,
     remaining_budget_ms: u64,
     pub recovery_owner: String,
     pub recovery_lease_epoch: i64,
@@ -554,6 +555,10 @@ impl ProviderSubmitRecoveryLease {
 
     pub fn command_json(&self) -> &Value {
         &self.command_json
+    }
+
+    pub fn inputs(&self) -> &[ExecutorInputObject] {
+        &self.inputs
     }
 
     pub fn remaining_budget_ms(&self) -> u64 {

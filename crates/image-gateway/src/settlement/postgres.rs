@@ -1,7 +1,9 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use image_provider_dreamina_cli::DREAMINA_SUBMIT_COMMAND_SCHEMA;
+use image_provider_dreamina_cli::{
+    DREAMINA_SUBMIT_COMMAND_SCHEMA, DreaminaSubmitRequestV1, parse_submit_command,
+};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Postgres, Transaction};
@@ -176,9 +178,12 @@ impl ExecutionSettlementStore for PostgresExecutionSettlementStore {
         let row: Option<VideoStatusRow> = sqlx::query_as(
             r#"
             SELECT j.state, w.state, j.last_error_code, j.model, j.billable_units,
-                   artifact.artifact_id
+                   artifact.artifact_id, payload.command_json
             FROM jobs j
             JOIN work_items w ON w.job_id = j.job_id
+            LEFT JOIN job_payloads payload
+              ON payload.job_id = j.job_id AND payload.command_schema = $3
+             AND j.provider_id = 'dreamina-cli'
             LEFT JOIN artifacts artifact
               ON artifact.job_id = j.job_id
              AND artifact.output_index = 0
@@ -191,6 +196,7 @@ impl ExecutionSettlementStore for PostgresExecutionSettlementStore {
         )
         .bind(job_id)
         .bind(tenant_id)
+        .bind(DREAMINA_SUBMIT_COMMAND_SCHEMA)
         .fetch_optional(&self.pool)
         .await
         .map_err(settlement_unavailable)?;
@@ -207,11 +213,14 @@ impl ExecutionSettlementStore for PostgresExecutionSettlementStore {
         let row: Option<VideoStatusRow> = sqlx::query_as(
             r#"
                 SELECT j.state, w.state, j.last_error_code, j.model, j.billable_units,
-                       artifact.artifact_id
+                       artifact.artifact_id, payload.command_json
                 FROM jobs j
                 JOIN work_items w ON w.job_id = j.job_id
                 JOIN job_auth_attributions attribution
                   ON attribution.job_id = j.job_id
+                LEFT JOIN job_payloads payload
+                  ON payload.job_id = j.job_id AND payload.command_schema = $5
+                 AND j.provider_id = 'dreamina-cli'
                 LEFT JOIN artifacts artifact
                   ON artifact.job_id = j.job_id
                  AND artifact.output_index = 0
@@ -228,6 +237,7 @@ impl ExecutionSettlementStore for PostgresExecutionSettlementStore {
         .bind(tenant_id)
         .bind(project_id)
         .bind(actor_user_id)
+        .bind(DREAMINA_SUBMIT_COMMAND_SCHEMA)
         .fetch_optional(&self.pool)
         .await
         .map_err(settlement_unavailable)?;
@@ -244,7 +254,7 @@ impl ExecutionSettlementStore for PostgresExecutionSettlementStore {
         let row: Option<VideoStatusWithMetadataRow> = sqlx::query_as(
             r#"
                 SELECT j.state, w.state, j.last_error_code, j.model, j.billable_units,
-                       artifact.artifact_id,
+                       artifact.artifact_id, payload.command_json,
                        payload.command_json -> 'model_version',
                        payload.command_json -> 'video_resolution',
                        payload.command_json -> 'ratio'
@@ -255,8 +265,7 @@ impl ExecutionSettlementStore for PostgresExecutionSettlementStore {
                 LEFT JOIN job_payloads payload
                   ON payload.job_id = j.job_id
                  AND payload.command_schema = $5
-                 AND payload.command_json -> 'schema_version' = '1'::JSONB
-                 AND payload.command_json ->> 'operation' = 'text2video'
+                 AND j.provider_id = 'dreamina-cli'
                 LEFT JOIN artifacts artifact
                   ON artifact.job_id = j.job_id
                  AND artifact.output_index = 0
@@ -285,13 +294,14 @@ impl ExecutionSettlementStore for PostgresExecutionSettlementStore {
                 model,
                 units,
                 artifact,
+                command,
                 provider_model,
                 resolution,
                 ratio,
             )| {
                 Ok((
                     video_result_status((
-                        job_state, work_state, error_code, model, units, artifact,
+                        job_state, work_state, error_code, model, units, artifact, command,
                     ))?,
                     video_request_metadata(provider_model, resolution, ratio),
                 ))
@@ -441,7 +451,15 @@ impl ExecutionSettlementStore for PostgresExecutionSettlementStore {
     }
 }
 
-type VideoStatusRow = (String, String, Option<String>, String, i32, Option<Uuid>);
+type VideoStatusRow = (
+    String,
+    String,
+    Option<String>,
+    String,
+    i32,
+    Option<Uuid>,
+    Option<serde_json::Value>,
+);
 type VideoStatusWithMetadataRow = (
     String,
     String,
@@ -449,6 +467,7 @@ type VideoStatusWithMetadataRow = (
     String,
     i32,
     Option<Uuid>,
+    Option<serde_json::Value>,
     Option<serde_json::Value>,
     Option<serde_json::Value>,
     Option<serde_json::Value>,
@@ -470,25 +489,22 @@ fn video_request_metadata(
 }
 
 fn video_result_status(row: VideoStatusRow) -> Result<VideoResultStatus, ImageGatewayError> {
-    let (job_state, work_state, error_code, model, billable_units, artifact_id) = row;
-    let duration = u8::try_from(billable_units)
-        .ok()
-        .filter(|duration| *duration > 0)
-        .ok_or_else(ImageGatewayError::artifact_integrity)?;
+    let (job_state, work_state, error_code, model, billable_units, artifact_id, command) = row;
+    let duration_ms = requested_video_duration_ms(billable_units, command.as_ref())?;
     if job_state == "succeeded" {
         Ok(VideoResultStatus::Succeeded {
             model,
-            duration,
+            duration_ms,
             artifact_id: artifact_id.ok_or_else(ImageGatewayError::artifact_integrity)?,
         })
     } else if job_state == "failed" || work_state == "failed" {
         Ok(VideoResultStatus::Failed {
             model,
-            duration,
+            duration_ms,
             error_code,
         })
     } else if work_state == "uncertain" {
-        Ok(VideoResultStatus::Uncertain { model, duration })
+        Ok(VideoResultStatus::Uncertain { model, duration_ms })
     } else {
         let stage = match work_state.as_str() {
             "ready" => VideoPendingStage::Queued,
@@ -497,10 +513,52 @@ fn video_result_status(row: VideoStatusRow) -> Result<VideoResultStatus, ImageGa
         };
         Ok(VideoResultStatus::Pending {
             model,
-            duration,
+            duration_ms,
             stage,
         })
     }
+}
+
+fn requested_video_duration_ms(
+    quota_seconds: i32,
+    command: Option<&serde_json::Value>,
+) -> Result<u32, ImageGatewayError> {
+    let quota_seconds = u32::try_from(quota_seconds)
+        .ok()
+        .filter(|seconds| *seconds > 0)
+        .ok_or_else(ImageGatewayError::artifact_integrity)?;
+    let Some(command) = command else {
+        return quota_seconds
+            .checked_mul(1_000)
+            .ok_or_else(ImageGatewayError::artifact_integrity);
+    };
+    let bytes = serde_json::to_vec(command).map_err(|_| ImageGatewayError::artifact_integrity())?;
+    let request =
+        parse_submit_command(&bytes).map_err(|_| ImageGatewayError::artifact_integrity())?;
+    let duration_ms = match request {
+        DreaminaSubmitRequestV1::TextToVideo(request) => {
+            u32::from(request.duration_seconds()) * 1_000
+        }
+        DreaminaSubmitRequestV1::ImageToVideo(request) => {
+            u32::from(request.options().duration_seconds()) * 1_000
+        }
+        DreaminaSubmitRequestV1::FramesToVideo(request) => {
+            u32::from(request.options().duration_seconds()) * 1_000
+        }
+        DreaminaSubmitRequestV1::MultimodalToVideo(request) => {
+            u32::from(request.duration_seconds()) * 1_000
+        }
+        DreaminaSubmitRequestV1::MultiframeToVideo(request) => request
+            .transitions()
+            .iter()
+            .map(|transition| transition.duration_ms())
+            .sum(),
+        _ => return Err(ImageGatewayError::artifact_integrity()),
+    };
+    if !(1..=152_000).contains(&duration_ms) || duration_ms.div_ceil(1_000) != quota_seconds {
+        return Err(ImageGatewayError::artifact_integrity());
+    }
+    Ok(duration_ms)
 }
 
 #[derive(sqlx::FromRow)]
@@ -1025,6 +1083,68 @@ fn settlement_unavailable(_: impl std::fmt::Display) -> ImageGatewayError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn multiframe_command(durations_ms: &[u32]) -> serde_json::Value {
+        use image_provider_dreamina_cli::{
+            MultiframeToVideoRequestV1, StagedImageV1, VideoResolution, VideoTransitionV1,
+            encode_submit_command,
+        };
+        let images = (0..=durations_ms.len())
+            .map(|index| {
+                StagedImageV1::new(format!("frame-{index}.png"), "a".repeat(64), 1600, 900).unwrap()
+            })
+            .collect();
+        let transitions = durations_ms
+            .iter()
+            .map(|duration| VideoTransitionV1::new("move smoothly", *duration).unwrap())
+            .collect();
+        let request =
+            MultiframeToVideoRequestV1::new(images, transitions, VideoResolution::P720).unwrap();
+        serde_json::from_slice(&encode_submit_command(
+            DreaminaSubmitRequestV1::MultiframeToVideo(request),
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn requested_multiframe_duration_preserves_milliseconds_and_checks_quota() {
+        let command = multiframe_command(&[2_500]);
+        assert_eq!(
+            requested_video_duration_ms(3, Some(&command)).unwrap(),
+            2_500
+        );
+        assert!(requested_video_duration_ms(2, Some(&command)).is_err());
+        assert_eq!(requested_video_duration_ms(3, None).unwrap(), 3_000);
+        assert!(requested_video_duration_ms(3, Some(&json!({}))).is_err());
+        assert!(requested_video_duration_ms(0, None).is_err());
+        let status = video_result_status((
+            "running".into(),
+            "provider_waiting".into(),
+            None,
+            "multiframe2video".into(),
+            3,
+            None,
+            Some(command),
+        ))
+        .unwrap();
+        assert!(matches!(
+            status,
+            VideoResultStatus::Pending {
+                duration_ms: 2_500,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn requested_multiframe_duration_supports_the_exact_152_second_limit() {
+        let command = multiframe_command(&[8_000; 19]);
+        assert_eq!(
+            requested_video_duration_ms(152, Some(&command)).unwrap(),
+            152_000
+        );
+        assert!(requested_video_duration_ms(151, Some(&command)).is_err());
+    }
     use image_provider_dreamina_cli::{
         DreaminaSubmitRequestV1, TextToVideoRequestV1, VideoModelVersion, VideoRatio,
         VideoResolution, encode_submit_command,

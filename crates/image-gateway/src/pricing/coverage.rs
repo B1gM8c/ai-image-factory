@@ -10,7 +10,7 @@ use super::{
     admission::{
         CustomerMeteringContract, customer_metering_contract, pricing_operation_for_route,
     },
-    surface_contract::find_contract,
+    surface_contract::{find_contract, find_contract_for_workflow},
 };
 
 #[derive(Clone, Debug, FromRow)]
@@ -268,12 +268,27 @@ fn coverage_row(
         .command_schema
         .as_deref()
         .and_then(|command_schema| {
-            find_contract(
-                &surface.provider_id,
-                &surface.operation,
-                command_schema,
-                &surface.media_kind,
-            )
+            if surface.provider_id == "dreamina-cli"
+                && matches!(
+                    surface.provider_model_id.as_str(),
+                    "image_upscale" | "multiframe2video"
+                )
+            {
+                find_contract_for_workflow(
+                    &surface.provider_id,
+                    pricing_operation?,
+                    command_schema,
+                    &surface.media_kind,
+                    Some(&surface.provider_model_id),
+                )
+            } else {
+                find_contract(
+                    &surface.provider_id,
+                    &surface.operation,
+                    command_schema,
+                    &surface.media_kind,
+                )
+            }
         })
         .map(|contract| {
             contract
@@ -342,7 +357,7 @@ fn coverage_row(
         None,
     );
 
-    let metering_status = metering_status(&customer, &surface.provider_id);
+    let metering_status = metering_status(&customer, surface);
     let emits_actual_cost = surface.provider_id == "grok-cli";
     let (provider_cost_status, provider_cost_currencies) = if provider_actual.status == "ready" {
         ("provider_actual", provider_actual.currencies.clone())
@@ -560,7 +575,7 @@ fn resolve_matches<'a>(
     }
 }
 
-fn metering_status(customer: &MatchResult<'_>, provider_id: &str) -> &'static str {
+fn metering_status(customer: &MatchResult<'_>, surface: &CoverageSurfaceRow) -> &'static str {
     if customer.status == "ambiguous" {
         return "ambiguous";
     }
@@ -568,9 +583,25 @@ fn metering_status(customer: &MatchResult<'_>, provider_id: &str) -> &'static st
         return "missing";
     }
     for (_, version) in &customer.versions {
-        match customer_metering_contract(version, provider_id) {
-            CustomerMeteringContract::Exact => {}
-            CustomerMeteringContract::Incompatible => return "incompatible",
+        if surface.provider_id == "dreamina-cli" {
+            let Ok(groups) = super::readiness::contract_groups_for_surface(version, surface) else {
+                return "incompatible";
+            };
+            if groups.iter().any(|(group, contract, _)| {
+                customer_metering_contract(group, &surface.provider_id)
+                    != CustomerMeteringContract::Exact
+                    || group.components.iter().any(|component| {
+                        contract
+                            .validate_component_selector(&component.dimensions)
+                            .is_err()
+                    })
+            }) {
+                return "incompatible";
+            }
+        } else if customer_metering_contract(version, &surface.provider_id)
+            != CustomerMeteringContract::Exact
+        {
+            return "incompatible";
         }
     }
     "exact"

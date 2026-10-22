@@ -29,6 +29,7 @@ use crate::{
     },
     pricing::{
         PriceResolutionError, PriceResolutionRequest,
+        admission::dreamina_pricing_facts,
         customer_usage::{
             CustomerUsageAuthority, CustomerUsageFactError, CustomerUsageOutput,
             persist_customer_usage_facts,
@@ -1729,66 +1730,97 @@ async fn persist_dreamina_projection(
     now: i64,
 ) -> Result<(), ExecutorTerminalError> {
     let bytes = serde_json::to_vec(&command_json).map_err(|_| ExecutorTerminalError::Conflict)?;
-    match parse_submit_command(&bytes).map_err(|_| ExecutorTerminalError::Conflict)? {
-        DreaminaSubmitRequestV1::TextToImage(request) => {
-            if !matches!(quota.economics_contract_version, 2 | 4)
-                || quota.operation != GENERATION_OPERATION
-                || quota.output_count != i32::from(request.generate_num())
-                || quota.billing_metric != "output"
-            {
-                return Err(ExecutorTerminalError::Conflict);
-            }
-            let size = match (request.ratio(), request.width(), request.height()) {
-                (Some(ratio), None, None) => {
-                    format!("{}:{}", request.resolution().as_str(), ratio.as_str())
-                }
-                (None, Some(width), Some(height)) => format!("{width}x{height}"),
-                _ => return Err(ExecutorTerminalError::Conflict),
-            };
-            insert_response_projection(
-                tx,
-                lease.job_id,
-                api_profile,
-                GENERATION_OPERATION,
-                GENERATION_RESPONSE_SCHEMA,
-                "auto",
-                "auto",
-                &size,
-                "opaque",
-                quota,
-                artifact_count,
-                now,
-            )
-            .await
-        }
-        DreaminaSubmitRequestV1::TextToVideo(request) => {
-            if !matches!(quota.economics_contract_version, 3 | 4)
-                || quota.operation != VIDEO_GENERATION_OPERATION
-                || quota.output_count != 1
-                || quota.output_billable_units != quota.billable_units
-                || quota.billing_metric != "video_second"
-                || quota.billing_unit != "second"
-                || i32::from(request.duration_seconds()) != quota.billable_units
-            {
-                return Err(ExecutorTerminalError::Conflict);
-            }
-            insert_response_projection(
-                tx,
-                lease.job_id,
-                api_profile,
-                VIDEO_GENERATION_OPERATION,
-                "dreamina-cli.videos.response.v1",
-                "mp4",
-                NOT_APPLICABLE,
-                request.resolution().as_str(),
-                NOT_APPLICABLE,
-                quota,
-                artifact_count,
-                now,
-            )
-            .await
-        }
+    let request = parse_submit_command(&bytes).map_err(|_| ExecutorTerminalError::Conflict)?;
+    let facts = dreamina_pricing_facts(&request, api_profile)
+        .map_err(|_| ExecutorTerminalError::Conflict)?;
+    let output_count =
+        i32::try_from(facts.output_count).map_err(|_| ExecutorTerminalError::Conflict)?;
+    let output_units =
+        i32::try_from(facts.output_billable_units).map_err(|_| ExecutorTerminalError::Conflict)?;
+    if quota.output_count != output_count
+        || quota.output_billable_units != output_units
+        || output_count.checked_mul(output_units) != Some(quota.billable_units)
+    {
+        return Err(ExecutorTerminalError::Conflict);
     }
+    let legacy_contract = match request {
+        DreaminaSubmitRequestV1::TextToImage(_) => 2,
+        DreaminaSubmitRequestV1::TextToVideo(_) => 3,
+        _ => 4,
+    };
+    if quota.economics_contract_version != 4 && quota.economics_contract_version != legacy_contract
+    {
+        return Err(ExecutorTerminalError::Conflict);
+    }
+    let (operation, response_schema, output_format, quality, background, size) =
+        match facts.media_kind {
+            "image"
+                if quota.operation == GENERATION_OPERATION
+                    && quota.billing_metric == "output"
+                    && quota.billing_unit == "output" =>
+            {
+                let resolution = facts
+                    .dimensions
+                    .get("resolution_type")
+                    .ok_or(ExecutorTerminalError::Conflict)?;
+                let size = if let Some(ratio) = facts.dimensions.get("ratio") {
+                    format!("{resolution}:{ratio}")
+                } else if let (Some(width), Some(height)) = (
+                    facts.dimensions.get("width"),
+                    facts.dimensions.get("height"),
+                ) {
+                    format!("{width}x{height}")
+                } else if matches!(request, DreaminaSubmitRequestV1::ImageUpscale(_)) {
+                    resolution.clone()
+                } else {
+                    return Err(ExecutorTerminalError::Conflict);
+                };
+                (
+                    GENERATION_OPERATION,
+                    GENERATION_RESPONSE_SCHEMA,
+                    "auto",
+                    "auto",
+                    "opaque",
+                    size,
+                )
+            }
+            "video"
+                if quota.operation == VIDEO_GENERATION_OPERATION
+                    && quota.output_count == 1
+                    && quota.billing_metric == "video_second"
+                    && quota.billing_unit == "second" =>
+            {
+                let size = facts
+                    .dimensions
+                    .get("resolution")
+                    .ok_or(ExecutorTerminalError::Conflict)?
+                    .clone();
+                (
+                    VIDEO_GENERATION_OPERATION,
+                    "dreamina-cli.videos.response.v1",
+                    "mp4",
+                    NOT_APPLICABLE,
+                    NOT_APPLICABLE,
+                    size,
+                )
+            }
+            _ => return Err(ExecutorTerminalError::Conflict),
+        };
+    insert_response_projection(
+        tx,
+        lease.job_id,
+        api_profile,
+        operation,
+        response_schema,
+        output_format,
+        quality,
+        &size,
+        background,
+        quota,
+        artifact_count,
+        now,
+    )
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]

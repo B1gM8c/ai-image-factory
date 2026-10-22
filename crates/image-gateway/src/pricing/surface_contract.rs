@@ -4,6 +4,8 @@
 //! API field: provider model identity, pricing dimensions, and output cardinality are the inputs
 //! that price resolution must prove before a price version can be published.
 
+mod dreamina;
+
 use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -73,6 +75,7 @@ pub struct ImageDimensionVariant {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 pub enum Constraint {
+    DreaminaWorkflow,
     ExactlyOnePresenceBranch(&'static [PresenceBranch]),
     ConditionalPresence {
         selector: Selector,
@@ -209,6 +212,11 @@ impl PricingSurfaceContract {
     /// This is useful while developing a future pricing adapter without accidentally making the
     /// surface publishable.
     pub fn validate_shape(&self, request: &SurfaceRequest<'_>) -> Result<(), ValidationError> {
+        if self.constraints.contains(&Constraint::DreaminaWorkflow)
+            && request.value("workflow") != Some(self.normalizer_key)
+        {
+            return Err(ValidationError::InvalidDimension("workflow"));
+        }
         if !self.provider_models.contains(&request.provider_model_id) {
             return Err(ValidationError::UnsupportedProviderModel);
         }
@@ -251,6 +259,11 @@ impl PricingSurfaceContract {
     }
 
     pub fn validate_component_selector(&self, selector: &Value) -> Result<(), ValidationError> {
+        if self.constraints.contains(&Constraint::DreaminaWorkflow)
+            && selector.get("workflow").and_then(Value::as_str) != Some(self.normalizer_key)
+        {
+            return Err(ValidationError::InvalidDimension("workflow"));
+        }
         let Some(selector) = selector.as_object() else {
             return Err(ValidationError::UnknownDimension);
         };
@@ -362,6 +375,7 @@ impl OutputCardinality {
 impl Constraint {
     fn validate(self, request: &SurfaceRequest<'_>) -> Result<(), ValidationError> {
         match self {
+            Self::DreaminaWorkflow => dreamina::validate(request),
             Self::ExactlyOnePresenceBranch(branches) => {
                 let matches = branches
                     .iter()
@@ -1063,6 +1077,29 @@ pub fn find_contract_for_pricing(
             && contract.command_schema == command_schema
             && contract.media_kind == media_kind
     })
+}
+
+/// Old callers retain the original text-only contract and its immutable hash.
+/// Additional workflows are selected only from validated frozen facts.
+pub(super) fn find_contract_for_workflow(
+    provider_id: &str,
+    pricing_operation: &str,
+    command_schema: &str,
+    media_kind: &str,
+    workflow: Option<&str>,
+) -> Option<&'static PricingSurfaceContract> {
+    match (provider_id, workflow) {
+        ("dreamina-cli", Some(workflow)) => dreamina::CONTRACTS.iter().find(|contract| {
+            contract.normalizer_key == workflow
+                && contract.pricing_operation == pricing_operation
+                && contract.command_schema == command_schema
+                && contract.media_kind == media_kind
+        }),
+        (_, None) => {
+            find_contract_for_pricing(provider_id, pricing_operation, command_schema, media_kind)
+        }
+        _ => None,
+    }
 }
 
 #[cfg(test)]

@@ -191,6 +191,9 @@ fn staged_image(
         (EditInputRoleV1::Image, _) => format!("image-{}", input.index),
         (EditInputRoleV1::Mask, Some(XaiImageEditFallbackMode::SemanticMask)) => "mask".to_owned(),
         (EditInputRoleV1::Mask, None) => return Err(XaiImageEditAdmissionError::UnsupportedMask),
+        (EditInputRoleV1::Video | EditInputRoleV1::Audio, _) => {
+            return Err(XaiImageEditAdmissionError::InvalidProviderCommand);
+        }
     };
     let extension = match input.media_type.as_str() {
         "image/png" => "png",
@@ -297,6 +300,22 @@ mod tests {
             payload.request().aspect_ratio(),
             image_provider_grok_cli::ImageAspectRatio::R16x9
         );
+    }
+
+    #[test]
+    fn image_edit_projection_rejects_video_and_audio_roles() {
+        for (role, media_type) in [
+            (EditInputRoleV1::Video, "video/mp4"),
+            (EditInputRoleV1::Audio, "audio/wav"),
+        ] {
+            let mut inputs = descriptors(1);
+            inputs[0].role = role;
+            inputs[0].media_type = media_type.to_owned();
+            assert_eq!(
+                XaiImageEditAdmissionPlan::for_grok_cli(&job(), inputs),
+                Err(XaiImageEditAdmissionError::InvalidProviderCommand)
+            );
+        }
     }
 
     #[test]

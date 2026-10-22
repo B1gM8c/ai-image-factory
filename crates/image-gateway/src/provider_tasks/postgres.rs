@@ -6,7 +6,8 @@ use uuid::Uuid;
 
 use crate::artifacts::executor_object_key;
 use crate::executor::{
-    ExecutorResultManifest, ExecutorSubmissionError, release_capacity_allocation,
+    ExecutorInputObject, ExecutorResultManifest, ExecutorSubmissionError,
+    release_capacity_allocation,
 };
 
 use super::capacity::insert_capacity_reconciliation;
@@ -171,6 +172,7 @@ struct RecoveryClaimRow {
     command_schema: String,
     command_hash: String,
     command_json: Value,
+    input_objects: Value,
     operation_id: String,
     operation_descriptor_revision: String,
     operation_descriptor_sha256_v1: String,
@@ -3678,6 +3680,17 @@ async fn load_recovery_claim_command_in(
                command.claim_claimed_at_ms AS database_now_ms,
                submission.model, submission.command_schema,
                submission.command_hash, payload.command_json,
+               (SELECT COALESCE(jsonb_agg(to_jsonb(input) ORDER BY
+                         CASE input.role WHEN 'image' THEN 0 WHEN 'mask' THEN 1
+                              WHEN 'video' THEN 2 WHEN 'audio' THEN 3 ELSE 4 END,
+                         input.input_index), '[]'::jsonb)
+                FROM job_input_manifests manifest
+                JOIN job_input_objects input
+                  ON input.job_id = manifest.job_id
+                 AND input.admission_session_id = manifest.admission_session_id
+                WHERE manifest.job_id = payload.job_id
+                  AND manifest.admission_session_id = payload.admission_session_id
+               ) AS input_objects,
                submission.operation_id,
                submission.operation_descriptor_revision,
                submission.operation_descriptor_sha256_v1,
@@ -4234,6 +4247,46 @@ fn provider_context_from_row(row: ProviderContextRow) -> ProviderExecutionContex
     }
 }
 
+#[derive(serde::Deserialize)]
+struct RecoveryInputRow {
+    admission_session_id: Uuid,
+    input_id: Uuid,
+    role: String,
+    input_index: u16,
+    media_type: String,
+    storage_backend: String,
+    object_key: String,
+    sha256_hex: String,
+    byte_size: u64,
+}
+
+fn recovery_inputs_from_json(
+    value: Value,
+) -> Result<Vec<ExecutorInputObject>, ProviderTaskStoreError> {
+    let rows: Vec<RecoveryInputRow> =
+        serde_json::from_value(value).map_err(|_| ProviderTaskStoreError::Conflict)?;
+    rows.into_iter()
+        .map(|row| {
+            ExecutorInputObject::new(
+                crate::input_blobs::InputBlobRef {
+                    key: crate::input_blobs::InputBlobKey {
+                        admission_session_id: row.admission_session_id,
+                        input_id: row.input_id,
+                    },
+                    storage_backend: row.storage_backend,
+                    object_key: row.object_key,
+                    sha256_hex: row.sha256_hex,
+                    byte_size: row.byte_size,
+                },
+                row.role,
+                row.input_index,
+                row.media_type,
+            )
+            .ok_or(ProviderTaskStoreError::Conflict)
+        })
+        .collect()
+}
+
 fn recovery_lease_from_row(
     row: RecoveryClaimRow,
 ) -> Result<ProviderSubmitRecoveryLease, ProviderTaskStoreError> {
@@ -4301,6 +4354,7 @@ fn recovery_lease_from_row(
         intent,
         context,
         command_json: row.command_json,
+        inputs: recovery_inputs_from_json(row.input_objects)?.into(),
         remaining_budget_ms,
         recovery_owner: row.recovery_owner,
         recovery_lease_epoch: row.recovery_lease_epoch,
@@ -5013,6 +5067,38 @@ fn map_executor_error(error: ExecutorSubmissionError) -> ProviderTaskStoreError 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recovery_inputs_preserve_frozen_identity_and_reject_invalid_descriptors() {
+        let session = Uuid::new_v4();
+        let id = Uuid::new_v4();
+        let value = serde_json::json!([{
+            "admission_session_id": session, "input_id": id,
+            "role": "image", "input_index": 0, "media_type": "image/png",
+            "storage_backend": "filesystem", "object_key": "inputs/frozen",
+            "sha256_hex": "a".repeat(64), "byte_size": 42,
+        }]);
+        let inputs = recovery_inputs_from_json(value.clone()).unwrap();
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(inputs[0].blob().key.admission_session_id, session);
+        assert_eq!(inputs[0].blob().key.input_id, id);
+        assert_eq!(inputs[0].blob().byte_size, 42);
+        assert_eq!(inputs[0].blob().sha256_hex, "a".repeat(64));
+        assert_eq!(inputs[0].role(), "image");
+        assert_eq!(inputs[0].index(), 0);
+        assert_eq!(inputs[0].media_type(), "image/png");
+        let mut invalid = value;
+        invalid[0]["media_type"] = serde_json::json!("video/mp4");
+        assert_eq!(
+            recovery_inputs_from_json(invalid),
+            Err(ProviderTaskStoreError::Conflict)
+        );
+        assert!(
+            recovery_inputs_from_json(serde_json::json!([]))
+                .unwrap()
+                .is_empty()
+        );
+    }
 
     #[test]
     fn artifact_observation_accepts_mp4_only_for_video_operations() {

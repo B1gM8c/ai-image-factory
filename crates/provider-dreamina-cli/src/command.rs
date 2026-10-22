@@ -3,9 +3,12 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
-    ADAPTER_REVISION, DreaminaSubmitRequestV1, ImageModelVersion, ImageRatio, ImageResolution,
-    RequestValidationError, TextToImageRequestV1, TextToVideoRequestV1, VideoModelVersion,
-    VideoRatio, VideoResolution,
+    ADAPTER_REVISION, DreaminaSubmitRequestV1, FramesToVideoRequestV1, ImageModelVersion,
+    ImageRatio, ImageResolution, ImageToImageRequestV1, ImageToVideoRequestV1,
+    ImageUpscaleRequestV1, MultiframeToVideoRequestV1, MultimodalToVideoRequestV1,
+    ReferenceVideoOptionsV1, RequestValidationError, StagedImageV1, StagedTimedMediaV1,
+    TextToImageRequestV1, TextToVideoRequestV1, UpscaleResolution, VideoModelVersion, VideoRatio,
+    VideoResolution, VideoTransitionV1,
 };
 
 pub const DREAMINA_SUBMIT_COMMAND_SCHEMA: &str = "dreamina-cli.submit.v1";
@@ -114,6 +117,128 @@ enum CanonicalSubmitV1 {
         video_resolution: String,
         poll: u8,
     },
+    #[serde(rename = "image2image")]
+    ImageToImage {
+        schema_version: u16,
+        images: Vec<CanonicalImageV1>,
+        prompt: String,
+        model_version: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ratio: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        width: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        height: Option<u32>,
+        resolution_type: String,
+        generate_num: u8,
+        poll: u8,
+    },
+    #[serde(rename = "image_upscale")]
+    ImageUpscale {
+        schema_version: u16,
+        image: CanonicalImageV1,
+        resolution_type: String,
+        poll: u8,
+    },
+    #[serde(rename = "image2video")]
+    ImageToVideo {
+        schema_version: u16,
+        image: CanonicalImageV1,
+        prompt: String,
+        model_version: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ratio: Option<String>,
+        duration: u8,
+        video_resolution: String,
+        poll: u8,
+    },
+    #[serde(rename = "frames2video")]
+    FramesToVideo {
+        schema_version: u16,
+        first: CanonicalImageV1,
+        last: CanonicalImageV1,
+        prompt: String,
+        model_version: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ratio: Option<String>,
+        duration: u8,
+        video_resolution: String,
+        poll: u8,
+    },
+    #[serde(rename = "multiframe2video")]
+    MultiframeToVideo {
+        schema_version: u16,
+        images: Vec<CanonicalImageV1>,
+        transitions: Vec<CanonicalTransitionV1>,
+        video_resolution: String,
+        poll: u8,
+    },
+    #[serde(rename = "multimodal2video")]
+    MultimodalToVideo {
+        schema_version: u16,
+        images: Vec<CanonicalImageV1>,
+        videos: Vec<CanonicalTimedMediaV1>,
+        audios: Vec<CanonicalTimedMediaV1>,
+        prompt: String,
+        model_version: String,
+        ratio: String,
+        duration: u8,
+        video_resolution: String,
+        poll: u8,
+    },
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CanonicalImageV1 {
+    filename: String,
+    sha256: String,
+    width: u32,
+    height: u32,
+}
+impl From<&StagedImageV1> for CanonicalImageV1 {
+    fn from(image: &StagedImageV1) -> Self {
+        Self {
+            filename: image.filename().to_owned(),
+            sha256: image.sha256().to_owned(),
+            width: image.width(),
+            height: image.height(),
+        }
+    }
+}
+impl TryFrom<CanonicalImageV1> for StagedImageV1 {
+    type Error = RequestValidationError;
+    fn try_from(value: CanonicalImageV1) -> Result<Self, Self::Error> {
+        Self::new(value.filename, value.sha256, value.width, value.height)
+    }
+}
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CanonicalTimedMediaV1 {
+    filename: String,
+    sha256: String,
+    duration_ms: u64,
+}
+impl From<&StagedTimedMediaV1> for CanonicalTimedMediaV1 {
+    fn from(media: &StagedTimedMediaV1) -> Self {
+        Self {
+            filename: media.filename().to_owned(),
+            sha256: media.sha256().to_owned(),
+            duration_ms: media.duration_ms(),
+        }
+    }
+}
+impl TryFrom<CanonicalTimedMediaV1> for StagedTimedMediaV1 {
+    type Error = RequestValidationError;
+    fn try_from(value: CanonicalTimedMediaV1) -> Result<Self, Self::Error> {
+        Self::new(value.filename, value.sha256, value.duration_ms)
+    }
+}
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CanonicalTransitionV1 {
+    prompt: String,
+    duration_ms: u32,
 }
 
 impl From<DreaminaSubmitRequestV1> for CanonicalSubmitV1 {
@@ -132,6 +257,71 @@ impl From<DreaminaSubmitRequestV1> for CanonicalSubmitV1 {
             },
             DreaminaSubmitRequestV1::TextToVideo(request) => Self::TextToVideo {
                 schema_version: crate::REQUEST_SCHEMA_VERSION,
+                prompt: request.prompt().to_owned(),
+                model_version: request.model().as_str().to_owned(),
+                ratio: request.ratio().as_str().to_owned(),
+                duration: request.duration_seconds(),
+                video_resolution: request.resolution().as_str().to_owned(),
+                poll: 0,
+            },
+            DreaminaSubmitRequestV1::ImageToImage(request) => Self::ImageToImage {
+                schema_version: crate::REQUEST_SCHEMA_VERSION,
+                images: request.images().iter().map(Into::into).collect(),
+                prompt: request.parameters().prompt().to_owned(),
+                model_version: request.parameters().model().as_str().to_owned(),
+                ratio: request.parameters().ratio().map(|r| r.as_str().to_owned()),
+                width: request.parameters().width(),
+                height: request.parameters().height(),
+                resolution_type: request.parameters().resolution().as_str().to_owned(),
+                generate_num: request.generate_num(),
+                poll: 0,
+            },
+            DreaminaSubmitRequestV1::ImageUpscale(request) => Self::ImageUpscale {
+                schema_version: crate::REQUEST_SCHEMA_VERSION,
+                image: request.image().into(),
+                resolution_type: request.resolution().as_str().to_owned(),
+                poll: 0,
+            },
+            DreaminaSubmitRequestV1::ImageToVideo(request) => Self::ImageToVideo {
+                schema_version: crate::REQUEST_SCHEMA_VERSION,
+                image: request.image().into(),
+                prompt: request.options().prompt().to_owned(),
+                model_version: request.options().model().as_str().to_owned(),
+                ratio: request.options().ratio().map(|r| r.as_str().to_owned()),
+                duration: request.options().duration_seconds(),
+                video_resolution: request.options().resolution().as_str().to_owned(),
+                poll: 0,
+            },
+            DreaminaSubmitRequestV1::FramesToVideo(request) => Self::FramesToVideo {
+                schema_version: crate::REQUEST_SCHEMA_VERSION,
+                first: request.first().into(),
+                last: request.last().into(),
+                prompt: request.options().prompt().to_owned(),
+                model_version: request.options().model().as_str().to_owned(),
+                ratio: request.options().ratio().map(|r| r.as_str().to_owned()),
+                duration: request.options().duration_seconds(),
+                video_resolution: request.options().resolution().as_str().to_owned(),
+                poll: 0,
+            },
+            DreaminaSubmitRequestV1::MultiframeToVideo(request) => Self::MultiframeToVideo {
+                schema_version: crate::REQUEST_SCHEMA_VERSION,
+                images: request.images().iter().map(Into::into).collect(),
+                transitions: request
+                    .transitions()
+                    .iter()
+                    .map(|t| CanonicalTransitionV1 {
+                        prompt: t.prompt().to_owned(),
+                        duration_ms: t.duration_ms(),
+                    })
+                    .collect(),
+                video_resolution: request.resolution().as_str().to_owned(),
+                poll: 0,
+            },
+            DreaminaSubmitRequestV1::MultimodalToVideo(request) => Self::MultimodalToVideo {
+                schema_version: crate::REQUEST_SCHEMA_VERSION,
+                images: request.images().iter().map(Into::into).collect(),
+                videos: request.videos().iter().map(Into::into).collect(),
+                audios: request.audios().iter().map(Into::into).collect(),
                 prompt: request.prompt().to_owned(),
                 model_version: request.model().as_str().to_owned(),
                 ratio: request.ratio().as_str().to_owned(),
@@ -203,8 +393,173 @@ impl TryFrom<CanonicalSubmitV1> for DreaminaSubmitRequestV1 {
                 .map(Into::into)
                 .map_err(Into::into)
             }
+            CanonicalSubmitV1::ImageToImage {
+                schema_version,
+                images,
+                prompt,
+                model_version,
+                ratio,
+                width,
+                height,
+                resolution_type,
+                generate_num,
+                poll,
+            } => {
+                validate_envelope(schema_version, poll)?;
+                let model = parse_image_model(&model_version)?;
+                let resolution = parse_image_resolution(&resolution_type)?;
+                let parameters = match (ratio, width, height) {
+                    (Some(ratio), None, None) => TextToImageRequestV1::new(
+                        prompt,
+                        model,
+                        parse_image_ratio(&ratio)?,
+                        resolution,
+                        generate_num,
+                    ),
+                    (None, Some(width), Some(height)) => TextToImageRequestV1::new_custom(
+                        prompt,
+                        model,
+                        width,
+                        height,
+                        resolution,
+                        generate_num,
+                    ),
+                    _ => return Err(DreaminaSubmitCommandError::UnknownOfficialOption),
+                }?;
+                Ok(ImageToImageRequestV1::new(parse_images(images)?, parameters)?.into())
+            }
+            CanonicalSubmitV1::ImageUpscale {
+                schema_version,
+                image,
+                resolution_type,
+                poll,
+            } => {
+                validate_envelope(schema_version, poll)?;
+                let resolution = match resolution_type.as_str() {
+                    "2k" => UpscaleResolution::K2,
+                    "4k" => UpscaleResolution::K4,
+                    "8k" => UpscaleResolution::K8,
+                    _ => return Err(RequestValidationError::InvalidUpscaleResolution.into()),
+                };
+                Ok(ImageUpscaleRequestV1::new(image.try_into()?, resolution).into())
+            }
+            CanonicalSubmitV1::ImageToVideo {
+                schema_version,
+                image,
+                prompt,
+                model_version,
+                ratio,
+                duration,
+                video_resolution,
+                poll,
+            } => {
+                validate_envelope(schema_version, poll)?;
+                let options = parse_reference_options(
+                    prompt,
+                    model_version,
+                    ratio,
+                    duration,
+                    video_resolution,
+                )?;
+                Ok(ImageToVideoRequestV1::new(image.try_into()?, options)?.into())
+            }
+            CanonicalSubmitV1::FramesToVideo {
+                schema_version,
+                first,
+                last,
+                prompt,
+                model_version,
+                ratio,
+                duration,
+                video_resolution,
+                poll,
+            } => {
+                validate_envelope(schema_version, poll)?;
+                let options = parse_reference_options(
+                    prompt,
+                    model_version,
+                    ratio,
+                    duration,
+                    video_resolution,
+                )?;
+                Ok(
+                    FramesToVideoRequestV1::new(first.try_into()?, last.try_into()?, options)?
+                        .into(),
+                )
+            }
+            CanonicalSubmitV1::MultiframeToVideo {
+                schema_version,
+                images,
+                transitions,
+                video_resolution,
+                poll,
+            } => {
+                validate_envelope(schema_version, poll)?;
+                let transitions = transitions
+                    .into_iter()
+                    .map(|t| VideoTransitionV1::new(t.prompt, t.duration_ms))
+                    .collect::<Result<_, _>>()?;
+                Ok(MultiframeToVideoRequestV1::new(
+                    parse_images(images)?,
+                    transitions,
+                    parse_video_resolution(&video_resolution)?,
+                )?
+                .into())
+            }
+            CanonicalSubmitV1::MultimodalToVideo {
+                schema_version,
+                images,
+                videos,
+                audios,
+                prompt,
+                model_version,
+                ratio,
+                duration,
+                video_resolution,
+                poll,
+            } => {
+                validate_envelope(schema_version, poll)?;
+                Ok(MultimodalToVideoRequestV1::new(
+                    parse_images(images)?,
+                    videos
+                        .into_iter()
+                        .map(TryInto::try_into)
+                        .collect::<Result<_, _>>()?,
+                    audios
+                        .into_iter()
+                        .map(TryInto::try_into)
+                        .collect::<Result<_, _>>()?,
+                    prompt,
+                    parse_video_model(&model_version)?,
+                    parse_video_ratio(&ratio)?,
+                    duration,
+                    parse_video_resolution(&video_resolution)?,
+                )?
+                .into())
+            }
         }
     }
+}
+
+fn parse_images(
+    images: Vec<CanonicalImageV1>,
+) -> Result<Vec<StagedImageV1>, RequestValidationError> {
+    images.into_iter().map(TryInto::try_into).collect()
+}
+fn parse_reference_options(
+    prompt: String,
+    model: String,
+    ratio: Option<String>,
+    duration: u8,
+    resolution: String,
+) -> Result<ReferenceVideoOptionsV1, DreaminaSubmitCommandError> {
+    Ok(ReferenceVideoOptionsV1::new(
+        prompt,
+        parse_video_model(&model)?,
+        ratio.map(|r| parse_video_ratio(&r)).transpose()?,
+        duration,
+        parse_video_resolution(&resolution)?,
+    )?)
 }
 
 fn validate_envelope(schema_version: u16, poll: u8) -> Result<(), DreaminaSubmitCommandError> {
@@ -249,6 +604,7 @@ fn parse_image_ratio(value: &str) -> Result<ImageRatio, DreaminaSubmitCommandErr
 fn parse_image_resolution(value: &str) -> Result<ImageResolution, DreaminaSubmitCommandError> {
     match value {
         "1k" => Ok(ImageResolution::K1),
+        "1.5k" => Ok(ImageResolution::K1_5),
         "2k" => Ok(ImageResolution::K2),
         "4k" => Ok(ImageResolution::K4),
         _ => Err(DreaminaSubmitCommandError::UnknownOfficialOption),
@@ -257,6 +613,8 @@ fn parse_image_resolution(value: &str) -> Result<ImageResolution, DreaminaSubmit
 
 fn parse_video_model(value: &str) -> Result<VideoModelVersion, DreaminaSubmitCommandError> {
     match value {
+        "seedance1.0fast" => Ok(VideoModelVersion::Seedance1_0Fast),
+        "seedance1.5pro" => Ok(VideoModelVersion::Seedance1_5Pro),
         "seedance2.0" => Ok(VideoModelVersion::Seedance2_0),
         "seedance2.0fast" => Ok(VideoModelVersion::Seedance2_0Fast),
         "seedance2.0_vip" => Ok(VideoModelVersion::Seedance2_0Vip),
@@ -299,10 +657,9 @@ fn valid_sha256(value: &str) -> bool {
 fn ensure_single_output(
     request: &DreaminaSubmitRequestV1,
 ) -> Result<(), DreaminaSubmitCommandError> {
-    match request {
-        DreaminaSubmitRequestV1::TextToImage(request) if request.generate_num() != 1 => {
-            Err(DreaminaSubmitCommandError::BatchSubmissionUnsupported)
-        }
-        DreaminaSubmitRequestV1::TextToImage(_) | DreaminaSubmitRequestV1::TextToVideo(_) => Ok(()),
+    if request.output_count() != 1 {
+        Err(DreaminaSubmitCommandError::BatchSubmissionUnsupported)
+    } else {
+        Ok(())
     }
 }

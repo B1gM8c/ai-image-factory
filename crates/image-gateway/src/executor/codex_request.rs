@@ -266,6 +266,9 @@ fn project_codex_edit_output_request(
                     .ok_or(CodexRequestProjectionError::InvalidCommand)?
             ),
             crate::admission::EditInputRoleV1::Mask => "mask.png".to_string(),
+            crate::admission::EditInputRoleV1::Video | crate::admission::EditInputRoleV1::Audio => {
+                return Err(CodexRequestProjectionError::InvalidCommand);
+            }
         };
         inputs.push(CodexEditInputRequest {
             filename,
@@ -332,6 +335,8 @@ fn validate_edit_request(
                 || input.filename.len() > 255
                 || input.filename.contains('/')
                 || !matches!(input.role.as_str(), "image" | "mask")
+                || (input.role == "image" && input.index >= 16)
+                || (input.role == "mask" && (input.index != 0 || input.media_type != "image/png"))
                 || extension_for_media_type(&input.media_type).is_none()
                 || input.sha256_hex.len() != 64
                 || !input
@@ -594,6 +599,49 @@ mod tests {
         assert_eq!(first.inputs.len(), 1);
         assert_eq!(first.inputs[0].filename, "input-0.png");
         assert_eq!(first.inputs[0].sha256_hex, "1".repeat(64));
+    }
+
+    #[test]
+    fn codex_edit_projection_keeps_legacy_roles_and_image_index_bounds() {
+        for (role, index, media_type) in [
+            (crate::admission::EditInputRoleV1::Video, 0, "video/mp4"),
+            (crate::admission::EditInputRoleV1::Audio, 0, "audio/wav"),
+            (crate::admission::EditInputRoleV1::Image, 16, "image/png"),
+        ] {
+            let mut command = edit_command(1);
+            command.inputs[0].role = role;
+            command.inputs[0].index = index;
+            command.inputs[0].media_type = media_type.to_owned();
+            let mut context = ExecutorLaunchContext::new(
+                "edit-request-1",
+                OPENAI_IMAGES_API_PROFILE,
+                0,
+                EDIT_COMMAND_SCHEMA,
+                command.request_hash_hex(),
+                serde_json::to_value(&command).unwrap(),
+            )
+            .unwrap();
+            // PostgreSQL loads typed storage descriptors before provider projection.
+            context.inputs = vec![
+                super::super::ExecutorInputObject::new(
+                    crate::input_blobs::InputBlobRef {
+                        key: crate::input_blobs::InputBlobKey {
+                            admission_session_id: Uuid::new_v4(),
+                            input_id: Uuid::new_v4(),
+                        },
+                        storage_backend: "memory".to_owned(),
+                        object_key: "input".to_owned(),
+                        sha256_hex: "1".repeat(64),
+                        byte_size: 128,
+                    },
+                    role.as_str(),
+                    index,
+                    media_type,
+                )
+                .unwrap(),
+            ];
+            assert!(project_codex_execution_request(&edit_lease(0, &command), &context).is_err());
+        }
     }
 
     #[test]

@@ -4,6 +4,8 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use utoipa::{Modify, OpenApi, ToSchema};
 
+mod dreamina;
+
 use crate::{
     admin_read::{
         AuditLogActor, AuditLogItem, AuditLogProject, AuditLogResource, AuditLogsSnapshot,
@@ -784,7 +786,7 @@ async fn cancel_batch_doc() {}
     request_body(
         content = DreaminaImageGenerationRequestDoc,
         content_type = "application/json",
-        description = "Dreamina CLI-native text-to-image request. Use ratio or a complete width/height pair, never both. Images are returned as base64 JSON and temporary local files are removed by the executor."
+        description = "Dreamina native image workflows: text2image, image2image and image_upscale. Omit workflow for the legacy text2image request. Reference images accept public HTTPS or base64 data URLs containing PNG/JPEG/WebP. Generation uses ratio or a complete width/height pair, never both. session and poll may only be omitted or integer 0; Factory manages CLI sessions and polling. Images are returned as base64 JSON."
     ),
     responses(
         (status = 200, description = "Base64 encoded generated images", body = ImagesResponse),
@@ -809,7 +811,7 @@ async fn create_dreamina_image() {}
     request_body(
         content = DreaminaVideoGenerationRequestDoc,
         content_type = "application/json",
-        description = "Dreamina CLI-native asynchronous Seedance text-to-video request."
+        description = "Dreamina native asynchronous video workflows: text2video, image2video, frames2video, multiframe2video and multimodal2video. Omit workflow for the legacy text2video request. Inputs accept public HTTPS or base64 data URLs: PNG/JPEG/WebP images, non-fragmented MP4 with H264/AVC video, and MP3 or PCM WAV audio. HEVC, VP9 and fragmented MP4 are unsupported. session and poll may only be omitted or integer 0; Factory manages CLI sessions and polling. Model, resolution, ratio and input-count limits depend on the selected workflow."
     ),
     responses(
         (status = 200, description = "Video task accepted", body = DreaminaTaskCreatedDoc),
@@ -868,7 +870,7 @@ async fn get_dreamina_video_file_content() {}
     request_body(
         content = ArkImageGenerationRequestDoc,
         content_type = "application/json",
-        description = "Volcengine Ark ImageGenerations wire contract. The current Dreamina CLI binding supports text-to-image, b64_json, non-streaming output, 1K/2K/4K or WIDTHxHEIGHT, and deterministic multi-image counts. Represented fields that the CLI cannot honor fail closed."
+        description = "Volcengine Ark ImageGenerations wire contract. Omit image for text2image, or supply one image URL or an array of 1-10 image URLs for image2image. Inputs accept public HTTPS or base64 data URLs containing PNG/JPEG/WebP. Output is non-streaming b64_json. Size accepts 1K/2K/4K or WIDTHxHEIGHT, subject to model support. sequential_image_generation=auto requires max_images and produces that exact count (1-10). Upscaling is available only through the native Dreamina image endpoint. Represented fields that the CLI cannot honor fail with unsupported_parameter."
     ),
     responses(
         (status = 200, description = "Ark-compatible base64 image response", body = ArkImageGenerationResponseDoc),
@@ -893,7 +895,7 @@ async fn create_ark_image() {}
     request_body(
         content = ArkContentGenerationTaskRequestDoc,
         content_type = "application/json",
-        description = "Volcengine Ark asynchronous content-generation contract. The current Dreamina CLI binding accepts exactly one text content item and Seedance 2.0 720p controls; reference media, callbacks, audio, draft, tools, frames, and other unbound fields fail closed."
+        description = "Volcengine Ark asynchronous content-generation contract. Content selects text2video (one text item), image2video (text plus first_frame image), frames2video (text plus first_frame and last_frame images), or multimodal2video (reference_image/reference_video/reference_audio items and optional text). An image with no role is a first_frame. Do not mix first/last frames with reference media; at most one text item is accepted. Inputs accept public HTTPS or base64 data URLs: PNG/JPEG/WebP images, non-fragmented MP4 with H264/AVC video, and MP3 or PCM WAV audio. Model-specific limits apply, including Seedance 2.5 at 480p/720p/1080p and 4-30 integer seconds. Multiframe transitions use the native Dreamina endpoint. Callbacks, draft, tools, frames, generate_audio and other represented-but-unbound controls fail with unsupported_parameter."
     ),
     responses(
         (status = 200, description = "Content generation task accepted", body = ArkContentGenerationTaskIdDoc),
@@ -948,7 +950,7 @@ async fn get_ark_video_file_content() {}
     tag = "Models",
     security(("BearerAuth" = [])),
     responses(
-        (status = 200, description = "Supported model list", body = ModelsResponse),
+        (status = 200, description = "Model IDs visible to the authenticated API key under the current project routing policy. Entries contain id, object, created and owned_by; this list is not a per-workflow capability matrix or a guarantee that every parameter combination is supported.", body = ModelsResponse),
         (status = 401, description = "Invalid authentication", body = ErrorResponseDoc)
     )
 )]
@@ -2909,7 +2911,7 @@ struct DreaminaVideoGenerationRequestDoc {
     model_version: Option<DreaminaVideoModelDoc>,
     #[schema(inline)]
     ratio: Option<DreaminaVideoRatioDoc>,
-    #[schema(minimum = 4, maximum = 15, default = 5)]
+    #[schema(minimum = 4, maximum = 30, default = 5)]
     duration: Option<u8>,
     #[schema(inline)]
     video_resolution: DreaminaVideoResolutionDoc,
@@ -2936,7 +2938,8 @@ struct DreaminaVideoTaskDoc {
 #[allow(dead_code)]
 struct DreaminaVideoContentDoc {
     video_url: String,
-    duration: u8,
+    /// Exact seconds frozen at millisecond precision. Whole seconds remain JSON integers (5); fractional seconds are JSON numbers (2.501).
+    duration: f64,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -2954,6 +2957,7 @@ struct ArkImageGenerationRequestDoc {
     model: String,
     #[schema(min_length = 1)]
     prompt: String,
+    /// One reference image or 1-10 images; each is a public HTTPS or base64 data URL containing PNG/JPEG/WebP.
     image: Option<ArkStringOrStringsDoc>,
     #[schema(example = "b64_json")]
     response_format: Option<String>,
@@ -3035,7 +3039,7 @@ struct ArkImageUsageDoc {
 #[schema(as = ArkContentGenerationTaskRequest)]
 #[allow(dead_code)]
 struct ArkContentGenerationTaskRequestDoc {
-    #[schema(example = "doubao-seedance-2-0-fast-260128")]
+    #[schema(example = "doubao-seedance-2-5-260628")]
     model: String,
     content: Vec<ArkContentItemDoc>,
     safety_identifier: Option<String>,
@@ -3053,8 +3057,9 @@ struct ArkContentGenerationTaskRequestDoc {
     resolution: Option<String>,
     #[schema(example = "16:9")]
     ratio: Option<String>,
-    #[schema(minimum = 4, maximum = 15, default = 5)]
-    duration: Option<u8>,
+    /// Integer seconds: 4-30 for Seedance 2.5, 4-15 for Seedance 2.0 variants. The official automatic-duration value -1 is represented but rejected with unsupported_parameter.
+    #[schema(minimum = 4, maximum = 30, default = 5)]
+    duration: Option<i16>,
     frames: Option<u32>,
     tools: Option<Vec<ArkContentGenerationToolDoc>>,
 }
@@ -3068,25 +3073,30 @@ enum ArkContentItemDoc {
     #[serde(rename = "image_url")]
     ImageUrl {
         image_url: ArkMediaUrlDoc,
-        role: String,
+        /// Omit for first_frame, or use first_frame, last_frame or reference_image.
+        role: Option<String>,
     },
     #[serde(rename = "audio_url")]
     AudioUrl {
         audio_url: ArkMediaUrlDoc,
+        /// Only reference_audio is supported.
         role: String,
     },
     #[serde(rename = "video_url")]
     VideoUrl {
         video_url: ArkMediaUrlDoc,
+        /// Only reference_video is supported.
         role: String,
     },
     #[serde(rename = "draft_task")]
+    /// Represented for wire compatibility; rejected with unsupported_parameter.
     DraftTask { draft_task: ArkDraftTaskRefDoc },
 }
 
 #[derive(Debug, Serialize, ToSchema)]
 #[allow(dead_code)]
 struct ArkMediaUrlDoc {
+    /// Public HTTPS or base64 data URL. Images: PNG/JPEG/WebP. Video: non-fragmented MP4 with H264/AVC. Audio: MP3 or PCM WAV. The declared MIME type must match the bytes; local paths and file IDs are unsupported.
     url: String,
 }
 
@@ -3114,7 +3124,8 @@ struct ArkContentGenerationTaskDoc {
     error: Option<ArkContentGenerationErrorDoc>,
     content: Option<ArkGeneratedContentDoc>,
     usage: Option<ArkContentGenerationUsageDoc>,
-    duration: Option<u8>,
+    /// Exact seconds frozen at millisecond precision. Whole seconds remain JSON integers (5); fractional seconds are JSON numbers (2.501).
+    duration: Option<f64>,
     resolution: Option<String>,
     ratio: Option<String>,
 }
@@ -3190,6 +3201,8 @@ enum DreaminaImageRatioDoc {
 enum DreaminaImageResolutionDoc {
     #[serde(rename = "1k")]
     K1,
+    #[serde(rename = "1.5k")]
+    K1_5,
     #[serde(rename = "2k")]
     K2,
     #[serde(rename = "4k")]
@@ -3199,6 +3212,10 @@ enum DreaminaImageResolutionDoc {
 #[derive(Debug, Serialize, ToSchema)]
 #[allow(dead_code)]
 enum DreaminaVideoModelDoc {
+    #[serde(rename = "seedance1.0fast")]
+    V1Fast,
+    #[serde(rename = "seedance1.5pro")]
+    V1_5Pro,
     #[serde(rename = "seedance2.0")]
     Standard,
     #[serde(rename = "seedance2.0fast")]
@@ -3209,6 +3226,8 @@ enum DreaminaVideoModelDoc {
     FastVip,
     #[serde(rename = "seedance2.0mini")]
     Mini,
+    #[serde(rename = "seedance2.5")]
+    V2_5,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -3231,6 +3250,8 @@ enum DreaminaVideoRatioDoc {
 #[derive(Debug, Serialize, ToSchema)]
 #[allow(dead_code)]
 enum DreaminaVideoResolutionDoc {
+    #[serde(rename = "480p")]
+    P480,
     #[serde(rename = "720p")]
     P720,
     #[serde(rename = "1080p")]
@@ -3882,6 +3903,7 @@ enum StyleDoc {
 }
 
 fn patch_generated_schema(value: &mut Value) {
+    dreamina::patch_schemas(value);
     patch_property_enum(
         value,
         "ImageGenerationRequest",

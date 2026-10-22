@@ -10,8 +10,8 @@ use image::ImageReader;
 use image_api_contracts::ark::{
     ARK_CONTENT_GENERATION_API_PROFILE, ARK_IMAGES_API_PROFILE, ArkContentGenerationError,
     ArkContentGenerationTask, ArkContentGenerationTaskId, ArkContentGenerationTaskRequest,
-    ArkGeneratedContent, ArkImageData, ArkImageGenerationRequest, ArkImageGenerationResponse,
-    ArkImageUsage,
+    ArkContentItem, ArkGeneratedContent, ArkImageData, ArkImageGenerationRequest,
+    ArkImageGenerationResponse, ArkImageUsage,
 };
 use uuid::Uuid;
 
@@ -19,7 +19,8 @@ use crate::{
     ImageGatewayError,
     admission::{
         AdmissionContract, ArkAdmissionError, ArkImageAdmissionPlan, ArkVideoAdmissionPlan,
-        CustomerPricingIntent, GENERATION_OPERATION, VIDEO_GENERATION_OPERATION,
+        CustomerPricingIntent, DreaminaWorkflowIntent, GENERATION_OPERATION,
+        VIDEO_GENERATION_OPERATION, ark_image_workflow, ark_video_workflow,
     },
     artifacts::StoredGenerationResult,
     auth::{ApiKeyCapability, AuthContext},
@@ -30,8 +31,9 @@ use crate::{
 use super::{
     AppState, RequestId, authenticate_image_request,
     dreamina::{
-        customer_pricing_request_hash, idempotency_digest, invalid_json,
+        customer_pricing_request_hash, dreamina_admission_error, idempotency_digest, invalid_json,
         require_external_execution, submit_image_generation, submit_video_generation,
+        submit_workflow,
     },
     images::{admission_deadline, generation_admission_contract},
     resolve_request_model,
@@ -105,6 +107,29 @@ async fn create_image_with_optional_route(
         return Err(ImageGatewayError::service_unavailable(
             "customer pricing requires an enabled model route",
         ));
+    }
+    if request.image.is_some() {
+        let workflow = ark_image_workflow(request)
+            .map_err(|error| ark_admission_error(error, &requested_model))?;
+        let intent = DreaminaWorkflowIntent::image(workflow).map_err(dreamina_admission_error)?;
+        let execution_model_id = execution_model_id.ok_or_else(|| {
+            ImageGatewayError::service_unavailable(
+                "Dreamina workflow requires an enabled model route",
+            )
+        })?;
+        let job_id = submit_workflow(
+            state,
+            &auth,
+            headers,
+            request_id,
+            ARK_IMAGES_API_PROFILE,
+            public_model_id,
+            execution_model_id,
+            intent,
+        )
+        .await?;
+        let result = super::images::wait_for_generation_result(state, job_id).await?;
+        return ark_image_response(requested_model, result);
     }
     let plan = ArkImageAdmissionPlan::new(request)
         .map_err(|error| ark_admission_error(error, &requested_model))?;
@@ -251,6 +276,35 @@ async fn create_content_task_with_optional_route(
             "customer pricing requires an enabled model route",
         ));
     }
+    if request
+        .content
+        .iter()
+        .any(|item| !matches!(item, ArkContentItem::Text { .. }))
+    {
+        let workflow = ark_video_workflow(request)
+            .map_err(|error| ark_admission_error(error, &requested_model))?;
+        let intent = DreaminaWorkflowIntent::video(workflow).map_err(dreamina_admission_error)?;
+        let execution_model_id = execution_model_id.ok_or_else(|| {
+            ImageGatewayError::service_unavailable(
+                "Dreamina workflow requires an enabled model route",
+            )
+        })?;
+        let job_id = submit_workflow(
+            state,
+            &auth,
+            headers,
+            request_id,
+            ARK_CONTENT_GENERATION_API_PROFILE,
+            public_model_id,
+            execution_model_id,
+            intent,
+        )
+        .await?;
+        return Ok(ArkContentGenerationTaskId {
+            id: public_task_id(job_id),
+            safety_identifier: None,
+        });
+    }
     let plan = ArkVideoAdmissionPlan::new(request)
         .map_err(|error| ark_admission_error(error, &requested_model))?;
     let idempotency = idempotency_digest(
@@ -385,22 +439,22 @@ fn ark_video_task(
     let public_id = public_task_id(id);
     let mut task = match status {
         VideoResultStatus::Pending {
-            model, duration, ..
+            model, duration_ms, ..
         }
-        | VideoResultStatus::Uncertain { model, duration } => ArkContentGenerationTask {
+        | VideoResultStatus::Uncertain { model, duration_ms } => ArkContentGenerationTask {
             id: public_id,
             model: public_video_model(&model).to_owned(),
             status: "running".to_owned(),
             error: None,
             content: None,
             usage: None,
-            duration: Some(duration),
+            duration: Some(super::dreamina::duration_seconds(duration_ms)),
             resolution: None,
             ratio: None,
         },
         VideoResultStatus::Succeeded {
             model,
-            duration,
+            duration_ms,
             artifact_id,
         } => ArkContentGenerationTask {
             id: public_id,
@@ -413,13 +467,13 @@ fn ark_video_task(
                 file_url: None,
             }),
             usage: None,
-            duration: Some(duration),
+            duration: Some(super::dreamina::duration_seconds(duration_ms)),
             resolution: None,
             ratio: None,
         },
         VideoResultStatus::Failed {
             model,
-            duration,
+            duration_ms,
             error_code,
         } => ArkContentGenerationTask {
             id: public_id,
@@ -431,7 +485,7 @@ fn ark_video_task(
             }),
             content: None,
             usage: None,
-            duration: Some(duration),
+            duration: Some(super::dreamina::duration_seconds(duration_ms)),
             resolution: None,
             ratio: None,
         },
@@ -600,21 +654,21 @@ mod tests {
         let statuses = [
             VideoResultStatus::Pending {
                 model: "execution-model-id".to_owned(),
-                duration: 5,
+                duration_ms: 5000,
                 stage: crate::settlement::VideoPendingStage::Queued,
             },
             VideoResultStatus::Uncertain {
                 model: "execution-model-id".to_owned(),
-                duration: 5,
+                duration_ms: 5000,
             },
             VideoResultStatus::Succeeded {
                 model: "execution-model-id".to_owned(),
-                duration: 5,
+                duration_ms: 5000,
                 artifact_id,
             },
             VideoResultStatus::Failed {
                 model: "execution-model-id".to_owned(),
-                duration: 5,
+                duration_ms: 5000,
                 error_code: Some("generation_failed".to_owned()),
             },
         ];
@@ -631,7 +685,7 @@ mod tests {
             assert_eq!(response.model, "doubao-seedance-2-5-260628");
             assert_eq!(response.resolution.as_deref(), Some("480p"));
             assert_eq!(response.ratio.as_deref(), Some("16:9"));
-            assert_eq!(response.duration, Some(5));
+            assert_eq!(response.duration, Some(5.into()));
             if response.status == "succeeded" {
                 assert_eq!(
                     response.content.unwrap().video_url.as_deref(),
@@ -647,7 +701,7 @@ mod tests {
             Uuid::new_v4(),
             VideoResultStatus::Pending {
                 model: "seedance2.0fast".to_owned(),
-                duration: 5,
+                duration_ms: 5000,
                 stage: crate::settlement::VideoPendingStage::Processing,
             },
             VideoRequestMetadata::default(),
@@ -658,6 +712,23 @@ mod tests {
         assert_eq!(
             ark_video_model_for_provider("seedance2.5"),
             Some("doubao-seedance-2-5-260628")
+        );
+    }
+
+    #[test]
+    fn ark_duration_exposes_frozen_milliseconds_as_exact_decimal_seconds() {
+        let task = ark_video_task(
+            Uuid::new_v4(),
+            VideoResultStatus::Pending {
+                model: "multiframe2video".to_owned(),
+                duration_ms: 2501,
+                stage: crate::settlement::VideoPendingStage::Processing,
+            },
+            VideoRequestMetadata::default(),
+        );
+        assert_eq!(
+            serde_json::to_value(task).unwrap()["duration"].to_string(),
+            "2.501"
         );
     }
 }

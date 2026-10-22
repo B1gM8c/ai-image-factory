@@ -13,6 +13,8 @@ pub const EDIT_OPERATION: &str = "edit";
 pub enum EditInputRoleV1 {
     Image,
     Mask,
+    Video,
+    Audio,
 }
 
 impl EditInputRoleV1 {
@@ -20,6 +22,8 @@ impl EditInputRoleV1 {
         match self {
             Self::Image => "image",
             Self::Mask => "mask",
+            Self::Video => "video",
+            Self::Audio => "audio",
         }
     }
 }

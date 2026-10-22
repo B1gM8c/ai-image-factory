@@ -98,7 +98,7 @@ pub struct ArkContentGenerationTaskRequest {
     #[serde(default)]
     pub ratio: Option<String>,
     #[serde(default)]
-    pub duration: Option<u8>,
+    pub duration: Option<i16>,
     #[serde(default)]
     pub frames: Option<u32>,
     #[serde(default)]
@@ -106,14 +106,15 @@ pub struct ArkContentGenerationTaskRequest {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(tag = "type")]
+#[serde(tag = "type", deny_unknown_fields)]
 pub enum ArkContentItem {
     #[serde(rename = "text")]
     Text { text: String },
     #[serde(rename = "image_url")]
     ImageUrl {
         image_url: ArkMediaUrl,
-        role: String,
+        #[serde(default)]
+        role: Option<String>,
     },
     #[serde(rename = "audio_url")]
     AudioUrl {
@@ -192,7 +193,7 @@ pub struct ArkContentGenerationTask {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<ArkContentGenerationUsage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub duration: Option<u8>,
+    pub duration: Option<serde_json::Number>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolution: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -225,6 +226,22 @@ pub struct ArkContentGenerationUsage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn content_roles_and_nested_fields_are_not_silently_discarded() {
+        let item: ArkContentItem = serde_json::from_str(
+            r#"{"type":"image_url","image_url":{"url":"https://example.com/a.png"}}"#,
+        )
+        .unwrap();
+        assert!(matches!(item, ArkContentItem::ImageUrl { role: None, .. }));
+        for json in [
+            r#"{"type":"text","text":"move","role":"reference_image"}"#,
+            r#"{"type":"image_url","image_url":{"url":"https://example.com/a.png","width":1024}}"#,
+            r#"{"type":"video_url","video_url":{"url":"https://example.com/a.mp4"},"role":"reference_video","duration":3}"#,
+        ] {
+            assert!(serde_json::from_str::<ArkContentItem>(json).is_err());
+        }
+    }
 
     #[test]
     fn image_request_matches_the_official_ark_wire_shape() {

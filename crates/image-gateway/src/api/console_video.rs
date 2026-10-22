@@ -143,7 +143,7 @@ struct ConsoleVideoStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    duration: Option<u8>,
+    duration: Option<serde_json::Number>,
     #[serde(skip_serializing_if = "Option::is_none")]
     progress: Option<u8>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -755,7 +755,7 @@ fn console_video_request(
                 seed: None,
                 resolution: Some(resolution),
                 ratio: aspect_ratio,
-                duration: Some(duration),
+                duration: Some(i16::from(duration)),
                 frames: None,
                 tools: None,
             },
@@ -809,38 +809,38 @@ fn console_video_status(
     match status {
         VideoResultStatus::Pending {
             model,
-            duration,
+            duration_ms,
             stage,
         } => ConsoleVideoStatus {
             task_id: task_id.to_owned(),
             status: "pending",
             stage: Some(console_video_pending_stage(stage)),
             model: Some(model),
-            duration: Some(duration),
+            duration: Some(super::dreamina::duration_seconds(duration_ms)),
             progress: None,
             content_url: None,
             error: None,
         },
-        VideoResultStatus::Uncertain { model, duration } => ConsoleVideoStatus {
+        VideoResultStatus::Uncertain { model, duration_ms } => ConsoleVideoStatus {
             task_id: task_id.to_owned(),
             status: "uncertain",
             stage: None,
             model: Some(model),
-            duration: Some(duration),
+            duration: Some(super::dreamina::duration_seconds(duration_ms)),
             progress: None,
             content_url: None,
             error: None,
         },
         VideoResultStatus::Succeeded {
             model,
-            duration,
+            duration_ms,
             artifact_id,
         } => ConsoleVideoStatus {
             task_id: task_id.to_owned(),
             status: "done",
             stage: None,
             model: Some(model),
-            duration: Some(duration),
+            duration: Some(super::dreamina::duration_seconds(duration_ms)),
             progress: Some(100),
             content_url: Some(format!(
                 "/v1/console/projects/{project_id}/videos/files/{artifact_id}/content"
@@ -849,7 +849,7 @@ fn console_video_status(
         },
         VideoResultStatus::Failed {
             model,
-            duration,
+            duration_ms,
             error_code,
         } => {
             let error_code = error_code.as_deref();
@@ -858,7 +858,7 @@ fn console_video_status(
                 status: "failed",
                 stage: None,
                 model: Some(model),
-                duration: Some(duration),
+                duration: Some(super::dreamina::duration_seconds(duration_ms)),
                 progress: None,
                 content_url: None,
                 error: Some(ConsoleVideoError {
@@ -1311,7 +1311,7 @@ mod tests {
             "task-one",
             VideoResultStatus::Succeeded {
                 model: "grok-imagine-video".to_owned(),
-                duration: 6,
+                duration_ms: 6000,
                 artifact_id,
             },
         );
@@ -1332,7 +1332,7 @@ mod tests {
             "task-one",
             VideoResultStatus::Failed {
                 model: "grok-imagine-video".to_owned(),
-                duration: 6,
+                duration_ms: 6000,
                 error_code: Some("grok_video_output_upload_url_required".to_owned()),
             },
         );
@@ -1371,7 +1371,7 @@ mod tests {
                 "task-one",
                 VideoResultStatus::Failed {
                     model: "grok-imagine-video".to_owned(),
-                    duration: 6,
+                    duration_ms: 6000,
                     error_code: Some(error_code.to_owned()),
                 },
             );

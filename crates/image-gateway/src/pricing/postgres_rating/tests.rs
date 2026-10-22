@@ -2685,3 +2685,5 @@ impl TestSchema {
         result.map(|_| ())
     }
 }
+
+mod multiframe;

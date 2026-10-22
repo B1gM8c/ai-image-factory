@@ -181,6 +181,59 @@ fn decode_data_url(
     max_bytes: usize,
     total_bytes: &mut usize,
 ) -> Result<DecodedVideoInput, ImageGatewayError> {
+    let decoded = decode_media_data_url(
+        param,
+        source,
+        max_bytes,
+        max_bytes,
+        &["image/png", "image/jpeg", "image/webp"],
+        total_bytes,
+    )?;
+    validate_signature(&decoded.media_type, &decoded.bytes, param)?;
+    Ok(decoded)
+}
+
+/// Fetch bounded source bytes; callers must probe the body before accepting its MIME.
+pub(super) async fn decode_media_source(
+    param: &str,
+    source: &str,
+    max_bytes: usize,
+    max_total_bytes: usize,
+    media_types: &[&str],
+    total_bytes: &mut usize,
+) -> Result<DecodedVideoInput, ImageGatewayError> {
+    if source.starts_with("data:") {
+        decode_media_data_url(
+            param,
+            source,
+            max_bytes,
+            max_total_bytes,
+            media_types,
+            total_bytes,
+        )
+    } else if source.starts_with("https://") {
+        fetch_https_input(
+            param,
+            source,
+            max_bytes,
+            max_total_bytes,
+            media_types,
+            total_bytes,
+        )
+        .await
+    } else {
+        Err(unsupported_source(param))
+    }
+}
+
+fn decode_media_data_url(
+    param: &str,
+    source: &str,
+    max_bytes: usize,
+    max_total_bytes: usize,
+    media_types: &[&str],
+    total_bytes: &mut usize,
+) -> Result<DecodedVideoInput, ImageGatewayError> {
     let Some((metadata, encoded)) = source
         .strip_prefix("data:")
         .and_then(|value| value.split_once(','))
@@ -195,11 +248,11 @@ fn decode_data_url(
             "image data URL must be base64 encoded",
         ));
     }
-    if !matches!(media_type, "image/png" | "image/jpeg" | "image/webp") {
+    if !media_types.contains(&media_type) {
         return Err(invalid_image(param, "unsupported image media type"));
     }
     let estimated = encoded.len().saturating_mul(3).saturating_div(4);
-    if estimated > max_bytes || total_bytes.saturating_add(estimated) > max_bytes {
+    if estimated > max_bytes || total_bytes.saturating_add(estimated) > max_total_bytes {
         return Err(ImageGatewayError::payload_too_large(
             "video input payload is too large",
         ));
@@ -207,8 +260,7 @@ fn decode_data_url(
     let bytes = STANDARD
         .decode(encoded)
         .map_err(|_| invalid_image(param, "invalid base64 image data"))?;
-    add_total(total_bytes, bytes.len(), max_bytes)?;
-    validate_signature(media_type, &bytes, param)?;
+    add_total(total_bytes, bytes.len(), max_total_bytes)?;
     Ok(DecodedVideoInput {
         filename: String::new(),
         media_type: media_type.to_owned(),
@@ -220,6 +272,27 @@ async fn decode_https_url(
     param: &str,
     source: &str,
     max_bytes: usize,
+    total_bytes: &mut usize,
+) -> Result<DecodedVideoInput, ImageGatewayError> {
+    let decoded = fetch_https_input(
+        param,
+        source,
+        max_bytes,
+        max_bytes,
+        &["image/png", "image/jpeg", "image/webp"],
+        total_bytes,
+    )
+    .await?;
+    validate_signature(&decoded.media_type, &decoded.bytes, param)?;
+    Ok(decoded)
+}
+
+async fn fetch_https_input(
+    param: &str,
+    source: &str,
+    max_bytes: usize,
+    max_total_bytes: usize,
+    media_types: &[&str],
     total_bytes: &mut usize,
 ) -> Result<DecodedVideoInput, ImageGatewayError> {
     let url = validate_public_https_url(param, source).await?;
@@ -260,17 +333,14 @@ async fn decode_https_url(
         .and_then(|value| value.split(';').next())
         .unwrap_or("")
         .to_owned();
-    if !matches!(
-        content_type.as_str(),
-        "image/png" | "image/jpeg" | "image/webp"
-    ) {
+    if !media_types.contains(&content_type.as_str()) {
         return Err(invalid_image(
             param,
             "video input URL has unsupported media type",
         ));
     }
     if response.content_length().is_some_and(|length| {
-        length > max_bytes as u64 || length > max_bytes.saturating_sub(*total_bytes) as u64
+        length > max_bytes as u64 || length > max_total_bytes.saturating_sub(*total_bytes) as u64
     }) {
         return Err(ImageGatewayError::payload_too_large(
             "video input payload is too large",
@@ -284,7 +354,7 @@ async fn decode_https_url(
             || total_bytes
                 .saturating_add(bytes.len())
                 .saturating_add(chunk.len())
-                > max_bytes
+                > max_total_bytes
         {
             return Err(ImageGatewayError::payload_too_large(
                 "video input payload is too large",
@@ -292,8 +362,7 @@ async fn decode_https_url(
         }
         bytes.extend_from_slice(&chunk);
     }
-    add_total(total_bytes, bytes.len(), max_bytes)?;
-    validate_signature(&content_type, &bytes, param)?;
+    add_total(total_bytes, bytes.len(), max_total_bytes)?;
     Ok(DecodedVideoInput {
         filename: String::new(),
         media_type: content_type,

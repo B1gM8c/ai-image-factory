@@ -855,7 +855,7 @@ fn validate_private_directory_path(
     Ok(())
 }
 
-fn validate_bound_root(
+pub(super) fn validate_bound_root(
     path: &Path,
     directory: &OwnedFd,
     error: RemoteSubmitJournalError,

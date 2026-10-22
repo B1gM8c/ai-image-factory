@@ -285,14 +285,28 @@ const ADAPTER_MODELS: &[AdapterModel] = &[
         "image",
         &["images.generations"],
     ),
-    catalog_only_model(
+    adapter_model(
+        DREAMINA_PROVIDER_ID,
+        "image_upscale",
+        "即梦图片超清",
+        "image",
+        &["images.generations"],
+    ),
+    adapter_model(
+        DREAMINA_PROVIDER_ID,
+        "multiframe2video",
+        "即梦多帧视频",
+        "video",
+        &["videos.generations"],
+    ),
+    adapter_model(
         DREAMINA_PROVIDER_ID,
         "seedance1.0fast",
         "Seedance 1.0 Fast",
         "video",
         &["videos.generations"],
     ),
-    catalog_only_model(
+    adapter_model(
         DREAMINA_PROVIDER_ID,
         "seedance1.5pro",
         "Seedance 1.5 Pro",
@@ -1183,11 +1197,15 @@ fn dreamina_discovery_models(
 ) -> Result<Vec<DiscoveredModel>, DiscoveryFailure> {
     let mut commands_by_model = BTreeMap::<(&str, String), Vec<&str>>::new();
     for (command, media_kind, output) in help {
-        // These workflows have fixed, unpublished model IDs. They are not model aliases.
-        if matches!(command, "image_upscale" | "multiframe2video") {
-            continue;
-        }
-        let versions = parse_model_versions(&output);
+        // The stable Factory identity names the fixed workflow, not a vendor model_version.
+        let versions = if matches!(command, "image_upscale" | "multiframe2video") {
+            if output.trim().is_empty() {
+                return Err(DiscoveryFailure("dreamina_models_unavailable"));
+            }
+            vec![command.to_owned()]
+        } else {
+            parse_model_versions(&output)
+        };
         if versions.is_empty() {
             return Err(DiscoveryFailure("dreamina_models_unavailable"));
         }
@@ -1200,11 +1218,15 @@ fn dreamina_discovery_models(
     }
     Ok(commands_by_model
         .into_iter()
-        .map(|((media_kind, model_id), commands)| DiscoveredModel {
-            model_id,
-            media_kind,
-            source_kind: "cli_help",
-            metadata: json!({"commands": commands}),
+        .map(|((media_kind, model_id), commands)| {
+            let fixed = matches!(model_id.as_str(), "image_upscale" | "multiframe2video");
+            DiscoveredModel {
+                model_id,
+                media_kind,
+                source_kind: "cli_help",
+                metadata: if fixed { json!({"commands": commands, "fixed_workflow": true, "model_version_configurable": false}) }
+                    else { json!({"commands": commands}) },
+            }
         })
         .collect())
 }
@@ -1572,23 +1594,25 @@ mod tests {
             .map(|(&(command, media_kind), output)| (command, media_kind, output.to_owned()))
             .collect();
         let models = dreamina_discovery_models(help).expect("all declared model lists parse");
-        assert_eq!(models.len(), 17);
+        assert_eq!(models.len(), 19);
         assert_eq!(
             models
                 .iter()
                 .filter(|model| model.media_kind == "image")
                 .count(),
-            9
+            10
         );
         assert_eq!(
             models
                 .iter()
                 .filter(|model| model.media_kind == "video")
                 .count(),
-            8
+            9
         );
         for model in &models {
             let expected_commands = match model.model_id.as_str() {
+                "image_upscale" => vec!["image_upscale"],
+                "multiframe2video" => vec!["multiframe2video"],
                 "3.0" | "3.1" => vec!["text2image"],
                 "seedance1.0fast" => vec!["image2video"],
                 "seedance1.5pro" => vec!["image2video", "frames2video"],
@@ -1625,11 +1649,11 @@ mod tests {
     }
 
     #[test]
-    fn dreamina_legacy_video_models_remain_catalog_only() {
+    fn dreamina_reference_models_support_execution_without_enabling_disabled_rows() {
         for model_id in ["seedance1.0fast", "seedance1.5pro"] {
             let model = find_adapter_model(DREAMINA_PROVIDER_ID, model_id, "video")
                 .expect("legacy model appears in the catalog");
-            assert!(!model.execution_verified);
+            assert!(model.execution_verified);
             let view = model_view(ProviderModelRow {
                 provider_id: DREAMINA_PROVIDER_ID.to_owned(),
                 model_id: model_id.to_owned(),
@@ -1647,6 +1671,29 @@ mod tests {
             });
             assert_eq!(view.availability, "not_supported");
         }
+    }
+
+    #[test]
+    fn dreamina_fixed_workflows_have_distinct_factory_ids_and_readiness() {
+        let upscale = find_adapter_model(DREAMINA_PROVIDER_ID, "image_upscale", "image").unwrap();
+        assert!(upscale.execution_verified);
+        assert_eq!(
+            super::execution_model_id(DREAMINA_PROVIDER_ID, "image_upscale", "image"),
+            "dreamina-image-image_upscale"
+        );
+        let multiframe =
+            find_adapter_model(DREAMINA_PROVIDER_ID, "multiframe2video", "video").unwrap();
+        assert!(multiframe.execution_verified);
+        assert_eq!(
+            super::execution_model_id(DREAMINA_PROVIDER_ID, "multiframe2video", "video"),
+            "multiframe2video"
+        );
+        let discovered =
+            dreamina_discovery_models(vec![("image_upscale", "image", "fixed model".into())])
+                .unwrap();
+        assert_eq!(discovered[0].model_id, "image_upscale");
+        assert_eq!(discovered[0].metadata["fixed_workflow"], true);
+        assert_eq!(discovered[0].metadata["model_version_configurable"], false);
     }
 
     #[test]

@@ -522,7 +522,7 @@ pub(super) fn video_response(status: VideoResultStatus) -> XaiVideoResponse {
         }
         VideoResultStatus::Succeeded {
             model,
-            duration,
+            duration_ms,
             artifact_id,
         } => XaiVideoResponse {
             factory_diagnostics: None,
@@ -532,7 +532,7 @@ pub(super) fn video_response(status: VideoResultStatus) -> XaiVideoResponse {
             progress: Some(100),
             usage: None,
             video: Some(XaiGeneratedVideo {
-                duration,
+                duration: super::dreamina::duration_seconds(duration_ms),
                 respect_moderation: true,
                 file_output: None,
                 storage_error: None,
@@ -829,7 +829,7 @@ mod tests {
         let artifact_id = Uuid::new_v4();
         let response = video_response(VideoResultStatus::Succeeded {
             model: "grok-imagine-video-1.5-preview".to_owned(),
-            duration: 6,
+            duration_ms: 6000,
             artifact_id,
         });
         assert_eq!(response.status, "done");
@@ -850,7 +850,7 @@ mod tests {
     fn uncertain_internal_state_remains_pending_at_the_xai_boundary() {
         let response = video_response(VideoResultStatus::Uncertain {
             model: "grok-imagine-video-1.5-preview".to_owned(),
-            duration: 6,
+            duration_ms: 6000,
         });
         assert_eq!(response.status, "pending");
         assert!(response.error.is_none());
@@ -868,7 +868,7 @@ mod tests {
     fn ordinary_pending_has_no_factory_diagnostics() {
         let response = video_response(VideoResultStatus::Pending {
             model: "grok-imagine-video-1.5-preview".to_owned(),
-            duration: 6,
+            duration_ms: 6000,
             stage: crate::settlement::VideoPendingStage::Processing,
         });
         let value = serde_json::to_value(response).unwrap();
@@ -881,7 +881,7 @@ mod tests {
     fn failed_status_omits_model_like_the_official_contract() {
         let response = video_response(VideoResultStatus::Failed {
             model: "grok-imagine-video-1.5-preview".to_owned(),
-            duration: 6,
+            duration_ms: 6000,
             error_code: Some("grok_cli_failed".to_owned()),
         });
         assert_eq!(response.status, "failed");

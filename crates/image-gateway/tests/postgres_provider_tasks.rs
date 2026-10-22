@@ -186,6 +186,8 @@ macro_rules! attach_request {
 #[cfg(unix)]
 #[path = "postgres_provider_tasks/gated_submit.rs"]
 mod gated_submit;
+#[path = "postgres_provider_tasks/remote_inputs.rs"]
+mod remote_inputs;
 
 #[tokio::test]
 async fn active_runtime_profile_freezes_scope_and_capacity() -> TestResult {

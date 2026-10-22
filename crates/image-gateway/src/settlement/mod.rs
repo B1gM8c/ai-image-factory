@@ -117,22 +117,22 @@ pub enum GenerationResultLookup {
 pub enum VideoResultStatus {
     Pending {
         model: String,
-        duration: u8,
+        duration_ms: u32,
         stage: VideoPendingStage,
     },
     Succeeded {
         model: String,
-        duration: u8,
+        duration_ms: u32,
         artifact_id: uuid::Uuid,
     },
     Failed {
         model: String,
-        duration: u8,
+        duration_ms: u32,
         error_code: Option<String>,
     },
     Uncertain {
         model: String,
-        duration: u8,
+        duration_ms: u32,
     },
 }
 

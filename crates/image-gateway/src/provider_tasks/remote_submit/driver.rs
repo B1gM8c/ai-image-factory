@@ -15,6 +15,9 @@ use image_provider_sdk::{
 use tokio::sync::{Mutex, oneshot};
 use uuid::Uuid;
 
+use super::inputs::{GatedCliInputFile, input_failure, stage_inputs};
+use crate::{executor::ExecutorInputObject, input_blobs::InputBlobStore};
+
 use super::process::{
     GatedCliBinding, GatedCliCommand, GatedCliObservation, GatedCliProcessError,
     GatedCliProcessOutcome, GatedCliProcessTerminal, GatedCliReady, GatedCliSubmission,
@@ -33,6 +36,19 @@ pub trait GatedCliSubmitCodec: Send + Sync + 'static {
     type Payload: CanonicalCommandPayload + Send + Sync + 'static;
 
     fn provider_id(&self) -> &'static str;
+
+    /// Match each frozen job input to its canonical command descriptor, in manifest order.
+    /// Returned filenames and measurements are verified before the submit gate is prepared.
+    fn input_files(
+        &self,
+        _command: &image_provider_sdk::SingleOutputCommand<Self::Payload>,
+        inputs: &[ExecutorInputObject],
+    ) -> Result<Vec<GatedCliInputFile>, ProviderFailure> {
+        if !inputs.is_empty() {
+            return Err(input_failure("provider_submit_input_manifest_invalid"));
+        }
+        Ok(Vec::new())
+    }
 
     fn command(
         &self,
@@ -56,6 +72,7 @@ pub struct GatedCliSubmitDriver<C> {
     runner_sha256: [u8; 32],
     runner_start: Mutex<()>,
     workspace: Arc<RecoverableAttemptWorkspace>,
+    input_blobs: Option<Arc<dyn InputBlobStore>>,
 }
 
 pub struct GatedCliPreparedSubmission {
@@ -92,7 +109,13 @@ where
             runner_sha256,
             runner_start: Mutex::new(()),
             workspace: Arc::new(workspace),
+            input_blobs: None,
         })
+    }
+
+    pub fn with_input_blobs(mut self, store: Arc<dyn InputBlobStore>) -> Self {
+        self.input_blobs = Some(store);
+        self
     }
 
     async fn prepare_process(
@@ -109,6 +132,30 @@ where
         .await
         .map_err(|_| local_process_failure("provider_submit_workspace_worker_stopped"))?
         .map_err(map_workspace_runtime_error)?;
+        let inputs = match self.codec.input_files(call.command(), call.inputs()) {
+            Ok(inputs) => inputs,
+            Err(failure) => {
+                self.cleanup_workspace(&process).await;
+                return Err(if failure.effect() == EffectCertainty::NoRemoteEffect {
+                    failure
+                } else {
+                    local_process_failure("provider_submit_codec_effect_invalid")
+                });
+            }
+        };
+        if let Err(failure) = stage_inputs(
+            self.input_blobs.as_ref(),
+            call.inputs(),
+            inputs,
+            &working_directory,
+            prepare_started,
+            Duration::from_millis(call.remaining_budget_ms()),
+        )
+        .await
+        {
+            self.cleanup_workspace(&process).await;
+            return Err(failure);
+        }
         let codec = Arc::clone(&self.codec);
         let owned_call = call.clone();
         let projected_workspace = working_directory.clone();
