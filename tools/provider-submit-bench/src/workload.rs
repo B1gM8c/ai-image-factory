@@ -173,6 +173,7 @@ async fn run_claimant(
     let provider_scope = ProviderTaskClaimScope {
         provider_id: PROVIDER_ID.to_string(),
         provider_account_id: ACCOUNT_ID,
+        execution_profile_id: executor_scope().execution_profile_id,
     };
     let mut report = WorkerReport::default();
     while acquired.load(Ordering::Acquire) < config.queue_rows {
