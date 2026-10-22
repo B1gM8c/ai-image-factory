@@ -17,7 +17,19 @@ use uuid::Uuid;
 
 type TestResult<T = ()> = Result<T, String>;
 
-const REQUIRED_COLUMNS: [(&str, &str); 984] = [
+const REQUIRED_COLUMNS: [(&str, &str); 996] = [
+    ("provider_remote_video_results", "remote_result_id"),
+    ("provider_remote_video_results", "executor_execution_id"),
+    ("provider_remote_video_results", "submission_id"),
+    ("provider_remote_video_results", "video_url"),
+    ("provider_remote_video_results", "expires_at_ms"),
+    ("provider_remote_video_results", "evidence_sha256_hex"),
+    ("provider_remote_video_results", "observed_at_ms"),
+    ("provider_task_observations", "remote_result_id"),
+    ("executor_resolution_decisions", "remote_result_id"),
+    ("provider_submissions", "remote_result_id"),
+    ("executor_terminal_reductions", "remote_result_id"),
+    ("job_response_projections", "remote_result_count"),
     ("executor_local_cleanup", "executor_execution_id"),
     ("executor_local_cleanup", "submission_id"),
     ("executor_local_cleanup", "execution_profile_id"),

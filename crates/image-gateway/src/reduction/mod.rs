@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use image_provider_sdk::RemoteVideoResult;
 use uuid::Uuid;
 
 use crate::artifacts::ArtifactMetadata;
@@ -23,11 +24,28 @@ pub struct ExecutorTerminalArtifact {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExecutorTerminalRemoteVideo {
+    pub remote_result_id: Uuid,
+    pub result: RemoteVideoResult,
+    pub evidence_sha256_hex: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CanonicalExecutorOutcome {
+    SucceededRemoteVideo(ExecutorTerminalRemoteVideo),
     Succeeded(ExecutorTerminalArtifact),
     Failed { error_code: String },
     Uncertain { error_code: String },
     Canceled { error_code: String },
+}
+
+impl CanonicalExecutorOutcome {
+    pub fn remote_result_id(&self) -> Option<Uuid> {
+        match self {
+            Self::SucceededRemoteVideo(result) => Some(result.remote_result_id),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

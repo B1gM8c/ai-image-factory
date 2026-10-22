@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use image_provider_sdk::RemoteVideoResult;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Postgres, Transaction};
@@ -215,6 +216,7 @@ struct ExistingObservation {
     observed_state: String,
     artifact_ref: Option<String>,
     result_manifest_id: Option<Uuid>,
+    remote_result_id: Option<Uuid>,
     artifact_sha256_hex: Option<String>,
     artifact_byte_size: Option<i64>,
     artifact_media_type: Option<String>,
@@ -231,6 +233,7 @@ struct ExistingObservation {
 struct ResolutionDecisionRow {
     resolved_state: String,
     result_manifest_id: Option<Uuid>,
+    remote_result_id: Option<Uuid>,
     error_code: Option<String>,
     provider_task_observation_id: Option<Uuid>,
     provider_submit_intent_id: Option<Uuid>,
@@ -2077,7 +2080,7 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
             ProviderTaskObservationOutcome::Waiting { poll_after_ms } => Some(*poll_after_ms),
             _ => None,
         };
-        let payload_hash = observation_hash(
+        let mut payload_hash = observation_hash(
             values.source,
             values.state,
             values.artifact_ref,
@@ -2091,6 +2094,12 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
             Some(&lease.poll_owner),
             Some(lease.poll_lease_epoch),
         );
+        if let Some(result) = values.remote_result {
+            payload_hash = hex::encode(Sha256::digest(format!(
+                "{payload_hash}:{}",
+                remote_result_hash(result)
+            )));
+        }
         let new_observation = NewObservation {
             submission_id: lease.task.submission_id,
             executor_execution_id: lease.task.executor_execution_id,
@@ -2099,6 +2108,9 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
             state: values.state,
             artifact_ref: values.artifact_ref,
             result_manifest_id: publication.map(|value| value.manifest.manifest_id()),
+            remote_result_id: values
+                .remote_result
+                .map(|_| lease.task.executor_execution_id),
             artifact_sha256_hex: publication.map(|value| value.sha256_hex.as_str()),
             artifact_byte_size: publication
                 .map(|value| i64::try_from(value.byte_size))
@@ -2137,6 +2149,9 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
             || task.provider_deadline_at_ms <= now
         {
             return Err(ProviderTaskStoreError::StaleLease);
+        }
+        if let Some(result) = values.remote_result {
+            persist_remote_video_result(&mut tx, lease, result, now).await?;
         }
         let persisted = insert_or_load_observation(&mut tx, &new_observation).await?;
         values.next_poll_at_ms = persisted.next_poll_at_ms;
@@ -2425,6 +2440,7 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
                 state: "provider_waiting",
                 artifact_ref: None,
                 result_manifest_id: None,
+                remote_result_id: None,
                 artifact_sha256_hex: None,
                 artifact_byte_size: None,
                 artifact_media_type: None,
@@ -2552,6 +2568,7 @@ struct ObservationValues<'a> {
     state: &'static str,
     artifact_ref: Option<&'a str>,
     publication: Option<&'a ProviderArtifactPublication>,
+    remote_result: Option<&'a RemoteVideoResult>,
     error_code: Option<&'a str>,
     effect_certainty: &'static str,
     next_poll_at_ms: Option<i64>,
@@ -2751,6 +2768,7 @@ async fn recover_published_artifact_in(
             state: "artifact_ready",
             artifact_ref: Some(&artifact_ref),
             result_manifest_id: Some(publication.manifest.manifest_id()),
+            remote_result_id: None,
             artifact_sha256_hex: Some(&publication.sha256_hex),
             artifact_byte_size: Some(
                 i64::try_from(publication.byte_size)
@@ -2951,6 +2969,44 @@ async fn resolve_submit_terminal(
     .map_err(map_executor_error)
 }
 
+fn remote_result_hash(result: &RemoteVideoResult) -> String {
+    let mut hash = Sha256::new();
+    hash.update(b"dreamina-remote-video-result-v1");
+    hash.update((result.video_url().len() as u64).to_be_bytes());
+    hash.update(result.video_url().as_bytes());
+    hash.update(result.expires_at_ms().unwrap_or(-1).to_be_bytes());
+    hex::encode(hash.finalize())
+}
+
+async fn persist_remote_video_result(
+    tx: &mut Transaction<'_, Postgres>,
+    lease: &ProviderTaskLease,
+    result: &RemoteVideoResult,
+    now: i64,
+) -> Result<(), ProviderTaskStoreError> {
+    if lease.task.provider_id != "dreamina-cli"
+        || result.expires_at_ms().is_some_and(|expiry| expiry <= now)
+    {
+        return Err(ProviderTaskStoreError::InvalidInput);
+    }
+    sqlx::query(
+        r#"INSERT INTO provider_remote_video_results
+          (remote_result_id, executor_execution_id, submission_id, video_url,
+           expires_at_ms, evidence_sha256_hex, observed_at_ms)
+        VALUES ($1, $1, $2, $3, $4, $5, $6)"#,
+    )
+    .bind(lease.task.executor_execution_id)
+    .bind(lease.task.submission_id)
+    .bind(result.video_url())
+    .bind(result.expires_at_ms())
+    .bind(remote_result_hash(result))
+    .bind(now)
+    .execute(&mut **tx)
+    .await
+    .map_err(storage_conflict)?;
+    Ok(())
+}
+
 async fn resolve_remote_terminal(
     tx: &mut Transaction<'_, Postgres>,
     task: &TaskRow,
@@ -2982,6 +3038,7 @@ async fn resolve_remote_terminal(
             }
             ("succeeded", Some(manifest.manifest_id()), None)
         }
+        "remote_ready" => ("succeeded", None, None),
         "failed" => (
             "failed",
             None,
@@ -3012,9 +3069,10 @@ async fn resolve_remote_terminal(
         _ => return Err(ProviderTaskStoreError::Conflict),
     };
 
+    let remote_result_id = (task.state == "remote_ready").then_some(task.executor_execution_id);
     let existing: Option<ResolutionDecisionRow> = sqlx::query_as(
         r#"
-            SELECT resolved_state, result_manifest_id, error_code,
+            SELECT resolved_state, result_manifest_id, remote_result_id, error_code,
                    provider_task_observation_id, provider_submit_intent_id
             FROM executor_resolution_decisions
             WHERE decision_id = $1
@@ -3027,6 +3085,7 @@ async fn resolve_remote_terminal(
     if let Some(existing) = existing {
         return if existing.resolved_state == resolved_state
             && existing.result_manifest_id == result_manifest_id
+            && existing.remote_result_id == remote_result_id
             && existing.error_code.as_deref() == error_code
             && existing.provider_task_observation_id == Some(task.state_observation_id)
             && existing.provider_submit_intent_id.is_none()
@@ -3042,9 +3101,9 @@ async fn resolve_remote_terminal(
         INSERT INTO executor_resolution_decisions
           (decision_id, executor_execution_id, submission_id, source,
            observation_id, provider_task_observation_id, resolved_state,
-           result_manifest_id, error_code, decided_at_ms)
+           result_manifest_id, error_code, decided_at_ms, remote_result_id)
         VALUES ($1, $1, $2, 'remote_provider_observation',
-                NULL, $3, $4, $5, $6, $7)
+                NULL, $3, $4, $5, $6, $7, $8)
         "#,
     )
     .bind(task.executor_execution_id)
@@ -3054,6 +3113,7 @@ async fn resolve_remote_terminal(
     .bind(result_manifest_id)
     .bind(error_code)
     .bind(now)
+    .bind(remote_result_id)
     .execute(&mut **tx)
     .await
     .map_err(storage_conflict)?;
@@ -3085,7 +3145,7 @@ async fn resolve_remote_terminal(
             UPDATE provider_submissions
             SET state = $3, result_manifest_id = $4,
                 resolution_decision_id = $1, finished_at_ms = $5,
-                updated_at_ms = $5, error_code = $6
+                updated_at_ms = $5, error_code = $6, remote_result_id = $7
             WHERE executor_execution_id = $1 AND submission_id = $2
               AND state = 'provider_waiting'
             "#,
@@ -3096,6 +3156,7 @@ async fn resolve_remote_terminal(
         .bind(result_manifest_id)
         .bind(now)
         .bind(error_code)
+        .bind(remote_result_id)
         .execute(&mut **tx)
         .await
         .map_err(storage_conflict)?,
@@ -3139,11 +3200,22 @@ fn observation_values<'a>(
         ProviderTaskObservationSource::Cancel => "cancel",
     };
     match &observation.outcome {
+        ProviderTaskObservationOutcome::RemoteReady { result } => ObservationValues {
+            source,
+            state: "remote_ready",
+            artifact_ref: None,
+            publication: None,
+            remote_result: Some(result),
+            error_code: None,
+            effect_certainty: "not_applicable",
+            next_poll_at_ms: None,
+        },
         ProviderTaskObservationOutcome::Waiting { poll_after_ms } => ObservationValues {
             source,
             state: "provider_waiting",
             artifact_ref: None,
             publication: None,
+            remote_result: None,
             error_code: None,
             effect_certainty: "not_applicable",
             next_poll_at_ms: Some(now + poll_after_ms),
@@ -3156,6 +3228,7 @@ fn observation_values<'a>(
             state: "artifact_ready",
             artifact_ref: Some(artifact_ref),
             publication: Some(publication),
+            remote_result: None,
             error_code: None,
             effect_certainty: "not_applicable",
             next_poll_at_ms: None,
@@ -3165,6 +3238,7 @@ fn observation_values<'a>(
             state: "failed",
             artifact_ref: None,
             publication: None,
+            remote_result: None,
             error_code: Some(error_code),
             effect_certainty: "not_applicable",
             next_poll_at_ms: None,
@@ -3174,6 +3248,7 @@ fn observation_values<'a>(
             state: "canceled",
             artifact_ref: None,
             publication: None,
+            remote_result: None,
             error_code: Some(error_code),
             effect_certainty: "confirmed_no_effect",
             next_poll_at_ms: None,
@@ -3183,6 +3258,7 @@ fn observation_values<'a>(
             state: "uncertain",
             artifact_ref: None,
             publication: None,
+            remote_result: None,
             error_code: Some(error_code),
             effect_certainty: "unknown_remote_effect",
             next_poll_at_ms: None,
@@ -3203,6 +3279,7 @@ struct NewObservation<'a> {
     state: &'a str,
     artifact_ref: Option<&'a str>,
     result_manifest_id: Option<Uuid>,
+    remote_result_id: Option<Uuid>,
     artifact_sha256_hex: Option<&'a str>,
     artifact_byte_size: Option<i64>,
     artifact_media_type: Option<&'a str>,
@@ -3228,9 +3305,9 @@ async fn insert_or_load_observation(
            source, observed_state, artifact_ref, result_manifest_id,
            artifact_sha256_hex, artifact_byte_size, artifact_media_type,
            error_code, effect_certainty, next_poll_at_ms, poll_owner,
-           poll_lease_epoch, payload_hash, observed_at_ms)
+           poll_lease_epoch, payload_hash, observed_at_ms, remote_result_id)
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
-                $13, $14, $15, $16, $17, $18)
+                $13, $14, $15, $16, $17, $18, $19)
         ON CONFLICT (submission_id, event_identity) DO NOTHING
         "#,
     )
@@ -3252,6 +3329,7 @@ async fn insert_or_load_observation(
     .bind(observation.poll_lease_epoch)
     .bind(observation.payload_hash)
     .bind(observation.now)
+    .bind(observation.remote_result_id)
     .execute(&mut **tx)
     .await
     .map_err(storage_conflict)?
@@ -3274,7 +3352,7 @@ async fn load_matching_observation(
     let existing: Option<ExistingObservation> = sqlx::query_as(
         r#"
         SELECT observation_id, source, observed_state, artifact_ref,
-               result_manifest_id, artifact_sha256_hex, artifact_byte_size,
+               result_manifest_id, remote_result_id, artifact_sha256_hex, artifact_byte_size,
                artifact_media_type, error_code, effect_certainty, next_poll_at_ms,
                poll_owner, poll_lease_epoch, payload_hash, observed_at_ms
         FROM provider_task_observations
@@ -3293,6 +3371,7 @@ async fn load_matching_observation(
         && existing.observed_state == observation.state
         && existing.artifact_ref.as_deref() == observation.artifact_ref
         && existing.result_manifest_id == observation.result_manifest_id
+        && existing.remote_result_id == observation.remote_result_id
         && existing.artifact_sha256_hex.as_deref() == observation.artifact_sha256_hex
         && existing.artifact_byte_size == observation.artifact_byte_size
         && existing.artifact_media_type.as_deref() == observation.artifact_media_type
@@ -4576,6 +4655,7 @@ fn parse_state(value: &str) -> Result<ProviderTaskState, ProviderTaskStoreError>
     match value {
         "provider_waiting" => Ok(ProviderTaskState::ProviderWaiting),
         "artifact_ready" => Ok(ProviderTaskState::ArtifactReady),
+        "remote_ready" => Ok(ProviderTaskState::RemoteReady),
         "failed" => Ok(ProviderTaskState::Failed),
         "canceled" => Ok(ProviderTaskState::Canceled),
         "uncertain" => Ok(ProviderTaskState::Uncertain),
@@ -4794,6 +4874,7 @@ fn provider_task_lease_authority_seal(
     let state = match task.state {
         ProviderTaskState::ProviderWaiting => b"provider_waiting".as_slice(),
         ProviderTaskState::ArtifactReady => b"artifact_ready".as_slice(),
+        ProviderTaskState::RemoteReady => b"remote_ready".as_slice(),
         ProviderTaskState::Failed => b"failed".as_slice(),
         ProviderTaskState::Canceled => b"canceled".as_slice(),
         ProviderTaskState::Uncertain => b"uncertain".as_slice(),
@@ -4856,6 +4937,9 @@ fn validate_observation(value: &ProviderTaskObservation) -> Result<(), ProviderT
         return Err(ProviderTaskStoreError::InvalidInput);
     }
     let valid = match &value.outcome {
+        ProviderTaskObservationOutcome::RemoteReady { .. } => {
+            value.source == ProviderTaskObservationSource::Poll
+        }
         ProviderTaskObservationOutcome::Waiting { poll_after_ms } => {
             (0..=MAX_POLL_AFTER_MS).contains(poll_after_ms)
         }
@@ -5221,6 +5305,7 @@ mod tests {
             observed_state: "provider_waiting".to_string(),
             artifact_ref: None,
             result_manifest_id: None,
+            remote_result_id: None,
             artifact_sha256_hex: None,
             artifact_byte_size: None,
             artifact_media_type: None,
@@ -5254,6 +5339,7 @@ mod tests {
             state: "provider_waiting",
             artifact_ref: None,
             result_manifest_id: None,
+            remote_result_id: None,
             artifact_sha256_hex: None,
             artifact_byte_size: None,
             artifact_media_type: None,

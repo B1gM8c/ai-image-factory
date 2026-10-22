@@ -1233,7 +1233,12 @@ mod tests {
             ),
         ] {
             let request = serde_json::from_str(json).unwrap();
-            let (plan, _) = stage_fixture(DreaminaWorkflowIntent::image(request).unwrap());
+            let (plan, ticket) = stage_fixture(DreaminaWorkflowIntent::image(request).unwrap());
+            assert_eq!(
+                super::super::attach_operation(&plan.attach(ticket, Uuid::new_v4(), "test"))
+                    .unwrap(),
+                GENERATION_OPERATION
+            );
             assert_eq!(plan.workflow(), workflow);
             assert_eq!(
                 parse_submit_command(&serde_json::to_vec(plan.provider_command()).unwrap())
@@ -1269,7 +1274,12 @@ mod tests {
             ),
         ] {
             let request = serde_json::from_str(json).unwrap();
-            let (plan, _) = stage_fixture(DreaminaWorkflowIntent::video(request).unwrap());
+            let (plan, ticket) = stage_fixture(DreaminaWorkflowIntent::video(request).unwrap());
+            assert_eq!(
+                super::super::attach_operation(&plan.attach(ticket, Uuid::new_v4(), "test"))
+                    .unwrap(),
+                VIDEO_GENERATION_OPERATION
+            );
             assert_eq!(plan.workflow(), workflow);
             assert_eq!(plan.duration_ms(), Some(duration_ms));
             assert_eq!(

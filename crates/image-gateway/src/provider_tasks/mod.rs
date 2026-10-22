@@ -1,7 +1,9 @@
 use std::{fmt, sync::Arc};
 
 use async_trait::async_trait;
-use image_provider_sdk::{DurableArtifactManifest, OutputSlot, ProviderCommandIdentity};
+use image_provider_sdk::{
+    DurableArtifactManifest, OutputSlot, ProviderCommandIdentity, RemoteVideoResult,
+};
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -62,6 +64,7 @@ pub use submit::{
 pub enum ProviderTaskState {
     ProviderWaiting,
     ArtifactReady,
+    RemoteReady,
     Failed,
     Canceled,
     Uncertain,
@@ -640,6 +643,9 @@ pub enum ProviderTaskObservationSource {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ProviderTaskObservationOutcome {
+    RemoteReady {
+        result: RemoteVideoResult,
+    },
     Waiting {
         poll_after_ms: i64,
     },

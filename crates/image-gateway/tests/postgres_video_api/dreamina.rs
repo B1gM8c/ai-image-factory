@@ -2,25 +2,51 @@ use super::*;
 use std::{fs, os::unix::fs::PermissionsExt, path::Path};
 
 use gpt_image_2_gateway::{
-    DreaminaCliPollDriverV1, DreaminaCliPollProcessConfig, DreaminaCliSubmitCodecV1,
-    DreaminaCliSubmitProcessConfig, DreaminaExecutionProfileProvisioning,
+    CanonicalExecutorOutcome, DreaminaCliPollDriverV1, DreaminaCliPollProcessConfig,
+    DreaminaCliSubmitCodecV1, DreaminaCliSubmitProcessConfig, DreaminaExecutionProfileProvisioning,
     FilesystemProviderArtifactStagerFactory, GatedCliSubmitDriver, ProviderAccountHomeCapability,
-    ProviderPollOrchestrator, ProviderPollOrchestratorConfig, ProviderPollRun,
-    ProviderRuntimeProfileStore, ProviderRuntimeReadinessStore, ProviderRuntimeRegistration,
-    ProviderRuntimeRole, ProviderSubmitIterationCommand, ProviderSubmitRun, ProviderSubmitService,
+    ProviderArtifactStageContext, ProviderArtifactStagerFactory, ProviderPollOrchestrator,
+    ProviderPollOrchestratorConfig, ProviderPollRun, ProviderRuntimeProfileStore,
+    ProviderRuntimeReadinessStore, ProviderRuntimeRegistration, ProviderRuntimeRole,
+    ProviderSubmitIterationCommand, ProviderSubmitRun, ProviderSubmitService,
     ProviderSubmitServiceConfig, ProviderTaskState, provision_dreamina_video_execution_profile,
 };
 use image_cli_runtime::WorkingDirectory;
 use image_provider_dreamina_cli::DREAMINA_SUBMIT_COMMAND_SCHEMA;
+use image_provider_sdk::ArtifactSinkError;
 use sha2::{Digest, Sha256};
+
+#[path = "dreamina_workflows.rs"]
+mod workflows;
 
 const MODEL: &str = "doubao-seedance-2-5-260628";
 const TASKS: &str = "/api/v3/contents/generations/tasks";
+// Deliberately nonresolving: this fixture must never fetch the video. Preserve
+// percent-escape case, query order and the signed URL bytes through every layer.
+const VIDEO_URL: &str = "https://video.example.invalid/clip%2fpart.mp4?sign=A%2Bb%2fC%3D&x=2&x=1";
+
+struct NoVideoStaging;
+
+impl ProviderArtifactStagerFactory for NoVideoStaging {
+    type Stager =
+        <FilesystemProviderArtifactStagerFactory as ProviderArtifactStagerFactory>::Stager;
+
+    async fn begin(
+        &self,
+        _: &ProviderArtifactStageContext,
+    ) -> Result<Self::Stager, ArtifactSinkError> {
+        panic!("Remote video polling must not write to the artifact sink")
+    }
+}
 
 // Runs the actual adapter, journalled CLI runner and poll driver against a local
 // executable fixture. No official CLI, credentials or upstream generation is used.
 #[tokio::test]
 async fn ark_seedance25_api_runs_one_cli_submission_and_settlement() -> TestResult {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::ERROR)
+        .with_test_writer()
+        .try_init();
     let _guard = postgres_video_test_lock().lock().await;
     let Some(database) = TestDatabase::new().await? else {
         return Ok(());
@@ -46,10 +72,16 @@ async fn run_seedance25(pool: &PgPool) -> TestResult {
         fs::create_dir(path).map_err(debug_error)?;
         fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(debug_error)?;
     }
-    // This is a structural transport fixture, not evidence of upstream video
-    // dimensions or duration. Ark metadata below describes the frozen request.
-    let mp4 = minimal_mp4();
-    fs::write(home.join("source.mp4"), &mp4).map_err(debug_error)?;
+    // The fixture contains only upstream metadata, never synthetic MP4 bytes.
+    fs::write(
+        home.join("query-response.json"),
+        serde_json::to_vec(&json!({
+            "submit_id": "seedance25-api-fixture", "gen_status": "success",
+            "result_json": {"videos": [{"video_url": VIDEO_URL}]}
+        }))
+        .map_err(debug_error)?,
+    )
+    .map_err(debug_error)?;
     let executable = root.path().join("dreamina-fixture");
     let script = br#"#!/bin/sh
 set -eu
@@ -62,19 +94,18 @@ case "$operation" in
     printf '{"submit_id":"seedance25-api-fixture","gen_status":"querying"}'
     ;;
   query_result)
+    printf '%s\n' "$@" > "$HOME/poll-arguments"
     submit=
-    download=
     while [ "$#" -gt 0 ]; do
       case "$1" in
         --submit_id) shift; submit=$1 ;;
-        --download_dir) shift; download=$1 ;;
+        --download_dir|--download_dir=*) exit 90 ;;
       esac
       shift
     done
     [ "$submit" = seedance25-api-fixture ]
     printf 'poll\n' >> "$HOME/poll-calls"
-    /bin/cp "$HOME/source.mp4" "$download/result.mp4"
-    printf '{"submit_id":"seedance25-api-fixture","gen_status":"success"}'
+    /bin/cat "$HOME/query-response.json"
     ;;
   *) exit 2 ;;
 esac
@@ -165,8 +196,7 @@ esac
             ),
         )
         .map_err(debug_error)?,
-        FilesystemProviderArtifactStagerFactory::new(blobs.clone(), 1024 * 1024)
-            .map_err(debug_error)?,
+        NoVideoStaging,
         ProviderPollOrchestratorConfig {
             scope: profile.claim_scope(),
             owner: "dreamina-video-api-poll".to_owned(),
@@ -203,6 +233,16 @@ esac
         .create_project("Other tenant")
         .await
         .map_err(debug_error)?;
+    let sibling_project_id = format!("proj_{}", Uuid::new_v4().simple());
+    sqlx::query(
+        "INSERT INTO gateway_projects (id, tenant_id, name, created_at)
+        VALUES ($1, $2, 'Sibling project', 1)",
+    )
+    .bind(&sibling_project_id)
+    .bind(&project.id)
+    .execute(pool)
+    .await
+    .map_err(debug_error)?;
     let owner = keys
         .create_service_account(
             &project.id,
@@ -216,6 +256,15 @@ esac
         .create_service_account(
             &other_project.id,
             "Other",
+            ApiKeyPermissionMode::All,
+            ApiKeyPermissions::default(),
+        )
+        .await
+        .map_err(debug_error)?;
+    let sibling = keys
+        .create_service_account(
+            &sibling_project_id,
+            "Sibling project",
             ApiKeyPermissionMode::All,
             ApiKeyPermissions::default(),
         )
@@ -369,29 +418,69 @@ esac
     .map_err(debug_error)??;
     require(
         matches!(observed, ProviderPollRun::Observed(ref task)
-        if task.state == ProviderTaskState::ArtifactReady),
+        if task.state == ProviderTaskState::RemoteReady),
         format!("Dreamina CLI poll: {observed:?}"),
+    )?;
+    let poll_arguments = fs::read_to_string(home.join("poll-arguments")).map_err(debug_error)?;
+    require(
+        poll_arguments.contains("--submit_id\nseedance25-api-fixture\n")
+            && !poll_arguments.contains("download"),
+        "Dreamina query must identify the task without requesting a download",
+    )?;
+    let (status, unreduced) = json_request(
+        app.clone(),
+        Method::GET,
+        &task_path,
+        &owner.api_key.value,
+        None,
+        None,
+    )
+    .await?;
+    require(
+        status == StatusCode::OK
+            && unreduced["status"] == "running"
+            && unreduced["content"].is_null(),
+        format!("Remote video escaped before terminal settlement: {status} {unreduced}"),
+    )?;
+    let before: (i64, i64) = sqlx::query_as(
+        "SELECT (SELECT COUNT(*) FROM ledger_transactions WHERE source_job_id = $1
+                 AND transaction_type = 'customer_job_charge'),
+                (SELECT COUNT(*) FROM job_response_projections WHERE job_id = $1)",
+    )
+    .bind(job_id)
+    .fetch_one(pool)
+    .await
+    .map_err(debug_error)?;
+    require(
+        before == (0, 0),
+        format!("Premature terminal billing/projection: {before:?}"),
     )?;
     let reductions = PostgresExecutorTerminalStore::new(pool.clone());
     let terminal = reductions
         .claim_terminal("dreamina-api-reducer", 30_000)
         .await
-        .map_err(debug_error)?
+        .map_err(|error| format!("Dreamina claim reduction: {error:?}"))?
         .ok_or("No Dreamina terminal reduction")?;
-    let artifact = CustomerArtifactPublisher::new(blobs)
-        .publish(&terminal)
-        .await
-        .map_err(debug_error)?;
+    require(
+        matches!(&terminal.outcome, CanonicalExecutorOutcome::SucceededRemoteVideo(remote)
+            if remote.result.video_url() == VIDEO_URL && remote.result.expires_at_ms().is_none()),
+        "Reducer did not preserve the upstream URL and unknown expiration",
+    )?;
+    assert_failed_charge_rolls_back(pool, &reductions, &terminal).await?;
     let completion = reductions
-        .complete_terminal(&terminal, Some(&artifact))
+        .complete_terminal(&terminal, None)
         .await
-        .map_err(debug_error)?;
+        .map_err(|error| format!("Dreamina complete reduction: {error:?}"))?;
+    require(
+        completion.customer_artifact_id.is_none(),
+        "Remote reduction created an artifact",
+    )?;
     require(
         completion
             == reductions
-                .complete_terminal(&terminal, Some(&artifact))
+                .complete_terminal(&terminal, None)
                 .await
-                .map_err(debug_error)?,
+                .map_err(|error| format!("Dreamina replay reduction: {error:?}"))?,
         "Repeated reduction changed settlement identity",
     )?;
     let (status, done) = json_request(
@@ -412,30 +501,55 @@ esac
             && done["ratio"] == "16:9",
         format!("Ark result: {status} {done}"),
     )?;
-    let content = done["content"]["video_url"]
-        .as_str()
-        .ok_or("Ark omitted video URL")?;
-    let (status, mime, bytes) =
-        raw_request(app.clone(), Method::GET, content, &owner.api_key.value).await?;
     require(
-        status == StatusCode::OK && mime.as_deref() == Some("video/mp4") && bytes == mp4,
-        "Ark artifact did not preserve MP4 bytes",
+        done["content"]["video_url"] == VIDEO_URL && done["expires_at"].is_null(),
+        "Ark changed upstream URL bytes or invented an expiration",
     )?;
-    for path in [&task_path, content] {
-        let (status, _) = json_request(
-            app.clone(),
-            Method::GET,
-            path,
-            &other.api_key.value,
-            None,
-            None,
-        )
-        .await?;
-        require(
-            status == StatusCode::NOT_FOUND,
-            format!("Cross-tenant Ark read: {status}"),
-        )?;
+    let native_path = format!("/v1/dreamina/videos/{job_id}");
+    let (native_status, native) = json_request(
+        app.clone(),
+        Method::GET,
+        &native_path,
+        &owner.api_key.value,
+        None,
+        None,
+    )
+    .await?;
+    require(
+        native_status == StatusCode::OK && native["content"]["video_url"] == VIDEO_URL,
+        "Native Dreamina API did not return the same upstream URL",
+    )?;
+    for key in [&other.api_key.value, &sibling.api_key.value] {
+        for path in [&task_path, &native_path] {
+            let (status, response) =
+                json_request(app.clone(), Method::GET, path, key, None, None).await?;
+            let expected_status = if path == &task_path {
+                StatusCode::NOT_FOUND
+            } else {
+                // The native API's existing not-found error uses HTTP 400.
+                StatusCode::BAD_REQUEST
+            };
+            require(
+                status == expected_status
+                    && response["error"]["code"] == "not_found"
+                    && !response.to_string().contains(VIDEO_URL),
+                format!("Cross-tenant/project video read {path}: {status} {response}"),
+            )?;
+        }
     }
+    let replay = json_request(
+        app.clone(),
+        Method::POST,
+        TASKS,
+        &owner.api_key.value,
+        Some("seedance25-api-fixture"),
+        Some(&body),
+    )
+    .await?;
+    require(
+        replay.0 == StatusCode::OK && replay.1["id"] == task_id,
+        "Completed admission replay created another task",
+    )?;
     require(
         Box::pin(submit.run_once(&command))
             .await
@@ -455,8 +569,10 @@ esac
     require(
         fs::read_to_string(home.join("submit-calls")).map_err(debug_error)? == "submit\n"
             && fs::read_to_string(home.join("poll-calls")).map_err(debug_error)? == "poll\n",
-        "Expected exactly one CLI submission and one materializing query",
+        "Expected exactly one CLI submission and one metadata-only query",
     )?;
+    assert_remote_rejects_local_evidence(pool, job_id).await?;
+    assert_remote_storage(pool, job_id, &artifact_root).await?;
     let ledger: (i64, i64, i64, i64) = sqlx::query_as(
         "SELECT (SELECT COUNT(*) FROM provider_submissions WHERE job_id = $1),
                 (SELECT COUNT(*) FROM ledger_transactions WHERE source_job_id = $1
@@ -474,6 +590,159 @@ esac
     )
 }
 
+async fn assert_remote_storage(pool: &PgPool, job_id: Uuid, artifact_root: &Path) -> TestResult {
+    let stored: (i64, i64, i64, i64, i32, i32, String, Option<i64>) = sqlx::query_as(
+        "SELECT (SELECT COUNT(*) FROM artifacts WHERE job_id = $1),
+                (SELECT COUNT(*) FROM executor_result_manifests manifest
+                 JOIN provider_submissions submission USING (submission_id, executor_execution_id)
+                 WHERE submission.job_id = $1),
+                (SELECT COUNT(*) FROM executor_artifact_authorities WHERE job_id = $1),
+                (SELECT COUNT(*) FROM provider_remote_video_results remote
+                 JOIN provider_submissions submission USING (submission_id, executor_execution_id)
+                 WHERE submission.job_id = $1),
+                projection.artifact_count, projection.remote_result_count,
+                remote.video_url, remote.expires_at_ms
+         FROM job_response_projections projection
+         JOIN provider_submissions submission USING (job_id)
+         JOIN provider_remote_video_results remote
+           ON remote.remote_result_id = submission.remote_result_id
+          AND remote.submission_id = submission.submission_id
+          AND remote.executor_execution_id = submission.executor_execution_id
+         WHERE projection.job_id = $1",
+    )
+    .bind(job_id)
+    .fetch_one(pool)
+    .await
+    .map_err(debug_error)?;
+    require(
+        stored == (0, 0, 0, 1, 0, 1, VIDEO_URL.to_owned(), None),
+        format!("Remote result/artifact storage invariant failed: {stored:?}"),
+    )?;
+    let evidence: String =
+        sqlx::query_scalar("SELECT evidence::text FROM provider_receipts WHERE job_id = $1")
+            .bind(job_id)
+            .fetch_one(pool)
+            .await
+            .map_err(debug_error)?;
+    require(
+        !evidence.contains(VIDEO_URL) && !evidence.contains("sign="),
+        "Signed upstream URL leaked into receipt evidence",
+    )?;
+    for directory in ["objects", "executor-objects", "executor-staging"] {
+        require(
+            fs::read_dir(artifact_root.join(directory))
+                .map_err(debug_error)?
+                .next()
+                .is_none(),
+            format!("Remote video left files in {directory}"),
+        )?;
+    }
+    Ok(())
+}
+
+async fn assert_failed_charge_rolls_back(
+    pool: &PgPool,
+    reductions: &PostgresExecutorTerminalStore,
+    terminal: &gpt_image_2_gateway::ExecutorTerminalLease,
+) -> TestResult {
+    // A failure at customer charging must roll back earlier receipt, projection
+    // and parent completion writes, including any released SQL savepoints.
+    let prior_state: String = sqlx::query_scalar("SELECT state FROM jobs WHERE job_id = $1")
+        .bind(terminal.job_id)
+        .fetch_one(pool)
+        .await
+        .map_err(debug_error)?;
+    sqlx::raw_sql(
+        "CREATE FUNCTION reject_test_customer_charge() RETURNS TRIGGER AS $$
+        BEGIN
+            IF NEW.transaction_type = 'customer_job_charge' THEN
+                RAISE EXCEPTION 'injected customer charge failure';
+            END IF;
+            RETURN NEW;
+        END;
+        $$ LANGUAGE plpgsql;
+        CREATE TRIGGER reject_test_customer_charge BEFORE INSERT ON ledger_transactions
+        FOR EACH ROW EXECUTE FUNCTION reject_test_customer_charge();",
+    )
+    .execute(pool)
+    .await
+    .map_err(debug_error)?;
+    let failed = reductions.complete_terminal(terminal, None).await;
+    sqlx::raw_sql(
+        "DROP TRIGGER reject_test_customer_charge ON ledger_transactions;
+        DROP FUNCTION reject_test_customer_charge();",
+    )
+    .execute(pool)
+    .await
+    .map_err(debug_error)?;
+    require(
+        failed.is_err(),
+        "Injected charging failure did not reject completion",
+    )?;
+    let rolled_back: (String, String, i64, i64, i64, i64, i64, String, i32, i32) = sqlx::query_as(
+        "SELECT job.state, reduction.state,
+                (SELECT COUNT(*) FROM provider_receipts WHERE job_id = $1),
+                (SELECT COUNT(*) FROM job_response_projections WHERE job_id = $1),
+                (SELECT COUNT(*) FROM ledger_transactions WHERE source_job_id = $1
+                    AND transaction_type = 'customer_job_charge'),
+                account.captured_micros, account.held_micros,
+                quota.state, quota.committed_units, quota.released_units
+         FROM jobs job JOIN provider_submissions submission USING (job_id)
+         JOIN executor_terminal_reductions reduction USING (submission_id, executor_execution_id)
+         JOIN billing_accounts account ON account.tenant_id = job.tenant_id AND account.currency = 'USD'
+         JOIN quota_reservations quota ON quota.reservation_id = job.reservation_id
+         WHERE job.job_id = $1",
+    )
+    .bind(terminal.job_id)
+    .fetch_one(pool)
+    .await
+    .map_err(debug_error)?;
+    require(
+        rolled_back
+            == (
+                prior_state,
+                "leased".to_owned(),
+                0,
+                0,
+                0,
+                0,
+                5 * UNIT_PRICE_MICROS,
+                "reserved".to_owned(),
+                0,
+                0,
+            ),
+        format!("Charging failure left partial terminal effects: {rolled_back:?}"),
+    )
+}
+
+async fn assert_remote_rejects_local_evidence(pool: &PgPool, job_id: Uuid) -> TestResult {
+    // Attempt only database evidence insertion, with no media bytes or file I/O.
+    // Both independent statements must fail specifically at the remote/local guard.
+    for statement in [
+        "INSERT INTO executor_artifact_authorities
+            (authority_id, executor_execution_id, submission_id, output_id, job_id,
+             storage_backend, storage_namespace, object_key, sha256_hex, byte_size,
+             media_type, created_at_ms)
+         SELECT executor_execution_id, executor_execution_id, submission_id, output_id,
+                job_id, 'filesystem-v1', 'filesystem-v1:remote-conflict-fixture',
+                'remote-conflict.bin', repeat('a', 64), 1, 'video/mp4', 1
+         FROM provider_submissions WHERE job_id = $1",
+        "INSERT INTO executor_result_manifests
+            (manifest_id, executor_execution_id, submission_id, artifact_authority_id, created_at_ms)
+         SELECT submission_id, executor_execution_id, submission_id, executor_execution_id, 1
+         FROM provider_submissions WHERE job_id = $1",
+    ] {
+        let result = sqlx::query(AssertSqlSafe(statement)).bind(job_id).execute(pool).await;
+        require(
+            result.as_ref().err().and_then(sqlx::Error::as_database_error).is_some_and(|error|
+                error.code().as_deref() == Some("P0001")
+                    && error.message() == "local artifact evidence conflicts with canonical remote video"),
+            format!("Canonical remote result allowed/confused local evidence insertion: {result:?}"),
+        )?;
+    }
+    Ok(())
+}
+
 async fn seed_route(
     pool: &PgPool,
     project: &str,
@@ -482,6 +751,71 @@ async fn seed_route(
     account: Uuid,
     profile: Uuid,
     home: &Path,
+) -> TestResult {
+    seed_model_route(
+        pool,
+        project,
+        service_account,
+        key,
+        account,
+        profile,
+        home,
+        FixtureModel::legacy(),
+    )
+    .await
+}
+
+#[derive(Clone, Copy)]
+struct FixtureModel {
+    api_profile: &'static str,
+    public_model: &'static str,
+    provider_model: &'static str,
+    execution_model: &'static str,
+    media_kind: &'static str,
+    workflow: Option<&'static str>,
+    rate_micros: i64,
+}
+
+impl FixtureModel {
+    fn legacy() -> Self {
+        Self {
+            api_profile: "volcengine-ark-content-generation-v3",
+            public_model: MODEL,
+            provider_model: "seedance2.5",
+            execution_model: "seedance2.5",
+            media_kind: "video",
+            workflow: None,
+            rate_micros: UNIT_PRICE_MICROS,
+        }
+    }
+    fn operation(self) -> &'static str {
+        if self.media_kind == "image" {
+            "images.generations"
+        } else {
+            "videos.generations"
+        }
+    }
+    fn metric_unit_size(self) -> (&'static str, &'static str, &'static str) {
+        if self.media_kind == "image" {
+            ("image_output", "image", "1")
+        } else if self.workflow == Some("multiframe2video") {
+            ("video_requested_millisecond", "millisecond", "1000")
+        } else {
+            ("video_requested_second", "second", "1")
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn seed_model_route(
+    pool: &PgPool,
+    project: &str,
+    service_account: &str,
+    key: &str,
+    account: Uuid,
+    profile: Uuid,
+    home: &Path,
+    model: FixtureModel,
 ) -> TestResult {
     let route = Uuid::new_v4();
     let route_key = format!("dreamina-api-{}", route.simple());
@@ -495,12 +829,13 @@ async fn seed_route(
         "INSERT INTO provider_routes
         (route_id, revision, route_key, display_name, provider_id, operation_id,
          command_schema, route_kind, selection_strategy, state, created_at_ms)
-        VALUES ($1, 1, $2, 'Dreamina API fixture', 'dreamina-cli', 'videos.generations',
+        VALUES ($1, 1, $2, 'Dreamina API fixture', 'dreamina-cli', $4,
                 $3, 'account', 'quota_aware_least_loaded', 'enabled', 1)",
     )
     .bind(route)
     .bind(&route_key)
     .bind(DREAMINA_SUBMIT_COMMAND_SCHEMA)
+    .bind(model.operation())
     .execute(pool)
     .await
     .map_err(debug_error)?;
@@ -508,11 +843,12 @@ async fn seed_route(
         "INSERT INTO provider_route_heads
         (route_id, route_key, provider_id, operation_id, command_schema, route_kind,
          current_revision, state, created_at_ms, updated_at_ms)
-        VALUES ($1, $2, 'dreamina-cli', 'videos.generations', $3, 'account', 1, 'enabled', 1, 1)",
+        VALUES ($1, $2, 'dreamina-cli', $4, $3, 'account', 1, 'enabled', 1, 1)",
     )
     .bind(route)
     .bind(&route_key)
     .bind(DREAMINA_SUBMIT_COMMAND_SCHEMA)
+    .bind(model.operation())
     .execute(pool)
     .await
     .map_err(debug_error)?;
@@ -520,40 +856,51 @@ async fn seed_route(
         "INSERT INTO provider_route_members
         (route_id, route_revision, provider_id, operation_id, command_schema,
          provider_account_id, execution_profile_id, state, created_at_ms)
-        VALUES ($1, 1, 'dreamina-cli', 'videos.generations', $2, $3, $4, 'enabled', 1)",
+        VALUES ($1, 1, 'dreamina-cli', $5, $2, $3, $4, 'enabled', 1)",
     )
     .bind(route)
     .bind(DREAMINA_SUBMIT_COMMAND_SCHEMA)
     .bind(account)
     .bind(profile)
+    .bind(model.operation())
     .execute(pool)
     .await
     .map_err(debug_error)?;
-    sqlx::query("INSERT INTO provider_models
+    sqlx::query(
+        "INSERT INTO provider_models
         (provider_id, model_id, execution_model_id, media_kind, display_name,
          adapter_state, lifecycle_state, operation_ids, source_kind,
          first_seen_at_ms, last_seen_at_ms, metadata_json)
-        VALUES ('dreamina-cli', 'seedance2.5', 'seedance2.5', 'video', 'Seedance 2.5',
-                'supported', 'enabled', ARRAY['videos.generations'], 'adapter_contract', 1, 1, '{}')")
-        .execute(pool).await.map_err(debug_error)?;
+        VALUES ('dreamina-cli', $1, $2, $3, 'Dreamina workflow fixture',
+                'supported', 'enabled', ARRAY[$4::TEXT], 'adapter_contract', 1, 1, '{}')",
+    )
+    .bind(model.provider_model)
+    .bind(model.execution_model)
+    .bind(model.media_kind)
+    .bind(model.operation())
+    .execute(pool)
+    .await
+    .map_err(debug_error)?;
     sqlx::query("INSERT INTO provider_route_model_mappings
         (route_id, route_revision, provider_id, operation_id, command_schema,
          api_profile, public_model_id, provider_model_id, execution_model_id, media_kind, created_at_ms)
-        VALUES ($1, 1, 'dreamina-cli', 'videos.generations', $2,
-                'volcengine-ark-content-generation-v3', $3, 'seedance2.5', 'seedance2.5', 'video', 1)")
-        .bind(route).bind(DREAMINA_SUBMIT_COMMAND_SCHEMA).bind(MODEL)
+        VALUES ($1, 1, 'dreamina-cli', $4, $2, $5, $3, $6, $7, $8, 1)")
+        .bind(route).bind(DREAMINA_SUBMIT_COMMAND_SCHEMA).bind(model.public_model)
+        .bind(model.operation()).bind(model.api_profile).bind(model.provider_model)
+        .bind(model.execution_model).bind(model.media_kind)
         .execute(pool).await.map_err(debug_error)?;
     sqlx::query(
         "INSERT INTO gateway_api_key_provider_routes
         (api_key_id, service_account_id, project_id, tenant_id, provider_id,
          operation_id, command_schema, route_id, route_revision, bound_at_ms)
-        VALUES ($1, $2, $3, $3, 'dreamina-cli', 'videos.generations', $4, $5, 1, 1)",
+        VALUES ($1, $2, $3, $3, 'dreamina-cli', $6, $4, $5, 1, 1)",
     )
     .bind(key)
     .bind(service_account)
     .bind(project)
     .bind(DREAMINA_SUBMIT_COMMAND_SCHEMA)
     .bind(route)
+    .bind(model.operation())
     .execute(pool)
     .await
     .map_err(debug_error)?;
@@ -561,10 +908,11 @@ async fn seed_route(
         "INSERT INTO gateway_platform_provider_routes
         (provider_id, operation_id, command_schema, route_id, route_revision,
          state, created_at_ms, updated_at_ms)
-        VALUES ('dreamina-cli', 'videos.generations', $1, $2, 1, 'enabled', 1, 1)",
+        VALUES ('dreamina-cli', $3, $1, $2, 1, 'enabled', 1, 1)",
     )
     .bind(DREAMINA_SUBMIT_COMMAND_SCHEMA)
     .bind(route)
+    .bind(model.operation())
     .execute(pool)
     .await
     .map_err(debug_error)?;
@@ -572,6 +920,11 @@ async fn seed_route(
 }
 
 async fn seed_economics(pool: &PgPool, tenant: &str) -> TestResult {
+    seed_model_economics(pool, tenant, FixtureModel::legacy()).await
+}
+
+async fn seed_model_economics(pool: &PgPool, tenant: &str, model: FixtureModel) -> TestResult {
+    let (metric, unit, unit_size) = model.metric_unit_size();
     let service = PostgresPricingAdminService::new(pool.clone());
     let book = service
         .create_price_book(CreatePriceBookRequest {
@@ -589,12 +942,12 @@ async fn seed_economics(pool: &PgPool, tenant: &str) -> TestResult {
     let components = ["succeeded", "failed", "no_effect"]
         .into_iter()
         .map(|outcome| PriceComponentDraft {
-            component_key: format!("video-second-{outcome}"),
-            metric: "video_requested_second".to_owned(),
-            unit: "second".to_owned(),
-            unit_size: "1".to_owned(),
+            component_key: format!("workflow-{outcome}"),
+            metric: metric.to_owned(),
+            unit: unit.to_owned(),
+            unit_size: unit_size.to_owned(),
             unit_price_micros: if outcome == "succeeded" {
-                UNIT_PRICE_MICROS
+                model.rate_micros
             } else {
                 0
             }
@@ -603,7 +956,9 @@ async fn seed_economics(pool: &PgPool, tenant: &str) -> TestResult {
             quantity_source: "request_derived".to_owned(),
             required_confidence: "exact".to_owned(),
             rounding_mode: "exact".to_owned(),
-            dimensions: json!({}),
+            dimensions: model
+                .workflow
+                .map_or_else(|| json!({}), |workflow| json!({"workflow": workflow})),
         })
         .collect();
     let version = service
@@ -611,12 +966,17 @@ async fn seed_economics(pool: &PgPool, tenant: &str) -> TestResult {
             book.price_book_id,
             CreatePriceBookVersionRequest {
                 draft: PriceBookVersionDraft {
-                    api_profile: "volcengine-ark-content-generation-v3".to_owned(),
-                    operation: "video_generation".to_owned(),
+                    api_profile: model.api_profile.to_owned(),
+                    operation: if model.media_kind == "image" {
+                        "generation"
+                    } else {
+                        "video_generation"
+                    }
+                    .to_owned(),
                     provider_id: Some("dreamina-cli".to_owned()),
-                    provider_model_id: Some("seedance2.5".to_owned()),
-                    public_model_id: MODEL.to_owned(),
-                    media_kind: "video".to_owned(),
+                    provider_model_id: Some(model.provider_model.to_owned()),
+                    public_model_id: model.public_model.to_owned(),
+                    media_kind: model.media_kind.to_owned(),
                     service_tier: "standard".to_owned(),
                     execution_surface: "provider_cli".to_owned(),
                     billing_mode: "customer_rate".to_owned(),

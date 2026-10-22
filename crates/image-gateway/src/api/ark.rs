@@ -471,6 +471,25 @@ fn ark_video_task(
             resolution: None,
             ratio: None,
         },
+        VideoResultStatus::SucceededRemote {
+            model,
+            duration_ms,
+            result,
+        } => ArkContentGenerationTask {
+            id: public_id,
+            model: public_video_model(&model).to_owned(),
+            status: "succeeded".to_owned(),
+            error: None,
+            content: Some(ArkGeneratedContent {
+                video_url: Some(result.video_url().to_owned()),
+                last_frame_url: None,
+                file_url: None,
+            }),
+            usage: None,
+            duration: Some(super::dreamina::duration_seconds(duration_ms)),
+            resolution: None,
+            ratio: None,
+        },
         VideoResultStatus::Failed {
             model,
             duration_ms,

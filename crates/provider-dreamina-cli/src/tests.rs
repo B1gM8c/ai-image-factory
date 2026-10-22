@@ -497,6 +497,19 @@ fn query_result_projects_submit_id_and_download_directory_exactly() {
             OsString::from("/tmp/output dir"),
         ]
     );
+
+    let query_only = QueryResultRequestV1::query_only("task-1", "/tmp/private-attempt").unwrap();
+    assert!(!query_only.downloads_media());
+    assert_eq!(
+        query_only.to_argv(),
+        vec![
+            OsString::from("query_result"),
+            OsString::from("--submit_id"),
+            OsString::from("task-1"),
+        ]
+    );
+    assert!(QueryResultRequestV1::query_only("task-1", "relative").is_err());
+    assert!(QueryResultRequestV1::query_only("task-1", "/tmp/../escape").is_err());
 }
 
 #[test]
@@ -820,11 +833,35 @@ fn query_policy_confines_downloads_to_one_direct_workspace_child() {
     );
     assert_eq!(command.arguments(), request.to_argv());
 
+    fs::set_permissions(&download, fs::Permissions::from_mode(0o700)).unwrap();
+    let query_only = QueryResultRequestV1::query_only("task-1", &download).unwrap();
+    let query_command = policy.command_spec(&query_only).unwrap();
+    assert_eq!(query_command.working_directory().path(), download);
+    assert_eq!(query_command.arguments(), query_only.to_argv());
+    assert_eq!(
+        query_command
+            .environment()
+            .get(std::ffi::OsStr::new("TMPDIR"))
+            .map(OsString::as_os_str),
+        Some(download.as_os_str())
+    );
+
     let outside = root.path().join("outside");
     fs::create_dir(&outside).expect("outside directory");
     let outside_request = QueryResultRequestV1::new("task-1", outside).expect("outside request");
     assert!(matches!(
         policy.command_spec(&outside_request),
+        Err(DreaminaCliQueryPolicyError::DownloadDirectoryOutsideWorkspace)
+    ));
+
+    let escaped = root.path().join("private-outside");
+    fs::create_dir(&escaped).unwrap();
+    fs::set_permissions(&escaped, fs::Permissions::from_mode(0o700)).unwrap();
+    let linked = workspace.path().join("linked-attempt");
+    std::os::unix::fs::symlink(&escaped, &linked).unwrap();
+    let escaped_query = QueryResultRequestV1::query_only("task-1", linked).unwrap();
+    assert!(matches!(
+        policy.command_spec(&escaped_query),
         Err(DreaminaCliQueryPolicyError::DownloadDirectoryOutsideWorkspace)
     ));
 }

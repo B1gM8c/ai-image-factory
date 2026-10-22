@@ -125,6 +125,11 @@ pub enum VideoResultStatus {
         duration_ms: u32,
         artifact_id: uuid::Uuid,
     },
+    SucceededRemote {
+        model: String,
+        duration_ms: u32,
+        result: image_provider_sdk::RemoteVideoResult,
+    },
     Failed {
         model: String,
         duration_ms: u32,

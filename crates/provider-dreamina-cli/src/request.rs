@@ -411,6 +411,7 @@ impl TextToVideoRequestV1 {
 pub struct QueryResultRequestV1 {
     submit_id: OpaqueProviderId,
     download_dir: PathBuf,
+    download_media: bool,
 }
 
 impl QueryResultRequestV1 {
@@ -443,7 +444,18 @@ impl QueryResultRequestV1 {
         Ok(Self {
             submit_id,
             download_dir,
+            download_media: true,
         })
+    }
+
+    /// Query remote result metadata, using a private directory only for CLI temporary files.
+    pub fn query_only(
+        submit_id: impl Into<String>,
+        workspace_dir: impl Into<PathBuf>,
+    ) -> Result<Self, RequestValidationError> {
+        let mut request = Self::new(submit_id, workspace_dir)?;
+        request.download_media = false;
+        Ok(request)
     }
 
     pub fn submit_id(&self) -> &str {
@@ -454,14 +466,21 @@ impl QueryResultRequestV1 {
         &self.download_dir
     }
 
+    pub fn downloads_media(&self) -> bool {
+        self.download_media
+    }
+
     pub fn to_argv(&self) -> Vec<OsString> {
-        vec![
+        let mut args = vec![
             "query_result".into(),
             "--submit_id".into(),
             self.submit_id.as_str().into(),
-            "--download_dir".into(),
-            self.download_dir.as_os_str().to_owned(),
-        ]
+        ];
+        if self.download_media {
+            args.push("--download_dir".into());
+            args.push(self.download_dir.as_os_str().to_owned());
+        }
+        args
     }
 }
 

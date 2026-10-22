@@ -177,7 +177,7 @@ fn codex_edit_admission_retains_legacy_image_limits_and_rejects_timed_media() {
 }
 
 #[test]
-fn new_dreamina_workflow_stays_closed_until_input_admission_is_bound() {
+fn dreamina_workflow_without_input_manifest_is_rejected_before_attach() {
     use image_provider_dreamina_cli::{
         ImageUpscaleRequestV1, StagedImageV1, UpscaleResolution, encode_submit_command,
     };
@@ -196,8 +196,5 @@ fn new_dreamina_workflow_stays_closed_until_input_admission_is_bound() {
         validate_attach_request(&request),
         Err(AdmissionError::InvalidCommand)
     ));
-    assert!(matches!(
-        attach_operation(&request),
-        Err(AdmissionError::InvalidCommand)
-    ));
+    assert_eq!(attach_operation(&request).unwrap(), GENERATION_OPERATION);
 }

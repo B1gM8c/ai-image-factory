@@ -123,6 +123,106 @@ impl Completed {
     }
 }
 
+/// Provider-hosted video delivery. This is URL evidence, not a durable media manifest.
+#[derive(Clone, Eq, PartialEq)]
+pub struct RemoteVideoResult {
+    video_url: String,
+    expires_at_ms: Option<i64>,
+}
+
+impl RemoteVideoResult {
+    pub fn new(
+        video_url: String,
+        expires_at_ms: Option<i64>,
+    ) -> Result<Self, RemoteVideoResultError> {
+        if video_url.is_empty()
+            || video_url.len() > 8_192
+            || video_url
+                .chars()
+                .any(|value| value.is_control() || value.is_whitespace())
+            || video_url.contains('\\')
+        {
+            return Err(RemoteVideoResultError);
+        }
+        let authority = video_url
+            .get(8..)
+            .filter(|_| {
+                video_url
+                    .get(..8)
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://"))
+            })
+            .and_then(|remainder| remainder.split(['/', '?', '#']).next())
+            .ok_or(RemoteVideoResultError)?;
+        if authority.contains('@') {
+            return Err(RemoteVideoResultError);
+        }
+        let parsed = url::Url::parse(&video_url).map_err(|_| RemoteVideoResultError)?;
+        if parsed.scheme() != "https"
+            || parsed.host_str().is_none()
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+            || parsed.fragment().is_some()
+            || expires_at_ms.is_some_and(|value| value <= 0)
+        {
+            return Err(RemoteVideoResultError);
+        }
+        Ok(Self {
+            video_url,
+            expires_at_ms,
+        })
+    }
+
+    pub fn video_url(&self) -> &str {
+        &self.video_url
+    }
+    pub fn expires_at_ms(&self) -> Option<i64> {
+        self.expires_at_ms
+    }
+}
+
+impl fmt::Debug for RemoteVideoResult {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RemoteVideoResult")
+            .field("video_url", &"[redacted]")
+            .field("expires_at_ms", &self.expires_at_ms)
+            .finish()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RemoteVideoResultError;
+
+impl fmt::Display for RemoteVideoResultError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(
+            "remote video result requires a bounded HTTPS URL and a valid optional expiry",
+        )
+    }
+}
+impl Error for RemoteVideoResultError {}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompletedRemoteVideo {
+    result: RemoteVideoResult,
+    provider_request_id: Option<ProviderRequestId>,
+}
+
+impl CompletedRemoteVideo {
+    pub fn new(result: RemoteVideoResult, provider_request_id: Option<ProviderRequestId>) -> Self {
+        Self {
+            result,
+            provider_request_id,
+        }
+    }
+    pub fn result(&self) -> &RemoteVideoResult {
+        &self.result
+    }
+    pub fn provider_request_id(&self) -> Option<&ProviderRequestId> {
+        self.provider_request_id.as_ref()
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PendingOperation {
     operation: RemoteOperationRef,
@@ -177,6 +277,7 @@ impl CanceledEvidence {
 pub enum PollObservation {
     Pending { next_poll_after_ms: Option<u64> },
     Completed(Completed),
+    CompletedRemoteVideo(CompletedRemoteVideo),
     Failed(ProviderFailure),
     Canceled(CanceledEvidence),
 }
@@ -295,5 +396,45 @@ mod tests {
         assert!(RemoteOperationRef::new("seedance", "submission-1", "task-1").is_ok());
         assert!(RemoteOperationRef::new("seedance", "submission-1", "https://temp").is_err());
         assert!(ProviderRequestId::new("/tmp/request").is_err());
+    }
+}
+
+#[cfg(test)]
+mod remote_video_tests {
+    use super::*;
+
+    #[test]
+    fn remote_video_preserves_signed_url_without_claiming_expiry() {
+        let url = "https://media.example.test/video.mp4?signature=private%2Ftoken&x=1";
+        let result = RemoteVideoResult::new(url.to_owned(), None).unwrap();
+        assert_eq!(result.video_url(), url);
+        assert_eq!(result.expires_at_ms(), None);
+        assert!(!format!("{result:?}").contains("private"));
+        assert!(!format!("{result:?}").contains("media.example"));
+    }
+
+    #[test]
+    fn remote_video_rejects_unsafe_or_ambiguous_urls_and_expiry() {
+        for url in [
+            "http://example.test/a",
+            "https:example.test/a",
+            "https://u:p@example.test/a",
+            "https://@example.test/a",
+            "https://example.test/a#fragment",
+            "https://example.test/a\n",
+            "https://example.test/a b",
+            "https://",
+        ] {
+            assert!(
+                RemoteVideoResult::new(url.to_owned(), None).is_err(),
+                "accepted {url:?}"
+            );
+        }
+        assert!(
+            RemoteVideoResult::new(format!("https://example.test/{}", "a".repeat(8192)), None)
+                .is_err()
+        );
+        assert!(RemoteVideoResult::new("https://example.test/a".to_owned(), Some(0)).is_err());
+        assert!(RemoteVideoResult::new("https://example.test/a".to_owned(), Some(-1)).is_err());
     }
 }

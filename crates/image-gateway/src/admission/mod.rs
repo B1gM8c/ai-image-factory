@@ -752,19 +752,17 @@ pub(crate) fn attach_operation(request: &AttachJob) -> Result<&'static str, Admi
             let bytes = serde_json::to_vec(&request.command_json)
                 .map_err(|_| AdmissionError::InvalidCommand)?;
             match parse_submit_command(&bytes).map_err(|_| AdmissionError::InvalidCommand)? {
-                image_provider_dreamina_cli::DreaminaSubmitRequestV1::TextToImage(_) => {
+                image_provider_dreamina_cli::DreaminaSubmitRequestV1::TextToImage(_)
+                | image_provider_dreamina_cli::DreaminaSubmitRequestV1::ImageToImage(_)
+                | image_provider_dreamina_cli::DreaminaSubmitRequestV1::ImageUpscale(_) => {
                     Ok(GENERATION_OPERATION)
                 }
-                image_provider_dreamina_cli::DreaminaSubmitRequestV1::TextToVideo(_) => {
-                    Ok(VIDEO_GENERATION_OPERATION)
-                }
-                image_provider_dreamina_cli::DreaminaSubmitRequestV1::ImageToImage(_)
-                | image_provider_dreamina_cli::DreaminaSubmitRequestV1::ImageUpscale(_)
+                image_provider_dreamina_cli::DreaminaSubmitRequestV1::TextToVideo(_)
                 | image_provider_dreamina_cli::DreaminaSubmitRequestV1::ImageToVideo(_)
                 | image_provider_dreamina_cli::DreaminaSubmitRequestV1::FramesToVideo(_)
                 | image_provider_dreamina_cli::DreaminaSubmitRequestV1::MultiframeToVideo(_)
                 | image_provider_dreamina_cli::DreaminaSubmitRequestV1::MultimodalToVideo(_) => {
-                    Err(AdmissionError::InvalidCommand)
+                    Ok(VIDEO_GENERATION_OPERATION)
                 }
             }
         }

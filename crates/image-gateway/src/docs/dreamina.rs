@@ -208,6 +208,9 @@ pub(super) fn patch_schemas(document: &mut Value) {
         }
     }
     let ark_image = &mut schemas["ArkImageGenerationRequest"]["properties"];
+    ark_image["image"]["description"] = json!(
+        "Omit for text-to-image generation. For image editing, supply one image URL or an array of 1-10 image URLs. HTTPS URLs and PNG, JPEG or WebP data URLs are supported."
+    );
     ark_image["model"]["description"] = json!(
         "Supported aliases: doubao-seedream-5-0-lite maps to 5.0; doubao-seedream-5-0 and doubao-seedream-5-0-pro map to 5.0Pro. Each accepts an optional six-digit date suffix. Model-specific resolution limits still apply."
     );
