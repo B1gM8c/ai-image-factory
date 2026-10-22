@@ -1,8 +1,16 @@
 use std::collections::BTreeMap;
 
 use image_api_contracts::{
-    ark::{ArkContentGenerationTaskRequest, ArkContentItem, ArkImageGenerationRequest},
-    dreamina::{DreaminaImageGenerationRequest, DreaminaVideoGenerationRequest},
+    ark::{
+        ArkContentGenerationTaskRequest, ArkContentItem, ArkImageGenerationRequest,
+        ArkStringOrStrings,
+    },
+    dreamina::{
+        DreaminaFramesToVideoRequest, DreaminaImageGenerationRequest, DreaminaImageToImageRequest,
+        DreaminaImageToVideoRequest, DreaminaImageWorkflowRequest,
+        DreaminaMultimodalToVideoRequest, DreaminaVideoGenerationRequest,
+        DreaminaVideoWorkflowRequest,
+    },
 };
 use thiserror::Error;
 use uuid::Uuid;
@@ -20,6 +28,9 @@ pub struct ArkImageAdmissionPlan {
 
 impl ArkImageAdmissionPlan {
     pub fn new(request: ArkImageGenerationRequest) -> Result<Self, ArkAdmissionError> {
+        if request.image.is_some() {
+            return Err(ArkAdmissionError::Unsupported("image"));
+        }
         reject_unsupported_image_fields(&request)?;
         let model_version = ark_image_model(&request.model)?;
         let (resolution_type, ratio, width, height) =
@@ -120,7 +131,7 @@ impl ArkVideoAdmissionPlan {
             prompt,
             model_version: Some(model_version.to_owned()),
             ratio: request.ratio,
-            duration: request.duration,
+            duration: ark_duration(request.duration)?,
             video_resolution: request.resolution.unwrap_or_else(|| "720p".to_owned()),
         })?;
         Ok(Self {
@@ -189,6 +200,141 @@ impl ArkVideoAdmissionPlan {
     }
 }
 
+pub fn ark_image_workflow(
+    request: ArkImageGenerationRequest,
+) -> Result<DreaminaImageWorkflowRequest, ArkAdmissionError> {
+    reject_unsupported_image_fields(&request)?;
+    let model_version = Some(ark_image_model(&request.model)?.to_owned());
+    let (resolution_type, ratio, width, height) =
+        ark_image_size(request.size.as_deref().unwrap_or("2K"))?;
+    let generate_num = Some(ark_image_count(&request)?);
+    Ok(match request.image {
+        None => DreaminaImageWorkflowRequest::TextToImage(DreaminaImageGenerationRequest {
+            prompt: request.prompt,
+            model_version,
+            ratio,
+            resolution_type,
+            width,
+            height,
+            generate_num,
+        }),
+        Some(images) => DreaminaImageWorkflowRequest::ImageToImage(DreaminaImageToImageRequest {
+            images: match images {
+                ArkStringOrStrings::One(url) => vec![url],
+                ArkStringOrStrings::Many(urls) => urls,
+            },
+            prompt: request.prompt,
+            model_version,
+            ratio,
+            resolution_type,
+            width,
+            height,
+            generate_num,
+        }),
+    })
+}
+
+/// Classify the complete content list before any download; roles are never discarded.
+pub fn ark_video_workflow(
+    request: ArkContentGenerationTaskRequest,
+) -> Result<DreaminaVideoWorkflowRequest, ArkAdmissionError> {
+    reject_unsupported_video_fields(&request)?;
+    let model_version = Some(ark_video_model(&request.model)?.to_owned());
+    let duration = ark_duration(request.duration)?;
+    let video_resolution = request.resolution.unwrap_or_else(|| "720p".to_owned());
+    let mut prompt = None;
+    let mut first = None;
+    let mut last = None;
+    let mut images = Vec::new();
+    let mut videos = Vec::new();
+    let mut audios = Vec::new();
+    for item in request.content {
+        match item {
+            ArkContentItem::Text { text } if prompt.is_none() => prompt = Some(text),
+            ArkContentItem::ImageUrl { image_url, role } => match role.as_deref() {
+                None | Some("first_frame") if first.is_none() => first = Some(image_url.url),
+                Some("last_frame") if last.is_none() => last = Some(image_url.url),
+                Some("reference_image") => images.push(image_url.url),
+                _ => return Err(ArkAdmissionError::InvalidValue("content.role")),
+            },
+            ArkContentItem::VideoUrl { video_url, role } if role == "reference_video" => {
+                videos.push(video_url.url)
+            }
+            ArkContentItem::AudioUrl { audio_url, role } if role == "reference_audio" => {
+                audios.push(audio_url.url)
+            }
+            ArkContentItem::DraftTask { .. } => {
+                return Err(ArkAdmissionError::Unsupported("content.draft_task"));
+            }
+            _ => return Err(ArkAdmissionError::InvalidValue("content")),
+        }
+    }
+    let has_references = !images.is_empty() || !videos.is_empty() || !audios.is_empty();
+    if has_references && (first.is_some() || last.is_some()) {
+        return Err(ArkAdmissionError::InvalidValue("content.role"));
+    }
+    let ratio =
+        if (first.is_some() || last.is_some()) && request.ratio.as_deref() == Some("adaptive") {
+            None
+        } else {
+            request.ratio
+        };
+    Ok(match (first, last, has_references) {
+        (None, None, false) => {
+            DreaminaVideoWorkflowRequest::TextToVideo(DreaminaVideoGenerationRequest {
+                prompt: prompt.ok_or(ArkAdmissionError::InvalidValue("content"))?,
+                model_version,
+                ratio,
+                duration,
+                video_resolution,
+            })
+        }
+        (Some(image), None, false) => {
+            DreaminaVideoWorkflowRequest::ImageToVideo(DreaminaImageToVideoRequest {
+                image,
+                prompt: prompt.ok_or(ArkAdmissionError::InvalidValue("content.text"))?,
+                model_version,
+                ratio,
+                duration,
+                video_resolution,
+            })
+        }
+        (Some(first), Some(last), false) => {
+            DreaminaVideoWorkflowRequest::FramesToVideo(DreaminaFramesToVideoRequest {
+                first,
+                last,
+                prompt: prompt.ok_or(ArkAdmissionError::InvalidValue("content.text"))?,
+                model_version,
+                ratio,
+                duration,
+                video_resolution,
+            })
+        }
+        (None, None, true) => {
+            DreaminaVideoWorkflowRequest::MultimodalToVideo(DreaminaMultimodalToVideoRequest {
+                image: images,
+                video: videos,
+                audio: audios,
+                prompt: prompt.unwrap_or_default(),
+                model_version,
+                ratio,
+                duration,
+                video_resolution,
+            })
+        }
+        _ => return Err(ArkAdmissionError::InvalidValue("content.role")),
+    })
+}
+
+fn ark_duration(duration: Option<i16>) -> Result<Option<u8>, ArkAdmissionError> {
+    if duration == Some(-1) {
+        return Err(ArkAdmissionError::Unsupported("duration"));
+    }
+    duration
+        .map(|value| u8::try_from(value).map_err(|_| ArkAdmissionError::InvalidValue("duration")))
+        .transpose()
+}
+
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum ArkAdmissionError {
     #[error(
@@ -214,7 +360,6 @@ fn reject_unsupported_image_fields(
     request: &ArkImageGenerationRequest,
 ) -> Result<(), ArkAdmissionError> {
     let unsupported = [
-        (request.image.is_some(), "image"),
         (request.seed.is_some(), "seed"),
         (request.guidance_scale.is_some(), "guidance_scale"),
         (request.watermark.is_some(), "watermark"),
@@ -274,7 +419,9 @@ fn ark_image_model(model: &str) -> Result<&'static str, ArkAdmissionError> {
 }
 
 fn ark_video_model(model: &str) -> Result<&'static str, ArkAdmissionError> {
-    if model_matches(model, "doubao-seedance-2-0-fast") {
+    if model_matches(model, "doubao-seedance-2-5") {
+        Ok("seedance2.5")
+    } else if model_matches(model, "doubao-seedance-2-0-fast") {
         Ok("seedance2.0fast")
     } else if model_matches(model, "doubao-seedance-2-0-mini") {
         Ok("seedance2.0mini")
@@ -370,6 +517,94 @@ mod tests {
     use image_api_contracts::ark::ArkSequentialImageGenerationOptions;
 
     #[test]
+    fn ark_content_dispatches_four_video_workflows_without_losing_roles() {
+        for (content, expected) in [
+            (r#"[{"type":"text","text":"move"}]"#, "text2video"),
+            (
+                r#"[{"type":"image_url","image_url":{"url":"first"}},{"type":"text","text":"move"}]"#,
+                "image2video",
+            ),
+            (
+                r#"[{"type":"image_url","image_url":{"url":"last"},"role":"last_frame"},{"type":"text","text":"move"},{"type":"image_url","image_url":{"url":"first"},"role":"first_frame"}]"#,
+                "frames2video",
+            ),
+            (
+                r#"[{"type":"video_url","video_url":{"url":"video1"},"role":"reference_video"},{"type":"image_url","image_url":{"url":"image1"},"role":"reference_image"},{"type":"audio_url","audio_url":{"url":"audio1"},"role":"reference_audio"}]"#,
+                "multimodal2video",
+            ),
+        ] {
+            let request = serde_json::from_str(&format!(
+                r#"{{"model":"doubao-seedance-2-5","content":{content}}}"#
+            ))
+            .unwrap();
+            let workflow = ark_video_workflow(request).unwrap();
+            let value = serde_json::to_value(&workflow).unwrap();
+            assert_eq!(value["workflow"], expected);
+            if expected == "frames2video" {
+                assert_eq!(value["first"], "first");
+                assert_eq!(value["last"], "last");
+            }
+            let intent = super::super::DreaminaWorkflowIntent::video(workflow).unwrap();
+            if expected == "multimodal2video" {
+                assert_eq!(
+                    intent
+                        .sources()
+                        .iter()
+                        .map(|s| s.url.as_str())
+                        .collect::<Vec<_>>(),
+                    ["image1", "video1", "audio1"]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ark_content_rejects_ambiguous_roles_duplicate_text_and_unsupported_controls() {
+        for content in [
+            r#"[{"type":"text","text":"a"},{"type":"text","text":"b"}]"#,
+            r#"[{"type":"image_url","image_url":{"url":"a"},"role":"last_frame"}]"#,
+            r#"[{"type":"image_url","image_url":{"url":"a"}},{"type":"image_url","image_url":{"url":"b"},"role":"reference_image"}]"#,
+            r#"[{"type":"image_url","image_url":{"url":"a"},"role":"first_frame"},{"type":"image_url","image_url":{"url":"b"},"role":"first_frame"}]"#,
+            r#"[{"type":"video_url","video_url":{"url":"a"},"role":"reference_image"}]"#,
+            r#"[{"type":"draft_task","draft_task":{"id":"x"}}]"#,
+        ] {
+            let request = serde_json::from_str(&format!(
+                r#"{{"model":"doubao-seedance-2-5","content":{content}}}"#
+            ))
+            .unwrap();
+            assert!(ark_video_workflow(request).is_err());
+        }
+        for option in [
+            r#""generate_audio":false"#,
+            r#""watermark":false"#,
+            r#""duration":-1"#,
+            r#""tools":[]"#,
+        ] {
+            let request = serde_json::from_str(&format!(r#"{{"model":"doubao-seedance-2-5","content":[{{"type":"text","text":"move"}}],{option}}}"#)).unwrap();
+            assert!(matches!(
+                ark_video_workflow(request),
+                Err(ArkAdmissionError::Unsupported(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn ark_adaptive_only_maps_to_reference_frame_inference() {
+        let request = serde_json::from_str(r#"{"model":"doubao-seedance-2-5","content":[{"type":"text","text":"move"},{"type":"image_url","image_url":{"url":"first"}}],"ratio":"adaptive"}"#).unwrap();
+        let workflow = ark_video_workflow(request).unwrap();
+        let DreaminaVideoWorkflowRequest::ImageToVideo(request) = &workflow else {
+            panic!("wrong workflow")
+        };
+        assert!(request.ratio.is_none());
+        assert!(super::super::DreaminaWorkflowIntent::video(workflow).is_ok());
+        let request = serde_json::from_str(r#"{"model":"doubao-seedance-2-5","content":[{"type":"image_url","image_url":{"url":"first"},"role":"reference_image"}],"ratio":"adaptive"}"#).unwrap();
+        assert!(
+            super::super::DreaminaWorkflowIntent::video(ark_video_workflow(request).unwrap())
+                .is_err()
+        );
+    }
+
+    #[test]
     fn official_seedream_request_maps_to_an_immutable_cli_command() {
         let plan = ArkImageAdmissionPlan::new(ArkImageGenerationRequest {
             model: "doubao-seedream-5-0-260128".to_owned(),
@@ -440,11 +675,45 @@ mod tests {
             image_url: image_api_contracts::ark::ArkMediaUrl {
                 url: "https://example.com/image.png".to_owned(),
             },
-            role: "first_frame".to_owned(),
+            role: Some("first_frame".to_owned()),
         });
         assert_eq!(
             ArkVideoAdmissionPlan::new(request).unwrap_err(),
             ArkAdmissionError::Unsupported("content")
         );
+    }
+
+    #[test]
+    fn seedance_25_aliases_preserve_requested_video_specifications() {
+        for model in ["doubao-seedance-2-5", "doubao-seedance-2-5-260628"] {
+            let request = serde_json::from_value(serde_json::json!({
+                "model": model,
+                "content": [{"type": "text", "text": "an orange paper airplane"}],
+                "resolution": "480p",
+                "ratio": "16:9",
+                "duration": 5
+            }))
+            .unwrap();
+            let plan = ArkVideoAdmissionPlan::new(request).unwrap();
+            assert_eq!(plan.public_model(), model);
+            assert_eq!(plan.provider_model(), "seedance2.5");
+            assert_eq!(plan.duration(), 5);
+            assert_eq!(plan.pricing_dimensions()["resolution"], "480p");
+            assert_eq!(plan.pricing_dimensions()["ratio"], "16:9");
+        }
+    }
+
+    #[test]
+    fn seedance_25_ark_alias_rejects_unknown_suffixes() {
+        for model in [
+            "doubao-seedance-2-50",
+            "doubao-seedance-2-5-fast",
+            "doubao-seedance-2-5-260628-extra",
+        ] {
+            assert_eq!(
+                ark_video_model(model),
+                Err(ArkAdmissionError::InvalidValue("model"))
+            );
+        }
     }
 }

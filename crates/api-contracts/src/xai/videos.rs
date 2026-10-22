@@ -476,7 +476,7 @@ pub struct XaiVideoUsage {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct XaiGeneratedVideo {
-    pub duration: u8,
+    pub duration: serde_json::Number,
     pub respect_moderation: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file_output: Option<XaiVideoFileOutput>,

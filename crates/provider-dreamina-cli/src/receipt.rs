@@ -1,7 +1,7 @@
 use serde::Deserialize;
 use thiserror::Error;
 
-use image_provider_sdk::OpaqueProviderId;
+use image_provider_sdk::{OpaqueProviderId, RemoteVideoResult};
 
 pub const MAX_RECEIPT_BYTES: usize = 64 * 1024;
 pub const MAX_FAIL_REASON_CHARS: usize = 1024;
@@ -39,6 +39,7 @@ pub enum DreaminaQueryStatusV1 {
 pub struct DreaminaQueryReceiptV1 {
     submit_id: OpaqueProviderId,
     status: DreaminaQueryStatusV1,
+    remote_video_result: Option<RemoteVideoResult>,
 }
 
 impl DreaminaQueryReceiptV1 {
@@ -48,6 +49,12 @@ impl DreaminaQueryReceiptV1 {
 
     pub fn status(&self) -> DreaminaQueryStatusV1 {
         self.status
+    }
+
+    /// Only the CLI's single-video result view can establish remote delivery.
+    /// Missing, ambiguous, or malformed video metadata remains unavailable.
+    pub fn remote_video_result(&self) -> Option<&RemoteVideoResult> {
+        self.remote_video_result.as_ref()
     }
 }
 
@@ -74,6 +81,7 @@ struct RawReceipt {
     submit_id: Option<String>,
     gen_status: Option<String>,
     fail_reason: Option<String>,
+    result_json: Option<serde_json::Value>,
 }
 
 pub fn parse_receipt(input: &[u8]) -> Result<AcceptedReceipt, ReceiptError> {
@@ -99,8 +107,33 @@ pub fn parse_query_receipt(input: &[u8]) -> Result<DreaminaQueryReceiptV1, Recei
         Some(status) => return Err(ReceiptError::UnknownStatus(sanitize_text(status))),
         None => return Err(ReceiptError::MissingStatus),
     };
+    let remote_video_result = (status == DreaminaQueryStatusV1::Success)
+        .then(|| single_remote_video(raw.result_json.as_ref()))
+        .flatten();
     let submit_id = parse_submit_id(raw.submit_id)?;
-    Ok(DreaminaQueryReceiptV1 { submit_id, status })
+    Ok(DreaminaQueryReceiptV1 {
+        submit_id,
+        status,
+        remote_video_result,
+    })
+}
+
+fn single_remote_video(result: Option<&serde_json::Value>) -> Option<RemoteVideoResult> {
+    // CLI 1.4.21 taskResultOutput.result_json contains queryResultMediaOutput;
+    // its video entries expose video_url. No TTL is present in that output type.
+    let result = result?.as_object()?;
+    if let Some(images) = result.get("images")
+        && !images.is_null()
+        && !images.as_array()?.is_empty()
+    {
+        return None;
+    }
+    let videos = result.get("videos")?.as_array()?;
+    let [video] = videos.as_slice() else {
+        return None;
+    };
+    let url = video.as_object()?.get("video_url")?.as_str()?;
+    RemoteVideoResult::new(url.to_owned(), None).ok()
 }
 
 fn parse_raw_receipt(input: &[u8]) -> Result<RawReceipt, ReceiptError> {
@@ -168,4 +201,63 @@ fn sanitize_text(value: &str) -> String {
     }
 
     sanitized
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn query_video_view_preserves_the_exact_url_without_inventing_an_expiry() {
+        // Fixture follows the CLI 1.4.21 static Go output types; it is not a live receipt.
+        let url = "https://media.example.test/clip%2Fone.mp4?token=a%2Bb&expires=123";
+        let bytes = serde_json::to_vec(&json!({
+            "submit_id": "task-1", "gen_status": "success",
+            "result_json": {"images": [], "videos": [{"video_url": url, "duration": 5}]}
+        }))
+        .unwrap();
+        let receipt = parse_query_receipt(&bytes).unwrap();
+        let result = receipt.remote_video_result().unwrap();
+        assert_eq!(result.video_url(), url);
+        assert_eq!(result.expires_at_ms(), None);
+        assert!(!format!("{receipt:?}").contains("token="));
+    }
+
+    #[test]
+    fn query_video_view_requires_one_unambiguous_https_url() {
+        for result_json in [
+            json!(null),
+            json!({}),
+            json!({"videos": []}),
+            json!({"videos": [{"video_url": "https://media.example.test/1.mp4"}, {"video_url": "https://media.example.test/2.mp4"}]}),
+            json!({"images": [{"image_url": "https://media.example.test/1.png"}], "videos": [{"video_url": "https://media.example.test/1.mp4"}]}),
+            json!({"videos": [{"download_url": "https://media.example.test/1.mp4"}]}),
+            json!({"videos": [{"video_url": "http://media.example.test/1.mp4"}]}),
+            json!({"videos": [{"video_url": "https://name:secret@media.example.test/1.mp4"}]}),
+            json!({"videos": [{"video_url": "https://media.example.test/1.mp4#fragment"}]}),
+            json!({"videos": [{"video_url": "https://media.example.test/line\nbreak"}]}),
+            json!({"videos": [{"video_url": "https://media.example.test/".to_owned() + &"x".repeat(8192)}]}),
+        ] {
+            let receipt = parse_query_receipt(
+                &serde_json::to_vec(&json!({
+                    "submit_id": "task-1", "gen_status": "success", "result_json": result_json
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            assert!(receipt.remote_video_result().is_none());
+        }
+        for status in ["querying", "fail"] {
+            let receipt = parse_query_receipt(
+                &serde_json::to_vec(&json!({
+                    "submit_id": "task-1", "gen_status": status,
+                    "result_json": {"videos": [{"video_url": "https://media.example.test/1.mp4"}]}
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            assert!(receipt.remote_video_result().is_none());
+        }
+    }
 }

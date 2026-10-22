@@ -15,8 +15,9 @@ use crate::executor::{
     PostgresExecutorSubmissionStore, RunnerError,
 };
 use async_trait::async_trait;
+use image::ImageDecoder;
 
-const MAX_DECODED_IMAGE_PIXELS: u64 = 16 * 1024 * 1024;
+const MAX_DECODED_IMAGE_PIXELS: u64 = 64 * 1024 * 1024;
 const MAX_DECODED_IMAGE_DIMENSION: u32 = 8 * 1024;
 const MAX_ARTIFACT_BYTES: usize = 256 * 1024 * 1024;
 
@@ -409,18 +410,27 @@ where
     limits.max_image_width = Some(MAX_DECODED_IMAGE_DIMENSION);
     limits.max_image_height = Some(MAX_DECODED_IMAGE_DIMENSION);
     limits.max_alloc = Some(MAX_DECODED_IMAGE_PIXELS * 8);
-    reader.limits(limits);
-    let image = reader
-        .decode()
+    reader.limits(limits.clone());
+    let mut decoder = reader
+        .into_decoder()
         .map_err(|_| ExecutorArtifactPublishError::ArtifactIntegrity)?;
-    let width = image.width();
-    let height = image.height();
+    let (width, height) = decoder.dimensions();
     if width > MAX_DECODED_IMAGE_DIMENSION
         || height > MAX_DECODED_IMAGE_DIMENSION
         || u64::from(width).saturating_mul(u64::from(height)) > MAX_DECODED_IMAGE_PIXELS
     {
         return Err(ExecutorArtifactPublishError::ArtifactIntegrity);
     }
+    // Keep ImageReader::decode's allocation accounting after checking the header geometry.
+    // This reserves budget, not memory; small images still allocate only their own pixels.
+    limits
+        .reserve(decoder.total_bytes())
+        .map_err(|_| ExecutorArtifactPublishError::ArtifactIntegrity)?;
+    decoder
+        .set_limits(limits)
+        .map_err(|_| ExecutorArtifactPublishError::ArtifactIntegrity)?;
+    image::DynamicImage::from_decoder(decoder)
+        .map_err(|_| ExecutorArtifactPublishError::ArtifactIntegrity)?;
     Ok(media_type)
 }
 
@@ -606,6 +616,51 @@ mod tests {
         );
     }
 
+    #[test]
+    fn image_validation_accepts_8k_png_from_bytes_and_staged_file() {
+        use std::io::Write;
+
+        // A constant grayscale 8K UHD image needs about 32 MiB while encoding/decoding;
+        // only its small compressed bytes survive between the two validation paths.
+        let bytes = constant_png(7_680, 4_320);
+        assert_eq!(media_type_from_bytes(&bytes), Ok("image/png"));
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(&bytes).unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        assert_eq!(media_type_from_file(file), Ok("image/png"));
+    }
+
+    #[test]
+    fn image_validation_rejects_excess_dimensions_and_pixels() {
+        for (width, height) in [(8_193, 1), (1, 8_193), (8_193, 8_193)] {
+            // The square also exceeds 64 Mi pixels; no oversized binary fixture is tracked.
+            let bytes = constant_png(width, height);
+            assert_eq!(
+                media_type_from_bytes(&bytes),
+                Err(ExecutorArtifactPublishError::ArtifactIntegrity)
+            );
+        }
+    }
+
+    #[test]
+    fn image_validation_still_decodes_pixels_after_accepting_the_header() {
+        let mut bytes = constant_png(32, 32);
+        let idat = bytes.windows(4).position(|bytes| bytes == b"IDAT").unwrap();
+        bytes[idat + 4] ^= 0xff;
+        assert_eq!(
+            image::ImageReader::new(Cursor::new(&bytes))
+                .with_guessed_format()
+                .unwrap()
+                .into_dimensions()
+                .unwrap(),
+            (32, 32)
+        );
+        assert_eq!(
+            media_type_from_bytes(&bytes),
+            Err(ExecutorArtifactPublishError::ArtifactIntegrity)
+        );
+    }
+
     #[tokio::test]
     async fn conflicting_bytes_cannot_replace_a_published_object() {
         let blobs = Arc::new(InMemoryArtifactBlobStore::default());
@@ -734,6 +789,20 @@ mod tests {
             .write_to(&mut cursor, image::ImageFormat::Png)
             .unwrap();
         cursor.into_inner()
+    }
+
+    fn constant_png(width: u32, height: u32) -> Vec<u8> {
+        use image::{
+            ImageEncoder,
+            codecs::png::{CompressionType, FilterType, PngEncoder},
+        };
+
+        let pixels = vec![127; width as usize * height as usize];
+        let mut bytes = Vec::new();
+        PngEncoder::new_with_quality(&mut bytes, CompressionType::Fast, FilterType::NoFilter)
+            .write_image(&pixels, width, height, image::ExtendedColorType::L8)
+            .unwrap();
+        bytes
     }
 
     fn minimal_mp4() -> Vec<u8> {

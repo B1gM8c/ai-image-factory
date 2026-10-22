@@ -43,7 +43,10 @@ impl ImageModelVersion {
             Self::V4_0 | Self::V4_1 | Self::V4_5 | Self::V4_6 | Self::V4_7 | Self::V5_0 => {
                 matches!(resolution, ImageResolution::K2 | ImageResolution::K4)
             }
-            Self::V5_0Pro => true,
+            Self::V5_0Pro => matches!(
+                resolution,
+                ImageResolution::K1_5 | ImageResolution::K2 | ImageResolution::K4
+            ),
         }
     }
 }
@@ -78,6 +81,7 @@ impl ImageRatio {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ImageResolution {
     K1,
+    K1_5,
     K2,
     K4,
 }
@@ -86,6 +90,7 @@ impl ImageResolution {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::K1 => "1k",
+            Self::K1_5 => "1.5k",
             Self::K2 => "2k",
             Self::K4 => "4k",
         }
@@ -94,28 +99,43 @@ impl ImageResolution {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum VideoModelVersion {
+    Seedance1_0Fast,
+    Seedance1_5Pro,
     Seedance2_0,
     Seedance2_0Fast,
     Seedance2_0Vip,
     Seedance2_0FastVip,
     Seedance2_0Mini,
+    Seedance2_5,
 }
 
 impl VideoModelVersion {
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::Seedance1_0Fast => "seedance1.0fast",
+            Self::Seedance1_5Pro => "seedance1.5pro",
             Self::Seedance2_0 => "seedance2.0",
             Self::Seedance2_0Fast => "seedance2.0fast",
             Self::Seedance2_0Vip => "seedance2.0_vip",
             Self::Seedance2_0FastVip => "seedance2.0fast_vip",
             Self::Seedance2_0Mini => "seedance2.0mini",
+            Self::Seedance2_5 => "seedance2.5",
         }
     }
 
-    const fn supports(self, resolution: VideoResolution) -> bool {
+    pub(crate) const fn supports(self, resolution: VideoResolution) -> bool {
         match self {
-            Self::Seedance2_0Vip => true,
-            Self::Seedance2_0
+            Self::Seedance2_0Vip => matches!(
+                resolution,
+                VideoResolution::P720 | VideoResolution::P1080 | VideoResolution::K4
+            ),
+            Self::Seedance2_5 => matches!(
+                resolution,
+                VideoResolution::P480 | VideoResolution::P720 | VideoResolution::P1080
+            ),
+            Self::Seedance1_0Fast
+            | Self::Seedance1_5Pro
+            | Self::Seedance2_0
             | Self::Seedance2_0Fast
             | Self::Seedance2_0FastVip
             | Self::Seedance2_0Mini => {
@@ -150,6 +170,7 @@ impl VideoRatio {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum VideoResolution {
+    P480,
     P720,
     P1080,
     K4,
@@ -158,6 +179,7 @@ pub enum VideoResolution {
 impl VideoResolution {
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::P480 => "480p",
             Self::P720 => "720p",
             Self::P1080 => "1080p",
             Self::K4 => "4k",
@@ -216,6 +238,11 @@ impl TextToImageRequestV1 {
         }
         if !model.supports(resolution) {
             return Err(RequestValidationError::UnsupportedImageResolution { model, resolution });
+        }
+        if matches!(model, ImageModelVersion::V3_0 | ImageModelVersion::V3_1)
+            && resolution != ImageResolution::K2
+        {
+            return Err(RequestValidationError::UnsupportedCustomImageResolution);
         }
         validate_custom_dimensions(width, height, resolution)?;
         Ok(Self {
@@ -314,7 +341,18 @@ impl TextToVideoRequestV1 {
         resolution: VideoResolution,
     ) -> Result<Self, RequestValidationError> {
         let prompt = validate_prompt(prompt.into())?;
-        if !(4..=15).contains(&duration_seconds) {
+        if matches!(
+            model,
+            VideoModelVersion::Seedance1_0Fast | VideoModelVersion::Seedance1_5Pro
+        ) {
+            return Err(RequestValidationError::UnsupportedWorkflowModel);
+        }
+        let maximum_duration = if model == VideoModelVersion::Seedance2_5 {
+            30
+        } else {
+            15
+        };
+        if !(4..=maximum_duration).contains(&duration_seconds) {
             return Err(RequestValidationError::InvalidVideoDuration(
                 duration_seconds,
             ));
@@ -373,6 +411,7 @@ impl TextToVideoRequestV1 {
 pub struct QueryResultRequestV1 {
     submit_id: OpaqueProviderId,
     download_dir: PathBuf,
+    download_media: bool,
 }
 
 impl QueryResultRequestV1 {
@@ -405,7 +444,18 @@ impl QueryResultRequestV1 {
         Ok(Self {
             submit_id,
             download_dir,
+            download_media: true,
         })
+    }
+
+    /// Query remote result metadata, using a private directory only for CLI temporary files.
+    pub fn query_only(
+        submit_id: impl Into<String>,
+        workspace_dir: impl Into<PathBuf>,
+    ) -> Result<Self, RequestValidationError> {
+        let mut request = Self::new(submit_id, workspace_dir)?;
+        request.download_media = false;
+        Ok(request)
     }
 
     pub fn submit_id(&self) -> &str {
@@ -416,19 +466,56 @@ impl QueryResultRequestV1 {
         &self.download_dir
     }
 
+    pub fn downloads_media(&self) -> bool {
+        self.download_media
+    }
+
     pub fn to_argv(&self) -> Vec<OsString> {
-        vec![
+        let mut args = vec![
             "query_result".into(),
             "--submit_id".into(),
             self.submit_id.as_str().into(),
-            "--download_dir".into(),
-            self.download_dir.as_os_str().to_owned(),
-        ]
+        ];
+        if self.download_media {
+            args.push("--download_dir".into());
+            args.push(self.download_dir.as_os_str().to_owned());
+        }
+        args
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum RequestValidationError {
+    #[error("the selected model does not support this workflow")]
+    UnsupportedWorkflowModel,
+    #[error("3.0 and 3.1 custom dimensions require resolution_type 2k")]
+    UnsupportedCustomImageResolution,
+    #[error("staged input filename must be a single safe ASCII basename")]
+    InvalidStagedFilename,
+    #[error("staged input SHA-256 must be 64 lowercase hexadecimal characters")]
+    InvalidStagedSha256,
+    #[error("staged image dimensions must be positive")]
+    InvalidStagedImageDimensions,
+    #[error("staged media duration must be positive")]
+    InvalidStagedMediaDuration,
+    #[error("input count is outside the supported range for this workflow and model")]
+    InvalidInputCount,
+    #[error("staged filenames must be unique within a request")]
+    DuplicateStagedFilename,
+    #[error("reference-frame Seedance 2.5 does not accept an explicit ratio")]
+    ReferenceRatioUnsupported,
+    #[error("legacy reference-frame ratio must match the first image")]
+    ReferenceRatioMismatch,
+    #[error("upscaling resolution must be 2k, 4k, or 8k")]
+    InvalidUpscaleResolution,
+    #[error("multi-frame video requires 720p or 1080p")]
+    InvalidMultiframeResolution,
+    #[error("multi-frame video needs one transition per adjacent image pair")]
+    InvalidTransitionCount,
+    #[error("transition durations must be 1000-8000 ms and total at least 2000 ms")]
+    InvalidTransitionDuration,
+    #[error("each and total duration per video/audio category exceeds the model's limits")]
+    UnsupportedReferenceDuration,
     #[error("prompt must contain non-whitespace text")]
     EmptyPrompt,
     #[error("prompt contains a NUL byte")]
@@ -446,7 +533,7 @@ pub enum RequestValidationError {
         height: u32,
         resolution: ImageResolution,
     },
-    #[error("video duration must be between 4 and 15 seconds, got {0}")]
+    #[error("video duration is outside the selected model's supported range, got {0}")]
     InvalidVideoDuration(u8),
     #[error("video model {model:?} does not support resolution {resolution:?}")]
     UnsupportedVideoResolution {
@@ -465,7 +552,7 @@ pub enum RequestValidationError {
     InvalidDownloadDirectory,
 }
 
-fn validate_prompt(prompt: String) -> Result<String, RequestValidationError> {
+pub(crate) fn validate_prompt(prompt: String) -> Result<String, RequestValidationError> {
     if prompt.trim().is_empty() {
         return Err(RequestValidationError::EmptyPrompt);
     }
@@ -482,6 +569,7 @@ fn validate_custom_dimensions(
 ) -> Result<(), RequestValidationError> {
     let (minimum, maximum, max_pixels) = match resolution {
         ImageResolution::K1 => (512_u32, 2_016_u32, 1_763_584_u64),
+        ImageResolution::K1_5 => (972, 2_268, 2_359_296),
         ImageResolution::K2 => (768, 3_072, 4_194_304),
         ImageResolution::K4 => (1_536, 6_240, 16_777_216),
     };

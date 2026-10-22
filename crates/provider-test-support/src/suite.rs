@@ -12,6 +12,7 @@ pub enum ConformanceError {
     Canceled,
     PollLimitExceeded,
     SubmissionMismatch,
+    UnexpectedRemoteVideoDelivery,
 }
 
 impl fmt::Display for ConformanceError {
@@ -19,6 +20,9 @@ impl fmt::Display for ConformanceError {
         match self {
             Self::Provider(error) => write!(formatter, "provider call failed: {error}"),
             Self::TerminalFailure(error) => write!(formatter, "remote task failed: {error}"),
+            Self::UnexpectedRemoteVideoDelivery => {
+                formatter.write_str("local artifact conformance requires a durable manifest")
+            }
             Self::Canceled => formatter.write_str("remote task was canceled"),
             Self::PollLimitExceeded => formatter.write_str("remote task exceeded poll limit"),
             Self::SubmissionMismatch => {
@@ -76,6 +80,9 @@ where
         {
             PollObservation::Pending { .. } => {}
             PollObservation::Completed(completed) => return Ok(completed),
+            PollObservation::CompletedRemoteVideo(_) => {
+                return Err(ConformanceError::UnexpectedRemoteVideoDelivery);
+            }
             PollObservation::Failed(error) => {
                 return Err(ConformanceError::TerminalFailure(error));
             }

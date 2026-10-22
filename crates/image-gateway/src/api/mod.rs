@@ -60,6 +60,7 @@ mod console_video;
 mod credit_grants;
 mod customer_refunds;
 mod dreamina;
+mod dreamina_inputs;
 mod edit_input;
 mod files;
 mod images;

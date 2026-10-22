@@ -143,7 +143,7 @@ struct ConsoleVideoStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    duration: Option<u8>,
+    duration: Option<serde_json::Number>,
     #[serde(skip_serializing_if = "Option::is_none")]
     progress: Option<u8>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -428,6 +428,10 @@ fn console_video_controls(
 ) -> Option<ConsoleVideoControls> {
     const DREAMINA_RATIOS: &[&str] = &["1:1", "3:4", "16:9", "4:3", "9:16", "21:9"];
     const DREAMINA_DURATIONS: &[u8] = &[4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+    const SEEDANCE_25_DURATIONS: &[u8] = &[
+        4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
+        28, 29, 30,
+    ];
     if api_profile == XAI_VIDEOS_API_PROFILE {
         if !is_grok_video_15(provider_model_id) {
             return None;
@@ -485,6 +489,9 @@ fn console_video_controls(
     }
     let provider_model_id = provider_model_id?;
     let resolutions = match (api_profile, provider_model_id) {
+        (DREAMINA_VIDEOS_API_PROFILE | ARK_CONTENT_GENERATION_API_PROFILE, "seedance2.5") => {
+            &["480p", "720p", "1080p"][..]
+        }
         (DREAMINA_VIDEOS_API_PROFILE, "seedance2.0_vip") => &["720p", "1080p", "4k"][..],
         (
             DREAMINA_VIDEOS_API_PROFILE,
@@ -504,7 +511,11 @@ fn console_video_controls(
         }),
         duration: ConsoleNumericChoiceControl {
             default: 5,
-            options: DREAMINA_DURATIONS,
+            options: if provider_model_id == "seedance2.5" {
+                SEEDANCE_25_DURATIONS
+            } else {
+                DREAMINA_DURATIONS
+            },
         },
         resolution: ConsoleChoiceControl {
             default: "720p",
@@ -744,7 +755,7 @@ fn console_video_request(
                 seed: None,
                 resolution: Some(resolution),
                 ratio: aspect_ratio,
-                duration: Some(duration),
+                duration: Some(i16::from(duration)),
                 frames: None,
                 tools: None,
             },
@@ -798,47 +809,61 @@ fn console_video_status(
     match status {
         VideoResultStatus::Pending {
             model,
-            duration,
+            duration_ms,
             stage,
         } => ConsoleVideoStatus {
             task_id: task_id.to_owned(),
             status: "pending",
             stage: Some(console_video_pending_stage(stage)),
             model: Some(model),
-            duration: Some(duration),
+            duration: Some(super::dreamina::duration_seconds(duration_ms)),
             progress: None,
             content_url: None,
             error: None,
         },
-        VideoResultStatus::Uncertain { model, duration } => ConsoleVideoStatus {
+        VideoResultStatus::Uncertain { model, duration_ms } => ConsoleVideoStatus {
             task_id: task_id.to_owned(),
             status: "uncertain",
             stage: None,
             model: Some(model),
-            duration: Some(duration),
+            duration: Some(super::dreamina::duration_seconds(duration_ms)),
             progress: None,
             content_url: None,
             error: None,
         },
         VideoResultStatus::Succeeded {
             model,
-            duration,
+            duration_ms,
             artifact_id,
         } => ConsoleVideoStatus {
             task_id: task_id.to_owned(),
             status: "done",
             stage: None,
             model: Some(model),
-            duration: Some(duration),
+            duration: Some(super::dreamina::duration_seconds(duration_ms)),
             progress: Some(100),
             content_url: Some(format!(
                 "/v1/console/projects/{project_id}/videos/files/{artifact_id}/content"
             )),
             error: None,
         },
+        VideoResultStatus::SucceededRemote {
+            model,
+            duration_ms,
+            result,
+        } => ConsoleVideoStatus {
+            task_id: task_id.to_owned(),
+            status: "done",
+            stage: None,
+            model: Some(model),
+            duration: Some(super::dreamina::duration_seconds(duration_ms)),
+            progress: Some(100),
+            content_url: Some(result.video_url().to_owned()),
+            error: None,
+        },
         VideoResultStatus::Failed {
             model,
-            duration,
+            duration_ms,
             error_code,
         } => {
             let error_code = error_code.as_deref();
@@ -847,7 +872,7 @@ fn console_video_status(
                 status: "failed",
                 stage: None,
                 model: Some(model),
-                duration: Some(duration),
+                duration: Some(super::dreamina::duration_seconds(duration_ms)),
                 progress: None,
                 content_url: None,
                 error: Some(ConsoleVideoError {
@@ -1300,7 +1325,7 @@ mod tests {
             "task-one",
             VideoResultStatus::Succeeded {
                 model: "grok-imagine-video".to_owned(),
-                duration: 6,
+                duration_ms: 6000,
                 artifact_id,
             },
         );
@@ -1315,13 +1340,29 @@ mod tests {
     }
 
     #[test]
+    fn completed_remote_video_preserves_the_upstream_url() {
+        let url = "https://media.example.test/video.mp4?sign=a%2fb&x=1&x=2";
+        let status = console_video_status(
+            "proj_one",
+            "task-one",
+            VideoResultStatus::SucceededRemote {
+                model: "seedance2.5".to_owned(),
+                duration_ms: 5000,
+                result: image_provider_sdk::RemoteVideoResult::new(url.to_owned(), None).unwrap(),
+            },
+        );
+        assert_eq!(status.status, "done");
+        assert_eq!(status.content_url.as_deref(), Some(url));
+    }
+
+    #[test]
     fn zdr_video_failures_keep_an_actionable_console_error() {
         let status = console_video_status(
             "proj_one",
             "task-one",
             VideoResultStatus::Failed {
                 model: "grok-imagine-video".to_owned(),
-                duration: 6,
+                duration_ms: 6000,
                 error_code: Some("grok_video_output_upload_url_required".to_owned()),
             },
         );
@@ -1360,7 +1401,7 @@ mod tests {
                 "task-one",
                 VideoResultStatus::Failed {
                     model: "grok-imagine-video".to_owned(),
-                    duration: 6,
+                    duration_ms: 6000,
                     error_code: Some(error_code.to_owned()),
                 },
             );
@@ -1404,6 +1445,24 @@ mod tests {
                 .map(|index| format!("data:image/png;base64,{index:02}"))
                 .collect(),
         }
+    }
+
+    #[test]
+    fn seedance_25_console_controls_follow_the_cli_model_limits() {
+        for profile in [
+            DREAMINA_VIDEOS_API_PROFILE,
+            ARK_CONTENT_GENERATION_API_PROFILE,
+        ] {
+            let controls = console_video_controls(profile, Some("seedance2.5")).unwrap();
+            assert_eq!(controls.resolution.options, &["480p", "720p", "1080p"]);
+            assert_eq!(controls.duration.options.first(), Some(&4));
+            assert_eq!(controls.duration.options.last(), Some(&30));
+            assert!(!controls.first_frame.supported);
+        }
+        let legacy =
+            console_video_controls(DREAMINA_VIDEOS_API_PROFILE, Some("seedance2.0fast")).unwrap();
+        assert_eq!(legacy.resolution.options, &["720p"]);
+        assert_eq!(legacy.duration.options.last(), Some(&15));
     }
 
     fn public_model(

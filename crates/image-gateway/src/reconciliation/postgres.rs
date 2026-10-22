@@ -801,7 +801,7 @@ impl ReconciliationStore for PostgresReconciliationStore {
             WITH candidates AS (
               SELECT s.session_id
               FROM admission_sessions s
-              WHERE s.operation IN ('edit', 'video_generation')
+              WHERE s.operation IN ('generation', 'edit', 'video_generation')
                 AND (
                   s.input_cleanup_state = 'pending'
                   OR (
@@ -907,7 +907,7 @@ async fn abort_expired_unreserved_input_sessions(
         r#"
         SELECT s.session_id
         FROM admission_sessions s
-        WHERE s.operation IN ('edit', 'video_generation')
+        WHERE s.operation IN ('generation', 'edit', 'video_generation')
           AND s.state = 'receiving' AND s.job_id IS NULL
           AND s.deadline_at_ms <= $1
           AND NOT EXISTS (

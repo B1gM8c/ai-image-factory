@@ -11,11 +11,14 @@ use crate::ImageGatewayError;
 use super::{
     PriceBookVersionView, PriceComponentView, PricePublishReadiness,
     admission::{
-        CustomerMeteringContract, customer_metering_contract, pricing_operation_for_route,
+        CustomerMeteringContract, customer_metering_contract, dreamina_price_groups,
+        pricing_operation_for_route,
     },
     canonical_customer_public_model_id,
     coverage::{CoverageSurfaceRow, load_aliases_on, load_surfaces_on},
-    surface_contract::{ContractBindingSnapshot, ExactSurfaceIdentity, find_contract},
+    surface_contract::{
+        ContractBindingSnapshot, ExactSurfaceIdentity, find_contract, find_contract_for_workflow,
+    },
 };
 
 #[derive(FromRow)]
@@ -173,33 +176,52 @@ pub(super) async fn evaluate_on(
                 CustomerMeteringContract::Exact => {}
                 CustomerMeteringContract::Incompatible => incompatible = true,
             }
-            match contract_snapshot_for_surface(&version, surface) {
-                Ok((contract, _)) => {
-                    dimensions.extend(
-                        contract
+            match contract_groups_for_surface(&version, surface) {
+                Ok(groups) => {
+                    for (group, contract, _) in groups {
+                        if customer_metering_contract(&group, &surface.provider_id)
+                            != CustomerMeteringContract::Exact
+                        {
+                            incompatible = true;
+                        }
+                        let group_dimensions = contract
                             .dimensions
                             .iter()
-                            .map(|dimension| dimension.key.to_string()),
-                    );
-                    if version.components.iter().any(|component| {
-                        contract
-                            .validate_component_selector(&component.dimensions)
-                            .is_err()
-                    }) {
-                        blocking_reasons.push("component_dimension_value_unsupported".to_string());
-                    }
-                    if version.components.iter().any(|component| {
-                        !contract.metering_bases.iter().any(|basis| {
-                            basis.metric == component.metric
-                                && basis.unit == component.unit
-                                && basis.quantity_source == component.quantity_source
-                        })
-                    }) {
-                        blocking_reasons.push("metering_basis_not_in_surface_contract".to_string());
-                    }
-                    if !has_required_customer_metering_bases(&version, contract) {
-                        blocking_reasons
-                            .push("required_customer_metering_basis_missing".to_string());
+                            .map(|dimension| dimension.key.to_string())
+                            .collect::<BTreeSet<_>>();
+                        dimensions.extend(group_dimensions.iter().cloned());
+                        if group.components.iter().any(|component| {
+                            contract
+                                .validate_component_selector(&component.dimensions)
+                                .is_err()
+                        }) {
+                            blocking_reasons
+                                .push("component_dimension_value_unsupported".to_string());
+                        }
+                        if group.components.iter().any(|component| {
+                            !contract.metering_bases.iter().any(|basis| {
+                                basis.metric == component.metric
+                                    && basis.unit == component.unit
+                                    && basis.quantity_source == component.quantity_source
+                            })
+                        }) {
+                            blocking_reasons
+                                .push("metering_basis_not_in_surface_contract".to_string());
+                        }
+                        if !has_required_customer_metering_bases(&group, contract) {
+                            blocking_reasons
+                                .push("required_customer_metering_basis_missing".to_string());
+                        }
+                        let workflow = (surface.provider_id == "dreamina-cli"
+                            && group_dimensions.contains("workflow"))
+                        .then_some(contract.normalizer_key);
+                        validate_component_dimensions(
+                            &group,
+                            &group_dimensions,
+                            workflow,
+                            &mut blocking_reasons,
+                            &mut warnings,
+                        );
                     }
                 }
                 Err(reason) => blocking_reasons.push(reason.to_string()),
@@ -208,7 +230,6 @@ pub(super) async fn evaluate_on(
         if incompatible {
             blocking_reasons.push("metering_contract_incompatible".to_string());
         }
-        validate_component_dimensions(&version, &dimensions, &mut blocking_reasons, &mut warnings);
         (
             if incompatible {
                 "incompatible"
@@ -265,7 +286,11 @@ pub(super) async fn binding_snapshots_on(
     if candidate.purpose != "customer_sale" {
         return Ok(Vec::new());
     }
-    let version = candidate.version_view(Vec::new());
+    let components = sqlx::query_as::<_, PublishComponentRow>(
+        "SELECT price_component_id, component_key, metric, unit, unit_size, unit_price_micros, outcome, quantity_source, required_confidence, rounding_mode, dimensions_json, created_at_ms FROM price_components WHERE price_book_version_id = $1 ORDER BY component_key",
+    ).bind(price_book_version_id).fetch_all(&mut *connection).await.map_err(store_unavailable)?
+        .into_iter().map(PublishComponentRow::into_view).collect();
+    let version = candidate.version_view(components);
     let surfaces = load_surfaces_on(connection).await?;
     let aliases = load_aliases_on(connection).await?;
     let matches = matching_surfaces(
@@ -276,14 +301,16 @@ pub(super) async fn binding_snapshots_on(
     );
     let mut snapshots = BTreeMap::new();
     for surface in matches {
-        let (_, snapshot) = contract_snapshot_for_surface(&version, surface).map_err(|reason| {
+        let groups = contract_groups_for_surface(&version, surface).map_err(|reason| {
             ImageGatewayError::invalid_request(
                 "Pricing surface contract is unavailable",
                 Some("price_book_version_id".to_string()),
                 reason,
             )
         })?;
-        snapshots.insert((snapshot.contract_key.clone(), snapshot.revision), snapshot);
+        for (_, _, snapshot) in groups {
+            snapshots.insert((snapshot.contract_key.clone(), snapshot.revision), snapshot);
+        }
     }
     if snapshots.is_empty() {
         return Err(ImageGatewayError::invalid_request(
@@ -293,6 +320,37 @@ pub(super) async fn binding_snapshots_on(
         ));
     }
     Ok(snapshots.into_values().collect())
+}
+
+type SurfaceContractGroup = (
+    PriceBookVersionView,
+    &'static super::surface_contract::PricingSurfaceContract,
+    ContractBindingSnapshot,
+);
+
+pub(super) fn contract_groups_for_surface(
+    version: &PriceBookVersionView,
+    surface: &CoverageSurfaceRow,
+) -> Result<Vec<SurfaceContractGroup>, &'static str> {
+    let groups = if surface.provider_id == "dreamina-cli" {
+        dreamina_price_groups(version)
+            .map_err(|_| "pricing_workflow_selector_invalid")?
+            .into_iter()
+            .map(|(_, group)| group)
+            .collect()
+    } else {
+        vec![version.clone()]
+    };
+    if groups.is_empty() {
+        return Err("price_components_missing");
+    }
+    groups
+        .into_iter()
+        .map(|group| {
+            let (contract, snapshot) = contract_snapshot_for_surface(&group, surface)?;
+            Ok((group, contract, snapshot))
+        })
+        .collect()
 }
 
 fn contract_snapshot_for_surface(
@@ -331,12 +389,39 @@ fn contract_snapshot_for_surface(
     ) {
         return Err("pricing_surface_contract_identity_mismatch");
     }
-    let contract = find_contract(
-        &surface.provider_id,
-        &surface.operation,
-        command_schema,
-        &surface.media_kind,
-    )
+    let workflow = if surface.provider_id == "dreamina-cli" {
+        let groups =
+            dreamina_price_groups(version).map_err(|_| "pricing_workflow_selector_invalid")?;
+        if groups.len() > 1 {
+            return Err("pricing_workflow_selector_ambiguous");
+        }
+        groups.into_iter().next().and_then(|(workflow, _)| workflow)
+    } else {
+        None
+    };
+    let contract = if workflow.is_some() {
+        let operation = pricing_operation_for_route(
+            &surface.provider_id,
+            &surface.operation,
+            command_schema,
+            &surface.media_kind,
+        )
+        .ok_or("pricing_surface_contract_missing")?;
+        find_contract_for_workflow(
+            &surface.provider_id,
+            operation,
+            command_schema,
+            &surface.media_kind,
+            workflow.as_deref(),
+        )
+    } else {
+        find_contract(
+            &surface.provider_id,
+            &surface.operation,
+            command_schema,
+            &surface.media_kind,
+        )
+    }
     .ok_or("pricing_surface_contract_missing")?;
     let snapshot = contract
         .binding_snapshot(ExactSurfaceIdentity {
@@ -794,9 +879,18 @@ fn validate_price_shape(
 fn validate_component_dimensions(
     version: &PriceBookVersionView,
     allowed_dimensions: &BTreeSet<String>,
+    workflow: Option<&str>,
     blocking_reasons: &mut Vec<String>,
     warnings: &mut Vec<String>,
 ) {
+    // A workflow is a disjoint price group, not an override of the legacy group.
+    let is_group_fallback = |dimensions: &serde_json::Map<String, Value>| match workflow {
+        Some(workflow) => {
+            dimensions.len() == 1
+                && dimensions.get("workflow").and_then(Value::as_str) == Some(workflow)
+        }
+        None => dimensions.is_empty(),
+    };
     let mut selectors = BTreeSet::new();
     let mut bases = BTreeSet::new();
     for component in &version.components {
@@ -843,7 +937,7 @@ fn validate_component_dimensions(
                     && component
                         .dimensions
                         .as_object()
-                        .is_some_and(serde_json::Map::is_empty)
+                        .is_some_and(is_group_fallback)
             });
             if !covered {
                 blocking_reasons.push("request_dimension_fallback_missing".to_string());
@@ -854,7 +948,7 @@ fn validate_component_dimensions(
         component
             .dimensions
             .as_object()
-            .is_some_and(|value| !value.is_empty())
+            .is_some_and(|value| !is_group_fallback(value))
     }) {
         warnings.push("dimension_overrides_present".to_string());
     }
@@ -1081,6 +1175,7 @@ mod tests {
         validate_component_dimensions(
             &version,
             &BTreeSet::from(["quality".to_string(), "size".to_string()]),
+            None,
             &mut blocking_reasons,
             &mut warnings,
         );
@@ -1101,12 +1196,58 @@ mod tests {
         validate_component_dimensions(
             &version,
             &BTreeSet::from(["quality".to_string(), "size".to_string()]),
+            None,
             &mut blocking_reasons,
             &mut warnings,
         );
 
         assert!(blocking_reasons.is_empty());
         assert!(warnings.contains(&"dimension_overrides_present".to_string()));
+    }
+
+    #[test]
+    fn workflow_fallbacks_are_required_within_each_exact_group() {
+        let dimensions = BTreeSet::from(["workflow".to_string(), "resolution".to_string()]);
+        let exact = version(vec![component(
+            "any",
+            json!({"workflow": "multiframe2video"}),
+        )]);
+        let mut reasons = Vec::new();
+        let mut warnings = Vec::new();
+        validate_component_dimensions(
+            &exact,
+            &dimensions,
+            Some("multiframe2video"),
+            &mut reasons,
+            &mut warnings,
+        );
+        assert!(reasons.is_empty());
+        assert!(warnings.is_empty());
+
+        let mixed = version(vec![
+            component("any", json!({})),
+            component(
+                "any",
+                json!({"workflow":"multiframe2video", "resolution":"720p"}),
+            ),
+        ]);
+        let groups = super::dreamina_price_groups(&mixed).unwrap();
+        for (workflow, group) in groups {
+            reasons.clear();
+            warnings.clear();
+            validate_component_dimensions(
+                &group,
+                &dimensions,
+                workflow.as_deref(),
+                &mut reasons,
+                &mut warnings,
+            );
+            assert_eq!(
+                reasons.contains(&"request_dimension_fallback_missing".to_string()),
+                workflow.is_some(),
+                "legacy fallback must not cover a partial workflow group",
+            );
+        }
     }
 
     #[test]
@@ -1149,5 +1290,59 @@ mod tests {
             blocking_reasons,
             ["paid_price_has_no_positive_success_rate".to_string()]
         );
+    }
+    #[test]
+    fn dreamina_workflow_bindings_preserve_the_legacy_snapshot() {
+        let surface = CoverageSurfaceRow {
+            provider_id: "dreamina-cli".into(),
+            provider_model_id: "5.0".into(),
+            provider_model_display_name: "5.0".into(),
+            media_kind: "image".into(),
+            operation: "images.generations".into(),
+            command_schema: Some("dreamina-cli.submit.v1".into()),
+            api_profile: Some("dreamina-cli-images-v1".into()),
+            public_model_id: Some("5.0".into()),
+            route_id: Some(Uuid::new_v4()),
+            routable_account_count: 1,
+        };
+        let legacy = version(vec![component("any", json!({}))]);
+        let (_, original) = contract_snapshot_for_surface(&legacy, &surface).unwrap();
+        let mixed = version(vec![
+            component("any", json!({})),
+            component("any", json!({"workflow":"image2image"})),
+        ]);
+        let groups = super::contract_groups_for_surface(&mixed, &surface).unwrap();
+        assert_eq!(groups.len(), 2);
+        let (_, legacy_contract, preserved) = &groups[0];
+        assert_eq!(preserved.contract_hash, original.contract_hash);
+        assert_eq!(preserved.contract_key, original.contract_key);
+        assert_eq!(preserved.contract_json, original.contract_json);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&preserved.contract_json.to_string())
+                .unwrap(),
+            original.contract_json
+        );
+        let (_, reference_contract, reference) = &groups[1];
+        assert_ne!(reference.contract_key, original.contract_key);
+        assert_ne!(reference.contract_hash, original.contract_hash);
+        assert!(
+            legacy_contract
+                .validate_component_selector(&json!({"workflow":"image2image"}))
+                .is_err()
+        );
+        assert!(
+            reference_contract
+                .validate_component_selector(&json!({}))
+                .is_err()
+        );
+        assert!(
+            reference_contract
+                .validate_component_selector(&json!({"workflow":"image_upscale"}))
+                .is_err()
+        );
+        for invalid in [json!("*"), json!("unknown_workflow"), json!(null)] {
+            let bad = version(vec![component("any", json!({"workflow": invalid}))]);
+            assert!(super::contract_groups_for_surface(&bad, &surface).is_err());
+        }
     }
 }

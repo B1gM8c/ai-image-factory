@@ -8,6 +8,7 @@ use gpt_image_2_gateway::{
     ProviderRuntimeSupervisorError, ProviderSubmitDaemon, ProviderSubmitDaemonConfig,
     ProviderSubmitDaemonError, ProviderSubmitService, ProviderSubmitServiceConfig,
     ProviderSubmitServiceError, ProviderTaskStoreError,
+    artifacts::{FilesystemArtifactBlobStore, artifact_root_from_env},
     database::{
         DEFAULT_MAX_CONNECTIONS, connect_pool_with_schema, database_schema_from_env,
         database_url_from_env, verify_migrations,
@@ -209,6 +210,8 @@ async fn main() -> Result<(), ImageGatewayError> {
         &config.account_home,
     )
     .map_err(|error| ImageGatewayError::config(error.to_string()))?;
+    let artifact_root = artifact_root_from_env()?;
+    let input_blobs = Arc::new(FilesystemArtifactBlobStore::new(&artifact_root)?);
     let workspace_root = WorkingDirectory::new_private(&config.workspace_root)
         .map_err(|error| ImageGatewayError::config(error.to_string()))?;
     let _journal_root = WorkingDirectory::new_private(&config.journal_root)
@@ -217,6 +220,7 @@ async fn main() -> Result<(), ImageGatewayError> {
         &config.account_home,
         &config.workspace_root,
         &config.journal_root,
+        &artifact_root,
     ])?;
     let codec = DreaminaCliSubmitCodecV1::from_runtime_profile(
         &profile,
@@ -236,7 +240,8 @@ async fn main() -> Result<(), ImageGatewayError> {
         &config.runner_sha256,
         workspace_root,
     )
-    .map_err(|error| ImageGatewayError::config(error.to_string()))?;
+    .map_err(|error| ImageGatewayError::config(error.to_string()))?
+    .with_input_blobs(input_blobs);
     let executor_store = PostgresExecutorSubmissionStore::new(pool);
     let provider_scope = profile.claim_scope();
     let service = Arc::new(

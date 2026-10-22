@@ -186,6 +186,8 @@ macro_rules! attach_request {
 #[cfg(unix)]
 #[path = "postgres_provider_tasks/gated_submit.rs"]
 mod gated_submit;
+#[path = "postgres_provider_tasks/remote_inputs.rs"]
+mod remote_inputs;
 
 #[tokio::test]
 async fn active_runtime_profile_freezes_scope_and_capacity() -> TestResult {
@@ -980,7 +982,8 @@ async fn provider_submitd_drains_fake_dreamina_submit_and_restarts_without_resub
         let account_home = root.path().join("account-home");
         let workspace = root.path().join("workspace");
         let journal = root.path().join("journal");
-        for path in [&account_home, &workspace, &journal] {
+        let artifact_root = root.path().join("artifacts");
+        for path in [&account_home, &workspace, &journal, &artifact_root] {
             fs::create_dir(path).map_err(debug_error)?;
             fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(debug_error)?;
         }
@@ -1005,6 +1008,7 @@ printf '{"submit_id":"dreamina-submitd-operation-1","gen_status":"querying"}'
                 .env_clear()
                 .env("DATABASE_URL", &database_url)
                 .env("GATEWAY_DATABASE_SCHEMA", &database.schema)
+                .env("GATEWAY_ARTIFACT_ROOT", &artifact_root)
                 .env("PROVIDER_SUBMITTER_ACTIVATION", "dreamina-image-submit-v1")
                 .env("PROVIDER_SUBMITTER_PROFILE_KEY", DREAMINA_PROFILE_KEY)
                 .env(

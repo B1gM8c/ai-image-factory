@@ -8,7 +8,7 @@ use image_provider_sdk::{EffectCertainty, PendingOperation, ProviderFailure, Sin
 use sha2::{Digest, Sha256};
 
 use crate::{
-    executor::ExecutorSubmissionLease,
+    executor::{ExecutorInputObject, ExecutorSubmissionLease},
     provider_tasks::{
         ProviderExecutionContext, ProviderRemoteTask, ProviderSubmitAcquire, ProviderSubmitDriver,
         ProviderSubmitDriverCall, ProviderSubmitDriverRecovery, ProviderSubmitFailureKind,
@@ -28,6 +28,7 @@ const MAX_POLL_AFTER_MS: u64 = 24 * 60 * 60 * 1_000;
 
 pub struct ProviderSubmitWork<D: ProviderSubmitDriver> {
     executor: ExecutorSubmissionLease,
+    inputs: Arc<[ExecutorInputObject]>,
     command: Arc<SingleOutputCommand<D::Payload>>,
 }
 
@@ -49,8 +50,14 @@ impl<D: ProviderSubmitDriver> ProviderSubmitWork<D> {
         }
         Ok(Self {
             executor: executor.clone(),
+            inputs: Arc::from([]),
             command: Arc::new(command),
         })
+    }
+
+    pub fn with_inputs(mut self, inputs: Vec<ExecutorInputObject>) -> Self {
+        self.inputs = Arc::from(inputs);
+        self
     }
 
     fn reservation(&self, provider_timeout_ms: i64) -> RemoteTaskSubmitReservation {
@@ -67,6 +74,7 @@ impl<D: ProviderSubmitDriver> ProviderSubmitWork<D> {
 pub struct ProviderSubmitRecoveryWork<D: ProviderSubmitDriver> {
     intent: ProviderSubmitIntent,
     context: ProviderExecutionContext,
+    inputs: Arc<[ExecutorInputObject]>,
     remaining_budget_ms: u64,
     recovery_fence: ProviderSubmitRecoveryFence,
     command: Arc<SingleOutputCommand<D::Payload>>,
@@ -95,6 +103,7 @@ impl<D: ProviderSubmitDriver> ProviderSubmitRecoveryWork<D> {
         Ok(Self {
             intent: intent.clone(),
             context: context.clone(),
+            inputs: Arc::clone(&lease.inputs),
             remaining_budget_ms: lease.remaining_budget_ms(),
             recovery_fence: ProviderSubmitRecoveryFence {
                 recovery_owner: lease.recovery_owner.clone(),
@@ -161,6 +170,7 @@ where
                     context,
                     authority.remaining_budget_ms(),
                     work.command,
+                    work.inputs,
                     None,
                 )
                 .await
@@ -182,6 +192,7 @@ where
                     authority.context(),
                     authority.remaining_budget_ms(),
                     work.command,
+                    work.inputs,
                     None,
                 )
                 .await
@@ -220,6 +231,7 @@ where
                     context,
                     work.remaining_budget_ms,
                     work.command,
+                    work.inputs,
                     Some(recovery_fence),
                 )
                 .await
@@ -255,6 +267,7 @@ where
         context: &ProviderExecutionContext,
         database_budget_ms: u64,
         command: Arc<SingleOutputCommand<D::Payload>>,
+        inputs: Arc<[ExecutorInputObject]>,
         recovery_fence: Option<ProviderSubmitRecoveryFence>,
     ) -> Result<ProviderSubmitOutcome, ProviderSubmitOrchestratorError> {
         if database_budget_ms == 0 {
@@ -330,7 +343,8 @@ where
             Arc::clone(&journal_root),
             launch.launch_nonce(),
             prepare_budget_ms,
-        );
+        )
+        .with_inputs(inputs);
         let prepared = match self.driver.prepare(&call).await {
             Ok(prepared) => prepared,
             Err(failure) => {

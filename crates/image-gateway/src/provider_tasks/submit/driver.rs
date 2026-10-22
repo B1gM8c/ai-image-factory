@@ -7,7 +7,10 @@ use image_provider_sdk::{
 };
 use uuid::Uuid;
 
-use crate::provider_tasks::{ProviderExecutionContext, ProviderSubmitIntent};
+use crate::{
+    executor::ExecutorInputObject,
+    provider_tasks::{ProviderExecutionContext, ProviderSubmitIntent},
+};
 
 pub trait ProviderSubmitDriver: Send + Sync + 'static {
     type Payload: CanonicalCommandPayload + Send + Sync + 'static;
@@ -37,6 +40,7 @@ pub struct ProviderSubmitDriverCall<P> {
     intent: Arc<ProviderSubmitIntent>,
     context: Arc<ProviderExecutionContext>,
     command: Arc<SingleOutputCommand<P>>,
+    inputs: Arc<[ExecutorInputObject]>,
     journal_root: Arc<Path>,
     launch_nonce: Uuid,
     remaining_budget_ms: u64,
@@ -49,6 +53,7 @@ impl<P> Clone for ProviderSubmitDriverCall<P> {
             intent: Arc::clone(&self.intent),
             context: Arc::clone(&self.context),
             command: Arc::clone(&self.command),
+            inputs: Arc::clone(&self.inputs),
             journal_root: Arc::clone(&self.journal_root),
             launch_nonce: self.launch_nonce,
             remaining_budget_ms: self.remaining_budget_ms,
@@ -70,10 +75,20 @@ impl<P> ProviderSubmitDriverCall<P> {
             intent: Arc::new(intent.clone()),
             context: Arc::new(context.clone()),
             command,
+            inputs: Arc::from([]),
             journal_root,
             launch_nonce,
             remaining_budget_ms,
         }
+    }
+
+    pub(crate) fn with_inputs(mut self, inputs: Arc<[ExecutorInputObject]>) -> Self {
+        self.inputs = inputs;
+        self
+    }
+
+    pub fn inputs(&self) -> &[ExecutorInputObject] {
+        &self.inputs
     }
 
     pub fn intent(&self) -> &ProviderSubmitIntent {

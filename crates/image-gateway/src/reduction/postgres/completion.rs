@@ -1,3 +1,4 @@
+use image_provider_sdk::RemoteVideoResult;
 use serde_json::{Value, json};
 use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
@@ -29,6 +30,7 @@ use crate::{
     },
     pricing::{
         PriceResolutionError, PriceResolutionRequest,
+        admission::dreamina_pricing_facts,
         customer_usage::{
             CustomerUsageAuthority, CustomerUsageFactError, CustomerUsageOutput,
             persist_customer_usage_facts,
@@ -46,6 +48,7 @@ const NOT_APPLICABLE: &str = "not_applicable";
 use super::super::{
     CanonicalExecutorOutcome, ExecutorParentTerminalState, ExecutorTerminalArtifact,
     ExecutorTerminalCompletion, ExecutorTerminalError, ExecutorTerminalLease,
+    ExecutorTerminalRemoteVideo,
 };
 
 #[derive(sqlx::FromRow)]
@@ -57,6 +60,7 @@ struct LockedCompletionRow {
     completion_owner: Option<String>,
     provider_receipt_id: Option<Uuid>,
     customer_artifact_id: Option<Uuid>,
+    completed_remote_result_id: Option<Uuid>,
     quota_reservation_id: Option<Uuid>,
     submission_id: Uuid,
     executor_execution_id: Uuid,
@@ -74,6 +78,10 @@ struct LockedCompletionRow {
     resolved_state: String,
     error_code: Option<String>,
     manifest_id: Option<Uuid>,
+    remote_result_id: Option<Uuid>,
+    remote_video_url: Option<String>,
+    remote_expires_at_ms: Option<i64>,
+    remote_evidence_sha256_hex: Option<String>,
     authority_id: Option<Uuid>,
     storage_backend: Option<String>,
     storage_namespace: Option<String>,
@@ -374,7 +382,7 @@ async fn lock_completion(
                reduction.lease_epoch, reduction.lease_expires_at_ms,
                reduction.completion_owner,
                reduction.provider_receipt_id, reduction.customer_artifact_id,
-               reduction.quota_reservation_id,
+               reduction.quota_reservation_id, reduction.remote_result_id AS completed_remote_result_id,
                reduction.submission_id, reduction.executor_execution_id,
                reduction.resolution_decision_id,
                submission.output_id, output.output_index, submission.job_id,
@@ -385,6 +393,9 @@ async fn lock_completion(
                submission.created_by_lease_epoch AS attempt_lease_epoch,
                decision.resolved_state, decision.error_code,
                manifest.manifest_id, authority.authority_id,
+                   remote.remote_result_id, remote.video_url AS remote_video_url,
+                   remote.expires_at_ms AS remote_expires_at_ms,
+                   remote.evidence_sha256_hex AS remote_evidence_sha256_hex,
                authority.storage_backend, authority.storage_namespace,
                authority.object_key, authority.sha256_hex,
                authority.byte_size, authority.media_type,
@@ -427,6 +438,10 @@ async fn lock_completion(
           ON manifest.manifest_id = decision.result_manifest_id
          AND manifest.executor_execution_id = reduction.executor_execution_id
          AND manifest.submission_id = reduction.submission_id
+        LEFT JOIN provider_remote_video_results remote
+          ON remote.remote_result_id = decision.remote_result_id
+         AND remote.executor_execution_id = reduction.executor_execution_id
+         AND remote.submission_id = reduction.submission_id
         LEFT JOIN executor_artifact_authorities authority
           ON authority.authority_id = manifest.artifact_authority_id
          AND authority.executor_execution_id = reduction.executor_execution_id
@@ -450,6 +465,31 @@ fn canonical_outcome(
     row: &LockedCompletionRow,
 ) -> Result<CanonicalExecutorOutcome, ExecutorTerminalError> {
     match row.resolved_state.as_str() {
+        "succeeded" if row.remote_result_id.is_some() => {
+            if row.remote_result_id != Some(row.executor_execution_id)
+                || row.manifest_id.is_some()
+                || row.authority_id.is_some()
+                || row.error_code.is_some()
+            {
+                return Err(ExecutorTerminalError::Conflict);
+            }
+            let result = RemoteVideoResult::new(
+                row.remote_video_url
+                    .clone()
+                    .ok_or(ExecutorTerminalError::Conflict)?,
+                row.remote_expires_at_ms,
+            )
+            .map_err(|_| ExecutorTerminalError::Conflict)?;
+            let remote = ExecutorTerminalRemoteVideo {
+                remote_result_id: row.executor_execution_id,
+                result,
+                evidence_sha256_hex: row
+                    .remote_evidence_sha256_hex
+                    .clone()
+                    .ok_or(ExecutorTerminalError::Conflict)?,
+            };
+            Ok(CanonicalExecutorOutcome::SucceededRemoteVideo(remote))
+        }
         "succeeded" => {
             if row.error_code.is_some()
                 || row.manifest_id != Some(row.submission_id)
@@ -486,7 +526,10 @@ fn canonical_outcome(
             ))
         }
         state @ ("failed" | "uncertain" | "canceled") => {
-            if row.manifest_id.is_some() || row.authority_id.is_some() {
+            if row.manifest_id.is_some()
+                || row.authority_id.is_some()
+                || row.remote_result_id.is_some()
+            {
                 return Err(ExecutorTerminalError::Conflict);
             }
             let error_code = row
@@ -509,6 +552,13 @@ fn validate_operation_artifact(
     operation: &str,
     outcome: &CanonicalExecutorOutcome,
 ) -> Result<(), ExecutorTerminalError> {
+    if matches!(outcome, CanonicalExecutorOutcome::SucceededRemoteVideo(_)) {
+        return if operation == VIDEO_GENERATION_OPERATION {
+            Ok(())
+        } else {
+            Err(ExecutorTerminalError::Conflict)
+        };
+    }
     let CanonicalExecutorOutcome::Succeeded(artifact) = outcome else {
         return Ok(());
     };
@@ -566,6 +616,7 @@ fn validate_live_completion_lease(
         || row.lease_expires_at_ms.is_none_or(|expires| expires <= now)
         || row.provider_receipt_id.is_some()
         || row.customer_artifact_id.is_some()
+        || row.completed_remote_result_id.is_some()
         || row.quota_reservation_id.is_some()
     {
         Err(ExecutorTerminalError::StaleLease)
@@ -704,6 +755,9 @@ fn canonical_receipt(
     provider_cost_evidence: Option<&ProviderReportedCostEvidenceV1>,
 ) -> Result<EconomicReceipt, ExecutorTerminalError> {
     let (economic_outcome, error_code, artifact) = match outcome {
+        CanonicalExecutorOutcome::SucceededRemoteVideo(_) => {
+            (EconomicReceiptOutcome::Succeeded, None, None)
+        }
         CanonicalExecutorOutcome::Succeeded(authority) => (
             EconomicReceiptOutcome::Succeeded,
             None,
@@ -742,6 +796,15 @@ fn canonical_receipt(
     if let Some(artifact) = artifact {
         object.insert("artifact".to_string(), artifact);
     }
+    if let CanonicalExecutorOutcome::SucceededRemoteVideo(remote) = outcome {
+        object.insert(
+            "remote_video".to_string(),
+            json!({
+                "remote_result_id": remote.remote_result_id,
+                "evidence_sha256_hex": remote.evidence_sha256_hex,
+            }),
+        );
+    }
     if let Some(provider_cost) = provider_cost_evidence {
         object.insert(
             "provider_reported_cost".to_string(),
@@ -763,7 +826,8 @@ fn canonical_receipt(
 
 fn resolved_state(outcome: &CanonicalExecutorOutcome) -> &'static str {
     match outcome {
-        CanonicalExecutorOutcome::Succeeded(_) => "succeeded",
+        CanonicalExecutorOutcome::Succeeded(_)
+        | CanonicalExecutorOutcome::SucceededRemoteVideo(_) => "succeeded",
         CanonicalExecutorOutcome::Failed { .. } => "failed",
         CanonicalExecutorOutcome::Uncertain { .. } => "uncertain",
         CanonicalExecutorOutcome::Canceled { .. } => "canceled",
@@ -778,9 +842,11 @@ async fn terminalize_v4_output(
     now: i64,
 ) -> Result<(), ExecutorTerminalError> {
     let (output_state, error_code) = match (receipt_outcome, outcome) {
-        (EconomicReceiptOutcome::Succeeded, CanonicalExecutorOutcome::Succeeded(_)) => {
-            ("succeeded", None)
-        }
+        (
+            EconomicReceiptOutcome::Succeeded,
+            CanonicalExecutorOutcome::Succeeded(_)
+            | CanonicalExecutorOutcome::SucceededRemoteVideo(_),
+        ) => ("succeeded", None),
         (EconomicReceiptOutcome::Failed, CanonicalExecutorOutcome::Failed { error_code })
         | (EconomicReceiptOutcome::NoEffect, CanonicalExecutorOutcome::Failed { error_code })
         | (EconomicReceiptOutcome::NoEffect, CanonicalExecutorOutcome::Canceled { error_code }) => {
@@ -820,7 +886,8 @@ async fn apply_quota_slice(
     now: i64,
 ) -> Result<QuotaSliceRow, ExecutorTerminalError> {
     let (commit_slice, release_slice, metering_outcome) = match outcome {
-        CanonicalExecutorOutcome::Succeeded(_) => (1, 0, "succeeded"),
+        CanonicalExecutorOutcome::Succeeded(_)
+        | CanonicalExecutorOutcome::SucceededRemoteVideo(_) => (1, 0, "succeeded"),
         CanonicalExecutorOutcome::Failed { error_code } => (0, 1, error_code.as_str()),
         CanonicalExecutorOutcome::Canceled { error_code } => (0, 1, error_code.as_str()),
         CanonicalExecutorOutcome::Uncertain { error_code } => (0, 0, error_code.as_str()),
@@ -941,7 +1008,8 @@ async fn persist_provider_usage_fact(
     now: i64,
 ) -> Result<(), ExecutorTerminalError> {
     let terminal_outcome = match outcome {
-        CanonicalExecutorOutcome::Succeeded(_) => "succeeded",
+        CanonicalExecutorOutcome::Succeeded(_)
+        | CanonicalExecutorOutcome::SucceededRemoteVideo(_) => "succeeded",
         CanonicalExecutorOutcome::Failed { error_code } if error_code == "provider_no_effect" => {
             "no_effect"
         }
@@ -1406,7 +1474,7 @@ async fn mark_completed(
         SET state = 'completed', lease_owner = NULL, lease_expires_at_ms = NULL,
             completed_at_ms = $5, updated_at_ms = $5,
             completion_owner = $6, provider_receipt_id = $7,
-            customer_artifact_id = $8, quota_reservation_id = $9
+            customer_artifact_id = $8, quota_reservation_id = $9, remote_result_id = $10
         WHERE submission_id = $1 AND resolution_decision_id = $2
           AND lease_owner = $3 AND lease_epoch = $4 AND state = 'leased'
           AND lease_expires_at_ms > $5
@@ -1421,6 +1489,7 @@ async fn mark_completed(
     .bind(receipt_id)
     .bind(artifact_id)
     .bind(reservation_id)
+    .bind(lease.outcome.remote_result_id())
     .execute(&mut **tx)
     .await
     .map_err(unavailable)?
@@ -1729,66 +1798,97 @@ async fn persist_dreamina_projection(
     now: i64,
 ) -> Result<(), ExecutorTerminalError> {
     let bytes = serde_json::to_vec(&command_json).map_err(|_| ExecutorTerminalError::Conflict)?;
-    match parse_submit_command(&bytes).map_err(|_| ExecutorTerminalError::Conflict)? {
-        DreaminaSubmitRequestV1::TextToImage(request) => {
-            if !matches!(quota.economics_contract_version, 2 | 4)
-                || quota.operation != GENERATION_OPERATION
-                || quota.output_count != i32::from(request.generate_num())
-                || quota.billing_metric != "output"
-            {
-                return Err(ExecutorTerminalError::Conflict);
-            }
-            let size = match (request.ratio(), request.width(), request.height()) {
-                (Some(ratio), None, None) => {
-                    format!("{}:{}", request.resolution().as_str(), ratio.as_str())
-                }
-                (None, Some(width), Some(height)) => format!("{width}x{height}"),
-                _ => return Err(ExecutorTerminalError::Conflict),
-            };
-            insert_response_projection(
-                tx,
-                lease.job_id,
-                api_profile,
-                GENERATION_OPERATION,
-                GENERATION_RESPONSE_SCHEMA,
-                "auto",
-                "auto",
-                &size,
-                "opaque",
-                quota,
-                artifact_count,
-                now,
-            )
-            .await
-        }
-        DreaminaSubmitRequestV1::TextToVideo(request) => {
-            if !matches!(quota.economics_contract_version, 3 | 4)
-                || quota.operation != VIDEO_GENERATION_OPERATION
-                || quota.output_count != 1
-                || quota.output_billable_units != quota.billable_units
-                || quota.billing_metric != "video_second"
-                || quota.billing_unit != "second"
-                || i32::from(request.duration_seconds()) != quota.billable_units
-            {
-                return Err(ExecutorTerminalError::Conflict);
-            }
-            insert_response_projection(
-                tx,
-                lease.job_id,
-                api_profile,
-                VIDEO_GENERATION_OPERATION,
-                "dreamina-cli.videos.response.v1",
-                "mp4",
-                NOT_APPLICABLE,
-                request.resolution().as_str(),
-                NOT_APPLICABLE,
-                quota,
-                artifact_count,
-                now,
-            )
-            .await
-        }
+    let request = parse_submit_command(&bytes).map_err(|_| ExecutorTerminalError::Conflict)?;
+    let facts = dreamina_pricing_facts(&request, api_profile)
+        .map_err(|_| ExecutorTerminalError::Conflict)?;
+    let output_count =
+        i32::try_from(facts.output_count).map_err(|_| ExecutorTerminalError::Conflict)?;
+    let output_units =
+        i32::try_from(facts.output_billable_units).map_err(|_| ExecutorTerminalError::Conflict)?;
+    if quota.output_count != output_count
+        || quota.output_billable_units != output_units
+        || output_count.checked_mul(output_units) != Some(quota.billable_units)
+    {
+        return Err(ExecutorTerminalError::Conflict);
     }
+    let legacy_contract = match request {
+        DreaminaSubmitRequestV1::TextToImage(_) => 2,
+        DreaminaSubmitRequestV1::TextToVideo(_) => 3,
+        _ => 4,
+    };
+    if quota.economics_contract_version != 4 && quota.economics_contract_version != legacy_contract
+    {
+        return Err(ExecutorTerminalError::Conflict);
+    }
+    let (operation, response_schema, output_format, quality, background, size) =
+        match facts.media_kind {
+            "image"
+                if quota.operation == GENERATION_OPERATION
+                    && quota.billing_metric == "output"
+                    && quota.billing_unit == "output" =>
+            {
+                let resolution = facts
+                    .dimensions
+                    .get("resolution_type")
+                    .ok_or(ExecutorTerminalError::Conflict)?;
+                let size = if let Some(ratio) = facts.dimensions.get("ratio") {
+                    format!("{resolution}:{ratio}")
+                } else if let (Some(width), Some(height)) = (
+                    facts.dimensions.get("width"),
+                    facts.dimensions.get("height"),
+                ) {
+                    format!("{width}x{height}")
+                } else if matches!(request, DreaminaSubmitRequestV1::ImageUpscale(_)) {
+                    resolution.clone()
+                } else {
+                    return Err(ExecutorTerminalError::Conflict);
+                };
+                (
+                    GENERATION_OPERATION,
+                    GENERATION_RESPONSE_SCHEMA,
+                    "auto",
+                    "auto",
+                    "opaque",
+                    size,
+                )
+            }
+            "video"
+                if quota.operation == VIDEO_GENERATION_OPERATION
+                    && quota.output_count == 1
+                    && quota.billing_metric == "video_second"
+                    && quota.billing_unit == "second" =>
+            {
+                let size = facts
+                    .dimensions
+                    .get("resolution")
+                    .ok_or(ExecutorTerminalError::Conflict)?
+                    .clone();
+                (
+                    VIDEO_GENERATION_OPERATION,
+                    "dreamina-cli.videos.response.v1",
+                    "mp4",
+                    NOT_APPLICABLE,
+                    NOT_APPLICABLE,
+                    size,
+                )
+            }
+            _ => return Err(ExecutorTerminalError::Conflict),
+        };
+    insert_response_projection(
+        tx,
+        lease.job_id,
+        api_profile,
+        operation,
+        response_schema,
+        output_format,
+        quality,
+        &size,
+        background,
+        quota,
+        artifact_count,
+        now,
+    )
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1806,15 +1906,30 @@ async fn insert_response_projection(
     artifact_count: i32,
     now: i64,
 ) -> Result<(), ExecutorTerminalError> {
+    let remote_result_count: i64 = if operation == VIDEO_GENERATION_OPERATION
+        && response_schema == "dreamina-cli.videos.response.v1"
+    {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM executor_terminal_reductions r JOIN provider_submissions s USING (submission_id, executor_execution_id) WHERE s.job_id = $1 AND r.state = 'completed' AND r.remote_result_id IS NOT NULL",
+        ).bind(job_id).fetch_one(&mut **tx).await.map_err(unavailable)?
+    } else {
+        0
+    };
+    let remote_result_count =
+        i32::try_from(remote_result_count).map_err(|_| ExecutorTerminalError::Conflict)?;
+    let artifact_count = artifact_count
+        .checked_sub(remote_result_count)
+        .filter(|value| *value >= 0)
+        .ok_or(ExecutorTerminalError::Conflict)?;
     sqlx::query(
         r#"
         INSERT INTO job_response_projections
           (job_id, api_profile, operation, response_schema, created_at_seconds,
            output_format, quality, size, background, stream,
            limit_5h, remaining_5h, limit_7d, remaining_7d,
-           artifact_count, created_at_ms)
+           artifact_count, created_at_ms, remote_result_count)
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, FALSE,
-                $10, $11, $12, $13, $14, $15)
+                $10, $11, $12, $13, $14, $15, $16)
         "#,
     )
     .bind(job_id)
@@ -1832,6 +1947,7 @@ async fn insert_response_projection(
     .bind(quota.remaining_7d)
     .bind(artifact_count)
     .bind(now)
+    .bind(remote_result_count)
     .execute(&mut **tx)
     .await
     .map_err(unavailable)?;
@@ -2207,6 +2323,7 @@ async fn replay_completion(
     }
     if row.quota_reservation_id != Some(row.reservation_id)
         || row.customer_artifact_id != artifact.map(|value| value.identity.artifact_id)
+        || row.completed_remote_result_id != lease.outcome.remote_result_id()
     {
         return Err(ExecutorTerminalError::Conflict);
     }

@@ -12,10 +12,12 @@ use gpt_image_2_gateway::{
     reduction::{
         CanonicalExecutorOutcome, CustomerArtifactPublishError, ExecutorParentTerminalState,
         ExecutorTerminalArtifact, ExecutorTerminalBlockReason, ExecutorTerminalCompletion,
-        ExecutorTerminalError, ExecutorTerminalLease, ExecutorTerminalStore, ReducerDaemon,
-        ReducerDaemonError, ReducerDaemonRun, TerminalArtifactPublisher,
+        ExecutorTerminalError, ExecutorTerminalLease, ExecutorTerminalRemoteVideo,
+        ExecutorTerminalStore, ReducerDaemon, ReducerDaemonError, ReducerDaemonRun,
+        TerminalArtifactPublisher,
     },
 };
+use image_provider_sdk::RemoteVideoResult;
 use tokio::sync::{Semaphore, oneshot};
 use uuid::Uuid;
 
@@ -270,6 +272,29 @@ async fn success_publishes_customer_artifact_before_completion() {
     assert_eq!(store.events(), vec!["claim", "publish", "complete"]);
     assert_eq!(publisher.call_count(), 1);
     assert_eq!(store.snapshot().completions, vec![Some(artifact)]);
+}
+
+#[tokio::test]
+async fn remote_video_success_completes_without_publishing_an_artifact() {
+    let lease = terminal_lease(CanonicalExecutorOutcome::SucceededRemoteVideo(
+        ExecutorTerminalRemoteVideo {
+            remote_result_id: Uuid::from_u128(2),
+            result: RemoteVideoResult::new(
+                "https://media.example/video.mp4?signature=opaque".to_owned(),
+                None,
+            )
+            .expect("remote video URL"),
+            evidence_sha256_hex: "a".repeat(64),
+        },
+    ));
+    let store = FakeStore::new(lease.clone());
+    let publisher = FakePublisher::immediate(&store, customer_artifact(&lease));
+    let daemon = daemon(store.clone(), publisher.clone());
+
+    assert_eq!(daemon.run_once().await, Ok(ReducerDaemonRun::Completed));
+    assert_eq!(store.events(), vec!["claim", "complete"]);
+    assert_eq!(publisher.call_count(), 0);
+    assert_eq!(store.snapshot().completions, vec![None]);
 }
 
 #[tokio::test]

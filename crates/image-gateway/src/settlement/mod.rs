@@ -65,6 +65,19 @@ pub trait ExecutionSettlementStore: Send + Sync + 'static {
         Ok(None)
     }
 
+    async fn project_video_status_with_metadata(
+        &self,
+        tenant_id: &str,
+        project_id: &str,
+        actor_user_id: Option<uuid::Uuid>,
+        job_id: uuid::Uuid,
+    ) -> Result<Option<(VideoResultStatus, VideoRequestMetadata)>, ImageGatewayError> {
+        Ok(self
+            .project_video_status(tenant_id, project_id, actor_user_id, job_id)
+            .await?
+            .map(|status| (status, VideoRequestMetadata::default())))
+    }
+
     async fn load_video_artifact(
         &self,
         _tenant_id: &str,
@@ -104,23 +117,36 @@ pub enum GenerationResultLookup {
 pub enum VideoResultStatus {
     Pending {
         model: String,
-        duration: u8,
+        duration_ms: u32,
         stage: VideoPendingStage,
     },
     Succeeded {
         model: String,
-        duration: u8,
+        duration_ms: u32,
         artifact_id: uuid::Uuid,
+    },
+    SucceededRemote {
+        model: String,
+        duration_ms: u32,
+        result: image_provider_sdk::RemoteVideoResult,
     },
     Failed {
         model: String,
-        duration: u8,
+        duration_ms: u32,
         error_code: Option<String>,
     },
     Uncertain {
         model: String,
-        duration: u8,
+        duration_ms: u32,
     },
+}
+
+/// Specifications frozen at admission, not measurements of the generated media.
+#[derive(Debug, Default, Eq, PartialEq)]
+pub struct VideoRequestMetadata {
+    pub provider_model: Option<String>,
+    pub resolution: Option<String>,
+    pub ratio: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

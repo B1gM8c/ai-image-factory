@@ -26,6 +26,13 @@ npm run build:admin
 Tests that need a real PostgreSQL database or provider account must remain
 explicitly opt-in and document their isolation requirements.
 
+Full CI runs automatically on pushes to `main`, including merged pull requests.
+Feature-branch pushes and pull-request updates do not start full CI. Group a
+cohesive set of changes into one pull request and use focused local checks while
+iterating. When a branch needs full validation before merging, run the `CI`
+workflow manually for that branch. Wait for the merged commit's CI to pass before
+starting production deployment; release candidate validation remains separate.
+
 ## Design Expectations
 
 - Keep public provider-shaped DTOs separate from provider-neutral domain

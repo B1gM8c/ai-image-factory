@@ -5,6 +5,7 @@ use gpt_image_2_gateway::{
     ImageGatewayError, OperationalCredentialRefresher, OperationalCredentialResolver,
     PostgresApiKeyStore, PostgresCredentialStore, PostgresProviderManagementService,
     PostgresUsageStore, UsageCharge, UsageLimits, UsageStore,
+    admission::{AdmissionClaim, AdmissionStore, ClaimAdmission, PostgresAdmissionStore},
     database::{
         connect_pool, connect_test_pool_with_search_path, run_migrations, verify_migrations,
     },
@@ -16,7 +17,19 @@ use uuid::Uuid;
 
 type TestResult<T = ()> = Result<T, String>;
 
-const REQUIRED_COLUMNS: [(&str, &str); 984] = [
+const REQUIRED_COLUMNS: [(&str, &str); 996] = [
+    ("provider_remote_video_results", "remote_result_id"),
+    ("provider_remote_video_results", "executor_execution_id"),
+    ("provider_remote_video_results", "submission_id"),
+    ("provider_remote_video_results", "video_url"),
+    ("provider_remote_video_results", "expires_at_ms"),
+    ("provider_remote_video_results", "evidence_sha256_hex"),
+    ("provider_remote_video_results", "observed_at_ms"),
+    ("provider_task_observations", "remote_result_id"),
+    ("executor_resolution_decisions", "remote_result_id"),
+    ("provider_submissions", "remote_result_id"),
+    ("executor_terminal_reductions", "remote_result_id"),
+    ("job_response_projections", "remote_result_count"),
     ("executor_local_cleanup", "executor_execution_id"),
     ("executor_local_cleanup", "submission_id"),
     ("executor_local_cleanup", "execution_profile_id"),
@@ -1376,7 +1389,7 @@ async fn concurrent_fresh_migrations_are_repeatable() -> TestResult {
 }
 
 #[tokio::test]
-async fn schema_128_upgrades_to_135_without_changing_existing_provider_rows() -> TestResult {
+async fn schema_128_upgrades_to_current_without_changing_existing_provider_rows() -> TestResult {
     let Some(test_schema) = TestSchema::new(2).await? else {
         return Ok(());
     };
@@ -1400,13 +1413,14 @@ async fn schema_128_upgrades_to_135_without_changing_existing_provider_rows() ->
             "SELECT COALESCE(jsonb_agg(to_jsonb(account) ORDER BY provider_account_id), '[]'::jsonb) FROM provider_accounts account",
         ).fetch_one(&test_schema.pool).await.map_err(|error| error.to_string())?;
         require(before.as_array().is_some_and(|rows| rows.len() == 1), "fixture must contain an existing account")?;
-        gateway_result(run_migrations(&test_schema.pool).await, "128-to-135 migration")?;
-        gateway_result(verify_migrations(&test_schema.pool).await, "135 verification")?;
+        gateway_result(run_migrations(&test_schema.pool).await, "128-to-current migration")?;
+        gateway_result(verify_migrations(&test_schema.pool).await, "current verification")?;
         let after: serde_json::Value = sqlx::query_scalar(
             "SELECT COALESCE(jsonb_agg(to_jsonb(account) ORDER BY provider_account_id), '[]'::jsonb) FROM provider_accounts account",
         ).fetch_one(&test_schema.pool).await.map_err(|error| error.to_string())?;
         require(before == after, "sidecar migrations changed existing provider accounts")?;
-        require(migration_versions(&test_schema.pool).await?.last() == Some(&135), "upgrade must end at 135")?;
+        require(migration_versions(&test_schema.pool).await? == expected_migration_versions(), "upgrade must apply every bundled migration")?;
+        require(migration_versions(&test_schema.pool).await?.last() == Some(&138), "upgrade must include exact millisecond pricing")?;
         let new_rows: i64 = sqlx::query_scalar(
             "SELECT (SELECT COUNT(*) FROM media_segment_assets) + (SELECT COUNT(*) FROM media_segment_results) + (SELECT COUNT(*) FROM media_segment_worker_heartbeats) + (SELECT COUNT(*) FROM provider_account_quota_refreshes)",
         ).fetch_one(&test_schema.pool).await.map_err(|error| error.to_string())?;
@@ -1415,6 +1429,143 @@ async fn schema_128_upgrades_to_135_without_changing_existing_provider_rows() ->
     }.await;
     test_schema.cleanup().await?;
     result
+}
+
+#[tokio::test]
+async fn millisecond_pricing_upgrade_preserves_seconds_and_rejects_mismatched_units() -> TestResult
+{
+    let Some(test_schema) = TestSchema::new(2).await? else {
+        return Ok(());
+    };
+    let result = async {
+        apply_migrations_through(&test_schema.pool, 137).await?;
+        let before: serde_json::Value = sqlx::query_scalar(
+            "SELECT jsonb_agg(to_jsonb(component) ORDER BY price_component_id) FROM price_components component",
+        ).fetch_one(&test_schema.pool).await.map_err(|error| error.to_string())?;
+        apply_migration_range(&test_schema.pool, 138, 138).await?;
+        let after: serde_json::Value = sqlx::query_scalar(
+            "SELECT jsonb_agg(to_jsonb(component) ORDER BY price_component_id) FROM price_components component",
+        ).fetch_one(&test_schema.pool).await.map_err(|error| error.to_string())?;
+        require(before == after, "millisecond migration changed historical price components")?;
+
+        for table in ["price_components", "provider_usage_facts", "customer_price_quote_lines"] {
+            let mut names = vec![
+                format!("{table}_metric_check"), format!("{table}_unit_check"),
+                format!("{table}_millisecond_unit_check"),
+            ];
+            if table != "customer_price_quote_lines" {
+                names.push(format!("{table}_check"));
+            }
+            let constraints: Vec<(String, String)> = sqlx::query_as(
+                "SELECT conname, pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid=$1::REGCLASS AND contype='c' AND conname = ANY($2) ORDER BY conname",
+            ).bind(table).bind(names).fetch_all(&test_schema.pool).await.map_err(|error| error.to_string())?;
+            let expected_count = if table == "customer_price_quote_lines" { 3 } else { 4 };
+            require(constraints.len() == expected_count, "missing metric/unit constraints")?;
+            // Exercise the actual migrated CHECK definitions without unrelated
+            // receipt/quote foreign keys obscuring the metric/unit boundary.
+            let probe = format!("{table}_metric_unit_probe");
+            let definitions = constraints.into_iter().map(|(name, definition)| {
+                format!("CONSTRAINT {name} {definition}")
+            }).collect::<Vec<_>>().join(", ");
+            sqlx::query(AssertSqlSafe(format!(
+                "CREATE TABLE {probe} (metric TEXT NOT NULL, unit TEXT NOT NULL, {definitions})",
+            ))).execute(&test_schema.pool).await.map_err(|error| error.to_string())?;
+            for (metric, unit, accepted) in [
+                ("video_requested_millisecond", "millisecond", true),
+                ("video_requested_second", "second", true),
+                ("image_output", "image", true),
+                ("video_requested_millisecond", "second", false),
+                ("video_requested_second", "millisecond", false),
+                ("image_output", "millisecond", false),
+            ] {
+                let inserted = sqlx::query(AssertSqlSafe(format!(
+                    "INSERT INTO {probe} (metric,unit) VALUES ($1,$2)",
+                ))).bind(metric).bind(unit).execute(&test_schema.pool).await;
+                require(inserted.is_ok() == accepted,
+                    &format!("{table} accepted/rejected the wrong metric/unit pair {metric}/{unit}"))?;
+            }
+        }
+        Ok(())
+    }.await;
+    test_schema.cleanup().await?;
+    result
+}
+
+#[tokio::test]
+async fn multimodal_input_upgrade_preserves_legacy_rows_and_enforces_storage_bounds() -> TestResult
+{
+    let Some(test_schema) = TestSchema::new(2).await? else {
+        return Ok(());
+    };
+    let result = async {
+        apply_migrations_through(&test_schema.pool, 135).await?;
+        let admission = PostgresAdmissionStore::new(test_schema.pool.clone());
+        let claim = admission.claim(ClaimAdmission {
+            owner_token: Uuid::new_v4(),
+            tenant_id: "proj_test".to_owned(),
+            project_id: "multimodal-migration".to_owned(),
+            api_profile: "openai-images-v1".to_owned(),
+            operation: "generation".to_owned(),
+            request_id: "multimodal-migration".to_owned(),
+            idempotency_key_digest: None,
+            request_hash: "a".repeat(64),
+            deadline_at_ms: i64::MAX,
+        }).await.map_err(|error| error.to_string())?;
+        let AdmissionClaim::Owner(ticket) = claim else {
+            return Err("migration fixture must own its admission".to_owned());
+        };
+        let mut charge = test_charge("multimodal-migration");
+        charge.admission_session_id = Some(ticket.session_id);
+        let reservation = PostgresUsageStore::new(test_schema.pool.clone()).reserve(charge)
+            .await.map_err(|error| format!("migration fixture reserve failed: {error:?}"))?;
+        sqlx::query("INSERT INTO job_input_manifests (job_id,admission_session_id,manifest_schema,manifest_hash,input_count,created_at_ms) VALUES ($1,$2,'legacy.inputs.v1',$3,1,1)")
+            .bind(reservation.job_id).bind(ticket.session_id).bind("a".repeat(64))
+            .execute(&test_schema.pool).await.map_err(|error| error.to_string())?;
+        insert_migration_input(&test_schema.pool, reservation.job_id, ticket.session_id, "image", 0, "image/png").await?;
+        let before: serde_json::Value = sqlx::query_scalar("SELECT to_jsonb(i) FROM job_input_objects i WHERE job_id=$1")
+            .bind(reservation.job_id).fetch_one(&test_schema.pool).await.map_err(|error| error.to_string())?;
+
+        apply_migration_range(&test_schema.pool, 137, 137).await?;
+        let after: serde_json::Value = sqlx::query_scalar("SELECT to_jsonb(i) FROM job_input_objects i WHERE job_id=$1")
+            .bind(reservation.job_id).fetch_one(&test_schema.pool).await.map_err(|error| error.to_string())?;
+        require(before == after, "multimodal migration changed an existing input row")?;
+        sqlx::query("UPDATE job_input_manifests SET input_count=50 WHERE job_id=$1")
+            .bind(reservation.job_id).execute(&test_schema.pool).await.map_err(|error| error.to_string())?;
+        insert_migration_input(&test_schema.pool, reservation.job_id, ticket.session_id, "video", 47, "video/mp4").await?;
+        insert_migration_input(&test_schema.pool, reservation.job_id, ticket.session_id, "audio", 48, "audio/mpeg").await?;
+        insert_migration_input(&test_schema.pool, reservation.job_id, ticket.session_id, "audio", 49, "audio/wav").await?;
+        require(sqlx::query("UPDATE job_input_manifests SET input_count=51 WHERE job_id=$1")
+            .bind(reservation.job_id).execute(&test_schema.pool).await.is_err(), "manifest accepted 51 inputs")?;
+        for (role, index, media_type) in [
+            ("image", 50, "image/png"),
+            ("video", 1, "image/png"),
+            ("audio", 1, "video/mp4"),
+            ("mask", 1, "image/png"),
+            ("mask", 0, "image/jpeg"),
+        ] {
+            require(insert_migration_input(&test_schema.pool, reservation.job_id, ticket.session_id, role, index, media_type).await.is_err(), "input storage accepted an invalid role, index or MIME")?;
+        }
+        let predicates: Vec<String> = sqlx::query_scalar("SELECT indexdef FROM pg_indexes WHERE schemaname=current_schema() AND indexname IN ('admission_input_cleanup_pending_idx','admission_input_cleanup_lease_idx')")
+            .fetch_all(&test_schema.pool).await.map_err(|error| error.to_string())?;
+        require(predicates.len() == 2 && predicates.iter().all(|definition| definition.contains("'generation'") && definition.contains("'edit'") && definition.contains("'video_generation'")), "input cleanup indexes must cover generation, edit and video")
+    }.await;
+    test_schema.cleanup().await?;
+    result
+}
+
+async fn insert_migration_input(
+    pool: &PgPool,
+    job_id: Uuid,
+    session_id: Uuid,
+    role: &str,
+    index: i16,
+    media_type: &str,
+) -> TestResult {
+    let input_id = Uuid::new_v4();
+    sqlx::query("INSERT INTO job_input_objects (input_id,job_id,admission_session_id,role,input_index,media_type,storage_backend,object_key,sha256_hex,byte_size,created_at_ms) VALUES ($1,$2,$3,$4,$5,$6,'memory',$7,$8,128,1)")
+        .bind(input_id).bind(job_id).bind(session_id).bind(role).bind(index).bind(media_type)
+        .bind(input_id.to_string()).bind("a".repeat(64)).execute(pool).await
+        .map(|_| ()).map_err(|error| error.to_string())
 }
 
 #[tokio::test]
@@ -3687,8 +3838,8 @@ async fn shared_pool_case(pool: &PgPool) -> TestResult {
 
 async fn assert_expected_schema(pool: &PgPool) -> TestResult {
     require(
-        migration_versions(pool).await? == (0_i64..=135_i64).collect::<Vec<_>>(),
-        "applied migration versions must be exactly 0 through 135",
+        migration_versions(pool).await? == expected_migration_versions(),
+        "applied migration versions must match every bundled migration",
     )?;
 
     let default_codex_prices: Vec<(String, i64, i64)> = sqlx::query_as(
@@ -4704,6 +4855,13 @@ async fn migration_versions(pool: &PgPool) -> TestResult<Vec<i64>> {
         .fetch_all(pool)
         .await
         .map_err(|error| format!("failed to query migration versions: {error}"))
+}
+
+fn expected_migration_versions() -> Vec<i64> {
+    sqlx::migrate!("./migrations")
+        .iter()
+        .map(|migration| migration.version)
+        .collect()
 }
 
 async fn apply_migrations_through(pool: &PgPool, last_version: i64) -> TestResult {

@@ -837,7 +837,7 @@ export function VideoWorkspace() {
                   ko: "생성된 동영상",
                 })}
                 src={{
-                  src: `/api/gateway${task.contentUrl}`,
+                  src: videoContentUrl(task.contentUrl),
                   type: "video/mp4",
                 }}
                 viewType="video"
@@ -887,7 +887,7 @@ export function VideoWorkspace() {
                 </div>
                 <div className="flex flex-wrap items-center gap-2">
                   <Button asChild variant="outline" size="sm">
-                    <a href={`/api/gateway${task.contentUrl}`} download>
+                    <a href={videoContentUrl(task.contentUrl)} download rel="noreferrer">
                       <Download aria-hidden="true" />
                       {t({ en: "Download", "zh-CN": "下载", ja: "ダウンロード", ko: "다운로드" })}
                     </a>
@@ -1676,6 +1676,10 @@ function choiceValue(
 function readTaskId(payload: unknown) {
   if (!isRecord(payload) || typeof payload.task_id !== "string") return null;
   return payload.task_id;
+}
+
+function videoContentUrl(url: string) {
+  return /^https:\/\//i.test(url) ? url : `/api/gateway${url}`;
 }
 
 function parseVideoTask(

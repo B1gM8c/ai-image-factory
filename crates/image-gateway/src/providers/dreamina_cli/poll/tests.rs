@@ -32,7 +32,7 @@ async fn pending_and_terminal_failure_require_an_empty_download_directory() {
     let mut sink = pending.sink([0_u8; 32]);
     let observation = pending
         .driver(1024 * 1024)
-        .poll_operation(&operation, &mut sink)
+        .poll_operation(&operation, false, &mut sink)
         .await
         .unwrap();
     assert_eq!(
@@ -52,7 +52,7 @@ async fn pending_and_terminal_failure_require_an_empty_download_directory() {
     let mut sink = failed.sink([0_u8; 32]);
     let observation = failed
         .driver(1024 * 1024)
-        .poll_operation(&operation, &mut sink)
+        .poll_operation(&operation, false, &mut sink)
         .await
         .unwrap();
     let PollObservation::Failed(failure) = observation else {
@@ -79,7 +79,7 @@ printf '{"submit_id":"%s","gen_status":"success"}' "$submit""#,
     let mut sink = fixture.sink(sha256);
     let observation = fixture
         .driver(1024 * 1024)
-        .poll_operation(&operation, &mut sink)
+        .poll_operation(&operation, false, &mut sink)
         .await
         .unwrap();
 
@@ -100,32 +100,84 @@ printf '{"submit_id":"%s","gen_status":"success"}' "$submit""#,
 }
 
 #[tokio::test]
-async fn success_streams_one_mp4_video_without_loading_it_as_an_image() {
+async fn video_success_returns_the_upstream_url_without_downloading_or_writing_a_blob() {
     let fixture = Fixture::new(
-        r#"/bin/cp "$HOME/source.mp4" "$download/result.mp4"
-printf '{"submit_id":"%s","gen_status":"success"}' "$submit""#,
+        r#"test -z "$download" || exit 21
+test "$PWD" = "$TMPDIR" || exit 22
+printf '%s' '{"submit_id":"task-1","gen_status":"success","result_json":{"images":[],"videos":[{"video_url":"https://media.example.test/clip%2Fone.mp4?token=a%2Bb&expires=123"}]}}'"#,
     );
-    let bytes = minimal_mp4();
-    fs::write(fixture.account_home.join("source.mp4"), &bytes).unwrap();
-    let sha256: [u8; 32] = Sha256::digest(&bytes).into();
     let operation = fixture.operation();
-    let mut sink = fixture.sink(sha256);
+    let mut sink = fixture.sink([0_u8; 32]);
 
     let observation = fixture
         .driver(1024 * 1024)
-        .poll_operation(&operation, &mut sink)
+        .poll_operation(&operation, true, &mut sink)
         .await
         .unwrap();
 
-    let PollObservation::Completed(completed) = observation else {
-        panic!("expected completed observation");
+    let PollObservation::CompletedRemoteVideo(completed) = observation else {
+        panic!("expected remote video observation");
     };
-    assert_eq!(completed.artifact().media_type(), "video/mp4");
-    assert_eq!(completed.artifact().byte_size(), bytes.len() as u64);
-    assert_eq!(completed.artifact().sha256(), &sha256);
-    assert_eq!(sink.bytes(), bytes);
-    assert_eq!(sink.finalize_count(), 1);
+    assert_eq!(
+        completed.result().video_url(),
+        "https://media.example.test/clip%2Fone.mp4?token=a%2Bb&expires=123"
+    );
+    assert_eq!(completed.result().expires_at_ms(), None);
+    assert!(sink.bytes().is_empty());
+    assert!(sink.chunk_sizes().is_empty());
+    assert_eq!(sink.finalize_count(), 0);
     fixture.assert_workspace_has_no_attempts();
+}
+
+#[tokio::test]
+async fn video_success_requires_exactly_one_valid_remote_url_and_never_retries() {
+    for result in [
+        "null",
+        r#"{"videos":[]}"#,
+        r#"{"videos":[{"video_url":"http://media.example.test/clip.mp4"}]}"#,
+        r#"{"videos":[{"video_url":"https://media.example.test/a.mp4"},{"video_url":"https://media.example.test/b.mp4"}]}"#,
+        r#"{"videos":[{"path":"/tmp/local.mp4"}]}"#,
+    ] {
+        let fixture = Fixture::new(&format!(
+            "test -z \"$download\" || exit 21\nprintf '%s' '{{\"submit_id\":\"task-1\",\"gen_status\":\"success\",\"result_json\":{result}}}'"
+        ));
+        let mut sink = fixture.sink([0_u8; 32]);
+        let failure = fixture
+            .driver(1024)
+            .poll_operation(&fixture.operation(), true, &mut sink)
+            .await
+            .unwrap_err();
+        assert_eq!(failure.code(), "dreamina_poll_video_url_invalid");
+        assert_eq!(failure.retry(), RetryDirective::Never);
+        assert!(sink.bytes().is_empty());
+        assert!(sink.chunk_sizes().is_empty());
+        assert_eq!(sink.finalize_count(), 0);
+        fixture.assert_workspace_has_no_attempts();
+    }
+}
+
+#[tokio::test]
+async fn video_pending_and_failed_queries_leave_the_artifact_sink_pristine() {
+    for status in ["querying", "fail"] {
+        let fixture = Fixture::new(&format!(
+            "test -z \"$download\" || exit 21\nprintf '%s' '{{\"submit_id\":\"task-1\",\"gen_status\":\"{status}\"}}'"
+        ));
+        let mut sink = fixture.sink([0_u8; 32]);
+        let observation = fixture
+            .driver(1024)
+            .poll_operation(&fixture.operation(), true, &mut sink)
+            .await
+            .unwrap();
+        if status == "querying" {
+            assert!(matches!(observation, PollObservation::Pending { .. }));
+        } else {
+            assert!(matches!(observation, PollObservation::Failed(_)));
+        }
+        assert!(sink.bytes().is_empty());
+        assert!(sink.chunk_sizes().is_empty());
+        assert_eq!(sink.finalize_count(), 0);
+        fixture.assert_workspace_has_no_attempts();
+    }
 }
 
 #[tokio::test]
@@ -135,7 +187,7 @@ async fn mismatched_receipts_and_multiple_outputs_fail_closed() {
     let mut sink = mismatch.sink([0_u8; 32]);
     let failure = mismatch
         .driver(1024)
-        .poll_operation(&operation, &mut sink)
+        .poll_operation(&operation, false, &mut sink)
         .await
         .unwrap_err();
     assert_eq!(failure.code(), "dreamina_poll_receipt_mismatch");
@@ -152,7 +204,7 @@ printf '{"submit_id":"%s","gen_status":"success"}' "$submit""#,
     let mut sink = multiple.sink([0_u8; 32]);
     let failure = multiple
         .driver(1024)
-        .poll_operation(&operation, &mut sink)
+        .poll_operation(&operation, false, &mut sink)
         .await
         .unwrap_err();
     assert_eq!(failure.code(), "dreamina_poll_artifact_invalid");
@@ -168,7 +220,7 @@ printf '{"submit_id":"%s","gen_status":"success"}' "$submit""#,
     let mut sink = invalid_media.sink([0_u8; 32]);
     let failure = invalid_media
         .driver(1024)
-        .poll_operation(&operation, &mut sink)
+        .poll_operation(&operation, false, &mut sink)
         .await
         .unwrap_err();
     assert_eq!(failure.code(), "dreamina_poll_media_invalid");
@@ -184,7 +236,7 @@ printf '{"submit_id":"%s","gen_status":"success"}' "$submit""#,
     let mut sink = oversized.sink([0_u8; 32]);
     let failure = oversized
         .driver(4)
-        .poll_operation(&operation, &mut sink)
+        .poll_operation(&operation, false, &mut sink)
         .await
         .unwrap_err();
     assert_eq!(failure.code(), "dreamina_poll_artifact_invalid");
@@ -204,7 +256,7 @@ printf '{"submit_id":"%s","gen_status":"success"}' "$submit""#,
     let mut sink = fixture.sink([9_u8; 32]);
     let failure = fixture
         .driver(1024 * 1024)
-        .poll_operation(&operation, &mut sink)
+        .poll_operation(&operation, false, &mut sink)
         .await
         .unwrap_err();
 
@@ -227,7 +279,7 @@ async fn canceling_a_poll_future_terminates_the_query_process_and_cleans_the_att
             DurableArtifactRef::new("test", "dreamina-cancel").unwrap(),
             [0_u8; 32],
         );
-        driver.poll_operation(&operation, &mut sink).await
+        driver.poll_operation(&operation, false, &mut sink).await
     });
     let pid_path = fixture.account_home.join("query.pid");
     let pid = tokio::time::timeout(Duration::from_secs(10), async {
@@ -273,7 +325,7 @@ printf '{"submit_id":"%s","gen_status":"querying"}' "$submit""#,
     let mut sink = fixture.sink([0_u8; 32]);
 
     let failure = driver
-        .poll_operation(&operation, &mut sink)
+        .poll_operation(&operation, false, &mut sink)
         .await
         .unwrap_err();
 
@@ -359,7 +411,7 @@ printf '{"submit_id":"%s","gen_status":"querying"}' "$submit""#,
     let mut sink = fixture.sink([0_u8; 32]);
 
     let failure = driver
-        .poll_operation(&operation, &mut sink)
+        .poll_operation(&operation, false, &mut sink)
         .await
         .unwrap_err();
 
@@ -417,7 +469,7 @@ fn media_detection_accepts_supported_image_and_video_signatures() {
 }
 
 #[test]
-fn poll_binding_accepts_only_explicitly_supported_image_models() {
+fn poll_binding_accepts_only_explicitly_supported_models_for_the_operation() {
     for model in [
         "dreamina-image-3.0",
         "dreamina-image-3.1",
@@ -434,7 +486,10 @@ fn poll_binding_accepts_only_explicitly_supported_image_models() {
     assert!(!supported_model("images.generations", "dreamina-image-5.1"));
     assert!(!supported_model("images.generations", "dreamina-image-"));
     assert!(!supported_model("images.generations", "seedance2.0"));
+    assert!(!supported_model("images.generations", "seedance2.5"));
     assert!(supported_model("videos.generations", "seedance2.0"));
+    assert!(supported_model("videos.generations", "seedance2.5"));
+    assert!(!supported_model("videos.generations", "seedance2.6"));
     assert!(!supported_model("videos.generations", "dreamina-image-5.0"));
 }
 
@@ -571,20 +626,6 @@ fn png_bytes(color: [u8; 4]) -> Vec<u8> {
     image
         .write_to(&mut Cursor::new(&mut bytes), ImageFormat::Png)
         .unwrap();
-    bytes
-}
-
-fn minimal_mp4() -> Vec<u8> {
-    let mut bytes = Vec::new();
-    for (box_type, payload) in [
-        (*b"ftyp", b"isom\0\0\0\0isom".as_slice()),
-        (*b"moov", b"m".as_slice()),
-        (*b"mdat", b"v".as_slice()),
-    ] {
-        bytes.extend_from_slice(&u32::try_from(payload.len() + 8).unwrap().to_be_bytes());
-        bytes.extend_from_slice(&box_type);
-        bytes.extend_from_slice(payload);
-    }
     bytes
 }
 

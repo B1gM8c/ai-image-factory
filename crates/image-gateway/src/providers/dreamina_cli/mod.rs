@@ -10,7 +10,8 @@ use image_provider_contracts::OperationDescriptor;
 use image_provider_dreamina_cli::{
     ADAPTER_REVISION, DREAMINA_IMAGE_GENERATION_OPERATION_V1, DREAMINA_SUBMIT_COMMAND_SCHEMA,
     DREAMINA_VIDEO_GENERATION_OPERATION_V1, DreaminaCliPolicyV1, DreaminaSubmitPayloadV1,
-    DreaminaSubmitRequestV1, PROVIDER_ID, ReceiptError, parse_receipt, parse_submit_command,
+    DreaminaSubmitRequestV1, PROVIDER_ID, ReceiptError, StagedInputKindV1, parse_receipt,
+    parse_submit_command,
 };
 use image_provider_sdk::{
     EffectCertainty, OutputSlot, PendingOperation, ProviderFailure, ProviderFailureClass,
@@ -19,9 +20,9 @@ use image_provider_sdk::{
 use uuid::Uuid;
 
 use crate::{
-    executor::{ExecutorLaunchContext, ExecutorSubmissionLease},
+    executor::{ExecutorInputObject, ExecutorLaunchContext, ExecutorSubmissionLease},
     provider_tasks::{
-        GatedCliCommand, GatedCliSubmitCodec, ProviderAccountHomeCapability,
+        GatedCliCommand, GatedCliInputFile, GatedCliSubmitCodec, ProviderAccountHomeCapability,
         ProviderAccountHomeCapabilityError, ProviderExecutionContext, ProviderRuntimeProfile,
         ProviderSubmitIntent, ProviderSubmitProjectionError, ProviderSubmitProjector,
         ProviderSubmitRecoveryLease,
@@ -41,7 +42,9 @@ pub use poll::{
     DreaminaCliPollDriverConfigError, DreaminaCliPollDriverV1, DreaminaCliPollProcessConfig,
 };
 
-const DEFAULT_POLL_AFTER_MS: u64 = 1_000;
+// Each query starts a CLI process; five seconds bounds status latency without
+// keeping an upstream query process busy throughout generation.
+const DEFAULT_POLL_AFTER_MS: u64 = 5_000;
 
 #[derive(Clone, Eq, PartialEq)]
 pub struct DreaminaCliRuntimeBindingV1 {
@@ -211,6 +214,16 @@ impl GatedCliSubmitCodec for DreaminaCliSubmitCodecV1 {
         PROVIDER_ID
     }
 
+    fn input_files(
+        &self,
+        command: &SingleOutputCommand<Self::Payload>,
+        inputs: &[ExecutorInputObject],
+    ) -> Result<Vec<GatedCliInputFile>, ProviderFailure> {
+        let request = parse_submit_command(command.canonical_payload())
+            .map_err(|_| no_effect_failure("dreamina_submit_command_invalid"))?;
+        dreamina_input_files(&request, inputs)
+    }
+
     fn command(
         &self,
         intent: &ProviderSubmitIntent,
@@ -267,7 +280,7 @@ where
             context.command_json(),
             context.command_hash(),
             lease.output_index,
-            1,
+            None,
         )
     }
 
@@ -287,8 +300,10 @@ where
             context.command_hash(),
             i32::try_from(lease.intent.output_index)
                 .map_err(|_| ProviderSubmitProjectionError::OutputOutOfRange)?,
-            i32::try_from(lease.intent.output_total)
-                .map_err(|_| ProviderSubmitProjectionError::OutputOutOfRange)?,
+            Some(
+                i32::try_from(lease.intent.output_total)
+                    .map_err(|_| ProviderSubmitProjectionError::OutputOutOfRange)?,
+            ),
         )
     }
 }
@@ -313,7 +328,7 @@ fn project_submit_command(
     source_command: &serde_json::Value,
     source_command_sha256: &str,
     output_index: i32,
-    output_total: i32,
+    expected_output_total: Option<i32>,
 ) -> Result<SingleOutputCommand<DreaminaSubmitPayloadV1>, ProviderSubmitProjectionError> {
     let source_bytes = serde_json::to_vec(source_command)
         .map_err(|_| ProviderSubmitProjectionError::InvalidSourceCommand)?;
@@ -321,13 +336,14 @@ fn project_submit_command(
         .map_err(|_| ProviderSubmitProjectionError::InvalidSourceCommand)?;
     let output_index =
         u32::try_from(output_index).map_err(|_| ProviderSubmitProjectionError::OutputOutOfRange)?;
-    let output_total =
-        u32::try_from(output_total).map_err(|_| ProviderSubmitProjectionError::OutputOutOfRange)?;
-    let output = OutputSlot::new(output_index, output_total)
-        .map_err(|_| ProviderSubmitProjectionError::OutputOutOfRange)?;
-    if u32::from(request.output_count()) != output_total {
+    let output_total = u32::from(request.output_count());
+    if let Some(expected) = expected_output_total
+        && u32::try_from(expected).ok() != Some(output_total)
+    {
         return Err(ProviderSubmitProjectionError::OutputOutOfRange);
     }
+    let output = OutputSlot::new(output_index, output_total)
+        .map_err(|_| ProviderSubmitProjectionError::OutputOutOfRange)?;
     let payload = DreaminaSubmitPayloadV1::new(source_command_sha256, request.into_single_output())
         .map_err(|_| ProviderSubmitProjectionError::InvalidSourceCommand)?;
     SingleOutputCommand::new(output, payload)
@@ -419,6 +435,64 @@ fn valid_sha256(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
 
+fn dreamina_input_files(
+    request: &DreaminaSubmitRequestV1,
+    inputs: &[ExecutorInputObject],
+) -> Result<Vec<GatedCliInputFile>, ProviderFailure> {
+    let expected = request.staged_inputs();
+    if expected.len() != inputs.len() {
+        return Err(no_effect_failure("dreamina_submit_input_manifest_invalid"));
+    }
+    let mut kind_indices = [0_usize; 3];
+    expected
+        .into_iter()
+        .zip(inputs)
+        .enumerate()
+        .map(|(position, (expected, input))| {
+            let (role, kind_index) = match expected.kind {
+                StagedInputKindV1::Image => ("image", 0),
+                StagedInputKindV1::Video => ("video", 1),
+                StagedInputKindV1::Audio => ("audio", 2),
+            };
+            if input.role() != role
+                || usize::from(input.index()) != position
+                || expected.index != kind_indices[kind_index]
+                || expected.sha256 != input.blob().sha256_hex
+            {
+                return Err(no_effect_failure("dreamina_submit_input_manifest_invalid"));
+            }
+            kind_indices[kind_index] += 1;
+            match expected.kind {
+                StagedInputKindV1::Image => {
+                    let (width, height) = expected.dimensions.ok_or_else(|| {
+                        no_effect_failure("dreamina_submit_input_manifest_invalid")
+                    })?;
+                    GatedCliInputFile::image(expected.filename, 32 * 1024 * 1024, width, height)
+                }
+                StagedInputKindV1::Video => GatedCliInputFile::video(
+                    expected.filename,
+                    256 * 1024 * 1024,
+                    expected.duration_ms.ok_or_else(|| {
+                        no_effect_failure("dreamina_submit_input_manifest_invalid")
+                    })?,
+                ),
+                StagedInputKindV1::Audio => {
+                    if !matches!(input.media_type(), "audio/mpeg" | "audio/wav") {
+                        return Err(no_effect_failure("dreamina_submit_input_manifest_invalid"));
+                    }
+                    GatedCliInputFile::audio(
+                        expected.filename,
+                        32 * 1024 * 1024,
+                        expected.duration_ms.ok_or_else(|| {
+                            no_effect_failure("dreamina_submit_input_manifest_invalid")
+                        })?,
+                    )
+                }
+            }
+        })
+        .collect()
+}
+
 fn request_matches_context(
     request: &DreaminaSubmitRequestV1,
     context: &ProviderExecutionContext,
@@ -440,6 +514,27 @@ fn request_matches_platform(
         }
         DreaminaSubmitRequestV1::TextToVideo(request) => {
             operation_id == "videos.generations" && model == request.model().as_str()
+        }
+        DreaminaSubmitRequestV1::ImageToImage(request) => {
+            operation_id == "images.generations"
+                && model
+                    .strip_prefix("dreamina-image-")
+                    .is_some_and(|version| version == request.parameters().model().as_str())
+        }
+        DreaminaSubmitRequestV1::ImageUpscale(_) => {
+            operation_id == "images.generations" && model == "dreamina-image-image_upscale"
+        }
+        DreaminaSubmitRequestV1::ImageToVideo(request) => {
+            operation_id == "videos.generations" && model == request.options().model().as_str()
+        }
+        DreaminaSubmitRequestV1::FramesToVideo(request) => {
+            operation_id == "videos.generations" && model == request.options().model().as_str()
+        }
+        DreaminaSubmitRequestV1::MultimodalToVideo(request) => {
+            operation_id == "videos.generations" && model == request.model().as_str()
+        }
+        DreaminaSubmitRequestV1::MultiframeToVideo(_) => {
+            operation_id == "videos.generations" && model == "multiframe2video"
         }
     }
 }
@@ -495,7 +590,7 @@ mod tests {
             "generate_num": 1,
             "poll": 0
         });
-        let command = project_submit_command(&source, &"a".repeat(64), 0, 1).unwrap();
+        let command = project_submit_command(&source, &"a".repeat(64), 0, Some(1)).unwrap();
 
         assert_eq!(command.schema_id(), DREAMINA_SUBMIT_COMMAND_SCHEMA);
         assert_eq!(command.adapter_revision(), ADAPTER_REVISION);
@@ -522,7 +617,7 @@ mod tests {
                 &serde_json::json!({"operation": "unknown"}),
                 &"a".repeat(64),
                 0,
-                1
+                Some(1)
             ),
             Err(ProviderSubmitProjectionError::InvalidSourceCommand)
         );
@@ -537,7 +632,7 @@ mod tests {
             "poll": 0
         });
         assert_eq!(
-            project_submit_command(&source, &"a".repeat(64), 1, 1),
+            project_submit_command(&source, &"a".repeat(64), 1, Some(1)),
             Err(ProviderSubmitProjectionError::OutputOutOfRange)
         );
     }
@@ -821,3 +916,9 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod input_tests;
+
+#[cfg(test)]
+mod workflow_identity_tests;

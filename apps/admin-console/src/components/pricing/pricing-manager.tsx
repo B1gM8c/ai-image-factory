@@ -1509,6 +1509,7 @@ function metricLabel(metric: string, t: Translate) {
     video_output_token: t({ en: "Video output tokens", "zh-CN": "视频输出 token", ja: "動画出力トークン", ko: "동영상 출력 토큰" }),
     video_input_second: t({ en: "Video input seconds", "zh-CN": "输入视频秒数", ja: "動画入力秒数", ko: "동영상 입력 초" }),
     video_requested_second: t({ en: "Requested video seconds", "zh-CN": "请求视频秒数", ja: "リクエスト動画秒数", ko: "요청 동영상 초" }),
+    video_requested_millisecond: t({ en: "Requested video milliseconds", "zh-CN": "请求视频毫秒数", ja: "リクエスト動画ミリ秒数", ko: "요청 동영상 밀리초" }),
     video_output_second: t({ en: "Actual video output seconds", "zh-CN": "实际输出视频秒数", ja: "実際の動画出力秒数", ko: "실제 동영상 출력 초" }),
     membership_point: t({ en: "Membership points", "zh-CN": "会员积分", ja: "会員ポイント", ko: "멤버십 포인트" }),
   };

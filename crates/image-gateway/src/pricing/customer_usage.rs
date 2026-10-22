@@ -142,10 +142,27 @@ pub(crate) async fn persist_customer_usage_facts(
                     "official_gpt_image_2_output_token_calculator",
                 )
             }
+            ("video_requested_millisecond", "millisecond", "request_derived")
+                if video_output
+                    && output.provider_id == "dreamina-cli"
+                    && context.provider_model_id.as_deref() == Some("multiframe2video") =>
+            {
+                (
+                    frozen_multiframe_duration_ms(
+                        &context.request_dimensions_json,
+                        output.output_billable_units,
+                    )?,
+                    "exact",
+                    "customer_price_quotes.request_dimensions_json.duration_ms",
+                    "admitted_video_duration_milliseconds",
+                )
+            }
             ("video_requested_second", "second", "request_derived")
                 if video_output
-                    && frozen_video_duration_seconds(&context.request_dimensions_json)?
-                        == i64::from(output.output_billable_units) =>
+                    && frozen_video_duration_seconds(
+                        &context.request_dimensions_json,
+                        output.provider_id == "dreamina-cli",
+                    )? == i64::from(output.output_billable_units) =>
             {
                 (
                     i64::from(output.output_billable_units),
@@ -156,8 +173,10 @@ pub(crate) async fn persist_customer_usage_facts(
             }
             ("video_output_second", "second", "request_derived")
                 if video_output
-                    && frozen_video_duration_seconds(&context.request_dimensions_json)?
-                        == i64::from(output.output_billable_units) =>
+                    && frozen_video_duration_seconds(
+                        &context.request_dimensions_json,
+                        output.provider_id == "dreamina-cli",
+                    )? == i64::from(output.output_billable_units) =>
             {
                 (
                     i64::from(output.output_billable_units),
@@ -277,13 +296,37 @@ pub(crate) async fn persist_customer_usage_facts(
     Ok(())
 }
 
-fn frozen_video_duration_seconds(dimensions: &Value) -> Result<i64, CustomerUsageFactError> {
+fn frozen_video_duration_seconds(
+    dimensions: &Value,
+    dreamina: bool,
+) -> Result<i64, CustomerUsageFactError> {
     dimensions
         .get("duration")
         .and_then(Value::as_str)
         .and_then(|duration| duration.parse::<i64>().ok())
-        .filter(|duration| (4..=15).contains(duration))
+        .filter(|duration| (4..=if dreamina { 30 } else { 15 }).contains(duration))
         .ok_or(CustomerUsageFactError::Conflict)
+}
+
+fn frozen_multiframe_duration_ms(
+    dimensions: &Value,
+    quota_seconds: i32,
+) -> Result<i64, CustomerUsageFactError> {
+    if dimensions.get("workflow").and_then(Value::as_str) != Some("multiframe2video")
+        || dimensions.get("duration").is_some()
+    {
+        return Err(CustomerUsageFactError::Conflict);
+    }
+    let duration = dimensions
+        .get("duration_ms")
+        .and_then(Value::as_str)
+        .and_then(|duration| duration.parse::<u32>().ok())
+        .filter(|duration| (2_000..=152_000).contains(duration))
+        .ok_or(CustomerUsageFactError::Conflict)?;
+    if i64::from(duration.div_ceil(1000)) != i64::from(quota_seconds) {
+        return Err(CustomerUsageFactError::Conflict);
+    }
+    Ok(i64::from(duration))
 }
 
 fn frozen_input_image_count(dimensions: &Value) -> Result<i64, CustomerUsageFactError> {
@@ -311,4 +354,44 @@ fn merge_usage_metadata(
     metadata.insert("billing_unit".to_string(), json!(billing_unit));
     metadata.insert("basis".to_string(), json!(basis));
     Ok(Value::Object(metadata))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exact_millisecond_usage_requires_matching_ceil_seconds_quota() {
+        for (milliseconds, quota) in [(2000, 2), (2001, 3), (2500, 3), (152000, 152)] {
+            let dimensions =
+                json!({"workflow": "multiframe2video", "duration_ms": milliseconds.to_string()});
+            assert_eq!(
+                frozen_multiframe_duration_ms(&dimensions, quota),
+                Ok(milliseconds)
+            );
+            assert_eq!(
+                frozen_multiframe_duration_ms(&dimensions, quota + 1),
+                Err(CustomerUsageFactError::Conflict)
+            );
+        }
+        for dimensions in [
+            json!({"workflow":"multiframe2video", "duration_ms":"2500", "duration":"3"}),
+            json!({"workflow":"text2video", "duration_ms":"2500"}),
+            json!({"workflow":"multiframe2video", "duration_ms":"2.5"}),
+            json!({"workflow":"multiframe2video", "duration_ms":"152001"}),
+            json!({"workflow":"multiframe2video", "duration_ms":"1999"}),
+        ] {
+            assert!(frozen_multiframe_duration_ms(&dimensions, 3).is_err());
+        }
+    }
+
+    #[test]
+    fn ordinary_seconds_usage_preserves_other_provider_limits() {
+        assert_eq!(
+            frozen_video_duration_seconds(&json!({"duration":"30"}), true),
+            Ok(30)
+        );
+        assert!(frozen_video_duration_seconds(&json!({"duration":"30"}), false).is_err());
+        assert!(frozen_video_duration_seconds(&json!({"duration_ms":"2500"}), true).is_err());
+    }
 }

@@ -24,8 +24,9 @@ pub use failure::{
 pub use inline::InlineProvider;
 pub use remote::{
     CallbackEnvelope, CallbackKind, CallbackReceipt, CancelReceipt, CancelState, CanceledEvidence,
-    Completed, OpaqueProviderId, OpaqueProviderIdError, PendingOperation, PollObservation,
-    ProviderRequestId, RemoteOperationRef, RemoteTaskProvider,
+    Completed, CompletedRemoteVideo, OpaqueProviderId, OpaqueProviderIdError, PendingOperation,
+    PollObservation, ProviderRequestId, RemoteOperationRef, RemoteTaskProvider, RemoteVideoResult,
+    RemoteVideoResultError,
 };
 
 #[cfg(test)]

@@ -51,6 +51,9 @@ use uuid::Uuid;
 
 type TestResult<T = ()> = Result<T, String>;
 
+#[path = "postgres_video_api/dreamina.rs"]
+mod dreamina;
+
 const UNIT_PRICE_MICROS: i64 = 10;
 const IMAGE_INPUT_PRICE_MICROS: i64 = 2;
 const DURATION_SECONDS: i32 = 6;

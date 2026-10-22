@@ -6,6 +6,8 @@ mod policy;
 mod receipt;
 mod request;
 mod runtime_environment;
+mod staged;
+mod workflows;
 
 pub use capabilities::{
     DREAMINA_CLI_REMOTE_TASK_CONTROLS_V1, DREAMINA_IMAGE_GENERATION_OPERATION_V1,
@@ -27,6 +29,14 @@ pub use request::{
 };
 #[cfg(target_os = "linux")]
 pub use runtime_environment::dreamina_secret_service_bus_address;
+pub use staged::{
+    LocalInputName, StagedImageV1, StagedInputKindV1, StagedInputRefV1, StagedTimedMediaV1,
+};
+pub use workflows::{
+    FramesToVideoRequestV1, ImageToImageRequestV1, ImageToVideoRequestV1, ImageUpscaleRequestV1,
+    MultiframeToVideoRequestV1, MultimodalToVideoRequestV1, ReferenceVideoOptionsV1,
+    UpscaleResolution, VideoTransitionV1,
+};
 
 pub const PROVIDER_ID: &str = "dreamina-cli";
 pub const ADAPTER_REVISION: &str = "dreamina-cli.remote-task.v1";
@@ -34,3 +44,5 @@ pub const REQUEST_SCHEMA_VERSION: u16 = 1;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod workflow_tests;

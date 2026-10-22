@@ -4,6 +4,8 @@
 //! API field: provider model identity, pricing dimensions, and output cardinality are the inputs
 //! that price resolution must prove before a price version can be published.
 
+mod dreamina;
+
 use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -73,6 +75,7 @@ pub struct ImageDimensionVariant {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 pub enum Constraint {
+    DreaminaWorkflow,
     ExactlyOnePresenceBranch(&'static [PresenceBranch]),
     ConditionalPresence {
         selector: Selector,
@@ -209,6 +212,11 @@ impl PricingSurfaceContract {
     /// This is useful while developing a future pricing adapter without accidentally making the
     /// surface publishable.
     pub fn validate_shape(&self, request: &SurfaceRequest<'_>) -> Result<(), ValidationError> {
+        if self.constraints.contains(&Constraint::DreaminaWorkflow)
+            && request.value("workflow") != Some(self.normalizer_key)
+        {
+            return Err(ValidationError::InvalidDimension("workflow"));
+        }
         if !self.provider_models.contains(&request.provider_model_id) {
             return Err(ValidationError::UnsupportedProviderModel);
         }
@@ -251,6 +259,11 @@ impl PricingSurfaceContract {
     }
 
     pub fn validate_component_selector(&self, selector: &Value) -> Result<(), ValidationError> {
+        if self.constraints.contains(&Constraint::DreaminaWorkflow)
+            && selector.get("workflow").and_then(Value::as_str) != Some(self.normalizer_key)
+        {
+            return Err(ValidationError::InvalidDimension("workflow"));
+        }
         let Some(selector) = selector.as_object() else {
             return Err(ValidationError::UnknownDimension);
         };
@@ -362,6 +375,7 @@ impl OutputCardinality {
 impl Constraint {
     fn validate(self, request: &SurfaceRequest<'_>) -> Result<(), ValidationError> {
         match self {
+            Self::DreaminaWorkflow => dreamina::validate(request),
             Self::ExactlyOnePresenceBranch(branches) => {
                 let matches = branches
                     .iter()
@@ -612,12 +626,13 @@ const DREAMINA_VIDEO_MODELS: &[&str] = &[
     "seedance2.0_vip",
     "seedance2.0fast_vip",
     "seedance2.0mini",
+    "seedance2.5",
 ];
 const DREAMINA_VIDEO_DIMENSIONS: &[DimensionContract] = &[
     DimensionContract {
         key: "duration",
         required: true,
-        domain: ValueDomain::IntegerClosed { min: 4, max: 15 },
+        domain: ValueDomain::IntegerClosed { min: 4, max: 30 },
     },
     DimensionContract {
         key: "ratio",
@@ -627,10 +642,14 @@ const DREAMINA_VIDEO_DIMENSIONS: &[DimensionContract] = &[
     DimensionContract {
         key: "resolution",
         required: true,
-        domain: ValueDomain::Enum(&["720p", "1080p", "4k"]),
+        domain: ValueDomain::Enum(&["480p", "720p", "1080p", "4k"]),
     },
 ];
 const DREAMINA_VIDEO_RESOLUTIONS: &[ConditionalEnumCase] = &[
+    ConditionalEnumCase {
+        selector_values: &["seedance2.5"],
+        allowed_values: &["480p", "720p", "1080p"],
+    },
     ConditionalEnumCase {
         selector_values: &["seedance2.0_vip"],
         allowed_values: &["720p", "1080p", "4k"],
@@ -645,11 +664,39 @@ const DREAMINA_VIDEO_RESOLUTIONS: &[ConditionalEnumCase] = &[
         allowed_values: &["720p"],
     },
 ];
-const DREAMINA_VIDEO_CONSTRAINTS: &[Constraint] = &[Constraint::ConditionalEnum {
-    selector: Selector::ProviderModel,
-    field: "resolution",
-    cases: DREAMINA_VIDEO_RESOLUTIONS,
-}];
+const DREAMINA_VIDEO_DURATIONS: &[ConditionalEnumCase] = &[
+    ConditionalEnumCase {
+        selector_values: &["seedance2.5"],
+        allowed_values: &[
+            "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16", "17", "18",
+            "19", "20", "21", "22", "23", "24", "25", "26", "27", "28", "29", "30",
+        ],
+    },
+    ConditionalEnumCase {
+        selector_values: &[
+            "seedance2.0",
+            "seedance2.0fast",
+            "seedance2.0_vip",
+            "seedance2.0fast_vip",
+            "seedance2.0mini",
+        ],
+        allowed_values: &[
+            "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15",
+        ],
+    },
+];
+const DREAMINA_VIDEO_CONSTRAINTS: &[Constraint] = &[
+    Constraint::ConditionalEnum {
+        selector: Selector::ProviderModel,
+        field: "resolution",
+        cases: DREAMINA_VIDEO_RESOLUTIONS,
+    },
+    Constraint::ConditionalEnum {
+        selector: Selector::ProviderModel,
+        field: "duration",
+        cases: DREAMINA_VIDEO_DURATIONS,
+    },
+];
 
 const GROK_VIDEO_MODELS: &[&str] = &[
     "grok-imagine-video",
@@ -942,7 +989,7 @@ const CONTRACTS: &[PricingSurfaceContract] = &[
     },
     PricingSurfaceContract {
         contract_id: "dreamina-cli.videos.generations.pricing-surface",
-        contract_version: 2,
+        contract_version: 3,
         provider_id: "dreamina-cli",
         route_operation: "videos.generations",
         pricing_operation: "video_generation",
@@ -1030,6 +1077,29 @@ pub fn find_contract_for_pricing(
             && contract.command_schema == command_schema
             && contract.media_kind == media_kind
     })
+}
+
+/// Old callers retain the original text-only contract and its immutable hash.
+/// Additional workflows are selected only from validated frozen facts.
+pub(super) fn find_contract_for_workflow(
+    provider_id: &str,
+    pricing_operation: &str,
+    command_schema: &str,
+    media_kind: &str,
+    workflow: Option<&str>,
+) -> Option<&'static PricingSurfaceContract> {
+    match (provider_id, workflow) {
+        ("dreamina-cli", Some(workflow)) => dreamina::CONTRACTS.iter().find(|contract| {
+            contract.normalizer_key == workflow
+                && contract.pricing_operation == pricing_operation
+                && contract.command_schema == command_schema
+                && contract.media_kind == media_kind
+        }),
+        (_, None) => {
+            find_contract_for_pricing(provider_id, pricing_operation, command_schema, media_kind)
+        }
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -1555,7 +1625,7 @@ mod tests {
                 ],
                 output_count: 1,
             }),
-            Err(ValidationError::InvalidDimension("duration"))
+            Err(ValidationError::ConstraintViolation("conditional_enum"))
         );
         assert_eq!(
             contract.validate(&SurfaceRequest {
@@ -1581,6 +1651,53 @@ mod tests {
             }),
             Ok(())
         );
+    }
+
+    #[test]
+    fn dreamina_seedance25_pricing_domain_preserves_legacy_limits() {
+        let contract = contract("dreamina-cli.videos.generations.pricing-surface");
+        for (model, duration, resolution, accepted) in [
+            ("seedance2.5", "4", "480p", true),
+            ("seedance2.5", "5", "480p", true),
+            ("seedance2.5", "30", "1080p", true),
+            ("seedance2.5", "3", "720p", false),
+            ("seedance2.5", "31", "720p", false),
+            ("seedance2.5", "5", "4k", false),
+            ("seedance2.0_vip", "15", "4k", true),
+            ("seedance2.0_vip", "16", "720p", false),
+            ("seedance2.0_vip", "5", "480p", false),
+            ("seedance2.0fast", "15", "720p", true),
+            ("seedance2.0fast", "16", "720p", false),
+            ("seedance2.0fast", "5", "480p", false),
+        ] {
+            assert_eq!(
+                contract
+                    .validate(&SurfaceRequest {
+                        provider_model_id: model,
+                        dimensions: &[
+                            value("duration", duration),
+                            value("ratio", "16:9"),
+                            value("resolution", resolution),
+                        ],
+                        output_count: 1,
+                    })
+                    .is_ok(),
+                accepted,
+                "{model} {duration}s {resolution}"
+            );
+        }
+
+        let binding = contract
+            .binding_snapshot(ExactSurfaceIdentity {
+                api_profile: "volcengine-ark-content-generation-v3",
+                provider_model_id: "seedance2.5",
+                public_model_id: "doubao-seedance-2-5-260628",
+                service_tier: "standard",
+                execution_surface: "provider_cli",
+            })
+            .expect("Seedance 2.5 Ark pricing contract can be bound");
+        assert_eq!(binding.revision, 3);
+        assert_eq!(binding.normalizer_key, "dreamina-cli.submit.video.v1");
     }
 
     #[test]

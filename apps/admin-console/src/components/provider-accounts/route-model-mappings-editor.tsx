@@ -450,6 +450,8 @@ function defaultPublicModelId(
       return "doubao-seedance-2-0-fast-260128";
     if (providerModelId === "seedance2.0mini")
       return "doubao-seedance-2-0-mini-260128";
+    if (providerModelId === "seedance2.5")
+      return "doubao-seedance-2-5-260628";
     return null;
   }
   return providerModelId;

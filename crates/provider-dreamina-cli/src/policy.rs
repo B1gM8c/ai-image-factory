@@ -1,13 +1,16 @@
-use std::{ffi::OsString, path::Path, time::Duration};
+use std::{ffi::OsString, io::Read, path::Path, time::Duration};
 
 use image_cli_runtime::{
     CommandSpec, CommandSpecError, ExitClassification, ReceiptCliPolicy, VerifiedExecutable,
     WorkingDirectory, default_exit_classification,
 };
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::{
-    DreaminaQueryReceiptV1, QueryResultRequestV1, ReceiptError, TextToImageRequestV1,
+    DreaminaQueryReceiptV1, FramesToVideoRequestV1, ImageToImageRequestV1, ImageToVideoRequestV1,
+    ImageUpscaleRequestV1, MultiframeToVideoRequestV1, MultimodalToVideoRequestV1,
+    QueryResultRequestV1, ReceiptError, StagedInputKindV1, StagedInputRefV1, TextToImageRequestV1,
     TextToVideoRequestV1, parse_query_receipt,
 };
 
@@ -15,31 +18,129 @@ use crate::{
 pub enum DreaminaSubmitRequestV1 {
     TextToImage(TextToImageRequestV1),
     TextToVideo(TextToVideoRequestV1),
+    ImageToImage(ImageToImageRequestV1),
+    ImageUpscale(ImageUpscaleRequestV1),
+    ImageToVideo(ImageToVideoRequestV1),
+    FramesToVideo(FramesToVideoRequestV1),
+    MultiframeToVideo(MultiframeToVideoRequestV1),
+    MultimodalToVideo(MultimodalToVideoRequestV1),
 }
 
 impl DreaminaSubmitRequestV1 {
     pub fn output_count(&self) -> u8 {
         match self {
             Self::TextToImage(request) => request.generate_num(),
-            Self::TextToVideo(_) => 1,
+            Self::ImageToImage(request) => request.generate_num(),
+            _ => 1,
         }
     }
 
     pub fn into_single_output(self) -> Self {
         match self {
             Self::TextToImage(request) => Self::TextToImage(request.into_single_output()),
-            Self::TextToVideo(request) => Self::TextToVideo(request),
+            Self::ImageToImage(request) => Self::ImageToImage(request.into_single_output()),
+            request => request,
         }
     }
 
     pub(crate) fn argv(&self) -> Result<Vec<OsString>, DreaminaCliPolicyError> {
+        if self.output_count() != 1 {
+            return Err(DreaminaCliPolicyError::BatchSubmissionUnsupported);
+        }
         match self {
-            Self::TextToImage(request) if request.generate_num() != 1 => {
-                Err(DreaminaCliPolicyError::BatchSubmissionUnsupported)
-            }
             Self::TextToImage(request) => Ok(request.to_argv()),
             Self::TextToVideo(request) => Ok(request.to_argv()),
+            Self::ImageToImage(request) => Ok(request.to_argv()),
+            Self::ImageUpscale(request) => Ok(request.to_argv()),
+            Self::ImageToVideo(request) => Ok(request.to_argv()),
+            Self::FramesToVideo(request) => Ok(request.to_argv()),
+            Self::MultiframeToVideo(request) => Ok(request.to_argv()),
+            Self::MultimodalToVideo(request) => Ok(request.to_argv()),
         }
+    }
+
+    /// Stable media-category order: images, videos, audio; frame order is preserved.
+    pub fn staged_inputs(&self) -> Vec<StagedInputRefV1<'_>> {
+        let images: Vec<_> = match self {
+            Self::ImageToImage(r) => r.images().iter().collect(),
+            Self::ImageUpscale(r) => vec![r.image()],
+            Self::ImageToVideo(r) => vec![r.image()],
+            Self::FramesToVideo(r) => vec![r.first(), r.last()],
+            Self::MultiframeToVideo(r) => r.images().iter().collect(),
+            Self::MultimodalToVideo(r) => r.images().iter().collect(),
+            _ => Vec::new(),
+        };
+        let mut inputs: Vec<_> = images
+            .into_iter()
+            .enumerate()
+            .map(|(index, image)| StagedInputRefV1 {
+                kind: StagedInputKindV1::Image,
+                index,
+                filename: image.filename(),
+                sha256: image.sha256(),
+                dimensions: Some((image.width(), image.height())),
+                duration_ms: None,
+            })
+            .collect();
+        if let Self::MultimodalToVideo(r) = self {
+            for (kind, media) in [
+                (StagedInputKindV1::Video, r.videos()),
+                (StagedInputKindV1::Audio, r.audios()),
+            ] {
+                inputs.extend(
+                    media
+                        .iter()
+                        .enumerate()
+                        .map(|(index, input)| StagedInputRefV1 {
+                            kind,
+                            index,
+                            filename: input.filename(),
+                            sha256: input.sha256(),
+                            dimensions: None,
+                            duration_ms: Some(input.duration_ms()),
+                        }),
+                );
+            }
+        }
+        inputs
+    }
+
+    pub fn input_names(&self) -> Vec<&str> {
+        self.staged_inputs()
+            .into_iter()
+            .map(|input| input.filename)
+            .collect()
+    }
+}
+
+impl From<ImageToImageRequestV1> for DreaminaSubmitRequestV1 {
+    fn from(request: ImageToImageRequestV1) -> Self {
+        Self::ImageToImage(request)
+    }
+}
+impl From<ImageUpscaleRequestV1> for DreaminaSubmitRequestV1 {
+    fn from(request: ImageUpscaleRequestV1) -> Self {
+        Self::ImageUpscale(request)
+    }
+}
+impl From<ImageToVideoRequestV1> for DreaminaSubmitRequestV1 {
+    fn from(request: ImageToVideoRequestV1) -> Self {
+        Self::ImageToVideo(request)
+    }
+}
+impl From<FramesToVideoRequestV1> for DreaminaSubmitRequestV1 {
+    fn from(request: FramesToVideoRequestV1) -> Self {
+        Self::FramesToVideo(request)
+    }
+}
+impl From<MultiframeToVideoRequestV1> for DreaminaSubmitRequestV1 {
+    fn from(request: MultiframeToVideoRequestV1) -> Self {
+        Self::MultiframeToVideo(request)
+    }
+}
+impl From<MultimodalToVideoRequestV1> for DreaminaSubmitRequestV1 {
+    fn from(request: MultimodalToVideoRequestV1) -> Self {
+        Self::MultimodalToVideo(request)
     }
 }
 
@@ -120,6 +221,9 @@ impl DreaminaCliPolicyV1 {
         request: &DreaminaSubmitRequestV1,
         workspace: WorkingDirectory,
     ) -> Result<CommandSpec, DreaminaCliPolicyError> {
+        for input in request.staged_inputs() {
+            verify_input(workspace.path(), input)?;
+        }
         let mut command = CommandSpec::new_receipt(
             self.executable.clone(),
             workspace.clone(),
@@ -193,9 +297,18 @@ impl DreaminaCliQueryPolicyV1 {
         if request.download_dir().parent() != Some(self.workspace_root.path()) {
             return Err(DreaminaCliQueryPolicyError::DownloadDirectoryOutsideWorkspace);
         }
+        let working_directory = if request.downloads_media() {
+            self.workspace_root.clone()
+        } else {
+            let directory = WorkingDirectory::new_private(request.download_dir())?;
+            if directory.path().parent() != Some(self.workspace_root.path()) {
+                return Err(DreaminaCliQueryPolicyError::DownloadDirectoryOutsideWorkspace);
+            }
+            directory
+        };
         let mut command = CommandSpec::new_receipt(
             self.executable.clone(),
-            self.workspace_root.clone(),
+            working_directory,
             self.wall_timeout,
             self.termination_grace,
         )?
@@ -244,6 +357,44 @@ pub enum DreaminaCliPolicyError {
     ExecutionWorkspaceOutsideRoot,
     #[error("Dreamina execution supports exactly one output per submission")]
     BatchSubmissionUnsupported,
+    #[error(
+        "Dreamina staged input is missing, not a regular file, or differs from its frozen digest"
+    )]
+    InvalidStagedInput,
+}
+
+fn verify_input(
+    workspace: &Path,
+    input: StagedInputRefV1<'_>,
+) -> Result<(), DreaminaCliPolicyError> {
+    let path = workspace.join(input.filename);
+    let metadata =
+        std::fs::symlink_metadata(&path).map_err(|_| DreaminaCliPolicyError::InvalidStagedInput)?;
+    if !metadata.is_file() {
+        return Err(DreaminaCliPolicyError::InvalidStagedInput);
+    }
+    let mut file =
+        std::fs::File::open(&path).map_err(|_| DreaminaCliPolicyError::InvalidStagedInput)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = file
+            .read(&mut buffer)
+            .map_err(|_| DreaminaCliPolicyError::InvalidStagedInput)?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    let digest = hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    if digest != input.sha256 {
+        return Err(DreaminaCliPolicyError::InvalidStagedInput);
+    }
+    Ok(())
 }
 
 #[derive(Debug, Error)]

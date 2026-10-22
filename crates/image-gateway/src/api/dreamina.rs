@@ -8,8 +8,9 @@ use axum::{
 };
 use image_api_contracts::dreamina::{
     DREAMINA_IMAGES_API_PROFILE, DREAMINA_VIDEOS_API_PROFILE, DreaminaImageGenerationRequest,
-    DreaminaTaskCreated, DreaminaTaskError, DreaminaVideoContent, DreaminaVideoGenerationRequest,
-    DreaminaVideoTask,
+    DreaminaImageRequest, DreaminaImageWorkflowRequest, DreaminaTaskCreated, DreaminaTaskError,
+    DreaminaVideoContent, DreaminaVideoGenerationRequest, DreaminaVideoRequest, DreaminaVideoTask,
+    DreaminaVideoWorkflowRequest,
 };
 use image_provider_contracts::BillingMetric;
 use serde::Serialize;
@@ -21,8 +22,8 @@ use crate::{
     admission::{
         AdmissionClaim, AdmissionContract, AdmissionTicket, AttachJob, ClaimAdmission,
         CustomerPricingIntent, DreaminaAdmissionError, DreaminaImageAdmissionPlan,
-        DreaminaVideoAdmissionPlan, GENERATION_OPERATION, VIDEO_GENERATION_OPERATION,
-        idempotency_key_digest,
+        DreaminaVideoAdmissionPlan, DreaminaWorkflowIntent, GENERATION_OPERATION,
+        VIDEO_GENERATION_OPERATION, idempotency_key_digest,
     },
     artifacts::StoredGenerationResult,
     auth::{ApiKeyCapability, AuthContext},
@@ -46,12 +47,20 @@ pub(super) async fn create_image(
     Extension(request_id): Extension<RequestId>,
     headers: HeaderMap,
     State(state): State<Arc<AppState>>,
-    body: Result<Json<DreaminaImageGenerationRequest>, axum::extract::rejection::JsonRejection>,
+    body: Result<Json<DreaminaImageRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Response, ImageGatewayError> {
     let auth = authenticate_image_request(&headers, &state).await?;
     auth.require_api_key_capability(ApiKeyCapability::ImagesWrite)?;
     let Json(request) = body.map_err(invalid_json)?;
-    create_image_with_auth(&state, auth, &headers, request_id.0, request).await
+    match request {
+        DreaminaImageRequest::Legacy(request)
+        | DreaminaImageRequest::Workflow(DreaminaImageWorkflowRequest::TextToImage(request)) => {
+            create_image_with_auth(&state, auth, &headers, request_id.0, request).await
+        }
+        DreaminaImageRequest::Workflow(request) => {
+            create_image_workflow(&state, auth, &headers, request_id.0, request).await
+        }
+    }
 }
 
 pub(super) async fn create_image_with_auth(
@@ -190,14 +199,21 @@ pub(super) async fn create_video(
     Extension(request_id): Extension<RequestId>,
     headers: HeaderMap,
     State(state): State<Arc<AppState>>,
-    body: Result<Json<DreaminaVideoGenerationRequest>, axum::extract::rejection::JsonRejection>,
+    body: Result<Json<DreaminaVideoRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Json<DreaminaTaskCreated>, ImageGatewayError> {
     let auth = authenticate_image_request(&headers, &state).await?;
     auth.require_api_key_capability(ApiKeyCapability::VideosWrite)?;
     let Json(request) = body.map_err(invalid_json)?;
-    create_video_with_auth(&state, auth, &headers, request_id.0, request)
-        .await
-        .map(Json)
+    let result = match request {
+        DreaminaVideoRequest::Legacy(request)
+        | DreaminaVideoRequest::Workflow(DreaminaVideoWorkflowRequest::TextToVideo(request)) => {
+            create_video_with_auth(&state, auth, &headers, request_id.0, request).await
+        }
+        DreaminaVideoRequest::Workflow(request) => {
+            create_video_workflow(&state, auth, &headers, request_id.0, request).await
+        }
+    }?;
+    Ok(Json(result))
 }
 
 pub(super) async fn create_video_with_auth(
@@ -334,6 +350,306 @@ async fn create_video_with_optional_route(
     })
 }
 
+async fn create_image_workflow(
+    state: &Arc<AppState>,
+    mut auth: AuthContext,
+    headers: &HeaderMap,
+    request_id: String,
+    mut request: DreaminaImageWorkflowRequest,
+) -> Result<Response, ImageGatewayError> {
+    let (model, default_model) = match &mut request {
+        DreaminaImageWorkflowRequest::TextToImage(r) => (Some(&mut r.model_version), "5.0"),
+        DreaminaImageWorkflowRequest::ImageToImage(r) => (Some(&mut r.model_version), "5.0"),
+        DreaminaImageWorkflowRequest::ImageUpscale(_) => (None, "image_upscale"),
+    };
+    let resolved = resolve_workflow_route(
+        state,
+        &mut auth,
+        DREAMINA_IMAGES_API_PROFILE,
+        "images.generations",
+        model,
+        default_model,
+    )
+    .await?;
+    let intent = DreaminaWorkflowIntent::image(request).map_err(dreamina_admission_error)?;
+    let job_id = submit_workflow(
+        state,
+        &auth,
+        headers,
+        request_id,
+        DREAMINA_IMAGES_API_PROFILE,
+        resolved.public_model_id,
+        resolved.execution_model_id,
+        intent,
+    )
+    .await?;
+    let result = wait_for_generation_result(state, job_id).await?;
+    render_stored_generation_response(result, &auth)
+}
+
+async fn create_video_workflow(
+    state: &Arc<AppState>,
+    mut auth: AuthContext,
+    headers: &HeaderMap,
+    request_id: String,
+    mut request: DreaminaVideoWorkflowRequest,
+) -> Result<DreaminaTaskCreated, ImageGatewayError> {
+    let (model, default_model) = match &mut request {
+        DreaminaVideoWorkflowRequest::TextToVideo(r) => {
+            (Some(&mut r.model_version), "seedance2.0fast")
+        }
+        DreaminaVideoWorkflowRequest::ImageToVideo(r) => {
+            (Some(&mut r.model_version), "seedance2.0_vip")
+        }
+        DreaminaVideoWorkflowRequest::FramesToVideo(r) => {
+            (Some(&mut r.model_version), "seedance2.0_vip")
+        }
+        DreaminaVideoWorkflowRequest::MultimodalToVideo(r) => {
+            (Some(&mut r.model_version), "seedance2.0_vip")
+        }
+        DreaminaVideoWorkflowRequest::MultiframeToVideo(_) => (None, "multiframe2video"),
+    };
+    let resolved = resolve_workflow_route(
+        state,
+        &mut auth,
+        DREAMINA_VIDEOS_API_PROFILE,
+        "videos.generations",
+        model,
+        default_model,
+    )
+    .await?;
+    let intent = DreaminaWorkflowIntent::video(request).map_err(dreamina_admission_error)?;
+    let job_id = submit_workflow(
+        state,
+        &auth,
+        headers,
+        request_id,
+        DREAMINA_VIDEOS_API_PROFILE,
+        resolved.public_model_id,
+        resolved.execution_model_id,
+        intent,
+    )
+    .await?;
+    Ok(DreaminaTaskCreated {
+        id: job_id.to_string(),
+    })
+}
+
+async fn resolve_workflow_route(
+    state: &Arc<AppState>,
+    auth: &mut AuthContext,
+    profile: &str,
+    operation: &str,
+    model: Option<&mut Option<String>>,
+    default_model: &str,
+) -> Result<ResolvedModelRoute, ImageGatewayError> {
+    require_external_execution(state)?;
+    let requested = model
+        .as_ref()
+        .and_then(|m| m.as_deref())
+        .unwrap_or(default_model);
+    let resolved = resolve_request_model(
+        state,
+        auth,
+        image_provider_dreamina_cli::PROVIDER_ID,
+        operation,
+        profile,
+        Some(requested),
+        default_model,
+    )
+    .await?
+    .ok_or_else(|| {
+        ImageGatewayError::service_unavailable("Dreamina workflow requires an enabled model route")
+    })?;
+    validate_resolved_dreamina_route(&resolved, profile, operation)?;
+    if let Some(model) = model {
+        *model = Some(resolved.provider_model_id.clone());
+    } else if resolved.provider_model_id != default_model {
+        return Err(ImageGatewayError::service_unavailable(
+            "fixed Dreamina workflow model route mismatch",
+        ));
+    }
+    Ok(resolved)
+}
+
+/// The source request owns idempotency; immutable bytes and measurements own execution and pricing.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn submit_workflow(
+    state: &Arc<AppState>,
+    auth: &AuthContext,
+    headers: &HeaderMap,
+    request_id: String,
+    api_profile: &str,
+    public_model_id: String,
+    execution_model_id: String,
+    intent: DreaminaWorkflowIntent,
+) -> Result<Uuid, ImageGatewayError> {
+    require_external_execution(state)?;
+    if generation_admission_contract(state.config.generation_admission_contract)
+        != AdmissionContract::CustomerPricingV4
+    {
+        return Err(admission_error(
+            crate::admission::AdmissionError::PricingUnavailable,
+        ));
+    }
+    let is_video = intent.is_video();
+    let operation = if is_video {
+        VIDEO_GENERATION_OPERATION
+    } else {
+        GENERATION_OPERATION
+    };
+    let claim = ClaimAdmission {
+        owner_token: Uuid::new_v4(),
+        tenant_id: auth.tenant_id.clone(),
+        project_id: auth.project_id.clone(),
+        api_profile: api_profile.to_owned(),
+        operation: operation.to_owned(),
+        request_id: request_id.clone(),
+        idempotency_key_digest: idempotency_digest(
+            headers,
+            &auth.project_id,
+            api_profile,
+            operation,
+        )?,
+        request_hash: customer_pricing_request_hash(
+            auth,
+            api_profile,
+            &public_model_id,
+            &execution_model_id,
+            intent.request_hash(),
+        )?,
+        deadline_at_ms: admission_deadline(&state.config),
+    };
+    let ticket = match claim_admission_with_retry(state, claim)
+        .await
+        .map_err(admission_error)?
+    {
+        AdmissionClaim::Owner(ticket) => ticket,
+        AdmissionClaim::Existing {
+            job_id,
+            state: status,
+            ..
+        } if is_video || status == "succeeded" => return Ok(job_id),
+        AdmissionClaim::Existing { .. } | AdmissionClaim::InProgress { .. } => {
+            return Err(ImageGatewayError::idempotency_in_progress());
+        }
+        AdmissionClaim::Conflict { .. } => return Err(ImageGatewayError::idempotency_conflict()),
+    };
+    let plan = match super::dreamina_inputs::stage_workflow_inputs(
+        state.input_blob_store.as_ref(),
+        &ticket,
+        intent,
+        state.config.max_upload_bytes,
+    )
+    .await
+    {
+        Ok(plan) => plan,
+        Err(error) => {
+            abort_before_attach(state, &ticket).await?;
+            return Err(error);
+        }
+    };
+    let facts = match crate::pricing::admission::dreamina_pricing_facts(
+        plan.typed_request(),
+        api_profile,
+    ) {
+        Ok(facts) => facts,
+        Err(error) => {
+            cleanup_workflow(state, &ticket).await?;
+            return Err(admission_error(error));
+        }
+    };
+    let Some(billable_units) = facts.output_count.checked_mul(facts.output_billable_units) else {
+        cleanup_workflow(state, &ticket).await?;
+        return Err(ImageGatewayError::internal(
+            "Dreamina billable unit count overflow",
+        ));
+    };
+    let reservation = match reserve_with_retry(
+        state,
+        UsageCharge {
+            tenant_id: auth.tenant_id.clone(),
+            attribution: Some(auth.attribution()),
+            request_id,
+            admission_session_id: Some(ticket.session_id),
+            operation,
+            provider_id: plan.provider_id().to_owned(),
+            model: execution_model_id.clone(),
+            output_count: facts.output_count,
+            billable_units,
+            billing_metric: if is_video {
+                BillingMetric::VideoSecond
+            } else {
+                BillingMetric::Output
+            },
+            limits: if is_video {
+                UsageLimits {
+                    five_hour_image_limit: state.config.five_hour_video_second_limit,
+                    seven_day_image_limit: state.config.seven_day_video_second_limit,
+                }
+            } else {
+                UsageLimits {
+                    five_hour_image_limit: state.config.five_hour_image_limit,
+                    seven_day_image_limit: state.config.seven_day_image_limit,
+                }
+            },
+        },
+    )
+    .await
+    {
+        Ok(reservation) => reservation,
+        Err(error) => {
+            cleanup_workflow(state, &ticket).await?;
+            return Err(error);
+        }
+    };
+    let decision = crate::service_tiers::ServiceTierDecision::for_default_only_project(
+        auth.project_service_tier,
+    );
+    let mut attach = plan.attach(
+        ticket.clone(),
+        reservation.job_id,
+        format!("tenant:{}", auth.tenant_id),
+    );
+    attach.customer_pricing = Some(CustomerPricingIntent {
+        public_model_id,
+        provider_model_id: facts.provider_model_id,
+        execution_model_id,
+        provider_command_hash: Some(plan.provider_command_hash().to_owned()),
+        media_kind: facts.media_kind.to_owned(),
+        service_tier: decision.effective.pricing_key().to_owned(),
+        service_tier_decision: decision,
+        execution_surface: "provider_cli".to_owned(),
+        currency: "USD".to_owned(),
+        pricing_dimensions: facts.dimensions,
+        processing_mode: crate::admission::PricingProcessingMode::Synchronous,
+    });
+    if let Err(error) = attach_ready_with_retry(state, attach).await {
+        // An unavailable store may have committed; retain its frozen inputs for reconciliation.
+        if !matches!(error, crate::admission::AdmissionError::Unavailable) {
+            state
+                .usage_store
+                .release(&reservation, "admission_attach_failed")
+                .await?;
+            cleanup_workflow(state, &ticket).await?;
+        }
+        return Err(admission_error(error));
+    }
+    Ok(reservation.job_id)
+}
+
+async fn cleanup_workflow(
+    state: &Arc<AppState>,
+    ticket: &AdmissionTicket,
+) -> Result<(), ImageGatewayError> {
+    abort_before_attach(state, ticket).await?;
+    state
+        .input_blob_store
+        .delete_session(ticket.session_id)
+        .await
+        .map_err(|_| ImageGatewayError::service_unavailable("Dreamina input cleanup unavailable"))
+}
+
 fn validate_resolved_dreamina_route(
     resolved: &ResolvedModelRoute,
     api_profile: &str,
@@ -342,6 +658,7 @@ fn validate_resolved_dreamina_route(
     if resolved.provider_id != image_provider_dreamina_cli::PROVIDER_ID
         || resolved.api_profile != api_profile
         || resolved.operation_id != operation_id
+        || resolved.command_schema != image_provider_dreamina_cli::DREAMINA_SUBMIT_COMMAND_SCHEMA
     {
         return Err(ImageGatewayError::service_unavailable(
             "resolved model route does not match the Dreamina execution surface",
@@ -540,7 +857,7 @@ fn video_task(id: Uuid, status: VideoResultStatus) -> DreaminaVideoTask {
         }
         VideoResultStatus::Succeeded {
             model,
-            duration,
+            duration_ms,
             artifact_id,
         } => DreaminaVideoTask {
             id: id.to_string(),
@@ -549,7 +866,21 @@ fn video_task(id: Uuid, status: VideoResultStatus) -> DreaminaVideoTask {
             error: None,
             content: Some(DreaminaVideoContent {
                 video_url: format!("/v1/dreamina/files/{artifact_id}/content"),
-                duration,
+                duration: duration_seconds(duration_ms),
+            }),
+        },
+        VideoResultStatus::SucceededRemote {
+            model,
+            duration_ms,
+            result,
+        } => DreaminaVideoTask {
+            id: id.to_string(),
+            status: "succeeded".to_owned(),
+            model: Some(model),
+            error: None,
+            content: Some(DreaminaVideoContent {
+                video_url: result.video_url().to_owned(),
+                duration: duration_seconds(duration_ms),
             }),
         },
         VideoResultStatus::Failed {
@@ -565,6 +896,17 @@ fn video_task(id: Uuid, status: VideoResultStatus) -> DreaminaVideoTask {
             content: None,
         },
     }
+}
+
+/// Keep whole-second responses byte-compatible and fractional seconds exact.
+pub(super) fn duration_seconds(duration_ms: u32) -> serde_json::Number {
+    if duration_ms % 1000 == 0 {
+        return (duration_ms / 1000).into();
+    }
+    format!("{}.{:03}", duration_ms / 1000, duration_ms % 1000)
+        .trim_end_matches('0')
+        .parse()
+        .expect("integer milliseconds always encode a finite JSON number")
 }
 
 pub(super) fn require_external_execution(state: &AppState) -> Result<(), ImageGatewayError> {
@@ -585,7 +927,7 @@ pub(super) fn invalid_json(error: axum::extract::rejection::JsonRejection) -> Im
     )
 }
 
-fn dreamina_admission_error(error: DreaminaAdmissionError) -> ImageGatewayError {
+pub(super) fn dreamina_admission_error(error: DreaminaAdmissionError) -> ImageGatewayError {
     ImageGatewayError::invalid_request(
         error.to_string(),
         Some(error.parameter().to_owned()),
@@ -676,6 +1018,28 @@ fn task_not_found() -> ImageGatewayError {
 mod tests {
     use super::*;
     use crate::auth::RequestRouteAttribution;
+
+    #[test]
+    fn video_duration_wire_keeps_whole_seconds_and_exact_millisecond_fractions() {
+        for (milliseconds, json) in [(5000, "5"), (2500, "2.5"), (2001, "2.001"), (152000, "152")] {
+            assert_eq!(
+                serde_json::to_string(&duration_seconds(milliseconds)).unwrap(),
+                json
+            );
+            let task = video_task(
+                Uuid::new_v4(),
+                VideoResultStatus::Succeeded {
+                    model: "multiframe2video".to_owned(),
+                    duration_ms: milliseconds,
+                    artifact_id: Uuid::new_v4(),
+                },
+            );
+            assert_eq!(
+                serde_json::to_value(task).unwrap()["content"]["duration"].to_string(),
+                json
+            );
+        }
+    }
 
     fn routed_auth(route_revision: i64) -> AuthContext {
         AuthContext {

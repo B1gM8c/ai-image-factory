@@ -1,6 +1,9 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use image_provider_dreamina_cli::{
+    DREAMINA_SUBMIT_COMMAND_SCHEMA, DreaminaSubmitRequestV1, parse_submit_command,
+};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Postgres, Transaction};
@@ -8,7 +11,7 @@ use uuid::Uuid;
 
 use super::{
     ExecutionSettlementStore, GenerationResultLookup, GenerationResultStatus, StoredVideoArtifact,
-    VideoPendingStage, VideoResultStatus, validate_generation_result,
+    VideoPendingStage, VideoRequestMetadata, VideoResultStatus, validate_generation_result,
 };
 use crate::{
     ImageGatewayError,
@@ -175,14 +178,40 @@ impl ExecutionSettlementStore for PostgresExecutionSettlementStore {
         let row: Option<VideoStatusRow> = sqlx::query_as(
             r#"
             SELECT j.state, w.state, j.last_error_code, j.model, j.billable_units,
-                   artifact.artifact_id
+                   artifact.artifact_id, remote.video_url, remote.expires_at_ms, payload.command_json
             FROM jobs j
             JOIN work_items w ON w.job_id = j.job_id
+            LEFT JOIN job_payloads payload
+              ON payload.job_id = j.job_id AND payload.command_schema = $3
+             AND j.provider_id = 'dreamina-cli'
             LEFT JOIN artifacts artifact
               ON artifact.job_id = j.job_id
              AND artifact.output_index = 0
              AND artifact.state = 'ready'
              AND artifact.media_type = 'video/mp4'
+            LEFT JOIN provider_submissions submission
+              ON submission.job_id = j.job_id
+             AND submission.tenant_id = j.tenant_id
+             AND submission.work_item_id = w.work_item_id
+             AND submission.state = 'succeeded'
+             AND submission.remote_result_id IS NOT NULL
+            LEFT JOIN executor_terminal_reductions reduction
+              ON reduction.submission_id = submission.submission_id
+             AND reduction.executor_execution_id = submission.executor_execution_id
+             AND reduction.state = 'completed'
+             AND reduction.resolved_state = 'succeeded'
+            LEFT JOIN provider_remote_video_results remote
+              ON remote.remote_result_id = reduction.remote_result_id
+             AND remote.remote_result_id = submission.remote_result_id
+             AND remote.submission_id = submission.submission_id
+             AND remote.executor_execution_id = submission.executor_execution_id
+             AND j.provider_id = 'dreamina-cli'
+             AND EXISTS (
+                 SELECT 1 FROM job_response_projections projection
+                 WHERE projection.job_id = j.job_id
+                   AND projection.artifact_count = 0
+                   AND projection.remote_result_count = 1
+             )
             WHERE j.job_id = $1 AND j.tenant_id = $2
               AND j.operation = 'video_generation'
               AND j.economics_contract_version IN (3, 4)
@@ -190,6 +219,7 @@ impl ExecutionSettlementStore for PostgresExecutionSettlementStore {
         )
         .bind(job_id)
         .bind(tenant_id)
+        .bind(DREAMINA_SUBMIT_COMMAND_SCHEMA)
         .fetch_optional(&self.pool)
         .await
         .map_err(settlement_unavailable)?;
@@ -206,16 +236,42 @@ impl ExecutionSettlementStore for PostgresExecutionSettlementStore {
         let row: Option<VideoStatusRow> = sqlx::query_as(
             r#"
                 SELECT j.state, w.state, j.last_error_code, j.model, j.billable_units,
-                       artifact.artifact_id
+                       artifact.artifact_id, remote.video_url, remote.expires_at_ms, payload.command_json
                 FROM jobs j
                 JOIN work_items w ON w.job_id = j.job_id
                 JOIN job_auth_attributions attribution
                   ON attribution.job_id = j.job_id
+                LEFT JOIN job_payloads payload
+                  ON payload.job_id = j.job_id AND payload.command_schema = $5
+                 AND j.provider_id = 'dreamina-cli'
                 LEFT JOIN artifacts artifact
                   ON artifact.job_id = j.job_id
                  AND artifact.output_index = 0
                  AND artifact.state = 'ready'
                  AND artifact.media_type = 'video/mp4'
+                LEFT JOIN provider_submissions submission
+                  ON submission.job_id = j.job_id
+                 AND submission.tenant_id = j.tenant_id
+                 AND submission.work_item_id = w.work_item_id
+                 AND submission.state = 'succeeded'
+                 AND submission.remote_result_id IS NOT NULL
+                LEFT JOIN executor_terminal_reductions reduction
+                  ON reduction.submission_id = submission.submission_id
+                 AND reduction.executor_execution_id = submission.executor_execution_id
+                 AND reduction.state = 'completed'
+                 AND reduction.resolved_state = 'succeeded'
+                LEFT JOIN provider_remote_video_results remote
+                  ON remote.remote_result_id = reduction.remote_result_id
+                 AND remote.remote_result_id = submission.remote_result_id
+                 AND remote.submission_id = submission.submission_id
+                 AND remote.executor_execution_id = submission.executor_execution_id
+                 AND j.provider_id = 'dreamina-cli'
+                 AND EXISTS (
+                     SELECT 1 FROM job_response_projections projection
+                     WHERE projection.job_id = j.job_id
+                       AND projection.artifact_count = 0
+                       AND projection.remote_result_count = 1
+                 )
                 WHERE j.job_id = $1 AND j.tenant_id = $2
                   AND attribution.project_id = $3
                   AND ($4::UUID IS NULL OR attribution.actor_user_id = $4)
@@ -227,10 +283,80 @@ impl ExecutionSettlementStore for PostgresExecutionSettlementStore {
         .bind(tenant_id)
         .bind(project_id)
         .bind(actor_user_id)
+        .bind(DREAMINA_SUBMIT_COMMAND_SCHEMA)
         .fetch_optional(&self.pool)
         .await
         .map_err(settlement_unavailable)?;
         row.map(video_result_status).transpose()
+    }
+
+    async fn project_video_status_with_metadata(
+        &self,
+        tenant_id: &str,
+        project_id: &str,
+        actor_user_id: Option<Uuid>,
+        job_id: Uuid,
+    ) -> Result<Option<(VideoResultStatus, VideoRequestMetadata)>, ImageGatewayError> {
+        let row: Option<VideoStatusRow> = sqlx::query_as(
+            r#"
+                SELECT j.state, w.state, j.last_error_code, j.model, j.billable_units,
+                       artifact.artifact_id, remote.video_url, remote.expires_at_ms, payload.command_json
+                FROM jobs j
+                JOIN work_items w ON w.job_id = j.job_id
+                JOIN job_auth_attributions attribution
+                  ON attribution.job_id = j.job_id
+                LEFT JOIN job_payloads payload
+                  ON payload.job_id = j.job_id
+                 AND payload.command_schema = $5
+                 AND j.provider_id = 'dreamina-cli'
+                LEFT JOIN artifacts artifact
+                  ON artifact.job_id = j.job_id
+                 AND artifact.output_index = 0
+                 AND artifact.state = 'ready'
+                 AND artifact.media_type = 'video/mp4'
+                LEFT JOIN provider_submissions submission
+                  ON submission.job_id = j.job_id
+                 AND submission.tenant_id = j.tenant_id
+                 AND submission.work_item_id = w.work_item_id
+                 AND submission.state = 'succeeded'
+                 AND submission.remote_result_id IS NOT NULL
+                LEFT JOIN executor_terminal_reductions reduction
+                  ON reduction.submission_id = submission.submission_id
+                 AND reduction.executor_execution_id = submission.executor_execution_id
+                 AND reduction.state = 'completed'
+                 AND reduction.resolved_state = 'succeeded'
+                LEFT JOIN provider_remote_video_results remote
+                  ON remote.remote_result_id = reduction.remote_result_id
+                 AND remote.remote_result_id = submission.remote_result_id
+                 AND remote.submission_id = submission.submission_id
+                 AND remote.executor_execution_id = submission.executor_execution_id
+                 AND j.provider_id = 'dreamina-cli'
+                 AND EXISTS (
+                     SELECT 1 FROM job_response_projections projection
+                     WHERE projection.job_id = j.job_id
+                       AND projection.artifact_count = 0
+                       AND projection.remote_result_count = 1
+                 )
+                WHERE j.job_id = $1 AND j.tenant_id = $2
+                  AND attribution.project_id = $3
+                  AND ($4::UUID IS NULL OR attribution.actor_user_id = $4)
+                  AND j.operation = 'video_generation'
+                  AND j.economics_contract_version IN (3, 4)
+                "#,
+        )
+        .bind(job_id)
+        .bind(tenant_id)
+        .bind(project_id)
+        .bind(actor_user_id)
+        .bind(DREAMINA_SUBMIT_COMMAND_SCHEMA)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(settlement_unavailable)?;
+        row.map(|row| {
+            let metadata = video_request_metadata(row.8.as_ref())?;
+            Ok((video_result_status(row)?, metadata))
+        })
+        .transpose()
     }
 
     async fn load_video_artifact(
@@ -374,28 +500,101 @@ impl ExecutionSettlementStore for PostgresExecutionSettlementStore {
     }
 }
 
-type VideoStatusRow = (String, String, Option<String>, String, i32, Option<Uuid>);
+type VideoStatusRow = (
+    String,
+    String,
+    Option<String>,
+    String,
+    i32,
+    Option<Uuid>,
+    Option<String>,
+    Option<i64>,
+    Option<serde_json::Value>,
+);
+
+fn video_request_metadata(
+    command: Option<&serde_json::Value>,
+) -> Result<VideoRequestMetadata, ImageGatewayError> {
+    let Some(command) = command else {
+        return Ok(VideoRequestMetadata::default());
+    };
+    let bytes = serde_json::to_vec(command).map_err(|_| ImageGatewayError::artifact_integrity())?;
+    let request =
+        parse_submit_command(&bytes).map_err(|_| ImageGatewayError::artifact_integrity())?;
+    let (model, resolution, ratio) = match request {
+        DreaminaSubmitRequestV1::TextToVideo(request) => (
+            request.model().as_str(),
+            request.resolution().as_str(),
+            Some(request.ratio().as_str()),
+        ),
+        DreaminaSubmitRequestV1::ImageToVideo(request) => (
+            request.options().model().as_str(),
+            request.options().resolution().as_str(),
+            request.options().ratio().map(|ratio| ratio.as_str()),
+        ),
+        DreaminaSubmitRequestV1::FramesToVideo(request) => (
+            request.options().model().as_str(),
+            request.options().resolution().as_str(),
+            request.options().ratio().map(|ratio| ratio.as_str()),
+        ),
+        DreaminaSubmitRequestV1::MultiframeToVideo(request) => {
+            ("multiframe2video", request.resolution().as_str(), None)
+        }
+        DreaminaSubmitRequestV1::MultimodalToVideo(request) => (
+            request.model().as_str(),
+            request.resolution().as_str(),
+            Some(request.ratio().as_str()),
+        ),
+        _ => return Err(ImageGatewayError::artifact_integrity()),
+    };
+    Ok(VideoRequestMetadata {
+        provider_model: Some(model.to_owned()),
+        resolution: Some(resolution.to_owned()),
+        ratio: ratio.map(str::to_owned),
+    })
+}
 
 fn video_result_status(row: VideoStatusRow) -> Result<VideoResultStatus, ImageGatewayError> {
-    let (job_state, work_state, error_code, model, billable_units, artifact_id) = row;
-    let duration = u8::try_from(billable_units)
-        .ok()
-        .filter(|duration| *duration > 0)
-        .ok_or_else(ImageGatewayError::artifact_integrity)?;
+    let (
+        job_state,
+        work_state,
+        error_code,
+        model,
+        billable_units,
+        artifact_id,
+        remote_url,
+        remote_expires_at_ms,
+        command,
+    ) = row;
+    let duration_ms = requested_video_duration_ms(billable_units, command.as_ref())?;
     if job_state == "succeeded" {
-        Ok(VideoResultStatus::Succeeded {
-            model,
-            duration,
-            artifact_id: artifact_id.ok_or_else(ImageGatewayError::artifact_integrity)?,
-        })
+        match (artifact_id, remote_url) {
+            (Some(artifact_id), None) if remote_expires_at_ms.is_none() => {
+                Ok(VideoResultStatus::Succeeded {
+                    model,
+                    duration_ms,
+                    artifact_id,
+                })
+            }
+            (None, Some(url)) => {
+                let result = image_provider_sdk::RemoteVideoResult::new(url, remote_expires_at_ms)
+                    .map_err(|_| ImageGatewayError::artifact_integrity())?;
+                Ok(VideoResultStatus::SucceededRemote {
+                    model,
+                    duration_ms,
+                    result,
+                })
+            }
+            _ => Err(ImageGatewayError::artifact_integrity()),
+        }
     } else if job_state == "failed" || work_state == "failed" {
         Ok(VideoResultStatus::Failed {
             model,
-            duration,
+            duration_ms,
             error_code,
         })
     } else if work_state == "uncertain" {
-        Ok(VideoResultStatus::Uncertain { model, duration })
+        Ok(VideoResultStatus::Uncertain { model, duration_ms })
     } else {
         let stage = match work_state.as_str() {
             "ready" => VideoPendingStage::Queued,
@@ -404,10 +603,52 @@ fn video_result_status(row: VideoStatusRow) -> Result<VideoResultStatus, ImageGa
         };
         Ok(VideoResultStatus::Pending {
             model,
-            duration,
+            duration_ms,
             stage,
         })
     }
+}
+
+fn requested_video_duration_ms(
+    quota_seconds: i32,
+    command: Option<&serde_json::Value>,
+) -> Result<u32, ImageGatewayError> {
+    let quota_seconds = u32::try_from(quota_seconds)
+        .ok()
+        .filter(|seconds| *seconds > 0)
+        .ok_or_else(ImageGatewayError::artifact_integrity)?;
+    let Some(command) = command else {
+        return quota_seconds
+            .checked_mul(1_000)
+            .ok_or_else(ImageGatewayError::artifact_integrity);
+    };
+    let bytes = serde_json::to_vec(command).map_err(|_| ImageGatewayError::artifact_integrity())?;
+    let request =
+        parse_submit_command(&bytes).map_err(|_| ImageGatewayError::artifact_integrity())?;
+    let duration_ms = match request {
+        DreaminaSubmitRequestV1::TextToVideo(request) => {
+            u32::from(request.duration_seconds()) * 1_000
+        }
+        DreaminaSubmitRequestV1::ImageToVideo(request) => {
+            u32::from(request.options().duration_seconds()) * 1_000
+        }
+        DreaminaSubmitRequestV1::FramesToVideo(request) => {
+            u32::from(request.options().duration_seconds()) * 1_000
+        }
+        DreaminaSubmitRequestV1::MultimodalToVideo(request) => {
+            u32::from(request.duration_seconds()) * 1_000
+        }
+        DreaminaSubmitRequestV1::MultiframeToVideo(request) => request
+            .transitions()
+            .iter()
+            .map(|transition| transition.duration_ms())
+            .sum(),
+        _ => return Err(ImageGatewayError::artifact_integrity()),
+    };
+    if !(1..=152_000).contains(&duration_ms) || duration_ms.div_ceil(1_000) != quota_seconds {
+        return Err(ImageGatewayError::artifact_integrity());
+    }
+    Ok(duration_ms)
 }
 
 #[derive(sqlx::FromRow)]
@@ -927,4 +1168,258 @@ fn quota_lock_id(tenant_id: &str) -> i64 {
 
 fn settlement_unavailable(_: impl std::fmt::Display) -> ImageGatewayError {
     ImageGatewayError::service_unavailable("execution settlement unavailable")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use image_provider_dreamina_cli::{
+        FramesToVideoRequestV1, ImageToVideoRequestV1, MultimodalToVideoRequestV1,
+        ReferenceVideoOptionsV1, StagedImageV1, TextToVideoRequestV1, VideoModelVersion,
+        VideoRatio, VideoResolution, encode_submit_command,
+    };
+
+    fn multiframe_command(durations_ms: &[u32]) -> serde_json::Value {
+        use image_provider_dreamina_cli::{
+            MultiframeToVideoRequestV1, StagedImageV1, VideoResolution, VideoTransitionV1,
+            encode_submit_command,
+        };
+        let images = (0..=durations_ms.len())
+            .map(|index| {
+                StagedImageV1::new(format!("frame-{index}.png"), "a".repeat(64), 1600, 900).unwrap()
+            })
+            .collect();
+        let transitions = durations_ms
+            .iter()
+            .map(|duration| VideoTransitionV1::new("move smoothly", *duration).unwrap())
+            .collect();
+        let request =
+            MultiframeToVideoRequestV1::new(images, transitions, VideoResolution::P720).unwrap();
+        serde_json::from_slice(&encode_submit_command(
+            DreaminaSubmitRequestV1::MultiframeToVideo(request),
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn requested_multiframe_duration_preserves_milliseconds_and_checks_quota() {
+        let command = multiframe_command(&[2_500]);
+        assert_eq!(
+            requested_video_duration_ms(3, Some(&command)).unwrap(),
+            2_500
+        );
+        assert!(requested_video_duration_ms(2, Some(&command)).is_err());
+        assert_eq!(requested_video_duration_ms(3, None).unwrap(), 3_000);
+        assert!(requested_video_duration_ms(3, Some(&json!({}))).is_err());
+        assert!(requested_video_duration_ms(0, None).is_err());
+        let status = video_result_status((
+            "running".into(),
+            "provider_waiting".into(),
+            None,
+            "multiframe2video".into(),
+            3,
+            None,
+            None,
+            None,
+            Some(command),
+        ))
+        .unwrap();
+        assert!(matches!(
+            status,
+            VideoResultStatus::Pending {
+                duration_ms: 2_500,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn requested_multiframe_duration_supports_the_exact_152_second_limit() {
+        let command = multiframe_command(&[8_000; 19]);
+        assert_eq!(
+            requested_video_duration_ms(152, Some(&command)).unwrap(),
+            152_000
+        );
+        assert!(requested_video_duration_ms(151, Some(&command)).is_err());
+    }
+    #[test]
+    fn successful_video_requires_exactly_one_delivery_source() {
+        let url = "https://media.example.com/video.mp4?signature=a%2Bb";
+        let row = |artifact, remote| {
+            (
+                "succeeded".to_owned(),
+                "succeeded".to_owned(),
+                None,
+                "seedance2.5".to_owned(),
+                5,
+                artifact,
+                remote,
+                None,
+                None,
+            )
+        };
+        let artifact = Uuid::new_v4();
+        assert!(
+            matches!(video_result_status(row(Some(artifact), None)).unwrap(),
+            VideoResultStatus::Succeeded { artifact_id, .. } if artifact_id == artifact)
+        );
+        let VideoResultStatus::SucceededRemote { result, .. } =
+            video_result_status(row(None, Some(url.to_owned()))).unwrap()
+        else {
+            panic!("expected remote delivery");
+        };
+        assert_eq!(result.video_url(), url);
+        assert_eq!(result.expires_at_ms(), None);
+        assert!(video_result_status(row(None, None)).is_err());
+        assert!(video_result_status(row(Some(artifact), Some(url.to_owned()))).is_err());
+        assert!(video_result_status(row(None, Some("file:///tmp/video.mp4".to_owned()))).is_err());
+    }
+
+    #[test]
+    fn remote_multiframe_success_keeps_exact_milliseconds() {
+        let url = "https://media.example.com/video.mp4?signature=a%2Bb";
+        let status = video_result_status((
+            "succeeded".into(),
+            "succeeded".into(),
+            None,
+            "multiframe2video".into(),
+            3,
+            None,
+            Some(url.to_owned()),
+            None,
+            Some(multiframe_command(&[2_500])),
+        ))
+        .unwrap();
+        let VideoResultStatus::SucceededRemote {
+            duration_ms,
+            result,
+            ..
+        } = status
+        else {
+            panic!("expected remote delivery");
+        };
+        assert_eq!(duration_ms, 2_500);
+        assert_eq!(result.video_url(), url);
+    }
+
+    #[test]
+    fn video_metadata_comes_from_the_frozen_dreamina_command() {
+        for (model, resolution, duration) in [
+            (VideoModelVersion::Seedance2_0Fast, VideoResolution::P720, 5),
+            (
+                VideoModelVersion::Seedance2_0Vip,
+                VideoResolution::P1080,
+                15,
+            ),
+            (VideoModelVersion::Seedance2_5, VideoResolution::P480, 5),
+            (VideoModelVersion::Seedance2_5, VideoResolution::P1080, 30),
+        ] {
+            let request = TextToVideoRequestV1::new(
+                "an orange paper airplane",
+                model,
+                VideoRatio::R16x9,
+                duration,
+                resolution,
+            )
+            .unwrap();
+            let command: serde_json::Value = serde_json::from_slice(&encode_submit_command(
+                DreaminaSubmitRequestV1::TextToVideo(request),
+            ))
+            .unwrap();
+            assert_eq!(command["operation"], "text2video");
+            assert_eq!(command["schema_version"], 1);
+            let metadata = video_request_metadata(Some(&command)).unwrap();
+            assert_eq!(metadata.provider_model.as_deref(), Some(model.as_str()));
+            assert_eq!(metadata.resolution.as_deref(), Some(resolution.as_str()));
+            assert_eq!(metadata.ratio.as_deref(), Some("16:9"));
+        }
+    }
+
+    #[test]
+    fn missing_video_metadata_remains_unknown() {
+        assert_eq!(
+            video_request_metadata(None).unwrap(),
+            VideoRequestMetadata::default()
+        );
+    }
+
+    #[test]
+    fn malformed_frozen_video_metadata_fails_closed() {
+        for command in [json!(null), json!(480), json!(true), json!([]), json!({})] {
+            assert!(video_request_metadata(Some(&command)).is_err());
+        }
+    }
+
+    #[test]
+    fn multiframe_metadata_preserves_its_fixed_workflow_model_and_unknown_ratio() {
+        let command = multiframe_command(&[2_500]);
+        assert_eq!(
+            video_request_metadata(Some(&command)).unwrap(),
+            VideoRequestMetadata {
+                provider_model: Some("multiframe2video".to_owned()),
+                resolution: Some("720p".to_owned()),
+                ratio: None,
+            }
+        );
+    }
+
+    #[test]
+    fn reference_and_multimodal_metadata_preserve_the_requested_model_and_ratio() {
+        let first = StagedImageV1::new("first.png", "a".repeat(64), 1600, 900).unwrap();
+        let last = StagedImageV1::new("last.png", "b".repeat(64), 1600, 900).unwrap();
+        for (model, ratio) in [
+            (VideoModelVersion::Seedance2_5, None),
+            (VideoModelVersion::Seedance2_0Fast, Some(VideoRatio::R16x9)),
+        ] {
+            let options =
+                ReferenceVideoOptionsV1::new("camera pan", model, ratio, 5, VideoResolution::P720)
+                    .unwrap();
+            for request in [
+                DreaminaSubmitRequestV1::ImageToVideo(
+                    ImageToVideoRequestV1::new(first.clone(), options.clone()).unwrap(),
+                ),
+                DreaminaSubmitRequestV1::FramesToVideo(
+                    FramesToVideoRequestV1::new(first.clone(), last.clone(), options.clone())
+                        .unwrap(),
+                ),
+            ] {
+                let command = serde_json::from_slice(&encode_submit_command(request)).unwrap();
+                assert_eq!(
+                    video_request_metadata(Some(&command)).unwrap(),
+                    VideoRequestMetadata {
+                        provider_model: Some(model.as_str().to_owned()),
+                        resolution: Some("720p".to_owned()),
+                        ratio: ratio.map(|ratio| ratio.as_str().to_owned()),
+                    }
+                );
+                assert_eq!(
+                    requested_video_duration_ms(5, Some(&command)).unwrap(),
+                    5_000
+                );
+            }
+        }
+        let request = MultimodalToVideoRequestV1::new(
+            vec![first],
+            vec![],
+            vec![],
+            "camera pan",
+            VideoModelVersion::Seedance2_5,
+            VideoRatio::R16x9,
+            5,
+            VideoResolution::P720,
+        )
+        .unwrap();
+        let command = serde_json::from_slice(&encode_submit_command(
+            DreaminaSubmitRequestV1::MultimodalToVideo(request),
+        ))
+        .unwrap();
+        assert_eq!(
+            video_request_metadata(Some(&command)).unwrap(),
+            VideoRequestMetadata {
+                provider_model: Some("seedance2.5".to_owned()),
+                resolution: Some("720p".to_owned()),
+                ratio: Some("16:9".to_owned()),
+            }
+        );
+    }
 }

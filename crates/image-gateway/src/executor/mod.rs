@@ -193,17 +193,7 @@ impl ExecutorInputObject {
     ) -> Option<Self> {
         let role = role.into();
         let media_type = media_type.into();
-        let valid_descriptor = match role.as_str() {
-            "image" => {
-                index <= 15
-                    && matches!(
-                        media_type.as_str(),
-                        "image/png" | "image/jpeg" | "image/webp"
-                    )
-            }
-            "mask" => index == 0 && media_type == "image/png",
-            _ => false,
-        };
+        let valid_descriptor = crate::admission::valid_input_descriptor(&role, index, &media_type);
         if !valid_descriptor
             || blob.byte_size == 0
             || blob.sha256_hex.len() != 64
@@ -276,10 +266,11 @@ impl ExecutorLaunchContext {
     }
 
     pub fn with_inputs(mut self, inputs: Vec<ExecutorInputObject>) -> Option<Self> {
-        if inputs
-            .iter()
-            .enumerate()
-            .any(|(index, input)| usize::from(input.index) != index)
+        if inputs.len() > crate::admission::MAX_JOB_INPUTS
+            || inputs
+                .iter()
+                .enumerate()
+                .any(|(index, input)| usize::from(input.index) != index)
         {
             return None;
         }

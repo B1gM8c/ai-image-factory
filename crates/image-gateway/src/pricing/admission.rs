@@ -1,3 +1,9 @@
+mod dreamina;
+pub(crate) use dreamina::dreamina_pricing_facts;
+pub(super) use dreamina::{
+    price_groups as dreamina_price_groups, select_price_group as select_dreamina_price_group,
+};
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use sha2::{Digest, Sha256};
@@ -10,18 +16,15 @@ use crate::admission::{
     GENERATION_COMMAND_SCHEMA_VERSION, GENERATION_OPERATION, GenerationCommandV1,
     VIDEO_GENERATION_OPERATION, provider_command_hash,
 };
-use image_api_contracts::{
-    ark::{ARK_CONTENT_GENERATION_API_PROFILE, ARK_IMAGES_API_PROFILE},
-    dreamina::{DREAMINA_IMAGES_API_PROFILE, DREAMINA_VIDEOS_API_PROFILE},
-    xai::{XAI_IMAGES_API_PROFILE, XAI_VIDEOS_API_PROFILE, XaiVideoAspectRatio},
+use image_api_contracts::xai::{
+    XAI_IMAGES_API_PROFILE, XAI_VIDEOS_API_PROFILE, XaiVideoAspectRatio,
 };
 use image_provider_contracts::provider::openai_codex::{
     MODEL_GPT_IMAGE_2 as CODEX_PRICING_MODEL_ID,
     MODEL_GPT_IMAGE_2_SNAPSHOT as CODEX_SNAPSHOT_MODEL_ID, PROVIDER_ID as CODEX_PROVIDER_ID,
 };
 use image_provider_dreamina_cli::{
-    DREAMINA_SUBMIT_COMMAND_SCHEMA, DreaminaSubmitRequestV1, PROVIDER_ID as DREAMINA_PROVIDER_ID,
-    parse_submit_command,
+    DREAMINA_SUBMIT_COMMAND_SCHEMA, PROVIDER_ID as DREAMINA_PROVIDER_ID, parse_submit_command,
 };
 use image_provider_grok_cli::{
     GROK_IMAGE_EDIT_COMMAND_SCHEMA, GROK_IMAGE_GENERATION_COMMAND_SCHEMA,
@@ -40,8 +43,16 @@ use super::{
     postgres_quote::{CustomerQuoteContext, CustomerQuoteStoreError, persist_customer_quote},
     rating::confidence_satisfies,
     surface_contract::{
-        DimensionValue, PricingSurfaceContract, SurfaceRequest, find_contract_for_pricing,
+        DimensionValue, PricingSurfaceContract, SurfaceRequest, find_contract_for_workflow,
     },
+};
+
+#[cfg(test)]
+use super::surface_contract::find_contract_for_pricing;
+#[cfg(test)]
+use image_api_contracts::{
+    ark::ARK_IMAGES_API_PROFILE,
+    dreamina::{DREAMINA_IMAGES_API_PROFILE, DREAMINA_VIDEOS_API_PROFILE},
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -100,10 +111,26 @@ pub(super) fn pricing_dimension_keys_for_route(
             Some(&["aspect_ratio", "resolution"])
         }
         (DREAMINA_PROVIDER_ID, "images.generations", DREAMINA_SUBMIT_COMMAND_SCHEMA, "image") => {
-            Some(&["height", "ratio", "resolution_type", "width"])
+            Some(&[
+                "height",
+                "input_image_count",
+                "ratio",
+                "resolution_type",
+                "width",
+                "workflow",
+            ])
         }
         (DREAMINA_PROVIDER_ID, "videos.generations", DREAMINA_SUBMIT_COMMAND_SCHEMA, "video") => {
-            Some(&["duration", "ratio", "resolution"])
+            Some(&[
+                "duration",
+                "duration_ms",
+                "input_audio_count",
+                "input_image_count",
+                "input_video_count",
+                "ratio",
+                "resolution",
+                "workflow",
+            ])
         }
         (GROK_PROVIDER_ID, "videos.generations", GROK_VIDEO_GENERATION_COMMAND_SCHEMA, "video") => {
             Some(&[
@@ -130,7 +157,7 @@ pub(super) fn pricing_dimension_keys_for_route(
 
 pub(super) fn customer_metering_contract(
     version: &PriceBookVersionView,
-    _provider_id: &str,
+    provider_id: &str,
 ) -> CustomerMeteringContract {
     if version.components.is_empty() {
         return CustomerMeteringContract::Incompatible;
@@ -154,6 +181,11 @@ pub(super) fn customer_metering_contract(
             component.unit.as_str(),
             component.quantity_source.as_str(),
         ) {
+            ("video_requested_millisecond", "millisecond", "request_derived")
+                if provider_id == DREAMINA_PROVIDER_ID =>
+            {
+                "exact"
+            }
             ("image_output", "image", "request_derived")
             | ("image_input", "image", "request_derived")
             | ("video_requested_second", "second", "request_derived")
@@ -322,19 +354,32 @@ pub(crate) async fn admit_customer_pricing_v4(
         billing_mode: "customer_rate".to_string(),
         at_ms: job.admitted_at_ms,
     };
-    let resolved = resolve_price_version_in_transaction(tx, &resolution)
+    let mut resolved = resolve_price_version_in_transaction(tx, &resolution)
         .await
         .map_err(map_resolution)?;
+    if job.provider_id == DREAMINA_PROVIDER_ID {
+        resolved.version = select_dreamina_price_group(
+            &resolved.version,
+            command_facts
+                .pricing_dimensions
+                .get("workflow")
+                .map(String::as_str),
+        )?;
+    }
     if customer_metering_contract(&resolved.version, &job.provider_id)
         != CustomerMeteringContract::Exact
     {
         return Err(AdmissionError::PricingUnavailable);
     }
-    let contract = find_contract_for_pricing(
+    let contract = find_contract_for_workflow(
         &command_facts.provider_id,
         &command_facts.operation,
         &request.command_schema,
         &command_facts.media_kind,
+        command_facts
+            .pricing_dimensions
+            .get("workflow")
+            .map(String::as_str),
     )
     .ok_or(AdmissionError::PricingUnavailable)?;
     if !customer_metering_bases_complete(&resolved.version, contract) {
@@ -430,10 +475,22 @@ fn quote_quantities(
                     "estimated",
                 )
             }
+            ("video_requested_millisecond", "millisecond", "request_derived")
+                if provider_id == Some(DREAMINA_PROVIDER_ID)
+                    && provider_model_id == Some("multiframe2video") =>
+            {
+                (
+                    "video_requested_millisecond",
+                    "millisecond",
+                    video_duration_milliseconds(dimensions)?,
+                    "request_derived",
+                    "exact",
+                )
+            }
             ("video_requested_second", "second", "request_derived") => (
                 "video_requested_second",
                 "second",
-                video_duration_seconds(dimensions)?,
+                video_duration_seconds(dimensions, provider_id == Some(DREAMINA_PROVIDER_ID))?,
                 "request_derived",
                 "exact",
             ),
@@ -441,7 +498,7 @@ fn quote_quantities(
             ("video_output_second", "second", "request_derived") => (
                 "video_output_second",
                 "second",
-                video_duration_seconds(dimensions)?,
+                video_duration_seconds(dimensions, provider_id == Some(DREAMINA_PROVIDER_ID))?,
                 "request_derived",
                 "exact",
             ),
@@ -476,12 +533,32 @@ fn quote_quantities(
         .collect())
 }
 
-fn video_duration_seconds(dimensions: &serde_json::Value) -> Result<u64, AdmissionError> {
+fn video_duration_seconds(
+    dimensions: &serde_json::Value,
+    dreamina: bool,
+) -> Result<u64, AdmissionError> {
     dimensions
         .get("duration")
         .and_then(serde_json::Value::as_str)
         .and_then(|duration| duration.parse::<u64>().ok())
-        .filter(|duration| (4..=15).contains(duration))
+        .filter(|duration| (4..=if dreamina { 30 } else { 15 }).contains(duration))
+        .ok_or(AdmissionError::PricingUnavailable)
+}
+
+fn video_duration_milliseconds(dimensions: &serde_json::Value) -> Result<u64, AdmissionError> {
+    if dimensions
+        .get("workflow")
+        .and_then(serde_json::Value::as_str)
+        != Some("multiframe2video")
+        || dimensions.get("duration").is_some()
+    {
+        return Err(AdmissionError::PricingUnavailable);
+    }
+    dimensions
+        .get("duration_ms")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|duration| duration.parse::<u64>().ok())
+        .filter(|duration| (2_000..=152_000).contains(duration))
         .ok_or(AdmissionError::PricingUnavailable)
 }
 
@@ -1102,82 +1179,28 @@ fn command_pricing_facts(
             if hex::encode(Sha256::digest(&bytes)) != provider_command_hash {
                 return Err(AdmissionError::InvalidCommand);
             }
-            match parse_submit_command(&bytes).map_err(|_| AdmissionError::InvalidCommand)? {
-                DreaminaSubmitRequestV1::TextToImage(command)
-                    if matches!(
-                        session_api_profile,
-                        DREAMINA_IMAGES_API_PROFILE | ARK_IMAGES_API_PROFILE
-                    ) =>
-                {
-                    let provider_model_id = command.model().as_str().to_string();
-                    let mut dimensions = BTreeMap::from([(
-                        "resolution_type".to_string(),
-                        command.resolution().as_str().to_string(),
-                    )]);
-                    if let Some(ratio) = command.ratio() {
-                        dimensions.insert("ratio".to_string(), ratio.as_str().to_string());
-                    } else {
-                        dimensions.insert(
-                            "width".to_string(),
-                            command
-                                .width()
-                                .ok_or(AdmissionError::InvalidCommand)?
-                                .to_string(),
-                        );
-                        dimensions.insert(
-                            "height".to_string(),
-                            command
-                                .height()
-                                .ok_or(AdmissionError::InvalidCommand)?
-                                .to_string(),
-                        );
-                    }
-                    let count = u32::from(command.generate_num());
-                    (
-                        DREAMINA_PROVIDER_ID.to_string(),
-                        provider_model_id,
-                        session_api_profile.to_string(),
-                        GENERATION_OPERATION.to_string(),
-                        count,
-                        count,
-                        1,
-                        "output".to_string(),
-                        "output".to_string(),
-                        "image".to_string(),
-                        dimensions,
-                    )
+            let command =
+                parse_submit_command(&bytes).map_err(|_| AdmissionError::InvalidCommand)?;
+            let facts = dreamina_pricing_facts(&command, session_api_profile)?;
+            let image = facts.media_kind == "image";
+            (
+                DREAMINA_PROVIDER_ID.to_string(),
+                facts.provider_model_id,
+                session_api_profile.to_string(),
+                if image {
+                    GENERATION_OPERATION
+                } else {
+                    VIDEO_GENERATION_OPERATION
                 }
-                DreaminaSubmitRequestV1::TextToVideo(command)
-                    if matches!(
-                        session_api_profile,
-                        DREAMINA_VIDEOS_API_PROFILE | ARK_CONTENT_GENERATION_API_PROFILE
-                    ) =>
-                {
-                    let provider_model_id = command.model().as_str().to_string();
-                    let duration = u32::from(command.duration_seconds());
-                    (
-                        DREAMINA_PROVIDER_ID.to_string(),
-                        provider_model_id,
-                        session_api_profile.to_string(),
-                        VIDEO_GENERATION_OPERATION.to_string(),
-                        1,
-                        duration,
-                        duration,
-                        "video_second".to_string(),
-                        "second".to_string(),
-                        "video".to_string(),
-                        BTreeMap::from([
-                            ("duration".to_string(), duration.to_string()),
-                            ("ratio".to_string(), command.ratio().as_str().to_string()),
-                            (
-                                "resolution".to_string(),
-                                command.resolution().as_str().to_string(),
-                            ),
-                        ]),
-                    )
-                }
-                _ => return Err(AdmissionError::PricingUnavailable),
-            }
+                .to_string(),
+                facts.output_count,
+                facts.output_count * facts.output_billable_units,
+                facts.output_billable_units,
+                if image { "output" } else { "video_second" }.to_string(),
+                if image { "output" } else { "second" }.to_string(),
+                facts.media_kind.to_string(),
+                facts.dimensions,
+            )
         }
         _ => return Err(AdmissionError::PricingUnavailable),
     };
@@ -1217,11 +1240,12 @@ fn command_pricing_facts(
         media_kind,
         pricing_dimensions,
     };
-    let contract = find_contract_for_pricing(
+    let contract = find_contract_for_workflow(
         &facts.provider_id,
         &facts.operation,
         &request.command_schema,
         &facts.media_kind,
+        facts.pricing_dimensions.get("workflow").map(String::as_str),
     )
     .ok_or(AdmissionError::PricingUnavailable)?;
     if !contract.api_profiles.contains(&facts.api_profile.as_str()) {
@@ -2309,7 +2333,17 @@ mod tests {
                 DREAMINA_SUBMIT_COMMAND_SCHEMA,
                 "image",
             ),
-            Some(["height", "ratio", "resolution_type", "width"].as_slice())
+            Some(
+                [
+                    "height",
+                    "input_image_count",
+                    "ratio",
+                    "resolution_type",
+                    "width",
+                    "workflow"
+                ]
+                .as_slice()
+            )
         );
         assert_eq!(
             pricing_dimension_keys_for_route(
@@ -2318,7 +2352,19 @@ mod tests {
                 DREAMINA_SUBMIT_COMMAND_SCHEMA,
                 "video",
             ),
-            Some(["duration", "ratio", "resolution"].as_slice())
+            Some(
+                [
+                    "duration",
+                    "duration_ms",
+                    "input_audio_count",
+                    "input_image_count",
+                    "input_video_count",
+                    "ratio",
+                    "resolution",
+                    "workflow"
+                ]
+                .as_slice()
+            )
         );
         assert_eq!(
             pricing_dimension_keys_for_route(
@@ -2337,5 +2383,128 @@ mod tests {
                 .as_slice()
             )
         );
+    }
+    #[test]
+    fn dreamina_price_groups_isolate_quotes_and_never_fall_back() {
+        let mut version =
+            metering_version("image_output", "image", "request_derived", "any", "exact");
+        version.provider_id = Some(DREAMINA_PROVIDER_ID.to_string());
+        version.provider_model_id = Some("5.0".to_owned());
+        version.components[0].unit_price_micros = "100".to_owned();
+        let mut reference = version.components[0].clone();
+        reference.price_component_id = Uuid::new_v4();
+        reference.component_key = "reference_image".to_owned();
+        reference.unit_price_micros = "250".to_owned();
+        reference.dimensions = json!({"workflow": "image2image"});
+        version.components.push(reference);
+        let output_id = Uuid::new_v4();
+        for (workflow, expected) in [(None, "100"), (Some("image2image"), "250")] {
+            let group = select_dreamina_price_group(&version, workflow).unwrap();
+            assert_eq!(group.components.len(), 1);
+            let resolved = ResolvedPriceVersion {
+                price_book_id: version.price_book_id,
+                price_book_key: "dreamina".into(),
+                purpose: "customer_sale".into(),
+                scope_type: "platform".into(),
+                organization_id: None,
+                project_id: None,
+                provider_id: Some(DREAMINA_PROVIDER_ID.into()),
+                currency: "USD".into(),
+                version: group,
+            };
+            let mut dimensions = json!({"resolution_type": "2k", "ratio": "16:9"});
+            if let Some(workflow) = workflow {
+                dimensions["workflow"] = json!(workflow);
+                dimensions["input_image_count"] = json!("1");
+            }
+            let quantities = quote_quantities(&resolved, &[output_id], &dimensions).unwrap();
+            let quote = plan_customer_quote_with_adjustment(&resolved, &quantities, None).unwrap();
+            assert_eq!(quote.max_total_micros, expected);
+            assert_eq!(quote.lines.len(), 3);
+            assert!(
+                quote
+                    .lines
+                    .iter()
+                    .all(|line| line.unit_price_micros == expected)
+            );
+        }
+        assert!(select_dreamina_price_group(&version, Some("image_upscale")).is_err());
+        version.components.remove(0);
+        assert!(select_dreamina_price_group(&version, None).is_err());
+        for invalid in [
+            json!("*"),
+            json!("unknown_workflow"),
+            json!(null),
+            json!(["image2image"]),
+        ] {
+            version.components[0].dimensions = json!({"workflow": invalid});
+            assert!(dreamina_price_groups(&version).is_err());
+        }
+    }
+    #[test]
+    fn dreamina_multiframe_quotes_and_rates_exact_milliseconds_not_quota_seconds() {
+        let mut version = metering_version(
+            "video_requested_millisecond",
+            "millisecond",
+            "request_derived",
+            "any",
+            "exact",
+        );
+        version.provider_id = Some(DREAMINA_PROVIDER_ID.into());
+        version.provider_model_id = Some("multiframe2video".into());
+        version.components[0].unit_size = "1000".into();
+        version.components[0].unit_price_micros = "1000000".into();
+        version.components[0].dimensions = json!({"workflow":"multiframe2video"});
+        let resolved = ResolvedPriceVersion {
+            price_book_id: version.price_book_id,
+            price_book_key: "test.multiframe".into(),
+            purpose: "customer_sale".into(),
+            scope_type: "platform".into(),
+            organization_id: None,
+            project_id: None,
+            provider_id: Some(DREAMINA_PROVIDER_ID.into()),
+            currency: "USD".into(),
+            version,
+        };
+        assert_eq!(
+            customer_metering_contract(&resolved.version, DREAMINA_PROVIDER_ID),
+            CustomerMeteringContract::Exact
+        );
+        assert_eq!(
+            customer_metering_contract(&resolved.version, GROK_PROVIDER_ID),
+            CustomerMeteringContract::Incompatible
+        );
+        let output_id = Uuid::new_v4();
+        let dimensions = json!({"workflow":"multiframe2video", "duration_ms":"2500", "input_image_count":"2", "resolution":"720p"});
+        let quantities = quote_quantities(&resolved, &[output_id], &dimensions).unwrap();
+        assert_eq!(quantities[0].max_quantity, "2500");
+        let quote = plan_customer_quote_with_adjustment(&resolved, &quantities, None).unwrap();
+        assert_eq!(quote.max_total_micros, "2500000");
+        assert_ne!(quote.max_total_micros, "3000000");
+        let fact = crate::pricing::UsageFact {
+            usage_fact_id: Uuid::new_v4(),
+            partition_key: format!("output:{output_id}"),
+            authority_key: "test-receipt".into(),
+            provider_id: DREAMINA_PROVIDER_ID.into(),
+            provider_account_id: None,
+            execution_surface: "provider_cli".into(),
+            fact_domain: "customer_billable".into(),
+            metric: "video_requested_millisecond".into(),
+            unit: "millisecond".into(),
+            quantity: "2500".into(),
+            outcome: "succeeded".into(),
+            quantity_source: "request_derived".into(),
+            confidence: "exact".into(),
+            dimensions: dimensions.clone(),
+        };
+        let rating = crate::pricing::rate_frozen_customer_quote(&quote, &[fact]).unwrap();
+        assert_eq!(rating.total_amount_micros, "2500000");
+        for invalid in [
+            json!({"workflow":"multiframe2video", "duration":"3", "duration_ms":"2500"}),
+            json!({"workflow":"text2video", "duration_ms":"2500"}),
+            json!({"workflow":"multiframe2video", "duration_ms":"2.5"}),
+        ] {
+            assert!(quote_quantities(&resolved, &[output_id], &invalid).is_err());
+        }
     }
 }

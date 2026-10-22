@@ -33,6 +33,191 @@ pub struct DreaminaVideoGenerationRequest {
     pub video_resolution: String,
 }
 
+/// Missing `workflow` retains the original text-generation contract.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(untagged)]
+pub enum DreaminaImageRequest {
+    Legacy(DreaminaImageGenerationRequest),
+    Workflow(DreaminaImageWorkflowRequest),
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "workflow", deny_unknown_fields)]
+pub enum DreaminaImageWorkflowRequest {
+    #[serde(rename = "text2image")]
+    TextToImage(DreaminaImageGenerationRequest),
+    #[serde(rename = "image2image")]
+    ImageToImage(DreaminaImageToImageRequest),
+    #[serde(rename = "image_upscale")]
+    ImageUpscale(DreaminaImageUpscaleRequest),
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DreaminaImageToImageRequest {
+    pub images: Vec<String>,
+    pub prompt: String,
+    #[serde(default)]
+    pub model_version: Option<String>,
+    #[serde(default)]
+    pub ratio: Option<String>,
+    pub resolution_type: String,
+    #[serde(default)]
+    pub width: Option<u32>,
+    #[serde(default)]
+    pub height: Option<u32>,
+    #[serde(default)]
+    pub generate_num: Option<u8>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DreaminaImageUpscaleRequest {
+    pub image: String,
+    pub resolution_type: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(untagged)]
+pub enum DreaminaVideoRequest {
+    Legacy(DreaminaVideoGenerationRequest),
+    Workflow(DreaminaVideoWorkflowRequest),
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "workflow", deny_unknown_fields)]
+pub enum DreaminaVideoWorkflowRequest {
+    #[serde(rename = "text2video")]
+    TextToVideo(DreaminaVideoGenerationRequest),
+    #[serde(rename = "image2video")]
+    ImageToVideo(DreaminaImageToVideoRequest),
+    #[serde(rename = "frames2video")]
+    FramesToVideo(DreaminaFramesToVideoRequest),
+    #[serde(rename = "multiframe2video")]
+    MultiframeToVideo(DreaminaMultiframeToVideoRequest),
+    #[serde(rename = "multimodal2video")]
+    MultimodalToVideo(DreaminaMultimodalToVideoRequest),
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DreaminaImageToVideoRequest {
+    pub image: String,
+    pub prompt: String,
+    #[serde(default)]
+    pub model_version: Option<String>,
+    #[serde(default)]
+    pub ratio: Option<String>,
+    #[serde(default)]
+    pub duration: Option<u8>,
+    pub video_resolution: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DreaminaFramesToVideoRequest {
+    pub first: String,
+    pub last: String,
+    pub prompt: String,
+    #[serde(default)]
+    pub model_version: Option<String>,
+    #[serde(default)]
+    pub ratio: Option<String>,
+    #[serde(default)]
+    pub duration: Option<u8>,
+    pub video_resolution: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DreaminaMultiframeToVideoRequest {
+    pub images: Vec<String>,
+    pub video_resolution: String,
+    #[serde(default)]
+    pub transitions: Option<Vec<DreaminaVideoTransition>>,
+    #[serde(default)]
+    pub transition_prompt: Option<Vec<String>>,
+    #[serde(default)]
+    pub transition_duration: Option<Vec<serde_json::Number>>,
+    #[serde(default)]
+    pub prompt: Option<String>,
+    #[serde(default)]
+    pub duration: Option<serde_json::Number>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DreaminaVideoTransition {
+    pub prompt: String,
+    #[serde(default)]
+    pub duration: Option<serde_json::Number>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DreaminaMultimodalToVideoRequest {
+    #[serde(default)]
+    pub image: Vec<String>,
+    #[serde(default)]
+    pub video: Vec<String>,
+    #[serde(default)]
+    pub audio: Vec<String>,
+    #[serde(default)]
+    pub prompt: String,
+    #[serde(default)]
+    pub model_version: Option<String>,
+    #[serde(default)]
+    pub ratio: Option<String>,
+    #[serde(default)]
+    pub duration: Option<u8>,
+    pub video_resolution: String,
+}
+
+fn native_request_value<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<serde_json::Value, D::Error> {
+    let mut value = serde_json::Value::deserialize(deserializer)?;
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| serde::de::Error::custom("Dreamina request must be an object"))?;
+    // Submission is asynchronous and CLI sessions belong to the service account.
+    // Explicit defaults are equivalent to omission; other values need a gateway contract.
+    for field in ["session", "poll"] {
+        if let Some(option) = object.remove(field)
+            && option.as_u64() != Some(0)
+        {
+            return Err(serde::de::Error::custom(format!(
+                "unsupported_parameter: `{field}` supports only 0"
+            )));
+        }
+    }
+    Ok(value)
+}
+
+impl<'de> Deserialize<'de> for DreaminaImageRequest {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = native_request_value(deserializer)?;
+        if value.get("workflow").is_some() {
+            serde_json::from_value(value).map(Self::Workflow)
+        } else {
+            serde_json::from_value(value).map(Self::Legacy)
+        }
+        .map_err(serde::de::Error::custom)
+    }
+}
+
+impl<'de> Deserialize<'de> for DreaminaVideoRequest {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = native_request_value(deserializer)?;
+        if value.get("workflow").is_some() {
+            serde_json::from_value(value).map(Self::Workflow)
+        } else {
+            serde_json::from_value(value).map(Self::Legacy)
+        }
+        .map_err(serde::de::Error::custom)
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct DreaminaTaskCreated {
     pub id: String,
@@ -53,7 +238,7 @@ pub struct DreaminaVideoTask {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct DreaminaVideoContent {
     pub video_url: String,
-    pub duration: u8,
+    pub duration: serde_json::Number,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -65,6 +250,73 @@ pub struct DreaminaTaskError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn all_native_workflows_have_strict_distinct_wire_shapes() {
+        for json in [
+            r#"{"workflow":"text2image","prompt":"city","resolution_type":"2k"}"#,
+            r#"{"workflow":"image2image","images":["https://example.com/a.png"],"prompt":"city","resolution_type":"2k"}"#,
+            r#"{"workflow":"image_upscale","image":"https://example.com/a.png","resolution_type":"8k"}"#,
+        ] {
+            let request: DreaminaImageRequest = serde_json::from_str(json).unwrap();
+            assert!(matches!(request, DreaminaImageRequest::Workflow(_)));
+        }
+        for json in [
+            r#"{"workflow":"text2video","prompt":"move","video_resolution":"720p"}"#,
+            r#"{"workflow":"image2video","image":"https://example.com/a.png","prompt":"move","video_resolution":"720p"}"#,
+            r#"{"workflow":"frames2video","first":"https://example.com/a.png","last":"https://example.com/b.png","prompt":"move","video_resolution":"720p"}"#,
+            r#"{"workflow":"multiframe2video","images":["a","b"],"prompt":"move","duration":2.501,"video_resolution":"720p"}"#,
+            r#"{"workflow":"multimodal2video","audio":["https://example.com/a.wav"],"model_version":"seedance2.5","video_resolution":"480p"}"#,
+        ] {
+            let request: DreaminaVideoRequest = serde_json::from_str(json).unwrap();
+            assert!(matches!(request, DreaminaVideoRequest::Workflow(_)));
+        }
+        for json in [
+            r#"{"workflow":"image_upscale","image":"a","resolution_type":"8k","prompt":"ignored"}"#,
+            r#"{"workflow":"image_upscale","image":"a","resolution_type":"8k","model_version":"5.0"}"#,
+        ] {
+            assert!(serde_json::from_str::<DreaminaImageRequest>(json).is_err());
+        }
+        for json in [
+            r#"{"workflow":"multiframe2video","images":["a","b"],"prompt":"move","video_resolution":"720p","ratio":"16:9"}"#,
+            r#"{"workflow":"image2video","image":"a","prompt":"move","video_resolution":"720p","duration_ms":5000}"#,
+            r#"{"workflow":"unknown","prompt":"move","video_resolution":"720p"}"#,
+        ] {
+            assert!(serde_json::from_str::<DreaminaVideoRequest>(json).is_err());
+        }
+    }
+
+    #[test]
+    fn explicit_server_control_defaults_preserve_legacy_request() {
+        let base = r#"{"prompt":"city","resolution_type":"2k"}"#;
+        let explicit = r#"{"prompt":"city","resolution_type":"2k","session":0,"poll":0}"#;
+        assert_eq!(
+            serde_json::from_str::<DreaminaImageRequest>(base).unwrap(),
+            serde_json::from_str::<DreaminaImageRequest>(explicit).unwrap()
+        );
+        for option in [r#""poll":1"#, r#""session":5"#, r#""session":null"#] {
+            let json = format!(r#"{{"prompt":"city","resolution_type":"2k",{option}}}"#);
+            let error = serde_json::from_str::<DreaminaImageRequest>(&json).unwrap_err();
+            assert!(error.to_string().contains("unsupported_parameter"));
+        }
+    }
+
+    #[test]
+    fn decimal_request_keeps_submillisecond_digits_until_validation() {
+        let request: DreaminaVideoRequest = serde_json::from_str(r#"{"workflow":"multiframe2video","images":["a","b"],"prompt":"move","duration":2.0000000000000001,"video_resolution":"720p"}"#).unwrap();
+        let DreaminaVideoRequest::Workflow(DreaminaVideoWorkflowRequest::MultiframeToVideo(
+            request,
+        )) = request
+        else {
+            panic!("wrong workflow")
+        };
+        assert_eq!(request.duration.unwrap().to_string(), "2.0000000000000001");
+        // Integer commands keep the original JSON representation with the feature enabled.
+        assert_eq!(
+            serde_json::to_string(&serde_json::json!({"schema_version":1,"duration":5})).unwrap(),
+            r#"{"duration":5,"schema_version":1}"#
+        );
+    }
 
     #[test]
     fn cli_wire_fields_are_strict_and_keep_custom_dimensions() {

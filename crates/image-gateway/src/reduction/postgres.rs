@@ -1,11 +1,13 @@
 use async_trait::async_trait;
+use image_provider_sdk::RemoteVideoResult;
 use sqlx::PgPool;
 use uuid::Uuid;
 
 use super::{
     BlockedTerminalRequeue, BlockedTerminalRequeueError, CanonicalExecutorOutcome,
     ExecutorTerminalArtifact, ExecutorTerminalBlockReason, ExecutorTerminalCompletion,
-    ExecutorTerminalError, ExecutorTerminalLease, ExecutorTerminalStore,
+    ExecutorTerminalError, ExecutorTerminalLease, ExecutorTerminalRemoteVideo,
+    ExecutorTerminalStore,
 };
 use crate::artifacts::ArtifactMetadata;
 
@@ -240,6 +242,10 @@ struct ClaimedTerminalRow {
     resolved_state: String,
     error_code: Option<String>,
     manifest_id: Option<Uuid>,
+    remote_result_id: Option<Uuid>,
+    remote_video_url: Option<String>,
+    remote_expires_at_ms: Option<i64>,
+    remote_evidence_sha256_hex: Option<String>,
     authority_id: Option<Uuid>,
     storage_backend: Option<String>,
     storage_namespace: Option<String>,
@@ -331,6 +337,9 @@ impl ExecutorTerminalStore for PostgresExecutorTerminalStore {
                    claimed.lease_expires_at_ms AS reducer_lease_expires_at_ms,
                    decision.resolved_state, decision.error_code,
                    manifest.manifest_id, authority.authority_id,
+                   remote.remote_result_id, remote.video_url AS remote_video_url,
+                   remote.expires_at_ms AS remote_expires_at_ms,
+                   remote.evidence_sha256_hex AS remote_evidence_sha256_hex,
                    authority.storage_backend, authority.storage_namespace,
                    authority.object_key, authority.sha256_hex,
                    authority.byte_size, authority.media_type
@@ -352,6 +361,10 @@ impl ExecutorTerminalStore for PostgresExecutorTerminalStore {
               ON manifest.manifest_id = decision.result_manifest_id
              AND manifest.executor_execution_id = claimed.executor_execution_id
              AND manifest.submission_id = claimed.submission_id
+            LEFT JOIN provider_remote_video_results remote
+              ON remote.remote_result_id = decision.remote_result_id
+             AND remote.executor_execution_id = claimed.executor_execution_id
+             AND remote.submission_id = claimed.submission_id
             LEFT JOIN executor_artifact_authorities authority
               ON authority.authority_id = manifest.artifact_authority_id
              AND authority.executor_execution_id = claimed.executor_execution_id
@@ -456,6 +469,31 @@ impl ExecutorTerminalStore for PostgresExecutorTerminalStore {
 
 fn terminal_lease(row: ClaimedTerminalRow) -> Result<ExecutorTerminalLease, ExecutorTerminalError> {
     let outcome = match row.resolved_state.as_str() {
+        "succeeded" if row.remote_result_id.is_some() => {
+            if row.remote_result_id != Some(row.executor_execution_id)
+                || row.manifest_id.is_some()
+                || row.authority_id.is_some()
+                || row.error_code.is_some()
+            {
+                return Err(ExecutorTerminalError::Conflict);
+            }
+            let result = RemoteVideoResult::new(
+                row.remote_video_url
+                    .clone()
+                    .ok_or(ExecutorTerminalError::Conflict)?,
+                row.remote_expires_at_ms,
+            )
+            .map_err(|_| ExecutorTerminalError::Conflict)?;
+            let remote = ExecutorTerminalRemoteVideo {
+                remote_result_id: row.executor_execution_id,
+                result,
+                evidence_sha256_hex: row
+                    .remote_evidence_sha256_hex
+                    .clone()
+                    .ok_or(ExecutorTerminalError::Conflict)?,
+            };
+            CanonicalExecutorOutcome::SucceededRemoteVideo(remote)
+        }
         "succeeded" => CanonicalExecutorOutcome::Succeeded(ExecutorTerminalArtifact {
             authority_id: row.authority_id.ok_or(ExecutorTerminalError::Conflict)?,
             storage_backend: row.storage_backend.ok_or(ExecutorTerminalError::Conflict)?,

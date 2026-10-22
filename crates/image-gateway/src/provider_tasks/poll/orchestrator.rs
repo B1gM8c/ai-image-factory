@@ -311,6 +311,28 @@ where
                 }
                 self.record_artifact(lease, publication).await
             }
+            Ok(PollObservation::CompletedRemoteVideo(completed)) => {
+                if sink.into_pristine().is_err() || lease.task.provider_id != "dreamina-cli" {
+                    return self
+                        .record_uncertain(lease, "provider_poll_remote_contract")
+                        .await;
+                }
+                if !provider_request_matches(
+                    lease,
+                    completed.provider_request_id().map(|value| value.as_str()),
+                ) {
+                    return self
+                        .record_uncertain(lease, "provider_poll_request_mismatch")
+                        .await;
+                }
+                self.record(
+                    lease,
+                    ProviderTaskObservationOutcome::RemoteReady {
+                        result: completed.result().clone(),
+                    },
+                )
+                .await
+            }
             Ok(PollObservation::Failed(failure)) => {
                 if sink.into_pristine().is_err() {
                     return self
@@ -496,6 +518,7 @@ fn verified_terminal_failure(failure: &ProviderFailure) -> bool {
 fn event_identity(lease: &ProviderTaskLease, outcome: &ProviderTaskObservationOutcome) -> String {
     let suffix = match outcome {
         ProviderTaskObservationOutcome::Waiting { .. } => "waiting".to_owned(),
+        ProviderTaskObservationOutcome::RemoteReady { .. } => "remote-video".to_owned(),
         ProviderTaskObservationOutcome::ArtifactReady { publication, .. } => {
             format!("artifact:{}", publication.manifest().manifest_id().simple())
         }
