@@ -193,6 +193,7 @@ crate 不拥有 SQL、租户身份、公共 HTTP DTO、定价或账户选择。
 | API 面 | 当前状态 | 兼容声明 |
 | --- | --- | --- |
 | `POST /v1/images/generations` | 已实现 | OpenAI/xAI 风格路由；具体字段受所选 binding 能力约束 |
+| `GET /v1/console/projects/{project_id}/images/generations/status` | 已实现 | 项目 API Key + 原始 `Idempotency-Key` 只读查询；当前仅覆盖 OpenAI 图片生成 profile，不查询编辑或其他 Provider |
 | `POST /v1/images/edits` | 已实现 | 支持的模型与参考图数量由路由能力决定 |
 | `POST /v1/videos/generations` | 默认关闭 | xAI 形状异步接口；新请求使用 Grok CLI 1.0.34 V2 子集，旧 V1 job 仅 replay |
 | `GET /v1/videos/{request_id}` | 默认关闭 | 返回 Factory Job 状态，不伪造 Provider 原生任务 ID |
@@ -210,6 +211,17 @@ crate 不拥有 SQL、租户身份、公共 HTTP DTO、定价或账户选择。
 
 这些术语都不表示供应商认证。公开错误响应不会包含 Provider stderr、凭据、内部账户 ID、
 上游原始响应或内部任务状态。
+
+状态查询沿用原 `POST` 的项目级 API Key 作用域和摘要算法；同项目有 `ImagesWrite` 权限的
+Key 只要知道原始幂等键，就可读取这份最小状态元数据。未命中及跨项目统一返回 404，
+缺失或无效的幂等键返回 400。响应只包含 `state`、`requested_count`、各 `outputs[index,state]`、
+`terminal` 和 `reconciliation_required`，并禁止缓存。`terminal=true` 要求业务作业已成功或失败且
+对应账务预留已结清；`uncertain` 始终不是终态。该接口不创建任务、不重试、不结算，也不返回部分成功
+的图片地址；即使 `terminal=true`，也不代表图片仍可取回。Blog 自动交付图片需要另行定义受保留期
+约束的持久产物合同。只有 `terminal=true` 且 `state=succeeded` 时，才可在结果保留期内用完全相同的
+请求体和幂等键尝试原 `POST` 的结果重放；其余状态不能据此自动重提或重试。
+`receiving` 或 `aborted` 尚未关联作业时，`requested_count=0` 且 `outputs=[]`。
+这两个状态的 `reconciliation_required=false` 仅表示尚无已知不确定作业或账务异常，不是允许自动重发的信号。
 
 ## 安全与可靠性
 

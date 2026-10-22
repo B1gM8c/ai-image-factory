@@ -14,8 +14,9 @@ use axum::{
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use gpt_image_2_gateway::{
-    AppConfig, EditJob, GeneratedImage, GenerationJob, ImageGatewayError, ImageGenerator,
-    InMemoryUsageStore, build_router,
+    ApiKeyPermissionMode, ApiKeyPermissions, ApiKeyStore, AppConfig, EditJob, GeneratedImage,
+    GenerationJob, ImageGatewayError, ImageGenerator, InMemoryApiKeyStore, InMemoryUsageStore,
+    build_router, build_router_with_api_key_store,
 };
 use image::{ImageBuffer, ImageFormat, Rgba};
 use serde_json::{Value, json};
@@ -136,6 +137,215 @@ async fn concurrent_idempotent_requests_have_one_provider_execution() {
     };
     assert_error(rejected, StatusCode::CONFLICT, "idempotency_in_progress");
     assert_eq!(generator.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn project_image_status_uses_original_key_without_reexecution_or_disclosure() {
+    let generator = CountingGenerator::new(Duration::ZERO);
+    let keys = Arc::new(InMemoryApiKeyStore::default());
+    let first = keys
+        .create_service_account(
+            "proj_default",
+            "Image client",
+            ApiKeyPermissionMode::All,
+            ApiKeyPermissions::default(),
+        )
+        .await
+        .expect("create first API key");
+    let same_project = keys
+        .create_service_account(
+            "proj_default",
+            "Second image client",
+            ApiKeyPermissionMode::All,
+            ApiKeyPermissions::default(),
+        )
+        .await
+        .expect("create second project API key");
+    let other_project = keys.create_project("Other project").await.expect("project");
+    let other = keys
+        .create_service_account(
+            &other_project.id,
+            "Other client",
+            ApiKeyPermissionMode::All,
+            ApiKeyPermissions::default(),
+        )
+        .await
+        .expect("create other API key");
+    let read_only = keys
+        .create_service_account(
+            "proj_default",
+            "Read-only client",
+            ApiKeyPermissionMode::ReadOnly,
+            ApiKeyPermissions::default(),
+        )
+        .await
+        .expect("create read-only API key");
+    let app = build_router_with_api_key_store(
+        config(),
+        Arc::new(generator.clone()),
+        Arc::new(InMemoryUsageStore::default()),
+        keys,
+    );
+    let mut body = generation_body("status lookup");
+    body["n"] = json!(2);
+    let post = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/images/generations")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", first.api_key.value),
+                )
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("idempotency-key", "status-original-key")
+                .body(Body::from(body.to_string()))
+                .expect("POST request"),
+        )
+        .await
+        .expect("POST response");
+    assert_eq!(post.status(), StatusCode::OK);
+
+    let path = "/v1/console/projects/proj_default/images/generations/status";
+    let (status, headers, result) = status_get(
+        app.clone(),
+        path,
+        &first.api_key.value,
+        Some("status-original-key"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers[header::CACHE_CONTROL], "no-store, max-age=0");
+    assert_eq!(result["state"], "succeeded");
+    assert_eq!(result["requested_count"], 2);
+    assert_eq!(
+        result["outputs"],
+        json!([{"index": 0, "state": "succeeded"}, {"index": 1, "state": "succeeded"}])
+    );
+    assert_eq!(result["terminal"], true);
+    assert_eq!(result["reconciliation_required"], false);
+    for forbidden in [
+        "job_id",
+        "prompt",
+        "key_digest",
+        "artifact",
+        "price",
+        "amount",
+    ] {
+        assert!(result.get(forbidden).is_none(), "unexpected {forbidden}");
+    }
+    let repeated = status_get(
+        app.clone(),
+        path,
+        &first.api_key.value,
+        Some("status-original-key"),
+    )
+    .await;
+    assert_eq!(repeated.0, StatusCode::OK);
+    assert_eq!(repeated.2, result);
+    assert_eq!(generator.calls.load(Ordering::SeqCst), 1);
+    let same_project_result = status_get(
+        app.clone(),
+        path,
+        &same_project.api_key.value,
+        Some("status-original-key"),
+    )
+    .await;
+    assert_eq!(same_project_result.0, StatusCode::OK);
+    assert_eq!(same_project_result.2, result);
+
+    assert_eq!(
+        status_get(app.clone(), path, &first.api_key.value, Some("unknown-key"))
+            .await
+            .0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        status_get(
+            app.clone(),
+            path,
+            &other.api_key.value,
+            Some("status-original-key")
+        )
+        .await
+        .0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        status_get(
+            app.clone(),
+            path,
+            &read_only.api_key.value,
+            Some("status-original-key")
+        )
+        .await
+        .0,
+        StatusCode::FORBIDDEN
+    );
+    let other_path = format!(
+        "/v1/console/projects/{}/images/generations/status",
+        other_project.id
+    );
+    assert_eq!(
+        status_get(
+            app.clone(),
+            &other_path,
+            &first.api_key.value,
+            Some("status-original-key")
+        )
+        .await
+        .0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        status_get(app.clone(), path, &first.api_key.value, None)
+            .await
+            .0,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        status_get(app.clone(), path, &first.api_key.value, Some("has space"))
+            .await
+            .0,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        status_get(app, path, "test-token", Some("status-original-key"))
+            .await
+            .0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(generator.calls.load(Ordering::SeqCst), 1);
+}
+
+async fn status_get(
+    app: axum::Router,
+    path: &str,
+    bearer: &str,
+    key: Option<&str>,
+) -> (StatusCode, HeaderMap, Value) {
+    let mut request = Request::builder()
+        .method(Method::GET)
+        .uri(path)
+        .header(header::AUTHORIZATION, format!("Bearer {bearer}"));
+    if let Some(key) = key {
+        request = request.header("idempotency-key", key);
+    }
+    let response = app
+        .oneshot(request.body(Body::empty()).expect("status request"))
+        .await
+        .expect("status response");
+    let status = response.status();
+    let headers = response.headers().clone();
+    let bytes = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("status body");
+    (
+        status,
+        headers,
+        serde_json::from_slice(&bytes).expect("status JSON"),
+    )
 }
 
 #[tokio::test]

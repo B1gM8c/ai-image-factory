@@ -72,6 +72,7 @@ use crate::{
         ProviderCostObligationDetail, ProviderCostObligationEventView, ProviderCostObligationList,
         ProviderCostObligationSummary, ProviderCostObligationView,
     },
+    settlement::{ImageGenerationStatusSnapshot, ImageOutputStatus},
     webhooks::{
         CreateProjectWebhookRequest, CreatedProjectWebhook, DeletedProjectWebhook,
         ProjectWebhookDelivery, ProjectWebhookDeliveryList, ProjectWebhookEndpoint,
@@ -118,6 +119,7 @@ pub fn openapi_json() -> Json<Value> {
 #[openapi(
     paths(
         create_image,
+        get_image_generation_status,
         edit_image,
         create_video,
         get_video,
@@ -222,6 +224,8 @@ pub fn openapi_json() -> Json<Value> {
         readyz,
     ),
     components(schemas(
+        ImageGenerationStatusSnapshot,
+        ImageOutputStatus,
         ImageGenerationProfileRequestDoc,
         ImageGenerationProfileResponseDoc,
         ImageGenerationRequestDoc,
@@ -537,6 +541,26 @@ impl Modify for SecurityAddon {
 )]
 #[allow(dead_code)]
 async fn create_image() {}
+
+#[utoipa::path(
+    get,
+    path = "/v1/console/projects/{project_id}/images/generations/status",
+    tag = "Console",
+    security(("BearerAuth" = [])),
+    params(
+        ("project_id" = String, Path, description = "Project bound to the Bearer API key"),
+        ("Idempotency-Key" = String, Header, description = "Required original 1-255 character visible ASCII key from an OpenAI-profile image generation POST")
+    ),
+    responses(
+        (status = 200, description = "Read-only aggregate and per-output status; no image bytes, partial artifact URL, job ID, prompt, or billing amount. terminal=true requires completed business and billing states but does not imply artifact availability. Cache-Control: no-store.", body = ImageGenerationStatusSnapshot),
+        (status = 400, description = "Missing or invalid Idempotency-Key", body = ErrorResponseDoc),
+        (status = 401, description = "Invalid project API key", body = ErrorResponseDoc),
+        (status = 403, description = "API key lacks images write permission", body = ErrorResponseDoc),
+        (status = 404, description = "Unknown key or different project/profile/operation", body = ErrorResponseDoc)
+    )
+)]
+#[allow(dead_code)]
+async fn get_image_generation_status() {}
 
 #[utoipa::path(
     post,
@@ -3729,6 +3753,24 @@ struct ErrorBodyDoc {
 #[cfg(test)]
 mod tests {
     use super::openapi_json;
+
+    #[test]
+    fn image_status_openapi_requires_original_idempotency_key() {
+        let axum::Json(document) = openapi_json();
+        let route = &document["paths"]["/v1/console/projects/{project_id}/images/generations/status"]
+            ["get"];
+        assert!(route.is_object());
+        assert!(
+            route["parameters"]
+                .as_array()
+                .is_some_and(|parameters| parameters.iter().any(|parameter| {
+                    parameter["name"] == "Idempotency-Key" && parameter["required"] == true
+                }))
+        );
+        assert!(document["components"]["schemas"]["ImageGenerationStatusSnapshot"]["properties"]
+            ["reconciliation_required"]
+            .is_object());
+    }
 
     #[test]
     fn provider_cost_allocation_openapi_exposes_receipt_exact_close() {
