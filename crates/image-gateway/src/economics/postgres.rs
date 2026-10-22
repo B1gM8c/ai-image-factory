@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use sqlx::{Acquire, PgPool, Postgres, Transaction};
 use uuid::Uuid;
@@ -138,6 +139,8 @@ struct SubmissionIdentity {
     submission_state: String,
     submission_error_code: Option<String>,
     result_manifest_id: Option<Uuid>,
+    remote_result_id: Option<Uuid>,
+    remote_evidence_sha256_hex: Option<String>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -651,7 +654,10 @@ pub(crate) async fn settle_receipt_in_transaction(
         r#"
             SELECT output_id, job_id, tenant_id, provider_id,
                    state AS submission_state, error_code AS submission_error_code,
-                   result_manifest_id
+                   result_manifest_id, remote_result_id,
+               (SELECT remote.evidence_sha256_hex FROM provider_remote_video_results remote
+                WHERE remote.remote_result_id = provider_submissions.remote_result_id
+                  AND remote.submission_id = provider_submissions.submission_id) AS remote_evidence_sha256_hex
             FROM provider_submissions
             WHERE submission_id = $1
             FOR UPDATE
@@ -897,7 +903,10 @@ pub(crate) async fn record_v4_provider_receipt_in_transaction(
         r#"
         SELECT output_id, job_id, tenant_id, provider_id,
                state AS submission_state, error_code AS submission_error_code,
-               result_manifest_id
+               result_manifest_id, remote_result_id,
+               (SELECT remote.evidence_sha256_hex FROM provider_remote_video_results remote
+                WHERE remote.remote_result_id = provider_submissions.remote_result_id
+                  AND remote.submission_id = provider_submissions.submission_id) AS remote_evidence_sha256_hex
         FROM provider_submissions
         WHERE submission_id = $1
         FOR UPDATE
@@ -1024,7 +1033,10 @@ async fn load_submission_identity(
         r#"
         SELECT output_id, job_id, tenant_id, provider_id,
                state AS submission_state, error_code AS submission_error_code,
-               result_manifest_id
+               result_manifest_id, remote_result_id,
+               (SELECT remote.evidence_sha256_hex FROM provider_remote_video_results remote
+                WHERE remote.remote_result_id = provider_submissions.remote_result_id
+                  AND remote.submission_id = provider_submissions.submission_id) AS remote_evidence_sha256_hex
         FROM provider_submissions
         WHERE submission_id = $1
         "#,
@@ -1042,22 +1054,61 @@ fn validate_provider_evidence(
 ) -> Result<(), EconomicSettlementError> {
     let valid = match receipt.outcome {
         EconomicReceiptOutcome::Succeeded => {
-            submission.submission_state == "succeeded" && submission.result_manifest_id.is_some()
+            if let Some(remote_result_id) = submission.remote_result_id {
+                let remote_id = remote_result_id.to_string();
+                let evidence = &receipt.evidence;
+                submission.submission_state == "succeeded"
+                    && submission.result_manifest_id.is_none()
+                    && submission.provider_id == "dreamina-cli"
+                    && receipt.receipt_schema == "executor.resolution.v1"
+                    && evidence.get("artifact").is_none()
+                    && evidence.get("submission_id").and_then(Value::as_str)
+                        == Some(receipt.submission_id.to_string().as_str())
+                    && evidence
+                        .get("executor_execution_id")
+                        .and_then(Value::as_str)
+                        == Some(remote_id.as_str())
+                    && evidence
+                        .get("resolution_decision_id")
+                        .and_then(Value::as_str)
+                        == Some(remote_id.as_str())
+                    && evidence.get("resolved_state").and_then(Value::as_str) == Some("succeeded")
+                    && evidence
+                        .pointer("/remote_video/remote_result_id")
+                        .and_then(Value::as_str)
+                        == Some(remote_id.as_str())
+                    && submission
+                        .remote_evidence_sha256_hex
+                        .as_deref()
+                        .is_some_and(|expected| {
+                            evidence
+                                .pointer("/remote_video/evidence_sha256_hex")
+                                .and_then(Value::as_str)
+                                == Some(expected)
+                        })
+            } else {
+                submission.submission_state == "succeeded"
+                    && submission.result_manifest_id.is_some()
+            }
         }
         EconomicReceiptOutcome::Failed => {
             submission.submission_state == "failed"
                 && submission.result_manifest_id.is_none()
+                && submission.remote_result_id.is_none()
                 && submission.submission_error_code.as_deref() != Some("provider_no_effect")
         }
         EconomicReceiptOutcome::NoEffect => {
             submission.result_manifest_id.is_none()
+                && submission.remote_result_id.is_none()
                 && ((submission.submission_state == "failed"
                     && submission.submission_error_code.as_deref() == Some("provider_no_effect"))
                     || (submission.submission_state == "canceled"
                         && submission.submission_error_code.is_some()))
         }
         EconomicReceiptOutcome::Uncertain => {
-            submission.submission_state == "uncertain" && submission.result_manifest_id.is_none()
+            submission.submission_state == "uncertain"
+                && submission.result_manifest_id.is_none()
+                && submission.remote_result_id.is_none()
         }
     };
     if valid {
@@ -1391,6 +1442,65 @@ fn unavailable(_: sqlx::Error) -> AdmissionError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_video_receipt_requires_exact_canonical_metadata_without_local_artifact() {
+        let submission_id = Uuid::new_v4();
+        let remote_id = Uuid::new_v4();
+        let mut submission = SubmissionIdentity {
+            output_id: Uuid::new_v4(),
+            job_id: Uuid::new_v4(),
+            tenant_id: "test".to_string(),
+            provider_id: "dreamina-cli".to_string(),
+            submission_state: "succeeded".to_string(),
+            submission_error_code: None,
+            result_manifest_id: None,
+            remote_result_id: Some(remote_id),
+            remote_evidence_sha256_hex: Some("a".repeat(64)),
+        };
+        let evidence = serde_json::json!({
+            "submission_id": submission_id, "executor_execution_id": remote_id,
+            "resolution_decision_id": remote_id, "resolved_state": "succeeded",
+            "remote_video": {"remote_result_id": remote_id, "evidence_sha256_hex": "a".repeat(64)},
+        });
+        let receipt = EconomicReceipt::new(
+            submission_id,
+            EconomicReceiptOutcome::Succeeded,
+            "executor.resolution.v1",
+            evidence.clone(),
+        )
+        .unwrap();
+        assert!(validate_provider_evidence(&submission, &receipt).is_ok());
+        for (pointer, replacement) in [
+            (
+                "/remote_video/evidence_sha256_hex",
+                serde_json::json!("b".repeat(64)),
+            ),
+            (
+                "/remote_video/remote_result_id",
+                serde_json::json!(Uuid::new_v4()),
+            ),
+            ("/submission_id", serde_json::json!(Uuid::new_v4())),
+        ] {
+            let mut forged = evidence.clone();
+            *forged.pointer_mut(pointer).unwrap() = replacement;
+            let receipt = EconomicReceipt::new(
+                submission_id,
+                EconomicReceiptOutcome::Succeeded,
+                "executor.resolution.v1",
+                forged,
+            )
+            .unwrap();
+            assert!(validate_provider_evidence(&submission, &receipt).is_err());
+        }
+        submission.result_manifest_id = Some(submission_id);
+        assert!(validate_provider_evidence(&submission, &receipt).is_err());
+        submission.remote_result_id = None;
+        assert!(
+            validate_provider_evidence(&submission, &receipt).is_ok(),
+            "existing local success contract must remain intact"
+        );
+    }
 
     fn locked_job(
         output_count: i32,

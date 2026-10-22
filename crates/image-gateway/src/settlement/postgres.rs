@@ -176,7 +176,7 @@ impl ExecutionSettlementStore for PostgresExecutionSettlementStore {
         let row: Option<VideoStatusRow> = sqlx::query_as(
             r#"
             SELECT j.state, w.state, j.last_error_code, j.model, j.billable_units,
-                   artifact.artifact_id
+                   artifact.artifact_id, remote.video_url, remote.expires_at_ms
             FROM jobs j
             JOIN work_items w ON w.job_id = j.job_id
             LEFT JOIN artifacts artifact
@@ -184,6 +184,29 @@ impl ExecutionSettlementStore for PostgresExecutionSettlementStore {
              AND artifact.output_index = 0
              AND artifact.state = 'ready'
              AND artifact.media_type = 'video/mp4'
+            LEFT JOIN provider_submissions submission
+              ON submission.job_id = j.job_id
+             AND submission.tenant_id = j.tenant_id
+             AND submission.work_item_id = w.work_item_id
+             AND submission.state = 'succeeded'
+             AND submission.remote_result_id IS NOT NULL
+            LEFT JOIN executor_terminal_reductions reduction
+              ON reduction.submission_id = submission.submission_id
+             AND reduction.executor_execution_id = submission.executor_execution_id
+             AND reduction.state = 'completed'
+             AND reduction.resolved_state = 'succeeded'
+            LEFT JOIN provider_remote_video_results remote
+              ON remote.remote_result_id = reduction.remote_result_id
+             AND remote.remote_result_id = submission.remote_result_id
+             AND remote.submission_id = submission.submission_id
+             AND remote.executor_execution_id = submission.executor_execution_id
+             AND j.provider_id = 'dreamina-cli'
+             AND EXISTS (
+                 SELECT 1 FROM job_response_projections projection
+                 WHERE projection.job_id = j.job_id
+                   AND projection.artifact_count = 0
+                   AND projection.remote_result_count = 1
+             )
             WHERE j.job_id = $1 AND j.tenant_id = $2
               AND j.operation = 'video_generation'
               AND j.economics_contract_version IN (3, 4)
@@ -207,7 +230,7 @@ impl ExecutionSettlementStore for PostgresExecutionSettlementStore {
         let row: Option<VideoStatusRow> = sqlx::query_as(
             r#"
                 SELECT j.state, w.state, j.last_error_code, j.model, j.billable_units,
-                       artifact.artifact_id
+                       artifact.artifact_id, remote.video_url, remote.expires_at_ms
                 FROM jobs j
                 JOIN work_items w ON w.job_id = j.job_id
                 JOIN job_auth_attributions attribution
@@ -217,6 +240,29 @@ impl ExecutionSettlementStore for PostgresExecutionSettlementStore {
                  AND artifact.output_index = 0
                  AND artifact.state = 'ready'
                  AND artifact.media_type = 'video/mp4'
+                LEFT JOIN provider_submissions submission
+                  ON submission.job_id = j.job_id
+                 AND submission.tenant_id = j.tenant_id
+                 AND submission.work_item_id = w.work_item_id
+                 AND submission.state = 'succeeded'
+                 AND submission.remote_result_id IS NOT NULL
+                LEFT JOIN executor_terminal_reductions reduction
+                  ON reduction.submission_id = submission.submission_id
+                 AND reduction.executor_execution_id = submission.executor_execution_id
+                 AND reduction.state = 'completed'
+                 AND reduction.resolved_state = 'succeeded'
+                LEFT JOIN provider_remote_video_results remote
+                  ON remote.remote_result_id = reduction.remote_result_id
+                 AND remote.remote_result_id = submission.remote_result_id
+                 AND remote.submission_id = submission.submission_id
+                 AND remote.executor_execution_id = submission.executor_execution_id
+                 AND j.provider_id = 'dreamina-cli'
+                 AND EXISTS (
+                     SELECT 1 FROM job_response_projections projection
+                     WHERE projection.job_id = j.job_id
+                       AND projection.artifact_count = 0
+                       AND projection.remote_result_count = 1
+                 )
                 WHERE j.job_id = $1 AND j.tenant_id = $2
                   AND attribution.project_id = $3
                   AND ($4::UUID IS NULL OR attribution.actor_user_id = $4)
@@ -244,7 +290,7 @@ impl ExecutionSettlementStore for PostgresExecutionSettlementStore {
         let row: Option<VideoStatusWithMetadataRow> = sqlx::query_as(
             r#"
                 SELECT j.state, w.state, j.last_error_code, j.model, j.billable_units,
-                       artifact.artifact_id,
+                       artifact.artifact_id, remote.video_url, remote.expires_at_ms,
                        payload.command_json -> 'model_version',
                        payload.command_json -> 'video_resolution',
                        payload.command_json -> 'ratio'
@@ -262,6 +308,29 @@ impl ExecutionSettlementStore for PostgresExecutionSettlementStore {
                  AND artifact.output_index = 0
                  AND artifact.state = 'ready'
                  AND artifact.media_type = 'video/mp4'
+                LEFT JOIN provider_submissions submission
+                  ON submission.job_id = j.job_id
+                 AND submission.tenant_id = j.tenant_id
+                 AND submission.work_item_id = w.work_item_id
+                 AND submission.state = 'succeeded'
+                 AND submission.remote_result_id IS NOT NULL
+                LEFT JOIN executor_terminal_reductions reduction
+                  ON reduction.submission_id = submission.submission_id
+                 AND reduction.executor_execution_id = submission.executor_execution_id
+                 AND reduction.state = 'completed'
+                 AND reduction.resolved_state = 'succeeded'
+                LEFT JOIN provider_remote_video_results remote
+                  ON remote.remote_result_id = reduction.remote_result_id
+                 AND remote.remote_result_id = submission.remote_result_id
+                 AND remote.submission_id = submission.submission_id
+                 AND remote.executor_execution_id = submission.executor_execution_id
+                 AND j.provider_id = 'dreamina-cli'
+                 AND EXISTS (
+                     SELECT 1 FROM job_response_projections projection
+                     WHERE projection.job_id = j.job_id
+                       AND projection.artifact_count = 0
+                       AND projection.remote_result_count = 1
+                 )
                 WHERE j.job_id = $1 AND j.tenant_id = $2
                   AND attribution.project_id = $3
                   AND ($4::UUID IS NULL OR attribution.actor_user_id = $4)
@@ -285,13 +354,22 @@ impl ExecutionSettlementStore for PostgresExecutionSettlementStore {
                 model,
                 units,
                 artifact,
+                remote_url,
+                remote_expires_at_ms,
                 provider_model,
                 resolution,
                 ratio,
             )| {
                 Ok((
                     video_result_status((
-                        job_state, work_state, error_code, model, units, artifact,
+                        job_state,
+                        work_state,
+                        error_code,
+                        model,
+                        units,
+                        artifact,
+                        remote_url,
+                        remote_expires_at_ms,
                     ))?,
                     video_request_metadata(provider_model, resolution, ratio),
                 ))
@@ -441,7 +519,16 @@ impl ExecutionSettlementStore for PostgresExecutionSettlementStore {
     }
 }
 
-type VideoStatusRow = (String, String, Option<String>, String, i32, Option<Uuid>);
+type VideoStatusRow = (
+    String,
+    String,
+    Option<String>,
+    String,
+    i32,
+    Option<Uuid>,
+    Option<String>,
+    Option<i64>,
+);
 type VideoStatusWithMetadataRow = (
     String,
     String,
@@ -449,6 +536,8 @@ type VideoStatusWithMetadataRow = (
     String,
     i32,
     Option<Uuid>,
+    Option<String>,
+    Option<i64>,
     Option<serde_json::Value>,
     Option<serde_json::Value>,
     Option<serde_json::Value>,
@@ -470,17 +559,40 @@ fn video_request_metadata(
 }
 
 fn video_result_status(row: VideoStatusRow) -> Result<VideoResultStatus, ImageGatewayError> {
-    let (job_state, work_state, error_code, model, billable_units, artifact_id) = row;
+    let (
+        job_state,
+        work_state,
+        error_code,
+        model,
+        billable_units,
+        artifact_id,
+        remote_url,
+        remote_expires_at_ms,
+    ) = row;
     let duration = u8::try_from(billable_units)
         .ok()
         .filter(|duration| *duration > 0)
         .ok_or_else(ImageGatewayError::artifact_integrity)?;
     if job_state == "succeeded" {
-        Ok(VideoResultStatus::Succeeded {
-            model,
-            duration,
-            artifact_id: artifact_id.ok_or_else(ImageGatewayError::artifact_integrity)?,
-        })
+        match (artifact_id, remote_url) {
+            (Some(artifact_id), None) if remote_expires_at_ms.is_none() => {
+                Ok(VideoResultStatus::Succeeded {
+                    model,
+                    duration,
+                    artifact_id,
+                })
+            }
+            (None, Some(url)) => {
+                let result = image_provider_sdk::RemoteVideoResult::new(url, remote_expires_at_ms)
+                    .map_err(|_| ImageGatewayError::artifact_integrity())?;
+                Ok(VideoResultStatus::SucceededRemote {
+                    model,
+                    duration,
+                    result,
+                })
+            }
+            _ => Err(ImageGatewayError::artifact_integrity()),
+        }
     } else if job_state == "failed" || work_state == "failed" {
         Ok(VideoResultStatus::Failed {
             model,
@@ -1029,6 +1141,38 @@ mod tests {
         DreaminaSubmitRequestV1, TextToVideoRequestV1, VideoModelVersion, VideoRatio,
         VideoResolution, encode_submit_command,
     };
+
+    #[test]
+    fn successful_video_requires_exactly_one_delivery_source() {
+        let url = "https://media.example.com/video.mp4?signature=a%2Bb";
+        let row = |artifact, remote| {
+            (
+                "succeeded".to_owned(),
+                "succeeded".to_owned(),
+                None,
+                "seedance2.5".to_owned(),
+                5,
+                artifact,
+                remote,
+                None,
+            )
+        };
+        let artifact = Uuid::new_v4();
+        assert!(
+            matches!(video_result_status(row(Some(artifact), None)).unwrap(),
+            VideoResultStatus::Succeeded { artifact_id, .. } if artifact_id == artifact)
+        );
+        let VideoResultStatus::SucceededRemote { result, .. } =
+            video_result_status(row(None, Some(url.to_owned()))).unwrap()
+        else {
+            panic!("expected remote delivery");
+        };
+        assert_eq!(result.video_url(), url);
+        assert_eq!(result.expires_at_ms(), None);
+        assert!(video_result_status(row(None, None)).is_err());
+        assert!(video_result_status(row(Some(artifact), Some(url.to_owned()))).is_err());
+        assert!(video_result_status(row(None, Some("file:///tmp/video.mp4".to_owned()))).is_err());
+    }
 
     #[test]
     fn video_metadata_comes_from_the_frozen_dreamina_command() {

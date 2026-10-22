@@ -16,7 +16,19 @@ use uuid::Uuid;
 
 type TestResult<T = ()> = Result<T, String>;
 
-const REQUIRED_COLUMNS: [(&str, &str); 984] = [
+const REQUIRED_COLUMNS: [(&str, &str); 996] = [
+    ("provider_remote_video_results", "remote_result_id"),
+    ("provider_remote_video_results", "executor_execution_id"),
+    ("provider_remote_video_results", "submission_id"),
+    ("provider_remote_video_results", "video_url"),
+    ("provider_remote_video_results", "expires_at_ms"),
+    ("provider_remote_video_results", "evidence_sha256_hex"),
+    ("provider_remote_video_results", "observed_at_ms"),
+    ("provider_task_observations", "remote_result_id"),
+    ("executor_resolution_decisions", "remote_result_id"),
+    ("provider_submissions", "remote_result_id"),
+    ("executor_terminal_reductions", "remote_result_id"),
+    ("job_response_projections", "remote_result_count"),
     ("executor_local_cleanup", "executor_execution_id"),
     ("executor_local_cleanup", "submission_id"),
     ("executor_local_cleanup", "execution_profile_id"),
@@ -1376,7 +1388,7 @@ async fn concurrent_fresh_migrations_are_repeatable() -> TestResult {
 }
 
 #[tokio::test]
-async fn schema_128_upgrades_to_135_without_changing_existing_provider_rows() -> TestResult {
+async fn schema_128_upgrades_to_136_without_changing_existing_provider_rows() -> TestResult {
     let Some(test_schema) = TestSchema::new(2).await? else {
         return Ok(());
     };
@@ -1400,13 +1412,13 @@ async fn schema_128_upgrades_to_135_without_changing_existing_provider_rows() ->
             "SELECT COALESCE(jsonb_agg(to_jsonb(account) ORDER BY provider_account_id), '[]'::jsonb) FROM provider_accounts account",
         ).fetch_one(&test_schema.pool).await.map_err(|error| error.to_string())?;
         require(before.as_array().is_some_and(|rows| rows.len() == 1), "fixture must contain an existing account")?;
-        gateway_result(run_migrations(&test_schema.pool).await, "128-to-135 migration")?;
-        gateway_result(verify_migrations(&test_schema.pool).await, "135 verification")?;
+        gateway_result(run_migrations(&test_schema.pool).await, "128-to-136 migration")?;
+        gateway_result(verify_migrations(&test_schema.pool).await, "136 verification")?;
         let after: serde_json::Value = sqlx::query_scalar(
             "SELECT COALESCE(jsonb_agg(to_jsonb(account) ORDER BY provider_account_id), '[]'::jsonb) FROM provider_accounts account",
         ).fetch_one(&test_schema.pool).await.map_err(|error| error.to_string())?;
         require(before == after, "sidecar migrations changed existing provider accounts")?;
-        require(migration_versions(&test_schema.pool).await?.last() == Some(&135), "upgrade must end at 135")?;
+        require(migration_versions(&test_schema.pool).await?.last() == Some(&136), "upgrade must end at 136")?;
         let new_rows: i64 = sqlx::query_scalar(
             "SELECT (SELECT COUNT(*) FROM media_segment_assets) + (SELECT COUNT(*) FROM media_segment_results) + (SELECT COUNT(*) FROM media_segment_worker_heartbeats) + (SELECT COUNT(*) FROM provider_account_quota_refreshes)",
         ).fetch_one(&test_schema.pool).await.map_err(|error| error.to_string())?;
@@ -3687,8 +3699,8 @@ async fn shared_pool_case(pool: &PgPool) -> TestResult {
 
 async fn assert_expected_schema(pool: &PgPool) -> TestResult {
     require(
-        migration_versions(pool).await? == (0_i64..=135_i64).collect::<Vec<_>>(),
-        "applied migration versions must be exactly 0 through 135",
+        migration_versions(pool).await? == (0_i64..=136_i64).collect::<Vec<_>>(),
+        "applied migration versions must be exactly 0 through 136",
     )?;
 
     let default_codex_prices: Vec<(String, i64, i64)> = sqlx::query_as(

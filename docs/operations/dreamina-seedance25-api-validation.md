@@ -36,12 +36,18 @@ Those fields are not measured output dimensions. Validate duration, dimensions,
 codec and playback separately using the produced video. No token usage is invented
 when the CLI does not report it.
 
-On success, `content.video_url` is the authenticated Factory path
-`/api/v3/files/{artifact_id}/content`. Resolve it against the Factory base URL and
-download with the same project key. Do not forward that key to an upstream CDN.
-The existing Blog path streams the Factory video into a temporary file and uploads
-it once to Qiniu; its final work URL is the Qiniu URL. Blog still needs an Ark
-response adapter. Do not mark Blog integration complete based on a CLI receipt.
+On success, `content.video_url` is the HTTPS video URL returned by Dreamina.
+Factory persists the provider result and settles the task without downloading,
+transcoding or storing the video. The client must fetch this URL without the
+Factory API key or owner cookies. The result remains scoped to the original
+Factory tenant, project and actor when querying the task.
+
+The CLI does not document a guaranteed URL lifetime. An absent upstream expiry
+remains unknown; Factory's local artifact retention policy does not apply to this
+URL. Consumers that need durable storage should copy the video promptly. Blog's
+adapter should download the upstream URL with its existing public-URL validation,
+then upload once to Qiniu and retain that Qiniu URL. No Factory media copy is
+needed. Other providers' existing authenticated Factory artifact URLs are unchanged.
 
 ## Runtime and overhead
 
@@ -64,8 +70,26 @@ processes retain a separate sixty-second limit. Lease heartbeats continue during
 the task; changing configuration does not extend already-submitted deadlines.
 
 Model help discovery runs only on refresh, with at most two commands in flight
-per refresh. Video sealing streams to the artifact sink, preserving hash and size
-verification. No transcoding or extra Qiniu copy is introduced.
+per refresh. Dreamina video queries omit `--download_dir`; successful URL evidence
+uses the existing terminal reduction transaction for a single customer charge.
+The video branch never writes the artifact sink. Image generation retains the
+existing downloaded-artifact path.
+
+## Migration and recovery
+
+Migration 0136 stores immutable upstream URL evidence separately from local media
+manifests. The existing resolution and terminal reduction transactions still own
+success, quota consumption and billing. Remote and local delivery are mutually
+exclusive; the API exposes the URL only after terminal settlement completes.
+
+During the first deployment, keep Dreamina dispatch disabled until normal Apply
+and runtime verification finish. The existing backup/restore path handles a failed
+Apply before new traffic is admitted. After remote results exist, an older binary
+that only understands local artifacts cannot serve those historical tasks. Drain
+Dreamina submissions and pending reductions before any later rollback, and retain
+a rollback build that understands migration 0136 and remote result reads. Do not
+switch back to the schema-135 application against a database containing remote
+video completions: its migration verifier rejects schema 136.
 
 ## USD tariff reference
 
@@ -107,12 +131,13 @@ revision with the 2.5 alias through the console and verify the project/key uses 
 The free `postgres_video_api::dreamina` integration test uses a disposable real
 PostgreSQL schema, the HTTP router, Workerd handoff, gated submit runner, actual
 Dreamina codec/poll driver and a local fake CLI. It verifies single submission,
-idempotent replay, metadata, tenant isolation, artifact bytes and settlement.
-Its MP4 is a transport fixture; it does not validate model quality or real media
-specifications. Real login, real generation, playback and credit delta are
-separate production evidence.
+idempotent replay, metadata, tenant isolation, byte-preserved URL delivery and
+single settlement without local media artifacts. Its URL is a fixture; it does
+not validate upstream URL access, model quality or real media specifications.
+Real login, real generation, playback and credit delta are separate production
+evidence.
 
 Only the single explicitly authorized production API task may incur provider
-cost. Record Factory task ID, upstream submit ID, terminal status, artifact hash,
+cost. Record Factory task ID, upstream submit ID, terminal status, returned URL evidence,
 actual video properties, before/after credits and the customer billing event.
 Do not retry or regenerate if any part is uncertain.

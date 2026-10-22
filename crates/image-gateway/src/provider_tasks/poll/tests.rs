@@ -169,6 +169,10 @@ impl ProviderPollStore for FakeStore {
         let mut task = lease.task.clone();
         match &observation.outcome {
             ProviderTaskObservationOutcome::Waiting { .. } => {}
+            ProviderTaskObservationOutcome::RemoteReady { .. } => {
+                task.state = ProviderTaskState::RemoteReady;
+                task.next_poll_at_ms = None;
+            }
             ProviderTaskObservationOutcome::ArtifactReady { artifact_ref, .. } => {
                 task.state = ProviderTaskState::ArtifactReady;
                 task.artifact_ref = Some(artifact_ref.clone());

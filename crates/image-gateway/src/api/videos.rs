@@ -539,6 +539,25 @@ pub(super) fn video_response(status: VideoResultStatus) -> XaiVideoResponse {
                 url: Some(format!("/v1/files/{artifact_id}/content")),
             }),
         },
+        VideoResultStatus::SucceededRemote {
+            model,
+            duration,
+            result,
+        } => XaiVideoResponse {
+            factory_diagnostics: None,
+            status: "done".to_owned(),
+            error: None,
+            model: Some(model),
+            progress: Some(100),
+            usage: None,
+            video: Some(XaiGeneratedVideo {
+                duration,
+                respect_moderation: true,
+                file_output: None,
+                storage_error: None,
+                url: Some(result.video_url().to_owned()),
+            }),
+        },
         VideoResultStatus::Failed { error_code, .. } => XaiVideoResponse {
             factory_diagnostics: None,
             status: "failed".to_owned(),

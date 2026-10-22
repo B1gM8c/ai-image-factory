@@ -193,9 +193,18 @@ impl DreaminaCliQueryPolicyV1 {
         if request.download_dir().parent() != Some(self.workspace_root.path()) {
             return Err(DreaminaCliQueryPolicyError::DownloadDirectoryOutsideWorkspace);
         }
+        let working_directory = if request.downloads_media() {
+            self.workspace_root.clone()
+        } else {
+            let directory = WorkingDirectory::new_private(request.download_dir())?;
+            if directory.path().parent() != Some(self.workspace_root.path()) {
+                return Err(DreaminaCliQueryPolicyError::DownloadDirectoryOutsideWorkspace);
+            }
+            directory
+        };
         let mut command = CommandSpec::new_receipt(
             self.executable.clone(),
-            self.workspace_root.clone(),
+            working_directory,
             self.wall_timeout,
             self.termination_grace,
         )?

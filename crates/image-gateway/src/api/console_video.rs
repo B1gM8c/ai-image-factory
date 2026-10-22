@@ -847,6 +847,20 @@ fn console_video_status(
             )),
             error: None,
         },
+        VideoResultStatus::SucceededRemote {
+            model,
+            duration,
+            result,
+        } => ConsoleVideoStatus {
+            task_id: task_id.to_owned(),
+            status: "done",
+            stage: None,
+            model: Some(model),
+            duration: Some(duration),
+            progress: Some(100),
+            content_url: Some(result.video_url().to_owned()),
+            error: None,
+        },
         VideoResultStatus::Failed {
             model,
             duration,
@@ -1323,6 +1337,22 @@ mod tests {
                     .as_str()
             )
         );
+    }
+
+    #[test]
+    fn completed_remote_video_preserves_the_upstream_url() {
+        let url = "https://media.example.test/video.mp4?sign=a%2fb&x=1&x=2";
+        let status = console_video_status(
+            "proj_one",
+            "task-one",
+            VideoResultStatus::SucceededRemote {
+                model: "seedance2.5".to_owned(),
+                duration: 5,
+                result: image_provider_sdk::RemoteVideoResult::new(url.to_owned(), None).unwrap(),
+            },
+        );
+        assert_eq!(status.status, "done");
+        assert_eq!(status.content_url.as_deref(), Some(url));
     }
 
     #[test]

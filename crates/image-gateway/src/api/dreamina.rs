@@ -552,6 +552,20 @@ fn video_task(id: Uuid, status: VideoResultStatus) -> DreaminaVideoTask {
                 duration,
             }),
         },
+        VideoResultStatus::SucceededRemote {
+            model,
+            duration,
+            result,
+        } => DreaminaVideoTask {
+            id: id.to_string(),
+            status: "succeeded".to_owned(),
+            model: Some(model),
+            error: None,
+            content: Some(DreaminaVideoContent {
+                video_url: result.video_url().to_owned(),
+                duration,
+            }),
+        },
         VideoResultStatus::Failed {
             model, error_code, ..
         } => DreaminaVideoTask {

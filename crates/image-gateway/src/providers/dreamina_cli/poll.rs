@@ -22,8 +22,8 @@ use image_provider_dreamina_cli::{
 };
 use image_provider_sdk::{
     ArtifactMetadata, ArtifactSink, ArtifactSinkError, ArtifactSinkErrorKind, Completed,
-    EffectCertainty, PollObservation, ProviderFailure, ProviderFailureClass, RemoteOperationRef,
-    RetryDirective,
+    CompletedRemoteVideo, EffectCertainty, PollObservation, ProviderFailure, ProviderFailureClass,
+    RemoteOperationRef, RetryDirective,
 };
 
 const DEFAULT_POLL_AFTER_MS: u64 = 5_000;
@@ -129,6 +129,7 @@ impl DreaminaCliPollDriverV1 {
     async fn poll_operation<S: ArtifactSink>(
         &self,
         operation: &RemoteOperationRef,
+        remote_video: bool,
         sink: &mut S,
     ) -> Result<PollObservation, ProviderFailure> {
         let attempt = self
@@ -139,10 +140,20 @@ impl DreaminaCliPollDriverV1 {
         let working_directory = attempt
             .working_directory()
             .map_err(map_attempt_workspace_error)?;
-        let output = FreshOutputDirectory::new(&working_directory, self.max_artifact_bytes)
-            .map_err(map_fresh_output_error)?;
-        let request = QueryResultRequestV1::new(operation.operation_id(), &download_dir)
-            .map_err(|_| contract_failure("dreamina_poll_request_invalid"))?;
+        let output = if remote_video {
+            None
+        } else {
+            Some(
+                FreshOutputDirectory::new(&working_directory, self.max_artifact_bytes)
+                    .map_err(map_fresh_output_error)?,
+            )
+        };
+        let request = if remote_video {
+            QueryResultRequestV1::query_only(operation.operation_id(), &download_dir)
+        } else {
+            QueryResultRequestV1::new(operation.operation_id(), &download_dir)
+        }
+        .map_err(|_| contract_failure("dreamina_poll_request_invalid"))?;
         let receipt = self
             .runtime
             .run_receipt(&request, &mut NoopSpawnObserver)
@@ -152,6 +163,27 @@ impl DreaminaCliPollDriverV1 {
         if receipt.submit_id() != operation.operation_id() {
             return Err(contract_failure("dreamina_poll_receipt_mismatch"));
         }
+
+        if remote_video {
+            return match receipt.status() {
+                DreaminaQueryStatusV1::Querying => Ok(PollObservation::Pending {
+                    next_poll_after_ms: Some(DEFAULT_POLL_AFTER_MS),
+                }),
+                DreaminaQueryStatusV1::Failed => Ok(PollObservation::Failed(terminal_failure(
+                    "dreamina_generation_failed",
+                ))),
+                DreaminaQueryStatusV1::Success => {
+                    let result = receipt
+                        .remote_video_result()
+                        .cloned()
+                        .ok_or_else(|| contract_failure("dreamina_poll_video_url_invalid"))?;
+                    Ok(PollObservation::CompletedRemoteVideo(
+                        CompletedRemoteVideo::new(result, None),
+                    ))
+                }
+            };
+        }
+        let output = output.expect("image polling creates a fresh output directory");
 
         match receipt.status() {
             DreaminaQueryStatusV1::Querying => {
@@ -223,7 +255,12 @@ impl ProviderPollDriver for DreaminaCliPollDriverV1 {
         {
             return Err(contract_failure("dreamina_poll_binding_mismatch"));
         }
-        self.poll_operation(call.operation(), sink).await
+        self.poll_operation(
+            call.operation(),
+            context.operation_id() == "videos.generations",
+            sink,
+        )
+        .await
     }
 }
 
