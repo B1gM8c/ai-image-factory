@@ -6,8 +6,8 @@ release runbook.
 
 ## Release Unit
 
-Each protected `v*` tag produces two assets per architecture plus one
-architecture-independent bootstrap installer:
+A full validation run on a protected `v*` tag produces two assets per
+architecture plus one architecture-independent bootstrap installer:
 
 ```text
 ai-image-factory-VERSION-x86_64-unknown-linux-gnu.tar.gz
@@ -99,6 +99,65 @@ git push origin v1.0.0
 The workflow tests the workspace, builds both targets, creates a draft Release,
 uploads every asset, emits GitHub provenance attestations, and publishes only
 after all uploads succeed. Do not publish a partial draft manually.
+
+### Hotfix candidates before a formal Release
+
+For the reviewed admin API-key route editor and remote-submit observation fix,
+use the scoped hotfix profile to validate production behavior before publishing
+a formal Release. A hotfix candidate is an attested Actions artifact; it does
+not create a draft or published GitHub Release. The workflow name is **Linux
+hotfix candidates and immutable releases**; its path remains `release.yml` so
+the existing candidate verifiers continue to require the same signer identity.
+
+After merging the reviewed fix, create a new protected, signed annotated
+`v*.hotfix.*` tag on that exact commit and explicitly dispatch:
+
+```bash
+hotfix_version=v0.1.0-YYYYMMDD.hotfix.N.COMMIT
+git tag -s "$hotfix_version" -m "AI Image Factory hotfix candidate"
+git push origin "$hotfix_version"
+gh workflow run release.yml --ref "$hotfix_version" \
+  -f mode=candidate -f validation_profile=hotfix
+```
+
+Hotfix tags do not start the tag-push release workflow. The scoped profile
+accepts only `workflow_dispatch`, `mode=candidate`, and a protected hotfix tag
+whose signature and commit match the run. It keeps release-script, runtime,
+systemd, candidate-verifier, Rust formatting, and admin type checks. It runs
+the remote-submit module unit tests and the `gated_submit::` PostgreSQL
+regressions, using the same PostgreSQL service as full validation. It skips the
+full Rust workspace suite and recovery rehearsal and builds only
+`x86_64-unknown-linux-gnu`. The complete process set and admin bundle still pass
+manifest, digest, installer, and GitHub provenance checks; no locally assembled
+binary or unsigned package is accepted. Main-branch CI may run the full suite
+in parallel, independently of this candidate run.
+
+These focused tests cover this reviewed fix, not arbitrary future hotfixes.
+Changes to schemas, updater or recovery behavior, process hooks, database
+contracts, or another uncovered subsystem require full validation or a
+reviewed adjustment to the scoped gates before using this profile. The
+default remains `validation_profile=full`; ordinary releases and promotable
+full candidates retain both architectures and the existing complete gates.
+
+Deploy only after the candidate run succeeds. Independently verify the exact
+tag object, commit, run and attempt, architecture artifact ID, ZIP digest and
+size with `scripts/verify-candidate.py`; pin the verified manifest and bundle
+digests in the root-owned site candidate configuration. Keep admission and
+rollback managed by the normal updater: use the authenticated owner's
+**Check**, then **Apply**, and verify the current version, process health and
+fresh worker leases. Retain the previous release and updater backup/recovery
+evidence. A failed Apply uses the existing backup-and-restore recovery path;
+do not edit `current`, overwrite live binaries, or bypass the owner workflow.
+Application acceptance, including any authorized paid canary, is a separate
+step after deployment.
+
+Hotfix runs never upload `candidate-publication`, so their single-architecture
+bytes cannot be promoted directly. Once production acceptance is complete,
+run full validation on the intended release tag to produce both architectures
+and all five publication assets. Only a full candidate can later be promoted
+with its exact publication pin, or use the normal protected non-hotfix tag
+publication flow. Do not reuse a hotfix acceptance result as full-release
+validation evidence.
 
 Download the published assets, copy them into a root-owned directory, and verify
 those protected copies. The installer refuses caller-writable paths, so the

@@ -13,10 +13,12 @@ use rustix::{
     fs::{self as rfs, Mode, OFlags},
     io::Errno,
 };
-use serde::Serialize;
+use serde::{Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+#[cfg(test)]
+mod observation_tests;
 mod protocol;
 mod runner;
 mod unix;
@@ -87,6 +89,13 @@ pub struct GatedCliSubmission {
     entry_path: PathBuf,
     directory: OwnedFd,
     submission_id: Uuid,
+}
+
+struct ProcessEvidence {
+    helper: Option<DiskHelperIdentity>,
+    child: Option<DiskChildIdentity>,
+    release: Option<DiskRelease>,
+    terminal: Option<GatedCliProcessTerminal>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -363,35 +372,35 @@ impl GatedCliSubmission {
             .map_err(map_journal_error)
     }
 
-    pub fn observe(
+    fn read_observation_marker<T: DeserializeOwned>(
         &self,
-        binding: &GatedCliBinding,
-    ) -> Result<GatedCliObservation, GatedCliProcessError> {
-        let request = self.read_request(binding)?;
-        let helper = read_optional_json::<DiskHelperIdentity>(
-            &self.directory,
-            HELPER_FILE,
-            MAX_IDENTITY_BYTES,
-        )
-        .map_err(map_journal_error)?;
-        let child = read_optional_json::<DiskChildIdentity>(
-            &self.directory,
-            CHILD_FILE,
-            MAX_IDENTITY_BYTES,
-        )
-        .map_err(map_journal_error)?;
-        let release =
-            read_optional_json::<DiskRelease>(&self.directory, RELEASE_FILE, MAX_IDENTITY_BYTES)
-                .map_err(map_journal_error)?;
-        let exec_start = read_optional_json::<DiskExecStart>(
-            &self.directory,
-            EXEC_STARTED_FILE,
-            MAX_IDENTITY_BYTES,
-        )
-        .map_err(map_journal_error)?;
+        name: &'static str,
+        max_bytes: u64,
+    ) -> Result<Option<T>, GatedCliProcessError> {
+        let marker =
+            read_optional_json(&self.directory, name, max_bytes).map_err(map_journal_error)?;
+        #[cfg(test)]
+        observation_tests::after_read(name);
+        Ok(marker)
+    }
+
+    fn read_process_evidence(
+        &self,
+        request: &DiskRequest,
+    ) -> Result<ProcessEvidence, GatedCliProcessError> {
+        // Markers are immutable and published in the opposite order. Read each
+        // dependent marker before its prerequisites so forward progress cannot
+        // combine a new marker with an older, missing prerequisite.
         let terminal =
-            read_optional_json::<DiskTerminal>(&self.directory, TERMINAL_FILE, MAX_TERMINAL_BYTES)
-                .map_err(map_journal_error)?;
+            self.read_observation_marker::<DiskTerminal>(TERMINAL_FILE, MAX_TERMINAL_BYTES)?;
+        let exec_start =
+            self.read_observation_marker::<DiskExecStart>(EXEC_STARTED_FILE, MAX_IDENTITY_BYTES)?;
+        let release =
+            self.read_observation_marker::<DiskRelease>(RELEASE_FILE, MAX_IDENTITY_BYTES)?;
+        let child =
+            self.read_observation_marker::<DiskChildIdentity>(CHILD_FILE, MAX_IDENTITY_BYTES)?;
+        let helper =
+            self.read_observation_marker::<DiskHelperIdentity>(HELPER_FILE, MAX_IDENTITY_BYTES)?;
         if child.is_some() && helper.is_none()
             || release.is_some() && child.is_none()
             || exec_start.is_some() && release.is_none()
@@ -407,24 +416,48 @@ impl GatedCliSubmission {
             child.validate(helper)?;
         }
         if let (Some(request), Some(helper), Some(child), Some(release)) =
-            (Some(&request), &helper, &child, &release)
+            (Some(request), &helper, &child, &release)
         {
             release.validate(request, helper, child)?;
         }
         if let (Some(helper), Some(child), Some(exec_start)) = (&helper, &child, &exec_start) {
-            exec_start.validate(&request, helper, child, release.as_ref())?;
+            exec_start.validate(request, helper, child, release.as_ref())?;
         }
+        let terminal = terminal
+            .map(|terminal| {
+                let helper = helper.as_ref().ok_or(GatedCliProcessError::Integrity)?;
+                let child = child.as_ref().ok_or(GatedCliProcessError::Integrity)?;
+                terminal.validate(
+                    request,
+                    helper,
+                    child,
+                    release.as_ref(),
+                    exec_start.as_ref(),
+                )?;
+                terminal.into_public()
+            })
+            .transpose()?;
+        Ok(ProcessEvidence {
+            helper,
+            child,
+            release,
+            terminal,
+        })
+    }
+
+    pub fn observe(
+        &self,
+        binding: &GatedCliBinding,
+    ) -> Result<GatedCliObservation, GatedCliProcessError> {
+        let request = self.read_request(binding)?;
+        let ProcessEvidence {
+            helper,
+            child,
+            release,
+            terminal,
+        } = self.read_process_evidence(&request)?;
         if let Some(terminal) = terminal {
-            let helper = helper.as_ref().ok_or(GatedCliProcessError::Integrity)?;
-            let child = child.as_ref().ok_or(GatedCliProcessError::Integrity)?;
-            terminal.validate(
-                &request,
-                helper,
-                child,
-                release.as_ref(),
-                exec_start.as_ref(),
-            )?;
-            return Ok(GatedCliObservation::Terminal(terminal.into_public()?));
+            return Ok(GatedCliObservation::Terminal(terminal));
         }
         let Some(helper) = helper else {
             return Ok(GatedCliObservation::AwaitingHelper);
@@ -432,42 +465,14 @@ impl GatedCliSubmission {
         let mut helper_current = helper.is_current_process()?;
         let mut lock_held = self.helper_lock_is_held(&helper)?;
         if helper_current != lock_held {
-            if let Some(terminal) = read_optional_json::<DiskTerminal>(
-                &self.directory,
-                TERMINAL_FILE,
-                MAX_TERMINAL_BYTES,
-            )
-            .map_err(map_journal_error)?
-            {
-                let child = child.as_ref().ok_or(GatedCliProcessError::Integrity)?;
-                terminal.validate(
-                    &request,
-                    &helper,
-                    child,
-                    release.as_ref(),
-                    exec_start.as_ref(),
-                )?;
-                return Ok(GatedCliObservation::Terminal(terminal.into_public()?));
+            if let Some(terminal) = self.read_process_evidence(&request)?.terminal {
+                return Ok(GatedCliObservation::Terminal(terminal));
             }
             helper_current = helper.is_current_process()?;
             lock_held = self.helper_lock_is_held(&helper)?;
             if helper_current != lock_held {
-                if let Some(terminal) = read_optional_json::<DiskTerminal>(
-                    &self.directory,
-                    TERMINAL_FILE,
-                    MAX_TERMINAL_BYTES,
-                )
-                .map_err(map_journal_error)?
-                {
-                    let child = child.as_ref().ok_or(GatedCliProcessError::Integrity)?;
-                    terminal.validate(
-                        &request,
-                        &helper,
-                        child,
-                        release.as_ref(),
-                        exec_start.as_ref(),
-                    )?;
-                    return Ok(GatedCliObservation::Terminal(terminal.into_public()?));
+                if let Some(terminal) = self.read_process_evidence(&request)?.terminal {
+                    return Ok(GatedCliObservation::Terminal(terminal));
                 }
                 return Err(GatedCliProcessError::Integrity);
             }
@@ -486,13 +491,21 @@ impl GatedCliSubmission {
             }
             return Ok(GatedCliObservation::Running);
         }
-        let child_alive = child
+        // The runner publishes terminal evidence before unlocking and exiting.
+        // Refresh all prerequisite markers as well, including the release flag
+        // used if the helper really died without publishing a terminal result.
+        let evidence = self.read_process_evidence(&request)?;
+        if let Some(terminal) = evidence.terminal {
+            return Ok(GatedCliObservation::Terminal(terminal));
+        }
+        let child_alive = evidence
+            .child
             .as_ref()
             .map(DiskChildIdentity::is_current_process)
             .transpose()?
             .unwrap_or(false);
         Ok(GatedCliObservation::Lost {
-            released: release.is_some(),
+            released: evidence.release.is_some(),
             child_alive,
         })
     }
