@@ -186,6 +186,8 @@ macro_rules! attach_request {
 #[cfg(unix)]
 #[path = "postgres_provider_tasks/gated_submit.rs"]
 mod gated_submit;
+#[path = "postgres_provider_tasks/profile_isolation.rs"]
+mod profile_isolation;
 #[path = "postgres_provider_tasks/remote_inputs.rs"]
 mod remote_inputs;
 
@@ -4137,6 +4139,7 @@ async fn remote_task_deadline_fences_late_poll_and_quarantines_capacity() -> Tes
                 .resolve_due_remote_task_deadline(&ProviderTaskClaimScope {
                     provider_id: "provider-test".to_string(),
                     provider_account_id: Uuid::new_v4(),
+                    execution_profile_id: PROFILE_ID,
                 })
                 .await
                 .map_err(debug_error)?
@@ -5465,6 +5468,7 @@ async fn submit_recovery_claim_is_scoped_fenced_and_reclaimable() -> TestResult 
         let wrong_scope = ProviderTaskClaimScope {
             provider_id: "provider-test".to_string(),
             provider_account_id: Uuid::new_v4(),
+            execution_profile_id: PROFILE_ID,
         };
         require(
             store
@@ -8076,6 +8080,7 @@ async fn capacity_reconciliation_is_scoped_fenced_and_exactly_replayable() -> Te
         let wrong_scope = ProviderTaskClaimScope {
             provider_id: "provider-test".to_string(),
             provider_account_id: Uuid::new_v4(),
+            execution_profile_id: PROFILE_ID,
         };
         require(
             store
@@ -9289,6 +9294,7 @@ fn claim_scope() -> ProviderTaskClaimScope {
     ProviderTaskClaimScope {
         provider_id: "provider-test".to_string(),
         provider_account_id: ACCOUNT_ID,
+        execution_profile_id: PROFILE_ID,
     }
 }
 

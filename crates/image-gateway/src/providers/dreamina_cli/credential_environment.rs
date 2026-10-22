@@ -11,7 +11,7 @@ use std::{
 use image_provider_dreamina_cli::dreamina_secret_service_bus_address;
 use sha2::{Digest, Sha256};
 #[cfg(target_os = "linux")]
-use std::{ffi::OsString, fs::File};
+use std::{ffi::OsString, fs::File, os::unix::fs::MetadataExt};
 #[cfg(target_os = "linux")]
 use tokio::time::{Instant, sleep};
 use tokio::{io::AsyncWriteExt, process::Command, time::timeout};
@@ -31,6 +31,13 @@ const GNOME_KEYRING_DAEMON: &str = "/usr/bin/gnome-keyring-daemon";
 const SECRET_SERVICE_START_TIMEOUT: Duration = Duration::from_secs(15);
 #[cfg(target_os = "linux")]
 const SECRET_SERVICE_STOP_TIMEOUT: Duration = Duration::from_secs(3);
+// Both foreground daemons keep cwd at the account HOME. These procfs aliases
+// reach the existing private directories without exceeding sockaddr_un.sun_path
+// for managed accounts or the longer temporary reauthorization HOME paths.
+#[cfg(target_os = "linux")]
+const LINUX_CONTROL_DIRECTORY: &str = "/proc/self/cwd/.factory/dreamina-secret-service/control";
+#[cfg(target_os = "linux")]
+const LINUX_XDG_RUNTIME_DIRECTORY: &str = "/proc/self/cwd/.factory/dreamina-secret-service/xdg";
 
 #[must_use = "the credential replacement must be committed or rolled back"]
 pub struct DreaminaKeychainReplacement {
@@ -297,8 +304,6 @@ async fn start_linux_secret_service_processes(
     home: &Path,
 ) -> Result<(), DreaminaCredentialEnvironmentError> {
     let runtime = linux_service_runtime(home);
-    let control = runtime.join("control");
-    let xdg_runtime = runtime.join("xdg");
     let bus_address = dreamina_secret_service_bus_address(home);
     let bus_marker = format!("--address={bus_address}");
     let mut bus = Command::new(DBUS_DAEMON);
@@ -306,7 +311,7 @@ async fn start_linux_secret_service_processes(
         .env_clear()
         .env("HOME", home)
         .env("PATH", "/usr/bin:/bin")
-        .env("XDG_RUNTIME_DIR", &xdg_runtime)
+        .env("XDG_RUNTIME_DIR", LINUX_XDG_RUNTIME_DIRECTORY)
         .current_dir(home)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -323,7 +328,7 @@ async fn start_linux_secret_service_processes(
     }
     drop(bus);
 
-    let control_argument = format!("--control-directory={}", control.to_string_lossy());
+    let control_argument = format!("--control-directory={LINUX_CONTROL_DIRECTORY}");
     let mut keyring = Command::new(GNOME_KEYRING_DAEMON);
     keyring
         .args([
@@ -335,7 +340,7 @@ async fn start_linux_secret_service_processes(
         .env_clear()
         .env("HOME", home)
         .env("PATH", "/usr/bin:/bin")
-        .env("XDG_RUNTIME_DIR", &xdg_runtime)
+        .env("XDG_RUNTIME_DIR", LINUX_XDG_RUNTIME_DIRECTORY)
         .env("DBUS_SESSION_BUS_ADDRESS", &bus_address)
         .current_dir(home)
         .stdin(Stdio::piped())
@@ -383,18 +388,17 @@ async fn linux_secret_service_ready(home: &Path) -> bool {
     let runtime = linux_service_runtime(home);
     let bus_address = dreamina_secret_service_bus_address(home);
     let bus_marker = format!("--address={bus_address}");
-    let control_marker = format!(
-        "--control-directory={}",
-        runtime.join("control").to_string_lossy()
-    );
+    let control_marker = format!("--control-directory={LINUX_CONTROL_DIRECTORY}");
     let bus_running = read_linux_pid(&runtime.join("dbus.pid"))
         .ok()
         .flatten()
-        .is_some_and(|pid| linux_process_matches(pid, DBUS_DAEMON, &bus_marker));
+        .is_some_and(|pid| linux_account_process_matches(home, pid, DBUS_DAEMON, &bus_marker));
     let keyring_running = read_linux_pid(&runtime.join("keyring.pid"))
         .ok()
         .flatten()
-        .is_some_and(|pid| linux_process_matches(pid, GNOME_KEYRING_DAEMON, &control_marker));
+        .is_some_and(|pid| {
+            linux_account_process_matches(home, pid, GNOME_KEYRING_DAEMON, &control_marker)
+        });
     if !bus_running || !keyring_running {
         return false;
     }
@@ -403,9 +407,12 @@ async fn linux_secret_service_ready(home: &Path) -> bool {
             "--session",
             "--print-reply",
             "--reply-timeout=1000",
-            "--dest=org.freedesktop.secrets",
-            "/org/freedesktop/secrets",
-            "org.freedesktop.DBus.Peer.Ping",
+            // Asking the bus avoids automatically starting a second keyring
+            // while the explicit, unlocked daemon is still initializing.
+            "--dest=org.freedesktop.DBus",
+            "/org/freedesktop/DBus",
+            "org.freedesktop.DBus.GetNameOwner",
+            "string:org.freedesktop.secrets",
         ])
         .env_clear()
         .env("HOME", home)
@@ -422,31 +429,39 @@ async fn linux_secret_service_ready(home: &Path) -> bool {
 #[cfg(target_os = "linux")]
 async fn stop_linux_secret_service(home: &Path) -> Result<(), DreaminaCredentialEnvironmentError> {
     let runtime = linux_service_runtime(home);
-    let control_marker = format!(
+    let legacy_control_marker = format!(
         "--control-directory={}",
         runtime.join("control").to_string_lossy()
     );
+    let control_marker = format!("--control-directory={LINUX_CONTROL_DIRECTORY}");
     stop_linux_process(
+        home,
         &runtime.join("keyring.pid"),
         GNOME_KEYRING_DAEMON,
-        &control_marker,
+        &[&control_marker, &legacy_control_marker],
     )
     .await?;
     let bus_marker = format!("--address={}", dreamina_secret_service_bus_address(home));
-    stop_linux_process(&runtime.join("dbus.pid"), DBUS_DAEMON, &bus_marker).await?;
+    stop_linux_process(home, &runtime.join("dbus.pid"), DBUS_DAEMON, &[&bus_marker]).await?;
     Ok(())
 }
 
 #[cfg(target_os = "linux")]
 async fn stop_linux_process(
+    home: &Path,
     pid_path: &Path,
     executable: &str,
-    marker: &str,
+    markers: &[&str],
 ) -> Result<(), DreaminaCredentialEnvironmentError> {
     let Some(pid) = read_linux_pid(pid_path)? else {
         return Ok(());
     };
-    if linux_process_matches(pid, executable, marker) {
+    let matches = || {
+        markers
+            .iter()
+            .any(|marker| linux_account_process_matches(home, pid, executable, marker))
+    };
+    if matches() {
         unsafe {
             libc::kill(pid as libc::pid_t, libc::SIGTERM);
         }
@@ -454,7 +469,7 @@ async fn stop_linux_process(
         while Instant::now() < deadline && Path::new(&format!("/proc/{pid}")).exists() {
             sleep(Duration::from_millis(50)).await;
         }
-        if linux_process_matches(pid, executable, marker) {
+        if matches() {
             unsafe {
                 libc::kill(pid as libc::pid_t, libc::SIGKILL);
             }
@@ -465,6 +480,19 @@ async fn stop_linux_process(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(_) => Err(DreaminaCredentialEnvironmentError::EnvironmentUnavailable),
     }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_account_process_matches(home: &Path, pid: u32, executable: &str, marker: &str) -> bool {
+    let Ok(home_metadata) = fs::metadata(home) else {
+        return false;
+    };
+    let Ok(cwd_metadata) = fs::metadata(format!("/proc/{pid}/cwd")) else {
+        return false;
+    };
+    home_metadata.dev() == cwd_metadata.dev()
+        && home_metadata.ino() == cwd_metadata.ino()
+        && linux_process_matches(pid, executable, marker)
 }
 
 #[cfg(target_os = "linux")]
@@ -1067,6 +1095,51 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn linux_process_identity_rejects_another_home_before_stopping() {
+        let home = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        for directory in [home.path(), other.path()] {
+            fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let marker = format!("--control-directory={LINUX_CONTROL_DIRECTORY}");
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "read unused", &marker])
+            .current_dir(home.path())
+            .stdin(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let pid = child.id().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !linux_account_process_matches(home.path(), pid, "/bin/sh", &marker) {
+            assert!(Instant::now() < deadline, "test process did not start");
+            sleep(Duration::from_millis(10)).await;
+        }
+        assert!(!linux_account_process_matches(
+            other.path(),
+            pid,
+            "/bin/sh",
+            &marker
+        ));
+
+        let wrong_pid = other.path().join("keyring.pid");
+        write_linux_pid(&wrong_pid, pid).unwrap();
+        stop_linux_process(other.path(), &wrong_pid, "/bin/sh", &[&marker])
+            .await
+            .unwrap();
+        assert!(child.try_wait().unwrap().is_none());
+
+        let correct_pid = home.path().join("keyring.pid");
+        write_linux_pid(&correct_pid, pid).unwrap();
+        stop_linux_process(home.path(), &correct_pid, "/bin/sh", &[&marker])
+            .await
+            .unwrap();
+        assert!(!child.wait().await.unwrap().success());
+        assert!(!correct_pid.exists());
+    }
+
+    #[cfg(target_os = "linux")]
     async fn run_secret_tool(
         home: &Path,
         arguments: &[&str],
@@ -1099,18 +1172,21 @@ mod tests {
         if !dreamina_account_isolation_available() || !Path::new("/usr/bin/secret-tool").is_file() {
             return;
         }
-        let destination = tempfile::tempdir().unwrap();
-        let source = tempfile::tempdir().unwrap();
-        let other = tempfile::tempdir().unwrap();
-        for home in [destination.path(), source.path(), other.path()] {
-            fs::set_permissions(home, fs::Permissions::from_mode(0o700)).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let long_parent = root
+            .path()
+            .join("temporary-reauthorization-home-".repeat(5));
+        let destination = long_parent.join("destination");
+        let source = long_parent.join("source");
+        let other = long_parent.join("other");
+        for home in [&destination, &source, &other] {
+            create_private_directory(home).unwrap();
+            assert!(home.as_os_str().len() > 108);
         }
 
-        prepare_dreamina_account_home(destination.path())
-            .await
-            .unwrap();
+        prepare_dreamina_account_home(&destination).await.unwrap();
         let stored = run_secret_tool(
-            destination.path(),
+            &destination,
             &[
                 "store",
                 "--label=aif-test",
@@ -1124,10 +1200,32 @@ mod tests {
         .await;
         assert!(stored.status.success());
 
-        seed_dreamina_reauthorization_home(source.path(), destination.path()).unwrap();
-        prepare_dreamina_account_home(source.path()).await.unwrap();
+        // Repeated prepare must reuse the same process; a restart must keep the
+        // encrypted credential and bind the full, untruncated socket again.
+        let keyring_pid = linux_service_runtime(&destination).join("keyring.pid");
+        let first_pid = read_linux_pid(&keyring_pid).unwrap();
+        prepare_dreamina_account_home(&destination).await.unwrap();
+        assert_eq!(read_linux_pid(&keyring_pid).unwrap(), first_pid);
+        shutdown_dreamina_account_home(&destination).await.unwrap();
+        prepare_dreamina_account_home(&destination).await.unwrap();
+        let persisted = run_secret_tool(
+            &destination,
+            &["lookup", "service", "aif-test", "account", "primary"],
+            b"",
+        )
+        .await;
+        assert!(persisted.status.success());
+        assert_eq!(persisted.stdout, b"original");
+        assert!(
+            linux_service_runtime(&destination)
+                .join("control/control")
+                .exists()
+        );
+
+        seed_dreamina_reauthorization_home(&source, &destination).unwrap();
+        prepare_dreamina_account_home(&source).await.unwrap();
         let stored = run_secret_tool(
-            source.path(),
+            &source,
             &[
                 "store",
                 "--label=aif-test",
@@ -1141,13 +1239,13 @@ mod tests {
         .await;
         assert!(stored.status.success());
         assert_eq!(
-            dreamina_credential_fingerprint(source.path()).unwrap(),
-            dreamina_credential_fingerprint(destination.path()).unwrap()
+            dreamina_credential_fingerprint(&source).unwrap(),
+            dreamina_credential_fingerprint(&destination).unwrap()
         );
 
-        prepare_dreamina_account_home(other.path()).await.unwrap();
+        prepare_dreamina_account_home(&other).await.unwrap();
         let isolated = run_secret_tool(
-            other.path(),
+            &other,
             &["lookup", "service", "aif-test", "account", "primary"],
             b"",
         )
@@ -1156,11 +1254,11 @@ mod tests {
         assert!(isolated.stdout.is_empty());
 
         let replacement =
-            DreaminaKeychainReplacement::install(source.path(), destination.path(), Uuid::new_v4())
+            DreaminaKeychainReplacement::install(&source, &destination, Uuid::new_v4())
                 .await
                 .unwrap();
         let replaced = run_secret_tool(
-            destination.path(),
+            &destination,
             &["lookup", "service", "aif-test", "account", "primary"],
             b"",
         )
@@ -1170,7 +1268,7 @@ mod tests {
 
         replacement.rollback().await.unwrap();
         let restored = run_secret_tool(
-            destination.path(),
+            &destination,
             &["lookup", "service", "aif-test", "account", "primary"],
             b"",
         )
@@ -1178,10 +1276,8 @@ mod tests {
         assert!(restored.status.success());
         assert_eq!(restored.stdout, b"original");
 
-        shutdown_dreamina_account_home(destination.path())
-            .await
-            .unwrap();
-        shutdown_dreamina_account_home(source.path()).await.unwrap();
-        shutdown_dreamina_account_home(other.path()).await.unwrap();
+        shutdown_dreamina_account_home(&destination).await.unwrap();
+        shutdown_dreamina_account_home(&source).await.unwrap();
+        shutdown_dreamina_account_home(&other).await.unwrap();
     }
 }

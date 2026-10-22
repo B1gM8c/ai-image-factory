@@ -216,6 +216,7 @@ const ALLOWED_GATEWAY_ROUTES: AllowedGatewayRoute[] = [
   { method: "POST", pattern: /^\/admin\/v1\/provider-accounts\/[^/]+\/model-refreshes$/ },
   { method: "GET", pattern: /^\/admin\/v1\/provider-accounts\/[^/]+\/models$/ },
   { method: "PUT", pattern: /^\/admin\/v1\/provider-accounts\/[^/]+\/models$/ },
+  { method: "PUT", pattern: /^\/admin\/v1\/provider-accounts\/[^/]+\/model-configuration$/ },
   { method: "GET", pattern: /^\/admin\/v1\/provider-accounts\/[^/]+\/grok-video-output$/ },
   { method: "PUT", pattern: /^\/admin\/v1\/provider-accounts\/[^/]+\/grok-video-output$/ },
   { method: "POST", pattern: /^\/admin\/v1\/provider-account-login-sessions$/ },
