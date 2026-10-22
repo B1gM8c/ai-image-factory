@@ -58,6 +58,11 @@ not a measured throughput improvement. Client GET requests read database state;
 they do not start another upstream CLI query. Ark metadata is projected in that
 same SQL query without loading or parsing the full prompt payload.
 
+The remote profile example uses one-second empty-queue checks and a ten-minute
+upstream task budget, frozen when submission starts. Individual CLI submit/query
+processes retain a separate sixty-second limit. Lease heartbeats continue during
+the task; changing configuration does not extend already-submitted deadlines.
+
 Model help discovery runs only on refresh, with at most two commands in flight
 per refresh. Video sealing streams to the artifact sink, preserving hash and size
 verification. No transcoding or extra Qiniu copy is introduced.
