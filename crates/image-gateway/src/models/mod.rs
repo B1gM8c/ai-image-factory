@@ -151,6 +151,26 @@ pub struct ModelData {
     pub object: String,
     pub created: i64,
     pub owned_by: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<ModelMetadata>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ModelMetadata {
+    /// Known Dreamina surfaces visible to this API key. Other surfaces may be omitted.
+    pub surfaces: Vec<ModelSurface>,
+}
+
+#[derive(Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, ToSchema)]
+pub struct ModelSurface {
+    pub provider_id: String,
+    /// Factory's configured canonical model identity, not an official vendor alias equivalence.
+    pub provider_model_id: String,
+    pub api_profile: String,
+    pub operation_id: String,
+    pub media_kind: String,
+    /// Supported workflow families; parameter combinations still undergo admission validation.
+    pub workflows: Vec<String>,
 }
 
 pub fn parse_generation(
@@ -586,6 +606,7 @@ pub fn models_response() -> ModelsResponse {
                     object: "model".to_owned(),
                     created: 0,
                     owned_by: provider.owner.to_owned(),
+                    metadata: None,
                 })
             })
             .collect(),

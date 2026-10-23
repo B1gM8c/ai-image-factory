@@ -102,7 +102,8 @@ after all uploads succeed. Do not publish a partial draft manually.
 
 ### Hotfix candidates before a formal Release
 
-For the reviewed admin API-key route editor and remote-submit observation fix,
+For the reviewed admin API-key route editor, remote-submit observation fix, and
+additive public model metadata,
 use the scoped hotfix profile to validate production behavior before publishing
 a formal Release. A hotfix candidate is an attested Actions artifact; it does
 not create a draft or published GitHub Release. The workflow name is **Linux
@@ -125,7 +126,15 @@ accepts only `workflow_dispatch`, `mode=candidate`, and a protected hotfix tag
 whose signature and commit match the run. It keeps release-script, runtime,
 systemd, candidate-verifier, Rust formatting, and admin type checks. It runs
 the remote-submit module unit tests and the `gated_submit::` PostgreSQL
-regressions, using the same PostgreSQL service as full validation. It skips the
+regressions, using the same PostgreSQL service as full validation. It also runs
+the `public_model_metadata` unit and OpenAPI tests, the existing
+`ark_openapi_explains_media_dispatch_and_unbound_controls` contract test, and the exact
+`dreamina::ark_seedance25_api_runs_one_cli_submission_and_settlement`
+PostgreSQL regression. That regression uses a local executable fixture, with
+no upstream generation, to verify the Ark flow and model catalog isolation for
+unrelated projects, disabled routes, account allowlists, and project allowlists.
+Public metadata is projected only from already-authorized routes and does not
+add database queries or CLI calls. It skips the
 full Rust workspace suite and recovery rehearsal and builds only
 `x86_64-unknown-linux-gnu`. The complete process set and admin bundle still pass
 manifest, digest, installer, and GitHub provenance checks; no locally assembled

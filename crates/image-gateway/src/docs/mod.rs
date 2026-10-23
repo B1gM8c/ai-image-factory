@@ -44,8 +44,8 @@ use crate::{
         CustomerRefundView,
     },
     models::{
-        HealthResponse, ImageData, ImageStreamEvent, ImagesResponse, ModelData, ModelsResponse,
-        ProviderProfileReadinessCounts, ReadinessResponse,
+        HealthResponse, ImageData, ImageStreamEvent, ImagesResponse, ModelData, ModelMetadata,
+        ModelSurface, ModelsResponse, ProviderProfileReadinessCounts, ReadinessResponse,
     },
     pricing::{
         ApplyOfficialPriceSnapshotRequest, CreatePriceBookRequest, CreatePriceBookVersionRequest,
@@ -431,6 +431,8 @@ pub fn openapi_json() -> Json<Value> {
         ImageStreamEvent,
         ModelsResponse,
         ModelData,
+        ModelMetadata,
+        ModelSurface,
         HealthResponse,
         ReadinessResponse,
         ProviderProfileReadinessCounts,
@@ -958,7 +960,7 @@ async fn get_ark_video_file_content() {}
     tag = "Models",
     security(("BearerAuth" = [])),
     responses(
-        (status = 200, description = "Model IDs visible to the authenticated API key under the current project routing policy. Entries contain id, object, created and owned_by; this list is not a per-workflow capability matrix or a guarantee that every parameter combination is supported.", body = ModelsResponse),
+        (status = 200, description = "Model IDs visible to the authenticated API key under the current project routing policy. Entries retain id, object, created and owned_by. Optional metadata.surfaces lists distinct authorized Dreamina surfaces with configured canonical provider_model_id, api_profile, operation_id, media_kind and supported workflow families. Canonical identity describes Factory routing, not official vendor alias equivalence. Unknown or non-Dreamina surfaces omit metadata; for mixed model IDs, metadata may cover only Dreamina surfaces. No account or runtime configuration is exposed. This list is not a per-workflow capability matrix or a guarantee that every parameter combination is supported.", body = ModelsResponse),
         (status = 401, description = "Invalid authentication", body = ErrorResponseDoc)
     )
 )]
@@ -3793,6 +3795,40 @@ struct ErrorBodyDoc {
 #[cfg(test)]
 mod tests {
     use super::openapi_json;
+
+    #[test]
+    fn public_model_metadata_openapi_is_optional_and_explicit() {
+        let axum::Json(document) = openapi_json();
+        let model = &document["components"]["schemas"]["ModelData"];
+        assert!(model["properties"].get("metadata").is_some());
+        assert!(
+            !model["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|field| field == "metadata")
+        );
+        let surface = &document["components"]["schemas"]["ModelSurface"]["properties"];
+        for field in [
+            "provider_id",
+            "provider_model_id",
+            "api_profile",
+            "operation_id",
+            "media_kind",
+            "workflows",
+        ] {
+            assert!(
+                surface.get(field).is_some(),
+                "missing surface field {field}"
+            );
+        }
+        assert_eq!(surface.as_object().unwrap().len(), 6);
+        let description = document["paths"]["/v1/models"]["get"]["responses"]["200"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(description.contains("authorized Dreamina surfaces"));
+        assert!(description.contains("not official vendor alias equivalence"));
+    }
 
     #[test]
     fn provider_cost_allocation_openapi_exposes_receipt_exact_close() {
