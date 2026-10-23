@@ -212,7 +212,7 @@ pub(super) fn patch_schemas(document: &mut Value) {
         "Omit for text-to-image generation. For image editing, supply one image URL or an array of 1-10 image URLs. HTTPS URLs and PNG, JPEG or WebP data URLs are supported."
     );
     ark_image["model"]["description"] = json!(
-        "Supported aliases: doubao-seedream-5-0-lite maps to 5.0; doubao-seedream-5-0 and doubao-seedream-5-0-pro map to 5.0Pro. Each accepts an optional six-digit date suffix. Model-specific resolution limits still apply."
+        "Supported aliases: doubao-seedream-5-0 and doubao-seedream-5-0-lite (including -260128) map to 5.0 Lite; doubao-seedream-5-0-pro (including -260628) maps to 5.0Pro. Each accepts an optional six-digit date suffix. Model-specific resolution limits still apply."
     );
     ark_image["response_format"]["description"] =
         json!("Omit or use b64_json. url is represented but unsupported.");
