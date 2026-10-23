@@ -412,7 +412,7 @@ fn controls_for_model(
         let native = api_profile == DREAMINA_IMAGES_API_PROFILE;
         let resolutions = match (native, provider_model_id) {
             (true, "3.0" | "3.1") => &["1k", "2k"][..],
-            (true, "5.0Pro") => &["1k", "2k", "4k"][..],
+            (true, "5.0Pro") => &["1.5k", "2k", "4k"][..],
             (true, "4.0" | "4.1" | "4.5" | "4.6" | "4.7" | "5.0") => &["2k", "4k"][..],
             (false, "5.0" | "5.0Pro") => &["2k", "4k"][..],
             _ => return None,
@@ -745,6 +745,47 @@ mod tests {
     }
 
     #[test]
+    fn dreamina_console_resolution_choices_match_provider_contracts() {
+        use image_provider_dreamina_cli::{
+            ImageModelVersion, ImageRatio, ImageResolution, TextToImageRequestV1,
+        };
+
+        for (model, expected) in [
+            (ImageModelVersion::V3_0, &["1k", "2k"][..]),
+            (ImageModelVersion::V3_1, &["1k", "2k"][..]),
+            (ImageModelVersion::V5_0Pro, &["1.5k", "2k", "4k"][..]),
+        ] {
+            let controls =
+                controls_for_model(DREAMINA_IMAGES_API_PROFILE, Some(model.as_str())).unwrap();
+            let resolution = controls.resolution.unwrap();
+            assert_eq!(resolution.options, expected);
+            assert_eq!(resolution.default, "2k");
+            for candidate in [
+                ImageResolution::K1,
+                ImageResolution::K1_5,
+                ImageResolution::K2,
+                ImageResolution::K4,
+            ] {
+                assert_eq!(
+                    resolution.options.contains(&candidate.as_str()),
+                    TextToImageRequestV1::new("a cat", model, ImageRatio::R1x1, candidate, 1)
+                        .is_ok(),
+                    "{} resolution {}",
+                    model.as_str(),
+                    candidate.as_str()
+                );
+            }
+        }
+
+        for model in ["5.0", "5.0Pro"] {
+            let controls = controls_for_model(ARK_IMAGES_API_PROFILE, Some(model)).unwrap();
+            let resolution = controls.resolution.unwrap();
+            assert_eq!(resolution.options, &["2k", "4k"]);
+            assert_eq!(resolution.default, "2k");
+        }
+    }
+
+    #[test]
     fn standard_image_requests_default_to_auto_geometry() {
         for (api_profile, field) in [
             (OPENAI_IMAGES_API_PROFILE, "size"),
@@ -893,7 +934,7 @@ mod tests {
             prompt: "a wide cinematic scene".to_owned(),
             count: Some(3),
             aspect_ratio: Some("21:9".to_owned()),
-            resolution: Some("4k".to_owned()),
+            resolution: Some("1.5k".to_owned()),
             quality: None,
             output_format: None,
             background: None,
@@ -906,7 +947,7 @@ mod tests {
         };
         assert_eq!(projected.model_version.as_deref(), Some("5.0Pro"));
         assert_eq!(projected.ratio.as_deref(), Some("21:9"));
-        assert_eq!(projected.resolution_type, "4k");
+        assert_eq!(projected.resolution_type, "1.5k");
         assert_eq!(projected.generate_num, Some(3));
     }
 
