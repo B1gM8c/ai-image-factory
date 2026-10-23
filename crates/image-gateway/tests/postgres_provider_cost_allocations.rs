@@ -777,23 +777,48 @@ async fn close_actual_race_case(pool: &PgPool) -> TestResult {
         )?;
     }
 
-    let outcome: (String, i64, i64, i64, i64, String) = sqlx::query_as(
+    let expected_amount_micros = if close_won { 10_i64 } else { 20_000_i64 };
+    let outcome: (String, i64, i64, i64, i64, String, i64) = sqlx::query_as(
         r#"
+        WITH receipt_ledgers AS (
+            SELECT ledger_tx.transaction_id
+            FROM ledger_transactions ledger_tx
+            WHERE ledger_tx.transaction_type = 'provider_cost'
+              AND (
+                  ledger_tx.source_job_id = $3
+                  OR EXISTS (
+                      SELECT 1 FROM provider_cost_observation_receipts receipt_link
+                      WHERE receipt_link.receipt_id = $2
+                        AND receipt_link.provider_cost_observation_id =
+                            ledger_tx.source_provider_cost_observation_id
+                  )
+              )
+        )
         SELECT
             pool.state,
             (SELECT COUNT(*) FROM provider_cost_allocation_closures closure
              WHERE closure.provider_cost_allocation_pool_id = pool.provider_cost_allocation_pool_id)::BIGINT,
             (SELECT COUNT(*) FROM provider_cost_authority_claims claim
              WHERE claim.source_receipt_id = $2)::BIGINT,
-            (SELECT COUNT(*) FROM ledger_transactions ledger_tx
-             WHERE ledger_tx.transaction_type = 'provider_cost'
-               AND ledger_tx.source_job_id = $3)::BIGINT,
+            (SELECT COUNT(*) FROM receipt_ledgers)::BIGINT,
             (SELECT COUNT(*) FROM provider_cost_obligations obligation
+             JOIN provider_cost_authority_claims claim
+               ON claim.claim_id = obligation.settlement_claim_id
              WHERE obligation.receipt_id = $2
                AND obligation.state = 'settled'
-               AND obligation.settlement_claim_id IS NOT NULL)::BIGINT,
+               AND claim.source_receipt_id = $2
+               AND claim.job_id = $3)::BIGINT,
             (SELECT authority_kind FROM provider_cost_authority_claims
-             WHERE source_receipt_id = $2)
+             WHERE source_receipt_id = $2),
+            (SELECT COUNT(*) FROM receipt_ledgers ledger_tx
+             WHERE (SELECT COUNT(*) FROM ledger_transaction_seals seal
+                    WHERE seal.transaction_id = ledger_tx.transaction_id) = 1
+               AND (SELECT COUNT(*) = 2
+                           AND SUM(posting.amount_micros) = 0
+                           AND MIN(posting.amount_micros) = -$4
+                           AND MAX(posting.amount_micros) = $4
+                    FROM ledger_postings posting
+                    WHERE posting.transaction_id = ledger_tx.transaction_id))::BIGINT
         FROM provider_cost_allocation_pools pool
         WHERE pool.provider_cost_allocation_pool_id = $1
         "#,
@@ -801,6 +826,7 @@ async fn close_actual_race_case(pool: &PgPool) -> TestResult {
     .bind(pool_id)
     .bind(job.receipt_id)
     .bind(job.job_id)
+    .bind(expected_amount_micros)
     .fetch_one(pool)
     .await
     .map_err(debug_error)?;
@@ -820,6 +846,7 @@ async fn close_actual_race_case(pool: &PgPool) -> TestResult {
                 1,
                 1,
                 expected_authority.to_string(),
+                1,
             ),
         format!("receipt race leaked or duplicated economic state: {outcome:?}"),
     )
