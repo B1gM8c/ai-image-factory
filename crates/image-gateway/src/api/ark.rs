@@ -157,7 +157,7 @@ async fn create_image_with_optional_route(
             ARK_IMAGES_API_PROFILE,
             &public_model_id,
             &job_model,
-            plan.provider_command_hash(),
+            plan.request_identity_hash(),
         )?;
     }
     let service_tier_decision = crate::service_tiers::ServiceTierDecision::for_default_only_project(

@@ -1,3 +1,4 @@
+mod batch;
 mod daemon;
 mod driver;
 mod orchestrator;
@@ -7,7 +8,10 @@ pub use daemon::{
     ProviderPollDaemon, ProviderPollDaemonConfig, ProviderPollDaemonError,
     ProviderPollDaemonReport, ProviderPollIteration,
 };
-pub use driver::{ProviderPollDriver, ProviderPollDriverCall};
+pub use driver::{
+    ProviderNativeBatchArtifactSink, ProviderNativeBatchPollObservation, ProviderPollDriver,
+    ProviderPollDriverCall,
+};
 pub use orchestrator::{
     ProviderPollOrchestrator, ProviderPollOrchestratorConfig, ProviderPollOrchestratorError,
     ProviderPollRun, ProviderPollStore,

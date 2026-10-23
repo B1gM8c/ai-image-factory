@@ -27,6 +27,7 @@ use crate::{
 };
 
 pub const STREAM_BUFFER_BYTES: usize = 64 * 1024;
+pub const MAX_BATCH_OUTPUT_FILES: usize = 10;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OutputContract {
@@ -41,11 +42,30 @@ pub struct SealedOutput {
     pub sha256_hex: String,
 }
 
-/// A one-shot capability for validating one provider-selected artifact in a
+/// A one-shot capability for validating provider-selected artifacts in a
 /// private, initially empty working directory.
 #[derive(Debug)]
 pub struct FreshOutputDirectory {
     directory: Arc<File>,
+    max_bytes: u64,
+}
+
+/// One artifact in a validated, filename-ordered snapshot of a fresh directory.
+///
+/// The directory and every artifact must remain unchanged until all outputs have
+/// been sealed. Sinks remain provisional until their sealing operation succeeds.
+#[derive(Debug)]
+pub struct VerifiedFreshOutputFile {
+    file: File,
+    relative_filename: PathBuf,
+    identity: OutputIdentity,
+    snapshot: Arc<VerifiedOutputDirectory>,
+}
+
+#[derive(Debug)]
+struct VerifiedOutputDirectory {
+    directory: Arc<File>,
+    entries: Vec<(PathBuf, OutputIdentity)>,
     max_bytes: u64,
 }
 
@@ -106,6 +126,10 @@ pub enum OutputError {
     Missing,
     #[error("output directory contains more than one entry")]
     MultipleEntries,
+    #[error("output file count limit must be between 1 and 10")]
+    InvalidFileLimit,
+    #[error("output directory exceeds the configured file count limit")]
+    TooManyEntries,
     #[error("output must be a regular file")]
     NotRegular,
     #[error("output must not be empty")]
@@ -165,6 +189,52 @@ impl FreshOutputDirectory {
             return Err(OutputError::DirectoryNotEmpty);
         }
         Ok(())
+    }
+
+    /// Opens and validates every output before returning any artifact handle.
+    ///
+    /// Artifacts are ordered lexicographically by the raw filename bytes, not
+    /// filesystem enumeration order. The returned count may be less than the
+    /// requested maximum; callers decide how to handle a partial provider result.
+    pub fn verify_files(
+        self,
+        max_files: usize,
+    ) -> Result<Vec<VerifiedFreshOutputFile>, OutputError> {
+        if !(1..=MAX_BATCH_OUTPUT_FILES).contains(&max_files) {
+            return Err(OutputError::InvalidFileLimit);
+        }
+        validate_private_directory(&self.directory)?;
+        let filenames = sorted_entries(&self.directory, max_files)?;
+        if filenames.is_empty() {
+            return Err(OutputError::Missing);
+        }
+        let mut files = Vec::with_capacity(filenames.len());
+        let mut entries = Vec::with_capacity(filenames.len());
+        for relative_filename in filenames {
+            let file = open_output_at(&self.directory, &relative_filename)?;
+            let metadata = file.metadata().map_err(OutputError::Unavailable)?;
+            validate_regular_output(&metadata, self.max_bytes)?;
+            let identity = OutputIdentity::from_metadata(&metadata);
+            entries.push((relative_filename.clone(), identity));
+            files.push((file, relative_filename, identity));
+        }
+        let snapshot = Arc::new(VerifiedOutputDirectory {
+            directory: self.directory,
+            entries,
+            max_bytes: self.max_bytes,
+        });
+        snapshot.validate()?;
+        Ok(files
+            .into_iter()
+            .map(
+                |(file, relative_filename, identity)| VerifiedFreshOutputFile {
+                    file,
+                    relative_filename,
+                    identity,
+                    snapshot: Arc::clone(&snapshot),
+                },
+            )
+            .collect())
     }
 
     /// Streams the sole output into a provisional sink and returns the sink
@@ -257,6 +327,84 @@ impl FreshOutputDirectory {
             },
             sink,
         ))
+    }
+}
+
+impl VerifiedFreshOutputFile {
+    pub fn relative_filename(&self) -> &Path {
+        &self.relative_filename
+    }
+
+    pub async fn seal_to_async_sink<S>(
+        self,
+        mut sink: S,
+    ) -> Result<(SealedOutput, S), AsyncOutputSealError<S::Error>>
+    where
+        S: AsyncOutputSink,
+    {
+        self.snapshot.validate()?;
+        let mut file = tokio::fs::File::from_std(self.file);
+        let mut hasher = Sha256::new();
+        let mut buffer = [0_u8; STREAM_BUFFER_BYTES];
+        let mut byte_size = 0_u64;
+        loop {
+            let count = file
+                .read(&mut buffer)
+                .await
+                .map_err(OutputError::Unavailable)?;
+            if count == 0 {
+                break;
+            }
+            byte_size = byte_size
+                .checked_add(count as u64)
+                .ok_or(OutputError::TooLarge)?;
+            if byte_size > self.snapshot.max_bytes {
+                return Err(OutputError::TooLarge.into());
+            }
+            hasher.update(&buffer[..count]);
+            sink.write_chunk(&buffer[..count])
+                .await
+                .map_err(AsyncOutputSealError::Sink)?;
+        }
+        let metadata = file.metadata().await.map_err(OutputError::Unavailable)?;
+        if byte_size != self.identity.size
+            || OutputIdentity::from_metadata(&metadata) != self.identity
+        {
+            return Err(OutputError::ChangedDuringRead.into());
+        }
+        self.snapshot.validate()?;
+        Ok((
+            SealedOutput {
+                relative_filename: self.relative_filename,
+                byte_size,
+                sha256_hex: hex_digest(&hasher.finalize()),
+            },
+            sink,
+        ))
+    }
+}
+
+impl VerifiedOutputDirectory {
+    fn validate(&self) -> Result<(), OutputError> {
+        validate_private_directory(&self.directory)?;
+        let filenames = sorted_entries(&self.directory, MAX_BATCH_OUTPUT_FILES).map_err(
+            |error| match error {
+                OutputError::TooManyEntries => OutputError::ChangedDuringRead,
+                error => error,
+            },
+        )?;
+        if filenames.len() != self.entries.len()
+            || filenames
+                .iter()
+                .zip(&self.entries)
+                .any(|(current, (expected, _))| current != expected)
+        {
+            return Err(OutputError::ChangedDuringRead);
+        }
+        for (filename, identity) in &self.entries {
+            validate_current_output(&self.directory, filename, *identity)?;
+        }
+        Ok(())
     }
 }
 
@@ -360,6 +508,29 @@ fn first_two_entries(directory: &File) -> Result<std::vec::IntoIter<OsString>, O
         }
     }
     Ok(entries.into_iter())
+}
+
+fn sorted_entries(directory: &File, max_files: usize) -> Result<Vec<PathBuf>, OutputError> {
+    let mut stream = Dir::read_from(directory)
+        .map_err(|error| OutputError::Unavailable(std::io::Error::from(error)))?;
+    let mut entries = Vec::with_capacity(max_files);
+    while let Some(entry) = stream.read() {
+        let entry = entry.map_err(|error| OutputError::Unavailable(std::io::Error::from(error)))?;
+        let name = entry.file_name().to_bytes();
+        if matches!(name, b"." | b"..") {
+            continue;
+        }
+        if entries.len() == max_files {
+            return Err(OutputError::TooManyEntries);
+        }
+        entries.push(PathBuf::from(OsString::from_vec(name.to_vec())));
+    }
+    entries.sort_by(|left, right| {
+        left.as_os_str()
+            .as_bytes()
+            .cmp(right.as_os_str().as_bytes())
+    });
+    Ok(entries)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

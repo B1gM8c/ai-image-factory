@@ -8,10 +8,11 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::{
-    DreaminaQueryReceiptV1, FramesToVideoRequestV1, ImageToImageRequestV1, ImageToVideoRequestV1,
-    ImageUpscaleRequestV1, MultiframeToVideoRequestV1, MultimodalToVideoRequestV1,
-    QueryResultRequestV1, ReceiptError, StagedInputKindV1, StagedInputRefV1, TextToImageRequestV1,
-    TextToVideoRequestV1, parse_query_receipt,
+    DreaminaNativeImageBatchV2, DreaminaQueryReceiptV1, FramesToVideoRequestV1,
+    ImageToImageRequestV1, ImageToVideoRequestV1, ImageUpscaleRequestV1,
+    MultiframeToVideoRequestV1, MultimodalToVideoRequestV1, QueryResultRequestV1, ReceiptError,
+    StagedInputKindV1, StagedInputRefV1, TextToImageRequestV1, TextToVideoRequestV1,
+    parse_query_receipt,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -202,7 +203,7 @@ impl DreaminaCliPolicyV1 {
         &self,
         request: &DreaminaSubmitRequestV1,
     ) -> Result<CommandSpec, DreaminaCliPolicyError> {
-        self.build_command(request, self.workspace_root.clone())
+        self.build_command(request, self.workspace_root.clone(), request.argv()?)
     }
 
     pub fn command_spec_in(
@@ -213,13 +214,25 @@ impl DreaminaCliPolicyV1 {
         if workspace.path().parent() != Some(self.workspace_root.path()) {
             return Err(DreaminaCliPolicyError::ExecutionWorkspaceOutsideRoot);
         }
-        self.build_command(request, workspace)
+        self.build_command(request, workspace, request.argv()?)
+    }
+
+    pub fn command_spec_native_image_batch_in(
+        &self,
+        batch: &DreaminaNativeImageBatchV2,
+        workspace: WorkingDirectory,
+    ) -> Result<CommandSpec, DreaminaCliPolicyError> {
+        if workspace.path().parent() != Some(self.workspace_root.path()) {
+            return Err(DreaminaCliPolicyError::ExecutionWorkspaceOutsideRoot);
+        }
+        self.build_command(batch.request(), workspace, batch.argv())
     }
 
     fn build_command(
         &self,
         request: &DreaminaSubmitRequestV1,
         workspace: WorkingDirectory,
+        arguments: Vec<OsString>,
     ) -> Result<CommandSpec, DreaminaCliPolicyError> {
         for input in request.staged_inputs() {
             verify_input(workspace.path(), input)?;
@@ -239,7 +252,7 @@ impl DreaminaCliPolicyV1 {
                 crate::dreamina_secret_service_bus_address(self.account_home.path()),
             )?;
         }
-        for argument in request.argv()? {
+        for argument in arguments {
             command = command.arg(argument)?;
         }
         Ok(command)

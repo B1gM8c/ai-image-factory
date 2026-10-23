@@ -155,6 +155,11 @@ impl ProviderProfileReadinessStore for PostgresProviderTaskStore {
                  AND submission.submission_id = execution.submission_id
                 CROSS JOIN db_clock
                 WHERE execution.state = 'prepared'
+                  AND NOT EXISTS (
+                      SELECT 1 FROM dreamina_native_batch_members member
+                      WHERE member.submission_id = execution.submission_id
+                        AND member.output_index > 0
+                  )
                 GROUP BY submission.execution_profile_id, db_clock.now_ms
             ),
             executor_profile_leases AS (

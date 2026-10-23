@@ -71,6 +71,17 @@ pub struct ProviderArtifactStageContext {
 }
 
 impl ProviderArtifactStageContext {
+    pub(crate) fn for_native_batch_member(
+        lease: &ProviderTaskLease,
+        member: &super::super::NativeBatchMember,
+    ) -> Self {
+        Self {
+            submission_id: member.submission_id,
+            executor_execution_id: member.executor_execution_id,
+            poll_lease_epoch: lease.poll_lease_epoch,
+        }
+    }
+
     pub(crate) fn from_lease(lease: &ProviderTaskLease) -> Self {
         Self {
             submission_id: lease.task.submission_id,

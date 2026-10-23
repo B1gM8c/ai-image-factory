@@ -16,11 +16,33 @@ for the selected account. Clients cannot name server files.
 | `image2image` | `images` plus the text-to-image parameters |
 | `image_upscale` | `image`, `resolution_type` (`2k`, `4k`, `8k`); fixed upstream model |
 
-The image endpoint retains the existing synchronous image response. A request
-for N images uses the existing N-output execution path, with one upstream task
-per output. Each CLI submission uses `generate_num=1`. Completed outputs retain
-their own settlement records; a failed output does not trigger paid regeneration.
-This is not a single upstream batch.
+The image endpoint retains the existing synchronous image response. Newly
+admitted `text2image` and `image2image` requests for 2–10 images use one native
+CLI submission with `generate_num=N` and one real upstream task ID. Each image
+retains its own output, artifact and customer settlement record. Single-image,
+upscale and video requests keep their existing execution paths. Historical
+version 1 frozen commands retain their original per-output behavior across an
+upgrade; only version 2 image commands select native batching.
+Public idempotency identity retains the historical image request hash, while
+execution and pricing evidence bind the actual frozen command hash. Replaying
+an older key therefore retains its original admission and execution path.
+
+Only the batch leader can acquire a submit lease. All members have immutable
+output indices, and followers cannot fall back to independent paid submissions.
+Submission timeout or an unknown receipt follows the existing durable submit
+journal; it does not authorize a retry or a replacement task. Restart recovery
+queries the same task and resumes artifact publication. Downloaded files are
+validated together and sorted by raw filename bytes before assigning output
+indices; already committed images must match their stored content hashes.
+Follower results, including explicit missing-image failures, are committed
+before the leader artifact. Database guards enforce this order so deadline
+recovery cannot encounter a committed leader with unresolved batch members.
+
+Completed images are settled individually and replayed idempotently. Missing
+images become explicit failed outputs; partial success returns and charges only
+delivered images. Neither missing images nor storage failures trigger paid
+regeneration. A batch's upstream cost evidence, when available, belongs to the
+single real upstream task and must not be duplicated across image receipts.
 
 `POST /v1/dreamina/videos/generations` accepts these `workflow` values:
 
@@ -112,6 +134,16 @@ calling the paid upstream. Deployment requires successful CI for the merged
 commit and the normal signed-candidate Check/Apply process. Only a separately
 authorized production API task proves real upstream generation, playable media
 and actual account charges; catalog discovery and fixture success do not.
+
+Native batch PostgreSQL tests opt in through `TEST_DATABASE_URL` and create
+isolated schemas. Use a disposable local PostgreSQL cluster, never production
+credentials. Native batching requires migration
+`0140_dreamina_native_image_batches.sql` before activation. Older binaries do not
+understand version 2 commands: stop new batch admissions and finish or reconcile
+in-flight native batches before rolling the binary back. Do not delete their
+membership or recreate their submissions. Code and fixture verification alone
+do not demonstrate real CLI result naming, actual image counts or upstream
+charges.
 
 Sources: [official CLI guide](https://bytedance.larkoffice.com/wiki/FVTwwm0bGiishxkKOoScdHR2nsg)
 and [Ark video task API](https://ark.volcengine.com/region:cn-beijing/docs/create-video-generation-task-api).

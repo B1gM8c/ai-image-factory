@@ -45,6 +45,7 @@ struct LockedUnlaunchedJob {
 
 #[derive(sqlx::FromRow)]
 struct LockedPreparedOutput {
+    native_batch_follower: bool,
     submission_id: Uuid,
     executor_execution_id: Uuid,
     submission_state: String,
@@ -188,6 +189,8 @@ async fn cancel_unlaunched_job(
     let outputs: Vec<LockedPreparedOutput> = sqlx::query_as(
         r#"
         SELECT submission.submission_id, execution.executor_execution_id,
+               EXISTS (SELECT 1 FROM dreamina_native_batch_members member
+                   WHERE member.submission_id = submission.submission_id AND member.output_index > 0) AS native_batch_follower,
                submission.state AS submission_state,
                submission.started_at_ms AS submission_started_at_ms,
                submission.finished_at_ms AS submission_finished_at_ms,
@@ -288,6 +291,10 @@ async fn cancel_unlaunched_job(
     }
     let now = database_now(&mut tx).await?;
     for output in &outputs {
+        // A native image leader atomically projects its unlaunched followers.
+        if output.native_batch_follower {
+            continue;
+        }
         require_one(
             sqlx::query(
                 r#"

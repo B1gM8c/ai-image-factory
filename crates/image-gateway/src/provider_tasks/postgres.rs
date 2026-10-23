@@ -25,6 +25,8 @@ use super::{
     VerifiedCallbackWakeup,
 };
 
+mod native_batch;
+
 const MAX_POLL_AFTER_MS: i64 = 24 * 60 * 60 * 1_000;
 const MAX_LEASE_MS: i64 = 24 * 60 * 60 * 1_000;
 const MAX_PROVIDER_TIMEOUT_MS: i64 = 30 * 24 * 60 * 60 * 1_000;
@@ -328,6 +330,43 @@ struct SubmitRecoveryRow {
 
 #[async_trait]
 impl ProviderTaskStore for PostgresProviderTaskStore {
+    async fn native_batch_members(
+        &self,
+        lease: &ProviderTaskLease,
+    ) -> Result<Option<Vec<super::NativeBatchMember>>, ProviderTaskStoreError> {
+        PostgresProviderTaskStore::native_batch_members(self, lease).await
+    }
+
+    async fn publish_native_batch_artifact(
+        &self,
+        lease: &ProviderTaskLease,
+        output_index: i32,
+        authority: &ProviderArtifactAuthority,
+    ) -> Result<ProviderArtifactPublication, ProviderTaskStoreError> {
+        PostgresProviderTaskStore::publish_native_batch_artifact(
+            self,
+            lease,
+            output_index,
+            authority,
+        )
+        .await
+    }
+
+    async fn record_native_batch_failure(
+        &self,
+        lease: &ProviderTaskLease,
+        output_index: i32,
+        error_code: &str,
+    ) -> Result<(), ProviderTaskStoreError> {
+        PostgresProviderTaskStore::record_native_batch_failure(
+            self,
+            lease,
+            output_index,
+            error_code,
+        )
+        .await
+    }
+
     async fn acquire_submit(
         &self,
         request: &RemoteTaskSubmitReservation,

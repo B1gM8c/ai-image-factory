@@ -7,7 +7,8 @@ use super::{DreaminaCliRuntimeBindingV1, dreamina_operation};
 use crate::{
     artifacts::MAX_ARTIFACT_BYTES,
     provider_tasks::{
-        ProviderAccountHomeCapability, ProviderAccountHomeCapabilityError, ProviderPollDriver,
+        ProviderAccountHomeCapability, ProviderAccountHomeCapabilityError,
+        ProviderNativeBatchArtifactSink, ProviderNativeBatchPollObservation, ProviderPollDriver,
         ProviderPollDriverCall, ProviderRuntimeProfile,
     },
 };
@@ -227,18 +228,97 @@ impl DreaminaCliPollDriverV1 {
             }
         }
     }
-}
 
-impl ProviderPollDriver for DreaminaCliPollDriverV1 {
-    fn provider_id(&self) -> &'static str {
-        PROVIDER_ID
+    async fn poll_native_batch_operation<S: ProviderNativeBatchArtifactSink>(
+        &self,
+        operation: &RemoteOperationRef,
+        output_count: usize,
+        sink: &mut S,
+    ) -> Result<ProviderNativeBatchPollObservation, ProviderFailure> {
+        if !(2..=10).contains(&output_count) {
+            return Err(contract_failure("dreamina_native_batch_count_invalid"));
+        }
+        let attempt = self
+            .workspace
+            .create_attempt()
+            .map_err(map_attempt_workspace_error)?;
+        let working_directory = attempt
+            .working_directory()
+            .map_err(map_attempt_workspace_error)?;
+        let output = FreshOutputDirectory::new(&working_directory, self.max_artifact_bytes)
+            .map_err(map_fresh_output_error)?;
+        let request = QueryResultRequestV1::new(operation.operation_id(), attempt.path())
+            .map_err(|_| contract_failure("dreamina_poll_request_invalid"))?;
+        let receipt = self
+            .runtime
+            .run_receipt(&request, &mut NoopSpawnObserver)
+            .await
+            .map_err(map_runtime_error)?
+            .receipt;
+        if receipt.submit_id() != operation.operation_id() {
+            return Err(contract_failure("dreamina_poll_receipt_mismatch"));
+        }
+        match receipt.status() {
+            DreaminaQueryStatusV1::Querying => {
+                output
+                    .ensure_empty()
+                    .map_err(|_| contract_failure("dreamina_poll_pending_artifact"))?;
+                Ok(ProviderNativeBatchPollObservation::Pending {
+                    next_poll_after_ms: Some(DEFAULT_POLL_AFTER_MS),
+                })
+            }
+            DreaminaQueryStatusV1::Failed => {
+                output
+                    .ensure_empty()
+                    .map_err(|_| contract_failure("dreamina_poll_failed_artifact"))?;
+                Ok(ProviderNativeBatchPollObservation::Failed(
+                    terminal_failure("dreamina_generation_failed"),
+                ))
+            }
+            DreaminaQueryStatusV1::Success => {
+                // Verify and open the entire set before any output is staged.
+                let files = match output.verify_files(output_count) {
+                    Ok(files) => files,
+                    Err(OutputError::Missing) => {
+                        return Ok(ProviderNativeBatchPollObservation::Failed(
+                            terminal_failure("dreamina_native_batch_result_empty"),
+                        ));
+                    }
+                    Err(error) => return Err(map_fresh_output_error(error)),
+                };
+                let actual_count = files.len();
+                for (index, file) in files.into_iter().enumerate() {
+                    sink.select_output(index).map_err(map_sink_error)?;
+                    let bridge = ArtifactSinkBridge::new(sink);
+                    let (sealed, bridge) = file
+                        .seal_to_async_sink(bridge)
+                        .await
+                        .map_err(map_output_seal_error)?;
+                    let (prefix, prefix_len) = bridge.into_prefix();
+                    let media_type = artifact_media_type(&prefix[..prefix_len])
+                        .filter(|value| value.starts_with("image/"))
+                        .ok_or_else(|| contract_failure("dreamina_poll_media_invalid"))?;
+                    let manifest = sink
+                        .finalize(ArtifactMetadata { media_type })
+                        .await
+                        .map_err(map_sink_error)?;
+                    let mut digest = [0_u8; 32];
+                    if hex::decode_to_slice(&sealed.sha256_hex, &mut digest).is_err()
+                        || manifest.byte_size() != sealed.byte_size
+                        || manifest.media_type() != media_type
+                        || manifest.sha256() != &digest
+                    {
+                        return Err(contract_failure("dreamina_poll_manifest_mismatch"));
+                    }
+                }
+                Ok(ProviderNativeBatchPollObservation::Completed {
+                    output_count: actual_count,
+                })
+            }
+        }
     }
 
-    async fn poll<S: ArtifactSink>(
-        &self,
-        call: &ProviderPollDriverCall,
-        sink: &mut S,
-    ) -> Result<PollObservation, ProviderFailure> {
+    fn validate_poll_call(&self, call: &ProviderPollDriverCall) -> Result<(), ProviderFailure> {
         let context = call.execution_context();
         if call.operation().provider_id() != PROVIDER_ID
             || !self
@@ -255,12 +335,43 @@ impl ProviderPollDriver for DreaminaCliPollDriverV1 {
         {
             return Err(contract_failure("dreamina_poll_binding_mismatch"));
         }
+        Ok(())
+    }
+}
+
+impl ProviderPollDriver for DreaminaCliPollDriverV1 {
+    fn provider_id(&self) -> &'static str {
+        PROVIDER_ID
+    }
+
+    async fn poll<S: ArtifactSink>(
+        &self,
+        call: &ProviderPollDriverCall,
+        sink: &mut S,
+    ) -> Result<PollObservation, ProviderFailure> {
+        self.validate_poll_call(call)?;
         self.poll_operation(
             call.operation(),
-            context.operation_id() == "videos.generations",
+            call.execution_context().operation_id() == "videos.generations",
             sink,
         )
         .await
+    }
+
+    async fn poll_native_batch<S: ProviderNativeBatchArtifactSink>(
+        &self,
+        call: &ProviderPollDriverCall,
+        output_count: usize,
+        sink: &mut S,
+    ) -> Result<ProviderNativeBatchPollObservation, ProviderFailure> {
+        self.validate_poll_call(call)?;
+        if call.execution_context().operation_id() != "images.generations"
+            || call.execution_context().model() == "dreamina-image-image_upscale"
+        {
+            return Err(contract_failure("dreamina_native_batch_operation_invalid"));
+        }
+        self.poll_native_batch_operation(call.operation(), output_count, sink)
+            .await
     }
 }
 
@@ -362,9 +473,11 @@ fn map_fresh_output_error(error: OutputError) -> ProviderFailure {
         OutputError::Unavailable(_) => retryable_failure("dreamina_poll_workspace_unavailable"),
         OutputError::UnsafeDirectory
         | OutputError::InvalidLimit
+        | OutputError::InvalidFileLimit
         | OutputError::DirectoryNotEmpty
         | OutputError::Missing
         | OutputError::MultipleEntries
+        | OutputError::TooManyEntries
         | OutputError::NotRegular
         | OutputError::Empty
         | OutputError::TooLarge

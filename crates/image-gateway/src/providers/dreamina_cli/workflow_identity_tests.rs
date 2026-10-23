@@ -127,8 +127,15 @@ fn image_source(count: u8, edit: bool) -> serde_json::Value {
     serde_json::from_slice(&encode_submit_command(request)).unwrap()
 }
 
+fn historical_image_source(count: u8, edit: bool) -> serde_json::Value {
+    let mut source = image_source(count, edit);
+    // This is the persisted pre-native-batch command format, not a new request.
+    source["schema_version"] = serde_json::json!(1);
+    source
+}
+
 #[test]
-fn image_fanout_preserves_requested_count_and_binds_unique_single_output_commands() {
+fn historical_image_fanout_preserves_requested_count_and_unique_single_output_commands() {
     use image_cli_runtime::WorkingDirectory;
     use sha2::{Digest, Sha256};
     use std::{fs, os::unix::fs::PermissionsExt, time::Duration};
@@ -157,9 +164,9 @@ fn image_fanout_preserves_requested_count_and_binds_unique_single_output_command
         super::DreaminaCliRuntimeBindingV1::new(profile_id, uuid::Uuid::new_v4(), "a".repeat(64))
             .unwrap(),
     );
-    for count in [2, 4] {
+    for count in [2, 10] {
         for edit in [false, true] {
-            let source = image_source(count, edit);
+            let source = historical_image_source(count, edit);
             let source_hash = "b".repeat(64);
             let mut identities = std::collections::HashSet::new();
             for index in 0..i32::from(count) {
@@ -201,6 +208,7 @@ fn image_fanout_preserves_requested_count_and_binds_unique_single_output_command
                 );
                 assert_eq!(command.source_command_sha256(), source_hash);
                 assert!(identities.insert(*command.canonical_sha256()));
+                assert!(!is_native_image_batch_command(command.canonical_payload()).unwrap());
                 let request = parse_submit_command(command.canonical_payload()).unwrap();
                 assert_eq!(request.output_count(), 1);
                 let args = match &request {
@@ -222,6 +230,7 @@ fn image_fanout_preserves_requested_count_and_binds_unique_single_output_command
                 assert_eq!(recovered, command);
             }
             assert_eq!(identities.len(), usize::from(count));
+            assert_eq!(source["schema_version"], 1);
             assert_eq!(source["generate_num"], count);
         }
     }
@@ -229,9 +238,9 @@ fn image_fanout_preserves_requested_count_and_binds_unique_single_output_command
 
 #[test]
 fn image_fanout_rejects_out_of_range_slots_and_recovery_total_drift() {
-    for count in [2, 4] {
+    for count in [2, 10] {
         for edit in [false, true] {
-            let source = image_source(count, edit);
+            let source = historical_image_source(count, edit);
             let source_hash = "b".repeat(64);
             for index in [-1, i32::from(count)] {
                 assert_eq!(
@@ -245,6 +254,70 @@ fn image_fanout_rejects_out_of_range_slots_and_recovery_total_drift() {
                     Err(ProviderSubmitProjectionError::OutputOutOfRange)
                 );
             }
+        }
+    }
+}
+
+#[test]
+fn native_image_edit_batch_preserves_all_parameters_and_only_projects_the_leader() {
+    for count in [2, 10] {
+        let source = image_source(count, true);
+        assert_eq!(source["schema_version"], 2);
+        assert_eq!(source["generate_num"], count);
+        let source_hash = "b".repeat(64);
+        let command =
+            project_submit_command(&source, &source_hash, 0, Some(i32::from(count))).unwrap();
+        assert_eq!(
+            command.output(),
+            OutputSlot::new(0, u32::from(count)).unwrap()
+        );
+        assert_eq!(command.source_command_sha256(), source_hash);
+        assert!(is_native_image_batch_command(command.canonical_payload()).unwrap());
+        let request = parse_submit_command(command.canonical_payload()).unwrap();
+        assert!(request_matches_platform(
+            &request,
+            "images.generations",
+            "dreamina-image-5.0"
+        ));
+        let DreaminaSubmitRequestV1::ImageToImage(request) = request else {
+            panic!("native image edit workflow changed during projection");
+        };
+        assert_eq!(request.generate_num(), count);
+        assert_eq!(request.parameters().prompt(), "paint a red fox");
+        assert_eq!(request.parameters().model(), ImageModelVersion::V5_0);
+        assert_eq!(request.parameters().ratio(), Some(ImageRatio::R16x9));
+        assert_eq!(request.parameters().resolution(), ImageResolution::K2);
+        assert_eq!(request.images().len(), 1);
+        let input = &request.images()[0];
+        assert_eq!(input.filename(), "input-0.png");
+        assert_eq!(input.sha256(), "a".repeat(64));
+        assert_eq!((input.width(), input.height()), (1600, 900));
+        let args = request.to_argv();
+        assert_eq!(args[0], "image2image");
+        assert_eq!(
+            args.iter().filter(|arg| *arg == "--generate_num").count(),
+            1
+        );
+        let count_arg = args.iter().position(|arg| arg == "--generate_num").unwrap();
+        assert_eq!(
+            args[count_arg + 1],
+            std::ffi::OsString::from(count.to_string())
+        );
+        assert_eq!(args.last(), Some(&std::ffi::OsString::from("--poll=0")));
+        let recovered =
+            project_submit_command(&source, &source_hash, 0, Some(i32::from(count))).unwrap();
+        assert_eq!(command, recovered);
+        for follower in 1..i32::from(count) {
+            assert_eq!(
+                project_submit_command(&source, &source_hash, follower, Some(i32::from(count))),
+                Err(ProviderSubmitProjectionError::OutputOutOfRange)
+            );
+        }
+        for total in [1, i32::from(count) + 1] {
+            assert_eq!(
+                project_submit_command(&source, &source_hash, 0, Some(total)),
+                Err(ProviderSubmitProjectionError::OutputOutOfRange)
+            );
         }
     }
 }

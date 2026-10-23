@@ -156,7 +156,7 @@ async fn create_image_with_optional_route(
             DREAMINA_IMAGES_API_PROFILE,
             &public_model_id,
             &job_model,
-            plan.provider_command_hash(),
+            plan.request_identity_hash(),
         )?;
     }
     let service_tier_decision = crate::service_tiers::ServiceTierDecision::for_default_only_project(
@@ -1120,5 +1120,42 @@ mod tests {
         assert_ne!(base, alias_changed);
         assert_ne!(base, execution_changed);
         assert_ne!(base, route_changed);
+    }
+
+    #[test]
+    fn native_batch_customer_identity_keeps_the_pre_upgrade_hash() {
+        let plan = DreaminaImageAdmissionPlan::new(
+            serde_json::from_value(serde_json::json!({
+                "prompt": "idempotent image", "generate_num": 2, "resolution_type": "2k"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let mut historical = plan
+            .attach(
+                crate::admission::AdmissionTicket {
+                    session_id: Uuid::new_v4(),
+                    owner_token: Uuid::new_v4(),
+                    request_hash: plan.request_identity_hash().to_owned(),
+                },
+                Uuid::new_v4(),
+                "test",
+            )
+            .command_json;
+        historical["schema_version"] = serde_json::json!(1);
+        let old_hash = hex::encode(Sha256::digest(serde_json::to_vec(&historical).unwrap()));
+        let auth = routed_auth(7);
+        let hash = |source: &str| {
+            customer_pricing_request_hash(
+                &auth,
+                DREAMINA_IMAGES_API_PROFILE,
+                "public-image",
+                "dreamina-image-5.0",
+                source,
+            )
+            .unwrap()
+        };
+        assert_eq!(hash(&old_hash), hash(plan.request_identity_hash()));
+        assert_ne!(hash(&old_hash), hash(plan.provider_command_hash()));
     }
 }

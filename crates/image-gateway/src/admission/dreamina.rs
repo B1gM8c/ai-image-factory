@@ -28,6 +28,7 @@ const PROVIDER_ID: &str = image_provider_dreamina_cli::PROVIDER_ID;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DreaminaImageAdmissionPlan {
     request_hash: String,
+    provider_command_hash: String,
     provider_model_id: String,
     provider_model: String,
     provider_command: Value,
@@ -85,12 +86,17 @@ impl DreaminaImageAdmissionPlan {
             );
         }
         let bytes = encode_submit_command(DreaminaSubmitRequestV1::from(typed));
-        let provider_command = serde_json::from_slice(&bytes)
+        let provider_command: Value = serde_json::from_slice(&bytes)
             .map_err(|_| DreaminaAdmissionError::InvalidProviderCommand)?;
         let durable_bytes = serde_json::to_vec(&provider_command)
             .map_err(|_| DreaminaAdmissionError::InvalidProviderCommand)?;
+        // Execution format upgrades must not change an existing public key's
+        // request identity. Version 1 is the historical image request identity.
+        let mut request_identity = provider_command.clone();
+        request_identity["schema_version"] = Value::from(1);
         Ok(Self {
-            request_hash: hex::encode(Sha256::digest(&durable_bytes)),
+            request_hash: source_hash(&request_identity)?,
+            provider_command_hash: hex::encode(Sha256::digest(&durable_bytes)),
             provider_model_id: model.as_str().to_string(),
             provider_model: format!("dreamina-image-{}", model.as_str()),
             provider_command,
@@ -112,6 +118,10 @@ impl DreaminaImageAdmissionPlan {
     }
 
     pub fn provider_command_hash(&self) -> &str {
+        &self.provider_command_hash
+    }
+
+    pub fn request_identity_hash(&self) -> &str {
         &self.request_hash
     }
 
@@ -1310,10 +1320,11 @@ mod tests {
     }
 
     #[test]
-    fn reference_image_generate_num_preserves_fanout_count_and_per_output_billing() {
+    fn reference_image_native_batch_preserves_count_and_per_output_billing() {
         let request = serde_json::from_str(r#"{"workflow":"image2image","images":["a"],"prompt":"city","resolution_type":"2k","generate_num":10}"#).unwrap();
         let (plan, _) = stage_fixture(DreaminaWorkflowIntent::image(request).unwrap());
         assert_eq!(plan.output_count(), 10);
+        assert_eq!(plan.provider_command()["schema_version"], 2);
         let facts = crate::pricing::admission::dreamina_pricing_facts(
             plan.typed_request(),
             DREAMINA_IMAGES_API_PROFILE,
@@ -1409,7 +1420,7 @@ mod tests {
     }
 
     #[test]
-    fn image_batch_is_frozen_once_and_split_by_output_slot_later() {
+    fn image_batch_is_frozen_once_for_a_native_submission() {
         let plan = DreaminaImageAdmissionPlan::new(DreaminaImageGenerationRequest {
             prompt: "a city".to_owned(),
             model_version: Some("5.0Pro".to_owned()),
@@ -1421,6 +1432,7 @@ mod tests {
         })
         .unwrap();
         assert_eq!(plan.output_count(), 3);
+        assert_eq!(plan.provider_command["schema_version"], 2);
         assert_eq!(plan.provider_model(), "dreamina-image-5.0Pro");
         let parsed =
             parse_submit_command(&serde_json::to_vec(&plan.provider_command).unwrap()).unwrap();
@@ -1438,6 +1450,36 @@ mod tests {
             crate::admission::attach_operation(&attach).unwrap(),
             GENERATION_OPERATION
         );
+    }
+
+    #[test]
+    fn native_batch_preserves_historical_request_identity_without_reusing_execution_hash() {
+        for count in [1, 2, 10] {
+            let plan = DreaminaImageAdmissionPlan::new(DreaminaImageGenerationRequest {
+                prompt: "idempotent image".to_owned(),
+                model_version: Some("5.0".to_owned()),
+                ratio: Some("1:1".to_owned()),
+                resolution_type: "2k".to_owned(),
+                width: None,
+                height: None,
+                generate_num: Some(count),
+            })
+            .unwrap();
+            let mut historical = plan.provider_command.clone();
+            historical["schema_version"] = Value::from(1);
+            assert_eq!(
+                plan.request_identity_hash(),
+                source_hash(&historical).unwrap()
+            );
+            assert_eq!(
+                plan.provider_command_hash(),
+                source_hash(&plan.provider_command).unwrap()
+            );
+            assert_eq!(
+                plan.request_identity_hash() == plan.provider_command_hash(),
+                count == 1
+            );
+        }
     }
 
     #[test]

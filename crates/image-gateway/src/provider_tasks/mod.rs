@@ -29,7 +29,8 @@ pub use capacity::{
 };
 pub use poll::{
     ProviderArtifactSinkContractError, ProviderArtifactStageContext, ProviderArtifactStager,
-    ProviderArtifactStagerFactory, ProviderPollDaemon, ProviderPollDaemonConfig,
+    ProviderArtifactStagerFactory, ProviderNativeBatchArtifactSink,
+    ProviderNativeBatchPollObservation, ProviderPollDaemon, ProviderPollDaemonConfig,
     ProviderPollDaemonError, ProviderPollDaemonReport, ProviderPollDriver, ProviderPollDriverCall,
     ProviderPollIteration, ProviderPollOrchestrator, ProviderPollOrchestratorConfig,
     ProviderPollOrchestratorError, ProviderPollRun, ProviderPollStore, StagedProviderArtifact,
@@ -84,6 +85,18 @@ pub struct ProviderRemoteTask {
     pub next_poll_at_ms: Option<i64>,
     pub cancel_requested: bool,
     pub poll_lease_epoch: i64,
+}
+
+/// Frozen output membership for one native Dreamina image submission.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeBatchMember {
+    pub output_index: i32,
+    pub submission_id: Uuid,
+    pub executor_execution_id: Uuid,
+    pub output_id: Uuid,
+    pub job_id: Uuid,
+    pub committed_artifact: Option<ProviderArtifactPublication>,
+    pub committed_failure_code: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -794,6 +807,31 @@ pub trait ProviderTaskStore: Send + Sync + 'static {
         lease: &ProviderTaskLease,
         authority: &ProviderArtifactAuthority,
     ) -> Result<ProviderArtifactPublication, ProviderTaskStoreError>;
+
+    async fn native_batch_members(
+        &self,
+        _lease: &ProviderTaskLease,
+    ) -> Result<Option<Vec<NativeBatchMember>>, ProviderTaskStoreError> {
+        Ok(None)
+    }
+
+    async fn publish_native_batch_artifact(
+        &self,
+        _lease: &ProviderTaskLease,
+        _output_index: i32,
+        _authority: &ProviderArtifactAuthority,
+    ) -> Result<ProviderArtifactPublication, ProviderTaskStoreError> {
+        Err(ProviderTaskStoreError::InvalidInput)
+    }
+
+    async fn record_native_batch_failure(
+        &self,
+        _lease: &ProviderTaskLease,
+        _output_index: i32,
+        _error_code: &str,
+    ) -> Result<(), ProviderTaskStoreError> {
+        Err(ProviderTaskStoreError::InvalidInput)
+    }
 
     async fn record_verified_callback(
         &self,

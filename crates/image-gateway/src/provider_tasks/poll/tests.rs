@@ -28,9 +28,10 @@ use crate::{
     artifacts::executor_object_key,
     executor::ExecutorResultManifest,
     provider_tasks::{
-        ProviderArtifactAuthority, ProviderArtifactPublication, ProviderExecutionContext,
-        ProviderRemoteTask, ProviderTaskClaimScope, ProviderTaskLease, ProviderTaskObservation,
-        ProviderTaskObservationOutcome, ProviderTaskState, ProviderTaskStoreError,
+        NativeBatchMember, ProviderArtifactAuthority, ProviderArtifactPublication,
+        ProviderExecutionContext, ProviderRemoteTask, ProviderTaskClaimScope, ProviderTaskLease,
+        ProviderTaskObservation, ProviderTaskObservationOutcome, ProviderTaskState,
+        ProviderTaskStoreError,
     },
     providers::dreamina_cli::{DreaminaCliPollDriverV1, DreaminaCliRuntimeBindingV1},
 };
@@ -106,6 +107,8 @@ struct FakeStoreState {
     fail_heartbeat: bool,
     actions: Vec<&'static str>,
     observations: Vec<ProviderTaskObservation>,
+    native_members: Option<Vec<NativeBatchMember>>,
+    fail_native_publish_once: Option<i32>,
 }
 
 #[derive(Clone, Default)]
@@ -125,6 +128,47 @@ impl FakeStore {
 }
 
 impl ProviderPollStore for FakeStore {
+    async fn native_batch_members(
+        &self,
+        _lease: &ProviderTaskLease,
+    ) -> Result<Option<Vec<NativeBatchMember>>, ProviderTaskStoreError> {
+        Ok(self.state.lock().unwrap().native_members.clone())
+    }
+
+    async fn publish_native_batch_artifact(
+        &self,
+        lease: &ProviderTaskLease,
+        output_index: i32,
+        authority: &ProviderArtifactAuthority,
+    ) -> Result<ProviderArtifactPublication, ProviderTaskStoreError> {
+        let mut state = self.state.lock().unwrap();
+        if state.fail_native_publish_once == Some(output_index) {
+            state.fail_native_publish_once = None;
+            return Err(ProviderTaskStoreError::Unavailable);
+        }
+        let member = &mut state.native_members.as_mut().unwrap()[output_index as usize];
+        let mut member_lease = lease.clone();
+        member_lease.task.submission_id = member.submission_id;
+        member_lease.task.executor_execution_id = member.executor_execution_id;
+        let publication = publication(&member_lease, authority);
+        member.committed_artifact = Some(publication.clone());
+        state.actions.push("publish-member");
+        Ok(publication)
+    }
+
+    async fn record_native_batch_failure(
+        &self,
+        _lease: &ProviderTaskLease,
+        output_index: i32,
+        error_code: &str,
+    ) -> Result<(), ProviderTaskStoreError> {
+        let mut state = self.state.lock().unwrap();
+        state.native_members.as_mut().unwrap()[output_index as usize].committed_failure_code =
+            Some(error_code.to_owned());
+        state.actions.push("missing-member");
+        Ok(())
+    }
+
     async fn claim_poll(
         &self,
         _scope: &ProviderTaskClaimScope,
@@ -154,8 +198,20 @@ impl ProviderPollStore for FakeStore {
         lease: &ProviderTaskLease,
         authority: &ProviderArtifactAuthority,
     ) -> Result<ProviderArtifactPublication, ProviderTaskStoreError> {
-        self.state.lock().unwrap().actions.push("publish");
-        Ok(publication(lease, authority))
+        let mut state = self.state.lock().unwrap();
+        if state.native_members.as_ref().is_some_and(|members| {
+            members[1..].iter().any(|member| {
+                member.committed_artifact.is_none() && member.committed_failure_code.is_none()
+            })
+        }) {
+            return Err(ProviderTaskStoreError::Conflict);
+        }
+        state.actions.push("publish");
+        let publication = publication(lease, authority);
+        if let Some(members) = state.native_members.as_mut() {
+            members[0].committed_artifact = Some(publication.clone());
+        }
+        Ok(publication)
     }
 
     async fn record_poll_observation(
@@ -242,6 +298,250 @@ impl Drop for DropFlag {
     fn drop(&mut self) {
         self.0.store(true, Ordering::SeqCst);
     }
+}
+
+#[derive(Clone)]
+struct NativeBatchDriver {
+    calls: Arc<AtomicUsize>,
+    outputs: Arc<Mutex<Vec<Vec<u8>>>>,
+}
+
+impl ProviderPollDriver for NativeBatchDriver {
+    fn provider_id(&self) -> &'static str {
+        DREAMINA_PROVIDER_ID
+    }
+
+    async fn poll<S: ArtifactSink>(
+        &self,
+        _call: &ProviderPollDriverCall,
+        _sink: &mut S,
+    ) -> Result<PollObservation, image_provider_sdk::ProviderFailure> {
+        panic!("native batch must not use the single-output poll path")
+    }
+
+    async fn poll_native_batch<S: ProviderNativeBatchArtifactSink>(
+        &self,
+        _call: &ProviderPollDriverCall,
+        _output_count: usize,
+        sink: &mut S,
+    ) -> Result<ProviderNativeBatchPollObservation, image_provider_sdk::ProviderFailure> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let outputs = self.outputs.lock().unwrap().clone();
+        for (index, bytes) in outputs.iter().enumerate() {
+            sink.select_output(index).map_err(sink_failure)?;
+            sink.write_chunk(bytes).await.map_err(sink_failure)?;
+            sink.finalize(ArtifactMetadata {
+                media_type: "image/png",
+            })
+            .await
+            .map_err(sink_failure)?;
+        }
+        Ok(ProviderNativeBatchPollObservation::Completed {
+            output_count: outputs.len(),
+        })
+    }
+}
+
+fn native_batch_fixture(
+    count: usize,
+    actual: usize,
+) -> (
+    FakeStore,
+    NativeBatchDriver,
+    TestStagerFactory,
+    ProviderTaskLease,
+) {
+    let lease = dreamina_lease(Uuid::from_u128(10));
+    let store = FakeStore::with_lease(lease.clone());
+    store.state.lock().unwrap().native_members = Some(
+        (0..count)
+            .map(|index| NativeBatchMember {
+                output_index: index as i32,
+                submission_id: if index == 0 {
+                    lease.task.submission_id
+                } else {
+                    Uuid::from_u128(100 + index as u128)
+                },
+                executor_execution_id: if index == 0 {
+                    lease.task.executor_execution_id
+                } else {
+                    Uuid::from_u128(200 + index as u128)
+                },
+                output_id: Uuid::from_u128(300 + index as u128),
+                job_id: Uuid::from_u128(400),
+                committed_artifact: None,
+                committed_failure_code: None,
+            })
+            .collect(),
+    );
+    let driver = NativeBatchDriver {
+        calls: Arc::new(AtomicUsize::new(0)),
+        outputs: Arc::new(Mutex::new(
+            (0..actual)
+                .map(|index| format!("image-{index}").into_bytes())
+                .collect(),
+        )),
+    };
+    (store, driver, TestStagerFactory::default(), lease)
+}
+
+fn native_batch_orchestrator(
+    store: FakeStore,
+    driver: NativeBatchDriver,
+    factory: TestStagerFactory,
+) -> ProviderPollOrchestrator<FakeStore, NativeBatchDriver, TestStagerFactory> {
+    let mut config = config(Duration::from_millis(20));
+    config.scope.provider_id = DREAMINA_PROVIDER_ID.to_owned();
+    ProviderPollOrchestrator::new(store, driver, factory, config).unwrap()
+}
+
+#[tokio::test]
+async fn native_batch_releases_single_staging_permit_between_all_ten_outputs() {
+    let (store, driver, factory, _) = native_batch_fixture(10, 10);
+    let orchestrator = native_batch_orchestrator(store.clone(), driver.clone(), factory.clone());
+    let run = tokio::time::timeout(Duration::from_secs(1), orchestrator.run_once())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        run,
+        ProviderPollRun::Observed(ProviderRemoteTask {
+            state: ProviderTaskState::ArtifactReady,
+            ..
+        })
+    ));
+    assert_eq!(driver.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(factory.begins.load(Ordering::SeqCst), 10);
+    let state = store.state.lock().unwrap();
+    assert!(
+        state
+            .native_members
+            .as_ref()
+            .unwrap()
+            .iter()
+            .all(|member| member.committed_artifact.is_some())
+    );
+    assert_eq!(state.actions.last(), Some(&"record"));
+    assert_eq!(state.actions[9..], ["publish", "record"]);
+    assert!(
+        state.actions[..9]
+            .iter()
+            .all(|action| *action == "publish-member")
+    );
+}
+
+#[tokio::test]
+async fn native_batch_records_missing_outputs_before_leader_completion() {
+    let (store, driver, factory, _) = native_batch_fixture(3, 1);
+    let run = native_batch_orchestrator(store.clone(), driver, factory)
+        .run_once()
+        .await
+        .unwrap();
+    assert!(matches!(
+        run,
+        ProviderPollRun::Observed(ProviderRemoteTask {
+            state: ProviderTaskState::ArtifactReady,
+            ..
+        })
+    ));
+    let state = store.state.lock().unwrap();
+    assert_eq!(
+        state.actions,
+        ["missing-member", "missing-member", "publish", "record"]
+    );
+    let members = state.native_members.as_ref().unwrap();
+    assert!(members[0].committed_artifact.is_some());
+    assert!(
+        members[1..]
+            .iter()
+            .all(|member| member.committed_failure_code.as_deref()
+                == Some("dreamina_native_batch_result_missing"))
+    );
+}
+
+#[tokio::test]
+async fn native_batch_storage_failure_and_restart_reuse_committed_results_without_regeneration() {
+    let (store, driver, factory, lease) = native_batch_fixture(3, 3);
+    store.state.lock().unwrap().fail_native_publish_once = Some(2);
+    let orchestrator = native_batch_orchestrator(store.clone(), driver.clone(), factory.clone());
+    assert!(matches!(
+        orchestrator.run_once().await,
+        Err(ProviderPollOrchestratorError::Store(
+            ProviderTaskStoreError::Unavailable
+        ))
+    ));
+    assert_eq!(factory.begins.load(Ordering::SeqCst), 3);
+    {
+        let state = store.state.lock().unwrap();
+        assert!(state.observations.is_empty());
+        assert_eq!(state.actions, ["publish-member"]);
+        let members = state.native_members.as_ref().unwrap();
+        assert!(members[0].committed_artifact.is_none());
+        assert!(members[1].committed_artifact.is_some());
+        assert!(members[2].committed_artifact.is_none());
+    }
+    store.state.lock().unwrap().lease = Some(lease.clone());
+    orchestrator.run_once().await.unwrap();
+    assert_eq!(driver.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        factory.begins.load(Ordering::SeqCst),
+        5,
+        "committed follower is verified rather than staged again"
+    );
+    store.state.lock().unwrap().lease = Some(lease);
+    orchestrator.run_once().await.unwrap();
+    assert_eq!(
+        driver.calls.load(Ordering::SeqCst),
+        2,
+        "all committed members recover without another query"
+    );
+    assert_eq!(factory.begins.load(Ordering::SeqCst), 5);
+    assert_eq!(
+        store.state.lock().unwrap().actions,
+        [
+            "publish-member",
+            "publish-member",
+            "publish",
+            "record",
+            "record"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn native_batch_restart_rejects_changed_ordinal_mapping() {
+    let (store, driver, factory, lease) = native_batch_fixture(3, 3);
+    store.state.lock().unwrap().fail_native_publish_once = Some(2);
+    let orchestrator = native_batch_orchestrator(store.clone(), driver.clone(), factory.clone());
+    assert!(orchestrator.run_once().await.is_err());
+    driver.outputs.lock().unwrap().swap(1, 2);
+    store.state.lock().unwrap().lease = Some(lease);
+    let run = orchestrator.run_once().await.unwrap();
+    assert!(matches!(
+        run,
+        ProviderPollRun::Observed(ProviderRemoteTask {
+            state: ProviderTaskState::Uncertain,
+            ..
+        })
+    ));
+    assert_eq!(factory.begins.load(Ordering::SeqCst), 4);
+    assert_eq!(driver.calls.load(Ordering::SeqCst), 2);
+    let state = store.state.lock().unwrap();
+    assert!(
+        state.native_members.as_ref().unwrap()[0]
+            .committed_artifact
+            .is_none()
+    );
+    assert!(
+        state.native_members.as_ref().unwrap()[1]
+            .committed_artifact
+            .is_some()
+    );
+    assert!(
+        state.native_members.as_ref().unwrap()[2]
+            .committed_artifact
+            .is_none()
+    );
 }
 
 struct ForgingDriver;
@@ -534,6 +834,76 @@ async fn unverified_terminal_failures_become_uncertain() {
                 if error_code == "provider_poll_failure_contract"
         ));
     }
+}
+
+#[tokio::test]
+async fn native_batch_dreamina_driver_composes_through_account_fenced_poll_call() {
+    let root = TempDir::new().unwrap();
+    let workspace = root.path().join("workspace");
+    let account_home = root.path().join("account-home");
+    fs::create_dir(&workspace).unwrap();
+    fs::create_dir(&account_home).unwrap();
+    fs::set_permissions(&workspace, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::set_permissions(&account_home, fs::Permissions::from_mode(0o700)).unwrap();
+    let executable = root.path().join("dreamina");
+    let script = br#"#!/bin/sh
+submit=
+download=
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --submit_id) shift; submit=$1 ;;
+    --download_dir) shift; download=$1 ;;
+  esac
+  shift
+done
+printf x >> "$HOME/query-count"
+/bin/cp "$HOME/source.png" "$download/00.png"
+/bin/cp "$HOME/source.png" "$download/01.png"
+printf '{"submit_id":"%s","gen_status":"success"}' "$submit"
+"#;
+    fs::write(&executable, script).unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o500)).unwrap();
+    fs::write(
+        account_home.join("source.png"),
+        b"\x89PNG\r\n\x1a\nnative-batch",
+    )
+    .unwrap();
+    let (store, _, factory, lease) = native_batch_fixture(2, 2);
+    let binding = DreaminaCliRuntimeBindingV1::new(
+        lease.context.execution_profile_id,
+        lease.task.provider_account_id,
+        lease.context.credential_auth_sha256.clone(),
+    )
+    .unwrap();
+    let policy = DreaminaCliQueryPolicyV1::new(
+        &executable,
+        Sha256::digest(script).into(),
+        WorkingDirectory::new(&workspace).unwrap(),
+        WorkingDirectory::new(&account_home).unwrap(),
+        Duration::from_secs(5),
+        Duration::from_millis(50),
+    )
+    .unwrap();
+    let driver = DreaminaCliPollDriverV1::new(policy, binding, 1024 * 1024).unwrap();
+    let mut config = config(Duration::from_millis(20));
+    config.scope.provider_id = DREAMINA_PROVIDER_ID.to_owned();
+    let orchestrator =
+        ProviderPollOrchestrator::new(store.clone(), driver, factory.clone(), config).unwrap();
+    let result = orchestrator.run_once().await.unwrap();
+    assert!(matches!(
+        result,
+        ProviderPollRun::Observed(ProviderRemoteTask {
+            state: ProviderTaskState::ArtifactReady,
+            ..
+        })
+    ));
+    assert_eq!(factory.begins.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        store.state.lock().unwrap().actions,
+        ["publish-member", "publish", "record"]
+    );
+    assert_eq!(fs::read(account_home.join("query-count")).unwrap(), b"x");
+    assert!(dreamina_workspace_has_no_attempts(&workspace));
 }
 
 #[tokio::test]
