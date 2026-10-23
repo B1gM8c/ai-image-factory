@@ -141,9 +141,14 @@ credentials. Native batching requires migration
 `0140_dreamina_native_image_batches.sql` before activation. Older binaries do not
 understand version 2 commands: stop new batch admissions and finish or reconcile
 in-flight native batches before rolling the binary back. Do not delete their
-membership or recreate their submissions. Code and fixture verification alone
-do not demonstrate real CLI result naming, actual image counts or upstream
-charges.
+membership or recreate their submissions. Version 139 binaries also reject a
+version 140 database at startup, even after all batches finish. Rollback must
+use a compatible build that retains migration 0140, or the supported backup
+and database-restore recovery path while admission is closed. Reconcile any
+post-upgrade business facts before restoring a pre-upgrade database; never
+change migration metadata to make an old binary start. Code and fixture
+verification alone do not demonstrate real CLI result naming, actual image
+counts or upstream charges.
 
 Sources: [official CLI guide](https://bytedance.larkoffice.com/wiki/FVTwwm0bGiishxkKOoScdHR2nsg)
 and [Ark video task API](https://ark.volcengine.com/region:cn-beijing/docs/create-video-generation-task-api).
