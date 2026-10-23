@@ -4640,7 +4640,7 @@ fn default_model_aliases(
                 Some(("volcengine-ark-images-v3", "doubao-seedream-5-0-lite"))
             }
             ("images.generations", "5.0Pro") => {
-                Some(("volcengine-ark-images-v3", "doubao-seedream-5-0-260128"))
+                Some(("volcengine-ark-images-v3", "doubao-seedream-5-0-pro-260628"))
             }
             ("videos.generations", "seedance2.0") => Some((
                 "volcengine-ark-content-generation-v3",
@@ -5463,6 +5463,20 @@ fn map_route_insert(error: sqlx::Error) -> ImageGatewayError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn seedream_pro_gets_the_official_pro_default_alias() {
+        assert_eq!(
+            default_model_aliases(DREAMINA_PROVIDER_ID, "images.generations", "5.0Pro"),
+            [
+                ("dreamina-cli-images-v1".to_owned(), "5.0Pro".to_owned()),
+                (
+                    "volcengine-ark-images-v3".to_owned(),
+                    "doubao-seedream-5-0-pro-260628".to_owned(),
+                ),
+            ]
+        );
+    }
 
     #[test]
     fn seedance25_gets_native_and_ark_default_model_aliases() {

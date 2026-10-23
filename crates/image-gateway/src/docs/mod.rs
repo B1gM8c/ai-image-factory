@@ -2998,7 +2998,7 @@ struct DreaminaTaskErrorDoc {
 #[schema(as = ArkImageGenerationRequest)]
 #[allow(dead_code)]
 struct ArkImageGenerationRequestDoc {
-    #[schema(example = "doubao-seedream-5-0-260128")]
+    #[schema(example = "doubao-seedream-5-0-pro-260628")]
     model: String,
     #[schema(min_length = 1)]
     prompt: String,

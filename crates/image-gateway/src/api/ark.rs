@@ -546,7 +546,7 @@ fn validate_resolved_ark_route(
 fn ark_image_model_for_provider(provider_model: &str) -> Option<&'static str> {
     match provider_model {
         "5.0" => Some("doubao-seedream-5-0-lite"),
-        "5.0Pro" => Some("doubao-seedream-5-0-260128"),
+        "5.0Pro" => Some("doubao-seedream-5-0-pro-260628"),
         _ => None,
     }
 }
@@ -617,6 +617,26 @@ mod tests {
         artifacts::GenerationResponseProjection, generator::GeneratedImage, usage::UsageSnapshot,
     };
     use image::{ImageBuffer, ImageFormat, Rgba};
+
+    #[test]
+    fn resolved_seedream_routes_keep_their_canonical_cli_model() {
+        for model in ["5.0", "5.0Pro"] {
+            let normalized = ark_image_model_for_provider(model).unwrap();
+            let request = serde_json::from_value(serde_json::json!({
+                "model": normalized,
+                "prompt": "a city",
+                "size": "2K"
+            }))
+            .unwrap();
+            let plan = ArkImageAdmissionPlan::new(request).unwrap();
+            assert_eq!(plan.provider_model_id(), model);
+        }
+        assert_eq!(
+            ark_image_model_for_provider("5.0Pro"),
+            Some("doubao-seedream-5-0-pro-260628")
+        );
+        assert_eq!(ark_image_model_for_provider("4.7"), None);
+    }
 
     #[test]
     fn ark_image_response_reports_actual_dimensions_and_base64() {

@@ -1420,12 +1420,44 @@ async fn schema_128_upgrades_to_current_without_changing_existing_provider_rows(
         ).fetch_one(&test_schema.pool).await.map_err(|error| error.to_string())?;
         require(before == after, "sidecar migrations changed existing provider accounts")?;
         require(migration_versions(&test_schema.pool).await? == expected_migration_versions(), "upgrade must apply every bundled migration")?;
-        require(migration_versions(&test_schema.pool).await?.last() == Some(&138), "upgrade must include exact millisecond pricing")?;
+        require(migration_versions(&test_schema.pool).await?.last() == Some(&139), "upgrade must include the official Seedream Pro alias")?;
         let new_rows: i64 = sqlx::query_scalar(
             "SELECT (SELECT COUNT(*) FROM media_segment_assets) + (SELECT COUNT(*) FROM media_segment_results) + (SELECT COUNT(*) FROM media_segment_worker_heartbeats) + (SELECT COUNT(*) FROM provider_account_quota_refreshes)",
         ).fetch_one(&test_schema.pool).await.map_err(|error| error.to_string())?;
         require(new_rows == 0, "migration must not enqueue analysis or quota observations")?;
         gateway_result(run_migrations(&test_schema.pool).await, "repeat migration")
+    }.await;
+    test_schema.cleanup().await?;
+    result
+}
+
+#[tokio::test]
+async fn official_seedream_pro_alias_upgrade_preserves_existing_shared_limits() -> TestResult {
+    let Some(test_schema) = TestSchema::new(2).await? else {
+        return Ok(());
+    };
+    let result = async {
+        apply_migrations_through(&test_schema.pool, 138).await?;
+        sqlx::query(
+            "UPDATE platform_model_limit_members SET request_ceiling_per_minute=7, unit_ceiling_per_minute=11 WHERE bucket_key='dreamina:seedream-5-pro'",
+        ).execute(&test_schema.pool).await.map_err(|error| error.to_string())?;
+        let before: serde_json::Value = sqlx::query_scalar(
+            "SELECT jsonb_agg(to_jsonb(member) ORDER BY operation_id,api_profile,public_model_id) FROM platform_model_limit_members member",
+        ).fetch_one(&test_schema.pool).await.map_err(|error| error.to_string())?;
+        apply_migration_range(&test_schema.pool, 139, 139).await?;
+        let after: serde_json::Value = sqlx::query_scalar(
+            "SELECT jsonb_agg(to_jsonb(member) ORDER BY operation_id,api_profile,public_model_id) FROM platform_model_limit_members member WHERE public_model_id <> 'doubao-seedream-5-0-pro-260628'",
+        ).fetch_one(&test_schema.pool).await.map_err(|error| error.to_string())?;
+        require(before == after, "alias migration changed existing limit members")?;
+        let same_limits: bool = sqlx::query_scalar(
+            "SELECT ROW(alias.bucket_key,alias.bucket_display_name,alias.media_kind,alias.unit_kind,alias.request_ceiling_per_minute,alias.unit_ceiling_per_minute,alias.created_at_ms) IS NOT DISTINCT FROM ROW(native.bucket_key,native.bucket_display_name,native.media_kind,native.unit_kind,native.request_ceiling_per_minute,native.unit_ceiling_per_minute,native.created_at_ms) FROM platform_model_limit_members alias JOIN platform_model_limit_members native ON native.operation_id='images.generations' AND native.api_profile='dreamina-cli-images-v1' AND native.public_model_id='5.0Pro' WHERE alias.operation_id='images.generations' AND alias.api_profile='volcengine-ark-images-v3' AND alias.public_model_id='doubao-seedream-5-0-pro-260628'",
+        ).fetch_one(&test_schema.pool).await.map_err(|error| error.to_string())?;
+        require(same_limits, "official Pro alias must share the canonical model's existing limits")?;
+        apply_migration_range(&test_schema.pool, 139, 139).await?;
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM platform_model_limit_members WHERE public_model_id='doubao-seedream-5-0-pro-260628'",
+        ).fetch_one(&test_schema.pool).await.map_err(|error| error.to_string())?;
+        require(count == 1, "alias migration must be idempotent")
     }.await;
     test_schema.cleanup().await?;
     result

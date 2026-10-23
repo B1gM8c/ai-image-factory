@@ -441,7 +441,7 @@ function defaultPublicModelId(
 ): string | null {
   if (apiProfile === "volcengine-ark-images-v3") {
     if (providerModelId === "5.0") return "doubao-seedream-5-0-lite";
-    if (providerModelId === "5.0Pro") return "doubao-seedream-5-0-260128";
+    if (providerModelId === "5.0Pro") return "doubao-seedream-5-0-pro-260628";
     return null;
   }
   if (apiProfile === "volcengine-ark-content-generation-v3") {

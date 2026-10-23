@@ -1607,7 +1607,7 @@ mod tests {
                 "image",
             ),
             model_route(
-                "doubao-seedream-5-0-260128",
+                "doubao-seedream-5-0-pro-260628",
                 "5.0Pro",
                 ARK_IMAGES_API_PROFILE,
                 "images.generations",

@@ -954,7 +954,7 @@ mod tests {
     #[test]
     fn ark_console_request_preserves_official_profile_and_projects_geometry() {
         let request = ConsoleImageGenerationRequest {
-            model: "doubao-seedream-5-0-260128".to_owned(),
+            model: "doubao-seedream-5-0-pro-260628".to_owned(),
             prompt: "a wide cinematic scene".to_owned(),
             count: Some(2),
             aspect_ratio: Some("16:9".to_owned()),
@@ -969,7 +969,7 @@ mod tests {
         else {
             panic!("Ark request was dispatched to the wrong adapter");
         };
-        assert_eq!(projected.model, "doubao-seedream-5-0-260128");
+        assert_eq!(projected.model, "doubao-seedream-5-0-pro-260628");
         assert_eq!(projected.size.as_deref(), Some("2048x1152"));
         assert_eq!(
             projected.sequential_image_generation.as_deref(),
@@ -987,7 +987,7 @@ mod tests {
     fn official_ark_alias_hides_the_duplicate_native_dreamina_alias() {
         let native = public_model("5.0Pro", DREAMINA_IMAGES_API_PROFILE, "5.0Pro");
         let ark = public_model(
-            "doubao-seedream-5-0-260128",
+            "doubao-seedream-5-0-pro-260628",
             ARK_IMAGES_API_PROFILE,
             "5.0Pro",
         );

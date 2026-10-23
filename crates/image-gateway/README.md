@@ -207,7 +207,7 @@ curl http://127.0.0.1:8787/api/v3/images/generations \
   -H 'Content-Type: application/json' \
   -H 'Idempotency-Key: ark-image-example-1' \
   -d '{
-    "model": "doubao-seedream-5-0-260128",
+    "model": "doubao-seedream-5-0-pro-260628",
     "prompt": "a clean product photograph on a white background",
     "size": "2K",
     "sequential_image_generation": "disabled",
@@ -215,6 +215,12 @@ curl http://127.0.0.1:8787/api/v3/images/generations \
     "stream": false
   }'
 ```
+
+The official `doubao-seedream-5-0-260128` and
+`doubao-seedream-5-0-lite-260128` names select CLI `5.0` Lite.
+`doubao-seedream-5-0-pro-260628` selects CLI `5.0Pro`.
+Existing frozen route revisions and prices retain their original identities;
+replace an incorrectly configured alias through a new route revision and price.
 
 Submit and poll a Seedance 2.0 video task:
 

@@ -407,11 +407,11 @@ fn ark_image_count(request: &ArkImageGenerationRequest) -> Result<u8, ArkAdmissi
 }
 
 fn ark_image_model(model: &str) -> Result<&'static str, ArkAdmissionError> {
-    if model_matches(model, "doubao-seedream-5-0-lite") {
-        Ok("5.0")
-    } else if model_matches(model, "doubao-seedream-5-0")
-        || model_matches(model, "doubao-seedream-5-0-pro")
+    if model_matches(model, "doubao-seedream-5-0-lite")
+        || model_matches(model, "doubao-seedream-5-0")
     {
+        Ok("5.0")
+    } else if model_matches(model, "doubao-seedream-5-0-pro") {
         Ok("5.0Pro")
     } else {
         Err(ArkAdmissionError::InvalidValue("model"))
@@ -627,8 +627,54 @@ mod tests {
         })
         .unwrap();
         assert_eq!(plan.public_model(), "doubao-seedream-5-0-260128");
-        assert_eq!(plan.provider_model(), "dreamina-image-5.0Pro");
+        assert_eq!(plan.provider_model(), "dreamina-image-5.0");
         assert_eq!(plan.output_count(), 3);
+    }
+
+    #[test]
+    fn official_seedream_lite_and_pro_aliases_have_distinct_cli_models() {
+        for (model, expected) in [
+            ("doubao-seedream-5-0", "5.0"),
+            ("doubao-seedream-5-0-260128", "5.0"),
+            ("doubao-seedream-5-0-lite", "5.0"),
+            ("doubao-seedream-5-0-lite-260128", "5.0"),
+            ("doubao-seedream-5-0-pro", "5.0Pro"),
+            ("doubao-seedream-5-0-pro-260628", "5.0Pro"),
+        ] {
+            let request = serde_json::from_value(serde_json::json!({
+                "model": model,
+                "prompt": "a city",
+                "size": "2K"
+            }))
+            .unwrap();
+            let plan = ArkImageAdmissionPlan::new(request).unwrap();
+            assert_eq!(plan.public_model(), model);
+            assert_eq!(plan.provider_model_id(), expected, "{model}");
+
+            let request = serde_json::from_value(serde_json::json!({
+                "model": model,
+                "prompt": "a city",
+                "image": "https://example.com/reference.png",
+                "size": "2K"
+            }))
+            .unwrap();
+            let DreaminaImageWorkflowRequest::ImageToImage(request) =
+                ark_image_workflow(request).unwrap()
+            else {
+                panic!("wrong workflow for {model}");
+            };
+            assert_eq!(request.model_version.as_deref(), Some(expected), "{model}");
+        }
+        for model in [
+            "doubao-seedream-5-0-pro-26062",
+            "doubao-seedream-5-0-pro-260628-extra",
+            "doubao-seedream-5-0-260128-pro",
+        ] {
+            assert_eq!(
+                ark_image_model(model),
+                Err(ArkAdmissionError::InvalidValue("model"))
+            );
+        }
     }
 
     #[test]
