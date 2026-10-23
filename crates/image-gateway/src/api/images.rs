@@ -10,9 +10,14 @@ use axum::{
     http::HeaderMap,
     response::{IntoResponse, Response},
 };
-use image_api_contracts::xai::XAI_IMAGES_API_PROFILE;
+use image_api_contracts::{
+    ark::{ARK_CONTENT_GENERATION_API_PROFILE, ARK_IMAGES_API_PROFILE},
+    dreamina::{DREAMINA_IMAGES_API_PROFILE, DREAMINA_VIDEOS_API_PROFILE},
+    xai::XAI_IMAGES_API_PROFILE,
+};
 use image_provider_contracts::BillingMetric;
 use image_provider_contracts::openai_codex;
+use image_provider_dreamina_cli::PROVIDER_ID as DREAMINA_PROVIDER_ID;
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -30,10 +35,10 @@ use crate::{
     auth::{ApiKeyCapability, AuthContext},
     generator::{EditJob, InputImage},
     input_blobs::{InputBlobKey, InputBlobWriteError},
-    model_routing::ResolvedModelRoute,
+    model_routing::{PublicModelRoute, ResolvedModelRoute},
     models::{
-        HealthResponse, ImageStreamKind, ModelData, ModelsResponse, images_response_at,
-        models_response, parse_generation,
+        HealthResponse, ImageStreamKind, ModelData, ModelMetadata, ModelSurface, ModelsResponse,
+        images_response_at, models_response, parse_generation,
     },
     usage::UsageCharge,
 };
@@ -82,23 +87,115 @@ pub(super) async fn models(
     let models = store
         .list_api_key_models(&auth.project_id, api_key_id, authz_version)
         .await?;
-    let data = models
-        .into_iter()
-        .fold(BTreeMap::new(), |mut unique, model| {
-            unique.entry(model.id.clone()).or_insert(ModelData {
-                id: model.id,
-                object: "model".to_owned(),
-                created: model.created_at_ms.div_euclid(1_000),
-                owned_by: model.provider_id,
-            });
-            unique
-        })
+    Ok(Json(routed_models_response(models)))
+}
+
+fn routed_models_response(models: Vec<PublicModelRoute>) -> ModelsResponse {
+    let mut unique = BTreeMap::new();
+    for model in models {
+        let surface = dreamina_model_surface(&model);
+        let entry = unique.entry(model.id.clone()).or_insert_with(|| ModelData {
+            id: model.id,
+            object: "model".to_owned(),
+            created: model.created_at_ms.div_euclid(1_000),
+            owned_by: model.provider_id,
+            metadata: None,
+        });
+        if let Some(surface) = surface {
+            entry
+                .metadata
+                .get_or_insert_with(|| ModelMetadata { surfaces: vec![] })
+                .surfaces
+                .push(surface);
+        }
+    }
+    let data = unique
         .into_values()
+        .map(|mut model| {
+            if let Some(metadata) = &mut model.metadata {
+                metadata.surfaces.sort();
+                metadata.surfaces.dedup();
+            }
+            model
+        })
         .collect();
-    Ok(Json(ModelsResponse {
+    ModelsResponse {
         object: "list".to_owned(),
         data,
-    }))
+    }
+}
+
+fn dreamina_model_surface(model: &PublicModelRoute) -> Option<ModelSurface> {
+    if model.provider_id != DREAMINA_PROVIDER_ID {
+        return None;
+    }
+    let canonical = model.provider_model_id.as_deref()?;
+    // Match the native adapter and Ark admission contracts, never the public alias.
+    let workflows: &[&str] = match (
+        model.api_profile.as_str(),
+        model.operation_id.as_str(),
+        model.media_kind.as_str(),
+        canonical,
+    ) {
+        (DREAMINA_IMAGES_API_PROFILE, "images.generations", "image", "3.0" | "3.1") => {
+            &["text2image"]
+        }
+        (
+            DREAMINA_IMAGES_API_PROFILE,
+            "images.generations",
+            "image",
+            "4.0" | "4.1" | "4.5" | "4.6" | "4.7" | "5.0" | "5.0Pro",
+        )
+        | (ARK_IMAGES_API_PROFILE, "images.generations", "image", "5.0" | "5.0Pro") => {
+            &["text2image", "image2image"]
+        }
+        (DREAMINA_IMAGES_API_PROFILE, "images.generations", "image", "image_upscale") => {
+            &["image_upscale"]
+        }
+        (DREAMINA_VIDEOS_API_PROFILE, "videos.generations", "video", "seedance1.0fast") => {
+            &["image2video"]
+        }
+        (DREAMINA_VIDEOS_API_PROFILE, "videos.generations", "video", "seedance1.5pro") => {
+            &["image2video", "frames2video"]
+        }
+        (
+            DREAMINA_VIDEOS_API_PROFILE,
+            "videos.generations",
+            "video",
+            "seedance2.0"
+            | "seedance2.0fast"
+            | "seedance2.0_vip"
+            | "seedance2.0fast_vip"
+            | "seedance2.0mini"
+            | "seedance2.5",
+        )
+        | (
+            ARK_CONTENT_GENERATION_API_PROFILE,
+            "videos.generations",
+            "video",
+            "seedance2.0" | "seedance2.0fast" | "seedance2.0mini" | "seedance2.5",
+        ) => &[
+            "text2video",
+            "image2video",
+            "frames2video",
+            "multimodal2video",
+        ],
+        (DREAMINA_VIDEOS_API_PROFILE, "videos.generations", "video", "multiframe2video") => {
+            &["multiframe2video"]
+        }
+        _ => return None,
+    };
+    Some(ModelSurface {
+        provider_id: model.provider_id.clone(),
+        provider_model_id: canonical.to_owned(),
+        api_profile: model.api_profile.clone(),
+        operation_id: model.operation_id.clone(),
+        media_kind: model.media_kind.clone(),
+        workflows: workflows
+            .iter()
+            .map(|workflow| (*workflow).to_owned())
+            .collect(),
+    })
 }
 
 pub(super) async fn generations(
@@ -1319,6 +1416,320 @@ pub(super) async fn claim_admission_with_retry(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn model_route(
+        id: &str,
+        canonical: &str,
+        profile: &str,
+        operation: &str,
+        media_kind: &str,
+    ) -> PublicModelRoute {
+        PublicModelRoute {
+            id: id.to_owned(),
+            provider_model_id: Some(canonical.to_owned()),
+            api_profile: profile.to_owned(),
+            provider_id: DREAMINA_PROVIDER_ID.to_owned(),
+            operation_id: operation.to_owned(),
+            media_kind: media_kind.to_owned(),
+            created_at_ms: 1_234,
+        }
+    }
+
+    #[test]
+    fn public_model_metadata_matches_adapter_workflow_families() {
+        let image = "images.generations";
+        let video = "videos.generations";
+        let image_workflows = &["text2image", "image2image"][..];
+        let video_workflows = &[
+            "text2video",
+            "image2video",
+            "frames2video",
+            "multimodal2video",
+        ][..];
+        let cases = [
+            (
+                DREAMINA_IMAGES_API_PROFILE,
+                image,
+                "image",
+                &["3.0", "3.1"][..],
+                &["text2image"][..],
+            ),
+            (
+                DREAMINA_IMAGES_API_PROFILE,
+                image,
+                "image",
+                &["4.0", "4.1", "4.5", "4.6", "4.7", "5.0", "5.0Pro"][..],
+                image_workflows,
+            ),
+            (
+                DREAMINA_IMAGES_API_PROFILE,
+                image,
+                "image",
+                &["image_upscale"][..],
+                &["image_upscale"][..],
+            ),
+            (
+                DREAMINA_VIDEOS_API_PROFILE,
+                video,
+                "video",
+                &["seedance1.0fast"][..],
+                &["image2video"][..],
+            ),
+            (
+                DREAMINA_VIDEOS_API_PROFILE,
+                video,
+                "video",
+                &["seedance1.5pro"][..],
+                &["image2video", "frames2video"][..],
+            ),
+            (
+                DREAMINA_VIDEOS_API_PROFILE,
+                video,
+                "video",
+                &[
+                    "seedance2.0",
+                    "seedance2.0fast",
+                    "seedance2.0_vip",
+                    "seedance2.0fast_vip",
+                    "seedance2.0mini",
+                    "seedance2.5",
+                ][..],
+                video_workflows,
+            ),
+            (
+                DREAMINA_VIDEOS_API_PROFILE,
+                video,
+                "video",
+                &["multiframe2video"][..],
+                &["multiframe2video"][..],
+            ),
+            (
+                ARK_IMAGES_API_PROFILE,
+                image,
+                "image",
+                &["5.0", "5.0Pro"][..],
+                image_workflows,
+            ),
+            (
+                ARK_CONTENT_GENERATION_API_PROFILE,
+                video,
+                "video",
+                &[
+                    "seedance2.0",
+                    "seedance2.0fast",
+                    "seedance2.0mini",
+                    "seedance2.5",
+                ][..],
+                video_workflows,
+            ),
+        ];
+        for (profile, operation, media, canonical_models, expected) in cases {
+            for canonical in canonical_models {
+                let surface = dreamina_model_surface(&model_route(
+                    "custom-alias",
+                    canonical,
+                    profile,
+                    operation,
+                    media,
+                ))
+                .unwrap();
+                assert_eq!(surface.provider_model_id, *canonical);
+                assert_eq!(surface.api_profile, profile);
+                assert_eq!(surface.operation_id, operation);
+                assert_eq!(surface.media_kind, media);
+                assert_eq!(surface.workflows, expected, "{profile}/{canonical}");
+            }
+        }
+    }
+
+    #[test]
+    fn public_model_metadata_retains_distinct_surfaces_and_existing_fields() {
+        let native = model_route(
+            "shared",
+            "5.0Pro",
+            DREAMINA_IMAGES_API_PROFILE,
+            "images.generations",
+            "image",
+        );
+        let ark = model_route(
+            "shared",
+            "5.0Pro",
+            ARK_IMAGES_API_PROFILE,
+            "images.generations",
+            "image",
+        );
+        let video = model_route(
+            "shared",
+            "seedance2.5",
+            DREAMINA_VIDEOS_API_PROFILE,
+            "videos.generations",
+            "video",
+        );
+        let mut duplicate = native.clone();
+        duplicate.created_at_ms = 8_999;
+        let mut legacy = native.clone();
+        legacy.id = "legacy".to_owned();
+        legacy.provider_id = "grok-cli".to_owned();
+        let response = routed_models_response(vec![native, video, legacy, duplicate, ark]);
+        let value = serde_json::to_value(response).unwrap();
+        assert_eq!(value["object"], "list");
+        assert_eq!(
+            value["data"][0],
+            serde_json::json!({
+                "id":"legacy", "object":"model", "created":1, "owned_by":"grok-cli"
+            })
+        );
+        let shared = &value["data"][1];
+        assert_eq!(shared["id"], "shared");
+        assert_eq!(shared["object"], "model");
+        assert_eq!(shared["created"], 1);
+        assert_eq!(shared["owned_by"], DREAMINA_PROVIDER_ID);
+        let surfaces = shared["metadata"]["surfaces"].as_array().unwrap();
+        assert_eq!(surfaces.len(), 3);
+        assert_eq!(surfaces[0]["api_profile"], DREAMINA_IMAGES_API_PROFILE);
+        assert_eq!(surfaces[1]["api_profile"], ARK_IMAGES_API_PROFILE);
+        assert_eq!(surfaces[2]["api_profile"], DREAMINA_VIDEOS_API_PROFILE);
+        assert!(
+            surfaces
+                .iter()
+                .all(|surface| surface.as_object().unwrap().len() == 6)
+        );
+    }
+
+    #[test]
+    fn public_model_metadata_uses_configured_canonical_identity_for_aliases() {
+        let routes = vec![
+            model_route(
+                "native-custom",
+                "5.0Pro",
+                DREAMINA_IMAGES_API_PROFILE,
+                "images.generations",
+                "image",
+            ),
+            model_route(
+                "doubao-seedream-5-0-260128",
+                "5.0Pro",
+                ARK_IMAGES_API_PROFILE,
+                "images.generations",
+                "image",
+            ),
+            model_route(
+                "seedance2.5",
+                "5.0Pro",
+                DREAMINA_IMAGES_API_PROFILE,
+                "images.generations",
+                "image",
+            ),
+        ];
+        let value = serde_json::to_value(routed_models_response(routes)).unwrap();
+        assert_eq!(value["data"].as_array().unwrap().len(), 3);
+        for model in value["data"].as_array().unwrap() {
+            assert_eq!(
+                model["metadata"]["surfaces"][0]["provider_model_id"],
+                "5.0Pro"
+            );
+            assert_eq!(
+                model["metadata"]["surfaces"][0]["workflows"],
+                serde_json::json!(["text2image", "image2image"])
+            );
+        }
+    }
+
+    #[test]
+    fn public_model_metadata_omits_unknown_and_mismatched_surfaces() {
+        let mut routes = vec![
+            model_route(
+                "unknown",
+                "future-version",
+                DREAMINA_IMAGES_API_PROFILE,
+                "images.generations",
+                "image",
+            ),
+            model_route(
+                "wrong-profile",
+                "5.0",
+                "openai-images-v1",
+                "images.generations",
+                "image",
+            ),
+            model_route(
+                "wrong-operation",
+                "5.0",
+                DREAMINA_IMAGES_API_PROFILE,
+                "images.edits",
+                "image",
+            ),
+            model_route(
+                "wrong-media",
+                "5.0",
+                DREAMINA_IMAGES_API_PROFILE,
+                "images.generations",
+                "video",
+            ),
+            model_route(
+                "ark-unsupported-image",
+                "4.0",
+                ARK_IMAGES_API_PROFILE,
+                "images.generations",
+                "image",
+            ),
+            model_route(
+                "ark-unsupported-video",
+                "seedance2.0_vip",
+                ARK_CONTENT_GENERATION_API_PROFILE,
+                "videos.generations",
+                "video",
+            ),
+            model_route(
+                "ark-fixed-image",
+                "image_upscale",
+                ARK_IMAGES_API_PROFILE,
+                "images.generations",
+                "image",
+            ),
+            model_route(
+                "ark-fixed-video",
+                "multiframe2video",
+                ARK_CONTENT_GENERATION_API_PROFILE,
+                "videos.generations",
+                "video",
+            ),
+        ];
+        let mut missing = model_route(
+            "missing",
+            "5.0",
+            DREAMINA_IMAGES_API_PROFILE,
+            "images.generations",
+            "image",
+        );
+        missing.provider_model_id = None;
+        routes.push(missing);
+        let mut other = model_route(
+            "other",
+            "5.0",
+            DREAMINA_IMAGES_API_PROFILE,
+            "images.generations",
+            "image",
+        );
+        other.provider_id = "grok-cli".to_owned();
+        routes.push(other);
+        let value = serde_json::to_value(routed_models_response(routes)).unwrap();
+        assert!(
+            value["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|model| model.as_object().unwrap().len() == 4)
+        );
+        let fallback = serde_json::to_value(models_response()).unwrap();
+        assert!(
+            fallback["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|model| model.get("metadata").is_none())
+        );
+    }
 
     #[test]
     fn external_wait_budget_includes_queue_execution_and_settlement_grace() {

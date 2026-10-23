@@ -299,22 +299,89 @@ esac
         }, None, None, None, None,
         Some(Arc::new(PostgresModelRoutingStore::new(pool.clone()))),
     ).map_err(debug_error)?;
-    let (models_status, models) = json_request(
-        app.clone(),
-        Method::GET,
-        "/v1/models",
-        &owner.api_key.value,
-        None,
-        None,
+    let catalog = json!({"object":"list", "data":[{
+        "id":MODEL, "object":"model", "created":0, "owned_by":"dreamina-cli",
+        "metadata":{"surfaces":[{
+            "provider_id":"dreamina-cli", "provider_model_id":"seedance2.5",
+            "api_profile":"volcengine-ark-content-generation-v3",
+            "operation_id":"videos.generations", "media_kind":"video",
+            "workflows":["text2video", "image2video", "frames2video", "multimodal2video"]
+        }]}
+    }]});
+    let empty_catalog = json!({"object":"list", "data":[]});
+    assert_model_catalog(app.clone(), &owner.api_key.value, &catalog).await?;
+    for key in [&other.api_key.value, &sibling.api_key.value] {
+        assert_model_catalog(app.clone(), key, &empty_catalog).await?;
+    }
+    // Metadata follows the same route/account/project filters as public model IDs.
+    for state in ["disabled", "enabled"] {
+        sqlx::query(
+            "UPDATE provider_route_heads SET state = $1 WHERE route_id IN
+            (SELECT route_id FROM gateway_api_key_provider_routes WHERE api_key_id = $2)",
+        )
+        .bind(state)
+        .bind(&owner.api_key.id)
+        .execute(pool)
+        .await
+        .map_err(debug_error)?;
+        assert_model_catalog(
+            app.clone(),
+            &owner.api_key.value,
+            if state == "disabled" {
+                &empty_catalog
+            } else {
+                &catalog
+            },
+        )
+        .await?;
+    }
+    sqlx::query(
+        "INSERT INTO provider_account_model_configurations
+        (provider_account_id, provider_id, mode, version, updated_at_ms)
+        VALUES ($1, 'dreamina-cli', 'allowlist', 1, 1)",
     )
-    .await?;
-    require(
-        models_status == StatusCode::OK
-            && models["data"]
-                .as_array()
-                .is_some_and(|models| models.iter().any(|model| model["id"] == MODEL)),
-        format!("Seedance 2.5 missing from routed model catalog: {models_status} {models}"),
-    )?;
+    .bind(provisioned.provider_account_id)
+    .execute(pool)
+    .await
+    .map_err(debug_error)?;
+    assert_model_catalog(app.clone(), &owner.api_key.value, &empty_catalog).await?;
+    sqlx::query(
+        "INSERT INTO provider_account_model_bindings
+        (provider_account_id, provider_id, model_id, media_kind, configured_at_ms)
+        VALUES ($1, 'dreamina-cli', 'seedance2.5', 'video', 1)",
+    )
+    .bind(provisioned.provider_account_id)
+    .execute(pool)
+    .await
+    .map_err(debug_error)?;
+    assert_model_catalog(app.clone(), &owner.api_key.value, &catalog).await?;
+    let policy_actor = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO identity_users
+        (user_id, normalized_email, display_name, roles, scopes, created_at_ms, updated_at_ms)
+        VALUES ($1, 'catalog-policy@example.test', 'Catalog policy actor',
+                ARRAY['platform_owner'], ARRAY['admin:*'], 1, 1)",
+    )
+    .bind(policy_actor)
+    .execute(pool)
+    .await
+    .map_err(debug_error)?;
+    sqlx::query("INSERT INTO project_model_policies
+        (project_id, organization_id, created_by_user_id, updated_by_user_id, created_at_ms, updated_at_ms)
+        VALUES ($1, $1, $2, $2, 1, 1)")
+        .bind(&project.id).bind(policy_actor).execute(pool).await.map_err(debug_error)?;
+    assert_model_catalog(app.clone(), &owner.api_key.value, &empty_catalog).await?;
+    sqlx::query(
+        "INSERT INTO project_model_access_entries
+        (project_id, operation_id, api_profile, public_model_id, media_kind, created_at_ms)
+        VALUES ($1, 'videos.generations', 'volcengine-ark-content-generation-v3', $2, 'video', 1)",
+    )
+    .bind(&project.id)
+    .bind(MODEL)
+    .execute(pool)
+    .await
+    .map_err(debug_error)?;
+    assert_model_catalog(app.clone(), &owner.api_key.value, &catalog).await?;
     let body = json!({"model": MODEL,
         "content": [{"type": "text", "text": "An orange paper airplane on a blue background"}],
         "duration": 5, "resolution": "480p", "ratio": "16:9"});
@@ -743,6 +810,14 @@ async fn assert_remote_rejects_local_evidence(pool: &PgPool, job_id: Uuid) -> Te
         )?;
     }
     Ok(())
+}
+
+async fn assert_model_catalog(app: axum::Router, key: &str, expected: &Value) -> TestResult {
+    let (status, models) = json_request(app, Method::GET, "/v1/models", key, None, None).await?;
+    require(
+        status == StatusCode::OK && &models == expected,
+        format!("Unexpected authorized model catalog: {status} {models}; expected {expected}"),
+    )
 }
 
 async fn seed_route(

@@ -270,6 +270,19 @@ jobs:
           cargo test --locked --package gpt-image-2-gateway \
             --test postgres_provider_tasks gated_submit:: -- --test-threads=1
 
+      - name: Test hotfix public model metadata and catalog authorization
+        if: inputs.validation_profile == 'hotfix'
+        run: |
+          cargo test --locked --package gpt-image-2-gateway \
+            --lib public_model_metadata -- --test-threads=1
+          cargo test --locked --package gpt-image-2-gateway \
+            --lib ark_openapi_explains_media_dispatch_and_unbound_controls \
+            -- --test-threads=1
+          cargo test --locked --package gpt-image-2-gateway \
+            --test postgres_video_api \
+            dreamina::ark_seedance25_api_runs_one_cli_submission_and_settlement \
+            -- --exact --test-threads=1
+
       - name: Install admin dependencies
         run: npm ci
 
