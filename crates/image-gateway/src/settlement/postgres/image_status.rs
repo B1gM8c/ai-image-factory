@@ -1,4 +1,6 @@
-use image_api_contracts::dreamina::{DREAMINA_IMAGES_API_PROFILE, DreaminaImageRequestMetadata};
+use image_api_contracts::dreamina::{
+    DREAMINA_IMAGES_API_PROFILE, DreaminaImageOutputCounts, DreaminaImageRequestMetadata,
+};
 use image_provider_dreamina_cli::DREAMINA_SUBMIT_COMMAND_SCHEMA;
 use sqlx::FromRow;
 use uuid::Uuid;
@@ -100,8 +102,24 @@ pub(super) async fn project(
         .ok_or_else(ImageGatewayError::artifact_integrity)?;
     let status = if row.job_state == "succeeded" {
         match store.load_generation_result(job_id).await? {
-            GenerationResultLookup::Available(result) if result.images.len() == count as usize => {
-                ImageResultStatus::Succeeded(result)
+            GenerationResultLookup::Available(result) => {
+                let delivered = u32::try_from(result.images.len())
+                    .ok()
+                    .filter(|delivered| (1..=count).contains(delivered))
+                    .ok_or_else(ImageGatewayError::artifact_integrity)?;
+                if delivered < count
+                    && !settled_native_partial(store, job_id, count, delivered).await?
+                {
+                    return Err(ImageGatewayError::artifact_integrity());
+                }
+                ImageResultStatus::Succeeded {
+                    result,
+                    output_counts: DreaminaImageOutputCounts {
+                        requested: count,
+                        delivered,
+                        failed: count - delivered,
+                    },
+                }
             }
             GenerationResultLookup::Expired => ImageResultStatus::Expired,
             _ => return Err(ImageGatewayError::artifact_integrity()),
@@ -137,6 +155,67 @@ pub(super) async fn project(
         },
         status,
     }))
+}
+
+// A short result is deliverable only after the original native batch has
+// finished and settled every output. This extra read is never used by pending
+// or full-count tasks. Blob existence and hashes remain checked by hydration.
+async fn settled_native_partial(
+    store: &PostgresExecutionSettlementStore,
+    job_id: Uuid,
+    requested: u32,
+    delivered: u32,
+) -> Result<bool, ImageGatewayError> {
+    sqlx::query_scalar(
+        r#"
+        SELECT EXISTS (
+            SELECT 1
+            FROM jobs job
+            JOIN work_items work ON work.job_id = job.job_id
+            JOIN job_response_projections projection ON projection.job_id = job.job_id
+            JOIN dreamina_native_batches batch ON batch.job_id = job.job_id
+            JOIN quota_reservations quota ON quota.reservation_id = job.reservation_id
+              AND quota.job_id = job.job_id AND quota.tenant_id = job.tenant_id
+            JOIN customer_billing_holds hold ON hold.job_id = job.job_id
+              AND hold.tenant_id = job.tenant_id
+            JOIN customer_price_quotes quote ON quote.quote_id = hold.quote_id
+              AND quote.job_id = job.job_id AND quote.tenant_id = job.tenant_id
+              AND quote.currency = hold.currency
+            JOIN customer_rated_usage rating ON rating.quote_id = quote.quote_id
+              AND rating.job_id = job.job_id AND rating.currency = hold.currency
+            WHERE job.job_id = $1 AND job.provider_id = 'dreamina-cli'
+              AND job.economics_contract_version = 4
+              AND job.state = 'succeeded' AND work.state = 'succeeded'
+              AND job.output_count = $2 AND batch.output_count = $2
+              AND job.requested_units = $2 AND job.billable_units = $2
+              AND job.charged_units = $3 AND projection.artifact_count = $3
+              AND quota.state = 'committed' AND quota.requested_units = $2
+              AND quota.committed_units = $3 AND quota.released_units = $2 - $3
+              AND hold.state = 'settled' AND hold.held_micros = quote.max_total_micros
+              AND hold.held_micros::NUMERIC = hold.captured_micros::NUMERIC + hold.released_micros::NUMERIC
+              AND rating.total_amount_micros = hold.captured_micros
+              AND (SELECT count(*) FROM job_outputs WHERE job_id = job.job_id) = $2
+              AND (SELECT count(*) FROM job_outputs WHERE job_id = job.job_id AND state = 'succeeded') = $3
+              AND (SELECT count(*) FROM job_outputs WHERE job_id = job.job_id AND state IN ('failed','canceled')) = $2 - $3
+              AND (SELECT count(*) FROM provider_submissions WHERE job_id = job.job_id) = $2
+              AND NOT EXISTS (
+                  SELECT 1 FROM provider_submissions submission
+                  LEFT JOIN executor_terminal_reductions reduction
+                    ON reduction.submission_id = submission.submission_id
+                   AND reduction.executor_execution_id = submission.executor_execution_id
+                  WHERE submission.job_id = job.job_id
+                    AND (reduction.submission_id IS NULL OR reduction.state <> 'completed'
+                         OR reduction.resolved_state NOT IN ('succeeded','failed','canceled'))
+              )
+        )
+        "#,
+    )
+    .bind(job_id)
+    .bind(requested as i32)
+    .bind(delivered as i32)
+    .fetch_one(&store.pool)
+    .await
+    .map_err(settlement_unavailable)
 }
 
 fn positive_dimension(value: Option<i64>) -> Result<Option<u32>, ImageGatewayError> {

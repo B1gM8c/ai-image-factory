@@ -314,6 +314,12 @@ fn patch_image_tasks(document: &mut Value) {
             "created": {"type": "integer", "format": "int64"},
             "data": {"type": "array", "items": {"type": "object", "additionalProperties": false,
                 "required": ["b64_json"], "properties": {"b64_json": {"type": "string"}}}},
+            "output_counts": {"type": "object", "additionalProperties": false,
+                "required": ["requested", "delivered", "failed"],
+                "description": "Present only on success. requested remains the original quantity; delivered equals data.length and requested equals delivered + failed. A partial native batch is returned only after all outputs and the original quote are settled; failed units are released. Missing blobs or uncertain outputs do not authorize partial success.",
+                "properties": {"requested": {"type": "integer", "minimum": 1, "maximum": 10},
+                    "delivered": {"type": "integer", "minimum": 1, "maximum": 10},
+                    "failed": {"type": "integer", "minimum": 0, "maximum": 9}}},
             "output_format": {"type": "string"}, "quality": {"type": "string"},
             "size": {"type": "string"}, "background": {"type": "string"}
         }

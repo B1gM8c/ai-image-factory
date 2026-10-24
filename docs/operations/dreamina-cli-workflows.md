@@ -67,8 +67,14 @@ model, request ID and frozen request dimensions. Status is `running`, `succeeded
 `failed`, `uncertain` or `expired`. Running tasks use the stages and progress
 fields described below. Successful tasks include the existing image fields at
 the top level: `created`, `data: [{b64_json}]`, `output_format`, `quality`, `size`
-and `background`, plus usage headers. The delivered count must match the frozen
-request. `uncertain` has error `generation_uncertain`; it does not authorize a
+and `background`, plus usage headers and `output_counts` with `requested`,
+`delivered` and `failed`. `requested` and `request.generate_num` retain the
+original quantity; `data.length` equals `delivered`, and `requested` equals
+`delivered + failed`. A native batch may deliver fewer images only when all its
+outputs have definite final outcomes and its original quote has settled with
+the successful units committed and failed units released. Missing blobs,
+unsettled quotes or uncertain outputs cannot authorize partial success.
+`uncertain` has error `generation_uncertain`; it does not authorize a
 refund or another generation. `expired` has error `artifact_expired` and does
 not authorize regeneration either.
 

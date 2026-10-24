@@ -18,7 +18,7 @@ async fn dreamina_async_images_keep_original_id_progress_scope_and_artifact() ->
     let Some(database) = TestDatabase::new().await? else {
         return Ok(());
     };
-    let result = Box::pin(run_async_image(&database.pool, true)).await;
+    let result = Box::pin(run_async_image(&database.pool, true, 1)).await;
     combine(result, database.cleanup().await)
 }
 
@@ -28,11 +28,35 @@ async fn dreamina_async_uncertain_images_keep_the_hold_and_original_id() -> Test
     let Some(database) = TestDatabase::new().await? else {
         return Ok(());
     };
-    let result = Box::pin(run_async_image(&database.pool, false)).await;
+    let result = Box::pin(run_async_image(&database.pool, false, 1)).await;
     combine(result, database.cleanup().await)
 }
 
-async fn run_async_image(pool: &PgPool, succeeds: bool) -> TestResult {
+#[tokio::test]
+async fn dreamina_async_partial_native_images_keep_original_count_and_settled_delivery()
+-> TestResult {
+    let _guard = postgres_video_test_lock().lock().await;
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = Box::pin(run_async_image(&database.pool, true, 3)).await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
+async fn dreamina_async_uncertain_native_batch_never_publishes_partial_counts_or_retries()
+-> TestResult {
+    let _guard = postgres_video_test_lock().lock().await;
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = Box::pin(run_async_image(&database.pool, false, 3)).await;
+    combine(result, database.cleanup().await)
+}
+
+async fn run_async_image(pool: &PgPool, succeeds: bool, requested: u32) -> TestResult {
+    let delivered = if requested == 1 { 1 } else { 2 };
+
     let root = TempDir::new().map_err(debug_error)?;
     let home = root.path().join("account");
     let submit_workspace = root.path().join("submit");
@@ -55,6 +79,15 @@ async fn run_async_image(pool: &PgPool, succeeds: bool) -> TestResult {
         .map_err(debug_error)?;
     let png = encoded.into_inner();
     fs::write(home.join("result.png"), &png).map_err(debug_error)?;
+    if requested > 1 {
+        fs::write(home.join("native-batch"), b"3").map_err(debug_error)?;
+        let mut encoded = Cursor::new(Vec::new());
+        ImageBuffer::from_pixel(32, 18, Rgba([200_u8, 100, 30, 255]))
+            .write_to(&mut encoded, ImageFormat::Png)
+            .map_err(debug_error)?;
+        fs::write(home.join("result-2.png"), encoded.into_inner()).map_err(debug_error)?;
+    }
+
     let executable = root.path().join("dreamina-async-image-fixture");
     // The only generation runs against this local fixture. GETs must never invoke it.
     let script = br#"#!/bin/sh
@@ -79,7 +112,12 @@ case "$operation" in
     [ "$submit" = async-image-original ]
     [ -n "$download" ]
     printf 'poll\n' >> "$HOME/poll-calls"
-    /bin/cp "$HOME/result.png" "$download/result.png"
+    if [ -f "$HOME/native-batch" ]; then
+      /bin/cp "$HOME/result.png" "$download/result-1.png"
+      /bin/cp "$HOME/result-2.png" "$download/result-2.png"
+    else
+      /bin/cp "$HOME/result.png" "$download/result.png"
+    fi
     printf '{"submit_id":"async-image-original","gen_status":"success"}'
     ;;
   *) exit 2 ;;
@@ -277,7 +315,7 @@ esac
         }, None, None, None, None, Some(Arc::new(PostgresModelRoutingStore::new(pool.clone()))),
     ).map_err(debug_error)?;
     let body = json!({"prompt":"private prompt must not appear in task metadata", "model_version":"5.0",
-        "ratio":"16:9", "resolution_type":"2k", "generate_num":1});
+        "ratio":"16:9", "resolution_type":"2k", "generate_num":requested});
     let (status, location, created) = image_request(
         &app,
         Method::POST,
@@ -302,7 +340,7 @@ esac
         "async Location changed original task ID",
     )?;
     require(
-        created["request"]["generate_num"] == 1
+        created["request"]["generate_num"] == requested
             && created["request"]["ratio"] == "16:9"
             && created["request"]["resolution_type"] == "2k"
             && created["request_id"].is_string(),
@@ -549,15 +587,17 @@ esac
             .await
             .map_err(debug_error)?;
         let reductions = PostgresExecutorTerminalStore::new(pool.clone());
-        let terminal = reductions
-            .claim_terminal("async-image-uncertain-reducer", 30_000)
-            .await
-            .map_err(debug_error)?
-            .ok_or("uncertain reduction missing")?;
-        reductions
-            .complete_terminal(&terminal, None)
-            .await
-            .map_err(debug_error)?;
+        for index in 0..requested {
+            let terminal = reductions
+                .claim_terminal(&format!("async-image-uncertain-reducer-{index}"), 30_000)
+                .await
+                .map_err(debug_error)?
+                .ok_or("uncertain reduction missing")?;
+            reductions
+                .complete_terminal(&terminal, None)
+                .await
+                .map_err(debug_error)?;
+        }
         let before = image_read_snapshot(pool, job).await?;
         let unknown = image_request(
             &app,
@@ -575,7 +615,8 @@ esac
                 && unknown.2["status"] == "uncertain"
                 && unknown.2["error"]["code"] == "generation_uncertain"
                 && unknown.2.get("provider_progress").is_none()
-                && unknown.2.get("data").is_none(),
+                && unknown.2.get("data").is_none()
+                && unknown.2.get("output_counts").is_none(),
             format!("uncertain image became a failure or retained old progress: {unknown:?}"),
         )?;
         let lookup = image_request(
@@ -621,7 +662,7 @@ esac
         .map_err(debug_error)?;
         return require(
             hold == ("held".into(), 0, 0)
-                && counts == (1, 1, 1)
+                && counts == (1, 1, i64::from(requested))
                 && fs::read_to_string(home.join("submit-calls")).map_err(debug_error)?
                     == "submit\n"
                 && !home.join("poll-calls").exists(),
@@ -644,19 +685,52 @@ esac
         format!("image fixture did not publish real artifact: {observed:?}"),
     )?;
     let reductions = PostgresExecutorTerminalStore::new(pool.clone());
-    let terminal = reductions
-        .claim_terminal("async-image-reducer", 30_000)
-        .await
-        .map_err(debug_error)?
-        .ok_or("no image terminal reduction")?;
-    let customer = CustomerArtifactPublisher::new(blobs.clone())
-        .publish(&terminal)
-        .await
-        .map_err(debug_error)?;
-    reductions
-        .complete_terminal(&terminal, Some(&customer))
-        .await
-        .map_err(debug_error)?;
+    let publisher = CustomerArtifactPublisher::new(blobs.clone());
+    for index in 0..requested {
+        let terminal = reductions
+            .claim_terminal(&format!("async-image-reducer-{index}"), 30_000)
+            .await
+            .map_err(debug_error)?
+            .ok_or("no image terminal reduction")?;
+        let customer = if matches!(&terminal.outcome, CanonicalExecutorOutcome::Succeeded(_)) {
+            Some(publisher.publish(&terminal).await.map_err(debug_error)?)
+        } else {
+            require(
+                matches!(&terminal.outcome, CanonicalExecutorOutcome::Failed { error_code }
+                    if error_code == "dreamina_native_batch_result_missing"),
+                "partial native image did not retain explicit missing-output failure",
+            )?;
+            None
+        };
+        reductions
+            .complete_terminal(&terminal, customer.as_ref())
+            .await
+            .map_err(debug_error)?;
+        if index + 1 < requested {
+            let before = image_read_snapshot(pool, job).await?;
+            let incomplete = image_request(
+                &app,
+                Method::GET,
+                &path,
+                &reader.api_key.value,
+                None,
+                None,
+                false,
+            )
+            .await?;
+            require(
+                incomplete.0 == StatusCode::OK
+                    && incomplete.2["status"] == "running"
+                    && incomplete.2.get("data").is_none()
+                    && incomplete.2.get("output_counts").is_none(),
+                format!("unfinished native settlement exposed partial delivery: {incomplete:?}"),
+            )?;
+            require(
+                image_read_snapshot(pool, job).await? == before,
+                "unfinished native GET changed settlement or task state",
+            )?;
+        }
+    }
     let before = image_read_snapshot(pool, job).await?;
     let done = image_request(
         &app,
@@ -672,6 +746,10 @@ esac
         done.0 == StatusCode::OK
             && done.2["status"] == "succeeded"
             && done.2["data"][0]["b64_json"] == STANDARD.encode(&png)
+            && done.2["data"].as_array().map(Vec::len) == Some(delivered as usize)
+            && done.2["request"]["generate_num"] == requested
+            && done.2["output_counts"]
+                == json!({"requested":requested,"delivered":delivered,"failed":requested-delivered})
             && done.2["created"].is_i64()
             && done.2.get("provider_progress").is_none()
             && done.2.get("stage").is_none(),
@@ -737,11 +815,69 @@ esac
     .await
     .map_err(debug_error)?;
     require(
-        counts == (1, 1, 1)
+        counts == (1, 1, i64::from(requested))
             && fs::read_to_string(home.join("submit-calls")).map_err(debug_error)? == "submit\n"
             && fs::read_to_string(home.join("poll-calls")).map_err(debug_error)? == "poll\n",
         format!("GET/replay repeated a submission: {counts:?}"),
     )?;
+    let money: (i64,i64,i32,i32,i64,i64,i64) = sqlx::query_as(
+        "SELECT hold.captured_micros,hold.released_micros,quota.committed_units,quota.released_units,
+            (SELECT count(*) FROM provider_remote_tasks task JOIN provider_submissions submission USING(submission_id) WHERE submission.job_id=$1),
+            (SELECT count(*) FROM provider_remote_submit_intents intent JOIN provider_submissions submission USING(submission_id) WHERE submission.job_id=$1),
+            (SELECT count(*) FROM customer_rated_usage WHERE job_id=$1)
+         FROM customer_billing_holds hold JOIN quota_reservations quota USING(job_id) WHERE hold.job_id=$1")
+        .bind(job).fetch_one(pool).await.map_err(debug_error)?;
+    require(
+        money
+            == (
+                i64::from(delivered) * 1000,
+                i64::from(requested - delivered) * 1000,
+                delivered as i32,
+                (requested - delivered) as i32,
+                1,
+                1,
+                1,
+            ),
+        format!("native asynchronous delivery changed per-image frozen settlement: {money:?}"),
+    )?;
+    if requested > 1 {
+        let key: String = sqlx::query_scalar(
+            "SELECT object_key FROM artifacts WHERE job_id=$1 AND output_index=0",
+        )
+        .bind(job)
+        .fetch_one(pool)
+        .await
+        .map_err(debug_error)?;
+        let blob_path = artifact_root.join(key);
+        let bytes = fs::read(&blob_path).map_err(debug_error)?;
+        fs::remove_file(&blob_path).map_err(debug_error)?;
+        let before = image_read_snapshot(pool, job).await?;
+        let missing = image_request(
+            &app,
+            Method::GET,
+            &path,
+            &reader.api_key.value,
+            None,
+            None,
+            false,
+        )
+        .await?;
+        fs::write(&blob_path, &bytes).map_err(debug_error)?;
+        fs::set_permissions(&blob_path, fs::Permissions::from_mode(0o600)).map_err(debug_error)?;
+        require(
+            missing.0.is_server_error()
+                && missing.2.get("data").is_none()
+                && missing.2.get("output_counts").is_none(),
+            format!("missing native blob was accepted as a smaller delivery: {missing:?}"),
+        )?;
+        require(
+            image_read_snapshot(pool, job).await? == before
+                && fs::read_to_string(home.join("submit-calls")).map_err(debug_error)?
+                    == "submit\n"
+                && fs::read_to_string(home.join("poll-calls")).map_err(debug_error)? == "poll\n",
+            "failed partial GET changed billing or invoked CLI",
+        )?;
+    }
     sqlx::query(
         "UPDATE job_artifact_retention SET state='expired',
         expired_at_ms=(extract(epoch FROM clock_timestamp())*1000)::BIGINT,
@@ -825,6 +961,9 @@ async fn image_read_snapshot(pool: &PgPool, job: Uuid) -> TestResult<Value> {
         'work', (SELECT to_jsonb(w) FROM work_items w WHERE job_id=$1),
         'quota', (SELECT to_jsonb(q) FROM quota_reservations q WHERE job_id=$1),
         'hold', (SELECT jsonb_agg(to_jsonb(h)) FROM customer_billing_holds h WHERE job_id=$1),
+        'usage_facts', (SELECT count(*) FROM provider_usage_facts WHERE job_id=$1),
+        'rating', (SELECT count(*) FROM customer_rated_usage WHERE job_id=$1),
+        'ledger_transactions', (SELECT count(*) FROM ledger_transactions WHERE source_job_id=$1),
         'tasks', (SELECT jsonb_agg(to_jsonb(task)) FROM provider_remote_tasks task JOIN provider_submissions s USING(submission_id) WHERE s.job_id=$1),
         'observations', (SELECT jsonb_agg(to_jsonb(observation) ORDER BY observed_at_ms, observation_id)
             FROM provider_task_observations observation JOIN provider_submissions s USING(submission_id) WHERE s.job_id=$1))")
