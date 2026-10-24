@@ -1113,3 +1113,90 @@ mod tests {
         );
     }
 }
+
+/// Record already reviewed local no-effect evidence under the normal capacity
+/// reconciliation fence, in the operator settlement transaction.
+pub(super) async fn release_operator_no_effect_capacity(
+    tx: &mut Transaction<'_, Postgres>,
+    submission_id: Uuid,
+    executor_execution_id: Uuid,
+    resolution_id: Uuid,
+) -> Result<(), ProviderTaskStoreError> {
+    let now = database_now(tx).await?;
+    let owner = "factoryctl.operator-compliance";
+    let command_id = resolution_id.to_string();
+    // Claim only this exact reconciliation. A live lease held by another worker
+    // is a conflict; this operator command never steals it or scans other jobs.
+    let claimed: ReconciliationRow = sqlx::query_as(
+        r#"
+        UPDATE provider_capacity_reconciliations
+        SET reconciliation_owner = $3,
+            reconciliation_lease_epoch = reconciliation_lease_epoch + 1,
+            available_at_ms = $5 + 60000,
+            claimed_evidence_revision = evidence_revision,
+            last_command_kind = 'claim', last_command_id = $4,
+            last_command_owner = $3,
+            last_command_lease_epoch = reconciliation_lease_epoch + 1,
+            claim_command_claimed_at_ms = $5,
+            claim_command_lease_expires_at_ms = $5 + 60000,
+            updated_at_ms = $5
+        WHERE submission_id = $1 AND executor_execution_id = $2
+          AND state = 'active' AND available_at_ms <= $5
+          AND evidence_revision = 0
+          AND EXISTS (SELECT 1 FROM executor_capacity_allocations allocation
+              WHERE allocation.submission_id = $1 AND allocation.executor_execution_id = $2
+                AND allocation.state = 'held')
+        RETURNING *
+        "#,
+    )
+    .bind(submission_id)
+    .bind(executor_execution_id)
+    .bind(owner)
+    .bind(command_id)
+    .bind(now)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(storage_conflict)?
+    .ok_or(ProviderTaskStoreError::Conflict)?;
+    heartbeat_capacity(tx, executor_execution_id, submission_id, now).await?;
+    let evidence = ProviderCapacityEvidence {
+        event_identity: format!("operator:{resolution_id}"),
+        outcome: ProviderCapacityEvidenceOutcome::ConfirmedNoEffect,
+    };
+    let payload_hash = evidence_hash(claimed.reconciliation_id, submission_id, &evidence);
+    require_one(
+        sqlx::query(
+            r#"
+            UPDATE provider_capacity_reconciliations
+            SET state = 'released', evidence_kind = 'confirmed_no_effect',
+                event_identity = $4, payload_hash = $5,
+                updated_at_ms = $6, released_at_ms = $6
+            WHERE submission_id = $1 AND executor_execution_id = $2
+              AND reconciliation_owner = $3 AND state = 'active'
+              AND available_at_ms > $6 AND evidence_revision = 0
+              AND claimed_evidence_revision = 0
+            "#,
+        )
+        .bind(submission_id)
+        .bind(executor_execution_id)
+        .bind(owner)
+        .bind(&evidence.event_identity)
+        .bind(payload_hash)
+        .bind(now)
+        .execute(&mut **tx)
+        .await
+        .map_err(storage_conflict)?,
+        ProviderTaskStoreError::Conflict,
+    )?;
+    release_capacity_allocation(
+        tx,
+        executor_execution_id,
+        submission_id,
+        "uncertain",
+        "provider_capacity_reconciliation",
+        Some(claimed.reconciliation_id),
+        now,
+    )
+    .await
+    .map_err(map_executor_error)
+}

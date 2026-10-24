@@ -1420,7 +1420,7 @@ async fn schema_128_upgrades_to_current_without_changing_existing_provider_rows(
         ).fetch_one(&test_schema.pool).await.map_err(|error| error.to_string())?;
         require(before == after, "sidecar migrations changed existing provider accounts")?;
         require(migration_versions(&test_schema.pool).await? == expected_migration_versions(), "upgrade must apply every bundled migration")?;
-        require(migration_versions(&test_schema.pool).await?.last() == Some(&140), "upgrade must include native Dreamina batch persistence")?;
+        require(migration_versions(&test_schema.pool).await?.contains(&140), "upgrade must include native Dreamina batch persistence")?;
         let new_rows: i64 = sqlx::query_scalar(
             "SELECT (SELECT COUNT(*) FROM media_segment_assets) + (SELECT COUNT(*) FROM media_segment_results) + (SELECT COUNT(*) FROM media_segment_worker_heartbeats) + (SELECT COUNT(*) FROM provider_account_quota_refreshes)",
         ).fetch_one(&test_schema.pool).await.map_err(|error| error.to_string())?;

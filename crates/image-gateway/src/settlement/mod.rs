@@ -78,6 +78,17 @@ pub trait ExecutionSettlementStore: Send + Sync + 'static {
             .map(|status| (status, VideoRequestMetadata::default())))
     }
 
+    async fn project_video_released_settlement(
+        &self,
+        _tenant_id: &str,
+        _project_id: &str,
+        _actor_user_id: Option<uuid::Uuid>,
+        _job_id: uuid::Uuid,
+    ) -> Result<Option<image_api_contracts::dreamina::DreaminaReleasedSettlement>, ImageGatewayError>
+    {
+        Ok(None)
+    }
+
     async fn load_video_artifact(
         &self,
         _tenant_id: &str,

@@ -240,6 +240,24 @@ impl RemoteSubmitJournalSpec {
 }
 
 impl RemoteSubmitJournal {
+    pub(crate) fn open_existing(root_path: &Path) -> Result<Self, RemoteSubmitJournalError> {
+        if !root_path.is_absolute() {
+            return Err(RemoteSubmitJournalError::InvalidInput);
+        }
+        let root = rfs::open(
+            root_path,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|_| RemoteSubmitJournalError::Integrity)?;
+        validate_directory(&root, RemoteSubmitJournalError::Integrity)?;
+        validate_bound_root(root_path, &root, RemoteSubmitJournalError::Integrity)?;
+        Ok(Self {
+            root_path: root_path.to_owned(),
+            root,
+        })
+    }
+
     pub(crate) fn validate_canonical_command(
         canonical_command: &[u8],
     ) -> Result<(), RemoteSubmitJournalError> {
@@ -1161,6 +1179,14 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+
+    #[test]
+    fn evidence_open_existing_does_not_create_a_missing_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("missing");
+        assert!(RemoteSubmitJournal::open_existing(&missing).is_err());
+        assert!(!missing.exists());
+    }
 
     #[test]
     fn prepare_is_exactly_replayable_and_rejects_conflicting_identity() {

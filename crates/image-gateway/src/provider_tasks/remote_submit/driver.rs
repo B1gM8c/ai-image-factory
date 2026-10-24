@@ -58,6 +58,8 @@ pub trait GatedCliSubmitCodec: Send + Sync + 'static {
         workspace: &WorkingDirectory,
     ) -> Result<GatedCliCommand, ProviderFailure>;
 
+    /// Only an explicit pre-acceptance refusal may return `NoRemoteEffect` with
+    /// `Never`; malformed receipts and post-acceptance failures remain unknown.
     fn decode_receipt(
         &self,
         intent: &ProviderSubmitIntent,
@@ -363,6 +365,13 @@ where
         .await
         {
             Ok(Ok(pending)) => ProviderSubmitDriverRecovery::Accepted(pending),
+            Ok(Err(failure))
+                if failure.effect() == EffectCertainty::NoRemoteEffect
+                    && failure.retry() == RetryDirective::Never
+                    && !terminal.stderr_truncated() =>
+            {
+                ProviderSubmitDriverRecovery::Failed(failure)
+            }
             Ok(Err(failure)) => {
                 ProviderSubmitDriverRecovery::Failed(unknown_process_failure(failure.code()))
             }

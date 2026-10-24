@@ -290,6 +290,72 @@ impl ExecutionSettlementStore for PostgresExecutionSettlementStore {
         row.map(video_result_status).transpose()
     }
 
+    async fn project_video_released_settlement(
+        &self,
+        tenant_id: &str,
+        project_id: &str,
+        actor_user_id: Option<Uuid>,
+        job_id: Uuid,
+    ) -> Result<Option<image_api_contracts::dreamina::DreaminaReleasedSettlement>, ImageGatewayError>
+    {
+        let row: Option<(Uuid, Uuid, String, Uuid, String, String, String, String)> =
+            sqlx::query_as(
+                r#"
+            SELECT resolution.resolution_id, job.job_id, job.request_id,
+                   hold.hold_id, hold.currency, hold.held_micros::TEXT,
+                   hold.released_micros::TEXT, hold.captured_micros::TEXT
+            FROM dreamina_operator_rejection_resolutions resolution
+            JOIN jobs job ON job.job_id = resolution.job_id
+            JOIN job_auth_attributions attribution
+              ON attribution.job_id = job.job_id AND attribution.tenant_id = job.tenant_id
+            JOIN customer_billing_holds hold
+              ON hold.hold_id = resolution.hold_id AND hold.job_id = job.job_id
+             AND hold.tenant_id = job.tenant_id
+            WHERE job.job_id = $1 AND job.tenant_id = $2
+              AND attribution.project_id = $3
+              AND ($4::UUID IS NULL OR attribution.actor_user_id = $4)
+              AND job.provider_id = 'dreamina-cli' AND job.operation = 'video_generation'
+              AND job.economics_contract_version = 4 AND job.output_count = 1
+              AND job.charged_units = 0
+              AND job.state = 'failed'
+              AND job.last_error_code = 'dreamina_compliance_confirmation_required'
+              AND resolution.reason = job.last_error_code
+              AND hold.state = 'released' AND hold.captured_micros = 0
+              AND hold.released_micros = hold.held_micros
+              AND resolution.released_micros = hold.released_micros
+            "#,
+            )
+            .bind(job_id)
+            .bind(tenant_id)
+            .bind(project_id)
+            .bind(actor_user_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(settlement_unavailable)?;
+        Ok(row.map(
+            |(
+                resolution_audit_id,
+                job_id,
+                request_id,
+                hold_id,
+                currency,
+                held_micros,
+                released_micros,
+                captured_micros,
+            )| image_api_contracts::dreamina::DreaminaReleasedSettlement {
+                state: "released".to_owned(),
+                resolution_audit_id: resolution_audit_id.to_string(),
+                job_id: job_id.to_string(),
+                request_id,
+                hold_id: hold_id.to_string(),
+                currency,
+                held_micros,
+                released_micros,
+                captured_micros,
+            },
+        ))
+    }
+
     async fn project_video_status_with_metadata(
         &self,
         tenant_id: &str,

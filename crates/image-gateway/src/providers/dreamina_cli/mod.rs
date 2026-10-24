@@ -189,11 +189,11 @@ impl DreaminaCliSubmitCodecV1 {
         command_to_gated(&command, self.policy.executable_sha256())
     }
 
-    fn decode_for_submission(
+    pub(crate) fn decode_for_submission(
         submission_id: Uuid,
         stdout: &[u8],
     ) -> Result<PendingOperation, ProviderFailure> {
-        let receipt = parse_receipt(stdout).map_err(receipt_failure)?;
+        let receipt = parse_receipt(stdout).map_err(|error| receipt_failure(error, stdout))?;
         let operation = RemoteOperationRef::new(
             PROVIDER_ID,
             submission_id.to_string(),
@@ -423,8 +423,14 @@ fn command_to_gated(
     .map_err(|_| no_effect_failure("dreamina_submit_command_invalid"))
 }
 
-fn receipt_failure(error: ReceiptError) -> ProviderFailure {
+fn receipt_failure(error: ReceiptError, stdout: &[u8]) -> ProviderFailure {
     let code = match error {
+        ReceiptError::GenerationFailed { ref reason }
+            if compliance_confirmation_required(reason)
+                && compliance_refusal_has_no_result(stdout) =>
+        {
+            return no_effect_failure("dreamina_compliance_confirmation_required");
+        }
         ReceiptError::GenerationFailed { .. } => "dreamina_submit_rejected",
         ReceiptError::InputTooLarge { .. } => "dreamina_submit_receipt_too_large",
         ReceiptError::InvalidJson(_)
@@ -434,6 +440,32 @@ fn receipt_failure(error: ReceiptError) -> ProviderFailure {
         | ReceiptError::InvalidSubmitId => "dreamina_submit_receipt_invalid",
     };
     unknown_failure(code)
+}
+
+fn compliance_confirmation_required(reason: &str) -> bool {
+    // Only this explicit pre-acceptance refusal establishes that no generation
+    // was accepted. Other failed receipts can follow an accepted, billable task.
+    reason == "AigcComplianceConfirmationRequired"
+        || reason
+            .strip_prefix("api error: ret=4010,")
+            .is_some_and(|message| {
+                message.contains("aigc compliance confirmation required")
+                    || message.contains("AigcComplianceConfirmationRequired")
+            })
+}
+
+fn compliance_refusal_has_no_result(stdout: &[u8]) -> bool {
+    // The CLI's failure shape contains a local submit_id before acceptance.
+    // Do not infer no effect if a result or an unrecognized acceptance field
+    // contradicts that refusal. Parsing is already bounded by parse_receipt.
+    let Ok(serde_json::Value::Object(receipt)) = serde_json::from_slice(stdout) else {
+        return false;
+    };
+    receipt.iter().all(|(field, value)| match field.as_str() {
+        "submit_id" | "gen_status" | "fail_reason" | "guidance" | "logid" | "prompt" => true,
+        "result_json" => value.is_null() || value.as_object().is_some_and(|value| value.is_empty()),
+        _ => false,
+    })
 }
 
 fn no_effect_failure(code: &str) -> ProviderFailure {
@@ -748,9 +780,71 @@ mod tests {
         for receipt in [
             br#"{"gen_status":"success"}"#.as_slice(),
             br#"{"gen_status":"fail","fail_reason":"denied"}"#.as_slice(),
+            br#"{"gen_status":"fail","fail_reason":"api error: ret=4010, message=other rejection"}"#.as_slice(),
+            br#"{"gen_status":"fail","fail_reason":"api error: ret=40100, message=aigc compliance confirmation required"}"#.as_slice(),
+            br#"{"gen_status":"fail","fail_reason":"api error: ret=4001, message=AigcComplianceConfirmationRequired"}"#.as_slice(),
+            br#"{"gen_status":"fail","fail_reason":"transport failed: aigc compliance confirmation required"}"#.as_slice(),
         ] {
             let failure = DreaminaCliSubmitCodecV1::decode_for_submission(Uuid::new_v4(), receipt)
                 .unwrap_err();
+            assert_eq!(failure.effect(), EffectCertainty::UnknownRemoteEffect);
+            assert_eq!(failure.retry(), RetryDirective::Never);
+        }
+    }
+
+    #[test]
+    fn compliance_refusal_is_terminal_without_reusing_the_local_submit_id() {
+        for reason in [
+            "api error: ret=4010, message=rejected, aigc compliance confirmation required, logid=redacted",
+            "api error: ret=4010, message=AigcComplianceConfirmationRequired",
+            "AigcComplianceConfirmationRequired",
+        ] {
+            let receipt = serde_json::to_vec(&serde_json::json!({
+                // The CLI allocates this ID before upstream acceptance.
+                "submit_id": "local-cli-task-only",
+                "gen_status": "fail",
+                "fail_reason": reason,
+                "guidance": "Confirm on Dreamina Web",
+                "logid": "local-log-id",
+                "prompt": "neutral fixture",
+            }))
+            .unwrap();
+            let failure = DreaminaCliSubmitCodecV1::decode_for_submission(Uuid::new_v4(), &receipt)
+                .unwrap_err();
+            assert_eq!(failure.code(), "dreamina_compliance_confirmation_required");
+            assert_eq!(failure.class(), ProviderFailureClass::Permanent);
+            assert_eq!(failure.effect(), EffectCertainty::NoRemoteEffect);
+            assert_eq!(failure.retry(), RetryDirective::Never);
+            assert!(!failure.to_string().contains(reason));
+        }
+    }
+
+    #[test]
+    fn compliance_refusal_with_result_or_acceptance_evidence_remains_unknown() {
+        for evidence in [
+            serde_json::json!({"result_json": {"videos": [{"video_url": "https://example.test/result.mp4"}]}}),
+            serde_json::json!({"result_json": {"images": []}}),
+            serde_json::json!({"result_json": []}),
+            serde_json::json!({"remote_operation_id": "accepted-task"}),
+            serde_json::json!({"provider_request_id": "accepted-request"}),
+            serde_json::json!({"video_url": "https://example.test/result.mp4"}),
+            serde_json::json!({"unknown_field": true}),
+        ] {
+            let mut receipt = serde_json::json!({
+                "submit_id": "local-cli-task-only",
+                "gen_status": "fail",
+                "fail_reason": "api error: ret=4010, aigc compliance confirmation required",
+            });
+            receipt
+                .as_object_mut()
+                .unwrap()
+                .extend(evidence.as_object().unwrap().clone());
+            let failure = DreaminaCliSubmitCodecV1::decode_for_submission(
+                Uuid::new_v4(),
+                &serde_json::to_vec(&receipt).unwrap(),
+            )
+            .unwrap_err();
+            assert_eq!(failure.code(), "dreamina_submit_rejected");
             assert_eq!(failure.effect(), EffectCertainty::UnknownRemoteEffect);
             assert_eq!(failure.retry(), RetryDirective::Never);
         }

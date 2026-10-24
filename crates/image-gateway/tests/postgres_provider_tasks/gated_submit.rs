@@ -642,6 +642,119 @@ async fn recovery_claim_completes_the_elected_unlaunched_attempt_once() -> TestR
 }
 
 #[tokio::test]
+async fn explicit_receipt_rejection_is_terminal_and_replay_never_relaunches_cli() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let lease = seed_running_submission(&database.pool, "gated-rejected-worker").await?;
+        let journal = tempfile::tempdir().map_err(debug_error)?;
+        let journal_root = journal.path().join("remote-submit");
+        let side_effect = journal.path().join("provider-invoked");
+        let codec = FakeGatedSubmitCodec::new(journal.path(), &side_effect, "unused-operation")?
+            .with_receipt("gated-pre-acceptance-rejection");
+        let runner = Path::new(env!("CARGO_BIN_EXE_remote-submit-runner"));
+        let runner_sha256 = file_sha256(runner)?;
+        for _ in 0..2 {
+            let outcome = ProviderSubmitOrchestrator::new(
+                PostgresProviderTaskStore::new(database.pool.clone()),
+                gated_submit_driver(codec.clone(), runner, &runner_sha256)?,
+                60_000,
+                &journal_root,
+            )
+            .map_err(debug_error)?
+            .submit(gated_orchestrator_work(&lease)?)
+            .await
+            .map_err(debug_error)?;
+            require(
+                matches!(outcome, ProviderSubmitOutcome::Terminal(ref intent)
+                    if intent.state == ProviderSubmitIntentState::Rejected
+                        && intent.failure_error_code.as_deref() == Some("gated_receipt_rejected")),
+                format!("explicit receipt refusal did not remain terminal: {outcome:?}"),
+            )?;
+        }
+        let durable: (String, String, Option<String>) = sqlx::query_as(
+            r#"
+            SELECT execution.state, submission.state, submission.error_code
+            FROM executor_executions execution
+            JOIN provider_submissions submission
+              ON submission.executor_execution_id = execution.executor_execution_id
+             AND submission.submission_id = execution.submission_id
+            WHERE execution.executor_execution_id = $1
+            "#,
+        )
+        .bind(lease.executor_execution_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        let remote_tasks: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM provider_remote_tasks WHERE submission_id = $1",
+        )
+        .bind(lease.submission_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        require(
+            durable
+                == (
+                    "failed".to_owned(),
+                    "failed".to_owned(),
+                    Some("gated_receipt_rejected".to_owned()),
+                )
+                && remote_tasks == 0
+                && fs::read(&side_effect).map_err(debug_error)? == b"invoked"
+                && workspace_attempt_count(&codec.workspace_root)? == 0,
+            format!("rejected receipt was resubmitted or retained: {durable:?}/{remote_tasks}"),
+        )
+    }
+    .await;
+    database.cleanup().await?;
+    result
+}
+
+#[tokio::test]
+async fn truncated_rejection_evidence_remains_unknown_without_relaunching_cli() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let lease = seed_running_submission(&database.pool, "gated-truncated-worker").await?;
+        let journal = tempfile::tempdir().map_err(debug_error)?;
+        let journal_root = journal.path().join("remote-submit");
+        let side_effect = journal.path().join("provider-invoked");
+        let codec = FakeGatedSubmitCodec::new(journal.path(), &side_effect, "unused-operation")?
+            .with_receipt("gated-pre-acceptance-rejection")
+            .with_stderr("x".repeat(65_537));
+        let runner = Path::new(env!("CARGO_BIN_EXE_remote-submit-runner"));
+        let runner_sha256 = file_sha256(runner)?;
+        for _ in 0..2 {
+            let outcome = ProviderSubmitOrchestrator::new(
+                PostgresProviderTaskStore::new(database.pool.clone()),
+                gated_submit_driver(codec.clone(), runner, &runner_sha256)?,
+                60_000,
+                &journal_root,
+            )
+            .map_err(debug_error)?
+            .submit(gated_orchestrator_work(&lease)?)
+            .await
+            .map_err(debug_error)?;
+            require(
+                matches!(outcome, ProviderSubmitOutcome::AwaitingEvidence(ref intent)
+                    if intent.state == ProviderSubmitIntentState::OutcomeUnknown),
+                format!("truncated rejection became definitive: {outcome:?}"),
+            )?;
+        }
+        require(
+            fs::read(&side_effect).map_err(debug_error)? == b"invoked",
+            "truncated rejection relaunched the CLI",
+        )
+    }
+    .await;
+    database.cleanup().await?;
+    result
+}
+
+#[tokio::test]
 async fn outcome_unknown_recovery_observes_without_relaunching_cli() -> TestResult {
     let Some(database) = TestDatabase::new().await? else {
         return Ok(());
@@ -728,6 +841,7 @@ struct FakeGatedSubmitCodec {
     operation_id: String,
     projection_delay: Duration,
     receipt: String,
+    stderr: String,
     workspace_mismatch: bool,
 }
 
@@ -751,6 +865,7 @@ impl FakeGatedSubmitCodec {
             operation_id: operation_id.into(),
             projection_delay: Duration::ZERO,
             receipt: "gated-receipt".to_owned(),
+            stderr: String::new(),
             workspace_mismatch: false,
         })
     }
@@ -762,6 +877,11 @@ impl FakeGatedSubmitCodec {
 
     fn with_receipt(mut self, receipt: impl Into<String>) -> Self {
         self.receipt = receipt.into();
+        self
+    }
+
+    fn with_stderr(mut self, stderr: String) -> Self {
+        self.stderr = stderr;
         self
     }
 
@@ -784,10 +904,11 @@ impl FakeGatedSubmitCodec {
             workspace.path(),
             vec![
                 "-c".to_owned(),
-                "printf invoked >> \"$1\"; printf %s \"$2\"".to_owned(),
+                "printf invoked >> \"$1\"; printf %s \"$2\"; printf %s \"$3\" >&2".to_owned(),
                 "gated-provider-test".to_owned(),
                 self.side_effect.to_string_lossy().into_owned(),
                 self.receipt.clone(),
+                self.stderr.clone(),
             ],
             BTreeMap::new(),
             Vec::new(),
@@ -831,6 +952,12 @@ impl GatedCliSubmitCodec for FakeGatedSubmitCodec {
         _command: &SingleOutputCommand<Self::Payload>,
         stdout: &[u8],
     ) -> Result<PendingOperation, ProviderFailure> {
+        if stdout == b"gated-pre-acceptance-rejection" {
+            return Err(fake_provider_failure(
+                "gated_receipt_rejected",
+                EffectCertainty::NoRemoteEffect,
+            ));
+        }
         if stdout != b"gated-receipt" {
             return Err(fake_provider_failure(
                 "gated_receipt_invalid",

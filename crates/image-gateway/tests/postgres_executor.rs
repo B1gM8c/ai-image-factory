@@ -74,6 +74,9 @@ use uuid::Uuid;
 
 type TestResult<T = ()> = Result<T, String>;
 
+#[path = "postgres_executor/dreamina_compliance_resolution.rs"]
+mod dreamina_compliance_resolution;
+
 const TEST_PROFILE_ID: Uuid = Uuid::from_u128(0x100);
 const CODEX_PROFILE_ID: Uuid = Uuid::from_u128(0x200);
 const CODEX_EDIT_PROFILE_ID: Uuid = Uuid::from_u128(0xe00);

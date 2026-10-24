@@ -139,6 +139,7 @@ pub use provider_management::{
 };
 pub use provider_tasks::GatedCliInputFile;
 pub use provider_tasks::{
+    DreaminaComplianceRejectionResolution, DreaminaComplianceRejectionResolutionRequest,
     GatedCliBinding, GatedCliCommand, GatedCliObservation, GatedCliPreparedSubmission,
     GatedCliProcessError, GatedCliProcessOutcome, GatedCliProcessTerminal, GatedCliReady,
     GatedCliSubmission, GatedCliSubmitCodec, GatedCliSubmitDriver, NativeBatchMember,
@@ -174,7 +175,7 @@ pub use provider_tasks::{
     ProviderTaskState, ProviderTaskStore, ProviderTaskStoreError, RemoteTaskAttach,
     RemoteTaskQuarantinedReceipt, RemoteTaskSubmitFailure, RemoteTaskSubmitReceipt,
     RemoteTaskSubmitReservation, StagedProviderArtifact, VerifiedCallbackWakeup,
-    run_remote_submit_gate, run_remote_submit_runner,
+    resolve_dreamina_compliance_rejection, run_remote_submit_gate, run_remote_submit_runner,
 };
 pub use provider_uploads::ProviderUploadService;
 pub use providers::dreamina_cli::{
