@@ -1,8 +1,12 @@
 """Offline rejection tests; no network, credentials, providers or generation."""
 import importlib.util
+import hashlib
 import json
+import os
 from pathlib import Path
+import subprocess
 import tempfile
+import textwrap
 import unittest
 from unittest.mock import patch
 import zipfile
@@ -129,6 +133,79 @@ class CandidateTests(unittest.TestCase):
         self.assertEqual(len(names), 5)
         self.assertIn('install-release', names)
         self.assertFalse(any('/' in name for name in names))
+
+
+class ReleaseAssetGateTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        workflow = Path(__file__).resolve().parents[1] / '.github/workflows/release.yml'
+        step = workflow.read_text().split(
+            '      - name: Verify release assets before attestation\n', 1)[1].split(
+            '\n      - name: Attest release assets\n', 1)[0]
+        run = textwrap.dedent(step.split('        run: |\n', 1)[1])
+        schema = run[:run.index('if test "$PUBLICATION_MODE"')]
+        validation = run[run.index('jq --exit-status \\\n'):run.index('test "$(stat --format=')]
+        # Execute the workflow's schema, manifest and bundle hash gates verbatim.
+        cls.gate = schema + validation
+
+    def run_gate(self, migrations, target_schema=140, migration_version=None, **changes):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            migration_directory = directory / 'crates/image-gateway/migrations'
+            migration_directory.mkdir(parents=True)
+            for version in migrations:
+                (migration_directory / f'{version:04d}_fixture.sql').write_text('-- fixture\n')
+            bundle = directory / 'fixture.tar.gz'
+            bundle.write_bytes(b'fixture bundle bytes')
+            manifest = dict(
+                schema_version=1, updater_protocol_version=1,
+                release_version='v0.1.0-fixture', commit_sha='a' * 40,
+                target_triple='x86_64-unknown-linux-gnu',
+                migration_version=target_schema if migration_version is None else migration_version,
+                min_schema_version=128, target_schema_version=target_schema,
+                rollback_mode='backup_restore',
+                files=[dict(path='bin/gateway', mode=493),
+                       dict(path='release.json', mode=420)],
+                bundle_sha256=hashlib.sha256(bundle.read_bytes()).hexdigest(),
+            )
+            manifest.update(changes)
+            manifest_path = directory / 'fixture.manifest.json'
+            manifest_path.write_text(json.dumps(manifest))
+            return subprocess.run(
+                ['bash', '-c', self.gate], cwd=directory,
+                env=dict(os.environ, RELEASE_VERSION='v0.1.0-fixture', RELEASE_COMMIT='a' * 40,
+                         target='x86_64-unknown-linux-gnu', manifest=str(manifest_path),
+                         bundle=str(bundle)),
+                capture_output=True, text=True, timeout=10,
+            )
+
+    def test_schema_follows_source_migrations(self):
+        for version in [139, 140, 141]:
+            with self.subTest(version=version):
+                result = self.run_gate([128, version], target_schema=version)
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_schema_rejects_missing_migrations_and_manifest_disagreement(self):
+        for migrations, target, migration in [
+            ([], 140, 140), ([140], 139, 139), ([140], 141, 141), ([140], 140, 139),
+        ]:
+            with self.subTest(migrations=migrations, target=target, migration=migration):
+                result = self.run_gate(migrations, target_schema=target, migration_version=migration)
+                self.assertNotEqual(result.returncode, 0)
+
+    def test_existing_identity_files_modes_and_bundle_hash_gates_remain_enforced(self):
+        for key, value in [
+            ('schema_version', 2), ('updater_protocol_version', 2),
+            ('release_version', 'wrong'), ('commit_sha', 'b' * 40),
+            ('target_triple', 'aarch64-unknown-linux-gnu'),
+            ('min_schema_version', 127), ('min_schema_version', 129),
+            ('rollback_mode', 'none'), ('files', []),
+            ('files', [dict(path='bin/gateway', mode=420)]),
+            ('files', [dict(path='release.json', mode=493)]),
+            ('bundle_sha256', '0' * 64),
+        ]:
+            with self.subTest(key=key, value=value):
+                self.assertNotEqual(self.run_gate([140], **{key: value}).returncode, 0)
 
 
 if __name__ == '__main__':
