@@ -37,6 +37,80 @@ type TestResult<T = ()> = Result<T, String>;
 const DREAMINA_VIDEO_EXECUTION_MODEL: &str = "dreamina-video-seedance2-fast";
 
 #[tokio::test]
+async fn native_batch_upgrade_reuses_historical_dreamina_and_ark_keys() -> TestResult {
+    use sha2::{Digest, Sha256};
+
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let store = PostgresAdmissionStore::new(database.pool.clone());
+        let plan = DreaminaImageAdmissionPlan::new(
+            serde_json::from_value(json!({
+                "prompt": "historical batch retry", "generate_num": 2, "resolution_type": "2k"
+            }))
+            .map_err(|error| format!("request: {error}"))?,
+        )
+        .map_err(|error| format!("plan: {error}"))?;
+        for profile in [DREAMINA_IMAGES_API_PROFILE, ARK_IMAGES_API_PROFILE] {
+            let mut old_claim = plan.claim_for_profile(
+                profile,
+                Uuid::new_v4(),
+                "tenant-a",
+                "project-a",
+                format!("req_{}", Uuid::new_v4().simple()),
+                Some("a".repeat(64)),
+                i64::MAX,
+            );
+            let mut historical = plan
+                .attach(
+                    AdmissionTicket {
+                        session_id: Uuid::new_v4(),
+                        owner_token: old_claim.owner_token,
+                        request_hash: old_claim.request_hash.clone(),
+                    },
+                    Uuid::new_v4(),
+                    "test",
+                )
+                .command_json;
+            historical["schema_version"] = json!(1);
+            old_claim.request_hash = hex::encode(Sha256::digest(
+                serde_json::to_vec(&historical)
+                    .map_err(|error| format!("legacy command: {error}"))?,
+            ));
+            claim_owner(&store, old_claim).await?;
+            let retry = plan.claim_for_profile(
+                profile,
+                Uuid::new_v4(),
+                "tenant-a",
+                "project-a",
+                format!("req_{}", Uuid::new_v4().simple()),
+                Some("a".repeat(64)),
+                i64::MAX,
+            );
+            let replay = store
+                .claim(retry)
+                .await
+                .map_err(|error| format!("replay: {error}"))?;
+            require(
+                matches!(replay, AdmissionClaim::InProgress { .. }),
+                format!("historical key did not retain its single admission: {replay:?}"),
+            )?;
+        }
+        let sessions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM admission_sessions")
+            .fetch_one(&database.pool)
+            .await
+            .map_err(|error| format!("sessions: {error}"))?;
+        require(
+            sessions == 2,
+            format!("retry created duplicate sessions: {sessions}"),
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
 async fn migration_creates_durable_admission_tables() -> TestResult {
     let Some(database) = TestDatabase::new().await? else {
         return Ok(());

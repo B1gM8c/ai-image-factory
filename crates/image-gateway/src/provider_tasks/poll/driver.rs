@@ -6,6 +6,22 @@ use uuid::Uuid;
 
 use super::super::{ProviderExecutionContext, ProviderTaskLease, ProviderTaskState};
 
+/// A native batch selects each output before streaming its bytes. Finalizing
+/// releases that output's staging capacity before the next output is selected.
+pub trait ProviderNativeBatchArtifactSink: ArtifactSink {
+    fn select_output(
+        &mut self,
+        output_index: usize,
+    ) -> Result<(), image_provider_sdk::ArtifactSinkError>;
+}
+
+#[derive(Debug)]
+pub enum ProviderNativeBatchPollObservation {
+    Pending { next_poll_after_ms: Option<u64> },
+    Completed { output_count: usize },
+    Failed(ProviderFailure),
+}
+
 pub struct ProviderPollDriverCall {
     submission_id: String,
     provider_id: String,
@@ -82,6 +98,16 @@ pub trait ProviderPollDriver: Send + Sync + 'static {
         call: &ProviderPollDriverCall,
         sink: &mut S,
     ) -> impl Future<Output = Result<PollObservation, ProviderFailure>> + Send;
+
+    fn poll_native_batch<S: ProviderNativeBatchArtifactSink>(
+        &self,
+        _call: &ProviderPollDriverCall,
+        _output_count: usize,
+        _sink: &mut S,
+    ) -> impl Future<Output = Result<ProviderNativeBatchPollObservation, ProviderFailure>> + Send
+    {
+        async { Err(invalid_poll_context()) }
+    }
 }
 
 impl<P> ProviderPollDriver for P

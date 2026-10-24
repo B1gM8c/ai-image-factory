@@ -15,11 +15,12 @@ use tokio::{
 
 use super::{
     ControlledProviderArtifactSink, ProviderArtifactSinkContractError,
-    ProviderArtifactStageContext, ProviderArtifactStagerFactory, ProviderPollDriver,
-    ProviderPollDriverCall,
+    ProviderArtifactStageContext, ProviderArtifactStagerFactory,
+    ProviderNativeBatchPollObservation, ProviderPollDriver, ProviderPollDriverCall,
+    batch::ControlledNativeBatchSink,
 };
 use crate::provider_tasks::{
-    ProviderArtifactAuthority, ProviderArtifactPublication, ProviderRemoteTask,
+    NativeBatchMember, ProviderArtifactAuthority, ProviderArtifactPublication, ProviderRemoteTask,
     ProviderTaskClaimScope, ProviderTaskLease, ProviderTaskObservation,
     ProviderTaskObservationOutcome, ProviderTaskObservationSource, ProviderTaskStore,
     ProviderTaskStoreError,
@@ -30,6 +31,33 @@ const DEFAULT_BACKOFF_POLL_AFTER_MS: u64 = 1_000;
 const MAX_POLL_AFTER_MS: u64 = 24 * 60 * 60 * 1_000;
 
 pub trait ProviderPollStore: Send + Sync + 'static {
+    fn native_batch_members(
+        &self,
+        _lease: &ProviderTaskLease,
+    ) -> impl Future<Output = Result<Option<Vec<NativeBatchMember>>, ProviderTaskStoreError>> + Send
+    {
+        async { Ok(None) }
+    }
+
+    fn publish_native_batch_artifact(
+        &self,
+        _lease: &ProviderTaskLease,
+        _output_index: i32,
+        _authority: &ProviderArtifactAuthority,
+    ) -> impl Future<Output = Result<ProviderArtifactPublication, ProviderTaskStoreError>> + Send
+    {
+        async { Err(ProviderTaskStoreError::InvalidInput) }
+    }
+
+    fn record_native_batch_failure(
+        &self,
+        _lease: &ProviderTaskLease,
+        _output_index: i32,
+        _error_code: &str,
+    ) -> impl Future<Output = Result<(), ProviderTaskStoreError>> + Send {
+        async { Err(ProviderTaskStoreError::InvalidInput) }
+    }
+
     fn claim_poll(
         &self,
         scope: &ProviderTaskClaimScope,
@@ -60,6 +88,31 @@ impl<S> ProviderPollStore for S
 where
     S: ProviderTaskStore,
 {
+    async fn native_batch_members(
+        &self,
+        lease: &ProviderTaskLease,
+    ) -> Result<Option<Vec<NativeBatchMember>>, ProviderTaskStoreError> {
+        ProviderTaskStore::native_batch_members(self, lease).await
+    }
+
+    async fn publish_native_batch_artifact(
+        &self,
+        lease: &ProviderTaskLease,
+        output_index: i32,
+        authority: &ProviderArtifactAuthority,
+    ) -> Result<ProviderArtifactPublication, ProviderTaskStoreError> {
+        ProviderTaskStore::publish_native_batch_artifact(self, lease, output_index, authority).await
+    }
+
+    async fn record_native_batch_failure(
+        &self,
+        lease: &ProviderTaskLease,
+        output_index: i32,
+        error_code: &str,
+    ) -> Result<(), ProviderTaskStoreError> {
+        ProviderTaskStore::record_native_batch_failure(self, lease, output_index, error_code).await
+    }
+
     async fn claim_poll(
         &self,
         scope: &ProviderTaskClaimScope,
@@ -163,6 +216,14 @@ where
         };
         self.validate_lease(&lease)?;
 
+        if lease.task.provider_id == "dreamina-cli"
+            && let Some(members) = self.store.native_batch_members(&lease).await?
+        {
+            // The native CLI download future owns process capture buffers. Keep
+            // those buffers off the unchanged single-output poll future's stack.
+            return Box::pin(self.run_native_batch(lease, members, claim_started_at)).await;
+        }
+
         if let Some(publication) = lease.committed_artifact().cloned() {
             let task = self.record_artifact(&lease, publication).await?;
             return Ok(ProviderPollRun::Observed(task));
@@ -184,6 +245,150 @@ where
                 .await
                 .map_err(|_| ProviderPollOrchestratorError::ProviderDeadlineElapsed)??;
         let task = self.resolve_poll_result(&lease, sink, result).await?;
+        Ok(ProviderPollRun::Observed(task))
+    }
+
+    async fn run_native_batch(
+        &self,
+        lease: ProviderTaskLease,
+        members: Vec<NativeBatchMember>,
+        claim_started_at: Instant,
+    ) -> Result<ProviderPollRun, ProviderPollOrchestratorError> {
+        if lease.task.provider_id != "dreamina-cli"
+            || !(2..=10).contains(&members.len())
+            || members.iter().enumerate().any(|(index, member)| {
+                member.output_index != index as i32
+                    || member.committed_artifact.is_some()
+                        && member.committed_failure_code.is_some()
+            })
+            || members[0].submission_id != lease.task.submission_id
+            || members[0].executor_execution_id != lease.task.executor_execution_id
+        {
+            return Err(ProviderPollOrchestratorError::InvalidLease);
+        }
+        if members.iter().all(|member| {
+            member.committed_artifact.is_some() || member.committed_failure_code.is_some()
+        }) {
+            let publication = members[0]
+                .committed_artifact
+                .clone()
+                .ok_or(ProviderPollOrchestratorError::InvalidLease)?;
+            let task = self.record_artifact(&lease, publication).await?;
+            return Ok(ProviderPollRun::Observed(task));
+        }
+
+        let call = ProviderPollDriverCall::new(&lease)
+            .map_err(|_| ProviderPollOrchestratorError::InvalidLease)?;
+        let mut sink = ControlledNativeBatchSink::new(
+            &self.stagers,
+            &members,
+            &lease,
+            std::sync::Arc::clone(&self.materialization_limit),
+        );
+        // Do not inline the CLI's streaming buffers into each heartbeat frame.
+        let operation = Box::pin(
+            self.driver
+                .poll_native_batch(&call, members.len(), &mut sink),
+        );
+        let deadline = claim_started_at + Duration::from_millis(lease.remaining_budget_ms());
+        let (renewed, result) =
+            tokio::time::timeout_at(deadline, self.run_with_heartbeat(lease.clone(), operation))
+                .await
+                .map_err(|_| ProviderPollOrchestratorError::ProviderDeadlineElapsed)??;
+        let task = match result {
+            Ok(ProviderNativeBatchPollObservation::Pending { next_poll_after_ms })
+                if sink.is_pristine() =>
+            {
+                self.record_waiting(
+                    &renewed,
+                    bounded_poll_after(next_poll_after_ms.unwrap_or(DEFAULT_PENDING_POLL_AFTER_MS)),
+                )
+                .await?
+            }
+            Ok(ProviderNativeBatchPollObservation::Failed(failure))
+                if sink.is_pristine() && verified_terminal_failure(&failure) =>
+            {
+                self.record_failed(&renewed, failure.code()).await?
+            }
+            Ok(ProviderNativeBatchPollObservation::Completed { output_count }) => {
+                let staged = match sink.finish(output_count) {
+                    Ok(staged) => staged,
+                    Err(_) => {
+                        return Ok(ProviderPollRun::Observed(
+                            self.record_uncertain(
+                                &renewed,
+                                "provider_native_batch_artifact_contract",
+                            )
+                            .await?,
+                        ));
+                    }
+                };
+                if members[output_count..]
+                    .iter()
+                    .any(|member| member.committed_artifact.is_some())
+                {
+                    return Ok(ProviderPollRun::Observed(
+                        self.record_uncertain(&renewed, "provider_native_batch_result_changed")
+                            .await?,
+                    ));
+                }
+                let mut leader = members[0].committed_artifact.clone();
+                let mut staged_leader = None;
+                for (index, artifact) in staged {
+                    if index == 0 {
+                        staged_leader = Some(artifact);
+                        continue;
+                    }
+                    let publication = self
+                        .store
+                        .publish_native_batch_artifact(&renewed, index as i32, artifact.authority())
+                        .await?;
+                    if !publication.matches_durable_manifest(artifact.manifest()) {
+                        return Err(ProviderPollOrchestratorError::ArtifactContract(
+                            ProviderArtifactSinkContractError::ManifestMismatch,
+                        ));
+                    }
+                }
+                for (index, member) in members.iter().enumerate().skip(output_count) {
+                    if member.committed_failure_code.is_none() {
+                        self.store
+                            .record_native_batch_failure(
+                                &renewed,
+                                index as i32,
+                                "dreamina_native_batch_result_missing",
+                            )
+                            .await?;
+                    }
+                }
+                // A committed leader artifact is recoverable as terminal success.
+                // Publish it only after every follower has durable result evidence.
+                if let Some(artifact) = staged_leader {
+                    let publication = self
+                        .store
+                        .publish_poll_artifact(&renewed, artifact.authority())
+                        .await?;
+                    if !publication.matches_durable_manifest(artifact.manifest()) {
+                        return Err(ProviderPollOrchestratorError::ArtifactContract(
+                            ProviderArtifactSinkContractError::ManifestMismatch,
+                        ));
+                    }
+                    leader = Some(publication);
+                }
+                self.record_artifact(
+                    &renewed,
+                    leader.ok_or(ProviderPollOrchestratorError::InvalidLease)?,
+                )
+                .await?
+            }
+            Err(failure) => match retry_poll_after(&failure) {
+                Some(delay) => self.record_waiting(&renewed, delay).await?,
+                None => self.record_uncertain(&renewed, failure.code()).await?,
+            },
+            _ => {
+                self.record_uncertain(&renewed, "provider_native_batch_artifact_contract")
+                    .await?
+            }
+        };
         Ok(ProviderPollRun::Observed(task))
     }
 

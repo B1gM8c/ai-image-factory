@@ -947,6 +947,23 @@ printf '{"submit_id":"%s","gen_status":"success"}' "$submit"
 #[tokio::test]
 async fn provider_submitd_drains_fake_dreamina_submit_and_restarts_without_resubmit() -> TestResult
 {
+    verify_dreamina_submitd_restart(1).await
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn native_batch_submitd_submits_two_images_once_across_restart() -> TestResult {
+    verify_dreamina_submitd_restart(2).await
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn native_batch_submitd_submits_ten_images_once_across_restart() -> TestResult {
+    verify_dreamina_submitd_restart(10).await
+}
+
+#[cfg(target_os = "macos")]
+async fn verify_dreamina_submitd_restart(output_count: i32) -> TestResult {
     let Some(database) = TestDatabase::new().await? else {
         return Ok(());
     };
@@ -960,12 +977,12 @@ async fn provider_submitd_drains_fake_dreamina_submit_and_restarts_without_resub
             DREAMINA_SUBMIT_COMMAND_SCHEMA,
             json!({
                 "operation": "text2image",
-                "schema_version": 1,
+                "schema_version": if output_count == 1 { 1 } else { 2 },
                 "prompt": "provider submit daemon process test",
                 "model_version": "5.0",
                 "ratio": "1:1",
                 "resolution_type": "2k",
-                "generate_num": 1,
+                "generate_num": output_count,
                 "poll": 0
             }),
         )
@@ -975,6 +992,7 @@ async fn provider_submitd_drains_fake_dreamina_submit_and_restarts_without_resub
             .prepare_and_handoff(&work, DREAMINA_PROFILE_ID)
             .await
             .map_err(debug_error)?;
+        require(prepared.len() == output_count as usize, "batch output preparation count mismatch")?;
         let submission_id = prepared
             .first()
             .ok_or_else(|| "provider-submitd fixture was not prepared".to_owned())?
@@ -992,6 +1010,7 @@ async fn provider_submitd_drains_fake_dreamina_submit_and_restarts_without_resub
         let executable = root.path().join("dreamina");
         let script = br#"#!/bin/sh
 printf 'invoked\n' >> "$HOME/submit-invocations"
+printf '%s\n' "$@" >> "$HOME/submit-arguments"
 printf started > "$HOME/submit-started"
 /bin/sleep 1
 printf '{"submit_id":"dreamina-submitd-operation-1","gen_status":"querying"}'
@@ -1234,6 +1253,21 @@ printf '{"submit_id":"dreamina-submitd-operation-1","gen_status":"querying"}'
         require(
             invocations.lines().count() == 1,
             format!("provider-submitd relaunched attached work: {invocations:?}"),
+        )?;
+        let arguments = fs::read_to_string(account_home.join("submit-arguments")).map_err(debug_error)?;
+        let argv: Vec<_> = arguments.lines().collect();
+        require(
+            argv.windows(2).filter(|pair| pair[0] == "--generate_num").collect::<Vec<_>>()
+                == vec![["--generate_num", output_count.to_string().as_str()].as_slice()]
+                && argv.iter().filter(|arg| **arg == "--poll=0").count() == 1,
+            format!("native batch CLI arguments were not frozen once: {arguments:?}"),
+        )?;
+        let states: Vec<(i32, String)> = sqlx::query_as(
+            "SELECT output.output_index, execution.state FROM executor_executions execution JOIN provider_submissions submission USING (submission_id, executor_execution_id) JOIN job_outputs output USING (output_id) WHERE output.job_id = $1 ORDER BY output.output_index",
+        ).bind(work.job_id).fetch_all(&database.pool).await.map_err(debug_error)?;
+        require(
+            states.len() == output_count as usize && states.iter().all(|(index, state)| state == if *index == 0 { "provider_waiting" } else { "prepared" }),
+            format!("batch followers entered the submit path: {states:?}"),
         )?;
         require(
             fs::read_dir(&workspace).map_err(debug_error)?.all(|entry| {
@@ -10816,6 +10850,10 @@ async fn seed_work_lease_for_runtime_profile_with_command(
     command_schema: &str,
     command: serde_json::Value,
 ) -> TestResult<WorkLease> {
+    let output_count = command
+        .get("generate_num")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(1) as i32;
     let job_id = Uuid::new_v4();
     let work_item_id = Uuid::new_v4();
     let execution_id = Uuid::new_v4();
@@ -10836,7 +10874,7 @@ async fn seed_work_lease_for_runtime_profile_with_command(
                requested_units, output_count, billable_units, billing_metric, billing_unit,
                economics_contract_version, created_at_ms, updated_at_ms)
             VALUES ($1, 'provider-task-test', $2, 'generation', $3,
-                    $4, 'reserved', 1, 1, 1, 'output', 'output', 2, $5, $5)
+                    $4, 'reserved', $6, $6, $6, 'output', 'output', 2, $5, $5)
             "#,
         )
         .bind(job_id)
@@ -10844,6 +10882,7 @@ async fn seed_work_lease_for_runtime_profile_with_command(
         .bind(provider_id)
         .bind(model)
         .bind(now)
+        .bind(output_count)
         .execute(pool)
         .await
         .map_err(debug_error)?;
@@ -10866,15 +10905,18 @@ async fn seed_work_lease_for_runtime_profile_with_command(
         .await
         .map_err(debug_error)?;
     }
-    sqlx::query(
-        "INSERT INTO job_outputs (output_id, job_id, output_index, state, created_at_ms, updated_at_ms) VALUES ($1, $2, 0, 'pending', $3, $3)",
-    )
-    .bind(Uuid::new_v4())
-    .bind(job_id)
-    .bind(now)
-    .execute(pool)
-    .await
-    .map_err(debug_error)?;
+    for output_index in 0..output_count {
+        sqlx::query(
+            "INSERT INTO job_outputs (output_id, job_id, output_index, state, created_at_ms, updated_at_ms) VALUES ($1, $2, $4, 'pending', $3, $3)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(job_id)
+        .bind(now)
+        .bind(output_index)
+        .execute(pool)
+        .await
+        .map_err(debug_error)?;
+    }
     sqlx::query(
         r#"
         INSERT INTO admission_sessions
@@ -11595,3 +11637,6 @@ fn combine(result: TestResult, cleanup: TestResult) -> TestResult {
         _ => Ok(()),
     }
 }
+
+#[path = "postgres_provider_tasks/native_batch.rs"]
+mod native_batch;

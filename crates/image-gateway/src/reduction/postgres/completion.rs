@@ -1527,7 +1527,7 @@ async fn aggregate_parent(
                COALESCE((
                    SELECT payload.command_schema IN (
                        'openai.images.generation.v1', 'openai.images.edit.v1'
-                   )
+                   ) OR EXISTS (SELECT 1 FROM dreamina_native_batches batch WHERE batch.job_id = job.job_id)
                    FROM job_payloads payload
                    WHERE payload.job_id = job.job_id
                ), FALSE) AS partial_success_allowed,

@@ -41,6 +41,13 @@ use gpt_image_2_gateway::{
         PostgresExecutorSubmissionStore,
     },
     input_blobs::{InputBlobKey, InputBlobRef},
+    provider_tasks::{
+        PostgresProviderTaskStore, ProviderNativeBatchArtifactSink,
+        ProviderNativeBatchPollObservation, ProviderPollDriver, ProviderPollDriverCall,
+        ProviderPollOrchestrator, ProviderPollOrchestratorConfig, ProviderPollRun,
+        ProviderTaskClaimScope, ProviderTaskState, ProviderTaskStore, RemoteTaskAttach,
+        RemoteTaskSubmitReceipt, RemoteTaskSubmitReservation,
+    },
     reconcile_inline_customer_settlement,
 };
 use image::{DynamicImage, ImageFormat, Rgba, RgbaImage};
@@ -54,7 +61,11 @@ use image_provider_contracts::{
 use image_provider_dreamina_cli::{
     ADAPTER_REVISION as DREAMINA_ADAPTER_REVISION, DREAMINA_IMAGE_GENERATION_OPERATION_V1,
     DREAMINA_SUBMIT_COMMAND_SCHEMA, DREAMINA_VIDEO_GENERATION_OPERATION_V1,
-    PROVIDER_ID as DREAMINA_PROVIDER_ID,
+    DreaminaSubmitPayloadV1, PROVIDER_ID as DREAMINA_PROVIDER_ID, parse_native_image_batch_command,
+};
+use image_provider_sdk::{
+    ArtifactMetadata as ProviderArtifactMetadata, ArtifactSink, EffectCertainty, OutputSlot,
+    PollObservation, ProviderFailure, ProviderFailureClass, RetryDirective, SingleOutputCommand,
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -812,6 +823,23 @@ async fn executord_sigterm_drains_running_helper_through_database_resolution() -
             "expected one prepared output",
         )?;
         let files = ExecutordFixture::new(Duration::from_secs(1))?;
+        let release = files._temp.path().join("release-drain-helper");
+        let script = fs::read_to_string(&files.fake_codex).map_err(debug_error)?;
+        require(
+            script.matches("/bin/sleep 1.000\n").count() == 1,
+            "expected one helper delay to replace with the drain barrier",
+        )?;
+        fs::write(
+            &files.fake_codex,
+            script.replace(
+                "/bin/sleep 1.000\n",
+                &format!(
+                    "while [ ! -f '{}' ]; do /bin/sleep 0.01; done\n",
+                    release.display()
+                ),
+            ),
+        )
+        .map_err(debug_error)?;
         let mut child = files
             .command(&database, "executord-drain-smoke")
             .await?
@@ -852,6 +880,7 @@ async fn executord_sigterm_drains_running_helper_through_database_resolution() -
         if unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) } != 0 {
             return Err("failed to SIGTERM executord".to_string());
         }
+        fs::write(&release, []).map_err(debug_error)?;
         let output = tokio::time::timeout(Duration::from_secs(8), child.wait_with_output())
             .await
             .map_err(|_| "executord did not finish drain".to_string())?
@@ -2185,6 +2214,278 @@ async fn v4_dreamina_terminal_success_settles_the_native_quote_once() -> TestRes
 }
 
 #[tokio::test]
+async fn v4_dreamina_native_batch_charges_each_delivered_image_once() -> TestResult {
+    verify_v4_dreamina_native_batch_settlement(2, 2).await
+}
+
+#[tokio::test]
+async fn v4_dreamina_native_batch_missing_image_releases_only_its_quote_once() -> TestResult {
+    verify_v4_dreamina_native_batch_settlement(3, 2).await
+}
+
+struct OfflineDreaminaBatchResults {
+    delivered: usize,
+    poll_calls: Arc<AtomicUsize>,
+}
+
+#[derive(Debug, Eq, PartialEq, sqlx::FromRow)]
+struct NativeBatchSettlementSnapshot {
+    state: String,
+    charged_units: i32,
+    committed_units: i32,
+    released_units: i32,
+    receipt_count: i64,
+    usage_fact_count: i64,
+    successful_quantity: i64,
+    artifact_count: i64,
+    distinct_artifact_count: i64,
+    rating_count: i64,
+    rating_line_count: i64,
+    captured_micros: i64,
+    released_micros: i64,
+    charge_count: i64,
+    remote_task_count: i64,
+    submit_intent_count: i64,
+}
+
+impl ProviderPollDriver for OfflineDreaminaBatchResults {
+    fn provider_id(&self) -> &'static str {
+        DREAMINA_PROVIDER_ID
+    }
+
+    async fn poll<S: ArtifactSink>(
+        &self,
+        _call: &ProviderPollDriverCall,
+        _sink: &mut S,
+    ) -> Result<PollObservation, ProviderFailure> {
+        panic!("a native batch must use one batch poll")
+    }
+
+    async fn poll_native_batch<S: ProviderNativeBatchArtifactSink>(
+        &self,
+        _call: &ProviderPollDriverCall,
+        output_count: usize,
+        sink: &mut S,
+    ) -> Result<ProviderNativeBatchPollObservation, ProviderFailure> {
+        assert!(self.delivered <= output_count);
+        self.poll_calls.fetch_add(1, Ordering::SeqCst);
+        for index in 0..self.delivered {
+            let bytes = png_bytes([10 + index as u8, 20, 30, 255]);
+            sink.select_output(index)
+                .map_err(offline_batch_artifact_failure)?;
+            sink.write_chunk(&bytes)
+                .await
+                .map_err(offline_batch_artifact_failure)?;
+            sink.finalize(ProviderArtifactMetadata {
+                media_type: "image/png",
+            })
+            .await
+            .map_err(offline_batch_artifact_failure)?;
+        }
+        Ok(ProviderNativeBatchPollObservation::Completed {
+            output_count: self.delivered,
+        })
+    }
+}
+
+fn offline_batch_artifact_failure(_: image_provider_sdk::ArtifactSinkError) -> ProviderFailure {
+    ProviderFailure::new(
+        ProviderFailureClass::Permanent,
+        "offline_batch_artifact_invalid",
+        EffectCertainty::UnknownRemoteEffect,
+        RetryDirective::Never,
+    )
+    .expect("static offline batch failure is valid")
+}
+
+async fn verify_v4_dreamina_native_batch_settlement(
+    output_count: u32,
+    delivered: usize,
+) -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let work = seed_dreamina_generation_lease_with_outputs_for_profile(
+            &database.pool,
+            "v4-dreamina-native-batch-worker",
+            DREAMINA_IMAGES_API_PROFILE,
+            output_count,
+        )
+        .await?;
+        require(
+            work.command_json.get("schema_version") == Some(&json!(2)),
+            "new Dreamina batch must freeze the native schema version",
+        )?;
+        seed_v4_customer_quote_with_basis(
+            &database.pool,
+            &work,
+            V4CustomerQuoteIdentity::dreamina(),
+            V4CustomerQuoteBasis {
+                metric: "image_output",
+                unit: "image",
+                unit_size: 1,
+                unit_price_micros: 7,
+                quantity_source: "request_derived",
+                confidence: "exact",
+                max_quantity: 1,
+                max_amount_micros: 7,
+            },
+        )
+        .await?;
+        let executor = PostgresExecutorSubmissionStore::new(database.pool.clone());
+        let prepared = executor.prepare_and_handoff(&work, DREAMINA_PROFILE_ID)
+            .await.map_err(debug_error)?;
+        require(prepared.len() == output_count as usize, "batch lost output membership")?;
+        seed_terminal_quota(&database.pool, &work).await?;
+        let scope = ExecutorClaimScope {
+            execution_profile_id: DREAMINA_PROFILE_ID,
+            provider_id: DREAMINA_PROVIDER_ID.to_string(),
+            command_schema: DREAMINA_SUBMIT_COMMAND_SCHEMA.to_string(),
+            adapter_revision: DREAMINA_ADAPTER_REVISION.to_string(),
+        };
+        let leader = executor.claim_prepared(&scope, "native-batch-executor", 60_000)
+            .await.map_err(debug_error)?
+            .ok_or_else(|| "native batch leader was not claimable".to_string())?;
+        require(leader.output_index == 0, "only batch output zero may launch")?;
+        executor.start(&leader).await.map_err(debug_error)?;
+        require(
+            executor.claim_prepared(&scope, "native-batch-follower-executor", 60_000)
+                .await.map_err(debug_error)?.is_none(),
+            "a native batch follower became independently claimable",
+        )?;
+        let source = serde_json::to_vec(&work.command_json).map_err(debug_error)?;
+        let batch = parse_native_image_batch_command(&source).map_err(debug_error)?;
+        let command = SingleOutputCommand::new(
+            OutputSlot::new(0, output_count).map_err(debug_error)?,
+            DreaminaSubmitPayloadV1::new_native_image_batch(&leader.command_hash, batch)
+                .map_err(debug_error)?,
+        ).map_err(debug_error)?;
+        let reservation = RemoteTaskSubmitReservation::new(
+            &leader,
+            format!("native-batch-{}", leader.submission_id.simple()),
+            command.output(),
+            command.identity(),
+            60_000,
+        );
+        let tasks = PostgresProviderTaskStore::new(database.pool.clone());
+        tasks.reserve_submit(&reservation).await.map_err(debug_error)?;
+        tasks.start_submit(&reservation).await.map_err(debug_error)?;
+        let binding = tasks.load_submit_intent(leader.submission_id).await.map_err(debug_error)?
+            .ok_or_else(|| "native batch submit intent disappeared".to_string())?
+            .execution_binding_sha256;
+        let operation = format!("offline-native-batch-{}", work.job_id.simple());
+        tasks.record_submit_receipt(&RemoteTaskSubmitReceipt {
+            submission_id: leader.submission_id,
+            executor_execution_id: leader.executor_execution_id,
+            executor_owner: leader.executor_owner.clone(),
+            executor_lease_epoch: leader.executor_lease_epoch,
+            remote_operation_id: operation.clone(),
+            provider_request_id: None,
+            event_identity: "offline-native-batch-receipt".to_string(),
+            execution_binding_sha256: binding.clone(),
+        }).await.map_err(debug_error)?;
+        tasks.attach(&RemoteTaskAttach {
+            submission_id: leader.submission_id,
+            executor_execution_id: leader.executor_execution_id,
+            executor_owner: leader.executor_owner.clone(),
+            executor_lease_epoch: leader.executor_lease_epoch,
+            remote_operation_id: operation,
+            provider_request_id: None,
+            event_identity: "offline-native-batch-attach".to_string(),
+            execution_binding_sha256: binding,
+            poll_after_ms: 0,
+            recovery_fence: None,
+        }).await.map_err(debug_error)?;
+        let artifact_root = tempfile::tempdir().map_err(debug_error)?;
+        let blobs = Arc::new(FilesystemArtifactBlobStore::new(artifact_root.path())
+            .map_err(debug_error)?);
+        let poll_calls = Arc::new(AtomicUsize::new(0));
+        let poller = ProviderPollOrchestrator::new(
+            tasks,
+            OfflineDreaminaBatchResults { delivered, poll_calls: Arc::clone(&poll_calls) },
+            gpt_image_2_gateway::FilesystemProviderArtifactStagerFactory::new(Arc::clone(&blobs), 1024 * 1024)
+                .map_err(debug_error)?,
+            ProviderPollOrchestratorConfig {
+                scope: ProviderTaskClaimScope {
+                    provider_id: DREAMINA_PROVIDER_ID.to_string(),
+                    provider_account_id: DREAMINA_ACCOUNT_ID,
+                    execution_profile_id: DREAMINA_PROFILE_ID,
+                },
+                owner: "offline-native-batch-poller".to_string(),
+                lease_ms: 5_000,
+                heartbeat_interval: Duration::from_secs(1),
+                max_materializations: 1,
+            },
+        ).map_err(debug_error)?;
+        let poll = poller.run_once().await.map_err(debug_error)?;
+        require(matches!(poll, ProviderPollRun::Observed(ref task) if task.state == ProviderTaskState::ArtifactReady),
+            format!("batch poll did not publish completed members: {poll:?}"))?;
+        require(matches!(poller.run_once().await.map_err(debug_error)?, ProviderPollRun::Idle)
+            && poll_calls.load(Ordering::SeqCst) == 1, "completed batch was polled again")?;
+
+        let reductions = PostgresExecutorTerminalStore::new(database.pool.clone());
+        let customer = CustomerArtifactPublisher::new(blobs);
+        for index in 0..output_count {
+            let terminal = reductions.claim_terminal(&format!("native-batch-reducer-{index}"), 60_000)
+                .await.map_err(debug_error)?
+                .ok_or_else(|| format!("batch output {index} terminal reduction missing"))?;
+            let artifact = if matches!(terminal.outcome, CanonicalExecutorOutcome::Succeeded(_)) {
+                Some(customer.publish(&terminal).await.map_err(debug_error)?)
+            } else {
+                require(matches!(&terminal.outcome, CanonicalExecutorOutcome::Failed { error_code }
+                    if error_code == "dreamina_native_batch_result_missing"),
+                    format!("missing output did not have explicit failure evidence: {:?}", terminal.outcome))?;
+                None
+            };
+            let first = reductions.complete_terminal(&terminal, artifact.as_ref()).await.map_err(debug_error)?;
+            let replay = reductions.complete_terminal(&terminal, artifact.as_ref()).await.map_err(debug_error)?;
+            require(first == replay, "replaying a member changed terminal settlement")?;
+            let expected = if index + 1 == output_count { ExecutorParentTerminalState::Succeeded }
+                else { ExecutorParentTerminalState::Pending };
+            require(first.parent_state == expected, format!("batch member completion drifted: {first:?}"))?;
+        }
+        let state: NativeBatchSettlementSnapshot = sqlx::query_as(
+            r#"
+            SELECT job.state, job.charged_units, quota.committed_units, quota.released_units,
+              (SELECT COUNT(*) FROM provider_receipts receipt JOIN provider_submissions submission USING (submission_id) WHERE submission.job_id = $1) AS receipt_count,
+              (SELECT COUNT(*) FROM provider_usage_facts WHERE job_id = $1) AS usage_fact_count,
+              (SELECT COALESCE(SUM(quantity), 0)::BIGINT FROM provider_usage_facts WHERE job_id = $1 AND metric = 'image_output' AND terminal_outcome = 'succeeded') AS successful_quantity,
+              (SELECT COUNT(*) FROM artifacts WHERE job_id = $1) AS artifact_count,
+              (SELECT COUNT(DISTINCT sha256_hex) FROM artifacts WHERE job_id = $1) AS distinct_artifact_count,
+              (SELECT COUNT(*) FROM customer_rated_usage WHERE job_id = $1) AS rating_count,
+              (SELECT COUNT(*) FROM customer_rated_usage_lines line JOIN customer_rated_usage rating USING (rated_usage_id) WHERE rating.job_id = $1) AS rating_line_count,
+              hold.captured_micros, hold.released_micros,
+              (SELECT COUNT(*) FROM ledger_transactions WHERE source_job_id = $1 AND transaction_type = 'customer_job_charge') AS charge_count,
+              (SELECT COUNT(*) FROM provider_remote_tasks task JOIN provider_submissions submission USING (submission_id) WHERE submission.job_id = $1) AS remote_task_count,
+              (SELECT COUNT(*) FROM provider_remote_submit_intents intent JOIN provider_submissions submission USING (submission_id) WHERE submission.job_id = $1) AS submit_intent_count
+            FROM jobs job JOIN quota_reservations quota ON quota.job_id = job.job_id
+            JOIN customer_billing_holds hold ON hold.job_id = job.job_id WHERE job.job_id = $1
+            "#,
+        ).bind(work.job_id).fetch_one(&database.pool).await.map_err(debug_error)?;
+        let delivered = i64::try_from(delivered).map_err(debug_error)?;
+        require(state == NativeBatchSettlementSnapshot {
+            state: "succeeded".to_string(), charged_units: delivered as i32,
+            committed_units: delivered as i32, released_units: output_count as i32 - delivered as i32,
+            receipt_count: output_count.into(), usage_fact_count: output_count.into(),
+            successful_quantity: delivered, artifact_count: delivered, distinct_artifact_count: delivered,
+            rating_count: 1, rating_line_count: output_count.into(), captured_micros: delivered * 7,
+            released_micros: (i64::from(output_count) - delivered) * 7,
+            charge_count: 1, remote_task_count: 1, submit_intent_count: 1 },
+            format!("native batch did not settle once per delivered image: {state:?}"))?;
+        let projection: (i32, String, i64) = sqlx::query_as(
+            r#"SELECT projection.artifact_count, hold.state, account.held_micros
+               FROM job_response_projections projection JOIN customer_billing_holds hold USING (job_id)
+               JOIN billing_accounts account ON account.tenant_id = hold.tenant_id AND account.currency = hold.currency
+               WHERE projection.job_id = $1"#,
+        ).bind(work.job_id).fetch_one(&database.pool).await.map_err(debug_error)?;
+        require(projection == (delivered as i32, "settled".to_string(), 0),
+            format!("native batch response or remaining hold was incorrect: {projection:?}"))
+    }.await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
 async fn v4_ark_terminal_success_preserves_ark_identity_and_dreamina_price() -> TestResult {
     verify_v4_dreamina_terminal_success(
         image_api_contracts::ark::ARK_IMAGES_API_PROFILE,
@@ -3398,24 +3699,53 @@ async fn assert_v4_codex_mixed_settlement(
 #[tokio::test]
 async fn v4_unlaunched_batch_cancellation_releases_every_hold_without_provider_launch() -> TestResult
 {
+    verify_v4_unlaunched_batch_cancellation(false).await
+}
+
+#[tokio::test]
+async fn v4_unlaunched_dreamina_native_batch_cancellation_releases_every_output_once() -> TestResult
+{
+    verify_v4_unlaunched_batch_cancellation(true).await
+}
+
+async fn verify_v4_unlaunched_batch_cancellation(native_batch: bool) -> TestResult {
     let _ = tracing_subscriber::fmt().with_test_writer().try_init();
     let Some(database) = TestDatabase::new().await? else {
         return Ok(());
     };
     let result = async {
-        let work = seed_codex_generation_lease_with_outputs(
+        let output_count = if native_batch { 3 } else { 2 };
+        let unit_price = if native_batch { 7 } else { 40_000 };
+        let work = if native_batch {
+            seed_dreamina_generation_lease_with_outputs_for_profile(
+                &database.pool,
+                "v4-native-batch-unlaunched-cancel-worker",
+                DREAMINA_IMAGES_API_PROFILE,
+                output_count,
+            ).await?
+        } else {
+            seed_codex_generation_lease_with_outputs(
+                &database.pool,
+                "v4-unlaunched-cancel-worker",
+                output_count,
+            ).await?
+        };
+        seed_v4_customer_quote_with_basis(
             &database.pool,
-            "v4-unlaunched-cancel-worker",
-            2,
-        )
-        .await?;
-        seed_v4_customer_quote(&database.pool, &work, 40_000).await?;
+            &work,
+            if native_batch { V4CustomerQuoteIdentity::dreamina() } else { V4CustomerQuoteIdentity::openai() },
+            V4CustomerQuoteBasis {
+                metric: "image_output", unit: "image", unit_size: 1,
+                unit_price_micros: unit_price, quantity_source: "request_derived",
+                confidence: "exact", max_quantity: 1, max_amount_micros: unit_price,
+            },
+        ).await?;
         let executor = PostgresExecutorSubmissionStore::new(database.pool.clone());
         let prepared = executor
             .prepare_and_handoff(&work, profile_id_for_lease(&work))
             .await
             .map_err(debug_error)?;
-        require(prepared.len() == 2, "expected two prepared outputs")?;
+        require(prepared.len() == output_count as usize, "prepared output count changed")?;
         seed_terminal_quota(&database.pool, &work).await?;
         sqlx::query("UPDATE jobs SET state = 'reserved' WHERE job_id = $1")
             .bind(work.job_id)
@@ -3428,7 +3758,7 @@ async fn v4_unlaunched_batch_cancellation_releases_every_hold_without_provider_l
             .await
             .map_err(debug_error)?;
         require(
-            canceled.job_id == work.job_id && canceled.canceled_outputs == 2,
+            canceled.job_id == work.job_id && canceled.canceled_outputs == output_count,
             format!("unexpected cancellation: {canceled:?}"),
         )?;
         let durable: (i64, i64, i64, i64, i64) = sqlx::query_as(
@@ -3455,7 +3785,7 @@ async fn v4_unlaunched_batch_cancellation_releases_every_hold_without_provider_l
         .await
         .map_err(debug_error)?;
         require(
-            durable == (2, 2, 2, 0, 0),
+            durable == (output_count.into(), output_count.into(), output_count.into(), 0, 0),
             format!("unlaunched cancellation was not side-effect free: {durable:?}"),
         )?;
         let replay = PostgresReconciliationStore::new(database.pool.clone())
@@ -3469,17 +3799,19 @@ async fn v4_unlaunched_batch_cancellation_releases_every_hold_without_provider_l
 
         let reductions = PostgresExecutorTerminalStore::new(database.pool.clone());
         let mut parent = ExecutorParentTerminalState::Pending;
-        for index in 0..2 {
+        for index in 0..output_count {
             let terminal = reductions
                 .claim_terminal(&format!("v4-unlaunched-cancel-reducer-{index}"), 60_000)
                 .await
                 .map_err(|error| format!("claim canceled terminal {index}: {error:?}"))?
                 .ok_or_else(|| "canceled terminal reduction was not queued".to_string())?;
-            parent = reductions
+            let first = reductions
                 .complete_terminal(&terminal, None)
                 .await
-                .map_err(|error| format!("complete canceled terminal {index}: {error:?}"))?
-                .parent_state;
+                .map_err(|error| format!("complete canceled terminal {index}: {error:?}"))?;
+            let replay = reductions.complete_terminal(&terminal, None).await.map_err(debug_error)?;
+            require(first == replay, "canceled terminal replay changed settlement")?;
+            parent = first.parent_state;
         }
         require(
             parent == ExecutorParentTerminalState::Failed,
@@ -3505,15 +3837,27 @@ async fn v4_unlaunched_batch_cancellation_releases_every_hold_without_provider_l
                 == (
                     "failed".to_string(),
                     0,
-                    2,
+                    output_count as i32,
                     "settled".to_string(),
                     0,
-                    80_000,
+                    i64::from(output_count) * unit_price,
                     "released".to_string(),
                     0,
                 ),
             format!("unlaunched cancellation did not release economics: {economics:?}"),
-        )
+        )?;
+        let effects: (i64, i64, i64, i64, i64) = sqlx::query_as(
+            r#"
+            SELECT
+              (SELECT COUNT(*) FROM provider_receipts receipt JOIN provider_submissions submission USING (submission_id) WHERE submission.job_id = $1),
+              (SELECT COUNT(*) FROM provider_usage_facts WHERE job_id = $1),
+              (SELECT COUNT(*) FROM provider_remote_submit_intents intent JOIN provider_submissions submission USING (submission_id) WHERE submission.job_id = $1),
+              (SELECT COUNT(*) FROM provider_remote_tasks task JOIN provider_submissions submission USING (submission_id) WHERE submission.job_id = $1),
+              (SELECT COUNT(*) FROM ledger_transactions WHERE source_job_id = $1 AND transaction_type = 'customer_job_charge')
+            "#,
+        ).bind(work.job_id).fetch_one(&database.pool).await.map_err(debug_error)?;
+        require(effects == (output_count.into(), output_count.into(), 0, 0, 0),
+            format!("unlaunched cancellation duplicated settlement or submitted remotely: {effects:?}"))
     }
     .await;
     combine(result, database.cleanup().await)
@@ -9005,6 +9349,15 @@ async fn seed_dreamina_generation_lease_for_profile(
     worker_id: &str,
     api_profile: &str,
 ) -> TestResult<WorkLease> {
+    seed_dreamina_generation_lease_with_outputs_for_profile(pool, worker_id, api_profile, 1).await
+}
+
+async fn seed_dreamina_generation_lease_with_outputs_for_profile(
+    pool: &PgPool,
+    worker_id: &str,
+    api_profile: &str,
+    output_count: u32,
+) -> TestResult<WorkLease> {
     let job_id = Uuid::new_v4();
     let owner_token = Uuid::new_v4();
     let request_id = format!("request-{}", Uuid::new_v4().simple());
@@ -9015,7 +9368,7 @@ async fn seed_dreamina_generation_lease_for_profile(
         resolution_type: "2k".to_string(),
         width: None,
         height: None,
-        generate_num: Some(1),
+        generate_num: Some(u8::try_from(output_count).map_err(debug_error)?),
     })
     .map_err(debug_error)?;
     let claim = plan.claim_for_profile(

@@ -81,7 +81,7 @@ impl Case {
     }
     fn count(self) -> usize {
         if matches!(self, Self::ImageBatch) {
-            3
+            2
         } else {
             1
         }
@@ -111,7 +111,8 @@ impl Case {
     }
     fn quota(self) -> i32 {
         match self {
-            Self::ImageBatch | Self::Multiframe => 3,
+            Self::ImageBatch => 2,
+            Self::Multiframe => 3,
             Self::Upscale => 1,
             Self::ImageToVideo | Self::ArkFrames | Self::Multimodal => 5,
         }
@@ -138,7 +139,7 @@ impl Case {
                 {"type":"image_url","role":"first_frame","image_url":{"url":first}}],
                 "duration":5,"resolution":"480p","ratio":"adaptive"}),
             Self::ImageBatch => {
-                json!({"workflow":"image2image","images":[first,last],"prompt":"orange paper planes","model_version":"5.0","ratio":"16:9","resolution_type":"2k","generate_num":3})
+                json!({"workflow":"image2image","images":[first,last],"prompt":"orange paper planes","model_version":"5.0","ratio":"16:9","resolution_type":"2k","generate_num":2})
             }
             // This route test verifies 8k parameter forwarding, not synthetic output dimensions.
             Self::Upscale => {
@@ -168,8 +169,8 @@ impl ProviderArtifactStagerFactory for WorkflowStaging {
 }
 
 #[tokio::test]
-async fn native_and_ark_reference_workflows_preserve_inputs_fanout_and_exact_billing() -> TestResult
-{
+async fn native_and_ark_reference_workflows_preserve_inputs_native_batch_and_exact_billing()
+-> TestResult {
     let _guard = postgres_video_test_lock().lock().await;
     for case in [
         Case::ImageToVideo,
@@ -221,6 +222,7 @@ async fn run_workflow(pool: &PgPool, case: Case) -> TestResult {
     fs::write(home.join("first.png"), &first_png).map_err(debug_error)?;
     fs::write(home.join("last.png"), &last_png).map_err(debug_error)?;
     fs::write(home.join("kind"), case.model().media_kind).map_err(debug_error)?;
+    fs::write(home.join("output-count"), case.count().to_string()).map_err(debug_error)?;
     fs::write(
         home.join("video.json"),
         serde_json::to_vec(&json!({
@@ -250,7 +252,7 @@ case "$operation" in
       esac
       shift
     done
-    [ "$count" = 1 ]
+    [ "$count" = "$(/bin/cat "$HOME/output-count")" ]
     if [ -n "$images" ]; then
       first=${images%%,*}
       last=${images#*,}
@@ -267,6 +269,7 @@ case "$operation" in
     ;;
   query_result)
     printf '%s\n' "$@" >> "$HOME/poll-arguments"
+    printf 'poll\n' >> "$HOME/poll-calls"
     submit= download=
     while [ "$#" -gt 0 ]; do
       case "$1" in
@@ -279,7 +282,12 @@ case "$operation" in
     case "$submit" in workflow-*) ;; *) exit 93 ;; esac
     if [ "$(/bin/cat "$HOME/kind")" = image ]; then
       [ -n "$download" ]
-      /bin/cp "$HOME/first.png" "$download/result.png"
+      if [ "$(/bin/cat "$HOME/output-count")" = 2 ]; then
+        /bin/cp "$HOME/first.png" "$download/result-0.png"
+        /bin/cp "$HOME/last.png" "$download/result-1.png"
+      else
+        /bin/cp "$HOME/first.png" "$download/result.png"
+      fi
       printf '{"submit_id":"%s","gen_status":"success"}' "$submit"
     else
       [ -z "$download" ]
@@ -525,35 +533,46 @@ esac
         "HTTP task was not handed off",
     )?;
     let reductions = PostgresExecutorTerminalStore::new(pool.clone());
-    for index in 0..case.count() {
+    let command = ProviderSubmitIterationCommand::new("workflow-submit", "claim-0", "defer-0")
+        .map_err(debug_error)?;
+    let submitted = Box::pin(submit.run_once(&command))
+        .await
+        .map_err(debug_error)?;
+    require(
+        submitted == ProviderSubmitRun::FreshSubmitted,
+        format!("workflow submit: {submitted:?}"),
+    )?;
+    if matches!(case, Case::ImageBatch) {
         let command = ProviderSubmitIterationCommand::new(
             "workflow-submit",
-            format!("claim-{index}"),
-            format!("defer-{index}"),
+            "claim-follower",
+            "defer-follower",
         )
         .map_err(debug_error)?;
-        let submitted = Box::pin(submit.run_once(&command))
-            .await
-            .map_err(debug_error)?;
         require(
-            submitted == ProviderSubmitRun::FreshSubmitted,
-            format!("slot {index} submit: {submitted:?}"),
+            Box::pin(submit.run_once(&command))
+                .await
+                .map_err(debug_error)?
+                == ProviderSubmitRun::Idle,
+            "native batch follower acquired independent submit authority",
         )?;
-        let observed = tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                let run = Box::pin(poll.run_once()).await.map_err(debug_error)?;
-                if !matches!(run, ProviderPollRun::Idle) {
-                    return Ok::<_, String>(run);
-                }
-                tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let observed = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let run = Box::pin(poll.run_once()).await.map_err(debug_error)?;
+            if !matches!(run, ProviderPollRun::Idle) {
+                return Ok::<_, String>(run);
             }
-        })
-        .await
-        .map_err(debug_error)??;
-        require(
-            matches!(observed,ProviderPollRun::Observed(ref task) if task.state == if case.is_image() { ProviderTaskState::ArtifactReady } else { ProviderTaskState::RemoteReady }),
-            format!("slot {index} poll: {observed:?}"),
-        )?;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .map_err(debug_error)??;
+    require(
+        matches!(observed,ProviderPollRun::Observed(ref task) if task.state == if case.is_image() { ProviderTaskState::ArtifactReady } else { ProviderTaskState::RemoteReady }),
+        format!("workflow poll: {observed:?}"),
+    )?;
+    for _ in 0..case.count() {
         let terminal = reductions
             .claim_terminal("workflow-reducer", 30_000)
             .await
@@ -600,10 +619,15 @@ esac
             data.len() == case.count(),
             format!("wrong output count: {created}"),
         )?;
-        for item in data {
+        for (index, item) in data.iter().enumerate() {
+            let expected = if matches!(case, Case::ImageBatch) && index == 1 {
+                &last_png
+            } else {
+                &first_png
+            };
             require(
-                item["b64_json"] == STANDARD.encode(&first_png),
-                "image output bytes changed",
+                item["b64_json"] == STANDARD.encode(expected),
+                format!("image output {index} bytes or order changed"),
             )?;
         }
     } else {
@@ -690,20 +714,36 @@ esac
     )?;
     let calls = fs::read_to_string(home.join("submit-calls")).map_err(debug_error)?;
     require(
-        calls.lines().count() == case.count(),
-        "replay or fanout submitted the wrong number of CLI operations",
+        calls.lines().count() == 1,
+        "workflow or replay submitted more than one CLI operation",
+    )?;
+    let polls = fs::read_to_string(home.join("poll-calls")).map_err(debug_error)?;
+    require(
+        polls.lines().count() == 1,
+        "workflow downloaded more than once",
     )?;
     let args = fs::read_to_string(home.join("submit-arguments")).map_err(debug_error)?;
     require(
-        args.matches("--poll=0\n").count() == case.count(),
+        args.matches("--poll=0\n").count() == 1,
         "poll ownership was not enforced",
     )?;
     if matches!(case, Case::ImageBatch) {
         require(
-            args.matches("--generate_num\n1\n").count() == 3,
-            "image fanout was not single-output CLI calls",
+            args.matches("--generate_num\n2\n").count() == 1,
+            "native image batch did not submit both outputs together",
         )?;
     }
+    let remote: (i64, i64, i64) = sqlx::query_as(
+        "SELECT (SELECT COUNT(*) FROM provider_remote_tasks task JOIN provider_submissions submission USING (submission_id) WHERE submission.job_id = $1), (SELECT COUNT(DISTINCT task.remote_operation_id) FROM provider_remote_tasks task JOIN provider_submissions submission USING (submission_id) WHERE submission.job_id = $1), (SELECT COUNT(*) FROM provider_remote_submit_intents intent JOIN provider_submissions submission USING (submission_id) WHERE submission.job_id = $1)",
+    )
+    .bind(job_id)
+    .fetch_one(pool)
+    .await
+    .map_err(debug_error)?;
+    require(
+        remote == (1, 1, 1),
+        format!("workflow did not retain one real remote task and submit intent: {remote:?}"),
+    )?;
     if matches!(case, Case::Upscale) {
         require(
             args.contains("--resolution_type\n8k\n"),
@@ -805,6 +845,19 @@ async fn assert_workflow_billing(pool: &PgPool, job: Uuid, tenant: &str, case: C
         charges == 1,
         format!("expected one parent charge, found {charges}"),
     )?;
+    if matches!(case, Case::ImageBatch) {
+        let outputs: (i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT (SELECT COUNT(*) FROM provider_receipts receipt JOIN provider_submissions submission USING (submission_id) WHERE submission.job_id = $1), (SELECT COALESCE(SUM(quantity), 0)::BIGINT FROM provider_usage_facts WHERE job_id = $1 AND metric = 'image_output' AND terminal_outcome = 'succeeded'), (SELECT COUNT(DISTINCT sha256_hex) FROM artifacts WHERE job_id = $1), (SELECT COUNT(*) FROM customer_rated_usage_lines line JOIN customer_rated_usage rating USING (rated_usage_id) WHERE rating.job_id = $1)",
+        )
+        .bind(job)
+        .fetch_one(pool)
+        .await
+        .map_err(debug_error)?;
+        require(
+            outputs == (2, 2, 2, 2),
+            format!("native batch did not independently settle two distinct images: {outputs:?}"),
+        )?;
+    }
     if matches!(case, Case::Multiframe) {
         let facts: Vec<(String, String, i64)> =
             sqlx::query_as("SELECT metric,unit,quantity FROM provider_usage_facts WHERE job_id=$1")

@@ -13,6 +13,28 @@ use crate::{
 
 pub const DREAMINA_SUBMIT_COMMAND_SCHEMA: &str = "dreamina-cli.submit.v1";
 pub const MAX_SUBMIT_COMMAND_BYTES: usize = 1024 * 1024;
+pub const NATIVE_IMAGE_BATCH_SCHEMA_VERSION: u16 = 2;
+
+/// An explicit native batch parsed from a version 2 canonical command.
+/// Version 1 image commands retain their historical per-output execution path.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DreaminaNativeImageBatchV2 {
+    request: DreaminaSubmitRequestV1,
+}
+
+impl DreaminaNativeImageBatchV2 {
+    pub fn request(&self) -> &DreaminaSubmitRequestV1 {
+        &self.request
+    }
+
+    pub(crate) fn argv(&self) -> Vec<std::ffi::OsString> {
+        match &self.request {
+            DreaminaSubmitRequestV1::TextToImage(request) => request.to_argv(),
+            DreaminaSubmitRequestV1::ImageToImage(request) => request.to_argv(),
+            _ => unreachable!("native image batch parsing only permits image generation"),
+        }
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DreaminaSubmitPayloadV1 {
@@ -39,6 +61,20 @@ impl DreaminaSubmitPayloadV1 {
     pub fn request(&self) -> &DreaminaSubmitRequestV1 {
         &self.request
     }
+
+    pub fn new_native_image_batch(
+        source_command_sha256: impl Into<String>,
+        batch: DreaminaNativeImageBatchV2,
+    ) -> Result<Self, DreaminaSubmitCommandError> {
+        let source_command_sha256 = source_command_sha256.into();
+        if !valid_sha256(&source_command_sha256) {
+            return Err(DreaminaSubmitCommandError::InvalidSourceCommand);
+        }
+        Ok(Self {
+            source_command_sha256,
+            request: batch.request,
+        })
+    }
 }
 
 impl CanonicalCommandPayload for DreaminaSubmitPayloadV1 {
@@ -58,12 +94,33 @@ impl CanonicalCommandPayload for DreaminaSubmitPayloadV1 {
 pub fn parse_submit_command(
     input: &[u8],
 ) -> Result<DreaminaSubmitRequestV1, DreaminaSubmitCommandError> {
+    parse_canonical_command(input)?.try_into()
+}
+
+pub fn is_native_image_batch_command(input: &[u8]) -> Result<bool, DreaminaSubmitCommandError> {
+    let canonical = parse_canonical_command(input)?;
+    let native_batch = canonical.schema_version() == NATIVE_IMAGE_BATCH_SCHEMA_VERSION;
+    DreaminaSubmitRequestV1::try_from(canonical)?;
+    Ok(native_batch)
+}
+
+pub fn parse_native_image_batch_command(
+    input: &[u8],
+) -> Result<DreaminaNativeImageBatchV2, DreaminaSubmitCommandError> {
+    let canonical = parse_canonical_command(input)?;
+    if canonical.schema_version() != NATIVE_IMAGE_BATCH_SCHEMA_VERSION {
+        return Err(DreaminaSubmitCommandError::NativeImageBatchRequired);
+    }
+    Ok(DreaminaNativeImageBatchV2 {
+        request: canonical.try_into()?,
+    })
+}
+
+fn parse_canonical_command(input: &[u8]) -> Result<CanonicalSubmitV1, DreaminaSubmitCommandError> {
     if input.is_empty() || input.len() > MAX_SUBMIT_COMMAND_BYTES {
         return Err(DreaminaSubmitCommandError::InvalidCanonicalCommand);
     }
-    let canonical: CanonicalSubmitV1 = serde_json::from_slice(input)
-        .map_err(|_| DreaminaSubmitCommandError::InvalidCanonicalCommand)?;
-    canonical.try_into()
+    serde_json::from_slice(input).map_err(|_| DreaminaSubmitCommandError::InvalidCanonicalCommand)
 }
 
 pub fn encode_submit_command(request: DreaminaSubmitRequestV1) -> Vec<u8> {
@@ -87,6 +144,8 @@ pub enum DreaminaSubmitCommandError {
     InvalidRequest(#[from] RequestValidationError),
     #[error("Dreamina execution supports exactly one output per provider submission")]
     BatchSubmissionUnsupported,
+    #[error("Dreamina native batch requires a version 2 image command with 2-10 outputs")]
+    NativeImageBatchRequired,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -188,6 +247,21 @@ enum CanonicalSubmitV1 {
     },
 }
 
+impl CanonicalSubmitV1 {
+    fn schema_version(&self) -> u16 {
+        match self {
+            Self::TextToImage { schema_version, .. }
+            | Self::TextToVideo { schema_version, .. }
+            | Self::ImageToImage { schema_version, .. }
+            | Self::ImageUpscale { schema_version, .. }
+            | Self::ImageToVideo { schema_version, .. }
+            | Self::FramesToVideo { schema_version, .. }
+            | Self::MultiframeToVideo { schema_version, .. }
+            | Self::MultimodalToVideo { schema_version, .. } => *schema_version,
+        }
+    }
+}
+
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct CanonicalImageV1 {
@@ -245,7 +319,7 @@ impl From<DreaminaSubmitRequestV1> for CanonicalSubmitV1 {
     fn from(request: DreaminaSubmitRequestV1) -> Self {
         match request {
             DreaminaSubmitRequestV1::TextToImage(request) => Self::TextToImage {
-                schema_version: crate::REQUEST_SCHEMA_VERSION,
+                schema_version: image_schema_version(request.generate_num()),
                 prompt: request.prompt().to_owned(),
                 model_version: request.model().as_str().to_owned(),
                 ratio: request.ratio().map(|ratio| ratio.as_str().to_owned()),
@@ -265,7 +339,7 @@ impl From<DreaminaSubmitRequestV1> for CanonicalSubmitV1 {
                 poll: 0,
             },
             DreaminaSubmitRequestV1::ImageToImage(request) => Self::ImageToImage {
-                schema_version: crate::REQUEST_SCHEMA_VERSION,
+                schema_version: image_schema_version(request.generate_num()),
                 images: request.images().iter().map(Into::into).collect(),
                 prompt: request.parameters().prompt().to_owned(),
                 model_version: request.parameters().model().as_str().to_owned(),
@@ -349,7 +423,7 @@ impl TryFrom<CanonicalSubmitV1> for DreaminaSubmitRequestV1 {
                 generate_num,
                 poll,
             } => {
-                validate_envelope(schema_version, poll)?;
+                validate_image_envelope(schema_version, poll, generate_num)?;
                 let model = parse_image_model(&model_version)?;
                 let resolution = parse_image_resolution(&resolution_type)?;
                 match (ratio, width, height) {
@@ -405,7 +479,7 @@ impl TryFrom<CanonicalSubmitV1> for DreaminaSubmitRequestV1 {
                 generate_num,
                 poll,
             } => {
-                validate_envelope(schema_version, poll)?;
+                validate_image_envelope(schema_version, poll, generate_num)?;
                 let model = parse_image_model(&model_version)?;
                 let resolution = parse_image_resolution(&resolution_type)?;
                 let parameters = match (ratio, width, height) {
@@ -570,6 +644,32 @@ fn validate_envelope(schema_version: u16, poll: u8) -> Result<(), DreaminaSubmit
         return Err(DreaminaSubmitCommandError::PollingMustBeDisabled);
     }
     Ok(())
+}
+
+fn image_schema_version(generate_num: u8) -> u16 {
+    if generate_num > 1 {
+        NATIVE_IMAGE_BATCH_SCHEMA_VERSION
+    } else {
+        crate::REQUEST_SCHEMA_VERSION
+    }
+}
+
+fn validate_image_envelope(
+    schema_version: u16,
+    poll: u8,
+    generate_num: u8,
+) -> Result<(), DreaminaSubmitCommandError> {
+    if schema_version == NATIVE_IMAGE_BATCH_SCHEMA_VERSION {
+        if !(2..=10).contains(&generate_num) {
+            return Err(DreaminaSubmitCommandError::NativeImageBatchRequired);
+        }
+        if poll != 0 {
+            return Err(DreaminaSubmitCommandError::PollingMustBeDisabled);
+        }
+        Ok(())
+    } else {
+        validate_envelope(schema_version, poll)
+    }
 }
 
 fn parse_image_model(value: &str) -> Result<ImageModelVersion, DreaminaSubmitCommandError> {

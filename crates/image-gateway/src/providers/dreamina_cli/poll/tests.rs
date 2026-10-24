@@ -468,6 +468,171 @@ fn media_detection_accepts_supported_image_and_video_signatures() {
     assert_eq!(artifact_media_type(b"not-media"), None);
 }
 
+#[derive(Default)]
+struct BatchTestSink {
+    outputs: Vec<Vec<u8>>,
+    finalized: usize,
+    mutate_directory_from: Option<PathBuf>,
+}
+
+impl ProviderNativeBatchArtifactSink for BatchTestSink {
+    fn select_output(&mut self, index: usize) -> Result<(), ArtifactSinkError> {
+        assert_eq!(index, self.finalized);
+        self.outputs.push(Vec::new());
+        Ok(())
+    }
+}
+
+impl ArtifactSink for BatchTestSink {
+    async fn write_chunk(&mut self, bytes: &[u8]) -> Result<(), ArtifactSinkError> {
+        self.outputs.last_mut().unwrap().extend_from_slice(bytes);
+        if let Some(marker) = self.mutate_directory_from.take() {
+            let directory = fs::read_to_string(marker).unwrap();
+            fs::remove_file(Path::new(&directory).join("01.png")).unwrap();
+            fs::write(Path::new(&directory).join("01.png"), b"replacement").unwrap();
+        }
+        Ok(())
+    }
+
+    async fn finalize(
+        &mut self,
+        metadata: ArtifactMetadata<'_>,
+    ) -> Result<image_provider_sdk::DurableArtifactManifest, ArtifactSinkError> {
+        let bytes = self.outputs.last().unwrap();
+        let manifest = image_provider_sdk::DurableArtifactManifest::new(
+            DurableArtifactRef::new("test-batch", self.finalized.to_string()).unwrap(),
+            metadata.media_type,
+            bytes.len() as u64,
+            Sha256::digest(bytes).into(),
+        )
+        .unwrap();
+        self.finalized += 1;
+        Ok(manifest)
+    }
+}
+
+#[tokio::test]
+async fn native_batch_queries_once_and_streams_two_or_ten_images_in_filename_order() {
+    for count in [2, 10] {
+        let fixture = Fixture::new(&format!(
+            r#"printf x >> "$HOME/query-count"
+i={count}
+while [ "$i" -gt 0 ]; do
+  i=$((i - 1))
+  name=$(/usr/bin/printf '%02d' "$i")
+  /bin/cp "$HOME/source-$name.png" "$download/$name.png"
+done
+printf '{{"submit_id":"%s","gen_status":"success"}}' "$submit""#
+        ));
+        let expected = (0..count)
+            .map(|index| png_bytes([index as u8, 20, 30, 255]))
+            .collect::<Vec<_>>();
+        for (index, bytes) in expected.iter().enumerate() {
+            fs::write(
+                fixture.account_home.join(format!("source-{index:02}.png")),
+                bytes,
+            )
+            .unwrap();
+        }
+        let mut sink = BatchTestSink::default();
+        let observation = fixture
+            .driver(1024 * 1024)
+            .poll_native_batch_operation(&fixture.operation(), count, &mut sink)
+            .await
+            .unwrap();
+        assert!(
+            matches!(observation, ProviderNativeBatchPollObservation::Completed { output_count } if output_count == count)
+        );
+        assert_eq!(sink.outputs, expected);
+        assert_eq!(sink.finalized, count);
+        assert_eq!(
+            fs::read(fixture.account_home.join("query-count")).unwrap(),
+            b"x"
+        );
+        fixture.assert_workspace_has_no_attempts();
+    }
+}
+
+#[tokio::test]
+async fn native_batch_exposes_partial_results_but_rejects_excess_and_unsafe_files_before_staging() {
+    for (count, expected_outputs) in [(1, Some(1)), (0, Some(0)), (3, None)] {
+        let fixture = Fixture::new(&format!(
+            r#"i=0
+while [ "$i" -lt {count} ]; do
+  /bin/cp "$HOME/source.png" "$download/$i.png"
+  i=$((i + 1))
+done
+printf '{{"submit_id":"%s","gen_status":"success"}}' "$submit""#
+        ));
+        fs::write(
+            fixture.account_home.join("source.png"),
+            png_bytes([1, 2, 3, 255]),
+        )
+        .unwrap();
+        let mut sink = BatchTestSink::default();
+        let result = fixture
+            .driver(1024 * 1024)
+            .poll_native_batch_operation(&fixture.operation(), 2, &mut sink)
+            .await;
+        match expected_outputs {
+            Some(0) => assert!(matches!(
+                result.unwrap(),
+                ProviderNativeBatchPollObservation::Failed(_)
+            )),
+            Some(count) => assert!(
+                matches!(result.unwrap(), ProviderNativeBatchPollObservation::Completed { output_count } if output_count == count)
+            ),
+            None => assert!(result.is_err()),
+        }
+        assert_eq!(sink.finalized, expected_outputs.unwrap_or_default());
+    }
+    let fixture = Fixture::new(
+        r#"/bin/cp "$HOME/source.png" "$download/00.png"
+/bin/ln -s "$HOME/source.png" "$download/01.png"
+printf '{"submit_id":"%s","gen_status":"success"}' "$submit""#,
+    );
+    fs::write(
+        fixture.account_home.join("source.png"),
+        png_bytes([1, 2, 3, 255]),
+    )
+    .unwrap();
+    let mut sink = BatchTestSink::default();
+    assert!(
+        fixture
+            .driver(1024 * 1024)
+            .poll_native_batch_operation(&fixture.operation(), 2, &mut sink)
+            .await
+            .is_err()
+    );
+    assert!(sink.outputs.is_empty());
+}
+
+#[tokio::test]
+async fn native_batch_rejects_replaced_sibling_before_finalizing_any_image() {
+    let fixture = Fixture::new(
+        r#"/bin/cp "$HOME/source.png" "$download/00.png"
+/bin/cp "$HOME/source.png" "$download/01.png"
+printf '%s' "$download" > "$HOME/download-path"
+printf '{"submit_id":"%s","gen_status":"success"}' "$submit""#,
+    );
+    fs::write(
+        fixture.account_home.join("source.png"),
+        png_bytes([1, 2, 3, 255]),
+    )
+    .unwrap();
+    let mut sink = BatchTestSink {
+        mutate_directory_from: Some(fixture.account_home.join("download-path")),
+        ..Default::default()
+    };
+    let failure = fixture
+        .driver(1024 * 1024)
+        .poll_native_batch_operation(&fixture.operation(), 2, &mut sink)
+        .await
+        .unwrap_err();
+    assert_eq!(failure.code(), "dreamina_poll_artifact_invalid");
+    assert_eq!(sink.finalized, 0);
+}
+
 #[test]
 fn poll_binding_accepts_only_explicitly_supported_models_for_the_operation() {
     for model in [

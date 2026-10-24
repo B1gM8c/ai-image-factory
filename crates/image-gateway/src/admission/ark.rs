@@ -72,6 +72,10 @@ impl ArkImageAdmissionPlan {
         self.inner.provider_command_hash()
     }
 
+    pub fn request_identity_hash(&self) -> &str {
+        self.inner.request_identity_hash()
+    }
+
     pub fn pricing_dimensions(&self) -> &BTreeMap<String, String> {
         self.inner.pricing_dimensions()
     }

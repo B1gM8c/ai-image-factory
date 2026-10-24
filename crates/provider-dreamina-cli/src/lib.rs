@@ -14,8 +14,10 @@ pub use capabilities::{
     DREAMINA_VIDEO_GENERATION_OPERATION_V1,
 };
 pub use command::{
-    DREAMINA_SUBMIT_COMMAND_SCHEMA, DreaminaSubmitCommandError, DreaminaSubmitPayloadV1,
-    MAX_SUBMIT_COMMAND_BYTES, encode_submit_command, parse_submit_command,
+    DREAMINA_SUBMIT_COMMAND_SCHEMA, DreaminaNativeImageBatchV2, DreaminaSubmitCommandError,
+    DreaminaSubmitPayloadV1, MAX_SUBMIT_COMMAND_BYTES, NATIVE_IMAGE_BATCH_SCHEMA_VERSION,
+    encode_submit_command, is_native_image_batch_command, parse_native_image_batch_command,
+    parse_submit_command,
 };
 pub use policy::{DreaminaCliPolicyError, DreaminaCliPolicyV1, DreaminaSubmitRequestV1};
 pub use policy::{DreaminaCliQueryPolicyError, DreaminaCliQueryPolicyV1};
@@ -42,6 +44,8 @@ pub const PROVIDER_ID: &str = "dreamina-cli";
 pub const ADAPTER_REVISION: &str = "dreamina-cli.remote-task.v1";
 pub const REQUEST_SCHEMA_VERSION: u16 = 1;
 
+#[cfg(test)]
+mod native_batch_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]

@@ -14,8 +14,8 @@ pub use command::{
     CommandSpec, CommandSpecError, MAX_STDIN_BYTES, VerifiedExecutable, WorkingDirectory,
 };
 pub use output::{
-    AsyncOutputSealError, AsyncOutputSink, FreshOutputDirectory, OutputContract, OutputError,
-    STREAM_BUFFER_BYTES, SealedOutput,
+    AsyncOutputSealError, AsyncOutputSink, FreshOutputDirectory, MAX_BATCH_OUTPUT_FILES,
+    OutputContract, OutputError, STREAM_BUFFER_BYTES, SealedOutput, VerifiedFreshOutputFile,
 };
 pub use process::{
     CapturedStream, MAX_CAPTURED_STREAM_BYTES, NoopSpawnObserver, ProcessBackend,
@@ -295,3 +295,6 @@ pub fn default_exit_classification(status: &ExitStatus) -> ExitClassification {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod output_batch_tests;

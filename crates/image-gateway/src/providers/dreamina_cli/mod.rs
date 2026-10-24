@@ -10,7 +10,8 @@ use image_provider_contracts::OperationDescriptor;
 use image_provider_dreamina_cli::{
     ADAPTER_REVISION, DREAMINA_IMAGE_GENERATION_OPERATION_V1, DREAMINA_SUBMIT_COMMAND_SCHEMA,
     DREAMINA_VIDEO_GENERATION_OPERATION_V1, DreaminaCliPolicyV1, DreaminaSubmitPayloadV1,
-    DreaminaSubmitRequestV1, PROVIDER_ID, ReceiptError, StagedInputKindV1, parse_receipt,
+    DreaminaSubmitRequestV1, PROVIDER_ID, ReceiptError, StagedInputKindV1,
+    is_native_image_batch_command, parse_native_image_batch_command, parse_receipt,
     parse_submit_command,
 };
 use image_provider_sdk::{
@@ -245,6 +246,22 @@ impl GatedCliSubmitCodec for DreaminaCliSubmitCodecV1 {
         if !request_matches_context(&request, context) {
             return Err(no_effect_failure("dreamina_submit_context_mismatch"));
         }
+        if is_native_image_batch_command(command.canonical_payload())
+            .map_err(|_| no_effect_failure("dreamina_submit_command_invalid"))?
+        {
+            if command.output().index() != 0
+                || command.output().total() != u32::from(request.output_count())
+            {
+                return Err(no_effect_failure("dreamina_submit_binding_mismatch"));
+            }
+            let batch = parse_native_image_batch_command(command.canonical_payload())
+                .map_err(|_| no_effect_failure("dreamina_submit_command_invalid"))?;
+            let spec = self
+                .policy
+                .command_spec_native_image_batch_in(&batch, workspace.clone())
+                .map_err(|_| no_effect_failure("dreamina_submit_command_invalid"))?;
+            return command_to_gated(&spec, self.policy.executable_sha256());
+        }
         self.project_request(&request, workspace)
     }
 
@@ -344,8 +361,19 @@ fn project_submit_command(
     }
     let output = OutputSlot::new(output_index, output_total)
         .map_err(|_| ProviderSubmitProjectionError::OutputOutOfRange)?;
-    let payload = DreaminaSubmitPayloadV1::new(source_command_sha256, request.into_single_output())
-        .map_err(|_| ProviderSubmitProjectionError::InvalidSourceCommand)?;
+    let payload = if is_native_image_batch_command(&source_bytes)
+        .map_err(|_| ProviderSubmitProjectionError::InvalidSourceCommand)?
+    {
+        if output_index != 0 {
+            return Err(ProviderSubmitProjectionError::OutputOutOfRange);
+        }
+        let batch = parse_native_image_batch_command(&source_bytes)
+            .map_err(|_| ProviderSubmitProjectionError::InvalidSourceCommand)?;
+        DreaminaSubmitPayloadV1::new_native_image_batch(source_command_sha256, batch)
+    } else {
+        DreaminaSubmitPayloadV1::new(source_command_sha256, request.into_single_output())
+    }
+    .map_err(|_| ProviderSubmitProjectionError::InvalidSourceCommand)?;
     SingleOutputCommand::new(output, payload)
         .map_err(|_| ProviderSubmitProjectionError::InvalidSourceCommand)
 }
@@ -635,6 +663,66 @@ mod tests {
             project_submit_command(&source, &"a".repeat(64), 1, Some(1)),
             Err(ProviderSubmitProjectionError::OutputOutOfRange)
         );
+    }
+
+    #[test]
+    fn native_batch_projection_keeps_full_count_and_only_allows_leader() {
+        for count in [2, 10] {
+            let source = serde_json::json!({
+                "operation": "text2image",
+                "schema_version": 2,
+                "prompt": "a red fox",
+                "model_version": "5.0",
+                "ratio": "1:1",
+                "resolution_type": "2k",
+                "generate_num": count,
+                "poll": 0
+            });
+            let command = project_submit_command(&source, &"a".repeat(64), 0, Some(count)).unwrap();
+            assert_eq!(command.output(), OutputSlot::new(0, count as u32).unwrap());
+            assert!(is_native_image_batch_command(command.canonical_payload()).unwrap());
+            assert_eq!(
+                parse_submit_command(command.canonical_payload())
+                    .unwrap()
+                    .output_count(),
+                count as u8
+            );
+            // Recovery reconstructs exactly the same paid command identity.
+            let recovered =
+                project_submit_command(&source, &"a".repeat(64), 0, Some(count)).unwrap();
+            assert_eq!(command, recovered);
+            for follower in 1..count {
+                assert_eq!(
+                    project_submit_command(&source, &"a".repeat(64), follower, Some(count)),
+                    Err(ProviderSubmitProjectionError::OutputOutOfRange)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn historical_v1_batch_keeps_independent_single_output_projection() {
+        let source = serde_json::json!({
+            "operation": "text2image",
+            "schema_version": 1,
+            "prompt": "a red fox",
+            "model_version": "5.0",
+            "ratio": "1:1",
+            "resolution_type": "2k",
+            "generate_num": 2,
+            "poll": 0
+        });
+        for index in 0..2 {
+            let command = project_submit_command(&source, &"a".repeat(64), index, Some(2)).unwrap();
+            assert_eq!(command.output(), OutputSlot::new(index as u32, 2).unwrap());
+            assert!(!is_native_image_batch_command(command.canonical_payload()).unwrap());
+            assert_eq!(
+                parse_submit_command(command.canonical_payload())
+                    .unwrap()
+                    .output_count(),
+                1
+            );
+        }
     }
 
     #[test]

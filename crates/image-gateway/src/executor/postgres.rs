@@ -668,6 +668,8 @@ impl ExecutorSubmissionStore for PostgresExecutorSubmissionStore {
             WHERE (e.state = 'prepared'
                OR (e.state = 'leased' AND e.lease_expires_at_ms <= $1))
               AND s.state = 'prepared'
+              AND NOT EXISTS (SELECT 1 FROM dreamina_native_batch_members member
+                  WHERE member.submission_id = s.submission_id AND member.output_index > 0)
               AND w.state = 'awaiting_executor'
               AND w.lease_owner IS NULL AND w.lease_expires_at_ms IS NULL
               AND w.execution_profile_id = s.execution_profile_id
@@ -1642,6 +1644,32 @@ async fn prepare_admission_outputs(
         };
         insert_attachment(tx, lease, submission_id, now).await?;
         prepared.push(submission);
+    }
+    if command.provider_id == image_provider_dreamina_cli::PROVIDER_ID
+        && command.command_schema == image_provider_dreamina_cli::DREAMINA_SUBMIT_COMMAND_SCHEMA
+        && command
+            .command_json
+            .get("schema_version")
+            .and_then(Value::as_u64)
+            == Some(2)
+    {
+        let bytes = serde_json::to_vec(&command.command_json)
+            .map_err(|_| ExecutorSubmissionError::InvalidInput)?;
+        if !image_provider_dreamina_cli::is_native_image_batch_command(&bytes)
+            .map_err(|_| ExecutorSubmissionError::InvalidInput)?
+            || output_count < 2
+        {
+            return Err(ExecutorSubmissionError::InvalidInput);
+        }
+        let leader = prepared.first().ok_or(ExecutorSubmissionError::Conflict)?;
+        sqlx::query("INSERT INTO dreamina_native_batches (leader_submission_id, job_id, output_count, command_hash, created_at_ms) VALUES ($1, $2, $3, $4, $5)")
+            .bind(leader.submission_id).bind(lease.job_id).bind(output_count).bind(command_hash).bind(now)
+            .execute(&mut **tx).await.map_err(unavailable)?;
+        for member in &prepared {
+            sqlx::query("INSERT INTO dreamina_native_batch_members (submission_id, executor_execution_id, leader_submission_id, output_index) VALUES ($1, $2, $3, $4)")
+                .bind(member.submission_id).bind(member.executor_execution_id).bind(leader.submission_id).bind(member.output_index)
+                .execute(&mut **tx).await.map_err(unavailable)?;
+        }
     }
     Ok(prepared)
 }
