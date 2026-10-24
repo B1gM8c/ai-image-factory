@@ -78,7 +78,7 @@ where
             .await
             .map_err(ConformanceError::Provider)?
         {
-            PollObservation::Pending { .. } => {}
+            PollObservation::Pending { .. } | PollObservation::PendingWithProgress { .. } => {}
             PollObservation::Completed(completed) => return Ok(completed),
             PollObservation::CompletedRemoteVideo(_) => {
                 return Err(ConformanceError::UnexpectedRemoteVideoDelivery);

@@ -297,6 +297,7 @@ async fn partial_result_metadata_survives_store_restart_and_rejects_changed_mapp
             .record_observation(
                 &lease,
                 &ProviderTaskObservation {
+                    progress: None,
                     event_identity: "offline-provider-failed".into(),
                     source: ProviderTaskObservationSource::Poll,
                     outcome: ProviderTaskObservationOutcome::Failed {
@@ -523,6 +524,7 @@ async fn native_batch_success_requires_every_member_result_and_membership_is_imm
             .await
             .map_err(debug_error)?;
         let terminal = ProviderTaskObservation {
+            progress: None,
             event_identity: "offline-leader-success".into(),
             source: ProviderTaskObservationSource::Poll,
             outcome: ProviderTaskObservationOutcome::ArtifactReady {

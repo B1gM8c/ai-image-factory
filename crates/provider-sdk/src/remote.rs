@@ -274,8 +274,68 @@ impl CanceledEvidence {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderTaskProgress {
+    pub provider_status: String,
+    pub queue_position: Option<u64>,
+    pub queue_total: Option<u64>,
+    pub estimated_remaining_seconds: Option<u64>,
+}
+
+impl ProviderTaskProgress {
+    pub fn validate(&self) -> Result<(), ProviderTaskProgressError> {
+        if self.provider_status.is_empty()
+            || self.provider_status.len() > 64
+            || !self
+                .provider_status
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        {
+            return Err(ProviderTaskProgressError::InvalidStatus);
+        }
+        if self
+            .queue_position
+            .is_some_and(|value| value > u32::MAX as u64)
+            || self
+                .queue_total
+                .is_some_and(|value| value > u32::MAX as u64)
+            || matches!((self.queue_position, self.queue_total), (Some(position), Some(total)) if position > total)
+        {
+            return Err(ProviderTaskProgressError::InvalidQueue);
+        }
+        if self
+            .estimated_remaining_seconds
+            .is_some_and(|value| value > 30 * 24 * 60 * 60)
+        {
+            return Err(ProviderTaskProgressError::InvalidEstimate);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProviderTaskProgressError {
+    InvalidStatus,
+    InvalidQueue,
+    InvalidEstimate,
+}
+
+impl fmt::Display for ProviderTaskProgressError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("provider task progress is invalid")
+    }
+}
+
+impl Error for ProviderTaskProgressError {}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PollObservation {
-    Pending { next_poll_after_ms: Option<u64> },
+    Pending {
+        next_poll_after_ms: Option<u64>,
+    },
+    PendingWithProgress {
+        next_poll_after_ms: Option<u64>,
+        progress: ProviderTaskProgress,
+    },
     Completed(Completed),
     CompletedRemoteVideo(CompletedRemoteVideo),
     Failed(ProviderFailure),
@@ -396,6 +456,80 @@ mod tests {
         assert!(RemoteOperationRef::new("seedance", "submission-1", "task-1").is_ok());
         assert!(RemoteOperationRef::new("seedance", "submission-1", "https://temp").is_err());
         assert!(ProviderRequestId::new("/tmp/request").is_err());
+    }
+
+    #[test]
+    fn progress_preserves_provider_numbers_and_optional_unknowns() {
+        let progress = ProviderTaskProgress {
+            provider_status: "Queueing".to_owned(),
+            queue_position: Some(3341),
+            queue_total: Some(476_961),
+            estimated_remaining_seconds: Some(27_131),
+        };
+        assert!(progress.validate().is_ok());
+        assert!(
+            ProviderTaskProgress {
+                queue_position: Some(0),
+                estimated_remaining_seconds: None,
+                ..progress.clone()
+            }
+            .validate()
+            .is_ok()
+        );
+        assert!(
+            ProviderTaskProgress {
+                queue_position: None,
+                queue_total: None,
+                estimated_remaining_seconds: None,
+                ..progress
+            }
+            .validate()
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn progress_rejects_unbounded_or_inconsistent_metadata() {
+        let progress = ProviderTaskProgress {
+            provider_status: "Queueing".to_owned(),
+            queue_position: Some(3),
+            queue_total: Some(10),
+            estimated_remaining_seconds: Some(60),
+        };
+        for provider_status in ["", "Queueing\n", "https://example.test", &"a".repeat(65)] {
+            assert_eq!(
+                ProviderTaskProgress {
+                    provider_status: provider_status.to_owned(),
+                    ..progress.clone()
+                }
+                .validate(),
+                Err(ProviderTaskProgressError::InvalidStatus)
+            );
+        }
+        assert_eq!(
+            ProviderTaskProgress {
+                queue_position: Some(11),
+                ..progress.clone()
+            }
+            .validate(),
+            Err(ProviderTaskProgressError::InvalidQueue)
+        );
+        assert_eq!(
+            ProviderTaskProgress {
+                queue_total: Some(u64::MAX),
+                ..progress.clone()
+            }
+            .validate(),
+            Err(ProviderTaskProgressError::InvalidQueue)
+        );
+        assert_eq!(
+            ProviderTaskProgress {
+                estimated_remaining_seconds: Some(u64::MAX),
+                ..progress
+            }
+            .validate(),
+            Err(ProviderTaskProgressError::InvalidEstimate)
+        );
     }
 }
 

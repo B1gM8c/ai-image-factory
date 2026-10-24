@@ -77,6 +77,12 @@ type TestResult<T = ()> = Result<T, String>;
 #[path = "postgres_executor/dreamina_compliance_resolution.rs"]
 mod dreamina_compliance_resolution;
 
+#[path = "postgres_executor/queue_progress_projection.rs"]
+mod queue_progress_projection;
+
+#[path = "postgres_executor/accepted_completion_budget.rs"]
+mod accepted_completion_budget;
+
 const TEST_PROFILE_ID: Uuid = Uuid::from_u128(0x100);
 const CODEX_PROFILE_ID: Uuid = Uuid::from_u128(0x200);
 const CODEX_EDIT_PROFILE_ID: Uuid = Uuid::from_u128(0xe00);

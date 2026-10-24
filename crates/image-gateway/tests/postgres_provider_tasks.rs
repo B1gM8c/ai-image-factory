@@ -3384,6 +3384,7 @@ async fn remote_task_store_closes_attach_poll_callback_and_cancel_invariants() -
             .await
             .map_err(debug_error)?;
         let uncertain = ProviderTaskObservation {
+            progress: None,
             event_identity: "cancel-unknown-a".to_string(),
             source: ProviderTaskObservationSource::Cancel,
             outcome: ProviderTaskObservationOutcome::Uncertain {
@@ -3531,6 +3532,7 @@ async fn remote_task_store_closes_attach_poll_callback_and_cancel_invariants() -
                 .record_observation(
                     &stale_lease,
                     &ProviderTaskObservation {
+                        progress: None,
                         event_identity: "expired-while-locked-b".to_string(),
                         source: ProviderTaskObservationSource::Poll,
                         outcome: ProviderTaskObservationOutcome::Waiting { poll_after_ms: 0 },
@@ -3623,6 +3625,7 @@ async fn remote_task_store_closes_attach_poll_callback_and_cancel_invariants() -
             .record_observation(
                 &second_lease,
                 &ProviderTaskObservation {
+                    progress: None,
                     event_identity: "stale-poll-b".to_string(),
                     source: ProviderTaskObservationSource::Poll,
                     outcome: ProviderTaskObservationOutcome::Waiting { poll_after_ms: 0 },
@@ -3631,6 +3634,7 @@ async fn remote_task_store_closes_attach_poll_callback_and_cancel_invariants() -
             .await;
         require(stale_result.is_err(), "stale poll fence wrote an observation")?;
         let waiting = ProviderTaskObservation {
+            progress: None,
             event_identity: "waiting-replay-b".to_string(),
             source: ProviderTaskObservationSource::Poll,
             outcome: ProviderTaskObservationOutcome::Waiting { poll_after_ms: 0 },
@@ -3668,6 +3672,7 @@ async fn remote_task_store_closes_attach_poll_callback_and_cancel_invariants() -
             .record_observation(
                 &reclaimed,
                 &ProviderTaskObservation {
+                    progress: None,
                     event_identity: "forged-cancel-b".to_string(),
                     source: ProviderTaskObservationSource::Cancel,
                     outcome: ProviderTaskObservationOutcome::Canceled {
@@ -3754,6 +3759,7 @@ async fn remote_task_store_closes_attach_poll_callback_and_cancel_invariants() -
                 .record_observation(
                     &reclaimed,
                     &ProviderTaskObservation {
+                        progress: None,
                         event_identity: "failure-after-authority-b".to_string(),
                         source: ProviderTaskObservationSource::Poll,
                         outcome: ProviderTaskObservationOutcome::Failed {
@@ -3766,6 +3772,7 @@ async fn remote_task_store_closes_attach_poll_callback_and_cancel_invariants() -
             "contradictory failure won after immutable artifact publication",
         )?;
         let artifact_ready = ProviderTaskObservation {
+            progress: None,
             event_identity: "artifact-ready-b".to_string(),
             source: ProviderTaskObservationSource::Poll,
             outcome: ProviderTaskObservationOutcome::ArtifactReady {
@@ -3932,6 +3939,7 @@ async fn provider_task_leases_reject_cross_submission_splicing() -> TestResult {
         forged.poll_owner = second.poll_owner.clone();
         forged.poll_lease_epoch = second.poll_lease_epoch;
         let observation = ProviderTaskObservation {
+            progress: None,
             event_identity: "forged-cross-submission-poll".to_string(),
             source: ProviderTaskObservationSource::Poll,
             outcome: ProviderTaskObservationOutcome::Waiting {
@@ -4225,6 +4233,7 @@ async fn remote_task_deadline_fences_late_poll_and_quarantines_capacity() -> Tes
                 .record_observation(
                     &observation_lease,
                     &ProviderTaskObservation {
+                        progress: None,
                         event_identity: "late-deadline-poll".to_string(),
                         source: ProviderTaskObservationSource::Poll,
                         outcome: ProviderTaskObservationOutcome::Waiting { poll_after_ms: 0 },
@@ -4427,6 +4436,7 @@ async fn remote_task_deadline_recovers_committed_artifact_authority() -> TestRes
                 .record_observation(
                     &lease,
                     &ProviderTaskObservation {
+                        progress: None,
                         event_identity: reserved_event.to_string(),
                         source: ProviderTaskObservationSource::Poll,
                         outcome: ProviderTaskObservationOutcome::Waiting { poll_after_ms: 0 },
@@ -4567,6 +4577,7 @@ async fn remote_task_deadline_error_code_remains_public_provider_evidence() -> T
             .record_observation(
                 &lease,
                 &ProviderTaskObservation {
+                    progress: None,
                     event_identity: "deadline-error-observation".to_string(),
                     source: ProviderTaskObservationSource::Poll,
                     outcome: ProviderTaskObservationOutcome::Uncertain {
@@ -11640,3 +11651,6 @@ fn combine(result: TestResult, cleanup: TestResult) -> TestResult {
 
 #[path = "postgres_provider_tasks/native_batch.rs"]
 mod native_batch;
+
+#[path = "postgres_provider_tasks/queue_progress.rs"]
+mod queue_progress;

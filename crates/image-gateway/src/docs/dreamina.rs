@@ -254,6 +254,34 @@ pub(super) fn patch_schemas(document: &mut Value) {
         "$ref": "#/components/schemas/DreaminaReleasedSettlement",
         "description": "Optional; omitted unless this failed Dreamina task has an audited full zero-charge hold release. Uses the same tenant, project and actor visibility as the task. Never infer release from status alone."
     });
+    schemas["DreaminaProviderProgress"] = json!({
+        "type": "object", "additionalProperties": false,
+        "required": ["provider_status", "observed_at_ms"],
+        "description": "Latest durable upstream observation. Queue position is reported verbatim, not a calculated number of people ahead. Missing values are unknown. A GET never queries the CLI or refreshes observed_at_ms. An uncertain task may retain a historical observation; terminal success or failure omits progress.",
+        "properties": {
+            "provider_status": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,64}$", "example": "Queueing"},
+            "queue_position": {"type": "integer", "minimum": 0, "maximum": 4294967295_u64, "example": 3341},
+            "queue_total": {"type": "integer", "minimum": 0, "maximum": 4294967295_u64, "example": 476961},
+            "estimated_remaining_seconds": {"type": "integer", "minimum": 0, "maximum": 2592000, "example": 27131, "description": "Provider estimate at observed_at_ms, not a guarantee or a precise countdown."},
+            "observed_at_ms": {"type": "integer", "format": "int64", "minimum": 0}
+        }
+    });
+    schemas["DreaminaCancellation"] = json!({
+        "type": "object", "additionalProperties": false,
+        "required": ["supported", "reason"],
+        "properties": {
+            "supported": {"type": "boolean", "enum": [false]},
+            "reason": {"type": "string", "enum": ["provider_cancellation_unsupported"]}
+        },
+        "description": "Official CLI 1.4.21 has no upstream cancellation command. Stopping local polling does not cancel generation, prove a refund or authorize releasing a hold. No cancellation POST is advertised."
+    });
+    let task = &mut schemas["DreaminaVideoTaskDoc"]["properties"];
+    task["stage"] = json!({
+        "type": "string", "enum": ["queued", "dispatching", "processing", "provider_queued"],
+        "description": "Optional while running. queued is Factory's local queue; provider_queued requires a Queueing upstream observation. processing is Factory tracking, not proof the provider started rendering. Unknown provider states do not establish a rendering phase."
+    });
+    task["provider_progress"] = json!({"$ref": "#/components/schemas/DreaminaProviderProgress"});
+    task["cancellation"] = json!({"$ref": "#/components/schemas/DreaminaCancellation"});
 }
 
 fn workflow(mut schema: Value, name: &str) -> Value {
@@ -271,6 +299,36 @@ fn workflow(mut schema: Value, name: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn video_progress_documents_real_observation_and_unsupported_cancellation() {
+        let axum::Json(document) = crate::docs::openapi_json();
+        let schemas = &document["components"]["schemas"];
+        let progress = &schemas["DreaminaProviderProgress"];
+        assert_eq!(
+            progress["required"],
+            json!(["provider_status", "observed_at_ms"])
+        );
+        assert!(
+            progress["description"]
+                .as_str()
+                .unwrap()
+                .contains("GET never queries")
+        );
+        let task = &schemas["DreaminaVideoTaskDoc"];
+        for name in ["stage", "provider_progress", "cancellation"] {
+            assert!(!task["required"].as_array().unwrap().contains(&json!(name)));
+        }
+        assert_eq!(
+            schemas["DreaminaCancellation"]["properties"]["supported"]["enum"],
+            json!([false])
+        );
+        assert!(
+            schemas["ArkContentGenerationTaskDoc"]["properties"]
+                .get("provider_progress")
+                .is_none()
+        );
+    }
 
     #[test]
     fn native_openapi_exposes_eight_closed_workflow_shapes() {

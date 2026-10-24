@@ -11,7 +11,8 @@ use uuid::Uuid;
 
 use super::{
     ExecutionSettlementStore, GenerationResultLookup, GenerationResultStatus, StoredVideoArtifact,
-    VideoPendingStage, VideoRequestMetadata, VideoResultStatus, validate_generation_result,
+    VideoPendingStage, VideoProviderProgress, VideoRequestMetadata, VideoResultStatus,
+    validate_generation_result,
 };
 use crate::{
     ImageGatewayError,
@@ -178,12 +179,30 @@ impl ExecutionSettlementStore for PostgresExecutionSettlementStore {
         let row: Option<VideoStatusRow> = sqlx::query_as(
             r#"
             SELECT j.state, w.state, j.last_error_code, j.model, j.billable_units,
-                   artifact.artifact_id, remote.video_url, remote.expires_at_ms, payload.command_json
+                   artifact.artifact_id, remote.video_url, remote.expires_at_ms, payload.command_json,
+                   progress_observation.progress_json, progress_observation.observed_at_ms
             FROM jobs j
             JOIN work_items w ON w.job_id = j.job_id
             LEFT JOIN job_payloads payload
               ON payload.job_id = j.job_id AND payload.command_schema = $3
              AND j.provider_id = 'dreamina-cli'
+            LEFT JOIN job_outputs progress_output
+              ON progress_output.job_id = j.job_id AND progress_output.output_index = 0
+             AND j.provider_id = 'dreamina-cli'
+            LEFT JOIN provider_submissions progress_submission
+              ON progress_submission.output_id = progress_output.output_id
+             AND progress_submission.job_id = j.job_id
+             AND progress_submission.tenant_id = j.tenant_id
+             AND progress_submission.work_item_id = w.work_item_id
+            LEFT JOIN provider_remote_tasks progress_task
+              ON progress_task.submission_id = progress_submission.submission_id
+             AND progress_task.executor_execution_id = progress_submission.executor_execution_id
+             AND progress_task.provider_id = j.provider_id
+            LEFT JOIN provider_task_observations progress_observation
+              ON progress_observation.observation_id = progress_task.state_observation_id
+             AND progress_observation.submission_id = progress_task.submission_id
+             AND progress_observation.executor_execution_id = progress_task.executor_execution_id
+             AND progress_observation.observed_state = 'provider_waiting'
             LEFT JOIN artifacts artifact
               ON artifact.job_id = j.job_id
              AND artifact.output_index = 0
@@ -236,7 +255,8 @@ impl ExecutionSettlementStore for PostgresExecutionSettlementStore {
         let row: Option<VideoStatusRow> = sqlx::query_as(
             r#"
                 SELECT j.state, w.state, j.last_error_code, j.model, j.billable_units,
-                       artifact.artifact_id, remote.video_url, remote.expires_at_ms, payload.command_json
+                       artifact.artifact_id, remote.video_url, remote.expires_at_ms, payload.command_json,
+                       progress_observation.progress_json, progress_observation.observed_at_ms
                 FROM jobs j
                 JOIN work_items w ON w.job_id = j.job_id
                 JOIN job_auth_attributions attribution
@@ -244,6 +264,23 @@ impl ExecutionSettlementStore for PostgresExecutionSettlementStore {
                 LEFT JOIN job_payloads payload
                   ON payload.job_id = j.job_id AND payload.command_schema = $5
                  AND j.provider_id = 'dreamina-cli'
+                LEFT JOIN job_outputs progress_output
+                  ON progress_output.job_id = j.job_id AND progress_output.output_index = 0
+                 AND j.provider_id = 'dreamina-cli'
+                LEFT JOIN provider_submissions progress_submission
+                  ON progress_submission.output_id = progress_output.output_id
+                 AND progress_submission.job_id = j.job_id
+                 AND progress_submission.tenant_id = j.tenant_id
+                 AND progress_submission.work_item_id = w.work_item_id
+                LEFT JOIN provider_remote_tasks progress_task
+                  ON progress_task.submission_id = progress_submission.submission_id
+                 AND progress_task.executor_execution_id = progress_submission.executor_execution_id
+                 AND progress_task.provider_id = j.provider_id
+                LEFT JOIN provider_task_observations progress_observation
+                  ON progress_observation.observation_id = progress_task.state_observation_id
+                 AND progress_observation.submission_id = progress_task.submission_id
+                 AND progress_observation.executor_execution_id = progress_task.executor_execution_id
+                 AND progress_observation.observed_state = 'provider_waiting'
                 LEFT JOIN artifacts artifact
                   ON artifact.job_id = j.job_id
                  AND artifact.output_index = 0
@@ -366,7 +403,8 @@ impl ExecutionSettlementStore for PostgresExecutionSettlementStore {
         let row: Option<VideoStatusRow> = sqlx::query_as(
             r#"
                 SELECT j.state, w.state, j.last_error_code, j.model, j.billable_units,
-                       artifact.artifact_id, remote.video_url, remote.expires_at_ms, payload.command_json
+                       artifact.artifact_id, remote.video_url, remote.expires_at_ms, payload.command_json,
+                       progress_observation.progress_json, progress_observation.observed_at_ms
                 FROM jobs j
                 JOIN work_items w ON w.job_id = j.job_id
                 JOIN job_auth_attributions attribution
@@ -375,6 +413,23 @@ impl ExecutionSettlementStore for PostgresExecutionSettlementStore {
                   ON payload.job_id = j.job_id
                  AND payload.command_schema = $5
                  AND j.provider_id = 'dreamina-cli'
+                LEFT JOIN job_outputs progress_output
+                  ON progress_output.job_id = j.job_id AND progress_output.output_index = 0
+                 AND j.provider_id = 'dreamina-cli'
+                LEFT JOIN provider_submissions progress_submission
+                  ON progress_submission.output_id = progress_output.output_id
+                 AND progress_submission.job_id = j.job_id
+                 AND progress_submission.tenant_id = j.tenant_id
+                 AND progress_submission.work_item_id = w.work_item_id
+                LEFT JOIN provider_remote_tasks progress_task
+                  ON progress_task.submission_id = progress_submission.submission_id
+                 AND progress_task.executor_execution_id = progress_submission.executor_execution_id
+                 AND progress_task.provider_id = j.provider_id
+                LEFT JOIN provider_task_observations progress_observation
+                  ON progress_observation.observation_id = progress_task.state_observation_id
+                 AND progress_observation.submission_id = progress_task.submission_id
+                 AND progress_observation.executor_execution_id = progress_task.executor_execution_id
+                 AND progress_observation.observed_state = 'provider_waiting'
                 LEFT JOIN artifacts artifact
                   ON artifact.job_id = j.job_id
                  AND artifact.output_index = 0
@@ -576,7 +631,36 @@ type VideoStatusRow = (
     Option<String>,
     Option<i64>,
     Option<serde_json::Value>,
+    Option<serde_json::Value>,
+    Option<i64>,
 );
+
+#[derive(serde::Deserialize)]
+struct StoredProviderProgress {
+    provider_status: String,
+    queue_position: Option<u64>,
+    queue_total: Option<u64>,
+    estimated_remaining_seconds: Option<u64>,
+}
+
+fn video_provider_progress(
+    value: Option<serde_json::Value>,
+    observed_at_ms: Option<i64>,
+) -> Option<VideoProviderProgress> {
+    let observed_at_ms = observed_at_ms.filter(|value| *value >= 0)?;
+    let stored: StoredProviderProgress = serde_json::from_value(value?).ok()?;
+    let progress = image_provider_sdk::ProviderTaskProgress {
+        provider_status: stored.provider_status,
+        queue_position: stored.queue_position,
+        queue_total: stored.queue_total,
+        estimated_remaining_seconds: stored.estimated_remaining_seconds,
+    };
+    progress.validate().ok()?;
+    Some(VideoProviderProgress {
+        progress,
+        observed_at_ms,
+    })
+}
 
 fn video_request_metadata(
     command: Option<&serde_json::Value>,
@@ -631,6 +715,8 @@ fn video_result_status(row: VideoStatusRow) -> Result<VideoResultStatus, ImageGa
         remote_url,
         remote_expires_at_ms,
         command,
+        progress,
+        progress_observed_at_ms,
     ) = row;
     let duration_ms = requested_video_duration_ms(billable_units, command.as_ref())?;
     if job_state == "succeeded" {
@@ -660,7 +746,11 @@ fn video_result_status(row: VideoStatusRow) -> Result<VideoResultStatus, ImageGa
             error_code,
         })
     } else if work_state == "uncertain" {
-        Ok(VideoResultStatus::Uncertain { model, duration_ms })
+        Ok(VideoResultStatus::Uncertain {
+            model,
+            duration_ms,
+            provider_progress: video_provider_progress(progress, progress_observed_at_ms),
+        })
     } else {
         let stage = match work_state.as_str() {
             "ready" => VideoPendingStage::Queued,
@@ -671,6 +761,7 @@ fn video_result_status(row: VideoStatusRow) -> Result<VideoResultStatus, ImageGa
             model,
             duration_ms,
             stage,
+            provider_progress: video_provider_progress(progress, progress_observed_at_ms),
         })
     }
 }
@@ -1288,12 +1379,93 @@ mod tests {
             None,
             None,
             Some(command),
+            None,
+            None,
         ))
         .unwrap();
         assert!(matches!(
             status,
             VideoResultStatus::Pending {
                 duration_ms: 2_500,
+                ..
+            }
+        ));
+    }
+
+    fn queued_video_row(job_state: &str, work_state: &str) -> VideoStatusRow {
+        (
+            job_state.to_owned(),
+            work_state.to_owned(),
+            (job_state == "failed").then(|| "provider_failed".to_owned()),
+            "seedance2.0fast".to_owned(),
+            10,
+            None,
+            (job_state == "succeeded").then(|| "https://media.example.test/video.mp4".to_owned()),
+            None,
+            None,
+            Some(json!({
+                "provider_status":"Queueing", "queue_position":3341,
+                "queue_total":476961, "estimated_remaining_seconds":27131
+            })),
+            Some(1_792_828_821_077),
+        )
+    }
+
+    #[test]
+    fn video_queue_progress_keeps_the_durable_time_for_pending_and_uncertain_only() {
+        for (job_state, work_state) in [("reserved", "running"), ("uncertain", "uncertain")] {
+            let status = video_result_status(queued_video_row(job_state, work_state)).unwrap();
+            let progress = match status {
+                VideoResultStatus::Pending {
+                    provider_progress, ..
+                }
+                | VideoResultStatus::Uncertain {
+                    provider_progress, ..
+                } => provider_progress.unwrap(),
+                _ => panic!("expected nonterminal projection"),
+            };
+            assert_eq!(progress.progress.provider_status, "Queueing");
+            assert_eq!(progress.progress.queue_position, Some(3341));
+            assert_eq!(progress.progress.queue_total, Some(476961));
+            assert_eq!(progress.progress.estimated_remaining_seconds, Some(27131));
+            assert_eq!(progress.observed_at_ms, 1_792_828_821_077);
+        }
+        assert!(matches!(
+            video_result_status(queued_video_row("failed", "failed")).unwrap(),
+            VideoResultStatus::Failed { .. }
+        ));
+        assert!(matches!(
+            video_result_status(queued_video_row("succeeded", "succeeded")).unwrap(),
+            VideoResultStatus::SucceededRemote { .. }
+        ));
+    }
+
+    #[test]
+    fn malformed_optional_queue_data_does_not_hide_the_video_state() {
+        for value in [
+            json!(null),
+            json!([]),
+            json!({"provider_status":"Queueing", "queue_position":"3341"}),
+            json!({"provider_status":"Queueing", "queue_position":5,"queue_total":4}),
+            json!({"provider_status":"bad\nstatus"}),
+        ] {
+            let mut row = queued_video_row("reserved", "running");
+            row.9 = Some(value);
+            let status = video_result_status(row).unwrap();
+            assert!(matches!(
+                status,
+                VideoResultStatus::Pending {
+                    provider_progress: None,
+                    ..
+                }
+            ));
+        }
+        let mut row = queued_video_row("reserved", "running");
+        row.10 = None;
+        assert!(matches!(
+            video_result_status(row).unwrap(),
+            VideoResultStatus::Pending {
+                provider_progress: None,
                 ..
             }
         ));
@@ -1320,6 +1492,8 @@ mod tests {
                 5,
                 artifact,
                 remote,
+                None,
+                None,
                 None,
                 None,
             )
@@ -1354,6 +1528,8 @@ mod tests {
             Some(url.to_owned()),
             None,
             Some(multiframe_command(&[2_500])),
+            None,
+            None,
         ))
         .unwrap();
         let VideoResultStatus::SucceededRemote {

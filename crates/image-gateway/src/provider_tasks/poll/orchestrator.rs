@@ -21,7 +21,7 @@ use super::{
 };
 use crate::provider_tasks::{
     NativeBatchMember, ProviderArtifactAuthority, ProviderArtifactPublication, ProviderRemoteTask,
-    ProviderTaskClaimScope, ProviderTaskLease, ProviderTaskObservation,
+    ProviderTaskClaimScope, ProviderTaskDeadlineStore, ProviderTaskLease, ProviderTaskObservation,
     ProviderTaskObservationOutcome, ProviderTaskObservationSource, ProviderTaskStore,
     ProviderTaskStoreError,
 };
@@ -31,6 +31,14 @@ const DEFAULT_BACKOFF_POLL_AFTER_MS: u64 = 1_000;
 const MAX_POLL_AFTER_MS: u64 = 24 * 60 * 60 * 1_000;
 
 pub trait ProviderPollStore: Send + Sync + 'static {
+    fn resolve_due_poll_deadline(
+        &self,
+        _scope: &ProviderTaskClaimScope,
+    ) -> impl Future<Output = Result<Option<ProviderRemoteTask>, ProviderTaskStoreError>> + Send
+    {
+        async { Ok(None) }
+    }
+
     fn native_batch_members(
         &self,
         _lease: &ProviderTaskLease,
@@ -86,8 +94,15 @@ pub trait ProviderPollStore: Send + Sync + 'static {
 
 impl<S> ProviderPollStore for S
 where
-    S: ProviderTaskStore,
+    S: ProviderTaskStore + ProviderTaskDeadlineStore,
 {
+    async fn resolve_due_poll_deadline(
+        &self,
+        scope: &ProviderTaskClaimScope,
+    ) -> Result<Option<ProviderRemoteTask>, ProviderTaskStoreError> {
+        ProviderTaskDeadlineStore::resolve_due_remote_task_deadline(self, scope).await
+    }
+
     async fn native_batch_members(
         &self,
         lease: &ProviderTaskLease,
@@ -206,6 +221,9 @@ where
     }
 
     pub async fn run_once(&self) -> Result<ProviderPollRun, ProviderPollOrchestratorError> {
+        if let Some(task) = self.store.resolve_due_poll_deadline(&self.scope).await? {
+            return Ok(ProviderPollRun::Observed(task));
+        }
         let claim_started_at = Instant::now();
         let Some(lease) = self
             .store
@@ -488,6 +506,32 @@ where
                     bounded_poll_after(next_poll_after_ms.unwrap_or(DEFAULT_PENDING_POLL_AFTER_MS));
                 self.record_waiting(lease, poll_after_ms).await
             }
+            Ok(PollObservation::PendingWithProgress {
+                next_poll_after_ms,
+                progress,
+            }) => {
+                if sink.into_pristine().is_err() {
+                    return self
+                        .record_uncertain(lease, "provider_poll_artifact_contract")
+                        .await;
+                }
+                let poll_after_ms =
+                    bounded_poll_after(next_poll_after_ms.unwrap_or(DEFAULT_PENDING_POLL_AFTER_MS));
+                if progress.validate().is_err() {
+                    return self.record_waiting(lease, poll_after_ms).await;
+                }
+                let outcome = ProviderTaskObservationOutcome::Waiting { poll_after_ms };
+                let observation = ProviderTaskObservation {
+                    event_identity: event_identity(lease, &outcome),
+                    source: ProviderTaskObservationSource::Poll,
+                    outcome,
+                    progress: Some(progress),
+                };
+                self.store
+                    .record_poll_observation(lease, &observation)
+                    .await
+                    .map_err(Into::into)
+            }
             Ok(PollObservation::Completed(completed)) => {
                 let staged = match sink.into_finalized(completed.artifact()) {
                     Ok(staged) => staged,
@@ -662,6 +706,7 @@ where
             event_identity: event_identity(lease, &outcome),
             source: ProviderTaskObservationSource::Poll,
             outcome,
+            progress: None,
         };
         self.store
             .record_poll_observation(lease, &observation)

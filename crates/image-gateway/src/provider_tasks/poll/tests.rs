@@ -103,6 +103,7 @@ impl ProviderArtifactStager for TestStager {
 #[derive(Default)]
 struct FakeStoreState {
     lease: Option<ProviderTaskLease>,
+    due_deadline: Option<ProviderRemoteTask>,
     heartbeat_count: usize,
     fail_heartbeat: bool,
     actions: Vec<&'static str>,
@@ -128,6 +129,20 @@ impl FakeStore {
 }
 
 impl ProviderPollStore for FakeStore {
+    async fn resolve_due_poll_deadline(
+        &self,
+        scope: &ProviderTaskClaimScope,
+    ) -> Result<Option<ProviderRemoteTask>, ProviderTaskStoreError> {
+        let mut state = self.state.lock().unwrap();
+        if let Some(task) = state.due_deadline.take() {
+            assert_eq!(task.provider_id, scope.provider_id);
+            assert_eq!(task.provider_account_id, scope.provider_account_id);
+            state.actions.push("deadline");
+            return Ok(Some(task));
+        }
+        Ok(None)
+    }
+
     async fn native_batch_members(
         &self,
         _lease: &ProviderTaskLease,
@@ -255,6 +270,25 @@ impl ProviderPollStore for FakeStore {
 }
 
 struct SlowPendingDriver;
+
+struct ProgressDriver(image_provider_sdk::ProviderTaskProgress);
+
+impl ProviderPollDriver for ProgressDriver {
+    fn provider_id(&self) -> &'static str {
+        "provider-test"
+    }
+
+    async fn poll<S: ArtifactSink>(
+        &self,
+        _call: &ProviderPollDriverCall,
+        _sink: &mut S,
+    ) -> Result<PollObservation, image_provider_sdk::ProviderFailure> {
+        Ok(PollObservation::PendingWithProgress {
+            next_poll_after_ms: Some(250),
+            progress: self.0.clone(),
+        })
+    }
+}
 
 impl ProviderPollDriver for SlowPendingDriver {
     fn provider_id(&self) -> &'static str {
@@ -638,6 +672,43 @@ async fn pending_poll_records_once_without_consuming_materialization_capacity() 
 }
 
 #[tokio::test]
+async fn pending_progress_is_observation_metadata_without_materialization() {
+    let progress = image_provider_sdk::ProviderTaskProgress {
+        provider_status: "Queueing".to_owned(),
+        queue_position: Some(3341),
+        queue_total: Some(476_961),
+        estimated_remaining_seconds: Some(27_131),
+    };
+    for valid in [true, false] {
+        let store = FakeStore::with_lease(lease(None));
+        let factory = TestStagerFactory::default();
+        let mut reported = progress.clone();
+        if !valid {
+            reported.queue_total = Some(1);
+        }
+        let orchestrator = orchestrator(store.clone(), ProgressDriver(reported), factory.clone());
+        assert!(matches!(
+            orchestrator.run_once().await.unwrap(),
+            ProviderPollRun::Observed(ProviderRemoteTask {
+                state: ProviderTaskState::ProviderWaiting,
+                ..
+            })
+        ));
+        let state = store.state.lock().unwrap();
+        assert_eq!(factory.begins.load(Ordering::SeqCst), 0);
+        assert_eq!(state.actions, ["record"]);
+        assert_eq!(
+            state.observations[0].progress,
+            valid.then(|| progress.clone())
+        );
+        assert_eq!(
+            state.observations[0].outcome,
+            ProviderTaskObservationOutcome::Waiting { poll_after_ms: 250 }
+        );
+    }
+}
+
+#[tokio::test]
 async fn completed_poll_publishes_before_recording_terminal_evidence() {
     let lease = lease(None);
     let store = FakeStore::with_lease(lease);
@@ -1016,6 +1087,32 @@ printf '{"submit_id":"%s","gen_status":"querying"}' "$submit"
     assert!(dreamina_workspace_has_no_attempts(&workspace));
 }
 
+#[tokio::test]
+async fn each_poll_iteration_resolves_a_due_deadline_before_launching_another_query() {
+    let current = lease(None);
+    let mut expired = current.task.clone();
+    expired.state = ProviderTaskState::Uncertain;
+    expired.error_code = Some("provider_remote_task_deadline".to_owned());
+    expired.next_poll_at_ms = None;
+    let store = FakeStore::with_lease(current);
+    store.state.lock().unwrap().due_deadline = Some(expired.clone());
+    let factory = TestStagerFactory::default();
+    let run = orchestrator(
+        store.clone(),
+        ScriptedFakeProvider::default(),
+        factory.clone(),
+    )
+    .run_once()
+    .await
+    .unwrap();
+    assert_eq!(run, ProviderPollRun::Observed(expired));
+    let state = store.state.lock().unwrap();
+    assert!(state.lease.is_some());
+    assert!(state.observations.is_empty());
+    assert_eq!(state.actions, ["deadline"]);
+    assert_eq!(factory.begins.load(Ordering::SeqCst), 0);
+}
+
 fn orchestrator<D: ProviderPollDriver>(
     store: FakeStore,
     driver: D,
@@ -1062,7 +1159,7 @@ fn scope() -> ProviderTaskClaimScope {
     }
 }
 
-fn lease(committed_artifact: Option<ProviderArtifactPublication>) -> ProviderTaskLease {
+pub(super) fn lease(committed_artifact: Option<ProviderArtifactPublication>) -> ProviderTaskLease {
     ProviderTaskLease {
         task: ProviderRemoteTask {
             submission_id: Uuid::from_u128(1),
@@ -1105,6 +1202,7 @@ fn lease(committed_artifact: Option<ProviderArtifactPublication>) -> ProviderTas
         },
         committed_artifact,
         remaining_budget_ms: 60_000,
+        completion_deadline_at_ms: 9_999_999_999_999,
         poll_owner: "poll-owner".to_owned(),
         poll_lease_epoch: 1,
         poll_lease_expires_at_ms: 9_999_999_999_999,

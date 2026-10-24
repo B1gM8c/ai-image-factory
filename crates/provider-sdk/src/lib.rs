@@ -25,8 +25,8 @@ pub use inline::InlineProvider;
 pub use remote::{
     CallbackEnvelope, CallbackKind, CallbackReceipt, CancelReceipt, CancelState, CanceledEvidence,
     Completed, CompletedRemoteVideo, OpaqueProviderId, OpaqueProviderIdError, PendingOperation,
-    PollObservation, ProviderRequestId, RemoteOperationRef, RemoteTaskProvider, RemoteVideoResult,
-    RemoteVideoResultError,
+    PollObservation, ProviderRequestId, ProviderTaskProgress, ProviderTaskProgressError,
+    RemoteOperationRef, RemoteTaskProvider, RemoteVideoResult, RemoteVideoResultError,
 };
 
 #[cfg(test)]

@@ -28,6 +28,7 @@ pub struct ProviderPollDriverCall {
     provider_account_id: Uuid,
     operation: RemoteOperationRef,
     context: ProviderExecutionContext,
+    completion_deadline_at_ms: i64,
 }
 
 impl ProviderPollDriverCall {
@@ -37,6 +38,7 @@ impl ProviderPollDriverCall {
         if lease.task.state != ProviderTaskState::ProviderWaiting
             || context.completion_mode() != "remote_task"
             || context.provider_deadline_at_ms() <= 0
+            || lease.completion_deadline_at_ms() < context.provider_deadline_at_ms()
         {
             return Err(ProviderPollDriverCallError);
         }
@@ -52,6 +54,7 @@ impl ProviderPollDriverCall {
             provider_account_id: lease.task.provider_account_id,
             operation,
             context,
+            completion_deadline_at_ms: lease.completion_deadline_at_ms(),
         })
     }
 
@@ -72,7 +75,7 @@ impl ProviderPollDriverCall {
             .map_err(|_| ProviderPollDriverCallError)?;
         let timeout = u64::try_from(self.context.provider_timeout_ms())
             .map_err(|_| ProviderPollDriverCallError)?;
-        let deadline = u64::try_from(self.context.provider_deadline_at_ms())
+        let deadline = u64::try_from(self.completion_deadline_at_ms)
             .map_err(|_| ProviderPollDriverCallError)?;
         InvocationContext::new(
             &self.submission_id,
@@ -138,4 +141,26 @@ fn invalid_poll_context() -> ProviderFailure {
         image_provider_sdk::RetryDirective::Never,
     )
     .expect("static provider failure must be valid")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn poll_invocation_uses_completion_budget_and_keeps_submit_context_frozen() {
+        let mut lease = super::super::tests::lease(None);
+        lease.context.provider_deadline_at_ms = 1;
+        lease.completion_deadline_at_ms = 86_400_001;
+        let call = ProviderPollDriverCall::new(&lease).unwrap();
+        assert_eq!(call.execution_context().provider_deadline_at_ms(), 1);
+        let invocation = call.invocation_context().unwrap();
+        assert_eq!(invocation.provider_deadline_unix_ms(), 86_400_001);
+        assert_eq!(
+            invocation.provider_timeout_ms(),
+            lease.context.provider_timeout_ms() as u64,
+        );
+        lease.completion_deadline_at_ms = 0;
+        assert!(ProviderPollDriverCall::new(&lease).is_err());
+    }
 }

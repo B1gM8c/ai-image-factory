@@ -2,7 +2,8 @@ use std::{fmt, sync::Arc};
 
 use async_trait::async_trait;
 use image_provider_sdk::{
-    DurableArtifactManifest, OutputSlot, ProviderCommandIdentity, RemoteVideoResult,
+    DurableArtifactManifest, OutputSlot, ProviderCommandIdentity, ProviderTaskProgress,
+    RemoteVideoResult,
 };
 use serde_json::Value;
 use uuid::Uuid;
@@ -515,6 +516,7 @@ pub struct ProviderTaskLease {
     context: ProviderExecutionContext,
     committed_artifact: Option<ProviderArtifactPublication>,
     remaining_budget_ms: u64,
+    completion_deadline_at_ms: i64,
     pub poll_owner: String,
     pub poll_lease_epoch: i64,
     pub poll_lease_expires_at_ms: i64,
@@ -532,6 +534,11 @@ impl ProviderTaskLease {
 
     pub fn remaining_budget_ms(&self) -> u64 {
         self.remaining_budget_ms
+    }
+
+    /// Completion authority is distinct from the immutable submit deadline.
+    pub fn completion_deadline_at_ms(&self) -> i64 {
+        self.completion_deadline_at_ms
     }
 }
 
@@ -685,6 +692,7 @@ pub struct ProviderTaskObservation {
     pub event_identity: String,
     pub source: ProviderTaskObservationSource,
     pub outcome: ProviderTaskObservationOutcome,
+    pub progress: Option<ProviderTaskProgress>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

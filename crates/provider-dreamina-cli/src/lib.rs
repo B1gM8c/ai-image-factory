@@ -23,7 +23,8 @@ pub use policy::{DreaminaCliPolicyError, DreaminaCliPolicyV1, DreaminaSubmitRequ
 pub use policy::{DreaminaCliQueryPolicyError, DreaminaCliQueryPolicyV1};
 pub use receipt::{
     AcceptedReceipt, AcceptedStatus, DreaminaQueryReceiptV1, DreaminaQueryStatusV1,
-    MAX_FAIL_REASON_CHARS, MAX_RECEIPT_BYTES, ReceiptError, parse_query_receipt, parse_receipt,
+    DreaminaQueueInfoV1, MAX_FAIL_REASON_CHARS, MAX_RECEIPT_BYTES, ReceiptError,
+    parse_query_receipt, parse_receipt,
 };
 pub use request::{
     ImageModelVersion, ImageRatio, ImageResolution, QueryResultRequestV1, RequestValidationError,

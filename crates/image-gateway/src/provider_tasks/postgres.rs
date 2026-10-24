@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use image_provider_sdk::RemoteVideoResult;
+use image_provider_sdk::{ProviderTaskProgress, RemoteVideoResult};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Postgres, Transaction};
@@ -54,6 +54,7 @@ struct TaskRow {
     remote_operation_id: String,
     provider_request_id: Option<String>,
     provider_deadline_at_ms: i64,
+    completion_deadline_at_ms: i64,
     state: String,
     artifact_ref: Option<String>,
     error_code: Option<String>,
@@ -111,6 +112,7 @@ struct ClaimRow {
     invocation_attempt: i32,
     provider_timeout_ms: i64,
     provider_deadline_at_ms: i64,
+    completion_deadline_at_ms: i64,
     committed_manifest_id: Option<Uuid>,
     committed_authority_id: Option<Uuid>,
     committed_sha256_hex: Option<String>,
@@ -229,6 +231,7 @@ struct ExistingObservation {
     poll_lease_epoch: Option<i64>,
     payload_hash: String,
     observed_at_ms: i64,
+    progress_json: Option<Value>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -1858,7 +1861,7 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
                        task.next_poll_at_ms,
                        COALESCE(task.poll_lease_expires_at_ms, task.next_poll_at_ms)
                      ) AS due_at,
-                     task.provider_deadline_at_ms
+                     provider_task_completion_deadline(task.submission_id, task.provider_deadline_at_ms) AS completion_deadline_at_ms
               FROM provider_remote_tasks task
               JOIN provider_submissions submission
                 ON submission.submission_id = task.submission_id
@@ -1867,6 +1870,7 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
               WHERE task.provider_id = $1 AND task.provider_account_id = $2
                 AND submission.execution_profile_id = $5
                 AND task.state = 'provider_waiting'
+                AND provider_task_completion_deadline(task.submission_id, task.provider_deadline_at_ms) > db_clock.now_ms
                 AND GREATEST(
                       task.next_poll_at_ms,
                       COALESCE(task.poll_lease_expires_at_ms, task.next_poll_at_ms)
@@ -1886,7 +1890,7 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
               CROSS JOIN db_clock
               WHERE task.provider_id = $1 AND task.provider_account_id = $2
                 AND task.state = 'provider_waiting'
-                AND task.provider_deadline_at_ms > db_clock.now_ms
+                AND provider_task_completion_deadline(task.submission_id, task.provider_deadline_at_ms) > db_clock.now_ms
                 AND GREATEST(
                       task.next_poll_at_ms,
                       COALESCE(task.poll_lease_expires_at_ms, task.next_poll_at_ms)
@@ -1898,7 +1902,7 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
               UPDATE provider_remote_tasks task
               SET poll_owner = $3, poll_lease_epoch = task.poll_lease_epoch + 1,
                   poll_lease_expires_at_ms = LEAST(
-                    task.provider_deadline_at_ms,
+                    provider_task_completion_deadline(task.submission_id, task.provider_deadline_at_ms),
                     candidate.now_ms + $4
                   ),
                   poll_claimed_at_ms = candidate.now_ms, updated_at_ms = candidate.now_ms
@@ -1931,6 +1935,7 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
                    intent.idempotency_key, intent.provider_command_sha256,
                    intent.execution_binding_sha256, recovery.invocation_attempt,
                    recovery.provider_timeout_ms, claimed.provider_deadline_at_ms,
+                   provider_task_completion_deadline(claimed.submission_id, claimed.provider_deadline_at_ms) AS completion_deadline_at_ms,
                    committed_manifest.manifest_id AS committed_manifest_id,
                    committed_manifest.artifact_authority_id AS committed_authority_id,
                    committed_authority.sha256_hex AS committed_sha256_hex,
@@ -2020,7 +2025,7 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
             r#"
             UPDATE provider_remote_tasks task
             SET poll_lease_expires_at_ms = LEAST(
-                  task.provider_deadline_at_ms,
+                  provider_task_completion_deadline(task.submission_id, task.provider_deadline_at_ms),
                   GREATEST(
                     task.poll_lease_expires_at_ms + 1,
                     $5 + $6
@@ -2032,7 +2037,7 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
               AND task.poll_owner = $3 AND task.poll_lease_epoch = $4
               AND task.state = 'provider_waiting'
               AND task.poll_lease_expires_at_ms > $5
-              AND task.provider_deadline_at_ms > $5
+              AND provider_task_completion_deadline(task.submission_id, task.provider_deadline_at_ms) > $5
             RETURNING task.poll_lease_expires_at_ms, task.updated_at_ms
             "#,
         )
@@ -2055,7 +2060,7 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
         .await?;
         tx.commit().await.map_err(unavailable)?;
         Ok(ProviderTaskLease {
-            remaining_budget_ms: remaining_budget_ms(lease.context.provider_deadline_at_ms, now)?,
+            remaining_budget_ms: remaining_budget_ms(lease.completion_deadline_at_ms, now)?,
             poll_lease_expires_at_ms: expires,
             ..lease.clone()
         })
@@ -2078,7 +2083,7 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
             return Ok(task);
         }
         let now = database_now(&mut tx).await?;
-        if task.provider_deadline_at_ms <= now {
+        if task.completion_deadline_at_ms <= now {
             let task = resolve_remote_task_deadline_in(&mut tx, task, now).await?;
             let task = task_from_row(task)?;
             tx.commit().await.map_err(storage_conflict)?;
@@ -2095,7 +2100,7 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
               AND cancel_requested = FALSE
             RETURNING submission_id, executor_execution_id, provider_id,
                       provider_account_id, remote_operation_id, provider_request_id,
-                      provider_deadline_at_ms, state, artifact_ref, error_code,
+                      provider_deadline_at_ms, provider_task_completion_deadline(submission_id, provider_deadline_at_ms) AS completion_deadline_at_ms, state, artifact_ref, error_code,
                       next_poll_at_ms,
                       cancel_requested, poll_owner, poll_lease_epoch,
                       poll_lease_expires_at_ms, state_observation_id,
@@ -2127,8 +2132,9 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
             .ok_or(ProviderTaskStoreError::StaleLease)?;
         let now = database_now(&mut tx).await?;
         let mut values = observation_values(observation, now);
+        let progress_json = observation.progress.as_ref().map(progress_json);
         if let Some(next_poll_at_ms) = values.next_poll_at_ms.as_mut() {
-            *next_poll_at_ms = (*next_poll_at_ms).min(task.provider_deadline_at_ms);
+            *next_poll_at_ms = (*next_poll_at_ms).min(task.completion_deadline_at_ms);
         }
         let publication = values.publication;
         let requested_poll_after_ms = match &observation.outcome {
@@ -2155,6 +2161,7 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
                 remote_result_hash(result)
             )));
         }
+        payload_hash = with_progress_hash(payload_hash, progress_json.as_ref());
         let new_observation = NewObservation {
             submission_id: lease.task.submission_id,
             executor_execution_id: lease.task.executor_execution_id,
@@ -2179,6 +2186,7 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
             poll_lease_epoch: Some(lease.poll_lease_epoch),
             payload_hash: &payload_hash,
             requested_poll_after_ms,
+            progress_json: progress_json.as_ref(),
             now,
         };
         if let Some(persisted) = load_matching_observation(&mut tx, &new_observation).await? {
@@ -2201,7 +2209,7 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
             || task
                 .poll_lease_expires_at_ms
                 .is_none_or(|expires_at_ms| expires_at_ms <= now)
-            || task.provider_deadline_at_ms <= now
+            || task.completion_deadline_at_ms <= now
         {
             return Err(ProviderTaskStoreError::StaleLease);
         }
@@ -2328,7 +2336,7 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
                 r#"
             SELECT submission.output_id, submission.job_id, task.state,
                    task.poll_owner, task.poll_lease_epoch, task.poll_lease_expires_at_ms,
-                   task.provider_deadline_at_ms
+                   provider_task_completion_deadline(task.submission_id, task.provider_deadline_at_ms)
             FROM provider_remote_tasks task
             JOIN provider_submissions submission
               ON submission.submission_id = task.submission_id
@@ -2351,13 +2359,13 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
             poll_owner,
             poll_lease_epoch,
             poll_lease_expires_at_ms,
-            provider_deadline_at_ms,
+            completion_deadline_at_ms,
         ) = locked_task.ok_or(ProviderTaskStoreError::StaleLease)?;
         if state != "provider_waiting"
             || poll_owner.as_deref() != Some(lease.poll_owner.as_str())
             || poll_lease_epoch != lease.poll_lease_epoch
             || poll_lease_expires_at_ms.is_none_or(|expires_at_ms| expires_at_ms <= now)
-            || provider_deadline_at_ms <= now
+            || completion_deadline_at_ms <= now
         {
             return Err(ProviderTaskStoreError::StaleLease);
         }
@@ -2465,7 +2473,7 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
             return Ok(task);
         }
         let now = database_now(&mut tx).await?;
-        if task.provider_deadline_at_ms <= now {
+        if task.completion_deadline_at_ms <= now {
             let task = resolve_remote_task_deadline_in(&mut tx, task, now).await?;
             let task = task_from_row(task)?;
             tx.commit().await.map_err(storage_conflict)?;
@@ -2488,6 +2496,7 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
         let persisted = insert_or_load_observation(
             &mut tx,
             &NewObservation {
+                progress_json: None,
                 submission_id: task.submission_id,
                 executor_execution_id: task.executor_execution_id,
                 event_identity: &callback.event_identity,
@@ -2571,7 +2580,7 @@ impl ProviderTaskDeadlineStore for PostgresProviderTaskStore {
               SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT AS now_ms
             ), candidate_window AS MATERIALIZED (
               SELECT task.submission_id, task.executor_execution_id,
-                     task.provider_deadline_at_ms
+                     provider_task_completion_deadline(task.submission_id, task.provider_deadline_at_ms) AS completion_deadline_at_ms
               FROM provider_remote_tasks task
               JOIN provider_submissions submission
                 ON submission.submission_id = task.submission_id
@@ -2580,8 +2589,8 @@ impl ProviderTaskDeadlineStore for PostgresProviderTaskStore {
               WHERE task.provider_id = $1 AND task.provider_account_id = $2
                 AND submission.execution_profile_id = $3
                 AND task.state = 'provider_waiting'
-                AND task.provider_deadline_at_ms <= db_clock.now_ms
-              ORDER BY task.provider_deadline_at_ms, task.submission_id
+                AND provider_task_completion_deadline(task.submission_id, task.provider_deadline_at_ms) <= db_clock.now_ms
+              ORDER BY provider_task_completion_deadline(task.submission_id, task.provider_deadline_at_ms), task.submission_id
               LIMIT 64
             ), candidate AS (
               SELECT task.submission_id, db_clock.now_ms
@@ -2595,8 +2604,8 @@ impl ProviderTaskDeadlineStore for PostgresProviderTaskStore {
                AND allocation.state = 'held'
               CROSS JOIN db_clock
               WHERE task.state = 'provider_waiting'
-                AND task.provider_deadline_at_ms <= db_clock.now_ms
-              ORDER BY candidates.provider_deadline_at_ms, candidates.submission_id
+                AND provider_task_completion_deadline(task.submission_id, task.provider_deadline_at_ms) <= db_clock.now_ms
+              ORDER BY candidates.completion_deadline_at_ms, candidates.submission_id
               FOR UPDATE OF task SKIP LOCKED
               LIMIT 1
             )
@@ -2642,7 +2651,7 @@ async fn resolve_remote_task_deadline_in(
     if task.state != "provider_waiting" {
         return Ok(task);
     }
-    if task.provider_deadline_at_ms > now || task.deadline_quarantine_id.is_some() {
+    if task.completion_deadline_at_ms > now || task.deadline_quarantine_id.is_some() {
         return Err(ProviderTaskStoreError::StaleLease);
     }
     if let Some(publication) = load_published_artifact_in(tx, &task).await? {
@@ -2683,7 +2692,7 @@ async fn resolve_remote_task_deadline_in(
             WHERE submission_id = $2
               AND executor_execution_id = $1
               AND state = 'provider_waiting'
-              AND provider_deadline_at_ms <= $4
+              AND provider_task_completion_deadline(submission_id, provider_deadline_at_ms) <= $4
             "#,
         )
         .bind(quarantine_id)
@@ -2821,6 +2830,7 @@ async fn recover_published_artifact_in(
     let persisted = insert_or_load_observation(
         tx,
         &NewObservation {
+            progress_json: None,
             submission_id: task.submission_id,
             executor_execution_id: task.executor_execution_id,
             event_identity: ARTIFACT_RECOVERY_EVENT,
@@ -2858,7 +2868,7 @@ async fn recover_published_artifact_in(
                 terminal_at_ms = $5
             WHERE submission_id = $1 AND executor_execution_id = $2
               AND state = 'provider_waiting'
-              AND provider_deadline_at_ms <= $5
+              AND provider_task_completion_deadline(submission_id, provider_deadline_at_ms) <= $5
               AND deadline_quarantine_id IS NULL
             "#,
         )
@@ -3350,6 +3360,7 @@ struct NewObservation<'a> {
     poll_lease_epoch: Option<i64>,
     payload_hash: &'a str,
     requested_poll_after_ms: Option<i64>,
+    progress_json: Option<&'a Value>,
     now: i64,
 }
 
@@ -3365,9 +3376,9 @@ async fn insert_or_load_observation(
            source, observed_state, artifact_ref, result_manifest_id,
            artifact_sha256_hex, artifact_byte_size, artifact_media_type,
            error_code, effect_certainty, next_poll_at_ms, poll_owner,
-           poll_lease_epoch, payload_hash, observed_at_ms, remote_result_id)
+           poll_lease_epoch, payload_hash, observed_at_ms, remote_result_id, progress_json)
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
-                $13, $14, $15, $16, $17, $18, $19)
+                $13, $14, $15, $16, $17, $18, $19, $20)
         ON CONFLICT (submission_id, event_identity) DO NOTHING
         "#,
     )
@@ -3390,6 +3401,7 @@ async fn insert_or_load_observation(
     .bind(observation.payload_hash)
     .bind(observation.now)
     .bind(observation.remote_result_id)
+    .bind(observation.progress_json)
     .execute(&mut **tx)
     .await
     .map_err(storage_conflict)?
@@ -3414,7 +3426,7 @@ async fn load_matching_observation(
         SELECT observation_id, source, observed_state, artifact_ref,
                result_manifest_id, remote_result_id, artifact_sha256_hex, artifact_byte_size,
                artifact_media_type, error_code, effect_certainty, next_poll_at_ms,
-               poll_owner, poll_lease_epoch, payload_hash, observed_at_ms
+               poll_owner, poll_lease_epoch, payload_hash, observed_at_ms, progress_json
         FROM provider_task_observations
         WHERE submission_id = $1 AND event_identity = $2
         "#,
@@ -3438,7 +3450,8 @@ async fn load_matching_observation(
         && existing.error_code.as_deref() == observation.error_code
         && existing.effect_certainty == observation.effect_certainty
         && existing.poll_owner.as_deref() == observation.poll_owner
-        && existing.poll_lease_epoch == observation.poll_lease_epoch;
+        && existing.poll_lease_epoch == observation.poll_lease_epoch
+        && existing.progress_json.as_ref() == observation.progress_json;
     let time_dependent_replay = observation.source == "verified_callback"
         || (observation.state == "provider_waiting"
             && stable_payload_matches
@@ -3460,6 +3473,9 @@ fn legacy_waiting_replay_matches(
     existing: &ExistingObservation,
     observation: &NewObservation<'_>,
 ) -> bool {
+    if existing.progress_json.is_some() || observation.progress_json.is_some() {
+        return false;
+    }
     let Some(requested_poll_after_ms) = observation.requested_poll_after_ms else {
         return false;
     };
@@ -3544,6 +3560,7 @@ async fn load_task(
         r#"
         SELECT submission_id, executor_execution_id, provider_id, provider_account_id,
                remote_operation_id, provider_request_id, provider_deadline_at_ms,
+               provider_task_completion_deadline(submission_id, provider_deadline_at_ms) AS completion_deadline_at_ms,
                state, artifact_ref, error_code, next_poll_at_ms, cancel_requested,
                poll_owner, poll_lease_epoch, poll_lease_expires_at_ms,
                state_observation_id, deadline_quarantine_id,
@@ -4515,6 +4532,7 @@ async fn load_task_in(
         r#"
         SELECT submission_id, executor_execution_id, provider_id, provider_account_id,
                remote_operation_id, provider_request_id, provider_deadline_at_ms,
+               provider_task_completion_deadline(submission_id, provider_deadline_at_ms) AS completion_deadline_at_ms,
                state, artifact_ref, error_code, next_poll_at_ms, cancel_requested,
                poll_owner, poll_lease_epoch, poll_lease_expires_at_ms,
                state_observation_id, deadline_quarantine_id,
@@ -4538,6 +4556,7 @@ async fn load_task_snapshot_in(
         r#"
         SELECT submission_id, executor_execution_id, provider_id, provider_account_id,
                remote_operation_id, provider_request_id, provider_deadline_at_ms,
+               provider_task_completion_deadline(submission_id, provider_deadline_at_ms) AS completion_deadline_at_ms,
                state, artifact_ref, error_code, next_poll_at_ms, cancel_requested,
                poll_owner, poll_lease_epoch, poll_lease_expires_at_ms,
                state_observation_id, deadline_quarantine_id,
@@ -4612,6 +4631,7 @@ fn lease_from_row(row: ClaimRow) -> Result<ProviderTaskLease, ProviderTaskStoreE
         invocation_attempt,
         provider_timeout_ms,
         provider_deadline_at_ms,
+        completion_deadline_at_ms,
         committed_manifest_id,
         committed_authority_id,
         committed_sha256_hex,
@@ -4626,6 +4646,7 @@ fn lease_from_row(row: ClaimRow) -> Result<ProviderTaskLease, ProviderTaskStoreE
         remote_operation_id,
         provider_request_id,
         provider_deadline_at_ms,
+        completion_deadline_at_ms,
         state,
         artifact_ref,
         error_code,
@@ -4696,14 +4717,20 @@ fn lease_from_row(row: ClaimRow) -> Result<ProviderTaskLease, ProviderTaskStoreE
         }
         _ => return Err(ProviderTaskStoreError::Conflict),
     };
-    let authority_seal =
-        provider_task_lease_authority_seal(&task, &context, &poll_owner, poll_lease_epoch);
-    let remaining_budget_ms = remaining_budget_ms(provider_deadline_at_ms, claim_updated_at_ms)?;
+    let authority_seal = provider_task_lease_authority_seal(
+        &task,
+        &context,
+        completion_deadline_at_ms,
+        &poll_owner,
+        poll_lease_epoch,
+    );
+    let remaining_budget_ms = remaining_budget_ms(completion_deadline_at_ms, claim_updated_at_ms)?;
     Ok(ProviderTaskLease {
         task,
         context,
         committed_artifact,
         remaining_budget_ms,
+        completion_deadline_at_ms,
         poll_owner,
         poll_lease_epoch,
         poll_lease_expires_at_ms,
@@ -4883,11 +4910,13 @@ fn validate_lease(lease: &ProviderTaskLease, lease_ms: i64) -> Result<(), Provid
         || lease.task.executor_execution_id.is_nil()
         || lease.poll_lease_epoch <= 0
         || lease.task.poll_lease_epoch != lease.poll_lease_epoch
+        || lease.completion_deadline_at_ms < lease.context.provider_deadline_at_ms
         || !valid_owner(&lease.poll_owner)
         || lease.authority_seal
             != provider_task_lease_authority_seal(
                 &lease.task,
                 &lease.context,
+                lease.completion_deadline_at_ms,
                 &lease.poll_owner,
                 lease.poll_lease_epoch,
             )
@@ -4931,6 +4960,7 @@ fn validate_recovery_lease(
 fn provider_task_lease_authority_seal(
     task: &ProviderRemoteTask,
     context: &ProviderExecutionContext,
+    completion_deadline_at_ms: i64,
     poll_owner: &str,
     poll_lease_epoch: i64,
 ) -> [u8; 32] {
@@ -4944,7 +4974,7 @@ fn provider_task_lease_authority_seal(
     };
     let cancel_requested = [u8::from(task.cancel_requested)];
     authority_seal(
-        b"ai-image-factory/provider-task-lease/v2\0",
+        b"ai-image-factory/provider-task-lease/v3\0",
         &[
             task.submission_id.as_bytes(),
             task.executor_execution_id.as_bytes(),
@@ -4956,6 +4986,12 @@ fn provider_task_lease_authority_seal(
             &cancel_requested,
             &task.poll_lease_epoch.to_be_bytes(),
             context.execution_binding_sha256.as_bytes(),
+            &context.provider_deadline_at_ms.to_be_bytes(),
+            &completion_deadline_at_ms.to_be_bytes(),
+            // Policy 1 is the only audited completion extension in this schema.
+            &[u8::from(
+                completion_deadline_at_ms != context.provider_deadline_at_ms,
+            )],
             poll_owner.as_bytes(),
             &poll_lease_epoch.to_be_bytes(),
         ],
@@ -4995,8 +5031,38 @@ fn authority_seal(domain: &[u8], values: &[&[u8]]) -> [u8; 32] {
     digest.finalize().into()
 }
 
+fn progress_json(progress: &ProviderTaskProgress) -> Value {
+    serde_json::json!({
+        "provider_status": progress.provider_status,
+        "queue_position": progress.queue_position,
+        "queue_total": progress.queue_total,
+        "estimated_remaining_seconds": progress.estimated_remaining_seconds,
+    })
+}
+
+fn with_progress_hash(base: String, progress: Option<&Value>) -> String {
+    let Some(progress) = progress else {
+        return base;
+    };
+    let mut digest = Sha256::new();
+    digest.update(b"ai-image-factory/provider-task-progress/v1\0");
+    digest.update(base.as_bytes());
+    digest.update(progress.to_string().as_bytes());
+    hex::encode(digest.finalize())
+}
+
 fn validate_observation(value: &ProviderTaskObservation) -> Result<(), ProviderTaskStoreError> {
     if !valid_public_event_identity(&value.event_identity) {
+        return Err(ProviderTaskStoreError::InvalidInput);
+    }
+    if let Some(progress) = &value.progress
+        && (value.source != ProviderTaskObservationSource::Poll
+            || !matches!(
+                value.outcome,
+                ProviderTaskObservationOutcome::Waiting { .. }
+            )
+            || progress.validate().is_err())
+    {
         return Err(ProviderTaskStoreError::InvalidInput);
     }
     let valid = match &value.outcome {
@@ -5216,6 +5282,55 @@ mod tests {
     use super::*;
 
     #[test]
+    fn optional_progress_hash_keeps_legacy_hash_and_binds_every_field() {
+        let base = "a".repeat(64);
+        assert_eq!(with_progress_hash(base.clone(), None), base);
+        let progress = ProviderTaskProgress {
+            provider_status: "Queueing".to_owned(),
+            queue_position: Some(3341),
+            queue_total: Some(476_961),
+            estimated_remaining_seconds: Some(27_131),
+        };
+        let original = progress_json(&progress);
+        let original_hash = with_progress_hash(base.clone(), Some(&original));
+        assert_ne!(original_hash, base);
+        assert_eq!(original.as_object().unwrap().len(), 4);
+        for (name, value) in [
+            ("provider_status", serde_json::json!("Generating")),
+            ("queue_position", serde_json::json!(3340)),
+            ("queue_total", serde_json::json!(476_960)),
+            ("estimated_remaining_seconds", serde_json::json!(27_130)),
+        ] {
+            let mut changed = original.clone();
+            changed[name] = value;
+            assert_ne!(
+                with_progress_hash(base.clone(), Some(&changed)),
+                original_hash
+            );
+        }
+        let mut observation = ProviderTaskObservation {
+            event_identity: "poll:1:waiting".to_owned(),
+            source: ProviderTaskObservationSource::Poll,
+            outcome: ProviderTaskObservationOutcome::Waiting { poll_after_ms: 100 },
+            progress: Some(progress),
+        };
+        assert!(validate_observation(&observation).is_ok());
+        observation.source = ProviderTaskObservationSource::Cancel;
+        assert_eq!(
+            validate_observation(&observation),
+            Err(ProviderTaskStoreError::InvalidInput)
+        );
+        observation.source = ProviderTaskObservationSource::Poll;
+        observation.outcome = ProviderTaskObservationOutcome::Failed {
+            error_code: "terminal_failure".to_owned(),
+        };
+        assert_eq!(
+            validate_observation(&observation),
+            Err(ProviderTaskStoreError::InvalidInput)
+        );
+    }
+
+    #[test]
     fn recovery_inputs_preserve_frozen_identity_and_reject_invalid_descriptors() {
         let session = Uuid::new_v4();
         let id = Uuid::new_v4();
@@ -5254,6 +5369,7 @@ mod tests {
             lease.context.operation_id = operation.to_owned();
             for media_type in ["image/png", "image/jpeg", "image/webp", "video/mp4"] {
                 let observation = ProviderTaskObservation {
+                    progress: None,
                     event_identity: "poll-artifact".to_owned(),
                     source: ProviderTaskObservationSource::Poll,
                     outcome: ProviderTaskObservationOutcome::ArtifactReady {
@@ -5329,11 +5445,58 @@ mod tests {
             },
             committed_artifact: None,
             remaining_budget_ms: 60_000,
+            completion_deadline_at_ms: 9_999_999_999_999,
             poll_owner: "artifact-test-poll".to_owned(),
             poll_lease_epoch: 1,
             poll_lease_expires_at_ms: 9_999_999_999_999,
             authority_seal: [0; 32],
         }
+    }
+
+    #[test]
+    fn poll_lease_seal_binds_both_deadlines_and_the_remote_identity() {
+        let mut lease = artifact_test_lease();
+        lease.completion_deadline_at_ms += 86_400_000;
+        lease.authority_seal = provider_task_lease_authority_seal(
+            &lease.task,
+            &lease.context,
+            lease.completion_deadline_at_ms,
+            &lease.poll_owner,
+            lease.poll_lease_epoch,
+        );
+        assert_eq!(validate_lease(&lease, 1), Ok(()));
+        assert_eq!(
+            lease.completion_deadline_at_ms(),
+            lease.context.provider_deadline_at_ms + 86_400_000
+        );
+        for change in 0..5 {
+            let mut altered = lease.clone();
+            match change {
+                0 => altered.completion_deadline_at_ms += 1,
+                1 => altered.completion_deadline_at_ms = altered.context.provider_deadline_at_ms,
+                2 => altered.context.provider_deadline_at_ms += 1,
+                3 => altered.task.remote_operation_id.push_str("-other"),
+                4 => altered.context.execution_binding_sha256 = "f".repeat(64),
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                validate_lease(&altered, 1),
+                Err(ProviderTaskStoreError::InvalidInput),
+                "alteration {change} must not retain poll authority",
+            );
+        }
+        lease.completion_deadline_at_ms = lease.context.provider_deadline_at_ms - 1;
+        lease.authority_seal = provider_task_lease_authority_seal(
+            &lease.task,
+            &lease.context,
+            lease.completion_deadline_at_ms,
+            &lease.poll_owner,
+            lease.poll_lease_epoch,
+        );
+        assert_eq!(
+            validate_lease(&lease, 1),
+            Err(ProviderTaskStoreError::InvalidInput)
+        );
     }
 
     #[test]
@@ -5379,6 +5542,7 @@ mod tests {
             poll_lease_epoch: Some(1),
             payload_hash: legacy_hash,
             observed_at_ms,
+            progress_json: None,
         };
         let semantic_hash = observation_hash(
             "poll",
@@ -5395,6 +5559,7 @@ mod tests {
             Some(1),
         );
         let mut replay = NewObservation {
+            progress_json: None,
             submission_id: Uuid::new_v4(),
             executor_execution_id: Uuid::new_v4(),
             event_identity: "legacy-waiting",
@@ -5416,6 +5581,10 @@ mod tests {
             now: 2_000,
         };
         assert!(legacy_waiting_replay_matches(&existing, &replay));
+        let progress = serde_json::json!({"provider_status": "Queueing"});
+        replay.progress_json = Some(&progress);
+        assert!(!legacy_waiting_replay_matches(&existing, &replay));
+        replay.progress_json = None;
         replay.requested_poll_after_ms = Some(251);
         assert!(!legacy_waiting_replay_matches(&existing, &replay));
     }

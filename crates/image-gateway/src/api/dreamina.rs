@@ -7,9 +7,10 @@ use axum::{
     response::Response,
 };
 use image_api_contracts::dreamina::{
-    DREAMINA_IMAGES_API_PROFILE, DREAMINA_VIDEOS_API_PROFILE, DreaminaImageGenerationRequest,
-    DreaminaImageRequest, DreaminaImageWorkflowRequest, DreaminaTaskCreated, DreaminaTaskError,
-    DreaminaVideoContent, DreaminaVideoGenerationRequest, DreaminaVideoRequest, DreaminaVideoTask,
+    DREAMINA_IMAGES_API_PROFILE, DREAMINA_VIDEOS_API_PROFILE, DreaminaCancellation,
+    DreaminaImageGenerationRequest, DreaminaImageRequest, DreaminaImageWorkflowRequest,
+    DreaminaProviderProgress, DreaminaTaskCreated, DreaminaTaskError, DreaminaVideoContent,
+    DreaminaVideoGenerationRequest, DreaminaVideoRequest, DreaminaVideoTask,
     DreaminaVideoWorkflowRequest,
 };
 use image_provider_contracts::BillingMetric;
@@ -28,7 +29,9 @@ use crate::{
     artifacts::StoredGenerationResult,
     auth::{ApiKeyCapability, AuthContext},
     model_routing::ResolvedModelRoute,
-    settlement::{ExecutionSettlementStore, VideoResultStatus},
+    settlement::{
+        ExecutionSettlementStore, VideoPendingStage, VideoProviderProgress, VideoResultStatus,
+    },
     usage::{UsageCharge, UsageLimits},
 };
 
@@ -870,18 +873,45 @@ async fn project_video_task(
 }
 
 fn video_task(id: Uuid, status: VideoResultStatus) -> DreaminaVideoTask {
-    match status {
-        VideoResultStatus::Pending { model, .. } => DreaminaVideoTask {
-            id: id.to_string(),
-            status: "running".to_owned(),
-            model: Some(model),
-            error: None,
-            content: None,
-            settlement: None,
-        },
-        VideoResultStatus::Uncertain { model, .. } => DreaminaVideoTask {
+    let mut task = match status {
+        VideoResultStatus::Pending {
+            model,
+            stage,
+            provider_progress,
+            ..
+        } => {
+            let stage = match (&provider_progress, stage) {
+                (_, VideoPendingStage::Queued) => "queued",
+                (_, VideoPendingStage::Dispatching) => "dispatching",
+                (Some(progress), VideoPendingStage::Processing)
+                    if progress.progress.provider_status == "Queueing" =>
+                {
+                    "provider_queued"
+                }
+                (_, VideoPendingStage::Processing) => "processing",
+            };
+            DreaminaVideoTask {
+                id: id.to_string(),
+                status: "running".to_owned(),
+                stage: Some(stage.to_owned()),
+                provider_progress: provider_progress.map(public_provider_progress),
+                cancellation: None,
+                model: Some(model),
+                error: None,
+                content: None,
+                settlement: None,
+            }
+        }
+        VideoResultStatus::Uncertain {
+            model,
+            provider_progress,
+            ..
+        } => DreaminaVideoTask {
             id: id.to_string(),
             status: "uncertain".to_owned(),
+            stage: None,
+            provider_progress: provider_progress.map(public_provider_progress),
+            cancellation: None,
             model: Some(model),
             error: Some(DreaminaTaskError {
                 code: "generation_uncertain".to_owned(),
@@ -897,6 +927,9 @@ fn video_task(id: Uuid, status: VideoResultStatus) -> DreaminaVideoTask {
         } => DreaminaVideoTask {
             id: id.to_string(),
             status: "succeeded".to_owned(),
+            stage: None,
+            provider_progress: None,
+            cancellation: None,
             model: Some(model),
             error: None,
             content: Some(DreaminaVideoContent {
@@ -912,6 +945,9 @@ fn video_task(id: Uuid, status: VideoResultStatus) -> DreaminaVideoTask {
         } => DreaminaVideoTask {
             id: id.to_string(),
             status: "succeeded".to_owned(),
+            stage: None,
+            provider_progress: None,
+            cancellation: None,
             model: Some(model),
             error: None,
             content: Some(DreaminaVideoContent {
@@ -932,6 +968,9 @@ fn video_task(id: Uuid, status: VideoResultStatus) -> DreaminaVideoTask {
             DreaminaVideoTask {
                 id: id.to_string(),
                 status: "failed".to_owned(),
+                stage: None,
+                provider_progress: None,
+                cancellation: None,
                 model: Some(model),
                 error: Some(DreaminaTaskError {
                     code: error_code.unwrap_or_else(|| "generation_failed".to_owned()),
@@ -941,6 +980,21 @@ fn video_task(id: Uuid, status: VideoResultStatus) -> DreaminaVideoTask {
                 settlement: None,
             }
         }
+    };
+    task.cancellation = Some(DreaminaCancellation {
+        supported: false,
+        reason: "provider_cancellation_unsupported".to_owned(),
+    });
+    task
+}
+
+fn public_provider_progress(value: VideoProviderProgress) -> DreaminaProviderProgress {
+    DreaminaProviderProgress {
+        provider_status: value.progress.provider_status,
+        queue_position: value.progress.queue_position,
+        queue_total: value.progress.queue_total,
+        estimated_remaining_seconds: value.progress.estimated_remaining_seconds,
+        observed_at_ms: value.observed_at_ms,
     }
 }
 
@@ -1149,11 +1203,13 @@ mod tests {
             Some(VideoResultStatus::Pending {
                 model: "seedance2.5".to_owned(),
                 duration_ms: 5000,
+                provider_progress: None,
                 stage: crate::settlement::VideoPendingStage::Processing,
             }),
             Some(VideoResultStatus::Uncertain {
                 model: "seedance2.5".to_owned(),
                 duration_ms: 5000,
+                provider_progress: None,
             }),
             Some(VideoResultStatus::Succeeded {
                 model: "seedance2.5".to_owned(),
@@ -1233,6 +1289,7 @@ mod tests {
             VideoResultStatus::Pending {
                 model: "seedance2.0fast_vip".to_owned(),
                 duration_ms: 5000,
+                provider_progress: None,
                 stage: crate::settlement::VideoPendingStage::Processing,
             },
         );
@@ -1245,6 +1302,7 @@ mod tests {
             VideoResultStatus::Uncertain {
                 model: "seedance2.0fast_vip".to_owned(),
                 duration_ms: 5000,
+                provider_progress: None,
             },
         ))
         .unwrap();
@@ -1254,6 +1312,116 @@ mod tests {
         assert_eq!(uncertain["error"]["code"], "generation_uncertain");
         assert_eq!(uncertain["error"]["message"], VIDEO_UNCERTAIN_MESSAGE);
         assert!(uncertain.get("content").is_none());
+    }
+
+    fn queue_progress() -> VideoProviderProgress {
+        VideoProviderProgress {
+            progress: image_provider_sdk::ProviderTaskProgress {
+                provider_status: "Queueing".to_owned(),
+                queue_position: Some(3341),
+                queue_total: Some(476961),
+                estimated_remaining_seconds: Some(27131),
+            },
+            observed_at_ms: 1_792_828_821_077,
+        }
+    }
+
+    #[test]
+    fn video_query_exposes_the_original_queue_and_observation_time_without_cancel_support() {
+        let task = video_task(
+            Uuid::new_v4(),
+            VideoResultStatus::Pending {
+                model: "seedance2.0fast".to_owned(),
+                duration_ms: 10_000,
+                stage: VideoPendingStage::Processing,
+                provider_progress: Some(queue_progress()),
+            },
+        );
+        let json = serde_json::to_value(task).unwrap();
+        assert_eq!(json["status"], "running");
+        assert_eq!(json["stage"], "provider_queued");
+        assert_eq!(json["provider_progress"]["provider_status"], "Queueing");
+        assert_eq!(json["provider_progress"]["queue_position"], 3341);
+        assert_eq!(json["provider_progress"]["queue_total"], 476961);
+        assert_eq!(
+            json["provider_progress"]["estimated_remaining_seconds"],
+            27131
+        );
+        assert_eq!(
+            json["provider_progress"]["observed_at_ms"],
+            1_792_828_821_077_i64
+        );
+        assert_eq!(json["cancellation"]["supported"], false);
+        assert_eq!(
+            json["cancellation"]["reason"],
+            "provider_cancellation_unsupported"
+        );
+        assert!(json.get("content").is_none());
+        assert!(json.get("settlement").is_none());
+        assert!(json["provider_progress"].get("priority").is_none());
+    }
+
+    #[test]
+    fn local_queue_and_unknown_provider_progress_do_not_invent_an_upstream_phase() {
+        let local = video_task(
+            Uuid::new_v4(),
+            VideoResultStatus::Pending {
+                model: "seedance2.0fast".to_owned(),
+                duration_ms: 10_000,
+                stage: VideoPendingStage::Queued,
+                provider_progress: None,
+            },
+        );
+        assert_eq!(local.stage.as_deref(), Some("queued"));
+        assert!(local.provider_progress.is_none());
+
+        let mut progress = queue_progress();
+        progress.progress.provider_status = "FutureProviderState".to_owned();
+        progress.progress.queue_position = None;
+        progress.progress.queue_total = None;
+        progress.progress.estimated_remaining_seconds = None;
+        let unknown = serde_json::to_value(video_task(
+            Uuid::new_v4(),
+            VideoResultStatus::Pending {
+                model: "seedance2.0fast".to_owned(),
+                duration_ms: 10_000,
+                stage: VideoPendingStage::Processing,
+                provider_progress: Some(progress),
+            },
+        ))
+        .unwrap();
+        assert_eq!(unknown["stage"], "processing");
+        assert_eq!(
+            unknown["provider_progress"]["provider_status"],
+            "FutureProviderState"
+        );
+        assert!(unknown["provider_progress"].get("queue_position").is_none());
+        assert!(unknown["provider_progress"].get("queue_total").is_none());
+        assert!(
+            unknown["provider_progress"]
+                .get("estimated_remaining_seconds")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_last_known_queue_observation_never_hides_uncertainty_or_refreshes_its_timestamp() {
+        let task = video_task(
+            Uuid::new_v4(),
+            VideoResultStatus::Uncertain {
+                model: "seedance2.0fast".to_owned(),
+                duration_ms: 10_000,
+                provider_progress: Some(queue_progress()),
+            },
+        );
+        assert_eq!(task.status, "uncertain");
+        assert_eq!(task.error.unwrap().code, "generation_uncertain");
+        assert!(task.stage.is_none());
+        assert_eq!(
+            task.provider_progress.unwrap().observed_at_ms,
+            1_792_828_821_077
+        );
+        assert!(task.settlement.is_none());
     }
 
     #[test]

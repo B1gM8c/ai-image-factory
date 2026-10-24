@@ -811,6 +811,7 @@ fn console_video_status(
             model,
             duration_ms,
             stage,
+            ..
         } => ConsoleVideoStatus {
             task_id: task_id.to_owned(),
             status: "pending",
@@ -821,7 +822,9 @@ fn console_video_status(
             content_url: None,
             error: None,
         },
-        VideoResultStatus::Uncertain { model, duration_ms } => ConsoleVideoStatus {
+        VideoResultStatus::Uncertain {
+            model, duration_ms, ..
+        } => ConsoleVideoStatus {
             task_id: task_id.to_owned(),
             status: "uncertain",
             stage: None,

@@ -66,6 +66,55 @@ expiry in the current receipt, so no lifetime is promised. A consumer needing
 durable media, such as Blog, should copy the successful result to its own storage
 once and save that durable URL.
 
+### Upstream queue observations and cancellation
+
+Running video responses retain `status: "running"` and may include
+`provider_progress`: `provider_status`, optional `queue_position`, `queue_total`,
+`estimated_remaining_seconds`, and the durable `observed_at_ms` timestamp.
+The CLI's `queue_idx` is returned unchanged as `queue_position`; it does not
+establish the number of people ahead. Unknown fields are omitted, including an
+unavailable estimate. Priority and upstream debug metadata are not exposed.
+Estimates describe the provider's observation, not a guaranteed completion time
+or a precise countdown. Reading the API does not run another CLI query or renew
+the observation timestamp. Clients should show the age of the observation.
+
+`stage: "queued"` means Factory's local queue; `provider_queued` requires a real
+`Queueing` upstream observation. `dispatching` and `processing` describe Factory
+tracking and do not prove rendering has started. Unknown provider states retain
+their original status string. An uncertain response keeps its error and may show
+the last known progress as historical information. Success and failure omit
+queue progress. While the provider explicitly reports `Queueing`, Factory polls
+the original ID every 30 seconds; other states retain the existing five-second
+cadence. No new generation is submitted to refresh a queue position.
+
+Official CLI 1.4.21 has no upstream cancellation command. Responses therefore
+report `cancellation: {"supported": false, "reason":
+"provider_cancellation_unsupported"}`. Clients must not advertise a successful
+API cancellation or refund based on that capability. Stopping local polling
+does not cancel the upstream generation. An account operator can use the
+official Dreamina website separately; it must not expose the shared upstream
+account to ordinary API consumers.
+
+### Accepted video completion budget
+
+An accepted single-output Dreamina video has a separate completion budget ending
+24 hours after its original durable acceptance time. The original submit
+deadline, submission ID, upstream task ID and execution binding remain frozen.
+No API read, progress observation, restart or deployment restarts that window.
+An original budget longer than 24 hours is preserved. Images, native image
+batches and submissions without confirmed acceptance keep their existing rules.
+
+The completion grant is append-only and binds the original accepted operation.
+Migration 143 can grant it to an unresolved, unleased accepted video only while
+the original acceptance-based window is still open and the task has no terminal
+decision, result, charge or contradictory receipt. It cannot reopen a quarantined
+or terminal task. Polling, heartbeat, result publication and deadline resolution
+all use the same validated completion authority; the submit authority is never
+extended. Expiry records `uncertain`, preserves the hold and requires explicit
+reconciliation. It does not establish failure, permit regeneration or authorize a
+refund. The poll daemon resolves expired tasks instead of silently abandoning
+them in `provider_waiting`.
+
 ## Model and media constraints
 
 The model catalog includes the selectable CLI model versions and the fixed
