@@ -1,0 +1,296 @@
+#!/usr/bin/env python3
+"""Synchronize stopped release-managed submitters with a verified runner.
+
+The updater holds the host update lock and drains consumers before invoking this
+hook. The root-owned manifest is persisted only after full release verification.
+Re-running after a partial write or selecting the previous release repairs pins
+before any consumer starts; no credential values are evaluated or logged.
+"""
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import stat
+import subprocess
+import sys
+import tempfile
+
+
+RUNNER = 'PROVIDER_SUBMITTER_RUNNER'
+PIN = RUNNER + '_SHA256'
+PROFILE = re.compile(r'[A-Za-z0-9_.-]{1,192}\Z')
+SHA256 = re.compile(r'[0-9a-f]{64}\Z')
+
+
+class PinError(ValueError):
+    pass
+
+
+def require(condition, message):
+    if not condition:
+        raise PinError(message)
+
+
+def same_file(left, right):
+    return all(getattr(left, key) == getattr(right, key) for key in
+               ('st_dev', 'st_ino', 'st_uid', 'st_gid', 'st_mode',
+                'st_size', 'st_mtime_ns', 'st_ctime_ns'))
+
+
+def protected(path, root, uid, directory=False, allow_hardlinks=False):
+    """Check every component inside a trusted boundary without following links."""
+    path.relative_to(root)
+    for part in [*reversed(path.parents), path]:
+        if part != root and root not in part.parents:
+            continue
+        metadata = part.lstat()
+        require(metadata.st_uid == uid and not metadata.st_mode & 0o7022,
+                'unprotected runner configuration or release path')
+        is_directory = part != path or directory
+        require(stat.S_ISDIR(metadata.st_mode) if is_directory else
+                stat.S_ISREG(metadata.st_mode) and (allow_hardlinks or metadata.st_nlink == 1),
+                'runner configuration or release path has an unsafe file type')
+    return metadata
+
+
+def bounded(path, root, uid, maximum, allow_empty=False, allow_hardlinks=False):
+    metadata = protected(path, root, uid, allow_hardlinks=allow_hardlinks)
+    require((0 if allow_empty else 1) <= metadata.st_size <= maximum,
+            'runner metadata size is invalid')
+    with path.open('rb') as source:
+        require(same_file(os.fstat(source.fileno()), metadata), 'runner metadata changed while opening')
+        data = source.read(maximum + 1)
+        require(same_file(os.fstat(source.fileno()), metadata) and len(data) == metadata.st_size,
+                'runner metadata changed while reading')
+    return data, metadata
+
+
+def json_object(pairs):
+    result = {}
+    for key, value in pairs:
+        require(key not in result, 'duplicate runner manifest field')
+        result[key] = value
+    return result
+
+
+def approved_runner(release_root, uid):
+    protected(release_root / 'releases', release_root, uid, directory=True)
+    current = release_root / 'current'
+    link = current.lstat()
+    require(stat.S_ISLNK(link.st_mode) and link.st_uid == uid,
+            'current release must be a protected symlink')
+    target = Path(os.path.normpath(release_root / os.readlink(current)))
+    require(target.parent == release_root / 'releases' and PROFILE.fullmatch(target.name),
+            'current release is outside the protected releases directory')
+    identity_bytes, _ = bounded(target / 'release.json', release_root, uid, 65536)
+    identity = json.loads(identity_bytes, object_pairs_hook=json_object)
+    require(isinstance(identity, dict) and identity.get('schema_version') == 1 and
+            identity.get('release_version') == target.name and
+            isinstance(identity.get('commit_sha'), str) and
+            re.fullmatch(r'[0-9a-fA-F]{40}', identity['commit_sha']) and
+            identity.get('target_triple') in
+            ('x86_64-unknown-linux-gnu', 'aarch64-unknown-linux-gnu'),
+            'current release identity is invalid')
+    manifest_path = release_root / 'verified-manifests' / (
+        identity['release_version'] + '-' + identity['target_triple'] + '.manifest.json')
+    manifest_bytes, _ = bounded(manifest_path, release_root, uid, 8 * 1024 * 1024,
+                                allow_hardlinks=True)
+    manifest = json.loads(manifest_bytes, object_pairs_hook=json_object)
+    require(isinstance(manifest, dict) and manifest.get('schema_version') == 1 and
+            all(manifest.get(field) == identity[field] for field in
+                ('release_version', 'commit_sha', 'target_triple')) and
+            isinstance(manifest.get('files'), list), 'verified runner manifest identity mismatch')
+    entries = [entry for entry in manifest['files'] if isinstance(entry, dict) and
+               entry.get('path') == 'bin/remote-submit-runner']
+    require(len(entries) == 1, 'verified manifest must contain exactly one runner')
+    entry = entries[0]
+    require(isinstance(entry.get('sha256'), str) and SHA256.fullmatch(entry['sha256']) and
+            type(entry.get('bytes')) is int and entry['bytes'] > 0 and entry.get('mode') == 0o755,
+            'verified runner manifest entry is invalid')
+    runner = target / 'bin/remote-submit-runner'
+    metadata = protected(runner, release_root, uid)
+    require(stat.S_IMODE(metadata.st_mode) == entry['mode'] and
+            metadata.st_size == entry['bytes'], 'verified runner size or mode mismatch')
+    digest = hashlib.sha256()
+    with runner.open('rb') as source:
+        require(same_file(os.fstat(source.fileno()), metadata), 'runner changed while opening')
+        for block in iter(lambda: source.read(1024 * 1024), b''):
+            digest.update(block)
+        require(same_file(os.fstat(source.fileno()), metadata), 'runner changed while reading')
+    require(digest.hexdigest() == entry['sha256'], 'verified runner digest mismatch')
+    return entry['sha256'].encode('ascii'), target
+
+
+def fields(data):
+    result = {}
+    offset = 0
+    for line in data.splitlines(keepends=True):
+        match = re.fullmatch(rb'[ \t]*(' + RUNNER.encode() + rb'|' + PIN.encode() +
+                             rb')[ \t]*=[ \t]*([^\r\n]*)(\r?\n)?', line)
+        if not match:
+            offset += len(line)
+            continue
+        key = match[1].decode('ascii')
+        require(key not in result, 'duplicate runner configuration field')
+        value = match[2].strip(b' \t')
+        if value[:1] in (b'\"', b"'"):
+            require(len(value) >= 2 and value[-1:] == value[:1] and
+                    value[:1] not in value[1:-1], 'unsupported quoted runner configuration')
+            value = value[1:-1]
+        require(not any(char in value for char in (b'\\', b'\"', b"'", b'\x00')),
+                'unsupported runner configuration value')
+        result[key] = (value, line, match, offset)
+        offset += len(line)
+    return result
+
+
+def systemd_state(unit):
+    result = subprocess.run(['/usr/bin/systemctl', 'show', unit,
+                             '--property=ActiveState,MainPID,ControlGroup,UnitFileState,LoadState'],
+                            capture_output=True, text=True, check=False)
+    state = dict(line.split('=', 1) for line in result.stdout.splitlines() if '=' in line)
+    require(result.returncode == 0 or state.get('LoadState') == 'not-found',
+            'cannot inspect runner consumer state')
+    require(state.get('ActiveState') and state.get('MainPID', '').isdigit(),
+            'incomplete runner consumer state')
+    group = state.get('ControlGroup', '')
+    pids = []
+    if group:
+        require(group.startswith('/') and '..' not in Path(group).parts,
+                'invalid runner consumer cgroup')
+        cgroup = Path('/sys/fs/cgroup') / group.lstrip('/')
+        if cgroup.exists():
+            for directory, _, _ in os.walk(cgroup, followlinks=False):
+                pids.extend((Path(directory) / 'cgroup.procs').read_text().split())
+    state['pids'] = pids
+    return state
+
+
+def stopped(state):
+    return state.get('ActiveState') in ('inactive', 'failed') and \
+        state.get('MainPID') == '0' and not state.get('pids')
+
+
+def atomic_replace(path, data, metadata):
+    require(same_file(path.lstat(), metadata), 'runner configuration changed before replacement')
+    descriptor, name = tempfile.mkstemp(prefix='.runner-pin-', suffix='.tmp', dir=path.parent)
+    try:
+        with os.fdopen(descriptor, 'wb') as destination:
+            os.fchmod(destination.fileno(), 0o600)
+            destination.write(data)
+            destination.flush()
+            os.fchown(destination.fileno(), metadata.st_uid, metadata.st_gid)
+            os.fchmod(destination.fileno(), stat.S_IMODE(metadata.st_mode))
+            os.fsync(destination.fileno())
+        os.replace(name, path)
+        parent = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(parent)
+        finally:
+            os.close(parent)
+    finally:
+        if os.path.exists(name):
+            os.unlink(name)
+
+
+def sync_pins(release_root, config_root, uid, state=systemd_state,
+              replace=atomic_replace, check=False):
+    canonical = str(release_root / 'current/bin/remote-submit-runner').encode()
+    profiles = config_root / 'remote-providers'
+    configured = []
+    if profiles.exists() or profiles.is_symlink():
+        protected(profiles, config_root, uid, directory=True)
+        for path in sorted(profiles.glob('*.env')):
+            require(PROFILE.fullmatch(path.stem), 'invalid runner profile filename')
+            data, metadata = bounded(path, config_root, uid, 1024 * 1024, allow_empty=True)
+            configured.append((path, data, metadata, fields(data)))
+
+    legacy = None
+    defaults = {}
+    app = config_root / 'app.env'
+    if app.exists() or app.is_symlink():
+        singleton = state('ai-image-factory-provider-submitd.service')
+        legacy_enabled = singleton.get('UnitFileState', '').startswith('enabled') or not stopped(singleton)
+        inherited = any(RUNNER not in values or
+                        (values[RUNNER][0] == canonical and PIN not in values)
+                        for _, _, _, values in configured)
+        if legacy_enabled or inherited:
+            data, _ = bounded(app, config_root, uid, 1024 * 1024, allow_empty=True)
+            defaults = fields(data)
+            if legacy_enabled and defaults.get(RUNNER, (None,))[0] == canonical:
+                require(PIN in defaults and SHA256.fullmatch(defaults[PIN][0].decode('ascii')),
+                        'legacy runner must have one valid SHA256 pin')
+                legacy = defaults[PIN][0]
+    managed = []
+    for path, data, metadata, values in configured:
+        if values.get(RUNNER, defaults.get(RUNNER, (None,)))[0] == canonical:
+            if PIN not in values and PIN in defaults:
+                values[PIN] = (defaults[PIN][0], None, None, None)
+            require(PIN in values and SHA256.fullmatch(values[PIN][0].decode('ascii')),
+                    'release-managed runner must have one valid SHA256 pin')
+            managed.append((path, data, metadata, values))
+    if not managed and legacy is None:
+        return 0
+
+    digest, target = approved_runner(release_root, uid)
+    require(legacy is None or legacy == digest,
+            'enabled legacy runner pin requires operator migration to remote-providers')
+    changed = [profile for profile in managed if profile[3][PIN][0] != digest]
+    if check:
+        require(not changed, 'release-managed runner pin does not match the current release')
+        return 0
+    if not changed:
+        return 0
+    for path, _, _, _ in managed:
+        # systemd treats an unescaped hyphen as '/'; %I must round-trip the filename.
+        instance = path.stem.replace('-', r'\x2d')
+        if instance.startswith('.'):
+            instance = r'\x2e' + instance[1:]
+        for consumer in ('remote-workerd', 'provider-submitd', 'provider-pollerd'):
+            require(stopped(state('ai-image-factory-' + consumer + '@' + instance + '.service')),
+                    'runner consumers must be fully stopped before changing pins')
+    for path, data, metadata, values in changed:
+        old_line, match, offset = values[PIN][1:]
+        if old_line is None:
+            # Override an inherited app.env pin inside this writable profile only.
+            separator = b'' if not data or data.endswith(b'\n') else b'\n'
+            updated = data + separator + PIN.encode() + b'=' + digest + b'\n'
+        else:
+            # Replace only the pin's value; retain quotes, whitespace and all other bytes.
+            start = match.start(2) + len(match[2]) - len(match[2].lstrip(b' \t'))
+            end = match.end(2) - len(match[2]) + len(match[2].rstrip(b' \t'))
+            if old_line[start:start + 1] in (b'\"', b"'"):
+                start += 1
+                end -= 1
+            new_line = old_line[:start] + digest + old_line[end:]
+            updated = data[:offset] + new_line + data[offset + len(old_line):]
+        require(Path(os.path.normpath(release_root / os.readlink(release_root / 'current'))) == target,
+                'current release changed before pin synchronization')
+        replace(path, updated, metadata)
+    return len(changed)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--check', action='store_true', help='check current pins without modifying them')
+    args = parser.parse_args()
+    try:
+        require(os.geteuid() == 0, 'runner pin synchronization requires root')
+        release_root = Path('/opt/ai-image-factory')
+        config_root = Path('/etc/ai-image-factory')
+        for root in (release_root, config_root):
+            protected(root, Path('/'), 0, directory=True)
+        count = sync_pins(release_root, config_root, 0, check=args.check)
+        print('remote runner pins checked' if args.check else f'remote runner pins synchronized: {count}')
+    except (ValueError, OSError, TypeError, KeyError, UnicodeError) as error:
+        # OS and JSON exceptions can contain source values or paths; never echo them.
+        message = str(error) if isinstance(error, PinError) else 'runner metadata or configuration is invalid'
+        print('remote runner pins: ' + message, file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

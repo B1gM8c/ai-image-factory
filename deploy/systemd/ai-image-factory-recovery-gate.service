@@ -13,6 +13,7 @@ User=root
 Group=root
 EnvironmentFile=/etc/ai-image-factory/update-policy.env
 EnvironmentFile=/etc/ai-image-factory/updater.env
+Environment=AIF_UPDATE_RUNNER_PINS_HOOK=/usr/libexec/ai-image-factory/hooks/sync-remote-runner-pins
 WorkingDirectory=/var/lib/ai-image-factory/updater
 ExecStart=/usr/libexec/ai-image-factory/updated recover-pending
 TimeoutStartSec=45min
@@ -30,6 +31,8 @@ ReadOnlyPaths=/usr/libexec/ai-image-factory
 ReadWritePaths=/opt/ai-image-factory
 # Recovery stages and atomically renames artifact siblings in this directory.
 ReadWritePaths=/var/lib/ai-image-factory
+# Optional for hosts without remote profiles; only runner pins are synchronized.
+ReadWritePaths=-/etc/ai-image-factory/remote-providers
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 RestrictSUIDSGID=yes
 SystemCallArchitectures=native

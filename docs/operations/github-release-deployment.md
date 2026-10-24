@@ -411,9 +411,13 @@ the manifest-to-bundle digest and size, rejects duplicate, escaping, linked, or
 special archive members, checks both outer binaries and inner admin native
 modules against the target architecture, verifies every file digest and fixed
 mode, validates `release.json`, atomically installs the release, installs the
-initial fixed updater, and only then creates `current`. A retry may resume the
-same fully verified release after a crash, but it never replaces different
-existing content or a pointer to another release; later changes must use the
+initial fixed updater, persists the verified manifest under
+`/opt/ai-image-factory/verified-manifests/VERSION-TARGET.manifest.json`, and only
+then creates `current`. The updater also persists that protected manifest after
+verifying and staging a release, including a retry of an existing staged tree.
+The stored manifest is release metadata, not a replacement for provenance or
+bundle verification. A retry may resume the same fully verified release after a
+crash, but it never replaces different existing content or a pointer to another release; later changes must use the
 updater state machine.
 
 Each bundle also contains `bin/grok-v1`, `bin/grok-v2`, the V1 compatibility
@@ -480,9 +484,11 @@ files through the same maintenance procedure; do not switch the live application
 This is a recovery-safety preparation window, not feature activation. Keep the
 existing fixed `updated` binary and the other existing host hooks/units; leave
 `segmentd` disabled. The isolated native rehearsal must start from that same
-baseline host layout, apply only the five-hook/three-unit preparation, and drive
-the failed upgrade and fenced recovery with the baseline fixed updater. Record
-its actual PID/executable digest as well as the installed hook/unit digests.
+baseline host layout, apply the five recovery hooks/three units plus the
+`sync-remote-runner-pins` prerequisite, and drive the failed upgrade and fenced
+recovery with the baseline fixed updater. Record its actual PID/executable digest as well as the installed hook/unit digests.
+That fixture has no remote profiles, so runner-pin synchronization is a no-op;
+it does not exercise the runner-pin activation preparation below.
 Any required fixed-updater replacement is a later step, after application
 verification, through the two-phase helper below; preinstalling a candidate
 updater is not evidence for this staged procedure.
@@ -564,10 +570,65 @@ directories are private, separate, and unique to each profile.
 Both CLI executable paths and SHA-256 values must match the verified installed
 CLI. Set `GATEWAY_MANAGED_DREAMINA_EXECUTABLE` in `app.env` to the same CLI version
 for login, quota, and model discovery. The submit runner path and digest must
-match the active release's `bin/remote-submit-runner`. On subsequent releases,
-include a changed runner digest in the protected configuration switch while
-admission is closed and consumers are drained; restore the prior configuration
-pin when recovering the prior release. Do not change a pin while work is active.
+match the active release's `bin/remote-submit-runner`. For profiles configured
+with the fixed `/opt/ai-image-factory/current/bin/remote-submit-runner` path,
+`sync-remote-runner-pins` verifies the active runner against its protected stored
+manifest and atomically updates only `PROVIDER_SUBMITTER_RUNNER_SHA256` in the
+root-owned profile files. `start-processes` invokes it before starting the full
+consumer set, after admission has closed and consumers have drained. Recovery
+restores `current` first, then the same hook restores the old release's pins
+before its consumers restart. Each file update is durable and idempotent: a
+partially completed multi-profile switch is completed on reentry, without
+submitting a provider task. A missing or invalid active manifest fails closed.
+Custom external runner paths are preserved.
+
+The three updater/recovery units configure the protected hook through
+`AIF_UPDATE_RUNNER_PINS_HOOK`. Before closing admission for Apply, the updater
+runs its read-only `--check` preflight so missing recovery metadata is caught
+while the current application is still serving. With no managed canonical
+runner profiles, the hook is a no-op and does not require a stored manifest.
+The units retain `ProtectSystem=strict`; the only additional writable path is
+optional `-/etc/ai-image-factory/remote-providers`. Neither `/etc` nor the whole
+Factory configuration directory is writable. Never change an active pin by
+hand while consumers are running.
+
+Legacy enabled singleton submitters that keep the canonical runner path in
+`app.env` need to move that configuration into a remote profile before a runner
+change. The hook does not rewrite `app.env` or broaden its sandbox to do so.
+An unused legacy singleton configuration does not block managed profiles.
+
+For an existing host that predates stored manifests, perform a separately
+reviewed host preparation before the first runner-changing Apply:
+
+1. Prove the update queue is idle and no protected recovery descriptor remains;
+   retain recoverable copies of the fixed updater, lifecycle hooks, all three
+   updater/recovery units, and their effective configuration. Keep Apply disabled
+   during preparation and retain its prior policy for restoration afterward.
+2. Recover the active release's manifest from its original trusted, verified
+   package. Validate its release identity and installed files, then persist it
+   root-owned and without group/world write permission at
+   `/opt/ai-image-factory/verified-manifests/VERSION-TARGET.manifest.json`.
+   Preserve existing protected metadata; do not construct a manifest from live
+   executable hashes or copy one from an unverified checkout.
+3. Independently verify the new signed candidate's complete package. Install
+   its `ops/hooks/sync-remote-runner-pins`, `ops/hooks/start-processes`, and three
+   updater/recovery units as fixed host files, checking each installed digest
+   against that package's manifest. Retain the prior files and run
+   `systemctl daemon-reload`.
+4. This feature also requires the candidate fixed updater's manifest-persistence
+   and preflight support before application Apply. Stage that candidate through
+   the normal owner Check, then use the existing `upgrade-updater` helper with
+   its explicit verified `releases/VERSION/bin/updated` path. Verify the new
+   fixed binary's digest, protocol identity, and service startup. This limited
+   host preparation leaves the active application, schema, and business-service
+   PIDs unchanged; it does not activate the candidate application.
+5. Run the installed hook with `--check`, repeat normal owner Check with the new
+   updater, and confirm the verified candidate receipt and protected staged
+   manifest. Restore the prior Apply policy, then use normal owner Apply with
+   its admission, backup, migration, recovery, and runtime gates. If preparation
+   fails, restore the saved host files before continuing; do not edit `current`
+   or migrate the database by hand.
+
 The poller example limits concurrent artifact downloads to one independently
 of the account's generation concurrency; raise it only within profile capacity.
 

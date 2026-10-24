@@ -5,7 +5,7 @@ use std::{
     fs::OpenOptions,
     future::Future,
     io::{Read, Write},
-    os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt, symlink},
+    os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt, symlink},
     path::{Component, Path, PathBuf},
     process::{Output, Stdio},
     str::FromStr,
@@ -181,6 +181,7 @@ pub struct UpdaterConfig {
     activate_hook: Option<PathBuf>,
     verify_hook: Option<PathBuf>,
     retention_hook: Option<PathBuf>,
+    runner_pins_hook: Option<PathBuf>,
     verify_context: BTreeMap<String, String>,
     poll_interval: Duration,
     lease_duration: Duration,
@@ -245,6 +246,7 @@ impl UpdaterConfig {
         let activate_hook = optional_absolute_env_path("AIF_UPDATE_ACTIVATE_HOOK")?;
         let verify_hook = optional_absolute_env_path("AIF_UPDATE_VERIFY_HOOK")?;
         let retention_hook = optional_absolute_env_path("AIF_UPDATE_RETENTION_HOOK")?;
+        let runner_pins_hook = optional_absolute_env_path("AIF_UPDATE_RUNNER_PINS_HOOK")?;
         let verify_context = configured_verify_context();
         for hook in [
             &admission_close_hook,
@@ -256,6 +258,7 @@ impl UpdaterConfig {
             &activate_hook,
             &verify_hook,
             &retention_hook,
+            &runner_pins_hook,
         ]
         .into_iter()
         .flatten()
@@ -286,6 +289,7 @@ impl UpdaterConfig {
             activate_hook,
             verify_hook,
             retention_hook,
+            runner_pins_hook,
             verify_context,
             poll_interval: duration_env("AIF_UPDATE_POLL_INTERVAL_MS", DEFAULT_POLL_INTERVAL)?,
             lease_duration: duration_env("AIF_UPDATE_LEASE_MS", DEFAULT_LEASE_DURATION)?,
@@ -723,6 +727,8 @@ impl Updater {
         let previous_release =
             read_current_release(&current_link, &self.config.release_root.join("releases"))?;
         ensure_upgrade_version(version, &previous_release)?;
+        let service_context = self.service_update_context(claim, &staged, None);
+        check_runner_pins(self.config.runner_pins_hook.as_deref(), &service_context).await?;
         let mut recovery = RecoveryDescriptor::new(claim, &staged, previous_release.clone());
         self.persist_recovery_descriptor(&recovery)?;
         if let Err(error) = self.assert_lease(claim).await {
@@ -738,7 +744,6 @@ impl Updater {
                 .resume_previous(claim, &staged, &hooks, &previous_release, error)
                 .await;
         }
-        let service_context = self.service_update_context(claim, &staged, None);
         if let Err(error) = run_hook(&hooks.admission_close, &service_context).await {
             return self
                 .resume_previous(claim, &staged, &hooks, &previous_release, error)
@@ -1161,14 +1166,19 @@ impl Updater {
                 "backup_token_sha256": sha256_hex(backup_token.as_bytes())
             }),
         );
-        self.assert_lease(claim).await?;
-        if let Err(recovery_error) =
-            atomic_switch(&self.config.release_root.join("current"), previous_release)
+        if let Err(recovery_error) = quiesce_and_switch_release(
+            &hooks.quiesce,
+            &service_context,
+            &self.config.release_root.join("current"),
+            previous_release,
+            || self.assert_lease(claim),
+        )
+        .await
         {
             self.mark_restore_required(claim, &cause, &recovery_error)
                 .await?;
             return Err(UpdaterError::RestoreRequired(format!(
-                "automatic recovery could not restore the previous release pointer: {recovery_error}"
+                "automatic recovery could not quiesce and restore the previous release pointer: {recovery_error}"
             )));
         }
         let mut context = match self.migration_update_context(claim, staged, Some(backup_token)) {
@@ -1550,6 +1560,12 @@ impl Updater {
             tokio::fs::rename(&unpacked, &release_dir).await?;
             sync_directory(&releases_dir)?;
         }
+        persist_verified_manifest(
+            &self.config.release_root,
+            version,
+            &self.config.target_triple,
+            &manifest_bytes,
+        )?;
         let manifest_sha256 = sha256_hex(&manifest_bytes);
         if let Some(claim) = claim {
             self.append_journal(
@@ -1822,11 +1838,14 @@ impl Updater {
         let service_context = self.recovery_service_context(claim, &descriptor, startup_gate);
         self.assert_lease(claim).await?;
         run_hook(&hooks.admission_close, &service_context).await?;
-        self.assert_lease(claim).await?;
-        atomic_switch(
+        quiesce_and_switch_release(
+            &hooks.quiesce,
+            &service_context,
             &self.config.release_root.join("current"),
             &descriptor.previous_release,
-        )?;
+            || self.assert_lease(claim),
+        )
+        .await?;
 
         if descriptor.backup_token.is_some() {
             let recovery_context =
@@ -2974,6 +2993,33 @@ async fn wait_for_loss(receiver: &mut watch::Receiver<bool>) {
     }
 }
 
+async fn check_runner_pins(
+    hook: Option<&Path>,
+    context: &BTreeMap<String, String>,
+) -> Result<(), UpdaterError> {
+    if let Some(hook) = hook {
+        run_trusted(hook, [OsStr::new("--check")], context).await?;
+    }
+    Ok(())
+}
+
+async fn quiesce_and_switch_release<F, G>(
+    quiesce_hook: &Path,
+    context: &BTreeMap<String, String>,
+    current: &Path,
+    previous_release: &Path,
+    mut assert_lease: F,
+) -> Result<(), UpdaterError>
+where
+    F: FnMut() -> G,
+    G: Future<Output = Result<(), UpdaterError>>,
+{
+    assert_lease().await?;
+    run_hook(quiesce_hook, context).await?;
+    assert_lease().await?;
+    atomic_switch(current, previous_release)
+}
+
 async fn run_hook(
     executable: &Path,
     context: &BTreeMap<String, String>,
@@ -3658,6 +3704,95 @@ fn validate_trusted_executable(path: &Path) -> Result<(), UpdaterError> {
             )));
         }
         parent = directory.parent();
+    }
+    Ok(())
+}
+
+// Keep the attested manifest outside the signed release tree so activation and
+// recovery can select a runner digest without adding files to that tree.
+fn persist_verified_manifest(
+    release_root: &Path,
+    version: &str,
+    target: &str,
+    bytes: &[u8],
+) -> Result<(), UpdaterError> {
+    validate_release_token(version, "release_version")?;
+    validate_release_token(target, "target_triple")?;
+    if bytes.is_empty() || bytes.len() as u64 > MAX_MANIFEST_BYTES {
+        return Err(UpdaterError::InvalidRelease(
+            "verified manifest size is outside the supported range".to_string(),
+        ));
+    }
+    validate_protected_directory(release_root)?;
+    let directory = release_root.join("verified-manifests");
+    match std::fs::DirBuilder::new().mode(0o700).create(&directory) {
+        Ok(()) => sync_directory(release_root)?,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error.into()),
+    }
+    validate_protected_directory(&directory)?;
+    let destination = directory.join(format!("{version}-{target}.manifest.json"));
+    let mut temporary = tempfile::NamedTempFile::new_in(&directory)?;
+    temporary
+        .as_file()
+        .set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    temporary.write_all(bytes)?;
+    temporary.as_file().sync_all()?;
+    match temporary.persist_noclobber(&destination) {
+        Ok(_) => sync_directory(&directory),
+        Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let mut saved = OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(&destination)?;
+            let metadata = saved.metadata()?;
+            let effective_uid = unsafe { libc::geteuid() };
+            if !metadata.is_file()
+                || (metadata.uid() != 0 && metadata.uid() != effective_uid)
+                || metadata.permissions().mode() & 0o077 != 0
+                || metadata.len() != bytes.len() as u64
+            {
+                return Err(UpdaterError::InvalidRelease(
+                    "existing verified manifest is not a matching protected regular file"
+                        .to_string(),
+                ));
+            }
+            let mut existing = Vec::new();
+            saved.read_to_end(&mut existing)?;
+            if existing != bytes {
+                return Err(UpdaterError::InvalidRelease(
+                    "verified manifest conflicts with an existing release identity".to_string(),
+                ));
+            }
+            sync_directory(&directory)
+        }
+        Err(error) => Err(error.error.into()),
+    }
+}
+
+fn validate_protected_directory(path: &Path) -> Result<(), UpdaterError> {
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|component| matches!(component, Component::ParentDir | Component::CurDir))
+    {
+        return Err(UpdaterError::InvalidRelease(
+            "verified manifest directory must be an absolute protected path".to_string(),
+        ));
+    }
+    let effective_uid = unsafe { libc::geteuid() };
+    for directory in path.ancestors() {
+        let metadata = std::fs::symlink_metadata(directory)?;
+        if metadata.file_type().is_symlink()
+            || !metadata.is_dir()
+            || metadata.permissions().mode() & 0o022 != 0
+            || (metadata.uid() != 0 && metadata.uid() != effective_uid)
+        {
+            return Err(UpdaterError::InvalidRelease(format!(
+                "verified manifest directory is not protected: {}",
+                directory.display()
+            )));
+        }
     }
     Ok(())
 }
@@ -4392,6 +4527,170 @@ mod tests {
         validate_release_file_mode("ops/systemd/ai-image-factory.target", 0o644).unwrap();
         assert!(validate_release_file_mode("ops/systemd/evil.service", 0o755).is_err());
         assert!(validate_release_file_mode("admin/server.js", 0o755).is_err());
+    }
+
+    fn protected_test_directory() -> TempDir {
+        // /tmp can be writable or a symlink. These tests exercise the same
+        // protected ancestors required for installed trusted commands.
+        tempfile::Builder::new()
+            .prefix(".updater-offline-")
+            .tempdir_in(std::fs::canonicalize(env::current_dir().unwrap()).unwrap())
+            .unwrap()
+    }
+
+    #[test]
+    fn verified_manifest_persistence_is_private_idempotent_and_preserves_conflicts() {
+        let root = protected_test_directory();
+        let version = "v1.2.3";
+        let target = "x86_64-unknown-linux-gnu";
+        let bytes = b"{\"verified\":true}";
+        persist_verified_manifest(root.path(), version, target, bytes).unwrap();
+        let path = root
+            .path()
+            .join("verified-manifests")
+            .join(format!("{version}-{target}.manifest.json"));
+        let inode = std::fs::metadata(&path).unwrap().ino();
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        persist_verified_manifest(root.path(), version, target, bytes).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().ino(), inode);
+        assert!(
+            persist_verified_manifest(root.path(), version, target, b"{\"verified\":null}")
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert_eq!(
+            std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
+            1
+        );
+    }
+
+    #[test]
+    fn verified_manifest_reentry_accepts_an_interrupted_noclobber_publish() {
+        let root = protected_test_directory();
+        let version = "v1.2.3";
+        let target = "x86_64-unknown-linux-gnu";
+        persist_verified_manifest(root.path(), version, target, b"{}").unwrap();
+        let directory = root.path().join("verified-manifests");
+        let path = directory.join(format!("{version}-{target}.manifest.json"));
+        // A crash between persist_noclobber's link and unlink can leave its
+        // protected temporary name linked to the already published manifest.
+        std::fs::hard_link(&path, directory.join(".interrupted-publish")).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().nlink(), 2);
+        persist_verified_manifest(root.path(), version, target, b"{}").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"{}");
+        assert_eq!(std::fs::metadata(&path).unwrap().nlink(), 2);
+        assert!(persist_verified_manifest(root.path(), version, target, b"[]").is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"{}");
+    }
+
+    #[test]
+    fn verified_manifest_rejects_unprotected_directories_and_unsafe_files() {
+        let root = protected_test_directory();
+        let target = "x86_64-unknown-linux-gnu";
+        let directory = root.path().join("verified-manifests");
+        let outside = root.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        symlink(&outside, &directory).unwrap();
+        assert!(persist_verified_manifest(root.path(), "v1.2.3", target, b"{}").is_err());
+        std::fs::remove_file(&directory).unwrap();
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o770)).unwrap();
+        assert!(persist_verified_manifest(root.path(), "v1.2.3", target, b"{}").is_err());
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = directory.join(format!("v1.2.3-{target}.manifest.json"));
+        let other = outside.join("manifest.json");
+        std::fs::write(&other, b"{}").unwrap();
+        symlink(&other, &path).unwrap();
+        assert!(persist_verified_manifest(root.path(), "v1.2.3", target, b"{}").is_err());
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, b"{}").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        assert!(persist_verified_manifest(root.path(), "v1.2.3", target, b"{}").is_err());
+        assert!(persist_verified_manifest(root.path(), "../escape", target, b"{}").is_err());
+        assert!(persist_verified_manifest(root.path(), "v1.2.3", target, b"").is_err());
+    }
+
+    #[tokio::test]
+    async fn runner_pin_preflight_is_optional_and_passes_only_check_to_trusted_hook() {
+        let directory = protected_test_directory();
+        let hook = directory.path().join("runner-pins");
+        std::fs::write(&hook, b"#!/bin/sh\n[ \"$#\" = 1 ] && [ \"$1\" = --check ] || exit 1\nprintf checked\nexit \"$AIF_TEST_EXIT\"\n").unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut context = BTreeMap::from([("AIF_TEST_EXIT".to_string(), "0".to_string())]);
+        check_runner_pins(None, &context).await.unwrap();
+        check_runner_pins(Some(&hook), &context).await.unwrap();
+        context.insert("AIF_TEST_EXIT".to_string(), "1".to_string());
+        assert!(check_runner_pins(Some(&hook), &context).await.is_err());
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o770)).unwrap();
+        context.insert("AIF_TEST_EXIT".to_string(), "0".to_string());
+        assert!(check_runner_pins(Some(&hook), &context).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn recovery_switch_requires_quiesce_and_a_live_lease_after_stopping() {
+        let directory = protected_test_directory();
+        let active = directory.path().join("new");
+        let previous = directory.path().join("old");
+        std::fs::create_dir(&active).unwrap();
+        std::fs::create_dir(&previous).unwrap();
+        let current = directory.path().join("current");
+        symlink(&active, &current).unwrap();
+        let events = directory.path().join("events");
+        let hook = directory.path().join("quiesce");
+        std::fs::write(&hook, b"#!/bin/sh\nset -eu\n[ \"$AIF_TEST_CURRENT\" -ef \"$AIF_TEST_ACTIVE\" ]\nprintf 'quiesced\\n' >> \"$AIF_TEST_EVENTS\"\nexit \"$AIF_TEST_EXIT\"\n").unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut context = BTreeMap::from([
+            (
+                "AIF_TEST_CURRENT".to_string(),
+                current.to_string_lossy().into_owned(),
+            ),
+            (
+                "AIF_TEST_ACTIVE".to_string(),
+                active.to_string_lossy().into_owned(),
+            ),
+            (
+                "AIF_TEST_EVENTS".to_string(),
+                events.to_string_lossy().into_owned(),
+            ),
+            ("AIF_TEST_EXIT".to_string(), "1".to_string()),
+        ]);
+        // A failed stop must leave the current pointer untouched.
+        assert!(
+            quiesce_and_switch_release(&hook, &context, &current, &previous, || async { Ok(()) })
+                .await
+                .is_err()
+        );
+        assert_eq!(std::fs::read_link(&current).unwrap(), active);
+        context.insert("AIF_TEST_EXIT".to_string(), "0".to_string());
+        let mut probes = 0;
+        assert!(matches!(
+            quiesce_and_switch_release(&hook, &context, &current, &previous, || {
+                probes += 1;
+                std::future::ready(if probes == 2 {
+                    Err(UpdaterError::LeaseLost)
+                } else {
+                    Ok(())
+                })
+            })
+            .await,
+            Err(UpdaterError::LeaseLost)
+        ));
+        assert_eq!(probes, 2);
+        assert_eq!(std::fs::read_link(&current).unwrap(), active);
+        std::fs::write(&events, b"").unwrap();
+        quiesce_and_switch_release(&hook, &context, &current, &previous, || {
+            let mut file = OpenOptions::new().append(true).open(&events).unwrap();
+            file.write_all(b"lease\n").unwrap();
+            std::future::ready(Ok(()))
+        })
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read(&events).unwrap(), b"lease\nquiesced\nlease\n");
+        assert_eq!(std::fs::read_link(&current).unwrap(), previous);
     }
 
     #[test]

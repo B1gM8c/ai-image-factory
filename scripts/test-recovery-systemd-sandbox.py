@@ -18,6 +18,7 @@ import uuid
 
 ROOT = Path(__file__).resolve().parents[1]
 STATE = '/var/lib/ai-image-factory'
+REMOTE_PROFILES = '/etc/ai-image-factory/remote-providers'
 UNITS = {
     'ai-image-factory-updater.service': '/usr/libexec/ai-image-factory/updated',
     'ai-image-factory-updater-recover@.service': '/usr/libexec/ai-image-factory/updated recover %i',
@@ -57,12 +58,13 @@ def directives(source, section):
 def validate(name, source):
     service = directives(source, 'Service')
     unit = directives(source, 'Unit')
-    expected = dict(HARDENING, User='root', Group='root', ExecStart=UNITS[name])
+    expected = dict(HARDENING, User='root', Group='root', ExecStart=UNITS[name],
+        Environment='AIF_UPDATE_RUNNER_PINS_HOOK=/usr/libexec/ai-image-factory/hooks/sync-remote-runner-pins')
     for key, value in expected.items():
         if service.get(key) != [value]:
             raise ValueError(f'{name}: changed {key} contract')
-    if service.get('ReadWritePaths') != ['/opt/ai-image-factory', STATE]:
-        raise ValueError(f'{name}: require exact state parent write allow-list')
+    if service.get('ReadWritePaths') != ['/opt/ai-image-factory', STATE, '-' + REMOTE_PROFILES]:
+        raise ValueError(f'{name}: require exact state and optional remote-profile write allow-list')
     if service.get('BindPaths') or service.get('BindReadOnlyPaths'):
         raise ValueError(f'{name}: unexpected explicit bind mounts')
     if name == 'ai-image-factory-updater-recover@.service':
@@ -93,6 +95,30 @@ class SandboxContractTests(unittest.TestCase):
                     source = (ROOT / 'deploy/systemd' / name).read_text()
                     with self.assertRaises(ValueError):
                         validate(name, source.replace(f'ReadWritePaths={STATE}\n', replacement + '\n'))
+
+    def test_remote_profiles_are_optional_and_narrowly_scoped(self):
+        for replacement in (
+            '',
+            'ReadWritePaths=' + REMOTE_PROFILES,
+            'ReadWritePaths=-/etc',
+            'ReadWritePaths=-/etc/ai-image-factory',
+            'ReadWritePaths=-' + REMOTE_PROFILES + '/profile.env',
+            'ReadWritePaths=-' + REMOTE_PROFILES + '\nReadWritePaths=-/etc',
+        ):
+            for name in UNITS:
+                with self.subTest(unit=name, replacement=replacement):
+                    source = (ROOT / 'deploy/systemd' / name).read_text()
+                    with self.assertRaises(ValueError):
+                        validate(name, source.replace('ReadWritePaths=-' + REMOTE_PROFILES, replacement))
+
+    def test_reject_changed_runner_pin_hook(self):
+        for name in UNITS:
+            source = (ROOT / 'deploy/systemd' / name).read_text()
+            for replacement in ('', 'Environment=AIF_UPDATE_RUNNER_PINS_HOOK=/tmp/untrusted'):
+                with self.subTest(unit=name, replacement=replacement), self.assertRaises(ValueError):
+                    validate(name, source.replace(
+                        'Environment=AIF_UPDATE_RUNNER_PINS_HOOK=/usr/libexec/ai-image-factory/hooks/sync-remote-runner-pins',
+                        replacement))
 
     def test_reject_explicit_bind_mounts(self):
         for name in UNITS:
@@ -232,6 +258,61 @@ def runtime():
             if (artifacts / 'marker').read_text() != marker:
                 raise AssertionError(f'{case}: artifact marker mismatch')
         runtime_lock_handoff(runner, root)
+    runtime_remote_profile_scope(runner)
+
+
+def runtime_remote_profile_scope(runner):
+    # Fixture paths live in /etc to exercise the same ProtectSystem=strict
+    # boundary as real remote profiles, without touching installed configuration.
+    program = """import errno, json, os, pathlib, tempfile, sys
+profiles, sibling = map(pathlib.Path, sys.argv[1:])
+try:
+    sibling.write_text("unexpected")
+except OSError as error:
+    assert error.errno == errno.EROFS, error
+else:
+    raise AssertionError("remote-profile allowance exposed sibling configuration")
+fd, temporary = tempfile.mkstemp(prefix=".profile.", dir=profiles)
+with os.fdopen(fd, "w") as target:
+    target.write("pin=new\\n")
+    target.flush()
+    os.fsync(target.fileno())
+os.replace(temporary, profiles / "profile.env")
+directory = os.open(profiles, os.O_RDONLY | os.O_DIRECTORY)
+try:
+    os.fsync(directory)
+finally:
+    os.close(directory)
+print(json.dumps({"profile_write": True, "sibling_readonly": True}), flush=True)
+"""
+    with tempfile.TemporaryDirectory(prefix='aif-remote-pin-', dir='/etc') as directory:
+        root = Path(directory)
+        profiles = root / 'remote-providers'
+        profiles.mkdir(mode=0o700)
+        sibling = root / 'updater.env'
+        sibling.write_text('unchanged')
+        script = root / 'probe.py'
+        script.write_text(program)
+        for present in (True, False):
+            path = profiles if present else root / 'unconfigured-remote-providers'
+            properties = dict(HARDENING, ReadOnlyPaths=str(script), User='root', Group='root')
+            command = [runner, '--quiet', '--wait', '--pipe', '--collect',
+                '--unit=aif-remote-pin-sandbox-' + uuid.uuid4().hex,
+                '--property=Type=oneshot', '--property=TimeoutStartSec=30s',
+                '--property=ReadWritePaths=-' + str(path)]
+            command.extend('--property=' + key + '=' + value for key, value in properties.items())
+            command.extend([sys.executable, str(script), str(profiles), str(sibling)]
+                           if present else ['/bin/true'])
+            result = subprocess.run(command, capture_output=True, text=True, timeout=45)
+            if result.returncode:
+                raise AssertionError(f'optional remote profiles present={present}: '
+                    f'{result.returncode}; stdout={result.stdout}; stderr={result.stderr}')
+            if sibling.read_text() != 'unchanged':
+                raise AssertionError('remote-profile sandbox changed sibling configuration')
+            if present and (profiles / 'profile.env').read_text() != 'pin=new\n':
+                raise AssertionError('remote-profile sandbox failed atomic pin update')
+            print(json.dumps({'runtime': 'real-systemd', 'case': 'remote-profile-scope',
+                'profiles_present': present, 'sibling_readonly': True}), flush=True)
 
 
 def runtime_lock_handoff(runner, root):

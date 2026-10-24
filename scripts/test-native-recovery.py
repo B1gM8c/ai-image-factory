@@ -47,7 +47,7 @@ CODEX_VERSION = '0.153.4'
 SECRET_VALUES = []
 RECOVERY_HOST_FILES = {
     'ops/hooks/' + name for name in
-    ('backup', 'recover', 'verify', 'verify-admin-reader', 'verify-gateway-runtime')
+    ('backup', 'recover', 'verify', 'verify-admin-reader', 'verify-gateway-runtime', 'sync-remote-runner-pins')
 } | {
     'ops/systemd/' + PREFIX + name for name in
     ('updater.service', 'updater-recover@.service', 'recovery-gate.service')
@@ -683,10 +683,12 @@ def unit_evidence(recovery_command_id='00000000-0000-0000-0000-000000000001'):
         output = run(['systemctl', 'show', unit, '-p', 'ReadWritePaths', '-p', 'ProtectSystem',
                       '-p', 'NoNewPrivileges', '-p', 'PrivateTmp', '-p', 'DropInPaths',
                       '-p', 'BindPaths', '-p', 'BindReadOnlyPaths',
-                      '-p', 'FragmentPath', '-p', 'ExecStart', '-p', 'After', '-p', 'Conflicts']).stdout
+                      '-p', 'FragmentPath', '-p', 'ExecStart', '-p', 'After', '-p', 'Conflicts', '-p', 'Environment']).stdout
         fields = dict(line.split('=', 1) for line in output.splitlines() if '=' in line)
-        require(set(fields['ReadWritePaths'].split()) == {str(ROOT), str(STATE)},
-                'effective recovery sandbox differs from exact parent-only contract')
+        require(set(fields['ReadWritePaths'].split()) == {str(ROOT), str(STATE), '-' + str(CONFIG / 'remote-providers')},
+                'effective recovery sandbox differs from exact state/optional remote-profile contract')
+        require('AIF_UPDATE_RUNNER_PINS_HOOK=' + str(LIB / 'hooks/sync-remote-runner-pins')
+                in fields['Environment'].split(), 'effective runner-pin preflight hook differs from repository units')
         require(fields['ProtectSystem'] == 'strict' and fields['NoNewPrivileges'] == 'yes'
                 and fields['PrivateTmp'] == 'yes' and fields['DropInPaths'] == '',
                 'effective recovery hardening/drop-ins differ from repository units')
@@ -905,14 +907,15 @@ def prepare_recovery_host_files(candidate_bundle, candidate, environment, instal
             previous[name] = {'existed': True, 'sha256': digest(destination),
                               'backup': str(destination), 'mode': source.stat().st_mode & 0o777}
         else:
-            require(name == 'ops/hooks/verify-admin-reader' and not (LIB / 'hooks/verify-admin-reader').exists(),
+            require(name in ('ops/hooks/verify-admin-reader', 'ops/hooks/sync-remote-runner-pins')
+                    and not (LIB / name.removeprefix('ops/')).exists(),
                     'unexpected missing baseline recovery file')
             previous[name] = {'existed': False}
     write(saved / 'manifest.json', json.dumps(previous, indent=2))
     prepared = install_host_files(candidate_bundle, candidate, RECOVERY_HOST_FILES)
     for name in ('bin/updated', 'ops/hooks/quiesce', 'ops/hooks/start-processes'):
         require(digest(Path(installed[name]['destination'])) == installed[name]['sha256'],
-                'recovery preparation changed a file outside its five-hook/three-unit scope')
+                'recovery preparation changed a file outside its six-hook/three-unit scope')
     run(['systemctl', 'daemon-reload'])
     return prepared, {'apply_disabled': True, 'updater_stopped': True, 'baseline_shutdown': shutdown,
                       'pending_commands': 0, 'protected_descriptors': 0, 'previous': previous}
@@ -1122,7 +1125,7 @@ RESET ROLE;
     run([LIB / 'hooks/verify'], timeout=180)
     stable_application_pids = {name: run(['systemctl', 'show', PREFIX + name + '.service', '-p', 'MainPID', '--value']).stdout.strip()
                                for name in ('gateway', 'admin')}
-    progress('Original baseline is serving; Apply=false, stopping old updater and preparing exactly five hooks/three units')
+    progress('Original baseline is serving; Apply=false, stopping old updater and preparing exactly six hooks/three units')
     prepared, host_preparation = prepare_recovery_host_files(args.candidate_bundle, candidate, owner_env, installed_host_files, baseline)
     installed_host_files.update(prepared)
     units = unit_evidence()
@@ -1307,7 +1310,7 @@ WHERE n.nspname='public' AND c.relname='ci_recovery_sequence' AND c.relkind='S';
         'boundaries': ['GitHub release transport and signature/attestation responses are explicit fixtures, not cryptographic acceptance',
                        'Real loopback admission proxy, not production nginx',
                        'Authenticated page shells and real BFF data with explicit Secure Cookie replay, not browser-rendered data/TLS policy acceptance',
-                       'Recovery preparation is exactly five hooks/three units with baseline updater retained; segmentd and segmentation host wiring are not enabled',
+                       'Recovery preparation is exactly six hooks/three units, including no-profile runner-pin preflight, with baseline updater retained; segmentd and segmentation host wiring are not enabled',
                        'Candidate fixed updater is installed only after application verification through the existing native helper, with Apply disabled',
                        'Real pinned Codex CLI is only a startup dependency; no credentials or inference and no segmentation capability claim',
                        'Synthetic DB/roles/identity/account/artifacts only; no provider/model request'],
