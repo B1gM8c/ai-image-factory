@@ -8457,6 +8457,16 @@ async fn seed_v4_customer_quote_with_funding(
     basis: V4CustomerQuoteBasis,
     grant_micros: i64,
 ) -> TestResult {
+    let rate_adjustment_denominator = if identity
+        .dimensions
+        .get("processing_mode")
+        .and_then(serde_json::Value::as_str)
+        == Some("batch")
+    {
+        2_i64
+    } else {
+        1_i64
+    };
     let (tenant_id, provider_id): (String, String) =
         sqlx::query_as("SELECT tenant_id, provider_id FROM jobs WHERE job_id = $1")
             .bind(work.job_id)
@@ -8797,12 +8807,13 @@ async fn seed_v4_customer_quote_with_funding(
                     metric, unit, unit_size, unit_price_micros,
                     quantity_source, required_confidence, rounding_mode,
                     reservation_quantity_source, reservation_confidence,
-                    dimensions_json, max_quantity, max_amount_micros, created_at_ms
+                    dimensions_json, max_quantity, max_amount_micros, created_at_ms,
+                    rate_adjustment_numerator, rate_adjustment_denominator
                 )
                 VALUES (
                     $1, $2, $3, $4, $5, $6, $7,
                     $8, $9, $10, $11, $12, $13, 'exact',
-                    $12, $13, $14, $15, $16, $17
+                    $12, $13, $14, $15, $16, $17, 1, $18
                 )
                 "#,
             )
@@ -8823,6 +8834,7 @@ async fn seed_v4_customer_quote_with_funding(
             .bind(basis.max_quantity)
             .bind(max_amount_micros)
             .bind(now)
+            .bind(rate_adjustment_denominator)
             .execute(&mut *tx)
             .await
             .map_err(debug_error)?;
