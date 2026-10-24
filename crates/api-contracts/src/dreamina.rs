@@ -247,6 +247,8 @@ pub struct DreaminaImageTask {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data: Option<Vec<DreaminaImageData>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_counts: Option<DreaminaImageOutputCounts>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_format: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quality: Option<String>,
@@ -260,6 +262,15 @@ pub struct DreaminaImageTask {
 #[serde(deny_unknown_fields)]
 pub struct DreaminaImageData {
     pub b64_json: String,
+}
+
+/// Final image delivery quantities; the original requested quantity is retained.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DreaminaImageOutputCounts {
+    pub requested: u32,
+    pub delivered: u32,
+    pub failed: u32,
 }
 
 /// Specifications frozen at admission; excludes prompts and input locations.

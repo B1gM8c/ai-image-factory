@@ -167,7 +167,10 @@ pub enum ImageResultStatus {
         stage: VideoPendingStage,
         provider_progress: Option<VideoProviderProgress>,
     },
-    Succeeded(StoredGenerationResult),
+    Succeeded {
+        result: StoredGenerationResult,
+        output_counts: image_api_contracts::dreamina::DreaminaImageOutputCounts,
+    },
     Failed {
         error_code: Option<String>,
     },

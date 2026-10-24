@@ -1074,6 +1074,7 @@ fn image_task(
         error: None,
         created: None,
         data: None,
+        output_counts: None,
         output_format: None,
         quality: None,
         size: None,
@@ -1100,16 +1101,25 @@ fn image_task(
             );
             task.provider_progress = provider_progress.map(public_provider_progress);
         }
-        ImageResultStatus::Succeeded(result) => {
-            if task
-                .request
-                .as_ref()
-                .and_then(|request| request.generate_num)
-                .is_some_and(|count| result.images.len() != count as usize)
+        ImageResultStatus::Succeeded {
+            result,
+            output_counts,
+        } => {
+            if !(1..=10).contains(&output_counts.requested)
+                || output_counts.delivered == 0
+                || output_counts.delivered.checked_add(output_counts.failed)
+                    != Some(output_counts.requested)
+                || result.images.len() != output_counts.delivered as usize
+                || task
+                    .request
+                    .as_ref()
+                    .and_then(|request| request.generate_num)
+                    .is_some_and(|count| output_counts.requested != count)
             {
                 return Err(ImageGatewayError::artifact_integrity());
             }
             task.status = "succeeded".to_owned();
+            task.output_counts = Some(output_counts);
             let mut projection = result.projection;
             if projection.output_format == "auto" {
                 projection.output_format = super::images::inferred_output_format(&result.images)?;

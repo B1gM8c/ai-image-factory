@@ -1,6 +1,6 @@
 use super::*;
 use base64::Engine;
-use image_api_contracts::dreamina::DreaminaImageRequestMetadata;
+use image_api_contracts::dreamina::{DreaminaImageOutputCounts, DreaminaImageRequestMetadata};
 use serde_json::{Value, json};
 
 fn projection(status: ImageResultStatus) -> ImageTaskProjection {
@@ -124,6 +124,7 @@ fn image_terminal_states_omit_old_progress_and_uncertain_remains_distinct() {
         assert!(value.get("stage").is_none());
         assert!(value.get("provider_progress").is_none());
         assert!(value.get("data").is_none());
+        assert!(value.get("output_counts").is_none());
         assert!(usage.is_none());
     }
 }
@@ -166,7 +167,14 @@ fn image_success_reuses_frozen_images_payload_and_usage() {
     let expected_base64 = base64::engine::general_purpose::STANDARD.encode(&result.images[0].bytes);
     let (task, usage) = image_task(
         Uuid::nil(),
-        projection(ImageResultStatus::Succeeded(result)),
+        projection(ImageResultStatus::Succeeded {
+            result,
+            output_counts: DreaminaImageOutputCounts {
+                requested: 1,
+                delivered: 1,
+                failed: 0,
+            },
+        }),
     )
     .unwrap();
     let value = serde_json::to_value(task).unwrap();
@@ -175,6 +183,10 @@ fn image_success_reuses_frozen_images_payload_and_usage() {
     assert_eq!(value["data"], json!([{"b64_json": expected_base64}]));
     assert_eq!(value["output_format"], "png");
     assert_eq!(value["size"], "1x1");
+    assert_eq!(
+        value["output_counts"],
+        json!({"requested": 1, "delivered": 1, "failed": 0})
+    );
     assert!(value.get("stage").is_none());
     assert!(value.get("provider_progress").is_none());
     assert_eq!(usage.unwrap().remaining_5h, 19);
@@ -186,10 +198,72 @@ fn image_success_rejects_more_images_than_the_frozen_request() {
     assert!(
         image_task(
             Uuid::nil(),
-            projection(ImageResultStatus::Succeeded(success(4)))
+            projection(ImageResultStatus::Succeeded {
+                result: success(4),
+                output_counts: DreaminaImageOutputCounts {
+                    requested: 1,
+                    delivered: 4,
+                    failed: 0
+                },
+            })
         )
         .is_err()
     );
+}
+
+#[test]
+fn image_partial_success_keeps_original_request_and_delivered_count() {
+    let mut projected = projection(ImageResultStatus::Succeeded {
+        result: success(2),
+        output_counts: DreaminaImageOutputCounts {
+            requested: 3,
+            delivered: 2,
+            failed: 1,
+        },
+    });
+    projected.request.generate_num = Some(3);
+    let (task, _) = image_task(Uuid::nil(), projected).unwrap();
+    let value = serde_json::to_value(task).unwrap();
+    assert_eq!(value["status"], "succeeded");
+    assert_eq!(value["request"]["generate_num"], 3);
+    assert_eq!(value["data"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        value["output_counts"],
+        json!({"requested": 3, "delivered": 2, "failed": 1})
+    );
+}
+
+#[test]
+fn image_success_rejects_inconsistent_output_proof() {
+    for counts in [
+        DreaminaImageOutputCounts {
+            requested: 3,
+            delivered: 1,
+            failed: 1,
+        },
+        DreaminaImageOutputCounts {
+            requested: 3,
+            delivered: 0,
+            failed: 3,
+        },
+        DreaminaImageOutputCounts {
+            requested: 2,
+            delivered: 2,
+            failed: 0,
+        },
+        DreaminaImageOutputCounts {
+            requested: 3,
+            delivered: 3,
+            failed: 0,
+        },
+    ] {
+        let mut projected = projection(ImageResultStatus::Succeeded {
+            result: success(2),
+            output_counts: counts,
+        });
+        projected.request.generate_num = Some(3);
+        assert!(image_task(Uuid::nil(), projected).is_err());
+    }
 }
 
 #[test]
