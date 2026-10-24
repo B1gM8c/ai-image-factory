@@ -142,6 +142,7 @@ pub(super) fn load(
         Some(Value::String(value)) => {
             serde_json::from_str::<Value>(value).map_err(|_| conflict())?
         }
+        Some(Value::Object(value)) => Value::Object(value.clone()),
         _ => return Err(conflict()),
     };
     let images = result
@@ -366,6 +367,57 @@ mod tests {
             bundle.save();
             assert!(load(&bundle.root, &bundle.request).is_err());
         }
+    }
+
+    #[test]
+    fn accepts_object_or_single_string_without_rewriting_reviewed_bytes() {
+        for object_result in [false, true] {
+            let mut bundle = Bundle::new();
+            if object_result {
+                bundle.receipt["result_json"] =
+                    serde_json::from_str(bundle.receipt["result_json"].as_str().unwrap()).unwrap();
+            }
+            bundle.save();
+            let stdout = std::fs::read(bundle.root.join("reviewed-query.json")).unwrap();
+            let verified = load(&bundle.root, &bundle.request).unwrap();
+            assert_eq!(verified.stdout_sha256, sha256_hex(&stdout));
+            assert_eq!(verified.selected_item_id, "item-0");
+            assert_eq!((verified.width, verified.height), (1, 1));
+            assert_eq!(
+                std::fs::read(bundle.root.join("reviewed-query.json")).unwrap(),
+                stdout
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_non_object_or_nested_result_json_even_when_rehashed() {
+        let original = Bundle::new().receipt["result_json"].clone();
+        for result in [
+            Value::Null,
+            json!([]),
+            json!("null"),
+            json!("[]"),
+            json!(serde_json::to_string(&original).unwrap()),
+        ] {
+            let mut bundle = Bundle::new();
+            bundle.receipt["result_json"] = result;
+            bundle.save();
+            assert!(load(&bundle.root, &bundle.request).is_err());
+        }
+    }
+
+    #[test]
+    fn rejects_semantically_equal_result_without_original_raw_hash_binding() {
+        let mut bundle = Bundle::new();
+        bundle.save();
+        let original_sha256 = bundle.request.reviewed_stdout_sha256.clone();
+        bundle.receipt["result_json"] =
+            serde_json::from_str(bundle.receipt["result_json"].as_str().unwrap()).unwrap();
+        let changed_stdout = serde_json::to_vec(&bundle.receipt).unwrap();
+        assert_ne!(sha256_hex(&changed_stdout), original_sha256);
+        std::fs::write(bundle.root.join("reviewed-query.json"), changed_stdout).unwrap();
+        assert!(load(&bundle.root, &bundle.request).is_err());
     }
 
     #[test]
