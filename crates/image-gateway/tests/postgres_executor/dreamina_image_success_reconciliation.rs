@@ -4,6 +4,25 @@ use image_provider_dreamina_cli::parse_submit_command;
 use std::path::{Path, PathBuf};
 
 const PRICE: i64 = 30_000;
+// Exercise the database evidence fence independently of the Rust preflight.
+const ORIGINAL_EVIDENCE_ASSERTION: &str = r#"SELECT assert_operator_dreamina_image_success_evidence(
+    jsonb_populate_record(NULL::dreamina_operator_image_success_resolutions, jsonb_build_object(
+        'job_id',submission.job_id,'submission_id',submission.submission_id,
+        'executor_execution_id',submission.executor_execution_id,'output_id',submission.output_id,
+        'original_receipt_id',receipt.receipt_id,'hold_id',hold.hold_id,
+        'remote_operation_id',task.remote_operation_id,'command_hash',submission.command_hash,
+        'execution_binding_sha256',intent.execution_binding_sha256,'quote_hash',quote.quote_hash,
+        'created_at_ms',receipt.created_at_ms)))
+    FROM provider_submissions submission
+    JOIN executor_terminal_reductions reduction USING(submission_id,executor_execution_id)
+    JOIN provider_receipts receipt ON receipt.receipt_id=reduction.provider_receipt_id
+    JOIN provider_remote_submit_intents intent ON intent.submission_id=submission.submission_id
+        AND intent.executor_execution_id=submission.executor_execution_id
+    JOIN provider_remote_tasks task ON task.submission_id=submission.submission_id
+        AND task.executor_execution_id=submission.executor_execution_id
+    JOIN customer_billing_holds hold ON hold.job_id=submission.job_id
+    JOIN customer_price_quotes quote ON quote.quote_id=hold.quote_id
+    WHERE submission.job_id=$1"#;
 
 struct HistoricalFourImageFailure;
 impl ProviderPollDriver for HistoricalFourImageFailure {
@@ -43,6 +62,28 @@ async fn fixture(pool: &PgPool) -> TestResult<Fixture> {
 }
 
 async fn fixture_with_funding(pool: &PgPool, grant_micros: i64) -> TestResult<Fixture> {
+    fixture_with_quote_dimensions(
+        pool,
+        grant_micros,
+        json!({"resolution_type":"2k","ratio":"1:1","processing_mode":"synchronous"}),
+    )
+    .await
+}
+
+async fn fixture_with_quote_dimensions(
+    pool: &PgPool,
+    grant_micros: i64,
+    dimensions: serde_json::Value,
+) -> TestResult<Fixture> {
+    let quote_max_micros = if dimensions
+        .get("processing_mode")
+        .and_then(serde_json::Value::as_str)
+        == Some("batch")
+    {
+        PRICE / 2
+    } else {
+        PRICE
+    };
     let work = seed_dreamina_generation_lease_for_profile(
         pool,
         "operator-image-resolution-worker",
@@ -52,7 +93,10 @@ async fn fixture_with_funding(pool: &PgPool, grant_micros: i64) -> TestResult<Fi
     seed_v4_customer_quote_with_funding(
         pool,
         &work,
-        V4CustomerQuoteIdentity::dreamina(),
+        V4CustomerQuoteIdentity {
+            dimensions,
+            ..V4CustomerQuoteIdentity::dreamina()
+        },
         V4CustomerQuoteBasis {
             metric: "image_output",
             unit: "image",
@@ -61,7 +105,7 @@ async fn fixture_with_funding(pool: &PgPool, grant_micros: i64) -> TestResult<Fi
             quantity_source: "request_derived",
             confidence: "exact",
             max_quantity: 1,
-            max_amount_micros: PRICE,
+            max_amount_micros: quote_max_micros,
         },
         grant_micros,
     )
@@ -239,6 +283,7 @@ async fn fixture_with_funding(pool: &PgPool, grant_micros: i64) -> TestResult<Fi
 
 async fn immutable_snapshot(pool: &PgPool, job_id: Uuid) -> TestResult<String> {
     let value: serde_json::Value = sqlx::query_scalar(r#"SELECT jsonb_build_object(
+        'quotes',(SELECT jsonb_agg(to_jsonb(t) ORDER BY quote_id) FROM customer_price_quotes t WHERE job_id=$1),
         'submissions',(SELECT jsonb_agg(to_jsonb(t) ORDER BY submission_id) FROM provider_submissions t WHERE job_id=$1),
         'executions',(SELECT jsonb_agg(to_jsonb(t) ORDER BY executor_execution_id) FROM executor_executions t WHERE submission_id IN (SELECT submission_id FROM provider_submissions WHERE job_id=$1)),
         'decisions',(SELECT jsonb_agg(to_jsonb(t) ORDER BY decision_id) FROM executor_resolution_decisions t WHERE submission_id IN (SELECT submission_id FROM provider_submissions WHERE job_id=$1)),
@@ -274,6 +319,8 @@ async fn original_four_image_success_resolves_once_and_preserves_canonical_evide
     let result=async {
         let fixture=fixture(&database.pool).await?;
         let before=immutable_snapshot(&database.pool,fixture.request.job_id).await?;
+        sqlx::query(ORIGINAL_EVIDENCE_ASSERTION).bind(fixture.request.job_id)
+            .execute(&database.pool).await.map_err(debug_error)?;
         let (a,b)=tokio::join!(
             resolve_dreamina_image_success(&database.pool,fixture.blobs.as_ref(),&fixture.evidence_root,&fixture.request),
             resolve_dreamina_image_success(&database.pool,fixture.blobs.as_ref(),&fixture.evidence_root,&fixture.request));
@@ -294,6 +341,55 @@ async fn original_four_image_success_resolves_once_and_preserves_canonical_evide
         require(matches!(settlement.generation_status(fixture.request.job_id).await.map_err(debug_error)?,gpt_image_2_gateway::GenerationResultStatus::Succeeded(ref result) if result.images.len()==1),"customer cannot read the single resolved image")
     }.await;
     combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
+async fn original_image_resolution_requires_exact_synchronous_frozen_dimensions() -> TestResult {
+    for dimensions in [
+        json!({"resolution_type":"2k","ratio":"1:1"}),
+        json!({"resolution_type":"2k","ratio":"1:1","processing_mode":"batch"}),
+        json!({"resolution_type":"2k","ratio":"1:1","processing_mode":"unknown"}),
+        json!({"resolution_type":"2k","ratio":"1:1","processing_mode":"synchronous","extra":"unexpected"}),
+    ] {
+        let Some(database) =
+            super::accepted_image_completion_budget::database_before_image_completion_budget()
+                .await?
+        else {
+            return Ok(());
+        };
+        let result = async {
+            let fixture = fixture_with_quote_dimensions(&database.pool, 0, dimensions).await?;
+            let before = rollback_snapshot(&database.pool, fixture.request.job_id).await?;
+            let frozen = immutable_snapshot(&database.pool, fixture.request.job_id).await?;
+            require(
+                sqlx::query(ORIGINAL_EVIDENCE_ASSERTION)
+                    .bind(fixture.request.job_id)
+                    .execute(&database.pool)
+                    .await
+                    .is_err(),
+                "database accepted incompatible frozen image dimensions",
+            )?;
+            require(
+                resolve_dreamina_image_success(
+                    &database.pool,
+                    fixture.blobs.as_ref(),
+                    &fixture.evidence_root,
+                    &fixture.request,
+                )
+                .await
+                .is_err(),
+                "operator accepted incompatible frozen image dimensions",
+            )?;
+            require(
+                before == rollback_snapshot(&database.pool, fixture.request.job_id).await?
+                    && frozen == immutable_snapshot(&database.pool, fixture.request.job_id).await?,
+                "rejected image dimensions changed frozen quote, funds or evidence",
+            )
+        }
+        .await;
+        combine(result, database.cleanup().await)?;
+    }
+    Ok(())
 }
 
 #[tokio::test]

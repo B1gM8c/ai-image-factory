@@ -5,6 +5,25 @@ use std::path::{Path, PathBuf};
 
 const PRICE: i64 = 1_200_000;
 const VIDEO_URL: &str = "https://media.example.test/original%2Fvideo.mp4?token=A%2Bb";
+// Exercise the database evidence fence independently of the Rust preflight.
+const ORIGINAL_EVIDENCE_ASSERTION: &str = r#"SELECT assert_operator_dreamina_video_success_evidence(
+    jsonb_populate_record(NULL::dreamina_operator_video_success_resolutions, jsonb_build_object(
+        'job_id',submission.job_id,'submission_id',submission.submission_id,
+        'executor_execution_id',submission.executor_execution_id,'output_id',submission.output_id,
+        'original_receipt_id',receipt.receipt_id,'hold_id',hold.hold_id,
+        'remote_operation_id',task.remote_operation_id,'command_hash',submission.command_hash,
+        'execution_binding_sha256',intent.execution_binding_sha256,'quote_hash',quote.quote_hash,
+        'created_at_ms',receipt.created_at_ms)))
+    FROM provider_submissions submission
+    JOIN executor_terminal_reductions reduction USING(submission_id,executor_execution_id)
+    JOIN provider_receipts receipt ON receipt.receipt_id=reduction.provider_receipt_id
+    JOIN provider_remote_submit_intents intent ON intent.submission_id=submission.submission_id
+        AND intent.executor_execution_id=submission.executor_execution_id
+    JOIN provider_remote_tasks task ON task.submission_id=submission.submission_id
+        AND task.executor_execution_id=submission.executor_execution_id
+    JOIN customer_billing_holds hold ON hold.job_id=submission.job_id
+    JOIN customer_price_quotes quote ON quote.quote_id=hold.quote_id
+    WHERE submission.job_id=$1"#;
 
 struct HistoricalVideoProtocolFailure(&'static str);
 impl ProviderPollDriver for HistoricalVideoProtocolFailure {
@@ -51,12 +70,36 @@ async fn fixture_with_funding(
     error: &'static str,
     grant_micros: i64,
 ) -> TestResult<Fixture> {
+    fixture_with_quote_dimensions(
+        pool,
+        error,
+        grant_micros,
+        json!({"duration":"10","ratio":"3:4","resolution":"720p","processing_mode":"synchronous"}),
+    )
+    .await
+}
+
+async fn fixture_with_quote_dimensions(
+    pool: &PgPool,
+    error: &'static str,
+    grant_micros: i64,
+    dimensions: serde_json::Value,
+) -> TestResult<Fixture> {
+    let quote_max_micros = if dimensions
+        .get("processing_mode")
+        .and_then(serde_json::Value::as_str)
+        == Some("batch")
+    {
+        PRICE / 2
+    } else {
+        PRICE
+    };
     let work = seed_video_ten_seconds(pool).await?;
     seed_v4_customer_quote_with_funding(
         pool,
         &work,
         V4CustomerQuoteIdentity {
-            dimensions: json!({"duration":"10","ratio":"3:4","resolution":"720p"}),
+            dimensions,
             ..V4CustomerQuoteIdentity::dreamina_video()
         },
         V4CustomerQuoteBasis {
@@ -67,7 +110,7 @@ async fn fixture_with_funding(
             quantity_source: "request_derived",
             confidence: "exact",
             max_quantity: 10,
-            max_amount_micros: PRICE,
+            max_amount_micros: quote_max_micros,
         },
         grant_micros,
     )
@@ -228,6 +271,7 @@ async fn fixture_with_funding(
 
 async fn immutable_snapshot(pool: &PgPool, job_id: Uuid) -> TestResult<String> {
     let value: serde_json::Value = sqlx::query_scalar(r#"SELECT jsonb_build_object(
+        'quotes',(SELECT jsonb_agg(to_jsonb(t) ORDER BY quote_id) FROM customer_price_quotes t WHERE job_id=$1),
         'submissions',(SELECT jsonb_agg(to_jsonb(t) ORDER BY submission_id) FROM provider_submissions t WHERE job_id=$1),
         'executions',(SELECT jsonb_agg(to_jsonb(t) ORDER BY executor_execution_id) FROM executor_executions t WHERE submission_id IN (SELECT submission_id FROM provider_submissions WHERE job_id=$1)),
         'decisions',(SELECT jsonb_agg(to_jsonb(t) ORDER BY decision_id) FROM executor_resolution_decisions t WHERE submission_id IN (SELECT submission_id FROM provider_submissions WHERE job_id=$1)),
@@ -262,6 +306,8 @@ async fn original_video_success_resolves_once_and_preserves_canonical_evidence()
     let result=async {
         let fixture=fixture(&database.pool).await?;
         let before=immutable_snapshot(&database.pool,fixture.request.job_id).await?;
+        sqlx::query(ORIGINAL_EVIDENCE_ASSERTION).bind(fixture.request.job_id)
+            .execute(&database.pool).await.map_err(debug_error)?;
         let (a,b)=tokio::join!(
             resolve_dreamina_video_success(&database.pool,&fixture.evidence_root,&fixture.request),
             resolve_dreamina_video_success(&database.pool,&fixture.evidence_root,&fixture.request));
@@ -294,6 +340,57 @@ async fn original_video_success_resolves_once_and_preserves_canonical_evidence()
         Ok(())
     }.await;
     combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
+async fn original_video_resolution_requires_exact_synchronous_frozen_dimensions() -> TestResult {
+    for dimensions in [
+        json!({"duration":"10","ratio":"3:4","resolution":"720p"}),
+        json!({"duration":"10","ratio":"3:4","resolution":"720p","processing_mode":"batch"}),
+        json!({"duration":"10","ratio":"3:4","resolution":"720p","processing_mode":"unknown"}),
+        json!({"duration":"10","ratio":"3:4","resolution":"720p","processing_mode":"synchronous","extra":"unexpected"}),
+    ] {
+        let Some(database) = TestDatabase::new().await? else {
+            return Ok(());
+        };
+        let result = async {
+            let fixture = fixture_with_quote_dimensions(
+                &database.pool,
+                "dreamina_poll_protocol_invalid",
+                0,
+                dimensions,
+            )
+            .await?;
+            let before = rollback_snapshot(&database.pool, fixture.request.job_id).await?;
+            let frozen = immutable_snapshot(&database.pool, fixture.request.job_id).await?;
+            require(
+                sqlx::query(ORIGINAL_EVIDENCE_ASSERTION)
+                    .bind(fixture.request.job_id)
+                    .execute(&database.pool)
+                    .await
+                    .is_err(),
+                "database accepted incompatible frozen video dimensions",
+            )?;
+            require(
+                resolve_dreamina_video_success(
+                    &database.pool,
+                    &fixture.evidence_root,
+                    &fixture.request,
+                )
+                .await
+                .is_err(),
+                "operator accepted incompatible frozen video dimensions",
+            )?;
+            require(
+                before == rollback_snapshot(&database.pool, fixture.request.job_id).await?
+                    && frozen == immutable_snapshot(&database.pool, fixture.request.job_id).await?,
+                "rejected video dimensions changed frozen quote, funds or evidence",
+            )
+        }
+        .await;
+        combine(result, database.cleanup().await)?;
+    }
+    Ok(())
 }
 
 #[tokio::test]

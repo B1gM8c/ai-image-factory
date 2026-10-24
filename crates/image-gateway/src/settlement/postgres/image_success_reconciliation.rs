@@ -230,10 +230,17 @@ pub async fn resolve_dreamina_image_success(
         return Err(conflict());
     }
     let facts = dreamina_pricing_facts(&command, &row.api_profile).map_err(|_| conflict())?;
+    let mut request_dimensions = serde_json::to_value(&facts.dimensions).map_err(|_| conflict())?;
+    request_dimensions
+        .as_object_mut()
+        .ok_or_else(conflict)?
+        .insert(
+            "processing_mode".into(),
+            json!(crate::admission::PricingProcessingMode::Synchronous.as_str()),
+        );
     if facts.output_count != 1
         || facts.output_billable_units != 1
-        || serde_json::to_value(&facts.dimensions).map_err(|_| conflict())?
-            != row.request_dimensions_json
+        || request_dimensions != row.request_dimensions_json
     {
         return Err(conflict());
     }
