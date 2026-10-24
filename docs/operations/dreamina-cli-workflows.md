@@ -129,6 +129,49 @@ treated as permission to create another paid task.
 
 ## Verification boundary
 
+Video status queries distinguish `running`, `uncertain`, `failed`, and
+`succeeded`. `uncertain` includes `generation_uncertain` and requires operator
+reconciliation; it is never permission to retry or create a replacement task.
+An explicit one-time web safety refusal is `failed` with
+`dreamina_compliance_confirmation_required`. Complete the website confirmation
+before any future request; the rejected task is not retried.
+
+### Historical compliance refusals
+
+Migration 0141 adds a narrow operator settlement for a single-output Dreamina
+video that was previously quarantined as uncertain despite a complete, explicit
+4010 refusal. Review the original stdout independently and record its SHA-256.
+After deploying the compatible build, run with the normal protected database
+configuration:
+
+```sh
+factoryctl resolve-dreamina-compliance-rejection \
+  JOB_UUID SUBMISSION_UUID EXECUTOR_UUID REVIEWED_STDOUT_SHA256 \
+  OPERATOR_REFERENCE EXISTING_PROFILE_JOURNAL_ROOT
+```
+
+The command only reads the existing, bound journal and process evidence. It
+rejects active, accepted, ambiguous, truncated, charged, or mismatched evidence.
+It preserves the immutable executor decision and receipt, appends an audit
+resolution, and atomically releases the full customer hold, quota, grant
+reservations, and local provider capacity. It does not invoke the CLI. Exact
+repetition returns the same audit receipt; a changed identity, digest, or
+operator reference conflicts. Do not use cancel/retry commands or direct table
+updates for these quarantined orders. Notify the client to GET the original
+task after settlement; an existing webhook event with no deliveries does not
+prove the client received it.
+
+`GET /v1/dreamina/videos/{task_id}` returns an optional `settlement` only for
+this audited, fully released refusal. It contains `state: released`,
+`resolution_audit_id`, `job_id`, the original `request_id`, `hold_id`, `currency`,
+and decimal-string `held_micros`, `released_micros`, and `captured_micros`.
+The read uses the same tenant, project, and actor scope as the task. Clients must
+bind both the top-level task ID and receipt job ID to their stored provider task,
+require full release and zero capture, and apply any real local precharge release
+once using the audit identity. Absence of a receipt is not proof of release.
+
+### Offline and production checks
+
 Local fixtures exercise parsing, staging, idempotency and settlement without
 calling the paid upstream. Deployment requires successful CI for the merged
 commit and the normal signed-candidate Check/Apply process. Only a separately

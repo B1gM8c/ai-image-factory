@@ -227,6 +227,33 @@ pub(super) fn patch_schemas(document: &mut Value) {
     ark_video["ratio"]["description"] = json!(
         "Defaults to 16:9 for text or multimodal input. For first/last frames, omit or use adaptive to preserve image geometry. Seedance 2.5 first/last-frame requests reject concrete ratios. adaptive is unsupported for text and multimodal input."
     );
+    for name in ["DreaminaVideoTaskDoc", "ArkContentGenerationTaskDoc"] {
+        schemas[name]["properties"]["status"] = json!({
+            "type": "string",
+            "enum": ["running", "succeeded", "failed", "uncertain"],
+            "description": "uncertain means the provider outcome is unknown and reconciliation is required; it is not a confirmed failure or permission to retry or create a replacement task. The error code is generation_uncertain. A confirmed one-time safety rejection is failed with dreamina_compliance_confirmation_required; complete the required confirmation on Dreamina Web before any future request. The rejected task is never retried."
+        });
+    }
+    schemas["DreaminaReleasedSettlement"] = json!({
+        "type": "object",
+        "description": "Read-only receipt from an audited operator compliance-rejection resolution joined to the fully released customer billing hold. Monetary micros are exact decimal strings. Absence of this receipt is not proof of release.",
+        "required": ["state", "resolution_audit_id", "job_id", "request_id", "hold_id", "currency", "held_micros", "released_micros", "captured_micros"],
+        "properties": {
+            "state": {"type": "string", "enum": ["released"]},
+            "resolution_audit_id": {"type": "string", "format": "uuid"},
+            "job_id": {"type": "string", "format": "uuid"},
+            "request_id": {"type": "string"},
+            "hold_id": {"type": "string", "format": "uuid"},
+            "currency": {"type": "string", "example": "USD"},
+            "held_micros": {"type": "string", "pattern": "^[0-9]+$", "example": "1200000"},
+            "released_micros": {"type": "string", "pattern": "^[0-9]+$", "example": "1200000"},
+            "captured_micros": {"type": "string", "enum": ["0"]}
+        }
+    });
+    schemas["DreaminaVideoTaskDoc"]["properties"]["settlement"] = json!({
+        "$ref": "#/components/schemas/DreaminaReleasedSettlement",
+        "description": "Optional; omitted unless this failed Dreamina task has an audited full zero-charge hold release. Uses the same tenant, project and actor visibility as the task. Never infer release from status alone."
+    });
 }
 
 fn workflow(mut schema: Value, name: &str) -> Value {
@@ -387,5 +414,51 @@ mod tests {
             );
             assert!(duration["description"].as_str().unwrap().contains("2.501"));
         }
+    }
+
+    #[test]
+    fn video_response_openapi_documents_uncertain_and_non_retryable_compliance_failure() {
+        let axum::Json(document) = crate::docs::openapi_json();
+        let schemas = &document["components"]["schemas"];
+        for name in ["DreaminaVideoTaskDoc", "ArkContentGenerationTaskDoc"] {
+            let status = &schemas[name]["properties"]["status"];
+            assert_eq!(
+                status["enum"],
+                json!(["running", "succeeded", "failed", "uncertain"])
+            );
+            let description = status["description"].as_str().unwrap();
+            assert!(description.contains("outcome is unknown"));
+            assert!(description.contains("not a confirmed failure"));
+            assert!(description.contains("generation_uncertain"));
+            assert!(description.contains("dreamina_compliance_confirmation_required"));
+            assert!(description.contains("never retried"));
+        }
+    }
+
+    #[test]
+    fn dreamina_release_receipt_openapi_is_optional_and_preserves_money_precision() {
+        let axum::Json(document) = crate::docs::openapi_json();
+        let schemas = &document["components"]["schemas"];
+        let task = &schemas["DreaminaVideoTaskDoc"];
+        assert!(
+            !task["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("settlement"))
+        );
+        assert_eq!(
+            task["properties"]["settlement"]["$ref"],
+            "#/components/schemas/DreaminaReleasedSettlement"
+        );
+        let receipt = &schemas["DreaminaReleasedSettlement"];
+        assert_eq!(receipt["properties"]["state"]["enum"], json!(["released"]));
+        for field in ["held_micros", "released_micros", "captured_micros"] {
+            assert_eq!(receipt["properties"][field]["type"], "string");
+        }
+        assert!(
+            schemas["ArkContentGenerationTaskDoc"]["properties"]
+                .get("settlement")
+                .is_none()
+        );
     }
 }

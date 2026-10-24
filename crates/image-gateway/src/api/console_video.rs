@@ -902,6 +902,9 @@ fn console_video_error_code(error_code: Option<&str>) -> &'static str {
             | "grok_video_invalid_parameter",
         ) => "invalid_argument",
         Some("grok_video_content_policy_rejected") => "content_policy_rejected",
+        Some("dreamina_compliance_confirmation_required") => {
+            "dreamina_compliance_confirmation_required"
+        }
         Some("failed_precondition") => "failed_precondition",
         Some("grok_video_output_upload_url_required") => "grok_video_output_upload_url_required",
         Some(
@@ -916,6 +919,9 @@ fn console_video_error_code(error_code: Option<&str>) -> &'static str {
 
 fn console_video_error_message(error_code: Option<&str>) -> &'static str {
     match error_code {
+        Some("dreamina_compliance_confirmation_required") => {
+            super::dreamina::DREAMINA_COMPLIANCE_CONFIRMATION_MESSAGE
+        }
         Some("grok_video_output_upload_url_required") => {
             "Grok Zero Data Retention accounts require a video upload target"
         }
@@ -1409,6 +1415,27 @@ mod tests {
             assert_eq!(error.code, expected_code);
             assert_eq!(error.message, expected_message);
         }
+    }
+
+    #[test]
+    fn dreamina_compliance_rejection_keeps_an_actionable_console_error() {
+        let status = console_video_status(
+            "proj_one",
+            "task-one",
+            VideoResultStatus::Failed {
+                model: "seedance2.0fast_vip".to_owned(),
+                duration_ms: 5000,
+                error_code: Some("dreamina_compliance_confirmation_required".to_owned()),
+            },
+        );
+        assert_eq!(status.status, "failed");
+        assert!(status.content_url.is_none());
+        let error = status.error.unwrap();
+        assert_eq!(error.code, "dreamina_compliance_confirmation_required");
+        assert_eq!(
+            error.message,
+            super::super::dreamina::DREAMINA_COMPLIANCE_CONFIRMATION_MESSAGE
+        );
     }
 
     fn resolved_route(api_profile: &str) -> ResolvedModelRoute {

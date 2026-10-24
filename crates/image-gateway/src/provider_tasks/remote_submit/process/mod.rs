@@ -300,6 +300,43 @@ impl GatedCliCommand {
 }
 
 impl GatedCliSubmission {
+    pub(crate) fn open_existing(
+        root_path: &Path,
+        submission_id: Uuid,
+    ) -> Result<Self, GatedCliProcessError> {
+        if !root_path.is_absolute() || submission_id.is_nil() {
+            return Err(GatedCliProcessError::InvalidInput);
+        }
+        let root = rfs::open(
+            root_path,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|_| GatedCliProcessError::Integrity)?;
+        validate_directory(&root, RemoteSubmitJournalError::Integrity)
+            .map_err(map_journal_error)?;
+        super::journal::validate_bound_root(root_path, &root, RemoteSubmitJournalError::Integrity)
+            .map_err(map_journal_error)?;
+        let name = submission_id.simple().to_string();
+        let directory = rfs::openat(
+            &root,
+            name.as_str(),
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|_| GatedCliProcessError::Integrity)?;
+        validate_directory(&directory, RemoteSubmitJournalError::Integrity)
+            .map_err(map_journal_error)?;
+        let entry_path = root_path.join(name);
+        validate_bound_directory(&entry_path, &directory)?;
+        Ok(Self {
+            root_path: root_path.to_owned(),
+            entry_path,
+            directory,
+            submission_id,
+        })
+    }
+
     pub fn new(root: impl AsRef<Path>, submission_id: Uuid) -> Result<Self, GatedCliProcessError> {
         if submission_id.is_nil() {
             return Err(GatedCliProcessError::InvalidInput);
@@ -859,6 +896,79 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
         temp
+    }
+
+    #[test]
+    fn evidence_open_existing_never_creates_a_root_or_submission() {
+        let temp = private_tempdir();
+        let missing_root = temp.path().join("absent");
+        assert!(GatedCliSubmission::open_existing(&missing_root, Uuid::new_v4()).is_err());
+        assert!(!missing_root.exists());
+        assert!(GatedCliSubmission::open_existing(temp.path(), Uuid::new_v4()).is_err());
+        assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn compliance_evidence_rejects_unreleased_truncated_or_changed_terminal() {
+        use super::super::compliance_evidence::verify_terminal;
+
+        let submission_id = Uuid::new_v4();
+        let stdout = br#"{"gen_status":"fail","fail_reason":"api error: ret=4010, message=aigc compliance confirmation required"}"#.to_vec();
+        let digest = sha256(&stdout);
+        let terminal = GatedCliProcessTerminal {
+            released: true,
+            exec_started: true,
+            outcome: GatedCliProcessOutcome::Exited {
+                exit_code: Some(0),
+                signal: None,
+            },
+            stdout,
+            stdout_truncated: false,
+            stderr: Vec::new(),
+            stderr_truncated: false,
+        };
+        assert!(verify_terminal(submission_id, &terminal, &digest).is_ok());
+        assert!(verify_terminal(submission_id, &terminal, &sha256(b"changed")).is_err());
+
+        let mut changed = terminal.clone();
+        changed.released = false;
+        assert!(verify_terminal(submission_id, &changed, &digest).is_err());
+        let mut changed = terminal.clone();
+        changed.exec_started = false;
+        assert!(verify_terminal(submission_id, &changed, &digest).is_err());
+        let mut changed = terminal.clone();
+        changed.stdout_truncated = true;
+        assert!(verify_terminal(submission_id, &changed, &digest).is_err());
+        let mut changed = terminal.clone();
+        changed.stderr_truncated = true;
+        assert!(verify_terminal(submission_id, &changed, &digest).is_err());
+        let mut changed = terminal;
+        changed.outcome = GatedCliProcessOutcome::TimedOut;
+        assert!(verify_terminal(submission_id, &changed, &digest).is_err());
+    }
+
+    #[test]
+    fn compliance_evidence_never_accepts_success_or_unrelated_rejection() {
+        use super::super::compliance_evidence::verify_terminal;
+
+        for stdout in [
+            br#"{"gen_status":"querying","submit_id":"accepted-video"}"#.as_slice(),
+            br#"{"gen_status":"fail","fail_reason":"unrelated refusal"}"#.as_slice(),
+        ] {
+            let terminal = GatedCliProcessTerminal {
+                released: true,
+                exec_started: true,
+                outcome: GatedCliProcessOutcome::Exited {
+                    exit_code: Some(0),
+                    signal: None,
+                },
+                stdout: stdout.to_vec(),
+                stdout_truncated: false,
+                stderr: Vec::new(),
+                stderr_truncated: false,
+            };
+            assert!(verify_terminal(Uuid::new_v4(), &terminal, &sha256(stdout)).is_err());
+        }
     }
 
     #[test]

@@ -440,12 +440,25 @@ fn ark_video_task(
     let mut task = match status {
         VideoResultStatus::Pending {
             model, duration_ms, ..
-        }
-        | VideoResultStatus::Uncertain { model, duration_ms } => ArkContentGenerationTask {
+        } => ArkContentGenerationTask {
             id: public_id,
             model: public_video_model(&model).to_owned(),
             status: "running".to_owned(),
             error: None,
+            content: None,
+            usage: None,
+            duration: Some(super::dreamina::duration_seconds(duration_ms)),
+            resolution: None,
+            ratio: None,
+        },
+        VideoResultStatus::Uncertain { model, duration_ms } => ArkContentGenerationTask {
+            id: public_id,
+            model: public_video_model(&model).to_owned(),
+            status: "uncertain".to_owned(),
+            error: Some(ArkContentGenerationError {
+                message: super::dreamina::VIDEO_UNCERTAIN_MESSAGE.to_owned(),
+                code: "generation_uncertain".to_owned(),
+            }),
             content: None,
             usage: None,
             duration: Some(super::dreamina::duration_seconds(duration_ms)),
@@ -494,20 +507,28 @@ fn ark_video_task(
             model,
             duration_ms,
             error_code,
-        } => ArkContentGenerationTask {
-            id: public_id,
-            model: public_video_model(&model).to_owned(),
-            status: "failed".to_owned(),
-            error: Some(ArkContentGenerationError {
-                message: "Video generation failed".to_owned(),
-                code: error_code.unwrap_or_else(|| "InternalError".to_owned()),
-            }),
-            content: None,
-            usage: None,
-            duration: Some(super::dreamina::duration_seconds(duration_ms)),
-            resolution: None,
-            ratio: None,
-        },
+        } => {
+            let message = match error_code.as_deref() {
+                Some("dreamina_compliance_confirmation_required") => {
+                    super::dreamina::DREAMINA_COMPLIANCE_CONFIRMATION_MESSAGE
+                }
+                _ => "Video generation failed",
+            };
+            ArkContentGenerationTask {
+                id: public_id,
+                model: public_video_model(&model).to_owned(),
+                status: "failed".to_owned(),
+                error: Some(ArkContentGenerationError {
+                    message: message.to_owned(),
+                    code: error_code.unwrap_or_else(|| "InternalError".to_owned()),
+                }),
+                content: None,
+                usage: None,
+                duration: Some(super::dreamina::duration_seconds(duration_ms)),
+                resolution: None,
+                ratio: None,
+            }
+        }
     };
     if let Some(model) = metadata.provider_model {
         task.model = public_video_model(&model).to_owned();
@@ -685,6 +706,63 @@ mod tests {
         let public = public_task_id(id);
         assert!(public.starts_with("cgt-"));
         assert_eq!(parse_task_id(&public).unwrap(), id);
+    }
+
+    #[test]
+    fn ark_video_query_exposes_uncertain_without_claiming_failure_or_success() {
+        let id = Uuid::new_v4();
+        let task = ark_video_task(
+            id,
+            VideoResultStatus::Uncertain {
+                model: "seedance2.5".to_owned(),
+                duration_ms: 5000,
+            },
+            VideoRequestMetadata::default(),
+        );
+        assert_eq!(task.id, public_task_id(id));
+        assert_eq!(task.status, "uncertain");
+        assert_eq!(task.model, "doubao-seedance-2-5-260628");
+        assert!(task.content.is_none());
+        assert!(task.usage.is_none());
+        let error = task.error.unwrap();
+        assert_eq!(error.code, "generation_uncertain");
+        assert_eq!(
+            error.message,
+            super::super::dreamina::VIDEO_UNCERTAIN_MESSAGE
+        );
+    }
+
+    #[test]
+    fn ark_video_query_explains_compliance_rejection_and_preserves_other_errors() {
+        for (code, expected_code, expected_message) in [
+            (
+                Some("dreamina_compliance_confirmation_required"),
+                "dreamina_compliance_confirmation_required",
+                super::super::dreamina::DREAMINA_COMPLIANCE_CONFIRMATION_MESSAGE,
+            ),
+            (
+                Some("provider_submit_cli_failed"),
+                "provider_submit_cli_failed",
+                "Video generation failed",
+            ),
+            (None, "InternalError", "Video generation failed"),
+        ] {
+            let task = ark_video_task(
+                Uuid::new_v4(),
+                VideoResultStatus::Failed {
+                    model: "seedance2.5".to_owned(),
+                    duration_ms: 5000,
+                    error_code: code.map(str::to_owned),
+                },
+                VideoRequestMetadata::default(),
+            );
+            assert_eq!(task.status, "failed");
+            assert!(task.content.is_none());
+            assert!(task.usage.is_none());
+            let error = task.error.unwrap();
+            assert_eq!(error.code, expected_code);
+            assert_eq!(error.message, expected_message);
+        }
     }
 
     #[test]

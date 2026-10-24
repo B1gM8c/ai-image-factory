@@ -44,10 +44,12 @@ pub use readiness::{
     ProviderRuntimeSupervisorConfig, ProviderRuntimeSupervisorError,
 };
 pub use remote_submit::{
+    DreaminaComplianceRejectionResolution, DreaminaComplianceRejectionResolutionRequest,
     GatedCliBinding, GatedCliCommand, GatedCliInputFile, GatedCliObservation,
     GatedCliPreparedSubmission, GatedCliProcessError, GatedCliProcessOutcome,
     GatedCliProcessTerminal, GatedCliReady, GatedCliSubmission, GatedCliSubmitCodec,
-    GatedCliSubmitDriver, run_remote_submit_gate, run_remote_submit_runner,
+    GatedCliSubmitDriver, resolve_dreamina_compliance_rejection, run_remote_submit_gate,
+    run_remote_submit_runner,
 };
 pub use runtime_profile::{ProviderRuntimeProfile, ProviderRuntimeProfileStore};
 pub use submit::{

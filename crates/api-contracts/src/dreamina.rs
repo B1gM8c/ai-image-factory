@@ -233,6 +233,23 @@ pub struct DreaminaVideoTask {
     pub error: Option<DreaminaTaskError>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content: Option<DreaminaVideoContent>,
+    /// Present only for an audited operator resolution backed by a fully released hold.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settlement: Option<DreaminaReleasedSettlement>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct DreaminaReleasedSettlement {
+    pub state: String,
+    pub resolution_audit_id: String,
+    pub job_id: String,
+    pub request_id: String,
+    pub hold_id: String,
+    pub currency: String,
+    /// Monetary micros are decimal strings to preserve exact integer precision.
+    pub held_micros: String,
+    pub released_micros: String,
+    pub captured_micros: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -250,6 +267,33 @@ pub struct DreaminaTaskError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn video_release_receipt_is_optional_and_keeps_exact_decimal_money() {
+        let legacy = r#"{"id":"task-a","status":"running"}"#;
+        let task: DreaminaVideoTask = serde_json::from_str(legacy).unwrap();
+        assert!(task.settlement.is_none());
+        assert!(
+            serde_json::to_value(task)
+                .unwrap()
+                .get("settlement")
+                .is_none()
+        );
+
+        let receipt = serde_json::json!({
+            "id": "task-a", "status": "failed",
+            "settlement": {
+                "state": "released",
+                "resolution_audit_id": "00000000-0000-4000-8000-000000000001",
+                "job_id": "00000000-0000-4000-8000-000000000002",
+                "request_id": "req_a", "hold_id": "00000000-0000-4000-8000-000000000003",
+                "currency": "USD", "held_micros": "9007199254740993",
+                "released_micros": "9007199254740993", "captured_micros": "0"
+            }
+        });
+        let parsed: DreaminaVideoTask = serde_json::from_value(receipt.clone()).unwrap();
+        assert_eq!(serde_json::to_value(parsed).unwrap(), receipt);
+    }
 
     #[test]
     fn all_native_workflows_have_strict_distinct_wire_shapes() {

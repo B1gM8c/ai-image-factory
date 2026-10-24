@@ -28,7 +28,7 @@ use crate::{
     artifacts::StoredGenerationResult,
     auth::{ApiKeyCapability, AuthContext},
     model_routing::ResolvedModelRoute,
-    settlement::VideoResultStatus,
+    settlement::{ExecutionSettlementStore, VideoResultStatus},
     usage::{UsageCharge, UsageLimits},
 };
 
@@ -831,8 +831,17 @@ pub(super) async fn get_video(
     let auth = authenticate_image_request(&headers, &state).await?;
     auth.require_api_key_capability(ApiKeyCapability::VideosRead)?;
     let job_id = parse_uuid(&task_id)?;
-    let status = state
-        .settlement_store
+    Ok(Json(
+        project_video_task(state.settlement_store.as_ref(), &auth, job_id).await?,
+    ))
+}
+
+async fn project_video_task(
+    settlement_store: &dyn ExecutionSettlementStore,
+    auth: &AuthContext,
+    job_id: Uuid,
+) -> Result<DreaminaVideoTask, ImageGatewayError> {
+    let status = settlement_store
         .project_video_status(
             &auth.tenant_id,
             &auth.project_id,
@@ -841,20 +850,46 @@ pub(super) async fn get_video(
         )
         .await?
         .ok_or_else(task_not_found)?;
-    Ok(Json(video_task(job_id, status)))
+    let audited_release_possible = matches!(
+        &status,
+        VideoResultStatus::Failed { error_code: Some(code), .. }
+            if code == "dreamina_compliance_confirmation_required"
+    );
+    let mut task = video_task(job_id, status);
+    if audited_release_possible {
+        task.settlement = settlement_store
+            .project_video_released_settlement(
+                &auth.tenant_id,
+                &auth.project_id,
+                auth.actor_user_id,
+                job_id,
+            )
+            .await?;
+    }
+    Ok(task)
 }
 
 fn video_task(id: Uuid, status: VideoResultStatus) -> DreaminaVideoTask {
     match status {
-        VideoResultStatus::Pending { model, .. } | VideoResultStatus::Uncertain { model, .. } => {
-            DreaminaVideoTask {
-                id: id.to_string(),
-                status: "running".to_owned(),
-                model: Some(model),
-                error: None,
-                content: None,
-            }
-        }
+        VideoResultStatus::Pending { model, .. } => DreaminaVideoTask {
+            id: id.to_string(),
+            status: "running".to_owned(),
+            model: Some(model),
+            error: None,
+            content: None,
+            settlement: None,
+        },
+        VideoResultStatus::Uncertain { model, .. } => DreaminaVideoTask {
+            id: id.to_string(),
+            status: "uncertain".to_owned(),
+            model: Some(model),
+            error: Some(DreaminaTaskError {
+                code: "generation_uncertain".to_owned(),
+                message: VIDEO_UNCERTAIN_MESSAGE.to_owned(),
+            }),
+            content: None,
+            settlement: None,
+        },
         VideoResultStatus::Succeeded {
             model,
             duration_ms,
@@ -868,6 +903,7 @@ fn video_task(id: Uuid, status: VideoResultStatus) -> DreaminaVideoTask {
                 video_url: format!("/v1/dreamina/files/{artifact_id}/content"),
                 duration: duration_seconds(duration_ms),
             }),
+            settlement: None,
         },
         VideoResultStatus::SucceededRemote {
             model,
@@ -882,21 +918,34 @@ fn video_task(id: Uuid, status: VideoResultStatus) -> DreaminaVideoTask {
                 video_url: result.video_url().to_owned(),
                 duration: duration_seconds(duration_ms),
             }),
+            settlement: None,
         },
         VideoResultStatus::Failed {
             model, error_code, ..
-        } => DreaminaVideoTask {
-            id: id.to_string(),
-            status: "failed".to_owned(),
-            model: Some(model),
-            error: Some(DreaminaTaskError {
-                code: error_code.unwrap_or_else(|| "generation_failed".to_owned()),
-                message: "Dreamina video generation failed".to_owned(),
-            }),
-            content: None,
-        },
+        } => {
+            let message = match error_code.as_deref() {
+                Some("dreamina_compliance_confirmation_required") => {
+                    DREAMINA_COMPLIANCE_CONFIRMATION_MESSAGE
+                }
+                _ => "Dreamina video generation failed",
+            };
+            DreaminaVideoTask {
+                id: id.to_string(),
+                status: "failed".to_owned(),
+                model: Some(model),
+                error: Some(DreaminaTaskError {
+                    code: error_code.unwrap_or_else(|| "generation_failed".to_owned()),
+                    message: message.to_owned(),
+                }),
+                content: None,
+                settlement: None,
+            }
+        }
     }
 }
+
+pub(super) const VIDEO_UNCERTAIN_MESSAGE: &str = "The generation outcome is unknown. Do not retry or create a replacement task; contact support to reconcile this task.";
+pub(super) const DREAMINA_COMPLIANCE_CONFIRMATION_MESSAGE: &str = "Dreamina requires a one-time safety confirmation on its website. Complete it before any future request. This task will not be retried.";
 
 /// Keep whole-second responses byte-compatible and fractional seconds exact.
 pub(super) fn duration_seconds(duration_ms: u32) -> serde_json::Number {
@@ -1018,6 +1067,229 @@ fn task_not_found() -> ImageGatewayError {
 mod tests {
     use super::*;
     use crate::auth::RequestRouteAttribution;
+    use std::sync::Mutex;
+
+    struct VideoQueryStore {
+        status: Mutex<Option<VideoResultStatus>>,
+        receipt: Option<image_api_contracts::dreamina::DreaminaReleasedSettlement>,
+        receipt_reads: Mutex<Vec<(String, String, Option<Uuid>, Uuid)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ExecutionSettlementStore for VideoQueryStore {
+        fn artifact_storage_identity(&self) -> String {
+            "unused".to_owned()
+        }
+
+        async fn succeed(
+            &self,
+            _: &crate::admission::WorkLease,
+            _: &crate::usage::UsageReservation,
+            _: &crate::artifacts::GenerationResultManifest,
+        ) -> Result<crate::usage::UsageSnapshot, ImageGatewayError> {
+            unreachable!()
+        }
+
+        async fn fail(
+            &self,
+            _: &crate::admission::WorkLease,
+            _: &crate::usage::UsageReservation,
+            _: &'static str,
+        ) -> Result<(), ImageGatewayError> {
+            unreachable!()
+        }
+
+        async fn load_generation_result(
+            &self,
+            _: Uuid,
+        ) -> Result<crate::settlement::GenerationResultLookup, ImageGatewayError> {
+            unreachable!()
+        }
+
+        async fn generation_status(
+            &self,
+            _: Uuid,
+        ) -> Result<crate::settlement::GenerationResultStatus, ImageGatewayError> {
+            unreachable!()
+        }
+
+        async fn project_video_status(
+            &self,
+            _: &str,
+            _: &str,
+            _: Option<Uuid>,
+            _: Uuid,
+        ) -> Result<Option<VideoResultStatus>, ImageGatewayError> {
+            Ok(self.status.lock().unwrap().take())
+        }
+
+        async fn project_video_released_settlement(
+            &self,
+            tenant_id: &str,
+            project_id: &str,
+            actor_user_id: Option<Uuid>,
+            job_id: Uuid,
+        ) -> Result<
+            Option<image_api_contracts::dreamina::DreaminaReleasedSettlement>,
+            ImageGatewayError,
+        > {
+            self.receipt_reads.lock().unwrap().push((
+                tenant_id.to_owned(),
+                project_id.to_owned(),
+                actor_user_id,
+                job_id,
+            ));
+            Ok(self.receipt.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn video_query_reads_no_release_receipt_for_normal_or_unknown_outcomes() {
+        for status in [
+            Some(VideoResultStatus::Pending {
+                model: "seedance2.5".to_owned(),
+                duration_ms: 5000,
+                stage: crate::settlement::VideoPendingStage::Processing,
+            }),
+            Some(VideoResultStatus::Uncertain {
+                model: "seedance2.5".to_owned(),
+                duration_ms: 5000,
+            }),
+            Some(VideoResultStatus::Succeeded {
+                model: "seedance2.5".to_owned(),
+                duration_ms: 5000,
+                artifact_id: Uuid::new_v4(),
+            }),
+            Some(VideoResultStatus::Failed {
+                model: "seedance2.5".to_owned(),
+                duration_ms: 5000,
+                error_code: Some("provider_submit_cli_failed".to_owned()),
+            }),
+            None,
+        ] {
+            let visible = status.is_some();
+            let store = VideoQueryStore {
+                status: Mutex::new(status),
+                receipt: None,
+                receipt_reads: Mutex::default(),
+            };
+            let result = project_video_task(&store, &routed_auth(7), Uuid::new_v4()).await;
+            assert_eq!(result.is_ok(), visible);
+            if let Ok(task) = result {
+                assert!(task.settlement.is_none());
+            }
+            assert!(store.receipt_reads.lock().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn video_query_attaches_only_the_store_receipt_under_the_authenticated_scope() {
+        let job_id = Uuid::new_v4();
+        let mut auth = routed_auth(7);
+        auth.actor_user_id = Some(Uuid::new_v4());
+        let receipt = image_api_contracts::dreamina::DreaminaReleasedSettlement {
+            state: "released".to_owned(),
+            resolution_audit_id: Uuid::new_v4().to_string(),
+            job_id: job_id.to_string(),
+            request_id: "req_test".to_owned(),
+            hold_id: Uuid::new_v4().to_string(),
+            currency: "USD".to_owned(),
+            held_micros: "1200000".to_owned(),
+            released_micros: "1200000".to_owned(),
+            captured_micros: "0".to_owned(),
+        };
+        for expected in [None, Some(receipt)] {
+            let store = VideoQueryStore {
+                status: Mutex::new(Some(VideoResultStatus::Failed {
+                    model: "seedance2.0fast_vip".to_owned(),
+                    duration_ms: 10000,
+                    error_code: Some("dreamina_compliance_confirmation_required".to_owned()),
+                })),
+                receipt: expected.clone(),
+                receipt_reads: Mutex::default(),
+            };
+            let task = project_video_task(&store, &auth, job_id).await.unwrap();
+            assert_eq!(task.status, "failed");
+            assert_eq!(task.settlement, expected);
+            let json = serde_json::to_value(task).unwrap();
+            assert_eq!(json.get("settlement").is_some(), expected.is_some());
+            assert_eq!(
+                *store.receipt_reads.lock().unwrap(),
+                vec![(
+                    auth.tenant_id.clone(),
+                    auth.project_id.clone(),
+                    auth.actor_user_id,
+                    job_id
+                )]
+            );
+        }
+    }
+
+    #[test]
+    fn video_query_distinguishes_uncertain_from_running_without_inventing_a_result() {
+        let id = Uuid::new_v4();
+        let pending = video_task(
+            id,
+            VideoResultStatus::Pending {
+                model: "seedance2.0fast_vip".to_owned(),
+                duration_ms: 5000,
+                stage: crate::settlement::VideoPendingStage::Processing,
+            },
+        );
+        assert_eq!(pending.status, "running");
+        assert!(pending.error.is_none());
+        assert!(pending.content.is_none());
+
+        let uncertain = serde_json::to_value(video_task(
+            id,
+            VideoResultStatus::Uncertain {
+                model: "seedance2.0fast_vip".to_owned(),
+                duration_ms: 5000,
+            },
+        ))
+        .unwrap();
+        assert_eq!(uncertain["id"], id.to_string());
+        assert_eq!(uncertain["status"], "uncertain");
+        assert_eq!(uncertain["model"], "seedance2.0fast_vip");
+        assert_eq!(uncertain["error"]["code"], "generation_uncertain");
+        assert_eq!(uncertain["error"]["message"], VIDEO_UNCERTAIN_MESSAGE);
+        assert!(uncertain.get("content").is_none());
+    }
+
+    #[test]
+    fn video_query_explains_compliance_rejection_without_suggesting_an_old_task_retry() {
+        for (code, expected_code, expected_message) in [
+            (
+                Some("dreamina_compliance_confirmation_required"),
+                "dreamina_compliance_confirmation_required",
+                DREAMINA_COMPLIANCE_CONFIRMATION_MESSAGE,
+            ),
+            (
+                Some("provider_submit_cli_failed"),
+                "provider_submit_cli_failed",
+                "Dreamina video generation failed",
+            ),
+            (
+                None,
+                "generation_failed",
+                "Dreamina video generation failed",
+            ),
+        ] {
+            let task = video_task(
+                Uuid::new_v4(),
+                VideoResultStatus::Failed {
+                    model: "seedance2.0fast_vip".to_owned(),
+                    duration_ms: 5000,
+                    error_code: code.map(str::to_owned),
+                },
+            );
+            assert_eq!(task.status, "failed");
+            assert!(task.content.is_none());
+            let error = task.error.unwrap();
+            assert_eq!(error.code, expected_code);
+            assert_eq!(error.message, expected_message);
+        }
+    }
 
     #[test]
     fn video_duration_wire_keeps_whole_seconds_and_exact_millisecond_fractions() {
