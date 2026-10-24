@@ -17,6 +17,38 @@ use image_provider_sdk::PendingOperation;
 const REFUSAL: &[u8] = br#"{"gen_status":"fail","fail_reason":"api error: ret=4010, message=aigc compliance confirmation required"}"#;
 const HELD_MICROS: i64 = 1_200_000;
 
+fn fixture_runner(root: &Path) -> TestResult<PathBuf> {
+    let source = Path::new(env!("CARGO_BIN_EXE_remote-submit-runner"));
+    #[cfg(target_os = "linux")]
+    {
+        // ELF embeds DWARF in the executable. Rehashing that debug payload can
+        // consume this fixture's five-second submit budget before runner start.
+        // Keep the real launch-time pin check and short deadline on a private
+        // debug-free copy; never modify Cargo's binary or the production runner.
+        let runner = root.join("remote-submit-runner");
+        fs::copy(source, &runner).map_err(debug_error)?;
+        fs::set_permissions(&runner, fs::Permissions::from_mode(0o700)).map_err(debug_error)?;
+        let status = std::process::Command::new("strip")
+            .arg("--strip-debug")
+            .arg(&runner)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map_err(|_| "offline fixture runner debug stripping unavailable".to_string())?;
+        require(
+            status.success(),
+            "offline fixture runner debug stripping failed",
+        )?;
+        Ok(runner)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        // Mach-O keeps its debug payload separately; preserve its code signature.
+        let _ = root;
+        Ok(source.to_path_buf())
+    }
+}
+
 /// Reproduce the old decoder's conservative classification while publishing
 /// genuine runner/journal evidence. This shell has no network or media ability.
 struct HistoricalRefusalCodec {
@@ -206,18 +238,20 @@ async fn refusal_fixture(pool: &PgPool, terminalize: bool) -> TestResult<Refusal
     let workspace = journal.path().join("workspace");
     fs::create_dir(&workspace).map_err(debug_error)?;
     fs::set_permissions(&workspace, fs::Permissions::from_mode(0o700)).map_err(debug_error)?;
-    let runner = Path::new(env!("CARGO_BIN_EXE_remote-submit-runner"));
+    let runner = fixture_runner(journal.path())?;
+    let runner_bytes = fs::metadata(&runner).map_err(debug_error)?.len();
     let codec = HistoricalRefusalCodec {
         invocation_marker: invocation_marker.clone(),
         shell_sha256: sha256(&fs::read("/bin/sh").map_err(debug_error)?),
     };
     let driver = GatedCliSubmitDriver::new(
         codec,
-        runner,
-        sha256(&fs::read(runner).map_err(debug_error)?),
+        &runner,
+        sha256(&fs::read(&runner).map_err(debug_error)?),
         WorkingDirectory::new_private(&workspace).map_err(debug_error)?,
     )
     .map_err(debug_error)?;
+    let preparation_started = std::time::Instant::now();
     let outcome = ProviderSubmitOrchestrator::new(
         PostgresProviderTaskStore::new(pool.clone()),
         driver,
@@ -228,11 +262,23 @@ async fn refusal_fixture(pool: &PgPool, terminalize: bool) -> TestResult<Refusal
     .submit(ProviderSubmitWork::new(&lease, command).map_err(debug_error)?)
     .await
     .map_err(debug_error)?;
-    require(
-        matches!(outcome, ProviderSubmitOutcome::AwaitingEvidence(ref intent)
+    let expected = matches!(outcome, ProviderSubmitOutcome::AwaitingEvidence(ref intent)
         if intent.state == ProviderSubmitIntentState::OutcomeUnknown
-            && intent.failure_error_code.as_deref() == Some("dreamina_submit_rejected")),
-        format!("historical decoder did not preserve uncertainty: {outcome:?}"),
+            && intent.failure_error_code.as_deref() == Some("dreamina_submit_rejected"));
+    let error_code = match &outcome {
+        ProviderSubmitOutcome::AwaitingEvidence(intent)
+        | ProviderSubmitOutcome::Terminal(intent) => intent
+            .failure_error_code
+            .as_deref()
+            .unwrap_or("missing_failure_code"),
+        ProviderSubmitOutcome::Attached(_) => "unexpected_accepted_operation",
+    };
+    require(
+        expected,
+        format!(
+            "offline fixture runner_bytes={runner_bytes} preparation_ms={} error_code={error_code}",
+            preparation_started.elapsed().as_millis()
+        ),
     )?;
     let fixture = RefusalFixture {
         journal,
