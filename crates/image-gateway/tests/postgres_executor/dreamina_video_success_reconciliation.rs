@@ -43,8 +43,16 @@ async fn fixture(pool: &PgPool) -> TestResult<Fixture> {
 }
 
 async fn fixture_with_error(pool: &PgPool, error: &'static str) -> TestResult<Fixture> {
+    fixture_with_funding(pool, error, 0).await
+}
+
+async fn fixture_with_funding(
+    pool: &PgPool,
+    error: &'static str,
+    grant_micros: i64,
+) -> TestResult<Fixture> {
     let work = seed_video_ten_seconds(pool).await?;
-    seed_v4_customer_quote_with_basis(
+    seed_v4_customer_quote_with_funding(
         pool,
         &work,
         V4CustomerQuoteIdentity {
@@ -61,6 +69,7 @@ async fn fixture_with_error(pool: &PgPool, error: &'static str) -> TestResult<Fi
             max_quantity: 10,
             max_amount_micros: PRICE,
         },
+        grant_micros,
     )
     .await?;
     let executor = PostgresExecutorSubmissionStore::new(pool.clone());
@@ -309,6 +318,44 @@ async fn original_video_resolution_rolls_back_all_database_effects_on_each_failu
         require(result.captured_micros==PRICE,"successful retry drifted after database rollback")
     }.await;
     combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
+async fn original_video_grant_and_mixed_funding_are_atomic_and_settle_once() -> TestResult {
+    for grant_micros in [PRICE, PRICE / 2] {
+        let Some(database) = TestDatabase::new().await? else {
+            return Ok(());
+        };
+        let result = async {
+            let fixture = fixture_with_funding(&database.pool, "dreamina_poll_protocol_invalid", grant_micros).await?;
+            let before = rollback_snapshot(&database.pool, fixture.request.job_id).await?;
+            let funding_before = operator_funding_snapshot(&database.pool, fixture.request.job_id).await?;
+            let canonical = immutable_snapshot(&database.pool, fixture.request.job_id).await?;
+            sqlx::query("CREATE FUNCTION reject_video_funding_commit() RETURNS TRIGGER AS $$ BEGIN RAISE EXCEPTION 'injected video grant commit failure'; END; $$ LANGUAGE plpgsql")
+                .execute(&database.pool).await.map_err(debug_error)?;
+            sqlx::query("CREATE CONSTRAINT TRIGGER reject_video_funding_commit AFTER INSERT ON dreamina_operator_video_success_resolutions DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION reject_video_funding_commit()")
+                .execute(&database.pool).await.map_err(debug_error)?;
+            let failed = resolve_dreamina_video_success(&database.pool, &fixture.evidence_root, &fixture.request).await;
+            sqlx::query("DROP TRIGGER reject_video_funding_commit ON dreamina_operator_video_success_resolutions")
+                .execute(&database.pool).await.map_err(debug_error)?;
+            require(failed.is_err(), "video grant commit failure was ignored")?;
+            require(before == rollback_snapshot(&database.pool, fixture.request.job_id).await?
+                && funding_before == operator_funding_snapshot(&database.pool, fixture.request.job_id).await?, "video rollback changed grant/account/ledger state")?;
+            let (first, concurrent) = tokio::join!(
+                resolve_dreamina_video_success(&database.pool, &fixture.evidence_root, &fixture.request),
+                resolve_dreamina_video_success(&database.pool, &fixture.evidence_root, &fixture.request)
+            );
+            let first = first.map_err(debug_error)?;
+            require(first == concurrent.map_err(debug_error)? && first.captured_micros == PRICE && first.committed_units == 10 && first.released_micros == 0, "video grant replay changed frozen price or identity")?;
+            assert_operator_funding_settled(&database.pool, fixture.request.job_id, PRICE, grant_micros).await?;
+            let after = operator_funding_snapshot(&database.pool, fixture.request.job_id).await?;
+            require(first == resolve_dreamina_video_success(&database.pool, &fixture.evidence_root, &fixture.request).await.map_err(debug_error)?
+                && after == operator_funding_snapshot(&database.pool, fixture.request.job_id).await?, "video grant replay repeated consumption")?;
+            require(canonical == immutable_snapshot(&database.pool, fixture.request.job_id).await?, "video grant recovery mutated original execution")
+        }.await;
+        combine(result, database.cleanup().await)?;
+    }
+    Ok(())
 }
 
 #[tokio::test]
