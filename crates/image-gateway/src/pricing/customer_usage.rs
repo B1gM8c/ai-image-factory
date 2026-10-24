@@ -57,6 +57,78 @@ pub(crate) async fn persist_customer_usage_facts(
     authority: CustomerUsageAuthority,
     now: i64,
 ) -> Result<(), CustomerUsageFactError> {
+    persist_customer_usage_facts_inner(tx, output, authority, None, now).await
+}
+
+pub(crate) async fn persist_customer_usage_facts_with_operator_resolution(
+    tx: &mut Transaction<'_, Postgres>,
+    output: &CustomerUsageOutput<'_>,
+    authority: CustomerUsageAuthority,
+    resolution_id: Uuid,
+    now: i64,
+) -> Result<(), CustomerUsageFactError> {
+    let CustomerUsageAuthority::Durable {
+        submission_id,
+        receipt_id,
+    } = authority
+    else {
+        return Err(CustomerUsageFactError::Conflict);
+    };
+    let bound: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM dreamina_operator_image_success_resolutions resolution JOIN provider_receipts receipt ON receipt.receipt_id = resolution.original_receipt_id WHERE resolution.resolution_id = $1 AND resolution.job_id = $2 AND resolution.submission_id = $3 AND resolution.original_receipt_id = $4 AND receipt.output_id = $5)",
+    ).bind(resolution_id).bind(output.job_id).bind(submission_id).bind(receipt_id).bind(output.output_id)
+        .fetch_one(&mut **tx).await.map_err(|_| CustomerUsageFactError::Unavailable)?;
+    if !bound {
+        return Err(CustomerUsageFactError::Conflict);
+    }
+    persist_customer_usage_facts_inner(tx, output, authority, Some(resolution_id), now).await
+}
+
+pub(crate) async fn persist_customer_usage_facts_with_operator_video_resolution(
+    tx: &mut Transaction<'_, Postgres>,
+    output: &CustomerUsageOutput<'_>,
+    authority: CustomerUsageAuthority,
+    resolution_id: Uuid,
+    now: i64,
+) -> Result<(), CustomerUsageFactError> {
+    let CustomerUsageAuthority::Durable {
+        submission_id,
+        receipt_id,
+    } = authority
+    else {
+        return Err(CustomerUsageFactError::Conflict);
+    };
+    if output.provider_id != "dreamina-cli"
+        || output.terminal_outcome != "succeeded"
+        || output.billing_metric != "video_second"
+        || output.billing_unit != "second"
+    {
+        return Err(CustomerUsageFactError::Conflict);
+    }
+    let bound: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM dreamina_operator_video_success_resolutions resolution JOIN provider_receipts receipt ON receipt.receipt_id = resolution.original_receipt_id WHERE resolution.resolution_id = $1 AND resolution.job_id = $2 AND resolution.submission_id = $3 AND resolution.original_receipt_id = $4 AND resolution.output_id = $5 AND receipt.output_id = $5)",
+    )
+    .bind(resolution_id)
+    .bind(output.job_id)
+    .bind(submission_id)
+    .bind(receipt_id)
+    .bind(output.output_id)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(|_| CustomerUsageFactError::Unavailable)?;
+    if !bound {
+        return Err(CustomerUsageFactError::Conflict);
+    }
+    persist_customer_usage_facts_inner(tx, output, authority, Some(resolution_id), now).await
+}
+
+async fn persist_customer_usage_facts_inner(
+    tx: &mut Transaction<'_, Postgres>,
+    output: &CustomerUsageOutput<'_>,
+    authority: CustomerUsageAuthority,
+    operator_resolution_id: Option<Uuid>,
+    now: i64,
+) -> Result<(), CustomerUsageFactError> {
     let image_output = output.billing_metric == "output"
         && output.billing_unit == "output"
         && output.output_billable_units == 1;
@@ -187,13 +259,19 @@ pub(crate) async fn persist_customer_usage_facts(
             }
             _ => return Err(CustomerUsageFactError::Conflict),
         };
-        let metadata = merge_usage_metadata(
+        let mut metadata = merge_usage_metadata(
             &context.request_dimensions_json,
             output.operation,
             output.billing_metric,
             output.billing_unit,
             basis_name,
         )?;
+        if let Some(resolution_id) = operator_resolution_id {
+            metadata
+                .as_object_mut()
+                .ok_or(CustomerUsageFactError::Conflict)?
+                .insert("operator_resolution_id".to_string(), json!(resolution_id));
+        }
         let (submission_id, receipt_id, attempt_execution_id, authority_key) = match authority {
             CustomerUsageAuthority::Durable {
                 submission_id,

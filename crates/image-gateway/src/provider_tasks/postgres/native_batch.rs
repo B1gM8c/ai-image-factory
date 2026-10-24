@@ -164,7 +164,7 @@ async fn lock_member(
     let task = sqlx::query_scalar::<_, bool>(
         r#"SELECT task.state = 'provider_waiting' AND task.poll_owner = $2
            AND task.poll_lease_epoch = $3 AND task.poll_lease_expires_at_ms > floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT
-           AND task.provider_deadline_at_ms > floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT
+           AND provider_task_completion_deadline(task.submission_id, task.provider_deadline_at_ms) > floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT
            FROM provider_remote_tasks task WHERE task.submission_id = $1 AND task.executor_execution_id = $4 FOR UPDATE"#,
     ).bind(lease.task.submission_id).bind(&lease.poll_owner).bind(lease.poll_lease_epoch)
         .bind(lease.task.executor_execution_id).fetch_optional(&mut **tx).await.map_err(unavailable)?;

@@ -80,6 +80,15 @@ mod dreamina_compliance_resolution;
 #[path = "postgres_executor/queue_progress_projection.rs"]
 mod queue_progress_projection;
 
+#[path = "postgres_executor/dreamina_image_success_reconciliation.rs"]
+mod dreamina_image_success_reconciliation;
+
+#[path = "postgres_executor/dreamina_video_success_reconciliation.rs"]
+mod dreamina_video_success_reconciliation;
+
+#[path = "postgres_executor/accepted_image_completion_budget.rs"]
+mod accepted_image_completion_budget;
+
 #[path = "postgres_executor/accepted_completion_budget.rs"]
 mod accepted_completion_budget;
 

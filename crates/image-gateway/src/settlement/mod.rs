@@ -18,6 +18,14 @@ use crate::{
 mod postgres;
 
 pub use postgres::PostgresExecutionSettlementStore;
+pub use postgres::image_success_reconciliation::{
+    DreaminaImageSuccessResolution, DreaminaImageSuccessResolutionRequest,
+    resolve_dreamina_image_success,
+};
+pub use postgres::video_success_reconciliation::{
+    DreaminaVideoSuccessResolution, DreaminaVideoSuccessResolutionRequest,
+    resolve_dreamina_video_success,
+};
 
 #[async_trait]
 pub trait ExecutionSettlementStore: Send + Sync + 'static {
@@ -46,6 +54,27 @@ pub trait ExecutionSettlementStore: Send + Sync + 'static {
         &self,
         job_id: uuid::Uuid,
     ) -> Result<GenerationResultStatus, ImageGatewayError>;
+
+    async fn project_image_status(
+        &self,
+        _tenant_id: &str,
+        _project_id: &str,
+        _actor_user_id: Option<uuid::Uuid>,
+        _job_id: uuid::Uuid,
+    ) -> Result<Option<ImageTaskProjection>, ImageGatewayError> {
+        Ok(None)
+    }
+
+    async fn project_image_job_by_idempotency_key(
+        &self,
+        _tenant_id: &str,
+        _project_id: &str,
+        _actor_user_id: Option<uuid::Uuid>,
+        _operation: &str,
+        _key_digest: &str,
+    ) -> Result<Option<uuid::Uuid>, ImageGatewayError> {
+        Ok(None)
+    }
 
     async fn video_status(
         &self,
@@ -122,6 +151,28 @@ pub enum GenerationResultLookup {
     Available(StoredGenerationResult),
     Expired,
     Missing,
+}
+
+#[derive(Debug)]
+pub struct ImageTaskProjection {
+    pub model: String,
+    pub request_id: String,
+    pub request: image_api_contracts::dreamina::DreaminaImageRequestMetadata,
+    pub status: ImageResultStatus,
+}
+
+#[derive(Debug)]
+pub enum ImageResultStatus {
+    Pending {
+        stage: VideoPendingStage,
+        provider_progress: Option<VideoProviderProgress>,
+    },
+    Succeeded(StoredGenerationResult),
+    Failed {
+        error_code: Option<String>,
+    },
+    Uncertain,
+    Expired,
 }
 
 #[derive(Debug, Eq, PartialEq)]

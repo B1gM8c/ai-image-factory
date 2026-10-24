@@ -223,6 +223,65 @@ pub struct DreaminaTaskCreated {
     pub id: String,
 }
 
+/// Read-only native image task. Image payload fields are present only after success.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DreaminaImageTask {
+    pub id: String,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_progress: Option<DreaminaProviderProgress>,
+    pub cancellation: DreaminaCancellation,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request: Option<DreaminaImageRequestMetadata>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<DreaminaTaskError>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<Vec<DreaminaImageData>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_format: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quality: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DreaminaImageData {
+    pub b64_json: String,
+}
+
+/// Specifications frozen at admission; excludes prompts and input locations.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DreaminaImageRequestMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generate_num: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ratio: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub width: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height: Option<u32>,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct DreaminaVideoTask {
     pub id: String,

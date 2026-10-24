@@ -26,7 +26,10 @@ use crate::{
 };
 
 mod failure;
+mod image_status;
+pub(super) mod image_success_reconciliation;
 mod results;
+pub(super) mod video_success_reconciliation;
 
 use results::{
     GenerationManifestLookup, generation_result_is_expired, load_generation_manifest,
@@ -171,6 +174,35 @@ impl ExecutionSettlementStore for PostgresExecutionSettlementStore {
         }
     }
 
+    async fn project_image_status(
+        &self,
+        tenant_id: &str,
+        project_id: &str,
+        actor_user_id: Option<Uuid>,
+        job_id: Uuid,
+    ) -> Result<Option<super::ImageTaskProjection>, ImageGatewayError> {
+        image_status::project(self, tenant_id, project_id, actor_user_id, job_id).await
+    }
+
+    async fn project_image_job_by_idempotency_key(
+        &self,
+        tenant_id: &str,
+        project_id: &str,
+        actor_user_id: Option<Uuid>,
+        operation: &str,
+        key_digest: &str,
+    ) -> Result<Option<Uuid>, ImageGatewayError> {
+        image_status::lookup(
+            self,
+            tenant_id,
+            project_id,
+            actor_user_id,
+            operation,
+            key_digest,
+        )
+        .await
+    }
+
     async fn video_status(
         &self,
         tenant_id: &str,
@@ -179,7 +211,8 @@ impl ExecutionSettlementStore for PostgresExecutionSettlementStore {
         let row: Option<VideoStatusRow> = sqlx::query_as(
             r#"
             SELECT j.state, w.state, j.last_error_code, j.model, j.billable_units,
-                   artifact.artifact_id, remote.video_url, remote.expires_at_ms, payload.command_json,
+                   artifact.artifact_id, COALESCE(operator_video.video_url, remote.video_url) AS video_url,
+                   CASE WHEN operator_video.resolution_id IS NOT NULL THEN operator_video.expires_at_ms ELSE remote.expires_at_ms END AS expires_at_ms, payload.command_json,
                    progress_observation.progress_json, progress_observation.observed_at_ms
             FROM jobs j
             JOIN work_items w ON w.job_id = j.job_id
@@ -198,11 +231,18 @@ impl ExecutionSettlementStore for PostgresExecutionSettlementStore {
               ON progress_task.submission_id = progress_submission.submission_id
              AND progress_task.executor_execution_id = progress_submission.executor_execution_id
              AND progress_task.provider_id = j.provider_id
-            LEFT JOIN provider_task_observations progress_observation
-              ON progress_observation.observation_id = progress_task.state_observation_id
-             AND progress_observation.submission_id = progress_task.submission_id
-             AND progress_observation.executor_execution_id = progress_task.executor_execution_id
-             AND progress_observation.observed_state = 'provider_waiting'
+            LEFT JOIN LATERAL (
+                SELECT observation.progress_json, observation.observed_at_ms
+                FROM provider_task_observations observation
+                WHERE observation.submission_id = progress_task.submission_id
+                  AND observation.executor_execution_id = progress_task.executor_execution_id
+                  AND observation.source = 'poll'
+                  AND observation.observed_state = 'provider_waiting'
+                  AND observation.progress_json IS NOT NULL
+                ORDER BY observation.observed_at_ms DESC,
+                         observation.poll_lease_epoch DESC, observation.observation_id DESC
+                LIMIT 1
+            ) progress_observation ON TRUE
             LEFT JOIN artifacts artifact
               ON artifact.job_id = j.job_id
              AND artifact.output_index = 0
@@ -231,6 +271,12 @@ impl ExecutionSettlementStore for PostgresExecutionSettlementStore {
                    AND projection.artifact_count = 0
                    AND projection.remote_result_count = 1
              )
+            LEFT JOIN dreamina_operator_video_success_resolutions operator_video
+              ON operator_video.job_id = j.job_id
+             AND operator_video.submission_id = progress_submission.submission_id
+             AND operator_video.executor_execution_id = progress_submission.executor_execution_id
+             AND operator_video.output_id = progress_output.output_id
+             AND j.provider_id = 'dreamina-cli' AND j.state = 'succeeded'
             WHERE j.job_id = $1 AND j.tenant_id = $2
               AND j.operation = 'video_generation'
               AND j.economics_contract_version IN (3, 4)
@@ -255,7 +301,8 @@ impl ExecutionSettlementStore for PostgresExecutionSettlementStore {
         let row: Option<VideoStatusRow> = sqlx::query_as(
             r#"
                 SELECT j.state, w.state, j.last_error_code, j.model, j.billable_units,
-                       artifact.artifact_id, remote.video_url, remote.expires_at_ms, payload.command_json,
+                       artifact.artifact_id, COALESCE(operator_video.video_url, remote.video_url) AS video_url,
+                   CASE WHEN operator_video.resolution_id IS NOT NULL THEN operator_video.expires_at_ms ELSE remote.expires_at_ms END AS expires_at_ms, payload.command_json,
                        progress_observation.progress_json, progress_observation.observed_at_ms
                 FROM jobs j
                 JOIN work_items w ON w.job_id = j.job_id
@@ -276,11 +323,18 @@ impl ExecutionSettlementStore for PostgresExecutionSettlementStore {
                   ON progress_task.submission_id = progress_submission.submission_id
                  AND progress_task.executor_execution_id = progress_submission.executor_execution_id
                  AND progress_task.provider_id = j.provider_id
-                LEFT JOIN provider_task_observations progress_observation
-                  ON progress_observation.observation_id = progress_task.state_observation_id
-                 AND progress_observation.submission_id = progress_task.submission_id
-                 AND progress_observation.executor_execution_id = progress_task.executor_execution_id
-                 AND progress_observation.observed_state = 'provider_waiting'
+                LEFT JOIN LATERAL (
+                    SELECT observation.progress_json, observation.observed_at_ms
+                    FROM provider_task_observations observation
+                    WHERE observation.submission_id = progress_task.submission_id
+                      AND observation.executor_execution_id = progress_task.executor_execution_id
+                      AND observation.source = 'poll'
+                      AND observation.observed_state = 'provider_waiting'
+                      AND observation.progress_json IS NOT NULL
+                    ORDER BY observation.observed_at_ms DESC,
+                             observation.poll_lease_epoch DESC, observation.observation_id DESC
+                    LIMIT 1
+                ) progress_observation ON TRUE
                 LEFT JOIN artifacts artifact
                   ON artifact.job_id = j.job_id
                  AND artifact.output_index = 0
@@ -309,6 +363,12 @@ impl ExecutionSettlementStore for PostgresExecutionSettlementStore {
                        AND projection.artifact_count = 0
                        AND projection.remote_result_count = 1
                  )
+                LEFT JOIN dreamina_operator_video_success_resolutions operator_video
+                  ON operator_video.job_id = j.job_id
+                 AND operator_video.submission_id = progress_submission.submission_id
+                 AND operator_video.executor_execution_id = progress_submission.executor_execution_id
+                 AND operator_video.output_id = progress_output.output_id
+                 AND j.provider_id = 'dreamina-cli' AND j.state = 'succeeded'
                 WHERE j.job_id = $1 AND j.tenant_id = $2
                   AND attribution.project_id = $3
                   AND ($4::UUID IS NULL OR attribution.actor_user_id = $4)
@@ -403,7 +463,8 @@ impl ExecutionSettlementStore for PostgresExecutionSettlementStore {
         let row: Option<VideoStatusRow> = sqlx::query_as(
             r#"
                 SELECT j.state, w.state, j.last_error_code, j.model, j.billable_units,
-                       artifact.artifact_id, remote.video_url, remote.expires_at_ms, payload.command_json,
+                       artifact.artifact_id, COALESCE(operator_video.video_url, remote.video_url) AS video_url,
+                   CASE WHEN operator_video.resolution_id IS NOT NULL THEN operator_video.expires_at_ms ELSE remote.expires_at_ms END AS expires_at_ms, payload.command_json,
                        progress_observation.progress_json, progress_observation.observed_at_ms
                 FROM jobs j
                 JOIN work_items w ON w.job_id = j.job_id
@@ -425,11 +486,18 @@ impl ExecutionSettlementStore for PostgresExecutionSettlementStore {
                   ON progress_task.submission_id = progress_submission.submission_id
                  AND progress_task.executor_execution_id = progress_submission.executor_execution_id
                  AND progress_task.provider_id = j.provider_id
-                LEFT JOIN provider_task_observations progress_observation
-                  ON progress_observation.observation_id = progress_task.state_observation_id
-                 AND progress_observation.submission_id = progress_task.submission_id
-                 AND progress_observation.executor_execution_id = progress_task.executor_execution_id
-                 AND progress_observation.observed_state = 'provider_waiting'
+                LEFT JOIN LATERAL (
+                    SELECT observation.progress_json, observation.observed_at_ms
+                    FROM provider_task_observations observation
+                    WHERE observation.submission_id = progress_task.submission_id
+                      AND observation.executor_execution_id = progress_task.executor_execution_id
+                      AND observation.source = 'poll'
+                      AND observation.observed_state = 'provider_waiting'
+                      AND observation.progress_json IS NOT NULL
+                    ORDER BY observation.observed_at_ms DESC,
+                             observation.poll_lease_epoch DESC, observation.observation_id DESC
+                    LIMIT 1
+                ) progress_observation ON TRUE
                 LEFT JOIN artifacts artifact
                   ON artifact.job_id = j.job_id
                  AND artifact.output_index = 0
@@ -458,6 +526,12 @@ impl ExecutionSettlementStore for PostgresExecutionSettlementStore {
                        AND projection.artifact_count = 0
                        AND projection.remote_result_count = 1
                  )
+                LEFT JOIN dreamina_operator_video_success_resolutions operator_video
+                  ON operator_video.job_id = j.job_id
+                 AND operator_video.submission_id = progress_submission.submission_id
+                 AND operator_video.executor_execution_id = progress_submission.executor_execution_id
+                 AND operator_video.output_id = progress_output.output_id
+                 AND j.provider_id = 'dreamina-cli' AND j.state = 'succeeded'
                 WHERE j.job_id = $1 AND j.tenant_id = $2
                   AND attribution.project_id = $3
                   AND ($4::UUID IS NULL OR attribution.actor_user_id = $4)

@@ -2,19 +2,19 @@ use std::sync::Arc;
 
 use axum::{
     Json,
-    extract::{Extension, Path, State},
-    http::HeaderMap,
-    response::Response,
+    extract::{Extension, Path, Query, State},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
+    response::{IntoResponse, Response},
 };
 use image_api_contracts::dreamina::{
     DREAMINA_IMAGES_API_PROFILE, DREAMINA_VIDEOS_API_PROFILE, DreaminaCancellation,
-    DreaminaImageGenerationRequest, DreaminaImageRequest, DreaminaImageWorkflowRequest,
-    DreaminaProviderProgress, DreaminaTaskCreated, DreaminaTaskError, DreaminaVideoContent,
-    DreaminaVideoGenerationRequest, DreaminaVideoRequest, DreaminaVideoTask,
+    DreaminaImageData, DreaminaImageGenerationRequest, DreaminaImageRequest, DreaminaImageTask,
+    DreaminaImageWorkflowRequest, DreaminaProviderProgress, DreaminaTaskCreated, DreaminaTaskError,
+    DreaminaVideoContent, DreaminaVideoGenerationRequest, DreaminaVideoRequest, DreaminaVideoTask,
     DreaminaVideoWorkflowRequest,
 };
 use image_provider_contracts::BillingMetric;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -30,7 +30,8 @@ use crate::{
     auth::{ApiKeyCapability, AuthContext},
     model_routing::ResolvedModelRoute,
     settlement::{
-        ExecutionSettlementStore, VideoPendingStage, VideoProviderProgress, VideoResultStatus,
+        ExecutionSettlementStore, ImageResultStatus, ImageTaskProjection, VideoPendingStage,
+        VideoProviderProgress, VideoResultStatus,
     },
     usage::{UsageCharge, UsageLimits},
 };
@@ -73,7 +74,16 @@ pub(super) async fn create_image_with_auth(
     request_id: String,
     request: DreaminaImageGenerationRequest,
 ) -> Result<Response, ImageGatewayError> {
-    create_image_with_optional_route(state, auth, headers, request_id, request, None).await
+    create_image_with_optional_route(
+        state,
+        auth,
+        headers,
+        request_id,
+        request,
+        None,
+        prefers_async(headers),
+    )
+    .await
 }
 
 pub(super) async fn create_image_with_resolved_auth(
@@ -84,8 +94,16 @@ pub(super) async fn create_image_with_resolved_auth(
     request: DreaminaImageGenerationRequest,
     resolved: ResolvedModelRoute,
 ) -> Result<Response, ImageGatewayError> {
-    create_image_with_optional_route(state, auth, headers, request_id, request, Some(resolved))
-        .await
+    create_image_with_optional_route(
+        state,
+        auth,
+        headers,
+        request_id,
+        request,
+        Some(resolved),
+        false,
+    )
+    .await
 }
 
 async fn create_image_with_optional_route(
@@ -95,6 +113,7 @@ async fn create_image_with_optional_route(
     request_id: String,
     mut request: DreaminaImageGenerationRequest,
     resolved: Option<ResolvedModelRoute>,
+    respond_async: bool,
 ) -> Result<Response, ImageGatewayError> {
     require_external_execution(state)?;
     let contract = generation_admission_contract(state.config.generation_admission_contract);
@@ -165,7 +184,7 @@ async fn create_image_with_optional_route(
     let service_tier_decision = crate::service_tiers::ServiceTierDecision::for_default_only_project(
         auth.project_service_tier,
     );
-    let result = submit_image_generation(
+    let result = submit_image_generation_with_mode(
         state,
         &auth,
         request_id,
@@ -173,6 +192,7 @@ async fn create_image_with_optional_route(
         plan.provider_id(),
         &job_model,
         plan.output_count(),
+        respond_async,
         |ticket, job_id, schedule_scope| {
             let mut attach = plan.attach(ticket, job_id, schedule_scope);
             attach.contract = contract;
@@ -195,7 +215,10 @@ async fn create_image_with_optional_route(
         },
     )
     .await?;
-    render_stored_generation_response(result, &auth)
+    match result {
+        ImageSubmission::Completed(result) => render_stored_generation_response(result, &auth),
+        ImageSubmission::Accepted(job_id) => accepted_image_response(state, &auth, job_id).await,
+    }
 }
 
 pub(super) async fn create_video(
@@ -375,7 +398,8 @@ async fn create_image_workflow(
     )
     .await?;
     let intent = DreaminaWorkflowIntent::image(request).map_err(dreamina_admission_error)?;
-    let job_id = submit_workflow(
+    let respond_async = prefers_async(headers);
+    let job_id = submit_workflow_with_mode(
         state,
         &auth,
         headers,
@@ -384,8 +408,12 @@ async fn create_image_workflow(
         resolved.public_model_id,
         resolved.execution_model_id,
         intent,
+        respond_async,
     )
     .await?;
+    if respond_async {
+        return accepted_image_response(state, &auth, job_id).await;
+    }
     let result = wait_for_generation_result(state, job_id).await?;
     render_stored_generation_response(result, &auth)
 }
@@ -487,6 +515,32 @@ pub(super) async fn submit_workflow(
     execution_model_id: String,
     intent: DreaminaWorkflowIntent,
 ) -> Result<Uuid, ImageGatewayError> {
+    submit_workflow_with_mode(
+        state,
+        auth,
+        headers,
+        request_id,
+        api_profile,
+        public_model_id,
+        execution_model_id,
+        intent,
+        false,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn submit_workflow_with_mode(
+    state: &Arc<AppState>,
+    auth: &AuthContext,
+    headers: &HeaderMap,
+    request_id: String,
+    api_profile: &str,
+    public_model_id: String,
+    execution_model_id: String,
+    intent: DreaminaWorkflowIntent,
+    return_existing: bool,
+) -> Result<Uuid, ImageGatewayError> {
     require_external_execution(state)?;
     if generation_admission_contract(state.config.generation_admission_contract)
         != AdmissionContract::CustomerPricingV4
@@ -532,7 +586,7 @@ pub(super) async fn submit_workflow(
             job_id,
             state: status,
             ..
-        } if is_video || status == "succeeded" => return Ok(job_id),
+        } if return_existing || is_video || status == "succeeded" => return Ok(job_id),
         AdmissionClaim::Existing { .. } | AdmissionClaim::InProgress { .. } => {
             return Err(ImageGatewayError::idempotency_in_progress());
         }
@@ -684,17 +738,60 @@ pub(super) async fn submit_image_generation<F>(
 where
     F: FnOnce(AdmissionTicket, Uuid, String) -> AttachJob,
 {
+    match submit_image_generation_with_mode(
+        state,
+        auth,
+        request_id,
+        claim,
+        provider_id,
+        provider_model,
+        output_count,
+        false,
+        attach,
+    )
+    .await?
+    {
+        ImageSubmission::Completed(result) => Ok(result),
+        ImageSubmission::Accepted(_) => unreachable!("synchronous submission waits for its result"),
+    }
+}
+
+enum ImageSubmission {
+    Accepted(Uuid),
+    Completed(StoredGenerationResult),
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn submit_image_generation_with_mode<F>(
+    state: &Arc<AppState>,
+    auth: &AuthContext,
+    request_id: String,
+    claim: ClaimAdmission,
+    provider_id: &str,
+    provider_model: &str,
+    output_count: u32,
+    respond_async: bool,
+    attach: F,
+) -> Result<ImageSubmission, ImageGatewayError>
+where
+    F: FnOnce(AdmissionTicket, Uuid, String) -> AttachJob,
+{
     let ticket = match claim_admission_with_retry(state, claim)
         .await
         .map_err(admission_error)?
     {
         AdmissionClaim::Owner(ticket) => ticket,
+        AdmissionClaim::Existing { job_id, .. } if respond_async => {
+            return Ok(ImageSubmission::Accepted(job_id));
+        }
         AdmissionClaim::Existing {
             job_id,
             state: admission_state,
             ..
         } if admission_state == "succeeded" => {
-            return replay_generation_result(state, job_id).await;
+            return replay_generation_result(state, job_id)
+                .await
+                .map(ImageSubmission::Completed);
         }
         AdmissionClaim::InProgress { .. } | AdmissionClaim::Existing { .. } => {
             return Err(ImageGatewayError::idempotency_in_progress());
@@ -748,7 +845,13 @@ where
         }
         return Err(admission_error(error));
     }
-    wait_for_generation_result(state, reservation.job_id).await
+    if respond_async {
+        Ok(ImageSubmission::Accepted(reservation.job_id))
+    } else {
+        wait_for_generation_result(state, reservation.job_id)
+            .await
+            .map(ImageSubmission::Completed)
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -824,6 +927,246 @@ where
         return Err(admission_error(error));
     }
     Ok(reservation.job_id)
+}
+
+fn prefers_async(headers: &HeaderMap) -> bool {
+    headers
+        .get_all("prefer")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .any(|value| {
+            value.split(',').any(|preference| {
+                preference
+                    .split(';')
+                    .next()
+                    .is_some_and(|token| token.trim().eq_ignore_ascii_case("respond-async"))
+            })
+        })
+}
+
+async fn accepted_image_response(
+    state: &Arc<AppState>,
+    auth: &AuthContext,
+    job_id: Uuid,
+) -> Result<Response, ImageGatewayError> {
+    let mut response =
+        project_image_response(state.settlement_store.as_ref(), auth, job_id).await?;
+    *response.status_mut() = StatusCode::ACCEPTED;
+    response.headers_mut().insert(
+        header::LOCATION,
+        HeaderValue::from_str(&format!("/v1/dreamina/images/{job_id}"))
+            .map_err(|_| ImageGatewayError::internal("invalid task location"))?,
+    );
+    response.headers_mut().insert(
+        "preference-applied",
+        HeaderValue::from_static("respond-async"),
+    );
+    Ok(response)
+}
+
+pub(super) async fn get_image(
+    Path(task_id): Path<String>,
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+) -> Result<Response, ImageGatewayError> {
+    let auth = authenticate_image_request(&headers, &state).await?;
+    auth.require_api_key_capability(ApiKeyCapability::ImagesRead)?;
+    project_image_response(
+        state.settlement_store.as_ref(),
+        &auth,
+        parse_uuid(&task_id)?,
+    )
+    .await
+}
+
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum ImageLookupOperation {
+    #[default]
+    Generation,
+    Edit,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ImageLookupQuery {
+    #[serde(default)]
+    operation: ImageLookupOperation,
+}
+
+pub(super) async fn get_image_by_idempotency_key(
+    query: Result<Query<ImageLookupQuery>, axum::extract::rejection::QueryRejection>,
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+) -> Result<Response, ImageGatewayError> {
+    let auth = authenticate_image_request(&headers, &state).await?;
+    auth.require_api_key_capability(ApiKeyCapability::ImagesRead)?;
+    let Query(query) = query.map_err(|_| {
+        ImageGatewayError::invalid_request(
+            "operation must be generation or edit",
+            Some("operation".to_owned()),
+            "invalid_value",
+        )
+    })?;
+    let operation = match query.operation {
+        ImageLookupOperation::Generation => GENERATION_OPERATION,
+        ImageLookupOperation::Edit => crate::admission::EDIT_OPERATION,
+    };
+    let digest = idempotency_digest(
+        &headers,
+        &auth.project_id,
+        DREAMINA_IMAGES_API_PROFILE,
+        operation,
+    )?
+    .ok_or_else(ImageGatewayError::invalid_idempotency_key)?;
+    let job_id = state
+        .settlement_store
+        .project_image_job_by_idempotency_key(
+            &auth.tenant_id,
+            &auth.project_id,
+            auth.actor_user_id,
+            operation,
+            &digest,
+        )
+        .await?
+        .ok_or_else(image_task_not_found)?;
+    project_image_response(state.settlement_store.as_ref(), &auth, job_id).await
+}
+
+async fn project_image_response(
+    settlement_store: &dyn ExecutionSettlementStore,
+    auth: &AuthContext,
+    job_id: Uuid,
+) -> Result<Response, ImageGatewayError> {
+    let projection = settlement_store
+        .project_image_status(
+            &auth.tenant_id,
+            &auth.project_id,
+            auth.actor_user_id,
+            job_id,
+        )
+        .await?
+        .ok_or_else(image_task_not_found)?;
+    let (task, usage) = image_task(job_id, projection)?;
+    let mut response = Json(task).into_response();
+    if let Some(usage) = usage {
+        super::responses::add_usage_headers(response.headers_mut(), &usage, auth);
+    }
+    Ok(response)
+}
+
+fn image_task(
+    id: Uuid,
+    projection: ImageTaskProjection,
+) -> Result<(DreaminaImageTask, Option<crate::usage::UsageSnapshot>), ImageGatewayError> {
+    let mut task = DreaminaImageTask {
+        id: id.to_string(),
+        status: "running".to_owned(),
+        stage: None,
+        provider_progress: None,
+        cancellation: DreaminaCancellation {
+            supported: false,
+            reason: "provider_cancellation_unsupported".to_owned(),
+        },
+        model: Some(projection.model),
+        request_id: Some(projection.request_id),
+        request: Some(projection.request),
+        error: None,
+        created: None,
+        data: None,
+        output_format: None,
+        quality: None,
+        size: None,
+        background: None,
+    };
+    let mut usage = None;
+    match projection.status {
+        ImageResultStatus::Pending {
+            stage,
+            provider_progress,
+        } => {
+            task.stage = Some(
+                match (&provider_progress, stage) {
+                    (_, VideoPendingStage::Queued) => "queued",
+                    (_, VideoPendingStage::Dispatching) => "dispatching",
+                    (Some(progress), VideoPendingStage::Processing)
+                        if progress.progress.provider_status == "Queueing" =>
+                    {
+                        "provider_queued"
+                    }
+                    (_, VideoPendingStage::Processing) => "processing",
+                }
+                .to_owned(),
+            );
+            task.provider_progress = provider_progress.map(public_provider_progress);
+        }
+        ImageResultStatus::Succeeded(result) => {
+            if task
+                .request
+                .as_ref()
+                .and_then(|request| request.generate_num)
+                .is_some_and(|count| result.images.len() != count as usize)
+            {
+                return Err(ImageGatewayError::artifact_integrity());
+            }
+            task.status = "succeeded".to_owned();
+            let mut projection = result.projection;
+            if projection.output_format == "auto" {
+                projection.output_format = super::images::inferred_output_format(&result.images)?;
+            }
+            usage = Some(projection.usage);
+            let response = crate::models::images_response_at(
+                projection.created_at_seconds,
+                result.images,
+                projection.output_format,
+                projection.quality,
+                projection.size,
+                projection.background,
+            );
+            task.created = Some(response.created);
+            task.data = Some(
+                response
+                    .data
+                    .into_iter()
+                    .map(|image| DreaminaImageData {
+                        b64_json: image.b64_json,
+                    })
+                    .collect(),
+            );
+            task.output_format = Some(response.output_format);
+            task.quality = Some(response.quality);
+            task.size = Some(response.size);
+            task.background = Some(response.background);
+        }
+        ImageResultStatus::Failed { error_code } => {
+            task.status = "failed".to_owned();
+            task.error = Some(DreaminaTaskError {
+                message: if error_code.as_deref()
+                    == Some("dreamina_compliance_confirmation_required")
+                {
+                    DREAMINA_COMPLIANCE_CONFIRMATION_MESSAGE.to_owned()
+                } else {
+                    "Dreamina image generation failed".to_owned()
+                },
+                code: error_code.unwrap_or_else(|| "generation_failed".to_owned()),
+            });
+        }
+        ImageResultStatus::Uncertain => {
+            task.status = "uncertain".to_owned();
+            task.error = Some(DreaminaTaskError {
+                code: "generation_uncertain".to_owned(),
+                message: VIDEO_UNCERTAIN_MESSAGE.to_owned(),
+            });
+        }
+        ImageResultStatus::Expired => {
+            task.status = "expired".to_owned();
+            task.error = Some(DreaminaTaskError {
+                code: "artifact_expired".to_owned(),
+                message: "The stored image result has expired".to_owned(),
+            });
+        }
+    }
+    Ok((task, usage))
 }
 
 pub(super) async fn get_video(
@@ -1107,6 +1450,14 @@ fn parse_uuid(value: &str) -> Result<Uuid, ImageGatewayError> {
             "invalid_value",
         )
     })
+}
+
+fn image_task_not_found() -> ImageGatewayError {
+    ImageGatewayError::not_found(
+        "Dreamina task was not found",
+        Some("task_id".to_owned()),
+        "not_found",
+    )
 }
 
 fn task_not_found() -> ImageGatewayError {
@@ -1599,3 +1950,7 @@ mod tests {
         assert_ne!(hash(&old_hash), hash(plan.provider_command_hash()));
     }
 }
+
+#[cfg(test)]
+#[path = "dreamina/image_tasks_tests.rs"]
+mod image_tasks_tests;

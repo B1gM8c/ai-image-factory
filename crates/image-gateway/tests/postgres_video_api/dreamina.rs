@@ -16,6 +16,8 @@ use image_provider_dreamina_cli::DREAMINA_SUBMIT_COMMAND_SCHEMA;
 use image_provider_sdk::ArtifactSinkError;
 use sha2::{Digest, Sha256};
 
+#[path = "dreamina_images_async.rs"]
+mod images_async;
 #[path = "platform_binding.rs"]
 mod platform_binding;
 #[path = "dreamina_workflows.rs"]

@@ -25,6 +25,10 @@ use crate::{
     provider_tasks::{ProviderAccountHomeCapability, ProviderRuntimeProfile},
 };
 
+mod completion;
+mod progress;
+mod receipt_retry;
+
 #[tokio::test]
 async fn video_queue_progress_survives_the_real_query_without_media_or_generation() {
     let fixture = Fixture::new(
@@ -63,7 +67,7 @@ fn unknown_queue_states_and_missing_estimates_keep_the_existing_poll_cadence() {
     let PollObservation::PendingWithProgress {
         next_poll_after_ms,
         progress,
-    } = video_pending_observation(&receipt)
+    } = pending_observation(&receipt)
     else {
         panic!("expected the provider's original observation");
     };
@@ -84,8 +88,14 @@ async fn pending_and_terminal_failure_require_an_empty_download_directory() {
         .unwrap();
     assert_eq!(
         observation,
-        PollObservation::Pending {
-            next_poll_after_ms: Some(DEFAULT_POLL_AFTER_MS)
+        PollObservation::PendingWithProgress {
+            next_poll_after_ms: Some(DEFAULT_POLL_AFTER_MS),
+            progress: ProviderTaskProgress {
+                provider_status: "querying".to_owned(),
+                queue_position: None,
+                queue_total: None,
+                estimated_remaining_seconds: None,
+            },
         }
     );
     assert!(sink.bytes().is_empty());
@@ -216,7 +226,10 @@ async fn video_pending_and_failed_queries_leave_the_artifact_sink_pristine() {
             .await
             .unwrap();
         if status == "querying" {
-            assert!(matches!(observation, PollObservation::Pending { .. }));
+            assert!(matches!(
+                observation,
+                PollObservation::PendingWithProgress { .. }
+            ));
         } else {
             assert!(matches!(observation, PollObservation::Failed(_)));
         }
@@ -726,6 +739,8 @@ impl Fixture {
         let executable = root.path().join("dreamina");
         let script = format!(
             r#"#!/bin/sh
+printf '%s\n' "$1" >> "$HOME/invocations"
+test "$1" = query_result || exit 23
 download=
 submit=
 while [ "$#" -gt 0 ]; do
@@ -735,6 +750,7 @@ while [ "$#" -gt 0 ]; do
   esac
   shift
 done
+printf '%s\n' "$submit" >> "$HOME/submit-ids"
 {action}
 "#
         );
@@ -795,6 +811,17 @@ done
 
     fn assert_workspace_has_no_attempts(&self) {
         assert!(workspace_has_no_attempts(&self.workspace));
+    }
+
+    fn assert_queries_used_original_submit_id(&self, query_count: usize) {
+        assert_eq!(
+            fs::read_to_string(self.account_home.join("invocations")).unwrap(),
+            "query_result\n".repeat(query_count),
+        );
+        assert_eq!(
+            fs::read_to_string(self.account_home.join("submit-ids")).unwrap(),
+            "task-1\n".repeat(query_count),
+        );
     }
 }
 

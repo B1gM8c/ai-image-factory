@@ -758,7 +758,7 @@ fn render_generation_response(
     Ok(response)
 }
 
-fn inferred_output_format(
+pub(super) fn inferred_output_format(
     images: &[crate::generator::GeneratedImage],
 ) -> Result<String, ImageGatewayError> {
     let mut detected = None;
