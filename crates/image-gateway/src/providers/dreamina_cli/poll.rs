@@ -15,7 +15,7 @@ use crate::{
 use image_cli_runtime::{
     AsyncOutputSealError, AsyncOutputSink, AttemptWorkspaceError, CliRuntime,
     ExclusiveAttemptWorkspace, FreshOutputDirectory, NoopSpawnObserver, OutputError, ProcessError,
-    RuntimeError, WorkingDirectory,
+    RuntimeError, VerifiedFreshOutputFile, WorkingDirectory,
 };
 use image_provider_dreamina_cli::{
     ADAPTER_REVISION, DREAMINA_SUBMIT_COMMAND_SCHEMA, DreaminaCliQueryPolicyError,
@@ -169,7 +169,7 @@ impl DreaminaCliPollDriverV1 {
 
         if remote_video {
             return match receipt.status() {
-                DreaminaQueryStatusV1::Querying => Ok(video_pending_observation(&receipt)),
+                DreaminaQueryStatusV1::Querying => Ok(pending_observation(&receipt)),
                 DreaminaQueryStatusV1::Failed => Ok(PollObservation::Failed(terminal_failure(
                     "dreamina_generation_failed",
                 ))),
@@ -191,9 +191,7 @@ impl DreaminaCliPollDriverV1 {
                 output
                     .ensure_empty()
                     .map_err(|_| contract_failure("dreamina_poll_pending_artifact"))?;
-                Ok(PollObservation::Pending {
-                    next_poll_after_ms: Some(DEFAULT_POLL_AFTER_MS),
-                })
+                Ok(pending_observation(&receipt))
             }
             DreaminaQueryStatusV1::Failed => {
                 output
@@ -204,13 +202,17 @@ impl DreaminaCliPollDriverV1 {
                 )))
             }
             DreaminaQueryStatusV1::Success => {
+                let files = output.verify_files(10).map_err(map_fresh_output_error)?;
+                let multiple_outputs = files.len() > 1;
+                let file = single_image_output(files, &receipt)?;
                 let bridge = ArtifactSinkBridge::new(sink);
-                let (sealed, bridge) = output
-                    .seal_single_file_to_async_sink(bridge)
+                let (sealed, bridge) = file
+                    .seal_to_async_sink(bridge)
                     .await
                     .map_err(map_output_seal_error)?;
                 let (prefix, prefix_len) = bridge.into_prefix();
                 let media_type = artifact_media_type(&prefix[..prefix_len])
+                    .filter(|media_type| !multiple_outputs || media_type.starts_with("image/"))
                     .ok_or_else(|| contract_failure("dreamina_poll_media_invalid"))?;
                 let manifest = sink
                     .finalize(ArtifactMetadata { media_type })
@@ -263,8 +265,10 @@ impl DreaminaCliPollDriverV1 {
                 output
                     .ensure_empty()
                     .map_err(|_| contract_failure("dreamina_poll_pending_artifact"))?;
-                Ok(ProviderNativeBatchPollObservation::Pending {
-                    next_poll_after_ms: Some(DEFAULT_POLL_AFTER_MS),
+                let (next_poll_after_ms, progress) = pending_progress(&receipt);
+                Ok(ProviderNativeBatchPollObservation::PendingWithProgress {
+                    next_poll_after_ms: Some(next_poll_after_ms),
+                    progress,
                 })
             }
             DreaminaQueryStatusV1::Failed => {
@@ -373,6 +377,43 @@ impl ProviderPollDriver for DreaminaCliPollDriverV1 {
         self.poll_native_batch_operation(call.operation(), output_count, sink)
             .await
     }
+}
+
+fn single_image_output(
+    mut files: Vec<VerifiedFreshOutputFile>,
+    receipt: &DreaminaQueryReceiptV1,
+) -> Result<VerifiedFreshOutputFile, ProviderFailure> {
+    if files.len() == 1 {
+        return Ok(files.pop().expect("the sole output exists"));
+    }
+    let count = files.len();
+    if receipt.image_result_count() != Some(count) {
+        return Err(contract_failure("dreamina_poll_artifact_invalid"));
+    }
+    let prefix = format!("{}_image_", receipt.submit_id());
+    let mut seen = [false; 10];
+    let mut selected = None;
+    for file in files {
+        let (index, extension) = file
+            .relative_filename()
+            .to_str()
+            .and_then(|name| name.strip_prefix(&prefix))
+            .and_then(|name| name.rsplit_once('.'))
+            .ok_or_else(|| contract_failure("dreamina_poll_artifact_invalid"))?;
+        let source_index = index
+            .parse::<usize>()
+            .ok()
+            .filter(|value| (1..=count).contains(value) && value.to_string() == index)
+            .ok_or_else(|| contract_failure("dreamina_poll_artifact_invalid"))?;
+        if seen[source_index - 1] || !matches!(extension, "png" | "jpg" | "jpeg" | "webp") {
+            return Err(contract_failure("dreamina_poll_artifact_invalid"));
+        }
+        seen[source_index - 1] = true;
+        if source_index == 1 {
+            selected = Some(file);
+        }
+    }
+    selected.ok_or_else(|| contract_failure("dreamina_poll_artifact_invalid"))
 }
 
 struct ArtifactSinkBridge<'a, S> {
@@ -504,11 +545,13 @@ fn map_runtime_error(error: RuntimeError) -> ProviderFailure {
         | RuntimeError::ProcessFailed { .. } => {
             retryable_failure("dreamina_poll_process_unavailable")
         }
+        RuntimeError::Receipt(_) | RuntimeError::CapturedOutputTooLarge { .. } => {
+            retryable_failure("dreamina_poll_receipt_unavailable")
+                .with_retry_after_ms(QUEUED_POLL_AFTER_MS)
+        }
         RuntimeError::Policy(_)
         | RuntimeError::MissingOutputContract
         | RuntimeError::UnexpectedOutputContract
-        | RuntimeError::CapturedOutputTooLarge { .. }
-        | RuntimeError::Receipt(_)
         | RuntimeError::Output(_)
         | RuntimeError::OutputTask(_) => contract_failure("dreamina_poll_protocol_invalid"),
     }
@@ -540,6 +583,7 @@ fn retryable_failure(code: &'static str) -> ProviderFailure {
         RetryDirective::Backoff,
     )
     .expect("static Dreamina poll failure must be valid")
+    .with_retry_after_ms(DEFAULT_POLL_AFTER_MS)
 }
 
 fn contract_failure(code: &'static str) -> ProviderFailure {
@@ -562,16 +606,19 @@ fn terminal_failure(code: &'static str) -> ProviderFailure {
     .expect("static Dreamina terminal failure must be valid")
 }
 
-fn video_pending_observation(receipt: &DreaminaQueryReceiptV1) -> PollObservation {
+fn pending_observation(receipt: &DreaminaQueryReceiptV1) -> PollObservation {
+    let (next_poll_after_ms, progress) = pending_progress(receipt);
+    PollObservation::PendingWithProgress {
+        next_poll_after_ms: Some(next_poll_after_ms),
+        progress,
+    }
+}
+
+fn pending_progress(receipt: &DreaminaQueryReceiptV1) -> (u64, ProviderTaskProgress) {
     let queue = receipt.queue_info();
     let estimate = receipt
         .estimated_remaining_seconds()
         .filter(|seconds| *seconds <= 30 * 24 * 60 * 60);
-    if queue.is_none() && estimate.is_none() {
-        return PollObservation::Pending {
-            next_poll_after_ms: Some(DEFAULT_POLL_AFTER_MS),
-        };
-    }
     let progress = ProviderTaskProgress {
         provider_status: queue
             .map(|queue| queue.queue_status.clone())
@@ -580,22 +627,15 @@ fn video_pending_observation(receipt: &DreaminaQueryReceiptV1) -> PollObservatio
         queue_total: queue.map(|queue| queue.queue_length),
         estimated_remaining_seconds: estimate,
     };
-    if progress.validate().is_err() {
-        return PollObservation::Pending {
-            next_poll_after_ms: Some(DEFAULT_POLL_AFTER_MS),
-        };
-    }
-    // A long upstream queue needs a fresh observation, not a new CLI process
-    // every five seconds. Unknown states keep the existing polling cadence.
-    let next_poll_after_ms = if progress.provider_status == "Queueing" {
+    // ETA only changes the query cadence; completion still requires success.
+    let next_poll_after_ms = if progress.provider_status == "Queueing"
+        && !estimate.is_some_and(|seconds| seconds <= 60)
+    {
         QUEUED_POLL_AFTER_MS
     } else {
         DEFAULT_POLL_AFTER_MS
     };
-    PollObservation::PendingWithProgress {
-        next_poll_after_ms: Some(next_poll_after_ms),
-        progress,
-    }
+    (next_poll_after_ms, progress)
 }
 
 #[derive(Debug, thiserror::Error)]

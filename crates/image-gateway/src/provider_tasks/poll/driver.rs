@@ -1,6 +1,6 @@
 use image_provider_sdk::{
     ArtifactSink, InvocationContext, InvocationDeadline, PollObservation, ProviderFailure,
-    RemoteOperationRef, RemoteTaskProvider,
+    ProviderTaskProgress, RemoteOperationRef, RemoteTaskProvider,
 };
 use uuid::Uuid;
 
@@ -17,8 +17,16 @@ pub trait ProviderNativeBatchArtifactSink: ArtifactSink {
 
 #[derive(Debug)]
 pub enum ProviderNativeBatchPollObservation {
-    Pending { next_poll_after_ms: Option<u64> },
-    Completed { output_count: usize },
+    Pending {
+        next_poll_after_ms: Option<u64>,
+    },
+    PendingWithProgress {
+        next_poll_after_ms: Option<u64>,
+        progress: ProviderTaskProgress,
+    },
+    Completed {
+        output_count: usize,
+    },
     Failed(ProviderFailure),
 }
 

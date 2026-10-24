@@ -1,11 +1,14 @@
 use super::*;
+use std::str::FromStr;
+
 use gpt_image_2_gateway::{
     provider_tasks::{
         ProviderTaskObservation, ProviderTaskObservationOutcome, ProviderTaskObservationSource,
     },
     settlement::{VideoPendingStage, VideoProviderProgress, VideoResultStatus},
 };
-use image_provider_sdk::ProviderTaskProgress;
+use image_provider_sdk::{ProviderTaskProgress, RemoteVideoResult};
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 
 const TENANT: &str = "executord-process-smoke";
 const PROJECT: &str = "project-test";
@@ -36,10 +39,59 @@ fn pending_progress(
 
 #[tokio::test]
 async fn accepted_video_projects_latest_durable_queue_under_the_original_scope() -> TestResult {
-    let Some(database) = TestDatabase::new().await? else {
+    verify_latest_durable_progress(true).await
+}
+
+#[tokio::test]
+async fn failed_video_drops_its_last_durable_queue_progress() -> TestResult {
+    verify_latest_durable_progress(false).await
+}
+
+// Freeze only this disposable schema's clock. This exercises two successful
+// polls in the same millisecond without rewriting any immutable observations.
+async fn progress_test_clock(database: &mut TestDatabase) -> TestResult<i64> {
+    sqlx::query("CREATE TABLE progress_test_clock (now_ms BIGINT NOT NULL)")
+        .execute(&database.pool)
+        .await
+        .map_err(debug_error)?;
+    let now: i64 = sqlx::query_scalar(
+        "INSERT INTO progress_test_clock SELECT floor(extract(epoch FROM pg_catalog.clock_timestamp())*1000)::BIGINT RETURNING now_ms",
+    )
+    .fetch_one(&database.pool)
+    .await
+    .map_err(debug_error)?;
+    for function in [
+        "clock_timestamp",
+        "statement_timestamp",
+        "transaction_timestamp",
+    ] {
+        sqlx::query(AssertSqlSafe(format!(
+            "CREATE FUNCTION {function}() RETURNS TIMESTAMPTZ LANGUAGE SQL VOLATILE AS \
+             'SELECT pg_catalog.to_timestamp(now_ms::DOUBLE PRECISION / 1000) FROM progress_test_clock'"
+        )))
+        .execute(&database.pool)
+        .await
+        .map_err(debug_error)?;
+    }
+    let options = PgConnectOptions::from_str(&env::var("TEST_DATABASE_URL").map_err(debug_error)?)
+        .map_err(debug_error)?
+        .options([("search_path", format!("{},pg_catalog", database.schema))]);
+    let pool = PgPoolOptions::new()
+        .max_connections(8)
+        .connect_with(options)
+        .await
+        .map_err(debug_error)?;
+    let previous = std::mem::replace(&mut database.pool, pool);
+    previous.close().await;
+    Ok(now)
+}
+
+async fn verify_latest_durable_progress(succeeds: bool) -> TestResult {
+    let Some(mut database) = TestDatabase::new().await? else {
         return Ok(());
     };
     let result = async {
+        let initial_time = progress_test_clock(&mut database).await?;
         let pool = &database.pool;
         let work = seed_dreamina_video_generation_lease_for_profile(
             pool,
@@ -150,24 +202,43 @@ async fn accepted_video_projects_latest_durable_queue_under_the_original_scope()
             pending_progress(reads.project_video_status(TENANT, PROJECT, None, work.job_id).await.map_err(debug_error)?)?.is_none(),
             "accepted task invented queue information before its first poll",
         )?;
-        for (index, progress) in [
-            Some(ProviderTaskProgress {
+        let mut latest_progress = None;
+        for (index, (offset_ms, progress)) in [
+            (0, Some(ProviderTaskProgress {
                 provider_status: "Queueing".to_owned(),
                 queue_position: Some(3341),
                 queue_total: Some(476961),
                 estimated_remaining_seconds: Some(27131),
-            }),
-            Some(ProviderTaskProgress {
+            })),
+            (1000, None),
+            (2000, Some(ProviderTaskProgress {
                 provider_status: "Queueing".to_owned(),
                 queue_position: Some(3339),
                 queue_total: Some(476960),
                 estimated_remaining_seconds: None,
-            }),
-            None,
+            })),
+            (2000, Some(ProviderTaskProgress {
+                provider_status: "querying".to_owned(),
+                queue_position: None,
+                queue_total: None,
+                estimated_remaining_seconds: None,
+            })),
+            (3000, None),
+            (4000, Some(ProviderTaskProgress {
+                provider_status: "Processing".to_owned(),
+                queue_position: None,
+                queue_total: None,
+                estimated_remaining_seconds: None,
+            })),
         ]
         .into_iter()
         .enumerate()
         {
+            sqlx::query("UPDATE progress_test_clock SET now_ms=$1")
+                .bind(initial_time + offset_ms)
+                .execute(pool)
+                .await
+                .map_err(debug_error)?;
             let poll = tasks
                 .claim_due(&poll_scope(), "queue-projection-poller", 60_000)
                 .await
@@ -196,14 +267,21 @@ async fn accepted_video_projects_latest_durable_queue_under_the_original_scope()
             .fetch_one(pool)
             .await
             .map_err(debug_error)?;
+            require(durable.1 == initial_time + offset_ms, "test poll escaped the controlled observation clock")?;
+            if let Some(progress) = progress {
+                latest_progress = Some(VideoProviderProgress { progress, observed_at_ms: durable.1 });
+            } else {
+                require(latest_progress.as_ref().is_some_and(|latest| latest.observed_at_ms < durable.1),
+                    "query error did not occur after the last valid progress report")?;
+            }
             for _ in 0..2 {
                 let restarted_reads = PostgresExecutionSettlementStore::new(
                     pool.clone(),
                     Arc::new(InMemoryArtifactBlobStore::default()),
                 );
                 let projected = pending_progress(restarted_reads.project_video_status(TENANT, PROJECT, None, work.job_id).await.map_err(debug_error)?)?;
-                require(projected == progress.clone().map(|progress| VideoProviderProgress { progress, observed_at_ms:durable.1 }),
-                    "GET lost the latest queue values, retained stale values, or refreshed the observation time")?;
+                require(projected == latest_progress,
+                    format!("poll {index}: GET lost the last valid progress, retained old queue values, or refreshed its observation time: {projected:?}"))?;
                 let unscoped = pending_progress(restarted_reads.video_status(TENANT, work.job_id).await.map_err(debug_error)?)?;
                 require(unscoped == projected, "tenant video projection lost queue metadata")?;
                 let with_metadata = restarted_reads.project_video_status_with_metadata(TENANT, PROJECT, None, work.job_id).await.map_err(debug_error)?.ok_or("video metadata projection missing")?;
@@ -246,6 +324,68 @@ async fn accepted_video_projects_latest_durable_queue_under_the_original_scope()
         .await
         .map_err(debug_error)?;
         require(counts == (1, 1, 0), "queue observations submitted again or charged usage")?;
+        let mut plan_tx = pool.begin().await.map_err(debug_error)?;
+        sqlx::query("SET LOCAL enable_seqscan = off")
+            .execute(&mut *plan_tx).await.map_err(debug_error)?;
+        let plan: Vec<String> = sqlx::query_scalar(
+            "EXPLAIN (COSTS OFF)
+             SELECT progress.progress_json, progress.observed_at_ms
+             FROM provider_remote_tasks task
+             LEFT JOIN LATERAL (
+                 SELECT observation.progress_json, observation.observed_at_ms
+                 FROM provider_task_observations observation
+                 WHERE observation.submission_id=task.submission_id
+                   AND observation.executor_execution_id=task.executor_execution_id
+                   AND observation.source='poll'
+                   AND observation.observed_state='provider_waiting'
+                   AND observation.progress_json IS NOT NULL
+                 ORDER BY observation.observed_at_ms DESC,
+                          observation.poll_lease_epoch DESC, observation.observation_id DESC
+                 LIMIT 1
+             ) progress ON TRUE
+             WHERE task.submission_id=$1 AND task.executor_execution_id=$2",
+        )
+        .bind(lease.submission_id).bind(lease.executor_execution_id)
+        .fetch_all(&mut *plan_tx).await.map_err(debug_error)?;
+        plan_tx.rollback().await.map_err(debug_error)?;
+        let plan = plan.join("\n");
+        require(plan.contains("provider_task_observations_progress_projection_idx")
+                && plan.contains("Limit")
+                && !plan.lines().any(|line| line.trim_start().starts_with("Sort")),
+            format!("latest progress lost its bounded indexed lookup:\n{plan}"))?;
+
+        let poll = tasks.claim_due(&poll_scope(), "queue-projection-poller", 60_000)
+            .await.map_err(debug_error)?.ok_or("terminal video poll lease missing")?;
+        let outcome = if succeeds {
+            ProviderTaskObservationOutcome::RemoteReady {
+                result: RemoteVideoResult::new("https://video.example.invalid/progress.mp4".to_owned(), None)
+                    .map_err(debug_error)?,
+            }
+        } else {
+            ProviderTaskObservationOutcome::Failed { error_code: "provider_failed".to_owned() }
+        };
+        tasks.record_observation(&poll, &ProviderTaskObservation {
+            event_identity: "offline-video-terminal".to_owned(),
+            source: ProviderTaskObservationSource::Poll,
+            outcome,
+            progress: None,
+        }).await.map_err(debug_error)?;
+        let terminal_store = PostgresExecutorTerminalStore::new(pool.clone());
+        let terminal = terminal_store.claim_terminal("queue-projection-reducer", 60_000)
+            .await.map_err(debug_error)?.ok_or("video terminal reduction missing")?;
+        terminal_store.complete_terminal(&terminal, None).await.map_err(debug_error)?;
+        for status in [
+            reads.video_status(TENANT, work.job_id).await.map_err(debug_error)?,
+            reads.project_video_status(TENANT, PROJECT, None, work.job_id).await.map_err(debug_error)?,
+            reads.project_video_status_with_metadata(TENANT, PROJECT, None, work.job_id)
+                .await.map_err(debug_error)?.map(|(status, _)| status),
+        ] {
+            require(if succeeds {
+                matches!(status, Some(VideoResultStatus::SucceededRemote { .. }))
+            } else {
+                matches!(status, Some(VideoResultStatus::Failed { error_code: Some(ref code), .. }) if code == "provider_failed")
+            }, "terminal projection retained pending progress or lost its terminal state")?;
+        }
         Ok(())
     }
     .await;

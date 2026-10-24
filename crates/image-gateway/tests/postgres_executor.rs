@@ -80,6 +80,15 @@ mod dreamina_compliance_resolution;
 #[path = "postgres_executor/queue_progress_projection.rs"]
 mod queue_progress_projection;
 
+#[path = "postgres_executor/dreamina_image_success_reconciliation.rs"]
+mod dreamina_image_success_reconciliation;
+
+#[path = "postgres_executor/dreamina_video_success_reconciliation.rs"]
+mod dreamina_video_success_reconciliation;
+
+#[path = "postgres_executor/accepted_image_completion_budget.rs"]
+mod accepted_image_completion_budget;
+
 #[path = "postgres_executor/accepted_completion_budget.rs"]
 mod accepted_completion_budget;
 
@@ -8438,6 +8447,16 @@ async fn seed_v4_customer_quote_with_basis(
     identity: V4CustomerQuoteIdentity,
     basis: V4CustomerQuoteBasis,
 ) -> TestResult {
+    seed_v4_customer_quote_with_funding(pool, work, identity, basis, 0).await
+}
+
+async fn seed_v4_customer_quote_with_funding(
+    pool: &PgPool,
+    work: &WorkLease,
+    identity: V4CustomerQuoteIdentity,
+    basis: V4CustomerQuoteBasis,
+    grant_micros: i64,
+) -> TestResult {
     let (tenant_id, provider_id): (String, String) =
         sqlx::query_as("SELECT tenant_id, provider_id FROM jobs WHERE job_id = $1")
             .bind(work.job_id)
@@ -8469,21 +8488,62 @@ async fn seed_v4_customer_quote_with_basis(
     let failed_price_component_id = Uuid::new_v4();
     let no_effect_price_component_id = Uuid::new_v4();
     let quote_id = Uuid::new_v4();
+    require(
+        (0..=max_total_micros).contains(&grant_micros),
+        "invalid fixture funding split",
+    )?;
+    let grant_id = if grant_micros > 0 {
+        use gpt_image_2_gateway::credit_grants::{
+            CreateCreditGrantRequest, CreditGrantActor, CreditGrantService,
+            PostgresCreditGrantService,
+        };
+        sqlx::query("INSERT INTO identity_organizations (organization_id,display_name,organization_kind,created_at_ms,updated_at_ms) VALUES ($1,'Executor v4 test','system',$2,$2)")
+            .bind(&tenant_id).bind(now).execute(pool).await.map_err(debug_error)?;
+        // Seed the original account limit before issuance. Changing an existing
+        // limit later requires its own audited control-version transition.
+        sqlx::query("INSERT INTO billing_accounts (tenant_id,currency,credit_limit_micros,held_micros,captured_micros,created_at_ms,updated_at_ms) VALUES ($1,'USD',$2,0,0,$3,$3)")
+            .bind(&tenant_id).bind(max_total_micros-grant_micros).bind(now)
+            .execute(pool).await.map_err(debug_error)?;
+        let grant = PostgresCreditGrantService::new(pool.clone())
+            .create(
+                &format!("operator-grant-{}", work.job_id),
+                CreditGrantActor {
+                    user_id: Uuid::new_v4(),
+                    session_id: Uuid::new_v4(),
+                },
+                CreateCreditGrantRequest {
+                    organization_id: tenant_id.clone(),
+                    currency: "USD".into(),
+                    amount_micros: grant_micros.to_string(),
+                    expires_at_ms: now + 86_400_000,
+                    source_reference: format!("operator-funding-{}", work.job_id),
+                    reason: "Offline operator funding fixture".into(),
+                },
+            )
+            .await
+            .map_err(debug_error)?;
+        Some(Uuid::parse_str(&grant.grant_id).map_err(debug_error)?)
+    } else {
+        None
+    };
+    let now = database_now(pool).await?;
     let mut tx = pool.begin().await.map_err(debug_error)?;
-    sqlx::query(
-        r#"
+    if grant_id.is_none() {
+        sqlx::query(
+            r#"
         INSERT INTO identity_organizations (
             organization_id, display_name, organization_kind,
             created_at_ms, updated_at_ms
         )
         VALUES ($1, 'Executor v4 test', 'system', $2, $2)
         "#,
-    )
-    .bind(&tenant_id)
-    .bind(now)
-    .execute(&mut *tx)
-    .await
-    .map_err(debug_error)?;
+        )
+        .bind(&tenant_id)
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .map_err(debug_error)?;
+    }
     sqlx::query(
         r#"
         INSERT INTO gateway_projects (id, tenant_id, name, created_at)
@@ -8671,10 +8731,13 @@ async fn seed_v4_customer_quote_with_basis(
             captured_micros, created_at_ms, updated_at_ms
         )
         VALUES ($1, 'USD', $2, $2, 0, $3, $3)
+        ON CONFLICT (tenant_id,currency) DO UPDATE
+        SET credit_limit_micros=EXCLUDED.credit_limit_micros,
+            held_micros=EXCLUDED.held_micros, updated_at_ms=EXCLUDED.updated_at_ms
         "#,
     )
     .bind(&tenant_id)
-    .bind(max_total_micros)
+    .bind(max_total_micros - grant_micros)
     .bind(now)
     .execute(&mut *tx)
     .await
@@ -8765,26 +8828,97 @@ async fn seed_v4_customer_quote_with_basis(
             .map_err(debug_error)?;
         }
     }
+    let hold_id = Uuid::new_v4();
+    if let Some(grant_id) = grant_id {
+        // Follow reserve_credit_grants without disabling any subledger guard.
+        let reservation_id = Uuid::new_v4();
+        require_one(sqlx::query("UPDATE credit_grants SET reserved_micros=reserved_micros+$2,control_version=control_version+1,updated_at_ms=$3 WHERE grant_id=$1 AND state='active' AND control_version=1 AND available_micros=$2 AND expires_at_ms>$3")
+            .bind(grant_id).bind(grant_micros).bind(now).execute(&mut *tx).await.map_err(debug_error)?, "fixture grant reservation")?;
+        sqlx::query("INSERT INTO customer_billing_hold_grant_reservations (grant_reservation_id,hold_id,grant_id,tenant_id,currency,reserved_micros,state,created_at_ms,updated_at_ms) VALUES ($1,$2,$3,$4,'USD',$5,'reserved',$6,$6)")
+            .bind(reservation_id).bind(hold_id).bind(grant_id).bind(&tenant_id).bind(grant_micros).bind(now)
+            .execute(&mut *tx).await.map_err(debug_error)?;
+        let payload_hash=hex::encode(Sha256::digest(format!("credit-grant-funding:v1:reserved:{grant_id}:{reservation_id}:{hold_id}:{grant_micros}").as_bytes()));
+        sqlx::query("INSERT INTO credit_grant_events (grant_event_id,grant_id,tenant_id,currency,event_sequence,event_type,amount_micros,grant_reservation_id,hold_id,payload_hash,occurred_at_ms,created_at_ms) VALUES ($1,$2,$3,'USD',2,'reserved',$4,$5,$6,$7,$8,$8)")
+            .bind(Uuid::new_v4()).bind(grant_id).bind(&tenant_id).bind(grant_micros).bind(reservation_id).bind(hold_id).bind(payload_hash).bind(now)
+            .execute(&mut *tx).await.map_err(debug_error)?;
+    }
     sqlx::query(
         r#"
         INSERT INTO customer_billing_holds (
             hold_id, quote_id, job_id, tenant_id, currency,
-            held_micros, account_held_micros,
+            held_micros, grant_held_micros, account_held_micros,
             state, created_at_ms, updated_at_ms
         )
-        VALUES ($1, $2, $3, $4, 'USD', $5, $5, 'held', $6, $6)
+        VALUES ($1, $2, $3, $4, 'USD', $5, $7, $5-$7, 'held', $6, $6)
         "#,
     )
-    .bind(Uuid::new_v4())
+    .bind(hold_id)
     .bind(quote_id)
     .bind(work.job_id)
     .bind(&tenant_id)
     .bind(max_total_micros)
     .bind(now)
+    .bind(grant_micros)
     .execute(&mut *tx)
     .await
     .map_err(debug_error)?;
     tx.commit().await.map_err(debug_error)
+}
+
+async fn operator_funding_snapshot(pool: &PgPool, job_id: Uuid) -> TestResult<serde_json::Value> {
+    sqlx::query_scalar(r#"SELECT jsonb_build_object(
+        'grants',(SELECT jsonb_agg(to_jsonb(g) ORDER BY grant_id) FROM credit_grants g WHERE tenant_id=hold.tenant_id),
+        'reservations',(SELECT jsonb_agg(to_jsonb(r) ORDER BY grant_reservation_id) FROM customer_billing_hold_grant_reservations r WHERE hold_id=hold.hold_id),
+        'events',(SELECT jsonb_agg(to_jsonb(e) ORDER BY grant_id,event_sequence) FROM credit_grant_events e WHERE tenant_id=hold.tenant_id),
+        'ledger',(SELECT jsonb_agg(to_jsonb(t) ORDER BY transaction_id) FROM ledger_transactions t WHERE source_job_id=hold.job_id OR source_credit_grant_event_id IN (SELECT grant_event_id FROM credit_grant_events WHERE tenant_id=hold.tenant_id)),
+        'postings',(SELECT jsonb_agg(to_jsonb(p) ORDER BY p.transaction_id,p.posting_no) FROM ledger_postings p JOIN ledger_transactions t USING(transaction_id) WHERE t.source_job_id=hold.job_id OR t.source_credit_grant_event_id IN (SELECT grant_event_id FROM credit_grant_events WHERE tenant_id=hold.tenant_id)))
+        FROM customer_billing_holds hold WHERE job_id=$1"#)
+        .bind(job_id).fetch_one(pool).await.map_err(debug_error)
+}
+
+async fn assert_operator_funding_settled(
+    pool: &PgPool,
+    job_id: Uuid,
+    total: i64,
+    grant: i64,
+) -> TestResult {
+    let split: (i64, i64, i64, i64, i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT hold.grant_held_micros,hold.account_held_micros,
+            hold.grant_captured_micros,hold.account_captured_micros,
+            hold.grant_released_micros,hold.account_released_micros,
+            account.held_micros,account.captured_micros
+         FROM customer_billing_holds hold JOIN billing_accounts account USING(tenant_id,currency)
+         WHERE hold.job_id=$1",
+    )
+    .bind(job_id)
+    .fetch_one(pool)
+    .await
+    .map_err(debug_error)?;
+    require(
+        split
+            == (
+                grant,
+                total - grant,
+                grant,
+                total - grant,
+                0,
+                0,
+                0,
+                total - grant,
+            ),
+        format!("operator funding split changed: {split:?}"),
+    )?;
+    let funding: (i64,i64,i64,i64,i64,i64,i64) = sqlx::query_as(
+        "SELECT g.reserved_micros,g.consumed_micros,g.available_micros,g.control_version,
+            r.consumed_micros,r.released_micros,
+            (SELECT count(*) FROM credit_grant_events e WHERE e.grant_id=g.grant_id AND e.event_type='consumed')
+         FROM customer_billing_hold_grant_reservations r JOIN credit_grants g USING(grant_id,tenant_id,currency)
+         JOIN customer_billing_holds hold USING(hold_id,tenant_id,currency) WHERE hold.job_id=$1")
+        .bind(job_id).fetch_one(pool).await.map_err(debug_error)?;
+    require(
+        funding == (0, grant, 0, 3, grant, 0, 1),
+        format!("operator grant consumed repeatedly or drifted: {funding:?}"),
+    )
 }
 
 async fn seed_terminal_quota(pool: &PgPool, work: &WorkLease) -> TestResult {

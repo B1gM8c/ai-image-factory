@@ -6,7 +6,7 @@ use std::{
 
 use image_provider_sdk::{
     ArtifactSinkError, EffectCertainty, PollObservation, ProviderFailure, ProviderFailureClass,
-    RetryDirective,
+    ProviderTaskProgress, RetryDirective,
 };
 use tokio::{
     sync::Semaphore,
@@ -323,6 +323,17 @@ where
                 )
                 .await?
             }
+            Ok(ProviderNativeBatchPollObservation::PendingWithProgress {
+                next_poll_after_ms,
+                progress,
+            }) if sink.is_pristine() => {
+                self.record_progress(
+                    &renewed,
+                    bounded_poll_after(next_poll_after_ms.unwrap_or(DEFAULT_PENDING_POLL_AFTER_MS)),
+                    progress,
+                )
+                .await?
+            }
             Ok(ProviderNativeBatchPollObservation::Failed(failure))
                 if sink.is_pristine() && verified_terminal_failure(&failure) =>
             {
@@ -517,20 +528,7 @@ where
                 }
                 let poll_after_ms =
                     bounded_poll_after(next_poll_after_ms.unwrap_or(DEFAULT_PENDING_POLL_AFTER_MS));
-                if progress.validate().is_err() {
-                    return self.record_waiting(lease, poll_after_ms).await;
-                }
-                let outcome = ProviderTaskObservationOutcome::Waiting { poll_after_ms };
-                let observation = ProviderTaskObservation {
-                    event_identity: event_identity(lease, &outcome),
-                    source: ProviderTaskObservationSource::Poll,
-                    outcome,
-                    progress: Some(progress),
-                };
-                self.store
-                    .record_poll_observation(lease, &observation)
-                    .await
-                    .map_err(Into::into)
+                self.record_progress(lease, poll_after_ms, progress).await
             }
             Ok(PollObservation::Completed(completed)) => {
                 let staged = match sink.into_finalized(completed.artifact()) {
@@ -637,6 +635,28 @@ where
             ProviderTaskObservationOutcome::Waiting { poll_after_ms },
         )
         .await
+    }
+
+    async fn record_progress(
+        &self,
+        lease: &ProviderTaskLease,
+        poll_after_ms: i64,
+        progress: ProviderTaskProgress,
+    ) -> Result<ProviderRemoteTask, ProviderPollOrchestratorError> {
+        if progress.validate().is_err() {
+            return self.record_waiting(lease, poll_after_ms).await;
+        }
+        let outcome = ProviderTaskObservationOutcome::Waiting { poll_after_ms };
+        let observation = ProviderTaskObservation {
+            event_identity: event_identity(lease, &outcome),
+            source: ProviderTaskObservationSource::Poll,
+            outcome,
+            progress: Some(progress),
+        };
+        self.store
+            .record_poll_observation(lease, &observation)
+            .await
+            .map_err(Into::into)
     }
 
     async fn record_artifact(

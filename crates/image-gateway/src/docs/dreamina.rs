@@ -282,6 +282,75 @@ pub(super) fn patch_schemas(document: &mut Value) {
     });
     task["provider_progress"] = json!({"$ref": "#/components/schemas/DreaminaProviderProgress"});
     task["cancellation"] = json!({"$ref": "#/components/schemas/DreaminaCancellation"});
+    patch_image_tasks(document);
+}
+
+fn patch_image_tasks(document: &mut Value) {
+    let schemas = &mut document["components"]["schemas"];
+    schemas["DreaminaImageRequestMetadata"] = json!({
+        "type": "object", "additionalProperties": false,
+        "description": "Safe specifications frozen at admission. No prompt, input location or credential is returned.",
+        "properties": {
+            "generate_num": {"type": "integer", "minimum": 1, "maximum": 10},
+            "model_version": {"type": "string"},
+            "workflow": {"type": "string", "enum": ["text2image", "image2image", "image_upscale"]},
+            "resolution_type": {"type": "string"}, "ratio": {"type": "string"},
+            "width": {"type": "integer", "minimum": 1}, "height": {"type": "integer", "minimum": 1}
+        }
+    });
+    schemas["DreaminaImageTask"] = json!({
+        "type": "object", "additionalProperties": false, "required": ["id", "status", "cancellation"],
+        "description": "Read-only image task. Success includes the existing frozen images response payload. uncertain requires reconciliation; it neither authorizes a replacement task nor proves a refund. Terminal states omit historical progress.",
+        "properties": {
+            "id": {"type": "string", "format": "uuid"},
+            "status": {"type": "string", "enum": ["running", "succeeded", "failed", "uncertain", "expired"]},
+            "stage": schemas["DreaminaVideoTaskDoc"]["properties"]["stage"].clone(),
+            "provider_progress": {"$ref": "#/components/schemas/DreaminaProviderProgress"},
+            "cancellation": {"$ref": "#/components/schemas/DreaminaCancellation"},
+            "model": {"type": "string"}, "request_id": {"type": "string"},
+            "request": {"$ref": "#/components/schemas/DreaminaImageRequestMetadata"},
+            "error": {"type": "object", "additionalProperties": false, "required": ["code", "message"],
+                "properties": {"code": {"type": "string"}, "message": {"type": "string"}}},
+            "created": {"type": "integer", "format": "int64"},
+            "data": {"type": "array", "items": {"type": "object", "additionalProperties": false,
+                "required": ["b64_json"], "properties": {"b64_json": {"type": "string"}}}},
+            "output_format": {"type": "string"}, "quality": {"type": "string"},
+            "size": {"type": "string"}, "background": {"type": "string"}
+        }
+    });
+    let task_response = json!({"description": "Current task snapshot. GET never invokes CLI, changes state or refreshes the observation time.",
+        "content": {"application/json": {"schema": {"$ref": "#/components/schemas/DreaminaImageTask"}}}});
+    let errors = json!({"description": "Invalid parameter or task not found",
+        "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ErrorResponseDoc"}}}});
+    let paths = &mut document["paths"];
+    let post = &mut paths["/v1/dreamina/images/generations"]["post"];
+    post["parameters"].as_array_mut().expect("native image parameters").push(json!({
+        "name": "Prefer", "in": "header", "required": false,
+        "schema": {"type": "string", "example": "respond-async"},
+        "description": "respond-async returns 202 and Location after durable admission. Same Idempotency-Key returns the original task's current snapshot without resubmitting or waiting. Omitting this preference retains the synchronous 200 response. The frozen request, processing mode and price do not change."
+    }));
+    let mut accepted = task_response.clone();
+    accepted["headers"] = json!({"Location": {"description": "Original task status URL", "schema": {"type": "string"}}});
+    post["responses"]["202"] = accepted;
+    let security = json!([{"BearerAuth": []}]);
+    paths["/v1/dreamina/images/{task_id}"]["get"] = json!({
+        "tags": ["Dreamina CLI"], "operationId": "get_dreamina_image", "security": security,
+        "summary": "Read an original Dreamina image task",
+        "description": "Requires images:read and the original tenant/project/actor scope. Existing native tasks remain readable, including uncertain tasks.",
+        "parameters": [{"name": "task_id", "in": "path", "required": true, "schema": {"type": "string", "format": "uuid"}}],
+        "responses": {"200": task_response, "400": errors, "404": {"description": "Task not found in the authenticated scope"}, "401": {"description": "Invalid authentication"}, "403": {"description": "Missing image read capability"}}
+    });
+    paths["/v1/dreamina/images/by-idempotency-key"]["get"] = json!({
+        "tags": ["Dreamina CLI"], "operationId": "get_dreamina_image_by_idempotency_key", "security": security,
+        "summary": "Find the original image task by its idempotency key",
+        "description": "Read-only lookup in the authenticated tenant/project/actor scope. Send the original key only in Idempotency-Key. Never resubmit to recover an ID. Receiving identities return idempotency_in_progress; conflicting identities return idempotency_conflict.",
+        "parameters": [
+            {"name": "Idempotency-Key", "in": "header", "required": true, "schema": {"type": "string"}},
+            {"name": "operation", "in": "query", "required": false,
+                "schema": {"type": "string", "enum": ["generation", "edit"], "default": "generation"}}
+        ],
+        "responses": {"200": task_response, "400": errors, "404": {"description": "Task not found in the authenticated scope"}, "401": {"description": "Invalid authentication"}, "403": {"description": "Missing image read capability"}, "409": {"description": "Idempotency identity is receiving or conflicts"}}
+    });
 }
 
 fn workflow(mut schema: Value, name: &str) -> Value {
@@ -299,6 +368,55 @@ fn workflow(mut schema: Value, name: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_image_tasks_document_async_and_read_only_original_key_lookup() {
+        let axum::Json(document) = crate::docs::openapi_json();
+        let paths = &document["paths"];
+        let post = &paths["/v1/dreamina/images/generations"]["post"];
+        assert!(post["responses"].get("200").is_some());
+        assert_eq!(
+            post["responses"]["202"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/DreaminaImageTask"
+        );
+        assert!(
+            post["parameters"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value["name"] == "Prefer")
+        );
+        let lookup = &paths["/v1/dreamina/images/by-idempotency-key"]["get"];
+        assert_eq!(lookup["parameters"][0]["name"], "Idempotency-Key");
+        assert_eq!(lookup["parameters"][0]["in"], "header");
+        assert_eq!(
+            lookup["parameters"][1]["schema"]["enum"],
+            json!(["generation", "edit"])
+        );
+        assert_eq!(lookup["parameters"][1]["schema"]["default"], "generation");
+        assert!(paths["/v1/dreamina/images/{task_id}"]["get"].is_object());
+        let schemas = &document["components"]["schemas"];
+        assert_eq!(schemas["DreaminaImageTask"]["additionalProperties"], false);
+        assert_eq!(
+            schemas["DreaminaImageRequestMetadata"]["additionalProperties"],
+            false
+        );
+        assert!(
+            schemas["DreaminaImageRequestMetadata"]["properties"]
+                .get("prompt")
+                .is_none()
+        );
+        assert!(
+            schemas["DreaminaImageRequestMetadata"]["properties"]
+                .get("images")
+                .is_none()
+        );
+        assert!(
+            document["paths"]["/v1/images/generations"]["post"]["responses"]
+                .get("202")
+                .is_none()
+        );
+    }
 
     #[test]
     fn video_progress_documents_real_observation_and_unsupported_cancellation() {

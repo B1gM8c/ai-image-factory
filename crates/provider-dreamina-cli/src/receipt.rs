@@ -47,6 +47,7 @@ pub struct DreaminaQueryReceiptV1 {
     submit_id: OpaqueProviderId,
     status: DreaminaQueryStatusV1,
     remote_video_result: Option<RemoteVideoResult>,
+    image_result_count: Option<usize>,
     queue_info: Option<DreaminaQueueInfoV1>,
     estimated_remaining_seconds: Option<u64>,
 }
@@ -64,6 +65,12 @@ impl DreaminaQueryReceiptV1 {
     /// Missing, ambiguous, or malformed video metadata remains unavailable.
     pub fn remote_video_result(&self) -> Option<&RemoteVideoResult> {
         self.remote_video_result.as_ref()
+    }
+
+    /// Count of validated image metadata with an explicitly empty video set.
+    /// Image URLs are neither retained nor exposed by the receipt view.
+    pub fn image_result_count(&self) -> Option<usize> {
+        self.image_result_count
     }
 
     pub fn queue_info(&self) -> Option<&DreaminaQueueInfoV1> {
@@ -126,9 +133,11 @@ pub fn parse_query_receipt(input: &[u8]) -> Result<DreaminaQueryReceiptV1, Recei
         Some(status) => return Err(ReceiptError::UnknownStatus(sanitize_text(status))),
         None => return Err(ReceiptError::MissingStatus),
     };
-    let remote_video_result = (status == DreaminaQueryStatusV1::Success)
-        .then(|| single_remote_video(raw.result_json.as_ref()))
+    let result = (status == DreaminaQueryStatusV1::Success)
+        .then(|| parse_result_json(raw.result_json))
         .flatten();
+    let remote_video_result = single_remote_video(result.as_ref());
+    let image_result_count = image_result_count(result.as_ref());
     // Progress is advisory. Invalid optional metadata must not turn a confirmed
     // pending task into a failed query or change any terminal receipt semantics.
     let querying = status == DreaminaQueryStatusV1::Querying;
@@ -148,6 +157,7 @@ pub fn parse_query_receipt(input: &[u8]) -> Result<DreaminaQueryReceiptV1, Recei
         submit_id,
         status,
         remote_video_result,
+        image_result_count,
         queue_info,
         estimated_remaining_seconds,
     })
@@ -178,10 +188,52 @@ fn parse_queue_info(value: Option<&serde_json::Value>) -> Option<DreaminaQueueIn
     })
 }
 
-fn single_remote_video(result: Option<&serde_json::Value>) -> Option<RemoteVideoResult> {
+fn parse_result_json(
+    result: Option<serde_json::Value>,
+) -> Option<serde_json::Map<String, serde_json::Value>> {
+    // The outer receipt is limited to 64 KiB. Decode at most one string layer.
+    match result? {
+        serde_json::Value::Object(result) => Some(result),
+        serde_json::Value::String(result) => serde_json::from_str(&result).ok(),
+        _ => None,
+    }
+}
+
+fn image_result_count(
+    result: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> Option<usize> {
+    let result = result?;
+    let images = result.get("images")?.as_array()?;
+    if !(1..=10).contains(&images.len()) || !result.get("videos")?.as_array()?.is_empty() {
+        return None;
+    }
+    for image in images {
+        let image = image.as_object()?;
+        let item_id = image.get("item_id")?.as_str()?;
+        let url = image.get("image_url")?.as_str()?;
+        if item_id.is_empty()
+            || item_id.len() > 255
+            || !url.starts_with("https://")
+            || url.len() <= "https://".len()
+            || url.len() > 8192
+            || url
+                .bytes()
+                .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+            || image.get("width")?.as_u64()? == 0
+            || image.get("height")?.as_u64()? == 0
+        {
+            return None;
+        }
+    }
+    Some(images.len())
+}
+
+fn single_remote_video(
+    result: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> Option<RemoteVideoResult> {
     // CLI 1.4.21 taskResultOutput.result_json contains queryResultMediaOutput;
     // its video entries expose video_url. No TTL is present in that output type.
-    let result = result?.as_object()?;
+    let result = result?;
     if let Some(images) = result.get("images")
         && !images.is_null()
         && !images.as_array()?.is_empty()
@@ -388,16 +440,108 @@ mod tests {
     fn query_video_view_preserves_the_exact_url_without_inventing_an_expiry() {
         // Fixture follows the CLI 1.4.21 static Go output types; it is not a live receipt.
         let url = "https://media.example.test/clip%2Fone.mp4?token=a%2Bb&expires=123";
-        let bytes = serde_json::to_vec(&json!({
-            "submit_id": "task-1", "gen_status": "success",
-            "result_json": {"images": [], "videos": [{"video_url": url, "duration": 5}]}
-        }))
-        .unwrap();
-        let receipt = parse_query_receipt(&bytes).unwrap();
-        let result = receipt.remote_video_result().unwrap();
-        assert_eq!(result.video_url(), url);
-        assert_eq!(result.expires_at_ms(), None);
-        assert!(!format!("{receipt:?}").contains("token="));
+        let result = json!({"images": [], "videos": [{"video_url": url, "duration": 5}]});
+        for result in [result.clone(), json!(result.to_string())] {
+            let bytes = serde_json::to_vec(&json!({
+                "submit_id": "task-1", "gen_status": "success", "result_json": result,
+            }))
+            .unwrap();
+            let receipt = parse_query_receipt(&bytes).unwrap();
+            let result = receipt.remote_video_result().unwrap();
+            assert_eq!(result.video_url(), url);
+            assert_eq!(result.expires_at_ms(), None);
+            assert!(receipt.image_result_count().is_none());
+            assert!(!format!("{receipt:?}").contains("token="));
+        }
+    }
+
+    fn image_result(count: usize) -> serde_json::Value {
+        json!({
+            "images": (0..count).map(|index| json!({
+                "item_id": format!("item-{index}"),
+                "image_url": format!("https://media.example.test/{index}.png?token=private"),
+                "width": 2560, "height": 1440,
+            })).collect::<Vec<_>>(),
+            "videos": [],
+        })
+    }
+
+    fn query_with_result(status: &str, result: serde_json::Value) -> DreaminaQueryReceiptV1 {
+        parse_query_receipt(
+            &serde_json::to_vec(&json!({
+                "submit_id": "task-1", "gen_status": status, "result_json": result,
+            }))
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn object_and_string_image_metadata_expose_only_the_bounded_count() {
+        for count in [1, 4, 10] {
+            let result = image_result(count);
+            for result in [result.clone(), json!(result.to_string())] {
+                let receipt = query_with_result("success", result.clone());
+                assert_eq!(receipt.image_result_count(), Some(count));
+                assert!(receipt.remote_video_result().is_none());
+                assert!(!format!("{receipt:?}").contains("private"));
+                for status in ["querying", "fail"] {
+                    assert!(
+                        query_with_result(status, result.clone())
+                            .image_result_count()
+                            .is_none()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_or_ambiguous_result_metadata_never_establishes_media_delivery() {
+        let mut invalid_images = vec![image_result(0), image_result(11)];
+        for (field, value) in [
+            ("item_id", json!("")),
+            ("item_id", json!(7)),
+            ("image_url", json!("http://media.example.test/image.png")),
+            ("width", json!(0)),
+            ("height", json!("1440")),
+        ] {
+            let mut result = image_result(4);
+            result["images"][0][field] = value;
+            invalid_images.push(result);
+        }
+        let mut with_video = image_result(4);
+        with_video["videos"] = json!([{"video_url":"https://media.example.test/a.mp4"}]);
+        invalid_images.push(with_video);
+        let mut missing_videos = image_result(4);
+        missing_videos.as_object_mut().unwrap().remove("videos");
+        invalid_images.push(missing_videos);
+        for result in invalid_images {
+            for result in [result.clone(), json!(result.to_string())] {
+                let receipt = query_with_result("success", result);
+                assert!(receipt.image_result_count().is_none());
+                assert!(receipt.remote_video_result().is_none());
+            }
+        }
+        for result in [
+            json!("{broken"),
+            json!("{} trailing"),
+            json!("null"),
+            json!(serde_json::to_string(&image_result(4).to_string()).unwrap()),
+            json!("[]"),
+            json!(null),
+        ] {
+            let receipt = query_with_result("success", result);
+            assert!(receipt.image_result_count().is_none());
+            assert!(receipt.remote_video_result().is_none());
+        }
+        let oversized = serde_json::to_vec(&json!({
+            "submit_id":"task-1", "gen_status":"success", "result_json":"x".repeat(MAX_RECEIPT_BYTES),
+        })).unwrap();
+        assert!(matches!(
+            parse_query_receipt(&oversized),
+            Err(ReceiptError::InputTooLarge { .. })
+        ));
     }
 
     #[test]

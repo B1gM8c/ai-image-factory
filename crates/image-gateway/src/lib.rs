@@ -204,7 +204,10 @@ pub use retention::{
     PostgresArtifactRetentionStore, reconcile_artifact_retention,
 };
 pub use settlement::{
+    DreaminaImageSuccessResolution, DreaminaImageSuccessResolutionRequest,
+    DreaminaVideoSuccessResolution, DreaminaVideoSuccessResolutionRequest,
     ExecutionSettlementStore, GenerationResultStatus, PostgresExecutionSettlementStore,
+    resolve_dreamina_image_success, resolve_dreamina_video_success,
 };
 pub use system_updates::{
     ApplySystemUpdateRequest, PostgresSystemUpdateService, SystemUpdateAction, SystemUpdateActor,
