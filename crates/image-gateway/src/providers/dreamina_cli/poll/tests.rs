@@ -26,6 +26,53 @@ use crate::{
 };
 
 #[tokio::test]
+async fn video_queue_progress_survives_the_real_query_without_media_or_generation() {
+    let fixture = Fixture::new(
+        r#"test -z "$download" || exit 21
+printf '%s' '{"submit_id":"task-1","gen_status":"querying","queue_info":{"queue_idx":3341,"queue_length":476961,"queue_status":"Queueing","priority":7,"debug_info":"private"},"estimated_remaining_seconds":27131}'"#,
+    );
+    let mut sink = fixture.sink([0_u8; 32]);
+    let observation = fixture
+        .driver(1024)
+        .poll_operation(&fixture.operation(), true, &mut sink)
+        .await
+        .unwrap();
+    assert_eq!(
+        observation,
+        PollObservation::PendingWithProgress {
+            next_poll_after_ms: Some(QUEUED_POLL_AFTER_MS),
+            progress: ProviderTaskProgress {
+                provider_status: "Queueing".to_owned(),
+                queue_position: Some(3341),
+                queue_total: Some(476961),
+                estimated_remaining_seconds: Some(27131),
+            },
+        }
+    );
+    assert!(sink.bytes().is_empty());
+    assert_eq!(sink.finalize_count(), 0);
+    fixture.assert_workspace_has_no_attempts();
+}
+
+#[test]
+fn unknown_queue_states_and_missing_estimates_keep_the_existing_poll_cadence() {
+    let receipt = image_provider_dreamina_cli::parse_query_receipt(
+        br#"{"submit_id":"task-1","gen_status":"querying","queue_info":{"queue_idx":0,"queue_length":100,"queue_status":"FutureState"},"estimated_remaining_seconds":-1}"#,
+    )
+    .unwrap();
+    let PollObservation::PendingWithProgress {
+        next_poll_after_ms,
+        progress,
+    } = video_pending_observation(&receipt)
+    else {
+        panic!("expected the provider's original observation");
+    };
+    assert_eq!(next_poll_after_ms, Some(DEFAULT_POLL_AFTER_MS));
+    assert_eq!(progress.provider_status, "FutureState");
+    assert_eq!(progress.estimated_remaining_seconds, None);
+}
+
+#[tokio::test]
 async fn pending_and_terminal_failure_require_an_empty_download_directory() {
     let pending = Fixture::new(r#"printf '{"submit_id":"%s","gen_status":"querying"}' "$submit""#);
     let operation = pending.operation();

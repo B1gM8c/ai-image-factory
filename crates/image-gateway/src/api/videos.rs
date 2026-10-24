@@ -870,6 +870,7 @@ mod tests {
         let response = video_response(VideoResultStatus::Uncertain {
             model: "grok-imagine-video-1.5-preview".to_owned(),
             duration_ms: 6000,
+            provider_progress: None,
         });
         assert_eq!(response.status, "pending");
         assert!(response.error.is_none());
@@ -888,6 +889,7 @@ mod tests {
         let response = video_response(VideoResultStatus::Pending {
             model: "grok-imagine-video-1.5-preview".to_owned(),
             duration_ms: 6000,
+            provider_progress: None,
             stage: crate::settlement::VideoPendingStage::Processing,
         });
         let value = serde_json::to_value(response).unwrap();

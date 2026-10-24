@@ -36,10 +36,19 @@ pub enum DreaminaQueryStatusV1 {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DreaminaQueueInfoV1 {
+    pub queue_idx: u64,
+    pub queue_length: u64,
+    pub queue_status: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DreaminaQueryReceiptV1 {
     submit_id: OpaqueProviderId,
     status: DreaminaQueryStatusV1,
     remote_video_result: Option<RemoteVideoResult>,
+    queue_info: Option<DreaminaQueueInfoV1>,
+    estimated_remaining_seconds: Option<u64>,
 }
 
 impl DreaminaQueryReceiptV1 {
@@ -55,6 +64,14 @@ impl DreaminaQueryReceiptV1 {
     /// Missing, ambiguous, or malformed video metadata remains unavailable.
     pub fn remote_video_result(&self) -> Option<&RemoteVideoResult> {
         self.remote_video_result.as_ref()
+    }
+
+    pub fn queue_info(&self) -> Option<&DreaminaQueueInfoV1> {
+        self.queue_info.as_ref()
+    }
+
+    pub fn estimated_remaining_seconds(&self) -> Option<u64> {
+        self.estimated_remaining_seconds
     }
 }
 
@@ -82,6 +99,8 @@ struct RawReceipt {
     gen_status: Option<String>,
     fail_reason: Option<String>,
     result_json: Option<serde_json::Value>,
+    queue_info: Option<serde_json::Value>,
+    estimated_remaining_seconds: Option<serde_json::Value>,
 }
 
 pub fn parse_receipt(input: &[u8]) -> Result<AcceptedReceipt, ReceiptError> {
@@ -110,11 +129,52 @@ pub fn parse_query_receipt(input: &[u8]) -> Result<DreaminaQueryReceiptV1, Recei
     let remote_video_result = (status == DreaminaQueryStatusV1::Success)
         .then(|| single_remote_video(raw.result_json.as_ref()))
         .flatten();
+    // Progress is advisory. Invalid optional metadata must not turn a confirmed
+    // pending task into a failed query or change any terminal receipt semantics.
+    let querying = status == DreaminaQueryStatusV1::Querying;
+    let queue_info = querying
+        .then(|| parse_queue_info(raw.queue_info.as_ref()))
+        .flatten();
+    let estimated_remaining_seconds = querying
+        .then(|| {
+            raw.estimated_remaining_seconds
+                .as_ref()?
+                .as_u64()
+                .filter(|seconds| *seconds <= i64::MAX as u64)
+        })
+        .flatten();
     let submit_id = parse_submit_id(raw.submit_id)?;
     Ok(DreaminaQueryReceiptV1 {
         submit_id,
         status,
         remote_video_result,
+        queue_info,
+        estimated_remaining_seconds,
+    })
+}
+
+fn parse_queue_info(value: Option<&serde_json::Value>) -> Option<DreaminaQueueInfoV1> {
+    // CLI 1.4.21 task.QueueInfo uses int32 counters and a string queue status.
+    // Priority and debug_info are intentionally excluded from the public view.
+    let value = value?.as_object()?;
+    let queue_idx = value.get("queue_idx")?.as_u64()?;
+    let queue_length = value.get("queue_length")?.as_u64()?;
+    if queue_idx > queue_length || queue_length > i32::MAX as u64 {
+        return None;
+    }
+    let queue_status = value.get("queue_status")?.as_str()?;
+    if queue_status.is_empty()
+        || queue_status.len() > 64
+        || !queue_status
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        return None;
+    }
+    Some(DreaminaQueueInfoV1 {
+        queue_idx,
+        queue_length,
+        queue_status: queue_status.to_owned(),
     })
 }
 
@@ -207,6 +267,122 @@ fn sanitize_text(value: &str) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn query_with_progress(
+        status: &str,
+        queue_info: serde_json::Value,
+        estimated_remaining_seconds: serde_json::Value,
+    ) -> DreaminaQueryReceiptV1 {
+        parse_query_receipt(
+            &serde_json::to_vec(&json!({
+                "submit_id": "task-queue-fixture",
+                "gen_status": status,
+                "queue_info": queue_info,
+                "estimated_remaining_seconds": estimated_remaining_seconds,
+            }))
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn queue_info_fixture() -> serde_json::Value {
+        // Shape verified from a CLI 1.4.21 pending video query; ID and values are synthetic.
+        json!({"queue_idx": 123, "priority": 7, "queue_status": "Queueing", "queue_length": 456})
+    }
+
+    #[test]
+    fn query_progress_preserves_provider_values_without_exposing_debug_or_priority() {
+        let mut queue = queue_info_fixture();
+        queue["debug_info"] = json!("internal diagnostic");
+        let receipt = query_with_progress("querying", queue, json!(27_131));
+        assert_eq!(receipt.status(), DreaminaQueryStatusV1::Querying);
+        assert_eq!(
+            receipt.queue_info(),
+            Some(&DreaminaQueueInfoV1 {
+                queue_idx: 123,
+                queue_length: 456,
+                queue_status: "Queueing".to_owned(),
+            })
+        );
+        assert_eq!(receipt.estimated_remaining_seconds(), Some(27_131));
+        let debug = format!("{receipt:?}");
+        assert!(!debug.contains("priority"));
+        assert!(!debug.contains("internal diagnostic"));
+    }
+
+    #[test]
+    fn query_progress_is_optional_and_never_attached_to_terminal_status() {
+        let legacy =
+            parse_query_receipt(br#"{"submit_id":"task-queue-fixture","gen_status":"querying"}"#)
+                .unwrap();
+        assert!(legacy.queue_info().is_none());
+        assert!(legacy.estimated_remaining_seconds().is_none());
+        for status in ["success", "fail"] {
+            let receipt = query_with_progress(status, queue_info_fixture(), json!(12));
+            assert!(receipt.queue_info().is_none());
+            assert!(receipt.estimated_remaining_seconds().is_none());
+        }
+    }
+
+    #[test]
+    fn malformed_queue_metadata_does_not_change_confirmed_pending_status() {
+        for queue in [
+            json!(null),
+            json!([]),
+            json!("Queueing"),
+            json!({}),
+            json!({"queue_idx": 1, "queue_status": "Queueing"}),
+            json!({"queue_idx": "1", "queue_length": 2, "queue_status": "Queueing"}),
+            json!({"queue_idx": true, "queue_length": 2, "queue_status": "Queueing"}),
+            json!({"queue_idx": -1, "queue_length": 2, "queue_status": "Queueing"}),
+            json!({"queue_idx": 1.5, "queue_length": 2, "queue_status": "Queueing"}),
+            json!({"queue_idx": 3, "queue_length": 2, "queue_status": "Queueing"}),
+            json!({"queue_idx": 1, "queue_length": -2, "queue_status": "Queueing"}),
+            json!({"queue_idx": 1, "queue_length": 2_147_483_648_u64, "queue_status": "Queueing"}),
+            json!({"queue_idx": 1, "queue_length": 2, "queue_status": ""}),
+            json!({"queue_idx": 1, "queue_length": 2, "queue_status": "  "}),
+            json!({"queue_idx": 1, "queue_length": 2, "queue_status": "<script>"}),
+            json!({"queue_idx": 1, "queue_length": 2, "queue_status": "Queueing\n"}),
+            json!({"queue_idx": 1, "queue_length": 2, "queue_status": "x".repeat(65)}),
+        ] {
+            let receipt = query_with_progress("querying", queue, json!(12));
+            assert_eq!(receipt.status(), DreaminaQueryStatusV1::Querying);
+            assert!(receipt.queue_info().is_none());
+            assert_eq!(receipt.estimated_remaining_seconds(), Some(12));
+        }
+    }
+
+    #[test]
+    fn malformed_estimate_does_not_discard_valid_queue_metadata() {
+        for estimate in [
+            json!(null),
+            json!("12"),
+            json!(true),
+            json!(-1),
+            json!(0.5),
+            json!(u64::MAX),
+            json!({"seconds": 12}),
+        ] {
+            let receipt = query_with_progress("querying", queue_info_fixture(), estimate);
+            assert_eq!(receipt.status(), DreaminaQueryStatusV1::Querying);
+            assert!(receipt.queue_info().is_some());
+            assert!(receipt.estimated_remaining_seconds().is_none());
+        }
+    }
+
+    #[test]
+    fn query_progress_accepts_zero_and_exact_cli_integer_limits() {
+        for (index, length) in [(0, 0), (0, 1), (i32::MAX, i32::MAX)] {
+            let receipt = query_with_progress(
+                "querying",
+                json!({"queue_idx": index, "queue_length": length, "queue_status": "Queueing"}),
+                json!(0),
+            );
+            assert_eq!(receipt.queue_info().unwrap().queue_idx, index as u64);
+            assert_eq!(receipt.queue_info().unwrap().queue_length, length as u64);
+            assert_eq!(receipt.estimated_remaining_seconds(), Some(0));
+        }
+    }
 
     #[test]
     fn query_video_view_preserves_the_exact_url_without_inventing_an_expiry() {

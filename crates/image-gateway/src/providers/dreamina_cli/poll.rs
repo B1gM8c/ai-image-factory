@@ -19,15 +19,17 @@ use image_cli_runtime::{
 };
 use image_provider_dreamina_cli::{
     ADAPTER_REVISION, DREAMINA_SUBMIT_COMMAND_SCHEMA, DreaminaCliQueryPolicyError,
-    DreaminaCliQueryPolicyV1, DreaminaQueryStatusV1, PROVIDER_ID, QueryResultRequestV1,
+    DreaminaCliQueryPolicyV1, DreaminaQueryReceiptV1, DreaminaQueryStatusV1, PROVIDER_ID,
+    QueryResultRequestV1,
 };
 use image_provider_sdk::{
     ArtifactMetadata, ArtifactSink, ArtifactSinkError, ArtifactSinkErrorKind, Completed,
     CompletedRemoteVideo, EffectCertainty, PollObservation, ProviderFailure, ProviderFailureClass,
-    RemoteOperationRef, RetryDirective,
+    ProviderTaskProgress, RemoteOperationRef, RetryDirective,
 };
 
 const DEFAULT_POLL_AFTER_MS: u64 = 5_000;
+const QUEUED_POLL_AFTER_MS: u64 = 30_000;
 const MEDIA_PREFIX_BYTES: usize = 12;
 const DREAMINA_POLL_ATTEMPT_PREFIX: &str = ".dreamina-poll-";
 
@@ -167,9 +169,7 @@ impl DreaminaCliPollDriverV1 {
 
         if remote_video {
             return match receipt.status() {
-                DreaminaQueryStatusV1::Querying => Ok(PollObservation::Pending {
-                    next_poll_after_ms: Some(DEFAULT_POLL_AFTER_MS),
-                }),
+                DreaminaQueryStatusV1::Querying => Ok(video_pending_observation(&receipt)),
                 DreaminaQueryStatusV1::Failed => Ok(PollObservation::Failed(terminal_failure(
                     "dreamina_generation_failed",
                 ))),
@@ -560,6 +560,42 @@ fn terminal_failure(code: &'static str) -> ProviderFailure {
         RetryDirective::Never,
     )
     .expect("static Dreamina terminal failure must be valid")
+}
+
+fn video_pending_observation(receipt: &DreaminaQueryReceiptV1) -> PollObservation {
+    let queue = receipt.queue_info();
+    let estimate = receipt
+        .estimated_remaining_seconds()
+        .filter(|seconds| *seconds <= 30 * 24 * 60 * 60);
+    if queue.is_none() && estimate.is_none() {
+        return PollObservation::Pending {
+            next_poll_after_ms: Some(DEFAULT_POLL_AFTER_MS),
+        };
+    }
+    let progress = ProviderTaskProgress {
+        provider_status: queue
+            .map(|queue| queue.queue_status.clone())
+            .unwrap_or_else(|| "querying".to_owned()),
+        queue_position: queue.map(|queue| queue.queue_idx),
+        queue_total: queue.map(|queue| queue.queue_length),
+        estimated_remaining_seconds: estimate,
+    };
+    if progress.validate().is_err() {
+        return PollObservation::Pending {
+            next_poll_after_ms: Some(DEFAULT_POLL_AFTER_MS),
+        };
+    }
+    // A long upstream queue needs a fresh observation, not a new CLI process
+    // every five seconds. Unknown states keep the existing polling cadence.
+    let next_poll_after_ms = if progress.provider_status == "Queueing" {
+        QUEUED_POLL_AFTER_MS
+    } else {
+        DEFAULT_POLL_AFTER_MS
+    };
+    PollObservation::PendingWithProgress {
+        next_poll_after_ms: Some(next_poll_after_ms),
+        progress,
+    }
 }
 
 #[derive(Debug, thiserror::Error)]

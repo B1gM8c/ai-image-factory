@@ -228,6 +228,12 @@ pub struct DreaminaVideoTask {
     pub id: String,
     pub status: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_progress: Option<DreaminaProviderProgress>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancellation: Option<DreaminaCancellation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<DreaminaTaskError>,
@@ -236,6 +242,26 @@ pub struct DreaminaVideoTask {
     /// Present only for an audited operator resolution backed by a fully released hold.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settlement: Option<DreaminaReleasedSettlement>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct DreaminaProviderProgress {
+    pub provider_status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_position: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_total: Option<u64>,
+    /// The provider's estimate at observed_at_ms, not a completion guarantee.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_remaining_seconds: Option<u64>,
+    /// Time of the durable provider observation; reading a task does not refresh it.
+    pub observed_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct DreaminaCancellation {
+    pub supported: bool,
+    pub reason: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -293,6 +319,45 @@ mod tests {
         });
         let parsed: DreaminaVideoTask = serde_json::from_value(receipt.clone()).unwrap();
         assert_eq!(serde_json::to_value(parsed).unwrap(), receipt);
+    }
+
+    #[test]
+    fn provider_progress_is_optional_and_preserves_unknown_queue_values() {
+        let legacy = serde_json::json!({"id":"task-a","status":"running"});
+        let task: DreaminaVideoTask = serde_json::from_value(legacy.clone()).unwrap();
+        assert!(task.stage.is_none());
+        assert!(task.provider_progress.is_none());
+        assert!(task.cancellation.is_none());
+        assert_eq!(serde_json::to_value(task).unwrap(), legacy);
+
+        let queued = serde_json::json!({
+            "id":"task-a", "status":"running", "stage":"provider_queued",
+            "provider_progress":{"provider_status":"Queueing", "observed_at_ms":1792828821077_i64},
+            "cancellation":{"supported":false,"reason":"provider_cancellation_unsupported"}
+        });
+        let task: DreaminaVideoTask = serde_json::from_value(queued.clone()).unwrap();
+        assert!(
+            task.provider_progress
+                .as_ref()
+                .unwrap()
+                .queue_position
+                .is_none()
+        );
+        assert!(
+            task.provider_progress
+                .as_ref()
+                .unwrap()
+                .queue_total
+                .is_none()
+        );
+        assert!(
+            task.provider_progress
+                .as_ref()
+                .unwrap()
+                .estimated_remaining_seconds
+                .is_none()
+        );
+        assert_eq!(serde_json::to_value(task).unwrap(), queued);
     }
 
     #[test]

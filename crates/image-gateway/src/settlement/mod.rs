@@ -130,6 +130,7 @@ pub enum VideoResultStatus {
         model: String,
         duration_ms: u32,
         stage: VideoPendingStage,
+        provider_progress: Option<VideoProviderProgress>,
     },
     Succeeded {
         model: String,
@@ -149,7 +150,14 @@ pub enum VideoResultStatus {
     Uncertain {
         model: String,
         duration_ms: u32,
+        provider_progress: Option<VideoProviderProgress>,
     },
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub struct VideoProviderProgress {
+    pub progress: image_provider_sdk::ProviderTaskProgress,
+    pub observed_at_ms: i64,
 }
 
 /// Specifications frozen at admission, not measurements of the generated media.

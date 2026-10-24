@@ -451,7 +451,9 @@ fn ark_video_task(
             resolution: None,
             ratio: None,
         },
-        VideoResultStatus::Uncertain { model, duration_ms } => ArkContentGenerationTask {
+        VideoResultStatus::Uncertain {
+            model, duration_ms, ..
+        } => ArkContentGenerationTask {
             id: public_id,
             model: public_video_model(&model).to_owned(),
             status: "uncertain".to_owned(),
@@ -716,6 +718,7 @@ mod tests {
             VideoResultStatus::Uncertain {
                 model: "seedance2.5".to_owned(),
                 duration_ms: 5000,
+                provider_progress: None,
             },
             VideoRequestMetadata::default(),
         );
@@ -772,11 +775,13 @@ mod tests {
             VideoResultStatus::Pending {
                 model: "execution-model-id".to_owned(),
                 duration_ms: 5000,
+                provider_progress: None,
                 stage: crate::settlement::VideoPendingStage::Queued,
             },
             VideoResultStatus::Uncertain {
                 model: "execution-model-id".to_owned(),
                 duration_ms: 5000,
+                provider_progress: None,
             },
             VideoResultStatus::Succeeded {
                 model: "execution-model-id".to_owned(),
@@ -819,6 +824,7 @@ mod tests {
             VideoResultStatus::Pending {
                 model: "seedance2.0fast".to_owned(),
                 duration_ms: 5000,
+                provider_progress: None,
                 stage: crate::settlement::VideoPendingStage::Processing,
             },
             VideoRequestMetadata::default(),
@@ -839,6 +845,7 @@ mod tests {
             VideoResultStatus::Pending {
                 model: "multiframe2video".to_owned(),
                 duration_ms: 2501,
+                provider_progress: None,
                 stage: crate::settlement::VideoPendingStage::Processing,
             },
             VideoRequestMetadata::default(),
