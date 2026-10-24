@@ -101,40 +101,46 @@ async fn submit_recovery_filters_execution_profile_before_candidate_window_and_r
     let result = async {
         let store = PostgresProviderTaskStore::new(database.pool.clone());
         let sibling = seed_sibling_profile(&database.pool).await?;
+        // Setup performs several database transactions before recovery can be
+        // tested. Keep their authority live on slower runners, then wait for
+        // the actual persisted expiry below rather than assuming it elapsed.
+        const SETUP_LEASE_MS: i64 = 5_000;
         for index in 0..64 {
             let lease = seed_running_submission_with_lease(
                 &database.pool,
                 &format!("profile-recovery-other-{index}"),
-                200,
+                SETUP_LEASE_MS,
             )
-            .await?;
+            .await
+            .map_err(|error| format!("recovery setup {index}: {error}"))?;
             let reservation = reservation_request(&lease);
             store
                 .reserve_submit(&reservation)
                 .await
-                .map_err(debug_error)?;
+                .map_err(|error| format!("recovery setup {index} reserve: {error:?}"))?;
             store
                 .start_submit(&reservation)
                 .await
-                .map_err(debug_error)?;
+                .map_err(|error| format!("recovery setup {index} start: {error:?}"))?;
         }
         let target = seed_running_submission_for_profile(
             &database.pool,
             "profile-recovery-target",
-            200,
+            SETUP_LEASE_MS,
             sibling.execution_profile_id,
             "provider-test-adapter-v1",
         )
-        .await?;
+        .await
+        .map_err(|error| format!("recovery target setup: {error}"))?;
         let reservation = reservation_request(&target);
         store
             .reserve_submit(&reservation)
             .await
-            .map_err(debug_error)?;
+            .map_err(|error| format!("recovery target reserve: {error:?}"))?;
         store
             .start_submit(&reservation)
             .await
-            .map_err(debug_error)?;
+            .map_err(|error| format!("recovery target start: {error:?}"))?;
         sleep_until_database_time(&database.pool, target.executor_lease_expires_at_ms + 20).await?;
         let claimed = store
             .claim_submit_recovery(
