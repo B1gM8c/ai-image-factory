@@ -5,14 +5,22 @@ IFS=$'\n\t'
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
 readonly REPO_ROOT
 readonly QUIESCE="${REPO_ROOT}/deploy/hooks/quiesce"
-readonly START_PROCESSES="${REPO_ROOT}/deploy/hooks/start-processes"
 TEST_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/aif-release-hooks.XXXXXXXX")"
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
 readonly VERIFY="$TEST_ROOT/hooks/verify"
+readonly START_PROCESSES="$TEST_ROOT/hooks/start-processes"
 
 mkdir -p "$TEST_ROOT/bin" "$TEST_ROOT/hooks"
 cp "$REPO_ROOT/deploy/hooks/verify" "$VERIFY"
+cp "$REPO_ROOT/deploy/hooks/start-processes" "$START_PROCESSES"
 : >"$TEST_ROOT/phase"
+
+cat >"$TEST_ROOT/hooks/sync-remote-runner-pins" <<'EOF'
+#!/bin/bash
+printf 'runner-pins\n' >>"$MOCK_START_LOG"
+[[ "${MOCK_RUNNER_PINS_FAILED:-false}" != true ]]
+EOF
+chmod 0755 "$START_PROCESSES" "$TEST_ROOT/hooks/sync-remote-runner-pins"
 
 # Process orchestration fixtures only. The sibling gate has no runtime bypass;
 # real reader login/SQL/42501 evidence lives in test-admin-reader-gate.py.
@@ -328,6 +336,7 @@ done
 for mode in target direct gate; do
   : >"$TEST_ROOT/start.log"
   run_start_processes MOCK_REMOTE_UNITS=true AIF_UPDATE_START_MODE="$mode" >/dev/null
+  [[ "$(head -n 1 "$TEST_ROOT/start.log")" == runner-pins ]]
   for unit in "${remote_units[@]}"; do
     grep -Fq "$unit" "$TEST_ROOT/start.log"
   done
@@ -338,10 +347,21 @@ for mode in target direct gate; do
   : >"$TEST_ROOT/start.log"
   run_start_processes MOCK_REMOTE_UNITS=true AIF_UPDATE_START_MODE="$mode" \
     AIF_UPDATE_PROCESS_SCOPE=validation >/dev/null
+  if grep -Fq runner-pins "$TEST_ROOT/start.log"; then
+    echo "validation activation must not change runner pins" >&2
+    exit 1
+  fi
   if grep -Fq 'managed.dreamina.' "$TEST_ROOT/start.log"; then
     echo "validation activation must not start remote consumers" >&2
     exit 1
   fi
+  : >"$TEST_ROOT/start.log"
+  if run_start_processes MOCK_REMOTE_UNITS=true AIF_UPDATE_START_MODE="$mode" \
+    MOCK_RUNNER_PINS_FAILED=true >/dev/null 2>&1; then
+    echo "expected runner pin failure to block all starts in ${mode} mode" >&2
+    exit 1
+  fi
+  [[ "$(cat "$TEST_ROOT/start.log")" == runner-pins ]]
 done
 : >"$TEST_ROOT/gate.log"
 run_verify MOCK_REMOTE_UNITS=true AIF_UPDATE_PROCESS_SCOPE=validation >/dev/null

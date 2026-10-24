@@ -44,6 +44,9 @@ readonly OPTIONAL_UNITS=(
 )
 
 if [[ "$PROCESS_SCOPE" == "full" ]]; then
+  # Use the verified current release on both activation and recovery. No
+  # consumer may start with a pin left over from the other release.
+  "$(dirname -- "${BASH_SOURCE[0]}")/sync-remote-runner-pins"
   for unit in "${LEGACY_EXECUTION_UNITS[@]}"; do
     if systemctl is-enabled --quiet "$unit"; then
       REQUIRED_PROFILE_UNITS+=("$unit")

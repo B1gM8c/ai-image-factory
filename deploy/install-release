@@ -594,6 +594,122 @@ else
   STAGING_DIR=""
   sync -f "${INSTALL_ROOT}/releases"
 fi
+
+env \
+  AIF_BOOTSTRAP_INSTALL_ROOT="$INSTALL_ROOT" \
+  AIF_BOOTSTRAP_MANIFEST="$MANIFEST" \
+  AIF_BOOTSTRAP_VERSION="$VERSION" \
+  AIF_BOOTSTRAP_TARGET="$TARGET_TRIPLE" \
+  python3 <<'PY'
+# Verified manifest store. Keep the original bytes outside the signed release tree.
+import json
+import os
+import re
+import stat
+import uuid
+from pathlib import Path
+
+
+def store_verified_manifest(install_root, manifest_path, version, target, *, expected_uid=0):
+    root = Path(install_root)
+    source = Path(manifest_path)
+    if (
+        not root.is_absolute()
+        or root == Path("/")
+        or root.resolve(strict=True) != root
+        or not re.fullmatch(r"[A-Za-z0-9._-]+", version)
+        or target not in ("x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu")
+    ):
+        raise SystemExit("verified manifest store identity is invalid")
+
+    def require_protected(descriptor, directory=False, private=False):
+        metadata = os.fstat(descriptor)
+        valid_kind = stat.S_ISDIR(metadata.st_mode) if directory else stat.S_ISREG(metadata.st_mode)
+        if (
+            not valid_kind
+            or metadata.st_uid != expected_uid
+            or stat.S_IMODE(metadata.st_mode) & 0o022
+            or (private and stat.S_IMODE(metadata.st_mode) != 0o600)
+        ):
+            raise SystemExit("verified manifest store is not root-protected")
+
+    source_fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        require_protected(source_fd)
+        with os.fdopen(source_fd, "rb", closefd=False) as stream:
+            manifest_bytes = stream.read(8 * 1024 * 1024 + 1)
+    finally:
+        os.close(source_fd)
+    if not manifest_bytes or len(manifest_bytes) > 8 * 1024 * 1024:
+        raise SystemExit("verified manifest size is outside the supported range")
+    manifest = json.loads(manifest_bytes)
+    if manifest.get("release_version") != version or manifest.get("target_triple") != target:
+        raise SystemExit("verified manifest store identity mismatch")
+
+    root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        require_protected(root_fd, directory=True)
+        try:
+            os.mkdir("verified-manifests", 0o700, dir_fd=root_fd)
+            os.fsync(root_fd)
+        except FileExistsError:
+            pass
+        store_fd = os.open(
+            "verified-manifests", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=root_fd
+        )
+        try:
+            require_protected(store_fd, directory=True)
+            name = f"{version}-{target}.manifest.json"
+
+            def verify_existing():
+                descriptor = os.open(
+                    name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=store_fd
+                )
+                try:
+                    require_protected(descriptor, private=True)
+                    with os.fdopen(descriptor, "rb", closefd=False) as stream:
+                        if stream.read(len(manifest_bytes) + 1) != manifest_bytes:
+                            raise SystemExit("verified manifest store conflicts with existing bytes")
+                finally:
+                    os.close(descriptor)
+
+            try:
+                verify_existing()
+                os.fsync(store_fd)
+                return
+            except FileNotFoundError:
+                pass
+            temporary = f".{name}.{uuid.uuid4().hex}.tmp"
+            descriptor = os.open(
+                temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600, dir_fd=store_fd
+            )
+            try:
+                with os.fdopen(descriptor, "wb", closefd=False) as stream:
+                    stream.write(manifest_bytes)
+                    stream.flush()
+                    os.fsync(descriptor)
+                try:
+                    os.link(temporary, name, src_dir_fd=store_fd, dst_dir_fd=store_fd,
+                            follow_symlinks=False)
+                except FileExistsError:
+                    verify_existing()
+            finally:
+                os.close(descriptor)
+                os.unlink(temporary, dir_fd=store_fd)
+                os.fsync(store_fd)
+        finally:
+            os.close(store_fd)
+    finally:
+        os.close(root_fd)
+
+
+if __name__ == "__main__":
+    store_verified_manifest(
+        os.environ["AIF_BOOTSTRAP_INSTALL_ROOT"], os.environ["AIF_BOOTSTRAP_MANIFEST"],
+        os.environ["AIF_BOOTSTRAP_VERSION"], os.environ["AIF_BOOTSTRAP_TARGET"]
+    )
+PY
 install -m 0755 "${RELEASE_ROOT}/bin/updated" "${LIBEXEC_ROOT}/updated"
 sync -f "${LIBEXEC_ROOT}/updated"
 if [[ ! -e "$CURRENT_LINK" && ! -L "$CURRENT_LINK" ]]; then
