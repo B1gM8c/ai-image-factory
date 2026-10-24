@@ -157,22 +157,43 @@ pub(super) fn load(
     {
         return Err(conflict());
     }
+    let download_dir = &audit.argv[4];
+    let valid_download_dir = !download_dir.chars().any(char::is_control)
+        && (download_dir == "/"
+            || (download_dir.starts_with('/')
+                && download_dir[1..]
+                    .split('/')
+                    .all(|part| !part.is_empty() && part != "." && part != "..")));
     let mut item_ids = std::collections::HashSet::new();
-    for image in images {
+    for (index, image) in images.iter().enumerate() {
         let item = image
             .get("item_id")
             .and_then(Value::as_str)
             .filter(|v| !v.is_empty() && v.len() <= 255 && !v.chars().any(char::is_control))
             .ok_or_else(conflict)?;
-        let url = image
-            .get("image_url")
-            .and_then(Value::as_str)
-            .ok_or_else(conflict)?;
-        if !item_ids.insert(item)
-            || !url.starts_with("https://")
-            || url.chars().any(char::is_control)
-        {
+        let url = image.get("image_url");
+        let path = image.get("path");
+        if !item_ids.insert(item) || (url.is_none() && path.is_none()) {
             return Err(conflict());
+        }
+        if let Some(url) = url {
+            let url = url.as_str().ok_or_else(conflict)?;
+            if !url.starts_with("https://") || url.chars().any(char::is_control) {
+                return Err(conflict());
+            }
+        }
+        if let Some(path) = path {
+            // CLI downloads replace URLs with local paths. Bind their spelling
+            // to the audited files; only the evidence package's PNG is opened.
+            let path = path.as_str().ok_or_else(conflict)?;
+            let filename = &audit.downloaded_images[index].filename;
+            if !valid_download_dir
+                || filename.contains(['/', '\\'])
+                || filename.chars().any(char::is_control)
+                || path != format!("{}/{}", download_dir.trim_end_matches('/'), filename)
+            {
+                return Err(conflict());
+            }
         }
     }
     let selected = &images[0];
@@ -312,6 +333,35 @@ mod tests {
                 image,
             }
         }
+        fn with_download_paths(object_result: bool) -> Self {
+            let mut bundle = Self::new();
+            let download_dir = bundle.root.join("unretained-original-download");
+            assert!(!download_dir.exists());
+            bundle.audit["argv"][4] = json!(download_dir.to_str().unwrap());
+            let mut result: Value =
+                serde_json::from_str(bundle.receipt["result_json"].as_str().unwrap()).unwrap();
+            for (index, image) in result["images"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .enumerate()
+            {
+                image.as_object_mut().unwrap().remove("image_url");
+                image["path"] = json!(format!(
+                    "{}/{}",
+                    download_dir.display(),
+                    bundle.audit["downloaded_images"][index]["filename"]
+                        .as_str()
+                        .unwrap()
+                ));
+            }
+            bundle.receipt["result_json"] = if object_result {
+                result
+            } else {
+                json!(serde_json::to_string(&result).unwrap())
+            };
+            bundle
+        }
         fn save(&mut self) {
             let stdout = serde_json::to_vec(&self.receipt).unwrap();
             self.request.reviewed_stdout_sha256 = sha256_hex(&stdout);
@@ -387,6 +437,148 @@ mod tests {
                 std::fs::read(bundle.root.join("reviewed-query.json")).unwrap(),
                 stdout
             );
+        }
+    }
+
+    #[test]
+    fn accepts_reviewed_download_paths_without_original_directory_or_raw_changes() {
+        for object_result in [false, true] {
+            let mut bundle = Bundle::with_download_paths(object_result);
+            bundle.save();
+            let stdout = std::fs::read(bundle.root.join("reviewed-query.json")).unwrap();
+            let verified = load(&bundle.root, &bundle.request).unwrap();
+            assert_eq!(verified.stdout_sha256, sha256_hex(&stdout));
+            assert_eq!(verified.selected_item_id, "item-0");
+            assert_eq!(verified.bytes, bundle.image);
+            assert_eq!(
+                std::fs::read(bundle.root.join("reviewed-query.json")).unwrap(),
+                stdout
+            );
+            assert!(!Path::new(bundle.audit["argv"][4].as_str().unwrap()).exists());
+        }
+    }
+
+    #[test]
+    fn rejects_rehashed_receipt_paths_outside_each_reviewed_canonical_filename() {
+        for object_result in [false, true] {
+            for index in 0..4 {
+                for mutation in 0..12 {
+                    let mut bundle = Bundle::with_download_paths(true);
+                    let dir = bundle.audit["argv"][4].as_str().unwrap();
+                    let filename = bundle.audit["downloaded_images"][index]["filename"]
+                        .as_str()
+                        .unwrap();
+                    let path = match mutation {
+                        0 => json!(format!("{dir}-neighbor/{filename}")),
+                        1 => json!(format!("{dir}/nested/{filename}")),
+                        2 => json!(format!("{dir}/different-remote-id_image_{}.png", index + 1)),
+                        3 => json!(format!(
+                            "{dir}/original-remote-id_image_{}.png",
+                            (index + 1) % 4 + 1
+                        )),
+                        4 => json!(format!("{dir}/../{filename}")),
+                        5 => json!(format!("{dir}/./{filename}")),
+                        6 => json!(format!("{dir}//{filename}")),
+                        7 => json!(filename),
+                        8 => json!(format!("{dir}/{filename}\n")),
+                        9 => json!(format!("{dir}/{filename}\u{85}")),
+                        10 => Value::Null,
+                        _ => json!(1),
+                    };
+                    bundle.receipt["result_json"]["images"][index]["path"] = path;
+                    if !object_result {
+                        bundle.receipt["result_json"] =
+                            json!(serde_json::to_string(&bundle.receipt["result_json"]).unwrap());
+                    }
+                    bundle.save();
+                    assert!(
+                        load(&bundle.root, &bundle.request).is_err(),
+                        "accepted mutation {mutation} at index {index}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_missing_or_invalid_media_fields_without_falling_back_to_another_field() {
+        for mutation in 0..5 {
+            let mut bundle = Bundle::with_download_paths(true);
+            let image = bundle.receipt["result_json"]["images"][2]
+                .as_object_mut()
+                .unwrap();
+            match mutation {
+                0 => {
+                    image.insert(
+                        "image_url".into(),
+                        json!("https://media.example.test/2.png"),
+                    );
+                    image.insert("path".into(), Value::Null);
+                }
+                1 => {
+                    image.insert(
+                        "image_url".into(),
+                        json!("https://media.example.test/2.png"),
+                    );
+                    image.insert("path".into(), json!("/different/file.png"));
+                }
+                2 => {
+                    image.insert("image_url".into(), Value::Null);
+                }
+                3 => {
+                    image.insert("image_url".into(), json!("http://media.example.test/2.png"));
+                }
+                _ => {
+                    image.remove("path");
+                }
+            }
+            bundle.save();
+            assert!(load(&bundle.root, &bundle.request).is_err());
+        }
+    }
+
+    #[test]
+    fn rejects_unsafe_download_directories_even_when_receipt_paths_match_and_are_rehashed() {
+        for dir in [
+            "relative",
+            "/safe/../safe",
+            "/safe/./nested",
+            "/safe//nested",
+            "/safe/",
+            "/safe/\n",
+            "/safe/\u{85}",
+        ] {
+            let mut bundle = Bundle::with_download_paths(true);
+            bundle.audit["argv"][4] = json!(dir);
+            for (index, image) in bundle.receipt["result_json"]["images"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .enumerate()
+            {
+                image["path"] = json!(format!("{dir}/original-remote-id_image_{}.png", index + 1));
+            }
+            bundle.save();
+            assert!(load(&bundle.root, &bundle.request).is_err());
+        }
+    }
+
+    #[test]
+    fn rejects_audited_filenames_that_are_not_single_safe_components() {
+        for remote in ["remote/../other", "remote\\other", "remote\u{85}other"] {
+            let mut bundle = Bundle::with_download_paths(true);
+            bundle.audit["remote_operation_id"] = json!(remote);
+            bundle.audit["argv"][2] = json!(remote);
+            bundle.receipt["submit_id"] = json!(remote);
+            let dir = bundle.audit["argv"][4].as_str().unwrap().to_owned();
+            for index in 0..4 {
+                let filename = format!("{remote}_image_{}.png", index + 1);
+                bundle.audit["downloaded_images"][index]["filename"] = json!(filename);
+                bundle.receipt["result_json"]["images"][index]["path"] =
+                    json!(format!("{dir}/{filename}"));
+            }
+            bundle.save();
+            assert!(load(&bundle.root, &bundle.request).is_err());
         }
     }
 

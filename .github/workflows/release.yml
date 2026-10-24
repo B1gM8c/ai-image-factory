@@ -272,6 +272,13 @@ jobs:
           cargo test --locked --package gpt-image-2-gateway \
             --test postgres_provider_tasks gated_submit:: -- --test-threads=1
 
+      - name: Test hotfix reviewed image evidence
+        if: inputs.validation_profile == 'hotfix'
+        run: |
+          cargo test --locked --package gpt-image-2-gateway \
+            --lib settlement::postgres::image_success_reconciliation::evidence::tests \
+            -- --test-threads=1
+
       - name: Test hotfix public model metadata and catalog authorization
         if: inputs.validation_profile == 'hotfix'
         run: |
