@@ -2201,8 +2201,11 @@ async fn submit_service_prioritizes_expired_recovery_before_fresh_work() -> Test
         return Ok(());
     };
     let result = async {
+        // This checks scheduling order after expiry, not a 100ms setup race.
+        const SETUP_LEASE_MS: i64 = 5_000;
+        const PROVIDER_TIMEOUT_MS: i64 = 30_000;
         let recovery_lease =
-            seed_running_submission_with_lease(&database.pool, "submit-service-recovery", 100)
+            seed_running_submission_with_lease(&database.pool, "submit-service-recovery", SETUP_LEASE_MS)
                 .await?;
         let provider_store = PostgresProviderTaskStore::new(database.pool.clone());
         let recovery_command = orchestrator_command(&recovery_lease);
@@ -2212,13 +2215,30 @@ async fn submit_service_prioritizes_expired_recovery_before_fresh_work() -> Test
                 format!("provider-submit-{}", recovery_lease.submission_id.simple()),
                 recovery_command.output(),
                 recovery_command.identity(),
-                2_000,
+                PROVIDER_TIMEOUT_MS,
             ))
-            .await
-            .map_err(debug_error)?;
+            .await;
+        let acquired = match acquired {
+            Ok(acquired) => acquired,
+            Err(error) => {
+                return Err(submit_fixture_error(
+                    &database.pool,
+                    "priority acquire_submit",
+                    &recovery_lease,
+                    format!("{error:?}"),
+                )
+                .await);
+            }
+        };
         require(
             matches!(acquired, ProviderSubmitAcquire::Dispatch(_)),
             format!("recovery fixture did not elect sending: {acquired:?}"),
+        )?;
+
+        require(
+            matches!(&acquired, ProviderSubmitAcquire::Dispatch(authority)
+                if authority.context().provider_deadline_at_ms() > recovery_lease.executor_lease_expires_at_ms),
+            "recovery provider budget does not cover the executor setup lease",
         )?;
 
         let fresh_work = seed_work_lease(&database.pool, "submit-service-waiting-fresh").await?;
@@ -2230,7 +2250,6 @@ async fn submit_service_prioritizes_expired_recovery_before_fresh_work() -> Test
         let fresh = fresh
             .first()
             .ok_or_else(|| "fresh priority fixture was not prepared".to_owned())?;
-        tokio::time::sleep(Duration::from_millis(130)).await;
 
         let provider = ScriptedFakeProvider::default();
         provider.push_submit(SubmitStep::Pending(PendingOperation::new(
@@ -2244,20 +2263,39 @@ async fn submit_service_prioritizes_expired_recovery_before_fresh_work() -> Test
             None,
         )));
         let journal = tempfile::tempdir().map_err(debug_error)?;
+        let mut config = submit_service_config(PROVIDER_TIMEOUT_MS);
+        config.recovery_lease_ms = 30_000;
         let service = ProviderSubmitService::new(
             executor_store,
             provider_store,
             provider.clone(),
             TestSubmitProjector::default(),
-            submit_service_config(2_000),
+            config,
             journal.path().join("remote-submit"),
         )
         .map_err(debug_error)?;
 
+        sleep_until_database_time(
+            &database.pool,
+            recovery_lease.executor_lease_expires_at_ms + 20,
+        )
+        .await?;
+
         let run = service
             .run_once(&submit_iteration_command("submit-service-priority"))
-            .await
-            .map_err(debug_error)?;
+            .await;
+        let run = match run {
+            Ok(run) => run,
+            Err(error) => {
+                return Err(submit_fixture_error(
+                    &database.pool,
+                    "priority service.run_once",
+                    &recovery_lease,
+                    format!("{error:?}"),
+                )
+                .await);
+            }
+        };
         let fresh_state: String = sqlx::query_scalar(
             "SELECT state FROM executor_executions WHERE executor_execution_id = $1",
         )
@@ -3984,23 +4022,44 @@ async fn submit_recovery_leases_reject_cross_submission_splicing() -> TestResult
         return Ok(());
     };
     let result = async {
+        // Construct both frozen invocations while their executor authority is live.
+        const SETUP_LEASE_MS: i64 = 5_000;
         let store = PostgresProviderTaskStore::new(database.pool.clone());
         let first =
-            seed_running_submission_with_lease(&database.pool, "splice-recovery-a", 250).await?;
+            seed_running_submission_with_lease(&database.pool, "splice-recovery-a", SETUP_LEASE_MS)
+                .await?;
         let second =
-            seed_running_submission_with_lease(&database.pool, "splice-recovery-b", 250).await?;
+            seed_running_submission_with_lease(&database.pool, "splice-recovery-b", SETUP_LEASE_MS)
+                .await?;
         for executor in [&first, &second] {
             let reservation = reservation_request(executor);
-            store
-                .reserve_submit(&reservation)
-                .await
-                .map_err(debug_error)?;
-            store
-                .start_submit(&reservation)
-                .await
-                .map_err(debug_error)?;
+            if let Err(error) = store.reserve_submit(&reservation).await {
+                return Err(submit_fixture_error(
+                    &database.pool,
+                    "splice reserve_submit",
+                    executor,
+                    format!("{error:?}"),
+                )
+                .await);
+            }
+            if let Err(error) = store.start_submit(&reservation).await {
+                return Err(submit_fixture_error(
+                    &database.pool,
+                    "splice start_submit",
+                    executor,
+                    format!("{error:?}"),
+                )
+                .await);
+            }
         }
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        sleep_until_database_time(
+            &database.pool,
+            first
+                .executor_lease_expires_at_ms
+                .max(second.executor_lease_expires_at_ms)
+                + 20,
+        )
+        .await?;
         let scope = claim_scope();
         let first = store
             .claim_submit_recovery(&scope, "splice-recovery", "splice-command-a", 5_000)
@@ -10433,7 +10492,15 @@ async fn seed_running_submission_for_runtime_profile(
         .await
         .map_err(debug_error)?
         .ok_or_else(|| "prepared submission was not claimable".to_string())?;
-    store.start(&lease).await.map_err(debug_error)?;
+    if let Err(error) = store.start(&lease).await {
+        return Err(submit_fixture_error(
+            pool,
+            "seed executor.start",
+            &lease,
+            format!("{error:?}"),
+        )
+        .await);
+    }
     Ok(lease)
 }
 
@@ -11548,6 +11615,45 @@ async fn runtime_lease_count(
     .fetch_one(pool)
     .await
     .map_err(debug_error)
+}
+
+async fn submit_fixture_error(
+    pool: &PgPool,
+    phase: &str,
+    lease: &ExecutorSubmissionLease,
+    error: String,
+) -> String {
+    let snapshot: Result<Option<serde_json::Value>, sqlx::Error> = sqlx::query_scalar(
+        r#"
+        WITH clock AS (
+            SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT AS now_ms
+        )
+        SELECT jsonb_build_object(
+            'database_now_ms', clock.now_ms,
+            'executor_state', execution.state,
+            'executor_owner', execution.executor_owner,
+            'executor_lease_expires_at_ms', execution.lease_expires_at_ms,
+            'executor_expired', execution.lease_expires_at_ms <= clock.now_ms,
+            'submission_state', submission.state,
+            'submit_state', intent.state,
+            'provider_timeout_ms', intent.provider_timeout_ms,
+            'provider_deadline_at_ms', recovery.provider_deadline_at_ms,
+            'recovery_lease_expires_at_ms', recovery.recovery_lease_expires_at_ms,
+            'recovery_expired', recovery.recovery_lease_expires_at_ms <= clock.now_ms
+        )
+        FROM executor_executions execution
+        CROSS JOIN clock
+        JOIN provider_submissions submission USING (executor_execution_id, submission_id)
+        LEFT JOIN provider_remote_submit_intents intent USING (executor_execution_id, submission_id)
+        LEFT JOIN provider_submit_recoveries recovery USING (executor_execution_id, submission_id)
+        WHERE execution.executor_execution_id = $1 AND execution.submission_id = $2
+        "#,
+    )
+    .bind(lease.executor_execution_id)
+    .bind(lease.submission_id)
+    .fetch_optional(pool)
+    .await;
+    format!("{phase}: {error}; lease_snapshot={snapshot:?}")
 }
 
 async fn database_now(pool: &PgPool) -> TestResult<i64> {
