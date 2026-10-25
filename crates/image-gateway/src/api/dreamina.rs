@@ -1289,6 +1289,7 @@ fn image_task(
         ImageResultStatus::Failed { error_code } => {
             task.status = "failed".to_owned();
             task.error = Some(DreaminaTaskError {
+                reason_code: None,
                 message: if error_code.as_deref()
                     == Some("dreamina_compliance_confirmation_required")
                 {
@@ -1302,6 +1303,7 @@ fn image_task(
         ImageResultStatus::Uncertain => {
             task.status = "uncertain".to_owned();
             task.error = Some(DreaminaTaskError {
+                reason_code: None,
                 code: "generation_uncertain".to_owned(),
                 message: VIDEO_UNCERTAIN_MESSAGE.to_owned(),
             });
@@ -1309,6 +1311,7 @@ fn image_task(
         ImageResultStatus::Expired => {
             task.status = "expired".to_owned();
             task.error = Some(DreaminaTaskError {
+                reason_code: None,
                 code: "artifact_expired".to_owned(),
                 message: "The stored image result has expired".to_owned(),
             });
@@ -1396,21 +1399,29 @@ fn video_task(id: Uuid, status: VideoResultStatus) -> DreaminaVideoTask {
         VideoResultStatus::Uncertain {
             model,
             provider_progress,
+            submission_error_code,
             ..
-        } => DreaminaVideoTask {
-            id: id.to_string(),
-            status: "uncertain".to_owned(),
-            stage: None,
-            provider_progress: provider_progress.map(public_provider_progress),
-            cancellation: None,
-            model: Some(model),
-            error: Some(DreaminaTaskError {
-                code: "generation_uncertain".to_owned(),
-                message: VIDEO_UNCERTAIN_MESSAGE.to_owned(),
-            }),
-            content: None,
-            settlement: None,
-        },
+        } => {
+            let diagnostic = submission_uncertainty_diagnostic(submission_error_code.as_deref());
+            DreaminaVideoTask {
+                id: id.to_string(),
+                status: "uncertain".to_owned(),
+                stage: diagnostic.map(|_| "submission_uncertain".to_owned()),
+                provider_progress: provider_progress.map(public_provider_progress),
+                cancellation: None,
+                model: Some(model),
+                error: Some(DreaminaTaskError {
+                    reason_code: diagnostic.map(|(code, _)| code.to_owned()),
+                    code: "generation_uncertain".to_owned(),
+                    message: diagnostic
+                        .map(|(_, message)| message)
+                        .unwrap_or(VIDEO_UNCERTAIN_MESSAGE)
+                        .to_owned(),
+                }),
+                content: None,
+                settlement: None,
+            }
+        }
         VideoResultStatus::Succeeded {
             model,
             duration_ms,
@@ -1464,6 +1475,7 @@ fn video_task(id: Uuid, status: VideoResultStatus) -> DreaminaVideoTask {
                 cancellation: None,
                 model: Some(model),
                 error: Some(DreaminaTaskError {
+                    reason_code: None,
                     code: error_code.unwrap_or_else(|| "generation_failed".to_owned()),
                     message: message.to_owned(),
                 }),
@@ -1477,6 +1489,28 @@ fn video_task(id: Uuid, status: VideoResultStatus) -> DreaminaVideoTask {
         reason: "provider_cancellation_unsupported".to_owned(),
     });
     task
+}
+
+fn submission_uncertainty_diagnostic(code: Option<&str>) -> Option<(&'static str, &'static str)> {
+    match code? {
+        "dreamina_cli_permission_denied" => Some((
+            "dreamina_cli_permission_denied",
+            "Dreamina CLI access was denied for this account. Upstream acceptance is unconfirmed; keep the original task for review and do not resubmit.",
+        )),
+        "provider_submit_timeout" => Some((
+            "provider_submit_timeout",
+            "Dreamina CLI submission timed out before an acceptance receipt was recorded. Upstream acceptance is unconfirmed; do not resubmit.",
+        )),
+        "provider_submit_cli_failed" => Some((
+            "provider_submit_cli_failed",
+            "Dreamina CLI exited without a valid acceptance receipt. Upstream acceptance is unconfirmed; do not resubmit.",
+        )),
+        "provider_submit_deadline" => Some((
+            "provider_submit_deadline",
+            "The Dreamina submission deadline elapsed without a recorded upstream task. Upstream acceptance is unconfirmed; do not resubmit.",
+        )),
+        _ => None,
+    }
 }
 
 fn public_provider_progress(value: VideoProviderProgress) -> DreaminaProviderProgress {
@@ -1706,6 +1740,7 @@ mod tests {
                 stage: crate::settlement::VideoPendingStage::Processing,
             }),
             Some(VideoResultStatus::Uncertain {
+                submission_error_code: None,
                 model: "seedance2.5".to_owned(),
                 duration_ms: 5000,
                 provider_progress: None,
@@ -1781,6 +1816,57 @@ mod tests {
     }
 
     #[test]
+    fn terminal_submit_reasons_preserve_uncertainty_without_releasing_funds() {
+        for code in [
+            "dreamina_cli_permission_denied",
+            "provider_submit_timeout",
+            "provider_submit_cli_failed",
+            "provider_submit_deadline",
+        ] {
+            let task = video_task(
+                Uuid::new_v4(),
+                VideoResultStatus::Uncertain {
+                    model: "seedance2.0fast_vip".to_owned(),
+                    duration_ms: 5000,
+                    provider_progress: None,
+                    submission_error_code: Some(code.to_owned()),
+                },
+            );
+            assert_eq!(task.status, "uncertain");
+            assert_eq!(task.stage.as_deref(), Some("submission_uncertain"));
+            let error = task.error.as_ref().unwrap();
+            assert_eq!(error.code, "generation_uncertain");
+            assert_eq!(error.reason_code.as_deref(), Some(code));
+            assert!(error.message.contains("unconfirmed"));
+            assert_ne!(error.message, VIDEO_UNCERTAIN_MESSAGE);
+            assert!(task.content.is_none());
+            assert!(task.settlement.is_none());
+            assert!(!task.cancellation.as_ref().unwrap().supported);
+        }
+    }
+
+    #[test]
+    fn unknown_submit_reasons_do_not_echo_private_values_or_change_legacy_shape() {
+        let private = "https://example.invalid/private?token=not-public";
+        let task = video_task(
+            Uuid::new_v4(),
+            VideoResultStatus::Uncertain {
+                model: "seedance2.5".to_owned(),
+                duration_ms: 5000,
+                provider_progress: None,
+                submission_error_code: Some(private.to_owned()),
+            },
+        );
+        let value = serde_json::to_value(task).unwrap();
+        assert_eq!(value["status"], "uncertain");
+        assert_eq!(value["error"]["code"], "generation_uncertain");
+        assert_eq!(value["error"]["message"], VIDEO_UNCERTAIN_MESSAGE);
+        assert!(value.get("stage").is_none());
+        assert!(value["error"].get("reason_code").is_none());
+        assert!(!value.to_string().contains(private));
+    }
+
+    #[test]
     fn video_query_distinguishes_uncertain_from_running_without_inventing_a_result() {
         let id = Uuid::new_v4();
         let pending = video_task(
@@ -1799,6 +1885,7 @@ mod tests {
         let uncertain = serde_json::to_value(video_task(
             id,
             VideoResultStatus::Uncertain {
+                submission_error_code: None,
                 model: "seedance2.0fast_vip".to_owned(),
                 duration_ms: 5000,
                 provider_progress: None,
@@ -1908,6 +1995,7 @@ mod tests {
         let task = video_task(
             Uuid::new_v4(),
             VideoResultStatus::Uncertain {
+                submission_error_code: None,
                 model: "seedance2.0fast".to_owned(),
                 duration_ms: 10_000,
                 provider_progress: Some(queue_progress()),

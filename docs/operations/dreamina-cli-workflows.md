@@ -143,6 +143,31 @@ expiry in the current receipt, so no lifetime is promised. A consumer needing
 durable media, such as Blog, should copy the successful result to its own storage
 once and save that durable URL.
 
+### Unconfirmed video submission
+
+A terminal video submission with no recorded upstream task may return
+`status: "uncertain"`, `stage: "submission_uncertain"` and
+`error.code: "generation_uncertain"`. The optional `error.reason_code` gives a
+bounded diagnostic:
+
+| Reason | Observed condition |
+| --- | --- |
+| `dreamina_cli_permission_denied` | The complete CLI exit matched its fixed account-permission refusal. |
+| `provider_submit_timeout` | The CLI process exceeded its execution timeout. |
+| `provider_submit_cli_failed` | The CLI exited without an accepted submission receipt. |
+| `provider_submit_deadline` | Submission recovery exhausted its deadline without a recorded upstream task. |
+
+These diagnostics preserve the original uncertain outcome. They do not prove
+that a generation was never accepted, authorize a refund, or permit another
+submission. Unknown diagnostics retain the existing response shape and generic
+message; raw CLI output, prompts and input addresses are never exposed.
+
+Consumers should stop automatic generation tracking for this explicit terminal
+submission state, retain the original task and frozen quote, and provide a
+manual review action that reads the same task ID. A running task with upstream
+queue progress continues its normal tracking, even beyond a local client
+timeout. An API GET neither starts a generation nor refreshes the CLI.
+
 ### Upstream queue observations and cancellation
 
 Running native image and video responses retain `status: "running"` and may

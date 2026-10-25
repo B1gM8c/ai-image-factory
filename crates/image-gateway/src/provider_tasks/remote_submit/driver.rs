@@ -66,6 +66,12 @@ pub trait GatedCliSubmitCodec: Send + Sync + 'static {
         command: &image_provider_sdk::SingleOutputCommand<Self::Payload>,
         stdout: &[u8],
     ) -> Result<PendingOperation, ProviderFailure>;
+
+    /// Return only a fixed diagnostic code for a complete, nonzero CLI exit.
+    /// The driver always preserves unknown effect and `Never` for this path.
+    fn nonzero_exit_diagnostic(&self, _exit_code: i32, _stderr: &[u8]) -> Option<&'static str> {
+        None
+    }
 }
 
 pub struct GatedCliSubmitDriver<C> {
@@ -354,6 +360,16 @@ where
                 signal: None,
             }
         ) {
+            if let Some(code) = nonzero_exit_diagnostic(
+                self.codec.as_ref(),
+                terminal.outcome(),
+                terminal.stdout(),
+                terminal.stdout_truncated(),
+                terminal.stderr(),
+                terminal.stderr_truncated(),
+            ) {
+                return ProviderSubmitDriverRecovery::Failed(unknown_process_failure(code));
+            }
             return ProviderSubmitDriverRecovery::Failed(unknown_terminal_failure(&terminal));
         }
         let codec = Arc::clone(&self.codec);
@@ -692,6 +708,26 @@ fn unknown_terminal_failure(terminal: &GatedCliProcessTerminal) -> ProviderFailu
     unknown_process_failure(code)
 }
 
+fn nonzero_exit_diagnostic<C: GatedCliSubmitCodec>(
+    codec: &C,
+    outcome: &GatedCliProcessOutcome,
+    stdout: &[u8],
+    stdout_truncated: bool,
+    stderr: &[u8],
+    stderr_truncated: bool,
+) -> Option<&'static str> {
+    if !stdout.is_empty() || stdout_truncated || stderr_truncated {
+        return None;
+    }
+    match outcome {
+        GatedCliProcessOutcome::Exited {
+            exit_code: Some(code),
+            signal: None,
+        } if *code != 0 => codec.nonzero_exit_diagnostic(*code, stderr),
+        _ => None,
+    }
+}
+
 fn local_process_failure(code: &str) -> ProviderFailure {
     ProviderFailure::new(
         ProviderFailureClass::Permanent,
@@ -733,3 +769,7 @@ fn unix_time_ms() -> u64 {
         .unwrap_or_default()
         .as_millis() as u64
 }
+
+#[cfg(test)]
+#[path = "driver_tests.rs"]
+mod tests;
