@@ -1353,6 +1353,83 @@ fn receipt_retains_only_safe_structured_upstream_failure_metadata() {
 }
 
 #[test]
+fn receipt_keeps_wrapped_http_failure_metadata_without_private_content() {
+    let fixture = PolicyFixture::new();
+    let request =
+        GrokImageGenerationRequestV1::new("prompt", ImageModel::Quality, ImageAspectRatio::Auto)
+            .unwrap();
+    let (_, invocation) = fixture
+        .policy
+        .command_spec_in(&request.into(), SESSION_ID, fixture.workspace.clone())
+        .unwrap();
+    let assistant = json!({"type":"assistant", "tool_calls":[{
+        "id":"tool-call-1", "name":invocation.tool().name(),
+        "arguments":serde_json::to_string(invocation.expected_arguments()).unwrap()
+    }]});
+    for (detail, status, code, error_type) in [
+        (
+            r#"Video generation failed with HTTP 401 Unauthorized: {"error":{"code":"invalid_api_key","type":"authentication_error","message":"private-token https://secret.invalid/input"}}"#,
+            Some(401),
+            Some("invalid_api_key"),
+            Some("authentication_error"),
+        ),
+        (
+            r#"Video generation failed with HTTP 429 Too Many Requests: {"error":{"code":"rate_limit_exceeded","type":"rate_limit_error","message":"private-token"}}"#,
+            Some(429),
+            Some("rate_limit_exceeded"),
+            Some("rate_limit_error"),
+        ),
+        (
+            r#"Video generation failed with HTTP 400 Bad Request: {"code":"invalid-argument","error":"private-token"}"#,
+            Some(400),
+            Some("invalid-argument"),
+            None,
+        ),
+        (
+            "Video generation failed with HTTP 502 Bad Gateway: private-token https://secret.invalid/input",
+            Some(502),
+            None,
+            None,
+        ),
+        (
+            r#"Video generation failed with HTTP 400 Bad Request: {"code":"private-token","type":"private-token","message":"private-token"}"#,
+            Some(400),
+            None,
+            None,
+        ),
+        (
+            "private-token mentions HTTP 401 Unauthorized: authentication_error",
+            None,
+            None,
+            None,
+        ),
+        (
+            "Video generation failed with HTTP 200 OK: private-token",
+            None,
+            None,
+            None,
+        ),
+    ] {
+        let result = json!({"type":"tool_result", "tool_call_id":"tool-call-1",
+            "content":format!("Tool `{}` failed: {detail}", invocation.tool().name())});
+        let history = format!("{assistant}\n{result}\n");
+        let error =
+            parse_invocation_receipt(&valid_stdout(), history.as_bytes(), &invocation).unwrap_err();
+        assert_eq!(error.to_string(), "Grok tool execution failed");
+        assert_eq!(error.tool_execution_http_status(), status);
+        let (actual_code, actual_type, digest, bytes) =
+            error.tool_execution_failure_summary().unwrap();
+        assert_eq!(actual_code, code);
+        assert_eq!(actual_type, error_type);
+        assert_eq!(digest.len(), 64);
+        assert!(bytes > 0);
+        let debug = format!("{error:?}");
+        assert!(!debug.contains("private-token"));
+        assert!(!debug.contains("secret.invalid"));
+    }
+}
+
+#[test]
 fn receipt_rejects_duplicate_or_non_terminal_end_events() {
     let fixture = PolicyFixture::new();
     let request =

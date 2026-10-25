@@ -1012,6 +1012,7 @@ impl ReceiptCliPolicy for GrokReceiptPolicy {
                     error.tool_execution_failure_summary()
                 {
                     GrokDiagnosticV1::receipt_tool_failure(
+                        error.tool_execution_http_status(),
                         upstream_code,
                         upstream_type,
                         message_sha256,
