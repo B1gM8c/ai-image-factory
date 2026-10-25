@@ -47,7 +47,7 @@ CODEX_VERSION = '0.153.4'
 SECRET_VALUES = []
 RECOVERY_HOST_FILES = {
     'ops/hooks/' + name for name in
-    ('backup', 'recover', 'verify', 'verify-admin-reader', 'verify-gateway-runtime', 'sync-remote-runner-pins')
+    ('backup', 'recover', 'restore-sql-search-path', 'verify', 'verify-admin-reader', 'verify-gateway-runtime', 'sync-remote-runner-pins')
 } | {
     'ops/systemd/' + PREFIX + name for name in
     ('updater.service', 'updater-recover@.service', 'recovery-gate.service')
@@ -907,7 +907,7 @@ def prepare_recovery_host_files(candidate_bundle, candidate, environment, instal
             previous[name] = {'existed': True, 'sha256': digest(destination),
                               'backup': str(destination), 'mode': source.stat().st_mode & 0o777}
         else:
-            require(name in ('ops/hooks/verify-admin-reader', 'ops/hooks/sync-remote-runner-pins')
+            require(name in ('ops/hooks/verify-admin-reader', 'ops/hooks/sync-remote-runner-pins', 'ops/hooks/restore-sql-search-path')
                     and not (LIB / name.removeprefix('ops/')).exists(),
                     'unexpected missing baseline recovery file')
             previous[name] = {'existed': False}
@@ -915,7 +915,7 @@ def prepare_recovery_host_files(candidate_bundle, candidate, environment, instal
     prepared = install_host_files(candidate_bundle, candidate, RECOVERY_HOST_FILES)
     for name in ('bin/updated', 'ops/hooks/quiesce', 'ops/hooks/start-processes'):
         require(digest(Path(installed[name]['destination'])) == installed[name]['sha256'],
-                'recovery preparation changed a file outside its six-hook/three-unit scope')
+                'recovery preparation changed a file outside its declared hook/unit scope')
     run(['systemctl', 'daemon-reload'])
     return prepared, {'apply_disabled': True, 'updater_stopped': True, 'baseline_shutdown': shutdown,
                       'pending_commands': 0, 'protected_descriptors': 0, 'previous': previous}

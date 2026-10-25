@@ -18,6 +18,8 @@ readonly BACKUP_ROOT="${AIF_BACKUP_ROOT:-/var/lib/ai-image-factory/backups}"
 readonly SERVICE_USER="${AIF_SERVICE_USER:-ai-image-factory}"
 readonly SERVICE_GROUP="${AIF_SERVICE_GROUP:-ai-image-factory}"
 readonly RECOVERY_LEASE_FLOOR_MS=300000
+RESTORE_SQL_SEARCH_PATH_HELPER="$(dirname -- "${BASH_SOURCE[0]}")/restore-sql-search-path"
+readonly RESTORE_SQL_SEARCH_PATH_HELPER
 RESOLVED_BACKUP_ROOT="$(realpath -e "$BACKUP_ROOT")"
 readonly RESOLVED_BACKUP_ROOT
 RECOVERY_DIRECTORY="$(realpath -e "$AIF_UPDATE_BACKUP_TOKEN")"
@@ -90,10 +92,27 @@ validate_database_backup() {
 # Never fabricate owners/ACLs missing from an old backup. Validate the format and
 # command identity before stopping processes or sending destructive SQL to psql.
 validate_database_backup "$RECOVERY_DIRECTORY"
-systemctl stop ai-image-factory-processes.target
-{
-  cat "${RECOVERY_DIRECTORY}/database.sql"
-  cat <<'SQL'
+RESTORE_SQL_DIRECTORY="$(mktemp -d "${RESOLVED_BACKUP_ROOT}/.restore-sql.XXXXXXXX")"
+readonly RESTORE_SQL_DIRECTORY
+readonly EXECUTION_SQL="${RESTORE_SQL_DIRECTORY}/execution.sql"
+cleanup_execution_sql() {
+  rm -rf -- "$RESTORE_SQL_DIRECTORY"
+}
+trap cleanup_execution_sql EXIT
+
+if [[ "$AIF_UPDATE_COMMAND_ID" == "8a540ae6-e6fc-4bd4-bf97-1dfe7a87f4d1" ]]; then
+  # The helper also requires the exact release and literal reviewed image SHA.
+  # The protected backup, its checksums, and its descriptor remain unchanged.
+  "$RESTORE_SQL_SEARCH_PATH_HELPER" legacy \
+    --schema "$GATEWAY_DATABASE_SCHEMA" \
+    --input "${RECOVERY_DIRECTORY}/database.sql" \
+    --output "$EXECUTION_SQL" \
+    --command-id "$AIF_UPDATE_COMMAND_ID" \
+    --release-version "$AIF_UPDATE_RELEASE_VERSION"
+else
+  cat "${RECOVERY_DIRECTORY}/database.sql" >"$EXECUTION_SQL"
+fi
+cat <<'SQL' >>"$EXECUTION_SQL"
 SET search_path TO :"database_schema";
 
 UPDATE platform_update_commands
@@ -126,8 +145,12 @@ SELECT EXISTS(
   DO $aif$ BEGIN RAISE EXCEPTION 'restored database did not contain the claimed update command'; END $aif$;
 \endif
 SQL
-} | psql -X \
+chmod 0600 "$EXECUTION_SQL"
+sync -f "$EXECUTION_SQL"
+systemctl stop ai-image-factory-processes.target
+psql -X \
   --dbname="$DATABASE_URL" \
+  --file="$EXECUTION_SQL" \
   --set=ON_ERROR_STOP=1 \
   --single-transaction \
   --set="database_schema=${GATEWAY_DATABASE_SCHEMA}" \
@@ -136,6 +159,8 @@ SQL
   --set="lease_epoch=${AIF_UPDATE_LEASE_EPOCH}" \
   --set="lease_duration_ms=${AIF_UPDATE_LEASE_DURATION_MS}" \
   --set="recovery_lease_floor_ms=${RECOVERY_LEASE_FLOOR_MS}"
+cleanup_execution_sql
+trap - EXIT
 
 [[ "$GATEWAY_ARTIFACT_ROOT" = /* && "$GATEWAY_ARTIFACT_ROOT" != "/" ]] || {
   printf 'GATEWAY_ARTIFACT_ROOT must be an absolute non-root path\n' >&2

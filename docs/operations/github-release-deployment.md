@@ -435,7 +435,8 @@ Automatic application updates do not overwrite root-owned systemd units or
 hooks. If a release changes `ops/`, review the diff and copy those files through
 a separate privileged maintenance window before enabling application Apply.
 
-For recovery format 2, that window must install the five fixed hooks and three
+For recovery format 2, that window must install the fixed hooks, their SQL
+preparation helper, and the three
 updater/recovery units listed below, **before** testing or enabling Apply. First
 keep Apply disabled, stop the updater daemon, and prove no pending command or
 protected recovery descriptor needs an old-format backup. Keep a recoverable
@@ -448,7 +449,7 @@ Inside that separately approved window (replace the example version):
 
 ```bash
 AIF_VERIFIED_OPS=/opt/ai-image-factory/bootstrap/NEW_SIGNED_VERSION/verified/ops
-for hook in backup recover verify verify-admin-reader verify-gateway-runtime; do
+for hook in backup recover restore-sql-search-path verify verify-admin-reader verify-gateway-runtime; do
   sudo install -o root -g root -m 0755 "$AIF_VERIFIED_OPS/hooks/$hook" \
     "/usr/libexec/ai-image-factory/hooks/$hook"
   sudo sha256sum "$AIF_VERIFIED_OPS/hooks/$hook" \
@@ -468,6 +469,8 @@ sudo /usr/libexec/ai-image-factory/hooks/verify-gateway-runtime
 ```
 
 Every source/destination hook digest must equal its new signed manifest entry.
+Install `restore-sql-search-path` together with `backup` and `recover`; the
+recovery hook prepares its complete private SQL file before starting psql.
 Inspect the effective units, including all drop-ins: no artifact-child bind or
 broad `/var/lib` write allowance may override the exact parent contract. Confirm
 the configured updater hook paths point at these installed files, then restart

@@ -72,7 +72,7 @@ jobs:
           )
           for hook in deploy/hooks/*; do
             case "$hook" in
-              deploy/hooks/verify-media-segments|deploy/hooks/verify-admin-reader|deploy/hooks/retain-storage|deploy/hooks/sync-remote-runner-pins)
+              deploy/hooks/verify-media-segments|deploy/hooks/verify-admin-reader|deploy/hooks/retain-storage|deploy/hooks/sync-remote-runner-pins|deploy/hooks/restore-sql-search-path)
                 python3 -c 'import ast, pathlib, sys; ast.parse(pathlib.Path(sys.argv[1]).read_text())' "$hook"
                 ;;
               *) shell_scripts+=("$hook") ;;
@@ -88,6 +88,7 @@ jobs:
           python3 scripts/test-native-recovery-evidence.py
           python3 scripts/test-candidate-artifacts.py
           PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-remote-runner-pins.py
+          PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-recovery-sql-search-path.py
           PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-installer-manifest.py
           PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-storage-retention.py
           python3 scripts/test-recovery-extension-sql.py

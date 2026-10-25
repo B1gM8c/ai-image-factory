@@ -498,7 +498,7 @@ fi
 cp -aL "${REPO_ROOT}/deploy/hooks/." "${RELEASE_ROOT}/ops/hooks/"
 # Check new builds without retroactively changing the protocol-1 manifest
 # contract used to validate historical signed releases and recovery descriptors.
-for required_hook in backup recover verify verify-admin-reader verify-gateway-runtime sync-remote-runner-pins; do
+for required_hook in backup recover restore-sql-search-path verify verify-admin-reader verify-gateway-runtime sync-remote-runner-pins; do
   [[ -s "${RELEASE_ROOT}/ops/hooks/${required_hook}" ]] \
     || die "packaged release is missing required hook: ${required_hook}"
 done
