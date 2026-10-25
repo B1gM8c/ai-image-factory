@@ -741,12 +741,11 @@ function DetailItem({
 }
 
 export function requestState(item: RequestLogItem): string {
-  if (
-    item.status_code >= 400 ||
-    item.job_state === "failed" ||
-    item.job_state === "uncertain"
-  ) {
+  if (item.status_code >= 400 || item.job_state === "failed") {
     return "failed";
+  }
+  if (item.job_state === "uncertain") {
+    return "uncertain";
   }
   if (
     item.status_code === 202 ||
