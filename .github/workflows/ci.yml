@@ -1,4 +1,4 @@
-name: Dreamina Linux process diagnostics
+name: CI
 
 on:
   workflow_dispatch:
