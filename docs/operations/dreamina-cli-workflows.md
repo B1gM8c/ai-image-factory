@@ -97,16 +97,18 @@ and adds:
 | --- | --- |
 | `additional_images` | Extra, nonbillable physical images from a single-output task; at most nine entries, ordered by `source_index` from 1 without gaps. Each entry contains `b64_json`, lowercase hexadecimal `sha256`, decoded `byte_size` and `mime_type` (`image/png`, `image/jpeg` or `image/webp`). Source zero remains `data[0]`. |
 | `returned_count` | The number of images actually present in `data` plus `additional_images`. |
-| `billable_units` | The original delivered billable output count; extra physical images do not increase it. |
+| `billable_units` | The number of billable primary image slots available in this response (`data` length); extra physical images do not increase it. |
 
 For example, a request for one image that physically returns four has
 `request.generate_num = 1`, `output_counts = {requested: 1, delivered: 1, failed: 0}`,
 one entry in `data`, three entries in `additional_images`, `returned_count = 4`
 and `billable_units = 1`. A real four-output native batch retains four billable
 `data` entries, no extras, `returned_count = 4` and `billable_units = 4`.
-Running, failed, uncertain and expired tasks do not fabricate image data or
-billable result counts. Older successful tasks without saved extras return the
-existing `data` and an empty `additional_images` array.
+Running, failed, uncertain and expired snapshots have `additional_images = []`,
+`returned_count = 0` and `billable_units = 0`; `data` may be omitted. These
+availability counts do not change historical captures or authorize refunds.
+Older successful tasks without saved extras return the existing `data` and an
+empty `additional_images` array.
 
 The complete decoded result, including the primary image, is limited to 256 MiB.
 Extra images are stored before the paid leader can complete and share the

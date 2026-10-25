@@ -8,6 +8,10 @@ struct PhysicalImagesDriver {
 }
 
 impl ProviderPollDriver for PhysicalImagesDriver {
+    fn supports_additional_images(&self) -> bool {
+        true
+    }
+
     fn provider_id(&self) -> &'static str {
         DREAMINA_PROVIDER_ID
     }

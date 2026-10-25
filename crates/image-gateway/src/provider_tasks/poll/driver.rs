@@ -117,6 +117,10 @@ pub struct ProviderPollDriverCallError;
 pub trait ProviderPollDriver: Send + Sync + 'static {
     fn provider_id(&self) -> &'static str;
 
+    fn supports_additional_images(&self) -> bool {
+        false
+    }
+
     fn poll<S: ArtifactSink>(
         &self,
         call: &ProviderPollDriverCall,
