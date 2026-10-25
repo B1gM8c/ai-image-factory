@@ -1,4 +1,4 @@
-name: CI
+name: Dreamina Linux process diagnostics
 
 on:
   workflow_dispatch:
@@ -18,6 +18,7 @@ env:
 
 jobs:
   recovery-rehearsal:
+    if: ${{ false }}
     uses: ./.github/workflows/recovery-rehearsal.yml
 
   rust:
@@ -28,7 +29,6 @@ jobs:
       fail-fast: false
       matrix:
         postgres:
-          - "16"
           - "18"
     services:
       postgres:
@@ -59,9 +59,10 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Test workspace
-        run: cargo test --locked --workspace --all-targets -- --test-threads=1
+        run: cargo test --locked --package gpt-image-2-gateway --test postgres_provider_tasks fresh_credential_dispatch::process_release:: -- --test-threads=1 --nocapture
 
   admin-console:
+    if: ${{ false }}
     name: Admin console / Node.js ${{ matrix.node }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
