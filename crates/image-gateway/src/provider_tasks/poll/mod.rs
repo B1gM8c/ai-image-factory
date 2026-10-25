@@ -1,3 +1,4 @@
+mod additional_images;
 mod batch;
 mod daemon;
 mod driver;
@@ -9,8 +10,8 @@ pub use daemon::{
     ProviderPollDaemonReport, ProviderPollIteration,
 };
 pub use driver::{
-    ProviderNativeBatchArtifactSink, ProviderNativeBatchPollObservation, ProviderPollDriver,
-    ProviderPollDriverCall,
+    ProviderAdditionalImageArtifactSink, ProviderNativeBatchArtifactSink,
+    ProviderNativeBatchPollObservation, ProviderPollDriver, ProviderPollDriverCall,
 };
 pub use orchestrator::{
     ProviderPollOrchestrator, ProviderPollOrchestratorConfig, ProviderPollOrchestratorError,

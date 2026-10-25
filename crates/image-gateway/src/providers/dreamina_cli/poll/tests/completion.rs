@@ -17,11 +17,39 @@ fn image_receipt(count: usize, stringify: bool) -> String {
     .to_string()
 }
 
+fn downloaded_image_receipt(count: usize, stringify: bool) -> String {
+    let mut receipt: serde_json::Value =
+        serde_json::from_str(&image_receipt(count, false)).unwrap();
+    let mut result = receipt["result_json"].take();
+    for (offset, entry) in result["images"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .enumerate()
+    {
+        entry.as_object_mut().unwrap().remove("image_url");
+        // This is receipt metadata only; files are separately opened from the
+        // fresh download directory and checked against the original submit ID.
+        entry["path"] = json!(format!("/private/download/task-1_image_{}.png", offset + 1));
+    }
+    receipt["result_json"] = if stringify {
+        json!(result.to_string())
+    } else {
+        result
+    };
+    receipt.to_string()
+}
+
 #[tokio::test]
-async fn single_request_delivers_only_image_one_from_a_verified_native_result() {
+async fn single_request_streams_every_verified_physical_image_without_resubmission() {
     for count in [1, 4, 10] {
-        for stringify in [false, true] {
-            let receipt = image_receipt(count, stringify);
+        for (stringify, downloaded) in [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let receipt = if downloaded {
+                downloaded_image_receipt(count, stringify)
+            } else {
+                image_receipt(count, stringify)
+            };
             let fixture = Fixture::new(&format!(
                 r#"i=1
 while [ "$i" -le {count} ]; do
@@ -42,15 +70,19 @@ printf '%s' '{receipt}'"#
                 )
                 .unwrap();
             }
-            let mut sink = fixture.sink(Sha256::digest(&sources[0]).into());
+            let mut sink = BatchTestSink {
+                outputs: Vec::new(),
+                finalized: 0,
+                mutate_directory_from: None,
+            };
             let observation = fixture
                 .driver(1024)
-                .poll_operation(&fixture.operation(), false, &mut sink)
+                .poll_image_results(&fixture.operation(), false, &mut sink)
                 .await
                 .unwrap();
             assert!(matches!(observation, PollObservation::Completed(_)));
-            assert_eq!(sink.bytes(), sources[0]);
-            assert_eq!(sink.finalize_count(), 1);
+            assert_eq!(sink.outputs, sources);
+            assert_eq!(sink.finalized, count);
             fixture.assert_queries_used_original_submit_id(1);
             fixture.assert_workspace_has_no_attempts();
         }
@@ -63,6 +95,10 @@ async fn extra_images_require_complete_matching_metadata_and_canonical_names() {
         .map(|index| format!("task-1_image_{index}.png"))
         .collect::<Vec<_>>();
     let cases = [
+        (
+            image_receipt(4, true),
+            vec!["task-1_image_1.png".to_owned()],
+        ),
         (image_receipt(3, true), canonical.clone()),
         (image_receipt(5, true), canonical.clone()),
         (
@@ -212,7 +248,7 @@ printf '%s' '{receipt}'"#
     };
     let failure = fixture
         .driver(1024)
-        .poll_operation(&fixture.operation(), false, &mut sink)
+        .poll_image_results(&fixture.operation(), false, &mut sink)
         .await
         .unwrap_err();
     assert_eq!(failure.code(), "dreamina_poll_artifact_invalid");
@@ -224,6 +260,13 @@ printf '%s' '{receipt}'"#
 struct ReplacingSiblingSink {
     sink: RecordingArtifactSink,
     directory_marker: PathBuf,
+}
+
+impl ProviderAdditionalImageArtifactSink for ReplacingSiblingSink {
+    fn select_image(&mut self, source_index: usize) -> Result<(), ArtifactSinkError> {
+        assert_eq!(source_index, 0);
+        Ok(())
+    }
 }
 
 impl ArtifactSink for ReplacingSiblingSink {
@@ -264,6 +307,96 @@ async fn string_video_result_preserves_the_original_url_without_a_download() {
     assert_eq!(completed.result().video_url(), url);
     assert!(sink.bytes().is_empty());
     assert_eq!(sink.finalize_count(), 0);
+    fixture.assert_queries_used_original_submit_id(1);
+    fixture.assert_workspace_has_no_attempts();
+}
+
+#[tokio::test]
+async fn legacy_single_sink_rejects_additional_images_before_writing_bytes() {
+    let receipt = image_receipt(4, false);
+    let fixture = Fixture::new(&format!(
+        r#"i=1
+while [ "$i" -le 4 ]; do
+  /bin/cp "$HOME/source.png" "$download/${{submit}}_image_$i.png"
+  i=$((i + 1))
+done
+printf '%s' '{receipt}'"#
+    ));
+    fs::write(
+        fixture.account_home.join("source.png"),
+        png_bytes([1, 2, 3, 255]),
+    )
+    .unwrap();
+    let mut sink = fixture.sink([0; 32]);
+    let failure = fixture
+        .driver(1024)
+        .poll_operation(&fixture.operation(), false, &mut sink)
+        .await
+        .unwrap_err();
+    assert_eq!(failure.code(), "dreamina_additional_image_sink_required");
+    assert!(sink.bytes().is_empty());
+    assert_eq!(sink.finalize_count(), 0);
+    fixture.assert_queries_used_original_submit_id(1);
+    fixture.assert_workspace_has_no_attempts();
+}
+
+#[tokio::test]
+async fn malformed_present_metadata_never_downgrades_a_multi_result_to_a_legacy_single_file() {
+    let mut multi: serde_json::Value = serde_json::from_str(&image_receipt(4, false)).unwrap();
+    multi["result_json"]["images"][3]["height"] = json!(0);
+    let malformed_multi = multi["result_json"].take();
+    for result in [
+        json!(null),
+        json!(false),
+        json!(7),
+        json!("{broken"),
+        json!({}),
+        malformed_multi,
+    ] {
+        let receipt = json!({"submit_id":"task-1","gen_status":"success","result_json":result});
+        let fixture = Fixture::new(&format!(
+            r#"/bin/cp "$HOME/source.png" "$download/${{submit}}_image_1.png"
+printf '%s' '{receipt}'"#
+        ));
+        fs::write(
+            fixture.account_home.join("source.png"),
+            png_bytes([1, 2, 3, 255]),
+        )
+        .unwrap();
+        let mut sink = BatchTestSink {
+            outputs: Vec::new(),
+            finalized: 0,
+            mutate_directory_from: None,
+        };
+        let failure = fixture
+            .driver(1024)
+            .poll_image_results(&fixture.operation(), false, &mut sink)
+            .await
+            .unwrap_err();
+        assert_eq!(failure.code(), "dreamina_poll_artifact_invalid");
+        assert!(sink.outputs.is_empty());
+        assert_eq!(sink.finalized, 0);
+        fixture.assert_queries_used_original_submit_id(1);
+        fixture.assert_workspace_has_no_attempts();
+    }
+
+    let fixture = Fixture::new(
+        r#"/bin/cp "$HOME/source.png" "$download/legacy.png"
+printf '{"submit_id":"%s","gen_status":"success"}' "$submit""#,
+    );
+    let bytes = png_bytes([1, 2, 3, 255]);
+    fs::write(fixture.account_home.join("source.png"), &bytes).unwrap();
+    let mut sink = fixture.sink(Sha256::digest(&bytes).into());
+    assert!(matches!(
+        fixture
+            .driver(1024)
+            .poll_operation(&fixture.operation(), false, &mut sink)
+            .await
+            .unwrap(),
+        PollObservation::Completed(_)
+    ));
+    assert_eq!(sink.bytes(), bytes);
+    assert_eq!(sink.finalize_count(), 1);
     fixture.assert_queries_used_original_submit_id(1);
     fixture.assert_workspace_has_no_attempts();
 }

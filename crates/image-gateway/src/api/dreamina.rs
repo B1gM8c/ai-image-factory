@@ -979,6 +979,144 @@ pub(super) async fn get_image(
     .await
 }
 
+#[derive(Serialize)]
+struct DreaminaCompleteImageTask {
+    #[serde(flatten)]
+    task: DreaminaImageTask,
+    additional_images: Vec<DreaminaAdditionalImage>,
+    returned_count: usize,
+    billable_units: usize,
+}
+
+#[derive(Serialize)]
+struct DreaminaAdditionalImage {
+    source_index: usize,
+    b64_json: String,
+    sha256: String,
+    byte_size: u64,
+    mime_type: String,
+}
+
+pub(super) async fn get_image_results(
+    Path(task_id): Path<String>,
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+) -> Result<Response, ImageGatewayError> {
+    let auth = authenticate_image_request(&headers, &state).await?;
+    auth.require_api_key_capability(ApiKeyCapability::ImagesRead)?;
+    let job_id = parse_uuid(&task_id)?;
+    state
+        .settlement_store
+        .validate_complete_image_result_budget(
+            &auth.tenant_id,
+            &auth.project_id,
+            auth.actor_user_id,
+            job_id,
+        )
+        .await?;
+    let projection = state
+        .settlement_store
+        .project_image_status(
+            &auth.tenant_id,
+            &auth.project_id,
+            auth.actor_user_id,
+            job_id,
+        )
+        .await?
+        .ok_or_else(image_task_not_found)?;
+    let (task, usage) = image_task(job_id, projection)?;
+    let additional = if task.status == "succeeded" {
+        state
+            .settlement_store
+            .project_additional_image_results(
+                &auth.tenant_id,
+                &auth.project_id,
+                auth.actor_user_id,
+                job_id,
+            )
+            .await?
+    } else {
+        Vec::new()
+    };
+    let complete = complete_image_task(task, additional)?;
+    let mut response = Json(complete).into_response();
+    if let Some(usage) = usage {
+        super::responses::add_usage_headers(response.headers_mut(), &usage, &auth);
+    }
+    Ok(response)
+}
+
+fn complete_image_byte_total(total: u64, next: u64) -> Result<u64, ImageGatewayError> {
+    total
+        .checked_add(next)
+        .filter(|value| *value <= crate::artifacts::MAX_ARTIFACT_BYTES)
+        .ok_or_else(ImageGatewayError::artifact_integrity)
+}
+
+fn complete_image_decoded_size(encoded: &str) -> Result<u64, ImageGatewayError> {
+    // These primary payloads were just encoded from integrity-checked server blobs.
+    // Count canonical base64 padding without decoding or copying the image again.
+    if encoded.is_empty() || !encoded.len().is_multiple_of(4) {
+        return Err(ImageGatewayError::artifact_integrity());
+    }
+    let padding = if encoded.ends_with("==") {
+        2
+    } else {
+        usize::from(encoded.ends_with('='))
+    };
+    let size = (encoded.len() / 4)
+        .checked_mul(3)
+        .and_then(|value| value.checked_sub(padding))
+        .and_then(|value| u64::try_from(value).ok())
+        .ok_or_else(ImageGatewayError::artifact_integrity)?;
+    Ok(size)
+}
+
+fn complete_image_task(
+    task: DreaminaImageTask,
+    additional: Vec<crate::settlement::AdditionalImageResult>,
+) -> Result<DreaminaCompleteImageTask, ImageGatewayError> {
+    use base64::Engine as _;
+    let billable_units = task.data.as_ref().map_or(0, Vec::len);
+    if !additional.is_empty() && (task.status != "succeeded" || billable_units != 1)
+        || additional.len() > 9
+    {
+        return Err(ImageGatewayError::artifact_integrity());
+    }
+    let mut total_bytes = 0_u64;
+    for image in task.data.as_deref().unwrap_or_default() {
+        total_bytes =
+            complete_image_byte_total(total_bytes, complete_image_decoded_size(&image.b64_json)?)?;
+    }
+    let mut additional_images = Vec::with_capacity(additional.len());
+    for (offset, image) in additional.into_iter().enumerate() {
+        if image.source_index != offset + 1
+            || image.bytes.len() as u64 != image.byte_size
+            || hex::encode(Sha256::digest(&image.bytes)) != image.sha256
+            || !matches!(
+                image.mime_type.as_str(),
+                "image/png" | "image/jpeg" | "image/webp"
+            )
+        {
+            return Err(ImageGatewayError::artifact_integrity());
+        }
+        total_bytes = complete_image_byte_total(total_bytes, image.byte_size)?;
+        additional_images.push(DreaminaAdditionalImage {
+            source_index: image.source_index,
+            b64_json: base64::engine::general_purpose::STANDARD.encode(image.bytes),
+            sha256: image.sha256,
+            byte_size: image.byte_size,
+            mime_type: image.mime_type,
+        });
+    }
+    Ok(DreaminaCompleteImageTask {
+        returned_count: billable_units + additional_images.len(),
+        billable_units,
+        task,
+        additional_images,
+    })
+}
+
 #[derive(Default, Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum ImageLookupOperation {
@@ -1964,3 +2102,7 @@ mod tests {
 #[cfg(test)]
 #[path = "dreamina/image_tasks_tests.rs"]
 mod image_tasks_tests;
+
+#[cfg(test)]
+#[path = "dreamina/complete_image_tasks_tests.rs"]
+mod complete_image_tasks_tests;

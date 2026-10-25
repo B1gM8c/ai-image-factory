@@ -37,7 +37,7 @@ use crate::{
 };
 
 #[derive(Clone, Default)]
-struct TestStagerFactory {
+pub(super) struct TestStagerFactory {
     begins: Arc<AtomicUsize>,
 }
 
@@ -50,13 +50,13 @@ impl ProviderArtifactStagerFactory for TestStagerFactory {
     ) -> Result<Self::Stager, ArtifactSinkError> {
         self.begins.fetch_add(1, Ordering::SeqCst);
         Ok(TestStager {
-            executor_execution_id: context.executor_execution_id(),
+            executor_execution_id: context.artifact_id(),
             bytes: Vec::new(),
         })
     }
 }
 
-struct TestStager {
+pub(super) struct TestStager {
     executor_execution_id: Uuid,
     bytes: Vec<u8>,
 }
@@ -110,6 +110,10 @@ struct FakeStoreState {
     observations: Vec<ProviderTaskObservation>,
     native_members: Option<Vec<NativeBatchMember>>,
     fail_native_publish_once: Option<i32>,
+    additional_images: Option<Vec<(usize, ProviderArtifactAuthority)>>,
+    fail_additional_publish_once: bool,
+    fail_primary_publish_once: bool,
+    saved_primary: Option<ProviderArtifactPublication>,
 }
 
 #[derive(Clone, Default)]
@@ -171,6 +175,36 @@ impl ProviderPollStore for FakeStore {
         Ok(publication)
     }
 
+    async fn prepare_additional_image_artifacts(
+        &self,
+        _lease: &ProviderTaskLease,
+    ) -> Result<(), ProviderTaskStoreError> {
+        self.state.lock().unwrap().actions.push("prepare-extras");
+        Ok(())
+    }
+
+    async fn publish_additional_image_artifacts(
+        &self,
+        _lease: &ProviderTaskLease,
+        authorities: &[(usize, ProviderArtifactAuthority)],
+    ) -> Result<(), ProviderTaskStoreError> {
+        let mut state = self.state.lock().unwrap();
+        if state.fail_additional_publish_once {
+            state.fail_additional_publish_once = false;
+            return Err(ProviderTaskStoreError::Unavailable);
+        }
+        if state
+            .additional_images
+            .as_ref()
+            .is_some_and(|existing| existing != authorities)
+        {
+            return Err(ProviderTaskStoreError::Conflict);
+        }
+        state.additional_images = Some(authorities.to_vec());
+        state.actions.push("publish-extras");
+        Ok(())
+    }
+
     async fn record_native_batch_failure(
         &self,
         _lease: &ProviderTaskLease,
@@ -221,8 +255,13 @@ impl ProviderPollStore for FakeStore {
         }) {
             return Err(ProviderTaskStoreError::Conflict);
         }
+        if state.fail_primary_publish_once {
+            state.fail_primary_publish_once = false;
+            return Err(ProviderTaskStoreError::Unavailable);
+        }
         state.actions.push("publish");
         let publication = publication(lease, authority);
+        state.saved_primary = Some(publication.clone());
         if let Some(members) = state.native_members.as_mut() {
             members[0].committed_artifact = Some(publication.clone());
         }
@@ -1274,3 +1313,5 @@ fn sink_failure(error: ArtifactSinkError) -> image_provider_sdk::ProviderFailure
     )
     .unwrap()
 }
+
+mod additional_images;

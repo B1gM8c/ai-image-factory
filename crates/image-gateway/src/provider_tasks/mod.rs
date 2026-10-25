@@ -29,12 +29,13 @@ pub use capacity::{
     ProviderCapacityReconciliationStore, ProviderCapacityTerminalState,
 };
 pub use poll::{
-    ProviderArtifactSinkContractError, ProviderArtifactStageContext, ProviderArtifactStager,
-    ProviderArtifactStagerFactory, ProviderNativeBatchArtifactSink,
-    ProviderNativeBatchPollObservation, ProviderPollDaemon, ProviderPollDaemonConfig,
-    ProviderPollDaemonError, ProviderPollDaemonReport, ProviderPollDriver, ProviderPollDriverCall,
-    ProviderPollIteration, ProviderPollOrchestrator, ProviderPollOrchestratorConfig,
-    ProviderPollOrchestratorError, ProviderPollRun, ProviderPollStore, StagedProviderArtifact,
+    ProviderAdditionalImageArtifactSink, ProviderArtifactSinkContractError,
+    ProviderArtifactStageContext, ProviderArtifactStager, ProviderArtifactStagerFactory,
+    ProviderNativeBatchArtifactSink, ProviderNativeBatchPollObservation, ProviderPollDaemon,
+    ProviderPollDaemonConfig, ProviderPollDaemonError, ProviderPollDaemonReport,
+    ProviderPollDriver, ProviderPollDriverCall, ProviderPollIteration, ProviderPollOrchestrator,
+    ProviderPollOrchestratorConfig, ProviderPollOrchestratorError, ProviderPollRun,
+    ProviderPollStore, StagedProviderArtifact,
 };
 pub use postgres::PostgresProviderTaskStore;
 pub use readiness::{
@@ -63,6 +64,25 @@ pub use submit::{
     ProviderSubmitRun, ProviderSubmitSchedulingStore, ProviderSubmitService,
     ProviderSubmitServiceConfig, ProviderSubmitServiceError, ProviderSubmitWork,
 };
+
+/// Stable storage identity for a nonbillable image returned alongside source zero.
+/// This is deliberately outside executor result manifests and billing output slots.
+pub fn additional_image_artifact_id(execution_id: Uuid, source_index: usize) -> Option<Uuid> {
+    use sha2::{Digest, Sha256};
+    if execution_id.is_nil() || !(1..=9).contains(&source_index) {
+        return None;
+    }
+    let mut digest = Sha256::new();
+    digest.update(b"dreamina-additional-image-v1\0");
+    digest.update(execution_id.as_bytes());
+    digest.update([source_index as u8]);
+    let hash = digest.finalize();
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&hash[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x80;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Some(Uuid::from_bytes(bytes))
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProviderTaskState {
@@ -817,6 +837,25 @@ pub trait ProviderTaskStore: Send + Sync + 'static {
         lease: &ProviderTaskLease,
         authority: &ProviderArtifactAuthority,
     ) -> Result<ProviderArtifactPublication, ProviderTaskStoreError>;
+
+    async fn prepare_additional_image_artifacts(
+        &self,
+        _lease: &ProviderTaskLease,
+    ) -> Result<(), ProviderTaskStoreError> {
+        Ok(())
+    }
+
+    async fn publish_additional_image_artifacts(
+        &self,
+        _lease: &ProviderTaskLease,
+        authorities: &[(usize, ProviderArtifactAuthority)],
+    ) -> Result<(), ProviderTaskStoreError> {
+        if authorities.is_empty() {
+            Ok(())
+        } else {
+            Err(ProviderTaskStoreError::InvalidInput)
+        }
+    }
 
     async fn native_batch_members(
         &self,

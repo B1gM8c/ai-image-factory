@@ -3,8 +3,8 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use super::{
-    ArtifactRetentionClaim, ArtifactRetentionLease, ArtifactRetentionStore, RetainedArtifactPair,
-    RetainedExecutorArtifact,
+    AdditionalArtifactRetentionLease, ArtifactRetentionClaim, ArtifactRetentionLease,
+    ArtifactRetentionStore, RetainedArtifactPair, RetainedExecutorArtifact,
 };
 use crate::{
     ImageGatewayError,
@@ -42,6 +42,18 @@ struct RetainedArtifactRow {
     authority_object_key: Option<String>,
     authority_sha256_hex: Option<String>,
     authority_byte_size: Option<i64>,
+}
+
+#[derive(sqlx::FromRow)]
+struct AdditionalRetainedRow {
+    source_index: i32,
+    artifact_id: Uuid,
+    executor_execution_id: Uuid,
+    storage_backend: String,
+    storage_namespace: String,
+    object_key: String,
+    sha256_hex: String,
+    byte_size: i64,
 }
 
 #[async_trait]
@@ -186,6 +198,122 @@ impl ArtifactRetentionStore for PostgresArtifactRetentionStore {
                 artifacts,
             },
         )))
+    }
+
+    async fn claim_additional_images(
+        &self,
+        owner: &str,
+        lease_ms: u64,
+    ) -> Result<Option<AdditionalArtifactRetentionLease>, ImageGatewayError> {
+        if owner.is_empty() || owner.len() > 255 || owner.chars().any(char::is_control) {
+            return Err(ImageGatewayError::internal(
+                "artifact retention owner is invalid",
+            ));
+        }
+        let lease_ms = i64::try_from(lease_ms)
+            .ok()
+            .filter(|value| *value > 0)
+            .ok_or_else(|| ImageGatewayError::internal("artifact retention lease is invalid"))?;
+        let mut tx = self.pool.begin().await.map_err(retention_unavailable)?;
+        let claimed: Option<(Uuid, i32)> = sqlx::query_as(
+            r#"SELECT result_set.submission_id, result_set.returned_count
+               FROM dreamina_image_result_sets result_set
+               LEFT JOIN job_artifact_retention retention USING (job_id)
+               WHERE ((result_set.cleanup_state = 'available'
+                       AND result_set.retry_after_ms <= floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT)
+                      OR (result_set.cleanup_state = 'deleting'
+                          AND result_set.cleanup_lease_expires_at_ms <= floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT))
+                 AND ((retention.job_id IS NOT NULL
+                       AND retention.expires_at_ms + retention.read_drain_ms <= floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT)
+                      OR (retention.job_id IS NULL
+                          AND result_set.cleanup_after_ms <= floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT
+                          AND NOT EXISTS (SELECT 1 FROM executor_artifact_authorities primary_authority
+                                          WHERE primary_authority.submission_id = result_set.submission_id
+                                            AND primary_authority.executor_execution_id = result_set.executor_execution_id)
+                          AND NOT EXISTS (SELECT 1 FROM executor_result_manifests primary_manifest
+                                          WHERE primary_manifest.submission_id = result_set.submission_id
+                                            AND primary_manifest.executor_execution_id = result_set.executor_execution_id)))
+               ORDER BY result_set.cleanup_after_ms, result_set.submission_id
+               FOR UPDATE OF result_set SKIP LOCKED LIMIT 1"#,
+        ).fetch_optional(&mut *tx).await.map_err(retention_unavailable)?;
+        let Some((submission_id, returned_count)) = claimed else {
+            tx.commit().await.map_err(retention_unavailable)?;
+            return claim_staged_images(&self.pool, owner, lease_ms).await;
+        };
+        let rows: Vec<AdditionalRetainedRow> = sqlx::query_as(
+            "SELECT source_index, artifact_id, executor_execution_id, storage_backend, storage_namespace, object_key, sha256_hex, byte_size FROM dreamina_image_additional_artifacts WHERE submission_id = $1 ORDER BY source_index",
+        ).bind(submission_id).fetch_all(&mut *tx).await.map_err(retention_unavailable)?;
+        if rows.len() + 1 != returned_count as usize {
+            return Err(ImageGatewayError::artifact_integrity());
+        }
+        let mut artifacts = Vec::with_capacity(rows.len());
+        for (offset, row) in rows.into_iter().enumerate() {
+            let index = offset + 1;
+            if row.source_index != index as i32
+                || Some(row.artifact_id)
+                    != crate::provider_tasks::additional_image_artifact_id(
+                        row.executor_execution_id,
+                        index,
+                    )
+                || row.object_key != crate::artifacts::executor_object_key(row.artifact_id)
+            {
+                return Err(ImageGatewayError::artifact_integrity());
+            }
+            artifacts.push(RetainedExecutorArtifact {
+                authority_id: row.artifact_id,
+                storage_backend: row.storage_backend,
+                storage_namespace: row.storage_namespace,
+                object_key: row.object_key,
+                sha256_hex: row.sha256_hex,
+                byte_size: u64::try_from(row.byte_size)
+                    .map_err(|_| ImageGatewayError::artifact_integrity())?,
+            });
+        }
+        let epoch: i64 = sqlx::query_scalar(
+            "UPDATE dreamina_image_result_sets SET cleanup_state = 'deleting', cleanup_owner = $2, cleanup_epoch = cleanup_epoch + 1, cleanup_lease_expires_at_ms = floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT + $3 WHERE submission_id = $1 RETURNING cleanup_epoch",
+        ).bind(submission_id).bind(owner).bind(lease_ms)
+            .fetch_one(&mut *tx).await.map_err(retention_unavailable)?;
+        tx.commit().await.map_err(retention_unavailable)?;
+        Ok(Some(AdditionalArtifactRetentionLease {
+            submission_id,
+            owner: owner.to_owned(),
+            epoch,
+            artifacts,
+            staged_ids: Vec::new(),
+            stage_intent: false,
+        }))
+    }
+
+    async fn finish_additional_images(
+        &self,
+        lease: &AdditionalArtifactRetentionLease,
+        deleted: bool,
+    ) -> Result<(), ImageGatewayError> {
+        let statement = if lease.stage_intent {
+            r#"UPDATE dreamina_image_stage_intents
+               SET cleanup_state = CASE WHEN $4 THEN 'deleted' ELSE 'available' END,
+                   cleanup_owner = NULL, cleanup_lease_expires_at_ms = NULL,
+                   retry_after_ms = floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT + 60000
+               WHERE submission_id = $1 AND cleanup_state = 'deleting'
+                 AND cleanup_owner = $2 AND cleanup_epoch = $3"#
+        } else {
+            r#"UPDATE dreamina_image_result_sets
+               SET cleanup_state = CASE WHEN $4 THEN 'deleted' ELSE 'available' END,
+                   cleanup_owner = NULL, cleanup_lease_expires_at_ms = NULL,
+                   retry_after_ms = floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT + 60000
+               WHERE submission_id = $1 AND cleanup_state = 'deleting'
+                 AND cleanup_owner = $2 AND cleanup_epoch = $3"#
+        };
+        let affected = sqlx::query(statement)
+            .bind(lease.submission_id)
+            .bind(&lease.owner)
+            .bind(lease.epoch)
+            .bind(deleted)
+            .execute(&self.pool)
+            .await
+            .map_err(retention_unavailable)?
+            .rows_affected();
+        require_fenced_update(affected)
     }
 
     async fn complete(&self, lease: &ArtifactRetentionLease) -> Result<(), ImageGatewayError> {
@@ -336,4 +464,45 @@ fn require_fenced_update(affected: u64) -> Result<(), ImageGatewayError> {
 fn retention_unavailable(error: impl std::fmt::Display) -> ImageGatewayError {
     tracing::error!(error = %error, "artifact retention storage unavailable");
     ImageGatewayError::service_unavailable("artifact retention unavailable")
+}
+
+async fn claim_staged_images(
+    pool: &PgPool,
+    owner: &str,
+    lease_ms: i64,
+) -> Result<Option<AdditionalArtifactRetentionLease>, ImageGatewayError> {
+    let mut tx = pool.begin().await.map_err(retention_unavailable)?;
+    let claimed: Option<(Uuid, Uuid)> = sqlx::query_as(
+        r#"SELECT intent.submission_id, intent.executor_execution_id
+           FROM dreamina_image_stage_intents intent
+           WHERE NOT EXISTS (SELECT 1 FROM dreamina_image_result_sets result_set WHERE result_set.submission_id = intent.submission_id)
+             AND ((intent.cleanup_state = 'available' AND intent.cleanup_after_ms <= floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT
+                  AND intent.retry_after_ms <= floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT)
+              OR (intent.cleanup_state = 'deleting' AND intent.cleanup_lease_expires_at_ms <= floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT)
+             )
+           ORDER BY intent.cleanup_after_ms,intent.submission_id
+           FOR UPDATE OF intent SKIP LOCKED LIMIT 1"#,
+    ).fetch_optional(&mut *tx).await.map_err(retention_unavailable)?;
+    let Some((submission_id, execution_id)) = claimed else {
+        tx.commit().await.map_err(retention_unavailable)?;
+        return Ok(None);
+    };
+    let epoch: i64 = sqlx::query_scalar(
+        "UPDATE dreamina_image_stage_intents SET cleanup_state = 'deleting', cleanup_owner = $2, cleanup_epoch = cleanup_epoch + 1, cleanup_lease_expires_at_ms = floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT + $3 WHERE submission_id = $1 RETURNING cleanup_epoch",
+    ).bind(submission_id).bind(owner).bind(lease_ms).fetch_one(&mut *tx).await.map_err(retention_unavailable)?;
+    let staged_ids = (1..=9)
+        .map(|index| {
+            crate::provider_tasks::additional_image_artifact_id(execution_id, index)
+                .ok_or_else(ImageGatewayError::artifact_integrity)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    tx.commit().await.map_err(retention_unavailable)?;
+    Ok(Some(AdditionalArtifactRetentionLease {
+        submission_id,
+        owner: owner.to_owned(),
+        epoch,
+        artifacts: Vec::new(),
+        staged_ids,
+        stage_intent: true,
+    }))
 }
