@@ -1,4 +1,8 @@
-use std::{env, path::PathBuf};
+use std::{
+    env, fs,
+    os::unix::fs::MetadataExt,
+    path::{Path, PathBuf},
+};
 
 use uuid::Uuid;
 
@@ -6,8 +10,8 @@ use gpt_image_2_gateway::executor::provision_grok_video_v2_execution_profile;
 use gpt_image_2_gateway::{
     BlockedTerminalRequeueError, CodexExecutionProfileProvisioning, CodexProfileProvisioningError,
     DreaminaComplianceRejectionResolutionRequest, DreaminaImageSuccessResolutionRequest,
-    DreaminaVideoSuccessResolutionRequest, ImageGatewayError, PostgresExecutorTerminalStore,
-    PostgresReconciliationStore, codex_auth_file_sha256,
+    DreaminaVideoSuccessResolutionRequest, ImageGatewayError, OperationalCredentialRefresher,
+    PostgresExecutorTerminalStore, PostgresReconciliationStore, codex_auth_file_sha256,
     database::{
         DEFAULT_MAX_CONNECTIONS, connect_pool_with_schema, database_schema_from_env,
         database_url_from_env, run_migrations, verify_migrations,
@@ -69,6 +73,11 @@ enum Command {
     RefreshProviderQuota {
         provider_account_id: Uuid,
     },
+    RefreshCodexCredential {
+        provider_account_id: Uuid,
+        expected_revision: i64,
+        expected_fingerprint_sha256: String,
+    },
     RetryBlockedTerminal {
         submission_id: Uuid,
         repair_revision: String,
@@ -86,7 +95,7 @@ where
 {
     let mut args = args.into_iter();
     let command = args.next().ok_or_else(|| {
-        "missing command: expected `migrate`, `bootstrap-admin`, `provision-codex-profile`, `provision-codex-cli-edit-profile`, `provision-grok-profile`, `provision-grok-video-profile`, `provision-grok-video-v2-profile`, `provision-grok-image-profile-replacement`, `provision-grok-edit-profile-replacement`, `provision-grok-video-profile-replacement`, `reconcile-execution-profile-routes`, `reconcile-dreamina-profiles`, `reconcile-inline-customer-settlement`, `terminalize-unstarted-job`, `cancel-unlaunched-job`, `refresh-provider-quota`, `resolve-dreamina-compliance-rejection`, `resolve-dreamina-image-success`, `resolve-dreamina-video-success`, or `retry-blocked-terminal`"
+        "missing command: expected `migrate`, `bootstrap-admin`, `provision-codex-profile`, `provision-codex-cli-edit-profile`, `provision-grok-profile`, `provision-grok-video-profile`, `provision-grok-video-v2-profile`, `provision-grok-image-profile-replacement`, `provision-grok-edit-profile-replacement`, `provision-grok-video-profile-replacement`, `reconcile-execution-profile-routes`, `reconcile-dreamina-profiles`, `reconcile-inline-customer-settlement`, `terminalize-unstarted-job`, `cancel-unlaunched-job`, `refresh-provider-quota`, `refresh-codex-credential`, `resolve-dreamina-compliance-rejection`, `resolve-dreamina-image-success`, `resolve-dreamina-video-success`, or `retry-blocked-terminal`"
             .to_string()
     })?;
     let command = match command.as_ref() {
@@ -276,6 +285,37 @@ where
                 provider_account_id,
             }
         }
+        "refresh-codex-credential" => {
+            let name = "refresh-codex-credential";
+            let provider_account_id = required_argument(&mut args, name, "provider account id")?
+                .parse::<Uuid>()
+                .ok()
+                .filter(|id| !id.is_nil())
+                .ok_or_else(|| format!("{name} requires a non-nil UUID provider account id"))?;
+            let expected_revision = required_argument(&mut args, name, "expected revision")?
+                .parse::<i64>()
+                .ok()
+                .filter(|revision| *revision > 0)
+                .ok_or_else(|| format!("{name} requires a positive expected revision"))?;
+            let expected_fingerprint_sha256 =
+                required_argument(&mut args, name, "expected fingerprint SHA-256")?;
+            if expected_fingerprint_sha256.len() != 64
+                || !expected_fingerprint_sha256
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+            {
+                return Err(format!("{name} requires a lowercase SHA-256 fingerprint"));
+            }
+            // Never echo an accidentally supplied credential argument.
+            if args.next().is_some() {
+                return Err(format!("{name} accepts exactly three arguments"));
+            }
+            Command::RefreshCodexCredential {
+                provider_account_id,
+                expected_revision,
+                expected_fingerprint_sha256,
+            }
+        }
         "retry-blocked-terminal" => {
             let submission_id =
                 required_argument(&mut args, "retry-blocked-terminal", "submission id")?
@@ -296,7 +336,7 @@ where
         }
         value => {
             return Err(format!(
-                "unknown command `{value}`: expected `migrate`, `bootstrap-admin`, `provision-codex-profile`, `provision-codex-cli-edit-profile`, `provision-grok-profile`, `provision-grok-video-profile`, `provision-grok-video-v2-profile`, `provision-grok-image-profile-replacement`, `provision-grok-edit-profile-replacement`, `provision-grok-video-profile-replacement`, `reconcile-execution-profile-routes`, `reconcile-dreamina-profiles`, `reconcile-inline-customer-settlement`, `terminalize-unstarted-job`, `cancel-unlaunched-job`, `refresh-provider-quota`, `resolve-dreamina-compliance-rejection`, `resolve-dreamina-image-success`, `resolve-dreamina-video-success`, or `retry-blocked-terminal`"
+                "unknown command `{value}`: expected `migrate`, `bootstrap-admin`, `provision-codex-profile`, `provision-codex-cli-edit-profile`, `provision-grok-profile`, `provision-grok-video-profile`, `provision-grok-video-v2-profile`, `provision-grok-image-profile-replacement`, `provision-grok-edit-profile-replacement`, `provision-grok-video-profile-replacement`, `reconcile-execution-profile-routes`, `reconcile-dreamina-profiles`, `reconcile-inline-customer-settlement`, `terminalize-unstarted-job`, `cancel-unlaunched-job`, `refresh-provider-quota`, `refresh-codex-credential`, `resolve-dreamina-compliance-rejection`, `resolve-dreamina-image-success`, `resolve-dreamina-video-success`, or `retry-blocked-terminal`"
             ));
         }
     };
@@ -329,8 +369,11 @@ fn init_tracing() {
 
 #[tokio::main]
 async fn main() -> Result<(), ImageGatewayError> {
-    init_tracing();
     let command = parse_command(env::args().skip(1)).map_err(ImageGatewayError::config)?;
+    // This command emits only its sanitized receipt/error, including storage failures.
+    if !matches!(command, Command::RefreshCodexCredential { .. }) {
+        init_tracing();
+    }
     let provisioning = match &command {
         Command::Migrate | Command::VerifyMigrations => None,
         Command::ProvisionCodexProfile | Command::ProvisionCodexCliEditProfile => {
@@ -360,6 +403,7 @@ async fn main() -> Result<(), ImageGatewayError> {
         | Command::TerminalizeUnstartedJob { .. }
         | Command::CancelUnlaunchedJob { .. }
         | Command::RefreshProviderQuota { .. }
+        | Command::RefreshCodexCredential { .. }
         | Command::RetryBlockedTerminal { .. } => None,
     };
     let database_url = database_url_from_env()?;
@@ -589,6 +633,21 @@ async fn main() -> Result<(), ImageGatewayError> {
                 .await?;
             println!("provider quota and credential refreshed: {provider_account_id}");
         }
+        Command::RefreshCodexCredential {
+            provider_account_id,
+            expected_revision,
+            expected_fingerprint_sha256,
+        } => {
+            verify_migrations(&pool).await?;
+            let receipt = refresh_codex_credential(
+                &pool,
+                provider_account_id,
+                expected_revision,
+                &expected_fingerprint_sha256,
+            )
+            .await?;
+            println!("{receipt}");
+        }
         Command::RetryBlockedTerminal {
             submission_id,
             repair_revision,
@@ -626,6 +685,180 @@ async fn main() -> Result<(), ImageGatewayError> {
                 ));
             }
             println!("administrator bootstrapped");
+        }
+    }
+    Ok(())
+}
+
+#[derive(sqlx::FromRow)]
+struct CodexCredentialHead {
+    provider_id: String,
+    revision: i64,
+    fingerprint_sha256: String,
+    environment_ref: String,
+    account_state: String,
+    environment_state: String,
+    lifecycle_state: String,
+    refresh_strategy: String,
+    material_kind: String,
+}
+
+async fn refresh_codex_credential(
+    pool: &sqlx::PgPool,
+    provider_account_id: Uuid,
+    expected_revision: i64,
+    expected_fingerprint_sha256: &str,
+) -> Result<serde_json::Value, ImageGatewayError> {
+    let current = sqlx::query_as::<_, CodexCredentialHead>(
+        r#"
+        SELECT account.provider_id, head.active_revision AS revision,
+               revision.material_fingerprint_sha256 AS fingerprint_sha256,
+               environment.environment_ref, account.state AS account_state,
+               environment.state AS environment_state, head.lifecycle_state,
+               head.refresh_strategy, revision.material_kind
+        FROM provider_accounts account
+        JOIN provider_account_credential_heads head USING (provider_account_id)
+        JOIN provider_account_credential_revisions revision
+          ON revision.provider_account_id = head.provider_account_id
+         AND revision.revision = head.active_revision
+        JOIN provider_account_environments environment
+          ON environment.provider_account_id = account.provider_account_id
+         AND environment.provider_id = account.provider_id
+        WHERE account.provider_account_id = $1
+        "#,
+    )
+    .bind(provider_account_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|_| ImageGatewayError::service_unavailable("credential storage is unavailable"))?
+    .ok_or_else(|| ImageGatewayError::config("managed credential account is unavailable"))?;
+    if current.provider_id != "openai-codex" {
+        return Err(ImageGatewayError::config(
+            "refresh-codex-credential only accepts openai-codex accounts",
+        ));
+    }
+    let receipt = |result: &str, revision: i64, fingerprint: &str| {
+        serde_json::json!({
+            "result": result,
+            "provider_account_id": provider_account_id,
+            "previous_revision": expected_revision,
+            "previous_fingerprint_sha256": expected_fingerprint_sha256,
+            "current_revision": revision,
+            "current_fingerprint_sha256": fingerprint,
+        })
+    };
+    if current.revision != expected_revision
+        || current.fingerprint_sha256 != expected_fingerprint_sha256
+    {
+        return Ok(receipt(
+            "already_changed",
+            current.revision,
+            &current.fingerprint_sha256,
+        ));
+    }
+    if current.account_state != "enabled"
+        || current.environment_state != "active"
+        || !matches!(
+            current.lifecycle_state.as_str(),
+            "active" | "refresh_due" | "refreshing"
+        )
+        || current.refresh_strategy != "broker_managed"
+        || current.material_kind != "auth_file"
+    {
+        return Err(ImageGatewayError::config(
+            "Codex credential is not eligible for broker refresh",
+        ));
+    }
+    let root = existing_private_directory(&absolute_env_path("GATEWAY_PROVIDER_HOME_ROOT")?)?;
+    let home = existing_private_directory(Path::new(&current.environment_ref))?;
+    if home == root || !home.starts_with(&root) {
+        return Err(ImageGatewayError::config(
+            "Codex credential environment is outside the managed root",
+        ));
+    }
+    let auth = fs::symlink_metadata(home.join("auth.json"))
+        .map_err(|_| ImageGatewayError::config("Codex credential material is unavailable"))?;
+    if !auth.is_file() || auth.uid() != unsafe { libc::geteuid() } || auth.mode() & 0o077 != 0 {
+        return Err(ImageGatewayError::config(
+            "Codex credential material is unsafe",
+        ));
+    }
+    let executable_env = if env::var_os("GATEWAY_MANAGED_CODEX_EXECUTABLE").is_some() {
+        "GATEWAY_MANAGED_CODEX_EXECUTABLE"
+    } else {
+        "EXECUTOR_CODEX_EXECUTABLE"
+    };
+    let executable = existing_trusted_executable(&absolute_env_path(executable_env)?)?;
+    // Construction only: from_env also expires logins and reconciles global routes.
+    let refreshed = PostgresProviderManagementService::new(pool.clone(), root, executable)
+        .refresh_after_authentication_rejection(
+            provider_account_id,
+            expected_revision,
+            expected_fingerprint_sha256,
+        )
+        .await
+        .map_err(|error| match error {
+            gpt_image_2_gateway::CredentialResolveError::ReauthorizationRequired => {
+                ImageGatewayError::service_unavailable("Codex credential requires reauthorization")
+            }
+            _ => ImageGatewayError::service_unavailable("Codex credential refresh failed"),
+        })?;
+    Ok(receipt(
+        "refreshed",
+        refreshed.revision,
+        &refreshed.material_fingerprint_sha256,
+    ))
+}
+
+fn existing_private_directory(path: &Path) -> Result<PathBuf, ImageGatewayError> {
+    let invalid =
+        || ImageGatewayError::config("Codex credential directory is unavailable or unsafe");
+    if !path.is_absolute() {
+        return Err(invalid());
+    }
+    let metadata = fs::symlink_metadata(path).map_err(|_| invalid())?;
+    if !metadata.is_dir()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.mode() & 0o077 != 0
+    {
+        return Err(invalid());
+    }
+    let canonical = path.canonicalize().map_err(|_| invalid())?;
+    validate_trusted_ancestors(path)?;
+    validate_trusted_ancestors(&canonical)?;
+    Ok(canonical)
+}
+
+fn existing_trusted_executable(path: &Path) -> Result<PathBuf, ImageGatewayError> {
+    let invalid = || ImageGatewayError::config("managed Codex executable is unavailable or unsafe");
+    let metadata = fs::symlink_metadata(path).map_err(|_| invalid())?;
+    if !path.is_absolute()
+        || !metadata.is_file()
+        || metadata.mode() & 0o022 != 0
+        || metadata.mode() & 0o111 == 0
+        || ![0, unsafe { libc::geteuid() }].contains(&metadata.uid())
+    {
+        return Err(invalid());
+    }
+    let canonical = path.canonicalize().map_err(|_| invalid())?;
+    validate_trusted_ancestors(path)?;
+    validate_trusted_ancestors(&canonical)?;
+    Ok(canonical)
+}
+
+fn validate_trusted_ancestors(path: &Path) -> Result<(), ImageGatewayError> {
+    let invalid = || ImageGatewayError::config("Codex credential path has an unsafe ancestor");
+    let trusted_owners = [0, unsafe { libc::geteuid() }];
+    for parent in path.ancestors().skip(1) {
+        let entry = fs::symlink_metadata(parent).map_err(|_| invalid())?;
+        let directory = fs::metadata(parent).map_err(|_| invalid())?;
+        if !trusted_owners.contains(&entry.uid())
+            || !trusted_owners.contains(&directory.uid())
+            || !directory.is_dir()
+            // Sticky system temp directories protect their trusted-owned children.
+            || (directory.mode() & 0o022 != 0 && directory.mode() & 0o1000 == 0)
+        {
+            return Err(invalid());
         }
     }
     Ok(())
@@ -981,6 +1214,108 @@ mod tests {
     }
 
     #[test]
+    fn codex_credential_refresh_requires_exact_reviewed_identity() {
+        let account = uuid::Uuid::new_v4();
+        let account_text = account.to_string();
+        let hash = "a".repeat(64);
+        let valid = ["refresh-codex-credential", &account_text, "2", &hash];
+        assert_eq!(
+            parse_command(valid),
+            Ok(Command::RefreshCodexCredential {
+                provider_account_id: account,
+                expected_revision: 2,
+                expected_fingerprint_sha256: hash.clone(),
+            })
+        );
+        for invalid in ["not-a-uuid", "00000000-0000-0000-0000-000000000000"] {
+            let mut args = valid;
+            args[1] = invalid;
+            assert!(parse_command(args).is_err());
+        }
+        for invalid in ["0", "-1", "no", "9223372036854775808"] {
+            let mut args = valid;
+            args[2] = invalid;
+            assert!(parse_command(args).is_err());
+        }
+        for invalid in [
+            "",
+            "short",
+            &"g".repeat(64),
+            &"A".repeat(64),
+            &"a".repeat(65),
+        ] {
+            let mut args = valid;
+            args[3] = invalid;
+            assert!(parse_command(args).is_err());
+        }
+        for len in 1..valid.len() {
+            assert!(parse_command(&valid[..len]).is_err());
+        }
+        let mut extra = valid.to_vec();
+        extra.push("secret-do-not-print");
+        let error = parse_command(extra).unwrap_err();
+        assert!(!error.contains("secret-do-not-print"));
+    }
+
+    #[test]
+    fn codex_credential_directory_validation_never_repairs_permissions_or_symlinks() {
+        use std::{
+            fs,
+            os::unix::fs::{PermissionsExt, symlink},
+        };
+        let directory = tempfile::tempdir().unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(super::existing_private_directory(directory.path()).is_ok());
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(super::existing_private_directory(directory.path()).is_err());
+        assert_eq!(
+            fs::metadata(directory.path()).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        let missing = directory.path().join("missing");
+        assert!(super::existing_private_directory(&missing).is_err());
+        assert!(!missing.exists());
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let link = directory.path().join("link");
+        symlink(directory.path(), &link).unwrap();
+        assert!(super::existing_private_directory(&link).is_err());
+        assert!(super::existing_private_directory(std::path::Path::new("relative")).is_err());
+    }
+
+    #[test]
+    fn codex_credential_paths_reject_unsafe_executables_and_ancestors() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let directory = tempfile::tempdir().unwrap();
+        let parent = directory.path().join("parent");
+        std::fs::create_dir(&parent).unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let executable = parent.join("codex");
+        std::fs::write(&executable, "#!/bin/sh\nexit 0\n").unwrap();
+        for mode in [0o644, 0o777] {
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(mode)).unwrap();
+            assert!(super::existing_trusted_executable(&executable).is_err());
+        }
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(super::existing_trusted_executable(&executable).is_ok());
+        let link = parent.join("codex-link");
+        symlink(&executable, &link).unwrap();
+        assert!(super::existing_trusted_executable(&link).is_err());
+
+        let home = parent.join("home");
+        std::fs::create_dir(&home).unwrap();
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap();
+        for mode in [0o775, 0o777] {
+            std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(mode)).unwrap();
+            assert!(super::existing_trusted_executable(&executable).is_err());
+            assert!(super::existing_private_directory(&home).is_err());
+        }
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o1777)).unwrap();
+        assert!(super::existing_trusted_executable(&executable).is_ok());
+        assert!(super::existing_private_directory(&home).is_ok());
+    }
+
+    #[test]
     fn accepts_only_canonical_conflict_terminal_requeue() {
         let submission_id = uuid::Uuid::new_v4();
         assert_eq!(
@@ -1010,7 +1345,7 @@ mod tests {
     fn rejects_missing_command() {
         assert_eq!(
             parse_command([] as [&str; 0]),
-            Err("missing command: expected `migrate`, `bootstrap-admin`, `provision-codex-profile`, `provision-codex-cli-edit-profile`, `provision-grok-profile`, `provision-grok-video-profile`, `provision-grok-video-v2-profile`, `provision-grok-image-profile-replacement`, `provision-grok-edit-profile-replacement`, `provision-grok-video-profile-replacement`, `reconcile-execution-profile-routes`, `reconcile-dreamina-profiles`, `reconcile-inline-customer-settlement`, `terminalize-unstarted-job`, `cancel-unlaunched-job`, `refresh-provider-quota`, `resolve-dreamina-compliance-rejection`, `resolve-dreamina-image-success`, `resolve-dreamina-video-success`, or `retry-blocked-terminal`".to_string())
+            Err("missing command: expected `migrate`, `bootstrap-admin`, `provision-codex-profile`, `provision-codex-cli-edit-profile`, `provision-grok-profile`, `provision-grok-video-profile`, `provision-grok-video-v2-profile`, `provision-grok-image-profile-replacement`, `provision-grok-edit-profile-replacement`, `provision-grok-video-profile-replacement`, `reconcile-execution-profile-routes`, `reconcile-dreamina-profiles`, `reconcile-inline-customer-settlement`, `terminalize-unstarted-job`, `cancel-unlaunched-job`, `refresh-provider-quota`, `refresh-codex-credential`, `resolve-dreamina-compliance-rejection`, `resolve-dreamina-image-success`, `resolve-dreamina-video-success`, or `retry-blocked-terminal`".to_string())
         );
     }
 
@@ -1019,7 +1354,7 @@ mod tests {
         assert_eq!(
             parse_command(["status"]),
             Err(
-                "unknown command `status`: expected `migrate`, `bootstrap-admin`, `provision-codex-profile`, `provision-codex-cli-edit-profile`, `provision-grok-profile`, `provision-grok-video-profile`, `provision-grok-video-v2-profile`, `provision-grok-image-profile-replacement`, `provision-grok-edit-profile-replacement`, `provision-grok-video-profile-replacement`, `reconcile-execution-profile-routes`, `reconcile-dreamina-profiles`, `reconcile-inline-customer-settlement`, `terminalize-unstarted-job`, `cancel-unlaunched-job`, `refresh-provider-quota`, `resolve-dreamina-compliance-rejection`, `resolve-dreamina-image-success`, `resolve-dreamina-video-success`, or `retry-blocked-terminal`"
+                "unknown command `status`: expected `migrate`, `bootstrap-admin`, `provision-codex-profile`, `provision-codex-cli-edit-profile`, `provision-grok-profile`, `provision-grok-video-profile`, `provision-grok-video-v2-profile`, `provision-grok-image-profile-replacement`, `provision-grok-edit-profile-replacement`, `provision-grok-video-profile-replacement`, `reconcile-execution-profile-routes`, `reconcile-dreamina-profiles`, `reconcile-inline-customer-settlement`, `terminalize-unstarted-job`, `cancel-unlaunched-job`, `refresh-provider-quota`, `refresh-codex-credential`, `resolve-dreamina-compliance-rejection`, `resolve-dreamina-image-success`, `resolve-dreamina-video-success`, or `retry-blocked-terminal`"
                     .to_string()
             )
         );
