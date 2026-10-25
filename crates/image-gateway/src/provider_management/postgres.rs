@@ -1824,6 +1824,39 @@ impl PostgresProviderManagementService {
             .await
     }
 
+    async fn insert_dreamina_login_session(
+        &self,
+        login_session_id: Uuid,
+        account_key: &str,
+        home: &Path,
+        request: &StartProviderLoginRequest,
+        now: i64,
+    ) -> Result<(), sqlx::Error> {
+        let expires_at_ms = now.saturating_add(LOGIN_TTL.as_millis() as i64);
+        sqlx::query(
+            r#"
+            INSERT INTO provider_account_login_sessions
+              (login_session_id, provider_id, account_key, display_name,
+               environment_ref, status, login_method, max_concurrency,
+               provider_account_id, expires_at_ms, created_at_ms, updated_at_ms)
+            VALUES ($1, $2, $3, $4, $5, 'starting', $6, $7, $8, $9, $10, $10)
+            "#,
+        )
+        .bind(login_session_id)
+        .bind(DREAMINA_PROVIDER_ID)
+        .bind(account_key)
+        .bind(request.display_name.trim())
+        .bind(home.to_string_lossy().as_ref())
+        .bind(request.login_method.as_str())
+        .bind(request.max_concurrency)
+        .bind(request.provider_account_id)
+        .bind(expires_at_ms)
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+    }
+
     async fn start_dreamina_login(
         &self,
         request: StartProviderLoginRequest,
@@ -1888,27 +1921,9 @@ impl PostgresProviderManagementService {
             ));
         }
         let now = now_ms()?;
-        let expires_at_ms = now.saturating_add(LOGIN_TTL.as_millis() as i64);
-        let inserted = sqlx::query(
-            r#"
-            INSERT INTO provider_account_login_sessions
-              (login_session_id, provider_id, account_key, display_name,
-               environment_ref, status, login_method, max_concurrency,
-               provider_account_id, expires_at_ms, created_at_ms, updated_at_ms)
-            VALUES ($1, $2, $3, $4, $5, 'starting', $6, $7, NULL, $8, $9, $9)
-            "#,
-        )
-        .bind(login_session_id)
-        .bind(DREAMINA_PROVIDER_ID)
-        .bind(&account_key)
-        .bind(request.display_name.trim())
-        .bind(home.to_string_lossy().as_ref())
-        .bind(request.login_method.as_str())
-        .bind(request.max_concurrency)
-        .bind(expires_at_ms)
-        .bind(now)
-        .execute(&self.pool)
-        .await;
+        let inserted = self
+            .insert_dreamina_login_session(login_session_id, &account_key, &home, &request, now)
+            .await;
         if let Err(error) = inserted {
             let _ = fs::remove_dir_all(&home);
             return Err(map_login_session_insert(error));
@@ -5606,3 +5621,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "postgres/dreamina_login_session_tests.rs"]
+mod dreamina_login_session_tests;
