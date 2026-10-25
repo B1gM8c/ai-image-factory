@@ -1,0 +1,179 @@
+#!/usr/bin/env python3
+"""Preserve the validated application search path in native restore sections.
+
+Section mode reads only the pg_restore prologue; object bodies and COPY data
+remain opaque. Legacy mode is pinned to one reviewed immutable recovery image.
+Neither mode executes SQL or changes its input.
+"""
+import argparse
+import hashlib
+import io
+import os
+from pathlib import Path
+import re
+import shutil
+import stat
+import sys
+
+
+RESET = b"SELECT pg_catalog.set_config('search_path', '', false);\n"
+HEADER = b"-- PostgreSQL database dump\n"
+PROLOGUE_LIMIT = 64 * 1024
+LEGACY_COMMAND = '8a540ae6-e6fc-4bd4-bf97-1dfe7a87f4d1'
+LEGACY_VERSION = 'v0.1.0-20261026.hotfix.26.33d56dc'
+LEGACY_SHA256 = '2f9dbc908b0675ac3c3e49f0a67b5832d34145e3449b92d4629e7df12d27ac01'
+LEGACY_LINES = (49, 17816, 281124)
+LEGACY_LIMIT = 512 * 1024**2
+SETTINGS = {
+    b'SET statement_timeout = 0;\n',
+    b'SET lock_timeout = 0;\n',
+    b'SET idle_in_transaction_session_timeout = 0;\n',
+    b'SET transaction_timeout = 0;\n',
+    b"SET client_encoding = 'UTF8';\n",
+    b'SET standard_conforming_strings = on;\n',
+    b'SET check_function_bodies = false;\n',
+    b'SET xmloption = content;\n',
+    b'SET client_min_messages = warning;\n',
+    b'SET row_security = off;\n',
+    b"SET default_tablespace = '';\n",
+}
+
+
+def require(condition):
+    if not condition:
+        raise ValueError('unsupported or unreviewed restore SQL')
+
+
+def replacement(schema):
+    require(re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]{0,62}', schema))
+    # pg_catalog remains implicitly first; current_schema() must be the app.
+    return ("SELECT pg_catalog.set_config('search_path', '\"" + schema + "\"', false);\n").encode()
+
+
+def section_prologue(source, schema):
+    lines = []
+    size = headers = resets = 0
+    restrict_key = None
+    while True:
+        line = source.readline(PROLOGUE_LIMIT + 1)
+        size += len(line)
+        require(line.endswith(b'\n') and size <= PROLOGUE_LIMIT)
+        if line.startswith((b'-- Name:', b'-- Data for Name:')):
+            require(headers == 1 and resets == 1)
+            return b''.join(lines) + line
+        if line == b'-- PostgreSQL database dump complete\n':
+            # A native post-data section can have no constraints or indexes.
+            require(headers == 1 and resets == 1)
+            footer = source.read(PROLOGUE_LIMIT - size + 1)
+            expected = b'--\n\n'
+            if restrict_key is not None:
+                expected += b'\\unrestrict ' + restrict_key + b'\n\n'
+            require(footer == expected)
+            return b''.join(lines) + line + footer
+        if line == RESET:
+            resets += 1
+            require(resets == 1)
+            lines.append(replacement(schema))
+        else:
+            headers += line == HEADER
+            require(headers <= 1)
+            restriction = re.fullmatch(rb'\\restrict ([A-Za-z0-9]+)\n', line)
+            if restriction:
+                require(restrict_key is None)
+                restrict_key = restriction[1]
+            require(line == b'\n' or line.startswith(b'--') or line in SETTINGS
+                    or restriction)
+            lines.append(line)
+
+
+def legacy_image(source, schema, command_id, release_version):
+    require(command_id == LEGACY_COMMAND and release_version == LEGACY_VERSION)
+    data = source.read(LEGACY_LIMIT + 1)
+    require(0 < len(data) <= LEGACY_LIMIT and hashlib.sha256(data).hexdigest() == LEGACY_SHA256)
+    offsets = []
+    position = 0
+    # Only the three reviewed prologue positions are inspected, never COPY rows.
+    for number, line in enumerate(io.BytesIO(data), 1):
+        if number in LEGACY_LINES:
+            require(line == RESET)
+            offsets.append((position, position + len(line)))
+        position += len(line)
+    require(len(offsets) == 3)
+    return data, offsets, replacement(schema)
+
+
+def open_source(path, private=False):
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        metadata = os.fstat(descriptor)
+        require(stat.S_ISREG(metadata.st_mode) and metadata.st_uid == os.geteuid()
+                and metadata.st_nlink == 1 and not metadata.st_mode & 0o022
+                and (not private or not metadata.st_mode & 0o077))
+        return os.fdopen(descriptor, 'rb')
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def open_destination(path):
+    parent = path.parent.stat()
+    require(stat.S_ISDIR(parent.st_mode) and parent.st_uid == os.geteuid()
+            and not parent.st_mode & 0o077)
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    return os.fdopen(descriptor, 'wb')
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('mode', choices=('section', 'legacy'))
+    parser.add_argument('--schema', required=True)
+    parser.add_argument('--input', type=Path)
+    parser.add_argument('--output', type=Path)
+    parser.add_argument('--command-id')
+    parser.add_argument('--release-version')
+    args = parser.parse_args()
+    replacement(args.schema)
+    if args.mode == 'legacy':
+        require(args.input is not None and args.output is not None)
+    else:
+        require(args.command_id is None and args.release_version is None)
+    source = open_source(args.input, private=args.mode == 'legacy') if args.input else sys.stdin.buffer
+    output = None
+    created = False
+    try:
+        if args.mode == 'legacy':
+            data, offsets, setting = legacy_image(source, args.schema, args.command_id, args.release_version)
+        else:
+            prologue = section_prologue(source, args.schema)
+        output = open_destination(args.output) if args.output else sys.stdout.buffer
+        created = args.output is not None
+        if args.mode == 'legacy':
+            previous = 0
+            for start, end in offsets:
+                output.write(memoryview(data)[previous:start])
+                output.write(setting)
+                previous = end
+            output.write(memoryview(data)[previous:])
+        else:
+            output.write(prologue)
+            shutil.copyfileobj(source, output, 65536)
+        output.flush()
+        if args.output:
+            os.fsync(output.fileno())
+    except Exception:
+        if created:
+            args.output.unlink()
+        raise
+    finally:
+        if source is not sys.stdin.buffer:
+            source.close()
+        if output is not None and output is not sys.stdout.buffer:
+            output.close()
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except Exception:
+        print('restore SQL search-path validation or materialization failed', file=sys.stderr)
+        sys.exit(1)

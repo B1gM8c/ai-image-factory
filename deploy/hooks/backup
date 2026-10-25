@@ -3,6 +3,8 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+RESTORE_SQL_SEARCH_PATH_HELPER="$(dirname -- "${BASH_SOURCE[0]}")/restore-sql-search-path"
+readonly RESTORE_SQL_SEARCH_PATH_HELPER
 
 : "${DATABASE_URL:?DATABASE_URL is required}"
 : "${GATEWAY_DATABASE_SCHEMA:?GATEWAY_DATABASE_SCHEMA is required}"
@@ -256,7 +258,9 @@ SQL
     --file="${directory}/database.dump"
   # One archive supplies every section from the same pg_dump snapshot. Never
   # parse COPY data as SQL metadata when relocating the schema ACL below.
-  pg_restore --section=pre-data --file="${directory}/database.pre.sql" "${directory}/database.dump"
+  pg_restore --section=pre-data --file=- "${directory}/database.dump" \
+    | "$RESTORE_SQL_SEARCH_PATH_HELPER" section --schema "$GATEWAY_DATABASE_SCHEMA" \
+      >"${directory}/database.pre.sql"
   security_after="$(printf 'SET search_path = pg_catalog;\n%s;\n' "$security_query" \
     | psql -X --dbname="$DATABASE_URL" -qAt --set=ON_ERROR_STOP=1 \
       --set="database_schema=${GATEWAY_DATABASE_SCHEMA}")"
@@ -305,8 +309,10 @@ SQL
         }
       }
     ' "${directory}/database.pre.sql" "${directory}/database.pre.sql"
-    pg_restore --section=data --file=- "${directory}/database.dump"
-    pg_restore --section=post-data --file=- "${directory}/database.dump"
+    pg_restore --section=data --file=- "${directory}/database.dump" \
+      | "$RESTORE_SQL_SEARCH_PATH_HELPER" section --schema "$GATEWAY_DATABASE_SCHEMA"
+    pg_restore --section=post-data --file=- "${directory}/database.dump" \
+      | "$RESTORE_SQL_SEARCH_PATH_HELPER" section --schema "$GATEWAY_DATABASE_SCHEMA"
     printf '\nSET search_path = pg_catalog;\n'
     printf "SELECT (%s) = '%s'::jsonb AS recovery_security_matches \\gset\n" \
       "$security_query" "${security_before//\'/\'\'}"

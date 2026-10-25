@@ -168,7 +168,7 @@ RESET ROLE;
             parts = urlsplit(self.test_url)
             url = urlunsplit(parts._replace(netloc=f'{role}:{self.role_password}@{parts.hostname}:{parts.port or 5432}'))
             environment = dict(self.environment(role=role), DATABASE_URL=url, GATEWAY_DATABASE_SCHEMA=schema, PATH=directory + ':' + os.environ['PATH'])
-            result = subprocess.run(['bash', '-c', 'set -euo pipefail\n' + functions + '\nprepare_database_sql "$1"', 'test', directory], env=environment, capture_output=True, text=True, check=False, timeout=60)
+            result = subprocess.run(['bash', '-c', 'set -euo pipefail\nreadonly RESTORE_SQL_SEARCH_PATH_HELPER="$2"\n' + functions + '\nprepare_database_sql "$1"', 'test', directory, str(ROOT / 'deploy/hooks/restore-sql-search-path')], env=environment, capture_output=True, text=True, check=False, timeout=60)
             sql_file = path / 'database.sql'
             return result, sql_file.read_text() if sql_file.exists() else None
 
