@@ -28,6 +28,7 @@ use crate::{
 };
 
 mod evidence;
+mod query_only_evidence;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DreaminaImageSuccessResolutionRequest {
@@ -84,7 +85,7 @@ struct LockedJob {
     remaining_7d: i32,
 }
 
-/// Deliver only source index zero from the reviewed four-image receipt against
+/// Deliver source index zero from an explicitly supported reviewed receipt against
 /// the original one-image quote. All database effects commit in one transaction.
 pub async fn resolve_dreamina_image_success(
     pool: &PgPool,
@@ -104,7 +105,7 @@ pub async fn resolve_dreamina_image_success(
         return Err(conflict());
     }
     let evidence = evidence::load(evidence_root, request)?;
-    let input_sha256 = sha256_hex(&serde_json::to_vec(&json!({
+    let mut input = json!({
         "schema_version": 1, "job_id": request.job_id, "submission_id": request.submission_id,
         "executor_execution_id": request.executor_execution_id, "operator_reference": request.operator_reference,
         "reviewed_stdout_sha256": evidence.stdout_sha256, "execution_audit_sha256": evidence.execution_audit_sha256,
@@ -112,7 +113,21 @@ pub async fn resolve_dreamina_image_success(
         "selected_source_index": 0, "selected_item_id": evidence.selected_item_id,
         "quote_hash": evidence.quote_hash, "command_hash": evidence.provider_command_sha256,
         "remote_operation_id": evidence.remote_operation_id, "storage_identity": blobs.storage_identity()
-    })).map_err(|_| conflict())?);
+    });
+    if evidence.mode == query_only_evidence::MODE {
+        input["schema_version"] = json!(2);
+        input["evidence_mode"] = json!(evidence.mode);
+        input["retrieval_audit_sha256"] = json!(evidence.retrieval_audit_sha256);
+        input["image_url_sha256"] = json!(evidence.image_url_sha256);
+        input["tenant_id"] = json!(evidence.tenant_id);
+        input["auth_attribution"] = json!(evidence.auth_attribution);
+    }
+    let input_sha256 = sha256_hex(&serde_json::to_vec(&input).map_err(|_| conflict())?);
+    let original_error = if evidence.mode == query_only_evidence::MODE {
+        "dreamina_poll_protocol_invalid"
+    } else {
+        "dreamina_poll_artifact_invalid"
+    };
     let mut tx = pool.begin().await.map_err(unavailable)?;
     // READ COMMITTED lets a waiter observe the committed winner after acquiring
     // these locks. The input hash makes its replay exact and conflict explicit.
@@ -188,12 +203,12 @@ pub async fn resolve_dreamina_image_success(
           AND job.provider_id = 'dreamina-cli' AND job.operation = 'generation'
           AND job.output_count = 1 AND job.billable_units = 1 AND job.requested_units = 1
           AND job.economics_contract_version = 4 AND job.state = 'uncertain' AND job.charged_units = 0
-          AND job.last_error_code = 'dreamina_poll_artifact_invalid'
+          AND job.last_error_code = $4
           AND work.state = 'uncertain' AND work.lease_owner IS NULL AND work.lease_expires_at_ms IS NULL
           AND attempt.state = 'uncertain' AND output.state = 'uncertain' AND output.output_index = 0 AND output.billable_units = 1
           AND submission.state = 'uncertain' AND execution.state = 'uncertain'
           AND execution.executor_owner IS NULL AND execution.lease_expires_at_ms IS NULL
-          AND task.state = 'uncertain' AND task.error_code = 'dreamina_poll_artifact_invalid'
+          AND task.state = 'uncertain' AND task.error_code = $4
           AND task.poll_owner IS NULL AND task.poll_lease_expires_at_ms IS NULL
           AND reduction.state = 'completed' AND reduction.resolved_state = 'uncertain'
           AND reduction.customer_artifact_id IS NULL AND receipt.outcome = 'uncertain'
@@ -202,7 +217,7 @@ pub async fn resolve_dreamina_image_success(
           AND hold.state = 'held' AND hold.captured_micros = 0 AND hold.released_micros = 0
         FOR UPDATE OF work, attempt, output, submission, execution, intent, task, reduction, allocation, quota, hold
         "#,
-    ).bind(request.job_id).bind(request.submission_id).bind(request.executor_execution_id)
+    ).bind(request.job_id).bind(request.submission_id).bind(request.executor_execution_id).bind(original_error)
         .fetch_optional(&mut *tx).await.map_err(unavailable)?.ok_or_else(conflict)?;
     let idempotency_rows: Vec<i32> =
         sqlx::query_scalar("SELECT 1 FROM idempotency_requests WHERE job_id = $1 FOR UPDATE")
@@ -226,7 +241,15 @@ pub async fn resolve_dreamina_image_success(
     let DreaminaSubmitRequestV1::TextToImage(ref image) = command else {
         return Err(conflict());
     };
-    if image.generate_num() != 1 {
+    if image.generate_num() != 1
+        || (evidence.mode == query_only_evidence::MODE
+            && (row
+                .command_json
+                .get("model_version")
+                .and_then(Value::as_str)
+                != Some("5.0Pro")
+                || evidence.tenant_id.as_deref() != Some(row.tenant_id.as_str())))
+    {
         return Err(conflict());
     }
     let facts = dreamina_pricing_facts(&command, &row.api_profile).map_err(|_| conflict())?;
@@ -252,14 +275,14 @@ pub async fn resolve_dreamina_image_success(
          remote_operation_id, command_hash, execution_binding_sha256, quote_hash, reviewed_stdout_sha256,
          execution_audit_sha256, review_sha256, input_sha256, selected_source_index, selected_item_id,
          upstream_result_count, artifact_sha256, artifact_byte_size, artifact_media_type, artifact_width, artifact_height,
-         operator_reference, created_at_ms)
-        VALUES ($1,$2,$3,$4,$23,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,0,$16,4,$17,$18,'image/png',$19,$20,$21,$22)"#)
+         operator_reference, created_at_ms, evidence_mode, retrieval_audit_sha256, image_url_sha256, tenant_id, auth_attribution_json)
+        VALUES ($1,$2,$3,$4,$23,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,0,$16,$24,$17,$18,'image/png',$19,$20,$21,$22,$25,$26,$27,$28,$29)"#)
         .bind(resolution_id).bind(request.job_id).bind(request.submission_id).bind(request.executor_execution_id)
         .bind(row.original_receipt_id).bind(row.hold_id).bind(artifact_id).bind(&row.remote_operation_id)
         .bind(&row.command_hash).bind(&row.execution_binding_sha256).bind(&row.quote_hash).bind(&evidence.stdout_sha256)
         .bind(&evidence.execution_audit_sha256).bind(&evidence.review_sha256).bind(&input_sha256).bind(&evidence.selected_item_id)
         .bind(&evidence.selected_sha256).bind(evidence.bytes.len() as i64).bind(i32::try_from(evidence.width).map_err(|_| conflict())?)
-        .bind(i32::try_from(evidence.height).map_err(|_| conflict())?).bind(&request.operator_reference).bind(now).bind(row.output_id)
+        .bind(i32::try_from(evidence.height).map_err(|_| conflict())?).bind(&request.operator_reference).bind(now).bind(row.output_id).bind(evidence.upstream_result_count).bind(evidence.mode).bind(&evidence.retrieval_audit_sha256).bind(&evidence.image_url_sha256).bind(&evidence.tenant_id).bind(&evidence.auth_attribution)
         .execute(&mut *tx).await.map_err(storage_conflict)?;
     let artifact = blobs
         .put(
@@ -338,7 +361,7 @@ pub async fn resolve_dreamina_image_success(
         .map_err(|_| conflict())?;
     let payload = json!({"resolution_id":resolution_id,"submission_id":request.submission_id,"executor_execution_id":request.executor_execution_id,
         "original_receipt_id":row.original_receipt_id,"artifact_id":artifact_id,"artifact_sha256":evidence.selected_sha256,
-        "selected_source_index":0,"upstream_result_count":4,"delivered_count":1,"committed_units":1,
+        "selected_source_index":0,"upstream_result_count":evidence.upstream_result_count,"evidence_mode":evidence.mode,"delivered_count":1,"committed_units":1,
         "currency":rating.currency,"captured_micros":rating.total_amount_micros,"reviewed_stdout_sha256":evidence.stdout_sha256});
     for table in ["job_events", "outbox_events"] {
         sqlx::query(AssertSqlSafe(format!("INSERT INTO {table} (event_id,job_id,event_type,semantic_key,payload_json,created_at_ms) VALUES ($1,$2,'job.succeeded','job.operator_dreamina_image_success',$3,$4)")))

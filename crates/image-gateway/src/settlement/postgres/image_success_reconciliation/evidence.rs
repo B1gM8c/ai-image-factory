@@ -8,8 +8,8 @@ use uuid::Uuid;
 use super::{DreaminaImageSuccessResolutionRequest, conflict};
 use crate::{ImageGatewayError, artifacts::sha256_hex};
 
-const MAX_RECEIPT_BYTES: u64 = 1024 * 1024;
-const MAX_IMAGE_BYTES: u64 = 32 * 1024 * 1024;
+pub(super) const MAX_RECEIPT_BYTES: u64 = 1024 * 1024;
+pub(super) const MAX_IMAGE_BYTES: u64 = 32 * 1024 * 1024;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -49,6 +49,12 @@ struct Review {
 }
 
 pub(super) struct VerifiedEvidence {
+    pub mode: &'static str,
+    pub upstream_result_count: i32,
+    pub retrieval_audit_sha256: Option<String>,
+    pub image_url_sha256: Option<String>,
+    pub tenant_id: Option<String>,
+    pub auth_attribution: Option<Value>,
     pub stdout_sha256: String,
     pub execution_audit_sha256: String,
     pub review_sha256: String,
@@ -62,9 +68,39 @@ pub(super) struct VerifiedEvidence {
     pub bytes: Vec<u8>,
 }
 
+pub(super) fn load(
+    root: &Path,
+    request: &DreaminaImageSuccessResolutionRequest,
+) -> Result<VerifiedEvidence, ImageGatewayError> {
+    let directory = open_directory(root)?;
+    let review: Value =
+        serde_json::from_slice(&read(&directory, "review.json", MAX_RECEIPT_BYTES)?)
+            .map_err(|_| conflict())?;
+    match review.get("schema_version").and_then(Value::as_u64) {
+        Some(1) => load_v1(root, request),
+        Some(2) => super::query_only_evidence::load(&directory, request),
+        _ => Err(conflict()),
+    }
+}
+
+pub(super) fn open_directory(root: &Path) -> Result<File, ImageGatewayError> {
+    if !root.is_absolute() || std::fs::canonicalize(root).ok().as_deref() != Some(root) {
+        return Err(conflict());
+    }
+    let directory: File = open(
+        root,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map(File::from)
+    .map_err(|_| conflict())?;
+    private_metadata(&directory, true)?;
+    Ok(directory)
+}
+
 /// Operator-reviewed files are not a cryptographic provider attestation. Pin
 /// every byte and require a private directory owned by the invoking actor.
-pub(super) fn load(
+fn load_v1(
     root: &Path,
     request: &DreaminaImageSuccessResolutionRequest,
 ) -> Result<VerifiedEvidence, ImageGatewayError> {
@@ -233,6 +269,12 @@ pub(super) fn load(
         return Err(conflict());
     }
     Ok(VerifiedEvidence {
+        mode: "download_four_v1",
+        upstream_result_count: 4,
+        retrieval_audit_sha256: None,
+        image_url_sha256: None,
+        tenant_id: None,
+        auth_attribution: None,
         stdout_sha256,
         execution_audit_sha256,
         review_sha256: sha256_hex(&review_bytes),
@@ -260,7 +302,11 @@ fn private_metadata(file: &File, directory: bool) -> Result<(), ImageGatewayErro
     Ok(())
 }
 
-fn read(directory: &File, name: &str, maximum: u64) -> Result<Vec<u8>, ImageGatewayError> {
+pub(super) fn read(
+    directory: &File,
+    name: &str,
+    maximum: u64,
+) -> Result<Vec<u8>, ImageGatewayError> {
     let mut file: File = openat(
         directory,
         name,

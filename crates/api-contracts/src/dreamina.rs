@@ -358,11 +358,31 @@ pub struct DreaminaVideoContent {
 pub struct DreaminaTaskError {
     pub code: String,
     pub message: String,
+    /// A safe, bounded cause for an unconfirmed submission; not a retry or billing decision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason_code: Option<String>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn task_error_reason_is_optional_and_does_not_change_legacy_json() {
+        let legacy = serde_json::json!({
+            "code": "generation_uncertain", "message": "Keep the original task"
+        });
+        let error: DreaminaTaskError = serde_json::from_value(legacy.clone()).unwrap();
+        assert!(error.reason_code.is_none());
+        assert_eq!(serde_json::to_value(error).unwrap(), legacy);
+
+        let diagnosed = serde_json::json!({
+            "code": "generation_uncertain", "message": "Keep the original task",
+            "reason_code": "provider_submit_timeout"
+        });
+        let error: DreaminaTaskError = serde_json::from_value(diagnosed.clone()).unwrap();
+        assert_eq!(serde_json::to_value(error).unwrap(), diagnosed);
+    }
 
     #[test]
     fn video_release_receipt_is_optional_and_keeps_exact_decimal_money() {

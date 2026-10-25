@@ -716,6 +716,7 @@ mod tests {
         let task = ark_video_task(
             id,
             VideoResultStatus::Uncertain {
+                submission_error_code: None,
                 model: "seedance2.5".to_owned(),
                 duration_ms: 5000,
                 provider_progress: None,
@@ -779,6 +780,7 @@ mod tests {
                 stage: crate::settlement::VideoPendingStage::Queued,
             },
             VideoResultStatus::Uncertain {
+                submission_error_code: None,
                 model: "execution-model-id".to_owned(),
                 duration_ms: 5000,
                 provider_progress: None,

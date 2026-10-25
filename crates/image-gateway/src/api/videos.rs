@@ -868,6 +868,7 @@ mod tests {
     #[test]
     fn uncertain_internal_state_remains_pending_at_the_xai_boundary() {
         let response = video_response(VideoResultStatus::Uncertain {
+            submission_error_code: None,
             model: "grok-imagine-video-1.5-preview".to_owned(),
             duration_ms: 6000,
             provider_progress: None,

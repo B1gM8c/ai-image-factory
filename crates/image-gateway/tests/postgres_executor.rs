@@ -86,6 +86,9 @@ mod queue_progress_projection;
 #[path = "postgres_executor/dreamina_image_success_reconciliation.rs"]
 mod dreamina_image_success_reconciliation;
 
+#[path = "postgres_executor/dreamina_single_image_protocol_recovery.rs"]
+mod dreamina_single_image_protocol_recovery;
+
 #[path = "postgres_executor/dreamina_video_success_reconciliation.rs"]
 mod dreamina_video_success_reconciliation;
 
@@ -9516,12 +9519,23 @@ async fn seed_dreamina_generation_lease_with_outputs_for_profile(
     api_profile: &str,
     output_count: u32,
 ) -> TestResult<WorkLease> {
+    seed_dreamina_generation_lease_with_model(pool, worker_id, api_profile, output_count, "5.0")
+        .await
+}
+
+async fn seed_dreamina_generation_lease_with_model(
+    pool: &PgPool,
+    worker_id: &str,
+    api_profile: &str,
+    output_count: u32,
+    model_version: &str,
+) -> TestResult<WorkLease> {
     let job_id = Uuid::new_v4();
     let owner_token = Uuid::new_v4();
     let request_id = format!("request-{}", Uuid::new_v4().simple());
     let plan = DreaminaImageAdmissionPlan::new(DreaminaImageGenerationRequest {
         prompt: "draw a provider-native pricing lighthouse".to_string(),
-        model_version: Some("5.0".to_string()),
+        model_version: Some(model_version.to_string()),
         ratio: Some("1:1".to_string()),
         resolution_type: "2k".to_string(),
         width: None,

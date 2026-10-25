@@ -469,6 +469,15 @@ pub(super) async fn claim_work(
               JOIN provider_account_execution_controls claim_control
                 ON claim_control.provider_account_id = claim_profile.provider_account_id
               WHERE claim_profile.execution_profile_id = $5
+                AND (claim_profile.provider_id <> 'dreamina-cli' OR EXISTS (
+                  SELECT 1 FROM provider_account_credential_heads head
+                  JOIN provider_accounts account USING (provider_account_id)
+                  WHERE head.provider_account_id = claim_profile.provider_account_id
+                    AND head.active_revision = claim_profile.credential_revision
+                    AND head.lifecycle_state IN ('active', 'refresh_due')
+                    AND account.state = 'enabled'
+                    AND account.credential_revision = claim_profile.credential_revision
+                ))
                 AND (
                   SELECT COUNT(*)
                   FROM work_items active_work
@@ -569,6 +578,12 @@ pub(super) async fn claim_work(
                   AND member.state = 'enabled'
                   AND profile.state = 'enabled'
                   AND account.state = 'enabled'
+                  AND (profile.provider_id <> 'dreamina-cli' OR EXISTS (
+                    SELECT 1 FROM provider_account_credential_heads head
+                    WHERE head.provider_account_id = account.provider_account_id
+                      AND head.active_revision = profile.credential_revision
+                      AND head.lifecycle_state IN ('active', 'refresh_due')
+                  ))
                   AND environment.state = 'active'
                   AND pool.state = 'enabled'
                   AND policy.state = 'enabled'

@@ -234,7 +234,13 @@ impl ExecutionSettlementStore for PostgresExecutionSettlementStore {
             SELECT j.state, w.state, j.last_error_code, j.model, j.billable_units,
                    artifact.artifact_id, COALESCE(operator_video.video_url, remote.video_url) AS video_url,
                    CASE WHEN operator_video.resolution_id IS NOT NULL THEN operator_video.expires_at_ms ELSE remote.expires_at_ms END AS expires_at_ms, payload.command_json,
-                   progress_observation.progress_json, progress_observation.observed_at_ms
+                   progress_observation.progress_json, progress_observation.observed_at_ms,
+                   CASE WHEN j.state = 'uncertain' AND w.state = 'uncertain'
+                         AND submit_intent.submission_id IS NOT NULL
+                         AND progress_submission.state = 'uncertain'
+                         AND progress_task.submission_id IS NULL
+                        THEN COALESCE(submit_intent.failure_error_code, j.last_error_code)
+                   END AS submission_error_code
             FROM jobs j
             JOIN work_items w ON w.job_id = j.job_id
             LEFT JOIN job_payloads payload
@@ -248,6 +254,13 @@ impl ExecutionSettlementStore for PostgresExecutionSettlementStore {
              AND progress_submission.job_id = j.job_id
              AND progress_submission.tenant_id = j.tenant_id
              AND progress_submission.work_item_id = w.work_item_id
+            LEFT JOIN provider_remote_submit_intents submit_intent
+              ON submit_intent.submission_id = progress_submission.submission_id
+             AND submit_intent.executor_execution_id = progress_submission.executor_execution_id
+             AND submit_intent.provider_id = progress_submission.provider_id
+             AND submit_intent.provider_account_id = progress_submission.provider_account_id
+             AND submit_intent.remote_operation_id IS NULL
+             AND submit_intent.state IN ('outcome_unknown', 'deadline_quarantined')
             LEFT JOIN provider_remote_tasks progress_task
               ON progress_task.submission_id = progress_submission.submission_id
              AND progress_task.executor_execution_id = progress_submission.executor_execution_id
@@ -324,7 +337,13 @@ impl ExecutionSettlementStore for PostgresExecutionSettlementStore {
                 SELECT j.state, w.state, j.last_error_code, j.model, j.billable_units,
                        artifact.artifact_id, COALESCE(operator_video.video_url, remote.video_url) AS video_url,
                    CASE WHEN operator_video.resolution_id IS NOT NULL THEN operator_video.expires_at_ms ELSE remote.expires_at_ms END AS expires_at_ms, payload.command_json,
-                       progress_observation.progress_json, progress_observation.observed_at_ms
+                       progress_observation.progress_json, progress_observation.observed_at_ms,
+                   CASE WHEN j.state = 'uncertain' AND w.state = 'uncertain'
+                         AND submit_intent.submission_id IS NOT NULL
+                         AND progress_submission.state = 'uncertain'
+                         AND progress_task.submission_id IS NULL
+                        THEN COALESCE(submit_intent.failure_error_code, j.last_error_code)
+                   END AS submission_error_code
                 FROM jobs j
                 JOIN work_items w ON w.job_id = j.job_id
                 JOIN job_auth_attributions attribution
@@ -340,6 +359,13 @@ impl ExecutionSettlementStore for PostgresExecutionSettlementStore {
                  AND progress_submission.job_id = j.job_id
                  AND progress_submission.tenant_id = j.tenant_id
                  AND progress_submission.work_item_id = w.work_item_id
+                LEFT JOIN provider_remote_submit_intents submit_intent
+              ON submit_intent.submission_id = progress_submission.submission_id
+             AND submit_intent.executor_execution_id = progress_submission.executor_execution_id
+             AND submit_intent.provider_id = progress_submission.provider_id
+             AND submit_intent.provider_account_id = progress_submission.provider_account_id
+             AND submit_intent.remote_operation_id IS NULL
+             AND submit_intent.state IN ('outcome_unknown', 'deadline_quarantined')
                 LEFT JOIN provider_remote_tasks progress_task
                   ON progress_task.submission_id = progress_submission.submission_id
                  AND progress_task.executor_execution_id = progress_submission.executor_execution_id
@@ -486,7 +512,13 @@ impl ExecutionSettlementStore for PostgresExecutionSettlementStore {
                 SELECT j.state, w.state, j.last_error_code, j.model, j.billable_units,
                        artifact.artifact_id, COALESCE(operator_video.video_url, remote.video_url) AS video_url,
                    CASE WHEN operator_video.resolution_id IS NOT NULL THEN operator_video.expires_at_ms ELSE remote.expires_at_ms END AS expires_at_ms, payload.command_json,
-                       progress_observation.progress_json, progress_observation.observed_at_ms
+                       progress_observation.progress_json, progress_observation.observed_at_ms,
+                   CASE WHEN j.state = 'uncertain' AND w.state = 'uncertain'
+                         AND submit_intent.submission_id IS NOT NULL
+                         AND progress_submission.state = 'uncertain'
+                         AND progress_task.submission_id IS NULL
+                        THEN COALESCE(submit_intent.failure_error_code, j.last_error_code)
+                   END AS submission_error_code
                 FROM jobs j
                 JOIN work_items w ON w.job_id = j.job_id
                 JOIN job_auth_attributions attribution
@@ -503,6 +535,13 @@ impl ExecutionSettlementStore for PostgresExecutionSettlementStore {
                  AND progress_submission.job_id = j.job_id
                  AND progress_submission.tenant_id = j.tenant_id
                  AND progress_submission.work_item_id = w.work_item_id
+                LEFT JOIN provider_remote_submit_intents submit_intent
+              ON submit_intent.submission_id = progress_submission.submission_id
+             AND submit_intent.executor_execution_id = progress_submission.executor_execution_id
+             AND submit_intent.provider_id = progress_submission.provider_id
+             AND submit_intent.provider_account_id = progress_submission.provider_account_id
+             AND submit_intent.remote_operation_id IS NULL
+             AND submit_intent.state IN ('outcome_unknown', 'deadline_quarantined')
                 LEFT JOIN provider_remote_tasks progress_task
                   ON progress_task.submission_id = progress_submission.submission_id
                  AND progress_task.executor_execution_id = progress_submission.executor_execution_id
@@ -728,6 +767,7 @@ type VideoStatusRow = (
     Option<serde_json::Value>,
     Option<serde_json::Value>,
     Option<i64>,
+    Option<String>,
 );
 
 #[derive(serde::Deserialize)]
@@ -812,6 +852,7 @@ fn video_result_status(row: VideoStatusRow) -> Result<VideoResultStatus, ImageGa
         command,
         progress,
         progress_observed_at_ms,
+        submission_error_code,
     ) = row;
     let duration_ms = requested_video_duration_ms(billable_units, command.as_ref())?;
     if job_state == "succeeded" {
@@ -845,6 +886,7 @@ fn video_result_status(row: VideoStatusRow) -> Result<VideoResultStatus, ImageGa
             model,
             duration_ms,
             provider_progress: video_provider_progress(progress, progress_observed_at_ms),
+            submission_error_code,
         })
     } else {
         let stage = match work_state.as_str() {
@@ -1476,6 +1518,7 @@ mod tests {
             Some(command),
             None,
             None,
+            None,
         ))
         .unwrap();
         assert!(matches!(
@@ -1503,6 +1546,7 @@ mod tests {
                 "queue_total":476961, "estimated_remaining_seconds":27131
             })),
             Some(1_792_828_821_077),
+            None,
         )
     }
 
@@ -1591,6 +1635,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
         };
         let artifact = Uuid::new_v4();
@@ -1623,6 +1668,7 @@ mod tests {
             Some(url.to_owned()),
             None,
             Some(multiframe_command(&[2_500])),
+            None,
             None,
             None,
         ))

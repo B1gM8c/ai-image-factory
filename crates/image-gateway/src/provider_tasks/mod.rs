@@ -20,6 +20,7 @@ mod runtime_profile;
 mod submit;
 
 const MAX_PROVIDER_RUNTIME_LANES: usize = 1_024;
+const SUBMIT_CREDENTIAL_BLOCKED: &str = "provider_submit_credential_blocked";
 
 pub use account_home::{ProviderAccountHomeCapability, ProviderAccountHomeCapabilityError};
 
@@ -735,8 +736,31 @@ pub enum ProviderTaskStoreError {
     StaleLease,
 }
 
+/// Keeps fresh credential state stable until dispatch permission is durable.
+/// Dropping the guard releases the database locks; it does not change task state.
+pub struct ProviderSubmitCredentialGuard {
+    pub(crate) _transaction: Option<sqlx::Transaction<'static, sqlx::Postgres>>,
+}
+
+impl ProviderSubmitCredentialGuard {
+    pub(crate) fn unrestricted() -> Self {
+        Self { _transaction: None }
+    }
+}
+
 #[async_trait]
 pub trait ProviderTaskStore: Send + Sync + 'static {
+    async fn guard_submit_credentials(
+        &self,
+        intent: &ProviderSubmitIntent,
+        _context: &ProviderExecutionContext,
+    ) -> Result<ProviderSubmitCredentialGuard, ProviderTaskStoreError> {
+        if intent.provider_id == image_provider_dreamina_cli::PROVIDER_ID {
+            return Err(ProviderTaskStoreError::Conflict);
+        }
+        Ok(ProviderSubmitCredentialGuard::unrestricted())
+    }
+
     async fn acquire_submit(
         &self,
         request: &RemoteTaskSubmitReservation,

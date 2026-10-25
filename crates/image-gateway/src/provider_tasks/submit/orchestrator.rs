@@ -115,7 +115,7 @@ impl<D: ProviderSubmitDriver> ProviderSubmitRecoveryWork<D> {
 }
 
 pub struct ProviderSubmitOrchestrator<S, D> {
-    store: S,
+    store: Arc<S>,
     driver: D,
     provider_timeout_ms: i64,
     journal: Arc<RemoteSubmitJournal>,
@@ -136,7 +136,7 @@ where
             return Err(ProviderSubmitOrchestratorError::InvalidWork);
         }
         Ok(Self {
-            store,
+            store: Arc::new(store),
             driver,
             provider_timeout_ms,
             journal: Arc::new(RemoteSubmitJournal::new(journal_root)?),
@@ -344,7 +344,8 @@ where
             launch.launch_nonce(),
             prepare_budget_ms,
         )
-        .with_inputs(inputs);
+        .with_inputs(inputs)
+        .with_credential_gate(Arc::clone(&self.store));
         let prepared = match self.driver.prepare(&call).await {
             Ok(prepared) => prepared,
             Err(failure) => {
@@ -364,14 +365,21 @@ where
                     .await;
             }
         };
+        // Filter revoked credentials after prepare. The gated CLI also rechecks
+        // at its actual process permission, including Ready-process recovery.
+        // Keep each guard only until its marker is durable, never for the CLI wait.
+        let credential_guard = self.store.guard_submit_credentials(intent, context).await?;
         let dispatch_budget_ms =
             remaining_budget_after(database_budget_ms, journal_started.elapsed());
         let journal = Arc::clone(&self.journal);
         let release_spec = journal_spec.clone();
-        let release =
-            tokio::task::spawn_blocking(move || journal.release_dispatch(&release_spec, launch))
-                .await
-                .map_err(|_| ProviderSubmitOrchestratorError::JournalWorkerStopped)??;
+        let release = tokio::task::spawn_blocking(move || {
+            let result = journal.release_dispatch(&release_spec, launch);
+            drop(credential_guard);
+            result
+        })
+        .await
+        .map_err(|_| ProviderSubmitOrchestratorError::JournalWorkerStopped)??;
         let released = match release {
             RemoteSubmitRelease::Dispatch(released) => released,
             RemoteSubmitRelease::Attach(observation) => {
@@ -395,6 +403,12 @@ where
                     .await?;
                 self.record_pending(intent, context, pending, recovery_fence)
                     .await
+            }
+            Err(failure) if failure.code() == crate::provider_tasks::SUBMIT_CREDENTIAL_BLOCKED => {
+                // A ready process has no dispatch permission. Preserve the journal
+                // and original certainty for later observation; do not synthesize
+                // a rejection, receipt, or refund from a credential denial.
+                Ok(ProviderSubmitOutcome::AwaitingEvidence(intent.clone()))
             }
             Err(failure) => {
                 let (kind, terminal) = journal_failure(&failure);
@@ -523,7 +537,8 @@ where
                     Arc::from(journal_root.into_boxed_path()),
                     released.launch_nonce(),
                     0,
-                );
+                )
+                .with_credential_gate(Arc::clone(&self.store));
                 match self.driver.recover_released(&call).await {
                     ProviderSubmitDriverRecovery::AwaitingEvidence => {
                         Ok(ProviderSubmitOutcome::AwaitingEvidence(intent.clone()))

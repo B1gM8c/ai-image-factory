@@ -66,6 +66,12 @@ pub trait GatedCliSubmitCodec: Send + Sync + 'static {
         command: &image_provider_sdk::SingleOutputCommand<Self::Payload>,
         stdout: &[u8],
     ) -> Result<PendingOperation, ProviderFailure>;
+
+    /// Return only a fixed diagnostic code for a complete, nonzero CLI exit.
+    /// The driver always preserves unknown effect and `Never` for this path.
+    fn nonzero_exit_diagnostic(&self, _exit_code: i32, _stderr: &[u8]) -> Option<&'static str> {
+        None
+    }
 }
 
 pub struct GatedCliSubmitDriver<C> {
@@ -282,8 +288,12 @@ where
         let process = match prepared {
             Some(prepared) => {
                 if let Some(ready) = prepared.ready {
-                    match release_process(&prepared.process, ready).await {
-                        Ok(()) | Err(GatedCliProcessError::NotReady) => {}
+                    match release_process(&prepared.process, ready, call).await {
+                        Ok(())
+                        | Err(ProcessReleaseFailure::Process(GatedCliProcessError::NotReady)) => {}
+                        Err(ProcessReleaseFailure::Credentials) => {
+                            return ProviderSubmitDriverRecovery::AwaitingEvidence;
+                        }
                         Err(_) => {
                             return ProviderSubmitDriverRecovery::Failed(unknown_process_failure(
                                 "provider_submit_release_failed",
@@ -302,11 +312,16 @@ where
                 }
             },
         };
-        match wait_for_terminal(&process).await {
+        match wait_for_terminal(&process, call).await {
             Ok(terminal) => {
                 let result = self.resolve_terminal(call, terminal).await;
                 self.cleanup_workspace(&process).await;
                 result
+            }
+            Err(failure)
+                if failure.failure.code() == crate::provider_tasks::SUBMIT_CREDENTIAL_BLOCKED =>
+            {
+                ProviderSubmitDriverRecovery::AwaitingEvidence
             }
             Err(failure) => {
                 if failure.cleanup_safe {
@@ -354,6 +369,16 @@ where
                 signal: None,
             }
         ) {
+            if let Some(code) = nonzero_exit_diagnostic(
+                self.codec.as_ref(),
+                terminal.outcome(),
+                terminal.stdout(),
+                terminal.stdout_truncated(),
+                terminal.stderr(),
+                terminal.stderr_truncated(),
+            ) {
+                return ProviderSubmitDriverRecovery::Failed(unknown_process_failure(code));
+            }
             return ProviderSubmitDriverRecovery::Failed(unknown_terminal_failure(&terminal));
         }
         let codec = Arc::clone(&self.codec);
@@ -408,9 +433,9 @@ where
         match self.resolve_released(call, Some(prepared)).await {
             ProviderSubmitDriverRecovery::Accepted(pending) => Ok(pending),
             ProviderSubmitDriverRecovery::Failed(failure) => Err(failure),
-            ProviderSubmitDriverRecovery::AwaitingEvidence => {
-                Err(unknown_process_failure("provider_submit_evidence_pending"))
-            }
+            ProviderSubmitDriverRecovery::AwaitingEvidence => Err(unknown_process_failure(
+                crate::provider_tasks::SUBMIT_CREDENTIAL_BLOCKED,
+            )),
         }
     }
 
@@ -518,13 +543,24 @@ async fn wait_until_prepared(
     }
 }
 
-async fn wait_for_terminal(
+async fn wait_for_terminal<P>(
     process: &GatedProcessRef,
+    call: &ProviderSubmitDriverCall<P>,
 ) -> Result<GatedCliProcessTerminal, ProcessWaitFailure> {
     loop {
         match observe_process(process).await {
-            Ok(GatedCliObservation::Ready(ready)) => match release_process(process, ready).await {
-                Ok(()) | Err(GatedCliProcessError::NotReady) => {}
+            Ok(GatedCliObservation::Ready(ready)) => match release_process(process, ready, call)
+                .await
+            {
+                Ok(()) | Err(ProcessReleaseFailure::Process(GatedCliProcessError::NotReady)) => {}
+                Err(ProcessReleaseFailure::Credentials) => {
+                    return Err(ProcessWaitFailure {
+                        failure: unknown_process_failure(
+                            crate::provider_tasks::SUBMIT_CREDENTIAL_BLOCKED,
+                        ),
+                        cleanup_safe: false,
+                    });
+                }
                 Err(_) => {
                     return Err(ProcessWaitFailure {
                         failure: unknown_process_failure("provider_submit_process_release_failed"),
@@ -598,17 +634,42 @@ async fn observe_process(
     .map_err(|_| GatedCliProcessError::Unavailable)?
 }
 
-async fn release_process(
+enum ProcessReleaseFailure {
+    Credentials,
+    Process(GatedCliProcessError),
+}
+
+async fn release_process<P>(
     process: &GatedProcessRef,
     ready: GatedCliReady,
-) -> Result<(), GatedCliProcessError> {
+    call: &ProviderSubmitDriverCall<P>,
+) -> Result<(), ProcessReleaseFailure> {
+    let guard = match call.guard_credentials().await {
+        Ok(guard) => guard,
+        Err(_) => {
+            // A concurrent caller may already have released this same process.
+            // Observation never needs a fresh credential or a new permission.
+            if matches!(
+                observe_process(process).await,
+                Ok(GatedCliObservation::Running | GatedCliObservation::Terminal(_))
+            ) {
+                return Ok(());
+            }
+            return Err(ProcessReleaseFailure::Credentials);
+        }
+    };
     let process = process.clone();
+    // The blocking worker owns the lock guard, including if its caller is
+    // cancelled while the durable process permission is being published.
     tokio::task::spawn_blocking(move || {
-        GatedCliSubmission::new(&process.root, process.submission_id)?
-            .release(&process.binding, &ready)
+        let result = GatedCliSubmission::new(&process.root, process.submission_id)
+            .and_then(|submission| submission.release(&process.binding, &ready));
+        drop(guard);
+        result
     })
     .await
-    .map_err(|_| GatedCliProcessError::Unavailable)?
+    .map_err(|_| ProcessReleaseFailure::Process(GatedCliProcessError::Unavailable))?
+    .map_err(ProcessReleaseFailure::Process)
 }
 
 async fn terminate_orphan(process: &GatedProcessRef) -> Result<bool, GatedCliProcessError> {
@@ -692,6 +753,26 @@ fn unknown_terminal_failure(terminal: &GatedCliProcessTerminal) -> ProviderFailu
     unknown_process_failure(code)
 }
 
+fn nonzero_exit_diagnostic<C: GatedCliSubmitCodec>(
+    codec: &C,
+    outcome: &GatedCliProcessOutcome,
+    stdout: &[u8],
+    stdout_truncated: bool,
+    stderr: &[u8],
+    stderr_truncated: bool,
+) -> Option<&'static str> {
+    if !stdout.is_empty() || stdout_truncated || stderr_truncated {
+        return None;
+    }
+    match outcome {
+        GatedCliProcessOutcome::Exited {
+            exit_code: Some(code),
+            signal: None,
+        } if *code != 0 => codec.nonzero_exit_diagnostic(*code, stderr),
+        _ => None,
+    }
+}
+
 fn local_process_failure(code: &str) -> ProviderFailure {
     ProviderFailure::new(
         ProviderFailureClass::Permanent,
@@ -733,3 +814,7 @@ fn unix_time_ms() -> u64 {
         .unwrap_or_default()
         .as_millis() as u64
 }
+
+#[cfg(test)]
+#[path = "driver_tests.rs"]
+mod tests;

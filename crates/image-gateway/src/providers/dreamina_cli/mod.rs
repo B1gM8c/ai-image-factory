@@ -273,6 +273,17 @@ impl GatedCliSubmitCodec for DreaminaCliSubmitCodecV1 {
     ) -> Result<PendingOperation, ProviderFailure> {
         Self::decode_for_submission(intent.submission_id, stdout)
     }
+
+    fn nonzero_exit_diagnostic(&self, exit_code: i32, stderr: &[u8]) -> Option<&'static str> {
+        if exit_code == 1
+            && stderr
+                == "当前账号没有 dreamina_cli 使用权限: current account is not allowed to use dreamina_cli\n"
+                    .as_bytes()
+        {
+            return Some("dreamina_cli_permission_denied");
+        }
+        None
+    }
 }
 
 impl<D> ProviderSubmitProjector<D> for DreaminaCliSubmitCodecV1

@@ -234,6 +234,8 @@ pub enum VideoResultStatus {
         model: String,
         duration_ms: u32,
         provider_progress: Option<VideoProviderProgress>,
+        /// Recorded on the bound submission before a deadline may replace the job error.
+        submission_error_code: Option<String>,
     },
 }
 

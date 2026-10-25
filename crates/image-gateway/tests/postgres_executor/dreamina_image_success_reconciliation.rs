@@ -24,7 +24,7 @@ const ORIGINAL_EVIDENCE_ASSERTION: &str = r#"SELECT assert_operator_dreamina_ima
     JOIN customer_price_quotes quote ON quote.quote_id=hold.quote_id
     WHERE submission.job_id=$1"#;
 
-struct HistoricalFourImageFailure;
+struct HistoricalFourImageFailure(&'static str);
 impl ProviderPollDriver for HistoricalFourImageFailure {
     fn provider_id(&self) -> &'static str {
         DREAMINA_PROVIDER_ID
@@ -36,7 +36,7 @@ impl ProviderPollDriver for HistoricalFourImageFailure {
     ) -> Result<PollObservation, ProviderFailure> {
         Err(ProviderFailure::new(
             ProviderFailureClass::Permanent,
-            "dreamina_poll_artifact_invalid",
+            self.0,
             EffectCertainty::UnknownRemoteEffect,
             RetryDirective::Never,
         )
@@ -44,15 +44,15 @@ impl ProviderPollDriver for HistoricalFourImageFailure {
     }
 }
 
-struct Fixture {
+pub(super) struct Fixture {
     _evidence: tempfile::TempDir,
-    evidence_root: PathBuf,
+    pub(super) evidence_root: PathBuf,
     _artifacts: tempfile::TempDir,
-    blobs: Arc<FilesystemArtifactBlobStore>,
-    request: DreaminaImageSuccessResolutionRequest,
+    pub(super) blobs: Arc<FilesystemArtifactBlobStore>,
+    pub(super) request: DreaminaImageSuccessResolutionRequest,
 }
 
-fn write_private(root: &Path, name: &str, bytes: &[u8]) -> TestResult {
+pub(super) fn write_private(root: &Path, name: &str, bytes: &[u8]) -> TestResult {
     fs::write(root.join(name), bytes).map_err(debug_error)?;
     fs::set_permissions(root.join(name), fs::Permissions::from_mode(0o600)).map_err(debug_error)
 }
@@ -75,6 +75,15 @@ async fn fixture_with_quote_dimensions(
     grant_micros: i64,
     dimensions: serde_json::Value,
 ) -> TestResult<Fixture> {
+    fixture_with_mode(pool, grant_micros, dimensions, false).await
+}
+
+pub(super) async fn fixture_with_mode(
+    pool: &PgPool,
+    grant_micros: i64,
+    dimensions: serde_json::Value,
+    protocol_mode: bool,
+) -> TestResult<Fixture> {
     let quote_max_micros = if dimensions
         .get("processing_mode")
         .and_then(serde_json::Value::as_str)
@@ -84,10 +93,12 @@ async fn fixture_with_quote_dimensions(
     } else {
         PRICE
     };
-    let work = seed_dreamina_generation_lease_for_profile(
+    let work = seed_dreamina_generation_lease_with_model(
         pool,
         "operator-image-resolution-worker",
         DREAMINA_IMAGES_API_PROFILE,
+        1,
+        if protocol_mode { "5.0Pro" } else { "5.0" },
     )
     .await?;
     seed_v4_customer_quote_with_funding(
@@ -95,6 +106,7 @@ async fn fixture_with_quote_dimensions(
         &work,
         V4CustomerQuoteIdentity {
             dimensions,
+            provider_model_id: if protocol_mode { "5.0Pro" } else { "5.0" },
             ..V4CustomerQuoteIdentity::dreamina()
         },
         V4CustomerQuoteBasis {
@@ -194,7 +206,11 @@ async fn fixture_with_quote_dimensions(
     let blobs = Arc::new(FilesystemArtifactBlobStore::new(artifacts.path()).map_err(debug_error)?);
     let poller = ProviderPollOrchestrator::new(
         tasks,
-        HistoricalFourImageFailure,
+        HistoricalFourImageFailure(if protocol_mode {
+            "dreamina_poll_protocol_invalid"
+        } else {
+            "dreamina_poll_artifact_invalid"
+        }),
         gpt_image_2_gateway::FilesystemProviderArtifactStagerFactory::new(
             Arc::clone(&blobs),
             1024 * 1024,
@@ -248,8 +264,10 @@ async fn fixture_with_quote_dimensions(
     let evidence = tempfile::tempdir().map_err(debug_error)?;
     fs::set_permissions(evidence.path(), fs::Permissions::from_mode(0o700)).map_err(debug_error)?;
     let evidence_root = fs::canonicalize(evidence.path()).map_err(debug_error)?;
-    let images = (0..4).map(|index| json!({"item_id":format!("original-item-{index}"),"image_url":format!("https://media.example.test/original-{index}.png"),"width":1,"height":1})).collect::<Vec<_>>();
-    let stdout = serde_json::to_vec(&json!({"submit_id":remote_operation_id,"gen_status":"success","result_json":serde_json::to_string(&json!({"images":images,"videos":[]})).map_err(debug_error)?})).map_err(debug_error)?;
+    let result_count = if protocol_mode { 1 } else { 4 };
+    let images = (0..result_count).map(|index| json!({"item_id":format!("original-item-{index}"),"image_url":format!("https://media.example.test/original-{index}.png"),"width":1,"height":1})).collect::<Vec<_>>();
+    let result_json = json!({"images":images,"videos":[]});
+    let stdout = serde_json::to_vec(&json!({"submit_id":remote_operation_id,"gen_status":"success","result_json":if protocol_mode { result_json } else { json!(serde_json::to_string(&result_json).map_err(debug_error)?) }})).map_err(debug_error)?;
     let request = DreaminaImageSuccessResolutionRequest {
         job_id: work.job_id,
         submission_id: lease.submission_id,
@@ -258,16 +276,43 @@ async fn fixture_with_quote_dimensions(
         operator_reference: "offline:original-four-images-reviewed".into(),
     };
     let selected = png_bytes([10, 20, 30, 255]);
-    let audit = serde_json::to_vec(&json!({"schema_version":1,"job_id":work.job_id,"submission_id":lease.submission_id,"executor_execution_id":lease.executor_execution_id,
-        "remote_operation_id":remote_operation_id,"argv":["query_result","--submit_id",remote_operation_id,"--download_dir","/existing/original-download"],"stdout_sha256":request.reviewed_stdout_sha256,"exit_code":0,"executed_at_ms":database_now(pool).await?,"downloaded_images":(0..4).map(|i|json!({"source_index":i,"filename":format!("{}_image_{}.png",remote_operation_id,i+1),"sha256":sha256(&selected),"byte_size":selected.len()})).collect::<Vec<_>>()})).map_err(debug_error)?;
+    let mut audit_value = json!({"schema_version":1,"job_id":work.job_id,"submission_id":lease.submission_id,"executor_execution_id":lease.executor_execution_id,
+        "remote_operation_id":remote_operation_id,"argv":["query_result","--submit_id",remote_operation_id,"--download_dir","/existing/original-download"],"stdout_sha256":request.reviewed_stdout_sha256,"exit_code":0,"executed_at_ms":database_now(pool).await?,"downloaded_images":(0..4).map(|i|json!({"source_index":i,"filename":format!("{}_image_{}.png",remote_operation_id,i+1),"sha256":sha256(&selected),"byte_size":selected.len()})).collect::<Vec<_>>()});
+    if protocol_mode {
+        audit_value["schema_version"] = json!(2);
+        audit_value["evidence_mode"] = json!("query_only_http_retrieval_v2");
+        audit_value["argv"] = json!(["query_result", "--submit_id", remote_operation_id]);
+        audit_value["downloaded_images"] = json!([]);
+    }
+    let audit = serde_json::to_vec(&audit_value).map_err(debug_error)?;
     let quote_hash: String =
         sqlx::query_scalar("SELECT quote_hash FROM customer_price_quotes WHERE job_id=$1")
             .bind(work.job_id)
             .fetch_one(pool)
             .await
             .map_err(debug_error)?;
-    let review = serde_json::to_vec(&json!({"schema_version":1,"stdout_sha256":request.reviewed_stdout_sha256,"execution_audit_sha256":sha256(&audit),
-        "selected_sha256":sha256(&selected),"selected_source_index":0,"selected_item_id":"original-item-0","quote_hash":quote_hash,"provider_command_sha256":lease.command_hash})).map_err(debug_error)?;
+    let mut review = json!({"schema_version":1,"stdout_sha256":request.reviewed_stdout_sha256,"execution_audit_sha256":sha256(&audit),
+        "selected_sha256":sha256(&selected),"selected_source_index":0,"selected_item_id":"original-item-0","quote_hash":quote_hash,"provider_command_sha256":lease.command_hash});
+    if protocol_mode {
+        let url_sha256 = sha256(b"https://media.example.test/original-0.png");
+        let retrieval = serde_json::to_vec(&json!({"schema_version":2,"evidence_mode":"query_only_http_retrieval_v2","job_id":work.job_id,"submission_id":lease.submission_id,
+            "executor_execution_id":lease.executor_execution_id,"remote_operation_id":remote_operation_id,"source_index":0,"item_id":"original-item-0","image_url_sha256":url_sha256,
+            "method":"GET","http_status":200,"redirect_count":0,"retrieved_at_ms":database_now(pool).await?,"media_type":"image/png","sha256":sha256(&selected),"byte_size":selected.len(),"width":1,"height":1})).map_err(debug_error)?;
+        let attribution: serde_json::Value =
+            sqlx::query_scalar("SELECT to_jsonb(a) FROM job_auth_attributions a WHERE job_id=$1")
+                .bind(work.job_id)
+                .fetch_one(pool)
+                .await
+                .map_err(debug_error)?;
+        review["schema_version"] = json!(2);
+        review["evidence_mode"] = json!("query_only_http_retrieval_v2");
+        review["tenant_id"] = attribution["tenant_id"].clone();
+        review["auth_attribution"] = attribution;
+        review["retrieval_audit_sha256"] = json!(sha256(&retrieval));
+        review["image_url_sha256"] = json!(url_sha256);
+        write_private(&evidence_root, "retrieval-audit.json", &retrieval)?;
+    }
+    let review = serde_json::to_vec(&review).map_err(debug_error)?;
     write_private(&evidence_root, "reviewed-query.json", &stdout)?;
     write_private(&evidence_root, "execution-audit.json", &audit)?;
     write_private(&evidence_root, "review.json", &review)?;
@@ -281,7 +326,7 @@ async fn fixture_with_quote_dimensions(
     })
 }
 
-async fn immutable_snapshot(pool: &PgPool, job_id: Uuid) -> TestResult<String> {
+pub(super) async fn immutable_snapshot(pool: &PgPool, job_id: Uuid) -> TestResult<String> {
     let value: serde_json::Value = sqlx::query_scalar(r#"SELECT jsonb_build_object(
         'quotes',(SELECT jsonb_agg(to_jsonb(t) ORDER BY quote_id) FROM customer_price_quotes t WHERE job_id=$1),
         'submissions',(SELECT jsonb_agg(to_jsonb(t) ORDER BY submission_id) FROM provider_submissions t WHERE job_id=$1),
@@ -296,7 +341,10 @@ async fn immutable_snapshot(pool: &PgPool, job_id: Uuid) -> TestResult<String> {
     Ok(sha256(&serde_json::to_vec(&value).map_err(debug_error)?))
 }
 
-async fn rollback_snapshot(pool: &PgPool, job_id: Uuid) -> TestResult<serde_json::Value> {
+pub(super) async fn rollback_snapshot(
+    pool: &PgPool,
+    job_id: Uuid,
+) -> TestResult<serde_json::Value> {
     sqlx::query_scalar(r#"SELECT jsonb_build_object('job',to_jsonb(job),'quota',to_jsonb(quota),'hold',to_jsonb(hold),'account',to_jsonb(account),
         'overlay',(SELECT count(*) FROM dreamina_operator_image_success_resolutions WHERE job_id=$1),
         'artifact',(SELECT count(*) FROM artifacts WHERE job_id=$1),'projection',(SELECT count(*) FROM job_response_projections WHERE job_id=$1),

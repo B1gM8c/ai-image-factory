@@ -143,6 +143,31 @@ expiry in the current receipt, so no lifetime is promised. A consumer needing
 durable media, such as Blog, should copy the successful result to its own storage
 once and save that durable URL.
 
+### Unconfirmed video submission
+
+A terminal video submission with no recorded upstream task may return
+`status: "uncertain"`, `stage: "submission_uncertain"` and
+`error.code: "generation_uncertain"`. The optional `error.reason_code` gives a
+bounded diagnostic:
+
+| Reason | Observed condition |
+| --- | --- |
+| `dreamina_cli_permission_denied` | The complete CLI exit matched its fixed account-permission refusal. |
+| `provider_submit_timeout` | The CLI process exceeded its execution timeout. |
+| `provider_submit_cli_failed` | The CLI exited without an accepted submission receipt. |
+| `provider_submit_deadline` | Submission recovery exhausted its deadline without a recorded upstream task. |
+
+These diagnostics preserve the original uncertain outcome. They do not prove
+that a generation was never accepted, authorize a refund, or permit another
+submission. Unknown diagnostics retain the existing response shape and generic
+message; raw CLI output, prompts and input addresses are never exposed.
+
+Consumers should stop automatic generation tracking for this explicit terminal
+submission state, retain the original task and frozen quote, and provide a
+manual review action that reads the same task ID. A running task with upstream
+queue progress continues its normal tracking, even beyond a local client
+timeout. An API GET neither starts a generation nor refreshes the CLI.
+
 ### Upstream queue observations and cancellation
 
 Running native image and video responses retain `status: "running"` and may
@@ -362,6 +387,37 @@ For videos, `argv` must be exactly
 `["query_result", "--submit_id", ORIGINAL_ID]`; do not add `downloaded_images` or
 `selected.png`. The command validates the original upstream HTTPS URL and does
 not download the video or invent an expiry.
+
+Migration 150 adds a separate image evidence version for an original schema-1
+`text2image`, `5.0Pro`, `generate_num: 1` execution whose historical error is
+`dreamina_poll_protocol_invalid`. Its original query must have an object
+`result_json` containing exactly one image and no videos. The version-1
+four-image/download path above remains unchanged. Use the same
+`resolve-dreamina-image-success` command with a version-2 evidence directory:
+
+- `execution-audit.json` uses `schema_version: 2` and
+  `evidence_mode: "query_only_http_retrieval_v2"`, the original identity fields,
+  exact query-only `argv: ["query_result", "--submit_id", ORIGINAL_ID]`, raw
+  `stdout_sha256`, actual `exit_code: 0` and `executed_at_ms`, and
+  `downloaded_images: []`. Never claim the CLI downloaded this image.
+- `retrieval-audit.json` uses the same version, mode and original identity fields,
+  `source_index: 0`, original `item_id`, `image_url_sha256` of the exact original
+  URL UTF-8 bytes, `method: "GET"`, actual `http_status: 200`,
+  `redirect_count: 0`, actual `retrieved_at_ms`, `media_type: "image/png"`, and
+  the original retrieved PNG's `sha256`, `byte_size`, `width` and `height`.
+  Record the separate authorized HTTP retrieval accurately; do not query again
+  just to manufacture a download audit. `selected.png` contains those original
+  bytes and must fully decode with the receipt's dimensions.
+- `review.json` uses the same version and mode, all existing image-review fields,
+  plus `retrieval_audit_sha256`, `image_url_sha256`, original `tenant_id`, and
+  `auth_attribution` equal to the original `to_jsonb(job_auth_attributions)` row.
+  This binds the recovered delivery to the original tenant, owner and credential.
+
+All five files retain the private ownership and permissions above; unknown
+fields, modes, counts, IDs, URL hashes, prices, ownership or image bytes fail
+closed. The raw successful query stdout is retained unchanged. This recovery
+appends a new immutable resolution and settles one output at the original
+frozen quote; it does not rewrite the uncertain poll or executor evidence.
 
 The commands do not invoke the provider or submit generation. They append an
 immutable audit resolution, keep the original uncertain executor decision and
