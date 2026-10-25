@@ -1356,6 +1356,12 @@ async fn lock_active_execution_profile(
           AND profile.state = 'enabled'
           AND pool.state = 'enabled'
           AND account.state = 'enabled'
+          AND (profile.provider_id <> 'dreamina-cli' OR EXISTS (
+              SELECT 1 FROM provider_account_credential_heads head
+              WHERE head.provider_account_id = account.provider_account_id
+                AND head.active_revision = profile.credential_revision
+                AND head.lifecycle_state IN ('active', 'refresh_due')
+          ))
           AND policy.state = 'enabled'
         FOR SHARE OF profile, pool, account, policy, control
         "#,
@@ -1404,6 +1410,12 @@ async fn lock_active_execution_profile_for_claim(
           AND profile.state = 'enabled'
           AND pool.state = 'enabled'
           AND account.state = 'enabled'
+          AND (profile.provider_id <> 'dreamina-cli' OR EXISTS (
+              SELECT 1 FROM provider_account_credential_heads head
+              WHERE head.provider_account_id = account.provider_account_id
+                AND head.active_revision = profile.credential_revision
+                AND head.lifecycle_state IN ('active', 'refresh_due')
+          ))
           AND policy.state = 'enabled'
         FOR SHARE OF profile, pool, account, control
         "#,

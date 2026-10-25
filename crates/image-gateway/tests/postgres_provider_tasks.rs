@@ -183,6 +183,8 @@ macro_rules! attach_request {
     };
 }
 
+#[path = "postgres_provider_tasks/fresh_credential_dispatch.rs"]
+mod fresh_credential_dispatch;
 #[cfg(unix)]
 #[path = "postgres_provider_tasks/gated_submit.rs"]
 mod gated_submit;

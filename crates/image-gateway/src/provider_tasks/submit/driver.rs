@@ -9,7 +9,10 @@ use uuid::Uuid;
 
 use crate::{
     executor::ExecutorInputObject,
-    provider_tasks::{ProviderExecutionContext, ProviderSubmitIntent},
+    provider_tasks::{
+        ProviderExecutionContext, ProviderSubmitCredentialGuard, ProviderSubmitIntent,
+        ProviderSubmitOrchestrationStore, ProviderTaskStoreError,
+    },
 };
 
 pub trait ProviderSubmitDriver: Send + Sync + 'static {
@@ -35,6 +38,26 @@ pub trait ProviderSubmitDriver: Send + Sync + 'static {
     ) -> impl Future<Output = ProviderSubmitDriverRecovery> + Send;
 }
 
+#[async_trait::async_trait]
+trait SubmitCredentialGate: Send + Sync {
+    async fn guard(
+        &self,
+        intent: &ProviderSubmitIntent,
+        context: &ProviderExecutionContext,
+    ) -> Result<ProviderSubmitCredentialGuard, ProviderTaskStoreError>;
+}
+
+#[async_trait::async_trait]
+impl<S: ProviderSubmitOrchestrationStore> SubmitCredentialGate for S {
+    async fn guard(
+        &self,
+        intent: &ProviderSubmitIntent,
+        context: &ProviderExecutionContext,
+    ) -> Result<ProviderSubmitCredentialGuard, ProviderTaskStoreError> {
+        self.guard_submit_credentials(intent, context).await
+    }
+}
+
 pub struct ProviderSubmitDriverCall<P> {
     submission_id: Arc<str>,
     intent: Arc<ProviderSubmitIntent>,
@@ -44,6 +67,7 @@ pub struct ProviderSubmitDriverCall<P> {
     journal_root: Arc<Path>,
     launch_nonce: Uuid,
     remaining_budget_ms: u64,
+    credential_gate: Option<Arc<dyn SubmitCredentialGate>>,
 }
 
 impl<P> Clone for ProviderSubmitDriverCall<P> {
@@ -57,6 +81,7 @@ impl<P> Clone for ProviderSubmitDriverCall<P> {
             journal_root: Arc::clone(&self.journal_root),
             launch_nonce: self.launch_nonce,
             remaining_budget_ms: self.remaining_budget_ms,
+            credential_gate: self.credential_gate.clone(),
         }
     }
 }
@@ -79,7 +104,29 @@ impl<P> ProviderSubmitDriverCall<P> {
             journal_root,
             launch_nonce,
             remaining_budget_ms,
+            credential_gate: None,
         }
+    }
+
+    pub(crate) fn with_credential_gate<S: ProviderSubmitOrchestrationStore>(
+        mut self,
+        store: Arc<S>,
+    ) -> Self {
+        self.credential_gate = Some(store);
+        self
+    }
+
+    pub(crate) async fn guard_credentials(
+        &self,
+    ) -> Result<ProviderSubmitCredentialGuard, ProviderTaskStoreError> {
+        if self.intent.provider_id != image_provider_dreamina_cli::PROVIDER_ID {
+            return Ok(ProviderSubmitCredentialGuard::unrestricted());
+        }
+        let gate = self
+            .credential_gate
+            .as_ref()
+            .ok_or(ProviderTaskStoreError::Conflict)?;
+        gate.guard(&self.intent, &self.context).await
     }
 
     pub(crate) fn with_inputs(mut self, inputs: Arc<[ExecutorInputObject]>) -> Self {

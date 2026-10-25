@@ -288,8 +288,12 @@ where
         let process = match prepared {
             Some(prepared) => {
                 if let Some(ready) = prepared.ready {
-                    match release_process(&prepared.process, ready).await {
-                        Ok(()) | Err(GatedCliProcessError::NotReady) => {}
+                    match release_process(&prepared.process, ready, call).await {
+                        Ok(())
+                        | Err(ProcessReleaseFailure::Process(GatedCliProcessError::NotReady)) => {}
+                        Err(ProcessReleaseFailure::Credentials) => {
+                            return ProviderSubmitDriverRecovery::AwaitingEvidence;
+                        }
                         Err(_) => {
                             return ProviderSubmitDriverRecovery::Failed(unknown_process_failure(
                                 "provider_submit_release_failed",
@@ -308,11 +312,16 @@ where
                 }
             },
         };
-        match wait_for_terminal(&process).await {
+        match wait_for_terminal(&process, call).await {
             Ok(terminal) => {
                 let result = self.resolve_terminal(call, terminal).await;
                 self.cleanup_workspace(&process).await;
                 result
+            }
+            Err(failure)
+                if failure.failure.code() == crate::provider_tasks::SUBMIT_CREDENTIAL_BLOCKED =>
+            {
+                ProviderSubmitDriverRecovery::AwaitingEvidence
             }
             Err(failure) => {
                 if failure.cleanup_safe {
@@ -424,9 +433,9 @@ where
         match self.resolve_released(call, Some(prepared)).await {
             ProviderSubmitDriverRecovery::Accepted(pending) => Ok(pending),
             ProviderSubmitDriverRecovery::Failed(failure) => Err(failure),
-            ProviderSubmitDriverRecovery::AwaitingEvidence => {
-                Err(unknown_process_failure("provider_submit_evidence_pending"))
-            }
+            ProviderSubmitDriverRecovery::AwaitingEvidence => Err(unknown_process_failure(
+                crate::provider_tasks::SUBMIT_CREDENTIAL_BLOCKED,
+            )),
         }
     }
 
@@ -534,13 +543,24 @@ async fn wait_until_prepared(
     }
 }
 
-async fn wait_for_terminal(
+async fn wait_for_terminal<P>(
     process: &GatedProcessRef,
+    call: &ProviderSubmitDriverCall<P>,
 ) -> Result<GatedCliProcessTerminal, ProcessWaitFailure> {
     loop {
         match observe_process(process).await {
-            Ok(GatedCliObservation::Ready(ready)) => match release_process(process, ready).await {
-                Ok(()) | Err(GatedCliProcessError::NotReady) => {}
+            Ok(GatedCliObservation::Ready(ready)) => match release_process(process, ready, call)
+                .await
+            {
+                Ok(()) | Err(ProcessReleaseFailure::Process(GatedCliProcessError::NotReady)) => {}
+                Err(ProcessReleaseFailure::Credentials) => {
+                    return Err(ProcessWaitFailure {
+                        failure: unknown_process_failure(
+                            crate::provider_tasks::SUBMIT_CREDENTIAL_BLOCKED,
+                        ),
+                        cleanup_safe: false,
+                    });
+                }
                 Err(_) => {
                     return Err(ProcessWaitFailure {
                         failure: unknown_process_failure("provider_submit_process_release_failed"),
@@ -614,17 +634,42 @@ async fn observe_process(
     .map_err(|_| GatedCliProcessError::Unavailable)?
 }
 
-async fn release_process(
+enum ProcessReleaseFailure {
+    Credentials,
+    Process(GatedCliProcessError),
+}
+
+async fn release_process<P>(
     process: &GatedProcessRef,
     ready: GatedCliReady,
-) -> Result<(), GatedCliProcessError> {
+    call: &ProviderSubmitDriverCall<P>,
+) -> Result<(), ProcessReleaseFailure> {
+    let guard = match call.guard_credentials().await {
+        Ok(guard) => guard,
+        Err(_) => {
+            // A concurrent caller may already have released this same process.
+            // Observation never needs a fresh credential or a new permission.
+            if matches!(
+                observe_process(process).await,
+                Ok(GatedCliObservation::Running | GatedCliObservation::Terminal(_))
+            ) {
+                return Ok(());
+            }
+            return Err(ProcessReleaseFailure::Credentials);
+        }
+    };
     let process = process.clone();
+    // The blocking worker owns the lock guard, including if its caller is
+    // cancelled while the durable process permission is being published.
     tokio::task::spawn_blocking(move || {
-        GatedCliSubmission::new(&process.root, process.submission_id)?
-            .release(&process.binding, &ready)
+        let result = GatedCliSubmission::new(&process.root, process.submission_id)
+            .and_then(|submission| submission.release(&process.binding, &ready));
+        drop(guard);
+        result
     })
     .await
-    .map_err(|_| GatedCliProcessError::Unavailable)?
+    .map_err(|_| ProcessReleaseFailure::Process(GatedCliProcessError::Unavailable))?
+    .map_err(ProcessReleaseFailure::Process)
 }
 
 async fn terminate_orphan(process: &GatedProcessRef) -> Result<bool, GatedCliProcessError> {

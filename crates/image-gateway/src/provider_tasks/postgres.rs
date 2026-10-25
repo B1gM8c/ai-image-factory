@@ -15,10 +15,10 @@ use super::capacity::insert_capacity_reconciliation;
 use super::{
     ProviderArtifactAuthority, ProviderArtifactPublication, ProviderExecutionContext,
     ProviderRemoteTask, ProviderSubmitAcquire, ProviderSubmitAttachAuthority,
-    ProviderSubmitBusyAuthority, ProviderSubmitDispatchAuthority, ProviderSubmitFailureKind,
-    ProviderSubmitIntent, ProviderSubmitIntentState, ProviderSubmitInvocation,
-    ProviderSubmitRecoveryLease, ProviderSubmitStart, ProviderTaskClaimScope,
-    ProviderTaskDeadlineStore, ProviderTaskLease, ProviderTaskObservation,
+    ProviderSubmitBusyAuthority, ProviderSubmitCredentialGuard, ProviderSubmitDispatchAuthority,
+    ProviderSubmitFailureKind, ProviderSubmitIntent, ProviderSubmitIntentState,
+    ProviderSubmitInvocation, ProviderSubmitRecoveryLease, ProviderSubmitStart,
+    ProviderTaskClaimScope, ProviderTaskDeadlineStore, ProviderTaskLease, ProviderTaskObservation,
     ProviderTaskObservationOutcome, ProviderTaskObservationSource, ProviderTaskState,
     ProviderTaskStore, ProviderTaskStoreError, RemoteTaskAttach, RemoteTaskQuarantinedReceipt,
     RemoteTaskSubmitFailure, RemoteTaskSubmitReceipt, RemoteTaskSubmitReservation,
@@ -371,6 +371,28 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
         .await
     }
 
+    async fn guard_submit_credentials(
+        &self,
+        intent: &ProviderSubmitIntent,
+        context: &ProviderExecutionContext,
+    ) -> Result<ProviderSubmitCredentialGuard, ProviderTaskStoreError> {
+        if intent.provider_id != image_provider_dreamina_cli::PROVIDER_ID {
+            return Ok(ProviderSubmitCredentialGuard::unrestricted());
+        }
+        let mut tx = self.pool.begin().await.map_err(unavailable)?;
+        lock_dreamina_submit_credentials(
+            &mut tx,
+            intent.provider_account_id,
+            context.credential_revision(),
+            context.credential_ref(),
+            context.credential_auth_sha256(),
+        )
+        .await?;
+        Ok(ProviderSubmitCredentialGuard {
+            _transaction: Some(tx),
+        })
+    }
+
     async fn acquire_submit(
         &self,
         request: &RemoteTaskSubmitReservation,
@@ -450,6 +472,7 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
                 if !submit_binding_is_live(&binding, request, now) {
                     return Err(ProviderTaskStoreError::StaleLease);
                 }
+                check_dreamina_submit_binding(&mut tx, &binding).await?;
                 transition_submit_to_sending(&mut tx, request, now).await?;
                 insert_submit_recovery(&mut tx, request, frozen_timeout_ms, now).await?;
                 let invocation =
@@ -503,6 +526,7 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
         if !submit_binding_is_live(&binding, request, now) {
             return Err(ProviderTaskStoreError::StaleLease);
         }
+        check_dreamina_submit_binding(&mut tx, &binding).await?;
         let execution_binding_sha256 = execution_binding_sha256(
             &binding,
             request,
@@ -5291,6 +5315,57 @@ fn map_executor_error(error: ExecutorSubmissionError) -> ProviderTaskStoreError 
             ProviderTaskStoreError::Conflict
         }
     }
+}
+
+async fn check_dreamina_submit_binding(
+    tx: &mut Transaction<'_, Postgres>,
+    binding: &SubmitBindingRow,
+) -> Result<(), ProviderTaskStoreError> {
+    if binding.provider_id == image_provider_dreamina_cli::PROVIDER_ID {
+        lock_dreamina_submit_credentials(
+            tx,
+            binding.provider_account_id,
+            binding.credential_revision,
+            &binding.credential_ref,
+            &binding.credential_auth_sha256,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn lock_dreamina_submit_credentials(
+    tx: &mut Transaction<'_, Postgres>,
+    provider_account_id: Uuid,
+    credential_revision: i64,
+    credential_ref: &str,
+    credential_auth_sha256: &str,
+) -> Result<(), ProviderTaskStoreError> {
+    let available: Option<Uuid> = sqlx::query_scalar(
+        r#"
+        SELECT account.provider_account_id
+        FROM provider_accounts account
+        JOIN provider_account_credential_heads head USING (provider_account_id)
+        WHERE account.provider_account_id = $1
+          AND account.provider_id = 'dreamina-cli'
+          AND account.state = 'enabled'
+          AND account.credential_revision = $2
+          AND account.credential_ref = $3
+          AND account.credential_auth_sha256 = $4
+          AND head.active_revision = $2
+          AND head.lifecycle_state IN ('active', 'refresh_due')
+        FOR SHARE OF account, head
+        "#,
+    )
+    .bind(provider_account_id)
+    .bind(credential_revision)
+    .bind(credential_ref)
+    .bind(credential_auth_sha256)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(unavailable)?;
+    available.ok_or(ProviderTaskStoreError::Conflict)?;
+    Ok(())
 }
 
 #[cfg(test)]

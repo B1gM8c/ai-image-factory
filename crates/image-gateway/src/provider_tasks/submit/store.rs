@@ -3,13 +3,30 @@ use std::future::Future;
 use uuid::Uuid;
 
 use crate::provider_tasks::{
-    ProviderRemoteTask, ProviderSubmitAcquire, ProviderSubmitIntent, ProviderSubmitRecoveryLease,
+    ProviderExecutionContext, ProviderRemoteTask, ProviderSubmitAcquire,
+    ProviderSubmitCredentialGuard, ProviderSubmitIntent, ProviderSubmitRecoveryLease,
     ProviderTaskClaimScope, ProviderTaskStore, ProviderTaskStoreError, RemoteTaskAttach,
     RemoteTaskQuarantinedReceipt, RemoteTaskSubmitFailure, RemoteTaskSubmitReceipt,
     RemoteTaskSubmitReservation,
 };
 
 pub trait ProviderSubmitOrchestrationStore: Send + Sync + 'static {
+    fn guard_submit_credentials(
+        &self,
+        intent: &ProviderSubmitIntent,
+        _context: &ProviderExecutionContext,
+    ) -> impl Future<Output = Result<ProviderSubmitCredentialGuard, ProviderTaskStoreError>> + Send
+    {
+        let dreamina = intent.provider_id == image_provider_dreamina_cli::PROVIDER_ID;
+        async move {
+            if dreamina {
+                Err(ProviderTaskStoreError::Conflict)
+            } else {
+                Ok(ProviderSubmitCredentialGuard::unrestricted())
+            }
+        }
+    }
+
     fn acquire_submit(
         &self,
         request: &RemoteTaskSubmitReservation,
@@ -45,6 +62,14 @@ impl<S> ProviderSubmitOrchestrationStore for S
 where
     S: ProviderTaskStore,
 {
+    async fn guard_submit_credentials(
+        &self,
+        intent: &ProviderSubmitIntent,
+        context: &ProviderExecutionContext,
+    ) -> Result<ProviderSubmitCredentialGuard, ProviderTaskStoreError> {
+        ProviderTaskStore::guard_submit_credentials(self, intent, context).await
+    }
+
     async fn acquire_submit(
         &self,
         request: &RemoteTaskSubmitReservation,
