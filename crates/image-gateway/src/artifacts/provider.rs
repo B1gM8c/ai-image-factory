@@ -56,15 +56,12 @@ impl ProviderArtifactStagerFactory for FilesystemProviderArtifactStagerFactory {
         &self,
         context: &ProviderArtifactStageContext,
     ) -> Result<Self::Stager, ArtifactSinkError> {
-        let manifest =
-            ExecutorResultManifest::new(context.submission_id(), context.executor_execution_id())
-                .ok_or_else(|| invalid_artifact("provider_artifact_stage_context_invalid"))?;
+        ExecutorResultManifest::new(context.submission_id(), context.executor_execution_id())
+            .ok_or_else(|| invalid_artifact("provider_artifact_stage_context_invalid"))?;
+        let artifact_id = context.artifact_id();
         let stage = self
             .store
-            .begin_executor_artifact_stage(
-                manifest.artifact_authority_id(),
-                context.poll_lease_epoch(),
-            )
+            .begin_executor_artifact_stage(artifact_id, context.poll_lease_epoch())
             .await
             .map_err(map_stage_error)?;
         let storage_namespace = self
@@ -74,7 +71,7 @@ impl ProviderArtifactStagerFactory for FilesystemProviderArtifactStagerFactory {
         Ok(FilesystemProviderArtifactStager {
             stage,
             submission_id: context.submission_id(),
-            artifact_id: manifest.artifact_authority_id(),
+            artifact_id: artifact_id,
             storage_namespace,
             max_artifact_bytes: self.max_artifact_bytes,
             byte_size: 0,

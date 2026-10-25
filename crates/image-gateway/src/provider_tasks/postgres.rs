@@ -25,6 +25,7 @@ use super::{
     VerifiedCallbackWakeup,
 };
 
+mod additional_images;
 mod native_batch;
 
 const MAX_POLL_AFTER_MS: i64 = 24 * 60 * 60 * 1_000;
@@ -2280,6 +2281,21 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
         let task = task_from_row(row)?;
         tx.commit().await.map_err(unavailable)?;
         Ok(task)
+    }
+
+    async fn prepare_additional_image_artifacts(
+        &self,
+        lease: &ProviderTaskLease,
+    ) -> Result<(), ProviderTaskStoreError> {
+        additional_images::prepare(self, lease).await
+    }
+
+    async fn publish_additional_image_artifacts(
+        &self,
+        lease: &ProviderTaskLease,
+        authorities: &[(usize, ProviderArtifactAuthority)],
+    ) -> Result<(), ProviderTaskStoreError> {
+        additional_images::publish(self, lease, authorities).await
     }
 
     async fn publish_artifact_authority(

@@ -6,6 +6,19 @@ use uuid::Uuid;
 
 use super::super::{ProviderExecutionContext, ProviderTaskLease, ProviderTaskState};
 
+/// Selects physical image results from a single billable image operation.
+/// Source zero remains the normal paid artifact; other sources have no output slot.
+pub trait ProviderAdditionalImageArtifactSink: ArtifactSink {
+    fn select_image(
+        &mut self,
+        source_index: usize,
+    ) -> Result<(), image_provider_sdk::ArtifactSinkError>;
+
+    fn image_capacity(&self) -> usize {
+        10
+    }
+}
+
 /// A native batch selects each output before streaming its bytes. Finalizing
 /// releases that output's staging capacity before the next output is selected.
 pub trait ProviderNativeBatchArtifactSink: ArtifactSink {
@@ -109,6 +122,14 @@ pub trait ProviderPollDriver: Send + Sync + 'static {
         call: &ProviderPollDriverCall,
         sink: &mut S,
     ) -> impl Future<Output = Result<PollObservation, ProviderFailure>> + Send;
+
+    fn poll_with_additional_images<S: ProviderAdditionalImageArtifactSink>(
+        &self,
+        call: &ProviderPollDriverCall,
+        sink: &mut S,
+    ) -> impl Future<Output = Result<PollObservation, ProviderFailure>> + Send {
+        self.poll(call, sink)
+    }
 
     fn poll_native_batch<S: ProviderNativeBatchArtifactSink>(
         &self,

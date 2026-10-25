@@ -17,7 +17,7 @@ use super::{
     ControlledProviderArtifactSink, ProviderArtifactSinkContractError,
     ProviderArtifactStageContext, ProviderArtifactStagerFactory,
     ProviderNativeBatchPollObservation, ProviderPollDriver, ProviderPollDriverCall,
-    batch::ControlledNativeBatchSink,
+    additional_images::ControlledAdditionalImageSink, batch::ControlledNativeBatchSink,
 };
 use crate::provider_tasks::{
     NativeBatchMember, ProviderArtifactAuthority, ProviderArtifactPublication, ProviderRemoteTask,
@@ -55,6 +55,27 @@ pub trait ProviderPollStore: Send + Sync + 'static {
     ) -> impl Future<Output = Result<ProviderArtifactPublication, ProviderTaskStoreError>> + Send
     {
         async { Err(ProviderTaskStoreError::InvalidInput) }
+    }
+
+    fn prepare_additional_image_artifacts(
+        &self,
+        _lease: &ProviderTaskLease,
+    ) -> impl Future<Output = Result<(), ProviderTaskStoreError>> + Send {
+        async { Ok(()) }
+    }
+
+    fn publish_additional_image_artifacts(
+        &self,
+        _lease: &ProviderTaskLease,
+        authorities: &[(usize, ProviderArtifactAuthority)],
+    ) -> impl Future<Output = Result<(), ProviderTaskStoreError>> + Send {
+        async {
+            if authorities.is_empty() {
+                Ok(())
+            } else {
+                Err(ProviderTaskStoreError::InvalidInput)
+            }
+        }
     }
 
     fn record_native_batch_failure(
@@ -117,6 +138,21 @@ where
         authority: &ProviderArtifactAuthority,
     ) -> Result<ProviderArtifactPublication, ProviderTaskStoreError> {
         ProviderTaskStore::publish_native_batch_artifact(self, lease, output_index, authority).await
+    }
+
+    async fn prepare_additional_image_artifacts(
+        &self,
+        lease: &ProviderTaskLease,
+    ) -> Result<(), ProviderTaskStoreError> {
+        ProviderTaskStore::prepare_additional_image_artifacts(self, lease).await
+    }
+
+    async fn publish_additional_image_artifacts(
+        &self,
+        lease: &ProviderTaskLease,
+        authorities: &[(usize, ProviderArtifactAuthority)],
+    ) -> Result<(), ProviderTaskStoreError> {
+        ProviderTaskStore::publish_additional_image_artifacts(self, lease, authorities).await
     }
 
     async fn record_native_batch_failure(
@@ -247,6 +283,12 @@ where
             return Ok(ProviderPollRun::Observed(task));
         }
 
+        if lease.task.provider_id == "dreamina-cli"
+            && lease.context().operation_id() == "images.generations"
+        {
+            return Box::pin(self.run_with_additional_images(lease, claim_started_at)).await;
+        }
+
         let call = ProviderPollDriverCall::new(&lease)
             .map_err(|_| ProviderPollOrchestratorError::InvalidLease)?;
         let stage_context = ProviderArtifactStageContext::from_lease(&lease);
@@ -263,6 +305,85 @@ where
                 .await
                 .map_err(|_| ProviderPollOrchestratorError::ProviderDeadlineElapsed)??;
         let task = self.resolve_poll_result(&lease, sink, result).await?;
+        Ok(ProviderPollRun::Observed(task))
+    }
+
+    async fn run_with_additional_images(
+        &self,
+        lease: ProviderTaskLease,
+        claim_started_at: Instant,
+    ) -> Result<ProviderPollRun, ProviderPollOrchestratorError> {
+        let call = ProviderPollDriverCall::new(&lease)
+            .map_err(|_| ProviderPollOrchestratorError::InvalidLease)?;
+        self.store
+            .prepare_additional_image_artifacts(&lease)
+            .await?;
+        let mut sink = ControlledAdditionalImageSink::new(
+            &self.stagers,
+            &lease,
+            std::sync::Arc::clone(&self.materialization_limit),
+        );
+        let operation = Box::pin(self.driver.poll_with_additional_images(&call, &mut sink));
+        let deadline = claim_started_at + Duration::from_millis(lease.remaining_budget_ms());
+        let (renewed, result) =
+            tokio::time::timeout_at(deadline, self.run_with_heartbeat(lease.clone(), operation))
+                .await
+                .map_err(|_| ProviderPollOrchestratorError::ProviderDeadlineElapsed)??;
+        let task = match result {
+            Ok(PollObservation::Completed(completed)) => {
+                let staged = match sink.finish(completed.artifact()) {
+                    Ok(staged) => staged,
+                    Err(_) => {
+                        return Ok(ProviderPollRun::Observed(
+                            self.record_uncertain(&renewed, "provider_additional_image_contract")
+                                .await?,
+                        ));
+                    }
+                };
+                if !provider_request_matches(
+                    &renewed,
+                    completed.provider_request_id().map(|value| value.as_str()),
+                ) {
+                    return Ok(ProviderPollRun::Observed(
+                        self.record_uncertain(&renewed, "provider_poll_request_mismatch")
+                            .await?,
+                    ));
+                }
+                let authorities = staged
+                    .iter()
+                    .enumerate()
+                    .skip(1)
+                    .map(|(index, artifact)| (index, artifact.authority().clone()))
+                    .collect::<Vec<_>>();
+                // Seal the complete extra set (including an empty set) before the
+                // paid leader can become recoverable as terminal success.
+                self.store
+                    .publish_additional_image_artifacts(&renewed, &authorities)
+                    .await?;
+                let publication = self
+                    .store
+                    .publish_poll_artifact(&renewed, staged[0].authority())
+                    .await?;
+                if !publication.matches_durable_manifest(staged[0].manifest()) {
+                    return Err(ProviderPollOrchestratorError::ArtifactContract(
+                        ProviderArtifactSinkContractError::ManifestMismatch,
+                    ));
+                }
+                self.record_artifact(&renewed, publication).await?
+            }
+            result if sink.is_pristine() => {
+                let pristine = ControlledProviderArtifactSink::new(
+                    &self.stagers,
+                    ProviderArtifactStageContext::from_lease(&renewed),
+                    std::sync::Arc::clone(&self.materialization_limit),
+                );
+                self.resolve_poll_result(&renewed, pristine, result).await?
+            }
+            _ => {
+                self.record_uncertain(&renewed, "provider_additional_image_contract")
+                    .await?
+            }
+        };
         Ok(ProviderPollRun::Observed(task))
     }
 

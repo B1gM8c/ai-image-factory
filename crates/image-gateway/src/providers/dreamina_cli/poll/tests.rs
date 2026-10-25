@@ -543,6 +543,12 @@ impl ProviderNativeBatchArtifactSink for BatchTestSink {
     }
 }
 
+impl ProviderAdditionalImageArtifactSink for BatchTestSink {
+    fn select_image(&mut self, source_index: usize) -> Result<(), ArtifactSinkError> {
+        self.select_output(source_index)
+    }
+}
+
 impl ArtifactSink for BatchTestSink {
     async fn write_chunk(&mut self, bytes: &[u8]) -> Result<(), ArtifactSinkError> {
         self.outputs.last_mut().unwrap().extend_from_slice(bytes);

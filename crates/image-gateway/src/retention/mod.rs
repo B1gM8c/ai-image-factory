@@ -38,6 +38,16 @@ pub struct ArtifactRetentionLease {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdditionalArtifactRetentionLease {
+    pub submission_id: Uuid,
+    pub owner: String,
+    pub epoch: i64,
+    pub artifacts: Vec<RetainedExecutorArtifact>,
+    pub staged_ids: Vec<Uuid>,
+    pub stage_intent: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ArtifactRetentionClaim {
     Lease(ArtifactRetentionLease),
     Deferred,
@@ -60,6 +70,24 @@ pub trait ArtifactRetentionStore: Send + Sync + 'static {
         owner: &str,
         lease_ms: u64,
     ) -> Result<Option<ArtifactRetentionClaim>, ImageGatewayError>;
+
+    async fn claim_additional_images(
+        &self,
+        _owner: &str,
+        _lease_ms: u64,
+    ) -> Result<Option<AdditionalArtifactRetentionLease>, ImageGatewayError> {
+        Ok(None)
+    }
+
+    async fn finish_additional_images(
+        &self,
+        _lease: &AdditionalArtifactRetentionLease,
+        _deleted: bool,
+    ) -> Result<(), ImageGatewayError> {
+        Err(ImageGatewayError::internal(
+            "additional image cleanup unsupported",
+        ))
+    }
 
     async fn complete(&self, lease: &ArtifactRetentionLease) -> Result<(), ImageGatewayError>;
 
@@ -97,6 +125,46 @@ pub async fn reconcile_artifact_retention(
         }
         store.complete(&lease).await?;
         outcome.deleted = outcome.deleted.saturating_add(1);
+    }
+    for _ in 0..limit {
+        let Some(lease) = store.claim_additional_images(owner, lease_ms).await? else {
+            break;
+        };
+        outcome.claimed = outcome.claimed.saturating_add(1);
+        let mut deleted = true;
+        for artifact_id in &lease.staged_ids {
+            if blobs
+                .delete_additional_image_stage(*artifact_id)
+                .await
+                .is_err()
+            {
+                deleted = false;
+                break;
+            }
+        }
+        for artifact in &lease.artifacts {
+            if blobs
+                .delete_executor_reference(&ExecutorArtifactReference {
+                    authority_id: artifact.authority_id,
+                    storage_backend: &artifact.storage_backend,
+                    storage_namespace: &artifact.storage_namespace,
+                    object_key: &artifact.object_key,
+                    sha256_hex: &artifact.sha256_hex,
+                    byte_size: artifact.byte_size,
+                })
+                .await
+                .is_err()
+            {
+                deleted = false;
+                break;
+            }
+        }
+        store.finish_additional_images(&lease, deleted).await?;
+        if deleted {
+            outcome.deleted = outcome.deleted.saturating_add(1);
+        } else {
+            outcome.failed = outcome.failed.saturating_add(1);
+        }
     }
     Ok(outcome)
 }

@@ -180,7 +180,7 @@ class ReleaseAssetGateTests(unittest.TestCase):
             )
 
     def test_schema_follows_source_migrations(self):
-        for version in [139, 140, 141]:
+        for version in [139, 140, 141, 148, 149]:
             with self.subTest(version=version):
                 result = self.run_gate([128, version], target_schema=version)
                 self.assertEqual(result.returncode, 0, result.stderr)

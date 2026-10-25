@@ -83,6 +83,42 @@ do not invoke the CLI, write progress or extend a deadline. Consumers should
 retain the original task ID and reconcile it after a local polling timeout or
 restart rather than impose a 25-minute generation failure.
 
+### Complete physical image results (opt in)
+
+`GET /v1/dreamina/images/{task_id}/results` reads the same original task with
+`ImagesRead` and the same tenant, project and actor scope. It does not query the
+CLI or create a generation. The existing `GET /v1/dreamina/images/{task_id}` and
+native batch billing keep their response contracts.
+
+The opt-in response preserves the task fields, `data` and `output_counts` above,
+and adds:
+
+| Field | Meaning |
+| --- | --- |
+| `additional_images` | Extra, nonbillable physical images from a single-output task; at most nine entries, ordered by `source_index` from 1 without gaps. Each entry contains `b64_json`, lowercase hexadecimal `sha256`, decoded `byte_size` and `mime_type` (`image/png`, `image/jpeg` or `image/webp`). Source zero remains `data[0]`. |
+| `returned_count` | The number of images actually present in `data` plus `additional_images`. |
+| `billable_units` | The original delivered billable output count; extra physical images do not increase it. |
+
+For example, a request for one image that physically returns four has
+`request.generate_num = 1`, `output_counts = {requested: 1, delivered: 1, failed: 0}`,
+one entry in `data`, three entries in `additional_images`, `returned_count = 4`
+and `billable_units = 1`. A real four-output native batch retains four billable
+`data` entries, no extras, `returned_count = 4` and `billable_units = 4`.
+Running, failed, uncertain and expired tasks do not fabricate image data or
+billable result counts. Older successful tasks without saved extras return the
+existing `data` and an empty `additional_images` array.
+
+The complete decoded result, including the primary image, is limited to 256 MiB.
+Extra images are stored before the paid leader can complete and share the
+original artifact availability window; this endpoint does not extend retention.
+Expired task snapshots retain `status: expired` and error `artifact_expired`.
+If the complete set expires during a read, HTTP 410 `artifact_expired` is returned
+instead of silently omitting extras. Missing or invalid stored artifacts also
+fail explicitly. Consumers should preserve their original quote and task ID,
+copy available results to durable storage, and never resubmit or charge again
+to recover unavailable images. An older server returning 404 for this new route
+may be queried through the original task GET without another POST.
+
 `POST /v1/dreamina/videos/generations` accepts these `workflow` values:
 
 | Workflow | Generation parameters |

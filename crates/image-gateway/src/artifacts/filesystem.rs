@@ -440,6 +440,40 @@ impl FilesystemArtifactBlobStore {
         .map_err(|_| ArtifactWriteError::Unavailable)?
     }
 
+    pub(crate) async fn delete_additional_image_stage(
+        &self,
+        artifact_id: Uuid,
+    ) -> Result<(), ArtifactWriteError> {
+        if artifact_id.is_nil() {
+            return Err(ArtifactWriteError::Unavailable);
+        }
+        self.executor_storage_namespace()
+            .map_err(|_| ArtifactWriteError::Unavailable)?;
+        self.validate_executor_staging_namespace()
+            .map_err(|_| ArtifactWriteError::Unavailable)?;
+        let objects = Arc::clone(&self.executor_objects);
+        let stages = Arc::clone(&self.executor_staging);
+        tokio::task::spawn_blocking(move || {
+            let (shard_name, object_name) = executor_object_names(artifact_id);
+            if let Some(shard) = open_optional_private_directory_at(&objects, &shard_name)? {
+                match rfs::unlinkat(&shard, object_name.as_str(), AtFlags::empty()) {
+                    Ok(()) => rfs::fsync(&shard).map_err(|_| ArtifactWriteError::Unavailable)?,
+                    Err(Errno::NOENT) => {}
+                    Err(_) => return Err(ArtifactWriteError::Unavailable),
+                }
+            }
+            if let Some(shard) = open_optional_private_directory_at(&stages, &shard_name)?
+                && let Some(stage) = open_optional_private_directory_at(&shard, &object_name)?
+            {
+                cleanup_abandoned_executor_stages(&stage, i64::MAX)
+                    .map_err(|_| ArtifactWriteError::Unavailable)?;
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|_| ArtifactWriteError::Unavailable)?
+    }
+
     pub(crate) async fn delete_unpublished_executor_artifact(
         &self,
         artifact: &ArtifactMetadata,
@@ -920,6 +954,25 @@ fn open_or_create_executor_shard(
     open_executor_shard(root, shard_name).map_err(|_| ArtifactWriteError::Unavailable)
 }
 
+fn open_optional_private_directory_at(
+    parent: &fs::File,
+    name: &str,
+) -> Result<Option<fs::File>, ArtifactWriteError> {
+    let fd = match rfs::openat(
+        parent,
+        name,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(fd) => fd,
+        Err(Errno::NOENT) => return Ok(None),
+        Err(_) => return Err(ArtifactWriteError::Unavailable),
+    };
+    let directory = fs::File::from(fd);
+    validate_private_directory_fd(&directory).map_err(|_| ArtifactWriteError::Unavailable)?;
+    Ok(Some(directory))
+}
+
 fn open_executor_shard(root: &fs::File, shard_name: &str) -> Result<fs::File, ArtifactReadError> {
     let fd = rfs::openat(
         root,
@@ -1143,6 +1196,17 @@ impl ArtifactBlobStore for FilesystemArtifactBlobStore {
             artifact.byte_size,
         )
         .await
+    }
+
+    async fn get_additional_image(
+        &self,
+        artifact: &ArtifactMetadata,
+        storage_namespace: &str,
+    ) -> Result<Vec<u8>, ArtifactReadError> {
+        if !self.executor_storage_namespace_matches(storage_namespace)? {
+            return Err(ArtifactReadError::Integrity);
+        }
+        self.get_executor_artifact(artifact).await
     }
 
     async fn delete(&self, artifact: &ArtifactMetadata) -> Result<(), ArtifactWriteError> {

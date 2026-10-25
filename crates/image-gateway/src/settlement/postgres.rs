@@ -25,6 +25,7 @@ use crate::{
     usage::{UsageReservation, UsageSnapshot},
 };
 
+mod additional_images;
 mod failure;
 mod image_status;
 pub(super) mod image_success_reconciliation;
@@ -182,6 +183,26 @@ impl ExecutionSettlementStore for PostgresExecutionSettlementStore {
         job_id: Uuid,
     ) -> Result<Option<super::ImageTaskProjection>, ImageGatewayError> {
         image_status::project(self, tenant_id, project_id, actor_user_id, job_id).await
+    }
+
+    async fn validate_complete_image_result_budget(
+        &self,
+        tenant_id: &str,
+        project_id: &str,
+        actor_user_id: Option<Uuid>,
+        job_id: Uuid,
+    ) -> Result<(), ImageGatewayError> {
+        additional_images::validate_budget(self, tenant_id, project_id, actor_user_id, job_id).await
+    }
+
+    async fn project_additional_image_results(
+        &self,
+        tenant_id: &str,
+        project_id: &str,
+        actor_user_id: Option<Uuid>,
+        job_id: Uuid,
+    ) -> Result<Vec<super::AdditionalImageResult>, ImageGatewayError> {
+        additional_images::project(self, tenant_id, project_id, actor_user_id, job_id).await
     }
 
     async fn project_image_job_by_idempotency_key(

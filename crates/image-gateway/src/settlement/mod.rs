@@ -65,6 +65,26 @@ pub trait ExecutionSettlementStore: Send + Sync + 'static {
         Ok(None)
     }
 
+    async fn validate_complete_image_result_budget(
+        &self,
+        _tenant_id: &str,
+        _project_id: &str,
+        _actor_user_id: Option<uuid::Uuid>,
+        _job_id: uuid::Uuid,
+    ) -> Result<(), ImageGatewayError> {
+        Ok(())
+    }
+
+    async fn project_additional_image_results(
+        &self,
+        _tenant_id: &str,
+        _project_id: &str,
+        _actor_user_id: Option<uuid::Uuid>,
+        _job_id: uuid::Uuid,
+    ) -> Result<Vec<AdditionalImageResult>, ImageGatewayError> {
+        Ok(Vec::new())
+    }
+
     async fn project_image_job_by_idempotency_key(
         &self,
         _tenant_id: &str,
@@ -151,6 +171,15 @@ pub enum GenerationResultLookup {
     Available(StoredGenerationResult),
     Expired,
     Missing,
+}
+
+#[derive(Debug)]
+pub struct AdditionalImageResult {
+    pub source_index: usize,
+    pub bytes: Vec<u8>,
+    pub sha256: String,
+    pub byte_size: u64,
+    pub mime_type: String,
 }
 
 #[derive(Debug)]

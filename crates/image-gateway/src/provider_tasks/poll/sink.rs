@@ -68,6 +68,7 @@ pub struct ProviderArtifactStageContext {
     submission_id: Uuid,
     executor_execution_id: Uuid,
     poll_lease_epoch: i64,
+    artifact_id: Option<Uuid>,
 }
 
 impl ProviderArtifactStageContext {
@@ -79,6 +80,7 @@ impl ProviderArtifactStageContext {
             submission_id: member.submission_id,
             executor_execution_id: member.executor_execution_id,
             poll_lease_epoch: lease.poll_lease_epoch,
+            artifact_id: None,
         }
     }
 
@@ -87,7 +89,25 @@ impl ProviderArtifactStageContext {
             submission_id: lease.task.submission_id,
             executor_execution_id: lease.task.executor_execution_id,
             poll_lease_epoch: lease.poll_lease_epoch,
+            artifact_id: None,
         }
+    }
+
+    pub(crate) fn for_additional_image(
+        lease: &ProviderTaskLease,
+        source_index: usize,
+    ) -> Option<Self> {
+        Some(Self {
+            artifact_id: Some(super::super::additional_image_artifact_id(
+                lease.task.executor_execution_id,
+                source_index,
+            )?),
+            ..Self::from_lease(lease)
+        })
+    }
+
+    pub fn artifact_id(&self) -> Uuid {
+        self.artifact_id.unwrap_or(self.executor_execution_id)
     }
 
     pub fn submission_id(&self) -> Uuid {

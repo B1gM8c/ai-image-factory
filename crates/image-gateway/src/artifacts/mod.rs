@@ -95,6 +95,14 @@ pub trait ArtifactBlobStore: Send + Sync + 'static {
 
     async fn get(&self, artifact: &ArtifactMetadata) -> Result<Vec<u8>, ArtifactReadError>;
 
+    async fn get_additional_image(
+        &self,
+        _artifact: &ArtifactMetadata,
+        _storage_namespace: &str,
+    ) -> Result<Vec<u8>, ArtifactReadError> {
+        Err(ArtifactReadError::Unavailable)
+    }
+
     async fn delete(&self, artifact: &ArtifactMetadata) -> Result<(), ArtifactWriteError>;
 }
 

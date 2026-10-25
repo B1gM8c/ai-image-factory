@@ -8,8 +8,9 @@ use crate::{
     artifacts::MAX_ARTIFACT_BYTES,
     provider_tasks::{
         ProviderAccountHomeCapability, ProviderAccountHomeCapabilityError,
-        ProviderNativeBatchArtifactSink, ProviderNativeBatchPollObservation, ProviderPollDriver,
-        ProviderPollDriverCall, ProviderRuntimeProfile,
+        ProviderAdditionalImageArtifactSink, ProviderNativeBatchArtifactSink,
+        ProviderNativeBatchPollObservation, ProviderPollDriver, ProviderPollDriverCall,
+        ProviderRuntimeProfile,
     },
 };
 use image_cli_runtime::{
@@ -135,6 +136,16 @@ impl DreaminaCliPollDriverV1 {
         remote_video: bool,
         sink: &mut S,
     ) -> Result<PollObservation, ProviderFailure> {
+        self.poll_image_results(operation, remote_video, &mut SingleImageSink(sink))
+            .await
+    }
+
+    async fn poll_image_results<S: ProviderAdditionalImageArtifactSink>(
+        &self,
+        operation: &RemoteOperationRef,
+        remote_video: bool,
+        sink: &mut S,
+    ) -> Result<PollObservation, ProviderFailure> {
         let attempt = self
             .workspace
             .create_attempt()
@@ -203,30 +214,42 @@ impl DreaminaCliPollDriverV1 {
             }
             DreaminaQueryStatusV1::Success => {
                 let files = output.verify_files(10).map_err(map_fresh_output_error)?;
-                let multiple_outputs = files.len() > 1;
-                let file = single_image_output(files, &receipt)?;
-                let bridge = ArtifactSinkBridge::new(sink);
-                let (sealed, bridge) = file
-                    .seal_to_async_sink(bridge)
-                    .await
-                    .map_err(map_output_seal_error)?;
-                let (prefix, prefix_len) = bridge.into_prefix();
-                let media_type = artifact_media_type(&prefix[..prefix_len])
-                    .filter(|media_type| !multiple_outputs || media_type.starts_with("image/"))
-                    .ok_or_else(|| contract_failure("dreamina_poll_media_invalid"))?;
-                let manifest = sink
-                    .finalize(ArtifactMetadata { media_type })
-                    .await
-                    .map_err(map_sink_error)?;
-                let mut sealed_sha256 = [0_u8; 32];
-                if hex::decode_to_slice(&sealed.sha256_hex, &mut sealed_sha256).is_err()
-                    || manifest.byte_size() != sealed.byte_size
-                    || manifest.media_type() != media_type
-                    || manifest.sha256() != &sealed_sha256
-                {
-                    return Err(contract_failure("dreamina_poll_manifest_mismatch"));
+                let files = ordered_image_outputs(files, &receipt)?;
+                if files.len() > sink.image_capacity() {
+                    return Err(contract_failure("dreamina_additional_image_sink_required"));
                 }
-                Ok(PollObservation::Completed(Completed::new(manifest, None)))
+                let multiple_outputs = files.len() > 1;
+                let mut primary = None;
+                for (source_index, file) in files.into_iter().enumerate() {
+                    sink.select_image(source_index).map_err(map_sink_error)?;
+                    let bridge = ArtifactSinkBridge::new(sink);
+                    let (sealed, bridge) = file
+                        .seal_to_async_sink(bridge)
+                        .await
+                        .map_err(map_output_seal_error)?;
+                    let (prefix, prefix_len) = bridge.into_prefix();
+                    let media_type = artifact_media_type(&prefix[..prefix_len])
+                        .filter(|media_type| !multiple_outputs || media_type.starts_with("image/"))
+                        .ok_or_else(|| contract_failure("dreamina_poll_media_invalid"))?;
+                    let manifest = sink
+                        .finalize(ArtifactMetadata { media_type })
+                        .await
+                        .map_err(map_sink_error)?;
+                    let mut sealed_sha256 = [0_u8; 32];
+                    if hex::decode_to_slice(&sealed.sha256_hex, &mut sealed_sha256).is_err()
+                        || manifest.byte_size() != sealed.byte_size
+                        || manifest.media_type() != media_type
+                        || manifest.sha256() != &sealed_sha256
+                    {
+                        return Err(contract_failure("dreamina_poll_manifest_mismatch"));
+                    }
+                    if source_index == 0 {
+                        primary = Some(manifest);
+                    }
+                }
+                let primary =
+                    primary.ok_or_else(|| contract_failure("dreamina_poll_artifact_invalid"))?;
+                Ok(PollObservation::Completed(Completed::new(primary, None)))
             }
         }
     }
@@ -362,6 +385,20 @@ impl ProviderPollDriver for DreaminaCliPollDriverV1 {
         .await
     }
 
+    async fn poll_with_additional_images<S: ProviderAdditionalImageArtifactSink>(
+        &self,
+        call: &ProviderPollDriverCall,
+        sink: &mut S,
+    ) -> Result<PollObservation, ProviderFailure> {
+        self.validate_poll_call(call)?;
+        if call.execution_context().operation_id() != "images.generations" {
+            return Err(contract_failure(
+                "dreamina_additional_image_operation_invalid",
+            ));
+        }
+        self.poll_image_results(call.operation(), false, sink).await
+    }
+
     async fn poll_native_batch<S: ProviderNativeBatchArtifactSink>(
         &self,
         call: &ProviderPollDriverCall,
@@ -379,12 +416,15 @@ impl ProviderPollDriver for DreaminaCliPollDriverV1 {
     }
 }
 
-fn single_image_output(
-    mut files: Vec<VerifiedFreshOutputFile>,
+fn ordered_image_outputs(
+    files: Vec<VerifiedFreshOutputFile>,
     receipt: &DreaminaQueryReceiptV1,
-) -> Result<VerifiedFreshOutputFile, ProviderFailure> {
+) -> Result<Vec<VerifiedFreshOutputFile>, ProviderFailure> {
     if files.len() == 1 {
-        return Ok(files.pop().expect("the sole output exists"));
+        if receipt.has_result_metadata() && receipt.image_result_count() != Some(1) {
+            return Err(contract_failure("dreamina_poll_artifact_invalid"));
+        }
+        return Ok(files);
     }
     let count = files.len();
     if receipt.image_result_count() != Some(count) {
@@ -392,7 +432,7 @@ fn single_image_output(
     }
     let prefix = format!("{}_image_", receipt.submit_id());
     let mut seen = [false; 10];
-    let mut selected = None;
+    let mut selected = (0..count).map(|_| None).collect::<Vec<_>>();
     for file in files {
         let (index, extension) = file
             .relative_filename()
@@ -409,11 +449,43 @@ fn single_image_output(
             return Err(contract_failure("dreamina_poll_artifact_invalid"));
         }
         seen[source_index - 1] = true;
-        if source_index == 1 {
-            selected = Some(file);
+        selected[source_index - 1] = Some(file);
+    }
+    selected
+        .into_iter()
+        .map(|file| file.ok_or_else(|| contract_failure("dreamina_poll_artifact_invalid")))
+        .collect()
+}
+
+/// A legacy caller cannot silently throw away additional physical results.
+struct SingleImageSink<'a, S>(&'a mut S);
+
+impl<S: ArtifactSink> ProviderAdditionalImageArtifactSink for SingleImageSink<'_, S> {
+    fn select_image(&mut self, source_index: usize) -> Result<(), ArtifactSinkError> {
+        if source_index == 0 {
+            Ok(())
+        } else {
+            Err(ArtifactSinkError::new(
+                ArtifactSinkErrorKind::InvalidArtifact,
+                "dreamina_additional_image_sink_required",
+            ))
         }
     }
-    selected.ok_or_else(|| contract_failure("dreamina_poll_artifact_invalid"))
+    fn image_capacity(&self) -> usize {
+        1
+    }
+}
+
+impl<S: ArtifactSink> ArtifactSink for SingleImageSink<'_, S> {
+    async fn write_chunk(&mut self, chunk: &[u8]) -> Result<(), ArtifactSinkError> {
+        self.0.write_chunk(chunk).await
+    }
+    async fn finalize(
+        &mut self,
+        metadata: ArtifactMetadata<'_>,
+    ) -> Result<image_provider_sdk::DurableArtifactManifest, ArtifactSinkError> {
+        self.0.finalize(metadata).await
+    }
 }
 
 struct ArtifactSinkBridge<'a, S> {
