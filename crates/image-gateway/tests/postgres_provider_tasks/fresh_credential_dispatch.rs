@@ -387,12 +387,16 @@ mod process_release {
         )
     }
 
+    // Match the existing 30s orchestrator budget without changing its deadline.
+    const STARTUP_BUDGET_MS: u64 = 30_000;
+
     #[derive(Clone)]
     struct RevokeAtProcessReleaseStore {
         inner: PostgresProviderTaskStore,
         pool: PgPool,
         calls: Arc<AtomicUsize>,
         revoke: Arc<AtomicBool>,
+        startup_ready: Option<Arc<Semaphore>>,
         guard_ready: Option<Arc<Semaphore>>,
         guard_proceed: Option<Arc<Semaphore>>,
     }
@@ -413,6 +417,11 @@ mod process_release {
             }
             let guard =
                 ProviderTaskStore::guard_submit_credentials(&self.inner, intent, context).await?;
+            if call == 1 {
+                if let Some(ready) = &self.startup_ready {
+                    ready.add_permits(1);
+                }
+            }
             if call == 2 {
                 if let (Some(ready), Some(proceed)) = (&self.guard_ready, &self.guard_proceed) {
                     ready.add_permits(1);
@@ -552,7 +561,7 @@ mod process_release {
             let revoke = Arc::new(AtomicBool::new(true));
             let store = RevokeAtProcessReleaseStore {
                 inner: PostgresProviderTaskStore::new(database.pool.clone()),
-                pool: database.pool.clone(), calls: calls.clone(), revoke: revoke.clone(), guard_ready: None, guard_proceed: None,
+                pool: database.pool.clone(), calls: calls.clone(), revoke: revoke.clone(), startup_ready: None, guard_ready: None, guard_proceed: None,
             };
             let driver = GatedCliSubmitDriver::new(LocalCodec { side_effect: side_effect.clone(), shell_sha256: hex::encode(Sha256::digest(fs::read("/bin/sh").map_err(debug_error)?)), finish: None }, runner,
                 hex::encode(Sha256::digest(fs::read(runner).map_err(debug_error)?)), WorkingDirectory::new_private(&workspace).map_err(debug_error)?).map_err(debug_error)?;
@@ -603,11 +612,13 @@ mod process_release {
             fs::set_permissions(&workspace, fs::Permissions::from_mode(0o700))
                 .map_err(debug_error)?;
             let calls = Arc::new(AtomicUsize::new(0));
+            let startup_ready = Arc::new(Semaphore::new(0));
             let store = RevokeAtProcessReleaseStore {
                 inner: PostgresProviderTaskStore::new(database.pool.clone()),
                 pool: database.pool.clone(),
                 calls: calls.clone(),
                 revoke: Arc::new(AtomicBool::new(false)),
+                startup_ready: Some(startup_ready.clone()),
                 guard_ready: None,
                 guard_proceed: None,
             };
@@ -629,11 +640,21 @@ mod process_release {
                 ProviderSubmitOrchestrator::new(store, driver, 30_000, &journal)
                     .map_err(debug_error)?,
             );
-            let submit = {
+            let mut submit = {
                 let orchestrator = orchestrator.clone();
                 let work = ProviderSubmitWork::new(&lease, command(&lease)).map_err(debug_error)?;
                 tokio::spawn(async move { orchestrator.submit(work).await })
             };
+            // Runner verification belongs to startup and uses the provider's
+            // existing budget. Start the short invocation assertion only after
+            // prepare has finished and the first credential guard is reached.
+            tokio::time::timeout(Duration::from_millis(STARTUP_BUDGET_MS), async {
+                tokio::select! {
+                    ready = startup_ready.acquire() => ready.map_err(debug_error)?.forget(),
+                    outcome = &mut submit => return Err(format!("submit ended before prepared startup: {outcome:?}")),
+                }
+                Ok(())
+            }).await.map_err(|_| process_wait_diagnostic("driver startup within provider budget", &journal, lease.submission_id, &calls, submit.is_finished()))??;
             tokio::time::timeout(Duration::from_secs(5), async {
                 while !side_effect.exists() {
                     tokio::time::sleep(Duration::from_millis(10)).await;
@@ -700,6 +721,9 @@ mod process_release {
     fn fresh_credential_cancelled_release_retains_lock_in_the_marker_worker() -> TestResult {
         tokio::runtime::Builder::new_multi_thread().worker_threads(1).max_blocking_threads(1)
             .enable_all().build().map_err(debug_error)?.block_on(async {
+                // Run both the test and submit futures on the sole async worker;
+                // Runtime::block_on itself otherwise runs on the calling thread.
+                tokio::spawn(async {
                 let Some(database) = TestDatabase::new().await? else { return Ok(()); };
                 let result = async {
                     prepare(&database.pool).await?;
@@ -710,13 +734,14 @@ mod process_release {
                     let workspace = root.path().join("workspace");
                     fs::create_dir(&workspace).map_err(debug_error)?;
                     fs::set_permissions(&workspace, fs::Permissions::from_mode(0o700)).map_err(debug_error)?;
+                    let startup_ready = Arc::new(Semaphore::new(0));
                     let ready = Arc::new(Semaphore::new(0));
                     let proceed = Arc::new(Semaphore::new(0));
                     let calls = Arc::new(AtomicUsize::new(0));
                     let store = RevokeAtProcessReleaseStore {
                         inner: PostgresProviderTaskStore::new(database.pool.clone()), pool: database.pool.clone(),
                         calls: calls.clone(), revoke: Arc::new(AtomicBool::new(false)),
-                        guard_ready: Some(ready.clone()), guard_proceed: Some(proceed.clone()),
+                        startup_ready: Some(startup_ready.clone()), guard_ready: Some(ready.clone()), guard_proceed: Some(proceed.clone()),
                     };
                     let driver = GatedCliSubmitDriver::new(LocalCodec {
                         side_effect: side_effect.clone(), finish: None,
@@ -724,8 +749,15 @@ mod process_release {
                     }, runner, hex::encode(Sha256::digest(fs::read(runner).map_err(debug_error)?)), WorkingDirectory::new_private(&workspace).map_err(debug_error)?).map_err(debug_error)?;
                     let journal = root.path().join("journal");
                     let orchestrator = Arc::new(ProviderSubmitOrchestrator::new(store, driver, 30_000, &journal).map_err(debug_error)?);
-                    let submit = { let orchestrator = orchestrator.clone(); let work = ProviderSubmitWork::new(&lease, command(&lease)).map_err(debug_error)?;
+                    let mut submit = { let orchestrator = orchestrator.clone(); let work = ProviderSubmitWork::new(&lease, command(&lease)).map_err(debug_error)?;
                         tokio::spawn(async move { orchestrator.submit(work).await }) };
+                    tokio::time::timeout(Duration::from_millis(STARTUP_BUDGET_MS), async {
+                        tokio::select! {
+                            ready = startup_ready.acquire() => ready.map_err(debug_error)?.forget(),
+                            outcome = &mut submit => return Err(format!("submit ended before prepared startup: {outcome:?}")),
+                        }
+                        Ok(())
+                    }).await.map_err(|_| process_wait_diagnostic("driver startup within provider budget", &journal, lease.submission_id, &calls, submit.is_finished()))??;
                     tokio::time::timeout(Duration::from_secs(5), ready.acquire()).await
                         .map_err(|_| process_wait_diagnostic("cancel fixture process credential guard", &journal, lease.submission_id, &calls, submit.is_finished()))?
                         .map_err(debug_error)?.forget();
@@ -760,6 +792,7 @@ mod process_release {
                         "cancelled authorized process could not be observed exactly once after reauth")
                 }.await;
                 combine(result, database.cleanup().await)
+                }).await.map_err(debug_error)?
             })
     }
 }
