@@ -59,7 +59,8 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Test workspace
-        run: cargo test --locked --package gpt-image-2-gateway --test postgres_provider_tasks fresh_credential_dispatch::process_release:: -- --test-threads=1 --nocapture
+        run: |
+          cargo test --locked --package gpt-image-2-gateway --test postgres_provider_tasks fresh_credential_dispatch::process_release:: -- --test-threads=1 --nocapture
 
   admin-console:
     if: ${{ false }}
