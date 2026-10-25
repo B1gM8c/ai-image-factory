@@ -283,7 +283,8 @@ where
             return Ok(ProviderPollRun::Observed(task));
         }
 
-        if lease.task.provider_id == "dreamina-cli"
+        if self.driver.supports_additional_images()
+            && lease.task.provider_id == "dreamina-cli"
             && lease.context().operation_id() == "images.generations"
         {
             return Box::pin(self.run_with_additional_images(lease, claim_started_at)).await;

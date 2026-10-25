@@ -173,6 +173,10 @@ struct FourImages {
     calls: Arc<AtomicUsize>,
 }
 impl ProviderPollDriver for FourImages {
+    fn supports_additional_images(&self) -> bool {
+        true
+    }
+
     fn provider_id(&self) -> &'static str {
         DREAMINA_PROVIDER_ID
     }
