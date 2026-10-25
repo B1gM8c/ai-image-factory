@@ -4874,21 +4874,22 @@ async fn concurrent_submit_recovery_command_retries_share_one_result() -> TestRe
         return Ok(());
     };
     let result = async {
+        // Build the frozen invocation before waiting for its persisted deadline.
+        const SETUP_LEASE_MS: i64 = 5_000;
         let executor =
-            seed_running_submission_with_lease(&database.pool, "same-recovery-command", 200)
+            seed_running_submission_with_lease(&database.pool, "same-recovery-command", SETUP_LEASE_MS)
                 .await?;
         let store = PostgresProviderTaskStore::new(database.pool.clone());
         let mut reservation = reservation_request(&executor);
         reservation.provider_timeout_ms = 60_000;
-        store
-            .reserve_submit(&reservation)
-            .await
-            .map_err(debug_error)?;
-        store
-            .start_submit(&reservation)
-            .await
-            .map_err(debug_error)?;
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        if let Err(error) = store.reserve_submit(&reservation).await {
+            return Err(submit_fixture_error(&database.pool, "command retry reserve_submit", &executor, format!("{error:?}")).await);
+        }
+        if let Err(error) = store.start_submit(&reservation).await {
+            return Err(submit_fixture_error(&database.pool, "command retry start_submit", &executor, format!("{error:?}")).await);
+        }
+        sleep_until_database_time(&database.pool, executor.executor_lease_expires_at_ms + 20)
+            .await?;
 
         let scope = claim_scope();
         let (left, right) = tokio::join!(

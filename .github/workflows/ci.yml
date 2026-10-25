@@ -63,6 +63,7 @@ jobs:
           fixture_exit=0
           cargo test --locked --package gpt-image-2-gateway --test postgres_provider_tasks submit_recovery_leases_reject_cross_submission_splicing -- --exact --test-threads=1 --nocapture || fixture_exit=1
           cargo test --locked --package gpt-image-2-gateway --test postgres_provider_tasks submit_service_prioritizes_expired_recovery_before_fresh_work -- --exact --test-threads=1 --nocapture || fixture_exit=1
+          cargo test --locked --package gpt-image-2-gateway --test postgres_provider_tasks concurrent_submit_recovery_command_retries_share_one_result -- --exact --test-threads=1 --nocapture || fixture_exit=1
           exit "$fixture_exit"
 
   admin-console:
