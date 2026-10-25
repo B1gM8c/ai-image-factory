@@ -147,6 +147,7 @@ impl GrokDiagnosticV1 {
     }
 
     pub(super) fn receipt_tool_failure(
+        http_status: Option<u16>,
         upstream_code: Option<&str>,
         upstream_type: Option<&str>,
         message_sha256: &str,
@@ -156,7 +157,7 @@ impl GrokDiagnosticV1 {
             schema_version: 1,
             stage: "receipt".to_owned(),
             class: "tool_execution_failed".to_owned(),
-            http_status: None,
+            http_status,
             upstream_code: upstream_code.and_then(safe_token),
             upstream_type: upstream_type.and_then(safe_token),
             message_sha256: safe_sha256(message_sha256),
@@ -810,6 +811,25 @@ mod tests {
         assert!(!serialized.contains("rewritten prompt"));
         assert!(serialized.contains("expected_sha256"));
         assert!(serialized.contains("actual_sha256"));
+    }
+
+    #[test]
+    fn receipt_failure_persists_http_metadata_without_changing_failure_class() {
+        let digest = sha256(b"private upstream body");
+        let diagnostic = GrokDiagnosticV1::receipt_tool_failure(
+            Some(401),
+            Some("invalid_api_key"),
+            Some("authentication_error"),
+            &digest,
+            21,
+        );
+        let saved = serde_json::to_value(&diagnostic).unwrap();
+        assert_eq!(saved["http_status"], 401);
+        assert_eq!(saved["upstream_code"], "invalid_api_key");
+        assert_eq!(saved["upstream_type"], "authentication_error");
+        assert_eq!(saved["class"], "tool_execution_failed");
+        assert_eq!(saved["message_sha256"], digest);
+        assert!(!saved.to_string().contains("private upstream body"));
     }
 
     #[test]

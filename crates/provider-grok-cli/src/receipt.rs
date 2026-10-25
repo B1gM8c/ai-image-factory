@@ -116,6 +116,7 @@ pub enum GrokReceiptError {
     VideoOutputUploadUrlRequired,
     #[error("Grok tool execution failed")]
     ToolExecutionFailed {
+        http_status: Option<u16>,
         upstream_code: Option<String>,
         upstream_type: Option<String>,
         message_sha256: String,
@@ -163,12 +164,20 @@ impl GrokReceiptError {
                 upstream_type,
                 message_sha256,
                 message_bytes,
+                ..
             } => Some((
                 upstream_code.as_deref(),
                 upstream_type.as_deref(),
                 message_sha256,
                 *message_bytes,
             )),
+            _ => None,
+        }
+    }
+
+    pub fn tool_execution_http_status(&self) -> Option<u16> {
+        match self {
+            Self::ToolExecutionFailed { http_status, .. } => *http_status,
             _ => None,
         }
     }
@@ -655,31 +664,69 @@ fn tool_execution_failed(content: &str) -> GrokReceiptError {
         .map(|(_, detail)| detail.trim())
         .filter(|detail| !detail.is_empty())
         .unwrap_or(content);
-    let parsed: Option<Value> = serde_json::from_str(detail).ok();
+    // CLI video errors wrap the upstream JSON in an HTTP status line. Do not
+    // search arbitrary message text for JSON or retain that private text.
+    let wrapped = detail
+        .strip_prefix("Video generation failed with HTTP ")
+        .and_then(|value| value.split_once(':'))
+        .and_then(|(status_line, body)| {
+            let status = status_line.split_ascii_whitespace().next()?;
+            let status = (status.len() == 3)
+                .then(|| status.parse::<u16>().ok())
+                .flatten()
+                .filter(|status| (400..=599).contains(status))?;
+            Some((status, body.trim()))
+        });
+    let (http_status, body) = wrapped
+        .map(|(status, body)| (Some(status), body))
+        .unwrap_or((None, detail));
+    let parsed: Option<Value> = serde_json::from_str(body).ok();
     let error = parsed.as_ref().and_then(|value| value.get("error"));
     let safe_token = |value: &str| {
-        let value = value.trim();
-        (!value.is_empty()
-            && value.len() <= 128
-            && value.bytes().all(|byte| {
-                byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':')
-            }))
+        matches!(
+            value,
+            "unauthorized"
+                | "authentication_error"
+                | "invalid_api_key"
+                | "token_expired"
+                | "rate_limit_exceeded"
+                | "rate_limit_error"
+                | "invalid_request_error"
+                | "invalid_argument"
+                | "invalid-argument"
+                | "unsupported_parameter"
+                | "permission_denied"
+                | "resource_exhausted"
+                | "internal_error"
+                | "server_error"
+                | "not_found"
+                | "deadline_exceeded"
+                | "unavailable"
+        )
         .then(|| value.to_owned())
     };
     let upstream_code = error
         .and_then(|value| value.get("code"))
+        .or_else(|| parsed.as_ref().and_then(|value| value.get("code")))
         .and_then(Value::as_str)
         .and_then(safe_token);
     let upstream_type = error
         .and_then(|value| value.get("type"))
+        .or_else(|| parsed.as_ref().and_then(|value| value.get("type")))
         .and_then(Value::as_str)
         .and_then(safe_token);
     let message = error
         .and_then(|value| value.get("message"))
         .and_then(Value::as_str)
         .or_else(|| error.and_then(Value::as_str))
-        .unwrap_or(detail);
+        .or_else(|| {
+            parsed
+                .as_ref()
+                .and_then(|value| value.get("message")?.as_str())
+        })
+        .unwrap_or(body);
     GrokReceiptError::ToolExecutionFailed {
+        http_status,
         upstream_code,
         upstream_type,
         message_sha256: hex_sha256(message.as_bytes()),
