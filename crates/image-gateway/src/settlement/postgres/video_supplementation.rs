@@ -19,6 +19,7 @@ use sqlx::{AssertSqlSafe, Postgres, Transaction};
 use std::path::Path;
 use uuid::Uuid;
 mod evidence;
+pub(super) mod progress;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DreaminaVideoSupplementAuthorizationRequest {

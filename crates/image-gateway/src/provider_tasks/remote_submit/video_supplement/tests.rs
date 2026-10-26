@@ -3,6 +3,49 @@ use std::io::Write;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+#[tokio::test]
+async fn frozen_image_and_audio_input_rows_decode_postgres_smallint_indices() {
+    let Ok(url) = env::var("TEST_DATABASE_URL") else {
+        assert!(
+            env::var_os("CI").is_none(),
+            "TEST_DATABASE_URL must be set in CI"
+        );
+        return;
+    };
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&url)
+        .await
+        .unwrap();
+    // job_input_objects.input_index is SMALLINT (migration 0007), even for
+    // multimodal requests whose image and audio indices share one sequence.
+    let sql = r#"
+        SELECT '11111111-1111-4111-8111-111111111111'::uuid AS admission_session_id,
+               input_id, role, input_index, media_type,
+               'filesystem-v1'::text AS storage_backend,
+               'inputs/frozen'::text AS object_key,
+               repeat('a', 64) AS sha256_hex, 10::bigint AS byte_size
+        FROM (VALUES
+            ('22222222-2222-4222-8222-222222222222'::uuid, 'image'::text, 0::smallint, 'image/jpeg'::text),
+            ('33333333-3333-4333-8333-333333333333'::uuid, 'audio'::text, 1::smallint, 'audio/mpeg'::text)
+        ) AS inputs(input_id, role, input_index, media_type)
+        ORDER BY input_index
+    "#;
+    let old_decode =
+        sqlx::query_as::<_, (Uuid, Uuid, String, i32, String, String, String, String, i64)>(sql)
+            .fetch_all(&pool)
+            .await;
+    assert!(matches!(old_decode, Err(sqlx::Error::ColumnDecode { .. })));
+    let rows = sqlx::query_as::<_, InputRow>(sql)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!((rows[0].role.as_str(), rows[0].input_index), ("image", 0));
+    assert_eq!((rows[1].role.as_str(), rows[1].input_index), ("audio", 1));
+    pool.close().await;
+}
+
 struct DurableFakeStore {
     path: PathBuf,
     runtime_binding: serde_json::Value,
