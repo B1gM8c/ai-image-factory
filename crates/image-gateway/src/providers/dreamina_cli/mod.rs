@@ -32,6 +32,7 @@ use crate::{
 
 mod credential_environment;
 mod poll;
+pub(crate) use poll::pending_progress;
 
 pub use credential_environment::{
     DreaminaCredentialEnvironmentError, DreaminaKeychainReplacement,

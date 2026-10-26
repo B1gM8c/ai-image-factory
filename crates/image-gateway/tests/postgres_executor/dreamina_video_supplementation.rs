@@ -274,6 +274,61 @@ async fn seed_supplement_video(
 }
 
 #[tokio::test]
+async fn supplement_progress_tracks_only_the_accepted_attempt_without_settling() -> TestResult {
+    use gpt_image_2_gateway::settlement::{VideoPendingStage, VideoResultStatus};
+    let Some(db) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let fixture = fixture_with_audio(&db.pool, "seedance2.0fast_vip", 1).await?;
+        let store = store(&db.pool);
+        let plan = store.authorize_dreamina_video_supplement(&fixture.request).await.map_err(debug_error)?;
+        require(matches!(store.video_status("executord-process-smoke", plan.job_id).await.map_err(debug_error)?, Some(VideoResultStatus::Uncertain { .. })), "unsubmitted supplement claimed acceptance")?;
+        store.claim_dreamina_video_supplement_dispatch(plan.authorization_id, plan.dispatch_nonce, &plan.runtime_binding_json).await.map_err(debug_error)?.ok_or("missing one-shot permit")?;
+        let (accepted, _) = evidence(&fixture, &plan)?;
+        store.record_dreamina_video_supplement_accepted(&accepted).await.map_err(debug_error)?;
+        require(matches!(store.video_status("executord-process-smoke", plan.job_id).await.map_err(debug_error)?, Some(VideoResultStatus::Pending { stage: VideoPendingStage::Processing, provider_progress: None, .. })), "accepted attempt did not project pending")?;
+        let at = database_now(&db.pool).await?;
+        let raw = serde_json::to_vec(&json!({"submit_id":accepted.remote_operation_id,"gen_status":"querying","queue_info":{"queue_idx":610,"queue_length":233061,"queue_status":"Queueing"},"estimated_remaining_seconds":5860})).map_err(debug_error)?;
+        store.record_dreamina_video_supplement_observation(plan.authorization_id, plan.dispatch_nonce, &raw, at).await.map_err(debug_error)?;
+        store.record_dreamina_video_supplement_observation(plan.authorization_id, plan.dispatch_nonce, &raw, at).await.map_err(debug_error)?;
+        require(store.record_dreamina_video_supplement_observation(plan.authorization_id, Uuid::new_v4(), &raw, at).await.is_err(), "unbound nonce accepted")?;
+        let statuses = [
+            store.video_status("executord-process-smoke", plan.job_id).await.map_err(debug_error)?.ok_or("missing tenant read")?,
+            store.project_video_status("executord-process-smoke", "project-test", None, plan.job_id).await.map_err(debug_error)?.ok_or("missing scoped read")?,
+            store.project_video_status_with_metadata("executord-process-smoke", "project-test", None, plan.job_id).await.map_err(debug_error)?.ok_or("missing metadata read")?.0,
+        ];
+        for status in statuses {
+            require(matches!(status, VideoResultStatus::Pending { stage: VideoPendingStage::Processing, provider_progress: Some(ref value), .. }
+                if value.observed_at_ms == at && value.progress.provider_status == "Queueing"
+                    && value.progress.queue_position == Some(610) && value.progress.queue_total == Some(233061)
+                    && value.progress.estimated_remaining_seconds == Some(5860)), "queue observation was not projected exactly")?;
+        }
+        for (tenant, project, actor) in [
+            ("wrong-tenant", "project-test", None),
+            ("executord-process-smoke", "wrong-project", None),
+            ("executord-process-smoke", "project-test", Some(Uuid::new_v4())),
+        ] {
+            require(store.project_video_status(tenant, project, actor, plan.job_id).await.map_err(debug_error)?.is_none(), "progress escaped original scope")?;
+            require(store.project_video_status_with_metadata(tenant, project, actor, plan.job_id).await.map_err(debug_error)?.is_none(), "metadata progress escaped original scope")?;
+        }
+        for (status, expected_pending) in [("fail", false), ("success", true)] {
+            let raw = serde_json::to_vec(&json!({"submit_id":accepted.remote_operation_id,"gen_status":status})).map_err(debug_error)?;
+            store.record_dreamina_video_supplement_observation(plan.authorization_id, plan.dispatch_nonce, &raw, at + if expected_pending { 2 } else { 1 }).await.map_err(debug_error)?;
+            let read = store.video_status("executord-process-smoke", plan.job_id).await.map_err(debug_error)?.ok_or("missing original")?;
+            require(if expected_pending { matches!(read, VideoResultStatus::Pending { provider_progress: None, .. }) } else { matches!(read, VideoResultStatus::Uncertain { .. }) }, "terminal query fabricated delivery or refund")?;
+            assert_pending(&db.pool, plan.job_id).await?;
+        }
+        require(store.claim_dreamina_video_supplement_dispatch(plan.authorization_id, plan.dispatch_nonce, &plan.runtime_binding_json).await.map_err(debug_error)?.is_none(), "progress reopened generation permit")?;
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM dreamina_operator_video_supplement_observations WHERE authorization_id=$1").bind(plan.authorization_id).fetch_one(&db.pool).await.map_err(debug_error)?;
+        require(count == 3, "duplicate observation was not idempotent")?;
+        require(sqlx::query("UPDATE dreamina_operator_video_supplement_observations SET query_status='success' WHERE authorization_id=$1").bind(plan.authorization_id).execute(&db.pool).await.is_err(), "observation mutation was allowed")
+    }.await;
+    let cleanup = db.cleanup().await;
+    result.and(cleanup)
+}
+
+#[tokio::test]
 async fn supplement_concurrent_claim_has_one_permit_and_failures_hold_funds() -> TestResult {
     let Some(db) = TestDatabase::new().await? else {
         return Ok(());
@@ -571,7 +626,7 @@ async fn supplement_local_artifact_scopes_and_byte_integrity_survive_old_actor_w
 }
 
 #[tokio::test]
-async fn supplement_download_not_ready_or_wrong_measured_media_keeps_original_uncertain()
+async fn supplement_download_not_ready_or_wrong_measured_media_keeps_original_unsettled()
 -> TestResult {
     let Some(db) = TestDatabase::new().await? else {
         return Ok(());
@@ -597,7 +652,9 @@ async fn supplement_download_not_ready_or_wrong_measured_media_keeps_original_un
             require(store.publish_dreamina_video_supplement(&fixture.root,&publish).await.is_err(),"wrong measured media published")?;
             assert_pending(&db.pool,plan.job_id).await?;
             require(matches!(store.video_status("executord-process-smoke",plan.job_id).await.map_err(debug_error)?,
-                Some(gpt_image_2_gateway::settlement::VideoResultStatus::Uncertain{..})),"unusable download exposed public success")?;
+                Some(gpt_image_2_gateway::settlement::VideoResultStatus::Pending{
+                    stage:gpt_image_2_gateway::settlement::VideoPendingStage::Processing,
+                    provider_progress:None,..})),"unusable download fabricated delivery or queue progress")?;
         }
         let counts:(i64,i64,i64)=sqlx::query_as("SELECT (SELECT count(*) FROM dreamina_operator_video_supplement_resolutions WHERE job_id=$1),(SELECT count(*) FROM provider_usage_facts WHERE job_id=$1),(SELECT count(*) FROM ledger_transactions WHERE source_job_id=$1)")
             .bind(plan.job_id).fetch_one(&db.pool).await.map_err(debug_error)?;

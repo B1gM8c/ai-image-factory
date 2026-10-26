@@ -327,7 +327,12 @@ impl ExecutionSettlementStore for PostgresExecutionSettlementStore {
         .fetch_optional(&self.pool)
         .await
         .map_err(settlement_unavailable)?;
-        row.map(video_result_status).transpose()
+        let Some(row) = row else { return Ok(None) };
+        let status = video_result_status(row)?;
+        Ok(Some(
+            video_supplementation::progress::project(self, tenant_id, None, None, job_id, status)
+                .await?,
+        ))
     }
 
     async fn project_video_status(
@@ -440,7 +445,19 @@ impl ExecutionSettlementStore for PostgresExecutionSettlementStore {
         .fetch_optional(&self.pool)
         .await
         .map_err(settlement_unavailable)?;
-        row.map(video_result_status).transpose()
+        let Some(row) = row else { return Ok(None) };
+        let status = video_result_status(row)?;
+        Ok(Some(
+            video_supplementation::progress::project(
+                self,
+                tenant_id,
+                Some(project_id),
+                actor_user_id,
+                job_id,
+                status,
+            )
+            .await?,
+        ))
     }
 
     async fn project_video_released_settlement(
@@ -620,11 +637,18 @@ impl ExecutionSettlementStore for PostgresExecutionSettlementStore {
         .fetch_optional(&self.pool)
         .await
         .map_err(settlement_unavailable)?;
-        row.map(|row| {
-            let metadata = video_request_metadata(row.8.as_ref())?;
-            Ok((video_result_status(row)?, metadata))
-        })
-        .transpose()
+        let Some(row) = row else { return Ok(None) };
+        let metadata = video_request_metadata(row.8.as_ref())?;
+        let status = video_supplementation::progress::project(
+            self,
+            tenant_id,
+            Some(project_id),
+            actor_user_id,
+            job_id,
+            video_result_status(row)?,
+        )
+        .await?;
+        Ok(Some((status, metadata)))
     }
 
     async fn load_video_artifact(

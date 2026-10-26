@@ -690,7 +690,7 @@ fn pending_observation(receipt: &DreaminaQueryReceiptV1) -> PollObservation {
     }
 }
 
-fn pending_progress(receipt: &DreaminaQueryReceiptV1) -> (u64, ProviderTaskProgress) {
+pub(crate) fn pending_progress(receipt: &DreaminaQueryReceiptV1) -> (u64, ProviderTaskProgress) {
     let queue = receipt.queue_info();
     let estimate = receipt
         .estimated_remaining_seconds()

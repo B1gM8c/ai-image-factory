@@ -79,7 +79,7 @@ struct InputRow {
     admission_session_id: Uuid,
     input_id: Uuid,
     role: String,
-    input_index: i32,
+    input_index: i16,
     media_type: String,
     storage_backend: String,
     object_key: String,
@@ -343,16 +343,25 @@ pub async fn poll_dreamina_video_supplement_operator(
         &format!("observation-{}", Uuid::new_v4().simple()),
     )?;
     private_write_once(&observation, "query-stdout.json", stdout)?;
+    let observed_at_ms = i64::try_from(now_ms()?).map_err(|_| failure())?;
     private_write_once(
         &observation,
         "observation.json",
         &serde_json::to_vec(&json!({
             "authorization_id": authorization_id, "dispatch_nonce": plan.dispatch_nonce,
             "remote_operation_id": remote, "stdout_sha256": stdout_sha256,
-            "observed_at_ms": now_ms()?, "status": format!("{:?}", parsed.status()),
+            "observed_at_ms": observed_at_ms, "status": format!("{:?}", parsed.status()),
         }))
         .map_err(|_| failure())?,
     )?;
+    store
+        .record_dreamina_video_supplement_observation(
+            authorization_id,
+            plan.dispatch_nonce,
+            stdout,
+            observed_at_ms,
+        )
+        .await?;
     guard.commit().await.map_err(|_| failure())?;
     if parsed.status() != DreaminaQueryStatusV1::Success {
         // Failure never releases/refunds the original held usage.
