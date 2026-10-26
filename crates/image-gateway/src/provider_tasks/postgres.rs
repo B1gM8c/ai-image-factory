@@ -5334,7 +5334,7 @@ async fn check_dreamina_submit_binding(
     Ok(())
 }
 
-async fn lock_dreamina_submit_credentials(
+pub(crate) async fn lock_dreamina_submit_credentials(
     tx: &mut Transaction<'_, Postgres>,
     provider_account_id: Uuid,
     credential_revision: i64,

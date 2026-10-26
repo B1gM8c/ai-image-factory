@@ -389,7 +389,7 @@ fn project_submit_command(
         .map_err(|_| ProviderSubmitProjectionError::InvalidSourceCommand)
 }
 
-fn command_to_gated(
+pub(crate) fn command_to_gated(
     command: &CommandSpec,
     executable_sha256: [u8; 32],
 ) -> Result<GatedCliCommand, ProviderFailure> {
@@ -506,7 +506,7 @@ fn valid_sha256(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
 
-fn dreamina_input_files(
+pub(crate) fn dreamina_input_files(
     request: &DreaminaSubmitRequestV1,
     inputs: &[ExecutorInputObject],
 ) -> Result<Vec<GatedCliInputFile>, ProviderFailure> {

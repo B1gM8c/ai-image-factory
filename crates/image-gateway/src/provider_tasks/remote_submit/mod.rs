@@ -4,6 +4,12 @@ mod driver;
 mod inputs;
 mod journal;
 mod process;
+mod video_supplement;
+
+pub use video_supplement::{
+    DreaminaVideoSupplementOperatorReceipt, dispatch_dreamina_video_supplement_operator,
+    poll_dreamina_video_supplement_operator, prepare_dreamina_video_supplement_operator,
+};
 
 pub use driver::{GatedCliPreparedSubmission, GatedCliSubmitCodec, GatedCliSubmitDriver};
 pub use inputs::GatedCliInputFile;

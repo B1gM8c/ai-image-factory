@@ -10,13 +10,15 @@ use gpt_image_2_gateway::executor::provision_grok_video_v2_execution_profile;
 use gpt_image_2_gateway::{
     BlockedTerminalRequeueError, CodexExecutionProfileProvisioning, CodexProfileProvisioningError,
     DreaminaComplianceRejectionResolutionRequest, DreaminaImageSuccessResolutionRequest,
-    DreaminaVideoSuccessResolutionRequest, ImageGatewayError, OperationalCredentialRefresher,
-    PostgresExecutorTerminalStore, PostgresReconciliationStore, codex_auth_file_sha256,
+    DreaminaVideoSuccessResolutionRequest, DreaminaVideoSupplementAuthorizationRequest,
+    ImageGatewayError, OperationalCredentialRefresher, PostgresExecutorTerminalStore,
+    PostgresReconciliationStore, codex_auth_file_sha256,
     database::{
         DEFAULT_MAX_CONNECTIONS, connect_pool_with_schema, database_schema_from_env,
         database_url_from_env, run_migrations, verify_migrations,
     },
-    grok_auth_file_sha256,
+    dispatch_dreamina_video_supplement_operator, grok_auth_file_sha256,
+    poll_dreamina_video_supplement_operator, prepare_dreamina_video_supplement_operator,
     provider_management::{PostgresProviderManagementService, ProviderManagementService},
     provision_codex_cli_edit_execution_profile, provision_codex_execution_profile,
     provision_grok_edit_execution_profile_replacement, provision_grok_execution_profile,
@@ -64,6 +66,18 @@ enum Command {
         evidence_root: PathBuf,
         request: DreaminaVideoSuccessResolutionRequest,
     },
+    PrepareDreaminaVideoSupplement {
+        evidence_root: PathBuf,
+        request: DreaminaVideoSupplementAuthorizationRequest,
+    },
+    DispatchDreaminaVideoSupplement {
+        evidence_root: PathBuf,
+        authorization_id: Uuid,
+    },
+    PollDreaminaVideoSupplement {
+        evidence_root: PathBuf,
+        authorization_id: Uuid,
+    },
     TerminalizeUnstartedJob {
         job_id: Uuid,
     },
@@ -95,7 +109,7 @@ where
 {
     let mut args = args.into_iter();
     let command = args.next().ok_or_else(|| {
-        "missing command: expected `migrate`, `bootstrap-admin`, `provision-codex-profile`, `provision-codex-cli-edit-profile`, `provision-grok-profile`, `provision-grok-video-profile`, `provision-grok-video-v2-profile`, `provision-grok-image-profile-replacement`, `provision-grok-edit-profile-replacement`, `provision-grok-video-profile-replacement`, `reconcile-execution-profile-routes`, `reconcile-dreamina-profiles`, `reconcile-inline-customer-settlement`, `terminalize-unstarted-job`, `cancel-unlaunched-job`, `refresh-provider-quota`, `refresh-codex-credential`, `resolve-dreamina-compliance-rejection`, `resolve-dreamina-image-success`, `resolve-dreamina-video-success`, or `retry-blocked-terminal`"
+        "missing command: expected `migrate`, `bootstrap-admin`, `provision-codex-profile`, `provision-codex-cli-edit-profile`, `provision-grok-profile`, `provision-grok-video-profile`, `provision-grok-video-v2-profile`, `provision-grok-image-profile-replacement`, `provision-grok-edit-profile-replacement`, `provision-grok-video-profile-replacement`, `reconcile-execution-profile-routes`, `reconcile-dreamina-profiles`, `reconcile-inline-customer-settlement`, `terminalize-unstarted-job`, `cancel-unlaunched-job`, `refresh-provider-quota`, `refresh-codex-credential`, `resolve-dreamina-compliance-rejection`, `resolve-dreamina-image-success`, `resolve-dreamina-video-success`, `prepare-dreamina-video-supplement`, `dispatch-dreamina-video-supplement`, `poll-dreamina-video-supplement`, or `retry-blocked-terminal`"
             .to_string()
     })?;
     let command = match command.as_ref() {
@@ -262,6 +276,60 @@ where
                 },
             }
         }
+        "prepare-dreamina-video-supplement" => {
+            let name = "prepare-dreamina-video-supplement";
+            let mut identity = |field: &str| -> Result<Uuid, String> {
+                required_argument(&mut args, name, field)?
+                    .parse()
+                    .map_err(|_| format!("{name} requires a UUID {field}"))
+            };
+            let job_id = identity("job id")?;
+            let submission_id = identity("submission id")?;
+            let executor_execution_id = identity("executor execution id")?;
+            let expected_command_sha256 =
+                required_argument(&mut args, name, "expected command SHA-256")?;
+            let expected_quote_hash = required_argument(&mut args, name, "expected quote SHA-256")?;
+            let operator_reference = required_argument(&mut args, name, "operator reference")?;
+            let evidence_root = PathBuf::from(required_argument(
+                &mut args,
+                name,
+                "protected evidence root",
+            )?);
+            Command::PrepareDreaminaVideoSupplement {
+                evidence_root,
+                request: DreaminaVideoSupplementAuthorizationRequest {
+                    runtime_binding_json: serde_json::Value::Null,
+                    job_id,
+                    submission_id,
+                    executor_execution_id,
+                    expected_command_sha256,
+                    expected_quote_hash,
+                    operator_reference,
+                },
+            }
+        }
+        "dispatch-dreamina-video-supplement" | "poll-dreamina-video-supplement" => {
+            let name = command.as_ref();
+            let authorization_id = required_argument(&mut args, name, "authorization id")?
+                .parse()
+                .map_err(|_| format!("{name} requires a UUID authorization id"))?;
+            let evidence_root = PathBuf::from(required_argument(
+                &mut args,
+                name,
+                "protected evidence root",
+            )?);
+            if name == "dispatch-dreamina-video-supplement" {
+                Command::DispatchDreaminaVideoSupplement {
+                    evidence_root,
+                    authorization_id,
+                }
+            } else {
+                Command::PollDreaminaVideoSupplement {
+                    evidence_root,
+                    authorization_id,
+                }
+            }
+        }
         "terminalize-unstarted-job" => {
             let job_id = required_argument(&mut args, "terminalize-unstarted-job", "job id")?
                 .parse()
@@ -336,7 +404,7 @@ where
         }
         value => {
             return Err(format!(
-                "unknown command `{value}`: expected `migrate`, `bootstrap-admin`, `provision-codex-profile`, `provision-codex-cli-edit-profile`, `provision-grok-profile`, `provision-grok-video-profile`, `provision-grok-video-v2-profile`, `provision-grok-image-profile-replacement`, `provision-grok-edit-profile-replacement`, `provision-grok-video-profile-replacement`, `reconcile-execution-profile-routes`, `reconcile-dreamina-profiles`, `reconcile-inline-customer-settlement`, `terminalize-unstarted-job`, `cancel-unlaunched-job`, `refresh-provider-quota`, `refresh-codex-credential`, `resolve-dreamina-compliance-rejection`, `resolve-dreamina-image-success`, `resolve-dreamina-video-success`, or `retry-blocked-terminal`"
+                "unknown command `{value}`: expected `migrate`, `bootstrap-admin`, `provision-codex-profile`, `provision-codex-cli-edit-profile`, `provision-grok-profile`, `provision-grok-video-profile`, `provision-grok-video-v2-profile`, `provision-grok-image-profile-replacement`, `provision-grok-edit-profile-replacement`, `provision-grok-video-profile-replacement`, `reconcile-execution-profile-routes`, `reconcile-dreamina-profiles`, `reconcile-inline-customer-settlement`, `terminalize-unstarted-job`, `cancel-unlaunched-job`, `refresh-provider-quota`, `refresh-codex-credential`, `resolve-dreamina-compliance-rejection`, `resolve-dreamina-image-success`, `resolve-dreamina-video-success`, `prepare-dreamina-video-supplement`, `dispatch-dreamina-video-supplement`, `poll-dreamina-video-supplement`, or `retry-blocked-terminal`"
             ));
         }
     };
@@ -400,6 +468,9 @@ async fn main() -> Result<(), ImageGatewayError> {
         | Command::ResolveDreaminaComplianceRejection { .. }
         | Command::ResolveDreaminaImageSuccess { .. }
         | Command::ResolveDreaminaVideoSuccess { .. }
+        | Command::PrepareDreaminaVideoSupplement { .. }
+        | Command::DispatchDreaminaVideoSupplement { .. }
+        | Command::PollDreaminaVideoSupplement { .. }
         | Command::TerminalizeUnstartedJob { .. }
         | Command::CancelUnlaunchedJob { .. }
         | Command::RefreshProviderQuota { .. }
@@ -600,6 +671,53 @@ async fn main() -> Result<(), ImageGatewayError> {
                 "{}",
                 serde_json::to_string(&receipt).map_err(|_| ImageGatewayError::internal(
                     "resolution receipt serialization failed"
+                ))?
+            );
+        }
+        Command::PrepareDreaminaVideoSupplement {
+            evidence_root,
+            request,
+        } => {
+            verify_migrations(&pool).await?;
+            let receipt =
+                prepare_dreamina_video_supplement_operator(&pool, &evidence_root, &request).await?;
+            println!(
+                "{}",
+                serde_json::to_string(&receipt).map_err(|_| ImageGatewayError::internal(
+                    "operator receipt serialization failed"
+                ))?
+            );
+        }
+        Command::DispatchDreaminaVideoSupplement {
+            evidence_root,
+            authorization_id,
+        } => {
+            verify_migrations(&pool).await?;
+            let receipt = dispatch_dreamina_video_supplement_operator(
+                &pool,
+                &evidence_root,
+                authorization_id,
+            )
+            .await?;
+            println!(
+                "{}",
+                serde_json::to_string(&receipt).map_err(|_| ImageGatewayError::internal(
+                    "operator receipt serialization failed"
+                ))?
+            );
+        }
+        Command::PollDreaminaVideoSupplement {
+            evidence_root,
+            authorization_id,
+        } => {
+            verify_migrations(&pool).await?;
+            let receipt =
+                poll_dreamina_video_supplement_operator(&pool, &evidence_root, authorization_id)
+                    .await?;
+            println!(
+                "{}",
+                serde_json::to_string(&receipt).map_err(|_| ImageGatewayError::internal(
+                    "operator receipt serialization failed"
                 ))?
             );
         }
@@ -1165,6 +1283,70 @@ mod tests {
     }
 
     #[test]
+    fn video_supplement_prepare_requires_all_original_identity_and_evidence_arguments() {
+        let job = uuid::Uuid::new_v4().to_string();
+        let submission = uuid::Uuid::new_v4().to_string();
+        let execution = uuid::Uuid::new_v4().to_string();
+        let digest = "a".repeat(64);
+        let args = [
+            "prepare-dreamina-video-supplement",
+            &job,
+            &submission,
+            &execution,
+            &digest,
+            &digest,
+            "operator-ticket-one-shot",
+            "/private/evidence",
+        ];
+        let Ok(Command::PrepareDreaminaVideoSupplement {
+            evidence_root,
+            request,
+        }) = parse_command(args)
+        else {
+            panic!("expected the explicit prepare command");
+        };
+        assert_eq!(request.job_id.to_string(), job);
+        assert_eq!(request.submission_id.to_string(), submission);
+        assert_eq!(request.executor_execution_id.to_string(), execution);
+        assert_eq!(request.expected_command_sha256, digest);
+        assert_eq!(request.expected_quote_hash, digest);
+        assert_eq!(request.runtime_binding_json, serde_json::Value::Null);
+        assert_eq!(evidence_root, std::path::PathBuf::from("/private/evidence"));
+        for len in 1..args.len() {
+            assert!(parse_command(&args[..len]).is_err());
+        }
+        let mut extra = args.to_vec();
+        extra.push("retry");
+        assert!(parse_command(extra).is_err());
+    }
+
+    #[test]
+    fn video_supplement_dispatch_and_poll_require_only_saved_authorization() {
+        let id = uuid::Uuid::new_v4();
+        for command in [
+            "dispatch-dreamina-video-supplement",
+            "poll-dreamina-video-supplement",
+        ] {
+            let args = [command, &id.to_string(), "/private/evidence"];
+            let parsed = parse_command(args).unwrap();
+            assert!(match parsed {
+                Command::DispatchDreaminaVideoSupplement {
+                    authorization_id, ..
+                } => command.starts_with("dispatch-") && authorization_id == id,
+                Command::PollDreaminaVideoSupplement {
+                    authorization_id, ..
+                } => command.starts_with("poll-") && authorization_id == id,
+                _ => false,
+            });
+            assert!(parse_command(&args[..2]).is_err());
+            assert!(parse_command([command, "not-a-uuid", "/private/evidence"]).is_err());
+            assert!(
+                parse_command([command, &id.to_string(), "/private/evidence", "retry"]).is_err()
+            );
+        }
+    }
+
+    #[test]
     fn accepts_unstarted_job_terminalization() {
         let job_id = uuid::Uuid::new_v4();
         assert_eq!(
@@ -1345,7 +1527,7 @@ mod tests {
     fn rejects_missing_command() {
         assert_eq!(
             parse_command([] as [&str; 0]),
-            Err("missing command: expected `migrate`, `bootstrap-admin`, `provision-codex-profile`, `provision-codex-cli-edit-profile`, `provision-grok-profile`, `provision-grok-video-profile`, `provision-grok-video-v2-profile`, `provision-grok-image-profile-replacement`, `provision-grok-edit-profile-replacement`, `provision-grok-video-profile-replacement`, `reconcile-execution-profile-routes`, `reconcile-dreamina-profiles`, `reconcile-inline-customer-settlement`, `terminalize-unstarted-job`, `cancel-unlaunched-job`, `refresh-provider-quota`, `refresh-codex-credential`, `resolve-dreamina-compliance-rejection`, `resolve-dreamina-image-success`, `resolve-dreamina-video-success`, or `retry-blocked-terminal`".to_string())
+            Err("missing command: expected `migrate`, `bootstrap-admin`, `provision-codex-profile`, `provision-codex-cli-edit-profile`, `provision-grok-profile`, `provision-grok-video-profile`, `provision-grok-video-v2-profile`, `provision-grok-image-profile-replacement`, `provision-grok-edit-profile-replacement`, `provision-grok-video-profile-replacement`, `reconcile-execution-profile-routes`, `reconcile-dreamina-profiles`, `reconcile-inline-customer-settlement`, `terminalize-unstarted-job`, `cancel-unlaunched-job`, `refresh-provider-quota`, `refresh-codex-credential`, `resolve-dreamina-compliance-rejection`, `resolve-dreamina-image-success`, `resolve-dreamina-video-success`, `prepare-dreamina-video-supplement`, `dispatch-dreamina-video-supplement`, `poll-dreamina-video-supplement`, or `retry-blocked-terminal`".to_string())
         );
     }
 
@@ -1354,7 +1536,7 @@ mod tests {
         assert_eq!(
             parse_command(["status"]),
             Err(
-                "unknown command `status`: expected `migrate`, `bootstrap-admin`, `provision-codex-profile`, `provision-codex-cli-edit-profile`, `provision-grok-profile`, `provision-grok-video-profile`, `provision-grok-video-v2-profile`, `provision-grok-image-profile-replacement`, `provision-grok-edit-profile-replacement`, `provision-grok-video-profile-replacement`, `reconcile-execution-profile-routes`, `reconcile-dreamina-profiles`, `reconcile-inline-customer-settlement`, `terminalize-unstarted-job`, `cancel-unlaunched-job`, `refresh-provider-quota`, `refresh-codex-credential`, `resolve-dreamina-compliance-rejection`, `resolve-dreamina-image-success`, `resolve-dreamina-video-success`, or `retry-blocked-terminal`"
+                "unknown command `status`: expected `migrate`, `bootstrap-admin`, `provision-codex-profile`, `provision-codex-cli-edit-profile`, `provision-grok-profile`, `provision-grok-video-profile`, `provision-grok-video-v2-profile`, `provision-grok-image-profile-replacement`, `provision-grok-edit-profile-replacement`, `provision-grok-video-profile-replacement`, `reconcile-execution-profile-routes`, `reconcile-dreamina-profiles`, `reconcile-inline-customer-settlement`, `terminalize-unstarted-job`, `cancel-unlaunched-job`, `refresh-provider-quota`, `refresh-codex-credential`, `resolve-dreamina-compliance-rejection`, `resolve-dreamina-image-success`, `resolve-dreamina-video-success`, `prepare-dreamina-video-supplement`, `dispatch-dreamina-video-supplement`, `poll-dreamina-video-supplement`, or `retry-blocked-terminal`"
                     .to_string()
             )
         );

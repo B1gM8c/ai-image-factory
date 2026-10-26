@@ -31,6 +31,7 @@ mod image_status;
 pub(super) mod image_success_reconciliation;
 mod results;
 pub(super) mod video_success_reconciliation;
+pub(super) mod video_supplementation;
 
 use results::{
     GenerationManifestLookup, generation_result_is_expired, load_generation_manifest,
@@ -232,7 +233,7 @@ impl ExecutionSettlementStore for PostgresExecutionSettlementStore {
         let row: Option<VideoStatusRow> = sqlx::query_as(
             r#"
             SELECT j.state, w.state, j.last_error_code, j.model, j.billable_units,
-                   artifact.artifact_id, COALESCE(operator_video.video_url, remote.video_url) AS video_url,
+                   COALESCE(operator_supplement.artifact_id, artifact.artifact_id) AS artifact_id, COALESCE(operator_video.video_url, remote.video_url) AS video_url,
                    CASE WHEN operator_video.resolution_id IS NOT NULL THEN operator_video.expires_at_ms ELSE remote.expires_at_ms END AS expires_at_ms, payload.command_json,
                    progress_observation.progress_json, progress_observation.observed_at_ms,
                    CASE WHEN j.state = 'uncertain' AND w.state = 'uncertain'
@@ -305,6 +306,10 @@ impl ExecutionSettlementStore for PostgresExecutionSettlementStore {
                    AND projection.artifact_count = 0
                    AND projection.remote_result_count = 1
              )
+            LEFT JOIN dreamina_operator_video_supplement_resolutions operator_supplement
+              ON operator_supplement.job_id = j.job_id
+             AND operator_supplement.output_id = progress_output.output_id
+             AND j.provider_id = 'dreamina-cli' AND j.state = 'succeeded'
             LEFT JOIN dreamina_operator_video_success_resolutions operator_video
               ON operator_video.job_id = j.job_id
              AND operator_video.submission_id = progress_submission.submission_id
@@ -335,7 +340,7 @@ impl ExecutionSettlementStore for PostgresExecutionSettlementStore {
         let row: Option<VideoStatusRow> = sqlx::query_as(
             r#"
                 SELECT j.state, w.state, j.last_error_code, j.model, j.billable_units,
-                       artifact.artifact_id, COALESCE(operator_video.video_url, remote.video_url) AS video_url,
+                       COALESCE(operator_supplement.artifact_id, artifact.artifact_id) AS artifact_id, COALESCE(operator_video.video_url, remote.video_url) AS video_url,
                    CASE WHEN operator_video.resolution_id IS NOT NULL THEN operator_video.expires_at_ms ELSE remote.expires_at_ms END AS expires_at_ms, payload.command_json,
                        progress_observation.progress_json, progress_observation.observed_at_ms,
                    CASE WHEN j.state = 'uncertain' AND w.state = 'uncertain'
@@ -410,6 +415,10 @@ impl ExecutionSettlementStore for PostgresExecutionSettlementStore {
                        AND projection.artifact_count = 0
                        AND projection.remote_result_count = 1
                  )
+                LEFT JOIN dreamina_operator_video_supplement_resolutions operator_supplement
+                  ON operator_supplement.job_id = j.job_id
+                 AND operator_supplement.output_id = progress_output.output_id
+                 AND j.provider_id = 'dreamina-cli' AND j.state = 'succeeded'
                 LEFT JOIN dreamina_operator_video_success_resolutions operator_video
                   ON operator_video.job_id = j.job_id
                  AND operator_video.submission_id = progress_submission.submission_id
@@ -510,7 +519,7 @@ impl ExecutionSettlementStore for PostgresExecutionSettlementStore {
         let row: Option<VideoStatusRow> = sqlx::query_as(
             r#"
                 SELECT j.state, w.state, j.last_error_code, j.model, j.billable_units,
-                       artifact.artifact_id, COALESCE(operator_video.video_url, remote.video_url) AS video_url,
+                       COALESCE(operator_supplement.artifact_id, artifact.artifact_id) AS artifact_id, COALESCE(operator_video.video_url, remote.video_url) AS video_url,
                    CASE WHEN operator_video.resolution_id IS NOT NULL THEN operator_video.expires_at_ms ELSE remote.expires_at_ms END AS expires_at_ms, payload.command_json,
                        progress_observation.progress_json, progress_observation.observed_at_ms,
                    CASE WHEN j.state = 'uncertain' AND w.state = 'uncertain'
@@ -586,6 +595,10 @@ impl ExecutionSettlementStore for PostgresExecutionSettlementStore {
                        AND projection.artifact_count = 0
                        AND projection.remote_result_count = 1
                  )
+                LEFT JOIN dreamina_operator_video_supplement_resolutions operator_supplement
+                  ON operator_supplement.job_id = j.job_id
+                 AND operator_supplement.output_id = progress_output.output_id
+                 AND j.provider_id = 'dreamina-cli' AND j.state = 'succeeded'
                 LEFT JOIN dreamina_operator_video_success_resolutions operator_video
                   ON operator_video.job_id = j.job_id
                  AND operator_video.submission_id = progress_submission.submission_id
@@ -619,6 +632,11 @@ impl ExecutionSettlementStore for PostgresExecutionSettlementStore {
         tenant_id: &str,
         artifact_id: Uuid,
     ) -> Result<Option<StoredVideoArtifact>, ImageGatewayError> {
+        if let Some(video) =
+            video_supplementation::load_artifact(self, tenant_id, None, None, artifact_id).await?
+        {
+            return Ok(Some(video));
+        }
         let row: Option<(
             Uuid,
             String,
@@ -723,6 +741,17 @@ impl ExecutionSettlementStore for PostgresExecutionSettlementStore {
         actor_user_id: Option<Uuid>,
         artifact_id: Uuid,
     ) -> Result<Option<StoredVideoArtifact>, ImageGatewayError> {
+        if let Some(video) = video_supplementation::load_artifact(
+            self,
+            tenant_id,
+            Some(project_id),
+            actor_user_id,
+            artifact_id,
+        )
+        .await?
+        {
+            return Ok(Some(video));
+        }
         let belongs_to_project: bool = sqlx::query_scalar(
             r#"
             SELECT EXISTS (
