@@ -20,10 +20,10 @@ const HTTPS_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const HTTPS_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct DecodedVideoInput {
-    pub(super) filename: String,
-    pub(super) media_type: String,
-    pub(super) bytes: Vec<u8>,
+pub(crate) struct DecodedVideoInput {
+    pub(crate) filename: String,
+    pub(crate) media_type: String,
+    pub(crate) bytes: Vec<u8>,
 }
 
 #[derive(Default)]
@@ -194,7 +194,7 @@ fn decode_data_url(
 }
 
 /// Fetch bounded source bytes; callers must probe the body before accepting its MIME.
-pub(super) async fn decode_media_source(
+pub(crate) async fn decode_media_source(
     param: &str,
     source: &str,
     max_bytes: usize,

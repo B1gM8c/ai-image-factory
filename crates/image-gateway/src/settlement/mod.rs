@@ -27,6 +27,12 @@ pub use postgres::video_success_reconciliation::{
     resolve_dreamina_video_success,
 };
 
+pub use postgres::video_supplementation::{
+    DreaminaVideoSupplementAcceptedRequest, DreaminaVideoSupplementAuthorizationRequest,
+    DreaminaVideoSupplementPlan, DreaminaVideoSupplementPublishRequest,
+    DreaminaVideoSupplementResolution, DreaminaVideoSupplementUncertainRequest,
+};
+
 #[async_trait]
 pub trait ExecutionSettlementStore: Send + Sync + 'static {
     fn artifact_storage_identity(&self) -> String;

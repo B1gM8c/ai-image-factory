@@ -89,6 +89,9 @@ mod dreamina_image_success_reconciliation;
 #[path = "postgres_executor/dreamina_single_image_protocol_recovery.rs"]
 mod dreamina_single_image_protocol_recovery;
 
+#[path = "postgres_executor/dreamina_video_supplementation.rs"]
+mod dreamina_video_supplementation;
+
 #[path = "postgres_executor/dreamina_video_success_reconciliation.rs"]
 mod dreamina_video_success_reconciliation;
 

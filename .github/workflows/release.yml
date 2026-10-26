@@ -268,10 +268,20 @@ jobs:
       - name: Test hotfix remote submit observations and recovery
         if: inputs.validation_profile == 'hotfix'
         run: |
+          cargo build --locked --package gpt-image-2-gateway \
+            --bin remote-submit-runner
           cargo test --locked --package gpt-image-2-gateway \
             --lib provider_tasks::remote_submit -- --test-threads=1
           cargo test --locked --package gpt-image-2-gateway \
             --test postgres_provider_tasks gated_submit:: -- --test-threads=1
+
+      - name: Test hotfix one-shot video supplementation and settlement
+        if: inputs.validation_profile == 'hotfix'
+        run: |
+          cargo test --locked --package gpt-image-2-gateway \
+            --test postgres_executor dreamina_video_supplementation -- --test-threads=1
+          cargo test --locked --package gpt-image-2-gateway \
+            --bin factoryctl video_supplement -- --test-threads=1
 
       - name: Test hotfix reviewed image evidence
         if: inputs.validation_profile == 'hotfix'
