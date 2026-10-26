@@ -29,7 +29,9 @@ mod additional_images;
 mod failure;
 mod image_status;
 pub(super) mod image_success_reconciliation;
+pub(super) mod manual_video_cancellation;
 mod results;
+pub(super) mod supplement_video_cancellation;
 pub(super) mod video_success_reconciliation;
 pub(super) mod video_supplementation;
 
@@ -333,6 +335,23 @@ impl ExecutionSettlementStore for PostgresExecutionSettlementStore {
             video_supplementation::progress::project(self, tenant_id, None, None, job_id, status)
                 .await?,
         ))
+    }
+
+    async fn project_dreamina_manual_video_cancellation(
+        &self,
+        tenant_id: &str,
+        project_id: &str,
+        actor_user_id: Option<Uuid>,
+        job_id: Uuid,
+    ) -> Result<Option<super::DreaminaManualVideoCancellationProof>, ImageGatewayError> {
+        PostgresExecutionSettlementStore::project_dreamina_manual_video_cancellation(
+            self,
+            tenant_id,
+            project_id,
+            actor_user_id,
+            job_id,
+        )
+        .await
     }
 
     async fn project_video_status(

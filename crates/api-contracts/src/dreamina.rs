@@ -312,6 +312,29 @@ pub struct DreaminaVideoTask {
     /// Present only for an audited operator resolution backed by a fully released hold.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settlement: Option<DreaminaReleasedSettlement>,
+    /// Operator-confirmed cancellation classification; ordinary failure is not proof.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manual_cancellation: Option<DreaminaManualCancellation>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct DreaminaManualCancellation {
+    pub schema: String,
+    pub status: String,
+    pub authority_id: String,
+    pub job_id: String,
+    pub request_id: String,
+    pub upstream_task_id: String,
+    pub submission_id: String,
+    pub hold_id: String,
+    pub confirmed_at_ms: i64,
+    pub currency: String,
+    /// Monetary micros are decimal strings to preserve exact integer precision.
+    pub held_micros: String,
+    pub captured_micros: String,
+    pub released_micros: String,
+    /// Original durable terminal event; this classification creates no refund ledger entry.
+    pub release_event_id: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -389,6 +412,7 @@ mod tests {
         let legacy = r#"{"id":"task-a","status":"running"}"#;
         let task: DreaminaVideoTask = serde_json::from_str(legacy).unwrap();
         assert!(task.settlement.is_none());
+        assert!(task.manual_cancellation.is_none());
         assert!(
             serde_json::to_value(task)
                 .unwrap()

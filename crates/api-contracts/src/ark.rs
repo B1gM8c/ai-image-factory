@@ -198,6 +198,18 @@ pub struct ArkContentGenerationTask {
     pub resolution: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ratio: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<ArkContentGenerationTaskMetadata>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ArkContentGenerationTaskMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_progress: Option<crate::dreamina::DreaminaProviderProgress>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manual_cancellation: Option<crate::dreamina::DreaminaManualCancellation>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -226,6 +238,20 @@ pub struct ArkContentGenerationUsage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn task_metadata_preserves_legacy_shape_and_exact_upstream_observation() {
+        let legacy =
+            serde_json::json!({"id":"cgt-original","model":"seedance2.5","status":"failed"});
+        let task: ArkContentGenerationTask = serde_json::from_value(legacy.clone()).unwrap();
+        assert!(task.metadata.is_none());
+        assert_eq!(serde_json::to_value(task).unwrap(), legacy);
+        let queued = serde_json::json!({"id":"cgt-original","model":"seedance2.5","status":"running", "metadata":{
+            "stage":"provider_queued", "provider_progress":{"provider_status":"Queueing","queue_position":610,"queue_total":233061,"estimated_remaining_seconds":5880,"observed_at_ms":1792995932000_i64}
+        }});
+        let task: ArkContentGenerationTask = serde_json::from_value(queued.clone()).unwrap();
+        assert_eq!(serde_json::to_value(task).unwrap(), queued);
+    }
 
     #[test]
     fn content_roles_and_nested_fields_are_not_silently_discarded() {

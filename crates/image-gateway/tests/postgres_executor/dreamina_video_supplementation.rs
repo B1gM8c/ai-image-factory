@@ -8,6 +8,10 @@ use gpt_image_2_gateway::{
 use image_provider_dreamina_cli::parse_submit_command;
 use std::path::{Path, PathBuf};
 const URL: &str = "https://media.example.test/supplement%2Fvideo.mp4?token=A%2Bb";
+#[path = "dreamina_video_supplementation/manual_cancellation.rs"]
+mod manual_cancellation;
+#[path = "dreamina_video_supplementation/populated_upgrade.rs"]
+mod populated_upgrade;
 #[path = "dreamina_video_supplementation/successor.rs"]
 mod successor;
 fn mp4(width: u16, height: u16, duration_ms: u32) -> Vec<u8> {
@@ -68,13 +72,21 @@ async fn fixture_with_audio(
     model: &'static str,
     audio_count: usize,
 ) -> TestResult<Fixture> {
+    fixture_with_funding(pool, model, audio_count, 0).await
+}
+async fn fixture_with_funding(
+    pool: &PgPool,
+    model: &'static str,
+    audio_count: usize,
+    grant_micros: i64,
+) -> TestResult<Fixture> {
     let work = seed_supplement_video(pool, model, audio_count).await?;
     let price = if model == "seedance2.0mini" {
         800_000
     } else {
         1_200_000
     };
-    seed_v4_customer_quote_with_basis(pool,&work,V4CustomerQuoteIdentity{provider_model_id:model,public_model_id:model,dimensions:json!({"duration":"10","ratio":"16:9","resolution":"720p","processing_mode":"synchronous","workflow":"multimodal2video","input_image_count":"1","input_video_count":"0","input_audio_count":audio_count.to_string()}),..V4CustomerQuoteIdentity::dreamina_video()},V4CustomerQuoteBasis{metric:"video_requested_second",unit:"second",unit_size:1,unit_price_micros:price/10,quantity_source:"request_derived",confidence:"exact",max_quantity:10,max_amount_micros:price}).await?;
+    seed_v4_customer_quote_with_funding(pool,&work,V4CustomerQuoteIdentity{provider_model_id:model,public_model_id:model,dimensions:json!({"duration":"10","ratio":"16:9","resolution":"720p","processing_mode":"synchronous","workflow":"multimodal2video","input_image_count":"1","input_video_count":"0","input_audio_count":audio_count.to_string()}),..V4CustomerQuoteIdentity::dreamina_video()},V4CustomerQuoteBasis{metric:"video_requested_second",unit:"second",unit_size:1,unit_price_micros:price/10,quantity_source:"request_derived",confidence:"exact",max_quantity:10,max_amount_micros:price},grant_micros).await?;
     let executor = PostgresExecutorSubmissionStore::new(pool.clone());
     executor
         .prepare_and_handoff(&work, DREAMINA_VIDEO_PROFILE_ID)

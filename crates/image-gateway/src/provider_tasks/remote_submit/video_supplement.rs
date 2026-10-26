@@ -319,6 +319,12 @@ pub async fn poll_dreamina_video_supplement_operator(
     if plan.state == "succeeded" {
         return Ok(receipt(&plan, &directory, "published", None));
     }
+    if store
+        .is_dreamina_video_supplement_cancelled(authorization_id, plan.dispatch_nonce)
+        .await?
+    {
+        return Ok(receipt(&plan, &directory, "cancelled", None));
+    }
     if plan.remote_operation_id.is_none() {
         recover_acceptance(&store, &plan, &directory).await?;
         plan = store
