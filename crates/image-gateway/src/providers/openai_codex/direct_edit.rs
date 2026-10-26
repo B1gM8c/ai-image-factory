@@ -1,6 +1,6 @@
 use std::{borrow::Cow, path::Path, time::Duration};
 
-#[cfg(debug_assertions)]
+#[cfg(any(debug_assertions, test))]
 use std::net::IpAddr;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -150,7 +150,7 @@ fn image_edits_endpoint() -> Result<Cow<'static, str>, ImageGatewayError> {
     Ok(Cow::Borrowed(CODEX_IMAGE_EDITS_URL))
 }
 
-#[cfg(debug_assertions)]
+#[cfg(any(debug_assertions, test))]
 fn validate_test_endpoint(endpoint: &str) -> Result<(), ImageGatewayError> {
     let url = reqwest::Url::parse(endpoint).map_err(|_| unavailable())?;
     if url.scheme() != "http" || url.username() != "" || url.password().is_some() {
