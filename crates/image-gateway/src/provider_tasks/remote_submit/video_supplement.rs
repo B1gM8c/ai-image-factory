@@ -94,6 +94,32 @@ pub async fn prepare_dreamina_video_supplement_operator(
     evidence_root: &Path,
     request: &DreaminaVideoSupplementAuthorizationRequest,
 ) -> Result<DreaminaVideoSupplementOperatorReceipt, ImageGatewayError> {
+    prepare_operator(pool, evidence_root, request, None).await
+}
+
+/// Prepare only a newly authorized successor. Dispatch remains a separate
+/// one-shot command with a new authority ID and protected evidence directory.
+pub async fn prepare_dreamina_video_supplement_successor_operator(
+    pool: &PgPool,
+    evidence_root: &Path,
+    previous_authorization_id: Uuid,
+    request: &DreaminaVideoSupplementAuthorizationRequest,
+) -> Result<DreaminaVideoSupplementOperatorReceipt, ImageGatewayError> {
+    prepare_operator(
+        pool,
+        evidence_root,
+        request,
+        Some(previous_authorization_id),
+    )
+    .await
+}
+
+async fn prepare_operator(
+    pool: &PgPool,
+    evidence_root: &Path,
+    request: &DreaminaVideoSupplementAuthorizationRequest,
+    previous_authorization_id: Option<Uuid>,
+) -> Result<DreaminaVideoSupplementOperatorReceipt, ImageGatewayError> {
     let (store, blobs) = stores(pool)?;
     let (profile_id, account_id): (Uuid, Uuid) = sqlx::query_as(
         "SELECT execution_profile_id,provider_account_id FROM provider_submissions WHERE job_id=$1 AND submission_id=$2 AND executor_execution_id=$3",
@@ -108,7 +134,14 @@ pub async fn prepare_dreamina_video_supplement_operator(
     let runtime = Runtime::load_for_identity(pool, profile_id, account_id).await?;
     let mut request = request.clone();
     request.runtime_binding_json = runtime.binding()?;
-    let plan = store.authorize_dreamina_video_supplement(&request).await?;
+    let plan = match previous_authorization_id {
+        Some(previous) => {
+            store
+                .authorize_dreamina_video_supplement_successor(previous, &request)
+                .await?
+        }
+        None => store.authorize_dreamina_video_supplement(&request).await?,
+    };
     let directory = evidence_directory(evidence_root, plan.authorization_id)?;
     if plan.state != "authorized" {
         return Ok(receipt(&plan, &directory, &plan.state, None));
@@ -117,6 +150,7 @@ pub async fn prepare_dreamina_video_supplement_operator(
     private_write_once(&directory, "plan.json", &serde_json::to_vec_pretty(&json!({
         "schema_version": 1,
         "authority": "dreamina-video-manual-supplement",
+        "previous_authorization_id": previous_authorization_id,
         "authorization": plan,
         "cli_executable_sha256": hex::encode(runtime.executable_sha256),
         "runner_sha256": hex::encode(runtime.runner_sha256),

@@ -8,6 +8,8 @@ use gpt_image_2_gateway::{
 use image_provider_dreamina_cli::parse_submit_command;
 use std::path::{Path, PathBuf};
 const URL: &str = "https://media.example.test/supplement%2Fvideo.mp4?token=A%2Bb";
+#[path = "dreamina_video_supplementation/successor.rs"]
+mod successor;
 fn mp4(width: u16, height: u16, duration_ms: u32) -> Vec<u8> {
     let config = mp4::Mp4Config {
         major_brand: "isom".parse().unwrap(),
@@ -404,12 +406,13 @@ async fn supplement_concurrent_claim_has_one_permit_and_failures_hold_funds() ->
     result.and(cleanup)
 }
 #[tokio::test]
-async fn supplement_four_multimodal_successes_settle_each_original_hold_once() -> TestResult {
+async fn supplement_supported_models_settle_each_original_hold_once() -> TestResult {
     for (model, audio_count, price) in [
         ("seedance2.0mini", 0, 800_000),
         ("seedance2.0fast_vip", 1, 1_200_000),
         ("seedance2.0fast_vip", 2, 1_200_000),
         ("seedance2.0fast_vip", 2, 1_200_000),
+        ("seedance2.0", 0, 1_200_000),
     ] {
         let Some(db) = TestDatabase::new().await? else {
             return Ok(());

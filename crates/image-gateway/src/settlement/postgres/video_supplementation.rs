@@ -124,12 +124,35 @@ struct Original {
     limit_7d: i32,
     remaining_7d: i32,
 }
-const PLAN: &str = "SELECT runtime_binding_json,authorization_id,dispatch_nonce,job_id,submission_id,executor_execution_id,output_id,provider_account_id,execution_profile_id,command_json,command_hash,quote_hash,execution_binding_sha256,billable_units,api_profile,state,remote_operation_id,submit_stdout_sha256 FROM dreamina_operator_video_supplement_authorizations WHERE authorization_id=$1";
+const PLAN: &str = "SELECT runtime_binding_json,authorization_id,dispatch_nonce,job_id,submission_id,executor_execution_id,output_id,provider_account_id,execution_profile_id,command_json,command_hash,quote_hash,execution_binding_sha256,billable_units,api_profile,state,remote_operation_id,submit_stdout_sha256 FROM dreamina_operator_video_supplement_authorizations current_attempt WHERE authorization_id=$1 AND NOT EXISTS(SELECT 1 FROM dreamina_operator_video_supplement_authorizations child WHERE child.previous_authorization_id=current_attempt.authorization_id)";
 
 impl PostgresExecutionSettlementStore {
     pub async fn authorize_dreamina_video_supplement(
         &self,
         request: &DreaminaVideoSupplementAuthorizationRequest,
+    ) -> Result<DreaminaVideoSupplementPlan, ImageGatewayError> {
+        self.authorize_dreamina_video_supplement_attempt(request, None)
+            .await
+    }
+
+    /// A separate human instruction may authorize one successor to a prior
+    /// unknown attempt. This never resets or reuses that attempt's nonce/gate.
+    pub async fn authorize_dreamina_video_supplement_successor(
+        &self,
+        previous_authorization_id: Uuid,
+        request: &DreaminaVideoSupplementAuthorizationRequest,
+    ) -> Result<DreaminaVideoSupplementPlan, ImageGatewayError> {
+        if previous_authorization_id.is_nil() {
+            return Err(conflict());
+        }
+        self.authorize_dreamina_video_supplement_attempt(request, Some(previous_authorization_id))
+            .await
+    }
+
+    async fn authorize_dreamina_video_supplement_attempt(
+        &self,
+        request: &DreaminaVideoSupplementAuthorizationRequest,
+        previous_authorization_id: Option<Uuid>,
     ) -> Result<DreaminaVideoSupplementPlan, ImageGatewayError> {
         if request.job_id.is_nil()
             || request.submission_id.is_nil()
@@ -149,7 +172,7 @@ impl PostgresExecutionSettlementStore {
             .await
             .map_err(unavailable)?
             .ok_or_else(conflict)?;
-        let existing: Option<(Uuid,Uuid,Uuid,String,String,String,Value)> = sqlx::query_as("SELECT authorization_id,submission_id,executor_execution_id,command_hash,quote_hash,operator_reference,runtime_binding_json FROM dreamina_operator_video_supplement_authorizations WHERE job_id=$1").bind(request.job_id).fetch_optional(&mut *tx).await.map_err(unavailable)?;
+        let existing: Option<(Uuid,Uuid,Uuid,String,String,String,Value)> = sqlx::query_as("SELECT authorization_id,submission_id,executor_execution_id,command_hash,quote_hash,operator_reference,runtime_binding_json FROM dreamina_operator_video_supplement_authorizations current_attempt WHERE job_id=$1 AND (($2::UUID IS NULL AND NOT EXISTS(SELECT 1 FROM dreamina_operator_video_supplement_authorizations child WHERE child.previous_authorization_id=current_attempt.authorization_id)) OR previous_authorization_id=$2)").bind(request.job_id).bind(previous_authorization_id).fetch_optional(&mut *tx).await.map_err(unavailable)?;
         if let Some((id, sub, exec, command, quote, reference, runtime)) = existing {
             if runtime != request.runtime_binding_json {
                 return Err(conflict());
@@ -169,6 +192,24 @@ impl PostgresExecutionSettlementStore {
             tx.commit().await.map_err(storage_conflict)?;
             return Ok(plan);
         }
+        if let Some(previous) = previous_authorization_id {
+            let parent = load_plan(&mut tx, previous).await?;
+            let parent_reference: String = sqlx::query_scalar(
+                "SELECT operator_reference FROM dreamina_operator_video_supplement_authorizations WHERE authorization_id=$1",
+            )
+            .bind(previous)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(unavailable)?;
+            if parent.job_id != request.job_id
+                || parent.state != "uncertain"
+                || parent.remote_operation_id.is_some()
+                || parent.submit_stdout_sha256.is_some()
+                || parent_reference == request.operator_reference
+            {
+                return Err(conflict());
+            }
+        }
         let row = load_original(&mut tx, request.job_id).await?;
         if row.submission_id != request.submission_id
             || row.executor_execution_id != request.executor_execution_id
@@ -187,8 +228,8 @@ impl PostgresExecutionSettlementStore {
         .await?;
         let now = super::database_now(&mut tx).await?;
         let id = Uuid::new_v4();
-        sqlx::query(r#"INSERT INTO dreamina_operator_video_supplement_authorizations (authorization_id,job_id,submission_id,executor_execution_id,output_id,original_receipt_id,hold_id,provider_account_id,execution_profile_id,dispatch_nonce,command_hash,quote_hash,execution_binding_sha256,command_json,api_profile,billable_units,operator_reference,original_evidence_json,state,created_at_ms,updated_at_ms,runtime_binding_json) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,dreamina_video_supplement_original_snapshot($2),'authorized',$18,$18,$19)"#)
-            .bind(id).bind(row.job_id).bind(row.submission_id).bind(row.executor_execution_id).bind(row.output_id).bind(row.original_receipt_id).bind(row.hold_id).bind(row.provider_account_id).bind(row.execution_profile_id).bind(Uuid::new_v4()).bind(&row.command_hash).bind(&row.quote_hash).bind(&row.execution_binding_sha256).bind(&row.command_json).bind(&row.api_profile).bind(row.billable_units).bind(&request.operator_reference).bind(now).bind(&request.runtime_binding_json).execute(&mut *tx).await.map_err(storage_conflict)?;
+        sqlx::query(r#"INSERT INTO dreamina_operator_video_supplement_authorizations (authorization_id,job_id,submission_id,executor_execution_id,output_id,original_receipt_id,hold_id,provider_account_id,execution_profile_id,dispatch_nonce,command_hash,quote_hash,execution_binding_sha256,command_json,api_profile,billable_units,operator_reference,original_evidence_json,state,created_at_ms,updated_at_ms,runtime_binding_json,previous_authorization_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,dreamina_video_supplement_original_snapshot($2),'authorized',$18,$18,$19,$20)"#)
+            .bind(id).bind(row.job_id).bind(row.submission_id).bind(row.executor_execution_id).bind(row.output_id).bind(row.original_receipt_id).bind(row.hold_id).bind(row.provider_account_id).bind(row.execution_profile_id).bind(Uuid::new_v4()).bind(&row.command_hash).bind(&row.quote_hash).bind(&row.execution_binding_sha256).bind(&row.command_json).bind(&row.api_profile).bind(row.billable_units).bind(&request.operator_reference).bind(now).bind(&request.runtime_binding_json).bind(previous_authorization_id).execute(&mut *tx).await.map_err(storage_conflict)?;
         assert_consistent(&mut tx, row.job_id).await?;
         let plan = load_plan(&mut tx, id).await?;
         tx.commit().await.map_err(storage_conflict)?;
@@ -356,7 +397,7 @@ fn validate_pricing(row: &Original) -> Result<(), ImageGatewayError> {
     // millisecond contract and is intentionally outside this operator workflow.
     if !matches!(
         facts.provider_model_id.as_str(),
-        "seedance2.0mini" | "seedance2.0fast_vip"
+        "seedance2.0mini" | "seedance2.0fast_vip" | "seedance2.0"
     ) {
         return Err(conflict());
     }

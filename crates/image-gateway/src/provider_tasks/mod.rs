@@ -55,6 +55,7 @@ pub use remote_submit::{
     GatedCliProcessTerminal, GatedCliReady, GatedCliSubmission, GatedCliSubmitCodec,
     GatedCliSubmitDriver, dispatch_dreamina_video_supplement_operator,
     poll_dreamina_video_supplement_operator, prepare_dreamina_video_supplement_operator,
+    prepare_dreamina_video_supplement_successor_operator,
     resolve_dreamina_compliance_rejection, run_remote_submit_gate, run_remote_submit_runner,
 };
 pub use runtime_profile::{ProviderRuntimeProfile, ProviderRuntimeProfileStore};
