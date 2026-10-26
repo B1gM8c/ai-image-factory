@@ -107,7 +107,10 @@ fn track_duration_ms(
             .checked_add(u64::from(entry.sample_count) * u64::from(entry.sample_delta))
             .ok_or(Error::Invalid)?;
     }
-    if timed_samples != u64::from(count) || units != track.trak.mdia.mdhd.duration {
+    if timed_samples != u64::from(count)
+        || (units != track.trak.mdia.mdhd.duration
+            && !aac_priming_explains_media_duration(track, movie_scale, units))
+    {
         return Err(Error::Invalid);
     }
     if let Some(ctts) = &stbl.ctts {
@@ -205,6 +208,44 @@ fn track_duration_ms(
         return Err(Error::Invalid);
     }
     presentation_duration_ms(track, movie_scale)
+}
+
+fn aac_priming_explains_media_duration(
+    track: &mp4::Mp4Track,
+    movie_scale: u32,
+    sample_duration: u64,
+) -> bool {
+    let media = &track.trak.mdia.mdhd;
+    if !matches!(track.track_type(), Ok(mp4::TrackType::Audio))
+        || !matches!(track.media_type(), Ok(mp4::MediaType::AAC))
+        || media.duration == 0
+        || media.timescale == 0
+        || movie_scale == 0
+    {
+        return false;
+    }
+    let Some(edits) = track.trak.edts.as_ref().and_then(|edts| edts.elst.as_ref()) else {
+        return false;
+    };
+    let [edit] = edits.entries.as_slice() else {
+        return false;
+    };
+    // mp4 stores the signed elst field as u64; reject encoded negative offsets.
+    let priming = edit.media_time;
+    if edits.version > 1
+        || (edits.version == 0 && priming > i32::MAX as u64)
+        || priming > i64::MAX as u64
+        || edit.media_rate != 1
+        || edit.media_rate_fraction != 0
+        || sample_duration.checked_sub(media.duration) != Some(priming)
+    {
+        return false;
+    }
+    // Some AAC muxers exclude encoder priming from mdhd while retaining it in
+    // sample times. The edit must explain exactly that prefix and media span.
+    let scaled = u128::from(media.duration) * u128::from(movie_scale);
+    let scale = u128::from(media.timescale);
+    (scaled / scale..=scaled.div_ceil(scale)).contains(&u128::from(edit.segment_duration))
 }
 
 fn presentation_duration_ms(track: &mp4::Mp4Track, movie_scale: u32) -> Result<u64, Error> {

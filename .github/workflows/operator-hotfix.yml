@@ -1,0 +1,91 @@
+name: Attested operator hotfix
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: operator-hotfix-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  operator:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: production-release
+    permissions:
+      contents: read
+      attestations: write
+      id-token: write
+    steps:
+      - name: Check out signed hotfix source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 0
+
+      - name: Verify protected signed operator tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -Eeuo pipefail
+          test "$GITHUB_REF_PROTECTED" = true
+          case "$GITHUB_REF" in refs/tags/v*.hotfix.operator.*) ;; *) exit 1 ;; esac
+          tag_sha="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$GITHUB_REF_NAME" --jq '.object | select(.type == "tag") | .sha')"
+          test -n "$tag_sha"
+          gh api "repos/$GITHUB_REPOSITORY/git/tags/$tag_sha" |
+            jq --exit-status --arg commit "$GITHUB_SHA" --arg tag "$GITHUB_REF_NAME" '
+              .verification.verified == true and .verification.reason == "valid"
+              and .tag == $tag and .object.type == "commit" and .object.sha == $commit'
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Verify media parsing regression
+        run: >-
+          cargo test --release --locked --package gpt-image-2-gateway
+          --lib media_inputs:: -- --test-threads=1
+
+      - name: Build only the operator tool
+        run: >-
+          cargo build --release --locked --package gpt-image-2-gateway
+          --bin factoryctl
+
+      - name: Package exact operator bytes
+        run: |
+          set -Eeuo pipefail
+          mkdir operator
+          install -m 0755 target/release/factoryctl operator/factoryctl
+          python3 - <<'PY'
+          import hashlib, json, os
+          from pathlib import Path
+          binary = Path('operator/factoryctl')
+          with binary.open('rb') as stream:
+              digest = hashlib.file_digest(stream, 'sha256').hexdigest()
+          manifest = {
+              'schema_version': 1,
+              'kind': 'operator_factoryctl_hotfix',
+              'source_commit': os.environ['GITHUB_SHA'],
+              'source_tag': os.environ['GITHUB_REF_NAME'],
+              'run_id': int(os.environ['GITHUB_RUN_ID']),
+              'run_attempt': int(os.environ['GITHUB_RUN_ATTEMPT']),
+              'database_schema': 153,
+              'intended_operation': 'poll-dreamina-video-supplement',
+              'binary': {'path': 'factoryctl', 'bytes': binary.stat().st_size,
+                         'sha256': digest},
+          }
+          Path('operator/operator-manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
+          PY
+
+      - name: Attest operator binary and manifest
+        uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4.1.0
+        with:
+          subject-path: "${{ github.workspace }}/operator/*"
+
+      - name: Preserve operator artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: operator-factoryctl-x86_64-${{ github.sha }}
+          path: operator/*
+          if-no-files-found: error
