@@ -22,6 +22,10 @@ pub use postgres::image_success_reconciliation::{
     DreaminaImageSuccessResolution, DreaminaImageSuccessResolutionRequest,
     resolve_dreamina_image_success,
 };
+pub use postgres::manual_video_cancellation::{
+    DreaminaManualVideoCancellationProof, DreaminaManualVideoCancellationRequest,
+};
+pub use postgres::supplement_video_cancellation::DreaminaSupplementVideoCancellationRequest;
 pub use postgres::video_success_reconciliation::{
     DreaminaVideoSuccessResolution, DreaminaVideoSuccessResolutionRequest,
     resolve_dreamina_video_success,
@@ -144,6 +148,16 @@ pub trait ExecutionSettlementStore: Send + Sync + 'static {
         Ok(None)
     }
 
+    async fn project_dreamina_manual_video_cancellation(
+        &self,
+        _tenant_id: &str,
+        _project_id: &str,
+        _actor_user_id: Option<uuid::Uuid>,
+        _job_id: uuid::Uuid,
+    ) -> Result<Option<DreaminaManualVideoCancellationProof>, ImageGatewayError> {
+        Ok(None)
+    }
+
     async fn load_video_artifact(
         &self,
         _tenant_id: &str,
@@ -245,7 +259,7 @@ pub enum VideoResultStatus {
     },
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VideoProviderProgress {
     pub progress: image_provider_sdk::ProviderTaskProgress,
     pub observed_at_ms: i64,

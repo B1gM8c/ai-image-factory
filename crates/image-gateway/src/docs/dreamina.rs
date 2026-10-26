@@ -282,7 +282,42 @@ pub(super) fn patch_schemas(document: &mut Value) {
     });
     task["provider_progress"] = json!({"$ref": "#/components/schemas/DreaminaProviderProgress"});
     task["cancellation"] = json!({"$ref": "#/components/schemas/DreaminaCancellation"});
+    patch_manual_cancellation(schemas);
     patch_image_tasks(document);
+}
+
+fn patch_manual_cancellation(schemas: &mut Value) {
+    schemas["DreaminaManualCancellation"] = json!({
+        "type":"object", "additionalProperties":false,
+        "description":"Trusted operator classification after same-account website cancellation, a Failed CLI query, and the original completed full zero-charge release. Task status remains failed. Ordinary failed status, a user request, or absence of this proof never authorizes a refund. release_event_id identifies the durable original release or operator cancellation audit event. A supplement cancellation waives the customer charge while the original provider effect remains unknown; no provider failure or absence of upstream cost is asserted. No refund ledger entry is created.",
+        "required":["schema","status","authority_id","job_id","request_id","upstream_task_id","submission_id","hold_id","confirmed_at_ms","currency","held_micros","captured_micros","released_micros","release_event_id"],
+        "properties":{
+            "schema":{"type":"string","enum":["factory.manual_cancellation.v1"]},
+            "status":{"type":"string","enum":["confirmed"]},
+            "authority_id":{"type":"string","format":"uuid"},
+            "job_id":{"type":"string","format":"uuid"}, "request_id":{"type":"string"},
+            "upstream_task_id":{"type":"string"}, "submission_id":{"type":"string","format":"uuid"},
+            "hold_id":{"type":"string","format":"uuid"}, "confirmed_at_ms":{"type":"integer","format":"int64","minimum":1},
+            "currency":{"type":"string","enum":["USD"]},
+            "held_micros":{"type":"string","pattern":"^[1-9][0-9]*$"},
+            "captured_micros":{"type":"string","enum":["0"]},
+            "released_micros":{"type":"string","pattern":"^[1-9][0-9]*$","description":"Exactly equals held_micros."},
+            "release_event_id":{"type":"string","format":"uuid"}
+        }
+    });
+    schemas["DreaminaVideoTaskDoc"]["properties"]["manual_cancellation"] =
+        json!({"$ref":"#/components/schemas/DreaminaManualCancellation"});
+    schemas["ArkContentGenerationTaskMetadata"] = json!({
+        "type":"object", "additionalProperties":false,
+        "description":"Read-only Factory tracking from the same scoped task query. Queue values and observed_at_ms are the durable upstream report, not refreshed or calculated by GET. Missing progress is unknown; an uncertain task may retain an earlier observation.",
+        "properties":{
+            "stage":schemas["DreaminaVideoTaskDoc"]["properties"]["stage"].clone(),
+            "provider_progress":{"$ref":"#/components/schemas/DreaminaProviderProgress"},
+            "manual_cancellation":{"$ref":"#/components/schemas/DreaminaManualCancellation"}
+        }
+    });
+    schemas["ArkContentGenerationTaskDoc"]["properties"]["metadata"] =
+        json!({"$ref":"#/components/schemas/ArkContentGenerationTaskMetadata"});
 }
 
 fn patch_image_tasks(document: &mut Value) {
@@ -421,6 +456,38 @@ mod tests {
             document["paths"]["/v1/images/generations"]["post"]["responses"]
                 .get("202")
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn manual_cancellation_is_a_read_only_proof_without_a_new_task_status() {
+        let axum::Json(document) = crate::docs::openapi_json();
+        let schemas = &document["components"]["schemas"];
+        assert_eq!(
+            schemas["DreaminaManualCancellation"]["properties"]["status"]["enum"],
+            json!(["confirmed"])
+        );
+        assert_eq!(
+            schemas["DreaminaManualCancellation"]["properties"]["captured_micros"]["enum"],
+            json!(["0"])
+        );
+        assert_eq!(
+            schemas["ArkContentGenerationTaskDoc"]["properties"]["metadata"]["$ref"],
+            "#/components/schemas/ArkContentGenerationTaskMetadata"
+        );
+        assert_eq!(
+            schemas["ArkContentGenerationTaskMetadata"]["properties"]["provider_progress"]["$ref"],
+            "#/components/schemas/DreaminaProviderProgress"
+        );
+        for name in ["DreaminaVideoTaskDoc", "ArkContentGenerationTaskDoc"] {
+            assert_eq!(
+                schemas[name]["properties"]["status"]["enum"],
+                json!(["running", "succeeded", "failed", "uncertain"])
+            );
+        }
+        assert_eq!(
+            schemas["DreaminaCancellation"]["properties"]["supported"]["enum"],
+            json!([false])
         );
     }
 

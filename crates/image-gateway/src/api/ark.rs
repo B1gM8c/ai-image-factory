@@ -9,9 +9,9 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use image::ImageReader;
 use image_api_contracts::ark::{
     ARK_CONTENT_GENERATION_API_PROFILE, ARK_IMAGES_API_PROFILE, ArkContentGenerationError,
-    ArkContentGenerationTask, ArkContentGenerationTaskId, ArkContentGenerationTaskRequest,
-    ArkContentItem, ArkGeneratedContent, ArkImageData, ArkImageGenerationRequest,
-    ArkImageGenerationResponse, ArkImageUsage,
+    ArkContentGenerationTask, ArkContentGenerationTaskId, ArkContentGenerationTaskMetadata,
+    ArkContentGenerationTaskRequest, ArkContentItem, ArkGeneratedContent, ArkImageData,
+    ArkImageGenerationRequest, ArkImageGenerationResponse, ArkImageUsage,
 };
 use uuid::Uuid;
 
@@ -25,7 +25,7 @@ use crate::{
     artifacts::StoredGenerationResult,
     auth::{ApiKeyCapability, AuthContext},
     model_routing::ResolvedModelRoute,
-    settlement::{VideoRequestMetadata, VideoResultStatus},
+    settlement::{ExecutionSettlementStore, VideoRequestMetadata, VideoResultStatus},
 };
 
 use super::{
@@ -381,8 +381,17 @@ pub(super) async fn get_content_task(
     let auth = authenticate_image_request(&headers, &state).await?;
     auth.require_api_key_capability(ApiKeyCapability::VideosRead)?;
     let job_id = parse_task_id(&task_id)?;
-    let (status, metadata) = state
-        .settlement_store
+    Ok(Json(
+        project_content_task(state.settlement_store.as_ref(), &auth, job_id).await?,
+    ))
+}
+
+pub(super) async fn project_content_task(
+    settlement_store: &dyn ExecutionSettlementStore,
+    auth: &AuthContext,
+    job_id: Uuid,
+) -> Result<ArkContentGenerationTask, ImageGatewayError> {
+    let (status, metadata) = settlement_store
         .project_video_status_with_metadata(
             &auth.tenant_id,
             &auth.project_id,
@@ -391,7 +400,27 @@ pub(super) async fn get_content_task(
         )
         .await?
         .ok_or_else(task_not_found)?;
-    Ok(Json(ark_video_task(job_id, status, metadata)))
+    let manual_cancellation = if matches!(&status, VideoResultStatus::Failed { .. }) {
+        settlement_store
+            .project_dreamina_manual_video_cancellation(
+                &auth.tenant_id,
+                &auth.project_id,
+                auth.actor_user_id,
+                job_id,
+            )
+            .await?
+            .map(|proof| super::dreamina::public_manual_cancellation(job_id, proof))
+            .transpose()?
+    } else {
+        None
+    };
+    let mut task = ark_video_task(job_id, status, metadata);
+    if let Some(proof) = manual_cancellation {
+        task.metadata
+            .get_or_insert_with(Default::default)
+            .manual_cancellation = Some(proof);
+    }
+    Ok(task)
 }
 
 fn ark_image_response(
@@ -437,6 +466,31 @@ fn ark_video_task(
     metadata: VideoRequestMetadata,
 ) -> ArkContentGenerationTask {
     let public_id = public_task_id(id);
+    let tracking = match &status {
+        VideoResultStatus::Pending {
+            stage,
+            provider_progress,
+            ..
+        } => Some(ArkContentGenerationTaskMetadata {
+            stage: Some(
+                super::dreamina::public_video_pending_stage(*stage, provider_progress.as_ref())
+                    .to_owned(),
+            ),
+            provider_progress: provider_progress
+                .clone()
+                .map(super::dreamina::public_provider_progress),
+            manual_cancellation: None,
+        }),
+        VideoResultStatus::Uncertain {
+            provider_progress: Some(progress),
+            ..
+        } => Some(ArkContentGenerationTaskMetadata {
+            stage: None,
+            provider_progress: Some(super::dreamina::public_provider_progress(progress.clone())),
+            manual_cancellation: None,
+        }),
+        _ => None,
+    };
     let mut task = match status {
         VideoResultStatus::Pending {
             model, duration_ms, ..
@@ -450,6 +504,7 @@ fn ark_video_task(
             duration: Some(super::dreamina::duration_seconds(duration_ms)),
             resolution: None,
             ratio: None,
+            metadata: None,
         },
         VideoResultStatus::Uncertain {
             model, duration_ms, ..
@@ -466,6 +521,7 @@ fn ark_video_task(
             duration: Some(super::dreamina::duration_seconds(duration_ms)),
             resolution: None,
             ratio: None,
+            metadata: None,
         },
         VideoResultStatus::Succeeded {
             model,
@@ -485,6 +541,7 @@ fn ark_video_task(
             duration: Some(super::dreamina::duration_seconds(duration_ms)),
             resolution: None,
             ratio: None,
+            metadata: None,
         },
         VideoResultStatus::SucceededRemote {
             model,
@@ -504,6 +561,7 @@ fn ark_video_task(
             duration: Some(super::dreamina::duration_seconds(duration_ms)),
             resolution: None,
             ratio: None,
+            metadata: None,
         },
         VideoResultStatus::Failed {
             model,
@@ -529,6 +587,7 @@ fn ark_video_task(
                 duration: Some(super::dreamina::duration_seconds(duration_ms)),
                 resolution: None,
                 ratio: None,
+                metadata: None,
             }
         }
     };
@@ -537,6 +596,7 @@ fn ark_video_task(
     }
     task.resolution = metadata.resolution;
     task.ratio = metadata.ratio;
+    task.metadata = tracking;
     task
 }
 
@@ -708,6 +768,96 @@ mod tests {
         let public = public_task_id(id);
         assert!(public.starts_with("cgt-"));
         assert_eq!(parse_task_id(&public).unwrap(), id);
+    }
+
+    #[test]
+    fn ark_video_metadata_retains_real_queue_progress_without_inventing_values() {
+        let id = Uuid::new_v4();
+        let progress = crate::settlement::VideoProviderProgress {
+            progress: image_provider_sdk::ProviderTaskProgress {
+                provider_status: "Queueing".into(),
+                queue_position: Some(610),
+                queue_total: Some(233061),
+                estimated_remaining_seconds: Some(5880),
+            },
+            observed_at_ms: 1_792_995_932_000,
+        };
+        for (stage, expected) in [
+            (crate::settlement::VideoPendingStage::Queued, "queued"),
+            (
+                crate::settlement::VideoPendingStage::Dispatching,
+                "dispatching",
+            ),
+            (
+                crate::settlement::VideoPendingStage::Processing,
+                "provider_queued",
+            ),
+        ] {
+            let task = ark_video_task(
+                id,
+                VideoResultStatus::Pending {
+                    model: "seedance2.0fast".into(),
+                    duration_ms: 5000,
+                    stage,
+                    provider_progress: Some(progress.clone()),
+                },
+                VideoRequestMetadata::default(),
+            );
+            let value = serde_json::to_value(task).unwrap();
+            assert_eq!(value["id"], public_task_id(id));
+            assert_eq!(value["status"], "running");
+            assert_eq!(value["metadata"]["stage"], expected);
+            assert_eq!(
+                value["metadata"]["provider_progress"]["queue_position"],
+                610
+            );
+            assert_eq!(
+                value["metadata"]["provider_progress"]["queue_total"],
+                233061
+            );
+            assert_eq!(
+                value["metadata"]["provider_progress"]["estimated_remaining_seconds"],
+                5880
+            );
+            assert_eq!(
+                value["metadata"]["provider_progress"]["observed_at_ms"],
+                progress.observed_at_ms
+            );
+        }
+        let task = ark_video_task(
+            id,
+            VideoResultStatus::Pending {
+                model: "seedance2.0fast".into(),
+                duration_ms: 5000,
+                stage: crate::settlement::VideoPendingStage::Processing,
+                provider_progress: None,
+            },
+            VideoRequestMetadata::default(),
+        );
+        let value = serde_json::to_value(task).unwrap();
+        assert_eq!(value["metadata"]["stage"], "processing");
+        assert!(value["metadata"].get("provider_progress").is_none());
+        for observed in [None, Some(progress.clone())] {
+            let task = ark_video_task(
+                id,
+                VideoResultStatus::Uncertain {
+                    model: "seedance2.0fast".into(),
+                    duration_ms: 5000,
+                    submission_error_code: None,
+                    provider_progress: observed,
+                },
+                VideoRequestMetadata::default(),
+            );
+            let value = serde_json::to_value(task).unwrap();
+            assert_eq!(value["status"], "uncertain");
+            assert!(value["metadata"]["stage"].is_null());
+            if value.get("metadata").is_some() {
+                assert_eq!(
+                    value["metadata"]["provider_progress"]["observed_at_ms"],
+                    progress.observed_at_ms
+                );
+            }
+        }
     }
 
     #[test]

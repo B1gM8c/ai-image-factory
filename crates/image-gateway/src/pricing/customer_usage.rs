@@ -57,7 +57,7 @@ pub(crate) async fn persist_customer_usage_facts(
     authority: CustomerUsageAuthority,
     now: i64,
 ) -> Result<(), CustomerUsageFactError> {
-    persist_customer_usage_facts_inner(tx, output, authority, None, now).await
+    persist_customer_usage_facts_inner(tx, output, authority, None, None, now).await
 }
 
 pub(crate) async fn persist_customer_usage_facts_with_operator_resolution(
@@ -81,7 +81,7 @@ pub(crate) async fn persist_customer_usage_facts_with_operator_resolution(
     if !bound {
         return Err(CustomerUsageFactError::Conflict);
     }
-    persist_customer_usage_facts_inner(tx, output, authority, Some(resolution_id), now).await
+    persist_customer_usage_facts_inner(tx, output, authority, Some(resolution_id), None, now).await
 }
 
 pub(crate) async fn persist_customer_usage_facts_with_operator_video_resolution(
@@ -119,7 +119,7 @@ pub(crate) async fn persist_customer_usage_facts_with_operator_video_resolution(
     if !bound {
         return Err(CustomerUsageFactError::Conflict);
     }
-    persist_customer_usage_facts_inner(tx, output, authority, Some(resolution_id), now).await
+    persist_customer_usage_facts_inner(tx, output, authority, Some(resolution_id), None, now).await
 }
 
 pub(crate) async fn persist_customer_usage_facts_with_operator_video_supplement(
@@ -157,7 +157,47 @@ pub(crate) async fn persist_customer_usage_facts_with_operator_video_supplement(
     if !bound {
         return Err(CustomerUsageFactError::Conflict);
     }
-    persist_customer_usage_facts_inner(tx, output, authority, Some(resolution_id), now).await
+    persist_customer_usage_facts_inner(tx, output, authority, Some(resolution_id), None, now).await
+}
+
+pub(crate) async fn persist_customer_usage_facts_with_operator_supplement_cancellation(
+    tx: &mut Transaction<'_, Postgres>,
+    output: &CustomerUsageOutput<'_>,
+    authority: CustomerUsageAuthority,
+    cancellation_id: Uuid,
+    now: i64,
+) -> Result<(), CustomerUsageFactError> {
+    let CustomerUsageAuthority::Durable {
+        submission_id,
+        receipt_id,
+    } = authority
+    else {
+        return Err(CustomerUsageFactError::Conflict);
+    };
+    if output.provider_id != "dreamina-cli"
+        || output.operation != "video_generation"
+        || output.terminal_outcome != "failed"
+        || output.billing_metric != "video_second"
+        || output.billing_unit != "second"
+    {
+        return Err(CustomerUsageFactError::Conflict);
+    }
+    let bound: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM dreamina_operator_video_supplement_cancellations cancellation JOIN provider_receipts receipt ON receipt.receipt_id = cancellation.original_receipt_id WHERE cancellation.cancellation_id = $1 AND cancellation.job_id = $2 AND cancellation.submission_id = $3 AND cancellation.original_receipt_id = $4 AND cancellation.output_id = $5 AND cancellation.reason = 'operator_supplement_cancelled' AND receipt.job_id = $2 AND receipt.submission_id = $3 AND receipt.output_id = $5 AND receipt.provider_id = 'dreamina-cli' AND receipt.outcome = 'uncertain')",
+    )
+    .bind(cancellation_id)
+    .bind(output.job_id)
+    .bind(submission_id)
+    .bind(receipt_id)
+    .bind(output.output_id)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(|_| CustomerUsageFactError::Unavailable)?;
+    if !bound {
+        return Err(CustomerUsageFactError::Conflict);
+    }
+    persist_customer_usage_facts_inner(tx, output, authority, None, Some(cancellation_id), now)
+        .await
 }
 
 async fn persist_customer_usage_facts_inner(
@@ -165,6 +205,7 @@ async fn persist_customer_usage_facts_inner(
     output: &CustomerUsageOutput<'_>,
     authority: CustomerUsageAuthority,
     operator_resolution_id: Option<Uuid>,
+    operator_supplement_cancellation_id: Option<Uuid>,
     now: i64,
 ) -> Result<(), CustomerUsageFactError> {
     let image_output = output.billing_metric == "output"
@@ -216,6 +257,19 @@ async fn persist_customer_usage_facts_inner(
             basis.unit.as_str(),
             basis.quantity_source.as_str(),
         ) {
+            ("video_requested_second", "second", "request_derived")
+                if operator_supplement_cancellation_id.is_some() =>
+            {
+                (
+                    0,
+                    "exact",
+                    "dreamina_operator_video_supplement_cancellations.cancellation_id",
+                    "operator_supplement_cancelled",
+                )
+            }
+            _ if operator_supplement_cancellation_id.is_some() => {
+                return Err(CustomerUsageFactError::Conflict);
+            }
             ("image_output", "image", "request_derived") => (
                 i64::from(output.output_billable_units),
                 "exact",
@@ -309,6 +363,21 @@ async fn persist_customer_usage_facts_inner(
                 .as_object_mut()
                 .ok_or(CustomerUsageFactError::Conflict)?
                 .insert("operator_resolution_id".to_string(), json!(resolution_id));
+        }
+        if let Some(cancellation_id) = operator_supplement_cancellation_id {
+            let metadata = metadata
+                .as_object_mut()
+                .ok_or(CustomerUsageFactError::Conflict)?;
+            metadata.insert(
+                "operator_supplement_cancellation_id".to_string(),
+                json!(cancellation_id),
+            );
+            metadata.insert("reason".to_string(), json!("operator_supplement_cancelled"));
+            metadata.insert(
+                "original_effect_certainty".to_string(),
+                json!("unknown_remote_effect"),
+            );
+            metadata.insert("customer_charge_waived".to_string(), json!(true));
         }
         let (submission_id, receipt_id, attempt_execution_id, authority_key) = match authority {
             CustomerUsageAuthority::Durable {

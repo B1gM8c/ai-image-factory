@@ -77,6 +77,9 @@ type TestResult<T = ()> = Result<T, String>;
 #[path = "postgres_executor/dreamina_compliance_resolution.rs"]
 mod dreamina_compliance_resolution;
 
+#[path = "postgres_executor/dreamina_manual_video_cancellation.rs"]
+mod dreamina_manual_video_cancellation;
+
 #[path = "postgres_executor/dreamina_additional_image_results.rs"]
 mod dreamina_additional_image_results;
 

@@ -9,9 +9,9 @@ use axum::{
 use image_api_contracts::dreamina::{
     DREAMINA_IMAGES_API_PROFILE, DREAMINA_VIDEOS_API_PROFILE, DreaminaCancellation,
     DreaminaImageData, DreaminaImageGenerationRequest, DreaminaImageRequest, DreaminaImageTask,
-    DreaminaImageWorkflowRequest, DreaminaProviderProgress, DreaminaTaskCreated, DreaminaTaskError,
-    DreaminaVideoContent, DreaminaVideoGenerationRequest, DreaminaVideoRequest, DreaminaVideoTask,
-    DreaminaVideoWorkflowRequest,
+    DreaminaImageWorkflowRequest, DreaminaManualCancellation, DreaminaProviderProgress,
+    DreaminaTaskCreated, DreaminaTaskError, DreaminaVideoContent, DreaminaVideoGenerationRequest,
+    DreaminaVideoRequest, DreaminaVideoTask, DreaminaVideoWorkflowRequest,
 };
 use image_provider_contracts::BillingMetric;
 use serde::{Deserialize, Serialize};
@@ -30,8 +30,8 @@ use crate::{
     auth::{ApiKeyCapability, AuthContext},
     model_routing::ResolvedModelRoute,
     settlement::{
-        ExecutionSettlementStore, ImageResultStatus, ImageTaskProjection, VideoPendingStage,
-        VideoProviderProgress, VideoResultStatus,
+        DreaminaManualVideoCancellationProof, ExecutionSettlementStore, ImageResultStatus,
+        ImageTaskProjection, VideoPendingStage, VideoProviderProgress, VideoResultStatus,
     },
     usage::{UsageCharge, UsageLimits},
 };
@@ -1352,7 +1352,22 @@ async fn project_video_task(
         VideoResultStatus::Failed { error_code: Some(code), .. }
             if code == "dreamina_compliance_confirmation_required"
     );
+    let manual_cancellation = if matches!(&status, VideoResultStatus::Failed { .. }) {
+        settlement_store
+            .project_dreamina_manual_video_cancellation(
+                &auth.tenant_id,
+                &auth.project_id,
+                auth.actor_user_id,
+                job_id,
+            )
+            .await?
+            .map(|proof| public_manual_cancellation(job_id, proof))
+            .transpose()?
+    } else {
+        None
+    };
     let mut task = video_task(job_id, status);
+    task.manual_cancellation = manual_cancellation;
     if audited_release_possible {
         task.settlement = settlement_store
             .project_video_released_settlement(
@@ -1374,16 +1389,7 @@ fn video_task(id: Uuid, status: VideoResultStatus) -> DreaminaVideoTask {
             provider_progress,
             ..
         } => {
-            let stage = match (&provider_progress, stage) {
-                (_, VideoPendingStage::Queued) => "queued",
-                (_, VideoPendingStage::Dispatching) => "dispatching",
-                (Some(progress), VideoPendingStage::Processing)
-                    if progress.progress.provider_status == "Queueing" =>
-                {
-                    "provider_queued"
-                }
-                (_, VideoPendingStage::Processing) => "processing",
-            };
+            let stage = public_video_pending_stage(stage, provider_progress.as_ref());
             DreaminaVideoTask {
                 id: id.to_string(),
                 status: "running".to_owned(),
@@ -1394,6 +1400,7 @@ fn video_task(id: Uuid, status: VideoResultStatus) -> DreaminaVideoTask {
                 error: None,
                 content: None,
                 settlement: None,
+                manual_cancellation: None,
             }
         }
         VideoResultStatus::Uncertain {
@@ -1420,6 +1427,7 @@ fn video_task(id: Uuid, status: VideoResultStatus) -> DreaminaVideoTask {
                 }),
                 content: None,
                 settlement: None,
+                manual_cancellation: None,
             }
         }
         VideoResultStatus::Succeeded {
@@ -1439,6 +1447,7 @@ fn video_task(id: Uuid, status: VideoResultStatus) -> DreaminaVideoTask {
                 duration: duration_seconds(duration_ms),
             }),
             settlement: None,
+            manual_cancellation: None,
         },
         VideoResultStatus::SucceededRemote {
             model,
@@ -1457,6 +1466,7 @@ fn video_task(id: Uuid, status: VideoResultStatus) -> DreaminaVideoTask {
                 duration: duration_seconds(duration_ms),
             }),
             settlement: None,
+            manual_cancellation: None,
         },
         VideoResultStatus::Failed {
             model, error_code, ..
@@ -1481,6 +1491,7 @@ fn video_task(id: Uuid, status: VideoResultStatus) -> DreaminaVideoTask {
                 }),
                 content: None,
                 settlement: None,
+                manual_cancellation: None,
             }
         }
     };
@@ -1513,7 +1524,7 @@ fn submission_uncertainty_diagnostic(code: Option<&str>) -> Option<(&'static str
     }
 }
 
-fn public_provider_progress(value: VideoProviderProgress) -> DreaminaProviderProgress {
+pub(super) fn public_provider_progress(value: VideoProviderProgress) -> DreaminaProviderProgress {
     DreaminaProviderProgress {
         provider_status: value.progress.provider_status,
         queue_position: value.progress.queue_position,
@@ -1521,6 +1532,62 @@ fn public_provider_progress(value: VideoProviderProgress) -> DreaminaProviderPro
         estimated_remaining_seconds: value.progress.estimated_remaining_seconds,
         observed_at_ms: value.observed_at_ms,
     }
+}
+
+pub(super) fn public_video_pending_stage(
+    stage: VideoPendingStage,
+    progress: Option<&VideoProviderProgress>,
+) -> &'static str {
+    match stage {
+        VideoPendingStage::Queued => "queued",
+        VideoPendingStage::Dispatching => "dispatching",
+        VideoPendingStage::Processing
+            if progress.is_some_and(|value| value.progress.provider_status == "Queueing") =>
+        {
+            "provider_queued"
+        }
+        VideoPendingStage::Processing => "processing",
+    }
+}
+
+pub(super) fn public_manual_cancellation(
+    job_id: Uuid,
+    proof: DreaminaManualVideoCancellationProof,
+) -> Result<DreaminaManualCancellation, ImageGatewayError> {
+    if proof.schema != "factory.manual_cancellation.v1"
+        || proof.job_id != job_id
+        || proof.authority_id.is_nil()
+        || proof.submission_id.is_nil()
+        || proof.hold_id.is_nil()
+        || proof.release_event_id.is_nil()
+        || proof.request_id.is_empty()
+        || proof.upstream_task_id.is_empty()
+        || proof.confirmed_at_ms <= 0
+        || proof.currency != "USD"
+        || proof.held_micros <= 0
+        || proof.captured_micros != 0
+        || proof.released_micros != proof.held_micros
+    {
+        return Err(ImageGatewayError::service_unavailable(
+            "Manual cancellation proof is inconsistent",
+        ));
+    }
+    Ok(DreaminaManualCancellation {
+        schema: proof.schema,
+        status: "confirmed".to_owned(),
+        authority_id: proof.authority_id.to_string(),
+        job_id: proof.job_id.to_string(),
+        request_id: proof.request_id,
+        upstream_task_id: proof.upstream_task_id,
+        submission_id: proof.submission_id.to_string(),
+        hold_id: proof.hold_id.to_string(),
+        confirmed_at_ms: proof.confirmed_at_ms,
+        currency: proof.currency,
+        held_micros: proof.held_micros.to_string(),
+        captured_micros: proof.captured_micros.to_string(),
+        released_micros: proof.released_micros.to_string(),
+        release_event_id: proof.release_event_id.to_string(),
+    })
 }
 
 pub(super) const VIDEO_UNCERTAIN_MESSAGE: &str = "The generation outcome is unknown. Do not retry or create a replacement task; contact support to reconcile this task.";
@@ -1660,6 +1727,8 @@ mod tests {
         status: Mutex<Option<VideoResultStatus>>,
         receipt: Option<image_api_contracts::dreamina::DreaminaReleasedSettlement>,
         receipt_reads: Mutex<Vec<(String, String, Option<Uuid>, Uuid)>>,
+        manual_receipt: Option<DreaminaManualVideoCancellationProof>,
+        manual_reads: Mutex<Vec<(String, String, Option<Uuid>, Uuid)>>,
     }
 
     #[async_trait::async_trait]
@@ -1728,6 +1797,22 @@ mod tests {
             ));
             Ok(self.receipt.clone())
         }
+
+        async fn project_dreamina_manual_video_cancellation(
+            &self,
+            tenant_id: &str,
+            project_id: &str,
+            actor_user_id: Option<Uuid>,
+            job_id: Uuid,
+        ) -> Result<Option<DreaminaManualVideoCancellationProof>, ImageGatewayError> {
+            self.manual_reads.lock().unwrap().push((
+                tenant_id.to_owned(),
+                project_id.to_owned(),
+                actor_user_id,
+                job_id,
+            ));
+            Ok(self.manual_receipt.clone())
+        }
     }
 
     #[tokio::test]
@@ -1762,11 +1847,14 @@ mod tests {
                 status: Mutex::new(status),
                 receipt: None,
                 receipt_reads: Mutex::default(),
+                manual_receipt: None,
+                manual_reads: Mutex::default(),
             };
             let result = project_video_task(&store, &routed_auth(7), Uuid::new_v4()).await;
             assert_eq!(result.is_ok(), visible);
             if let Ok(task) = result {
                 assert!(task.settlement.is_none());
+                assert!(task.manual_cancellation.is_none());
             }
             assert!(store.receipt_reads.lock().unwrap().is_empty());
         }
@@ -1797,6 +1885,8 @@ mod tests {
                 })),
                 receipt: expected.clone(),
                 receipt_reads: Mutex::default(),
+                manual_receipt: None,
+                manual_reads: Mutex::default(),
             };
             let task = project_video_task(&store, &auth, job_id).await.unwrap();
             assert_eq!(task.status, "failed");
@@ -1812,6 +1902,161 @@ mod tests {
                     job_id
                 )]
             );
+        }
+    }
+
+    fn cancellation_proof(job_id: Uuid) -> DreaminaManualVideoCancellationProof {
+        DreaminaManualVideoCancellationProof {
+            schema: "factory.manual_cancellation.v1".into(),
+            authority_id: Uuid::new_v4(),
+            job_id,
+            request_id: "original-request".into(),
+            upstream_task_id: "original-upstream".into(),
+            submission_id: Uuid::new_v4(),
+            hold_id: Uuid::new_v4(),
+            confirmed_at_ms: 1234,
+            currency: "USD".into(),
+            held_micros: 9_007_199_254_740_993,
+            captured_micros: 0,
+            released_micros: 9_007_199_254_740_993,
+            release_event_id: Uuid::new_v4(),
+        }
+    }
+
+    #[tokio::test]
+    async fn video_queries_attach_only_confirmed_scoped_proof_and_preserve_failed_status() {
+        let job_id = Uuid::new_v4();
+        let mut auth = routed_auth(7);
+        auth.actor_user_id = Some(Uuid::new_v4());
+        for ark in [false, true] {
+            for proof in [None, Some(cancellation_proof(job_id))] {
+                let store = VideoQueryStore {
+                    status: Mutex::new(Some(VideoResultStatus::Failed {
+                        model: "seedance2.5".into(),
+                        duration_ms: 5000,
+                        error_code: Some("provider_failed".into()),
+                    })),
+                    receipt: None,
+                    receipt_reads: Mutex::default(),
+                    manual_receipt: proof.clone(),
+                    manual_reads: Mutex::default(),
+                };
+                let task = if ark {
+                    serde_json::to_value(
+                        super::super::ark::project_content_task(&store, &auth, job_id)
+                            .await
+                            .unwrap(),
+                    )
+                    .unwrap()
+                } else {
+                    serde_json::to_value(project_video_task(&store, &auth, job_id).await.unwrap())
+                        .unwrap()
+                };
+                assert_eq!(task["status"], "failed");
+                let public_proof = if ark {
+                    &task["metadata"]["manual_cancellation"]
+                } else {
+                    &task["manual_cancellation"]
+                };
+                if let Some(proof) = proof {
+                    assert_eq!(public_proof["status"], "confirmed");
+                    assert_eq!(public_proof["schema"], "factory.manual_cancellation.v1");
+                    assert_eq!(public_proof["authority_id"], proof.authority_id.to_string());
+                    assert_eq!(
+                        public_proof["release_event_id"],
+                        proof.release_event_id.to_string()
+                    );
+                    assert_eq!(public_proof["held_micros"], "9007199254740993");
+                    assert_eq!(public_proof["released_micros"], "9007199254740993");
+                    assert_eq!(public_proof["captured_micros"], "0");
+                } else {
+                    assert!(public_proof.is_null());
+                    if ark {
+                        assert!(task.get("metadata").is_none());
+                    }
+                }
+                if !ark {
+                    assert_eq!(task["cancellation"]["supported"], false);
+                }
+                assert_eq!(
+                    *store.manual_reads.lock().unwrap(),
+                    vec![(
+                        auth.tenant_id.clone(),
+                        auth.project_id.clone(),
+                        auth.actor_user_id,
+                        job_id
+                    )]
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn nonfailed_video_queries_never_read_or_attach_manual_cancellation() {
+        let job_id = Uuid::new_v4();
+        for ark in [false, true] {
+            for status in [
+                VideoResultStatus::Pending {
+                    model: "seedance2.5".into(),
+                    duration_ms: 5000,
+                    stage: VideoPendingStage::Processing,
+                    provider_progress: None,
+                },
+                VideoResultStatus::Uncertain {
+                    model: "seedance2.5".into(),
+                    duration_ms: 5000,
+                    provider_progress: None,
+                    submission_error_code: None,
+                },
+                VideoResultStatus::Succeeded {
+                    model: "seedance2.5".into(),
+                    duration_ms: 5000,
+                    artifact_id: Uuid::new_v4(),
+                },
+            ] {
+                let store = VideoQueryStore {
+                    status: Mutex::new(Some(status)),
+                    receipt: None,
+                    receipt_reads: Mutex::default(),
+                    manual_receipt: Some(cancellation_proof(job_id)),
+                    manual_reads: Mutex::default(),
+                };
+                let task = if ark {
+                    serde_json::to_value(
+                        super::super::ark::project_content_task(&store, &routed_auth(7), job_id)
+                            .await
+                            .unwrap(),
+                    )
+                    .unwrap()
+                } else {
+                    serde_json::to_value(
+                        project_video_task(&store, &routed_auth(7), job_id)
+                            .await
+                            .unwrap(),
+                    )
+                    .unwrap()
+                };
+                assert!(task["manual_cancellation"].is_null());
+                assert!(task["metadata"]["manual_cancellation"].is_null());
+                assert!(store.manual_reads.lock().unwrap().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn inconsistent_cancellation_proof_cannot_be_returned() {
+        let job_id = Uuid::new_v4();
+        let proof = cancellation_proof(job_id);
+        assert!(public_manual_cancellation(Uuid::new_v4(), proof.clone()).is_err());
+        for mutation in [0, 1, 2, 3] {
+            let mut invalid = proof.clone();
+            match mutation {
+                0 => invalid.captured_micros = 1,
+                1 => invalid.released_micros -= 1,
+                2 => invalid.schema = "client-assertion".into(),
+                _ => invalid.release_event_id = Uuid::nil(),
+            }
+            assert!(public_manual_cancellation(job_id, invalid).is_err());
         }
     }
 

@@ -52,15 +52,16 @@ pub(in crate::settlement::postgres) async fn project(
     else {
         return Ok(status);
     };
-    let observation: Option<(Option<String>, Option<Value>, Option<i64>)> = sqlx::query_as(
+    let observation: Option<(Option<String>, Option<Value>, Option<i64>, bool)> = sqlx::query_as(
         r#"
-        SELECT observation.query_status, observation.progress_json, observation.observed_at_ms
+        SELECT observation.query_status, observation.progress_json, observation.observed_at_ms, cancellation.cancellation_id IS NOT NULL
         FROM dreamina_operator_video_supplement_authorizations supplement
         JOIN jobs job ON job.job_id = supplement.job_id
         JOIN job_auth_attributions attribution
           ON attribution.job_id = job.job_id AND attribution.tenant_id = job.tenant_id
         JOIN customer_billing_holds hold ON hold.hold_id = supplement.hold_id
           AND hold.job_id = job.job_id AND hold.tenant_id = job.tenant_id
+        LEFT JOIN dreamina_operator_video_supplement_cancellations cancellation ON cancellation.authorization_id=supplement.authorization_id AND cancellation.finalized_snapshot IS NOT NULL
         LEFT JOIN LATERAL (
             SELECT query_status, progress_json, observed_at_ms
             FROM dreamina_operator_video_supplement_observations
@@ -77,7 +78,7 @@ pub(in crate::settlement::postgres) async fn project(
           AND supplement.state IN ('accepted', 'uncertain')
           AND supplement.remote_operation_id IS NOT NULL
           AND supplement.submit_stdout_sha256 IS NOT NULL
-          AND hold.state = 'held' AND hold.captured_micros = 0 AND hold.released_micros = 0
+          AND ((hold.state = 'held' AND hold.captured_micros = 0 AND hold.released_micros = 0) OR (cancellation.cancellation_id IS NOT NULL AND hold.captured_micros=0 AND hold.released_micros=hold.held_micros))
     "#,
     )
     .bind(job_id)
@@ -88,8 +89,13 @@ pub(in crate::settlement::postgres) async fn project(
     .await
     .map_err(unavailable)?;
     match observation {
-        Some((Some(query_status), _, _)) if query_status == "failed" => Ok(status),
-        Some((_, progress, observed_at_ms)) => Ok(VideoResultStatus::Pending {
+        Some((_, _, _, true)) => Ok(VideoResultStatus::Failed {
+            model: model.clone(),
+            duration_ms: *duration_ms,
+            error_code: Some("operator_supplement_cancelled".to_owned()),
+        }),
+        Some((Some(query_status), _, _, false)) if query_status == "failed" => Ok(status),
+        Some((_, progress, observed_at_ms, false)) => Ok(VideoResultStatus::Pending {
             model: model.clone(),
             duration_ms: *duration_ms,
             stage: VideoPendingStage::Processing,
