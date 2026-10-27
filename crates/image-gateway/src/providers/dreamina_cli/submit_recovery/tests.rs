@@ -2,6 +2,8 @@ use super::*;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use tempfile::TempDir;
 
+const TRACE: &str = "20261027222605172021091123594D4D6";
+const OTHER_TRACE: &str = "20261028025505000000000000392CFF9";
 const REMOTE: &str = "7eabf607-22b0-4e1d-b693-d60569e51edf";
 fn argv(workspace: &str) -> Vec<String> {
     [
@@ -28,7 +30,7 @@ fn input(argv: &[String]) -> Value {
 }
 fn log(value: &Value, trace: &str, remote: &str) -> String {
     format!(
-        "Info 2026-10-27 22:26:05,901 v1(7) gen.go:181 host - {trace} default - 0 [SubmitTask] start submit generation task input={value}\nInfo 2026-10-27 22:26:09,701 v1(7) gen.go:200 host - {trace} default - 0 [SubmitTask] submit generation task finished submit_id={remote} task_status=querying remote_logid=upstream-trace input={value}\n"
+        "Info 2026-10-27 22:26:05,901 v1(7) gen.go:181 192.0.2.1 - {trace} default - 0 _env=prod [SubmitTask] start submit generation task input={value}\nInfo 2026-10-27 22:26:09,701 v1(7) gen.go:257 192.0.2.1 - {trace} default - 0 _env=prod [SubmitTask] submit generation task finished submit_id={remote} task_status=querying remote_logid=upstream-trace input={value}\n"
     )
 }
 fn window() -> (i64, i64) {
@@ -39,20 +41,80 @@ fn window() -> (i64, i64) {
 }
 
 #[test]
+fn native_trace_accepts_observed_prefixes_with_and_without_host() {
+    // Real CLI 1.4.21 logger prefixes; only the host IP is anonymized.
+    let with_host = format!(
+        "Info 2026-10-27 22:26:09,701 v1(7) gen.go:257 192.0.2.1 - {TRACE} default - 0 _env=prod [SubmitTask] submit generation task finished"
+    );
+    let without_host = format!(
+        "Info 2026-10-28 02:55:05,746 v1(7) gen.go:181 - {OTHER_TRACE} default - 0 _env=prod [SubmitTask] start submit generation task"
+    );
+    assert_eq!(native_log_trace(&with_host).unwrap(), TRACE);
+    assert_eq!(native_log_trace(&without_host).unwrap(), OTHER_TRACE);
+    let a = argv("/private/attempt-a");
+    let (start, end) = window();
+    let source = log(&input(&a), TRACE, REMOTE).replace("192.0.2.1 ", "");
+    assert_eq!(
+        select_log_source(&source, &a, start, end, 28800)
+            .unwrap()
+            .unwrap()
+            .1,
+        TRACE
+    );
+}
+
+#[test]
+fn native_trace_requires_unique_valid_metadata_anchor() {
+    let valid =
+        format!("Info 2026-10-27 22:26:05,901 v1(7) gen.go:181 - {TRACE} default - 0 [SubmitTask]");
+    for invalid in [
+        valid.replace(TRACE, "fake-trace"),
+        valid.replace(TRACE, "20261027222605172021091123594d4d6"),
+        valid.replace("default - 0", "default - unknown"),
+        valid.replace(
+            "[SubmitTask]",
+            &format!("- {OTHER_TRACE} default - 0 [SubmitTask]"),
+        ),
+        valid.replace("[SubmitTask]", "- fake-trace default - 0 [SubmitTask]"),
+        format!("Info 2026-10-27 22:26:05,901 v1(7) gen.go:181 [SubmitTask] - {TRACE} default - 0"),
+    ] {
+        assert!(native_log_trace(&invalid).is_err());
+    }
+    assert_eq!(
+        native_log_trace(&format!("{valid} input=\"- {OTHER_TRACE} default - 0\"")).unwrap(),
+        TRACE
+    );
+}
+
+#[test]
+fn native_prefix_fix_does_not_accept_start_only_or_cross_trace() {
+    let a = argv("/private/attempt-a");
+    let (start, end) = window();
+    let source = log(&input(&a), TRACE, REMOTE).replace("192.0.2.1 ", "");
+    assert!(select_log_source(source.lines().next().unwrap(), &a, start, end, 28800).is_err());
+    let crossed = source.replacen(
+        &format!("gen.go:257 - {TRACE}"),
+        &format!("gen.go:257 - {OTHER_TRACE}"),
+        1,
+    );
+    assert!(select_log_source(&crossed, &a, start, end, 28800).is_err());
+}
+
+#[test]
 fn selects_the_same_absolute_attempt_among_identical_parallel_prompts() {
     let a = argv("/private/attempt-a");
     let b = argv("/private/attempt-b");
     let (start, end) = window();
     let source = log(
         &input(&b),
-        "other-trace",
+        OTHER_TRACE,
         "8137cf73-6698-4533-bf61-3c743aa536ff",
-    ) + &log(&input(&a), "same-trace", REMOTE);
+    ) + &log(&input(&a), TRACE, REMOTE);
     let matched = select_log_source(&source, &a, start, end, 28800)
         .unwrap()
         .unwrap();
     assert_eq!(matched.0, REMOTE);
-    assert_eq!(matched.1, "same-trace");
+    assert_eq!(matched.1, TRACE);
     assert!(!matched.2.contains("attempt-b"));
 }
 
@@ -60,11 +122,11 @@ fn selects_the_same_absolute_attempt_among_identical_parallel_prompts() {
 fn rejects_ambiguous_candidates_and_cross_trace_pairs() {
     let a = argv("/private/attempt-a");
     let (start, end) = window();
-    let source = log(&input(&a), "same-trace", REMOTE);
+    let source = log(&input(&a), TRACE, REMOTE);
     assert!(select_log_source(&(source.clone() + &source), &a, start, end, 28800).is_err());
     let crossed = source.replacen(
-        "gen.go:200 host - same-trace",
-        "gen.go:200 host - other-trace",
+        &format!("gen.go:257 192.0.2.1 - {TRACE}"),
+        &format!("gen.go:257 192.0.2.1 - {OTHER_TRACE}"),
         1,
     );
     assert!(select_log_source(&crossed, &a, start, end, 28800).is_err());
@@ -95,7 +157,7 @@ fn relative_historical_arguments_or_missing_null_fields_do_not_match() {
 fn failed_local_cache_or_outside_window_cannot_prove_acceptance() {
     let a = argv("/private/attempt-a");
     let (start, end) = window();
-    let source = log(&input(&a), "same-trace", REMOTE);
+    let source = log(&input(&a), TRACE, REMOTE);
     assert!(
         select_log_source(&source, &a, end + 1, end + 1000, 28800)
             .unwrap()
@@ -142,7 +204,7 @@ fn bounded_log_reader_rejects_symlink_and_reads_only_bound_hour() {
     let a = argv("/private/attempt-a");
     let (start, end) = window();
     let path = dir.join("dreamina.log.2026-10-27_22");
-    fs::write(&path, log(&input(&a), "same-trace", REMOTE)).unwrap();
+    fs::write(&path, log(&input(&a), TRACE, REMOTE)).unwrap();
     assert!(
         native_logs(&home, start, end, 28800)
             .unwrap()
@@ -160,7 +222,7 @@ fn bounded_log_reader_rejects_symlink_and_reads_only_bound_hour() {
     );
     let mut large = vec![b'x'; MAX_LOG_BYTES as usize + 100];
     large.push(b'\n');
-    large.extend(log(&input(&a), "same-trace", REMOTE).as_bytes());
+    large.extend(log(&input(&a), TRACE, REMOTE).as_bytes());
     fs::write(&path, large).unwrap();
     let tail = native_logs(&home, start, end, 28800).unwrap();
     assert!(

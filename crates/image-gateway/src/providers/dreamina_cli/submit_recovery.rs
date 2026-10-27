@@ -489,11 +489,7 @@ fn select_log_source(
             continue;
         }
         let fields = prefix.split_whitespace().collect::<Vec<_>>();
-        // Native logger: level date clock v1(...) source host - trace ... .
-        if fields.len() < 9 || fields[6] != "-" || fields[7].is_empty() || fields[7] == "-" {
-            return Err(invalid());
-        }
-        let trace = fields[7].to_owned();
+        let trace = native_log_trace(prefix)?.to_owned();
         if prefix.contains("[SubmitTask] start submit generation task") {
             starts.push((at, trace, input, line.to_owned()));
         } else if prefix.contains("[SubmitTask] submit generation task finished") {
@@ -522,6 +518,30 @@ fn select_log_source(
         return Err(invalid());
     }
     Ok(Some((remote, start_trace, first, last)))
+}
+
+fn native_log_trace(prefix: &str) -> Result<&str, ProviderFailure> {
+    // CLI 1.4.21 may omit the host field. Bind the unique logger metadata
+    // anchor instead of a column, and never search the task message/input.
+    let (metadata, _) = prefix.split_once("[SubmitTask]").ok_or_else(invalid)?;
+    let fields = metadata.split_whitespace().collect::<Vec<_>>();
+    let mut anchors = fields
+        .windows(5)
+        .filter(|parts| parts[0] == "-" && parts[2] == "default" && parts[3] == "-");
+    let parts = anchors.next().ok_or_else(invalid)?;
+    let trace = parts[1];
+    if anchors.next().is_some()
+        || parts[4].is_empty()
+        || !parts[4].bytes().all(|byte| byte.is_ascii_digit())
+        || trace.len() != 33
+        || !trace.as_bytes()[..14].iter().all(u8::is_ascii_digit)
+        || !trace
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'A'..=b'F').contains(&byte))
+    {
+        return Err(invalid());
+    }
+    Ok(trace)
 }
 
 fn field<'a>(fields: &[&'a str], prefix: &str) -> Option<&'a str> {
