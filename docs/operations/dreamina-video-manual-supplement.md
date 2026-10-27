@@ -8,7 +8,8 @@ A separate record retains the old uncertainty and the new launch nonce/task ID.
 Before using it, confirm that no original success, artifact, remote task or
 success overlay exists and no consumer can still upload or refund an old result.
 Do not substitute models, omit references or replace expired inputs with other
-material. Install the signed application/migration normally. Run as the gateway
+material. The database must already have every migration required by the signed
+operator tool, with matching checksums. Run as the gateway
 service identity with its protected database environment and the target video
 profile's `remote-providers/<profile>.env`, as used by `provider-submitd@`.
 Inject both through protected `EnvironmentFile` settings, never credentials in
@@ -24,7 +25,33 @@ factoryctl poll-dreamina-video-supplement AUTHORIZATION_ID EVIDENCE_ROOT
 ```
 
 Preparation checks the original inputs and freezes runtime identity/pins without
-launching a generator. The private plan and journals contain prompts, arguments
+launching a generator. New plans also require these explicit settings from the
+protected profile environment:
+
+```text
+PROVIDER_SUBMITTER_CLI_WALL_TIMEOUT_MS=540000
+PROVIDER_SUBMITTER_PROVIDER_TIMEOUT_MS=600000
+```
+
+Both values must be positive integer milliseconds, at most one day; the CLI
+budget must be at least 60 seconds below the provider budget. The values above
+allow nine minutes for submit-time material uploads and the acceptance receipt.
+They do not make a generation retry safe or prove that submission will succeed.
+The reviewed `plan.json` schema version 2 freezes both values in `submit_budget`,
+outside the unchanged database runtime identity. Dispatch rejects missing or
+changed budgets before claiming its one allowed send. It uses the frozen CLI
+budget for input staging, the command wall limit, the new launch's absolute
+deadline and its bounded observer wait. The new deadline starts after acquiring
+the credential guard; the original execution's expired deadline remains intact.
+Query-only polling retains its separate 60-second limit.
+
+Legacy plans without a reviewed budget cannot be dispatched by the new tool.
+Do not edit their private plan, reset the claim or erase evidence to get past
+this check. Already dispatched legacy plans can still recover their genuine
+accepted ID and poll without the new configuration fields. Review an unused
+legacy authorization separately; create this incident's new authorizations only
+with the reviewed version 2 preparation tool.
+ The private plan and journals contain prompts, arguments
 and signed references; keep them out of ordinary logs and source control.
 
 Dispatch must obtain its durable single-use claim before releasing the runner.
@@ -46,3 +73,51 @@ Delivery, usage, rating, ledger and audit records settle the original quote in
 one transaction. Verify a unique original debit and the consumer's downloaded
 hash. Do not manually edit the job, hold, receipt, fence, supplement or blob.
 Keep unrelated completed orders unchanged.
+
+## Use an independently attested operator tool
+
+A budget-only operator hotfix does not require changing `current` or restarting
+the application fleet when its migration list and checksums match the installed
+database. Use the existing `.github/workflows/operator-hotfix.yml` workflow:
+
+1. Merge the reviewed source normally and wait for the exact main commit's full
+   CI, including PostgreSQL 16/18 and recovery rehearsal, to succeed. Create a
+   unique signed, protected `v*.hotfix.operator.*` tag at that commit and dispatch
+   the operator workflow on that tag. Complete its normal `production-release`
+   environment approval. The workflow checks the signed tag and exact main CI,
+   formatting, media regression and supplement budget/process regressions before
+   building and attesting the operator bytes.
+2. Record the exact workflow run/attempt, artifact ID, archive size and archive
+   digest. Download that artifact once. Require exactly `factoryctl` and
+   `operator-manifest.json`; reject links or unexpected paths. Verify both files
+   with the official GitHub attestation verifier, constrained to this repository,
+   the `operator-hotfix.yml` signer, exact signed source tag and source commit:
+
+   ```text
+   gh attestation verify FILE --repo OWNER/REPOSITORY \
+     --signer-workflow OWNER/REPOSITORY/.github/workflows/operator-hotfix.yml \
+     --source-ref refs/tags/EXACT_SIGNED_TAG --source-digest EXACT_SOURCE_COMMIT
+   ```
+
+   Require manifest schema version 2, kind `operator_factoryctl_hotfix`, the same
+   source commit/tag and run/attempt, the installed database schema and exactly
+   these `intended_operations`: `prepare-dreamina-video-supplement`,
+   `dispatch-dreamina-video-supplement`, `poll-dreamina-video-supplement`. Check
+   `factoryctl` size and SHA-256 against the attested manifest after extraction.
+3. Copy only those verified files into a new root-owned protected operator
+   directory, separate from `current`. Recheck their bytes on the production
+   host. Execute that exact absolute `factoryctl` path as the existing gateway
+   service UID with its protected `EnvironmentFile` settings and retained signed
+   CLI/runner pins. Each command still verifies the database migrations and
+   frozen account/runtime identity. Do not run an unverified local build, replace
+   the runner, use a direct CLI generation or place credentials in arguments.
+4. Prepare and review each authorized original job separately, then dispatch its
+   authority once. Preserve the operator version, plan, launch, one-shot nonce
+   and terminal evidence. A timeout does not reset authority; continue with poll
+   only. Reconcile the consumer through its normal authenticated original-task
+   path and verify the original debit and downloaded bytes exactly once.
+
+This installs an operator tool only. Do not invoke bootstrap, Check/Apply,
+application activation, schema changes or a `current` symlink switch for this
+procedure. A tool that requires any unapplied or changed migration must instead
+use the normal application migration/release workflow before operating.

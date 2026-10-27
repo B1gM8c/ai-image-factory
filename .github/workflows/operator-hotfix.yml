@@ -15,8 +15,25 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     environment: production-release
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_DB: ai_image_factory_operator_test
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_USER: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d ai_image_factory_operator_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      TEST_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/ai_image_factory_operator_test
     permissions:
       contents: read
+      actions: read
       attestations: write
       id-token: write
     steps:
@@ -39,6 +56,17 @@ jobs:
               .verification.verified == true and .verification.reason == "valid"
               and .tag == $tag and .object.type == "commit" and .object.sha == $commit'
 
+      - name: Require successful CI for this exact main commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -Eeuo pipefail
+          run_id="$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?branch=main&event=push&head_sha=$GITHUB_SHA" \
+            --jq '.workflow_runs | sort_by(.run_number) | last | select(.status == "completed" and .conclusion == "success") | .id')"
+          test -n "$run_id"
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id" \
+            --jq '.head_sha' | grep --fixed-strings --line-regexp "$GITHUB_SHA"
+
       - name: Check formatting
         run: cargo fmt --all -- --check
 
@@ -46,6 +74,17 @@ jobs:
         run: >-
           cargo test --release --locked --package gpt-image-2-gateway
           --lib media_inputs:: -- --test-threads=1
+
+      - name: Build process runner for operator regression
+        run: >-
+          cargo build --release --locked --package gpt-image-2-gateway
+          --bin remote-submit-runner
+
+      - name: Verify supplement budget, one-shot dispatch and legacy poll
+        run: >-
+          cargo test --release --locked --package gpt-image-2-gateway
+          --lib provider_tasks::remote_submit::video_supplement::tests
+          -- --test-threads=1
 
       - name: Build only the operator tool
         run: >-
@@ -64,14 +103,19 @@ jobs:
           with binary.open('rb') as stream:
               digest = hashlib.file_digest(stream, 'sha256').hexdigest()
           manifest = {
-              'schema_version': 1,
+              'schema_version': 2,
               'kind': 'operator_factoryctl_hotfix',
               'source_commit': os.environ['GITHUB_SHA'],
               'source_tag': os.environ['GITHUB_REF_NAME'],
               'run_id': int(os.environ['GITHUB_RUN_ID']),
               'run_attempt': int(os.environ['GITHUB_RUN_ATTEMPT']),
-              'database_schema': 153,
-              'intended_operation': 'poll-dreamina-video-supplement',
+              'database_schema': max(int(path.name.split('_', 1)[0])
+                                     for path in Path('crates/image-gateway/migrations').glob('*.sql')),
+              'intended_operations': [
+                  'prepare-dreamina-video-supplement',
+                  'dispatch-dreamina-video-supplement',
+                  'poll-dreamina-video-supplement',
+              ],
               'binary': {'path': 'factoryctl', 'bytes': binary.stat().st_size,
                          'sha256': digest},
           }

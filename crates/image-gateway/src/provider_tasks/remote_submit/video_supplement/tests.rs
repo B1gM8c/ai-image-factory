@@ -46,6 +46,111 @@ async fn frozen_image_and_audio_input_rows_decode_postgres_smallint_indices() {
     pool.close().await;
 }
 
+#[test]
+fn submit_budget_is_explicit_bounded_and_leaves_a_receipt_margin() {
+    let budget = SubmitBudget::parse("540000", "600000").unwrap();
+    assert_eq!(budget.wall_limit(), Duration::from_secs(540));
+    assert_eq!(budget.launch_deadline(1_000).unwrap(), 541_000);
+    assert!(budget.launch_deadline(u64::MAX).is_err());
+    assert!(SubmitBudget::parse("1", "60001").is_ok());
+    assert!(SubmitBudget::parse("86340000", "86400000").is_ok());
+    for (wall, provider) in [
+        ("", "600000"),
+        ("0", "600000"),
+        ("540001", "600000"),
+        ("600000", "600000"),
+        ("1", "60000"),
+        ("1", "0"),
+        ("1", "86400001"),
+        ("1.5", "600000"),
+        ("540000", "bad"),
+        ("18446744073709551616", "600000"),
+    ] {
+        assert!(
+            SubmitBudget::parse(wall, provider).is_err(),
+            "accepted {wall}/{provider}"
+        );
+    }
+}
+
+#[test]
+fn prepared_budget_drift_or_legacy_dispatch_is_rejected_before_any_claim() {
+    let budget = SubmitBudget::parse("540000", "600000").unwrap();
+    let reviewed = json!({"schema_version":2, "submit_budget": budget});
+    assert_eq!(validate_prepared_budget(&reviewed, budget).unwrap(), budget);
+    for current in [
+        SubmitBudget::parse("60000", "600000").unwrap(),
+        SubmitBudget::parse("540000", "900000").unwrap(),
+    ] {
+        assert!(validate_prepared_budget(&reviewed, current).is_err());
+    }
+    for altered in [
+        json!({"schema_version":1}),
+        json!({"schema_version":1,"submit_budget":budget}),
+        json!({"schema_version":2,"submit_budget":{"cli_wall_timeout_ms":540000}}),
+        json!({"schema_version":2,"submit_budget":{"cli_wall_timeout_ms":540000,"provider_timeout_ms":600000,"extra":1}}),
+        json!({"schema_version":2,"submit_budget":{"cli_wall_timeout_ms":600000,"provider_timeout_ms":600000}}),
+    ] {
+        assert!(validate_prepared_budget(&altered, budget).is_err());
+    }
+}
+
+#[test]
+fn submit_command_and_launch_use_the_same_reviewed_budget_without_extending_poll() {
+    let fixture = ProcessFixture::new("accepted");
+    let budget = SubmitBudget::parse("540000", "600000").unwrap();
+    let policy = DreaminaCliPolicyV1::new(
+        &fixture.executable,
+        fixture.executable_sha256,
+        fixture.workspace.clone(),
+        fixture.home.clone(),
+        budget.wall_limit(),
+        TERMINATION_GRACE,
+    )
+    .unwrap();
+    let request = parse_submit_command(br#"{"operation":"text2video","schema_version":1,"prompt":"p","model_version":"seedance2.5","ratio":"16:9","duration":5,"video_resolution":"480p","poll":0}"#).unwrap();
+    let command = policy.command_spec(&request).unwrap();
+    let started = now_ms().unwrap();
+    let launch = LaunchEvidence {
+        authorization_id: fixture.plan.authorization_id,
+        dispatch_nonce: fixture.plan.dispatch_nonce,
+        execution_binding_sha256: supplement_binding(&fixture.plan).unwrap(),
+        absolute_deadline_unix_ms: budget.launch_deadline(started).unwrap(),
+    };
+    assert_eq!(
+        command.wall_timeout().as_millis() as u64,
+        launch.absolute_deadline_unix_ms - started
+    );
+    assert!(
+        command
+            .arguments()
+            .iter()
+            .any(|argument| argument == "--poll=0")
+    );
+    assert_eq!(QUERY_WALL_LIMIT, Duration::from_secs(60));
+    assert_eq!(
+        fixture.plan.runtime_binding_json.as_object().unwrap().len(),
+        11
+    );
+}
+
+#[tokio::test]
+async fn legacy_plan_still_recovers_and_polls_without_a_submit_budget() {
+    let fixture = ProcessFixture::new("accepted");
+    private_write_once(&fixture.directory, "plan.json", br#"{"schema_version":1}"#).unwrap();
+    let store = DurableFakeStore {
+        path: fixture.directory.join("claimed"),
+        runtime_binding: fixture.plan.runtime_binding_json.clone(),
+    };
+    let stdout = fixture.dispatch(&store).await.unwrap().unwrap();
+    let recovered = recover_submit_stdout(&fixture.plan, &fixture.directory).unwrap();
+    assert_eq!(recovered, stdout);
+    let remote = parse_receipt(&recovered).unwrap();
+    fixture.poll(remote.submit_id()).await;
+    assert_eq!(fixture.count("generation-count"), 1);
+    assert_eq!(fixture.count("poll-count"), 1);
+}
+
 struct DurableFakeStore {
     path: PathBuf,
     runtime_binding: serde_json::Value,

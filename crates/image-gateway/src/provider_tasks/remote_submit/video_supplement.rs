@@ -40,10 +40,84 @@ use crate::{
     },
 };
 
-const WALL_LIMIT: Duration = Duration::from_secs(60);
+const QUERY_WALL_LIMIT: Duration = Duration::from_secs(60);
+const MAX_SUBMIT_DURATION_MS: u64 = 24 * 60 * 60 * 1_000;
+const SUBMIT_RECEIPT_MARGIN_MS: u64 = 60_000;
 const TERMINATION_GRACE: Duration = Duration::from_secs(2);
 const MAX_VIDEO_BYTES: usize = 128 * 1024 * 1024;
 const MAX_PRIVATE_JSON_BYTES: u64 = 1024 * 1024;
+
+/// This reviewed budget belongs to the new operator launch, not the expired
+/// original execution. It is intentionally outside the 11-key DB identity.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SubmitBudget {
+    cli_wall_timeout_ms: u64,
+    provider_timeout_ms: u64,
+}
+
+impl SubmitBudget {
+    fn from_env() -> Result<Self, ImageGatewayError> {
+        Self::parse(
+            &required_env("PROVIDER_SUBMITTER_CLI_WALL_TIMEOUT_MS")?,
+            &required_env("PROVIDER_SUBMITTER_PROVIDER_TIMEOUT_MS")?,
+        )
+    }
+
+    fn parse(wall: &str, provider: &str) -> Result<Self, ImageGatewayError> {
+        let budget = Self {
+            cli_wall_timeout_ms: wall.parse().map_err(|_| failure())?,
+            provider_timeout_ms: provider.parse().map_err(|_| failure())?,
+        };
+        budget.validate()?;
+        Ok(budget)
+    }
+
+    fn validate(self) -> Result<(), ImageGatewayError> {
+        let maximum_wall = self
+            .provider_timeout_ms
+            .checked_sub(SUBMIT_RECEIPT_MARGIN_MS)
+            .ok_or_else(failure)?;
+        if self.cli_wall_timeout_ms == 0
+            || self.provider_timeout_ms > MAX_SUBMIT_DURATION_MS
+            || self.cli_wall_timeout_ms > maximum_wall
+        {
+            return Err(ImageGatewayError::config(
+                "video supplement submit budget must leave at least 60000ms for its receipt",
+            ));
+        }
+        Ok(())
+    }
+
+    fn wall_limit(self) -> Duration {
+        Duration::from_millis(self.cli_wall_timeout_ms)
+    }
+
+    fn launch_deadline(self, now: u64) -> Result<u64, ImageGatewayError> {
+        now.checked_add(self.cli_wall_timeout_ms)
+            .ok_or_else(failure)
+    }
+}
+
+fn validate_prepared_budget(
+    prepared: &serde_json::Value,
+    current: SubmitBudget,
+) -> Result<SubmitBudget, ImageGatewayError> {
+    let frozen: SubmitBudget =
+        serde_json::from_value(prepared.get("submit_budget").cloned().ok_or_else(|| {
+            ImageGatewayError::config(
+                "legacy supplement plan has no reviewed submit budget; dispatch refused",
+            )
+        })?)
+        .map_err(|_| failure())?;
+    frozen.validate()?;
+    if prepared["schema_version"] != json!(2) || frozen != current {
+        return Err(ImageGatewayError::config(
+            "video supplement submit budget changed after prepare",
+        ));
+    }
+    Ok(frozen)
+}
 
 #[derive(Serialize)]
 pub struct DreaminaVideoSupplementOperatorReceipt {
@@ -120,6 +194,7 @@ async fn prepare_operator(
     request: &DreaminaVideoSupplementAuthorizationRequest,
     previous_authorization_id: Option<Uuid>,
 ) -> Result<DreaminaVideoSupplementOperatorReceipt, ImageGatewayError> {
+    let submit_budget = SubmitBudget::from_env()?;
     let (store, blobs) = stores(pool)?;
     let (profile_id, account_id): (Uuid, Uuid) = sqlx::query_as(
         "SELECT execution_profile_id,provider_account_id FROM provider_submissions WHERE job_id=$1 AND submission_id=$2 AND executor_execution_id=$3",
@@ -146,10 +221,11 @@ async fn prepare_operator(
     if plan.state != "authorized" {
         return Ok(receipt(&plan, &directory, &plan.state, None));
     }
-    let (_, command) = prepare_command(pool, &plan, &runtime, blobs).await?;
+    let (_, command) = prepare_command(pool, &plan, &runtime, blobs, submit_budget).await?;
     private_write_once(&directory, "plan.json", &serde_json::to_vec_pretty(&json!({
-        "schema_version": 1,
+        "schema_version": 2,
         "authority": "dreamina-video-manual-supplement",
+        "submit_budget": submit_budget,
         "previous_authorization_id": previous_authorization_id,
         "authorization": plan,
         "cli_executable_sha256": hex::encode(runtime.executable_sha256),
@@ -189,6 +265,7 @@ pub async fn dispatch_dreamina_video_supplement_operator(
     {
         return Err(failure());
     }
+    let submit_budget = validate_prepared_budget(&prepared_plan, SubmitBudget::from_env()?)?;
     let runtime = Runtime::load(pool, &plan).await?;
     let runtime_binding = runtime.binding()?;
     if runtime_binding != plan.runtime_binding_json
@@ -197,16 +274,10 @@ pub async fn dispatch_dreamina_video_supplement_operator(
     {
         return Err(failure());
     }
-    let (_, command) = prepare_command(pool, &plan, &runtime, blobs).await?;
+    let (_, command) = prepare_command(pool, &plan, &runtime, blobs, submit_budget).await?;
     let gate_command =
         command_to_gated(&command, runtime.executable_sha256).map_err(|_| failure())?;
     let gate_root = private_subdirectory(&directory, "gate")?;
-    let launch = LaunchEvidence {
-        authorization_id,
-        dispatch_nonce: plan.dispatch_nonce,
-        execution_binding_sha256: supplement_binding(&plan)?,
-        absolute_deadline_unix_ms: now_ms()?.saturating_add(WALL_LIMIT.as_millis() as u64),
-    };
     // Lock the same live credential head used by the normal submit runtime; no
     // credential refresh or keychain replacement can cross the release boundary.
     let mut credential_guard = pool.begin().await.map_err(|_| failure())?;
@@ -220,6 +291,12 @@ pub async fn dispatch_dreamina_video_supplement_operator(
     .await
     .map_err(|_| failure())?;
     runtime.verify_identity()?;
+    let launch = LaunchEvidence {
+        authorization_id,
+        dispatch_nonce: plan.dispatch_nonce,
+        execution_binding_sha256: supplement_binding(&plan)?,
+        absolute_deadline_unix_ms: submit_budget.launch_deadline(now_ms()?)?,
+    };
     // From here every failure remains uncertain and the one-shot claim is never reset.
     let result = one_shot_dispatch(
         &store,
@@ -249,7 +326,8 @@ pub async fn dispatch_dreamina_video_supplement_operator(
                 .stderr(Stdio::null())
                 .spawn()
                 .map_err(|_| failure())?;
-            let deadline = tokio::time::Instant::now() + WALL_LIMIT + Duration::from_secs(4);
+            let deadline =
+                tokio::time::Instant::now() + submit_budget.wall_limit() + Duration::from_secs(4);
             loop {
                 if tokio::time::Instant::now() >= deadline {
                     return Err(failure());
@@ -348,7 +426,7 @@ pub async fn poll_dreamina_video_supplement_operator(
         runtime.executable_sha256,
         runtime.workspace_root.clone(),
         runtime.home.clone(),
-        WALL_LIMIT,
+        QUERY_WALL_LIMIT,
         TERMINATION_GRACE,
     )
     .map_err(|_| failure())?;
@@ -969,6 +1047,7 @@ async fn prepare_command(
     plan: &DreaminaVideoSupplementPlan,
     runtime: &Runtime,
     blobs: Arc<FilesystemArtifactBlobStore>,
+    submit_budget: SubmitBudget,
 ) -> Result<(DreaminaSubmitRequestV1, image_cli_runtime::CommandSpec), ImageGatewayError> {
     let bytes = serde_json::to_vec(&plan.command_json).map_err(|_| failure())?;
     if sha256_hex(&bytes) != plan.command_hash {
@@ -1027,7 +1106,7 @@ async fn prepare_command(
         files,
         &workspace,
         Instant::now(),
-        WALL_LIMIT,
+        submit_budget.wall_limit(),
     )
     .await
     .map_err(|_| failure())?;
@@ -1036,7 +1115,7 @@ async fn prepare_command(
         runtime.executable_sha256,
         runtime.workspace_root.clone(),
         runtime.home.clone(),
-        WALL_LIMIT,
+        submit_budget.wall_limit(),
         TERMINATION_GRACE,
     )
     .map_err(|_| failure())?;
