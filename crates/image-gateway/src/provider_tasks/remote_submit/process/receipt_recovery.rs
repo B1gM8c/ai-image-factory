@@ -179,7 +179,9 @@ fn marker_millis<T: DeserializeOwned>(
     let millis = stat
         .st_mtime
         .checked_mul(1000)
-        .and_then(|millis| millis.checked_add(stat.st_mtime_nsec / 1_000_000))
+        // Darwin exposes signed nanoseconds, Linux unsigned. Dividing first
+        // bounds either representation to an i64 before the checked addition.
+        .and_then(|millis| millis.checked_add((stat.st_mtime_nsec / 1_000_000) as i64))
         .ok_or(GatedCliProcessError::Integrity)?;
     Ok((value, millis, hex::encode(Sha256::digest(&bytes))))
 }
