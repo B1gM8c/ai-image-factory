@@ -21,6 +21,8 @@ pub(super) const MAX_VIDEO_INPUT_BYTES: usize = 32 * 1024 * 1024;
 const HTTPS_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const HTTPS_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 const GENERATED_VIDEO_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+#[cfg(debug_assertions)]
+const TEST_GENERATED_VIDEO_URL_ENV: &str = "GATEWAY_TEST_GENERATED_VIDEO_URL";
 
 #[derive(Debug)]
 pub(crate) enum GeneratedVideoDownloadError {
@@ -45,6 +47,24 @@ pub(crate) async fn stream_generated_video<S: ArtifactSink>(
     use GeneratedVideoDownloadError::{Invalid, Unavailable};
     if max_bytes == 0 || max_bytes > crate::artifacts::MAX_ARTIFACT_BYTES {
         return Err(Invalid);
+    }
+    // Like the existing direct-edit fixture endpoint, this seam does not exist
+    // in release builds. Real bytes still cross the normal bounded stream/sink.
+    #[cfg(debug_assertions)]
+    if let Some(endpoint) = std::env::var_os(TEST_GENERATED_VIDEO_URL_ENV) {
+        let endpoint = test_generated_video_url(endpoint.to_str().ok_or(Invalid)?)?;
+        let response = Client::builder()
+            .no_proxy()
+            .redirect(Policy::none())
+            .connect_timeout(HTTPS_CONNECT_TIMEOUT)
+            .timeout(GENERATED_VIDEO_TIMEOUT)
+            .build()
+            .map_err(|_| Unavailable)?
+            .get(endpoint)
+            .send()
+            .await
+            .map_err(|_| Unavailable)?;
+        return stream_generated_video_response(response, max_bytes, sink).await;
     }
     let url = validate_public_https_url("video", source)
         .await
@@ -80,6 +100,26 @@ pub(crate) async fn stream_generated_video<S: ArtifactSink>(
         .map_err(|_| Unavailable)?;
     let response = client.get(url).send().await.map_err(|_| Unavailable)?;
     stream_generated_video_response(response, max_bytes, sink).await
+}
+
+#[cfg(debug_assertions)]
+fn test_generated_video_url(source: &str) -> Result<Url, GeneratedVideoDownloadError> {
+    let url = Url::parse(source).map_err(|_| GeneratedVideoDownloadError::Invalid)?;
+    let loopback = url.host_str().is_some_and(|host| {
+        host.trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+    });
+    if url.scheme() != "http"
+        || !loopback
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(GeneratedVideoDownloadError::Invalid);
+    }
+    Ok(url)
 }
 
 async fn stream_generated_video_response<S: ArtifactSink>(
@@ -778,6 +818,27 @@ mod generated_video_tests {
             DurableArtifactRef::new("test", "video-download").unwrap(),
             [0; 32],
         )
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn explicit_test_download_endpoint_accepts_only_uncredentialed_loopback_http() {
+        for source in [
+            "http://127.0.0.1:12345/fixture.mp4",
+            "http://[::1]:12345/fixture.mp4",
+        ] {
+            assert!(test_generated_video_url(source).is_ok());
+        }
+        for source in [
+            "http://example.com/fixture.mp4",
+            "https://127.0.0.1/fixture.mp4",
+            "http://user:password@127.0.0.1/fixture.mp4",
+            "http://127.0.0.1/fixture.mp4#fragment",
+            "http://169.254.169.254/fixture.mp4",
+            "http://localhost/fixture.mp4",
+        ] {
+            assert!(test_generated_video_url(source).is_err());
+        }
     }
 
     fn response(

@@ -152,22 +152,6 @@ impl Case {
     }
 }
 
-struct WorkflowStaging {
-    image: bool,
-    inner: FilesystemProviderArtifactStagerFactory,
-}
-impl ProviderArtifactStagerFactory for WorkflowStaging {
-    type Stager =
-        <FilesystemProviderArtifactStagerFactory as ProviderArtifactStagerFactory>::Stager;
-    async fn begin(
-        &self,
-        context: &ProviderArtifactStageContext,
-    ) -> Result<Self::Stager, ArtifactSinkError> {
-        assert!(self.image, "remote video must not open an artifact sink");
-        self.inner.begin(context).await
-    }
-}
-
 #[tokio::test]
 async fn native_and_ark_reference_workflows_preserve_inputs_native_batch_and_exact_billing()
 -> TestResult {
@@ -183,7 +167,7 @@ async fn native_and_ark_reference_workflows_preserve_inputs_native_batch_and_exa
         let Some(database) = TestDatabase::new().await? else {
             return Ok(());
         };
-        let result = Box::pin(run_workflow(&database.pool, case))
+        let result = Box::pin(run_workflow(&database.pool, case, &_guard))
             .await
             .map_err(|error| format!("{case:?}: {error}"));
         combine(result, database.cleanup().await)?;
@@ -200,8 +184,36 @@ fn png(color: [u8; 4]) -> TestResult<Vec<u8>> {
     Ok(encoded.into_inner())
 }
 
-async fn run_workflow(pool: &PgPool, case: Case) -> TestResult {
+async fn run_workflow(
+    pool: &PgPool,
+    case: Case,
+    serial: &tokio::sync::MutexGuard<'_, ()>,
+) -> TestResult {
     let root = TempDir::new().map_err(debug_error)?;
+    let result = run_workflow_inner(pool, case, serial, &root).await;
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let preserved = root.keep();
+            Err(format!(
+                "{error}; private_fixture_preserved={}",
+                preserved.display()
+            ))
+        }
+    }
+}
+
+async fn run_workflow_inner(
+    pool: &PgPool,
+    case: Case,
+    serial: &tokio::sync::MutexGuard<'_, ()>,
+    root: &TempDir,
+) -> TestResult {
+    let transport = if case.is_image() {
+        None
+    } else {
+        Some(video_fixture::VideoTransportFixture::start(serial).await?)
+    };
     let home = root.path().join("account");
     let submit_workspace = root.path().join("submit");
     let poll_workspace = root.path().join("poll");
@@ -257,10 +269,18 @@ case "$operation" in
       first=${images%%,*}
       last=${images#*,}
     fi
-    case "$first" in */*|..|'') exit 91 ;; esac
+    if [ "$operation" = multimodal2video ]; then
+      [ "$first" = "$PWD/input-0.png" ] || exit 91
+    else
+      case "$first" in */*|..|'') exit 91 ;; esac
+    fi
     /usr/bin/cmp "$first" "$HOME/first.png"
     if [ -n "$last" ]; then
-      case "$last" in */*|..|'') exit 92 ;; esac
+      if [ "$operation" = multimodal2video ]; then
+        [ "$last" = "$PWD/input-1.png" ] || exit 92
+      else
+        case "$last" in */*|..|'') exit 92 ;; esac
+      fi
       /usr/bin/cmp "$last" "$HOME/last.png"
     fi
     printf 'submit\n' >> "$HOME/submit-calls"
@@ -344,11 +364,11 @@ esac
     )
     .map_err(debug_error)?;
     let blobs = Arc::new(FilesystemArtifactBlobStore::new(&artifact_root).map_err(debug_error)?);
-    let runner = Path::new(env!("CARGO_BIN_EXE_remote-submit-runner"));
+    let runner = video_fixture::private_submit_runner(root.path())?;
     let driver = GatedCliSubmitDriver::new(
         codec.clone(),
-        runner,
-        &hex::encode(Sha256::digest(fs::read(runner).map_err(debug_error)?)),
+        &runner,
+        &hex::encode(Sha256::digest(fs::read(&runner).map_err(debug_error)?)),
         WorkingDirectory::new_private(&submit_workspace).map_err(debug_error)?,
     )
     .map_err(debug_error)?
@@ -385,11 +405,8 @@ esac
             ),
         )
         .map_err(debug_error)?,
-        WorkflowStaging {
-            image: case.is_image(),
-            inner: FilesystemProviderArtifactStagerFactory::new(blobs.clone(), 1024 * 1024)
-                .map_err(debug_error)?,
-        },
+        FilesystemProviderArtifactStagerFactory::new(blobs.clone(), 1024 * 1024)
+            .map_err(debug_error)?,
         ProviderPollOrchestratorConfig {
             scope: profile.claim_scope(),
             owner: "dreamina-workflow-poll".into(),
@@ -505,8 +522,14 @@ esac
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
-    .await
-    .map_err(debug_error)?;
+    .await;
+    let job_id = match job_id {
+        Ok(result) => result,
+        Err(error) => {
+            response.abort();
+            return Err(workflow_wait_error(pool, &home, "admission", &error.to_string()).await);
+        }
+    };
     let job_id = match job_id {
         Ok(id) => id,
         Err(error) => {
@@ -558,7 +581,20 @@ esac
         )?;
     }
     let observed = tokio::time::timeout(Duration::from_secs(10), async {
+        // FreshSubmitted is an iteration result, not proof of upstream acceptance.
+        // Rotate the same normal submit owner like the daemon, without a new dispatch.
+        let mut tick = 0;
         loop {
+            let recovery = ProviderSubmitIterationCommand::new(
+                "workflow-submit",
+                format!("poll-claim-{tick}"),
+                format!("poll-defer-{tick}"),
+            )
+            .map_err(debug_error)?;
+            Box::pin(submit.run_once(&recovery))
+                .await
+                .map_err(debug_error)?;
+            tick += 1;
             let run = Box::pin(poll.run_once()).await.map_err(debug_error)?;
             if !matches!(run, ProviderPollRun::Idle) {
                 return Ok::<_, String>(run);
@@ -566,10 +602,16 @@ esac
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     })
-    .await
-    .map_err(debug_error)??;
+    .await;
+    let observed = match observed {
+        Ok(result) => result?,
+        Err(error) => {
+            response.abort();
+            return Err(workflow_wait_error(pool, &home, "poll", &error.to_string()).await);
+        }
+    };
     require(
-        matches!(observed,ProviderPollRun::Observed(ref task) if task.state == if case.is_image() { ProviderTaskState::ArtifactReady } else { ProviderTaskState::RemoteReady }),
+        matches!(observed,ProviderPollRun::Observed(ref task) if task.state == ProviderTaskState::ArtifactReady),
         format!("workflow poll: {observed:?}"),
     )?;
     for _ in 0..case.count() {
@@ -578,29 +620,25 @@ esac
             .await
             .map_err(debug_error)?
             .ok_or("no terminal reduction")?;
-        let customer = if case.is_image() {
-            Some(
-                CustomerArtifactPublisher::new(blobs.clone())
-                    .publish(&terminal)
-                    .await
-                    .map_err(debug_error)?,
-            )
-        } else {
+        if !case.is_image() {
             require(
-                matches!(&terminal.outcome,CanonicalExecutorOutcome::SucceededRemoteVideo(remote)
-                if remote.result.video_url()==VIDEO_URL && remote.result.expires_at_ms().is_none()),
-                "remote URL lost",
+                matches!(&terminal.outcome,CanonicalExecutorOutcome::Succeeded(artifact)
+                if artifact.media_type == "video/mp4" && artifact.sha256_hex == hex::encode(Sha256::digest(VIDEO_BYTES))),
+                "canonical video artifact lost",
             )?;
-            None
-        };
+        }
+        let customer = CustomerArtifactPublisher::new(blobs.clone())
+            .publish(&terminal)
+            .await
+            .map_err(debug_error)?;
         let completion = reductions
-            .complete_terminal(&terminal, customer.as_ref())
+            .complete_terminal(&terminal, Some(&customer))
             .await
             .map_err(debug_error)?;
         require(
             completion
                 == reductions
-                    .complete_terminal(&terminal, customer.as_ref())
+                    .complete_terminal(&terminal, Some(&customer))
                     .await
                     .map_err(debug_error)?,
             "repeat reduction charged twice",
@@ -643,10 +681,21 @@ esac
         .await?;
         require(
             status == StatusCode::OK
-                && native["content"]["video_url"] == VIDEO_URL
+                && native["content"]["video_url"]
+                    .as_str()
+                    .is_some_and(|url| url.starts_with("/v1/dreamina/files/"))
                 && native["content"]["duration"] == case.duration(),
             format!("native exact result: {status} {native}"),
         )?;
+        let native_content = native["content"]["video_url"]
+            .as_str()
+            .ok_or("missing native content")?;
+        let artifact = native_content
+            .split('/')
+            .nth_back(1)
+            .ok_or("missing artifact ID")?;
+        let ark_content = format!("/api/v3/files/{artifact}/content");
+        assert_video_download(app.clone(), native_content, &owner.api_key.value).await?;
         let (status, ark) = json_request(
             app.clone(),
             Method::GET,
@@ -668,13 +717,14 @@ esac
         };
         require(
             status == StatusCode::OK
-                && ark["content"]["video_url"] == VIDEO_URL
+                && ark["content"]["video_url"] == ark_content
                 && ark["duration"] == case.duration()
                 && ark["resolution"] == resolution
                 && ark["ratio"] == ratio,
             format!("Ark frozen result metadata: {status} {ark}"),
         )?;
-        assert_remote_storage(pool, job_id, &artifact_root).await?;
+        assert_video_download(app.clone(), &ark_content, &owner.api_key.value).await?;
+        assert_canonical_storage(pool, job_id, &artifact_root).await?;
     }
     let replay = json_request(
         app.clone(),
@@ -762,7 +812,29 @@ esac
             "adaptive ratio became a fixed ratio",
         )?;
     }
-    assert_workflow_billing(pool, job_id, &project.id, case).await
+    assert_workflow_billing(pool, job_id, &project.id, case).await?;
+    if let Some(transport) = transport {
+        transport.finish().await?;
+    }
+    Ok(())
+}
+
+async fn workflow_wait_error(pool: &PgPool, home: &Path, phase: &str, error: &str) -> String {
+    let snapshot = tokio::time::timeout(Duration::from_secs(1), sqlx::query_scalar::<_, Value>(
+        "SELECT json_build_object(
+            'jobs',(SELECT json_agg(state) FROM jobs),
+            'submissions',(SELECT json_agg(state) FROM provider_submissions),
+            'intents',(SELECT json_agg(json_build_object('state',state,'failure_error_code',failure_error_code)) FROM provider_remote_submit_intents),
+            'recoveries',(SELECT json_agg(json_build_object('state',state,'next_recovery_at_ms',next_recovery_at_ms)) FROM provider_submit_recoveries),
+            'tasks',(SELECT json_agg(json_build_object('state',state,'next_poll_at_ms',next_poll_at_ms,'poll_owner',poll_owner)) FROM provider_remote_tasks),
+            'db_now_ms',floor(extract(epoch FROM clock_timestamp())*1000)::BIGINT)")
+        .fetch_one(pool)).await;
+    let calls = |name: &str| fs::read_to_string(home.join(name)).map(|value| value.lines().count());
+    format!(
+        "workflow {phase} wait elapsed: {error}; submit_calls={:?}; poll_calls={:?}; snapshot={snapshot:?}",
+        calls("submit-calls"),
+        calls("poll-calls")
+    )
 }
 
 async fn assert_frozen_inputs(
