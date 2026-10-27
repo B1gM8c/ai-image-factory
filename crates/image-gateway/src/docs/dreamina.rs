@@ -284,6 +284,7 @@ pub(super) fn patch_schemas(document: &mut Value) {
     task["cancellation"] = json!({"$ref": "#/components/schemas/DreaminaCancellation"});
     patch_manual_cancellation(schemas);
     patch_image_tasks(document);
+    patch_video_lookup(document);
 }
 
 fn patch_manual_cancellation(schemas: &mut Value) {
@@ -318,6 +319,44 @@ fn patch_manual_cancellation(schemas: &mut Value) {
     });
     schemas["ArkContentGenerationTaskDoc"]["properties"]["metadata"] =
         json!({"$ref":"#/components/schemas/ArkContentGenerationTaskMetadata"});
+}
+
+fn patch_video_lookup(document: &mut Value) {
+    let schema = &mut document["components"]["schemas"];
+    schema["DreaminaVideoRequestMetadata"] = json!({
+        "type":"object", "additionalProperties":false,
+        "required":["workflow","model_version","video_resolution","duration_ms","output_count","image_count","video_count","audio_count"],
+        "properties":{
+            "workflow":{"type":"string"},"model_version":{"type":"string"},
+            "video_resolution":{"type":"string"},"ratio":{"type":"string"},
+            "duration_ms":{"type":"integer","minimum":1},"output_count":{"type":"integer","enum":[1]},
+            "image_count":{"type":"integer","minimum":0},"video_count":{"type":"integer","minimum":0},"audio_count":{"type":"integer","minimum":0},
+            "transition_durations_ms":{"type":"array","items":{"type":"integer","minimum":1}}
+        },
+        "description":"Admission-frozen non-secret specifications and material counts, not measured output. Never includes prompts, material locations, keys or private command hashes."
+    });
+    let mut task = schema["DreaminaVideoTaskDoc"].clone();
+    task["properties"]["request_id"] = json!({"type":"string"});
+    task["properties"]["request"] =
+        json!({"$ref":"#/components/schemas/DreaminaVideoRequestMetadata"});
+    task["required"]
+        .as_array_mut()
+        .expect("video task schema required fields")
+        .extend([json!("request_id"), json!("request")]);
+    schema["DreaminaVideoLookupTask"] = task;
+    document["paths"]["/v1/dreamina/videos/by-idempotency-key"]["get"] = json!({
+        "tags":["Dreamina CLI"],"operationId":"get_dreamina_video_by_idempotency_key",
+        "security":[{"BearerAuth":[]}],"summary":"Find the original video task by its idempotency key",
+        "description":"Read-only lookup requiring videos:read and original tenant/project/actor scope. Send the unchanged original key only in Idempotency-Key; query parameters are not accepted. No submit, provider query, billing mutation or refreshed progress observation occurs. 404 does not prove absence of an upstream effect and never authorizes resubmission or refund.",
+        "parameters":[{"name":"Idempotency-Key","in":"header","required":true,"schema":{"type":"string"}}],
+        "responses":{
+            "200":{"description":"Original task and frozen safe request","content":{"application/json":{"schema":{"$ref":"#/components/schemas/DreaminaVideoLookupTask"}}}},
+            "400":{"description":"Missing/invalid original key or unsupported query parameters"},
+            "401":{"description":"Invalid authentication"},"403":{"description":"Missing videos:read capability"},
+            "404":{"description":"No matching original task in this exact scope/profile/operation"},
+            "409":{"description":"idempotency_in_progress while receiving; idempotency_conflict for inconsistent identity"}
+        }
+    });
 }
 
 fn patch_image_tasks(document: &mut Value) {
@@ -409,6 +448,24 @@ fn workflow(mut schema: Value, name: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_video_key_lookup_documents_safe_specs_and_never_submission() {
+        let axum::Json(document) = crate::docs::openapi_json();
+        let path = &document["paths"]["/v1/dreamina/videos/by-idempotency-key"];
+        assert!(path.get("post").is_none());
+        assert_eq!(path["get"]["parameters"][0]["name"], "Idempotency-Key");
+        assert_eq!(path["get"]["parameters"][0]["in"], "header");
+        for status in ["200", "400", "401", "403", "404", "409"] {
+            assert!(path["get"]["responses"].get(status).is_some());
+        }
+        let specs = &document["components"]["schemas"]["DreaminaVideoRequestMetadata"];
+        assert_eq!(specs["additionalProperties"], false);
+        assert!(specs["properties"].get("prompt").is_none());
+        assert!(specs["properties"].get("images").is_none());
+        assert!(specs["properties"].get("duration_ms").is_some());
+        assert!(specs["properties"].get("image_count").is_some());
+    }
 
     #[test]
     fn native_image_tasks_document_async_and_read_only_original_key_lookup() {

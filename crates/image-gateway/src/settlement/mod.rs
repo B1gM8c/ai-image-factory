@@ -106,6 +106,16 @@ pub trait ExecutionSettlementStore: Send + Sync + 'static {
         Ok(None)
     }
 
+    async fn project_video_job_by_idempotency_key(
+        &self,
+        _tenant_id: &str,
+        _project_id: &str,
+        _actor_user_id: Option<uuid::Uuid>,
+        _key_digest: &str,
+    ) -> Result<Option<VideoIdempotencyProjection>, ImageGatewayError> {
+        Ok(None)
+    }
+
     async fn video_status(
         &self,
         _tenant_id: &str,
@@ -225,6 +235,13 @@ pub enum ImageResultStatus {
     },
     Uncertain,
     Expired,
+}
+
+#[derive(Debug)]
+pub struct VideoIdempotencyProjection {
+    pub job_id: uuid::Uuid,
+    pub request_id: String,
+    pub request: image_api_contracts::dreamina::DreaminaVideoRequestMetadata,
 }
 
 #[derive(Debug, Eq, PartialEq)]

@@ -22,6 +22,8 @@ mod dreamina_submission_uncertain;
 mod images_async;
 #[path = "platform_binding.rs"]
 mod platform_binding;
+#[path = "dreamina_video_lookup.rs"]
+mod video_lookup;
 #[path = "dreamina_workflows.rs"]
 mod workflows;
 

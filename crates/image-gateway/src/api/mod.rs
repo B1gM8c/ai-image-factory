@@ -128,7 +128,7 @@ use customer_refunds::{create_customer_refund, get_customer_charge, list_custome
 use dreamina::{
     create_image as create_dreamina_image, create_video as create_dreamina_video,
     get_image as get_dreamina_image, get_image_by_idempotency_key, get_image_results,
-    get_video as get_dreamina_video,
+    get_video as get_dreamina_video, get_video_by_idempotency_key,
 };
 use files::{
     create_console_file, create_file, delete_console_file, delete_file, get_console_file,
@@ -1015,6 +1015,10 @@ fn build_router_with_execution_mode(
         .route(
             "/v1/dreamina/videos/generations",
             post(create_dreamina_video),
+        )
+        .route(
+            "/v1/dreamina/videos/by-idempotency-key",
+            get(get_video_by_idempotency_key),
         )
         .route("/v1/dreamina/videos/{task_id}", get(get_dreamina_video))
         .route(

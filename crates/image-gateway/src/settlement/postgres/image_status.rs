@@ -234,6 +234,7 @@ pub(super) async fn lookup(
     tenant_id: &str,
     project_id: &str,
     actor_user_id: Option<Uuid>,
+    api_profile: &str,
     operation: &str,
     key_digest: &str,
 ) -> Result<Option<Uuid>, ImageGatewayError> {
@@ -260,7 +261,7 @@ pub(super) async fn lookup(
     )
     .bind(tenant_id)
     .bind(project_id)
-    .bind(DREAMINA_IMAGES_API_PROFILE)
+    .bind(api_profile)
     .bind(operation)
     .bind(key_digest)
     .bind(actor_user_id)
@@ -276,4 +277,116 @@ pub(super) async fn lookup(
         }
         Some(_) => Err(ImageGatewayError::idempotency_conflict()),
     }
+}
+
+pub(super) async fn video_lookup_projection(
+    store: &PostgresExecutionSettlementStore,
+    tenant_id: &str,
+    project_id: &str,
+    actor_user_id: Option<Uuid>,
+    job_id: Uuid,
+) -> Result<Option<crate::settlement::VideoIdempotencyProjection>, ImageGatewayError> {
+    use image_api_contracts::dreamina::{
+        DREAMINA_VIDEOS_API_PROFILE, DreaminaVideoRequestMetadata,
+    };
+    let row: Option<(String, serde_json::Value, i32)> = sqlx::query_as(
+        r#"SELECT job.request_id, payload.command_json, job.output_count
+        FROM jobs job
+        JOIN job_auth_attributions attribution ON attribution.job_id = job.job_id
+        JOIN job_payloads payload ON payload.job_id = job.job_id AND payload.command_schema = $5
+        JOIN admission_sessions session ON session.session_id = payload.admission_session_id
+          AND session.job_id = job.job_id AND session.tenant_id = job.tenant_id
+          AND session.project_id = attribution.project_id AND session.api_profile = $6
+          AND session.operation = job.operation
+        WHERE job.job_id = $1 AND job.tenant_id = $2 AND attribution.project_id = $3
+          AND ($4::UUID IS NULL OR attribution.actor_user_id = $4)
+          AND job.provider_id = 'dreamina-cli' AND job.operation = 'video_generation'"#,
+    )
+    .bind(job_id)
+    .bind(tenant_id)
+    .bind(project_id)
+    .bind(actor_user_id)
+    .bind(DREAMINA_SUBMIT_COMMAND_SCHEMA)
+    .bind(DREAMINA_VIDEOS_API_PROFILE)
+    .fetch_optional(&store.pool)
+    .await
+    .map_err(settlement_unavailable)?;
+    let Some((request_id, command, output_count)) = row else {
+        return Ok(None);
+    };
+    let bytes =
+        serde_json::to_vec(&command).map_err(|_| ImageGatewayError::artifact_integrity())?;
+    image_provider_dreamina_cli::parse_submit_command(&bytes)
+        .map_err(|_| ImageGatewayError::artifact_integrity())?;
+    let metadata = super::video_request_metadata(Some(&command))?;
+    let workflow = command["operation"]
+        .as_str()
+        .ok_or_else(ImageGatewayError::artifact_integrity)?;
+    let count = |name: &str| -> Result<u32, ImageGatewayError> {
+        let values = command[name]
+            .as_array()
+            .ok_or_else(ImageGatewayError::artifact_integrity)?;
+        u32::try_from(values.len()).map_err(|_| ImageGatewayError::artifact_integrity())
+    };
+    let image_count = match workflow {
+        "text2video" => 0,
+        "image2video" => 1,
+        "frames2video" => 2,
+        "multiframe2video" | "multimodal2video" => count("images")?,
+        _ => return Err(ImageGatewayError::artifact_integrity()),
+    };
+    let transition_durations_ms: Vec<u32> = if workflow == "multiframe2video" {
+        command["transitions"]
+            .as_array()
+            .ok_or_else(ImageGatewayError::artifact_integrity)?
+            .iter()
+            .map(|value| {
+                value["duration_ms"]
+                    .as_u64()
+                    .and_then(|v| u32::try_from(v).ok())
+                    .ok_or_else(ImageGatewayError::artifact_integrity)
+            })
+            .collect::<Result<_, _>>()?
+    } else {
+        Vec::new()
+    };
+    let duration_ms = if workflow == "multiframe2video" {
+        transition_durations_ms.iter().map(|v| u64::from(*v)).sum()
+    } else {
+        command["duration"]
+            .as_u64()
+            .and_then(|v| v.checked_mul(1000))
+            .ok_or_else(ImageGatewayError::artifact_integrity)?
+    };
+    if output_count != 1 || request_id.is_empty() || duration_ms == 0 {
+        return Err(ImageGatewayError::artifact_integrity());
+    }
+    Ok(Some(crate::settlement::VideoIdempotencyProjection {
+        job_id,
+        request_id,
+        request: DreaminaVideoRequestMetadata {
+            workflow: workflow.to_owned(),
+            model_version: metadata
+                .provider_model
+                .ok_or_else(ImageGatewayError::artifact_integrity)?,
+            video_resolution: metadata
+                .resolution
+                .ok_or_else(ImageGatewayError::artifact_integrity)?,
+            ratio: metadata.ratio,
+            duration_ms,
+            output_count: 1,
+            image_count,
+            video_count: if workflow == "multimodal2video" {
+                count("videos")?
+            } else {
+                0
+            },
+            audio_count: if workflow == "multimodal2video" {
+                count("audios")?
+            } else {
+                0
+            },
+            transition_durations_ms,
+        },
+    }))
 }

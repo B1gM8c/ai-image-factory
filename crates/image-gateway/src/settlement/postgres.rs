@@ -221,10 +221,35 @@ impl ExecutionSettlementStore for PostgresExecutionSettlementStore {
             tenant_id,
             project_id,
             actor_user_id,
+            image_api_contracts::dreamina::DREAMINA_IMAGES_API_PROFILE,
             operation,
             key_digest,
         )
         .await
+    }
+
+    async fn project_video_job_by_idempotency_key(
+        &self,
+        tenant_id: &str,
+        project_id: &str,
+        actor_user_id: Option<Uuid>,
+        key_digest: &str,
+    ) -> Result<Option<super::VideoIdempotencyProjection>, ImageGatewayError> {
+        let Some(job_id) = image_status::lookup(
+            self,
+            tenant_id,
+            project_id,
+            actor_user_id,
+            image_api_contracts::dreamina::DREAMINA_VIDEOS_API_PROFILE,
+            crate::admission::VIDEO_GENERATION_OPERATION,
+            key_digest,
+        )
+        .await?
+        else {
+            return Ok(None);
+        };
+        image_status::video_lookup_projection(self, tenant_id, project_id, actor_user_id, job_id)
+            .await
     }
 
     async fn video_status(

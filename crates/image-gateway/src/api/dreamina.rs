@@ -1320,6 +1320,66 @@ fn image_task(
     Ok((task, usage))
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct VideoLookupQuery {}
+
+#[derive(Serialize)]
+pub(super) struct VideoLookupResponse {
+    #[serde(flatten)]
+    task: DreaminaVideoTask,
+    request_id: String,
+    request: image_api_contracts::dreamina::DreaminaVideoRequestMetadata,
+}
+
+pub(super) async fn get_video_by_idempotency_key(
+    query: Result<Query<VideoLookupQuery>, axum::extract::rejection::QueryRejection>,
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<VideoLookupResponse>, ImageGatewayError> {
+    let auth = authenticate_image_request(&headers, &state).await?;
+    auth.require_api_key_capability(ApiKeyCapability::VideosRead)?;
+    query.map_err(|_| {
+        ImageGatewayError::invalid_request(
+            "Video identity lookup does not accept query parameters",
+            Some("operation".to_owned()),
+            "invalid_value",
+        )
+    })?;
+    let digest = idempotency_digest(
+        &headers,
+        &auth.project_id,
+        DREAMINA_VIDEOS_API_PROFILE,
+        VIDEO_GENERATION_OPERATION,
+    )?
+    .ok_or_else(ImageGatewayError::invalid_idempotency_key)?;
+    let projection = state
+        .settlement_store
+        .project_video_job_by_idempotency_key(
+            &auth.tenant_id,
+            &auth.project_id,
+            auth.actor_user_id,
+            &digest,
+        )
+        .await?
+        .ok_or_else(video_lookup_not_found)?;
+    let task =
+        project_video_task(state.settlement_store.as_ref(), &auth, projection.job_id).await?;
+    Ok(Json(VideoLookupResponse {
+        task,
+        request_id: projection.request_id,
+        request: projection.request,
+    }))
+}
+
+fn video_lookup_not_found() -> ImageGatewayError {
+    ImageGatewayError::not_found(
+        "Dreamina task was not found",
+        Some("Idempotency-Key".to_owned()),
+        "not_found",
+    )
+}
+
 pub(super) async fn get_video(
     Path(task_id): Path<String>,
     headers: HeaderMap,
