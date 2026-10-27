@@ -219,6 +219,8 @@ printf '%s' '{receipt}'"#
             .unwrap_err();
         let expected_code = if unsafe_output.starts_with("/bin/ln -s") {
             "dreamina_poll_workspace_unavailable"
+        } else if unsafe_output.starts_with(": >") {
+            "dreamina_poll_download_incomplete"
         } else {
             "dreamina_poll_artifact_invalid"
         };
@@ -287,8 +289,8 @@ impl ArtifactSink for ReplacingSiblingSink {
 }
 
 #[tokio::test]
-async fn string_video_result_preserves_the_original_url_without_a_download() {
-    let url = "https://media.example.test/clip%2Fone.mp4?token=a%2Bb&expires=123";
+async fn string_video_result_requires_safe_materialization_before_completion() {
+    let url = "https://127.0.0.1/clip%2Fone.mp4?token=a%2Bb&expires=123";
     let result = json!({"images":[],"videos":[{"video_url":url}]});
     let receipt =
         json!({"submit_id":"task-1","gen_status":"success","result_json":result.to_string()});
@@ -296,15 +298,13 @@ async fn string_video_result_preserves_the_original_url_without_a_download() {
         "test -z \"$download\" || exit 21\nprintf '%s' '{receipt}'"
     ));
     let mut sink = fixture.sink([0; 32]);
-    let observation = fixture
+    let failure = fixture
         .driver(1024)
         .poll_operation(&fixture.operation(), true, &mut sink)
         .await
-        .unwrap();
-    let PollObservation::CompletedRemoteVideo(completed) = observation else {
-        panic!("expected remote video")
-    };
-    assert_eq!(completed.result().video_url(), url);
+        .unwrap_err();
+    assert_eq!(failure.code(), "dreamina_poll_video_download_invalid");
+    assert_eq!(failure.retry(), RetryDirective::Never);
     assert!(sink.bytes().is_empty());
     assert_eq!(sink.finalize_count(), 0);
     fixture.assert_queries_used_original_submit_id(1);

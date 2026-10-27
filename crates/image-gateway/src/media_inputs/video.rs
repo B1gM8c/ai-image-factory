@@ -1,15 +1,29 @@
-use std::io::Cursor;
+use std::io::{Cursor, Read, Seek, SeekFrom};
 
-use super::{MediaInputError as Error, MediaInputMetadata, duration_ms};
+use super::{MediaInputError as Error, MediaInputMetadata, duration_ms_with_limit as duration_ms};
 
 const MAX_BOXES: usize = 1_024;
 const MAX_METADATA_BYTES: u64 = 8 * 1024 * 1024;
-const MAX_SAMPLES: u32 = 18_000; // Thirty seconds at up to 600 encoded frames per second.
+const MAX_SAMPLES: u32 = 18_000; // Bound sample-table work for inputs and generated outputs.
 
 pub(super) fn probe(bytes: &[u8]) -> Result<MediaInputMetadata, Error> {
-    let media_ranges = media_ranges(bytes)?;
-    let reader = mp4::Mp4Reader::read_header(Cursor::new(bytes), bytes.len() as u64)
+    probe_reader(
+        Cursor::new(bytes),
+        bytes.len() as u64,
+        super::MAX_TIMED_INPUT_DURATION_MS,
+    )
+}
+
+pub(super) fn probe_reader<R: Read + Seek>(
+    mut reader: R,
+    byte_size: u64,
+    duration_limit_ms: u64,
+) -> Result<MediaInputMetadata, Error> {
+    let media_ranges = media_ranges(&mut reader, byte_size)?;
+    reader
+        .seek(SeekFrom::Start(0))
         .map_err(|_| Error::Invalid)?;
+    let reader = mp4::Mp4Reader::read_header(reader, byte_size).map_err(|_| Error::Invalid)?;
     if reader.is_fragmented() {
         return Err(Error::Unsupported);
     }
@@ -53,7 +67,7 @@ pub(super) fn probe(bytes: &[u8]) -> Result<MediaInputMetadata, Error> {
         return Err(Error::Invalid);
     }
     let movie_scale = reader.moov.mvhd.timescale;
-    let movie_duration = duration_ms(reader.moov.mvhd.duration, movie_scale)?;
+    let movie_duration = duration_ms(reader.moov.mvhd.duration, movie_scale, duration_limit_ms)?;
     let mut duration = movie_duration;
     for related in reader.tracks().values() {
         // Unknown handlers/codecs cannot silently hide a longer presentation.
@@ -63,7 +77,8 @@ pub(super) fn probe(bytes: &[u8]) -> Result<MediaInputMetadata, Error> {
             | (Ok(mp4::TrackType::Subtitle), Ok(mp4::MediaType::TTXT)) => {}
             _ => return Err(Error::Unsupported),
         }
-        let track_duration = track_duration_ms(related, movie_scale, &media_ranges)?;
+        let track_duration =
+            track_duration_ms(related, movie_scale, &media_ranges, duration_limit_ms)?;
         // Different timescales may round by one millisecond. A shorter forged movie
         // header must never conceal a longer audio, subtitle or video presentation.
         if movie_duration.saturating_add(1) < track_duration {
@@ -82,6 +97,7 @@ fn track_duration_ms(
     track: &mp4::Mp4Track,
     movie_scale: u32,
     media_ranges: &[(u64, u64)],
+    duration_limit_ms: u64,
 ) -> Result<u64, Error> {
     let stbl = &track.trak.mdia.minf.stbl;
     let count = stbl.stsz.sample_count;
@@ -207,7 +223,7 @@ fn track_duration_ms(
     if extents.windows(2).any(|pair| pair[0].1 > pair[1].0) {
         return Err(Error::Invalid);
     }
-    presentation_duration_ms(track, movie_scale)
+    presentation_duration_ms(track, movie_scale, duration_limit_ms)
 }
 
 fn aac_priming_explains_media_duration(
@@ -248,7 +264,11 @@ fn aac_priming_explains_media_duration(
     (scaled / scale..=scaled.div_ceil(scale)).contains(&u128::from(edit.segment_duration))
 }
 
-fn presentation_duration_ms(track: &mp4::Mp4Track, movie_scale: u32) -> Result<u64, Error> {
+fn presentation_duration_ms(
+    track: &mp4::Mp4Track,
+    movie_scale: u32,
+    duration_limit_ms: u64,
+) -> Result<u64, Error> {
     let stbl = &track.trak.mdia.minf.stbl;
     let media_scale = track.trak.mdia.mdhd.timescale;
     if media_scale == 0 {
@@ -290,7 +310,7 @@ fn presentation_duration_ms(track: &mp4::Mp4Track, movie_scale: u32) -> Result<u
         if edit.media_rate != 1 || edit.media_rate_fraction != 0 {
             return Err(Error::Unsupported);
         }
-        let duration = duration_ms(edit.segment_duration, movie_scale)?;
+        let duration = duration_ms(edit.segment_duration, movie_scale, duration_limit_ms)?;
         let start = i128::from(edit.media_time);
         let span = (u128::from(edit.segment_duration) * u128::from(media_scale))
             .div_ceil(u128::from(movie_scale));
@@ -303,35 +323,38 @@ fn presentation_duration_ms(track: &mp4::Mp4Track, movie_scale: u32) -> Result<u
         duration_ms(
             u64::try_from(last_end).map_err(|_| Error::Invalid)?,
             media_scale,
+            duration_limit_ms,
         )?
     };
-    let declared = duration_ms(track.trak.tkhd.duration, movie_scale)?;
+    let declared = duration_ms(track.trak.tkhd.duration, movie_scale, duration_limit_ms)?;
     if declared.saturating_add(1) < playable {
         return Err(Error::Invalid);
     }
     Ok(declared.max(playable))
 }
 
-fn media_ranges(bytes: &[u8]) -> Result<Vec<(u64, u64)>, Error> {
-    let mut cursor = Cursor::new(bytes);
+fn media_ranges<R: Read + Seek>(cursor: &mut R, byte_size: u64) -> Result<Vec<(u64, u64)>, Error> {
+    cursor
+        .seek(SeekFrom::Start(0))
+        .map_err(|_| Error::Invalid)?;
     let mut ranges = Vec::new();
     let mut boxes = 0;
     let mut metadata_bytes = 0_u64;
     let mut ftyp = 0;
     let mut moov = 0;
-    while cursor.position() < bytes.len() as u64 {
+    while cursor.stream_position().map_err(|_| Error::Invalid)? < byte_size {
         boxes += 1;
         if boxes > MAX_BOXES {
             return Err(Error::LimitExceeded);
         }
-        let start = cursor.position();
-        let header = mp4::BoxHeader::read(&mut cursor).map_err(|_| Error::Invalid)?;
+        let start = cursor.stream_position().map_err(|_| Error::Invalid)?;
+        let header = mp4::BoxHeader::read(&mut *cursor).map_err(|_| Error::Invalid)?;
         // mp4 0.14 normalizes large-size headers to an eight-byte header in BoxHeader::size.
         // Open-ended boxes are deliberately unsupported for immutable uploaded inputs.
-        let payload = cursor.position();
+        let payload = cursor.stream_position().map_err(|_| Error::Invalid)?;
         let end = payload
             .checked_add(header.size.checked_sub(8).ok_or(Error::Invalid)?)
-            .filter(|end| *end <= bytes.len() as u64)
+            .filter(|end| *end <= byte_size)
             .ok_or(Error::Invalid)?;
         if header.name == mp4::BoxType::MdatBox {
             ranges.push((payload, end));
@@ -349,7 +372,9 @@ fn media_ranges(bytes: &[u8]) -> Result<Vec<(u64, u64)>, Error> {
                 moov += 1;
             }
         }
-        cursor.set_position(end);
+        cursor
+            .seek(SeekFrom::Start(end))
+            .map_err(|_| Error::Invalid)?;
     }
     if ftyp != 1 || moov != 1 || ranges.is_empty() {
         return Err(Error::Invalid);

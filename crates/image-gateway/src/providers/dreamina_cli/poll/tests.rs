@@ -157,33 +157,73 @@ printf '{"submit_id":"%s","gen_status":"success"}' "$submit""#,
 }
 
 #[tokio::test]
-async fn video_success_returns_the_upstream_url_without_downloading_or_writing_a_blob() {
+async fn video_success_does_not_publish_a_url_before_safe_materialization() {
     let fixture = Fixture::new(
         r#"test -z "$download" || exit 21
 test "$PWD" = "$TMPDIR" || exit 22
-printf '%s' '{"submit_id":"task-1","gen_status":"success","result_json":{"images":[],"videos":[{"video_url":"https://media.example.test/clip%2Fone.mp4?token=a%2Bb&expires=123"}]}}'"#,
+printf '%s' '{"submit_id":"task-1","gen_status":"success","result_json":{"images":[],"videos":[{"video_url":"https://127.0.0.1/clip.mp4"}]}}'"#,
     );
     let operation = fixture.operation();
     let mut sink = fixture.sink([0_u8; 32]);
-
-    let observation = fixture
+    let failure = fixture
         .driver(1024 * 1024)
         .poll_operation(&operation, true, &mut sink)
         .await
-        .unwrap();
-
-    let PollObservation::CompletedRemoteVideo(completed) = observation else {
-        panic!("expected remote video observation");
-    };
-    assert_eq!(
-        completed.result().video_url(),
-        "https://media.example.test/clip%2Fone.mp4?token=a%2Bb&expires=123"
-    );
-    assert_eq!(completed.result().expires_at_ms(), None);
+        .unwrap_err();
+    assert_eq!(failure.code(), "dreamina_poll_video_download_invalid");
+    assert_eq!(failure.retry(), RetryDirective::Never);
     assert!(sink.bytes().is_empty());
-    assert!(sink.chunk_sizes().is_empty());
     assert_eq!(sink.finalize_count(), 0);
     fixture.assert_workspace_has_no_attempts();
+}
+
+#[tokio::test]
+async fn missing_or_empty_download_requeries_the_same_accepted_id_then_succeeds() {
+    for empty in [false, true] {
+        let incomplete = if empty {
+            ": > \"$download/result.png\""
+        } else {
+            ":"
+        };
+        let fixture = Fixture::new(&format!(
+            r#"printf '%s\n' "$submit" >> "$HOME/queries"
+if test -f "$HOME/queried"; then
+/bin/cp "$HOME/source.png" "$download/result.png"
+else
+: > "$HOME/queried"
+{incomplete}
+fi
+printf '{{"submit_id":"%s","gen_status":"success"}}' "$submit""#,
+        ));
+        let bytes = png_bytes([10, 20, 30, 255]);
+        fs::write(fixture.account_home.join("source.png"), &bytes).unwrap();
+        let digest = Sha256::digest(&bytes).into();
+        let driver = fixture.driver(1024 * 1024);
+        let operation = fixture.operation();
+        let mut first = fixture.sink(digest);
+        let failure = driver
+            .poll_operation(&operation, false, &mut first)
+            .await
+            .unwrap_err();
+        assert_eq!(failure.code(), "dreamina_poll_download_incomplete");
+        assert_eq!(failure.class(), ProviderFailureClass::Transient);
+        assert_eq!(failure.retry(), RetryDirective::Backoff);
+        assert!(first.bytes().is_empty());
+        let mut second = fixture.sink(digest);
+        assert!(matches!(
+            driver
+                .poll_operation(&operation, false, &mut second)
+                .await
+                .unwrap(),
+            PollObservation::Completed(_)
+        ));
+        assert_eq!(second.bytes(), bytes);
+        assert_eq!(
+            fs::read_to_string(fixture.account_home.join("queries")).unwrap(),
+            "task-1\ntask-1\n"
+        );
+        fixture.assert_workspace_has_no_attempts();
+    }
 }
 
 #[tokio::test]
@@ -641,10 +681,11 @@ printf '{{"submit_id":"%s","gen_status":"success"}}' "$submit""#
             .poll_native_batch_operation(&fixture.operation(), 2, &mut sink)
             .await;
         match expected_outputs {
-            Some(0) => assert!(matches!(
-                result.unwrap(),
-                ProviderNativeBatchPollObservation::Failed(_)
-            )),
+            Some(0) => {
+                let failure = result.unwrap_err();
+                assert_eq!(failure.code(), "dreamina_poll_download_incomplete");
+                assert_eq!(failure.retry(), RetryDirective::Backoff);
+            }
             Some(count) => assert!(
                 matches!(result.unwrap(), ProviderNativeBatchPollObservation::Completed { output_count } if output_count == count)
             ),

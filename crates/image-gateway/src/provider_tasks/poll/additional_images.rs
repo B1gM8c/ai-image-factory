@@ -22,6 +22,7 @@ pub(super) struct ControlledAdditionalImageSink<'a, F: ProviderArtifactStagerFac
     staged: Vec<StagedProviderArtifact>,
     touched: bool,
     total_byte_size: u64,
+    failure: Option<ArtifactSinkErrorKind>,
 }
 
 impl<'a, F: ProviderArtifactStagerFactory> ControlledAdditionalImageSink<'a, F> {
@@ -34,6 +35,7 @@ impl<'a, F: ProviderArtifactStagerFactory> ControlledAdditionalImageSink<'a, F> 
             staged: Vec::new(),
             touched: false,
             total_byte_size: 0,
+            failure: None,
         }
     }
 
@@ -41,11 +43,38 @@ impl<'a, F: ProviderArtifactStagerFactory> ControlledAdditionalImageSink<'a, F> 
         !self.touched
     }
 
+    fn note_failure(&mut self, kind: ArtifactSinkErrorKind) {
+        if self
+            .failure
+            .is_none_or(|previous| previous == ArtifactSinkErrorKind::Storage)
+        {
+            self.failure = Some(kind);
+        }
+    }
+
+    pub(super) fn discard_unpublished_for_retry(self) -> Result<(), ArtifactSinkError> {
+        if self
+            .failure
+            .is_some_and(|kind| kind != ArtifactSinkErrorKind::Storage)
+        {
+            return Err(contract_error());
+        }
+        if let Some(current) = self.current {
+            current
+                .discard_unpublished_for_retry()
+                .map_err(|_| contract_error())?;
+        }
+        // The orchestrator publishes this complete set only after Completed.
+        // Finalized siblings here have no authority or billing publication yet.
+        Ok(())
+    }
+
     pub(super) fn finish(
         self,
         primary: &DurableArtifactManifest,
     ) -> Result<Vec<StagedProviderArtifact>, ArtifactSinkError> {
-        if self.current.is_some()
+        if self.failure.is_some()
+            || self.current.is_some()
             || self.staged.is_empty()
             || self.staged.len() > 10
             || self.staged[0].manifest() != primary
@@ -61,6 +90,7 @@ impl<F: ProviderArtifactStagerFactory> ProviderAdditionalImageArtifactSink
 {
     fn select_image(&mut self, source_index: usize) -> Result<(), ArtifactSinkError> {
         if self.current.is_some() || source_index != self.staged.len() || source_index >= 10 {
+            self.note_failure(ArtifactSinkErrorKind::InvalidArtifact);
             return Err(contract_error());
         }
         let context = if source_index == 0 {
@@ -85,16 +115,24 @@ impl<F: ProviderArtifactStagerFactory> ArtifactSink for ControlledAdditionalImag
             .total_byte_size
             .checked_add(chunk.len() as u64)
             .filter(|size| *size <= crate::artifacts::MAX_ARTIFACT_BYTES)
-            .ok_or_else(contract_error)?;
+            .ok_or_else(|| {
+                self.note_failure(ArtifactSinkErrorKind::InvalidArtifact);
+                contract_error()
+            })?;
         // Ordinary single-output drivers need not know about the opt-in channel.
         if self.current.is_none() && self.staged.is_empty() {
             self.select_image(0)?;
         }
-        self.current
+        let result = self
+            .current
             .as_mut()
             .ok_or_else(contract_error)?
             .write_chunk(chunk)
-            .await
+            .await;
+        if let Err(error) = &result {
+            self.note_failure(error.kind());
+        }
+        result
     }
 
     async fn finalize(
@@ -105,10 +143,20 @@ impl<F: ProviderArtifactStagerFactory> ArtifactSink for ControlledAdditionalImag
             metadata.media_type,
             "image/png" | "image/jpeg" | "image/webp"
         ) {
+            self.note_failure(ArtifactSinkErrorKind::InvalidArtifact);
             return Err(contract_error());
         }
-        let mut current = self.current.take().ok_or_else(contract_error)?;
-        let manifest = current.finalize(metadata).await?;
+        let mut current = self.current.take().ok_or_else(|| {
+            self.note_failure(ArtifactSinkErrorKind::InvalidArtifact);
+            contract_error()
+        })?;
+        let manifest = match current.finalize(metadata).await {
+            Ok(manifest) => manifest,
+            Err(error) => {
+                self.note_failure(error.kind());
+                return Err(error);
+            }
+        };
         let staged = current
             .into_finalized(&manifest)
             .map_err(|_| contract_error())?;

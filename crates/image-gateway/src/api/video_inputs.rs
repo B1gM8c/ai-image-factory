@@ -9,7 +9,9 @@ use futures_util::StreamExt;
 use image_api_contracts::xai::{
     XaiVideoGenerationCommandV1, XaiVideoGenerationCommandV2, XaiVideoWorkflow,
 };
+use image_provider_sdk::{ArtifactSink, ArtifactSinkError};
 use reqwest::{Client, Url, redirect::Policy};
+use sha2::{Digest, Sha256};
 
 use crate::{ImageGatewayError, generator::InputImage};
 
@@ -18,6 +20,117 @@ use super::{super::admission::XaiVideoInputRoleV2, edit_input::decode_data_url_i
 pub(super) const MAX_VIDEO_INPUT_BYTES: usize = 32 * 1024 * 1024;
 const HTTPS_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const HTTPS_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+const GENERATED_VIDEO_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
+#[derive(Debug)]
+pub(crate) enum GeneratedVideoDownloadError {
+    Unavailable,
+    Invalid,
+    Sink(ArtifactSinkError),
+}
+
+#[derive(Debug)]
+pub(crate) struct GeneratedVideoDownload {
+    pub(crate) byte_size: u64,
+    pub(crate) sha256: [u8; 32],
+}
+
+/// Query results become deliverable only after bounded bytes reach the existing
+/// private artifact stager. Input fetching keeps its separate, shorter budget.
+pub(crate) async fn stream_generated_video<S: ArtifactSink>(
+    source: &str,
+    max_bytes: u64,
+    sink: &mut S,
+) -> Result<GeneratedVideoDownload, GeneratedVideoDownloadError> {
+    use GeneratedVideoDownloadError::{Invalid, Unavailable};
+    if max_bytes == 0 || max_bytes > crate::artifacts::MAX_ARTIFACT_BYTES {
+        return Err(Invalid);
+    }
+    let url = validate_public_https_url("video", source)
+        .await
+        .map_err(|_| Invalid)?;
+    let host = url.host_str().ok_or(Invalid)?.to_ascii_lowercase();
+    let mut addresses = if let Ok(ip) = host.parse::<IpAddr>() {
+        vec![SocketAddr::new(ip, 443)]
+    } else {
+        tokio::time::timeout(
+            HTTPS_CONNECT_TIMEOUT,
+            tokio::net::lookup_host((host.as_str(), 443)),
+        )
+        .await
+        .map_err(|_| Unavailable)?
+        .map_err(|_| Unavailable)?
+        .collect::<Vec<_>>()
+    };
+    addresses.sort();
+    addresses.dedup();
+    if addresses.is_empty() {
+        return Err(Unavailable);
+    }
+    if addresses.iter().any(|address| !is_public_ip(address.ip())) {
+        return Err(Invalid);
+    }
+    let client = Client::builder()
+        .no_proxy()
+        .redirect(Policy::none())
+        .connect_timeout(HTTPS_CONNECT_TIMEOUT)
+        .timeout(GENERATED_VIDEO_TIMEOUT)
+        .resolve_to_addrs(&host, &addresses)
+        .build()
+        .map_err(|_| Unavailable)?;
+    let response = client.get(url).send().await.map_err(|_| Unavailable)?;
+    stream_generated_video_response(response, max_bytes, sink).await
+}
+
+async fn stream_generated_video_response<S: ArtifactSink>(
+    response: reqwest::Response,
+    max_bytes: u64,
+    sink: &mut S,
+) -> Result<GeneratedVideoDownload, GeneratedVideoDownloadError> {
+    use GeneratedVideoDownloadError::{Invalid, Sink, Unavailable};
+    if response.status().is_redirection() {
+        return Err(Invalid);
+    }
+    if !response.status().is_success() {
+        // An expired CDN URL is refreshed by querying the same accepted task.
+        return Err(Unavailable);
+    }
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .unwrap_or("");
+    if !matches!(content_type, "video/mp4" | "application/octet-stream")
+        || response
+            .content_length()
+            .is_some_and(|length| length > max_bytes)
+    {
+        return Err(Invalid);
+    }
+    let mut total = 0_u64;
+    let mut digest = Sha256::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|_| Unavailable)?;
+        if chunk.is_empty() {
+            continue;
+        }
+        total = total
+            .checked_add(chunk.len() as u64)
+            .filter(|size| *size <= max_bytes)
+            .ok_or(Invalid)?;
+        sink.write_chunk(&chunk).await.map_err(Sink)?;
+        digest.update(&chunk);
+    }
+    if total == 0 {
+        return Err(Unavailable);
+    }
+    Ok(GeneratedVideoDownload {
+        byte_size: total,
+        sha256: digest.finalize().into(),
+    })
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct DecodedVideoInput {
@@ -651,5 +764,145 @@ mod tests {
         let inputs = decode_video_inputs_v1(&command, 33 * 1024 * 1024).unwrap();
         assert_eq!(inputs[0].bytes.len(), 32 * 1024 * 1024 + 9);
         assert!(decode_video_inputs_v1(&command, 32 * 1024 * 1024).is_err());
+    }
+}
+
+#[cfg(test)]
+mod generated_video_tests {
+    use super::*;
+    use image_provider_sdk::DurableArtifactRef;
+    use image_provider_test_support::RecordingArtifactSink;
+
+    fn sink() -> RecordingArtifactSink {
+        RecordingArtifactSink::new(
+            DurableArtifactRef::new("test", "video-download").unwrap(),
+            [0; 32],
+        )
+    }
+
+    fn response(
+        status: u16,
+        media_type: &str,
+        chunks: Vec<Result<Vec<u8>, std::io::Error>>,
+    ) -> reqwest::Response {
+        axum::http::Response::builder()
+            .status(status)
+            .header(reqwest::header::CONTENT_TYPE, media_type)
+            .body(reqwest::Body::wrap_stream(futures_util::stream::iter(
+                chunks,
+            )))
+            .unwrap()
+            .into()
+    }
+
+    #[tokio::test]
+    async fn generated_video_stream_hashes_bounded_chunks_without_finalizing_early() {
+        let bytes = include_bytes!("../media_inputs/fixtures/blue.mp4");
+        let chunks = bytes.chunks(37).map(|chunk| Ok(chunk.to_vec())).collect();
+        let mut sink = sink();
+        let downloaded = stream_generated_video_response(
+            response(200, "video/mp4", chunks),
+            bytes.len() as u64,
+            &mut sink,
+        )
+        .await
+        .unwrap();
+        assert_eq!(sink.bytes(), bytes);
+        assert!(sink.chunk_sizes().iter().all(|size| *size <= 37));
+        assert_eq!(downloaded.byte_size, bytes.len() as u64);
+        assert_eq!(downloaded.sha256, <[u8; 32]>::from(Sha256::digest(bytes)));
+        assert_eq!(
+            sink.finalize_count(),
+            0,
+            "only the verified file stager may finalize"
+        );
+    }
+
+    #[tokio::test]
+    async fn interrupted_or_expired_cdn_download_remains_retryable_not_deliverable() {
+        let mut sink = sink();
+        let error = stream_generated_video_response(
+            response(
+                200,
+                "video/mp4",
+                vec![
+                    Ok(b"partial".to_vec()),
+                    Err(std::io::Error::other("connection reset")),
+                ],
+            ),
+            1024,
+            &mut sink,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, GeneratedVideoDownloadError::Unavailable));
+        assert_eq!(sink.bytes(), b"partial");
+        assert_eq!(sink.finalize_count(), 0);
+        for status in [403, 404, 429, 503] {
+            let mut sink = self::sink();
+            assert!(matches!(
+                stream_generated_video_response(
+                    response(status, "video/mp4", vec![]),
+                    1024,
+                    &mut sink
+                )
+                .await,
+                Err(GeneratedVideoDownloadError::Unavailable)
+            ));
+            assert!(sink.bytes().is_empty());
+        }
+        let mut sink = self::sink();
+        assert!(matches!(
+            stream_generated_video_response(response(200, "video/mp4", vec![]), 1024, &mut sink)
+                .await,
+            Err(GeneratedVideoDownloadError::Unavailable)
+        ));
+    }
+
+    #[tokio::test]
+    async fn generated_video_rejects_redirect_mime_and_streamed_size_overflow() {
+        for (status, mime) in [(302, "video/mp4"), (200, "text/html")] {
+            let mut sink = sink();
+            assert!(matches!(
+                stream_generated_video_response(
+                    response(status, mime, vec![Ok(vec![1])]),
+                    1024,
+                    &mut sink
+                )
+                .await,
+                Err(GeneratedVideoDownloadError::Invalid)
+            ));
+            assert!(sink.bytes().is_empty());
+        }
+        let mut sink = sink();
+        assert!(matches!(
+            stream_generated_video_response(
+                response(200, "video/mp4", vec![Ok(vec![1; 3]), Ok(vec![2; 3])]),
+                5,
+                &mut sink
+            )
+            .await,
+            Err(GeneratedVideoDownloadError::Invalid)
+        ));
+        assert_eq!(sink.bytes(), [1; 3]);
+        assert_eq!(sink.finalize_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn generated_video_public_wrapper_rejects_private_or_credentialed_sources() {
+        for source in [
+            "http://example.com/v.mp4",
+            "https://127.0.0.1/v.mp4",
+            "https://user:password@example.com/v.mp4",
+            "https://example.com:8443/v.mp4",
+            "https://example.com/v.mp4#fragment",
+        ] {
+            let mut sink = sink();
+            assert!(matches!(
+                stream_generated_video(source, 1024, &mut sink).await,
+                Err(GeneratedVideoDownloadError::Invalid)
+            ));
+            assert!(sink.bytes().is_empty());
+        }
     }
 }

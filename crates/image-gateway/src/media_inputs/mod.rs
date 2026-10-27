@@ -1,4 +1,4 @@
-//! Bounded, server-side measurements of immutable input bytes. No external processes or I/O.
+//! Bounded, server-side measurements of immutable media. No external processes.
 //!
 //! Audio is decoded packet by packet and discarded. Video validation checks the MP4 video
 //! track, sample tables and data extents; it does not decode compressed video pixels.
@@ -78,6 +78,19 @@ pub fn probe_input(
     }
 }
 
+/// Validate a bounded generated video already staged on disk. This reads only
+/// container/sample metadata and never materializes the complete media body.
+pub(crate) fn probe_video_file(file: std::fs::File) -> Result<MediaInputMetadata, MediaInputError> {
+    let byte_size = file.metadata().map_err(|_| MediaInputError::Invalid)?.len();
+    if byte_size == 0 {
+        return Err(MediaInputError::Invalid);
+    }
+    if byte_size > MediaInputKind::Video.max_bytes() {
+        return Err(MediaInputError::LimitExceeded);
+    }
+    video::probe_reader(std::io::BufReader::new(file), byte_size, u64::MAX)
+}
+
 fn probe_image(bytes: &[u8]) -> Result<MediaInputMetadata, MediaInputError> {
     let format = image::guess_format(bytes).map_err(|_| MediaInputError::Unsupported)?;
     let media_type = match format {
@@ -107,11 +120,19 @@ fn probe_image(bytes: &[u8]) -> Result<MediaInputMetadata, MediaInputError> {
 }
 
 fn duration_ms(units: u64, timescale: u32) -> Result<u64, MediaInputError> {
+    duration_ms_with_limit(units, timescale, MAX_TIMED_INPUT_DURATION_MS)
+}
+
+fn duration_ms_with_limit(
+    units: u64,
+    timescale: u32,
+    limit_ms: u64,
+) -> Result<u64, MediaInputError> {
     if units == 0 || timescale == 0 {
         return Err(MediaInputError::Invalid);
     }
     let ms = (u128::from(units) * 1_000).div_ceil(u128::from(timescale));
-    if ms > u128::from(MAX_TIMED_INPUT_DURATION_MS) {
+    if ms > u128::from(limit_ms) {
         return Err(MediaInputError::LimitExceeded);
     }
     Ok(ms as u64)

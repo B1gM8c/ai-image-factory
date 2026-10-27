@@ -25,8 +25,8 @@ use image_provider_dreamina_cli::{
 };
 use image_provider_sdk::{
     ArtifactMetadata, ArtifactSink, ArtifactSinkError, ArtifactSinkErrorKind, Completed,
-    CompletedRemoteVideo, EffectCertainty, PollObservation, ProviderFailure, ProviderFailureClass,
-    ProviderTaskProgress, RemoteOperationRef, RetryDirective,
+    EffectCertainty, PollObservation, ProviderFailure, ProviderFailureClass, ProviderTaskProgress,
+    RemoteOperationRef, RetryDirective,
 };
 
 const DEFAULT_POLL_AFTER_MS: u64 = 5_000;
@@ -187,11 +187,27 @@ impl DreaminaCliPollDriverV1 {
                 DreaminaQueryStatusV1::Success => {
                     let result = receipt
                         .remote_video_result()
-                        .cloned()
                         .ok_or_else(|| contract_failure("dreamina_poll_video_url_invalid"))?;
-                    Ok(PollObservation::CompletedRemoteVideo(
-                        CompletedRemoteVideo::new(result, None),
-                    ))
+                    let downloaded = crate::api::video_inputs::stream_generated_video(
+                        result.video_url(),
+                        self.max_artifact_bytes,
+                        sink,
+                    )
+                    .await
+                    .map_err(map_video_download_error)?;
+                    let manifest = sink
+                        .finalize(ArtifactMetadata {
+                            media_type: "video/mp4",
+                        })
+                        .await
+                        .map_err(map_sink_error)?;
+                    if manifest.byte_size() != downloaded.byte_size
+                        || manifest.media_type() != "video/mp4"
+                        || manifest.sha256() != &downloaded.sha256
+                    {
+                        return Err(contract_failure("dreamina_poll_manifest_mismatch"));
+                    }
+                    Ok(PollObservation::Completed(Completed::new(manifest, None)))
                 }
             };
         }
@@ -304,15 +320,9 @@ impl DreaminaCliPollDriverV1 {
             }
             DreaminaQueryStatusV1::Success => {
                 // Verify and open the entire set before any output is staged.
-                let files = match output.verify_files(output_count) {
-                    Ok(files) => files,
-                    Err(OutputError::Missing) => {
-                        return Ok(ProviderNativeBatchPollObservation::Failed(
-                            terminal_failure("dreamina_native_batch_result_empty"),
-                        ));
-                    }
-                    Err(error) => return Err(map_fresh_output_error(error)),
-                };
+                let files = output
+                    .verify_files(output_count)
+                    .map_err(map_fresh_output_error)?;
                 let actual_count = files.len();
                 for (index, file) in files.into_iter().enumerate() {
                     sink.select_output(index).map_err(map_sink_error)?;
@@ -588,15 +598,16 @@ fn supported_model(operation_id: &str, model: &str) -> bool {
 fn map_fresh_output_error(error: OutputError) -> ProviderFailure {
     match error {
         OutputError::Unavailable(_) => retryable_failure("dreamina_poll_workspace_unavailable"),
+        OutputError::Missing | OutputError::Empty => {
+            retryable_failure("dreamina_poll_download_incomplete")
+        }
         OutputError::UnsafeDirectory
         | OutputError::InvalidLimit
         | OutputError::InvalidFileLimit
         | OutputError::DirectoryNotEmpty
-        | OutputError::Missing
         | OutputError::MultipleEntries
         | OutputError::TooManyEntries
         | OutputError::NotRegular
-        | OutputError::Empty
         | OutputError::TooLarge
         | OutputError::ChangedDuringRead
         | OutputError::Sink(_) => contract_failure("dreamina_poll_artifact_invalid"),
@@ -648,6 +659,21 @@ fn map_sink_error(error: ArtifactSinkError) -> ProviderFailure {
         ArtifactSinkErrorKind::AlreadyFinalized | ArtifactSinkErrorKind::InvalidArtifact => {
             contract_failure("dreamina_poll_artifact_invalid")
         }
+    }
+}
+
+fn map_video_download_error(
+    error: crate::api::video_inputs::GeneratedVideoDownloadError,
+) -> ProviderFailure {
+    use crate::api::video_inputs::GeneratedVideoDownloadError;
+    match error {
+        GeneratedVideoDownloadError::Unavailable => {
+            retryable_failure("dreamina_poll_video_download_unavailable")
+        }
+        GeneratedVideoDownloadError::Invalid => {
+            contract_failure("dreamina_poll_video_download_invalid")
+        }
+        GeneratedVideoDownloadError::Sink(error) => map_sink_error(error),
     }
 }
 

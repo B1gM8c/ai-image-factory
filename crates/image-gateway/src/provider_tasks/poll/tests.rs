@@ -947,7 +947,7 @@ async fn unverified_terminal_failures_become_uncertain() {
 }
 
 #[tokio::test]
-async fn native_batch_dreamina_driver_composes_through_account_fenced_poll_call() {
+async fn native_batch_empty_download_requeries_same_id_then_publishes_once() {
     let root = TempDir::new().unwrap();
     let workspace = root.path().join("workspace");
     let account_home = root.path().join("account-home");
@@ -957,6 +957,7 @@ async fn native_batch_dreamina_driver_composes_through_account_fenced_poll_call(
     fs::set_permissions(&account_home, fs::Permissions::from_mode(0o700)).unwrap();
     let executable = root.path().join("dreamina");
     let script = br#"#!/bin/sh
+test "$1" = query_result || exit 23
 submit=
 download=
 while [ "$#" -gt 0 ]; do
@@ -966,9 +967,14 @@ while [ "$#" -gt 0 ]; do
   esac
   shift
 done
-printf x >> "$HOME/query-count"
-/bin/cp "$HOME/source.png" "$download/00.png"
-/bin/cp "$HOME/source.png" "$download/01.png"
+printf '%s\n' "$submit" >> "$HOME/queried-ids"
+if test -f "$HOME/queried"; then
+  /bin/cp "$HOME/source.png" "$download/00.png"
+  /bin/cp "$HOME/source.png" "$download/01.png"
+else
+  : > "$HOME/queried"
+  : > "$download/00.png"
+fi
 printf '{"submit_id":"%s","gen_status":"success"}' "$submit"
 "#;
     fs::write(&executable, script).unwrap();
@@ -999,6 +1005,29 @@ printf '{"submit_id":"%s","gen_status":"success"}' "$submit"
     config.scope.provider_id = DREAMINA_PROVIDER_ID.to_owned();
     let orchestrator =
         ProviderPollOrchestrator::new(store.clone(), driver, factory.clone(), config).unwrap();
+    assert!(matches!(
+        orchestrator.run_once().await.unwrap(),
+        ProviderPollRun::Observed(ProviderRemoteTask {
+            state: ProviderTaskState::ProviderWaiting,
+            ..
+        })
+    ));
+    assert_eq!(factory.begins.load(Ordering::SeqCst), 0);
+    {
+        let mut state = store.state.lock().unwrap();
+        assert_eq!(state.actions, ["record"]);
+        assert!(state.saved_primary.is_none());
+        assert!(
+            state
+                .native_members
+                .as_ref()
+                .unwrap()
+                .iter()
+                .all(|member| member.committed_failure_code.is_none()
+                    && member.committed_artifact.is_none())
+        );
+        state.lease = Some(lease.clone());
+    }
     let result = orchestrator.run_once().await.unwrap();
     assert!(matches!(
         result,
@@ -1010,9 +1039,12 @@ printf '{"submit_id":"%s","gen_status":"success"}' "$submit"
     assert_eq!(factory.begins.load(Ordering::SeqCst), 2);
     assert_eq!(
         store.state.lock().unwrap().actions,
-        ["publish-member", "publish", "record"]
+        ["record", "publish-member", "publish", "record"]
     );
-    assert_eq!(fs::read(account_home.join("query-count")).unwrap(), b"x");
+    assert_eq!(
+        fs::read_to_string(account_home.join("queried-ids")).unwrap(),
+        format!("{0}\n{0}\n", lease.task.remote_operation_id)
+    );
     assert!(dreamina_workspace_has_no_attempts(&workspace));
 }
 
@@ -1315,3 +1347,4 @@ fn sink_failure(error: ArtifactSinkError) -> image_provider_sdk::ProviderFailure
 }
 
 mod additional_images;
+mod transient_staging;
