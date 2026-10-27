@@ -8558,6 +8558,7 @@ async fn seed_v4_customer_quote_with_funding(
             created_at_ms, updated_at_ms
         )
         VALUES ($1, 'Executor v4 test', 'system', $2, $2)
+        ON CONFLICT (organization_id) DO NOTHING
         "#,
         )
         .bind(&tenant_id)
@@ -8570,6 +8571,7 @@ async fn seed_v4_customer_quote_with_funding(
         r#"
         INSERT INTO gateway_projects (id, tenant_id, name, created_at)
         VALUES ('project-test', $1, 'Executor test project', $2)
+        ON CONFLICT (id) DO NOTHING
         "#,
     )
     .bind(&tenant_id)
@@ -8754,8 +8756,8 @@ async fn seed_v4_customer_quote_with_funding(
         )
         VALUES ($1, 'USD', $2, $2, 0, $3, $3)
         ON CONFLICT (tenant_id,currency) DO UPDATE
-        SET credit_limit_micros=EXCLUDED.credit_limit_micros,
-            held_micros=EXCLUDED.held_micros, updated_at_ms=EXCLUDED.updated_at_ms
+        SET held_micros=billing_accounts.held_micros+EXCLUDED.held_micros,
+            updated_at_ms=EXCLUDED.updated_at_ms
         "#,
     )
     .bind(&tenant_id)

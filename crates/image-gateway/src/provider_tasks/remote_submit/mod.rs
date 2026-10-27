@@ -10,6 +10,7 @@ pub use video_supplement::{
     DreaminaVideoSupplementOperatorReceipt, dispatch_dreamina_video_supplement_operator,
     poll_dreamina_video_supplement_operator, prepare_dreamina_video_supplement_operator,
     prepare_dreamina_video_supplement_successor_operator,
+    recover_dreamina_video_supplement_acceptance_operator,
 };
 
 pub use driver::{GatedCliPreparedSubmission, GatedCliSubmitCodec, GatedCliSubmitDriver};

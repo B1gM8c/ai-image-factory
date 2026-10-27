@@ -437,6 +437,7 @@ impl ProcessFixture {
                 "printf '{\"submit_id\":\"replacement-process-id\",\"gen_status\":\"querying\"}'"
             }
             "bad_stdout" => "printf '{\"submit_id\":'",
+            "empty_stdout" => "true",
             "timeout" => "exec /bin/sleep 30",
             _ => panic!("unknown fake CLI mode"),
         };
@@ -671,7 +672,7 @@ async fn process_gate_concurrent_dispatch_restarts_recover_torn_receipt_and_only
 #[tokio::test]
 async fn process_gate_timeout_or_bad_stdout_never_relaunches_or_quarantines_without_valid_terminal()
 {
-    for mode in ["timeout", "bad_stdout"] {
+    for mode in ["timeout", "bad_stdout", "empty_stdout"] {
         let fixture = ProcessFixture::new(mode);
         let store = DurableFakeStore {
             path: fixture.directory.join("claimed"),
@@ -713,6 +714,80 @@ async fn process_gate_timeout_or_bad_stdout_never_relaunches_or_quarantines_with
         assert_eq!(fixture.count("generation-count"), 1);
         assert_eq!(fixture.count("poll-count"), 0);
     }
+}
+
+struct UncertainReceiptStore {
+    directory: PathBuf,
+}
+
+#[test]
+fn source_import_lock_is_released_before_normal_publication_recovery() {
+    let fixture = ProcessFixture::new("empty_stdout");
+    let source_lock = recovery_lock(&fixture.directory).unwrap();
+    // This is the same real non-reentrant flock used by normal publication.
+    assert!(recover_publication_pointer(&fixture.plan, &fixture.directory).is_err());
+    drop(source_lock);
+    assert!(
+        recover_publication_pointer(&fixture.plan, &fixture.directory)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[async_trait::async_trait]
+impl ReceiptStore for UncertainReceiptStore {
+    async fn record_accepted(
+        &self,
+        _: &DreaminaVideoSupplementAcceptedRequest,
+    ) -> Result<(), ImageGatewayError> {
+        panic!("invalid receipt must never create acceptance");
+    }
+    async fn record_uncertain(
+        &self,
+        request: &DreaminaVideoSupplementUncertainRequest,
+    ) -> Result<(), ImageGatewayError> {
+        private_write_once(
+            &self.directory,
+            "durable-uncertain.json",
+            &serde_json::to_vec(&json!({
+                "authorization_id": request.authorization_id,
+                "dispatch_nonce": request.dispatch_nonce,
+                "error_code": request.error_code,
+            }))
+            .unwrap(),
+        )
+    }
+}
+
+#[tokio::test]
+async fn empty_successful_cli_output_records_uncertainty_without_a_fake_submit_receipt() {
+    let fixture = ProcessFixture::new("empty_stdout");
+    let claims = DurableFakeStore {
+        path: fixture.directory.join("claimed"),
+        runtime_binding: fixture.plan.runtime_binding_json.clone(),
+    };
+    let stdout = fixture.dispatch(&claims).await.unwrap().unwrap();
+    assert!(stdout.is_empty());
+    let store = UncertainReceiptStore {
+        directory: fixture.directory.clone(),
+    };
+    let result = accept_stdout(&store, &fixture.plan, &fixture.directory, &stdout)
+        .await
+        .unwrap();
+    assert_eq!(result.state, "uncertain");
+    assert!(result.remote_operation_id.is_none());
+    assert!(fixture.directory.join("durable-uncertain.json").is_file());
+    assert!(!fixture.directory.join("submit-stdout.json").exists());
+    let missing: serde_json::Value = serde_json::from_slice(
+        &private_read(&fixture.directory, "missing-submit-receipt.json", 4096).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(missing["stdout_byte_size"], json!(0));
+    assert_eq!(missing["stdout_sha256"], json!(sha256_hex(b"")));
+    // The durable claim survives a new observer and cannot release generation twice.
+    assert!(fixture.dispatch(&claims).await.is_none());
+    assert_eq!(fixture.count("generation-count"), 1);
+    assert_eq!(fixture.count("release-count"), 1);
 }
 
 #[test]

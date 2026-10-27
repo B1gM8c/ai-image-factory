@@ -181,6 +181,7 @@ pub use provider_tasks::{
     DreaminaVideoSupplementOperatorReceipt, dispatch_dreamina_video_supplement_operator,
     poll_dreamina_video_supplement_operator, prepare_dreamina_video_supplement_operator,
     prepare_dreamina_video_supplement_successor_operator,
+    recover_dreamina_video_supplement_acceptance_operator,
 };
 pub use provider_uploads::ProviderUploadService;
 pub use providers::dreamina_cli::{

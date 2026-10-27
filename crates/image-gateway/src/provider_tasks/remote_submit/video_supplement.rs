@@ -47,6 +47,9 @@ const TERMINATION_GRACE: Duration = Duration::from_secs(2);
 const MAX_VIDEO_BYTES: usize = 128 * 1024 * 1024;
 const MAX_PRIVATE_JSON_BYTES: u64 = 1024 * 1024;
 
+mod acceptance_recovery;
+pub use acceptance_recovery::recover_dreamina_video_supplement_acceptance_operator;
+
 /// This reviewed budget belongs to the new operator launch, not the expired
 /// original execution. It is intentionally outside the 11-key DB identity.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -506,33 +509,64 @@ pub async fn poll_dreamina_video_supplement_operator(
     )
     .await
     .map_err(|_| failure())?;
-    let metadata = probe_input(&downloaded.bytes, MediaInputKind::Video).map_err(|_| failure())?;
+    publish_video_evidence(
+        &store,
+        &plan,
+        &directory,
+        stdout,
+        &downloaded.bytes,
+        i64::try_from(now_ms()?).map_err(|_| failure())?,
+    )
+    .await
+}
+
+async fn publish_video_evidence(
+    store: &PostgresExecutionSettlementStore,
+    plan: &DreaminaVideoSupplementPlan,
+    directory: &Path,
+    stdout: &[u8],
+    video_bytes: &[u8],
+    executed_at_ms: i64,
+) -> Result<DreaminaVideoSupplementOperatorReceipt, ImageGatewayError> {
+    let remote = plan.remote_operation_id.as_deref().ok_or_else(failure)?;
+    let parsed = validate_query(stdout, remote)?;
+    let video = parsed.remote_video_result().ok_or_else(failure)?;
+    let stdout_sha256 = sha256_hex(stdout);
+    let metadata = probe_input(video_bytes, MediaInputKind::Video).map_err(|_| failure())?;
     let audit = serde_json::to_vec(&json!({
-        "schema_version": 1, "authorization_id": authorization_id, "dispatch_nonce": plan.dispatch_nonce,
+        "schema_version": 1, "authorization_id": plan.authorization_id, "dispatch_nonce": plan.dispatch_nonce,
         "job_id": plan.job_id, "submission_id": plan.submission_id, "executor_execution_id": plan.executor_execution_id,
         "remote_operation_id": remote, "argv": ["query_result", "--submit_id", remote],
-        "stdout_sha256": stdout_sha256, "exit_code": 0, "executed_at_ms": now_ms()?,
+        "stdout_sha256": stdout_sha256, "exit_code": 0, "executed_at_ms": executed_at_ms,
     })).map_err(|_| failure())?;
+    let source = acceptance_recovery::recovered_receipt(plan, directory)?;
+    let recovery_digest = source.as_ref().map(|(_, marker)| sha256_hex(marker));
     let review = serde_json::to_vec(&json!({
         "schema_version": 1, "stdout_sha256": stdout_sha256, "execution_audit_sha256": sha256_hex(&audit),
         "video_url_sha256": sha256_hex(video.video_url().as_bytes()), "quote_hash": plan.quote_hash,
         "provider_command_sha256": plan.command_hash, "submit_stdout_sha256": plan.submit_stdout_sha256,
-        "retrieved_video_sha256": sha256_hex(&downloaded.bytes), "retrieved_video_byte_size": downloaded.bytes.len(),
+        "acceptance_recovery_sha256": recovery_digest, "retrieved_video_sha256": sha256_hex(video_bytes), "retrieved_video_byte_size": video_bytes.len(),
     })).map_err(|_| failure())?;
     let evidence_name = format!("success-{}", Uuid::new_v4().simple());
     let evidence = private_subdirectory(&directory, &evidence_name)?;
-    private_write_once(
-        &evidence,
-        "submit-stdout.json",
-        &private_read(&directory, "submit-stdout.json", 64 * 1024)?,
-    )?;
+    match acceptance_recovery::recovered_receipt(plan, directory)? {
+        Some((accepted, marker)) => {
+            private_write_once(&evidence, "acceptance-query.json", &accepted)?;
+            private_write_once(&evidence, "acceptance-recovery.json", &marker)?;
+        }
+        None => private_write_once(
+            &evidence,
+            "submit-stdout.json",
+            &private_read(directory, "submit-stdout.json", 64 * 1024)?,
+        )?,
+    }
     private_write_once(&evidence, "reviewed-query.json", stdout)?;
     private_write_once(&evidence, "execution-audit.json", &audit)?;
-    private_write_once(&evidence, "retrieved-video.mp4", &downloaded.bytes)?;
+    private_write_once(&evidence, "retrieved-video.mp4", video_bytes)?;
     private_write_once(&evidence, "review.json", &review)?;
     private_write_once(&evidence, "video-metadata.json", &serde_json::to_vec(&json!({
         "expires_at_ms": video.expires_at_ms(), "dimensions": metadata.dimensions(), "duration_ms": metadata.duration_ms(),
-        "sha256": sha256_hex(&downloaded.bytes), "byte_size": downloaded.bytes.len(),
+        "sha256": sha256_hex(video_bytes), "byte_size": video_bytes.len(),
     })).map_err(|_| failure())?)?;
     private_write_once(
         &directory,
@@ -543,7 +577,7 @@ pub async fn poll_dreamina_video_supplement_operator(
         })
         .map_err(|_| failure())?,
     )?;
-    recover_publication(&store, &plan, &directory)
+    recover_publication(store, plan, directory)
         .await?
         .ok_or_else(failure)
 }
@@ -681,25 +715,72 @@ fn bound_terminal_stdout(
     }
 }
 
-async fn accept_stdout(
-    store: &PostgresExecutionSettlementStore,
+#[async_trait::async_trait]
+trait ReceiptStore: Sync {
+    async fn record_accepted(
+        &self,
+        request: &DreaminaVideoSupplementAcceptedRequest,
+    ) -> Result<(), ImageGatewayError>;
+    async fn record_uncertain(
+        &self,
+        request: &DreaminaVideoSupplementUncertainRequest,
+    ) -> Result<(), ImageGatewayError>;
+}
+
+#[async_trait::async_trait]
+impl ReceiptStore for PostgresExecutionSettlementStore {
+    async fn record_accepted(
+        &self,
+        request: &DreaminaVideoSupplementAcceptedRequest,
+    ) -> Result<(), ImageGatewayError> {
+        self.record_dreamina_video_supplement_accepted(request)
+            .await
+    }
+    async fn record_uncertain(
+        &self,
+        request: &DreaminaVideoSupplementUncertainRequest,
+    ) -> Result<(), ImageGatewayError> {
+        self.record_dreamina_video_supplement_uncertain(request)
+            .await
+    }
+}
+
+async fn accept_stdout<S: ReceiptStore>(
+    store: &S,
     plan: &DreaminaVideoSupplementPlan,
     directory: &Path,
     stdout: &[u8],
 ) -> Result<DreaminaVideoSupplementOperatorReceipt, ImageGatewayError> {
-    private_write_once(directory, "submit-stdout.json", stdout)?;
     let accepted = match parse_receipt(stdout) {
         Ok(receipt) => receipt,
         Err(_) => {
             store
-                .record_dreamina_video_supplement_uncertain(
-                    &DreaminaVideoSupplementUncertainRequest {
-                        authorization_id: plan.authorization_id,
-                        dispatch_nonce: plan.dispatch_nonce,
-                        error_code: "dreamina_video_supplement_receipt_invalid".into(),
-                    },
-                )
+                .record_uncertain(&DreaminaVideoSupplementUncertainRequest {
+                    authorization_id: plan.authorization_id,
+                    dispatch_nonce: plan.dispatch_nonce,
+                    error_code: "dreamina_video_supplement_receipt_invalid".into(),
+                })
                 .await?;
+            // Empty output is possible after a real upstream acceptance. Record
+            // uncertainty before writing evidence: the journal deliberately
+            // refuses an empty file and must not leave this claim dispatching.
+            if stdout.is_empty() {
+                private_write_once(
+                    directory,
+                    "missing-submit-receipt.json",
+                    &serde_json::to_vec(&json!({
+                        "schema_version": 1,
+                        "authorization_id": plan.authorization_id,
+                        "dispatch_nonce": plan.dispatch_nonce,
+                        "stdout_byte_size": 0,
+                        "stdout_sha256": sha256_hex(stdout),
+                        "error_code": "dreamina_video_supplement_receipt_invalid",
+                    }))
+                    .map_err(|_| failure())?,
+                )?;
+            } else {
+                private_write_once(directory, "submit-stdout.json", stdout)?;
+            }
             return Ok(receipt(
                 plan,
                 directory,
@@ -708,9 +789,10 @@ async fn accept_stdout(
             ));
         }
     };
+    private_write_once(directory, "submit-stdout.json", stdout)?;
     let digest = sha256_hex(stdout);
     store
-        .record_dreamina_video_supplement_accepted(&DreaminaVideoSupplementAcceptedRequest {
+        .record_accepted(&DreaminaVideoSupplementAcceptedRequest {
             authorization_id: plan.authorization_id,
             dispatch_nonce: plan.dispatch_nonce,
             remote_operation_id: accepted.submit_id().into(),
@@ -802,7 +884,10 @@ fn recover_publication_pointer(
     if serde_json::from_slice::<serde_json::Value>(&broken).is_ok() {
         return Err(failure());
     }
-    let submit = bound_terminal_stdout(plan, directory)?;
+    let submit = match acceptance_recovery::recovered_receipt(plan, directory)? {
+        Some((query, _)) => query,
+        None => bound_terminal_stdout(plan, directory)?,
+    };
     if plan.submit_stdout_sha256.as_deref() != Some(sha256_hex(&submit).as_str())
         || Some(parse_receipt(&submit).map_err(|_| failure())?.submit_id())
             != plan.remote_operation_id.as_deref()
@@ -846,9 +931,21 @@ fn complete_publication_evidence(
     let raw = private_read(&evidence, "reviewed-query.json", MAX_PRIVATE_JSON_BYTES)?;
     let remote = plan.remote_operation_id.as_deref().ok_or_else(failure)?;
     let query = validate_query(&raw, remote)?;
-    if query.status() != DreaminaQueryStatusV1::Success
-        || private_read(&evidence, "submit-stdout.json", 64 * 1024)? != submit
-    {
+    let accepted = match acceptance_recovery::recovered_receipt(plan, directory)? {
+        Some((_, marker)) => {
+            if private_read(
+                &evidence,
+                "acceptance-recovery.json",
+                MAX_PRIVATE_JSON_BYTES,
+            )? != marker
+            {
+                return Err(failure());
+            }
+            private_read(&evidence, "acceptance-query.json", 64 * 1024)?
+        }
+        None => private_read(&evidence, "submit-stdout.json", 64 * 1024)?,
+    };
+    if query.status() != DreaminaQueryStatusV1::Success || accepted != submit {
         return Err(failure());
     }
     let audit = private_read(&evidence, "execution-audit.json", MAX_PRIVATE_JSON_BYTES)?;
