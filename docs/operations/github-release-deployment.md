@@ -570,6 +570,13 @@ root, and admission contract in `app.env`. Account HOME is shared by that
 account's image/video profiles; submit workspace, poll workspace, and journal
 directories are private, separate, and unique to each profile.
 
+Set the provider task budget and submit CLI wall budget together. The example
+uses `600000` and `540000` milliseconds, leaving time to recover an acceptance
+receipt after reference uploads. An omitted submit CLI wall budget follows the
+provider budget; an explicit value above it prevents submitd startup. Query and
+poll processes retain their independent limits. A timeout never authorizes
+another generation.
+
 Both CLI executable paths and SHA-256 values must match the verified installed
 CLI. Set `GATEWAY_MANAGED_DREAMINA_EXECUTABLE` in `app.env` to the same CLI version
 for login, quota, and model discovery. The submit runner path and digest must

@@ -29,7 +29,6 @@ const DEFAULT_IDLE_DELAY_MS: u64 = 250;
 const DEFAULT_ERROR_BASE_DELAY_MS: u64 = 250;
 const DEFAULT_ERROR_MAX_DELAY_MS: u64 = 30_000;
 const DEFAULT_SHUTDOWN_DRAIN_MS: u64 = 30_000;
-const DEFAULT_CLI_WALL_TIMEOUT_MS: u64 = 60_000;
 const DEFAULT_CLI_TERMINATION_GRACE_MS: u64 = 2_000;
 const DEFAULT_RUNTIME_LEASE_MS: u64 = 60_000;
 const DEFAULT_RUNTIME_HEARTBEAT_MS: u64 = 10_000;
@@ -126,9 +125,9 @@ impl ProviderSubmitterConfig {
             "PROVIDER_SUBMITTER_SHUTDOWN_DRAIN_MS",
             DEFAULT_SHUTDOWN_DRAIN_MS,
         )?;
-        let cli_wall_timeout_ms = duration_env(
-            "PROVIDER_SUBMITTER_CLI_WALL_TIMEOUT_MS",
-            DEFAULT_CLI_WALL_TIMEOUT_MS,
+        let cli_wall_timeout_ms = cli_wall_timeout_ms(
+            provider_timeout_ms,
+            optional_env("PROVIDER_SUBMITTER_CLI_WALL_TIMEOUT_MS").as_deref(),
         )?;
         let cli_termination_grace_ms = duration_env(
             "PROVIDER_SUBMITTER_CLI_TERMINATION_GRACE_MS",
@@ -398,7 +397,32 @@ fn sha256_bytes(name: &str) -> Result<[u8; 32], ImageGatewayError> {
 }
 
 fn duration_env(name: &str, default: u64) -> Result<u64, ImageGatewayError> {
-    let value = optional_env(name)
+    duration_value(name, optional_env(name).as_deref(), default)
+}
+
+fn cli_wall_timeout_ms(
+    provider_timeout_ms: u64,
+    configured: Option<&str>,
+) -> Result<u64, ImageGatewayError> {
+    let value = duration_value(
+        "PROVIDER_SUBMITTER_CLI_WALL_TIMEOUT_MS",
+        configured,
+        provider_timeout_ms,
+    )?;
+    if value > provider_timeout_ms {
+        return Err(ImageGatewayError::config(
+            "PROVIDER_SUBMITTER_CLI_WALL_TIMEOUT_MS must not exceed PROVIDER_SUBMITTER_PROVIDER_TIMEOUT_MS",
+        ));
+    }
+    Ok(value)
+}
+
+fn duration_value(
+    name: &str,
+    configured: Option<&str>,
+    default: u64,
+) -> Result<u64, ImageGatewayError> {
+    let value = configured
         .map(|value| {
             value
                 .parse::<u64>()
@@ -512,6 +536,40 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn submit_cli_budget_defaults_to_the_provider_budget() {
+        assert_eq!(
+            cli_wall_timeout_ms(DEFAULT_PROVIDER_TIMEOUT_MS, None).unwrap(),
+            60_000
+        );
+        assert_eq!(cli_wall_timeout_ms(600_000, None).unwrap(), 600_000);
+        assert_eq!(cli_wall_timeout_ms(5_000, None).unwrap(), 5_000);
+    }
+
+    #[test]
+    fn explicit_submit_cli_budget_must_fit_the_provider_budget() {
+        assert_eq!(
+            cli_wall_timeout_ms(600_000, Some("540000")).unwrap(),
+            540_000
+        );
+        assert_eq!(
+            cli_wall_timeout_ms(600_000, Some("600000")).unwrap(),
+            600_000
+        );
+        assert!(cli_wall_timeout_ms(600_000, Some("600001")).is_err());
+        assert!(cli_wall_timeout_ms(5_000, Some("60000")).is_err());
+    }
+
+    #[test]
+    fn submit_cli_budget_rejects_invalid_or_unbounded_values() {
+        for value in ["", "0", "-1", "1.5", "86400001", "invalid"] {
+            assert!(
+                cli_wall_timeout_ms(MAX_DURATION_MS, Some(value)).is_err(),
+                "accepted invalid CLI wall budget {value:?}"
+            );
+        }
+    }
 
     #[test]
     fn account_workspace_and_journal_roots_must_be_separate_trees() {
