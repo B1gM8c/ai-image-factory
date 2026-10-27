@@ -1072,7 +1072,10 @@ pub(super) fn read_optional_bytes(
     Ok(Some(bytes))
 }
 
-fn validate_file(stat: &rfs::Stat, max_bytes: u64) -> Result<usize, RemoteSubmitJournalError> {
+pub(super) fn validate_file(
+    stat: &rfs::Stat,
+    max_bytes: u64,
+) -> Result<usize, RemoteSubmitJournalError> {
     if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile
         || Mode::from_raw_mode(stat.st_mode) != Mode::RUSR | Mode::WUSR
         || stat.st_uid != unsafe { libc::geteuid() }

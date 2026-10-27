@@ -22,8 +22,8 @@ pub(super) use journal::{
 };
 pub use process::{
     GatedCliBinding, GatedCliCommand, GatedCliObservation, GatedCliProcessError,
-    GatedCliProcessOutcome, GatedCliProcessTerminal, GatedCliReady, GatedCliSubmission,
-    run_remote_submit_gate, run_remote_submit_runner,
+    GatedCliProcessOutcome, GatedCliProcessTerminal, GatedCliReady, GatedCliReceiptEvidence,
+    GatedCliSubmission, run_remote_submit_gate, run_remote_submit_runner,
 };
 
 pub use compliance_reconciliation::{

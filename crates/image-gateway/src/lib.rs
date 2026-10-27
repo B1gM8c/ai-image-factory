@@ -138,6 +138,7 @@ pub use provider_management::{
     reconcile_execution_profile_routes,
 };
 pub use provider_tasks::GatedCliInputFile;
+pub use provider_tasks::GatedCliReceiptEvidence;
 pub use provider_tasks::{
     DreaminaComplianceRejectionResolution, DreaminaComplianceRejectionResolutionRequest,
     GatedCliBinding, GatedCliCommand, GatedCliObservation, GatedCliPreparedSubmission,

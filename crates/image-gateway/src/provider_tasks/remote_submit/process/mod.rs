@@ -20,6 +20,7 @@ use uuid::Uuid;
 #[cfg(test)]
 mod observation_tests;
 mod protocol;
+mod receipt_recovery;
 mod runner;
 mod unix;
 
@@ -27,6 +28,7 @@ use protocol::{
     DiskChildIdentity, DiskExecStart, DiskHelperIdentity, DiskOutcome, DiskRelease, DiskRequest,
     DiskTerminal,
 };
+pub use receipt_recovery::GatedCliReceiptEvidence;
 pub use runner::{run_remote_submit_gate, run_remote_submit_runner};
 #[cfg(test)]
 use unix::unix_time_ms;
@@ -69,7 +71,7 @@ pub struct GatedCliBinding {
     absolute_deadline_unix_ms: u64,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 /// A frozen CLI command whose non-stdin fields are persisted in the private journal.
 ///
 /// Environment values are durable evidence and must not contain credentials or other secrets.
@@ -296,6 +298,31 @@ impl GatedCliCommand {
 
     pub fn working_directory(&self) -> &Path {
         Path::new(&self.working_directory)
+    }
+
+    pub(crate) fn with_arguments(
+        mut self,
+        arguments: Vec<String>,
+    ) -> Result<Self, GatedCliProcessError> {
+        self.arguments = arguments;
+        self.validate()?;
+        Ok(self)
+    }
+
+    pub fn arguments(&self) -> &[String] {
+        &self.arguments
+    }
+
+    pub fn environment(&self) -> &BTreeMap<String, String> {
+        &self.environment
+    }
+
+    pub fn executable(&self) -> &Path {
+        Path::new(&self.executable)
+    }
+
+    pub fn executable_sha256(&self) -> &str {
+        &self.executable_sha256
     }
 }
 
