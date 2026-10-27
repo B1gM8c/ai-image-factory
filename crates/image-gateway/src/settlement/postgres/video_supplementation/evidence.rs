@@ -38,6 +38,22 @@ struct Review {
     submit_stdout_sha256: String,
     retrieved_video_sha256: String,
     retrieved_video_byte_size: i64,
+    #[serde(default)]
+    acceptance_recovery_sha256: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecoveredAcceptance {
+    schema_version: u16,
+    evidence_mode: String,
+    authorization_id: Uuid,
+    dispatch_nonce: Uuid,
+    command_hash: String,
+    quote_hash: String,
+    remote_operation_id: String,
+    query_stdout_sha256: String,
+    reviewed_recovery_sha256: String,
 }
 
 pub(super) struct VerifiedEvidence {
@@ -78,12 +94,34 @@ pub(super) fn load(
     .map(File::from)
     .map_err(|_| conflict())?;
     private_metadata(&directory, true)?;
-    let submit_stdout = read(&directory, "submit-stdout.json", MAX_RECEIPT_BYTES)?;
     let stdout = read(&directory, "reviewed-query.json", MAX_RECEIPT_BYTES)?;
     let audit_bytes = read(&directory, "execution-audit.json", MAX_RECEIPT_BYTES)?;
     let review_bytes = read(&directory, "review.json", MAX_RECEIPT_BYTES)?;
     let review: Review = serde_json::from_slice(&review_bytes).map_err(|_| conflict())?;
     let audit: ExecutionAudit = serde_json::from_slice(&audit_bytes).map_err(|_| conflict())?;
+    let submit_stdout = match &review.acceptance_recovery_sha256 {
+        None => read(&directory, "submit-stdout.json", MAX_RECEIPT_BYTES)?,
+        Some(expected) => {
+            let marker = read(&directory, "acceptance-recovery.json", MAX_RECEIPT_BYTES)?;
+            let source: RecoveredAcceptance =
+                serde_json::from_slice(&marker).map_err(|_| conflict())?;
+            let query = read(&directory, "acceptance-query.json", MAX_RECEIPT_BYTES)?;
+            if sha256_hex(&marker) != *expected
+                || source.schema_version != 1
+                || source.evidence_mode != "native_log_acceptance_query_v1"
+                || source.authorization_id != request.authorization_id
+                || source.dispatch_nonce != request.dispatch_nonce
+                || source.command_hash != review.provider_command_sha256
+                || source.quote_hash != review.quote_hash
+                || source.remote_operation_id != audit.remote_operation_id
+                || source.query_stdout_sha256 != sha256_hex(&query)
+                || !super::valid_sha256(&source.reviewed_recovery_sha256)
+            {
+                return Err(conflict());
+            }
+            query
+        }
+    };
     let stdout_sha256 = sha256_hex(&stdout);
     let execution_audit_sha256 = sha256_hex(&audit_bytes);
     if review.schema_version != 1
@@ -106,8 +144,8 @@ pub(super) fn load(
     {
         return Err(conflict());
     }
-    // A new submit receipt must actually name this operation. It cannot be a
-    // URL supplied by the caller or an old job's query-only success overlay.
+    // The original receipt or explicitly reviewed native-log recovery receipt
+    // must name this operation. A URL alone is never acceptance evidence.
     let submit =
         image_provider_dreamina_cli::parse_receipt(&submit_stdout).map_err(|_| conflict())?;
     if submit.submit_id() != audit.remote_operation_id {

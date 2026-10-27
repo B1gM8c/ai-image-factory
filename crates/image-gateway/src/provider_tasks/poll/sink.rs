@@ -127,7 +127,7 @@ enum SinkState {
     Pristine,
     Streaming,
     Finalized(Box<StagedProviderArtifact>),
-    Failed,
+    Failed(ArtifactSinkErrorKind),
 }
 
 pub(crate) struct ControlledProviderArtifactSink<'a, F>
@@ -164,7 +164,23 @@ where
     pub(crate) fn into_pristine(self) -> Result<(), ProviderArtifactSinkContractError> {
         match self.state {
             SinkState::Pristine => Ok(()),
-            SinkState::Streaming | SinkState::Finalized(_) | SinkState::Failed => {
+            SinkState::Streaming | SinkState::Finalized(_) | SinkState::Failed(_) => {
+                Err(ProviderArtifactSinkContractError::NotPristine)
+            }
+        }
+    }
+
+    /// Only the orchestrator's classified transient query failure may discard
+    /// these unpublished bytes. An integrity failure or finalized result is not
+    /// interchangeable with a failed download/storage attempt.
+    pub(crate) fn discard_unpublished_for_retry(
+        self,
+    ) -> Result<(), ProviderArtifactSinkContractError> {
+        match self.state {
+            SinkState::Pristine
+            | SinkState::Streaming
+            | SinkState::Failed(ArtifactSinkErrorKind::Storage) => Ok(()),
+            SinkState::Finalized(_) | SinkState::Failed(_) => {
                 Err(ProviderArtifactSinkContractError::NotPristine)
             }
         }
@@ -177,7 +193,7 @@ where
         match self.state {
             SinkState::Finalized(staged) if staged.manifest == *expected => Ok(*staged),
             SinkState::Finalized(_) => Err(ProviderArtifactSinkContractError::ManifestMismatch),
-            SinkState::Pristine | SinkState::Streaming | SinkState::Failed => {
+            SinkState::Pristine | SinkState::Streaming | SinkState::Failed(_) => {
                 Err(ProviderArtifactSinkContractError::NotFinalized)
             }
         }
@@ -212,21 +228,21 @@ where
             match self.factory.begin(&self.context).await {
                 Ok(stager) => self.stager = Some(stager),
                 Err(error) => {
-                    self.state = SinkState::Failed;
+                    self.state = SinkState::Failed(error.kind());
                     return Err(error);
                 }
             }
         }
         self.state = SinkState::Streaming;
         let Some(stager) = self.stager.as_mut() else {
-            self.state = SinkState::Failed;
+            self.state = SinkState::Failed(ArtifactSinkErrorKind::Storage);
             return Err(sink_error(
                 ArtifactSinkErrorKind::Storage,
                 "provider_artifact_stager_unavailable",
             ));
         };
         if let Err(error) = stager.write_chunk(chunk).await {
-            self.state = SinkState::Failed;
+            self.state = SinkState::Failed(error.kind());
             return Err(error);
         }
         Ok(())
@@ -243,7 +259,7 @@ where
             ));
         }
         let Some(stager) = self.stager.as_mut() else {
-            self.state = SinkState::Failed;
+            self.state = SinkState::Failed(ArtifactSinkErrorKind::Storage);
             return Err(sink_error(
                 ArtifactSinkErrorKind::Storage,
                 "provider_artifact_stager_unavailable",
@@ -256,7 +272,7 @@ where
                 Ok(manifest)
             }
             Err(error) => {
-                self.state = SinkState::Failed;
+                self.state = SinkState::Failed(error.kind());
                 Err(error)
             }
         }

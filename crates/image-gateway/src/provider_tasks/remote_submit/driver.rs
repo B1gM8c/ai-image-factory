@@ -20,7 +20,8 @@ use crate::{executor::ExecutorInputObject, input_blobs::InputBlobStore};
 
 use super::process::{
     GatedCliBinding, GatedCliCommand, GatedCliObservation, GatedCliProcessError,
-    GatedCliProcessOutcome, GatedCliProcessTerminal, GatedCliReady, GatedCliSubmission,
+    GatedCliProcessOutcome, GatedCliProcessTerminal, GatedCliReady, GatedCliReceiptEvidence,
+    GatedCliSubmission,
 };
 use crate::provider_tasks::{
     ProviderExecutionContext, ProviderSubmitDriver, ProviderSubmitDriverCall,
@@ -58,6 +59,18 @@ pub trait GatedCliSubmitCodec: Send + Sync + 'static {
         workspace: &WorkingDirectory,
     ) -> Result<GatedCliCommand, ProviderFailure>;
 
+    /// Transport projection used only by the normal one-shot submit driver.
+    /// Operator recovery reconstructs `command` without changing historical argv.
+    fn normal_command(
+        &self,
+        intent: &ProviderSubmitIntent,
+        context: &ProviderExecutionContext,
+        command: &image_provider_sdk::SingleOutputCommand<Self::Payload>,
+        workspace: &WorkingDirectory,
+    ) -> Result<GatedCliCommand, ProviderFailure> {
+        self.command(intent, context, command, workspace)
+    }
+
     /// Only an explicit pre-acceptance refusal may return `NoRemoteEffect` with
     /// `Never`; malformed receipts and post-acceptance failures remain unknown.
     fn decode_receipt(
@@ -66,6 +79,17 @@ pub trait GatedCliSubmitCodec: Send + Sync + 'static {
         command: &image_provider_sdk::SingleOutputCommand<Self::Payload>,
         stdout: &[u8],
     ) -> Result<PendingOperation, ProviderFailure>;
+
+    /// Observe the already executed attempt only. Implementations must persist
+    /// independent acceptance evidence before returning an accepted identity;
+    /// neither a local candidate nor a failed cache entry authorizes a replay.
+    fn recover_receipt(
+        &self,
+        _call: &ProviderSubmitDriverCall<Self::Payload>,
+        _evidence: Arc<GatedCliReceiptEvidence>,
+    ) -> impl Future<Output = Result<Option<PendingOperation>, ProviderFailure>> + Send {
+        async { Ok(None) }
+    }
 
     /// Return only a fixed diagnostic code for a complete, nonzero CLI exit.
     /// The driver always preserves unknown effect and `Never` for this path.
@@ -168,7 +192,7 @@ where
         let owned_call = call.clone();
         let projected_workspace = working_directory.clone();
         let command = tokio::task::spawn_blocking(move || {
-            codec.command(
+            codec.normal_command(
                 owned_call.intent(),
                 owned_call.execution_context(),
                 owned_call.command(),
@@ -314,8 +338,10 @@ where
         };
         match wait_for_terminal(&process, call).await {
             Ok(terminal) => {
-                let result = self.resolve_terminal(call, terminal).await;
-                self.cleanup_workspace(&process).await;
+                let result = self.resolve_terminal(call, &process, terminal).await;
+                if cleanup_after_resolution(&result) {
+                    self.cleanup_workspace(&process).await;
+                }
                 result
             }
             Err(failure)
@@ -324,7 +350,9 @@ where
                 ProviderSubmitDriverRecovery::AwaitingEvidence
             }
             Err(failure) => {
-                if failure.cleanup_safe {
+                if failure.cleanup_safe
+                    && failure.failure.effect() == EffectCertainty::NoRemoteEffect
+                {
                     self.cleanup_workspace(&process).await;
                 }
                 ProviderSubmitDriverRecovery::Failed(failure.failure)
@@ -352,15 +380,21 @@ where
     async fn resolve_terminal(
         &self,
         call: &ProviderSubmitDriverCall<C::Payload>,
+        process: &GatedProcessRef,
         terminal: GatedCliProcessTerminal,
     ) -> ProviderSubmitDriverRecovery {
         if !terminal.released() || !terminal.exec_started() {
             return ProviderSubmitDriverRecovery::Failed(no_effect_terminal_failure(&terminal));
         }
         if terminal.stdout_truncated() {
-            return ProviderSubmitDriverRecovery::Failed(unknown_process_failure(
-                "provider_submit_receipt_truncated",
-            ));
+            return self
+                .recover_terminal_receipt(
+                    call,
+                    process,
+                    terminal,
+                    unknown_process_failure("provider_submit_receipt_truncated"),
+                )
+                .await;
         }
         if !matches!(
             terminal.outcome(),
@@ -379,31 +413,73 @@ where
             ) {
                 return ProviderSubmitDriverRecovery::Failed(unknown_process_failure(code));
             }
-            return ProviderSubmitDriverRecovery::Failed(unknown_terminal_failure(&terminal));
+            let failure = unknown_terminal_failure(&terminal);
+            return self
+                .recover_terminal_receipt(call, process, terminal, failure)
+                .await;
         }
         let codec = Arc::clone(&self.codec);
         let owned_call = call.clone();
         let stdout = terminal.stdout().to_vec();
-        match tokio::task::spawn_blocking(move || {
+        let failure = match tokio::task::spawn_blocking(move || {
             codec.decode_receipt(owned_call.intent(), owned_call.command(), &stdout)
         })
         .await
         {
-            Ok(Ok(pending)) => ProviderSubmitDriverRecovery::Accepted(pending),
+            Ok(Ok(pending)) => return ProviderSubmitDriverRecovery::Accepted(pending),
             Ok(Err(failure))
                 if failure.effect() == EffectCertainty::NoRemoteEffect
                     && failure.retry() == RetryDirective::Never
                     && !terminal.stderr_truncated() =>
             {
-                ProviderSubmitDriverRecovery::Failed(failure)
+                return ProviderSubmitDriverRecovery::Failed(failure);
             }
-            Ok(Err(failure)) => {
+            Ok(Err(failure)) => unknown_process_failure(failure.code()),
+            Err(_) => unknown_process_failure("provider_submit_receipt_worker_stopped"),
+        };
+        self.recover_terminal_receipt(call, process, terminal, failure)
+            .await
+    }
+
+    async fn recover_terminal_receipt(
+        &self,
+        call: &ProviderSubmitDriverCall<C::Payload>,
+        process: &GatedProcessRef,
+        terminal: GatedCliProcessTerminal,
+        original_failure: ProviderFailure,
+    ) -> ProviderSubmitDriverRecovery {
+        let process = process.clone();
+        let snapshot = tokio::task::spawn_blocking(move || {
+            GatedCliSubmission::open_existing(&process.root, process.submission_id)?
+                .receipt_evidence(&process.binding, &terminal)
+        })
+        .await;
+        let Ok(Ok(snapshot)) = snapshot else {
+            return ProviderSubmitDriverRecovery::Failed(original_failure);
+        };
+        match self.codec.recover_receipt(call, Arc::new(snapshot)).await {
+            Ok(Some(pending)) => ProviderSubmitDriverRecovery::Accepted(pending),
+            Ok(None) => ProviderSubmitDriverRecovery::Failed(original_failure),
+            Err(failure) => {
+                tracing::warn!(
+                    submission_id = %call.intent().submission_id,
+                    provider_id = self.codec.provider_id(),
+                    error_code = failure.code(),
+                    "provider receipt recovery did not establish acceptance"
+                );
                 ProviderSubmitDriverRecovery::Failed(unknown_process_failure(failure.code()))
             }
-            Err(_) => ProviderSubmitDriverRecovery::Failed(unknown_process_failure(
-                "provider_submit_receipt_worker_stopped",
-            )),
         }
+    }
+}
+
+fn cleanup_after_resolution(result: &ProviderSubmitDriverRecovery) -> bool {
+    match result {
+        ProviderSubmitDriverRecovery::Accepted(_) => true,
+        ProviderSubmitDriverRecovery::Failed(failure) => {
+            failure.effect() == EffectCertainty::NoRemoteEffect
+        }
+        ProviderSubmitDriverRecovery::AwaitingEvidence => false,
     }
 }
 

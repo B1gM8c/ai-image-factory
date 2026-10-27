@@ -287,6 +287,28 @@ impl PostgresExecutionSettlementStore {
         }
         let mut tx = self.pool.begin().await.map_err(unavailable)?;
         let plan = lock_plan(&mut tx, request.authorization_id, request.dispatch_nonce).await?;
+        // Ordinary and recovered receipts share the same remote identity fence.
+        // The original job lock remains first, as required by the leaf guards.
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))")
+            .bind(format!(
+                "dreamina-video-supplement-remote:{}:{}",
+                plan.provider_account_id, request.remote_operation_id
+            ))
+            .execute(&mut *tx)
+            .await
+            .map_err(unavailable)?;
+        let already_bound: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM dreamina_operator_video_supplement_authorizations WHERE provider_account_id=$1 AND remote_operation_id=$2 AND authorization_id<>$3) OR EXISTS(SELECT 1 FROM provider_remote_tasks WHERE provider_id='dreamina-cli' AND provider_account_id=$1 AND remote_operation_id=$2)",
+        )
+        .bind(plan.provider_account_id)
+        .bind(&request.remote_operation_id)
+        .bind(request.authorization_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(unavailable)?;
+        if already_bound {
+            return Err(conflict());
+        }
         if let Some(remote) = plan.remote_operation_id {
             if remote != request.remote_operation_id
                 || plan.submit_stdout_sha256.as_deref()
@@ -303,6 +325,16 @@ impl PostgresExecutionSettlementStore {
         let now = super::database_now(&mut tx).await?;
         sqlx::query("UPDATE dreamina_operator_video_supplement_authorizations SET state='accepted',remote_operation_id=$2,submit_stdout_sha256=$3,error_code=NULL,updated_at_ms=$4 WHERE authorization_id=$1").bind(request.authorization_id).bind(&request.remote_operation_id).bind(&request.submit_stdout_sha256).bind(now).execute(&mut *tx).await.map_err(storage_conflict)?;
         tx.commit().await.map_err(storage_conflict)
+    }
+    /// Bind only a separately verified acceptance-recovery receipt. The caller
+    /// validates its protected source evidence and query; this transaction keeps
+    /// the same leaf, nonce, remote identity and original settlement fences.
+    pub async fn record_dreamina_video_supplement_recovered_acceptance(
+        &self,
+        request: &DreaminaVideoSupplementAcceptedRequest,
+    ) -> Result<(), ImageGatewayError> {
+        self.record_dreamina_video_supplement_accepted(request)
+            .await
     }
     pub async fn record_dreamina_video_supplement_uncertain(
         &self,

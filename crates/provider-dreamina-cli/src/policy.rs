@@ -199,6 +199,31 @@ impl DreaminaCliPolicyV1 {
         self.executable_sha256
     }
 
+    pub fn account_home_path(&self) -> &Path {
+        self.account_home.path()
+    }
+
+    pub fn workspace_root_path(&self) -> &Path {
+        self.workspace_root.path()
+    }
+
+    /// Query the same account without widening the submit policy's credential
+    /// capability or reusing its expired generation deadline.
+    pub fn query_policy(
+        &self,
+        wall_timeout: Duration,
+        termination_grace: Duration,
+    ) -> Result<DreaminaCliQueryPolicyV1, DreaminaCliQueryPolicyError> {
+        DreaminaCliQueryPolicyV1::new(
+            self.executable.path(),
+            self.executable_sha256,
+            self.workspace_root.clone(),
+            self.account_home.clone(),
+            wall_timeout,
+            termination_grace,
+        )
+    }
+
     pub fn command_spec(
         &self,
         request: &DreaminaSubmitRequestV1,

@@ -12,6 +12,8 @@ const URL: &str = "https://media.example.test/supplement%2Fvideo.mp4?token=A%2Bb
 mod manual_cancellation;
 #[path = "dreamina_video_supplementation/populated_upgrade.rs"]
 mod populated_upgrade;
+#[path = "dreamina_video_supplementation/recovered_acceptance.rs"]
+mod recovered_acceptance;
 #[path = "dreamina_video_supplementation/successor.rs"]
 mod successor;
 fn mp4(width: u16, height: u16, duration_ms: u32) -> Vec<u8> {

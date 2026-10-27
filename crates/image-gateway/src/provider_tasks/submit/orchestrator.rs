@@ -404,10 +404,16 @@ where
                 self.record_pending(intent, context, pending, recovery_fence)
                     .await
             }
-            Err(failure) if failure.code() == crate::provider_tasks::SUBMIT_CREDENTIAL_BLOCKED => {
-                // A ready process has no dispatch permission. Preserve the journal
-                // and original certainty for later observation; do not synthesize
-                // a rejection, receipt, or refund from a credential denial.
+            Err(failure)
+                if matches!(
+                    failure.code(),
+                    crate::provider_tasks::SUBMIT_CREDENTIAL_BLOCKED
+                        | crate::provider_tasks::SUBMIT_RECEIPT_RECOVERY_PENDING
+                ) =>
+            {
+                // Preserve dispatch permission and certainty for later observation
+                // of either a blocked gate or a known receipt candidate. Neither
+                // observation authorizes another generation, rejection or refund.
                 Ok(ProviderSubmitOutcome::AwaitingEvidence(intent.clone()))
             }
             Err(failure) => {
@@ -549,6 +555,12 @@ where
                             .await?;
                         self.record_pending(intent, context, pending, recovery_fence)
                             .await
+                    }
+                    ProviderSubmitDriverRecovery::Failed(failure)
+                        if failure.code()
+                            == crate::provider_tasks::SUBMIT_RECEIPT_RECOVERY_PENDING =>
+                    {
+                        Ok(ProviderSubmitOutcome::AwaitingEvidence(intent.clone()))
                     }
                     ProviderSubmitDriverRecovery::Failed(failure) => {
                         let (kind, terminal) = journal_failure(&failure);

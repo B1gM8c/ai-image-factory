@@ -293,6 +293,24 @@ pub struct DreaminaImageRequestMetadata {
     pub height: Option<u32>,
 }
 
+/// Non-secret specifications frozen at admission, never generated-media measurements.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DreaminaVideoRequestMetadata {
+    pub workflow: String,
+    pub model_version: String,
+    pub video_resolution: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ratio: Option<String>,
+    pub duration_ms: u64,
+    pub output_count: u32,
+    pub image_count: u32,
+    pub video_count: u32,
+    pub audio_count: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub transition_durations_ms: Vec<u32>,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct DreaminaVideoTask {
     pub id: String,

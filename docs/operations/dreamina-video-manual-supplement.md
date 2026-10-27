@@ -74,9 +74,52 @@ one transaction. Verify a unique original debit and the consumer's downloaded
 hash. Do not manually edit the job, hold, receipt, fence, supplement or blob.
 Keep unrelated completed orders unchanged.
 
+## Recover a genuine acceptance when CLI stdout is missing
+
+An exit status of zero with empty stdout does not prove that no request reached
+Dreamina. The operator records durable uncertainty and a missing-receipt record;
+it must not release a second generation or invent a submit receipt. Keep the
+original gate, launch, claim, nonce and account log unchanged.
+
+When the same execution has a genuine upstream acceptance in the private CLI
+account log, use an independently reviewed recovery bundle:
+
+```text
+factoryctl recover-dreamina-video-supplement-acceptance \
+  AUTHORIZATION_ID EXISTING_EVIDENCE_ROOT RECOVERY_BUNDLE_ROOT \
+  EXPECTED_REVIEW_JSON_SHA256
+```
+
+This command imports existing query-only evidence. It never submits, retries,
+cancels or refunds a generation. The bundle must retain the original CLI log
+bytes, actual query stdout and execution audit, retrieved video bytes and the
+review manifest. Supply the reviewed manifest digest as an argument; do not edit
+the original gate or write query output into `submit-stdout.json`.
+This is operator-reviewed source evidence, not a provider-signed attestation.
+Keep the original root-protected archive; copy the reviewed bundle into a new
+service-owned private directory (0700, regular single-link files 0600).
+
+Recovery must bind the exact original authorization and nonce, command, quote,
+account and runtime pins to the executed gate. The start and accepted account-log
+records must identify the same invocation, with matching trace, input paths,
+material bytes, prompt and generation parameters within that gate's execution
+window. The actual query must name that accepted upstream ID and its prompt must
+match the original bytes. Missing or ambiguous correlation fails closed; a
+matching prompt alone is insufficient. Query/history fields that are absent do
+not count as verified parameters.
+The current recovery contract covers `multimodal2video` and requires a successful
+query with one retrieved video. Pending results do not authorize publication.
+
+The imported query receipt has an explicit recovery source and independent
+private evidence. It does not become an invented submit stdout. Acceptance and
+publication retain the existing leaf, cancellation, original-hold and unique
+settlement checks. Verify the consumer's original task ID, one original debit
+and actual downloaded bytes after publication. A completed import is idempotent;
+it does not authorize a second dispatch or an additional customer charge.
+
 ## Use an independently attested operator tool
 
-A budget-only operator hotfix does not require changing `current` or restarting
+A standalone operator hotfix does not require changing `current` or restarting
 the application fleet when its migration list and checksums match the installed
 database. Use the existing `.github/workflows/operator-hotfix.yml` workflow:
 
@@ -99,10 +142,11 @@ database. Use the existing `.github/workflows/operator-hotfix.yml` workflow:
      --source-ref refs/tags/EXACT_SIGNED_TAG --source-digest EXACT_SOURCE_COMMIT
    ```
 
-   Require manifest schema version 2, kind `operator_factoryctl_hotfix`, the same
+   Require manifest schema version 3, kind `operator_factoryctl_hotfix`, the same
    source commit/tag and run/attempt, the installed database schema and exactly
    these `intended_operations`: `prepare-dreamina-video-supplement`,
-   `dispatch-dreamina-video-supplement`, `poll-dreamina-video-supplement`. Check
+   `dispatch-dreamina-video-supplement`, `poll-dreamina-video-supplement`,
+   `recover-dreamina-video-supplement-acceptance`. Check
    `factoryctl` size and SHA-256 against the attested manifest after extraction.
 3. Copy only those verified files into a new root-owned protected operator
    directory, separate from `current`. Recheck their bytes on the production

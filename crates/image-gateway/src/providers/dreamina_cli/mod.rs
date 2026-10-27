@@ -32,6 +32,7 @@ use crate::{
 
 mod credential_environment;
 mod poll;
+mod submit_recovery;
 pub(crate) use poll::pending_progress;
 
 pub use credential_environment::{
@@ -264,6 +265,25 @@ impl GatedCliSubmitCodec for DreaminaCliSubmitCodecV1 {
             return command_to_gated(&spec, self.policy.executable_sha256());
         }
         self.project_request(&request, workspace)
+    }
+
+    fn normal_command(
+        &self,
+        intent: &ProviderSubmitIntent,
+        context: &ProviderExecutionContext,
+        command: &SingleOutputCommand<Self::Payload>,
+        workspace: &WorkingDirectory,
+    ) -> Result<GatedCliCommand, ProviderFailure> {
+        let projected = self.command(intent, context, command, workspace)?;
+        submit_recovery::project_normal_material_paths(projected, command, workspace)
+    }
+
+    async fn recover_receipt(
+        &self,
+        call: &crate::provider_tasks::ProviderSubmitDriverCall<Self::Payload>,
+        evidence: std::sync::Arc<crate::provider_tasks::GatedCliReceiptEvidence>,
+    ) -> Result<Option<PendingOperation>, ProviderFailure> {
+        submit_recovery::recover(self, call, evidence).await
     }
 
     fn decode_receipt(
@@ -648,6 +668,55 @@ mod tests {
         assert!(rendered.contains("HOME"));
         assert!(rendered.contains("TMPDIR"));
         assert!(rendered.contains(&fixture.executable_sha256));
+    }
+
+    #[test]
+    fn normal_material_projection_does_not_change_operator_historical_argv() {
+        let fixture = Fixture::new();
+        let workspace = fixture.attempt_workspace();
+        let bytes = b"frozen synthetic media";
+        let path = workspace.path().join("input-0.png");
+        fs::write(&path, bytes).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let request = image_provider_dreamina_cli::MultimodalToVideoRequestV1::new(
+            vec![
+                image_provider_dreamina_cli::StagedImageV1::new(
+                    "input-0.png",
+                    hex::encode(Sha256::digest(bytes)),
+                    1600,
+                    900,
+                )
+                .unwrap(),
+            ],
+            vec![],
+            vec![],
+            "--audio",
+            VideoModelVersion::Seedance2_0,
+            VideoRatio::R16x9,
+            6,
+            VideoResolution::P720,
+        )
+        .unwrap();
+        let request: DreaminaSubmitRequestV1 = request.into();
+        let command = SingleOutputCommand::new(
+            OutputSlot::new(0, 1).unwrap(),
+            DreaminaSubmitPayloadV1::new(&"a".repeat(64), request.clone()).unwrap(),
+        )
+        .unwrap();
+        let operator = fixture.codec.project_request(&request, &workspace).unwrap();
+        let normal =
+            submit_recovery::project_normal_material_paths(operator.clone(), &command, &workspace)
+                .unwrap();
+        assert_eq!(operator.arguments()[2], "input-0.png");
+        assert_eq!(normal.arguments()[2], path.to_str().unwrap());
+        assert_eq!(
+            fixture.codec.project_request(&request, &workspace).unwrap(),
+            operator
+        );
+        // Projection still checks frozen SHA; absolute transport paths cannot
+        // admit another input's bytes even when all prompt parameters match.
+        fs::write(&path, b"different synthetic media").unwrap();
+        assert!(fixture.codec.project_request(&request, &workspace).is_err());
     }
 
     #[test]

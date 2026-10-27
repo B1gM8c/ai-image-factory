@@ -9,8 +9,8 @@ use std::{
 };
 
 use gpt_image_2_gateway::{
-    GatedCliBinding, GatedCliCommand, GatedCliObservation, GatedCliSubmission, GatedCliSubmitCodec,
-    GatedCliSubmitDriver,
+    GatedCliBinding, GatedCliCommand, GatedCliObservation, GatedCliReceiptEvidence,
+    GatedCliSubmission, GatedCliSubmitCodec, GatedCliSubmitDriver, ProviderSubmitDriverCall,
 };
 
 use super::*;
@@ -786,7 +786,8 @@ async fn outcome_unknown_recovery_observes_without_relaunching_cli() -> TestResu
         require(
             matches!(first, ProviderSubmitOutcome::AwaitingEvidence(ref intent)
                 if intent.state == ProviderSubmitIntentState::OutcomeUnknown)
-                && fs::read(&side_effect).map_err(debug_error)? == b"invoked",
+                && fs::read(&side_effect).map_err(debug_error)? == b"invoked"
+                && workspace_attempt_count(&codec.workspace_root)? == 1,
             format!("invalid receipt did not create one unknown attempt: {first:?}"),
         )?;
 
@@ -833,6 +834,63 @@ async fn outcome_unknown_recovery_observes_without_relaunching_cli() -> TestResu
     result
 }
 
+#[tokio::test]
+async fn receipt_recovery_pending_keeps_dispatch_released_and_queries_without_second_generation()
+-> TestResult {
+    receipt_recovery_lifecycle(false).await
+}
+
+#[tokio::test]
+async fn accepted_recovery_evidence_survives_crash_after_staging_cleanup() -> TestResult {
+    receipt_recovery_lifecycle(true).await
+}
+
+async fn receipt_recovery_lifecycle(cleanup_before_replay: bool) -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let lease = seed_running_submission_with_lease(&database.pool, "gated-receipt-source-worker", 60_000).await?;
+        let journal = tempfile::tempdir().map_err(debug_error)?;
+        let journal_root = journal.path().join("remote-submit");
+        let side_effect = journal.path().join("provider-invoked");
+        let codec = FakeGatedSubmitCodec::new(journal.path(), &side_effect, "same-accepted-operation")?
+            .with_receipt("").with_receipt_recovery(cleanup_before_replay);
+        // Immutable per-test helper copy avoids a concurrent build replacing
+        // the executable between the process pin and spawn.
+        let runner = journal.path().join("remote-submit-runner");
+        fs::copy(env!("CARGO_BIN_EXE_remote-submit-runner"), &runner).map_err(debug_error)?;
+        fs::set_permissions(&runner, fs::Permissions::from_mode(0o500)).map_err(debug_error)?;
+        let runner_sha256 = file_sha256(&runner)?;
+        let orchestrator = ProviderSubmitOrchestrator::new(
+            PostgresProviderTaskStore::new(database.pool.clone()),
+            gated_submit_driver(codec.clone(), &runner, &runner_sha256)?, 60_000, &journal_root,
+        ).map_err(debug_error)?;
+        let first = orchestrator.submit(gated_orchestrator_work(&lease)?).await.map_err(debug_error)?;
+        require(matches!(first, ProviderSubmitOutcome::AwaitingEvidence(ref intent) if intent.state != ProviderSubmitIntentState::OutcomeUnknown), format!("receipt pending was sealed as Unknown: {first:?}"))?;
+        require(workspace_attempt_count(&codec.workspace_root)? == 1, "pending receipt deleted original staging")?;
+        let entry = journal_root.join(lease.submission_id.simple().to_string());
+        require(!entry.join("terminal.json").exists(), "pending receipt sealed terminal journal")?;
+        let terminal_before = fs::read(entry.join("process-terminal.json")).map_err(debug_error)?;
+        let value: serde_json::Value = serde_json::from_slice(&terminal_before).map_err(debug_error)?;
+        require(value["stdout_base64"] == json!(""), "fixture submit stdout was not empty")?;
+        if cleanup_before_replay {
+            for item in fs::read_dir(&codec.workspace_root).map_err(debug_error)? {
+                let path = item.map_err(debug_error)?.path();
+                if path.is_dir() { fs::remove_dir_all(path).map_err(debug_error)?; }
+            }
+        }
+        // Re-enter the same released journal without another process launch.
+        let second = orchestrator.submit(gated_orchestrator_work(&lease)?).await.map_err(debug_error)?;
+        require(matches!(second, ProviderSubmitOutcome::Attached(ref task) if task.remote_operation_id == "same-accepted-operation"), format!("same-ID recovery did not attach: {second:?}"))?;
+        require(fs::read(&side_effect).map_err(debug_error)? == b"invoked" && codec.recovery_calls.load(Ordering::SeqCst) == 2, "receipt recovery generated twice or skipped original evidence")?;
+        require(fs::read(entry.join("process-terminal.json")).map_err(debug_error)? == terminal_before && workspace_attempt_count(&codec.workspace_root)? == 0, "original streams changed or accepted staging was retained")?;
+        Ok(())
+    }.await;
+    database.cleanup().await?;
+    result
+}
+
 #[derive(Clone)]
 struct FakeGatedSubmitCodec {
     workspace_root: PathBuf,
@@ -843,6 +901,8 @@ struct FakeGatedSubmitCodec {
     receipt: String,
     stderr: String,
     workspace_mismatch: bool,
+    recovery_mode: u8,
+    recovery_calls: Arc<AtomicUsize>,
 }
 
 impl FakeGatedSubmitCodec {
@@ -867,7 +927,14 @@ impl FakeGatedSubmitCodec {
             receipt: "gated-receipt".to_owned(),
             stderr: String::new(),
             workspace_mismatch: false,
+            recovery_mode: 0,
+            recovery_calls: Arc::new(AtomicUsize::new(0)),
         })
+    }
+
+    fn with_receipt_recovery(mut self, accepted_before_interrupt: bool) -> Self {
+        self.recovery_mode = if accepted_before_interrupt { 2 } else { 1 };
+        self
     }
 
     fn with_projection_delay(mut self, projection_delay: Duration) -> Self {
@@ -944,6 +1011,55 @@ impl GatedCliSubmitCodec for FakeGatedSubmitCodec {
         } else {
             self.gated_command(workspace)
         }
+    }
+
+    async fn recover_receipt(
+        &self,
+        call: &ProviderSubmitDriverCall<Self::Payload>,
+        evidence: Arc<GatedCliReceiptEvidence>,
+    ) -> Result<Option<PendingOperation>, ProviderFailure> {
+        if self.recovery_mode == 0 {
+            return Ok(None);
+        }
+        let count = self.recovery_calls.fetch_add(1, Ordering::SeqCst);
+        let marker = "process-receipt-recovery-fixture-accepted.json";
+        let bytes = serde_json::to_vec(&json!({
+            "gate_request_sha256": evidence.request_sha256(),
+            "remote_operation_id": self.operation_id,
+        }))
+        .unwrap();
+        if self.recovery_mode == 2 || count > 0 {
+            evidence.publish(marker, &bytes).map_err(|_| {
+                fake_provider_failure(
+                    "fixture_evidence_invalid",
+                    EffectCertainty::UnknownRemoteEffect,
+                )
+            })?;
+        }
+        if count == 0 {
+            return Err(fake_provider_failure(
+                "provider_submit_receipt_recovery_pending",
+                EffectCertainty::UnknownRemoteEffect,
+            ));
+        }
+        if evidence
+            .read(marker, 4096)
+            .map_err(|_| {
+                fake_provider_failure(
+                    "fixture_evidence_invalid",
+                    EffectCertainty::UnknownRemoteEffect,
+                )
+            })?
+            .as_deref()
+            != Some(bytes.as_slice())
+        {
+            return Err(fake_provider_failure(
+                "fixture_evidence_invalid",
+                EffectCertainty::UnknownRemoteEffect,
+            ));
+        }
+        self.decode_receipt(call.intent(), call.command(), b"gated-receipt")
+            .map(Some)
     }
 
     fn decode_receipt(

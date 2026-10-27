@@ -372,6 +372,18 @@ where
                 }
                 self.record_artifact(&renewed, publication).await?
             }
+            Err(failure) if retry_unpublished_staging(&failure) => {
+                if sink.discard_unpublished_for_retry().is_err() {
+                    self.record_uncertain(&renewed, "provider_additional_image_contract")
+                        .await?
+                } else {
+                    self.record_waiting(
+                        &renewed,
+                        retry_poll_after(&failure).expect("retry was checked"),
+                    )
+                    .await?
+                }
+            }
             result if sink.is_pristine() => {
                 let pristine = ControlledProviderArtifactSink::new(
                     &self.stagers,
@@ -734,7 +746,12 @@ where
                 self.record_canceled(lease, "provider_canceled").await
             }
             Err(failure) => {
-                if sink.into_pristine().is_err() {
+                let pristine = if retry_unpublished_staging(&failure) {
+                    sink.discard_unpublished_for_retry()
+                } else {
+                    sink.into_pristine()
+                };
+                if pristine.is_err() {
                     return self
                         .record_uncertain(lease, "provider_poll_artifact_contract")
                         .await;
@@ -899,6 +916,15 @@ fn retry_poll_after(failure: &ProviderFailure) -> Option<i64> {
                 .unwrap_or(DEFAULT_BACKOFF_POLL_AFTER_MS),
         )),
     }
+}
+
+fn retry_unpublished_staging(failure: &ProviderFailure) -> bool {
+    failure.class() == ProviderFailureClass::Transient
+        && failure.effect() == EffectCertainty::NoRemoteEffect
+        && matches!(
+            failure.retry(),
+            RetryDirective::Backoff | RetryDirective::SafeImmediate
+        )
 }
 
 fn verified_terminal_failure(failure: &ProviderFailure) -> bool {

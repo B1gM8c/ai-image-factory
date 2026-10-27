@@ -23,6 +23,7 @@ pub(crate) use postgres::lock_dreamina_submit_credentials;
 
 const MAX_PROVIDER_RUNTIME_LANES: usize = 1_024;
 const SUBMIT_CREDENTIAL_BLOCKED: &str = "provider_submit_credential_blocked";
+pub(crate) const SUBMIT_RECEIPT_RECOVERY_PENDING: &str = "provider_submit_receipt_recovery_pending";
 
 pub use account_home::{ProviderAccountHomeCapability, ProviderAccountHomeCapabilityError};
 
@@ -52,10 +53,11 @@ pub use remote_submit::{
     DreaminaComplianceRejectionResolution, DreaminaComplianceRejectionResolutionRequest,
     DreaminaVideoSupplementOperatorReceipt, GatedCliBinding, GatedCliCommand, GatedCliInputFile,
     GatedCliObservation, GatedCliPreparedSubmission, GatedCliProcessError, GatedCliProcessOutcome,
-    GatedCliProcessTerminal, GatedCliReady, GatedCliSubmission, GatedCliSubmitCodec,
-    GatedCliSubmitDriver, dispatch_dreamina_video_supplement_operator,
+    GatedCliProcessTerminal, GatedCliReady, GatedCliReceiptEvidence, GatedCliSubmission,
+    GatedCliSubmitCodec, GatedCliSubmitDriver, dispatch_dreamina_video_supplement_operator,
     poll_dreamina_video_supplement_operator, prepare_dreamina_video_supplement_operator,
-    prepare_dreamina_video_supplement_successor_operator, resolve_dreamina_compliance_rejection,
+    prepare_dreamina_video_supplement_successor_operator,
+    recover_dreamina_video_supplement_acceptance_operator, resolve_dreamina_compliance_rejection,
     run_remote_submit_gate, run_remote_submit_runner,
 };
 pub use runtime_profile::{ProviderRuntimeProfile, ProviderRuntimeProfileStore};

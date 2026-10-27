@@ -125,10 +125,19 @@ impl ProviderArtifactStager for FilesystemProviderArtifactStager {
             .open_reader(self.byte_size)
             .await
             .map_err(map_stage_error)?;
-        let actual_media_type = tokio::task::spawn_blocking(move || media_type_from_file(reader))
-            .await
-            .map_err(|_| storage_error("provider_artifact_validation_unavailable"))?
-            .map_err(|_| invalid_artifact("provider_artifact_media_invalid"))?;
+        let video = metadata.media_type == "video/mp4";
+        let actual_media_type = tokio::task::spawn_blocking(move || {
+            if video {
+                crate::media_inputs::probe_video_file(reader)
+                    .map(|metadata| metadata.media_type())
+                    .map_err(|_| ())
+            } else {
+                media_type_from_file(reader).map_err(|_| ())
+            }
+        })
+        .await
+        .map_err(|_| storage_error("provider_artifact_validation_unavailable"))?
+        .map_err(|_| invalid_artifact("provider_artifact_media_invalid"))?;
         if metadata.media_type != actual_media_type {
             return Err(invalid_artifact("provider_artifact_media_mismatch"));
         }
@@ -227,6 +236,47 @@ mod tests {
             &<[u8; 32]>::from(Sha256::digest(&bytes))
         );
         assert_eq!(fs::read(fixture.object_path()).unwrap(), bytes);
+        assert!(staging_entries(fixture.staging_path()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn video_finalize_probes_the_real_file_and_commits_an_immutable_mp4() {
+        let fixture = fixture();
+        let bytes = include_bytes!("../media_inputs/fixtures/blue-audio-60s.mp4");
+        let staged = fixture.finalize(1, bytes, "video/mp4").await.unwrap();
+        assert_eq!(staged.manifest().media_type(), "video/mp4");
+        assert_eq!(staged.manifest().byte_size(), bytes.len() as u64);
+        assert_eq!(
+            staged.manifest().sha256(),
+            &<[u8; 32]>::from(Sha256::digest(bytes))
+        );
+        assert_eq!(fs::read(fixture.object_path()).unwrap(), bytes);
+        assert!(staging_entries(fixture.staging_path()).is_empty());
+        // Duration constraints for reference inputs must not reject generated output.
+        fixture.finalize(2, bytes, "video/mp4").await.unwrap();
+        let error = expect_sink_error(
+            fixture
+                .finalize(
+                    3,
+                    include_bytes!("../media_inputs/fixtures/blue.mp4"),
+                    "video/mp4",
+                )
+                .await,
+        );
+        assert_eq!(error.kind(), ArtifactSinkErrorKind::InvalidArtifact);
+        assert_eq!(fs::read(fixture.object_path()).unwrap(), bytes);
+    }
+
+    #[tokio::test]
+    async fn mp4_signature_without_valid_tracks_never_becomes_deliverable() {
+        let fixture = fixture();
+        let error = expect_sink_error(
+            fixture
+                .finalize(1, b"\0\0\0\x18ftypisom\0\0\0\0isommp42", "video/mp4")
+                .await,
+        );
+        assert_eq!(error.kind(), ArtifactSinkErrorKind::InvalidArtifact);
+        assert!(!fixture.object_path().exists());
         assert!(staging_entries(fixture.staging_path()).is_empty());
     }
 

@@ -83,8 +83,19 @@ jobs:
       - name: Verify supplement budget, one-shot dispatch and legacy poll
         run: >-
           cargo test --release --locked --package gpt-image-2-gateway
-          --lib provider_tasks::remote_submit::video_supplement::tests
+          --lib provider_tasks::remote_submit::video_supplement::
           -- --test-threads=1
+
+      - name: Verify recovered acceptance concurrency and original hold isolation
+        run: >-
+          cargo test --release --locked --package gpt-image-2-gateway
+          --test postgres_executor dreamina_video_supplementation::recovered_acceptance::
+          -- --test-threads=1
+
+      - name: Verify recovery operator argument contract
+        run: >-
+          cargo test --release --locked --package gpt-image-2-gateway
+          --bin factoryctl video_supplement_acceptance_recovery
 
       - name: Build only the operator tool
         run: >-
@@ -103,7 +114,7 @@ jobs:
           with binary.open('rb') as stream:
               digest = hashlib.file_digest(stream, 'sha256').hexdigest()
           manifest = {
-              'schema_version': 2,
+              'schema_version': 3,
               'kind': 'operator_factoryctl_hotfix',
               'source_commit': os.environ['GITHUB_SHA'],
               'source_tag': os.environ['GITHUB_REF_NAME'],
@@ -115,6 +126,7 @@ jobs:
                   'prepare-dreamina-video-supplement',
                   'dispatch-dreamina-video-supplement',
                   'poll-dreamina-video-supplement',
+                  'recover-dreamina-video-supplement-acceptance',
               ],
               'binary': {'path': 'factoryctl', 'bytes': binary.stat().st_size,
                          'sha256': digest},
