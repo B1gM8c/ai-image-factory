@@ -1839,8 +1839,11 @@ async fn provider_poll_orchestrator_recovers_committed_authority_without_repoll(
             0,
         )
         .await?;
+        // Commit the authority before simulating a crashed lease; publication
+        // itself must not race a 100ms lease on a loaded database. Expiry is
+        // still observed below using the actual PostgreSQL lease deadline.
         let crashed_lease = store
-            .claim_due(&claim_scope(), "crashed-poller", 100)
+            .claim_due(&claim_scope(), "crashed-poller", 5_000)
             .await
             .map_err(debug_error)?
             .ok_or_else(|| "crash recovery task was not claimable".to_owned())?;
@@ -1852,10 +1855,16 @@ async fn provider_poll_orchestrator_recovers_committed_authority_without_repoll(
             bytes.len() as u64,
             "image/png",
         )?;
+        let publication_started_ms = database_now(&database.pool).await?;
         store
             .publish_artifact_authority(&crashed_lease, &authority)
             .await
-            .map_err(debug_error)?;
+            .map_err(|error| {
+                format!(
+                    "committed-authority fixture publication: {error:?}; database_now_ms={publication_started_ms}, poll_lease_expires_at_ms={}",
+                    crashed_lease.poll_lease_expires_at_ms,
+                )
+            })?;
         sleep_until_database_time(&database.pool, crashed_lease.poll_lease_expires_at_ms + 20)
             .await?;
 
@@ -2128,7 +2137,10 @@ async fn submit_service_resumes_unacknowledged_fresh_claim_without_reclaiming() 
             .first()
             .ok_or_else(|| "lost claim fixture was not prepared".to_owned())?;
         let command = submit_iteration_command("submit-service-lost-claim");
-        let mut config = submit_service_config(200);
+        // This checks same-epoch resume and unique attachment, not expiry.
+        // The frozen provider budget also covers journal fsync and database
+        // round trips before dispatch, as in the adjacent fresh-submit case.
+        let mut config = submit_service_config(30_000);
         config.executor_lease_ms = 30_000;
         config.recovery_lease_ms = 30_000;
         let claimed = executor_store
@@ -2178,6 +2190,19 @@ async fn submit_service_resumes_unacknowledged_fresh_claim_without_reclaiming() 
         .fetch_one(&database.pool)
         .await
         .map_err(debug_error)?;
+        let failure_code: Option<String> = sqlx::query_scalar(
+            "SELECT failure_error_code FROM provider_remote_submit_intents WHERE submission_id = $1",
+        )
+        .bind(submission.submission_id)
+        .fetch_one(&database.pool)
+        .await
+        .map_err(debug_error)?;
+        let failure_code = match failure_code.as_deref() {
+            None => "none",
+            Some("provider_submit_deadline_elapsed") => "provider_submit_deadline_elapsed",
+            Some("provider_submit_timeout") => "provider_submit_timeout",
+            Some(_) => "other",
+        };
         require(
             run == ProviderSubmitRun::FreshSubmitted
                 && provider.calls().submit == 1
@@ -2187,7 +2212,7 @@ async fn submit_service_resumes_unacknowledged_fresh_claim_without_reclaiming() 
                         claimed.executor_lease_epoch,
                         "attached".to_owned(),
                     ),
-            format!("lost fresh claim was not resumed exactly once: {run:?}/{durable:?}"),
+            format!("lost fresh claim was not resumed exactly once: {run:?}/{durable:?}; failure_code={failure_code}"),
         )
     }
     .await;
