@@ -6445,10 +6445,19 @@ async fn capacity_reconciliation_migration_rejects_incomplete_quarantine() -> Te
         return Ok(());
     };
     let result = async {
+        // Establish the valid legacy invocation before expiring its persisted deadline.
+        const SETUP_LEASE_MS: i64 = 30_000;
+        const PROVIDER_TIMEOUT_MS: i64 = 5_000;
         let executor =
-            seed_running_submission_with_lease(&database.pool, "capacity-drift", 5_000).await?;
-        seed_legacy_sending_submit(&database.pool, &executor, 40).await?;
-        tokio::time::sleep(Duration::from_millis(60)).await;
+            seed_running_submission_with_lease(&database.pool, "capacity-drift", SETUP_LEASE_MS)
+                .await?;
+        let deadline =
+            seed_legacy_sending_submit(&database.pool, &executor, PROVIDER_TIMEOUT_MS).await?;
+        require(
+            deadline < executor.executor_lease_expires_at_ms,
+            "incomplete quarantine fixture lease does not cover its provider deadline",
+        )?;
+        sleep_until_database_time(&database.pool, deadline + 20).await?;
         force_deadline_quarantine_v21(&database.pool, &executor).await?;
 
         sqlx::query(
