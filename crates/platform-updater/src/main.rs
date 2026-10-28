@@ -18,12 +18,14 @@ async fn main() -> Result<(), UpdaterError> {
         [] => updater.run().await,
         [operation] if operation == "prepare-candidate" => updater.prepare_candidate().await,
         [operation] if operation == "bootstrap-candidate" => updater.bootstrap_candidate().await,
+        [operation] if operation == "prepare-local" => updater.prepare_local().await,
+        [operation] if operation == "bootstrap-local" => updater.bootstrap_local().await,
         [operation] if operation == "recover-pending" => updater.recover_pending().await,
         [operation, command_id] if operation == "recover" => {
             updater.recover_command(command_id).await
         }
         _ => Err(UpdaterError::Config(
-            "usage: updated [version|prepare-candidate|bootstrap-candidate|recover-pending|recover COMMAND_ID]"
+            "usage: updated [version|prepare-candidate|bootstrap-candidate|prepare-local|bootstrap-local|recover-pending|recover COMMAND_ID]"
                 .to_string(),
         )),
     }

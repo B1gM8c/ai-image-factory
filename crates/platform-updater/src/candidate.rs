@@ -233,6 +233,9 @@ with zipfile.ZipFile(archive) as zipped:
     }
 
     pub(crate) fn source_receipt(&self, version: &str) -> Value {
+        if let Some(pin) = &self.config.local_bundle {
+            return pin.receipt();
+        }
         match &self.config.candidate {
             Some(pin) => json!({"latest_version": version, "source": "actions_candidate",
                 "immutable": false, "run_id": pin.run_id, "run_attempt": pin.run_attempt,
