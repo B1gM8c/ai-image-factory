@@ -10,6 +10,8 @@ use std::path::{Path, PathBuf};
 const URL: &str = "https://media.example.test/supplement%2Fvideo.mp4?token=A%2Bb";
 #[path = "dreamina_video_supplementation/manual_cancellation.rs"]
 mod manual_cancellation;
+#[path = "dreamina_video_supplementation/normal_archive.rs"]
+mod normal_archive;
 #[path = "dreamina_video_supplementation/populated_upgrade.rs"]
 mod populated_upgrade;
 #[path = "dreamina_video_supplementation/recovered_acceptance.rs"]

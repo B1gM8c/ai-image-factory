@@ -12,9 +12,10 @@ use gpt_image_2_gateway::{
     BlockedTerminalRequeueError, CodexExecutionProfileProvisioning, CodexProfileProvisioningError,
     DreaminaComplianceRejectionResolutionRequest, DreaminaImageSuccessResolutionRequest,
     DreaminaManualVideoCancellationRequest, DreaminaSupplementVideoCancellationRequest,
-    DreaminaVideoSuccessResolutionRequest, DreaminaVideoSupplementAuthorizationRequest,
-    ImageGatewayError, OperationalCredentialRefresher, PostgresExecutionSettlementStore,
-    PostgresExecutorTerminalStore, PostgresReconciliationStore, codex_auth_file_sha256,
+    DreaminaVideoArchiveResolutionRequest, DreaminaVideoSuccessResolutionRequest,
+    DreaminaVideoSupplementAuthorizationRequest, ImageGatewayError, OperationalCredentialRefresher,
+    PostgresExecutionSettlementStore, PostgresExecutorTerminalStore, PostgresReconciliationStore,
+    codex_auth_file_sha256,
     database::{
         DEFAULT_MAX_CONNECTIONS, connect_pool_with_schema, database_schema_from_env,
         database_url_from_env, run_migrations, verify_migrations,
@@ -29,7 +30,7 @@ use gpt_image_2_gateway::{
     provision_grok_video_execution_profile_replacement, reconcile_execution_profile_routes,
     reconcile_inline_customer_settlement, recover_dreamina_video_supplement_acceptance_operator,
     resolve_dreamina_compliance_rejection, resolve_dreamina_image_success,
-    resolve_dreamina_video_success,
+    resolve_dreamina_video_archive, resolve_dreamina_video_success,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -65,6 +66,10 @@ enum Command {
     ResolveDreaminaImageSuccess {
         evidence_root: PathBuf,
         request: DreaminaImageSuccessResolutionRequest,
+    },
+    ResolveDreaminaVideoArchive {
+        evidence_root: PathBuf,
+        request: DreaminaVideoArchiveResolutionRequest,
     },
     ResolveDreaminaVideoSuccess {
         evidence_root: PathBuf,
@@ -132,7 +137,7 @@ where
 {
     let mut args = args.into_iter();
     let command = args.next().ok_or_else(|| {
-        "missing command: expected `migrate`, `bootstrap-admin`, `provision-codex-profile`, `provision-codex-cli-edit-profile`, `provision-grok-profile`, `provision-grok-video-profile`, `provision-grok-video-v2-profile`, `provision-grok-image-profile-replacement`, `provision-grok-edit-profile-replacement`, `provision-grok-video-profile-replacement`, `reconcile-execution-profile-routes`, `reconcile-dreamina-profiles`, `reconcile-inline-customer-settlement`, `terminalize-unstarted-job`, `cancel-unlaunched-job`, `refresh-provider-quota`, `refresh-codex-credential`, `resolve-dreamina-compliance-rejection`, `resolve-dreamina-image-success`, `resolve-dreamina-video-success`, `confirm-dreamina-video-cancellation`, `confirm-dreamina-video-supplement-cancellation`, `prepare-dreamina-video-supplement`, `prepare-dreamina-video-supplement-successor`, `dispatch-dreamina-video-supplement`, `poll-dreamina-video-supplement`, `recover-dreamina-video-supplement-acceptance`, or `retry-blocked-terminal`"
+        "missing command: expected `migrate`, `bootstrap-admin`, `provision-codex-profile`, `provision-codex-cli-edit-profile`, `provision-grok-profile`, `provision-grok-video-profile`, `provision-grok-video-v2-profile`, `provision-grok-image-profile-replacement`, `provision-grok-edit-profile-replacement`, `provision-grok-video-profile-replacement`, `reconcile-execution-profile-routes`, `reconcile-dreamina-profiles`, `reconcile-inline-customer-settlement`, `terminalize-unstarted-job`, `cancel-unlaunched-job`, `refresh-provider-quota`, `refresh-codex-credential`, `resolve-dreamina-compliance-rejection`, `resolve-dreamina-image-success`, `resolve-dreamina-video-success`, `resolve-dreamina-video-archive`, `confirm-dreamina-video-cancellation`, `confirm-dreamina-video-supplement-cancellation`, `prepare-dreamina-video-supplement`, `prepare-dreamina-video-supplement-successor`, `dispatch-dreamina-video-supplement`, `poll-dreamina-video-supplement`, `recover-dreamina-video-supplement-acceptance`, or `retry-blocked-terminal`"
             .to_string()
     })?;
     let command = match command.as_ref() {
@@ -266,6 +271,35 @@ where
                     submission_id,
                     executor_execution_id,
                     reviewed_stdout_sha256,
+                    operator_reference,
+                },
+            }
+        }
+        "resolve-dreamina-video-archive" => {
+            let name = "resolve-dreamina-video-archive";
+            let mut identity = |field: &str| -> Result<Uuid, String> {
+                required_argument(&mut args, name, field)?
+                    .parse()
+                    .map_err(|_| format!("{name} requires a UUID {field}"))
+            };
+            let job_id = identity("job id")?;
+            let submission_id = identity("submission id")?;
+            let executor_execution_id = identity("executor execution id")?;
+            let reviewed_recovery_sha256 =
+                required_argument(&mut args, name, "reviewed recovery SHA-256")?;
+            let operator_reference = required_argument(&mut args, name, "operator reference")?;
+            let evidence_root = PathBuf::from(required_argument(
+                &mut args,
+                name,
+                "protected evidence directory",
+            )?);
+            Command::ResolveDreaminaVideoArchive {
+                evidence_root,
+                request: DreaminaVideoArchiveResolutionRequest {
+                    job_id,
+                    submission_id,
+                    executor_execution_id,
+                    reviewed_recovery_sha256,
                     operator_reference,
                 },
             }
@@ -528,7 +562,7 @@ where
         }
         value => {
             return Err(format!(
-                "unknown command `{value}`: expected `migrate`, `bootstrap-admin`, `provision-codex-profile`, `provision-codex-cli-edit-profile`, `provision-grok-profile`, `provision-grok-video-profile`, `provision-grok-video-v2-profile`, `provision-grok-image-profile-replacement`, `provision-grok-edit-profile-replacement`, `provision-grok-video-profile-replacement`, `reconcile-execution-profile-routes`, `reconcile-dreamina-profiles`, `reconcile-inline-customer-settlement`, `terminalize-unstarted-job`, `cancel-unlaunched-job`, `refresh-provider-quota`, `refresh-codex-credential`, `resolve-dreamina-compliance-rejection`, `resolve-dreamina-image-success`, `resolve-dreamina-video-success`, `confirm-dreamina-video-cancellation`, `confirm-dreamina-video-supplement-cancellation`, `prepare-dreamina-video-supplement`, `prepare-dreamina-video-supplement-successor`, `dispatch-dreamina-video-supplement`, `poll-dreamina-video-supplement`, `recover-dreamina-video-supplement-acceptance`, or `retry-blocked-terminal`"
+                "unknown command `{value}`: expected `migrate`, `bootstrap-admin`, `provision-codex-profile`, `provision-codex-cli-edit-profile`, `provision-grok-profile`, `provision-grok-video-profile`, `provision-grok-video-v2-profile`, `provision-grok-image-profile-replacement`, `provision-grok-edit-profile-replacement`, `provision-grok-video-profile-replacement`, `reconcile-execution-profile-routes`, `reconcile-dreamina-profiles`, `reconcile-inline-customer-settlement`, `terminalize-unstarted-job`, `cancel-unlaunched-job`, `refresh-provider-quota`, `refresh-codex-credential`, `resolve-dreamina-compliance-rejection`, `resolve-dreamina-image-success`, `resolve-dreamina-video-success`, `resolve-dreamina-video-archive`, `confirm-dreamina-video-cancellation`, `confirm-dreamina-video-supplement-cancellation`, `prepare-dreamina-video-supplement`, `prepare-dreamina-video-supplement-successor`, `dispatch-dreamina-video-supplement`, `poll-dreamina-video-supplement`, `recover-dreamina-video-supplement-acceptance`, or `retry-blocked-terminal`"
             ));
         }
     };
@@ -607,6 +641,7 @@ async fn main() -> Result<(), ImageGatewayError> {
         | Command::ReconcileInlineCustomerSettlement { .. }
         | Command::ResolveDreaminaComplianceRejection { .. }
         | Command::ResolveDreaminaImageSuccess { .. }
+        | Command::ResolveDreaminaVideoArchive { .. }
         | Command::ResolveDreaminaVideoSuccess { .. }
         | Command::ConfirmDreaminaVideoCancellation { .. }
         | Command::ConfirmDreaminaVideoSupplementCancellation { .. }
@@ -798,6 +833,23 @@ async fn main() -> Result<(), ImageGatewayError> {
             )?;
             let receipt =
                 resolve_dreamina_image_success(&pool, &blobs, &evidence_root, &request).await?;
+            println!(
+                "{}",
+                serde_json::to_string(&receipt).map_err(|_| ImageGatewayError::internal(
+                    "resolution receipt serialization failed"
+                ))?
+            );
+        }
+        Command::ResolveDreaminaVideoArchive {
+            evidence_root,
+            request,
+        } => {
+            verify_migrations(&pool).await?;
+            let blobs = gpt_image_2_gateway::FilesystemArtifactBlobStore::new(
+                gpt_image_2_gateway::artifacts::artifact_root_from_env()?,
+            )?;
+            let receipt =
+                resolve_dreamina_video_archive(&pool, &blobs, &evidence_root, &request).await?;
             println!(
                 "{}",
                 serde_json::to_string(&receipt).map_err(|_| ImageGatewayError::internal(
@@ -1510,6 +1562,41 @@ mod tests {
     }
 
     #[test]
+    fn video_archive_requires_original_identity_and_reviewed_private_bundle() {
+        let job = Uuid::new_v4().to_string();
+        let submission = Uuid::new_v4().to_string();
+        let execution = Uuid::new_v4().to_string();
+        let digest = "a".repeat(64);
+        let args = [
+            "resolve-dreamina-video-archive",
+            &job,
+            &submission,
+            &execution,
+            &digest,
+            "original-archive-ticket",
+            "/private/archive-evidence",
+        ];
+        let Command::ResolveDreaminaVideoArchive {
+            evidence_root,
+            request,
+        } = parse_command(args).unwrap()
+        else {
+            panic!("expected original archive recovery")
+        };
+        assert_eq!(request.job_id.to_string(), job);
+        assert_eq!(request.submission_id.to_string(), submission);
+        assert_eq!(request.executor_execution_id.to_string(), execution);
+        assert_eq!(request.reviewed_recovery_sha256, digest);
+        assert_eq!(evidence_root, PathBuf::from("/private/archive-evidence"));
+        for n in 1..args.len() {
+            assert!(parse_command(&args[..n]).is_err());
+        }
+        let mut extra = args.to_vec();
+        extra.push("retry");
+        assert!(parse_command(extra).is_err());
+    }
+
+    #[test]
     fn video_cancellation_confirmation_requires_original_identity_and_private_evidence() {
         let job = Uuid::new_v4().to_string();
         let submission = Uuid::new_v4().to_string();
@@ -1922,7 +2009,7 @@ mod tests {
     fn rejects_missing_command() {
         assert_eq!(
             parse_command([] as [&str; 0]),
-            Err("missing command: expected `migrate`, `bootstrap-admin`, `provision-codex-profile`, `provision-codex-cli-edit-profile`, `provision-grok-profile`, `provision-grok-video-profile`, `provision-grok-video-v2-profile`, `provision-grok-image-profile-replacement`, `provision-grok-edit-profile-replacement`, `provision-grok-video-profile-replacement`, `reconcile-execution-profile-routes`, `reconcile-dreamina-profiles`, `reconcile-inline-customer-settlement`, `terminalize-unstarted-job`, `cancel-unlaunched-job`, `refresh-provider-quota`, `refresh-codex-credential`, `resolve-dreamina-compliance-rejection`, `resolve-dreamina-image-success`, `resolve-dreamina-video-success`, `confirm-dreamina-video-cancellation`, `confirm-dreamina-video-supplement-cancellation`, `prepare-dreamina-video-supplement`, `prepare-dreamina-video-supplement-successor`, `dispatch-dreamina-video-supplement`, `poll-dreamina-video-supplement`, `recover-dreamina-video-supplement-acceptance`, or `retry-blocked-terminal`".to_string())
+            Err("missing command: expected `migrate`, `bootstrap-admin`, `provision-codex-profile`, `provision-codex-cli-edit-profile`, `provision-grok-profile`, `provision-grok-video-profile`, `provision-grok-video-v2-profile`, `provision-grok-image-profile-replacement`, `provision-grok-edit-profile-replacement`, `provision-grok-video-profile-replacement`, `reconcile-execution-profile-routes`, `reconcile-dreamina-profiles`, `reconcile-inline-customer-settlement`, `terminalize-unstarted-job`, `cancel-unlaunched-job`, `refresh-provider-quota`, `refresh-codex-credential`, `resolve-dreamina-compliance-rejection`, `resolve-dreamina-image-success`, `resolve-dreamina-video-success`, `resolve-dreamina-video-archive`, `confirm-dreamina-video-cancellation`, `confirm-dreamina-video-supplement-cancellation`, `prepare-dreamina-video-supplement`, `prepare-dreamina-video-supplement-successor`, `dispatch-dreamina-video-supplement`, `poll-dreamina-video-supplement`, `recover-dreamina-video-supplement-acceptance`, or `retry-blocked-terminal`".to_string())
         );
     }
 
@@ -1931,7 +2018,7 @@ mod tests {
         assert_eq!(
             parse_command(["status"]),
             Err(
-                "unknown command `status`: expected `migrate`, `bootstrap-admin`, `provision-codex-profile`, `provision-codex-cli-edit-profile`, `provision-grok-profile`, `provision-grok-video-profile`, `provision-grok-video-v2-profile`, `provision-grok-image-profile-replacement`, `provision-grok-edit-profile-replacement`, `provision-grok-video-profile-replacement`, `reconcile-execution-profile-routes`, `reconcile-dreamina-profiles`, `reconcile-inline-customer-settlement`, `terminalize-unstarted-job`, `cancel-unlaunched-job`, `refresh-provider-quota`, `refresh-codex-credential`, `resolve-dreamina-compliance-rejection`, `resolve-dreamina-image-success`, `resolve-dreamina-video-success`, `confirm-dreamina-video-cancellation`, `confirm-dreamina-video-supplement-cancellation`, `prepare-dreamina-video-supplement`, `prepare-dreamina-video-supplement-successor`, `dispatch-dreamina-video-supplement`, `poll-dreamina-video-supplement`, `recover-dreamina-video-supplement-acceptance`, or `retry-blocked-terminal`"
+                "unknown command `status`: expected `migrate`, `bootstrap-admin`, `provision-codex-profile`, `provision-codex-cli-edit-profile`, `provision-grok-profile`, `provision-grok-video-profile`, `provision-grok-video-v2-profile`, `provision-grok-image-profile-replacement`, `provision-grok-edit-profile-replacement`, `provision-grok-video-profile-replacement`, `reconcile-execution-profile-routes`, `reconcile-dreamina-profiles`, `reconcile-inline-customer-settlement`, `terminalize-unstarted-job`, `cancel-unlaunched-job`, `refresh-provider-quota`, `refresh-codex-credential`, `resolve-dreamina-compliance-rejection`, `resolve-dreamina-image-success`, `resolve-dreamina-video-success`, `resolve-dreamina-video-archive`, `confirm-dreamina-video-cancellation`, `confirm-dreamina-video-supplement-cancellation`, `prepare-dreamina-video-supplement`, `prepare-dreamina-video-supplement-successor`, `dispatch-dreamina-video-supplement`, `poll-dreamina-video-supplement`, `recover-dreamina-video-supplement-acceptance`, or `retry-blocked-terminal`"
                     .to_string()
             )
         );

@@ -19,6 +19,7 @@ mod remote_submit;
 mod runtime_profile;
 mod submit;
 
+pub(crate) use capacity::release_operator_normal_archive_capacity;
 pub(crate) use postgres::lock_dreamina_submit_credentials;
 
 const MAX_PROVIDER_RUNTIME_LANES: usize = 1_024;

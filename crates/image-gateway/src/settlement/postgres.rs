@@ -339,6 +339,7 @@ impl ExecutionSettlementStore for PostgresExecutionSettlementStore {
              AND j.provider_id = 'dreamina-cli' AND j.state = 'succeeded'
             LEFT JOIN dreamina_operator_video_success_resolutions operator_video
               ON operator_video.job_id = j.job_id
+             AND operator_video.evidence_mode = 'legacy_poll_v1'
              AND operator_video.submission_id = progress_submission.submission_id
              AND operator_video.executor_execution_id = progress_submission.executor_execution_id
              AND operator_video.output_id = progress_output.output_id
@@ -470,6 +471,7 @@ impl ExecutionSettlementStore for PostgresExecutionSettlementStore {
                  AND j.provider_id = 'dreamina-cli' AND j.state = 'succeeded'
                 LEFT JOIN dreamina_operator_video_success_resolutions operator_video
                   ON operator_video.job_id = j.job_id
+                 AND operator_video.evidence_mode = 'legacy_poll_v1'
                  AND operator_video.submission_id = progress_submission.submission_id
                  AND operator_video.executor_execution_id = progress_submission.executor_execution_id
                  AND operator_video.output_id = progress_output.output_id
@@ -662,6 +664,7 @@ impl ExecutionSettlementStore for PostgresExecutionSettlementStore {
                  AND j.provider_id = 'dreamina-cli' AND j.state = 'succeeded'
                 LEFT JOIN dreamina_operator_video_success_resolutions operator_video
                   ON operator_video.job_id = j.job_id
+                 AND operator_video.evidence_mode = 'legacy_poll_v1'
                  AND operator_video.submission_id = progress_submission.submission_id
                  AND operator_video.executor_execution_id = progress_submission.executor_execution_id
                  AND operator_video.output_id = progress_output.output_id

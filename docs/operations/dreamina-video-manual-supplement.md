@@ -117,6 +117,50 @@ settlement checks. Verify the consumer's original task ID, one original debit
 and actual downloaded bytes after publication. A completed import is idempotent;
 it does not authorize a second dispatch or an additional customer charge.
 
+## Recover the original normal-submit video archive
+
+A normal submit with empty CLI output and a closed submit deadline has no
+supplement authorization. Use its original query and downloaded MP4 only after
+reviewing the original journal, account trace, command and frozen quote:
+
+```text
+factoryctl resolve-dreamina-video-archive \
+  JOB_ID ORIGINAL_SUBMISSION_ID ORIGINAL_EXECUTION_ID \
+  EXPECTED_REVIEW_JSON_SHA256 OPERATOR_REFERENCE PRIVATE_BUNDLE_ROOT
+```
+
+This path requires migration 157 and the matching gateway code. Deploying only
+the operator is insufficient: the gateway must project the new archive mode as
+a canonical artifact rather than also returning the historical CDN URL. The
+current recovery scope is one 10-second, 720p `multimodal2video` original whose
+submit intent is `deadline_quarantined` with `dreamina_submit_receipt_invalid`.
+It does not create an acceptance receipt or a provider task, or call Dreamina.
+
+The private bundle contains the untouched `command.bin`, `spec.json`,
+`process-request.json`, `process-terminal.json`, `source-account-log.bin`,
+`query-stdout.json`, `query-stderr.bin`, `execution-audit.json`, the reviewed
+`capture-query-only.py`, `original-video.mp4`, `archive-audit.json`, and
+`review.json`. The review freezes file hashes, the original job/submission/
+execution/account/tenant, both distinct command hash namespaces, execution
+binding, quote, native ID, source trace and line hashes, original execution
+interval, account home hash and operator reference. Never reuse a different
+order's evidence or modify an original gate to invent acceptance.
+
+The loader validates the positive same-ID/same-prompt query, retrieval audit and
+original MP4 before opening a business transaction. The transaction locks the
+original job and funding, rejects competing authority or live capacity leases,
+publishes the exact archive, closes capacity using an audited positive terminal
+observation, and settles the original quote once. Original executor, receipt,
+intent and deadline evidence stay unchanged. An exact replay returns the first
+resolution; conflicting evidence fails. The original archive is retained even
+when validation or the transaction fails. Related Dreamina native-authority
+writes require READ COMMITTED so a waiter observes the shared identity-lock
+winner; normal polling updates do not acquire that new lock.
+
+Verify the normal scoped file download bytes and SHA-256, the original single
+charge, and downstream delivery. Do not substitute a new generation, force a
+refund, or edit database state when evidence is rejected.
+
 ## Use an independently attested operator tool
 
 A standalone operator hotfix does not require changing `current` or restarting

@@ -27,8 +27,9 @@ pub use postgres::manual_video_cancellation::{
 };
 pub use postgres::supplement_video_cancellation::DreaminaSupplementVideoCancellationRequest;
 pub use postgres::video_success_reconciliation::{
+    DreaminaVideoArchiveResolution, DreaminaVideoArchiveResolutionRequest,
     DreaminaVideoSuccessResolution, DreaminaVideoSuccessResolutionRequest,
-    resolve_dreamina_video_success,
+    resolve_dreamina_video_archive, resolve_dreamina_video_success,
 };
 
 pub use postgres::video_supplementation::{

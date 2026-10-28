@@ -23,7 +23,12 @@ use crate::{
     },
 };
 
+mod archive;
 mod evidence;
+pub use archive::{
+    DreaminaVideoArchiveResolution, DreaminaVideoArchiveResolutionRequest,
+    resolve_dreamina_video_archive,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DreaminaVideoSuccessResolutionRequest {
@@ -62,6 +67,7 @@ struct LockedJob {
     operation: String,
     work_item_id: Uuid,
     attempt_execution_id: Uuid,
+    lease_epoch: i64,
     output_id: Uuid,
     provider_account_id: Uuid,
     reservation_id: Uuid,
@@ -158,7 +164,7 @@ pub async fn resolve_dreamina_video_success(
     }
     let row: LockedJob = sqlx::query_as(
         r#"SELECT job.tenant_id, job.request_id, job.operation, work.work_item_id,
-          attempt.execution_id AS attempt_execution_id, output.output_id,
+          attempt.execution_id AS attempt_execution_id, attempt.lease_epoch, output.output_id,
           submission.provider_account_id, quota.reservation_id, receipt.receipt_id AS original_receipt_id,
           hold.hold_id, submission.command_hash, payload.command_schema, payload.command_json,
           intent.execution_binding_sha256, quote.quote_hash, quote.request_dimensions_json,

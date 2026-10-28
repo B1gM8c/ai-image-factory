@@ -213,13 +213,14 @@ pub use retention::{
 pub use settlement::{
     DreaminaImageSuccessResolution, DreaminaImageSuccessResolutionRequest,
     DreaminaManualVideoCancellationProof, DreaminaManualVideoCancellationRequest,
-    DreaminaSupplementVideoCancellationRequest, DreaminaVideoSuccessResolution,
+    DreaminaSupplementVideoCancellationRequest, DreaminaVideoArchiveResolution,
+    DreaminaVideoArchiveResolutionRequest, DreaminaVideoSuccessResolution,
     DreaminaVideoSuccessResolutionRequest, DreaminaVideoSupplementAcceptedRequest,
     DreaminaVideoSupplementAuthorizationRequest, DreaminaVideoSupplementPlan,
     DreaminaVideoSupplementPublishRequest, DreaminaVideoSupplementResolution,
     DreaminaVideoSupplementUncertainRequest, ExecutionSettlementStore, GenerationResultStatus,
     PostgresExecutionSettlementStore, resolve_dreamina_image_success,
-    resolve_dreamina_video_success,
+    resolve_dreamina_video_archive, resolve_dreamina_video_success,
 };
 pub use system_updates::{
     ApplySystemUpdateRequest, PostgresSystemUpdateService, SystemUpdateAction, SystemUpdateActor,
