@@ -247,6 +247,12 @@ BEGIN
         OR EXISTS (SELECT 1 FROM dreamina_operator_video_supplement_authorizations supplement
             WHERE supplement.provider_account_id = account_id
               AND supplement.remote_operation_id = resolution.remote_operation_id)
+        OR EXISTS (SELECT 1 FROM provider_remote_submit_intents intent
+            JOIN provider_submissions submission USING (submission_id, executor_execution_id)
+            WHERE intent.provider_id = 'dreamina-cli' AND intent.provider_account_id = account_id
+              AND submission.operation_id = 'videos.generations'
+              AND submission.completion_mode = 'remote_task'
+              AND intent.remote_operation_id = resolution.remote_operation_id)
     )) THEN
         RAISE EXCEPTION 'native video is already bound to another delivery authority';
     END IF;
@@ -378,7 +384,7 @@ CREATE CONSTRAINT TRIGGER operator_dreamina_video_success_capacity_check
 CREATE FUNCTION fence_normal_video_archive_native_claim() RETURNS TRIGGER AS $$
 BEGIN
     IF NEW.remote_operation_id IS NULL THEN RETURN NEW; END IF;
-    IF TG_TABLE_NAME = 'provider_remote_tasks' AND NOT EXISTS (
+    IF TG_TABLE_NAME IN ('provider_remote_tasks', 'provider_remote_submit_intents') AND NOT EXISTS (
         SELECT 1 FROM provider_submissions submission
         WHERE submission.submission_id = NEW.submission_id
           AND submission.executor_execution_id = NEW.executor_execution_id
@@ -406,6 +412,10 @@ $$ LANGUAGE plpgsql;
 CREATE TRIGGER normal_video_archive_native_task_fence
     BEFORE INSERT OR UPDATE OF remote_operation_id, provider_account_id, submission_id, executor_execution_id
     ON provider_remote_tasks
+    FOR EACH ROW EXECUTE FUNCTION fence_normal_video_archive_native_claim();
+CREATE TRIGGER normal_video_archive_native_intent_fence
+    BEFORE INSERT OR UPDATE OF remote_operation_id, provider_account_id, submission_id, executor_execution_id
+    ON provider_remote_submit_intents
     FOR EACH ROW EXECUTE FUNCTION fence_normal_video_archive_native_claim();
 CREATE TRIGGER normal_video_archive_native_supplement_fence
     BEFORE INSERT OR UPDATE OF remote_operation_id, provider_account_id, submission_id, executor_execution_id

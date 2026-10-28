@@ -501,7 +501,10 @@ async fn normal_archive_preserves_confirmed_cancellation_and_unique_release() ->
     result.and(cleanup)
 }
 
-async fn normal_attach_request(pool: &PgPool, native: &str) -> TestResult<RemoteTaskAttach> {
+async fn normal_native_request(
+    pool: &PgPool,
+    native: &str,
+) -> TestResult<(RemoteTaskSubmitReceipt, RemoteTaskAttach)> {
     let work = seed_dreamina_video_generation_lease_for_profile(
         pool,
         "native-identity-worker",
@@ -579,20 +582,17 @@ async fn normal_attach_request(pool: &PgPool, native: &str) -> TestResult<Remote
         .map_err(debug_error)?
         .ok_or("missing normal intent")?
         .execution_binding_sha256;
-    tasks
-        .record_submit_receipt(&RemoteTaskSubmitReceipt {
-            submission_id: lease.submission_id,
-            executor_execution_id: lease.executor_execution_id,
-            executor_owner: lease.executor_owner.clone(),
-            executor_lease_epoch: lease.executor_lease_epoch,
-            remote_operation_id: native.into(),
-            provider_request_id: None,
-            event_identity: "normal-native-accepted".into(),
-            execution_binding_sha256: binding.clone(),
-        })
-        .await
-        .map_err(debug_error)?;
-    Ok(RemoteTaskAttach {
+    let receipt = RemoteTaskSubmitReceipt {
+        submission_id: lease.submission_id,
+        executor_execution_id: lease.executor_execution_id,
+        executor_owner: lease.executor_owner.clone(),
+        executor_lease_epoch: lease.executor_lease_epoch,
+        remote_operation_id: native.into(),
+        provider_request_id: None,
+        event_identity: "normal-native-accepted".into(),
+        execution_binding_sha256: binding.clone(),
+    };
+    let attach = RemoteTaskAttach {
         submission_id: lease.submission_id,
         executor_execution_id: lease.executor_execution_id,
         executor_owner: lease.executor_owner,
@@ -603,7 +603,8 @@ async fn normal_attach_request(pool: &PgPool, native: &str) -> TestResult<Remote
         execution_binding_sha256: binding,
         poll_after_ms: 0,
         recovery_fence: None,
-    })
+    };
+    Ok((receipt, attach))
 }
 
 async fn wait_native_waiters(pool: &PgPool, key: &str, expected: i64) -> TestResult {
@@ -629,14 +630,18 @@ async fn native_authority_race(archive_first: bool) -> TestResult {
         let native=review["remote_operation_id"].as_str().ok_or("missing native")?.to_string();
         use gpt_image_2_gateway::billing_control::{BillingAccountControlService,BillingControlActor,PostgresBillingAccountControlService,UpdateBillingAccountLimitRequest};
         PostgresBillingAccountControlService::new(db.pool.clone()).update_limit("executord-process-smoke","USD",BillingControlActor{user_id:Uuid::new_v4(),session_id:Uuid::new_v4()},UpdateBillingAccountLimitRequest{credit_limit_micros:"2000000".into(),expected_control_version:"1".into(),reason:"Offline two-original native authority race".into()}).await.map_err(debug_error)?;
-        let attach=normal_attach_request(&db.pool,&native).await?;
+        let (receipt,attach)=normal_native_request(&db.pool,&native).await?;
         let key=format!("dreamina-video-success:{DREAMINA_ACCOUNT_ID}:{native}");
         let mut barrier=db.pool.begin().await.map_err(debug_error)?;
         sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))").bind(&key).execute(&mut *barrier).await.map_err(debug_error)?;
         let archive_pool=db.pool.clone();let root=fixture.root.clone();let archive_request=request.clone();
         let archive=move||tokio::spawn(async move {resolve_dreamina_video_archive(&archive_pool,&InMemoryArtifactBlobStore::default(),&root,&archive_request).await});
         let normal_pool=db.pool.clone();let normal_request=attach.clone();
-        let normal=move||tokio::spawn(async move {PostgresProviderTaskStore::new(normal_pool).attach(&normal_request).await});
+        let normal=move||tokio::spawn(async move {
+            let tasks=PostgresProviderTaskStore::new(normal_pool);
+            tasks.record_submit_receipt(&receipt).await?;
+            tasks.attach(&normal_request).await
+        });
         let (archive,normal)=if archive_first {
             let a=archive();wait_native_waiters(&db.pool,&key,1).await?;
             let n=normal();wait_native_waiters(&db.pool,&key,2).await?;(a,n)
@@ -649,8 +654,15 @@ async fn native_authority_race(archive_first: bool) -> TestResult {
         require(a.is_ok()==archive_first && n.is_ok()!=archive_first,format!("native authority race wrong winner: archive={a:?},normal={n:?}"))?;
         let counts:(i64,i64,i64)=sqlx::query_as("SELECT (SELECT count(*) FROM dreamina_operator_video_success_resolutions WHERE job_id=$1),(SELECT count(*) FROM provider_remote_tasks WHERE remote_operation_id=$2),(SELECT count(*) FROM ledger_transactions WHERE source_job_id=$1)").bind(request.job_id).bind(&native).fetch_one(&db.pool).await.map_err(debug_error)?;
         require(counts==if archive_first{(1,0,1)}else{(0,1,0)},format!("race polluted loser state: {counts:?}"))?;
+        let native_intents:i64=sqlx::query_scalar("SELECT count(*) FROM provider_remote_submit_intents WHERE remote_operation_id=$1").bind(&native).fetch_one(&db.pool).await.map_err(debug_error)?;
+        require(native_intents==if archive_first{0}else{1},format!("losing writer persisted accepted intent: {native_intents}"))?;
         if !archive_first {
             assert_pending(&db.pool,request.job_id).await?;
+            let mut tx=db.pool.begin().await.map_err(debug_error)?;
+            sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ").execute(&mut *tx).await.map_err(debug_error)?;
+            let rejected=sqlx::query("UPDATE provider_remote_submit_intents SET remote_operation_id=remote_operation_id WHERE submission_id=$1").bind(attach.submission_id).execute(&mut *tx).await;
+            require(rejected.as_ref().is_err_and(|error|error.to_string().contains("requires READ COMMITTED")),format!("RR accepted-intent writer not refused narrowly: {rejected:?}"))?;
+            tx.rollback().await.map_err(debug_error)?;
             let mut tx=db.pool.begin().await.map_err(debug_error)?;
             sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ").execute(&mut *tx).await.map_err(debug_error)?;
             let rejected=sqlx::query("UPDATE provider_remote_tasks SET remote_operation_id=remote_operation_id WHERE submission_id=$1").bind(attach.submission_id).execute(&mut *tx).await;
