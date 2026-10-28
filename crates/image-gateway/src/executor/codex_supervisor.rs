@@ -506,14 +506,27 @@ impl CodexProcessSupervisor {
             }
             let bytes = blobs.get(input.blob()).await.map_err(|error| match error {
                 crate::input_blobs::InputBlobReadError::Unavailable => RunnerError::Unavailable,
-                crate::input_blobs::InputBlobReadError::Integrity => RunnerError::Definite {
-                    error_code: "codex_input_integrity_failed".to_string(),
-                },
+                crate::input_blobs::InputBlobReadError::Integrity => {
+                    tracing::warn!(
+                        stage = "blob_read_integrity",
+                        "Codex input validation failed"
+                    );
+                    RunnerError::Definite {
+                        error_code: "codex_input_integrity_failed".to_string(),
+                    }
+                }
             })?;
-            if bytes.len() as u64 != expected.byte_size
-                || sha256(&bytes) != expected.sha256_hex
-                || media_type_from_bytes(&bytes).ok() != Some(expected.media_type.as_str())
-            {
+            let failed_stage = if bytes.len() as u64 != expected.byte_size {
+                Some("byte_size")
+            } else if sha256(&bytes) != expected.sha256_hex {
+                Some("sha256")
+            } else if media_type_from_bytes(&bytes).ok() != Some(expected.media_type.as_str()) {
+                Some("decode_or_mime")
+            } else {
+                None
+            };
+            if let Some(stage) = failed_stage {
+                tracing::warn!(stage, "Codex input validation failed");
                 return Err(RunnerError::Definite {
                     error_code: "codex_input_integrity_failed".to_string(),
                 });
