@@ -17,6 +17,7 @@ use image_provider_sdk::{OutputSlot, SingleOutputCommand};
 use rustix::fs::{Mode, OFlags, open, openat};
 use serde::Deserialize;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, fs::File, io::Read, os::unix::fs::MetadataExt, path::Path};
 use uuid::Uuid;
 
@@ -175,7 +176,6 @@ pub(super) fn load(
             .is_none_or(|home| sha256_hex(home.as_bytes()) != review.account_home_sha256)
         || spec["command_byte_size"].as_u64() != Some(command_bytes.len() as u64)
         || gate["submission_id"] != spec["submission_id"]
-        || terminal["submission_id"] != spec["submission_id"]
         || gate["execution_binding_sha256"] != spec["execution_binding_sha256"]
         || terminal["execution_binding_sha256"] != spec["execution_binding_sha256"]
         || gate["launch_nonce"] != terminal["launch_nonce"]
@@ -202,6 +202,7 @@ pub(super) fn load(
             return Err(conflict());
         }
     }
+    verify_success_terminal_payload(&terminal)?;
     let argv: Vec<String> =
         serde_json::from_value(gate["arguments"].clone()).map_err(|_| conflict())?;
     if argv.first().map(String::as_str) != Some("multimodal2video") {
@@ -487,6 +488,37 @@ pub(super) fn load(
         video,
     })
 }
+
+// DiskTerminal has no submission_id: the reviewed request binds that ID, while
+// the terminal binds its execution and launch nonce plus its own payload hash.
+// Match process::protocol::DiskTerminal's fixed successful, empty-stream form.
+fn verify_success_terminal_payload(terminal: &Value) -> Result<(), ImageGatewayError> {
+    let mut digest = Sha256::new();
+    digest.update(b"ai-image-factory/gated-cli-terminal/v1\0");
+    let binding = terminal["execution_binding_sha256"]
+        .as_str()
+        .ok_or_else(conflict)?;
+    digest.update((binding.len() as u64).to_be_bytes());
+    digest.update(binding.as_bytes());
+    for key in ["launch_nonce", "helper_nonce", "child_nonce"] {
+        let nonce = terminal[key]
+            .as_str()
+            .and_then(|s| Uuid::parse_str(s).ok())
+            .ok_or_else(conflict)?;
+        digest.update(nonce.as_bytes());
+    }
+    digest.update([1, 1]); // released, exec_started
+    digest.update([0, 1, 0, 0, 0, 0, 0]); // Exited(Some(0), None)
+    for _ in 0..2 {
+        digest.update(0_u64.to_be_bytes()); // empty base64 stream
+        digest.update([0]); // not truncated
+    }
+    if terminal["payload_sha256"].as_str() != Some(hex::encode(digest.finalize()).as_str()) {
+        return Err(conflict());
+    }
+    Ok(())
+}
+
 fn private(file: &File, directory: bool) -> Result<(), ImageGatewayError> {
     let m = file.metadata().map_err(|_| conflict())?;
     if m.uid() != unsafe { libc::geteuid() }
@@ -521,4 +553,43 @@ fn read(dir: &File, name: &str, max: u64, empty: bool) -> Result<Vec<u8>, ImageG
         return Err(conflict());
     }
     Ok(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn successful_terminal_matches_producer_hash_without_submission_id() {
+        let mut terminal = serde_json::json!({
+            "execution_binding_sha256": "a".repeat(64),
+            "launch_nonce": "00000000-0000-4000-8000-000000000001",
+            "helper_nonce": "00000000-0000-4000-8000-000000000002",
+            "child_nonce": "00000000-0000-4000-8000-000000000003",
+            "released": true,
+            "exec_started": true,
+            "outcome": { "state": "exited", "exit_code": 0, "signal": null },
+            "stdout_base64": "", "stdout_truncated": false,
+            "stderr_base64": "", "stderr_truncated": false,
+            "payload_sha256": "debefb249766fa313739359f83cb49472d91e2b4ae9664eaf907669bea2e36b6"
+        });
+        assert!(terminal.get("submission_id").is_none());
+        assert!(verify_success_terminal_payload(&terminal).is_ok());
+        for field in [
+            "payload_sha256",
+            "execution_binding_sha256",
+            "launch_nonce",
+            "helper_nonce",
+            "child_nonce",
+        ] {
+            let mut changed = terminal.clone();
+            changed[field] = serde_json::json!("changed");
+            assert!(
+                verify_success_terminal_payload(&changed).is_err(),
+                "{field}"
+            );
+        }
+        terminal.as_object_mut().unwrap().remove("payload_sha256");
+        assert!(verify_success_terminal_payload(&terminal).is_err());
+    }
 }

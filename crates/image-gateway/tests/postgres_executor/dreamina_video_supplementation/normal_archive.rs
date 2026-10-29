@@ -1,6 +1,30 @@
 use super::*;
 use gpt_image_2_gateway::{DreaminaVideoArchiveResolutionRequest, resolve_dreamina_video_archive};
 
+fn terminal_payload_sha256(terminal: &serde_json::Value) -> TestResult<String> {
+    use sha2::{Digest, Sha256};
+    let mut digest = Sha256::new();
+    digest.update(b"ai-image-factory/gated-cli-terminal/v1\0");
+    let binding = terminal["execution_binding_sha256"]
+        .as_str()
+        .ok_or("binding")?;
+    digest.update((binding.len() as u64).to_be_bytes());
+    digest.update(binding.as_bytes());
+    for key in ["launch_nonce", "helper_nonce", "child_nonce"] {
+        digest.update(
+            Uuid::parse_str(terminal[key].as_str().ok_or("nonce")?)
+                .map_err(debug_error)?
+                .as_bytes(),
+        );
+    }
+    digest.update([1, 1, 0, 1, 0, 0, 0, 0, 0]);
+    for _ in 0..2 {
+        digest.update(0_u64.to_be_bytes());
+        digest.update([0]);
+    }
+    Ok(hex::encode(digest.finalize()))
+}
+
 async fn normal_original(
     pool: &PgPool,
     model: &'static str,
@@ -149,7 +173,8 @@ async fn recovery_evidence(
         / 1_000_000) as i64;
     let spec = json!({"provider_id":"dreamina-cli","provider_account_id":DREAMINA_ACCOUNT_ID,"command_schema":DREAMINA_SUBMIT_COMMAND_SCHEMA,"adapter_revision":DREAMINA_ADAPTER_REVISION,"output_index":0,"output_total":1,"submission_id":fixture.request.submission_id,"executor_execution_id":fixture.request.executor_execution_id,"provider_command_sha256":provider_hash,"execution_binding_sha256":binding,"command_bytes_sha256":sha256(&command_bytes),"command_byte_size":command_bytes.len()});
     let gate = json!({"environment":{"HOME":"/offline/supplement-home"},"submission_id":fixture.request.submission_id,"execution_binding_sha256":binding,"launch_nonce":nonce,"executable":"/offline/dreamina","executable_sha256":"e".repeat(64),"arguments":["multimodal2video","--prompt",command["prompt"],"--model_version",command["model_version"],"--ratio","16:9","--video_resolution","720p","--duration","10","--image","/offline/image-0.png","--audio","/offline/audio-0.mp3","--poll=0"]});
-    let terminal = json!({"submission_id":fixture.request.submission_id,"execution_binding_sha256":binding,"launch_nonce":nonce,"released":true,"exec_started":true,"outcome":{"state":"exited","exit_code":0,"signal":null},"stdout_truncated":false,"stderr_truncated":false,"stdout_base64":"","stderr_base64":""});
+    let mut terminal = json!({"execution_binding_sha256":binding,"launch_nonce":nonce,"helper_nonce":Uuid::new_v4(),"child_nonce":Uuid::new_v4(),"released":true,"exec_started":true,"outcome":{"state":"exited","exit_code":0,"signal":null},"stdout_truncated":false,"stderr_truncated":false,"stdout_base64":"","stderr_base64":""});
+    terminal["payload_sha256"] = json!(terminal_payload_sha256(&terminal)?);
     let query=serde_json::to_vec(&json!({"submit_id":native,"gen_status":"success","prompt":command["prompt"],"result_json":{"images":[],"videos":[{"video_url":URL,"duration":10}]}})).map_err(debug_error)?;
     let audit = json!({"native_id":native,"exit_code":0,"timed_out":false,"query_only":true,"generation_calls":0,"business_writes":0,"stdout_sha256":sha256(&query),"stdout_bytes":query.len(),"stderr_bytes":0,"executable_sha256":"e".repeat(64),"argv":["/offline/dreamina","query_result","--submit_id",native],"started_at":"2026-10-01T00:00:02+08:00","finished_at":"2026-10-01T00:00:03+08:00"});
     let archive = json!({"native_id":native,"query_sha256":sha256(&query),"original_sha256":sha256(video_bytes()),"original_bytes":video_bytes().len(),"public_dns_pinned":true,"tls_hostname_verified":true,"transcoded":false,"generation_calls":0,"business_writes":0,"hops":[{"host":"media.example.test","status":200}],"started_at":"2026-10-01T00:00:04+08:00","finished_at":"2026-10-01T00:00:05+08:00"});
@@ -198,6 +223,59 @@ async fn recovery_evidence(
         reviewed_recovery_sha256: sha256(&review),
         operator_reference: "offline-original-archive".into(),
     })
+}
+
+#[tokio::test]
+async fn normal_archive_binds_real_terminal_schema_without_submission_id() -> TestResult {
+    let Some(db) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let fixture = normal_original(&db.pool, "seedance2.0fast_vip", 1, 0).await?;
+        let request = recovery_evidence(&db.pool, &fixture).await?;
+        let original_review: serde_json::Value = serde_json::from_slice(&fs::read(fixture.root.join("review.json")).map_err(debug_error)?).map_err(debug_error)?;
+        let original_gate: serde_json::Value = serde_json::from_slice(&fs::read(fixture.root.join("process-request.json")).map_err(debug_error)?).map_err(debug_error)?;
+        let original_terminal: serde_json::Value = serde_json::from_slice(&fs::read(fixture.root.join("process-terminal.json")).map_err(debug_error)?).map_err(debug_error)?;
+        require(original_terminal.get("submission_id").is_none(), "fixture invented a terminal submission_id")?;
+        for case in ["payload", "binding", "nonce", "request_submission"] {
+            let mut terminal = original_terminal.clone();
+            let mut gate = original_gate.clone();
+            let mut review = original_review.clone();
+            match case {
+                "payload" => terminal["payload_sha256"] = json!("0".repeat(64)),
+                "binding" => {
+                    terminal["execution_binding_sha256"] = json!("0".repeat(64));
+                    terminal["payload_sha256"] = json!(terminal_payload_sha256(&terminal)?);
+                }
+                "nonce" => {
+                    terminal["launch_nonce"] = json!(Uuid::new_v4());
+                    terminal["payload_sha256"] = json!(terminal_payload_sha256(&terminal)?);
+                }
+                "request_submission" => gate["submission_id"] = json!(Uuid::new_v4()),
+                _ => unreachable!(),
+            }
+            for (name, value) in [("process-terminal.json", terminal), ("process-request.json", gate)] {
+                let bytes = serde_json::to_vec(&value).map_err(debug_error)?;
+                write(&fixture.root, name, &bytes)?;
+                review["files"][name] = json!(sha256(&bytes));
+            }
+            let review_bytes = serde_json::to_vec(&review).map_err(debug_error)?;
+            write(&fixture.root, "review.json", &review_bytes)?;
+            let mut changed = request.clone();
+            changed.reviewed_recovery_sha256 = sha256(&review_bytes);
+            require(resolve_dreamina_video_archive(&db.pool, &InMemoryArtifactBlobStore::default(), &fixture.root, &changed).await.is_err(), format!("terminal {case} mismatch accepted"))?;
+            assert_pending(&db.pool, request.job_id).await?;
+            let counts: (i64, i64, i64) = sqlx::query_as("SELECT (SELECT count(*) FROM dreamina_operator_video_success_resolutions WHERE job_id=$1),(SELECT count(*) FROM artifacts WHERE job_id=$1),(SELECT count(*) FROM ledger_transactions WHERE source_job_id=$1)").bind(request.job_id).fetch_one(&db.pool).await.map_err(debug_error)?;
+            require(counts == (0, 0, 0), "rejected terminal changed delivery or billing")?;
+        }
+        for (name, value) in [("process-terminal.json", original_terminal), ("process-request.json", original_gate), ("review.json", original_review)] {
+            write(&fixture.root, name, &serde_json::to_vec(&value).map_err(debug_error)?)?;
+        }
+        let recovered = resolve_dreamina_video_archive(&db.pool, &InMemoryArtifactBlobStore::default(), &fixture.root, &request).await.map_err(debug_error)?;
+        require(recovered.archive_sha256 == sha256(video_bytes()), "real terminal schema did not recover original bytes")
+    }.await;
+    let cleanup = db.cleanup().await;
+    result.and(cleanup)
 }
 
 #[tokio::test]
