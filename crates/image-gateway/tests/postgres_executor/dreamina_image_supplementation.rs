@@ -16,6 +16,7 @@ use std::str::FromStr;
 const PRICE: i64 = 30_000;
 struct Fixture {
     request: Authorize,
+    provider_command_sha256: String,
     root: PathBuf,
     _directory: tempfile::TempDir,
 }
@@ -80,6 +81,18 @@ async fn fixture(pool: &PgPool) -> TestResult<Fixture> {
         .reserve_submit(&reservation)
         .await
         .map_err(debug_error)?;
+    let provider_command_sha256: String = sqlx::query_scalar(
+        "SELECT provider_command_sha256 FROM provider_remote_submit_intents WHERE submission_id=$1",
+    )
+    .bind(lease.submission_id)
+    .fetch_one(pool)
+    .await
+    .map_err(debug_error)?;
+    require(
+        provider_command_sha256 == hex::encode(command.canonical_sha256())
+            && provider_command_sha256 != lease.command_hash,
+        "fixture must retain distinct source and provider command identities",
+    )?;
     tasks
         .start_submit(&reservation)
         .await
@@ -130,6 +143,7 @@ async fn fixture(pool: &PgPool) -> TestResult<Fixture> {
             expected_quote_hash: quote,
             operator_reference: "offline-regression:one-manual-supplement".into(),
         },
+        provider_command_sha256,
         root,
         _directory: directory,
     })
@@ -174,7 +188,7 @@ fn evidence(
     }
     let query=serde_json::to_vec(&json!({"submit_id":remote,"gen_status":"success","result_json":{"images":images,"videos":[]}})).map_err(debug_error)?;
     let audit=serde_json::to_vec(&json!({"schema_version":1,"authorization_id":plan.authorization_id,"dispatch_nonce":plan.dispatch_nonce,"job_id":plan.job_id,"submission_id":plan.submission_id,"executor_execution_id":plan.executor_execution_id,"remote_operation_id":remote,"argv":["query_result","--submit_id",remote,"--download_dir",dir],"stdout_sha256":sha256(&query),"exit_code":0,"executed_at_ms":1,"downloaded_images":downloaded})).map_err(debug_error)?;
-    let review=serde_json::to_vec(&json!({"schema_version":1,"authority":"dreamina-image-manual-supplement/v1","stdout_sha256":sha256(&query),"execution_audit_sha256":sha256(&audit),"quote_hash":plan.quote_hash,"provider_command_sha256":plan.command_hash,"submit_stdout_sha256":sha256(&submit),"authorization_id":plan.authorization_id,"dispatch_nonce":plan.dispatch_nonce})).map_err(debug_error)?;
+    let review=serde_json::to_vec(&json!({"schema_version":1,"authority":"dreamina-image-manual-supplement/v1","stdout_sha256":sha256(&query),"execution_audit_sha256":sha256(&audit),"quote_hash":plan.quote_hash,"provider_command_sha256":plan.provider_command_sha256,"submit_stdout_sha256":sha256(&submit),"authorization_id":plan.authorization_id,"dispatch_nonce":plan.dispatch_nonce})).map_err(debug_error)?;
     for (name, bytes) in [
         ("submit-stdout.json", submit.clone()),
         ("reviewed-query.json", query.clone()),
@@ -237,13 +251,14 @@ async fn image_supplement_explicit_authorization_and_concurrent_claim_are_once_o
         let fixture = fixture(&db.pool).await?;
         let store = store(&db.pool);
         let before = original_snapshot(&db.pool, fixture.request.job_id).await?;
-        for changed in 0..4 {
+        for changed in 0..5 {
             let mut invalid = fixture.request.clone();
             match changed {
                 0 => invalid.acknowledged_unknown_original_effect = false,
                 1 => invalid.authorization_id = Uuid::nil(),
                 2 => invalid.expected_quote_hash = "f".repeat(64),
-                _ => invalid.expected_command_sha256 = "e".repeat(64),
+                3 => invalid.expected_command_sha256 = "e".repeat(64),
+                _ => invalid.expected_command_sha256 = fixture.provider_command_sha256.clone(),
             }
             require(
                 store
@@ -347,6 +362,7 @@ async fn image_supplement_preserves_all_one_to_four_images_and_settles_original_
             let store=PostgresExecutionSettlementStore::new(db.pool.clone(),blobs.clone());
             let before=original_snapshot(&db.pool,fixture.request.job_id).await?;
             let plan=store.authorize_dreamina_image_supplement(&fixture.request).await.map_err(debug_error)?;
+            require(plan.command_hash==fixture.request.expected_command_sha256 && plan.provider_command_sha256==fixture.provider_command_sha256 && plan.command_hash!=plan.provider_command_sha256,"authorization conflated source and provider command identities")?;
             require(plan.billable_units==1 && plan.command_json["generate_num"]==1 && plan.command_json["model_version"]=="4.5","supplement changed original requested quantity/model")?;
             claim(&store,&plan).await?;
             let(accepted,publish)=evidence(&fixture,&plan,count)?;
@@ -355,6 +371,8 @@ async fn image_supplement_preserves_all_one_to_four_images_and_settles_original_
             let first=a.map_err(debug_error)?;
             require(first==b.map_err(debug_error)? && first.returned_count==count as i32 && first.captured_micros==PRICE && first.released_micros==0 && first.committed_units==1 && first.released_units==0,"concurrent publish changed original single charge")?;
             require(original_snapshot(&db.pool,plan.job_id).await?==before,"publish rewrote old Unknown receipt or request/quote identity")?;
+            let saved_hashes:(String,String)=sqlx::query_as("SELECT command_hash,provider_command_sha256 FROM dreamina_operator_image_supplement_resolutions WHERE authorization_id=$1").bind(plan.authorization_id).fetch_one(&db.pool).await.map_err(debug_error)?;
+            require(saved_hashes==(fixture.request.expected_command_sha256.clone(),fixture.provider_command_sha256.clone()) && first.provider_command_sha256==fixture.provider_command_sha256,"publication rewrote or conflated command identities")?;
             let counts:(i64,i64,i64,i64,i64)=sqlx::query_as("SELECT (SELECT count(*) FROM provider_submissions WHERE job_id=$1),(SELECT count(*) FROM ledger_transactions WHERE source_job_id=$1),(SELECT count(*) FROM provider_usage_facts WHERE job_id=$1),(SELECT count(*) FROM artifacts WHERE job_id=$1),(SELECT count(*) FROM dreamina_operator_image_supplement_artifacts WHERE job_id=$1)").bind(plan.job_id).fetch_one(&db.pool).await.map_err(debug_error)?;
             require(counts==(1,1,1,1,count as i64),format!("unexpected duplicate charge/artifacts: {counts:?}"))?;
             // A fresh reader uses only durable canonical/public projection state.
@@ -394,6 +412,25 @@ async fn image_supplement_wrong_native_receipt_or_changed_bytes_cannot_publish()
             .record_dreamina_image_supplement_accepted(&accepted)
             .await
             .map_err(debug_error)?;
+        let mut review: serde_json::Value = serde_json::from_slice(
+            &fs::read(fixture.root.join("review.json")).map_err(debug_error)?,
+        )
+        .map_err(debug_error)?;
+        review["provider_command_sha256"] = json!(plan.command_hash);
+        write(
+            &fixture.root,
+            "review.json",
+            &serde_json::to_vec(&review).map_err(debug_error)?,
+        )?;
+        require(
+            store
+                .publish_dreamina_image_supplement(&fixture.root, &publish)
+                .await
+                .is_err(),
+            "source command digest was accepted as provider command identity",
+        )?;
+        assert_pending(&db.pool, plan.job_id).await?;
+        evidence(&fixture, &plan, 2)?;
         let mut wrong = accepted.clone();
         wrong.remote_operation_id = "different-native".into();
         require(

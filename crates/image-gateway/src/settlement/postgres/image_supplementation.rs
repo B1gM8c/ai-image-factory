@@ -16,7 +16,10 @@ use crate::{
     },
     usage::UsageSnapshot,
 };
-use image_provider_dreamina_cli::{DREAMINA_SUBMIT_COMMAND_SCHEMA, parse_submit_command};
+use image_provider_dreamina_cli::{
+    DREAMINA_SUBMIT_COMMAND_SCHEMA, DreaminaSubmitPayloadV1, parse_submit_command,
+};
+use image_provider_sdk::{OutputSlot, SingleOutputCommand};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sqlx::{AssertSqlSafe, Postgres, Transaction};
@@ -50,6 +53,7 @@ pub struct DreaminaImageSupplementPlan {
     pub execution_profile_id: Uuid,
     pub command_json: Value,
     pub command_hash: String,
+    pub provider_command_sha256: String,
     pub quote_hash: String,
     pub execution_binding_sha256: String,
     pub billable_units: i32,
@@ -90,6 +94,7 @@ pub struct DreaminaImageSupplementResolution {
     pub hold_id: Uuid,
     pub remote_operation_id: String,
     pub reviewed_stdout_sha256: String,
+    pub provider_command_sha256: String,
     pub quote_hash: String,
     pub returned_count: i32,
     pub image_sha256: String,
@@ -119,6 +124,7 @@ struct Original {
     hold_id: Uuid,
     reservation_id: Uuid,
     command_hash: String,
+    provider_command_sha256: String,
     quote_hash: String,
     execution_binding_sha256: String,
     command_json: Value,
@@ -130,7 +136,7 @@ struct Original {
     limit_7d: i32,
     remaining_7d: i32,
 }
-const PLAN: &str = "SELECT runtime_binding_json,authorization_id,dispatch_nonce,job_id,submission_id,executor_execution_id,output_id,provider_account_id,execution_profile_id,command_json,command_hash,quote_hash,execution_binding_sha256,billable_units,api_profile,state,remote_operation_id,submit_stdout_sha256 FROM dreamina_operator_image_supplement_authorizations current_attempt WHERE authorization_id=$1";
+const PLAN: &str = "SELECT runtime_binding_json,authorization_id,dispatch_nonce,job_id,submission_id,executor_execution_id,output_id,provider_account_id,execution_profile_id,command_json,command_hash,provider_command_sha256,quote_hash,execution_binding_sha256,billable_units,api_profile,state,remote_operation_id,submit_stdout_sha256 FROM dreamina_operator_image_supplement_authorizations current_attempt WHERE authorization_id=$1";
 
 impl PostgresExecutionSettlementStore {
     pub async fn authorize_dreamina_image_supplement(
@@ -196,8 +202,8 @@ impl PostgresExecutionSettlementStore {
         .await?;
         let now = super::database_now(&mut tx).await?;
         let id = request.authorization_id;
-        sqlx::query(r#"INSERT INTO dreamina_operator_image_supplement_authorizations (authorization_id,job_id,submission_id,executor_execution_id,output_id,original_receipt_id,hold_id,provider_account_id,execution_profile_id,dispatch_nonce,command_hash,quote_hash,execution_binding_sha256,command_json,api_profile,billable_units,operator_reference,original_evidence_json,state,created_at_ms,updated_at_ms,runtime_binding_json,acknowledged_unknown_original_effect) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,dreamina_image_supplement_original_snapshot($2),'authorized',$18,$18,$19,TRUE)"#)
-            .bind(id).bind(row.job_id).bind(row.submission_id).bind(row.executor_execution_id).bind(row.output_id).bind(row.original_receipt_id).bind(row.hold_id).bind(row.provider_account_id).bind(row.execution_profile_id).bind(Uuid::new_v4()).bind(&row.command_hash).bind(&row.quote_hash).bind(&row.execution_binding_sha256).bind(&row.command_json).bind(&row.api_profile).bind(row.billable_units).bind(&request.operator_reference).bind(now).bind(&request.runtime_binding_json).execute(&mut *tx).await.map_err(storage_conflict)?;
+        sqlx::query(r#"INSERT INTO dreamina_operator_image_supplement_authorizations (authorization_id,job_id,submission_id,executor_execution_id,output_id,original_receipt_id,hold_id,provider_account_id,execution_profile_id,dispatch_nonce,command_hash,quote_hash,execution_binding_sha256,command_json,api_profile,billable_units,operator_reference,original_evidence_json,state,created_at_ms,updated_at_ms,runtime_binding_json,acknowledged_unknown_original_effect,provider_command_sha256) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,dreamina_image_supplement_original_snapshot($2),'authorized',$18,$18,$19,TRUE,$20)"#)
+            .bind(id).bind(row.job_id).bind(row.submission_id).bind(row.executor_execution_id).bind(row.output_id).bind(row.original_receipt_id).bind(row.hold_id).bind(row.provider_account_id).bind(row.execution_profile_id).bind(Uuid::new_v4()).bind(&row.command_hash).bind(&row.quote_hash).bind(&row.execution_binding_sha256).bind(&row.command_json).bind(&row.api_profile).bind(row.billable_units).bind(&request.operator_reference).bind(now).bind(&request.runtime_binding_json).bind(&row.provider_command_sha256).execute(&mut *tx).await.map_err(storage_conflict)?;
         assert_consistent(&mut tx, row.job_id).await?;
         let plan = load_plan(&mut tx, id).await?;
         tx.commit().await.map_err(storage_conflict)?;
@@ -361,15 +367,17 @@ async fn load_original(
     tx: &mut Transaction<'_, Postgres>,
     job: Uuid,
 ) -> Result<Original, ImageGatewayError> {
-    sqlx::query_as(r#"SELECT job.job_id,job.tenant_id,job.request_id,work.work_item_id,attempt.execution_id AS attempt_execution_id,attempt.lease_epoch,submission.submission_id,submission.executor_execution_id,output.output_id,submission.provider_account_id,submission.execution_profile_id,receipt.receipt_id AS original_receipt_id,hold.hold_id,quota.reservation_id,submission.command_hash,quote.quote_hash,intent.execution_binding_sha256,payload.command_json,admission.api_profile,job.billable_units,quote.request_dimensions_json,quota.limit_5h,quota.remaining_5h,quota.limit_7d,quota.remaining_7d
+    sqlx::query_as(r#"SELECT job.job_id,job.tenant_id,job.request_id,work.work_item_id,attempt.execution_id AS attempt_execution_id,attempt.lease_epoch,submission.submission_id,submission.executor_execution_id,output.output_id,submission.provider_account_id,submission.execution_profile_id,receipt.receipt_id AS original_receipt_id,hold.hold_id,quota.reservation_id,submission.command_hash,intent.provider_command_sha256,quote.quote_hash,intent.execution_binding_sha256,payload.command_json,admission.api_profile,job.billable_units,quote.request_dimensions_json,quota.limit_5h,quota.remaining_5h,quota.limit_7d,quota.remaining_7d
     FROM jobs job JOIN work_items work ON work.job_id=job.job_id JOIN job_attempts attempt ON attempt.execution_id=work.execution_id AND attempt.work_item_id=work.work_item_id AND attempt.lease_epoch=work.lease_epoch JOIN job_outputs output ON output.job_id=job.job_id AND output.output_index=0 JOIN provider_submissions submission ON submission.job_id=job.job_id AND submission.output_id=output.output_id AND submission.work_item_id=work.work_item_id JOIN executor_executions execution ON execution.submission_id=submission.submission_id AND execution.executor_execution_id=submission.executor_execution_id JOIN executor_terminal_reductions reduction ON reduction.submission_id=submission.submission_id AND reduction.executor_execution_id=submission.executor_execution_id JOIN provider_receipts receipt ON receipt.receipt_id=reduction.provider_receipt_id JOIN provider_remote_submit_intents intent ON intent.submission_id=submission.submission_id AND intent.executor_execution_id=submission.executor_execution_id JOIN provider_submit_recoveries recovery ON recovery.submission_id=submission.submission_id AND recovery.executor_execution_id=submission.executor_execution_id JOIN customer_billing_holds hold ON hold.job_id=job.job_id JOIN customer_price_quotes quote ON quote.quote_id=hold.quote_id JOIN quota_reservations quota ON quota.reservation_id=job.reservation_id JOIN job_payloads payload ON payload.job_id=job.job_id JOIN admission_sessions admission ON admission.session_id=payload.admission_session_id
     WHERE job.job_id=$1 AND payload.command_schema=$2 AND recovery.recovery_owner IS NULL AND recovery.recovery_lease_expires_at_ms IS NULL
     FOR UPDATE OF work,attempt,output,submission,execution,reduction,receipt,intent,recovery,hold,quota"#).bind(job).bind(DREAMINA_SUBMIT_COMMAND_SCHEMA).fetch_optional(&mut **tx).await.map_err(unavailable)?.ok_or_else(conflict)
 }
 fn validate_pricing(row: &Original) -> Result<(), ImageGatewayError> {
-    let command =
-        parse_submit_command(&serde_json::to_vec(&row.command_json).map_err(|_| conflict())?)
-            .map_err(|_| conflict())?;
+    let source_bytes = serde_json::to_vec(&row.command_json).map_err(|_| conflict())?;
+    if sha256_hex(&source_bytes) != row.command_hash {
+        return Err(conflict());
+    }
+    let command = parse_submit_command(&source_bytes).map_err(|_| conflict())?;
     let facts = dreamina_pricing_facts(&command, &row.api_profile).map_err(|_| conflict())?;
     let mut dimensions = serde_json::to_value(&facts.dimensions).map_err(|_| conflict())?;
     dimensions
@@ -390,6 +398,14 @@ fn validate_pricing(row: &Original) -> Result<(), ImageGatewayError> {
             image_provider_dreamina_cli::DreaminaSubmitRequestV1::TextToImage(_)
         )
     {
+        return Err(conflict());
+    }
+    let payload =
+        DreaminaSubmitPayloadV1::new(&row.command_hash, command).map_err(|_| conflict())?;
+    let provider_command =
+        SingleOutputCommand::new(OutputSlot::new(0, 1).map_err(|_| conflict())?, payload)
+            .map_err(|_| conflict())?;
+    if hex::encode(provider_command.canonical_sha256()) != row.provider_command_sha256 {
         return Err(conflict());
     }
     Ok(())
@@ -426,7 +442,7 @@ async fn publish(
     if plan.job_id != verified.job_id
         || plan.submission_id != verified.submission_id
         || plan.executor_execution_id != verified.executor_execution_id
-        || plan.command_hash != verified.provider_command_sha256
+        || plan.provider_command_sha256 != verified.provider_command_sha256
         || plan.quote_hash != verified.quote_hash
         || plan.remote_operation_id.as_deref() != Some(verified.remote_operation_id.as_str())
         || plan.submit_stdout_sha256.as_deref() != Some(verified.submit_stdout_sha256.as_str())
@@ -494,7 +510,7 @@ async fn publish(
     }
     let primary = &verified.images[0];
     let artifact = &artifacts[0];
-    sqlx::query(r#"INSERT INTO dreamina_operator_image_supplement_resolutions (resolution_id,authorization_id,job_id,submission_id,executor_execution_id,output_id,original_receipt_id,hold_id,remote_operation_id,command_hash,quote_hash,execution_binding_sha256,billable_units,reviewed_stdout_sha256,submit_stdout_sha256,execution_audit_sha256,review_sha256,input_sha256,returned_count,image_sha256,image_byte_size,image_width,image_height,operator_reference,created_at_ms,artifact_id,storage_backend,storage_namespace,object_key) SELECT $1,authorization_id,job_id,submission_id,executor_execution_id,output_id,original_receipt_id,hold_id,remote_operation_id,command_hash,quote_hash,execution_binding_sha256,billable_units,$3,submit_stdout_sha256,$4,$5,$6,$7,$8,$9,$10,$11,operator_reference,$12,$13,$14,$15,$16 FROM dreamina_operator_image_supplement_authorizations WHERE authorization_id=$2"#)
+    sqlx::query(r#"INSERT INTO dreamina_operator_image_supplement_resolutions (resolution_id,authorization_id,job_id,submission_id,executor_execution_id,output_id,original_receipt_id,hold_id,remote_operation_id,command_hash,provider_command_sha256,quote_hash,execution_binding_sha256,billable_units,reviewed_stdout_sha256,submit_stdout_sha256,execution_audit_sha256,review_sha256,input_sha256,returned_count,image_sha256,image_byte_size,image_width,image_height,operator_reference,created_at_ms,artifact_id,storage_backend,storage_namespace,object_key) SELECT $1,authorization_id,job_id,submission_id,executor_execution_id,output_id,original_receipt_id,hold_id,remote_operation_id,command_hash,provider_command_sha256,quote_hash,execution_binding_sha256,billable_units,$3,submit_stdout_sha256,$4,$5,$6,$7,$8,$9,$10,$11,operator_reference,$12,$13,$14,$15,$16 FROM dreamina_operator_image_supplement_authorizations WHERE authorization_id=$2"#)
         .bind(resolution_id).bind(request.authorization_id).bind(&verified.stdout_sha256).bind(&verified.execution_audit_sha256).bind(&verified.review_sha256).bind(&input_sha256)
         .bind(verified.images.len() as i32).bind(&primary.sha256).bind(primary.bytes.len() as i64).bind(primary.width as i32).bind(primary.height as i32).bind(now)
         .bind(artifact.identity.artifact_id).bind(&artifact.storage_backend).bind(store.artifact_store.storage_identity()).bind(&artifact.object_key).execute(&mut *tx).await.map_err(storage_conflict)?;
@@ -631,7 +647,7 @@ async fn load_resolution(
     tx: &mut Transaction<'_, Postgres>,
     id: Uuid,
 ) -> Result<DreaminaImageSupplementResolution, ImageGatewayError> {
-    sqlx::query_as("SELECT resolution.artifact_id,resolution.resolution_id,resolution.authorization_id,resolution.job_id,job.request_id,resolution.submission_id,resolution.executor_execution_id,resolution.original_receipt_id,resolution.hold_id,resolution.remote_operation_id,resolution.reviewed_stdout_sha256,resolution.quote_hash,resolution.returned_count,resolution.image_sha256,resolution.image_byte_size,resolution.image_width,resolution.image_height,hold.currency,hold.captured_micros,hold.released_micros,quota.committed_units,quota.released_units FROM dreamina_operator_image_supplement_resolutions resolution JOIN jobs job USING(job_id) JOIN customer_billing_holds hold USING(hold_id) JOIN quota_reservations quota ON quota.reservation_id=job.reservation_id WHERE resolution.authorization_id=$1").bind(id).fetch_one(&mut **tx).await.map_err(unavailable)
+    sqlx::query_as("SELECT resolution.artifact_id,resolution.resolution_id,resolution.authorization_id,resolution.job_id,job.request_id,resolution.submission_id,resolution.executor_execution_id,resolution.original_receipt_id,resolution.hold_id,resolution.remote_operation_id,resolution.reviewed_stdout_sha256,resolution.provider_command_sha256,resolution.quote_hash,resolution.returned_count,resolution.image_sha256,resolution.image_byte_size,resolution.image_width,resolution.image_height,hold.currency,hold.captured_micros,hold.released_micros,quota.committed_units,quota.released_units FROM dreamina_operator_image_supplement_resolutions resolution JOIN jobs job USING(job_id) JOIN customer_billing_holds hold USING(hold_id) JOIN quota_reservations quota ON quota.reservation_id=job.reservation_id WHERE resolution.authorization_id=$1").bind(id).fetch_one(&mut **tx).await.map_err(unavailable)
 }
 fn valid_sha256(v: &str) -> bool {
     v.len() == 64

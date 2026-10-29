@@ -10,9 +10,11 @@ use image_cli_runtime::{
     VerifiedExecutable, WorkingDirectory,
 };
 use image_provider_dreamina_cli::{
-    DreaminaCliPolicyV1, DreaminaCliQueryPolicyV1, DreaminaQueryStatusV1, DreaminaSubmitRequestV1,
-    QueryResultRequestV1, parse_query_receipt, parse_receipt, parse_submit_command,
+    DreaminaCliPolicyV1, DreaminaCliQueryPolicyV1, DreaminaQueryStatusV1, DreaminaSubmitPayloadV1,
+    DreaminaSubmitRequestV1, QueryResultRequestV1, parse_query_receipt, parse_receipt,
+    parse_submit_command,
 };
+use image_provider_sdk::{OutputSlot, SingleOutputCommand};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sqlx::PgPool;
@@ -97,6 +99,8 @@ pub async fn dispatch_dreamina_image_supplement_operator(
         || prepared["authorization"]["authorization_id"] != json!(authorization_id)
         || prepared["authorization"]["dispatch_nonce"] != json!(plan.dispatch_nonce)
         || prepared["authorization"]["command_hash"] != json!(plan.command_hash)
+        || prepared["authorization"]["provider_command_sha256"]
+            != json!(plan.provider_command_sha256)
         || prepared["authorization"]["quote_hash"] != json!(plan.quote_hash)
         || prepared["authorization"]["runtime_binding_json"] != plan.runtime_binding_json
     {
@@ -346,7 +350,7 @@ pub async fn poll_dreamina_image_supplement_operator(
     private_write_once(&evidence, "submit-stdout.json", &submit)?;
     private_write_once(&evidence, "reviewed-query.json", stdout)?;
     private_write_once(&evidence, "execution-audit.json", &audit)?;
-    private_write_once(&evidence,"review.json",&serde_json::to_vec(&json!({"schema_version":1,"authority":AUTHORITY,"stdout_sha256":sha256_hex(stdout),"execution_audit_sha256":sha256_hex(&audit),"quote_hash":plan.quote_hash,"provider_command_sha256":plan.command_hash,"submit_stdout_sha256":sha256_hex(&submit),"authorization_id":authorization_id,"dispatch_nonce":plan.dispatch_nonce})).map_err(|_| failure())?)?;
+    private_write_once(&evidence,"review.json",&serde_json::to_vec(&json!({"schema_version":1,"authority":AUTHORITY,"stdout_sha256":sha256_hex(stdout),"execution_audit_sha256":sha256_hex(&audit),"quote_hash":plan.quote_hash,"provider_command_sha256":plan.provider_command_sha256,"submit_stdout_sha256":sha256_hex(&submit),"authorization_id":authorization_id,"dispatch_nonce":plan.dispatch_nonce})).map_err(|_| failure())?)?;
     private_write_once(
         &directory,
         "publication.json",
@@ -433,6 +437,16 @@ fn prepare_command(
         return Err(failure());
     }
     let request = parse_submit_command(&bytes).map_err(|_| failure())?;
+    // The original admission hash and provider canonical command digest are
+    // separate identities. Rebuild the same typed command as normal submission.
+    let payload =
+        DreaminaSubmitPayloadV1::new(&plan.command_hash, request.clone()).map_err(|_| failure())?;
+    let canonical =
+        SingleOutputCommand::new(OutputSlot::new(0, 1).map_err(|_| failure())?, payload)
+            .map_err(|_| failure())?;
+    if hex::encode(canonical.canonical_sha256()) != plan.provider_command_sha256 {
+        return Err(failure());
+    }
     if !matches!(&request,DreaminaSubmitRequestV1::TextToImage(image) if image.model().as_str()=="4.5" && image.generate_num()==1)
     {
         return Err(failure());
@@ -470,7 +484,7 @@ async fn runtime_for_plan(
     Ok(runtime)
 }
 fn supplement_binding(plan: &DreaminaImageSupplementPlan) -> Result<String, ImageGatewayError> {
-    Ok(sha256_hex(&serde_json::to_vec(&json!({"authority":AUTHORITY,"authorization_id":plan.authorization_id,"dispatch_nonce":plan.dispatch_nonce,"job_id":plan.job_id,"submission_id":plan.submission_id,"executor_execution_id":plan.executor_execution_id,"original_execution_binding_sha256":plan.execution_binding_sha256,"command_hash":plan.command_hash,"quote_hash":plan.quote_hash,"runtime_binding":plan.runtime_binding_json})).map_err(|_|failure())?))
+    Ok(sha256_hex(&serde_json::to_vec(&json!({"authority":AUTHORITY,"authorization_id":plan.authorization_id,"dispatch_nonce":plan.dispatch_nonce,"job_id":plan.job_id,"submission_id":plan.submission_id,"executor_execution_id":plan.executor_execution_id,"original_execution_binding_sha256":plan.execution_binding_sha256,"command_hash":plan.command_hash,"provider_command_sha256":plan.provider_command_sha256,"quote_hash":plan.quote_hash,"runtime_binding":plan.runtime_binding_json})).map_err(|_|failure())?))
 }
 fn bound_terminal_stdout(
     plan: &DreaminaImageSupplementPlan,

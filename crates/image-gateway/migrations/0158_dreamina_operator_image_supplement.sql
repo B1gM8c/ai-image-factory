@@ -7,6 +7,7 @@ CREATE TABLE dreamina_operator_image_supplement_authorizations (
  hold_id UUID NOT NULL UNIQUE REFERENCES customer_billing_holds(hold_id),
  provider_account_id UUID NOT NULL, execution_profile_id UUID NOT NULL, dispatch_nonce UUID NOT NULL UNIQUE,
  command_hash TEXT NOT NULL CHECK(command_hash ~ '^[a-f0-9]{64}$'),
+ provider_command_sha256 TEXT NOT NULL CHECK(provider_command_sha256 ~ '^[a-f0-9]{64}$'),
  quote_hash TEXT NOT NULL CHECK(quote_hash ~ '^[a-f0-9]{64}$'),
  execution_binding_sha256 TEXT NOT NULL CHECK(execution_binding_sha256 ~ '^[a-f0-9]{64}$'),
  acknowledged_unknown_original_effect BOOLEAN NOT NULL CHECK(acknowledged_unknown_original_effect),
@@ -33,6 +34,7 @@ CREATE TABLE dreamina_operator_image_supplement_resolutions (
  job_id UUID NOT NULL UNIQUE, submission_id UUID NOT NULL UNIQUE, executor_execution_id UUID NOT NULL UNIQUE,
  output_id UUID NOT NULL UNIQUE, original_receipt_id UUID NOT NULL UNIQUE, hold_id UUID NOT NULL UNIQUE,
  remote_operation_id TEXT NOT NULL, command_hash TEXT NOT NULL, quote_hash TEXT NOT NULL,
+ provider_command_sha256 TEXT NOT NULL CHECK(provider_command_sha256 ~ '^[a-f0-9]{64}$'),
  execution_binding_sha256 TEXT NOT NULL, billable_units INTEGER NOT NULL CHECK(billable_units = 1),
  reviewed_stdout_sha256 TEXT NOT NULL CHECK(reviewed_stdout_sha256 ~ '^[a-f0-9]{64}$'),
  submit_stdout_sha256 TEXT NOT NULL CHECK(submit_stdout_sha256 ~ '^[a-f0-9]{64}$'),
@@ -162,7 +164,7 @@ BEGIN
  AND EXISTS(SELECT 1 FROM job_payloads payload JOIN admission_sessions admission ON admission.session_id=payload.admission_session_id WHERE payload.job_id=target_job_id AND payload.command_schema=submission.command_schema AND payload.command_json=supplement_auth.command_json AND admission.api_profile=supplement_auth.api_profile)
  AND submission.state='uncertain' AND submission.error_code='provider_submit_deadline' AND submission.remote_result_id IS NULL AND submission.result_manifest_id IS NULL
  AND execution.state='uncertain' AND execution.error_code='provider_submit_deadline' AND execution.executor_owner IS NULL AND execution.lease_expires_at_ms IS NULL
- AND intent.state='deadline_quarantined' AND intent.remote_operation_id IS NULL AND intent.execution_binding_sha256=supplement_auth.execution_binding_sha256
+ AND intent.state='deadline_quarantined' AND intent.remote_operation_id IS NULL AND intent.execution_binding_sha256=supplement_auth.execution_binding_sha256 AND intent.provider_command_sha256=supplement_auth.provider_command_sha256
  AND reduction.state='completed' AND reduction.resolved_state='uncertain' AND reduction.customer_artifact_id IS NULL AND reduction.remote_result_id IS NULL
  AND receipt.receipt_id=supplement_auth.original_receipt_id AND receipt.outcome='uncertain'
  AND hold.hold_id=supplement_auth.hold_id AND hold.tenant_id=job.tenant_id AND hold.held_micros=quote.max_total_micros
@@ -185,7 +187,7 @@ BEGIN
  IF NEW.storage_backend NOT IN ('filesystem-v1','memory-v1') OR length(NEW.storage_namespace)=0 OR length(NEW.object_key)=0 THEN RAISE EXCEPTION 'supplement requires immutable local image artifact'; END IF;
  IF NOT EXISTS(SELECT 1 FROM dreamina_operator_image_supplement_authorizations supplement_auth WHERE supplement_auth.authorization_id=NEW.authorization_id AND supplement_auth.job_id=NEW.job_id
  AND NEW.artifact_id=supplement_auth.dispatch_nonce
- AND supplement_auth.state IN ('accepted','uncertain') AND supplement_auth.submission_id=NEW.submission_id AND supplement_auth.executor_execution_id=NEW.executor_execution_id AND supplement_auth.output_id=NEW.output_id AND supplement_auth.original_receipt_id=NEW.original_receipt_id AND supplement_auth.hold_id=NEW.hold_id AND supplement_auth.remote_operation_id=NEW.remote_operation_id AND supplement_auth.submit_stdout_sha256=NEW.submit_stdout_sha256 AND supplement_auth.command_hash=NEW.command_hash AND supplement_auth.quote_hash=NEW.quote_hash AND supplement_auth.billable_units=NEW.billable_units AND supplement_auth.execution_binding_sha256=NEW.execution_binding_sha256 AND supplement_auth.operator_reference=NEW.operator_reference) THEN RAISE EXCEPTION 'supplement result does not bind authorized new attempt'; END IF;
+ AND supplement_auth.state IN ('accepted','uncertain') AND supplement_auth.submission_id=NEW.submission_id AND supplement_auth.executor_execution_id=NEW.executor_execution_id AND supplement_auth.output_id=NEW.output_id AND supplement_auth.original_receipt_id=NEW.original_receipt_id AND supplement_auth.hold_id=NEW.hold_id AND supplement_auth.remote_operation_id=NEW.remote_operation_id AND supplement_auth.submit_stdout_sha256=NEW.submit_stdout_sha256 AND supplement_auth.command_hash=NEW.command_hash AND supplement_auth.provider_command_sha256=NEW.provider_command_sha256 AND supplement_auth.quote_hash=NEW.quote_hash AND supplement_auth.billable_units=NEW.billable_units AND supplement_auth.execution_binding_sha256=NEW.execution_binding_sha256 AND supplement_auth.operator_reference=NEW.operator_reference) THEN RAISE EXCEPTION 'supplement result does not bind authorized new attempt'; END IF;
  RETURN NEW;
 END; $$ LANGUAGE plpgsql;
 CREATE TRIGGER dreamina_image_supplement_resolution_insert BEFORE INSERT ON dreamina_operator_image_supplement_resolutions FOR EACH ROW EXECUTE FUNCTION validate_dreamina_image_supplement_resolution_insert();
