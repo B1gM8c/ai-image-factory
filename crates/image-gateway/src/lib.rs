@@ -179,9 +179,12 @@ pub use provider_tasks::{
     resolve_dreamina_compliance_rejection, run_remote_submit_gate, run_remote_submit_runner,
 };
 pub use provider_tasks::{
-    DreaminaVideoSupplementOperatorReceipt, dispatch_dreamina_video_supplement_operator,
-    poll_dreamina_video_supplement_operator, prepare_dreamina_video_supplement_operator,
+    DreaminaImageSupplementOperatorReceipt, DreaminaVideoSupplementOperatorReceipt,
+    dispatch_dreamina_image_supplement_operator, dispatch_dreamina_video_supplement_operator,
+    poll_dreamina_image_supplement_operator, poll_dreamina_video_supplement_operator,
+    prepare_dreamina_image_supplement_operator, prepare_dreamina_video_supplement_operator,
     prepare_dreamina_video_supplement_successor_operator,
+    publish_dreamina_image_supplement_operator,
     recover_dreamina_video_supplement_acceptance_operator,
 };
 pub use provider_uploads::ProviderUploadService;
@@ -212,6 +215,9 @@ pub use retention::{
 };
 pub use settlement::{
     DreaminaImageSuccessResolution, DreaminaImageSuccessResolutionRequest,
+    DreaminaImageSupplementAcceptedRequest, DreaminaImageSupplementAuthorizationRequest,
+    DreaminaImageSupplementPlan, DreaminaImageSupplementPublishRequest,
+    DreaminaImageSupplementResolution, DreaminaImageSupplementUncertainRequest,
     DreaminaManualVideoCancellationProof, DreaminaManualVideoCancellationRequest,
     DreaminaSupplementVideoCancellationRequest, DreaminaVideoArchiveResolution,
     DreaminaVideoArchiveResolutionRequest, DreaminaVideoSuccessResolution,

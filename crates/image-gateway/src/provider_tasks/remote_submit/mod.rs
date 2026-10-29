@@ -1,10 +1,17 @@
 pub(crate) mod compliance_evidence;
 mod compliance_reconciliation;
 mod driver;
+mod image_supplement;
 mod inputs;
 mod journal;
 mod process;
 mod video_supplement;
+
+pub use image_supplement::{
+    DreaminaImageSupplementOperatorReceipt, dispatch_dreamina_image_supplement_operator,
+    poll_dreamina_image_supplement_operator, prepare_dreamina_image_supplement_operator,
+    publish_dreamina_image_supplement_operator,
+};
 
 pub use video_supplement::{
     DreaminaVideoSupplementOperatorReceipt, dispatch_dreamina_video_supplement_operator,

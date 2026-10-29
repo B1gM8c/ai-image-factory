@@ -29,6 +29,7 @@ mod additional_images;
 mod failure;
 mod image_status;
 pub(super) mod image_success_reconciliation;
+pub(super) mod image_supplementation;
 pub(super) mod manual_video_cancellation;
 mod results;
 pub(super) mod supplement_video_cancellation;
@@ -195,6 +196,17 @@ impl ExecutionSettlementStore for PostgresExecutionSettlementStore {
         actor_user_id: Option<Uuid>,
         job_id: Uuid,
     ) -> Result<(), ImageGatewayError> {
+        if image_supplementation::projection::validate_budget(
+            self,
+            tenant_id,
+            project_id,
+            actor_user_id,
+            job_id,
+        )
+        .await?
+        {
+            return Ok(());
+        }
         additional_images::validate_budget(self, tenant_id, project_id, actor_user_id, job_id).await
     }
 
@@ -205,6 +217,17 @@ impl ExecutionSettlementStore for PostgresExecutionSettlementStore {
         actor_user_id: Option<Uuid>,
         job_id: Uuid,
     ) -> Result<Vec<super::AdditionalImageResult>, ImageGatewayError> {
+        if let Some(images) = image_supplementation::projection::project(
+            self,
+            tenant_id,
+            project_id,
+            actor_user_id,
+            job_id,
+        )
+        .await?
+        {
+            return Ok(images);
+        }
         additional_images::project(self, tenant_id, project_id, actor_user_id, job_id).await
     }
 

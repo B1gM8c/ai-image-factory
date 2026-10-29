@@ -430,7 +430,7 @@ impl ProviderPollDriver for DreaminaCliPollDriverV1 {
     }
 }
 
-fn ordered_image_outputs(
+pub(crate) fn ordered_image_outputs(
     files: Vec<VerifiedFreshOutputFile>,
     receipt: &DreaminaQueryReceiptV1,
 ) -> Result<Vec<VerifiedFreshOutputFile>, ProviderFailure> {

@@ -148,7 +148,19 @@ impl ArtifactRetentionStore for PostgresArtifactRetentionStore {
               ON authority.job_id = artifact.job_id
              AND authority.output_id = artifact.artifact_id
             WHERE artifact.job_id = $1
-            ORDER BY artifact.output_index
+            UNION ALL
+            SELECT extra.artifact_id, job.tenant_id, extra.job_id,
+                   primary_artifact.work_item_id, primary_artifact.execution_id, primary_artifact.lease_epoch,
+                   extra.source_index, 'image/png', extra.storage_backend,
+                   extra.object_key, extra.sha256_hex, extra.byte_size,
+                   NULL::UUID, NULL::TEXT, NULL::TEXT, NULL::TEXT, NULL::TEXT, NULL::BIGINT
+            FROM dreamina_operator_image_supplement_artifacts extra
+            JOIN dreamina_operator_image_supplement_resolutions resolution USING(authorization_id,job_id)
+            JOIN dreamina_operator_image_supplement_authorizations supplement_auth USING(authorization_id,job_id)
+            JOIN artifacts primary_artifact ON primary_artifact.artifact_id=resolution.artifact_id AND primary_artifact.job_id=extra.job_id
+            JOIN jobs job ON job.job_id=extra.job_id
+            WHERE extra.job_id=$1 AND extra.source_index>0 AND supplement_auth.state='succeeded'
+            ORDER BY output_index
             "#,
         )
         .bind(job_id)

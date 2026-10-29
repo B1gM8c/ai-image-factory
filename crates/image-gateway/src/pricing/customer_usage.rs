@@ -160,6 +160,46 @@ pub(crate) async fn persist_customer_usage_facts_with_operator_video_supplement(
     persist_customer_usage_facts_inner(tx, output, authority, Some(resolution_id), None, now).await
 }
 
+pub(crate) async fn persist_customer_usage_facts_with_operator_image_supplement(
+    tx: &mut Transaction<'_, Postgres>,
+    output: &CustomerUsageOutput<'_>,
+    authority: CustomerUsageAuthority,
+    resolution_id: Uuid,
+    now: i64,
+) -> Result<(), CustomerUsageFactError> {
+    let CustomerUsageAuthority::Durable {
+        submission_id,
+        receipt_id,
+    } = authority
+    else {
+        return Err(CustomerUsageFactError::Conflict);
+    };
+    if output.operation != "generation"
+        || output.output_billable_units != 1
+        || output.provider_id != "dreamina-cli"
+        || output.terminal_outcome != "succeeded"
+        || output.billing_metric != "output"
+        || output.billing_unit != "output"
+    {
+        return Err(CustomerUsageFactError::Conflict);
+    }
+    let bound: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM dreamina_operator_image_supplement_resolutions resolution JOIN provider_receipts receipt ON receipt.receipt_id = resolution.original_receipt_id WHERE resolution.resolution_id = $1 AND resolution.job_id = $2 AND resolution.submission_id = $3 AND resolution.original_receipt_id = $4 AND resolution.output_id = $5 AND receipt.output_id = $5)",
+    )
+    .bind(resolution_id)
+    .bind(output.job_id)
+    .bind(submission_id)
+    .bind(receipt_id)
+    .bind(output.output_id)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(|_| CustomerUsageFactError::Unavailable)?;
+    if !bound {
+        return Err(CustomerUsageFactError::Conflict);
+    }
+    persist_customer_usage_facts_inner(tx, output, authority, Some(resolution_id), None, now).await
+}
+
 pub(crate) async fn persist_customer_usage_facts_with_operator_supplement_cancellation(
     tx: &mut Transaction<'_, Postgres>,
     output: &CustomerUsageOutput<'_>,

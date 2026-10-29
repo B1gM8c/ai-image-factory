@@ -22,6 +22,11 @@ pub use postgres::image_success_reconciliation::{
     DreaminaImageSuccessResolution, DreaminaImageSuccessResolutionRequest,
     resolve_dreamina_image_success,
 };
+pub use postgres::image_supplementation::{
+    DreaminaImageSupplementAcceptedRequest, DreaminaImageSupplementAuthorizationRequest,
+    DreaminaImageSupplementPlan, DreaminaImageSupplementPublishRequest,
+    DreaminaImageSupplementResolution, DreaminaImageSupplementUncertainRequest,
+};
 pub use postgres::manual_video_cancellation::{
     DreaminaManualVideoCancellationProof, DreaminaManualVideoCancellationRequest,
 };

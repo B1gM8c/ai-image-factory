@@ -86,6 +86,9 @@ mod dreamina_additional_image_results;
 #[path = "postgres_executor/queue_progress_projection.rs"]
 mod queue_progress_projection;
 
+#[path = "postgres_executor/dreamina_image_supplementation.rs"]
+mod dreamina_image_supplementation;
+
 #[path = "postgres_executor/dreamina_image_success_reconciliation.rs"]
 mod dreamina_image_success_reconciliation;
 

@@ -33,7 +33,7 @@ use crate::{
 mod credential_environment;
 mod poll;
 mod submit_recovery;
-pub(crate) use poll::pending_progress;
+pub(crate) use poll::{ordered_image_outputs, pending_progress};
 
 pub use credential_environment::{
     DreaminaCredentialEnvironmentError, DreaminaKeychainReplacement,
