@@ -519,20 +519,20 @@ function AccountsContent({
         />
         <MetricCard
           label={t({
-            en: "Execution concurrency",
-            "zh-CN": "执行并发",
-            ja: "実行同時数",
-            ko: "실행 동시성",
+            en: "Concurrency usage",
+            "zh-CN": "并发占用",
+            ja: "同時実行枠の使用状況",
+            ko: "동시 실행 슬롯 사용량",
           })}
           value={`${formatInteger(allocated)} / ${formatInteger(totalConcurrency)}`}
           detail={
             queued === "0"
               ? t(
                   {
-                    en: "Running / limit · {available} available · no queued jobs",
-                    "zh-CN": "已执行 / 上限 · 可用 {available} · 无等待任务",
-                    ja: "実行中 / 上限 · 空き {available} · 待機ジョブなし",
-                    ko: "실행 중 / 한도 · 사용 가능 {available} · 대기 작업 없음",
+                    en: "Occupied / limit · {available} available · no local queued jobs",
+                    "zh-CN": "占用 / 上限 · 可用 {available} · 无本地等待任务",
+                    ja: "使用中 / 上限 · 空き {available} · ローカル待機ジョブなし",
+                    ko: "사용 중 / 한도 · 사용 가능 {available} · 로컬 대기 작업 없음",
                   },
                   { available: formatInteger(available) },
                 )
@@ -659,10 +659,10 @@ function AccountsContent({
                       </TableHead>
                       <TableHead className="w-[42%] md:w-36">
                         {t({
-                          en: "Concurrency",
-                          "zh-CN": "执行并发",
-                          ja: "同時実行数",
-                          ko: "동시 실행",
+                          en: "Concurrency usage",
+                          "zh-CN": "并发占用",
+                          ja: "同時実行枠の使用状況",
+                          ko: "동시 실행 슬롯 사용량",
                         })}
                       </TableHead>
                       <TableHead className="w-14 pr-4 text-right">
@@ -810,6 +810,12 @@ function AccountsContent({
       </Tabs>
       <AccountSchedulingSheet
         account={selectedAccount}
+        capacity={
+          accounts.find(
+            (account) =>
+              account.provider_account_id === selectedAccount?.provider_account_id,
+          )
+        }
         open={Boolean(selectedAccount)}
         initialTab={selectedAccountTab}
         onOpenChange={(open) => {
@@ -1328,16 +1334,16 @@ function ConcurrencyCell({ account }: { account: ProviderAccountView }) {
 
   return (
     <div
-      className="w-full max-w-36 space-y-1.5"
+      className="w-full max-w-56 space-y-1.5"
       aria-label={
         schedulable
           ? t(
               {
-                en: "{allocated} running, maximum concurrency {maximum}, {available} available",
+                en: "{allocated} occupied, maximum concurrency {maximum}, {available} available",
                 "zh-CN":
-                  "当前执行 {allocated}，最大并发 {maximum}，可用 {available}",
-                ja: "実行中 {allocated}、最大同時実行数 {maximum}、空き {available}",
-                ko: "현재 실행 {allocated}, 최대 동시 실행 {maximum}, 사용 가능 {available}",
+                  "当前占用 {allocated}，最大并发 {maximum}，可用 {available}",
+                ja: "使用中 {allocated}、最大同時実行数 {maximum}、空き {available}",
+                ko: "현재 사용 {allocated}, 최대 동시 실행 {maximum}, 사용 가능 {available}",
               },
               {
                 allocated: account.allocated_count,
@@ -1347,11 +1353,11 @@ function ConcurrencyCell({ account }: { account: ProviderAccountView }) {
             )
           : t(
               {
-                en: "{allocated} running, maximum concurrency {maximum}, not currently scheduled",
+                en: "{allocated} occupied, maximum concurrency {maximum}, not currently scheduled",
                 "zh-CN":
-                  "当前执行 {allocated}，最大并发 {maximum}，当前不参与调度",
-                ja: "実行中 {allocated}、最大同時実行数 {maximum}、現在はスケジューリング対象外",
-                ko: "현재 실행 {allocated}, 최대 동시 실행 {maximum}, 현재 스케줄링 제외",
+                  "当前占用 {allocated}，最大并发 {maximum}，当前不参与调度",
+                ja: "使用中 {allocated}、最大同時実行数 {maximum}、現在はスケジューリング対象外",
+                ko: "현재 사용 {allocated}, 최대 동시 실행 {maximum}, 현재 스케줄링 제외",
               },
               {
                 allocated: account.allocated_count,
@@ -1370,6 +1376,21 @@ function ConcurrencyCell({ account }: { account: ProviderAccountView }) {
         </span>
       </div>
       <Progress className="h-1.5" value={utilization} />
+      <p className="text-xs tabular-nums text-muted-foreground">
+        {t(
+          {
+            en: "Executing {executing} · Upstream waiting {waiting} · To reconcile {reconciling}",
+            "zh-CN": "执行 {executing} · 上游等待 {waiting} · 待核对 {reconciling}",
+            ja: "実行 {executing} · 上流待機 {waiting} · 要照合 {reconciling}",
+            ko: "실행 {executing} · 업스트림 대기 {waiting} · 확인 필요 {reconciling}",
+          },
+          {
+            executing: formatInteger(account.execution_count),
+            waiting: formatInteger(account.upstream_waiting_count),
+            reconciling: formatInteger(account.reconciliation_count),
+          },
+        )}
+      </p>
       <p className="text-xs tabular-nums text-muted-foreground">
         {schedulable
           ? t(
@@ -1776,12 +1797,33 @@ function concurrencyStateLabel(
       ja: "上限到達",
       ko: "가득 참",
     });
-  if (allocated > 0)
+  if (Number(account.execution_count) > 0)
     return t({
-      en: "Running",
-      "zh-CN": "运行中",
+      en: "Executing",
+      "zh-CN": "执行中",
       ja: "実行中",
       ko: "실행 중",
+    });
+  if (Number(account.upstream_waiting_count) > 0)
+    return t({
+      en: "Upstream waiting",
+      "zh-CN": "上游等待",
+      ja: "上流待機",
+      ko: "업스트림 대기",
+    });
+  if (Number(account.reconciliation_count) > 0)
+    return t({
+      en: "To reconcile",
+      "zh-CN": "待核对",
+      ja: "要照合",
+      ko: "확인 필요",
+    });
+  if (allocated > 0)
+    return t({
+      en: "Occupied",
+      "zh-CN": "已占用",
+      ja: "使用中",
+      ko: "사용 중",
     });
   return t({
     en: "Idle",

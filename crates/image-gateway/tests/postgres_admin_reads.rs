@@ -336,7 +336,10 @@ async fn admin_read_case(pool: &PgPool) -> TestResult {
         .first()
         .ok_or_else(|| "provider account projection is missing".to_string())?;
     require(
-        provider.runtime_status == "unobserved",
+        provider.runtime_status == "unobserved"
+            && provider.execution_count == "0"
+            && provider.upstream_waiting_count == "0"
+            && provider.reconciliation_count == "0",
         "inline profiles must not claim runtime readiness",
     )?;
     require(
@@ -353,6 +356,9 @@ async fn admin_read_case(pool: &PgPool) -> TestResult {
         runtime.accounts.len() == 1
             && runtime.accounts[0].max_concurrency == "7"
             && runtime.accounts[0].allocated_count == "0"
+            && runtime.accounts[0].execution_count == "0"
+            && runtime.accounts[0].upstream_waiting_count == "0"
+            && runtime.accounts[0].reconciliation_count == "0"
             && runtime.accounts[0].available_capacity == "7",
         "provider runtime projection must preserve the authoritative concurrency counters",
     )?;
@@ -2505,10 +2511,12 @@ async fn seed_blocked_terminal_reduction(pool: &PgPool) -> TestResult<BlockedTer
         .await
         .map_err(debug_error)?
         .ok_or_else(|| "admin read blocked seed was not claimable".to_string())?;
+    assert_capacity_breakdown(pool, ("1", "1", "0", "0", "6")).await?;
     submissions
         .start(&executor_lease)
         .await
         .map_err(debug_error)?;
+    assert_capacity_breakdown(pool, ("1", "1", "0", "0", "6")).await?;
     submissions
         .record_outcome(
             &executor_lease,
@@ -2518,6 +2526,8 @@ async fn seed_blocked_terminal_reduction(pool: &PgPool) -> TestResult<BlockedTer
         )
         .await
         .map_err(debug_error)?;
+
+    assert_capacity_breakdown(pool, ("0", "0", "0", "0", "7")).await?;
 
     let reductions = PostgresExecutorTerminalStore::new(pool.clone());
     let terminal = reductions
@@ -2535,6 +2545,64 @@ async fn seed_blocked_terminal_reduction(pool: &PgPool) -> TestResult<BlockedTer
         job_id,
         request_id,
     })
+}
+
+async fn assert_capacity_breakdown(
+    pool: &PgPool,
+    expected: (&str, &str, &str, &str, &str),
+) -> TestResult {
+    let store = PostgresAdminReadStore::new(pool.clone());
+    let providers = store.provider_accounts().await.map_err(debug_error)?;
+    require(
+        providers.accounts.len() == 1,
+        "capacity grouping duplicated profiles",
+    )?;
+    let provider = &providers.accounts[0];
+    require(
+        (
+            provider.allocated_count.as_str(),
+            provider.execution_count.as_str(),
+            provider.upstream_waiting_count.as_str(),
+            provider.reconciliation_count.as_str(),
+            provider.available_capacity.as_str(),
+        ) == expected,
+        "provider account capacity grouping changed total or hid held capacity",
+    )?;
+    let runtime = store
+        .provider_account_concurrency(None)
+        .await
+        .map_err(debug_error)?;
+    require(
+        runtime.accounts.len() == 1,
+        "live capacity grouping duplicated profiles",
+    )?;
+    let runtime = &runtime.accounts[0];
+    require(
+        (
+            runtime.allocated_count.as_str(),
+            runtime.execution_count.as_str(),
+            runtime.upstream_waiting_count.as_str(),
+            runtime.reconciliation_count.as_str(),
+            runtime.available_capacity.as_str(),
+        ) == expected,
+        "live capacity grouping differs from provider account snapshot",
+    )?;
+    let scheduler = store.scheduler(60_000).await.map_err(debug_error)?;
+    require(
+        scheduler.capacity.len() == 1,
+        "scheduler capacity grouping duplicated policy",
+    )?;
+    let capacity = &scheduler.capacity[0];
+    require(
+        (
+            capacity.allocated_count.as_str(),
+            capacity.execution_count.as_str(),
+            capacity.upstream_waiting_count.as_str(),
+            capacity.reconciliation_count.as_str(),
+            capacity.available_capacity.as_str(),
+        ) == expected,
+        "scheduler capacity grouping differs from authoritative account capacity",
+    )
 }
 
 async fn seed_large_billing_account(pool: &PgPool) -> TestResult {

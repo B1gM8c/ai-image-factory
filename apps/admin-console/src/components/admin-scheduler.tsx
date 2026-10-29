@@ -1462,10 +1462,10 @@ function CapacityPanel({
               </TableHead>
               <TableHead>
                 {t({
-                  en: "Concurrency",
-                  "zh-CN": "并发使用",
-                  ja: "同時実行数",
-                  ko: "동시 실행",
+                  en: "Concurrency usage",
+                  "zh-CN": "并发占用",
+                  ja: "同時実行枠の使用状況",
+                  ko: "동시 실행 슬롯 사용량",
                 })}
               </TableHead>
               <TableHead className="text-right">
@@ -1540,6 +1540,21 @@ function CapacityRow({ item }: { item: SchedulerCapacity }) {
             {formatInteger(item.max_concurrency)}
           </span>
         </div>
+        <p className="mt-1.5 text-xs tabular-nums text-muted-foreground">
+          {t(
+            {
+              en: "Executing {executing} · Upstream waiting {waiting} · To reconcile {reconciling}",
+              "zh-CN": "执行 {executing} · 上游等待 {waiting} · 待核对 {reconciling}",
+              ja: "実行 {executing} · 上流待機 {waiting} · 要照合 {reconciling}",
+              ko: "실행 {executing} · 업스트림 대기 {waiting} · 확인 필요 {reconciling}",
+            },
+            {
+              executing: formatInteger(item.execution_count),
+              waiting: formatInteger(item.upstream_waiting_count),
+              reconciling: formatInteger(item.reconciliation_count),
+            },
+          )}
+        </p>
       </TableCell>
       <TableCell className="text-right font-mono tabular-nums">
         {formatInteger(item.available_capacity)}

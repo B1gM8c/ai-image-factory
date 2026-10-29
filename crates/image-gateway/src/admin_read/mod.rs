@@ -373,6 +373,9 @@ pub struct ProviderAccountView {
     pub runtime_status: String,
     pub max_concurrency: String,
     pub allocated_count: String,
+    pub execution_count: String,
+    pub upstream_waiting_count: String,
+    pub reconciliation_count: String,
     pub available_capacity: String,
     pub active_submitters: String,
     pub active_pollers: String,
@@ -392,6 +395,9 @@ pub struct ProviderAccountConcurrency {
     pub provider_account_id: String,
     pub max_concurrency: String,
     pub allocated_count: String,
+    pub execution_count: String,
+    pub upstream_waiting_count: String,
+    pub reconciliation_count: String,
     pub available_capacity: String,
 }
 
@@ -447,6 +453,9 @@ pub struct SchedulerCapacity {
     pub account_email: Option<String>,
     pub max_concurrency: String,
     pub allocated_count: String,
+    pub execution_count: String,
+    pub upstream_waiting_count: String,
+    pub reconciliation_count: String,
     pub available_capacity: String,
 }
 

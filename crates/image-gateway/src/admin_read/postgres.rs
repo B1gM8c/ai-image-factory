@@ -944,7 +944,18 @@ impl AdminReadStore for PostgresAdminReadStore {
         let (mut tx, as_of_ms) = self.begin_current_snapshot().await?;
         let accounts = sqlx::query_as::<_, ProviderAccountRow>(
             r#"
-            WITH profile_runtime AS (
+            WITH capacity_breakdown AS (
+                SELECT allocation.resource_policy_id, allocation.resource_policy_revision,
+                       COUNT(*) FILTER (WHERE execution.state IN ('prepared', 'leased', 'running'))::TEXT AS execution_count,
+                       COUNT(*) FILTER (WHERE execution.state = 'provider_waiting')::TEXT AS upstream_waiting_count,
+                       COUNT(*) FILTER (WHERE execution.state NOT IN ('prepared', 'leased', 'running', 'provider_waiting'))::TEXT AS reconciliation_count
+                FROM executor_capacity_allocations allocation
+                JOIN executor_executions execution
+                  ON execution.executor_execution_id = allocation.executor_execution_id
+                 AND execution.submission_id = allocation.submission_id
+                WHERE allocation.state = 'held'
+                GROUP BY allocation.resource_policy_id, allocation.resource_policy_revision
+            ), profile_runtime AS (
                 SELECT account.provider_account_id, account.account_key,
                        account.provider_id, account.state AS account_state,
                        pool.state AS credential_pool_state,
@@ -956,6 +967,7 @@ impl AdminReadStore for PostgresAdminReadStore {
                        control.control_version,
                        control.desired_max_concurrency AS max_concurrency,
                        policy.allocated_count,
+                       policy.resource_policy_id, policy.revision AS resource_policy_revision,
                        (
                            profile.state = 'enabled'
                            AND pool.state = 'enabled'
@@ -1011,7 +1023,7 @@ impl AdminReadStore for PostgresAdminReadStore {
                          profile.operation_id, profile.completion_mode, profile.state,
                          profile.credential_ref, profile.credential_revision,
                          profile.credential_pool_id, profile.provider_account_id,
-                         policy.max_concurrency, policy.allocated_count, policy.state,
+                         policy.max_concurrency, policy.allocated_count, policy.resource_policy_id, policy.revision, policy.state,
                          control.lifecycle_state, control.control_version,
                          control.desired_max_concurrency,
                          policy.credential_pool_id, policy.provider_account_id,
@@ -1068,6 +1080,9 @@ impl AdminReadStore for PostgresAdminReadStore {
                    END AS runtime_status,
                    profile_runtime.max_concurrency::TEXT AS max_concurrency,
                    profile_runtime.allocated_count::TEXT AS allocated_count,
+                   COALESCE(capacity.execution_count, '0') AS execution_count,
+                   COALESCE(capacity.upstream_waiting_count, '0') AS upstream_waiting_count,
+                   COALESCE(capacity.reconciliation_count, '0') AS reconciliation_count,
                    GREATEST(profile_runtime.max_concurrency::NUMERIC
                      - profile_runtime.allocated_count::NUMERIC, 0)::TEXT
                        AS available_capacity,
@@ -1076,6 +1091,9 @@ impl AdminReadStore for PostgresAdminReadStore {
                    profile_runtime.draining_submitters::TEXT AS draining_submitters,
                    profile_runtime.draining_pollers::TEXT AS draining_pollers
             FROM profile_runtime
+            LEFT JOIN capacity_breakdown capacity
+              ON capacity.resource_policy_id = profile_runtime.resource_policy_id
+             AND capacity.resource_policy_revision = profile_runtime.resource_policy_revision
             LEFT JOIN provider_account_environments environment
               ON environment.provider_account_id = profile_runtime.provider_account_id
              AND environment.provider_id = profile_runtime.provider_id
@@ -1123,10 +1141,22 @@ impl AdminReadStore for PostgresAdminReadStore {
         let provider_account_ids = provider_account_ids.map(<[Uuid]>::to_vec);
         let accounts = sqlx::query_as::<_, ProviderAccountConcurrencyRow>(
             r#"
-            WITH ranked_runtime AS (
+            WITH capacity_breakdown AS (
+                SELECT allocation.resource_policy_id, allocation.resource_policy_revision,
+                       COUNT(*) FILTER (WHERE execution.state IN ('prepared', 'leased', 'running'))::TEXT AS execution_count,
+                       COUNT(*) FILTER (WHERE execution.state = 'provider_waiting')::TEXT AS upstream_waiting_count,
+                       COUNT(*) FILTER (WHERE execution.state NOT IN ('prepared', 'leased', 'running', 'provider_waiting'))::TEXT AS reconciliation_count
+                FROM executor_capacity_allocations allocation
+                JOIN executor_executions execution
+                  ON execution.executor_execution_id = allocation.executor_execution_id
+                 AND execution.submission_id = allocation.submission_id
+                WHERE allocation.state = 'held'
+                GROUP BY allocation.resource_policy_id, allocation.resource_policy_revision
+            ), ranked_runtime AS (
                 SELECT profile.provider_account_id,
                        control.desired_max_concurrency AS max_concurrency,
                        policy.allocated_count,
+                       policy.resource_policy_id, policy.revision AS resource_policy_revision,
                        ROW_NUMBER() OVER (
                            PARTITION BY profile.provider_account_id
                            ORDER BY CASE profile.operation_id
@@ -1147,12 +1177,18 @@ impl AdminReadStore for PostgresAdminReadStore {
                 WHERE $1::UUID[] IS NULL
                    OR profile.provider_account_id = ANY($1)
             )
-            SELECT provider_account_id,
+            SELECT runtime.provider_account_id,
                    max_concurrency::TEXT AS max_concurrency,
                    allocated_count::TEXT AS allocated_count,
+                   COALESCE(capacity.execution_count, '0') AS execution_count,
+                   COALESCE(capacity.upstream_waiting_count, '0') AS upstream_waiting_count,
+                   COALESCE(capacity.reconciliation_count, '0') AS reconciliation_count,
                    GREATEST(max_concurrency::NUMERIC - allocated_count::NUMERIC, 0)::TEXT
                        AS available_capacity
-            FROM ranked_runtime
+            FROM ranked_runtime runtime
+            LEFT JOIN capacity_breakdown capacity
+              ON capacity.resource_policy_id = runtime.resource_policy_id
+             AND capacity.resource_policy_revision = runtime.resource_policy_revision
             WHERE runtime_rank = 1
             ORDER BY provider_account_id
             "#,
@@ -1451,15 +1487,33 @@ impl AdminReadStore for PostgresAdminReadStore {
         .collect();
         let capacity = sqlx::query_as::<_, SchedulerCapacityRow>(
             r#"
+            WITH capacity_breakdown AS (
+                SELECT allocation.resource_policy_id, allocation.resource_policy_revision,
+                       COUNT(*) FILTER (WHERE execution.state IN ('prepared', 'leased', 'running'))::TEXT AS execution_count,
+                       COUNT(*) FILTER (WHERE execution.state = 'provider_waiting')::TEXT AS upstream_waiting_count,
+                       COUNT(*) FILTER (WHERE execution.state NOT IN ('prepared', 'leased', 'running', 'provider_waiting'))::TEXT AS reconciliation_count
+                FROM executor_capacity_allocations allocation
+                JOIN executor_executions execution
+                  ON execution.executor_execution_id = allocation.executor_execution_id
+                 AND execution.submission_id = allocation.submission_id
+                WHERE allocation.state = 'held'
+                GROUP BY allocation.resource_policy_id, allocation.resource_policy_revision
+            )
             SELECT account.provider_account_id, account.account_key,
                    policy.provider_id, environment.display_name,
                    environment.account_email,
                    control.desired_max_concurrency::TEXT AS max_concurrency,
                    policy.allocated_count::TEXT AS allocated_count,
+                   COALESCE(capacity.execution_count, '0') AS execution_count,
+                   COALESCE(capacity.upstream_waiting_count, '0') AS upstream_waiting_count,
+                   COALESCE(capacity.reconciliation_count, '0') AS reconciliation_count,
                    GREATEST(control.desired_max_concurrency::NUMERIC
                      - policy.allocated_count::NUMERIC, 0)::TEXT
                        AS available_capacity
             FROM executor_resource_policies policy
+            LEFT JOIN capacity_breakdown capacity
+              ON capacity.resource_policy_id = policy.resource_policy_id
+             AND capacity.resource_policy_revision = policy.revision
             JOIN provider_accounts account
               ON account.provider_account_id = policy.provider_account_id
              AND account.credential_pool_id = policy.credential_pool_id
@@ -2232,6 +2286,9 @@ struct ProviderAccountRow {
     runtime_status: String,
     max_concurrency: String,
     allocated_count: String,
+    execution_count: String,
+    upstream_waiting_count: String,
+    reconciliation_count: String,
     available_capacity: String,
     active_submitters: String,
     active_pollers: String,
@@ -2290,6 +2347,9 @@ impl From<ProviderAccountRow> for ProviderAccountView {
             runtime_status: row.runtime_status,
             max_concurrency: row.max_concurrency,
             allocated_count: row.allocated_count,
+            execution_count: row.execution_count,
+            upstream_waiting_count: row.upstream_waiting_count,
+            reconciliation_count: row.reconciliation_count,
             available_capacity: row.available_capacity,
             active_submitters: row.active_submitters,
             active_pollers: row.active_pollers,
@@ -2305,6 +2365,9 @@ struct ProviderAccountConcurrencyRow {
     provider_account_id: Uuid,
     max_concurrency: String,
     allocated_count: String,
+    execution_count: String,
+    upstream_waiting_count: String,
+    reconciliation_count: String,
     available_capacity: String,
 }
 
@@ -2314,6 +2377,9 @@ impl From<ProviderAccountConcurrencyRow> for ProviderAccountConcurrency {
             provider_account_id: row.provider_account_id.to_string(),
             max_concurrency: row.max_concurrency,
             allocated_count: row.allocated_count,
+            execution_count: row.execution_count,
+            upstream_waiting_count: row.upstream_waiting_count,
+            reconciliation_count: row.reconciliation_count,
             available_capacity: row.available_capacity,
         }
     }
@@ -2375,6 +2441,9 @@ struct SchedulerCapacityRow {
     account_email: Option<String>,
     max_concurrency: String,
     allocated_count: String,
+    execution_count: String,
+    upstream_waiting_count: String,
+    reconciliation_count: String,
     available_capacity: String,
 }
 
@@ -2474,6 +2543,9 @@ impl From<SchedulerCapacityRow> for SchedulerCapacity {
             account_email: row.account_email,
             max_concurrency: row.max_concurrency,
             allocated_count: row.allocated_count,
+            execution_count: row.execution_count,
+            upstream_waiting_count: row.upstream_waiting_count,
+            reconciliation_count: row.reconciliation_count,
             available_capacity: row.available_capacity,
         }
     }

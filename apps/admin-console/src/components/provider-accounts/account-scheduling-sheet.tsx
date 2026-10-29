@@ -49,6 +49,7 @@ import {
 import { useI18n } from "@/i18n/locale-provider";
 import type {
   GrokVideoOutput,
+  ProviderAccountConcurrency,
   ProviderAccountModels,
   ProviderAccountView,
   ProviderModelView,
@@ -79,6 +80,7 @@ const DEFAULT_QINIU_REGION = QINIU_REGIONS[0].id;
 
 export function AccountSchedulingSheet({
   account,
+  capacity,
   open,
   onOpenChange,
   initialTab = "scheduling",
@@ -88,6 +90,7 @@ export function AccountSchedulingSheet({
   onSaved,
 }: {
   account: ProviderAccountView | null;
+  capacity?: ProviderAccountConcurrency;
   open: boolean;
   onOpenChange: (open: boolean) => void;
   initialTab?: AccountSettingsTab;
@@ -273,7 +276,8 @@ export function AccountSchedulingSheet({
 
   if (!account) return null;
   const currentAccount = account;
-  const allocated = Number(account.allocated_count);
+  const currentCapacity = capacity ?? account;
+  const allocated = Number(currentCapacity.allocated_count);
   const memberships = groups.flatMap((group) =>
     group.members
       .filter(
@@ -795,14 +799,15 @@ export function AccountSchedulingSheet({
                 <div className="flex items-center justify-between gap-4 text-sm">
                   <span className="text-muted-foreground">
                     {t({
-                      en: "Live concurrency",
-                      "zh-CN": "实时并发",
-                      ja: "リアルタイム同時実行数",
-                      ko: "실시간 동시 실행",
+                      en: "Concurrency usage",
+                      "zh-CN": "并发占用",
+                      ja: "同時実行枠の使用状況",
+                      ko: "동시 실행 슬롯 사용량",
                     })}
                   </span>
                   <span className="tabular-nums">
-                    {account.allocated_count} / {account.max_concurrency}
+                    {currentCapacity.allocated_count} /{" "}
+                    {currentCapacity.max_concurrency}
                     <span className="ml-2 text-muted-foreground">
                       {t(
                         {
@@ -811,34 +816,49 @@ export function AccountSchedulingSheet({
                           ja: "利用可能 {count}",
                           ko: "사용 가능 {count}",
                         },
-                        { count: account.available_capacity },
+                        { count: currentCapacity.available_capacity },
                       )}
                     </span>
                   </span>
                 </div>
                 <Progress
                   value={
-                    Number(account.max_concurrency) > 0
+                    Number(currentCapacity.max_concurrency) > 0
                       ? Math.min(
                           100,
-                          (allocated / Number(account.max_concurrency)) * 100,
+                          (allocated / Number(currentCapacity.max_concurrency)) * 100,
                         )
                       : 0
                   }
                   aria-label={t(
                     {
-                      en: "Current concurrency {current}, maximum {maximum}",
-                      "zh-CN": "当前并发 {current}，最大并发 {maximum}",
-                      ja: "現在の同時実行数 {current}、最大 {maximum}",
-                      ko: "현재 동시 실행 {current}, 최대 {maximum}",
+                      en: "Occupied slots {current}, maximum {maximum}",
+                      "zh-CN": "当前占用 {current}，最大并发 {maximum}",
+                      ja: "現在の使用枠 {current}、最大 {maximum}",
+                      ko: "현재 사용 슬롯 {current}, 최대 {maximum}",
                     },
                     {
-                      current: account.allocated_count,
-                      maximum: account.max_concurrency,
+                      current: currentCapacity.allocated_count,
+                      maximum: currentCapacity.max_concurrency,
                     },
                   )}
                   className="h-1.5"
                 />
+                <p className="text-xs tabular-nums text-muted-foreground">
+                  {t(
+                    {
+                      en: "Executing {executing} · Upstream waiting {waiting} · To reconcile {reconciling}",
+                      "zh-CN": "执行 {executing} · 上游等待 {waiting} · 待核对 {reconciling}",
+                      ja: "実行 {executing} · 上流待機 {waiting} · 要照合 {reconciling}",
+                      ko: "실행 {executing} · 업스트림 대기 {waiting} · 확인 필요 {reconciling}",
+                    },
+                    {
+                      executing: currentCapacity.execution_count,
+                      waiting: currentCapacity.upstream_waiting_count,
+                      reconciling: currentCapacity.reconciliation_count,
+                    },
+                  )}
+                </p>
               </div>
               {maxConcurrency < allocated ? (
                 <p className="border-l-2 border-foreground/30 pl-3 text-sm text-muted-foreground">
