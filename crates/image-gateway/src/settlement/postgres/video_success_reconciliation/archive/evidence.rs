@@ -51,6 +51,7 @@ pub(super) struct Review {
 pub(super) struct Evidence {
     pub review: Review,
     pub command: DreaminaSubmitRequestV1,
+    pub duration_seconds: u32,
     pub query_sha256: String,
     pub audit_sha256: String,
     pub video_url: String,
@@ -127,7 +128,8 @@ pub(super) fn load(
     let DreaminaSubmitRequestV1::MultimodalToVideo(video_command) = &command else {
         return Err(conflict());
     };
-    if video_command.duration_seconds() != 10 || video_command.resolution().as_str() != "720p" {
+    let duration_seconds = u32::from(video_command.duration_seconds());
+    if !matches!(duration_seconds, 10 | 15) || video_command.resolution().as_str() != "720p" {
         return Err(conflict());
     }
     let identity = SingleOutputCommand::new(
@@ -290,7 +292,8 @@ pub(super) fn load(
             return Err(conflict());
         }
     }
-    if flags.get("--duration").map(Vec::as_slice) != Some(["10"].as_slice()) {
+    let duration_arg = duration_seconds.to_string();
+    if flags.get("--duration").map(Vec::as_slice) != Some([duration_arg.as_str()].as_slice()) {
         return Err(conflict());
     }
     let log = String::from_utf8(bound("source-account-log.bin", 4 * MAX_JSON, false)?)
@@ -471,15 +474,17 @@ pub(super) fn load(
     let (width, height) = metadata.dimensions().ok_or_else(conflict)?;
     if width != 1280
         || height != 720
-        || metadata
-            .duration_ms()
-            .is_none_or(|ms| !(9000..=11000).contains(&ms))
+        || metadata.duration_ms().is_none_or(|ms| {
+            !(u64::from(duration_seconds) * 1000 - 1000..=u64::from(duration_seconds) * 1000 + 1000)
+                .contains(&ms)
+        })
     {
         return Err(conflict());
     }
     Ok(Evidence {
         review,
         command,
+        duration_seconds,
         query_sha256: sha256_hex(&query),
         audit_sha256: sha256_hex(&audit_bytes),
         video_url: remote.video_url().into(),

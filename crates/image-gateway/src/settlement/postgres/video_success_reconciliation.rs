@@ -267,7 +267,7 @@ pub async fn resolve_dreamina_video_success(
         .bind(request.job_id).bind(&row.api_profile).bind(&row.operation).bind(now / 1000)
         .bind(video.resolution().as_str()).bind(row.limit_5h).bind(row.remaining_5h)
         .bind(row.limit_7d).bind(row.remaining_7d).bind(now).execute(&mut *tx).await.map_err(storage_conflict)?;
-    transition(&mut tx, request, &row, now).await?;
+    transition(&mut tx, request, &row, 10, now).await?;
     persist_customer_usage_facts_with_operator_video_resolution(
         &mut tx,
         &CustomerUsageOutput {
@@ -311,11 +311,12 @@ async fn transition(
     tx: &mut Transaction<'_, Postgres>,
     request: &DreaminaVideoSuccessResolutionRequest,
     row: &LockedJob,
+    duration_seconds: u32,
     now: i64,
 ) -> Result<(), ImageGatewayError> {
     for (query, id) in [
         (
-            "UPDATE jobs SET state='succeeded',charged_units=10,last_error_code=NULL,updated_at_ms=$2 WHERE job_id=$1 AND state='uncertain' AND charged_units=0",
+            "UPDATE jobs SET state='succeeded',charged_units=billable_units,last_error_code=NULL,updated_at_ms=$2 WHERE job_id=$1 AND state='uncertain' AND charged_units=0",
             request.job_id,
         ),
         (
@@ -331,7 +332,7 @@ async fn transition(
             row.output_id,
         ),
         (
-            "UPDATE quota_reservations SET state='committed',committed_units=10,updated_at_ms=$2 WHERE reservation_id=$1 AND state IN ('reserved','expired') AND requested_units=10 AND committed_units=0 AND released_units=0",
+            "UPDATE quota_reservations SET state='committed',committed_units=requested_units,updated_at_ms=$2 WHERE reservation_id=$1 AND state IN ('reserved','expired') AND committed_units=0 AND released_units=0",
             row.reservation_id,
         ),
     ] {
@@ -358,10 +359,10 @@ async fn transition(
     if expected == 0 || updated.rows_affected() != expected as u64 {
         return Err(conflict());
     }
-    sqlx::query("INSERT INTO usage_events (event_id,tenant_id,job_id,request_id,operation,units,outcome,billing_metric,billing_unit,created_at_ms) VALUES ($1,$2,$3,$4,$5,10,'charged','video_second','second',$6)")
-        .bind(Uuid::new_v4()).bind(&row.tenant_id).bind(request.job_id).bind(&row.request_id).bind(&row.operation).bind(now).execute(&mut **tx).await.map_err(storage_conflict)?;
-    sqlx::query("INSERT INTO metering_events (event_id,tenant_id,job_id,reservation_id,request_id,operation,event_type,units,outcome,billing_metric,billing_unit,created_at_ms) VALUES ($1,$2,$3,$4,$5,$6,'operator_video_success',10,'succeeded','video_second','second',$7)")
-        .bind(Uuid::new_v4()).bind(&row.tenant_id).bind(request.job_id).bind(row.reservation_id).bind(&row.request_id).bind(&row.operation).bind(now).execute(&mut **tx).await.map_err(storage_conflict)?;
+    sqlx::query("INSERT INTO usage_events (event_id,tenant_id,job_id,request_id,operation,units,outcome,billing_metric,billing_unit,created_at_ms) VALUES ($1,$2,$3,$4,$5,$7,'charged','video_second','second',$6)")
+        .bind(Uuid::new_v4()).bind(&row.tenant_id).bind(request.job_id).bind(&row.request_id).bind(&row.operation).bind(now).bind(i32::try_from(duration_seconds).map_err(|_| conflict())?).execute(&mut **tx).await.map_err(storage_conflict)?;
+    sqlx::query("INSERT INTO metering_events (event_id,tenant_id,job_id,reservation_id,request_id,operation,event_type,units,outcome,billing_metric,billing_unit,created_at_ms) VALUES ($1,$2,$3,$4,$5,$6,'operator_video_success',$8,'succeeded','video_second','second',$7)")
+        .bind(Uuid::new_v4()).bind(&row.tenant_id).bind(request.job_id).bind(row.reservation_id).bind(&row.request_id).bind(&row.operation).bind(now).bind(i32::try_from(duration_seconds).map_err(|_| conflict())?).execute(&mut **tx).await.map_err(storage_conflict)?;
     Ok(())
 }
 

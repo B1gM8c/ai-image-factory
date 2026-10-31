@@ -124,24 +124,24 @@ pub async fn resolve_dreamina_video_archive(
         JOIN admission_sessions admission ON admission.session_id = payload.admission_session_id
         WHERE job.job_id = $1 AND submission.submission_id = $2 AND execution.executor_execution_id = $3
           AND job.provider_id = 'dreamina-cli' AND job.operation = 'video_generation'
-          AND job.output_count = 1 AND job.billable_units = 10 AND job.requested_units = 10
+          AND job.output_count = 1 AND job.billable_units = $7 AND job.requested_units = $7
           AND job.economics_contract_version = 4 AND job.state = 'uncertain' AND job.charged_units = 0
           AND job.last_error_code = 'provider_submit_deadline'
           AND intent.state = 'deadline_quarantined' AND intent.remote_operation_id IS NULL
           AND intent.provider_command_sha256 = $5 AND intent.execution_binding_sha256 = $6
           AND work.state = 'uncertain' AND work.lease_owner IS NULL AND work.lease_expires_at_ms IS NULL
-          AND attempt.state = 'uncertain' AND output.state = 'uncertain' AND output.output_index = 0 AND output.billable_units = 10
+          AND attempt.state = 'uncertain' AND output.state = 'uncertain' AND output.output_index = 0 AND output.billable_units = $7
           AND submission.state = 'uncertain' AND execution.state = 'uncertain'
           AND execution.executor_owner IS NULL AND execution.lease_expires_at_ms IS NULL
           AND reduction.state = 'completed' AND reduction.resolved_state = 'uncertain'
           AND reduction.customer_artifact_id IS NULL AND receipt.outcome = 'uncertain'
           AND allocation.state = 'held'
-          AND quota.state IN ('reserved','expired') AND quota.committed_units = 0 AND quota.released_units = 0
+          AND quota.requested_units = $7 AND quota.state IN ('reserved','expired') AND quota.committed_units = 0 AND quota.released_units = 0
           AND hold.state = 'held' AND hold.captured_micros = 0 AND hold.released_micros = 0
         FOR UPDATE OF work, attempt, output, submission, execution, intent, reduction, allocation, quota, hold
         "#,
     ).bind(request.job_id).bind(request.submission_id).bind(request.executor_execution_id)
-        .bind(&evidence.review.remote_operation_id).bind(&evidence.review.provider_command_sha256).bind(&evidence.review.execution_binding_sha256)
+        .bind(&evidence.review.remote_operation_id).bind(&evidence.review.provider_command_sha256).bind(&evidence.review.execution_binding_sha256).bind(i32::try_from(evidence.duration_seconds).map_err(|_| conflict())?)
         .fetch_optional(&mut *tx).await.map_err(unavailable)?.ok_or_else(conflict)?;
     let idempotency_rows: Vec<i32> =
         sqlx::query_scalar("SELECT 1 FROM idempotency_requests WHERE job_id = $1 FOR UPDATE")
@@ -182,7 +182,7 @@ pub async fn resolve_dreamina_video_archive(
         json!(crate::admission::PricingProcessingMode::Synchronous.as_str()),
     );
     if facts.output_count != 1
-        || facts.output_billable_units != 10
+        || facts.output_billable_units != evidence.duration_seconds
         || dimensions != row.request_dimensions_json
     {
         return Err(conflict());
@@ -269,7 +269,14 @@ pub async fn resolve_dreamina_video_archive(
         reviewed_stdout_sha256: evidence.query_sha256.clone(),
         operator_reference: request.operator_reference.clone(),
     };
-    transition(&mut tx, &transition_request, &row, now).await?;
+    transition(
+        &mut tx,
+        &transition_request,
+        &row,
+        evidence.duration_seconds,
+        now,
+    )
+    .await?;
     persist_customer_usage_facts_with_operator_video_resolution(
         &mut tx,
         &CustomerUsageOutput {
@@ -280,7 +287,8 @@ pub async fn resolve_dreamina_video_archive(
             operation: &row.operation,
             billing_metric: "video_second",
             billing_unit: "second",
-            output_billable_units: 10,
+            output_billable_units: i32::try_from(evidence.duration_seconds)
+                .map_err(|_| conflict())?,
             terminal_outcome: "succeeded",
         },
         CustomerUsageAuthority::Durable {
@@ -297,7 +305,7 @@ pub async fn resolve_dreamina_video_archive(
         .map_err(|_| conflict())?;
     let payload = json!({"resolution_id":resolution_id,"submission_id":request.submission_id,"executor_execution_id":request.executor_execution_id,
         "original_receipt_id":row.original_receipt_id,"artifact_id":artifact_id,"archive_sha256":evidence.video_sha256,
-        "evidence_mode":evidence::MODE,"delivered_count":1,"committed_units":10,"currency":rating.currency,
+        "evidence_mode":evidence::MODE,"delivered_count":1,"committed_units":evidence.duration_seconds,"currency":rating.currency,
         "captured_micros":rating.total_amount_micros,"reviewed_stdout_sha256":evidence.query_sha256});
     for table in ["job_events", "outbox_events"] {
         sqlx::query(AssertSqlSafe(format!("INSERT INTO {table} (event_id,job_id,event_type,semantic_key,payload_json,created_at_ms) VALUES ($1,$2,'job.succeeded','job.operator_dreamina_video_success',$3,$4)")))

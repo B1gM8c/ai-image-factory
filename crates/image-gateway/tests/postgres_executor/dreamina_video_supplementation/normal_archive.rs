@@ -31,13 +31,33 @@ async fn normal_original(
     audio_count: usize,
     grant_micros: i64,
 ) -> TestResult<Fixture> {
-    let work = seed_supplement_video(pool, model, audio_count).await?;
-    let price = if model == "seedance2.0mini" {
-        800_000
+    normal_original_duration(
+        pool,
+        model,
+        audio_count,
+        grant_micros,
+        10,
+        "dreamina_submit_receipt_invalid",
+    )
+    .await
+}
+
+async fn normal_original_duration(
+    pool: &PgPool,
+    model: &'static str,
+    audio_count: usize,
+    grant_micros: i64,
+    duration_seconds: u32,
+    failure_code: &str,
+) -> TestResult<Fixture> {
+    let work = seed_supplement_video_duration(pool, model, audio_count, duration_seconds).await?;
+    let unit_price = if model == "seedance2.0mini" {
+        80_000
     } else {
-        1_200_000
+        120_000
     };
-    seed_v4_customer_quote_with_funding(pool,&work,V4CustomerQuoteIdentity{provider_model_id:model,public_model_id:model,dimensions:json!({"duration":"10","ratio":"16:9","resolution":"720p","processing_mode":"synchronous","workflow":"multimodal2video","input_image_count":"1","input_video_count":"0","input_audio_count":audio_count.to_string()}),..V4CustomerQuoteIdentity::dreamina_video()},V4CustomerQuoteBasis{metric:"video_requested_second",unit:"second",unit_size:1,unit_price_micros:price/10,quantity_source:"request_derived",confidence:"exact",max_quantity:10,max_amount_micros:price},grant_micros).await?;
+    let price = unit_price * i64::from(duration_seconds);
+    seed_v4_customer_quote_with_funding(pool,&work,V4CustomerQuoteIdentity{provider_model_id:model,public_model_id:model,dimensions:json!({"duration":duration_seconds.to_string(),"ratio":"16:9","resolution":"720p","processing_mode":"synchronous","workflow":"multimodal2video","input_image_count":"1","input_video_count":"0","input_audio_count":audio_count.to_string()}),..V4CustomerQuoteIdentity::dreamina_video()},V4CustomerQuoteBasis{metric:"video_requested_second",unit:"second",unit_size:1,unit_price_micros:unit_price,quantity_source:"request_derived",confidence:"exact",max_quantity:i64::from(duration_seconds),max_amount_micros:price},grant_micros).await?;
     let executor = PostgresExecutorSubmissionStore::new(pool.clone());
     executor
         .prepare_and_handoff(&work, DREAMINA_VIDEO_PROFILE_ID)
@@ -94,7 +114,7 @@ async fn normal_original(
                 kind:
                     gpt_image_2_gateway::provider_tasks::ProviderSubmitFailureKind::OutcomeUnknown,
                 event_identity: "offline-empty-normal-submit".into(),
-                error_code: "dreamina_submit_receipt_invalid".into(),
+                error_code: failure_code.into(),
                 execution_binding_sha256: binding,
                 recovery_fence: None,
             },
@@ -157,9 +177,11 @@ async fn recovery_evidence(
         "SELECT payload.command_json,intent.execution_binding_sha256,intent.provider_command_sha256 FROM job_payloads payload JOIN provider_submissions submission USING(job_id) JOIN provider_remote_submit_intents intent USING(submission_id) WHERE payload.job_id=$1")
         .bind(fixture.request.job_id).fetch_one(pool).await.map_err(debug_error)?;
     let command_bytes = serde_json::to_vec(&command).map_err(debug_error)?;
+    let duration = command["duration"].as_u64().ok_or("duration")? as u32;
+    let video = mp4(1280, 720, duration * 1000);
     let native = Uuid::new_v4().to_string();
     let nonce = Uuid::new_v4();
-    let source = json!({"prompt":command["prompt"],"model_version":command["model_version"],"ratio":"16:9","duration":10,"video_resolution":"720p","image_paths":["/offline/image-0.png"],"audio_paths":["/offline/audio-0.mp3"]});
+    let source = json!({"prompt":command["prompt"],"model_version":command["model_version"],"ratio":"16:9","duration":duration,"video_resolution":"720p","image_paths":["/offline/image-0.png"],"audio_paths":["/offline/audio-0.mp3"]});
     let start = format!(
         "INFO 2026-10-01 00:00:00,000 traceABC [SubmitTask] start submit generation task input={source}"
     );
@@ -172,12 +194,12 @@ async fn recovery_evidence(
     .unix_timestamp_nanos()
         / 1_000_000) as i64;
     let spec = json!({"provider_id":"dreamina-cli","provider_account_id":DREAMINA_ACCOUNT_ID,"command_schema":DREAMINA_SUBMIT_COMMAND_SCHEMA,"adapter_revision":DREAMINA_ADAPTER_REVISION,"output_index":0,"output_total":1,"submission_id":fixture.request.submission_id,"executor_execution_id":fixture.request.executor_execution_id,"provider_command_sha256":provider_hash,"execution_binding_sha256":binding,"command_bytes_sha256":sha256(&command_bytes),"command_byte_size":command_bytes.len()});
-    let gate = json!({"environment":{"HOME":"/offline/supplement-home"},"submission_id":fixture.request.submission_id,"execution_binding_sha256":binding,"launch_nonce":nonce,"executable":"/offline/dreamina","executable_sha256":"e".repeat(64),"arguments":["multimodal2video","--prompt",command["prompt"],"--model_version",command["model_version"],"--ratio","16:9","--video_resolution","720p","--duration","10","--image","/offline/image-0.png","--audio","/offline/audio-0.mp3","--poll=0"]});
+    let gate = json!({"environment":{"HOME":"/offline/supplement-home"},"submission_id":fixture.request.submission_id,"execution_binding_sha256":binding,"launch_nonce":nonce,"executable":"/offline/dreamina","executable_sha256":"e".repeat(64),"arguments":["multimodal2video","--prompt",command["prompt"],"--model_version",command["model_version"],"--ratio","16:9","--video_resolution","720p","--duration",duration.to_string(),"--image","/offline/image-0.png","--audio","/offline/audio-0.mp3","--poll=0"]});
     let mut terminal = json!({"execution_binding_sha256":binding,"launch_nonce":nonce,"helper_nonce":Uuid::new_v4(),"child_nonce":Uuid::new_v4(),"released":true,"exec_started":true,"outcome":{"state":"exited","exit_code":0,"signal":null},"stdout_truncated":false,"stderr_truncated":false,"stdout_base64":"","stderr_base64":""});
     terminal["payload_sha256"] = json!(terminal_payload_sha256(&terminal)?);
-    let query=serde_json::to_vec(&json!({"submit_id":native,"gen_status":"success","prompt":command["prompt"],"result_json":{"images":[],"videos":[{"video_url":URL,"duration":10}]}})).map_err(debug_error)?;
+    let query=serde_json::to_vec(&json!({"submit_id":native,"gen_status":"success","prompt":command["prompt"],"result_json":{"images":[],"videos":[{"video_url":URL,"duration":duration}]}})).map_err(debug_error)?;
     let audit = json!({"native_id":native,"exit_code":0,"timed_out":false,"query_only":true,"generation_calls":0,"business_writes":0,"stdout_sha256":sha256(&query),"stdout_bytes":query.len(),"stderr_bytes":0,"executable_sha256":"e".repeat(64),"argv":["/offline/dreamina","query_result","--submit_id",native],"started_at":"2026-10-01T00:00:02+08:00","finished_at":"2026-10-01T00:00:03+08:00"});
-    let archive = json!({"native_id":native,"query_sha256":sha256(&query),"original_sha256":sha256(video_bytes()),"original_bytes":video_bytes().len(),"public_dns_pinned":true,"tls_hostname_verified":true,"transcoded":false,"generation_calls":0,"business_writes":0,"hops":[{"host":"media.example.test","status":200}],"started_at":"2026-10-01T00:00:04+08:00","finished_at":"2026-10-01T00:00:05+08:00"});
+    let archive = json!({"native_id":native,"query_sha256":sha256(&query),"original_sha256":sha256(&video),"original_bytes":video.len(),"public_dns_pinned":true,"tls_hostname_verified":true,"transcoded":false,"generation_calls":0,"business_writes":0,"hops":[{"host":"media.example.test","status":200}],"started_at":"2026-10-01T00:00:04+08:00","finished_at":"2026-10-01T00:00:05+08:00"});
     let mut files = std::collections::BTreeMap::new();
     for (name, bytes) in [
         ("command.bin", command_bytes),
@@ -204,7 +226,7 @@ async fn recovery_evidence(
             b"# Offline fixture: never executed\n".to_vec(),
         ),
         ("query-stderr.bin", Vec::new()),
-        ("original-video.mp4", video_bytes().to_vec()),
+        ("original-video.mp4", video),
         (
             "archive-audit.json",
             serde_json::to_vec(&archive).map_err(debug_error)?,
@@ -764,4 +786,138 @@ async fn normal_archive_wins_shared_native_race_and_blocks_other_normal_writer()
 #[tokio::test]
 async fn normal_archive_loses_shared_native_race_without_delivery_or_charge() -> TestResult {
     native_authority_race(false).await
+}
+
+#[tokio::test]
+async fn normal_archive_fifteen_seconds_preserves_exact_units_and_unique_settlement() -> TestResult
+{
+    let Some(db) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let fixture = normal_original_duration(&db.pool, "seedance2.0fast_vip", 1, 0, 15, "dreamina_submit_recovery_evidence_invalid").await?;
+        let request = recovery_evidence(&db.pool, &fixture).await?;
+        let blobs = InMemoryArtifactBlobStore::default();
+        let first = resolve_dreamina_video_archive(&db.pool, &blobs, &fixture.root, &request).await.map_err(debug_error)?;
+        let again = resolve_dreamina_video_archive(&db.pool, &blobs, &fixture.root, &request).await.map_err(debug_error)?;
+        require(first == again && first.archive_sha256 == sha256(&mp4(1280,720,15000)), "15s original replay changed result")?;
+        let units:(i32,i32,i64,i64,i64,i64)=sqlx::query_as("SELECT job.charged_units,quota.committed_units,hold.captured_micros,(SELECT count(*) FROM ledger_transactions WHERE source_job_id=$1),(SELECT units::BIGINT FROM usage_events WHERE job_id=$1 AND outcome='charged'),(SELECT quantity::BIGINT FROM provider_usage_facts WHERE job_id=$1) FROM jobs job JOIN quota_reservations quota USING(reservation_id) JOIN customer_billing_holds hold ON hold.job_id=job.job_id WHERE job.job_id=$1").bind(request.job_id).fetch_one(&db.pool).await.map_err(debug_error)?;
+        require(units == (15,15,1_800_000,1,15,15), format!("15s billing mismatch: {units:?}"))?;
+        for query in [
+            "UPDATE jobs SET charged_units=10 WHERE job_id=$1",
+            "UPDATE quota_reservations SET committed_units=10 WHERE job_id=$1",
+            "UPDATE customer_price_quote_lines SET max_quantity=10 WHERE job_id=$1",
+            "UPDATE provider_usage_facts SET quantity=10 WHERE job_id=$1",
+        ] {
+            let mut tx=db.pool.begin().await.map_err(debug_error)?;
+            let mutation=sqlx::query(query).bind(request.job_id).execute(&mut *tx).await;
+            let rejected=if mutation.is_err() {tx.rollback().await.map_err(debug_error)?;true} else {tx.commit().await.is_err()};
+            require(rejected,format!("settlement/quote mismatch was accepted: {query}"))?;
+        }
+        Ok(())
+    }.await;
+    let cleanup = db.cleanup().await;
+    result.and(cleanup)
+}
+
+async fn rejects_cross_duration_evidence(duration: u32) -> TestResult {
+    let Some(db) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let fixture = normal_original_duration(
+            &db.pool,
+            "seedance2.0fast_vip",
+            1,
+            0,
+            duration,
+            "dreamina_submit_recovery_evidence_invalid",
+        )
+        .await?;
+        let request = recovery_evidence(&db.pool, &fixture).await?;
+        let other = if duration == 10 { 15 } else { 10 };
+        let original_review: serde_json::Value = serde_json::from_slice(
+            &fs::read(fixture.root.join("review.json")).map_err(debug_error)?,
+        )
+        .map_err(debug_error)?;
+        let original_gate =
+            fs::read(fixture.root.join("process-request.json")).map_err(debug_error)?;
+        let original_archive =
+            fs::read(fixture.root.join("archive-audit.json")).map_err(debug_error)?;
+        for case in ["cli", "media", "missing"] {
+            let mut review = original_review.clone();
+            let mut gate: serde_json::Value =
+                serde_json::from_slice(&original_gate).map_err(debug_error)?;
+            let mut archive: serde_json::Value =
+                serde_json::from_slice(&original_archive).map_err(debug_error)?;
+            let mut video = mp4(1280, 720, duration * 1000);
+            if case == "cli" {
+                let args = gate["arguments"].as_array_mut().ok_or("args")?;
+                let index = args
+                    .iter()
+                    .position(|v| v == "--duration")
+                    .ok_or("duration flag")?;
+                args[index + 1] = json!(other.to_string());
+            }
+            if case == "media" {
+                video = mp4(1280, 720, other * 1000);
+                archive["original_sha256"] = json!(sha256(&video));
+                archive["original_bytes"] = json!(video.len());
+            }
+            for (name, bytes) in [
+                (
+                    "process-request.json",
+                    serde_json::to_vec(&gate).map_err(debug_error)?,
+                ),
+                (
+                    "archive-audit.json",
+                    serde_json::to_vec(&archive).map_err(debug_error)?,
+                ),
+                ("original-video.mp4", video),
+            ] {
+                review["files"][name] = json!(sha256(&bytes));
+                write(&fixture.root, name, &bytes)?;
+            }
+            if case == "missing" {
+                fs::remove_file(fixture.root.join("process-terminal.json")).map_err(debug_error)?;
+            }
+            let bytes = serde_json::to_vec(&review).map_err(debug_error)?;
+            write(&fixture.root, "review.json", &bytes)?;
+            let mut changed = request.clone();
+            changed.reviewed_recovery_sha256 = sha256(&bytes);
+            require(
+                resolve_dreamina_video_archive(
+                    &db.pool,
+                    &InMemoryArtifactBlobStore::default(),
+                    &fixture.root,
+                    &changed,
+                )
+                .await
+                .is_err(),
+                format!("{duration}s accepted {case} mismatch"),
+            )?;
+            assert_pending(&db.pool, request.job_id).await?;
+            let count: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM ledger_transactions WHERE source_job_id=$1",
+            )
+            .bind(request.job_id)
+            .fetch_one(&db.pool)
+            .await
+            .map_err(debug_error)?;
+            require(count == 0, "invalid evidence charged original")?;
+        }
+        Ok(())
+    }
+    .await;
+    let cleanup = db.cleanup().await;
+    result.and(cleanup)
+}
+
+#[tokio::test]
+async fn normal_archive_ten_seconds_rejects_fifteen_seconds_and_missing_evidence() -> TestResult {
+    rejects_cross_duration_evidence(10).await
+}
+#[tokio::test]
+async fn normal_archive_fifteen_seconds_rejects_ten_seconds_and_missing_evidence() -> TestResult {
+    rejects_cross_duration_evidence(15).await
 }
