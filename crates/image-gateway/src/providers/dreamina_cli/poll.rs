@@ -182,7 +182,9 @@ impl DreaminaCliPollDriverV1 {
             return match receipt.status() {
                 DreaminaQueryStatusV1::Querying => Ok(pending_observation(&receipt)),
                 DreaminaQueryStatusV1::Failed => Ok(PollObservation::Failed(terminal_failure(
-                    "dreamina_generation_failed",
+                    receipt
+                        .failure_code()
+                        .unwrap_or("dreamina_generation_failed"),
                 ))),
                 DreaminaQueryStatusV1::Success => {
                     let result = receipt
@@ -225,7 +227,9 @@ impl DreaminaCliPollDriverV1 {
                     .ensure_empty()
                     .map_err(|_| contract_failure("dreamina_poll_failed_artifact"))?;
                 Ok(PollObservation::Failed(terminal_failure(
-                    "dreamina_generation_failed",
+                    receipt
+                        .failure_code()
+                        .unwrap_or("dreamina_generation_failed"),
                 )))
             }
             DreaminaQueryStatusV1::Success => {
@@ -315,7 +319,11 @@ impl DreaminaCliPollDriverV1 {
                     .ensure_empty()
                     .map_err(|_| contract_failure("dreamina_poll_failed_artifact"))?;
                 Ok(ProviderNativeBatchPollObservation::Failed(
-                    terminal_failure("dreamina_generation_failed"),
+                    terminal_failure(
+                        receipt
+                            .failure_code()
+                            .unwrap_or("dreamina_generation_failed"),
+                    ),
                 ))
             }
             DreaminaQueryStatusV1::Success => {
@@ -430,7 +438,7 @@ impl ProviderPollDriver for DreaminaCliPollDriverV1 {
     }
 }
 
-fn ordered_image_outputs(
+pub(crate) fn ordered_image_outputs(
     files: Vec<VerifiedFreshOutputFile>,
     receipt: &DreaminaQueryReceiptV1,
 ) -> Result<Vec<VerifiedFreshOutputFile>, ProviderFailure> {

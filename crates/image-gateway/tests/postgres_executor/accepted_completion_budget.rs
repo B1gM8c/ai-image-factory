@@ -23,7 +23,7 @@ fn scope() -> ProviderTaskClaimScope {
 /// Only this disposable schema shadows database clock functions. Every stored
 /// timestamp and immutable submit binding is created through the normal stores;
 /// advancing time never updates those records or changes the host clock.
-async fn controlled_clock(database: &mut TestDatabase) -> TestResult {
+pub(super) async fn controlled_clock(database: &mut TestDatabase) -> TestResult {
     let schema = &database.schema;
     sqlx::query(AssertSqlSafe(format!(
         "CREATE TABLE \"{schema}\".completion_test_clock (offset_ms BIGINT NOT NULL)"
@@ -63,7 +63,7 @@ async fn controlled_clock(database: &mut TestDatabase) -> TestResult {
     Ok(())
 }
 
-async fn advance_clock(pool: &PgPool, offset_ms: i64) -> TestResult {
+pub(super) async fn advance_clock(pool: &PgPool, offset_ms: i64) -> TestResult {
     sqlx::query("UPDATE completion_test_clock SET offset_ms=$1")
         .bind(offset_ms)
         .execute(pool)

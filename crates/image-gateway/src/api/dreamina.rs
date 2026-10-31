@@ -1290,13 +1290,9 @@ fn image_task(
             task.status = "failed".to_owned();
             task.error = Some(DreaminaTaskError {
                 reason_code: None,
-                message: if error_code.as_deref()
-                    == Some("dreamina_compliance_confirmation_required")
-                {
-                    DREAMINA_COMPLIANCE_CONFIRMATION_MESSAGE.to_owned()
-                } else {
-                    "Dreamina image generation failed".to_owned()
-                },
+                message: known_terminal_failure_message(error_code.as_deref())
+                    .unwrap_or("Dreamina image generation failed")
+                    .to_owned(),
                 code: error_code.unwrap_or_else(|| "generation_failed".to_owned()),
             });
         }
@@ -1410,7 +1406,7 @@ async fn project_video_task(
     let audited_release_possible = matches!(
         &status,
         VideoResultStatus::Failed { error_code: Some(code), .. }
-            if code == "dreamina_compliance_confirmation_required"
+            if matches!(code.as_str(), "dreamina_compliance_confirmation_required" | "dreamina_concurrency_limit_exceeded")
     );
     let manual_cancellation = if matches!(&status, VideoResultStatus::Failed { .. }) {
         settlement_store
@@ -1531,12 +1527,8 @@ fn video_task(id: Uuid, status: VideoResultStatus) -> DreaminaVideoTask {
         VideoResultStatus::Failed {
             model, error_code, ..
         } => {
-            let message = match error_code.as_deref() {
-                Some("dreamina_compliance_confirmation_required") => {
-                    DREAMINA_COMPLIANCE_CONFIRMATION_MESSAGE
-                }
-                _ => "Dreamina video generation failed",
-            };
+            let message = known_terminal_failure_message(error_code.as_deref())
+                .unwrap_or("Dreamina video generation failed");
             DreaminaVideoTask {
                 id: id.to_string(),
                 status: "failed".to_owned(),
@@ -1562,6 +1554,17 @@ fn video_task(id: Uuid, status: VideoResultStatus) -> DreaminaVideoTask {
     task
 }
 
+pub(super) fn known_terminal_failure_message(code: Option<&str>) -> Option<&'static str> {
+    match code? {
+        "dreamina_compliance_confirmation_required" => {
+            Some(DREAMINA_COMPLIANCE_CONFIRMATION_MESSAGE)
+        }
+        "dreamina_copyright_rejected" => Some("生成的视频里包含受版权保护元素"),
+        "dreamina_concurrency_limit_exceeded" => Some("上游并发已满，请稍后再试"),
+        _ => None,
+    }
+}
+
 fn submission_uncertainty_diagnostic(code: Option<&str>) -> Option<(&'static str, &'static str)> {
     match code? {
         "dreamina_cli_permission_denied" => Some((
@@ -1585,7 +1588,18 @@ fn submission_uncertainty_diagnostic(code: Option<&str>) -> Option<(&'static str
 }
 
 pub(super) fn public_provider_progress(value: VideoProviderProgress) -> DreaminaProviderProgress {
+    use image_api_contracts::dreamina::{ProviderProgressSource, ProviderProgressStage};
+    let stage = match value.progress.provider_status.as_str() {
+        "Queueing" => ProviderProgressStage::ProviderQueued,
+        "Generating" => ProviderProgressStage::Generating,
+        _ => ProviderProgressStage::Processing,
+    };
     DreaminaProviderProgress {
+        progress_percent: value.estimated_percent,
+        progress_source: value
+            .estimated_percent
+            .map(|_| ProviderProgressSource::Estimated),
+        stage: Some(stage),
         provider_status: value.progress.provider_status,
         queue_position: value.progress.queue_position,
         queue_total: value.progress.queue_total,
@@ -2205,8 +2219,24 @@ mod tests {
         assert!(uncertain.get("content").is_none());
     }
 
+    #[test]
+    fn public_progress_marks_estimates_and_keeps_generation_nonterminal() {
+        let mut progress = queue_progress();
+        progress.progress.provider_status = "Generating".to_owned();
+        progress.estimated_percent = Some(0);
+        let json = serde_json::to_value(public_provider_progress(progress)).unwrap();
+        assert_eq!(json["progress_percent"], 0);
+        assert_eq!(json["progress_source"], "estimated");
+        assert_eq!(json["stage"], "generating");
+        let queued = serde_json::to_value(public_provider_progress(queue_progress())).unwrap();
+        assert!(queued.get("progress_percent").is_none());
+        assert!(queued.get("progress_source").is_none());
+        assert_eq!(queued["stage"], "provider_queued");
+    }
+
     fn queue_progress() -> VideoProviderProgress {
         VideoProviderProgress {
+            estimated_percent: None,
             progress: image_provider_sdk::ProviderTaskProgress {
                 provider_status: "Queueing".to_owned(),
                 queue_position: Some(3341),
@@ -2323,6 +2353,16 @@ mod tests {
                 Some("dreamina_compliance_confirmation_required"),
                 "dreamina_compliance_confirmation_required",
                 DREAMINA_COMPLIANCE_CONFIRMATION_MESSAGE,
+            ),
+            (
+                Some("dreamina_copyright_rejected"),
+                "dreamina_copyright_rejected",
+                "生成的视频里包含受版权保护元素",
+            ),
+            (
+                Some("dreamina_concurrency_limit_exceeded"),
+                "dreamina_concurrency_limit_exceeded",
+                "上游并发已满，请稍后再试",
             ),
             (
                 Some("provider_submit_cli_failed"),

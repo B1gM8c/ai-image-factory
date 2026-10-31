@@ -566,6 +566,54 @@ esac
             "GET modified task/observation/billing state",
         )?;
     }
+    let generating = provider_store
+        .claim_due(&profile.claim_scope(), "async-image-generating", 30_000)
+        .await
+        .map_err(debug_error)?
+        .ok_or("generating poll lease missing")?;
+    provider_store
+        .record_observation(
+            &generating,
+            &ProviderTaskObservation {
+                event_identity: "async-image-generating-progress".into(),
+                source: ProviderTaskObservationSource::Poll,
+                outcome: ProviderTaskObservationOutcome::Waiting { poll_after_ms: 0 },
+                progress: Some(ProviderTaskProgress {
+                    provider_status: "Generating".into(),
+                    queue_position: None,
+                    queue_total: None,
+                    estimated_remaining_seconds: Some(60),
+                }),
+            },
+        )
+        .await
+        .map_err(debug_error)?;
+    let before = image_read_snapshot(pool, job).await?;
+    for uri in [&path, LOOKUP] {
+        let response = image_request(
+            &app,
+            Method::GET,
+            uri,
+            &reader.api_key.value,
+            Some(KEY),
+            None,
+            false,
+        )
+        .await?;
+        require(
+            response.0 == StatusCode::OK
+                && response.2["status"] == "running"
+                && response.2["provider_progress"]["stage"] == "generating"
+                && response.2["provider_progress"]["progress_percent"] == 0
+                && response.2["provider_progress"]["progress_source"] == "estimated"
+                && response.2["provider_progress"]["estimated_remaining_seconds"] == 60,
+            format!("image generation estimate missing or became a terminal outcome: {response:?}"),
+        )?;
+    }
+    require(
+        image_read_snapshot(pool, job).await? == before,
+        "estimated progress read changed task or billing",
+    )?;
     if !succeeds {
         let lease = provider_store
             .claim_due(&profile.claim_scope(), "async-image-uncertain", 30_000)

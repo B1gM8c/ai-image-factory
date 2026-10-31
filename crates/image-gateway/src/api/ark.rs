@@ -568,12 +568,8 @@ fn ark_video_task(
             duration_ms,
             error_code,
         } => {
-            let message = match error_code.as_deref() {
-                Some("dreamina_compliance_confirmation_required") => {
-                    super::dreamina::DREAMINA_COMPLIANCE_CONFIRMATION_MESSAGE
-                }
-                _ => "Video generation failed",
-            };
+            let message = super::dreamina::known_terminal_failure_message(error_code.as_deref())
+                .unwrap_or("Video generation failed");
             ArkContentGenerationTask {
                 id: public_id,
                 model: public_video_model(&model).to_owned(),
@@ -774,6 +770,7 @@ mod tests {
     fn ark_video_metadata_retains_real_queue_progress_without_inventing_values() {
         let id = Uuid::new_v4();
         let progress = crate::settlement::VideoProviderProgress {
+            estimated_percent: None,
             progress: image_provider_sdk::ProviderTaskProgress {
                 provider_status: "Queueing".into(),
                 queue_position: Some(610),
@@ -893,6 +890,11 @@ mod tests {
                 Some("dreamina_compliance_confirmation_required"),
                 "dreamina_compliance_confirmation_required",
                 super::super::dreamina::DREAMINA_COMPLIANCE_CONFIRMATION_MESSAGE,
+            ),
+            (
+                Some("dreamina_concurrency_limit_exceeded"),
+                "dreamina_concurrency_limit_exceeded",
+                "上游并发已满，请稍后再试",
             ),
             (
                 Some("provider_submit_cli_failed"),

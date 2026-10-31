@@ -260,6 +260,9 @@ pub(super) fn patch_schemas(document: &mut Value) {
         "description": "Latest durable upstream observation. Queue position is reported verbatim, not a calculated number of people ahead. Missing values are unknown. A GET never queries the CLI or refreshes observed_at_ms. An uncertain task may retain a historical observation; terminal success or failure omits progress.",
         "properties": {
             "provider_status": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,64}$", "example": "Queueing"},
+            "progress_percent": {"type":"integer", "minimum":0, "maximum":99, "description":"Optional sampled estimate; 0 is valid. Current Dreamina adapter computes elapsed since first Generating+ETA observation divided by elapsed plus the latest ETA. Uses observation time only, may decrease, and never establishes success."},
+            "progress_source": {"type":"string", "enum":["provider", "estimated"], "description":"Current adapter emits estimated only; display as estimated, not measured model progress."},
+            "stage": {"type":"string", "enum":["provider_queued", "generating", "processing"]},
             "queue_position": {"type": "integer", "minimum": 0, "maximum": 4294967295_u64, "example": 3341},
             "queue_total": {"type": "integer", "minimum": 0, "maximum": 4294967295_u64, "example": 476961},
             "estimated_remaining_seconds": {"type": "integer", "minimum": 0, "maximum": 2592000, "example": 27131, "description": "Provider estimate at observed_at_ms, not a guarantee or a precise countdown."},
@@ -564,6 +567,14 @@ mod tests {
                 .contains("GET never queries")
         );
         let task = &schemas["DreaminaVideoTaskDoc"];
+        assert_eq!(
+            schemas["DreaminaProviderProgress"]["properties"]["progress_percent"]["maximum"],
+            99
+        );
+        assert_eq!(
+            schemas["DreaminaProviderProgress"]["properties"]["progress_source"]["enum"],
+            json!(["provider", "estimated"])
+        );
         for name in ["stage", "provider_progress", "cancellation"] {
             assert!(!task["required"].as_array().unwrap().contains(&json!(name)));
         }

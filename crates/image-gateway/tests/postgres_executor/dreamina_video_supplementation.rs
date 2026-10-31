@@ -10,6 +10,8 @@ use std::path::{Path, PathBuf};
 const URL: &str = "https://media.example.test/supplement%2Fvideo.mp4?token=A%2Bb";
 #[path = "dreamina_video_supplementation/manual_cancellation.rs"]
 mod manual_cancellation;
+#[path = "dreamina_video_supplementation/normal_archive.rs"]
+mod normal_archive;
 #[path = "dreamina_video_supplementation/populated_upgrade.rs"]
 mod populated_upgrade;
 #[path = "dreamina_video_supplementation/recovered_acceptance.rs"]
@@ -237,6 +239,15 @@ async fn seed_supplement_video(
     model: &str,
     audio_count: usize,
 ) -> TestResult<WorkLease> {
+    seed_supplement_video_duration(pool, model, audio_count, 10).await
+}
+
+async fn seed_supplement_video_duration(
+    pool: &PgPool,
+    model: &str,
+    audio_count: usize,
+    duration_seconds: u32,
+) -> TestResult<WorkLease> {
     let job_id = Uuid::new_v4();
     let session_id = Uuid::new_v4();
     let images =
@@ -246,7 +257,7 @@ async fn seed_supplement_video(
     })).collect();
     let command = json!({"schema_version":1,"operation":"multimodal2video","images":images,
         "videos":[],"audios":audios,"prompt":"offline multimodal regression", "model_version":model,
-        "ratio":"16:9","duration":10,"video_resolution":"720p","poll":0});
+        "ratio":"16:9","duration":duration_seconds,"video_resolution":"720p","poll":0});
     parse_submit_command(&serde_json::to_vec(&command).map_err(debug_error)?)
         .map_err(debug_error)?;
     let work = seed_generation_lease(
@@ -266,8 +277,8 @@ async fn seed_supplement_video(
             operation: VIDEO_GENERATION_OPERATION.into(),
             work_kind: "video_single".into(),
             output_count: 1,
-            billable_units: 10,
-            output_billable_units: 10,
+            billable_units: duration_seconds,
+            output_billable_units: duration_seconds,
             billing_metric: "video_second".into(),
             billing_unit: "second".into(),
         },

@@ -33,7 +33,9 @@ use uuid::Uuid;
 
 mod candidate;
 mod candidate_bootstrap;
+mod local_bundle;
 use candidate::CandidatePin;
+use local_bundle::LocalBundlePin;
 
 const DEFAULT_RELEASE_ROOT: &str = "/opt/ai-image-factory";
 const DEFAULT_JOURNAL_ROOT: &str = "/var/lib/ai-image-factory/updater";
@@ -172,6 +174,7 @@ pub struct UpdaterConfig {
     apply_enabled: bool,
     attestation_workflow: String,
     candidate: Option<CandidatePin>,
+    local_bundle: Option<LocalBundlePin>,
     admission_close_hook: Option<PathBuf>,
     admission_open_hook: Option<PathBuf>,
     quiesce_hook: Option<PathBuf>,
@@ -200,7 +203,6 @@ impl UpdaterConfig {
         let journal_root = absolute_env_path("AIF_UPDATE_JOURNAL_ROOT", DEFAULT_JOURNAL_ROOT)?;
         let gh_executable = absolute_env_path("AIF_UPDATE_GH_EXECUTABLE", "/usr/bin/gh")?;
         let tar_executable = absolute_env_path("AIF_UPDATE_TAR_EXECUTABLE", "/usr/bin/tar")?;
-        validate_trusted_executable(&gh_executable)?;
         validate_trusted_executable(&tar_executable)?;
         let artifact_root = absolute_env_path(
             "GATEWAY_ARTIFACT_ROOT",
@@ -216,7 +218,13 @@ impl UpdaterConfig {
         }
         let attestation_workflow =
             optional_env("AIF_UPDATE_ATTESTATION_WORKFLOW").unwrap_or_default();
-        if apply_enabled && attestation_workflow.is_empty() {
+        let local_bundle = optional_absolute_env_path("AIF_UPDATE_LOCAL_BUNDLE_PIN")?
+            .map(|path| LocalBundlePin::from_file(&path))
+            .transpose()?;
+        if local_bundle.is_none() {
+            validate_trusted_executable(&gh_executable)?;
+        }
+        if apply_enabled && local_bundle.is_none() && attestation_workflow.is_empty() {
             return Err(UpdaterError::Config(
                 "AIF_UPDATE_ATTESTATION_WORKFLOW is required when automatic apply is enabled"
                     .to_string(),
@@ -230,6 +238,7 @@ impl UpdaterConfig {
         let candidate = optional_absolute_env_path("AIF_UPDATE_CANDIDATE_PIN")?
             .map(|path| CandidatePin::from_file(&path))
             .transpose()?;
+        local_bundle::validate_source_selection(candidate.is_some(), local_bundle.is_some())?;
         if candidate.is_some()
             && attestation_workflow != format!("{repository}/.github/workflows/release.yml")
         {
@@ -280,6 +289,7 @@ impl UpdaterConfig {
             apply_enabled,
             attestation_workflow,
             candidate,
+            local_bundle,
             admission_close_hook,
             admission_open_hook,
             quiesce_hook,
@@ -645,15 +655,20 @@ impl Updater {
     async fn execute_check(&self, claim: &ClaimedCommand) -> Result<(), UpdaterError> {
         self.record_phase(claim, "preflight", "started", json!({}))
             .await?;
-        let version = match &self.config.candidate {
-            Some(pin) => {
-                self.verify_candidate(pin).await?;
-                pin.version.clone()
-            }
-            None => {
-                let release = self.latest_release().await?;
-                self.verify_release(&release.tag_name).await?;
-                release.tag_name
+        let version = if let Some(pin) = &self.config.local_bundle {
+            pin.verify_source(&self.config.target_triple)?;
+            pin.version.clone()
+        } else {
+            match &self.config.candidate {
+                Some(pin) => {
+                    self.verify_candidate(pin).await?;
+                    pin.version.clone()
+                }
+                None => {
+                    let release = self.latest_release().await?;
+                    self.verify_release(&release.tag_name).await?;
+                    release.tag_name
+                }
             }
         };
         let staged = self.stage_release(Some(claim), &version).await?;
@@ -693,8 +708,19 @@ impl Updater {
             json!({"target_version": version}),
         )
         .await?;
-        if let Some(pin) = &self.config.candidate {
-            if version != pin.version {
+        if self.config.candidate.is_some() || self.config.local_bundle.is_some() {
+            let pinned_version = self
+                .config
+                .local_bundle
+                .as_ref()
+                .map(|pin| pin.version.as_str())
+                .or_else(|| {
+                    self.config
+                        .candidate
+                        .as_ref()
+                        .map(|pin| pin.version.as_str())
+                });
+            if Some(version) != pinned_version {
                 return Err(UpdaterError::InvalidRelease(
                     "target does not match operator candidate pin".into(),
                 ));
@@ -709,7 +735,11 @@ impl Updater {
             {
                 return Err(UpdaterError::InvalidRelease("candidate pin differs from the latest successful Check; Check again before Apply".into()));
             }
-            self.verify_candidate(pin).await?;
+            if let Some(pin) = &self.config.local_bundle {
+                pin.verify_source(&self.config.target_triple)?;
+            } else if let Some(pin) = &self.config.candidate {
+                self.verify_candidate(pin).await?;
+            }
         } else {
             self.verify_release(version).await?;
         }
@@ -1398,7 +1428,15 @@ impl Updater {
             "ai-image-factory-{version}-{}.tar.gz",
             self.config.target_triple
         );
-        if let Some(pin) = &self.config.candidate {
+        if let Some(pin) = &self.config.local_bundle {
+            if version != pin.version {
+                return Err(UpdaterError::InvalidRelease(
+                    "local build version mismatch".into(),
+                ));
+            }
+            pin.copy_assets(temp.path(), &self.config.target_triple)
+                .await?;
+        } else if let Some(pin) = &self.config.candidate {
             if version != pin.version {
                 return Err(UpdaterError::InvalidRelease(
                     "candidate version mismatch".into(),
@@ -1433,7 +1471,9 @@ impl Updater {
                 "release manifest size is outside the supported range".to_string(),
             ));
         }
-        if let Some(pin) = &self.config.candidate {
+        if let Some(pin) = &self.config.local_bundle {
+            verify_file_digest(&manifest_path, &pin.manifest_sha256, pin.manifest_bytes).await?;
+        } else if let Some(pin) = &self.config.candidate {
             verify_file_digest(
                 &manifest_path,
                 &pin.manifest_sha256,
@@ -1459,6 +1499,9 @@ impl Updater {
         let manifest: ReleaseManifest = serde_json::from_slice(&manifest_bytes)
             .map_err(|error| UpdaterError::InvalidRelease(error.to_string()))?;
         manifest.validate(version, &self.config.target_triple)?;
+        if let Some(pin) = &self.config.local_bundle {
+            pin.verify_manifest(&manifest)?;
+        }
         if let Some(pin) = &self.config.candidate
             && (manifest.commit_sha != pin.commit_sha
                 || manifest.bundle_sha256 != pin.bundle_sha256)
@@ -1468,52 +1511,54 @@ impl Updater {
             ));
         }
 
-        let source_ref = format!("refs/tags/{version}");
-        for asset in [&manifest_path, &bundle_path] {
-            if asset != &manifest_path && self.config.candidate.is_none() {
-                run_trusted(
+        if self.config.local_bundle.is_none() {
+            let source_ref = format!("refs/tags/{version}");
+            for asset in [&manifest_path, &bundle_path] {
+                if asset != &manifest_path && self.config.candidate.is_none() {
+                    run_trusted(
+                        &self.config.gh_executable,
+                        [
+                            OsStr::new("release"),
+                            OsStr::new("verify-asset"),
+                            OsStr::new(version),
+                            asset.as_os_str(),
+                            OsStr::new("--repo"),
+                            OsStr::new(&self.config.repository),
+                        ],
+                        &github_environment(),
+                    )
+                    .await?;
+                }
+                let attestation = run_trusted(
                     &self.config.gh_executable,
                     [
-                        OsStr::new("release"),
-                        OsStr::new("verify-asset"),
-                        OsStr::new(version),
+                        OsStr::new("attestation"),
+                        OsStr::new("verify"),
                         asset.as_os_str(),
                         OsStr::new("--repo"),
                         OsStr::new(&self.config.repository),
+                        OsStr::new("--signer-workflow"),
+                        OsStr::new(&self.config.attestation_workflow),
+                        OsStr::new("--source-ref"),
+                        OsStr::new(&source_ref),
+                        OsStr::new("--source-digest"),
+                        OsStr::new(&manifest.commit_sha),
+                        OsStr::new("--deny-self-hosted-runners"),
+                        OsStr::new("--format"),
+                        OsStr::new("json"),
                     ],
                     &github_environment(),
                 )
                 .await?;
-            }
-            let attestation = run_trusted(
-                &self.config.gh_executable,
-                [
-                    OsStr::new("attestation"),
-                    OsStr::new("verify"),
-                    asset.as_os_str(),
-                    OsStr::new("--repo"),
-                    OsStr::new(&self.config.repository),
-                    OsStr::new("--signer-workflow"),
-                    OsStr::new(&self.config.attestation_workflow),
-                    OsStr::new("--source-ref"),
-                    OsStr::new(&source_ref),
-                    OsStr::new("--source-digest"),
-                    OsStr::new(&manifest.commit_sha),
-                    OsStr::new("--deny-self-hosted-runners"),
-                    OsStr::new("--format"),
-                    OsStr::new("json"),
-                ],
-                &github_environment(),
-            )
-            .await?;
-            if let Some(pin) = &self.config.candidate {
-                let verified: Value =
-                    serde_json::from_slice(&attestation.stdout).map_err(|_| {
-                        UpdaterError::InvalidRelease(
-                            "invalid attestation verification output".into(),
-                        )
-                    })?;
-                pin.check_attestation(&verified, &self.config.repository)?;
+                if let Some(pin) = &self.config.candidate {
+                    let verified: Value =
+                        serde_json::from_slice(&attestation.stdout).map_err(|_| {
+                            UpdaterError::InvalidRelease(
+                                "invalid attestation verification output".into(),
+                            )
+                        })?;
+                    pin.check_attestation(&verified, &self.config.repository)?;
+                }
             }
         }
         verify_file_digest(&bundle_path, &manifest.bundle_sha256, manifest.bundle_bytes).await?;
@@ -4344,7 +4389,7 @@ mod tests {
         assert!(!context.contains_key("DATABASE_URL"));
     }
 
-    fn valid_manifest() -> ReleaseManifest {
+    pub(super) fn valid_manifest() -> ReleaseManifest {
         ReleaseManifest {
             schema_version: 1,
             updater_protocol_version: 1,

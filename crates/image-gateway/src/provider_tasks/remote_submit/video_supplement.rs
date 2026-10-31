@@ -54,13 +54,13 @@ pub use acceptance_recovery::recover_dreamina_video_supplement_acceptance_operat
 /// original execution. It is intentionally outside the 11-key DB identity.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-struct SubmitBudget {
+pub(super) struct SubmitBudget {
     cli_wall_timeout_ms: u64,
     provider_timeout_ms: u64,
 }
 
 impl SubmitBudget {
-    fn from_env() -> Result<Self, ImageGatewayError> {
+    pub(super) fn from_env() -> Result<Self, ImageGatewayError> {
         Self::parse(
             &required_env("PROVIDER_SUBMITTER_CLI_WALL_TIMEOUT_MS")?,
             &required_env("PROVIDER_SUBMITTER_PROVIDER_TIMEOUT_MS")?,
@@ -76,7 +76,7 @@ impl SubmitBudget {
         Ok(budget)
     }
 
-    fn validate(self) -> Result<(), ImageGatewayError> {
+    pub(super) fn validate(self) -> Result<(), ImageGatewayError> {
         let maximum_wall = self
             .provider_timeout_ms
             .checked_sub(SUBMIT_RECEIPT_MARGIN_MS)
@@ -92,17 +92,17 @@ impl SubmitBudget {
         Ok(())
     }
 
-    fn wall_limit(self) -> Duration {
+    pub(super) fn wall_limit(self) -> Duration {
         Duration::from_millis(self.cli_wall_timeout_ms)
     }
 
-    fn launch_deadline(self, now: u64) -> Result<u64, ImageGatewayError> {
+    pub(super) fn launch_deadline(self, now: u64) -> Result<u64, ImageGatewayError> {
         now.checked_add(self.cli_wall_timeout_ms)
             .ok_or_else(failure)
     }
 }
 
-fn validate_prepared_budget(
+pub(super) fn validate_prepared_budget(
     prepared: &serde_json::Value,
     current: SubmitBudget,
 ) -> Result<SubmitBudget, ImageGatewayError> {
@@ -131,24 +131,24 @@ pub struct DreaminaVideoSupplementOperatorReceipt {
     pub evidence_directory: PathBuf,
 }
 
-struct Runtime {
-    profile: ProviderRuntimeProfile,
-    upstream_identity_sha256: String,
-    executable: PathBuf,
-    executable_sha256: [u8; 32],
-    runner: PathBuf,
-    runner_sha256: [u8; 32],
-    home: WorkingDirectory,
-    workspace_root: WorkingDirectory,
+pub(super) struct Runtime {
+    pub(super) profile: ProviderRuntimeProfile,
+    pub(super) upstream_identity_sha256: String,
+    pub(super) executable: PathBuf,
+    pub(super) executable_sha256: [u8; 32],
+    pub(super) runner: PathBuf,
+    pub(super) runner_sha256: [u8; 32],
+    pub(super) home: WorkingDirectory,
+    pub(super) workspace_root: WorkingDirectory,
 }
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct LaunchEvidence {
-    authorization_id: Uuid,
-    dispatch_nonce: Uuid,
-    execution_binding_sha256: String,
-    absolute_deadline_unix_ms: u64,
+pub(super) struct LaunchEvidence {
+    pub(super) authorization_id: Uuid,
+    pub(super) dispatch_nonce: Uuid,
+    pub(super) execution_binding_sha256: String,
+    pub(super) absolute_deadline_unix_ms: u64,
 }
 
 #[derive(FromRow)]
@@ -804,7 +804,7 @@ async fn accept_stdout<S: ReceiptStore>(
     Ok(receipt)
 }
 
-fn terminal_stdout(
+pub(super) fn terminal_stdout(
     terminal: &super::GatedCliProcessTerminal,
 ) -> Result<Vec<u8>, ImageGatewayError> {
     if !terminal.released()
@@ -998,7 +998,7 @@ fn complete_publication_evidence(
 }
 
 impl LaunchEvidence {
-    fn binding(&self) -> Result<GatedCliBinding, ImageGatewayError> {
+    pub(super) fn binding(&self) -> Result<GatedCliBinding, ImageGatewayError> {
         GatedCliBinding::new(
             &self.execution_binding_sha256,
             self.dispatch_nonce,
@@ -1025,12 +1025,24 @@ impl Runtime {
         profile_id: Uuid,
         account_id: Uuid,
     ) -> Result<Self, ImageGatewayError> {
+        Self::load_for_operation(pool, profile_id, account_id, "videos.generations").await
+    }
+
+    pub(super) async fn load_for_operation(
+        pool: &PgPool,
+        profile_id: Uuid,
+        account_id: Uuid,
+        operation: &str,
+    ) -> Result<Self, ImageGatewayError> {
+        if !matches!(operation, "videos.generations" | "images.generations") {
+            return Err(failure());
+        }
         let profile = PostgresProviderTaskStore::new(pool.clone())
             .load_active_runtime_profile(&required_env("PROVIDER_SUBMITTER_PROFILE_KEY")?)
             .await
             .map_err(|_| failure())?;
         if profile.provider_id() != "dreamina-cli"
-            || profile.operation_id() != "videos.generations"
+            || profile.operation_id() != operation
             || profile.provider_account_id() != account_id
             || profile.execution_profile_id() != profile_id
             || profile.credential_pool_id().to_string()
@@ -1083,7 +1095,7 @@ impl Runtime {
         runtime.verify_identity()?;
         Ok(runtime)
     }
-    fn verify_identity(&self) -> Result<(), ImageGatewayError> {
+    pub(super) fn verify_identity(&self) -> Result<(), ImageGatewayError> {
         // Private WorkingDirectory validates owner == the service UID at every command.
         validate_private_directory(self.home.path())?;
         validate_private_directory(self.workspace_root.path())?;
@@ -1099,7 +1111,7 @@ impl Runtime {
         Ok(())
     }
 
-    fn binding(&self) -> Result<serde_json::Value, ImageGatewayError> {
+    pub(super) fn binding(&self) -> Result<serde_json::Value, ImageGatewayError> {
         Ok(json!({
             "execution_profile_id": self.profile.execution_profile_id(),
             "provider_account_id": self.profile.provider_account_id(),
@@ -1116,7 +1128,7 @@ impl Runtime {
     }
 }
 
-fn validate_poll_binding(
+pub(super) fn validate_poll_binding(
     frozen: &serde_json::Value,
     current: &serde_json::Value,
 ) -> Result<(), ImageGatewayError> {
@@ -1222,7 +1234,7 @@ async fn prepare_command(
     Ok((request, command))
 }
 
-fn stores(
+pub(super) fn stores(
     pool: &PgPool,
 ) -> Result<
     (
@@ -1269,7 +1281,7 @@ fn digest_env(name: &str) -> Result<[u8; 32], ImageGatewayError> {
         .and_then(|bytes| bytes.try_into().ok())
         .ok_or_else(failure)
 }
-fn now_ms() -> Result<u64, ImageGatewayError> {
+pub(super) fn now_ms() -> Result<u64, ImageGatewayError> {
     Ok(SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|_| failure())?
@@ -1279,11 +1291,14 @@ fn failure() -> ImageGatewayError {
     ImageGatewayError::config("video supplement operator preflight or evidence validation failed")
 }
 
-fn evidence_directory(root: &Path, id: Uuid) -> Result<PathBuf, ImageGatewayError> {
+pub(super) fn evidence_directory(root: &Path, id: Uuid) -> Result<PathBuf, ImageGatewayError> {
     validate_private_directory(root)?;
     private_subdirectory(root, &id.simple().to_string())
 }
-fn private_subdirectory(parent: &Path, name: &str) -> Result<PathBuf, ImageGatewayError> {
+pub(super) fn private_subdirectory(
+    parent: &Path,
+    name: &str,
+) -> Result<PathBuf, ImageGatewayError> {
     validate_private_directory(parent)?;
     let path = parent.join(name);
     match fs::DirBuilder::new().mode(0o700).create(&path) {
@@ -1296,7 +1311,7 @@ fn private_subdirectory(parent: &Path, name: &str) -> Result<PathBuf, ImageGatew
     validate_private_directory(&path)?;
     Ok(path)
 }
-fn validate_private_directory(path: &Path) -> Result<(), ImageGatewayError> {
+pub(super) fn validate_private_directory(path: &Path) -> Result<(), ImageGatewayError> {
     let metadata = fs::symlink_metadata(path).map_err(|_| failure())?;
     if !path.is_absolute()
         || fs::canonicalize(path).ok().as_deref() != Some(path)
@@ -1308,7 +1323,11 @@ fn validate_private_directory(path: &Path) -> Result<(), ImageGatewayError> {
     }
     Ok(())
 }
-fn private_write_once(directory: &Path, name: &str, bytes: &[u8]) -> Result<(), ImageGatewayError> {
+pub(super) fn private_write_once(
+    directory: &Path,
+    name: &str,
+    bytes: &[u8],
+) -> Result<(), ImageGatewayError> {
     let fd = private_directory_fd(directory)?;
     super::journal::publish_or_compare(&fd, name, bytes, bytes.len() as u64)
         .map_err(|_| failure())?;
@@ -1319,7 +1338,11 @@ fn private_write_once(directory: &Path, name: &str, bytes: &[u8]) -> Result<(), 
     )
     .map_err(|_| failure())
 }
-fn private_read(directory: &Path, name: &str, maximum: u64) -> Result<Vec<u8>, ImageGatewayError> {
+pub(super) fn private_read(
+    directory: &Path,
+    name: &str,
+    maximum: u64,
+) -> Result<Vec<u8>, ImageGatewayError> {
     private_read_optional(directory, name, maximum)?
         .filter(|bytes| !bytes.is_empty())
         .ok_or_else(failure)
@@ -1382,7 +1405,7 @@ fn quarantine_broken_json(
     rfs::fsync(&fd).map_err(|_| failure())
 }
 
-fn private_read_optional(
+pub(super) fn private_read_optional(
     directory: &Path,
     name: &str,
     maximum: u64,

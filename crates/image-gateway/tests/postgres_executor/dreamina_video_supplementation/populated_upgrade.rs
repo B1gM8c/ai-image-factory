@@ -154,7 +154,9 @@ async fn populated_upgrade_case(url: &str, delivered: bool) -> TestResult {
         migrations.run(&db.pool).await.map_err(debug_error)?;
         let version: i64 = sqlx::query_scalar("SELECT max(version) FROM _sqlx_migrations WHERE success")
             .fetch_one(&db.pool).await.map_err(debug_error)?;
-        require(version == 156, "cancellation upgrade did not reach schema156")?;
+        let expected_version = migrations.iter().map(|migration| migration.version).max()
+            .ok_or("missing migration version")?;
+        require(version == expected_version, "cancellation upgrade did not reach latest schema")?;
         require(snapshot(&db.pool, head.job_id).await? == before,
             "155/156 migration rewrote existing authority, result, quote, hold, ledger or queue observation")?;
         let cancellations: (i64,i64) = sqlx::query_as("SELECT (SELECT count(*) FROM dreamina_manual_video_cancellations),(SELECT count(*) FROM dreamina_operator_video_supplement_cancellations)")

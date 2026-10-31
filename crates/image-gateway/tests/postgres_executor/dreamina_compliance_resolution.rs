@@ -15,9 +15,10 @@ use image_provider_dreamina_cli::parse_submit_command;
 use image_provider_sdk::PendingOperation;
 
 const REFUSAL: &[u8] = br#"{"gen_status":"fail","fail_reason":"api error: ret=4010, message=aigc compliance confirmation required"}"#;
+const CONCURRENCY_REFUSAL: &[u8] = br#"{"submit_id":"fixture-local-id","gen_status":"fail","fail_reason":"api error: ret=1310, message=ExceedConcurrencyLimit, logid=fixture1310"}"#;
 const HELD_MICROS: i64 = 1_200_000;
 
-fn fixture_runner(root: &Path) -> TestResult<PathBuf> {
+pub(super) fn fixture_runner(root: &Path) -> TestResult<PathBuf> {
     let source = Path::new(env!("CARGO_BIN_EXE_remote-submit-runner"));
     #[cfg(target_os = "linux")]
     {
@@ -54,6 +55,8 @@ fn fixture_runner(root: &Path) -> TestResult<PathBuf> {
 struct HistoricalRefusalCodec {
     invocation_marker: PathBuf,
     shell_sha256: String,
+    refusal: &'static [u8],
+    historical_code: &'static str,
 }
 
 impl GatedCliSubmitCodec for HistoricalRefusalCodec {
@@ -79,7 +82,7 @@ impl GatedCliSubmitCodec for HistoricalRefusalCodec {
                 "printf invoked >> \"$1\"; printf %s \"$2\"".into(),
                 "offline-compliance-fixture".into(),
                 self.invocation_marker.to_string_lossy().into_owned(),
-                String::from_utf8(REFUSAL.to_vec()).expect("ASCII fixture"),
+                String::from_utf8(self.refusal.to_vec()).expect("ASCII fixture"),
             ],
             BTreeMap::new(),
             Vec::new(),
@@ -95,8 +98,14 @@ impl GatedCliSubmitCodec for HistoricalRefusalCodec {
         _: &SingleOutputCommand<Self::Payload>,
         stdout: &[u8],
     ) -> Result<PendingOperation, ProviderFailure> {
-        assert_eq!(stdout, REFUSAL);
-        Err(historical_unknown())
+        assert_eq!(stdout, self.refusal);
+        Err(ProviderFailure::new(
+            ProviderFailureClass::Ambiguous,
+            self.historical_code,
+            EffectCertainty::UnknownRemoteEffect,
+            RetryDirective::Never,
+        )
+        .unwrap())
     }
 }
 
@@ -116,6 +125,7 @@ struct RefusalFixture {
     invocation_marker: PathBuf,
     work: WorkLease,
     lease: ExecutorSubmissionLease,
+    refusal: &'static [u8],
 }
 
 impl RefusalFixture {
@@ -124,7 +134,7 @@ impl RefusalFixture {
             job_id: self.work.job_id,
             submission_id: self.lease.submission_id,
             executor_execution_id: self.lease.executor_execution_id,
-            reviewed_stdout_sha256: sha256(REFUSAL),
+            reviewed_stdout_sha256: sha256(self.refusal),
             operator_reference: "offline-regression:reviewed-4010".into(),
         }
     }
@@ -160,6 +170,15 @@ fn video_poll_scope() -> ProviderTaskClaimScope {
 }
 
 async fn refusal_fixture(pool: &PgPool, terminalize: bool) -> TestResult<RefusalFixture> {
+    refusal_fixture_with_receipt(pool, terminalize, REFUSAL, "dreamina_submit_rejected").await
+}
+
+async fn refusal_fixture_with_receipt(
+    pool: &PgPool,
+    terminalize: bool,
+    refusal: &'static [u8],
+    historical_code: &'static str,
+) -> TestResult<RefusalFixture> {
     let work = seed_dreamina_video_generation_lease_for_profile(
         pool,
         "compliance-resolution-worker",
@@ -233,6 +252,7 @@ async fn refusal_fixture(pool: &PgPool, terminalize: bool) -> TestResult<Refusal
             invocation_marker,
             work,
             lease,
+            refusal,
         });
     }
     let workspace = journal.path().join("workspace");
@@ -243,6 +263,8 @@ async fn refusal_fixture(pool: &PgPool, terminalize: bool) -> TestResult<Refusal
     let codec = HistoricalRefusalCodec {
         invocation_marker: invocation_marker.clone(),
         shell_sha256: sha256(&fs::read("/bin/sh").map_err(debug_error)?),
+        refusal,
+        historical_code,
     };
     let driver = GatedCliSubmitDriver::new(
         codec,
@@ -264,7 +286,7 @@ async fn refusal_fixture(pool: &PgPool, terminalize: bool) -> TestResult<Refusal
     .map_err(debug_error)?;
     let expected = matches!(outcome, ProviderSubmitOutcome::AwaitingEvidence(ref intent)
         if intent.state == ProviderSubmitIntentState::OutcomeUnknown
-            && intent.failure_error_code.as_deref() == Some("dreamina_submit_rejected"));
+            && intent.failure_error_code.as_deref() == Some(historical_code));
     let error_code = match &outcome {
         ProviderSubmitOutcome::AwaitingEvidence(intent)
         | ProviderSubmitOutcome::Terminal(intent) => intent
@@ -286,6 +308,7 @@ async fn refusal_fixture(pool: &PgPool, terminalize: bool) -> TestResult<Refusal
         invocation_marker,
         work,
         lease,
+        refusal,
     };
     fixture.assert_one_fixture_invocation()?;
     if terminalize {
@@ -394,12 +417,36 @@ async fn canonical_evidence(
 #[tokio::test]
 async fn dreamina_compliance_resolution_releases_exactly_once_preserving_canonical_uncertainty()
 -> TestResult {
+    rejection_resolution_preserves_originals(
+        REFUSAL,
+        "dreamina_submit_rejected",
+        "dreamina_compliance_confirmation_required",
+    )
+    .await
+}
+
+#[tokio::test]
+async fn dreamina_concurrency_resolution_releases_exactly_once_preserving_canonical_uncertainty()
+-> TestResult {
+    rejection_resolution_preserves_originals(
+        CONCURRENCY_REFUSAL,
+        "dreamina_submit_recovery_evidence_invalid",
+        "dreamina_concurrency_limit_exceeded",
+    )
+    .await
+}
+
+async fn rejection_resolution_preserves_originals(
+    refusal: &'static [u8],
+    historical_code: &'static str,
+    reason: &'static str,
+) -> TestResult {
     let _ = tracing_subscriber::fmt().with_test_writer().try_init();
     let Some(database) = TestDatabase::new().await? else {
         return Ok(());
     };
     let result = async {
-        let fixture = refusal_fixture(&database.pool, true).await?;
+        let fixture = refusal_fixture_with_receipt(&database.pool, true, refusal, historical_code).await?;
         let before = snapshot(&database.pool, &fixture).await?;
         let canonical_before = canonical_evidence(&database.pool, &fixture).await?;
         let read_store = PostgresExecutionSettlementStore::new(database.pool.clone(),
@@ -422,10 +469,17 @@ async fn dreamina_compliance_resolution_releases_exactly_once_preserving_canonic
             format!("fixture lost the original USD1.20 hold: {before:?}"),
         )?;
         let request = fixture.request();
-        let first =
-            resolve_dreamina_compliance_rejection(&database.pool, &fixture.journal_root, &request)
-                .await
-                .map_err(debug_error)?;
+        let (first_attempt, competing_attempt) = tokio::join!(
+            resolve_dreamina_compliance_rejection(&database.pool, &fixture.journal_root, &request),
+            resolve_dreamina_compliance_rejection(&database.pool, &fixture.journal_root, &request),
+        );
+        // Serializable contention may reject one caller. At least one must commit,
+        // and the subsequent exact replay must return that same immutable audit.
+        let first = match (first_attempt, competing_attempt) {
+            (Ok(first), Ok(second)) => { require(first == second, "concurrent resolutions differed")?; first }
+            (Ok(first), Err(_)) | (Err(_), Ok(first)) => first,
+            (Err(first), Err(second)) => return Err(format!("both resolutions failed: {first:?}/{second:?}")),
+        };
         let replay =
             resolve_dreamina_compliance_rejection(&database.pool, &fixture.journal_root, &request)
                 .await
@@ -456,7 +510,7 @@ async fn dreamina_compliance_resolution_releases_exactly_once_preserving_canonic
             .await.map_err(debug_error)?;
         require(matches!(public_status,
             Some(gpt_image_2_gateway::settlement::VideoResultStatus::Failed { error_code: Some(ref code), .. })
-            if code == "dreamina_compliance_confirmation_required"),
+            if code == reason),
             format!("resolved video API projection lost its truthful terminal status: {public_status:?}"))?;
         for (tenant, project, actor) in [
             ("other-tenant", "project-test", None),
@@ -559,11 +613,29 @@ async fn dreamina_compliance_resolution_releases_exactly_once_preserving_canonic
 #[tokio::test]
 async fn dreamina_compliance_resolution_rejects_mismatched_review_and_missing_evidence_unchanged()
 -> TestResult {
+    rejection_resolution_rejects_bad_evidence(REFUSAL, "dreamina_submit_rejected").await
+}
+
+#[tokio::test]
+async fn dreamina_concurrency_resolution_rejects_mismatched_review_and_missing_evidence_unchanged()
+-> TestResult {
+    rejection_resolution_rejects_bad_evidence(
+        CONCURRENCY_REFUSAL,
+        "dreamina_submit_recovery_evidence_invalid",
+    )
+    .await
+}
+
+async fn rejection_resolution_rejects_bad_evidence(
+    refusal: &'static [u8],
+    historical_code: &'static str,
+) -> TestResult {
     let Some(database) = TestDatabase::new().await? else {
         return Ok(());
     };
     let result = async {
-        let fixture = refusal_fixture(&database.pool, true).await?;
+        let fixture =
+            refusal_fixture_with_receipt(&database.pool, true, refusal, historical_code).await?;
         let before = snapshot(&database.pool, &fixture).await?;
         let mut wrong_sha = fixture.request();
         wrong_sha.reviewed_stdout_sha256 = "a".repeat(64);

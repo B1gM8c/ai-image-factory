@@ -355,8 +355,30 @@ pub struct DreaminaManualCancellation {
     pub release_event_id: String,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderProgressSource {
+    Provider,
+    Estimated,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderProgressStage {
+    ProviderQueued,
+    Generating,
+    Processing,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct DreaminaProviderProgress {
+    /// A sampled percentage, never evidence of task completion. Unknown is omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress_percent: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress_source: Option<ProviderProgressSource>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage: Option<ProviderProgressStage>,
     pub provider_status: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub queue_position: Option<u64>,
@@ -451,6 +473,22 @@ mod tests {
         });
         let parsed: DreaminaVideoTask = serde_json::from_value(receipt.clone()).unwrap();
         assert_eq!(serde_json::to_value(parsed).unwrap(), receipt);
+    }
+
+    #[test]
+    fn sampled_progress_preserves_zero_and_explicit_estimate_source() {
+        let json = serde_json::json!({
+            "provider_status":"Generating", "stage":"generating",
+            "progress_percent":0, "progress_source":"estimated",
+            "estimated_remaining_seconds":60, "observed_at_ms":123000,
+        });
+        let progress: DreaminaProviderProgress = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(progress.progress_percent, Some(0));
+        assert_eq!(
+            progress.progress_source,
+            Some(ProviderProgressSource::Estimated)
+        );
+        assert_eq!(serde_json::to_value(progress).unwrap(), json);
     }
 
     #[test]

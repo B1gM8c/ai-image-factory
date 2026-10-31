@@ -86,6 +86,9 @@ mod dreamina_additional_image_results;
 #[path = "postgres_executor/queue_progress_projection.rs"]
 mod queue_progress_projection;
 
+#[path = "postgres_executor/dreamina_image_supplementation.rs"]
+mod dreamina_image_supplementation;
+
 #[path = "postgres_executor/dreamina_image_success_reconciliation.rs"]
 mod dreamina_image_success_reconciliation;
 
@@ -10520,3 +10523,6 @@ fn combine(primary: TestResult, cleanup: TestResult) -> TestResult {
 fn debug_error(error: impl std::fmt::Debug) -> String {
     format!("{error:?}")
 }
+
+#[path = "postgres_executor/accepted_terminal_recovery.rs"]
+mod accepted_terminal_recovery;

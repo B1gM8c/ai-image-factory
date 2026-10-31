@@ -102,18 +102,41 @@ impl Updater {
 
     /// The existing trusted gh must verify this binary before invoking it.
     pub async fn bootstrap_candidate(&self) -> Result<(), UpdaterError> {
+        if self.config.candidate.is_none() {
+            return Err(UpdaterError::Config("candidate pin required".into()));
+        }
+        self.bootstrap_pinned_source().await
+    }
+
+    /// The operator must verify this executable against the reviewed local build
+    /// record before invocation. No GitHub attestation is claimed for this path.
+    pub async fn bootstrap_local(&self) -> Result<(), UpdaterError> {
+        if self.config.local_bundle.is_none() {
+            return Err(UpdaterError::Config("local build pin required".into()));
+        }
+        self.bootstrap_pinned_source().await
+    }
+
+    async fn bootstrap_pinned_source(&self) -> Result<(), UpdaterError> {
         if unsafe { libc::geteuid() } != 0
             || self.config.release_root != Path::new(DEFAULT_RELEASE_ROOT)
         {
             return Err(UpdaterError::Config(
-                "bootstrap-candidate requires the root-managed production layout".into(),
+                "pinned bootstrap requires the root-managed production layout".into(),
             ));
         }
-        let pin = self
+        let version = self
             .config
-            .candidate
+            .local_bundle
             .as_ref()
-            .ok_or_else(|| UpdaterError::Config("candidate pin required".into()))?;
+            .map(|pin| pin.version.as_str())
+            .or_else(|| {
+                self.config
+                    .candidate
+                    .as_ref()
+                    .map(|pin| pin.version.as_str())
+            })
+            .ok_or_else(|| UpdaterError::Config("operator source pin required".into()))?;
         let maintenance = OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -154,8 +177,12 @@ impl Updater {
         let old_bytes = tokio::fs::read(&previous).await?;
         let old_digest = sha256_hex(&old_bytes);
         verify_file_digest(Path::new(FIXED), &old_digest, old_bytes.len() as u64).await?;
-        self.verify_candidate(pin).await?;
-        let staged = self.stage_release(None, &pin.version).await?;
+        if let Some(pin) = &self.config.local_bundle {
+            pin.verify_source(&self.config.target_triple)?;
+        } else if let Some(pin) = &self.config.candidate {
+            self.verify_candidate(pin).await?;
+        }
+        let staged = self.stage_release(None, version).await?;
         self.verify_schema_contract(&staged.manifest).await?;
         if self.candidate_idle_snapshot().await? != before {
             return Err(UpdaterError::Config(
@@ -233,12 +260,19 @@ impl Updater {
             }).await.map_err(|_| UpdaterError::RestoreRequired("fixed updater rollback timed out; Apply must remain disabled".into()))??;
             return Err(error);
         }
-        println!(
-            "{}",
-            json!({"source":"actions_candidate", "fixed_updater_verified":true,
+        let mut receipt = self.source_receipt(version);
+        receipt
+            .as_object_mut()
+            .expect("source receipt object")
+            .extend(
+                json!({"fixed_updater_verified":true,
             "application_unchanged":true, "current":before.current, "schema":before.schema,
-            "candidate":pin.version, "pending_owner_check":true})
-        );
+            "candidate":version, "pending_owner_check":true})
+                .as_object()
+                .expect("bootstrap receipt object")
+                .clone(),
+            );
+        println!("{receipt}");
         Ok(())
     }
 }

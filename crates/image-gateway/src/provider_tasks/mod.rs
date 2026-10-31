@@ -19,6 +19,7 @@ mod remote_submit;
 mod runtime_profile;
 mod submit;
 
+pub(crate) use capacity::release_operator_normal_archive_capacity;
 pub(crate) use postgres::lock_dreamina_submit_credentials;
 
 const MAX_PROVIDER_RUNTIME_LANES: usize = 1_024;
@@ -50,15 +51,20 @@ pub use readiness::{
     ProviderRuntimeSupervisorConfig, ProviderRuntimeSupervisorError,
 };
 pub use remote_submit::{
+    DreaminaAcceptedTerminalResolution, DreaminaAcceptedTerminalResolutionRequest,
     DreaminaComplianceRejectionResolution, DreaminaComplianceRejectionResolutionRequest,
-    DreaminaVideoSupplementOperatorReceipt, GatedCliBinding, GatedCliCommand, GatedCliInputFile,
-    GatedCliObservation, GatedCliPreparedSubmission, GatedCliProcessError, GatedCliProcessOutcome,
+    DreaminaImageSupplementOperatorReceipt, DreaminaVideoSupplementOperatorReceipt,
+    GatedCliBinding, GatedCliCommand, GatedCliInputFile, GatedCliObservation,
+    GatedCliPreparedSubmission, GatedCliProcessError, GatedCliProcessOutcome,
     GatedCliProcessTerminal, GatedCliReady, GatedCliReceiptEvidence, GatedCliSubmission,
-    GatedCliSubmitCodec, GatedCliSubmitDriver, dispatch_dreamina_video_supplement_operator,
-    poll_dreamina_video_supplement_operator, prepare_dreamina_video_supplement_operator,
+    GatedCliSubmitCodec, GatedCliSubmitDriver, dispatch_dreamina_image_supplement_operator,
+    dispatch_dreamina_video_supplement_operator, poll_dreamina_image_supplement_operator,
+    poll_dreamina_video_supplement_operator, prepare_dreamina_image_supplement_operator,
+    prepare_dreamina_video_supplement_operator,
     prepare_dreamina_video_supplement_successor_operator,
-    recover_dreamina_video_supplement_acceptance_operator, resolve_dreamina_compliance_rejection,
-    run_remote_submit_gate, run_remote_submit_runner,
+    publish_dreamina_image_supplement_operator,
+    recover_dreamina_video_supplement_acceptance_operator, resolve_dreamina_accepted_terminal,
+    resolve_dreamina_compliance_rejection, run_remote_submit_gate, run_remote_submit_runner,
 };
 pub use runtime_profile::{ProviderRuntimeProfile, ProviderRuntimeProfileStore};
 pub use submit::{

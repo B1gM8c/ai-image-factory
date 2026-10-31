@@ -140,6 +140,7 @@ pub use provider_management::{
 pub use provider_tasks::GatedCliInputFile;
 pub use provider_tasks::GatedCliReceiptEvidence;
 pub use provider_tasks::{
+    DreaminaAcceptedTerminalResolution, DreaminaAcceptedTerminalResolutionRequest,
     DreaminaComplianceRejectionResolution, DreaminaComplianceRejectionResolutionRequest,
     GatedCliBinding, GatedCliCommand, GatedCliObservation, GatedCliPreparedSubmission,
     GatedCliProcessError, GatedCliProcessOutcome, GatedCliProcessTerminal, GatedCliReady,
@@ -176,12 +177,16 @@ pub use provider_tasks::{
     ProviderTaskState, ProviderTaskStore, ProviderTaskStoreError, RemoteTaskAttach,
     RemoteTaskQuarantinedReceipt, RemoteTaskSubmitFailure, RemoteTaskSubmitReceipt,
     RemoteTaskSubmitReservation, StagedProviderArtifact, VerifiedCallbackWakeup,
-    resolve_dreamina_compliance_rejection, run_remote_submit_gate, run_remote_submit_runner,
+    resolve_dreamina_accepted_terminal, resolve_dreamina_compliance_rejection,
+    run_remote_submit_gate, run_remote_submit_runner,
 };
 pub use provider_tasks::{
-    DreaminaVideoSupplementOperatorReceipt, dispatch_dreamina_video_supplement_operator,
-    poll_dreamina_video_supplement_operator, prepare_dreamina_video_supplement_operator,
+    DreaminaImageSupplementOperatorReceipt, DreaminaVideoSupplementOperatorReceipt,
+    dispatch_dreamina_image_supplement_operator, dispatch_dreamina_video_supplement_operator,
+    poll_dreamina_image_supplement_operator, poll_dreamina_video_supplement_operator,
+    prepare_dreamina_image_supplement_operator, prepare_dreamina_video_supplement_operator,
     prepare_dreamina_video_supplement_successor_operator,
+    publish_dreamina_image_supplement_operator,
     recover_dreamina_video_supplement_acceptance_operator,
 };
 pub use provider_uploads::ProviderUploadService;
@@ -212,14 +217,18 @@ pub use retention::{
 };
 pub use settlement::{
     DreaminaImageSuccessResolution, DreaminaImageSuccessResolutionRequest,
+    DreaminaImageSupplementAcceptedRequest, DreaminaImageSupplementAuthorizationRequest,
+    DreaminaImageSupplementPlan, DreaminaImageSupplementPublishRequest,
+    DreaminaImageSupplementResolution, DreaminaImageSupplementUncertainRequest,
     DreaminaManualVideoCancellationProof, DreaminaManualVideoCancellationRequest,
-    DreaminaSupplementVideoCancellationRequest, DreaminaVideoSuccessResolution,
+    DreaminaSupplementVideoCancellationRequest, DreaminaVideoArchiveResolution,
+    DreaminaVideoArchiveResolutionRequest, DreaminaVideoSuccessResolution,
     DreaminaVideoSuccessResolutionRequest, DreaminaVideoSupplementAcceptedRequest,
     DreaminaVideoSupplementAuthorizationRequest, DreaminaVideoSupplementPlan,
     DreaminaVideoSupplementPublishRequest, DreaminaVideoSupplementResolution,
     DreaminaVideoSupplementUncertainRequest, ExecutionSettlementStore, GenerationResultStatus,
     PostgresExecutionSettlementStore, resolve_dreamina_image_success,
-    resolve_dreamina_video_success,
+    resolve_dreamina_video_archive, resolve_dreamina_video_success,
 };
 pub use system_updates::{
     ApplySystemUpdateRequest, PostgresSystemUpdateService, SystemUpdateAction, SystemUpdateActor,

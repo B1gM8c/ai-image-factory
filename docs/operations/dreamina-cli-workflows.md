@@ -180,6 +180,28 @@ Estimates describe the provider's observation, not a guaranteed completion time
 or a precise countdown. Reading the API does not run another CLI query or renew
 the observation timestamp. Clients should show the age of the observation.
 
+`provider_progress` also has optional `stage` (`provider_queued`, `generating`,
+`processing`), `progress_percent` (integer) and `progress_source` (`estimated` or
+`provider`). Existing clients can ignore these additions. The current Dreamina
+CLI does not provide a verified numerical generation percentage, so this adapter
+only emits `estimated`: it takes the first durable `Generating` observation with
+an ETA for the same submission and executor execution as the baseline. At each
+subsequent `Generating` observation with an ETA, the estimate is
+`floor(100 * elapsed_ms / (elapsed_ms + remaining_seconds * 1000))`, capped at 99.
+The elapsed interval ends at that observation, not the API read time. A first
+observation with positive ETA therefore returns 0; an all-zero interval is
+unknown. Increased upstream ETA may lower the estimate. Queue observations and
+missing ETA omit the percentage and its source. Existing timestamps, errors and
+terminal-state evidence keep their meanings; 99 is never evidence of success.
+
+Display estimates as “预计 42%”, retain the observation age, and mark observations
+older than one minute as historical. Do not animate percentages, extrapolate
+stale reports or convert queue position into percent. Terminal success/failure
+still comes from the task status and verified result, not the percentage. Codex
+image generation currently exposes start/completion stages, but no verified
+numerical model progress; standard synchronous image APIs retain their existing
+response shape and must not invent a percentage from token usage or elapsed time.
+
 `stage: "queued"` means Factory's local queue; `provider_queued` requires a real
 `Queueing` upstream observation. `dispatching` and `processing` describe Factory
 tracking and do not prove rendering has started. Unknown provider states retain

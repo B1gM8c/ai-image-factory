@@ -29,6 +29,7 @@ mod additional_images;
 mod failure;
 mod image_status;
 pub(super) mod image_success_reconciliation;
+pub(super) mod image_supplementation;
 pub(super) mod manual_video_cancellation;
 mod results;
 pub(super) mod supplement_video_cancellation;
@@ -195,6 +196,17 @@ impl ExecutionSettlementStore for PostgresExecutionSettlementStore {
         actor_user_id: Option<Uuid>,
         job_id: Uuid,
     ) -> Result<(), ImageGatewayError> {
+        if image_supplementation::projection::validate_budget(
+            self,
+            tenant_id,
+            project_id,
+            actor_user_id,
+            job_id,
+        )
+        .await?
+        {
+            return Ok(());
+        }
         additional_images::validate_budget(self, tenant_id, project_id, actor_user_id, job_id).await
     }
 
@@ -205,6 +217,17 @@ impl ExecutionSettlementStore for PostgresExecutionSettlementStore {
         actor_user_id: Option<Uuid>,
         job_id: Uuid,
     ) -> Result<Vec<super::AdditionalImageResult>, ImageGatewayError> {
+        if let Some(images) = image_supplementation::projection::project(
+            self,
+            tenant_id,
+            project_id,
+            actor_user_id,
+            job_id,
+        )
+        .await?
+        {
+            return Ok(images);
+        }
         additional_images::project(self, tenant_id, project_id, actor_user_id, job_id).await
     }
 
@@ -294,7 +317,26 @@ impl ExecutionSettlementStore for PostgresExecutionSettlementStore {
              AND progress_task.executor_execution_id = progress_submission.executor_execution_id
              AND progress_task.provider_id = j.provider_id
             LEFT JOIN LATERAL (
-                SELECT observation.progress_json, observation.observed_at_ms
+                SELECT observation.progress_json || jsonb_build_object(
+                        'generation_started_at_ms', CASE
+                            WHEN observation.progress_json ->> 'provider_status' = 'Generating'
+                             AND jsonb_typeof(observation.progress_json -> 'estimated_remaining_seconds') = 'number'
+                            THEN (
+                            SELECT baseline.observed_at_ms
+                            FROM provider_task_observations baseline
+                            WHERE baseline.submission_id = observation.submission_id
+                              AND baseline.executor_execution_id = observation.executor_execution_id
+                              AND baseline.source = 'poll'
+                              AND baseline.observed_state = 'provider_waiting'
+                              AND baseline.progress_json IS NOT NULL
+                              AND baseline.progress_json ->> 'provider_status' = 'Generating'
+                              AND jsonb_typeof(baseline.progress_json -> 'estimated_remaining_seconds') = 'number'
+                              AND baseline.observed_at_ms <= observation.observed_at_ms
+                            ORDER BY baseline.observed_at_ms ASC,
+                                     baseline.poll_lease_epoch ASC, baseline.observation_id ASC
+                            LIMIT 1
+                        ) END
+                    ) AS progress_json, observation.observed_at_ms
                 FROM provider_task_observations observation
                 WHERE observation.submission_id = progress_task.submission_id
                   AND observation.executor_execution_id = progress_task.executor_execution_id
@@ -339,6 +381,7 @@ impl ExecutionSettlementStore for PostgresExecutionSettlementStore {
              AND j.provider_id = 'dreamina-cli' AND j.state = 'succeeded'
             LEFT JOIN dreamina_operator_video_success_resolutions operator_video
               ON operator_video.job_id = j.job_id
+             AND operator_video.evidence_mode = 'legacy_poll_v1'
              AND operator_video.submission_id = progress_submission.submission_id
              AND operator_video.executor_execution_id = progress_submission.executor_execution_id
              AND operator_video.output_id = progress_output.output_id
@@ -425,7 +468,26 @@ impl ExecutionSettlementStore for PostgresExecutionSettlementStore {
                  AND progress_task.executor_execution_id = progress_submission.executor_execution_id
                  AND progress_task.provider_id = j.provider_id
                 LEFT JOIN LATERAL (
-                    SELECT observation.progress_json, observation.observed_at_ms
+                    SELECT observation.progress_json || jsonb_build_object(
+                        'generation_started_at_ms', CASE
+                            WHEN observation.progress_json ->> 'provider_status' = 'Generating'
+                             AND jsonb_typeof(observation.progress_json -> 'estimated_remaining_seconds') = 'number'
+                            THEN (
+                            SELECT baseline.observed_at_ms
+                            FROM provider_task_observations baseline
+                            WHERE baseline.submission_id = observation.submission_id
+                              AND baseline.executor_execution_id = observation.executor_execution_id
+                              AND baseline.source = 'poll'
+                              AND baseline.observed_state = 'provider_waiting'
+                              AND baseline.progress_json IS NOT NULL
+                              AND baseline.progress_json ->> 'provider_status' = 'Generating'
+                              AND jsonb_typeof(baseline.progress_json -> 'estimated_remaining_seconds') = 'number'
+                              AND baseline.observed_at_ms <= observation.observed_at_ms
+                            ORDER BY baseline.observed_at_ms ASC,
+                                     baseline.poll_lease_epoch ASC, baseline.observation_id ASC
+                            LIMIT 1
+                        ) END
+                    ) AS progress_json, observation.observed_at_ms
                     FROM provider_task_observations observation
                     WHERE observation.submission_id = progress_task.submission_id
                       AND observation.executor_execution_id = progress_task.executor_execution_id
@@ -470,6 +532,7 @@ impl ExecutionSettlementStore for PostgresExecutionSettlementStore {
                  AND j.provider_id = 'dreamina-cli' AND j.state = 'succeeded'
                 LEFT JOIN dreamina_operator_video_success_resolutions operator_video
                   ON operator_video.job_id = j.job_id
+                 AND operator_video.evidence_mode = 'legacy_poll_v1'
                  AND operator_video.submission_id = progress_submission.submission_id
                  AND operator_video.executor_execution_id = progress_submission.executor_execution_id
                  AND operator_video.output_id = progress_output.output_id
@@ -518,7 +581,15 @@ impl ExecutionSettlementStore for PostgresExecutionSettlementStore {
             SELECT resolution.resolution_id, job.job_id, job.request_id,
                    hold.hold_id, hold.currency, hold.held_micros::TEXT,
                    hold.released_micros::TEXT, hold.captured_micros::TEXT
-            FROM dreamina_operator_rejection_resolutions resolution
+            FROM (
+                SELECT resolution_id, job_id, hold_id, reason, released_micros
+                FROM dreamina_operator_rejection_resolutions
+                WHERE reason IN ('dreamina_compliance_confirmation_required', 'dreamina_concurrency_limit_exceeded')
+                UNION ALL
+                SELECT resolution_id, job_id, hold_id, reason, released_micros
+                FROM dreamina_accepted_terminal_resolutions
+                WHERE reason = 'dreamina_copyright_rejected'
+            ) resolution
             JOIN jobs job ON job.job_id = resolution.job_id
             JOIN job_auth_attributions attribution
               ON attribution.job_id = job.job_id AND attribution.tenant_id = job.tenant_id
@@ -532,8 +603,7 @@ impl ExecutionSettlementStore for PostgresExecutionSettlementStore {
               AND job.economics_contract_version = 4 AND job.output_count = 1
               AND job.charged_units = 0
               AND job.state = 'failed'
-              AND job.last_error_code = 'dreamina_compliance_confirmation_required'
-              AND resolution.reason = job.last_error_code
+              AND job.last_error_code = resolution.reason
               AND hold.state = 'released' AND hold.captured_micros = 0
               AND hold.released_micros = hold.held_micros
               AND resolution.released_micros = hold.released_micros
@@ -617,7 +687,26 @@ impl ExecutionSettlementStore for PostgresExecutionSettlementStore {
                  AND progress_task.executor_execution_id = progress_submission.executor_execution_id
                  AND progress_task.provider_id = j.provider_id
                 LEFT JOIN LATERAL (
-                    SELECT observation.progress_json, observation.observed_at_ms
+                    SELECT observation.progress_json || jsonb_build_object(
+                        'generation_started_at_ms', CASE
+                            WHEN observation.progress_json ->> 'provider_status' = 'Generating'
+                             AND jsonb_typeof(observation.progress_json -> 'estimated_remaining_seconds') = 'number'
+                            THEN (
+                            SELECT baseline.observed_at_ms
+                            FROM provider_task_observations baseline
+                            WHERE baseline.submission_id = observation.submission_id
+                              AND baseline.executor_execution_id = observation.executor_execution_id
+                              AND baseline.source = 'poll'
+                              AND baseline.observed_state = 'provider_waiting'
+                              AND baseline.progress_json IS NOT NULL
+                              AND baseline.progress_json ->> 'provider_status' = 'Generating'
+                              AND jsonb_typeof(baseline.progress_json -> 'estimated_remaining_seconds') = 'number'
+                              AND baseline.observed_at_ms <= observation.observed_at_ms
+                            ORDER BY baseline.observed_at_ms ASC,
+                                     baseline.poll_lease_epoch ASC, baseline.observation_id ASC
+                            LIMIT 1
+                        ) END
+                    ) AS progress_json, observation.observed_at_ms
                     FROM provider_task_observations observation
                     WHERE observation.submission_id = progress_task.submission_id
                       AND observation.executor_execution_id = progress_task.executor_execution_id
@@ -662,6 +751,7 @@ impl ExecutionSettlementStore for PostgresExecutionSettlementStore {
                  AND j.provider_id = 'dreamina-cli' AND j.state = 'succeeded'
                 LEFT JOIN dreamina_operator_video_success_resolutions operator_video
                   ON operator_video.job_id = j.job_id
+                 AND operator_video.evidence_mode = 'legacy_poll_v1'
                  AND operator_video.submission_id = progress_submission.submission_id
                  AND operator_video.executor_execution_id = progress_submission.executor_execution_id
                  AND operator_video.output_id = progress_output.output_id
@@ -869,6 +959,7 @@ type VideoStatusRow = (
 
 #[derive(serde::Deserialize)]
 struct StoredProviderProgress {
+    generation_started_at_ms: Option<i64>,
     provider_status: String,
     queue_position: Option<u64>,
     queue_total: Option<u64>,
@@ -888,10 +979,36 @@ fn video_provider_progress(
         estimated_remaining_seconds: stored.estimated_remaining_seconds,
     };
     progress.validate().ok()?;
+    let estimated_percent =
+        estimated_generation_percent(&progress, stored.generation_started_at_ms, observed_at_ms);
     Some(VideoProviderProgress {
+        estimated_percent,
         progress,
         observed_at_ms,
     })
+}
+
+// This is an estimate since our first observed Generating report, not a provider
+// percentage or a wall-clock animation. Only a new durable report changes it.
+fn estimated_generation_percent(
+    progress: &image_provider_sdk::ProviderTaskProgress,
+    generation_started_at_ms: Option<i64>,
+    observed_at_ms: i64,
+) -> Option<u8> {
+    if progress.provider_status != "Generating" {
+        return None;
+    }
+    let start = generation_started_at_ms.filter(|start| *start >= 0)?;
+    let elapsed_ms = observed_at_ms
+        .checked_sub(start)
+        .filter(|elapsed| *elapsed >= 0)? as u128;
+    let remaining_ms = u128::from(progress.estimated_remaining_seconds?) * 1_000;
+    // A zero ETA is not completion evidence; only artifact publication completes a task.
+    let denominator = elapsed_ms + remaining_ms;
+    if denominator == 0 {
+        return None;
+    }
+    Some(((elapsed_ms * 100 / denominator).min(99)) as u8)
 }
 
 fn video_request_metadata(
@@ -1563,6 +1680,50 @@ fn settlement_unavailable(_: impl std::fmt::Display) -> ImageGatewayError {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn generation_percent_uses_only_observations_and_can_revise_downward() {
+        let progress = |status: &str, eta: Option<u64>, start: Option<i64>, observed: i64| {
+            video_provider_progress(
+                Some(serde_json::json!({
+                    "provider_status": status,
+                    "estimated_remaining_seconds": eta,
+                    "generation_started_at_ms": start,
+                })),
+                Some(observed),
+            )
+            .unwrap()
+            .estimated_percent
+        };
+        assert_eq!(
+            progress("Generating", Some(60), Some(1_000), 1_000),
+            Some(0)
+        );
+        assert_eq!(
+            progress("Generating", Some(30), Some(1_000), 31_000),
+            Some(50)
+        );
+        assert_eq!(
+            progress("Generating", Some(120), Some(1_000), 61_000),
+            Some(33)
+        );
+        assert_eq!(
+            progress("Generating", Some(0), Some(1_000), 61_000),
+            Some(99)
+        );
+        assert_eq!(progress("Generating", Some(0), Some(1_000), 1_000), None);
+        assert_eq!(progress("Generating", None, Some(1_000), 61_000), None);
+        assert_eq!(progress("Generating", Some(30), None, 61_000), None);
+        assert_eq!(progress("Generating", Some(30), Some(-1), 61_000), None);
+        assert_eq!(progress("Generating", Some(30), Some(62_000), 61_000), None);
+        assert_eq!(progress("Queueing", Some(30), Some(1_000), 61_000), None);
+        assert_eq!(progress("Processing", Some(30), Some(1_000), 61_000), None);
+        // Re-reading the identical observation has no wall-clock input to advance it.
+        assert_eq!(
+            progress("Generating", Some(30), Some(1_000), 31_000),
+            Some(50)
+        );
+    }
+
     use super::*;
     use image_provider_dreamina_cli::{
         FramesToVideoRequestV1, ImageToVideoRequestV1, MultimodalToVideoRequestV1,

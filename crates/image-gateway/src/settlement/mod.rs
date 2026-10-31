@@ -22,13 +22,19 @@ pub use postgres::image_success_reconciliation::{
     DreaminaImageSuccessResolution, DreaminaImageSuccessResolutionRequest,
     resolve_dreamina_image_success,
 };
+pub use postgres::image_supplementation::{
+    DreaminaImageSupplementAcceptedRequest, DreaminaImageSupplementAuthorizationRequest,
+    DreaminaImageSupplementPlan, DreaminaImageSupplementPublishRequest,
+    DreaminaImageSupplementResolution, DreaminaImageSupplementUncertainRequest,
+};
 pub use postgres::manual_video_cancellation::{
     DreaminaManualVideoCancellationProof, DreaminaManualVideoCancellationRequest,
 };
 pub use postgres::supplement_video_cancellation::DreaminaSupplementVideoCancellationRequest;
 pub use postgres::video_success_reconciliation::{
+    DreaminaVideoArchiveResolution, DreaminaVideoArchiveResolutionRequest,
     DreaminaVideoSuccessResolution, DreaminaVideoSuccessResolutionRequest,
-    resolve_dreamina_video_success,
+    resolve_dreamina_video_archive, resolve_dreamina_video_success,
 };
 
 pub use postgres::video_supplementation::{
@@ -278,6 +284,8 @@ pub enum VideoResultStatus {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VideoProviderProgress {
+    /// Derived only from durable Generating observations and upstream ETA.
+    pub estimated_percent: Option<u8>,
     pub progress: image_provider_sdk::ProviderTaskProgress,
     pub observed_at_ms: i64,
 }
