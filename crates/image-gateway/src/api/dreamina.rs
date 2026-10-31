@@ -1406,7 +1406,7 @@ async fn project_video_task(
     let audited_release_possible = matches!(
         &status,
         VideoResultStatus::Failed { error_code: Some(code), .. }
-            if code == "dreamina_compliance_confirmation_required"
+            if matches!(code.as_str(), "dreamina_compliance_confirmation_required" | "dreamina_concurrency_limit_exceeded")
     );
     let manual_cancellation = if matches!(&status, VideoResultStatus::Failed { .. }) {
         settlement_store

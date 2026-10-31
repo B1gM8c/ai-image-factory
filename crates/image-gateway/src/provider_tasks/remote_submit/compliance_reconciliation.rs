@@ -9,8 +9,6 @@ use uuid::Uuid;
 
 use crate::{ImageGatewayError, credit_grants::settle_credit_grant_reservations};
 
-const REASON: &str = "dreamina_compliance_confirmation_required";
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DreaminaComplianceRejectionResolutionRequest {
     pub job_id: Uuid,
@@ -174,7 +172,7 @@ pub async fn resolve_dreamina_compliance_rejection(
         "#,
     ).bind(request.job_id).bind(request.submission_id).bind(request.executor_execution_id)
         .fetch_optional(&mut *tx).await.map_err(unavailable)?.ok_or_else(conflict)?;
-    let evidence = super::compliance_evidence::load(
+    let evidence = super::compliance_evidence::load_rejection(
         &mut tx,
         journal_root,
         request.submission_id,
@@ -182,6 +180,7 @@ pub async fn resolve_dreamina_compliance_rejection(
         &request.reviewed_stdout_sha256,
     )
     .await?;
+    let reason = evidence.reason.code();
     let now: i64 =
         sqlx::query_scalar("SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT")
             .fetch_one(&mut *tx)
@@ -202,7 +201,7 @@ pub async fn resolve_dreamina_compliance_rejection(
     .bind(request.submission_id)
     .bind(request.executor_execution_id)
     .bind(locked.hold_id)
-    .bind(REASON)
+    .bind(reason)
     .bind(&evidence.stdout_sha256)
     .bind(&evidence.execution_binding_sha256)
     .bind(evidence.launch_nonce)
@@ -248,16 +247,16 @@ pub async fn resolve_dreamina_compliance_rejection(
     ).bind(locked.reservation_id).bind(now).execute(&mut *tx).await.map_err(storage_conflict)?)?;
     require_one(sqlx::query(
         "UPDATE jobs SET state = 'failed', last_error_code = $2, updated_at_ms = $3 WHERE job_id = $1 AND state = 'uncertain' AND charged_units = 0",
-    ).bind(request.job_id).bind(REASON).bind(now).execute(&mut *tx).await.map_err(storage_conflict)?)?;
+    ).bind(request.job_id).bind(reason).bind(now).execute(&mut *tx).await.map_err(storage_conflict)?)?;
     require_one(sqlx::query(
         "UPDATE work_items SET state = 'failed', updated_at_ms = $2 WHERE work_item_id = $1 AND state = 'uncertain'",
     ).bind(locked.work_item_id).bind(now).execute(&mut *tx).await.map_err(storage_conflict)?)?;
     require_one(sqlx::query(
         "UPDATE job_attempts SET state = 'failed', error_code = $2, updated_at_ms = $3 WHERE work_item_id = $1 AND state = 'uncertain'",
-    ).bind(locked.work_item_id).bind(REASON).bind(now).execute(&mut *tx).await.map_err(storage_conflict)?)?;
+    ).bind(locked.work_item_id).bind(reason).bind(now).execute(&mut *tx).await.map_err(storage_conflict)?)?;
     require_one(sqlx::query(
         "UPDATE job_outputs SET state = 'failed', error_code = $2, updated_at_ms = $3 WHERE job_id = $1 AND state = 'uncertain'",
-    ).bind(request.job_id).bind(REASON).bind(now).execute(&mut *tx).await.map_err(storage_conflict)?)?;
+    ).bind(request.job_id).bind(reason).bind(now).execute(&mut *tx).await.map_err(storage_conflict)?)?;
     sqlx::query(
         "UPDATE idempotency_requests SET state = 'failed', terminal_outcome = 'failed', updated_at_ms = $2 WHERE job_id = $1 AND state = 'uncertain' AND terminal_outcome = 'uncertain'",
     ).bind(request.job_id).bind(now).execute(&mut *tx).await.map_err(storage_conflict)?;
@@ -276,7 +275,7 @@ pub async fn resolve_dreamina_compliance_rejection(
         .bind(&locked.operation)
         .bind(event_type)
         .bind(locked.requested_units)
-        .bind(REASON)
+        .bind(reason)
         .bind(&locked.billing_metric)
         .bind(&locked.billing_unit)
         .bind(now)
@@ -284,7 +283,7 @@ pub async fn resolve_dreamina_compliance_rejection(
         .await
         .map_err(storage_conflict)?;
     }
-    let payload = json!({"reason": REASON, "error_code": REASON,
+    let payload = json!({"reason": reason, "error_code": reason,
         "resolution_id": resolution_id, "submission_id": request.submission_id,
         "executor_execution_id": request.executor_execution_id, "hold_id": locked.hold_id,
         "currency": locked.currency, "captured_micros": 0,

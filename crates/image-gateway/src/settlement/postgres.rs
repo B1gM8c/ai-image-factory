@@ -595,8 +595,8 @@ impl ExecutionSettlementStore for PostgresExecutionSettlementStore {
               AND job.economics_contract_version = 4 AND job.output_count = 1
               AND job.charged_units = 0
               AND job.state = 'failed'
-              AND job.last_error_code = 'dreamina_compliance_confirmation_required'
-              AND resolution.reason = job.last_error_code
+              AND job.last_error_code = resolution.reason
+              AND resolution.reason IN ('dreamina_compliance_confirmation_required', 'dreamina_concurrency_limit_exceeded')
               AND hold.state = 'released' AND hold.captured_micros = 0
               AND hold.released_micros = hold.held_micros
               AND resolution.released_micros = hold.released_micros

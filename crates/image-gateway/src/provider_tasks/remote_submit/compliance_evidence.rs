@@ -21,7 +21,30 @@ use crate::{
     providers::dreamina_cli::DreaminaCliSubmitCodecV1,
 };
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum RejectionReason {
+    Compliance,
+    Concurrency,
+}
+
+impl RejectionReason {
+    pub(super) fn code(self) -> &'static str {
+        match self {
+            Self::Compliance => "dreamina_compliance_confirmation_required",
+            Self::Concurrency => "dreamina_concurrency_limit_exceeded",
+        }
+    }
+
+    fn historical_code(self) -> &'static str {
+        match self {
+            Self::Compliance => "dreamina_submit_rejected",
+            Self::Concurrency => "dreamina_submit_recovery_evidence_invalid",
+        }
+    }
+}
+
 pub(crate) struct VerifiedComplianceEvidence {
+    pub(super) reason: RejectionReason,
     pub(crate) execution_binding_sha256: String,
     pub(crate) provider_deadline_at_ms: i64,
     pub(crate) launch_nonce: Uuid,
@@ -66,6 +89,27 @@ struct EvidenceRow {
 /// Inspect one existing, bound CLI result. This path cannot prepare, launch,
 /// release, poll, or alter any provider command or journal marker.
 pub(crate) async fn load(
+    tx: &mut Transaction<'_, Postgres>,
+    root: &Path,
+    submission_id: Uuid,
+    executor_execution_id: Uuid,
+    reviewed_stdout_sha256: &str,
+) -> Result<VerifiedComplianceEvidence, ImageGatewayError> {
+    let proof = load_rejection(
+        tx,
+        root,
+        submission_id,
+        executor_execution_id,
+        reviewed_stdout_sha256,
+    )
+    .await?;
+    if proof.reason != RejectionReason::Compliance {
+        return Err(conflict());
+    }
+    Ok(proof)
+}
+
+pub(super) async fn load_rejection(
     tx: &mut Transaction<'_, Postgres>,
     root: &Path,
     submission_id: Uuid,
@@ -124,7 +168,7 @@ pub(crate) async fn load(
           AND intent.remote_operation_id IS NULL AND intent.provider_request_id IS NULL
           AND intent.receipt_event_identity IS NULL
           AND intent.output_index = 0 AND intent.output_total = 1
-          AND intent.failure_error_code = 'dreamina_submit_rejected'
+          AND intent.failure_error_code IN ('dreamina_submit_rejected', 'dreamina_submit_recovery_evidence_invalid')
           AND submission.state = 'uncertain' AND execution.state = 'uncertain'
           AND execution.executor_owner IS NULL AND execution.lease_expires_at_ms IS NULL
           AND recovery.state = 'closed' AND recovery.invocation_attempt = 1
@@ -217,14 +261,12 @@ pub(crate) async fn load(
     let spec = RemoteSubmitJournalSpec::new(&intent, &context, command.canonical_payload())
         .map_err(|_| conflict())?;
     let journal = RemoteSubmitJournal::open_existing(root).map_err(|_| conflict())?;
-    if !matches!(
-        journal.observe(&spec).map_err(|_| conflict())?,
-        RemoteSubmitJournalObservation::Terminal(RemoteSubmitJournalTerminal::Unknown {
-            error_code
-        }) if error_code == "dreamina_submit_rejected"
-    ) {
+    let RemoteSubmitJournalObservation::Terminal(RemoteSubmitJournalTerminal::Unknown {
+        error_code: journal_error,
+    }) = journal.observe(&spec).map_err(|_| conflict())?
+    else {
         return Err(conflict());
-    }
+    };
     let launch_nonce = journal
         .released_authority(&spec)
         .map_err(|_| conflict())?
@@ -241,8 +283,14 @@ pub(crate) async fn load(
     else {
         return Err(conflict());
     };
-    verify_terminal(submission_id, &terminal, reviewed_stdout_sha256)?;
+    let reason = verify_rejection_terminal(submission_id, &terminal, reviewed_stdout_sha256)?;
+    if journal_error != reason.historical_code()
+        || intent.failure_error_code.as_deref() != Some(reason.historical_code())
+    {
+        return Err(conflict());
+    }
     Ok(VerifiedComplianceEvidence {
+        reason,
         execution_binding_sha256: context.execution_binding_sha256().to_owned(),
         provider_deadline_at_ms: context.provider_deadline_at_ms(),
         launch_nonce,
@@ -250,11 +298,25 @@ pub(crate) async fn load(
     })
 }
 
+#[cfg(test)]
 pub(super) fn verify_terminal(
     submission_id: Uuid,
     terminal: &super::GatedCliProcessTerminal,
     reviewed_stdout_sha256: &str,
 ) -> Result<(), ImageGatewayError> {
+    if verify_rejection_terminal(submission_id, terminal, reviewed_stdout_sha256)?
+        != RejectionReason::Compliance
+    {
+        return Err(conflict());
+    }
+    Ok(())
+}
+
+fn verify_rejection_terminal(
+    submission_id: Uuid,
+    terminal: &super::GatedCliProcessTerminal,
+    reviewed_stdout_sha256: &str,
+) -> Result<RejectionReason, ImageGatewayError> {
     if !terminal.released()
         || !terminal.exec_started()
         || terminal.stdout_truncated()
@@ -273,13 +335,18 @@ pub(super) fn verify_terminal(
     let failure = DreaminaCliSubmitCodecV1::decode_for_submission(submission_id, terminal.stdout())
         .err()
         .ok_or_else(conflict)?;
-    if failure.code() != "dreamina_compliance_confirmation_required"
-        || failure.effect() != EffectCertainty::NoRemoteEffect
+    if failure.effect() != EffectCertainty::NoRemoteEffect
         || failure.retry() != RetryDirective::Never
     {
         return Err(conflict());
     }
-    Ok(())
+    match failure.code() {
+        "dreamina_compliance_confirmation_required" => Ok(RejectionReason::Compliance),
+        "dreamina_concurrency_limit_exceeded" if terminal.stderr().is_empty() => {
+            Ok(RejectionReason::Concurrency)
+        }
+        _ => Err(conflict()),
+    }
 }
 
 fn conflict() -> ImageGatewayError {
