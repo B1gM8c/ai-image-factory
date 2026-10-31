@@ -129,6 +129,34 @@ fn image_terminal_states_omit_old_progress_and_uncertain_remains_distinct() {
     }
 }
 
+#[test]
+fn image_terminal_known_reason_is_displayed_without_changing_unknown_fallback() {
+    for (code, message) in [
+        (
+            "dreamina_copyright_rejected",
+            "生成的视频里包含受版权保护元素",
+        ),
+        (
+            "dreamina_generation_failed",
+            "Dreamina image generation failed",
+        ),
+        ("future_reason", "Dreamina image generation failed"),
+    ] {
+        let (task, _) = image_task(
+            Uuid::nil(),
+            projection(ImageResultStatus::Failed {
+                error_code: Some(code.to_owned()),
+            }),
+        )
+        .unwrap();
+        assert_eq!(task.status, "failed");
+        assert!(task.data.is_none());
+        let error = task.error.unwrap();
+        assert_eq!(error.code, code);
+        assert_eq!(error.message, message);
+    }
+}
+
 fn success(count: usize) -> StoredGenerationResult {
     let mut encoded = std::io::Cursor::new(Vec::new());
     image::RgbaImage::from_pixel(1, 1, image::Rgba([30, 100, 200, 255]))

@@ -46,6 +46,7 @@ pub struct DreaminaQueueInfoV1 {
 pub struct DreaminaQueryReceiptV1 {
     submit_id: OpaqueProviderId,
     status: DreaminaQueryStatusV1,
+    failure_code: Option<&'static str>,
     remote_video_result: Option<RemoteVideoResult>,
     image_result_count: Option<usize>,
     result_metadata_present: bool,
@@ -60,6 +61,11 @@ impl DreaminaQueryReceiptV1 {
 
     pub fn status(&self) -> DreaminaQueryStatusV1 {
         self.status
+    }
+
+    /// Allowlisted terminal reason only; raw provider text is never retained.
+    pub fn failure_code(&self) -> Option<&'static str> {
+        self.failure_code
     }
 
     /// Only the CLI's single-video result view can establish remote delivery.
@@ -151,6 +157,8 @@ pub fn parse_query_receipt(input: &[u8]) -> Result<DreaminaQueryReceiptV1, Recei
         Some(status) => return Err(ReceiptError::UnknownStatus(sanitize_text(status))),
         None => return Err(ReceiptError::MissingStatus),
     };
+    let failure_code = (status == DreaminaQueryStatusV1::Failed)
+        .then(|| known_failure_code(raw.fail_reason.as_deref()));
     let result_metadata_present = raw.result_json.is_some();
     let result = (status == DreaminaQueryStatusV1::Success)
         .then(|| parse_result_json(raw.result_json))
@@ -175,6 +183,7 @@ pub fn parse_query_receipt(input: &[u8]) -> Result<DreaminaQueryReceiptV1, Recei
     Ok(DreaminaQueryReceiptV1 {
         submit_id,
         status,
+        failure_code,
         remote_video_result,
         image_result_count,
         result_metadata_present,
@@ -337,6 +346,18 @@ fn parse_submit_id(submit_id: Option<String>) -> Result<OpaqueProviderId, Receip
             OpaqueProviderId::new(submit_id).map_err(|_| ReceiptError::InvalidSubmitId)
         }
         None => Err(ReceiptError::EmptySubmitId),
+    }
+}
+
+fn known_failure_code(reason: Option<&str>) -> &'static str {
+    // Match complete provider messages, not keywords inside arbitrary diagnostics.
+    // The copyright wording is observed in the provider UI; different CLI wording
+    // deliberately remains generic until its exact contract is established.
+    match reason.filter(|value| value.chars().count() <= MAX_FAIL_REASON_CHARS) {
+        Some(value) if value.trim() == "生成的视频里包含受版权保护元素" => {
+            "dreamina_copyright_rejected"
+        }
+        _ => "dreamina_generation_failed",
     }
 }
 

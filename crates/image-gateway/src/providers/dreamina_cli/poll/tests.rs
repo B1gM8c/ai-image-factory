@@ -124,6 +124,53 @@ async fn pending_and_terminal_failure_require_an_empty_download_directory() {
 }
 
 #[tokio::test]
+async fn known_terminal_reason_is_preserved_only_for_the_bound_task() {
+    for remote_video in [false, true] {
+        for submit in ["task-1", "another-task"] {
+            let fixture = Fixture::new(&format!(
+                r#"printf '%s' '{{"submit_id":"{submit}","gen_status":"fail","fail_reason":"生成的视频里包含受版权保护元素"}}'"#,
+            ));
+            let mut sink = fixture.sink([0_u8; 32]);
+            let result = fixture
+                .driver(1024)
+                .poll_operation(&fixture.operation(), remote_video, &mut sink)
+                .await;
+            if submit == "task-1" {
+                let PollObservation::Failed(failure) = result.unwrap() else {
+                    panic!("expected terminal failure")
+                };
+                assert_eq!(failure.code(), "dreamina_copyright_rejected");
+                assert_eq!(failure.effect(), EffectCertainty::NoRemoteEffect);
+                assert_eq!(failure.retry(), RetryDirective::Never);
+            } else {
+                assert_eq!(result.unwrap_err().code(), "dreamina_poll_receipt_mismatch");
+            }
+            assert!(sink.bytes().is_empty());
+            assert_eq!(sink.finalize_count(), 0);
+            fixture.assert_workspace_has_no_attempts();
+        }
+    }
+    let fixture = Fixture::new(
+        r#"printf '%s' '{"submit_id":"task-1","gen_status":"fail","fail_reason":"生成的视频里包含受版权保护元素"}'"#,
+    );
+    let mut sink = BatchTestSink::default();
+    let result = fixture
+        .driver(1024)
+        .poll_native_batch_operation(&fixture.operation(), 2, &mut sink)
+        .await
+        .unwrap();
+    let ProviderNativeBatchPollObservation::Failed(failure) = result else {
+        panic!("expected terminal failure")
+    };
+    assert_eq!(failure.code(), "dreamina_copyright_rejected");
+    assert_eq!(failure.effect(), EffectCertainty::NoRemoteEffect);
+    assert_eq!(failure.retry(), RetryDirective::Never);
+    assert!(sink.outputs.is_empty());
+    assert_eq!(sink.finalized, 0);
+    fixture.assert_workspace_has_no_attempts();
+}
+
+#[tokio::test]
 async fn success_streams_one_valid_image_and_verifies_the_sink_manifest() {
     let fixture = Fixture::new(
         r#"/bin/cp "$HOME/source.png" "$download/result.png"

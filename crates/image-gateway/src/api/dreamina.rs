@@ -1290,13 +1290,9 @@ fn image_task(
             task.status = "failed".to_owned();
             task.error = Some(DreaminaTaskError {
                 reason_code: None,
-                message: if error_code.as_deref()
-                    == Some("dreamina_compliance_confirmation_required")
-                {
-                    DREAMINA_COMPLIANCE_CONFIRMATION_MESSAGE.to_owned()
-                } else {
-                    "Dreamina image generation failed".to_owned()
-                },
+                message: known_terminal_failure_message(error_code.as_deref())
+                    .unwrap_or("Dreamina image generation failed")
+                    .to_owned(),
                 code: error_code.unwrap_or_else(|| "generation_failed".to_owned()),
             });
         }
@@ -1531,12 +1527,8 @@ fn video_task(id: Uuid, status: VideoResultStatus) -> DreaminaVideoTask {
         VideoResultStatus::Failed {
             model, error_code, ..
         } => {
-            let message = match error_code.as_deref() {
-                Some("dreamina_compliance_confirmation_required") => {
-                    DREAMINA_COMPLIANCE_CONFIRMATION_MESSAGE
-                }
-                _ => "Dreamina video generation failed",
-            };
+            let message = known_terminal_failure_message(error_code.as_deref())
+                .unwrap_or("Dreamina video generation failed");
             DreaminaVideoTask {
                 id: id.to_string(),
                 status: "failed".to_owned(),
@@ -1560,6 +1552,16 @@ fn video_task(id: Uuid, status: VideoResultStatus) -> DreaminaVideoTask {
         reason: "provider_cancellation_unsupported".to_owned(),
     });
     task
+}
+
+fn known_terminal_failure_message(code: Option<&str>) -> Option<&'static str> {
+    match code? {
+        "dreamina_compliance_confirmation_required" => {
+            Some(DREAMINA_COMPLIANCE_CONFIRMATION_MESSAGE)
+        }
+        "dreamina_copyright_rejected" => Some("生成的视频里包含受版权保护元素"),
+        _ => None,
+    }
 }
 
 fn submission_uncertainty_diagnostic(code: Option<&str>) -> Option<(&'static str, &'static str)> {
@@ -2323,6 +2325,11 @@ mod tests {
                 Some("dreamina_compliance_confirmation_required"),
                 "dreamina_compliance_confirmation_required",
                 DREAMINA_COMPLIANCE_CONFIRMATION_MESSAGE,
+            ),
+            (
+                Some("dreamina_copyright_rejected"),
+                "dreamina_copyright_rejected",
+                "生成的视频里包含受版权保护元素",
             ),
             (
                 Some("provider_submit_cli_failed"),

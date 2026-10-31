@@ -606,6 +606,56 @@ fn query_receipt_binds_querying_success_and_failure_to_a_submit_id() {
 }
 
 #[test]
+fn query_failure_reason_is_allowlisted_bounded_and_does_not_change_status() {
+    let copyright = "生成的视频里包含受版权保护元素";
+    for (reason, expected) in [
+        (Some(copyright.to_owned()), "dreamina_copyright_rejected"),
+        (
+            Some(format!("  {copyright}\n")),
+            "dreamina_copyright_rejected",
+        ),
+        (None, "dreamina_generation_failed"),
+        (Some(String::new()), "dreamina_generation_failed"),
+        (
+            Some(format!("not {copyright}")),
+            "dreamina_generation_failed",
+        ),
+        (
+            Some(format!(
+                "{copyright}: https://private.example/?token=secret"
+            )),
+            "dreamina_generation_failed",
+        ),
+        (
+            Some(format!("{copyright}{}", " ".repeat(MAX_FAIL_REASON_CHARS))),
+            "dreamina_generation_failed",
+        ),
+    ] {
+        let receipt = parse_query_receipt(
+            &serde_json::to_vec(&serde_json::json!({
+                "submit_id": "task-1", "gen_status": "fail", "fail_reason": reason,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(receipt.status(), DreaminaQueryStatusV1::Failed);
+        assert_eq!(receipt.failure_code(), Some(expected));
+        assert!(!format!("{receipt:?}").contains("private.example"));
+    }
+    for status in ["querying", "success"] {
+        let receipt = parse_query_receipt(
+            &serde_json::to_vec(&serde_json::json!({
+                "submit_id": "task-1", "gen_status": status, "fail_reason": copyright,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(receipt.failure_code(), None);
+        assert_ne!(receipt.status(), DreaminaQueryStatusV1::Failed);
+    }
+}
+
+#[test]
 fn failed_receipt_returns_a_single_line_sanitized_reason() {
     let error = parse_receipt(
         br#"{"submit_id":"task-1","gen_status":"fail","fail_reason":"  denied\n\u001b[31m retry\t later  "}"#,
