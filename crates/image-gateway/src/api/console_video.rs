@@ -908,6 +908,8 @@ fn console_video_error_code(error_code: Option<&str>) -> &'static str {
         Some("dreamina_compliance_confirmation_required") => {
             "dreamina_compliance_confirmation_required"
         }
+        Some("dreamina_concurrency_limit_exceeded") => "dreamina_concurrency_limit_exceeded",
+        Some("dreamina_copyright_rejected") => "dreamina_copyright_rejected",
         Some("failed_precondition") => "failed_precondition",
         Some("grok_video_output_upload_url_required") => "grok_video_output_upload_url_required",
         Some(
@@ -921,6 +923,9 @@ fn console_video_error_code(error_code: Option<&str>) -> &'static str {
 }
 
 fn console_video_error_message(error_code: Option<&str>) -> &'static str {
+    if let Some(message) = super::dreamina::known_terminal_failure_message(error_code) {
+        return message;
+    }
     match error_code {
         Some("dreamina_compliance_confirmation_required") => {
             super::dreamina::DREAMINA_COMPLIANCE_CONFIRMATION_MESSAGE
@@ -1417,6 +1422,23 @@ mod tests {
             let error = status.error.unwrap();
             assert_eq!(error.code, expected_code);
             assert_eq!(error.message, expected_message);
+        }
+    }
+
+    #[test]
+    fn dreamina_specific_failures_keep_safe_console_codes_and_messages() {
+        for (code, message) in [
+            (
+                "dreamina_concurrency_limit_exceeded",
+                "上游并发已满，请稍后再试",
+            ),
+            (
+                "dreamina_copyright_rejected",
+                "生成的视频里包含受版权保护元素",
+            ),
+        ] {
+            assert_eq!(console_video_error_code(Some(code)), code);
+            assert_eq!(console_video_error_message(Some(code)), message);
         }
     }
 

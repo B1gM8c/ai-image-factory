@@ -351,10 +351,16 @@ fn parse_submit_id(submit_id: Option<String>) -> Result<OpaqueProviderId, Receip
 
 fn known_failure_code(reason: Option<&str>) -> &'static str {
     // Match complete provider messages, not keywords inside arbitrary diagnostics.
-    // The copyright wording is observed in the provider UI; different CLI wording
-    // deliberately remains generic until its exact contract is established.
+    // The exact CLI 1.4.21 terminal and UI messages are independently observed.
+    // Do not classify arbitrary text containing a copyright keyword.
     match reason.filter(|value| value.chars().count() <= MAX_FAIL_REASON_CHARS) {
-        Some(value) if value.trim() == "生成的视频里包含受版权保护元素" => {
+        Some(value)
+            if matches!(
+                value.trim(),
+                "生成的视频里包含受版权保护元素"
+                    | "generation failed: code=2053; OutputVideoCopyright; 生成的视频里包含受版权保护元素"
+            ) =>
+        {
             "dreamina_copyright_rejected"
         }
         _ => "dreamina_generation_failed",

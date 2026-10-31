@@ -614,6 +614,24 @@ fn query_failure_reason_is_allowlisted_bounded_and_does_not_change_status() {
             Some(format!("  {copyright}\n")),
             "dreamina_copyright_rejected",
         ),
+        (
+            Some(format!(
+                "generation failed: code=2053; OutputVideoCopyright; {copyright}"
+            )),
+            "dreamina_copyright_rejected",
+        ),
+        (
+            Some(format!(
+                "generation failed: code=2054; OutputVideoCopyright; {copyright}"
+            )),
+            "dreamina_generation_failed",
+        ),
+        (
+            Some(format!(
+                "generation failed: code=2053; OutputVideoCopyright; {copyright}; private data"
+            )),
+            "dreamina_generation_failed",
+        ),
         (None, "dreamina_generation_failed"),
         (Some(String::new()), "dreamina_generation_failed"),
         (

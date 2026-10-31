@@ -463,6 +463,9 @@ fn receipt_failure(error: ReceiptError, stdout: &[u8]) -> ProviderFailure {
         {
             return no_effect_failure("dreamina_compliance_confirmation_required");
         }
+        ReceiptError::GenerationFailed { .. } if concurrency_refusal_has_no_result(stdout) => {
+            return no_effect_failure("dreamina_concurrency_limit_exceeded");
+        }
         ReceiptError::GenerationFailed { .. } => "dreamina_submit_rejected",
         ReceiptError::InputTooLarge { .. } => "dreamina_submit_receipt_too_large",
         ReceiptError::InvalidJson(_)
@@ -472,6 +475,34 @@ fn receipt_failure(error: ReceiptError, stdout: &[u8]) -> ProviderFailure {
         | ReceiptError::InvalidSubmitId => "dreamina_submit_receipt_invalid",
     };
     unknown_failure(code)
+}
+
+fn concurrency_refusal_has_no_result(stdout: &[u8]) -> bool {
+    // CLI 1.4.21 allocates submit_id locally before the API can refuse admission.
+    // Only the complete observed 1310 response proves non-acceptance, not an ID
+    // or a concurrency keyword in an arbitrary diagnostic.
+    let Ok(serde_json::Value::Object(receipt)) = serde_json::from_slice(stdout) else {
+        return false;
+    };
+    let Some(reason) = receipt
+        .get("fail_reason")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return false;
+    };
+    let Some(trace) =
+        reason.strip_prefix("api error: ret=1310, message=ExceedConcurrencyLimit, logid=")
+    else {
+        return false;
+    };
+    receipt
+        .get("gen_status")
+        .and_then(serde_json::Value::as_str)
+        == Some("fail")
+        && !trace.is_empty()
+        && trace.len() <= 64
+        && trace.bytes().all(|b| b.is_ascii_alphanumeric())
+        && compliance_refusal_has_no_result(stdout)
 }
 
 fn compliance_confirmation_required(reason: &str) -> bool {
@@ -928,6 +959,59 @@ mod tests {
             assert_eq!(failure.code(), "dreamina_submit_rejected");
             assert_eq!(failure.effect(), EffectCertainty::UnknownRemoteEffect);
             assert_eq!(failure.retry(), RetryDirective::Never);
+        }
+    }
+
+    #[test]
+    fn exact_concurrency_refusal_is_terminal_without_retrying_generation() {
+        let receipt = serde_json::json!({
+            "submit_id": "local-cli-task-only", "gen_status": "fail",
+            "fail_reason": "api error: ret=1310, message=ExceedConcurrencyLimit, logid=20261031114521000000000000114E7D0",
+            "logid": "20261031114521000000000000114E7D0", "prompt": "neutral fixture",
+        });
+        let failure = DreaminaCliSubmitCodecV1::decode_for_submission(
+            Uuid::new_v4(),
+            &serde_json::to_vec(&receipt).unwrap(),
+        )
+        .unwrap_err();
+        assert_eq!(failure.code(), "dreamina_concurrency_limit_exceeded");
+        assert_eq!(failure.effect(), EffectCertainty::NoRemoteEffect);
+        assert_eq!(failure.retry(), RetryDirective::Never);
+        assert!(!failure.to_string().contains("20261031"));
+
+        for reason in [
+            "api error: ret=13100, message=ExceedConcurrencyLimit, logid=trace",
+            "api error: ret=1310, message=OtherFailure, logid=trace",
+            "api error: ret=1310, message=ExceedConcurrencyLimit, logid=",
+            "api error: ret=1310, message=ExceedConcurrencyLimit, logid=trace accepted=true",
+            "transport failed: ExceedConcurrencyLimit",
+        ] {
+            let mut invalid = receipt.clone();
+            invalid["fail_reason"] = reason.into();
+            let failure = DreaminaCliSubmitCodecV1::decode_for_submission(
+                Uuid::new_v4(),
+                &serde_json::to_vec(&invalid).unwrap(),
+            )
+            .unwrap_err();
+            assert_eq!(failure.effect(), EffectCertainty::UnknownRemoteEffect);
+        }
+        for evidence in [
+            serde_json::json!({"result_json":{"videos":[]}}),
+            serde_json::json!({"remote_operation_id":"accepted"}),
+            serde_json::json!({"credit_count":60}),
+            serde_json::json!({"unknown_acceptance":true}),
+        ] {
+            let mut invalid = receipt.clone();
+            invalid
+                .as_object_mut()
+                .unwrap()
+                .extend(evidence.as_object().unwrap().clone());
+            let failure = DreaminaCliSubmitCodecV1::decode_for_submission(
+                Uuid::new_v4(),
+                &serde_json::to_vec(&invalid).unwrap(),
+            )
+            .unwrap_err();
+            assert_eq!(failure.effect(), EffectCertainty::UnknownRemoteEffect);
         }
     }
 

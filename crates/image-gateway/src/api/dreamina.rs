@@ -1554,12 +1554,13 @@ fn video_task(id: Uuid, status: VideoResultStatus) -> DreaminaVideoTask {
     task
 }
 
-fn known_terminal_failure_message(code: Option<&str>) -> Option<&'static str> {
+pub(super) fn known_terminal_failure_message(code: Option<&str>) -> Option<&'static str> {
     match code? {
         "dreamina_compliance_confirmation_required" => {
             Some(DREAMINA_COMPLIANCE_CONFIRMATION_MESSAGE)
         }
         "dreamina_copyright_rejected" => Some("生成的视频里包含受版权保护元素"),
+        "dreamina_concurrency_limit_exceeded" => Some("上游并发已满，请稍后再试"),
         _ => None,
     }
 }
@@ -2357,6 +2358,11 @@ mod tests {
                 Some("dreamina_copyright_rejected"),
                 "dreamina_copyright_rejected",
                 "生成的视频里包含受版权保护元素",
+            ),
+            (
+                Some("dreamina_concurrency_limit_exceeded"),
+                "dreamina_concurrency_limit_exceeded",
+                "上游并发已满，请稍后再试",
             ),
             (
                 Some("provider_submit_cli_failed"),
