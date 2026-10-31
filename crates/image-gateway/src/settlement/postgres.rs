@@ -581,7 +581,15 @@ impl ExecutionSettlementStore for PostgresExecutionSettlementStore {
             SELECT resolution.resolution_id, job.job_id, job.request_id,
                    hold.hold_id, hold.currency, hold.held_micros::TEXT,
                    hold.released_micros::TEXT, hold.captured_micros::TEXT
-            FROM dreamina_operator_rejection_resolutions resolution
+            FROM (
+                SELECT resolution_id, job_id, hold_id, reason, released_micros
+                FROM dreamina_operator_rejection_resolutions
+                WHERE reason IN ('dreamina_compliance_confirmation_required', 'dreamina_concurrency_limit_exceeded')
+                UNION ALL
+                SELECT resolution_id, job_id, hold_id, reason, released_micros
+                FROM dreamina_accepted_terminal_resolutions
+                WHERE reason = 'dreamina_copyright_rejected'
+            ) resolution
             JOIN jobs job ON job.job_id = resolution.job_id
             JOIN job_auth_attributions attribution
               ON attribution.job_id = job.job_id AND attribution.tenant_id = job.tenant_id
@@ -596,7 +604,6 @@ impl ExecutionSettlementStore for PostgresExecutionSettlementStore {
               AND job.charged_units = 0
               AND job.state = 'failed'
               AND job.last_error_code = resolution.reason
-              AND resolution.reason IN ('dreamina_compliance_confirmation_required', 'dreamina_concurrency_limit_exceeded')
               AND hold.state = 'released' AND hold.captured_micros = 0
               AND hold.released_micros = hold.held_micros
               AND resolution.released_micros = hold.released_micros

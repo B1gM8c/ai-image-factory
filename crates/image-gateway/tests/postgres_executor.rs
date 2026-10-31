@@ -10523,3 +10523,6 @@ fn combine(primary: TestResult, cleanup: TestResult) -> TestResult {
 fn debug_error(error: impl std::fmt::Debug) -> String {
     format!("{error:?}")
 }
+
+#[path = "postgres_executor/accepted_terminal_recovery.rs"]
+mod accepted_terminal_recovery;

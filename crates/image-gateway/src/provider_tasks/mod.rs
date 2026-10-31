@@ -51,6 +51,7 @@ pub use readiness::{
     ProviderRuntimeSupervisorConfig, ProviderRuntimeSupervisorError,
 };
 pub use remote_submit::{
+    DreaminaAcceptedTerminalResolution, DreaminaAcceptedTerminalResolutionRequest,
     DreaminaComplianceRejectionResolution, DreaminaComplianceRejectionResolutionRequest,
     DreaminaImageSupplementOperatorReceipt, DreaminaVideoSupplementOperatorReceipt,
     GatedCliBinding, GatedCliCommand, GatedCliInputFile, GatedCliObservation,
@@ -62,8 +63,8 @@ pub use remote_submit::{
     prepare_dreamina_video_supplement_operator,
     prepare_dreamina_video_supplement_successor_operator,
     publish_dreamina_image_supplement_operator,
-    recover_dreamina_video_supplement_acceptance_operator, resolve_dreamina_compliance_rejection,
-    run_remote_submit_gate, run_remote_submit_runner,
+    recover_dreamina_video_supplement_acceptance_operator, resolve_dreamina_accepted_terminal,
+    resolve_dreamina_compliance_rejection, run_remote_submit_gate, run_remote_submit_runner,
 };
 pub use runtime_profile::{ProviderRuntimeProfile, ProviderRuntimeProfileStore};
 pub use submit::{

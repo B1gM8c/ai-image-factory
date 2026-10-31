@@ -18,7 +18,7 @@ const REFUSAL: &[u8] = br#"{"gen_status":"fail","fail_reason":"api error: ret=40
 const CONCURRENCY_REFUSAL: &[u8] = br#"{"submit_id":"fixture-local-id","gen_status":"fail","fail_reason":"api error: ret=1310, message=ExceedConcurrencyLimit, logid=fixture1310"}"#;
 const HELD_MICROS: i64 = 1_200_000;
 
-fn fixture_runner(root: &Path) -> TestResult<PathBuf> {
+pub(super) fn fixture_runner(root: &Path) -> TestResult<PathBuf> {
     let source = Path::new(env!("CARGO_BIN_EXE_remote-submit-runner"));
     #[cfg(target_os = "linux")]
     {
