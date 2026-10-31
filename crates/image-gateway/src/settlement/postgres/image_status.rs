@@ -70,7 +70,26 @@ pub(super) async fn project(
          AND task.executor_execution_id = submission.executor_execution_id
          AND task.provider_id = j.provider_id
         LEFT JOIN LATERAL (
-            SELECT progress.progress_json, progress.observed_at_ms
+            SELECT progress.progress_json || jsonb_build_object(
+                'generation_started_at_ms', CASE
+                    WHEN progress.progress_json ->> 'provider_status' = 'Generating'
+                     AND jsonb_typeof(progress.progress_json -> 'estimated_remaining_seconds') = 'number'
+                    THEN (
+                    SELECT baseline.observed_at_ms
+                    FROM provider_task_observations baseline
+                    WHERE baseline.submission_id = progress.submission_id
+                      AND baseline.executor_execution_id = progress.executor_execution_id
+                      AND baseline.source = 'poll'
+                      AND baseline.observed_state = 'provider_waiting'
+                      AND baseline.progress_json IS NOT NULL
+                      AND baseline.progress_json ->> 'provider_status' = 'Generating'
+                      AND jsonb_typeof(baseline.progress_json -> 'estimated_remaining_seconds') = 'number'
+                      AND baseline.observed_at_ms <= progress.observed_at_ms
+                    ORDER BY baseline.observed_at_ms ASC,
+                             baseline.poll_lease_epoch ASC, baseline.observation_id ASC
+                    LIMIT 1
+                ) END
+            ) AS progress_json, progress.observed_at_ms
             FROM provider_task_observations progress
             WHERE progress.submission_id = task.submission_id
               AND progress.executor_execution_id = task.executor_execution_id

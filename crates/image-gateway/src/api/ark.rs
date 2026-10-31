@@ -774,6 +774,7 @@ mod tests {
     fn ark_video_metadata_retains_real_queue_progress_without_inventing_values() {
         let id = Uuid::new_v4();
         let progress = crate::settlement::VideoProviderProgress {
+            estimated_percent: None,
             progress: image_provider_sdk::ProviderTaskProgress {
                 provider_status: "Queueing".into(),
                 queue_position: Some(610),

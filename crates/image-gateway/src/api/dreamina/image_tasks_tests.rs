@@ -21,6 +21,7 @@ fn projection(status: ImageResultStatus) -> ImageTaskProjection {
 
 fn progress() -> VideoProviderProgress {
     VideoProviderProgress {
+        estimated_percent: None,
         progress: image_provider_sdk::ProviderTaskProgress {
             provider_status: "Queueing".to_owned(),
             queue_position: Some(3341),

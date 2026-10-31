@@ -230,6 +230,42 @@ async fn verify_latest_durable_progress(succeeds: bool) -> TestResult {
                 queue_total: None,
                 estimated_remaining_seconds: None,
             })),
+            (5000, Some(ProviderTaskProgress {
+                provider_status: "Generating".to_owned(),
+                queue_position: None,
+                queue_total: None,
+                estimated_remaining_seconds: Some(60),
+            })),
+            (35000, Some(ProviderTaskProgress {
+                provider_status: "Generating".to_owned(),
+                queue_position: None,
+                queue_total: None,
+                estimated_remaining_seconds: Some(30),
+            })),
+            (65000, Some(ProviderTaskProgress {
+                provider_status: "Generating".to_owned(),
+                queue_position: None,
+                queue_total: None,
+                estimated_remaining_seconds: Some(120),
+            })),
+            (66000, Some(ProviderTaskProgress {
+                provider_status: "Generating".to_owned(),
+                queue_position: None,
+                queue_total: None,
+                estimated_remaining_seconds: Some(0),
+            })),
+            (67000, Some(ProviderTaskProgress {
+                provider_status: "Generating".to_owned(),
+                queue_position: None,
+                queue_total: None,
+                estimated_remaining_seconds: None,
+            })),
+            (68000, Some(ProviderTaskProgress {
+                provider_status: "Queueing".to_owned(),
+                queue_position: None,
+                queue_total: None,
+                estimated_remaining_seconds: Some(30),
+            })),
         ]
         .into_iter()
         .enumerate()
@@ -269,7 +305,16 @@ async fn verify_latest_durable_progress(succeeds: bool) -> TestResult {
             .map_err(debug_error)?;
             require(durable.1 == initial_time + offset_ms, "test poll escaped the controlled observation clock")?;
             if let Some(progress) = progress {
-                latest_progress = Some(VideoProviderProgress { progress, observed_at_ms: durable.1 });
+                latest_progress = Some(VideoProviderProgress {
+                    estimated_percent: match offset_ms {
+                        5000 => Some(0),
+                        35000 => Some(50),
+                        65000 => Some(33),
+                        66000 => Some(99),
+                        _ => None,
+                    },
+                    progress, observed_at_ms: durable.1,
+                });
             } else {
                 require(latest_progress.as_ref().is_some_and(|latest| latest.observed_at_ms < durable.1),
                     "query error did not occur after the last valid progress report")?;
@@ -347,6 +392,23 @@ async fn verify_latest_durable_progress(succeeds: bool) -> TestResult {
         )
         .bind(lease.submission_id).bind(lease.executor_execution_id)
         .fetch_all(&mut *plan_tx).await.map_err(debug_error)?;
+        let baseline_plan: Vec<String> = sqlx::query_scalar(
+            "EXPLAIN (COSTS OFF) SELECT baseline.observed_at_ms
+             FROM provider_task_observations baseline
+             WHERE baseline.submission_id=$1 AND baseline.executor_execution_id=$2
+               AND baseline.source='poll' AND baseline.observed_state='provider_waiting'
+               AND baseline.progress_json IS NOT NULL
+               AND baseline.progress_json ->> 'provider_status'='Generating'
+               AND jsonb_typeof(baseline.progress_json -> 'estimated_remaining_seconds')='number'
+             ORDER BY baseline.observed_at_ms ASC,
+                      baseline.poll_lease_epoch ASC, baseline.observation_id ASC LIMIT 1",
+        ).bind(lease.submission_id).bind(lease.executor_execution_id)
+            .fetch_all(&mut *plan_tx).await.map_err(debug_error)?;
+        let baseline_plan = baseline_plan.join("\n");
+        require(baseline_plan.contains("provider_task_observations_progress_projection_idx")
+                && baseline_plan.contains("Limit")
+                && !baseline_plan.lines().any(|line| line.trim_start().starts_with("Sort")),
+            format!("generation baseline lost its indexed lookup:\n{baseline_plan}"))?;
         plan_tx.rollback().await.map_err(debug_error)?;
         let plan = plan.join("\n");
         require(plan.contains("provider_task_observations_progress_projection_idx")

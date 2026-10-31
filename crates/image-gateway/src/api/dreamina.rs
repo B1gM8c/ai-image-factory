@@ -1587,7 +1587,18 @@ fn submission_uncertainty_diagnostic(code: Option<&str>) -> Option<(&'static str
 }
 
 pub(super) fn public_provider_progress(value: VideoProviderProgress) -> DreaminaProviderProgress {
+    use image_api_contracts::dreamina::{ProviderProgressSource, ProviderProgressStage};
+    let stage = match value.progress.provider_status.as_str() {
+        "Queueing" => ProviderProgressStage::ProviderQueued,
+        "Generating" => ProviderProgressStage::Generating,
+        _ => ProviderProgressStage::Processing,
+    };
     DreaminaProviderProgress {
+        progress_percent: value.estimated_percent,
+        progress_source: value
+            .estimated_percent
+            .map(|_| ProviderProgressSource::Estimated),
+        stage: Some(stage),
         provider_status: value.progress.provider_status,
         queue_position: value.progress.queue_position,
         queue_total: value.progress.queue_total,
@@ -2207,8 +2218,24 @@ mod tests {
         assert!(uncertain.get("content").is_none());
     }
 
+    #[test]
+    fn public_progress_marks_estimates_and_keeps_generation_nonterminal() {
+        let mut progress = queue_progress();
+        progress.progress.provider_status = "Generating".to_owned();
+        progress.estimated_percent = Some(0);
+        let json = serde_json::to_value(public_provider_progress(progress)).unwrap();
+        assert_eq!(json["progress_percent"], 0);
+        assert_eq!(json["progress_source"], "estimated");
+        assert_eq!(json["stage"], "generating");
+        let queued = serde_json::to_value(public_provider_progress(queue_progress())).unwrap();
+        assert!(queued.get("progress_percent").is_none());
+        assert!(queued.get("progress_source").is_none());
+        assert_eq!(queued["stage"], "provider_queued");
+    }
+
     fn queue_progress() -> VideoProviderProgress {
         VideoProviderProgress {
+            estimated_percent: None,
             progress: image_provider_sdk::ProviderTaskProgress {
                 provider_status: "Queueing".to_owned(),
                 queue_position: Some(3341),

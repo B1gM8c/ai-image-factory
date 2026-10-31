@@ -284,6 +284,8 @@ pub enum VideoResultStatus {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VideoProviderProgress {
+    /// Derived only from durable Generating observations and upstream ETA.
+    pub estimated_percent: Option<u8>,
     pub progress: image_provider_sdk::ProviderTaskProgress,
     pub observed_at_ms: i64,
 }
