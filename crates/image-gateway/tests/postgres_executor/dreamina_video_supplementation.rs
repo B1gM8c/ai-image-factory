@@ -1,4 +1,6 @@
 use super::*;
+#[path = "dreamina_video_supplementation/capacity_risk_waivers.rs"]
+mod capacity_risk_waivers;
 use gpt_image_2_gateway::{
     DreaminaVideoSupplementAcceptedRequest as Accepted,
     DreaminaVideoSupplementAuthorizationRequest as Authorize, DreaminaVideoSupplementPlan,

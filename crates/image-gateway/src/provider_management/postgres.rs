@@ -2985,7 +2985,7 @@ impl ProviderManagementService for PostgresProviderManagementService {
         let runtime = sqlx::query_as::<_, AccountExecutionRuntimeRow>(
             r#"
             SELECT policy.max_concurrency AS hard_max_concurrency,
-                   policy.allocated_count, policy.state AS policy_state,
+                   executor_effective_allocated_count(policy.resource_policy_id, policy.revision) AS allocated_count, policy.state AS policy_state,
                    account.state AS account_state,
                    pool.state AS credential_pool_state,
                    environment.state AS environment_state,
