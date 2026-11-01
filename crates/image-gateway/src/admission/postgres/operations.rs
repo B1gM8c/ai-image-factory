@@ -611,7 +611,7 @@ pub(super) async fn claim_work(
                     control.lifecycle_state = 'active'
                     OR w.execution_profile_id = profile.execution_profile_id
                   )
-                  AND policy.allocated_count
+                  AND executor_effective_allocated_count(policy.resource_policy_id, policy.revision)
                       < LEAST(policy.max_concurrency, control.desired_max_concurrency)
                   AND (
                     route_config.unknown_quota_policy = 'allow'
@@ -624,7 +624,7 @@ pub(super) async fn claim_work(
                            THEN COALESCE(quota.highest_used_percent, 50)
                          END ASC NULLS LAST,
                          CASE WHEN route_config.selection_strategy = 'quota_aware_least_loaded'
-                           THEN policy.allocated_count::NUMERIC
+                           THEN executor_effective_allocated_count(policy.resource_policy_id, policy.revision)::NUMERIC
                                 / control.desired_max_concurrency::NUMERIC
                          END ASC NULLS LAST,
                          -LN(

@@ -183,6 +183,8 @@ macro_rules! attach_request {
     };
 }
 
+#[path = "postgres_provider_tasks/capacity_scheduler.rs"]
+mod capacity_scheduler;
 #[path = "postgres_provider_tasks/fresh_credential_dispatch.rs"]
 mod fresh_credential_dispatch;
 #[cfg(unix)]

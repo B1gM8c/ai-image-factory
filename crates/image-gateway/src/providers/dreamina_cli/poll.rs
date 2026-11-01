@@ -42,11 +42,11 @@ pub struct DreaminaCliPollDriverV1 {
 }
 
 pub struct DreaminaCliPollProcessConfig {
-    executable_path: PathBuf,
-    executable_sha256: [u8; 32],
-    workspace_root: WorkingDirectory,
-    wall_timeout: Duration,
-    termination_grace: Duration,
+    pub(super) executable_path: PathBuf,
+    pub(super) executable_sha256: [u8; 32],
+    pub(super) workspace_root: WorkingDirectory,
+    pub(super) wall_timeout: Duration,
+    pub(super) termination_grace: Duration,
     max_artifact_bytes: u64,
 }
 
@@ -572,7 +572,7 @@ fn artifact_media_type(prefix: &[u8]) -> Option<&'static str> {
     }
 }
 
-fn supported_model(operation_id: &str, model: &str) -> bool {
+pub(super) fn supported_model(operation_id: &str, model: &str) -> bool {
     match operation_id {
         "images.generations" => matches!(
             model,

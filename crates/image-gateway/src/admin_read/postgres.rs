@@ -946,13 +946,22 @@ impl AdminReadStore for PostgresAdminReadStore {
             r#"
             WITH capacity_breakdown AS (
                 SELECT allocation.resource_policy_id, allocation.resource_policy_revision,
-                       COUNT(*) FILTER (WHERE execution.state IN ('prepared', 'leased', 'running'))::TEXT AS execution_count,
-                       COUNT(*) FILTER (WHERE execution.state = 'provider_waiting')::TEXT AS upstream_waiting_count,
-                       COUNT(*) FILTER (WHERE execution.state NOT IN ('prepared', 'leased', 'running', 'provider_waiting'))::TEXT AS reconciliation_count
+                       COUNT(*) FILTER (WHERE waiver.allocation_id IS NULL AND execution.state IN ('prepared', 'leased', 'running'))::TEXT AS execution_count,
+                       COUNT(*) FILTER (WHERE waiver.allocation_id IS NULL AND execution.state = 'provider_waiting')::TEXT AS upstream_waiting_count,
+                       COUNT(*) FILTER (WHERE waiver.allocation_id IS NULL AND execution.state NOT IN ('prepared', 'leased', 'running', 'provider_waiting'))::TEXT AS reconciliation_count,
+                       COUNT(*) FILTER (WHERE waiver.allocation_id IS NULL AND execution.state NOT IN ('prepared', 'leased', 'running', 'provider_waiting')
+                           AND reconciliation.review_status = 'manual_required')::TEXT AS manual_reconciliation_count,
+                       COUNT(*) FILTER (WHERE waiver.allocation_id IS NOT NULL)::TEXT AS waived_held_count
                 FROM executor_capacity_allocations allocation
                 JOIN executor_executions execution
                   ON execution.executor_execution_id = allocation.executor_execution_id
                  AND execution.submission_id = allocation.submission_id
+                LEFT JOIN provider_capacity_reconciliations reconciliation
+                  ON reconciliation.executor_execution_id = allocation.executor_execution_id
+                 AND reconciliation.submission_id = allocation.submission_id
+                 AND reconciliation.state = 'active'
+                LEFT JOIN executor_capacity_risk_waivers waiver
+                  ON waiver.allocation_id = allocation.allocation_id
                 WHERE allocation.state = 'held'
                 GROUP BY allocation.resource_policy_id, allocation.resource_policy_revision
             ), profile_runtime AS (
@@ -1079,12 +1088,15 @@ impl AdminReadStore for PostgresAdminReadStore {
                        ELSE 'configured'
                    END AS runtime_status,
                    profile_runtime.max_concurrency::TEXT AS max_concurrency,
-                   profile_runtime.allocated_count::TEXT AS allocated_count,
+                   profile_runtime.allocated_count::TEXT AS raw_allocated_count,
+                   COALESCE(capacity.waived_held_count, '0') AS waived_held_count,
+                   (profile_runtime.allocated_count - COALESCE(capacity.waived_held_count, '0')::INTEGER)::TEXT AS allocated_count,
                    COALESCE(capacity.execution_count, '0') AS execution_count,
                    COALESCE(capacity.upstream_waiting_count, '0') AS upstream_waiting_count,
                    COALESCE(capacity.reconciliation_count, '0') AS reconciliation_count,
+                   COALESCE(capacity.manual_reconciliation_count, '0') AS manual_reconciliation_count,
                    GREATEST(profile_runtime.max_concurrency::NUMERIC
-                     - profile_runtime.allocated_count::NUMERIC, 0)::TEXT
+                     - (profile_runtime.allocated_count::NUMERIC - COALESCE(capacity.waived_held_count, '0')::NUMERIC), 0)::TEXT
                        AS available_capacity,
                    profile_runtime.active_submitters::TEXT AS active_submitters,
                    profile_runtime.active_pollers::TEXT AS active_pollers,
@@ -1143,13 +1155,22 @@ impl AdminReadStore for PostgresAdminReadStore {
             r#"
             WITH capacity_breakdown AS (
                 SELECT allocation.resource_policy_id, allocation.resource_policy_revision,
-                       COUNT(*) FILTER (WHERE execution.state IN ('prepared', 'leased', 'running'))::TEXT AS execution_count,
-                       COUNT(*) FILTER (WHERE execution.state = 'provider_waiting')::TEXT AS upstream_waiting_count,
-                       COUNT(*) FILTER (WHERE execution.state NOT IN ('prepared', 'leased', 'running', 'provider_waiting'))::TEXT AS reconciliation_count
+                       COUNT(*) FILTER (WHERE waiver.allocation_id IS NULL AND execution.state IN ('prepared', 'leased', 'running'))::TEXT AS execution_count,
+                       COUNT(*) FILTER (WHERE waiver.allocation_id IS NULL AND execution.state = 'provider_waiting')::TEXT AS upstream_waiting_count,
+                       COUNT(*) FILTER (WHERE waiver.allocation_id IS NULL AND execution.state NOT IN ('prepared', 'leased', 'running', 'provider_waiting'))::TEXT AS reconciliation_count,
+                       COUNT(*) FILTER (WHERE waiver.allocation_id IS NULL AND execution.state NOT IN ('prepared', 'leased', 'running', 'provider_waiting')
+                           AND reconciliation.review_status = 'manual_required')::TEXT AS manual_reconciliation_count,
+                       COUNT(*) FILTER (WHERE waiver.allocation_id IS NOT NULL)::TEXT AS waived_held_count
                 FROM executor_capacity_allocations allocation
                 JOIN executor_executions execution
                   ON execution.executor_execution_id = allocation.executor_execution_id
                  AND execution.submission_id = allocation.submission_id
+                LEFT JOIN provider_capacity_reconciliations reconciliation
+                  ON reconciliation.executor_execution_id = allocation.executor_execution_id
+                 AND reconciliation.submission_id = allocation.submission_id
+                 AND reconciliation.state = 'active'
+                LEFT JOIN executor_capacity_risk_waivers waiver
+                  ON waiver.allocation_id = allocation.allocation_id
                 WHERE allocation.state = 'held'
                 GROUP BY allocation.resource_policy_id, allocation.resource_policy_revision
             ), ranked_runtime AS (
@@ -1179,11 +1200,14 @@ impl AdminReadStore for PostgresAdminReadStore {
             )
             SELECT runtime.provider_account_id,
                    max_concurrency::TEXT AS max_concurrency,
-                   allocated_count::TEXT AS allocated_count,
+                   allocated_count::TEXT AS raw_allocated_count,
+                   COALESCE(capacity.waived_held_count, '0') AS waived_held_count,
+                   (allocated_count - COALESCE(capacity.waived_held_count, '0')::INTEGER)::TEXT AS allocated_count,
                    COALESCE(capacity.execution_count, '0') AS execution_count,
                    COALESCE(capacity.upstream_waiting_count, '0') AS upstream_waiting_count,
                    COALESCE(capacity.reconciliation_count, '0') AS reconciliation_count,
-                   GREATEST(max_concurrency::NUMERIC - allocated_count::NUMERIC, 0)::TEXT
+                   COALESCE(capacity.manual_reconciliation_count, '0') AS manual_reconciliation_count,
+                   GREATEST(max_concurrency::NUMERIC - (allocated_count::NUMERIC - COALESCE(capacity.waived_held_count, '0')::NUMERIC), 0)::TEXT
                        AS available_capacity
             FROM ranked_runtime runtime
             LEFT JOIN capacity_breakdown capacity
@@ -1489,13 +1513,22 @@ impl AdminReadStore for PostgresAdminReadStore {
             r#"
             WITH capacity_breakdown AS (
                 SELECT allocation.resource_policy_id, allocation.resource_policy_revision,
-                       COUNT(*) FILTER (WHERE execution.state IN ('prepared', 'leased', 'running'))::TEXT AS execution_count,
-                       COUNT(*) FILTER (WHERE execution.state = 'provider_waiting')::TEXT AS upstream_waiting_count,
-                       COUNT(*) FILTER (WHERE execution.state NOT IN ('prepared', 'leased', 'running', 'provider_waiting'))::TEXT AS reconciliation_count
+                       COUNT(*) FILTER (WHERE waiver.allocation_id IS NULL AND execution.state IN ('prepared', 'leased', 'running'))::TEXT AS execution_count,
+                       COUNT(*) FILTER (WHERE waiver.allocation_id IS NULL AND execution.state = 'provider_waiting')::TEXT AS upstream_waiting_count,
+                       COUNT(*) FILTER (WHERE waiver.allocation_id IS NULL AND execution.state NOT IN ('prepared', 'leased', 'running', 'provider_waiting'))::TEXT AS reconciliation_count,
+                       COUNT(*) FILTER (WHERE waiver.allocation_id IS NULL AND execution.state NOT IN ('prepared', 'leased', 'running', 'provider_waiting')
+                           AND reconciliation.review_status = 'manual_required')::TEXT AS manual_reconciliation_count,
+                       COUNT(*) FILTER (WHERE waiver.allocation_id IS NOT NULL)::TEXT AS waived_held_count
                 FROM executor_capacity_allocations allocation
                 JOIN executor_executions execution
                   ON execution.executor_execution_id = allocation.executor_execution_id
                  AND execution.submission_id = allocation.submission_id
+                LEFT JOIN provider_capacity_reconciliations reconciliation
+                  ON reconciliation.executor_execution_id = allocation.executor_execution_id
+                 AND reconciliation.submission_id = allocation.submission_id
+                 AND reconciliation.state = 'active'
+                LEFT JOIN executor_capacity_risk_waivers waiver
+                  ON waiver.allocation_id = allocation.allocation_id
                 WHERE allocation.state = 'held'
                 GROUP BY allocation.resource_policy_id, allocation.resource_policy_revision
             )
@@ -1503,12 +1536,15 @@ impl AdminReadStore for PostgresAdminReadStore {
                    policy.provider_id, environment.display_name,
                    environment.account_email,
                    control.desired_max_concurrency::TEXT AS max_concurrency,
-                   policy.allocated_count::TEXT AS allocated_count,
+                   policy.allocated_count::TEXT AS raw_allocated_count,
+                   COALESCE(capacity.waived_held_count, '0') AS waived_held_count,
+                   (policy.allocated_count - COALESCE(capacity.waived_held_count, '0')::INTEGER)::TEXT AS allocated_count,
                    COALESCE(capacity.execution_count, '0') AS execution_count,
                    COALESCE(capacity.upstream_waiting_count, '0') AS upstream_waiting_count,
                    COALESCE(capacity.reconciliation_count, '0') AS reconciliation_count,
+                   COALESCE(capacity.manual_reconciliation_count, '0') AS manual_reconciliation_count,
                    GREATEST(control.desired_max_concurrency::NUMERIC
-                     - policy.allocated_count::NUMERIC, 0)::TEXT
+                     - (policy.allocated_count::NUMERIC - COALESCE(capacity.waived_held_count, '0')::NUMERIC), 0)::TEXT
                        AS available_capacity
             FROM executor_resource_policies policy
             LEFT JOIN capacity_breakdown capacity
@@ -2286,9 +2322,12 @@ struct ProviderAccountRow {
     runtime_status: String,
     max_concurrency: String,
     allocated_count: String,
+    raw_allocated_count: String,
+    waived_held_count: String,
     execution_count: String,
     upstream_waiting_count: String,
     reconciliation_count: String,
+    manual_reconciliation_count: String,
     available_capacity: String,
     active_submitters: String,
     active_pollers: String,
@@ -2347,9 +2386,12 @@ impl From<ProviderAccountRow> for ProviderAccountView {
             runtime_status: row.runtime_status,
             max_concurrency: row.max_concurrency,
             allocated_count: row.allocated_count,
+            raw_allocated_count: row.raw_allocated_count,
+            waived_held_count: row.waived_held_count,
             execution_count: row.execution_count,
             upstream_waiting_count: row.upstream_waiting_count,
             reconciliation_count: row.reconciliation_count,
+            manual_reconciliation_count: row.manual_reconciliation_count,
             available_capacity: row.available_capacity,
             active_submitters: row.active_submitters,
             active_pollers: row.active_pollers,
@@ -2365,9 +2407,12 @@ struct ProviderAccountConcurrencyRow {
     provider_account_id: Uuid,
     max_concurrency: String,
     allocated_count: String,
+    raw_allocated_count: String,
+    waived_held_count: String,
     execution_count: String,
     upstream_waiting_count: String,
     reconciliation_count: String,
+    manual_reconciliation_count: String,
     available_capacity: String,
 }
 
@@ -2377,9 +2422,12 @@ impl From<ProviderAccountConcurrencyRow> for ProviderAccountConcurrency {
             provider_account_id: row.provider_account_id.to_string(),
             max_concurrency: row.max_concurrency,
             allocated_count: row.allocated_count,
+            raw_allocated_count: row.raw_allocated_count,
+            waived_held_count: row.waived_held_count,
             execution_count: row.execution_count,
             upstream_waiting_count: row.upstream_waiting_count,
             reconciliation_count: row.reconciliation_count,
+            manual_reconciliation_count: row.manual_reconciliation_count,
             available_capacity: row.available_capacity,
         }
     }
@@ -2441,9 +2489,12 @@ struct SchedulerCapacityRow {
     account_email: Option<String>,
     max_concurrency: String,
     allocated_count: String,
+    raw_allocated_count: String,
+    waived_held_count: String,
     execution_count: String,
     upstream_waiting_count: String,
     reconciliation_count: String,
+    manual_reconciliation_count: String,
     available_capacity: String,
 }
 
@@ -2543,9 +2594,12 @@ impl From<SchedulerCapacityRow> for SchedulerCapacity {
             account_email: row.account_email,
             max_concurrency: row.max_concurrency,
             allocated_count: row.allocated_count,
+            raw_allocated_count: row.raw_allocated_count,
+            waived_held_count: row.waived_held_count,
             execution_count: row.execution_count,
             upstream_waiting_count: row.upstream_waiting_count,
             reconciliation_count: row.reconciliation_count,
+            manual_reconciliation_count: row.manual_reconciliation_count,
             available_capacity: row.available_capacity,
         }
     }

@@ -1884,6 +1884,15 @@ async fn ensure_capacity_allocation(
     if row.executor_state != "prepared" {
         return Err(ExecutorSubmissionError::Conflict);
     }
+    // Acquire the policy lock in a separate statement before counting waived
+    // held rows. A concurrent real release changes both raw and waived counts;
+    // a pre-lock statement snapshot must not undercount effective occupancy.
+    sqlx::query("SELECT 1 FROM executor_resource_policies WHERE resource_policy_id = $1 AND revision = $2 FOR UPDATE")
+        .bind(profile.resource_policy_id)
+        .bind(profile.resource_policy_revision)
+        .execute(&mut **tx)
+        .await
+        .map_err(unavailable)?;
     let acquired = sqlx::query(
         r#"
         UPDATE executor_resource_policies policy
@@ -1893,7 +1902,7 @@ async fn ensure_capacity_allocation(
           AND control.provider_account_id = policy.provider_account_id
           AND control.lifecycle_state IN ('active', 'draining')
           AND policy.state = 'enabled'
-          AND policy.allocated_count
+          AND policy.allocated_count - executor_waived_held_count(policy.resource_policy_id, policy.revision)
               < LEAST(policy.max_concurrency, control.desired_max_concurrency)
         "#,
     )

@@ -10114,6 +10114,10 @@ async fn database_now(pool: &PgPool) -> TestResult<i64> {
 }
 
 async fn seed_execution_profiles(pool: &PgPool) -> TestResult {
+    seed_execution_profiles_with_capacity(pool, 1000).await
+}
+
+async fn seed_execution_profiles_with_capacity(pool: &PgPool, capacity: i32) -> TestResult {
     let now = database_now(pool).await?;
     let mut tx = pool.begin().await.map_err(debug_error)?;
     for (pool_id, pool_key, provider_id) in [
@@ -10215,7 +10219,7 @@ async fn seed_execution_profiles(pool: &PgPool) -> TestResult {
               (resource_policy_id, revision, credential_pool_id,
                provider_account_id, provider_id, execution_class,
                max_concurrency, state, created_at_ms)
-            VALUES ($1, 1, $2, $3, $4, $5, 1000, 'enabled', $6)
+            VALUES ($1, 1, $2, $3, $4, $5, $7, 'enabled', $6)
             "#,
         )
         .bind(policy_id)
@@ -10224,6 +10228,7 @@ async fn seed_execution_profiles(pool: &PgPool) -> TestResult {
         .bind(provider_id)
         .bind(execution_class)
         .bind(now)
+        .bind(capacity)
         .execute(&mut *tx)
         .await
         .map_err(debug_error)?;
@@ -10440,6 +10445,10 @@ struct TestDatabase {
 
 impl TestDatabase {
     async fn new() -> TestResult<Option<Self>> {
+        Self::new_with_capacity(1000).await
+    }
+
+    async fn new_with_capacity(capacity: i32) -> TestResult<Option<Self>> {
         let Some(url) = env::var("TEST_DATABASE_URL")
             .ok()
             .filter(|value| !value.trim().is_empty())
@@ -10473,7 +10482,7 @@ impl TestDatabase {
             pool.close().await;
             return Err(format!("migration failed: {error:?}"));
         }
-        if let Err(error) = seed_execution_profiles(&pool).await {
+        if let Err(error) = seed_execution_profiles_with_capacity(&pool, capacity).await {
             let _ = sqlx::query(AssertSqlSafe(format!("DROP SCHEMA \"{schema}\" CASCADE")))
                 .execute(&pool)
                 .await;

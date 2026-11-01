@@ -1,4 +1,6 @@
 use super::*;
+#[path = "dreamina_video_supplementation/capacity_risk_waivers.rs"]
+mod capacity_risk_waivers;
 use gpt_image_2_gateway::{
     DreaminaVideoSupplementAcceptedRequest as Accepted,
     DreaminaVideoSupplementAuthorizationRequest as Authorize, DreaminaVideoSupplementPlan,
@@ -777,4 +779,28 @@ async fn supplement_authorization_waits_for_old_history_and_freezes_committed_by
     }.await;
     let cleanup = db.cleanup().await;
     result.and(cleanup)
+}
+
+#[tokio::test]
+async fn capacity_scheduler_video_frozen_original_is_classified_without_mutation() -> TestResult {
+    let Some(db) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let fixture = fixture(&db.pool, "seedance2.0fast_vip").await?;
+        let plan = store(&db.pool).authorize_dreamina_video_supplement(&fixture.request).await.map_err(debug_error)?;
+        let before: serde_json::Value = sqlx::query_scalar("SELECT dreamina_video_supplement_original_snapshot($1)").bind(plan.job_id).fetch_one(&db.pool).await.map_err(debug_error)?;
+        let allocation_before:serde_json::Value=sqlx::query_scalar("SELECT to_jsonb(a) FROM executor_capacity_allocations a WHERE submission_id=$1").bind(fixture.request.submission_id).fetch_one(&db.pool).await.map_err(debug_error)?;
+        let tasks=PostgresProviderTaskStore::new(db.pool.clone());
+        let scope=ProviderTaskClaimScope { provider_id:DREAMINA_PROVIDER_ID.into(), provider_account_id:DREAMINA_ACCOUNT_ID, execution_profile_id:DREAMINA_VIDEO_PROFILE_ID };
+        require(tasks.classify_capacity_reconciliation(&scope).await.map_err(debug_error)?==1,"frozen original was not classified before claim")?;
+        use gpt_image_2_gateway::ProviderCapacityReconciliationStore;
+        require(tasks.claim_due_capacity_reconciliation(&scope,"must-not-claim-frozen","frozen-test",5000).await.map_err(debug_error)?.is_none(),"frozen original reached heartbeat/CLI lane")?;
+        let disposition:(String,Option<String>)=sqlx::query_as("SELECT review_status,manual_reason FROM provider_capacity_reconciliations WHERE submission_id=$1").bind(fixture.request.submission_id).fetch_one(&db.pool).await.map_err(debug_error)?;
+        require(disposition==("manual_required".into(),Some("original_evidence_frozen".into())),"frozen original lost its manual reason")?;
+        let after:serde_json::Value=sqlx::query_scalar("SELECT dreamina_video_supplement_original_snapshot($1)").bind(plan.job_id).fetch_one(&db.pool).await.map_err(debug_error)?;
+        let allocation_after:serde_json::Value=sqlx::query_scalar("SELECT to_jsonb(a) FROM executor_capacity_allocations a WHERE submission_id=$1").bind(fixture.request.submission_id).fetch_one(&db.pool).await.map_err(debug_error)?;
+        require(before==after && allocation_before==allocation_after,"classification altered frozen original or allocation heartbeat")
+    }.await;
+    result.and(db.cleanup().await)
 }
