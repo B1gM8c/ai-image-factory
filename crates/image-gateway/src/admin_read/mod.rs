@@ -372,7 +372,10 @@ pub struct ProviderAccountView {
     pub configuration_status: String,
     pub runtime_status: String,
     pub max_concurrency: String,
+    /// Effective occupancy used by admission, excluding explicitly waived originals.
     pub allocated_count: String,
+    pub raw_allocated_count: String,
+    pub waived_held_count: String,
     pub execution_count: String,
     pub upstream_waiting_count: String,
     pub reconciliation_count: String,
@@ -396,7 +399,10 @@ pub struct ProviderAccountsSnapshot {
 pub struct ProviderAccountConcurrency {
     pub provider_account_id: String,
     pub max_concurrency: String,
+    /// Effective occupancy used by admission, excluding explicitly waived originals.
     pub allocated_count: String,
+    pub raw_allocated_count: String,
+    pub waived_held_count: String,
     pub execution_count: String,
     pub upstream_waiting_count: String,
     pub reconciliation_count: String,
@@ -456,7 +462,10 @@ pub struct SchedulerCapacity {
     pub display_name: Option<String>,
     pub account_email: Option<String>,
     pub max_concurrency: String,
+    /// Effective occupancy used by admission, excluding explicitly waived originals.
     pub allocated_count: String,
+    pub raw_allocated_count: String,
+    pub waived_held_count: String,
     pub execution_count: String,
     pub upstream_waiting_count: String,
     pub reconciliation_count: String,

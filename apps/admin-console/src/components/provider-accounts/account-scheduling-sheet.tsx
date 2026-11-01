@@ -800,8 +800,8 @@ export function AccountSchedulingSheet({
                 <div className="flex items-center justify-between gap-4 text-sm">
                   <span className="text-muted-foreground">
                     {t({
-                      en: "Concurrency usage",
-                      "zh-CN": "并发占用",
+                      en: "Effective occupancy",
+                      "zh-CN": "有效占用",
                       ja: "同時実行枠の使用状況",
                       ko: "동시 실행 슬롯 사용량",
                     })}
@@ -866,6 +866,22 @@ export function AccountSchedulingSheet({
                     },
                   )}
                 </p>
+                {BigInt(currentCapacity.waived_held_count) > 0n && (
+                  <p className="text-xs tabular-nums text-muted-foreground">
+                    {t(
+                      {
+                        en: "Historical waivers {waived} · Original occupancy {raw}",
+                        "zh-CN": "历史豁免 {waived} · 原始占用 {raw}",
+                        ja: "過去の例外 {waived} · 元の使用枠 {raw}",
+                        ko: "이전 예외 {waived} · 원래 점유 {raw}",
+                      },
+                      {
+                        waived: formatInteger(currentCapacity.waived_held_count),
+                        raw: formatInteger(currentCapacity.raw_allocated_count),
+                      },
+                    )}
+                  </p>
+                )}
               </div>
               {maxConcurrency < allocated ? (
                 <p className="border-l-2 border-foreground/30 pl-3 text-sm text-muted-foreground">

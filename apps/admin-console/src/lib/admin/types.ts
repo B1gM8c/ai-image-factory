@@ -857,6 +857,8 @@ export type ProviderAccountView = {
   runtime_status: string;
   max_concurrency: Int64String;
   allocated_count: Int64String;
+  raw_allocated_count: Int64String;
+  waived_held_count: Int64String;
   execution_count: Int64String;
   upstream_waiting_count: Int64String;
   reconciliation_count: Int64String;
@@ -891,6 +893,8 @@ export type ProviderAccountConcurrency = {
   provider_account_id: string;
   max_concurrency: Int64String;
   allocated_count: Int64String;
+  raw_allocated_count: Int64String;
+  waived_held_count: Int64String;
   execution_count: Int64String;
   upstream_waiting_count: Int64String;
   reconciliation_count: Int64String;
@@ -1093,6 +1097,8 @@ export type SchedulerCapacity = {
   account_email: string | null;
   max_concurrency: Int64String;
   allocated_count: Int64String;
+  raw_allocated_count: Int64String;
+  waived_held_count: Int64String;
   execution_count: Int64String;
   upstream_waiting_count: Int64String;
   reconciliation_count: Int64String;
