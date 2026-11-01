@@ -30,8 +30,9 @@ pub use account_home::{ProviderAccountHomeCapability, ProviderAccountHomeCapabil
 
 pub use capacity::{
     ProviderCapacityEvidence, ProviderCapacityEvidenceOutcome, ProviderCapacityReconciliation,
-    ProviderCapacityReconciliationLease, ProviderCapacityReconciliationState,
-    ProviderCapacityReconciliationStore, ProviderCapacityTerminalState,
+    ProviderCapacityReconciliationLease, ProviderCapacityReconciliationRun,
+    ProviderCapacityReconciliationState, ProviderCapacityReconciliationStore,
+    ProviderCapacityReconciliationWorker, ProviderCapacityTerminalState,
 };
 pub use poll::{
     ProviderAdditionalImageArtifactSink, ProviderArtifactSinkContractError,

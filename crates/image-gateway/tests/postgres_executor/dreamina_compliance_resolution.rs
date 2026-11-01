@@ -447,6 +447,8 @@ async fn rejection_resolution_preserves_originals(
     };
     let result = async {
         let fixture = refusal_fixture_with_receipt(&database.pool, true, refusal, historical_code).await?;
+        let tasks=PostgresProviderTaskStore::new(database.pool.clone());
+        require(tasks.classify_capacity_reconciliation(&ProviderTaskClaimScope { provider_id:DREAMINA_PROVIDER_ID.into(), provider_account_id:DREAMINA_ACCOUNT_ID, execution_profile_id:DREAMINA_VIDEO_PROFILE_ID }).await.map_err(debug_error)? == 1,"audited no-effect fixture was not classified manual")?;
         let before = snapshot(&database.pool, &fixture).await?;
         let canonical_before = canonical_evidence(&database.pool, &fixture).await?;
         let read_store = PostgresExecutionSettlementStore::new(database.pool.clone(),

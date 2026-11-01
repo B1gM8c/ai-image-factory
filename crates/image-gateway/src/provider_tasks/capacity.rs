@@ -10,6 +10,10 @@ use super::{
     ProviderTaskStoreError,
 };
 
+mod scheduler;
+mod worker;
+pub use worker::{ProviderCapacityReconciliationRun, ProviderCapacityReconciliationWorker};
+
 const MAX_LEASE_MS: i64 = 24 * 60 * 60 * 1_000;
 const MAX_RETRY_AFTER_MS: i64 = 24 * 60 * 60 * 1_000;
 
@@ -60,6 +64,9 @@ pub struct ProviderCapacityReconciliation {
     pub provider_account_id: Uuid,
     pub provider_deadline_at_ms: i64,
     pub state: ProviderCapacityReconciliationState,
+    pub review_status: String,
+    pub manual_reason: Option<String>,
+    pub query_failures: i32,
     pub available_at_ms: i64,
     pub reconciliation_owner: Option<String>,
     pub reconciliation_lease_epoch: i64,
@@ -74,6 +81,7 @@ pub struct ProviderCapacityReconciliation {
 pub struct ProviderCapacityReconciliationLease {
     pub reconciliation: ProviderCapacityReconciliation,
     context: ProviderExecutionContext,
+    remote_operation_id: Option<String>,
     pub reconciliation_owner: String,
     pub reconciliation_lease_epoch: i64,
     pub reconciliation_lease_expires_at_ms: i64,
@@ -81,6 +89,10 @@ pub struct ProviderCapacityReconciliationLease {
 }
 
 impl ProviderCapacityReconciliationLease {
+    pub fn remote_operation_id(&self) -> Option<&str> {
+        self.remote_operation_id.as_deref()
+    }
+
     pub fn context(&self) -> &ProviderExecutionContext {
         &self.context
     }
@@ -130,6 +142,9 @@ struct ReconciliationRow {
     provider_account_id: Uuid,
     provider_deadline_at_ms: i64,
     state: String,
+    review_status: String,
+    manual_reason: Option<String>,
+    query_failures: i32,
     available_at_ms: i64,
     reconciliation_owner: Option<String>,
     reconciliation_lease_epoch: i64,
@@ -231,6 +246,7 @@ impl ProviderCapacityReconciliationStore for PostgresProviderTaskStore {
             WHERE reconciliation.provider_id = $1
               AND reconciliation.provider_account_id = $2
               AND reconciliation.state = 'active'
+              AND reconciliation.review_status = 'auto'
               AND reconciliation.reconciliation_owner = $3
               AND reconciliation.last_command_kind = 'claim'
               AND reconciliation.last_command_id = $4
@@ -252,7 +268,8 @@ impl ProviderCapacityReconciliationStore for PostgresProviderTaskStore {
             if context.execution_profile_id != scope.execution_profile_id {
                 return Err(ProviderTaskStoreError::Conflict);
             }
-            let lease = replay_lease_from_row(row, context)?;
+            let remote_operation_id = load_original_remote_id(&mut tx, row.submission_id).await?;
+            let lease = replay_lease_from_row(row, context, remote_operation_id)?;
             tx.commit().await.map_err(storage_conflict)?;
             return Ok(Some(lease));
         }
@@ -271,6 +288,7 @@ impl ProviderCapacityReconciliationStore for PostgresProviderTaskStore {
                 AND reconciliation.provider_account_id = $2
                 AND submission.execution_profile_id = $6
                 AND reconciliation.state = 'active'
+                AND reconciliation.review_status = 'auto'
                 AND reconciliation.available_at_ms <= floor(
                       extract(epoch FROM statement_timestamp()) * 1000
                     )::BIGINT
@@ -308,6 +326,7 @@ impl ProviderCapacityReconciliationStore for PostgresProviderTaskStore {
             WHERE reconciliation.submission_id = candidate.submission_id
               AND reconciliation.executor_execution_id = candidate.executor_execution_id
               AND reconciliation.state = 'active'
+              AND reconciliation.review_status = 'auto'
               AND reconciliation.available_at_ms <= candidate.now_ms
             RETURNING reconciliation.*
             "#,
@@ -333,7 +352,8 @@ impl ProviderCapacityReconciliationStore for PostgresProviderTaskStore {
             row.updated_at_ms,
         )
         .await?;
-        let lease = lease_from_row(row, context)?;
+        let remote_operation_id = load_original_remote_id(&mut tx, row.submission_id).await?;
+        let lease = lease_from_row(row, context, remote_operation_id)?;
         tx.commit().await.map_err(storage_conflict)?;
         Ok(Some(lease))
     }
@@ -378,7 +398,8 @@ impl ProviderCapacityReconciliationStore for PostgresProviderTaskStore {
         .map_err(storage_conflict)?
         .ok_or(ProviderTaskStoreError::StaleLease)?;
         heartbeat_capacity(&mut tx, row.executor_execution_id, row.submission_id, now).await?;
-        let renewed = lease_from_row(row, lease.context.clone())?;
+        let remote_operation_id = load_original_remote_id(&mut tx, row.submission_id).await?;
+        let renewed = lease_from_row(row, lease.context.clone(), remote_operation_id)?;
         tx.commit().await.map_err(storage_conflict)?;
         Ok(renewed)
     }
@@ -800,6 +821,19 @@ async fn database_now(tx: &mut Transaction<'_, Postgres>) -> Result<i64, Provide
         .map_err(unavailable)
 }
 
+async fn load_original_remote_id(
+    tx: &mut Transaction<'_, Postgres>,
+    submission_id: Uuid,
+) -> Result<Option<String>, ProviderTaskStoreError> {
+    sqlx::query_scalar(
+        "SELECT remote_operation_id FROM provider_remote_submit_intents WHERE submission_id = $1",
+    )
+    .bind(submission_id)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(unavailable)
+}
+
 fn reconciliation_from_row(
     row: ReconciliationRow,
 ) -> Result<ProviderCapacityReconciliation, ProviderTaskStoreError> {
@@ -844,6 +878,9 @@ fn reconciliation_from_row(
         provider_account_id: row.provider_account_id,
         provider_deadline_at_ms: row.provider_deadline_at_ms,
         state,
+        review_status: row.review_status,
+        manual_reason: row.manual_reason,
+        query_failures: row.query_failures,
         available_at_ms: row.available_at_ms,
         reconciliation_owner: row.reconciliation_owner,
         reconciliation_lease_epoch: row.reconciliation_lease_epoch,
@@ -858,6 +895,7 @@ fn reconciliation_from_row(
 fn lease_from_row(
     row: ReconciliationRow,
     context: ProviderExecutionContext,
+    remote_operation_id: Option<String>,
 ) -> Result<ProviderCapacityReconciliationLease, ProviderTaskStoreError> {
     let owner = row
         .reconciliation_owner
@@ -868,10 +906,14 @@ fn lease_from_row(
     let claimed_evidence_revision = row
         .claimed_evidence_revision
         .ok_or(ProviderTaskStoreError::Conflict)?;
+    // Revision zero is the durable no-receipt snapshot. A late original
+    // receipt wakes revision one but must not alter an exact claim replay.
+    let remote_operation_id = remote_operation_id.filter(|_| claimed_evidence_revision > 0);
     let reconciliation = reconciliation_from_row(row)?;
     Ok(ProviderCapacityReconciliationLease {
         reconciliation,
         context,
+        remote_operation_id,
         reconciliation_owner: owner,
         reconciliation_lease_epoch: epoch,
         reconciliation_lease_expires_at_ms: expires_at_ms,
@@ -882,6 +924,7 @@ fn lease_from_row(
 fn replay_lease_from_row(
     mut row: ReconciliationRow,
     context: ProviderExecutionContext,
+    remote_operation_id: Option<String>,
 ) -> Result<ProviderCapacityReconciliationLease, ProviderTaskStoreError> {
     row.evidence_revision = row
         .claimed_evidence_revision
@@ -892,7 +935,7 @@ fn replay_lease_from_row(
     row.available_at_ms = row
         .claim_command_lease_expires_at_ms
         .ok_or(ProviderTaskStoreError::Conflict)?;
-    lease_from_row(row, context)
+    lease_from_row(row, context, remote_operation_id)
 }
 
 fn context_from_row(row: ContextRow) -> ProviderExecutionContext {

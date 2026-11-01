@@ -860,6 +860,7 @@ export type ProviderAccountView = {
   execution_count: Int64String;
   upstream_waiting_count: Int64String;
   reconciliation_count: Int64String;
+  manual_reconciliation_count: Int64String;
   available_capacity: Int64String;
   active_submitters: Int64String;
   active_pollers: Int64String;
@@ -893,6 +894,7 @@ export type ProviderAccountConcurrency = {
   execution_count: Int64String;
   upstream_waiting_count: Int64String;
   reconciliation_count: Int64String;
+  manual_reconciliation_count: Int64String;
   available_capacity: Int64String;
 };
 
@@ -1094,6 +1096,7 @@ export type SchedulerCapacity = {
   execution_count: Int64String;
   upstream_waiting_count: Int64String;
   reconciliation_count: Int64String;
+  manual_reconciliation_count: Int64String;
   available_capacity: Int64String;
 };
 

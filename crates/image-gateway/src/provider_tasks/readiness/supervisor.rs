@@ -32,6 +32,7 @@ pub enum ProviderRuntimeSupervisorError<E> {
     Runtime(E),
 }
 
+#[derive(Clone)]
 pub struct ProviderRuntimeShutdown {
     receiver: watch::Receiver<bool>,
 }

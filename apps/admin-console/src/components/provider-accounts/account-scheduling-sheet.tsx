@@ -55,6 +55,7 @@ import type {
   ProviderModelView,
   ProviderRoute,
 } from "@/lib/admin/types";
+import { formatInteger, sumIntegers } from "@/lib/admin/format";
 import { consoleFetch } from "@/lib/auth/client";
 
 type Translate = ReturnType<typeof useI18n>["t"];
@@ -847,15 +848,21 @@ export function AccountSchedulingSheet({
                 <p className="text-xs tabular-nums text-muted-foreground">
                   {t(
                     {
-                      en: "Executing {executing} · Upstream waiting {waiting} · To reconcile {reconciling}",
-                      "zh-CN": "执行 {executing} · 上游等待 {waiting} · 待核对 {reconciling}",
-                      ja: "実行 {executing} · 上流待機 {waiting} · 要照合 {reconciling}",
-                      ko: "실행 {executing} · 업스트림 대기 {waiting} · 확인 필요 {reconciling}",
+                      en: "Executing {executing} · Upstream waiting {waiting} · Automatic review {reconciling} · Manual review {manual}",
+                      "zh-CN": "执行 {executing} · 上游等待 {waiting} · 待自动核对 {reconciling} · 待人工处理 {manual}",
+                      ja: "実行 {executing} · 上流待機 {waiting} · 自動照合 {reconciling} · 手動確認 {manual}",
+                      ko: "실행 {executing} · 업스트림 대기 {waiting} · 자동 확인 {reconciling} · 수동 확인 {manual}",
                     },
                     {
                       executing: currentCapacity.execution_count,
                       waiting: currentCapacity.upstream_waiting_count,
-                      reconciling: currentCapacity.reconciliation_count,
+                      reconciling: formatInteger(
+                        sumIntegers([
+                          currentCapacity.reconciliation_count,
+                          `-${currentCapacity.manual_reconciliation_count}`,
+                        ]),
+                      ),
+                      manual: formatInteger(currentCapacity.manual_reconciliation_count),
                     },
                   )}
                 </p>

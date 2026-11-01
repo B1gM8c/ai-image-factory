@@ -1,13 +1,13 @@
 use std::{env, path::PathBuf, sync::Arc, time::Duration};
 
 use gpt_image_2_gateway::{
-    DreaminaCliPollDriverV1, DreaminaCliPollProcessConfig, FilesystemArtifactBlobStore,
-    FilesystemProviderArtifactStagerFactory, ImageGatewayError, PostgresProviderTaskStore,
-    ProviderAccountHomeCapability, ProviderPollDaemon, ProviderPollDaemonConfig,
-    ProviderPollDaemonError, ProviderPollOrchestrator, ProviderPollOrchestratorConfig,
-    ProviderRuntimeProfileStore, ProviderRuntimeRegistration, ProviderRuntimeRole,
-    ProviderRuntimeSupervisor, ProviderRuntimeSupervisorConfig, ProviderRuntimeSupervisorError,
-    ProviderTaskStoreError,
+    DreaminaCliCapacityQueryDriverV1, DreaminaCliPollDriverV1, DreaminaCliPollProcessConfig,
+    FilesystemArtifactBlobStore, FilesystemProviderArtifactStagerFactory, ImageGatewayError,
+    PostgresProviderTaskStore, ProviderAccountHomeCapability, ProviderCapacityReconciliationWorker,
+    ProviderPollDaemon, ProviderPollDaemonConfig, ProviderPollDaemonError,
+    ProviderPollOrchestrator, ProviderPollOrchestratorConfig, ProviderRuntimeProfileStore,
+    ProviderRuntimeRegistration, ProviderRuntimeRole, ProviderRuntimeSupervisor,
+    ProviderRuntimeSupervisorConfig, ProviderRuntimeSupervisorError, ProviderTaskStoreError,
     artifacts::artifact_root_from_env,
     database::{
         connect_pool_with_schema, database_schema_from_env, database_url_from_env,
@@ -239,7 +239,47 @@ async fn main() -> Result<(), ImageGatewayError> {
         ),
     )
     .map_err(|error| ImageGatewayError::config(error.to_string()))?;
+    // This workspace has its own exclusive lock; normal polling retains its root.
+    let capacity_workspace_path = config.workspace_root.join("capacity-reconciliation");
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        match std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&capacity_workspace_path)
+        {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(_) => {
+                return Err(ImageGatewayError::config(
+                    "capacity query workspace unavailable",
+                ));
+            }
+        }
+    }
+    let capacity_driver = DreaminaCliCapacityQueryDriverV1::from_runtime_profile(
+        &profile,
+        &account_home,
+        DreaminaCliPollProcessConfig::new(
+            &config.executable,
+            config.executable_sha256,
+            WorkingDirectory::new_private(&capacity_workspace_path)
+                .map_err(|error| ImageGatewayError::config(error.to_string()))?,
+            config.cli_wall_timeout.min(Duration::from_secs(20)),
+            config.cli_termination_grace,
+            config.max_artifact_bytes,
+        ),
+    )
+    .map_err(|error| ImageGatewayError::config(error.to_string()))?;
     let scope = profile.claim_scope();
+    let capacity_worker = ProviderCapacityReconciliationWorker::new(
+        store.clone(),
+        capacity_driver,
+        scope.clone(),
+        config.owner.clone(),
+        config.lease_ms,
+        config.heartbeat_interval,
+    )
+    .map_err(|error| ImageGatewayError::config(error.to_string()))?;
     let orchestrator = Arc::new(
         ProviderPollOrchestrator::new(
             store.clone(),
@@ -292,7 +332,27 @@ async fn main() -> Result<(), ImageGatewayError> {
                 max.materializations = config.max_materializations,
                 "provider-pollerd started"
             );
-            daemon.run_until_shutdown(shutdown.wait())
+            async {
+                let (stop_capacity, capacity_stopped) = tokio::sync::oneshot::channel();
+                let capacity_shutdown = shutdown.clone();
+                let (report, ()) = tokio::join!(
+                    async {
+                        let report = daemon.run_until_shutdown(shutdown.wait()).await;
+                        let _ = stop_capacity.send(());
+                        report
+                    },
+                    capacity_worker.run_until_shutdown(
+                        async {
+                            tokio::select! {
+                                _ = capacity_shutdown.wait() => {},
+                                _ = capacity_stopped => {},
+                            }
+                        },
+                        config.shutdown_drain_timeout
+                    ),
+                );
+                report
+            }
         })
         .await
         .map_err(map_runtime_error)?;

@@ -150,8 +150,9 @@ pub use provider_tasks::{
     ProviderArtifactAuthority, ProviderArtifactPublication, ProviderArtifactSinkContractError,
     ProviderArtifactStageContext, ProviderArtifactStager, ProviderArtifactStagerFactory,
     ProviderCapacityEvidence, ProviderCapacityEvidenceOutcome, ProviderCapacityReconciliation,
-    ProviderCapacityReconciliationLease, ProviderCapacityReconciliationState,
-    ProviderCapacityReconciliationStore, ProviderCapacityTerminalState, ProviderExecutionContext,
+    ProviderCapacityReconciliationLease, ProviderCapacityReconciliationRun,
+    ProviderCapacityReconciliationState, ProviderCapacityReconciliationStore,
+    ProviderCapacityReconciliationWorker, ProviderCapacityTerminalState, ProviderExecutionContext,
     ProviderNativeBatchArtifactSink, ProviderNativeBatchPollObservation, ProviderPollDaemon,
     ProviderPollDaemonConfig, ProviderPollDaemonError, ProviderPollDaemonReport,
     ProviderPollDriver, ProviderPollDriverCall, ProviderPollIteration, ProviderPollOrchestrator,
@@ -192,13 +193,14 @@ pub use provider_tasks::{
 };
 pub use provider_uploads::ProviderUploadService;
 pub use providers::dreamina_cli::{
-    DreaminaCliCodecConfigError, DreaminaCliPollDriverConfigError, DreaminaCliPollDriverV1,
-    DreaminaCliPollProcessConfig, DreaminaCliRuntimeBindingV1, DreaminaCliSubmitCodecV1,
-    DreaminaCliSubmitProcessConfig, DreaminaCliSubmitRuntimeConfigError,
-    DreaminaCredentialEnvironmentError, DreaminaKeychainReplacement,
-    dreamina_account_isolation_available, dreamina_credential_fingerprint,
-    prepare_dreamina_account_home, seed_dreamina_reauthorization_home,
-    shutdown_dreamina_account_home,
+    DreaminaCliCapacityQueryDriverV1, DreaminaCliCodecConfigError,
+    DreaminaCliPollDriverConfigError, DreaminaCliPollDriverV1, DreaminaCliPollProcessConfig,
+    DreaminaCliRuntimeBindingV1, DreaminaCliSubmitCodecV1, DreaminaCliSubmitProcessConfig,
+    DreaminaCliSubmitRuntimeConfigError, DreaminaCredentialEnvironmentError,
+    DreaminaKeychainReplacement, ProviderCapacityQueryDriver, ProviderCapacityQueryError,
+    ProviderCapacityQueryObservation, dreamina_account_isolation_available,
+    dreamina_credential_fingerprint, prepare_dreamina_account_home,
+    seed_dreamina_reauthorization_home, shutdown_dreamina_account_home,
 };
 pub use reconciliation::{
     InputCleanupOutcome, PostgresReconciliationStore, ReconciliationOutcome, ReconciliationStore,

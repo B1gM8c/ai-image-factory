@@ -339,7 +339,8 @@ async fn admin_read_case(pool: &PgPool) -> TestResult {
         provider.runtime_status == "unobserved"
             && provider.execution_count == "0"
             && provider.upstream_waiting_count == "0"
-            && provider.reconciliation_count == "0",
+            && provider.reconciliation_count == "0"
+            && provider.manual_reconciliation_count == "0",
         "inline profiles must not claim runtime readiness",
     )?;
     require(
@@ -359,6 +360,7 @@ async fn admin_read_case(pool: &PgPool) -> TestResult {
             && runtime.accounts[0].execution_count == "0"
             && runtime.accounts[0].upstream_waiting_count == "0"
             && runtime.accounts[0].reconciliation_count == "0"
+            && runtime.accounts[0].manual_reconciliation_count == "0"
             && runtime.accounts[0].available_capacity == "7",
         "provider runtime projection must preserve the authoritative concurrency counters",
     )?;
@@ -2559,6 +2561,10 @@ async fn assert_capacity_breakdown(
     )?;
     let provider = &providers.accounts[0];
     require(
+        provider.manual_reconciliation_count == "0",
+        "provider account invented manual review capacity",
+    )?;
+    require(
         (
             provider.allocated_count.as_str(),
             provider.execution_count.as_str(),
@@ -2578,6 +2584,10 @@ async fn assert_capacity_breakdown(
     )?;
     let runtime = &runtime.accounts[0];
     require(
+        runtime.manual_reconciliation_count == "0",
+        "live capacity invented manual review capacity",
+    )?;
+    require(
         (
             runtime.allocated_count.as_str(),
             runtime.execution_count.as_str(),
@@ -2593,6 +2603,10 @@ async fn assert_capacity_breakdown(
         "scheduler capacity grouping duplicated policy",
     )?;
     let capacity = &scheduler.capacity[0];
+    require(
+        capacity.manual_reconciliation_count == "0",
+        "scheduler capacity invented manual review capacity",
+    )?;
     require(
         (
             capacity.allocated_count.as_str(),

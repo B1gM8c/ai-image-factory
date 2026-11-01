@@ -948,11 +948,17 @@ impl AdminReadStore for PostgresAdminReadStore {
                 SELECT allocation.resource_policy_id, allocation.resource_policy_revision,
                        COUNT(*) FILTER (WHERE execution.state IN ('prepared', 'leased', 'running'))::TEXT AS execution_count,
                        COUNT(*) FILTER (WHERE execution.state = 'provider_waiting')::TEXT AS upstream_waiting_count,
-                       COUNT(*) FILTER (WHERE execution.state NOT IN ('prepared', 'leased', 'running', 'provider_waiting'))::TEXT AS reconciliation_count
+                       COUNT(*) FILTER (WHERE execution.state NOT IN ('prepared', 'leased', 'running', 'provider_waiting'))::TEXT AS reconciliation_count,
+                       COUNT(*) FILTER (WHERE execution.state NOT IN ('prepared', 'leased', 'running', 'provider_waiting')
+                           AND reconciliation.review_status = 'manual_required')::TEXT AS manual_reconciliation_count
                 FROM executor_capacity_allocations allocation
                 JOIN executor_executions execution
                   ON execution.executor_execution_id = allocation.executor_execution_id
                  AND execution.submission_id = allocation.submission_id
+                LEFT JOIN provider_capacity_reconciliations reconciliation
+                  ON reconciliation.executor_execution_id = allocation.executor_execution_id
+                 AND reconciliation.submission_id = allocation.submission_id
+                 AND reconciliation.state = 'active'
                 WHERE allocation.state = 'held'
                 GROUP BY allocation.resource_policy_id, allocation.resource_policy_revision
             ), profile_runtime AS (
@@ -1083,6 +1089,7 @@ impl AdminReadStore for PostgresAdminReadStore {
                    COALESCE(capacity.execution_count, '0') AS execution_count,
                    COALESCE(capacity.upstream_waiting_count, '0') AS upstream_waiting_count,
                    COALESCE(capacity.reconciliation_count, '0') AS reconciliation_count,
+                   COALESCE(capacity.manual_reconciliation_count, '0') AS manual_reconciliation_count,
                    GREATEST(profile_runtime.max_concurrency::NUMERIC
                      - profile_runtime.allocated_count::NUMERIC, 0)::TEXT
                        AS available_capacity,
@@ -1145,11 +1152,17 @@ impl AdminReadStore for PostgresAdminReadStore {
                 SELECT allocation.resource_policy_id, allocation.resource_policy_revision,
                        COUNT(*) FILTER (WHERE execution.state IN ('prepared', 'leased', 'running'))::TEXT AS execution_count,
                        COUNT(*) FILTER (WHERE execution.state = 'provider_waiting')::TEXT AS upstream_waiting_count,
-                       COUNT(*) FILTER (WHERE execution.state NOT IN ('prepared', 'leased', 'running', 'provider_waiting'))::TEXT AS reconciliation_count
+                       COUNT(*) FILTER (WHERE execution.state NOT IN ('prepared', 'leased', 'running', 'provider_waiting'))::TEXT AS reconciliation_count,
+                       COUNT(*) FILTER (WHERE execution.state NOT IN ('prepared', 'leased', 'running', 'provider_waiting')
+                           AND reconciliation.review_status = 'manual_required')::TEXT AS manual_reconciliation_count
                 FROM executor_capacity_allocations allocation
                 JOIN executor_executions execution
                   ON execution.executor_execution_id = allocation.executor_execution_id
                  AND execution.submission_id = allocation.submission_id
+                LEFT JOIN provider_capacity_reconciliations reconciliation
+                  ON reconciliation.executor_execution_id = allocation.executor_execution_id
+                 AND reconciliation.submission_id = allocation.submission_id
+                 AND reconciliation.state = 'active'
                 WHERE allocation.state = 'held'
                 GROUP BY allocation.resource_policy_id, allocation.resource_policy_revision
             ), ranked_runtime AS (
@@ -1183,6 +1196,7 @@ impl AdminReadStore for PostgresAdminReadStore {
                    COALESCE(capacity.execution_count, '0') AS execution_count,
                    COALESCE(capacity.upstream_waiting_count, '0') AS upstream_waiting_count,
                    COALESCE(capacity.reconciliation_count, '0') AS reconciliation_count,
+                   COALESCE(capacity.manual_reconciliation_count, '0') AS manual_reconciliation_count,
                    GREATEST(max_concurrency::NUMERIC - allocated_count::NUMERIC, 0)::TEXT
                        AS available_capacity
             FROM ranked_runtime runtime
@@ -1491,11 +1505,17 @@ impl AdminReadStore for PostgresAdminReadStore {
                 SELECT allocation.resource_policy_id, allocation.resource_policy_revision,
                        COUNT(*) FILTER (WHERE execution.state IN ('prepared', 'leased', 'running'))::TEXT AS execution_count,
                        COUNT(*) FILTER (WHERE execution.state = 'provider_waiting')::TEXT AS upstream_waiting_count,
-                       COUNT(*) FILTER (WHERE execution.state NOT IN ('prepared', 'leased', 'running', 'provider_waiting'))::TEXT AS reconciliation_count
+                       COUNT(*) FILTER (WHERE execution.state NOT IN ('prepared', 'leased', 'running', 'provider_waiting'))::TEXT AS reconciliation_count,
+                       COUNT(*) FILTER (WHERE execution.state NOT IN ('prepared', 'leased', 'running', 'provider_waiting')
+                           AND reconciliation.review_status = 'manual_required')::TEXT AS manual_reconciliation_count
                 FROM executor_capacity_allocations allocation
                 JOIN executor_executions execution
                   ON execution.executor_execution_id = allocation.executor_execution_id
                  AND execution.submission_id = allocation.submission_id
+                LEFT JOIN provider_capacity_reconciliations reconciliation
+                  ON reconciliation.executor_execution_id = allocation.executor_execution_id
+                 AND reconciliation.submission_id = allocation.submission_id
+                 AND reconciliation.state = 'active'
                 WHERE allocation.state = 'held'
                 GROUP BY allocation.resource_policy_id, allocation.resource_policy_revision
             )
@@ -1507,6 +1527,7 @@ impl AdminReadStore for PostgresAdminReadStore {
                    COALESCE(capacity.execution_count, '0') AS execution_count,
                    COALESCE(capacity.upstream_waiting_count, '0') AS upstream_waiting_count,
                    COALESCE(capacity.reconciliation_count, '0') AS reconciliation_count,
+                   COALESCE(capacity.manual_reconciliation_count, '0') AS manual_reconciliation_count,
                    GREATEST(control.desired_max_concurrency::NUMERIC
                      - policy.allocated_count::NUMERIC, 0)::TEXT
                        AS available_capacity
@@ -2289,6 +2310,7 @@ struct ProviderAccountRow {
     execution_count: String,
     upstream_waiting_count: String,
     reconciliation_count: String,
+    manual_reconciliation_count: String,
     available_capacity: String,
     active_submitters: String,
     active_pollers: String,
@@ -2350,6 +2372,7 @@ impl From<ProviderAccountRow> for ProviderAccountView {
             execution_count: row.execution_count,
             upstream_waiting_count: row.upstream_waiting_count,
             reconciliation_count: row.reconciliation_count,
+            manual_reconciliation_count: row.manual_reconciliation_count,
             available_capacity: row.available_capacity,
             active_submitters: row.active_submitters,
             active_pollers: row.active_pollers,
@@ -2368,6 +2391,7 @@ struct ProviderAccountConcurrencyRow {
     execution_count: String,
     upstream_waiting_count: String,
     reconciliation_count: String,
+    manual_reconciliation_count: String,
     available_capacity: String,
 }
 
@@ -2380,6 +2404,7 @@ impl From<ProviderAccountConcurrencyRow> for ProviderAccountConcurrency {
             execution_count: row.execution_count,
             upstream_waiting_count: row.upstream_waiting_count,
             reconciliation_count: row.reconciliation_count,
+            manual_reconciliation_count: row.manual_reconciliation_count,
             available_capacity: row.available_capacity,
         }
     }
@@ -2444,6 +2469,7 @@ struct SchedulerCapacityRow {
     execution_count: String,
     upstream_waiting_count: String,
     reconciliation_count: String,
+    manual_reconciliation_count: String,
     available_capacity: String,
 }
 
@@ -2546,6 +2572,7 @@ impl From<SchedulerCapacityRow> for SchedulerCapacity {
             execution_count: row.execution_count,
             upstream_waiting_count: row.upstream_waiting_count,
             reconciliation_count: row.reconciliation_count,
+            manual_reconciliation_count: row.manual_reconciliation_count,
             available_capacity: row.available_capacity,
         }
     }

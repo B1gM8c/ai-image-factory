@@ -309,6 +309,8 @@ async fn normal_archive_recovers_original_bytes_once_with_capacity_and_quote_con
     let result=async {
         let fixture=normal_original(&db.pool,"seedance2.0fast_vip",1,0).await?;
         let request=recovery_evidence(&db.pool,&fixture).await?;
+        let tasks=PostgresProviderTaskStore::new(db.pool.clone());
+        require(tasks.classify_capacity_reconciliation(&ProviderTaskClaimScope { provider_id:DREAMINA_PROVIDER_ID.into(), provider_account_id:DREAMINA_ACCOUNT_ID, execution_profile_id:DREAMINA_VIDEO_PROFILE_ID }).await.map_err(debug_error)? == 1,"normal archive fixture was not classified manual before reviewed recovery")?;
         let before:serde_json::Value=sqlx::query_scalar("SELECT dreamina_video_supplement_original_snapshot($1)").bind(request.job_id).fetch_one(&db.pool).await.map_err(debug_error)?;
         let blobs=Arc::new(InMemoryArtifactBlobStore::default());
         let (a,b)=tokio::join!(resolve_dreamina_video_archive(&db.pool,&*blobs,&fixture.root,&request),resolve_dreamina_video_archive(&db.pool,&*blobs,&fixture.root,&request));

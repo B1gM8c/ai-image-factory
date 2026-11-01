@@ -30,10 +30,16 @@ use crate::{
     },
 };
 
+mod capacity_query;
 mod credential_environment;
 mod poll;
 mod submit_recovery;
 pub(crate) use poll::{ordered_image_outputs, pending_progress};
+
+pub use capacity_query::{
+    DreaminaCliCapacityQueryDriverV1, ProviderCapacityQueryDriver, ProviderCapacityQueryError,
+    ProviderCapacityQueryObservation,
+};
 
 pub use credential_environment::{
     DreaminaCredentialEnvironmentError, DreaminaKeychainReplacement,

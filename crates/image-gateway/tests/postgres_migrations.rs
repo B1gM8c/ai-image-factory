@@ -17,7 +17,7 @@ use uuid::Uuid;
 
 type TestResult<T = ()> = Result<T, String>;
 
-const REQUIRED_COLUMNS: [(&str, &str); 996] = [
+const REQUIRED_COLUMNS: [(&str, &str); 999] = [
     ("provider_remote_video_results", "remote_result_id"),
     ("provider_remote_video_results", "executor_execution_id"),
     ("provider_remote_video_results", "submission_id"),
@@ -772,6 +772,9 @@ const REQUIRED_COLUMNS: [(&str, &str); 996] = [
         "provider_deadline_at_ms",
     ),
     ("provider_capacity_reconciliations", "state"),
+    ("provider_capacity_reconciliations", "review_status"),
+    ("provider_capacity_reconciliations", "manual_reason"),
+    ("provider_capacity_reconciliations", "query_failures"),
     ("provider_capacity_reconciliations", "available_at_ms"),
     ("provider_capacity_reconciliations", "reconciliation_owner"),
     (
@@ -1208,7 +1211,7 @@ const REQUIRED_COLUMNS: [(&str, &str); 996] = [
     ("operator_terminal_reduction_requeues", "requeued_at_ms"),
 ];
 
-const REQUIRED_INDEXES: [&str; 153] = [
+const REQUIRED_INDEXES: [&str; 154] = [
     "provider_route_model_mappings_execution_idx",
     "usage_events_tenant_created_at_ms_idx",
     "gateway_api_keys_project_id_idx",
@@ -1235,6 +1238,7 @@ const REQUIRED_INDEXES: [&str; 153] = [
     "provider_submit_recoveries_claim_idx",
     "provider_submit_recoveries_deadline_idx",
     "provider_capacity_reconciliations_claim_idx",
+    "provider_capacity_auto_review_idx",
     "provider_capacity_reconciliations_remote_operation_idx",
     "provider_capacity_reconciliations_claim_command_idx",
     "provider_runtime_leases_profile_role_idx",
