@@ -1406,7 +1406,7 @@ async fn project_video_task(
     let audited_release_possible = matches!(
         &status,
         VideoResultStatus::Failed { error_code: Some(code), .. }
-            if matches!(code.as_str(), "dreamina_compliance_confirmation_required" | "dreamina_concurrency_limit_exceeded")
+            if matches!(code.as_str(), "dreamina_compliance_confirmation_required" | "dreamina_concurrency_limit_exceeded" | "dreamina_copyright_rejected")
     );
     let manual_cancellation = if matches!(&status, VideoResultStatus::Failed { .. }) {
         settlement_store
@@ -1950,12 +1950,19 @@ mod tests {
             released_micros: "1200000".to_owned(),
             captured_micros: "0".to_owned(),
         };
-        for expected in [None, Some(receipt)] {
+        for (code, expected) in [
+            "dreamina_compliance_confirmation_required",
+            "dreamina_concurrency_limit_exceeded",
+            "dreamina_copyright_rejected",
+        ]
+        .into_iter()
+        .flat_map(|code| [None, Some(receipt.clone())].map(|receipt| (code, receipt)))
+        {
             let store = VideoQueryStore {
                 status: Mutex::new(Some(VideoResultStatus::Failed {
                     model: "seedance2.0fast_vip".to_owned(),
                     duration_ms: 10000,
-                    error_code: Some("dreamina_compliance_confirmation_required".to_owned()),
+                    error_code: Some(code.to_owned()),
                 })),
                 receipt: expected.clone(),
                 receipt_reads: Mutex::default(),
