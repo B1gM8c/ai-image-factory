@@ -395,3 +395,170 @@ async fn accepted_terminal_rejects_bad_query_and_rolls_back_late_failure() -> Te
  Ok(())}.await;
     combine(result, db.cleanup().await)
 }
+
+#[tokio::test]
+async fn accepted_terminal_video_get_exposes_only_audited_project_release() -> TestResult {
+    use axum::{
+        body::{Body, to_bytes},
+        http::{Request, StatusCode, header},
+    };
+    use gpt_image_2_gateway::{
+        ApiKeyKeyring, ApiKeyPermissionMode, ApiKeyPermissions, ApiKeyStore, AppConfig,
+        ExternalImageGatewayComponents, GenerationAdmissionContract, PostgresApiKeyStore,
+        PostgresUsageStore, ProxyConfig, admission::PostgresAdmissionStore,
+        build_router_with_external_execution,
+    };
+    use tower::ServiceExt;
+
+    let Some(mut db) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let f = fixture(&mut db).await?;
+        let keys = Arc::new(PostgresApiKeyStore::new(
+            db.pool.clone(),
+            ApiKeyKeyring::new(1, [(1, vec![0x47; 32])]).map_err(debug_error)?,
+        ));
+        let reader = keys
+            .create_service_account(
+                "project-test",
+                "Release reader",
+                ApiKeyPermissionMode::ReadOnly,
+                ApiKeyPermissions::default(),
+            )
+            .await
+            .map_err(debug_error)?;
+        let denied = keys
+            .create_service_account(
+                "project-test",
+                "No video permission",
+                ApiKeyPermissionMode::Restricted,
+                ApiKeyPermissions::default(),
+            )
+            .await
+            .map_err(debug_error)?;
+        let other_project = keys
+            .create_project("Other release scope")
+            .await
+            .map_err(debug_error)?;
+        let other = keys
+            .create_service_account(
+                &other_project.id,
+                "Other reader",
+                ApiKeyPermissionMode::ReadOnly,
+                ApiKeyPermissions::default(),
+            )
+            .await
+            .map_err(debug_error)?;
+        let blobs = Arc::new(InMemoryArtifactBlobStore::default());
+        let store = Arc::new(PostgresExecutionSettlementStore::new(
+            db.pool.clone(),
+            blobs.clone(),
+        ));
+        let app = build_router_with_external_execution(
+            AppConfig {
+                bind: "127.0.0.1:0".parse().unwrap(),
+                auth_token: None,
+                admin_token: None,
+                legacy_admin_auth_enabled: false,
+                database_url: None,
+                generation_admission_contract: GenerationAdmissionContract::CustomerPricingV4,
+                enable_xai_video_api: true,
+                five_hour_image_limit: 100,
+                seven_day_image_limit: 100,
+                five_hour_video_second_limit: 100,
+                seven_day_video_second_limit: 100,
+                max_concurrent_jobs: 2,
+                max_queue_size: 4,
+                max_concurrent_jobs_per_tenant: 2,
+                max_queue_size_per_tenant: 4,
+                queue_timeout: Duration::from_secs(5),
+                request_timeout: Duration::from_secs(30),
+                readiness_timeout: Duration::from_millis(500),
+                readiness_stall_threshold: Duration::from_secs(60),
+                max_upload_bytes: 1024 * 1024,
+                proxy: ProxyConfig::default(),
+                codex_home: None,
+                cleanup_codex_outputs: false,
+            },
+            ExternalImageGatewayComponents {
+                usage_store: Arc::new(PostgresUsageStore::new(db.pool.clone())),
+                api_key_store: keys,
+                admission_store: Arc::new(PostgresAdmissionStore::new(db.pool.clone())),
+                settlement_store: store,
+                input_blob_store: blobs,
+                provider_readiness_store: Arc::new(PostgresProviderTaskStore::new(db.pool.clone())),
+            },
+        )
+        .map_err(debug_error)?;
+        let get = |token: String| {
+            let app = app.clone();
+            let uri = format!("/v1/dreamina/videos/{}", f.request.job_id);
+            async move {
+                let response = app
+                    .oneshot(
+                        Request::builder()
+                            .uri(uri)
+                            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                            .body(Body::empty())
+                            .map_err(debug_error)?,
+                    )
+                    .await
+                    .map_err(debug_error)?;
+                let status = response.status();
+                let bytes = to_bytes(response.into_body(), 64 * 1024)
+                    .await
+                    .map_err(debug_error)?;
+                let body: serde_json::Value =
+                    serde_json::from_slice(&bytes).map_err(debug_error)?;
+                Ok::<_, String>((status, body))
+            }
+        };
+        // Before the audited resolution the original remains uncertain, without
+        // inventing a released settlement from the error or billing hold alone.
+        let (status, body) = get(reader.api_key.value.clone()).await?;
+        require(
+            status == StatusCode::OK
+                && body["status"] == "uncertain"
+                && body.get("settlement").is_none(),
+            format!("unresolved original fabricated receipt: {status}/{body}"),
+        )?;
+        let receipt = resolve(&db.pool, &f).await.map_err(debug_error)?;
+        let (status, body) = get(reader.api_key.value.clone()).await?;
+        require(
+            status == StatusCode::OK
+                && body["status"] == "failed"
+                && body["error"]["code"] == "dreamina_copyright_rejected"
+                && body["error"]["message"] == "生成的视频里包含受版权保护元素",
+            format!("copyright GET lost actual terminal reason: {status}/{body}"),
+        )?;
+        require(
+            body["settlement"]
+                == json!({
+                    "state": "released", "resolution_audit_id": receipt.resolution_id,
+                    "job_id": receipt.job_id, "request_id": receipt.request_id,
+                    "hold_id": receipt.hold_id, "currency": "USD",
+                    "held_micros": "1200000", "released_micros": "1200000", "captured_micros": "0",
+                }),
+            format!("GET omitted or changed audited settlement: {body}"),
+        )?;
+        for (token, expected) in [
+            (denied.api_key.value, StatusCode::FORBIDDEN),
+            (other.api_key.value, StatusCode::BAD_REQUEST),
+            ("invalid-fixture-token".to_owned(), StatusCode::UNAUTHORIZED),
+        ] {
+            let (status, body) = get(token).await?;
+            require(
+                status == expected && body.get("settlement").is_none(),
+                format!("unauthorized GET exposed settlement: {status}/{body}"),
+            )?;
+        }
+        require(
+            fs::read(&f.marker).map_err(debug_error)? == b"invoked",
+            "project GET dispatched a provider operation",
+        )?;
+        Ok(())
+    }
+    .await;
+    combine(result, db.cleanup().await)
+}
