@@ -143,6 +143,26 @@ async fn webhook_case(pool: &PgPool) -> TestResult {
         .enqueue_test(&first.project_id, &created.endpoint.id, first.user_id)
         .await
         .map_err(debug_error)?;
+    // Enqueue uses the application clock; the relay claims using the DB clock.
+    // Wait for this delivery to be due when the test DB runs in a slower VM.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let due: bool = sqlx::query_scalar(
+                "SELECT next_attempt_at_ms <= (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT
+                 FROM project_webhook_deliveries WHERE delivery_id = $1",
+            )
+            .bind(first_test.delivery_id)
+            .fetch_one(pool)
+            .await
+            .map_err(debug_error)?;
+            if due {
+                return Ok::<(), String>(());
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .map_err(|_| "test webhook did not become due on the database clock".to_owned())??;
     let first_lease = relay
         .claim_deliveries("worker-a", 1, Duration::from_secs(60))
         .await

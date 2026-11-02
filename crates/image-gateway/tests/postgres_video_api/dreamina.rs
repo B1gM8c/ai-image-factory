@@ -1133,6 +1133,7 @@ async fn seed_model_economics(pool: &PgPool, tenant: &str, model: FixtureModel) 
         )
         .await
         .map_err(debug_error)?;
+    wait_for_price_effective(pool, version.price_book_version_id).await?;
     sqlx::query("INSERT INTO billing_accounts
         (tenant_id, currency, credit_limit_micros, held_micros, captured_micros, created_at_ms, updated_at_ms)
         VALUES ($1, 'USD', 1000000, 0, 0, 1, 1)")

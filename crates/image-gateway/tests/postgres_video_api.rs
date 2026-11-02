@@ -1579,6 +1579,30 @@ fn video_request_v2() -> Value {
     })
 }
 
+// Publication uses the application clock, while admission uses the database clock.
+// A local container can lag its host; wait for the real published price to apply
+// rather than backdating the price or changing the admitted job timestamp.
+async fn wait_for_price_effective(pool: &PgPool, version_id: Uuid) -> TestResult {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let effective: bool = sqlx::query_scalar(
+                "SELECT effective_from_ms <= floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT
+                 FROM price_book_versions WHERE price_book_version_id = $1 AND state = 'active'",
+            )
+            .bind(version_id)
+            .fetch_one(pool)
+            .await
+            .map_err(debug_error)?;
+            if effective {
+                return Ok::<(), String>(());
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .map_err(|_| "published fixture price did not become effective on the database clock".to_owned())?
+}
+
 async fn seed_video_economics(pool: &PgPool, tenant_id: &str) -> TestResult {
     let now: i64 =
         sqlx::query_scalar("SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT")
@@ -1669,6 +1693,7 @@ async fn seed_video_economics(pool: &PgPool, tenant_id: &str) -> TestResult {
         )
         .await
         .map_err(debug_error)?;
+    wait_for_price_effective(pool, version.price_book_version_id).await?;
     sqlx::query(
         r#"
         INSERT INTO billing_accounts
@@ -1767,6 +1792,7 @@ async fn seed_v2_active_economics(pool: &PgPool, now: i64) -> TestResult {
         )
         .await
         .map_err(debug_error)?;
+    wait_for_price_effective(pool, version.price_book_version_id).await?;
     Ok(())
 }
 
