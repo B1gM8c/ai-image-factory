@@ -112,6 +112,10 @@ async fn populated_upgrade_case(url: &str, delivered: bool) -> TestResult {
             migrations.iter().filter(|migration| migration.version <= 154).cloned().collect(),
         );
         old.run(&db.pool).await.map_err(debug_error)?;
+        // Current admission reads capacity waivers introduced in166. Schema154
+        // has none; remove this fixture-only identity before the real upgrade.
+        sqlx::query("CREATE FUNCTION executor_waived_held_count(UUID,BIGINT) RETURNS INTEGER LANGUAGE SQL IMMUTABLE AS 'SELECT 0'")
+            .execute(&db.pool).await.map_err(debug_error)?;
         seed_execution_profiles(&db.pool).await?;
         let service = store(&db.pool);
         let fixture = if delivered {
@@ -151,7 +155,12 @@ async fn populated_upgrade_case(url: &str, delivered: bool) -> TestResult {
         };
         let before = snapshot(&db.pool, head.job_id).await?;
 
+        sqlx::query("DROP FUNCTION executor_waived_held_count(UUID,BIGINT)")
+            .execute(&db.pool).await.map_err(debug_error)?;
         migrations.run(&db.pool).await.map_err(debug_error)?;
+        let real_waivers:bool=sqlx::query_scalar("SELECT position('executor_capacity_risk_waivers' in pg_get_functiondef('executor_waived_held_count(uuid,bigint)'::regprocedure)) > 0")
+            .fetch_one(&db.pool).await.map_err(debug_error)?;
+        require(real_waivers,"cancellation upgrade retained the fixture waiver function")?;
         let version: i64 = sqlx::query_scalar("SELECT max(version) FROM _sqlx_migrations WHERE success")
             .fetch_one(&db.pool).await.map_err(debug_error)?;
         let expected_version = migrations.iter().map(|migration| migration.version).max()
