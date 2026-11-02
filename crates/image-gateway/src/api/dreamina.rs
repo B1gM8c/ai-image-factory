@@ -1024,7 +1024,18 @@ pub(super) async fn get_image_results(
         )
         .await?
         .ok_or_else(image_task_not_found)?;
-    let (task, usage) = image_task(job_id, projection)?;
+    let (mut task, usage) = image_task(job_id, projection)?;
+    if task.status == "failed" {
+        task.settlement = state
+            .settlement_store
+            .project_image_released_settlement(
+                &auth.tenant_id,
+                &auth.project_id,
+                auth.actor_user_id,
+                job_id,
+            )
+            .await?;
+    }
     let additional = if task.status == "succeeded" {
         state
             .settlement_store
@@ -1185,7 +1196,17 @@ async fn project_image_response(
         )
         .await?
         .ok_or_else(image_task_not_found)?;
-    let (task, usage) = image_task(job_id, projection)?;
+    let (mut task, usage) = image_task(job_id, projection)?;
+    if task.status == "failed" {
+        task.settlement = settlement_store
+            .project_image_released_settlement(
+                &auth.tenant_id,
+                &auth.project_id,
+                auth.actor_user_id,
+                job_id,
+            )
+            .await?;
+    }
     let mut response = Json(task).into_response();
     if let Some(usage) = usage {
         super::responses::add_usage_headers(response.headers_mut(), &usage, auth);
@@ -1202,6 +1223,7 @@ fn image_task(
         status: "running".to_owned(),
         stage: None,
         provider_progress: None,
+        settlement: None,
         cancellation: DreaminaCancellation {
             supported: false,
             reason: "provider_cancellation_unsupported".to_owned(),
@@ -1940,6 +1962,7 @@ mod tests {
         let mut auth = routed_auth(7);
         auth.actor_user_id = Some(Uuid::new_v4());
         let receipt = image_api_contracts::dreamina::DreaminaReleasedSettlement {
+            basis: None,
             state: "released".to_owned(),
             resolution_audit_id: Uuid::new_v4().to_string(),
             job_id: job_id.to_string(),

@@ -115,3 +115,32 @@ fn physical_result_budget_counts_base64_padding_and_exact_256_mib_boundary_witho
     assert!(complete_image_byte_total(max, 1).is_err());
     assert!(complete_image_byte_total(u64::MAX, 1).is_err());
 }
+
+#[test]
+fn failed_image_receipt_basis_survives_task_and_complete_results_serialization() {
+    let mut original = task("failed", 0);
+    original.settlement = Some(image_api_contracts::dreamina::DreaminaReleasedSettlement {
+        basis: Some("native_image_terminal_reduction_v1".into()),
+        state: "released".into(),
+        resolution_audit_id: Uuid::new_v4().to_string(),
+        job_id: original.id.clone(),
+        request_id: "original-request".into(),
+        hold_id: Uuid::new_v4().to_string(),
+        currency: "USD".into(),
+        held_micros: "90000".into(),
+        released_micros: "90000".into(),
+        captured_micros: "0".into(),
+    });
+    let task_json = serde_json::to_value(&original).unwrap();
+    assert_eq!(
+        task_json["settlement"]["basis"],
+        "native_image_terminal_reduction_v1"
+    );
+    let results_json =
+        serde_json::to_value(complete_image_task(original, Vec::new()).unwrap()).unwrap();
+    assert_eq!(results_json["settlement"], task_json["settlement"]);
+    assert_eq!(results_json["returned_count"], 0);
+    assert_eq!(results_json["billable_units"], 0);
+    assert_eq!(results_json["additional_images"], json!([]));
+    assert!(results_json.get("data").is_none());
+}
