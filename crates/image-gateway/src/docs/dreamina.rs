@@ -236,9 +236,10 @@ pub(super) fn patch_schemas(document: &mut Value) {
     }
     schemas["DreaminaReleasedSettlement"] = json!({
         "type": "object",
-        "description": "Read-only receipt from an audited operator compliance-rejection resolution joined to the fully released customer billing hold. Monetary micros are exact decimal strings. Absence of this receipt is not proof of release.",
+        "description": "Read-only receipt from an audited operator resolution or an authoritative image poll-terminal resolution joined to the fully released customer billing hold. Normal zero-charge image rating may leave the internal hold settled; this public state means the entire held amount was released. Monetary micros are exact decimal strings. Absence of this receipt is not proof of release.",
         "required": ["state", "resolution_audit_id", "job_id", "request_id", "hold_id", "currency", "held_micros", "released_micros", "captured_micros"],
         "properties": {
+            "basis": {"type": "string", "enum": ["native_image_terminal_reduction_v1"], "description": "Required by consumers for native image terminal release; omitted for legacy audited video resolutions."},
             "state": {"type": "string", "enum": ["released"]},
             "resolution_audit_id": {"type": "string", "format": "uuid"},
             "job_id": {"type": "string", "format": "uuid"},
@@ -383,6 +384,8 @@ fn patch_image_tasks(document: &mut Value) {
             "status": {"type": "string", "enum": ["running", "succeeded", "failed", "uncertain", "expired"]},
             "stage": schemas["DreaminaVideoTaskDoc"]["properties"]["stage"].clone(),
             "provider_progress": {"$ref": "#/components/schemas/DreaminaProviderProgress"},
+            "settlement": {"$ref": "#/components/schemas/DreaminaReleasedSettlement",
+                "description": "Optional on failed tasks only: authoritative original poll failure, completed terminal reduction, full zero-capture release and zero customer rating. Unknown, expired, operator-supplemented or partial batch results do not provide this receipt."},
             "cancellation": {"$ref": "#/components/schemas/DreaminaCancellation"},
             "model": {"type": "string"}, "request_id": {"type": "string"},
             "request": {"$ref": "#/components/schemas/DreaminaImageRequestMetadata"},

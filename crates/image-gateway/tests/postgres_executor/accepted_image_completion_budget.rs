@@ -719,3 +719,113 @@ async fn longer_original_image_deadline_is_preserved_and_lease_seal_remains_boun
     .await;
     combine(result, database.cleanup().await)
 }
+
+#[tokio::test]
+async fn image_terminal_release_receipt_requires_original_poll_and_completed_zero_rating()
+-> TestResult {
+    for error_code in [
+        "dreamina_generation_failed",
+        "dreamina_copyright_rejected",
+        "unclassified_failure",
+    ] {
+        let Some(database) = TestDatabase::new().await? else {
+            return Ok(());
+        };
+        let result = async {
+            let pool = &database.pool;
+            let image = accepted_image(pool, 1, ORIGINAL_TIMEOUT_MS, true, true).await?;
+            let store = PostgresExecutionSettlementStore::new(pool.clone(), Arc::new(InMemoryArtifactBlobStore::default()));
+            require(store.project_image_released_settlement("executord-process-smoke", "project-test", None, image.job_id).await.map_err(debug_error)?.is_none(), "waiting image exposed release")?;
+            let tasks = PostgresProviderTaskStore::new(pool.clone());
+            let poll = tasks.claim_due(&scope(), "failed-image-poll", 60_000).await.map_err(debug_error)?.ok_or("image poll missing")?;
+            tasks.record_observation(&poll, &ProviderTaskObservation {
+                event_identity: "original-image-failure".into(), source: ProviderTaskObservationSource::Poll,
+                outcome: ProviderTaskObservationOutcome::Failed { error_code: error_code.into() }, progress: None,
+            }).await.map_err(debug_error)?;
+            require(store.project_image_released_settlement("executord-process-smoke", "project-test", None, image.job_id).await.map_err(debug_error)?.is_none(), "unreduced image exposed release")?;
+            let reductions = PostgresExecutorTerminalStore::new(pool.clone());
+            let terminal = reductions.claim_terminal("image-release-reducer", 60_000).await.map_err(debug_error)?.ok_or("image terminal missing")?;
+            let settled = reductions.complete_terminal(&terminal, None).await.map_err(debug_error)?;
+            require(settled == reductions.complete_terminal(&terminal, None).await.map_err(debug_error)?, "terminal replay changed settlement")?;
+            let receipt = store.project_image_released_settlement("executord-process-smoke", "project-test", None, image.job_id).await.map_err(debug_error)?;
+            if error_code == "unclassified_failure" {
+                return require(receipt.is_none(), "unclassified error exposed release");
+            }
+            let receipt = receipt.ok_or("authoritative failed image omitted release")?;
+            require(receipt.basis.as_deref() == Some("native_image_terminal_reduction_v1") && receipt.state == "released" && receipt.job_id == image.job_id.to_string() && receipt.captured_micros == "0" && receipt.released_micros == receipt.held_micros, "wrong image release receipt")?;
+            let proof: (Uuid, String, String, i64, i64, i64, i64) = sqlx::query_as(
+                "SELECT reduction.resolution_decision_id, job.request_id, hold.state, hold.held_micros, hold.released_micros, rated.total_amount_micros,
+                (SELECT count(*) FROM ledger_transactions WHERE source_job_id=job.job_id AND transaction_type IN ('customer_charge','customer_job_charge'))
+                FROM jobs job JOIN provider_submissions submission USING(job_id)
+                JOIN executor_terminal_reductions reduction USING(submission_id)
+                JOIN customer_billing_holds hold USING(job_id) JOIN customer_rated_usage rated ON rated.job_id=job.job_id
+                WHERE job.job_id=$1")
+                .bind(image.job_id).fetch_one(pool).await.map_err(debug_error)?;
+            require(receipt.resolution_audit_id == proof.0.to_string() && receipt.request_id == proof.1 && proof.2 == "settled" && proof.3 == proof.4 && proof.5 == 0 && proof.6 == 0, "receipt lacked exact zero-charge accounting evidence")?;
+            for (tenant, project, actor) in [("other", "project-test", None), ("executord-process-smoke", "other", None), ("executord-process-smoke", "project-test", Some(Uuid::new_v4()))] {
+                require(store.project_image_released_settlement(tenant, project, actor, image.job_id).await.map_err(debug_error)?.is_none(), "image release leaked scope")?;
+            }
+            require(store.project_video_released_settlement("executord-process-smoke", "project-test", None, image.job_id).await.map_err(debug_error)?.is_none(), "image release entered video path")?;
+            require(store.project_image_released_settlement("executord-process-smoke", "project-test", None, image.job_id).await.map_err(debug_error)? == Some(receipt), "repeated read changed receipt")?;
+            if error_code == "dreamina_generation_failed" {
+                // Fault injection only in this disposable fixture schema: normal
+                // immutable evidence guards remain enabled in production. Each
+                // malformed projection is restored before testing the next one.
+                for (table, corrupt, restore) in [
+                    ("customer_billing_holds",
+                     "state='held', released_micros=held_micros-1, grant_released_micros=GREATEST(grant_held_micros-1,0), account_released_micros=held_micros-1-GREATEST(grant_held_micros-1,0)",
+                     "state='settled', released_micros=held_micros, grant_released_micros=grant_held_micros, account_released_micros=account_held_micros"),
+                    ("customer_billing_holds",
+                     "captured_micros=1, grant_captured_micros=LEAST(grant_held_micros,1), account_captured_micros=1-LEAST(grant_held_micros,1), released_micros=held_micros-1, grant_released_micros=GREATEST(grant_held_micros-1,0), account_released_micros=held_micros-1-GREATEST(grant_held_micros-1,0)",
+                     "captured_micros=0, grant_captured_micros=0, account_captured_micros=0, released_micros=held_micros, grant_released_micros=grant_held_micros, account_released_micros=account_held_micros"),
+                    ("customer_rated_usage", "total_amount_micros=1", "total_amount_micros=0"),
+                    ("provider_task_observations", "source='cancel'", "source='poll'"),
+                ] {
+                    let predicate = if table == "provider_task_observations" { "observation_id=(SELECT state_observation_id FROM provider_remote_tasks WHERE submission_id=(SELECT submission_id FROM provider_submissions WHERE job_id=$1))" } else { "job_id=$1" };
+                    sqlx::query(AssertSqlSafe(format!("ALTER TABLE {table} DISABLE TRIGGER USER"))).execute(pool).await.map_err(debug_error)?;
+                    sqlx::query(AssertSqlSafe(format!("UPDATE {table} SET {corrupt} WHERE {predicate}"))).bind(image.job_id).execute(pool).await.map_err(debug_error)?;
+                    require(store.project_image_released_settlement("executord-process-smoke", "project-test", None, image.job_id).await.map_err(debug_error)?.is_none(), format!("corrupt {table} exposed release: {corrupt}"))?;
+                    sqlx::query(AssertSqlSafe(format!("UPDATE {table} SET {restore} WHERE {predicate}"))).bind(image.job_id).execute(pool).await.map_err(debug_error)?;
+                    sqlx::query(AssertSqlSafe(format!("ALTER TABLE {table} ENABLE TRIGGER USER"))).execute(pool).await.map_err(debug_error)?;
+                    require(store.project_image_released_settlement("executord-process-smoke", "project-test", None, image.job_id).await.map_err(debug_error)?.is_some(), "fixture evidence did not restore")?;
+                }
+            }
+            Ok(())
+        }.await;
+        combine(result, database.cleanup().await)?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn image_terminal_release_receipt_omits_unknown_and_native_batch() -> TestResult {
+    for (count, accepted) in [(1, false), (2, true)] {
+        let Some(database) = TestDatabase::new().await? else {
+            return Ok(());
+        };
+        let result = async {
+            let image =
+                accepted_image(&database.pool, count, ORIGINAL_TIMEOUT_MS, true, accepted).await?;
+            let store = PostgresExecutionSettlementStore::new(
+                database.pool.clone(),
+                Arc::new(InMemoryArtifactBlobStore::default()),
+            );
+            require(
+                store
+                    .project_image_released_settlement(
+                        "executord-process-smoke",
+                        "project-test",
+                        None,
+                        image.job_id,
+                    )
+                    .await
+                    .map_err(debug_error)?
+                    .is_none(),
+                "unknown or native batch exposed a single-image release",
+            )
+        }
+        .await;
+        combine(result, database.cleanup().await)?;
+    }
+    Ok(())
+}

@@ -233,6 +233,9 @@ pub struct DreaminaImageTask {
     pub stage: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_progress: Option<DreaminaProviderProgress>,
+    /// Present only for an authoritative terminal failure with a fully released hold.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settlement: Option<DreaminaReleasedSettlement>,
     pub cancellation: DreaminaCancellation,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
@@ -399,6 +402,8 @@ pub struct DreaminaCancellation {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct DreaminaReleasedSettlement {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub basis: Option<String>,
     pub state: String,
     pub resolution_audit_id: String,
     pub job_id: String,

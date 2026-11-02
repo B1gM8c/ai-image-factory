@@ -501,6 +501,7 @@ async fn rejection_resolution_preserves_originals(
             "executord-process-smoke", "project-test", None, fixture.work.job_id)
             .await.map_err(debug_error)?.ok_or("released audit receipt was not project-readable")?;
         require(public_receipt == image_api_contracts::dreamina::DreaminaReleasedSettlement {
+                basis: None,
             state: "released".into(), resolution_audit_id: first.resolution_id.to_string(),
             job_id: fixture.work.job_id.to_string(), request_id: first.request_id.clone(),
             hold_id: first.hold_id.to_string(), currency: "USD".into(),

@@ -30,6 +30,7 @@ mod failure;
 mod image_status;
 pub(super) mod image_success_reconciliation;
 pub(super) mod image_supplementation;
+mod image_terminal_release;
 pub(super) mod manual_video_cancellation;
 mod results;
 pub(super) mod supplement_video_cancellation;
@@ -567,6 +568,17 @@ impl ExecutionSettlementStore for PostgresExecutionSettlementStore {
         ))
     }
 
+    async fn project_image_released_settlement(
+        &self,
+        tenant_id: &str,
+        project_id: &str,
+        actor_user_id: Option<Uuid>,
+        job_id: Uuid,
+    ) -> Result<Option<image_api_contracts::dreamina::DreaminaReleasedSettlement>, ImageGatewayError>
+    {
+        image_terminal_release::project(self, tenant_id, project_id, actor_user_id, job_id).await
+    }
+
     async fn project_video_released_settlement(
         &self,
         tenant_id: &str,
@@ -627,6 +639,7 @@ impl ExecutionSettlementStore for PostgresExecutionSettlementStore {
                 released_micros,
                 captured_micros,
             )| image_api_contracts::dreamina::DreaminaReleasedSettlement {
+                basis: None,
                 state: "released".to_owned(),
                 resolution_audit_id: resolution_audit_id.to_string(),
                 job_id: job_id.to_string(),
