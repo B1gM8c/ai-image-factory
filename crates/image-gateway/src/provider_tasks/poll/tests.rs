@@ -365,6 +365,80 @@ impl ProviderPollDriver for NeverDriver {
     }
 }
 
+struct TrackingNeverDriver {
+    additional: bool,
+    dropped: Arc<AtomicBool>,
+}
+impl ProviderPollDriver for TrackingNeverDriver {
+    fn provider_id(&self) -> &'static str {
+        DREAMINA_PROVIDER_ID
+    }
+    fn supports_additional_images(&self) -> bool {
+        self.additional
+    }
+    async fn poll<S: ArtifactSink>(
+        &self,
+        _: &ProviderPollDriverCall,
+        _: &mut S,
+    ) -> Result<PollObservation, image_provider_sdk::ProviderFailure> {
+        let _guard = DropFlag(self.dropped.clone());
+        std::future::pending().await
+    }
+    async fn poll_native_batch<S: ProviderNativeBatchArtifactSink>(
+        &self,
+        _: &ProviderPollDriverCall,
+        _: usize,
+        _: &mut S,
+    ) -> Result<ProviderNativeBatchPollObservation, image_provider_sdk::ProviderFailure> {
+        let _guard = DropFlag(self.dropped.clone());
+        std::future::pending().await
+    }
+}
+
+#[tokio::test]
+async fn accepted_tracking_timeout_reschedules_all_three_paths_without_terminal_observation() {
+    for mode in 0..3 {
+        let (store, _, factory, mut lease) = native_batch_fixture(2, 2);
+        lease.completion_deadline_at_ms = i64::MAX;
+        lease.poll_attempt_deadline_at_ms = lease.context.provider_deadline_at_ms;
+        lease.remaining_budget_ms = 15;
+        {
+            let mut state = store.state.lock().unwrap();
+            state.lease = Some(lease);
+            if mode != 2 {
+                state.native_members = None;
+            }
+        }
+        let dropped = Arc::new(AtomicBool::new(false));
+        let mut cfg = config(Duration::from_millis(20));
+        cfg.scope.provider_id = DREAMINA_PROVIDER_ID.into();
+        let runner = ProviderPollOrchestrator::new(
+            store.clone(),
+            TrackingNeverDriver {
+                additional: mode == 1,
+                dropped: dropped.clone(),
+            },
+            factory,
+            cfg,
+        )
+        .unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(2), runner.run_once())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(result,ProviderPollRun::Observed(ref task) if task.state==ProviderTaskState::ProviderWaiting),
+            "path {mode}"
+        );
+        assert!(dropped.load(Ordering::SeqCst));
+        let state = store.state.lock().unwrap();
+        assert_eq!(state.observations.len(), 1);
+        assert!(
+            matches!(state.observations[0].outcome,ProviderTaskObservationOutcome::Waiting {poll_after_ms} if poll_after_ms>0)
+        );
+    }
+}
+
 struct DropFlag(Arc<AtomicBool>);
 
 impl Drop for DropFlag {
@@ -1274,6 +1348,7 @@ pub(super) fn lease(committed_artifact: Option<ProviderArtifactPublication>) -> 
         committed_artifact,
         remaining_budget_ms: 60_000,
         completion_deadline_at_ms: 9_999_999_999_999,
+        poll_attempt_deadline_at_ms: 9_999_999_999_999,
         poll_owner: "poll-owner".to_owned(),
         poll_lease_epoch: 1,
         poll_lease_expires_at_ms: 9_999_999_999_999,

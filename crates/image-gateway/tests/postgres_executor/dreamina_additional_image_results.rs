@@ -13,7 +13,7 @@ use image_provider_sdk::Completed;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use std::str::FromStr;
 
-fn scope() -> ProviderTaskClaimScope {
+pub(super) fn scope() -> ProviderTaskClaimScope {
     ProviderTaskClaimScope {
         provider_id: DREAMINA_PROVIDER_ID.into(),
         provider_account_id: DREAMINA_ACCOUNT_ID,
@@ -59,7 +59,7 @@ async fn advance(pool: &PgPool, offset: i64) -> TestResult {
     Ok(())
 }
 
-async fn accepted(pool: &PgPool) -> TestResult<(WorkLease, Uuid)> {
+pub(super) async fn accepted(pool: &PgPool) -> TestResult<(WorkLease, Uuid)> {
     let work = seed_dreamina_generation_lease_for_profile(
         pool,
         "additional-worker",
@@ -224,16 +224,24 @@ async fn financial(pool: &PgPool, job: Uuid) -> TestResult<(i32, i64, i64, i64, 
 
 #[tokio::test]
 async fn additional_images_four_results_keep_one_capture_and_expire_as_a_group() -> TestResult {
-    verify_additional_images_group(0).await
+    verify_additional_images_group(0, 0).await
 }
 
 #[tokio::test]
 async fn additional_images_delayed_reducer_keeps_extras_until_original_customer_retention_ends()
 -> TestResult {
-    verify_additional_images_group(90_000_000).await
+    verify_additional_images_group(90_000_000, 0).await
 }
 
-async fn verify_additional_images_group(reducer_delay_ms: i64) -> TestResult {
+#[tokio::test]
+async fn accepted_tracking_additional_results_after_two_days_publish_and_cleanup() -> TestResult {
+    verify_additional_images_group(90_000_000, 49 * 60 * 60 * 1000).await
+}
+
+async fn verify_additional_images_group(
+    reducer_delay_ms: i64,
+    tracking_delay_ms: i64,
+) -> TestResult {
     let Some(mut database) = TestDatabase::new().await? else {
         return Ok(());
     };
@@ -241,6 +249,7 @@ async fn verify_additional_images_group(reducer_delay_ms: i64) -> TestResult {
         clock(&mut database).await?;
         let pool=&database.pool;
         let (work,submission)=accepted(pool).await?;
+        advance(pool,tracking_delay_ms).await?;
         let root=tempfile::tempdir().map_err(debug_error)?;
         let blobs=Arc::new(FilesystemArtifactBlobStore::new(root.path()).map_err(debug_error)?);
         let calls=Arc::new(AtomicUsize::new(0));
@@ -251,7 +260,7 @@ async fn verify_additional_images_group(reducer_delay_ms: i64) -> TestResult {
             .bind(submission).fetch_one(pool).await.map_err(debug_error)?;
         require(counts==(3,1,1),format!("physical/billable counts drifted:{counts:?}"))?;
         if reducer_delay_ms > 0 {
-            advance(pool,reducer_delay_ms).await?;
+            advance(pool,tracking_delay_ms+reducer_delay_ms).await?;
             let gc=PostgresArtifactRetentionStore::new(pool.clone());
             require(gc.claim_additional_images("delayed-reducer-cleanup",1000).await.map_err(debug_error)?.is_none(),"committed primary lost extras while customer reduction was pending")?;
         }
@@ -275,9 +284,9 @@ async fn verify_additional_images_group(reducer_delay_ms: i64) -> TestResult {
         }
         let gc=PostgresArtifactRetentionStore::new(pool.clone());
         require(gc.claim_additional_images("not-due",1000).await.map_err(debug_error)?.is_none(),"unexpired candidate claimed")?;
-        advance(pool,reducer_delay_ms+1800001).await?;
+        advance(pool,tracking_delay_ms+reducer_delay_ms+1800001).await?;
         require(reads.project_additional_image_results("executord-process-smoke","project-test",None,work.job_id).await.err().is_some(),"expired group silently shrank to no extras")?;
-        advance(pool,reducer_delay_ms+1900000).await?;
+        advance(pool,tracking_delay_ms+reducer_delay_ms+1900000).await?;
         let outcome=reconcile_artifact_retention(&gc,&blobs,"candidate-cleanup",1000,5).await.map_err(debug_error)?;
         require(outcome.deleted==2 && outcome.failed==0,format!("original and additional TTL cleanup failed:{outcome:?}"))?;
         require(financial(pool,work.job_id).await?==before,"cleanup changed bill")?;
@@ -382,6 +391,13 @@ async fn additional_images_unsealed_crash_intent_reclaims_only_fixed_extra_ids()
         let gc=PostgresArtifactRetentionStore::new(pool.clone());
         require(gc.claim_additional_images("early-cleanup",1000).await.map_err(debug_error)?.is_none(),"active stage intent expired early")?;
         advance(pool,90000000).await?;
+        require(gc.claim_additional_images("tracking-keeps-stage",1000).await.map_err(debug_error)?.is_none(),"tracking lost unfinished stage after 24h")?;
+        // A definite provider failure ends tracking and makes the expired orphan reclaimable.
+        let terminal_poll=tasks.claim_due(&scope(),"failed-stage-poll",60000).await.map_err(debug_error)?.ok_or("tracking poll missing")?;
+        tasks.record_observation(&terminal_poll,&gpt_image_2_gateway::provider_tasks::ProviderTaskObservation {
+            event_identity:"stage-definite-failure".into(),source:gpt_image_2_gateway::provider_tasks::ProviderTaskObservationSource::Poll,
+            outcome:gpt_image_2_gateway::provider_tasks::ProviderTaskObservationOutcome::Failed {error_code:"provider_rejected".into()},progress:None,
+        }).await.map_err(debug_error)?;
         let held=gc.claim_additional_images("dead-cleaner",1000).await.map_err(debug_error)?.ok_or("expired unsealed intent not claimed")?;
         require(held.stage_intent && held.staged_ids.len()==9,"orphan claim not bounded to fixed IDs")?;
         require(gc.claim_additional_images("parallel-cleaner",1000).await.map_err(debug_error)?.is_none(),"parallel GC stole live cleanup lease")?;

@@ -284,7 +284,7 @@ async fn resolve(
 #[tokio::test]
 async fn accepted_terminal_exact_failure_releases_once_and_preserves_originals() -> TestResult {
     let _ = tracing_subscriber::fmt().with_test_writer().try_init();
-    let Some(mut db) = TestDatabase::new().await? else {
+    let Some(mut db) = TestDatabase::new_through(1000, 166).await? else {
         return Ok(());
     };
     let result=async {
@@ -310,7 +310,7 @@ async fn accepted_terminal_exact_failure_releases_once_and_preserves_originals()
 #[tokio::test]
 async fn accepted_terminal_wrong_review_rolls_back_and_concurrent_replay_is_unique() -> TestResult {
     let _ = tracing_subscriber::fmt().with_test_writer().try_init();
-    let Some(mut db) = TestDatabase::new().await? else {
+    let Some(mut db) = TestDatabase::new_through(1000, 166).await? else {
         return Ok(());
     };
     let result = async {
@@ -366,7 +366,7 @@ async fn accepted_terminal_wrong_review_rolls_back_and_concurrent_replay_is_uniq
 #[tokio::test]
 async fn accepted_terminal_rejects_bad_query_and_rolls_back_late_failure() -> TestResult {
     let _ = tracing_subscriber::fmt().with_test_writer().try_init();
-    let Some(mut db) = TestDatabase::new().await? else {
+    let Some(mut db) = TestDatabase::new_through(1000, 166).await? else {
         return Ok(());
     };
     let result=async {
@@ -410,7 +410,7 @@ async fn accepted_terminal_video_get_exposes_only_audited_project_release() -> T
     };
     use tower::ServiceExt;
 
-    let Some(mut db) = TestDatabase::new().await? else {
+    let Some(mut db) = TestDatabase::new_through(1000, 166).await? else {
         return Ok(());
     };
     let result = async {

@@ -230,6 +230,7 @@ impl ArtifactRetentionStore for PostgresArtifactRetentionStore {
         let claimed: Option<(Uuid, i32)> = sqlx::query_as(
             r#"SELECT result_set.submission_id, result_set.returned_count
                FROM dreamina_image_result_sets result_set
+               JOIN provider_remote_tasks locked_task USING (submission_id, executor_execution_id)
                LEFT JOIN job_artifact_retention retention USING (job_id)
                WHERE ((result_set.cleanup_state = 'available'
                        AND result_set.retry_after_ms <= floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT)
@@ -245,8 +246,12 @@ impl ArtifactRetentionStore for PostgresArtifactRetentionStore {
                           AND NOT EXISTS (SELECT 1 FROM executor_result_manifests primary_manifest
                                           WHERE primary_manifest.submission_id = result_set.submission_id
                                             AND primary_manifest.executor_execution_id = result_set.executor_execution_id)))
+               AND NOT EXISTS (SELECT 1 FROM accepted_tracking_authorities tracking
+                                 JOIN provider_remote_tasks task USING (submission_id)
+                                 WHERE tracking.submission_id = result_set.submission_id
+                                   AND task.state = 'provider_waiting')
                ORDER BY result_set.cleanup_after_ms, result_set.submission_id
-               FOR UPDATE OF result_set SKIP LOCKED LIMIT 1"#,
+               FOR UPDATE OF locked_task, result_set SKIP LOCKED LIMIT 1"#,
         ).fetch_optional(&mut *tx).await.map_err(retention_unavailable)?;
         let Some((submission_id, returned_count)) = claimed else {
             tx.commit().await.map_err(retention_unavailable)?;
@@ -487,13 +492,18 @@ async fn claim_staged_images(
     let claimed: Option<(Uuid, Uuid)> = sqlx::query_as(
         r#"SELECT intent.submission_id, intent.executor_execution_id
            FROM dreamina_image_stage_intents intent
+           JOIN provider_remote_tasks locked_task USING (submission_id, executor_execution_id)
            WHERE NOT EXISTS (SELECT 1 FROM dreamina_image_result_sets result_set WHERE result_set.submission_id = intent.submission_id)
              AND ((intent.cleanup_state = 'available' AND intent.cleanup_after_ms <= floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT
                   AND intent.retry_after_ms <= floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT)
               OR (intent.cleanup_state = 'deleting' AND intent.cleanup_lease_expires_at_ms <= floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT)
              )
+           AND NOT EXISTS (SELECT 1 FROM accepted_tracking_authorities tracking
+                             JOIN provider_remote_tasks task USING (submission_id)
+                             WHERE tracking.submission_id = intent.submission_id
+                               AND task.state = 'provider_waiting')
            ORDER BY intent.cleanup_after_ms,intent.submission_id
-           FOR UPDATE OF intent SKIP LOCKED LIMIT 1"#,
+           FOR UPDATE OF locked_task, intent SKIP LOCKED LIMIT 1"#,
     ).fetch_optional(&mut *tx).await.map_err(retention_unavailable)?;
     let Some((submission_id, execution_id)) = claimed else {
         tx.commit().await.map_err(retention_unavailable)?;

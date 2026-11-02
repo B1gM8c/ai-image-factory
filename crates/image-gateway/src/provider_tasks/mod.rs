@@ -551,6 +551,7 @@ pub struct ProviderTaskLease {
     committed_artifact: Option<ProviderArtifactPublication>,
     remaining_budget_ms: u64,
     completion_deadline_at_ms: i64,
+    poll_attempt_deadline_at_ms: i64,
     pub poll_owner: String,
     pub poll_lease_epoch: i64,
     pub poll_lease_expires_at_ms: i64,
@@ -566,8 +567,13 @@ impl ProviderTaskLease {
         self.committed_artifact.as_ref()
     }
 
+    /// Remaining budget of this bounded query/download attempt, not task lifetime.
     pub fn remaining_budget_ms(&self) -> u64 {
         self.remaining_budget_ms
+    }
+
+    pub fn poll_attempt_deadline_at_ms(&self) -> i64 {
+        self.poll_attempt_deadline_at_ms
     }
 
     /// Completion authority is distinct from the immutable submit deadline.

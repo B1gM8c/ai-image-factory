@@ -28,6 +28,7 @@ use super::{
 mod additional_images;
 mod native_batch;
 
+const MAX_POLL_ATTEMPT_MS: i64 = 5 * 60 * 1_000;
 const MAX_POLL_AFTER_MS: i64 = 24 * 60 * 60 * 1_000;
 const MAX_LEASE_MS: i64 = 24 * 60 * 60 * 1_000;
 const MAX_PROVIDER_TIMEOUT_MS: i64 = 30 * 24 * 60 * 60 * 1_000;
@@ -2085,7 +2086,7 @@ impl ProviderTaskStore for PostgresProviderTaskStore {
         .await?;
         tx.commit().await.map_err(unavailable)?;
         Ok(ProviderTaskLease {
-            remaining_budget_ms: remaining_budget_ms(lease.completion_deadline_at_ms, now)?,
+            remaining_budget_ms: remaining_budget_ms(lease.poll_attempt_deadline_at_ms, now)?,
             poll_lease_expires_at_ms: expires,
             ..lease.clone()
         })
@@ -4757,20 +4758,28 @@ fn lease_from_row(row: ClaimRow) -> Result<ProviderTaskLease, ProviderTaskStoreE
         }
         _ => return Err(ProviderTaskStoreError::Conflict),
     };
+    let poll_attempt_deadline_at_ms = if completion_deadline_at_ms == i64::MAX {
+        claim_updated_at_ms.saturating_add(context.provider_timeout_ms.min(MAX_POLL_ATTEMPT_MS))
+    } else {
+        completion_deadline_at_ms
+    };
     let authority_seal = provider_task_lease_authority_seal(
         &task,
         &context,
         completion_deadline_at_ms,
+        poll_attempt_deadline_at_ms,
         &poll_owner,
         poll_lease_epoch,
     );
-    let remaining_budget_ms = remaining_budget_ms(completion_deadline_at_ms, claim_updated_at_ms)?;
+    let remaining_budget_ms =
+        remaining_budget_ms(poll_attempt_deadline_at_ms, claim_updated_at_ms)?;
     Ok(ProviderTaskLease {
         task,
         context,
         committed_artifact,
         remaining_budget_ms,
         completion_deadline_at_ms,
+        poll_attempt_deadline_at_ms,
         poll_owner,
         poll_lease_epoch,
         poll_lease_expires_at_ms,
@@ -4951,12 +4960,15 @@ fn validate_lease(lease: &ProviderTaskLease, lease_ms: i64) -> Result<(), Provid
         || lease.poll_lease_epoch <= 0
         || lease.task.poll_lease_epoch != lease.poll_lease_epoch
         || lease.completion_deadline_at_ms < lease.context.provider_deadline_at_ms
+        || lease.poll_attempt_deadline_at_ms > lease.completion_deadline_at_ms
+        || lease.poll_attempt_deadline_at_ms <= 0
         || !valid_owner(&lease.poll_owner)
         || lease.authority_seal
             != provider_task_lease_authority_seal(
                 &lease.task,
                 &lease.context,
                 lease.completion_deadline_at_ms,
+                lease.poll_attempt_deadline_at_ms,
                 &lease.poll_owner,
                 lease.poll_lease_epoch,
             )
@@ -5001,6 +5013,7 @@ fn provider_task_lease_authority_seal(
     task: &ProviderRemoteTask,
     context: &ProviderExecutionContext,
     completion_deadline_at_ms: i64,
+    poll_attempt_deadline_at_ms: i64,
     poll_owner: &str,
     poll_lease_epoch: i64,
 ) -> [u8; 32] {
@@ -5014,7 +5027,7 @@ fn provider_task_lease_authority_seal(
     };
     let cancel_requested = [u8::from(task.cancel_requested)];
     authority_seal(
-        b"ai-image-factory/provider-task-lease/v3\0",
+        b"ai-image-factory/provider-task-lease/v4\0",
         &[
             task.submission_id.as_bytes(),
             task.executor_execution_id.as_bytes(),
@@ -5028,7 +5041,8 @@ fn provider_task_lease_authority_seal(
             context.execution_binding_sha256.as_bytes(),
             &context.provider_deadline_at_ms.to_be_bytes(),
             &completion_deadline_at_ms.to_be_bytes(),
-            // Policy 1 is the only audited completion extension in this schema.
+            &poll_attempt_deadline_at_ms.to_be_bytes(),
+            // Completion authority never renews the frozen submit authority.
             &[u8::from(
                 completion_deadline_at_ms != context.provider_deadline_at_ms,
             )],
@@ -5537,6 +5551,7 @@ mod tests {
             committed_artifact: None,
             remaining_budget_ms: 60_000,
             completion_deadline_at_ms: 9_999_999_999_999,
+            poll_attempt_deadline_at_ms: 9_999_999_999_999,
             poll_owner: "artifact-test-poll".to_owned(),
             poll_lease_epoch: 1,
             poll_lease_expires_at_ms: 9_999_999_999_999,
@@ -5552,6 +5567,7 @@ mod tests {
             &lease.task,
             &lease.context,
             lease.completion_deadline_at_ms,
+            lease.poll_attempt_deadline_at_ms,
             &lease.poll_owner,
             lease.poll_lease_epoch,
         );
@@ -5560,7 +5576,7 @@ mod tests {
             lease.completion_deadline_at_ms(),
             lease.context.provider_deadline_at_ms + 86_400_000
         );
-        for change in 0..5 {
+        for change in 0..6 {
             let mut altered = lease.clone();
             match change {
                 0 => altered.completion_deadline_at_ms += 1,
@@ -5568,6 +5584,7 @@ mod tests {
                 2 => altered.context.provider_deadline_at_ms += 1,
                 3 => altered.task.remote_operation_id.push_str("-other"),
                 4 => altered.context.execution_binding_sha256 = "f".repeat(64),
+                5 => altered.poll_attempt_deadline_at_ms -= 1,
                 _ => unreachable!(),
             }
             assert_eq!(
@@ -5581,6 +5598,7 @@ mod tests {
             &lease.task,
             &lease.context,
             lease.completion_deadline_at_ms,
+            lease.poll_attempt_deadline_at_ms,
             &lease.poll_owner,
             lease.poll_lease_epoch,
         );
