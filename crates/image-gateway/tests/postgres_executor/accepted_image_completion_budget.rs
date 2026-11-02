@@ -337,7 +337,7 @@ async fn settle_images(
 
 #[tokio::test]
 async fn accepted_single_image_keeps_original_id_after_ten_minutes_and_nine_hours() -> TestResult {
-    let Some(mut database) = TestDatabase::new().await? else {
+    let Some(mut database) = TestDatabase::new_through(1000, 166).await? else {
         return Ok(());
     };
     let result=async {
@@ -397,8 +397,12 @@ async fn accepted_single_image_keeps_original_id_after_ten_minutes_and_nine_hour
 #[tokio::test]
 async fn accepted_native_images_materialize_after_ten_minutes_and_settle_each_output_once()
 -> TestResult {
+    native_images_complete(166, 9 * 60 * 60 * 1000).await
+}
+
+pub(super) async fn native_images_complete(version: i64, elapsed_ms: i64) -> TestResult {
     for (count, delivered) in [(2, 2), (3, 2), (10, 10)] {
-        let Some(mut database) = TestDatabase::new().await? else {
+        let Some(mut database) = TestDatabase::new_through(1000, version).await? else {
             return Ok(());
         };
         let result=async {
@@ -406,7 +410,7 @@ async fn accepted_native_images_materialize_after_ten_minutes_and_settle_each_ou
             let pool=&database.pool;
             let image=accepted_image(pool,count,ORIGINAL_TIMEOUT_MS,true,true).await?;
             let frozen=immutable_submit_fingerprint(pool,image.submission_id).await?;
-            advance_clock(pool,9*60*60*1000).await?;
+            advance_clock(pool,elapsed_ms).await?;
             let artifacts=tempfile::tempdir().map_err(debug_error)?;
             let blobs=Arc::new(FilesystemArtifactBlobStore::new(artifacts.path()).map_err(debug_error)?);
             let calls=Arc::new(AtomicUsize::new(0));
@@ -454,14 +458,18 @@ async fn accepted_native_images_materialize_after_ten_minutes_and_settle_each_ou
 #[tokio::test]
 async fn native_follower_partial_publication_replays_after_store_restart_with_leader_budget()
 -> TestResult {
-    let Some(mut database) = TestDatabase::new().await? else {
+    native_partial(166, ORIGINAL_TIMEOUT_MS + 1000).await
+}
+
+pub(super) async fn native_partial(version: i64, elapsed_ms: i64) -> TestResult {
+    let Some(mut database) = TestDatabase::new_through(1000, version).await? else {
         return Ok(());
     };
     let result=async {
         controlled_clock(&mut database).await?;
         let pool=&database.pool;
         let image=accepted_image(pool,3,ORIGINAL_TIMEOUT_MS,true,true).await?;
-        advance_clock(pool,ORIGINAL_TIMEOUT_MS+1000).await?;
+        advance_clock(pool,elapsed_ms).await?;
         let tasks=PostgresProviderTaskStore::new(pool.clone());
         let poll=tasks.claim_due(&scope(),"partial-native-image-poller",60_000).await.map_err(debug_error)?
             .ok_or("late native leader was not claimable")?;
@@ -492,7 +500,7 @@ async fn native_follower_partial_publication_replays_after_store_restart_with_le
 #[tokio::test]
 async fn accepted_image_completion_expiry_keeps_unknown_hold_and_quota_without_resubmit()
 -> TestResult {
-    let Some(mut database) = TestDatabase::new().await? else {
+    let Some(mut database) = TestDatabase::new_through(1000, 166).await? else {
         return Ok(());
     };
     let result=async {
@@ -565,6 +573,10 @@ pub(super) async fn database_before_image_completion_budget() -> TestResult<Opti
                 .collect(),
         );
         migrations.run(&database.pool).await.map_err(debug_error)?;
+        // Current admission reads capacity waivers introduced in 166. The historical
+        // schema has none; this fixture-only identity is removed before upgrading.
+        sqlx::query("CREATE FUNCTION executor_waived_held_count(UUID,BIGINT) RETURNS INTEGER LANGUAGE SQL IMMUTABLE AS 'SELECT 0'")
+            .execute(&database.pool).await.map_err(debug_error)?;
         seed_execution_profiles(&database.pool).await
     }
     .await;
@@ -613,7 +625,16 @@ async fn migration_147_backfills_only_original_accepted_unleased_live_image_wind
             let before:(i64,i64,i64)=sqlx::query_as("SELECT (SELECT max(version) FROM _sqlx_migrations),(SELECT count(*) FROM provider_task_observations),(SELECT count(*) FROM provider_remote_tasks)")
                 .fetch_one(pool).await.map_err(debug_error)?;
             require(before.0==146,"image history fixture did not use real migration 146")?;
-            run_migrations(pool).await.map_err(debug_error)?;
+            sqlx::query("DROP FUNCTION executor_waived_held_count(UUID,BIGINT)")
+                .execute(pool).await.map_err(debug_error)?;
+            // This fixture exercises the historical 143/147 budget upgrade, not
+            // the separately tested drained 167 tracking-authority transition.
+            let mut migrations = sqlx::migrate!("./migrations");
+            migrations.migrations = Cow::Owned(migrations.iter().filter(|migration| migration.version <= 166).cloned().collect());
+            migrations.run(pool).await.map_err(debug_error)?;
+            let restored: (i64, bool) = sqlx::query_as("SELECT (SELECT max(version) FROM _sqlx_migrations), position('executor_capacity_risk_waivers' in pg_get_functiondef('executor_waived_held_count(uuid,bigint)'::regprocedure)) > 0")
+                .fetch_one(pool).await.map_err(debug_error)?;
+            require(restored == (166, true), "historical upgrade retained a fixture stub or crossed its version boundary")?;
             let grants:Vec<(Uuid,i64,i64,i64,String)>=sqlx::query_as("SELECT submission_id,original_submit_deadline_at_ms,accepted_at_ms,completion_deadline_at_ms,grant_source FROM accepted_completion_budgets")
                 .fetch_all(pool).await.map_err(debug_error)?;
             if matches!(scenario,"single"|"native") {
@@ -643,7 +664,7 @@ async fn migration_147_backfills_only_original_accepted_unleased_live_image_wind
 
 #[tokio::test]
 async fn longer_original_image_deadline_is_preserved_and_lease_seal_remains_bound() -> TestResult {
-    let Some(mut database) = TestDatabase::new().await? else {
+    let Some(mut database) = TestDatabase::new_through(1000, 166).await? else {
         return Ok(());
     };
     let result = async {

@@ -301,10 +301,20 @@ where
         let operation = self.driver.poll(&call, &mut sink);
         let poll_budget = Duration::from_millis(lease.remaining_budget_ms());
         let poll_deadline = claim_started_at + poll_budget;
-        let (lease, result) =
-            tokio::time::timeout_at(poll_deadline, self.run_with_heartbeat(lease, operation))
-                .await
-                .map_err(|_| ProviderPollOrchestratorError::ProviderDeadlineElapsed)??;
+        let (lease, result) = match tokio::time::timeout_at(
+            poll_deadline,
+            self.run_with_heartbeat(lease.clone(), operation),
+        )
+        .await
+        {
+            Ok(result) => result?,
+            Err(_) => {
+                // The canceled future cannot publish. Keep the original remote ID;
+                // the normal observation CAS releases only this poll epoch.
+                drop(sink);
+                return self.record_attempt_timeout(&lease).await;
+            }
+        };
         let task = self.resolve_poll_result(&lease, sink, result).await?;
         Ok(ProviderPollRun::Observed(task))
     }
@@ -326,10 +336,18 @@ where
         );
         let operation = Box::pin(self.driver.poll_with_additional_images(&call, &mut sink));
         let deadline = claim_started_at + Duration::from_millis(lease.remaining_budget_ms());
-        let (renewed, result) =
-            tokio::time::timeout_at(deadline, self.run_with_heartbeat(lease.clone(), operation))
-                .await
-                .map_err(|_| ProviderPollOrchestratorError::ProviderDeadlineElapsed)??;
+        let (renewed, result) = match tokio::time::timeout_at(
+            deadline,
+            self.run_with_heartbeat(lease.clone(), operation),
+        )
+        .await
+        {
+            Ok(result) => result?,
+            Err(_) => {
+                drop(sink);
+                return self.record_attempt_timeout(&lease).await;
+            }
+        };
         let task = match result {
             Ok(PollObservation::Completed(completed)) => {
                 let staged = match sink.finish(completed.artifact()) {
@@ -443,10 +461,18 @@ where
                 .poll_native_batch(&call, members.len(), &mut sink),
         );
         let deadline = claim_started_at + Duration::from_millis(lease.remaining_budget_ms());
-        let (renewed, result) =
-            tokio::time::timeout_at(deadline, self.run_with_heartbeat(lease.clone(), operation))
-                .await
-                .map_err(|_| ProviderPollOrchestratorError::ProviderDeadlineElapsed)??;
+        let (renewed, result) = match tokio::time::timeout_at(
+            deadline,
+            self.run_with_heartbeat(lease.clone(), operation),
+        )
+        .await
+        {
+            Ok(result) => result?,
+            Err(_) => {
+                drop(sink);
+                return self.record_attempt_timeout(&lease).await;
+            }
+        };
         let task = match result {
             Ok(ProviderNativeBatchPollObservation::Pending { next_poll_after_ms })
                 if sink.is_pristine() =>
@@ -762,6 +788,20 @@ where
                 }
             }
         }
+    }
+
+    async fn record_attempt_timeout(
+        &self,
+        lease: &ProviderTaskLease,
+    ) -> Result<ProviderPollRun, ProviderPollOrchestratorError> {
+        if lease.completion_deadline_at_ms() <= lease.poll_attempt_deadline_at_ms() {
+            // Legacy task-lifetime expiry keeps its existing quarantine path.
+            return Err(ProviderPollOrchestratorError::ProviderDeadlineElapsed);
+        }
+        let task = self
+            .record_waiting(lease, DEFAULT_BACKOFF_POLL_AFTER_MS as i64)
+            .await?;
+        Ok(ProviderPollRun::Observed(task))
     }
 
     async fn record_waiting(

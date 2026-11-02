@@ -81,15 +81,19 @@ pub(super) async fn advance_clock(pool: &PgPool, offset_ms: i64) -> TestResult {
     )
 }
 
-struct AcceptedVideo {
-    job_id: Uuid,
-    submission_id: Uuid,
-    original_deadline_at_ms: i64,
-    accepted_at_ms: i64,
-    remote_operation_id: String,
+pub(super) struct AcceptedVideo {
+    pub(super) job_id: Uuid,
+    pub(super) submission_id: Uuid,
+    pub(super) original_deadline_at_ms: i64,
+    pub(super) accepted_at_ms: i64,
+    pub(super) remote_operation_id: String,
 }
 
-async fn accepted_video(pool: &PgPool, timeout_ms: i64, v4: bool) -> TestResult<AcceptedVideo> {
+pub(super) async fn accepted_video(
+    pool: &PgPool,
+    timeout_ms: i64,
+    v4: bool,
+) -> TestResult<AcceptedVideo> {
     let work = seed_dreamina_video_generation_lease_for_profile(
         pool,
         "completion-budget-worker",
@@ -214,7 +218,10 @@ async fn accepted_video(pool: &PgPool, timeout_ms: i64, v4: bool) -> TestResult<
     })
 }
 
-async fn immutable_submit_fingerprint(pool: &PgPool, submission_id: Uuid) -> TestResult<String> {
+pub(super) async fn immutable_submit_fingerprint(
+    pool: &PgPool,
+    submission_id: Uuid,
+) -> TestResult<String> {
     sqlx::query_scalar(
         "SELECT encode(sha256(convert_to((jsonb_build_object(\
              'intent',to_jsonb(intent),'recovery',to_jsonb(recovery)))::TEXT,'UTF8')),'hex') \
@@ -230,7 +237,7 @@ async fn immutable_submit_fingerprint(pool: &PgPool, submission_id: Uuid) -> Tes
 #[tokio::test]
 async fn accepted_video_completes_after_original_submit_deadline_without_resubmitting() -> TestResult
 {
-    let Some(mut database) = TestDatabase::new().await? else {
+    let Some(mut database) = TestDatabase::new_through(1000, 166).await? else {
         return Ok(());
     };
     let result = async {
@@ -302,7 +309,7 @@ async fn accepted_video_completes_after_original_submit_deadline_without_resubmi
 
 #[tokio::test]
 async fn completion_budget_expires_once_without_refunding_unknown_generation() -> TestResult {
-    let Some(mut database) = TestDatabase::new().await? else {
+    let Some(mut database) = TestDatabase::new_through(1000, 166).await? else {
         return Ok(());
     };
     let result = async {
@@ -361,7 +368,7 @@ async fn completion_budget_expires_once_without_refunding_unknown_generation() -
 
 #[tokio::test]
 async fn non_v4_video_and_longer_original_budget_do_not_receive_an_extension() -> TestResult {
-    let Some(mut database) = TestDatabase::new().await? else {
+    let Some(mut database) = TestDatabase::new_through(1000, 166).await? else {
         return Ok(());
     };
     let result = async {
@@ -409,7 +416,7 @@ async fn non_v4_video_and_longer_original_budget_do_not_receive_an_extension() -
 
 #[tokio::test]
 async fn sixty_four_expired_tasks_do_not_hide_the_next_live_accepted_video() -> TestResult {
-    let Some(mut database) = TestDatabase::new().await? else {
+    let Some(mut database) = TestDatabase::new_through(1000, 166).await? else {
         return Ok(());
     };
     let result=async {
@@ -462,6 +469,10 @@ async fn database_before_completion_budget() -> TestResult<Option<TestDatabase>>
         let mut migrations = sqlx::migrate!("./migrations");
         migrations.migrations = Cow::Owned(migrations.iter().filter(|migration| migration.version<=142).cloned().collect());
         migrations.run(&database.pool).await.map_err(debug_error)?;
+        // Current admission reads capacity waivers introduced in 166. The historical
+        // schema has none; this fixture-only identity is removed before upgrading.
+        sqlx::query("CREATE FUNCTION executor_waived_held_count(UUID,BIGINT) RETURNS INTEGER LANGUAGE SQL IMMUTABLE AS 'SELECT 0'")
+            .execute(&database.pool).await.map_err(debug_error)?;
         seed_execution_profiles(&database.pool).await?;
         // Current store reads select the effective deadline. This identity-only
         // compatibility function reproduces 142 behavior for legal fixture setup;
@@ -515,7 +526,16 @@ async fn historical_upgrade_grants_only_eligible_original_acceptance_windows() -
             require(before_version==142,"historical fixture did not use the real 142 schema")?;
             sqlx::query("DROP FUNCTION provider_task_completion_deadline(UUID,BIGINT)")
                 .execute(pool).await.map_err(debug_error)?;
-            run_migrations(pool).await.map_err(debug_error)?;
+            sqlx::query("DROP FUNCTION executor_waived_held_count(UUID,BIGINT)")
+                .execute(pool).await.map_err(debug_error)?;
+            // This fixture exercises the historical 143/147 budget upgrade, not
+            // the separately tested drained 167 tracking-authority transition.
+            let mut migrations = sqlx::migrate!("./migrations");
+            migrations.migrations = Cow::Owned(migrations.iter().filter(|migration| migration.version <= 166).cloned().collect());
+            migrations.run(pool).await.map_err(debug_error)?;
+            let restored: (i64, bool) = sqlx::query_as("SELECT (SELECT max(version) FROM _sqlx_migrations), position('executor_capacity_risk_waivers' in pg_get_functiondef('executor_waived_held_count(uuid,bigint)'::regprocedure)) > 0")
+                .fetch_one(pool).await.map_err(debug_error)?;
+            require(restored == (166, true), "historical upgrade retained a fixture stub or crossed its version boundary")?;
             let applied: bool = sqlx::query_scalar(
                 "SELECT EXISTS(SELECT 1 FROM _sqlx_migrations WHERE version=143 AND success)",
             )

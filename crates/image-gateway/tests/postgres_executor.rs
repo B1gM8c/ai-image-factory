@@ -107,6 +107,9 @@ mod accepted_image_completion_budget;
 #[path = "postgres_executor/accepted_completion_budget.rs"]
 mod accepted_completion_budget;
 
+#[path = "postgres_executor/accepted_tracking.rs"]
+mod accepted_tracking;
+
 const TEST_PROFILE_ID: Uuid = Uuid::from_u128(0x100);
 const CODEX_PROFILE_ID: Uuid = Uuid::from_u128(0x200);
 const CODEX_EDIT_PROFILE_ID: Uuid = Uuid::from_u128(0xe00);
@@ -10449,6 +10452,10 @@ impl TestDatabase {
     }
 
     async fn new_with_capacity(capacity: i32) -> TestResult<Option<Self>> {
+        Self::new_through(capacity, i64::MAX).await
+    }
+
+    async fn new_through(capacity: i32, version: i64) -> TestResult<Option<Self>> {
         let Some(url) = env::var("TEST_DATABASE_URL")
             .ok()
             .filter(|value| !value.trim().is_empty())
@@ -10475,7 +10482,15 @@ impl TestDatabase {
             .execute(&pool)
             .await
             .map_err(debug_error)?;
-        if let Err(error) = run_migrations(&pool).await {
+        let migrations = sqlx::migrate!("./migrations");
+        let migrations = sqlx::migrate::Migrator::with_migrations(
+            migrations
+                .iter()
+                .filter(|migration| migration.version <= version)
+                .cloned()
+                .collect(),
+        );
+        if let Err(error) = migrations.run(&pool).await {
             let _ = sqlx::query(AssertSqlSafe(format!("DROP SCHEMA \"{schema}\" CASCADE")))
                 .execute(&pool)
                 .await;

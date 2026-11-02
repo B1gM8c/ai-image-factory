@@ -49,7 +49,8 @@ pub struct ProviderPollDriverCall {
     provider_account_id: Uuid,
     operation: RemoteOperationRef,
     context: ProviderExecutionContext,
-    completion_deadline_at_ms: i64,
+    poll_attempt_deadline_at_ms: i64,
+    poll_attempt_budget_ms: u64,
 }
 
 impl ProviderPollDriverCall {
@@ -75,7 +76,13 @@ impl ProviderPollDriverCall {
             provider_account_id: lease.task.provider_account_id,
             operation,
             context,
-            completion_deadline_at_ms: lease.completion_deadline_at_ms(),
+            poll_attempt_deadline_at_ms: lease.poll_attempt_deadline_at_ms(),
+            poll_attempt_budget_ms: if lease.completion_deadline_at_ms() == i64::MAX {
+                lease.remaining_budget_ms()
+            } else {
+                u64::try_from(lease.context().provider_timeout_ms())
+                    .map_err(|_| ProviderPollDriverCallError)?
+            },
         })
     }
 
@@ -94,9 +101,8 @@ impl ProviderPollDriverCall {
     fn invocation_context(&self) -> Result<InvocationContext<'_>, ProviderPollDriverCallError> {
         let attempt = u32::try_from(self.context.invocation_attempt())
             .map_err(|_| ProviderPollDriverCallError)?;
-        let timeout = u64::try_from(self.context.provider_timeout_ms())
-            .map_err(|_| ProviderPollDriverCallError)?;
-        let deadline = u64::try_from(self.completion_deadline_at_ms)
+        let timeout = self.poll_attempt_budget_ms;
+        let deadline = u64::try_from(self.poll_attempt_deadline_at_ms)
             .map_err(|_| ProviderPollDriverCallError)?;
         InvocationContext::new(
             &self.submission_id,
@@ -184,15 +190,23 @@ mod tests {
     fn poll_invocation_uses_completion_budget_and_keeps_submit_context_frozen() {
         let mut lease = super::super::tests::lease(None);
         lease.context.provider_deadline_at_ms = 1;
-        lease.completion_deadline_at_ms = 86_400_001;
+        lease.completion_deadline_at_ms = i64::MAX;
+        lease.poll_attempt_deadline_at_ms = 86_400_001;
+        lease.remaining_budget_ms = 5_000;
         let call = ProviderPollDriverCall::new(&lease).unwrap();
         assert_eq!(call.execution_context().provider_deadline_at_ms(), 1);
         let invocation = call.invocation_context().unwrap();
         assert_eq!(invocation.provider_deadline_unix_ms(), 86_400_001);
-        assert_eq!(
-            invocation.provider_timeout_ms(),
-            lease.context.provider_timeout_ms() as u64,
-        );
+        assert_eq!(invocation.provider_timeout_ms(), 5_000);
+        assert_eq!(call.execution_context().provider_timeout_ms(), 60_000);
+        // A bounded legacy completion window must not extend one SDK request.
+        lease.completion_deadline_at_ms = 86_400_001;
+        lease.remaining_budget_ms = 86_400_000;
+        lease.context.provider_timeout_ms = 10_000;
+        let legacy = ProviderPollDriverCall::new(&lease).unwrap();
+        let invocation = legacy.invocation_context().unwrap();
+        assert_eq!(invocation.provider_timeout_ms(), 10_000);
+        assert_eq!(invocation.provider_deadline_unix_ms(), 86_400_001);
         lease.completion_deadline_at_ms = 0;
         assert!(ProviderPollDriverCall::new(&lease).is_err());
     }

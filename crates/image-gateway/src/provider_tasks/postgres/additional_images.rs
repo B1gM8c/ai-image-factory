@@ -108,7 +108,9 @@ async fn lock_image_task(
 ) -> Result<(Uuid, i64, i64), ProviderTaskStoreError> {
     let locked: Option<(Uuid, i64, i64)> = sqlx::query_as(
         r#"SELECT submission.job_id,
-              provider_task_completion_deadline(task.submission_id, task.provider_deadline_at_ms),
+              CASE WHEN provider_task_completion_deadline(task.submission_id, task.provider_deadline_at_ms) = 9223372036854775807
+                   THEN floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT
+                   ELSE provider_task_completion_deadline(task.submission_id, task.provider_deadline_at_ms) END,
               floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT
            FROM provider_remote_tasks task
            JOIN provider_submissions submission USING (submission_id, executor_execution_id)
