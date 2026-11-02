@@ -219,7 +219,13 @@ async fn main() -> Result<(), ImageGatewayError> {
     let workspace_root = WorkingDirectory::new_private(&config.workspace_root)
         .map_err(|error| ImageGatewayError::config(error.to_string()))?;
     let artifact_root = artifact_root_from_env()?;
-    validate_isolated_roots(&artifact_root, &config.account_home, &config.workspace_root)?;
+    let capacity_workspace_root = prepare_capacity_workspace(&workspace_root)?;
+    validate_isolated_roots(
+        &artifact_root,
+        &config.account_home,
+        workspace_root.path(),
+        capacity_workspace_root.path(),
+    )?;
     let artifacts = Arc::new(FilesystemArtifactBlobStore::new(artifact_root)?);
     let stagers = FilesystemProviderArtifactStagerFactory::new(
         Arc::clone(&artifacts),
@@ -239,31 +245,13 @@ async fn main() -> Result<(), ImageGatewayError> {
         ),
     )
     .map_err(|error| ImageGatewayError::config(error.to_string()))?;
-    // This workspace has its own exclusive lock; normal polling retains its root.
-    let capacity_workspace_path = config.workspace_root.join("capacity-reconciliation");
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        match std::fs::DirBuilder::new()
-            .mode(0o700)
-            .create(&capacity_workspace_path)
-        {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(_) => {
-                return Err(ImageGatewayError::config(
-                    "capacity query workspace unavailable",
-                ));
-            }
-        }
-    }
     let capacity_driver = DreaminaCliCapacityQueryDriverV1::from_runtime_profile(
         &profile,
         &account_home,
         DreaminaCliPollProcessConfig::new(
             &config.executable,
             config.executable_sha256,
-            WorkingDirectory::new_private(&capacity_workspace_path)
-                .map_err(|error| ImageGatewayError::config(error.to_string()))?,
+            capacity_workspace_root,
             config.cli_wall_timeout.min(Duration::from_secs(20)),
             config.cli_termination_grace,
             config.max_artifact_bytes,
@@ -366,18 +354,58 @@ async fn main() -> Result<(), ImageGatewayError> {
     Ok(())
 }
 
+// Each exclusive workspace owns its entire directory, including startup cleanup.
+// Keep capacity attempts beside normal polling, never inside its namespace.
+fn prepare_capacity_workspace(
+    workspace_root: &WorkingDirectory,
+) -> Result<WorkingDirectory, ImageGatewayError> {
+    use std::os::unix::fs::DirBuilderExt;
+
+    let mut name = workspace_root
+        .path()
+        .file_name()
+        .ok_or_else(|| ImageGatewayError::config("poll workspace must have a directory name"))?
+        .to_os_string();
+    name.push(".capacity-reconciliation");
+    let path = workspace_root.path().with_file_name(name);
+    match std::fs::DirBuilder::new().mode(0o700).create(&path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(_) => {
+            return Err(ImageGatewayError::config(
+                "capacity query workspace unavailable",
+            ));
+        }
+    }
+    let workspace = WorkingDirectory::new_private(&path)
+        .map_err(|error| ImageGatewayError::config(error.to_string()))?;
+    // The parent is already canonical; an existing child must not alias another root.
+    if workspace.path() != path {
+        return Err(ImageGatewayError::config(
+            "capacity query workspace must not be a symbolic link",
+        ));
+    }
+    Ok(workspace)
+}
+
 fn validate_isolated_roots(
     artifact_root: &std::path::Path,
     account_home: &std::path::Path,
     workspace_root: &std::path::Path,
+    capacity_workspace_root: &std::path::Path,
 ) -> Result<(), ImageGatewayError> {
-    let roots = [artifact_root, account_home, workspace_root]
-        .map(|path| {
-            std::fs::canonicalize(path)
-                .map_err(|_| ImageGatewayError::config("provider-pollerd root is unavailable"))
-        })
-        .into_iter()
-        .collect::<Result<Vec<_>, _>>()?;
+    let roots = [
+        artifact_root,
+        account_home,
+        workspace_root,
+        capacity_workspace_root,
+    ]
+    .map(|path| {
+        std::fs::canonicalize(path)
+            .map_err(|_| ImageGatewayError::config("provider-pollerd root is unavailable"))
+    })
+    .into_iter()
+    .collect::<Result<Vec<_>, _>>()?;
     for left in 0..roots.len() {
         for right in left + 1..roots.len() {
             if roots[left].starts_with(&roots[right]) || roots[right].starts_with(&roots[left]) {
@@ -533,7 +561,14 @@ async fn shutdown_signal() {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, os::unix::fs::symlink};
+    use std::{
+        fs,
+        os::unix::fs::{DirBuilderExt, PermissionsExt, symlink},
+    };
+
+    use image_cli_runtime::{
+        ATTEMPT_WORKSPACE_LOCK_FILENAME, AttemptWorkspaceError, ExclusiveAttemptWorkspace,
+    };
 
     use super::*;
 
@@ -543,17 +578,135 @@ mod tests {
         let artifact = root.path().join("artifact");
         let account = root.path().join("account");
         let workspace = root.path().join("workspace");
-        for path in [&artifact, &account, &workspace] {
+        let capacity = root.path().join("workspace.capacity-reconciliation");
+        for path in [&artifact, &account, &workspace, &capacity] {
             fs::create_dir(path).unwrap();
         }
-        assert!(validate_isolated_roots(&artifact, &account, &workspace).is_ok());
+        assert!(validate_isolated_roots(&artifact, &account, &workspace, &capacity).is_ok());
 
         let nested = artifact.join("nested-account");
         fs::create_dir(&nested).unwrap();
-        assert!(validate_isolated_roots(&artifact, &nested, &workspace).is_err());
+        assert!(validate_isolated_roots(&artifact, &nested, &workspace, &capacity).is_err());
 
         let account_alias = root.path().join("account-alias");
         symlink(&account, &account_alias).unwrap();
-        assert!(validate_isolated_roots(&artifact, &account, &account_alias).is_err());
+        assert!(validate_isolated_roots(&artifact, &account, &workspace, &account_alias).is_err());
+    }
+
+    fn private_root(path: &std::path::Path) -> WorkingDirectory {
+        fs::DirBuilder::new().mode(0o700).create(path).unwrap();
+        WorkingDirectory::new_private(path).unwrap()
+    }
+
+    #[test]
+    fn sibling_workspaces_start_and_restart_with_independent_cleanup() {
+        let root = tempfile::tempdir().unwrap();
+        let poll = private_root(&root.path().join("poll"));
+        let capacity = prepare_capacity_workspace(&poll).unwrap();
+        assert_eq!(
+            capacity.path(),
+            poll.path().with_file_name("poll.capacity-reconciliation")
+        );
+        assert_eq!(
+            fs::metadata(capacity.path()).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        {
+            let poll_owner = ExclusiveAttemptWorkspace::acquire(&poll, ".dreamina-poll-").unwrap();
+            let capacity_owner =
+                ExclusiveAttemptWorkspace::acquire(&capacity, ".dreamina-capacity-query-").unwrap();
+            let poll_attempt = poll_owner.create_attempt().unwrap();
+            let capacity_attempt = capacity_owner.create_attempt().unwrap();
+            assert!(poll_attempt.path().starts_with(poll.path()));
+            assert!(capacity_attempt.path().starts_with(capacity.path()));
+        }
+        // Crash residue from each driver must be cleaned only by its own next owner.
+        private_root(&poll.path().join(".dreamina-poll-crash"));
+        private_root(&capacity.path().join(".dreamina-capacity-query-crash"));
+        let restarted_capacity = prepare_capacity_workspace(&poll).unwrap();
+        let poll_owner = ExclusiveAttemptWorkspace::acquire(&poll, ".dreamina-poll-").unwrap();
+        assert!(
+            capacity
+                .path()
+                .join(".dreamina-capacity-query-crash")
+                .exists()
+        );
+        let capacity_owner =
+            ExclusiveAttemptWorkspace::acquire(&restarted_capacity, ".dreamina-capacity-query-")
+                .unwrap();
+        assert_eq!(poll_owner.cleaned_attempts(), 1);
+        assert_eq!(capacity_owner.cleaned_attempts(), 1);
+    }
+
+    #[test]
+    fn sibling_workspaces_keep_exclusive_locks_independent() {
+        let root = tempfile::tempdir().unwrap();
+        let poll = private_root(&root.path().join("poll"));
+        let capacity = prepare_capacity_workspace(&poll).unwrap();
+        let poll_owner = ExclusiveAttemptWorkspace::acquire(&poll, ".dreamina-poll-").unwrap();
+        let capacity_owner =
+            ExclusiveAttemptWorkspace::acquire(&capacity, ".dreamina-capacity-query-").unwrap();
+        for (workspace, prefix) in [
+            (&poll, ".dreamina-poll-"),
+            (&capacity, ".dreamina-capacity-query-"),
+        ] {
+            assert!(matches!(
+                ExclusiveAttemptWorkspace::acquire(workspace, prefix),
+                Err(AttemptWorkspaceError::AlreadyLocked)
+            ));
+        }
+        drop(poll_owner);
+        let _poll_owner = ExclusiveAttemptWorkspace::acquire(&poll, ".dreamina-poll-").unwrap();
+        assert!(matches!(
+            ExclusiveAttemptWorkspace::acquire(&capacity, ".dreamina-capacity-query-"),
+            Err(AttemptWorkspaceError::AlreadyLocked)
+        ));
+        drop(capacity_owner);
+    }
+
+    #[test]
+    fn legacy_nested_workspace_is_preserved_and_requires_explicit_migration() {
+        let root = tempfile::tempdir().unwrap();
+        let poll = private_root(&root.path().join("poll"));
+        let first_owner = ExclusiveAttemptWorkspace::acquire(&poll, ".dreamina-poll-").unwrap();
+        let legacy_path = poll.path().join("capacity-reconciliation");
+        let legacy = private_root(&legacy_path);
+        drop(ExclusiveAttemptWorkspace::acquire(&legacy, ".dreamina-capacity-query-").unwrap());
+        drop(first_owner);
+        let capacity = prepare_capacity_workspace(&poll).unwrap();
+        assert!(matches!(
+            ExclusiveAttemptWorkspace::acquire(&poll, ".dreamina-poll-"),
+            Err(AttemptWorkspaceError::Integrity)
+        ));
+        assert!(legacy_path.join(ATTEMPT_WORKSPACE_LOCK_FILENAME).is_file());
+        assert_ne!(capacity.path(), legacy.path());
+        // An operator moves the verified legacy tree out while both pollers are stopped.
+        let backup = root.path().join("maintenance-backup");
+        fs::rename(&legacy_path, &backup).unwrap();
+        let _poll_owner = ExclusiveAttemptWorkspace::acquire(&poll, ".dreamina-poll-").unwrap();
+        let _capacity_owner =
+            ExclusiveAttemptWorkspace::acquire(&capacity, ".dreamina-capacity-query-").unwrap();
+        assert!(backup.join(ATTEMPT_WORKSPACE_LOCK_FILENAME).is_file());
+    }
+
+    #[test]
+    fn capacity_workspace_rejects_alias_permissions_and_unknown_entries() {
+        let root = tempfile::tempdir().unwrap();
+        let poll = private_root(&root.path().join("poll"));
+        let path = poll.path().with_file_name("poll.capacity-reconciliation");
+        symlink(poll.path(), &path).unwrap();
+        assert!(prepare_capacity_workspace(&poll).is_err());
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(prepare_capacity_workspace(&poll).is_err());
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        let capacity = prepare_capacity_workspace(&poll).unwrap();
+        fs::write(path.join("unrecognized"), b"preserve").unwrap();
+        assert!(matches!(
+            ExclusiveAttemptWorkspace::acquire(&capacity, ".dreamina-capacity-query-"),
+            Err(AttemptWorkspaceError::Integrity)
+        ));
+        assert_eq!(fs::read(path.join("unrecognized")).unwrap(), b"preserve");
     }
 }
