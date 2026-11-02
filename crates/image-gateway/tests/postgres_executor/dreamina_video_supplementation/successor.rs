@@ -165,6 +165,10 @@ async fn supplement_successor_upgrade_preserves_schema153_authority_and_hold() -
         let all=sqlx::migrate!("./migrations");
         let old=sqlx::migrate::Migrator::with_migrations(all.iter().filter(|m|m.version<=153).cloned().collect());
         old.run(&db.pool).await.map_err(debug_error)?;
+        // Current admission reads the later capacity-waiver function. This
+        // historical schema has no waivers; keep the upgrade itself at153..154.
+        sqlx::query("CREATE FUNCTION executor_waived_held_count(UUID,BIGINT) RETURNS INTEGER LANGUAGE SQL IMMUTABLE AS 'SELECT 0'")
+            .execute(&db.pool).await.map_err(debug_error)?;
         seed_execution_profiles(&db.pool).await?;
         let fixture=fixture(&db.pool,"seedance2.0fast_vip").await?;
         let parent=Uuid::new_v4();let nonce=Uuid::new_v4();let now=database_now(&db.pool).await?;
@@ -184,7 +188,12 @@ async fn supplement_successor_upgrade_preserves_schema153_authority_and_hold() -
         require(child.authorization_id!=parent && child.dispatch_nonce!=nonce,"upgrade reused old authority")?;
         let hold_after:Value=sqlx::query_scalar("SELECT to_jsonb(hold) FROM customer_billing_holds hold WHERE job_id=$1").bind(fixture.request.job_id).fetch_one(&db.pool).await.map_err(debug_error)?;
         require(hold_after==hold_before,"upgrade/successor altered original financial hold")?;
-        assert_pending(&db.pool,fixture.request.job_id).await
+        assert_pending(&db.pool,fixture.request.job_id).await?;
+        sqlx::query("DROP FUNCTION executor_waived_held_count(UUID,BIGINT)")
+            .execute(&db.pool).await.map_err(debug_error)?;
+        let version:i64=sqlx::query_scalar("SELECT max(version) FROM _sqlx_migrations WHERE success")
+            .fetch_one(&db.pool).await.map_err(debug_error)?;
+        require(version==154,"successor fixture crossed its historical migration boundary")
     }.await;
     let cleanup = db.cleanup().await;
     result.and(cleanup)

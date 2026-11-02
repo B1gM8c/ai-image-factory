@@ -249,7 +249,19 @@ pub(super) async fn fixture_with_mode(
     )?;
     // Reproduce a pre-147 terminal order, then upgrade through the real migration.
     // New post-147 acceptances get a budget and are outside this narrow recovery.
+    // The shared schema146 fixture supplies the current admission reader with a
+    // zero-waiver compatibility function; real migration166 must create its own.
+    sqlx::query("DROP FUNCTION executor_waived_held_count(UUID,BIGINT)")
+        .execute(pool)
+        .await
+        .map_err(debug_error)?;
     run_migrations(pool).await.map_err(debug_error)?;
+    let real_waivers: bool = sqlx::query_scalar("SELECT position('executor_capacity_risk_waivers' in pg_get_functiondef('executor_waived_held_count(uuid,bigint)'::regprocedure)) > 0")
+        .fetch_one(pool).await.map_err(debug_error)?;
+    require(
+        real_waivers,
+        "image recovery upgrade retained the fixture waiver function",
+    )?;
     let budget_count: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM accepted_completion_budgets WHERE submission_id=$1",
     )
