@@ -129,9 +129,9 @@ jobs:
       - name: Install pinned real Codex startup dependency in the disposable runner
         run: |
           npm install --prefix "$RUNNER_TEMP/aif-codex" --ignore-scripts --no-audit --no-fund \
-            --save-exact --registry=https://registry.npmjs.org @openai/codex@0.153.4
+            --save-exact --registry=https://registry.npmjs.org @openai/codex@0.168.0-alpha.7
           codex_runtime="$RUNNER_TEMP/aif-codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl"
-          test "$("$codex_runtime/bin/codex" --version)" = 'codex-cli 0.153.4'
+          test "$("$codex_runtime/bin/codex" --version)" = 'codex-cli 0.168.0-alpha.7'
           sha256sum "$codex_runtime/bin/codex" "$RUNNER_TEMP/aif-codex/package-lock.json"
           node -e 'const lock=require(process.argv[1]); for (const name of ["node_modules/@openai/codex", "node_modules/@openai/codex-linux-x64"]) { const p=lock.packages[name]; if (!p?.integrity) throw Error("missing pinned Codex integrity"); console.log(JSON.stringify({name,version:p.version,resolved:p.resolved,integrity:p.integrity})); }' \
             "$RUNNER_TEMP/aif-codex/package-lock.json"

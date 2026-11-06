@@ -4,6 +4,8 @@ use image::{DynamicImage, ImageFormat, ImageReader, Rgb, RgbImage};
 
 use crate::{ImageGatewayError, core::provider::GeneratedImage};
 
+mod native;
+
 const MAX_DECODED_IMAGE_PIXELS: u64 = 16 * 1024 * 1024;
 const MAX_DECODED_IMAGE_DIMENSION: u32 = 8 * 1024;
 
@@ -28,6 +30,15 @@ fn normalize_generated_image(
     output_format: &str,
     output_compression: Option<u8>,
 ) -> Result<GeneratedImage, ImageGatewayError> {
+    if matches!(output_format, "gif" | "svg") {
+        if output_compression.is_some() {
+            return Err(ImageGatewayError::backend(
+                "Native GIF and SVG outputs do not support compression overrides",
+            ));
+        }
+        native::validate(&image.bytes, output_format)?;
+        return Ok(image);
+    }
     let decoded = decode_generated_image(&image.bytes)?;
     encode_image(
         flatten_to_opaque(decoded),

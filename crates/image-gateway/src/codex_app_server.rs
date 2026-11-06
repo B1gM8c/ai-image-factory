@@ -2347,10 +2347,24 @@ mod tests {
     #[tokio::test]
     async fn retry_notifications_do_not_extend_the_invocation_deadline() {
         let fixture = FakeAppServer::new(FakeMode::RetryUntilTimeout);
+        // The invocation budget includes process startup and every protocol
+        // handshake. Exercise slow startup without expiring before retries begin.
+        let script = std::fs::read_to_string(&fixture.executable).unwrap();
+        assert!(script.contains("set -eu\n"));
+        std::fs::write(
+            &fixture.executable,
+            script.replacen("set -eu\n", "set -eu\n/bin/sleep 0.6\n", 1),
+        )
+        .unwrap();
+        let invocation_timeout = Duration::from_secs(3);
+        let total_budget = invocation_timeout + REAP_TIMEOUT + Duration::from_secs(2);
         let started = tokio::time::Instant::now();
-        let (result, diagnostic) = fixture.run_capturing(Duration::from_millis(500)).await;
+        let (result, diagnostic) =
+            tokio::time::timeout(total_budget, fixture.run_capturing(invocation_timeout))
+                .await
+                .expect("retry notifications must not keep the invocation alive");
         assert_eq!(result, Err(CodexAppServerError::Timeout));
-        assert!(started.elapsed() < REAP_TIMEOUT + Duration::from_secs(2));
+        assert!(started.elapsed() < total_budget);
         let diagnostic = diagnostic.unwrap();
         assert!(diagnostic.retry_notification_count > 1);
         assert_eq!(diagnostic.will_retry, Some(true));

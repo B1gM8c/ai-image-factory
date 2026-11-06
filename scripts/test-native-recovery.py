@@ -43,7 +43,7 @@ LIB = Path('/usr/libexec/ai-image-factory')
 UNITS = Path('/etc/systemd/system')
 TARGET = 'x86_64-unknown-linux-gnu'
 PREFIX = 'ai-image-factory-'
-CODEX_VERSION = '0.153.4'
+CODEX_VERSION = '0.168.0-alpha.7'
 SECRET_VALUES = []
 RECOVERY_HOST_FILES = {
     'ops/hooks/' + name for name in

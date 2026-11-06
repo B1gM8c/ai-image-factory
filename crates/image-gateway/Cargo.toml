@@ -11,6 +11,7 @@ axum = { version = "0.8.9", features = ["multipart", "json"] }
 base64 = "0.22.1"
 factory-identity = { path = "../factory-identity" }
 futures-util = "0.3.31"
+gif = { version = "0.14.2", default-features = false, features = ["std"] }
 hex = "0.4.3"
 hmac = "0.13.0"
 httpdate = "1.0.3"
@@ -27,6 +28,7 @@ mp4 = "0.14.0"
 opentelemetry = "0.32.0"
 opentelemetry-otlp = "0.32.0"
 opentelemetry_sdk = "0.32.1"
+quick-xml = "0.42.0"
 rustix = { version = "1.1.4", features = ["fs"] }
 rpassword = "7.4.0"
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls", "stream", "system-proxy"] }
