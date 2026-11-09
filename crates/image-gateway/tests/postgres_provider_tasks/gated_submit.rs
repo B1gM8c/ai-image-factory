@@ -16,6 +16,113 @@ use gpt_image_2_gateway::{
 use super::*;
 
 #[tokio::test]
+async fn stalled_runner_start_does_not_block_another_submission() -> TestResult {
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let stalled = seed_running_submission(&database.pool, "gated-stalled-start").await?;
+        let healthy = seed_running_submission(&database.pool, "gated-healthy-start").await?;
+        let journal = tempfile::tempdir().map_err(debug_error)?;
+        let journal_root = journal.path().join("remote-submit");
+        let side_effect = journal.path().join("provider-invoked");
+        let start_log = journal.path().join("runner-starts");
+        let stalled_started = journal.path().join("stalled-started");
+        let release_stalled = journal.path().join("release-stalled");
+        let runner = journal.path().join("controlled-remote-submit-runner");
+        fs::write(
+            &runner,
+            format!(
+                "#!/bin/sh\n\
+                 printf '%s\\n' \"$2\" >> '{}'\n\
+                 if [ \"$2\" = '{}' ]; then\n\
+                   : > '{}'\n\
+                   tries=0\n\
+                   until [ -f '{}' ]; do\n\
+                     tries=$((tries + 1))\n\
+                     [ \"$tries\" -lt 6000 ] || exit 71\n\
+                     /bin/sleep 0.01\n\
+                   done\n\
+                 fi\n\
+                 exec '{}' \"$@\"\n",
+                start_log.display(),
+                stalled.submission_id,
+                stalled_started.display(),
+                release_stalled.display(),
+                env!("CARGO_BIN_EXE_remote-submit-runner"),
+            ),
+        )
+        .map_err(debug_error)?;
+        fs::set_permissions(&runner, fs::Permissions::from_mode(0o500))
+            .map_err(debug_error)?;
+        let mut codec = FakeGatedSubmitCodec::new(journal.path(), &side_effect, "isolated-start")?;
+        codec.unique_operations = true;
+        let orchestrator = Arc::new(
+            ProviderSubmitOrchestrator::new(
+                PostgresProviderTaskStore::new(database.pool.clone()),
+                gated_submit_driver(codec, &runner, file_sha256(&runner)?)?,
+                60_000,
+                &journal_root,
+            )
+            .map_err(debug_error)?,
+        );
+        let stalled_task = {
+            let orchestrator = Arc::clone(&orchestrator);
+            let work = gated_orchestrator_work(&stalled)?;
+            tokio::spawn(async move { orchestrator.submit(work).await })
+        };
+        // The marker is a process handshake: the first helper is alive and
+        // cannot become Ready until this test releases it, independent of time.
+        let started = tokio::time::timeout(Duration::from_secs(10), async {
+            while !stalled_started.is_file() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        if started.is_err() {
+            fs::write(&release_stalled, b"release").map_err(debug_error)?;
+            let _ = stalled_task.await;
+            return Err("stalled runner did not reach its startup barrier".to_owned());
+        }
+        let mut healthy_task = {
+            let orchestrator = Arc::clone(&orchestrator);
+            let work = gated_orchestrator_work(&healthy)?;
+            tokio::spawn(async move { orchestrator.submit(work).await })
+        };
+        let healthy_before_release =
+            tokio::time::timeout(Duration::from_secs(10), &mut healthy_task).await;
+        // Always release and join both real child processes, including the red
+        // regression path, before returning a failure or deleting the fixture.
+        fs::write(&release_stalled, b"release").map_err(debug_error)?;
+        let isolated = healthy_before_release.is_ok();
+        let healthy_outcome = match healthy_before_release {
+            Ok(outcome) => outcome,
+            Err(_) => healthy_task.await,
+        }
+        .map_err(debug_error)?
+        .map_err(debug_error)?;
+        let stalled_outcome = stalled_task
+            .await
+            .map_err(debug_error)?
+            .map_err(debug_error)?;
+        let starts = fs::read_to_string(&start_log).map_err(debug_error)?;
+        require(
+            isolated
+                && matches!(healthy_outcome, ProviderSubmitOutcome::Attached(_))
+                && matches!(stalled_outcome, ProviderSubmitOutcome::Attached(_))
+                && starts.lines().count() == 2
+                && starts.lines().filter(|id| *id == healthy.submission_id.to_string()).count() == 1
+                && starts.lines().filter(|id| *id == stalled.submission_id.to_string()).count() == 1
+                && fs::read(&side_effect).map_err(debug_error)? == b"invokedinvoked",
+            format!("runner startup crossed submission boundary: isolated={isolated}, healthy={healthy_outcome:?}, stalled={stalled_outcome:?}, starts={starts:?}"),
+        )
+    }
+    .await;
+    database.cleanup().await?;
+    result
+}
+
+#[tokio::test]
 async fn orchestrator_runs_one_cli_for_concurrent_callers_and_replays() -> TestResult {
     let Some(database) = TestDatabase::new().await? else {
         return Ok(());
@@ -69,12 +176,14 @@ async fn orchestrator_runs_one_cli_for_concurrent_callers_and_replays() -> TestR
             .submit(gated_orchestrator_work(&lease)?)
             .await
             .map_err(debug_error)?;
+        let invoked = fs::read(&side_effect).map_err(debug_error)?;
+        let remaining_workspaces = workspace_attempt_count(&workspace_root)?;
         require(
             matches!(replay, ProviderSubmitOutcome::Attached(ref task)
                 if task.remote_operation_id == "gated-operation-1")
-                && fs::read(&side_effect).map_err(debug_error)? == b"invoked"
-                && workspace_attempt_count(&workspace_root)? == 0,
-            format!("gated submit relaunched or failed to replay: {replay:?}"),
+                && invoked == b"invoked"
+                && remaining_workspaces == 0,
+            format!("gated submit relaunched or failed to replay: {replay:?}, invoked={invoked:?}, remaining_workspaces={remaining_workspaces}"),
         )
     }
     .await;
@@ -897,6 +1006,7 @@ struct FakeGatedSubmitCodec {
     side_effect: PathBuf,
     shell_sha256: String,
     operation_id: String,
+    unique_operations: bool,
     projection_delay: Duration,
     receipt: String,
     stderr: String,
@@ -923,6 +1033,7 @@ impl FakeGatedSubmitCodec {
             side_effect: side_effect.as_ref().to_owned(),
             shell_sha256: file_sha256(Path::new("/bin/sh"))?,
             operation_id: operation_id.into(),
+            unique_operations: false,
             projection_delay: Duration::ZERO,
             receipt: "gated-receipt".to_owned(),
             stderr: String::new(),
@@ -1084,7 +1195,11 @@ impl GatedCliSubmitCodec for FakeGatedSubmitCodec {
             RemoteOperationRef::new(
                 self.provider_id(),
                 intent.submission_id.to_string(),
-                self.operation_id.clone(),
+                if self.unique_operations {
+                    format!("{}-{}", self.operation_id, intent.submission_id)
+                } else {
+                    self.operation_id.clone()
+                },
             )
             .map_err(|_| {
                 fake_provider_failure(

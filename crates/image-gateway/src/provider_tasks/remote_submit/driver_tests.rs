@@ -161,6 +161,39 @@ fn timeout_signal_and_other_exit_outcomes_never_use_permission_diagnostic() {
 
 struct DefaultCodec;
 
+#[tokio::test]
+async fn runner_start_lock_keeps_waiters_and_reclaims_only_unused_submissions() {
+    let fixture = Fixture::new();
+    let runner = fixture._root.path().join("dreamina");
+    let driver = GatedCliSubmitDriver::new(
+        DefaultCodec,
+        &runner,
+        hex::encode(Sha256::digest(fs::read(&runner).unwrap())),
+        WorkingDirectory::new_private(fixture._root.path().join("workspace")).unwrap(),
+    )
+    .unwrap();
+    let submission = Uuid::new_v4();
+    let first = driver.runner_start_lock(submission).await;
+    let guard = first.clone().lock_owned().await;
+    let waiter = driver.runner_start_lock(submission).await;
+    assert!(Arc::ptr_eq(&first, &waiter));
+    assert!(waiter.try_lock().is_err());
+    drop(first);
+    let other = driver.runner_start_lock(Uuid::new_v4()).await;
+    assert!(other.try_lock().is_ok());
+    assert!(Arc::ptr_eq(
+        &waiter,
+        &driver.runner_start_lock(submission).await
+    ));
+    drop(guard);
+    assert!(waiter.try_lock().is_ok());
+    drop(waiter);
+    let _third = driver.runner_start_lock(Uuid::new_v4()).await;
+    let starts = driver.runner_start.lock().await;
+    assert!(!starts.contains_key(&submission));
+    assert_eq!(starts.len(), 2);
+}
+
 impl GatedCliSubmitCodec for DefaultCodec {
     type Payload = TestPayload;
 

@@ -1,7 +1,8 @@
 use std::{
+    collections::BTreeMap,
     path::{Path, PathBuf},
     process::{ExitStatus, Stdio},
-    sync::Arc,
+    sync::{Arc, Weak},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -102,7 +103,7 @@ pub struct GatedCliSubmitDriver<C> {
     codec: Arc<C>,
     runner_executable: PathBuf,
     runner_sha256: [u8; 32],
-    runner_start: Mutex<()>,
+    runner_start: Mutex<BTreeMap<Uuid, Weak<Mutex<()>>>>,
     workspace: Arc<RecoverableAttemptWorkspace>,
     input_blobs: Option<Arc<dyn InputBlobStore>>,
 }
@@ -139,7 +140,7 @@ where
             codec: Arc::new(codec),
             runner_executable: runner.path().to_owned(),
             runner_sha256,
-            runner_start: Mutex::new(()),
+            runner_start: Mutex::new(BTreeMap::new()),
             workspace: Arc::new(workspace),
             input_blobs: None,
         })
@@ -148,6 +149,17 @@ where
     pub fn with_input_blobs(mut self, store: Arc<dyn InputBlobStore>) -> Self {
         self.input_blobs = Some(store);
         self
+    }
+
+    async fn runner_start_lock(&self, submission_id: Uuid) -> Arc<Mutex<()>> {
+        let mut starts = self.runner_start.lock().await;
+        starts.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = starts.get(&submission_id).and_then(Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(Mutex::new(()));
+        starts.insert(submission_id, Arc::downgrade(&lock));
+        lock
     }
 
     async fn prepare_process(
@@ -242,12 +254,18 @@ where
             .map_err(pre_release_process_failure)?;
         let mut runner_start = None;
         let runner_exit = if matches!(observation, GatedCliObservation::AwaitingHelper) {
-            let guard = self.runner_start.lock().await;
+            // Only this submission waits for its helper startup. Keep the guard
+            // through re-observation and readiness, including a concurrent start.
+            runner_start = Some(
+                self.runner_start_lock(process.submission_id)
+                    .await
+                    .lock_owned()
+                    .await,
+            );
             observation = observe_process(&process)
                 .await
                 .map_err(pre_release_process_failure)?;
             if matches!(observation, GatedCliObservation::AwaitingHelper) {
-                runner_start = Some(guard);
                 match self.spawn_runner(&process).await {
                     Ok(runner) => Some(runner),
                     Err(failure) => {
