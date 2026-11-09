@@ -660,6 +660,7 @@ fn persisted_generation_error(error_code: Option<&str>) -> ImageGatewayError {
             code @ ("codex_app_server_request_rejected"
             | "codex_turn_failed"
             | "codex_image_tool_failed"
+            | "codex_image_tool_unauthorized"
             | "codex_event_capture_invalid"
             | "codex_process_exited_without_terminal"
             | "codex_multiple_image_outputs"
@@ -1789,6 +1790,7 @@ mod tests {
             "codex_app_server_request_rejected",
             "codex_turn_failed",
             "codex_image_tool_failed",
+            "codex_image_tool_unauthorized",
             "codex_event_capture_invalid",
             "codex_process_exited_without_terminal",
             "codex_multiple_image_outputs",

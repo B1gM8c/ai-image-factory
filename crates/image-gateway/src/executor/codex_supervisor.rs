@@ -1391,7 +1391,7 @@ async fn run_codex_child(
                     error.code = error.code(),
                     "Codex completed without a valid sealed image handoff"
                 );
-                break map_codex_app_server_child_error(error);
+                break map_codex_app_server_child_error(error, diagnostic.as_ref());
             }
         }
     };
@@ -1416,6 +1416,7 @@ fn normalize_child_outcome(outcome: ChildOutcome, request: &CodexExecutionReques
 
 fn map_codex_app_server_child_error(
     error: crate::codex_app_server::CodexAppServerError,
+    diagnostic: Option<&crate::codex_app_server::CodexAppServerFailureDiagnosticV1>,
 ) -> ChildOutcome {
     use crate::codex_app_server::CodexAppServerError;
 
@@ -1425,7 +1426,13 @@ fn map_codex_app_server_child_error(
             ChildOutcome::Failed("codex_app_server_request_rejected")
         }
         CodexAppServerError::TurnFailed => ChildOutcome::Failed("codex_turn_failed"),
-        CodexAppServerError::ImageToolFailed => ChildOutcome::Failed("codex_image_tool_failed"),
+        CodexAppServerError::ImageToolFailed => ChildOutcome::Failed(
+            if diagnostic.is_some_and(|value| value.is_image_tool_unauthorized_response()) {
+                "codex_image_tool_unauthorized"
+            } else {
+                "codex_image_tool_failed"
+            },
+        ),
         CodexAppServerError::ContentPolicyRejected => {
             ChildOutcome::Failed("content_policy_rejected")
         }
@@ -2170,7 +2177,7 @@ mod tests {
                 "content_policy_rejected",
             ),
         ] {
-            match map_codex_app_server_child_error(error) {
+            match map_codex_app_server_child_error(error, None) {
                 ChildOutcome::Failed(actual) => assert_eq!(actual, expected),
                 ChildOutcome::Succeeded(_) | ChildOutcome::Uncertain(_) => {
                     panic!("stable app-server failure was not terminalized as failed")
@@ -2671,6 +2678,75 @@ mod tests {
             }
         );
         assert_eq!(fs::read_to_string(&fixture.invocations).unwrap(), "1\n1\n");
+    }
+
+    #[tokio::test]
+    async fn image_tool_unauthorized_response_is_reported_without_refresh_or_replay() {
+        for stderr in [
+            "HTTP 401 invalid_request authentication",
+            "HTTP 401 rejected invalid_request authentication",
+        ] {
+            let fixture = CodexFixture::http_401_rejection(None, stderr);
+            let lease = fixture.lease();
+            let context = fixture.context(&lease);
+            fixture.journal.start_or_attach(&lease).unwrap();
+            fixture.supervisor.prepare(&lease, &context).await.unwrap();
+            assert_eq!(
+                fixture.journal.commit_launch(&lease).unwrap(),
+                LaunchDecision::LaunchOnce
+            );
+            let spool = ExecutionSpool::for_lease(&fixture.journal, &lease).unwrap();
+            run_codex_runner_child(fixture.journal.root_path(), lease.executor_execution_id)
+                .await
+                .unwrap();
+            assert_eq!(
+                spool.observe().unwrap(),
+                ProcessObservation::Failed {
+                    error_code: "codex_image_tool_unauthorized".to_string(),
+                }
+            );
+            assert!(
+                spool
+                    .read_diagnostic::<CodexAuthRefreshRequestV1>(CODEX_AUTH_REFRESH_REQUEST_FILE)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                spool
+                    .read_diagnostic::<CodexAuthAttemptBindingV1>(CODEX_AUTH_ATTEMPT_2_START_FILE)
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(fs::read_to_string(&fixture.invocations).unwrap(), "1\n");
+            let start: CodexAuthAttemptBindingV1 = spool
+                .read_diagnostic(CODEX_AUTH_ATTEMPT_1_START_FILE)
+                .unwrap()
+                .unwrap();
+            let finish: CodexAuthAttemptBindingV1 = spool
+                .read_diagnostic(CODEX_AUTH_ATTEMPT_1_FINISH_FILE)
+                .unwrap()
+                .unwrap();
+            assert!(auth_binding_unchanged(&start, &finish));
+            let diagnostic_path = fixture
+                .journal
+                .root_path()
+                .join(lease.executor_execution_id.simple().to_string())
+                .join(CODEX_APP_SERVER_FAILURE_DIAGNOSTIC_FILE);
+            let diagnostic: crate::codex_app_server::CodexAppServerFailureDiagnosticV1 =
+                serde_json::from_slice(&fs::read(diagnostic_path).unwrap()).unwrap();
+            assert!(diagnostic.is_image_tool_unauthorized_response());
+            assert!(!diagnostic.is_retryable_authentication_rejection());
+            assert_eq!(
+                fixture
+                    .supervisor
+                    .start_or_attach(&lease, LaunchDecision::Attach)
+                    .await,
+                Err(RunnerError::Definite {
+                    error_code: "codex_image_tool_unauthorized".to_string(),
+                })
+            );
+            assert_eq!(fs::read_to_string(&fixture.invocations).unwrap(), "1\n");
+        }
     }
 
     #[tokio::test]
