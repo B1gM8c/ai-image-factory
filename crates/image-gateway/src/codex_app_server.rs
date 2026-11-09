@@ -254,6 +254,44 @@ struct PersistedProtocolDiagnostic {
 }
 
 impl CodexAppServerFailureDiagnosticV1 {
+    pub(crate) fn is_image_tool_unauthorized_response(&self) -> bool {
+        // This is a diagnostic classification, not permission to refresh or replay.
+        // In particular, an invalid_request tag still fails the stricter retry guard.
+        let compatible_class = matches!(
+            self.class.as_str(),
+            "unknown" | "tool_failure" | "rejected" | "authentication"
+        ) || (self.class == "explicit_failure"
+            && self.code_source == Some(FailureCodeSource::EnvelopeFallback));
+        if self.schema_version != 1
+            || self.failure_category != CodexAppServerError::ImageToolFailed.code()
+            || self.source != "image_generation_item"
+            || !compatible_class
+            || self.numeric_code.is_some_and(|code| code != 401)
+            || self.http_status_code.is_some_and(|code| code != 401)
+            || self
+                .codex_error_info
+                .is_some_and(|kind| kind != CodexErrorInfoKind::Unauthorized)
+            || self.will_retry == Some(true)
+            || self
+                .recovery_blocker
+                .is_some_and(|blocker| blocker != RecoveryBlocker::Auth)
+            || self.code.truncated
+            || self.message.truncated
+        {
+            return false;
+        }
+        let Some(stderr) = self.stderr.as_ref().filter(|stderr| !stderr.truncated) else {
+            return false;
+        };
+        let Some(signals) = stderr.class.strip_prefix("http_status:401:") else {
+            return false;
+        };
+        signals.split('+').any(|signal| signal == "authentication")
+            && signals
+                .split('+')
+                .all(|signal| matches!(signal, "authentication" | "invalid_request" | "rejected"))
+    }
+
     pub(crate) fn is_retryable_authentication_rejection(&self) -> bool {
         if self.failure_category != CodexAppServerError::ImageToolFailed.code()
             || !matches!(
@@ -457,7 +495,15 @@ impl ProtocolState {
                 "unknown" | "tool_failure" | "authentication" | "rejected"
             )
         {
-            class = "explicit_failure";
+            // The persisted primary numeric code cannot represent every code.
+            // Retain contradictory or invalid numeric metadata in the class.
+            class = if invalid_numeric_code {
+                "invalid_numeric_code"
+            } else if numeric_codes.windows(2).any(|codes| codes[0] != codes[1]) {
+                "numeric_code_conflict"
+            } else {
+                "explicit_failure"
+            };
         }
         let (codex_error_info, http_status_code) = summarize_codex_error_info(value);
         let error_infos = CODEX_ERROR_INFO_PATHS
@@ -3417,6 +3463,207 @@ mod tests {
     }
 
     #[test]
+    fn image_tool_unauthorized_classification_does_not_authorize_replay() {
+        let observed = |stderr_class: &str| {
+            serde_json::from_value::<CodexAppServerFailureDiagnosticV1>(json!({
+                "schema_version": 1,
+                "failure_category": "codex_image_tool_failed",
+                "source": "image_generation_item",
+                "class": "explicit_failure",
+                "numeric_code": null,
+                "code_source": "envelope_fallback",
+                "code": { "sha256": null, "bytes": 15, "truncated": false },
+                "message": { "sha256": null, "bytes": 0, "truncated": false },
+                "stderr": { "sha256": "a".repeat(64), "bytes": 353,
+                    "truncated": false, "class": stderr_class },
+                "exit": { "observed": true, "code": 0, "signal": null }
+            }))
+            .unwrap()
+        };
+
+        // The eight observed failures have these two redacted diagnostic shapes.
+        for stderr_class in [
+            "http_status:401:invalid_request+authentication",
+            "http_status:401:rejected+invalid_request+authentication",
+        ] {
+            let diagnostic = observed(stderr_class);
+            assert!(diagnostic.is_image_tool_unauthorized_response());
+            assert!(!diagnostic.is_retryable_authentication_rejection());
+        }
+
+        let base = observed("http_status:401:invalid_request+authentication");
+        for class in [
+            "policy",
+            "rate_limit",
+            "availability",
+            "entitlement",
+            "forbidden",
+            "account",
+            "retention",
+            "organization",
+            "prompt",
+            "originator_policy",
+        ] {
+            let mut diagnostic = base.clone();
+            diagnostic.class = class.to_string();
+            assert!(!diagnostic.is_image_tool_unauthorized_response(), "{class}");
+        }
+        for stderr_class in [
+            "http_status:401",
+            "http_status:401:rejected",
+            "http_status:401:invalid_request",
+            "http_status:401:authentication+policy",
+            "http_status:401:authentication+entitlement",
+            "http_status:401:authentication+forbidden",
+            "http_status:401:authentication+rate_limit",
+            "http_status:401:authentication+availability",
+            "http_status:401:authentication+unknown_future_signal",
+            "http_status:401:authentication+",
+            "http_status:4010:authentication",
+            "http_status:403:authentication",
+            "http_status:401+503:authentication",
+            "api_code:authentication",
+        ] {
+            assert!(
+                !observed(stderr_class).is_image_tool_unauthorized_response(),
+                "{stderr_class}"
+            );
+        }
+        let mut conflicts = Vec::new();
+        let mut diagnostic = base.clone();
+        diagnostic.numeric_code = Some(403);
+        conflicts.push(diagnostic);
+        let mut diagnostic = base.clone();
+        diagnostic.http_status_code = Some(503);
+        conflicts.push(diagnostic);
+        let mut diagnostic = base.clone();
+        diagnostic.codex_error_info = Some(CodexErrorInfoKind::BadRequest);
+        conflicts.push(diagnostic);
+        let mut diagnostic = base.clone();
+        diagnostic.will_retry = Some(true);
+        conflicts.push(diagnostic);
+        let mut diagnostic = base.clone();
+        diagnostic.recovery_blocker = Some(RecoveryBlocker::MetadataRejected);
+        conflicts.push(diagnostic);
+        let mut diagnostic = base.clone();
+        diagnostic.stderr.as_mut().unwrap().truncated = true;
+        conflicts.push(diagnostic);
+        let mut diagnostic = base.clone();
+        diagnostic.message.truncated = true;
+        conflicts.push(diagnostic);
+        let mut diagnostic = base.clone();
+        diagnostic.code.truncated = true;
+        conflicts.push(diagnostic);
+        let mut diagnostic = base.clone();
+        diagnostic.code_source = Some(FailureCodeSource::ExplicitCode);
+        conflicts.push(diagnostic);
+        let mut diagnostic = base.clone();
+        diagnostic.failure_category = "codex_turn_failed".to_string();
+        conflicts.push(diagnostic);
+        let mut diagnostic = base.clone();
+        diagnostic.source = "turn_error".to_string();
+        conflicts.push(diagnostic);
+        let mut diagnostic = base.clone();
+        diagnostic.schema_version = 2;
+        conflicts.push(diagnostic);
+        for diagnostic in conflicts {
+            assert!(!diagnostic.is_image_tool_unauthorized_response());
+        }
+
+        let mut pure_auth = observed("http_status:401:authentication");
+        pure_auth.class = "authentication".to_string();
+        pure_auth.code_source = Some(FailureCodeSource::ExplicitCode);
+        assert!(pure_auth.is_retryable_authentication_rejection());
+        assert!(pure_auth.is_image_tool_unauthorized_response());
+    }
+
+    #[test]
+    fn image_tool_unauthorized_classification_preserves_raw_numeric_conflicts() {
+        for (value, expected_class, expected_unauthorized) in [
+            (
+                json!({"type": "imageGeneration", "code": 401, "error": {"code": 403}}),
+                "numeric_code_conflict",
+                false,
+            ),
+            (
+                json!({"type": "imageGeneration", "code": 403, "error": {"code": 401}}),
+                "numeric_code_conflict",
+                false,
+            ),
+            (
+                json!({"type": "imageGeneration", "code": 401,
+                    "result": {"error": {"status": 503}}}),
+                "numeric_code_conflict",
+                false,
+            ),
+            (
+                json!({"type": "imageGeneration", "code": 401.5}),
+                "invalid_numeric_code",
+                false,
+            ),
+            (
+                json!({"type": "imageGeneration", "code": 401,
+                    "result": {"error": {"code": 401.0}}}),
+                "invalid_numeric_code",
+                false,
+            ),
+            (
+                json!({"type": "imageGeneration", "error": {"code": u64::MAX}}),
+                "invalid_numeric_code",
+                false,
+            ),
+            (
+                json!({"type": "imageGeneration", "result": {"status": 1e100}}),
+                "invalid_numeric_code",
+                false,
+            ),
+            (
+                json!({"type": "imageGeneration", "code": 401,
+                    "error": {"code": 401}, "result": ""}),
+                "explicit_failure",
+                true,
+            ),
+            (
+                json!({"type": "imageGeneration", "status": "failed", "result": ""}),
+                "explicit_failure",
+                true,
+            ),
+        ] {
+            for stderr in [
+                b"HTTP 401 invalid_request authentication".as_slice(),
+                b"HTTP 401 rejected invalid_request authentication".as_slice(),
+            ] {
+                let mut state = ProtocolState::default();
+                state.record_failure("image_generation_item", &value);
+                let diagnostic = build_failure_diagnostic(
+                    &state,
+                    CodexAppServerError::ImageToolFailed,
+                    Some(&StreamDiagnostic {
+                        class: classify_stream_bytes(stderr),
+                        ..StreamDiagnostic::default()
+                    }),
+                    &ExitDiagnostic::default(),
+                );
+                assert_eq!(diagnostic.class, expected_class, "{value}");
+                assert_eq!(
+                    diagnostic.code_source,
+                    Some(FailureCodeSource::EnvelopeFallback),
+                    "{value}"
+                );
+                assert_eq!(
+                    diagnostic.is_image_tool_unauthorized_response(),
+                    expected_unauthorized,
+                    "{value}"
+                );
+                assert!(
+                    !diagnostic.is_retryable_authentication_rejection(),
+                    "{value}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn only_definitive_authentication_rejections_are_retryable() {
         let persisted = |failure_category: &str, numeric_code: Option<i64>, stderr_class: &str| {
             CodexAppServerFailureDiagnosticV1 {
@@ -3707,7 +3954,7 @@ mod tests {
                     "code": 401,
                     "result": { "code": 403 }
                 }),
-                "explicit_failure",
+                "numeric_code_conflict",
                 Some(401),
             ),
             (
@@ -3725,7 +3972,7 @@ mod tests {
                     "status": "failed",
                     "result": { "code": 403.0 }
                 }),
-                "explicit_failure",
+                "invalid_numeric_code",
                 None,
             ),
             (
@@ -3734,7 +3981,7 @@ mod tests {
                     "status": "failed",
                     "result": { "code": 1e100 }
                 }),
-                "explicit_failure",
+                "invalid_numeric_code",
                 None,
             ),
             (

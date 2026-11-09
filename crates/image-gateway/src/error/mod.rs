@@ -28,6 +28,7 @@ const CODE_CODEX_CLI_FAILED: &str = "codex_cli_failed";
 const CODE_CODEX_APP_SERVER_REQUEST_REJECTED: &str = "codex_app_server_request_rejected";
 const CODE_CODEX_TURN_FAILED: &str = "codex_turn_failed";
 const CODE_CODEX_IMAGE_TOOL_FAILED: &str = "codex_image_tool_failed";
+const CODE_CODEX_IMAGE_TOOL_UNAUTHORIZED: &str = "codex_image_tool_unauthorized";
 const CODE_CONTENT_POLICY_REJECTED: &str = "content_policy_rejected";
 const CODE_CODEX_EVENT_CAPTURE_INVALID: &str = "codex_event_capture_invalid";
 const CODE_CODEX_PROCESS_EXITED_WITHOUT_TERMINAL: &str = "codex_process_exited_without_terminal";
@@ -477,6 +478,10 @@ impl ImageGatewayError {
             CODE_CODEX_IMAGE_TOOL_FAILED => (
                 "Codex image generation tool failed",
                 CODE_CODEX_IMAGE_TOOL_FAILED,
+            ),
+            CODE_CODEX_IMAGE_TOOL_UNAUTHORIZED => (
+                "Upstream image service returned an authentication error; server-side verification is required",
+                CODE_CODEX_IMAGE_TOOL_UNAUTHORIZED,
             ),
             CODE_CODEX_EVENT_CAPTURE_INVALID => (
                 "Codex app-server event stream failed validation",

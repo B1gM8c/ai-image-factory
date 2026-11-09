@@ -337,6 +337,9 @@ fn safe_failure_message(error_code: &str) -> Option<&'static str> {
         "codex_app_server_request_rejected" => Some("Codex app-server request rejected"),
         "codex_turn_failed" => Some("Codex image generation turn failed"),
         "codex_image_tool_failed" => Some("Codex image generation tool failed"),
+        "codex_image_tool_unauthorized" => Some(
+            "Upstream image service returned an authentication error; server-side verification is required",
+        ),
         "content_policy_rejected" => {
             Some("The image request was rejected by the provider safety policy")
         }
@@ -372,6 +375,12 @@ mod tests {
         assert_eq!(
             safe_failure_message("content_policy_rejected"),
             Some("The image request was rejected by the provider safety policy")
+        );
+        assert_eq!(
+            safe_failure_message("codex_image_tool_unauthorized"),
+            Some(
+                "Upstream image service returned an authentication error; server-side verification is required"
+            )
         );
         assert_eq!(
             safe_failure_message("codex_image_edit_rate_limited"),
