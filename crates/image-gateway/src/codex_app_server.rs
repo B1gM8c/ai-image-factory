@@ -495,7 +495,15 @@ impl ProtocolState {
                 "unknown" | "tool_failure" | "authentication" | "rejected"
             )
         {
-            class = "explicit_failure";
+            // The persisted primary numeric code cannot represent every code.
+            // Retain contradictory or invalid numeric metadata in the class.
+            class = if invalid_numeric_code {
+                "invalid_numeric_code"
+            } else if numeric_codes.windows(2).any(|codes| codes[0] != codes[1]) {
+                "numeric_code_conflict"
+            } else {
+                "explicit_failure"
+            };
         }
         let (codex_error_info, http_status_code) = summarize_codex_error_info(value);
         let error_infos = CODEX_ERROR_INFO_PATHS
@@ -3570,6 +3578,92 @@ mod tests {
     }
 
     #[test]
+    fn image_tool_unauthorized_classification_preserves_raw_numeric_conflicts() {
+        for (value, expected_class, expected_unauthorized) in [
+            (
+                json!({"type": "imageGeneration", "code": 401, "error": {"code": 403}}),
+                "numeric_code_conflict",
+                false,
+            ),
+            (
+                json!({"type": "imageGeneration", "code": 403, "error": {"code": 401}}),
+                "numeric_code_conflict",
+                false,
+            ),
+            (
+                json!({"type": "imageGeneration", "code": 401,
+                    "result": {"error": {"status": 503}}}),
+                "numeric_code_conflict",
+                false,
+            ),
+            (
+                json!({"type": "imageGeneration", "code": 401.5}),
+                "invalid_numeric_code",
+                false,
+            ),
+            (
+                json!({"type": "imageGeneration", "code": 401,
+                    "result": {"error": {"code": 401.0}}}),
+                "invalid_numeric_code",
+                false,
+            ),
+            (
+                json!({"type": "imageGeneration", "error": {"code": u64::MAX}}),
+                "invalid_numeric_code",
+                false,
+            ),
+            (
+                json!({"type": "imageGeneration", "result": {"status": 1e100}}),
+                "invalid_numeric_code",
+                false,
+            ),
+            (
+                json!({"type": "imageGeneration", "code": 401,
+                    "error": {"code": 401}, "result": ""}),
+                "explicit_failure",
+                true,
+            ),
+            (
+                json!({"type": "imageGeneration", "status": "failed", "result": ""}),
+                "explicit_failure",
+                true,
+            ),
+        ] {
+            for stderr in [
+                b"HTTP 401 invalid_request authentication".as_slice(),
+                b"HTTP 401 rejected invalid_request authentication".as_slice(),
+            ] {
+                let mut state = ProtocolState::default();
+                state.record_failure("image_generation_item", &value);
+                let diagnostic = build_failure_diagnostic(
+                    &state,
+                    CodexAppServerError::ImageToolFailed,
+                    Some(&StreamDiagnostic {
+                        class: classify_stream_bytes(stderr),
+                        ..StreamDiagnostic::default()
+                    }),
+                    &ExitDiagnostic::default(),
+                );
+                assert_eq!(diagnostic.class, expected_class, "{value}");
+                assert_eq!(
+                    diagnostic.code_source,
+                    Some(FailureCodeSource::EnvelopeFallback),
+                    "{value}"
+                );
+                assert_eq!(
+                    diagnostic.is_image_tool_unauthorized_response(),
+                    expected_unauthorized,
+                    "{value}"
+                );
+                assert!(
+                    !diagnostic.is_retryable_authentication_rejection(),
+                    "{value}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn only_definitive_authentication_rejections_are_retryable() {
         let persisted = |failure_category: &str, numeric_code: Option<i64>, stderr_class: &str| {
             CodexAppServerFailureDiagnosticV1 {
@@ -3860,7 +3954,7 @@ mod tests {
                     "code": 401,
                     "result": { "code": 403 }
                 }),
-                "explicit_failure",
+                "numeric_code_conflict",
                 Some(401),
             ),
             (
@@ -3878,7 +3972,7 @@ mod tests {
                     "status": "failed",
                     "result": { "code": 403.0 }
                 }),
-                "explicit_failure",
+                "invalid_numeric_code",
                 None,
             ),
             (
@@ -3887,7 +3981,7 @@ mod tests {
                     "status": "failed",
                     "result": { "code": 1e100 }
                 }),
-                "explicit_failure",
+                "invalid_numeric_code",
                 None,
             ),
             (
