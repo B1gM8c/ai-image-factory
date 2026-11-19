@@ -172,6 +172,16 @@ pub(crate) struct CodexAppServerFailureDiagnosticV1 {
     retry_notification_count: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     invocation: Option<PersistedInvocationDiagnostic>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    upstream_http_status: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    upstream_reason: Option<ImageToolFailureReason>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ImageToolFailureReason {
+    IpNotAuthorized,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -292,6 +302,11 @@ impl CodexAppServerFailureDiagnosticV1 {
                 .all(|signal| matches!(signal, "authentication" | "invalid_request" | "rejected"))
     }
 
+    pub(crate) fn is_image_tool_ip_not_authorized(&self) -> bool {
+        self.upstream_reason == Some(ImageToolFailureReason::IpNotAuthorized)
+            && self.is_image_tool_unauthorized_response()
+    }
+
     pub(crate) fn is_retryable_authentication_rejection(&self) -> bool {
         if self.failure_category != CodexAppServerError::ImageToolFailed.code()
             || !matches!(
@@ -364,6 +379,7 @@ struct StreamDiagnostic {
     bytes: usize,
     truncated: bool,
     class: String,
+    ip_not_authorized: bool,
 }
 
 #[derive(Debug, Default)]
@@ -994,6 +1010,7 @@ where
             bytes: total,
             truncated: total > MAX_STDERR_DIGEST_BYTES,
             class: classify_stream_bytes(&sample),
+            ip_not_authorized: ip_not_authorized_body(&sample),
         }
     });
     let mut stdout = BufReader::new(stdout);
@@ -1548,6 +1565,32 @@ fn classify_stream_bytes(value: &[u8]) -> String {
     classify_bytes(value).to_string()
 }
 
+// Codex prints this transport error as `http {status}: {body:?}`. Decode
+// the exact upstream JSON envelope rather than matching arbitrary log text.
+fn ip_not_authorized_body(value: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(value) else {
+        return false;
+    };
+    text.match_indices("http 401 Unauthorized: Some(")
+        .take(8)
+        .any(|(index, prefix)| {
+            let encoded = &text[index + prefix.len()..];
+            let mut stream = serde_json::Deserializer::from_str(encoded).into_iter::<String>();
+            let Some(Ok(body)) = stream.next() else {
+                return false;
+            };
+            if !encoded[stream.byte_offset()..].starts_with(')') {
+                return false;
+            }
+            let Ok(error) = serde_json::from_str::<Value>(&body) else {
+                return false;
+            };
+            error.pointer("/error/type").and_then(Value::as_str) == Some("invalid_request_error")
+                && error.pointer("/error/message").and_then(Value::as_str)
+                    == Some("Your IP is not authorized to make this request.")
+        })
+}
+
 fn observed_http_statuses(value: &str) -> Vec<u16> {
     let bytes = value.as_bytes();
     let mut statuses = Vec::new();
@@ -1709,7 +1752,7 @@ fn build_failure_diagnostic(
         .failure_diagnostic
         .as_ref()
         .or(state.last_retry_diagnostic.as_ref());
-    CodexAppServerFailureDiagnosticV1 {
+    let mut diagnostic = CodexAppServerFailureDiagnosticV1 {
         schema_version: 1,
         failure_category: error.code().to_string(),
         source: failure.map_or("none", |value| value.source).to_string(),
@@ -1757,7 +1800,40 @@ fn build_failure_diagnostic(
         recovery_blocker: failure.and_then(|value| value.recovery_blocker),
         retry_notification_count: state.retry_notification_count,
         invocation: None,
+        upstream_http_status: None,
+        upstream_reason: None,
+    };
+    if diagnostic.source == "image_generation_item" {
+        diagnostic.upstream_http_status =
+            image_tool_http_status(diagnostic.http_status_code, diagnostic.numeric_code, stderr);
+        if diagnostic.is_image_tool_unauthorized_response()
+            && stderr.is_some_and(|value| value.ip_not_authorized)
+        {
+            diagnostic.upstream_reason = Some(ImageToolFailureReason::IpNotAuthorized);
+        }
     }
+    diagnostic
+}
+
+fn image_tool_http_status(
+    structured_status: Option<u16>,
+    numeric_code: Option<i64>,
+    stderr: Option<&StreamDiagnostic>,
+) -> Option<u16> {
+    if stderr
+        .is_some_and(|value| value.truncated || value.class.starts_with("http_status_conflict:"))
+    {
+        return None;
+    }
+    let stderr_status = stderr
+        .and_then(|value| value.class.strip_prefix("http_status:"))
+        .and_then(|value| value.split(':').next())
+        .and_then(|value| value.parse::<u16>().ok());
+    let status = structured_status.or(stderr_status)?;
+    ((400..=599).contains(&status)
+        && stderr_status.is_none_or(|value| value == status)
+        && numeric_code.is_none_or(|value| value == i64::from(status)))
+    .then_some(status)
 }
 
 fn trace_retry_summary(request: &CodexAppServerRequest<'_>, state: &ProtocolState) {
@@ -3341,6 +3417,7 @@ mod tests {
                 bytes: 25,
                 truncated: false,
                 class: "authentication".to_string(),
+                ip_not_authorized: false,
             }),
             &ExitDiagnostic {
                 observed: true,
@@ -3460,6 +3537,44 @@ mod tests {
             ),
             "http_status:400:retention+organization+rejected+policy"
         );
+    }
+
+    #[test]
+    fn ip_denial_requires_the_exact_upstream_transport_envelope() {
+        let expected_message = "Your IP is not authorized to make this request.";
+        let body = |error_type: &str, message: &str| {
+            json!({"error": {"type": error_type, "message": message}}).to_string()
+        };
+        let transport = |status: &str, body: &str| format!("http {status}: {:?}", Some(body));
+        let expected_body = body("invalid_request_error", expected_message);
+        assert!(ip_not_authorized_body(
+            transport("401 Unauthorized", &expected_body).as_bytes()
+        ));
+        for false_match in [
+            format!("http 401 Unauthorized: {expected_body}"),
+            transport("403 Forbidden", &expected_body),
+            transport(
+                "401 Unauthorized",
+                &body("authentication_error", expected_message),
+            ),
+            transport(
+                "401 Unauthorized",
+                &body(
+                    "invalid_request_error",
+                    &format!("quoted {expected_message}"),
+                ),
+            ),
+            transport(
+                "401 Unauthorized",
+                &json!({"prompt": expected_body}).to_string(),
+            ),
+            format!("http 401 Unauthorized: Some({expected_body:?}"),
+        ] {
+            assert!(
+                !ip_not_authorized_body(false_match.as_bytes()),
+                "{false_match}"
+            );
+        }
     }
 
     #[test]
@@ -3694,6 +3809,8 @@ mod tests {
                 recovery_blocker: None,
                 retry_notification_count: 0,
                 invocation: None,
+                upstream_http_status: None,
+                upstream_reason: None,
             }
         };
 
@@ -3790,6 +3907,7 @@ mod tests {
                     bytes: 32,
                     truncated: false,
                     class: "http_status:401:rejected".to_string(),
+                    ip_not_authorized: false,
                 }),
                 &ExitDiagnostic {
                     observed: true,

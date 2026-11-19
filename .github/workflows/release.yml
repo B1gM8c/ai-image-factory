@@ -290,6 +290,17 @@ jobs:
             --lib settlement::postgres::image_success_reconciliation::evidence::tests \
             -- --test-threads=1
 
+      - name: Test hotfix Codex image failures
+        if: inputs.validation_profile == 'hotfix'
+        run: |
+          cargo test --locked --package gpt-image-2-gateway \
+            --lib codex_app_server::tests -- --test-threads=1
+          cargo test --locked --package gpt-image-2-gateway \
+            --lib executor::codex_supervisor::tests -- --test-threads=1
+          cargo test --locked --package gpt-image-2-gateway \
+            --test process_smoke generation_v2_recoverable_app_server_error_settles_once \
+            -- --exact --test-threads=1
+
       - name: Test hotfix public model metadata and catalog authorization
         if: inputs.validation_profile == 'hotfix'
         run: |

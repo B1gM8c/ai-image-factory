@@ -337,6 +337,9 @@ fn safe_failure_message(error_code: &str) -> Option<&'static str> {
         "codex_app_server_request_rejected" => Some("Codex app-server request rejected"),
         "codex_turn_failed" => Some("Codex image generation turn failed"),
         "codex_image_tool_failed" => Some("Codex image generation tool failed"),
+        "codex_image_tool_ip_not_authorized" => {
+            Some("Upstream image service did not authorize the request IP")
+        }
         "codex_image_tool_unauthorized" => Some(
             "Upstream image service returned an authentication error; server-side verification is required",
         ),

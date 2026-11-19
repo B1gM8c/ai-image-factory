@@ -141,6 +141,11 @@ manifest, digest, installer, and GitHub provenance checks; no locally assembled
 binary or unsigned package is accepted. Main-branch CI may run the full suite
 in parallel, independently of this candidate run.
 
+The hotfix profile also runs the Codex app-server and supervisor suites and
+the isolated PostgreSQL process test for a recoverable app-server error.
+These tests use fixtures and preserve the existing no-replay and settlement
+rules for image-tool authentication failures.
+
 These focused tests cover this reviewed fix, not arbitrary future hotfixes.
 Changes to schemas, updater or recovery behavior, process hooks, database
 contracts, or another uncovered subsystem require full validation or a
