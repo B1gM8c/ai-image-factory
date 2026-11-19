@@ -661,6 +661,7 @@ fn persisted_generation_error(error_code: Option<&str>) -> ImageGatewayError {
             | "codex_turn_failed"
             | "codex_image_tool_failed"
             | "codex_image_tool_unauthorized"
+            | "codex_image_tool_ip_not_authorized"
             | "codex_event_capture_invalid"
             | "codex_process_exited_without_terminal"
             | "codex_multiple_image_outputs"
@@ -1766,6 +1767,33 @@ mod tests {
         assert_eq!(error.error_code(), Some("billing_limit_exceeded"));
     }
 
+    #[tokio::test]
+    async fn persisted_image_auth_failures_expose_only_safe_diagnostic_fields() {
+        use axum::{body::to_bytes, response::IntoResponse};
+
+        for (code, diagnostics) in [
+            (
+                "codex_image_tool_ip_not_authorized",
+                serde_json::json!({
+                    "reason_code": "ip_not_authorized",
+                    "upstream_http_status": 401
+                }),
+            ),
+            (
+                "codex_image_tool_unauthorized",
+                serde_json::json!({"upstream_http_status": 401}),
+            ),
+            ("codex_image_tool_failed", serde_json::Value::Null),
+        ] {
+            let response = persisted_generation_error(Some(code)).into_response();
+            assert_eq!(response.status(), axum::http::StatusCode::BAD_GATEWAY);
+            let body = to_bytes(response.into_body(), 4096).await.unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["error"]["code"], code);
+            assert_eq!(body["error"]["diagnostics"], diagnostics);
+        }
+    }
+
     #[test]
     fn persisted_failure_codes_restore_the_original_gateway_error() {
         let timeout = persisted_generation_error(Some("timeout"));
@@ -1791,6 +1819,7 @@ mod tests {
             "codex_turn_failed",
             "codex_image_tool_failed",
             "codex_image_tool_unauthorized",
+            "codex_image_tool_ip_not_authorized",
             "codex_event_capture_invalid",
             "codex_process_exited_without_terminal",
             "codex_multiple_image_outputs",

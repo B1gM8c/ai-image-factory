@@ -39,6 +39,16 @@ release record to establish runtime provenance. New readers accept the previous
 diagnostic shape with absent optional fields; old strict readers do not accept
 new fields. Do not describe this as bidirectional diagnostic compatibility.
 
+An image-tool authentication failure carries `diagnostics.upstream_http_status`
+set to 401 in the API error body. Factory keeps its gateway HTTP status
+separate. A matching upstream invalid-request response that explicitly denies
+the source IP returns `codex_image_tool_ip_not_authorized` and
+`diagnostics.reason_code` set to `ip_not_authorized`. A generic 401 carries
+the existing `codex_image_tool_unauthorized` code. These details describe the
+observed failure and do not authorize a retry. The Codex CLI 0.170.0 app-server
+wire format omits its internal image request ID. Use the Factory request ID
+and execution time for correlation when the upstream ID is absent.
+
 ## Verification and rollout
 
 Use synthetic parser/subprocess fixtures and the explicitly isolated local

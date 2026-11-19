@@ -1427,7 +1427,9 @@ fn map_codex_app_server_child_error(
         }
         CodexAppServerError::TurnFailed => ChildOutcome::Failed("codex_turn_failed"),
         CodexAppServerError::ImageToolFailed => ChildOutcome::Failed(
-            if diagnostic.is_some_and(|value| value.is_image_tool_unauthorized_response()) {
+            if diagnostic.is_some_and(|value| value.is_image_tool_ip_not_authorized()) {
+                "codex_image_tool_ip_not_authorized"
+            } else if diagnostic.is_some_and(|value| value.is_image_tool_unauthorized_response()) {
                 "codex_image_tool_unauthorized"
             } else {
                 "codex_image_tool_failed"
@@ -2682,9 +2684,31 @@ mod tests {
 
     #[tokio::test]
     async fn image_tool_unauthorized_response_is_reported_without_refresh_or_replay() {
-        for stderr in [
-            "HTTP 401 invalid_request authentication",
-            "HTTP 401 rejected invalid_request authentication",
+        let expected_ip_denial = format!(
+            "http 401 Unauthorized: {:?}",
+            Some(
+                serde_json::json!({"error": {
+                    "message": "Your IP is not authorized to make this request.",
+                    "type": "invalid_request_error",
+                    "param": null,
+                    "code": null,
+                }})
+                .to_string()
+            )
+        );
+        for (stderr, error_code) in [
+            (
+                "HTTP 401 invalid_request authentication",
+                "codex_image_tool_unauthorized",
+            ),
+            (
+                "HTTP 401 rejected invalid_request authentication",
+                "codex_image_tool_unauthorized",
+            ),
+            (
+                expected_ip_denial.as_str(),
+                "codex_image_tool_ip_not_authorized",
+            ),
         ] {
             let fixture = CodexFixture::http_401_rejection(None, stderr);
             let lease = fixture.lease();
@@ -2702,7 +2726,7 @@ mod tests {
             assert_eq!(
                 spool.observe().unwrap(),
                 ProcessObservation::Failed {
-                    error_code: "codex_image_tool_unauthorized".to_string(),
+                    error_code: error_code.to_string(),
                 }
             );
             assert!(
@@ -2732,9 +2756,24 @@ mod tests {
                 .root_path()
                 .join(lease.executor_execution_id.simple().to_string())
                 .join(CODEX_APP_SERVER_FAILURE_DIAGNOSTIC_FILE);
+            let redacted = fs::read_to_string(diagnostic_path).unwrap();
             let diagnostic: crate::codex_app_server::CodexAppServerFailureDiagnosticV1 =
-                serde_json::from_slice(&fs::read(diagnostic_path).unwrap()).unwrap();
+                serde_json::from_str(&redacted).unwrap();
             assert!(diagnostic.is_image_tool_unauthorized_response());
+            assert_eq!(
+                diagnostic.is_image_tool_ip_not_authorized(),
+                error_code == "codex_image_tool_ip_not_authorized",
+            );
+            let fields: serde_json::Value = serde_json::from_str(&redacted).unwrap();
+            assert_eq!(fields["upstream_http_status"], 401);
+            assert_eq!(
+                fields["upstream_reason"].as_str(),
+                diagnostic
+                    .is_image_tool_ip_not_authorized()
+                    .then_some("ip_not_authorized"),
+            );
+            assert!(!redacted.contains("Your IP is not authorized"));
+            assert!(!redacted.contains("invalid_request_error"));
             assert!(!diagnostic.is_retryable_authentication_rejection());
             assert_eq!(
                 fixture
@@ -2742,7 +2781,7 @@ mod tests {
                     .start_or_attach(&lease, LaunchDecision::Attach)
                     .await,
                 Err(RunnerError::Definite {
-                    error_code: "codex_image_tool_unauthorized".to_string(),
+                    error_code: error_code.to_string(),
                 })
             );
             assert_eq!(fs::read_to_string(&fixture.invocations).unwrap(), "1\n");

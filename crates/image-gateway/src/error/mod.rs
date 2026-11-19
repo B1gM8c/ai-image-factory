@@ -28,6 +28,7 @@ const CODE_CODEX_CLI_FAILED: &str = "codex_cli_failed";
 const CODE_CODEX_APP_SERVER_REQUEST_REJECTED: &str = "codex_app_server_request_rejected";
 const CODE_CODEX_TURN_FAILED: &str = "codex_turn_failed";
 const CODE_CODEX_IMAGE_TOOL_FAILED: &str = "codex_image_tool_failed";
+const CODE_CODEX_IMAGE_TOOL_IP_NOT_AUTHORIZED: &str = "codex_image_tool_ip_not_authorized";
 const CODE_CODEX_IMAGE_TOOL_UNAUTHORIZED: &str = "codex_image_tool_unauthorized";
 const CODE_CONTENT_POLICY_REJECTED: &str = "content_policy_rejected";
 const CODE_CODEX_EVENT_CAPTURE_INVALID: &str = "codex_event_capture_invalid";
@@ -91,6 +92,29 @@ struct ErrorBody<'a> {
     error_type: &'static str,
     param: Option<&'a str>,
     code: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    diagnostics: Option<UpstreamErrorDiagnostics>,
+}
+
+#[derive(Serialize)]
+struct UpstreamErrorDiagnostics {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason_code: Option<&'static str>,
+    upstream_http_status: u16,
+}
+
+impl UpstreamErrorDiagnostics {
+    fn for_error(code: Option<&str>) -> Option<Self> {
+        let reason_code = match code? {
+            CODE_CODEX_IMAGE_TOOL_IP_NOT_AUTHORIZED => Some("ip_not_authorized"),
+            CODE_CODEX_IMAGE_TOOL_UNAUTHORIZED => None,
+            _ => return None,
+        };
+        Some(Self {
+            reason_code,
+            upstream_http_status: 401,
+        })
+    }
 }
 
 impl ImageGatewayError {
@@ -479,6 +503,10 @@ impl ImageGatewayError {
                 "Codex image generation tool failed",
                 CODE_CODEX_IMAGE_TOOL_FAILED,
             ),
+            CODE_CODEX_IMAGE_TOOL_IP_NOT_AUTHORIZED => (
+                "Upstream image service did not authorize the request IP",
+                CODE_CODEX_IMAGE_TOOL_IP_NOT_AUTHORIZED,
+            ),
             CODE_CODEX_IMAGE_TOOL_UNAUTHORIZED => (
                 "Upstream image service returned an authentication error; server-side verification is required",
                 CODE_CODEX_IMAGE_TOOL_UNAUTHORIZED,
@@ -673,6 +701,7 @@ impl IntoResponse for ImageGatewayError {
                 error_type: self.error_type,
                 param: self.param.as_deref(),
                 code: self.code,
+                diagnostics: UpstreamErrorDiagnostics::for_error(self.code),
             },
         });
 
