@@ -56,7 +56,7 @@ pub(super) async fn project(
         FROM jobs j
         JOIN work_items w ON w.job_id = j.job_id
         JOIN job_auth_attributions attribution ON attribution.job_id = j.job_id
-        JOIN job_payloads payload ON payload.job_id = j.job_id AND payload.command_schema = $5
+        JOIN job_payloads payload ON payload.job_id = j.job_id
         JOIN admission_sessions session ON session.session_id = payload.admission_session_id
           AND session.job_id = j.job_id AND session.tenant_id = j.tenant_id
           AND session.project_id = attribution.project_id AND session.api_profile = $6
@@ -101,7 +101,10 @@ pub(super) async fn project(
         ) observation ON TRUE
         WHERE j.job_id = $1 AND j.tenant_id = $2 AND attribution.project_id = $3
           AND ($4::UUID IS NULL OR attribution.actor_user_id = $4)
-          AND j.provider_id = 'dreamina-cli' AND j.operation IN ('generation', 'edit')
+          AND ((j.provider_id = 'dreamina-cli' AND payload.command_schema = $5 AND j.operation IN ('generation', 'edit'))
+            OR (j.provider_id = 'dreamina-canvas' AND payload.command_schema = 'dreamina-canvas.submit.v1'
+              AND j.operation = 'generation' AND j.output_count = 1
+              AND payload.command_json->>'model_version' = '5.5'))
           AND j.economics_contract_version IN (2, 3, 4)
         "#,
     )
@@ -273,7 +276,12 @@ pub(super) async fn lookup(
               SELECT 1 FROM job_auth_attributions attribution
               JOIN jobs job ON job.job_id = attribution.job_id
               WHERE attribution.job_id = identity.job_id AND attribution.project_id = $2
-                AND job.tenant_id = $1 AND job.provider_id = 'dreamina-cli'
+                AND job.tenant_id = $1
+                AND (job.provider_id = 'dreamina-cli' OR (job.provider_id = 'dreamina-canvas'
+                  AND identity.api_profile = 'dreamina-cli-images-v1' AND identity.operation = 'generation'
+                  AND EXISTS (SELECT 1 FROM job_payloads payload WHERE payload.job_id = job.job_id
+                    AND payload.command_schema = 'dreamina-canvas.submit.v1'
+                    AND payload.command_json->>'model_version' = '5.5')))
                 AND ($6::UUID IS NULL OR attribution.actor_user_id = $6)
           ))
         "#,

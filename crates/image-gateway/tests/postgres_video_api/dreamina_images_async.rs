@@ -1,16 +1,567 @@
 use super::*;
 use gpt_image_2_gateway::{
-    ProviderTaskStore,
+    ProviderPollDriver, ProviderPollDriverCall, ProviderTaskStore,
+    dreamina_canvas::{
+        CANVAS_ADAPTER_REVISION, CANVAS_IMAGE_MODEL, CANVAS_PROVIDER_ID,
+        CANVAS_SUBMIT_COMMAND_SCHEMA, CanvasImagePlan,
+    },
+    executor::{ExecutionProfileProvisioning, provision_dreamina_canvas_execution_profile},
+    provider_management::{PostgresProviderManagementService, ProviderManagementService},
     provider_tasks::{
         ProviderTaskObservation, ProviderTaskObservationOutcome, ProviderTaskObservationSource,
+        RemoteTaskAttach, RemoteTaskSubmitReceipt, RemoteTaskSubmitReservation,
     },
     provision_dreamina_execution_profile,
 };
-use image_provider_sdk::ProviderTaskProgress;
+use image_provider_sdk::{
+    ArtifactMetadata, ArtifactSink, CanonicalCommandPayload, Completed, EffectCertainty,
+    OutputSlot, PollObservation, ProviderFailure, ProviderFailureClass, ProviderTaskProgress,
+    RetryDirective, SingleOutputCommand,
+};
 
 const IMAGES: &str = "/v1/dreamina/images/generations";
 const LOOKUP: &str = "/v1/dreamina/images/by-idempotency-key";
 const KEY: &str = "async-image-original-id";
+
+#[tokio::test]
+async fn dreamina_canvas_routes_55_and_admits_only_one_job_and_hold_per_key() -> TestResult {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::WARN)
+        .with_test_writer()
+        .try_init();
+    let _guard = postgres_video_test_lock().lock().await;
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = Box::pin(run_canvas_image(&database.pool)).await;
+    combine(result, database.cleanup().await)
+}
+
+async fn run_canvas_image(pool: &PgPool) -> TestResult {
+    let root = TempDir::new().map_err(debug_error)?;
+    let home = root.path().join("canvas");
+    let artifacts = root.path().join("artifacts");
+    for path in [&home, &artifacts] {
+        fs::create_dir(path).map_err(debug_error)?;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(debug_error)?;
+    }
+    let provisioned = provision_dreamina_canvas_execution_profile(
+        pool,
+        &ExecutionProfileProvisioning {
+            profile_key: "canvas-async-image-fixture".into(),
+            credential_pool_key: "canvas-async-image-fixture".into(),
+            provider_account_key: "canvas-async-image-fixture".into(),
+            credential_ref: "managed.canvas-async-image-fixture.1".into(),
+            credential_revision: 1,
+            credential_auth_sha256: "c".repeat(64),
+            max_concurrency: 1,
+        },
+        &home,
+    )
+    .await
+    .map_err(debug_error)?;
+    let provider_store = PostgresProviderTaskStore::new(pool.clone());
+    // Register readiness locally. No executor or provider process is started.
+    for role in [ProviderRuntimeRole::Submit, ProviderRuntimeRole::Poll] {
+        provider_store
+            .register_runtime(
+                &ProviderRuntimeRegistration {
+                    runtime_id: Uuid::new_v4(),
+                    execution_profile_id: provisioned.execution_profile_id,
+                    role,
+                    runtime_owner: format!("canvas-async-{role:?}"),
+                },
+                60_000,
+            )
+            .await
+            .map_err(debug_error)?;
+    }
+    let management = PostgresProviderManagementService::new(
+        pool.clone(),
+        root.path().into(),
+        "/nonexistent/test-cli".into(),
+    );
+    let route = management
+        .create_route(
+            serde_json::from_value(json!({
+                "route_key": "canvas-async-image-fixture",
+                "display_name": "Canvas asynchronous image fixture",
+                "provider_id": CANVAS_PROVIDER_ID,
+                "operation_id": "images.generations",
+                "members": [{ "provider_account_id": provisioned.provider_account_id }],
+            }))
+            .map_err(debug_error)?,
+        )
+        .await
+        .map_err(debug_error)?;
+    platform_binding::publish_fixture_route(pool, &home, route.route_id).await?;
+
+    let keys = Arc::new(PostgresApiKeyStore::new(
+        pool.clone(),
+        ApiKeyKeyring::new(1, [(1, vec![0x48; 32])]).map_err(debug_error)?,
+    ));
+    let project = keys
+        .create_project("Canvas image fixture")
+        .await
+        .map_err(debug_error)?;
+    let owner = keys
+        .create_service_account(
+            &project.id,
+            "Owner",
+            ApiKeyPermissionMode::All,
+            ApiKeyPermissions::default(),
+        )
+        .await
+        .map_err(debug_error)?;
+    let reader = keys
+        .create_service_account(
+            &project.id,
+            "Reader",
+            ApiKeyPermissionMode::ReadOnly,
+            ApiKeyPermissions::default(),
+        )
+        .await
+        .map_err(debug_error)?;
+    let model = FixtureModel {
+        api_profile: "dreamina-cli-images-v1",
+        public_model: "5.5",
+        provider_model: "5.5",
+        execution_model: CANVAS_IMAGE_MODEL,
+        media_kind: "image",
+        workflow: None,
+        rate_micros: 1000,
+    };
+    seed_provider_model_economics(pool, &project.id, CANVAS_PROVIDER_ID, model).await?;
+    let blobs = Arc::new(FilesystemArtifactBlobStore::new(&artifacts).map_err(debug_error)?);
+    let app = build_router_with_external_execution_and_control_plane_and_runtime_events_and_model_routing(
+        config(), ExternalImageGatewayComponents {
+            usage_store: Arc::new(PostgresUsageStore::new(pool.clone())), api_key_store: keys,
+            admission_store: Arc::new(PostgresAdmissionStore::new(pool.clone())),
+            settlement_store: Arc::new(PostgresExecutionSettlementStore::new(pool.clone(), blobs.clone())),
+            input_blob_store: blobs.clone(),
+            provider_readiness_store: Arc::new(provider_store.clone()),
+        }, None, None, None, None, Some(Arc::new(PostgresModelRoutingStore::new(pool.clone()))),
+    ).map_err(debug_error)?;
+    let models = image_request(
+        &app,
+        Method::GET,
+        "/v1/models",
+        &reader.api_key.value,
+        None,
+        None,
+        false,
+    )
+    .await?;
+    let surface = json!({
+        "provider_id": "dreamina-cli",
+        "provider_model_id": "5.5",
+        "api_profile": "dreamina-cli-images-v1",
+        "operation_id": "images.generations",
+        "media_kind": "image",
+        "workflows": ["text2image"],
+    });
+    require(
+        models.0 == StatusCode::OK
+            && models.2["data"].as_array().is_some_and(|entries| {
+                entries.iter().any(|entry| {
+                    entry["id"] == "5.5" && entry["metadata"]["surfaces"] == json!([surface])
+                })
+            }),
+        format!("5.5 exposed an incompatible model catalog surface: {models:?}"),
+    )?;
+
+    let body = json!({
+        "prompt": "A paper boat in a rain puddle",
+        "model_version": "5.5",
+        "ratio": "9:16",
+        "resolution_type": "1.5k",
+        "generate_num": 1,
+    });
+    for (field, value, expected_code) in [
+        ("generate_num", json!(2), "unsupported_parameter"),
+        ("resolution_type", json!("2k"), "unsupported_parameter"),
+        ("width", json!(1536), "unsupported_parameter"),
+        ("ratio", json!("9:20"), "invalid_value"),
+    ] {
+        let mut invalid = body.clone();
+        invalid[field] = value;
+        let rejected = image_request(
+            &app,
+            Method::POST,
+            IMAGES,
+            &owner.api_key.value,
+            Some(field),
+            Some(&invalid),
+            true,
+        )
+        .await?;
+        require(
+            rejected.0 == StatusCode::BAD_REQUEST && rejected.2["error"]["code"] == expected_code,
+            format!("unsupported 5.5 shape was not rejected: {rejected:?}"),
+        )?;
+    }
+    let counts = || async {
+        sqlx::query_as::<_, (i64, i64, i64)>(
+            "SELECT (SELECT count(*) FROM jobs), (SELECT count(*) FROM customer_billing_holds),
+                (SELECT count(*) FROM provider_submissions)",
+        )
+        .fetch_one(pool)
+        .await
+        .map_err(debug_error)
+    };
+    require(
+        counts().await? == (0, 0, 0),
+        "invalid Canvas request created work or a hold",
+    )?;
+
+    let submit = || {
+        image_request(
+            &app,
+            Method::POST,
+            IMAGES,
+            &owner.api_key.value,
+            Some(KEY),
+            Some(&body),
+            true,
+        )
+    };
+    let (first, second) = tokio::join!(submit(), submit());
+    let (first, second) = (first?, second?);
+    let (created, competing) = if second.0 == StatusCode::ACCEPTED {
+        (second, first)
+    } else {
+        (first, second)
+    };
+    require(
+        created.0 == StatusCode::ACCEPTED && created.2["status"] == "running",
+        format!("Canvas did not return an async task: {created:?}, {competing:?}"),
+    )?;
+    require(
+        competing == created
+            || (competing.0 == StatusCode::CONFLICT
+                && competing.2["error"]["code"] == "idempotency_in_progress"),
+        format!("concurrent Canvas submission changed identity or failed: {competing:?}"),
+    )?;
+    let job_id = created.2["id"]
+        .as_str()
+        .ok_or("Canvas response omitted task ID")?;
+    let job = Uuid::parse_str(job_id).map_err(debug_error)?;
+    let path = format!("/v1/dreamina/images/{job_id}");
+    require(
+        created.1.as_deref() == Some(path.as_str())
+            && created.2["request"]["model_version"] == "5.5"
+            && created.2["request"]["workflow"] == "text2image"
+            && created.2["request"]["ratio"] == "9:16"
+            && created.2["request"]["resolution_type"] == "1.5k"
+            && created.2["request"]["generate_num"] == 1,
+        format!("Canvas async task omitted compatible request metadata: {created:?}"),
+    )?;
+    require(
+        submit().await? == created,
+        "Canvas replay changed the original task",
+    )?;
+    for lookup in [&path, LOOKUP] {
+        let found = image_request(
+            &app,
+            Method::GET,
+            lookup,
+            &reader.api_key.value,
+            Some(KEY),
+            None,
+            false,
+        )
+        .await?;
+        require(
+            found.0 == StatusCode::OK && found.2 == created.2,
+            format!("Canvas lookup did not recover the original task: {found:?}"),
+        )?;
+    }
+    let pinned: (String, String, String, String, String, i64, i64) = sqlx::query_as(
+        "SELECT attribution.provider_id, payload.command_schema, quote.api_profile,
+             quote.provider_model_id, quote.public_model_id, account.held_micros, account.captured_micros
+         FROM job_payloads payload
+         JOIN job_provider_route_attributions attribution USING (job_id)
+         JOIN customer_price_quotes quote USING (job_id)
+         JOIN billing_accounts account ON account.tenant_id = quote.tenant_id
+         WHERE payload.job_id = $1",
+    )
+    .bind(job)
+    .fetch_one(pool)
+    .await
+    .map_err(debug_error)?;
+    require(
+        pinned
+            == (
+                CANVAS_PROVIDER_ID.to_owned(),
+                CANVAS_SUBMIT_COMMAND_SCHEMA.to_owned(),
+                model.api_profile.to_owned(),
+                model.provider_model.to_owned(),
+                model.public_model.to_owned(),
+                model.rate_micros,
+                0,
+            )
+            && counts().await? == (1, 1, 0),
+        format!(
+            "Canvas replay created duplicate work or changed the original route and hold: {pinned:?}"
+        ),
+    )?;
+
+    let png = settle_canvas_fixture(
+        pool,
+        provider_store,
+        provisioned.execution_profile_id,
+        job,
+        blobs,
+    )
+    .await?;
+    let done = image_request(
+        &app,
+        Method::GET,
+        &path,
+        &reader.api_key.value,
+        None,
+        None,
+        false,
+    )
+    .await?;
+    let found = image_request(
+        &app,
+        Method::GET,
+        LOOKUP,
+        &reader.api_key.value,
+        Some(KEY),
+        None,
+        false,
+    )
+    .await?;
+    let replay = submit().await?;
+    let billed: (i64, i64) = sqlx::query_as(
+        "SELECT held_micros, captured_micros FROM billing_accounts WHERE tenant_id = $1",
+    )
+    .bind(&project.id)
+    .fetch_one(pool)
+    .await
+    .map_err(debug_error)?;
+    require(
+        done.0 == StatusCode::OK
+            && done == found
+            && done.2["id"] == job_id
+            && done.2["status"] == "succeeded"
+            && done.2["data"][0]["b64_json"] == STANDARD.encode(png)
+            && done.2["output_counts"] == json!({"requested":1,"delivered":1,"failed":0})
+            && replay.0 == StatusCode::ACCEPTED
+            && replay.2 == done.2
+            && billed == (0, model.rate_micros)
+            && counts().await? == (1, 1, 1),
+        format!(
+            "Canvas artifact, original identity or one-time settlement was lost: {done:?} {billed:?}"
+        ),
+    )
+}
+
+struct CanvasFixturePayload(String, CanvasImagePlan);
+
+impl CanonicalCommandPayload for CanvasFixturePayload {
+    const SCHEMA_ID: &'static str = CANVAS_SUBMIT_COMMAND_SCHEMA;
+    const ADAPTER_REVISION: &'static str = CANVAS_ADAPTER_REVISION;
+
+    fn source_command_sha256(&self) -> &str {
+        &self.0
+    }
+
+    fn into_canonical_bytes(self, _output: OutputSlot) -> Vec<u8> {
+        serde_json::to_vec(&self.1).expect("Canvas fixture plan serializes")
+    }
+}
+
+struct CanvasFixturePoll {
+    remote_id: String,
+    png: Vec<u8>,
+}
+
+impl ProviderPollDriver for CanvasFixturePoll {
+    fn provider_id(&self) -> &'static str {
+        CANVAS_PROVIDER_ID
+    }
+
+    async fn poll<S: ArtifactSink>(
+        &self,
+        call: &ProviderPollDriverCall,
+        sink: &mut S,
+    ) -> Result<PollObservation, ProviderFailure> {
+        assert_eq!(call.operation().operation_id(), self.remote_id);
+        let artifact_failure = |_| {
+            ProviderFailure::new(
+                ProviderFailureClass::ArtifactInvalid,
+                "offline_canvas_fixture_artifact",
+                EffectCertainty::NoRemoteEffect,
+                RetryDirective::Never,
+            )
+            .expect("fixture failure code is valid")
+        };
+        sink.write_chunk(&self.png)
+            .await
+            .map_err(artifact_failure)?;
+        let artifact = sink
+            .finalize(ArtifactMetadata {
+                media_type: "image/png",
+            })
+            .await
+            .map_err(artifact_failure)?;
+        Ok(PollObservation::Completed(Completed::new(artifact, None)))
+    }
+}
+
+async fn settle_canvas_fixture(
+    pool: &PgPool,
+    tasks: PostgresProviderTaskStore,
+    profile_id: Uuid,
+    job: Uuid,
+    blobs: Arc<FilesystemArtifactBlobStore>,
+) -> TestResult<Vec<u8>> {
+    let executor = Arc::new(PostgresExecutorSubmissionStore::new(pool.clone()));
+    let worker = Workerd::new_handoff_only_with_contract(
+        "canvas-fixture-worker".into(),
+        Arc::new(PostgresAdmissionStore::new(pool.clone())),
+        Arc::new(PostgresExecutionContextStore::new(pool.clone())),
+        executor.clone(),
+        profile_id,
+        CANVAS_SUBMIT_COMMAND_SCHEMA.into(),
+        Duration::from_secs(30),
+        AdmissionContract::CustomerPricingV4,
+    )
+    .map_err(debug_error)?;
+    require(
+        worker.run_once().await.map_err(debug_error)? == Some(job),
+        "Canvas work was not handed off",
+    )?;
+    let lease = executor
+        .claim_prepared(
+            &ExecutorClaimScope {
+                execution_profile_id: profile_id,
+                provider_id: CANVAS_PROVIDER_ID.into(),
+                command_schema: CANVAS_SUBMIT_COMMAND_SCHEMA.into(),
+                adapter_revision: CANVAS_ADAPTER_REVISION.into(),
+            },
+            "canvas-fixture-submit",
+            30_000,
+        )
+        .await
+        .map_err(debug_error)?
+        .ok_or("Canvas submission was not claimable")?;
+    executor.start(&lease).await.map_err(debug_error)?;
+    let command: Value =
+        sqlx::query_scalar("SELECT command_json FROM job_payloads WHERE job_id = $1")
+            .bind(job)
+            .fetch_one(pool)
+            .await
+            .map_err(debug_error)?;
+    let command = SingleOutputCommand::new(
+        OutputSlot::new(0, 1).map_err(debug_error)?,
+        CanvasFixturePayload(
+            lease.command_hash.clone(),
+            serde_json::from_value(command).map_err(debug_error)?,
+        ),
+    )
+    .map_err(debug_error)?;
+    let reservation = RemoteTaskSubmitReservation::new(
+        &lease,
+        format!("offline-canvas-{}", lease.submission_id),
+        command.output(),
+        command.identity(),
+        30_000,
+    );
+    let intent = tasks
+        .reserve_submit(&reservation)
+        .await
+        .map_err(debug_error)?;
+    tasks
+        .start_submit(&reservation)
+        .await
+        .map_err(debug_error)?;
+    // Fixture supplies the acceptance receipt and media. The real stores enforce all fences and accounting.
+    let remote_id = format!("{}:{}", Uuid::new_v4(), lease.submission_id);
+    tasks
+        .record_submit_receipt(&RemoteTaskSubmitReceipt {
+            submission_id: lease.submission_id,
+            executor_execution_id: lease.executor_execution_id,
+            executor_owner: lease.executor_owner.clone(),
+            executor_lease_epoch: lease.executor_lease_epoch,
+            remote_operation_id: remote_id.clone(),
+            provider_request_id: None,
+            event_identity: "canvas-fixture-receipt".into(),
+            execution_binding_sha256: intent.execution_binding_sha256.clone(),
+        })
+        .await
+        .map_err(debug_error)?;
+    tasks
+        .attach(&RemoteTaskAttach {
+            submission_id: lease.submission_id,
+            executor_execution_id: lease.executor_execution_id,
+            executor_owner: lease.executor_owner,
+            executor_lease_epoch: lease.executor_lease_epoch,
+            remote_operation_id: remote_id.clone(),
+            provider_request_id: None,
+            event_identity: "canvas-fixture-attach".into(),
+            execution_binding_sha256: intent.execution_binding_sha256,
+            poll_after_ms: 0,
+            recovery_fence: None,
+        })
+        .await
+        .map_err(debug_error)?;
+    let profile = tasks
+        .load_active_runtime_profile("canvas-async-image-fixture")
+        .await
+        .map_err(debug_error)?;
+    let mut png = Cursor::new(Vec::new());
+    ImageBuffer::from_pixel(16, 24, Rgba([30_u8, 100, 200, 255]))
+        .write_to(&mut png, ImageFormat::Png)
+        .map_err(debug_error)?;
+    let png = png.into_inner();
+    let poll = ProviderPollOrchestrator::new(
+        tasks,
+        CanvasFixturePoll {
+            remote_id,
+            png: png.clone(),
+        },
+        FilesystemProviderArtifactStagerFactory::new(blobs.clone(), 1024 * 1024)
+            .map_err(debug_error)?,
+        ProviderPollOrchestratorConfig {
+            scope: profile.claim_scope(),
+            owner: "canvas-fixture-poll".into(),
+            lease_ms: 30_000,
+            heartbeat_interval: Duration::from_secs(1),
+            max_materializations: 1,
+        },
+    )
+    .map_err(debug_error)?;
+    let result = Box::pin(poll.run_once()).await.map_err(debug_error)?;
+    require(
+        matches!(&result, ProviderPollRun::Observed(task) if task.state == ProviderTaskState::ArtifactReady),
+        format!("Canvas poll did not publish an artifact: {result:?}"),
+    )?;
+
+    let reductions = PostgresExecutorTerminalStore::new(pool.clone());
+    let terminal = reductions
+        .claim_terminal("canvas-fixture-reducer", 30_000)
+        .await
+        .map_err(debug_error)?
+        .ok_or("Canvas reduction not queued")?;
+    let artifact = CustomerArtifactPublisher::new(blobs)
+        .publish(&terminal)
+        .await
+        .map_err(debug_error)?;
+    let completion = reductions
+        .complete_terminal(&terminal, Some(&artifact))
+        .await
+        .map_err(debug_error)?;
+    let replay = reductions
+        .complete_terminal(&terminal, Some(&artifact))
+        .await
+        .map_err(debug_error)?;
+    require(completion == replay, "Canvas settlement changed on replay")?;
+    Ok(png)
+}
 
 #[tokio::test]
 async fn dreamina_async_images_keep_original_id_progress_scope_and_artifact() -> TestResult {

@@ -4645,6 +4645,7 @@ fn default_model_aliases(
         ("grok-cli", "images.generations" | "images.edits") => "xai-images-v1",
         ("grok-cli", "videos.generations") => "xai-videos-v1",
         ("dreamina-cli", "images.generations") => "dreamina-cli-images-v1",
+        ("dreamina-canvas", "images.generations") if model_id == "5.5" => "dreamina-cli-images-v1",
         ("dreamina-cli", "videos.generations") => "dreamina-cli-videos-v1",
         _ => return aliases,
     };
@@ -4703,6 +4704,11 @@ fn supported_api_profile(provider_id: &str, operation_id: &str, api_profile: &st
                 "dreamina-cli",
                 "videos.generations",
                 "dreamina-cli-videos-v1" | "volcengine-ark-content-generation-v3"
+            )
+            | (
+                "dreamina-canvas",
+                "images.generations",
+                "dreamina-cli-images-v1"
             )
     )
 }
@@ -5625,3 +5631,7 @@ mod tests {
 #[cfg(test)]
 #[path = "postgres/dreamina_login_session_tests.rs"]
 mod dreamina_login_session_tests;
+
+#[cfg(test)]
+#[path = "postgres/dreamina_canvas_route_tests.rs"]
+mod dreamina_canvas_route_tests;

@@ -192,6 +192,7 @@ pub use provider_tasks::{
     recover_dreamina_video_supplement_acceptance_operator,
 };
 pub use provider_uploads::ProviderUploadService;
+pub use providers::dreamina_canvas;
 pub use providers::dreamina_cli::{
     DreaminaCliCapacityQueryDriverV1, DreaminaCliCodecConfigError,
     DreaminaCliPollDriverConfigError, DreaminaCliPollDriverV1, DreaminaCliPollProcessConfig,

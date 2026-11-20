@@ -52,8 +52,8 @@ pub use provisioning::{
     ProvisionedExecutionProfile, ProvisionedGrokExecutionProfile,
     provision_codex_cli_edit_execution_profile,
     provision_codex_edit_execution_profile_in_transaction, provision_codex_execution_profile,
-    provision_codex_execution_profile_in_transaction, provision_dreamina_execution_profile,
-    provision_dreamina_execution_profile_in_transaction,
+    provision_codex_execution_profile_in_transaction, provision_dreamina_canvas_execution_profile,
+    provision_dreamina_execution_profile, provision_dreamina_execution_profile_in_transaction,
     provision_dreamina_video_execution_profile,
     provision_dreamina_video_execution_profile_in_transaction,
     provision_grok_edit_execution_profile, provision_grok_edit_execution_profile_in_transaction,
@@ -62,6 +62,7 @@ pub use provisioning::{
     provision_grok_image_execution_profile_replacement, provision_grok_video_execution_profile,
     provision_grok_video_execution_profile_in_transaction,
     provision_grok_video_execution_profile_replacement, provision_grok_video_v2_execution_profile,
+    validate_dreamina_canvas_home,
 };
 pub use runner::{
     DurableEvidenceRecovery, DurableRunner, DurableRunnerResult, ExecutorArtifactSink,

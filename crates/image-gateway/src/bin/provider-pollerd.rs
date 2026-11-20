@@ -3,9 +3,10 @@ use std::{env, path::PathBuf, sync::Arc, time::Duration};
 use gpt_image_2_gateway::{
     DreaminaCliCapacityQueryDriverV1, DreaminaCliPollDriverV1, DreaminaCliPollProcessConfig,
     FilesystemArtifactBlobStore, FilesystemProviderArtifactStagerFactory, ImageGatewayError,
-    PostgresProviderTaskStore, ProviderAccountHomeCapability, ProviderCapacityReconciliationWorker,
-    ProviderPollDaemon, ProviderPollDaemonConfig, ProviderPollDaemonError,
-    ProviderPollOrchestrator, ProviderPollOrchestratorConfig, ProviderRuntimeProfileStore,
+    PostgresProviderTaskStore, ProviderAccountHomeCapability, ProviderCapacityQueryDriver,
+    ProviderCapacityReconciliationWorker, ProviderPollDaemon, ProviderPollDaemonConfig,
+    ProviderPollDaemonError, ProviderPollDriver, ProviderPollOrchestrator,
+    ProviderPollOrchestratorConfig, ProviderRuntimeProfile, ProviderRuntimeProfileStore,
     ProviderRuntimeRegistration, ProviderRuntimeRole, ProviderRuntimeSupervisor,
     ProviderRuntimeSupervisorConfig, ProviderRuntimeSupervisorError, ProviderTaskStoreError,
     artifacts::artifact_root_from_env,
@@ -13,13 +14,17 @@ use gpt_image_2_gateway::{
         connect_pool_with_schema, database_schema_from_env, database_url_from_env,
         verify_migrations, worker_database_max_connections_from_env,
     },
+    dreamina_canvas::{
+        CANVAS_PROVIDER_ID, CanvasCliCapacityQueryDriver, CanvasCliConfig, CanvasCliPollDriver,
+        CanvasCliProcessConfig,
+    },
+    executor::validate_dreamina_canvas_home,
     init_telemetry, prepare_dreamina_account_home,
 };
 use image_cli_runtime::WorkingDirectory;
 use image_provider_dreamina_cli::PROVIDER_ID as DREAMINA_PROVIDER_ID;
 use uuid::Uuid;
 
-const ACTIVATION_TOKENS: &[&str] = &["dreamina-remote-poll-v1", "dreamina-image-v1"];
 const DEFAULT_LEASE_MS: u64 = 60_000;
 const DEFAULT_HEARTBEAT_MS: u64 = 10_000;
 const DEFAULT_IDLE_DELAY_MS: u64 = 250;
@@ -33,6 +38,7 @@ const DEFAULT_RUNTIME_HEARTBEAT_MS: u64 = 10_000;
 const MAX_DURATION_MS: u64 = 24 * 60 * 60 * 1_000;
 
 struct ProviderPollerConfig {
+    canvas: Option<CanvasPollerConfig>,
     profile_key: String,
     owner: String,
     credential_pool_id: Uuid,
@@ -58,13 +64,22 @@ struct ProviderPollerConfig {
     runtime_heartbeat_interval: Duration,
 }
 
+struct CanvasPollerConfig {
+    state_dir: PathBuf,
+    project_id: Uuid,
+    oauth_profile: String,
+}
+
 impl ProviderPollerConfig {
     fn from_env() -> Result<Self, ImageGatewayError> {
-        if !ACTIVATION_TOKENS.contains(&required_env("PROVIDER_POLLER_ACTIVATION")?.as_str()) {
-            return Err(ImageGatewayError::config(
-                "PROVIDER_POLLER_ACTIVATION does not enable a supported provider runtime",
-            ));
-        }
+        let canvas = match activated_provider(&required_env("PROVIDER_POLLER_ACTIVATION")?)? {
+            CANVAS_PROVIDER_ID => Some(CanvasPollerConfig {
+                state_dir: absolute_env_path("DREAMINA_CANVAS_STATE_DIR")?,
+                project_id: env_uuid("DREAMINA_CANVAS_PROJECT_ID")?,
+                oauth_profile: required_env("DREAMINA_CANVAS_OAUTH_PROFILE")?,
+            }),
+            _ => None,
+        };
         let profile_key = required_env("PROVIDER_POLLER_PROFILE_KEY")?;
         let owner = optional_env("PROVIDER_POLLER_OWNER")
             .unwrap_or_else(|| format!("provider-pollerd-{}", Uuid::new_v4().simple()));
@@ -153,6 +168,7 @@ impl ProviderPollerConfig {
             ));
         }
         Ok(Self {
+            canvas,
             profile_key,
             owner,
             credential_pool_id,
@@ -183,23 +199,56 @@ impl ProviderPollerConfig {
     }
 }
 
+fn activated_provider(token: &str) -> Result<&'static str, ImageGatewayError> {
+    match token {
+        "dreamina-remote-poll-v1" | "dreamina-image-v1" => Ok(DREAMINA_PROVIDER_ID),
+        "dreamina-canvas-poll-v1" => Ok(CANVAS_PROVIDER_ID),
+        _ => Err(ImageGatewayError::config(
+            "PROVIDER_POLLER_ACTIVATION does not enable a supported provider runtime",
+        )),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), ImageGatewayError> {
     let config = ProviderPollerConfig::from_env()?;
-    prepare_dreamina_account_home(&config.account_home)
-        .await
-        .map_err(|error| ImageGatewayError::config(error.to_string()))?;
     let telemetry = init_telemetry()?;
     let database_url = database_url_from_env()?;
     let database_schema = database_schema_from_env()?;
     let max_connections = worker_database_max_connections_from_env()?;
     let pool = connect_pool_with_schema(&database_url, max_connections, &database_schema).await?;
     verify_migrations(&pool).await?;
-    let store = PostgresProviderTaskStore::new(pool);
+    let store = PostgresProviderTaskStore::new(pool.clone());
     let profile = store
         .load_active_runtime_profile(&config.profile_key)
         .await
         .map_err(map_profile_error)?;
+    let provider_id = if config.canvas.is_some() {
+        CANVAS_PROVIDER_ID
+    } else {
+        DREAMINA_PROVIDER_ID
+    };
+    if profile.provider_id() != provider_id
+        || config.canvas.is_some() && profile.max_in_flight() != 1
+    {
+        return Err(ImageGatewayError::config(
+            "provider-pollerd activation does not match the execution profile",
+        ));
+    }
+    if provider_id == DREAMINA_PROVIDER_ID {
+        prepare_dreamina_account_home(&config.account_home)
+            .await
+            .map_err(|error| ImageGatewayError::config(error.to_string()))?;
+    } else {
+        validate_dreamina_canvas_home(
+            &pool,
+            profile.provider_account_id(),
+            &config.account_home,
+            profile.credential_auth_sha256(),
+        )
+        .await
+        .map_err(|error| ImageGatewayError::config(error.to_string()))?;
+    }
     if config.max_materializations > profile.max_in_flight() {
         return Err(ImageGatewayError::config(
             "PROVIDER_POLLER_MAX_MATERIALIZATIONS exceeds profile concurrency",
@@ -207,12 +256,12 @@ async fn main() -> Result<(), ImageGatewayError> {
     }
 
     let account_home = ProviderAccountHomeCapability::new(
-        DREAMINA_PROVIDER_ID,
+        provider_id,
         config.credential_pool_id,
         config.provider_account_id,
-        config.credential_ref,
+        &config.credential_ref,
         config.credential_revision,
-        config.credential_auth_sha256,
+        &config.credential_auth_sha256,
         &config.account_home,
     )
     .map_err(|error| ImageGatewayError::config(error.to_string()))?;
@@ -226,48 +275,119 @@ async fn main() -> Result<(), ImageGatewayError> {
         workspace_root.path(),
         capacity_workspace_root.path(),
     )?;
+    if let Some(canvas) = &config.canvas {
+        validate_isolated_roots(
+            &artifact_root,
+            &config.account_home,
+            &canvas.state_dir,
+            capacity_workspace_root.path(),
+        )?;
+    }
     let artifacts = Arc::new(FilesystemArtifactBlobStore::new(artifact_root)?);
     let stagers = FilesystemProviderArtifactStagerFactory::new(
         Arc::clone(&artifacts),
         config.max_artifact_bytes,
     )
     .map_err(|error| ImageGatewayError::config(error.to_string()))?;
-    let driver = DreaminaCliPollDriverV1::from_runtime_profile(
-        &profile,
-        &account_home,
-        DreaminaCliPollProcessConfig::new(
-            &config.executable,
-            config.executable_sha256,
-            workspace_root,
-            config.cli_wall_timeout,
-            config.cli_termination_grace,
-            config.max_artifact_bytes,
-        ),
-    )
-    .map_err(|error| ImageGatewayError::config(error.to_string()))?;
-    let capacity_driver = DreaminaCliCapacityQueryDriverV1::from_runtime_profile(
-        &profile,
-        &account_home,
-        DreaminaCliPollProcessConfig::new(
-            &config.executable,
-            config.executable_sha256,
-            capacity_workspace_root,
-            config.cli_wall_timeout.min(Duration::from_secs(20)),
-            config.cli_termination_grace,
-            config.max_artifact_bytes,
-        ),
-    )
-    .map_err(|error| ImageGatewayError::config(error.to_string()))?;
+    match &config.canvas {
+        Some(canvas) => {
+            let cli = CanvasCliConfig::from_runtime_profile(
+                &profile,
+                &account_home,
+                CanvasCliProcessConfig {
+                    executable: config.executable.clone(),
+                    executable_sha256: config.executable_sha256,
+                    workspace: workspace_root,
+                    state_dir: canvas.state_dir.clone(),
+                    project_id: canvas.project_id,
+                    oauth_profile: canvas.oauth_profile.clone(),
+                    wall_timeout: config.cli_wall_timeout,
+                    termination_grace: config.cli_termination_grace,
+                },
+            )
+            .map_err(|error| ImageGatewayError::config(error.to_string()))?;
+            cli.verify_authenticated().await.map_err(|_| {
+                ImageGatewayError::config("Canvas OAuth profile is unavailable to the poller")
+            })?;
+            let capacity_driver =
+                CanvasCliCapacityQueryDriver::new(cli.clone(), capacity_workspace_root)
+                    .map_err(|error| ImageGatewayError::config(error.to_string()))?;
+            let driver = CanvasCliPollDriver::new(cli)
+                .map_err(|error| ImageGatewayError::config(error.to_string()))?;
+            run_poller(
+                &config,
+                &profile,
+                store,
+                stagers,
+                driver,
+                Some(capacity_driver),
+            )
+            .await?;
+        }
+        None => {
+            let driver = DreaminaCliPollDriverV1::from_runtime_profile(
+                &profile,
+                &account_home,
+                DreaminaCliPollProcessConfig::new(
+                    &config.executable,
+                    config.executable_sha256,
+                    workspace_root,
+                    config.cli_wall_timeout,
+                    config.cli_termination_grace,
+                    config.max_artifact_bytes,
+                ),
+            )
+            .map_err(|error| ImageGatewayError::config(error.to_string()))?;
+            let capacity_driver = DreaminaCliCapacityQueryDriverV1::from_runtime_profile(
+                &profile,
+                &account_home,
+                DreaminaCliPollProcessConfig::new(
+                    &config.executable,
+                    config.executable_sha256,
+                    capacity_workspace_root,
+                    config.cli_wall_timeout.min(Duration::from_secs(20)),
+                    config.cli_termination_grace,
+                    config.max_artifact_bytes,
+                ),
+            )
+            .map_err(|error| ImageGatewayError::config(error.to_string()))?;
+            run_poller(
+                &config,
+                &profile,
+                store,
+                stagers,
+                driver,
+                Some(capacity_driver),
+            )
+            .await?;
+        }
+    }
+    telemetry.shutdown();
+    Ok(())
+}
+
+async fn run_poller<D: ProviderPollDriver, C: ProviderCapacityQueryDriver>(
+    config: &ProviderPollerConfig,
+    profile: &ProviderRuntimeProfile,
+    store: PostgresProviderTaskStore,
+    stagers: FilesystemProviderArtifactStagerFactory,
+    driver: D,
+    capacity_driver: Option<C>,
+) -> Result<(), ImageGatewayError> {
     let scope = profile.claim_scope();
-    let capacity_worker = ProviderCapacityReconciliationWorker::new(
-        store.clone(),
-        capacity_driver,
-        scope.clone(),
-        config.owner.clone(),
-        config.lease_ms,
-        config.heartbeat_interval,
-    )
-    .map_err(|error| ImageGatewayError::config(error.to_string()))?;
+    let capacity_worker = capacity_driver
+        .map(|capacity_driver| {
+            ProviderCapacityReconciliationWorker::new(
+                store.clone(),
+                capacity_driver,
+                scope.clone(),
+                config.owner.clone(),
+                config.lease_ms,
+                config.heartbeat_interval,
+            )
+        })
+        .transpose()
+        .map_err(|error| ImageGatewayError::config(error.to_string()))?;
     let orchestrator = Arc::new(
         ProviderPollOrchestrator::new(
             store.clone(),
@@ -321,6 +441,9 @@ async fn main() -> Result<(), ImageGatewayError> {
                 "provider-pollerd started"
             );
             async {
+                let Some(capacity_worker) = capacity_worker else {
+                    return daemon.run_until_shutdown(shutdown.wait()).await;
+                };
                 let (stop_capacity, capacity_stopped) = tokio::sync::oneshot::channel();
                 let capacity_shutdown = shutdown.clone();
                 let (report, ()) = tokio::join!(
@@ -350,7 +473,6 @@ async fn main() -> Result<(), ImageGatewayError> {
         errors = report.errors,
         "provider-pollerd stopped"
     );
-    telemetry.shutdown();
     Ok(())
 }
 
@@ -571,6 +693,18 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn poll_activations_select_only_the_bound_provider() {
+        assert_eq!(
+            activated_provider("dreamina-canvas-poll-v1").unwrap(),
+            CANVAS_PROVIDER_ID
+        );
+        for token in ["dreamina-remote-poll-v1", "dreamina-image-v1"] {
+            assert_eq!(activated_provider(token).unwrap(), DREAMINA_PROVIDER_ID);
+        }
+        assert!(activated_provider("dreamina-canvas-submit-v1").is_err());
+    }
 
     #[test]
     fn artifact_account_and_workspace_roots_must_be_separate_trees() {

@@ -8,7 +8,9 @@ use std::{
 
 use uuid::Uuid;
 
-use gpt_image_2_gateway::executor::provision_grok_video_v2_execution_profile;
+use gpt_image_2_gateway::executor::{
+    provision_dreamina_canvas_execution_profile, provision_grok_video_v2_execution_profile,
+};
 use gpt_image_2_gateway::{
     BlockedTerminalRequeueError, CodexExecutionProfileProvisioning, CodexProfileProvisioningError,
     DreaminaAcceptedTerminalResolutionRequest, DreaminaComplianceRejectionResolutionRequest,
@@ -47,6 +49,8 @@ enum Command {
     ProvisionGrokProfile,
     ProvisionGrokVideoProfile,
     ProvisionGrokVideoV2Profile,
+    ProvisionDreaminaCanvasProfile,
+    ServeDreaminaCanvasKeyring,
     ProvisionGrokVideoProfileReplacement {
         source_profile_key: String,
         replacement_profile_key: String,
@@ -163,7 +167,7 @@ where
 {
     let mut args = args.into_iter();
     let command = args.next().ok_or_else(|| {
-        "missing command: expected `migrate`, `bootstrap-admin`, `provision-codex-profile`, `provision-codex-cli-edit-profile`, `provision-grok-profile`, `provision-grok-video-profile`, `provision-grok-video-v2-profile`, `provision-grok-image-profile-replacement`, `provision-grok-edit-profile-replacement`, `provision-grok-video-profile-replacement`, `reconcile-execution-profile-routes`, `reconcile-dreamina-profiles`, `reconcile-inline-customer-settlement`, `terminalize-unstarted-job`, `cancel-unlaunched-job`, `refresh-provider-quota`, `refresh-codex-credential`, `resolve-dreamina-accepted-terminal`, `resolve-dreamina-compliance-rejection`, `resolve-dreamina-image-success`, `resolve-dreamina-video-success`, `resolve-dreamina-video-archive`, `confirm-dreamina-video-cancellation`, `confirm-dreamina-video-supplement-cancellation`, `prepare-dreamina-image-supplement`, `dispatch-dreamina-image-supplement`, `poll-dreamina-image-supplement`, `publish-dreamina-image-supplement`, `prepare-dreamina-video-supplement`, `prepare-dreamina-video-supplement-successor`, `dispatch-dreamina-video-supplement`, `poll-dreamina-video-supplement`, `recover-dreamina-video-supplement-acceptance`, or `retry-blocked-terminal`"
+        "missing command: expected `migrate`, `bootstrap-admin`, `provision-codex-profile`, `provision-codex-cli-edit-profile`, `provision-grok-profile`, `provision-grok-video-profile`, `provision-grok-video-v2-profile`, `provision-dreamina-canvas-profile`, `serve-dreamina-canvas-keyring`, `provision-grok-image-profile-replacement`, `provision-grok-edit-profile-replacement`, `provision-grok-video-profile-replacement`, `reconcile-execution-profile-routes`, `reconcile-dreamina-profiles`, `reconcile-inline-customer-settlement`, `terminalize-unstarted-job`, `cancel-unlaunched-job`, `refresh-provider-quota`, `refresh-codex-credential`, `resolve-dreamina-accepted-terminal`, `resolve-dreamina-compliance-rejection`, `resolve-dreamina-image-success`, `resolve-dreamina-video-success`, `resolve-dreamina-video-archive`, `confirm-dreamina-video-cancellation`, `confirm-dreamina-video-supplement-cancellation`, `prepare-dreamina-image-supplement`, `dispatch-dreamina-image-supplement`, `poll-dreamina-image-supplement`, `publish-dreamina-image-supplement`, `prepare-dreamina-video-supplement`, `prepare-dreamina-video-supplement-successor`, `dispatch-dreamina-video-supplement`, `poll-dreamina-video-supplement`, `recover-dreamina-video-supplement-acceptance`, or `retry-blocked-terminal`"
             .to_string()
     })?;
     let command = match command.as_ref() {
@@ -182,6 +186,8 @@ where
         "provision-grok-profile" => Command::ProvisionGrokProfile,
         "provision-grok-video-profile" => Command::ProvisionGrokVideoProfile,
         "provision-grok-video-v2-profile" => Command::ProvisionGrokVideoV2Profile,
+        "provision-dreamina-canvas-profile" => Command::ProvisionDreaminaCanvasProfile,
+        "serve-dreamina-canvas-keyring" => Command::ServeDreaminaCanvasKeyring,
         "provision-grok-video-profile-replacement" => {
             let source_profile_key = required_argument(
                 &mut args,
@@ -668,7 +674,7 @@ where
         }
         value => {
             return Err(format!(
-                "unknown command `{value}`: expected `migrate`, `bootstrap-admin`, `provision-codex-profile`, `provision-codex-cli-edit-profile`, `provision-grok-profile`, `provision-grok-video-profile`, `provision-grok-video-v2-profile`, `provision-grok-image-profile-replacement`, `provision-grok-edit-profile-replacement`, `provision-grok-video-profile-replacement`, `reconcile-execution-profile-routes`, `reconcile-dreamina-profiles`, `reconcile-inline-customer-settlement`, `terminalize-unstarted-job`, `cancel-unlaunched-job`, `refresh-provider-quota`, `refresh-codex-credential`, `resolve-dreamina-accepted-terminal`, `resolve-dreamina-compliance-rejection`, `resolve-dreamina-image-success`, `resolve-dreamina-video-success`, `resolve-dreamina-video-archive`, `confirm-dreamina-video-cancellation`, `confirm-dreamina-video-supplement-cancellation`, `prepare-dreamina-image-supplement`, `dispatch-dreamina-image-supplement`, `poll-dreamina-image-supplement`, `publish-dreamina-image-supplement`, `prepare-dreamina-video-supplement`, `prepare-dreamina-video-supplement-successor`, `dispatch-dreamina-video-supplement`, `poll-dreamina-video-supplement`, `recover-dreamina-video-supplement-acceptance`, or `retry-blocked-terminal`"
+                "unknown command `{value}`: expected `migrate`, `bootstrap-admin`, `provision-codex-profile`, `provision-codex-cli-edit-profile`, `provision-grok-profile`, `provision-grok-video-profile`, `provision-grok-video-v2-profile`, `provision-dreamina-canvas-profile`, `serve-dreamina-canvas-keyring`, `provision-grok-image-profile-replacement`, `provision-grok-edit-profile-replacement`, `provision-grok-video-profile-replacement`, `reconcile-execution-profile-routes`, `reconcile-dreamina-profiles`, `reconcile-inline-customer-settlement`, `terminalize-unstarted-job`, `cancel-unlaunched-job`, `refresh-provider-quota`, `refresh-codex-credential`, `resolve-dreamina-accepted-terminal`, `resolve-dreamina-compliance-rejection`, `resolve-dreamina-image-success`, `resolve-dreamina-video-success`, `resolve-dreamina-video-archive`, `confirm-dreamina-video-cancellation`, `confirm-dreamina-video-supplement-cancellation`, `prepare-dreamina-image-supplement`, `dispatch-dreamina-image-supplement`, `poll-dreamina-image-supplement`, `publish-dreamina-image-supplement`, `prepare-dreamina-video-supplement`, `prepare-dreamina-video-supplement-successor`, `dispatch-dreamina-video-supplement`, `poll-dreamina-video-supplement`, `recover-dreamina-video-supplement-acceptance`, or `retry-blocked-terminal`"
             ));
         }
     };
@@ -724,6 +730,7 @@ async fn main() -> Result<(), ImageGatewayError> {
     }
     let provisioning = match &command {
         Command::Migrate | Command::VerifyMigrations => None,
+        Command::ServeDreaminaCanvasKeyring => return serve_dreamina_canvas_keyring().await,
         Command::ProvisionCodexProfile | Command::ProvisionCodexCliEditProfile => {
             let credential_home = provider_credential_home("EXECUTOR_CODEX_CREDENTIAL_HOME")?;
             Some(provisioning_from_env(codex_auth_file_sha256(
@@ -744,6 +751,7 @@ async fn main() -> Result<(), ImageGatewayError> {
         | Command::ProvisionGrokVideoProfileReplacement { .. }
         | Command::ReconcileExecutionProfileRoutes
         | Command::ReconcileDreaminaProfiles
+        | Command::ProvisionDreaminaCanvasProfile
         | Command::ReconcileInlineCustomerSettlement { .. }
         | Command::ResolveDreaminaAcceptedTerminal { .. }
         | Command::ResolveDreaminaComplianceRejection { .. }
@@ -772,6 +780,7 @@ async fn main() -> Result<(), ImageGatewayError> {
     let pool =
         connect_pool_with_schema(&database_url, DEFAULT_MAX_CONNECTIONS, &database_schema).await?;
     match command {
+        Command::ServeDreaminaCanvasKeyring => unreachable!("handled before database connection"),
         Command::Migrate => {
             run_migrations(&pool).await?;
             println!("database migrations complete");
@@ -843,6 +852,21 @@ async fn main() -> Result<(), ImageGatewayError> {
             println!(
                 "Grok video V2 execution profile provisioned: {}",
                 provisioned.execution_profile_id
+            );
+        }
+        Command::ProvisionDreaminaCanvasProfile => {
+            verify_migrations(&pool).await?;
+            let home = absolute_env_path("EXECUTOR_CANVAS_CREDENTIAL_HOME")?;
+            let fingerprint = required_env("EXECUTOR_CANVAS_ACCOUNT_FINGERPRINT_SHA256")?;
+            let provisioning = provisioning_from_env(fingerprint)?;
+            let profile = provision_dreamina_canvas_execution_profile(&pool, &provisioning, &home)
+                .await
+                .map_err(|error| map_provisioning_error("Dreamina Canvas", error))?;
+            println!(
+                "Canvas execution profile provisioned: {}\nCanvas provider account: {}\nCanvas credential pool: {}",
+                profile.execution_profile_id,
+                profile.provider_account_id,
+                profile.credential_pool_id
             );
         }
         Command::ProvisionGrokVideoProfileReplacement {
@@ -1548,6 +1572,78 @@ fn provisioning_from_env(
     })
 }
 
+#[cfg(any(target_os = "linux", test))]
+fn valid_canvas_keyring_home(home: &Path) -> bool {
+    let root = Path::new("/var/lib/ai-image-factory/provider-homes/dreamina-canvas");
+    home.parent() == Some(root)
+        && home
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| {
+                !name.is_empty()
+                    && name.len() <= 64
+                    && name
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+            })
+}
+
+#[cfg(target_os = "linux")]
+async fn serve_dreamina_canvas_keyring() -> Result<(), ImageGatewayError> {
+    use gpt_image_2_gateway::prepare_dreamina_account_home;
+    use image_cli_runtime::WorkingDirectory;
+    use std::time::Duration;
+
+    let configured = absolute_env_path("EXECUTOR_CANVAS_CREDENTIAL_HOME")?;
+    let uid = unsafe { libc::geteuid() };
+    if uid == 0 || !valid_canvas_keyring_home(&configured) {
+        return Err(ImageGatewayError::config(
+            "Canvas keyring requires a dedicated account HOME and an unprivileged service user",
+        ));
+    }
+    let home = WorkingDirectory::new_private(&configured).map_err(|_| {
+        ImageGatewayError::config("Canvas keyring account HOME is unavailable or not private")
+    })?;
+    if home.path().as_os_str() != configured.as_os_str() {
+        return Err(ImageGatewayError::config(
+            "Canvas keyring requires the canonical account HOME path",
+        ));
+    }
+    let owner_lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(home.path().join(".factory-canvas-keyring-supervisor.lock"))
+        .map_err(|_| ImageGatewayError::config("Canvas keyring supervisor lock is unavailable"))?;
+    let lock_metadata = owner_lock
+        .metadata()
+        .map_err(|_| ImageGatewayError::config("Canvas keyring supervisor lock is unavailable"))?;
+    if !lock_metadata.is_file() || lock_metadata.uid() != uid || lock_metadata.mode() & 0o077 != 0 {
+        return Err(ImageGatewayError::config(
+            "Canvas keyring supervisor lock is not private",
+        ));
+    }
+    owner_lock
+        .try_lock()
+        .map_err(|_| ImageGatewayError::config("Canvas keyring already has a supervisor"))?;
+
+    loop {
+        prepare_dreamina_account_home(home.path())
+            .await
+            .map_err(|_| ImageGatewayError::config("Canvas Secret Service is unavailable"))?;
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn serve_dreamina_canvas_keyring() -> Result<(), ImageGatewayError> {
+    Err(ImageGatewayError::config(
+        "Canvas Secret Service supervision requires Linux",
+    ))
+}
+
 fn required_env(name: &str) -> Result<String, ImageGatewayError> {
     env::var(name)
         .ok()
@@ -1623,8 +1719,8 @@ fn map_provisioning_error(
 #[cfg(test)]
 mod tests {
     use super::require_cancellation_operator_uid;
-    use super::{Command, init_tracing, parse_command};
-    use std::path::PathBuf;
+    use super::{Command, init_tracing, parse_command, valid_canvas_keyring_home};
+    use std::path::{Path, PathBuf};
     use uuid::Uuid;
 
     #[test]
@@ -1698,6 +1794,38 @@ mod tests {
             parse_command(["provision-grok-video-profile"]),
             Ok(Command::ProvisionGrokVideoProfile)
         );
+    }
+
+    #[test]
+    fn accepts_only_explicit_canvas_profile_provisioning_command() {
+        assert_eq!(
+            parse_command(["provision-dreamina-canvas-profile"]),
+            Ok(Command::ProvisionDreaminaCanvasProfile)
+        );
+        assert!(parse_command(["provision-dreamina-canvas-profile", "unexpected"]).is_err());
+    }
+
+    #[test]
+    fn canvas_keyring_command_has_a_dedicated_home() {
+        assert_eq!(
+            parse_command(["serve-dreamina-canvas-keyring"]),
+            Ok(Command::ServeDreaminaCanvasKeyring)
+        );
+        assert!(parse_command(["serve-dreamina-canvas-keyring", "unexpected"]).is_err());
+        let root = "/var/lib/ai-image-factory/provider-homes";
+        assert!(valid_canvas_keyring_home(Path::new(&format!(
+            "{root}/dreamina-canvas/factory-a"
+        ))));
+        for suffix in [
+            "dreamina-canvas",
+            "dreamina-canvas/../native",
+            "dreamina-canvas/sub/home",
+            "dreamina-cli/factory-a",
+        ] {
+            assert!(!valid_canvas_keyring_home(Path::new(&format!(
+                "{root}/{suffix}"
+            ))));
+        }
     }
 
     #[test]
@@ -2335,7 +2463,7 @@ mod tests {
     fn rejects_missing_command() {
         assert_eq!(
             parse_command([] as [&str; 0]),
-            Err("missing command: expected `migrate`, `bootstrap-admin`, `provision-codex-profile`, `provision-codex-cli-edit-profile`, `provision-grok-profile`, `provision-grok-video-profile`, `provision-grok-video-v2-profile`, `provision-grok-image-profile-replacement`, `provision-grok-edit-profile-replacement`, `provision-grok-video-profile-replacement`, `reconcile-execution-profile-routes`, `reconcile-dreamina-profiles`, `reconcile-inline-customer-settlement`, `terminalize-unstarted-job`, `cancel-unlaunched-job`, `refresh-provider-quota`, `refresh-codex-credential`, `resolve-dreamina-accepted-terminal`, `resolve-dreamina-compliance-rejection`, `resolve-dreamina-image-success`, `resolve-dreamina-video-success`, `resolve-dreamina-video-archive`, `confirm-dreamina-video-cancellation`, `confirm-dreamina-video-supplement-cancellation`, `prepare-dreamina-image-supplement`, `dispatch-dreamina-image-supplement`, `poll-dreamina-image-supplement`, `publish-dreamina-image-supplement`, `prepare-dreamina-video-supplement`, `prepare-dreamina-video-supplement-successor`, `dispatch-dreamina-video-supplement`, `poll-dreamina-video-supplement`, `recover-dreamina-video-supplement-acceptance`, or `retry-blocked-terminal`".to_string())
+            Err("missing command: expected `migrate`, `bootstrap-admin`, `provision-codex-profile`, `provision-codex-cli-edit-profile`, `provision-grok-profile`, `provision-grok-video-profile`, `provision-grok-video-v2-profile`, `provision-dreamina-canvas-profile`, `serve-dreamina-canvas-keyring`, `provision-grok-image-profile-replacement`, `provision-grok-edit-profile-replacement`, `provision-grok-video-profile-replacement`, `reconcile-execution-profile-routes`, `reconcile-dreamina-profiles`, `reconcile-inline-customer-settlement`, `terminalize-unstarted-job`, `cancel-unlaunched-job`, `refresh-provider-quota`, `refresh-codex-credential`, `resolve-dreamina-accepted-terminal`, `resolve-dreamina-compliance-rejection`, `resolve-dreamina-image-success`, `resolve-dreamina-video-success`, `resolve-dreamina-video-archive`, `confirm-dreamina-video-cancellation`, `confirm-dreamina-video-supplement-cancellation`, `prepare-dreamina-image-supplement`, `dispatch-dreamina-image-supplement`, `poll-dreamina-image-supplement`, `publish-dreamina-image-supplement`, `prepare-dreamina-video-supplement`, `prepare-dreamina-video-supplement-successor`, `dispatch-dreamina-video-supplement`, `poll-dreamina-video-supplement`, `recover-dreamina-video-supplement-acceptance`, or `retry-blocked-terminal`".to_string())
         );
     }
 
@@ -2344,7 +2472,7 @@ mod tests {
         assert_eq!(
             parse_command(["status"]),
             Err(
-                "unknown command `status`: expected `migrate`, `bootstrap-admin`, `provision-codex-profile`, `provision-codex-cli-edit-profile`, `provision-grok-profile`, `provision-grok-video-profile`, `provision-grok-video-v2-profile`, `provision-grok-image-profile-replacement`, `provision-grok-edit-profile-replacement`, `provision-grok-video-profile-replacement`, `reconcile-execution-profile-routes`, `reconcile-dreamina-profiles`, `reconcile-inline-customer-settlement`, `terminalize-unstarted-job`, `cancel-unlaunched-job`, `refresh-provider-quota`, `refresh-codex-credential`, `resolve-dreamina-accepted-terminal`, `resolve-dreamina-compliance-rejection`, `resolve-dreamina-image-success`, `resolve-dreamina-video-success`, `resolve-dreamina-video-archive`, `confirm-dreamina-video-cancellation`, `confirm-dreamina-video-supplement-cancellation`, `prepare-dreamina-image-supplement`, `dispatch-dreamina-image-supplement`, `poll-dreamina-image-supplement`, `publish-dreamina-image-supplement`, `prepare-dreamina-video-supplement`, `prepare-dreamina-video-supplement-successor`, `dispatch-dreamina-video-supplement`, `poll-dreamina-video-supplement`, `recover-dreamina-video-supplement-acceptance`, or `retry-blocked-terminal`"
+                "unknown command `status`: expected `migrate`, `bootstrap-admin`, `provision-codex-profile`, `provision-codex-cli-edit-profile`, `provision-grok-profile`, `provision-grok-video-profile`, `provision-grok-video-v2-profile`, `provision-dreamina-canvas-profile`, `serve-dreamina-canvas-keyring`, `provision-grok-image-profile-replacement`, `provision-grok-edit-profile-replacement`, `provision-grok-video-profile-replacement`, `reconcile-execution-profile-routes`, `reconcile-dreamina-profiles`, `reconcile-inline-customer-settlement`, `terminalize-unstarted-job`, `cancel-unlaunched-job`, `refresh-provider-quota`, `refresh-codex-credential`, `resolve-dreamina-accepted-terminal`, `resolve-dreamina-compliance-rejection`, `resolve-dreamina-image-success`, `resolve-dreamina-video-success`, `resolve-dreamina-video-archive`, `confirm-dreamina-video-cancellation`, `confirm-dreamina-video-supplement-cancellation`, `prepare-dreamina-image-supplement`, `dispatch-dreamina-image-supplement`, `poll-dreamina-image-supplement`, `publish-dreamina-image-supplement`, `prepare-dreamina-video-supplement`, `prepare-dreamina-video-supplement-successor`, `dispatch-dreamina-video-supplement`, `poll-dreamina-video-supplement`, `recover-dreamina-video-supplement-acceptance`, or `retry-blocked-terminal`"
                     .to_string()
             )
         );

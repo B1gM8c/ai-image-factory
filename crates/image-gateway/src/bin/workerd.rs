@@ -16,6 +16,10 @@ use gpt_image_2_gateway::{
         connect_pool_with_schema, database_schema_from_env, database_url_from_env,
         verify_migrations, worker_database_max_connections_from_env,
     },
+    dreamina_canvas::{
+        CANVAS_ADAPTER_REVISION, CANVAS_IMAGE_GENERATION_OPERATION, CANVAS_PROVIDER_ID,
+        CANVAS_SUBMIT_COMMAND_SCHEMA,
+    },
     identify_executor_profile_binding, init_telemetry,
 };
 use image_provider_contracts::openai_codex;
@@ -190,6 +194,14 @@ async fn main() -> Result<(), ImageGatewayError> {
             validate_handoff_profile(&profile).map_err(|_| {
                 ImageGatewayError::config("workerd executor handoff profile is incompatible")
             })?;
+            if profile.provider_id == CANVAS_PROVIDER_ID
+                && config.generation_admission_contract
+                    != GenerationAdmissionContract::CustomerPricingV4
+            {
+                return Err(ImageGatewayError::config(
+                    "Canvas executor handoff requires customer pricing V4",
+                ));
+            }
             let handoff_lease = Duration::from_millis(handoff_lease_ms()?);
             tracing::info!(
                 execution.profile.id = %profile.execution_profile_id,
@@ -375,15 +387,30 @@ fn validate_handoff_profile(profile: &ExecutorExecutionProfile) -> Result<(), ()
     if identify_executor_profile_binding(profile).is_ok() {
         return Ok(());
     }
-    if profile.provider_id != DREAMINA_PROVIDER_ID
-        || profile.command_schema != DREAMINA_SUBMIT_COMMAND_SCHEMA
-        || profile.adapter_revision != DREAMINA_ADAPTER_REVISION
-    {
-        return Err(());
-    }
-    let operation = match profile.operation_id.as_str() {
-        "images.generations" => DREAMINA_IMAGE_GENERATION_OPERATION_V1,
-        "videos.generations" => DREAMINA_VIDEO_GENERATION_OPERATION_V1,
+    let operation = match (
+        profile.provider_id.as_str(),
+        profile.command_schema.as_str(),
+        profile.adapter_revision.as_str(),
+        profile.operation_id.as_str(),
+    ) {
+        (
+            CANVAS_PROVIDER_ID,
+            CANVAS_SUBMIT_COMMAND_SCHEMA,
+            CANVAS_ADAPTER_REVISION,
+            "images.generations",
+        ) if profile.max_concurrency == 1 => CANVAS_IMAGE_GENERATION_OPERATION,
+        (
+            DREAMINA_PROVIDER_ID,
+            DREAMINA_SUBMIT_COMMAND_SCHEMA,
+            DREAMINA_ADAPTER_REVISION,
+            "images.generations",
+        ) => DREAMINA_IMAGE_GENERATION_OPERATION_V1,
+        (
+            DREAMINA_PROVIDER_ID,
+            DREAMINA_SUBMIT_COMMAND_SCHEMA,
+            DREAMINA_ADAPTER_REVISION,
+            "videos.generations",
+        ) => DREAMINA_VIDEO_GENERATION_OPERATION_V1,
         _ => return Err(()),
     };
     if profile.operation_descriptor_revision == operation.descriptor_revision
@@ -484,6 +511,40 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canvas_handoff_requires_exact_operation_and_single_lane() {
+        let operation = CANVAS_IMAGE_GENERATION_OPERATION;
+        let mut profile = ExecutorExecutionProfile {
+            execution_profile_id: uuid::Uuid::new_v4(),
+            profile_key: "canvas.fixture".to_owned(),
+            provider_id: CANVAS_PROVIDER_ID.to_owned(),
+            command_schema: CANVAS_SUBMIT_COMMAND_SCHEMA.to_owned(),
+            operation_id: operation.id.to_owned(),
+            operation_descriptor_revision: operation.descriptor_revision.to_owned(),
+            operation_descriptor_sha256_v1: operation.canonical_sha256_v1_hex(),
+            completion_mode: operation.completion.as_str().to_owned(),
+            idempotency_mode: operation.idempotency.as_str().to_owned(),
+            adapter_revision: CANVAS_ADAPTER_REVISION.to_owned(),
+            credential_pool_id: uuid::Uuid::new_v4(),
+            provider_account_id: uuid::Uuid::new_v4(),
+            credential_ref: "canvas-fixture".to_owned(),
+            credential_revision: 1,
+            credential_auth_sha256: "a".repeat(64),
+            resource_policy_id: uuid::Uuid::new_v4(),
+            resource_policy_revision: 1,
+            max_concurrency: 1,
+        };
+        assert!(validate_handoff_profile(&profile).is_ok());
+        profile.max_concurrency = 2;
+        assert!(validate_handoff_profile(&profile).is_err());
+        profile.max_concurrency = 1;
+        profile.operation_id = "videos.generations".to_owned();
+        assert!(validate_handoff_profile(&profile).is_err());
+        profile.operation_id = operation.id.to_owned();
+        profile.adapter_revision = DREAMINA_ADAPTER_REVISION.to_owned();
+        assert!(validate_handoff_profile(&profile).is_err());
+    }
 
     #[test]
     fn customer_priced_video_profiles_claim_v4_work() {

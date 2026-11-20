@@ -230,6 +230,14 @@ Unsupported upstream fields may be retained in public DTOs for compatibility,
 but they must not be advertised as effective until the selected adapter proves
 the behavior.
 
+### Dreamina image model routing
+
+Factory selects a provider before creating the generation job. For `/v1/dreamina/images/generations`, it checks the caller's native Dreamina route first. When that route lacks Seedream 5.5, it checks the caller's official Dreamina Canvas route for one text-to-image result at `1.5k` with a supported aspect ratio. The public model version is `5.5`. Async status, results, and idempotency lookup use the existing Dreamina image endpoints and the same Factory task ID. Factory owns the route and Blog uses the same logical provider contract.
+
+The Canvas route requires a separately authorized Canvas profile, a dedicated private Canvas project, a single execution lane, and an enabled scoped model and price. On Linux, run the opt-in Canvas keyring service for the dedicated account before authorizing the CLI. The submitter and poller verify that the configured profile is signed in at startup. The CLI invocation enforces a per-request provider credit ceiling. Seedream 5.5 pricing and model visibility depend on explicit configuration. See [the official Canvas CLI installer](https://jimeng.jianying.com/ai-tool/business) and [runtime configuration](deploy/systemd/dreamina-canvas-remote.env.example).
+
+An accepted or uncertain submission stays on its original provider and task ID, including after a worker restart. Health, transport, authorization and capacity failures cannot switch an existing job to another provider.
+
 ## Console
 
 The same control plane serves operators and creators. User-facing reads are

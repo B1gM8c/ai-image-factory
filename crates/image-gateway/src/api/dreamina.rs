@@ -29,6 +29,9 @@ use crate::{
     artifacts::StoredGenerationResult,
     auth::{ApiKeyCapability, AuthContext},
     model_routing::ResolvedModelRoute,
+    providers::dreamina_canvas::{
+        CANVAS_IMAGE_MODEL, CANVAS_PROVIDER_ID, CANVAS_SUBMIT_COMMAND_SCHEMA, CanvasImagePlan,
+    },
     settlement::{
         DREAMINA_LOCAL_STAGING_FAILURE_CODES, DreaminaManualVideoCancellationProof,
         ExecutionSettlementStore, ImageResultStatus, ImageTaskProjection, VideoPendingStage,
@@ -125,26 +128,73 @@ async fn create_image_with_optional_route(
     let mut execution_model_id = None;
     let resolved = match resolved {
         Some(resolved) => {
-            validate_resolved_dreamina_route(
-                &resolved,
-                DREAMINA_IMAGES_API_PROFILE,
-                "images.generations",
-            )?;
+            if resolved.provider_id != CANVAS_PROVIDER_ID {
+                validate_resolved_dreamina_route(
+                    &resolved,
+                    DREAMINA_IMAGES_API_PROFILE,
+                    "images.generations",
+                )?;
+            }
             Some(resolved)
         }
         None => {
-            resolve_request_model(
+            let canvas_model = matches!(
+                request.model_version.as_deref(),
+                Some("5.5" | "dreamina-image-5.5" | CANVAS_IMAGE_MODEL)
+            );
+            let requested_model = if canvas_model {
+                Some("5.5")
+            } else {
+                request.model_version.as_deref()
+            };
+            let native = resolve_request_model(
                 state,
                 &mut auth,
                 image_provider_dreamina_cli::PROVIDER_ID,
                 "images.generations",
                 DREAMINA_IMAGES_API_PROFILE,
-                request.model_version.as_deref(),
+                requested_model,
                 "5.0",
             )
-            .await?
+            .await;
+            match native {
+                Ok(Some(route)) => Some(route),
+                Err(error) if !canvas_model || error.error_code() != Some("model_not_found") => {
+                    return Err(error);
+                }
+                Ok(None) if !canvas_model => None,
+                Ok(None) | Err(_) => {
+                    let route = resolve_request_model(
+                        state,
+                        &mut auth,
+                        CANVAS_PROVIDER_ID,
+                        "images.generations",
+                        DREAMINA_IMAGES_API_PROFILE,
+                        requested_model,
+                        "5.5",
+                    )
+                    .await?;
+                    Some(route.ok_or_else(|| ImageGatewayError::model_not_found("5.5"))?)
+                }
+            }
         }
     };
+    if let Some(route) = resolved
+        .as_ref()
+        .filter(|route| route.provider_id == CANVAS_PROVIDER_ID)
+    {
+        return create_canvas_image(
+            state,
+            &auth,
+            headers,
+            request_id,
+            request,
+            route,
+            contract,
+            respond_async,
+        )
+        .await;
+    }
     if let Some(resolved) = resolved {
         public_model_id = resolved.public_model_id;
         execution_model_id = Some(resolved.execution_model_id);
@@ -219,6 +269,126 @@ async fn create_image_with_optional_route(
     match result {
         ImageSubmission::Completed(result) => render_stored_generation_response(result, &auth),
         ImageSubmission::Accepted(job_id) => accepted_image_response(state, &auth, job_id).await,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn create_canvas_image(
+    state: &Arc<AppState>,
+    auth: &AuthContext,
+    headers: &HeaderMap,
+    request_id: String,
+    request: DreaminaImageGenerationRequest,
+    route: &ResolvedModelRoute,
+    contract: AdmissionContract,
+    respond_async: bool,
+) -> Result<Response, ImageGatewayError> {
+    if contract != AdmissionContract::CustomerPricingV4
+        || route.api_profile != DREAMINA_IMAGES_API_PROFILE
+        || route.operation_id != "images.generations"
+        || route.media_kind != "image"
+        || route.provider_model_id != "5.5"
+        || route.execution_model_id != CANVAS_IMAGE_MODEL
+        || route.command_schema != CANVAS_SUBMIT_COMMAND_SCHEMA
+    {
+        return Err(ImageGatewayError::service_unavailable(
+            "Canvas image route is unavailable",
+        ));
+    }
+    if !request.resolution_type.eq_ignore_ascii_case("1.5k")
+        || request.generate_num.unwrap_or(1) != 1
+        || request.width.is_some()
+        || request.height.is_some()
+    {
+        return Err(ImageGatewayError::invalid_request(
+            "Seedream 5.5 currently accepts one 1.5K image and an aspect ratio",
+            Some("resolution_type".to_owned()),
+            "unsupported_parameter",
+        ));
+    }
+    let ratio = request.ratio.as_deref().unwrap_or("16:9");
+    let plan = CanvasImagePlan::new(request.prompt, ratio).map_err(|_| {
+        ImageGatewayError::invalid_request(
+            "invalid Seedream 5.5 prompt or aspect ratio",
+            None,
+            "invalid_value",
+        )
+    })?;
+    let command_json = serde_json::to_value(&plan)
+        .map_err(|_| ImageGatewayError::internal("could not encode Canvas command"))?;
+    let command_hash = hex::encode(Sha256::digest(
+        serde_json::to_vec(&command_json)
+            .map_err(|_| ImageGatewayError::internal("could not encode Canvas command"))?,
+    ));
+    let claim = ClaimAdmission {
+        owner_token: Uuid::new_v4(),
+        tenant_id: auth.tenant_id.clone(),
+        project_id: auth.project_id.clone(),
+        api_profile: DREAMINA_IMAGES_API_PROFILE.to_owned(),
+        operation: GENERATION_OPERATION.to_owned(),
+        request_id: request_id.clone(),
+        idempotency_key_digest: idempotency_digest(
+            headers,
+            &auth.project_id,
+            DREAMINA_IMAGES_API_PROFILE,
+            GENERATION_OPERATION,
+        )?,
+        request_hash: customer_pricing_request_hash(
+            auth,
+            DREAMINA_IMAGES_API_PROFILE,
+            &route.public_model_id,
+            &route.execution_model_id,
+            &command_hash,
+        )?,
+        deadline_at_ms: admission_deadline(&state.config),
+    };
+    let tier = crate::service_tiers::ServiceTierDecision::for_default_only_project(
+        auth.project_service_tier,
+    );
+    let pricing_dimensions = std::collections::BTreeMap::from([
+        ("resolution_type".to_owned(), "1.5k".to_owned()),
+        ("ratio".to_owned(), ratio.to_owned()),
+    ]);
+    let result = submit_image_generation_with_mode(
+        state,
+        auth,
+        request_id,
+        claim,
+        CANVAS_PROVIDER_ID,
+        &route.execution_model_id,
+        1,
+        respond_async,
+        |ticket, job_id, schedule_scope| AttachJob {
+            ticket,
+            job_id,
+            command_schema: CANVAS_SUBMIT_COMMAND_SCHEMA.to_owned(),
+            command_json,
+            input_manifest: None,
+            work_kind: "image_batch".to_owned(),
+            schedule_scope,
+            schedule_weight: 1,
+            schedule_priority: 1,
+            schedule_cost: 1,
+            contract,
+            customer_pricing: Some(CustomerPricingIntent {
+                public_model_id: route.public_model_id.clone(),
+                provider_model_id: "5.5".to_owned(),
+                execution_model_id: route.execution_model_id.clone(),
+                provider_command_hash: Some(command_hash),
+                media_kind: "image".to_owned(),
+                service_tier: tier.effective.pricing_key().to_owned(),
+                service_tier_decision: tier,
+                execution_surface: "provider_cli".to_owned(),
+                currency: "USD".to_owned(),
+                pricing_dimensions,
+                processing_mode: crate::admission::PricingProcessingMode::Synchronous,
+            }),
+        },
+    )
+    .await?;
+    match result {
+        ImageSubmission::Completed(result) => render_stored_generation_response(result, auth),
+        ImageSubmission::Accepted(job_id) => accepted_image_response(state, auth, job_id).await,
     }
 }
 
@@ -556,6 +726,7 @@ async fn submit_workflow_with_mode(
     } else {
         GENERATION_OPERATION
     };
+    let claim_deadline_at_ms = admission_deadline(&state.config);
     let claim = ClaimAdmission {
         owner_token: Uuid::new_v4(),
         tenant_id: auth.tenant_id.clone(),
@@ -576,7 +747,7 @@ async fn submit_workflow_with_mode(
             &execution_model_id,
             intent.request_hash(),
         )?,
-        deadline_at_ms: admission_deadline(&state.config),
+        deadline_at_ms: claim_deadline_at_ms,
     };
     let ticket = match claim_admission_with_retry(state, claim)
         .await
@@ -598,6 +769,7 @@ async fn submit_workflow_with_mode(
         &ticket,
         intent,
         state.config.max_upload_bytes,
+        super::dreamina_inputs::remaining_preparation_budget(claim_deadline_at_ms),
     )
     .await
     {
