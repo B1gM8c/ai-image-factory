@@ -30,8 +30,9 @@ use crate::{
     auth::{ApiKeyCapability, AuthContext},
     model_routing::ResolvedModelRoute,
     settlement::{
-        DreaminaManualVideoCancellationProof, ExecutionSettlementStore, ImageResultStatus,
-        ImageTaskProjection, VideoPendingStage, VideoProviderProgress, VideoResultStatus,
+        DREAMINA_LOCAL_STAGING_FAILURE_CODES, DreaminaManualVideoCancellationProof,
+        ExecutionSettlementStore, ImageResultStatus, ImageTaskProjection, VideoPendingStage,
+        VideoProviderProgress, VideoResultStatus, dreamina_video_material_rejection_basis,
     },
     usage::{UsageCharge, UsageLimits},
 };
@@ -1431,8 +1432,8 @@ async fn project_video_task(
             if matches!(code.as_str(),
                 "dreamina_compliance_confirmation_required"
                     | "dreamina_concurrency_limit_exceeded"
-                    | "dreamina_copyright_rejected"
-                    | "dreamina_material_upload_failed")
+                    | "dreamina_copyright_rejected")
+                || dreamina_video_material_rejection_basis(code).is_some()
     );
     let manual_cancellation = if matches!(&status, VideoResultStatus::Failed { .. }) {
         settlement_store
@@ -1553,8 +1554,13 @@ fn video_task(id: Uuid, status: VideoResultStatus) -> DreaminaVideoTask {
         VideoResultStatus::Failed {
             model, error_code, ..
         } => {
-            let message = known_terminal_failure_message(error_code.as_deref())
-                .unwrap_or("Dreamina video generation failed");
+            let message = match error_code.as_deref() {
+                Some(code) if DREAMINA_LOCAL_STAGING_FAILURE_CODES.contains(&code) => {
+                    "参考素材准备失败，视频未提交生成"
+                }
+                code => known_terminal_failure_message(code)
+                    .unwrap_or("Dreamina video generation failed"),
+            };
             DreaminaVideoTask {
                 id: id.to_string(),
                 status: "failed".to_owned(),
@@ -1587,7 +1593,7 @@ pub(super) fn known_terminal_failure_message(code: Option<&str>) -> Option<&'sta
         }
         "dreamina_copyright_rejected" => Some("生成的视频里包含受版权保护元素"),
         "dreamina_concurrency_limit_exceeded" => Some("上游并发已满，请稍后再试"),
-        "dreamina_material_upload_failed" => Some("即梦参考图上传失败，视频未提交生成"),
+        "dreamina_material_upload_failed" => Some("即梦参考素材上传失败，视频未提交生成"),
         _ => None,
     }
 }
@@ -1941,6 +1947,11 @@ mod tests {
                 duration_ms: 5000,
                 error_code: Some("provider_submit_cli_failed".to_owned()),
             }),
+            Some(VideoResultStatus::Failed {
+                model: "seedance2.5".to_owned(),
+                duration_ms: 5000,
+                error_code: Some("provider_submit_input_manifest_invalid_extra".to_owned()),
+            }),
             None,
         ] {
             let visible = status.is_some();
@@ -1985,11 +1996,10 @@ mod tests {
             "dreamina_material_upload_failed",
         ]
         .into_iter()
+        .chain(DREAMINA_LOCAL_STAGING_FAILURE_CODES.iter().copied())
         .flat_map(|code| {
             let mut receipt = receipt.clone();
-            if code == "dreamina_material_upload_failed" {
-                receipt.basis = Some("dreamina_material_upload_rejection_v1".to_owned());
-            }
+            receipt.basis = dreamina_video_material_rejection_basis(code).map(str::to_owned);
             [None, Some(receipt)].map(|receipt| (code, receipt))
         }) {
             let store = VideoQueryStore {
@@ -2008,7 +2018,9 @@ mod tests {
             let error = task.error.as_ref().unwrap();
             assert_eq!(error.code, code);
             if code == "dreamina_material_upload_failed" {
-                assert_eq!(error.message, "即梦参考图上传失败，视频未提交生成");
+                assert_eq!(error.message, "即梦参考素材上传失败，视频未提交生成");
+            } else if DREAMINA_LOCAL_STAGING_FAILURE_CODES.contains(&code) {
+                assert_eq!(error.message, "参考素材准备失败，视频未提交生成");
             }
             assert_eq!(task.settlement, expected);
             let json = serde_json::to_value(task).unwrap();

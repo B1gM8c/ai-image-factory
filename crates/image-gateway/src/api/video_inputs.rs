@@ -10,7 +10,7 @@ use image_api_contracts::xai::{
     XaiVideoGenerationCommandV1, XaiVideoGenerationCommandV2, XaiVideoWorkflow,
 };
 use image_provider_sdk::{ArtifactSink, ArtifactSinkError};
-use reqwest::{Client, Url, redirect::Policy};
+use reqwest::{Client, StatusCode, Url, redirect::Policy};
 use sha2::{Digest, Sha256};
 
 use crate::{ImageGatewayError, generator::InputImage};
@@ -20,6 +20,7 @@ use super::{super::admission::XaiVideoInputRoleV2, edit_input::decode_data_url_i
 pub(super) const MAX_VIDEO_INPUT_BYTES: usize = 32 * 1024 * 1024;
 const HTTPS_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const HTTPS_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+const HTTPS_INPUT_RETRY_DELAY: Duration = Duration::from_millis(150);
 const GENERATED_VIDEO_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 #[cfg(debug_assertions)]
 const TEST_GENERATED_VIDEO_URL_ENV: &str = "GATEWAY_TEST_GENERATED_VIDEO_URL";
@@ -404,15 +405,27 @@ fn decode_media_data_url(
     if !media_types.contains(&media_type) {
         return Err(invalid_image(param, "unsupported image media type"));
     }
-    let estimated = encoded.len().saturating_mul(3).saturating_div(4);
-    if estimated > max_bytes || total_bytes.saturating_add(estimated) > max_total_bytes {
-        return Err(ImageGatewayError::payload_too_large(
-            "video input payload is too large",
-        ));
+    let padding = if encoded.ends_with("==") {
+        2
+    } else {
+        usize::from(encoded.ends_with('='))
+    };
+    // Standard Base64 padding represents no decoded bytes.
+    let estimated = (encoded.len() / 4 * 3).saturating_sub(padding);
+    let too_large = || ImageGatewayError::payload_too_large("video input payload is too large");
+    if estimated > max_bytes
+        || total_bytes
+            .checked_add(estimated)
+            .is_none_or(|total| total > max_total_bytes)
+    {
+        return Err(too_large());
     }
     let bytes = STANDARD
         .decode(encoded)
         .map_err(|_| invalid_image(param, "invalid base64 image data"))?;
+    if bytes.len() > max_bytes {
+        return Err(too_large());
+    }
     add_total(total_bytes, bytes.len(), max_total_bytes)?;
     Ok(DecodedVideoInput {
         filename: String::new(),
@@ -448,6 +461,25 @@ async fn fetch_https_input(
     media_types: &[&str],
     total_bytes: &mut usize,
 ) -> Result<DecodedVideoInput, ImageGatewayError> {
+    let fetch = fetch_https_input_within_budget(
+        param,
+        source,
+        max_bytes.min(max_total_bytes.saturating_sub(*total_bytes)),
+        media_types,
+    );
+    let decoded = tokio::time::timeout(HTTPS_REQUEST_TIMEOUT, fetch)
+        .await
+        .map_err(|_| invalid_image(param, "video input URL could not be read in time"))??;
+    add_total(total_bytes, decoded.bytes.len(), max_total_bytes)?;
+    Ok(decoded)
+}
+
+async fn fetch_https_input_within_budget(
+    param: &str,
+    source: &str,
+    max_bytes: usize,
+    media_types: &[&str],
+) -> Result<DecodedVideoInput, ImageGatewayError> {
     let url = validate_public_https_url(param, source).await?;
     let host = url
         .host_str()
@@ -463,21 +495,67 @@ async fn fetch_https_input(
         .resolve_to_addrs(&host, &addresses)
         .build()
         .map_err(|_| ImageGatewayError::service_unavailable("video input client unavailable"))?;
-    let response = client.get(url).send().await.map_err(|_| {
-        ImageGatewayError::invalid_request(
-            "video input URL could not be fetched",
-            Some(param.to_owned()),
-            "invalid_image_url",
-        )
+    download_input_with_retry(&client, &url, param, max_bytes, media_types).await
+}
+
+enum InputDownloadError {
+    Transient(ImageGatewayError),
+    Refused(ImageGatewayError),
+}
+
+async fn download_input_with_retry(
+    client: &Client,
+    url: &Url,
+    param: &str,
+    max_bytes: usize,
+    media_types: &[&str],
+) -> Result<DecodedVideoInput, ImageGatewayError> {
+    let first = download_input_once(client, url, param, max_bytes, media_types).await;
+    let result = if matches!(&first, Err(InputDownloadError::Transient(_))) {
+        // Retry only the read from the same DNS-pinned client, within the caller's
+        // original deadline. Do not retain a partial body or consume its bytes.
+        tokio::time::sleep(HTTPS_INPUT_RETRY_DELAY).await;
+        download_input_once(client, url, param, max_bytes, media_types).await
+    } else {
+        first
+    };
+    result.map_err(|error| match error {
+        InputDownloadError::Transient(error) | InputDownloadError::Refused(error) => error,
+    })
+}
+
+async fn download_input_once(
+    client: &Client,
+    url: &Url,
+    param: &str,
+    max_bytes: usize,
+    media_types: &[&str],
+) -> Result<DecodedVideoInput, InputDownloadError> {
+    use InputDownloadError::{Refused, Transient};
+
+    let response = client.get(url.clone()).send().await.map_err(|cause| {
+        let error = invalid_image(param, "video input URL could not be fetched");
+        if cause.is_connect() || cause.is_timeout() || cause.is_body() {
+            Transient(error)
+        } else {
+            Refused(error)
+        }
     })?;
     if response.status().is_redirection() {
-        return Err(invalid_image(
+        return Err(Refused(invalid_image(
             param,
             "video input redirects are not allowed",
-        ));
+        )));
     }
     if !response.status().is_success() {
-        return Err(invalid_image(param, "video input URL returned an error"));
+        let error = invalid_image(param, "video input URL returned an error");
+        return Err(match response.status() {
+            StatusCode::REQUEST_TIMEOUT
+            | StatusCode::BAD_GATEWAY
+            | StatusCode::SERVICE_UNAVAILABLE
+            | StatusCode::GATEWAY_TIMEOUT => Transient(error),
+            _ => Refused(error),
+        });
     }
     let content_type = response
         .headers()
@@ -487,35 +565,31 @@ async fn fetch_https_input(
         .unwrap_or("")
         .to_owned();
     if !media_types.contains(&content_type.as_str()) {
-        return Err(invalid_image(
+        return Err(Refused(invalid_image(
             param,
             "video input URL has unsupported media type",
-        ));
+        )));
     }
-    if response.content_length().is_some_and(|length| {
-        length > max_bytes as u64 || length > max_total_bytes.saturating_sub(*total_bytes) as u64
-    }) {
-        return Err(ImageGatewayError::payload_too_large(
+    if response
+        .content_length()
+        .is_some_and(|length| length > max_bytes as u64)
+    {
+        return Err(Refused(ImageGatewayError::payload_too_large(
             "video input payload is too large",
-        ));
+        )));
     }
     let mut bytes = Vec::new();
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|_| invalid_image(param, "video input URL could not be read"))?;
-        if bytes.len().saturating_add(chunk.len()) > max_bytes
-            || total_bytes
-                .saturating_add(bytes.len())
-                .saturating_add(chunk.len())
-                > max_total_bytes
-        {
-            return Err(ImageGatewayError::payload_too_large(
+        let chunk = chunk
+            .map_err(|_| Transient(invalid_image(param, "video input URL could not be read")))?;
+        if bytes.len().saturating_add(chunk.len()) > max_bytes {
+            return Err(Refused(ImageGatewayError::payload_too_large(
                 "video input payload is too large",
-            ));
+            )));
         }
         bytes.extend_from_slice(&chunk);
     }
-    add_total(total_bytes, bytes.len(), max_total_bytes)?;
     Ok(DecodedVideoInput {
         filename: String::new(),
         media_type: content_type,
@@ -658,7 +732,12 @@ impl XaiVideoInputRoleV2 {
 
 #[cfg(test)]
 mod tests {
+    use axum::{body::to_bytes, response::IntoResponse};
     use image_api_contracts::xai::{XaiVideoImageUrl, XaiVideoKeyframe};
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
 
     use super::*;
 
@@ -668,6 +747,152 @@ mod tests {
         assert!(decode_data_url("image", "data:image/png;base64,AA==", 1024, &mut total).is_err());
         let png = "data:image/png;base64,iVBORw0KGgo=";
         assert!(decode_data_url("image", png, 1024, &mut total).is_ok());
+    }
+
+    #[test]
+    fn media_data_url_counts_decoded_bytes_at_exact_budgets() {
+        for (encoded, expected) in [
+            ("YQ==", &b"a"[..]),
+            ("YWI=", &b"ab"[..]),
+            ("YWJj", &b"abc"[..]),
+        ] {
+            let url = format!("data:image/png;base64,{encoded}");
+            let mut total = 3;
+            let decoded = decode_media_data_url(
+                "image",
+                &url,
+                expected.len(),
+                total + expected.len(),
+                &["image/png"],
+                &mut total,
+            )
+            .unwrap();
+            assert_eq!(decoded.bytes, expected);
+            assert_eq!(total, 3 + expected.len());
+        }
+    }
+
+    #[test]
+    fn media_data_url_rejects_overflow_and_invalid_padding_without_counting_bytes() {
+        for (encoded, max_bytes, max_total, status) in [
+            ("YWI=", 1, 8, 413),
+            ("YWI=", 2, 4, 413),
+            ("A===", 2, 5, 400),
+            ("YQ=", 2, 5, 400),
+        ] {
+            let url = format!("data:image/png;base64,{encoded}");
+            let mut total = 3;
+            let error = decode_media_data_url(
+                "image",
+                &url,
+                max_bytes,
+                max_total,
+                &["image/png"],
+                &mut total,
+            )
+            .unwrap_err();
+            assert_eq!(error.status_code().as_u16(), status);
+            assert_eq!(total, 3);
+        }
+    }
+
+    async fn input_response_fixture(
+        responses: Vec<&'static str>,
+    ) -> (Url, tokio::task::JoinHandle<usize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = Url::parse(&format!(
+            "http://{}/reference?key=fixture",
+            listener.local_addr().unwrap()
+        ))
+        .unwrap();
+        let handle = tokio::spawn(async move {
+            let mut count = 0;
+            for response in responses {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut received = Vec::new();
+                while !received.ends_with(b"\r\n\r\n") {
+                    let mut chunk = [0; 256];
+                    let n = socket.read(&mut chunk).await.unwrap();
+                    assert_ne!(n, 0);
+                    received.extend_from_slice(&chunk[..n]);
+                }
+                assert!(received.starts_with(b"GET /reference?key=fixture HTTP/1.1\r\n"));
+                socket.write_all(response.as_bytes()).await.unwrap();
+                socket.shutdown().await.unwrap();
+                count += 1;
+            }
+            count
+        });
+        (url, handle)
+    }
+
+    #[tokio::test]
+    async fn https_input_retries_only_one_transient_original_get() {
+        const OK: &str = "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: 3\r\nConnection: close\r\n\r\nabc";
+        const UNAVAILABLE: &str =
+            "HTTP/1.1 503 Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        const TRUNCATED: &str = "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: 3\r\nConnection: close\r\n\r\nab";
+        let client = Client::builder()
+            .no_proxy()
+            .redirect(Policy::none())
+            .build()
+            .unwrap();
+        for (responses, expected) in [
+            (vec![UNAVAILABLE, OK], true),
+            (vec![TRUNCATED, OK], true),
+            (vec![UNAVAILABLE, UNAVAILABLE], false),
+        ] {
+            let (url, server) = input_response_fixture(responses).await;
+            let result = download_input_with_retry(&client, &url, "image", 3, &["image/png"]).await;
+            if expected {
+                assert_eq!(result.unwrap().bytes, b"abc");
+            } else {
+                assert_eq!(result.unwrap_err().status_code(), StatusCode::BAD_REQUEST);
+            }
+            assert_eq!(server.await.unwrap(), 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn https_input_does_not_retry_permanent_source_rejections() {
+        let client = Client::builder()
+            .no_proxy()
+            .redirect(Policy::none())
+            .build()
+            .unwrap();
+        for (response, status, detail) in [
+            (
+                "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                StatusCode::BAD_REQUEST,
+                "returned an error",
+            ),
+            (
+                "HTTP/1.1 302 Found\r\nLocation: /different\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                StatusCode::BAD_REQUEST,
+                "redirects",
+            ),
+            (
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                StatusCode::BAD_REQUEST,
+                "unsupported media type",
+            ),
+            (
+                "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: 4\r\nConnection: close\r\n\r\nABCD",
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "too large",
+            ),
+        ] {
+            let (url, server) = input_response_fixture(vec![response]).await;
+            let error = download_input_with_retry(&client, &url, "image", 3, &["image/png"])
+                .await
+                .unwrap_err();
+            assert_eq!(error.status_code(), status);
+            let response = error.into_response();
+            let body = to_bytes(response.into_body(), 4096).await.unwrap();
+            let wire: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert!(wire["error"]["message"].as_str().unwrap().contains(detail));
+            assert_eq!(server.await.unwrap(), 1);
+        }
     }
 
     #[tokio::test]

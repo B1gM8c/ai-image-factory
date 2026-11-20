@@ -43,6 +43,26 @@ pub use postgres::video_supplementation::{
     DreaminaVideoSupplementResolution, DreaminaVideoSupplementUncertainRequest,
 };
 
+// These failures come only from frozen input preparation before the CLI gate.
+pub(crate) const DREAMINA_LOCAL_STAGING_FAILURE_CODES: &[&str] = &[
+    "provider_submit_input_manifest_invalid",
+    "provider_submit_input_store_unavailable",
+    "provider_submit_input_integrity_failed",
+    "provider_submit_input_worker_stopped",
+    "provider_submit_input_workspace_invalid",
+    "dreamina_submit_input_manifest_invalid",
+];
+
+pub(crate) fn dreamina_video_material_rejection_basis(code: &str) -> Option<&'static str> {
+    if code == "dreamina_material_upload_failed" {
+        Some("dreamina_material_upload_rejection_v1")
+    } else if DREAMINA_LOCAL_STAGING_FAILURE_CODES.contains(&code) {
+        Some("dreamina_material_staging_rejection_v1")
+    } else {
+        None
+    }
+}
+
 #[async_trait]
 pub trait ExecutionSettlementStore: Send + Sync + 'static {
     fn artifact_storage_identity(&self) -> String;
