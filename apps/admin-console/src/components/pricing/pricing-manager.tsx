@@ -1459,6 +1459,7 @@ function providerLabel(provider: string | null | undefined, t: Translate) {
     grok: "Grok",
     xai: "xAI",
     dreamina: t({ en: "Dreamina", "zh-CN": "即梦", ja: "Dreamina", ko: "Dreamina" }),
+    "dreamina-canvas": t({ en: "Dreamina Canvas", "zh-CN": "即梦画布", ja: "Dreamina Canvas", ko: "Dreamina Canvas" }),
     ark: t({ en: "Volcengine Ark", "zh-CN": "火山方舟", ja: "Volcengine Ark", ko: "Volcengine Ark" }),
   };
   return labels[provider.toLowerCase()] ?? provider;

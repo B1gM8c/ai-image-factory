@@ -57,13 +57,14 @@ export function RouteModelMappingsEditor({
 }) {
   const { t } = useI18n();
   const profiles = apiProfilesFor(providerId, operationId, t);
+  const canvas = providerId === "dreamina-canvas";
   const routeModels = models.filter(
     (model) =>
       model.provider_id === providerId &&
       model.adapter_state === "supported" &&
       model.lifecycle_state === "enabled" &&
       model.operation_ids.includes(operationId) &&
-      defaultPublicModelId(activeApiProfile, model.model_id) !== null,
+      defaultPublicModelId(activeApiProfile, model.model_id, providerId) !== null,
   );
 
   function toggleModel(model: ProviderModelView) {
@@ -77,6 +78,7 @@ export function RouteModelMappingsEditor({
     const publicModelId = defaultPublicModelId(
       activeApiProfile,
       model.model_id,
+      providerId,
     );
     if (!publicModelId) return;
     onMappingsChange({
@@ -236,6 +238,7 @@ export function RouteModelMappingsEditor({
                       updatePublicModelId(model.model_id, event.target.value)
                     }
                     disabled={!mapping || !accountModelEnabled}
+                    readOnly={canvas}
                     className="mt-1 h-8 w-full min-w-0 max-w-full font-mono text-xs md:mt-0"
                     maxLength={255}
                     aria-label={t(
@@ -270,6 +273,16 @@ export function apiProfilesFor(
     return [{ id: "xai-images-v1", label: "xAI Images API" }];
   if (providerId === "grok-cli" && operationId === "videos.generations")
     return [{ id: "xai-videos-v1", label: "xAI Video API" }];
+  if (providerId === "dreamina-canvas" && operationId === "images.generations")
+    return [{
+      id: "dreamina-cli-images-v1",
+      label: localize(t, {
+        en: "Dreamina Canvas · Seedream 5.5 (1.5K)",
+        "zh-CN": "即梦画布 · Seedream 5.5（1.5K）",
+        ja: "Dreamina Canvas · Seedream 5.5 (1.5K)",
+        ko: "Dreamina Canvas · Seedream 5.5 (1.5K)",
+      }),
+    }];
   if (providerId === "dreamina-cli" && operationId === "images.generations") {
     return [
       {
@@ -343,7 +356,7 @@ export function defaultRouteModelMappings(
         !model.operation_ids.includes(operationId)
       )
         continue;
-      const publicModelId = defaultPublicModelId(profile.id, model.model_id);
+      const publicModelId = defaultPublicModelId(profile.id, model.model_id, providerId);
       if (!publicModelId) continue;
       mappings[routeModelMappingKey(profile.id, model.model_id)] = {
         apiProfile: profile.id,
@@ -438,7 +451,10 @@ function localize(
 function defaultPublicModelId(
   apiProfile: string,
   providerModelId: string,
+  providerId: string,
 ): string | null {
+  if (providerId === "dreamina-canvas")
+    return apiProfile === "dreamina-cli-images-v1" && providerModelId === "5.5" ? "5.5" : null;
   if (apiProfile === "volcengine-ark-images-v3") {
     if (providerModelId === "5.0") return "doubao-seedream-5-0-lite";
     if (providerModelId === "5.0Pro") return "doubao-seedream-5-0-pro-260628";

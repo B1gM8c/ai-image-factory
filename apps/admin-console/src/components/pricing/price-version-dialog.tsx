@@ -712,13 +712,14 @@ function SectionTitle({ title, description }: { title: string; description: stri
 function emptyForm(book: PriceBook | null, preset: PricingCoverageRow | null): VersionForm {
   const mediaKind = preset?.media_kind ?? "image";
   const purpose = book?.purpose ?? "customer_sale";
+  const canvas = book?.provider_id === "dreamina-canvas" && purpose === "customer_sale";
   return {
-    api_profile: preset?.api_profile ?? "openai.images.v1",
+    api_profile: preset?.api_profile ?? (canvas ? "dreamina-cli-images-v1" : "openai.images.v1"),
     operation: preset?.pricing_operation
       ?? (mediaKind === "video" ? "video_generation" : "generation"),
     provider_id: preset?.provider_id ?? book?.provider_id ?? "",
-    provider_model_id: preset?.provider_model_id ?? "",
-    public_model_id: preset?.public_model_id ?? "",
+    provider_model_id: preset?.provider_model_id ?? (canvas ? "5.5" : ""),
+    public_model_id: preset?.public_model_id ?? (canvas ? "5.5" : ""),
     media_kind: mediaKind,
     service_tier: "standard",
     execution_surface: preset || book?.provider_id ? "provider_cli" : "provider_api",
