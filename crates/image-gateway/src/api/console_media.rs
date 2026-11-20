@@ -413,6 +413,7 @@ fn controls_for_model(
         let resolutions = match (native, provider_model_id) {
             (true, "3.0" | "3.1") => &["1k", "2k"][..],
             (true, "5.0Pro") => &["1.5k", "2k", "4k"][..],
+            (true, "5.5") => &["1.5k"][..],
             (true, "4.0" | "4.1" | "4.5" | "4.6" | "4.7" | "5.0") => &["2k", "4k"][..],
             (false, "5.0" | "5.0Pro") => &["2k", "4k"][..],
             _ => return None,
@@ -425,10 +426,14 @@ fn controls_for_model(
             count: ConsoleRangeControl {
                 default: 1,
                 min: 1,
-                max: 10,
+                max: if provider_model_id == "5.5" { 1 } else { 10 },
             },
             resolution: Some(ConsoleChoiceControl {
-                default: "2k",
+                default: if provider_model_id == "5.5" {
+                    "1.5k"
+                } else {
+                    "2k"
+                },
                 options: resolutions,
             }),
             quality: None,

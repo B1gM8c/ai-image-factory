@@ -561,6 +561,17 @@ const DREAMINA_IMAGE_DIMENSIONS: &[DimensionContract] = &[
         },
     },
 ];
+const CANVAS_IMAGE_DIMENSIONS: &[DimensionContract] = &[
+    DimensionContract {
+        key: "resolution_type",
+        required: true,
+        domain: ValueDomain::Enum(&["1.5k"]),
+    },
+    DimensionContract {
+        required: true,
+        ..DREAMINA_IMAGE_DIMENSIONS[1]
+    },
+];
 const DREAMINA_IMAGE_GEOMETRY: &[PresenceBranch] = &[
     PresenceBranch {
         required: &["ratio"],
@@ -898,6 +909,24 @@ const GROK_VIDEO_BASES: &[MeteringBasisContract] = &[
 
 const CONTRACTS: &[PricingSurfaceContract] = &[
     PricingSurfaceContract {
+        contract_id: "dreamina-canvas.images.text2image.v1",
+        contract_version: 1,
+        provider_id: crate::providers::dreamina_canvas::CANVAS_PROVIDER_ID,
+        route_operation: "images.generations",
+        pricing_operation: "generation",
+        command_schema: crate::providers::dreamina_canvas::CANVAS_SUBMIT_COMMAND_SCHEMA,
+        media_kind: "image",
+        api_profiles: &["dreamina-cli-images-v1"],
+        provider_models: &["5.5"],
+        dimensions: CANVAS_IMAGE_DIMENSIONS,
+        constraints: &[],
+        output_cardinality: OutputCardinality::Fixed(1),
+        metering_bases: IMAGE_OUTPUT_BASIS,
+        normalizer_key: "dreamina-canvas.images.text2image.v1",
+        normalizer_revision: 1,
+        support: SurfaceSupport::Supported,
+    },
+    PricingSurfaceContract {
         contract_id: "openai-codex.images.generations.pricing-surface",
         contract_version: 2,
         provider_id: "openai-codex",
@@ -1126,10 +1155,10 @@ mod tests {
 
     #[test]
     fn registry_identity_and_hash_are_deterministic() {
-        assert_eq!(registry().len(), 8);
+        assert_eq!(registry().len(), 9);
         assert_eq!(registry_hash(), registry_hash());
         assert_eq!(registry_hash().len(), 64);
-        let generation = registry()[0]
+        let generation = contract("openai-codex.images.generations.pricing-surface")
             .binding_snapshot(ExactSurfaceIdentity {
                 api_profile: "openai-images-v1",
                 provider_model_id: "gpt-image-2",
@@ -1138,7 +1167,7 @@ mod tests {
                 execution_surface: "provider_cli",
             })
             .unwrap();
-        let edit = registry()[1]
+        let edit = contract("openai-codex.images.edits.pricing-surface")
             .binding_snapshot(ExactSurfaceIdentity {
                 api_profile: "openai-images-v1",
                 provider_model_id: "gpt-image-2",

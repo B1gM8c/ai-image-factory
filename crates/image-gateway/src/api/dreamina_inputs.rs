@@ -1,5 +1,8 @@
+use std::time::Duration;
+
 use image_provider_dreamina_cli::{StagedImageV1, StagedInputKindV1, StagedTimedMediaV1};
 use sha2::{Digest, Sha256};
+use tokio::time::Instant;
 use uuid::Uuid;
 
 use crate::{
@@ -16,6 +19,16 @@ use super::{dreamina::dreamina_admission_error, video_inputs::decode_media_sourc
 
 // An application resource bound, independent of the upstream per-model input count.
 const MAX_TOTAL_INPUT_BYTES: usize = 256 * 1024 * 1024;
+const ADMISSION_CLEANUP_MARGIN_MS: i64 = 5_000;
+
+pub(super) fn remaining_preparation_budget(admission_deadline_ms: i64) -> Duration {
+    let now_ms = time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000;
+    let now_ms = i64::try_from(now_ms).unwrap_or(i64::MAX);
+    let remaining_ms = admission_deadline_ms
+        .saturating_sub(now_ms)
+        .saturating_sub(ADMISSION_CLEANUP_MARGIN_MS);
+    Duration::from_millis(u64::try_from(remaining_ms).unwrap_or_default())
+}
 
 /// Download, probe and persist one input at a time. Recovery uses these frozen objects.
 pub(super) async fn stage_workflow_inputs(
@@ -23,14 +36,40 @@ pub(super) async fn stage_workflow_inputs(
     ticket: &AdmissionTicket,
     intent: DreaminaWorkflowIntent,
     max_upload_bytes: usize,
+    budget: Duration,
 ) -> Result<DreaminaWorkflowAdmissionPlan, ImageGatewayError> {
-    let result = stage_inputs(store, ticket, intent, max_upload_bytes).await;
+    // Individual downloads retain their own shorter timeout and single read retry.
+    // The aggregate budget also covers decoding and persisting all inputs.
+    let started = Instant::now();
+    let result = if budget.is_zero() {
+        Err(preparation_timed_out())
+    } else {
+        match tokio::time::timeout(
+            budget,
+            stage_inputs(store, ticket, intent, max_upload_bytes),
+        )
+        .await
+        {
+            Ok(result) if started.elapsed() < budget => result,
+            _ => Err(preparation_timed_out()),
+        }
+    };
     if result.is_err() {
+        // Cleanup must remain outside the expired staging future. If the client
+        // disconnects, the existing admission reconciler also cleans this session.
         store.delete_session(ticket.session_id).await.map_err(|_| {
             ImageGatewayError::service_unavailable("Dreamina input cleanup is unavailable")
         })?;
     }
     result
+}
+
+fn preparation_timed_out() -> ImageGatewayError {
+    ImageGatewayError::invalid_request(
+        "Dreamina reference material preparation exceeded the time limit",
+        None,
+        "invalid_image_url",
+    )
 }
 
 async fn stage_inputs(
@@ -174,9 +213,57 @@ fn media_error(error: MediaInputError, parameter: &str) -> ImageGatewayError {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        future::pending,
+        sync::{
+            Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
+
     use super::*;
-    use crate::artifacts::InMemoryArtifactBlobStore;
+    use crate::{
+        artifacts::InMemoryArtifactBlobStore,
+        input_blobs::{
+            InputBlobDeleteError, InputBlobReadError, InputBlobRef, InputBlobWriteError,
+        },
+    };
     use base64::{Engine as _, engine::general_purpose::STANDARD};
+
+    #[derive(Default)]
+    struct SecondWriteStalls {
+        inner: InMemoryArtifactBlobStore,
+        started: AtomicUsize,
+        first: Mutex<Option<InputBlobRef>>,
+    }
+
+    #[async_trait::async_trait]
+    impl InputBlobStore for SecondWriteStalls {
+        async fn put(
+            &self,
+            key: InputBlobKey,
+            bytes: &[u8],
+        ) -> Result<InputBlobRef, InputBlobWriteError> {
+            if self.started.fetch_add(1, Ordering::Relaxed) != 0 {
+                return pending().await;
+            }
+            let blob = self.inner.put(key, bytes).await?;
+            *self.first.lock().unwrap() = Some(blob.clone());
+            Ok(blob)
+        }
+
+        async fn get(&self, blob: &InputBlobRef) -> Result<Vec<u8>, InputBlobReadError> {
+            self.inner.get(blob).await
+        }
+
+        async fn delete(&self, blob: &InputBlobRef) -> Result<(), InputBlobDeleteError> {
+            self.inner.delete(blob).await
+        }
+
+        async fn delete_session(&self, session_id: Uuid) -> Result<(), InputBlobDeleteError> {
+            self.inner.delete_session(session_id).await
+        }
+    }
 
     fn image_source() -> (String, Vec<u8>) {
         let mut bytes = std::io::Cursor::new(Vec::new());
@@ -219,6 +306,7 @@ mod tests {
             &ticket,
             video_intent(source.clone(), source),
             1024 * 1024,
+            Duration::from_secs(5),
         )
         .await
         .unwrap();
@@ -266,7 +354,8 @@ mod tests {
                     &store,
                     &ticket,
                     video_intent(source.clone(), invalid),
-                    1024 * 1024
+                    1024 * 1024,
+                    Duration::from_secs(5),
                 )
                 .await
                 .is_err()
@@ -284,10 +373,64 @@ mod tests {
                 &store,
                 &ticket(),
                 video_intent(source.clone(), source),
-                bytes.len() + 4
+                bytes.len() + 4,
+                Duration::from_secs(5),
             )
             .await
             .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn aggregate_timeout_cleans_partial_staging_and_never_yields_a_plan() {
+        let store = SecondWriteStalls::default();
+        let ticket = ticket();
+        let (source, bytes) = image_source();
+        let unrelated = store
+            .inner
+            .put(
+                InputBlobKey {
+                    admission_session_id: Uuid::new_v4(),
+                    input_id: Uuid::new_v4(),
+                },
+                &bytes,
+            )
+            .await
+            .unwrap();
+        let result = stage_workflow_inputs(
+            &store,
+            &ticket,
+            video_intent(source.clone(), source),
+            1024 * 1024,
+            Duration::from_secs(1),
+        )
+        .await;
+        let error = result.err().expect("stalled input cannot be attached");
+        assert_eq!(error.status_code().as_u16(), 400);
+        assert_eq!(error.error_code(), Some("invalid_image_url"));
+        assert_eq!(store.started.load(Ordering::Relaxed), 2);
+        let first = store.first.lock().unwrap().take().unwrap();
+        assert_eq!(first.key.admission_session_id, ticket.session_id);
+        assert!(store.get(&first).await.is_err());
+        assert_eq!(store.get(&unrelated).await.unwrap(), bytes);
+    }
+
+    #[tokio::test]
+    async fn expired_admission_does_not_stage_any_inputs() {
+        let store = SecondWriteStalls::default();
+        let (source, _) = image_source();
+        let result = stage_workflow_inputs(
+            &store,
+            &ticket(),
+            video_intent(source.clone(), source),
+            1024 * 1024,
+            remaining_preparation_budget(0),
+        )
+        .await;
+        assert_eq!(
+            result.err().unwrap().error_code(),
+            Some("invalid_image_url")
+        );
+        assert_eq!(store.started.load(Ordering::Relaxed), 0);
     }
 }

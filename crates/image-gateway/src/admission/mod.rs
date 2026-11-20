@@ -7,6 +7,7 @@ use tracing::warn;
 use uuid::Uuid;
 
 use crate::input_blobs::InputBlobRef;
+use crate::providers::dreamina_canvas::{CANVAS_SUBMIT_COMMAND_SCHEMA, CanvasImagePlan};
 use image_provider_dreamina_cli::{DREAMINA_SUBMIT_COMMAND_SCHEMA, parse_submit_command};
 use image_provider_grok_cli::{
     GROK_IMAGE_EDIT_COMMAND_SCHEMA, GROK_IMAGE_GENERATION_COMMAND_SCHEMA,
@@ -237,6 +238,7 @@ pub(crate) fn validate_attach_request(request: &AttachJob) -> Result<(), Admissi
     let provider_command_hash = provider_command_hash(request)?;
     let Some(manifest) = request.input_manifest.as_ref() else {
         return match request.command_schema.as_str() {
+            CANVAS_SUBMIT_COMMAND_SCHEMA => Ok(()),
             GENERATION_COMMAND_SCHEMA => {
                 let command: GenerationCommandV1 =
                     serde_json::from_value(request.command_json.clone())
@@ -497,6 +499,12 @@ pub(crate) fn provider_command_hash(request: &AttachJob) -> Result<String, Admis
             parse_submit_command(&bytes).map_err(|_| AdmissionError::InvalidCommand)?;
             hex::encode(Sha256::digest(&bytes))
         }
+        CANVAS_SUBMIT_COMMAND_SCHEMA => {
+            let bytes = serde_json::to_vec(&request.command_json)
+                .map_err(|_| AdmissionError::InvalidCommand)?;
+            CanvasImagePlan::from_command(&bytes).map_err(|_| AdmissionError::InvalidCommand)?;
+            hex::encode(Sha256::digest(&bytes))
+        }
         _ => return Err(AdmissionError::InvalidCommand),
     };
     let explicit_hash = request
@@ -743,7 +751,7 @@ fn validate_video_attach_request_v2(
 
 pub(crate) fn attach_operation(request: &AttachJob) -> Result<&'static str, AdmissionError> {
     match request.command_schema.as_str() {
-        GENERATION_COMMAND_SCHEMA => Ok(GENERATION_OPERATION),
+        GENERATION_COMMAND_SCHEMA | CANVAS_SUBMIT_COMMAND_SCHEMA => Ok(GENERATION_OPERATION),
         GROK_IMAGE_GENERATION_COMMAND_SCHEMA => Ok(GENERATION_OPERATION),
         GROK_IMAGE_EDIT_COMMAND_SCHEMA => Ok(EDIT_OPERATION),
         GROK_VIDEO_GENERATION_COMMAND_SCHEMA => Ok(VIDEO_GENERATION_OPERATION),

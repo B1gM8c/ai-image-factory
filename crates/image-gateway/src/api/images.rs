@@ -126,10 +126,20 @@ fn routed_models_response(models: Vec<PublicModelRoute>) -> ModelsResponse {
 }
 
 fn dreamina_model_surface(model: &PublicModelRoute) -> Option<ModelSurface> {
-    if model.provider_id != DREAMINA_PROVIDER_ID {
+    use crate::providers::dreamina_canvas::CANVAS_PROVIDER_ID;
+    let canvas = model.provider_id == CANVAS_PROVIDER_ID;
+    if model.provider_id != DREAMINA_PROVIDER_ID && !canvas {
         return None;
     }
     let canonical = model.provider_model_id.as_deref()?;
+    if canvas
+        && !(model.api_profile == DREAMINA_IMAGES_API_PROFILE
+            && model.operation_id == "images.generations"
+            && model.media_kind == "image"
+            && canonical == "5.5")
+    {
+        return None;
+    }
     // Match the native adapter and Ark admission contracts, never the public alias.
     let workflows: &[&str] = match (
         model.api_profile.as_str(),
@@ -137,6 +147,9 @@ fn dreamina_model_surface(model: &PublicModelRoute) -> Option<ModelSurface> {
         model.media_kind.as_str(),
         canonical,
     ) {
+        (DREAMINA_IMAGES_API_PROFILE, "images.generations", "image", "5.5") if canvas => {
+            &["text2image"]
+        }
         (DREAMINA_IMAGES_API_PROFILE, "images.generations", "image", "3.0" | "3.1") => {
             &["text2image"]
         }
@@ -186,7 +199,7 @@ fn dreamina_model_surface(model: &PublicModelRoute) -> Option<ModelSurface> {
         _ => return None,
     };
     Some(ModelSurface {
-        provider_id: model.provider_id.clone(),
+        provider_id: DREAMINA_PROVIDER_ID.to_owned(),
         provider_model_id: canonical.to_owned(),
         api_profile: model.api_profile.clone(),
         operation_id: model.operation_id.clone(),

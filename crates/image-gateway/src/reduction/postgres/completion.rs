@@ -3,7 +3,10 @@ use serde_json::{Value, json};
 use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
-use image_api_contracts::xai::{XAI_IMAGES_API_PROFILE, XAI_VIDEOS_API_PROFILE};
+use image_api_contracts::{
+    dreamina::DREAMINA_IMAGES_API_PROFILE,
+    xai::{XAI_IMAGES_API_PROFILE, XAI_VIDEOS_API_PROFILE},
+};
 use image_provider_contracts::{
     ProviderCostEvidenceScope, ProviderCostObservationV1, ProviderReportedCostEvidenceV1,
 };
@@ -24,6 +27,7 @@ use crate::{
         VIDEO_GENERATION_OPERATION,
     },
     artifacts::{ArtifactMetadata, GENERATION_RESPONSE_SCHEMA, customer_object_key},
+    dreamina_canvas::{CANVAS_SUBMIT_COMMAND_SCHEMA, CanvasImagePlan},
     economics::{
         EconomicReceipt, EconomicReceiptOutcome, EconomicSettlementError,
         record_v4_provider_receipt_in_transaction, settle_receipt_in_transaction,
@@ -1780,6 +1784,39 @@ async fn persist_projection(
                 artifact_count,
                 command_json,
                 &api_profile,
+                now,
+            )
+            .await
+        }
+        CANVAS_SUBMIT_COMMAND_SCHEMA => {
+            if api_profile != DREAMINA_IMAGES_API_PROFILE
+                || quota.economics_contract_version != 4
+                || quota.operation != GENERATION_OPERATION
+                || quota.billing_metric != "output"
+                || quota.billing_unit != "output"
+                || quota.output_count != 1
+                || quota.billable_units != 1
+                || quota.output_billable_units != 1
+                || artifact_count != 1
+            {
+                return Err(ExecutorTerminalError::Conflict);
+            }
+            let bytes =
+                serde_json::to_vec(&command_json).map_err(|_| ExecutorTerminalError::Conflict)?;
+            let plan = CanvasImagePlan::from_command(&bytes)
+                .map_err(|_| ExecutorTerminalError::Conflict)?;
+            insert_response_projection(
+                tx,
+                lease.job_id,
+                &api_profile,
+                GENERATION_OPERATION,
+                GENERATION_RESPONSE_SCHEMA,
+                "auto",
+                "auto",
+                &format!("1.5k:{}", plan.ratio()),
+                "opaque",
+                quota,
+                artifact_count,
                 now,
             )
             .await

@@ -1056,17 +1056,26 @@ async fn seed_economics(pool: &PgPool, tenant: &str) -> TestResult {
 }
 
 async fn seed_model_economics(pool: &PgPool, tenant: &str, model: FixtureModel) -> TestResult {
+    seed_provider_model_economics(pool, tenant, "dreamina-cli", model).await
+}
+
+async fn seed_provider_model_economics(
+    pool: &PgPool,
+    tenant: &str,
+    provider: &str,
+    model: FixtureModel,
+) -> TestResult {
     let (metric, unit, unit_size) = model.metric_unit_size();
     let service = PostgresPricingAdminService::new(pool.clone());
     let book = service
         .create_price_book(CreatePriceBookRequest {
-            price_book_key: "customer.dreamina-api-fixture.usd".to_owned(),
+            price_book_key: format!("customer.{provider}-api-fixture.usd"),
             display_name: "Dreamina API fixture".to_owned(),
             purpose: "customer_sale".to_owned(),
             scope_type: "platform".to_owned(),
             organization_id: None,
             project_id: None,
-            provider_id: Some("dreamina-cli".to_owned()),
+            provider_id: Some(provider.to_owned()),
             currency: "USD".to_owned(),
         })
         .await
@@ -1105,7 +1114,7 @@ async fn seed_model_economics(pool: &PgPool, tenant: &str, model: FixtureModel) 
                         "video_generation"
                     }
                     .to_owned(),
-                    provider_id: Some("dreamina-cli".to_owned()),
+                    provider_id: Some(provider.to_owned()),
                     provider_model_id: Some(model.provider_model.to_owned()),
                     public_model_id: model.public_model.to_owned(),
                     media_kind: model.media_kind.to_owned(),

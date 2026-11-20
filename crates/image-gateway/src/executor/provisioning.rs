@@ -1,3 +1,4 @@
+use image_cli_runtime::WorkingDirectory;
 use image_provider_contracts::{OperationDescriptor, openai_codex};
 use image_provider_dreamina_cli::{
     ADAPTER_REVISION as DREAMINA_ADAPTER_REVISION, DREAMINA_IMAGE_GENERATION_OPERATION_V1,
@@ -16,7 +17,13 @@ use image_provider_grok_cli::{
 use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
-use crate::admission::{EDIT_COMMAND_SCHEMA, GENERATION_COMMAND_SCHEMA};
+use crate::{
+    admission::{EDIT_COMMAND_SCHEMA, GENERATION_COMMAND_SCHEMA},
+    providers::dreamina_canvas::{
+        CANVAS_ADAPTER_REVISION, CANVAS_IMAGE_GENERATION_OPERATION, CANVAS_IMAGE_MODEL,
+        CANVAS_PROVIDER_ID, CANVAS_SUBMIT_COMMAND_SCHEMA,
+    },
+};
 
 use super::CODEX_GENERATION_ADAPTER_REVISION;
 
@@ -547,6 +554,137 @@ pub async fn provision_dreamina_execution_profile(
     provisioning: &DreaminaExecutionProfileProvisioning,
 ) -> Result<ProvisionedDreaminaExecutionProfile, DreaminaProfileProvisioningError> {
     provision_execution_profile(pool, provisioning, dreamina_provisioning_binding()).await
+}
+
+/// Register a dedicated, pre-authorized Canvas OAuth home. Enabling a user
+/// route and published price remains an explicit control-plane operation.
+pub async fn provision_dreamina_canvas_execution_profile(
+    pool: &PgPool,
+    provisioning: &ExecutionProfileProvisioning,
+    account_home: &std::path::Path,
+) -> Result<ProvisionedExecutionProfile, ExecutionProfileProvisioningError> {
+    use ExecutionProfileProvisioningError::{Conflict, InvalidInput};
+
+    if provisioning.credential_revision != 1 || provisioning.max_concurrency != 1 {
+        return Err(InvalidInput);
+    }
+    let account_home = WorkingDirectory::new_private(account_home).map_err(|_| InvalidInput)?;
+    let home = account_home
+        .path()
+        .to_str()
+        .filter(|home| home.len() <= 2048)
+        .ok_or(InvalidInput)?;
+    let mut tx = pool.begin().await.map_err(map_sql_error)?;
+    let provisioned = provision_execution_profile_in_transaction(
+        &mut tx,
+        provisioning,
+        ProvisioningBinding {
+            provider_id: CANVAS_PROVIDER_ID,
+            command_schema: CANVAS_SUBMIT_COMMAND_SCHEMA,
+            operation: &CANVAS_IMAGE_GENERATION_OPERATION,
+            adapter_revision: CANVAS_ADAPTER_REVISION,
+            advisory_lock_key: "factoryctl.provision-dreamina-canvas-profile",
+        },
+    )
+    .await?;
+    let now = database_now(&mut tx).await?;
+    let environment = sqlx::query(
+        r#"
+        INSERT INTO provider_account_environments (
+          provider_account_id, provider_id, environment_kind, environment_ref,
+          upstream_identity_sha256, display_name, state, created_at_ms, updated_at_ms
+        )
+        VALUES ($1, $2, 'dreamina_canvas_home_v1', $3, $4, $5, 'active', $6, $6)
+        ON CONFLICT (provider_account_id) DO UPDATE SET updated_at_ms = EXCLUDED.updated_at_ms
+        WHERE provider_account_environments.provider_id = EXCLUDED.provider_id
+          AND provider_account_environments.environment_kind = EXCLUDED.environment_kind
+          AND provider_account_environments.environment_ref = EXCLUDED.environment_ref
+          AND provider_account_environments.upstream_identity_sha256 = EXCLUDED.upstream_identity_sha256
+          AND provider_account_environments.state = 'active'
+        "#,
+    )
+    .bind(provisioned.provider_account_id)
+    .bind(CANVAS_PROVIDER_ID)
+    .bind(home)
+    .bind(&provisioning.credential_auth_sha256)
+    .bind(&provisioning.provider_account_key)
+    .bind(now)
+    .execute(&mut *tx).await.map_err(map_sql_error)?;
+    if environment.rows_affected() != 1 {
+        return Err(Conflict);
+    }
+    sqlx::query(
+        r#"
+        INSERT INTO provider_models (
+          provider_id, model_id, execution_model_id, media_kind, display_name,
+          adapter_state, lifecycle_state, operation_ids, source_kind,
+          first_seen_at_ms, last_seen_at_ms
+        )
+        VALUES ($1, '5.5', $2, 'image', 'Seedream 5.5', 'supported', 'enabled',
+                ARRAY['images.generations']::TEXT[], 'adapter_contract', $3, $3)
+        ON CONFLICT (provider_id, model_id, media_kind) DO NOTHING
+        "#,
+    )
+    .bind(CANVAS_PROVIDER_ID)
+    .bind(CANVAS_IMAGE_MODEL)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .map_err(map_sql_error)?;
+    let model_matches: bool = sqlx::query_scalar(
+        r#"
+        SELECT EXISTS (
+          SELECT 1 FROM provider_models
+          WHERE provider_id = $1 AND model_id = '5.5' AND execution_model_id = $2
+            AND media_kind = 'image' AND adapter_state = 'supported'
+            AND operation_ids = ARRAY['images.generations']::TEXT[]
+        )
+        "#,
+    )
+    .bind(CANVAS_PROVIDER_ID)
+    .bind(CANVAS_IMAGE_MODEL)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(map_sql_error)?;
+    if !model_matches {
+        return Err(Conflict);
+    }
+    tx.commit().await.map_err(map_sql_error)?;
+    Ok(provisioned)
+}
+
+pub async fn validate_dreamina_canvas_home(
+    pool: &PgPool,
+    provider_account_id: Uuid,
+    account_home: &std::path::Path,
+    fingerprint: &str,
+) -> Result<(), ExecutionProfileProvisioningError> {
+    use ExecutionProfileProvisioningError::{Conflict, InvalidInput};
+
+    let account_home = WorkingDirectory::new_private(account_home).map_err(|_| InvalidInput)?;
+    let home = account_home.path().to_str().ok_or(InvalidInput)?;
+    let matched = sqlx::query_scalar::<_, bool>(
+        r#"
+        SELECT EXISTS (
+          SELECT 1 FROM provider_account_environments
+          WHERE provider_account_id = $1
+            AND provider_id = $2 AND environment_kind = 'dreamina_canvas_home_v1'
+            AND environment_ref = $3 AND upstream_identity_sha256 = $4
+            AND state = 'active'
+        )
+        "#,
+    )
+    .bind(provider_account_id)
+    .bind(CANVAS_PROVIDER_ID)
+    .bind(home)
+    .bind(fingerprint)
+    .fetch_one(pool)
+    .await
+    .map_err(map_sql_error)?;
+    if !matched {
+        return Err(Conflict);
+    }
+    Ok(())
 }
 
 pub async fn provision_dreamina_execution_profile_in_transaction(

@@ -18,6 +18,7 @@ use crate::{
     },
     artifacts::ArtifactBlobStore,
     core::provider::validate_edit_job,
+    dreamina_canvas::CANVAS_SUBMIT_COMMAND_SCHEMA,
     execution::{EditExecutionContext, ExecutionContextError, ExecutionContextStore},
     executor::{ExecutorHandoffStore, ExecutorSubmissionError},
     generator::{EditJob, ImageGenerator, InputImage},
@@ -394,6 +395,7 @@ fn is_handoff_schema(schema: &str) -> bool {
             | GROK_VIDEO_GENERATION_COMMAND_SCHEMA
             | GROK_VIDEO_GENERATION_COMMAND_SCHEMA_V2
             | DREAMINA_SUBMIT_COMMAND_SCHEMA
+            | CANVAS_SUBMIT_COMMAND_SCHEMA
     )
 }
 

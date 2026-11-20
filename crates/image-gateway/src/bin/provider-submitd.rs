@@ -1,25 +1,29 @@
 use std::{env, path::PathBuf, sync::Arc, time::Duration};
 
 use gpt_image_2_gateway::{
-    DreaminaCliSubmitCodecV1, DreaminaCliSubmitProcessConfig, GatedCliSubmitDriver,
-    ImageGatewayError, PostgresExecutorSubmissionStore, PostgresProviderTaskStore,
-    ProviderAccountHomeCapability, ProviderRuntimeProfileStore, ProviderRuntimeRegistration,
-    ProviderRuntimeRole, ProviderRuntimeSupervisor, ProviderRuntimeSupervisorConfig,
-    ProviderRuntimeSupervisorError, ProviderSubmitDaemon, ProviderSubmitDaemonConfig,
-    ProviderSubmitDaemonError, ProviderSubmitService, ProviderSubmitServiceConfig,
+    DreaminaCliSubmitCodecV1, DreaminaCliSubmitProcessConfig, GatedCliSubmitCodec,
+    GatedCliSubmitDriver, ImageGatewayError, PostgresExecutorSubmissionStore,
+    PostgresProviderTaskStore, ProviderAccountHomeCapability, ProviderRuntimeProfile,
+    ProviderRuntimeProfileStore, ProviderRuntimeRegistration, ProviderRuntimeRole,
+    ProviderRuntimeSupervisor, ProviderRuntimeSupervisorConfig, ProviderRuntimeSupervisorError,
+    ProviderSubmitDaemon, ProviderSubmitDaemonConfig, ProviderSubmitDaemonError,
+    ProviderSubmitProjector, ProviderSubmitService, ProviderSubmitServiceConfig,
     ProviderSubmitServiceError, ProviderTaskStoreError,
     artifacts::{FilesystemArtifactBlobStore, artifact_root_from_env},
     database::{
         connect_pool_with_schema, database_schema_from_env, database_url_from_env,
         verify_migrations, worker_database_max_connections_from_env,
     },
+    dreamina_canvas::{
+        CANVAS_PROVIDER_ID, CanvasCliConfig, CanvasCliProcessConfig, CanvasCliSubmitCodec,
+    },
+    executor::validate_dreamina_canvas_home,
     init_telemetry, prepare_dreamina_account_home,
 };
 use image_cli_runtime::WorkingDirectory;
 use image_provider_dreamina_cli::PROVIDER_ID as DREAMINA_PROVIDER_ID;
 use uuid::Uuid;
 
-const ACTIVATION_TOKENS: &[&str] = &["dreamina-remote-submit-v1", "dreamina-image-submit-v1"];
 const DEFAULT_PROVIDER_TIMEOUT_MS: u64 = 60_000;
 const DEFAULT_EXECUTOR_LEASE_MS: u64 = 60_000;
 const DEFAULT_RECOVERY_LEASE_MS: u64 = 60_000;
@@ -35,6 +39,7 @@ const DEFAULT_RUNTIME_HEARTBEAT_MS: u64 = 10_000;
 const MAX_DURATION_MS: u64 = 24 * 60 * 60 * 1_000;
 
 struct ProviderSubmitterConfig {
+    canvas: Option<CanvasSubmitterConfig>,
     profile_key: String,
     owner_prefix: String,
     credential_pool_id: Uuid,
@@ -64,13 +69,22 @@ struct ProviderSubmitterConfig {
     runtime_heartbeat_interval: Duration,
 }
 
+struct CanvasSubmitterConfig {
+    state_dir: PathBuf,
+    project_id: Uuid,
+    oauth_profile: String,
+}
+
 impl ProviderSubmitterConfig {
     fn from_env() -> Result<Self, ImageGatewayError> {
-        if !ACTIVATION_TOKENS.contains(&required_env("PROVIDER_SUBMITTER_ACTIVATION")?.as_str()) {
-            return Err(ImageGatewayError::config(
-                "PROVIDER_SUBMITTER_ACTIVATION does not enable a supported provider runtime",
-            ));
-        }
+        let canvas = match activated_provider(&required_env("PROVIDER_SUBMITTER_ACTIVATION")?)? {
+            CANVAS_PROVIDER_ID => Some(CanvasSubmitterConfig {
+                state_dir: absolute_env_path("DREAMINA_CANVAS_STATE_DIR")?,
+                project_id: env_uuid("DREAMINA_CANVAS_PROJECT_ID")?,
+                oauth_profile: required_env("DREAMINA_CANVAS_OAUTH_PROFILE")?,
+            }),
+            _ => None,
+        };
         let profile_key = required_env("PROVIDER_SUBMITTER_PROFILE_KEY")?;
         let owner_prefix = optional_env("PROVIDER_SUBMITTER_OWNER_PREFIX")
             .unwrap_or_else(|| format!("provider-submitd-{}", Uuid::new_v4().simple()));
@@ -151,6 +165,7 @@ impl ProviderSubmitterConfig {
             ));
         }
         Ok(Self {
+            canvas,
             profile_key,
             owner_prefix,
             credential_pool_id,
@@ -182,12 +197,19 @@ impl ProviderSubmitterConfig {
     }
 }
 
+fn activated_provider(token: &str) -> Result<&'static str, ImageGatewayError> {
+    match token {
+        "dreamina-remote-submit-v1" | "dreamina-image-submit-v1" => Ok(DREAMINA_PROVIDER_ID),
+        "dreamina-canvas-submit-v1" => Ok(CANVAS_PROVIDER_ID),
+        _ => Err(ImageGatewayError::config(
+            "PROVIDER_SUBMITTER_ACTIVATION does not enable a supported provider runtime",
+        )),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), ImageGatewayError> {
     let config = ProviderSubmitterConfig::from_env()?;
-    prepare_dreamina_account_home(&config.account_home)
-        .await
-        .map_err(|error| ImageGatewayError::config(error.to_string()))?;
     let telemetry = init_telemetry()?;
     let database_url = database_url_from_env()?;
     let database_schema = database_schema_from_env()?;
@@ -199,13 +221,39 @@ async fn main() -> Result<(), ImageGatewayError> {
         .load_active_runtime_profile(&config.profile_key)
         .await
         .map_err(map_profile_error)?;
+    let provider_id = if config.canvas.is_some() {
+        CANVAS_PROVIDER_ID
+    } else {
+        DREAMINA_PROVIDER_ID
+    };
+    if profile.provider_id() != provider_id
+        || config.canvas.is_some() && profile.max_in_flight() != 1
+    {
+        return Err(ImageGatewayError::config(
+            "provider-submitd activation does not match the execution profile",
+        ));
+    }
+    if provider_id == DREAMINA_PROVIDER_ID {
+        prepare_dreamina_account_home(&config.account_home)
+            .await
+            .map_err(|error| ImageGatewayError::config(error.to_string()))?;
+    } else {
+        validate_dreamina_canvas_home(
+            &pool,
+            profile.provider_account_id(),
+            &config.account_home,
+            profile.credential_auth_sha256(),
+        )
+        .await
+        .map_err(|error| ImageGatewayError::config(error.to_string()))?;
+    }
     let account_home = ProviderAccountHomeCapability::new(
-        DREAMINA_PROVIDER_ID,
+        provider_id,
         config.credential_pool_id,
         config.provider_account_id,
-        config.credential_ref,
+        &config.credential_ref,
         config.credential_revision,
-        config.credential_auth_sha256,
+        &config.credential_auth_sha256,
         &config.account_home,
     )
     .map_err(|error| ImageGatewayError::config(error.to_string()))?;
@@ -215,24 +263,89 @@ async fn main() -> Result<(), ImageGatewayError> {
         .map_err(|error| ImageGatewayError::config(error.to_string()))?;
     let _journal_root = WorkingDirectory::new_private(&config.journal_root)
         .map_err(|error| ImageGatewayError::config(error.to_string()))?;
-    validate_isolated_roots(&[
+    let mut roots: Vec<&std::path::Path> = vec![
         &config.account_home,
         &config.workspace_root,
         &config.journal_root,
         &artifact_root,
-    ])?;
-    let codec = DreaminaCliSubmitCodecV1::from_runtime_profile(
-        &profile,
-        &account_home,
-        DreaminaCliSubmitProcessConfig::new(
-            &config.executable,
-            config.executable_sha256,
-            workspace_root.clone(),
-            config.cli_wall_timeout,
-            config.cli_termination_grace,
-        ),
-    )
-    .map_err(|error| ImageGatewayError::config(error.to_string()))?;
+    ];
+    if let Some(canvas) = &config.canvas {
+        roots.push(&canvas.state_dir);
+    }
+    validate_isolated_roots(&roots)?;
+    let executor_store = PostgresExecutorSubmissionStore::new(pool);
+    match &config.canvas {
+        Some(canvas) => {
+            let cli = CanvasCliConfig::from_runtime_profile(
+                &profile,
+                &account_home,
+                CanvasCliProcessConfig {
+                    executable: config.executable.clone(),
+                    executable_sha256: config.executable_sha256,
+                    workspace: workspace_root.clone(),
+                    state_dir: canvas.state_dir.clone(),
+                    project_id: canvas.project_id,
+                    oauth_profile: canvas.oauth_profile.clone(),
+                    wall_timeout: config.cli_wall_timeout,
+                    termination_grace: config.cli_termination_grace,
+                },
+            )
+            .map_err(|error| ImageGatewayError::config(error.to_string()))?;
+            cli.verify_authenticated().await.map_err(|_| {
+                ImageGatewayError::config("Canvas OAuth profile is unavailable to the submitter")
+            })?;
+            run_submitter(
+                &config,
+                &profile,
+                executor_store,
+                provider_store,
+                workspace_root,
+                input_blobs,
+                CanvasCliSubmitCodec::new(cli),
+            )
+            .await?;
+        }
+        None => {
+            let codec = DreaminaCliSubmitCodecV1::from_runtime_profile(
+                &profile,
+                &account_home,
+                DreaminaCliSubmitProcessConfig::new(
+                    &config.executable,
+                    config.executable_sha256,
+                    workspace_root.clone(),
+                    config.cli_wall_timeout,
+                    config.cli_termination_grace,
+                ),
+            )
+            .map_err(|error| ImageGatewayError::config(error.to_string()))?;
+            run_submitter(
+                &config,
+                &profile,
+                executor_store,
+                provider_store,
+                workspace_root,
+                input_blobs,
+                codec,
+            )
+            .await?;
+        }
+    }
+    telemetry.shutdown();
+    Ok(())
+}
+
+async fn run_submitter<C>(
+    config: &ProviderSubmitterConfig,
+    profile: &ProviderRuntimeProfile,
+    executor_store: PostgresExecutorSubmissionStore,
+    provider_store: PostgresProviderTaskStore,
+    workspace_root: WorkingDirectory,
+    input_blobs: Arc<FilesystemArtifactBlobStore>,
+    codec: C,
+) -> Result<(), ImageGatewayError>
+where
+    C: Clone + GatedCliSubmitCodec + ProviderSubmitProjector<GatedCliSubmitDriver<C>>,
+{
     let driver = GatedCliSubmitDriver::new(
         codec.clone(),
         &config.runner,
@@ -241,7 +354,6 @@ async fn main() -> Result<(), ImageGatewayError> {
     )
     .map_err(|error| ImageGatewayError::config(error.to_string()))?
     .with_input_blobs(input_blobs);
-    let executor_store = PostgresExecutorSubmissionStore::new(pool);
     let provider_scope = profile.claim_scope();
     let service = Arc::new(
         ProviderSubmitService::new(
@@ -313,7 +425,6 @@ async fn main() -> Result<(), ImageGatewayError> {
         errors = report.errors,
         "provider-submitd stopped"
     );
-    telemetry.shutdown();
     Ok(())
 }
 
@@ -536,6 +647,18 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn submit_activations_select_only_the_bound_provider() {
+        assert_eq!(
+            activated_provider("dreamina-canvas-submit-v1").unwrap(),
+            CANVAS_PROVIDER_ID
+        );
+        for token in ["dreamina-remote-submit-v1", "dreamina-image-submit-v1"] {
+            assert_eq!(activated_provider(token).unwrap(), DREAMINA_PROVIDER_ID);
+        }
+        assert!(activated_provider("dreamina-canvas-poll-v1").is_err());
+    }
 
     #[test]
     fn submit_cli_budget_defaults_to_the_provider_budget() {

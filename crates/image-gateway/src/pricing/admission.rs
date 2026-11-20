@@ -16,6 +16,9 @@ use crate::admission::{
     GENERATION_COMMAND_SCHEMA_VERSION, GENERATION_OPERATION, GenerationCommandV1,
     VIDEO_GENERATION_OPERATION, provider_command_hash,
 };
+use crate::providers::dreamina_canvas::{
+    CANVAS_IMAGE_MODEL, CANVAS_PROVIDER_ID, CANVAS_SUBMIT_COMMAND_SCHEMA, CanvasImagePlan,
+};
 use image_api_contracts::xai::{
     XAI_IMAGES_API_PROFILE, XAI_VIDEOS_API_PROFILE, XaiVideoAspectRatio,
 };
@@ -70,7 +73,8 @@ pub(super) fn pricing_operation_for_route(
     match (provider_id, route_operation, command_schema, media_kind) {
         (CODEX_PROVIDER_ID, "images.generations", GENERATION_COMMAND_SCHEMA, "image")
         | (GROK_PROVIDER_ID, "images.generations", GROK_IMAGE_GENERATION_COMMAND_SCHEMA, "image")
-        | (DREAMINA_PROVIDER_ID, "images.generations", DREAMINA_SUBMIT_COMMAND_SCHEMA, "image") => {
+        | (DREAMINA_PROVIDER_ID, "images.generations", DREAMINA_SUBMIT_COMMAND_SCHEMA, "image")
+        | (CANVAS_PROVIDER_ID, "images.generations", CANVAS_SUBMIT_COMMAND_SCHEMA, "image") => {
             Some(GENERATION_OPERATION)
         }
         (CODEX_PROVIDER_ID, "images.edits", EDIT_COMMAND_SCHEMA, "image") => Some(EDIT_OPERATION),
@@ -100,6 +104,9 @@ pub(super) fn pricing_dimension_keys_for_route(
     media_kind: &str,
 ) -> Option<&'static [&'static str]> {
     match (provider_id, route_operation, command_schema, media_kind) {
+        (CANVAS_PROVIDER_ID, "images.generations", CANVAS_SUBMIT_COMMAND_SCHEMA, "image") => {
+            Some(&["ratio", "resolution_type"])
+        }
         (CODEX_PROVIDER_ID, "images.generations", GENERATION_COMMAND_SCHEMA, "image")
         | (CODEX_PROVIDER_ID, "images.edits", EDIT_COMMAND_SCHEMA, "image") => {
             Some(&["quality", "size"])
@@ -918,6 +925,28 @@ fn command_pricing_facts(
         media_kind,
         pricing_dimensions,
     ) = match request.command_schema.as_str() {
+        CANVAS_SUBMIT_COMMAND_SCHEMA => {
+            let bytes = serde_json::to_vec(&request.command_json)
+                .map_err(|_| AdmissionError::InvalidCommand)?;
+            let plan = CanvasImagePlan::from_command(&bytes)
+                .map_err(|_| AdmissionError::InvalidCommand)?;
+            (
+                CANVAS_PROVIDER_ID.to_owned(),
+                "5.5".to_owned(),
+                image_api_contracts::dreamina::DREAMINA_IMAGES_API_PROFILE.to_owned(),
+                GENERATION_OPERATION.to_owned(),
+                1,
+                1,
+                1,
+                "output".to_owned(),
+                "output".to_owned(),
+                "image".to_owned(),
+                BTreeMap::from([
+                    ("resolution_type".to_owned(), "1.5k".to_owned()),
+                    ("ratio".to_owned(), plan.ratio().to_owned()),
+                ]),
+            )
+        }
         EDIT_COMMAND_SCHEMA => {
             let command: EditCommandV1 = serde_json::from_value(request.command_json.clone())
                 .map_err(|_| AdmissionError::InvalidCommand)?;
@@ -1218,8 +1247,11 @@ fn command_pricing_facts(
     {
         return Err(AdmissionError::InvalidCommand);
     }
-    let command_execution_model_id =
-        (provider_id == CODEX_PROVIDER_ID).then(|| provider_model_id.clone());
+    let command_execution_model_id = match provider_id.as_str() {
+        CODEX_PROVIDER_ID => Some(provider_model_id.clone()),
+        CANVAS_PROVIDER_ID => Some(CANVAS_IMAGE_MODEL.to_owned()),
+        _ => None,
+    };
     let provider_model_id =
         if provider_id == CODEX_PROVIDER_ID && provider_model_id == CODEX_SNAPSHOT_MODEL_ID {
             CODEX_PRICING_MODEL_ID.to_owned()
