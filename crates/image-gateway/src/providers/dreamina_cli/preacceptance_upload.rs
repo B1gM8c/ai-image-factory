@@ -1,14 +1,19 @@
 use std::path::Path;
 
 use image_provider_dreamina_cli::{
-    DreaminaSubmitPayloadV1, DreaminaSubmitRequestV1, parse_submit_command,
+    DreaminaSubmitPayloadV1, DreaminaSubmitRequestV1, StagedImageV1, VideoModelVersion,
+    parse_submit_command,
 };
 use image_provider_sdk::SingleOutputCommand;
 use serde::Deserialize;
 use uuid::Uuid;
 
-use crate::provider_tasks::{
-    GatedCliProcessOutcome, GatedCliProcessTerminal, GatedCliReceiptEvidence,
+use crate::{
+    executor::ExecutorInputObject,
+    provider_tasks::{
+        GatedCliProcessOutcome, GatedCliProcessTerminal, GatedCliReceiptEvidence,
+        ProviderSubmitDriverCall,
+    },
 };
 
 use super::submit_recovery::{absolute_media_arguments, has_no_acceptance_evidence};
@@ -31,11 +36,64 @@ struct FailedUploadReceipt {
     fail_reason: String,
 }
 
+pub(super) struct MaterialUploadFailure {
+    workflow: &'static str,
+    model: VideoModelVersion,
+    image_index: usize,
+    image: StagedImageV1,
+}
+
+impl MaterialUploadFailure {
+    fn frozen_input<'a>(
+        &self,
+        inputs: &'a [ExecutorInputObject],
+    ) -> Option<&'a ExecutorInputObject> {
+        inputs.get(self.image_index).filter(|input| {
+            usize::from(input.index()) == self.image_index
+                && input.role() == "image"
+                && matches!(
+                    input.media_type(),
+                    "image/png" | "image/jpeg" | "image/webp"
+                )
+                && input.blob().sha256_hex == self.image.sha256()
+        })
+    }
+
+    pub(super) fn log(
+        &self,
+        call: &ProviderSubmitDriverCall<DreaminaSubmitPayloadV1>,
+        evidence: &GatedCliReceiptEvidence,
+    ) {
+        let input = self.frozen_input(call.inputs());
+        tracing::warn!(
+            submission_id = %call.intent().submission_id,
+            error_code = "dreamina_material_upload_failed",
+            workflow = self.workflow,
+            model = self.model.as_str(),
+            image_ordinal = self.image_index + 1,
+            image_width = self.image.width(),
+            image_height = self.image.height(),
+            image_media_type = input.map(ExecutorInputObject::media_type),
+            image_byte_size = input.map(|input| input.blob().byte_size),
+            cli_elapsed_ms = evidence.finished_at_ms() - evidence.started_at_ms(),
+            "Dreamina stopped before video submission; CLI did not report the underlying upload error"
+        );
+    }
+}
+
 pub(crate) fn is_dreamina_material_upload_failure(
     terminal: &GatedCliProcessTerminal,
     evidence: &GatedCliReceiptEvidence,
     command: &SingleOutputCommand<DreaminaSubmitPayloadV1>,
 ) -> bool {
+    dreamina_material_upload_failure(terminal, evidence, command).is_some()
+}
+
+pub(super) fn dreamina_material_upload_failure(
+    terminal: &GatedCliProcessTerminal,
+    evidence: &GatedCliReceiptEvidence,
+    command: &SingleOutputCommand<DreaminaSubmitPayloadV1>,
+) -> Option<MaterialUploadFailure> {
     if !terminal.released()
         || !terminal.exec_started()
         || terminal.stdout_truncated()
@@ -49,11 +107,9 @@ pub(crate) fn is_dreamina_material_upload_failure(
             }
         )
     {
-        return false;
+        return None;
     }
-    let Ok(request) = parse_submit_command(command.canonical_payload()) else {
-        return false;
-    };
+    let request = parse_submit_command(command.canonical_payload()).ok()?;
     let process = evidence.command();
     matches_material_upload_failure(
         terminal.stdout(),
@@ -61,7 +117,8 @@ pub(crate) fn is_dreamina_material_upload_failure(
         process.working_directory(),
         process.arguments(),
         &request,
-    ) && has_no_acceptance_evidence(evidence)
+    )
+    .filter(|_| has_no_acceptance_evidence(evidence))
 }
 
 fn matches_material_upload_failure(
@@ -70,70 +127,77 @@ fn matches_material_upload_failure(
     workspace: &Path,
     observed_argv: &[String],
     request: &DreaminaSubmitRequestV1,
-) -> bool {
+) -> Option<MaterialUploadFailure> {
     if executable_sha256 != REVIEWED_DREAMINA_SHA256 {
-        return false;
+        return None;
     }
-    let Ok(receipt) = serde_json::from_slice::<FailedUploadReceipt>(stdout) else {
-        return false;
-    };
-    let Ok(candidate_id) = Uuid::parse_str(&receipt.submit_id) else {
-        return false;
-    };
-    let (argv, prompt, images, normal_absolute_paths) = match request {
-        DreaminaSubmitRequestV1::MultimodalToVideo(request) => {
-            (request.to_argv(), request.prompt(), request.images(), true)
-        }
+    let receipt = serde_json::from_slice::<FailedUploadReceipt>(stdout).ok()?;
+    let candidate_id = Uuid::parse_str(&receipt.submit_id).ok()?;
+    let (argv, prompt, images, model, workflow) = match request {
+        DreaminaSubmitRequestV1::MultimodalToVideo(request) => (
+            request.to_argv(),
+            request.prompt(),
+            request.images(),
+            request.model(),
+            "multimodal2video",
+        ),
         DreaminaSubmitRequestV1::ImageToVideo(request) => (
             request.to_argv(),
             request.options().prompt(),
             std::slice::from_ref(request.image()),
-            false,
+            request.options().model(),
+            "image2video",
         ),
-        _ => return false,
+        _ => return None,
     };
     if candidate_id.is_nil()
         || candidate_id.hyphenated().to_string() != receipt.submit_id
         || receipt.gen_status != "fail"
         || receipt.prompt != prompt
     {
-        return false;
+        return None;
     }
-    let Some(path) = receipt
+    let path = receipt
         .fail_reason
         .strip_prefix(UPLOAD_FAILURE_PREFIX)
-        .and_then(|reason| reason.strip_suffix(UPLOAD_FAILURE_SUFFIX))
-    else {
-        return false;
-    };
-    let Ok(relative_argv) = argv
+        .and_then(|reason| reason.strip_suffix(UPLOAD_FAILURE_SUFFIX))?;
+    let relative_argv = argv
         .into_iter()
         .map(|arg| arg.into_string())
         .collect::<Result<Vec<_>, _>>()
-    else {
-        return false;
-    };
-    if observed_argv == relative_argv {
-        return images.iter().any(|image| image.filename() == path);
-    }
-    // Only the newer normal multimodal projection replaces basenames with
-    // absolute paths under the same isolated workspace.
-    normal_absolute_paths
+        .ok()?;
+    let image_index = if observed_argv == relative_argv {
+        images.iter().position(|image| image.filename() == path)
+    } else if matches!(request, DreaminaSubmitRequestV1::MultimodalToVideo(_))
         && workspace.is_absolute()
         && absolute_media_arguments(&relative_argv, workspace, false)
             .is_ok_and(|argv| argv == observed_argv)
-        && images
+    {
+        // Only the newer normal multimodal projection replaces basenames with
+        // absolute paths under the same isolated workspace.
+        images
             .iter()
-            .any(|image| workspace.join(image.filename()).as_os_str() == path)
+            .position(|image| workspace.join(image.filename()).as_os_str() == path)
+    } else {
+        None
+    }?;
+    Some(MaterialUploadFailure {
+        workflow,
+        model,
+        image_index,
+        image: images[image_index].clone(),
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use image_provider_dreamina_cli::{
-        ImageToVideoRequestV1, MultimodalToVideoRequestV1, ReferenceVideoOptionsV1, StagedImageV1,
-        StagedTimedMediaV1, VideoModelVersion, VideoRatio, VideoResolution,
+        ImageToVideoRequestV1, MultimodalToVideoRequestV1, ReferenceVideoOptionsV1,
+        StagedTimedMediaV1, VideoRatio, VideoResolution,
     };
     use serde_json::{Value, json};
+
+    use crate::input_blobs::{InputBlobKey, InputBlobRef};
 
     use super::*;
 
@@ -143,7 +207,10 @@ mod tests {
 
     fn request() -> MultimodalToVideoRequestV1 {
         MultimodalToVideoRequestV1::new(
-            vec![StagedImageV1::new("input-0.png", "a".repeat(64), 1600, 900).unwrap()],
+            vec![
+                StagedImageV1::new("input-0.png", "a".repeat(64), 1600, 900).unwrap(),
+                StagedImageV1::new("input-1.jpg", "c".repeat(64), 1674, 940).unwrap(),
+            ],
             vec![],
             vec![StagedTimedMediaV1::new("audio-0.wav", "b".repeat(64), 2_000).unwrap()],
             PROMPT,
@@ -180,6 +247,7 @@ mod tests {
             argv,
             request,
         )
+        .is_some()
     }
 
     #[test]
@@ -213,13 +281,65 @@ mod tests {
         let mut other_command = absolute.clone();
         *other_command.last_mut().unwrap() = "--poll=1".into();
         assert!(!matches(current.as_bytes(), &other_command, &request));
-        assert!(!matches_material_upload_failure(
-            current.as_bytes(),
-            &"f".repeat(64),
+        assert!(
+            matches_material_upload_failure(
+                current.as_bytes(),
+                &"f".repeat(64),
+                workspace,
+                &absolute,
+                &request,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn material_upload_diagnostics_select_the_bound_failed_image() {
+        let request = request();
+        let workspace = Path::new(WORKSPACE);
+        let absolute = absolute_media_arguments(&argv(&request), workspace, false).unwrap();
+        let path = workspace.join("input-1.jpg");
+        let failure = matches_material_upload_failure(
+            receipt(path.to_str().unwrap()).to_string().as_bytes(),
+            REVIEWED_DREAMINA_SHA256,
             workspace,
             &absolute,
-            &request,
-        ));
+            &request.into(),
+        )
+        .unwrap();
+
+        assert_eq!(failure.workflow, "multimodal2video");
+        assert_eq!(failure.model, VideoModelVersion::Seedance2_5);
+        assert_eq!(failure.image_index + 1, 2);
+        assert_eq!((failure.image.width(), failure.image.height()), (1674, 940));
+        let input = |index, media_type, digest| {
+            ExecutorInputObject::new(
+                InputBlobRef {
+                    key: InputBlobKey {
+                        admission_session_id: Uuid::new_v4(),
+                        input_id: Uuid::new_v4(),
+                    },
+                    storage_backend: "test".into(),
+                    object_key: "fixture".into(),
+                    sha256_hex: digest,
+                    byte_size: 1_767_471,
+                },
+                "image",
+                index,
+                media_type,
+            )
+            .unwrap()
+        };
+        let mut inputs = [
+            input(0, "image/png", "a".repeat(64)),
+            input(1, "image/jpeg", "c".repeat(64)),
+        ];
+        let selected = failure.frozen_input(&inputs).unwrap();
+        assert_eq!(selected.media_type(), "image/jpeg");
+        assert_eq!(selected.blob().byte_size, 1_767_471);
+        assert!(failure.frozen_input(&[]).is_none());
+        inputs[1] = input(1, "image/jpeg", "d".repeat(64));
+        assert!(failure.frozen_input(&inputs).is_none());
     }
 
     #[test]

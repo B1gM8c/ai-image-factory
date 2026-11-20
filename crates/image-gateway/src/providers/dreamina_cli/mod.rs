@@ -325,11 +325,19 @@ impl GatedCliSubmitCodec for DreaminaCliSubmitCodecV1 {
         terminal: &GatedCliProcessTerminal,
         evidence: &GatedCliReceiptEvidence,
     ) -> Option<&'static str> {
-        (self.matches_frozen_runtime(call, evidence)
-            && evidence.command().working_directory().parent()
-                == Some(self.policy.workspace_root_path())
-            && is_dreamina_material_upload_failure(terminal, evidence, call.command()))
-        .then_some("dreamina_material_upload_failed")
+        if !self.matches_frozen_runtime(call, evidence)
+            || evidence.command().working_directory().parent()
+                != Some(self.policy.workspace_root_path())
+        {
+            return None;
+        }
+        let failure = preacceptance_upload::dreamina_material_upload_failure(
+            terminal,
+            evidence,
+            call.command(),
+        )?;
+        failure.log(call, evidence);
+        Some("dreamina_material_upload_failed")
     }
 
     fn nonzero_exit_diagnostic(&self, exit_code: i32, stderr: &[u8]) -> Option<&'static str> {
