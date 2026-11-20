@@ -81,6 +81,17 @@ pub trait GatedCliSubmitCodec: Send + Sync + 'static {
         stdout: &[u8],
     ) -> Result<PendingOperation, ProviderFailure>;
 
+    /// Recognize a definitive pre-acceptance failure that requires the sealed
+    /// process identity and full original streams, rather than stdout alone.
+    fn bound_preacceptance_failure_code(
+        &self,
+        _call: &ProviderSubmitDriverCall<Self::Payload>,
+        _terminal: &GatedCliProcessTerminal,
+        _evidence: &GatedCliReceiptEvidence,
+    ) -> Option<&'static str> {
+        None
+    }
+
     /// Observe the already executed attempt only. Implementations must persist
     /// independent acceptance evidence before returning an accepted identity;
     /// neither a local candidate nor a failed cache entry authorizes a replay.
@@ -467,14 +478,22 @@ where
         original_failure: ProviderFailure,
     ) -> ProviderSubmitDriverRecovery {
         let process = process.clone();
+        let codec = Arc::clone(&self.codec);
+        let owned_call = call.clone();
         let snapshot = tokio::task::spawn_blocking(move || {
-            GatedCliSubmission::open_existing(&process.root, process.submission_id)?
-                .receipt_evidence(&process.binding, &terminal)
+            let snapshot = GatedCliSubmission::open_existing(&process.root, process.submission_id)?
+                .receipt_evidence(&process.binding, &terminal)?;
+            let rejection =
+                codec.bound_preacceptance_failure_code(&owned_call, &terminal, &snapshot);
+            Ok::<_, GatedCliProcessError>((snapshot, rejection))
         })
         .await;
-        let Ok(Ok(snapshot)) = snapshot else {
+        let Ok(Ok((snapshot, rejection))) = snapshot else {
             return ProviderSubmitDriverRecovery::Failed(original_failure);
         };
+        if let Some(code) = rejection {
+            return ProviderSubmitDriverRecovery::Failed(local_process_failure(code));
+        }
         match self.codec.recover_receipt(call, Arc::new(snapshot)).await {
             Ok(Some(pending)) => ProviderSubmitDriverRecovery::Accepted(pending),
             Ok(None) => ProviderSubmitDriverRecovery::Failed(original_failure),

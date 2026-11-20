@@ -23,8 +23,9 @@ use uuid::Uuid;
 use crate::{
     executor::{ExecutorInputObject, ExecutorLaunchContext, ExecutorSubmissionLease},
     provider_tasks::{
-        GatedCliCommand, GatedCliInputFile, GatedCliSubmitCodec, ProviderAccountHomeCapability,
-        ProviderAccountHomeCapabilityError, ProviderExecutionContext, ProviderRuntimeProfile,
+        GatedCliCommand, GatedCliInputFile, GatedCliProcessTerminal, GatedCliReceiptEvidence,
+        GatedCliSubmitCodec, ProviderAccountHomeCapability, ProviderAccountHomeCapabilityError,
+        ProviderExecutionContext, ProviderRuntimeProfile, ProviderSubmitDriverCall,
         ProviderSubmitIntent, ProviderSubmitProjectionError, ProviderSubmitProjector,
         ProviderSubmitRecoveryLease,
     },
@@ -33,8 +34,10 @@ use crate::{
 mod capacity_query;
 mod credential_environment;
 mod poll;
+mod preacceptance_upload;
 mod submit_recovery;
 pub(crate) use poll::{ordered_image_outputs, pending_progress};
+pub(crate) use preacceptance_upload::is_dreamina_material_upload_failure;
 
 pub use capacity_query::{
     DreaminaCliCapacityQueryDriverV1, ProviderCapacityQueryDriver, ProviderCapacityQueryError,
@@ -214,6 +217,21 @@ impl DreaminaCliSubmitCodecV1 {
             Some(DEFAULT_POLL_AFTER_MS),
         ))
     }
+
+    fn matches_frozen_runtime(
+        &self,
+        call: &ProviderSubmitDriverCall<DreaminaSubmitPayloadV1>,
+        evidence: &GatedCliReceiptEvidence,
+    ) -> bool {
+        self.binding
+            .matches_submit(call.intent(), call.execution_context())
+            && evidence.execution_binding_sha256()
+                == call.execution_context().execution_binding_sha256()
+            && evidence.command().executable_sha256()
+                == hex::encode(self.policy.executable_sha256())
+            && evidence.command().environment().get("HOME").map(Path::new)
+                == Some(self.policy.account_home_path())
+    }
 }
 
 impl GatedCliSubmitCodec for DreaminaCliSubmitCodecV1 {
@@ -299,6 +317,19 @@ impl GatedCliSubmitCodec for DreaminaCliSubmitCodecV1 {
         stdout: &[u8],
     ) -> Result<PendingOperation, ProviderFailure> {
         Self::decode_for_submission(intent.submission_id, stdout)
+    }
+
+    fn bound_preacceptance_failure_code(
+        &self,
+        call: &ProviderSubmitDriverCall<Self::Payload>,
+        terminal: &GatedCliProcessTerminal,
+        evidence: &GatedCliReceiptEvidence,
+    ) -> Option<&'static str> {
+        (self.matches_frozen_runtime(call, evidence)
+            && evidence.command().working_directory().parent()
+                == Some(self.policy.workspace_root_path())
+            && is_dreamina_material_upload_failure(terminal, evidence, call.command()))
+        .then_some("dreamina_material_upload_failed")
     }
 
     fn nonzero_exit_diagnostic(&self, exit_code: i32, stderr: &[u8]) -> Option<&'static str> {

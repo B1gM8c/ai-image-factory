@@ -587,20 +587,60 @@ impl ExecutionSettlementStore for PostgresExecutionSettlementStore {
         job_id: Uuid,
     ) -> Result<Option<image_api_contracts::dreamina::DreaminaReleasedSettlement>, ImageGatewayError>
     {
-        let row: Option<(Uuid, Uuid, String, Uuid, String, String, String, String)> =
+        let row: Option<(Uuid, Uuid, String, Uuid, String, String, String, String, String)> =
             sqlx::query_as(
                 r#"
             SELECT resolution.resolution_id, job.job_id, job.request_id,
                    hold.hold_id, hold.currency, hold.held_micros::TEXT,
-                   hold.released_micros::TEXT, hold.captured_micros::TEXT
+                   hold.released_micros::TEXT, hold.captured_micros::TEXT, resolution.reason
             FROM (
-                SELECT resolution_id, job_id, hold_id, reason, released_micros
+                SELECT resolution_id, job_id, hold_id, reason, released_micros, false AS native_rejection
                 FROM dreamina_operator_rejection_resolutions
-                WHERE reason IN ('dreamina_compliance_confirmation_required', 'dreamina_concurrency_limit_exceeded')
+                WHERE job_id = $1 AND reason IN ('dreamina_compliance_confirmation_required',
+                    'dreamina_concurrency_limit_exceeded', 'dreamina_material_upload_failed')
                 UNION ALL
-                SELECT resolution_id, job_id, hold_id, reason, released_micros
+                SELECT resolution_id, job_id, hold_id, reason, released_micros, false
                 FROM dreamina_accepted_terminal_resolutions
-                WHERE reason = 'dreamina_copyright_rejected'
+                WHERE job_id = $1 AND reason = 'dreamina_copyright_rejected'
+                UNION ALL
+                SELECT decision.decision_id, submission.job_id, native_hold.hold_id,
+                       decision.error_code, native_hold.released_micros, true
+                FROM provider_submissions submission
+                JOIN jobs native_job ON native_job.job_id = submission.job_id
+                                    AND native_job.tenant_id = submission.tenant_id
+                JOIN provider_remote_submit_intents intent USING (submission_id, executor_execution_id)
+                JOIN executor_resolution_decisions decision
+                  ON decision.decision_id = submission.resolution_decision_id
+                 AND decision.submission_id = submission.submission_id
+                 AND decision.executor_execution_id = submission.executor_execution_id
+                 AND decision.provider_submit_intent_id = intent.submission_id
+                JOIN executor_terminal_reductions reduction
+                  ON reduction.resolution_decision_id = decision.decision_id
+                 AND reduction.submission_id = submission.submission_id
+                 AND reduction.executor_execution_id = submission.executor_execution_id
+                JOIN customer_billing_holds native_hold
+                  ON native_hold.job_id = submission.job_id AND native_hold.tenant_id = submission.tenant_id
+                JOIN quota_reservations quota
+                  ON quota.reservation_id = native_job.reservation_id AND quota.job_id = native_job.job_id
+                 AND quota.tenant_id = native_job.tenant_id AND quota.request_id = native_job.request_id
+                WHERE submission.job_id = $1 AND submission.provider_id = 'dreamina-cli'
+                  AND submission.command_schema = 'dreamina-cli.submit.v1'
+                  AND submission.state = 'failed' AND submission.result_manifest_id IS NULL
+                  AND intent.state = 'rejected' AND intent.failure_event_identity IS NOT NULL
+                  AND intent.failure_error_code = 'dreamina_material_upload_failed'
+                  AND intent.remote_operation_id IS NULL AND intent.provider_request_id IS NULL
+                  AND intent.receipt_event_identity IS NULL
+                  AND decision.source = 'remote_submit_outcome' AND decision.resolved_state = 'failed'
+                  AND decision.error_code = intent.failure_error_code AND decision.result_manifest_id IS NULL
+                  AND reduction.state = 'completed' AND reduction.resolved_state = 'failed'
+                  AND quota.state = 'released' AND quota.committed_units = 0
+                  AND quota.released_units = quota.requested_units
+                  AND quota.requested_units = native_job.billable_units
+                  AND NOT EXISTS (SELECT 1 FROM provider_remote_tasks task
+                                  WHERE task.submission_id = submission.submission_id)
+                  AND NOT EXISTS (SELECT 1 FROM artifacts artifact WHERE artifact.job_id = submission.job_id)
+                  AND NOT EXISTS (SELECT 1 FROM ledger_transactions ledger WHERE ledger.source_job_id = submission.job_id
+                                  AND ledger.transaction_type IN ('customer_charge', 'customer_job_charge'))
             ) resolution
             JOIN jobs job ON job.job_id = resolution.job_id
             JOIN job_auth_attributions attribution
@@ -616,7 +656,8 @@ impl ExecutionSettlementStore for PostgresExecutionSettlementStore {
               AND job.charged_units = 0
               AND job.state = 'failed'
               AND job.last_error_code = resolution.reason
-              AND hold.state = 'released' AND hold.captured_micros = 0
+              AND (hold.state = 'released' OR (resolution.native_rejection AND hold.state = 'settled'))
+              AND hold.captured_micros = 0
               AND hold.released_micros = hold.held_micros
               AND resolution.released_micros = hold.released_micros
             "#,
@@ -638,8 +679,10 @@ impl ExecutionSettlementStore for PostgresExecutionSettlementStore {
                 held_micros,
                 released_micros,
                 captured_micros,
+                reason,
             )| image_api_contracts::dreamina::DreaminaReleasedSettlement {
-                basis: None,
+                basis: (reason == "dreamina_material_upload_failed")
+                    .then(|| "dreamina_material_upload_rejection_v1".to_owned()),
                 state: "released".to_owned(),
                 resolution_audit_id: resolution_audit_id.to_string(),
                 job_id: job_id.to_string(),

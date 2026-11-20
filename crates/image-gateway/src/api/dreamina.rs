@@ -1428,7 +1428,11 @@ async fn project_video_task(
     let audited_release_possible = matches!(
         &status,
         VideoResultStatus::Failed { error_code: Some(code), .. }
-            if matches!(code.as_str(), "dreamina_compliance_confirmation_required" | "dreamina_concurrency_limit_exceeded" | "dreamina_copyright_rejected")
+            if matches!(code.as_str(),
+                "dreamina_compliance_confirmation_required"
+                    | "dreamina_concurrency_limit_exceeded"
+                    | "dreamina_copyright_rejected"
+                    | "dreamina_material_upload_failed")
     );
     let manual_cancellation = if matches!(&status, VideoResultStatus::Failed { .. }) {
         settlement_store
@@ -1583,6 +1587,7 @@ pub(super) fn known_terminal_failure_message(code: Option<&str>) -> Option<&'sta
         }
         "dreamina_copyright_rejected" => Some("生成的视频里包含受版权保护元素"),
         "dreamina_concurrency_limit_exceeded" => Some("上游并发已满，请稍后再试"),
+        "dreamina_material_upload_failed" => Some("即梦参考图上传失败，视频未提交生成"),
         _ => None,
     }
 }
@@ -1977,10 +1982,16 @@ mod tests {
             "dreamina_compliance_confirmation_required",
             "dreamina_concurrency_limit_exceeded",
             "dreamina_copyright_rejected",
+            "dreamina_material_upload_failed",
         ]
         .into_iter()
-        .flat_map(|code| [None, Some(receipt.clone())].map(|receipt| (code, receipt)))
-        {
+        .flat_map(|code| {
+            let mut receipt = receipt.clone();
+            if code == "dreamina_material_upload_failed" {
+                receipt.basis = Some("dreamina_material_upload_rejection_v1".to_owned());
+            }
+            [None, Some(receipt)].map(|receipt| (code, receipt))
+        }) {
             let store = VideoQueryStore {
                 status: Mutex::new(Some(VideoResultStatus::Failed {
                     model: "seedance2.0fast_vip".to_owned(),
@@ -1994,6 +2005,11 @@ mod tests {
             };
             let task = project_video_task(&store, &auth, job_id).await.unwrap();
             assert_eq!(task.status, "failed");
+            let error = task.error.as_ref().unwrap();
+            assert_eq!(error.code, code);
+            if code == "dreamina_material_upload_failed" {
+                assert_eq!(error.message, "即梦参考图上传失败，视频未提交生成");
+            }
             assert_eq!(task.settlement, expected);
             let json = serde_json::to_value(task).unwrap();
             assert_eq!(json.get("settlement").is_some(), expected.is_some());
