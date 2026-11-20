@@ -2716,6 +2716,31 @@ async fn v4_dreamina_video_terminal_success_settles_output_seconds_once() -> Tes
 
 #[tokio::test]
 async fn dreamina_material_upload_failure_projects_exact_original_release() -> TestResult {
+    verify_dreamina_material_rejection_release(
+        "dreamina_material_upload_failed",
+        Some("dreamina_material_upload_rejection_v1"),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn dreamina_material_staging_failure_projects_exact_original_release() -> TestResult {
+    verify_dreamina_material_rejection_release(
+        "provider_submit_input_store_unavailable",
+        Some("dreamina_material_staging_rejection_v1"),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn dreamina_material_staging_similar_error_code_never_projects_a_receipt() -> TestResult {
+    verify_dreamina_material_rejection_release("provider_submit_input_store_unknown", None).await
+}
+
+async fn verify_dreamina_material_rejection_release(
+    error_code: &str,
+    expected_basis: Option<&str>,
+) -> TestResult {
     use gpt_image_2_gateway::{ProviderSubmitFailureKind, RemoteTaskSubmitFailure};
     let Some(database) = TestDatabase::new().await? else {
         return Ok(());
@@ -2806,7 +2831,7 @@ async fn dreamina_material_upload_failure_projects_exact_original_release() -> T
                 executor_lease_epoch: lease.executor_lease_epoch,
                 kind: ProviderSubmitFailureKind::Rejected,
                 event_identity: "offline-gated-material-upload-refusal".into(),
-                error_code: "dreamina_material_upload_failed".into(),
+                error_code: error_code.into(),
                 execution_binding_sha256: intent.execution_binding_sha256,
                 recovery_fence: None,
             })
@@ -2838,23 +2863,35 @@ async fn dreamina_material_upload_failure_projects_exact_original_release() -> T
         let proof = read
             .project_video_released_settlement(tenant, "project-test", None, work.job_id)
             .await
-            .map_err(debug_error)?
-            .ok_or("completed original release proof missing")?;
+            .map_err(debug_error)?;
+        let Some(expected_basis) = expected_basis else {
+            return require(
+                proof.is_none(),
+                format!("unexpected release proof: {proof:?}"),
+            );
+        };
+        let proof = proof.ok_or("completed original release proof missing")?;
         require(
-            proof.basis.as_deref() == Some("dreamina_material_upload_rejection_v1")
+            proof.basis.as_deref() == Some(expected_basis)
                 && proof.job_id == work.job_id.to_string()
                 && proof.captured_micros == "0"
                 && proof.held_micros == "24"
                 && proof.released_micros == "24",
             format!("incorrect release proof: {proof:?}"),
         )?;
-        require(
-            read.project_video_released_settlement(tenant, "other-project", None, work.job_id)
-                .await
-                .map_err(debug_error)?
-                .is_none(),
-            "another project exposed the original proof",
-        )
+        for (project, actor) in [
+            ("other-project", None),
+            ("project-test", Some(Uuid::new_v4())),
+        ] {
+            require(
+                read.project_video_released_settlement(tenant, project, actor, work.job_id)
+                    .await
+                    .map_err(debug_error)?
+                    .is_none(),
+                "another project or actor received the original proof",
+            )?;
+        }
+        Ok(())
     }
     .await;
     combine(result, database.cleanup().await)

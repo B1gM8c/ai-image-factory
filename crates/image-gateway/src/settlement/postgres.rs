@@ -10,8 +10,9 @@ use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
 use super::{
-    ExecutionSettlementStore, GenerationResultLookup, GenerationResultStatus, StoredVideoArtifact,
-    VideoPendingStage, VideoProviderProgress, VideoRequestMetadata, VideoResultStatus,
+    DREAMINA_LOCAL_STAGING_FAILURE_CODES, ExecutionSettlementStore, GenerationResultLookup,
+    GenerationResultStatus, StoredVideoArtifact, VideoPendingStage, VideoProviderProgress,
+    VideoRequestMetadata, VideoResultStatus, dreamina_video_material_rejection_basis,
     validate_generation_result,
 };
 use crate::{
@@ -627,7 +628,8 @@ impl ExecutionSettlementStore for PostgresExecutionSettlementStore {
                   AND submission.command_schema = 'dreamina-cli.submit.v1'
                   AND submission.state = 'failed' AND submission.result_manifest_id IS NULL
                   AND intent.state = 'rejected' AND intent.failure_event_identity IS NOT NULL
-                  AND intent.failure_error_code = 'dreamina_material_upload_failed'
+                  AND (intent.failure_error_code = 'dreamina_material_upload_failed'
+                       OR intent.failure_error_code = ANY($5::TEXT[]))
                   AND intent.remote_operation_id IS NULL AND intent.provider_request_id IS NULL
                   AND intent.receipt_event_identity IS NULL
                   AND decision.source = 'remote_submit_outcome' AND decision.resolved_state = 'failed'
@@ -666,6 +668,7 @@ impl ExecutionSettlementStore for PostgresExecutionSettlementStore {
             .bind(tenant_id)
             .bind(project_id)
             .bind(actor_user_id)
+            .bind(DREAMINA_LOCAL_STAGING_FAILURE_CODES)
             .fetch_optional(&self.pool)
             .await
             .map_err(settlement_unavailable)?;
@@ -681,8 +684,7 @@ impl ExecutionSettlementStore for PostgresExecutionSettlementStore {
                 captured_micros,
                 reason,
             )| image_api_contracts::dreamina::DreaminaReleasedSettlement {
-                basis: (reason == "dreamina_material_upload_failed")
-                    .then(|| "dreamina_material_upload_rejection_v1".to_owned()),
+                basis: dreamina_video_material_rejection_basis(&reason).map(str::to_owned),
                 state: "released".to_owned(),
                 resolution_audit_id: resolution_audit_id.to_string(),
                 job_id: job_id.to_string(),
