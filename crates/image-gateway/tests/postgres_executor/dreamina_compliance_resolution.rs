@@ -11,11 +11,14 @@ use gpt_image_2_gateway::{
     ProviderSubmitWork, resolve_dreamina_compliance_rejection,
 };
 use image_cli_runtime::WorkingDirectory;
-use image_provider_dreamina_cli::parse_submit_command;
+use image_provider_dreamina_cli::{DreaminaSubmitRequestV1, parse_submit_command};
 use image_provider_sdk::PendingOperation;
 
 const REFUSAL: &[u8] = br#"{"gen_status":"fail","fail_reason":"api error: ret=4010, message=aigc compliance confirmation required"}"#;
 const CONCURRENCY_REFUSAL: &[u8] = br#"{"submit_id":"fixture-local-id","gen_status":"fail","fail_reason":"api error: ret=1310, message=ExceedConcurrencyLimit, logid=fixture1310"}"#;
+const UNBOUND_UPLOAD_REFUSAL: &[u8] = br#"{"submit_id":"40d80c02-66de-416b-b638-7609c25ede38","gen_status":"fail","prompt":"offline historic video","fail_reason":"upload resource \"input-0.png\": upload image: upload phase, no file upload, please check log for more details"}"#;
+const MATERIAL_UPLOAD_REFUSAL: &[u8] = br#"{"submit_id":"40d80c02-66de-416b-b638-7609c25ede38","gen_status":"fail","prompt":"offline multimodal regression","fail_reason":"upload resource \"image-0.png\": upload image: upload phase, no file upload, please check log for more details"}"#;
+const REVIEWED_PIN: &str = "0a5fdc262ab44669e7db4ce67e6543ece6daf405804aca3d1d17d1345c146f69";
 const HELD_MICROS: i64 = 1_200_000;
 
 pub(super) fn fixture_runner(root: &Path) -> TestResult<PathBuf> {
@@ -135,7 +138,7 @@ impl RefusalFixture {
             submission_id: self.lease.submission_id,
             executor_execution_id: self.lease.executor_execution_id,
             reviewed_stdout_sha256: sha256(self.refusal),
-            operator_reference: "offline-regression:reviewed-4010".into(),
+            operator_reference: "offline-regression:reviewed-preacceptance".into(),
         }
     }
 
@@ -185,10 +188,29 @@ async fn refusal_fixture_with_receipt(
         DREAMINA_VIDEOS_API_PROFILE,
     )
     .await?;
+    refusal_fixture_for_work(
+        pool,
+        work,
+        V4CustomerQuoteIdentity::dreamina_video(),
+        terminalize,
+        refusal,
+        historical_code,
+    )
+    .await
+}
+
+async fn refusal_fixture_for_work(
+    pool: &PgPool,
+    work: WorkLease,
+    quote: V4CustomerQuoteIdentity,
+    terminalize: bool,
+    refusal: &'static [u8],
+    historical_code: &'static str,
+) -> TestResult<RefusalFixture> {
     seed_v4_customer_quote_with_basis(
         pool,
         &work,
-        V4CustomerQuoteIdentity::dreamina_video(),
+        quote,
         V4CustomerQuoteBasis {
             metric: "video_requested_second",
             unit: "second",
@@ -436,6 +458,109 @@ async fn dreamina_concurrency_resolution_releases_exactly_once_preserving_canoni
     .await
 }
 
+#[tokio::test]
+async fn dreamina_material_upload_resolution_releases_exactly_once_preserving_canonical_uncertainty()
+-> TestResult {
+    rejection_resolution_preserves_originals(
+        MATERIAL_UPLOAD_REFUSAL,
+        "dreamina_submit_recovery_evidence_invalid",
+        "dreamina_material_upload_failed",
+    )
+    .await
+}
+
+async fn material_upload_fixture(
+    pool: &PgPool,
+    historical_code: &'static str,
+) -> TestResult<RefusalFixture> {
+    let model = "seedance2.5";
+    let work =
+        super::dreamina_video_supplementation::seed_supplement_video_duration(pool, model, 0, 8)
+            .await?;
+    let fixture = refusal_fixture_for_work(pool, work, V4CustomerQuoteIdentity {
+        provider_model_id: model, public_model_id: model,
+        dimensions: json!({"duration":"8","ratio":"16:9","resolution":"720p","processing_mode":"synchronous","workflow":"multimodal2video","input_image_count":"1","input_video_count":"0","input_audio_count":"0"}),
+        ..V4CustomerQuoteIdentity::dreamina_video()
+    }, true, MATERIAL_UPLOAD_REFUSAL, historical_code).await?;
+    let source = serde_json::to_vec(&fixture.work.command_json).map_err(debug_error)?;
+    let DreaminaSubmitRequestV1::MultimodalToVideo(request) =
+        parse_submit_command(&source).map_err(debug_error)?
+    else {
+        return Err("offline fixture requires a multimodal command".into());
+    };
+    let request_path = fixture.entry().join("process-request.json");
+    let mut recorded: serde_json::Value =
+        serde_json::from_slice(&fs::read(&request_path).map_err(debug_error)?)
+            .map_err(debug_error)?;
+    // Keep the local shell's terminal protocol and model the independently
+    // pinned request metadata in this disposable fixture. No native executable
+    // or provider credentials are used or looked up by the test.
+    recorded["executable"] = json!("/offline/dreamina");
+    recorded["executable_sha256"] = json!(REVIEWED_PIN);
+    recorded["arguments"] = json!(
+        request
+            .to_argv()
+            .into_iter()
+            .map(|arg| arg.into_string().map_err(debug_error))
+            .collect::<TestResult<Vec<_>>>()?
+    );
+    recorded["payload_sha256"] = json!(fixture_request_payload_sha256(&recorded)?);
+    fs::write(
+        &request_path,
+        serde_json::to_vec(&recorded).map_err(debug_error)?,
+    )
+    .map_err(debug_error)?;
+    Ok(fixture)
+}
+
+fn fixture_request_payload_sha256(request: &serde_json::Value) -> TestResult<String> {
+    fn field(digest: &mut Sha256, text: &str) {
+        digest.update((text.len() as u64).to_be_bytes());
+        digest.update(text.as_bytes());
+    }
+    let text = |key: &str| {
+        request[key]
+            .as_str()
+            .ok_or_else(|| format!("fixture {key}"))
+    };
+    let number = |key: &str| {
+        request[key]
+            .as_u64()
+            .ok_or_else(|| format!("fixture {key}"))
+    };
+    let nonce = |key: &str| Uuid::parse_str(text(key)?).map_err(debug_error);
+    let mut digest = Sha256::new();
+    digest.update(b"ai-image-factory/gated-cli-request-payload/v1\0");
+    field(&mut digest, text("schema")?);
+    digest.update(
+        u16::try_from(number("schema_version")?)
+            .map_err(debug_error)?
+            .to_be_bytes(),
+    );
+    digest.update(nonce("submission_id")?.as_bytes());
+    field(&mut digest, text("execution_binding_sha256")?);
+    digest.update(nonce("launch_nonce")?.as_bytes());
+    digest.update(number("absolute_deadline_unix_ms")?.to_be_bytes());
+    for key in ["executable", "executable_sha256", "working_directory"] {
+        field(&mut digest, text(key)?);
+    }
+    let arguments = request["arguments"].as_array().ok_or("fixture argv")?;
+    digest.update((arguments.len() as u64).to_be_bytes());
+    for argument in arguments {
+        field(&mut digest, argument.as_str().ok_or("fixture argument")?);
+    }
+    require(
+        request["environment"] == json!({}),
+        "offline fixture environment must stay empty",
+    )?;
+    digest.update(0_u64.to_be_bytes());
+    field(&mut digest, text("stdin_sha256")?);
+    for key in ["stdin_byte_size", "wall_timeout_ms", "termination_grace_ms"] {
+        digest.update(number(key)?.to_be_bytes());
+    }
+    Ok(hex::encode(digest.finalize()))
+}
+
 async fn rejection_resolution_preserves_originals(
     refusal: &'static [u8],
     historical_code: &'static str,
@@ -446,7 +571,12 @@ async fn rejection_resolution_preserves_originals(
         return Ok(());
     };
     let result = async {
-        let fixture = refusal_fixture_with_receipt(&database.pool, true, refusal, historical_code).await?;
+        let material_upload = reason == "dreamina_material_upload_failed";
+        let fixture = if material_upload {
+            material_upload_fixture(&database.pool, historical_code).await?
+        } else {
+            refusal_fixture_with_receipt(&database.pool, true, refusal, historical_code).await?
+        };
         let tasks=PostgresProviderTaskStore::new(database.pool.clone());
         require(tasks.classify_capacity_reconciliation(&ProviderTaskClaimScope { provider_id:DREAMINA_PROVIDER_ID.into(), provider_account_id:DREAMINA_ACCOUNT_ID, execution_profile_id:DREAMINA_VIDEO_PROFILE_ID }).await.map_err(debug_error)? == 1,"audited no-effect fixture was not classified manual")?;
         let before = snapshot(&database.pool, &fixture).await?;
@@ -501,7 +631,7 @@ async fn rejection_resolution_preserves_originals(
             "executord-process-smoke", "project-test", None, fixture.work.job_id)
             .await.map_err(debug_error)?.ok_or("released audit receipt was not project-readable")?;
         require(public_receipt == image_api_contracts::dreamina::DreaminaReleasedSettlement {
-                basis: None,
+            basis: material_upload.then(|| "dreamina_material_upload_rejection_v1".to_owned()),
             state: "released".into(), resolution_audit_id: first.resolution_id.to_string(),
             job_id: fixture.work.job_id.to_string(), request_id: first.request_id.clone(),
             hold_id: first.hold_id.to_string(), currency: "USD".into(),
@@ -627,6 +757,45 @@ async fn dreamina_concurrency_resolution_rejects_mismatched_review_and_missing_e
         "dreamina_submit_recovery_evidence_invalid",
     )
     .await
+}
+
+#[tokio::test]
+async fn dreamina_material_upload_resolution_rejects_matching_words_without_native_binding()
+-> TestResult {
+    for code in [
+        "dreamina_submit_rejected",
+        "dreamina_submit_recovery_evidence_invalid",
+    ] {
+        let Some(database) = TestDatabase::new().await? else {
+            return Ok(());
+        };
+        let result = async {
+            let fixture =
+                refusal_fixture_with_receipt(&database.pool, true, UNBOUND_UPLOAD_REFUSAL, code)
+                    .await?;
+            let before = snapshot(&database.pool, &fixture).await?;
+            let canonical = canonical_evidence(&database.pool, &fixture).await?;
+            require(
+                resolve_dreamina_compliance_rejection(
+                    &database.pool,
+                    &fixture.journal_root,
+                    &fixture.request(),
+                )
+                .await
+                .is_err(),
+                "upload wording and matching stdout digest cannot replace native command binding",
+            )?;
+            require(
+                snapshot(&database.pool, &fixture).await? == before
+                    && canonical_evidence(&database.pool, &fixture).await? == canonical,
+                "unbound upload wording changed the original state or hold",
+            )?;
+            fixture.assert_one_fixture_invocation()
+        }
+        .await;
+        combine(result, database.cleanup().await)?;
+    }
+    Ok(())
 }
 
 async fn rejection_resolution_rejects_bad_evidence(

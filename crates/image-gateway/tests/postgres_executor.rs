@@ -2715,6 +2715,152 @@ async fn v4_dreamina_video_terminal_success_settles_output_seconds_once() -> Tes
 }
 
 #[tokio::test]
+async fn dreamina_material_upload_failure_projects_exact_original_release() -> TestResult {
+    use gpt_image_2_gateway::{ProviderSubmitFailureKind, RemoteTaskSubmitFailure};
+    let Some(database) = TestDatabase::new().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let pool = &database.pool;
+        let work = seed_dreamina_video_generation_lease_for_profile(
+            pool,
+            "upload-failure-worker",
+            DREAMINA_VIDEOS_API_PROFILE,
+        )
+        .await?;
+        seed_v4_customer_quote_with_basis(
+            pool,
+            &work,
+            V4CustomerQuoteIdentity::dreamina_video(),
+            V4CustomerQuoteBasis {
+                metric: "video_requested_second",
+                unit: "second",
+                unit_size: 1,
+                unit_price_micros: 3,
+                quantity_source: "request_derived",
+                confidence: "exact",
+                max_quantity: 8,
+                max_amount_micros: 24,
+            },
+        )
+        .await?;
+        let executor = PostgresExecutorSubmissionStore::new(pool.clone());
+        executor
+            .prepare_and_handoff(&work, DREAMINA_VIDEO_PROFILE_ID)
+            .await
+            .map_err(debug_error)?;
+        seed_terminal_quota(pool, &work).await?;
+        let lease = executor
+            .claim_prepared(
+                &ExecutorClaimScope {
+                    execution_profile_id: DREAMINA_VIDEO_PROFILE_ID,
+                    provider_id: DREAMINA_PROVIDER_ID.into(),
+                    command_schema: DREAMINA_SUBMIT_COMMAND_SCHEMA.into(),
+                    adapter_revision: DREAMINA_ADAPTER_REVISION.into(),
+                },
+                "upload-failure-executor",
+                60_000,
+            )
+            .await
+            .map_err(debug_error)?
+            .ok_or("video executor lease missing")?;
+        executor.start(&lease).await.map_err(debug_error)?;
+        let payload = DreaminaSubmitPayloadV1::new(
+            &lease.command_hash,
+            image_provider_dreamina_cli::parse_submit_command(
+                &serde_json::to_vec(&work.command_json).map_err(debug_error)?,
+            )
+            .map_err(debug_error)?
+            .into_single_output(),
+        )
+        .map_err(debug_error)?;
+        let command =
+            SingleOutputCommand::new(OutputSlot::new(0, 1).map_err(debug_error)?, payload)
+                .map_err(debug_error)?;
+        let tasks = PostgresProviderTaskStore::new(pool.clone());
+        let reservation = RemoteTaskSubmitReservation::new(
+            &lease,
+            "offline-material-upload-failure".into(),
+            command.output(),
+            command.identity(),
+            60_000,
+        );
+        tasks
+            .reserve_submit(&reservation)
+            .await
+            .map_err(debug_error)?;
+        tasks
+            .start_submit(&reservation)
+            .await
+            .map_err(debug_error)?;
+        let intent = tasks
+            .load_submit_intent(lease.submission_id)
+            .await
+            .map_err(debug_error)?
+            .ok_or("video submit intent missing")?;
+        tasks
+            .record_submit_failure(&RemoteTaskSubmitFailure {
+                submission_id: lease.submission_id,
+                executor_execution_id: lease.executor_execution_id,
+                executor_owner: lease.executor_owner.clone(),
+                executor_lease_epoch: lease.executor_lease_epoch,
+                kind: ProviderSubmitFailureKind::Rejected,
+                event_identity: "offline-gated-material-upload-refusal".into(),
+                error_code: "dreamina_material_upload_failed".into(),
+                execution_binding_sha256: intent.execution_binding_sha256,
+                recovery_fence: None,
+            })
+            .await
+            .map_err(debug_error)?;
+        let read = PostgresExecutionSettlementStore::new(
+            pool.clone(),
+            Arc::new(InMemoryArtifactBlobStore::default()),
+        );
+        let tenant = "executord-process-smoke";
+        let before = read
+            .project_video_released_settlement(tenant, "project-test", None, work.job_id)
+            .await
+            .map_err(debug_error)?;
+        require(
+            before.is_none(),
+            "rejection without completed reduction proved release",
+        )?;
+        let reductions = PostgresExecutorTerminalStore::new(pool.clone());
+        let terminal = reductions
+            .claim_terminal("upload-failure-reducer", 60_000)
+            .await
+            .map_err(debug_error)?
+            .ok_or("rejection reduction missing")?;
+        reductions
+            .complete_terminal(&terminal, None)
+            .await
+            .map_err(debug_error)?;
+        let proof = read
+            .project_video_released_settlement(tenant, "project-test", None, work.job_id)
+            .await
+            .map_err(debug_error)?
+            .ok_or("completed original release proof missing")?;
+        require(
+            proof.basis.as_deref() == Some("dreamina_material_upload_rejection_v1")
+                && proof.job_id == work.job_id.to_string()
+                && proof.captured_micros == "0"
+                && proof.held_micros == "24"
+                && proof.released_micros == "24",
+            format!("incorrect release proof: {proof:?}"),
+        )?;
+        require(
+            read.project_video_released_settlement(tenant, "other-project", None, work.job_id)
+                .await
+                .map_err(debug_error)?
+                .is_none(),
+            "another project exposed the original proof",
+        )
+    }
+    .await;
+    combine(result, database.cleanup().await)
+}
+
+#[tokio::test]
 async fn v4_ark_video_terminal_success_preserves_ark_identity_and_dreamina_rate() -> TestResult {
     verify_v4_dreamina_video_terminal_success(
         image_api_contracts::ark::ARK_CONTENT_GENERATION_API_PROFILE,

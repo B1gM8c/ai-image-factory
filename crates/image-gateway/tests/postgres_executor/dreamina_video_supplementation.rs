@@ -244,7 +244,7 @@ async fn seed_supplement_video(
     seed_supplement_video_duration(pool, model, audio_count, 10).await
 }
 
-async fn seed_supplement_video_duration(
+pub(super) async fn seed_supplement_video_duration(
     pool: &PgPool,
     model: &str,
     audio_count: usize,

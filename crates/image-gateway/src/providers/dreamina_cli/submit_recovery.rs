@@ -29,6 +29,12 @@ const QUERY_TIMEOUT: Duration = Duration::from_secs(30);
 const QUERY_GRACE: Duration = Duration::from_secs(2);
 const MODE: &str = "same_attempt_native_acceptance_query_v1";
 
+pub(super) fn has_no_acceptance_evidence(evidence: &GatedCliReceiptEvidence) -> bool {
+    [SOURCE_FILE, ACCEPTED_FILE]
+        .iter()
+        .all(|name| matches!(evidence.read(name, MAX_SOURCE_BYTES), Ok(None)))
+}
+
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct Source {
@@ -87,7 +93,7 @@ pub(super) fn project_normal_material_paths(
     projected.with_arguments(argv).map_err(|_| invalid())
 }
 
-fn absolute_media_arguments(
+pub(super) fn absolute_media_arguments(
     argv: &[String],
     workspace: &Path,
     verify_files: bool,
@@ -150,15 +156,7 @@ pub(super) async fn recover(
     call: &ProviderSubmitDriverCall<DreaminaSubmitPayloadV1>,
     evidence: Arc<GatedCliReceiptEvidence>,
 ) -> Result<Option<PendingOperation>, ProviderFailure> {
-    if !codec
-        .binding
-        .matches_submit(call.intent(), call.execution_context())
-        || evidence.execution_binding_sha256()
-            != call.execution_context().execution_binding_sha256()
-        || evidence.command().executable_sha256() != hex::encode(codec.policy.executable_sha256())
-        || evidence.command().environment().get("HOME").map(Path::new)
-            != Some(codec.policy.account_home_path())
-    {
+    if !codec.matches_frozen_runtime(call, &evidence) {
         return Err(invalid());
     }
     let request =
