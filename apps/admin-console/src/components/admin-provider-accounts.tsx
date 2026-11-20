@@ -169,7 +169,8 @@ export function AdminProviderAccounts() {
     ...new Set(routableAccounts.map((account) => account.provider_id)),
   ].some(
     (providerId) =>
-      routableAccounts.filter((account) => account.provider_id === providerId)
+      providerId === "dreamina-canvas"
+      || routableAccounts.filter((account) => account.provider_id === providerId)
         .length >= 2,
   );
 
@@ -1650,6 +1651,13 @@ function GroupTableRow({
 function providerLabel(t: Translate, providerId: string) {
   if (providerId === "openai-codex") return "Codex";
   if (providerId === "grok-cli") return "Grok";
+  if (providerId === "dreamina-canvas")
+    return t({
+      en: "Dreamina Canvas",
+      "zh-CN": "即梦画布",
+      ja: "Dreamina Canvas",
+      ko: "Dreamina Canvas",
+    });
   if (providerId === "dreamina-cli")
     return t({
       en: "Dreamina",

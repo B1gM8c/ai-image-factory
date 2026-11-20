@@ -1013,6 +1013,13 @@ function preferredOperation(models: ProviderModelView[], providerId: string) {
 function providerLabel(t: Translate, providerId: string) {
   if (providerId === "openai-codex") return "Codex";
   if (providerId === "grok-cli") return "Grok";
+  if (providerId === "dreamina-canvas")
+    return t({
+      en: "Dreamina Canvas",
+      "zh-CN": "即梦画布",
+      ja: "Dreamina Canvas",
+      ko: "Dreamina Canvas",
+    });
   if (providerId === "dreamina-cli")
     return t({
       en: "Dreamina",
