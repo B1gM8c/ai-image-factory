@@ -5,8 +5,9 @@ use std::net::IpAddr;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use futures_util::StreamExt;
-use reqwest::{Client, StatusCode, redirect::Policy};
+use reqwest::{Client, StatusCode, header::HeaderMap, redirect::Policy};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::{
     ImageGatewayError,
@@ -42,6 +43,8 @@ pub(crate) struct DirectEditFailure {
     error: ImageGatewayError,
     error_code: &'static str,
     http_status: Option<u16>,
+    upstream_error_code: Option<&'static str>,
+    upstream_request_id_sha256: Option<String>,
     outcome_uncertain: bool,
 }
 
@@ -69,6 +72,14 @@ impl DirectEditFailure {
         self.http_status
     }
 
+    pub(crate) fn upstream_error_code(&self) -> Option<&'static str> {
+        self.upstream_error_code
+    }
+
+    pub(crate) fn upstream_request_id_sha256(&self) -> Option<&str> {
+        self.upstream_request_id_sha256.as_deref()
+    }
+
     pub(crate) fn is_authentication_rejection(&self) -> bool {
         self.error_code == "codex_authentication_rejected"
             && self.http_status == Some(StatusCode::UNAUTHORIZED.as_u16())
@@ -80,6 +91,12 @@ impl DirectEditFailure {
 
     fn into_gateway_error(self) -> ImageGatewayError {
         self.error
+    }
+
+    fn with_upstream_response(mut self, status: StatusCode, request_id: Option<String>) -> Self {
+        self.http_status = Some(status.as_u16());
+        self.upstream_request_id_sha256 = request_id;
+        self
     }
 }
 
@@ -262,20 +279,24 @@ async fn post_one(
         }
     })?;
     let status = response.status();
-    let body = read_bounded_body(response)
-        .await
-        .map_err(|_| uncertain_transport())?;
+    let request_id_sha256 = upstream_request_id_sha256(response.headers());
+    let body = read_bounded_body(response).await.map_err(|_| {
+        uncertain_transport().with_upstream_response(status, request_id_sha256.clone())
+    })?;
     if !status.is_success() {
-        let upstream_code = structured_error_code(&body);
+        let failure =
+            map_http_error(status, &body).with_upstream_response(status, request_id_sha256);
         tracing::warn!(
             codex.edit.output_index = output_index,
             http.status = status.as_u16(),
-            upstream.code = safe_upstream_token(upstream_code.as_deref()),
+            upstream.code = failure.upstream_error_code().unwrap_or("none"),
+            upstream.request_id_sha256 = failure.upstream_request_id_sha256().unwrap_or("none"),
             "Codex image edit upstream rejected request"
         );
-        return Err(map_http_error(status, &body));
+        return Err(failure);
     }
-    decode_outputs(&body, 1).map_err(|_| direct_invalid_response())
+    decode_outputs(&body, 1)
+        .map_err(|_| direct_invalid_response().with_upstream_response(status, request_id_sha256))
 }
 
 fn edit_request<'a>(
@@ -390,17 +411,18 @@ fn decode_outputs(body: &[u8], expected: u32) -> Result<Vec<GeneratedImage>, Ima
 }
 
 fn map_http_error(status: StatusCode, body: &[u8]) -> DirectEditFailure {
-    let code = structured_error_code(body)
-        .unwrap_or_default()
-        .to_ascii_lowercase();
+    let code = structured_error_code(body).map(|code| code.to_ascii_lowercase());
+    let upstream_error_code = safe_upstream_error_code(code.as_deref());
     if matches!(
-        code.as_str(),
-        "content_policy" | "content_policy_violation" | "moderation_blocked" | "safety"
+        code.as_deref(),
+        Some("content_policy" | "content_policy_violation" | "moderation_blocked" | "safety")
     ) {
         return DirectEditFailure {
             error: ImageGatewayError::content_policy_rejected(),
             error_code: "content_policy_rejected",
             http_status: Some(status.as_u16()),
+            upstream_error_code,
+            upstream_request_id_sha256: None,
             outcome_uncertain: false,
         };
     }
@@ -422,6 +444,8 @@ fn map_http_error(status: StatusCode, body: &[u8]) -> DirectEditFailure {
         error,
         error_code,
         http_status: Some(status.as_u16()),
+        upstream_error_code,
+        upstream_request_id_sha256: None,
         outcome_uncertain: false,
     }
 }
@@ -431,6 +455,8 @@ fn local_credentials_unavailable(error: ImageGatewayError) -> DirectEditFailure 
         error,
         error_code: "codex_credentials_unavailable",
         http_status: None,
+        upstream_error_code: None,
+        upstream_request_id_sha256: None,
         outcome_uncertain: false,
     }
 }
@@ -440,6 +466,8 @@ fn local_invalid_request(error: ImageGatewayError) -> DirectEditFailure {
         error,
         error_code: "codex_image_edit_request_invalid",
         http_status: None,
+        upstream_error_code: None,
+        upstream_request_id_sha256: None,
         outcome_uncertain: false,
     }
 }
@@ -449,6 +477,8 @@ fn local_unavailable(error: ImageGatewayError) -> DirectEditFailure {
         error,
         error_code: "codex_image_edit_upstream_unavailable",
         http_status: None,
+        upstream_error_code: None,
+        upstream_request_id_sha256: None,
         outcome_uncertain: false,
     }
 }
@@ -458,6 +488,8 @@ fn uncertain_transport() -> DirectEditFailure {
         error: unavailable(),
         error_code: "codex_image_edit_outcome_unknown",
         http_status: None,
+        upstream_error_code: None,
+        upstream_request_id_sha256: None,
         outcome_uncertain: true,
     }
 }
@@ -467,6 +499,8 @@ fn direct_invalid_response() -> DirectEditFailure {
         error: invalid_response(),
         error_code: "codex_image_edit_invalid_response",
         http_status: Some(StatusCode::OK.as_u16()),
+        upstream_error_code: None,
+        upstream_request_id_sha256: None,
         outcome_uncertain: true,
     }
 }
@@ -478,20 +512,55 @@ fn structured_error_code(body: &[u8]) -> Option<String> {
         .and_then(|error| error.code)
 }
 
-fn safe_upstream_token(value: Option<&str>) -> &str {
-    match value {
-        Some(value)
-            if !value.is_empty()
-                && value.len() <= 64
-                && value.bytes().all(|byte| {
-                    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.')
-                }) =>
-        {
-            value
-        }
-        Some(_) => "redacted",
-        None => "none",
+fn safe_upstream_error_code(value: Option<&str>) -> Option<&'static str> {
+    // A token-shaped string can still contain a credential or customer data.
+    const ALLOWED: &[&str] = &[
+        "access_token_expired",
+        "account_deactivated",
+        "account_not_found",
+        "authentication_error",
+        "content_policy",
+        "content_policy_violation",
+        "expired_token",
+        "insufficient_quota",
+        "internal_server_error",
+        "invalid_api_key",
+        "invalid_authentication",
+        "invalid_request_error",
+        "invalid_token",
+        "ip_not_allowed",
+        "ip_rejected",
+        "moderation_blocked",
+        "rate_limit_exceeded",
+        "safety",
+        "server_error",
+        "service_unavailable",
+        "token_expired",
+        "token_invalidated",
+        "unauthorized",
+        "unsupported_country_region_territory",
+    ];
+    let value = value?;
+    Some(
+        ALLOWED
+            .iter()
+            .copied()
+            .find(|code| *code == value)
+            .unwrap_or("redacted"),
+    )
+}
+
+fn upstream_request_id_sha256(headers: &HeaderMap) -> Option<String> {
+    let mut values = headers.get_all("x-request-id").iter();
+    let request_id = values.next()?.to_str().ok()?;
+    let suffix = request_id.strip_prefix("req_")?;
+    if values.next().is_some()
+        || suffix.len() != 32
+        || !suffix.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return None;
     }
+    Some(hex::encode(Sha256::digest(request_id.as_bytes())))
 }
 
 fn credentials_unavailable() -> ImageGatewayError {
@@ -598,6 +667,46 @@ mod tests {
         assert!(!unauthorized_policy.is_authentication_rejection());
         let forbidden = map_http_error(StatusCode::FORBIDDEN, br#"{}"#);
         assert!(!forbidden.is_authentication_rejection());
+    }
+
+    #[test]
+    fn direct_edit_upstream_code_is_allowlisted_without_affecting_401_classification() {
+        for (body, expected) in [
+            (
+                &br#"{"error":{"code":"TOKEN_EXPIRED"}}"#[..],
+                Some("token_expired"),
+            ),
+            (
+                br#"{"error":{"code":"sk-fixture-private-token"}}"#,
+                Some("redacted"),
+            ),
+            (
+                br#"{"error":{"code":"https://fixture.invalid/private"}}"#,
+                Some("redacted"),
+            ),
+            (br#"{"error":{"message":"token_expired"}}"#, None),
+            (b"<html>token_expired</html>", None),
+        ] {
+            let failure = map_http_error(StatusCode::UNAUTHORIZED, body);
+            assert_eq!(failure.upstream_error_code(), expected);
+            assert!(failure.is_authentication_rejection());
+        }
+    }
+
+    #[test]
+    fn direct_edit_hashes_only_one_canonical_request_id() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(upstream_request_id_sha256(&headers), None);
+        headers.insert("x-request-id", "fixture-private-data".parse().unwrap());
+        assert_eq!(upstream_request_id_sha256(&headers), None);
+        let request_id = "req_0123456789abcdef0123456789abcdef";
+        headers.insert("x-request-id", request_id.parse().unwrap());
+        assert_eq!(
+            upstream_request_id_sha256(&headers),
+            Some(hex::encode(Sha256::digest(request_id.as_bytes()))),
+        );
+        headers.append("x-request-id", request_id.parse().unwrap());
+        assert_eq!(upstream_request_id_sha256(&headers), None);
     }
 
     #[test]

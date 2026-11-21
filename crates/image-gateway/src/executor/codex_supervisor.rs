@@ -164,6 +164,10 @@ struct CodexEditAttemptDiagnosticV1 {
     terminal_state: Option<String>,
     error_code: Option<String>,
     http_status: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    upstream_error_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    upstream_request_id_sha256: Option<String>,
     output_sha256: Option<String>,
     output_byte_size: Option<u64>,
 }
@@ -293,6 +297,8 @@ fn edit_attempt_diagnostic(
         terminal_state: terminal_state.map(str::to_owned),
         error_code: error_code.map(str::to_owned),
         http_status,
+        upstream_error_code: None,
+        upstream_request_id_sha256: None,
         output_sha256: output.map(sha256),
         output_byte_size: output.map(|bytes| bytes.len() as u64),
     }
@@ -321,6 +327,8 @@ fn edit_attempt_binding_unchanged(
         && start.terminal_state.is_none()
         && start.error_code.is_none()
         && start.http_status.is_none()
+        && start.upstream_error_code.is_none()
+        && start.upstream_request_id_sha256.is_none()
         && start.output_sha256.is_none()
         && start.output_byte_size.is_none()
 }
@@ -1086,7 +1094,7 @@ async fn run_direct_edit_child(
                 None,
             ),
         };
-        let finished = edit_attempt_diagnostic(
+        let mut finished = edit_attempt_diagnostic(
             request,
             attempt,
             "image_generation_finished",
@@ -1099,6 +1107,11 @@ async fn run_direct_edit_child(
             http_status,
             output,
         );
+        if let Err(error) = &result {
+            finished.upstream_error_code = error.upstream_error_code().map(str::to_owned);
+            finished.upstream_request_id_sha256 =
+                error.upstream_request_id_sha256().map(str::to_owned);
+        }
         let binding_unchanged = edit_attempt_binding_unchanged(&started, &finished);
         let finish_durable = spool.publish_diagnostic(finish_file, &finished).is_ok();
         if !binding_unchanged {
@@ -1869,6 +1882,8 @@ mod tests {
         delay: Duration,
     }
 
+    const DIRECT_EDIT_UPSTREAM_REQUEST_ID: &str = "req_9abc0123456789def0123456789defff";
+
     async fn direct_edit_handler(
         State(state): State<Arc<DirectEditServerState>>,
         headers: HeaderMap,
@@ -1903,9 +1918,20 @@ mod tests {
             )
                 .into_response()
         } else {
+            let (code, request_id) = match status {
+                StatusCode::FORBIDDEN => ("sk-fixture-private-token", "fixture-private-request-id"),
+                StatusCode::INTERNAL_SERVER_ERROR => {
+                    ("internal_server_error", DIRECT_EDIT_UPSTREAM_REQUEST_ID)
+                }
+                StatusCode::TOO_MANY_REQUESTS => {
+                    ("rate_limit_exceeded", DIRECT_EDIT_UPSTREAM_REQUEST_ID)
+                }
+                _ => ("authentication_error", DIRECT_EDIT_UPSTREAM_REQUEST_ID),
+            };
             (
                 status,
-                Json(json!({"error": {"code": "authentication_error"}})),
+                [("x-request-id", request_id)],
+                Json(json!({"error": {"code": code, "message": "fixture-private-error-body"}})),
             )
                 .into_response()
         };
@@ -3212,6 +3238,14 @@ mod tests {
                 .unwrap();
             assert_eq!(first.http_status, Some(401));
             assert_eq!(
+                first.upstream_error_code.as_deref(),
+                Some("authentication_error")
+            );
+            assert_eq!(
+                first.upstream_request_id_sha256,
+                Some(sha256(DIRECT_EDIT_UPSTREAM_REQUEST_ID.as_bytes())),
+            );
+            assert_eq!(
                 first.error_code.as_deref(),
                 Some("codex_authentication_rejected")
             );
@@ -3226,15 +3260,21 @@ mod tests {
 
     #[tokio::test]
     async fn managed_edit_never_retries_non_authentication_failures() {
-        for (status, expected_code) in [
-            (StatusCode::FORBIDDEN, "codex_image_edit_rejected"),
+        for (status, expected_code, upstream_code) in [
+            (
+                StatusCode::FORBIDDEN,
+                "codex_image_edit_rejected",
+                "redacted",
+            ),
             (
                 StatusCode::TOO_MANY_REQUESTS,
                 "codex_image_edit_rate_limited",
+                "rate_limit_exceeded",
             ),
             (
-                StatusCode::SERVICE_UNAVAILABLE,
+                StatusCode::INTERNAL_SERVER_ERROR,
                 "codex_image_edit_upstream_unavailable",
+                "internal_server_error",
             ),
         ] {
             let fixture = CodexFixture::new();
@@ -3255,6 +3295,40 @@ mod tests {
             .await;
             assert!(matches!(outcome, ChildOutcome::Failed(code) if code == expected_code));
             assert_eq!(state.requests.lock().unwrap().len(), 1);
+            let raw: Value = spool
+                .read_diagnostic(CODEX_EDIT_ATTEMPT_1_FINISH_FILE)
+                .unwrap()
+                .unwrap();
+            let finish: CodexEditAttemptDiagnosticV1 = serde_json::from_value(raw.clone()).unwrap();
+            assert_eq!(finish.http_status, Some(status.as_u16()));
+            assert_eq!(finish.upstream_error_code.as_deref(), Some(upstream_code));
+            assert_eq!(
+                finish.upstream_request_id_sha256,
+                (status != StatusCode::FORBIDDEN)
+                    .then(|| sha256(DIRECT_EDIT_UPSTREAM_REQUEST_ID.as_bytes())),
+            );
+            let serialized = raw.to_string();
+            for private in [
+                "sk-fixture-private-token",
+                "fixture-private-request-id",
+                "fixture-private-error-body",
+                DIRECT_EDIT_UPSTREAM_REQUEST_ID,
+            ] {
+                assert!(!serialized.contains(private));
+            }
+            let mut legacy = raw;
+            legacy
+                .as_object_mut()
+                .unwrap()
+                .remove("upstream_error_code");
+            legacy
+                .as_object_mut()
+                .unwrap()
+                .remove("upstream_request_id_sha256");
+            let legacy: CodexEditAttemptDiagnosticV1 = serde_json::from_value(legacy).unwrap();
+            assert_eq!(legacy.http_status, finish.http_status);
+            assert!(legacy.upstream_error_code.is_none());
+            assert!(legacy.upstream_request_id_sha256.is_none());
             assert!(
                 spool
                     .read_diagnostic::<CodexAuthRefreshRequestV1>(CODEX_AUTH_REFRESH_REQUEST_FILE,)
