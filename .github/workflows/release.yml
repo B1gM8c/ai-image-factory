@@ -459,6 +459,7 @@ jobs:
           fetch-depth: 1
 
       - name: Require immutable releases before publication
+        if: inputs.mode != 'candidate'
         env:
           GH_TOKEN: ${{ secrets.RELEASE_POLICY_TOKEN }}
         run: |
