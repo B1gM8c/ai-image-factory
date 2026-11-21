@@ -6,7 +6,10 @@ use uuid::Uuid;
 #[tokio::main]
 async fn main() -> Result<(), ImageGatewayError> {
     tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::WARN)
+        .with_writer(std::io::stderr)
+        .with_env_filter(tracing_subscriber::EnvFilter::new(
+            "off,gpt_image_2_gateway::providers::openai_codex::direct_edit=warn",
+        ))
         .with_target(false)
         .compact()
         .try_init()
