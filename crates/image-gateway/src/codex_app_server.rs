@@ -1585,10 +1585,16 @@ fn ip_not_authorized_body(value: &[u8]) -> bool {
             let Ok(error) = serde_json::from_str::<Value>(&body) else {
                 return false;
             };
-            error.pointer("/error/type").and_then(Value::as_str) == Some("invalid_request_error")
-                && error.pointer("/error/message").and_then(Value::as_str)
-                    == Some("Your IP is not authorized to make this request.")
+            matches_codex_ip_denial(
+                error.pointer("/error/type").and_then(Value::as_str),
+                error.pointer("/error/message").and_then(Value::as_str),
+            )
         })
+}
+
+pub(crate) fn matches_codex_ip_denial(error_type: Option<&str>, message: Option<&str>) -> bool {
+    error_type == Some("invalid_request_error")
+        && message == Some("Your IP is not authorized to make this request.")
 }
 
 fn observed_http_statuses(value: &str) -> Vec<u16> {

@@ -1875,6 +1875,7 @@ mod tests {
     #[derive(Default)]
     struct DirectEditServerState {
         statuses: Mutex<VecDeque<StatusCode>>,
+        rejection_body: Mutex<Option<Value>>,
         requests: Mutex<Vec<Value>>,
         authorizations: Mutex<Vec<String>>,
         concurrency: Mutex<(usize, usize)>,
@@ -1917,6 +1918,8 @@ mod tests {
                 Json(json!({"data": [{"b64_json": STANDARD.encode(&state.output)}]})),
             )
                 .into_response()
+        } else if let Some(body) = state.rejection_body.lock().unwrap().take() {
+            (status, Json(body)).into_response()
         } else {
             let (code, request_id) = match status {
                 StatusCode::FORBIDDEN => ("sk-fixture-private-token", "fixture-private-request-id"),
@@ -3262,24 +3265,36 @@ mod tests {
     async fn managed_edit_never_retries_non_authentication_failures() {
         for (status, expected_code, upstream_code) in [
             (
+                StatusCode::UNAUTHORIZED,
+                "codex_image_tool_ip_not_authorized",
+                None,
+            ),
+            (
                 StatusCode::FORBIDDEN,
                 "codex_image_edit_rejected",
-                "redacted",
+                Some("redacted"),
             ),
             (
                 StatusCode::TOO_MANY_REQUESTS,
                 "codex_image_edit_rate_limited",
-                "rate_limit_exceeded",
+                Some("rate_limit_exceeded"),
             ),
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "codex_image_edit_upstream_unavailable",
-                "internal_server_error",
+                Some("internal_server_error"),
             ),
         ] {
             let fixture = CodexFixture::new();
             let blobs = Arc::new(InMemoryArtifactBlobStore::default());
             let (endpoint, state, server) = start_direct_edit_server([status]).await;
+            if status == StatusCode::UNAUTHORIZED {
+                *state.rejection_body.lock().unwrap() = Some(json!({"error": {
+                    "type": "invalid_request_error",
+                    "message": "Your IP is not authorized to make this request.",
+                    "code": null,
+                }}));
+            }
             let (_lease, spool, request) = prepare_managed_edit_output(&fixture, blobs, 1, 1).await;
             let CodexExecutionRequest::Edit(edit) = &request.output else {
                 panic!("managed edit projected as generation");
@@ -3301,17 +3316,21 @@ mod tests {
                 .unwrap();
             let finish: CodexEditAttemptDiagnosticV1 = serde_json::from_value(raw.clone()).unwrap();
             assert_eq!(finish.http_status, Some(status.as_u16()));
-            assert_eq!(finish.upstream_error_code.as_deref(), Some(upstream_code));
+            assert_eq!(finish.upstream_error_code.as_deref(), upstream_code);
             assert_eq!(
                 finish.upstream_request_id_sha256,
-                (status != StatusCode::FORBIDDEN)
-                    .then(|| sha256(DIRECT_EDIT_UPSTREAM_REQUEST_ID.as_bytes())),
+                matches!(
+                    status,
+                    StatusCode::TOO_MANY_REQUESTS | StatusCode::INTERNAL_SERVER_ERROR
+                )
+                .then(|| sha256(DIRECT_EDIT_UPSTREAM_REQUEST_ID.as_bytes())),
             );
             let serialized = raw.to_string();
             for private in [
                 "sk-fixture-private-token",
                 "fixture-private-request-id",
                 "fixture-private-error-body",
+                "Your IP is not authorized to make this request.",
                 DIRECT_EDIT_UPSTREAM_REQUEST_ID,
             ] {
                 assert!(!serialized.contains(private));
