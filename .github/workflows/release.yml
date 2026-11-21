@@ -202,6 +202,7 @@ jobs:
             /usr/share/doc/ai-image-factory/github-release-deployment.md
           for binary in \
             executord \
+            factoryctl \
             gpt-image-2-gateway \
             provider-pollerd \
             provider-submitd \
