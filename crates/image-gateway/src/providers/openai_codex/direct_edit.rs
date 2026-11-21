@@ -6,11 +6,12 @@ use std::net::IpAddr;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use futures_util::StreamExt;
 use reqwest::{Client, StatusCode, header::HeaderMap, redirect::Policy};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::IgnoredAny};
 use sha2::{Digest, Sha256};
 
 use crate::{
     ImageGatewayError,
+    codex_app_server::matches_codex_ip_denial,
     core::provider::{GeneratedImage, InputImage},
 };
 
@@ -21,6 +22,7 @@ const CODEX_ORIGINATOR: &str = "codex_cli_rs";
 const CODEX_USER_AGENT: &str = "codex_cli_rs/0.145.0";
 const MAX_AUTH_BYTES: u64 = 64 * 1024;
 const MAX_RESPONSE_BYTES: usize = 96 * 1024 * 1024;
+const MAX_ERROR_INSPECTION_BYTES: usize = 64 * 1024;
 const MAX_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Deserialize)]
@@ -46,6 +48,12 @@ pub(crate) struct DirectEditFailure {
     upstream_error_code: Option<&'static str>,
     upstream_request_id_sha256: Option<String>,
     outcome_uncertain: bool,
+}
+
+struct HttpRejection {
+    failure: DirectEditFailure,
+    body_shape: &'static str,
+    error_type: Option<&'static str>,
 }
 
 pub(crate) struct DirectEditParameters<'a> {
@@ -134,6 +142,25 @@ struct ErrorEnvelope {
 #[derive(Deserialize)]
 struct ErrorBody {
     code: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum RejectionEnvelope {
+    Object { error: Option<RejectionBody> },
+    Other(IgnoredAny),
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum RejectionBody {
+    Object {
+        #[serde(rename = "code")]
+        _code: Option<String>,
+        #[serde(rename = "type")]
+        error_type: Option<String>,
+        message: Option<String>,
+    },
 }
 
 pub(super) async fn edit(
@@ -280,16 +307,26 @@ async fn post_one(
     })?;
     let status = response.status();
     let request_id_sha256 = upstream_request_id_sha256(response.headers());
+    let request_id_state = match request_id_sha256.as_ref() {
+        Some(_) => "recognized",
+        None if response.headers().contains_key("x-request-id") => "present_unusable",
+        None => "absent",
+    };
     let body = read_bounded_body(response).await.map_err(|_| {
         uncertain_transport().with_upstream_response(status, request_id_sha256.clone())
     })?;
     if !status.is_success() {
-        let failure =
-            map_http_error(status, &body).with_upstream_response(status, request_id_sha256);
+        let rejection = map_http_error(status, &body);
+        let failure = rejection
+            .failure
+            .with_upstream_response(status, request_id_sha256);
         tracing::warn!(
             codex.edit.output_index = output_index,
             http.status = status.as_u16(),
+            upstream.response_body_shape = rejection.body_shape,
+            upstream.error_type = rejection.error_type.unwrap_or("none"),
             upstream.code = failure.upstream_error_code().unwrap_or("none"),
+            upstream.request_id_state = request_id_state,
             upstream.request_id_sha256 = failure.upstream_request_id_sha256().unwrap_or("none"),
             "Codex image edit upstream rejected request"
         );
@@ -410,29 +447,62 @@ fn decode_outputs(body: &[u8], expected: u32) -> Result<Vec<GeneratedImage>, Ima
     Ok(outputs)
 }
 
-fn map_http_error(status: StatusCode, body: &[u8]) -> DirectEditFailure {
-    let code = structured_error_code(body).map(|code| code.to_ascii_lowercase());
-    let upstream_error_code = safe_upstream_error_code(code.as_deref());
-    if matches!(
-        code.as_deref(),
-        Some("content_policy" | "content_policy_violation" | "moderation_blocked" | "safety")
-    ) {
-        return DirectEditFailure {
-            error: ImageGatewayError::content_policy_rejected(),
-            error_code: "content_policy_rejected",
-            http_status: Some(status.as_u16()),
-            upstream_error_code,
-            upstream_request_id_sha256: None,
-            outcome_uncertain: false,
-        };
-    }
-    let (error, error_code) = match status {
-        StatusCode::UNAUTHORIZED => (credentials_unavailable(), "codex_authentication_rejected"),
-        StatusCode::TOO_MANY_REQUESTS => (
+fn map_http_error(status: StatusCode, body: &[u8]) -> HttpRejection {
+    let raw_code = structured_error_code(body).map(|code| code.to_ascii_lowercase());
+    let upstream_error_code = safe_upstream_error_code(raw_code.as_deref());
+    let oversized = body.len() > MAX_ERROR_INSPECTION_BYTES;
+    let json = (!oversized)
+        .then(|| serde_json::from_slice::<RejectionEnvelope>(body).ok())
+        .flatten();
+    // Derived object fields reject duplicates before any IP-denial signal is used.
+    let (body_shape, error_type, ip_denial) = match json.as_ref() {
+        Some(RejectionEnvelope::Object {
+            error:
+                Some(RejectionBody::Object {
+                    error_type,
+                    message,
+                    ..
+                }),
+        }) => (
+            "json_error",
+            safe_upstream_error_code(error_type.as_deref()),
+            matches!(raw_code.as_deref(), Some("ip_not_allowed" | "ip_rejected"))
+                || matches_codex_ip_denial(error_type.as_deref(), message.as_deref()),
+        ),
+        Some(_) => ("json_other", None, false),
+        None if oversized => ("oversized", None, false),
+        None => {
+            let shape = match body.iter().find(|byte| !byte.is_ascii_whitespace()) {
+                None => "empty",
+                Some(b'<') => "markup_like",
+                Some(_) => "other",
+            };
+            (shape, None, false)
+        }
+    };
+    let (error, error_code) = match (status, raw_code.as_deref()) {
+        (
+            _,
+            Some("content_policy" | "content_policy_violation" | "moderation_blocked" | "safety"),
+        ) => (
+            ImageGatewayError::content_policy_rejected(),
+            "content_policy_rejected",
+        ),
+        (StatusCode::UNAUTHORIZED, _) if ip_denial => {
+            let error_code = "codex_image_tool_ip_not_authorized";
+            (
+                ImageGatewayError::codex_app_server_failure(error_code),
+                error_code,
+            )
+        }
+        (StatusCode::UNAUTHORIZED, _) => {
+            (credentials_unavailable(), "codex_authentication_rejected")
+        }
+        (StatusCode::TOO_MANY_REQUESTS, _) => (
             ImageGatewayError::queue_overloaded(),
             "codex_image_edit_rate_limited",
         ),
-        status if status.is_server_error() => {
+        (status, _) if status.is_server_error() => {
             (unavailable(), "codex_image_edit_upstream_unavailable")
         }
         _ => (
@@ -440,13 +510,17 @@ fn map_http_error(status: StatusCode, body: &[u8]) -> DirectEditFailure {
             "codex_image_edit_rejected",
         ),
     };
-    DirectEditFailure {
-        error,
-        error_code,
-        http_status: Some(status.as_u16()),
-        upstream_error_code,
-        upstream_request_id_sha256: None,
-        outcome_uncertain: false,
+    HttpRejection {
+        failure: DirectEditFailure {
+            error,
+            error_code,
+            http_status: Some(status.as_u16()),
+            upstream_error_code,
+            upstream_request_id_sha256: None,
+            outcome_uncertain: false,
+        },
+        body_shape,
+        error_type,
     }
 }
 
@@ -644,29 +718,124 @@ mod tests {
         let policy = map_http_error(
             StatusCode::BAD_REQUEST,
             br#"{"error":{"code":"content_policy"}}"#,
-        );
+        )
+        .failure;
         assert_eq!(policy.error_code(), "content_policy_rejected");
         let moderation = map_http_error(
             StatusCode::BAD_REQUEST,
             br#"{"error":{"code":"moderation_blocked"}}"#,
-        );
+        )
+        .failure;
         assert_eq!(moderation.error_code(), "content_policy_rejected");
         let generic = map_http_error(
             StatusCode::BAD_REQUEST,
             br#"{"error":{"message":"content policy"}}"#,
-        );
+        )
+        .failure;
         assert_eq!(generic.error_code(), "codex_image_edit_rejected");
         assert!(!generic.is_authentication_rejection());
 
-        let unauthorized = map_http_error(StatusCode::UNAUTHORIZED, br#"{}"#);
+        let unauthorized = map_http_error(StatusCode::UNAUTHORIZED, br#"{}"#).failure;
         assert!(unauthorized.is_authentication_rejection());
         let unauthorized_policy = map_http_error(
             StatusCode::UNAUTHORIZED,
             br#"{"error":{"code":"content_policy"}}"#,
-        );
+        )
+        .failure;
         assert!(!unauthorized_policy.is_authentication_rejection());
-        let forbidden = map_http_error(StatusCode::FORBIDDEN, br#"{}"#);
+        let forbidden = map_http_error(StatusCode::FORBIDDEN, br#"{}"#).failure;
         assert!(!forbidden.is_authentication_rejection());
+    }
+
+    #[test]
+    fn direct_edit_requires_structured_ip_denial_in_a_401() {
+        let exact_signature = br#"{"error":{"type":"invalid_request_error","message":"Your IP is not authorized to make this request."}}"#;
+        for (body, upstream_code) in [
+            (&exact_signature[..], None),
+            (
+                br#"{"error":{"code":"ip_not_allowed"}}"#,
+                Some("ip_not_allowed"),
+            ),
+            (br#"{"error":{"code":"ip_rejected"}}"#, Some("ip_rejected")),
+        ] {
+            let failure = map_http_error(StatusCode::UNAUTHORIZED, body).failure;
+            assert_eq!(failure.error_code(), "codex_image_tool_ip_not_authorized");
+            assert_eq!(failure.upstream_error_code(), upstream_code);
+            assert_eq!(failure.http_status(), Some(401));
+            assert!(!failure.is_authentication_rejection());
+            assert!(!failure.outcome_uncertain());
+            let failure = map_http_error(StatusCode::INTERNAL_SERVER_ERROR, body).failure;
+            assert_eq!(
+                failure.error_code(),
+                "codex_image_edit_upstream_unavailable"
+            );
+            assert!(!failure.is_authentication_rejection());
+        }
+        for body in [
+            &br#"{"error":{"type":"authentication_error","message":"Your IP is not authorized to make this request."}}"#[..],
+            br#"{"error":{"type":"invalid_request_error","message":"quoted: Your IP is not authorized to make this request."}}"#,
+            br#"{"error":{"message":"Your IP is not authorized to make this request."}}"#,
+            br#"{"type":"invalid_request_error","message":"Your IP is not authorized to make this request."}"#,
+            br#"{"error":{"code":"unsupported_country_region_territory"}}"#,
+            br#"{"code":"ip_not_allowed"}"#,
+            b"<html>Your IP is not authorized to make this request.</html>",
+        ] {
+            let failure = map_http_error(StatusCode::UNAUTHORIZED, body).failure;
+            assert_eq!(failure.error_code(), "codex_authentication_rejected");
+            assert!(failure.is_authentication_rejection());
+        }
+    }
+
+    #[test]
+    fn direct_edit_does_not_classify_ambiguous_json_as_ip_denial() {
+        for body in [
+            &br#"{"error":null,"error":{"type":"invalid_request_error","message":"Your IP is not authorized to make this request."}}"#[..],
+            br#"{"error":{"code":null,"code":"ip_rejected"}}"#,
+            br#"{"error":{"type":null,"type":"invalid_request_error","message":"Your IP is not authorized to make this request."}}"#,
+            br#"{"error":{"type":"invalid_request_error","message":null,"message":"Your IP is not authorized to make this request."}}"#,
+            br#"{"error":{"code":"ip_rejected","type":null,"type":"invalid_request_error"}}"#,
+            br#"{"error":["ip_rejected","invalid_request_error","Your IP is not authorized to make this request."]}"#,
+            br#"[["ip_rejected","invalid_request_error","Your IP is not authorized to make this request."]]"#,
+        ] {
+            let rejection = map_http_error(StatusCode::UNAUTHORIZED, body);
+            assert!(rejection.failure.is_authentication_rejection());
+            assert_eq!(rejection.error_type, None);
+        }
+        let rejection = map_http_error(
+            StatusCode::UNAUTHORIZED,
+            br#"{"error":{"code":"not_policy","code":"content_policy"}}"#,
+        );
+        assert!(rejection.failure.is_authentication_rejection());
+        assert_eq!(rejection.failure.upstream_error_code(), None);
+    }
+
+    #[test]
+    fn direct_edit_records_only_coarse_http_rejection_metadata() {
+        for (body, body_shape, error_type) in [
+            (
+                &br#"{"error":{"type":"invalid_request_error"}}"#[..],
+                "json_error",
+                Some("invalid_request_error"),
+            ),
+            (
+                br#"{"error":{"type":"sk-fixture-private-token"}}"#,
+                "json_error",
+                Some("redacted"),
+            ),
+            (br#"{"type":"invalid_request_error"}"#, "json_other", None),
+            (
+                b" \n<html>fixture-private-content</html>",
+                "markup_like",
+                None,
+            ),
+            (b" \t\n", "empty", None),
+            (b"fixture-private-content", "other", None),
+        ] {
+            let rejection = map_http_error(StatusCode::UNAUTHORIZED, body);
+            assert_eq!(rejection.body_shape, body_shape);
+            assert_eq!(rejection.error_type, error_type);
+            assert!(rejection.failure.is_authentication_rejection());
+        }
     }
 
     #[test]
@@ -687,7 +856,7 @@ mod tests {
             (br#"{"error":{"message":"token_expired"}}"#, None),
             (b"<html>token_expired</html>", None),
         ] {
-            let failure = map_http_error(StatusCode::UNAUTHORIZED, body);
+            let failure = map_http_error(StatusCode::UNAUTHORIZED, body).failure;
             assert_eq!(failure.upstream_error_code(), expected);
             assert!(failure.is_authentication_rejection());
         }
