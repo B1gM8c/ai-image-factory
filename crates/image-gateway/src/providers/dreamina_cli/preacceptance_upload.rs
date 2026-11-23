@@ -19,7 +19,8 @@ use crate::{
 use super::submit_recovery::{absolute_media_arguments, has_no_acceptance_evidence};
 
 // The pinned Linux Dreamina 1.4.21 handlers return these exact upload
-// failures before reaching the generation client: image2video at 0x116c46d,
+// failures before reaching the generation client: image2image at 0x117070d
+// (error branches to 0x117088f), image2video at 0x116c46d,
 // frames2video at 0x116d6e3, multiframe2video at 0x1171ec8, and
 // multimodal2video at 0x116eb29 (images), 0x116ebaf (videos), 0x116ec32 (audio).
 const REVIEWED_DREAMINA_SHA256: &str =
@@ -101,7 +102,7 @@ impl MaterialUploadFailure {
             image_media_type = media_type.filter(|_| is_image),
             image_byte_size = byte_size.filter(|_| is_image),
             cli_elapsed_ms = evidence.finished_at_ms() - evidence.started_at_ms(),
-            "Dreamina stopped before video submission; CLI did not report the underlying upload error"
+            "Dreamina stopped before generation submission; CLI did not report the underlying upload error"
         );
     }
 }
@@ -159,6 +160,12 @@ fn matches_material_upload_failure(
     let receipt = serde_json::from_slice::<FailedUploadReceipt>(stdout).ok()?;
     let candidate_id = Uuid::parse_str(&receipt.submit_id).ok()?;
     let (argv, prompt, model, workflow) = match request {
+        DreaminaSubmitRequestV1::ImageToImage(request) if request.generate_num() == 1 => (
+            request.to_argv(),
+            request.parameters().prompt(),
+            request.parameters().model().as_str(),
+            "image2image",
+        ),
         DreaminaSubmitRequestV1::MultimodalToVideo(request) => (
             request.to_argv(),
             request.prompt(),
@@ -249,9 +256,10 @@ fn matches_material_upload_failure(
 #[cfg(test)]
 mod tests {
     use image_provider_dreamina_cli::{
-        FramesToVideoRequestV1, ImageToVideoRequestV1, MultiframeToVideoRequestV1,
+        FramesToVideoRequestV1, ImageModelVersion, ImageRatio, ImageResolution,
+        ImageToImageRequestV1, ImageToVideoRequestV1, MultiframeToVideoRequestV1,
         MultimodalToVideoRequestV1, ReferenceVideoOptionsV1, StagedImageV1, StagedTimedMediaV1,
-        VideoModelVersion, VideoRatio, VideoResolution, VideoTransitionV1,
+        TextToImageRequestV1, VideoModelVersion, VideoRatio, VideoResolution, VideoTransitionV1,
     };
     use serde_json::{Value, json};
 
@@ -433,6 +441,69 @@ mod tests {
         assert!(!matches(duplicate.as_bytes(), &relative, &request));
         let trailing = format!("{valid}\n{{}}");
         assert!(!matches(trailing.as_bytes(), &relative, &request));
+    }
+
+    #[test]
+    fn material_upload_failure_binds_single_output_image_edit() {
+        for count in [1, 2] {
+            let request = ImageToImageRequestV1::new(
+                vec![
+                    StagedImageV1::new("input-0.png", "a".repeat(64), 800, 600).unwrap(),
+                    StagedImageV1::new("input-1.png", "b".repeat(64), 900, 900).unwrap(),
+                    StagedImageV1::new("input-2.png", "c".repeat(64), 1024, 768).unwrap(),
+                ],
+                TextToImageRequestV1::new(
+                    PROMPT,
+                    ImageModelVersion::V5_0,
+                    ImageRatio::R1x1,
+                    ImageResolution::K2,
+                    count,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            let argv = request
+                .to_argv()
+                .into_iter()
+                .map(|arg| arg.into_string().unwrap())
+                .collect::<Vec<_>>();
+            let request = request.into();
+            let workspace = Path::new(WORKSPACE);
+            let raw = receipt("input-2.png").to_string();
+            let failure = matches_material_upload_failure(
+                raw.as_bytes(),
+                REVIEWED_DREAMINA_SHA256,
+                workspace,
+                &argv,
+                &request,
+            );
+            if count == 1 {
+                let failure = failure.unwrap();
+                assert_eq!(failure.workflow, "image2image");
+                assert_eq!(failure.ordinal, 3);
+                assert_eq!(failure.dimensions, Some((1024, 768)));
+            } else {
+                assert!(failure.is_none());
+            }
+            assert!(!matches(
+                receipt("other.png").to_string().as_bytes(),
+                &argv,
+                &request,
+            ));
+            let mut changed = receipt("input-2.png");
+            changed["fail_reason"] = json!("upload image: no file upload");
+            assert!(!matches(changed.to_string().as_bytes(), &argv, &request));
+            assert!(
+                matches_material_upload_failure(
+                    raw.as_bytes(),
+                    &"f".repeat(64),
+                    workspace,
+                    &argv,
+                    &request
+                )
+                .is_none()
+            );
+        }
     }
 
     #[test]

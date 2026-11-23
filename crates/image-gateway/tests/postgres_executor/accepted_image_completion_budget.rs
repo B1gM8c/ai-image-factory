@@ -1,6 +1,9 @@
 use super::*;
 use std::{borrow::Cow, str::FromStr};
 
+use gpt_image_2_gateway::admission::{
+    AttachInputObject, DreaminaStagedInputs, DreaminaWorkflowIntent,
+};
 use gpt_image_2_gateway::provider_tasks::{
     ProviderArtifactAuthority, ProviderSubmitFailureKind, ProviderTaskDeadlineStore,
     ProviderTaskObservation, ProviderTaskObservationOutcome, ProviderTaskObservationSource,
@@ -85,20 +88,13 @@ struct AcceptedImage {
     remote_operation_id: String,
 }
 
-async fn accepted_image(
+async fn start_image_submit(
     pool: &PgPool,
+    work: WorkLease,
     output_count: u32,
     timeout_ms: i64,
     v4: bool,
-    accept: bool,
-) -> TestResult<AcceptedImage> {
-    let work = seed_dreamina_generation_lease_with_outputs_for_profile(
-        pool,
-        "image-completion-worker",
-        DREAMINA_IMAGES_API_PROFILE,
-        output_count,
-    )
-    .await?;
+) -> TestResult<(Uuid, ExecutorSubmissionLease, String)> {
     if v4 {
         seed_v4_customer_quote_with_basis(
             pool,
@@ -187,7 +183,27 @@ async fn accepted_image(
         .map_err(debug_error)?
         .ok_or("image submit intent missing")?
         .execution_binding_sha256;
-    let remote_operation_id = format!("accepted-image-{}", work.job_id.simple());
+    Ok((work.job_id, lease, binding))
+}
+
+async fn accepted_image(
+    pool: &PgPool,
+    output_count: u32,
+    timeout_ms: i64,
+    v4: bool,
+    accept: bool,
+) -> TestResult<AcceptedImage> {
+    let work = seed_dreamina_generation_lease_with_outputs_for_profile(
+        pool,
+        "image-completion-worker",
+        DREAMINA_IMAGES_API_PROFILE,
+        output_count,
+    )
+    .await?;
+    let (job_id, lease, binding) =
+        start_image_submit(pool, work, output_count, timeout_ms, v4).await?;
+    let tasks = PostgresProviderTaskStore::new(pool.clone());
+    let remote_operation_id = format!("accepted-image-{}", job_id.simple());
     if accept {
         tasks
             .record_submit_receipt(&RemoteTaskSubmitReceipt {
@@ -241,7 +257,7 @@ async fn accepted_image(
             .bind(lease.submission_id).fetch_one(pool).await.map_err(debug_error)?
     };
     Ok(AcceptedImage {
-        job_id: work.job_id,
+        job_id,
         submission_id: lease.submission_id,
         original_deadline_at_ms,
         accepted_at_ms,
@@ -726,6 +742,7 @@ async fn image_terminal_release_receipt_requires_original_poll_and_completed_zer
     for error_code in [
         "dreamina_generation_failed",
         "dreamina_copyright_rejected",
+        "dreamina_material_upload_failed",
         "unclassified_failure",
     ] {
         let Some(database) = TestDatabase::new().await? else {
@@ -748,8 +765,8 @@ async fn image_terminal_release_receipt_requires_original_poll_and_completed_zer
             let settled = reductions.complete_terminal(&terminal, None).await.map_err(debug_error)?;
             require(settled == reductions.complete_terminal(&terminal, None).await.map_err(debug_error)?, "terminal replay changed settlement")?;
             let receipt = store.project_image_released_settlement("executord-process-smoke", "project-test", None, image.job_id).await.map_err(debug_error)?;
-            if error_code == "unclassified_failure" {
-                return require(receipt.is_none(), "unclassified error exposed release");
+            if matches!(error_code, "unclassified_failure" | "dreamina_material_upload_failed") {
+                return require(receipt.is_none(), "unexpected poll error exposed release");
             }
             let receipt = receipt.ok_or("authoritative failed image omitted release")?;
             require(receipt.basis.as_deref() == Some("native_image_terminal_reduction_v1") && receipt.state == "released" && receipt.job_id == image.job_id.to_string() && receipt.captured_micros == "0" && receipt.released_micros == receipt.held_micros, "wrong image release receipt")?;
@@ -792,6 +809,200 @@ async fn image_terminal_release_receipt_requires_original_poll_and_completed_zer
             }
             Ok(())
         }.await;
+        combine(result, database.cleanup().await)?;
+    }
+    Ok(())
+}
+
+async fn seed_image_to_image_lease(pool: &PgPool) -> TestResult<WorkLease> {
+    let job_id = Uuid::new_v4();
+    let session_id = Uuid::new_v4();
+    let input_id = Uuid::new_v4();
+    let owner_token = Uuid::new_v4();
+    let request = serde_json::from_value(json!({
+        "workflow": "image2image",
+        "images": ["https://example.com/offline.png"],
+        "prompt": "paint an offline fixture",
+        "model_version": "5.0",
+        "resolution_type": "2k",
+        "ratio": "1:1",
+    }))
+    .map_err(debug_error)?;
+    let intent = DreaminaWorkflowIntent::image(request).map_err(debug_error)?;
+    let sha = sha256(b"offline-image");
+    let plan = intent
+        .bind(DreaminaStagedInputs {
+            images: vec![
+                image_provider_dreamina_cli::StagedImageV1::new("offline.png", &sha, 1920, 1080)
+                    .map_err(debug_error)?,
+            ],
+            objects: vec![AttachInputObject {
+                role: EditInputRoleV1::Image,
+                index: 0,
+                media_type: "image/png".into(),
+                blob: InputBlobRef {
+                    key: InputBlobKey {
+                        admission_session_id: session_id,
+                        input_id,
+                    },
+                    storage_backend: "test".into(),
+                    object_key: format!("{session_id}/{input_id}"),
+                    sha256_hex: sha,
+                    byte_size: 100,
+                },
+            }],
+            ..Default::default()
+        })
+        .map_err(debug_error)?;
+    let attach = plan.attach(
+        AdmissionTicket {
+            session_id,
+            owner_token,
+            request_hash: plan.source_request_hash().into(),
+        },
+        job_id,
+        "dreamina-material-upload-test",
+    );
+    seed_generation_lease(
+        pool,
+        "image-completion-worker",
+        GenerationLeaseSeed {
+            job_id,
+            admission_session_id: session_id,
+            owner_token,
+            api_profile: DREAMINA_IMAGES_API_PROFILE.into(),
+            provider_id: plan.provider_id().into(),
+            model: format!("dreamina-image-{}", plan.provider_model_id()),
+            request_id: format!("request-{}", job_id.simple()),
+            request_hash: attach.ticket.request_hash,
+            command_schema: attach.command_schema,
+            command_json: attach.command_json,
+            operation: "generation".into(),
+            work_kind: attach.work_kind,
+            output_count: 1,
+            billable_units: 1,
+            output_billable_units: 1,
+            billing_metric: "output".into(),
+            billing_unit: "output".into(),
+        },
+    )
+    .await
+}
+
+#[tokio::test]
+async fn image_terminal_release_receipt_requires_definitive_material_upload_rejection() -> TestResult
+{
+    for (image_to_image, kind, expect_terminal, expect_release) in [
+        (true, ProviderSubmitFailureKind::Rejected, true, true),
+        (
+            true,
+            ProviderSubmitFailureKind::OutcomeUnknown,
+            false,
+            false,
+        ),
+        (false, ProviderSubmitFailureKind::Rejected, true, false),
+    ] {
+        let Some(database) = TestDatabase::new().await? else {
+            return Ok(());
+        };
+        let result = async {
+            let pool = &database.pool;
+            let work = if image_to_image {
+                seed_image_to_image_lease(pool).await?
+            } else {
+                seed_dreamina_generation_lease_for_profile(
+                    pool,
+                    "image-completion-worker",
+                    DREAMINA_IMAGES_API_PROFILE,
+                )
+                .await?
+            };
+            let (job_id, lease, binding) =
+                start_image_submit(pool, work, 1, ORIGINAL_TIMEOUT_MS, true).await?;
+            let tasks = PostgresProviderTaskStore::new(pool.clone());
+            tasks
+                .record_submit_failure(&RemoteTaskSubmitFailure {
+                    submission_id: lease.submission_id,
+                    executor_execution_id: lease.executor_execution_id,
+                    executor_owner: lease.executor_owner,
+                    executor_lease_epoch: lease.executor_lease_epoch,
+                    kind,
+                    event_identity: "offline-material-upload-outcome".into(),
+                    error_code: "dreamina_material_upload_failed".into(),
+                    execution_binding_sha256: binding,
+                    recovery_fence: None,
+                })
+                .await
+                .map_err(debug_error)?;
+            let store = PostgresExecutionSettlementStore::new(
+                pool.clone(),
+                Arc::new(InMemoryArtifactBlobStore::default()),
+            );
+            let receipt = || {
+                store.project_image_released_settlement(
+                    "executord-process-smoke",
+                    "project-test",
+                    None,
+                    job_id,
+                )
+            };
+            require(
+                receipt().await.map_err(debug_error)?.is_none(),
+                "unreduced submit or unknown outcome exposed release",
+            )?;
+            let reductions = PostgresExecutorTerminalStore::new(pool.clone());
+            let terminal = reductions
+                .claim_terminal("image-material-rejection-reducer", 60_000)
+                .await
+                .map_err(debug_error)?;
+            if !expect_terminal {
+                return require(terminal.is_none(), "unknown outcome became terminal");
+            }
+            let terminal = terminal.ok_or("definitive material rejection was not reducible")?;
+            let result = reductions.complete_terminal(&terminal, None).await.map_err(debug_error)?;
+            if !expect_release {
+                return require(
+                    receipt().await.map_err(debug_error)?.is_none(),
+                    "text-to-image job exposed a material upload release",
+                );
+            }
+            require(
+                result == reductions.complete_terminal(&terminal, None).await.map_err(debug_error)?,
+                "terminal replay changed material rejection settlement",
+            )?;
+            let proof = receipt().await.map_err(debug_error)?.ok_or("completed image release missing")?;
+            require(
+                proof.basis.as_deref() == Some("dreamina_image_material_upload_rejection_v1")
+                    && proof.state == "released"
+                    && proof.resolution_audit_id == terminal.resolution_decision_id.to_string()
+                    && proof.job_id == job_id.to_string()
+                    && proof.captured_micros == "0"
+                    && proof.held_micros == PRICE.to_string()
+                    && proof.released_micros == proof.held_micros,
+                format!("incorrect material rejection release: {proof:?}"),
+            )?;
+
+            // Inject contradictory upstream evidence only in this disposable fixture schema.
+            sqlx::query("ALTER TABLE provider_submit_quarantined_receipts DISABLE TRIGGER USER")
+                .execute(pool).await.map_err(debug_error)?;
+            require_one(sqlx::query(
+                "INSERT INTO provider_submit_quarantined_receipts
+                (event_identity, submission_id, executor_execution_id, execution_binding_sha256,
+                 expected_provider_id, observed_provider_id, observed_submission_id, remote_operation_id,
+                 reason, recorded_at_ms)
+                SELECT 'conflicting-image-receipt', submission_id, executor_execution_id,
+                       execution_binding_sha256, provider_id, provider_id, submission_id::TEXT,
+                       'unexpected-remote-operation', 'conflicting_receipt', updated_at_ms
+                FROM provider_remote_submit_intents WHERE submission_id = $1"
+            ).bind(lease.submission_id).execute(pool).await.map_err(debug_error)?, "insert contradictory image receipt")?;
+            sqlx::query("ALTER TABLE provider_submit_quarantined_receipts ENABLE TRIGGER USER")
+                .execute(pool).await.map_err(debug_error)?;
+            require(
+                receipt().await.map_err(debug_error)?.is_none(),
+                "material rejection exposed a release despite conflicting remote evidence",
+            )
+        }
+        .await;
         combine(result, database.cleanup().await)?;
     }
     Ok(())
