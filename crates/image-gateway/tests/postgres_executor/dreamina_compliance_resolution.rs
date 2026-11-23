@@ -14,6 +14,9 @@ use image_cli_runtime::WorkingDirectory;
 use image_provider_dreamina_cli::{DreaminaSubmitRequestV1, parse_submit_command};
 use image_provider_sdk::PendingOperation;
 
+#[path = "dreamina_compliance_resolution/historical_image.rs"]
+mod historical_image;
+
 const REFUSAL: &[u8] = br#"{"gen_status":"fail","fail_reason":"api error: ret=4010, message=aigc compliance confirmation required"}"#;
 const CONCURRENCY_REFUSAL: &[u8] = br#"{"submit_id":"fixture-local-id","gen_status":"fail","fail_reason":"api error: ret=1310, message=ExceedConcurrencyLimit, logid=fixture1310"}"#;
 const UNBOUND_UPLOAD_REFUSAL: &[u8] = br#"{"submit_id":"40d80c02-66de-416b-b638-7609c25ede38","gen_status":"fail","prompt":"offline historic video","fail_reason":"upload resource \"input-0.png\": upload image: upload phase, no file upload, please check log for more details"}"#;
@@ -207,31 +210,49 @@ async fn refusal_fixture_for_work(
     refusal: &'static [u8],
     historical_code: &'static str,
 ) -> TestResult<RefusalFixture> {
-    seed_v4_customer_quote_with_basis(
-        pool,
-        &work,
-        quote,
-        V4CustomerQuoteBasis {
-            metric: "video_requested_second",
-            unit: "second",
-            unit_size: 1,
-            unit_price_micros: HELD_MICROS / 8,
-            quantity_source: "request_derived",
-            confidence: "exact",
-            max_quantity: 8,
-            max_amount_micros: HELD_MICROS,
-        },
-    )
-    .await?;
+    let is_image = quote.media_kind == "image";
+    let (scope, basis) = if is_image {
+        (
+            ExecutorClaimScope {
+                execution_profile_id: DREAMINA_PROFILE_ID,
+                ..video_scope()
+            },
+            V4CustomerQuoteBasis {
+                metric: "image_output",
+                unit: "image",
+                unit_size: 1,
+                unit_price_micros: HELD_MICROS,
+                quantity_source: "request_derived",
+                confidence: "exact",
+                max_quantity: 1,
+                max_amount_micros: HELD_MICROS,
+            },
+        )
+    } else {
+        (
+            video_scope(),
+            V4CustomerQuoteBasis {
+                metric: "video_requested_second",
+                unit: "second",
+                unit_size: 1,
+                unit_price_micros: HELD_MICROS / 8,
+                quantity_source: "request_derived",
+                confidence: "exact",
+                max_quantity: 8,
+                max_amount_micros: HELD_MICROS,
+            },
+        )
+    };
+    seed_v4_customer_quote_with_basis(pool, &work, quote, basis).await?;
     let executor = PostgresExecutorSubmissionStore::new(pool.clone());
     let prepared = executor
-        .prepare_and_handoff(&work, DREAMINA_VIDEO_PROFILE_ID)
+        .prepare_and_handoff(&work, scope.execution_profile_id)
         .await
         .map_err(debug_error)?;
-    require(prepared.len() == 1, "fixture must have one video output")?;
+    require(prepared.len() == 1, "fixture must have one output")?;
     seed_terminal_quota(pool, &work).await?;
     let lease = executor
-        .claim_prepared(&video_scope(), "compliance-resolution-executor", 60_000)
+        .claim_prepared(&scope, "compliance-resolution-executor", 60_000)
         .await
         .map_err(debug_error)?
         .ok_or("fixture executor not claimable")?;
@@ -336,7 +357,10 @@ async fn refusal_fixture_for_work(
     if terminalize {
         tokio::time::sleep(Duration::from_millis(5_100)).await;
         let intent = PostgresProviderTaskStore::new(pool.clone())
-            .resolve_due_submit_deadline(&video_poll_scope())
+            .resolve_due_submit_deadline(&ProviderTaskClaimScope {
+                execution_profile_id: scope.execution_profile_id,
+                ..video_poll_scope()
+            })
             .await
             .map_err(debug_error)?
             .ok_or("fixture deadline did not resolve")?;
@@ -488,6 +512,14 @@ async fn material_upload_fixture(
     else {
         return Err("offline fixture requires a multimodal command".into());
     };
+    bind_reviewed_fixture_request(&fixture, request.to_argv())?;
+    Ok(fixture)
+}
+
+fn bind_reviewed_fixture_request(
+    fixture: &RefusalFixture,
+    argv: Vec<std::ffi::OsString>,
+) -> TestResult {
     let request_path = fixture.entry().join("process-request.json");
     let mut recorded: serde_json::Value =
         serde_json::from_slice(&fs::read(&request_path).map_err(debug_error)?)
@@ -498,9 +530,7 @@ async fn material_upload_fixture(
     recorded["executable"] = json!("/offline/dreamina");
     recorded["executable_sha256"] = json!(REVIEWED_PIN);
     recorded["arguments"] = json!(
-        request
-            .to_argv()
-            .into_iter()
+        argv.into_iter()
             .map(|arg| arg.into_string().map_err(debug_error))
             .collect::<TestResult<Vec<_>>>()?
     );
@@ -509,8 +539,7 @@ async fn material_upload_fixture(
         &request_path,
         serde_json::to_vec(&recorded).map_err(debug_error)?,
     )
-    .map_err(debug_error)?;
-    Ok(fixture)
+    .map_err(debug_error)
 }
 
 fn fixture_request_payload_sha256(request: &serde_json::Value) -> TestResult<String> {

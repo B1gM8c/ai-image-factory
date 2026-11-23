@@ -1,8 +1,9 @@
 use std::path::Path;
 
 use image_provider_dreamina_cli::{
-    ADAPTER_REVISION, DREAMINA_SUBMIT_COMMAND_SCHEMA, DREAMINA_VIDEO_GENERATION_OPERATION_V1,
-    DreaminaSubmitPayloadV1, DreaminaSubmitRequestV1, PROVIDER_ID, parse_submit_command,
+    ADAPTER_REVISION, DREAMINA_IMAGE_GENERATION_OPERATION_V1, DREAMINA_SUBMIT_COMMAND_SCHEMA,
+    DREAMINA_VIDEO_GENERATION_OPERATION_V1, DreaminaSubmitPayloadV1, DreaminaSubmitRequestV1,
+    PROVIDER_ID, parse_submit_command,
 };
 use image_provider_sdk::{EffectCertainty, OutputSlot, RetryDirective, SingleOutputCommand};
 use serde_json::Value;
@@ -179,7 +180,13 @@ pub(super) async fn load_rejection(
           AND execution.executor_owner IS NULL AND execution.lease_expires_at_ms IS NULL
           AND recovery.state = 'closed' AND recovery.invocation_attempt = 1
           AND recovery.recovery_owner IS NULL AND recovery.recovery_lease_expires_at_ms IS NULL
-          AND job.operation = 'video_generation' AND job.output_count = 1
+          AND job.output_count = 1
+          AND (job.operation = 'video_generation' OR (
+               job.operation = 'generation' AND payload.command_json->>'operation' = 'image2image'
+               AND intent.failure_error_code = 'dreamina_submit_rejected'
+               AND EXISTS (SELECT 1 FROM work_items work
+                           WHERE work.job_id = job.job_id AND work.kind = 'image_batch')
+          ))
           AND NOT EXISTS (SELECT 1 FROM provider_remote_tasks task
                           WHERE task.submission_id = intent.submission_id)
           AND NOT EXISTS (SELECT 1 FROM provider_submit_quarantined_receipts receipt
@@ -243,17 +250,24 @@ pub(super) async fn load_rejection(
     };
     let source_bytes = serde_json::to_vec(&row.command_json).map_err(|_| conflict())?;
     let request = parse_submit_command(&source_bytes).map_err(|_| conflict())?;
+    let is_image_edit = matches!(&request, DreaminaSubmitRequestV1::ImageToImage(image)
+        if image.generate_num() == 1);
+    let valid_operation = if is_image_edit {
+        context.operation_id() == DREAMINA_IMAGE_GENERATION_OPERATION_V1.id
+    } else {
+        context.operation_id() == DREAMINA_VIDEO_GENERATION_OPERATION_V1.id
+            && matches!(
+                request,
+                DreaminaSubmitRequestV1::TextToVideo(_)
+                    | DreaminaSubmitRequestV1::ImageToVideo(_)
+                    | DreaminaSubmitRequestV1::FramesToVideo(_)
+                    | DreaminaSubmitRequestV1::MultiframeToVideo(_)
+                    | DreaminaSubmitRequestV1::MultimodalToVideo(_)
+            )
+    };
     if context.command_schema() != DREAMINA_SUBMIT_COMMAND_SCHEMA
         || context.adapter_revision() != ADAPTER_REVISION
-        || context.operation_id() != DREAMINA_VIDEO_GENERATION_OPERATION_V1.id
-        || !matches!(
-            request,
-            DreaminaSubmitRequestV1::TextToVideo(_)
-                | DreaminaSubmitRequestV1::ImageToVideo(_)
-                | DreaminaSubmitRequestV1::FramesToVideo(_)
-                | DreaminaSubmitRequestV1::MultiframeToVideo(_)
-                | DreaminaSubmitRequestV1::MultimodalToVideo(_)
-        )
+        || !valid_operation
     {
         return Err(conflict());
     }
@@ -291,6 +305,7 @@ pub(super) async fn load_rejection(
     };
     validate_terminal(&terminal, reviewed_stdout_sha256)?;
     let reason = match classify_terminal(submission_id, &terminal) {
+        Some(_) if is_image_edit => return Err(conflict()),
         Some(reason) => reason,
         None => {
             let evidence = process
@@ -308,7 +323,8 @@ pub(super) async fn load_rejection(
             RejectionReason::MaterialUpload
         }
     };
-    if !reason.matches_historical_code(&journal_error)
+    if (is_image_edit && journal_error != "dreamina_submit_rejected")
+        || !reason.matches_historical_code(&journal_error)
         || intent.failure_error_code.as_deref() != Some(journal_error.as_str())
     {
         return Err(conflict());

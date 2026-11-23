@@ -134,10 +134,15 @@ pub async fn resolve_dreamina_compliance_rejection(
         JOIN customer_billing_holds hold ON hold.job_id = job.job_id AND hold.tenant_id = job.tenant_id
         WHERE job.job_id = $1 AND submission.submission_id = $2
           AND execution.executor_execution_id = $3
-          AND job.provider_id = 'dreamina-cli' AND job.operation = 'video_generation'
+          AND job.provider_id = 'dreamina-cli'
           AND job.output_count = 1 AND job.economics_contract_version = 4
           AND job.state = 'uncertain' AND job.charged_units = 0
-          AND work.state = 'uncertain' AND work.kind = 'video_single'
+          AND work.state = 'uncertain'
+          AND (
+            (job.operation = 'video_generation' AND work.kind = 'video_single')
+            OR (quota.started_units = 0
+                AND is_operator_dreamina_image_upload_rejection(job.job_id, submission.submission_id))
+          )
           AND work.lease_owner IS NULL AND work.lease_expires_at_ms IS NULL
           AND attempt.state = 'uncertain' AND output.state = 'uncertain'
           AND submission.state = 'uncertain' AND execution.state = 'uncertain'
@@ -166,6 +171,9 @@ pub async fn resolve_dreamina_compliance_rejection(
     )
     .await?;
     let reason = evidence.reason.code();
+    if locked.operation == "generation" && reason != "dreamina_material_upload_failed" {
+        return Err(conflict());
+    }
     let now: i64 =
         sqlx::query_scalar("SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT")
             .fetch_one(&mut *tx)

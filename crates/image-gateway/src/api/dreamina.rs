@@ -1485,9 +1485,14 @@ fn image_task(
             task.status = "failed".to_owned();
             task.error = Some(DreaminaTaskError {
                 reason_code: None,
-                message: known_terminal_failure_message(error_code.as_deref())
-                    .unwrap_or("Dreamina image generation failed")
-                    .to_owned(),
+                message: match error_code.as_deref() {
+                    Some("dreamina_material_upload_failed") => {
+                        "即梦参考素材上传失败，图片未提交生成"
+                    }
+                    code => known_terminal_failure_message(code)
+                        .unwrap_or("Dreamina image generation failed"),
+                }
+                .to_owned(),
                 code: error_code.unwrap_or_else(|| "generation_failed".to_owned()),
             });
         }

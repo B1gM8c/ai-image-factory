@@ -134,6 +134,10 @@ fn image_terminal_states_omit_old_progress_and_uncertain_remains_distinct() {
 fn image_terminal_known_reason_is_displayed_without_changing_unknown_fallback() {
     for (code, message) in [
         (
+            "dreamina_material_upload_failed",
+            "即梦参考素材上传失败，图片未提交生成",
+        ),
+        (
             "dreamina_copyright_rejected",
             "生成的视频里包含受版权保护元素",
         ),
