@@ -1,6 +1,39 @@
 use super::*;
 
 #[tokio::test]
+async fn finished_image_queue_waits_for_the_original_receipt_then_delivers_one_image() {
+    let fixture = Fixture::new(
+        r#"if [ ! -f "$HOME/result-ready" ]; then
+  : > "$HOME/result-ready"
+  printf '{"submit_id":"%s","gen_status":"querying","credit_count":3,"queue_info":{"queue_idx":0,"queue_length":0,"queue_status":"Finish"},"estimated_remaining_seconds":0}' "$submit"
+else
+  /bin/cp "$HOME/source.png" "$download/${submit}_image_1.png"
+  printf '{"submit_id":"%s","gen_status":"success","result_json":{"images":[{"item_id":"existing-image","path":"%s_image_1.png","width":1,"height":1}],"videos":[]}}' "$submit" "$submit"
+fi"#,
+    );
+    fs::write(
+        fixture.account_home.join("source.png"),
+        png_bytes([1, 2, 3, 255]),
+    )
+    .unwrap();
+    let driver = fixture.driver(1024);
+    let (delay, progress) = poll_pending(&fixture, &driver, "single").await.unwrap();
+    assert_eq!(delay, Some(IMAGE_RESULT_WAIT_POLL_AFTER_MS));
+    assert_eq!(progress.provider_status, "Finish");
+    assert_eq!(progress.queue_position, None);
+    assert_eq!(progress.queue_total, None);
+    assert_eq!(progress.estimated_remaining_seconds, None);
+    let mut sink = fixture.sink(Sha256::digest(png_bytes([1, 2, 3, 255])).into());
+    let result = driver
+        .poll_operation(&fixture.operation(), false, &mut sink)
+        .await
+        .unwrap();
+    assert!(matches!(result, PollObservation::Completed(_)));
+    fixture.assert_queries_used_original_submit_id(2);
+    fixture.assert_workspace_has_no_attempts();
+}
+
+#[tokio::test]
 async fn single_batch_and_video_keep_valid_query_progress_and_bounded_cadence() {
     let cases = [
         (
