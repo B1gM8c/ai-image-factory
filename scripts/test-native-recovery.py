@@ -834,14 +834,14 @@ def baseline_stop_wait_evidence(environment, pid):
     return evidence
 
 
-def stop_baseline_updater(baseline, expected_hash, environment):
+def stop_baseline_updater(baseline, expected_hash, environment, *, running_apply_enabled='false'):
     # Only this immutable baseline predates the retained shutdown future. Never
     # cancel an active pass or treat systemd's eventual SIGKILL as a graceful stop.
     require(baseline['release_version'] == 'v0.1.0-20260824.40c7432'
             and baseline['commit_sha'] == '40c74329080aeaea7b4eddeaf56a20fead554c4f',
             'legacy shutdown workaround requires the exact audited baseline')
     require_idle_host_preparation(environment)
-    identity = updater_identity(expected_hash, 'false', require_safe_mounts=False)
+    identity = updater_identity(expected_hash, running_apply_enabled, require_safe_mounts=False)
     unit = PREFIX + 'updater.service'
     run(['systemctl', 'stop', '--no-block', unit], timeout=10)
     started = time.monotonic()
@@ -1249,6 +1249,9 @@ WHERE n.nspname='public' AND c.relname='ci_recovery_sequence' AND c.relkind='S';
     progress('Application upgrade verified with baseline updater; disabling Apply before the existing fixed-binary helper')
     policy['AIF_UPDATE_APPLY_ENABLED'] = 'false'
     env_file(CONFIG / 'update-policy.env', policy)
+    # Gateway startup runs recover-pending under the same host lock that the
+    # baseline updater takes on every poll, even with no queued command.
+    stop_baseline_updater(baseline, baseline_updater_hash, owner_env, running_apply_enabled='true')
     run(['systemctl', 'restart', PREFIX + 'gateway.service'])
     wait_http(8787, '/readyz')
     require(sql(owner_env, "SELECT count(*) FROM platform_update_commands WHERE status IN ('queued','running','restoring','restore_required');") == '0',
