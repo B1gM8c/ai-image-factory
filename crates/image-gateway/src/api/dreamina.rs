@@ -1432,7 +1432,17 @@ fn image_task(
                 }
                 .to_owned(),
             );
-            task.provider_progress = provider_progress.map(public_provider_progress);
+            task.provider_progress = provider_progress.map(|value| {
+                let mut progress = public_provider_progress(value);
+                if progress.provider_status == "Finish" {
+                    // Earlier workers may have persisted a zero ETA for a
+                    // finished queue while the image receipt was still pending.
+                    progress.queue_position = None;
+                    progress.queue_total = None;
+                    progress.estimated_remaining_seconds = None;
+                }
+                progress
+            });
         }
         ImageResultStatus::Succeeded {
             result,

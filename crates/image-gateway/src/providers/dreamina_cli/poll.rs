@@ -31,6 +31,7 @@ use image_provider_sdk::{
 
 const DEFAULT_POLL_AFTER_MS: u64 = 5_000;
 const QUEUED_POLL_AFTER_MS: u64 = 30_000;
+const IMAGE_RESULT_WAIT_POLL_AFTER_MS: u64 = 30_000;
 const MEDIA_PREFIX_BYTES: usize = 12;
 const DREAMINA_POLL_ATTEMPT_PREFIX: &str = ".dreamina-poll-";
 
@@ -220,7 +221,11 @@ impl DreaminaCliPollDriverV1 {
                 output
                     .ensure_empty()
                     .map_err(|_| contract_failure("dreamina_poll_pending_artifact"))?;
-                Ok(pending_observation(&receipt))
+                let (next_poll_after_ms, progress) = pending_image_progress(&receipt);
+                Ok(PollObservation::PendingWithProgress {
+                    next_poll_after_ms: Some(next_poll_after_ms),
+                    progress,
+                })
             }
             DreaminaQueryStatusV1::Failed => {
                 output
@@ -308,7 +313,7 @@ impl DreaminaCliPollDriverV1 {
                 output
                     .ensure_empty()
                     .map_err(|_| contract_failure("dreamina_poll_pending_artifact"))?;
-                let (next_poll_after_ms, progress) = pending_progress(&receipt);
+                let (next_poll_after_ms, progress) = pending_image_progress(&receipt);
                 Ok(ProviderNativeBatchPollObservation::PendingWithProgress {
                     next_poll_after_ms: Some(next_poll_after_ms),
                     progress,
@@ -722,6 +727,19 @@ fn pending_observation(receipt: &DreaminaQueryReceiptV1) -> PollObservation {
         next_poll_after_ms: Some(next_poll_after_ms),
         progress,
     }
+}
+
+fn pending_image_progress(receipt: &DreaminaQueryReceiptV1) -> (u64, ProviderTaskProgress) {
+    let (next_poll_after_ms, mut progress) = pending_progress(receipt);
+    if progress.provider_status == "Finish" {
+        // The queue can finish while query_result still reports querying and
+        // returns no image. Keep polling the original ID without a queue ETA.
+        progress.queue_position = None;
+        progress.queue_total = None;
+        progress.estimated_remaining_seconds = None;
+        return (IMAGE_RESULT_WAIT_POLL_AFTER_MS, progress);
+    }
+    (next_poll_after_ms, progress)
 }
 
 pub(crate) fn pending_progress(receipt: &DreaminaQueryReceiptV1) -> (u64, ProviderTaskProgress) {

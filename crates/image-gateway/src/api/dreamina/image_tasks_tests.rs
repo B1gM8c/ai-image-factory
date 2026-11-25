@@ -89,6 +89,39 @@ fn image_running_projection_preserves_durable_progress_and_safe_frozen_metadata(
 }
 
 #[test]
+fn image_finish_queue_without_result_has_no_countdown_or_output() {
+    let mut progress = progress();
+    progress.progress.provider_status = "Finish".into();
+    progress.progress.queue_position = Some(0);
+    progress.progress.queue_total = Some(0);
+    progress.progress.estimated_remaining_seconds = Some(0);
+    let (task, usage) = image_task(
+        Uuid::nil(),
+        projection(ImageResultStatus::Pending {
+            stage: VideoPendingStage::Processing,
+            provider_progress: Some(progress),
+        }),
+    )
+    .unwrap();
+    let value = serde_json::to_value(task).unwrap();
+    assert_eq!(value["status"], "running");
+    assert_eq!(value["provider_progress"]["provider_status"], "Finish");
+    assert_eq!(
+        value["provider_progress"]["observed_at_ms"],
+        1_792_828_821_077_i64
+    );
+    for field in [
+        "queue_position",
+        "queue_total",
+        "estimated_remaining_seconds",
+    ] {
+        assert!(value["provider_progress"].get(field).is_none(), "{field}");
+    }
+    assert!(value.get("data").is_none());
+    assert!(usage.is_none());
+}
+
+#[test]
 fn image_unknown_progress_does_not_invent_queue_or_eta() {
     let (task, _) = image_task(
         Uuid::nil(),
